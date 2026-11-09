@@ -25,6 +25,9 @@ export CPLUS_INCLUDE_PATH="$C_INCLUDE_PATH${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_
 export RUNNER_TEMP="${RUNNER_TEMP:-/tmp/lccc-runner-temp}"
 mkdir -p "$RUNNER_TEMP"
 export CARGO_BUILD_JOBS=1
+# Reuse the already-active 4 GiB swap instead of letting ensure_swap.sh
+# allocate a SECOND 4 GiB /swapfile and exhaust this 21 GiB sandbox.
+export LCCC_SWAPFILE="$HOME/.cache/lccc-swap.img"
 export RUSTFLAGS="-D warnings"
 unset RUSTUP_TOOLCHAIN RUSTUP_HOME CCC_NO_BB_SLP
 export LCCC_BIN="${LCCC_BIN:-$PWD/target/fastbuild/lccc}"

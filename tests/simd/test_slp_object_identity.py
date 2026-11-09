@@ -55,6 +55,7 @@ if str(HERE) not in sys.path:
 ROOT = HERE.parents[1]
 LCCC = ROOT / "target" / "fastbuild" / "lccc"
 GCC = os.environ.get("LCCC_TEST_CC", "gcc")
+CLANG = os.environ.get("LCCC_TEST_CLANG", "clang")
 CORPUS = HERE / "slp_object_identity.c"
 SHAPES = HERE / "simd_shape_matrix.c"
 OBJDUMP = os.environ.get("LCCC_TEST_OBJDUMP", "objdump")
@@ -718,10 +719,14 @@ int main(void) {
         for an owned ``FxHashSet<SeedKey>`` (one ``Vec<usize>`` allocation per
         candidate) to remove them.  The new design inserts each store ONCE,
         derives the site tier as a partition, and dedups by a stable hash
-        with exact equality inside each bucket.  These asserts have teeth:
-        they pin the algorithmic invariants that a "simplification" can
-        silently destroy (quadratic site partition, lossy boolean identity,
-        value-collapsed LaneKey), and they pin bit-exact output.
+        with exact equality inside each bucket.  The post-merge audit further
+        removes every remaining StreamEntry clone from the run splitter, keeps
+        site buckets in first-appearance order, bounds GEP recursion, and
+        makes hash collisions executable with a forced-collision test seam.
+        These asserts have teeth: they pin the algorithmic invariants that a
+        "simplification" can silently destroy (quadratic site partition,
+        lossy boolean identity, value-collapsed LaneKey, unbounded recursion),
+        and they pin bit-exact output.
         """
         src = ROOT / "engineering" / "verification" / "bench" / "site_subsets_stress.c"
         self.assertTrue(src.is_file(), src)
@@ -755,14 +760,43 @@ int main(void) {
         self.assertIn("fn site_subsets(", code)
         self.assertIn("if entries.iter().all(|e| e.4 == only_base)", code,
                       "zero-allocation single-web fast path must survive")
-        self.assertIn("buckets.entry(e.4).or_default().push(e.clone())", code,
+        self.assertIn("let idx = match index.entry(e.4)", code,
                       "O(n) single-pass bucket build must survive")
+        self.assertIn("buckets[idx].push(e.clone())", code,
+                      "first-appearance-ordered buckets must stay exact")
         self.assertNotIn("entries.iter().filter(|e| e.4 == base)", code,
                          "the O(n*b) quadratic site partition must not return")
+        self.assertNotIn("buckets.into_values().collect()", code,
+                         "hash-table iteration must not reorder tied candidates")
+        self.assertIn("fn emit_run(", code,
+                      "run slices must be borrowed, not cloned into a Vec")
+        self.assertNotIn("run.push(entry.clone())", code,
+                         "no per-store StreamEntry clone may return")
+        self.assertNotIn("offs.dedup()", code,
+                         "a duplicate cannot occur inside a strided run")
+        self.assertIn("Vec<&StreamEntry>", code,
+                      "joint windows must borrow the sorted stream")
+        self.assertNotIn("let mut last: Vec<StreamEntry>", code,
+                         "the joint path must not clone every store")
+        self.assertNotIn("eval_sym_addr_d(block, def_pos, *base, depth.saturating_sub(1))",
+                         code, "GEP recursion must be bounded, not saturating")
+        self.assertIn("eval_sym_addr_d(block, def_pos, *base, depth - 1)", code,
+                      "the recursion must actually decrement its fuel")
+        self.assertIn("if depth == 0 {", code,
+                      "a bounded GEP chain must fail closed at the limit")
+        self.assertNotIn("store_idx[0].cmp", code,
+                         "a malformed empty span must not panic the tie-break")
+        self.assertIn("store_idx.first().cmp", code)
+        self.assertIn("if size == 0 {", code,
+                      "preferred_width must not divide by zero")
         self.assertIn("fn seed_hash(", code)
         self.assertIn("fn seed_fields_eq(", code)
         self.assertIn("enum SeedReps", code)
         self.assertIn("fn dedup_seed_candidates(", code)
+        self.assertIn("fn dedup_seed_candidates_with", code,
+                      "forced-collision test seam must stay")
+        self.assertIn("match groups.entry(h)", code,
+                      "one hash lookup per candidate must stay")
         self.assertIn("enum SeedOperandKey", code)
         self.assertIn("fn seed_operand_key(", code)
         self.assertIn("#[cfg(test)]\ntype SeedKey", code,
@@ -775,6 +809,8 @@ int main(void) {
         self.assertIn("pub alpha: u8", joint)
         self.assertIn("i32::from(self.alpha)", joint)
         self.assertIn("for alpha in 0u8..4", joint)
+        self.assertIn("run: &[&StreamEntry]", joint,
+                      "joint seed must consume borrowed stream entries")
         # LaneKey value-equivalence is load-bearing for s_clamp_u8 (test_30).
         self.assertIn("enum LaneKey", code)
         self.assertIn("I8(0)", code)
@@ -873,6 +909,56 @@ int main(int argc, char **argv) {
             self.fail(f"missing callgrind summary in {path}")
         self.assertLessEqual(ir(cg_on), ir(cg_off),
                              f"SLP must not cost instructions: {ir(cg_on)} vs {ir(cg_off)}")
+
+    def test_38_deep_gep_chain_is_bounded_and_natively_correct(self):
+        """A 64-deep GEP chain must not recurse without bound in SLP.
+
+        The Rust unit test proves the depth-0 fail-closed base exactly; this
+        end-to-end gate proves the compiler still accepts the same shape on
+        the host CPU with zero diagnostics and byte-identical runtime results
+        to GCC 16.2 and Clang 23.1.5.  It is a regression for the
+        ``saturating_sub(1)`` recursion bug, not a codegen-shape assertion.
+        """
+        src = self.d / "deep_gep.c"
+        lines = [
+            "#include <stdint.h>",
+            "uint32_t g[128];",
+            "void deep(uint32_t s) {",
+            "    uint32_t *p = g;",
+        ]
+        lines += ["    p = p + 1;" for _ in range(64)]
+        lines += [
+            "    *p = s;",
+            "}",
+            "int main(void) {",
+            "    deep(0x12345678u);",
+            "    return g[64] == 0x12345678u ? 0 : 1;",
+            "}",
+        ]
+        src.write_text("\n".join(lines) + "\n")
+        flags = ["-O2", "-march=x86-64-v3", "-Wall", "-Wextra", "-Werror", "-Wpedantic"]
+        for name, compiler in [("lccc", LCCC), ("gcc16", GCC), ("clang23", CLANG)]:
+            if not shutil.which(str(compiler)) and not Path(compiler).is_file():
+                self.skipTest(f"compiler absent: {compiler}")
+            with self.subTest(compiler=name):
+                exe = self.d / f"deep_{name}"
+                env = {"LCCC_DEBUG_SLP": "1", "CCC_DISABLE_PASSES": "gaddrcse"} \
+                    if name == "lccc" else None
+                c = compile_ok(compiler, src, exe, flags, env=env)
+                self.assertEqual(c.returncode, 0, c.stderr)
+                self.assertNotIn("warning:", c.stderr.lower())
+                self.assertNotIn("panicked", c.stderr)
+                # LCCC_DEBUG_SLP writes deterministic [SLP-SEEDS] traces; any
+                # OTHER stderr line is a real diagnostic and must fail.
+                for line in c.stderr.splitlines():
+                    if line.strip():
+                        self.assertTrue(
+                            line.startswith("[SLP-SEEDS]"),
+                            f"{name} emitted an unexpected diagnostic: {line!r}",
+                        )
+                r = run([exe], self.d)
+                self.assertEqual(r.returncode, 0, r.stdout)
+                self.assertEqual(r.stdout, "")
 
 
 if __name__ == "__main__":

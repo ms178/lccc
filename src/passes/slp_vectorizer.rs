@@ -53,6 +53,7 @@ use crate::passes::CfgAnalysis;
 use crate::passes::vectorize::{
     x86_avx2_available_pub, x86_prefer_wide_pub, x86_simd_available_pub, x86_sse41_available_pub,
 };
+use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 
 /// Hashable lane encoding for PACK / SPLAT dedup. Exact on float bits, but
@@ -496,6 +497,17 @@ fn eval_sym_addr_d(
     ptr: Value,
     depth: usize,
 ) -> Option<SymAddr> {
+    // A GEP chain is bounded, not just its affine offset expression.  The
+    // previous `depth.saturating_sub(1)` kept recursing at depth 0 forever on
+    // an unrolled chain: fail closed as an opaque base at the limit instead.
+    if depth == 0 {
+        return Some(SymAddr {
+            base: ptr,
+            var: None,
+            mult: 1,
+            off: 0,
+        });
+    }
     // A pointer defined OUTSIDE this block (entry-block ParamRef or
     // GlobalAddr, a foreign block's computation) is an opaque base:
     // affine-equal to itself with no local offset structure. Returning
@@ -546,13 +558,12 @@ fn eval_sym_addr_d(
             //     the SAME base-GEP value still stream together — the
             //     `p = &a[i]; p[0..3]` shape; the historical behavior,
             //     byte-for-byte).
-            let mut addr = eval_sym_addr_d(block, def_pos, *base, depth.saturating_sub(1))
-                .unwrap_or(SymAddr {
-                    base: *base,
-                    var: None,
-                    mult: 1,
-                    off: 0,
-                });
+            let mut addr = eval_sym_addr_d(block, def_pos, *base, depth - 1).unwrap_or(SymAddr {
+                base: *base,
+                var: None,
+                mult: 1,
+                off: 0,
+            });
             // The offset term: a constant folds into `off`; a variable
             // term (with its scale and constant part from `affine_term`)
             // becomes the stream's index. `addr` may carry at most one
@@ -2028,9 +2039,18 @@ enum SeedReps {
 /// for EVERY candidate on EVERY fixpoint round.  A sort-by-hash alternative
 /// was measured SLOWER (2,253,108,448 Ir vs 2,252,135,211 Ir baseline on the
 /// 300-global seed stress) because of the O(n log n) sort and the extra
-/// `keep` vector.  This version keeps one inline representative per bucket,
-/// hashes each seed once, and compares fields ONLY inside a colliding bucket.
-fn dedup_seed_candidates(mut candidates: Vec<SeedCandidate>) -> Vec<SeedCandidate> {
+/// `keep` vector.  This version hashes each seed once, performs ONE hash-map
+/// lookup via the entry API, keeps one inline representative per bucket, and
+/// compares fields ONLY inside a colliding bucket.
+///
+/// The `hash_fn` seam is test-only: a forced all-collisions hash proves the
+/// `SeedReps::Many` path and exact equality without needing a 64-bit birthday
+/// search.  Production always passes `seed_hash`.
+#[inline]
+fn dedup_seed_candidates_with<H>(candidates: Vec<SeedCandidate>, hash_fn: H) -> Vec<SeedCandidate>
+where
+    H: Fn(&SeedCandidate) -> u64,
+{
     // Fast paths for the overwhelmingly common tiny blocks: no HashMap and
     // no hashing at all.  Blocks with 0/1 seed are free, and a 2-seed block
     // only needs ONE exact field comparison (hashing both plus two map
@@ -2039,34 +2059,47 @@ fn dedup_seed_candidates(mut candidates: Vec<SeedCandidate>) -> Vec<SeedCandidat
         return candidates;
     }
     if candidates.len() == 2 && seed_fields_eq(&candidates[0], &candidates[1]) {
+        let mut candidates = candidates;
         candidates.pop();
         return candidates;
     }
     let mut groups: FxHashMap<u64, SeedReps> = FxHashMap::default();
     let mut out: Vec<SeedCandidate> = Vec::with_capacity(candidates.len());
     for c in candidates {
-        let h = seed_hash(&c);
-        let duplicate = match groups.get(&h) {
-            None => false,
-            Some(SeedReps::One(i)) => seed_fields_eq(&out[*i], &c),
-            Some(SeedReps::Many(v)) => v.iter().any(|&i| seed_fields_eq(&out[i], &c)),
-        };
-        if duplicate {
-            continue;
-        }
+        let h = hash_fn(&c);
         let idx = out.len();
-        match groups.get_mut(&h) {
-            None => {
-                groups.insert(h, SeedReps::One(idx));
+        let mut duplicate = false;
+        match groups.entry(h) {
+            Entry::Vacant(slot) => {
+                slot.insert(SeedReps::One(idx));
             }
-            Some(reps) => match reps {
-                SeedReps::One(first) => *reps = SeedReps::Many(vec![*first, idx]),
-                SeedReps::Many(v) => v.push(idx),
-            },
+            Entry::Occupied(mut slot) => {
+                let reps = slot.get_mut();
+                duplicate = match reps {
+                    SeedReps::One(i) => seed_fields_eq(&out[*i], &c),
+                    SeedReps::Many(v) => v.iter().any(|&i| seed_fields_eq(&out[i], &c)),
+                };
+                if !duplicate {
+                    match reps {
+                        SeedReps::One(first) => {
+                            let first = *first;
+                            *reps = SeedReps::Many(vec![first, idx]);
+                        }
+                        SeedReps::Many(v) => v.push(idx),
+                    }
+                }
+            }
         }
-        out.push(c);
+        if !duplicate {
+            out.push(c);
+        }
     }
     out
+}
+
+#[inline]
+fn dedup_seed_candidates(candidates: Vec<SeedCandidate>) -> Vec<SeedCandidate> {
+    dedup_seed_candidates_with(candidates, seed_hash)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2439,6 +2472,75 @@ fn is_memory_access(inst: &Instruction) -> bool {
         )
 }
 
+/// Emit seeds for ONE strictly-strided, duplicate-free run of stores.
+///
+/// `run` is a borrowed slice of the sorted object/site stream: no
+/// `StreamEntry` is cloned into a temporary run vector.  A duplicate offset
+/// can never occur inside it (the caller splits on `checked_sub != size`),
+/// so the old `offs: Vec<i64>` + `dedup()` guard was dead work and a per-run
+/// allocation; the `debug_assert!` below keeps that invariant executable.
+fn emit_run(
+    ty: IrType,
+    run: &[StreamEntry],
+    size: i64,
+    avx2: bool,
+    candidates: &mut Vec<SeedCandidate>,
+) {
+    debug_assert!(run.len() >= 2);
+    debug_assert!(
+        run.windows(2)
+            .all(|w| w[1].0.checked_sub(w[0].0) == Some(size))
+    );
+    let Ok(size_u64) = u64::try_from(size) else {
+        return;
+    };
+    let Some(width) = preferred_width(run.len(), size_u64, ty, avx2) else {
+        return;
+    };
+    let store_idx: Vec<usize> = run[..width].iter().map(|(_, i, ..)| *i).collect();
+    let lane_ops: Vec<Operand> = run[..width].iter().map(|(_, _, v, ..)| v.clone()).collect();
+    candidates.push(SeedCandidate {
+        store_idx,
+        lane_ops,
+        ty,
+        anchor_ptr: run[0].3,
+        width,
+        joint: None,
+        value_sink: None,
+    });
+    // Fallback sub-window candidates: the full-width seed takes the first
+    // `width` stores of the run, and when ITS lanes are not uniform
+    // (v7_pressure: three independent 4-lane groups fused into one 12-store
+    // run) the pack build fails and, without fallbacks, the WHOLE run stays
+    // scalar. Every aligned 128-bit window is offered as its own seed so the
+    // uniform groups still pack.  Overlap is safe: plans are attempted
+    // longest-first, one applied per scan, and the rewrite turns the packed
+    // stores into vector stores before the rescan re-collects.
+    let w128 = usize::try_from(16u64 / size_u64).unwrap_or(0);
+    if w128 >= 2 && width > w128 {
+        for chunk in run.chunks(w128) {
+            if chunk.len() < 2 {
+                continue;
+            }
+            let cw = match preferred_width(chunk.len(), size_u64, ty, avx2) {
+                Some(cw) if cw == chunk.len() => cw,
+                _ => continue,
+            };
+            let store_idx: Vec<usize> = chunk.iter().map(|(_, i, ..)| *i).collect();
+            let lane_ops: Vec<Operand> = chunk.iter().map(|(_, _, v, ..)| v.clone()).collect();
+            candidates.push(SeedCandidate {
+                store_idx,
+                lane_ops,
+                ty,
+                anchor_ptr: chunk[0].3,
+                width: cw,
+                joint: None,
+                value_sink: None,
+            });
+        }
+    }
+}
+
 /// Collect store seeds: runs of stores on one address stream with
 /// consecutive offsets at the lane stride, longest first.
 fn push_stream_candidates(
@@ -2455,13 +2557,15 @@ fn push_stream_candidates(
     sorted.sort_by_key(|(off, idx, ..)| (*off, *idx));
     if is_object_tier && ty == IrType::U8 && x86_sse41_available_pub() {
         // Joint seeds use the LAST store to each byte; overwritten stores
-        // are retired only after the complete use/access proof below.
-        let mut last: Vec<StreamEntry> = Vec::new();
+        // are retired only after the complete use/access proof below.  The
+        // window holds BORROWED entries: the old `Vec<StreamEntry>` cloned
+        // every store once just to remove overwritten offsets.
+        let mut last: Vec<&StreamEntry> = Vec::with_capacity(sorted.len());
         for e in &sorted {
-            if last.last().is_some_and(|p: &StreamEntry| p.0 == e.0) {
+            if last.last().is_some_and(|p| p.0 == e.0) {
                 last.pop();
             }
-            last.push(e.clone());
+            last.push(e);
         }
         for window in last.windows(4) {
             if window
@@ -2475,82 +2579,30 @@ fn push_stream_candidates(
         }
     }
 
-    let size = ty.size() as i64;
+    let Ok(size) = i64::try_from(ty.size()) else {
+        return;
+    };
     if size <= 0 {
         return;
     }
-    // Split into consecutive runs at stride == size. A duplicate offset
+    // Split into consecutive runs at stride == size.  A duplicate offset
     // (store overwritten by a later store to the same address) ends the
-    // current run; the earlier store stays scalar.
-    let mut run: Vec<StreamEntry> = Vec::new();
-    let flush = |run: &mut Vec<StreamEntry>, candidates: &mut Vec<SeedCandidate>| {
-        if run.len() >= 2 {
-            let mut offs: Vec<i64> = run.iter().map(|(o, ..)| *o).collect();
-            offs.dedup();
-            if offs.len() == run.len() {
-                if let Some(width) = preferred_width(run.len(), size as u64, ty, avx2) {
-                    let store_idx: Vec<usize> = run[..width].iter().map(|(_, i, ..)| *i).collect();
-                    let lane_ops: Vec<Operand> =
-                        run[..width].iter().map(|(_, _, v, ..)| v.clone()).collect();
-                    candidates.push(SeedCandidate {
-                        store_idx,
-                        lane_ops,
-                        ty,
-                        anchor_ptr: run[0].3,
-                        width,
-                        joint: None,
-                        value_sink: None,
-                    });
-                    // Fallback sub-window candidates: the full-width seed
-                    // takes the first `width` stores of the run, and when ITS
-                    // lanes are not uniform (v7_pressure: three independent
-                    // 4-lane groups fused into one 12-store run) the pack
-                    // build fails and, without fallbacks, the WHOLE run stays
-                    // scalar. Every aligned 128-bit window is offered as its
-                    // own seed so the uniform groups still pack.
-                    // Overlap is safe: plans are attempted longest-first, one
-                    // applied per scan, and the rewrite turns the packed
-                    // stores into vector stores before the rescan re-collects.
-                    let w128 = (16 / size) as usize;
-                    if width > w128 {
-                        for chunk in run.chunks(w128) {
-                            if chunk.len() < 2 {
-                                continue;
-                            }
-                            let cw = match preferred_width(chunk.len(), size as u64, ty, avx2) {
-                                Some(cw) if cw == chunk.len() => cw,
-                                _ => continue,
-                            };
-                            let store_idx: Vec<usize> = chunk.iter().map(|(_, i, ..)| *i).collect();
-                            let lane_ops: Vec<Operand> =
-                                chunk.iter().map(|(_, _, v, ..)| v.clone()).collect();
-                            candidates.push(SeedCandidate {
-                                store_idx,
-                                lane_ops,
-                                ty,
-                                anchor_ptr: chunk[0].3,
-                                width: cw,
-                                joint: None,
-                                value_sink: None,
-                            });
-                        }
-                    }
-                }
+    // current run; the earlier store stays scalar.  Run boundaries are
+    // indices into `sorted`, so there is no per-store `StreamEntry` clone.
+    let mut start = 0usize;
+    for i in 1..sorted.len() {
+        // checked: an offset delta that does not fit i64 cannot be the lane
+        // stride (debug builds would panic on overflow).
+        if sorted[i].0.checked_sub(sorted[i - 1].0) != Some(size) {
+            if i - start >= 2 {
+                emit_run(ty, &sorted[start..i], size, avx2, candidates);
             }
+            start = i;
         }
-        run.clear();
-    };
-    for entry in &sorted {
-        if let Some(last) = run.last() {
-            // checked: an offset delta that does not fit i64 cannot be the
-            // lane stride (debug builds would panic on overflow).
-            if entry.0.checked_sub(last.0) != Some(size) {
-                flush(&mut run, candidates);
-            }
-        }
-        run.push(entry.clone());
     }
-    flush(&mut run, candidates);
+    if sorted.len() - start >= 2 {
+        emit_run(ty, &sorted[start..], size, avx2, candidates);
+    }
 }
 
 /// Partition one object-tier stream into the site-tier streams the ORIGINAL
@@ -2558,7 +2610,8 @@ fn push_stream_candidates(
 /// base has NO distinct site tier: the old code built a byte-identical second
 /// stream, sorted it, split it, built a duplicate seed and then threw the
 /// duplicate away in the exact-dedup pass.  Returning an empty vector here is
-/// the measured fix — zero duplicate work, zero per-store clone.
+/// the measured fix — zero duplicate work and zero per-store clone in the
+/// single-web case.
 ///
 /// `StreamBase::Value(v)` roots always have exactly one raw base (`v` itself),
 /// so they never get a site tier either; that is the same behaviour as before,
@@ -2579,13 +2632,24 @@ fn site_subsets(entries: &[StreamEntry]) -> Vec<Vec<StreamEntry>> {
     // ONE pass builds the buckets: O(n) hashing, O(b) map lookups.  The
     // obvious `bases.map(|b| entries.filter(...))` form is O(n*b) and becomes
     // quadratic when PostVec unrolling materialises one address web per copy
-    // of a loop body.  Preserve first-appearance order of each bucket so the
-    // stable final sort sees the same tie order as the old two-map chain.
-    let mut buckets: FxHashMap<u32, Vec<StreamEntry>> = FxHashMap::default();
+    // of a loop body.  A `u32 -> bucket index` map plus a `Vec` of buckets
+    // preserves the FIRST-APPEARANCE order of distinct raw bases; returning
+    // `HashMap::into_values()` would iterate the hash table, not insertion
+    // order, and could reorder tied candidates on another build.
+    let mut buckets: Vec<Vec<StreamEntry>> = Vec::new();
+    let mut index: FxHashMap<u32, usize> = FxHashMap::default();
     for e in entries {
-        buckets.entry(e.4).or_default().push(e.clone());
+        let idx = match index.entry(e.4) {
+            Entry::Occupied(slot) => *slot.get(),
+            Entry::Vacant(slot) => {
+                let idx = buckets.len();
+                buckets.push(Vec::new());
+                *slot.insert(idx)
+            }
+        };
+        buckets[idx].push(e.clone());
     }
-    buckets.into_values().collect()
+    buckets
 }
 
 /// Collect store seeds: runs of stores on one address stream with
@@ -2667,7 +2731,7 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
         b.lane_ops
             .len()
             .cmp(&a.lane_ops.len())
-            .then(a.store_idx[0].cmp(&b.store_idx[0]))
+            .then_with(|| a.store_idx.first().cmp(&b.store_idx.first()))
     });
     candidates
 }
@@ -2682,11 +2746,14 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
 /// ≥32-byte run and `family_for` then rejected the candidate — those
 /// runs never vectorized at all until the family-aware fallback).
 fn preferred_width(len: usize, size: u64, ty: IrType, avx2: bool) -> Option<usize> {
+    if size == 0 {
+        return None;
+    }
     let w256 = (32 / size) as usize;
     let w128 = (16 / size) as usize;
-    if avx2 && len >= w256 && family_for(ty, w256).is_some() {
+    if w256 >= 2 && avx2 && len >= w256 && family_for(ty, w256).is_some() {
         Some(w256)
-    } else if len >= w128 && family_for(ty, w128).is_some() {
+    } else if w128 >= 2 && len >= w128 && family_for(ty, w128).is_some() {
         Some(w128)
     } else if size == 4 && len == 2 && family_for(ty, 2).is_some() {
         // HALF-WIDE dword pairs: two consecutive dword stores are one
@@ -8766,5 +8833,195 @@ mod tests {
             65,
             "one extra web must not lose or duplicate any store"
         );
+    }
+    // ── post-merge red-team: bounds, ownership, order and collisions ─────
+
+    #[test]
+    fn preferred_width_rejects_zero_and_oversized_strides_without_division_by_zero() {
+        assert_eq!(preferred_width(4, 0, IrType::U8, true), None);
+        for size in [17u64, 32, 64, u64::MAX] {
+            assert_eq!(
+                preferred_width(8, size, IrType::U8, true),
+                None,
+                "a stride wider than a 128-bit register has no family"
+            );
+        }
+        assert_eq!(preferred_width(4, 4, IrType::U32, false), Some(4));
+        assert_eq!(preferred_width(2, 4, IrType::U32, false), Some(2));
+    }
+
+    #[test]
+    fn push_stream_candidates_never_emits_duplicate_offsets_or_zero_width_runs() {
+        let external = FxHashSet::default();
+        let roots = SymbolRoots::default();
+        let steps = FxHashMap::default();
+        let mut f = IrFunction::new("dup".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let ctx = build_ctx(&f, 0, &external, Default::default(), &steps, false, &roots);
+        // Two stores at byte offset 8: the overwritten one must end its run.
+        let entries = vec![
+            stream_entry(0, 0, 1),
+            stream_entry(4, 1, 1),
+            stream_entry(8, 2, 1),
+            stream_entry(8, 3, 1),
+            stream_entry(12, 4, 1),
+            stream_entry(16, 5, 1),
+            stream_entry(20, 6, 1),
+        ];
+        let mut out = Vec::new();
+        with_isa_gate(|| {
+            push_stream_candidates(&ctx, IrType::U32, entries.clone(), true, true, &mut out)
+        });
+        assert_eq!(
+            out.len(),
+            1,
+            "the overwritten offset must not create a second run"
+        );
+        let seed = &out[0];
+        assert_eq!(seed.width, 4);
+        assert_eq!(seed.store_idx, vec![3, 4, 5, 6]);
+        assert_eq!(seed.lane_ops.len(), 4);
+        assert!(
+            !(seed.store_idx.contains(&2) && seed.store_idx.contains(&3)),
+            "two stores at one byte offset must never become two lanes"
+        );
+    }
+
+    #[test]
+    fn site_subsets_preserves_first_appearance_order_and_bucket_contents() {
+        let entries = vec![
+            stream_entry(0, 0, 9),
+            stream_entry(4, 1, 3),
+            stream_entry(8, 2, 9),
+            stream_entry(12, 3, 7),
+            stream_entry(16, 4, 3),
+        ];
+        let parts = site_subsets(&entries);
+        assert_eq!(parts.len(), 3);
+        let bases: Vec<u32> = parts.iter().map(|b| b[0].4).collect();
+        assert_eq!(
+            bases,
+            vec![9, 3, 7],
+            "distinct webs must keep first-appearance order"
+        );
+        assert_eq!(parts[0].iter().map(|e| e.1).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(parts[1].iter().map(|e| e.1).collect::<Vec<_>>(), vec![1, 4]);
+        assert_eq!(parts[2].iter().map(|e| e.1).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(parts.iter().map(Vec::len).sum::<usize>(), entries.len());
+    }
+
+    #[test]
+    fn eval_sym_addr_d_bounded_gep_depth_fails_closed_without_deep_recursion() {
+        let mut insts = vec![Instruction::GlobalAddr {
+            dest: Value(0),
+            name: "g".into(),
+        }];
+        for i in 1..=64u32 {
+            insts.push(Instruction::GetElementPtr {
+                dest: Value(i),
+                base: Value(i - 1),
+                offset: Operand::Const(IrConst::I64(4)),
+                ty: IrType::Ptr,
+            });
+        }
+        let mut f = IrFunction::new("deep_geps".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let roots = SymbolRoots::default();
+        let external = FxHashSet::default();
+        let steps = FxHashMap::default();
+        let ctx = seed_ctx(&f, &roots, &external, &steps);
+        let addr = eval_sym_addr(ctx.block, &ctx.def_pos, Value(64))
+            .expect("a bounded GEP chain must still classify");
+        assert_eq!(
+            addr.base,
+            Value(60),
+            "depth 4 must stop four GEPs from the leaf"
+        );
+        assert_eq!(addr.off, 16);
+        assert!(addr.var.is_none());
+        assert_eq!(addr.mult, 1);
+        let opaque = eval_sym_addr_d(ctx.block, &ctx.def_pos, Value(64), 0)
+            .expect("depth zero must fail closed, not recurse");
+        assert_eq!(opaque.base, Value(64));
+        assert_eq!(opaque.off, 0);
+    }
+
+    #[test]
+    fn dedup_seed_candidates_forced_hash_collisions_match_exact_reference() {
+        use super::joint::Tail;
+        let make = |group: usize| SeedCandidate {
+            store_idx: vec![group, group + 1, group + 2, group + 3],
+            lane_ops: vec![
+                match group % 4 {
+                    0 => Operand::Const(IrConst::I8(0)),
+                    1 => Operand::Const(IrConst::Zero),
+                    2 => Operand::Const(IrConst::F32(-0.0)),
+                    _ => Operand::Value(Value(group as u32)),
+                };
+                4
+            ],
+            ty: if group % 7 == 0 {
+                IrType::I32
+            } else {
+                IrType::U32
+            },
+            anchor_ptr: Value(group as u32 + 1),
+            width: if group % 11 == 0 { 2 } else { 4 },
+            joint: if group % 3 == 0 {
+                Some(Tail {
+                    alpha: (group % 4) as u8,
+                    four_inputs: group % 2 == 0,
+                })
+            } else {
+                None
+            },
+            value_sink: if group % 5 == 0 {
+                Some(Value(group as u32))
+            } else {
+                None
+            },
+        };
+        let mut input: Vec<SeedCandidate> = Vec::new();
+        for _round in 0..8 {
+            for group in 0..17 {
+                input.push(make(group));
+            }
+        }
+        let mut seen: FxHashSet<SeedKey> = FxHashSet::default();
+        let reference: Vec<SeedKey> = input
+            .iter()
+            .filter(|c| seen.insert(seed_dedup_key(c)))
+            .map(seed_dedup_key)
+            .collect();
+        assert_eq!(reference.len(), 17, "17 deliberately distinct identities");
+        // Force EVERY seed into one bucket: SeedReps::Many must compare all
+        // representatives exactly and preserve first-occurrence order.
+        let forced = dedup_seed_candidates_with(input.clone(), |_| 0);
+        assert_eq!(forced.len(), reference.len());
+        for (got, want) in forced.iter().zip(&reference) {
+            assert_eq!(&seed_dedup_key(got), want);
+        }
+        let normal = dedup_seed_candidates(input);
+        assert_eq!(normal.len(), reference.len());
+        for (got, want) in normal.iter().zip(&reference) {
+            assert_eq!(&seed_dedup_key(got), want);
+        }
+        // The len==2 exact-equality fast path must also work under a forced
+        // collision, without consulting the hash map at all.
+        let pair = dedup_seed_candidates_with(vec![make(1), make(1)], |_| 0);
+        assert_eq!(pair.len(), 1);
+        assert_eq!(seed_dedup_key(&pair[0]), seed_dedup_key(&make(1)));
     }
 }

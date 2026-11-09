@@ -273,13 +273,13 @@ fn leaves(ctx: &BlockCtx, o: &Operand, out: &mut Vec<Operand>, fuel: usize) -> O
     Some(())
 }
 
-pub(super) fn seed(ctx: &BlockCtx, run: &[StreamEntry]) -> Option<SeedCandidate> {
+pub(super) fn seed(ctx: &BlockCtx, run: &[&StreamEntry]) -> Option<SeedCandidate> {
     if run.len() != 4 || !x86_sse41_available_pub() {
         return None;
     }
     let sources: Vec<_> = run
         .iter()
-        .map(|(_, _, o, _, _)| wide_store_source(ctx, o))
+        .map(|r| wide_store_source(ctx, &r.2))
         .collect::<Option<_>>()?;
     let (lane_ops, ty, tail) = find_tail(ctx, &sources)?;
     Some(SeedCandidate {
