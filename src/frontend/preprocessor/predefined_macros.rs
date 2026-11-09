@@ -1704,8 +1704,26 @@ impl Preprocessor {
         // x86-64 tuple. Admit that tree only when its explicit 32-bit glibc
         // support marker exists; a pure 64-bit installation is not a fallback.
         let multilib = sysroot_candidate("/usr/include/x86_64-linux-gnu");
-        if multilib.join("gnu/stubs-32.h").is_file() {
-            self.system_include_paths.push(multilib);
+        let sysroot_multilib = multilib.join("gnu/stubs-32.h").is_file();
+        if sysroot_multilib {
+            self.system_include_paths.push(multilib.clone());
+        }
+        // A rootless biarch sysroot (scripts/ensure_i386_multilib_safe.sh) ships
+        // the 32-bit glibc stubs and crt/libgcc, but deliberately NOT the
+        // arch-independent `bits/*.h`: those come from the live amd64 libc6-dev
+        // and are word-size-selected by `bits/wordsize.h`. The wrapper recipe
+        // passes `-idirafter /usr/include/x86_64-linux-gnu`; the driver must do
+        // the same when LCCC_SYSROOT supplies the 32-bit marker, or <stdio.h>
+        // resolves from the host while every `bits/*` include fails. Admit the
+        // host tree only as a late fallback and only when it actually carries
+        // the libc headers; the sysroot's stubs-32 still wins for `gnu/stubs-*`.
+        if sysroot_multilib {
+            let host_multilib = std::path::Path::new("/usr/include/x86_64-linux-gnu");
+            if host_multilib.join("bits/libc-header-start.h").is_file()
+                && !self.system_include_paths.iter().any(|p| p == host_multilib)
+            {
+                self.system_include_paths.push(host_multilib.to_path_buf());
+            }
         }
     }
 
