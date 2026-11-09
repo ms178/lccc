@@ -648,14 +648,14 @@ Evidence: `/home/user/artifacts/redteam/induction_evidence.json` and
 | Static `loop_count` instructions | **16** | 17 | 19 | 73 (vectorized) |
 | 64-bit induction ops | **none** | `addq,cmpq,movq,shrq` | `movq` | `movq` |
 | Callgrind Ir refs, 1000 varied calls | **41,208,254** | 41,209,254 | 45,297,780 | 24,315,280 |
-| Wall-clock median, 7 runs pinned CPU 0 | 0.005333 s | 0.005301 s | 0.006330 s | 0.005375 s |
+| Wall-clock median, 7 runs pinned CPU 0 | 0.005091 s | 0.005049 s | 0.005882 s | 0.006165 s |
 | Memcheck errors | 0 | 0 | 0 | 0 |
 | Runtime checksum | `e05a0b25418af6d6` | same | same | same |
 
 The deterministic Callgrind delta is exactly 1,000 fewer references for 1,000
 calls: one prologue instruction per invocation, not one per loop iteration.
-Wall-clock is within run-to-run noise (PR median 0.005333 s vs main 0.005301
-s), so no dishonest wall-clock speedup is claimed.  GCC uses more references;
+Wall-clock is within run-to-run noise (PR median 0.005091 s vs main 0.005049
+s in the final remeasurement), so no dishonest wall-clock speedup is claimed.  GCC uses more references;
 Clang vectorizes the bitmap loop and uses fewer, so no broad compiler
 superiority is claimed.  The claim is narrower and measured: on this shape the
 range proof removes one instruction and one dynamic reference per call without
@@ -720,7 +720,8 @@ and saying exactly what was and was not proven.
 
 ### 13.5 Rebase and final hosted authority
 
-The branch is rebased onto the latest `origin/main` before delivery.  Hosted CI
+The branch is rebased onto `origin/main = cdd5def266cb1f7e59ecce3ceb92774659420d29`
+(HEAD `fb768895da9a8adea155be460d8974ae4144aa2c` after the rebase).  Hosted CI
 remains the accepting authority; the PR body records the final run ID and
 per-check verdict.  No production-ready claim is made until every required
 hosted check is green.
