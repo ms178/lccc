@@ -3730,6 +3730,7 @@ jobs:
           --lccc target/fastbuild/lccc --lccc target/fastbuild/lccc-i686 \
           --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
           --reference "$GCC16" --reference "$CLANG" --reference "$LCCC_ICX_BIN" \
+          --reference32 "$GCC16" --reference32 "$CLANG" \
           2>&1 | tee intel-evidence/pack-underflow.log
     - name: SV-03 conditional-load sink four-compiler execution proof
       env:

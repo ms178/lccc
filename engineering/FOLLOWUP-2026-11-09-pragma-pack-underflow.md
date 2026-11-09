@@ -18,8 +18,12 @@ underflows at file and block scope, suppression by a diagnostic pragma, layout
 after each transition, `-Werror=pragmas`, `-Wno-pragmas`, `-E`, and object
 compilation. It runs LCCC's four target executables; a hosted vendor lane also
 compiles the layout assertions with pinned GCC 16.2, Clang 23.1.5, and
-authenticated ICX 2026.2. Reference warning categories are not assumed
-identical. The fixture is a narrow layout witness, not exhaustive ABI proof.
+authenticated ICX 2026.2, plus GCC and Clang in i686 syntax-only mode.
+Reference warning categories are not assumed identical. The test additionally
+replaces the first unmatched pop with a reset in the fixture and requires
+LCCC to reject it; this models the old state transition but is not a mutated
+compiler binary. The fixture is a narrow layout witness, not exhaustive ABI
+proof.
 
 ## Evidence and limits
 

@@ -60,18 +60,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--lccc', action='append', default=[], help='LCCC target executable; repeat for each target')
     parser.add_argument('--reference', action='append', default=[], help='reference compiler; repeat')
+    parser.add_argument('--reference32', action='append', default=[], help='reference compiler with -m32; repeat')
     args = parser.parse_args()
-    if not args.lccc and not args.reference:
+    if not args.lccc and not args.reference and not args.reference32:
         parser.error('at least one compiler is required')
     with tempfile.TemporaryDirectory(prefix='lccc-pack-underflow-') as tmp:
         source = Path(tmp) / 'pack.c'
         source.write_text(SOURCE, encoding='utf-8')
-        for compiler in args.reference:
+        for compiler, flags in ([(compiler, []) for compiler in args.reference] +
+                                [(compiler, ['-m32']) for compiler in args.reference32]):
             # This is a layout/stack comparison, not a diagnostic parity claim.
-            command = [compiler, '-w', '-fsyntax-only', str(source)]
+            command = [compiler, *flags, '-w', '-fsyntax-only', str(source)]
             result = run(command)
             require(result[0] == 0, 'reference layout', command, result)
-            print(f'PASS reference layout: {compiler}', flush=True)
+            print(f'PASS reference layout: {compiler} {flags}', flush=True)
+        # Replace the first unmatched pop with a reset. This models the old
+        # state transition at the fixture boundary, not a mutated compiler.
+        mutant = Path(tmp) / 'mutated.c'
+        mutant.write_text(SOURCE.replace('#pragma pack(pop)', '#pragma pack(0)', 1), encoding='utf-8')
         for compiler in args.lccc:
             def check(flags, expected, count=None, preprocess=False):
                 command = [compiler, *flags, str(source)]
@@ -88,7 +94,10 @@ def main():
             check(['-fsyntax-only', '-Werror', '-Wno-pragmas'], True, 0)
             check(['-E', '-Werror=pragmas'], True, 0, preprocess=True)
             check(['-c', '-Wno-pragmas', '-o', str(Path(tmp) / 'pack.o')], True, 0)
-            print(f'PASS LCCC layout and diagnostics: {compiler}', flush=True)
+            command = [compiler, '-fsyntax-only', '-Wno-pragmas', str(mutant)]
+            result = run(command)
+            require(result[0] != 0, 'reset-on-underflow fixture mutation was not detected', command, result)
+            print(f'PASS LCCC layout, diagnostics and fixture mutation: {compiler}', flush=True)
 
 
 if __name__ == '__main__':
