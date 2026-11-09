@@ -35,7 +35,12 @@ impl X86Codegen {
             Operand::Const(_) => None,
         };
         if let Operand::Value(v) = arg {
-            if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+            // Width-narrowed claim: `vec_live_regs` is polyglot (an `%xmmN`
+            // claim from a 128-bit producer, `%ymmN` from a 256-bit one), so
+            // this EVEX.512 consumer must only accept a `%zmm` claim. A raw
+            // read here would splice `%xmm3` into a `zmm0` operand -- an
+            // illegal mixed encoding the emitter never checks for.
+            if let Some(held) = self.state.vec_live_zmm(v.0) {
                 if held != zmm {
                     self.state
                         .emit_fmt(format_args!("    vmovdqa64 %{}, %{}", held, zmm));
@@ -100,7 +105,14 @@ impl X86Codegen {
     fn evex_arg_mem(&mut self, arg: &Operand) -> Option<String> {
         match arg {
             Operand::Value(v) => {
-                if self.state.vec_live_regs.contains_key(&v.0) {
+                // Width-filtered presence: a claim is a promise about the
+                // BANK, valid at every width, so any spelling here means
+                // "already in a register" -- going through the accessors keeps
+                // every claim read in one idiom.
+                if self.state.vec_live_xmm(v.0).is_some()
+                    || self.state.vec_live_ymm(v.0).is_some()
+                    || self.state.vec_live_zmm(v.0).is_some()
+                {
                     return None;
                 }
                 // LAZY-FLUSH SOUNDNESS: a deferred result for this value has
@@ -149,7 +161,10 @@ impl X86Codegen {
         let Operand::Value(v) = arg else {
             return None;
         };
-        if self.state.vec_live_regs.contains_key(&v.0) {
+        if self.state.vec_live_xmm(v.0).is_some()
+            || self.state.vec_live_ymm(v.0).is_some()
+            || self.state.vec_live_zmm(v.0).is_some()
+        {
             return None;
         }
         // A deferred store or memfold is an UNCOMMITTED write whose flush
@@ -2298,7 +2313,14 @@ impl X86Codegen {
                 } else {
                     "vbroadcastsd"
                 };
-                if let Some(&held) = self.state.vec_live_regs.get(&simd_value_id(&args[0])) {
+                // Width-filtered claim, exactly like `avx_load_arg_to`: this
+                // emitter writes `%ymm0` with a VEX.256 broadcast, so the
+                // source must be a `%ymm` register. `vec_live_regs` also
+                // carries `%xmm` claims (128-bit producers) and `%zmm` claims
+                // (EVEX producers), neither of which is a legal VEX.256
+                // source -- a raw read would splice the wrong bank width into
+                // the operand and the emitter does no width check.
+                if let Some(held) = self.state.vec_live_ymm(simd_value_id(&args[0])) {
                     self.state
                         .emit_fmt(format_args!("    {} %{}, %ymm0", inst, held));
                 } else if let Some(m) = self.evex_arg_mem(&args[0]) {
@@ -3128,5 +3150,140 @@ mod simd_operand_role_and_upper_state_tests {
             cg.state.vec_claim_live_reg(0, wide);
             assert!(cg.state.dirty_upper_ymm, "{wide} must arm vzeroupper");
         }
+    }
+
+    /// A slot-homed vector value: the shape `vec_arg_mem` folds and every
+    /// loader can reload from. `-32(%rbp)` is the same fixture the fold tests
+    /// use, so these cases drive the real emitter rather than a stub.
+    ///
+    /// `value_use_counts` must cover BOTH ids: the dispatcher treats a
+    /// destination with zero uses as dead code and emits nothing, which would
+    /// make every assertion below vacuous (an empty `out`), and the loader
+    /// needs a materialised operand. Ids 0 (source) and 9 (destination) are
+    /// the ones these tests use.
+    fn slot_vector(cg: &mut X86Codegen, id: u32) {
+        cg.state.value_locations.insert(id, StackSlot(-32));
+        cg.state.vector_values.insert(id);
+        cg.state.value_use_counts = vec![1; 10];
+    }
+
+    /// `vec_live_regs` is WIDTH-POLYGLOT: one map, three spellings (`%xmmN`
+    /// from a 128-bit producer, `%ymmN` from 256, `%zmmN` from EVEX). The EVEX
+    /// loader writes `%zmm{target}`, so it may only consume a `%zmm` claim. A
+    /// raw read here spliced `%xmm3`/`%ymm3` into a `zmm0` operand:
+    /// `vmovdqa64 %xmm3, %zmm0` mixes widths, which is an illegal encoding the
+    /// assembler rejects outright -- a valid program failed to build.
+    ///
+    /// The `%zmm` case is the control: the filtered path must still take the
+    /// register and still move it aside, or the de-facto fix would be "never
+    /// reuse a claim here" and every EVEX operand would pay a reload.
+    #[test]
+    fn evex_load_arg_to_ignores_claims_of_the_wrong_width() {
+        for wrong in ["xmm3", "ymm3"] {
+            let mut cg = X86Codegen::new();
+            slot_vector(&mut cg, 7);
+            cg.state.vec_live_regs.insert(7, wrong);
+            cg.evex_load_arg_to(&Operand::Value(Value(7)), "zmm0");
+            let out = cg.state.out.buf.clone();
+            assert!(
+                !out.contains("vmovdqa64"),
+                "a {wrong} claim must not be moved into a zmm operand: the \
+                 widths would not match: {out}"
+            );
+            assert!(
+                out.contains("vmovdqu64 -32(%rbp), %zmm0"),
+                "the width-matched slot load must run instead: {out}"
+            );
+        }
+        // Control: a `%zmm` claim takes the register path, with no reload.
+        let mut cg = X86Codegen::new();
+        slot_vector(&mut cg, 7);
+        cg.state.vec_live_regs.insert(7, "zmm3");
+        cg.evex_load_arg_to(&Operand::Value(Value(7)), "zmm0");
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("vmovdqa64 %zmm3, %zmm0"),
+            "a width-matched claim must still be reused: {out}"
+        );
+        assert!(
+            !out.contains("vmovdqu64"),
+            "and must not be reloaded: {out}"
+        );
+    }
+
+    /// The VEX.256 broadcast reads a `%ymm` source operand. `vec_live_regs`
+    /// also carries `%xmm` (128-bit producers) and `%zmm` (EVEX producers)
+    /// claims, neither legal in a VEX.256 source: `vbroadcastss %xmm3, %ymm0`
+    /// mixes widths and `%zmm3` is not encodable in a VEX instruction at all.
+    /// The loader read the raw map, so a value homed at 128 bits by an earlier
+    /// `VecAddF32x4` turned a valid broadcast into an assembler error.
+    ///
+    /// The control pins the other direction: a `%ymm` claim must still be
+    /// consumed, or the de-facto fix would be "never use the claim here" and
+    /// every broadcast after a 256-bit producer would reload.
+    #[test]
+    fn avx_broadcast_ignores_claims_of_the_wrong_width() {
+        for wrong in ["xmm3", "zmm3"] {
+            let mut cg = X86Codegen::new();
+            slot_vector(&mut cg, 0);
+            // The result needs a home of its own: `avx_store_dest` resolves the
+            // destination's slot or register, and asserts (debug builds) when
+            // it has neither. Value 9 is the destination in this fixture.
+            slot_vector(&mut cg, 9);
+            cg.state.vec_live_regs.insert(0, wrong);
+            let handled = cg.emit_simd_op(
+                &Some(Value(9)),
+                &IntrinsicOp::Vbroadcastss,
+                &Some(Value(9)),
+                &[Operand::Value(Value(0))],
+            );
+            let out = cg.state.out.buf.clone();
+            assert!(handled, "the Vbroadcastss arm must handle the op");
+            assert!(
+                !out.contains(&format!("vbroadcastss %{wrong}, %ymm0")),
+                "a {wrong} claim must not feed a VEX.256 source operand: {out}"
+            );
+            // Either legitimate fallback is acceptable, and the emitter picks
+            // the better one: the MEMORY FOLD (`vbroadcastss -32(%rbp), %ymm0`,
+            // one instruction, no staging) when the value is slot-homed, or the
+            // staging load (`%xmm1`) when it is not. Pinning only the wrong
+            // register is the invariant; pinning which fallback runs would
+            // forbid an improvement.
+            assert!(
+                out.contains("vbroadcastss -32(%rbp), %ymm0")
+                    || out.contains("vbroadcastss %xmm1, %ymm0"),
+                "a wrong-width claim must fall back to the slot (fold or \
+                 staging load): {out}"
+            );
+        }
+        // Control: an `%ymm` claim is exactly the right width and is used.
+        let mut cg = X86Codegen::new();
+        slot_vector(&mut cg, 0);
+        slot_vector(&mut cg, 9);
+        cg.state.vec_live_regs.insert(0, "ymm3");
+        let handled = cg.emit_simd_op(
+            &Some(Value(9)),
+            &IntrinsicOp::Vbroadcastss,
+            &Some(Value(9)),
+            &[Operand::Value(Value(0))],
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(handled, "the Vbroadcastss arm must handle the op");
+        // The claim is VALID here, so the arm may use it -- and it does when
+        // that is the cheapest form. What must not happen is a REGISTER COPY:
+        // with the fold available (`vbroadcastss mem, %ymm0`) moving `%ymm3`
+        // into `%ymm0` first would be a wasted instruction. Assert the
+        // instruction count, not which of the two optimal spellings wins, so a
+        // better emitter is never regressed into a test failure.
+        assert!(
+            out.contains("vbroadcastss %ymm3, %ymm0")
+                || out.contains("vbroadcastss -32(%rbp), %ymm0"),
+            "a width-matched claim must reach the broadcast without a register \
+             copy: {out}"
+        );
+        assert!(
+            !out.contains("vmovdqa"),
+            "no staging copy may be emitted when the value has a home: {out}"
+        );
     }
 }

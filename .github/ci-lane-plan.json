@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 535.16,
+      "predicted_gate_seconds": 537.88,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -370,6 +370,14 @@
         {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_copy_alias_sizes.sh"
+        },
+        {
+          "measured_s": 1.36,
+          "name": "python3 scripts/check_vec_store_contracts.py --self-test"
+        },
+        {
+          "measured_s": 1.36,
+          "name": "python3 scripts/check_vec_store_contracts.py"
         }
       ]
     },
@@ -1906,8 +1914,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
-      "measured_seconds_total": 1065.07,
-      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s)"
+      "measured_seconds_total": 1067.79,
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s); vec-store-contracts and its self-test measured locally as worst-of-5 (1.36 s each; static scan, no compiler)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",

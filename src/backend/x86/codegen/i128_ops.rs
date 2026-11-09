@@ -389,15 +389,39 @@ impl X86Codegen {
             // __fixunstfti (i128 result in %rdx:%rax).
             match src {
                 Operand::Value(v) => {
-                    if let Some(slot) = self.state.get_slot(v.0) {
-                        self.state
-                            .out
-                            .emit_instr_rbp_reg("    movdqu", slot.0, "xmm0");
-                    } else if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+                    // LAZY-FLUSH SOUNDNESS (the `vec_arg_mem` / `evex_arg_mem`
+                    // discipline). A deferred vector store means this value's
+                    // slot has NOT been written yet, so the slot load below
+                    // would read uninitialised stack. Commit the store first:
+                    // the slot then holds the value and the load stays the
+                    // cheapest form (`movdqu`), which is why this commits
+                    // rather than taking the register path — an F128 value can
+                    // be the deferred result without any claim (banks 0/1 are
+                    // unclaimable), so refusing to fold would reload from the
+                    // same unwritten slot.
+                    //
+                    // The value test is required: an unrelated deferred store
+                    // ("always flush") would delete the deferral win on every
+                    // following conversion.
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.flush_pending_vec_store_impl();
+                    }
+                    // Registers before slots, as everywhere else: the claim
+                    // says where the 16 bytes ARE, and a claim is recorded only
+                    // after a real write of `v` into that bank. Read through
+                    // `vec_live_xmm` rather than the raw map — the map is
+                    // width-polyglot and `movdqa %ymmN, %xmm0` /
+                    // `movdqa %zmmN, %xmm0` are illegal mixed-width encodings
+                    // that the assembler rejects outright.
+                    if let Some(held) = self.state.vec_live_xmm(v.0) {
                         if held != "xmm0" {
                             self.state
                                 .emit_fmt(format_args!("    movdqa %{}, %xmm0", held));
                         }
+                    } else if let Some(slot) = self.state.get_slot(v.0) {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movdqu", slot.0, "xmm0");
                     } else {
                         self.operand_to_reg(src, "rax");
                         self.state.emit("    movdqu (%rax), %xmm0");
@@ -537,5 +561,116 @@ impl X86Codegen {
     pub(super) fn emit_i128_not_impl(&mut self) {
         self.state.emit("    notq %rax");
         self.state.emit("    notq %rdx");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LAW E at the F128 boundary: a DEFERRED vector store means the value's
+    /// slot has not been written, so a slot-first load reads uninitialised
+    /// stack and `__fixtfti` converts garbage.
+    ///
+    /// The F128 value here is the deferred one and carries NO claim — that is
+    /// the reachable shape, not a contrived one: `vec_claim_live_reg` refuses
+    /// the reserved scratch pair, so a value left in `%xmm0` by a 128-bit
+    /// producer is described only by `pending_vec_store`. The three asserts
+    /// are ordered as the contract: the store must be committed FIRST, into
+    /// the value's own slot, and only then may the load read it.
+    #[test]
+    fn f128_conversion_commits_a_deferred_store_before_reading_the_slot() {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(3, StackSlot(-48));
+        cg.state.vector128_values.insert(3);
+        cg.state.pending_vec_store = Some((3, "xmm0", false));
+        cg.emit_float_to_i128_call_impl(&Operand::Value(Value(3)), true, IrType::F128);
+
+        let out = cg.state.out.buf.clone();
+        let store = out
+            .find("movdqu %xmm0, -48(%rbp)")
+            .or_else(|| out.find("movups %xmm0, -48(%rbp)"))
+            .unwrap_or_else(|| {
+                panic!("the deferred F128 store must be committed to its slot: {out}")
+            });
+        let load = out
+            .find("movdqu -48(%rbp), %xmm0")
+            .or_else(|| out.find("movups -48(%rbp), %xmm0"))
+            .unwrap_or_else(|| {
+                panic!("the value must be loaded into %xmm0 for the libcall: {out}")
+            });
+        assert!(
+            store < load,
+            "the commit must precede the load, or the load reads uninitialised \
+             stack: {out}"
+        );
+        assert!(
+            cg.state.pending_vec_store.is_none(),
+            "the deferral must be consumed, not merely found: {out}"
+        );
+        assert!(
+            out.contains("call __fixtfti@PLT"),
+            "the libcall must still be emitted: {out}"
+        );
+    }
+
+    /// The commit is VALUE-SPECIFIC: an unrelated deferral must survive, or
+    /// the deferred-store optimisation collapses to \"always flush\" and every
+    /// conversion after a deferred producer pays a store it does not need.
+    #[test]
+    fn f128_conversion_leaves_an_unrelated_deferred_store_alone() {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(3, StackSlot(-48));
+        cg.state.vector128_values.insert(3);
+        cg.state.pending_vec_store = Some((7, "xmm0", false));
+        cg.emit_float_to_i128_call_impl(&Operand::Value(Value(3)), true, IrType::F128);
+        assert_eq!(
+            cg.state.pending_vec_store,
+            Some((7, "xmm0", false)),
+            "an unrelated value's deferral must not be flushed"
+        );
+    }
+
+    /// Registers before slots, and the claim must be WIDTH-FILTERED. The map
+    /// is polyglot (`%xmmN` / `%ymmN` / `%zmmN`), and this consumer emits
+    /// `movdqa %held, %xmm0`, which is an illegal mixed-width encoding for a
+    /// `%ymm`/`%zmm` name. A width-mismatched claim therefore falls back to
+    /// the (valid, now committed) slot instead of failing to assemble.
+    #[test]
+    fn f128_conversion_uses_only_width_matched_claims() {
+        // A `%xmm` claim wins over the slot, and needs no move when it is
+        // already `%xmm0`.
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(3, StackSlot(-48));
+        cg.state.vector128_values.insert(3);
+        cg.state.vec_live_regs.insert(3, "xmm5");
+        cg.emit_float_to_i128_call_impl(&Operand::Value(Value(3)), true, IrType::F128);
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("movdqa %xmm5, %xmm0"),
+            "a width-matched claim must be moved in: {out}"
+        );
+        assert!(
+            !out.contains("movdqu -48(%rbp)"),
+            "and the slot must not be read as well: {out}"
+        );
+
+        // A claim at the wrong width is reported absent: the slot load runs.
+        for wrong in ["ymm5", "zmm5"] {
+            let mut cg = X86Codegen::new();
+            cg.state.value_locations.insert(3, StackSlot(-48));
+            cg.state.vector128_values.insert(3);
+            cg.state.vec_live_regs.insert(3, wrong);
+            cg.emit_float_to_i128_call_impl(&Operand::Value(Value(3)), true, IrType::F128);
+            let out = cg.state.out.buf.clone();
+            assert!(
+                !out.contains("movdqa %"),
+                "a {wrong} claim must not be spliced into an xmm operand: {out}"
+            );
+            assert!(
+                out.contains("movdqu -48(%rbp), %xmm0"),
+                "the slot load must run instead: {out}"
+            );
+        }
     }
 }
