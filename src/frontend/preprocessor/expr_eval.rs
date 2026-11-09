@@ -491,6 +491,17 @@ impl Preprocessor {
         }
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag(format!("missing '(' after '{op}'"), diag_line);
+            // GCC absorbs a following identifier operand in this recovery
+            // (measured: `__has_feature tls` -> `0`, not `0tls`).
+            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+                *i += 1;
+            }
+            if *i < len && is_ident_start_byte(bytes[*i]) {
+                *i += 1;
+                while *i < len && is_ident_cont_byte(bytes[*i]) {
+                    *i += 1;
+                }
+            }
             return "0";
         }
         *i += 1;

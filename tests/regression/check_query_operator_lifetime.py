@@ -190,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
             ("__has_attribute packed", "missing '(' after '__has_attribute'"),
             ("__has_c_attribute()", "macro '__has_attribute' requires an identifier"),
             ("__has_c_attribute(deprecated fallback)", "missing ')' after '__has_attribute'"),
+            ("__has_feature tls", "missing '(' after '__has_feature'"),
+            ("__has_extension tls", "missing '(' after '__has_extension'"),
         ]
         for expr, msg in malformed:
             for ctx, text in [
