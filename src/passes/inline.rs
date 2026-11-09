@@ -206,6 +206,53 @@ const ALWAYS_INLINE_GUARD_BLOCKS: usize = 4_096;
 /// unmetered, and an adversarial diamond DAG could otherwise multiply.
 const PHASE0_CALLER_GUARD_INSTRUCTIONS: usize = 262_144;
 
+/// Structural inlining limit: a callee whose control-flow graph is not
+/// justified by its straight-line work.
+///
+/// The kernel's fortify wrappers (`sized_strscpy` and the whole
+/// `__CHECK_OBJECT_SIZE` family) are macro-expanded against a constellation of
+/// `__builtin_constant_p` guards. The dead arms collapse to blocks that hold
+/// no instructions, so the body reaches 78 blocks over 49 instructions. That
+/// body is fine out of line and ruinous in line: `init/do_mounts.c` clones it
+/// into an already-large caller until the build is OOM-killed at `-O2`/`-O3`.
+///
+/// Two limits therefore bound the SHAPE of a body this pass will clone:
+///
+/// * `block_count > inst_count` — control flow that carries no code. A hand
+///   written function gives every block at least one instruction, so this
+///   fires only on conditional-compilation collapse.
+/// * `block_count > MAX_STRUCTURAL_INLINE_BLOCKS` — an absolute ceiling that
+///   keeps the quadratic site-scans bounded even for a dense but enormous
+///   body. It is far above anything the profitability economics would accept
+///   anyway (`MAX_SMALL_INLINE_BLOCKS` is the small-body budget), so it is a
+///   backstop, not a policy knob.
+///
+/// SOUNDNESS: neither limit may ever block a body whose call MUST disappear.
+/// `extern inline __gnu_inline__ __always_inline__` definitions have no
+/// out-of-line copy (see `run_always_inline_only`), so skipping one converts
+/// a mandatory inline into an undefined-symbol link error. A gnu_inline
+/// definition is therefore always admitted; everything else — including a
+/// plain `always_inline` whose body the linker can still supply — falls back
+/// to the call.
+const MAX_STRUCTURAL_INLINE_BLOCKS: usize = 256;
+
+/// The single predicate shared by the selectors and by Phase 0's mandatory
+/// drain. They must agree: a drain that keeps picking a site the selector
+/// refuses spins until its work counter expires, and a selector that admits a
+/// site the drain skips leaves the call behind.
+fn should_skip_complex_callee(callee: &CalleeData) -> bool {
+    // Never refuse a body that has no out-of-line copy.
+    if callee.is_gnu_inline_def {
+        return false;
+    }
+    let block_count = callee.blocks.len();
+    if block_count > MAX_STRUCTURAL_INLINE_BLOCKS {
+        return true;
+    }
+    let inst_count: usize = callee.blocks.iter().map(|b| b.instructions.len()).sum();
+    block_count > inst_count
+}
+
 /// A callee whose inlining cannot grow a recursive caller's frame: one block,
 /// at most `MAX_SMALL_INLINE_INSTRUCTIONS`, no stack object (`Alloca`,
 /// `DynAlloca`, non-promotable aggregate bytes) and no call of its own. It
@@ -998,6 +1045,11 @@ fn select_inline_site(
         if callee_data.is_recursive && !callee_data.is_always_inline {
             continue;
         }
+        // Block-density guard: skip macro-generated wrappers with more blocks
+        // than instructions (e.g., kernel sized_strscpy: 78 blocks, 49 insts).
+        if should_skip_complex_callee(callee_data) {
+            continue;
+        }
         let callee_inst_count: usize = callee_data
             .blocks
             .iter()
@@ -1209,6 +1261,11 @@ fn select_inline_site(
             continue;
         }
         if callee_data.is_recursive && !callee_data.is_always_inline {
+            continue;
+        }
+        // Block-density guard: skip macro-generated wrappers with more blocks
+        // than instructions (e.g., kernel sized_strscpy: 78 blocks, 49 insts).
+        if should_skip_complex_callee(callee_data) {
             continue;
         }
         // For recursive callers, skip non-tiny, non-always_inline callees
@@ -1738,10 +1795,15 @@ fn inline_run_with(
                 &skip_list,
                 caller_has_section,
             );
+            // A mandatory site is an `always_inline` call whose body this
+            // pass will actually clone. Folding the shape limit in here (not
+            // into the two `.find`/`.filter` predicates below) is what keeps
+            // the drain terminating: the site that cannot be cloned is never
+            // selected, so `phase0_budget` is not burned on it.
             let is_mandatory = |s: &InlineCallSite| {
                 callee_map
                     .get(&s.callee_name)
-                    .is_some_and(|d| d.is_always_inline)
+                    .is_some_and(|d| d.is_always_inline && !should_skip_complex_callee(d))
             };
             // Original-label sites first; clone-born sites only once the
             // last original is gone.  Splits preserve the continuation's
@@ -2307,6 +2369,11 @@ fn inline_run_with(
                 for site in &call_sites {
                     let callee_data = &callee_map[&site.callee_name];
                     if !callee_data.is_always_inline {
+                        continue;
+                    }
+                    // Block-density guard: skip macro-generated wrappers with
+                    // more blocks than instructions (e.g., kernel sized_strscpy).
+                    if should_skip_complex_callee(callee_data) {
                         continue;
                     }
                     let callee_inst_count: usize = callee_data
@@ -8504,6 +8571,15 @@ mod phase0_drain_tests {
     /// under the shared budget.  inline_call_site now lets the merge block
     /// KEEP the split block's label whenever that label is private, so the
     /// contract site stays entry-class for the whole drain.
+    ///
+    /// `fortify_like` is shaped like a REAL fortify wrapper: its entry block
+    /// carries the fold that produces the value it returns, so the body has at
+    /// least one instruction per block and the structural inlining limit does
+    /// not apply to it. An instruction-free body with branches is precisely
+    /// the macro-collapse shape that limit exists to refuse (see
+    /// `structural_shape_limits_refuse_collapsed_wrappers_but_never_gnu_inline`),
+    /// so a fixture with no code would be testing a body this pass now
+    /// (correctly) declines to clone.
     #[test]
     fn phase0_survives_contract_site_after_same_block_dispatcher_split() {
         let mut replicator = IrFunction::new("replicator".to_string(), IrType::Void, vec![], false);
@@ -8596,13 +8672,20 @@ mod phase0_drain_tests {
     #[test]
     fn label_preserving_split_keeps_label_and_retargets_returns() {
         // Callee with TWO return paths => cloned return blocks with
-        // Branch(merge_block_id) edges.
+        // Branch(merge_block_id) edges. Each block carries the value it
+        // returns, so this is an ordinary body (one instruction per block)
+        // rather than the instruction-free macro-collapse shape that the
+        // structural inlining limit — correctly — refuses to clone.
         let mut two_way = IrFunction::new("two_way".to_string(), IrType::I32, vec![], false);
         two_way.is_static = true;
         two_way.is_always_inline = true;
+        two_way.next_value_id = 10;
         two_way.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![],
+            instructions: vec![Instruction::Copy {
+                dest: Value(7),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
             terminator: Terminator::CondBranch {
                 cond: Operand::Const(IrConst::I32(1)),
                 true_label: BlockId(1),
@@ -8614,8 +8697,11 @@ mod phase0_drain_tests {
         for lbl in [1u32, 2u32] {
             two_way.blocks.push(BasicBlock {
                 label: BlockId(lbl),
-                instructions: vec![],
-                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(7)))),
+                instructions: vec![Instruction::Copy {
+                    dest: Value(8),
+                    src: Operand::Const(IrConst::I32(7)),
+                }],
+                terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
                 source_spans: Vec::new(),
                 source_inline_ids: Vec::new(),
             });
@@ -9274,6 +9360,128 @@ mod feature_switch_tests {
     fn run(mut module: IrModule, features: InlineFeatures) -> IrModule {
         inline_run_with(&mut module, false, false, features);
         module
+    }
+
+    /// `per_block` copies in each of `blocks` blocks, terminated by a return.
+    ///
+    /// The linkage shape is a parameter because it changes which size gates
+    /// apply BEFORE the structural limit is consulted: a plain `static` body is
+    /// bounded by the small/medium windows, a `static inline` body by the
+    /// relaxed ones, and an `always_inline` body not at all (only the 4096-block
+    /// sanity guard). Use `always_inline` when the block count itself is the
+    /// variable, so the measurement cannot be confounded by a size window.
+    fn fixture(
+        name: &str,
+        blocks: usize,
+        per_block: usize,
+        is_inline: bool,
+        is_always_inline: bool,
+    ) -> IrFunction {
+        let mut f = IrFunction::new(name.to_string(), IrType::Void, vec![], false);
+        f.is_static = true;
+        f.is_inline = is_inline;
+        f.is_always_inline = is_always_inline;
+        f.next_value_id = 2;
+        for label in 0..blocks as u32 {
+            let instructions = (0..per_block)
+                .map(|_| Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                })
+                .collect();
+            f.blocks.push(BasicBlock {
+                label: BlockId(label),
+                instructions,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            });
+        }
+        f
+    }
+
+    fn body(name: &str, blocks: usize, per_block: usize) -> IrFunction {
+        fixture(name, blocks, per_block, false, false)
+    }
+
+    fn always_body(name: &str, blocks: usize, per_block: usize) -> IrFunction {
+        fixture(name, blocks, per_block, false, true)
+    }
+
+    /// The structural inlining limit is a SHAPE test, not a size test, and it
+    /// must never be able to break a mandatory inline.
+    ///
+    /// * A macro-collapsed wrapper (more blocks than instructions — the
+    ///   kernel's `__CHECK_OBJECT_SIZE` family, 78 blocks over 49
+    ///   instructions) is refused: cloning it adds IR structure and no code,
+    ///   which is what OOM-killed `init/do_mounts.c`.
+    /// * A dense body of the same block count is NOT refused: the ratio, not
+    ///   the count, is the signal.
+    /// * A gnu_inline definition is NEVER refused, whatever its shape: it has
+    ///   no out-of-line copy, so a refused site is an undefined symbol at link
+    ///   time. This is the invariant that makes the limit safe to apply at
+    ///   every admission point.
+    #[test]
+    fn structural_shape_limits_refuse_collapsed_wrappers_but_never_gnu_inline() {
+        let module = IrModule::new();
+        let ctx = callee_context(&module);
+        let callee = |f: &IrFunction| {
+            callee_data_for(f, &module, &ctx).expect("fixture must be an admissible callee shape")
+        };
+
+        // `sized_strscpy`'s measured shape, scaled down to the size window so
+        // that the density limb is the only thing that can refuse it.
+        let collapsed = callee(&body("collapsed", 8, 0));
+        assert!(
+            !collapsed.exceeds_normal_limits,
+            "fixture is broken: the density limb must not ride on a size gate"
+        );
+        assert!(
+            should_skip_complex_callee(&collapsed),
+            "a body with more blocks than instructions must be refused"
+        );
+
+        // The control: identical block count, one instruction per block.
+        let dense = callee(&body("dense", 8, 8));
+        assert!(
+            !dense.exceeds_normal_limits,
+            "control must be admissible for the comparison to mean anything"
+        );
+        assert!(
+            !should_skip_complex_callee(&dense),
+            "a dense body is not a macro-collapsed wrapper"
+        );
+
+        // The absolute ceiling, on a body that is otherwise admissible and
+        // dense. `always_inline` is the only shape whose admission is not
+        // gated by a block-count window (it has the 4096-block sanity guard
+        // instead), so the block count is genuinely the only variable here.
+        let at_limit = callee(&always_body("at_limit", MAX_STRUCTURAL_INLINE_BLOCKS, 1));
+        assert!(
+            !should_skip_complex_callee(&at_limit),
+            "the ceiling is a strict upper bound"
+        );
+        let over = callee(&always_body("over", MAX_STRUCTURAL_INLINE_BLOCKS + 1, 1));
+        assert!(
+            should_skip_complex_callee(&over),
+            "the absolute block ceiling must still bind"
+        );
+
+        // SOUNDNESS: neither limb may refuse a body that has no out-of-line
+        // copy. A gnu_inline definition is mandatory at every call site, so
+        // skipping it leaves an undefined symbol at link time.
+        let mut gnu_over = over.clone();
+        gnu_over.is_gnu_inline_def = true;
+        assert!(
+            !should_skip_complex_callee(&gnu_over),
+            "the ceiling must never refuse a mandatory inline"
+        );
+        let mut gnu_collapsed = collapsed.clone();
+        gnu_collapsed.is_gnu_inline_def = true;
+        assert!(
+            !should_skip_complex_callee(&gnu_collapsed),
+            "the density limb must never refuse a mandatory inline"
+        );
     }
 
     /// Second-pass always_inline templates expose ordinary calls. `gen`
