@@ -1900,6 +1900,15 @@ gate "seg-conversion-parity" fast \
 
 gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
 
+# A vector stored to an over-aligned frame home and read straight back must
+# become a register copy: the reload puts a store-forwarding stall on the
+# loop-carried chain (measured -36.8% on vector_home_call_loop.c).
+gate "aligned-vector-reload" fast \
+    python3 tests/simd/check_aligned_vector_reload.py --lccc target/fastbuild/lccc
+
+gate "aligned-vector-reload-contracts" fast \
+    python3 tests/simd/test_check_aligned_vector_reload.py
+
 gate "kernel-tree-clear" fast bash tests/regression/check_kernel_tree_clear.sh
 # The shared mount-table helper and the chroot/kernel-tree root guards.
 gate "destructive-path-guards" fast bash tests/regression/check_destructive_guards.sh

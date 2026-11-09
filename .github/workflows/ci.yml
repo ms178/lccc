@@ -1868,6 +1868,10 @@ jobs:
       run: bash tests/regression/check_seg_copy_sweep.sh
     - name: Run chroot bind regression
       run: bash tests/regression/check_chroot_bind.sh
+    - name: Vector reloads of a just-stored aligned home must be register copies
+      run: python3 tests/simd/check_aligned_vector_reload.py --lccc target/fastbuild/lccc
+    - name: Verify the aligned-vector-reload ratchet contracts
+      run: python3 tests/simd/test_check_aligned_vector_reload.py
     needs:
     - build
   backend:

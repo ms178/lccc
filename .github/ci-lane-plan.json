@@ -1045,7 +1045,7 @@
     "codegen-b": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 403.36,
+      "predicted_gate_seconds": 405.31,
       "shards": 2,
       "steps": [
         {
@@ -1179,6 +1179,14 @@
         {
           "measured_s": 0.25,
           "name": "Run chroot bind regression"
+        },
+        {
+          "measured_s": 1.7,
+          "name": "Vector reloads of a just-stored aligned home must be register copies"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify the aligned-vector-reload ratchet contracts"
         }
       ]
     },
