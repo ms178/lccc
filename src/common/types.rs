@@ -1513,26 +1513,38 @@ impl StructLayoutBuilder {
         };
         // Unlike the packed attribute, pragma pack also caps explicit member
         // alignment, including when both forms of packing are present.
-        let field_align = pragma_pack.map_or(field_align, |cap| field_align.min(cap));
+        let field_align = if field.bit_width == Some(0) {
+            // GCC and Clang ignore both record/field packed attributes and
+            // pragma pack when choosing a zero-width bitfield boundary.
+            natural_align.max(field.alignment.unwrap_or(1))
+        } else {
+            pragma_pack.map_or(field_align, |cap| field_align.min(cap))
+        };
         let field_size = field.ty.size_ctx(ctx);
-        self.max_align = self.max_align.max(field_align);
-        self.user_align |= field_contributes_user_align(field, natural_align, ctx);
+        // AArch64 counts anonymous bitfields for aggregate alignment; the
+        // x86 and RISC-V ABIs do not. A zero-width AArch64 field retains its
+        // uncapped boundary alignment even inside a packed record.
+        if !field.name.is_empty() || field.bit_width.is_none() || target_elf_machine() == 183 {
+            self.max_align = self.max_align.max(field_align);
+            self.user_align |= field_contributes_user_align(field, natural_align, ctx);
+        }
         (field_align, field_size)
     }
 
     /// Handle zero-width bitfield: force alignment to next storage unit boundary.
     fn layout_zero_width_bitfield(&mut self, field_align: usize) {
-        if self.in_bitfield {
-            if self.is_packed_1 {
-                let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-                self.offset = align_up((total_bits as usize).div_ceil(8), 1);
-            } else {
-                self.offset = self.bf_unit_offset + self.bf_unit_size;
-            }
-        }
+        self.close_bitfield_run();
         self.offset = align_up(self.offset, field_align);
-        self.in_bitfield = false;
-        self.bf_bit_pos = 0;
+    }
+
+    /// Close a bitfield run at the next byte, not the end of its declared
+    /// storage unit: a following zero-width char field can require less padding.
+    fn close_bitfield_run(&mut self) {
+        if self.in_bitfield {
+            self.offset = self.bf_unit_offset + (self.bf_bit_pos as usize).div_ceil(8);
+            self.in_bitfield = false;
+            self.bf_bit_pos = 0;
+        }
     }
 
     /// Layout a bitfield with pack(1) — contiguous bit stream, may span storage units.
@@ -1544,9 +1556,8 @@ impl StructLayoutBuilder {
             self.bf_unit_size = field_size;
             self.in_bitfield = true;
         }
-        let total_bit_offset = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-        let storage_offset = (total_bit_offset / 8) as usize;
-        let bit_offset_in_storage = total_bit_offset % 8;
+        let storage_offset = self.bf_unit_offset + (self.bf_bit_pos / 8) as usize;
+        let bit_offset_in_storage = self.bf_bit_pos % 8;
 
         // Widen storage type if bitfield spans beyond declared type.
         let needed_bits = bit_offset_in_storage + bw;
@@ -1700,12 +1711,7 @@ impl StructLayoutBuilder {
 
     /// Layout a regular (non-bitfield) field.
     fn layout_regular_field(&mut self, field: &StructField, field_size: usize, field_align: usize) {
-        if self.in_bitfield {
-            let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-            self.offset = (total_bits as usize).div_ceil(8);
-            self.in_bitfield = false;
-        }
-
+        self.close_bitfield_run();
         self.offset = align_up(self.offset, field_align);
 
         // Reverse SSO: scalar members are stored byte-reversed. Mark every
@@ -1743,11 +1749,7 @@ impl StructLayoutBuilder {
 
     /// Finalize the layout: account for trailing bitfield and padding.
     fn finalize(mut self) -> StructLayout {
-        if self.in_bitfield {
-            let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-            self.offset = (total_bits as usize).div_ceil(8);
-        }
-
+        self.close_bitfield_run();
         let size = align_up(self.offset, self.max_align);
         StructLayout {
             is_complete: true,
@@ -1968,10 +1970,17 @@ impl StructLayout {
             if let Some(bw) = field.bit_width {
                 if bw == 0 {
                     b.layout_zero_width_bitfield(field_align);
-                } else if b.is_packed_1 || field.is_packed {
-                    b.layout_packed_bitfield(field, bw, field_size);
                 } else {
-                    b.layout_standard_bitfield(field, bw, field_size, field_align);
+                    if let Some(explicit) = field.alignment {
+                        b.close_bitfield_run();
+                        let placement = pragma_pack.map_or(explicit, |cap| explicit.min(cap));
+                        b.offset = align_up(b.offset, placement);
+                    }
+                    if b.is_packed_1 || field.is_packed {
+                        b.layout_packed_bitfield(field, bw, field_size);
+                    } else {
+                        b.layout_standard_bitfield(field, bw, field_size, field_align);
+                    }
                 }
             } else {
                 b.layout_regular_field(field, field_size, field_align);
@@ -2014,11 +2023,22 @@ impl StructLayout {
             } else {
                 natural_align
             };
-            let field_align = pragma_pack.map_or(field_align, |cap| field_align.min(cap));
+            let field_align = if field.bit_width == Some(0) {
+                natural_align.max(field.alignment.unwrap_or(1))
+            } else {
+                pragma_pack.map_or(field_align, |cap| field_align.min(cap))
+            };
             let field_size = field.ty.size_ctx(ctx);
-            max_align = max_align.max(field_align);
-            max_size = max_size.max(field_size);
-            user_align |= field_contributes_user_align(field, natural_align, ctx);
+            if !field.name.is_empty() || field.bit_width.is_none() || target_elf_machine() == 183 {
+                max_align = max_align.max(field_align);
+                user_align |= field_contributes_user_align(field, natural_align, ctx);
+            }
+            // A bitfield occupies only the bytes needed by its width; the
+            // enclosing union's alignment supplies any final tail padding.
+            let occupied = field
+                .bit_width
+                .map_or(field_size, |width| (width as usize).div_ceil(8));
+            max_size = max_size.max(occupied);
 
             // For union bitfield members, set bit_offset to 0 (all fields start at byte 0)
             // and propagate bit_width so extraction is performed on read.

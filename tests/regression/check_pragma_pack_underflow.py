@@ -95,6 +95,49 @@ _Static_assert(sizeof(union V) == 4 && _Alignof(union V) == 2, "packed pragma un
 int read_q(struct Q *p) { return p->x; }
 '''
 
+# Bitfield aggregate alignment and placement differ on AArch64; pragma
+# capping of explicitly aligned nonzero bitfields also differs between GCC
+# and Clang, so that particular dispute has its own GCC-only fixture below.
+BITFIELD_SOURCE = r'''struct PlainZero { char c; unsigned :0; char x; };
+struct __attribute__((packed)) PackedZero { char c; unsigned :0; char x; };
+struct AlignedZero { char c; unsigned :0 __attribute__((aligned(8))); char x; };
+struct ShortZero { char c; unsigned a:1; unsigned char :0; char x; };
+struct Unnamed { char c; unsigned :3; char x; };
+struct Explicit { char c; unsigned x:3 __attribute__((aligned(8))); char y; };
+struct SmallExplicit { char c; unsigned x:3 __attribute__((aligned(2))); char y; };
+struct __attribute__((packed)) PackedExplicit { char c; unsigned x:3 __attribute__((aligned(8))); char y; };
+#pragma pack(push, 1)
+struct PragmaZero { char c; unsigned :0; char x; };
+#pragma pack(pop)
+union EmptyBits { char c; unsigned :0; };
+union NarrowBits { char c; unsigned :3; };
+union __attribute__((packed)) NamedBits { char c; unsigned b:3; };
+#define FIELD(t, member, off) _Static_assert(__builtin_offsetof(struct t, member) == off, #t " offset")
+#define RECORD(t, size, align) _Static_assert(sizeof(struct t) == size && _Alignof(struct t) == align, #t " layout")
+FIELD(PlainZero, x, 4); FIELD(PackedZero, x, 4); FIELD(AlignedZero, x, 8);
+FIELD(ShortZero, x, 2); FIELD(Unnamed, x, 2); FIELD(PragmaZero, x, 4);
+FIELD(Explicit, y, 9); RECORD(Explicit, 16, 8);
+FIELD(SmallExplicit, y, 3); RECORD(SmallExplicit, 4, 4);
+FIELD(PackedExplicit, y, 9); RECORD(PackedExplicit, 16, 8);
+_Static_assert(sizeof(union NamedBits) == 1 && _Alignof(union NamedBits) == 1, "packed union");
+#ifdef __aarch64__
+RECORD(PlainZero, 8, 4); RECORD(PackedZero, 8, 4); RECORD(AlignedZero, 16, 8);
+RECORD(ShortZero, 4, 4); RECORD(Unnamed, 4, 4); RECORD(PragmaZero, 8, 4);
+_Static_assert(sizeof(union EmptyBits) == 4 && _Alignof(union EmptyBits) == 4, "AArch64 empty bits");
+_Static_assert(sizeof(union NarrowBits) == 4 && _Alignof(union NarrowBits) == 4, "AArch64 unnamed bits");
+#else
+RECORD(PlainZero, 5, 1); RECORD(PackedZero, 5, 1); RECORD(AlignedZero, 9, 1);
+RECORD(ShortZero, 4, 4); RECORD(Unnamed, 3, 1); RECORD(PragmaZero, 5, 1);
+_Static_assert(sizeof(union EmptyBits) == 1 && _Alignof(union EmptyBits) == 1, "empty bits");
+_Static_assert(sizeof(union NarrowBits) == 1 && _Alignof(union NarrowBits) == 1, "unnamed bits");
+#endif
+int use_bits(struct Explicit *p) { return p->x + p->y; }
+'''
+GCC_BITFIELD_SOURCE = r'''#pragma pack(2)
+struct S { char c; unsigned b:3 __attribute__((aligned(8))); char d; };
+_Static_assert(sizeof(struct S) == 4 && _Alignof(struct S) == 2 && __builtin_offsetof(struct S,d) == 3, "GCC pragma bitfield placement");
+'''
+
 MESSAGE = "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'"
 
 
@@ -123,6 +166,10 @@ def main():
         source.write_text(SOURCE, encoding='utf-8')
         operator = Path(tmp) / 'operator.c'
         operator.write_text(OPERATOR_SOURCE, encoding='utf-8')
+        bitfield = Path(tmp) / 'bitfield.c'
+        bitfield.write_text(BITFIELD_SOURCE, encoding='utf-8')
+        gcc_bitfield = Path(tmp) / 'gcc-bitfield.c'
+        gcc_bitfield.write_text(GCC_BITFIELD_SOURCE, encoding='utf-8')
         alignment = Path(tmp) / 'alignment.c'
         alignment.write_text(ALIGNMENT_SOURCE, encoding='utf-8')
         clang_placement = Path(tmp) / 'clang-placement.c'
@@ -130,12 +177,21 @@ def main():
         for compiler, flags in ([(compiler, []) for compiler in args.reference] +
                                 [(compiler, ['-m32']) for compiler in args.reference32]):
             # This is a layout/stack comparison, not a diagnostic parity claim.
-            for fixture in (source, operator, alignment):
+            for fixture in (source, operator, alignment, bitfield):
                 command = [compiler, *flags, '-w', '-fsyntax-only', str(fixture)]
                 result = run(command)
                 require(result[0] == 0, 'reference layout', command, result)
             print(f'PASS reference layout: {compiler} {flags}', flush=True)
+        for compiler, flags in ([(c, []) for c in args.reference if 'gcc' in Path(c).name] +
+                                [(c, ['-m32']) for c in args.reference32 if 'gcc' in Path(c).name]):
+            command = [compiler, *flags, '-w', '-fsyntax-only', str(gcc_bitfield)]
+            result = run(command)
+            require(result[0] == 0, 'GCC-specific pragma bitfield placement', command, result)
         if args.clang_placement:
+            for target in ('aarch64-linux-gnu', 'riscv64-linux-gnu'):
+                command = [args.clang_placement, '--target=' + target, '-w', '-fsyntax-only', str(bitfield)]
+                result = run(command)
+                require(result[0] == 0, 'cross-target Clang bitfield layout', command, result)
             command = [args.clang_placement, '-w', '-fsyntax-only', str(clang_placement)]
             result = run(command)
             require(result[0] == 0, 'Clang-specific operator placement', command, result)
@@ -166,6 +222,10 @@ def main():
             command = [compiler, '-c', '-Wno-pragmas', '-o', str(Path(tmp) / 'alignment.o'), str(alignment)]
             result = run(command)
             require(result[0] == 0, 'pragma and explicit alignment layout/codegen', command, result)
+            for fixture in (bitfield, gcc_bitfield):
+                command = [compiler, '-c', '-Wno-pragmas', '-o', str(Path(tmp) / 'bits.o'), str(fixture)]
+                result = run(command)
+                require(result[0] == 0, 'bitfield layout/codegen', command, result)
             command = [compiler, '-fsyntax-only', '-Werror', str(operator)]
             result = run(command)
             require(result[0] == 0, 'operator layout', command, result)
