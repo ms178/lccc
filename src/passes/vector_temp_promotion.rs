@@ -1587,6 +1587,8 @@ fn spill_home_may_be_clobbered(
         | Instruction::InlineAsm { .. }
         | Instruction::PgoCounterInc { .. }
         | Instruction::StackRestore { .. }
+        | Instruction::DynAlloca { .. }
+        | Instruction::SetStaticChain { .. }
         | Instruction::InitTrampoline { .. }
         | Instruction::NonlocalGotoSave { .. }
         | Instruction::NonlocalGoto { .. } => true,
@@ -6362,6 +6364,40 @@ mod tests {
             // write is inside the union interval ending at the final reader.
             assert_eq!(forward_vector_home_results(&mut func), expected);
         }
+    }
+
+    #[test]
+    fn relay_cannot_target_a_home_whose_defining_spill_is_retired() {
+        // Construct independent plans directly: the current planner already
+        // refuses a home with a second write, but pruning is a separate
+        // safety layer for future plan producers and must not rely on that
+        // incidental rejection. A retired spill's register readers ignore a
+        // relay's new memory write into the same home.
+        let spill = HomeForward {
+            block: 0,
+            producer: 3,
+            home: 2,
+            kind: HomeBypass::Spill,
+            value: Some(3),
+            arg_rewrites: vec![(4, 0)],
+            dead: vec![3],
+        };
+        let relay = HomeForward {
+            block: 0,
+            producer: 5,
+            home: 1,
+            kind: HomeBypass::Relay { destination: 2 },
+            value: None,
+            arg_rewrites: Vec::new(),
+            dead: vec![6, 7],
+        };
+        let mut defs = FxHashMap::default();
+        defs.insert(2, (0, 3));
+        defs.insert(3, (0, 2));
+        let kept = prune_conflicting_plans(vec![spill, relay], &defs);
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(kept[0].kind, HomeBypass::Spill));
+        assert_eq!(kept[0].home, 2);
     }
 
     #[test]
