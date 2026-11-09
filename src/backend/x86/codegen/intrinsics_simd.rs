@@ -3243,9 +3243,17 @@ mod simd_operand_role_and_upper_state_tests {
                 !out.contains(&format!("vbroadcastss %{wrong}, %ymm0")),
                 "a {wrong} claim must not feed a VEX.256 source operand: {out}"
             );
+            // Either legitimate fallback is acceptable, and the emitter picks
+            // the better one: the MEMORY FOLD (`vbroadcastss -32(%rbp), %ymm0`,
+            // one instruction, no staging) when the value is slot-homed, or the
+            // staging load (`%xmm1`) when it is not. Pinning only the wrong
+            // register is the invariant; pinning which fallback runs would
+            // forbid an improvement.
             assert!(
-                out.contains("vbroadcastss %xmm1, %ymm0"),
-                "the ordinary staging load must be used instead: {out}"
+                out.contains("vbroadcastss -32(%rbp), %ymm0")
+                    || out.contains("vbroadcastss %xmm1, %ymm0"),
+                "a wrong-width claim must fall back to the slot (fold or \
+                 staging load): {out}"
             );
         }
         // Control: an `%ymm` claim is exactly the right width and is used.
