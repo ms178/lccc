@@ -416,7 +416,7 @@ including `scripts/check_vec_store_contracts.py --self-test` and its normal
 run, and adds the PR's four-ISA cross, same-width cast-range, best-tools and
 matrix gates.  The lane plan's `predicted_gate_seconds` is recomputed from the
 exact `measured_s` sum: shard A `539.32 s`, shard B `558.20 s`, total
-`2990 s`.  Static parity reports `571 commands / 42 invocation contracts`,
+`2989 s`.  Static parity reports `573 commands / 42 invocation contracts`,
 shard partition `a=88, b=124`, lane self-test `19 rules / 30 fixtures`.
   After the induction-proof additions in section 13 the measured plan is
   `2989 s` (backend A `539.32 s`, backend B `557.52 s`).
@@ -546,12 +546,12 @@ claim is made.
 | Check | Result |
 |---|---|
 | `cargo build --profile fastbuild --locked --bins` | PASS, 0 warnings |
-| `cargo test --profile fastbuild --locked --lib` | PASS, 8681 passed / 0 failed / 10 ignored |
+| `cargo test --profile fastbuild --locked --lib` | PASS, 8702 passed / 0 failed / 10 ignored |
 | `cargo clippy --profile fastbuild --locked --all-targets -- -D warnings` | PASS |
 | `cargo fmt --check`, `git diff --check`, Python/shell syntax | PASS |
 | `audit_census.py --check` | PASS: 863/94/27/10/233/97/26/565/254 vs baselines 863/94/27/10/233/97/26/565/255 |
-| static CI: workflow shell / parity / shard / lane plan + self-test | PASS: 14 files, 571 commands / 42 contracts, a=88 b=124, 2989 s |
-| 13 targeted `ci_local.sh --only` selector invocations | PASS: 21 unique selected gates, 0 failed; 7 optional toolchain gates skipped per invocation |
+| static CI: workflow shell / parity / shard / lane plan + self-test | PASS: 14 files, 573 commands / 42 contracts, a=88 b=124, 2989 s |
+| 16 targeted `ci_local.sh --only` selector invocations | PASS: 24 unique selected gates, 0 failed; 7 optional toolchain gates skipped per invocation |
 | `check_cond_load_sink_best_tools.py --self-test` | PASS: 14 verdict mutations rejected, 3 readelf frame dialects decoded, fail-fast report paths proven |
 | best-tools with system readelf 2.40 + pinned GDB 18.1 | PASS: 5 decoded FDE records, 0 search-table rows, complete GDB/objdump/IR/Callgrind evidence |
 | four hosted-like no-alias harnesses | PASS, evidence in `/tmp/recovery/evidence/*.json` |
@@ -647,15 +647,18 @@ Evidence: `/home/user/artifacts/redteam/induction_evidence.json` and
 |---|---:|---:|---:|---:|
 | Static `loop_count` instructions | **16** | 17 | 19 | 73 (vectorized) |
 | 64-bit induction ops | **none** | `addq,cmpq,movq,shrq` | `movq` | `movq` |
-| Callgrind Ir refs, 1000 varied calls | **41,208,254** | 41,209,254 | 45,297,780 | 24,315,280 |
-| Wall-clock median, 7 runs pinned CPU 0 | 0.005091 s | 0.005049 s | 0.005882 s | 0.006165 s |
+| Callgrind Ir refs, 1000 varied calls | **41,209,657** | 41,210,663 | 45,299,179 | 24,316,683 |
+| Wall-clock median, 7 runs pinned CPU 0 | 0.005792 s | 0.005457 s | 0.007491 s | 0.006055 s |
 | Memcheck errors | 0 | 0 | 0 | 0 |
 | Runtime checksum | `e05a0b25418af6d6` | same | same | same |
 
-The deterministic Callgrind delta is exactly 1,000 fewer references for 1,000
-calls: one prologue instruction per invocation, not one per loop iteration.
-Wall-clock is within run-to-run noise (PR median 0.005091 s vs main 0.005049
-s in the final remeasurement), so no dishonest wall-clock speedup is claimed.  GCC uses more references;
+The deterministic Callgrind delta is about one reference per call: 1,006
+fewer references for 1,000 calls in the final run (the benchmark varies `n`
+by 0..7 across calls, so the exact startup/iteration mix shifts slightly).
+The removed instruction is in the prologue, one per invocation, not one per
+loop iteration.  Wall-clock is noisy and even shows PR slower than main in the
+final run (0.005792 s vs 0.005457 s), so no dishonest wall-clock speedup is
+claimed.  GCC uses more references;
 Clang vectorizes the bitmap loop and uses fewer, so no broad compiler
 superiority is claimed.  The claim is narrower and measured: on this shape the
 range proof removes one instruction and one dynamic reference per call without
@@ -689,7 +692,7 @@ claim that the standalone `pahole` binary ran.
   integers.
 * The lane plan is remeasured worst-of-three with the pinned cache: bit-select
   fold 3.59 s, cast-range full 1.44 s, cast-range self-test 0.06 s; total
-  `2989 s` (A 539.32 s, B 557.52 s).  Parity remains 571 commands / 42
+  `2989 s` (A 539.32 s, B 557.52 s).  Parity remains 573 commands / 42
   contracts; shard partition remains a=88, b=124.
 
 ### 13.4 Line-by-line function audit and efficiency verdict
@@ -720,8 +723,11 @@ and saying exactly what was and was not proven.
 
 ### 13.5 Rebase and final hosted authority
 
-The branch is rebased onto `origin/main = cdd5def266cb1f7e59ecce3ceb92774659420d29`
-(HEAD `fb768895da9a8adea155be460d8974ae4144aa2c` after the rebase).  Hosted CI
+The branch is rebased onto the latest
+`origin/main = 2477d554bf140a21e79c0218d50a69d605e73cc1`, which includes the
+GNU preprocessor assertions, pragma-pack-underflow and VLA-layout repairs from
+PRs #1156/#1169 (HEAD `fd9f86f2b2295a73c48bce350b9ba7cbcb4adfbe` at the time
+of this measurement).  Hosted CI
 remains the accepting authority; the PR body records the final run ID and
 per-check verdict.  No production-ready claim is made until every required
 hosted check is green.
