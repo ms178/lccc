@@ -19,6 +19,7 @@ textual-fallback guards preprocess instead of dying on a stray argument list.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -54,11 +55,24 @@ LIVE_VALUE = {
 }
 
 
-def run(cc: str, src: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+def run(cc: str, src: Path, *flags: str, std: str = "gnu23") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [cc, "-std=gnu23", "-E", "-P", *flags, str(src)],
+        [cc, f"-std={std}", "-E", "-P", *flags, str(src)],
         capture_output=True, text=True, timeout=20,
     )
+
+
+def canon_tokens(text: str) -> str:
+    """Normalize trivia without erasing word-token boundaries (`0 bar` != `0bar`).
+
+    Whitespace around punctuators is not a token boundary, so `= 0;` and
+    `=0;` compare equal; whitespace between two identifier/number tokens is
+    significant and survives.  The recovery batches contain no string literal
+    whose internal spacing is under test.
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r" ?([!-/:-@\[-`{-~]) ?", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -253,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         #     trailing-token #if check rejects an unknown function-like name.
         #     This is the exact shape that broke the AArch64/RV64 cross gate.
         clang = shutil.which("clang-23")
+        gcc = shutil.which("gcc-16")
         if clang:
             res = subprocess.run([clang, "-print-resource-dir"], capture_output=True,
                                  text=True, timeout=20)
@@ -349,6 +364,129 @@ def main(argv: list[str] | None = None) -> int:
                       and want_out in c.stdout and want_out in l.stdout
                       and ((want_diag in c.stderr) if want_diag else True),
                       f"clang={c.stdout + c.stderr}\nlccc={l.stdout + l.stderr}")
+
+
+        # 12c. Missing-`(` recovery absorbs exactly one preprocessing token,
+        #      but the token boundary and macro-expansion persona differ.  Batch
+        #      28 tails x 7 code operators x 3 contexts x 2 dialects against the
+        #      pinned oracle instead of hand-picking a few happy shapes.
+        recovery_tails = [
+            ("ident", "bar"), ("object-macro", "M"), ("object-macro-call", "M(1)"),
+            ("function-macro-call", "F(1)"), ("warning-macro", "W"),
+            ("number", "123"), ("ppnumber", "1.5e+3"), ("c23-separator", "1'000"),
+            ("string", '"s"'), ("char", "'c'"), ("u8-string", 'u8"s"'),
+            ("L-char", "L'c'"), ("arrow", "->"), ("plusplus", "++"),
+            ("ellipsis", "..."), ("shl-assign", "<<="), ("shr-assign", ">>="),
+            ("paste", "##"), ("digraph-paste", "%:%:"), ("scope", "::"),
+            ("colon-gt", ":>"), ("lt-percent", "<%"), ("percent-gt", "%>"),
+            ("percent-colon", "%:"), ("lt-colon", "<:"), ("plus", "+"),
+            ("utf8-2", "é"), ("utf8-4", "𐀀"),
+        ]
+        if gcc and clang:
+            for std in ("gnu23", "c11"):
+                for op in sorted(CODE_OPS):
+                    ref = clang if op in ("__has_warning", "__building_module") else gcc
+                    for ctx in ("direct", "object", "function"):
+                        lines = ['#define M foo bar', '#define F(x) 99', '#define W "-Wcpp"']
+                        if ctx == "object":
+                            lines.append(f"#define Q {op}")
+                        elif ctx == "function":
+                            lines.append(f"#define Q() {op}")
+                        for i, (_, tail) in enumerate(recovery_tails):
+                            spell = op if ctx == "direct" else ("Q" if ctx == "object" else "Q()")
+                            lines.append(f"int r{i}={spell} {tail};")
+                        text = "\n".join(lines) + "\n"
+                        src.write_text(text)
+                        want = run(ref, src, std=std)
+                        got = run(args.lccc, src, std=std)
+                        # GCC words both attribute queries' diagnostics as
+                        # __has_attribute (measured), including __has_c_attribute.
+                        diag_op = "__has_attribute" if op == "__has_c_attribute" else op
+                        diag = f"missing '(' after '{diag_op}'"
+                        check(
+                            f"recovery-matrix/{std}/{op}/{ctx}",
+                            want.returncode == got.returncode
+                            and canon_tokens(want.stdout) == canon_tokens(got.stdout)
+                            and diag in got.stderr,
+                            f"ref={want.returncode} {canon_tokens(want.stdout)}\n"
+                            f"lccc={got.returncode} {canon_tokens(got.stdout)}\n{got.stderr}",
+                        )
+
+        # 12d. Newlines are whitespace between a query operator and its operand.
+        #      The pending-line accumulator must keep trivia-only continuations
+        #      pending, including blank lines and line comments, and must not
+        #      mistake an identifier inside a literal/comment for the operator.
+        newline_shapes = [
+            ("direct", "int x={op}\n({operand});\n", False),
+            ("object", "#define Q {op}\nint x=Q\n({operand});\n", False),
+            ("function", "#define Q() {op}\nint x=Q()\n({operand});\n", False),
+            ("blank", "int x={op}\n\n({operand});\n", False),
+            ("line-comment", "int x={op} // c\n({operand});\n", False),
+            ("block-comment", "int x={op} /* ) \" */\n({operand});\n", False),
+            ("multiline-comment", "int x={op} /* c\nc */\n({operand});\n", False),
+            ("missing-next-line", '#define W "-Wcpp"\nint x={op}\nW;\n', True),
+            ("missing-line-comment", '#define W "-Wcpp"\nint x={op} // c\nW;\n', True),
+            ("missing-block-comment", '#define W "-Wcpp"\nint x={op} /* c */\nW;\n', True),
+        ]
+        if gcc and clang:
+            for op in sorted(CODE_OPS):
+                ref = clang if op in ("__has_warning", "__building_module") else gcc
+                operand = ALL_OPS[op]
+                for shape, template, missing in newline_shapes:
+                    text = template.format(op=op, operand=operand)
+                    src.write_text(text)
+                    want = run(ref, src)
+                    got = run(args.lccc, src)
+                    compact = re.sub(r"\s+", "", got.stdout)
+                    expected = f"intx={LIVE_VALUE[op] if not missing else '0'};"
+                    diag_op = "__has_attribute" if op == "__has_c_attribute" else op
+                    diag = f"missing '(' after '{diag_op}'"
+                    check(
+                        f"newline/{op}/{shape}",
+                        want.returncode == got.returncode
+                        and compact == expected
+                        and (got.stderr.count(diag) == 1 if missing else diag not in got.stderr),
+                        f"ref={want.returncode} {want.stdout}\n"
+                        f"lccc={got.returncode} {got.stdout}\n{got.stderr}",
+                    )
+
+        # 12e. Comments inside a balanced operand are trivia, not delimiters.
+        balanced_comments = [
+            ("feature", '#define M tls\nint x=__has_feature(/* ) " */ M);\n', "1", False),
+            ("builtin", 'int x=__has_builtin(/* ) */ memcpy);\n', "1", False),
+            ("warning", 'int x=__has_warning("-Wcpp" /* ) */);\n', "1", True),
+            ("module", '#define M foo bar\nint x=__building_module(/* ) */ M);\n', "0", True),
+        ]
+        if gcc and clang:
+            for name, text, value, clang_persona in balanced_comments:
+                src.write_text(text)
+                ref = clang if clang_persona else gcc
+                want = run(ref, src)
+                got = run(args.lccc, src)
+                check(
+                    f"balanced-comment/{name}",
+                    want.returncode == got.returncode == 0
+                    and re.sub(r"\s+", "", got.stdout) == f"intx={value};"
+                    and got.stderr.strip() == "",
+                    f"ref={want.stdout}{want.stderr}\nlccc={got.stdout}{got.stderr}",
+                )
+
+        # 12f. A C23 digit separator is not a character-literal opener.  The
+        #      trailing-candidate validator must skip the whole pp-number so a
+        #      query after `1'000 +` still waits for its next-line operand.
+        if gcc and clang:
+            for op in sorted(CODE_OPS):
+                ref = clang if op in ("__has_warning", "__building_module") else gcc
+                src.write_text(f"int x=1'000 + {op}\n({ALL_OPS[op]});\n")
+                want = run(ref, src)
+                got = run(args.lccc, src)
+                check(
+                    f"c23-number-tail/{op}",
+                    want.returncode == got.returncode == 0
+                    and re.sub(r"\s+", "", got.stdout) == f"intx=1'000+{LIVE_VALUE[op]};"
+                    and got.stderr.strip() == "",
+                    f"ref={want.stdout}{want.stderr}\nlccc={got.stdout}{got.stderr}",
+                )
 
         # 13. Extra tokens after #undef are diagnosed, repeated #undef still warns.
         src.write_text("#undef __has_feature junk\n#undef __has_feature\n")
