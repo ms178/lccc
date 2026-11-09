@@ -1269,6 +1269,7 @@ enum HomeBypass {
 struct HomeForward {
     block: usize,
     producer: usize,
+    home: u32,
     kind: HomeBypass,
     /// Register value that replaces every read of the home. `None` for a
     /// relay, which re-points the producer instead of forwarding a value --
@@ -1339,6 +1340,15 @@ impl UseIndex {
         self.0.get(&value)
     }
 
+    /// The sole use site of a value, when it is read exactly once.
+    fn single_use_site(&self, value: u32) -> Option<((usize, usize), usize)> {
+        let sites = self.0.get(&value)?;
+        if sites.len() != 1 {
+            return None;
+        }
+        sites.iter().next().map(|(&site, &n)| (site, n))
+    }
+
     /// True when `forwarded` accounts for every use of `value` exactly.
     /// Allocation-free: the query compares against the index in place rather
     /// than cloning it.
@@ -1348,27 +1358,6 @@ impl UseIndex {
             Some(uses) => uses == forwarded,
         }
     }
-}
-
-/// Count how many instructions in `func` read `value`, per instruction.
-fn count_uses(func: &IrFunction, value: u32) -> FxHashMap<(usize, usize), usize> {
-    let mut uses: FxHashMap<(usize, usize), usize> = FxHashMap::default();
-    for (bi, b) in func.blocks.iter().enumerate() {
-        for (ii, i) in b.instructions.iter().enumerate() {
-            let mut n = 0usize;
-            i.for_each_used_value(|v| n += usize::from(v == value));
-            if n > 0 {
-                uses.insert((bi, ii), n);
-            }
-        }
-        let mut n = 0usize;
-        b.terminator
-            .for_each_used_value(|v| n += usize::from(v == value));
-        if n > 0 {
-            *uses.entry((bi, TERMINATOR)).or_insert(0) += n;
-        }
-    }
-    uses
 }
 
 /// Width of the vector REGISTER carried at intrinsic argument position
@@ -1438,18 +1427,171 @@ fn as_whole_vector_store(inst: &Instruction, width: usize, home: u32) -> Option<
     Some(src.0)
 }
 
-/// The destination slot of a whole-register `VecStore*` of `width` bytes.
-fn store_target(inst: &Instruction, width: usize) -> Option<u32> {
+/// The destination of the exact whole-register store `VecStore* [ld, dst, 0]`.
+///
+/// `dest_ptr` alone is not a store contract: the stored VALUE must be the
+/// reload, the address operand must agree with the effect destination, and
+/// the offset must be zero. Extra operands and malformed lookalikes fail closed.
+fn relay_store_destination(inst: &Instruction, width: usize, ld: u32) -> Option<u32> {
     let Instruction::Intrinsic {
-        dest, op, dest_ptr, ..
+        dest,
+        op,
+        dest_ptr,
+        args,
     } = inst
     else {
         return None;
     };
-    if dest.is_some() || whole_vector_store_width(*op) != Some(width) {
+    if dest.is_some() || whole_vector_store_width(*op) != Some(width) || args.len() != 3 {
         return None;
     }
-    dest_ptr.as_ref().map(|p| p.0)
+    if !matches!(&args[0], Operand::Value(v) if v.0 == ld) || !operand_is_const_zero(&args[2]) {
+        return None;
+    }
+    let Operand::Value(ptr) = &args[1] else {
+        return None;
+    };
+    let dst = dest_ptr.as_ref()?.0;
+    (ptr.0 == dst).then_some(dst)
+}
+
+/// Object root for a relay destination, following only pointer-preserving
+/// copies/casts and GEPs with a literal constant offset. The shared root
+/// analysis deliberately stops at nonzero GEPs because it proves the *exact*
+/// address; aliasing a private compiler home only needs the enclosing object.
+/// A constant offset from a parameter/global cannot name a private alloca.
+/// For an alloca, every moved byte must stay inside the object. Variable or
+/// negative offsets, cycles and integer-derived pointers fail closed.
+fn relay_destination_object_root(
+    mut value: u32,
+    func: &IrFunction,
+    value_defs: &FxHashMap<u32, (usize, usize)>,
+    roots: &FxHashMap<u32, PointerRoot>,
+    allocas: &FxHashMap<u32, AllocaInfo>,
+    width: usize,
+) -> Option<PointerRoot> {
+    for _ in 0..16 {
+        if let Some(&root) = roots.get(&value) {
+            return Some(root);
+        }
+        let &(block, instr) = value_defs.get(&value)?;
+        match func.blocks.get(block)?.instructions.get(instr)? {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                let Operand::Const(offset) = offset else {
+                    return None;
+                };
+                let offset = offset.to_i128()?;
+                if offset < 0 {
+                    return None;
+                }
+                let offset = usize::try_from(offset).ok()?;
+                if let Some(info) = allocas.get(&base.0) {
+                    if offset.checked_add(width)? > info.size {
+                        return None;
+                    }
+                }
+                value = base.0;
+            }
+            Instruction::Copy {
+                src: Operand::Value(src),
+                ..
+            }
+            | Instruction::Cast {
+                src: Operand::Value(src),
+                from_ty: IrType::Ptr,
+                to_ty: IrType::Ptr,
+                ..
+            } => value = src.0,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Conservative interval test for a private spill home. Forwarding the
+/// stored register deletes the home's defining store, so every intervening
+/// access must be unable to observe or change those bytes. Rooted accesses to
+/// a proven-distinct object are harmless; unknown pointer roots, calls,
+/// atomics, fences and volatile/segment effects fail closed.
+fn spill_home_may_be_clobbered(
+    inst: &Instruction,
+    home: u32,
+    roots: &FxHashMap<u32, PointerRoot>,
+) -> bool {
+    let target = Value(home);
+    let may_alias = |ptr: u32| write_may_clobber(target, roots.get(&ptr).copied(), roots);
+    match inst {
+        Instruction::Store {
+            ptr,
+            volatile,
+            seg_override,
+            ..
+        }
+        | Instruction::Load {
+            ptr,
+            volatile,
+            seg_override,
+            ..
+        } => *volatile || *seg_override != AddressSpace::Default || may_alias(ptr.0),
+        Instruction::Memcpy { dest, src, .. } => may_alias(dest.0) || may_alias(src.0),
+        Instruction::VaArg { va_list_ptr, .. }
+        | Instruction::VaStart { va_list_ptr }
+        | Instruction::VaEnd { va_list_ptr } => may_alias(va_list_ptr.0),
+        Instruction::VaCopy { dest_ptr, src_ptr } => may_alias(dest_ptr.0) || may_alias(src_ptr.0),
+        Instruction::VaArgStruct {
+            dest_ptr,
+            va_list_ptr,
+            ..
+        } => may_alias(dest_ptr.0) || may_alias(va_list_ptr.0),
+        // Operands are untyped here. Every Value exposed to a pure intrinsic
+        // must have a proven-distinct root, even at a position the address
+        // table does not classify. A constant in an audited address position
+        // is an absolute address and also fails closed. This deliberately
+        // sacrifices forwarding across register-only computations rather than
+        // guessing which unclassified operand might be a pointer.
+        Instruction::Intrinsic {
+            dest_ptr, op, args, ..
+        } => {
+            if !op.is_pure() {
+                return true;
+            }
+            if let Some(pointer) = dest_ptr {
+                if may_alias(pointer.0) {
+                    return true;
+                }
+            }
+            for (idx, arg) in args.iter().enumerate() {
+                match arg {
+                    Operand::Value(pointer) => {
+                        if may_alias(pointer.0) {
+                            return true;
+                        }
+                    }
+                    Operand::Const(_) => {
+                        if intrinsic_arg_required_alignment(*op, idx).is_some() {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        Instruction::AtomicLoad { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicInc { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::Fence { .. }
+        | Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::PgoCounterInc { .. }
+        | Instruction::StackRestore { .. }
+        | Instruction::InitTrampoline { .. }
+        | Instruction::NonlocalGotoSave { .. }
+        | Instruction::NonlocalGoto { .. } => true,
+        _ => false,
+    }
 }
 
 /// Plan every safe vector-home bypass in `func`.
@@ -1467,20 +1609,12 @@ fn store_target(inst: &Instruction, width: usize) -> Option<u32> {
 /// happens to hold. Requiring the per-instruction use counts to match the
 /// rewritten counts is what rules that out; there is no "probably fine"
 /// path here.
-fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -> Vec<HomeForward> {
-    // Where every home is defined. Both bypass forms MOVE a use earlier (the
-    // relay re-points the producer at the final destination; the spill hands
-    // the stored register to readers), so a destination whose Alloca sits at
-    // or after the producer would hand the backend a use that its definition
-    // does not dominate. Recording the sites up front keeps that a lookup.
-    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
-    for (bi, b) in func.blocks.iter().enumerate() {
-        for inst in &b.instructions {
-            if let Instruction::Alloca { dest, .. } = inst {
-                def_block.insert(dest.0, bi);
-            }
-        }
-    }
+fn plan_home_forwards(
+    func: &IrFunction,
+    allocas: &FxHashMap<u32, AllocaInfo>,
+    value_defs: &FxHashMap<u32, (usize, usize)>,
+    roots: &FxHashMap<u32, PointerRoot>,
+) -> Vec<HomeForward> {
     let use_index = UseIndex::build(func);
     let mut plans = Vec::new();
     for (block_idx, block) in func.blocks.iter().enumerate() {
@@ -1499,223 +1633,226 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
             if info.volatile || info.semantic_volatile {
                 continue;
             }
-            // The write must cover the entire object. A narrower write leaves
-            // bytes that only a memory read can observe, and retiring the
-            // home would drop them.
+            // The write must cover and OVERWRITE the entire object. An
+            // accumulator reads its old destination; moving that read to a
+            // different object changes the computation, not just the write.
             let width = match dest {
-                // Computing intrinsic: result width is the written width.
-                Some(_) => match temp_result_width(*op) {
-                    Some(w) if w == info.size => w,
-                    _ => continue,
-                },
-                // Explicit store: the store's own width contract.
+                Some(_) => {
+                    if !intrinsic_overwrites_full_result(*op) {
+                        continue;
+                    }
+                    match temp_result_width(*op) {
+                        Some(w) if w == info.size => w,
+                        _ => continue,
+                    }
+                }
                 None => match whole_vector_store_width(*op) {
                     Some(w) if w == info.size => w,
                     _ => continue,
                 },
             };
-
+            let Some(home_uses) = use_index.uses(home) else {
+                continue;
+            };
             let mut forwarded: FxHashMap<(usize, usize), usize> = FxHashMap::default();
-            // The producer's own write slot; a store also names the home as
-            // its address operand.
-            *forwarded.entry((block_idx, producer)).or_insert(0) += 1;
-            if dest.is_none() {
-                *forwarded.entry((block_idx, producer)).or_insert(0) += 1;
-            }
-
             let mut arg_rewrites = Vec::new();
             let mut dead = Vec::new();
-            let mut aborted = false;
-            let mut kind: Option<HomeBypass> = None;
-
-            for (reader, r_inst) in block.instructions.iter().enumerate().skip(producer + 1) {
-                if let Instruction::Intrinsic { dest_ptr: r_dp, .. } = r_inst {
-                    // A second write invalidates the bypass: later readers
-                    // would observe a different value than the one forwarded.
-                    if let Some(p) = r_dp {
-                        if p.0 == home {
-                            aborted = true;
-                            break;
-                        }
-                    }
-                }
-
-                match (r_inst, dest) {
-                    // Relay: the home's value is loaded and immediately
-                    // stored to the real destination.
-                    (
-                        Instruction::Intrinsic {
-                            op: r_op,
-                            dest: Some(ld),
-                            args: r_args,
-                            ..
-                        },
-                        Some(producer_dest),
-                    ) if whole_vector_load(*r_op)
-                        && temp_result_width(*r_op) == Some(width)
-                        && r_args.len() == 2
-                        && matches!(r_args.first(), Some(Operand::Value(v)) if v.0 == home)
-                        && operand_is_const_zero(&r_args[1]) =>
+            let plan = match dest {
+                // Prove the CONTIGUOUS triple producer -> home;
+                // ld = VecLoad(home, 0); VecStore(dst) <- ld. Moving a write
+                // across even one call or scalar store can change which write
+                // wins. Contiguity removes the destination-observation interval.
+                Some(_) => {
+                    let reader = producer + 1;
+                    let store = producer + 2;
+                    let Some(r_inst) = block.instructions.get(reader) else {
+                        continue;
+                    };
+                    let Some(s_inst) = block.instructions.get(store) else {
+                        continue;
+                    };
+                    let Instruction::Intrinsic {
+                        dest: Some(ld),
+                        op: r_op,
+                        dest_ptr: None,
+                        args: r_args,
+                    } = r_inst
+                    else {
+                        continue;
+                    };
+                    if !whole_vector_load(*r_op)
+                        || temp_result_width(*r_op) != Some(width)
+                        || r_args.len() != 2
+                        || !matches!(&r_args[0], Operand::Value(v) if v.0 == home)
+                        || !operand_is_const_zero(&r_args[1])
                     {
-                        // The loaded register must feed exactly one
-                        // whole-register store; that store's destination is
-                        // where the producer should write instead.
-                        let ld_uses = count_uses(func, ld.0);
-                        // Require exactly one use site and destructure it in
-                        // the same step. The census counts panicking
-                        // accessors, so the bound is expressed as an
-                        // irrefutable-by-construction pattern instead of
-                        // `.expect("len == 1")`.
-                        let first = ld_uses.iter().next();
-                        let second = ld_uses.iter().nth(1);
-                        let (Some((&(lb, li), &ln)), None) = (first, second) else {
-                            aborted = true;
-                            break;
-                        };
-                        // A terminator use shares the block id, so reject the
-                        // sentinel explicitly before it reaches an index.
-                        if lb != block_idx || li == TERMINATOR || ln != 1 {
-                            aborted = true;
-                            break;
-                        }
-                        // The relay store's destination is where the
-                        // producer should write instead. It must not be the
-                        // home itself (that would be a self-copy).
-                        let Some(store_dest) =
-                            store_target(&block.instructions[li], width).filter(|&d| d != home)
-                        else {
-                            aborted = true;
-                            break;
-                        };
-                        // The producer now writes into `store_dest` rather
-                        // than the home, so the write has to satisfy that
-                        // object's contract, not the home's. The audited
-                        // table grants the unaligned-safe result only on an
-                        // exact width match, so a destination of a different
-                        // size can demand real alignment.
-                        // The producer now writes into `store_dest` instead of
-                        // the home, so when that destination is a stack home
-                        // the write must satisfy THAT object's contract: the
-                        // audited table grants the unaligned-safe result only
-                        // on an exact width match, so a home of a different
-                        // size can demand real alignment.
-                        //
-                        // A destination that is not a home (a parameter or a
-                        // GEP -- the `vmovdqu %ymm0,(%rdi)` epilogue store in
-                        // `avx_fp_private`) needs no check at all: the relay
-                        // store already writes exactly `width` bytes through
-                        // that pointer, so the producer writes the same bytes
-                        // to the same place under the same contract.
-                        if let Some(dst) = allocas.get(&store_dest) {
-                            if dst.volatile || dst.semantic_volatile || width > dst.size {
-                                aborted = true;
-                                break;
-                            }
-                            if intrinsic_dest_required_alignment(*op, dest.is_some(), dst.size)
-                                .is_none_or(|need| need > dst.align)
-                            {
-                                aborted = true;
-                                break;
-                            }
-                        }
-                        // Dominance for the moved use: when the destination
-                        // is a stack home it must be defined in this block
-                        // before the producer. An earlier block is not
-                        // accepted, because this pass proves dominance only
-                        // within the block it rewrites.
-                        if let Some(&dbi) = def_block.get(&store_dest) {
-                            let def_idx = func.blocks[dbi]
-                                .instructions
-                                .iter()
-                                .position(|i| matches!(i, Instruction::Alloca { dest, .. } if dest.0 == store_dest));
-                            if dbi != block_idx || def_idx.is_none_or(|di| di >= producer) {
-                                aborted = true;
-                                break;
-                            }
-                        }
-                        *forwarded.entry((block_idx, reader)).or_insert(0) += 1;
-                        dead.push(reader);
-                        dead.push(li);
-                        kind = Some(HomeBypass::Relay {
-                            destination: store_dest,
-                        });
-                    }
-                    _ => {
-                        // Otherwise every read must be a classified
-                        // full-width vector data operand.
-                        if let Instruction::Intrinsic {
-                            op: r_op,
-                            args: r_args,
-                            ..
-                        } = r_inst
-                        {
-                            for (idx, arg) in r_args.iter().enumerate() {
-                                let Operand::Value(v) = arg else { continue };
-                                if v.0 != home {
-                                    continue;
-                                }
-                                // The read must consume the home's bytes as
-                                // a whole vector REGISTER. A position that
-                                // names an address is refused: see
-                                // `vector_register_arg_width`.
-                                if vector_register_arg_width(*r_op, idx) != Some(width) {
-                                    aborted = true;
-                                    break;
-                                }
-                                arg_rewrites.push((reader, idx));
-                                *forwarded.entry((block_idx, reader)).or_insert(0) += 1;
-                            }
-                            if aborted {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if aborted {
-                continue;
-            }
-
-            // A relay re-points the producer instead of forwarding a value,
-            // so `dest` alone discriminates the two forms: `Some` is a
-            // computing intrinsic (relay), `None` an explicit store (spill).
-            let plan = match (kind, dest) {
-                (Some(HomeBypass::Relay { destination }), _) => {
-                    // A relay home has exactly one reader by construction, so
-                    // no other rewrite may accompany it.
-                    if !arg_rewrites.is_empty() {
                         continue;
                     }
+                    if use_index.single_use_site(ld.0) != Some(((block_idx, store), 1)) {
+                        continue;
+                    }
+                    let Some(destination) = relay_store_destination(s_inst, width, ld.0) else {
+                        continue;
+                    };
+                    if destination == home {
+                        continue;
+                    }
+                    // Unequal SSA IDs are not disjointness. An integer-derived
+                    // destination could still designate the private home.
+                    let destination_root = roots.get(&destination).copied().or_else(|| {
+                        relay_destination_object_root(
+                            destination,
+                            func,
+                            value_defs,
+                            roots,
+                            allocas,
+                            width,
+                        )
+                    });
+                    if write_may_clobber(Value(home), destination_root, roots) {
+                        continue;
+                    }
+                    if let Some(dst) = allocas.get(&destination) {
+                        if dst.volatile || dst.semantic_volatile || width > dst.size {
+                            continue;
+                        }
+                        if intrinsic_dest_required_alignment(*op, true, dst.size)
+                            .is_none_or(|need| need > dst.align)
+                        {
+                            continue;
+                        }
+                    }
+                    // The moved pointer use must be dominated by its actual
+                    // definition, including ParamRefs and GEPs, not just allocas.
+                    let Some(&(db, di)) = value_defs.get(&destination) else {
+                        continue;
+                    };
+                    if db != block_idx || di >= producer {
+                        continue;
+                    }
+                    *forwarded.entry((block_idx, producer)).or_insert(0) += 1;
+                    *forwarded.entry((block_idx, reader)).or_insert(0) += 1;
+                    dead.push(reader);
+                    dead.push(store);
                     HomeForward {
                         block: block_idx,
                         producer,
+                        home,
                         kind: HomeBypass::Relay { destination },
                         value: None,
                         arg_rewrites: Vec::new(),
                         dead,
                     }
                 }
-                // Spill: the stored register is handed to every reader.
-                (None, None) => {
+                // Spill: a whole-register store defines the home; every other
+                // mention is a whole-register VecStore VALUE operand.
+                None => {
                     let Some(stored) = as_whole_vector_store(inst, width, home) else {
                         continue;
                     };
-                    if arg_rewrites.is_empty() {
+                    *forwarded.entry((block_idx, producer)).or_insert(0) += 2;
+                    let mut aborted = false;
+                    for (&(bi, ii), &n) in home_uses {
+                        if bi == block_idx && ii == producer {
+                            continue;
+                        }
+                        if bi != block_idx || ii == TERMINATOR || ii <= producer {
+                            aborted = true;
+                            break;
+                        }
+                        let Some(r_inst) = block.instructions.get(ii) else {
+                            aborted = true;
+                            break;
+                        };
+                        let Instruction::Intrinsic {
+                            dest: None,
+                            op: r_op,
+                            dest_ptr: r_dp,
+                            args: r_args,
+                        } = r_inst
+                        else {
+                            aborted = true;
+                            break;
+                        };
+                        if r_dp.is_some_and(|p| p.0 == home) {
+                            aborted = true;
+                            break;
+                        }
+                        if whole_vector_store_width(*r_op) != Some(width)
+                            || vector_register_arg_width(*r_op, 0) != Some(width)
+                        {
+                            aborted = true;
+                            break;
+                        }
+                        let mentions: Vec<usize> = r_args
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, arg)| {
+                                matches!(arg, Operand::Value(v) if v.0 == home).then_some(idx)
+                            })
+                            .collect();
+                        if mentions.as_slice() != [0] || n != 1 {
+                            aborted = true;
+                            break;
+                        }
+                        arg_rewrites.push((ii, 0));
+                        *forwarded.entry((bi, ii)).or_insert(0) += 1;
+                    }
+                    if aborted || arg_rewrites.is_empty() {
+                        continue;
+                    }
+                    // Scan the union of spill-to-reader intervals once. The
+                    // final reader's destination write is irrelevant (the home
+                    // is dead); earlier reader writes must be proven disjoint.
+                    arg_rewrites.sort_unstable_by_key(|(idx, _)| *idx);
+                    let last_reader = arg_rewrites.last().map(|(idx, _)| *idx).unwrap_or(producer);
+                    let readers: FxHashSet<usize> =
+                        arg_rewrites.iter().map(|(idx, _)| *idx).collect();
+                    for idx in producer + 1..=last_reader {
+                        let between = &block.instructions[idx];
+                        if readers.contains(&idx) {
+                            if idx == last_reader {
+                                continue;
+                            }
+                            let Instruction::Intrinsic {
+                                dest_ptr: Some(reader_dest),
+                                ..
+                            } = between
+                            else {
+                                aborted = true;
+                                break;
+                            };
+                            if write_may_clobber(
+                                Value(home),
+                                roots.get(&reader_dest.0).copied(),
+                                roots,
+                            ) {
+                                aborted = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        if spill_home_may_be_clobbered(between, home, roots) {
+                            aborted = true;
+                            break;
+                        }
+                    }
+                    if aborted {
                         continue;
                     }
                     dead.push(producer);
                     HomeForward {
                         block: block_idx,
                         producer,
+                        home,
                         kind: HomeBypass::Spill,
                         value: Some(stored),
                         arg_rewrites,
                         dead,
                     }
                 }
-                _ => continue,
             };
-            if !use_index.matches(home, &forwarded) {
+            if home_uses != &forwarded {
                 continue;
             }
             plans.push(plan);
@@ -1744,9 +1881,13 @@ fn prune_conflicting_plans(
         return plans;
     }
     let mut all_dead: FxHashSet<(usize, usize)> = FxHashSet::default();
+    let mut retired_spill_homes: FxHashSet<u32> = FxHashSet::default();
     for plan in &plans {
         for &instr in &plan.dead {
             all_dead.insert((plan.block, instr));
+        }
+        if matches!(plan.kind, HomeBypass::Spill) {
+            retired_spill_homes.insert(plan.home);
         }
     }
     plans
@@ -1755,6 +1896,22 @@ fn prune_conflicting_plans(
             let own: FxHashSet<(usize, usize)> =
                 plan.dead.iter().map(|&i| (plan.block, i)).collect();
             let hazard = |slot: (usize, usize)| all_dead.contains(&slot) && !own.contains(&slot);
+            // Our own producer must survive a neighbouring relay's deletion.
+            if hazard((plan.block, plan.producer)) {
+                return false;
+            }
+            // A relay cannot replace a home whose defining spill disappears:
+            // the spill's rewritten readers would ignore the relay's write.
+            if let HomeBypass::Relay { destination } = plan.kind {
+                if let Some(&slot) = value_defs.get(&destination) {
+                    if hazard(slot) {
+                        return false;
+                    }
+                }
+                if retired_spill_homes.contains(&destination) {
+                    return false;
+                }
+            }
             // Readers we rewrite must survive.
             if plan
                 .arg_rewrites
@@ -1794,7 +1951,11 @@ fn forward_vector_home_results(func: &mut IrFunction) -> usize {
             }
         }
     }
-    let plans = prune_conflicting_plans(plan_home_forwards(func, &allocas), &value_defs);
+    let PointerRootAnalysis { roots, .. } = pointer_root_analysis(func);
+    let plans = prune_conflicting_plans(
+        plan_home_forwards(func, &allocas, &value_defs, &roots),
+        &value_defs,
+    );
     if plans.is_empty() {
         return 0;
     }
@@ -1864,8 +2025,14 @@ fn remove_unused_allocas(func: &mut IrFunction) -> usize {
     let mut dead: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (instr_idx, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::Alloca { dest, .. } = inst {
-                if !used.contains(&dest.0) {
+            if let Instruction::Alloca {
+                dest,
+                volatile,
+                semantic_volatile,
+                ..
+            } = inst
+            {
+                if !*volatile && !*semantic_volatile && !used.contains(&dest.0) {
                     dead.entry(block_idx).or_default().push(instr_idx);
                 }
             }
@@ -5692,6 +5859,11 @@ mod tests {
         let mut func = single_block(
             "dest_is_parameter",
             vec![
+                Instruction::ParamRef {
+                    dest: Value(7),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
                 alloca(1, 32, 32),
                 intrinsic(
                     Some(3),
