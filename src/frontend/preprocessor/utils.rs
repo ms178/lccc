@@ -293,6 +293,87 @@ pub(super) fn is_digit_separator(bytes: &[u8], i: usize) -> bool {
     k < i && starts_ppnumber(k)
 }
 
+/// Skip ASCII whitespace and C comments, returning the offset of the next
+/// preprocessing token (or `bytes.len()`).  Bounded and progress-making: an
+/// unterminated comment consumes to EOL exactly like the resolver's recovery.
+pub(super) fn skip_blanks_and_comments(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+        } else if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = if i + 1 < len { i + 2 } else { len };
+        } else if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// Length of the single preprocessing token starting at `bytes[i]` (`i` must
+/// already point at a token, not trivia).  Maximal munch for punctuators,
+/// escape-aware literals, C23 pp-numbers, and prefixed string/char literals.
+/// Returns 0 at EOL.  Non-ASCII unknown bytes consume one whole UTF-8 scalar
+/// so callers never slice through a code point.
+pub(super) fn pp_token_len(bytes: &[u8], i: usize) -> usize {
+    let len = bytes.len();
+    if i >= len {
+        return 0;
+    }
+    let rest = &bytes[i..];
+    // Prefixed literals are one token (`u8"x"`, `L'c'`), not identifier+literal.
+    for prefix in [&b"u8"[..], &b"L"[..], &b"u"[..], &b"U"[..]] {
+        if rest.starts_with(prefix) {
+            let q = i + prefix.len();
+            if q < len && (bytes[q] == b'"' || bytes[q] == b'\'') {
+                return skip_literal_bytes(bytes, q, bytes[q]).min(len) - i;
+            }
+        }
+    }
+    let b = bytes[i];
+    if is_ident_start_byte(b) {
+        let mut j = i + 1;
+        while j < len && is_ident_cont_byte(bytes[j]) {
+            j += 1;
+        }
+        return j - i;
+    }
+    if b.is_ascii_digit() || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
+        return ppnumber_end(bytes, i) - i;
+    }
+    if b == b'"' || (b == b'\'' && !is_digit_separator(bytes, i)) {
+        return skip_literal_bytes(bytes, i, b).min(len) - i;
+    }
+    const PUNCTUATORS: &[&[u8]] = &[
+        b"%:%:", b"...", b"<<=", b">>=", b"->", b"++", b"--", b"<<", b">>", b"<=", b">=", b"==",
+        b"!=", b"&&", b"||", b"+=", b"-=", b"*=", b"/=", b"%=", b"&=", b"^=", b"|=", b"##", b"::",
+        b"<:", b":>", b"<%", b"%>", b"%:",
+    ];
+    for p in PUNCTUATORS {
+        if rest.starts_with(p) {
+            return p.len();
+        }
+    }
+    if b < 0x80 {
+        1
+    } else {
+        std::str::from_utf8(rest)
+            .ok()
+            .and_then(|s| s.chars().next())
+            .map(|c| c.len_utf8())
+            .unwrap_or(1)
+    }
+}
+
 #[cfg(test)]
 mod digraph_token_tests {
     use super::*;
@@ -314,6 +395,54 @@ mod digraph_token_tests {
         assert_eq!(less_punctuator_len(b"<<%:x"), 2);
         assert_eq!(less_punctuator_len(b"<<=%:x"), 3);
         assert_eq!(less_punctuator_len(b"<x"), 0);
+    }
+}
+
+#[cfg(test)]
+mod pp_token_tests {
+    use super::*;
+
+    #[test]
+    fn trivia_skip_is_bounded_and_progress_making() {
+        assert_eq!(skip_blanks_and_comments(b"  /* ) */ x", 0), 10);
+        assert_eq!(skip_blanks_and_comments(b"// line\nx", 0), 8);
+        assert_eq!(skip_blanks_and_comments(b"/* unterminated", 0), 15);
+        assert_eq!(skip_blanks_and_comments(b"x", 0), 0);
+        assert_eq!(skip_blanks_and_comments(b"", 0), 0);
+    }
+
+    #[test]
+    fn token_length_uses_maximal_munch_and_whole_literals() {
+        for (input, want) in [
+            (&b"abc_123"[..], 7),
+            (b"$x", 2),
+            (b"123abc", 6),
+            (b".5f", 3),
+            (b"\"a\\\"b\"x", 6),
+            (b"'\\''x", 4),
+            (b"u8\"x\"y", 5),
+            (b"L'c'z", 4),
+            (b"::x", 2),
+            (b"->x", 2),
+            (b"...x", 3),
+            (b"<<=x", 3),
+            (b"%:%:x", 4),
+            (b"+x", 1),
+            (b"", 0),
+        ] {
+            assert_eq!(pp_token_len(input, 0), want, "{input:?}");
+        }
+        // A non-ASCII unknown token consumes one scalar, never half a code point.
+        assert_eq!(pp_token_len("éx".as_bytes(), 0), 2);
+    }
+
+    #[test]
+    fn c23_digit_separators_stay_inside_the_pp_number() {
+        set_c23_dialect(true);
+        assert_eq!(pp_token_len(b"1'000+2", 0), 5);
+        assert_eq!(pp_token_len(b"0x1p-3'0f)", 0), 9);
+        set_c23_dialect(false);
+        assert_eq!(pp_token_len(b"1'000+2", 0), 1);
     }
 }
 

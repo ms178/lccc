@@ -18,8 +18,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::utils::{
     bytes_to_str, copy_literal_bytes_to_string, hash_token_len, is_digit_separator,
-    is_ident_cont_byte, is_ident_start_byte, less_punctuator_len, paste_token_len, ppnumber_end,
-    skip_literal_bytes,
+    is_ident_cont_byte, is_ident_start_byte, less_punctuator_len, paste_token_len, pp_token_len,
+    ppnumber_end, skip_blanks_and_comments, skip_literal_bytes,
 };
 
 /// Check if two adjacent bytes would form an unintended multi-character token
@@ -615,13 +615,19 @@ impl MacroTable {
     }
 
     /// End offset (exclusive) of a balanced parenthesized query operand whose
-    /// opening `(` is at `open`. Literal-aware and bounded by the slice; an
-    /// unterminated operand consumes to EOL, matching the resolver's recovery.
+    /// opening `(` is at `open`. Literal- and comment-aware and bounded by the
+    /// slice; an unterminated operand consumes to EOL, matching the resolver's
+    /// recovery.
     fn query_arg_end(bytes: &[u8], open: usize) -> usize {
         let len = bytes.len();
         let mut k = open + 1;
         let mut depth = 1usize;
         while k < len {
+            let trivia_end = skip_blanks_and_comments(bytes, k);
+            if trivia_end > k {
+                k = trivia_end;
+                continue;
+            }
             match bytes[k] {
                 quote @ (b'"' | b'\'') => {
                     k = super::utils::skip_literal_bytes(bytes, k, quote).min(len);
@@ -641,6 +647,15 @@ impl MacroTable {
         len
     }
 
+    /// Operators whose missing-`(` recovery absorbs one RAW preprocessing
+    /// token (Clang persona).  GCC's feature/builtin/attribute queries instead
+    /// macro-expand the following tokens normally and the resolver absorbs one
+    /// resulting token, so they must not be shielded here.
+    #[inline]
+    fn query_missing_paren_raw(name: &str) -> bool {
+        matches!(name, "__has_warning" | "__building_module")
+    }
+
     /// Copy an active query operator and its raw operand into `result`,
     /// returning the source offset just past the operand. `i` points just after
     /// the operator identifier. Returns `None` when there is no operand to
@@ -655,32 +670,25 @@ impl MacroTable {
         result: &mut String,
     ) -> Option<usize> {
         let len = bytes.len();
-        let mut j = i;
-        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            j += 1;
-        }
+        let j = skip_blanks_and_comments(bytes, i);
         if j < len && bytes[j] == b'(' {
             let end = Self::query_arg_end(bytes, j);
             result.push_str(ident);
             result.push_str(&text[i..end]);
             return Some(end);
         }
-        // GCC/Clang missing-`(` recovery absorbs a following identifier operand.
-        // Protect it too, so a macro operand is not expanded into several tokens
-        // before the resolver can absorb exactly one (`__building_module M`).
-        if !matches!(
-            ident,
-            "__has_warning" | "__has_include" | "__has_include_next" | "__has_embed"
-        ) && j < len
-            && is_ident_start_byte(bytes[j])
-        {
-            let mut k = j + 1;
-            while k < len && is_ident_cont_byte(bytes[k]) {
-                k += 1;
-            }
+        // Clang's `__has_warning` / `__building_module` missing-`(` recovery
+        // absorbs exactly one RAW preprocessing token.  Shield that token so a
+        // macro operand is not expanded before the resolver absorbs it
+        // (`__has_warning W` with `#define W "-Wcpp"` -> `0`, not `0"-Wcpp"`).
+        // GCC's feature/builtin/attribute queries deliberately expand the
+        // following tokens normally; their resolver absorbs one *expanded*
+        // token (`__has_feature M(1)` with `#define M foo bar` -> `0 bar(1)`).
+        if Self::query_missing_paren_raw(ident) && j < len {
+            let end = j + pp_token_len(bytes, j);
             result.push_str(ident);
-            result.push_str(&text[i..k]);
-            return Some(k);
+            result.push_str(&text[i..end]);
+            return Some(end);
         }
         None
     }
@@ -1064,30 +1072,26 @@ impl MacroTable {
                     && self.query_operator_active(trail_ident)
                     && !expanding.contains(trail_ident.as_str())
                 {
-                    let mut k = i;
-                    while k < len && bytes[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
+                    let k = skip_blanks_and_comments(bytes, i);
                     if k < len && bytes[k] == b'(' {
                         let end = Self::query_arg_end(bytes, k);
                         expanded.push_str(bytes_to_str(bytes, i, end));
                         i = end;
                         continue;
                     }
-                    if !matches!(
-                        trail_ident.as_str(),
-                        "__has_warning" | "__has_include" | "__has_include_next" | "__has_embed"
-                    ) && k < len
-                        && is_ident_start_byte(bytes[k])
-                    {
-                        let mut end = k + 1;
-                        while end < len && is_ident_cont_byte(bytes[end]) {
-                            end += 1;
-                        }
+                    if Self::query_missing_paren_raw(trail_ident) && k < len {
+                        let end = k + pp_token_len(bytes, k);
                         expanded.push_str(bytes_to_str(bytes, i, end));
                         i = end;
-                        continue;
+                        // The absorbed token belongs to the failed query, not
+                        // to the replacement list.  Stop rescanning it as a
+                        // trailing macro (`F() M(1)` must not expand M).
+                        break;
                     }
+                    // GCC-persona queries: leave the following source tokens
+                    // for normal expansion; the resolver absorbs one expanded
+                    // token during missing-`(` recovery.
+                    break;
                 }
                 if !expanding.contains(trail_ident.as_str()) {
                     if let Some(trail_mac) = self.macros.get(trail_ident.as_str()) {
@@ -1157,30 +1161,22 @@ impl MacroTable {
         if Self::query_operand_is_raw(expanded_trimmed)
             && self.query_operator_active(expanded_trimmed)
         {
-            let mut j = i;
-            while j < len && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
+            let j = skip_blanks_and_comments(bytes, i);
             if j < len && bytes[j] == b'(' {
                 let end = Self::query_arg_end(bytes, j);
                 let mut out = expanded.to_string();
                 out.push_str(bytes_to_str(bytes, i, end));
                 return Some((out, end));
             }
-            if !matches!(
-                expanded_trimmed,
-                "__has_warning" | "__has_include" | "__has_include_next" | "__has_embed"
-            ) && j < len
-                && is_ident_start_byte(bytes[j])
-            {
-                let mut end = j + 1;
-                while end < len && is_ident_cont_byte(bytes[end]) {
-                    end += 1;
-                }
+            if Self::query_missing_paren_raw(expanded_trimmed) && j < len {
+                let end = j + pp_token_len(bytes, j);
                 let mut out = expanded.to_string();
                 out.push_str(bytes_to_str(bytes, i, end));
                 return Some((out, end));
             }
+            // GCC-persona queries expand the following source tokens normally;
+            // `expand_trailing_func_macros` leaves them untouched and the
+            // resolver absorbs one expanded token during recovery.
             return None;
         }
         let target_mac = self.macros.get(expanded_trimmed)?;
@@ -2344,7 +2340,16 @@ impl MacroTable {
             true
         };
 
-        (result, result_ends_with_func_ident)
+        // A replacement list may also end in a compiler-owned query operator.
+        // Its operand lives in the following source tokens, so the trailing
+        // resolver must run even though the operator is not a user MacroDef.
+        let result_ends_with_query_operator = extract_trailing_ident(&result)
+            .is_some_and(|t| Self::query_operand_is_raw(&t) && self.query_operator_active(&t));
+
+        (
+            result,
+            result_ends_with_func_ident || result_ends_with_query_operator,
+        )
     }
 
     /// Handle # / %: (stringify) and ## / %:%: (token paste) operators.
@@ -3479,6 +3484,42 @@ mod query_operator_lifetime_tests {
             t.expand_line("__building_module(M)"),
             "__building_module(foo bar)"
         );
+    }
+
+    #[test]
+    fn clang_missing_paren_shields_one_raw_token_and_stops_rescan() {
+        let mut t = MacroTable::new();
+        t.define(obj("W", "\"-Wcpp\""));
+        t.define(obj("M", "foo bar"));
+        t.define(def("F", "99"));
+        // The raw token, not its replacement, reaches the resolver.
+        assert_eq!(t.expand_line("__has_warning W"), "__has_warning W");
+        assert_eq!(t.expand_line("__building_module M"), "__building_module M");
+        // Only the identifier token is absorbed; the following `(1)` survives.
+        assert_eq!(
+            t.expand_line("__building_module F(1)"),
+            "__building_module F(1)"
+        );
+        t.define(obj("BM", "__building_module"));
+        assert_eq!(t.expand_line("BM F(1)"), "__building_module F(1)");
+        // A function-like macro whose replacement ends in the operator must not
+        // rescan the absorbed token as a trailing macro invocation.
+        t.define(def("Q", "__building_module"));
+        assert_eq!(t.expand_line("Q() F(1)"), "__building_module F(1)");
+    }
+
+    #[test]
+    fn gcc_missing_paren_expands_following_tokens_normally() {
+        let mut t = MacroTable::new();
+        t.define(obj("M", "foo bar"));
+        t.define(def("F", "99"));
+        // GCC persona: the resolver absorbs one *expanded* token, so the macro
+        // expander must not shield the operand.
+        assert_eq!(
+            t.expand_line("__has_feature M(1)"),
+            "__has_feature foo bar(1)"
+        );
+        assert_eq!(t.expand_line("__has_builtin F(1)"), "__has_builtin 99");
     }
 
     #[test]

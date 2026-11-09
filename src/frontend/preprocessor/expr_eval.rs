@@ -9,8 +9,8 @@
 
 use super::pipeline::Preprocessor;
 use super::utils::{
-    bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte, push_char_at,
-    skip_literal_bytes,
+    bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte, pp_token_len,
+    push_char_at, skip_blanks_and_comments, skip_literal_bytes,
 };
 
 impl Preprocessor {
@@ -191,6 +191,7 @@ impl Preprocessor {
         }
         if *i >= len || bytes[*i] != b'(' {
             diag!("missing '(' after '__has_warning'".to_string());
+            Self::absorb_missing_paren_token(bytes, i);
             return "0".to_string();
         }
         *i += 1;
@@ -400,16 +401,7 @@ impl Preprocessor {
         }
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag("missing '(' after '__has_builtin'".to_string(), diag_line);
-            // GCC absorbs a following identifier operand in this recovery.
-            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-                *i += 1;
-            }
-            if *i < len && is_ident_start_byte(bytes[*i]) {
-                *i += 1;
-                while *i < len && is_ident_cont_byte(bytes[*i]) {
-                    *i += 1;
-                }
-            }
+            Self::absorb_missing_paren_token(bytes, i);
             return "0";
         }
         *i += 1;
@@ -498,17 +490,7 @@ impl Preprocessor {
         }
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag(format!("missing '(' after '{op}'"), diag_line);
-            // GCC absorbs a following identifier operand in this recovery
-            // (measured: `__has_feature tls` -> `0`, not `0tls`).
-            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-                *i += 1;
-            }
-            if *i < len && is_ident_start_byte(bytes[*i]) {
-                *i += 1;
-                while *i < len && is_ident_cont_byte(bytes[*i]) {
-                    *i += 1;
-                }
-            }
+            Self::absorb_missing_paren_token(bytes, i);
             return "0";
         }
         *i += 1;
@@ -578,17 +560,7 @@ impl Preprocessor {
         }
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag(format!("missing '(' after '{op}'"), diag_line);
-            // Clang absorbs a following identifier operand in this recovery
-            // (measured: `__building_module foo` -> `0`, not `0foo`).
-            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-                *i += 1;
-            }
-            if *i < len && is_ident_start_byte(bytes[*i]) {
-                *i += 1;
-                while *i < len && is_ident_cont_byte(bytes[*i]) {
-                    *i += 1;
-                }
-            }
+            Self::absorb_missing_paren_token(bytes, i);
             return "0";
         }
         *i += 1;
@@ -651,6 +623,20 @@ impl Preprocessor {
         }
         *i += 1;
         "0"
+    }
+
+    /// Missing-`(` recovery: GCC 16.2 and Clang 23.1.5 both diagnose, yield 0,
+    /// and absorb exactly ONE following preprocessing token (identifier,
+    /// literal, pp-number, or maximal-munch punctuator).  Comments are trivia.
+    /// The token is already macro-expanded for GCC-persona queries and raw for
+    /// Clang-persona queries; this resolver only consumes the resulting token.
+    fn absorb_missing_paren_token(bytes: &[u8], i: &mut usize) {
+        let j = skip_blanks_and_comments(bytes, *i);
+        *i = if j < bytes.len() {
+            j + pp_token_len(bytes, j)
+        } else {
+            j
+        };
     }
 
     /// Push a GCC-worded error for a malformed `__has_*` operand.  These are
@@ -730,10 +716,7 @@ impl Preprocessor {
         skip_blanks(i);
         if *i >= len || bytes[*i] != b'(' {
             self.query_diag("missing '(' after '__has_attribute'".to_string(), diag_line);
-            skip_blanks(i);
-            if *i < len && is_ident_start_byte(bytes[*i]) {
-                ident(i);
-            }
+            Self::absorb_missing_paren_token(bytes, i);
             return "0";
         }
         *i += 1;
@@ -951,6 +934,11 @@ impl Preprocessor {
         let len = bytes.len();
         let mut depth = 1usize;
         while *i < len {
+            let trivia_end = skip_blanks_and_comments(bytes, *i);
+            if trivia_end > *i {
+                *i = trivia_end;
+                continue;
+            }
             match bytes[*i] {
                 b'"' | b'\'' => {
                     *i = skip_literal_bytes(bytes, *i, bytes[*i]).min(len);
