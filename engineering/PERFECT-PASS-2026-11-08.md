@@ -717,3 +717,155 @@ so follow-up PR **#1158** was opened from the same fixed session branch
 `engineering/snapshots/` (all sha `5c0b217161069385b189d60eecabdfa4c3466e0c274807b8dbc582389433ea03`,
 reverse-apply verified).  Hosted CI for #1158 is the acceptance gate; the
 final receipts are recorded in §13 once every job is green.
+
+## 13. New PR: one-map seed streams (2026-11-09)
+
+Base: `origin/main` = `5e9a06a2fab2edd2ee87f9286a2cdf7595acbc66`
+(Merge PR #1160).  Branch: `arena/f7fcee89-lccc`.  Toolchain:
+`harness-cache-8` (GCC 16.2.0, Clang 23.1.5, Rust 1.99.1, GDB 18.1,
+binutils 2.47, Valgrind 3.19), 4 GiB `/home/user/.cache/lccc-swap.img`,
+`fastbuild` for every `lccc*` binary, `RUSTFLAGS="-D warnings"`.
+
+### 13.1 What changed and why every alternative lost
+
+`collect_seed_candidates` used to build TWO `FxHashMap`s (object tier and
+site tier), clone every store into both, sort/split/price both, then remove
+byte-identical duplicates with an owned `FxHashSet<SeedKey>` that allocated a
+fresh `Vec<usize>` for EVERY candidate on EVERY fixpoint round.  A single-web
+global produced the *same* stream twice: all of that work was dead.
+
+The new design inserts each store exactly once into one map; the fifth field
+of `StreamEntry` carries the raw SSA address base.  `site_subsets` derives the
+site tier as a partition of the object stream, with a zero-allocation scan
+fast path for the overwhelmingly common single-web case and a single-pass
+`FxHashMap<u32, Vec<StreamEntry>>` bucket build for genuinely merged roots.
+`dedup_seed_candidates` hashes every field with `FxHasher` and compares fields
+EXACTLY only inside a colliding bucket, with no-hash fast paths for 0/1/2
+candidates.  `SeedOperandKey` is strictly exact (constant variants, float
+bits, LongDouble `f64` approximation + 16 bytes); `LaneKey` stays deliberately
+VALUE-EQUIVALENT for pack/splat dedup.  `joint::Tail::alpha` becomes `u8`, so
+`control()` is lossless on every host and `Option<Tail>` is a 2-byte niche.
+
+Quantified compiler-time alternatives (Callgrind Ir, 5 runs each, identical
+`-o /tmp/stress.s`, `CCC_DISABLE_PASSES=gaddrcse`,
+`engineering/verification/bench/site_subsets_stress.c`, 320 stores):
+
+| Variant | Mean Ir | SD | vs baseline |
+|---|---:|---:|---:|
+| A baseline: two maps + owned `SeedKey` set | 506,859,599 | 2,699 | — |
+| B one map + O(n*b) filter partition | 506,983,859 | 18,501 | +0.0245 % |
+| C one map + O(n) buckets, no fast path | 506,940,729 | 51,276 | +0.0160 % |
+| D final: O(n) buckets + zero-alloc fast paths | 506,756,826 | 2,226 | **−0.0203 %** |
+
+All four emit **bit-identical assembly**
+`313f00f51593fd88ad7110cc8c60385faeb0f365d1430b5a0a863e1daf059abe`.
+B/C were rejected: B is quadratic when unrolling materialises one address
+web per body copy; C's unconditional bucket `HashMap` costs 8,551 Ir on the
+common single-web path.  The no-hash 2-candidate dedup path and the owned
+`SeedKey` removal are the remaining contributors to D's −102,774 Ir.
+
+### 13.2 Correctness, edge cases, and every code path traced
+
+* `site_subsets`: empty input, one web, 37 interleaved webs / 400 stores
+  (byte-equal to the original per-site grouping, lossless partition),
+  `StreamBase::Value` roots (never a second tier), first-appearance order.
+* `push_stream_candidates`: `i64::MIN` 4-lane run (valid), `i64::MAX`
+  overflowing gap (splits into two pair seeds, `checked_sub` never panics),
+  duplicate offsets, `size <= 0`, 128-bit fallback sub-windows.
+* `seed_operand_key`: `I8(0)` / `I32(0)` / `Zero` stay distinct; `F32(±0)`
+  bit-exact; both LongDouble halves preserved; `Value` ids exact.
+* `seed_hash` / `seed_fields_eq`: equal fields ⇒ equal hash; 240 generated
+  candidates with near misses in tail, sink, anchor, width, store span and
+  lane operands match the slow `FxHashSet<SeedKey>` reference oracle EXACTLY
+  and preserve first-occurrence order.  Hash collisions are safe because
+  equality is field-exact.
+* `Tail`: exhaustive `0u8..=255` proves `control()` is lossless;
+  `size_of::<Tail>() == 2`, `size_of::<Option<Tail>>() == 2`; every
+  `find_tail` result is in the backend's `checked_vec_control(0..=7)` range
+  with `alpha = control & 3`, `independent = control & 4`.
+* Cross-architecture: `lccc`, `lccc-i686`, `lccc-arm`, `lccc-riscv`,
+  `lccc-x86` all compile the store-stream corpus with ZERO diagnostics,
+  deterministic output, and bit-exact `CCC_NO_BB_SLP=1` parity.  The joint
+  SSE4.1 path stays x86-only.
+
+### 13.3 Zero-warning receipts (final source)
+
+`cargo fmt --all -- --check` OK; `cargo check --all-targets` OK;
+`cargo clippy --all-targets -- -D warnings` OK;
+`cargo build --profile fastbuild --locked -j1 --bins` OK;
+`cargo test --profile fastbuild --locked -j1` → **8641 passed / 0 failed /
+10 ignored** (plus doc-tests 3 ignored); `slp_vectorizer::tests` → 32/32;
+`python3 -m unittest discover -s tests/simd -p 'test_*.py'` → 104 tests OK;
+`git diff --check` OK.  Test-log "warning:" lines are fixture diagnostics
+from gates that intentionally exercise warnings, not build warnings.
+
+### 13.4 Best-tool evidence
+
+* **Callgrind** (compiler): §13.1.  (Runtime) 29-shape corpus compiled with
+  `-ffp-contract=off`: SLP-on **511,454 Ir** vs SLP-off **513,944 Ir**
+  → ratio 0.995155 (−0.4845 %), with byte-identical stdout and 0 MISMATCH
+  under both native execution and Valgrind.  This is an instruction-count
+  ablation, NOT a wall-clock claim.
+* **GDB 18.1**: `break s_clamp_u8`, `info registers`, `x/12i $pc`, `continue`
+  on the LCCC-built shape corpus; all 29 rows `ok`, inferior exited normally.
+* **objdump 2.47**: `s_clamp_u8` lowering contains `movd`/`punpckldq`/
+  `punpcklqdq` and one packed `movdqu %xmm4,(...)` store — the profitable
+  4xU32 pack still fires.
+* **readelf 2.47 / nm**: ELF64, `.debug_*` present, `SeedReps`,
+  `SeedOperandKey`, `StreamEntry` and `LaneKey` instantiations visible.
+* **Memcheck**: 0 errors / 0 definite or indirect leaks for BOTH the final
+  compiler and the baseline compiler on the 320-store stress, and for the
+  generated shape executable.  The 141 "possibly lost" records with
+  `--errors-for-leak-kinds=all` are the pre-existing process-lifetime
+  `BUILTIN_MAP` `LazyLock` statics (present identically in the baseline).
+* **GCC 16.2 / Clang 23.1.5**: native `simd_shape_matrix.c` stdout is
+  byte-identical to LCCC (`fcedb168a26eb508…`), all 29 rows `ok`.  ICX 2026.2
+  is NOT installed locally (Intel PPA / apt.llvm.org / GitHub asset fetches
+  blocked); the hosted authenticated ICX lane is the only ICX evidence.
+* **pahole / objtool**: `pahole` inspects C DWARF structs and `objtool`
+  validates Linux-kernel ORC metadata.  Neither is installed, and neither
+  applies to this userspace Rust IR pass (no new C struct, no kernel object).
+  Rust `size_of` / niche tests plus `readelf --debug-dump=info` cover the
+  actual layout question.  This is a scope decision, not a skipped check.
+
+### 13.5 A red-team finding that is a tool limitation, proven three ways
+
+Valgrind 3.19's VEX emulates FMA3 with different bits than the host CPU.
+Under VEX, `fma_orientation` reports a MISMATCH for LCCC's default-contraction
+build, because LCCC contracts the `volatile` reference arm into
+`vfmsub132ss`/`vfnmadd231ss` while the fast arm stays `vmulss`+`vsubss`.
+Evidence that this is VEX, not LCCC:
+
+| Compiler | FMA in asm (default / `-ffp-contract=off`) | Native | Under VEX |
+|---|---|---|---|
+| GCC 16.2 | 0 / 0 | `cd50fa…` ok | `cd50fa…` ok |
+| Clang 23.1.5 | 87 / 0 | `cd50fa…` ok | `c322b9…` ok (both arms contract) |
+| LCCC | 26 / 0 | `cd50fa…` ok | `cd50fa…` vs `c322b9…` MISMATCH |
+
+`-ffp-contract=off` removes every FMA from all three compilers and restores
+byte-identical native/VEX results (test_37).  GCC 16.2 at
+`-march=x86-64-v3` also emits `rorx` (BMI2), which VEX 3.19 cannot decode
+(`disInstr_AMD64: miscalculated next %rip` in `s_crc32_braid8`); at
+`-march=x86-64-v2` GCC's Callgrind total is 441,840 Ir vs Clang 419,536 and
+LCCC 511,508.  No fair three-way v3 Callgrind ranking is possible with this
+Valgrind, and **"beat all C compilers" is NOT claimed**: Clang is ahead on
+this corpus.
+
+### 13.6 Honest limits
+
+No wall-clock claim (`bench_ab3.py`: 1.0100 with CI `[0.9761, 1.0418]`
+includes 1.0).  No per-function "maximal efficiency" verdict.  No local ICX,
+no `pahole`, no `objtool`, no `perf`.  No large-model/LTO/DWARF
+`.debug_info` fix, no full ISA matrix, no 48-seed YARPGen proof.  The
+pre-existing backlog MB-01..MB-45, SV-01..SV-12, GP-01..GP-24, UP-1..UP-9,
+F1..F7 and `knobs_undocumented 254` is preserved, not hidden.  Hosted CI on
+the pushed head is the acceptance gate; local receipts are evidence only.
+
+## 14. Snapshot discipline
+
+`engineering/verification/agent-env.sh` (pinned offline toolchain),
+`prepare_local_env.sh` (idempotent glibc/CRT/multilib symlinks),
+`bench/site_subsets_stress.c` (320-store one-object stress) are committed
+with the patch.  `/home/user/ms178-1.patch` and the dated mirror under
+`engineering/snapshots/` are regenerated from the staged diff after each
+validated fix and verified with `git apply --check --reverse`.

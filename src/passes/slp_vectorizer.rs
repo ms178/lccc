@@ -41,10 +41,10 @@
 
 mod joint;
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet, FxHasher};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, IrType};
-use crate::ir::constants::IrConst;
+use crate::ir::constants::{ConstHashKey, IrConst};
 use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value};
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
@@ -53,12 +53,18 @@ use crate::passes::CfgAnalysis;
 use crate::passes::vectorize::{
     x86_avx2_available_pub, x86_prefer_wide_pub, x86_simd_available_pub, x86_sse41_available_pub,
 };
+use std::hash::{Hash, Hasher};
 
-/// Hashable lane encoding for pack dedup. Exact — no lossy constant
-/// folding, so distinct constants can never collide into one pack.
+/// Hashable lane encoding for PACK / SPLAT dedup. Exact on float bits, but
+/// deliberately VALUE-based for integer constants: `I8(0)`, `I32(0)` and
+/// `Zero` are one key.  That equivalence is load-bearing — separating the
+/// variants adds extra `Splat` packs to `s_clamp_u8`, changing its measured
+/// cost-model benefit from +2 to -2 and losing the 0.8399x Callgrind Ir win
+/// (Python `test_30`).  Seed dedup needs STRICT operand identity, so it uses
+/// the separate `SeedOperandKey` below instead of changing this key.
 /// LongDouble stores its f64 approximation bit-exactly alongside the 16
 /// binary128 bytes (f64 has no Hash — keep the raw bits only).
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LaneKey {
     V(u32),
     I(i128),
@@ -85,6 +91,38 @@ fn lane_key(op: &Operand) -> LaneKey {
             IrConst::D32(v) => LaneKey::D32(*v),
             IrConst::D64(v) => LaneKey::D64(*v),
         },
+    }
+}
+
+/// One store's position in an address stream:
+/// (byte offset, store instruction index, stored operand, store pointer,
+///  RAW SSA address base).
+///
+/// The fifth field is what the old, second `site_streams` HashMap keyed on.
+/// Carrying it in the entry lets the site tier be reconstructed as a
+/// PARTITION of one object-tier stream: one map, one insertion per store, no
+/// per-store clone, and no duplicate stream for a single-web root.
+pub(super) type StreamEntry = (i64, usize, Operand, Value, u32);
+
+/// EXACT hashable operand identity, used ONLY by seed dedup.  Unlike
+/// `LaneKey`, it preserves the constant variant (`I8(0)` vs `Zero`) and the
+/// lossy `f64` approximation that `IrConst::to_hash_key` drops for
+/// `LongDouble`.  Keeping it separate means the pack/splat key's deliberate
+/// value-equivalence semantics are untouched while seed dedup never conflates
+/// two genuinely different stored operands.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SeedOperandKey {
+    V(u32),
+    C(ConstHashKey),
+    /// (`f64` approximation bits, 16 binary128 bytes)
+    LD(u64, [u8; 16]),
+}
+
+fn seed_operand_key(op: &Operand) -> SeedOperandKey {
+    match op {
+        Operand::Value(v) => SeedOperandKey::V(v.0),
+        Operand::Const(IrConst::LongDouble(f, b)) => SeedOperandKey::LD(f.to_bits(), *b),
+        Operand::Const(c) => SeedOperandKey::C(c.to_hash_key()),
     }
 }
 
@@ -1890,6 +1928,7 @@ struct Pack {
     order: usize,
 }
 
+#[derive(Clone, Debug)]
 struct SeedCandidate {
     /// Store instruction indices, address-ordered (lane i at stream offset
     /// off0 + i*size).
@@ -1904,11 +1943,12 @@ struct SeedCandidate {
     value_sink: Option<Value>,
 }
 
-/// EXACT identity of a seed.  Two tiers can emit the same run; a boolean
-/// `joint.is_some()` / `value_sink.is_some()` would silently conflate two
-/// different joint tails or two different return sinks.  `store_idx` already
-/// determines `lane_ops` (the same store instruction has one stored
-/// operand), but `anchor_ptr` is included explicitly so the key is total.
+/// EXACT identity of a seed, used only as the slow REFERENCE ORACLE in unit
+/// tests.  `joint`/`value_sink` are compared by payload (a boolean
+/// `is_some()` would conflate two different tails or sinks), and `lane_ops`
+/// is included through `SeedOperandKey` rather than relying on the invariant
+/// that `store_idx` determines the stored operands.
+#[cfg(test)]
 type SeedKey = (
     IrType,
     usize,
@@ -1916,8 +1956,10 @@ type SeedKey = (
     Value,
     Option<joint::Tail>,
     Option<Value>,
+    Vec<SeedOperandKey>,
 );
 
+#[cfg(test)]
 fn seed_dedup_key(c: &SeedCandidate) -> SeedKey {
     (
         c.ty,
@@ -1926,7 +1968,105 @@ fn seed_dedup_key(c: &SeedCandidate) -> SeedKey {
         c.anchor_ptr,
         c.joint,
         c.value_sink,
+        c.lane_ops.iter().map(seed_operand_key).collect(),
     )
+}
+
+/// Stable, allocation-free hash of the FULL seed identity.  `FxHasher` is
+/// deliberately non-cryptographic: a collision is not a correctness problem
+/// because `dedup_seed_candidates` compares every hashed field exactly within
+/// each equal-hash group.  Hashing `SeedOperandKey` (not `Operand`) keeps
+/// float/double constants bit-exact and preserves the constant variant
+/// without requiring `Hash` on `IrConst`.
+#[inline]
+fn seed_hash(c: &SeedCandidate) -> u64 {
+    let mut h = FxHasher::default();
+    c.ty.hash(&mut h);
+    c.width.hash(&mut h);
+    c.store_idx.hash(&mut h);
+    c.anchor_ptr.hash(&mut h);
+    c.joint.hash(&mut h);
+    c.value_sink.hash(&mut h);
+    c.lane_ops.len().hash(&mut h);
+    for op in &c.lane_ops {
+        seed_operand_key(op).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Exact equality of every field `seed_hash` hashes.  `lane_ops` is compared
+/// through `SeedOperandKey` so distinct float bit patterns and distinct
+/// constant variants never compare equal.
+#[inline]
+fn seed_fields_eq(a: &SeedCandidate, b: &SeedCandidate) -> bool {
+    a.ty == b.ty
+        && a.width == b.width
+        && a.store_idx == b.store_idx
+        && a.anchor_ptr == b.anchor_ptr
+        && a.joint == b.joint
+        && a.value_sink == b.value_sink
+        && a.lane_ops.len() == b.lane_ops.len()
+        && a.lane_ops
+            .iter()
+            .zip(&b.lane_ops)
+            .all(|(x, y)| seed_operand_key(x) == seed_operand_key(y))
+}
+
+/// Distinct representatives of one 64-bit hash bucket.  The overwhelmingly
+/// common case is ONE candidate per bucket, so the first index is stored
+/// inline and no `Vec` is allocated per seed.  Only a genuine hash collision
+/// between two DIFFERENT seeds promotes the bucket to `Many`.
+enum SeedReps {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+/// Collapse EXACTLY identical seeds in O(n) expected time, preserving the
+/// first occurrence and the original order.
+///
+/// The owned `FxHashSet<SeedKey>` it replaces allocated a fresh `Vec<usize>`
+/// for EVERY candidate on EVERY fixpoint round.  A sort-by-hash alternative
+/// was measured SLOWER (2,253,108,448 Ir vs 2,252,135,211 Ir baseline on the
+/// 300-global seed stress) because of the O(n log n) sort and the extra
+/// `keep` vector.  This version keeps one inline representative per bucket,
+/// hashes each seed once, and compares fields ONLY inside a colliding bucket.
+fn dedup_seed_candidates(mut candidates: Vec<SeedCandidate>) -> Vec<SeedCandidate> {
+    // Fast paths for the overwhelmingly common tiny blocks: no HashMap and
+    // no hashing at all.  Blocks with 0/1 seed are free, and a 2-seed block
+    // only needs ONE exact field comparison (hashing both plus two map
+    // lookups was strictly more work).
+    if candidates.len() < 2 {
+        return candidates;
+    }
+    if candidates.len() == 2 && seed_fields_eq(&candidates[0], &candidates[1]) {
+        candidates.pop();
+        return candidates;
+    }
+    let mut groups: FxHashMap<u64, SeedReps> = FxHashMap::default();
+    let mut out: Vec<SeedCandidate> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let h = seed_hash(&c);
+        let duplicate = match groups.get(&h) {
+            None => false,
+            Some(SeedReps::One(i)) => seed_fields_eq(&out[*i], &c),
+            Some(SeedReps::Many(v)) => v.iter().any(|&i| seed_fields_eq(&out[i], &c)),
+        };
+        if duplicate {
+            continue;
+        }
+        let idx = out.len();
+        match groups.get_mut(&h) {
+            None => {
+                groups.insert(h, SeedReps::One(idx));
+            }
+            Some(reps) => match reps {
+                SeedReps::One(first) => *reps = SeedReps::Many(vec![*first, idx]),
+                SeedReps::Many(v) => v.push(idx),
+            },
+        }
+        out.push(c);
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2301,42 +2441,179 @@ fn is_memory_access(inst: &Instruction) -> bool {
 
 /// Collect store seeds: runs of stores on one address stream with
 /// consecutive offsets at the lane stride, longest first.
+fn push_stream_candidates(
+    ctx: &BlockCtx,
+    ty: IrType,
+    mut sorted: Vec<StreamEntry>,
+    is_object_tier: bool,
+    avx2: bool,
+    candidates: &mut Vec<SeedCandidate>,
+) {
+    if sorted.len() < 2 {
+        return;
+    }
+    sorted.sort_by_key(|(off, idx, ..)| (*off, *idx));
+    if is_object_tier && ty == IrType::U8 && x86_sse41_available_pub() {
+        // Joint seeds use the LAST store to each byte; overwritten stores
+        // are retired only after the complete use/access proof below.
+        let mut last: Vec<StreamEntry> = Vec::new();
+        for e in &sorted {
+            if last.last().is_some_and(|p: &StreamEntry| p.0 == e.0) {
+                last.pop();
+            }
+            last.push(e.clone());
+        }
+        for window in last.windows(4) {
+            if window
+                .windows(2)
+                .all(|w| w[1].0.checked_sub(w[0].0) == Some(1))
+            {
+                if let Some(seed) = joint::seed(ctx, window) {
+                    candidates.push(seed);
+                }
+            }
+        }
+    }
+
+    let size = ty.size() as i64;
+    if size <= 0 {
+        return;
+    }
+    // Split into consecutive runs at stride == size. A duplicate offset
+    // (store overwritten by a later store to the same address) ends the
+    // current run; the earlier store stays scalar.
+    let mut run: Vec<StreamEntry> = Vec::new();
+    let flush = |run: &mut Vec<StreamEntry>, candidates: &mut Vec<SeedCandidate>| {
+        if run.len() >= 2 {
+            let mut offs: Vec<i64> = run.iter().map(|(o, ..)| *o).collect();
+            offs.dedup();
+            if offs.len() == run.len() {
+                if let Some(width) = preferred_width(run.len(), size as u64, ty, avx2) {
+                    let store_idx: Vec<usize> = run[..width].iter().map(|(_, i, ..)| *i).collect();
+                    let lane_ops: Vec<Operand> =
+                        run[..width].iter().map(|(_, _, v, ..)| v.clone()).collect();
+                    candidates.push(SeedCandidate {
+                        store_idx,
+                        lane_ops,
+                        ty,
+                        anchor_ptr: run[0].3,
+                        width,
+                        joint: None,
+                        value_sink: None,
+                    });
+                    // Fallback sub-window candidates: the full-width seed
+                    // takes the first `width` stores of the run, and when ITS
+                    // lanes are not uniform (v7_pressure: three independent
+                    // 4-lane groups fused into one 12-store run) the pack
+                    // build fails and, without fallbacks, the WHOLE run stays
+                    // scalar. Every aligned 128-bit window is offered as its
+                    // own seed so the uniform groups still pack.
+                    // Overlap is safe: plans are attempted longest-first, one
+                    // applied per scan, and the rewrite turns the packed
+                    // stores into vector stores before the rescan re-collects.
+                    let w128 = (16 / size) as usize;
+                    if width > w128 {
+                        for chunk in run.chunks(w128) {
+                            if chunk.len() < 2 {
+                                continue;
+                            }
+                            let cw = match preferred_width(chunk.len(), size as u64, ty, avx2) {
+                                Some(cw) if cw == chunk.len() => cw,
+                                _ => continue,
+                            };
+                            let store_idx: Vec<usize> = chunk.iter().map(|(_, i, ..)| *i).collect();
+                            let lane_ops: Vec<Operand> =
+                                chunk.iter().map(|(_, _, v, ..)| v.clone()).collect();
+                            candidates.push(SeedCandidate {
+                                store_idx,
+                                lane_ops,
+                                ty,
+                                anchor_ptr: chunk[0].3,
+                                width: cw,
+                                joint: None,
+                                value_sink: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        run.clear();
+    };
+    for entry in &sorted {
+        if let Some(last) = run.last() {
+            // checked: an offset delta that does not fit i64 cannot be the
+            // lane stride (debug builds would panic on overflow).
+            if entry.0.checked_sub(last.0) != Some(size) {
+                flush(&mut run, candidates);
+            }
+        }
+        run.push(entry.clone());
+    }
+    flush(&mut run, candidates);
+}
+
+/// Partition one object-tier stream into the site-tier streams the ORIGINAL
+/// two-map implementation would have built.  A stream with a single raw SSA
+/// base has NO distinct site tier: the old code built a byte-identical second
+/// stream, sorted it, split it, built a duplicate seed and then threw the
+/// duplicate away in the exact-dedup pass.  Returning an empty vector here is
+/// the measured fix — zero duplicate work, zero per-store clone.
+///
+/// `StreamBase::Value(v)` roots always have exactly one raw base (`v` itself),
+/// so they never get a site tier either; that is the same behaviour as before,
+/// now derived instead of special-cased.
+fn site_subsets(entries: &[StreamEntry]) -> Vec<Vec<StreamEntry>> {
+    // ZERO-ALLOCATION fast path: the overwhelmingly common case is one raw
+    // address web per object stream.  Allocating a HashMap just to discover
+    // it has one entry cost 8,551 Ir on the 320-store stress file (measured
+    // with Callgrind), so scan first and only build buckets when the scan
+    // PROVES there is more than one web.
+    let Some(first) = entries.first() else {
+        return Vec::new();
+    };
+    let only_base = first.4;
+    if entries.iter().all(|e| e.4 == only_base) {
+        return Vec::new();
+    }
+    // ONE pass builds the buckets: O(n) hashing, O(b) map lookups.  The
+    // obvious `bases.map(|b| entries.filter(...))` form is O(n*b) and becomes
+    // quadratic when PostVec unrolling materialises one address web per copy
+    // of a loop body.  Preserve first-appearance order of each bucket so the
+    // stable final sort sees the same tie order as the old two-map chain.
+    let mut buckets: FxHashMap<u32, Vec<StreamEntry>> = FxHashMap::default();
+    for e in entries {
+        buckets.entry(e.4).or_default().push(e.clone());
+    }
+    buckets.into_values().collect()
+}
+
+/// Collect store seeds: runs of stores on one address stream with
+/// consecutive offsets at the lane stride, longest first.
 fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
     let block = ctx.block;
     // The SLP driver's width choice honours `-mprefer-vector-width=`. The
     // shared `family_for`/`packed_*` helpers keep the raw hardware permission
     // because the frontend's explicit `vector_size` lowering calls them too.
     let avx2 = x86_avx2_available_pub() && x86_prefer_wide_pub();
-    // TWO seed tiers, one cost model.  `entries` is
-    // (off, store_idx, stored value, address SSA value).
+    // ONE map, TWO tiers.  Every store is inserted exactly once, carrying its
+    // raw SSA address base in `StreamEntry`.  The object tier groups by
+    // `StreamBase` (interned symbol / parameter index): the frontend and
+    // PostVec unroller emit several `GlobalAddr`s for ONE object, and keying
+    // on their SSA ids split a consecutive run into one-element streams.
+    // The site tier is the ORIGINAL grouping by raw SSA base; it is the only
+    // source of the 2-lane dword pair family (`movq`-loaded XMM pairs), which
+    // hosted CI caught being deleted by an object-only design.
     //
-    // * OBJECT tier: keyed by `StreamBase` (interned symbol / parameter
-    //   index).  The frontend and the PostVec unroller emit several
-    //   `GlobalAddr`s for ONE object; keying on their SSA ids split a
-    //   consecutive store run into one-element streams and BB-SLP saw zero
-    //   seeds.  This tier is what unlocks the 4xU32 `s_jhash` pack.
-    // * SITE tier: keyed by the raw `SymAddr::base` SSA value.  It is the
-    //   ORIGINAL grouping, and it is the only source of the 2-lane dword
-    //   pair family (`movq`-loaded XMM pairs).  Replacing it with the
-    //   object tier silently deleted that family - hosted CI caught it in
-    //   `check_slp_loop_carried_recurrence.sh`.  Keeping BOTH tiers is
-    //   strictly more powerful: every candidate still goes through the same
-    //   `build_plan` legality proofs over its OWN store-index span, so no
-    //   narrow window can inherit an illegal wide plan's permission.
-    //
-    // A `StreamBase::Value` root has no object-identity merge to undo, so
-    // its site-tier key would be byte-identical to the object key; skip it.
-    // All other roots feed both tiers.  A final EXACT dedup collapses the
-    // identical single-web seeds before any plan is priced (see
-    // `seed_dedup_key`).
-    let mut object_streams: FxHashMap<
-        (StreamBase, Option<u32>, u64, IrType),
-        Vec<(i64, usize, Operand, Value)>,
-    > = FxHashMap::default();
-    let mut site_streams: FxHashMap<
-        (u32, Option<u32>, u64, IrType),
-        Vec<(i64, usize, Operand, Value)>,
-    > = FxHashMap::default();
+    // Instead of a second map with a cloned entry per store, `site_subsets`
+    // reconstructs the site tier as a PARTITION of each object-tier stream,
+    // and ONLY when there is more than one distinct raw base.  For a
+    // single-web global the two tiers were byte-identical, so the old code
+    // paid twice for map insertion, sort, run splitting and seed building and
+    // then discarded one copy.  Both tiers still go through the same
+    // `build_plan` legality proofs over their OWN store-index span.
+    let mut object_streams: FxHashMap<(StreamBase, Option<u32>, u64, IrType), Vec<StreamEntry>> =
+        FxHashMap::default();
     for (i, inst) in block.instructions.iter().enumerate() {
         let Instruction::Store {
             val,
@@ -2356,146 +2633,35 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
         };
         let var = addr.var.map(|v| v.0);
         let root = ctx.roots.stream_base(addr.base);
-        let entry = (addr.off, i, val.clone(), *ptr);
+        let entry: StreamEntry = (addr.off, i, val.clone(), *ptr, addr.base.0);
         object_streams
             .entry((root, var, addr.mult, *ty))
             .or_default()
-            .push(entry.clone());
-        if !matches!(root, StreamBase::Value(_)) {
-            site_streams
-                .entry((addr.base.0, var, addr.mult, *ty))
-                .or_default()
-                .push(entry);
-        }
+            .push(entry);
     }
-    // Chain both tiers into one `(ty, entries, is_object_tier)` stream so
-    // the existing run-splitting / fallback logic has exactly one body.
-    let groups = object_streams
-        .into_iter()
-        .map(|(k, v)| (k.3, v, true))
-        .chain(site_streams.into_iter().map(|(k, v)| (k.3, v, false)));
     let mut candidates = Vec::new();
-    for (ty, mut entries, is_object_tier) in groups {
-        if entries.len() < 2 {
-            continue;
-        }
-        entries.sort_by_key(|(off, idx, _, _)| (*off, *idx));
-        if is_object_tier && ty == IrType::U8 && x86_sse41_available_pub() {
-            // Joint seeds use the LAST store to each byte; overwritten stores
-            // are retired only after the complete use/access proof below.
-            let mut last = Vec::new();
-            for e in &entries {
-                if last
-                    .last()
-                    .is_some_and(|p: &(i64, usize, Operand, Value)| p.0 == e.0)
-                {
-                    last.pop();
-                }
-                last.push(e.clone());
-            }
-            for window in last.windows(4) {
-                if window
-                    .windows(2)
-                    .all(|w| w[1].0.checked_sub(w[0].0) == Some(1))
-                {
-                    if let Some(seed) = joint::seed(ctx, window) {
-                        candidates.push(seed);
-                    }
-                }
-            }
-        }
-
-        let size = ty.size() as i64;
-        if size <= 0 {
-            continue;
-        }
-        // Split into consecutive runs at stride == size. A duplicate
-        // offset (store overwritten by a later store to the same address)
-        // ends the current run; the earlier store stays scalar.
-        let mut run: Vec<(i64, usize, Operand, Value)> = Vec::new();
-        let flush = |run: &mut Vec<(i64, usize, Operand, Value)>,
-                     candidates: &mut Vec<SeedCandidate>| {
-            if run.len() >= 2 {
-                let mut offs: Vec<i64> = run.iter().map(|(o, ..)| *o).collect();
-                offs.dedup();
-                if offs.len() == run.len() {
-                    if let Some(width) = preferred_width(run.len(), size as u64, ty, avx2) {
-                        let store_idx: Vec<usize> =
-                            run[..width].iter().map(|(_, i, _, _)| *i).collect();
-                        let lane_ops: Vec<Operand> =
-                            run[..width].iter().map(|(_, _, v, _)| v.clone()).collect();
-                        candidates.push(SeedCandidate {
-                            store_idx,
-                            lane_ops,
-                            ty,
-                            anchor_ptr: run[0].3,
-                            width,
-                            joint: None,
-                            value_sink: None,
-                        });
-                        // Fallback sub-window candidates: the full-width
-                        // seed takes the first `width` stores of the run,
-                        // and when ITS lanes are not uniform (v7_pressure:
-                        // three independent 4-lane groups — add, sub, xor
-                        // — fused into one 12-store run) the pack build
-                        // fails and, without fallbacks, the WHOLE run
-                        // stays scalar. Every aligned 128-bit window is
-                        // offered as its own seed so the uniform groups
-                        // still pack (GCC's behavior on the same shape).
-                        // Overlap with the primary seed is safe: plans are
-                        // attempted longest-first, one applied per scan,
-                        // and the rewrite turns the packed stores into
-                        // vector stores before the rescan re-collects.
-                        let w128 = (16 / size) as usize;
-                        if width > w128 {
-                            for chunk in run.chunks(w128) {
-                                if chunk.len() < 2 {
-                                    continue;
-                                }
-                                let cw = match preferred_width(chunk.len(), size as u64, ty, avx2) {
-                                    Some(cw) if cw == chunk.len() => cw,
-                                    _ => continue,
-                                };
-                                let store_idx: Vec<usize> =
-                                    chunk.iter().map(|(_, i, _, _)| *i).collect();
-                                let lane_ops: Vec<Operand> =
-                                    chunk.iter().map(|(_, _, v, _)| v.clone()).collect();
-                                candidates.push(SeedCandidate {
-                                    store_idx,
-                                    lane_ops,
-                                    ty,
-                                    anchor_ptr: chunk[0].3,
-                                    width: cw,
-                                    joint: None,
-                                    value_sink: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            run.clear();
-        };
-        for entry in &entries {
-            if let Some(last) = run.last() {
-                // checked: an offset delta that does not fit i64 cannot be
-                // the lane stride (debug builds would panic on overflow).
-                if entry.0.checked_sub(last.0) != Some(size) {
-                    flush(&mut run, &mut candidates);
-                }
-            }
-            run.push(entry.clone());
-        }
-        flush(&mut run, &mut candidates);
+    // Keep the object-tier / site-tier ordering of the old chained iterator
+    // so the stable final sort sees the same tie order as before.
+    let mut site_groups: Vec<(IrType, Vec<StreamEntry>)> = Vec::new();
+    for (key, entries) in object_streams {
+        let ty = key.3;
+        // Derive the site partition BEFORE consuming `entries`; each entry is
+        // cloned exactly once into its own bucket, then the original Vec is
+        // moved into the object tier with no second `to_vec()` copy.
+        let subsets = site_subsets(&entries);
+        push_stream_candidates(ctx, ty, entries, true, avx2, &mut candidates);
+        site_groups.extend(subsets.into_iter().map(|subset| (ty, subset)));
+    }
+    for (ty, subset) in site_groups {
+        push_stream_candidates(ctx, ty, subset, false, avx2, &mut candidates);
     }
     if let Some(seed) = joint::value_seed(ctx) {
         candidates.push(seed);
     }
-    // A single-web global produces the SAME run in both tiers.  Collapse
-    // EXACTLY identical seeds so the cost model and `apply_plan` are not
-    // paid twice; `seed_dedup_key` pins every distinguishing field.
-    let mut seen: FxHashSet<SeedKey> = FxHashSet::default();
-    candidates.retain(|c| seen.insert(seed_dedup_key(c)));
+    // Defensive EXACT dedup: with the one-map design there should be no
+    // tier duplicates left, but joint/value seeds and future refactors must
+    // never price or apply the same plan twice.
+    let mut candidates = dedup_seed_candidates(candidates);
     // Longest chains first; ties by earliest position.
     candidates.sort_by(|a, b| {
         b.lane_ops
@@ -8082,5 +8248,523 @@ mod tests {
         let mut g = make(None, None);
         g.anchor_ptr = Value(43);
         assert_ne!(seed_dedup_key(&d), seed_dedup_key(&g));
+    }
+
+    // ── seed-stream red-team fixtures ────────────────────────────────────
+
+    fn seed_ctx<'a>(
+        func: &'a IrFunction,
+        roots: &'a SymbolRoots,
+        external: &'a FxHashSet<u32>,
+        steps: &'a FxHashMap<u32, i64>,
+    ) -> BlockCtx<'a> {
+        build_ctx(func, 0, external, Default::default(), steps, false, roots)
+    }
+
+    /// (GEP dest, raw base, byte offset).  All `GlobalAddr`s share the name
+    /// `"g"`, so `SymbolRoots` merges them into ONE object identity; the raw
+    /// SSA bases stay distinct, which is exactly the two-tier case.
+    fn store_stream_fixture(
+        webs: &[u32],
+        ptrs: &[(u32, u32, i64)],
+        raw_value_root: bool,
+    ) -> IrFunction {
+        let mut insts = Vec::new();
+        if !raw_value_root {
+            for &w in webs {
+                insts.push(Instruction::GlobalAddr {
+                    dest: Value(w),
+                    name: "g".into(),
+                });
+            }
+        }
+        for &(dest, base, off) in ptrs {
+            insts.push(Instruction::GetElementPtr {
+                dest: Value(dest),
+                base: Value(base),
+                offset: Operand::Const(IrConst::I64(off)),
+                ty: IrType::Ptr,
+            });
+        }
+        for (k, &(dest, _, _)) in ptrs.iter().enumerate() {
+            insts.push(Instruction::Store {
+                val: Operand::Const(IrConst::I32(100 + k as i32)),
+                ptr: Value(dest),
+                ty: IrType::U32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+        }
+        let mut f = IrFunction::new("seed_fixture".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        f
+    }
+
+    /// The ISA gate is thread-local state shared by libtest's worker threads;
+    /// save/set/restore so parallel test execution cannot leak into others.
+    fn with_isa_gate<T>(f: impl FnOnce() -> T) -> T {
+        use crate::passes::vectorize as v;
+        let saved = (
+            v::x86_simd_available_pub(),
+            v::x86_avx2_available_pub(),
+            v::x86_sse41_available_pub(),
+            v::x86_avx512vl_available_pub(),
+            v::x86_prefer_vector_bits_pub(),
+        );
+        v::set_x86_simd_isa(true, true, true, false);
+        v::set_x86_prefer_vector_bits(256);
+        let out = f();
+        v::set_x86_prefer_vector_bits(saved.4);
+        v::set_x86_simd_isa(saved.0, saved.1, saved.2, saved.3);
+        out
+    }
+
+    fn stream_entry(off: i64, idx: usize, base: u32) -> StreamEntry {
+        (
+            off,
+            idx,
+            Operand::Const(IrConst::I32(idx as i32)),
+            Value(idx as u32 + 100),
+            base,
+        )
+    }
+
+    #[test]
+    fn site_subsets_is_empty_for_a_single_web_and_exact_for_merged_roots() {
+        let single: Vec<StreamEntry> = (0..4usize)
+            .map(|i| stream_entry(i as i64 * 4, i, 1))
+            .collect();
+        assert!(
+            site_subsets(&single).is_empty(),
+            "a single raw base has NO distinct site tier; building one is pure waste"
+        );
+        let merged: Vec<StreamEntry> = [
+            stream_entry(0, 0, 1),
+            stream_entry(4, 1, 1),
+            stream_entry(8, 2, 2),
+            stream_entry(12, 3, 2),
+            stream_entry(16, 4, 3),
+        ]
+        .to_vec();
+        let subsets = site_subsets(&merged);
+        assert_eq!(subsets.len(), 3, "one site stream per distinct raw base");
+        assert_eq!(subsets[0].len(), 2);
+        assert_eq!(subsets[1].len(), 2);
+        assert_eq!(subsets[2].len(), 1);
+        assert!(subsets[0].iter().all(|e| e.4 == 1));
+        assert!(subsets[1].iter().all(|e| e.4 == 2));
+        assert!(subsets[2].iter().all(|e| e.4 == 3));
+        // A Value root can never have two raw bases (the base IS the root).
+        let value_root: Vec<StreamEntry> =
+            (0..4usize).map(|i| stream_entry(i as i64, i, 9)).collect();
+        assert!(site_subsets(&value_root).is_empty());
+    }
+
+    #[test]
+    fn collect_seed_candidates_single_web_is_deduplicated_exactly_once() {
+        let f = store_stream_fixture(&[1], &[(10, 1, 0), (11, 1, 4)], false);
+        let roots = SymbolRoots::build(&f);
+        let external = FxHashSet::default();
+        let steps = FxHashMap::default();
+        let ctx = seed_ctx(&f, &roots, &external, &steps);
+        let candidates = with_isa_gate(|| collect_seed_candidates(&ctx));
+        assert_eq!(
+            candidates.len(),
+            1,
+            "one object stream must yield exactly ONE seed, with no site duplicate"
+        );
+        assert_eq!(
+            candidates[0].width, 2,
+            "two dword stores are the pair family"
+        );
+        assert_eq!(candidates[0].store_idx.len(), 2);
+    }
+
+    #[test]
+    fn collect_seed_candidates_two_webs_keep_wide_and_pair_tiers() {
+        let f = store_stream_fixture(
+            &[1, 2],
+            &[(10, 1, 0), (11, 1, 4), (12, 2, 8), (13, 2, 12)],
+            false,
+        );
+        let roots = SymbolRoots::build(&f);
+        let external = FxHashSet::default();
+        let steps = FxHashMap::default();
+        let ctx = seed_ctx(&f, &roots, &external, &steps);
+        let candidates = with_isa_gate(|| collect_seed_candidates(&ctx));
+        assert_eq!(
+            candidates.len(),
+            3,
+            "one 4-lane object seed plus two 2-lane site seeds, none conflated"
+        );
+        let widths: Vec<usize> = candidates.iter().map(|c| c.width).collect();
+        assert!(
+            widths.contains(&4),
+            "object identity must merge the two webs"
+        );
+        assert_eq!(widths.iter().filter(|&&w| w == 2).count(), 2);
+        let keys: FxHashSet<SeedKey> = candidates.iter().map(seed_dedup_key).collect();
+        assert_eq!(keys.len(), 3, "all three surviving keys must be distinct");
+    }
+
+    #[test]
+    fn collect_seed_candidates_raw_value_root_skips_site_tier_without_clone() {
+        let f = store_stream_fixture(&[1], &[(10, 1, 0), (11, 1, 4)], true);
+        let roots = SymbolRoots::build(&f);
+        let external = FxHashSet::default();
+        let steps = FxHashMap::default();
+        let ctx = seed_ctx(&f, &roots, &external, &steps);
+        let candidates = with_isa_gate(|| collect_seed_candidates(&ctx));
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a Value root has no object merge to undo"
+        );
+        assert_eq!(candidates[0].width, 2);
+        assert!(matches!(roots.stream_base(Value(1)), StreamBase::Value(1)));
+    }
+
+    #[test]
+    fn push_stream_candidates_handles_i64_offset_extremes_without_overflow() {
+        let external = FxHashSet::default();
+        let roots = SymbolRoots::default();
+        let steps = FxHashMap::default();
+        // build_ctx borrows `func.blocks[0]`: a fixture with zero blocks
+        // cannot produce a usable context.  An empty basic block is enough
+        // because push_stream_candidates only reads `ctx` for the joint
+        // path (the extreme offsets are not a 4-byte U8 joint run).
+        let mut f = IrFunction::new("extremes".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let ctx = build_ctx(&f, 0, &external, Default::default(), &steps, false, &roots);
+        // Four lanes at i64::MIN: every delta is exactly 4, no overflow.
+        let low: Vec<StreamEntry> = (0..4usize)
+            .map(|i| stream_entry(i64::MIN + i as i64 * 4, i, 1))
+            .collect();
+        let mut a = Vec::new();
+        with_isa_gate(|| push_stream_candidates(&ctx, IrType::U32, low, true, true, &mut a));
+        assert_eq!(a.len(), 1, "a valid 4-lane run at i64::MIN still seeds");
+        // A huge gap must be a run break, never a panic on checked_sub.
+        let gap: Vec<StreamEntry> = vec![
+            stream_entry(i64::MIN, 0, 1),
+            stream_entry(i64::MIN + 4, 1, 1),
+            stream_entry(i64::MAX - 4, 2, 1),
+            stream_entry(i64::MAX, 3, 1),
+        ];
+        let mut b = Vec::new();
+        with_isa_gate(|| push_stream_candidates(&ctx, IrType::U32, gap, true, true, &mut b));
+        // The overflowing delta splits ONE 4-entry input into TWO 2-lane
+        // runs.  Both are valid pair-family seeds; what matters is that no
+        // 4-lane seed spans the gap and no checked_sub can panic.
+        assert_eq!(b.len(), 2, "the overflowing delta splits the run");
+        assert!(b.iter().all(|c| c.width == 2));
+    }
+
+    // ── exact operand identity and O(n) dedup ────────────────────────────
+
+    #[test]
+    fn lane_key_value_equivalence_is_intentional_and_bit_exact_for_floats() {
+        // Splitting these costs `s_clamp_u8` its measured 0.8399x Ir win.
+        assert_eq!(
+            lane_key(&Operand::Const(IrConst::I8(0))),
+            lane_key(&Operand::Const(IrConst::Zero))
+        );
+        assert_eq!(
+            lane_key(&Operand::Const(IrConst::I32(9))),
+            lane_key(&Operand::Const(IrConst::I64(9)))
+        );
+        assert_ne!(
+            lane_key(&Operand::Const(IrConst::F32(-0.0))),
+            lane_key(&Operand::Const(IrConst::F32(0.0)))
+        );
+    }
+
+    #[test]
+    fn seed_operand_key_preserves_every_constant_variant_and_bit_pattern() {
+        let z8 = seed_operand_key(&Operand::Const(IrConst::I8(0)));
+        let z32 = seed_operand_key(&Operand::Const(IrConst::I32(0)));
+        let zero = seed_operand_key(&Operand::Const(IrConst::Zero));
+        assert_ne!(z8, zero);
+        assert_ne!(z8, z32);
+        assert_ne!(z32, zero);
+        assert_ne!(
+            seed_operand_key(&Operand::Const(IrConst::F32(0.0))),
+            seed_operand_key(&Operand::Const(IrConst::F32(-0.0)))
+        );
+        let bytes = [0u8; 16];
+        let ld_a = seed_operand_key(&Operand::Const(IrConst::LongDouble(1.0, bytes)));
+        let ld_b = seed_operand_key(&Operand::Const(IrConst::LongDouble(2.0, bytes)));
+        assert_ne!(ld_a, ld_b, "ConstHashKey drops the f64 approximation");
+        let mut bytes2 = bytes;
+        bytes2[0] = 1;
+        assert_ne!(
+            ld_a,
+            seed_operand_key(&Operand::Const(IrConst::LongDouble(1.0, bytes2)))
+        );
+        assert_eq!(
+            seed_operand_key(&Operand::Value(Value(7))),
+            seed_operand_key(&Operand::Value(Value(7)))
+        );
+        assert_ne!(
+            seed_operand_key(&Operand::Value(Value(7))),
+            seed_operand_key(&Operand::Value(Value(8)))
+        );
+    }
+
+    #[test]
+    fn seed_hash_is_consistent_with_exact_field_equality() {
+        let make = |sink: Option<Value>, lane: Operand| SeedCandidate {
+            store_idx: vec![3, 4, 5, 6],
+            lane_ops: vec![lane; 4],
+            ty: IrType::U32,
+            anchor_ptr: Value(11),
+            width: 4,
+            joint: None,
+            value_sink: sink,
+        };
+        let ops = [
+            Operand::Const(IrConst::I8(0)),
+            Operand::Const(IrConst::Zero),
+            Operand::Const(IrConst::F32(-0.0)),
+            Operand::Value(Value(9)),
+        ];
+        for sink in [None, Some(Value(1)), Some(Value(2))] {
+            for op in ops.iter() {
+                let a = make(sink, op.clone());
+                let b = make(sink, op.clone());
+                let c = make(sink, Operand::Const(IrConst::I64(123)));
+                assert!(seed_fields_eq(&a, &b));
+                assert_eq!(seed_hash(&a), seed_hash(&b));
+                assert!(!seed_fields_eq(&a, &c));
+            }
+        }
+    }
+
+    #[test]
+    fn dedup_seed_candidates_never_merges_constant_variant_only_differences() {
+        let make = |lane: Operand| SeedCandidate {
+            store_idx: vec![7, 8, 9, 10],
+            lane_ops: vec![lane; 4],
+            ty: IrType::U32,
+            anchor_ptr: Value(42),
+            width: 4,
+            joint: None,
+            value_sink: None,
+        };
+        let a = make(Operand::Const(IrConst::I8(0)));
+        let b = make(Operand::Const(IrConst::Zero));
+        let c = make(Operand::Const(IrConst::I8(0)));
+        let out = dedup_seed_candidates(vec![a, b, c]);
+        assert_eq!(out.len(), 2, "only the EXACT duplicate may be removed");
+        assert_eq!(
+            seed_dedup_key(&out[0]),
+            seed_dedup_key(&make(Operand::Const(IrConst::I8(0))))
+        );
+        assert_eq!(
+            seed_dedup_key(&out[1]),
+            seed_dedup_key(&make(Operand::Const(IrConst::Zero)))
+        );
+    }
+
+    #[test]
+    fn dedup_seed_candidates_matches_exact_reference_on_generated_set() {
+        use super::joint::Tail;
+        // 240 candidates, deliberately full of exact repeats and near misses
+        // in every distinguishing field (tail payload, sink payload, anchor,
+        // width, store span, lane operands).
+        let mut input: Vec<SeedCandidate> = Vec::new();
+        for i in 0..240usize {
+            let group = i % 12;
+            let tail = match group {
+                0 => Some(Tail {
+                    alpha: 0,
+                    four_inputs: false,
+                }),
+                1 => Some(Tail {
+                    alpha: 1,
+                    four_inputs: false,
+                }),
+                2 => Some(Tail {
+                    alpha: 0,
+                    four_inputs: true,
+                }),
+                _ => None,
+            };
+            let sink = if group == 3 { Some(Value(9)) } else { None };
+            let lane = match group {
+                4 => Operand::Const(IrConst::I8(0)),
+                5 => Operand::Const(IrConst::Zero),
+                6 => Operand::Const(IrConst::F32(-0.0)),
+                7 => Operand::Const(IrConst::F32(0.0)),
+                8 => Operand::Const(IrConst::LongDouble(1.0, [0; 16])),
+                9 => Operand::Const(IrConst::LongDouble(2.0, [0; 16])),
+                _ => Operand::Value(Value(1)),
+            };
+            input.push(SeedCandidate {
+                store_idx: vec![group, group + 1, group + 2, group + 3],
+                lane_ops: vec![lane; 4],
+                ty: if group == 10 {
+                    IrType::I32
+                } else {
+                    IrType::U32
+                },
+                anchor_ptr: Value((group + 1) as u32),
+                width: if group == 11 { 2 } else { 4 },
+                joint: tail,
+                value_sink: sink,
+            });
+        }
+        // Exact reference oracle: first occurrence wins, all fields compared.
+        let mut seen: FxHashSet<SeedKey> = FxHashSet::default();
+        let reference: Vec<SeedKey> = input
+            .iter()
+            .filter(|c| seen.insert(seed_dedup_key(c)))
+            .map(seed_dedup_key)
+            .collect();
+        let fast = dedup_seed_candidates(input);
+        let fast_keys: Vec<SeedKey> = fast.iter().map(seed_dedup_key).collect();
+        assert_eq!(
+            fast_keys, reference,
+            "O(n) dedup must be order-preserving and field-exact"
+        );
+        assert_eq!(fast.len(), reference.len());
+    }
+
+    // ── Tail: narrow type, lossless control, backend range proof ──────────
+
+    #[test]
+    fn tail_control_is_exact_for_every_u8_alpha() {
+        use super::joint::Tail;
+        for alpha in 0u8..=255 {
+            assert_eq!(
+                Tail {
+                    alpha,
+                    four_inputs: false
+                }
+                .control(),
+                i32::from(alpha)
+            );
+            assert_eq!(
+                Tail {
+                    alpha,
+                    four_inputs: true
+                }
+                .control(),
+                i32::from(alpha) | 4
+            );
+        }
+    }
+
+    #[test]
+    fn joint_tail_is_two_bytes_with_a_niche_option_and_backend_valid_control() {
+        use super::joint::Tail;
+        assert_eq!(std::mem::size_of::<Tail>(), 2);
+        assert_eq!(std::mem::size_of::<Option<Tail>>(), 2);
+        // The backend decodes alpha = control & 3, independent = control & 4,
+        // after checked_vec_control(0..=7).  find_tail only produces 0..4.
+        for alpha in 0u8..4 {
+            for four_inputs in [false, true] {
+                let c = Tail { alpha, four_inputs }.control();
+                assert!((0..=7).contains(&c));
+                assert_eq!(c & 3, i32::from(alpha));
+                assert_eq!(c & 4 != 0, four_inputs);
+            }
+        }
+    }
+
+    #[test]
+    fn site_subsets_matches_reference_grouping_on_a_large_unrolled_stream() {
+        // 400 stores, 37 distinct address webs, deliberately interleaved:
+        // this is the shape a PostVec-unrolled loop body produces.  The
+        // single-pass bucket implementation must be byte-equivalent to the
+        // original per-site HashMap grouping, including per-bucket order.
+        let entries: Vec<StreamEntry> = (0..400usize)
+            .map(|i| stream_entry((i / 37) as i64 * 4, i, (i % 37) as u32 + 1))
+            .collect();
+        let mut reference: FxHashMap<u32, Vec<StreamEntry>> = FxHashMap::default();
+        for e in &entries {
+            reference.entry(e.4).or_default().push(e.clone());
+        }
+        let got = site_subsets(&entries);
+        assert_eq!(got.len(), 37);
+        let mut got_map: FxHashMap<u32, Vec<StreamEntry>> = FxHashMap::default();
+        for bucket in got {
+            let key = bucket[0].4;
+            assert!(bucket.iter().all(|e| e.4 == key));
+            got_map.insert(key, bucket);
+        }
+        assert_eq!(got_map.len(), reference.len());
+        for (key, expect) in reference {
+            assert_eq!(got_map[&key], expect, "site bucket {key} must be exact");
+        }
+        assert_eq!(
+            got_map.values().map(Vec::len).sum::<usize>(),
+            entries.len(),
+            "the partition must be lossless"
+        );
+    }
+
+    #[test]
+    fn dedup_seed_candidates_fast_paths_are_order_preserving() {
+        use super::joint::Tail;
+        let make = |alpha: u8| SeedCandidate {
+            store_idx: vec![1, 2, 3, 4],
+            lane_ops: vec![Operand::Value(Value(1)); 4],
+            ty: IrType::U32,
+            anchor_ptr: Value(9),
+            width: 4,
+            joint: Some(Tail {
+                alpha,
+                four_inputs: false,
+            }),
+            value_sink: None,
+        };
+        assert!(dedup_seed_candidates(vec![]).is_empty());
+        let one = dedup_seed_candidates(vec![make(0)]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(seed_dedup_key(&one[0]), seed_dedup_key(&make(0)));
+        // Equal pair: the no-hash fast path must remove exactly the second.
+        let two_same = dedup_seed_candidates(vec![make(1), make(1)]);
+        assert_eq!(two_same.len(), 1);
+        assert_eq!(seed_dedup_key(&two_same[0]), seed_dedup_key(&make(1)));
+        // Distinct pair: both survive, in order.
+        let two_diff = dedup_seed_candidates(vec![make(1), make(2)]);
+        assert_eq!(two_diff.len(), 2);
+        assert_eq!(seed_dedup_key(&two_diff[0]), seed_dedup_key(&make(1)));
+        assert_eq!(seed_dedup_key(&two_diff[1]), seed_dedup_key(&make(2)));
+        // Three-way: the general hash path must still remove only the repeat.
+        let three = dedup_seed_candidates(vec![make(3), make(1), make(3)]);
+        assert_eq!(three.len(), 2);
+        assert_eq!(seed_dedup_key(&three[0]), seed_dedup_key(&make(3)));
+        assert_eq!(seed_dedup_key(&three[1]), seed_dedup_key(&make(1)));
+    }
+
+    #[test]
+    fn site_subsets_single_web_fast_path_is_allocation_free_and_exact() {
+        let entries: Vec<StreamEntry> = (0..64usize)
+            .map(|i| stream_entry(i as i64 * 4, i, 7))
+            .collect();
+        assert!(site_subsets(&entries).is_empty());
+        assert!(site_subsets(&[]).is_empty());
+        let mut mixed = entries;
+        mixed.push(stream_entry(64 * 4, 64, 8));
+        let parts = site_subsets(&mixed);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts.iter().map(Vec::len).sum::<usize>(),
+            65,
+            "one extra web must not lose or duplicate any store"
+        );
     }
 }

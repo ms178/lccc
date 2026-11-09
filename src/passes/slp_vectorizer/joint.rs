@@ -4,13 +4,19 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Tail {
-    pub alpha: usize,
+    /// Index of the widened reduction lane.  `find_tail` only ever produces
+    /// 0..4, but `u8` (not `usize`) makes `control()` lossless for EVERY
+    /// representable value: `i32::from(u8)` cannot truncate on any host.
+    /// It also shrinks `Tail` from 16 to 2 bytes, and `bool`'s spare bit
+    /// patterns let `Option<Tail>` stay 2 bytes (no tag byte) in every
+    /// `SeedCandidate` hashed by the seed dedup pass.
+    pub alpha: u8,
     pub four_inputs: bool,
 }
 
 impl Tail {
     pub fn control(self) -> i32 {
-        self.alpha as i32 | if self.four_inputs { 4 } else { 0 }
+        i32::from(self.alpha) | if self.four_inputs { 4 } else { 0 }
     }
     pub fn cost(self) -> i64 {
         match (self.four_inputs, x86_avx2_available_pub()) {
@@ -267,13 +273,13 @@ fn leaves(ctx: &BlockCtx, o: &Operand, out: &mut Vec<Operand>, fuel: usize) -> O
     Some(())
 }
 
-pub(super) fn seed(ctx: &BlockCtx, run: &[(i64, usize, Operand, Value)]) -> Option<SeedCandidate> {
+pub(super) fn seed(ctx: &BlockCtx, run: &[StreamEntry]) -> Option<SeedCandidate> {
     if run.len() != 4 || !x86_sse41_available_pub() {
         return None;
     }
     let sources: Vec<_> = run
         .iter()
-        .map(|(_, _, o, _)| wide_store_source(ctx, o))
+        .map(|(_, _, o, _, _)| wide_store_source(ctx, o))
         .collect::<Option<_>>()?;
     let (lane_ops, ty, tail) = find_tail(ctx, &sources)?;
     Some(SeedCandidate {
@@ -291,13 +297,16 @@ fn find_tail(
     ctx: &BlockCtx,
     sources: &[(Operand, IrType)],
 ) -> Option<(Vec<Operand>, IrType, Tail)> {
-    for alpha in 0..4 {
+    // `alpha` is a `u8` here: constructing `Tail` below is lossless and
+    // cannot silently wrap a future larger lane index.
+    for alpha in 0u8..4 {
+        let slot = usize::from(alpha);
         let mut reduced = Vec::new();
-        leaves(ctx, &sources[alpha].0, &mut reduced, 8)?;
+        leaves(ctx, &sources[slot].0, &mut reduced, 8)?;
         if !(3..=4).contains(&reduced.len()) {
             continue;
         }
-        let others: Vec<_> = (0..4).filter(|&i| i != alpha).collect();
+        let others: Vec<_> = (0..4).filter(|&i| i != slot).collect();
         let mut remaining = reduced.clone();
         let mut matches = true;
         for &i in &others {
@@ -318,7 +327,7 @@ fn find_tail(
         }
         let mut lanes: Vec<_> = sources.iter().map(|(o, _)| o.clone()).collect();
         let four_inputs = !remaining.is_empty();
-        lanes[alpha] = if four_inputs {
+        lanes[slot] = if four_inputs {
             remaining.remove(0)
         } else {
             lanes[others[0]].clone()
