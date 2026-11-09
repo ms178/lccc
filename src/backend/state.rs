@@ -1588,6 +1588,51 @@ impl CodegenState {
             .filter(|reg| reg.starts_with("xmm"))
     }
 
+    /// Is `v` provably sitting in the STAGING register (`%ymm0` / `%xmm0`)
+    /// right now, so a consumer may read that register instead of reloading
+    /// the value's slot?
+    ///
+    /// Two records describe that register, and neither is sufficient alone:
+    ///
+    /// * `pending_vec_store` — a DEFERRED result. It names the register the
+    ///   value really sits in (`ymm0` or `ymm1`) and survives intervening
+    ///   loads; it is the ONLY record of a value that a load-elision
+    ///   (`pending_vec_memfold`) or a deferred `VecLoad*` left in the
+    ///   register without any store ever being issued.
+    /// * `*_last_store_*` — the register the last store moved FROM. It says
+    ///   which VALUE was stored but not, on its own, which register the
+    ///   consumer is about to read: a record naming an allocator bank
+    ///   (`%xmm3`, a `pblendvb` result) does not license reading `%xmm0`.
+    ///   The register name must therefore be compared, not assumed.
+    ///
+    /// Returns false when neither record proves it; the caller then reloads
+    /// from the slot, which is always correct (a wasted load, never a wrong
+    /// read).
+    pub fn vec_holds_staging_reg(&self, v: u32, wide: bool) -> bool {
+        let (reg, last_used, last_val, last_name) = if wide {
+            (
+                "ymm0",
+                self.vec_last_store_reg,
+                self.vec_last_store_val,
+                self.vec_last_store_reg_name,
+            )
+        } else {
+            (
+                "xmm0",
+                self.sse_last_store_reg,
+                self.sse_last_store_val,
+                self.sse_last_store_reg_name,
+            )
+        };
+        if last_used && last_val == Some(v) && last_name == Some(reg) {
+            return true;
+        }
+        matches!(
+            self.pending_vec_store,
+            Some((p, pending_reg, pending_wide)) if p == v && pending_wide == wide && pending_reg == reg
+        )
+    }
+
     /// Retire a value's DEFERRED result store now that a consumer has taken it
     /// from its register.
     ///

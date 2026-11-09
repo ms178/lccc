@@ -108,7 +108,12 @@ loop_body=$(awk '
 # group, so the previous `\(%rsp\)` spelling could never match and the check
 # was vacuous.
 YMM_SLOT_STORE='vmov(up|dq|dqa|dqu|ap)(s|d|pd|ps)?[[:space:]]+%ymm[0-9]+,[[:space:]]*[-0-9]+[(]%r(sp|bp)[)]'
-if echo "$loop_body" | grep -qE "$YMM_SLOT_STORE"; then
+# `grep -c ... >/dev/null`, NOT `grep -q ...`: under `set -o pipefail` a `-q`
+# consumer exits as soon as it matches, the producer takes SIGPIPE, and the
+# pipeline's status becomes 141 — turning a MATCH (the failure we are looking
+# for) into a "pass". `-c` reads the stream to the end, so the status is grep's
+# own verdict. Contract: `scripts/check_pipefail_sigpipe.py`.
+if echo "$loop_body" | grep -cE "$YMM_SLOT_STORE" >/dev/null; then
     echo "FAIL: vec_adler_epic contract — YMM slot store inside the vector loop (homing bug)"
     echo "$loop_body" | grep -E "$YMM_SLOT_STORE"
     exit 1
