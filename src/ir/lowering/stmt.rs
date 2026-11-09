@@ -2304,21 +2304,10 @@ impl Lowerer {
             pragma_pack,
             reverse_sso,
         );
-        let vla_member_static_offset = fields[..vla_idx]
-            .iter()
-            .filter_map(|f| {
-                let name = f.name.as_deref()?;
-                layout
-                    .fields
-                    .iter()
-                    .find(|fl| fl.name == name)
-                    .map(|fl| fl.offset)
-            })
-            .next()
-            .unwrap_or(0);
+        let vla_member_static_offset = self.static_vla_member_offset(fields, vla_idx, &layout)?;
 
         let mut cursor = VlaDynCursor::new(vla_member_static_offset, is_packed);
-        let mut max_align: usize = 1;
+        let mut max_align = layout.align;
         let mut last_bitfield_unit = 0usize;
 
         for f in &fields[vla_idx..] {
@@ -2328,34 +2317,21 @@ impl Lowerer {
                 .and_then(|bw| self.eval_const_expr(bw).and_then(|c| c.to_u32()));
             if let Some(bw) = bit_width {
                 let ct = self.struct_field_ctype(f);
-                if is_packed {
-                    // A packed zero-width bitfield still forces the next
-                    // boundary of its declared type (GCC packed `T :0`
-                    // semantics); nonzero widths pack bit-granularly.
-                    if bw == 0 {
-                        let a = self.vla_field_effective_align(f, &ct, is_packed, pragma_pack);
-                        self.vla_cursor_close_run_for_field(&mut cursor);
-                        self.vla_cursor_align(&mut cursor, a);
-                        if a > max_align {
-                            max_align = a;
-                        }
-                    } else {
-                        self.vla_cursor_bitfield_packed(&mut cursor, bw);
-                        last_bitfield_unit = 1; // byte-rounded on close
-                    }
+                if bw == 0 {
+                    let boundary = self.ctype_align(&ct).max(f.alignment.unwrap_or(1));
+                    self.vla_cursor_close_run_for_field(&mut cursor);
+                    self.vla_cursor_align(&mut cursor, boundary);
+                    last_bitfield_unit = 0;
+                } else if is_packed || pragma_pack == Some(1) || f.is_packed {
+                    self.vla_cursor_bitfield_packed(&mut cursor, bw);
+                    last_bitfield_unit = 1; // byte-rounded on close
                 } else {
                     let unit_size = self.ctype_size(&ct);
                     let unit_align = self.vla_field_effective_align(f, &ct, is_packed, pragma_pack);
                     if unit_size == 0 {
                         continue;
                     }
-                    if unit_align > max_align {
-                        max_align = unit_align;
-                    }
-                    if bw == 0 {
-                        self.vla_cursor_close_run_for_field(&mut cursor);
-                        self.vla_cursor_align(&mut cursor, unit_align);
-                    } else if unit_size <= cursor.guarantee {
+                    if unit_size <= cursor.guarantee {
                         self.vla_cursor_bitfield_unit(&mut cursor, bw, unit_size);
                         last_bitfield_unit = unit_size;
                     } else {

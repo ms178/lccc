@@ -111,7 +111,6 @@ struct PragmaZero { char c; unsigned :0; char x; };
 #pragma pack(pop)
 union EmptyBits { char c; unsigned :0; };
 union NarrowBits { char c; unsigned :3; };
-union __attribute__((packed)) NamedBits { char c; unsigned b:3; };
 #define FIELD(t, member, off) _Static_assert(__builtin_offsetof(struct t, member) == off, #t " offset")
 #define RECORD(t, size, align) _Static_assert(sizeof(struct t) == size && _Alignof(struct t) == align, #t " layout")
 FIELD(PlainZero, x, 4); FIELD(PackedZero, x, 4); FIELD(AlignedZero, x, 8);
@@ -119,7 +118,6 @@ FIELD(ShortZero, x, 2); FIELD(Unnamed, x, 2); FIELD(PragmaZero, x, 4);
 FIELD(Explicit, y, 9); RECORD(Explicit, 16, 8);
 FIELD(SmallExplicit, y, 3); RECORD(SmallExplicit, 4, 4);
 FIELD(PackedExplicit, y, 9); RECORD(PackedExplicit, 16, 8);
-_Static_assert(sizeof(union NamedBits) == 1 && _Alignof(union NamedBits) == 1, "packed union");
 #ifdef __aarch64__
 RECORD(PlainZero, 8, 4); RECORD(PackedZero, 8, 4); RECORD(AlignedZero, 16, 8);
 RECORD(ShortZero, 4, 4); RECORD(Unnamed, 4, 4); RECORD(PragmaZero, 8, 4);
@@ -136,6 +134,23 @@ int use_bits(struct Explicit *p) { return p->x + p->y; }
 GCC_BITFIELD_SOURCE = r'''#pragma pack(2)
 struct S { char c; unsigned b:3 __attribute__((aligned(8))); char d; };
 _Static_assert(sizeof(struct S) == 4 && _Alignof(struct S) == 2 && __builtin_offsetof(struct S,d) == 3, "GCC pragma bitfield placement");
+'''
+
+# GCC-only VLA members are rejected by Clang/ICX; this is not a vendor parity claim.
+VLA_SOURCE = r'''int run(int n) {
+  struct S { int prefix; char a[n]; int tail; } s;
+  if ((char *)&s.a - (char *)&s != 4) return 1;
+  if ((char *)&s.tail - (char *)&s != ((n+7)&~3)) return 2;
+  if (sizeof s != ((n+7)&~3)+4) return 3;
+  struct T { int prefix; char a[n]; int :0; char tail; } t;
+  if ((char *)&t.tail - (char *)&t != ((n+7)&~3)) return 4;
+  if (sizeof t != ((n+7)&~3)+4) return 5;
+  struct __attribute__((packed)) U { int prefix; char a[n]; int :0; char tail; } u;
+  if ((char *)&u.tail - (char *)&u != ((n+7)&~3)) return 6;
+  if (sizeof u != ((n+7)&~3)+1) return 7;
+  return 0;
+}
+int main(void) { for (int n=1; n<=20; n++) { int e=run(n); if (e) return e; } return 0; }
 '''
 
 MESSAGE = "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'"
@@ -166,6 +181,8 @@ def main():
         source.write_text(SOURCE, encoding='utf-8')
         operator = Path(tmp) / 'operator.c'
         operator.write_text(OPERATOR_SOURCE, encoding='utf-8')
+        vla = Path(tmp) / 'vla.c'
+        vla.write_text(VLA_SOURCE, encoding='utf-8')
         bitfield = Path(tmp) / 'bitfield.c'
         bitfield.write_text(BITFIELD_SOURCE, encoding='utf-8')
         gcc_bitfield = Path(tmp) / 'gcc-bitfield.c'
@@ -187,6 +204,13 @@ def main():
             command = [compiler, *flags, '-w', '-fsyntax-only', str(gcc_bitfield)]
             result = run(command)
             require(result[0] == 0, 'GCC-specific pragma bitfield placement', command, result)
+            if not flags:
+                executable = Path(tmp) / 'gcc-vla'
+                command = [compiler, '-O2', str(vla), '-o', str(executable)]
+                result = run(command)
+                require(result[0] == 0, 'GCC VLA-member compile', command, result)
+                result = run([str(executable)])
+                require(result[0] == 0, 'GCC VLA-member execution', [str(executable)], result)
         if args.clang_placement:
             for target in ('aarch64-linux-gnu', 'riscv64-linux-gnu'):
                 command = [args.clang_placement, '--target=' + target, '-w', '-fsyntax-only', str(bitfield)]
@@ -222,6 +246,17 @@ def main():
             command = [compiler, '-c', '-Wno-pragmas', '-o', str(Path(tmp) / 'alignment.o'), str(alignment)]
             result = run(command)
             require(result[0] == 0, 'pragma and explicit alignment layout/codegen', command, result)
+            command = [compiler, '-c', '-O2', '-o', str(Path(tmp) / 'vla.o'), str(vla)]
+            result = run(command)
+            require(result[0] == 0, 'VLA-member codegen', command, result)
+            if compiler == args.lccc[0]:
+                for opt in ('-O0', '-O2'):
+                    executable = Path(tmp) / 'lccc-vla'
+                    command = [compiler, opt, str(vla), '-o', str(executable)]
+                    result = run(command)
+                    require(result[0] == 0, 'VLA-member native compile', command, result)
+                    result = run([str(executable)])
+                    require(result[0] == 0, 'VLA-member native execution', [str(executable)], result)
             for fixture in (bitfield, gcc_bitfield):
                 command = [compiler, '-c', '-Wno-pragmas', '-o', str(Path(tmp) / 'bits.o'), str(fixture)]
                 result = run(command)

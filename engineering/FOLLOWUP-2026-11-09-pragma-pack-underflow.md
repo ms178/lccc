@@ -70,3 +70,37 @@ exercises the scaling path. This only removes one quadratic component of the
 case-label problem; it does not remove the recursive AST/parser/lowering
 limits or establish a performance measurement for a complete translation
 unit. The 50,000-operation local Python model check is not an LCCC test.
+
+### Subsequent audit: bitfields and dynamic members
+
+GCC 16.2 on x86-64/i686 and Clang 23.1.5 on x86-64/i686/AArch64/RISC-V
+were probed for unnamed and zero-width bitfields, explicit field alignment,
+and packed records. AArch64 counts unnamed bitfields toward record alignment,
+while x86 and RISC-V do not; zero-width fields keep their type boundary under
+attribute/pragma packing. GCC and Clang disagree on placement of explicitly
+aligned nonzero bitfields under `#pragma pack(2)` (GCC places the field at
+byte 2; Clang at byte 1). The regression asserts the GCC behavior separately
+and does not report it as cross-vendor agreement.
+
+The audit also found that shrinking a named packed union bitfield's allocation
+to its C ABI size without changing the access machinery is unsafe: the
+existing bitfield load/store path uses its declared integer storage width, so
+a byte-sized object could be accessed with a wider load/store. That shrink is
+intentionally not retained; named packed union bitfield layout and exact-width
+packed bitfield accesses remain **open**, including object-boundary, volatile,
+reverse-storage-order, initialization and cross-target cases. The unnamed
+union cases are not addressable and can be sized independently. No claim of
+complete packed-bitfield correctness is made.
+
+GCC 16.2 also distinguishes `-fpack-struct=N` from a pragma for a zero-width
+field: the command-line cap applies to its boundary while a pragma does not.
+The bare option and numeric option are independent in GCC; a later
+`-fno-pack-struct` clears the bare option but leaves the numeric cap. These
+observations preclude simply initializing the pragma stack from the flag.
+Neither variant is implemented yet.
+
+The dynamic VLA-record walk has separately been changed to seed from the
+actual VLA member's static offset rather than the first preceding field. GCC's
+VLA-member extension is rejected by Clang 23.1.5, so its runtime witness uses
+GCC only, and is not a four-vendor comparison. VLA unions, trailing dynamic
+bitfield member accesses, and side-effectful bounds require further audit.

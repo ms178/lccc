@@ -2018,6 +2018,42 @@ impl Lowerer {
         }
     }
 
+    /// Find the first dynamic member's offset in the already-computed static
+    /// layout. Earlier members can end before this offset because the VLA
+    /// member itself can require padding. Anonymous aggregate members are
+    /// disambiguated by their ordinal among other anonymous aggregates.
+    pub(super) fn static_vla_member_offset(
+        &self,
+        fields: &[StructFieldDecl],
+        vla_idx: usize,
+        layout: &crate::common::types::StructLayout,
+    ) -> Option<usize> {
+        if let Some(name) = fields[vla_idx].name.as_deref() {
+            return layout
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.offset);
+        }
+        let ordinal = fields[..vla_idx]
+            .iter()
+            .filter(|f| {
+                f.name.is_none()
+                    && f.bit_width.is_none()
+                    && matches!(
+                        self.struct_field_ctype(f),
+                        CType::Struct(_) | CType::Union(_)
+                    )
+            })
+            .count();
+        layout
+            .fields
+            .iter()
+            .filter(|f| f.name.is_empty() && f.bit_width.is_none())
+            .nth(ordinal)
+            .map(|f| f.offset)
+    }
+
     pub(super) fn compute_vla_field_offsets_for_decl(
         &mut self,
         struct_key: &str,
@@ -2026,8 +2062,6 @@ impl Lowerer {
         pragma_pack: Option<usize>,
         layout: &crate::common::types::StructLayout,
     ) {
-        use crate::common::types::StructFieldLayout;
-
         // Locate the first VLA member. Without one there are no dynamic
         // offsets to record.
         let mut vla_idx = None;
@@ -2048,18 +2082,10 @@ impl Lowerer {
         // member. (The previous implementation recomputed the pre-VLA prefix
         // by hand and skipped bitfields, so `struct { unsigned b:3; int
         // i[n]; ... }` started the dynamic walk at 0 instead of 4.)
-        let vla_member_static_offset = fields[..vla_idx]
-            .iter()
-            .filter_map(|f| {
-                let name = f.name.as_deref()?;
-                layout
-                    .fields
-                    .iter()
-                    .find(|fl: &&StructFieldLayout| fl.name == name)
-                    .map(|fl| fl.offset)
-            })
-            .next()
-            .unwrap_or(0);
+        let Some(vla_member_static_offset) = self.static_vla_member_offset(fields, vla_idx, layout)
+        else {
+            return;
+        };
 
         let mut cursor = VlaDynCursor::new(vla_member_static_offset, is_packed);
 
@@ -2073,19 +2099,19 @@ impl Lowerer {
                 // not recorded (member access to a bitfield that follows a
                 // VLA member keeps the static path — no test exercises it).
                 let ct = self.struct_field_ctype(f);
-                if is_packed {
+                if bw == 0 {
+                    let boundary = self.ctype_align(&ct).max(f.alignment.unwrap_or(1));
+                    self.vla_cursor_close_run_for_field(&mut cursor);
+                    self.vla_cursor_align(&mut cursor, boundary);
+                } else if is_packed || pragma_pack == Some(1) || f.is_packed {
                     self.vla_cursor_bitfield_packed(&mut cursor, bw);
                 } else {
                     let unit_size = self.ctype_size(&ct);
-                    let unit_align = self.ctype_align(&ct).max(1);
+                    let unit_align = self.vla_field_effective_align(f, &ct, is_packed, pragma_pack);
                     if unit_size == 0 {
                         continue;
                     }
-                    if bw == 0 {
-                        // Zero-width: next field at the type's unit boundary.
-                        self.vla_cursor_close_run_for_field(&mut cursor);
-                        self.vla_cursor_align(&mut cursor, unit_align);
-                    } else if unit_size <= cursor.guarantee {
+                    if unit_size <= cursor.guarantee {
                         // Cursor ≡ 0 (mod unit_size) is statically known, so
                         // the SysV straddle test is decidable.
                         self.vla_cursor_bitfield_unit(&mut cursor, bw, unit_size);
@@ -2247,10 +2273,18 @@ impl Lowerer {
         is_packed: bool,
         pragma_pack: Option<usize>,
     ) -> usize {
-        let natural = self.ctype_align(ct).max(1);
+        let natural = self
+            .typedef_alignment_for_type_spec(&f.type_spec)
+            .copied()
+            .unwrap_or_else(|| self.ctype_align(ct))
+            .max(1);
+        let explicit = crate::common::types::strictest_alignment([
+            f.alignment,
+            f.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+        ]);
         let alignment = if f.is_packed {
-            f.alignment.unwrap_or(1)
-        } else if let Some(explicit) = f.alignment {
+            explicit.unwrap_or(1)
+        } else if let Some(explicit) = explicit {
             natural.max(explicit)
         } else if is_packed {
             1

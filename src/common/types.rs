@@ -2033,11 +2033,17 @@ impl StructLayout {
                 max_align = max_align.max(field_align);
                 user_align |= field_contributes_user_align(field, natural_align, ctx);
             }
-            // A bitfield occupies only the bytes needed by its width; the
-            // enclosing union's alignment supplies any final tail padding.
-            let occupied = field
-                .bit_width
-                .map_or(field_size, |width| (width as usize).div_ceil(8));
+            // Unnamed bitfields are never accessed and contribute only the
+            // bytes covered by their width. Named fields retain the declared
+            // storage unit until lowering supports exact-width accesses for
+            // small packed union members (otherwise they would overrun).
+            let occupied = if field.name.is_empty() {
+                field
+                    .bit_width
+                    .map_or(field_size, |width| (width as usize).div_ceil(8))
+            } else {
+                field_size
+            };
             max_size = max_size.max(occupied);
 
             // For union bitfield members, set bit_offset to 0 (all fields start at byte 0)

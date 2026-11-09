@@ -165,7 +165,11 @@ pub(super) fn extract_bitfield(
     if bit_width == 0 || bit_width > 64 || bit_offset >= 64 || bit_offset + bit_width > 64 {
         return None;
     }
-    let mask = (1u64 << bit_width) - 1;
+    let mask = if bit_width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bit_width) - 1
+    };
     let field = (raw >> bit_offset) & mask;
     let value = if signed && bit_width < 64 {
         let shift = 64 - bit_width;
@@ -179,4 +183,23 @@ pub(super) fn extract_bitfield(
         17..=32 => IrConst::I32(value as i32),
         _ => IrConst::I64(value),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IrConst, extract_bitfield};
+
+    #[test]
+    fn full_width_bitfield_does_not_shift_by_word_width() {
+        assert_eq!(
+            extract_bitfield(u64::MAX, 0, 64, false),
+            Some(IrConst::I64(-1))
+        );
+        assert_eq!(
+            extract_bitfield(1 << 63, 0, 64, true),
+            Some(IrConst::I64(i64::MIN))
+        );
+        assert_eq!(extract_bitfield(1, 1, 64, false), None);
+        assert_eq!(extract_bitfield(1, 0, 0, false), None);
+    }
 }
