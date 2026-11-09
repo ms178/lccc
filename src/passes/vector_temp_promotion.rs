@@ -5415,6 +5415,134 @@ mod tests {
         assert_eq!(func.blocks[0].instructions.len(), before);
     }
 
+    /// The counting discipline is the pass's entire safety argument: a
+    /// reader the plan cannot classify still lands in `uses`, and the plan is
+    /// discarded because `forwarded` cannot account for it. This pins the
+    /// non-intrinsic reader case -- a `Memcpy` source is a read of the home
+    /// that no `arg_rewrites` entry can ever rewrite.
+    #[test]
+    fn a_non_intrinsic_reader_of_the_home_refuses_the_bypass() {
+        let mut func = single_block(
+            "memcpy_reader",
+            vec![
+                alloca(1, 32, 32),
+                intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(1),
+                    vec![
+                        Operand::Value(Value(2)),
+                        Operand::Value(Value(1)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+                Instruction::Memcpy {
+                    dest: Value(9),
+                    src: Value(1),
+                    size: 32,
+                },
+            ],
+        );
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "a read the plan cannot rewrite must refuse the home"
+        );
+        assert!(
+            func.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::VecStoreF32x8,
+                    ..
+                }
+            )),
+            "the spill store must be kept: the memcpy still reads the home"
+        );
+    }
+
+    /// A reader earlier in the block than the producer is counted in `uses`
+    /// but can never be in `forwarded`, so the counts differ and the home is
+    /// refused. Retiring the write would leave that reader observing whatever
+    /// the slot held before.
+    #[test]
+    fn a_use_before_the_producer_refuses_the_bypass() {
+        let mut func = single_block(
+            "use_before_producer",
+            vec![
+                alloca(1, 32, 32),
+                // Reads %1 before the store that defines it in this block.
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::MinPs256,
+                    Some(9),
+                    vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                ),
+                intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(1),
+                    vec![
+                        Operand::Value(Value(2)),
+                        Operand::Value(Value(1)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "a use preceding the producer must refuse the home"
+        );
+    }
+
+    /// A volatile home can be observed by something the IR does not name, so
+    /// neither bypass form may retire it.
+    #[test]
+    fn a_volatile_home_is_never_bypassed() {
+        let mut func = single_block(
+            "volatile_home",
+            vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 32,
+                    align: 32,
+                    volatile: true,
+                    semantic_volatile: false,
+                },
+                intrinsic(Some(2), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(1),
+                    vec![
+                        Operand::Value(Value(2)),
+                        Operand::Value(Value(1)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(9),
+                    vec![
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(9)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "a volatile home must never be bypassed"
+        );
+    }
+
     #[test]
     fn a_relay_whose_destination_alloca_follows_the_producer_is_refused() {
         // Dominance: the rewrite MOVES the destination's use up to the
