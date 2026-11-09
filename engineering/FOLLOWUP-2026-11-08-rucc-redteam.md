@@ -317,3 +317,22 @@ now also exercises withdrawn and user-owned operator states (**2880 cases across
 three seeds**, zero panics/hangs/signals). The capability gate now asserts the
 query answers are identical on the i686/AArch64/RISC-V sibling drivers, not just
 x86-64. Preprocessor units remain green; Clippy `-D warnings` and rustfmt clean.
+
+### Directive-only operators and a fuzz-found out-of-bounds panic
+
+`__has_include`, `__has_include_next` and `__has_embed` in ordinary code were
+left as plain identifiers (silent accept). GCC 16.2 diagnoses "'…' used outside
+of preprocessing directive" but still evaluates the operand; LCCC now matches
+that persona. Malformed `#if __has_include()` / missing `(` now emit GCC's
+header-name diagnostics instead of silent zeros.
+
+Extending the seeded fuzz to those operators immediately found a real panic:
+`__has_embed("` / `__has_embed('` with an unterminated literal sliced
+`bytes[start..len+1]` (`utils.rs:74`, range end out of range). The open-coded
+balance loop incremented past `len` after `skip_literal_bytes` had already
+returned `len`. The scan now delegates literal skipping to the bounds-safe
+helper and keeps `*i <= len` in every arm; `depth` only decrements on `)`.
+A Rust unit pins the three reproducer shapes. The expanded fuzz corpus
+(**3168 cases across three seeds**, now 1056 per seed) and the 187-check
+lifetime gate are clean; Clippy `-D warnings`, rustfmt and the preprocessor
+units remain green.

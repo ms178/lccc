@@ -207,6 +207,26 @@ def main(argv: list[str] | None = None) -> int:
         check("malformed/macro-junk", r.returncode != 0 and "expected ')' after 'memcpy'" in r.stderr,
               r.stderr)
 
+        # Directive-only operators are rejected in code (GCC still answers),
+        # and malformed header operands are errors in #if.
+        for op, operand in [
+            ("__has_include", "<stddef.h>"),
+            ("__has_include_next", "<stddef.h>"),
+            ("__has_embed", '"nonexistent.bin"'),
+        ]:
+            src.write_text(f"int x={op}({operand});\n")
+            r = run(args.lccc, src)
+            check(f"directive-only/{op}/code", r.returncode != 0
+                  and f"'{op}' used outside of preprocessing directive" in r.stderr, r.stderr)
+        for expr, msg in [
+            ("__has_include()", "operator '__has_include' requires a header-name"),
+            ("__has_include stddef.h", "missing '(' before '__has_include' operand"),
+            ("__has_include_next()", "operator '__has_include_next' requires a header-name"),
+        ]:
+            src.write_text(f"#if {expr}\nint x=1;\n#endif\n")
+            r = run(args.lccc, src)
+            check(f"directive-only/{expr}", r.returncode != 0 and msg in r.stderr, r.stderr)
+
         # 11. GCC expands attribute scope/name identifiers and whole scoped tokens.
         for src_text, want in [
             ("#define SCOPE gnu\nint x=__has_attribute(SCOPE::deprecated);\n", "int x=1;"),

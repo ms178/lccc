@@ -93,6 +93,30 @@ impl Preprocessor {
                         let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
                         result.push_str(&val);
                     }
+                    "__has_include" | "__has_include_next" | "__has_embed" => {
+                        // GCC 16.2 rejects these outside a directive but still
+                        // evaluates the operand (measured: include -> 1/0,
+                        // embed -> its tri-state value). Clang leaves them
+                        // unexpanded; LCCC follows the GCC persona.
+                        self.query_diag(
+                            format!("'{ident}' used outside of preprocessing directive"),
+                            diag_line,
+                        );
+                        let val = match ident {
+                            "__has_include" => {
+                                self.resolve_has_include_call_bytes(bytes, &mut i, false, diag_line)
+                            }
+                            "__has_include_next" => {
+                                self.resolve_has_include_call_bytes(bytes, &mut i, true, diag_line)
+                            }
+                            _ => {
+                                let v = self.resolve_has_embed_call_bytes(bytes, &mut i, diag_line);
+                                result.push_str(&v);
+                                continue;
+                            }
+                        };
+                        result.push_str(val);
+                    }
                     _ => result.push_str(ident),
                 }
                 continue;
@@ -331,10 +355,10 @@ impl Preprocessor {
                     let val = self.resolve_has_feature_call_bytes(bytes, &mut i, true, diag_line);
                     result.push_str(val);
                 } else if ident == "__has_include" {
-                    let val = self.resolve_has_include_call_bytes(bytes, &mut i, false);
+                    let val = self.resolve_has_include_call_bytes(bytes, &mut i, false, diag_line);
                     result.push_str(val);
                 } else if ident == "__has_include_next" {
-                    let val = self.resolve_has_include_call_bytes(bytes, &mut i, true);
+                    let val = self.resolve_has_include_call_bytes(bytes, &mut i, true, diag_line);
                     result.push_str(val);
                 } else if ident == "__has_embed" {
                     let val = self.resolve_has_embed_call_bytes(bytes, &mut i, diag_line);
@@ -670,13 +694,20 @@ impl Preprocessor {
         bytes: &[u8],
         i: &mut usize,
         is_next: bool,
+        diag_line: usize,
     ) -> &'static str {
+        let op = if is_next {
+            "__has_include_next"
+        } else {
+            "__has_include"
+        };
         let len = bytes.len();
         // Skip whitespace
         while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
             *i += 1;
         }
         if *i >= len || bytes[*i] != b'(' {
+            self.query_diag(format!("missing '(' before '{op}' operand"), diag_line);
             return "0";
         }
         *i += 1; // skip '('
@@ -727,6 +758,7 @@ impl Preprocessor {
         } // skip ')'
 
         if header_name.is_empty() {
+            self.query_diag(format!("operator '{op}' requires a header-name"), diag_line);
             return "0";
         }
 
@@ -761,28 +793,27 @@ impl Preprocessor {
         *i += 1; // skip '('
         let start = *i;
         let mut depth = 1usize;
-        // Literal-aware balance scan: parens inside string/char literals
-        // do not terminate the operand.
+        // Literal-aware balance scan: parens inside string/char literals do
+        // not terminate the operand. `skip_literal_bytes` returns `len` for an
+        // unterminated literal; the old open-coded loop then incremented past
+        // `len` and sliced out of bounds (fuzz-found panic). Every arm below
+        // keeps `*i <= len`, and `depth` only decrements on ')'.
         while *i < len && depth > 0 {
-            let c = bytes[*i];
-            if c == b'"' || c == b'\'' {
-                let quote = c;
-                *i += 1;
-                while *i < len && bytes[*i] != quote {
-                    if bytes[*i] == b'\\' && *i + 1 < len {
-                        *i += 1;
-                    }
+            match bytes[*i] {
+                quote @ (b'"' | b'\'') => {
+                    *i = skip_literal_bytes(bytes, *i, quote);
+                }
+                b'(' => {
+                    depth += 1;
                     *i += 1;
                 }
-            } else {
-                match c {
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
+                b')' => {
+                    depth -= 1;
+                    if depth > 0 {
+                        *i += 1;
+                    }
                 }
-            }
-            if depth > 0 {
-                *i += 1;
+                _ => *i += 1,
             }
         }
         let inner = bytes_to_str(bytes, start, *i);
@@ -1140,6 +1171,25 @@ mod has_macro_utf8_tests {
         let source = "const char *s = \"é\"; int c = '__has_feature'; int f = __has_feature(x);";
         let expected = "const char *s = \"é\"; int c = '__has_feature'; int f = 0;";
         assert_eq!(pp.resolve_has_macros_in_code(source, 1), expected);
+    }
+}
+
+#[cfg(test)]
+mod embed_operand_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn unterminated_embed_literal_does_not_panic() {
+        for src in [
+            "#if __has_embed( \"\nint x=1;\n#endif\n",
+            "#if __has_embed('\nint x=1;\n#endif\n",
+            "int v = __has_embed(\"))\n",
+        ] {
+            let mut pp = Preprocessor::new();
+            let _ = pp.preprocess(src);
+            // A malformed operand may error, but must never slice out of bounds.
+            assert!(!pp.errors().is_empty() || pp.warnings().is_empty());
+        }
     }
 }
 

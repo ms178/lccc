@@ -29,6 +29,9 @@ OPS = (
     "__has_builtin",
     "__has_attribute",
     "__has_c_attribute",
+    "__has_include",
+    "__has_include_next",
+    "__has_embed",
 )
 ATOMS = [
     "c_atomic", "c_generic_selections", "tls", "cxx_binary_literals",
