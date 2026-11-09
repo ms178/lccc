@@ -3773,13 +3773,18 @@ impl Parser {
                 true
             }
             TokenKind::PragmaPackPop => {
+                let span = self.peek_span();
                 self.advance();
-                // Pop previous alignment from stack
                 if let Some(prev) = self.pragma_pack_stack.pop() {
                     self.pragma_pack_align = prev;
                 } else {
-                    // Stack underflow: reset to default
-                    self.pragma_pack_align = None;
+                    // GCC leaves the current alignment unchanged on underflow.
+                    // Diagnose at the token so scoped -Wpragmas settings apply.
+                    self.diagnostics.warning_with_kind(
+                        "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'",
+                        span,
+                        crate::common::error::WarningKind::Pragmas,
+                    );
                 }
                 true
             }
