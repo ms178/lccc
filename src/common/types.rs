@@ -2679,6 +2679,12 @@ impl StructLayout {
     }
 }
 
+/// Valid numeric operands of GCC's `#pragma pack`: zero resets the packing
+/// state, and otherwise the value must be a power of two no greater than 16.
+pub(crate) fn valid_pragma_pack_alignment(n: usize) -> bool {
+    n == 0 || (n <= 16 && n.is_power_of_two())
+}
+
 /// Align `offset` up to the next multiple of `align`.
 pub fn align_up(offset: usize, align: usize) -> usize {
     if align == 0 {
