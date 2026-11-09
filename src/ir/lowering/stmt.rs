@@ -2297,8 +2297,13 @@ impl Lowerer {
         // before it is fixed-size and its exact offset (including any
         // pre-VLA bitfield units) is already in the static layout.
         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
-        let layout =
-            self.compute_struct_union_layout_packed(fields, false, max_field_align, reverse_sso);
+        let layout = self.compute_struct_union_layout_packed(
+            fields,
+            false,
+            max_field_align,
+            pragma_pack,
+            reverse_sso,
+        );
         let vla_member_static_offset = fields[..vla_idx]
             .iter()
             .filter_map(|f| {

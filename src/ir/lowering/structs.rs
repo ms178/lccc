@@ -265,6 +265,7 @@ impl Lowerer {
                     fields,
                     false,
                     max_field_align,
+                    *pragma_pack,
                     reverse_sso.is_some_and(|v| v),
                 );
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
@@ -313,6 +314,7 @@ impl Lowerer {
                     fields,
                     true,
                     max_field_align,
+                    *pragma_pack,
                     reverse_sso.is_some_and(|v| v),
                 );
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
@@ -473,6 +475,7 @@ impl Lowerer {
                 fields,
                 is_union,
                 max_field_align,
+                pragma_pack,
                 reverse_sso,
             );
             layout.apply_struct_aligned(struct_aligned);
@@ -734,6 +737,7 @@ impl Lowerer {
                     fields,
                     false,
                     max_field_align,
+                    *pragma_pack,
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
@@ -763,6 +767,7 @@ impl Lowerer {
                     fields,
                     true,
                     max_field_align,
+                    *pragma_pack,
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
@@ -2229,12 +2234,12 @@ impl Lowerer {
 
     /// Effective alignment of a struct field for the dynamic VLA cursor,
     /// mirroring `StructLayoutBuilder::compute_field_alignment`: a per-field
-    /// `packed` forces 1; an explicit `aligned(N)` attribute raises above the
-    /// natural alignment and overrides struct-level packing
+    /// `packed` forces 1 unless explicitly aligned; an explicit `aligned(N)`
+    /// overrides record-level packed, but remains capped by pragma pack
     /// (pr82210.c: `__attribute__((aligned(16))) struct T { short c; }
     /// a[size];` gives the member 16-byte alignment — the struct's size
     /// rounds to 16 even though the member's runtime span does not); a
-    /// struct-level `packed` or `#pragma pack` caps the natural alignment.
+    /// record-level `packed` or `#pragma pack` caps the natural alignment.
     pub(super) fn vla_field_effective_align(
         &self,
         f: &StructFieldDecl,
@@ -2243,17 +2248,16 @@ impl Lowerer {
         pragma_pack: Option<usize>,
     ) -> usize {
         let natural = self.ctype_align(ct).max(1);
-        if f.is_packed {
-            return 1;
-        }
-        if let Some(explicit) = f.alignment {
-            return natural.max(explicit);
-        }
-        let cap = if is_packed { Some(1) } else { pragma_pack };
-        match cap {
-            Some(c) => natural.min(c.max(1)),
-            None => natural,
-        }
+        let alignment = if f.is_packed {
+            f.alignment.unwrap_or(1)
+        } else if let Some(explicit) = f.alignment {
+            natural.max(explicit)
+        } else if is_packed {
+            1
+        } else {
+            natural
+        };
+        pragma_pack.map_or(alignment, |cap| alignment.min(cap.max(1)))
     }
 
     /// Packed bitfield placement: bits accumulate contiguously with no

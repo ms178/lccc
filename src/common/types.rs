@@ -1494,6 +1494,7 @@ impl StructLayoutBuilder {
         &mut self,
         field: &StructField,
         max_field_align: Option<usize>,
+        pragma_pack: Option<usize>,
         ctx: &dyn StructLayoutProvider,
     ) -> (usize, usize) {
         let natural_align = field.type_align.unwrap_or_else(|| field.ty.align_ctx(ctx));
@@ -1510,6 +1511,9 @@ impl StructLayoutBuilder {
         } else {
             natural_align
         };
+        // Unlike the packed attribute, pragma pack also caps explicit member
+        // alignment, including when both forms of packing are present.
+        let field_align = pragma_pack.map_or(field_align, |cap| field_align.min(cap));
         let field_size = field.ty.size_ctx(ctx);
         self.max_align = self.max_align.max(field_align);
         self.user_align |= field_contributes_user_align(field, natural_align, ctx);
@@ -1946,17 +1950,20 @@ impl StructLayout {
     ///   For __attribute__((packed)), pass Some(1).
     ///   For #pragma pack(N), pass Some(N).
     ///   For normal structs, pass None.
+    /// `pragma_pack`: independently caps even explicitly aligned members.
     /// `ctx`: provides struct/union layout lookup for nested struct/union field types.
     pub fn for_struct_with_packing(
         fields: &[StructField],
         max_field_align: Option<usize>,
+        pragma_pack: Option<usize>,
         ctx: &dyn StructLayoutProvider,
         reverse_sso: bool,
     ) -> Self {
         let mut b = StructLayoutBuilder::new(fields.len(), max_field_align, reverse_sso);
 
         for field in fields {
-            let (field_align, field_size) = b.compute_field_alignment(field, max_field_align, ctx);
+            let (field_align, field_size) =
+                b.compute_field_alignment(field, max_field_align, pragma_pack, ctx);
 
             if let Some(bw) = field.bit_width {
                 if bw == 0 {
@@ -1979,9 +1986,11 @@ impl StructLayout {
     ///   For __attribute__((packed)), pass Some(1).
     ///   For #pragma pack(N), pass Some(N).
     ///   For normal unions, pass None.
+    /// `pragma_pack`: independently caps even explicitly aligned members.
     pub fn for_union_with_packing(
         fields: &[StructField],
         max_field_align: Option<usize>,
+        pragma_pack: Option<usize>,
         ctx: &dyn StructLayoutProvider,
         reverse_sso: bool,
     ) -> Self {
@@ -2005,6 +2014,7 @@ impl StructLayout {
             } else {
                 natural_align
             };
+            let field_align = pragma_pack.map_or(field_align, |cap| field_align.min(cap));
             let field_size = field.ty.size_ctx(ctx);
             max_align = max_align.max(field_align);
             max_size = max_size.max(field_size);
@@ -5595,7 +5605,7 @@ mod conditional_type_tests {
                 pointer_quals: Vec::new(),
             },
         ];
-        let layout = super::StructLayout::for_struct_with_packing(&fields, None, &ctx, false);
+        let layout = super::StructLayout::for_struct_with_packing(&fields, None, None, &ctx, false);
         assert_eq!(layout.align, 2);
         assert_eq!(layout.size, 10);
         assert_eq!(layout.fields[1].offset, 2);
@@ -5621,7 +5631,7 @@ mod conditional_type_tests {
             counted_by: None,
             pointer_quals: Vec::new(),
         }];
-        let l1 = super::StructLayout::for_struct_with_packing(&packed_bf, None, &ctx, false);
+        let l1 = super::StructLayout::for_struct_with_packing(&packed_bf, None, None, &ctx, false);
         assert_eq!(l1.align, 1);
         assert_eq!(l1.size, 1);
 
@@ -5641,7 +5651,7 @@ mod conditional_type_tests {
             counted_by: None,
             pointer_quals: Vec::new(),
         }];
-        let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);
+        let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), None, &ctx, false);
         assert_eq!(l2.align, 2);
         assert_eq!(l2.size, 2);
     }
@@ -5676,7 +5686,7 @@ mod conditional_type_tests {
         ];
 
         // struct __attribute__((aligned(16))) T { long long a, b; }
-        let mut t = super::StructLayout::for_struct_with_packing(&pair, None, &ctx, false);
+        let mut t = super::StructLayout::for_struct_with_packing(&pair, None, None, &ctx, false);
         t.apply_struct_aligned(Some(16));
         assert_eq!((t.size, t.align, t.member_align), (16, 16, 8));
 
@@ -5686,7 +5696,7 @@ mod conditional_type_tests {
             field("a", CType::LongLong, None),
             field("b", CType::LongLong, Some(16)),
         ];
-        let m = super::StructLayout::for_struct_with_packing(&member, None, &ctx, false);
+        let m = super::StructLayout::for_struct_with_packing(&member, None, None, &ctx, false);
         assert_eq!((m.size, m.align, m.member_align), (32, 16, 16));
 
         // struct __attribute__((packed, aligned(4))) { char c; long long x; }
@@ -5694,7 +5704,7 @@ mod conditional_type_tests {
             field("c", CType::Char, None),
             field("x", CType::LongLong, None),
         ];
-        let mut p = super::StructLayout::for_struct_with_packing(&packed, Some(1), &ctx, false);
+        let mut p = super::StructLayout::for_struct_with_packing(&packed, Some(1), None, &ctx, false);
         p.apply_struct_aligned(Some(4));
         assert_eq!((p.size, p.align, p.member_align), (12, 4, 1));
 
@@ -5703,7 +5713,7 @@ mod conditional_type_tests {
             field("a", CType::LongLong, None),
             field("d", CType::Double, None),
         ];
-        let mut u = super::StructLayout::for_union_with_packing(&members, None, &ctx, false);
+        let mut u = super::StructLayout::for_union_with_packing(&members, None, None, &ctx, false);
         u.apply_struct_aligned(Some(16));
         assert_eq!((u.size, u.align, u.member_align), (16, 16, 8));
     }
@@ -5905,7 +5915,7 @@ mod fp_aggregate_abi_tests {
 
     fn riscv(fields: &[StructField]) -> Option<FpAggClass> {
         let ctx: super::FxHashMap<String, RcLayout> = Default::default();
-        StructLayout::for_struct_with_packing(fields, None, &ctx, false)
+        StructLayout::for_struct_with_packing(fields, None, None, &ctx, false)
             .classify_riscv_float_fields(&ctx)
     }
 

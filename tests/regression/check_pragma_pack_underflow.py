@@ -70,6 +70,31 @@ struct H { char c; int i; };
 _Static_assert(sizeof(struct G) == 5, "completed record changed packing");
 _Static_assert(sizeof(struct H) == 8, "pop must affect later records");
 '''
+# The pragma cap and packed attribute are deliberately combined. An explicit
+# member alignment escapes the attribute but not the pragma; typedef alignment
+# is a natural alignment and is capped by both.
+ALIGNMENT_SOURCE = r'''typedef int aligned_int __attribute__((aligned(16)));
+struct Plain { char c; int x __attribute__((aligned(8))); };
+struct __attribute__((packed)) Packed { char c; int x __attribute__((aligned(8))); };
+_Static_assert(sizeof(struct Plain) == 16 && _Alignof(struct Plain) == 8 && __builtin_offsetof(struct Plain, x) == 8, "plain aligned");
+_Static_assert(sizeof(struct Packed) == 16 && _Alignof(struct Packed) == 8 && __builtin_offsetof(struct Packed, x) == 8, "packed aligned");
+#pragma pack(push, 2)
+struct P { char c; int x __attribute__((aligned(8))); };
+struct __attribute__((packed)) Q { char c; int x __attribute__((aligned(8))); };
+struct __attribute__((packed)) R { char c; int x; };
+struct T { char c; aligned_int x; };
+struct A { char c; _Alignas(8) int x; };
+union U { char c; int x __attribute__((aligned(8))); };
+union __attribute__((packed)) V { char c; int x __attribute__((aligned(8))); };
+#pragma pack(pop)
+#define CHECK(t) _Static_assert(sizeof(struct t) == 6 && _Alignof(struct t) == 2 && __builtin_offsetof(struct t,x) == 2, #t)
+CHECK(P); CHECK(Q); CHECK(T); CHECK(A);
+_Static_assert(sizeof(struct R) == 5 && _Alignof(struct R) == 1 && __builtin_offsetof(struct R,x) == 1, "ordinary packed member");
+_Static_assert(sizeof(union U) == 4 && _Alignof(union U) == 2, "pragma union");
+_Static_assert(sizeof(union V) == 4 && _Alignof(union V) == 2, "packed pragma union");
+int read_q(struct Q *p) { return p->x; }
+'''
+
 MESSAGE = "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'"
 
 
@@ -98,12 +123,14 @@ def main():
         source.write_text(SOURCE, encoding='utf-8')
         operator = Path(tmp) / 'operator.c'
         operator.write_text(OPERATOR_SOURCE, encoding='utf-8')
+        alignment = Path(tmp) / 'alignment.c'
+        alignment.write_text(ALIGNMENT_SOURCE, encoding='utf-8')
         clang_placement = Path(tmp) / 'clang-placement.c'
         clang_placement.write_text(CLANG_PLACEMENT_SOURCE, encoding='utf-8')
         for compiler, flags in ([(compiler, []) for compiler in args.reference] +
                                 [(compiler, ['-m32']) for compiler in args.reference32]):
             # This is a layout/stack comparison, not a diagnostic parity claim.
-            for fixture in (source, operator):
+            for fixture in (source, operator, alignment):
                 command = [compiler, *flags, '-w', '-fsyntax-only', str(fixture)]
                 result = run(command)
                 require(result[0] == 0, 'reference layout', command, result)
@@ -136,6 +163,9 @@ def main():
             command = [compiler, '-fsyntax-only', '-Wno-pragmas', str(mutant)]
             result = run(command)
             require(result[0] != 0, 'reset-on-underflow fixture mutation was not detected', command, result)
+            command = [compiler, '-c', '-Wno-pragmas', '-o', str(Path(tmp) / 'alignment.o'), str(alignment)]
+            result = run(command)
+            require(result[0] == 0, 'pragma and explicit alignment layout/codegen', command, result)
             command = [compiler, '-fsyntax-only', '-Werror', str(operator)]
             result = run(command)
             require(result[0] == 0, 'operator layout', command, result)

@@ -1463,6 +1463,7 @@ impl<'a> ExprTypeChecker<'a> {
             StructLayout::for_union_with_packing(
                 &struct_fields,
                 max_field_align,
+                pragma_pack,
                 &*self.types.borrow_struct_layouts(),
                 reverse_sso,
             )
@@ -1470,6 +1471,7 @@ impl<'a> ExprTypeChecker<'a> {
             StructLayout::for_struct_with_packing(
                 &struct_fields,
                 max_field_align,
+                pragma_pack,
                 &*self.types.borrow_struct_layouts(),
                 reverse_sso,
             )
