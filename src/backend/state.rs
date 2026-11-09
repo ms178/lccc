@@ -1604,6 +1604,29 @@ impl CodegenState {
             .filter(|reg| reg.starts_with("xmm"))
     }
 
+    /// The 512-bit twin of [`Self::vec_live_xmm`]: only an `%zmm` claim may
+    /// feed an EVEX.512 operand.
+    ///
+    /// The map is WIDTH-POLYGLOT by construction — one value, one bank, but
+    /// the spelling records the width the producer wrote (`%xmmN` for a
+    /// legacy/VEX.128 write, `%ymmN` for VEX.256, `%zmmN` for EVEX.512). Every
+    /// reader therefore has to narrow the map to ITS width, and reading it raw
+    /// is only safe for consumers with no fixed width: a `movdqa64` move, a
+    /// bank eviction, or an `ereg` reservation test. A computed-width consumer
+    /// that reads the map directly will splice `%zmm3` into a VEX.256 operand
+    /// (illegal mixed encoding, and the emitter does no width check), so this
+    /// accessor exists to make the correct choice the easy one.
+    ///
+    /// Absent means "reload from the slot": always correct, at worst one
+    /// redundant load. A stale claim can therefore only cost instructions,
+    /// never correctness.
+    pub fn vec_live_zmm(&self, v: u32) -> Option<&'static str> {
+        self.vec_live_regs
+            .get(&v)
+            .copied()
+            .filter(|reg| reg.starts_with("zmm"))
+    }
+
     /// Is `v` provably sitting in the STAGING register (`%ymm0` / `%xmm0`)
     /// right now, so a consumer may read that register instead of reloading
     /// the value's slot?

@@ -2841,6 +2841,14 @@ jobs:
         # what stops them growing back.  Runs in ci_local.sh too.
         python3 scripts/audit_census.py --selftest
         bash tests/regression/check_copy_alias_sizes.sh
+        # The laws that make a vector store source sound are only visible in
+        # review.  A resolver may name a register only from an enclosing
+        # proof, the staging predicate must compare the register NAME, the
+        # reserved scratch pair must stay unclaimable, a memory store must
+        # retire only the scratch peephole, and a fold must consult the
+        # register records before slot validity.  Static, compiler-free.
+        python3 scripts/check_vec_store_contracts.py --self-test
+        python3 scripts/check_vec_store_contracts.py
         }
         # The body MUST NOT be invoked from a conditional context
         # (`if ! ...`, `||`, `&&`): bash ignores errexit AND the ERR trap

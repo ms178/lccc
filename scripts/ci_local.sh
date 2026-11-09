@@ -2560,6 +2560,19 @@ gate "phi-acyclic-copy-order" fast \
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
 
+# The vector store-source records (`vec_live_regs`, `*_last_store_*`,
+# `pending_vec_store`) are three separate answers to "which register holds this
+# value", and a wrong answer is a SILENT miscompile: the destination receives
+# whatever the register held before.  The laws that make the answer sound are
+# only visible in code review, and the three that were regressions were found
+# by review, not by any gate.  Pure static scan of `src/`, so it needs no
+# compiler and runs before `build`; mirrors the hosted `backend-contracts`
+# shard step.
+gate "vec-store-contracts-selftest" fast \
+    python3 scripts/check_vec_store_contracts.py --self-test
+gate "vec-store-contracts" fast \
+    python3 scripts/check_vec_store_contracts.py
+
 # AUD-RATCHET-1: the audit's site counts are a ratchet, not a snapshot.  The
 # scanner self-tests first (its tokenizer is what every number rests on), then
 # --check refuses any metric that grew past scripts/audit_census_baseline.json:
