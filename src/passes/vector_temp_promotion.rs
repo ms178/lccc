@@ -5511,6 +5511,110 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_destination_narrower_than_the_result_is_refused() {
+        // The producer is re-pointed at the relay store's destination, so
+        // that object -- not the home -- has to hold the whole result. A
+        // 16-byte destination cannot take the 32-byte `MinPs256` result.
+        let insts = vec![
+            alloca(1, 32, 32),
+            intrinsic(
+                Some(3),
+                IntrinsicOp::MinPs256,
+                Some(1),
+                vec![Operand::Value(Value(0))],
+            ),
+            // Destination declared up front and dominating, but too small.
+            alloca(2, 16, 16),
+            intrinsic(
+                Some(4),
+                IntrinsicOp::VecLoadF32x8,
+                None,
+                vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+            ),
+            intrinsic(
+                None,
+                IntrinsicOp::VecStoreF32x8,
+                Some(2),
+                vec![
+                    Operand::Value(Value(4)),
+                    Operand::Value(Value(2)),
+                    Operand::Const(IrConst::I64(0)),
+                ],
+            ),
+        ];
+        let before = insts.len();
+        let mut func = single_block("dest_too_small", insts);
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            0,
+            "a destination narrower than the result must be refused"
+        );
+        assert_eq!(func.blocks[0].instructions.len(), before);
+    }
+
+    #[test]
+    fn a_relay_destination_that_is_not_a_home_needs_no_size_check() {
+        // A parameter or GEP destination is not a stack home, so there is no
+        // object to measure. The relay store already writes exactly `width`
+        // bytes through that pointer, so the producer writes the same bytes
+        // to the same place under the same contract. This is the
+        // `vmovdqu %ymm0,(%rdi)` epilogue store in `avx_fp_private` and is
+        // the whole point of the relay: gating it on `allocas` would cost
+        // the entire measured win (41 vs 57 instructions).
+        let mut func = single_block(
+            "dest_is_parameter",
+            vec![
+                alloca(1, 32, 32),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::MinPs256,
+                    Some(1),
+                    vec![Operand::Value(Value(0))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadF32x8,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+                // %7 is never declared as an alloca: a parameter.
+                intrinsic(
+                    None,
+                    IntrinsicOp::VecStoreF32x8,
+                    Some(7),
+                    vec![
+                        Operand::Value(Value(4)),
+                        Operand::Value(Value(7)),
+                        Operand::Const(IrConst::I64(0)),
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(
+            forward_vector_home_results(&mut func),
+            1,
+            "a non-home destination must not block the relay"
+        );
+        let producer = func.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::MinPs256,
+                    dest_ptr,
+                    ..
+                } => dest_ptr.clone(),
+                _ => None,
+            })
+            .expect("the MinPs256 producer must survive");
+        assert_eq!(
+            producer,
+            Value(7),
+            "the producer must write straight to the parameter"
+        );
+    }
+
+    #[test]
     fn conflicting_plans_are_pruned_rather_than_dangling_a_definition() {
         // Two relays over the SAME store: the second names instruction 3 as
         // its producer while the first retires it. Dropping one keeps the
