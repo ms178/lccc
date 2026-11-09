@@ -278,17 +278,44 @@ impl Lowerer {
                 // (Runs before insert_struct_layout_scoped, which takes the
                 // layout by value and the dynamic-offset walk reads it.)
                 if self.func_state.is_some() {
-                    if let Some(vla_size) = self.compute_vla_size_from_type_spec(ts) {
+                    let captured = self.capture_direct_vla_fields(fields);
+                    let size = if let Some((sizes, _)) = &captured {
+                        self.compute_vla_struct_sizeof(
+                            fields,
+                            false,
+                            *is_packed,
+                            *struct_aligned,
+                            *pragma_pack,
+                            reverse_sso.is_some_and(|v| v),
+                            Some(sizes),
+                        )
+                    } else {
+                        self.compute_vla_size_from_type_spec(ts)
+                    };
+                    if let Some(vla_size) = size {
                         self.func_mut()
                             .insert_vla_typedef_size_scoped(key.clone(), vla_size);
+                        if tag.is_none() {
+                            // The declaration machinery will mint its own
+                            // `__anon_struct_N` CType key for this definition;
+                            // the declaration-level code re-keys this metadata
+                            // once that key exists (see lower_local_decl).
+                            self.pending_anon_vla
+                                .insert(ts as *const TypeSpecifier as usize, key.clone());
+                        }
                     }
-                    self.compute_vla_field_strides_for_decl(&key, fields);
+                    self.compute_vla_field_strides_for_decl(
+                        &key,
+                        fields,
+                        captured.as_ref().map(|(_, bounds)| bounds.as_slice()),
+                    );
                     self.compute_vla_field_offsets_for_decl(
                         &key,
                         fields,
                         *is_packed,
                         *pragma_pack,
                         &layout,
+                        captured.as_ref().map(|(sizes, _)| sizes.as_slice()),
                     );
                 }
                 self.insert_struct_layout_scoped(key.clone(), layout);
@@ -325,13 +352,70 @@ impl Lowerer {
                     self.invalidate_ctype_cache_scoped(&key);
                 }
                 if self.func_state.is_some() {
-                    if let Some(vla_size) = self.compute_vla_size_from_type_spec(ts) {
+                    let captured = self.capture_direct_vla_fields(fields);
+                    let size = if let Some((sizes, _)) = &captured {
+                        self.compute_vla_struct_sizeof(
+                            fields,
+                            true,
+                            *is_packed,
+                            *struct_aligned,
+                            *pragma_pack,
+                            reverse_sso.is_some_and(|v| v),
+                            Some(sizes),
+                        )
+                    } else {
+                        self.compute_vla_size_from_type_spec(ts)
+                    };
+                    if let Some(vla_size) = size {
                         self.func_mut()
-                            .insert_vla_typedef_size_scoped(key, vla_size);
+                            .insert_vla_typedef_size_scoped(key.clone(), vla_size);
+                        if tag.is_none() {
+                            self.pending_anon_vla
+                                .insert(ts as *const TypeSpecifier as usize, key);
+                        }
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Re-key the dynamic VLA metadata recorded for an anonymous record
+    /// definition under the CType key the declaration machinery minted for
+    /// it. The size, per-field strides and per-field offsets were computed
+    /// exactly once at the type definition; member accesses and `sizeof`
+    /// look them up through the variable's CType key, which differs from
+    /// the registration key for anonymous records.
+    pub(super) fn alias_vla_record_metadata(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        let Some(fs) = self.func_state.as_ref() else {
+            return;
+        };
+        let size = fs.vla_typedef_sizes.get(from).copied();
+        let prefix = format!("{from}::");
+        let strides: Vec<(String, Vec<Value>)> = fs
+            .vla_field_strides
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| (format!("{to}::{}", &k[prefix.len()..]), v.clone()))
+            .collect();
+        let offsets: Vec<(String, Value)> = fs
+            .vla_field_offsets
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| (format!("{to}::{}", &k[prefix.len()..]), *v))
+            .collect();
+        if let Some(size) = size {
+            self.func_mut()
+                .insert_vla_typedef_size_scoped(to.to_string(), size);
+        }
+        for (k, v) in strides {
+            self.func_mut().insert_vla_field_strides_scoped(k, v);
+        }
+        for (k, v) in offsets {
+            self.func_mut().insert_vla_field_offset_scoped(k, v);
         }
     }
 
@@ -1927,15 +2011,78 @@ impl Lowerer {
         }
     }
 
+    /// Capture direct array-member bounds once, keyed by member and dimension
+    /// ordinal rather than source span (macro expansions may share spans).
+    /// Nested dynamically sized element types still take the older path.
+    fn capture_direct_vla_fields(
+        &mut self,
+        fields: &[StructFieldDecl],
+    ) -> Option<(Vec<Option<Value>>, Vec<Vec<Option<Operand>>>)> {
+        use crate::frontend::parser::ast::DerivedDeclarator;
+        fn base(f: &StructFieldDecl) -> &TypeSpecifier {
+            let mut ty = &f.type_spec;
+            while let TypeSpecifier::Array(inner, _) = ty {
+                ty = inner;
+            }
+            ty
+        }
+        if !fields.iter().any(|f| self.field_vla_runtime_size_probe(f))
+            || fields.iter().any(|f| {
+                self.probe_vla_size_from_type_spec(base(f))
+                    || (matches!(f.type_spec, TypeSpecifier::Array(..)) && !f.derived.is_empty())
+            })
+        {
+            return None;
+        }
+        let mut sizes = Vec::with_capacity(fields.len());
+        let mut bounds = Vec::with_capacity(fields.len());
+        for field in fields {
+            let mut dims = Vec::new();
+            let mut ty = &field.type_spec;
+            while let TypeSpecifier::Array(inner, dim) = ty {
+                dims.push(DerivedDeclarator::Array(dim.clone()));
+                ty = inner;
+            }
+            if dims.is_empty() {
+                dims.clone_from(&field.derived);
+            }
+            let array_exprs: Vec<_> = dims
+                .iter()
+                .filter_map(|d| match d {
+                    DerivedDeclarator::Array(expr) => Some(expr.as_deref()),
+                    _ => None,
+                })
+                .collect();
+            let mut field_bounds = vec![None; array_exprs.len()];
+            // GCC evaluates dimensions from innermost to outermost.
+            for (index, expr) in array_exprs.iter().enumerate().rev() {
+                if let Some(expr) = expr {
+                    if self.expr_as_array_size(expr).is_none() {
+                        field_bounds[index] = Some(self.lower_expr(expr));
+                    }
+                }
+            }
+            let size = if field.bit_width.is_none() && self.field_vla_runtime_size_probe(field) {
+                self.compute_vla_runtime_size_with_bounds(ty, &dims, Some(&field_bounds))
+            } else {
+                None
+            };
+            sizes.push(size);
+            bounds.push(field_bounds);
+        }
+        Some((sizes, bounds))
+    }
+
     pub(super) fn compute_vla_field_strides_for_decl(
         &mut self,
         struct_key: &str,
         fields: &[StructFieldDecl],
+        captured_bounds: Option<&[Vec<Option<Operand>>]>,
     ) {
         use crate::frontend::parser::ast::DerivedDeclarator;
         use crate::ir::ops::IrBinOp;
         let ptr_int_ty = crate::common::types::target_int_ir_type();
-        for f in fields {
+        for (field_index, f) in fields.iter().enumerate() {
             let Some(ref field_name) = f.name else {
                 continue;
             };
@@ -1965,12 +2112,15 @@ impl Lowerer {
             let elem_size = self.sizeof_type(curr_ts);
             let mut dim_ops: Vec<Option<Operand>> = Vec::new();
             let mut has_vla = elem_size_val.is_some() || !inner_strides.is_empty();
-            for dim in &dims {
+            for (dim_index, dim) in dims.iter().enumerate() {
                 if let Some(dim_node) = dim {
                     if let Some(c) = self.expr_as_array_size(dim_node) {
                         dim_ops.push(Some(Operand::Const(IrConst::ptr_int(c as i64))));
                     } else {
-                        let op = self.lower_expr(dim_node);
+                        let op = captured_bounds
+                            .and_then(|bounds| bounds[field_index].get(dim_index))
+                            .and_then(Clone::clone)
+                            .unwrap_or_else(|| self.lower_expr(dim_node));
                         dim_ops.push(Some(op));
                         has_vla = true;
                     }
@@ -2061,6 +2211,7 @@ impl Lowerer {
         is_packed: bool,
         pragma_pack: Option<usize>,
         layout: &crate::common::types::StructLayout,
+        captured_sizes: Option<&[Option<Value>]>,
     ) {
         // Locate the first VLA member. Without one there are no dynamic
         // offsets to record.
@@ -2089,7 +2240,7 @@ impl Lowerer {
 
         let mut cursor = VlaDynCursor::new(vla_member_static_offset, is_packed);
 
-        for f in &fields[vla_idx..] {
+        for (index, f) in fields.iter().enumerate().skip(vla_idx) {
             let bit_width = f
                 .bit_width
                 .as_ref()
@@ -2145,7 +2296,12 @@ impl Lowerer {
                         .insert_vla_field_offset_scoped(field_key, off_val);
                 }
             }
-            if let Some(vla_sz) = self.field_vla_runtime_size(f) {
+            let field_size = if let Some(sizes) = captured_sizes {
+                sizes[index]
+            } else {
+                self.field_vla_runtime_size(f)
+            };
+            if let Some(vla_sz) = field_size {
                 self.vla_cursor_add_vla(&mut cursor, vla_sz);
                 continue;
             }
@@ -2250,8 +2406,9 @@ impl Lowerer {
                 }
                 false
             }
-            TypeSpecifier::Array(_, Some(size_expr)) => {
+            TypeSpecifier::Array(inner, Some(size_expr)) => {
                 self.expr_as_array_size(size_expr).is_none()
+                    || self.probe_vla_size_from_type_spec(inner)
             }
             TypeSpecifier::Array(_, None) => true,
             _ => false,

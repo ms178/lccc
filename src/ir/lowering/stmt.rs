@@ -76,6 +76,15 @@ impl Lowerer {
     }
 
     pub(super) fn lower_local_decl(&mut self, decl: &Declaration) {
+        self.pending_anon_vla.clear();
+        self.lower_local_decl_inner(decl);
+        // The pending entries hold raw addresses of TypeSpecifier nodes
+        // that may be temporary resolved clones owned by this declaration;
+        // never let them survive into the next statement.
+        self.pending_anon_vla.clear();
+    }
+
+    fn lower_local_decl_inner(&mut self, decl: &Declaration) {
         let mut resolved_type_spec = None;
         let type_spec = self.resolve_local_type_spec(decl, &mut resolved_type_spec);
 
@@ -145,6 +154,24 @@ impl Lowerer {
             }
 
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
+            // An anonymous record definition registered its once-evaluated
+            // VLA size/strides/offsets under the lowerer's own key; re-key
+            // them under the CType key the analysis minted, which is what
+            // member accesses and sizeof resolve through.
+            if let Some(from) = self
+                .pending_anon_vla
+                .get(&(type_spec as *const TypeSpecifier as usize))
+                .cloned()
+            {
+                let mut ct = da.c_type.as_ref();
+                while let Some(CType::Array(inner, _) | CType::Pointer(inner, _)) = ct {
+                    ct = Some(inner);
+                }
+                if let Some(CType::Struct(to) | CType::Union(to)) = ct {
+                    let to = to.to_string();
+                    self.alias_vla_record_metadata(&from, &to);
+                }
+            }
             self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
             da.apply_decl_vector_type(decl);
             self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
@@ -357,6 +384,23 @@ impl Lowerer {
                             .insert_struct_layout_scoped_from_ref(&old_key, layout);
                     }
                     resolved_ctype = existing.clone();
+                }
+            }
+            // Re-key once-evaluated anonymous VLA record metadata under the
+            // typedef's CType key (see the matching logic in the variable
+            // declaration path).
+            if let Some(from) = self
+                .pending_anon_vla
+                .get(&(type_spec as *const TypeSpecifier as usize))
+                .cloned()
+            {
+                let mut ct = Some(&resolved_ctype);
+                while let Some(CType::Array(inner, _) | CType::Pointer(inner, _)) = ct {
+                    ct = Some(inner);
+                }
+                if let Some(CType::Struct(to) | CType::Union(to)) = ct {
+                    let to = to.to_string();
+                    self.alias_vla_record_metadata(&from, &to);
                 }
             }
             self.types
@@ -1750,6 +1794,17 @@ impl Lowerer {
         type_spec: &TypeSpecifier,
         derived: &[DerivedDeclarator],
     ) -> Option<Value> {
+        self.compute_vla_runtime_size_with_bounds(type_spec, derived, None)
+    }
+
+    /// As above, but reuse bounds captured for a record member at its type
+    /// definition. Entries correspond to array declarators, not source spans.
+    pub(super) fn compute_vla_runtime_size_with_bounds(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+        bounds: Option<&[Option<Operand>]>,
+    ) -> Option<Value> {
         // Collect array dimensions from derived declarators
         let array_dims: Vec<&Option<Box<Expr>>> = derived
             .iter()
@@ -1828,13 +1883,18 @@ impl Lowerer {
             base_elem_size
         };
 
-        for expr in array_dims.iter().copied().flatten() {
+        for (index, dim) in array_dims.iter().enumerate() {
+            let Some(expr) = dim.as_deref() else { continue };
             if let Some(const_val) = self.array_bound_elems(expr, 0) {
                 // Constant dimension - accumulate
                 const_product *= const_val;
             } else {
-                // Runtime dimension - emit multiplication
-                let dim_val = self.lower_expr(expr);
+                // Runtime dimension - emit multiplication. Captured operands
+                // are indexed by declarator occurrence, not source location.
+                let dim_val = bounds
+                    .and_then(|b| b.get(index))
+                    .and_then(Clone::clone)
+                    .unwrap_or_else(|| self.lower_expr(expr));
                 self.emit_ubsan_vla_bound_check(dim_val, expr);
                 let dim_value = self.operand_to_value(dim_val);
 
@@ -2147,6 +2207,23 @@ impl Lowerer {
         &mut self,
         type_spec: &TypeSpecifier,
     ) -> Option<Value> {
+        // This exact anonymous record definition already evaluated its
+        // bounds once at registration (C99 6.7.6.2: side effects in the
+        // bounds happen once, at the type definition). The node address
+        // identifies the definition; same-span macro clones cannot alias
+        // because the entry never outlives the registering declaration.
+        if let Some(key) = self
+            .pending_anon_vla
+            .get(&(type_spec as *const TypeSpecifier as usize))
+        {
+            if let Some(&size) = self
+                .func_state
+                .as_ref()
+                .and_then(|fs| fs.vla_typedef_sizes.get(key))
+            {
+                return Some(size);
+            }
+        }
         if let TypeSpecifier::TypedefName(name) = type_spec {
             if let Some(&vla_size) = self
                 .func_state
@@ -2184,8 +2261,19 @@ impl Lowerer {
         {
             return Some(size);
         }
-        let resolved = self.resolve_type_spec(type_spec).clone();
-        match &resolved {
+        // Preserve node identity when resolution is the identity: the field
+        // walks below consult `pending_anon_vla` by node address, and a
+        // clone would silently re-evaluate side-effectful bounds of nested
+        // anonymous record members.
+        let resolved_is_same = std::ptr::eq(self.resolve_type_spec(type_spec), type_spec);
+        let resolved_owned;
+        let resolved: &TypeSpecifier = if resolved_is_same {
+            type_spec
+        } else {
+            resolved_owned = self.resolve_type_spec(type_spec).clone();
+            &resolved_owned
+        };
+        match resolved {
             TypeSpecifier::Array(elem, Some(size_expr)) => {
                 if self.expr_as_array_size(size_expr).is_some() {
                     return None; // Constant size
@@ -2225,6 +2313,7 @@ impl Lowerer {
                 *struct_aligned,
                 *pragma_pack,
                 reverse_sso.is_some_and(|v| v),
+                None,
             ),
             TypeSpecifier::Union(
                 _,
@@ -2241,6 +2330,7 @@ impl Lowerer {
                 *struct_aligned,
                 *pragma_pack,
                 reverse_sso.is_some_and(|v| v),
+                None,
             ),
             TypeSpecifier::TypedefName(name) => {
                 if let Some(ct) = self.types.typedefs.get(name).cloned() {
@@ -2266,7 +2356,7 @@ impl Lowerer {
     /// bound is captured, later stores to the bound expression are ignored).
     /// Covers gcc.c-torture 20040423-1 (`typedef struct { int c[i+2]; } c`)
     /// and 20041218-2 (`struct s { char b[n]; } packed; n++; sizeof(struct s)`).
-    fn compute_vla_struct_sizeof(
+    pub(super) fn compute_vla_struct_sizeof(
         &mut self,
         fields: &[StructFieldDecl],
         is_union: bool,
@@ -2274,6 +2364,7 @@ impl Lowerer {
         struct_aligned: Option<usize>,
         pragma_pack: Option<usize>,
         reverse_sso: bool,
+        captured_sizes: Option<&[Option<Value>]>,
     ) -> Option<Value> {
         let ptr_int_ty = target_int_ir_type();
 
@@ -2316,11 +2407,15 @@ impl Lowerer {
                 reverse_sso,
             );
             let mut largest = Operand::Const(IrConst::ptr_int(fixed_layout.size as i64));
-            for field in fields {
+            for (index, field) in fields.iter().enumerate() {
                 if field.bit_width.is_some() || !self.field_vla_runtime_size_probe(field) {
                     continue;
                 }
-                let size = self.field_vla_runtime_size(field)?;
+                let size = if let Some(sizes) = captured_sizes {
+                    sizes[index]?
+                } else {
+                    self.field_vla_runtime_size(field)?
+                };
                 let cmp = self.emit_cmp_val(
                     IrCmpOp::Ugt,
                     Operand::Value(size),
@@ -2361,7 +2456,7 @@ impl Lowerer {
         let mut max_align = layout.align;
         let mut last_bitfield_unit = 0usize;
 
-        for f in &fields[vla_idx..] {
+        for (index, f) in fields.iter().enumerate().skip(vla_idx) {
             let bit_width = f
                 .bit_width
                 .as_ref()
@@ -2404,7 +2499,12 @@ impl Lowerer {
             self.vla_cursor_align(&mut cursor, align);
             last_bitfield_unit = 0;
 
-            if let Some(vla_sz) = self.field_vla_runtime_size(f) {
+            let field_size = if let Some(sizes) = captured_sizes {
+                sizes[index]
+            } else {
+                self.field_vla_runtime_size(f)
+            };
+            if let Some(vla_sz) = field_size {
                 self.vla_cursor_add_vla(&mut cursor, vla_sz);
                 continue;
             }

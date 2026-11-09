@@ -177,9 +177,44 @@ int unions(int n, int m) {
     }
     return 0;
 }
+/* C99 6.7.6.2: side effects in VLA bounds run exactly once, at the type
+   definition; size, member offsets and array strides must reuse the same
+   evaluation (GCC 16.2 witnessed 2026-11-09). */
+int side_effects(int n) {
+    int i = n;
+    struct S { int prefix; char a[i++]; char b[i++]; int tail; } s[2];
+    if (i != n + 2) return 20;
+    int asz = n, bsz = n + 1;
+    int stride = ((4 + asz + bsz + 3) & ~3) + 4;
+    if (sizeof s != 2 * stride) return 21;
+    if ((char *)&s[0].b - (char *)s != 4 + asz) return 22;
+    if ((char *)&s[1].tail - (char *)s != 2 * stride - 4) return 23;
+    int j = n;
+    struct M { char x[j++][j++]; char t; } m;
+    /* Dimensions evaluate innermost first: x[n+1][n]. */
+    if (j != n + 2) return 24;
+    if (sizeof m != (n + 1) * n + 1) return 25;
+    if ((char *)&m.x[1] - (char *)&m.x[0] != n) return 26;
+    int k = n;
+    struct { struct { char w[k++]; } in; int t; } o;
+    if (k != n + 1) return 27;
+    if ((char *)&o.t - (char *)&o != ((n + 3) & ~3)) return 28;
+    int u = n;
+    union { char a[u++]; short h; } q;
+    int qe = n > 2 ? n : 2; qe = (qe + 1) & ~1;
+    if (u != n + 1 || sizeof q != qe) return 29;
+    int d = n;
+    typedef struct { char a[d++]; int z; } Q;
+    Q q1, q2;
+    if (d != n + 1) return 30;
+    if (sizeof q1 != ((n + 3) & ~3) + 4 || sizeof q2 != sizeof q1) return 31;
+    if ((char *)&q1.z - (char *)&q1 != ((n + 3) & ~3)) return 32;
+    return 0;
+}
 int main(void) {
     for (int n=1; n<=20; n++) {
         int e=run(n); if (e) return e;
+        e=side_effects(n); if (e) return e;
         for (int m=1; m<=20; m++) { e=unions(n,m); if (e) return e; }
     }
     return 0;
