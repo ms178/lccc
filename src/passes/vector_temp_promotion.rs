@@ -1301,6 +1301,56 @@ fn operand_is_const_zero(operand: &Operand) -> bool {
 const TERMINATOR: usize = usize::MAX;
 
 /// Count how many instructions in `func` read `value`, per instruction.
+/// Every use site of every value in `func`, built in one sweep.
+///
+/// `plan_home_forwards` needs the uses of a home for each candidate producer
+/// and, on the relay path, of the loaded register as well. Scanning the whole
+/// function per query makes planning quadratic in the size of the block being
+/// rewritten; one sweep turns each query into a lookup. The IR is immutable
+/// for the entire planning phase, so the index cannot go stale.
+struct UseIndex(FxHashMap<u32, FxHashMap<(usize, usize), usize>>);
+
+impl UseIndex {
+    fn build(func: &IrFunction) -> Self {
+        let mut index: FxHashMap<u32, FxHashMap<(usize, usize), usize>> =
+            FxHashMap::with_capacity_and_hasher(
+                (map_capacity(func) / 8).max(8),
+                Default::default(),
+            );
+        for (bi, b) in func.blocks.iter().enumerate() {
+            for (ii, i) in b.instructions.iter().enumerate() {
+                i.for_each_used_value(|v| {
+                    *index.entry(v).or_default().entry((bi, ii)).or_insert(0) += 1;
+                });
+            }
+            b.terminator.for_each_used_value(|v| {
+                *index
+                    .entry(v)
+                    .or_default()
+                    .entry((bi, TERMINATOR))
+                    .or_insert(0) += 1;
+            });
+        }
+        Self(index)
+    }
+
+    /// The use sites of `value`, if it has any.
+    fn uses(&self, value: u32) -> Option<&FxHashMap<(usize, usize), usize>> {
+        self.0.get(&value)
+    }
+
+    /// True when `forwarded` accounts for every use of `value` exactly.
+    /// Allocation-free: the query compares against the index in place rather
+    /// than cloning it.
+    fn matches(&self, value: u32, forwarded: &FxHashMap<(usize, usize), usize>) -> bool {
+        match self.0.get(&value) {
+            None => forwarded.is_empty(),
+            Some(uses) => uses == forwarded,
+        }
+    }
+}
+
+/// Count how many instructions in `func` read `value`, per instruction.
 fn count_uses(func: &IrFunction, value: u32) -> FxHashMap<(usize, usize), usize> {
     let mut uses: FxHashMap<(usize, usize), usize> = FxHashMap::default();
     for (bi, b) in func.blocks.iter().enumerate() {
@@ -1431,6 +1481,7 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
             }
         }
     }
+    let use_index = UseIndex::build(func);
     let mut plans = Vec::new();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (producer, inst) in block.instructions.iter().enumerate() {
@@ -1464,7 +1515,6 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                 },
             };
 
-            let uses = count_uses(func, home);
             let mut forwarded: FxHashMap<(usize, usize), usize> = FxHashMap::default();
             // The producer's own write slot; a store also names the home as
             // its address operand.
@@ -1477,7 +1527,6 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
             let mut dead = Vec::new();
             let mut aborted = false;
             let mut kind: Option<HomeBypass> = None;
-            let mut value: Option<u32> = None;
 
             for (reader, r_inst) in block.instructions.iter().enumerate().skip(producer + 1) {
                 if let Instruction::Intrinsic { dest_ptr: r_dp, .. } = r_inst {
@@ -1590,7 +1639,6 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                         kind = Some(HomeBypass::Relay {
                             destination: store_dest,
                         });
-                        value = Some(producer_dest.0);
                     }
                     _ => {
                         // Otherwise every read must be a classified
@@ -1628,8 +1676,11 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                 continue;
             }
 
-            let plan = match (kind, value, dest) {
-                (Some(HomeBypass::Relay { destination }), _, _) => {
+            // A relay re-points the producer instead of forwarding a value,
+            // so `dest` alone discriminates the two forms: `Some` is a
+            // computing intrinsic (relay), `None` an explicit store (spill).
+            let plan = match (kind, dest) {
+                (Some(HomeBypass::Relay { destination }), _) => {
                     // A relay home has exactly one reader by construction, so
                     // no other rewrite may accompany it.
                     if !arg_rewrites.is_empty() {
@@ -1645,7 +1696,7 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                     }
                 }
                 // Spill: the stored register is handed to every reader.
-                (None, None, None) => {
+                (None, None) => {
                     let Some(stored) = as_whole_vector_store(inst, width, home) else {
                         continue;
                     };
@@ -1664,7 +1715,7 @@ fn plan_home_forwards(func: &IrFunction, allocas: &FxHashMap<u32, AllocaInfo>) -
                 }
                 _ => continue,
             };
-            if uses != forwarded {
+            if !use_index.matches(home, &forwarded) {
                 continue;
             }
             plans.push(plan);
@@ -1791,7 +1842,9 @@ fn forward_vector_home_results(func: &mut IrFunction) -> usize {
             remove_instructions(block, &mut removed);
         }
     }
-    remove_unused_allocas(func);
+    if applied > 0 {
+        remove_unused_allocas(func);
+    }
     applied
 }
 
