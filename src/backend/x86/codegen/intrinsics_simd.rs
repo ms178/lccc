@@ -3226,6 +3226,10 @@ mod simd_operand_role_and_upper_state_tests {
         for wrong in ["xmm3", "zmm3"] {
             let mut cg = X86Codegen::new();
             slot_vector(&mut cg, 0);
+            // The result needs a home of its own: `avx_store_dest` resolves the
+            // destination's slot or register, and asserts (debug builds) when
+            // it has neither. Value 9 is the destination in this fixture.
+            slot_vector(&mut cg, 9);
             cg.state.vec_live_regs.insert(0, wrong);
             let handled = cg.emit_simd_op(
                 &Some(Value(9)),
@@ -3247,6 +3251,7 @@ mod simd_operand_role_and_upper_state_tests {
         // Control: an `%ymm` claim is exactly the right width and is used.
         let mut cg = X86Codegen::new();
         slot_vector(&mut cg, 0);
+        slot_vector(&mut cg, 9);
         cg.state.vec_live_regs.insert(0, "ymm3");
         let handled = cg.emit_simd_op(
             &Some(Value(9)),
