@@ -3198,7 +3198,10 @@ mod simd_operand_role_and_upper_state_tests {
             out.contains("vmovdqa64 %zmm3, %zmm0"),
             "a width-matched claim must still be reused: {out}"
         );
-        assert!(!out.contains("vmovdqu64"), "and must not be reloaded: {out}");
+        assert!(
+            !out.contains("vmovdqu64"),
+            "and must not be reloaded: {out}"
+        );
     }
 
     /// The VEX.256 broadcast reads a `%ymm` source operand. `vec_live_regs`
