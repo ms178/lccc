@@ -1441,7 +1441,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 352.29,
+      "predicted_gate_seconds": 352.92,
       "shards": 3,
       "steps": [
         {
@@ -1571,6 +1571,10 @@
         {
           "measured_s": 5.0,
           "name": "Preprocessor rescanning, conditional comma, character constants, wchar_t and pragma rendering"
+        },
+        {
+          "measured_s": 0.63,
+          "name": "Feature capability truthfulness"
         },
         {
           "measured_s": 3.0,
@@ -1904,8 +1908,8 @@
     },
     "frontend": {
       "costs": "/home/user/checkpoints/ci-main-union-costs.tsv",
-      "measured_seconds_total": 1058.94,
-      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed). GNU object-placement declarator scopes added to frontend-a (local worst of three 2.00 s; fastbuild and GCC 16.2)."
+      "measured_seconds_total": 1059.57,
+      "source": "Union with main 662b771c0; retain both sides coverage and previously measured diagnostic gate costs. Four 2026-11-04 GCC-16.2 follow-up gates added to frontend-a with locally measured worst-of-3 wall times (scripts/ci_local.sh toolchain, fastbuild binaries): asm-constraints 1.65 s, vectorizer-openmp 0.93 s, gnu-declaration-corners 0.55 s, parser-depth-limits 0.34 s (worst-of-3 remeasured after the 64-spelling red-team differential gate landed). GNU object-placement declarator scopes added to frontend-a (local worst of three 2.00 s; fastbuild and GCC 16.2). Feature capability truthfulness added to frontend-b (local worst-of-3 wall 0.63 s; fastbuild, GCC 16.2 / Clang 23.1.5 oracles)."
     }
   }
 }

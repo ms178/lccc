@@ -119,6 +119,18 @@ if ! want mold; then
   :
 elif have "$MOLD_NAME"; then
   log "mold already present: $("$BIN/$MOLD_NAME" --version | head -1)"
+elif [[ ${MOLD_PREFER:-cache} == cache && ($MOLD_REF == v3.0.0 || $MOLD_REF == 3.0.0) ]] && \
+     bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$SRC/mold-cache-v3.0.0"; then
+  # Hash-verified upstream release bytes (the same digest ci_install_mold_oracle.sh
+  # pins), with a functional elf_i386 + elf_x86_64 link probe.  For LINK TIMING
+  # research use MOLD_PREFER=source: the release binary is not built
+  # -C target-cpu=native and uses mimalloc, while the research preset is
+  # x86_64,i386,system-allocator + target-cpu=native.
+  install -m755 "$SRC/mold-cache-v3.0.0/bin/mold" "$BIN/$MOLD_NAME"
+  ln -sf "$MOLD_NAME" "$BIN/ld$(ref_suffix "$MOLD_REF").mold"
+  ln -sf "$MOLD_NAME" "$BIN/mold"
+  ln -sf mold "$BIN/ld.mold"
+  log "mold: $("$BIN/$MOLD_NAME" --version | head -1) (verified cache binary)"
 else
   log "building mold ${MOLD_REF} (cargo features: x86_64,i386,system-allocator)"
   command -v cargo >/dev/null || { echo "cargo is required (mold 3.x is built with Cargo, not CMake)" >&2; exit 1; }

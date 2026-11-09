@@ -78,7 +78,17 @@ BINUTILS_VER=2.47
 # binaries 2.47.20260726; oracle_versions.sh accepts that exact banner.
 BINUTILS_SHA256=154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff
 MOLD_VER=3.0.0
-MOLD_FEATURES='x86_64,i386'
+# Upstream v3.0.0 cli/Cargo.toml: `system-allocator` is a real, non-default
+# feature (mimalloc is an unconditional git dependency otherwise).  The
+# research preset is x86 targets + the system allocator, matching
+# tests/linker/setup_oracles.sh so both produce the SAME source oracle.
+MOLD_FEATURES='x86_64,i386,system-allocator'
+# cache  = hash-verified upstream release bytes from the agent tag cache
+#          (same digest CI pins), functionally probed for elf_i386 and
+#          elf_x86_64; seconds instead of a ~40-minute source build.
+# source = the -C target-cpu=native, system-allocator research build,
+#          required when the oracle is used for LINK TIMING.
+MOLD_PREFER="${MOLD_PREFER:-cache}"
 LLD_MAJOR=23
 LLD_MINOR_PIN=23.1
 WITH_WILD="${WITH_WILD:-1}"
@@ -120,7 +130,9 @@ restore_cached "bfd-$BINUTILS_VER" bin/ld || need git python3
 # rustup installs cargo outside the default PATH; mold 3.x needs it (and a
 # C compiler for its two small C parts: mold-wrapper.so, lto-message).
 [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
-restore_cached "mold-$MOLD_VER" bin/mold || need cargo cc
+# cargo/cc are only needed for the source fallback below, not for the
+# verified-cache path; requiring them here broke cache-only hosts.
+restore_cached "mold-$MOLD_VER" bin/mold || true
 if [ "$WITH_WILD" = 1 ]; then
     # rustup installs cargo outside the default PATH.
     [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
@@ -164,7 +176,13 @@ oracle_require_version "$PREFIX/bfd-$BINUTILS_VER/bin/ld" "$BINUTILS_VER"
 if [ -x "$PREFIX/mold-$MOLD_VER/bin/mold" ]; then
     mold_build_receipt="existing binary; build features not re-probed"
     note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (restored from $ARTIFACTS)"
+elif [ "$MOLD_PREFER" = cache ] && \
+     PATH="$PREFIX/bfd-$BINUTILS_VER/bin:$PATH" \
+     bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$PREFIX/mold-$MOLD_VER"; then
+    mold_build_receipt="upstream release v$MOLD_VER (agent cache, digest-pinned); elf_i386+elf_x86_64 probed"
+    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (verified cache binary)"
 else
+    need cargo cc
     TARBALL="$SRC/mold-$MOLD_VER.tar.gz"
     [ -f "$TARBALL" ] || { note "mold  : fetching mold $MOLD_VER"; \
         curl -fsSL -o "$TARBALL" "https://github.com/rui314/mold/archive/refs/tags/v$MOLD_VER.tar.gz"; }
