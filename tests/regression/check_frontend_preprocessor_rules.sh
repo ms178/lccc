@@ -672,7 +672,7 @@ run_diag -E -fsanitize=address "$tmp/feature.c"
 [ "$rc" -ne 0 ] || fail "address sanitizer must be rejected" "exit 0"
 want_diag "address sanitizer is unavailable" "is not supported"
 # A string literal is not an operator invocation.
-if ! "$CCC" -E -std=gnu23 "$tmp/feature.c" 2>/dev/null | grep -qF 'int hf_c_generic = 1;'; then
+if ! "$CCC" -E -std=gnu23 "$tmp/feature.c" 2>/dev/null | grep -cF 'int hf_c_generic = 1;' >/dev/null; then
     fail "feature code-line expansion" "expected 'int hf_c_generic = 1;' in -E output"
 fi
 cat >"$tmp/feature_literal.c" <<'C'
@@ -680,7 +680,7 @@ const char *s = "__has_feature(c_atomic) __has_extension(tls)";
 int c = '__has_feature';
 C
 if ! "$CCC" -E -std=gnu23 "$tmp/feature_literal.c" 2>/dev/null \
-    | grep -qF '"__has_feature(c_atomic) __has_extension(tls)"'; then
+    | grep -cF '"__has_feature(c_atomic) __has_extension(tls)"' >/dev/null; then
     fail "feature literals untouched" "string literal was rewritten"
 fi
 
@@ -776,6 +776,11 @@ fi
 # failure modes that matter are panics, hangs and non-progressing recovery.
 # Seeded corpus; malformed input erroring out is a PASS.
 if ! python3 "$here/fuzz_has_queries.py" --lccc "$CCC"; then
+    status=1
+fi
+# Lifetime: #undef/#define/push_macro/pop_macro must control the compiler-owned
+# operators in #ifdef, #if and code, with GCC's unclassified warning controls.
+if ! python3 "$here/check_query_operator_lifetime.py" --lccc "$CCC"; then
     status=1
 fi
 

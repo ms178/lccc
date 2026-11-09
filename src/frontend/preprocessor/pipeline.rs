@@ -48,8 +48,10 @@ const MAX_PENDING_NEWLINES: usize = 100_000;
 /// output for `#error`, `#warning`, and missing `#include` errors.
 #[derive(Debug, Clone)]
 pub struct PreprocessorDiagnostic {
-    /// Diagnostic category; warnings retain independent -W controls.
-    pub kind: crate::common::error::WarningKind,
+    /// Diagnostic category. `None` is GCC's unclassified preprocessor
+    /// warning: `-w` silences it and plain `-Werror` promotes it, but no
+    /// leaf `-Wno-...`/`-Werror=...` switch controls it.
+    pub kind: Option<crate::common::error::WarningKind>,
     /// The source file where the diagnostic originated.
     pub file: String,
     /// The 1-based line number in the source file.
@@ -1404,7 +1406,7 @@ impl Preprocessor {
                     message,
                 } => {
                     self.errors.push(PreprocessorDiagnostic {
-                        kind: crate::common::error::WarningKind::Cpp,
+                        kind: Some(crate::common::error::WarningKind::Cpp),
                         file,
                         line,
                         col: 1,
@@ -1413,7 +1415,7 @@ impl Preprocessor {
                 }
                 super::macro_defs::ExpansionEffect::DateTime { name, file, line } => {
                     self.push_warning(PreprocessorDiagnostic {
-                        kind: crate::common::error::WarningKind::DateTime,
+                        kind: Some(crate::common::error::WarningKind::DateTime),
                         file,
                         line,
                         col: 1,
@@ -1481,7 +1483,7 @@ impl Preprocessor {
                 }
                 if self.conditionals.is_active() {
                     self.errors.push(PreprocessorDiagnostic {
-                        kind: crate::common::error::WarningKind::Cpp,
+                        kind: Some(crate::common::error::WarningKind::Cpp),
                         file: self.current_file(),
                         line: line_num.max(1),
                         col: 1,
@@ -1527,7 +1529,7 @@ impl Preprocessor {
                 });
             }
             "define" => self.handle_define(rest, line_num, col),
-            "undef" => self.handle_undef(rest),
+            "undef" => self.handle_undef(rest, line_num),
             "ifdef" => self.handle_ifdef(rest, false),
             "ifndef" => self.handle_ifdef(rest, true),
             "if" => self.handle_if(rest, line_num),
@@ -1538,7 +1540,7 @@ impl Preprocessor {
                 // C11 6.10.5p1 / C23 6.10.6p1: preprocessing tokens in #error
                 // are not subject to macro expansion.
                 self.errors.push(PreprocessorDiagnostic {
-                    kind: crate::common::error::WarningKind::Cpp,
+                    kind: Some(crate::common::error::WarningKind::Cpp),
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1548,7 +1550,7 @@ impl Preprocessor {
             "warning" => {
                 // GCC extension, collect warning for structured diagnostic output
                 self.push_warning(PreprocessorDiagnostic {
-                    kind: crate::common::error::WarningKind::Cpp,
+                    kind: Some(crate::common::error::WarningKind::Cpp),
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1581,7 +1583,7 @@ impl Preprocessor {
                     // are visible while preserving compatibility with projects
                     // that intentionally use vendor-specific directives.
                     self.push_warning(PreprocessorDiagnostic {
-                        kind: crate::common::error::WarningKind::Cpp,
+                        kind: Some(crate::common::error::WarningKind::Cpp),
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -1703,6 +1705,40 @@ impl Preprocessor {
     fn handle_define(&mut self, rest: &str, line_num: usize, col: usize) {
         if let Some(def) = parse_define(rest) {
             self.validate_macro_stringize(&def, line_num, col);
+            if super::macro_defs::is_gcc_query_operator(&def.name) {
+                // GCC 16.2 warns on EVERY #define of these operator names.
+                // Taking over the live builtin (or redefining a user macro of
+                // that name) is "'x' redefined" and a pedantic error; defining
+                // after #undef is the weaker "'x' defined" warning. -w still
+                // inhibits both (measured on gcc-16.2).
+                let after_undef = self.macros.builtin_suppressed(&def.name)
+                    && self.macros.get(&def.name).is_none();
+                let message = if after_undef {
+                    format!("'{}' defined", def.name)
+                } else {
+                    format!("'{}' redefined", def.name)
+                };
+                let pedantic_error = !after_undef
+                    && self.feature_mode.pedantic_errors
+                    && !self.diagnostic_pragmas.current.inhibits_all();
+                if pedantic_error {
+                    self.errors.push(PreprocessorDiagnostic {
+                        kind: None,
+                        file: self.current_file(),
+                        line: line_num,
+                        col,
+                        message,
+                    });
+                } else {
+                    self.push_warning(PreprocessorDiagnostic {
+                        kind: None,
+                        file: self.current_file(),
+                        line: line_num,
+                        col,
+                        message,
+                    });
+                }
+            }
             self.macros.define(def);
         }
     }
@@ -1767,7 +1803,7 @@ impl Preprocessor {
                     || (def.is_variadic && operand == "__VA_ARGS__"));
             if !valid {
                 self.errors.push(PreprocessorDiagnostic {
-                    kind: crate::common::error::WarningKind::Cpp,
+                    kind: Some(crate::common::error::WarningKind::Cpp),
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1779,10 +1815,35 @@ impl Preprocessor {
         }
     }
 
-    fn handle_undef(&mut self, rest: &str) {
-        let name = rest.split_whitespace().next().unwrap_or("");
-        if !name.is_empty() {
-            self.macros.undefine(name);
+    fn handle_undef(&mut self, rest: &str, line_num: usize) {
+        let trimmed = rest.trim();
+        let name = trimmed.split_whitespace().next().unwrap_or("");
+        if name.is_empty() {
+            return;
+        }
+        // GCC 16.2 warns on every #undef of these operator names, even a
+        // repeated one. The warning is unclassified: -Wno-cpp and
+        // -Wno-builtin-macro-redefined do NOT suppress it, while -w and plain
+        // -Werror do.
+        if super::macro_defs::is_gcc_query_operator(name) {
+            self.push_warning(PreprocessorDiagnostic {
+                kind: None,
+                file: self.current_file(),
+                line: line_num,
+                col: 0,
+                message: format!("undefining '{name}'"),
+            });
+        }
+        self.macros.undefine(name);
+        let after = trimmed[name.len()..].trim_start();
+        if !after.is_empty() {
+            self.push_warning(PreprocessorDiagnostic {
+                kind: None,
+                file: self.current_file(),
+                line: line_num,
+                col: 0,
+                message: "extra tokens at end of '#undef' directive".to_string(),
+            });
         }
     }
 
@@ -1794,10 +1855,19 @@ impl Preprocessor {
     }
 
     fn evaluate_pp_condition(&mut self, expr: &str, line: usize) -> bool {
-        let (value, undefined) = evaluate_condition(expr, &self.macros);
+        let (value, undefined, error) = evaluate_condition(expr, &self.macros);
+        if let Some(message) = error {
+            self.errors.push(PreprocessorDiagnostic {
+                kind: Some(crate::common::error::WarningKind::Cpp),
+                file: self.current_file(),
+                line,
+                col: 1,
+                message,
+            });
+        }
         for name in undefined {
             self.push_warning(PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Undef,
+                kind: Some(crate::common::error::WarningKind::Undef),
                 file: self.current_file(),
                 line,
                 col: 1,
@@ -1859,7 +1929,7 @@ impl Preprocessor {
             return;
         }
         self.errors.push(PreprocessorDiagnostic {
-            kind: crate::common::error::WarningKind::Cpp,
+            kind: Some(crate::common::error::WarningKind::Cpp),
             file: self.current_file(),
             line: line.max(1),
             col: 1,

@@ -130,7 +130,7 @@ impl Preprocessor {
         let rest = rest.trim();
         if let Some(message) = crate::common::diagnostic_pragma::threshold_error(rest) {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Cpp,
+                kind: Some(crate::common::error::WarningKind::Cpp),
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -247,7 +247,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), false, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                        kind: crate::common::error::WarningKind::Cpp,
+                        kind: Some(crate::common::error::WarningKind::Cpp),
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -261,7 +261,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), true, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                        kind: crate::common::error::WarningKind::Cpp,
+                        kind: Some(crate::common::error::WarningKind::Cpp),
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -272,7 +272,7 @@ impl Preprocessor {
             }
         } else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Cpp,
+                kind: Some(crate::common::error::WarningKind::Cpp),
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -282,7 +282,7 @@ impl Preprocessor {
         };
         let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Cpp,
+                kind: Some(crate::common::error::WarningKind::Cpp),
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -311,7 +311,7 @@ impl Preprocessor {
                 )
             };
             self.push_warning(super::pipeline::PreprocessorDiagnostic {
-                kind: crate::common::error::WarningKind::Cpp,
+                kind: Some(crate::common::error::WarningKind::Cpp),
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -341,7 +341,7 @@ impl Preprocessor {
             None => (format!("invalid '#pragma GCC {keyword}' directive"), true),
         };
         let diagnostic = PreprocessorDiagnostic {
-            kind: crate::common::error::WarningKind::Pragmas,
+            kind: Some(crate::common::error::WarningKind::Pragmas),
             file: self.current_file(),
             line: line_num,
             col,
@@ -372,7 +372,7 @@ impl Preprocessor {
                 warning_config: matches!(severity, PragmaSeverity::PragmasWarning)
                     .then(|| Box::new(self.diagnostic_pragmas.current.clone())),
                 diagnostic: PreprocessorDiagnostic {
-                    kind: crate::common::error::WarningKind::Pragmas,
+                    kind: Some(crate::common::error::WarningKind::Pragmas),
                     file: file.clone(),
                     line: line_num,
                     col,

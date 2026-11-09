@@ -844,6 +844,11 @@ impl WarningConfig {
         }
     }
 
+    /// Whether `-w` currently inhibits unclassified warnings.
+    pub fn inhibits_all(&self) -> bool {
+        self.inhibit_all
+    }
+
     pub fn is_enabled(&self, kind: WarningKind) -> bool {
         self.enabled.contains(&kind)
             && (!self.inhibit_all || (self.default_errors.contains(&kind) && self.is_error(kind)))

@@ -266,3 +266,38 @@ text, because it expands the line first) while the `#if` path diagnosed
 expansion on failure so both paths quote GCC's first expanded token; a
 regression asserts both paths print the identical diagnostic.
 
+
+## Third red-team pass: query-operator lifetime and CI contract repairs
+
+A differential probe against GCC 16.2 and Clang 23.1.5 found a second real
+preprocessor defect in the first patch: `#undef __has_feature` (and the other
+`__has_*` operators) was ignored. The operator stayed live in `#ifdef`, `#if`
+and ordinary code, and a user `#define __has_feature(x) 7` was pre-empted by the
+builtin in `#if` even though the code-line path honoured the macro. GCC/Clang
+both withdraw the operator on `#undef`, let a user macro take over, and restore
+the saved state with `push_macro`/`pop_macro`.
+
+Fix: one `is_query_operator` list now drives existence, suppression and
+evaluation. `MacroTable::suppressed` covers the operators as well as dynamic
+builtins; `query_operator_active` is false while suppressed or while a user
+macro owns the spelling. Both the `#if` and code-line resolvers consult it.
+`#undef`/`#define` emit GCC's unclassified warnings (`-w` and plain `-Werror`
+control them; `-Wno-cpp`/`-Wno-builtin-macro-redefined` do not), and
+`-pedantic-errors` promotes live-builtin takeover to an error. A withdrawn
+operator left in `#if` is now a hard "missing binary operator" error instead of
+silently evaluating as the identifier alone; the expression parser rejects any
+trailing tokens and empty conditions.
+
+New gates: `check_query_operator_lifetime.py` (155 checks across 9 operators:
+initial/undef/redef/push-pop/skipped-undef/alias/warning controls/pedantic) and
+Rust units for suppression, snapshot restore and trailing-token rejection.
+The preprocessor unit suite is now **116 passed / 0 failed**; the full frontend
+gate remains green (1346 oracle checks + capability execution + 410 fuzz cases
++ 155 lifetime checks). Clippy `-D warnings` and rustfmt are clean.
+
+CI repairs forced by the hosted red: the capability gate is now registered in
+both CI mirrors (it was only reached transitively, which `check_ci_gate_parity`
+correctly rejects as orphaned), and two `grep -q` early-exit consumers in the
+frontend gate were converted to `grep -c >/dev/null` so a compiler crash cannot
+be masked as SIGPIPE under `pipefail`. `check_pipefail_sigpipe.py` and
+`check_ci_gate_parity.py` now pass locally.

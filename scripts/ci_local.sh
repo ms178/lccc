@@ -304,6 +304,8 @@ gate "frontend-ternary-common-type" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
 gate "frontend-preprocessor-rules" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_preprocessor_rules.sh
+gate "feature-capabilities" fast \
+    env CCC="$LCCC" bash tests/regression/check_feature_capabilities.sh
 gate "frontend-duplicate-definition" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_duplicate_definition.sh
 gate "frontend-differential-family" fast \

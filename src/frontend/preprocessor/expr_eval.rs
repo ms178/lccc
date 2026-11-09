@@ -56,6 +56,14 @@ impl Preprocessor {
                     i += 1;
                 }
                 let ident = bytes_to_str(bytes, start, i);
+                // A user macro of the same spelling was already expanded by
+                // the caller; a suppressed operator is now an ordinary name.
+                if super::macro_defs::is_query_operator(ident)
+                    && !self.macros.query_operator_active(ident)
+                {
+                    result.push_str(ident);
+                    continue;
+                }
                 match ident {
                     "__has_builtin" => {
                         let val = self.resolve_has_builtin_call_bytes(bytes, &mut i);
@@ -125,7 +133,7 @@ impl Preprocessor {
         macro_rules! diag {
             ($msg:expr) => {
                 self.errors.push(super::pipeline::PreprocessorDiagnostic {
-                    kind: crate::common::error::WarningKind::Cpp,
+                    kind: Some(crate::common::error::WarningKind::Cpp),
                     file: self.current_file(),
                     line: diag_line,
                     col: 0,
@@ -139,7 +147,7 @@ impl Preprocessor {
         macro_rules! warn {
             ($msg:expr) => {
                 self.push_warning(super::pipeline::PreprocessorDiagnostic {
-                    kind: crate::common::error::WarningKind::Cpp,
+                    kind: Some(crate::common::error::WarningKind::Cpp),
                     file: self.current_file(),
                     line: diag_line,
                     col: 0,
@@ -261,6 +269,17 @@ impl Preprocessor {
                     i += 1;
                 }
                 let ident = bytes_to_str(bytes, start, i);
+
+                // Do not pre-empt a user macro or a suppressed operator.
+                // The subsequent macro-expansion pass owns a user definition;
+                // a suppressed operator remains an ordinary identifier and the
+                // expression parser rejects its stray argument list.
+                if super::macro_defs::is_query_operator(ident)
+                    && !self.macros.query_operator_active(ident)
+                {
+                    result.push_str(ident);
+                    continue;
+                }
 
                 if ident == "defined" {
                     while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
@@ -456,7 +475,7 @@ impl Preprocessor {
     /// constraint violations: GCC and Clang both reject the translation unit.
     fn query_diag(&mut self, message: String, diag_line: usize) {
         self.errors.push(super::pipeline::PreprocessorDiagnostic {
-            kind: crate::common::error::WarningKind::Cpp,
+            kind: Some(crate::common::error::WarningKind::Cpp),
             file: self.current_file(),
             line: diag_line,
             col: 0,
@@ -1045,5 +1064,57 @@ mod has_macro_utf8_tests {
         let source = "const char *s = \"é\"; int c = '__has_feature'; int f = __has_feature(x);";
         let expected = "const char *s = \"é\"; int c = '__has_feature'; int f = 0;";
         assert_eq!(pp.resolve_has_macros_in_code(source, 1), expected);
+    }
+}
+
+#[cfg(test)]
+mod query_operator_suppression_tests {
+    use super::*;
+
+    #[test]
+    fn suppressed_operator_is_plain_in_code_and_if() {
+        let mut pp = Preprocessor::new();
+        let out = pp.preprocess(
+            "#undef __has_feature\n\
+             #ifdef __has_feature\nint defined_yes = 1;\n#else\nint defined_no = 1;\n#endif\n\
+             int code = __has_feature(tls);\n\
+             #if __has_feature(tls)\nint if_yes = 1;\n#else\nint if_no = 1;\n#endif\n",
+        );
+        assert!(out.contains("int defined_no = 1;"), "{out}");
+        assert!(out.contains("int code = __has_feature(tls);"), "{out}");
+        assert!(
+            pp.errors()
+                .iter()
+                .any(|e| e.message.contains("missing binary operator"))
+        );
+        assert!(
+            pp.warnings()
+                .iter()
+                .any(|w| w.message == "undefining '__has_feature'")
+        );
+    }
+
+    #[test]
+    fn user_macro_wins_in_if_before_expansion() {
+        let mut pp = Preprocessor::new();
+        let out = pp.preprocess(
+            "#define __has_feature(x) 7\n\
+             #if __has_feature(tls) == 7\nint yes = 1;\n#else\nint no = 1;\n#endif\n",
+        );
+        assert!(out.contains("int yes = 1;"), "{out}");
+        assert!(!out.contains("int no = 1;"), "{out}");
+        assert!(pp.errors().is_empty(), "{:?}", pp.errors());
+    }
+
+    #[test]
+    fn pop_macro_restores_a_withdrawn_operator() {
+        let mut pp = Preprocessor::new();
+        let out = pp.preprocess(
+            "#pragma push_macro(\"__has_feature\")\n\
+             #undef __has_feature\n\
+             #pragma pop_macro(\"__has_feature\")\n\
+             int code = __has_feature(tls);\n",
+        );
+        assert!(out.contains("int code = 1;"), "{out}");
     }
 }

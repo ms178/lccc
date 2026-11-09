@@ -288,16 +288,19 @@ pub struct MacroTable {
     /// must survive an `#include`, which both oracles do and lccc did not (it
     /// re-materialised the header's name inside the header).
     user_owned: Cell<u8>,
-    /// Builtins the source removed with `#undef`.
+    /// Compiler-owned names the source removed with `#undef`.
     ///
-    /// A dynamic builtin is not a macro-table entry that `#undef` can simply
+    /// This covers both dynamic builtins and the special `__has_*` query
+    /// operators. Neither is necessarily a macro-table entry that `#undef` can simply
     /// delete: `__LINE__` and `__COUNTER__` are computed per token, and
     /// `__FILE__`, `__INCLUDE_LEVEL__` and `__TIMESTAMP__` are *re-materialised*
     /// on every file transition. Without this set, `#undef __FILE__` followed by
     /// any `#include` would silently bring the macro back (measured: GCC 16.2
     /// and Clang 23.1.4 both leave all five undefined for the rest of the
     /// translation unit), which is exactly the "did my `#undef` work?" question
-    /// that portable code asks in its own feature probes.
+    /// that portable code asks in its own feature probes. The same lifetime
+    /// rule applies to `__has_*`: after `#undef __has_feature`, both `#ifdef`
+    /// and evaluation must stop treating the spelling as a compiler operator.
     suppressed: FxHashSet<String>,
 }
 
@@ -392,6 +395,34 @@ pub(super) fn is_dynamic_builtin(name: &str) -> bool {
     }
 }
 
+/// The special preprocessor query operators. They have no MacroDef entry,
+/// but GCC and Clang both let `#undef` withdraw them and `#define` replace
+/// them. Keep one list so existence, suppression and evaluation cannot drift.
+/// `__has_warning` is LCCC's documented Clang-compatible extension; GCC does
+/// not define it, but LCCC's existing corpus requires it to remain available.
+#[inline]
+pub(super) fn is_query_operator(name: &str) -> bool {
+    is_gcc_query_operator(name) || name == "__has_warning"
+}
+
+/// The subset GCC 16.2 itself defines. `__has_warning` is LCCC's
+/// Clang-compatible extension: it has the same #undef/#define lifetime, but
+/// GCC emits no builtin-macro directive warnings for it.
+#[inline]
+pub(super) fn is_gcc_query_operator(name: &str) -> bool {
+    matches!(
+        name,
+        "__has_builtin"
+            | "__has_attribute"
+            | "__has_c_attribute"
+            | "__has_feature"
+            | "__has_extension"
+            | "__has_include"
+            | "__has_include_next"
+            | "__has_embed"
+    )
+}
+
 impl MacroTable {
     pub fn new() -> Self {
         Self {
@@ -453,11 +484,13 @@ impl MacroTable {
             );
             self.user_owned
                 .set((self.user_owned.get() & !bit) | if saved.user_owned { bit } else { 0 });
-            if saved.suppressed {
-                self.suppressed.insert(name.to_string());
-            } else {
-                self.suppressed.remove(name);
-            }
+        }
+        // Query operators have no ownership bit, but their suppressed state
+        // is still part of the definition snapshot.
+        if saved.suppressed {
+            self.suppressed.insert(name.to_string());
+        } else {
+            self.suppressed.remove(name);
         }
     }
 
@@ -472,7 +505,7 @@ impl MacroTable {
             self.user_owned.set(self.user_owned.get() | bit);
             self.compiler_owned.set(self.compiler_owned.get() & !bit);
         }
-        if is_dynamic_builtin(&def.name) {
+        if is_dynamic_builtin(&def.name) || is_query_operator(&def.name) {
             self.suppressed.remove(&def.name);
         }
         self.macros.insert(def.name.clone(), def);
@@ -480,8 +513,8 @@ impl MacroTable {
 
     /// Undefine a macro.
     ///
-    /// For a dynamic builtin this also records the removal so that later file
-    /// transitions cannot re-materialise it (see `suppressed`).
+    /// For a dynamic builtin or query operator this also records the removal
+    /// so that later file transitions cannot re-materialise it (see `suppressed`).
     pub fn undefine(&mut self, name: &str) {
         self.macros.remove(name);
         if let Some(bit) = builtin_bit(name) {
@@ -489,7 +522,7 @@ impl MacroTable {
             self.compiler_owned.set(self.compiler_owned.get() & !bit);
             self.user_owned.set(self.user_owned.get() & !bit);
         }
-        if is_dynamic_builtin(name) {
+        if is_dynamic_builtin(name) || is_query_operator(name) {
             self.suppressed.insert(name.to_string());
         }
     }
@@ -513,7 +546,7 @@ impl MacroTable {
         }
     }
 
-    /// Whether the builtin `name` is currently suppressed by `#undef`.
+    /// Whether a compiler-owned `name` is currently suppressed by `#undef`.
     #[inline]
     pub(super) fn builtin_suppressed(&self, name: &str) -> bool {
         !self.suppressed.is_empty() && self.suppressed.contains(name)
@@ -536,18 +569,19 @@ impl MacroTable {
     pub fn is_defined(&self, name: &str) -> bool {
         (is_dynamic_builtin(name) && !self.builtin_suppressed(name))
             || self.macros.contains_key(name)
-            // These are special preprocessor operators, not real macros.
-            // They need to be recognized by #ifdef but are evaluated as
-            // special functions in #if expressions by resolve_defined_in_expr().
-            || name == "__has_builtin"
-            || name == "__has_attribute"
-            || name == "__has_c_attribute"
-            || name == "__has_feature"
-            || name == "__has_extension"
-            || name == "__has_include"
-            || name == "__has_include_next"
-            || name == "__has_embed"
-            || name == "__has_warning"
+            // Special preprocessor operators are visible to #ifdef until
+            // #undef withdraws them. A user definition is an ordinary macro
+            // and is already covered by the table lookup above.
+            || (is_query_operator(name) && !self.builtin_suppressed(name))
+    }
+
+    /// Whether `name` currently denotes a compiler-owned query operator.
+    /// A user macro of the same spelling wins in both #if and code lines;
+    /// `#undef` suppresses the operator until a new definition takes ownership
+    /// or `pop_macro` restores a snapshot taken while it was still active.
+    #[inline]
+    pub(super) fn query_operator_active(&self, name: &str) -> bool {
+        is_query_operator(name) && !self.builtin_suppressed(name) && !self.macros.contains_key(name)
     }
 
     /// Iterate over all macro definitions.
@@ -3145,5 +3179,76 @@ mod builtin_table_tests {
         // defend against.
         assert_eq!(builtin_bit("__BASE_FILE__"), Some(1 << 1));
         assert!(!is_dynamic_builtin("__BASE_FILE__"));
+    }
+}
+
+#[cfg(test)]
+mod query_operator_lifetime_tests {
+    use super::*;
+
+    fn def(name: &str, body: &str) -> MacroDef {
+        MacroDef {
+            name: name.to_string(),
+            is_function_like: true,
+            params: vec!["x".to_string()],
+            is_variadic: false,
+            has_named_variadic: false,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn undef_withdraws_every_query_operator_until_redefined() {
+        for name in [
+            "__has_builtin",
+            "__has_attribute",
+            "__has_c_attribute",
+            "__has_feature",
+            "__has_extension",
+            "__has_include",
+            "__has_include_next",
+            "__has_embed",
+            "__has_warning",
+        ] {
+            let mut t = MacroTable::new();
+            assert!(t.is_defined(name), "{name} initially defined");
+            assert!(t.query_operator_active(name), "{name} initially active");
+            t.undefine(name);
+            assert!(!t.is_defined(name), "{name} suppressed");
+            assert!(!t.query_operator_active(name), "{name} inactive");
+            t.define(def(name, "7"));
+            assert!(t.is_defined(name), "{name} user macro defined");
+            assert!(!t.query_operator_active(name), "{name} user macro wins");
+            t.undefine(name);
+            assert!(!t.is_defined(name), "{name} user macro removed");
+            assert!(!t.query_operator_active(name), "{name} stays suppressed");
+        }
+    }
+
+    #[test]
+    fn push_pop_restores_operator_suppression_state() {
+        let mut t = MacroTable::new();
+        let active = t.snapshot_definition("__has_feature");
+        t.undefine("__has_feature");
+        let suppressed = t.snapshot_definition("__has_feature");
+        t.restore_definition("__has_feature", active);
+        assert!(t.query_operator_active("__has_feature"));
+        t.undefine("__has_feature");
+        t.define(def("__has_feature", "7"));
+        t.restore_definition("__has_feature", suppressed);
+        assert!(!t.is_defined("__has_feature"));
+        assert!(t.builtin_suppressed("__has_feature"));
+    }
+
+    #[test]
+    fn ordinary_macros_do_not_gain_operator_lifetime_rules() {
+        let mut t = MacroTable::new();
+        assert!(!t.is_defined("MY_QUERY"));
+        t.undefine("MY_QUERY");
+        assert!(!t.builtin_suppressed("MY_QUERY"));
+        assert!(!t.query_operator_active("MY_QUERY"));
+        t.define(def("MY_QUERY", "7"));
+        assert!(t.is_defined("MY_QUERY"));
+        assert!(!t.query_operator_active("MY_QUERY"));
     }
 }

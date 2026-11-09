@@ -1437,10 +1437,13 @@ impl Driver {
             match *entry {
                 PreprocessorDiagnosticIndex::Warning(index) => {
                     let warn = &preprocessor.warnings()[index];
-                    let diag = crate::common::error::Diagnostic::warning_with_kind(
-                        warn.message.clone(),
-                        warn.kind,
-                    )
+                    let diag = match warn.kind {
+                        Some(kind) => crate::common::error::Diagnostic::warning_with_kind(
+                            warn.message.clone(),
+                            kind,
+                        ),
+                        None => crate::common::error::Diagnostic::warning(warn.message.clone()),
+                    }
                     .with_location(&warn.file, warn.line, warn.col);
                     diagnostics
                         .emit_with_warning_config(&diag, preprocessor.warning_config_at(index));
