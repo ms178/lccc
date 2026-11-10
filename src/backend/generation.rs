@@ -9168,8 +9168,11 @@ fn generate_load(
         // register here sound. When it is false the GEP was materialised
         // normally and `rematerialize_const_addr` below is a no-op.
         if let Some(info) = gep_fold_map.get(&ptr.0) {
-            if !is_wide_int_type(ty)
-                && can_const_addr_fold(cg, info)
+            // 16-byte types take the same fold: the backend answers false
+            // when the shape is not expressible, and the generic segment
+            // load below is exact either way. Refusing wide types here used
+            // to cost one `leaq` per element on per-CPU aggregate arrays.
+            if can_const_addr_fold(cg, info)
                 && cg.emit_seg_load_with_const_offset(
                     dest,
                     &info.base,
@@ -9300,8 +9303,7 @@ fn generate_store(
             }
         }
         if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
-            if !is_wide_int_type(ty)
-                && seg_fold_base_in_register(gep_info, global_addr_map, const_addr_vals)
+            if seg_fold_base_in_register(gep_info, global_addr_map, const_addr_vals)
                 && can_seg_const_addr_fold(cg, gep_info)
                 && cg.emit_seg_store_with_const_offset(
                     val,

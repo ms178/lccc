@@ -4521,6 +4521,7 @@ pub(crate) fn run_passes(
     // Runs before `fuse_vector_loads` so that pass sees the shortened chains.
     if !pass_disabled(&disabled, "vechomefwd") {
         vector_temp_promotion::forward_vector_homes(module);
+        verify::verify_after_pass(module, "vechomefwd");
     }
 
     // Phase 11b': Collapse the 16/32-byte aggregate-load -> VecLoad ->

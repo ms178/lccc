@@ -741,7 +741,7 @@
           "name": "bash tests/regression/check_i686_label_ref_safety.sh"
         },
         {
-          "measured_s": 2.80,
+          "measured_s": 2.8,
           "name": "python3 tests/regression/check_llvm_guarded_folds.py --clang \"$CLANG\""
         },
         {

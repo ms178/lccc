@@ -9,7 +9,7 @@
 # runners have those paths; this script reproduces them with symlinks that
 # point ONLY at the verified offline Debian extraction.
 set -euo pipefail
-P="${LCCC_AGENT_CACHE_PREFIX:-/home/user/.cache/lccc/agent-tools}"
+P="${LCCC_AGENT_CACHE_PREFIX:-${HOME}/.cache/lccc/agent-toolchains}"
 D="$P/debs-root"
 B="$P/binutils-2.47-x86_64-linux/bin"
 link() { # link TARGET LINK_NAME
@@ -18,6 +18,34 @@ link() { # link TARGET LINK_NAME
     [[ $(readlink -f "$name") == $(readlink -f "$target") ]] && return 0
     sudo rm -f -- "$name"
   elif [[ -e $name ]]; then
+    # A multiarch directory the distribution itself owns is a REAL directory,
+    # not something this script may replace: replacing /usr/include/
+    # i386-linux-gnu with a symlink to the 64-bit multiarch tree would silently
+    # drop linux-libc-dev's 32-bit <asm/*.h> (a -m32 include collapse), and on
+    # hosts where the same path is a symlink swapoff/ln -s would be a no-op
+    # churn.  Reconcile the MEMBERS instead of the container: every entry the
+    # offline extraction provides is published as a symlink INSIDE the existing
+    # directory, and pre-existing members are never deleted.  This keeps the
+    # 32-bit glibc headers reachable without touching distribution state.
+    if [[ -d $name && -d $target ]]; then
+      local member target_real rel dst
+      target_real=$(readlink -f -- "$target") || return 1
+      while IFS= read -r -d '' member; do
+        # `find` enumerates the canonical target. Strip that same canonical
+        # root—not the caller's possibly relative/symlink spelling—or a
+        # symlinked target leaves the absolute source path embedded under
+        # `$name`, creating an incorrect nested destination.
+        case "$member" in
+          "$target_real"/*) rel=${member#"$target_real"/} ;;
+          *) echo "prepare_local_env.sh: target member escaped canonical root" >&2; return 1 ;;
+        esac
+        dst="$name/$rel"
+        [[ -e $dst || -L $dst ]] && continue
+        sudo mkdir -p -- "$(dirname "$dst")"
+        sudo ln -s -- "$member" "$dst"
+      done < <(find "$target_real" -mindepth 1 -maxdepth 1 -print0)
+      return 0
+    fi
     echo "prepare_local_env.sh: $name exists and is not a symlink; refusing to replace" >&2
     return 1
   fi

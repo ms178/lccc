@@ -2585,6 +2585,9 @@ jobs:
         # auto-repair and invalidate-before-replace (synthetic tarball).
         bash tests/regression/check_ensure_gcc_torture.sh
         bash tests/regression/check_bool_pair_tail_jmp.sh
+        # Blendv and FMA semantic gates live in their dedicated codegen shard;
+        # keep them single-owned so the lane-plan audit can prove their exact
+        # invocation and negative controls are not silently duplicated.
         # The architectural implicit-operand table is the single source of
         # truth for every pass that reasons about registers an instruction
         # does not name; its fixture is reviewed independently of the code.

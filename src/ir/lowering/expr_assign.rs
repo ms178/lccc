@@ -316,6 +316,26 @@ impl Lowerer {
             return rhs_val;
         }
 
+        // Segment-to-segment assignment of a small aggregate is decided BEFORE
+        // the right operand is lowered: `lower_aggregate_rvalue` copies a
+        // segment object into a generic temporary (correct, but that is a
+        // whole extra 16-byte copy plus a frame slot) precisely so its result
+        // is never a `%gs` address. Here both spaces are known, so the copy is
+        // emitted once, between the two segment addresses.
+        let dest_space = self.aggregate_lvalue_space(lhs);
+        let rhs_space = self.lower_expr_result_space(rhs);
+        if dest_space != AddressSpace::Default
+            && rhs_space != AddressSpace::Default
+            && dynamic_size.is_none()
+        {
+            let dest_addr = self.lower_expr(lhs);
+            let dest_addr = self.operand_to_value(dest_addr);
+            let src_addr = self.lower_expr(rhs);
+            let src_addr = self.operand_to_value(src_addr);
+            let vol = self.expr_access_is_volatile(lhs) || self.expr_access_is_volatile(rhs);
+            self.emit_segment_copy(dest_addr, dest_space, src_addr, rhs_space, struct_size, vol);
+            return Operand::Value(dest_addr);
+        }
         let rhs_val = self.lower_aggregate_rvalue(rhs);
         if let Some(lv) = self.lower_lvalue_for_mutation(lhs) {
             let dest_addr = self.lvalue_addr(&lv);
@@ -1624,6 +1644,20 @@ impl Lowerer {
         // Small vectors (<=8 bytes) are returned as packed I64 values, not pointers.
         let rhs_is_small_vec_call = self.rhs_is_small_vector_call(rhs, total_size);
 
+        // Both sides in a named address space: one copy between the two
+        // segment addresses, decided before the right operand is lowered (see
+        // the struct twin for why the order matters).
+        let lhs_space = self.aggregate_lvalue_space(lhs);
+        if lhs_space != AddressSpace::Default
+            && self.lower_expr_result_space(rhs) != AddressSpace::Default
+        {
+            let src_space = self.lower_expr_result_space(rhs);
+            let src_seg = self.lower_expr(rhs);
+            let src_seg = self.operand_to_value(src_seg);
+            let vol = self.expr_access_is_volatile(lhs) || self.expr_access_is_volatile(rhs);
+            self.emit_segment_copy(lhs_ptr_val, lhs_space, src_seg, src_space, total_size, vol);
+            return Operand::Value(lhs_ptr_val);
+        }
         let rhs_val = self.lower_aggregate_rvalue(rhs);
         let rhs_ptr_val = if rhs_is_small_vec_call {
             // The return value is packed vector data in a register.

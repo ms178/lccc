@@ -105,11 +105,13 @@ for i, l in enumerate(lines):
         if i < back:
             break
         between = lines[i - back + 1 : i]
-        if any(lbl.match(x) or jcc.match(x) for x in between):
-            break
-        cmps = [x for x in between if re.match(r"^[ \t]*cmp", x)]
+        # A fall-through block label between the first jcc and the second
+        # compare is normal CFG layout, not an instruction barrier. Permit
+        # labels but no extra instructions or branches in the chain.
+        non_labels = [x for x in between if not lbl.match(x)]
+        cmps = [x for x in non_labels if re.match(r"^[ \t]*cmp", x)]
         c1 = jcc.match(lines[i - back])
-        if c1 and len(cmps) == 1 and len(between) == 1:
+        if c1 and len(cmps) == 1 and len(non_labels) == 1:
             m1 = c1
             break
     if m1 is None:

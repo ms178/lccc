@@ -827,42 +827,29 @@ impl super::InstructionEncoder {
     }
 
     /// Extract EVEX masking info from an operand (register or memory):
-    /// returns (aaa, zeroing). Mask-less operands yield (0, false).
+    /// returns `(aaa, zeroing)`. Mask-less operands yield `(0, false)`.
     ///
-    /// SA-19: an unparseable mask name must NEVER degrade to `aaa = 0`.  `0`
-    /// is not "no mask" to the decoder -- it is the unmasked encoding -- so
-    /// mapping a typo or an out-of-range `{k8}`/`{k9}` (which `is_kreg`
-    /// accepts, being `k`+digit, while `reg_num` knows only k0-k7) to 0 would
-    /// silently drop the caller's mask and execute every lane.  The parser
-    /// rejects `{k8}` textually today, so this is defence in depth, but a
-    /// future path that constructs an `Operand` directly must fail closed.
-    ///
-    /// Returning `Result` from all 32 call sites would push the same
-    /// three-line `?` boilerplate into every EVEX emitter for a case the
-    /// front end already excludes; instead this debug-asserter is the
-    /// contract and the release build keeps the honest answer.  `expect`
-    /// would be a `panic_sites` census entry for an unreachable path, which
-    /// the census ratchet deliberately treats as a defect in its own right.
-    fn evex_mask_info(op: &Operand) -> (u8, bool) {
-        /// `Some(name)` -> the k-register number, asserting the name parses.
-        fn mask_num(name: Option<&String>) -> u8 {
+    /// Invalid internal operands are rejected in every build profile. In
+    /// particular, silently replacing an unparseable `{k8}`/`{k9}` mask with
+    /// `aaa = 0` disables masking and changes which lanes execute.
+    fn evex_mask_info(op: &Operand) -> Result<(u8, bool), String> {
+        fn mask_num(name: Option<&String>, zeroing: bool) -> Result<u8, String> {
             match name {
-                None => 0,
-                Some(m) => {
-                    let n = reg_num(m);
-                    debug_assert!(
-                        n.is_some(),
-                        "EVEX mask `{m}` has no k-register number; the encoder \
-                         must reject it rather than encode as unmasked (SA-19)"
-                    );
-                    n.unwrap_or(0)
-                }
+                None if zeroing => Err("EVEX zeroing requires a nonzero opmask".to_string()),
+                None => Ok(0),
+                Some(m) => match reg_num(m) {
+                    Some(n @ 1..=7) => Ok(n),
+                    // k0 is the architectural no-mask encoding; accepting it
+                    // as an explicit mask silently turns a masked operation
+                    // into an unmasked one.
+                    _ => Err(format!("invalid EVEX opmask register `{m}`")),
+                },
             }
         }
         match op {
-            Operand::Register(r) => (mask_num(r.mask.as_ref()), r.zeroing),
-            Operand::Memory(m) => (mask_num(m.mask.as_ref()), m.zeroing),
-            _ => (0, false),
+            Operand::Register(r) => Ok((mask_num(r.mask.as_ref(), r.zeroing)?, r.zeroing)),
+            Operand::Memory(m) => Ok((mask_num(m.mask.as_ref(), m.zeroing)?, m.zeroing)),
+            _ => Ok((0, false)),
         }
     }
 
@@ -1258,7 +1245,7 @@ impl super::InstructionEncoder {
             return Err(CMP_SIZE_MISMATCH.to_string());
         }
         let mut bcst = sae_bcst;
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         match (&ops[0], &ops[1], &ops[2]) {
             (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
                 let (dst_num, src_num) = self.emit_evex_mod3(
@@ -1358,7 +1345,7 @@ impl super::InstructionEncoder {
         // %xmm1,%xmm2` and `vcvtqq2ps {rn-sae},%ymm1,%xmm2` are both
         // rejected while the zmm shapes accept.
         let (sae_bcst, sae_ll) = Self::apply_evex_sae(sae, params.sae_class, 0)?;
-        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1])?;
         // Narrowing LL is the SOURCE width (ymm->xmm is LL=01,
         // zmm/m512->ymm is LL=10); same/wide use the dest width.
         let width_ll = if let Some(pinned_ll) = params.pinned_ll {
@@ -1503,7 +1490,7 @@ impl super::InstructionEncoder {
         let (ops, sae) = Self::peel_evex_sae(ops);
         Self::apply_evex_sae(sae, EvexSae::None, 0)?;
         check_compress_shape(mnemonic, ops, compress)?;
-        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1])?;
         let ll = if compress {
             match &ops[0] {
                 Operand::Register(r) if is_zmm(&r.name) => 0b10,
@@ -1604,7 +1591,7 @@ impl super::InstructionEncoder {
             0x32 | 0x22 => 8,
             _ => 1,
         };
-        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1])?;
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let (dst_num, src_num) =
@@ -1758,7 +1745,7 @@ impl super::InstructionEncoder {
             return Err("EVEX imm2 op requires 3 operands (imm, src, dst)".to_string());
         }
         let ll = Self::evex_ll(ops);
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         match (&ops[0], &ops[1], &ops[2]) {
             (
                 Operand::Immediate(ImmediateValue::Integer(imm)),
@@ -1822,7 +1809,7 @@ impl super::InstructionEncoder {
         if sae.is_some() && vl_ll != 0b10 {
             return Err(CMP_SIZE_MISMATCH.to_string());
         }
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         match (&ops[0], &ops[1], &ops[2]) {
             (
                 Operand::Immediate(ImmediateValue::Integer(imm)),
@@ -1905,7 +1892,7 @@ impl super::InstructionEncoder {
         }
         Self::evex_forbid_broadcast(mnemonic, ops)?;
         let ll = Self::evex_ll(ops);
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         match (&ops[0], &ops[1], &ops[2]) {
             (Operand::Register(count), Operand::Register(src), Operand::Register(dst))
                 if is_xmm(&count.name) =>
@@ -1962,7 +1949,7 @@ impl super::InstructionEncoder {
             return Err("EVEX shift requires 3 operands (imm, src, dst)".to_string());
         }
         let ll = Self::evex_ll(ops);
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         match (&ops[0], &ops[1], &ops[2]) {
             (
                 Operand::Immediate(ImmediateValue::Integer(imm)),
@@ -2178,7 +2165,7 @@ impl super::InstructionEncoder {
                 return Err(CMP_SIZE_MISMATCH.to_string());
             }
         }
-        let (aaa, z) = Self::evex_mask_info(&ops[3]);
+        let (aaa, z) = Self::evex_mask_info(&ops[3])?;
         match (&ops[0], &ops[1], &ops[2], &ops[3]) {
             (
                 Operand::Immediate(ImmediateValue::Integer(imm)),
@@ -2324,7 +2311,7 @@ impl super::InstructionEncoder {
                 let k_num = reg_num(&kdst.name).ok_or("bad k-dest register")?;
                 // The k destination carries a merge mask (`%k5{%k7}`); GAS
                 // rejects `{z}` here ("unsupported masking").
-                let (aaa, z) = Self::evex_mask_info(&rest[2]);
+                let (aaa, z) = Self::evex_mask_info(&rest[2])?;
                 if z {
                     return Err("unsupported masking for compare-to-mask".to_string());
                 }
@@ -2366,7 +2353,7 @@ impl super::InstructionEncoder {
                     Self::evex_mem_scale(mem, vl_ll, 1)
                 };
                 bcst |= mem_bcst;
-                let (aaa, z) = Self::evex_mask_info(&rest[2]);
+                let (aaa, z) = Self::evex_mask_info(&rest[2])?;
                 if z {
                     return Err("unsupported masking for compare-to-mask".to_string());
                 }
@@ -2406,7 +2393,7 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1], &ops[2]) {
             (Operand::Register(src2), Operand::Register(src1), Operand::Register(kdst)) => {
                 let k_num = reg_num(&kdst.name).ok_or("bad k-dest register")?;
-                let (aaa, z) = Self::evex_mask_info(&ops[2]);
+                let (aaa, z) = Self::evex_mask_info(&ops[2])?;
                 if z {
                     return Err("unsupported masking for compare-to-mask".to_string());
                 }
@@ -2429,7 +2416,7 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(src1), Operand::Register(kdst)) => {
                 let k_num = reg_num(&kdst.name).ok_or("bad k-dest register")?;
                 let (bcst, scale_n) = Self::evex_mem_scale(mem, ll, 1);
-                let (aaa, z) = Self::evex_mask_info(&ops[2]);
+                let (aaa, z) = Self::evex_mask_info(&ops[2])?;
                 if z {
                     return Err("unsupported masking for compare-to-mask".to_string());
                 }
@@ -2467,7 +2454,7 @@ impl super::InstructionEncoder {
             return Err("EVEX extract requires 3 operands (imm, src, dst)".to_string());
         }
         let ll = Self::evex_ll(ops);
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         match (&ops[0], &ops[1], &ops[2]) {
             (
                 Operand::Immediate(ImmediateValue::Integer(imm)),
@@ -2518,7 +2505,7 @@ impl super::InstructionEncoder {
         let ll = Self::evex_ll(ops);
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
-                let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                let (aaa, z) = Self::evex_mask_info(&ops[1])?;
                 // `.s` selects the store-direction opcode with the SOURCE in
                 // ModRM.reg (`vmovapd.s %xmm29,%xmm30` = 62 01 fd 08 29 ee,
                 // GAS-probed) — the alternate encoding of the same move.
@@ -2536,14 +2523,14 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
-                let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                let (aaa, z) = Self::evex_mask_info(&ops[1])?;
                 let dst_num =
                     self.emit_evex_memop(&dst.name, mem, None, 1, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(load_op);
                 self.encode_evex_rm(dst_num, mem, ll)
             }
             (Operand::Register(src), Operand::Memory(mem)) => {
-                let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                let (aaa, z) = Self::evex_mask_info(&ops[1])?;
                 let src_num =
                     self.emit_evex_memop(&src.name, mem, None, 1, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(store_op);
@@ -2565,7 +2552,7 @@ impl super::InstructionEncoder {
             return Err("EVEX gpr-broadcast requires 2 operands".to_string());
         }
         let ll = Self::evex_ll(ops);
-        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1])?;
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let (dst_num, src_num) =
@@ -2608,7 +2595,7 @@ impl super::InstructionEncoder {
             return Err("EVEX mem-broadcast requires 2 operands".to_string());
         }
         let ll = Self::evex_ll(ops);
-        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1])?;
         match (&ops[0], &ops[1]) {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num =
@@ -2674,7 +2661,7 @@ impl super::InstructionEncoder {
             ) => {
                 let src_id = Self::evex_id(&src.name)?;
                 let dst_id = Self::evex_id(&dst.name)?;
-                let (aaa, z) = Self::evex_mask_info(&ops[2]);
+                let (aaa, z) = Self::evex_mask_info(&ops[2])?;
                 // pp=1 (66), mm=1 (0F map); ModRM.reg is the /ext, dest is vvvv.
                 self.emit_evex(
                     false,
@@ -2706,7 +2693,7 @@ impl super::InstructionEncoder {
                 let dst_id = Self::evex_id(&dst.name)?;
                 let (x3, b3, b4, x4) = Self::evex_addr_bits(mem);
                 let (bcst, scale_n) = Self::evex_mem_scale(mem, ll, 1);
-                let (aaa, z) = Self::evex_mask_info(&ops[2]);
+                let (aaa, z) = Self::evex_mask_info(&ops[2])?;
                 self.emit_evex(
                     false,
                     x3,
@@ -3524,7 +3511,7 @@ impl super::InstructionEncoder {
             _ => return Err("operand type mismatch for `vmpsadbw'".to_string()),
         };
         let ll = Self::evex_ll(ops);
-        let (aaa, z) = Self::evex_mask_info(&ops[3]);
+        let (aaa, z) = Self::evex_mask_info(&ops[3])?;
         match (&ops[1], &ops[2], &ops[3]) {
             (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
                 let (dst_num, src_num) = self.emit_evex_mod3(
@@ -4756,7 +4743,7 @@ impl super::InstructionEncoder {
         }
         // Reject `{sae}`/RC with the per-family GAS message (none exists).
         Self::apply_evex_sae(sae, EvexSae::None, 0)?;
-        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1])?;
         // EVEX.LL comes from the REGISTER operand: the destination for
         // expand, the source for compress (probed: `vcompresspd %ymm2,
         // (%rax)` encodes LL=ymm).
@@ -4822,7 +4809,7 @@ impl super::InstructionEncoder {
             Operand::Register(reg) if is_kreg(&reg.name) => reg,
             _ => return Err(type_error()),
         };
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         if z {
             return Err(format!("unsupported masking for `{mnemonic}'"));
         }
@@ -4925,7 +4912,7 @@ impl super::InstructionEncoder {
         if reg_num(&base).is_none() {
             return Err("operand type mismatch".to_string());
         }
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         if z {
             // {z} on an opmask destination: GAS rejects the spelling.
             return Err("operand type mismatch".to_string());
@@ -4997,7 +4984,7 @@ impl super::InstructionEncoder {
             _ => return Err("operand type mismatch".to_string()),
         };
         let src_ll = Self::evex_ll(&[ops[0].clone()]);
-        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1])?;
         // Memory tuple N = the narrow RESULT byte count at every source VL:
         // vpmovqb zmm -> 8 (VL/8), vpmovqw zmm -> 16 (VL/4), vpmovqd zmm
         // -> 32 (VL/2), vpmovdb xmm -> 4 (VL/4), vpmovdw ymm -> 16 (VL/2),
@@ -5077,7 +5064,7 @@ impl super::InstructionEncoder {
             _ => return Err("operand type mismatch for `vcvtps2ph'".to_string()),
         };
         let src_ll = Self::evex_ll(&[ops[1].clone()]);
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        let (aaa, z) = Self::evex_mask_info(&ops[2])?;
         // Slot placement (GAS 2.47, byte-probed): ModRM.reg = SOURCE,
         // r/m = destination for BOTH the register and memory forms.
         match &ops[2] {
@@ -5210,7 +5197,7 @@ impl super::InstructionEncoder {
                 if !is_xmm(src1) || !is_xmm(src2) || !is_xmm(dst) {
                     return Err(format!("operand size mismatch for `{mnemonic}'"));
                 }
-                let (aaa, z) = Self::evex_mask_info(&ops[2]);
+                let (aaa, z) = Self::evex_mask_info(&ops[2])?;
                 // `.s` selects the store-direction opcode 0x11 with the
                 // source pair swapped into the register slots
                 // (`vmovss.s %xmm28,%xmm29,%xmm30{%k7}` =
@@ -5233,7 +5220,7 @@ impl super::InstructionEncoder {
                     if !is_xmm(&dst.name) {
                         return Err(format!("operand type mismatch for `{mnemonic}'"));
                     }
-                    let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                    let (aaa, z) = Self::evex_mask_info(&ops[1])?;
                     let dst_num =
                         self.emit_evex_memop(&dst.name, mem, None, map, w, pp, 0, z, aaa, false)?;
                     self.bytes.push(0x10);
@@ -5247,7 +5234,7 @@ impl super::InstructionEncoder {
                     if !is_xmm(&src.name) {
                         return Err(format!("operand type mismatch for `{mnemonic}'"));
                     }
-                    let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                    let (aaa, z) = Self::evex_mask_info(&ops[1])?;
                     let src_num =
                         self.emit_evex_memop(&src.name, mem, None, map, w, pp, 0, z, aaa, false)?;
                     self.bytes.push(0x11);
@@ -6735,7 +6722,7 @@ impl super::InstructionEncoder {
         if !pair_ok {
             return Err("EVEX gather: operand size mismatch".to_string());
         }
-        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        let (aaa, z) = Self::evex_mask_info(&ops[1])?;
         if aaa == 0 {
             return Err("EVEX gather requires an explicit nonzero mask".to_string());
         }
@@ -7087,6 +7074,44 @@ mod tests {
         let mut r = Register::new(name);
         r.mask = Some(mask.to_string());
         Operand::Register(r)
+    }
+
+    #[test]
+    fn evex_mask_extraction_is_validated_in_release_paths() {
+        assert_eq!(
+            super::InstructionEncoder::evex_mask_info(&reg("zmm0")).unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            super::InstructionEncoder::evex_mask_info(&masked_reg("zmm0", "k1")).unwrap(),
+            (1, false)
+        );
+        assert!(super::InstructionEncoder::evex_mask_info(&masked_reg("zmm0", "k0")).is_err());
+        assert!(super::InstructionEncoder::evex_mask_info(&masked_reg("zmm0", "k8")).is_err());
+
+        let mut zeroing_without_mask = Register::new("zmm0");
+        zeroing_without_mask.zeroing = true;
+        assert!(
+            super::InstructionEncoder::evex_mask_info(&Operand::Register(zeroing_without_mask))
+                .is_err()
+        );
+
+        let mut mem = MemoryOperand {
+            segment: None,
+            displacement: Displacement::None,
+            base: Some(Register::new("rax")),
+            index: None,
+            scale: None,
+            mask: Some("k3".to_string()),
+            zeroing: false,
+            broadcast: None,
+        };
+        assert_eq!(
+            super::InstructionEncoder::evex_mask_info(&Operand::Memory(mem.clone())).unwrap(),
+            (3, false)
+        );
+        mem.mask = Some("k9".to_string());
+        assert!(super::InstructionEncoder::evex_mask_info(&Operand::Memory(mem)).is_err());
     }
 
     /// SA-19: an EVEX opmask decorator that names no real k-register must be
