@@ -33,11 +33,21 @@
 //!   (Intel order), so AT&T operand 0 is the right-hand source and operand 1
 //!   the left-hand one — both are `r/m`;
 //! * the immediate-first forms (`vpshufd $imm, src, dst`, `vroundps`,
-//!   `vpalignr`, `vcmpps`, …) take `r/m` in AT&T operand 1.
+//!   `vpalignr`, `vcmpps`, …) take `r/m` in AT&T operand 1 — with one carved
+//!   exception, the VEX *shift-by-immediate* group, documented at
+//!   [`VEX_REG_ONLY_IMM_SRCS`]: `vpslld $3, MEM, %ymm3` is not a VEX
+//!   instruction, and an assembler that accepts the text emits AVX-512VL.
 //!
 //! Packed (and scalar) arithmetic never requires an aligned memory operand —
 //! the alignment trap belongs to `movaps`/`movdqa` only — so an unaligned
 //! `movups`/`movdqu` load folds just as safely as an aligned one.
+//!
+//! A bare address carries no size, so the folded operand's width has to be
+//! recoverable from the instruction that remains, and it has to be the width
+//! the retired load actually produced — see [`uniform_width_bytes`] and the
+//! register-class rule in [`try_fold`].  `vmovsd (%rax), %xmm1` writes 64 bits
+//! and `vaddpd %xmm1, %xmm2, %xmm3` reads 128, so folding them would silently
+//! read bytes 8..15 the original never touched.
 //!
 //! ## Soundness argument
 //!
@@ -75,6 +85,13 @@
 //!    register instead.
 //! 8. **Neither line is pinned.**  Volatile accesses stay exactly where the
 //!    frontend put them; this pass never moves one.
+//! 9. **The encoding survives the substitution.**  Two shapes are declined
+//!    even though the *semantics* would be preserved, because no legal
+//!    encoding exists at the ISA level the caller selected:
+//!    a VEX shift-by-immediate (its source is register-only, so the text
+//!    would silently become AVX-512VL — see [`VEX_REG_ONLY_IMM_SRCS`]), and
+//!    any consumer whose destination is narrower than the temporary (the
+//!    operand size would be undeterminable).
 //!
 //! The replacement performs exactly one read of the original width at the
 //! original address, so volatile/MMIO semantics are untouched (and pinned
@@ -156,6 +173,82 @@ const ALIGNED_VEC_LOADS: &[&str] = &[
     "vmovdqa32",
     "vmovdqa64",
 ];
+
+/// Mnemonic bases whose `r/m` operand width is **not** the uniform rule
+/// ([`uniform_width_bytes`]).  Sorted for `binary_search`.
+///
+/// Measured, not assumed — each entry is a GAS `objdump -M intel` operand size
+/// that disagrees with the rule:
+///
+/// ```text
+///   vcvtps2pd (%rax), %xmm0        -> QWORD    (8,  not 16: widening)
+///   vcvtpd2dq (%rax), %xmm0        -> rejected (source is 256-bit)
+///   vpmaxsd (%rax), %xmm1, %xmm0   -> XMMWORD  (16, not 8: PACKED, despite `sd`)
+///   vpmovzxbd (%rax), %xmm0        -> DWORD    (4; 8 with a %ymm destination)
+///   vinsertps $0, (%rax), %xmm1, %xmm0 -> DWORD
+/// ```
+///
+/// `pmaxsd`/`pminsd` are the trap: the uniform rule reads the `sd` suffix as
+/// "scalar double, 8 bytes", but they are packed dword comparisons reading 16.
+/// Trusting the suffix there would let a 64-bit `movsd` load fold into a
+/// 128-bit read.  The `pmovsx`/`pmovzx` family is genuinely destination-width
+/// dependent, so no single answer exists for it either.
+///
+/// Every entry is declined rather than modelled: these are widening, narrowing
+/// or shuffling forms, and a fold that has to *prove* a width the instruction
+/// text does not state is not worth the one load it saves.
+const NON_UNIFORM_WIDTH_BASES: &[&str] = &[
+    "cvtdq2pd",
+    "cvtpd2dq",
+    "cvtpd2ps",
+    "cvtps2pd",
+    "cvttpd2dq",
+    "insertps",
+    "pmovsxbd",
+    "pmovsxbq",
+    "pmovsxbw",
+    "pmovsxdq",
+    "pmovsxwd",
+    "pmovsxwq",
+    "pmovzxbd",
+    "pmovzxbq",
+    "pmovzxbw",
+    "pmovzxdq",
+    "pmovzxwd",
+    "pmovzxwq",
+];
+
+/// Packed compares whose suffix *lies*: `pmaxsd`/`pminsd` read the whole
+/// register (measured: `vpmaxsd (%rax), %xmm1, %xmm0` is an `XMMWORD`
+/// operand), not the 8 bytes the `sd` ending suggests.  Trusting the suffix
+/// would fold a 64-bit `movsd` load into a 128-bit read, so they are named
+/// here and answered "full width" before the suffix rule runs.  Sorted.
+const FULL_WIDTH_DESPITE_SUFFIX: &[&str] = &["pmaxsd", "pminsd"];
+
+/// Bytes the `r/m` operand of `mnemonic` reads or writes in a register of class
+/// `reg_class` (`1` = `%xmm`, `2` = `%ymm`, `3` = `%zmm`), or `None` when the
+/// width is not the uniform rule and the fold must be declined.
+///
+/// The uniform rule, verified mnemonic-by-mnemonic against GAS: a `ss` suffix
+/// means 4 bytes, a `sd` suffix means 8, and anything else reads the whole
+/// register.  [`NON_UNIFORM_WIDTH_BASES`] names the exceptions.
+fn uniform_width_bytes(mnemonic: &str, reg_class: u8) -> Option<u32> {
+    let base = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+    if NON_UNIFORM_WIDTH_BASES.binary_search(&base).is_ok() {
+        return None;
+    }
+    // Checked before the suffix rule: these are packed despite ending in `sd`.
+    if FULL_WIDTH_DESPITE_SUFFIX.binary_search(&base).is_ok() {
+        return Some(128 * u32::from(reg_class));
+    }
+    if base.ends_with("ss") {
+        Some(4)
+    } else if base.ends_with("sd") {
+        Some(8)
+    } else {
+        Some(128 * u32::from(reg_class))
+    }
+}
 
 /// Whether a consumer spelled `mnemonic` may read the folded address when the
 /// only alignment evidence is an *unaligned* load spelling.
@@ -435,6 +528,33 @@ const IMM_FIRST_BASES: &[&str] = &[
     "roundss",
 ];
 
+/// The VEX **shift-by-immediate** group — opcode `0F 71` (`psllw`/`psrlw`/
+/// `psraw`), `0F 72` (`pslld`/`psrld`/`psrad`) and `0F 73` (`psllq`/`psrlq`/
+/// `pslldq`/`psrldq`).  Sorted for `binary_search`.
+///
+/// In the VEX encoding this group's source is **register-only**: `VPSLLD
+/// xmm1, xmm2, imm8` has no `xmm2/m128` form, so `vpslld $3, MEM, %ymm3` is
+/// not a VEX instruction at all.  GAS does not reject it — it silently
+/// promotes the text to the EVEX encoding, which requires AVX-512VL:
+///
+/// ```text
+///   vmovdqu (%rdi), %ymm3        c5 fe 6f 1f        vmovdqu (%rdi),%ymm3
+///   vpslld  $3, %ymm3, %ymm3     c5 e5 72 f3 03     vpslld $0x3,%ymm3,%ymm3
+///                           ->
+///   vpslld  $3, (%rdi), %ymm3    62 f1 65 28 72 37 03
+/// ```
+///
+/// `c5`/`c4` is VEX, `62` is EVEX.  Emitting the folded form into a function
+/// compiled for `-march=x86-64-v3` — which guarantees AVX2 and *not*
+/// AVX-512VL — turns working code into `SIGILL` on the target it was built
+/// for.  Measured on this tree's own `tests/regression/bb_slp_v7.c`
+/// (`v7_mf_shift`).  The legacy two-operand form has no such problem
+/// (`pslld MEM, %xmm0` is a real SSE2 encoding), which is why the gate below
+/// is scoped to the `v`-prefixed spelling.
+const VEX_REG_ONLY_IMM_SRCS: &[&str] = &[
+    "pslld", "pslldq", "psllq", "psllw", "psrad", "psraw", "psrld", "psrldq", "psrlq", "psrlw",
+];
+
 /// Split an operand list at its top-level commas, returning the byte spans of
 /// the operands so a caller can splice one back in without disturbing the
 /// surrounding separators or whitespace.
@@ -479,6 +599,20 @@ fn vec_reg_index(op: &str) -> Option<u32> {
     }
     let n: u32 = rest.parse().ok()?;
     (n < 16).then_some(n)
+}
+
+/// The 128/256/512-bit register class of `%xmmN`/`%ymmN`/`%zmmN`, as a rank
+/// that orders by width.  `None` for anything that is not a vector register.
+fn vec_reg_class(op: &str) -> Option<u8> {
+    if op.starts_with("%xmm") {
+        Some(1)
+    } else if op.starts_with("%ymm") {
+        Some(2)
+    } else if op.starts_with("%zmm") {
+        Some(3)
+    } else {
+        None
+    }
 }
 
 /// `movups MEM, %xmmN` → `(mem, "%xmmN")`.  Only a plain parenthesised (or
@@ -593,7 +727,13 @@ fn slot_foldable(mnemonic: &str, operands: &str, spans: &[(usize, usize)], slot:
         2 => slot == 0 && FOLDABLE_BASES.binary_search(&base).is_ok(),
         n if n >= 3 => {
             if first.starts_with('$') {
-                slot == 1 && IMM_FIRST_BASES.binary_search(&base).is_ok()
+                // A VEX shift-by-immediate has no memory source at all; see
+                // [`VEX_REG_ONLY_IMM_SRCS`].  The legacy spelling keeps its
+                // SSE2 memory form, so only the `v` prefix is refused.
+                slot == 1
+                    && IMM_FIRST_BASES.binary_search(&base).is_ok()
+                    && !(mnemonic.starts_with('v')
+                        && VEX_REG_ONLY_IMM_SRCS.binary_search(&base).is_ok())
             } else {
                 // VEX/EVEX three-operand: Intel `VOP dst, src1, src2` is
                 // spelled `vop src2, src1, dst` in AT&T, and `src1` lives in
@@ -621,6 +761,7 @@ struct Census {
     temp_live: usize,
     upper_live: usize,
     alignment: usize,
+    width: usize,
     folded: usize,
 }
 
@@ -631,6 +772,7 @@ static CENSUS: std::sync::Mutex<Census> = std::sync::Mutex::new(Census {
     temp_live: 0,
     upper_live: 0,
     alignment: 0,
+    width: 0,
     folded: 0,
 });
 
@@ -722,8 +864,12 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        let load_text = infos[i].trimmed(store.get(i)).to_string();
-        let Some((mem, t_reg)) = parse_vector_load(&load_text) else {
+        // Reject on borrowed text: `trimmed` hands back a slice of the line,
+        // so the overwhelming majority of candidates — every scalar
+        // instruction and every directive — are turned away here without a
+        // single heap allocation.
+        let load_text = infos[i].trimmed(store.get(i));
+        let Some((mem, t_reg)) = parse_vector_load(load_text) else {
             i += 1;
             continue;
         };
@@ -740,7 +886,6 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
             .unwrap_or("");
         let t_fam = VEC_FAMILY_BASE + t_num as RegId;
         let addr_gp = memory_operand_families(mem);
-        let mem = mem.to_string();
 
         // Walk forward to the first line that mentions the temporary.
         let mut j = next_insn(store, infos, i + 1, len);
@@ -774,26 +919,41 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        let cons = infos[j].trimmed(store.get(j)).to_string();
+        // Borrowed too: the EVEX filter below rejects most consumers, and
+        // only a fold that survives every gate reaches `try_fold`, which is
+        // the first thing in this pass that allocates.
+        let cons = infos[j].trimmed(store.get(j));
         // Reject EVEX decorations: a masked or broadcasting operand is not the
         // plain `r/m` substitution this pass proves.
         if cons.contains('{') || cons.contains('}') || cons.contains("%k") {
             i += 1;
             continue;
         }
+        let cons_mnemonic = cons.split_once(char::is_whitespace).map(|(m, _)| m);
+        // Element-width discipline.  The retired load and the fused consumer
+        // must move the SAME number of bytes, because the fold turns a
+        // register operand of a known width into a bare address of an inferred
+        // one.  `vmovsd (%rax), %xmm1` writes 64 bits and
+        // `vaddpd %xmm1, %xmm2, %xmm3` reads 128, so the folded
+        // `vaddpd (%rax), %xmm2, %xmm3` would read bytes 8..15 the original
+        // never touched — a silent wrong answer, not a trap.  Same in reverse
+        // for `vmovss` into a packed consumer.
+        let t_class = vec_reg_class(t_reg).unwrap_or(1);
+        if cons_mnemonic.and_then(|m| uniform_width_bytes(m, t_class))
+            != uniform_width_bytes(load_mnemonic, t_class)
+        {
+            census_bump("width");
+            i += 1;
+            continue;
+        }
         let Some(new_line) = try_fold(&cons, &mem, t_reg) else {
-            census_reject(
-                cons.split_once(char::is_whitespace)
-                    .map(|(m, _)| m)
-                    .unwrap_or("?"),
-            );
+            census_reject(cons_mnemonic.unwrap_or("?"));
             i += 1;
             continue;
         };
         // Alignment gate (see [`fold_needs_aligned_load`]): a legacy SSE
         // consumer may only re-read the address if the retired load was the
         // selector's own proof that the object is 16-byte aligned.
-        let cons_mnemonic = cons.split_once(char::is_whitespace).map(|(m, _)| m);
         if cons_mnemonic.is_some_and(fold_needs_aligned_load)
             && !ALIGNED_VEC_LOADS.contains(&load_mnemonic)
         {
@@ -840,7 +1000,22 @@ fn try_fold(cons: &str, mem: &str, t_reg: &str) -> Option<String> {
     // a legacy two-operand op reads it, and a VEX destination that aliases the
     // source is a shape this pass declines rather than models.
     let last = spans.len() - 1;
-    if operands[spans[last].0..spans[last].1].trim() == t_reg {
+    let dst = operands[spans[last].0..spans[last].1].trim();
+    if dst == t_reg {
+        return None;
+    }
+    // Width discipline.  The folded operand is a bare address, so the
+    // assembler has to derive its size from the mnemonic plus the *other*
+    // operands, and the destination is what pins it down.  That only works
+    // while the temporary is no wider than the destination:
+    // `vcvtpd2dq %ymm3, %xmm0` reads a 256-bit source into a 128-bit
+    // destination, and the folded `vcvtpd2dq MEM, %xmm0` names no size GAS can
+    // pick (it rejects the line outright).  Widening conversions are the
+    // sound direction — `vcvtdq2pd %xmm3, %ymm0` folds to a `XMMWORD` operand
+    // and `vpmovzxbd %xmm3, %ymm0` to a `QWORD` one, both exactly what the
+    // register form read.  A destination that is not a vector register names
+    // no width at all and is declined.
+    if vec_reg_class(t_reg)? > vec_reg_class(dst).unwrap_or(0) {
         return None;
     }
     let slot = spans[..last]
@@ -1053,6 +1228,136 @@ mod tests {
         assert_unchanged(
             "    vmovups (%rdx), %ymm1\n    vaddps %ymm1, %ymm4, %ymm1\n    vmovups %ymm1, (%rdi)\n    ret",
         );
+    }
+
+    #[test]
+    fn refuses_a_scalar_load_into_a_packed_consumer() {
+        // The width rule.  `vmovsd` writes 64 bits and zeroes the rest;
+        // `vaddpd` then reads 128.  Folding would produce
+        // `vaddpd (%rax), %xmm2, %xmm3`, which reads bytes 8..15 the original
+        // never touched.  A silent wrong answer, not a fault.
+        let tail = "    vmovupd (%rsi), %xmm1\n    vmovupd %xmm1, (%rdx)\n    ret";
+        assert_unchanged(&format!(
+            "    vmovsd (%rax), %xmm1\n    vaddpd %xmm1, %xmm2, %xmm3\n    vmovupd %xmm3, (%rdi)\n{tail}"
+        ));
+        assert_unchanged(&format!(
+            "    vmovss (%rax), %xmm1\n    vmulps %xmm1, %xmm2, %xmm3\n    vmovups %xmm3, (%rdi)\n{tail}"
+        ));
+        assert_unchanged(&format!(
+            "    vmovsd (%rax), %xmm1\n    vaddps %xmm1, %xmm2, %xmm3\n    vmovaps %xmm3, (%rdi)\n{tail}"
+        ));
+    }
+
+    #[test]
+    fn still_folds_a_scalar_load_into_a_matching_scalar_consumer() {
+        // Same width on both sides is sound and is where the scalar wins are.
+        let tail = "    vmovupd (%rsi), %xmm1\n    vmovupd %xmm1, (%rdx)\n    ret";
+        let out = body_of(&format!(
+            "    vmovsd (%rax), %xmm1\n    vaddsd %xmm1, %xmm2, %xmm3\n    vmovsd %xmm3, (%rdi)\n{tail}"
+        ));
+        assert!(out.contains("vaddsd (%rax), %xmm2, %xmm3"), "{out}");
+        let out = body_of(&format!(
+            "    vmovss (%rax), %xmm1\n    vaddss %xmm1, %xmm2, %xmm3\n    vmovss %xmm3, (%rdi)\n{tail}"
+        ));
+        assert!(out.contains("vaddss (%rax), %xmm2, %xmm3"), "{out}");
+    }
+
+    #[test]
+    fn refuses_a_scalar_load_feeding_a_wrong_width_scalar_consumer() {
+        // 32-bit load, 64-bit read: `vmovss` writes 4 bytes, `vaddsd` reads 8.
+        let tail = "    vmovupd (%rsi), %xmm1\n    vmovupd %xmm1, (%rdx)\n    ret";
+        assert_unchanged(&format!(
+            "    vmovss (%rax), %xmm1\n    vaddsd %xmm1, %xmm2, %xmm3\n    vmovsd %xmm3, (%rdi)\n{tail}"
+        ));
+    }
+
+    #[test]
+    fn refuses_pmaxsd_whose_sd_suffix_lies() {
+        // `pmaxsd` is a PACKED dword compare: GAS reads 16 bytes from its `r/m`
+        // operand despite the `sd` suffix.  Trusting the suffix would let a
+        // 64-bit `vmovsd` load fold into a 128-bit read.
+        let tail = "    vmovupd (%rsi), %xmm1\n    vmovupd %xmm1, (%rdx)\n    ret";
+        assert_unchanged(&format!(
+            "    vmovsd (%rax), %xmm1\n    vpmaxsd %xmm1, %xmm2, %xmm3\n    vmovdqu %xmm3, (%rdi)\n{tail}"
+        ));
+        // ...while a *packed* load, which really is 16 bytes, still folds.
+        let out = body_of(&format!(
+            "    vmovdqu (%rax), %xmm1\n    vpmaxsd %xmm1, %xmm2, %xmm3\n    vmovdqu %xmm3, (%rdi)\n{tail}"
+        ));
+        assert!(out.contains("vpmaxsd (%rax), %xmm2, %xmm3"), "{out}");
+    }
+
+    #[test]
+    fn refuses_the_destination_dependent_widening_forms() {
+        // `pmovzxbd` reads 4 bytes with an %xmm destination and 8 with a %ymm
+        // one; `cvtps2pd` reads 8.  Neither width is stated by the text.
+        let tail = "    vmovupd (%rsi), %xmm1\n    vmovupd %xmm1, (%rdx)\n    ret";
+        assert_unchanged(&format!(
+            "    vmovdqu (%rax), %xmm1\n    vpmovzxbd %xmm1, %xmm2\n    vmovdqu %xmm2, (%rdi)\n{tail}"
+        ));
+        assert_unchanged(&format!(
+            "    vmovdqu (%rax), %xmm1\n    vcvtps2pd %xmm1, %xmm2\n    vmovupd %xmm2, (%rdi)\n{tail}"
+        ));
+    }
+
+    #[test]
+    fn refuses_a_vex_shift_by_immediate() {
+        // The whole point of [`VEX_REG_ONLY_IMM_SRCS`]: this text assembles,
+        // but only as the EVEX encoding `62 f1 65 28 72 37 03`, which needs
+        // AVX-512VL and traps SIGILL on the AVX2-only targets
+        // `-march=x86-64-v3` promises.  Caught by
+        // tests/regression/check_bb_slp_v7_codegen.sh (v7_mf_shift).
+        assert_unchanged(
+            "    vmovdqu (%rdi), %ymm3\n    vpslld $3, %ymm3, %ymm3\n    vmovdqu %ymm3, (%rsi)\n    ret",
+        );
+        assert_unchanged(
+            "    vmovdqu (%rdi), %ymm3\n    vpsrld $3, %ymm3, %ymm1\n    vmovdqu %ymm1, (%rsi)\n    ret",
+        );
+        assert_unchanged(
+            "    vmovdqu (%rdi), %ymm3\n    vpslldq $3, %ymm3, %ymm1\n    vmovdqu %ymm1, (%rsi)\n    ret",
+        );
+    }
+
+    #[test]
+    fn still_folds_a_vex_shuffle_by_immediate() {
+        // `vpshufd $imm, src, dst` really does take `r/m` in AT&T operand 1,
+        // so refusing the shift group must not take the shuffles with it.
+        let out = body_of(
+            "    vmovdqu (%rdi), %ymm3\n    vpshufd $0x1b, %ymm3, %ymm1\n    vmovdqu %ymm1, (%rsi)\n    ret",
+        );
+        assert!(out.contains("vpshufd $0x1b, (%rdi), %ymm1"), "{out}");
+    }
+
+    #[test]
+    fn refuses_when_the_temporary_is_wider_than_the_destination() {
+        // `vcvtpd2dq %ymm3, %xmm0` reads 256 bits and writes 128.  The folded
+        // `vcvtpd2dq MEM, %xmm0` leaves the operand size undeterminable and
+        // GAS rejects the line, so the pass must never emit it.
+        assert_unchanged(
+            "    vmovupd (%rdi), %ymm3\n    vcvtpd2dq %ymm3, %xmm0\n    vmovdqu %xmm0, (%rsi)\n    ret",
+        );
+        assert_unchanged(
+            "    vmovupd (%rdi), %ymm3\n    vcvttpd2dq %ymm3, %xmm0\n    vmovdqu %xmm0, (%rsi)\n    ret",
+        );
+    }
+
+    #[test]
+    fn refuses_a_conversion_whose_operand_width_follows_the_destination() {
+        // `vcvtdq2pd %xmm3, %ymm0` reads 128 bits but `vcvtdq2pd %xmm3, %xmm0`
+        // reads 64 — the operand size follows the *destination*, not the
+        // source, so a 128-bit `%xmm` load is only safe for one of the two.
+        // The pass declines the family rather than model that (see
+        // [`NON_UNIFORM_WIDTH_BASES`]).
+        let tail = "    vmovupd (%rsi), %xmm3\n    vmovupd %xmm3, (%rdx)\n    ret";
+        assert_unchanged(&format!(
+            "    vmovdqu (%rdi), %xmm3\n    vcvtdq2pd %xmm3, %ymm0\n    vmovupd %ymm0, (%rsi)\n{tail}"
+        ));
+    }
+
+    #[test]
+    fn refuses_a_non_vector_destination() {
+        // A GP destination names no vector width for the assembler to infer.
+        assert_unchanged("    vmovdqu (%rdi), %xmm3\n    vpextrd $1, %xmm3, %eax\n    ret");
     }
 
     #[test]
