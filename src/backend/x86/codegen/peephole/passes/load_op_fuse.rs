@@ -287,7 +287,7 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
 
 /// GP families named inside a memory operand such as `8(%rax,%rcx,4)` or
 /// `sym(%rip)` (`%rip` is not a GP family and is ignored).
-fn memory_operand_families(mem: &str) -> u16 {
+pub(super) fn memory_operand_families(mem: &str) -> u16 {
     let mut fams = 0u16;
     let mut rest = mem;
     while let Some(pct) = rest.find('%') {
@@ -350,7 +350,7 @@ fn is_reg_or_imm(op: &str) -> bool {
 
 /// True when `t` (an `Other`/`Cmp`/`SetCC` line) touches memory in any way.
 /// `lea` computes an address without accessing it and is allowed.
-fn accesses_memory(t: &str, info: &LineInfo) -> bool {
+pub(super) fn accesses_memory(t: &str, info: &LineInfo) -> bool {
     if matches!(
         info.kind,
         LineKind::LoadRbp { .. } | LineKind::StoreRbp { .. }
@@ -377,7 +377,7 @@ fn accesses_memory(t: &str, info: &LineInfo) -> bool {
 }
 
 /// Kinds that may sit between a load and its consumer.
-fn is_window_kind(kind: LineKind) -> bool {
+pub(super) fn is_window_kind(kind: LineKind) -> bool {
     matches!(
         kind,
         LineKind::Other { .. } | LineKind::Cmp | LineKind::SetCC { .. }

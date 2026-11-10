@@ -68,6 +68,7 @@ mod store_forwarding;
 mod tail_call;
 mod vector_broadcast;
 mod vector_copy;
+mod vector_load_op_fuse;
 mod vex_promote;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -510,6 +511,7 @@ pub(crate) fn peephole_optimize_with_config(
     if std::env::var("CCC_NO_VEX_PROMOTE").is_err() {
         let _ = vex_promote::promote_legacy_sse_to_vex(&mut out);
     }
+    vector_load_op_fuse::dump_census();
     out
 }
 
@@ -1180,6 +1182,15 @@ fn peephole_optimize_inner(
         if !sk("load_alu_fuse") {
             let c = load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
             trace("fuse_load_into_alu", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        // Vector (SSE/AVX) load -> ALU memory-operand fusion: the packed and
+        // scalar half of the transform above, which cannot share its GP-only
+        // register model.  See vector_load_op_fuse.rs for the soundness
+        // argument and the liveness-monotonicity proof.
+        if !sk("vector_load_fuse") {
+            let c = vector_load_op_fuse::fuse_vector_load_into_op(&mut store, &mut infos);
+            trace("fuse_vector_load_into_op", pass_count, c, &store, &infos);
             changed |= c;
         }
         // Load -> LEA-add in-place (`mov MEM,%t; leaq (%acc,%t,1),%s` ->
