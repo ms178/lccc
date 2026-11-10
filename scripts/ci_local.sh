@@ -193,6 +193,12 @@ gate "rootfs-write-policy" fast \
 gate "script-imports" fast \
     python3 scripts/check_script_imports.py
 
+# Swap provisioning is part of the verification environment: a second 4 GiB
+# image exhausts a 21 GiB sandbox, and a fixed /tmp diagnostic file cannot be
+# reopened by a non-root caller. Static, so it runs before the build.
+gate "agent-swap-reuse" fast \
+    python3 tests/regression/check_agent_swap_reuse.py
+
 # The volatile ratchet is a pure static scan of `src/`. It needs no compiler,
 # so running it before the build means a dropped `!*volatile` guard is
 # reported even when the build is broken.

@@ -392,7 +392,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 556.89,
+      "predicted_gate_seconds": 557.14,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -741,7 +741,7 @@
           "name": "bash tests/regression/check_i686_label_ref_safety.sh"
         },
         {
-          "measured_s": 2.80,
+          "measured_s": 2.8,
           "name": "python3 tests/regression/check_llvm_guarded_folds.py --clang \"$CLANG\""
         },
         {
@@ -935,6 +935,10 @@
         {
           "measured_s": 0.04,
           "name": "python3 scripts/check_cond_load_sink_best_tools.py --self-test"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 tests/regression/check_agent_swap_reuse.py"
         }
       ]
     },
