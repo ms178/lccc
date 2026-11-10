@@ -105,6 +105,68 @@ fn lane_key(op: &Operand) -> LaneKey {
 /// per-store clone, and no duplicate stream for a single-web root.
 pub(super) type StreamEntry = (i64, usize, Operand, Value, u32);
 
+/// Zero-copy view over one store-stream entry.
+///
+/// `StreamEntry` is 64 bytes and 16-byte aligned because `Operand` contains
+/// `IrConst::I128`.  Every accessor therefore takes `&self`; even a view that
+/// is itself an owned tuple never copies that tuple.  A blanket implementation
+/// for `&T` lets the object tier pass `&[StreamEntry]` and the site tier pass
+/// `&[&StreamEntry]` through ONE generic core.  Rust lifetimes prove that a
+/// borrowed view cannot outlive the one owned object stream.
+pub(super) trait StreamEntryRef {
+    fn off(&self) -> i64;
+    fn idx(&self) -> usize;
+    fn val(&self) -> Operand;
+    fn ptr(&self) -> Value;
+    fn base(&self) -> u32;
+}
+
+impl StreamEntryRef for StreamEntry {
+    #[inline]
+    fn off(&self) -> i64 {
+        self.0
+    }
+    #[inline]
+    fn idx(&self) -> usize {
+        self.1
+    }
+    #[inline]
+    fn val(&self) -> Operand {
+        self.2
+    }
+    #[inline]
+    fn ptr(&self) -> Value {
+        self.3
+    }
+    #[inline]
+    fn base(&self) -> u32 {
+        self.4
+    }
+}
+
+impl<T: StreamEntryRef + ?Sized> StreamEntryRef for &T {
+    #[inline]
+    fn off(&self) -> i64 {
+        (**self).off()
+    }
+    #[inline]
+    fn idx(&self) -> usize {
+        (**self).idx()
+    }
+    #[inline]
+    fn val(&self) -> Operand {
+        (**self).val()
+    }
+    #[inline]
+    fn ptr(&self) -> Value {
+        (**self).ptr()
+    }
+    #[inline]
+    fn base(&self) -> u32 {
+        (**self).base()
+    }
+}
+
 /// EXACT hashable operand identity, used ONLY by seed dedup.  Unlike
 /// `LaneKey`, it preserves the constant variant (`I8(0)` vs `Zero`) and the
 /// lossy `f64` approximation that `IrConst::to_hash_key` drops for
@@ -2479,9 +2541,9 @@ fn is_memory_access(inst: &Instruction) -> bool {
 /// can never occur inside it (the caller splits on `checked_sub != size`),
 /// so the old `offs: Vec<i64>` + `dedup()` guard was dead work and a per-run
 /// allocation; the `debug_assert!` below keeps that invariant executable.
-fn emit_run(
+fn emit_run<E: StreamEntryRef>(
     ty: IrType,
-    run: &[StreamEntry],
+    run: &[E],
     size: i64,
     avx2: bool,
     candidates: &mut Vec<SeedCandidate>,
@@ -2489,7 +2551,7 @@ fn emit_run(
     debug_assert!(run.len() >= 2);
     debug_assert!(
         run.windows(2)
-            .all(|w| w[1].0.checked_sub(w[0].0) == Some(size))
+            .all(|w| w[1].off().checked_sub(w[0].off()) == Some(size))
     );
     let Ok(size_u64) = u64::try_from(size) else {
         return;
@@ -2497,13 +2559,13 @@ fn emit_run(
     let Some(width) = preferred_width(run.len(), size_u64, ty, avx2) else {
         return;
     };
-    let store_idx: Vec<usize> = run[..width].iter().map(|(_, i, ..)| *i).collect();
-    let lane_ops: Vec<Operand> = run[..width].iter().map(|(_, _, v, ..)| v.clone()).collect();
+    let store_idx: Vec<usize> = run[..width].iter().map(|e| e.idx()).collect();
+    let lane_ops: Vec<Operand> = run[..width].iter().map(|e| e.val()).collect();
     candidates.push(SeedCandidate {
         store_idx,
         lane_ops,
         ty,
-        anchor_ptr: run[0].3,
+        anchor_ptr: run[0].ptr(),
         width,
         joint: None,
         value_sink: None,
@@ -2526,13 +2588,13 @@ fn emit_run(
                 Some(cw) if cw == chunk.len() => cw,
                 _ => continue,
             };
-            let store_idx: Vec<usize> = chunk.iter().map(|(_, i, ..)| *i).collect();
-            let lane_ops: Vec<Operand> = chunk.iter().map(|(_, _, v, ..)| v.clone()).collect();
+            let store_idx: Vec<usize> = chunk.iter().map(|e| e.idx()).collect();
+            let lane_ops: Vec<Operand> = chunk.iter().map(|e| e.val()).collect();
             candidates.push(SeedCandidate {
                 store_idx,
                 lane_ops,
                 ty,
-                anchor_ptr: chunk[0].3,
+                anchor_ptr: chunk[0].ptr(),
                 width: cw,
                 joint: None,
                 value_sink: None,
@@ -2555,14 +2617,33 @@ fn push_stream_candidates(
         return;
     }
     sorted.sort_by_key(|(off, idx, ..)| (*off, *idx));
+    push_sorted(ctx, ty, &sorted, is_object_tier, avx2, candidates);
+}
+
+/// ONE seed-collection core for both owned object streams and borrowed site
+/// partitions.  `sorted` is already ordered by `(byte offset, store index)`;
+/// the generic `E` is either `StreamEntry` or `&StreamEntry`, so neither tier
+/// clones a 64-byte entry.  Accessors borrow `self`, and the joint window
+/// holds `&E`, so even the owned tier never copies the 64-byte tuple.
+fn push_sorted<E: StreamEntryRef>(
+    ctx: &BlockCtx,
+    ty: IrType,
+    sorted: &[E],
+    is_object_tier: bool,
+    avx2: bool,
+    candidates: &mut Vec<SeedCandidate>,
+) {
+    if sorted.len() < 2 {
+        return;
+    }
     if is_object_tier && ty == IrType::U8 && x86_sse41_available_pub() {
         // Joint seeds use the LAST store to each byte; overwritten stores
         // are retired only after the complete use/access proof below.  The
-        // window holds BORROWED entries: the old `Vec<StreamEntry>` cloned
-        // every store once just to remove overwritten offsets.
-        let mut last: Vec<&StreamEntry> = Vec::with_capacity(sorted.len());
-        for e in &sorted {
-            if last.last().is_some_and(|p| p.0 == e.0) {
+        // window holds borrowed views into the one owned stream: no
+        // `StreamEntry` copy and no owned temporary run vector.
+        let mut last: Vec<&E> = Vec::with_capacity(sorted.len());
+        for e in sorted {
+            if last.last().is_some_and(|p| p.off() == e.off()) {
                 last.pop();
             }
             last.push(e);
@@ -2570,7 +2651,7 @@ fn push_stream_candidates(
         for window in last.windows(4) {
             if window
                 .windows(2)
-                .all(|w| w[1].0.checked_sub(w[0].0) == Some(1))
+                .all(|w| w[1].off().checked_sub(w[0].off()) == Some(1))
             {
                 if let Some(seed) = joint::seed(ctx, window) {
                     candidates.push(seed);
@@ -2593,7 +2674,7 @@ fn push_stream_candidates(
     for i in 1..sorted.len() {
         // checked: an offset delta that does not fit i64 cannot be the lane
         // stride (debug builds would panic on overflow).
-        if sorted[i].0.checked_sub(sorted[i - 1].0) != Some(size) {
+        if sorted[i].off().checked_sub(sorted[i - 1].off()) != Some(size) {
             if i - start >= 2 {
                 emit_run(ty, &sorted[start..i], size, avx2, candidates);
             }
@@ -2616,7 +2697,7 @@ fn push_stream_candidates(
 /// `StreamBase::Value(v)` roots always have exactly one raw base (`v` itself),
 /// so they never get a site tier either; that is the same behaviour as before,
 /// now derived instead of special-cased.
-fn site_subsets(entries: &[StreamEntry]) -> Vec<Vec<StreamEntry>> {
+fn site_subsets<'a>(entries: &'a [StreamEntry]) -> Vec<Vec<&'a StreamEntry>> {
     // ZERO-ALLOCATION fast path: the overwhelmingly common case is one raw
     // address web per object stream.  Allocating a HashMap just to discover
     // it has one entry cost 8,551 Ir on the 320-store stress file (measured
@@ -2636,10 +2717,15 @@ fn site_subsets(entries: &[StreamEntry]) -> Vec<Vec<StreamEntry>> {
     // preserves the FIRST-APPEARANCE order of distinct raw bases; returning
     // `HashMap::into_values()` would iterate the hash table, not insertion
     // order, and could reorder tied candidates on another build.
-    let mut buckets: Vec<Vec<StreamEntry>> = Vec::new();
+    //
+    // Buckets hold `&StreamEntry`, not owned `StreamEntry`: the old code
+    // copied 64 bytes per store into a second tier.  Pointer identity is
+    // asserted by the new regression test, so this is a true zero-copy
+    // partition of the one owned object stream.
+    let mut buckets: Vec<Vec<&'a StreamEntry>> = Vec::new();
     let mut index: FxHashMap<u32, usize> = FxHashMap::default();
     for e in entries {
-        let idx = match index.entry(e.4) {
+        let idx = match index.entry(e.base()) {
             Entry::Occupied(slot) => *slot.get(),
             Entry::Vacant(slot) => {
                 let idx = buckets.len();
@@ -2647,7 +2733,7 @@ fn site_subsets(entries: &[StreamEntry]) -> Vec<Vec<StreamEntry>> {
                 *slot.insert(idx)
             }
         };
-        buckets[idx].push(e.clone());
+        buckets[idx].push(e);
     }
     buckets
 }
@@ -2704,21 +2790,31 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
             .push(entry);
     }
     let mut candidates = Vec::new();
-    // Keep the object-tier / site-tier ordering of the old chained iterator
-    // so the stable final sort sees the same tie order as before.
-    let mut site_groups: Vec<(IrType, Vec<StreamEntry>)> = Vec::new();
+    // Keep the old GLOBAL tier ordering: every object-tier seed first, then
+    // every site-tier seed, each in the same `object_streams` iteration order.
+    // Site candidates are buffered because their borrowed partitions must be
+    // consumed BEFORE the owned `entries` Vec is moved into the object tier.
+    let mut site_candidates = Vec::new();
     for (key, entries) in object_streams {
         let ty = key.3;
-        // Derive the site partition BEFORE consuming `entries`; each entry is
-        // cloned exactly once into its own bucket, then the original Vec is
-        // moved into the object tier with no second `to_vec()` copy.
-        let subsets = site_subsets(&entries);
+        // Derive the zero-copy site partition from the immutable owned stream.
+        // A singleton bucket can never form a strided run, so it is dropped
+        // before the sort/split work instead of paying for it pointlessly.
+        for mut subset in site_subsets(&entries) {
+            if subset.len() < 2 {
+                continue;
+            }
+            // `site_subsets` keeps first-appearance order for its public
+            // contract; the run splitter needs `(off, idx)` order.  Sorting
+            // the borrowed bucket in place costs no `StreamEntry` copies.
+            subset.sort_by_key(|e| (e.0, e.1));
+            push_sorted(ctx, ty, &subset, false, avx2, &mut site_candidates);
+        }
+        // All immutable borrows of `entries` are dead here; moving it into
+        // the object tier is now legal and still sorts it exactly once.
         push_stream_candidates(ctx, ty, entries, true, avx2, &mut candidates);
-        site_groups.extend(subsets.into_iter().map(|subset| (ty, subset)));
     }
-    for (ty, subset) in site_groups {
-        push_stream_candidates(ctx, ty, subset, false, avx2, &mut candidates);
-    }
+    candidates.extend(site_candidates);
     if let Some(seed) = joint::value_seed(ctx) {
         candidates.push(seed);
     }
@@ -5800,6 +5896,22 @@ fn slp_decline(reason: &'static str) -> Option<Plan> {
 fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Option<Plan> {
     let block = ctx.block;
     let width = cand.width;
+    // Every producer promises `width` lanes and `width` store positions.
+    // A future refactor that violates that invariant must DECLINE, not index
+    // `ptrs[0]` / unwrap `store_idx.max()` and panic inside optimisation.
+    if cand.store_idx.is_empty()
+        || cand.store_idx.len() != width
+        || cand.lane_ops.len() != width
+        || width == 0
+        || cand
+            .store_idx
+            .iter()
+            .any(|&i| i >= block.instructions.len())
+    {
+        return slp_decline(
+            "malformed seed: empty, zero-width, out-of-bounds or mismatched store/lane span",
+        );
+    }
     let Some(fam) = family_for(cand.ty, width) else {
         return slp_decline("no vector family for lane type/width");
     };
@@ -8769,7 +8881,9 @@ mod tests {
         for bucket in got {
             let key = bucket[0].4;
             assert!(bucket.iter().all(|e| e.4 == key));
-            got_map.insert(key, bucket);
+            // Dereference the borrowed views back to owned values so the
+            // reference oracle still compares exact bytes, not pointer tags.
+            got_map.insert(key, bucket.iter().map(|e| **e).collect());
         }
         assert_eq!(got_map.len(), reference.len());
         for (key, expect) in reference {
@@ -9023,5 +9137,181 @@ mod tests {
         let pair = dedup_seed_candidates_with(vec![make(1), make(1)], |_| 0);
         assert_eq!(pair.len(), 1);
         assert_eq!(seed_dedup_key(&pair[0]), seed_dedup_key(&make(1)));
+    }
+    #[test]
+    fn seed_stream_layout_is_pahole_equivalent_and_niche_optimal() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        use super::joint::Tail;
+        // `pahole` is not installed in this sandbox and fastbuild emits
+        // line-tables-only DWARF (no struct DIEs).  `size_of`/`align_of`/
+        // `offset_of!` are the authoritative Rust layout oracle instead.
+        assert_eq!(size_of::<Tail>(), 2);
+        assert_eq!(align_of::<Tail>(), 1);
+        assert_eq!(offset_of!(Tail, four_inputs), 0);
+        assert_eq!(offset_of!(Tail, alpha), 1);
+        assert_eq!(size_of::<Option<Tail>>(), 2);
+        assert_eq!(align_of::<Option<Tail>>(), 1);
+        // 16-byte alignment comes from IrConst::I128 inside Operand; this is
+        // exactly why the two-tier design must borrow rather than copy it.
+        assert_eq!(size_of::<StreamEntry>(), 64);
+        assert_eq!(align_of::<StreamEntry>(), 16);
+        assert_eq!(size_of::<SeedOperandKey>(), 32);
+        assert_eq!(align_of::<SeedOperandKey>(), 16);
+        assert_eq!(size_of::<LaneKey>(), 32);
+        assert_eq!(align_of::<LaneKey>(), 16);
+        // One inline index or one Vec<usize>: no heap allocation until a
+        // genuine 64-bit hash collision promotes the bucket.
+        assert_eq!(size_of::<SeedReps>(), 24);
+        assert_eq!(align_of::<SeedReps>(), 8);
+        assert_eq!(size_of::<SeedCandidate>(), 72);
+        assert_eq!(align_of::<SeedCandidate>(), 8);
+        assert_eq!(offset_of!(SeedCandidate, store_idx), 0);
+        assert_eq!(offset_of!(SeedCandidate, lane_ops), 24);
+        assert_eq!(offset_of!(SeedCandidate, value_sink), 48);
+        assert_eq!(offset_of!(SeedCandidate, width), 56);
+        assert_eq!(offset_of!(SeedCandidate, anchor_ptr), 64);
+        assert_eq!(offset_of!(SeedCandidate, joint), 68);
+        assert_eq!(offset_of!(SeedCandidate, ty), 70);
+    }
+
+    #[test]
+    fn site_subsets_borrows_original_entries_without_copying() {
+        let entries = vec![
+            stream_entry(0, 0, 9),
+            stream_entry(4, 1, 3),
+            stream_entry(8, 2, 9),
+            stream_entry(12, 3, 7),
+            stream_entry(16, 4, 3),
+        ];
+        let parts = site_subsets(&entries);
+        assert_eq!(parts.len(), 3);
+        for bucket in &parts {
+            for e in bucket {
+                // Pointer identity proves the site tier is a zero-copy
+                // PARTITION: no StreamEntry was cloned into a second Vec.
+                assert!(
+                    entries.iter().any(|original| std::ptr::eq(original, *e)),
+                    "site bucket must borrow the original owned stream"
+                );
+            }
+        }
+        assert_eq!(
+            parts.iter().map(Vec::len).sum::<usize>(),
+            entries.len(),
+            "the borrowed partition must be lossless"
+        );
+    }
+
+    #[test]
+    fn push_sorted_owned_and_borrowed_views_are_identical() {
+        let external = FxHashSet::default();
+        let roots = SymbolRoots::default();
+        let steps = FxHashMap::default();
+        let mut f = IrFunction::new("views".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let ctx = build_ctx(&f, 0, &external, Default::default(), &steps, false, &roots);
+        let entries = vec![
+            stream_entry(0, 0, 1),
+            stream_entry(4, 1, 1),
+            stream_entry(8, 2, 1),
+            stream_entry(12, 3, 1),
+            stream_entry(20, 4, 1),
+            stream_entry(24, 5, 1),
+        ];
+        let mut owned = Vec::new();
+        let mut borrowed = Vec::new();
+        with_isa_gate(|| {
+            push_stream_candidates(&ctx, IrType::U32, entries.clone(), true, true, &mut owned);
+            let mut refs: Vec<&StreamEntry> = entries.iter().collect();
+            refs.sort_by_key(|e| (e.0, e.1));
+            push_sorted(&ctx, IrType::U32, &refs, true, true, &mut borrowed);
+        });
+        assert!(!owned.is_empty(), "the fixture must produce seeds");
+        assert_eq!(
+            owned.iter().map(seed_dedup_key).collect::<Vec<_>>(),
+            borrowed.iter().map(seed_dedup_key).collect::<Vec<_>>(),
+            "owned and borrowed views must emit byte-identical seeds"
+        );
+    }
+
+    #[test]
+    fn build_plan_fails_closed_on_malformed_seed_spans() {
+        let external = FxHashSet::default();
+        let roots = SymbolRoots::default();
+        let steps = FxHashMap::default();
+        let mut f = IrFunction::new("malformed".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let ctx = seed_ctx(&f, &roots, &external, &steps);
+        let bases = RestrictBases::build(&f);
+        let mut malformed = Vec::new();
+        for (store_idx, lane_ops, width) in [
+            (vec![], vec![], 4usize),
+            (vec![1, 2, 3], vec![Operand::Value(Value(1)); 3], 4),
+            (vec![1, 2, 3, 4], vec![Operand::Value(Value(1)); 3], 4),
+            (vec![0, 1, 2, 4096], vec![Operand::Value(Value(1)); 4], 4),
+            (vec![usize::MAX], vec![Operand::Value(Value(1))], 1),
+            (vec![], vec![], 0),
+        ] {
+            malformed.push(SeedCandidate {
+                store_idx,
+                lane_ops,
+                ty: IrType::U32,
+                anchor_ptr: Value(0),
+                width,
+                joint: None,
+                value_sink: None,
+            });
+        }
+        for cand in &malformed {
+            SLP_DECLINE.with(|r| r.set("unset"));
+            // A malformed producer must DECLINE, never panic on ptrs[0] or
+            // store_idx.iter().max().unwrap().
+            assert!(build_plan(&ctx, cand, &bases).is_none());
+            assert!(
+                SLP_DECLINE.with(|r| r.get()).contains("malformed"),
+                "the decline reason must name the invariant violation"
+            );
+        }
+    }
+
+    #[test]
+    fn site_subsets_borrowed_partition_stress_is_lossless() {
+        // Callgrind can instrument this exact test with `--exact` without
+        // an ignored-test attribute: the repo's audit census forbids growing
+        // that budget, and an ignored test is not a regression gate.
+        let entries: Vec<StreamEntry> = (0..4000usize)
+            .map(|i| stream_entry((i / 37) as i64 * 4, i, (i % 37) as u32 + 1))
+            .collect();
+        for _ in 0..64 {
+            let parts = site_subsets(&entries);
+            assert_eq!(parts.len(), 37, "one borrowed bucket per raw base");
+            assert_eq!(
+                parts.iter().map(Vec::len).sum::<usize>(),
+                entries.len(),
+                "every repetition must remain a lossless partition"
+            );
+            let first = parts[0][0];
+            let last = parts[36][parts[36].len() - 1];
+            assert!(
+                std::ptr::eq(first, &entries[0])
+                    && entries.iter().any(|original| std::ptr::eq(original, last)),
+                "bucket endpoints must borrow the one owned stream"
+            );
+            std::hint::black_box(&parts);
+        }
+        std::hint::black_box(&entries);
     }
 }
