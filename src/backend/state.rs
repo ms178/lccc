@@ -472,6 +472,27 @@ pub struct CodegenState {
     /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
     /// provably holds the vector data (128-bit vector register allocation).
     pub vec_live_regs: FxHashMap<u32, &'static str>,
+    /// Home (address) value id -> physical YMM register that provably holds
+    /// the CURRENT CONTENTS of that home.
+    ///
+    /// Set only by whole-register 256-bit stores that wrote all 32 bytes from
+    /// an allocator-owned YMM register: after such a store the home's slot and
+    /// that register both hold the value, so a later read of the home may take
+    /// the register instead of reloading. This is what keeps a loop-invariant
+    /// vector constant (`hi`/`lo` in a clamp) in a register across every
+    /// iteration instead of spilling it once and folding a memory operand on
+    /// each use -- the `avx_fp_private` 41-vs-36 instruction gap.
+    ///
+    /// Deliberately a SEPARATE map from `vec_live_regs`. That map means "the
+    /// vector VALUE v is in r"; this one means "the contents of the home AT v
+    /// are in r". `vec_arg_register_held` consults the former to decide whether
+    /// a slot may be stale, so reusing it here would make every 128-bit
+    /// consumer of a 256-bit home refuse its memory operand for no reason.
+    ///
+    /// WIDTH-EXACT by construction: only "ymmN" names are ever stored (see
+    /// `set_vec_home_reg`), so a 256-bit read can take the register and no
+    /// 128-bit read can mistake it for its own contents.
+    pub vec_home_reg: FxHashMap<u32, &'static str>,
     /// True once this function emitted any 256/512-bit vector instruction.
     /// Dirty upper YMM halves trigger the AVX-SSE transition penalty in
     /// callers that use legacy SSE encodings; the epilogue emits
@@ -992,6 +1013,7 @@ impl CodegenState {
             sibcall_hint: None,
             sibcall_marker_lines: Vec::new(),
             vec_live_regs: FxHashMap::default(),
+            vec_home_reg: FxHashMap::default(),
             dirty_upper_ymm: false,
             requires_executable_stack: false,
             trampoline_data_blocks: Vec::new(),
@@ -1417,6 +1439,7 @@ impl CodegenState {
         self.sibcall_hint = None;
         self.sibcall_marker_lines.clear();
         self.vec_live_regs.clear();
+        self.vec_home_reg.clear();
         self.dirty_upper_ymm = false;
         self.uses_sret = false;
         self.next_block_label = None;
@@ -1469,6 +1492,7 @@ impl CodegenState {
     pub fn invalidate_vec_peephole(&mut self) {
         self.invalidate_vec_scratch_peephole();
         self.vec_live_regs.clear();
+        self.vec_home_reg.clear();
         // NOTE: dirty_upper_ymm is deliberately NOT cleared here. The vec
         // peephole cache is compiler bookkeeping, but upper-half dirtiness is
         // physical machine state that persists until an explicit vzeroupper
@@ -1557,12 +1581,51 @@ impl CodegenState {
     pub fn vec_evict_bank(&mut self, reg: &str) {
         let bank = vector_reg_bank(reg);
         self.vec_live_regs.retain(|_, r| vector_reg_bank(r) != bank);
+        self.vec_home_reg.retain(|_, r| vector_reg_bank(r) != bank);
     }
 
     pub fn vec_evict_bank_except(&mut self, reg: &str, keep: u32) {
         let bank = vector_reg_bank(reg);
         self.vec_live_regs
             .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == keep);
+        self.vec_home_reg
+            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == keep);
+    }
+
+    /// The YMM register holding the current contents of home `v`, if a
+    /// whole-register 256-bit store proved it resident there and nothing has
+    /// evicted that bank since.
+    ///
+    /// Width-exact: `set_vec_home_reg` only ever records "ymmN" names, so this
+    /// answer is valid for a 256-bit operand read and is never consulted by the
+    /// 128-bit paths.
+    pub fn vec_home_reg_256(&self, v: u32) -> Option<&'static str> {
+        self.vec_home_reg.get(&v).copied()
+    }
+
+    /// Record (`Some`) or retract (`None`) the register holding home `v`'s
+    /// contents.
+    ///
+    /// Two refusals keep the map sound:
+    ///
+    /// * Only "ymmN" names are recorded. A 128-bit store leaves the home's
+    ///   upper 16 bytes untouched, so a 256-bit read of it could not be served
+    ///   from the register.
+    /// * Banks 0 and 1 (`%ymm0`/`%ymm1`) are refused, exactly as
+    ///   `vec_claim_live_reg` refuses them: they are the backend's universal
+    ///   scratch, overwritten by any emitter at any time, and
+    ///   `invalidate_vec_scratch_peephole` deliberately does NOT clear this map
+    ///   (that is the whole point -- the claim must survive a scratch-only
+    ///   invalidation to be useful).
+    pub fn set_vec_home_reg(&mut self, v: u32, reg: Option<&'static str>) {
+        match reg {
+            Some(r) if r.starts_with("ymm") && vector_reg_bank(r) >= 2 => {
+                self.vec_home_reg.insert(v, r);
+            }
+            _ => {
+                self.vec_home_reg.remove(&v);
+            }
+        }
     }
 
     /// `vec_live_regs` lookup with the operand-WIDTH contract enforced.
