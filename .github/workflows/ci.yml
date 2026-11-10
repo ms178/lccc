@@ -3736,6 +3736,9 @@ jobs:
           --reference "$GCC16" --reference "$CLANG" --reference "$LCCC_ICX_BIN" \
           --reference32 "$GCC16" --reference32 "$CLANG" --clang-placement "$CLANG" \
           2>&1 | tee intel-evidence/pack-underflow.log
+    - name: DA-07 -fpack-struct[=<n>] and x86 -mcpu= alias contracts
+      run: |
+        set -euo pipefail
         # DA-07: `-fpack-struct[=<n>]` layouts and the x86 `-mcpu=` alias,
         # measured against GCC (see the script's header for the fixture table).
         python3 tests/regression/check_pack_struct_mcpu.py \
