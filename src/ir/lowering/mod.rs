@@ -17,6 +17,13 @@ mod expr_builtins_gcc16;
 mod expr_builtins_gcc17;
 mod expr_builtins_intrin;
 mod expr_builtins_lcccsimd;
+// The x86 backend's SIMD tests resolve mnemonics through the front end's own
+// table rather than hard-coding a second copy, so a rename in the lowering
+// table fails the test instead of silently testing a stale spelling.  That
+// needs exactly these two items, so exactly these two are re-exported: the
+// module itself stays private, and `lower_lccc_simd` (the only other
+// `pub(super)` item) stays unreachable from outside.
+pub(crate) use expr_builtins_lcccsimd::{LcccSimdClass, lccc_simd_lookup};
 mod expr_builtins_overflow;
 pub(crate) mod expr_calls;
 pub(crate) mod expr_ops;

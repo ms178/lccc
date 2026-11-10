@@ -60,6 +60,12 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         ("__builtin_ilogb", "ilogb"),
         ("__builtin_modf", "modf"),
         ("__builtin_modff", "modff"),
+        ("__builtin_frexp", "frexp"),
+        ("__builtin_frexpf", "frexpf"),
+        ("__builtin_ldexp", "ldexp"),
+        ("__builtin_ldexpf", "ldexpf"),
+        ("__builtin_scalbn", "scalbn"),
+        ("__builtin_scalbnf", "scalbnf"),
         ("__builtin_strncasecmp", "strncasecmp"),
         ("__builtin_bcopy", "bcopy"),
     ] {
@@ -4364,6 +4370,14 @@ pub fn gcc_compat_builtin_ctype(name: &str) -> Option<CType> {
         "__builtin_stack_save" => Some(void_ptr()),
         "__builtin_modff" => Some(CType::Float),
         "__builtin_modf" => Some(CType::Double),
+        "__builtin_ldexp" | "__builtin_scalbn" | "__builtin_frexp" => Some(CType::Double),
+        // The single-precision spellings are NOT optional: without a row here
+        // `builtin_return_ctype` falls through to "undeclared", sema keeps the
+        // implicit-`int` return, and `__builtin_ldexpf(1.5f, 3)` produced
+        // 1.09471e+09 -- the xmm0 low half reinterpreted as an `int` and then
+        // converted back to float.  The `l` spellings had rows already, which
+        // is exactly why only the `f` ones were broken.
+        "__builtin_ldexpf" | "__builtin_scalbnf" | "__builtin_frexpf" => Some(CType::Float),
         "__builtin_cexpi" | "__builtin_cpow" => Some(CType::ComplexDouble),
         _ => None,
     }

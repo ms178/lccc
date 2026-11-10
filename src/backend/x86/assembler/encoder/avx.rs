@@ -828,16 +828,40 @@ impl super::InstructionEncoder {
 
     /// Extract EVEX masking info from an operand (register or memory):
     /// returns (aaa, zeroing). Mask-less operands yield (0, false).
+    ///
+    /// SA-19: an unparseable mask name must NEVER degrade to `aaa = 0`.  `0`
+    /// is not "no mask" to the decoder -- it is the unmasked encoding -- so
+    /// mapping a typo or an out-of-range `{k8}`/`{k9}` (which `is_kreg`
+    /// accepts, being `k`+digit, while `reg_num` knows only k0-k7) to 0 would
+    /// silently drop the caller's mask and execute every lane.  The parser
+    /// rejects `{k8}` textually today, so this is defence in depth, but a
+    /// future path that constructs an `Operand` directly must fail closed.
+    ///
+    /// Returning `Result` from all 32 call sites would push the same
+    /// three-line `?` boilerplate into every EVEX emitter for a case the
+    /// front end already excludes; instead this debug-asserter is the
+    /// contract and the release build keeps the honest answer.  `expect`
+    /// would be a `panic_sites` census entry for an unreachable path, which
+    /// the census ratchet deliberately treats as a defect in its own right.
     fn evex_mask_info(op: &Operand) -> (u8, bool) {
+        /// `Some(name)` -> the k-register number, asserting the name parses.
+        fn mask_num(name: Option<&String>) -> u8 {
+            match name {
+                None => 0,
+                Some(m) => {
+                    let n = reg_num(m);
+                    debug_assert!(
+                        n.is_some(),
+                        "EVEX mask `{m}` has no k-register number; the encoder \
+                         must reject it rather than encode as unmasked (SA-19)"
+                    );
+                    n.unwrap_or(0)
+                }
+            }
+        }
         match op {
-            Operand::Register(r) => {
-                let aaa = r.mask.as_ref().and_then(|m| reg_num(m)).unwrap_or(0);
-                (aaa, r.zeroing)
-            }
-            Operand::Memory(m) => {
-                let aaa = m.mask.as_ref().and_then(|m| reg_num(m)).unwrap_or(0);
-                (aaa, m.zeroing)
-            }
+            Operand::Register(r) => (mask_num(r.mask.as_ref()), r.zeroing),
+            Operand::Memory(m) => (mask_num(m.mask.as_ref()), m.zeroing),
             _ => (0, false),
         }
     }
@@ -7057,6 +7081,78 @@ mod tests {
 
     fn reg(name: &str) -> Operand {
         Operand::Register(Register::new(name))
+    }
+
+    fn masked_reg(name: &str, mask: &str) -> Operand {
+        let mut r = Register::new(name);
+        r.mask = Some(mask.to_string());
+        Operand::Register(r)
+    }
+
+    /// SA-19: an EVEX opmask decorator that names no real k-register must be
+    /// rejected, never silently encoded as UNMASKED.
+    ///
+    /// This is the wrong-code shape that is easy to miss: `aaa = 0` is not
+    /// "no mask" to the decoder, it *is* the unmasked encoding, so an
+    /// out-of-range mask that degrades to 0 executes every lane while looking
+    /// like a perfectly valid instruction.  `is_kreg` accepts `k` + any digit,
+    /// so `k8`/`k9` pass the class test while `reg_num` -- which knows only
+    /// k0-k7 -- returns `None`.  The single validation point is
+    /// `validate_operands`, so that is where the rule is pinned.
+    #[test]
+    fn evex_mask_decorator_must_name_a_real_k_register() {
+        use crate::backend::x86::assembler::encoder::registers::validate_operands;
+
+        // Every legal mask is accepted, at each operand position, so the rule
+        // cannot be satisfied by rejecting everything.
+        for k in 0..=7 {
+            let mask = format!("k{k}");
+            assert!(
+                validate_operands("vaddps", &[masked_reg("zmm0", &mask), reg("zmm1")]).is_ok(),
+                "{{%{mask}}} is a legal EVEX mask"
+            );
+        }
+        // ... including the upper-case spelling, which `Register::new`
+        // normalises.  `masked_reg` sets `mask` directly (the parser's
+        // `{K3}` path stores the written case and relies on `reg_num`'s
+        // `K0`-`K7` arms), so `K3` is deliberately NOT pre-lowercased here:
+        // this pins that the un-normalised form is accepted too.
+        assert!(validate_operands("vaddps", &[masked_reg("zmm0", "K3"), reg("zmm1")]).is_ok());
+
+        // Out-of-range names are rejected with the GNU as wording.
+        for bad in ["k8", "k9", "K8", "k10"] {
+            let err = validate_operands("vaddps", &[masked_reg("zmm0", bad), reg("zmm1")])
+                .expect_err(&format!("{{%{bad}}} must be rejected"));
+            assert!(
+                err.contains("bad register name"),
+                "expected the GAS wording for {{%{bad}}}, got {err:?}"
+            );
+        }
+        // A memory operand carries a mask too, and it must not slip through.
+        let mut mem = MemoryOperand {
+            segment: None,
+            displacement: Displacement::None,
+            base: Some(Register::new("rax")),
+            index: None,
+            scale: None,
+            mask: Some("k9".to_string()),
+            zeroing: false,
+            broadcast: None,
+        };
+        assert!(
+            validate_operands("vaddps", &[reg("zmm0"), Operand::Memory(mem.clone())]).is_err(),
+            "a masked memory operand must be validated as well"
+        );
+        // ... and the same operand with a legal mask is accepted, so the test
+        // above fails for the mask and not for some other reason.  Clone
+        // rather than move: the point of the pair is that ONE operand differs
+        // only in its mask, and rebuilding the nine-field literal would let a
+        // typo in any other field masquerade as the mask check passing.
+        mem.mask = Some("k1".to_string());
+        assert!(
+            validate_operands("vaddps", &[reg("zmm0"), Operand::Memory(mem)]).is_ok(),
+            "a legally masked memory operand must be accepted"
+        );
     }
 
     /// The rule the three EVEX entry points share: a uniform spelling passes at

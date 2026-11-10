@@ -18,7 +18,7 @@ use crate::frontend::sema::builtins::BuiltinIntrinsic;
 use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LcccSimdClass {
+pub(crate) enum LcccSimdClass {
     Vec128,
     Vec256,
     Vec512,
@@ -43,7 +43,7 @@ fn exact_immediate_operand(op: &Operand) -> bool {
     }
 }
 
-pub(super) fn lccc_simd_lookup(
+pub(crate) fn lccc_simd_lookup(
     mnemonic: &str,
 ) -> Option<(LcccSimdClass, IntrinsicOp, bool, usize)> {
     use IntrinsicOp::*;

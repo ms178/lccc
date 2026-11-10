@@ -12,8 +12,15 @@
 //!   register that never survives an intrinsic (kmov in -> use -> kmov out).
 
 use super::emit::X86Codegen;
+use crate::backend::x86_common::{FmaRoleOrder, fma_role_order};
 use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand, Value};
 
+/// FMA3 places `args = [a, b, c]` differently for each digit triple; see
+/// `crate::backend::x86_common::{FmaRoleOrder, fma_role_order}`, which owns
+/// the table, the SDM pseudocode it follows, the opcode bytes that identify
+/// each permutation, and the exhaustive enumeration of legal placements.
+/// Both backends emit these instructions, so the table is shared rather than
+/// restated per target.
 impl X86Codegen {
     /// Load a 512-bit operand into a ZMM register.
     /// Honors vec_live_regs (register-held values) and direct slot addressing.
@@ -90,14 +97,32 @@ impl X86Codegen {
     /// Store %zmm0 to the 512-bit destination slot and record the register
     /// as live for `dest_ptr` so the next op in the chain reuses it.
     fn evex_store_dest(&mut self, dest_ptr: &Value) {
+        self.evex_store_dest_from(dest_ptr, "zmm0");
+    }
+
+    /// Store the 512-bit register `src` to `dest_ptr` and claim it live.
+    ///
+    /// SA-11 at 512 bits: `evex_store_dest` hard-coding `%zmm0` is right for
+    /// every EVEX op that leaves its result there, but NOT for the FMA digit
+    /// permutations -- 213 writes `%zmm1` and 231 writes `%zmm2`, exactly as
+    /// their VEX counterparts do.  Emitted before this split (a=3,b=5,c=7):
+    ///
+    ///     vfmadd213ps %zmm2, %zmm0, %zmm1     # result in zmm1
+    ///     vmovdqu64   %zmm0, (%rax)           # ... but zmm0 (= a) is stored
+    ///
+    /// The callers that need a non-`%zmm0` destination say so explicitly
+    /// rather than the store guessing, which is what keeps the other ~40
+    /// EVEX emitters on the cheap one-argument form.
+    fn evex_store_dest_from(&mut self, dest_ptr: &Value, src: &'static str) {
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state
-                .emit_fmt(format_args!("    vmovdqu64 %zmm0, {}", mem));
+                .emit_fmt(format_args!("    vmovdqu64 %{}, {}", src, mem));
         } else {
             self.value_to_reg(dest_ptr, "rax");
-            self.state.emit("    vmovdqu64 %zmm0, (%rax)");
+            self.state
+                .emit_fmt(format_args!("    vmovdqu64 %{}, (%rax)", src));
         }
-        self.state.vec_claim_live_reg(dest_ptr.0, "zmm0");
+        self.state.vec_claim_live_reg(dest_ptr.0, src);
     }
 
     /// Whether arg[0] may be folded as a memory operand (never if the value is
@@ -1721,16 +1746,58 @@ impl X86Codegen {
     }
 
     /// 512-bit FMA: args (a, b, c) -> vfmadd132ps %zmm_c, %zmm_b, %zmm_a.
+    /// Emit an EVEX FMA3 (`vfmadd{132,213,231}{ps,pd}`) for `args = [a, b, c]`.
+    ///
+    /// SA-11: the 213 and 231 spellings don't share the 132 operand placement.
+    /// Intel SDM maps the three digit permutations onto the three operand
+    /// roles as
+    ///
+    /// ```text
+    /// 132:  dst = dst   * src3 + src2     (destination is multiplicand 1)
+    /// 213:  dst = src2  * dst  + src3     (destination is multiplicand 2)
+    /// 231:  dst = src2  * src3 + dst      (destination is the ADDEND)
+    /// ```
+    ///
+    /// so with a fixed reading of `args` as `[a, b, c]` the three mnemonic
+    /// suffixes call for three *different* implicit roles for the destination
+    /// register.  The old code loaded `%zmm0 = a`, `%zmm1 = b` (r/m),
+    /// `%zmm2 = c` (vvvv) and emitted `%zmm1, %zmm2, %zmm0` for all six, which
+    /// is right for 132, right for 213 only because the two multiplicands
+    /// commute (`b·a = a·b` bit-for-bit, including signed zeros and NaN
+    /// payload propagation — multiplication is commutative in IEEE 754), and
+    /// WRONG for 231, which computed `b·c + a` instead of `a·b + c`.
+    ///
+    /// The fix keeps the mnemonic verbatim — byte-identical for the 132/213
+    /// spellings a raw-builtin user already relied on — and re-assigns the
+    /// register roles for 231 so the arithmetic matches the spelling:
+    /// `%zmm0 = a` takes the vvvv (src2) slot, `%zmm1 = b` the r/m slot and
+    /// `%zmm2 = c` the destination (addend) slot, i.e. `%zmm1, %zmm0, %zmm2`.
+    /// Cost: zero instructions, one different register name.
     fn emit_evex_fma_512(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str) {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
-        self.evex_load_arg_to(&args[0], "zmm0"); // a (dest)
-        self.evex_load_arg_to(&args[1], "zmm1"); // b (r/m)
-        self.evex_load_arg_to(&args[2], "zmm2"); // c (vvvv)
-        // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
+        // Place the three operands in the roles THIS spelling's digit order
+        // requires, then emit one instruction.  See `FmaRoleOrder` for the
+        // measured table: 213 and 231 were both wrong before SA-11 (26.0 and
+        // 38.0 instead of 22.0 with a=3, b=5, c=7).
+        let (rm, vvvv, dst): (&'static str, &'static str, &'static str) = match fma_role_order(inst)
+        {
+            FmaRoleOrder::RmBVvvvCDstA => ("zmm1", "zmm2", "zmm0"),
+            FmaRoleOrder::RmCVvvvADstB => ("zmm2", "zmm0", "zmm1"),
+            FmaRoleOrder::RmBVvvvADstC => ("zmm1", "zmm0", "zmm2"),
+        };
+        // Load in an order that cannot clobber an already-loaded operand: the
+        // three destinations are distinct, and each `evex_load_arg_to` writes
+        // only its own register, so any order works -- but reading `a` first
+        // keeps the instruction stream identical to the 132 case.
+        self.evex_load_arg_to(&args[0], "zmm0"); // a
+        self.evex_load_arg_to(&args[1], "zmm1"); // b
+        self.evex_load_arg_to(&args[2], "zmm2"); // c
         self.state
-            .emit_fmt(format_args!("    {} %zmm1, %zmm2, %zmm0", inst));
-        self.evex_store_dest(dest_ptr);
+            .emit_fmt(format_args!("    {} %{rm}, %{vvvv}, %{dst}", inst));
+        // Store the permutation's own destination, never a fixed `%zmm0`:
+        // only the 132 placement leaves its result there.
+        self.evex_store_dest_from(dest_ptr, dst);
     }
 
     /// Scalar-result SIMD ops (mask compares, movemask, extracts to GPR,
@@ -2117,13 +2184,22 @@ impl X86Codegen {
                     FmaPd231 => "vfmadd231pd",
                     _ => unreachable!(),
                 };
-                self.sse_load_arg(&args[0], "xmm0"); // a (dest)
-                self.sse_load_arg(&args[1], "xmm1"); // b (r/m)
-                self.sse_load_arg(&args[2], "xmm2"); // c (vvvv)
-                // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
+                // SA-11: place the operands in the roles this spelling's
+                // digit order requires.  See `FmaRoleOrder` for the measured
+                // table -- 213 and 231 both computed a different expression
+                // than 132 before this fix.
+                let (rm, vvvv, dst): (&'static str, &'static str, &'static str) =
+                    match fma_role_order(inst) {
+                        FmaRoleOrder::RmBVvvvCDstA => ("xmm1", "xmm2", "xmm0"),
+                        FmaRoleOrder::RmCVvvvADstB => ("xmm2", "xmm0", "xmm1"),
+                        FmaRoleOrder::RmBVvvvADstC => ("xmm1", "xmm0", "xmm2"),
+                    };
+                self.sse_load_arg(&args[0], "xmm0"); // a
+                self.sse_load_arg(&args[1], "xmm1"); // b
+                self.sse_load_arg(&args[2], "xmm2"); // c
                 self.state
-                    .emit_fmt(format_args!("    {} %xmm1, %xmm2, %xmm0", inst));
-                self.sse_store_dest(dest_ptr, "xmm0");
+                    .emit_fmt(format_args!("    {} %{rm}, %{vvvv}, %{dst}", inst));
+                self.sse_store_dest(dest_ptr, dst);
             }
             _ => {}
         }
@@ -2379,12 +2455,26 @@ impl X86Codegen {
                     FmaPd231v256 => "vfmadd231pd",
                     _ => unreachable!(),
                 };
-                self.avx_load_arg_to(&args[0], "ymm0"); // a (dest)
-                self.avx_load_arg_to(&args[1], "ymm1"); // b (r/m)
-                self.avx_load_arg_to(&args[2], "ymm2"); // c (vvvv)
+                // SA-11: role placement per digit order; see `FmaRoleOrder`.
+                let (rm, vvvv, dst): (&'static str, &'static str, &'static str) =
+                    match fma_role_order(inst) {
+                        FmaRoleOrder::RmBVvvvCDstA => ("ymm1", "ymm2", "ymm0"),
+                        FmaRoleOrder::RmCVvvvADstB => ("ymm2", "ymm0", "ymm1"),
+                        FmaRoleOrder::RmBVvvvADstC => ("ymm1", "ymm0", "ymm2"),
+                    };
+                self.avx_load_arg_to(&args[0], "ymm0"); // a
+                self.avx_load_arg_to(&args[1], "ymm1"); // b
+                self.avx_load_arg_to(&args[2], "ymm2"); // c
                 self.state
-                    .emit_fmt(format_args!("    {} %ymm1, %ymm2, %ymm0", inst));
-                self.avx_store_dest(dest_ptr);
+                    .emit_fmt(format_args!("    {} %{rm}, %{vvvv}, %{dst}", inst));
+                // Store from the register the permutation actually wrote.
+                // `avx_store_dest` hard-codes `%ymm0`, which is only the
+                // result for the 132 placement: 213 writes `%ymm1` and 231
+                // writes `%ymm2`, so storing `%ymm0` published a STALE
+                // operand. Measured before this fix: every 256-bit 213/231
+                // spelling returned `a` unchanged (a=3,5,7,9 -> 3,5,7,9 where
+                // 22,46,80,122 was owed), because `%ymm0` still held `a`.
+                self.avx_store_dest_from(dest_ptr, dst);
             }
             _ => {}
         }
@@ -2872,6 +2962,31 @@ mod mask_cmp_global_mem_tests {
 }
 
 #[cfg(test)]
+mod test_fixtures {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    /// Home a vector value at `-32(%rbp)` and give it ONE use.
+    ///
+    /// Why both halves matter: `value_locations` alone is not enough -- a
+    /// destination with zero uses is dead code that `emit_simd_op` skips
+    /// entirely, which makes every assertion about the emitted text vacuous
+    /// (an empty `out`), and the vector loaders need a materialised operand.
+    /// `value_use_counts = vec![1; 10]` covers ids 0..9, so id 9 may be used
+    /// as a destination as well as id 0 as a source.
+    ///
+    /// One definition shared by every fixture that needs it: the SA-11 and
+    /// blendv tests previously could not see the copy that lived inside
+    /// `simd_operand_role_and_upper_state_tests`, which is a compile error
+    /// (`cannot find function slot_vector`), not a silent skip.
+    pub(super) fn slot_vector(cg: &mut X86Codegen, id: u32) {
+        cg.state.value_locations.insert(id, StackSlot(-32));
+        cg.state.vector_values.insert(id);
+        cg.state.value_use_counts = vec![1; 10];
+    }
+}
+
+#[cfg(test)]
 mod mask_compare_kmov_tests {
     use super::*;
     use crate::ir::intrinsics::IntrinsicOp as O;
@@ -2999,6 +3114,7 @@ mod mask_compare_kmov_tests {
 /// in a user's `vpmaddubsw` result or in an AVX->SSE transition penalty.
 #[cfg(test)]
 mod simd_operand_role_and_upper_state_tests {
+    use super::test_fixtures::slot_vector;
     use super::*;
     use crate::backend::state::StackSlot;
     use crate::ir::reexports::IrConst;
@@ -3167,21 +3283,6 @@ mod simd_operand_role_and_upper_state_tests {
         }
     }
 
-    /// A slot-homed vector value: the shape `vec_arg_mem` folds and every
-    /// loader can reload from. `-32(%rbp)` is the same fixture the fold tests
-    /// use, so these cases drive the real emitter rather than a stub.
-    ///
-    /// `value_use_counts` must cover BOTH ids: the dispatcher treats a
-    /// destination with zero uses as dead code and emits nothing, which would
-    /// make every assertion below vacuous (an empty `out`), and the loader
-    /// needs a materialised operand. Ids 0 (source) and 9 (destination) are
-    /// the ones these tests use.
-    fn slot_vector(cg: &mut X86Codegen, id: u32) {
-        cg.state.value_locations.insert(id, StackSlot(-32));
-        cg.state.vector_values.insert(id);
-        cg.state.value_use_counts = vec![1; 10];
-    }
-
     /// `vec_live_regs` is WIDTH-POLYGLOT: one map, three spellings (`%xmmN`
     /// from a 128-bit producer, `%ymmN` from 256, `%zmmN` from EVEX). The EVEX
     /// loader writes `%zmm{target}`, so it may only consume a `%zmm` claim. A
@@ -3300,5 +3401,414 @@ mod simd_operand_role_and_upper_state_tests {
             !out.contains("vmovdqa"),
             "no staging copy may be emitted when the value has a home: {out}"
         );
+    }
+}
+
+/// SA-11: the three FMA3 digit permutations are three DIFFERENT expressions,
+/// and the emitter must realise `a·b + c` for every one of them.
+///
+/// Intel SDM maps the digit triple onto the three operand roles:
+///
+/// ```text
+/// 132:  dst = dst  * src3 + src2
+/// 213:  dst = src2 * dst  + src3
+/// 231:  dst = src2 * src3 + dst     <- the destination is the ADDEND
+/// ```
+///
+/// Read uniformly as `args = [a, b, c]`, the 231 spelling therefore needs the
+/// destination register to hold `c`, not `a`.  Before this fix all six
+/// spellings emitted one placement, so `vfmadd231ps` computed `b·c + a` —
+/// silently, and reachable only through a raw `__lccc_simd*` builtin call, so
+/// no header-level test could see it.
+///
+/// The assertion is on the operand ROLE, not a fixed string: a later emitter
+/// may choose different scratch registers as long as the roles stay right.
+/// Every spelling is resolved through `lccc_simd_lookup`, the single table the
+/// front end uses, so a rename fails here rather than in production.
+/// SA-11: the three FMA3 digit permutations are three DIFFERENT expressions.
+///
+/// Measured on this host with a=3, b=5, c=7 and the placement the emitter used
+/// for every spelling before SA-11 (`rm=b, vvvv=c, dst=a`):
+///
+/// ```text
+/// 132 -> 22.0  == a*b + c   correct
+/// 213 -> 26.0  == c*a + b   WRONG
+/// 231 -> 38.0  == b*c + a   WRONG
+/// ```
+///
+/// Only 132 was ever right, and 213 is not fixable by swapping its two
+/// multiplicand slots (both are multiplicands there) -- the ADDEND role has to
+/// move.  So each spelling gets its own assignment, and this test pins the
+/// assignment for all six spellings at both widths by reading the roles back
+/// out of the emitted instruction.
+///
+/// `132` is additionally pinned to be BYTE-IDENTICAL to the pre-fix stream,
+/// because that is the placement every public `_mm[_256]_fmadd_*` macro uses
+/// and a fix for a raw-builtin-only defect must not perturb the hot path.
+#[cfg(test)]
+mod fma_role_order_tests {
+    use super::test_fixtures::slot_vector;
+    use super::*;
+    use crate::ir::lowering::{LcccSimdClass, lccc_simd_lookup};
+
+    /// Home `id` at a DISTINCT 32-byte slot.  `slot_vector` gives every id the
+    /// same `-32` slot, which is fine for single-value fixtures but would let
+    /// an operand-role swap hide behind a shared address here.
+    fn distinct_slot_vector(cg: &mut X86Codegen, id: u32) {
+        slot_vector(cg, id);
+        cg.state.value_locations.insert(
+            id,
+            crate::backend::state::StackSlot(-32 * (i64::from(id) + 1)),
+        );
+    }
+
+    /// The `(%rbp)` home `distinct_slot_vector` produces for operand `id`.
+    fn home(id: u32) -> String {
+        format!("-{}(%rbp)", 32 * (id + 1))
+    }
+
+    /// The table key for one FMA spelling, resolved the way the front end
+    /// resolves it.
+    ///
+    /// The `v` prefix is NOT uniform across widths: GCC spells the 128-bit
+    /// rows `fmadd132ps128` but the wider ones `vfmadd132ps256` /
+    /// `vfmadd132ps512`, and the table mirrors the header keys exactly.
+    /// `lower_lccc_simd` copes by trying `name` and then `name + width`;
+    /// hard-coding either spelling in a test is what would break -- the first
+    /// draft of this module built `fmadd...256` unconditionally and panicked
+    /// at 256.
+    ///
+    /// Asserts EXACTLY ONE key matches.  Two keys for one spelling would mean
+    /// the lookup accepts either spelling for the same instruction, which no
+    /// caller can rely on, so it is a table defect rather than a test
+    /// preference.
+    fn resolve_fma(
+        width: &str,
+        float: &str,
+        digits: &str,
+    ) -> (String, LcccSimdClass, IntrinsicOp, usize) {
+        let mut hits = Vec::new();
+        for key in [
+            format!("fmadd{digits}{float}{width}"),
+            format!("vfmadd{digits}{float}{width}"),
+        ] {
+            if let Some((class, op, _, nargs)) = lccc_simd_lookup(&key) {
+                hits.push((key, class, op, nargs));
+            }
+        }
+        assert_eq!(
+            hits.len(),
+            1,
+            "width {width} {float} {digits}: expected exactly one table spelling, got {hits:?}"
+        );
+        hits.pop().expect("exactly one hit asserted above")
+    }
+
+    /// `(mnemonic, op)` for every 128/256-bit spelling, resolved through the
+    /// front end's own table so a rename fails here, not in production.
+    ///
+    /// The class is ASSERTED, not just carried: `x86_codegen` decides between
+    /// the 128- and 256-bit emitter arm from the operand width, so a row that
+    /// said `fmadd...256` but declared `Vec128` would put a 256-bit value
+    /// through the xmm path.  Nothing downstream re-checks that pairing, which
+    /// makes the table the single point where it can be caught.
+    fn spellings(width: &str) -> Vec<(String, IntrinsicOp)> {
+        let want_class = match width {
+            "128" => LcccSimdClass::Vec128,
+            "256" => LcccSimdClass::Vec256,
+            other => panic!("no FMA3 spelling has width {other}"),
+        };
+        let mut v = Vec::new();
+        for float in ["ps", "pd"] {
+            for digits in ["132", "213", "231"] {
+                let (key, class, op, nargs) = resolve_fma(width, float, digits);
+                assert_eq!(nargs, 3, "`{key}` takes three operands");
+                assert_eq!(
+                    class, want_class,
+                    "`{key}` must be classed as the {width}-bit row"
+                );
+                v.push((format!("vfmadd{digits}{float}{width}"), op));
+            }
+        }
+        v
+    }
+
+    /// The single `vfmadd*` instruction in `out` as `(mnemonic, rm, vvvv,
+    /// dst)` from AT&T `mnemonic %rm, %vvvv, %dst`.
+    fn parse_fma(out: &str) -> Option<(String, String, String, String)> {
+        out.lines().find_map(|line| {
+            let t = line.trim();
+            if !t.starts_with("vfmadd") {
+                return None;
+            }
+            let mut it = t.split_whitespace();
+            let mnemonic = it.next()?.to_string();
+            let rm = it.next()?.trim_end_matches(',').to_string();
+            let vvvv = it.next()?.trim_end_matches(',').to_string();
+            let dst = it.next()?.to_string();
+            Some((mnemonic, rm, vvvv, dst))
+        })
+    }
+
+    /// Which operand (`0` = a, `1` = b, `2` = c) a register name holds, given
+    /// that the fixture homes a/b/c at `home(0..3)` and staging puts them in
+    /// `xmm0..2` / `ymm0..2`.  Returns `None` for anything unrecognised so a
+    /// new scratch register fails loudly instead of being waved through.
+    fn which_operand(reg: &str) -> Option<u32> {
+        let bare = reg.trim_start_matches('%');
+        for id in 0..3u32 {
+            if bare == home(id) {
+                return Some(id);
+            }
+            for prefix in ["xmm", "ymm", "zmm"] {
+                if bare == format!("{prefix}{id}") {
+                    return Some(id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Every spelling must compute `a*b + c`, i.e. place `c` in the
+    /// destination for 231, `a` and `b` as multiplicands for 213, and `a` in
+    /// the destination for 132.
+    #[test]
+    fn every_fma_spelling_places_the_addend_where_its_digits_require() {
+        for (width, is_256) in [("128", false), ("256", true)] {
+            for (name, op) in spellings(width) {
+                let mut cg = X86Codegen::new();
+                for id in 0..3u32 {
+                    distinct_slot_vector(&mut cg, id);
+                }
+                distinct_slot_vector(&mut cg, 9);
+                let args = [
+                    Operand::Value(Value(0)),
+                    Operand::Value(Value(1)),
+                    Operand::Value(Value(2)),
+                ];
+                if is_256 {
+                    cg.emit_avx_fp_256_op(&Value(9), &op, &args);
+                } else {
+                    cg.emit_sse_fp_128_op(&Value(9), &op, &args);
+                }
+                let out = cg.state.out.buf.clone();
+                let (got, rm, vvvv, dst) =
+                    parse_fma(&out).unwrap_or_else(|| panic!("{name}: no vfmadd* in {out:?}"));
+                assert_eq!(
+                    fma_role_order(&got),
+                    fma_role_order(&name),
+                    "{name}: emitted a different permutation ({got}): {out}"
+                );
+                // The three roles must be three DISTINCT operands, or the
+                // expression is not `a*b + c` at all.
+                let roles = [
+                    which_operand(&rm).unwrap_or_else(|| panic!("{name}: rm {rm} in {out}")),
+                    which_operand(&vvvv).unwrap_or_else(|| panic!("{name}: vvvv {vvvv} in {out}")),
+                    which_operand(&dst).unwrap_or_else(|| panic!("{name}: dst {dst} in {out}")),
+                ];
+                let mut sorted = roles;
+                sorted.sort_unstable();
+                assert_eq!(
+                    sorted,
+                    [0, 1, 2],
+                    "{name}: roles must be a permutation of a/b/c, got {roles:?}: {out}"
+                );
+                // The digit order fixes exactly which role `c` (the addend for
+                // 231) and `a` take.
+                match fma_role_order(&name) {
+                    // 132: dst = dst*rm + vvvv, destination must be `a`.
+                    FmaRoleOrder::RmBVvvvCDstA => assert_eq!(
+                        (roles[2], roles[0], roles[1]),
+                        (0, 1, 2),
+                        "{name}: 132 needs dst=a, rm=b, vvvv=c: {out}"
+                    ),
+                    // 213: dst = vvvv*dst + rm, so the ADDEND (`c`) is the rm
+                    // slot and the destination is a multiplicand.
+                    FmaRoleOrder::RmCVvvvADstB => assert_eq!(
+                        (roles[0], roles[1], roles[2]),
+                        (2, 0, 1),
+                        "{name}: 213 needs rm=c (the addend), vvvv=a, dst=b: {out}"
+                    ),
+                    // 231: dst = vvvv*rm + dst, so the ADDEND (`c`) is the dst.
+                    FmaRoleOrder::RmBVvvvADstC => assert_eq!(
+                        (roles[0], roles[1], roles[2]),
+                        (1, 0, 2),
+                        "{name}: 231 needs rm=b, vvvv=a, dst=c (the addend): {out}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The 132 placement — the only one any public macro emits — must not move.
+    #[test]
+    fn fma132_placement_is_unchanged() {
+        for (width, is_256) in [("128", false), ("256", true)] {
+            for float in ["ps", "pd"] {
+                let (_, _, op, _) = resolve_fma(width, float, "132");
+                let mut cg = X86Codegen::new();
+                for id in 0..3u32 {
+                    distinct_slot_vector(&mut cg, id);
+                }
+                distinct_slot_vector(&mut cg, 9);
+                let args = [
+                    Operand::Value(Value(0)),
+                    Operand::Value(Value(1)),
+                    Operand::Value(Value(2)),
+                ];
+                if is_256 {
+                    cg.emit_avx_fp_256_op(&Value(9), &op, &args);
+                } else {
+                    cg.emit_sse_fp_128_op(&Value(9), &op, &args);
+                }
+                let out = cg.state.out.buf.clone();
+                let (_, _, _, dst) = parse_fma(&out).expect("a vfmadd* instruction");
+                assert_eq!(
+                    which_operand(&dst),
+                    Some(0),
+                    "width {width} {float}: the 132 destination must stay a's \
+                     home: {out}"
+                );
+            }
+        }
+    }
+
+    /// The decoded role order for every mnemonic the emitter can be handed,
+    /// including every table spelling and the unrecognised-name fallback.
+    ///
+    /// The width-suffixed rows are the regression: the parser used to take
+    /// EVERY digit in the string, so `vfmadd213ps128` became `"213128"`, missed
+    /// and fell through to the 132 placement -- 213 silently mis-computing as
+    /// 132, which is the SA-11 defect over again.  Both suffix conventions are
+    /// covered because the table uses them both: 128-bit keys carry no `v` and
+    /// no width marker beyond `...128`, while 256/512 keep the `v`.
+    #[test]
+    fn fma_role_order_decodes_every_spelling_and_defaults_to_132() {
+        for (inst, want) in [
+            // Bare operation field (what the three emit sites pass).
+            ("vfmadd132ps", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmadd213pd", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmadd231ps", FmaRoleOrder::RmBVvvvADstC),
+            // 128-bit table keys: no `v`, width marker after the lane type.
+            ("fmadd132ps128", FmaRoleOrder::RmBVvvvCDstA),
+            ("fmadd213ps128", FmaRoleOrder::RmCVvvvADstB),
+            ("fmadd231pd128", FmaRoleOrder::RmBVvvvADstC),
+            // 256/512-bit table keys: `v` prefix, width marker after the lane.
+            ("vfmadd132ps256", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmadd213ps256", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmadd231pd256", FmaRoleOrder::RmBVvvvADstC),
+            ("vfmadd132ps512", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmadd213pd512", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmadd231ps512", FmaRoleOrder::RmBVvvvADstC),
+            // The two shapes the emitter used to see in the 256-bit path.
+            ("vfmadd132psv256", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmadd213pdv256", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmadd231psv512", FmaRoleOrder::RmBVvvvADstC),
+            // Unknown digits must not silently become 231 or 213, and a
+            // digit-less name must not either.
+            ("vfmadd999ps", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmaddps", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmaddsoftps", FmaRoleOrder::RmBVvvvCDstA),
+        ] {
+            assert_eq!(fma_role_order(inst), want, "{inst}");
+        }
+    }
+}
+
+/// The VEX lane-mask select (`vblendvps`/`vblendvpd`) is plain **AVX**, so a
+/// `-mavx -mno-avx2` target must emit it.
+///
+/// The dispatch gated it on `sse41 && avx2_enabled` — one ISA level too
+/// strict.  `vblendvps` is VEX.128.66.0F3A.W0 4A and `vblendvpd` is
+/// `...W0 4B`; both round-trip through `as`/`objdump` at `-mavx` with no AVX2
+/// feature involved.  Gating on `isa.avx` makes that target two or three
+/// instructions lighter per blend (`vblendvps` instead of
+/// `psrad`/`pshufd` + `andps`/`andnps`/`orps`), which is the whole point of
+/// this arm existing.
+///
+/// The test is on the EMITTED MNEMONIC, not on the branch, so any future
+/// refactor that keeps the fast path keeps the test green.
+#[cfg(test)]
+mod blendv_vex_gate_tests {
+    use super::test_fixtures::slot_vector;
+    use super::*;
+    use crate::backend::x86::isa::X86Isa;
+
+    fn codegen_with(avx: bool) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        // SSE2 baseline + exactly the feature under test; no SSE4.1 and no
+        // AVX2, so anything the arm emits is attributable to `avx` alone.
+        cg.isa = X86Isa {
+            simd: true,
+            sse41: false,
+            avx,
+            ymm: false,
+            fma: false,
+            movbe: false,
+            cx16: false,
+        };
+        cg.avx2_enabled = false;
+        cg
+    }
+
+    #[test]
+    fn avx_without_avx2_emits_the_one_instruction_lane_select() {
+        let mut cg = codegen_with(true);
+        slot_vector(&mut cg, 0);
+        slot_vector(&mut cg, 1);
+        slot_vector(&mut cg, 2);
+        slot_vector(&mut cg, 9);
+        cg.emit_sse_blendv_128(
+            &Value(9),
+            &[
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            super::super::intrinsics::BlendvDomain::Ps,
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("vblendvps"),
+            "-mavx must emit the one-instruction VEX select: {out}"
+        );
+        // ... and neither the bitwise triple nor the SA-10 canonicalization.
+        for slow in ["andps", "andnps", "orps", "psrad", "pshufd"] {
+            assert!(
+                !out.contains(slow),
+                "-mavx must not pay the SSEx path's `{slow}`: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse41_without_avx_keeps_the_canonicalised_bitwise_select() {
+        let mut cg = codegen_with(false);
+        cg.isa.sse41 = true; // SSE4.1 but -mno-avx: no VEX encoding is legal
+        slot_vector(&mut cg, 0);
+        slot_vector(&mut cg, 1);
+        slot_vector(&mut cg, 2);
+        slot_vector(&mut cg, 9);
+        cg.emit_sse_blendv_128(
+            &Value(9),
+            &[
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            super::super::intrinsics::BlendvDomain::Ps,
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(
+            !out.contains("vblendvps"),
+            "a VEX encoding without -mavx is a SIGILL: {out}"
+        );
+        // SA-10 canonicalization must still be present, or every
+        // non-compare-produced mask silently changes meaning.
+        assert!(
+            out.contains("psrad $31"),
+            "the SSE path must broadcast the dword sign (SA-10): {out}"
+        );
+        assert!(out.contains("andps") && out.contains("orps"), "{out}");
     }
 }

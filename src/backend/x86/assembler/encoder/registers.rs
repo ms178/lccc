@@ -1161,6 +1161,34 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
         }
     }
 
+    // 4b. SA-19: every EVEX opmask decorator must name a real k-register.
+    //
+    // `is_kreg` accepts `k` followed by ANY digit (`k8`, `k9`), while the
+    // encoder's `reg_num` knows only k0-k7 and `evex_mask_info` therefore
+    // maps an unparseable mask to `aaa = 0`.  `0` is not "no mask" to the
+    // decoder -- it IS the unmasked encoding -- so encoding an out-of-range
+    // mask would silently DROP it and execute every lane: a wrong-code
+    // failure shaped like a valid instruction.
+    //
+    // The parser rejects `{k8}` textually today, so this is defence in depth
+    // for any future path that builds an `Operand` directly, and it keeps the
+    // invariant in ONE place instead of pushing a `Result` through the 32
+    // EVEX emitters.  Rejecting here is exactly what GNU as 2.47 does
+    // (`bad register name '%k8'`) and it happens before a single byte is
+    // emitted, so no partial encoding can escape.
+    for op in ops {
+        let mask = match op {
+            Operand::Register(r) => r.mask.as_ref(),
+            Operand::Memory(m) => m.mask.as_ref(),
+            _ => None,
+        };
+        if let Some(name) = mask {
+            if reg_num(name).is_none() {
+                return Err(format!("bad register name `%{name}' for `{mnemonic}'"));
+            }
+        }
+    }
+
     // 5. A suffixed mnemonic must agree with its register operands' width.
     //    `setCC`/`cmovCC`/`jCC` end in a CONDITION CODE, not a size suffix
     //    (`setl` is set-if-less, not "set long"), so they must be excluded.
