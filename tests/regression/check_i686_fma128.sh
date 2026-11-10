@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Gate: the i686 backend's 128-bit VEX FMA3 spellings compile AND compute a*b+c.
+# Gate: the i686 backend's VEX FMA3 spellings compile AND compute a*b+c.
+#
+# Scope: both widths.  The 128-bit half covers the crash below; the 256-bit
+# half pins the operand-placement fix that shares this arm's role table, so one
+# executed probe covers 42 lanes over 12 spellings (18 x 128-bit, 24 x 256-bit).
 #
 # The defect this exists for was a CRASH, not a wrong answer: every 128-bit
 # spelling (`_mm_fmadd_ps`, `_mm_fmadd_pd` and the raw `__lccc_simd128_*`
@@ -65,7 +69,7 @@ case "$(uname -m)" in
     *) echo "FAIL: this gate executes a 32-bit x86 binary and needs an x86-64 host (got $(uname -m))" >&2; exit 1 ;;
 esac
 
-echo "check_i686_fma128: i686 128-bit VEX FMA3 compile + placement"
+echo "check_i686_fma128: i686 VEX FMA3 compile + placement (128- and 256-bit)"
 
 # -mavx -mfma is the minimum that grants the VEX.128 encodings; -nostdlib and
 # -ffreestanding because the probe talks to the kernel directly.
@@ -113,4 +117,4 @@ case "$pout" in
     *) echo "  ok  the pre-fix placement is detected: ${pout}" ;;
 esac
 
-echo "PASS: i686 128-bit FMA3 compiles and every permutation computes a*b+c"
+echo "PASS: i686 FMA3 (128- and 256-bit) compiles and every permutation computes a*b+c"
