@@ -17,6 +17,12 @@
 //!       movq %r15, %r10          ; shuffle new frac back
 //!       jmp .LOOP
 //!
+//! AUD-X86-LTC-1 (owner item for the two `#[ignore]`d coalescing tests in
+//! `passes/mod.rs`): the patterns in `test_loop_trampoline_simple_coalesce`
+//! and `test_loop_trampoline_two_copies` do not yet trigger this pass; they
+//! stay ignored -- under this x86 ID, not the ARM global-store-forwarding
+//! ID they previously carried -- until the matcher learns them.
+//!
 //! This pass detects trampoline blocks and coalesces the register copies:
 //!   1. For each trampoline copy %src -> %dst, find where %src was created in
 //!      the predecessor (as a copy from %dst followed by modifications).

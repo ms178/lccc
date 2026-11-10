@@ -2057,6 +2057,10 @@ pragma_pack_underflow() {
         --reference gcc-16 --reference "${CLANG:-clang-23}" \
         --reference32 gcc-16 --reference32 "${CLANG:-clang-23}" \
         --clang-placement "${CLANG:-clang-23}" "${icx_args[@]}"
+    # DA-07: `-fpack-struct[=<n>]` layouts and the x86 `-mcpu=` alias,
+    # measured against GCC (see the script's header for the fixture table).
+    python3 tests/regression/check_pack_struct_mcpu.py \
+        --lccc target/fastbuild/lccc --reference "${GCC16:-gcc-16}"
 }
 gate "pragma-pack-underflow" fast pragma_pack_underflow
 gate "count-observations" fast python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"

@@ -169,13 +169,26 @@ gimple_rc=$?
 set -e
 
 pack_errs=$(grep -c 'error:' "$tmp/pack.log" || true)
-if [ "$pack_rc" -eq 1 ] && [ "$pack_errs" -eq 1 ] \
-   && grep -q 'does not implement this data-model request' "$tmp/pack.log"; then
-    check '-fpack-struct fails closed with one honest diagnostic' 0
+if [ "$pack_rc" -eq 0 ] && [ "$pack_errs" -eq 0 ] && [ -s "$tmp/pack.o" ]; then
+    check '-fpack-struct is implemented (bare form compiles and emits an object)' 0
 else
     printf 'FAIL: -fpack-struct rc=%s errors=%s: %s\n' "$pack_rc" "$pack_errs" \
         "$(head -2 "$tmp/pack.log")"
-    check '-fpack-struct fails closed' 1
+    check '-fpack-struct implemented' 1
+fi
+
+# The layouts themselves are pinned against GCC in
+# tests/regression/check_pack_struct_mcpu.py; this gate additionally pins
+# that an invalid cap still fails closed with GCC's diagnostic.
+set +e
+"$CCC" -fpack-struct=3 -c "$tmp/unsupported.c" -o "$tmp/pack3.o" >"$tmp/pack3.log" 2>&1
+pack3_rc=$?
+set -e
+if [ "$pack3_rc" -eq 1 ] && grep -q 'small power of two, not 3' "$tmp/pack3.log"; then
+    check '-fpack-struct=3 fails closed with GCCs diagnostic' 0
+else
+    printf 'FAIL: -fpack-struct=3 rc=%s: %s\n' "$pack3_rc" "$(head -2 "$tmp/pack3.log")"
+    check '-fpack-struct=3 fails closed' 1
 fi
 
 if [ "$skylake_rc" -eq 0 ] && [ -s "$tmp/skylake.o" ] \
@@ -194,6 +207,40 @@ else
     printf 'FAIL: GIMPLE rc=%s errors=%s: %s\n' "$gimple_rc" "$gimple_errs" \
         "$(head -3 "$tmp/gimple.log")"
     check 'GCC GIMPLE IR clean refusal' 1
+fi
+
+# ---------------------------------------------------------------------------
+# DA-01 scaling shape: block-scope declarations must not be quadratic.
+#
+# 100k declarations in one block once cost ~41 s of sema (linear scans in
+# the local-object table plus a byte-rescan per span resolution). The fix
+# is indexed on both paths; this leg pins the SHAPE, not a wall time: the
+# 80k case's sema time must stay below 3.0x the 40k case's (a quadratic
+# regression reads ~4x), with the phase timer as the instrument so parse
+# and lowering noise cannot mask it.
+# ---------------------------------------------------------------------------
+for n in 40000 80000; do
+    python3 -c "
+import sys
+sys.stdout.write('void f(void){\n')
+for i in range($n):
+    sys.stdout.write('int v%d;\n' % i)
+sys.stdout.write('}\n')" >"$tmp/decl$n.c"
+done
+sema_time() {
+    CCC_TIME_PHASES=1 "$CCC" -O0 -w -c "$1" -o "$tmp/decl.o" 2>&1 \
+        | sed -n 's/.*\[TIME\] sema: \([0-9.]*\)s.*/\1/p'
+}
+t40=$(sema_time "$tmp/decl40000.c")
+t80=$(sema_time "$tmp/decl80000.c")
+if python3 -c "
+import sys
+t40, t80 = float('$t40' or 0), float('$t80' or 0)
+sys.exit(0 if t40 > 0 and t80 < 3.0 * t40 + 0.05 else 1)"; then
+    check "declaration scaling is sub-quadratic (sema 40k=${t40}s 80k=${t80}s)" 0
+else
+    printf 'FAIL: declaration scaling sema 40k=%s 80k=%s (ratio bound 3.0x)\n' "$t40" "$t80"
+    check 'declaration scaling is sub-quadratic' 1
 fi
 
 printf 'check_parser_depth_limits: %d passed, %d failed\n' "$pass" "$fail"

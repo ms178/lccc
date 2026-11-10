@@ -937,6 +937,11 @@ impl Parser {
                 self.peek_span(),
             );
         }
+        // Bare `-fpack-struct`: the record is packed as if it carried
+        // `__attribute__((packed))` (GCC's documented and measured
+        // equivalence); an explicit member alignment still escapes it,
+        // unlike the `=<n>` cap applied through `max_field_align` below.
+        is_packed = is_packed || self.pack_struct_all;
         // Apply current #pragma pack alignment to struct definition
         let max_field_align = self.pragma_pack_align;
         // Both supported targets (x86-64, i686) are little-endian, so the

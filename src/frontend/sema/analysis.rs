@@ -3083,6 +3083,25 @@ impl SemanticAnalyzer {
     }
 
     fn warn_unused_scope(&mut self) {
+        // DA-01 (step 3): do not build the cloned unused-object list -- and
+        // do not let the diagnostic engine resolve a span per candidate --
+        // when every warning this scope exit can emit is disabled. That is
+        // the common case (unused-variable is `-Wall`-only, and `-w`
+        // inhibits all three kinds), so a 100k-declaration block otherwise
+        // pays a full clone + span resolution per declaration for output
+        // that is discarded. `warning_enabled` also consults positive
+        // `_Pragma` warning scopes, so a scope that re-enables one of the
+        // kinds still warns exactly as before.
+        {
+            use crate::common::error::WarningKind;
+            let diagnostics = self.diagnostics.borrow();
+            if !diagnostics.warning_enabled(WarningKind::UnusedVariable)
+                && !diagnostics.warning_enabled(WarningKind::UnusedButSetVariable)
+                && !diagnostics.warning_enabled(WarningKind::UnusedConstVariable)
+            {
+                return;
+            }
+        }
         for (name, span, level) in self.symbol_table.unused_local_objects() {
             if let Some(level) = level {
                 self.diagnostics

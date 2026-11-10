@@ -571,9 +571,20 @@ pub struct Driver {
     /// a machine scheduler, so this is deliberately diagnostic-only; ISA
     /// selection belongs to -march= and is never silently conflated with tune.
     pub(super) x86_tune: Option<String>,
+    /// Which flag spelling last set `x86_tune`: `-mtune=` or `-mcpu=`.
+    /// Used to produce accurate diagnostic messages that name the flag the
+    /// user actually passed, not the internal alias target.
+    pub(super) x86_tune_spelling: Option<String>,
     /// The `-march=` spelling as given (x86 only); the tuning row falls back
     /// to it when `-mtune` is absent, exactly like GCC.
     pub(super) x86_march: Option<String>,
+    /// `-fpack-struct=<n>`: cap every record's member alignment at `n`
+    /// (the `#pragma pack(<n>)` baseline for the whole translation unit).
+    pub(super) pack_struct_cap: Option<usize>,
+    /// Bare `-fpack-struct`: pack every record as if it carried
+    /// `__attribute__((packed))`. Mutually exclusive with `pack_struct_cap`
+    /// (a later spelling replaces an earlier one, as in GCC).
+    pub(super) pack_struct_all: bool,
     /// Whether to use only general-purpose registers (-mgeneral-regs-only).
     /// On AArch64, this prevents FP/SIMD register usage. The Linux kernel uses
     /// this to avoid touching NEON/FP state. When set, variadic function prologues
@@ -974,9 +985,12 @@ impl Driver {
             enable_amx_bf16: false,
             enable_cmpccxadd: false,
             x86_tune: None,
+            x86_tune_spelling: None,
             x86_extras_explicit: 0,
             x86_prefer_vector_bits: None,
             x86_march: None,
+            pack_struct_cap: None,
+            pack_struct_all: false,
             general_regs_only: false,
             code_model_kernel: false,
             no_jump_tables: false,
@@ -1578,6 +1592,7 @@ impl Driver {
             let mut parser = Parser::new(tokens);
             parser.set_diagnostics(diagnostics);
             parser.set_c23(self.c23_dialect());
+            parser.set_pack_struct(self.pack_struct_cap, self.pack_struct_all);
             let ast = parser.parse();
             let diagnostics = parser.take_diagnostics();
             // Lexer diagnostics were seeded into this engine before parsing.
@@ -3154,6 +3169,7 @@ impl Driver {
         let mut parser = Parser::new(tokens);
         parser.set_diagnostics(diagnostics);
         parser.set_c23(self.c23_dialect());
+        parser.set_pack_struct(self.pack_struct_cap, self.pack_struct_all);
         // Code generation runs the post-optimization asm-constraint validator,
         // which can prove local constant initializers and inlined arguments
         // that the parser alone cannot classify. Syntax-only mode deliberately

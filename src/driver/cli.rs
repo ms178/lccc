@@ -31,7 +31,7 @@
 //! | `-std=<unrecognized>` | **hard error** with a suggestion (a wrong dialect silently mis-parses headers) |
 //! | `-std=<known>`, `-ansi` | implemented: `-ansi` is `-std=c90` (measured on GCC: no `__STDC_VERSION__`, `__STRICT_ANSI__` defined) |
 //! | *contract* flags — `-fstack-protector*`, `-ftrapv`, `-fsanitize=` | **hard error** + remediation hint (upstream's original rule) |
-//! | data-model / ABI requests — `-fshort-enums`, `-fpack-struct[=n]` | **hard error**, because ignoring one silently returns objects whose layout disagrees with the libraries they link against. `-funsigned-char` and `-fshort-wchar` are *not* here: both are implemented (`char_is_unsigned()` / `set_short_wchar`), and `-fsigned-char` names the x86-64 SysV default LCCC already emits |
+//! | data-model / ABI requests — `-fshort-enums` | **hard error**, because ignoring one silently returns objects whose layout disagrees with the libraries they link against. `-funsigned-char`, `-fshort-wchar` and `-fpack-struct[=n]` are *not* here: all three are implemented (`char_is_unsigned()` / `set_short_wchar` / `Parser::set_pack_struct`), and `-fsigned-char` names the x86-64 SysV default LCCC already emits |
 //! | `-g<selector>` that GNU rejects (`-g4`, `-ggdb9`, `-gdwarf-9`, `-gz=bogus`, `-gno-bogus`, `-gbogus`) | **hard error** — the selector grammar is closed and was measured exhaustively, so a name outside it is a typo, not a newer GNU (GCC 14.2/16.2, Clang 23.1 and ICX all reject these) |
 //! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>`, `-fno-delete-null-pointer-checks` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured; for the `-f` spelling, nine measured null-guard shapes keep their checks with and without the flag, pinned by `tests/regression/check_nullptr_check_policy.sh`) |
 //! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
@@ -1828,10 +1828,11 @@ impl Driver {
                 && tune != "native"
                 && !x86_tune_name_valid(tune, x86_64)
             {
+                let spelling = self.x86_tune_spelling.as_deref().unwrap_or("-mtune=");
                 return Err(if x86_64 && x86_tune_name_valid(tune, false) {
-                    format!("-mtune={tune} is only valid with -m32/-m16 (i686 target)")
+                    format!("{spelling}{tune} is only valid with -m32/-m16 (i686 target)")
                 } else {
-                    format!("unsupported x86 -mtune={tune}")
+                    format!("unsupported x86 {spelling}{tune}")
                 });
             }
         }
@@ -3250,6 +3251,34 @@ impl Driver {
                         }
                     };
                 }
+                arg if arg.starts_with("-mcpu=") => {
+                    // GCC on x86: `-mcpu=` is the deprecated alias of
+                    // `-mtune=` (warning measured on GCC 14.2/16.2; a bogus
+                    // value is then rejected by the same `-mtune=`
+                    // vocabulary check below). It never selected an ISA
+                    // there, so it must not touch `-march=` state here
+                    // either. On non-x86 targets `-mcpu=` keeps the
+                    // `-mtune=` arm's refusal until those backends grow a
+                    // CPU table of their own.
+                    let tune = &arg["-mcpu=".len()..];
+                    match self.target {
+                        Target::X86_64 | Target::I686 => {
+                            lccc::cli::stderr_line(format_args!(
+                                "lccc: warning: '-mcpu=' is deprecated; use '-mtune=' \
+                                 or '-march=' instead"
+                            ));
+                            self.x86_tune = Some(tune.to_string());
+                            self.x86_tune_spelling = Some("-mcpu=".to_string());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "-mcpu={} is not implemented for target {}",
+                                tune,
+                                self.target.triple()
+                            ));
+                        }
+                    }
+                }
                 arg if arg.starts_with("-mtune=") => {
                     let tune = &arg["-mtune=".len()..];
                     match self.target {
@@ -3257,6 +3286,7 @@ impl Driver {
                             // Validated after parsing, once `-m32` is known
                             // (GCC's vocabulary depends on the mode).
                             self.x86_tune = Some(tune.to_string());
+                            self.x86_tune_spelling = Some("-mtune=".to_string());
                         }
                         _ => {
                             return Err(format!(
@@ -4034,7 +4064,7 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 // data-model refusal.
                 // `-fshort-wchar` is NOT in this arm either: LCCC implements
                 // it (`set_short_wchar`, dedicated arm above).
-                a @ ("-fshort-enums" | "-fpack-struct") => {
+                a @ "-fshort-enums" => {
                     return Err(format!(
                         "{}: LCCC does not implement this data-model request, and \
                          ignoring it would silently produce objects whose layout or \
@@ -4042,12 +4072,29 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                         a
                     ));
                 }
+                // `-fpack-struct` / `-fpack-struct=<n>` are implemented, not
+                // refused: the bare form packs every record like
+                // `__attribute__((packed))`, the valued form seeds the
+                // `#pragma pack` baseline at <n> (see
+                // `Parser::set_pack_struct`). GCC rejects a value that is
+                // not a small power of two with exactly this wording.
+                "-fpack-struct" => {
+                    self.pack_struct_all = true;
+                    self.pack_struct_cap = None;
+                }
                 arg if arg.starts_with("-fpack-struct=") => {
-                    return Err(format!(
-                        "{}: LCCC does not implement packed struct layouts; define the \
-                         struct with __attribute__((packed)) instead",
-                        arg
-                    ));
+                    let raw = &arg["-fpack-struct=".len()..];
+                    match raw.parse::<usize>() {
+                        Ok(n) if crate::common::types::valid_pragma_pack_alignment(n) && n != 0 => {
+                            self.pack_struct_cap = Some(n);
+                            self.pack_struct_all = false;
+                        }
+                        _ => {
+                            return Err(format!(
+                                "structure alignment must be a small power of two, not {raw}"
+                            ));
+                        }
+                    }
                 }
                 // NOTE: there used to be a blanket `arg if arg.starts_with("-f") => {}`
                 // here. It made every unimplemented `-f` option -- including
@@ -5368,6 +5415,76 @@ mod cli_tests {
         assert!(err.contains("only valid with -m32"), "{err}");
         let err = parse(&["ccc", "-m32", "-mapxf", "x.c"]).expect_err("-m32 -mapxf");
         assert!(err.contains("not supported for 32-bit code"), "{err}");
+    }
+
+    /// `-mcpu=` on x86 is GCC's deprecated `-mtune=` alias: it fills the
+    /// same tune slot (validated by the same vocabulary check), never the
+    /// `-march=` slot, and a bogus value is refused exactly like a bogus
+    /// `-mtune=` (GCC 14.2/16.2 measured).
+    #[test]
+    fn mcpu_is_a_deprecated_mtune_alias_on_x86() {
+        let mut d = Driver::new();
+        let owned: Vec<String> = ["ccc", "-mcpu=core2", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        d.parse_cli_args(&owned).expect("-mcpu=core2 must parse");
+        assert_eq!(d.x86_tune.as_deref(), Some("core2"));
+        assert_eq!(d.x86_march, None, "-mcpu must not select an ISA");
+
+        let mut d = Driver::new();
+        let owned: Vec<String> = ["ccc", "-mcpu=bogus123", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = d
+            .parse_cli_args(&owned)
+            .expect_err("bogus -mcpu must be refused like bogus -mtune");
+        assert!(err.contains("bogus123"), "{err}");
+
+        // Last spelling wins across the alias boundary, as with GCC.
+        let mut d = Driver::new();
+        let owned: Vec<String> = ["ccc", "-mtune=core2", "-mcpu=znver3", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        d.parse_cli_args(&owned)
+            .expect("mixed tune spellings parse");
+        assert_eq!(d.x86_tune.as_deref(), Some("znver3"));
+    }
+
+    /// `-fpack-struct[=<n>]`: bare packs all records, `=<n>` seeds the
+    /// pragma-pack baseline; a later spelling replaces an earlier one and
+    /// a non-power-of-two (or out-of-range) value is a hard error with
+    /// GCC's wording, never a silent no-op.
+    #[test]
+    fn pack_struct_spellings_and_validation() {
+        let mut d = Driver::new();
+        let owned: Vec<String> = ["ccc", "-fpack-struct", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        d.parse_cli_args(&owned).expect("bare -fpack-struct parses");
+        assert!(d.pack_struct_all);
+        assert_eq!(d.pack_struct_cap, None);
+
+        let mut d = Driver::new();
+        let owned: Vec<String> = ["ccc", "-fpack-struct=2", "-fpack-struct", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        d.parse_cli_args(&owned).expect("later bare form parses");
+        assert!(d.pack_struct_all, "later bare spelling wins");
+        assert_eq!(d.pack_struct_cap, None);
+
+        let mut d = Driver::new();
+        let owned: Vec<String> = ["ccc", "-fpack-struct", "-fpack-struct=4", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        d.parse_cli_args(&owned).expect("later valued form parses");
+        assert!(!d.pack_struct_all, "valued spelling clears the bare form");
+        assert_eq!(d.pack_struct_cap, Some(4));
     }
 
     /// Stack alignment: a request for <= 16 bytes is permission to align less
@@ -7265,8 +7382,12 @@ mod cli_tests {
             "-fvisibility=bogus",
             "-ftrivial-auto-var-init=bogus",
             "-fshort-enums",
-            "-fpack-struct",
-            "-fpack-struct=1",
+            // Implemented below, so only its invalid values are refused
+            // (GCC: "structure alignment must be a small power of two").
+            "-fpack-struct=0",
+            "-fpack-struct=3",
+            "-fpack-struct=32",
+            "-fpack-struct=bogus",
             "-std=obscure-dialect",
         ] {
             assert!(try_flag(arg).is_err(), "{arg} must be refused");
@@ -7288,6 +7409,14 @@ mod cli_tests {
             // `set_short_wchar` plumbs the 16-bit `wchar_t` request.
             "-funsigned-char",
             "-fshort-wchar",
+            // Implemented: bare packs every record, `=<n>` seeds the
+            // `#pragma pack` baseline (GCC 14.2/16.2 measured layouts).
+            "-fpack-struct",
+            "-fpack-struct=1",
+            "-fpack-struct=2",
+            "-fpack-struct=4",
+            "-fpack-struct=8",
+            "-fpack-struct=16",
             "-ftrapv",
             "-fno-trapv",
             "-fno-plt",
