@@ -706,3 +706,180 @@ mod substitution_layering_tests {
         );
     }
 }
+
+/// Operand roles for a packed/vector FMA3 instruction, per the Intel SDM.
+///
+/// FMA3's digit triple is not a flavour of one instruction: each names a
+/// DIFFERENT assignment of the destination register to `vfmadd132ps`,
+/// `vfmadd213ps` and `vfmadd231ps`. The pseudocode is
+///
+/// ```text
+/// 132:  dst = dst  * src3 + src2     destination is multiplicand 1
+/// 213:  dst = src2 * dst  + src3     destination is multiplicand 2
+/// 231:  dst = src2 * src3 + dst      destination is the ADDEND
+/// ```
+///
+/// so an emitter that places `args = [a, b, c]` for `a*b + c` in one fixed
+/// assignment gets exactly one of the three right. Measured consequences with
+/// `a=3, b=5, c=7` (all three owe 22.0) are in `fma_role_digits`'s callers.
+///
+/// Lives here rather than in either backend because BOTH backends emit these
+/// and the placement is a property of the instruction, not of the target: the
+/// 32-bit backend emitted `vfmadd213ps %ymm1, %ymm2, %ymm0` -- the 132
+/// placement -- for all six ops, mis-computing 213 and 231 on any AVX2-capable
+/// i686 target while x86-64 had been fixed.
+///
+/// `#[derive(PartialEq, Eq)]` so tests can compare roles directly instead of
+/// matching on names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FmaRoleOrder {
+    /// `rm = b, vvvv = c, dst = a` -- computes `a*b + c` when the destination
+    /// holds `a`. This is the 132 placement.
+    RmBVvvvCDstA,
+    /// `rm = c, vvvv = a, dst = b` -- computes `a*b + c` when the destination
+    /// holds `b` and the ADDEND sits in the first source slot.
+    RmCVvvvADstB,
+    /// `rm = b, vvvv = a, dst = c` -- computes `a*b + c` when the destination
+    /// holds the addend, which is what 231 is for.
+    RmBVvvvADstC,
+}
+
+/// The operation digits of a `vfmadd{digits}{ps,pd}[v]{width}` mnemonic.
+///
+/// Only the digits between the `fmadd` prefix and the first non-digit are the
+/// operation field. Collecting every digit in the string would splice the
+/// width suffix into it: `vfmadd213ps128` would read as `"213128"`, miss both
+/// arms and take the 132 default -- silently reintroducing the very defect the
+/// per-digit placement exists to fix. The table keys are
+/// `fmadd{digits}ps128` and `vfmadd{digits}ps256`/`...512` (see
+/// `expr_builtins_lcccsimd`), so the operation field always starts right after
+/// `fmadd`.
+pub(crate) fn fma_role_digits(mnemonic: &str) -> &str {
+    let after = match mnemonic.find("fmadd") {
+        Some(i) => &mnemonic[i + "fmadd".len()..],
+        None => mnemonic,
+    };
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    &after[..end]
+}
+
+/// Map a `vfmadd{digits}{ps,pd}[v]{width}` mnemonic onto its role order.
+///
+/// Anything unrecognised gets the 132 placement: it is the one every public
+/// `_mm_fmadd_*` macro uses, so a new or misspelled mnemonic keeps the
+/// conservative mapping rather than picking up an arbitrary permutation.
+pub(crate) fn fma_role_order(mnemonic: &str) -> FmaRoleOrder {
+    match fma_role_digits(mnemonic) {
+        "213" => FmaRoleOrder::RmCVvvvADstB,
+        "231" => FmaRoleOrder::RmBVvvvADstC,
+        _ => FmaRoleOrder::RmBVvvvCDstA,
+    }
+}
+
+#[cfg(test)]
+mod fma_role_tests {
+    use super::{FmaRoleOrder, fma_role_digits, fma_role_order};
+
+    /// Every mnemonic shape either backend can hand `fma_role_order`, with the
+    /// role it must decode to.
+    ///
+    /// The width-suffixed rows are the regression that mattered: reading every
+    /// digit in the mnemonic turned `vfmadd213ps128` into `"213128"`, which
+    /// missed both arms and fell through to the 132 placement -- silently
+    /// mis-computing 213 exactly the way the un-fixed emitter did. Both suffix
+    /// conventions are covered because the table really does use both
+    /// (128-bit keys carry no `v`; 256/512 keep it).
+    #[test]
+    fn every_mnemonic_shape_decodes_to_its_own_placement() {
+        for (mnemonic, want) in [
+            // Bare operation field: what the emit sites pass.
+            ("vfmadd132ps", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmadd213ps", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmadd231ps", FmaRoleOrder::RmBVvvvADstC),
+            // 128-bit table keys.
+            ("fmadd132ps128", FmaRoleOrder::RmBVvvvCDstA),
+            ("fmadd213ps128", FmaRoleOrder::RmCVvvvADstB),
+            ("fmadd231pd128", FmaRoleOrder::RmBVvvvADstC),
+            ("fmadd213pd128", FmaRoleOrder::RmCVvvvADstB),
+            // 256/512-bit table keys.
+            ("vfmadd132ps256", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmadd213ps256", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmadd231pd256", FmaRoleOrder::RmBVvvvADstC),
+            ("vfmadd213pd512", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmadd231ps512", FmaRoleOrder::RmBVvvvADstC),
+            // The `...v{width}` shape the 256-bit dispatch used to present.
+            ("vfmadd213pdv256", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmadd231psv512", FmaRoleOrder::RmBVvvvADstC),
+            // Fallbacks: unknown digits, no digits, and a non-FMA name must
+            // all take the conservative 132 placement rather than inventing a
+            // permutation.
+            ("vfmadd999ps", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmaddps", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfmaddsoftps", FmaRoleOrder::RmBVvvvCDstA),
+            ("", FmaRoleOrder::RmBVvvvCDstA),
+        ] {
+            assert_eq!(fma_role_order(mnemonic), want, "`{mnemonic}`");
+        }
+    }
+
+    /// Only the operation field is extracted: a width suffix must never join
+    /// it.
+    #[test]
+    fn only_the_operation_digits_are_extracted() {
+        assert_eq!(fma_role_digits("vfmadd132ps"), "132");
+        assert_eq!(fma_role_digits("vfmadd213ps128"), "213");
+        assert_eq!(fma_role_digits("vfmadd231pd512"), "231");
+        assert_eq!(fma_role_digits("vfmadd213pdv256"), "213");
+        // No `fmadd` at all: the whole string is scanned, and a leading
+        // non-digit means an empty field rather than a panic.
+        assert_eq!(fma_role_digits("vfmsub132ps"), "");
+        assert_eq!(fma_role_digits(""), "");
+    }
+
+    /// The table is only worth anything if the three placements really compute
+    /// `a*b + c`. Evaluate each role assignment against the SDM's pseudocode
+    /// for its digit triple, for several inputs, instead of comparing names to
+    /// names.
+    #[test]
+    fn every_placement_computes_a_times_b_plus_c() {
+        /// SDM pseudocode, with `dst`/`src2`(=vvvv)/`src3`(=rm) as named slots.
+        fn sdm(digits: &str, dst: f64, src2: f64, src3: f64) -> f64 {
+            match digits {
+                "132" => dst * src3 + src2,
+                "213" => src2 * dst + src3,
+                "231" => src2 * src3 + dst,
+                other => panic!("no FMA3 pseudocode for {other}"),
+            }
+        }
+        for (a, b, c) in [
+            (3.0, 5.0, 7.0),
+            (1.0, 0.0, 0.0),
+            (-2.0, 4.5, -0.5),
+            (1e300, 1e-300, 2.0),
+        ] {
+            for (digits, role) in [
+                ("132", FmaRoleOrder::RmBVvvvCDstA),
+                ("213", FmaRoleOrder::RmCVvvvADstB),
+                ("231", FmaRoleOrder::RmBVvvvADstC),
+            ] {
+                // Slot contents: register 0 holds `a`, 1 `b`, 2 `c`.
+                let regs = [a, b, c];
+                let slot = |name: &str| match name {
+                    "a" => regs[0],
+                    "b" => regs[1],
+                    _ => regs[2],
+                };
+                let (rm, vvvv, dst) = match role {
+                    FmaRoleOrder::RmBVvvvCDstA => ("b", "c", "a"),
+                    FmaRoleOrder::RmCVvvvADstB => ("c", "a", "b"),
+                    FmaRoleOrder::RmBVvvvADstC => ("b", "a", "c"),
+                };
+                let got = sdm(digits, slot(dst), slot(vvvv), slot(rm));
+                let want = a * b + c;
+                assert_eq!(got, want, "{digits} with a={a} b={b} c={c}");
+            }
+        }
+    }
+}

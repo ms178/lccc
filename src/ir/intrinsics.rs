@@ -2666,6 +2666,33 @@ impl IntrinsicOp {
                 | IntrinsicOp::LoaduPs256
                 | IntrinsicOp::LoaduPd256
                 | IntrinsicOp::Loadu512
+                // SA-12: masked loads dereference their pointer argument
+                // exactly like the unmasked family above -- the x86 emitter
+                // turns `args[1]` into `vmovdqu8 (%rax), %zmm0{k1}{z}` (and
+                // `sse_load_arg` for the legacy `Loaddqu`).  They were
+                // missing, so `reads_pointer_arg` derived `false` for a
+                // memory reader; the three audited consumers (DSE's opaque
+                // kill, LICM's pure-hoist gate, `ip_purity`'s nonlocal-read
+                // flag) each failed closed through a *different* unrelated
+                // predicate -- a coincidence, not a contract.  Listing them
+                // also gives the derive in `reads_pointer_arg` the right
+                // answer instead of relying on `produces_vector_value`.
+                | IntrinsicOp::MaskzLoaduEpi8_128
+                | IntrinsicOp::MaskzLoaduEpi8_256
+                | IntrinsicOp::MaskzLoaduEpi8_512
+                | IntrinsicOp::MaskLoaduEpi8_128
+                | IntrinsicOp::MaskLoaduEpi8_256
+                | IntrinsicOp::MaskLoaduEpi8_512
+                // `MaskzLoaduEpi32_512`/`Epi64_512` are declared but have no
+                // emitter arm yet, so they cannot reach a memory operand
+                // today; they are listed here anyway because the moment an
+                // arm lands the classification must already be conservative.
+                // `Loaddqu` (legacy `movdqu`) and `Loadldi128` (legacy
+                // `movq` low-half load) do have arms and do dereference.
+                | IntrinsicOp::MaskzLoaduEpi32_512
+                | IntrinsicOp::MaskzLoaduEpi64_512
+                | IntrinsicOp::Loaddqu
+                | IntrinsicOp::Loadldi128
         )
     }
 
@@ -3769,6 +3796,121 @@ mod memory_classification_tests {
                 "{op:?} is a load, not a memory writer"
             );
         }
+    }
+
+    /// SA-12 anti-drift sweep: a load opcode that a source-level intrinsic
+    /// can reach must be classified as a memory reader.
+    ///
+    /// The `may_read_memory` list is hand-maintained, so it drifted: the eight
+    /// masked loads (`MaskzLoadu*`/`MaskLoadu*`) and the two legacy loads
+    /// (`Loaddqu`, `Loadldi128`) all dereference a user pointer in the x86
+    /// emitter -- `vmovdqu8 (%rax), %reg{k1}` / `movdqu (%rax)` / `movq` --
+    /// yet none was listed.  `reads_pointer_arg` therefore derived `false`,
+    /// i.e. "no pointer operand", for a memory reader.
+    ///
+    /// This test is the structural half of the fix: the *naming* contract for
+    /// load opcodes is that the variant is spelled `Load*`, `MaskLoad*`,
+    /// `MaskzLoad*` or `Loadu*`.  Any new opcode matching that prefix and not
+    /// reading memory is a red build, forcing the author to either list it or
+    /// rename it.  `LoadStackGuard` is the single legitimate exception: it
+    /// reads thread-local process state through `%fs:0`, never through a
+    /// pointer argument, so it is reachable only from the prologue emitter
+    /// and never carries `args[1]`.
+    #[test]
+    fn every_load_named_opcode_is_classified_as_a_memory_reader() {
+        // `include_str!` pins the enum text at compile time, so this sweep
+        // cannot drift from the real variant list the way a hand-copied array
+        // does.  (The array below is still needed because there is no runtime
+        // reflection over an enum without a derive macro; the parse proves the
+        // array is COMPLETE, which is the direction that catches the bug.)
+        const SOURCE: &str = include_str!("intrinsics.rs");
+        let enum_body = {
+            let start = SOURCE
+                .find("pub enum IntrinsicOp {")
+                .expect("IntrinsicOp enum moved; update this sweep");
+            let rest = &SOURCE[start..];
+            let end = rest.find("\n}\n").expect("unterminated IntrinsicOp enum");
+            &rest[..end]
+        };
+        let load_named_from_source: Vec<&str> = enum_body
+            .lines()
+            .filter_map(|line| {
+                let name = line.strip_prefix("    ")?.trim_end_matches(',');
+                let bare = name.strip_suffix('{').unwrap_or(name);
+                let is_plain_ident = !bare.is_empty()
+                    && bare.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                let is_load_named = bare.starts_with("Load")
+                    || bare.starts_with("MaskLoad")
+                    || bare.starts_with("MaskzLoad");
+                (is_plain_ident && is_load_named).then_some(bare)
+            })
+            .collect();
+        assert!(
+            load_named_from_source.len() >= 18,
+            "load-opcode sweep collapsed ({:?}); the parser is broken",
+            load_named_from_source
+        );
+
+        // The only load-named variant with no pointer operand in `args`: it
+        // reads thread-local process state through `%fs:0`, never a pointer.
+        const NO_POINTER_ARG: &[&str] = &["LoadStackGuard"];
+        let enumerated = [
+            O::Loaddqu,
+            O::Loadldi128,
+            O::Loadu256Raw,
+            O::Loadu256,
+            O::Load256,
+            O::LoaduPs256,
+            O::LoaduPd256,
+            O::Loadu512,
+            O::LoadF64x2,
+            O::LoadF64x4,
+            O::LoadI32x4,
+            O::LoadI32x8,
+            O::MaskzLoaduEpi8_128,
+            O::MaskzLoaduEpi8_256,
+            O::MaskzLoaduEpi8_512,
+            O::MaskzLoaduEpi32_512,
+            O::MaskzLoaduEpi64_512,
+            O::MaskLoaduEpi8_128,
+            O::MaskLoaduEpi8_256,
+            O::MaskLoaduEpi8_512,
+        ];
+        // COMPLETENESS: every load-named variant in the enum is enumerated.
+        for name in &load_named_from_source {
+            if *name == "LoadStackGuard" {
+                continue;
+            }
+            assert!(
+                enumerated.iter().any(|op| format!("{op:?}") == *name),
+                "{name} is load-named but missing from this sweep; add it and \
+                 classify it (SA-12)"
+            );
+        }
+        for op in enumerated {
+            let name = format!("{op:?}");
+            if NO_POINTER_ARG.contains(&name.as_str()) {
+                assert!(!op.may_read_memory(), "{op:?} reads no pointer argument");
+                continue;
+            }
+            assert!(
+                op.may_read_memory(),
+                "{op:?} dereferences its pointer argument and must be listed \
+                 in may_read_memory (SA-12)"
+            );
+            assert!(
+                op.reads_pointer_arg(),
+                "{op:?} must allow a pointer argument"
+            );
+            assert!(
+                !op.writes_memory_via_args(),
+                "{op:?} is a load, not a writer"
+            );
+        }
+        // The exception really is an exception: nothing derives read-ness
+        // from it, so listing it would be a lie in the other direction.
+        assert!(!O::LoadStackGuard.may_read_memory());
     }
 
     /// Round 8 metadata contract for the two new masked-fold producers.

@@ -1920,6 +1920,27 @@ gate "aligned-vector-reload" fast \
 gate "aligned-vector-reload-contracts" fast \
     python3 tests/simd/test_check_aligned_vector_reload.py
 
+# SA-10: the lane-mask select must mean the same thing at every ISA level and
+# that meaning is the Intel sign-bit contract for the FP forms (a per-lane
+# sign select) and the per-BIT contract for `_mm_blendv_epi8`.  The invariance
+# leg needs no reference compiler; the contract leg uses an independent Python
+# model, so the gate is meaningful wherever `python3` exists.
+gate "blendv-lane-semantics" fast \
+    bash tests/regression/check_blendv_lane_semantics.sh --lccc target/fastbuild/lccc
+# ... and it must go RED on the pre-fix lowering, or it is decoration.
+gate "blendv-lane-semantics-nonvacuity" fast \
+    bash tests/regression/check_blendv_lane_semantics.sh \
+    --lccc tests/regression/blendv_prefix_standin.sh --expect-defect
+
+# SA-11: all three FMA3 digit spellings must compute a*b+c.  Measured pre-fix
+# with a=3, b=5, c=7: 132 -> 22.0 (right), 213 -> 26.0, 231 -> 38.0 (both
+# WRONG, via one shared operand placement).
+gate "fma-digit-permutation" fast \
+    bash tests/regression/check_fma_digit_permutation.sh --lccc target/fastbuild/lccc
+gate "fma-digit-permutation-nonvacuity" fast \
+    bash tests/regression/check_fma_digit_permutation.sh \
+    --lccc tests/regression/fma_prefix_standin.sh --expect-defect
+
 gate "kernel-tree-clear" fast bash tests/regression/check_kernel_tree_clear.sh
 # The shared mount-table helper and the chroot/kernel-tree root guards.
 gate "destructive-path-guards" fast bash tests/regression/check_destructive_guards.sh

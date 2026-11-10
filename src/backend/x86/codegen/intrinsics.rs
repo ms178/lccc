@@ -100,6 +100,16 @@ impl core::fmt::Display for VecArgSrc {
             VecArgSrc::Reg(r) => write!(f, "%{}", r),
         }
     }
+
+/// Per-lane width of an SSE2 lane-mask select (`vblendvps`/`vblendvpd`
+/// semantics).  `None` at the call site means "no canonicalization": the
+/// producing IR op's contract is a per-BIT select, so the raw mask is already
+/// correct.  `Dword` is `_mm_blendv_ps` (sign bit 31 of each 32-bit lane),
+/// `Qword` is `_mm_blendv_pd` (sign bit 63 of each 64-bit lane).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SseBlendvLane {
+    Dword,
+    Qword,
 }
 
 impl X86Codegen {
@@ -2029,7 +2039,7 @@ impl X86Codegen {
     /// downstream consumer of the pending/last-store machinery is
     /// register-name-generic, so the deferral and register-cache
     /// behaviour is identical to the %ymm0 spelling.
-    fn avx_store_dest_from(&mut self, dest_ptr: &Value, src: &'static str) {
+    pub(super) fn avx_store_dest_from(&mut self, dest_ptr: &Value, src: &'static str) {
         // 256-bit store paths read the full YMM register; the earlier load
         // already dirtied it, but mark defensively (a broadcast-only body
         // could reach here through a register-copy path).
@@ -7138,7 +7148,13 @@ impl X86Codegen {
                 if let Some(d) = dest {
                     // Dword lanes: the vblendvps sign-bit select is exact
                     // at the lane granularity under SSE4.1+AVX2.
-                    if self.isa.sse41 && self.avx2_enabled {
+                    // VEX select: `vblendvps` and `vpblendvb` are
+                    // VEX.128.66.0F3A.W0 4A / 4C -- plain AVX, not AVX2 (see
+                    // the gate note in `emit_sse_blendv_128`).  Requiring
+                    // `-mavx2` here made a `-mavx -mno-avx2` target pay the
+                    // bitwise triple for a blend AVX encodes in one
+                    // instruction.
+                    if self.isa.avx {
                         self.emit_blendv_128_vex(d, args, "vblendvps");
                     } else {
                         self.emit_sse_blendv_128_int(d, args);
@@ -7434,7 +7450,13 @@ impl X86Codegen {
                     // DWORD `vblendvps` would read only the HIGH word's
                     // mask into bits 31 of each dword — wrong whenever a
                     // dword's two word lanes disagree.
-                    if self.isa.sse41 && self.avx2_enabled {
+                    // VEX select: `vblendvps` and `vpblendvb` are
+                    // VEX.128.66.0F3A.W0 4A / 4C -- plain AVX, not AVX2 (see
+                    // the gate note in `emit_sse_blendv_128`).  Requiring
+                    // `-mavx2` here made a `-mavx -mno-avx2` target pay the
+                    // bitwise triple for a blend AVX encodes in one
+                    // instruction.
+                    if self.isa.avx {
                         self.emit_blendv_128_vex(d, args, "vpblendvb");
                     } else {
                         self.emit_sse_blendv_128_int(d, args);
@@ -7544,7 +7566,13 @@ impl X86Codegen {
                     // Byte lanes: `vpblendvb` (per-BYTE sign select) is
                     // the exact one-instruction form; the dword blend
                     // would smear one mask bit across four bytes.
-                    if self.isa.sse41 && self.avx2_enabled {
+                    // VEX select: `vblendvps` and `vpblendvb` are
+                    // VEX.128.66.0F3A.W0 4A / 4C -- plain AVX, not AVX2 (see
+                    // the gate note in `emit_sse_blendv_128`).  Requiring
+                    // `-mavx2` here made a `-mavx -mno-avx2` target pay the
+                    // bitwise triple for a blend AVX encodes in one
+                    // instruction.
+                    if self.isa.avx {
                         self.emit_blendv_128_vex(d, args, "vpblendvb");
                     } else {
                         self.emit_sse_blendv_128_int(d, args);
@@ -11963,15 +11991,25 @@ impl X86Codegen {
         domain: BlendvDomain,
     ) {
         assert!(args.len() == 3, "blendv128: expects false, true, mask");
-        // SSE4.1+AVX2 takes the ONE-instruction VEX lane select first.
-        // The FP compares produce per-DWORD masks (cmpps) or per-QWORD
-        // masks (cmppd, whose two dwords agree), so the dword-granular
-        // vblendvps/vblendvpd sign select is exact for both FP widths.
-        // Legacy SSE4.1-only targets keep the 3-op andps/andnps/orps
-        // select: blendvps carries its mask IMPLICITLY in %xmm0 there
-        // (a different, destructive encoding) and vblendvps without VEX
-        // is a guaranteed SIGILL.
-        if self.isa.sse41 && self.avx2_enabled {
+        // VEX takes the ONE-instruction lane select first.
+        //
+        // The gate used to be `sse41 && avx2_enabled`, which is the `-mavx2`
+        // permission.  That is one ISA level too strict: `vblendvps` and
+        // `vblendvpd` are VEX.128.66.0F3A.W0 4A / VEX.128.66.0F3A.W0 4B —
+        // plain **AVX**, not AVX2 (verified by round-tripping the encoding
+        // through `as`/`objdump`).  So a `-mavx -mno-avx2` target was paying
+        // the three-instruction `andps/andnps/orps` select plus a mask
+        // canonicalization for no reason.  Gating on `isa.avx` instead makes
+        // that target two/three instructions lighter per blend and is
+        // exactly the feature the mnemonics require.
+        //
+        // `isa.sse41` is no longer part of the condition because it was only
+        // ever a proxy for "has blendv": the VEX form needs VEX, not SSE4.1.
+        // Legacy SSEx-only targets keep the bitwise triple (with the SA-10
+        // mask canonicalization): the legacy `blendvps` carries its mask
+        // IMPLICITLY in %xmm0, a different and destructive encoding, and
+        // `vblendvps` without VEX is a guaranteed SIGILL.
+        if self.isa.avx {
             let inst = match domain {
                 BlendvDomain::Pd => "vblendvpd",
                 _ => "vblendvps",
@@ -11984,7 +12022,12 @@ impl X86Codegen {
             BlendvDomain::Pd => ("andpd", "andnpd", "orpd"),
             BlendvDomain::Int => ("pand", "pandn", "por"),
         };
-        self.emit_sse_blendv_128_mnemonics(dest, args, and, andn, or);
+        let lane = match domain {
+            BlendvDomain::Ps => Some(SseBlendvLane::Dword),
+            BlendvDomain::Pd => Some(SseBlendvLane::Qword),
+            BlendvDomain::Int => None,
+        };
+        self.emit_sse_blendv_128_mnemonics_granular(dest, args, and, andn, or, lane);
     }
 
     /// Integer-domain lane-mask select (SSE2): pand/pandn/por — see
@@ -12053,6 +12096,18 @@ impl X86Codegen {
         andn: &str,
         or: &str,
     ) {
+        self.emit_sse_blendv_128_mnemonics_granular(dest, args, and, andn, or, None);
+    }
+
+    fn emit_sse_blendv_128_mnemonics_granular(
+        &mut self,
+        dest: &Value,
+        args: &[Operand],
+        and: &str,
+        andn: &str,
+        or: &str,
+        lane: Option<SseBlendvLane>,
+    ) {
         // No leading flush: a deferred mask still held in %xmm0 must keep
         // its cache hit (the mask load below consumes it in place).  The
         // mask/true loads then commit or consume any other pending store,
@@ -12064,6 +12119,35 @@ impl X86Codegen {
             return;
         }
         self.sse_load_arg(&args[2], "xmm1");
+        // SA-10: the bitwise triple is a PER-BIT select, while the VEX path
+        // this target would otherwise take (`vblendvps`/`vblendvpd`) -- and
+        // the documented IR contract of `VecBlendvF32x4`/`VecBlendvF64x2` --
+        // is a PER-LANE select keyed on each lane's SIGN BIT.  The two agree
+        // only when every mask lane is all-ones or all-zeros, i.e. when the
+        // mask came from a compare.  An arbitrary mask does not: the public
+        // `_mm_blendv_ps` hands the caller's mask straight to this IR op, so
+        // a mask lane of 0x0000_0001 selected `true` per-bit on an
+        // SSE2/SSE4.1-without-AVX target but `false` on an AVX2 target --
+        // same source, same flags, different answer.  Broadcast each lane's
+        // sign bit across the lane first: `psrad $31` replicates a dword's
+        // bit 31 over its 32 bits; for qword lanes a second `pshufd $0xF5`
+        // replicates the HIGH dword over the pair, because a qword's sign bit
+        // is bit 63 (== bit 31 of the high dword).  Cost is 1-2 instructions
+        // on a target that has no one-instruction lane select at all, and
+        // zero on AVX2 (the VEX path returns before this helper runs), so
+        // the fast path is untouched.
+        if lane.is_some() {
+            // One `psrad` serves both widths: it replicates each DWORD's own
+            // sign over that dword, which is already the whole lane for a
+            // dword mask.
+            self.state.emit("    psrad $31, %xmm1");
+            if lane == Some(SseBlendvLane::Qword) {
+                // [s0,s0,s1,s1] -> [s1,s1,s1,s1]: a qword's sign bit is bit
+                // 63, i.e. bit 31 of its HIGH dword, so replicate dword 1
+                // over dwords 0-1 and dword 3 over dwords 2-3.
+                self.state.emit("    pshufd $0xF5, %xmm1, %xmm1");
+            }
+        }
         self.sse_load_arg(&args[1], "xmm0");
         self.state
             .emit_fmt(format_args!("    {} %xmm1, %xmm0", and));

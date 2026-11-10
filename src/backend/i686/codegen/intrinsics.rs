@@ -12,6 +12,7 @@
 use super::emit::I686Codegen;
 use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;
+use crate::backend::x86_common::{FmaRoleOrder, fma_role_order};
 use crate::emit;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
@@ -2154,7 +2155,8 @@ impl I686Codegen {
                 }
             }
 
-            // FMA 256 (a, b, c): vfmadd*ps/pd %ymm1, %ymm2, %ymm0.
+            // FMA 256: args = [a, b, c] -> `a*b + c`. The operand placement
+            // depends on the digit triple; see the per-role match below.
             IntrinsicOp::FmaPs132v256
             | IntrinsicOp::FmaPs213v256
             | IntrinsicOp::FmaPs231v256
@@ -2171,12 +2173,29 @@ impl I686Codegen {
                         IntrinsicOp::FmaPd231v256 => "vfmadd231pd",
                         _ => unreachable!("unexpected FMA op: {:?}", op),
                     };
-                    self.emit_avx_load(&args[0], "ymm0");
-                    self.emit_avx_load(&args[1], "ymm1");
-                    self.emit_avx_load(&args[2], "ymm2");
+                    // Each digit triple needs its OWN placement of
+                    // `args = [a, b, c]`: 132 puts `a` in the destination,
+                    // 213 puts `b` there, 231 puts the ADDEND `c` there.  The
+                    // uniform `%ymm1, %ymm2, %ymm0` this arm used to emit is
+                    // the 132 placement, so 213 and 231 mis-computed -- the
+                    // same defect x86-64 had, still present on this backend.
+                    // With a=3, b=5, c=7 that yields 26.0 for 213 and 38.0 for
+                    // 231, where all three owe 22.0.
+                    let (rm, vvvv, dst): (&'static str, &'static str, &'static str) =
+                        match fma_role_order(inst) {
+                            FmaRoleOrder::RmBVvvvCDstA => ("ymm1", "ymm2", "ymm0"),
+                            FmaRoleOrder::RmCVvvvADstB => ("ymm2", "ymm0", "ymm1"),
+                            FmaRoleOrder::RmBVvvvADstC => ("ymm1", "ymm0", "ymm2"),
+                        };
+                    self.emit_avx_load(&args[0], "ymm0"); // a
+                    self.emit_avx_load(&args[1], "ymm1"); // b
+                    self.emit_avx_load(&args[2], "ymm2"); // c
                     self.state
-                        .emit_fmt(format_args!("    {} %ymm1, %ymm2, %ymm0", inst));
-                    self.emit_avx_store_dest(dptr);
+                        .emit_fmt(format_args!("    {} %{rm}, %{vvvv}, %{dst}", inst));
+                    // Store the register the permutation wrote, not `%ymm0`:
+                    // only the 132 placement leaves its result there, so a
+                    // fixed `%ymm0` store published `a` for 213 and 231.
+                    self.emit_avx_store_dest_from(dptr, dst);
                 } else if dest.is_some() {
                     self.reject_value_form(op);
                 }
@@ -3135,8 +3154,20 @@ impl I686Codegen {
     /// Store %ymm0 to a 256-bit destination's slot and invalidate the
     /// accumulator cache (the address staging used %eax).
     fn emit_avx_store_dest(&mut self, dptr: &Value) {
+        self.emit_avx_store_dest_from(dptr, "ymm0");
+    }
+
+    /// `emit_avx_store_dest` with an explicit source register.
+    ///
+    /// Needed by every 256-bit FMA3 spelling: the digit permutation decides
+    /// which register holds the result (132 -> `%ymm0`, 213 -> `%ymm1`,
+    /// 231 -> `%ymm2`), so a store that always names `%ymm0` publishes a stale
+    /// operand for two of the three. The register cache and the upper-state
+    /// bookkeeping are independent of the register name, so they are unchanged.
+    fn emit_avx_store_dest_from(&mut self, dptr: &Value, src: &'static str) {
         self.operand_to_eax(&Operand::Value(*dptr));
-        self.state.emit("    vmovdqu %ymm0, (%eax)");
+        self.state
+            .emit_fmt(format_args!("    vmovdqu %{src}, (%eax)"));
         self.state.dirty_upper_ymm = true;
         self.state.reg_cache.invalidate_acc();
     }

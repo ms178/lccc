@@ -1880,6 +1880,14 @@ jobs:
       run: python3 tests/simd/check_aligned_vector_reload.py --lccc target/fastbuild/lccc
     - name: Verify the aligned-vector-reload ratchet contracts
       run: python3 tests/simd/test_check_aligned_vector_reload.py
+    - name: Lane-mask select must be target-invariant sign-bit semantics (SA-10)
+      run: bash tests/regression/check_blendv_lane_semantics.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: Prove the lane-mask gate goes red on the pre-fix lowering
+      run: bash tests/regression/check_blendv_lane_semantics.sh --lccc tests/regression/blendv_prefix_standin.sh --expect-defect
+    - name: Every FMA3 digit permutation must compute a*b+c (SA-11)
+      run: bash tests/regression/check_fma_digit_permutation.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: Prove the FMA digit gate goes red on the pre-fix placement
+      run: bash tests/regression/check_fma_digit_permutation.sh --lccc tests/regression/fma_prefix_standin.sh --expect-defect
     needs:
     - build
   backend:
