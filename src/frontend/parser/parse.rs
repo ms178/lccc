@@ -834,6 +834,18 @@ pub struct Parser {
     pub(super) pragma_pack_stack: Vec<Option<usize>>,
     /// Current #pragma pack alignment. None means default (natural) alignment.
     pub(super) pragma_pack_align: Option<usize>,
+    /// Command-line packing baseline from `-fpack-struct=<n>`: the value
+    /// `pragma_pack_align` starts at and the value `#pragma pack()` /
+    /// `#pragma pack(0)` restore (measured on GCC 14.2/16.2: a bare reset
+    /// returns to the command-line cap, not to natural alignment).
+    pub(super) pack_struct_cap: Option<usize>,
+    /// Bare `-fpack-struct`: every record definition is parsed as if it
+    /// carried `__attribute__((packed))`, and `#pragma pack` is ignored
+    /// with a `-Wpragmas` warning (both measured on GCC 14.2/16.2). This is
+    /// deliberately distinct from `pack_struct_cap == Some(1)`: the packed
+    /// attribute does not cap an explicitly aligned member, while a
+    /// `#pragma pack(1)`-style cap does.
+    pub(super) pack_struct_all: bool,
     /// Stack for #pragma GCC visibility push/pop.
     /// Each entry is the visibility string (e.g., "hidden", "default").
     pub(super) pragma_visibility_stack: Vec<String>,
@@ -1097,6 +1109,8 @@ impl Parser {
             attrs: ParsedDeclAttrs::default(),
             pragma_pack_stack: Vec::with_capacity(4),
             pragma_pack_align: None,
+            pack_struct_cap: None,
+            pack_struct_all: false,
             pragma_visibility_stack: Vec::with_capacity(4),
             pragma_default_visibility: None,
             func_decl_no_instrument: FxHashSet::default(),
@@ -1130,6 +1144,19 @@ impl Parser {
     /// Select the C23 dialect (see the `c23` field).
     pub fn set_c23(&mut self, enabled: bool) {
         self.c23 = enabled;
+    }
+
+    /// Apply the driver's `-fpack-struct[=<n>]` request before parsing.
+    ///
+    /// `cap == Some(n)` is the `-fpack-struct=<n>` form: it seeds the
+    /// `#pragma pack` state, so later pragmas override it and a bare reset
+    /// returns to it (GCC's measured behaviour). `all == true` is the bare
+    /// `-fpack-struct` form: every record is packed and `#pragma pack` is
+    /// inert. The two forms are mutually exclusive at the driver.
+    pub fn set_pack_struct(&mut self, cap: Option<usize>, all: bool) {
+        self.pack_struct_cap = cap;
+        self.pack_struct_all = all;
+        self.pragma_pack_align = cap;
     }
 
     /// Defer immediate-only inline-asm constness checks until optimized IR.
@@ -3745,6 +3772,31 @@ impl Parser {
     /// Check if current token is a pragma pack directive and handle it.
     /// Returns true if a pragma pack token was consumed.
     pub(super) fn handle_pragma_pack_token(&mut self) -> bool {
+        // Bare `-fpack-struct` makes every `#pragma pack` inert: GCC warns
+        // "'#pragma pack' has no effect with '-fpack-struct' - ignored"
+        // (-Wpragmas) and leaves the packed layout untouched. The token is
+        // still consumed so parsing continues at the next real token.
+        if self.pack_struct_all {
+            let is_pack_token = matches!(
+                self.peek(),
+                TokenKind::PragmaPackSet(_)
+                    | TokenKind::PragmaPackPush(_)
+                    | TokenKind::PragmaPackPushOnly
+                    | TokenKind::PragmaPackPop
+                    | TokenKind::PragmaPackReset
+            );
+            if is_pack_token {
+                let span = self.peek_span();
+                self.advance();
+                self.diagnostics.warning_with_kind(
+                    "'#pragma pack' has no effect with '-fpack-struct' - ignored",
+                    span,
+                    crate::common::error::WarningKind::Pragmas,
+                );
+                return true;
+            }
+            return false;
+        }
         match self.peek() {
             TokenKind::PragmaPackSet(n) => {
                 let n = *n;
@@ -3752,8 +3804,14 @@ impl Parser {
                 // Invalid operands must not affect layout (nor reach align_up,
                 // which assumes a power of two). The preprocessor records the
                 // frontend diagnostic and retains the marker for -E output.
+                // `pack(0)` restores the command-line baseline, which is
+                // natural alignment unless `-fpack-struct=<n>` seeded one.
                 if crate::common::types::valid_pragma_pack_alignment(n) {
-                    self.pragma_pack_align = if n == 0 { None } else { Some(n) };
+                    self.pragma_pack_align = if n == 0 {
+                        self.pack_struct_cap
+                    } else {
+                        Some(n)
+                    };
                 }
                 true
             }
@@ -3765,10 +3823,11 @@ impl Parser {
                 }
                 // Push current alignment onto stack
                 self.pragma_pack_stack.push(self.pragma_pack_align);
-                // pack(push, 0) means push and reset to default (natural alignment)
+                // pack(push, 0) means push and reset to the baseline
+                // (natural alignment, or the `-fpack-struct=<n>` cap)
                 // pack(push, N) means push and set to N
                 if n == 0 {
-                    self.pragma_pack_align = None;
+                    self.pragma_pack_align = self.pack_struct_cap;
                 } else {
                     self.pragma_pack_align = Some(n);
                 }
@@ -3798,7 +3857,9 @@ impl Parser {
             }
             TokenKind::PragmaPackReset => {
                 self.advance();
-                self.pragma_pack_align = None;
+                // `#pragma pack()` restores the command-line baseline, not
+                // necessarily natural alignment (see `pack_struct_cap`).
+                self.pragma_pack_align = self.pack_struct_cap;
                 true
             }
             _ => false,
