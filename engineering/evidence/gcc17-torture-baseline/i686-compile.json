@@ -40,8 +40,8 @@
     }
   },
   "counts": {
-    "compile-fail": 6,
-    "pass": 1987,
+    "compile-fail": 5,
+    "pass": 1988,
     "reference-compile-skip": 22,
     "unsupported": 1
   },
@@ -223,14 +223,6 @@
       "1e588bb56d924a4e70b5b04a4154079914ad04f6dab7c79866c37bcd4c117878"
     ],
     [
-      "pr67106.c",
-      "-O2",
-      "compile-fail",
-      "lccc-i686",
-      1,
-      "d0276f0d082979cc0a0e9aec4b1602bacc428d91a26882f346209f4e9262005f"
-    ],
-    [
       "pr70355.c",
       "-O2",
       "reference-compile-skip",
@@ -280,6 +272,6 @@
     ]
   ],
   "schema": 1,
-  "source_head": "47135d2db1e93a6b0e28ce81b1076e0a832792e2",
-  "source_run": 42535980102
+  "source_head": "470a775acdda2cb622ebe1873e2706b52dee2cb3",
+  "source_run": 42817930714
 }
