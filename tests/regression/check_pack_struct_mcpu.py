@@ -20,7 +20,7 @@ on x86-64 (the two disagree on nothing here):
 
 The fixture uses only char/int/long long through stdint-width types whose
 x86-64 layout is ABI-fixed, so the static asserts are exact, not sampled.
-Run: python3 tests/regression/check_pack_struct_mcpu.py \
+Run: python3 tests/regression/check_pack_struct_mcpu.py \\
         --lccc target/fastbuild/lccc [--reference gcc]
 """
 
@@ -30,8 +30,6 @@ import subprocess
 import sys
 import tempfile
 
-# struct S { char c; int i; char d; long long l; }
-# struct A { char c; int i __attribute__((aligned(8))); } __attribute__((aligned(16)));
 CAP_TEMPLATE = r'''
 #include <stdint.h>
 struct S { char c; int i; char d; long long l; };
@@ -94,6 +92,59 @@ _Static_assert(sizeof(struct W) == 6, "pop restores the cap");
 int main(void) { return 0; }
 '''
 
+# Array member under -fpack-struct=2: { char c; int arr[3]; char d; }
+# pack(2): c@0, arr@2 (align 2, size 12), d@14, sizeof=16, align=2
+ARRAY_SOURCE = r'''
+#include <stdint.h>
+struct Arr { char c; int arr[3]; char d; };
+_Static_assert(sizeof(struct Arr) == 16, "pack(2) array sizeof");
+_Static_assert(_Alignof(struct Arr) == 2, "pack(2) array align");
+_Static_assert(__builtin_offsetof(struct Arr, c) == 0, "pack(2) array c off");
+_Static_assert(__builtin_offsetof(struct Arr, arr) == 2, "pack(2) array arr off");
+_Static_assert(__builtin_offsetof(struct Arr, d) == 14, "pack(2) array d off");
+int main(void) { return 0; }
+'''
+
+# __attribute__((aligned(8))) member under -fpack-struct=2: capped at 2
+ALIGNED_MEMBER_SOURCE = r'''
+#include <stdint.h>
+struct Am { char c; int i __attribute__((aligned(8))); char d; };
+_Static_assert(sizeof(struct Am) == 8, "pack(2) aligned member capped");
+_Static_assert(__builtin_offsetof(struct Am, i) == 2, "pack(2) aligned member off");
+int main(void) { return 0; }
+'''
+
+# #pragma pack(0) restores the cap (not natural alignment)
+PRAGMA_ZERO_RESTORE_SOURCE = r'''
+struct Base { char c; int i; };
+#pragma pack(2)
+struct Mid { char c; int i; };
+#pragma pack(0)
+struct After { char c; int i; };
+_Static_assert(sizeof(struct Base) == 6, "pack(2) applies before pragma");
+_Static_assert(sizeof(struct Mid) == 8, "pack(2) applies after pragma too");
+_Static_assert(sizeof(struct After) == 6, "pack(0) restores cap not natural");
+int main(void) { return 0; }
+'''
+
+# #pragma pack(push, 0) with cap baseline: push current, reset to cap
+PRAGMA_PUSH_ZERO_SOURCE = r'''
+struct First { char c; int i; };
+#pragma pack(push, 0)
+struct Second { char c; int i; };
+_Static_assert(sizeof(struct First) == 6, "push(0) baseline is cap(2)");
+_Static_assert(sizeof(struct Second) == 6, "push(0) doesn't change layout");
+int main(void) { return 0; }
+'''
+
+# Bare -fpack-struct: #pragma pack(4) is inert, struct packed to 5 bytes
+BARE_PRAGMA_SOURCE = r'''
+#pragma pack(4)
+struct S { char c; int i; };
+_Static_assert(sizeof(struct S) == 5, "pragma inline");
+int main(void) { return 0; }
+'''
+
 RUNTIME_SOURCE = r'''
 #include <stdio.h>
 struct S { char c; int i; char d; long long l; };
@@ -144,6 +195,7 @@ def main():
             rc2, out2, err2 = run([str(exe)])
             return rc2, out2, err + err2, exe
 
+        # ---- CAP_CASES: layout table against every compiler ----
         for label, cc in compilers:
             for flags, s_size, s_align, s_ioff, s_loff, a_ioff in CAP_CASES:
                 src = (CAP_TEMPLATE.replace("@S_SIZE@", str(s_size))
@@ -151,13 +203,11 @@ def main():
                        .replace("@S_IOFF@", str(s_ioff))
                        .replace("@S_LOFF@", str(s_loff))
                        .replace("@A_IOFF@", str(a_ioff)))
-                def _tag_suffix(flags: list[str]) -> str:
-                    if not flags:
-                        return "none"
-                    if "=" in flags[0]:
-                        return flags[0].split("=", 1)[1]
-                    return flags[0]
-                tag = f"cap-{label}-{_tag_suffix(flags)}"
+                if flags:
+                    suffix = flags[0].split("=", 1)[1] if "=" in flags[0] else flags[0]
+                else:
+                    suffix = "none"
+                tag = f"cap-{label}-{suffix}"
                 rc, out, err, _ = compile_and_run(tag, src, flags, cc)
                 check(f"{label} cap {flags or 'default'}", rc == 0, err[:300])
 
@@ -170,31 +220,55 @@ def main():
                                               ["-fpack-struct=2"], cc)
             check(f"{label} pragma overrides/restores cap", rc == 0, err[:300])
 
+            # Array member under pack(2)
+            rc, out, err, _ = compile_and_run(f"array-{label}", ARRAY_SOURCE,
+                                              ["-fpack-struct=2"], cc)
+            check(f"{label} array under -fpack-struct=2", rc == 0, err[:300])
+
+            # Aligned member under pack(2): capped at 2
+            rc, out, err, _ = compile_and_run(f"aligned-member-{label}",
+                                              ALIGNED_MEMBER_SOURCE,
+                                              ["-fpack-struct=2"], cc)
+            check(f"{label} aligned member capped by pack(2)", rc == 0, err[:300])
+
+            # #pragma pack(0) restores cap (not natural alignment)
+            rc, out, err, _ = compile_and_run(f"pragma-zero-{label}",
+                                              PRAGMA_ZERO_RESTORE_SOURCE,
+                                              ["-fpack-struct=2"], cc)
+            check(f"{label} #pragma pack(0) restores cap", rc == 0, err[:300])
+
+            # #pragma pack(push, 0) with cap baseline
+            rc, out, err, _ = compile_and_run(f"pragma-push-zero-{label}",
+                                              PRAGMA_PUSH_ZERO_SOURCE,
+                                              ["-fpack-struct=2"], cc)
+            check(f"{label} #pragma pack(push,0) with cap", rc == 0, err[:300])
+
             for flags, expect in RUNTIME_EXPECT.items():
                 tag = f"run-{label}-{'_'.join(flags) or 'none'}".replace("=", "")
                 rc, out, err, _ = compile_and_run(tag, RUNTIME_SOURCE,
                                                   list(flags), cc)
                 check(f"{label} runtime layout {flags or 'default'}",
-                      rc == 0 and out == expect, f"rc={rc} out={out!r} err={err[:200]}")
+                      rc == 0 and out == expect,
+                      f"rc={rc} out={out!r} err={err[:200]}")
 
-        # lccc-only diagnostics: bare form makes `#pragma pack` inert, with
-        # GCC's warning text; invalid caps are hard errors with GCC's words.
+        # ---- lccc-only diagnostics ----
+        # Bare form makes `#pragma pack` inert with GCC's warning text.
         src = tmp / "bare-pragma.c"
-        src.write_text("#pragma pack(4)\nstruct S { char c; int i; };\n"
-                       "_Static_assert(sizeof(struct S) == 5, \"pragma inert\");\n"
-                       "int main(void) { return 0; }\n")
+        src.write_text(BARE_PRAGMA_SOURCE)
         rc, out, err = run([args.lccc, "-fpack-struct", str(src), "-o", str(tmp / "bp")])
         check("lccc bare: #pragma pack ignored with warning",
               rc == 0 and "has no effect with '-fpack-struct'" in err,
               f"rc={rc} err={err[:300]}")
 
+        # Invalid caps are hard errors with GCC's wording.
         trivial = tmp / "trivial.c"
         trivial.write_text("struct S { char c; int i; };\nint main(void){return 0;}\n")
         for bad in ("0", "3", "32", "bogus"):
             rc, out, err = run([args.lccc, f"-fpack-struct={bad}", "-c",
                                 str(trivial), "-o", str(tmp / "t.o")])
             check(f"lccc -fpack-struct={bad} refused",
-                  rc != 0 and "small power of two" in err, f"rc={rc} err={err[:200]}")
+                  rc != 0 and "small power of two" in err,
+                  f"rc={rc} err={err[:200]}")
         if args.reference:
             for bad in ("0", "3", "32"):
                 rc, out, err = run([args.reference, f"-fpack-struct={bad}", "-c",
@@ -202,8 +276,15 @@ def main():
                 check(f"reference -fpack-struct={bad} refused", rc != 0,
                       f"rc={rc}")
 
-        # -mcpu= alias parity: accepted with a deprecation warning, bogus
-        # refused, and codegen identical to the -mtune= spelling.
+        # Out-of-range power-of-two values (17, 64, 128).
+        for bad in ("17", "64", "128"):
+            rc, out, err = run([args.lccc, f"-fpack-struct={bad}", "-c",
+                                str(trivial), "-o", str(tmp / f"bad_{bad}.o")])
+            check(f"lccc -fpack-struct={bad} refused (>16)",
+                  rc != 0 and "small power of two" in err,
+                  f"rc={rc} err={err[:200]}")
+
+        # ---- -mcpu= alias parity ----
         for label, cc in compilers:
             rc, out, err = run([cc, "-mcpu=core2", "-c", str(trivial),
                                 "-o", str(tmp / "m.o")])
@@ -213,6 +294,8 @@ def main():
             rc, out, err = run([cc, "-mcpu=bogus123", "-c", str(trivial),
                                 "-o", str(tmp / "m.o")])
             check(f"{label} -mcpu=bogus123 refused", rc != 0, f"rc={rc}")
+
+        # -mcpu= assembly identical to -mtune= (never selects an ISA).
         asm = {}
         for tag, flag in (("mcpu", "-mcpu=core2"), ("mtune", "-mtune=core2")):
             out_s = tmp / f"{tag}.s"
@@ -222,36 +305,36 @@ def main():
         check("lccc -mcpu assembly identical to -mtune",
               bool(asm["mcpu"]) and asm["mcpu"] == asm["mtune"])
 
-        # -mcpu= with a tune valid only for i686 must be refused on x86-64.
+        # -mcpu= with i686-only tune refused on x86-64.
         rc, out, err = run([args.lccc, "-mcpu=pentium4", "-c",
                             str(trivial), "-o", str(tmp / "m3.o")])
         check("lccc -mcpu=pentium4 refused on x86-64 (i686-only tune)",
               rc != 0 and ("pentium4" in err or "unsupported" in err),
               f"rc={rc} err={err[:200]}")
 
-        # -mcpu= error message must name -mcpu=, not -mtune=.
+        # -mcpu= error message names -mcpu=, not -mtune=.
         rc, out, err = run([args.lccc, "-mcpu=bogus123", "-c",
                             str(trivial), "-o", str(tmp / "m4.o")])
         check("lccc -mcpu bogus error names -mcpu= not -mtune=",
               rc != 0 and "-mcpu=bogus123" in err and "-mtune=bogus123" not in err,
               f"rc={rc} err={err[:200]}")
 
-        # -mtune= error message must name -mtune=, not -mcpu=.
+        # -mtune= error message names -mtune=, not -mcpu=.
         rc, out, err = run([args.lccc, "-mtune=bogus123", "-c",
                             str(trivial), "-o", str(tmp / "m5.o")])
         check("lccc -mtune bogus error names -mtune= not -mcpu=",
               rc != 0 and "-mtune=bogus123" in err and "-mcpu=bogus123" not in err,
               f"rc={rc} err={err[:200]}")
 
-        # -mcpu=native is accepted (CPUID-based tune resolution).
+        # -mcpu=native accepted (CPUID-based tune resolution).
         rc, out, err = run([args.lccc, "-mcpu=native", "-c",
                             str(trivial), "-o", str(tmp / "m6.o")])
         check("lccc -mcpu=native accepted", rc == 0,
               f"rc={rc} err={err[:200]}")
 
-        # -fsyntax-only must agree with full compilation for pack-struct.
+        # ---- -fsyntax-only parity ----
         for flags in [[], ["-fpack-struct"], ["-fpack-struct=2"],
-                      ["-fpack-struct=4"]]:
+                      ["-fpack-struct=4"], ["-fpack-struct=16"]]:
             src_syntax = tmp / f"syntax_{'_'.join(flags) or 'default'}.c"
             src_syntax.write_text(CAP_TEMPLATE.replace("@S_SIZE@", "24")
                                   .replace("@S_ALIGN@", "8")
@@ -266,7 +349,7 @@ def main():
                   rc_full == 0 and rc_syntax == 0,
                   f"full rc={rc_full} syntax rc={rc_syntax}")
 
-        # -fpack-struct=16 (max valid cap) behaves like default (natural alignment).
+        # -fpack-struct=16 (max valid cap) compiles and matches default layout.
         src16 = tmp / "pack16.c"
         src16.write_text(CAP_TEMPLATE.replace("@S_SIZE@", "24")
                          .replace("@S_ALIGN@", "8")
@@ -277,7 +360,7 @@ def main():
                         "-o", str(tmp / "pack16.o")])
         check("lccc -fpack-struct=16 compiles (max valid cap)", rc == 0)
 
-        # #pragma pack(push) / pack(pop) with -fpack-struct=2 cap.
+        # #pragma pack(push/pop) with -fpack-struct=2 cap baseline.
         src_pushpop = tmp / "pushpop.c"
         src_pushpop.write_text(r'''
 #include <stdint.h>
@@ -300,7 +383,7 @@ int main(void) { return 0; }
         check("lccc #pragma pack push/pop with cap baseline", rc == 0,
               f"rc={rc} err={err[:300]}")
 
-        # #pragma pack(push) with -fpack-struct (bare): all inert, stack untouched.
+        # #pragma pack(push) with bare -fpack-struct: all inert, stack untouched.
         src_bare_pushpop = tmp / "bare_pushpop.c"
         src_bare_pushpop.write_text(r'''
 #pragma pack(push, 1)
@@ -317,22 +400,14 @@ int main(void) { return 0; }
               rc == 0 and "has no effect with '-fpack-struct'" in err,
               f"rc={rc} err={err[:300]}")
 
-        # Invalid -fpack-struct values at boundary: 17 (power of 2 but > 16).
-        for bad in ("17", "64", "128"):
-            rc, out, err = run([args.lccc, f"-fpack-struct={bad}", "-c",
-                                str(trivial), "-o", str(tmp / f"bad_{bad}.o")])
-            check(f"lccc -fpack-struct={bad} refused (>16)",
-                  rc != 0 and "small power of two" in err,
-                  f"rc={rc} err={err[:200]}")
-
-        # -mcpu= on the reference compiler (if provided) also rejects bogus.
+        # -mcpu= on reference compiler rejects bogus too.
         if args.reference:
             rc, _, err = run([args.reference, "-mcpu=bogus123", "-c",
                               str(trivial), "-o", str(tmp / "ref_m.o")])
             check(f"reference -mcpu=bogus123 refused", rc != 0,
                   f"rc={rc} err={err[:200]}")
 
-    print(f"\n{ 'FAIL' if failures else 'PASS' }: {len(failures)} failure(s)")
+    print(f"\n{'FAIL' if failures else 'PASS'}: {len(failures)} failure(s)")
     return 1 if failures else 0
 
 
