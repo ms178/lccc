@@ -69,7 +69,9 @@ test in `test_audit_pack.py` enforces that invariant.
 | SA-08 | release fallback | P1 | vectorize.rs | Three `debug_assert!(false)` fallbacks fabricate compare predicates / bounds and still count the rewrite as success | S |
 | SA-09 | FP contract | P1 | slp_vectorizer.rs | SLP FMA contraction treats `-ffp-contract=on` as `fast` (no statement-tag check) | S |
 | SA-10 | dual semantics | P1 | intrinsics/IR | `VecBlendv*` is per-lane-sign-select on AVX2 but per-BIT select in the SSE2 fallback — divergent results for non-canonical masks | S |
+| ^ | **CLOSED** | — | — | see §9c.10: sign-lane canonicalisation at every ISA level, gate + `--expect-defect` red path | — |
 | SA-11 | wrong code (raw builtin) | P2 | intrinsics_simd.rs | Raw `vfmadd213/231` spellings share the 132 operand placement → three spellings compute three different expressions | S |
+| ^ | **CLOSED** | — | — | see §9c.10: all six spellings at 128/256/512 bits on both x86 backends, plus the i686 128-bit arm that was missing entirely (a compiler panic) | — |
 | SA-12 | metadata gap | P1 | ir/intrinsics.rs | Masked load family absent from `may_read_memory()`/`reads_pointer_arg()`; consumers protected only by a three-way coincidence | S |
 | SA-13 | encoder false-accept | P1 | encoder/avx.rs | VEX.256-only insert/extract/perm2 rows encode all-xmm forms: `vinserti128` xmm→#UD bytes, `vextracti128` xmm→reads ymm silently | S |
 | SA-14 | encoder false-accept | P2 | encoder/avx.rs | No imm8 range check on the VEX 0F3A/0F shuffle/permute rows (`vpshufd $300` silently truncates) | S |
@@ -1815,3 +1817,87 @@ refactor whose blast radius is every declaration in the language; bundling
 it with a measured codegen win would put the whole delivery at risk.  It is
 recorded here with the full reference matrix so the next change starts from
 evidence.
+
+## 9c.10 Closure of SA-10 and SA-11 (delivered, measured)
+
+Both findings are closed in the same PR that carries this section.  Each row
+below is a claim about the DELIVERED tree, with the command that shows it.
+
+### SA-10 — lane-mask select must be target-invariant
+
+Closed.  The 128-bit path canonicalises a non-per-bit mask to its sign lane at
+every ISA level before the select, so `_mm_blendv_ps`/`_mm_blendv_pd` mean the
+Intel sign-bit contract whether the target takes the SSE4.1 `blendvps`, the
+VEX `vblendvps`, or the SSE2 `andps/andnps/orps` fallback.
+
+    bash tests/regression/check_blendv_lane_semantics.sh --lccc <lccc> --reference gcc-16
+      ok 10 rows invariant between -msse4.1 and -mavx
+      ok all 16 mask-class rows match the independent sign-bit model
+      ok 28 rows match gcc-16 (controls included)
+
+Non-vacuity is measured, not assumed:
+`check_blendv_lane_semantics.sh --lccc tests/regression/blendv_prefix_standin.sh
+--expect-defect` drives the pre-fix lowering and must be red.
+
+### SA-11 — the three FMA3 digit permutations must all compute `a*b+c`
+
+Closed on BOTH backends and at ALL THREE widths.  One role table
+(`x86_common::fma_role_order`) is the sole authority; `132/213/231` now place
+`a`, `b`, `c` in three different operand positions instead of one.
+
+The store half of the bug is worth recording because it was invisible to any
+mnemonic-level test: the emitter chose the right permutation and then STORED
+the wrong register.  213 writes `%ymm1` and 231 writes `%ymm2`, but
+`avx_store_dest` / `evex_store_dest` hard-coded `%ymm0`/`%zmm0`, so the store
+published a stale operand:
+
+    vfmadd213ps %ymm2, %ymm0, %ymm1     # result lands in ymm1
+    vmovdqu     %ymm0, (%rax)           # ... but ymm0 (= a) is stored
+
+Measured, isolated case (`a=3,b=5,c=7,d=9`, owed `22 46 80 122`): 213 returned
+`3 5 7 9`.  Third instance of the same shape at 512 bits (owed `5.0`, returned
+`1.0`, 16 of 16 lanes wrong).
+
+Coverage delivered, all executed:
+
+| width | spellings | lanes | how |
+|-------|-----------|-------|-----|
+| 128 ps/pd | 6 | 18 | `check_fma_digit_permutation.sh` (126 rows total) |
+| 256 ps/pd | 6 | 36 | same gate, `-mavx2` |
+| 512 ps/pd | 6 | 72 | same gate, `-mavx512f` when the host has it |
+| i686 128/256 | 12 | 42 | `check_i686_fma128.sh`, static i386 ELF executed natively |
+
+The i686 half is the reason this section exists at all: the backend's 128-bit
+arm was MISSING, so `_mm_fmadd_ps` with `-m32 -mavx -mfma` did not compute
+anything — the compiler panicked (`reject_value_form`).  A compile-only gate
+would have caught the panic; only execution catches the placement.  The gate
+therefore runs a third leg that executes the PRE-FIX placement and fails if it
+ever reports zero wrong lanes.
+
+Three further defects were found and fixed while making the i686 path
+reachable, each a prerequisite rather than a side quest:
+
+* `F::Fma` and `F::F16c` were derived from `X86Isa` fields that are
+  permanently false on i686, so `__FMA__`/`__F16C__` were announced while every
+  FMA intrinsic was rejected and `(float)_Float16` silently took the software
+  conversion path.  One `vex128` predicate now feeds all four VEX families.
+* `emit_avx_store_dest`/`evex_store_dest` gained a `_from(dest, src)` sibling;
+  the fixed-register form survives for the ~40 emitters that really do leave
+  their result in `%ymm0`/`%zmm0`.
+* The 128-bit i686 store keeps its legacy `movdqu` encoding.  This is NOT a
+  missed optimization: the SSE/AVX transition penalty needs a dirty upper
+  state, which only a 256/512-bit write creates, and VEX.128 zeroes the uppers
+  — so no penalty exists.  Measured anyway, 2M iterations, best of three:
+  2 509 152 / 2 533 016 / 2 557 952 cycles legacy vs 2 538 018 / 2 567 008 /
+  2 567 160 VEX, i.e. inside noise.  A VEX-only helper would also be wrong for
+  the SSE-only callers, where a VEX prefix is an illegal instruction.
+
+Evidence for the store fix at 512 bits (the widest case), executed:
+
+    pre-fix 213: 16 of 16 lanes wrong (lane0 got 1.0 want 5.0)
+
+and after the fix, `emit_evex_store_dest_from(dest_ptr, dst)`:
+
+    vfmadd132ps %zmm1, %zmm2, %zmm0 / vmovdqu64 %zmm0, (%rax)
+    vfmadd213ps %zmm2, %zmm0, %zmm1 / vmovdqu64 %zmm1, (%rax)
+    vfmadd231ps %zmm1, %zmm0, %zmm2 / vmovdqu64 %zmm2, (%rax)
