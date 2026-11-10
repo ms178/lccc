@@ -5490,17 +5490,39 @@ impl Driver {
         // i686 instructions, or widen the vectorizer ceiling to admit them.
         let i686_avx =
             !x86_64 && set.contains(F::Sse2) && self.enable_avx && !self.avx_explicitly_disabled;
-        set.insert_if(isa.avx || i686_avx, F::Avx);
+        // FMA and F16C are VEX-encoded, so each needs the same 128-bit VEX
+        // permission `-mavx` grants -- and on i686 that permission is
+        // `i686_avx`, not `isa.avx` (which `x86_isa()` deliberately pins to
+        // NONE for that target).  Deriving them from `isa` alone left the
+        // whole FMA/F16C surface unreachable on i686 while `__FMA__`/`__F16C__`
+        // were still announced: `-m32 -mfma` defined the macro and then
+        // rejected `__lccc_simd256_ps_vfmadd132ps256` with "requires the fma
+        // instruction-set extension (-mfma)", and `-m32 -mf16c -mavx` silently
+        // dropped `(float)_Float16` from `vcvtph2ps` to the software path
+        // (`has_hw_f16_convert` reads this very set).  GCC 16.2 accepts both
+        // (measured: `gcc-16 -m32 -mfma -mavx2` compiles `_mm256_fmadd_ps`;
+        // `gcc-16 -m32 -mf16c` defines `__F16C__`).  One predicate now feeds
+        // every VEX family, so a future VEX instruction cannot reintroduce the
+        // same asymmetry by being added to only one arm.
+        let vex128 = isa.avx || i686_avx;
+        set.insert_if(vex128, F::Avx);
         set.insert_if(
             isa.ymm || (i686_avx && self.enable_avx2 && !self.avx2_explicitly_disabled),
             F::Avx2,
         );
-        set.insert_if(isa.fma, F::Fma);
+        // A VEX feature is usable only where VEX itself is: `-mno-avx` and
+        // `-mno-avx2` both remove the 128-bit class, so neither FMA nor F16C
+        // can survive them.  The explicit per-feature denial is kept separate
+        // because `x86_isa()` does not carry either bit.
+        set.insert_if(
+            vex128 && self.enable_fma && !self.fma_explicitly_disabled,
+            F::Fma,
+        );
         // F16C is VEX-encoded: `-mno-avx` removes it even when a `-march=`
         // profile asked for it (GCC undefines `__F16C__` for the same
         // combination — measured). It is granted only by `-mf16c` or the
         // `-march` profile that includes it, never by the default baseline.
-        set.insert_if(simd && isa.avx && self.enable_f16c, F::F16c);
+        set.insert_if(simd && vex128 && self.enable_f16c, F::F16c);
         // AES-NI and PCLMUL are NOT part of any psABI microarchitecture level
         // (v2 has SSE4.2/POPCNT, v3 adds AVX2/BMI2/FMA/F16C). Granting them
         // from a default baseline would promise an instruction class the target
