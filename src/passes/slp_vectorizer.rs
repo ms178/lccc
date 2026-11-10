@@ -5903,8 +5903,14 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         || cand.store_idx.len() != width
         || cand.lane_ops.len() != width
         || width == 0
+        || cand
+            .store_idx
+            .iter()
+            .any(|&i| i >= block.instructions.len())
     {
-        return slp_decline("malformed seed: empty, zero-width or mismatched store/lane span");
+        return slp_decline(
+            "malformed seed: empty, zero-width, out-of-bounds or mismatched store/lane span",
+        );
     }
     let Some(fam) = family_for(cand.ty, width) else {
         return slp_decline("no vector family for lane type/width");
@@ -9255,6 +9261,8 @@ mod tests {
             (vec![], vec![], 4usize),
             (vec![1, 2, 3], vec![Operand::Value(Value(1)); 3], 4),
             (vec![1, 2, 3, 4], vec![Operand::Value(Value(1)); 3], 4),
+            (vec![0, 1, 2, 4096], vec![Operand::Value(Value(1)); 4], 4),
+            (vec![usize::MAX], vec![Operand::Value(Value(1))], 1),
             (vec![], vec![], 0),
         ] {
             malformed.push(SeedCandidate {
@@ -9280,13 +9288,30 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Callgrind microbenchmark; run explicitly with --ignored"]
-    fn site_subsets_borrowed_partition_bench() {
+    fn site_subsets_borrowed_partition_stress_is_lossless() {
+        // Callgrind can instrument this exact test with `--exact` without
+        // an ignored-test attribute: the repo's audit census forbids growing
+        // that budget, and an ignored test is not a regression gate.
         let entries: Vec<StreamEntry> = (0..4000usize)
             .map(|i| stream_entry((i / 37) as i64 * 4, i, (i % 37) as u32 + 1))
             .collect();
-        for _ in 0..1000 {
+        for _ in 0..64 {
             let parts = site_subsets(&entries);
+            assert_eq!(parts.len(), 37, "one borrowed bucket per raw base");
+            assert_eq!(
+                parts.iter().map(Vec::len).sum::<usize>(),
+                entries.len(),
+                "every repetition must remain a lossless partition"
+            );
+            let first = parts[0][0];
+            let last = parts[36][parts[36].len() - 1];
+            assert!(
+                std::ptr::eq(first, &entries[0])
+                    && entries
+                        .iter()
+                        .any(|original| std::ptr::eq(original, last)),
+                "bucket endpoints must borrow the one owned stream"
+            );
             std::hint::black_box(&parts);
         }
         std::hint::black_box(&entries);

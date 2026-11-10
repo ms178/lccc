@@ -781,6 +781,8 @@ int main(void) {
                       "singleton site buckets must not pay for sort/split")
         self.assertIn("if cand.store_idx.is_empty()", code,
                       "malformed seeds must fail closed before any indexing")
+        self.assertIn("i >= block.instructions.len()", code,
+                      "out-of-bounds store positions must fail closed too")
         self.assertIn("fn seed_stream_layout_is_pahole_equivalent", code,
                       "size/align/offset layout proof must stay")
         self.assertIn("fn site_subsets_borrows_original_entries_without_copying", code,
@@ -789,8 +791,10 @@ int main(void) {
                       "owned/borrowed parity proof must stay")
         self.assertIn("fn build_plan_fails_closed_on_malformed_seed_spans", code,
                       "fail-closed seed guard proof must stay")
-        self.assertIn("fn site_subsets_borrowed_partition_bench", code,
-                      "Callgrind microbenchmark seam must stay")
+        self.assertIn("fn site_subsets_borrowed_partition_stress_is_lossless", code,
+                      "always-on Callgrind-instrumentable stress proof must stay")
+        self.assertNotIn("#[ignore", code,
+                         "the SLP patchset must not grow the ignored-test census")
         self.assertNotIn("entries.iter().filter(|e| e.4 == base)", code,
                          "the O(n*b) quadratic site partition must not return")
         self.assertNotIn("buckets.into_values().collect()", code,

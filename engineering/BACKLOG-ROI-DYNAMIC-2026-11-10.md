@@ -84,6 +84,35 @@ python3 scripts/check_backlog_roi_dynamic.py --offline --self-test --json
   are the local dynamic oracles; hosted CI's authenticated ICX lane is the
   third-compiler receipt.
 
+## Hosted-CI red-team repair (2026-11-10)
+
+The first hosted run of PR #1174 was red in `Assembler and linker contracts`,
+`Fast local contracts (shard b)` and the aggregate `Test Suite`. The job logs
+named one root cause in both independent lanes:
+
+```text
+FAIL: audit census grew:
+  ignored_tests: 10 -> 11 (+1)
+python3 scripts/audit_census.py --check (exit 1)
+```
+
+The extra ignored test was the Rust `#[ignore]` Callgrind microbenchmark in
+the SLP patchset. An ignored test is not a regression gate and it violates this
+repository's shrinking census. It was replaced by an always-on 64-repetition
+stress test that asserts the 37-bucket partition is lossless and borrows the
+original owned stream; Callgrind can still instrument that named test with
+`--exact`. `build_plan` additionally rejects out-of-bounds store positions,
+including `usize::MAX`, before any instruction indexing, and the malformed-seed
+Rust matrix exercises both cases.
+
+The harness-wipe snapshot helper was itself defective after commits landed: it
+diffed only against `HEAD`, producing an empty patch from a clean tree. It now
+diffs from `merge-base HEAD origin/main` through the working tree (with a
+`HEAD^` fallback for shallow CI), marks new deliverables intent-to-add,
+reverse-applies the full patch, and records the base selection in its JSON
+manifest. A compiler-free corpus module pins both repairs and runs
+`audit_census.py --check` in the fast hosted lane.
+
 ## Negative-control doctrine
 
 A check that cannot fail is decoration. `negative_controls()` deep-copies the
