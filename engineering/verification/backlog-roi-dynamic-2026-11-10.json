@@ -1,0 +1,130 @@
+{
+  "failed": [],
+  "items": 16,
+  "items_registry": [
+    {
+      "contract": "peephole never heap-copies a line before a rejecting filter",
+      "id": "MB-20/3",
+      "roi": 4.8,
+      "source": "\u00a74 rank 3"
+    },
+    {
+      "contract": "-fno-plt emits a direct GOTPCREL call",
+      "id": "MB-01/1",
+      "roi": 4.6,
+      "source": "\u00a74 rank 1"
+    },
+    {
+      "contract": "-fvisibility=hidden emits .hidden",
+      "id": "MB-01/2",
+      "roi": 4.6,
+      "source": "\u00a74 rank 1"
+    },
+    {
+      "contract": "-z execstack / noexecstack control PT_GNU_STACK",
+      "id": "MB-02/1",
+      "roi": 4.5,
+      "source": "\u00a74 rank 2"
+    },
+    {
+      "contract": "driver --oformat=binary matches objcopy of the same ELF",
+      "id": "MB-02/2",
+      "roi": 4.5,
+      "source": "\u00a74 rank 2"
+    },
+    {
+      "contract": "the option-effect ledger executes on all four drivers",
+      "id": "GP-22/5",
+      "roi": 4.5,
+      "source": "\u00a712.1 rank 1"
+    },
+    {
+      "contract": "an unknown attribute warns under -Wattributes",
+      "id": "GP-01/1",
+      "roi": 4.6,
+      "source": "\u00a712.1 rank 2"
+    },
+    {
+      "contract": "-dM -E macro parity stays within measured budgets",
+      "id": "GP-23/1",
+      "roi": 4.0,
+      "source": "\u00a712.1 rank 5"
+    },
+    {
+      "contract": "__GNUC__ matches the pinned GCC 16.2 oracle",
+      "id": "GP-05/1",
+      "roi": 4.4,
+      "source": "\u00a712.1 rank 3"
+    },
+    {
+      "contract": "-Wformat warns and -Werror=format fails",
+      "id": "MB-12/1",
+      "roi": 3.4,
+      "source": "\u00a74 rank 10"
+    },
+    {
+      "contract": "C digraphs compile without diagnostics",
+      "id": "GP-07/1",
+      "roi": 3.4,
+      "source": "\u00a712.1 rank 17"
+    },
+    {
+      "contract": "default C23 rejects an unprototyped extra argument",
+      "id": "GP-08/1",
+      "roi": 3.0,
+      "source": "\u00a712.1 rank 22"
+    },
+    {
+      "contract": "driver query flags answer without diagnostics",
+      "id": "GP-21/1",
+      "roi": 3.2,
+      "source": "\u00a712.1 rank 20"
+    },
+    {
+      "contract": "the i686 driver emits a real ELF32 object",
+      "id": "MB-13/1",
+      "roi": 3.6,
+      "source": "\u00a74 rank 8"
+    },
+    {
+      "contract": "a ymm-using function ends with vzeroupper",
+      "id": "SV-08/1",
+      "roi": 0.0,
+      "source": "\u00a79b.3 SV-08 (unranked, effort S)"
+    },
+    {
+      "contract": "explicit -pie and --build-id=sha1 produce DYN + Build ID",
+      "id": "MB-04/3",
+      "roi": 4.2,
+      "source": "\u00a74 rank 4"
+    }
+  ],
+  "passed": 16,
+  "results": {
+    "GP-01/1": [],
+    "GP-05/1": [],
+    "GP-07/1": [],
+    "GP-08/1": [],
+    "GP-21/1": [],
+    "GP-22/5": [],
+    "GP-23/1": [],
+    "MB-01/1": [],
+    "MB-01/2": [],
+    "MB-02/1": [],
+    "MB-02/2": [],
+    "MB-04/3": [],
+    "MB-12/1": [],
+    "MB-13/1": [],
+    "MB-20/3": [],
+    "SV-08/1": []
+  },
+  "self_test": [],
+  "tools": {
+    "clang": "/home/user/.cache/lccc/agent-tools/bin/clang-23",
+    "gcc": "/home/user/.cache/lccc/agent-tools/bin/gcc-16",
+    "lccc": "/home/user/lccc/target/fastbuild/lccc",
+    "mode": "live dynamic probes",
+    "objcopy": "/home/user/.cache/lccc/agent-tools/bin/objcopy",
+    "readelf": "/home/user/.cache/lccc/agent-tools/bin/readelf"
+  }
+}
