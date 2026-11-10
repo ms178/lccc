@@ -765,6 +765,7 @@ mod tests {
             global_init_label_blocks: vec![],
             ret_eightbyte_classes: vec![],
             ret_is_f128_sse: false,
+            ret_is_vector128: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: vec![],
             ssp: Default::default(),

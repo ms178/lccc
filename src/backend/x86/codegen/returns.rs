@@ -94,6 +94,19 @@ impl X86Codegen {
                         self.sse_load_arg(val, "xmm0");
                         self.emit_epilogue_and_ret_impl(frame_size);
                     } else {
+                        // Already in the return register: `return
+                        // ext8(a);` leaves the call result in `%ymm0` (a
+                        // 32/64-byte return home IS `%ymm0`/`%zmm0`).  Loading
+                        // it back out of its protected slot is a store, an
+                        // aligned-slot reload and a register copy for nothing
+                        // -- measured as 12 instructions against GCC's 1 for
+                        // `v8 f(v8 a){ return ext8(a); }`.
+                        if self.state.call_ret_vector_in_xmm0.contains(&v.0) {
+                            let dirty = std::mem::replace(&mut self.state.dirty_upper_ymm, false);
+                            self.emit_epilogue_and_ret_impl(frame_size);
+                            self.state.dirty_upper_ymm = dirty;
+                            return;
+                        }
                         self.avx_load_arg_to(val, "ymm0");
                         // No `vzeroupper` on this exit (see the hidden-buffer
                         // path below): it would zero the upper lanes of
@@ -134,6 +147,24 @@ impl X86Codegen {
             // this -- the caller stores the register through its own
             // buffer.
             if self.vector_ret_buffer_bytes > 0 {
+                // The register already holds the value: `return ext8(a);`
+                // leaves the call result in `%ymm0` (a 32/64-byte return
+                // home is `%ymm0`/`%zmm0` by construction, see
+                // `emit_call_store_vector_return`), and storing it to the
+                // hidden buffer only to reload it is two memory operations
+                // and a frame slot per return -- measured as
+                // `v8 f(v8 a){ return ext8(a); }`, 12 instructions against
+                // GCC's 1.  Returning it in place is exactly what the psABI
+                // asks for; the caller stores the register through its own
+                // buffer.
+                if matches!(val, Operand::Value(v)
+                        if self.state.call_ret_vector_in_xmm0.contains(&v.0))
+                {
+                    let dirty = std::mem::replace(&mut self.state.dirty_upper_ymm, false);
+                    self.emit_epilogue_and_ret_impl(frame_size);
+                    self.state.dirty_upper_ymm = dirty;
+                    return;
+                }
                 self.operand_to_rax(val);
                 let (mov, reg) = super::calls::vector_reg_move(self.vector_ret_buffer_bytes, 0);
                 self.state

@@ -641,6 +641,7 @@ fn instrument_function(
             ret_eightbyte_classes: Vec::new(),
             assume_library: true,
             ret_is_f128_sse: false,
+            ret_is_vector128: false,
             cold: true,
         };
         new_blocks.push(BasicBlock {

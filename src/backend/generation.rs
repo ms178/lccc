@@ -8790,6 +8790,7 @@ fn generate_instruction_body(
                 info.regparm,
                 &info.ret_eightbyte_classes,
                 info.ret_is_f128_sse,
+                info.ret_is_vector128,
             );
             clobber_after_call_like(cg);
         }
@@ -8820,6 +8821,7 @@ fn generate_instruction_body(
                 info.regparm,
                 &info.ret_eightbyte_classes,
                 info.ret_is_f128_sse,
+                info.ret_is_vector128,
             );
             clobber_after_call_like(cg);
         }

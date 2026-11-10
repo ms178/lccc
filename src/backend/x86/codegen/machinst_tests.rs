@@ -4798,6 +4798,7 @@ mod typed_indirect_calls {
                 struct_arg_fp_agg_classes: vec![],
                 struct_arg_is_f128_sse: vec![],
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,

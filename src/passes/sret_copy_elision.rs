@@ -910,6 +910,7 @@ mod tests {
                 struct_arg_fp_agg_classes: vec![None, None],
                 struct_arg_is_f128_sse: vec![false, false],
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 is_sret: true,
                 calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,

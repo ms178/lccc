@@ -852,6 +852,11 @@ pub struct X86Codegen {
     pub(super) call_ret_classes: Vec<crate::common::types::EightbyteClass>,
     /// True when the current call returns _Float128 (ONE 16-byte XMM, xmm0).
     pub(super) call_ret_is_f128_sse: bool,
+    /// The call just emitted returned a 16-byte vector in ONE `%xmm0`
+    /// (`Instruction::CallInfo::ret_is_vector128`).  Read by
+    /// `emit_call_store_result_impl`, which then stores `%xmm0` directly
+    /// instead of rebuilding the value from two I64 halves.
+    pub(super) call_ret_is_vector128: bool,
     /// For variadic functions: number of named integer/pointer parameters (excluding long double)
     pub(super) num_named_int_params: usize,
     /// For variadic functions: number of named float/double parameters (excluding long double)
@@ -1575,6 +1580,7 @@ impl X86Codegen {
             func_ret_classes: Vec::new(),
             func_set_second_ret: false,
             call_ret_is_f128_sse: false,
+            call_ret_is_vector128: false,
             call_ret_classes: Vec::new(),
             func_ret_is_f128_sse: false,
             num_named_int_params: 0,
@@ -10425,6 +10431,15 @@ impl ArchCodegen for X86Codegen {
         // with ymm/xmm registers instead of scalar movq.
         if let Operand::Value(v) = src {
             if self.state.vector_values.contains(&v.0) {
+                // A copy of a value that already sits in the return register
+                // (`return ext8(a);` -- the call result is in `%ymm0`/`%zmm0`)
+                // is likewise register-resident: the SSA rename in between
+                // must not turn one register into a store plus a reload.
+                if self.state.call_ret_vector_in_xmm0.contains(&v.0) {
+                    self.state.call_ret_vector_in_xmm0.insert(dest.0);
+                } else {
+                    self.state.call_ret_vector_in_xmm0.remove(&dest.0);
+                }
                 let debug = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
                 let is_128 = self.state.vector128_values.contains(&v.0);
                 if debug {
