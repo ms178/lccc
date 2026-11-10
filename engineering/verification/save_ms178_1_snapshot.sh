@@ -10,10 +10,21 @@
 # from the merge base with origin/main through HEAD *and* the working tree.
 # On a shallow CI checkout where merge-base is unavailable, fall back to the
 # first parent of HEAD, which still captures the latest commit plus all
-# uncommitted work.  The patch is reverse-apply checked before publication.
+# uncommitted work.  A root/shallow tree with neither ancestor available uses
+# HEAD, so an isolated regression fixture can still exercise the publication
+# contract with its own untracked delta.  Empty output is always refused: a
+# zero-byte patch is not reverse-appliable and must never be published.
+#
+# MS178_1_ROOT redirects every Git operation to an isolated work tree for
+# contract tests; production calls leave it unset and use the script's repo.
+# MS178_1_NO_INTENT=1 skips `git add -N` on read-only trees.
 set -euo pipefail
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+ROOT=$(CDPATH= cd -- "${MS178_1_ROOT:-$(dirname -- "$0")/../..}" && pwd)
+if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "save_ms178_1_snapshot.sh: MS178_1_ROOT is not a Git work tree" >&2
+    exit 1
+fi
 OUT=${MS178_1_PATCH:-/home/user/ms178-1.patch}
 MANIFEST=${MS178_1_MANIFEST:-/home/user/ms178-1-snapshot-manifest.json}
 SNAP_DIR="$ROOT/engineering/snapshots"
@@ -22,8 +33,6 @@ mkdir -p -- "$SNAP_DIR" "$(dirname -- "$OUT")" "$(dirname -- "$MANIFEST")"
 # New deliverable files must appear in `git diff <base>`.  Intent-to-add does
 # not stage their contents; it only makes the diff show them.  Ignored build
 # artifacts and timestamped snapshot copies are excluded by Git itself.
-# MS178_1_NO_INTENT=1 is for read-only contract tests on an already clean
-# tree; production snapshot calls leave it unset.
 if [[ ${MS178_1_NO_INTENT:-0} != 1 ]]; then
     git -C "$ROOT" ls-files --others --exclude-standard -z |
         xargs -0 -r git -C "$ROOT" add -N --
@@ -43,6 +52,11 @@ fi
 
 tmp="$OUT.tmp.$$"
 git -C "$ROOT" diff --binary "$base" >"$tmp"
+if [[ ! -s "$tmp" ]]; then
+    rm -f -- "$tmp"
+    echo "save_ms178_1_snapshot.sh: empty snapshot refused; reverse-apply check failed (shallow checkout or clean tree)" >&2
+    exit 1
+fi
 if ! git -C "$ROOT" apply --check -R "$tmp"; then
     rm -f -- "$tmp"
     echo "save_ms178_1_snapshot.sh: reverse-apply check failed" >&2

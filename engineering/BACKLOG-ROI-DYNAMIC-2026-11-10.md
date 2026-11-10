@@ -113,6 +113,47 @@ reverse-applies the full patch, and records the base selection in its JSON
 manifest. A compiler-free corpus module pins both repairs and runs
 `audit_census.py --check` in the fast hosted lane.
 
+## Second hosted-CI red-team repair: shallow snapshot contract (2026-11-10)
+
+The repaired head `a68deb891` turned 27 hosted checks green; only
+`Fast local contracts (shard b)` (check-run `129936348147`) and the dependent
+`Test Suite` aggregator remained red. The blob log named exactly one failing
+unittest:
+
+```text
+FAIL: test_snapshot_script_produces_a_reverse_appliable_full_delta
+AssertionError: 1 != 0 : error: No valid patches in input (allow with "--allow-empty")
+save_ms178_1_snapshot.sh: reverse-apply check failed
+::error title=Fast contract failed::python3 -m unittest discover -s tests/corpus -p 'test_*.py' (exit 1)
+```
+
+The cause was a test-design defect, not compiler codegen. GitHub's
+`actions/checkout@v7` uses `fetch-depth: 1`; on that tree
+`git merge-base HEAD origin/main` and `HEAD^` are both unavailable, so the
+helper's root-commit fallback diffed `HEAD` against a clean work tree and
+produced a zero-byte patch. `git apply --check -R` correctly refused it. The
+earlier local test had passed only because the developer tree was deep and
+dirty. The repair is threefold:
+
+1. `MS178_1_ROOT` redirects every Git operation to an isolated work tree and
+   is rejected unless `git rev-parse --is-inside-work-tree` succeeds. This lets
+   the corpus contract construct the exact shallow shape without touching the
+   real checkout or depending on GitHub network state.
+2. The helper explicitly refuses an empty snapshot before publication with a
+   named `empty snapshot refused` / `reverse-apply check failed` diagnostic.
+   A silent zero-byte patch can no longer masquerade as a deliverable.
+3. `tests/corpus/test_slp_patchset_hardening.py` now creates root-commit-only
+   Git fixtures, publishes a non-empty reverse-appliable delta from an
+   intent-to-add deliverable, applies that patch forward to a second clean
+   tree, exercises the `MS178_1_NO_INTENT=1` tracked-edit path, and includes
+   negative controls for the hosted empty-patch shape and a non-Git root.
+   These are compiler-free, deterministic on shallow CI, and cannot pass on a
+   vacuous patch.
+
+This is a stricter contract than the failing one: it proves both directions of
+the patch, both intent modes, the root override validation, and fail-closed
+behavior on the exact hosted failure mode.
+
 ## Negative-control doctrine
 
 A check that cannot fail is decoration. `negative_controls()` deep-copies the

@@ -2,10 +2,13 @@
 """Executable red-team ratchets for the SLP patchset and its snapshot helper.
 
 Hosted CI proved that a single `#[ignore]` raised the repository's
-`ignored_tests` census and failed two independent lanes.  These tests pin the
-root cause, the stronger malformed-seed guard, the zero-copy view design, and
-the harness-wipe snapshot contract.  Every check is compiler-free so the fast
-corpus lane can run it on both local and hosted CI.
+`ignored_tests` census and failed two independent lanes.  It then proved that
+a `fetch-depth: 1` checkout has neither `origin/main` ancestry nor `HEAD^`, so
+a snapshot contract that silently assumed a deep, dirty local tree produced an
+empty patch.  These tests pin the root causes, the stronger malformed-seed
+guard, the zero-copy view design, and the harness-wipe snapshot contract with
+isolated Git fixtures that behave identically on shallow hosted CI.  Every
+check is compiler-free so the fast corpus lane can run it everywhere.
 """
 
 from __future__ import annotations
@@ -24,6 +27,75 @@ SLP = REPO / "src/passes/slp_vectorizer.rs"
 JOINT = REPO / "src/passes/slp_vectorizer/joint.rs"
 SNAPSHOT = REPO / "engineering/verification/save_ms178_1_snapshot.sh"
 AUDIT_CENSUS = REPO / "scripts/audit_census.py"
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _make_repo(path: Path, tracked: str = "base\n") -> None:
+    """A root-commit-only work tree: the shallow-CI shape under test."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-c", "init.defaultBranch=main", "init", "-q"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    (path / "tracked.txt").write_text(tracked)
+    _git(path, "add", "tracked.txt")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.name=Snapshot Contract",
+            "-c",
+            "user.email=snapshot@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _run_helper(
+    root: Path,
+    patch: Path,
+    manifest: Path,
+    *,
+    no_intent: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ}
+    env["MS178_1_ROOT"] = str(root)
+    env["MS178_1_PATCH"] = str(patch)
+    env["MS178_1_MANIFEST"] = str(manifest)
+    if no_intent:
+        env["MS178_1_NO_INTENT"] = "1"
+    else:
+        env.pop("MS178_1_NO_INTENT", None)
+    return subprocess.run(
+        ["bash", str(SNAPSHOT)],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
 
 
 class SlpPatchsetHardening(unittest.TestCase):
@@ -77,44 +149,106 @@ class SlpPatchsetHardening(unittest.TestCase):
         self.assertIn("candidates.extend(site_candidates)", self.slp)
 
     def test_snapshot_script_diffs_from_the_merge_base_not_head(self) -> None:
-        self.assertIn('git -C "$ROOT" diff --binary "$base"', self.snapshot_script)
-        self.assertIn("merge-base HEAD origin/main", self.snapshot_script)
+        for needle in (
+            'git -C "$ROOT" diff --binary "$base"',
+            "merge-base HEAD origin/main",
+            "HEAD^ fallback",
+            "HEAD fallback",
+            "MS178_1_NO_INTENT",
+            "MS178_1_ROOT",
+            "rev-parse --is-inside-work-tree",
+            "empty snapshot refused",
+        ):
+            self.assertIn(needle, self.snapshot_script)
         self.assertNotIn('git diff --binary HEAD >', self.snapshot_script)
-        self.assertIn("HEAD^ fallback", self.snapshot_script)
-        self.assertIn("MS178_1_NO_INTENT", self.snapshot_script)
 
-    def test_snapshot_script_produces_a_reverse_appliable_full_delta(self) -> None:
+    def test_snapshot_script_publishes_a_reverse_appliable_shallow_delta(self) -> None:
+        """A shallow root-commit fixture with an untracked deliverable file."""
         with tempfile.TemporaryDirectory(prefix="ms178-snapshot-") as td:
+            root = Path(td) / "repo"
+            other = Path(td) / "forward"
             patch = Path(td) / "canonical.patch"
             manifest = Path(td) / "canonical.json"
-            env = {
-                **os.environ,
-                "MS178_1_PATCH": str(patch),
-                "MS178_1_MANIFEST": str(manifest),
-                "MS178_1_NO_INTENT": "1",
-            }
-            proc = subprocess.run(
-                ["bash", str(SNAPSHOT)], cwd=REPO, env=env,
-                capture_output=True, text=True, timeout=180,
-            )
+            _make_repo(root)
+            (root / "new-deliverable.txt").write_text("production delta\n")
+            proc = _run_helper(root, patch, manifest)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("SNAPSHOT_OK", proc.stdout)
             record = json.loads(manifest.read_text())
             self.assertEqual(record["sha256"], hashlib.sha256(patch.read_bytes()).hexdigest())
             self.assertEqual(record["bytes"], patch.stat().st_size)
+            self.assertGreater(record["bytes"], 0)
             self.assertGreater(record["changed_file_count"], 0)
+            self.assertIn("new-deliverable.txt", record["changed_files"])
+            self.assertTrue(record["base"])
             self.assertTrue(
-                record["base_mode"].startswith(
-                    ("merge-base HEAD origin/main", "HEAD^ fallback", "HEAD fallback")
-                ),
+                record["base_mode"].startswith("HEAD fallback"),
                 record["base_mode"],
             )
-            self.assertTrue(record["base"])
             reverse = subprocess.run(
-                ["git", "apply", "--check", "-R", str(patch)],
-                cwd=REPO, capture_output=True, text=True, timeout=180,
+                ["git", "-C", str(root), "apply", "--check", "-R", str(patch)],
+                capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(reverse.returncode, 0, reverse.stdout + reverse.stderr)
+            # A forward apply to a second clean tree proves the patch carries
+            # real content, not merely a reverse-apply-compatible index entry.
+            _make_repo(other)
+            forward = subprocess.run(
+                ["git", "-C", str(other), "apply", str(patch)],
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(forward.returncode, 0, forward.stdout + forward.stderr)
+            self.assertEqual(
+                (other / "new-deliverable.txt").read_text(),
+                "production delta\n",
+            )
+
+    def test_snapshot_script_no_intent_path_reverse_applies_a_tracked_edit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ms178-no-intent-") as td:
+            root = Path(td) / "repo"
+            patch = Path(td) / "canonical.patch"
+            manifest = Path(td) / "canonical.json"
+            _make_repo(root)
+            (root / "tracked.txt").write_text("modified\n")
+            proc = _run_helper(root, patch, manifest, no_intent=True)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("SNAPSHOT_OK", proc.stdout)
+            record = json.loads(manifest.read_text())
+            self.assertGreater(record["bytes"], 0)
+            self.assertIn("tracked.txt", record["changed_files"])
+            reverse = subprocess.run(
+                ["git", "-C", str(root), "apply", "--check", "-R", str(patch)],
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(reverse.returncode, 0, reverse.stdout + reverse.stderr)
+
+    def test_snapshot_script_refuses_empty_snapshots_fail_closed(self) -> None:
+        """The exact hosted failure: shallow checkout plus clean work tree."""
+        with tempfile.TemporaryDirectory(prefix="ms178-empty-") as td:
+            root = Path(td) / "repo"
+            patch = Path(td) / "canonical.patch"
+            manifest = Path(td) / "canonical.json"
+            _make_repo(root)
+            proc = _run_helper(root, patch, manifest, no_intent=True)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("empty snapshot refused", combined)
+            self.assertIn("reverse-apply check failed", combined)
+            self.assertNotIn("SNAPSHOT_OK", proc.stdout)
+            self.assertFalse(patch.exists())
+            self.assertFalse(manifest.exists())
+
+    def test_snapshot_script_rejects_a_non_git_root_override(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ms178-bad-root-") as td:
+            root = Path(td) / "not-a-repo"
+            root.mkdir()
+            patch = Path(td) / "canonical.patch"
+            manifest = Path(td) / "canonical.json"
+            proc = _run_helper(root, patch, manifest, no_intent=True)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("not a Git work tree", proc.stdout + proc.stderr)
+            self.assertFalse(patch.exists())
+            self.assertFalse(manifest.exists())
 
     def test_snapshot_contract_does_not_grow_the_ignored_census(self) -> None:
         # The live census is the authority; this source check names the exact
