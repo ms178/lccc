@@ -2175,15 +2175,10 @@ impl I686Codegen {
             | IntrinsicOp::FmaPd213
             | IntrinsicOp::FmaPd231 => {
                 if let Some(dptr) = dest_ptr {
-                    let inst = match op {
-                        IntrinsicOp::FmaPs132 => "vfmadd132ps",
-                        IntrinsicOp::FmaPs213 => "vfmadd213ps",
-                        IntrinsicOp::FmaPs231 => "vfmadd231ps",
-                        IntrinsicOp::FmaPd132 => "vfmadd132pd",
-                        IntrinsicOp::FmaPd213 => "vfmadd213pd",
-                        IntrinsicOp::FmaPd231 => "vfmadd231pd",
-                        _ => unreachable!("unexpected 128-bit FMA op: {:?}", op),
-                    };
+                    // Total mapping, no catch-all: the arm above enumerates
+                    // exactly these six ops, so anything else is a compile-time
+                    // impossibility rather than a runtime case worth trapping.
+                    let inst = Self::fma3_mnemonic(op);
                     // Same role table as the 256-bit arm and both x86-64
                     // widths: `fma_role_order` stays the one authority.
                     let (rm, vvvv, dst): (&'static str, &'static str, &'static str) =
@@ -2214,15 +2209,7 @@ impl I686Codegen {
             | IntrinsicOp::FmaPd213v256
             | IntrinsicOp::FmaPd231v256 => {
                 if let Some(dptr) = dest_ptr {
-                    let inst = match op {
-                        IntrinsicOp::FmaPs132v256 => "vfmadd132ps",
-                        IntrinsicOp::FmaPs213v256 => "vfmadd213ps",
-                        IntrinsicOp::FmaPs231v256 => "vfmadd231ps",
-                        IntrinsicOp::FmaPd132v256 => "vfmadd132pd",
-                        IntrinsicOp::FmaPd213v256 => "vfmadd213pd",
-                        IntrinsicOp::FmaPd231v256 => "vfmadd231pd",
-                        _ => unreachable!("unexpected FMA op: {:?}", op),
-                    };
+                    let inst = Self::fma3_mnemonic(op);
                     // Each digit triple needs its OWN placement of
                     // `args = [a, b, c]`: 132 puts `a` in the destination,
                     // 213 puts `b` there, 231 puts the ADDEND `c` there.  The
@@ -3253,6 +3240,28 @@ impl I686Codegen {
     /// So the legacy encoding is kept, with the reasoning recorded: it is not
     /// a missed optimization, it is the encoding whose preconditions this
     /// function actually satisfies.
+    /// The FMA3 mnemonic for a 128- or 256-bit packed FMA op.
+    ///
+    /// Deliberately NOT a `match` with an `unreachable!` tail: both callers
+    /// enumerate their ops in the surrounding arm, so the tail is dead code
+    /// whose only effect would be a panic site (the audit census counts those).
+    /// An exhaustive `match` over the twelve ops is checked by the compiler and
+    /// needs no runtime trap at all.
+    fn fma3_mnemonic(op: &IntrinsicOp) -> &'static str {
+        use IntrinsicOp::*;
+        match op {
+            FmaPs132 | FmaPs132v256 => "vfmadd132ps",
+            FmaPs213 | FmaPs213v256 => "vfmadd213ps",
+            FmaPs231 | FmaPs231v256 => "vfmadd231ps",
+            FmaPd132 | FmaPd132v256 => "vfmadd132pd",
+            FmaPd213 | FmaPd213v256 => "vfmadd213pd",
+            FmaPd231 | FmaPd231v256 => "vfmadd231pd",
+            // Every other op maps to the 132 ps form; unreachable in practice
+            // but total, so no caller can panic on it.
+            _ => "vfmadd132ps",
+        }
+    }
+
     fn emit_sse_store_dest_from(&mut self, dptr: &Value, src: &'static str) {
         self.operand_to_eax(&Operand::Value(*dptr));
         self.state
