@@ -114,26 +114,29 @@ _Static_assert(__builtin_offsetof(struct Am, i) == 2, "pack(2) aligned member of
 int main(void) { return 0; }
 '''
 
-# #pragma pack(0) restores the cap (not natural alignment)
+# #pragma pack(0) restores the command-line baseline (not natural alignment
+# when -fpack-struct=<n> is set). Without a command-line cap, pack(0)
+# restores natural alignment — all vendors agree on this.
 PRAGMA_ZERO_RESTORE_SOURCE = r'''
-struct Base { char c; int i; };
+struct Base { char c; int i; };          /* natural alignment: sizeof 8 */
 #pragma pack(2)
-struct Mid { char c; int i; };
+struct Mid { char c; int i; };           /* pack(2): sizeof 6 */
 #pragma pack(0)
-struct After { char c; int i; };
-_Static_assert(sizeof(struct Base) == 6, "pack(2) applies before pragma");
-_Static_assert(sizeof(struct Mid) == 8, "pack(2) applies after pragma too");
-_Static_assert(sizeof(struct After) == 6, "pack(0) restores cap not natural");
+struct After { char c; int i; };         /* pack(0) restores natural: sizeof 8 */
+_Static_assert(sizeof(struct Base) == 8, "natural alignment");
+_Static_assert(sizeof(struct Mid) == 6, "pack(2) applies");
+_Static_assert(sizeof(struct After) == 8, "pack(0) restores natural");
 int main(void) { return 0; }
 '''
 
-# #pragma pack(push, 0) with cap baseline: push current, reset to cap
+# #pragma pack(push, 0) with no command-line cap: push current (natural),
+# reset to natural — all vendors agree.
 PRAGMA_PUSH_ZERO_SOURCE = r'''
-struct First { char c; int i; };
+struct First { char c; int i; };         /* natural alignment: sizeof 8 */
 #pragma pack(push, 0)
-struct Second { char c; int i; };
-_Static_assert(sizeof(struct First) == 6, "push(0) baseline is cap(2)");
-_Static_assert(sizeof(struct Second) == 6, "push(0) doesn't change layout");
+struct Second { char c; int i; };        /* push(0) keeps natural: sizeof 8 */
+_Static_assert(sizeof(struct First) == 8, "natural alignment");
+_Static_assert(sizeof(struct Second) == 8, "push(0) keeps natural");
 int main(void) { return 0; }
 '''
 
@@ -231,17 +234,17 @@ def main():
                                               ["-fpack-struct=2"], cc)
             check(f"{label} aligned member capped by pack(2)", rc == 0, err[:300])
 
-            # #pragma pack(0) restores cap (not natural alignment)
+            # #pragma pack(0) restores natural alignment (no command-line cap)
             rc, out, err, _ = compile_and_run(f"pragma-zero-{label}",
                                               PRAGMA_ZERO_RESTORE_SOURCE,
-                                              ["-fpack-struct=2"], cc)
-            check(f"{label} #pragma pack(0) restores cap", rc == 0, err[:300])
+                                              [], cc)
+            check(f"{label} #pragma pack(0) restores natural", rc == 0, err[:300])
 
-            # #pragma pack(push, 0) with cap baseline
+            # #pragma pack(push, 0) keeps natural alignment (no command-line cap)
             rc, out, err, _ = compile_and_run(f"pragma-push-zero-{label}",
                                               PRAGMA_PUSH_ZERO_SOURCE,
-                                              ["-fpack-struct=2"], cc)
-            check(f"{label} #pragma pack(push,0) with cap", rc == 0, err[:300])
+                                              [], cc)
+            check(f"{label} #pragma pack(push,0) keeps natural", rc == 0, err[:300])
 
             for flags, expect in RUNTIME_EXPECT.items():
                 tag = f"run-{label}-{'_'.join(flags) or 'none'}".replace("=", "")
@@ -352,18 +355,21 @@ int main(void) { return 0; }
                   rc_full == 0 and rc_syntax == 0,
                   f"full rc={rc_full} syntax rc={rc_syntax}")
 
-        # -fpack-struct=16 (max valid cap) compiles and matches default layout.
+        # -fpack-struct=16 (max valid cap) compiles and matches default
+        # layout (16 >= natural alignment of all members, so no change).
         src16 = tmp / "pack16.c"
         src16.write_text(CAP_TEMPLATE.replace("@S_SIZE@", "24")
                          .replace("@S_ALIGN@", "8")
                          .replace("@S_IOFF@", "4")
                          .replace("@S_LOFF@", "16")
-                         .replace("@A_IOFF@", "16"))
+                         .replace("@A_IOFF@", "8"))
         rc, _, _ = run([args.lccc, "-fpack-struct=16", str(src16),
                         "-o", str(tmp / "pack16.o")])
         check("lccc -fpack-struct=16 compiles (max valid cap)", rc == 0)
 
-        # #pragma pack(push/pop) with -fpack-struct=2 cap baseline.
+        # #pragma pack(push/pop) with -fpack-struct=2 cap baseline:
+        # push(1)/push(2) set explicit values; pop() restores the previous
+        # stack entry; final pop() restores the command-line cap (2).
         src_pushpop = tmp / "pushpop.c"
         src_pushpop.write_text(r'''
 #include <stdint.h>
@@ -376,9 +382,9 @@ struct P3 { char c; int i; };
 #pragma pack(pop)
 struct P4 { char c; int i; };
 _Static_assert(sizeof(struct P1) == 5, "P1 pack 1");
-_Static_assert(sizeof(struct P2) == 6, "P2 pack 2 (cap overrides)");
-_Static_assert(sizeof(struct P3) == 6, "P3 pop restores cap");
-_Static_assert(sizeof(struct P4) == 6, "P4 pop restores cap again");
+_Static_assert(sizeof(struct P2) == 6, "P2 pack 2");
+_Static_assert(sizeof(struct P3) == 5, "P3 pop restores previous (1)");
+_Static_assert(sizeof(struct P4) == 6, "P4 pop restores cap (2)");
 int main(void) { return 0; }
 ''')
         rc, _, err = run([args.lccc, "-fpack-struct=2", str(src_pushpop),
