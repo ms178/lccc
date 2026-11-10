@@ -1890,6 +1890,8 @@ jobs:
       run: bash tests/regression/check_fma_digit_permutation.sh --lccc tests/regression/fma_prefix_standin.sh --expect-defect
     - name: i686 128-bit VEX FMA3 must compile and compute a*b+c (SA-11)
       run: bash tests/regression/check_i686_fma128.sh --lccc target/fastbuild/lccc
+    - name: binary16 conversion must be value-identical with and without F16C
+      run: bash tests/regression/check_f16_conversion_parity.sh --lccc target/fastbuild/lccc --reference gcc-16
     needs:
     - build
   backend:

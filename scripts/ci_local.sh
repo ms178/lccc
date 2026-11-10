@@ -1945,6 +1945,12 @@ gate "fma-digit-permutation-nonvacuity" fast \
 # way to see the operand placement as well as the crash.
 gate "i686-fma128" fast \
     bash tests/regression/check_i686_fma128.sh --lccc target/fastbuild/lccc
+# `-mf16c` must change the ENCODING and nothing else.  On i686 it once changed
+# neither: __F16C__ was announced while the effective feature set had no F16c
+# bit, so the option silently bought nothing.  Both paths compute correct
+# values, so this needs the pair (identical output) AND (vcvtph2ps present).
+gate "f16-conversion-parity" fast \
+    bash tests/regression/check_f16_conversion_parity.sh --lccc target/fastbuild/lccc
 gate "kernel-tree-clear" fast bash tests/regression/check_kernel_tree_clear.sh
 # The shared mount-table helper and the chroot/kernel-tree root guards.
 gate "destructive-path-guards" fast bash tests/regression/check_destructive_guards.sh
