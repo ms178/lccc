@@ -881,6 +881,37 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
             "--json": ("target/cond-load-sink-best-tools.json",),
         },
     ),
+    # The guarded-folds rewrite shares the same-width Cast proof with the
+    # SV-03 range gates, so its local, hosted and authenticated-vendor
+    # invocations are pinned separately.  Dropping the Clang pin, silently
+    # accepting a wrong ICX release, or weakening --require-icx fails parity.
+    InvocationContract(
+        program="tests/regression/check_llvm_guarded_folds.py",
+        name="llvm-guarded-folds-local",
+        sides=frozenset({"local"}),
+        option_spec={
+            "--clang": ("${CLANG:-clang-23}",),
+        },
+        local_gate=("llvm-guarded-folds", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_llvm_guarded_folds.py",
+        name="llvm-guarded-folds-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--clang": ("$CLANG",),
+        },
+    ),
+    InvocationContract(
+        program="tests/regression/check_llvm_guarded_folds.py",
+        name="llvm-guarded-folds-icx",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--clang": ("$CLANG",),
+            "--icx": ("$LCCC_ICX_BIN",),
+        },
+        rest_spec=("--require-icx",),
+    ),
     InvocationContract(
         program="scripts/check_cond_load_sink_best_tools.py",
         name="cond-load-sink-best-tools-icx",
@@ -940,6 +971,10 @@ PROGRAM_ENV_CHANNELS: dict[str, frozenset[str]] = {
          "LCCC_AGENT_CACHE_PREFIX", "CLANG", "CLANG23"}),
     "tests/regression/check_cond_load_sink_matrix.py": frozenset(
         {"CCC_NO_COND_LOAD_SINK", "CLANG", "CLANG23"}),
+    "tests/regression/check_llvm_guarded_folds.py": frozenset(
+        {"CCC_SIMPLIFY_SKIP", "CCC_DISABLE_PASSES", "CCC_VERIFY_IR",
+         "CCC_VERIFY_REGALLOC", "CCC_NO_PEEPHOLE", "LCCC_AGENT_CACHE_PREFIX",
+         "GCC", "CLANG", "CLANG23", "ICX", "LCCC_ICX_BIN"}),
 }
 
 

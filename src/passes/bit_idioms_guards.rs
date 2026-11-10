@@ -160,7 +160,9 @@ fn sign_bit_zero(cx: &Context<'_>, op: Operand, ty: IrType, facts: &Facts, depth
             from_ty,
             to_ty,
             ..
-        }) if *to_ty == ty && scalar(*from_ty) && from_ty.size() == ty.size() => {
+        }) if same_width_scalar(*to_ty, ty) && same_width_scalar(*from_ty, ty) => {
+            // Same-width signedness reinterpretation preserves the bit
+            // pattern; only later widening would make the labels diverge.
             sign_bit_zero(cx, *src, *from_ty, facts, depth - 1)
         }
         _ => false,

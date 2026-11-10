@@ -3277,7 +3277,7 @@ jobs:
         # parity-checked).
         bash tests/regression/check_asm_goto_outputs.sh
         bash tests/regression/check_i686_label_ref_safety.sh
-        python3 tests/regression/check_llvm_guarded_folds.py
+        python3 tests/regression/check_llvm_guarded_folds.py --clang "$CLANG"
         python3 tests/regression/check_shift_count_demand.py
         bash tests/regression/check_fortify_diagnose_as.sh
         # UB-exploitation invariant (E22): `-fno-strict-aliasing`,
@@ -3784,6 +3784,8 @@ jobs:
           --lccc target/fastbuild/lccc --gcc "$GCC16" --clang "$CLANG" \
           --icx "$LCCC_ICX_BIN" --require-icx \
           --json intel-evidence/cond-load-sink-best-tools.json
+        python3 tests/regression/check_llvm_guarded_folds.py \
+          --clang "$CLANG" --icx "$LCCC_ICX_BIN" --require-icx
     - name: Vector integer-address snapshot against four compilers
       run: |
         set -euo pipefail

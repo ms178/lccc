@@ -2011,7 +2011,7 @@ gate "llvm-missed-zero-choice" fast python3 tests/regression/check_llvm_missed_z
 gate "llvm-integer-observations" fast python3 tests/regression/check_llvm_integer_observations.py
 gate "llvm-bit-demand" fast python3 tests/regression/check_llvm_bit_demand.py
 gate "llvm-scalar-facts" fast python3 tests/regression/check_llvm_scalar_facts.py
-gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py
+gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py --clang "${CLANG:-clang-23}"
 gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
 
 # Round 11: the AVX-512VL mask-compare differential is a hosted gate too
