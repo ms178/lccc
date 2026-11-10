@@ -66,11 +66,22 @@ REPO=$(pwd)
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
-export CARGO_BUILD_JOBS=2
+# Do NOT export CARGO_BUILD_JOBS here. The parameter expansion below is
+# deliberate (an explicitly EMPTY value still means "derive it"), and a
+# host-verified budget — engineering/verification/agent-env.sh exports
+# CARGO_BUILD_JOBS=1 precisely to protect a small host — must reach the gates
+# unchanged. An unconditional `export CARGO_BUILD_JOBS=2` on this line made the
+# documented "choose 1 below 6 GB RAM" branch dead code, and
+# `cargo test --profile fastbuild --all-targets -j 2` was then OOM-killed
+# (SIGKILL) on a 3.8 GiB host even with swap: fifteen test targets are linked
+# concurrently and the peak exceeded RAM+swap. scripts/test_ci_resources.py
+# pins the caller's value against both gate functions and both orderings.
+#
 # Research policy: the fastbuild wrapper must not silently drop to one job on
 # this low-RAM host. ensure_swap.sh installs the OOM backstop; the explicit
-# override keeps the requested two-job REACT cycle.
-export LCCC_BUILD_JOBS=2
+# override keeps the requested two-job REACT cycle. It uses its own variable so
+# it cannot couple the wrapper's budget to the Cargo gates' budget.
+export LCCC_BUILD_JOBS="${LCCC_BUILD_JOBS:-2}"
 # Same fingerprints for build, normal unit tests and clippy. Debug assertions
 # have their own target directory and explicitly disable incremental state.
 export CARGO_PROFILE_FASTBUILD_DEBUG="${CARGO_PROFILE_FASTBUILD_DEBUG:-0}"
