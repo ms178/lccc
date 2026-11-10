@@ -9,10 +9,9 @@
  * immediately in front of the `vpaddd`/`vpmulld`/`vpxor` that consumes them.
  * That is exactly the `movdqu N(%rsp), %xmmT ; vOP %xmmT, %xmmS, %xmmD` pair
  * the pass retires, producing `vpaddd 96(%rsp), %xmm14, %xmm14` in its place.
- * At -O2 -mavx2 this file folds 66 of them; `CCC_DEBUG_VLFUSE=1` prints the
- * count.  A regression test built only from straight maps would pass
- * vacuously, because there the intrinsic-level memfold machinery already
- * folds the stream loads and the pass finds nothing left to do.
+ * A regression test built only from straight maps would pass vacuously,
+ * because there the intrinsic-level memfold machinery already folds the
+ * stream loads and the pass finds nothing left to do.
  *
  * It also caught a real miscompile.  `vfmadd231sd %xmm1, %xmm1, %xmm12` is
  * Intel `VFMADD231SD xmm12, xmm1, xmm1`: `%xmm1` is both the foldable `r/m`

@@ -750,105 +750,8 @@ fn slot_foldable(mnemonic: &str, operands: &str, spans: &[(usize, usize)], slot:
     }
 }
 
-/// Rejection census for `CCC_DEBUG_VLFUSE=1`: counts *why* candidates were
-/// declined so a tuning session can tell "no opportunity here" apart from
-/// "the gate is too strict".
-#[derive(Default)]
-struct Census {
-    candidates: usize,
-    no_consumer: usize,
-    not_foldable: usize,
-    temp_live: usize,
-    upper_live: usize,
-    alignment: usize,
-    width: usize,
-    folded: usize,
-}
-
-static CENSUS: std::sync::Mutex<Census> = std::sync::Mutex::new(Census {
-    candidates: 0,
-    no_consumer: 0,
-    not_foldable: 0,
-    temp_live: 0,
-    upper_live: 0,
-    alignment: 0,
-    width: 0,
-    folded: 0,
-});
-
-/// `CCC_DEBUG_VLFUSE=1` dumps the rejection census to stderr once per process.
-pub(super) fn dump_census() {
-    if std::env::var_os("CCC_DEBUG_VLFUSE").is_none() {
-        return;
-    }
-    if let Ok(c) = CENSUS.lock() {
-        crate::cli::stderr_line(format_args!(
-            "[VLFUSE] candidates={} folded={} no_consumer={} not_foldable={} temp_live={} upper_live={} alignment={}",
-            c.candidates,
-            c.folded,
-            c.no_consumer,
-            c.not_foldable,
-            c.temp_live,
-            c.upper_live,
-            c.alignment
-        ));
-    }
-    dump_rejects();
-}
-
-/// Mnemonic histogram of the consumers `try_fold` declined, so a tuning
-/// session can see which instruction families are missing from the
-/// allow-lists instead of guessing.
-static REJECTS: std::sync::Mutex<Option<std::collections::BTreeMap<String, usize>>> =
-    std::sync::Mutex::new(None);
-
-fn census_reject(mnemonic: &str) {
-    census_bump("not_foldable");
-    if std::env::var_os("CCC_DEBUG_VLFUSE").is_none() {
-        return;
-    }
-    if let Ok(mut m) = REJECTS.lock() {
-        *m.get_or_insert_with(Default::default)
-            .entry(mnemonic.to_string())
-            .or_default() += 1;
-    }
-}
-
-/// Print the decline histogram.  Called from [`dump_census`].
-fn dump_rejects() {
-    if let Ok(m) = REJECTS.lock() {
-        if let Some(map) = &*m {
-            let mut rows: Vec<_> = map.iter().collect();
-            rows.sort_by(|a, b| b.1.cmp(a.1));
-            let top: Vec<String> = rows
-                .iter()
-                .take(24)
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect();
-            crate::cli::stderr_line(format_args!("[VLFUSE] declined: {}", top.join(" ")));
-        }
-    }
-}
-
-fn census_bump(kind: &str) {
-    if std::env::var_os("CCC_DEBUG_VLFUSE").is_none() {
-        return;
-    }
-    if let Ok(mut c) = CENSUS.lock() {
-        match kind {
-            "cand" => c.candidates += 1,
-            "no_consumer" => c.no_consumer += 1,
-            "not_foldable" => c.not_foldable += 1,
-            "temp_live" => c.temp_live += 1,
-            "upper_live" => c.upper_live += 1,
-            "alignment" => c.alignment += 1,
-            "folded" => c.folded += 1,
-            _ => {}
-        }
-    }
-}
-
 /// Fuse `movups MEM, %xmmT … OP %xmmT, %xmmD` into `OP MEM, %xmmD`.
+///
 pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut fp: Option<FpLiveness> = None;
@@ -873,7 +776,6 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         };
-        census_bump("cand");
         let Some(t_num) = vec_reg_index(t_reg) else {
             i += 1;
             continue;
@@ -911,7 +813,6 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
             j = next_insn(store, infos, j + 1, len);
         }
         let Some(j) = consumer else {
-            census_bump("no_consumer");
             i += 1;
             continue;
         };
@@ -942,12 +843,10 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
         if cons_mnemonic.and_then(|m| uniform_width_bytes(m, t_class))
             != uniform_width_bytes(load_mnemonic, t_class)
         {
-            census_bump("width");
             i += 1;
             continue;
         }
         let Some(new_line) = try_fold(&cons, &mem, t_reg) else {
-            census_reject(cons_mnemonic.unwrap_or("?"));
             i += 1;
             continue;
         };
@@ -957,7 +856,6 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
         if cons_mnemonic.is_some_and(fold_needs_aligned_load)
             && !ALIGNED_VEC_LOADS.contains(&load_mnemonic)
         {
-            census_bump("alignment");
             i += 1;
             continue;
         }
@@ -966,21 +864,12 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
         // regions.
         let oracle = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
         if oracle.xmm_live_after(j, t_num) != Some(false) {
-            census_bump("temp_live");
             i += 1;
             continue;
         }
         if load_text.trim_start().starts_with('v') && !oracle.upper_regions_dead_after(j, t_num) {
-            census_bump("upper_live");
             i += 1;
             continue;
-        }
-        census_bump("folded");
-        if std::env::var("CCC_DEBUG_VLFUSE").is_ok() {
-            eprintln!(
-                "[VLFUSE] fold i={} j={} load={:?} cons={:?} new={:?}",
-                i, j, load_text, cons, new_line
-            );
         }
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, new_line);

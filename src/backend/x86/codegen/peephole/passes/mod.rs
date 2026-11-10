@@ -511,7 +511,6 @@ pub(crate) fn peephole_optimize_with_config(
     if std::env::var("CCC_NO_VEX_PROMOTE").is_err() {
         let _ = vex_promote::promote_legacy_sse_to_vex(&mut out);
     }
-    vector_load_op_fuse::dump_census();
     out
 }
 
