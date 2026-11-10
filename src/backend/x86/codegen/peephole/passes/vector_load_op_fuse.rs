@@ -816,6 +816,12 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
             continue;
         }
         census_bump("folded");
+        if std::env::var("CCC_DEBUG_VLFUSE").is_ok() {
+            eprintln!(
+                "[VLFUSE] fold i={} j={} load={:?} cons={:?} new={:?}",
+                i, j, load_text, cons, new_line
+            );
+        }
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, new_line);
         changed = true;
@@ -840,6 +846,21 @@ fn try_fold(cons: &str, mem: &str, t_reg: &str) -> Option<String> {
     let slot = spans[..last]
         .iter()
         .position(|(lo, hi)| operands[*lo..*hi].trim() == t_reg)?;
+    // `%xmmT` must appear in exactly one source slot.  A second occurrence
+    // stays behind when the load retires and would then read whatever the
+    // register held *before* the load instead of the loaded value — the
+    // retired load is the only thing that made the two agree.  The shape is
+    // not exotic: AT&T `vfmadd231sd %xmm1, %xmm1, %xmm12` is Intel
+    // `VFMADD231SD xmm12, xmm1, xmm1`, where `%xmm1` is both the foldable
+    // `r/m` operand and the VEX.vvvv addend.  Refusing costs one load in a
+    // fused-multiply-add; getting it wrong corrupts the addend.
+    if spans[..last]
+        .iter()
+        .enumerate()
+        .any(|(k, (lo, hi))| k != slot && operands[*lo..*hi].trim() == t_reg)
+    {
+        return None;
+    }
     if !slot_foldable(mnemonic, operands, &spans, slot) {
         return None;
     }
@@ -1001,6 +1022,37 @@ mod tests {
             "    vmovups (%rdx), %ymm3\n    vsubps %ymm3, %ymm4, %ymm5\n    vmovups %ymm5, (%rdi)\n    ret",
         );
         assert!(out.contains("vsubps (%rdx), %ymm4, %ymm5"), "{out}");
+    }
+
+    #[test]
+    fn refuses_when_the_temporary_is_also_the_vex_vvvv_addend() {
+        // AT&T `vfmadd231sd %xmm1, %xmm1, %xmm12` is Intel
+        // `VFMADD231SD xmm12, xmm1, xmm1`: `%xmm1` is both the foldable `r/m`
+        // operand and the VEX.vvvv addend.  Retiring the load would leave the
+        // addend reading `%xmm1` as it was *before* the load, which is a
+        // miscompile.  This is the exact shape that broke
+        // tests/regression/fma_slot_operand_staging.c.
+        assert_unchanged(
+            "    movsd 48(%rsp), %xmm1\n    vfmadd231sd %xmm1, %xmm1, %xmm12\n    ret",
+        );
+    }
+
+    #[test]
+    fn refuses_when_the_temporary_is_both_scalar_sources() {
+        // Same hazard one mnemonic family over: `%xmm1` is `r/m` and the
+        // `vvvv` addend of a `vaddsd` with a distinct destination.
+        assert_unchanged("    movsd 8(%rsp), %xmm1\n    vaddsd %xmm1, %xmm1, %xmm2\n    ret");
+    }
+
+    #[test]
+    fn declines_when_the_temporary_is_also_the_destination() {
+        // A VEX destination is a pure write, so this shape would be sound,
+        // but the pass declines every destination-aliasing form rather than
+        // model the difference, and a legacy two-operand destination is a
+        // genuine read.  Pinned so the conservative choice is deliberate.
+        assert_unchanged(
+            "    vmovups (%rdx), %ymm1\n    vaddps %ymm1, %ymm4, %ymm1\n    vmovups %ymm1, (%rdi)\n    ret",
+        );
     }
 
     #[test]
