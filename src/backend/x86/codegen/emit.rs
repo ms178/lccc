@@ -9667,7 +9667,20 @@ impl ArchCodegen for X86Codegen {
         self.machinst_buf_ir.clear();
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
+        // A BOOKKEEPING flush, not a register clobber: every instruction in
+        // `machinst_buf` was already accounted for when it was generated (its
+        // emitter ran `set_vec_home_reg` / `vec_evict_bank_*` / the store
+        // helpers), so committing the buffer changes no vector register.
+        //
+        // `invalidate_vec_peephole` nevertheless clears the home-content map,
+        // because for every OTHER caller (calls, unknown control flow, opaque
+        // asm) the registers really are dead. Preserving just that map here is
+        // what lets a loop-invariant vector constant stay in its YMM register
+        // past a buffer boundary: without it the clamp bounds were re-read
+        // from their stack slots on every iteration after the first.
+        let home_reg = std::mem::take(&mut self.state.vec_home_reg);
         self.state.invalidate_vec_peephole();
+        self.state.vec_home_reg = home_reg;
     }
 
     fn emit_reg_to_reg_move(&mut self, src: PhysReg, dest: PhysReg) {

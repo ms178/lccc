@@ -76,6 +76,32 @@ pub(super) enum BlendvDomain {
     Int,
 }
 
+/// A resolved source operand for a 256-bit VEX instruction: either a tiled
+/// memory operand (the fold case) or a register the value is already in.
+///
+/// In AT&T VEX syntax only the FIRST source may be memory, and a register is
+/// legal in exactly that position, so `vminps 0x28(%rsp), %ymm0, %ymm0` and
+/// `vminps %ymm15, %ymm0, %ymm0` are the SAME instruction with the SAME
+/// semantics -- one instruction each. Substituting the register therefore costs
+/// nothing while removing a load uop and the stack traffic from every iteration
+/// of a hot loop.
+#[derive(Clone, Debug)]
+enum VecArgSrc {
+    Mem(String),
+    Reg(&'static str),
+}
+
+/// Renders as a bare memory operand or a `%reg` register operand, so every
+/// existing `format_args!("... {} ...", src)` site keeps working unchanged.
+impl core::fmt::Display for VecArgSrc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            VecArgSrc::Mem(m) => f.write_str(m),
+            VecArgSrc::Reg(r) => write!(f, "%{}", r),
+        }
+    }
+}
+
 impl X86Codegen {
     /// Emitter-side commutativity table for the 128-bit VEX memfold: may the
     /// folded load sit in the IR args[0] (src1) position? The IR analysis
@@ -2509,8 +2535,16 @@ impl X86Codegen {
         args: &[Operand],
         dest_ptr: &Option<Value>,
         mnemonic: &str,
-        source_reg: &str,
+        source_reg: &'static str,
     ) {
+        let home = if args.len() >= 3 {
+            match &args[1] {
+                Operand::Value(v) => Some(v.0),
+                _ => None,
+            }
+        } else {
+            dest_ptr.map(|p| p.0)
+        };
         if args.len() >= 3 {
             let disp = Self::vec_disp_arg(args, 3);
             let mem = self.vec_mem_operand(&args[1], &args[2], disp);
@@ -2520,6 +2554,31 @@ impl X86Codegen {
             self.operand_to_reg(&Operand::Value(*ptr), "rax");
             self.state
                 .emit_fmt(format_args!("    {} %{}, (%rax)", mnemonic, source_reg));
+        }
+        // HOME-CONTENT CLAIM. A whole-register store leaves the home's slot AND
+        // `source_reg` both holding the value, so a later read of the home may
+        // take the register instead of reloading. This is what lets a
+        // loop-invariant vector constant (a clamp's `lo`/`hi`) stay in its YMM
+        // register across every iteration instead of being spilled once and
+        // re-read as a memory operand on each use.
+        //
+        // Gated on a DIRECT STACK SLOT -- the home must be a private frame
+        // object, so no caller or aliasing store can observe or replace its
+        // contents behind the backend's back. A computed or parameter pointer
+        // (`*out = v`) is deliberately not tracked.
+        //
+        // Soundness rests on bank eviction, which the shared helpers now apply
+        // to this map: any write to `source_reg`'s bank drops the entry, so the
+        // register provably still holds the stored value whenever the entry is
+        // present. Scratch banks are refused outright by `set_vec_home_reg`.
+        if let Some(home) = home {
+            let private_slot = matches!(
+                self.state.resolve_slot_addr(home),
+                Some(crate::backend::state::SlotAddr::Direct(_))
+            );
+            if private_slot {
+                self.state.set_vec_home_reg(home, Some(source_reg));
+            }
         }
     }
 
@@ -12156,13 +12215,19 @@ impl X86Codegen {
         false
     }
 
-    fn emit_avx_binary_256_inner(
+    /// Consume -- or, failing that, materialise -- a pending 256-bit memory
+    /// fold for this operation.
+    ///
+    /// Returns `true` when the instruction has been emitted and the caller must
+    /// return immediately; `false` when the fold does not name one of this op's
+    /// operands, or was materialised, so the ordinary paths should run.
+    fn try_emit_avx_256_memfold(
         &mut self,
         dest_ptr: &Value,
         args: &[Operand],
         avx_inst: &str,
         commutative: bool,
-    ) {
+    ) -> bool {
         // VLFOLD register forms. `acc' = op(acc, load)` with acc/acc' in one
         // YMM family becomes the single ICX reduction instruction
         // `op mem, %ymmA, %ymmA`; a homed non-accumulator source (map
@@ -12249,7 +12314,7 @@ impl X86Codegen {
                             self.avx_store_dest(dest_ptr);
                         }
                         self.state.pending_vec_memfold = None;
-                        return;
+                        return true;
                     }
                     // No register source for the other operand (slot-homed
                     // splat, foreign-width... ): the fold cannot be consumed
@@ -12261,6 +12326,19 @@ impl X86Codegen {
                     }
                 }
             }
+        }
+        false
+    }
+
+    fn emit_avx_binary_256_inner(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        avx_inst: &str,
+        commutative: bool,
+    ) {
+        if self.try_emit_avx_256_memfold(dest_ptr, args, avx_inst, commutative) {
+            return;
         }
 
         // In AT&T VEX syntax only the first textual source may be memory.
@@ -12344,12 +12422,27 @@ impl X86Codegen {
             }
         }
 
-        let mem_of = |this: &Self, arg: &Operand| -> Option<String> {
+        let mem_of = |this: &Self, arg: &Operand| -> Option<VecArgSrc> {
             if let Some(mem) = this.memfold_operand(arg) {
-                return Some(mem);
+                return Some(VecArgSrc::Mem(mem));
             }
             match arg {
                 Operand::Value(v) => {
+                    // REGISTER FIRST: a whole-register store proved this home's
+                    // contents resident in an allocator-owned YMM register, so
+                    // take it as a REGISTER source.
+                    //
+                    // This must be tested BEFORE `vec_arg_register_held` below,
+                    // which answers a different question -- "may this value's
+                    // slot be stale" -- about the home's own SSA value, not
+                    // about the contents the home holds.
+                    //
+                    // Width-exact: `vec_home_reg_256` only ever yields "ymmN"
+                    // names recorded by 32-byte stores, so all 32 bytes the
+                    // instruction will read are present in the register.
+                    if let Some(reg) = this.state.vec_home_reg_256(v.0) {
+                        return Some(VecArgSrc::Reg(reg));
+                    }
                     // A register-held value has a possibly-unwritten slot. The
                     // three-record test is shared with `vec_arg_mem`, evaluated
                     // WITHOUT mutating the deferred state: the branches below
@@ -12359,7 +12452,7 @@ impl X86Codegen {
                     {
                         return None;
                     }
-                    this.value_ptr_mem_operand(v.0)
+                    this.value_ptr_mem_operand(v.0).map(VecArgSrc::Mem)
                 }
                 _ => None,
             }

@@ -2148,7 +2148,22 @@ impl X86Codegen {
         // the store pending can never expose an unwritten slot.
         if !self.pending_vec_store_consumed_by(op, args) {
             self.flush_pending_vec_store_impl();
-            self.state.invalidate_vec_peephole();
+            // PRECISE invalidation, not the blanket `invalidate_vec_peephole`.
+            //
+            // Every path this family can take writes only the scratch pair
+            // (%ymm0, and %ymm1 for the two-source forms) plus the
+            // destination's OWN register -- and each of those paths records
+            // that write immediately (`vec_claim_live_reg` /
+            // `avx_store_dest_*`), which evicts the destination's bank on its
+            // own. So the only banks this prologue has to retire are 0 and 1.
+            //
+            // Clearing every allocator claim here instead retired the
+            // loop-invariant clamp bounds after their FIRST use, so the
+            // constant was re-read from its stack slot on all eight iterations
+            // while GCC and Clang kept it in a register for the whole body.
+            self.state.invalidate_vec_scratch_peephole();
+            self.state.vec_evict_bank("ymm0");
+            self.state.vec_evict_bank("ymm1");
         }
         // binary 3-op
         let binary = |this: &mut Self, inst: &str, commutative: bool| {
