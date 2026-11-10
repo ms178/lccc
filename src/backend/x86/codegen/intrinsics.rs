@@ -100,6 +100,7 @@ impl core::fmt::Display for VecArgSrc {
             VecArgSrc::Reg(r) => write!(f, "%{}", r),
         }
     }
+}
 
 /// Per-lane width of an SSE2 lane-mask select (`vblendvps`/`vblendvpd`
 /// semantics).  `None` at the call site means "no canonicalization": the
