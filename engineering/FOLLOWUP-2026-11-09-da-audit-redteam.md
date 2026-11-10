@@ -96,3 +96,22 @@ been double-counting. Verdicts:
 3. `-static-pie` (`rcrt1.o`) if a golden workload requests it.
 4. A reachable reproducer for the `typeof` fallback, or delete the TODO
    with the probe matrix as evidence.
+
+## Post-merge red-team sweep (2026-11-11, `fc8350a`)
+
+Baseline is the merge of PR #1174 (`fc8350a`). The toolchain is the pinned
+`harness-cache-8` tag (`d66c5ac881e2`): Rust 1.99.1, GCC 16.2, Clang 23.1.5,
+GDB 18.1, Valgrind 3.19, binutils 2.47, qemu-user 11.1.3, plus exactly 4 GiB
+of active swap. Detailed evidence and decisions live in
+`engineering/REDTEAM-2026-11-11-I128-TYPEOF.md`.
+
+| Follow-up | Post-merge verdict |
+|---|---|
+| 1. RAP-04/RAP-05 | **Still open, one measured slice landed.** The generic x86-64 128x128 multiply was the last stack-round-trip in the dynamic multiply path and is now an 8-instruction register-only sequence. The allocator/IR legalisation that dominates `k_bn_mul128` is a multi-week programme and is NOT claimed complete; the target ≤1.1× GCC remains unmet. |
+| 2. DA-04 | **No change.** A scan of 3,249 real `tests/**/*.c` TUs found max parenthesis nesting 8; the only 16,385-brace file is the deliberate `clang-c/Parser/parser_overflow.c` adversarial case. No real TU reaches a budget. |
+| 3. `-static-pie` | **No change.** No golden workload requests it and `rcrt1.o` support is still absent; the honest hard error stays. |
+| 4. `typeof` TODO | **Done.** A 15-shape negative matrix (identifier, member, arrow, call, subscript, address-of, deref, nested, sizeof, bad subscript, cast, binary, comma, conditional, statement expression) is rejected by LCCC, GCC 16.2 and Clang 23.1.5 with a named unresolved operand. A positive 7-result `typeof` matrix is bit-identical. The fallback comment is now an explicit recovery-only contract; adding a second diagnostic would double-report. |
+
+The sweep also removed the unreachable x86 `prep_i128_binop` twin that still
+contained the old push/pop sequence, and added raw-emitter, peephole-disabled,
+`-O2`/`-O3`, ELF/Capstone, cross-ISA and differential regression gates.
