@@ -102,7 +102,7 @@ fi
 #
 # The hosted fixture needs <stdio.h>, and this host has no 32-bit libc headers,
 # so the i686 leg uses the freestanding sibling and runs it natively.
-I686_SRC="$ROOT/tests/regression/f16_i686_freestanding.c"
+I686_SRC="$ROOT/tests/regression/i686_fma/f16_i686_freestanding.c"
 I686_FLAGS="-m32 -O2 -w -ffreestanding -nostdlib -static -fno-pic"
 case "$(uname -m)" in
 x86_64|amd64)

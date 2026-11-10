@@ -319,7 +319,15 @@ int main(void) {
     }
     /* 512-bit: needs -mavx512f, which the driver only passes for this row.
      * The store bug this catches is the one `evex_store_dest` had: it always
-     * stored `%zmm0`, so 213/231 published `a`. */
+     * stored `%zmm0`, so 213/231 published `a`.
+     *
+     * GUARDED BY THE FEATURE, NOT BY THE DRIVER.  `check_fma_digit_permutation.sh`
+     * appends `-mavx512f` only when /proc/cpuinfo advertises avx512f, so on a
+     * runner without it the row count drops to 54 -- and an unguarded block
+     * would fail to COMPILE there, turning a host limitation into a red gate.
+     * The gate's own expected count follows the same macro, so the two cannot
+     * drift: 126 rows with AVX-512F, 54 without. */
+#if defined(__AVX512F__)
     {
         float got[16];
         { void *r = __lccc_simd512_ps_vfmadd132ps512(0, (void *)ga_v, (void *)gb_v,
@@ -368,7 +376,8 @@ int main(void) {
             printf("pd512_231 lane%d %.1f want %.1f\n", i, got[i], want_h[i]);
         }
     }
-#endif
+#endif /* __AVX512F__ */
+#endif /* FMA_DIGIT_PROBE */
     printf("checksum %016llx\n", (unsigned long long)h);
     return 0;
 }

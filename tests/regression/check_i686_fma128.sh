@@ -51,8 +51,8 @@ while [ $# -gt 0 ]; do
 done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SRC="$ROOT/tests/regression/i686_fma128.c"
-PREFIX_SRC="$ROOT/tests/regression/i686_fma128_prefix.c"
+SRC="$ROOT/tests/regression/i686_fma/i686_fma128.c"
+PREFIX_SRC="$ROOT/tests/regression/i686_fma/i686_fma128_prefix.c"
 CC="${LCCC:-$ROOT/target/fastbuild/lccc}"
 for f in "$SRC" "$PREFIX_SRC"; do
     [ -f "$f" ] || { echo "FAIL: missing source $f" >&2; exit 1; }
