@@ -723,6 +723,9 @@ int main(void) {
         removes every remaining StreamEntry clone from the run splitter, keeps
         site buckets in first-appearance order, bounds GEP recursion, and
         makes hash collisions executable with a forced-collision test seam.
+        The zero-copy follow-up makes the site tier a BORROWED partition,
+        shares one generic owned/borrowed run core, skips singleton buckets,
+        and makes malformed seeds decline instead of panic.
         These asserts have teeth: they pin the algorithmic invariants that a
         "simplification" can silently destroy (quadratic site partition,
         lossy boolean identity, value-collapsed LaneKey, unbounded recursion),
@@ -757,25 +760,51 @@ int main(void) {
         code = (ROOT / "src" / "passes" / "slp_vectorizer.rs").read_text()
         joint = (ROOT / "src" / "passes" / "slp_vectorizer" / "joint.rs").read_text()
         self.assertIn("pub(super) type StreamEntry", code)
-        self.assertIn("fn site_subsets(", code)
+        self.assertIn("fn site_subsets<'a>(", code)
         self.assertIn("if entries.iter().all(|e| e.4 == only_base)", code,
                       "zero-allocation single-web fast path must survive")
-        self.assertIn("let idx = match index.entry(e.4)", code,
+        self.assertIn("let idx = match index.entry(e.base())", code,
                       "O(n) single-pass bucket build must survive")
-        self.assertIn("buckets[idx].push(e.clone())", code,
+        self.assertIn("Vec<Vec<&'a StreamEntry>>", code,
+                      "site partitions must be borrowed, not cloned")
+        self.assertIn("buckets[idx].push(e);", code,
                       "first-appearance-ordered buckets must stay exact")
+        self.assertNotIn("buckets[idx].push(e.clone())", code,
+                         "no 64-byte StreamEntry clone may return")
+        self.assertIn("trait StreamEntryRef", code,
+                      "one generic core must cover owned and borrowed views")
+        self.assertIn("fn push_sorted<E: StreamEntryRef>", code,
+                      "the borrowed/owned run splitter must stay shared")
+        self.assertIn("candidates.extend(site_candidates)", code,
+                      "object-first/site-second tier ordering must survive")
+        self.assertIn("if subset.len() < 2", code,
+                      "singleton site buckets must not pay for sort/split")
+        self.assertIn("if cand.store_idx.is_empty()", code,
+                      "malformed seeds must fail closed before any indexing")
+        self.assertIn("fn seed_stream_layout_is_pahole_equivalent", code,
+                      "size/align/offset layout proof must stay")
+        self.assertIn("fn site_subsets_borrows_original_entries_without_copying", code,
+                      "pointer-identity zero-copy proof must stay")
+        self.assertIn("fn push_sorted_owned_and_borrowed_views_are_identical", code,
+                      "owned/borrowed parity proof must stay")
+        self.assertIn("fn build_plan_fails_closed_on_malformed_seed_spans", code,
+                      "fail-closed seed guard proof must stay")
+        self.assertIn("fn site_subsets_borrowed_partition_bench", code,
+                      "Callgrind microbenchmark seam must stay")
         self.assertNotIn("entries.iter().filter(|e| e.4 == base)", code,
                          "the O(n*b) quadratic site partition must not return")
         self.assertNotIn("buckets.into_values().collect()", code,
                          "hash-table iteration must not reorder tied candidates")
-        self.assertIn("fn emit_run(", code,
+        self.assertIn("fn emit_run<E: StreamEntryRef>(", code,
                       "run slices must be borrowed, not cloned into a Vec")
         self.assertNotIn("run.push(entry.clone())", code,
                          "no per-store StreamEntry clone may return")
         self.assertNotIn("offs.dedup()", code,
                          "a duplicate cannot occur inside a strided run")
-        self.assertIn("Vec<&StreamEntry>", code,
-                      "joint windows must borrow the sorted stream")
+        self.assertIn("let mut last: Vec<&E>", code,
+                      "joint windows must hold generic zero-copy views")
+        self.assertIn("impl<T: StreamEntryRef + ?Sized> StreamEntryRef for &T", code,
+                      "one blanket impl must cover every borrowed view")
         self.assertNotIn("let mut last: Vec<StreamEntry>", code,
                          "the joint path must not clone every store")
         self.assertNotIn("eval_sym_addr_d(block, def_pos, *base, depth.saturating_sub(1))",
@@ -809,8 +838,10 @@ int main(void) {
         self.assertIn("pub alpha: u8", joint)
         self.assertIn("i32::from(self.alpha)", joint)
         self.assertIn("for alpha in 0u8..4", joint)
-        self.assertIn("run: &[&StreamEntry]", joint,
-                      "joint seed must consume borrowed stream entries")
+        self.assertIn("run: &[E]", joint,
+                      "joint seed must be generic over owned/borrowed views")
+        self.assertIn("E: StreamEntryRef", joint,
+                      "joint seed must reuse the zero-copy view trait")
         # LaneKey value-equivalence is load-bearing for s_clamp_u8 (test_30).
         self.assertIn("enum LaneKey", code)
         self.assertIn("I8(0)", code)
@@ -959,6 +990,87 @@ int main(int argc, char **argv) {
                 r = run([exe], self.d)
                 self.assertEqual(r.returncode, 0, r.stdout)
                 self.assertEqual(r.stdout, "")
+
+
+    def test_39_cross_backend_deep_gep_and_multi_object_streams_are_clean(self):
+        """Every shipped backend must survive the two-tier seed audit.
+
+        A 64-deep pointer chain exercises the bounded GEP recursion; 32
+        file-scope objects with four consecutive dword stores each exercise
+        the one-map object tier and the zero-allocation single-web site fast
+        path.  All five binaries must emit deterministic, warning-free
+        assembly.  On the host x86-64 backend, GCC 16.2, Clang 23.1.5 and
+        LCCC must additionally agree on the native runtime result.
+        """
+        lines = ["#include <stdint.h>", "uint32_t g[128];"]
+        for j in range(32):
+            lines.append(f"uint32_t h{j}[4];")
+        lines += ["int main(void) {", "    uint32_t *p = g;"]
+        lines += ["    p = p + 1;" for _ in range(64)]
+        lines += [
+            "    *p = 0x12345678u;",
+            "    for (int j = 0; j < 32; j++) {",
+            "        uint32_t *q = (j == 0) ? h0 : (j == 1) ? h1 : (j == 2) ? h2 : (j == 3) ? h3 :",
+            "                     (j == 4) ? h4 : (j == 5) ? h5 : (j == 6) ? h6 : (j == 7) ? h7 :",
+            "                     (j == 8) ? h8 : (j == 9) ? h9 : (j == 10) ? h10 : (j == 11) ? h11 :",
+            "                     (j == 12) ? h12 : (j == 13) ? h13 : (j == 14) ? h14 : (j == 15) ? h15 :",
+            "                     (j == 16) ? h16 : (j == 17) ? h17 : (j == 18) ? h18 : (j == 19) ? h19 :",
+            "                     (j == 20) ? h20 : (j == 21) ? h21 : (j == 22) ? h22 : (j == 23) ? h23 :",
+            "                     (j == 24) ? h24 : (j == 25) ? h25 : (j == 26) ? h26 : (j == 27) ? h27 :",
+            "                     (j == 28) ? h28 : (j == 29) ? h29 : (j == 30) ? h30 : h31;",
+            "        q[0] = (uint32_t)j + 0u; q[1] = (uint32_t)j + 1u;",
+            "        q[2] = (uint32_t)j + 2u; q[3] = (uint32_t)j + 3u;",
+            "    }",
+            "    return g[64] == 0x12345678u && h31[3] == 34u ? 0 : 1;",
+            "}",
+        ]
+        src = self.d / "cross_seed_stress.c"
+        src.write_text("\n".join(lines) + "\n")
+        flags = ["-O2", "-Wall", "-Wextra", "-Werror", "-Wpedantic", "-S"]
+        bins = ["lccc", "lccc-i686", "lccc-arm", "lccc-riscv", "lccc-x86"]
+        for name in bins:
+            binary = ROOT / "target" / "fastbuild" / name
+            if not binary.is_file():
+                self.skipTest(f"fastbuild binary absent: {name}")
+            with self.subTest(backend=name):
+                first = self.d / f"{name}_cross.s"
+                second = self.d / f"{name}_cross_repeat.s"
+                a = compile_ok(binary, src, first, flags)
+                self.assertEqual(a.returncode, 0, a.stderr)
+                self.assertEqual(a.stderr.strip(), "",
+                                 f"{name} emitted diagnostics")
+                self.assertNotIn("panicked", a.stderr)
+                c = compile_ok(binary, src, second, flags)
+                self.assertEqual(c.returncode, 0, c.stderr)
+                self.assertEqual(first.read_bytes(), second.read_bytes(),
+                                 f"{name} codegen is nondeterministic")
+
+        def present(compiler):
+            return Path(compiler).is_file() or shutil.which(str(compiler)) is not None
+
+        native = ["-O2", "-Wall", "-Wextra", "-Werror", "-Wpedantic"]
+        results = []
+        for name, compiler in [("lccc", LCCC), ("gcc16", GCC), ("clang23", CLANG)]:
+            if not present(compiler):
+                self.skipTest(f"compiler absent: {compiler}")
+            with self.subTest(native=name):
+                exe = self.d / f"cross_{name}"
+                c = compile_ok(compiler, src, exe, native,
+                               env={"LCCC_DEBUG_SLP": "1",
+                                    "CCC_DISABLE_PASSES": "gaddrcse"}
+                               if name == "lccc" else None)
+                self.assertEqual(c.returncode, 0, c.stderr)
+                for line in c.stderr.splitlines():
+                    if line.strip():
+                        self.assertTrue(
+                            line.startswith("[SLP-SEEDS]") or "warning:" not in line.lower(),
+                            f"{name} emitted an unexpected diagnostic: {line!r}",
+                        )
+                self.assertNotIn("panicked", c.stderr)
+                r = run([exe], self.d)
+                results.append((name, r.returncode, r.stdout))
+        self.assertEqual(len(set((rc, out) for _, rc, out in results)), 1,
+                         f"native parity diverged: {results}")
 
 
 if __name__ == "__main__":

@@ -273,20 +273,29 @@ fn leaves(ctx: &BlockCtx, o: &Operand, out: &mut Vec<Operand>, fuel: usize) -> O
     Some(())
 }
 
-pub(super) fn seed(ctx: &BlockCtx, run: &[&StreamEntry]) -> Option<SeedCandidate> {
+/// Joint seed over FOUR consecutive byte stores.
+///
+/// Generic over owned or borrowed `StreamEntry` views so the object tier can
+/// pass its already-sorted owned slice and the site tier can pass a borrowed
+/// partition without either tier cloning a 64-byte entry.  The byte-store
+/// legality proof (`wide_store_source` + `find_tail`) is unchanged.
+pub(super) fn seed<E: StreamEntryRef>(ctx: &BlockCtx, run: &[E]) -> Option<SeedCandidate> {
     if run.len() != 4 || !x86_sse41_available_pub() {
         return None;
     }
     let sources: Vec<_> = run
         .iter()
-        .map(|r| wide_store_source(ctx, &r.2))
+        .map(|r| {
+            let v = r.val();
+            wide_store_source(ctx, &v)
+        })
         .collect::<Option<_>>()?;
     let (lane_ops, ty, tail) = find_tail(ctx, &sources)?;
     Some(SeedCandidate {
-        store_idx: run.iter().map(|r| r.1).collect(),
+        store_idx: run.iter().map(|r| r.idx()).collect(),
         lane_ops,
         ty,
-        anchor_ptr: run[0].3,
+        anchor_ptr: run[0].ptr(),
         width: 4,
         joint: Some(tail),
         value_sink: None,
