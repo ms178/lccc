@@ -1888,6 +1888,8 @@ jobs:
       run: bash tests/regression/check_fma_digit_permutation.sh --lccc target/fastbuild/lccc --reference gcc-16
     - name: Prove the FMA digit gate goes red on the pre-fix placement
       run: bash tests/regression/check_fma_digit_permutation.sh --lccc tests/regression/fma_prefix_standin.sh --expect-defect
+    - name: i686 128-bit VEX FMA3 must compile and compute a*b+c (SA-11)
+      run: bash tests/regression/check_i686_fma128.sh --lccc target/fastbuild/lccc
     needs:
     - build
   backend:

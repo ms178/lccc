@@ -2155,6 +2155,56 @@ impl I686Codegen {
                 }
             }
 
+            // FMA 128: args = [a, b, c] -> `a*b + c`, the VEX.128 spelling.
+            //
+            // This arm did not exist, and its absence was a hard CRASH, not a
+            // missing feature: `_mm_fmadd_ps` (and every other 128-bit
+            // spelling) lowers to `FmaPs132` + friends, which fell through to
+            // the catch-all `reject_value_form` and PANICKED with
+            // "i686 emit_intrinsic: FmaPs132 produces a value (dest) but only
+            // the dest_ptr form is supported here".  Measured: `-m32 -mavx
+            // -mfma` on `_mm_fmadd_ps` aborted the compiler, while GCC 16.2 and
+            // Clang 23.1.5 both compile the same source to one `vfmadd132ps`.
+            // The 128-bit VEX forms are therefore part of this target's
+            // contract even though `x86_isa()` keeps the 256-bit vectorizer
+            // ceiling at NONE for it.
+            IntrinsicOp::FmaPs132
+            | IntrinsicOp::FmaPs213
+            | IntrinsicOp::FmaPs231
+            | IntrinsicOp::FmaPd132
+            | IntrinsicOp::FmaPd213
+            | IntrinsicOp::FmaPd231 => {
+                if let Some(dptr) = dest_ptr {
+                    let inst = match op {
+                        IntrinsicOp::FmaPs132 => "vfmadd132ps",
+                        IntrinsicOp::FmaPs213 => "vfmadd213ps",
+                        IntrinsicOp::FmaPs231 => "vfmadd231ps",
+                        IntrinsicOp::FmaPd132 => "vfmadd132pd",
+                        IntrinsicOp::FmaPd213 => "vfmadd213pd",
+                        IntrinsicOp::FmaPd231 => "vfmadd231pd",
+                        _ => unreachable!("unexpected 128-bit FMA op: {:?}", op),
+                    };
+                    // Same role table as the 256-bit arm and both x86-64
+                    // widths: `fma_role_order` stays the one authority.
+                    let (rm, vvvv, dst): (&'static str, &'static str, &'static str) =
+                        match fma_role_order(inst) {
+                            FmaRoleOrder::RmBVvvvCDstA => ("xmm1", "xmm2", "xmm0"),
+                            FmaRoleOrder::RmCVvvvADstB => ("xmm2", "xmm0", "xmm1"),
+                            FmaRoleOrder::RmBVvvvADstC => ("xmm1", "xmm0", "xmm2"),
+                        };
+                    self.emit_avx_load128(&args[0], "xmm0"); // a
+                    self.emit_avx_load128(&args[1], "xmm1"); // b
+                    self.emit_avx_load128(&args[2], "xmm2"); // c
+                    self.state
+                        .emit_fmt(format_args!("    {} %{rm}, %{vvvv}, %{dst}", inst));
+                    // Store the register the permutation wrote (132 -> xmm0,
+                    // 213 -> xmm1, 231 -> xmm2), never a fixed one.
+                    self.emit_sse_store_dest_from(dptr, dst);
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+
             // FMA 256: args = [a, b, c] -> `a*b + c`. The operand placement
             // depends on the digit triple; see the per-role match below.
             IntrinsicOp::FmaPs132v256
@@ -3169,6 +3219,19 @@ impl I686Codegen {
         self.state
             .emit_fmt(format_args!("    vmovdqu %{src}, (%eax)"));
         self.state.dirty_upper_ymm = true;
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Store `%xmmN` to a 128-bit destination slot.
+    ///
+    /// The 128-bit sibling of `emit_avx_store_dest_from`, and needed for the
+    /// same reason: the FMA3 digit permutation decides which register holds
+    /// the result, so a store that always names `%xmm0` publishes a stale
+    /// operand for 213 and 231.
+    fn emit_sse_store_dest_from(&mut self, dptr: &Value, src: &'static str) {
+        self.operand_to_eax(&Operand::Value(*dptr));
+        self.state
+            .emit_fmt(format_args!("    movdqu %{}, (%eax)", src));
         self.state.reg_cache.invalidate_acc();
     }
 

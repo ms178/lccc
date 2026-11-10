@@ -1940,7 +1940,11 @@ gate "fma-digit-permutation" fast \
 gate "fma-digit-permutation-nonvacuity" fast \
     bash tests/regression/check_fma_digit_permutation.sh \
     --lccc tests/regression/fma_prefix_standin.sh --expect-defect
-
+# SA-11 at 128 bits on i686: the arm did not exist, so `_mm_fmadd_ps`
+# PANICKED the compiler.  This gate executes the values, which is the only
+# way to see the operand placement as well as the crash.
+gate "i686-fma128" fast \
+    bash tests/regression/check_i686_fma128.sh --lccc target/fastbuild/lccc
 gate "kernel-tree-clear" fast bash tests/regression/check_kernel_tree_clear.sh
 # The shared mount-table helper and the chroot/kernel-tree root guards.
 gate "destructive-path-guards" fast bash tests/regression/check_destructive_guards.sh
