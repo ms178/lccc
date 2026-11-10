@@ -13,6 +13,26 @@ fn fixed_shift_count(op: Operand, width: usize) -> Option<u32> {
     (n < width as u32).then_some(n)
 }
 
+/// Whether two scalar types describe the SAME fixed-width bit ring.
+///
+/// The bit-fact lattice is a pair of masks `(known_zero, known_one)` over a
+/// width. Signedness changes how `Cmp` interprets those bits; it does not
+/// change the bits, `const_in_ring`, bitwise `And`/`Or`/`Xor`, or a Boolean
+/// `Cmp` result. A range-gated same-width signedness `Cast` can therefore be
+/// elided (see `simplify::cast_sign_range_fold`) while leaving a `U32`
+/// producer feeding an `I32`-typed comparison. Requiring exact `IrType`
+/// equality there silently loses every bit fact derived from that producer.
+///
+/// This predicate is deliberately NOT a value-preservation or ABI predicate.
+/// `IrType::cast_preserves_integer_value` must still reject a same-width
+/// signedness reinterpretation before later widening: `(I64)(I32)0xffffffff`
+/// and `(I64)(U32)0xffffffff` are different values. Here we only normalize
+/// the label used to inspect an ALREADY-PRODUCED bit pattern. `scalar` also
+/// keeps 128-bit and floating-point rings out of this bounded analysis.
+pub(super) fn same_width_scalar(a: IrType, b: IrType) -> bool {
+    scalar(a) && scalar(b) && a.size() == b.size()
+}
+
 struct Facts(Vec<(Operand, usize, u64, u64)>);
 struct Context<'a> {
     defs: &'a [Option<Instruction>],
@@ -40,7 +60,7 @@ impl Context<'_> {
                 rhs,
                 ty: t,
                 ..
-            } if *op == want && *t == ty => Some((*lhs, *rhs)),
+            } if *op == want && same_width_scalar(*t, ty) => Some((*lhs, *rhs)),
             _ => None,
         }
     }
@@ -91,7 +111,7 @@ impl Context<'_> {
                 false_val,
                 ty: t,
                 ..
-            }) if *t == ty => match self.truth(*cond, facts, depth - 1) {
+            }) if same_width_scalar(*t, ty) => match self.truth(*cond, facts, depth - 1) {
                 Some(true) => self.known(*true_val, ty, facts, depth - 1),
                 Some(false) => self.known(*false_val, ty, facts, depth - 1),
                 None => (0, 0),
@@ -102,7 +122,7 @@ impl Context<'_> {
                 rhs,
                 ty: t,
                 ..
-            }) if *t == ty => {
+            }) if same_width_scalar(*t, ty) => {
                 let a = self.known(*lhs, ty, facts, depth - 1);
                 let b = self.known(*rhs, ty, facts, depth - 1);
                 match op {
@@ -321,7 +341,7 @@ impl Context<'_> {
             ty: t,
             ..
         }) = self.def(op)
-            && *t == ty
+            && same_width_scalar(*t, ty)
         {
             let a = self.value(*lhs, ty, facts);
             let b = self.value(*rhs, ty, facts);

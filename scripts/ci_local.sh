@@ -2011,7 +2011,7 @@ gate "llvm-missed-zero-choice" fast python3 tests/regression/check_llvm_missed_z
 gate "llvm-integer-observations" fast python3 tests/regression/check_llvm_integer_observations.py
 gate "llvm-bit-demand" fast python3 tests/regression/check_llvm_bit_demand.py
 gate "llvm-scalar-facts" fast python3 tests/regression/check_llvm_scalar_facts.py
-gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py
+gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py --clang "${CLANG:-clang-23}"
 gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
 
 # Round 11: the AVX-512VL mask-compare differential is a hosted gate too
@@ -2790,6 +2790,46 @@ gate "asm-goto-phi-edge" fast \
 # faults; the OFF leg is a mutation control that must stay branchy.
 gate "cond-load-sink" fast \
     bash tests/regression/check_cond_load_sink.sh
+# SV-03 generated differential matrix: 82 deterministic shapes (8 integer
+# types x 6 guards x 4 pointer spellings + 10 runtime-index shapes), four
+# compiler legs when ICX is installed, -O0/-O2/-O3, and a three-TU final-IR
+# pointer-select census.  The self-test rejects six synthetic mutations.
+gate "cond-load-sink-matrix" fast \
+    python3 tests/regression/check_cond_load_sink_matrix.py --cases 82 \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --clang "${CLANG23:-clang-23}" \
+        --json target/cond-load-sink-matrix.json
+gate "cond-load-sink-matrix-contracts" fast \
+    python3 tests/regression/check_cond_load_sink_matrix.py --self-test
+# Original SV-03 four-ISA freestanding execution proof (oracle 51, 8 binaries).
+gate "cond-load-sink-cross-arch" fast \
+    python3 scripts/check_cond_load_sink_cross_arch.py \
+        --clang "${CLANG23:-clang-23}" \
+        --json target/cond-load-sink-cross-arch.json
+gate "cond-load-sink-cross-arch-contracts" fast \
+    python3 scripts/check_cond_load_sink_cross_arch.py --self-test
+# Sound range-gated same-width signedness Cast fold: IR census proves the
+# proof folds masked/join shapes and refuses sign-bit-set shapes; three host
+# compilers and four ISAs execute the same freestanding oracle.  The harness
+# self-test rejects nine synthetic mutations of its own verdicts.
+gate "same-width-cast-range" fast \
+    python3 scripts/check_same_width_cast_range.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --clang "${CLANG23:-clang-23}" \
+        --json target/same-width-cast-range.json
+gate "same-width-cast-range-contracts" fast \
+    python3 scripts/check_same_width_cast_range.py --self-test
+# Best-tool evidence: GDB PROT_NONE canary, objdump instruction census,
+# readelf structural check, and non-vacuous Callgrind dynamic instruction
+# refs with a volatile-reload control.  objtool/pahole/perf are absent on
+# this runner and are explicitly recorded as such (never faked).
+gate "cond-load-sink-best-tools" fast \
+    python3 scripts/check_cond_load_sink_best_tools.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --clang "${CLANG23:-clang-23}" \
+        --json target/cond-load-sink-best-tools.json
+gate "cond-load-sink-best-tools-contracts" fast \
+    python3 scripts/check_cond_load_sink_best_tools.py --self-test
 gate "asm-goto-outputs" fast \
     bash tests/regression/check_asm_goto_outputs.sh
 gate "i686-label-ref-safety" fast \

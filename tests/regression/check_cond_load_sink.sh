@@ -21,7 +21,10 @@ set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
 GCC16=${GCC16:-gcc-16}
-CLANG23=${CLANG23:-clang-23}
+# Hosted runners expose the verified Clang 23.1.5 oracle as an absolute
+# $CLANG path, not necessarily as a `clang-23` name on PATH.  Use the pinned
+# path when present; never silently fall back to the runner's default clang.
+CLANG23=${CLANG23:-${CLANG:-clang-23}}
 # Optional fourth oracle.  The hosted icx-oracle job passes its verified
 # ICX 2026.2 binary here; locally Intel's APT repo is unreachable, so this
 # leg is reported as a SKIP rather than faked with a surrogate compiler.
@@ -34,6 +37,31 @@ mkdir -p "$tmp"
 expect='-13.50'
 
 # ── pure predicates (exercised by --self-test) ────────────────────────────
+exact_release_ok() { [[ $1 == "$2" ]]; }
+icx_release_ok() { [[ $1 == *2026.2.* ]]; }
+
+# One version query per pinned oracle.  Failing closed here prevents a
+# runner-image GCC/Clang of the wrong release from being reported as a
+# four-compiler differential proof.
+require_release() {  # require_release <label> <cc> <flag> <expected|icx2026>
+    local label=$1 cc=$2 flag=$3 expected=$4 text first
+    if ! text=$("$cc" "$flag" 2>/dev/null); then
+        echo "FAIL: $label version query failed ($cc $flag)"
+        return 1
+    fi
+    first=${text%%$'\n'*}
+    if [[ $expected == icx2026 ]]; then
+        if ! icx_release_ok "$first"; then
+            echo "FAIL: $label must be ICX 2026.2, got: $first"
+            return 1
+        fi
+    elif ! exact_release_ok "$first" "$expected"; then
+        echo "FAIL: $label must be $expected, got: $first"
+        return 1
+    fi
+    echo "PASS $label pinned release: $first"
+}
+
 # Extract the body of one LCCC-emitted function from a .s file.
 fn_body() {
     sed -n "/^$1:/,/^\\.size $1,/p" "$2"
@@ -79,7 +107,17 @@ if [[ ${1:-} == --self-test ]]; then
         || { echo 'self-test: valid packed min body rejected'; exit 1; }
     ! slp_min_ok $'umin4:\n    cmovbl %eax, %edx\n    ret\n.size umin4, .-umin4' pminud \
         || { echo 'self-test: scalarized min body accepted'; exit 1; }
-    echo 'PASS cond-load-sink self-test (7 synthetic shape mutations rejected)'
+    exact_release_ok 16.2.0 16.2.0 \
+        || { echo 'self-test: exact GCC release rejected'; exit 1; }
+    ! exact_release_ok 16.1.0 16.2.0 \
+        || { echo 'self-test: wrong GCC release accepted'; exit 1; }
+    ! exact_release_ok 23.0.0 23.1.5 \
+        || { echo 'self-test: wrong Clang release accepted'; exit 1; }
+    icx_release_ok 'Intel(R) oneAPI DPC++/C++ Compiler 2026.2.0' \
+        || { echo 'self-test: pinned ICX release rejected'; exit 1; }
+    ! icx_release_ok 'Intel(R) oneAPI DPC++/C++ Compiler 2025.2.0' \
+        || { echo 'self-test: wrong ICX release accepted'; exit 1; }
+    echo 'PASS cond-load-sink self-test (7 shape + 5 toolchain-identity mutations rejected)'
     exit 0
 fi
 
@@ -103,17 +141,29 @@ compile_run() {  # compile_run <label> <compiler> [env assignments...]
 compile_run lccc_on  "$CCC"
 compile_run lccc_off "$CCC" CCC_NO_COND_LOAD_SINK=1
 if command -v "$GCC16" >/dev/null 2>&1; then
+    require_release gcc16 "$GCC16" -dumpfullversion 16.2.0 || exit 1
     compile_run gcc16 "$GCC16"
+elif [[ ${CI:-} == true ]]; then
+    echo "FAIL: pinned gcc16 oracle unavailable ($GCC16)"
+    exit 1
 else
     echo "SKIP gcc16 ($GCC16 unavailable)"
 fi
 if command -v "$CLANG23" >/dev/null 2>&1; then
+    require_release clang23 "$CLANG23" -dumpversion 23.1.5 || exit 1
     compile_run clang23 "$CLANG23"
+elif [[ -n ${CLANG:-} || ${CI:-} == true ]]; then
+    echo "FAIL: pinned clang23 oracle unavailable ($CLANG23)"
+    exit 1
 else
     echo "SKIP clang23 ($CLANG23 unavailable)"
 fi
 if command -v "$ICX" >/dev/null 2>&1; then
+    require_release icx2026 "$ICX" --version icx2026 || exit 1
     compile_run icx2026 "$ICX"
+elif [[ $ICX != icx ]]; then
+    echo "FAIL: explicitly requested ICX 2026.2 oracle unavailable ($ICX)"
+    exit 1
 else
     echo "SKIP icx2026 ($ICX unavailable; local sandbox cannot reach Intel PPA)"
 fi

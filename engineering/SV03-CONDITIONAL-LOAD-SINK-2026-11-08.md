@@ -264,3 +264,611 @@ Measured after the fix (local, cached GCC 16.2 / Clang 23.1.5, fastbuild):
 PASS, `check_env_test_hygiene.sh` PASS, `check_cond_load_sink.sh` PASS,
 four-ISA execution proof PASS (8 binaries, oracle 28).  Hosted re-run is the
 accepting authority and is polled separately.
+
+
+## 11. Post-#1153 perfection pass: sound range-gated signedness folding
+
+> Historical measurement record.  Section 12 supersedes the counts, base
+> commit, tool versions and CI verdicts below with the final remeasurement on
+> `origin/main = 7ad9f30161ddc4bc1ebdea00ddb4ec54f6865498`.  The proof
+> invariants in 11.1–11.3 remain the design authority.
+
+This section records a second, independent red team of the uncommitted
+follow-up work on the NEW active branch `arena/4058527f-lccc`, based at that
+time on `origin/main = 5e9a06a2fab2edd2ee87f9286a2cdf7595acbc66` after a clean
+rebase (PR #1160 changed only four preprocessor/test/doc files, with no
+overlap).  PR #1153 is merged and untouched.  Every number below was
+remeasured on that tree; the earlier base was `6efad731`.
+
+### 11.1 The unsafe shortcut and why it was rejected
+
+An unconditional same-width signedness `Instruction::Cast -> Instruction::Copy`
+deletes one reg-reg move per iteration in the SV-03 narrow-load loop
+(Callgrind, 100,000 iterations: 1,940,442 / 2,090,441 refs versus the sound
+2,040,442 / 2,190,441).  It is WRONG.  The backend deliberately canonicalizes
+same-width signedness homes: i686 `cast_normalize_eax`, AArch64 `sxtw` /
+`mov w0,w0`, RISC-V `sext.w`, x86-64 `movl`.  `(I8)(U8)255` must be
+`0xffffffff`, not `0x000000ff`.  We rebuilt the unsound fold deliberately and
+ran the full 22-section / 4-ISA harness: the IR census failed **all 17 guard
+Casts** (count 0), while all three host compilers and all four ISAs still
+exited with the correct oracle 5.  ABI/backend canonicalization repaired the
+upper bits.  **Conclusion: the runtime teeth are not an architecture-safe
+unsoundness detector; the per-function IR census is the load-bearing
+assertion.**  The harness docstring now says so explicitly.  Conversely,
+`CCC_SIMPLIFY_SKIP=cast_sign_range` fails exactly the five folded sections
+(count 1) while hosts/cross still exit 5, so the bisection kill switch is
+non-vacuous too.
+
+### 11.2 Alternatives quantified
+
+| Strategy | Correctness | Measured cost | Verdict |
+|---|---|---|---|
+| Keep every same-width signedness Cast | sound | leaves 99,986 refs on the join benchmark | rejected: a proven one-instruction/iteration loss |
+| Unconditional Copy | UNSOUND on 4 backends | saves 99,986 refs | rejected by IR census red team |
+| Range-gated proof (`cast_sign_range`) | sound | ON 2,640,446 vs OFF 2,740,432 refs (99,986 saved); opaque volatile-Load control 2,040,448 vs 2,040,434 (14 layout refs) | chosen |
+| Backend peephole after register allocation | sound in principle | would need 4 ISA-specific patterns plus a proof of non-negativity that RA has already erased | rejected: more code, worse information |
+| Runtime guard / speculation | unsound for trapping loads, adds branches | slower | rejected |
+
+GCC 16.2 / Clang 23.1.5 measured 2,541,005 / 2,543,029 refs on the same
+synthetic loop: LCCC ON is still ~3.9% slower.  This patch is a measured
+shape-local win, **not** a claim of overall compiler superiority.  The
+29-shape geomean deficit in §9c.9.7 and SV-01's paired timing remain open.
+
+### 11.3 The proof, invariant by invariant
+
+`sign_bit_provably_clear` fires only for 8/16/32/64-bit single-register
+homes.  128-bit split carriers are refused (the earlier `I128 -> U128`
+`LShr`-by-64 pack-extract misoptimisation was caught by a unit test).  Sound
+producers are: known booleans; `And` with an in-width constant whose sign bit
+is clear; `LShr` by `1..bits-1`; `Select` with BOTH arms proved; `Phi` with
+EVERY incoming proved; and in-width non-negative constant join arms.  A
+top-level constant is deliberately NOT handled: `fold_const_cast` must retype
+it (`I32(5) -> U32` is `I64(5)`, `U32 0x80000005 -> I32` is
+`I32(-2147483643)`).  The recursive walk is capped at depth 8, so a cyclic
+loop Phi terminates by refusal, never stack overflow.  This pass runs BEFORE
+`eliminate_phis`, when the IR is strict SSA and every `Value` has exactly one
+definition; the `def_counts == Some(1)` guard on `Select`/`Phi` maps is
+therefore load-bearing.  Post-phi duplicate `Copy` homes are a backend
+representation, not an input.  No allocation in the proof: def maps are flat
+`Vec<Option<T>>` indexed by `Value` ID, all lookups O(1).
+
+### 11.4 Programmatic evidence (all PASS unless stated)
+
+* `cargo build --profile fastbuild --locked --bins`: rc 0, **0 warnings**.
+  `cargo clippy --lib --profile fastbuild --locked -- -D warnings`: rc 0.
+  `cargo fmt --all -- --check`, `git diff --check`: PASS.
+* `cargo test --lib --profile fastbuild --locked`: **8637 passed, 0 failed,
+  10 ignored, 15.25 s**.  Six focused range/join/constant/kill-switch unit
+  tests plus the 128-bit refusal assertion.
+* `scripts/check_same_width_cast_range.py`: 33-mutation `--self-test`,
+  independent oracle 5, 3 host compilers (`gcc-16 16.2.0`,
+  `clang-23 23.1.5`, LCCC), `-O2 -Wall -Wextra -Werror`, 28 IR sections
+  (5 folded / 17 guard Casts kept), four ISAs exit 5:
+  x86_64 525, i686 924, AArch64 607, RISC-V64 1538 instructions.
+  `CCC_VERIFY_IR=abort` + `CCC_VALIDATE_SSA=1` on every host/cross compile.
+* `scripts/check_cond_load_sink_best_tools.py`: 12-mutation `--self-test`;
+  GDB 18.1 PROT_NONE canary ON/OFF returns `5a/5a`, no SIGSEGV;
+  objdump `pick8/pick16` ON 4 / OFF 7 / GCC16 4 / Clang23 4;
+  IR join census ON 0 / OFF 1; Callgrind refs above; readelf
+  `.text`/`.eh_frame` present with 5 FDE entries (objtool stand-in).
+* `scripts/check_cond_load_sink_cross_arch.py`: 4-mutation self-test,
+  oracle 51, 8 binaries exit 51: AArch64 117/126, i686 188/192,
+  RISC-V64 298/316, x86_64 93/96 instructions.
+* `tests/regression/check_cond_load_sink_matrix.py`: 6-mutation self-test,
+  82 deterministic shapes, receipt `5d7bed2a19deb1f4`, 12 compile+run
+  pairs, pointer-select census 53/53, skipped oracle `icx2026` locally.
+* CI static contracts: workflow-shell `ok (14 workflow file(s), 2 rules)`;
+  gate parity `570 commands, 41 registered invocation contracts`;
+  shard partition `a=87, b=124`; lane plan `backend-contracts=2`,
+  `codegen=2`, `frontend=3`, `2987 s`, self-test `19 rules, 30 fixtures`;
+  `ci_verify_oracles.sh --require gcc,multilib,valgrind,pyyaml,gdb,qemu,mold`
+  PASS with the pinned GCC16/Clang23/GDB18.1/QEMU11.1.3/mold3.0.0.
+* Targeted `ci_local.sh --only` gates: **14 selected gates green (0 failed)**, including the newly wired original four-ISA harness and its mutation contracts.
+
+### 11.5 Tool acquisition, stated honestly
+
+The pinned `harness-cache-8` release-tag cache (`d66c5ac881e2`) supplied
+Rust 1.99.1, GCC 16.2.0, Clang 23.1.5, GDB 18.1, binutils 2.47, mold 3.0.0,
+QEMU 11.1.3 and the Valgrind 3.19.0 Debian package; a 4 GiB `/swapfile` was
+active.  PyYAML 6.0.3 was installed as a PyPI wheel because the cached
+`python3-yaml` Debian package needs `libyaml-0-2`, which is not in the cache.
+`objtool`, `pahole` and `perf` are NOT installed and were NOT faked:
+`apt-get download dwarves linux-tools-common` reported "Unable to locate
+package"; `git ls-remote https://github.com/acmel/dwarves.git HEAD` succeeded
+(`028149ba6ff5...`) but `cmake`, `pkg-config`, `libelf` and `libdw` are absent,
+so a source build is impossible here; `pip index versions pahole|objtool|perf`
+found no distributions.  objtool is a Linux-kernel ORC validator and pahole a
+DWARF/BTF struct-layout tool: this patch changes neither kernel objects nor
+struct layouts.  Their applicable equivalents are readelf's ELF/machine/FDE
+check, objdump's instruction census and Callgrind's dynamic instruction refs.
+ICX 2026.2 is unavailable locally (Intel PPA unreachable, no usable release
+binary); the hosted `icx-oracle` lane is wired with `--require-icx` for the
+matrix, the 4-ISA cast-range harness and the best-tool evidence.  No local
+ICX PASS is claimed.
+
+### 11.6 Design review / known limits
+
+A super-genius compiler engineer would approve the proof's information
+boundary: it refuses exactly what it cannot prove, uses the IR's strict-SSA
+invariant instead of inventing a second, weaker dataflow analysis, and leaves
+the typed constant fold alone.  It would NOT approve claiming "godlike"
+efficiency or "beats GCC/Clang/ICX" from these numbers: the synthetic loop is
+still slower than GCC/Clang, ICX is hosted-only, and no broad workload sweep
+was rerun here.  The 197-gate broad sweep from the previous session had
+16 environment/tooling failures unrelated to this patch; hosted CI is the
+accepting authority.  No unsafe code, mutex/spinlock, null dereference,
+use-after-free, buffer arithmetic, or new environment-read budget was added.
+The new harnesses are deterministic and mutation-tested.  Technical debt
+closed: stale performance comment, missing Select/Phi/constant-join proof,
+missing full-width sign-set and opaque-Load negatives, unwired four-ISA SV-03
+harness, missing GDB/QEMU/mold lane probes, and missing invocation contracts.
+
+
+## 12. Third pass: rebase, ratchet repair, hosted toolchain pinning and fail-fast evidence
+
+### 12.1 Final base and reconstruction
+
+The final branch is a small rebased commit series on
+`origin/main = 7ad9f30161ddc4bc1ebdea00ddb4ec54f6865498`; that main includes
+PRs #1161, #1165 and #1166 (vector-store/query-operator fixes, GCC17 torture
+CI and last-20-PR red-team repairs).  The rebase preserves every upstream gate,
+including `scripts/check_vec_store_contracts.py --self-test` and its normal
+run, and adds the PR's four-ISA cross, same-width cast-range, best-tools and
+matrix gates.  The lane plan's `predicted_gate_seconds` is recomputed from the
+exact `measured_s` sum: shard A `539.32 s`, shard B `558.20 s`, total
+`2989 s`.  At that revision, static parity reported
+`573 commands / 42 invocation contracts`, shard partition `a=88, b=124`, lane
+self-test `19 rules / 30 fixtures`; section 14 records the current 574/45
+contracts after the guarded-fold pins.
+  After the induction-proof additions in section 13 the measured plan is
+  `2989 s` (backend A `539.32 s`, backend B `557.52 s`).
+
+### 12.2 Hosted-red root causes closed without weakening a ratchet
+
+The first hosted run `42617961252` failed four real lanes plus the aggregator:
+three hidden `clang-23` alias failures and one audit-census ratchet failure.
+The alias failures came from two harnesses that hard-coded `tool("clang-23")`
+and one missing `--clang "$CLANG" \\` in the lane-plan step, while the hosted
+runner publishes Clang only as
+`/home/runner/.cache/lccc/clang-oracle/23.1.5/bin/clang`.  The fix is a shared,
+version-verified resolver (`scripts/sv03_toolchain_identity.py`), explicit
+`--clang` arguments and 42 parity contracts that pin `CLANG`/`CLANG23` as
+hidden invocation channels.  No unpinned PATH fallback is permitted.
+
+The census grew `panic_sites 863 -> 867`, `fns_over_300 233 -> 234` and
+`fns_over_500 97 -> 98`.  Rebaselining would have hidden three real code-quality
+defects, so they were removed instead:
+
+| Defect | Root cause | Total replacement | Measured result |
+|---|---|---|---|
+| 4 new panic sites | `CondAddrExpr::key()` used `unreachable!` + `unwrap()`, and the apply phase re-matched a cloned `Instruction` with `unwrap()`/`unreachable!` | exhaustive `match` for all four key shapes; typed `CondLoadCastTail { dest, from_ty, to_ty }` emitted as a Cast with no variant re-match | `panic_sites = 863`, unchanged baseline |
+| `simplify_function_with_config` 498 -> 513 | 69-line use-count census inline | `compute_reassociation_use_counts` plus a bounds-checked, saturating `bump_use_count` | `fns_over_500 = 97`, unchanged baseline |
+| `simplify_cast` 298 -> 338 | range proof and Cast-chain rewrites inline | independent `cast_sign_range_fold` and `simplify_cast_chain`; each decision is total over its own def maps | `fns_over_300 = 233`, unchanged baseline |
+
+The saturating increment also removes a theoretical `u32` debug-build overflow
+abort without changing the profitability verdict: every count above one is
+already the refusing case.  New unit tests cover all four address-key shape
+classes, typed-tail parsing, saturating use counts, and the extracted range
+fold's width/signedness/proof guards.  `git apply`-reconstructed rebase and
+all static CI checkers pass.  A later hosted run exposed one more independent
+harness defect, the binutils-output parser documented in 12.3; it is not a
+compiler or ratchet regression.
+
+### 12.3 Local best-tools failure found and fixed
+
+A harness wipe removed the cached toolchains, Valgrind, `/swapfile` and
+`target/`.  The `harness-cache-8` tag (`d66c5ac881e2`) restored Rust 1.99.1,
+GCC 16.2.0, Clang 23.1.5, GDB 18.1, binutils 2.47, mold 3.0.0 and QEMU
+11.1.3; Valgrind 3.19.0 and `libc6-dbg` were installed from the cache's Debian
+packages, and a 4 GiB `/swapfile` was reactivated.  The first restored gate
+then exposed a real harness defect: a missing Valgrind produced a bare
+`assert`, whose empty message became `error = ""`, followed by
+`KeyError: 'objdump'` while the script printed unearned `PASS` lines.
+
+`check_cond_load_sink_best_tools.py` now uses one executable-aware
+`discover_tool`, names each missing required tool with a `RuntimeError`, and
+routes all printing through `report_evidence`.  An incomplete report prints
+the cause and all problems to stderr and returns 1; a complete report prints
+the same PASS evidence as before.  `--self-test` grew from 12 to 13 rejected
+verdict mutations (adding missing Valgrind), and directly proves both report
+paths plus `main()`'s missing-tool preflight.  Simulating the old failure
+returns rc 1, empty stdout, `verdict=FAIL` and the named cause; no exception
+escapes.
+
+Hosted run `42652939283` then exposed a second, independent defect in the same
+gate: every compiler, GDB, objdump, IR census and Callgrind leg passed in both
+shard B and the authenticated ICX 2026.2 lane, but the ELF/FDE check failed.
+Ubuntu 24.04's system readelf 2.40 prints only decoded
+`00000018 ... FDE cie=00000000 ...` records; the local cache's readelf 2.47
+additionally prints an `.eh_frame_hdr` search table with `fde=[ ... ]` rows.
+The old parser counted only `fde=[`, so it reported `fde_count = 0` on hosted
+while the same executable had five decoded FDE records.  This was reproduced
+locally with system readelf 2.40 and pinned GDB 18.1.
+
+`decode_fde_count()` now counts decoded `FDE cie=` records as the
+version-independent authority and retains the optional search-table row count
+and readelf version as corroborating evidence.  `structural_readelf()` uses
+`--debug-dump=frames`; `evaluate()` still requires a positive decoded FDE
+count, and a report with a search table but no decoded records is a mutation
+case.  The self-test now rejects 14 verdict mutations, decodes three readelf
+frame dialects (2.40-only, 2.47 header+decoded, and CIE-only), and records
+`verdict=FAIL` whenever any problem is present.  Both readelf 2.40 and 2.47
+produce PASS locally with five FDE records.
+
+### 12.4 Hosted-like no-alias execution proof
+
+A sanitized PATH was constructed with `clang-23 = MISSING`; compilers were
+passed as pinned absolute paths and verified as GCC 16.2.0 / Clang 23.1.5.
+This reproduces the exact condition that broke hosted shard A, shard B and the
+ICX lane.
+
+| Harness | Result | Quantified evidence |
+|---|---|---|
+| `check_cond_load_sink_cross_arch.py` | PASS | 8 freestanding binaries, four ISAs, oracle 51; AArch64 117/126, i686 188/192, RISC-V64 298/316, x86-64 93/96 instructions ON/OFF |
+| `check_same_width_cast_range.py` | PASS | 3 host compilers, 28 IR sections (5 folded / 17 guard Casts kept), four ISAs exit 5; x86-64 525, i686 924, AArch64 607, RISC-V64 1538 instructions |
+| `check_cond_load_sink_best_tools.py` | PASS | GDB PROT_NONE ON/OFF `5a/5a` no SIGSEGV; objdump `pick8/pick16` ON 4 / OFF 7 / GCC16 4 / Clang23 4; IR ON 0 / OFF 1; readelf 2.40 and 2.47 both decode 5 FDE records; Callgrind below |
+| `check_cond_load_sink_matrix.py` | PASS | 82 deterministic shapes, 12 compile+run pairs, receipt `5d7bed2a19deb1f4`, pointer-select census 53/53, ICX oracle skipped locally |
+
+Hosted run `42652939283` independently extended the matrix to 15 compile+run
+pairs with the authenticated ICX 2026.2 oracle and extended the cast-range gate
+to four host compilers; both reported PASS before the best-tools parser failed.
+The local no-alias proof therefore matches the hosted compiler identities, with
+ICX intentionally exercised only in the authenticated lane.
+
+### 12.5 Host-CPU performance, measured not asserted
+
+Host CPU: `Intel(R) Xeon(R) Processor @ 2.60GHz` (x86-64, SSE4.2/AVX2/FMA
+available).  Callgrind counts deterministic instruction references over
+100,000 iterations, not wall-clock time, so VM frequency scaling cannot turn
+a codegen difference into a false win.  With the restored Valgrind 3.19.0:
+
+| Binary / state | Ir refs | Delta vs LCCC ON |
+|---|---:|---:|
+| LCCC fold ON | 2,640,550 | — |
+| LCCC fold OFF (`cast_sign_range` kill switch) | 2,740,536 | +99,986 (0.99986 / iteration) |
+| LCCC volatile control ON | 2,040,552 | — |
+| LCCC volatile control OFF | 2,040,538 | 14 layout refs |
+| GCC 16.2.0 fold shape | 2,541,109 | LCCC +99,441 (3.913% more refs) |
+| Clang 23.1.5 fold shape | 2,543,133 | LCCC +97,417 (3.831% more refs) |
+
+The table is from the final normal-environment evidence
+(`/tmp/recovery/evidence/best_tools_after_247.json`); the independent
+system-readelf 2.40 run produced 2,641,051 / 2,741,051 refs and a 100,000-ref
+delta.  Absolute counts vary slightly with the assembler/linker resolved from
+PATH, but the ~one-instruction-per-iteration delta, the 14-ref volatile control
+and the GCC/Clang ordering do not.  The fold removes one instruction per
+iteration on the proven join shape; the opaque volatile-Load control changes by
+only 14 refs, so the proof refuses what it cannot prove.  GCC and Clang still
+emit fewer refs on this synthetic loop.  ICX 2026.2 is available only in the
+hosted authenticated lane; no local ICX result or broad compiler-superiority
+claim is made.
+
+### 12.6 Final local validation table
+
+| Check | Result |
+|---|---|
+| `cargo build --profile fastbuild --locked --bins` | PASS, 0 warnings |
+| `cargo test --profile fastbuild --locked --lib` | PASS, 8702 passed / 0 failed / 10 ignored |
+| `cargo clippy --profile fastbuild --locked --all-targets -- -D warnings` | PASS |
+| `cargo fmt --check`, `git diff --check`, Python/shell syntax | PASS |
+| `audit_census.py --check` | PASS: 863/94/27/10/233/97/26/565/254 vs baselines 863/94/27/10/233/97/26/565/255 |
+| static CI: workflow shell / parity / shard / lane plan + self-test | PASS: 14 files, 573 commands / 42 contracts, a=88 b=124, 2989 s |
+| 16 targeted `ci_local.sh --only` selector invocations | PASS: 24 unique selected gates, 0 failed; 7 optional toolchain gates skipped per invocation |
+| `check_cond_load_sink_best_tools.py --self-test` | PASS: 14 verdict mutations rejected, 3 readelf frame dialects decoded, fail-fast report paths proven |
+| best-tools with system readelf 2.40 + pinned GDB 18.1 | PASS: 5 decoded FDE records, 0 search-table rows, complete GDB/objdump/IR/Callgrind evidence |
+| four hosted-like no-alias harnesses | PASS, evidence in `/tmp/recovery/evidence/*.json` |
+
+### 12.7 Tool honesty and efficiency verdict
+
+`objtool`, `pahole` and `perf` remain unavailable in this sandbox; the JSON
+evidence records `null` for each and performs the applicable user-space
+equivalents with `readelf`, `objdump` and Callgrind.  No result from those three
+tools is claimed.  GDB 18.1, objdump 2.47, readelf 2.40 and 2.47, and
+Valgrind/Callgrind 3.19 actually ran locally; hosted run `42652939283`
+additionally exercised GDB 15.1, Valgrind 3.22.0 and ICX 2026.2.  Section 13
+adds GDB `ptype /o`, independent pyelftools DWARF layout checks, Capstone
+instruction decoding and an objtool-equivalent CFI/stack audit.  Standalone
+`pahole`/`objtool`/`perf` binaries are unavailable in this sandbox and are
+never claimed to have run.  The new helper functions are O(1) per visited definition,
+allocate nothing in the range proof, use flat indexed def maps, and fail closed
+on unknown IR.  A compiler engineer can approve the information boundary and
+the measured one-instruction win, but **cannot honestly call every function
+globally optimal**: no exhaustive superoptimizer proof was run, LCCC is still
+slower than GCC/Clang on the synthetic loop, and ICX 2026.2 is hosted-only.
+This document therefore claims correctness, zero new audit debt, zero warnings
+and a measured shape-local improvement, not godlike universal efficiency.
+
+### 12.8 Hosted acceptance
+
+The hosted run is the accepting authority.  Run `42652939283` on merge commit
+`404adc9dbd730a3ffbdebd60118c51b6685832ea` was RED in two real lanes —
+`Fast local contracts (shard b)` job `129286215568` and `Authenticated Intel
+ICX 2026.2 integration` job `129286216011` — plus the `Test Suite` aggregator
+job `129292331382`.  Every other required lane passed, including the full
+build, release-profile unit tests, assertion-enabled units and corpus, all
+frontend/codegen shards, assembler/linker, benchmarks, Clippy and the Debian
+exact-version contracts.  The uploaded ICX evidence proves the authenticated
+compiler ran: matrix `82 shapes / 15 pairs / icx2026`, cast-range `4 host
+compilers / 28 IR sections / 4 ISAs`, plus GDB/objdump/IR/Callgrind legs.
+The only failing verdict was `ELF .text/.eh_frame/FDE structural check failed`
+caused by the readelf 2.40 output dialect, not by a missing unwind table.
+
+The FDE decoder fix made run `42657814376` green in the authenticated ICX lane
+and in every other lane except `Fast local contracts (shard b)` job
+`129303132681`.  That lane then reached the next gate and reported
+`loop_count costs 16 instructions in rows-on.s, expected 17`: a real one-
+instruction improvement from the same range proof, not a compiler regression.
+Section 13 red-teams that improvement, adds regression teeth and updates the
+pinned count.  The PR body carries the final run ID and check verdict.  No
+production-ready claim is made before every required hosted check is green.
+
+
+## 13. Final red-team: 32-bit induction win, tool-heavy proof and per-function audit
+
+### 13.1 Hosted-red root cause and decision
+
+After the FDE-parser fix, hosted run `42657814376` was green in the
+authenticated ICX 2026.2 lane and all other lanes except shard B.  Shard B
+failed `check_bit_select_fold.sh`: LCCC emitted 16 instructions for
+`loop_count` while the script pinned 17, and 18 with `CCC_NO_BT_ADC_FUSION=1`
+while it pinned 19.  The first instinct — restoring 17 instructions — would
+have deleted a sound optimization.  The second — changing two integers without
+evidence — would have been a rebaseline.  Neither is acceptable.
+
+A clean `origin/main = cdd5def2` fastbuild binary was built in a detached
+worktree with the same Rust/GCC/Clang cache, 4 GiB swap and `fastbuild`
+preset.  Main emits 17/19; this PR emits 16/18.  `CCC_SIMPLIFY_SKIP=
+cast_sign_range` restores 17/19 and the U64 induction ops, isolating the cause
+to the range proof.  Final IR proves the PR has no `U32 -> U64` widening Cast,
+no U64 `Cmp`, and two U32 `Cmp`s; main has a U64 induction with `cmpq/addq/
+movq/shrq`.
+
+The C loop is `for (u32 i = 0; i < n; i++)` with `n` a U32 parameter.
+Starting from zero, `i` increments by one only while `i < n` and stops at
+`i = n <= UINT32_MAX`; therefore `i + 1` never wraps to zero.  The U32
+induction is not merely smaller, it is the exact C abstract machine width.
+The U64 version was a conservative workaround, not a correctness requirement.
+The proof is structural (IR), differential (runtime) and dynamic (Callgrind),
+not a guess from an instruction count.
+
+### 13.2 Best-tool evidence on the host CPU
+
+Host CPU: `Intel(R) Xeon(R) Processor @ 2.60GHz`, x86-64.  Tools actually
+used: GDB 18.1, GNU objdump/readelf 2.47, Valgrind/Callgrind/Memcheck 3.19.0,
+pyelftools 0.33, Capstone 5, GCC 16.2.0, Clang 23.1.5, Rust 1.99.1.  The
+standalone `pahole`, `objtool` and `perf` binaries are not installed in this
+sandbox; GDB `ptype /o` is used as the pahole-style DWARF layout view, and
+readelf/objdump/Capstone as the objtool-equivalent CFI/stack/encoding check.
+ICX 2026.2 is available only in the hosted authenticated lane.  No result is
+claimed for a tool that did not run.
+
+Evidence: `/home/user/artifacts/redteam/induction_evidence.json` and
+`/home/user/artifacts/redteam/induction_redteam.log`.  Verdict **PASS**.
+
+| Probe | LCCC PR | LCCC main | GCC 16.2 | Clang 23.1.5 |
+|---|---:|---:|---:|---:|
+| Static `loop_count` instructions | **16** | 17 | 19 | 73 (vectorized) |
+| 64-bit induction ops | **none** | `addq,cmpq,movq,shrq` | `movq` | `movq` |
+| Callgrind Ir refs, 1000 varied calls | **41,209,657** | 41,210,663 | 45,299,179 | 24,316,683 |
+| Wall-clock median, 7 runs pinned CPU 0 | 0.005792 s | 0.005457 s | 0.007491 s | 0.006055 s |
+| Memcheck errors | 0 | 0 | 0 | 0 |
+| Runtime checksum | `e05a0b25418af6d6` | same | same | same |
+
+The deterministic Callgrind delta is about one reference per call: 1,006
+fewer references for 1,000 calls in the final run (the benchmark varies `n`
+by 0..7 across calls, so the exact startup/iteration mix shifts slightly).
+The removed instruction is in the prologue, one per invocation, not one per
+loop iteration.  Wall-clock is noisy and even shows PR slower than main in the
+final run (0.005792 s vs 0.005457 s), so no dishonest wall-clock speedup is
+claimed.  GCC uses more references;
+Clang vectorizes the bitmap loop and uses fewer, so no broad compiler
+superiority is claimed.  The claim is narrower and measured: on this shape the
+range proof removes one instruction and one dynamic reference per call without
+changing the checksum.
+
+GDB stepped 24 instructions through `loop_count` for `n = 8` with no SIGSEGV
+and returned `4`, matching the independent Python oracle.  Capstone decoded all
+102 bytes / 21 instructions of the PR `loop_count` symbol with zero errors; the
+`bt` operand is `r9d, r11d` (32-bit registers), not an invalid register field.
+`readelf --debug-dump=frames` reports 4 decoded FDE records and 4 header rows;
+`objdump` shows a leaf function with balanced push/pop and `rsp` adjustments.
+GDB `ptype /o struct Probe` and an independent pyelftools DWARF walk both
+report `size=24`, holes `(1,7)` and `(19,5)` — a pahole-style ABI check, not a
+claim that the standalone `pahole` binary ran.
+
+### 13.3 Regression teeth added, not a bare count update
+
+* `tests/regression/same_width_cast_range/induction.c` is a new fixture.
+* `scripts/check_same_width_cast_range.py` now proves the final IR has U32
+  compares, no U64 compare and no `U32 -> U64` Cast; compiles ON/kill-switch/
+  GCC16/Clang23 assembly; checks ON=16, kill-switch=17 and the presence/
+  absence of 64-bit induction ops; and compares a checksum over `n = 0..4096`
+  against an independent Python oracle.  ICX 2026.2 is included automatically
+  in the hosted authenticated lane.  `--self-test` grew from 33 to **44**
+  rejected verdict mutations, including induction IR, counts, kill-switch and
+  runtime-checksum mutations.
+* `tests/regression/check_bit_select_fold.sh` now pins 16/18, compiles two
+  explicit `CCC_SIMPLIFY_SKIP=cast_sign_range` controls that must restore
+  17/19, and compares LCCC/GCC16/Clang23 runtime checksums to a Python oracle.
+  A reviewer who deletes the proof cannot keep the gate green by editing two
+  integers.
+* The lane plan is remeasured worst-of-three with the pinned cache: bit-select
+  fold 3.59 s, cast-range full 1.44 s, cast-range self-test 0.06 s; total
+  `2989 s` rounded (A 539.32 s, B 556.89 s after the guarded-folds
+  remeasure).  Parity now reports 574 local standalone commands / 45
+  invocation contracts; shard partition remains a=88, b=124.  The extra
+  contracts pin the guarded-folds local, hosted and strict ICX invocations.
+
+### 13.4 Line-by-line function audit and efficiency verdict
+
+| Function / type | Audit | Complexity / allocation | Decision |
+|---|---|---|---|
+| `compute_reassociation_use_counts` | Operand-for-operand equivalent to the old inline census; only `fill_use_counts` allocates | O(total IR operands), one `Vec<u32>` | Extracted to remove a 69-line function; no verdict drift |
+| `bump_use_count` | Bounds-checked index; `u32::saturating_add` removes a theoretical debug overflow abort | O(1), no allocation | Any count > 1 is already the refusing verdict, so saturation is conservative and cannot strengthen a rewrite |
+| `cast_sign_range_fold` | Total over def maps; width/sign/128-bit/volatile/Phi/Select guards; exact `fold_const_cast` | O(1) per Cast, flat `Vec<Option<T>>` lookups, no allocation in the proof | Keeps all 17 guard Casts; refuse beats an unsafe 99,986-ref saving |
+| `simplify_cast_chain` | Independent helper with explicit width/sign range; no `unwrap`/`unreachable` | O(chain length), bounded | Removes the 298→338-line growth without rebaselining |
+| `CondLoadCastTail` | POD `{dest,from_ty,to_ty}`; emitted directly as a Cast | O(1), `Copy` | Apply phase cannot re-match a cloned variant or panic |
+| `CondAddrExpr::key` | Exhaustive match; sorted atoms; `i128::checked_add`; opaque unique keys on ambiguity | O(a log a) for the bounded atom multiset, one `String` per key | False positives can only decline a rewrite; recursion bounded at 8 |
+| `parse_cond_load_arm` | Linear tail parser; identical type chains required; rejects truncation/float/pointer/volatile | O(block instructions), `Vec` + `FxHashSet` only for a real plan | No SSA id is defined twice; no trapping load is speculated |
+| `decode_fde_count` (Python) | Counts decoded `FDE cie=` records, retains `fde=[` header rows as evidence | O(readelf output size) | Version-independent for binutils 2.40–2.47; 3-dialect self-test |
+| `report_evidence` (Python) | Total over incomplete reports; prints PASS only on zero-problem PASS | O(problems) | Missing Valgrind can no longer produce unearned PASS lines |
+
+No unsafe block, mutex/spinlock, null dereference, use-after-free, buffer
+arithmetic, unchecked index, invalid register field or new environment-read
+budget was introduced by this pass.  `cargo clippy --all-targets -D warnings`,
+`cargo fmt --check`, `git diff --check`, `audit_census.py --check` and all
+targeted gates are re-run after the rebase below.  A superoptimizer proof of
+global optimality was NOT run; LCCC is still behind Clang's vectorized loop on
+this host, and ICX is hosted-only.  Therefore the honest verdict is: **zero
+new warnings, zero new audit debt, zero measured defects in scope, and a proven
+shape-local one-instruction win** — not "every function is godlike-optimal".
+Casey Muratori's standard is honored by measuring, refusing unsound shortcuts,
+and saying exactly what was and was not proven.
+
+### 13.5 Rebase and final hosted authority
+
+The branch is rebased onto the latest
+`origin/main = eba81727812e2d00b40461ed179981c3818e5654` (PR #1173), which
+adds the AVX-256 home-register optimizations and also includes the
+GNU preprocessor assertions, pragma-pack-underflow and VLA-layout repairs from
+PRs #1156/#1169/#1171.  Hosted CI remains the accepting
+authority; the PR body records the final run ID and per-check verdict.  No
+production-ready claim is made until every required hosted check is green.
+
+## 14. Guarded signed-range proof after a same-width Cast is elided
+
+### 14.1 Exact defect and root cause
+
+Hosted run `42669440475`, shard-b job `129343956545`, failed with
+`ValueError: signed lower range guard survives` from
+`tests/regression/check_llvm_guarded_folds.py`.  The failure was reproduced on
+the pinned cache toolchain.  `gf_range` ON emitted 8 instructions ending in
+`cmovgeq`; clean main and `CCC_SIMPLIFY_SKIP=cast_sign_range` emitted 5
+instructions ending in `setb`.  Final IR showed the interaction:
+
+```text
+ON (bad):    Cmp Sge x,0; Cmp Slt x, And(y,15) [U32]; Select
+kill switch: Cast U32->I32 (y&15); Cmp Ult x, casted-bound
+```
+
+`simplify::cast_sign_range_fold` soundly replaces a proven-nonnegative
+same-width `U32 -> I32` Cast with an untyped `Copy`.  The producer keeps its
+`U32` label while the consuming `Cmp` keeps `ty: I32`.  The guarded-range
+rewrite in `bit_idioms_guards::fold` calls `sign_bit_zero(cx, rhs, I32, ...)`,
+which calls `Context::known(rhs, I32, ...)`.  `known` required exact
+`*t == ty` for `BinOp`/`Select` definitions, so it refused the `U32` `And`
+producer and lost the proof that `y & 15` has a zero sign bit.  The result was
+a correct but 8-instruction signed-range guard, not a miscompile.
+
+Disabling `cast_sign_range` would have restored 5 instructions but thrown away
+the separately proven 32-bit induction win; relaxing the `cmov` assertion or
+special-casing the function would have hidden a real missed optimization.  The
+chosen fix addresses the fact engine instead.
+
+### 14.2 Design decision: normalize the bit ring, not the value domain
+
+A bit fact is `(known_zero, known_one)` over a fixed width.  Signedness changes
+how `Cmp` interprets those bits, not the bits, `const_in_ring`, bitwise
+`And`/`Or`/`Xor`, or a Boolean `Cmp` result.  Therefore `same_width_scalar`
+permits fact derivation from any same-width scalar producer, while explicitly
+NOT claiming value preservation across later widening.  This keeps
+`IrType::cast_preserves_integer_value` and every extension/ABI guard intact.
+`scalar` deliberately excludes 128-bit and floating-point rings; wrong widths
+still refuse the fact.  The helper is used by `Context::binary`,
+`Context::known`, `Context::simplify_operand` and `sign_bit_zero`, so every
+downstream bit-idiom consumer sees the same normalization rather than one
+special case.
+
+| Function | Audit | Complexity | Verdict |
+|---|---|---|---|
+| `same_width_scalar` | Two `scalar` checks plus an exact width equality; no signedness/value assumption | O(1), no allocation | Narrower than a cast-preservation predicate; cannot greenlight later widening |
+| `Context::binary` / `with_const` | Same structural match, now accepts only same-width scalar labels | O(1) per def lookup | Unlocks masked producers without matching different-width IR |
+| `Context::known` | Select/BinOp derivation now width-normalized; signed comparisons still use `IrCmpOp` | O(bounded def-walk depth), visits budget unchanged | Fixes the root cause and all sibling fact consumers, no new recursion |
+| `Context::simplify_operand` | Same-width producers may supply a fully known bit pattern | O(1) per def lookup | No `unwrap`, no new allocation, no change to truth semantics |
+| `sign_bit_zero` | Cast peel accepts same-width source/target labels; direct U32 producer now reaches `known` | O(bounded def-walk depth) | Keeps negative/unknown/wrong-width bounds refused |
+| `check_mechanisms` / `check_ir_mechanisms` | Python verdicts fail closed on assembly, final IR, kill switch and reduction mutations | O(text size), 21 self-test mutations including ICX identity | No compiler-free mutation can silently weaken a verdict |
+| `range_oracle_checksum` | Independent 64-bit FNV-style oracle over 16 x 12 boundary pairs | 192 iterations, O(1) memory | Python authority is not derived from any compiler under test |
+
+### 14.3 Added regression teeth and measured result
+
+`tests/regression/check_llvm_guarded_folds.py` now:
+
+* runs 21 compiler-free verdict mutations on every CI invocation, including
+  the ICX 2026.2 identity predicate;
+* dumps final IR for ON, `CCC_DISABLE_PASSES=bit_idioms` and
+  `CCC_SIMPLIFY_SKIP=cast_sign_range`, then requires ON `Cmp Ult`, no
+  `Sge`/`Slt`/`Select`, no same-width Cast, and a visible U32 mask;
+* requires the disabled-pass control to retain both signed guards and the
+  kill switch to restore the `U32 -> I32` Cast plus `Cmp Ult`;
+* compiles a generated 192-pair runtime oracle with Python as the independent
+  authority and GCC 16.2, Clang 23.1.5, LCCC ON/OFF/kill-switch, plus LCCC at
+  `-O0..-O3/-Os`; the authenticated hosted vendor lane additionally runs
+  `--icx "$LCCC_ICX_BIN" --require-icx` against ICX 2026.2 and refuses any
+  wrong release or missing vendor oracle;
+* keeps the existing native/i686/guard-page/ELF-unwind contracts.
+
+`src/passes/bit_idioms_facts_tests.rs` adds exact-width, wrong-width,
+negative-bound and mixed-signedness Select proofs with exhaustive boundary
+samples; the existing refusal tests still pass.  With the fix, `gf_range` is
+8 -> 5 instructions versus disabled bit-idioms, and the hosted shard-b command
+is remeasured worst-of-3 at 2.80 s with the Clang 23.1.5 oracle pinned on the
+command line.  Parity is 574 local standalone commands and 45 invocation
+contracts; the strict ICX contract lives in the separate authenticated vendor
+job and does not change the two shard partitions.
+
+### 14.4 Hosted red-run diagnosis and honest scope
+
+Fresh hosted run `42672719307` at `28b193a1` had ICX 2026.2, Debian,
+relocation/PGO, IPA-PTA, build, clippy, shard A and all other executed checks
+PASS; its `Test Suite` aggregator failed because GitHub reported seven lanes
+as `abandoned` and `benchmark` as `skipped`.  Those jobs were never acquired by
+a hosted runner; the aggregator correctly failed closed.  This is a GitHub
+runner-allocation transient, not a compiler regression, and the correct remedy
+is a complete fresh run after the code fix.  The previous `a219f67d` run had
+also exposed the real `gf_range` defect, which is fixed here.  No broad
+superiority, universal optimality, zero-defect or production-ready claim is
+made until a fresh hosted run has executed every required lane and passed.
+
+### 14.5 Current local evidence after rebase onto PR #1173
+
+The final harness reset was recovered without weakening any gate: the dirty
+worktree was hash-compared against the published PR head, the six guarded-fold
+paths were re-applied onto a clean six-commit rebase over
+`origin/main = eba81727812e2d00b40461ed179981c3818e5654`, and the hash-pinned
+`harness-cache-8` toolchain plus 4 GiB swap were restored.  Local results on
+this exact tree:
+
+| Check | Verdict |
+|---|---|
+| `scripts/build_lccc_fast.sh` | PASS, 0 compiler warnings (branch 6 m 05 s / clean-main control 6 m 16 s from empty target after the final reset) |
+| `cargo test --profile fastbuild --lib --locked` | PASS, 8707 passed / 0 failed / 10 ignored |
+| `cargo clippy --profile fastbuild --all-targets --locked -- -D warnings` | PASS, 0 compiler warnings |
+| `cargo fmt --check`, `git diff --check`, `py_compile`, `bash -n` | PASS |
+| CI contracts | PASS: 574 local standalone commands / 45 invocation contracts; shard a=88, b=124; lane plan 2989 s rounded (A 539.32 s, B 556.98 s); workflow shell 14 files / 2 rules; audit ratchet held |
+| 18 `ci_local.sh --only` selectors + workflow-shell | PASS: 20 unique gates, 0 failed; 7 optional cross-toolchain gates skipped per partial invocation |
+| `check_llvm_guarded_folds.py --clang clang-23` | PASS: 21 self-test mutations, `gf_range` 8 -> 5, 192-pair Python/GCC16/Clang23/LCCC ON/OFF/kill-switch oracle; worst-of-3 2.80 s |
+| four-ISA SV-03 runtime | PASS: aarch64/i686/riscv64/x86_64, 8 binaries, oracle=51; same-width range gate PASS over 28 IR sections and 4 ISAs |
+| tool-heavy host red-team | PASS: 10 evidence mutations rejected; see `/home/user/artifacts/redteam/induction_evidence.json` |
+
+The external red-team rebuilt clean main `eba81727` in a detached worktree with
+0 warnings and compared five host binaries: PR ON, kill switch, clean main,
+GCC 16.2.0 and Clang 23.1.5.  All five returned the independent Python
+checksum `e05a0b25418af6d6`; GDB 18.1 saw no SIGSEGV and `n=8 -> 4`; Memcheck
+reported 0 errors; Callgrind measured 84,169,556 / 84,173,691 / 84,173,691 /
+92,548,744 / 49,674,843 dynamic references; wall medians were 0.006922 /
+0.006351 / 0.006422 / 0.006633 / 0.007534 s.  Static `-S` counts were 16 / 17
+/ 17 / 19 / 73; ON had no 64-bit induction ops while both refuse controls had
+`addq,cmpq,movq,shrq`.  Capstone 5.0.9 decoded the exact ELF symbol bytes with
+zero errors (20/21/21/23/85 instructions), objdump and readelf supplied the
+independent instruction and FDE structure censuses, and GDB `ptype /o` plus
+pyelftools agreed on `struct Probe` size 24 with holes `(1,7)` and `(19,5)`.
+Standalone `objtool`, `pahole` and `perf` are absent and were explicitly not
+faked; readelf/objdump/Callgrind/GDB/DWARF are the documented equivalents.
+Clang used fewer Callgrind references but a higher wall median, so this remains
+a shape-local one-instruction proof, not a wall-clock or broad-superiority
+claim.  ICX 2026.2 is authenticated in the hosted vendor lane only.
+
+This is not a claim that the full local fast contract sweep or hosted CI has
+already run on this tree.  Hosted CI is the accepting authority; the final PR
+body records the fresh run ID and per-check verdict.  No production-ready claim
+is made until every required hosted check is green.

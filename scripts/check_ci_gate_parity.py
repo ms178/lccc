@@ -730,6 +730,201 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         rest_spec=("--prefix", "$HOME/.cache/lccc-kernel-tools"),
         local_gate=("kernel-relocs-tool", "fast"),
     ),
+    # ── SV-03 / range-gated Cast evidence: exact invocation contracts ──────
+    # Local mirrors use the env-var pins (`$LCCC`, `${GCC16:-gcc-16}`, ...);
+    # hosted shard-b uses literal paths; the authenticated ICX lane adds the
+    # strict --require-icx fourth oracle.  Every shape is pinned separately:
+    # a dropped --cases 82, a weakened --require-icx, or a swapped oracle
+    # path fails parity instead of quietly shrinking the matrix.
+    InvocationContract(
+        program="scripts/check_cond_load_sink_cross_arch.py",
+        name="cond-load-sink-cross-arch-selftest",
+        sides=_BOTH,
+        rest_spec=("--self-test",),
+        local_gate=("cond-load-sink-cross-arch-contracts", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/check_cond_load_sink_cross_arch.py",
+        name="cond-load-sink-cross-arch-full-local",
+        sides=frozenset({"local"}),
+        option_spec={
+            "--clang": ("${CLANG23:-clang-23}",),
+            "--json": ("target/cond-load-sink-cross-arch.json",),
+        },
+        local_gate=("cond-load-sink-cross-arch", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/check_cond_load_sink_cross_arch.py",
+        name="cond-load-sink-cross-arch-full-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--clang": ("$CLANG",),
+            "--json": ("target/cond-load-sink-cross-arch.json",),
+        },
+    ),
+    InvocationContract(
+        program="tests/regression/check_cond_load_sink_matrix.py",
+        name="cond-load-sink-matrix-selftest",
+        sides=_BOTH,
+        rest_spec=("--self-test",),
+        local_gate=("cond-load-sink-matrix-contracts", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_cond_load_sink_matrix.py",
+        name="cond-load-sink-matrix-local",
+        sides=frozenset({"local"}),
+        option_spec={
+            "--cases": ("82",),
+            "--lccc": ("$LCCC",),
+            "--gcc": ("${GCC16:-gcc-16}",),
+            "--clang": ("${CLANG23:-clang-23}",),
+            "--json": ("target/cond-load-sink-matrix.json",),
+        },
+        local_gate=("cond-load-sink-matrix", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_cond_load_sink_matrix.py",
+        name="cond-load-sink-matrix-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--cases": ("82",),
+            "--lccc": ("target/fastbuild/lccc",),
+            "--gcc": ("gcc-16",),
+            "--clang": ("$CLANG",),
+            "--json": ("target/cond-load-sink-matrix.json",),
+        },
+    ),
+    InvocationContract(
+        program="tests/regression/check_cond_load_sink_matrix.py",
+        name="cond-load-sink-matrix-icx",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--cases": ("82",),
+            "--lccc": ("target/fastbuild/lccc",),
+            "--gcc": ("$GCC16",),
+            "--clang": ("$CLANG",),
+            "--icx": ("$LCCC_ICX_BIN",),
+            "--json": ("intel-evidence/cond-load-sink-matrix.json",),
+        },
+        rest_spec=("--require-icx",),
+    ),
+    InvocationContract(
+        program="scripts/check_same_width_cast_range.py",
+        name="same-width-cast-range-selftest",
+        sides=_BOTH,
+        rest_spec=("--self-test",),
+        local_gate=("same-width-cast-range-contracts", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/check_same_width_cast_range.py",
+        name="same-width-cast-range-local",
+        sides=frozenset({"local"}),
+        option_spec={
+            "--lccc": ("$LCCC",),
+            "--gcc": ("${GCC16:-gcc-16}",),
+            "--clang": ("${CLANG23:-clang-23}",),
+            "--json": ("target/same-width-cast-range.json",),
+        },
+        local_gate=("same-width-cast-range", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/check_same_width_cast_range.py",
+        name="same-width-cast-range-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--lccc": ("target/fastbuild/lccc",),
+            "--gcc": ("gcc-16",),
+            "--clang": ("$CLANG",),
+            "--json": ("target/same-width-cast-range.json",),
+        },
+    ),
+    InvocationContract(
+        program="scripts/check_same_width_cast_range.py",
+        name="same-width-cast-range-icx",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--lccc": ("target/fastbuild/lccc",),
+            "--gcc": ("$GCC16",),
+            "--clang": ("$CLANG",),
+            "--icx": ("$LCCC_ICX_BIN",),
+            "--json": ("intel-evidence/same-width-cast-range.json",),
+        },
+        rest_spec=("--require-icx",),
+    ),
+    InvocationContract(
+        program="scripts/check_cond_load_sink_best_tools.py",
+        name="cond-load-sink-best-tools-selftest",
+        sides=_BOTH,
+        rest_spec=("--self-test",),
+        local_gate=("cond-load-sink-best-tools-contracts", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/check_cond_load_sink_best_tools.py",
+        name="cond-load-sink-best-tools-local",
+        sides=frozenset({"local"}),
+        option_spec={
+            "--lccc": ("$LCCC",),
+            "--gcc": ("${GCC16:-gcc-16}",),
+            "--clang": ("${CLANG23:-clang-23}",),
+            "--json": ("target/cond-load-sink-best-tools.json",),
+        },
+        local_gate=("cond-load-sink-best-tools", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/check_cond_load_sink_best_tools.py",
+        name="cond-load-sink-best-tools-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--lccc": ("target/fastbuild/lccc",),
+            "--gcc": ("gcc-16",),
+            "--clang": ("$CLANG",),
+            "--json": ("target/cond-load-sink-best-tools.json",),
+        },
+    ),
+    # The guarded-folds rewrite shares the same-width Cast proof with the
+    # SV-03 range gates, so its local, hosted and authenticated-vendor
+    # invocations are pinned separately.  Dropping the Clang pin, silently
+    # accepting a wrong ICX release, or weakening --require-icx fails parity.
+    InvocationContract(
+        program="tests/regression/check_llvm_guarded_folds.py",
+        name="llvm-guarded-folds-local",
+        sides=frozenset({"local"}),
+        option_spec={
+            "--clang": ("${CLANG:-clang-23}",),
+        },
+        local_gate=("llvm-guarded-folds", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_llvm_guarded_folds.py",
+        name="llvm-guarded-folds-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--clang": ("$CLANG",),
+        },
+    ),
+    InvocationContract(
+        program="tests/regression/check_llvm_guarded_folds.py",
+        name="llvm-guarded-folds-icx",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--clang": ("$CLANG",),
+            "--icx": ("$LCCC_ICX_BIN",),
+        },
+        rest_spec=("--require-icx",),
+    ),
+    InvocationContract(
+        program="scripts/check_cond_load_sink_best_tools.py",
+        name="cond-load-sink-best-tools-icx",
+        sides=frozenset({"hosted"}),
+        option_spec={
+            "--lccc": ("target/fastbuild/lccc",),
+            "--gcc": ("$GCC16",),
+            "--clang": ("$CLANG",),
+            "--icx": ("$LCCC_ICX_BIN",),
+            "--json": ("intel-evidence/cond-load-sink-best-tools.json",),
+        },
+        rest_spec=("--require-icx",),
+    ),
 )
 
 # The programs under invocation contract — derived, never hand-maintained:
@@ -763,6 +958,23 @@ PROGRAM_ENV_CHANNELS: dict[str, frozenset[str]] = {
     "scripts/ensure_gas_247.sh": frozenset({"GAS_DL_DIR", "GAS_CACHE"}),
     "tests/linker/run_linker_tests.py": frozenset(
         {"LCCC_BIN", "LINKTEST_CC", "LINKTEST_CXX", "LCCC_TEST_ASSEMBLER"}),
+    # These harnesses pin their oracles on the command line; a hidden
+    # kill-switch or cache-prefix channel could silently change a verdict.
+    "scripts/check_same_width_cast_range.py": frozenset(
+        {"CCC_SIMPLIFY_SKIP", "CCC_VERIFY_IR", "CCC_VALIDATE_SSA",
+         "LCCC_AGENT_CACHE_PREFIX", "LCCC_QEMU_PREFIX", "CLANG", "CLANG23"}),
+    "scripts/check_cond_load_sink_cross_arch.py": frozenset(
+        {"LCCC_AGENT_CACHE_PREFIX", "LCCC_QEMU_PREFIX",
+         "CCC_NO_COND_LOAD_SINK", "CLANG", "CLANG23"}),
+    "scripts/check_cond_load_sink_best_tools.py": frozenset(
+        {"CCC_SIMPLIFY_SKIP", "CCC_NO_COND_LOAD_SINK",
+         "LCCC_AGENT_CACHE_PREFIX", "CLANG", "CLANG23"}),
+    "tests/regression/check_cond_load_sink_matrix.py": frozenset(
+        {"CCC_NO_COND_LOAD_SINK", "CLANG", "CLANG23"}),
+    "tests/regression/check_llvm_guarded_folds.py": frozenset(
+        {"CCC_SIMPLIFY_SKIP", "CCC_DISABLE_PASSES", "CCC_VERIFY_IR",
+         "CCC_VERIFY_REGALLOC", "CCC_NO_PEEPHOLE", "LCCC_AGENT_CACHE_PREFIX",
+         "GCC", "CLANG", "CLANG23", "ICX", "LCCC_ICX_BIN"}),
 }
 
 

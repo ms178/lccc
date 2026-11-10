@@ -66,6 +66,40 @@ impl Builder {
             Value(self.next),
         )
     }
+    fn defs_and_uses(&self) -> (Vec<Option<Instruction>>, Vec<u32>) {
+        let mut defs = vec![None; self.next as usize];
+        let mut uses = vec![0; defs.len()];
+        for i in &self.insts {
+            defs[i.dest().unwrap().0 as usize] = Some(i.clone());
+            crate::backend::liveness::for_each_operand_in_instruction(i, |o| {
+                if let Operand::Value(v) = o {
+                    uses[v.0 as usize] += 1;
+                }
+            });
+        }
+        (defs, uses)
+    }
+    fn context_view(&self, f: impl FnOnce(&Context<'_>, &Facts), facts: &Facts) {
+        let (defs, uses) = self.defs_and_uses();
+        let cx = Context {
+            defs: &defs,
+            uses: &uses,
+            visits: std::cell::Cell::new(512),
+            disable_logic: false,
+            wrap_signed_overflow: true,
+        };
+        f(&cx, facts);
+    }
+    fn known(&self, op: Operand, ty: IrType, facts: &Facts) -> (u64, u64) {
+        let mut out = (0, 0);
+        self.context_view(|cx, facts| out = cx.known(op, ty, facts, 8), facts);
+        out
+    }
+    fn with_const(&self, op: Operand, want: IrBinOp, ty: IrType) -> Option<(Operand, u64)> {
+        let mut out = None;
+        self.context_view(|cx, _| out = cx.with_const(op, want, ty), &Facts(vec![]));
+        out
+    }
     fn verify(&self, samples: impl IntoIterator<Item = [u64; 3]>) {
         let replacement = self.fold().expect("production matcher must fire");
         for args in samples {
@@ -646,5 +680,149 @@ fn range_does_not_drop_sign_guard_for_unknown_or_negative_bounds() {
             });
             assert!(b.fold().is_none(), "{ty:?}");
         }
+    }
+}
+
+/// `cast_sign_range_fold` replaces a proven `U32 -> I32` Cast with an
+/// untyped Copy. The producer keeps its U32 label while the consuming Cmp
+/// keeps its I32 label. That mixed IR is bit-pattern-correct, but exact
+/// `IrType` equality used to make the guarded-range proof blind.
+#[test]
+fn same_width_signedness_labels_do_not_hide_bit_facts() {
+    assert!(same_width_scalar(IrType::I32, IrType::U32));
+    assert!(same_width_scalar(IrType::U32, IrType::I32));
+    assert!(!same_width_scalar(IrType::I32, IrType::I64));
+    assert!(!same_width_scalar(IrType::I32, IrType::F32));
+    assert!(!same_width_scalar(IrType::I128, IrType::U128));
+
+    let mut b = Builder::new(IrType::U32);
+    let masked = b.bin(IrBinOp::And, v(1), constant(15, IrType::U32));
+    assert_eq!(
+        b.with_const(masked, IrBinOp::And, IrType::I32),
+        Some((v(1), 15)),
+        "same-width signedness must not hide a masked producer"
+    );
+    assert!(b.with_const(masked, IrBinOp::And, IrType::I64).is_none());
+    let facts = Facts(vec![]);
+    let (zero, one) = b.known(masked, IrType::I32, &facts);
+    assert_ne!(zero & (1u64 << 31), 0, "sign bit must be known zero");
+    assert_eq!(one & !15, 0, "all high bits must be known zero");
+    assert_eq!(
+        b.known(masked, IrType::U32, &facts),
+        (zero, one),
+        "both signedness labels describe the same bit ring"
+    );
+    assert_eq!(
+        b.known(masked, IrType::I64, &facts),
+        (0, 0),
+        "a different width must still refuse the fact"
+    );
+}
+
+fn mixed_signedness_range(mask: u64, producer_ty: IrType) -> Builder {
+    let mut b = Builder::new(IrType::U32);
+    let masked = b.push(|dest| Instruction::BinOp {
+        dest,
+        op: IrBinOp::And,
+        lhs: v(1),
+        rhs: constant(mask, producer_ty),
+        ty: producer_ty,
+    });
+    let lower = b.push(|dest| Instruction::Cmp {
+        dest,
+        op: IrCmpOp::Sge,
+        lhs: v(0),
+        rhs: constant(0, IrType::I32),
+        ty: IrType::I32,
+    });
+    let upper = b.push(|dest| Instruction::Cmp {
+        dest,
+        op: IrCmpOp::Slt,
+        lhs: v(0),
+        rhs: masked,
+        ty: IrType::I32,
+    });
+    let widened = b.push(|dest| Instruction::Cast {
+        dest,
+        src: upper,
+        from_ty: IrType::U8,
+        to_ty: IrType::I64,
+    });
+    b.push(|dest| Instruction::Select {
+        dest,
+        cond: lower,
+        true_val: widened,
+        false_val: constant(0, IrType::I64),
+        ty: IrType::I64,
+    });
+    b
+}
+
+#[test]
+fn guarded_range_folds_when_signedness_cast_was_range_elided() {
+    let b = mixed_signedness_range(15, IrType::U32);
+    let plan = b
+        .fold()
+        .expect("same-width U32 mask must still certify a nonnegative I32 bound");
+    assert_eq!(plan.len(), 2, "Boolean result must be widened once");
+    assert!(matches!(
+        &plan[0],
+        Instruction::Cmp {
+            op: IrCmpOp::Ult,
+            lhs,
+            rhs,
+            ty: IrType::I32,
+            ..
+        } if *lhs == v(0) && *rhs == v(3)
+    ));
+    let xs = [
+        i32::MIN,
+        i32::MIN + 1,
+        -256,
+        -16,
+        -15,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        14,
+        15,
+        16,
+        255,
+        i32::MAX - 1,
+        i32::MAX,
+    ];
+    let ys = [
+        0u32,
+        1,
+        2,
+        14,
+        15,
+        16,
+        255,
+        0x4000_0000,
+        0x7fff_fff0,
+        0x8000_0000,
+        0xffff_fff0,
+        u32::MAX,
+    ];
+    b.verify(
+        xs.iter()
+            .flat_map(|&x| ys.iter().map(move |&y| [x as u32 as u64, u64::from(y), 0])),
+    );
+}
+
+#[test]
+fn guarded_range_still_refuses_negative_or_wrong_width_bounds() {
+    for (mask, ty) in [
+        (0x8000_000f, IrType::U32), // sign bit is not known clear
+        (15, IrType::U64),          // same-width normalization is not widening
+    ] {
+        let b = mixed_signedness_range(mask, ty);
+        assert!(
+            b.fold().is_none(),
+            "unsafe bound must keep both signed guards: mask={mask:#x} ty={ty:?}"
+        );
     }
 }

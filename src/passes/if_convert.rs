@@ -1297,8 +1297,38 @@ fn cond_load_hoistable(inst: &Instruction) -> bool {
     }
 }
 
+/// Faithful, injective integer-extension cast: no bit is lost and no
+/// float/pointer reinterpretation occurs.  Swift is deliberately absent.
+fn cond_load_widening_cast(from_ty: IrType, to_ty: IrType) -> bool {
+    use IrType::*;
+    matches!(
+        (from_ty, to_ty),
+        (I8, I16 | I32 | I64)
+            | (U8, U16 | U32 | U64 | I16 | I32 | I64)
+            | (I16, I32 | I64)
+            | (U16, U32 | U64 | I32 | I64)
+            | (I32, I64)
+            | (U32, U64 | I64)
+    )
+}
+
+/// One already-validated promotion Cast in an arm's linear tail.
+///
+/// Keeping the typed fields instead of a cloned `Instruction` makes the apply
+/// phase total: it can emit a Cast without re-matching a variant, unwrapping a
+/// destination, or reaching an `unreachable!` branch.  The parser is the only
+/// place that inspects an untrusted shape.
+#[derive(Clone, Copy, Debug)]
+struct CondLoadCastTail {
+    dest: Value,
+    from_ty: IrType,
+    to_ty: IrType,
+}
+
 struct CondLoadArm {
-    /// Every instruction except the single load, in original order.
+    /// Pure instructions BEFORE the load only, in original order.  Anything
+    /// AFTER the load is a promotion tail and is re-emitted in the merge, not
+    /// hoisted into the pred (otherwise one SSA id gets two definitions).
     pure_insts: Vec<Instruction>,
     load_dest: Value,
     load_ptr: Value,
@@ -1306,13 +1336,21 @@ struct CondLoadArm {
     seg: AddressSpace,
     /// All destination ids defined anywhere in this arm.
     defined: FxHashSet<u32>,
+    /// Pure, bijective integer-promotion/sign-extension casts between the
+    /// load and the merge Phi.  Empty for the canonical direct-load shape.
+    /// Both arms must have the IDENTICAL type chain.
+    tail: Vec<CondLoadCastTail>,
+    /// Phi incoming: the last `tail` dest, or the load dest when empty.
+    tail_result: Value,
+    /// Type of `tail_result`: the final Cast's target, or the load type.
+    result_ty: IrType,
 }
 
 fn parse_cond_load_arm(block: &BasicBlock) -> Option<CondLoadArm> {
     let mut pure_insts = Vec::with_capacity(block.instructions.len());
     let mut defined = FxHashSet::default();
-    let mut load: Option<(Value, Value, IrType, AddressSpace)> = None;
-    for inst in &block.instructions {
+    let mut load: Option<(usize, Value, Value, IrType, AddressSpace)> = None;
+    for (idx, inst) in block.instructions.iter().enumerate() {
         if let Some(d) = inst.dest() {
             defined.insert(d.0);
         }
@@ -1330,13 +1368,54 @@ fn parse_cond_load_arm(block: &BasicBlock) -> Option<CondLoadArm> {
                 if *volatile || load.is_some() {
                     return None;
                 }
-                load = Some((*dest, *ptr, *ty, *seg_override));
+                load = Some((idx, *dest, *ptr, *ty, *seg_override));
             }
-            other if cond_load_hoistable(other) => pure_insts.push(other.clone()),
+            other if cond_load_hoistable(other) => {
+                // Only the address chain BEFORE the load may be hoisted.
+                // Pure instructions after it are validated as a promotion
+                // tail below and re-emitted after the sunk load.
+                if load.is_none() {
+                    pure_insts.push(other.clone());
+                }
+            }
             _ => return None,
         }
     }
-    let (load_dest, load_ptr, ty, seg) = load?;
+    let (load_index, load_dest, load_ptr, ty, seg) = load?;
+    // C integer promotion puts Cast(I8/U8/I16/U16 -> I32) between a narrow
+    // load and a merge Phi.  Refusing those shapes leaves LCCC branchy while
+    // GCC 16.2 and Clang 23.1.5 emit `cmov` + one `movzbl`/`movswl`.
+    // Accept ONLY a pure linear chain of *bijective* integer casts whose
+    // source type matches the previous result: no truncation, no
+    // float/pointer reinterpretation, no address/segment changes.
+    let mut tail: Vec<CondLoadCastTail> = Vec::new();
+    let mut tail_result = load_dest;
+    let mut expected_from = ty;
+    for inst in &block.instructions[load_index + 1..] {
+        let Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty,
+        } = inst
+        else {
+            return None;
+        };
+        if !matches!(*src, Operand::Value(v) if v == tail_result)
+            || *from_ty != expected_from
+            || !cond_load_widening_cast(*from_ty, *to_ty)
+        {
+            return None;
+        }
+        tail.push(CondLoadCastTail {
+            dest: *dest,
+            from_ty: *from_ty,
+            to_ty: *to_ty,
+        });
+        tail_result = *dest;
+        expected_from = *to_ty;
+    }
+    let result_ty = tail.last().map_or(ty, |cast| cast.to_ty);
     Some(CondLoadArm {
         pure_insts,
         load_dest,
@@ -1344,6 +1423,9 @@ fn parse_cond_load_arm(block: &BasicBlock) -> Option<CondLoadArm> {
         ty,
         seg,
         defined,
+        tail,
+        tail_result,
+        result_ty,
     })
 }
 
@@ -1449,6 +1531,8 @@ struct CondLoadPlan {
     cond: Operand,
     t_arm: CondLoadArm,
     f_arm: CondLoadArm,
+    /// Shared promotion chain, re-emitted after the sunk load.
+    tail: Vec<CondLoadCastTail>,
     phi_idx: usize,
     phi_dest: Value,
     extra_phis: Vec<CondLoadPhi>,
@@ -1456,58 +1540,215 @@ struct CondLoadPlan {
 
 /// Structural identity for an address expression, independent of SSA id.
 ///
-/// A guard that reads `a[i]` and the arm that reloads `a[i]` frequently carry
-/// DIFFERENT `GetElementPtr` destinations (the frontend materializes the
-/// address twice, and `load_forward` only merges some of them before
-/// if-conversion runs).  Comparing `Value` ids would miss exactly the cases
-/// where sinking is a pessimization, so fold GEP/Cast/Copy chains into a
-/// canonical key.  The element type is deliberately NOT part of the key: the
-/// address is `base + offset` in bytes regardless of the loaded type.  Recursion
-/// is bounded; anything unrecognised falls back to an opaque, unique key so the
-/// comparison never claims two unknown addresses are equal.
-fn cond_load_offset_is_zero(offset: &Operand) -> bool {
-    match offset {
-        Operand::Const(IrConst::I8(v)) => *v == 0,
-        Operand::Const(IrConst::I16(v)) => *v == 0,
-        Operand::Const(IrConst::I32(v)) => *v == 0,
-        Operand::Const(IrConst::I64(v)) => *v == 0,
-        Operand::Const(IrConst::I128(v)) => *v == 0,
-        Operand::Const(IrConst::Zero) => true,
-        _ => false,
+/// A guard that reads `a[i]` and the arm that reloads `a[i]` frequently use
+/// DIFFERENT IR spellings with DIFFERENT SSA ids: the frontend emits a
+/// `GetElementPtr` for one and `BinOp::Add` (or `Sub`) for the other.  This
+/// was measured on generated shapes (`GEP(a, 24)` vs `Add(a, 24)`), and an
+/// SSA-id-only comparison missed exactly those cases.  Both forms are folded
+/// into ONE canonical sum of atomic operands plus a byte displacement, with
+/// associativity/commutativity and zero/nested constant offsets normalised.
+///
+/// Ambiguous definitions, side-effecting instructions, multiply-defined SSA
+/// homes, arithmetic overflow and recursion beyond a small bound produce an
+/// OPAQUE, UNIQUE key.  The comparison must never claim two unknown addresses
+/// are equal.  These keys are used ONLY to DECLINE an optimization, so even a
+/// hypothetical false positive is conservative; every rule below is still
+/// designed to be sound.
+type CondLoadDefs<'a> = FxHashMap<u32, Vec<&'a Instruction>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CondAddrExpr {
+    /// Sorted multiset of non-constant, non-Add terms.
+    atoms: Vec<String>,
+    /// Sum of every constant byte displacement in the Add chain.
+    offset: i128,
+}
+
+impl CondAddrExpr {
+    fn atom(key: String) -> Self {
+        Self {
+            atoms: vec![key],
+            offset: 0,
+        }
+    }
+
+    fn constant(n: i128) -> Self {
+        Self {
+            atoms: Vec::new(),
+            offset: n,
+        }
+    }
+
+    fn opaque(v: Value) -> Self {
+        Self::atom(format!("opaque:{}", v.0))
+    }
+
+    fn add(self, rhs: Self, v: Value) -> Self {
+        let Some(offset) = self.offset.checked_add(rhs.offset) else {
+            // i128 exhaustion is only reachable from malformed/very deep IR.
+            // Fail closed with a deterministic, operand-dependent token.
+            return Self::atom(format!(
+                "opaque:overflow:{}:{}:{}",
+                v.0,
+                self.key(),
+                rhs.key()
+            ));
+        };
+        let mut atoms = self.atoms;
+        atoms.extend(rhs.atoms);
+        Self { atoms, offset }
+    }
+
+    fn key(&self) -> String {
+        let mut atoms = self.atoms.clone();
+        atoms.sort_unstable();
+        if self.offset == 0 {
+            // The three cases are exhaustive; no indexing, unwrap or
+            // unreachable branch can abort on malformed IR.
+            return match atoms.as_slice() {
+                [] => "const(0)".to_string(),
+                [only] => only.clone(),
+                _ => format!("add({})", atoms.join(",")),
+            };
+        }
+        let mut parts = Vec::with_capacity(atoms.len() + 1);
+        parts.push(format!("const({})", self.offset));
+        parts.extend(atoms);
+        format!("add({})", parts.join(","))
     }
 }
 
-fn cond_load_ptr_key(v: Value, defs: &FxHashMap<u32, &Instruction>, depth: usize) -> String {
-    if depth > 8 {
-        return format!("opaque:{}", v.0);
+fn cond_load_const_offset(op: &Operand) -> Option<i128> {
+    match op {
+        Operand::Const(IrConst::I8(v)) => Some(*v as i128),
+        Operand::Const(IrConst::I16(v)) => Some(*v as i128),
+        Operand::Const(IrConst::I32(v)) => Some(*v as i128),
+        Operand::Const(IrConst::I64(v)) => Some(*v as i128),
+        Operand::Const(IrConst::I128(v)) => Some(*v),
+        Operand::Const(IrConst::Zero) => Some(0),
+        _ => None,
     }
-    let Some(inst) = defs.get(&v.0) else {
-        return format!("opaque:{}", v.0);
-    };
-    match inst {
-        Instruction::GetElementPtr { base, offset, .. } => {
-            // `base + 0` IS `base`: the frontend materializes a zero-offset
-            // GEP for `a[0]` while the guard may load straight from `a`.
-            // Folding it keeps the two spellings of one address comparable.
-            if cond_load_offset_is_zero(offset) {
-                return cond_load_ptr_key(*base, defs, depth + 1);
-            }
-            format!(
-                "gep({},{:?})",
-                cond_load_ptr_key(*base, defs, depth + 1),
-                offset
-            )
-        }
-        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
-            Operand::Value(sv) => {
-                format!("alias({})", cond_load_ptr_key(*sv, defs, depth + 1))
-            }
-            Operand::Const(c) => format!("const({c:?})"),
+}
+
+fn cond_load_operand_expr(op: &Operand, defs: &CondLoadDefs<'_>, depth: usize) -> CondAddrExpr {
+    match op {
+        Operand::Value(v) => cond_load_expr(*v, defs, depth + 1),
+        Operand::Const(c) => match cond_load_const_offset(op) {
+            Some(n) => CondAddrExpr::constant(n),
+            None => CondAddrExpr::atom(format!("const({c:?})")),
         },
-        Instruction::GlobalAddr { name, .. } => format!("global({name})"),
-        Instruction::ParamRef { param_idx, .. } => format!("param({param_idx})"),
-        _ => format!("opaque:{}", v.0),
     }
+}
+
+/// Casts that preserve every address bit.  Same-width integer/integer and
+/// integer/pointer reinterpretations are no-ops in every backend; narrowing,
+/// widening, float conversion and signedness-changing casts of DIFFERENT
+/// widths are not, so those become opaque atoms.
+fn cond_load_cast_preserves_address(from_ty: IrType, to_ty: IrType) -> bool {
+    let integerish = |t: IrType| t.is_integer() || t == IrType::Ptr;
+    integerish(from_ty) && integerish(to_ty) && from_ty.size() == to_ty.size()
+}
+
+fn cond_load_expr(v: Value, defs: &CondLoadDefs<'_>, depth: usize) -> CondAddrExpr {
+    if depth > 8 {
+        return CondAddrExpr::opaque(v);
+    }
+    let Some(one) = defs.get(&v.0) else {
+        return CondAddrExpr::opaque(v);
+    };
+    if one.len() != 1 {
+        return CondAddrExpr::opaque(v);
+    }
+    match one[0] {
+        Instruction::GetElementPtr { base, offset, .. } => cond_load_expr(*base, defs, depth + 1)
+            .add(cond_load_operand_expr(offset, defs, depth + 1), v),
+        Instruction::BinOp {
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ..
+        } => cond_load_operand_expr(lhs, defs, depth + 1)
+            .add(cond_load_operand_expr(rhs, defs, depth + 1), v),
+        Instruction::BinOp {
+            op: IrBinOp::Sub,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } => {
+            let l = cond_load_operand_expr(lhs, defs, depth + 1);
+            let r = cond_load_operand_expr(rhs, defs, depth + 1);
+            if r.atoms.is_empty() {
+                // `base - const` normalises to `base + (-const)`.
+                // `wrapping_neg` handles i128::MIN without a debug panic.
+                l.add(CondAddrExpr::constant(r.offset.wrapping_neg()), v)
+            } else {
+                CondAddrExpr::atom(format!("sub:{ty:?}({},{})", l.key(), r.key()))
+            }
+        }
+        Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        } => {
+            let mut keys = [
+                cond_load_operand_expr(lhs, defs, depth + 1).key(),
+                cond_load_operand_expr(rhs, defs, depth + 1).key(),
+            ];
+            if op.is_commutative() {
+                keys.sort_unstable();
+            }
+            CondAddrExpr::atom(format!("{op:?}:{ty:?}({},{})", keys[0], keys[1]))
+        }
+        Instruction::UnaryOp { op, src, ty, .. } => CondAddrExpr::atom(format!(
+            "{op:?}:{ty:?}({})",
+            cond_load_operand_expr(src, defs, depth + 1).key()
+        )),
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } => CondAddrExpr::atom(format!(
+            "{op:?}:{ty:?}({},{})",
+            cond_load_operand_expr(lhs, defs, depth + 1).key(),
+            cond_load_operand_expr(rhs, defs, depth + 1).key()
+        )),
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ty,
+            ..
+        } => CondAddrExpr::atom(format!(
+            "select:{ty:?}({},{},{})",
+            cond_load_operand_expr(cond, defs, depth + 1).key(),
+            cond_load_operand_expr(true_val, defs, depth + 1).key(),
+            cond_load_operand_expr(false_val, defs, depth + 1).key()
+        )),
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } if cond_load_cast_preserves_address(*from_ty, *to_ty) => {
+            cond_load_operand_expr(src, defs, depth + 1)
+        }
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } => CondAddrExpr::atom(format!(
+            "cast:{from_ty:?}->{to_ty:?}({})",
+            cond_load_operand_expr(src, defs, depth + 1).key()
+        )),
+        Instruction::Copy { src, .. } => cond_load_operand_expr(src, defs, depth + 1),
+        Instruction::GlobalAddr { name, .. } => CondAddrExpr::atom(format!("global({name})")),
+        Instruction::ParamRef { param_idx, ty, .. } => {
+            CondAddrExpr::atom(format!("param({param_idx}:{ty:?})"))
+        }
+        _ => CondAddrExpr::opaque(v),
+    }
+}
+
+fn cond_load_ptr_key(v: Value, defs: &CondLoadDefs<'_>, depth: usize) -> String {
+    cond_load_expr(v, defs, depth).key()
 }
 
 /// Profitability proof for the `a[i] < b[i] ? a[i] : b[i]` family.
@@ -1525,7 +1766,7 @@ fn cond_load_guard_reads_arm_address(
     cond: Operand,
     t_key: &str,
     f_key: &str,
-    defs: &FxHashMap<u32, &Instruction>,
+    defs: &CondLoadDefs<'_>,
 ) -> bool {
     let Operand::Value(root) = cond else {
         return false;
@@ -1536,16 +1777,21 @@ fn cond_load_guard_reads_arm_address(
         if !seen.insert(id) {
             continue;
         }
-        let Some(inst) = defs.get(&id) else {
+        // Conventional SSA permits several `Copy` definitions of one phi
+        // home; keeping ALL of them prevents an earlier alias from hiding the
+        // guard's load.
+        let Some(defs_for_id) = defs.get(&id) else {
             continue;
         };
-        if let Instruction::Load { ptr, .. } = inst {
-            let key = cond_load_ptr_key(*ptr, defs, 0);
-            if key == t_key || key == f_key {
-                return true;
+        for &inst in defs_for_id.iter() {
+            if let Instruction::Load { ptr, .. } = inst {
+                let key = cond_load_ptr_key(*ptr, defs, 0);
+                if key == t_key || key == f_key {
+                    return true;
+                }
             }
+            inst.for_each_used_value(|u| work.push(u));
         }
-        inst.for_each_used_value(|u| work.push(u));
     }
     false
 }
@@ -1564,15 +1810,16 @@ fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
     // Where every SSA value is defined.  A value with no entry is treated as
     // unavailable (fail closed) by the availability proof below.
     let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
-    // Definition instruction for each SSA id, used by the guard-dependence
-    // profitability proof below.  A duplicate id keeps the first definition;
-    // the SSA verifier rejects real duplicates, so this cannot mask a bug.
-    let mut def_inst: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    // Every definition instruction for each SSA id, used by the
+    // guard-dependence profitability proof below.  Conventional SSA permits
+    // several `Copy` definitions of one phi home, so keep ALL of them: taking
+    // only the first could hide the guard's load behind an earlier alias.
+    let mut def_inst: CondLoadDefs<'_> = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             if let Some(d) = inst.dest() {
                 def_block.insert(d.0, bi);
-                def_inst.entry(d.0).or_insert(inst);
+                def_inst.entry(d.0).or_default().push(inst);
             }
         }
     }
@@ -1672,10 +1919,18 @@ fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
         ) {
             continue;
         }
-        // Each load result must be used ONLY by the merge Phi; otherwise the
-        // hoist would leave a dangling SSA use after the arms are emptied.
+        // Each load result and each promotion-tail id must be used ONLY by
+        // the next chain instruction (or, for the final tail result, by the
+        // merge Phi).  Otherwise emptying the arms leaves a dangling SSA use.
+        let tail_single_use = |arm: &CondLoadArm| {
+            arm.tail
+                .iter()
+                .all(|cast| use_counts.get(&cast.dest.0).copied().unwrap_or(0) == 1)
+        };
         if use_counts.get(&t_arm.load_dest.0).copied().unwrap_or(0) != 1
             || use_counts.get(&f_arm.load_dest.0).copied().unwrap_or(0) != 1
+            || !tail_single_use(&t_arm)
+            || !tail_single_use(&f_arm)
         {
             continue;
         }
@@ -1718,10 +1973,10 @@ fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
             let is_target = matches!(
                 (tv, fv),
                 (Operand::Value(a), Operand::Value(b))
-                    if a.0 == t_arm.load_dest.0 && b.0 == f_arm.load_dest.0
+                    if a.0 == t_arm.tail_result.0 && b.0 == f_arm.tail_result.0
             );
             if is_target {
-                if phi.is_some() || *ty != t_arm.ty {
+                if phi.is_some() || *ty != t_arm.result_ty {
                     bad_phi = true;
                     break;
                 }
@@ -1731,10 +1986,18 @@ fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
             // A different Phi becomes a Select: it needs a Select-able type,
             // must not consume either doomed load result, and both of its
             // incomings must be available at the pred.
+            // Arm-local pure chains ARE hoisted into the pred, but the
+            // promotion tail is NOT: it is re-emitted in the merge.  A Select
+            // consuming any of those ids would therefore be invalid.
+            let doomed: FxHashSet<u32> = [t_arm.load_dest.0, f_arm.load_dest.0]
+                .into_iter()
+                .chain(t_arm.tail.iter().map(|cast| cast.dest.0))
+                .chain(f_arm.tail.iter().map(|cast| cast.dest.0))
+                .collect();
             let mut incoming_ok = cond_load_phi_selectable(*ty);
             for op in [tv, fv] {
                 if let Operand::Value(v) = op {
-                    if v.0 == t_arm.load_dest.0 || v.0 == f_arm.load_dest.0 {
+                    if doomed.contains(&v.0) {
                         incoming_ok = false;
                     } else if !t_arm.defined.contains(&v.0) && !f_arm.defined.contains(&v.0) {
                         incoming_ok &= def_block.get(&v.0).is_some_and(|&b| dom.dominates(b, p));
@@ -1759,6 +2022,18 @@ fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
         let Some((phi_idx, phi_dest)) = phi else {
             continue;
         };
+        // Both arms must present the SAME promotion chain.  Different chains
+        // cannot share one sunk load; declining is always sound.
+        if t_arm.tail.len() != f_arm.tail.len()
+            || !t_arm
+                .tail
+                .iter()
+                .zip(&f_arm.tail)
+                .all(|(a, b)| a.from_ty == b.from_ty && a.to_ty == b.to_ty)
+        {
+            continue;
+        }
+        let tail = t_arm.tail.clone();
         plans.push(CondLoadPlan {
             pred: p,
             t,
@@ -1768,6 +2043,7 @@ fn plan_cond_load_sinks(func: &IrFunction) -> Vec<CondLoadPlan> {
             cond,
             t_arm,
             f_arm,
+            tail,
             phi_idx,
             phi_dest,
             extra_phis,
@@ -1786,7 +2062,16 @@ fn apply_cond_load_sink(func: &mut IrFunction, p: &CondLoadPlan) -> bool {
         return false;
     }
     let fresh = Value(func.sound_next_value_id());
-    func.next_value_id = fresh.0.saturating_add(1);
+    let fresh_load = Value(fresh.0.saturating_add(1));
+    func.next_value_id = fresh_load.0.saturating_add(1);
+    // With a promotion tail, the sunk Load must define a NEW id (the pointer
+    // Select already owns `fresh`) and the tail must end at the ORIGINAL phi
+    // destination, preserving every downstream use without rewriting them.
+    let (load_dest, tail_dest) = if p.tail.is_empty() {
+        (p.phi_dest, p.phi_dest)
+    } else {
+        (fresh_load, p.phi_dest)
+    };
     let dummy = crate::common::source::Span::dummy();
     {
         let pred = &mut func.blocks[p.pred];
@@ -1828,12 +2113,34 @@ fn apply_cond_load_sink(func: &mut IrFunction, p: &CondLoadPlan) -> bool {
     // every use of it) is unchanged, and the parallel span/provenance arrays
     // stay aligned because the instruction count does not change.
     func.blocks[p.merge].instructions[p.phi_idx] = Instruction::Load {
-        dest: p.phi_dest,
+        dest: load_dest,
         ptr: fresh,
         ty: p.t_arm.ty,
         seg_override: p.t_arm.seg,
         volatile: false,
     };
+    if !p.tail.is_empty() {
+        let mut prev = load_dest;
+        let mut rewritten_tail = Vec::with_capacity(p.tail.len());
+        for (k, cast) in p.tail.iter().enumerate() {
+            let dest = if k + 1 == p.tail.len() {
+                tail_dest
+            } else {
+                cast.dest
+            };
+            rewritten_tail.push(Instruction::Cast {
+                dest,
+                src: Operand::Value(prev),
+                from_ty: cast.from_ty,
+                to_ty: cast.to_ty,
+            });
+            prev = dest;
+        }
+        // Insert DIRECTLY after the replaced Phi, before the original Store.
+        // `insert_insts` keeps spans/inline ids in lockstep; appending would
+        // place the casts after a use of the phi destination (invalid SSA).
+        func.blocks[p.merge].insert_insts(p.phi_idx + 1, rewritten_tail, dummy);
+    }
     // Remove the other phis (their values now come from the pred's Selects).
     // retain_insts keeps spans/inline ids in lockstep.
     if !p.extra_phis.is_empty() {
@@ -3883,6 +4190,32 @@ mod tests {
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{IrBinOp, IrConst};
 
+    #[test]
+    fn cond_load_addr_expr_key_is_total_on_every_shape_class() {
+        // Empty / one atom / many atoms, with and without an offset.  The old
+        // implementation used `unreachable!` + `unwrap()` for the one-part
+        // case; this locks the exhaustive, allocation-light replacement.
+        assert_eq!(CondAddrExpr::constant(0).key(), "const(0)");
+        assert_eq!(CondAddrExpr::atom("global(a)".into()).key(), "global(a)");
+        assert_eq!(
+            CondAddrExpr::atom("b".into())
+                .add(CondAddrExpr::atom("a".into()), Value(9))
+                .key(),
+            "add(a,b)"
+        );
+        assert_eq!(CondAddrExpr::constant(24).key(), "add(const(24))");
+        assert_eq!(
+            CondAddrExpr::atom("global(a)".into())
+                .add(CondAddrExpr::constant(24), Value(9))
+                .key(),
+            "add(const(24),global(a))"
+        );
+        let overflow = CondAddrExpr::constant(i128::MAX)
+            .add(CondAddrExpr::constant(1), Value(7))
+            .key();
+        assert!(overflow.starts_with("opaque:overflow:7:"), "{overflow}");
+    }
+
     fn masked_triangle(
         mask: i64,
         pattern: i64,
@@ -5877,6 +6210,429 @@ mod cond_load_sink_tests {
         };
         f.next_value_id = 60;
         assert_eq!(sink_conditional_loads(&mut f), 1);
+    }
+
+    /// Narrow C integer loads: `Cast(U8/I8/U16/I16 -> I32)` sits between the
+    /// arm Load and the merge Phi.  GCC 16.2 and Clang 23.1.5 both emit a
+    /// branchless `cmov` + `movzbl`/`movswl` for this family; SV-03 must not
+    /// leave LCCC's two-branch form behind.
+    fn cond_load_narrow_diamond(
+        from_ty: IrType,
+        t_to: IrType,
+        f_to: IrType,
+        f_dest: Value,
+    ) -> IrFunction {
+        let mut f = cond_load_diamond();
+        for (bi, to_ty, dest) in [(2usize, t_to, Value(12)), (3, f_to, f_dest)] {
+            if let Some(Instruction::Load { ty, .. }) = f.blocks[bi].instructions.get_mut(1) {
+                *ty = from_ty;
+            }
+            f.blocks[bi].instructions.push(Instruction::Cast {
+                dest,
+                src: Operand::Value(Value(if bi == 2 { 11 } else { 21 })),
+                from_ty,
+                to_ty,
+            });
+        }
+        if let Instruction::Phi { ty, incoming, .. } = &mut f.blocks[4].instructions[0] {
+            *ty = t_to;
+            incoming[0].0 = Operand::Value(Value(12));
+            incoming[1].0 = Operand::Value(f_dest);
+        }
+        if let Instruction::Store { ty, .. } = &mut f.blocks[4].instructions[1] {
+            *ty = t_to;
+        }
+        f.next_value_id = 41;
+        f
+    }
+
+    #[test]
+    fn cond_load_arm_parse_records_a_typed_promotion_tail() {
+        let f = cond_load_narrow_diamond(IrType::I8, IrType::I32, IrType::I32, Value(22));
+        let arm = parse_cond_load_arm(&f.blocks[2]).expect("canonical narrow-load arm");
+        assert_eq!(arm.tail.len(), 1);
+        assert_eq!(arm.tail[0].from_ty, IrType::I8);
+        assert_eq!(arm.tail[0].to_ty, IrType::I32);
+        assert_eq!(arm.tail_result, arm.tail[0].dest);
+        assert_eq!(arm.result_ty, IrType::I32);
+        assert_ne!(arm.load_dest, arm.tail_result);
+    }
+
+    fn count_defs(f: &IrFunction, id: u32) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| i.dest().is_some_and(|d| d.0 == id))
+            .count()
+    }
+
+    #[test]
+    fn cond_load_sink_sinks_narrow_loads_through_integer_promotion() {
+        let mut f = cond_load_narrow_diamond(IrType::U8, IrType::I32, IrType::I32, Value(22));
+        assert_eq!(sink_conditional_loads(&mut f), 1);
+        let sel = match f.blocks[1].instructions.last().unwrap() {
+            Instruction::Select { dest, ty, .. } => {
+                assert_eq!(*ty, IrType::Ptr);
+                *dest
+            }
+            other => panic!("expected pointer Select, got {other:?}"),
+        };
+        let load_dest = match &f.blocks[4].instructions[0] {
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile,
+                ..
+            } => {
+                assert_ne!(*dest, Value(30));
+                assert_ne!(*dest, sel);
+                assert_eq!(*ptr, sel);
+                assert_eq!(*ty, IrType::U8);
+                assert!(!*volatile);
+                *dest
+            }
+            other => panic!("expected sunk narrow Load, got {other:?}"),
+        };
+        // The promoted cast must be inserted BEFORE the Store and define the
+        // original phi destination, so downstream uses stay valid.
+        match &f.blocks[4].instructions[1] {
+            Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } => {
+                assert_eq!(*dest, Value(30));
+                assert_eq!(*src, Operand::Value(load_dest));
+                assert_eq!(*from_ty, IrType::U8);
+                assert_eq!(*to_ty, IrType::I32);
+            }
+            other => panic!("expected promotion Cast, got {other:?}"),
+        }
+        assert!(matches!(
+            &f.blocks[4].instructions[2],
+            Instruction::Store { val: Operand::Value(v), .. } if *v == Value(30)
+        ));
+        // Regression for the self-audited duplicate-definition defect: a tail
+        // Cast must be re-emitted ONLY in the merge, never also hoisted into
+        // the pred.  Otherwise the same SSA id has two definitions.
+        assert!(
+            !f.blocks[1]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Cast { .. }))
+        );
+        assert_eq!(count_defs(&f, 30), 1);
+        assert!(f.blocks[2].instructions.is_empty());
+        assert!(f.blocks[3].instructions.is_empty());
+        assert_eq!(
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter(|i| matches!(i, Instruction::Load { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cond_load_sink_sinks_a_multi_cast_promotion_chain() {
+        let mut f = cond_load_narrow_diamond(IrType::I8, IrType::I32, IrType::I32, Value(22));
+        // Replace each one-step I8->I32 tail with I8->I16->I32.
+        for (bi, first, final_dest) in [(2usize, Value(13), Value(12)), (3, Value(23), Value(22))] {
+            let insts = &mut f.blocks[bi].instructions;
+            insts.pop();
+            insts.push(Instruction::Cast {
+                dest: first,
+                src: Operand::Value(Value(if bi == 2 { 11 } else { 21 })),
+                from_ty: IrType::I8,
+                to_ty: IrType::I16,
+            });
+            insts.push(Instruction::Cast {
+                dest: final_dest,
+                src: Operand::Value(first),
+                from_ty: IrType::I16,
+                to_ty: IrType::I32,
+            });
+        }
+        assert_eq!(sink_conditional_loads(&mut f), 1);
+        assert!(matches!(
+            f.blocks[4].instructions[0],
+            Instruction::Load { .. }
+        ));
+        for inst in f.blocks[4].instructions.iter().take(3) {
+            assert!(matches!(
+                inst,
+                Instruction::Load { .. } | Instruction::Cast { .. }
+            ));
+        }
+        assert_eq!(f.blocks[4].instructions[1].dest().unwrap(), Value(13));
+        assert_eq!(f.blocks[4].instructions[2].dest().unwrap(), Value(30));
+        assert_eq!(count_defs(&f, 13), 1);
+        assert_eq!(count_defs(&f, 30), 1);
+        assert!(
+            !f.blocks[1]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Cast { .. }))
+        );
+        assert_eq!(
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter(|i| matches!(i, Instruction::Load { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cond_load_sink_refuses_mismatched_or_truncating_promotion_tails() {
+        // Different final cast types => the merge Phi cannot have one type.
+        let mut mismatched =
+            cond_load_narrow_diamond(IrType::U8, IrType::I32, IrType::I64, Value(22));
+        if let Instruction::Phi { ty, .. } = &mut mismatched.blocks[4].instructions[0] {
+            *ty = IrType::I64;
+        }
+        assert_eq!(sink_conditional_loads(&mut mismatched), 0);
+        // A truncating cast is not bijective: the original tail must survive.
+        let mut truncating =
+            cond_load_narrow_diamond(IrType::I32, IrType::I8, IrType::I8, Value(22));
+        if let Instruction::Phi { ty, .. } = &mut truncating.blocks[4].instructions[0] {
+            *ty = IrType::I8;
+        }
+        assert_eq!(sink_conditional_loads(&mut truncating), 0);
+        // A side-effecting instruction after the load is never a tail.
+        let mut impure = cond_load_narrow_diamond(IrType::U8, IrType::I32, IrType::I32, Value(22));
+        impure.blocks[2].instructions.push(Instruction::Load {
+            dest: Value(14),
+            ptr: Value(10),
+            ty: IrType::U8,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        assert_eq!(sink_conditional_loads(&mut impure), 0);
+        // A second use of a tail id would dangle once the arms disappear.
+        let mut extra_use =
+            cond_load_narrow_diamond(IrType::U8, IrType::I32, IrType::I32, Value(22));
+        extra_use.blocks[4].instructions.push(Instruction::Copy {
+            dest: Value(35),
+            src: Operand::Value(Value(12)),
+        });
+        assert_eq!(sink_conditional_loads(&mut extra_use), 0);
+    }
+
+    /// Build a tiny definition map for the structural address-key tests.
+    /// Each instruction below defines Value(i+1); the map borrows the local
+    /// Vec, so NO unsafe lifetime extension is needed.
+    fn key_defs(insts: &[Instruction]) -> CondLoadDefs<'_> {
+        insts
+            .iter()
+            .enumerate()
+            .map(|(i, inst)| (i as u32 + 1, vec![inst]))
+            .collect()
+    }
+
+    #[test]
+    fn cond_load_ptr_key_normalises_gep_add_sub_and_zero_offsets() {
+        let insts = vec![
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "a".into(),
+            },
+            Instruction::GetElementPtr {
+                dest: Value(2),
+                base: Value(1),
+                offset: Operand::Const(IrConst::I64(24)),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(24)),
+                ty: IrType::I64,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(4),
+                base: Value(1),
+                offset: Operand::Const(IrConst::Zero),
+                ty: IrType::Ptr,
+            },
+            Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I64(8)),
+                ty: IrType::I64,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(6),
+                base: Value(1),
+                offset: Operand::Const(IrConst::I64(16)),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(8)),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(8),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(7)),
+                rhs: Operand::Const(IrConst::I64(8)),
+                ty: IrType::I64,
+            },
+            Instruction::ParamRef {
+                dest: Value(9),
+                param_idx: 0,
+                ty: IrType::I64,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(10),
+                base: Value(1),
+                offset: Operand::Value(Value(9)),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(11),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(9)),
+                rhs: Operand::Value(Value(1)),
+                ty: IrType::I64,
+            },
+            Instruction::Cast {
+                dest: Value(12),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I64,
+                to_ty: IrType::I8,
+            },
+            Instruction::BinOp {
+                dest: Value(13),
+                op: IrBinOp::Add,
+                lhs: Operand::Const(IrConst::I128(i128::MAX)),
+                rhs: Operand::Const(IrConst::I128(1)),
+                ty: IrType::I128,
+            },
+        ];
+        let defs = key_defs(&insts);
+        assert_eq!(
+            cond_load_ptr_key(Value(2), &defs, 0),
+            cond_load_ptr_key(Value(3), &defs, 0)
+        );
+        assert_eq!(cond_load_ptr_key(Value(4), &defs, 0), "global(a)");
+        assert_eq!(
+            cond_load_ptr_key(Value(5), &defs, 0),
+            cond_load_ptr_key(Value(6), &defs, 0)
+        );
+        assert_eq!(
+            cond_load_ptr_key(Value(8), &defs, 0),
+            cond_load_ptr_key(Value(6), &defs, 0)
+        );
+        assert_eq!(
+            cond_load_ptr_key(Value(10), &defs, 0),
+            cond_load_ptr_key(Value(11), &defs, 0)
+        );
+        assert_ne!(cond_load_ptr_key(Value(12), &defs, 0), "global(a)");
+        assert!(cond_load_ptr_key(Value(13), &defs, 0).starts_with("opaque:overflow"));
+        assert_ne!(cond_load_ptr_key(Value(99), &defs, 0), "global(a)");
+    }
+
+    #[test]
+    fn cond_load_ptr_key_is_bounded_for_deep_chains() {
+        let mut insts = vec![Instruction::GlobalAddr {
+            dest: Value(1),
+            name: "a".into(),
+        }];
+        for i in 2..=12u32 {
+            insts.push(Instruction::GetElementPtr {
+                dest: Value(i),
+                base: Value(i - 1),
+                offset: Operand::Const(IrConst::I64(1)),
+                ty: IrType::Ptr,
+            });
+        }
+        let defs = key_defs(&insts);
+        let key = cond_load_ptr_key(Value(12), &defs, 0);
+        assert!(key.contains("opaque:"), "unbounded chain key: {key}");
+    }
+
+    #[test]
+    fn cond_load_guard_detects_binop_add_arm_addresses() {
+        let insts = vec![
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "a".into(),
+            },
+            Instruction::GetElementPtr {
+                dest: Value(2),
+                base: Value(1),
+                offset: Operand::Const(IrConst::I64(24)),
+                ty: IrType::I64,
+            },
+            Instruction::Load {
+                dest: Value(3),
+                ptr: Value(2),
+                ty: IrType::U64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Cmp {
+                dest: Value(4),
+                op: IrCmpOp::Ne,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ty: IrType::U64,
+            },
+            Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(24)),
+                ty: IrType::I64,
+            },
+            Instruction::GlobalAddr {
+                dest: Value(6),
+                name: "flag".into(),
+            },
+        ];
+        let defs = key_defs(&insts);
+        let t_key = cond_load_ptr_key(Value(5), &defs, 0);
+        let f_key = cond_load_ptr_key(Value(6), &defs, 0);
+        assert!(cond_load_guard_reads_arm_address(
+            Operand::Value(Value(4)),
+            &t_key,
+            &f_key,
+            &defs,
+        ));
+        let unrelated = cond_load_ptr_key(Value(6), &defs, 0);
+        assert!(!cond_load_guard_reads_arm_address(
+            Operand::Value(Value(4)),
+            &unrelated,
+            &f_key,
+            &defs,
+        ));
+        // A second conventional-SSA definition of the guard value must not
+        // hide the load behind the first (Cmp) definition.
+        let extra_load = Instruction::Load {
+            dest: Value(3),
+            ptr: Value(2),
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        let mut multi = key_defs(&insts);
+        multi.entry(3).or_default().push(&extra_load);
+        assert!(cond_load_guard_reads_arm_address(
+            Operand::Value(Value(4)),
+            &t_key,
+            &f_key,
+            &multi,
+        ));
     }
 
     #[test]
