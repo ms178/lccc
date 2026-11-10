@@ -285,12 +285,15 @@ def main():
                   f"rc={rc} err={err[:200]}")
 
         # ---- -mcpu= alias parity ----
+        # lccc emits a deprecation warning for -mcpu=; GCC accepts it
+        # silently (no warning). Only check the warning on lccc.
         for label, cc in compilers:
             rc, out, err = run([cc, "-mcpu=core2", "-c", str(trivial),
                                 "-o", str(tmp / "m.o")])
             check(f"{label} -mcpu=core2 accepted", rc == 0, err[:200])
-            check(f"{label} -mcpu=core2 warns deprecated",
-                  "deprecated" in err, err[:200])
+            if label == "lccc":
+                check(f"{label} -mcpu=core2 warns deprecated",
+                      "deprecated" in err, err[:200])
             rc, out, err = run([cc, "-mcpu=bogus123", "-c", str(trivial),
                                 "-o", str(tmp / "m.o")])
             check(f"{label} -mcpu=bogus123 refused", rc != 0, f"rc={rc}")
