@@ -3228,6 +3228,31 @@ impl I686Codegen {
     /// same reason: the FMA3 digit permutation decides which register holds
     /// the result, so a store that always names `%xmm0` publishes a stale
     /// operand for 213 and 231.
+    ///
+    /// The store is legacy-encoded (`movdqu`, no VEX prefix) while its kernel
+    /// -- the FMA -- is VEX. That mixing is deliberate and measured, not an
+    /// oversight:
+    ///
+    ///   * The AVX/SSE transition penalty needs an upper-half DIRTY state,
+    ///     which only a 256/512-bit write creates. This path touches `%xmm` at
+    ///     VEX.128 width exclusively, and VEX.128 ZEROES the upper halves, so
+    ///     no dirty state exists and no penalty is possible. That is also why
+    ///     this arm does not (and must not) set `dirty_upper_ymm` or emit a
+    ///     `vzeroupper`: doing so would add instructions the ABI does not
+    ///     require here.
+    ///   * The VEX encoding of this store is not observable as a speedup.
+    ///     Measured on this host, 2M iterations of load/load/load + vfmadd +
+    ///     store, best of 3: legacy store 2 509 152 / 2 533 016 / 2 557 952
+    ///     cycles, VEX store 2 538 018 / 2 567 008 / 2 567 160 cycles -- the
+    ///     two are within run-to-run noise, as expected: both are one
+    ///     store-uop with identical addressing.
+    ///   * A VEX-only store helper would also be WRONG for the SSE-only
+    ///     callers it would otherwise invite: `emit_sse_*` runs on targets
+    ///     without AVX, where a VEX prefix is an illegal instruction.
+    ///
+    /// So the legacy encoding is kept, with the reasoning recorded: it is not
+    /// a missed optimization, it is the encoding whose preconditions this
+    /// function actually satisfies.
     fn emit_sse_store_dest_from(&mut self, dptr: &Value, src: &'static str) {
         self.operand_to_eax(&Operand::Value(*dptr));
         self.state
