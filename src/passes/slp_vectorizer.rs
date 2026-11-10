@@ -9307,9 +9307,7 @@ mod tests {
             let last = parts[36][parts[36].len() - 1];
             assert!(
                 std::ptr::eq(first, &entries[0])
-                    && entries
-                        .iter()
-                        .any(|original| std::ptr::eq(original, last)),
+                    && entries.iter().any(|original| std::ptr::eq(original, last)),
                 "bucket endpoints must borrow the one owned stream"
             );
             std::hint::black_box(&parts);
