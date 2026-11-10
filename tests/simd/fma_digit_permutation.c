@@ -86,6 +86,18 @@ void *__lccc_simd256_ps_vfmadd231ps256(long, __m256, __m256, __m256);
 void *__lccc_simd256_ps_vfmadd132pd256(long, __m256d, __m256d, __m256d);
 void *__lccc_simd256_ps_vfmadd213pd256(long, __m256d, __m256d, __m256d);
 void *__lccc_simd256_ps_vfmadd231pd256(long, __m256d, __m256d, __m256d);
+
+/* 512-bit spellings.  Declared next to the 256-bit ones because the SAME
+ * store bug lived in both widths: `evex_store_dest` hard-coded `%zmm0` while
+ * 213/231 write `%zmm1`/`%zmm2`, so the pre-fix 213 returned `a` (measured
+ * 1.0 where 5.0 was owed, 16 of 16 lanes).  Reaching them needs -mavx512f,
+ * which the driver passes for that row only. */
+void *__lccc_simd512_ps_vfmadd132ps512(long, void *, void *, void *);
+void *__lccc_simd512_ps_vfmadd213ps512(long, void *, void *, void *);
+void *__lccc_simd512_ps_vfmadd231ps512(long, void *, void *, void *);
+void *__lccc_simd512_ps_vfmadd132pd512(long, void *, void *, void *);
+void *__lccc_simd512_ps_vfmadd213pd512(long, void *, void *, void *);
+void *__lccc_simd512_ps_vfmadd231pd512(long, void *, void *, void *);
 #endif
 
 /* Distinct, exactly-representable payloads so a wrong permutation produces a
@@ -102,10 +114,24 @@ static const float FC[8] = {7.0f, 11.0f, 3.0f, 5.0f, 19.0f, 23.0f, 13.0f, 17.0f}
 static const double DA[4] = {2.0, 6.0, 9.0, 14.0};
 static const double DB[4] = {4.0, 8.0, 13.0, 5.0};
 static const double DC[4] = {6.0, 10.0, 2.0, 7.0};
+static const float GA[16] = {3.0f, 5.0f, 7.0f, 11.0f, 13.0f, 17.0f, 19.0f, 23.0f,
+                             29.0f, 31.0f, 37.0f, 41.0f, 43.0f, 47.0f, 53.0f, 59.0f};
+static const float GB[16] = {5.0f, 7.0f, 11.0f, 3.0f, 17.0f, 19.0f, 23.0f, 13.0f,
+                             31.0f, 29.0f, 41.0f, 37.0f, 47.0f, 43.0f, 59.0f, 53.0f};
+static const float GC[16] = {7.0f, 11.0f, 3.0f, 5.0f, 19.0f, 23.0f, 13.0f, 17.0f,
+                             37.0f, 41.0f, 29.0f, 31.0f, 53.0f, 59.0f, 43.0f, 47.0f};
+static const double HA[8] = {2.0, 6.0, 9.0, 14.0, 21.0, 26.0, 33.0, 38.0};
+static const double HB[8] = {4.0, 8.0, 13.0, 5.0, 22.0, 27.0, 34.0, 39.0};
+static const double HC[8] = {6.0, 10.0, 2.0, 7.0, 23.0, 28.0, 35.0, 40.0};
 
 /* 8, not 4: the 256-bit ps lanes consume a full __m256 (32 bytes), so a
  * 4-element array would be read 16 bytes past its end. */
 static volatile float fa_v[8], fb_v[8], fc_v[8];
+/* 512-bit payloads: 16 ps lanes, 8 pd lanes.  Distinct magnitudes again so a
+ * wrong permutation cannot coincide, and disjoint from the 128/256 values so a
+ * mis-sized load shows up as a wild number rather than a plausible one. */
+static volatile float ga_v[16], gb_v[16], gc_v[16];
+static volatile double ha_v[8], hb_v[8], hc_v[8];
 /* 4, not 2: the 256-bit pd lanes consume a full __m256d (32 bytes), so a
  * 2-element array would be read 16 bytes past its end. */
 static volatile double da_v[4], db_v[4], dc_v[4];
@@ -128,6 +154,12 @@ int main(void) {
     memcpy((void *)da_v, DA, sizeof DA);
     memcpy((void *)db_v, DB, sizeof DB);
     memcpy((void *)dc_v, DC, sizeof DC);
+    memcpy((void *)ga_v, GA, sizeof GA);
+    memcpy((void *)gb_v, GB, sizeof GB);
+    memcpy((void *)gc_v, GC, sizeof GC);
+    memcpy((void *)ha_v, HA, sizeof HA);
+    memcpy((void *)hb_v, HB, sizeof HB);
+    memcpy((void *)hc_v, HC, sizeof HC);
 
     uint64_t h = 1469598103934665603ULL;
 
@@ -145,8 +177,20 @@ int main(void) {
         want_d[i] = da_v[i] * db_v[i] + dc_v[i];
         printf("ref_pd128 lane%d %.1f\n", i, want_d[i]);
     }
+    float want_g[16];
+    for (int i = 0; i < 16; i++) {
+        want_g[i] = ga_v[i] * gb_v[i] + gc_v[i];
+        printf("ref_ps512 lane%d %.1f\n", i, (double)want_g[i]);
+    }
+    double want_h[8];
+    for (int i = 0; i < 8; i++) {
+        want_h[i] = ha_v[i] * hb_v[i] + hc_v[i];
+        printf("ref_pd512 lane%d %.1f\n", i, want_h[i]);
+    }
     h = mix(h, want_f, sizeof want_f);
     h = mix(h, want_d, sizeof want_d);
+    h = mix(h, want_g, sizeof want_g);
+    h = mix(h, want_h, sizeof want_h);
 
 #if defined(FMA_DIGIT_PROBE)
     {
@@ -271,6 +315,57 @@ int main(void) {
         h = mix(h, got, sizeof got);
         for (int i = 0; i < 4; i++) {
             printf("pd256_231 lane%d %.1f want %.1f\n", i, got[i], want_d[i]);
+        }
+    }
+    /* 512-bit: needs -mavx512f, which the driver only passes for this row.
+     * The store bug this catches is the one `evex_store_dest` had: it always
+     * stored `%zmm0`, so 213/231 published `a`. */
+    {
+        float got[16];
+        { void *r = __lccc_simd512_ps_vfmadd132ps512(0, (void *)ga_v, (void *)gb_v,
+                                                    (void *)gc_v);
+          memcpy(got, r, sizeof got); }
+        h = mix(h, got, sizeof got);
+        for (int i = 0; i < 16; i++) {
+            printf("ps512_132 lane%d %.1f want %.1f\n", i, got[i], want_g[i]);
+        }
+        { void *r = __lccc_simd512_ps_vfmadd213ps512(0, (void *)ga_v, (void *)gb_v,
+                                                    (void *)gc_v);
+          memcpy(got, r, sizeof got); }
+        h = mix(h, got, sizeof got);
+        for (int i = 0; i < 16; i++) {
+            printf("ps512_213 lane%d %.1f want %.1f\n", i, got[i], want_g[i]);
+        }
+        { void *r = __lccc_simd512_ps_vfmadd231ps512(0, (void *)ga_v, (void *)gb_v,
+                                                    (void *)gc_v);
+          memcpy(got, r, sizeof got); }
+        h = mix(h, got, sizeof got);
+        for (int i = 0; i < 16; i++) {
+            printf("ps512_231 lane%d %.1f want %.1f\n", i, got[i], want_g[i]);
+        }
+    }
+    {
+        double got[8];
+        { void *r = __lccc_simd512_ps_vfmadd132pd512(0, (void *)ha_v, (void *)hb_v,
+                                                    (void *)hc_v);
+          memcpy(got, r, sizeof got); }
+        h = mix(h, got, sizeof got);
+        for (int i = 0; i < 8; i++) {
+            printf("pd512_132 lane%d %.1f want %.1f\n", i, got[i], want_h[i]);
+        }
+        { void *r = __lccc_simd512_ps_vfmadd213pd512(0, (void *)ha_v, (void *)hb_v,
+                                                    (void *)hc_v);
+          memcpy(got, r, sizeof got); }
+        h = mix(h, got, sizeof got);
+        for (int i = 0; i < 8; i++) {
+            printf("pd512_213 lane%d %.1f want %.1f\n", i, got[i], want_h[i]);
+        }
+        { void *r = __lccc_simd512_ps_vfmadd231pd512(0, (void *)ha_v, (void *)hb_v,
+                                                    (void *)hc_v);
+          memcpy(got, r, sizeof got); }
+        h = mix(h, got, sizeof got);
+        for (int i = 0; i < 8; i++) {
+            printf("pd512_231 lane%d %.1f want %.1f\n", i, got[i], want_h[i]);
         }
     }
 #endif

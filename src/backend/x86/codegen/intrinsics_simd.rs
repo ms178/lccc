@@ -97,14 +97,32 @@ impl X86Codegen {
     /// Store %zmm0 to the 512-bit destination slot and record the register
     /// as live for `dest_ptr` so the next op in the chain reuses it.
     fn evex_store_dest(&mut self, dest_ptr: &Value) {
+        self.evex_store_dest_from(dest_ptr, "zmm0");
+    }
+
+    /// Store the 512-bit register `src` to `dest_ptr` and claim it live.
+    ///
+    /// SA-11 at 512 bits: `evex_store_dest` hard-coding `%zmm0` is right for
+    /// every EVEX op that leaves its result there, but NOT for the FMA digit
+    /// permutations -- 213 writes `%zmm1` and 231 writes `%zmm2`, exactly as
+    /// their VEX counterparts do.  Emitted before this split (a=3,b=5,c=7):
+    ///
+    ///     vfmadd213ps %zmm2, %zmm0, %zmm1     # result in zmm1
+    ///     vmovdqu64   %zmm0, (%rax)           # ... but zmm0 (= a) is stored
+    ///
+    /// The callers that need a non-`%zmm0` destination say so explicitly
+    /// rather than the store guessing, which is what keeps the other ~40
+    /// EVEX emitters on the cheap one-argument form.
+    fn evex_store_dest_from(&mut self, dest_ptr: &Value, src: &'static str) {
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state
-                .emit_fmt(format_args!("    vmovdqu64 %zmm0, {}", mem));
+                .emit_fmt(format_args!("    vmovdqu64 %{}, {}", src, mem));
         } else {
             self.value_to_reg(dest_ptr, "rax");
-            self.state.emit("    vmovdqu64 %zmm0, (%rax)");
+            self.state
+                .emit_fmt(format_args!("    vmovdqu64 %{}, (%rax)", src));
         }
-        self.state.vec_claim_live_reg(dest_ptr.0, "zmm0");
+        self.state.vec_claim_live_reg(dest_ptr.0, src);
     }
 
     /// Whether arg[0] may be folded as a memory operand (never if the value is
@@ -1777,7 +1795,9 @@ impl X86Codegen {
         self.evex_load_arg_to(&args[2], "zmm2"); // c
         self.state
             .emit_fmt(format_args!("    {} %{rm}, %{vvvv}, %{dst}", inst));
-        self.evex_store_dest(dest_ptr);
+        // Store the permutation's own destination, never a fixed `%zmm0`:
+        // only the 132 placement leaves its result there.
+        self.evex_store_dest_from(dest_ptr, dst);
     }
 
     /// Scalar-result SIMD ops (mask compares, movemask, extracts to GPR,

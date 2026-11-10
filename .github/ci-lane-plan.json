@@ -1053,7 +1053,7 @@
     "codegen-b": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 409.72,
+      "predicted_gate_seconds": 411.51,
       "shards": 2,
       "steps": [
         {
@@ -1197,19 +1197,19 @@
           "name": "Verify the aligned-vector-reload ratchet contracts"
         },
         {
-          "measured_s": 1.85,
+          "measured_s": 2.01,
           "name": "Lane-mask select must be target-invariant sign-bit semantics (SA-10)"
         },
         {
-          "measured_s": 0.89,
+          "measured_s": 0.92,
           "name": "Prove the lane-mask gate goes red on the pre-fix lowering"
         },
         {
-          "measured_s": 0.84,
+          "measured_s": 1.76,
           "name": "Every FMA3 digit permutation must compute a*b+c (SA-11)"
         },
         {
-          "measured_s": 0.83,
+          "measured_s": 1.51,
           "name": "Prove the FMA digit gate goes red on the pre-fix placement"
         }
       ]
@@ -1939,8 +1939,8 @@
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",
-      "measured_seconds_total": 810.43,
-      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); Errexit-negation detector 1 s by scripts/ci_local.sh --fast (0 s + 0 s, floored); SA-10/SA-11 gate pairs added to codegen-b with locally measured worst-of-3 wall times (fastbuild, GCC 16.2 oracle): blendv invariance 1.85 s, blendv pre-fix red-path 0.89 s, FMA digit 0.84 s, FMA pre-fix red-path 0.83 s."
+      "measured_seconds_total": 812.22,
+      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); Errexit-negation detector 1 s by scripts/ci_local.sh --fast (0 s + 0 s, floored); SA-10/SA-11 gate pairs added to codegen-b with locally measured worst-of-3 wall times (fastbuild, GCC 16.2 oracle): blendv invariance 2.01 s, blendv pre-fix red-path 0.92 s, FMA digit 1.76 s, FMA pre-fix red-path 1.51 s (remeasured after the FMA gate grew from 54 to 126 compared rows: the 512-bit blocks and their pre-fix emulation, which is what makes the 512-bit store bug detectable)."
     },
     "frontend": {
       "costs": "/home/user/checkpoints/ci-main-union-costs.tsv",

@@ -94,7 +94,16 @@ esac
 # reference compiler asks it to declare and call LCCC's raw `__lccc_simd*`
 # builtins, which it cannot, and the differential then degraded to a SKIP
 # instead of pinning the fixture.
-BASE_FLAGS="-O2 -Wall -Wextra -Werror -mfma -mavx2${TARGET_FLAGS:+ $TARGET_FLAGS}"
+# The 512-bit rows are only reachable with -mavx512f, and only MEANINGFUL where
+# the host can execute them.  Probe the host's own AVX-512F bit rather than
+# assuming it: on a runner without it the gate still checks 128- and 256-bit
+# and simply omits the 512 rows from its expected count.  x86-64 only -- the
+# i686 backend has no EVEX emitters, so -m32 never gets the flag.
+AVX512_FLAG=""
+if [ -z "$TARGET_FLAGS" ] && grep -qw avx512f /proc/cpuinfo 2>/dev/null; then
+    AVX512_FLAG="-mavx512f"
+fi
+BASE_FLAGS="-O2 -Wall -Wextra -Werror -mfma -mavx2${AVX512_FLAG:+ $AVX512_FLAG}${TARGET_FLAGS:+ $TARGET_FLAGS}"
 FLAGS="$BASE_FLAGS${PROBE_DEFINE:+ $PROBE_DEFINE}"
 
 echo "check_fma_digit_permutation: SA-11 FMA3 role placement${TARGET_FLAGS:+ [$TARGET_FLAGS]}"
@@ -137,12 +146,20 @@ while IFS= read -r line; do
     fi
 done <"$WORK/out.txt"
 
-# ps128 3x4 + pd128 3x2 + ps256 3x8 + pd256 3x4, i.e. every lane of every
-# spelling at both widths: 12 + 6 + 24 + 12 = 54 compared rows.  The floor is
-# exact (not a lower bound) because a dropped row silently weakens the gate:
-# the previous 24 came from 4-lane ps256/pd256 blocks that read 16 bytes past
-# their arrays, and it also counted only half the lanes the vectors have.
+# Every lane of every spelling at every width the host can execute:
+#
+#     ps128 3x4  + pd128 3x2  = 12 + 6  = 18
+#     ps256 3x8  + pd256 3x4  = 24 + 12 = 36
+#     ps512 3x16 + pd512 3x8  = 48 + 24 = 72   (only with -mavx512f)
+#
+# The floor is EXACT, not a lower bound: a dropped row silently weakens the
+# gate.  The previous value of 24 came from half-width blocks that read 16
+# bytes past arrays sized for the other width, and it counted only half of each
+# vector's lanes -- so the "green" it reported covered a third of what it said.
 expect_rows=54
+if [ -n "$AVX512_FLAG" ]; then
+    expect_rows=126
+fi
 if [ "$EXPECT_DEFECT" -eq 1 ]; then
     if [ "$mismatch" -eq 0 ] && [ "$rows_bad" -eq 0 ]; then
         echo "FAIL: --expect-defect but every permutation computes a*b+c" >&2

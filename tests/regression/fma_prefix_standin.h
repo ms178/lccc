@@ -37,6 +37,13 @@ static __m128  fma_standin_r128;
 static __m128d fma_standin_r128d;
 static __m256  fma_standin_r256;
 static __m256d fma_standin_r256d;
+/* 512-bit scratch.  `__m512`/`__m512d` only exist under -mavx512f, which the
+ * gate passes only when the host can execute the result, so the 512-bit
+ * emulation is guarded on the same macro the compiler defines for it. */
+#if defined(__AVX512F__)
+static __m512  fma_standin_r512;
+static __m512d fma_standin_r512d;
+#endif
 
 /* The shared PRE-FIX placement, spelled out per width: result lane =
  * a[lane] * b[lane] + c[lane] would be CORRECT, so to reproduce the defect the
@@ -157,5 +164,66 @@ static void *__lccc_simd256_ps_vfmadd231pd256(long imm, __m256d a, __m256d b, __
     FMA_STANDIN_PD256(231, a, b, c, fma_standin_r256d);
     return &fma_standin_r256d;
 }
+
+#if defined(__AVX512F__)
+/* 512-bit: the identical pre-fix assignment.  The store bug here was separate
+ * in code (`evex_store_dest` hard-coded `%zmm0`) but identical in shape, so
+ * the same emulation applies and the 213/231 rows must disagree the same way. */
+#define FMA_STANDIN_PS512(digits, a, b, c, out)                                  \
+    do {                                                                        \
+        __m512 s2 = (c), s3 = (b), d = (a);                                      \
+        if ((digits) == 132) {                                                   \
+            out = d * s3 + s2;                                                   \
+        } else if ((digits) == 213) {                                            \
+            out = s2 * d + s3;                                                   \
+        } else {                                                                 \
+            out = s2 * s3 + d;                                                   \
+        }                                                                        \
+    } while (0)
+
+static void *__lccc_simd512_ps_vfmadd132ps512(long imm, void *a, void *b, void *c) {
+    (void)imm;
+    FMA_STANDIN_PS512(132, *(__m512 *)a, *(__m512 *)b, *(__m512 *)c, fma_standin_r512);
+    return &fma_standin_r512;
+}
+static void *__lccc_simd512_ps_vfmadd213ps512(long imm, void *a, void *b, void *c) {
+    (void)imm;
+    FMA_STANDIN_PS512(213, *(__m512 *)a, *(__m512 *)b, *(__m512 *)c, fma_standin_r512);
+    return &fma_standin_r512;
+}
+static void *__lccc_simd512_ps_vfmadd231ps512(long imm, void *a, void *b, void *c) {
+    (void)imm;
+    FMA_STANDIN_PS512(231, *(__m512 *)a, *(__m512 *)b, *(__m512 *)c, fma_standin_r512);
+    return &fma_standin_r512;
+}
+
+#define FMA_STANDIN_PD512(digits, a, b, c, out)                                  \
+    do {                                                                        \
+        __m512d s2 = (c), s3 = (b), d = (a);                                     \
+        if ((digits) == 132) {                                                   \
+            out = d * s3 + s2;                                                   \
+        } else if ((digits) == 213) {                                            \
+            out = s2 * d + s3;                                                   \
+        } else {                                                                 \
+            out = s2 * s3 + d;                                                   \
+        }                                                                        \
+    } while (0)
+
+static void *__lccc_simd512_ps_vfmadd132pd512(long imm, void *a, void *b, void *c) {
+    (void)imm;
+    FMA_STANDIN_PD512(132, *(__m512d *)a, *(__m512d *)b, *(__m512d *)c, fma_standin_r512d);
+    return &fma_standin_r512d;
+}
+static void *__lccc_simd512_ps_vfmadd213pd512(long imm, void *a, void *b, void *c) {
+    (void)imm;
+    FMA_STANDIN_PD512(213, *(__m512d *)a, *(__m512d *)b, *(__m512d *)c, fma_standin_r512d);
+    return &fma_standin_r512d;
+}
+static void *__lccc_simd512_ps_vfmadd231pd512(long imm, void *a, void *b, void *c) {
+    (void)imm;
+    FMA_STANDIN_PD512(231, *(__m512d *)a, *(__m512d *)b, *(__m512d *)c, fma_standin_r512d);
+    return &fma_standin_r512d;
+}
+#endif /* __AVX512F__ */
 
 #endif /* FMA_PREFIX_STANDIN_H */
