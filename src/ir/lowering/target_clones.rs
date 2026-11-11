@@ -440,6 +440,7 @@ impl Lowerer {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
+            ret_is_vector128: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: crate::ir::module::SspInfo {

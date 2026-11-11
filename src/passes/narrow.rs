@@ -27,6 +27,44 @@
 //! Similarly, comparisons (Cmp) where both operands are widened from
 //! the same type can be narrowed, since sign/zero extension preserves
 //! the ordering of values.
+//!
+//! # The ring a narrowed operation lands in
+//!
+//! "The low bits are identical" is a statement about bits. It does not say
+//! which *ring* the narrowed operation belongs to, and in this IR the ring
+//! is the type: an `Add`/`Sub`/`Mul`/`Shl` typed `I32` is a C `int`
+//! operation, whose overflow is undefined, and `iv_widen`, the strength
+//! reducer and the x86-64 address peeler (`scale_ring_is_linear`) all use
+//! that -- `sext(x + 1) == sext(x) + 1` -- without a range proof.
+//!
+//! The pattern this pass narrows is the opposite case. The frontend lowers
+//! `int` arithmetic directly in `I32`; a 64-bit operation whose result is
+//! truncated to 32 bits reaches this pass only from source that asked for
+//! it, `(int)((long)a + 1L)` or `r += some_long`, and there the truncation
+//! WRAPS: C17 6.3.1.3p3 makes the conversion implementation-defined, and
+//! this compiler follows GCC in reducing modulo 2^N. Rewriting it to
+//! `Add I32` laundered a defined wrap into undefined overflow, and
+//! `p[(int)((long)a + 1L)]` was compiled to `movslq %esi, %rsi;
+//! movsbl 1(%rdi,%rsi)` -- the wrong element for `a == INT_MAX`
+//! (`tests/regression/explicit_narrowing_wraps.c`).
+//!
+//! So a wrap-sensitive operation with a signed target is narrowed into the
+//! UNSIGNED ring of the same width, in the shape the frontend itself emits
+//! for `(int)((unsigned)a + 1u)`:
+//!
+//! ```text
+//!   %w = Cast %x, I32 -> I64           %w = Cast %x, I32 -> U32
+//!   %r = Add  %w, 1 : I64       ==>    %r = Add  %w, 1 : U32
+//!   %n = Cast %r, I64 -> I32           %n = Cast %r, U32 -> I32
+//! ```
+//!
+//! Three instructions are retyped where they stand; none is created, moved
+//! or rewired, so every reader still sees a value of the type it declares.
+//! The generated code is the same `addl`/`leal`. When the widening cast has
+//! another reader the pattern is left 64-bit, which is also correct.
+//! Bitwise operations and right shifts cannot overflow and keep the signed
+//! type. Under `-fwrapv` the signed ring wraps by policy and nothing
+//! changes.
 
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand};
@@ -44,6 +82,82 @@ struct BinOpDef {
     op: IrBinOp,
     lhs: Operand,
     rhs: Operand,
+}
+
+/// True when narrowing `op` to the signed type `target` would turn a wrap
+/// the source defines into an overflow the optimizer may assume away (see
+/// "The ring a narrowed operation lands in" in the module header).
+fn narrowing_leaves_wrapping_ring(op: IrBinOp, target: IrType, wrap_signed_overflow: bool) -> bool {
+    !wrap_signed_overflow
+        && target.is_signed()
+        && matches!(
+            op,
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Shl
+        )
+}
+
+/// One `Cast(BinOp(widen(x), widen(y)))` island that Phase 4 retypes into
+/// the unsigned ring in place.
+struct WrappingIsland {
+    /// The 64-bit operation, its operands after constant narrowing.
+    binop: u32,
+    lhs: Operand,
+    rhs: Operand,
+    /// The widening casts feeding it; each has no other reader.
+    widens: [Option<u32>; 2],
+    /// The unsigned type of the target's width.
+    ring: IrType,
+}
+
+/// Plan the island for the narrowing cast `binop -> target`, or `None` when
+/// an operand is neither a constant nor a widening cast, from an integer of
+/// the target's width, that only this operation reads.
+fn plan_wrapping_island(
+    binop: u32,
+    info: &BinOpDef,
+    target: IrType,
+    widen_map: &[Option<CastInfo>],
+    use_counts: &[u32],
+    asm_pinned: &[bool],
+) -> Option<WrappingIsland> {
+    let ring = target.to_unsigned();
+    // A shift count is a value, not a ring element: only a constant count
+    // (already proven in range by the caller) is carried over.
+    if info.op == IrBinOp::Shl && !matches!(info.rhs, Operand::Const(_)) {
+        return None;
+    }
+    let reads = |v: u32| {
+        [&info.lhs, &info.rhs]
+            .into_iter()
+            .filter(|op| matches!(op, Operand::Value(x) if x.0 == v))
+            .count() as u32
+    };
+    let mut widens = [None, None];
+    let mut operands = [info.lhs, info.rhs];
+    for (slot, operand) in operands.iter_mut().enumerate() {
+        match *operand {
+            Operand::Const(c) => *operand = Operand::Const(try_narrow_const(&c, ring)?),
+            Operand::Value(v) => {
+                let id = v.0 as usize;
+                let from = widen_map.get(id)?.as_ref()?.from_ty;
+                if !from.is_integer()
+                    || from.size() != target.size()
+                    || use_counts.get(id).copied() != Some(reads(v.0))
+                    || asm_pinned.get(id).copied().unwrap_or(false)
+                {
+                    return None;
+                }
+                widens[slot] = Some(v.0);
+            }
+        }
+    }
+    Some(WrappingIsland {
+        binop,
+        lhs: operands[0],
+        rhs: operands[1],
+        widens,
+        ring,
+    })
 }
 
 /// Narrow operations in a single function.
@@ -216,7 +330,7 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
         func,
         &binop_map,
         &use_counts,
-        &widen_map,
+        &mut widen_map,
         &mut narrowed_map,
         &asm_pinned,
     );
@@ -272,6 +386,7 @@ fn narrow_through_stores(
         return 0;
     }
     let max_id = narrowed_map.len() - 1;
+    let wrap_signed_overflow = func.pass_policy.wrap_signed_overflow;
 
     // Value -> narrow type for Load instructions.
     let mut load_type_map: Vec<Option<IrType>> = vec![None; max_id + 1];
@@ -339,6 +454,16 @@ fn narrow_through_stores(
                         continue;
                     }
                     if let Some(t) = store_narrow_target(op, lhs, rhs, &ntype, &load_type_map) {
+                        // A stored `(long)a + 1` wraps when the store
+                        // truncates it. Retyping the operation `I32` in
+                        // place would put it in the ring whose overflow is
+                        // undefined, and the value reaches extending readers
+                        // through store-to-load forwarding. The in-place
+                        // rewrite cannot add the casts the unsigned ring
+                        // needs, so the chain stays 64-bit.
+                        if narrowing_leaves_wrapping_ring(*op, t, wrap_signed_overflow) {
+                            continue;
+                        }
                         ntype[id] = Some(t);
                         changed = true;
                     }
@@ -632,12 +757,16 @@ fn narrow_binops_with_cast(
     func: &mut IrFunction,
     binop_map: &[Option<BinOpDef>],
     use_counts: &[u32],
-    widen_map: &[Option<CastInfo>],
+    widen_map: &mut [Option<CastInfo>],
     narrowed_map: &mut [Option<IrType>],
     asm_pinned: &[bool],
 ) -> usize {
     let max_id = narrowed_map.len() - 1;
     let mut changes = 0;
+    let wrap_signed_overflow = func.pass_policy.wrap_signed_overflow;
+    // Islands retyped into the unsigned ring: the narrowing cast is retyped
+    // in the walk below, the operation and its widening casts afterwards.
+    let mut islands: Vec<WrappingIsland> = Vec::new();
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
@@ -776,6 +905,29 @@ fn narrow_binops_with_cast(
                     continue;
                 }
 
+                if narrowing_leaves_wrapping_ring(binop_info.op, *to_ty, wrap_signed_overflow) {
+                    // The truncation wraps by definition; keep the wrap in a
+                    // ring that says so. No island, no narrowing: the 64-bit
+                    // form is already correct.
+                    if let Some(island) = plan_wrapping_island(
+                        src_val.0,
+                        &binop_info,
+                        *to_ty,
+                        widen_map,
+                        use_counts,
+                        asm_pinned,
+                    ) {
+                        *from_ty = island.ring;
+                        islands.push(island);
+                        changes += 1;
+                        let dest_id = dest.0 as usize;
+                        if dest_id <= max_id {
+                            narrowed_map[dest_id] = Some(*to_ty);
+                        }
+                    }
+                    continue;
+                }
+
                 let narrow_lhs =
                     try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
                 let narrow_rhs = match &shift_rhs_override {
@@ -803,6 +955,44 @@ fn narrow_binops_with_cast(
                         narrowed_map[dest_id] = Some(narrow_ty);
                     }
                 }
+            }
+        }
+    }
+
+    if islands.is_empty() {
+        return changes;
+    }
+    // Retype each island's operation and widening casts where they stand.
+    // A retyped cast no longer widens, so it leaves `widen_map` before the
+    // later phases consult it.
+    let mut binops: Vec<Option<usize>> = vec![None; max_id + 1];
+    let mut rings: Vec<Option<IrType>> = vec![None; max_id + 1];
+    for (index, island) in islands.iter().enumerate() {
+        binops[island.binop as usize] = Some(index);
+        for cast in island.widens.into_iter().flatten() {
+            rings[cast as usize] = Some(island.ring);
+            widen_map[cast as usize] = None;
+        }
+    }
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            match inst {
+                Instruction::BinOp {
+                    dest, lhs, rhs, ty, ..
+                } => {
+                    if let Some(index) = binops.get(dest.0 as usize).copied().flatten() {
+                        let island = &islands[index];
+                        *lhs = island.lhs;
+                        *rhs = island.rhs;
+                        *ty = island.ring;
+                    }
+                }
+                Instruction::Cast { dest, to_ty, .. } => {
+                    if let Some(ring) = rings.get(dest.0 as usize).copied().flatten() {
+                        *to_ty = ring;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1193,60 +1383,301 @@ mod tests {
         func
     }
 
-    #[test]
-    fn test_narrow_add_i32() {
-        // %1 = Cast %0, I32->I64     (widen)
-        // %2 = BinOp Add %1, I64(5), I64   (add in I64)
-        // %3 = Cast %2, I64->I32     (narrow)
-        // => Should become:
-        // %3 = BinOp Add %0, I32(5), I32
-        let mut func = make_func_with_blocks(vec![BasicBlock {
+    /// `%1 = widen %0; %2 = %1 <op> rhs : I64; %3 = Cast %2, I64 -> to_ty`.
+    fn widen_op_narrow(from_ty: IrType, op: IrBinOp, rhs: Operand, to_ty: IrType) -> IrFunction {
+        make_func_with_blocks(vec![BasicBlock {
             label: BlockId(0),
             instructions: vec![
                 Instruction::Cast {
                     dest: Value(1),
                     src: Operand::Value(Value(0)),
-                    from_ty: IrType::I32,
+                    from_ty,
                     to_ty: IrType::I64,
                 },
                 Instruction::BinOp {
                     dest: Value(2),
-                    op: IrBinOp::Add,
+                    op,
                     lhs: Operand::Value(Value(1)),
-                    rhs: Operand::Const(IrConst::I64(5)),
+                    rhs,
                     ty: IrType::I64,
                 },
                 Instruction::Cast {
                     dest: Value(3),
                     src: Operand::Value(Value(2)),
                     from_ty: IrType::I64,
-                    to_ty: IrType::I32,
+                    to_ty,
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
             source_inline_ids: Vec::new(),
-        }]);
+        }])
+    }
 
-        let changes = narrow_function(&mut func);
-        assert!(changes > 0, "Should narrow the add");
+    /// The island `Cast I32->U32; <op> U32; Cast U32->I32`, every instruction
+    /// where it stood, the constant narrowed into the ring.
+    fn assert_unsigned_island(func: &IrFunction, op: IrBinOp, constant: i64) {
+        let insts = &func.blocks[0].instructions;
+        assert_eq!(insts.len(), 3, "nothing is created or removed: {insts:?}");
+        assert!(
+            matches!(
+                &insts[0],
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::U32,
+                }
+            ),
+            "the widening cast becomes the reinterpretation: {:?}",
+            insts[0]
+        );
+        match &insts[1] {
+            Instruction::BinOp {
+                dest: Value(2),
+                op: found,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(c),
+                ty: IrType::U32,
+            } => {
+                assert_eq!(*found, op);
+                assert_eq!(c.to_i64(), Some(constant));
+            }
+            other => panic!("expected {op:?} in U32 over the retyped cast, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                &insts[2],
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(2)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I32,
+                }
+            ),
+            "the truncation becomes the reinterpretation: {:?}",
+            insts[2]
+        );
+    }
 
-        // The last instruction should now be a BinOp in I32
-        let last = &func.blocks[0].instructions[2];
-        match last {
+    /// `(int)((long)x + 5)` wraps by definition. It narrows to 32 bits, but
+    /// into the unsigned ring: an `Add I32` would be a C `int` addition whose
+    /// overflow later passes assume away (wrong code at -O2,
+    /// `tests/regression/explicit_narrowing_wraps.c`).
+    #[test]
+    fn wrapping_signed_narrowing_lands_in_the_unsigned_ring() {
+        for (op, constant) in [
+            (IrBinOp::Add, 5),
+            (IrBinOp::Sub, 5),
+            (IrBinOp::Mul, 0x4000_0000),
+            (IrBinOp::Shl, 30),
+        ] {
+            let mut func = widen_op_narrow(
+                IrType::I32,
+                op,
+                Operand::Const(IrConst::I64(constant)),
+                IrType::I32,
+            );
+            assert!(narrow_function(&mut func) > 0, "{op:?} should narrow");
+            assert_unsigned_island(&func, op, constant);
+            let signed_arithmetic = func.blocks[0].instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        ty: IrType::I32,
+                        ..
+                    }
+                )
+            });
+            assert!(
+                !signed_arithmetic,
+                "{op:?}: no operation may enter the I32 ring"
+            );
+            // Idempotent: the island is 32-bit and is not matched again.
+            assert_eq!(narrow_function(&mut func), 0);
+        }
+    }
+
+    /// Operations that cannot overflow keep the signed type and the compact
+    /// single-instruction form.
+    #[test]
+    fn overflow_free_signed_narrowing_keeps_the_signed_type() {
+        for op in [IrBinOp::And, IrBinOp::Or, IrBinOp::Xor] {
+            let mut func = widen_op_narrow(
+                IrType::I32,
+                op,
+                Operand::Const(IrConst::I64(5)),
+                IrType::I32,
+            );
+            assert!(narrow_function(&mut func) > 0);
+            assert!(
+                matches!(
+                    &func.blocks[0].instructions[2],
+                    Instruction::BinOp {
+                        dest: Value(3),
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(IrConst::I32(5)),
+                        ty: IrType::I32,
+                        ..
+                    }
+                ),
+                "{op:?}: {:?}",
+                func.blocks[0].instructions[2]
+            );
+        }
+    }
+
+    /// An unsigned target was always in the wrapping ring: unchanged.
+    #[test]
+    fn unsigned_narrowing_is_unchanged() {
+        let mut func = widen_op_narrow(
+            IrType::U32,
+            IrBinOp::Add,
+            Operand::Const(IrConst::I64(5)),
+            IrType::U32,
+        );
+        assert!(narrow_function(&mut func) > 0);
+        assert!(matches!(
+            &func.blocks[0].instructions[2],
             Instruction::BinOp {
                 op: IrBinOp::Add,
-                ty: IrType::I32,
-                lhs,
-                rhs,
+                dest: Value(3),
+                lhs: Operand::Value(Value(0)),
+                ty: IrType::U32,
                 ..
-            } => {
-                // LHS should be the original %0 (unwrapped from the widening cast)
-                assert!(matches!(lhs, Operand::Value(Value(0))));
-                // RHS should be I32(5) (narrowed constant)
-                assert!(matches!(rhs, Operand::Const(IrConst::I32(5))));
             }
-            other => panic!("Expected narrowed BinOp Add I32, got {:?}", other),
+        ));
+    }
+
+    /// Under `-fwrapv` the signed ring wraps by policy, every reader gates
+    /// on that policy, and the compact `Add I32` form stays.
+    #[test]
+    fn wrapv_keeps_the_signed_single_instruction_form() {
+        let mut func = widen_op_narrow(
+            IrType::I32,
+            IrBinOp::Add,
+            Operand::Const(IrConst::I64(5)),
+            IrType::I32,
+        );
+        func.pass_policy.wrap_signed_overflow = true;
+        assert!(narrow_function(&mut func) > 0);
+        assert!(matches!(
+            &func.blocks[0].instructions[2],
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                dest: Value(3),
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(5)),
+                ty: IrType::I32,
+            }
+        ));
+    }
+
+    /// The widening cast has a second reader: it cannot be retyped, and the
+    /// island is not built by mixing a signed operand into an unsigned
+    /// operation. The 64-bit form is already correct and stays.
+    #[test]
+    fn shared_widening_cast_leaves_the_pattern_wide() {
+        let mut func = widen_op_narrow(
+            IrType::I32,
+            IrBinOp::Add,
+            Operand::Const(IrConst::I64(5)),
+            IrType::I32,
+        );
+        let block = &mut func.blocks[0];
+        block.instructions.push(Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::LShr,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(40)),
+            ty: IrType::I64,
+        });
+        block.terminator = Terminator::Return(Some(Operand::Value(Value(4))));
+        let before = format!("{:?}", func.blocks[0].instructions);
+        narrow_function(&mut func);
+        assert_eq!(before, format!("{:?}", func.blocks[0].instructions));
+    }
+
+    /// `x + x` reads one widening cast twice; both reads belong to the
+    /// island, so it still narrows.
+    #[test]
+    fn island_accepts_one_cast_read_twice() {
+        let mut func = widen_op_narrow(
+            IrType::I32,
+            IrBinOp::Add,
+            Operand::Value(Value(1)),
+            IrType::I32,
+        );
+        assert!(narrow_function(&mut func) > 0);
+        let insts = &func.blocks[0].instructions;
+        assert!(matches!(
+            &insts[0],
+            Instruction::Cast {
+                to_ty: IrType::U32,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &insts[1],
+            Instruction::BinOp {
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(1)),
+                ty: IrType::U32,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &insts[2],
+            Instruction::Cast {
+                from_ty: IrType::U32,
+                to_ty: IrType::I32,
+                ..
+            }
+        ));
+    }
+
+    /// Phase 6: `*p = (long)x + 5` stored as `int`. The in-place retype
+    /// would create an `Add I32` that store-to-load forwarding hands to
+    /// extending readers; the signed chain stays 64-bit, the unsigned one
+    /// still narrows.
+    #[test]
+    fn stored_wrapping_chain_narrows_only_in_the_unsigned_ring() {
+        for (ty, narrows) in [(IrType::I32, false), (IrType::U32, true)] {
+            let mut func = make_func_with_blocks(vec![BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::Cast {
+                        dest: Value(1),
+                        src: Operand::Value(Value(0)),
+                        from_ty: ty,
+                        to_ty: IrType::I64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I64(5)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::Store {
+                        val: Operand::Value(Value(2)),
+                        ptr: Value(9),
+                        ty,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                        volatile: false,
+                    },
+                ],
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            }]);
+            narrow_function(&mut func);
+            let found = match &func.blocks[0].instructions[1] {
+                Instruction::BinOp { ty, .. } => *ty,
+                other => panic!("the addition disappeared: {other:?}"),
+            };
+            let expected = if narrows { IrType::U32 } else { IrType::I64 };
+            assert_eq!(found, expected, "stored {ty:?} chain");
         }
     }
 

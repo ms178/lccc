@@ -1108,47 +1108,76 @@ fn try_if_combine_loop(
         return 0;
     }
 
-    // Pre-filter 4: profitability — the guard the module docs promise.
-    // A combine converts a control dependence into a data dependence; it
-    // is a WIN only when the loop body ends up branch-free (straight-line
-    // goes to the vectorizer). It is a LOSS otherwise: the branches stay,
-    // and every iteration pays for predicates the short circuit used to
-    // skip (lz4's skip loop, expat's UTF-8 scanner).
+    // Pre-filter 4: profitability — the guard the module docs promise, and
+    // which the module docs say is answered by SIMULATION.
     //
-    // So every OTHER conditional branch in the body must provably go
-    // away: either it is part of this round's chain (folds now — the
-    // survivor is the diamond converter's problem, exactly as today), or
-    // the diamond/triangle converter below takes it (same detectors, same
-    // CPU-model budgets — no heuristic drift). In particular this rejects
-    // loops containing inner-loop back-edges or oversized if/else
-    // diamonds: those can never become branch-free, so no vectorizer will
-    // ever take the loop and the combine is pure added work.
+    // A combine converts a control dependence into a data dependence. The
+    // strongest win is a branch-free loop body (straight-line goes to the
+    // vectorizer); independently, branches in the candidate chain may remain
+    // because these are the edges this transform simplifies. Unrelated
+    // internal branches must still become convertible, or the combine risks
+    // adding per-iteration predicate work without removing control flow.
+    //
+    // The question is therefore: after applying THIS round's combines, can
+    // every remaining non-chain conditional become diamond/triangle
+    // convertible? A branch in a candidate chain block may remain: that is
+    // precisely the short-circuit edge this combine evaluates. Probing the
+    // UNMODIFIED IR — the historical behaviour — cannot answer the question
+    // whenever two chain links share a join block:
+    //
+    //     ptr:  br a, B2, JOIN       (|| link 1)
+    //     B3:   br b, JOIN, B4       (|| link 2)
+    //
+    // On the live IR neither link converts (`plan_shared_arm_dup` only
+    // duplicates a one-level diamond, and it refuses here because B3's other
+    // arm continues the chain), so `a || b || c || ...` — the ASCII
+    // classifier this transform exists for — was rejected outright with
+    // "branch in block N survives". Three of four links DID convert; testing
+    // them one at a time hides exactly that.
+    //
+    // So: simulate. The combines are applied for real to a copy of the
+    // function, the diamond/triangle detectors are run to fixpoint on the
+    // result with the same CPU-model budgets, and the whole thing is thrown
+    // away — `func` is never written here. `apply_if_combine` is
+    // deterministic in the values the detectors read (labels, terminators,
+    // phi edges, conditions), so re-applying the same candidates to the real
+    // function below is exactly what was simulated.
     //
     // Fail-closed (reject = keep the short circuit) is always safe: the
     // uncombined IR is the pipeline's common case.
-    let chain_blocks: crate::common::fx_hash::FxHashSet<usize> = cands
-        .iter()
-        .flat_map(|c| [c.pred_idx, c.inner_idx])
-        .collect();
     {
-        let ctx = IfConvCtx::build(func);
-        for &b in &nl.body {
-            if b == exiting {
-                continue;
-            }
-            if !matches!(func.blocks[b].terminator, Terminator::CondBranch { .. }) {
-                continue;
-            }
-            if chain_blocks.contains(&b) {
-                continue;
-            }
-            if detect_diamond(&ctx, b).is_some() || detect_triangle(&ctx, b).is_some() {
-                continue;
-            }
+        // A candidate may leave a conditional in one of its own chain blocks:
+        // that is the branch whose combine this round is evaluating. The old
+        // profitability check intentionally exempted these blocks and checked
+        // all other loop branches. Keep that contract, but now test the
+        // post-combine CFG and simulate every convertible non-chain branch.
+        let chain_blocks: FxHashSet<usize> = cands
+            .iter()
+            .flat_map(|c| [c.pred_idx, c.inner_idx])
+            .collect();
+        let mut probe = func.clone();
+        let mut next_real = probe.next_value_id;
+        let applied = cands
+            .iter()
+            .filter(|c| apply_if_combine(&mut probe, c, &mut next_real))
+            .count();
+        probe.next_value_id = next_real;
+        if applied == 0 {
+            // Every candidate was stale; nothing to simulate (and the
+            // diagnostic below is about the unmodified loop).
             if dbg {
                 lccc::cli::stderr_line(format_args!(
-                    "[IFCOMB] {} loop@{}: reject (branch in block {} survives)",
-                    func.name, nl.header, b
+                    "[IFCOMB] {} loop@{}: reject (no candidate applicable)",
+                    func.name, nl.header
+                ));
+            }
+            return 0;
+        }
+        if !body_becomes_branch_free(&mut probe, nl, exiting, &chain_blocks, dbg) {
+            if dbg {
+                lccc::cli::stderr_line(format_args!(
+                    "[IFCOMB] {} loop@{}: reject (a branch in the body survives the combine)",
+                    func.name, nl.header
                 ));
             }
             return 0;
@@ -1174,6 +1203,94 @@ fn try_if_combine_loop(
     }
     func.next_value_id = next_real;
     applied
+}
+
+/// Does every non-exiting, non-chain conditional branch become
+/// diamond/triangle convertible once the combines have been applied?
+///
+/// Runs the real detectors to a fixpoint, converting as it goes, so a branch
+/// that only becomes convertible AFTER an inner one folded still counts --
+/// the chain `((a || b) || c) || d` needs its links converted inside-out. The
+/// detectors are the same ones `if_convert_diamonds` uses, with the same
+/// CPU-model budgets, so this cannot drift from what the pass will actually
+/// do to the loop afterwards.
+///
+/// `nl.body` is the PRE-combine body set: combines only merge blocks inside
+/// it (they retarget edges between body blocks and reuse the same labels), so
+/// it remains a superset of the post-combine body and testing it can only be
+/// conservative. The candidate chain blocks are exempt from the final
+/// survivor test; their conditional edges are the transform's subject.
+fn body_becomes_branch_free(
+    probe: &mut IrFunction,
+    nl: &crate::passes::loop_analysis::NaturalLoop,
+    exiting: usize,
+    chain_blocks: &FxHashSet<usize>,
+    dbg: bool,
+) -> bool {
+    let body: Vec<usize> = {
+        let mut v: Vec<usize> = nl.body.iter().copied().collect();
+        v.sort_unstable();
+        v
+    };
+    // Bounded: each conversion removes at least one conditional branch and a
+    // body of B blocks holds at most B of them. The bound is belt-and-braces
+    // against a detector/apply pair that disagrees about progress.
+    for _ in 0..=body.len() {
+        let ctx = IfConvCtx::build(probe);
+        let mut plan: Option<DiamondInfo> = None;
+        for &b in &body {
+            if b == exiting || b >= probe.blocks.len() {
+                continue;
+            }
+            if !matches!(probe.blocks[b].terminator, Terminator::CondBranch { .. }) {
+                continue;
+            }
+            // Same precedence as `if_convert_diamonds` (diamond, else
+            // triangle), same detectors, same CPU-model budgets.
+            if let Some(d) = detect_diamond_inner(&ctx, b, true) {
+                plan = Some(d);
+                break;
+            }
+            if let Some(t) = detect_triangle_inner(&ctx, b, true) {
+                plan = Some(t);
+                break;
+            }
+        }
+        drop(ctx);
+        let Some(plan) = plan else { break };
+        if !apply_diamond(probe, &plan) {
+            break;
+        }
+        if dbg {
+            lccc::cli::stderr_line(format_args!(
+                "[IFCOMB]     sim: converted pred={} merge={}",
+                plan.pred_idx, plan.merge_idx
+            ));
+        }
+    }
+    if dbg {
+        for &b in &body {
+            if b != exiting && b < probe.blocks.len() {
+                if let Terminator::CondBranch { cond, .. } = &probe.blocks[b].terminator {
+                    lccc::cli::stderr_line(format_args!(
+                        "[IFCOMB]     sim: survivor block {} cond {:?} insts {}",
+                        b,
+                        cond,
+                        probe.blocks[b].instructions.len()
+                    ));
+                }
+            }
+        }
+    }
+    // The current chain may retain the branch whose combine was just
+    // evaluated; every other surviving conditional must be the loop exit or
+    // the profitability proof failed.
+    body.iter().all(|&b| {
+        b == exiting
+            || chain_blocks.contains(&b)
+            || b >= probe.blocks.len()
+            || !matches!(probe.blocks[b].terminator, Terminator::CondBranch { .. })
+    })
 }
 
 /// Is `op` provably 0 or 1?  Only then is a bitwise `and`/`or` the logical
@@ -3492,7 +3609,26 @@ fn skip_boolean_diamond(
     func: &IrFunction,
     phi_selects: &[(Value, IrType, Operand, Operand)],
 ) -> bool {
+    skip_boolean_diamond_inner(func, phi_selects, false)
+}
+
+/// `skip_boolean_diamond` with the loop-body override.
+///
+/// `in_vectorizable_loop` is set only by `body_becomes_branch_free`'s
+/// simulation, i.e. while proving that a loop can be made straight-line so
+/// the integer map vectorizer will take it. There the trade documented on
+/// `skip_boolean_diamond` is reversed: a 32-byte-at-a-time vector body beats
+/// any branch, so the branchy form it preserves is exactly what blocks the
+/// win. Everywhere else the historical rule stands unchanged.
+fn skip_boolean_diamond_inner(
+    func: &IrFunction,
+    phi_selects: &[(Value, IrType, Operand, Operand)],
+    in_vectorizable_loop: bool,
+) -> bool {
     if phi_selects.is_empty() {
+        return false;
+    }
+    if in_vectorizable_loop {
         return false;
     }
     // Every converted phi must be the `||` shape: `cond ? 1 : rhs`.
@@ -3634,6 +3770,14 @@ fn walk_arm(
 }
 
 fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
+    detect_diamond_inner(ctx, pred_idx, false)
+}
+
+fn detect_diamond_inner(
+    ctx: &IfConvCtx<'_>,
+    pred_idx: usize,
+    in_vectorizable_loop: bool,
+) -> Option<DiamondInfo> {
     let func = &ctx.func;
     let label_to_idx = &ctx.label_to_idx;
     let preds = &ctx.preds;
@@ -3790,7 +3934,7 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     }
 
     // Keep short-circuit boolean diamonds branchy (see skip_boolean_diamond).
-    if skip_boolean_diamond(func, &phi_selects) {
+    if skip_boolean_diamond_inner(func, &phi_selects, in_vectorizable_loop) {
         return None;
     }
 
@@ -3839,6 +3983,14 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
 /// This handles ternaries like `a >= t ? a - t : 0` where the false arm
 /// is a constant and doesn't need its own block.
 fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
+    detect_triangle_inner(ctx, pred_idx, false)
+}
+
+fn detect_triangle_inner(
+    ctx: &IfConvCtx<'_>,
+    pred_idx: usize,
+    in_vectorizable_loop: bool,
+) -> Option<DiamondInfo> {
     let func = &ctx.func;
     let label_to_idx = &ctx.label_to_idx;
     let preds = &ctx.preds;
@@ -3994,7 +4146,7 @@ fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> 
     }
 
     // Keep short-circuit boolean diamonds branchy (see skip_boolean_diamond).
-    if skip_boolean_diamond(func, &phi_selects) {
+    if skip_boolean_diamond_inner(func, &phi_selects, in_vectorizable_loop) {
         return None;
     }
 
@@ -4189,6 +4341,57 @@ mod tests {
     use super::*;
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{IrBinOp, IrConst};
+
+    #[test]
+    fn loop_profitability_exempts_only_the_candidate_chain_branch() {
+        let mut f = IrFunction::new("chain_profitability".into(), IrType::Void, vec![], false);
+        f.blocks.extend([
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![],
+                terminator: Terminator::Return(None),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![],
+                terminator: Terminator::Return(None),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            },
+        ]);
+        let mut body = FxHashSet::default();
+        body.insert(0);
+        let natural_loop = crate::passes::loop_analysis::NaturalLoop { header: 0, body };
+        let mut candidate_chain = FxHashSet::default();
+        candidate_chain.insert(0);
+        assert!(body_becomes_branch_free(
+            &mut f.clone(),
+            &natural_loop,
+            usize::MAX,
+            &candidate_chain,
+            false,
+        ));
+        assert!(!body_becomes_branch_free(
+            &mut f,
+            &natural_loop,
+            usize::MAX,
+            &FxHashSet::default(),
+            false,
+        ));
+    }
 
     #[test]
     fn cond_load_addr_expr_key_is_total_on_every_shape_class() {

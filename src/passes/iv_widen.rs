@@ -1818,8 +1818,23 @@ fn analyze_iv(
                     // arithmetic) stay in the narrow loop, which is where they
                     // were lowered and where they are known-correct.
                     let to_within_wide_domain = to_ty.size() <= wide_ty.size();
+                    // "Widening" is relative to the value being read, not to
+                    // the narrow phi. `cur` may be a WIDE chain value -- the
+                    // 64-bit sum in `(int)((long)a + (long)i)` -- and for it
+                    // an I64 -> I32 cast is a truncation whose wrap the
+                    // source defines (C17 6.3.1.3p3: implementation-defined,
+                    // modulo 2^32 here as in GCC; it is not the undefined
+                    // overflow theorem 2 rests on). Dropping that cast and
+                    // aliasing its readers to the 64-bit sum stored
+                    // 2147483649 where the program computes -2147483647,
+                    // at -O2 and -O3
+                    // (`tests/regression/explicit_narrowing_wraps.c`). The
+                    // 8 -> 2 and 8 -> 1 truncations always took the
+                    // `NarrowCast` path below; 8 -> 4 now joins them.
+                    let extends_operand = to_ty.size() >= from_ty.size();
                     if to_is_int
                         && to_ty.size() >= 4
+                        && extends_operand
                         && to_within_wide_domain
                         && *to_ty != IrType::Ptr
                         && same_sign
@@ -8506,5 +8521,102 @@ mod tests {
             }),
         );
         check(&mut f, 1);
+    }
+
+    /// `p[i] = (int)((long)a + (long)i)`: the wide sum is a chain value of
+    /// the widened counter, and its truncation to `int` wraps by definition
+    /// (C17 6.3.1.3p3). The truncation and its re-extension must survive --
+    /// the pass used to file the I64 -> I32 cast as a *widening* cast, drop
+    /// it and store the unwrapped 64-bit sum (wrong code at -O2 on
+    /// `tests/regression/explicit_narrowing_wraps.c`).
+    #[test]
+    fn truncation_of_a_wide_chain_value_is_retained() {
+        for (op, other) in [
+            (IrBinOp::Add, Operand::Value(Value(60))),
+            (IrBinOp::Mul, Operand::Const(IrConst::I64(0x4000_0000))),
+            (IrBinOp::Shl, Operand::Const(IrConst::I64(30))),
+        ] {
+            let body = vec![
+                Instruction::Cast {
+                    dest: Value(10),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(11),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: Operand::Const(IrConst::I64(3)),
+                    ty: IrType::I64,
+                },
+                gep_inst(12, 11, IrType::I64),
+                // The wide chain: (long)i `op` other.
+                Instruction::BinOp {
+                    dest: Value(13),
+                    op,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: other,
+                    ty: IrType::I64,
+                },
+                // (int) of it, then the implicit conversion back to long.
+                Instruction::Cast {
+                    dest: Value(14),
+                    src: Operand::Value(Value(13)),
+                    from_ty: IrType::I64,
+                    to_ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(15),
+                    src: Operand::Value(Value(14)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(15)),
+                    ptr: Value(12),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                },
+            ];
+            let mut func = counting_loop("chain_trunc", IrType::I32, IrBinOp::Add, body, None);
+            // The loop-invariant addend `(long)a`, defined in the preheader.
+            func.blocks[0].instructions.push(Instruction::Copy {
+                dest: Value(60),
+                src: Operand::Const(IrConst::I64(0x7fff_fffe)),
+            });
+            check(&mut func, 1);
+            let body = &func.blocks[2].instructions;
+            let truncation = body.iter().find_map(|i| match i {
+                Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    from_ty: IrType::I64,
+                    to_ty: IrType::I32,
+                } if src.0 == 13 => Some(*dest),
+                _ => None,
+            });
+            let truncation = truncation
+                .unwrap_or_else(|| panic!("{op:?}: the I64 -> I32 truncation was dropped"));
+            let extension = body.iter().find_map(|i| match i {
+                Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                } if *src == truncation => Some(*dest),
+                _ => None,
+            });
+            let extension =
+                extension.unwrap_or_else(|| panic!("{op:?}: the re-extension was dropped"));
+            assert!(
+                body.iter().any(|i| matches!(
+                    i,
+                    Instruction::Store { val: Operand::Value(v), .. } if *v == extension
+                )),
+                "{op:?}: the store must read the wrapped value, not the 64-bit chain"
+            );
+        }
     }
 }

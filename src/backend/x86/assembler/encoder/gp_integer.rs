@@ -1713,6 +1713,20 @@ impl super::InstructionEncoder {
                     self.bytes.push(self.modrm(3, src1_n, src_n));
                     return Ok(());
                 }
+                // The same product with the multiplier in memory:
+                // `{nf} imulq 192(%rsp), %r15, %rbx` is
+                // `62 74 e4 1c af bc 24 c0 00 00 00` (GAS 2.47, byte-probed).
+                // The NDD fold emits it whenever the multiplier is a spill
+                // slot, and without this arm every such function failed to
+                // assemble under -mapxf ("unsupported imul operands").
+                if let (Operand::Memory(mem), Operand::Register(src1), Operand::Register(ndd)) =
+                    (&ops[0], &ops[1], &ops[2])
+                {
+                    let src1_n = reg_num(&src1.name).ok_or("bad register")?;
+                    self.emit_apx_evex_rm(size, &src1.name, mem, Some(&ndd.name), self.apx_nf)?;
+                    self.bytes.push(0xAF);
+                    return self.encode_modrm_mem(src1_n, mem);
+                }
                 let (val, dst) = match (&ops[0], &ops[2]) {
                     (Operand::Immediate(ImmediateValue::Integer(v)), Operand::Register(d)) => {
                         (*v, d)

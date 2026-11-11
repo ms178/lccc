@@ -2585,6 +2585,9 @@ jobs:
         # auto-repair and invalidate-before-replace (synthetic tarball).
         bash tests/regression/check_ensure_gcc_torture.sh
         bash tests/regression/check_bool_pair_tail_jmp.sh
+        # Blendv and FMA semantic gates live in their dedicated codegen shard;
+        # keep them single-owned so the lane-plan audit can prove their exact
+        # invocation and negative controls are not silently duplicated.
         # The architectural implicit-operand table is the single source of
         # truth for every pass that reasons about registers an instruction
         # does not name; its fixture is reviewed independently of the code.
@@ -3042,6 +3045,10 @@ jobs:
           --lccc target/fastbuild/lccc --gcc gcc-16 --clang "$CLANG" \
           --json target/cond-load-sink-best-tools.json
         python3 scripts/check_cond_load_sink_best_tools.py --self-test
+        # The verification environment must reuse an active exactly-4 GiB swap
+        # file: a second fixed 4 GiB image exhausts a 21 GiB sandbox, and a
+        # fixed /tmp swapon diagnostic cannot be written by a non-root caller.
+        python3 tests/regression/check_agent_swap_reuse.py
         python3 scripts/edg_corpus_mine.py selftest
         # IPA-RA must not summarize weak/interposable bodies: a strong
         # override linked from another TU clobbers %r8-%r11 (was 55, not 79)

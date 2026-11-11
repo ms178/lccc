@@ -6707,6 +6707,28 @@ mod apx_tests {
         assert_eq!(hex("imulq %rcx, %rdx, %r16"), "62 f4 fc 10 af d1");
     }
 
+    /// The NDD product with its multiplier in memory (GAS 2.47 bytes).  The
+    /// arm was missing: `-O2 -mapxf` could not assemble a multiply whose
+    /// multiplier lived in a spill slot.
+    #[test]
+    fn apx_ndd_imul_takes_a_memory_multiplier() {
+        assert_eq!(
+            hex("{nf} imulq 192(%rsp), %r15, %rbx"),
+            "62 74 e4 1c af bc 24 c0 00 00 00"
+        );
+        assert_eq!(
+            hex("{nf} imulq (%r16,%r17,4), %r18, %r19"),
+            "62 ec e0 14 af 14 88"
+        );
+        assert_eq!(hex("imulq 8(%rdi), %rsi, %rax"), "62 f4 fc 18 af 77 08");
+        assert_eq!(
+            hex("{nf} imull 4(%rbp), %ecx, %edx"),
+            "62 f4 6c 1c af 4d 04"
+        );
+        assert_eq!(hex("{nf} imulw 4(%rbp), %cx, %dx"), "62 f4 6d 1c af 4d 04");
+        assert_eq!(hex("{nf} imulq %rbx, %r16, %r14"), "62 e4 8c 1c af c3");
+    }
+
     #[test]
     fn lock_splices_before_rex2() {
         assert_eq!(hex("lock addq %rax, (%r16)"), "f0 d5 18 01 00");

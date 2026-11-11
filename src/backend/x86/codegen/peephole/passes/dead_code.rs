@@ -132,14 +132,18 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
         let dst_mask = 1u16 << dst_reg;
         let mut dead = false;
 
-        // Scan forward within the same basic block.
+        // Scan forward within the same basic block.  The window counts
+        // INSTRUCTIONS: a deleted line or a hidden `-g` row occupies an
+        // index but not a place in the window, or the same move would be
+        // dead without `-g` and live with it.
         let mut j = i + 1;
-        let scan_end = (i + DEAD_MOVE_WINDOW).min(len);
-        while j < scan_end {
+        let mut examined = 1usize;
+        while j < len && examined < DEAD_MOVE_WINDOW {
             if infos[j].is_nop() {
                 j += 1;
                 continue;
             }
+            examined += 1;
 
             if infos[j].is_barrier() {
                 // A return cannot observe non-result caller-saved registers.

@@ -166,8 +166,8 @@ pub(super) fn home_phys_by_asm_name(clobber: &str) -> Option<u8> {
         ("r11w", 10),
         ("r11b", 10),
         ("r10d", 11),
-        ("r10w", 10),
-        ("r10b", 10),
+        ("r10w", 11),
+        ("r10b", 11),
         ("r8d", 12),
         ("r8w", 12),
         ("r8b", 12),
@@ -831,6 +831,10 @@ impl super::isel::HomeMap for FreshHomes<'_> {
     fn is_rorx_masked_shift(&self, id: u32) -> bool {
         self.0.rorx_masked_shifts.contains(&id)
     }
+
+    fn i128_pair_relay(&self, id: u32) -> bool {
+        self.0.i128_pair_relay && !self.0.i128_block_copies.contains(&id)
+    }
 }
 
 pub struct X86Codegen {
@@ -852,6 +856,11 @@ pub struct X86Codegen {
     pub(super) call_ret_classes: Vec<crate::common::types::EightbyteClass>,
     /// True when the current call returns _Float128 (ONE 16-byte XMM, xmm0).
     pub(super) call_ret_is_f128_sse: bool,
+    /// The call just emitted returned a 16-byte vector in ONE `%xmm0`
+    /// (`Instruction::CallInfo::ret_is_vector128`).  Read by
+    /// `emit_call_store_result_impl`, which then stores `%xmm0` directly
+    /// instead of rebuilding the value from two I64 halves.
+    pub(super) call_ret_is_vector128: bool,
     /// For variadic functions: number of named integer/pointer parameters (excluding long double)
     pub(super) num_named_int_params: usize,
     /// For variadic functions: number of named float/double parameters (excluding long double)
@@ -861,6 +870,11 @@ pub struct X86Codegen {
     pub(super) num_named_stack_bytes: usize,
     /// For variadic functions: stack offset of the register save area (negative from rbp)
     pub(super) reg_save_area_offset: i64,
+    /// A function that calls `__builtin_apply_args`: the frame offset
+    /// (negative from the frame base) of the block the prologue fills with
+    /// the incoming argument registers, laid out like the builtin's result
+    /// (`APPLY_ARGS_*`).  `None` in every other function.
+    pub(super) apply_args_capture_offset: Option<i64>,
     /// The current function returns its aggregate in ONE `%ymm0` / `%zmm0`
     /// (`call_abi::hidden_vector_return_bytes`): the byte width, and the
     /// frame offset (negative from the frame base) of the private buffer
@@ -1130,11 +1144,30 @@ pub struct X86Codegen {
     /// strength reduction for constant mul/div is skipped in favour of imul/idiv).
     pub(super) optimize_for_size: bool,
     /// Current function being generated (needed for indexed addressing detection).
+    ///
+    /// Written only through [`X86Codegen::set_current_function`]; the
+    /// borrow it points at is the caller's, which outlives the emission of
+    /// that function (see [`X86Codegen::current_function`]).
     pub(super) current_func: Option<*const IrFunction>,
+    /// Identity of the *emission* of `current_func`, bumped by
+    /// [`X86Codegen::set_current_function`] on every rebind.
+    ///
+    /// Per-function caches key on this counter rather than on the function
+    /// address: an address is not an identity. The allocator may free one
+    /// `IrFunction` and hand the next one the same address, which would let
+    /// a stale cache answer for a different function's value ids (ABA). A
+    /// counter that only ever increases cannot repeat, so a cache entry
+    /// built for generation `n` is recognisable as stale forever.
+    pub(super) func_generation: u64,
     /// `find_defining_instruction`'s answers for `current_func`, built on the
     /// first `get_defining_instruction` of the function (see there) and reset
     /// wherever `current_func` changes.
     pub(super) def_index: std::cell::OnceCell<DefIndex>,
+    /// High-half facts of `current_func`'s single-definition 128-bit values
+    /// (`i128_ops::build_i128_high_facts`), built on the first 128-bit
+    /// multiply that asks and reset wherever `current_func` changes. The
+    /// `u64` is the `func_generation` the facts describe.
+    pub(super) i128_high_facts: std::cell::OnceCell<super::i128_ops::I128HighFacts>,
     /// When true, skip movslq sign-extension after 32-bit ALU ops on registers
     /// for values NOT in needs_sext_values. Set when no GEPs and no widening casts.
     pub(super) skip_i32_sext: bool,
@@ -1247,6 +1280,21 @@ pub struct X86Codegen {
     /// slot-homed i128 values the typed store route may read. See the
     /// prologue scan that fills it.
     pub(super) coherent_i128_homes: crate::common::fx_hash::FxHashSet<u32>,
+    /// Typed 128-bit integer Load/Store in this function relay through the
+    /// GPR pair instead of the `movdqu` scratch (`isel::HomeMap::
+    /// i128_pair_relay`).  True unless the function has 128-bit XMM traffic
+    /// -- a `_Float128` or 16-byte vector argument or result, a vector or
+    /// F128 intrinsic -- whose values are produced and consumed in an XMM
+    /// register and therefore want the 16-byte transfer.  Set per function
+    /// by the prologue scan next to `coherent_i128_homes`.
+    pub(super) i128_pair_relay: bool,
+    /// The exception inside a pair-relay function: 128-bit values that are
+    /// only loaded through a pointer and stored again (`*d = *s`).  Such a
+    /// value never meets the GPR pair, so the 16-byte relay is the shorter
+    /// transfer -- one load and one store, as GCC and Clang emit -- and it
+    /// straddles nothing this function wrote in halves.  See
+    /// `prologue::collect_i128_block_copies`.
+    pub(super) i128_block_copies: crate::common::fx_hash::FxHashSet<u32>,
     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
     /// Set by the Cmp emitter when the consumer is the next instruction.
     pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
@@ -1575,12 +1623,14 @@ impl X86Codegen {
             func_ret_classes: Vec::new(),
             func_set_second_ret: false,
             call_ret_is_f128_sse: false,
+            call_ret_is_vector128: false,
             call_ret_classes: Vec::new(),
             func_ret_is_f128_sse: false,
             num_named_int_params: 0,
             num_named_fp_params: 0,
             num_named_stack_bytes: 0,
             reg_save_area_offset: 0,
+            apply_args_capture_offset: None,
             vector_ret_buffer_bytes: 0,
             vector_ret_buffer_offset: 0,
             caller_regs_restored: false,
@@ -1673,11 +1723,15 @@ impl X86Codegen {
             masked_guard_splats: FxHashSet::default(),
             masked_guard_zero_splats: FxHashSet::default(),
             coherent_i128_homes: crate::common::fx_hash::FxHashSet::default(),
+            i128_pair_relay: false,
+            i128_block_copies: crate::common::fx_hash::FxHashSet::default(),
             pending_cmp: None,
             pending_widen: [None, None],
             pending_fp_cmp: None,
             current_func: None,
+            func_generation: 0,
             def_index: std::cell::OnceCell::new(),
+            i128_high_facts: std::cell::OnceCell::new(),
             ivsr_pointers: FxHashMap::default(),
             pointer_to_counter: FxHashMap::default(),
             param_source_regs: FxHashMap::default(),
@@ -3931,6 +3985,34 @@ impl X86Codegen {
         matches!(scale, 1 | 2 | 4 | 8)
     }
 
+    /// Point this codegen at `func` for the emission that follows.
+    ///
+    /// The single writer of `current_func`, so the pointer the rest of the
+    /// emitter trusts and the [`Self::func_generation`] the per-function
+    /// caches key on can never disagree. Every rebind bumps the generation
+    /// and invalidates the caches that answer for the previous function.
+    pub(super) fn set_current_function(&mut self, func: &IrFunction) {
+        self.current_func = Some(func as *const IrFunction);
+        self.func_generation = self.func_generation.wrapping_add(1);
+        self.def_index = std::cell::OnceCell::new();
+        self.i128_high_facts = std::cell::OnceCell::new();
+    }
+
+    /// The function being emitted, once the prologue has installed it.
+    ///
+    /// The one place `current_func` is dereferenced, so every per-function
+    /// analysis the emitter builds lazily (the def index, the 128-bit
+    /// high-half facts) shares a single justification instead of repeating
+    /// the `unsafe`.
+    pub(super) fn current_function(&self) -> Option<&crate::ir::reexports::IrFunction> {
+        let func_ptr = self.current_func?;
+        // SAFETY: `calculate_stack_space_impl` stores the address of the
+        // `&IrFunction` the generation driver keeps borrowed until that
+        // function's emission is complete, and replaces it at the start of
+        // the next function; nothing mutates the function in between.
+        Some(unsafe { &*func_ptr })
+    }
+
     /// Helper function to get the instruction that defines a value.
     /// Returns None if the value isn't defined by an instruction in the current function.
     ///
@@ -3949,7 +4031,7 @@ impl X86Codegen {
         val_id: u32,
     ) -> Option<&crate::ir::reexports::Instruction> {
         let func_ptr = self.current_func?;
-        let func = unsafe { &*func_ptr };
+        let func = self.current_function()?;
         let (built_for, index) = self
             .def_index
             .get_or_init(|| (func_ptr, Self::build_def_index(func)));
@@ -5215,23 +5297,6 @@ impl X86Codegen {
             "    lock cmpxchg{suffix} %{candidate}, (%{addr})"
         ));
         self.state.out.emit_jcc_label("    jne", &loop_label);
-    }
-
-    /// Load i128 operands for binary ops: lhs → rax:rdx, rhs → rcx:rsi.
-    pub(super) fn prep_i128_binop(&mut self, lhs: &Operand, rhs: &Operand) {
-        self.operand_to_rax_rdx(lhs);
-        self.state.emit("    pushq %rdx");
-        self.state.emit("    pushq %rax");
-        self.state.out.rsp_frame_size += 16;
-        self.operand_to_rax_rdx(rhs);
-        self.state.emit("    movq %rax, %rcx");
-        self.state.emit("    movq %rdx, %rsi");
-        self.state.emit("    popq %rax");
-        self.state.emit("    popq %rdx");
-        self.state.out.rsp_frame_size -= 16;
-        self.state.reg_cache.invalidate_all();
-        self.flush_pending_vec_store_impl();
-        self.state.invalidate_vec_peephole();
     }
 
     /// Load an operand value into any GP register (returned as string).
@@ -8433,6 +8498,12 @@ impl ArchCodegen for X86Codegen {
         self.emit_memcpy_ir_impl(dest, src, size);
     }
 
+    /// x86-64 override: `emit_memcpy` stages in `%rdi`/`%rsi`, which the
+    /// allocator may be using across this (non-call-point) pair.
+    fn emit_f128_exact_copy(&mut self, dest: &Value, src: &Value) {
+        self.emit_f128_exact_copy_impl(dest, src);
+    }
+
     fn flush_pending_widen(&mut self) {
         self.flush_pending_widen_impl();
     }
@@ -10425,6 +10496,15 @@ impl ArchCodegen for X86Codegen {
         // with ymm/xmm registers instead of scalar movq.
         if let Operand::Value(v) = src {
             if self.state.vector_values.contains(&v.0) {
+                // A copy of a value that already sits in the return register
+                // (`return ext8(a);` -- the call result is in `%ymm0`/`%zmm0`)
+                // is likewise register-resident: the SSA rename in between
+                // must not turn one register into a store plus a reload.
+                if self.state.call_ret_vector_in_xmm0.contains(&v.0) {
+                    self.state.call_ret_vector_in_xmm0.insert(dest.0);
+                } else {
+                    self.state.call_ret_vector_in_xmm0.remove(&dest.0);
+                }
                 let debug = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
                 let is_128 = self.state.vector128_values.contains(&v.0);
                 if debug {
@@ -10975,6 +11055,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_i128_sub(&mut self) => emit_i128_sub_impl;
         fn emit_i128_mul(&mut self) => emit_i128_mul_impl;
         fn emit_i128_mul_const(&mut self, lhs: &Operand, rhs: &Operand, lo: u64, hi: u64) => emit_i128_mul_const_impl;
+        fn emit_i128_mul_narrow(&mut self, lhs: &Operand, rhs: &Operand) -> bool => emit_i128_mul_narrow_impl;
         fn emit_i128_and(&mut self) => emit_i128_and_impl;
         fn emit_i128_or(&mut self) => emit_i128_or_impl;
         fn emit_i128_xor(&mut self) => emit_i128_xor_impl;
@@ -11050,6 +11131,26 @@ mod alias_freshness_tests {
             ("r31b", 55),
         ] {
             assert_eq!(home_phys_by_asm_name(name), Some(phys), "{name}");
+        }
+    }
+
+    /// Every width alias of every GPR home names that home, taken from the
+    /// names the emitter itself prints.  The table once sent `r10w` and
+    /// `r10b` to `%r11`'s home: an `asm` statement clobbering either evicted
+    /// the wrong register and left the value in `%r10` trusted.
+    #[test]
+    fn every_width_alias_of_a_gpr_home_names_that_home() {
+        for phys in (1..=6).chain(10..=16).chain(40..=55) {
+            let reg = PhysReg(phys);
+            for ty in [IrType::I64, IrType::I32, IrType::I16, IrType::I8] {
+                let name = typed_phys_reg_name(reg, ty);
+                assert_eq!(
+                    home_phys_by_asm_name(name),
+                    Some(phys),
+                    "clobber {name} must evict the home of {}",
+                    phys_reg_name(reg)
+                );
+            }
         }
     }
 
@@ -12470,7 +12571,7 @@ mod switch_bound_emitter_tests {
         func.next_value_id = 6;
 
         let mut cg = X86Codegen::new();
-        cg.current_func = Some(&func as *const IrFunction);
+        cg.set_current_function(&func);
         cg.state.current_program_point = 10;
 
         // Missing live segments must fail closed.

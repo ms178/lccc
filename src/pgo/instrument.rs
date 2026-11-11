@@ -1649,6 +1649,7 @@ fn dump_helper(
         global_init_label_blocks: vec![],
         ret_eightbyte_classes: vec![],
         ret_is_f128_sse: false,
+        ret_is_vector128: false,
         is_gnu_inline_def: false,
         loop_promoted_f64_values: Vec::new(),
         ssp: Default::default(),
@@ -1706,6 +1707,7 @@ fn dump_helper(
                 global_init_label_blocks: vec![],
                 ret_eightbyte_classes: vec![],
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 is_gnu_inline_def: false,
                 loop_promoted_f64_values: Vec::new(),
                 ssp: Default::default(),
@@ -1739,6 +1741,7 @@ fn ci(d: Option<Value>, a: Vec<Operand>, t: Vec<IrType>, r: IrType, var: bool) -
         assume_library: false,
         ret_eightbyte_classes: vec![],
         ret_is_f128_sse: false,
+        ret_is_vector128: false,
         cold: false,
     }
 }
@@ -2007,6 +2010,7 @@ fn push_helper_fn(
         global_init_label_blocks: vec![],
         ret_eightbyte_classes: vec![],
         ret_is_f128_sse: false,
+        ret_is_vector128: false,
         is_gnu_inline_def: false,
         loop_promoted_f64_values: Vec::new(),
         ssp: Default::default(),

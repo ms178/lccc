@@ -443,6 +443,9 @@ pub(super) struct FuncSig {
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     /// True if the return value is _Float128 (ONE 16-byte XMM return).
     pub ret_is_f128_sse: bool,
+    /// The callee returns a 16-byte vector in ONE `%xmm0`
+    /// (`Instruction::CallInfo::ret_is_vector128`).
+    pub ret_is_vector128: bool,
     /// The aggregate result comes back in the FP registers of this class
     /// through the hidden buffer (`sret_size` is set); see
     /// `AggregateReturn::fp_agg`.
@@ -484,6 +487,7 @@ impl FuncSig {
             two_reg_ret_size: None,
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
+            ret_is_vector128: false,
             ret_fp_agg_class: None,
             ret_x87_aggregate: false,
             ret_x87_pair: false,

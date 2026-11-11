@@ -44,6 +44,27 @@ pub trait HomeMap {
     fn is_rorx_masked_shift(&self, _id: u32) -> bool {
         false
     }
+
+    /// True when the 16-byte integer value `id` must cross a typed
+    /// Load/Store as two 8-byte halves through the reserved `%rax`/`%rdx`
+    /// instead of one `movdqu` pair through `%xmm0`.
+    ///
+    /// A 128-bit integer is produced and consumed by this backend as a GPR
+    /// pair, so its slot is written with two 8-byte stores and read with two
+    /// 8-byte loads.  A 16-byte load that straddles two such stores cannot be
+    /// store-forwarded (measured: 7.2-7.6 ns per transfer against 0.6-0.7 ns
+    /// for the pair relay), which is what an SSE relay next to pair traffic
+    /// costs.  The answer is a pure transfer-width choice -- both relays
+    /// move the same 16 bytes with the same read-before-write ordering.
+    ///
+    /// A plain map makes no claim (the SSE relay, as before).  The emitter's
+    /// view answers per function (`X86Codegen::i128_pair_relay`), except for
+    /// the values that are only copied from memory to memory
+    /// (`X86Codegen::i128_block_copies`): those never meet a GPR pair and
+    /// keep the one-load, one-store SSE transfer.
+    fn i128_pair_relay(&self, _id: u32) -> bool {
+        false
+    }
 }
 
 impl HomeMap for FxHashMap<u32, PhysReg> {
@@ -102,6 +123,69 @@ pub fn set_sse_integer_moves(enabled: bool) {
 #[inline]
 pub fn sse_integer_moves() -> bool {
     SSE_INTEGER_MOVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Kill switch for the pair relay of 128-bit integer Load/Store:
+/// `CCC_DISABLE_PASSES=i128_pair_relay` restores the `movdqu` relay wherever
+/// the SSE scratch is free, so the transfer-width choice can be bisected and
+/// A/B-measured.  Cached: the environment never changes mid-compile.
+pub fn i128_pair_relay_allowed() -> bool {
+    static OPT_OUT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        crate::passes::pass_disabled(
+            std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+            "i128_pair_relay",
+        )
+    });
+    !*OPT_OUT
+}
+
+/// The operand eight bytes above `op`: the high half of a 16-byte object
+/// whose low half is `op`.  `None` for an operand that is not a plain slot
+/// or base+displacement memory reference.
+fn wide_high_half(op: &MachOperand) -> Option<MachOperand> {
+    match op {
+        MachOperand::StackSlot(slot) => Some(MachOperand::StackSlot(slot + 8)),
+        MachOperand::Mem { base, offset } => Some(MachOperand::Mem {
+            base: *base,
+            offset: offset + 8,
+        }),
+        _ => None,
+    }
+}
+
+/// Relay a 16-byte integer object from `src` to `dst` as two 8-byte halves
+/// through the reserved `%rax`/`%rdx` (every 128-bit Load/Store is a fixed
+/// `%rdx` clobber point for the allocator: `regalloc::x86_inst_fixed_scratch`).
+///
+/// BOTH loads are issued before EITHER store: the destination may overlap
+/// the source, and a store to its low half must not corrupt the high half's
+/// source.  Returns false, pushing nothing, for an operand without a
+/// computable high half.
+fn push_i128_pair_relay(src: MachOperand, dst: MachOperand, out: &mut Vec<MachInst>) -> bool {
+    let (Some(src_hi), Some(dst_hi)) = (wide_high_half(&src), wide_high_half(&dst)) else {
+        return false;
+    };
+    out.push(MachInst::Mov {
+        src,
+        dst: MachOperand::Reg(MachReg::Phys(RAX)),
+        size: OpSize::S64,
+    });
+    out.push(MachInst::Mov {
+        src: src_hi,
+        dst: MachOperand::Reg(MachReg::Phys(RDX)),
+        size: OpSize::S64,
+    });
+    out.push(MachInst::Mov {
+        src: MachOperand::Reg(MachReg::Phys(RAX)),
+        dst,
+        size: OpSize::S64,
+    });
+    out.push(MachInst::Mov {
+        src: MachOperand::Reg(MachReg::Phys(RDX)),
+        dst: dst_hi,
+        size: OpSize::S64,
+    });
+    true
 }
 
 /// Convert an IR Operand to a MachOperand, using physical registers for
@@ -2228,11 +2312,16 @@ fn lower_instruction_typed_inner(
             //
             // Mirror of the typed i128 store: the value's home is a
             // contiguous 16-byte slot, the source address a direct slot or
-            // a GPR-held pointer, and the transfer is the atomic Mov128
-            // (movdqu pair through the pre-colored xmm0 scratch,
-            // alias-ordered) or the four-Mov GPR fallback through the
-            // reserved rax/rdx when the scratch is live.  Segment
-            // overrides stay on the mature path.
+            // a GPR-held pointer.  The transfer is the pair relay (four
+            // S64 Movs through the reserved rax/rdx, loads before stores)
+            // whenever the value lives in the GPR-pair regime -- an
+            // integer's slot is written and read as two 8-byte halves, and
+            // a 16-byte access next to them fails store forwarding -- or
+            // the xmm0 scratch is live; otherwise the Mov128 (movdqu pair
+            // through the pre-colored xmm0 scratch), which is the right
+            // width for a `_Float128` or vector carrier that is produced
+            // and consumed in an XMM register.  `HomeMap::i128_pair_relay`
+            // decides.  Segment overrides stay on the mature path.
             if ty.is_128bit() {
                 if *seg_override != AddressSpace::Default || *volatile {
                     return false;
@@ -2263,37 +2352,8 @@ fn lower_instruction_typed_inner(
                     return false;
                 };
                 let dst = MachOperand::StackSlot(dslot);
-                if xmm_scratch_unsafe(ra) {
-                    let dst_hi = MachOperand::StackSlot(dslot + 8);
-                    out.push(MachInst::Mov {
-                        src: src.clone(),
-                        dst: MachOperand::Reg(MachReg::Phys(RAX)),
-                        size: OpSize::S64,
-                    });
-                    let src_hi = match src {
-                        MachOperand::StackSlot(slot) => MachOperand::StackSlot(slot + 8),
-                        MachOperand::Mem { base, offset } => MachOperand::Mem {
-                            base,
-                            offset: offset + 8,
-                        },
-                        _ => return false,
-                    };
-                    out.push(MachInst::Mov {
-                        src: src_hi,
-                        dst: MachOperand::Reg(MachReg::Phys(RDX)),
-                        size: OpSize::S64,
-                    });
-                    out.push(MachInst::Mov {
-                        src: MachOperand::Reg(MachReg::Phys(RAX)),
-                        dst,
-                        size: OpSize::S64,
-                    });
-                    out.push(MachInst::Mov {
-                        src: MachOperand::Reg(MachReg::Phys(RDX)),
-                        dst: dst_hi,
-                        size: OpSize::S64,
-                    });
-                    return true;
+                if xmm_scratch_unsafe(ra) || ra.i128_pair_relay(dest.0) {
+                    return push_i128_pair_relay(src, dst, out);
                 }
                 out.push(MachInst::Mov128 { src, dst });
                 return true;
@@ -2437,12 +2497,17 @@ fn lower_instruction_typed_inner(
             //     either an imm32-window `movq $imm` or takes the emitter's
             //     hardened wide-imm relay, which stores exactly 8 bytes at
             //     the operand's own size).  No staging register, no spill.
-            //   * Value (slot-homed, the universal i128 home): the atomic
-            //     Mov128 — `movdqu` load + `movdqu` store through the
-            //     pre-colored xmm0 scratch; alias-ordered (the source is
-            //     read in full before any destination byte is written).
-            //   * Scratch-unsafe: the GPR fallback, four S64 Movs through
-            //     the reserved rax/rdx with both loads before both stores.
+            //   * Value (slot-homed, the universal i128 home), GPR-pair
+            //     regime or xmm0 scratch live: the pair relay, four S64
+            //     Movs through the reserved rax/rdx with both loads before
+            //     both stores.  An integer's slot was written as two 8-byte
+            //     halves (parameter spill, call result, arithmetic), so a
+            //     16-byte load of it cannot be store-forwarded.
+            //   * Value, XMM regime (`_Float128` / vector carriers, see
+            //     `HomeMap::i128_pair_relay`): the Mov128 — `movdqu` load +
+            //     `movdqu` store through the pre-colored xmm0 scratch;
+            //     alias-ordered (the source is read in full before any
+            //     destination byte is written).
             //
             // Destination subset: a direct (non-small) 16-byte slot or a
             // GPR-held pointer — the same addressing subset every other
@@ -2516,31 +2581,11 @@ fn lower_instruction_typed_inner(
                             return false;
                         }
                         let src = MachOperand::StackSlot(vslot);
-                        if xmm_scratch_unsafe(ra) {
-                            // GPR fallback: load both halves into the
+                        if xmm_scratch_unsafe(ra) || ra.i128_pair_relay(val_v.0) {
+                            // Pair relay: both halves are loaded into the
                             // reserved rax/rdx BEFORE either store — the
                             // destination may overlap the source slot.
-                            out.push(MachInst::Mov {
-                                src,
-                                dst: MachOperand::Reg(MachReg::Phys(RAX)),
-                                size: OpSize::S64,
-                            });
-                            out.push(MachInst::Mov {
-                                src: MachOperand::StackSlot(vslot + 8),
-                                dst: MachOperand::Reg(MachReg::Phys(RDX)),
-                                size: OpSize::S64,
-                            });
-                            out.push(MachInst::Mov {
-                                src: MachOperand::Reg(MachReg::Phys(RAX)),
-                                dst: dst.clone(),
-                                size: OpSize::S64,
-                            });
-                            out.push(MachInst::Mov {
-                                src: MachOperand::Reg(MachReg::Phys(RDX)),
-                                dst: dst_hi,
-                                size: OpSize::S64,
-                            });
-                            return true;
+                            return push_i128_pair_relay(src, dst, out);
                         }
                         out.push(MachInst::Mov128 { src, dst });
                         return true;

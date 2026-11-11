@@ -17,6 +17,34 @@ use crate::frontend::lexer::token::TokenKind;
 /// "unsigned long int"), so we accumulate boolean flags and a `long_count`
 /// while scanning tokens, then resolve them into a concrete `TypeSpecifier`
 /// via `Parser::resolve_type_flags`.
+/// The four type-specifier tokens that name a type on their own and so used to
+/// resolve *inside* the base-token loop: `__int128`, `__uint128_t`,
+/// `_Float128`, and the decimal floating types.
+///
+/// They cannot `return` from there.  Returning skipped the trailing
+/// qualifier/storage-class loop below, so `__int128 __seg_gs x` and
+/// `_Float128 __seg_gs x` silently dropped the named address space (the
+/// backend then emitted a plain, *unsegmented* access to a per-CPU object --
+/// silent memory corruption, not a diagnostic), and `__int128 const x` lost
+/// its `const`.  Recording the base kind in a flag and resolving it after the
+/// same trailing loop every other base specifier uses keeps the parse
+/// identical for the unqualified spelling and correct for the qualified one.
+///
+/// `Unsigned` may precede or follow the token (`unsigned __int128` /
+/// `__int128 unsigned`), which the `has_signed`/`has_unsigned` flags already
+/// carry; `__uint128_t` is unsigned by definition.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum WideBaseKind {
+    #[default]
+    None,
+    Int128,
+    UInt128,
+    Float128,
+    Decimal32,
+    Decimal64,
+    Decimal128,
+}
+
 #[derive(Default)]
 struct TypeSpecFlags {
     has_void: bool,
@@ -38,6 +66,9 @@ struct TypeSpecFlags {
     /// `typeof_unqual`: the expression type drops the named address space.
     typeof_unqual: bool,
     long_count: u32,
+    /// Set by a self-contained wide base token; resolved after the trailing
+    /// qualifier/storage-class loop so qualifiers and `__seg_gs` survive.
+    wide_kind: WideBaseKind,
     typedef_name: Option<String>,
 }
 
@@ -280,19 +311,27 @@ impl Parser {
                 }
                 TokenKind::Float128 => {
                     self.advance();
-                    return Some(TypeSpecifier::Float128);
+                    flags.wide_kind = WideBaseKind::Float128;
+                    any_base_specifier = true;
+                    break;
                 }
                 TokenKind::Decimal32 => {
                     self.advance();
-                    return Some(TypeSpecifier::Decimal32);
+                    flags.wide_kind = WideBaseKind::Decimal32;
+                    any_base_specifier = true;
+                    break;
                 }
                 TokenKind::Decimal64 => {
                     self.advance();
-                    return Some(TypeSpecifier::Decimal64);
+                    flags.wide_kind = WideBaseKind::Decimal64;
+                    any_base_specifier = true;
+                    break;
                 }
                 TokenKind::Decimal128 => {
                     self.advance();
-                    return Some(TypeSpecifier::Decimal128);
+                    flags.wide_kind = WideBaseKind::Decimal128;
+                    any_base_specifier = true;
+                    break;
                 }
                 TokenKind::Bool => {
                     self.advance();
@@ -310,7 +349,10 @@ impl Parser {
                     flags.has_unsigned = true;
                     any_base_specifier = true;
                 }
-                // __int128 can combine with signed/unsigned
+                // __int128 can combine with signed/unsigned, `const`, and a
+                // named address space -- all of which live in the trailing
+                // loop or the qualifier collection, so record the base kind
+                // and let `resolve_type_flags` decide sign and width.
                 TokenKind::Int128 => {
                     let span = self.peek_span();
                     self.advance();
@@ -318,14 +360,13 @@ impl Parser {
                     if crate::common::types::target_is_32bit() {
                         self.emit_error("__int128 is not supported on this target", span);
                         // Fall through with Int (to avoid cascading errors)
-                        return Some(TypeSpecifier::Int);
+                        flags.has_int = true;
+                        any_base_specifier = true;
+                        break;
                     }
-                    // __int128 already implies signed unless unsigned is present
-                    if flags.has_unsigned {
-                        return Some(TypeSpecifier::UnsignedInt128);
-                    } else {
-                        return Some(TypeSpecifier::Int128);
-                    }
+                    flags.wide_kind = WideBaseKind::Int128;
+                    any_base_specifier = true;
+                    break;
                 }
                 // __uint128_t is always unsigned
                 TokenKind::UInt128 => {
@@ -334,9 +375,13 @@ impl Parser {
                     // GCC rejects __uint128_t on 32-bit targets
                     if crate::common::types::target_is_32bit() {
                         self.emit_error("__uint128_t is not supported on this target", span);
-                        return Some(TypeSpecifier::UnsignedInt);
+                        flags.has_unsigned = true;
+                        any_base_specifier = true;
+                        break;
                     }
-                    return Some(TypeSpecifier::UnsignedInt128);
+                    flags.wide_kind = WideBaseKind::UInt128;
+                    any_base_specifier = true;
+                    break;
                 }
                 TokenKind::Struct => {
                     self.advance();
@@ -502,7 +547,17 @@ impl Parser {
         flags: &mut TypeSpecFlags,
         mode_kind: &mut Option<ModeKind>,
     ) {
-        if flags.has_char || flags.has_short || flags.has_int || flags.long_count > 0 {
+        if flags.has_char
+            || flags.has_short
+            || flags.has_int
+            || flags.long_count > 0
+            || flags.wide_kind != WideBaseKind::None
+        {
+            // A wide base token (`__int128`, `__uint128_t`, `_Float128`,
+            // `_Decimal*`) joins this loop because it is the one that accepts
+            // the full trailing set: signed/unsigned, qualifiers, `__seg_gs`,
+            // storage classes and attributes.  Returning directly from the
+            // base loop used to skip all of it.
             loop {
                 match self.peek() {
                     TokenKind::Signed => {
@@ -753,8 +808,32 @@ impl Parser {
             has_typeof,
             typeof_unqual,
             long_count,
+            wide_kind,
             ref typedef_name,
         } = *flags;
+        // A self-contained wide base token outranks every other base flag:
+        // `__int128 unsigned` is `unsigned __int128`, and no combination with
+        // `long`/`int` is meaningful.  Resolving it here (rather than inside
+        // the base-token loop) is what keeps the trailing qualifiers -- and
+        // above all `__seg_gs` -- on the type.
+        match wide_kind {
+            WideBaseKind::Float128 => return TypeSpecifier::Float128,
+            WideBaseKind::Decimal32 => return TypeSpecifier::Decimal32,
+            WideBaseKind::Decimal64 => return TypeSpecifier::Decimal64,
+            WideBaseKind::Decimal128 => return TypeSpecifier::Decimal128,
+            WideBaseKind::UInt128 => return TypeSpecifier::UnsignedInt128,
+            WideBaseKind::Int128 => {
+                // `unsigned __int128` and `__int128 unsigned` both arrive with
+                // `has_unsigned` set: `Unsigned` is accepted on either side of
+                // the base token.
+                return if has_unsigned {
+                    TypeSpecifier::UnsignedInt128
+                } else {
+                    TypeSpecifier::Int128
+                };
+            }
+            WideBaseKind::None => {}
+        }
         if has_void {
             TypeSpecifier::Void
         } else if has_bool {

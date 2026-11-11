@@ -12,7 +12,7 @@
 use super::common::AsmOutput;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{BlockId, IrCmpOp, Operand, Value};
+use crate::ir::reexports::{BlockId, Instruction, IrCmpOp, Operand, Value};
 use std::sync::Arc;
 
 /// Stack slot location for a value. Interpretation varies by arch:
@@ -300,6 +300,32 @@ pub struct FnEntryRows {
 }
 
 pub struct CodegenState {
+    /// Values whose vector content currently sits in the vector return
+    /// register (`%xmm0`/`%ymm0`/`%zmm0`): a vector call result, and the
+    /// renames (`Copy`) of it.
+    ///
+    /// The IR carries a 16-byte vector as `IrType::I128`, and `emit_copy_i128`
+    /// would otherwise route every such value through `%rax`/`%rdx`: a spill,
+    /// two reloads and two stores per copy.  A value in this set is read from
+    /// the register directly, and `return ext8(a);` returns it in place.
+    ///
+    /// The set states a fact about the register file, so it holds only while
+    /// nothing has written the register and only on the path it was
+    /// established on.  Residency therefore ends
+    ///
+    /// * with the function ([`Self::reset_for_function`]): value ids restart,
+    ///   and a stale id names an unrelated value whose `return` would skip
+    ///   its load;
+    /// * with the block ([`Self::end_call_ret_vector_residency`]): another
+    ///   predecessor reaches the next block with a different register file;
+    /// * before every instruction that is not a rename of a member
+    ///   ([`Self::expire_call_ret_vector_residency`]): scalar floating point
+    ///   computes in `%xmm0` and block copies travel through it, and no
+    ///   emitter is asked to remember to say so.
+    ///
+    /// What remains between the call and its consumer is a chain of renames,
+    /// none of which changes the register's content.
+    pub call_ret_vector_in_xmm0: FxHashSet<u32>,
     pub(crate) frame_report: Option<crate::backend::FrameReport>,
     pub(crate) debug_homes: Option<crate::backend::DebugHomes>,
     pub out: AsmOutput,
@@ -975,6 +1001,7 @@ impl CodegenState {
 
     pub fn new_with_ra_config(ra_config: Arc<crate::backend::regalloc::RaConfig>) -> Self {
         Self {
+            call_ret_vector_in_xmm0: Default::default(),
             frame_report: None,
             debug_homes: None,
             out: AsmOutput::new(),
@@ -1426,6 +1453,7 @@ impl CodegenState {
         // of its slot).
         self.vector_values.clear();
         self.vector128_values.clear();
+        self.call_ret_vector_in_xmm0.clear();
         self.protected_slot_values.clear();
         self.vector_defer_values.clear();
         self.vector_memfold_values.clear();
@@ -1485,6 +1513,38 @@ impl CodegenState {
         self.sse_last_store_reg = false;
         self.sse_last_store_reg_name = None;
         self.direct_fp_result = None;
+    }
+
+    /// End the register residency of every vector call result
+    /// ([`Self::call_ret_vector_in_xmm0`]): a block begins.
+    pub fn end_call_ret_vector_residency(&mut self) {
+        if !self.call_ret_vector_in_xmm0.is_empty() {
+            self.call_ret_vector_in_xmm0.clear();
+        }
+    }
+
+    /// End the register residency of vector call results
+    /// ([`Self::call_ret_vector_in_xmm0`]) at `inst`, unless `inst` only
+    /// renames a resident value.
+    ///
+    /// A resident value is the result of the call just emitted; the one
+    /// thing that may stand between that call and the `return` (or the
+    /// store) that consumes the register is a `Copy` of the value itself.
+    /// Anything else may write `%xmm0` -- scalar floating point computes in
+    /// it, a 32-byte block copy travels through it -- and the membership
+    /// test in the return path would then skip a load that is needed.
+    pub fn expire_call_ret_vector_residency(&mut self, inst: &Instruction) {
+        if self.call_ret_vector_in_xmm0.is_empty() {
+            return;
+        }
+        let renames_resident = matches!(
+            inst,
+            Instruction::Copy { src: Operand::Value(v), .. }
+                if self.call_ret_vector_in_xmm0.contains(&v.0)
+        );
+        if !renames_resident {
+            self.call_ret_vector_in_xmm0.clear();
+        }
     }
 
     /// Invalidate all vector-register peephole state. Called when control flow
@@ -2549,6 +2609,82 @@ mod sec_epoch_validator_tests {
             state.sec_has_verified(9, false),
             "without the opt-in the query degrades to the raw predicate"
         );
+    }
+}
+
+#[cfg(test)]
+mod call_ret_vector_residency_tests {
+    use super::*;
+    use crate::ir::reexports::IrConst;
+
+    fn copy(dest: u32, src: Operand) -> Instruction {
+        Instruction::Copy {
+            dest: Value(dest),
+            src,
+        }
+    }
+
+    fn resident(ids: &[u32]) -> CodegenState {
+        let mut state = CodegenState::new();
+        state.call_ret_vector_in_xmm0.extend(ids.iter().copied());
+        state
+    }
+
+    /// Value ids restart in every function: an id left behind names an
+    /// unrelated value of the next one, whose `return` then skipped the load
+    /// of its result (`c_ptr` at `-O1 -mavx2` returned its own argument).
+    #[test]
+    fn a_function_boundary_ends_residency() {
+        let mut state = resident(&[5, 9]);
+        state.reset_for_function();
+        assert!(state.call_ret_vector_in_xmm0.is_empty());
+    }
+
+    /// The next block is also reached from predecessors that never made the
+    /// call, so even a rename at its head must not find the value resident.
+    #[test]
+    fn a_block_boundary_ends_residency() {
+        let mut state = resident(&[5]);
+        state.end_call_ret_vector_residency();
+        assert!(state.call_ret_vector_in_xmm0.is_empty());
+        state.expire_call_ret_vector_residency(&copy(6, Operand::Value(Value(5))));
+        assert!(state.call_ret_vector_in_xmm0.is_empty());
+    }
+
+    #[test]
+    fn a_rename_of_a_resident_value_keeps_it() {
+        let mut state = resident(&[5]);
+        state.expire_call_ret_vector_residency(&copy(6, Operand::Value(Value(5))));
+        assert!(state.call_ret_vector_in_xmm0.contains(&5));
+    }
+
+    /// Everything else may write the register: the hidden-buffer copy of
+    /// `c_rvo` at `-O0 -mavx2` travelled through `%xmm0` and the `return`
+    /// behind it still skipped the reload of `%ymm0`.
+    #[test]
+    fn every_other_instruction_ends_residency() {
+        let unrelated_copy = copy(6, Operand::Value(Value(7)));
+        let constant_copy = copy(6, Operand::Const(IrConst::I64(0)));
+        let block_copy = Instruction::Memcpy {
+            dest: Value(1),
+            src: Value(2),
+            size: 32,
+        };
+        for inst in [unrelated_copy, constant_copy, block_copy] {
+            let mut state = resident(&[5]);
+            state.expire_call_ret_vector_residency(&inst);
+            assert!(state.call_ret_vector_in_xmm0.is_empty(), "{inst:?}");
+        }
+    }
+
+    /// Announcing a scratch clobber is not the end of residency: the generic
+    /// driver announces one ahead of every `Copy`, renames included, and the
+    /// rename chain would never be followed.
+    #[test]
+    fn a_scratch_announcement_leaves_residency_to_the_instruction_rule() {
+        let mut state = resident(&[5]);
+        state.invalidate_vec_scratch_peephole();
+        assert!(state.call_ret_vector_in_xmm0.contains(&5));
     }
 }
 

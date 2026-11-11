@@ -213,6 +213,19 @@ impl BasicBlock {
         }
     }
 
+    /// Index of the first instruction of the block's return tail
+    /// ([`Instruction::is_return_tail`]): where code that must run before
+    /// the block returns is inserted.  The block length when there is none.
+    pub fn return_tail_start(&self) -> usize {
+        let tail = self
+            .instructions
+            .iter()
+            .rev()
+            .take_while(|inst| inst.is_return_tail())
+            .count();
+        self.instructions.len() - tail
+    }
+
     /// Append `inst`.
     pub fn push_inst(&mut self, inst: Instruction, span: Span) {
         let at = self.instructions.len();
@@ -518,6 +531,15 @@ pub struct CallInfo {
     pub struct_arg_is_f128_sse: Vec<bool>,
     /// True if the return value is _Float128 (ONE 16-byte XMM register).
     pub ret_is_f128_sse: bool,
+    /// True if the return value is a 16-byte vector (`__m128`, `__m128i`,
+    /// `__m128d`): psABI classes `[Sse, SseUp]`, the whole value in `%xmm0`.
+    ///
+    /// The IR carries such a value as packed `I64` (`IrType` has no vector
+    /// variant), so without this bit the backend stores the result as two
+    /// independent I64 halves read out through `%rax`/`%rdx` -- a spill, two
+    /// reloads and two GPR stores for what is one `movdqu %xmm0` to a home or,
+    /// when the value has no home, one register left in place.
+    pub ret_is_vector128: bool,
     /// True if the call uses a hidden pointer argument for struct returns (i386 SysV ABI).
     pub is_sret: bool,
     /// True if the callee uses the fastcall calling convention.
@@ -989,6 +1011,30 @@ pub enum Terminator {
 // === Instruction impl: dest, result_type, value visitors ===
 
 impl Instruction {
+    /// Whether this instruction loads a return register for the `Return`
+    /// that ends its block, so it has to stay next to that terminator: the
+    /// second register of a two-register floating-point return, or
+    /// `__builtin_return`'s reload of every return register.
+    ///
+    /// A pass that inserts code "just before the return" inserts it before
+    /// these ([`BasicBlock::return_tail_start`]); whatever it adds would
+    /// otherwise run between the load and the `ret` and overwrite the
+    /// register.  A canary check after `__builtin_return` returned the
+    /// canary, and an `-finstrument-functions` exit hook returned the
+    /// hook's leftovers in place of a `_Complex double`'s imaginary part.
+    pub fn is_return_tail(&self) -> bool {
+        matches!(
+            self,
+            Instruction::SetReturnF64Second { .. }
+                | Instruction::SetReturnF32Second { .. }
+                | Instruction::SetReturnF128Second { .. }
+                | Instruction::Intrinsic {
+                    op: IntrinsicOp::RestoreApplyResult,
+                    ..
+                }
+        )
+    }
+
     /// Get the destination value defined by this instruction, if any.
     /// Instructions like Store, Memcpy, VaStart, VaEnd, VaCopy, AtomicStore,
     /// Fence, and InlineAsm produce no value.

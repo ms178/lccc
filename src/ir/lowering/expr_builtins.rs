@@ -691,6 +691,7 @@ impl Lowerer {
                         assume_library: true,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,
+                        ret_is_vector128: false,
                         cold: false,
                     },
                 });
@@ -1897,6 +1898,7 @@ impl Lowerer {
                         assume_library: false,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,
+                        ret_is_vector128: false,
                         cold: false,
                     },
                 });
@@ -2174,6 +2176,7 @@ impl Lowerer {
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 cold: false,
             },
         });

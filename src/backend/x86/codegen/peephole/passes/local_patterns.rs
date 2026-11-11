@@ -1586,6 +1586,12 @@ mod highbit_sub_tests {
 }
 
 pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    /// Stack stores the reverse-move fold looks past between `movq %a, %b`
+    /// and the `movq %b, %a` it retires: seven instructions after the first
+    /// move are examined in all, the reach the fold had when it counted
+    /// lines.
+    const REVERSE_MOVE_STORES: usize = 6;
+
     let mut changed = false;
     let len = store.len();
     let mut label_refs = super::dead_writes::LazyLabelRefs::default();
@@ -1897,22 +1903,31 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             && src.starts_with('%')
                             && dst.starts_with('%')
                         {
-                            // Find the next non-NOP, non-StoreRbp instruction.
-                            // Limit search to 8 lines to avoid pathological scanning.
+                            // Find the next instruction that is not a
+                            // StoreRbp, looking past at most
+                            // `REVERSE_MOVE_STORES` of those.  The bound is
+                            // on INSTRUCTIONS, not on line indices: deleted
+                            // lines and hidden `-g` rows occupy indices, and
+                            // an index bound made the same function lose
+                            // this fold under `-g` when three debug rows sat
+                            // between the stores (simd_defer_chain.c).
                             let mut j = i + 1;
-                            let search_limit = (i + 8).min(len);
-                            while j < search_limit {
+                            let mut stores = 0usize;
+                            while j < len {
                                 if debug_transparent(store, infos[j], j) {
                                     j += 1;
                                     continue;
                                 }
-                                if matches!(infos[j].kind, LineKind::StoreRbp { .. }) {
+                                if matches!(infos[j].kind, LineKind::StoreRbp { .. })
+                                    && stores < REVERSE_MOVE_STORES
+                                {
+                                    stores += 1;
                                     j += 1;
                                     continue;
                                 }
                                 break;
                             }
-                            if j < search_limit {
+                            if j < len {
                                 // Check if line j is the reverse: movq %dstReg, %srcReg
                                 if let LineKind::Other { dest_reg: dest_b } = infos[j].kind {
                                     if dest_b == src_fam {

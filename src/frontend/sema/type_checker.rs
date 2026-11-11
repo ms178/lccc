@@ -1150,8 +1150,14 @@ impl<'a> ExprTypeChecker<'a> {
                 CType::Vector(Box::new(self.resolve_type_spec(elem)), *total_bytes)
             }
             TypeSpecifier::Typeof(expr, _) => {
-                // typeof(expr): try to infer the expression's type
-                self.infer_expr_ctype(expr).unwrap_or(CType::Int)
+                // `typeof(expr)`: the operand's inferred type.  `CType::Int`
+                // is a recovery-only value, exactly as in
+                // `resolve_type_spec_with_scope`, where the contract is
+                // stated in full.
+                self.infer_expr_ctype(expr).unwrap_or_else(|| {
+                    super::typeof_recovery::record_fallback(expr);
+                    CType::Int
+                })
             }
             TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype, abi) => {
                 let ret_ct = self.resolve_type_spec(ret);
@@ -1864,8 +1870,32 @@ impl<'a> ExprTypeChecker<'a> {
                 if let Some(ctype) = self.infer_expr_ctype_with_scope(expr, scope) {
                     return ctype;
                 }
-                // TODO: report diagnostic for unresolved typeof expression
-                CType::Int // fallback
+                // Contract: `CType::Int` here is recovery-only.  It is never
+                // the type of a program that compiles.
+                //
+                // An operand reaches this line only when neither the symbol
+                // table nor the local scope can type it, and sema has by then
+                // rejected the translation unit: `analyze_unevaluated` walks
+                // every `typeof` operand and reports the undeclared
+                // identifier (or the implicit declaration) with the operand's
+                // own span.  A diagnostic issued here would double-report
+                // that error, once at the operand and once at the declaration
+                // that names its type.  `int` is what lets the rest of the
+                // declaration be checked, so one mistake yields one message
+                // instead of a cascade.
+                //
+                // `tests/corpus/test_typeof_unresolved_fallback.py` holds the
+                // evidence: fifteen unresolvable operand shapes, each rejected
+                // by this compiler, GCC 16.2 and Clang 23.1.5 with a message
+                // that names the operand, and a positive matrix whose output
+                // is bit-identical across the three.
+                //
+                // `typeof_recovery::record_fallback` makes the recovery
+                // observable (`LCCC_TYPEOF_RECOVERY_TRACE`), so the tests can
+                // check the contract in both directions instead of trusting
+                // this comment.
+                super::typeof_recovery::record_fallback(expr);
+                CType::Int
             }
             TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec_with_scope(inner, scope),
             _ => self.resolve_type_spec(ts),

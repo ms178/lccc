@@ -929,6 +929,7 @@ fn build_outlined_function(
         global_init_label_blocks: Vec::new(),
         ret_eightbyte_classes: Vec::new(),
         ret_is_f128_sse: false,
+        ret_is_vector128: false,
         // Synthesized: the outlined body has no opening brace of its own.
         decl_span: crate::common::source::Span::dummy(),
         body_span: crate::common::source::Span::dummy(),
@@ -1357,6 +1358,7 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
         assume_library: info.assume_library,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
         ret_is_f128_sse: info.ret_is_f128_sse,
+        ret_is_vector128: info.ret_is_vector128,
         cold: info.cold,
     }
 }
@@ -1504,6 +1506,7 @@ fn replace_case_with_call(
                 assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 cold: false,
             },
         };
@@ -1551,6 +1554,7 @@ fn replace_case_with_call(
                 assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 cold: false,
             },
         };

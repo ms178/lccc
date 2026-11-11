@@ -755,6 +755,7 @@ impl Lowerer {
                 assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 cold: false,
             },
         });
@@ -1810,6 +1811,14 @@ impl Lowerer {
                 f.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
             });
         let mut ret_is_f128_sse = full_ret_ctype.is_half_float() || ms_integer128_return;
+        // A 16-byte vector (`__m128`/`__m128i`/`__m128d`) returns in ONE
+        // `%xmm0` with psABI classes `[Sse, SseUp]`.  The IR carries its
+        // value as packed `I64`, so the class is the ONLY thing that tells
+        // the backend "one register, not two halves" -- see
+        // `Instruction::CallInfo::ret_is_vector128`.
+        let ret_is_vector128 = !crate::common::types::target_is_32bit()
+            && full_ret_ctype.is_vector()
+            && self.sizeof_type(ret_type_spec) == 16;
         let ret_eightbyte_classes = if ms_integer128_return {
             vec![
                 crate::common::types::EightbyteClass::Sse,
@@ -2007,6 +2016,7 @@ impl Lowerer {
                 two_reg_ret_size,
                 ret_eightbyte_classes: ret_eightbyte_classes.clone(),
                 ret_is_f128_sse,
+                ret_is_vector128,
                 ret_fp_agg_class,
                 ret_x87_aggregate,
                 ret_x87_pair,
@@ -2027,6 +2037,7 @@ impl Lowerer {
                 two_reg_ret_size,
                 ret_eightbyte_classes,
                 ret_is_f128_sse,
+                ret_is_vector128,
                 ret_fp_agg_class,
                 ret_x87_aggregate,
                 ret_x87_pair,
@@ -2665,6 +2676,7 @@ impl Lowerer {
                     regparm: None,
                     ret_eightbyte_classes: Vec::new(),
                     ret_is_f128_sse: false,
+                    ret_is_vector128: false,
                     is_const: false,
                     assume_library: false,
                     is_pure: false,
@@ -2723,6 +2735,7 @@ impl Lowerer {
                 assume_library: false,
                 ret_eightbyte_classes: ret_classes,
                 ret_is_f128_sse: ret_is_f128,
+                ret_is_vector128: false,
                 cold: false,
             },
         });
@@ -3198,6 +3211,7 @@ impl Lowerer {
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 cold: false,
             },
         });
@@ -3241,6 +3255,7 @@ impl Lowerer {
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 cold: false,
             },
         });
@@ -3279,6 +3294,7 @@ impl Lowerer {
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 cold: false,
             },
         });

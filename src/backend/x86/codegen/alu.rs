@@ -3151,6 +3151,31 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
+        // A 16-byte value that lives in `%xmm0` (a vector argument or a
+        // vector return) copies register-to-register.  `operand_to_rax_rdx`
+        // would first spill it to the stack and read it back as two GPR
+        // halves, and `store_rax_rdx_to` would then rebuild it from those
+        // halves -- four memory operations and two false GPR dependencies to
+        // move one `%xmm` register.
+        //
+        // Only the SOURCE decides.  The destination is being defined here;
+        // asking whether it is resident let a redefinition (a sequenced
+        // parallel copy, or simply a stale id) store whatever `%xmm0` held
+        // into its home instead of copying `src`.
+        if matches!(src, Operand::Value(v) if self.state.call_ret_vector_in_xmm0.contains(&v.0)) {
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                let (mov, reg) = super::calls::vector_reg_move(16, 0);
+                self.state
+                    .out
+                    .emit_instr_reg_rbp(&format!("    {mov}"), &reg, slot.0);
+                self.state.i128_values.insert(dest.0);
+                self.state.f128_direct_slots.insert(dest.0);
+            } else {
+                self.state.call_ret_vector_in_xmm0.insert(dest.0);
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
         self.operand_to_rax_rdx(src);
         self.store_rax_rdx_to(dest);
     }

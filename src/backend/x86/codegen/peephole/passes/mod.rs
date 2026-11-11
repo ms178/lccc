@@ -52,6 +52,7 @@ mod logical_narrow_test;
 mod loop_trampoline;
 mod mask_test;
 mod memory_fold;
+mod multiword;
 mod narrow_copy_fold;
 mod pow2_cmov;
 mod push_pop;
@@ -68,6 +69,7 @@ mod store_forwarding;
 mod tail_call;
 mod vector_broadcast;
 mod vector_copy;
+mod vector_load_op_fuse;
 mod vex_promote;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -1182,6 +1184,15 @@ fn peephole_optimize_inner(
             trace("fuse_load_into_alu", pass_count, c, &store, &infos);
             changed |= c;
         }
+        // Vector (SSE/AVX) load -> ALU memory-operand fusion: the packed and
+        // scalar half of the transform above, which cannot share its GP-only
+        // register model.  See vector_load_op_fuse.rs for the soundness
+        // argument and the liveness-monotonicity proof.
+        if !sk("vector_load_fuse") {
+            let c = vector_load_op_fuse::fuse_vector_load_into_op(&mut store, &mut infos);
+            trace("fuse_vector_load_into_op", pass_count, c, &store, &infos);
+            changed |= c;
+        }
         // Load -> LEA-add in-place (`mov MEM,%t; leaq (%acc,%t,1),%s` ->
         // `add MEM,%acc` + rename the chain uses). One transform, one switch:
         // `CCC_PEEPHOLE_SKIP=load_lea_inplace` bisects it independently of the
@@ -1476,6 +1487,22 @@ fn peephole_optimize_inner(
         if !sk("setcc_increment") {
             let c = flag_peepholes::fold_setcc_increment(&mut store, &mut infos);
             trace("fold_setcc_increment", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        // The carry twins of that fold (`s = a + b; hi += s < a`): drop the
+        // compare that recomputes the carry of the add before it, turn the
+        // widened carry byte into `adc`/`sbb`, and fold the addend that
+        // follows a carry-in into it.  Any order is sound; this one settles
+        // in a single iteration.
+        if !sk("multiword") {
+            let c = multiword::fold_carry_compare(&mut store, &mut infos);
+            trace("fold_carry_compare", pass_count, c, &store, &infos);
+            changed |= c;
+            let c = multiword::fold_carry_into_adc(&mut store, &mut infos);
+            trace("fold_carry_into_adc", pass_count, c, &store, &infos);
+            changed |= c;
+            let c = multiword::fold_carry_addend(&mut store, &mut infos);
+            trace("fold_carry_addend", pass_count, c, &store, &infos);
             changed |= c;
         }
         if !sk("acc_roundtrip") {
@@ -2434,6 +2461,11 @@ fn peephole_optimize_inner(
 
     if !sk("div_rem_fusion") {
         div_rem_fusion::run(&mut store, &mut infos);
+    }
+    // The product twin: one `mul` already holds the low half an `imul` of
+    // the same factors recomputes (idempotent, so no loop).
+    if !sk("multiword") {
+        multiword::fold_product_pair(&mut store, &mut infos);
     }
     if !sk("logical_narrow_test") {
         logical_narrow_test::run(&mut store, &mut infos);

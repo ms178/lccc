@@ -10993,12 +10993,12 @@ fn parse_map_operand(
 //     exit    = vextracti128+vpaddq+vpshufd+vpaddq+movq  (horizontal)
 // ```
 //
-// The tree is first normalised so every 0/1-valued `Select(m, 1, 0)` and
-// `Select(m, 0, 1)` becomes `m & 1`: in the PACKED world a compare mask is
-// all-ones/all-zeros per lane, so `m & 1` is exactly the lane's 0/1; in the
-// SCALAR world a setcc is 0/1, so `m & 1` is the setcc.  The rewrite is
-// therefore exact in BOTH interpreter worlds — no packed-only caveat —
-// and it deletes a `vpblendvb` (two uops) from every classifier kernel.
+// The tree is first normalised so `Select(m, 1, 0)` becomes `m & 1`, while
+// `Select(m, 0, 1)` becomes `(m & 1) ^ 1`: in the PACKED world a compare mask
+// is all-ones/all-zeros per lane, so these expressions produce exact 0/1
+// values; in the SCALAR world a setcc is already 0/1 and the same bitwise
+// identities hold. This removes blends without changing inverted-predicate
+// lanes.
 //
 // The accumulator runs in u64x4 even when the source accumulator is `int`:
 // the true count cannot exceed the element count, and the mod-2^32
@@ -11059,6 +11059,24 @@ fn is_scalar_zero_one_tree(expr: &MapExpr) -> bool {
     }
 }
 
+/// Convert a packed representation of a scalar 0/1-valued expression back to
+/// its C value representation.  Packed comparisons yield all-one lanes, while
+/// scalar comparisons yield 1; blends preserve those all-one lanes when a
+/// comparison is selected as a value.  Masking the completed boolean tree with
+/// one is exact for both 0/1 and 0/-1 lane encodings and prevents a vectorized
+/// classifier from storing 0xFF where C requires 1.
+fn canonicalize_packed_zero_one_value(expr: MapExpr) -> MapExpr {
+    if is_scalar_zero_one_tree(&expr) {
+        MapExpr::BinOp(
+            IrBinOp::And,
+            Box::new(expr),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(1)))),
+        )
+    } else {
+        expr
+    }
+}
+
 /// Rewrite every 0/1-valued select to mask arithmetic, bottom-up:
 /// `Select(m, 1, 0)` and `Select(m, 0, 1)` become `m & 1` (exact in both
 /// interpreter worlds — see the section comment), and any other
@@ -11096,9 +11114,18 @@ fn rewrite_zero_one_selects(expr: MapExpr) -> MapExpr {
         };
         if let (Some(tv), Some(fv)) = (const01(t), const01(f)) {
             if (tv == 1 && fv == 0) || (tv == 0 && fv == 1) {
-                // `m ? 1 : 0` == `m ? 0 : 1` == `m & 1` for mask/setcc m.
-                let konst = if tv == 1 { t.clone() } else { f.clone() };
-                return MapExpr::BinOp(IrBinOp::And, c.clone(), konst);
+                // In the packed tree a comparison is 0x00/0xFF per lane.
+                // `m ? 1 : 0` is therefore `m & 1`; the opposite polarity
+                // is its complement, `(m & 1) ^ 1`.  Do not collapse both
+                // arm orders to the positive mask: that changes every false
+                // lane of `m ? 0 : 1` from one to zero.
+                let one = if tv == 1 { t.clone() } else { f.clone() };
+                let bit = MapExpr::BinOp(IrBinOp::And, c.clone(), one.clone());
+                return if tv == 1 {
+                    bit
+                } else {
+                    MapExpr::BinOp(IrBinOp::Xor, Box::new(bit), one)
+                };
             }
         }
     }
@@ -33324,6 +33351,15 @@ fn transform_map_vector(
     let packed_expr = match map_lane_bits(&pattern.elem_ty) {
         Some(_) => {
             let reduced = strength_reduce_mask_select(&expr);
+            // The mask-select reduction handles the common direct `m ? 1 :
+            // 0` shape.  If-conversion can produce a nested short-circuit
+            // select whose false arm is itself a boolean-valued select; the
+            // outer blend then returns the raw 0xFF comparison mask for true
+            // lanes.  Canonicalize the final value, not its condition, so
+            // arbitrary scalar-valued maps remain untouched and C's required
+            // 0/1 result is preserved in both packed and scalar-remainder
+            // domains.
+            let reduced = canonicalize_packed_zero_one_value(reduced);
             if map_tree_ops_available(
                 &reduced,
                 &bin_op,
@@ -37667,6 +37703,71 @@ mod byte_lane_demotion_tests {
                 matches!(u, IrCmpOp::Eq | IrCmpOp::Ne)
             );
         }
+    }
+
+    #[test]
+    fn packed_boolean_values_are_canonical_zero_or_one() {
+        let cmp = MapExpr::Cmp(
+            IrCmpOp::Ule,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(90)))),
+        );
+        let one = MapExpr::Invariant(Operand::Const(IrConst::I32(1)));
+        let zero = MapExpr::Invariant(Operand::Const(IrConst::I32(0)));
+        let nested = MapExpr::Select(
+            Box::new(cmp.clone()),
+            Box::new(one.clone()),
+            Box::new(MapExpr::Select(
+                Box::new(cmp.clone()),
+                Box::new(one.clone()),
+                Box::new(zero),
+            )),
+        );
+        assert!(is_scalar_zero_one_tree(&nested));
+        let expected = MapExpr::BinOp(
+            IrBinOp::And,
+            Box::new(strength_reduce_mask_select(&nested)),
+            Box::new(one),
+        );
+        assert_eq!(
+            canonicalize_packed_zero_one_value(strength_reduce_mask_select(&nested)),
+            expected
+        );
+
+        // Non-boolean byte maps must not be truncated to one bit.
+        let value = MapExpr::BinOp(
+            IrBinOp::Add,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(1)))),
+        );
+        assert_eq!(canonicalize_packed_zero_one_value(value.clone()), value);
+    }
+
+    #[test]
+    fn inverted_zero_one_select_keeps_the_false_lane_set() {
+        let cmp = MapExpr::Cmp(
+            IrCmpOp::Eq,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(7)))),
+        );
+        let one = MapExpr::Invariant(Operand::Const(IrConst::I32(1)));
+        let select = MapExpr::Select(
+            Box::new(cmp.clone()),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(0)))),
+            Box::new(one.clone()),
+        );
+        assert_eq!(
+            rewrite_zero_one_selects(select),
+            MapExpr::BinOp(
+                IrBinOp::Xor,
+                Box::new(MapExpr::BinOp(
+                    IrBinOp::And,
+                    Box::new(cmp),
+                    Box::new(one.clone())
+                )),
+                Box::new(one),
+            )
+        );
     }
 
     /// `m ? x + k : x` must become `x + (m & k)`, and `m ? k : 0` must become

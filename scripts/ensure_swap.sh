@@ -20,6 +20,30 @@ else
     exit 1
 fi
 
+# Total active swap, in KiB, from /proc/swaps (the authoritative view: it
+# reports every activated area, whatever its path or backing device).
+active_swap_kib() {
+    [[ -r /proc/swaps ]] || { echo 0; return; }
+    awk 'NR > 1 { total += $3 } END { print total + 0 }' /proc/swaps
+}
+
+# Any active area that already provides the budget satisfies the requirement.
+# A harness may hand back a correctly sized swap under another name
+# (/swap.img, a zram device, a partition); insisting on our own path would
+# allocate a *second* image, spend disk the build needs, and — on a host
+# whose swap is already live — risk activating a file whose pages are in use.
+# The contract is "the build runs with at least $size of active swap", not
+# "a file named $swapfile exists": the wrong-size check below still pins our
+# own file to exactly $size.
+# `mkswap` reserves one page for the swap header, so a file of exactly
+# $wanted_bytes reports one page less in /proc/swaps (4 GiB -> 4194300 KiB).
+# Allow that single page of slack; anything smaller is a genuinely smaller
+# area and does not satisfy the budget.
+if (( $(active_swap_kib) * 1024 + 4096 >= wanted_bytes )); then
+    /sbin/swapon --show
+    exit 0
+fi
+
 if [[ -r /proc/swaps ]] && grep -Fq "$swapfile" /proc/swaps; then
     if [[ -e "$swapfile" ]] && [[ $(stat -c %s "$swapfile") -eq $wanted_bytes ]]; then
         /sbin/swapon --show
@@ -70,11 +94,16 @@ fi
 # mkswap is idempotent for our disposable file and refreshes a partially
 # created header after an interrupted harness turn.
 "${privilege[@]}" /sbin/mkswap "$swapfile" >/dev/null
-if ! "${privilege[@]}" /sbin/swapon "$swapfile" 2>/tmp/lccc-swapon.err; then
+# A fixed /tmp path can be owned by root from an earlier sudo run, making the
+# calling user's redirection fail before swapon is even attempted. Create the
+# diagnostic file as the calling user and let the privileged child write to it.
+swapon_err=$(mktemp "${TMPDIR:-/tmp}/lccc-swapon.XXXXXX")
+trap 'rm -f "$swapon_err"' EXIT
+if ! "${privilege[@]}" /sbin/swapon "$swapfile" 2>"$swapon_err"; then
     # Some sandboxes (unprivileged containers, no CAP_SYS_ADMIN) refuse
     # swapon even as root. The 4G file is still useful as a tmp spill
     # target; do not fail the compiler build.
-    echo "warning: swapon $swapfile failed (continuing without swap): $(tr '\n' ' ' </tmp/lccc-swapon.err)" >&2
+    echo "warning: swapon $swapfile failed (continuing without swap): $(tr '\n' ' ' <"$swapon_err")" >&2
     exit 0
 fi
 

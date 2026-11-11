@@ -2022,6 +2022,11 @@ impl X86Codegen {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         if let Some(dest) = dest {
+            // The register still holds the value.  Record it so a following
+            // `return dest;` emits no further traffic; anything that clobbers
+            // `%ymm0` removes the entry (see `call_ret_vector_in_xmm0`).
+            self.state.call_ret_vector_in_xmm0.insert(dest.0);
+            self.state.i128_values.insert(dest.0);
             self.store_rax_to(dest);
         }
     }
@@ -2135,18 +2140,72 @@ impl X86Codegen {
             // Mark the dest as a 16-byte payload value: its slot holds the
             // DATA directly (resolve_slot_addr must answer Direct, and
             // copies/loads/stores must treat it as full 128-bit).
+            // Derive the fact from the classes themselves rather than from a
+            // propagated flag: a 16-byte vector is `[Sse, SseUp]`, while
+            // `_Float128` -- the other 16-byte `%xmm0` carrier with
+            // `IrType::I128` storage -- is `[Sse, Sse]` (see
+            // `lower.rs`, which assigns exactly those two vectors).  The two
+            // are therefore disjoint by construction and need no extra
+            // bookkeeping across the lowering boundary.
+            let is_vector128 = return_type == IrType::I128
+                && self.call_ret_classes[..]
+                    == [
+                        crate::common::types::EightbyteClass::Sse,
+                        crate::common::types::EightbyteClass::SseUp,
+                    ];
+            if is_vector128 && self.state.get_slot(dest.0).is_none() {
+                // No home: the value stays in `%xmm0` and its consumers read
+                // it from there (`emit_copy_i128`), so the copy chain never
+                // touches the stack at all.  This is the case that made
+                // `v8 f(v8 a){ return ext8(a); }` 13 instructions instead of 1.
+                self.state.call_ret_vector_in_xmm0.insert(dest.0);
+                self.state.i128_values.insert(dest.0);
+                self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                return;
+            }
             if let Some(slot) = self.state.get_slot(dest.0) {
-                self.state.out.emit_instr_reg_rbp(
-                    &format!("    {}", self.xmm_move(false)),
-                    "xmm0",
-                    slot.0,
-                );
+                // A 16-byte VECTOR uses an unaligned move: its home is a
+                // stack slot or a caller buffer whose alignment the frame
+                // does not promise beyond 16, and the psABI classifies it
+                // [Sse, SseUp] with no alignment requirement.  _Float128
+                // keeps xmm_move, whose aligned form that ABI does promise.
+                let (mov, reg) = if is_vector128 {
+                    let (m, r) = vector_reg_move(16, 0);
+                    (m.to_string(), r)
+                } else {
+                    (self.xmm_move(false).to_string(), "xmm0".to_string())
+                };
+                self.state
+                    .out
+                    .emit_instr_reg_rbp(&format!("    {mov}"), &reg, slot.0);
                 self.state.i128_values.insert(dest.0);
                 self.state.f128_direct_slots.insert(dest.0);
             }
             self.state.reg_cache.invalidate_all();
             self.flush_pending_vec_store_impl();
             self.state.invalidate_vec_peephole();
+            return;
+        }
+        // A 16-byte vector returned in ONE `%xmm0` (`__m128`, `__m128i`,
+        // `__m128d`): psABI classes `[Sse, SseUp]`, the whole value in
+        // `%xmm0`.  The IR carries it as packed `I64` only because `IrType`
+        // has no vector variant, so without this arm the generic path stores
+        // the result as TWO INDEPENDENT I64 halves:
+        //
+        //     movdqu %xmm0, (%rsp)          # spill the whole vector
+        //     movq (%rsp), %rax             # half 0 out through a GPR
+        //     movq 8(%rsp), %rdx            # half 1 out through a GPR
+        //     ... a store each for %rax and %rdx ...
+        //
+        // which is a full register round trip and two false GPR dependencies
+        // for one `movdqu %xmm0` to the destination's home.  This is the
+        // 128-bit half of the same defect that made `_mm256_fmadd_ps` 28
+        // instructions; the 256/512-bit half goes through
+        // `emit_call_store_vector_return`.
+        if self.call_ret_is_vector128 {
+            self.emit_call_store_vector128(dest);
             return;
         }
         // One SSE eightbyte (`struct { float x, y; }`, `struct { double }`,
@@ -2244,6 +2303,31 @@ impl X86Codegen {
         } else {
             self.store_rax_to(dest);
         }
+    }
+
+    /// Home a 16-byte vector call result (`call_ret_is_vector128`) without
+    /// routing it through the general registers.
+    ///
+    /// A `%xmm0` value carried as `IrType::I128` has no other store path: the
+    /// generic one splits it into two `I64` halves, each of which spills,
+    /// reloads and stores through `%rax`/`%rdx`. One `movdqu %xmm0` to the
+    /// destination's home is the whole job, and marking the value as a
+    /// 128-bit payload keeps later loads, stores and copies width-exact.
+    fn emit_call_store_vector128(&mut self, dest: &Value) {
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            // `vector_reg_move` keeps the SSE1 `movups` spelling on targets
+            // without SSE2, exactly like every other 16-byte carrier move.
+            let (mov, reg) = vector_reg_move(16, 0);
+            self.state
+                .out
+                .emit_instr_reg_rbp(&format!("    {mov}"), &reg, slot.0);
+            // The slot holds 16 bytes of DATA: a later 128-bit load, store or
+            // copy of this value must see the whole register, not one half.
+            self.state.i128_values.insert(dest.0);
+        }
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
     }
 
     pub(super) fn emit_call_store_i128_result_impl(&mut self, dest: &Value) {
