@@ -1545,11 +1545,24 @@ pub(super) fn next_non_nop(infos: &[LineInfo], start: usize, limit: usize) -> us
 /// deleted line consumes no budget, which is the same rule every walker
 /// applies to control flow.
 #[inline]
-pub(super) fn window_end(infos: &[LineInfo], start: usize, lines: usize, limit: usize) -> usize {
+pub(super) fn window_end(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    lines: usize,
+    limit: usize,
+) -> usize {
     let mut j = start;
     let mut seen = 0;
     while j < limit && seen < lines {
-        if !infos[j].is_nop() {
+        // The test is `debug_transparent`, not `is_nop`, on purpose: it is the
+        // exact predicate every adjacency walk uses, so the budget agrees with
+        // the walk it bounds whether or not `hide_debug_rows` has run yet.  A
+        // budget keyed on `is_nop` alone silently reintroduced the `-g`
+        // divergence in any pass exercised before hiding (the peephole unit
+        // tests do exactly that), which is the class of dependency this helper
+        // exists to remove.
+        if !debug_transparent(store, infos[j], j) {
             seen += 1;
         }
         j += 1;

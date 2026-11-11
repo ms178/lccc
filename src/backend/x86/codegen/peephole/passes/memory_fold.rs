@@ -155,7 +155,7 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
             // Find the next steady line (skip only deleted rows, not other
             // instructions).  The budget counts lines the passes can see, so a
             // hidden `-g` row cannot consume part of it.
-            let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+            let j = next_non_debug(store, infos, i + 1, window_end(store, infos, i + 1, 3, len));
             if j >= len {
                 i += 1;
                 continue;

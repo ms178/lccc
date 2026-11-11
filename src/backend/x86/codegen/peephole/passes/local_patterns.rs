@@ -1904,7 +1904,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             // between the two moves must not spend it (see
                             // `window_end`).
                             let mut j = i + 1;
-                            let search_limit = window_end(infos, i + 1, 8, len);
+                            let search_limit = window_end(store, infos, i + 1, 8, len);
                             while j < search_limit {
                                 if debug_transparent(store, infos[j], j) {
                                     j += 1;
@@ -2259,7 +2259,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         let mut ext_idx = i + 1;
         // Budget of 10 STEADY lines (see `window_end`): a `-g` row must not
         // spend part of it and change which extension the pass fuses.
-        let ext_limit = window_end(infos, i + 1, 10, len);
+        let ext_limit = window_end(store, infos, i + 1, 10, len);
         while ext_idx < ext_limit {
             if debug_transparent(store, infos[ext_idx], ext_idx) {
                 ext_idx += 1;
@@ -2461,7 +2461,7 @@ pub(super) fn eliminate_dead_sign_extensions(
                     let mut j = i + 1;
                     let mut found_re_extend = false;
                     // 4 STEADY lines, not raw indices (see `window_end`).
-                    let re_ext_limit = window_end(infos, i + 1, 4, len);
+                    let re_ext_limit = window_end(store, infos, i + 1, 4, len);
                     while j < re_ext_limit {
                         if infos[j].is_nop() {
                             j += 1;
@@ -2501,7 +2501,7 @@ pub(super) fn eliminate_dead_sign_extensions(
             let mut j = i + 1;
             let mut can_eliminate = false;
             // 8 STEADY lines, not raw indices (see `window_end`).
-            let cltq_limit = window_end(infos, i + 1, 8, len);
+            let cltq_limit = window_end(store, infos, i + 1, 8, len);
             while j < cltq_limit {
                 if infos[j].is_nop() {
                     j += 1;
@@ -2786,7 +2786,7 @@ pub(super) fn eliminate_dead_sign_extensions(
                         let reg32_suffix = src; // e.g. "%ebx"
                         let reg64_name = dst; // e.g. "%rbx"
                         // 12 STEADY lines, not raw indices (see `window_end`).
-                        let sub3b_limit = window_end(infos, i + 1, 12, len);
+                        let sub3b_limit = window_end(store, infos, i + 1, 12, len);
                         let mut j2 = i + 1;
                         let mut can_eliminate = false;
                         while j2 < sub3b_limit {
@@ -4099,7 +4099,8 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                 // Skip the (hidden) `-g` rows to the next steady line; the walk
                 // is bounded by the line budget, not by a raw index count, so a
                 // `.loc` row cannot change which instruction is reached.
-                let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+                let j =
+                    next_non_debug(store, infos, i + 1, window_end(store, infos, i + 1, 3, len));
                 if j < len && !infos[j].is_nop() {
                     let line_j = infos[j].trimmed(store.get(j));
                     // Generalize to any %xmmN destination (the emitter rotates
@@ -4168,7 +4169,12 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
             if line_i.starts_with("movq %xmm") && line_i.ends_with(", %rax") {
                 let src_xmm = &line_i[5..line_i.len() - 6]; // strip "movq " and ", %rax"
                 if src_xmm.starts_with("%xmm") {
-                    let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+                    let j = next_non_debug(
+                        store,
+                        infos,
+                        i + 1,
+                        window_end(store, infos, i + 1, 3, len),
+                    );
                     if j < len {
                         if let LineKind::StoreRbp {
                             reg: 0,
@@ -4213,7 +4219,7 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
             size: MoveSize::Q,
         } = infos[i].kind
         {
-            let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+            let j = next_non_debug(store, infos, i + 1, window_end(store, infos, i + 1, 3, len));
             if j < len {
                 let line_j = infos[j].trimmed(store.get(j));
                 if line_j == "movq %rax, %xmm0" || line_j == "movq %rax, %xmm1" {
@@ -4249,7 +4255,8 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                 // Skip the (hidden) `-g` rows to the next steady line; the walk
                 // is bounded by the line budget, not by a raw index count, so a
                 // `.loc` row cannot change which instruction is reached.
-                let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+                let j =
+                    next_non_debug(store, infos, i + 1, window_end(store, infos, i + 1, 3, len));
                 if j < len {
                     let line_j = infos[j].trimmed(store.get(j));
                     let xmm = if line_j == "movq %rax, %xmm0" {
@@ -4293,7 +4300,8 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                 // Skip the (hidden) `-g` rows to the next steady line; the walk
                 // is bounded by the line budget, not by a raw index count, so a
                 // `.loc` row cannot change which instruction is reached.
-                let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+                let j =
+                    next_non_debug(store, infos, i + 1, window_end(store, infos, i + 1, 3, len));
                 if j < len {
                     let line_j = infos[j].trimmed(store.get(j));
                     if line_j.starts_with("movq %rax, %") && !line_j.ends_with("%xmm0") {
@@ -4381,7 +4389,8 @@ pub(super) fn fold_ptr_deref_through_stack(store: &mut LineStore, infos: &mut [L
                 // Skip the (hidden) `-g` rows to the next steady line; the walk
                 // is bounded by the line budget, not by a raw index count, so a
                 // `.loc` row cannot change which instruction is reached.
-                let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+                let j =
+                    next_non_debug(store, infos, i + 1, window_end(store, infos, i + 1, 3, len));
                 if j >= len {
                     i += 1;
                     continue;
@@ -5046,7 +5055,8 @@ pub(super) fn fuse_copy_and_operation(store: &mut LineStore, infos: &mut [LineIn
                 // Skip the (hidden) `-g` rows to the next steady line; the walk
                 // is bounded by the line budget, not by a raw index count, so a
                 // `.loc` row cannot change which instruction is reached.
-                let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+                let j =
+                    next_non_debug(store, infos, i + 1, window_end(store, infos, i + 1, 3, len));
                 if j >= len {
                     i += 1;
                     continue;
@@ -5241,7 +5251,12 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
                 let src_reg = &line_i[6..line_i.len() - 6]; // between "movq %" and ", %rcx"
                 // src_reg must not be "rcx" itself (no-op move) and must be a plain GPR
                 if src_reg != "rcx" && !src_reg.contains('(') && !src_reg.contains('$') {
-                    let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
+                    let j = next_non_debug(
+                        store,
+                        infos,
+                        i + 1,
+                        window_end(store, infos, i + 1, 3, len),
+                    );
                     if j < len {
                         let line_j = infos[j].trimmed(store.get(j));
 

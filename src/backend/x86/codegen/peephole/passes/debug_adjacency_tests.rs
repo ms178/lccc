@@ -88,3 +88,60 @@ fn debug_adjacency_never_crosses_semantic_or_pinned_lines() {
         assert!(!debug_transparent(&store, info, 0));
     }
 }
+
+/// A window budget is a count of *lines the passes may see*, never of raw
+/// source rows.
+///
+/// The reverse-move fold bounds its scan with a budget of eight steady lines.
+/// Expressed as a raw index count, `-g` rows between the two moves spent part
+/// of that budget, so the fold silently refused.  `check_debug_info_invariance.sh`
+/// caught the consequence at `-O1` on `simd_defer_chain.c`: without `-g` the
+/// pass rewrote `movq %r8, %rdx` / ... / `movq %rdx, %r8` into the commuted
+/// reverse form, and with `-g` it left the pair alone.
+///
+/// Every budget a pass derives now goes through `window_end`, whose idea of an
+/// invisible row is `debug_transparent` -- the same predicate the walks use --
+/// so the result cannot depend on how many attribution rows were interleaved,
+/// nor on whether `hide_debug_rows` has run yet.
+#[test]
+fn a_dense_block_of_debug_rows_never_spends_a_window_budget() {
+    // The forward-then-reverse pair, five steady lines apart: comfortably
+    // inside an eight-line budget however many rows sit between them.
+    let body = "orq %rdi, %r8\n\
+                movq %r8, %rdx\n\
+                movq %r11, 184(%rsp)\n\
+                movq %rdx, 192(%rsp)\n\
+                movq %r11, 168(%rsp)\n\
+                movq %rdx, 176(%rsp)\n\
+                movq %rdx, %r8\n\
+                ret";
+    let (changed, plain) = apply(local_patterns::combined_local_pass, body);
+    assert!(changed, "missing positive control:\n{body}");
+    let plain_code = code(&plain);
+    assert!(
+        !plain_code.contains(&"movq %rdx, %r8"),
+        "the reverse move must be folded without -g:\n{plain}"
+    );
+
+    // A dense run of rows at every separation, not just a single row.
+    for rows in 1..=9usize {
+        let marker = ".loc 1 7 3";
+        let filler: Vec<&str> = std::iter::repeat_n(marker, rows).collect();
+        let annotated = body
+            .lines()
+            .collect::<Vec<_>>()
+            .join(&format!("\n{}\n", filler.join("\n")));
+        let (changed, debug) = apply(local_patterns::combined_local_pass, &annotated);
+        assert!(changed, "{rows} rows changed the result:\n{annotated}");
+        assert_eq!(
+            plain_code,
+            code(&debug),
+            "a budget must not count hidden rows ({rows} inserted)"
+        );
+        assert_eq!(
+            annotated.matches(marker).count(),
+            debug.matches(marker).count(),
+            "attribution was discarded"
+        );
+    }
+}
