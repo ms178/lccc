@@ -118,6 +118,95 @@ class TypeofUnresolvedFallback(unittest.TestCase):
                                 f"{compiler} must name the unresolved operand: {diagnostic}",
                             )
 
+    @unittest.skipUnless(LCCC.is_file(), "built LCCC required")
+    def test_every_recovery_reports_itself(self) -> None:
+        """The contract is observable, not merely documented.
+
+        ``LCCC_TYPEOF_RECOVERY_TRACE`` makes each ``CType::Int`` recovery
+        print the operand. The measured table below is a ratchet, not an
+        aspiration: sema reports the undeclared identifier while collecting
+        the declaration and then, for most shapes, abandons the declaration
+        before its type is resolved, so no recovery happens at all. The
+        shapes that *do* reach the resolver are exactly the ones whose
+        declaration survives to type resolution.
+
+        Two properties are load-bearing. A shape that recovers must still
+        fail (a recovery is never the type of a compiling program), and the
+        trace must name the operand so the recovery is actionable.
+        """
+        env = dict(os.environ, LCCC_TYPEOF_RECOVERY_TRACE="1")
+        # Measured with this compiler; a change here is a behaviour change
+        # and must be justified, not absorbed.
+        expected = {
+            "undeclared": 1,
+            "undeclared_member": 1,
+            "undeclared_arrow": 1,
+            "undeclared_call": 0,
+            "undeclared_subscript": 1,
+            "undeclared_addr": 0,
+            "undeclared_deref": 1,
+            "undeclared_nested": 6,
+            "undeclared_sizeof": 0,
+            "bad_subscript_type": 0,
+            "undeclared_in_cast": 0,
+            "undeclared_binary": 0,
+            "undeclared_comma": 0,
+            "undeclared_conditional": 0,
+            "undeclared_stmtexpr": 0,
+        }
+        self.assertEqual(set(expected), set(CASES), "CASES and the table disagree")
+        self.assertTrue(any(expected.values()), "the trace must be exercised")
+        with tempfile.TemporaryDirectory(prefix="typeof-trace-") as td:
+            root = Path(td)
+            for name, src in CASES.items():
+                with self.subTest(case=name):
+                    path = root / f"{name}.c"
+                    path.write_text(src)
+                    proc = subprocess.run(
+                        [str(LCCC), "-std=gnu11", "-fsyntax-only", str(path)],
+                        capture_output=True, text=True, timeout=60, env=env,
+                    )
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    traces = [
+                        line for line in (proc.stdout + proc.stderr).splitlines()
+                        if line.startswith("typeof-recovery:")
+                    ]
+                    self.assertEqual(
+                        len(traces), expected[name],
+                        f"{name}: expected {expected[name]} recoveries, got {traces}",
+                    )
+                    # A recovery names the operand it replaced.
+                    for line in traces:
+                        self.assertIn("undeclared", line)
+
+    @unittest.skipUnless(LCCC.is_file(), "built LCCC required")
+    def test_compiling_program_never_takes_the_fallback(self) -> None:
+        """No recovery on any program that compiles.
+
+        This is the property the recovery-only contract asserts, checked in
+        the direction that matters: a `typeof` sema *can* type must never
+        reach the fallback, or the program would be silently given `int`.
+        """
+        env = dict(os.environ, LCCC_TYPEOF_RECOVERY_TRACE="1")
+        with tempfile.TemporaryDirectory(prefix="typeof-clean-") as td:
+            root = Path(td)
+            source = root / "positive.c"
+            source.write_text(POSITIVE)
+            proc = subprocess.run(
+                [str(LCCC), "-std=gnu11", "-O2", str(source), "-o", str(root / "positive.out")],
+                capture_output=True, text=True, timeout=180, env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("typeof-recovery:", proc.stdout + proc.stderr)
+            # The trace is opt-in: a normal compile stays silent.
+            proc = subprocess.run(
+                [str(LCCC), "-std=gnu11", "-O2", str(source), "-o", str(root / "quiet.out")],
+                capture_output=True, text=True, timeout=180,
+                env={k: v for k, v in os.environ.items() if k != "LCCC_TYPEOF_RECOVERY_TRACE"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("typeof-recovery:", proc.stdout + proc.stderr)
+
     @unittest.skipUnless(
         LCCC.is_file() and GCC and CLANG,
         "built LCCC, GCC 16.2 and Clang 23.1.5 required",

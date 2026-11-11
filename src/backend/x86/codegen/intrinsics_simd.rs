@@ -2802,7 +2802,7 @@ mod mask_cmp_global_mem_tests {
 
     fn cg_with(func: &IrFunction) -> X86Codegen {
         let mut cg = X86Codegen::new();
-        cg.current_func = Some(func as *const IrFunction);
+        cg.set_current_function(func);
         cg
     }
 

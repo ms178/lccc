@@ -638,18 +638,15 @@ impl X86Codegen {
             lccc::cli::stderr_line(format_args!("{:#?}", func));
             lccc::cli::stderr_line(format_args!("===== end IR ====="));
         }
-        // Store function pointer for indexed addressing detection
-        self.current_func = Some(func as *const IrFunction);
+        // Store function pointer for indexed addressing detection; the
+        // setter also bumps the per-function cache generation.
+        self.set_current_function(func);
         self.state.func_calling_convention = func.calling_convention;
         self.state.num_params = func.params.len();
         // The IPA-RA keep set answers for one function (set below, after
         // the caller-saved pool is final).
         self.ipa_keep = 0;
         self.ipa_keep_callees.clear();
-        // The def index answers for one function; the next question builds
-        // this one's (see `get_defining_instruction`).
-        self.def_index = std::cell::OnceCell::new();
-        self.i128_high_facts = std::cell::OnceCell::new();
         self.wide_simd_copies = func.blocks.iter().any(|block| {
             block.instructions.iter().any(|inst| {
                 matches!(

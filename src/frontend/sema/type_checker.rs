@@ -1154,7 +1154,10 @@ impl<'a> ExprTypeChecker<'a> {
                 // is a recovery-only value, exactly as in
                 // `resolve_type_spec_with_scope`, where the contract is
                 // stated in full.
-                self.infer_expr_ctype(expr).unwrap_or(CType::Int)
+                self.infer_expr_ctype(expr).unwrap_or_else(|| {
+                    super::typeof_recovery::record_fallback(expr);
+                    CType::Int
+                })
             }
             TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype, abi) => {
                 let ret_ct = self.resolve_type_spec(ret);
@@ -1886,6 +1889,12 @@ impl<'a> ExprTypeChecker<'a> {
                 // by this compiler, GCC 16.2 and Clang 23.1.5 with a message
                 // that names the operand, and a positive matrix whose output
                 // is bit-identical across the three.
+                //
+                // `typeof_recovery::record_fallback` makes the recovery
+                // observable (`LCCC_TYPEOF_RECOVERY_TRACE`), so the tests can
+                // check the contract in both directions instead of trusting
+                // this comment.
+                super::typeof_recovery::record_fallback(expr);
                 CType::Int
             }
             TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec_with_scope(inner, scope),

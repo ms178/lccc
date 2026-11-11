@@ -13651,7 +13651,7 @@ mod vector_address_contract_tests {
                 terminator: Terminator::Return(None),
             });
             let mut cg = X86Codegen::new();
-            cg.current_func = Some(&f as *const _);
+            cg.set_current_function(&f);
             for (id, reg) in [
                 (0, super::super::machinst::R12),
                 (1, super::super::machinst::R13),

@@ -11200,8 +11200,18 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
 
     fn resolve_typeof_expr(&self, expr: &Expr) -> CType {
         // Use the ExprTypeChecker to infer typeof(expr) from sema state.
+        //
+        // This is the reachable `typeof` fallback for declarations: a
+        // specifier resolved through `TypeConvertContext` lands here. The
+        // `CType::Int` is recovery-only -- the operand is already rejected by
+        // `analyze_unevaluated` -- and `typeof_recovery::record_fallback`
+        // makes the recovery observable so the contract is testable (see
+        // `resolve_type_spec_with_scope` for the full contract).
         let checker = self.expr_type_checker();
-        checker.infer_expr_ctype(expr).unwrap_or(CType::Int)
+        checker.infer_expr_ctype(expr).unwrap_or_else(|| {
+            super::typeof_recovery::record_fallback(expr);
+            CType::Int
+        })
     }
 
     fn eval_array_bound_len(&self, expr: &Expr, elem: &CType) -> Option<usize> {

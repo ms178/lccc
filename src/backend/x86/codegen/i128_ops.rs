@@ -20,9 +20,15 @@ pub(super) enum I128High {
     Sign,
 }
 
-/// `X86Codegen::i128_high_facts`: the function the facts were derived from,
-/// and the fact per value id (see [`build_i128_high_facts`]).
-pub(super) type I128HighFacts = (*const IrFunction, FxHashMap<u32, I128High>);
+/// `X86Codegen::i128_high_facts`: the `X86Codegen::func_generation` the facts
+/// were derived for, and the fact per value id (see
+/// [`build_i128_high_facts`]).
+///
+/// The key is the emission's generation, not the function address: an
+/// address is reused once its `IrFunction` is dropped, a counter is not, so
+/// a stale entry can always be told apart from a live one (see
+/// `X86Codegen::func_generation`).
+pub(super) type I128HighFacts = (u64, FxHashMap<u32, I128High>);
 
 /// Kill switch for the narrow 128-bit multiplies:
 /// `CCC_DISABLE_PASSES=i128_narrow_mul` makes every 128-bit multiply take
@@ -207,12 +213,12 @@ impl X86Codegen {
     /// prologue's reset, the answer is "no fact" -- the generic product --
     /// rather than a fact about another function's value of the same id.
     fn i128_high_fact(&self, v: u32) -> Option<I128High> {
-        let func_ptr = self.current_func?;
         let func = self.current_function()?;
+        let generation = self.func_generation;
         let (built_for, facts) = self
             .i128_high_facts
-            .get_or_init(|| (func_ptr, build_i128_high_facts(func)));
-        if !std::ptr::eq(*built_for, func_ptr) {
+            .get_or_init(|| (generation, build_i128_high_facts(func)));
+        if *built_for != generation {
             return None;
         }
         facts.get(&v).copied()
@@ -1600,7 +1606,7 @@ mod tests {
     /// A codegen positioned on `func` with 16-byte slots for the i128 values.
     fn codegen_on(func: &IrFunction, slots: &[(u32, i64)]) -> X86Codegen {
         let mut cg = X86Codegen::new();
-        cg.current_func = Some(func as *const IrFunction);
+        cg.set_current_function(func);
         for &(value, offset) in slots {
             cg.state.value_locations.insert(value, StackSlot(offset));
             cg.state.i128_values.insert(value);
@@ -1727,7 +1733,7 @@ mod tests {
         let other = IrFunction::new("other".to_string(), IrType::Void, vec![], false);
         let mut cg = codegen_on(&func, &[(1, -32), (5, -64)]);
         assert_eq!(cg.i128_high_fact(1), Some(I128High::Zero));
-        cg.current_func = Some(&other as *const IrFunction);
+        cg.set_current_function(&other);
         assert_eq!(cg.i128_high_fact(1), None);
     }
 

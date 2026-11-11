@@ -1144,14 +1144,29 @@ pub struct X86Codegen {
     /// strength reduction for constant mul/div is skipped in favour of imul/idiv).
     pub(super) optimize_for_size: bool,
     /// Current function being generated (needed for indexed addressing detection).
+    ///
+    /// Written only through [`X86Codegen::set_current_function`]; the
+    /// borrow it points at is the caller's, which outlives the emission of
+    /// that function (see [`X86Codegen::current_function`]).
     pub(super) current_func: Option<*const IrFunction>,
+    /// Identity of the *emission* of `current_func`, bumped by
+    /// [`X86Codegen::set_current_function`] on every rebind.
+    ///
+    /// Per-function caches key on this counter rather than on the function
+    /// address: an address is not an identity. The allocator may free one
+    /// `IrFunction` and hand the next one the same address, which would let
+    /// a stale cache answer for a different function's value ids (ABA). A
+    /// counter that only ever increases cannot repeat, so a cache entry
+    /// built for generation `n` is recognisable as stale forever.
+    pub(super) func_generation: u64,
     /// `find_defining_instruction`'s answers for `current_func`, built on the
     /// first `get_defining_instruction` of the function (see there) and reset
     /// wherever `current_func` changes.
     pub(super) def_index: std::cell::OnceCell<DefIndex>,
     /// High-half facts of `current_func`'s single-definition 128-bit values
     /// (`i128_ops::build_i128_high_facts`), built on the first 128-bit
-    /// multiply that asks and reset wherever `current_func` changes.
+    /// multiply that asks and reset wherever `current_func` changes. The
+    /// `u64` is the `func_generation` the facts describe.
     pub(super) i128_high_facts: std::cell::OnceCell<super::i128_ops::I128HighFacts>,
     /// When true, skip movslq sign-extension after 32-bit ALU ops on registers
     /// for values NOT in needs_sext_values. Set when no GEPs and no widening casts.
@@ -1714,6 +1729,7 @@ impl X86Codegen {
             pending_widen: [None, None],
             pending_fp_cmp: None,
             current_func: None,
+            func_generation: 0,
             def_index: std::cell::OnceCell::new(),
             i128_high_facts: std::cell::OnceCell::new(),
             ivsr_pointers: FxHashMap::default(),
@@ -3967,6 +3983,19 @@ impl X86Codegen {
     /// Valid scales are 1, 2, 4, or 8 (encoded in 2 bits).
     pub(super) fn is_valid_sib_scale(scale: i64) -> bool {
         matches!(scale, 1 | 2 | 4 | 8)
+    }
+
+    /// Point this codegen at `func` for the emission that follows.
+    ///
+    /// The single writer of `current_func`, so the pointer the rest of the
+    /// emitter trusts and the [`Self::func_generation`] the per-function
+    /// caches key on can never disagree. Every rebind bumps the generation
+    /// and invalidates the caches that answer for the previous function.
+    pub(super) fn set_current_function(&mut self, func: &IrFunction) {
+        self.current_func = Some(func as *const IrFunction);
+        self.func_generation = self.func_generation.wrapping_add(1);
+        self.def_index = std::cell::OnceCell::new();
+        self.i128_high_facts = std::cell::OnceCell::new();
     }
 
     /// The function being emitted, once the prologue has installed it.
@@ -12542,7 +12571,7 @@ mod switch_bound_emitter_tests {
         func.next_value_id = 6;
 
         let mut cg = X86Codegen::new();
-        cg.current_func = Some(&func as *const IrFunction);
+        cg.set_current_function(&func);
         cg.state.current_program_point = 10;
 
         // Missing live segments must fail closed.
