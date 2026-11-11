@@ -120,9 +120,11 @@ fn instrument_function(func: &mut IrFunction) {
             func: HOOK_EXIT.to_string(),
             info: hook_call(vfn2, vsite2),
         });
-        // Append: the hook must run AFTER the block's effects, immediately
-        // before the Return terminator (which lives in `block.terminator`).
-        block.extend_insts(insts, crate::common::source::Span::dummy());
+        // The hook runs AFTER the block's effects and before the block
+        // returns -- which is before the return tail, not after it: the
+        // call would overwrite the registers those instructions load.
+        let at = block.return_tail_start();
+        block.insert_insts(at, insts, crate::common::source::Span::dummy());
     }
 
     func.next_value_id = id;
@@ -143,6 +145,7 @@ fn hook_call(vfn: Value, vsite: Value) -> CallInfo {
         struct_arg_fp_agg_classes: vec![None],
         struct_arg_is_f128_sse: vec![false, false],
         ret_is_f128_sse: false,
+        ret_is_vector128: false,
         is_sret: false,
         calling_convention: crate::common::types::CallingConvention::Default,
         is_fastcall: false,
@@ -155,5 +158,77 @@ fn hook_call(vfn: Value, vsite: Value) -> CallInfo {
         assume_library: false,
         ret_eightbyte_classes: vec![],
         cold: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::intrinsics::IntrinsicOp;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst};
+
+    fn returning(instructions: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("f".to_string(), IrType::Void, Vec::new(), false);
+        f.next_value_id = 8;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        });
+        f
+    }
+
+    fn exit_hook_position(f: &IrFunction) -> usize {
+        f.blocks[0]
+            .instructions
+            .iter()
+            .position(|inst| matches!(inst, Instruction::Call { func, .. } if func == HOOK_EXIT))
+            .expect("an exit hook before the return")
+    }
+
+    /// The exit hook is a call: it runs before the instructions that load
+    /// return registers, or it overwrites them.
+    #[test]
+    fn the_exit_hook_runs_before_the_return_tail() {
+        let work = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I64(7)),
+        };
+        let second = Instruction::SetReturnF64Second {
+            src: Operand::Value(Value(0)),
+        };
+        let reload = Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::RestoreApplyResult,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(0))],
+        };
+        for tail in [
+            vec![],
+            vec![second.clone()],
+            vec![reload.clone()],
+            vec![second, reload],
+        ] {
+            let mut body = vec![work.clone()];
+            body.extend(tail.iter().cloned());
+            let mut f = returning(body);
+            instrument_function(&mut f);
+            let insts = &f.blocks[0].instructions;
+            let hook = exit_hook_position(&f);
+            assert_eq!(
+                insts.len() - 1 - hook,
+                tail.len(),
+                "exactly the return tail follows the hook"
+            );
+            assert!(insts[hook + 1..].iter().all(Instruction::is_return_tail));
+            let work_at = insts
+                .iter()
+                .position(|inst| matches!(inst, Instruction::Copy { .. }))
+                .expect("the body survives");
+            assert!(work_at < hook, "the hook runs after the block's effects");
+        }
     }
 }

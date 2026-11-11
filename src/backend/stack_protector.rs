@@ -525,18 +525,18 @@ fn instrument_function(
         let track_ids = track_spans && blk.source_inline_ids.len() == blk.instructions.len();
         let tail_span = blk.source_spans.last().copied().unwrap_or_else(Span::dummy);
 
-        // Keep trailing SetReturn*Second instructions paired with Return in ret_block.
+        // The return tail stays paired with Return in ret_block: the check
+        // computes in the accumulator, so it has to run before the
+        // instructions that load return registers
+        // (`Instruction::is_return_tail`).
         let mut moved_insts = Vec::new();
         let mut moved_spans = Vec::new();
         let mut moved_ids = Vec::new();
-        while blk.instructions.last().is_some_and(|inst| {
-            matches!(
-                inst,
-                Instruction::SetReturnF64Second { .. }
-                    | Instruction::SetReturnF32Second { .. }
-                    | Instruction::SetReturnF128Second { .. }
-            )
-        }) {
+        while blk
+            .instructions
+            .last()
+            .is_some_and(Instruction::is_return_tail)
+        {
             if let Some(inst) = blk.instructions.pop() {
                 moved_insts.push(inst);
             }
@@ -641,6 +641,7 @@ fn instrument_function(
             ret_eightbyte_classes: Vec::new(),
             assume_library: true,
             ret_is_f128_sse: false,
+            ret_is_vector128: false,
             cold: true,
         };
         new_blocks.push(BasicBlock {
@@ -725,6 +726,70 @@ mod tests {
                 .iter()
                 .all(|&id| id == 77 || id == crate::ir::instruction::NO_INLINE_INSTANCE)
         );
+    }
+
+    /// `__builtin_return` reloads %rax/%rdx/%xmm0; the canary check
+    /// computes in %rax.  The reload has to come after the check, next to
+    /// the `Return` -- the same pairing the second FP return register gets.
+    #[test]
+    fn the_return_tail_stays_with_the_return_behind_the_canary_check() {
+        use crate::ir::intrinsics::IntrinsicOp;
+        let reload = Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::RestoreApplyResult,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(0))],
+        };
+        let second = Instruction::SetReturnF64Second {
+            src: Operand::Value(Value(0)),
+        };
+        for tail in [
+            vec![reload.clone()],
+            vec![second.clone()],
+            vec![second, reload],
+        ] {
+            let mut f = sample_func();
+            f.blocks[0].instructions.push(Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(7)),
+            });
+            f.blocks[0].instructions.extend(tail.iter().cloned());
+            f.blocks[0].terminator = Terminator::Return(None);
+            let mut next_blk = 10;
+            instrument_function(
+                &mut f,
+                &EffectiveStackGuard::Global {
+                    symbol: "__stack_chk_guard".to_string(),
+                },
+                8,
+                IrType::U64,
+                &mut next_blk,
+            );
+            let returning: Vec<&BasicBlock> = f
+                .blocks
+                .iter()
+                .filter(|b| matches!(b.terminator, Terminator::Return(_)))
+                .collect();
+            assert_eq!(returning.len(), 1);
+            assert_eq!(
+                returning[0].instructions.len(),
+                tail.len(),
+                "only the return tail may stand between the check and the return"
+            );
+            assert!(
+                returning[0]
+                    .instructions
+                    .iter()
+                    .all(Instruction::is_return_tail)
+            );
+            assert!(
+                !f.blocks[0]
+                    .instructions
+                    .iter()
+                    .any(Instruction::is_return_tail),
+                "the check must not run after a return register is loaded"
+            );
+        }
     }
 
     #[test]

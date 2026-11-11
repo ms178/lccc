@@ -1370,42 +1370,96 @@ fn x86_rdx_clobbers_allow_param_homes(func: &IrFunction, ra_config: &RaConfig) -
     if ra_config.no_rdx_param_homes || ra_config.no_rdx_hazard {
         return false;
     }
-    let narrow_divlike = |inst: &Instruction| {
-        matches!(
-            inst,
-            Instruction::BinOp { op, ty, .. }
-                if !matches!(ty, IrType::I128 | IrType::U128)
-                    && matches!(
-                        op,
-                        IrBinOp::SDiv
-                            | IrBinOp::UDiv
-                            | IrBinOp::SRem
-                            | IrBinOp::URem
-                            | IrBinOp::UMulHigh
-                            | IrBinOp::SMulHigh
-                    )
-        )
-    };
+    let all_admitted = func.blocks.iter().all(|block| {
+        block
+            .instructions
+            .iter()
+            .all(|inst| !x86_inst_fixed_scratch(inst).rdx || x86_narrow_rdx_clobber(inst))
+    });
+    all_admitted && !x86_body_has_wide_ops(func)
+}
+
+/// The `%rdx`-clobber classes whose only `%rdx` write is the instruction
+/// itself, at its own program point (see
+/// [`x86_rdx_clobbers_allow_param_homes`]).
+fn x86_narrow_rdx_clobber(inst: &Instruction) -> bool {
+    let narrow_divlike = matches!(
+        inst,
+        Instruction::BinOp { op, ty, .. }
+            if !matches!(ty, IrType::I128 | IrType::U128)
+                && matches!(
+                    op,
+                    IrBinOp::SDiv
+                        | IrBinOp::UDiv
+                        | IrBinOp::SRem
+                        | IrBinOp::URem
+                        | IrBinOp::UMulHigh
+                        | IrBinOp::SMulHigh
+                )
+    );
     // Narrow atomics write %rdx only inside their own sequence (cmpxchg's
     // `desired`, an atomic store's value, the RMW loop's candidate), after
     // which none of their operands is read again -- and the wave refuses any
     // value live INTO the point, so no operand is %rdx-homed.  128-bit forms
-    // are wide and excluded below.
-    let narrow_atomic = |inst: &Instruction| {
-        matches!(
-            inst,
-            Instruction::AtomicRmw { ty, .. }
-                | Instruction::AtomicCmpxchg { ty, .. }
-                | Instruction::AtomicStore { ty, .. }
-                if !matches!(ty, IrType::I128 | IrType::U128)
-        ) && !x86_inst_fixed_scratch(inst).rdi
+    // are wide and excluded by the callers.
+    let narrow_atomic = matches!(
+        inst,
+        Instruction::AtomicRmw { ty, .. }
+            | Instruction::AtomicCmpxchg { ty, .. }
+            | Instruction::AtomicStore { ty, .. }
+            if !matches!(ty, IrType::I128 | IrType::U128)
+    ) && !x86_inst_fixed_scratch(inst).rdi;
+    narrow_divlike || narrow_atomic
+}
+
+/// Whether the parameters of an x86-64 body may fill the free stretches of
+/// `%r10`/`%r11` although the caller-saved parameter model
+/// ([`x86_param_caller_homes_safe_with_config`]) rejects the body for being
+/// wide (the allocator's Phase 2-x64wp).
+///
+/// That model parks parameters in their argument registers, which is what a
+/// wide body cannot have: its emitters stage through `%rdx` everywhere and
+/// through `%rdi`/`%rsi`/`%r8`/`%r9` at the points of
+/// [`collect_x64_wide_hazard_points`].  `%r10` and `%r11` are neither -- no
+/// argument arrives in them and no 128-bit emitter writes them, which is why
+/// the general waves already home a wide body's temporaries there -- so once
+/// the entry prefix has the shape the model requires
+/// ([`x86_param_homes_shape_ok`]) a parameter is as safe in them as any
+/// temporary.
+///
+/// The `%rdx`-scratch classes admitted are the narrow ones
+/// ([`x86_narrow_rdx_clobber`]) and the plain wide instructions.  The 128-bit
+/// atomics (libatomic staging in `%rdi`), F128 stores and the fixed-scratch
+/// intrinsics keep the callee-saved-only rule, and so does a nested
+/// function: its static chain arrives in `%r10`.
+pub(crate) fn x86_wide_body_param_overflow_safe(func: &IrFunction, ra_config: &RaConfig) -> bool {
+    if ra_config.no_rdx_param_homes
+        || !x86_param_homes_shape_ok(func, ra_config)
+        || x86_body_fixed_scratch(func).rdi
+    {
+        return false;
+    }
+    let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128);
+    let plain_wide = |inst: &Instruction| match inst {
+        Instruction::BinOp { ty, .. }
+        | Instruction::UnaryOp { ty, .. }
+        | Instruction::Cmp { ty, .. }
+        | Instruction::Load { ty, .. }
+        | Instruction::Store { ty, .. } => wide(ty),
+        Instruction::Cast { from_ty, to_ty, .. } => wide(from_ty) || wide(to_ty),
+        _ => false,
     };
-    let all_admitted = func.blocks.iter().all(|block| {
+    let admitted = func.blocks.iter().all(|block| {
         block.instructions.iter().all(|inst| {
-            !x86_inst_fixed_scratch(inst).rdx || narrow_divlike(inst) || narrow_atomic(inst)
+            !matches!(
+                inst,
+                Instruction::GetStaticChain { .. } | Instruction::SetStaticChain { .. }
+            ) && (!x86_inst_fixed_scratch(inst).rdx
+                || x86_narrow_rdx_clobber(inst)
+                || plain_wide(inst))
         })
     });
-    all_admitted && !x86_body_has_wide_ops(func)
+    admitted && x86_body_has_wide_ops(func)
 }
 
 /// Compatibility query for isolated callers. Production code must use the
@@ -1418,6 +1472,37 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
     func: &IrFunction,
     ra_config: &RaConfig,
 ) -> bool {
+    if !x86_param_homes_shape_ok(func, ra_config) {
+        return false;
+    }
+    // The pre-store model parks each register param in its incoming ABI
+    // register for the WHOLE body. Any instruction that implicitly clobbers
+    // %rdx (division via cqto/cltd, i128 rax:rdx pairs, switch jump tables,
+    // fixed-scratch intrinsics) destroys a param homed there behind the
+    // allocator's back. Reproduced: `(uint8_t)p2` read from %dl after an
+    // `idivq`'s cqto zeroed it — every truncation of the param silently
+    // wrong (stress intexpr seed 1, O1 rt+cf, got 65533 expected 65532).
+    // Mirror the prologue's allocation exclusions (see
+    // x86_body_fixed_scratch): when the body can clobber %rdi, or %rdx in a
+    // way the position-aware model does not cover
+    // ([`x86_rdx_clobbers_allow_param_homes`]), params fall back to the
+    // ordinary spill-home path.  The %rdi half matters for
+    // future-proofing: today every rdi clobberer (rdtscp, the 128-bit
+    // atomics) is an RDX_RDI pair, so the historical rdx-only gate happened
+    // to catch them transitively — but the prologue already removes %rdi
+    // from the pool independently, and a future rdi-only scratch would
+    // otherwise silently destroy a param parked in %rdi.
+    let caller_home_scratch = x86_body_fixed_scratch(func);
+    !(caller_home_scratch.rdi
+        || (caller_home_scratch.rdx && !x86_rdx_clobbers_allow_param_homes(func, ra_config)))
+}
+
+/// The part of [`x86_param_caller_homes_safe_with_config`] that does not
+/// depend on which registers the body's emitters stage through: the entry
+/// prefix is `Alloca`s and `ParamRef`s only, there is no inline assembly,
+/// an inline-expanded `memcpy`/`memset` is followed by no parameter read,
+/// and a multi-block body takes all its arguments in registers.
+fn x86_param_homes_shape_ok(func: &IrFunction, ra_config: &RaConfig) -> bool {
     if func.blocks.is_empty() || ra_config.no_leaf_param_gpr {
         return false;
     }
@@ -1460,29 +1545,6 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
         return false;
     }
     if !x86_params_dead_after_inline_libc_calls(func, &inline_libc) {
-        return false;
-    }
-    // The pre-store model parks each register param in its incoming ABI
-    // register for the WHOLE body. Any instruction that implicitly clobbers
-    // %rdx (division via cqto/cltd, i128 rax:rdx pairs, switch jump tables,
-    // fixed-scratch intrinsics) destroys a param homed there behind the
-    // allocator's back. Reproduced: `(uint8_t)p2` read from %dl after an
-    // `idivq`'s cqto zeroed it — every truncation of the param silently
-    // wrong (stress intexpr seed 1, O1 rt+cf, got 65533 expected 65532).
-    // Mirror the prologue's allocation exclusions (see
-    // x86_body_fixed_scratch): when the body can clobber %rdi, or %rdx in a
-    // way the position-aware model does not cover
-    // ([`x86_rdx_clobbers_allow_param_homes`]), params fall back to the
-    // ordinary spill-home path.  The %rdi half matters for
-    // future-proofing: today every rdi clobberer (rdtscp, the 128-bit
-    // atomics) is an RDX_RDI pair, so the historical rdx-only gate happened
-    // to catch them transitively — but the prologue already removes %rdi
-    // from the pool independently, and a future rdi-only scratch would
-    // otherwise silently destroy a param parked in %rdi.
-    let caller_home_scratch = x86_body_fixed_scratch(func);
-    if caller_home_scratch.rdi
-        || (caller_home_scratch.rdx && !x86_rdx_clobbers_allow_param_homes(func, ra_config))
-    {
         return false;
     }
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -5925,6 +5987,82 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 assignments.insert(vid, r);
                 caller_used_regs_set.insert(r.0);
             }
+        }
+    }
+
+    // Phase 2-x64wp (parameters of a wide x86-64 body, overflow only).
+    // `x86_param_caller_homes_safe` keeps every parameter of a wide body out
+    // of the waves above, so each one that needed a register reached
+    // Phase 2c: `u128 mul(u64 a, u64 b) { return (u128)a * b; }` pushed %rbx
+    // and %r12 for two values it reads once, and `*d = *s` on two 128-bit
+    // objects did the same for its two pointers (GCC, Clang and ICX: three
+    // instructions each).  %r10 and %r11 are the caller-saved registers no
+    // argument arrives in and no wide emitter stages through
+    // ([`x86_wide_body_param_overflow_safe`]), so a parameter takes whichever
+    // of them no home occupies during its range -- the rule of Phase 2p
+    // below over x86-64's volatile pair.  The wave runs after every wave
+    // that homes temporaries and displaces nothing.
+    //
+    //   * A parameter is resident from function entry (the prologue's
+    //     ordered copy), not from its `ParamRef`, so its range is taken from
+    //     point 0 and two parameters never share a register here.
+    //   * An indirect call keeps its target in %r10 while the arguments are
+    //     staged (`indirect_target_regs`): an argument of one stays out.
+    //   * %r11 is not a constant-offset fold base (`fold_base_regs`), so a
+    //     parameter whose deferred `C(%base)` accesses read its register
+    //     takes %r10 or nothing; the others try %r11 first and leave %r10
+    //     to it.
+    if crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
+        && !ordered_param_homes
+        && x86_wide_body_param_overflow_safe(func, &config.ra_config)
+    {
+        let pool: Vec<PhysReg> = [PhysReg(10), PhysReg(11)]
+            .into_iter()
+            .filter(|r| config.caller_saved_regs.contains(r))
+            .collect();
+        // The relocation rule of the IPA fill (`reloc_ok`), over the web.
+        let web_is_fold_base = |leader: u32| {
+            fold_use_transfer.contains_key(&leader)
+                || coalesce_groups.get(&leader).is_some_and(|members| {
+                    members.iter().any(|m| fold_use_transfer.contains_key(m))
+                })
+        };
+        let mut candidates: Vec<LiveInterval> = scan_ivs
+            .iter()
+            .copied()
+            .filter(|iv| {
+                param_restricted.contains(&iv.value_id)
+                    && !assignments.contains_key(&iv.value_id)
+                    && !call_spanning.contains(&iv.value_id)
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|iv| (iv.start, iv.value_id));
+        let mut homes: Vec<(u32, u8)> = Vec::new();
+        for iv in &candidates {
+            let end = allocation_owner_bounds(iv.value_id, &merged_of, &iv_map)
+                .map_or(iv.end, |(_, end)| end);
+            let fold_base = web_is_fold_base(iv.value_id);
+            let indirect_arg = indirect_arg_values.contains(&iv.value_id);
+            let home = pool.iter().copied().find(|reg| {
+                (!fold_base || config.fold_base_regs.contains(reg))
+                    && !(indirect_arg && config.indirect_target_regs.contains(reg))
+                    && !assignments.iter().any(|(vid, r)| {
+                        r == reg
+                            && allocation_owner_bounds(*vid, &merged_of, &iv_map)
+                                .is_none_or(|(start, _)| start <= end)
+                    })
+            });
+            if let Some(reg) = home {
+                assignments.insert(iv.value_id, reg);
+                caller_used_regs_set.insert(reg.0);
+                homes.push((iv.value_id, reg.0));
+            }
+        }
+        if config.ra_config.debug_ra_intervals {
+            lccc::cli::stderr_line(format_args!(
+                "[RA-P2WP] fn={} wide-body parameter homes={:?}",
+                func.name, homes
+            ));
         }
     }
 
@@ -18714,6 +18852,7 @@ mod allocation_kernel_tests {
                             struct_arg_fp_agg_classes: vec![],
                             struct_arg_is_f128_sse: vec![],
                             ret_is_f128_sse: false,
+                            ret_is_vector128: false,
                             is_sret: false,
                             calling_convention: crate::common::types::CallingConvention::Default,
                             is_fastcall: false,
@@ -21352,6 +21491,141 @@ mod wide_hazard_tests {
             "integer casts 3 and 6 stage through rax:rdx only; the F64 cast \
              is a libcall; the I128 cmp's fusion window runs to the terminator"
         );
+    }
+
+    fn param(dest: u32, param_idx: usize, ty: IrType) -> Instruction {
+        Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx,
+            ty,
+        }
+    }
+
+    fn binop(dest: u32, op: IrBinOp, lhs: u32, rhs: u32, ty: IrType) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs: v(lhs),
+            rhs: v(rhs),
+            ty,
+        }
+    }
+
+    fn one_block(instructions: Vec<Instruction>, result: u32) -> IrFunction {
+        let mut f = IrFunction::new("f".into(), IrType::U128, vec![], false);
+        f.next_value_id = instructions.len() as u32 + 8;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(v(result))),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        });
+        f
+    }
+
+    /// `u128 mul(u64 a, u64 b) { return (u128)a * b; }` and friends.
+    fn widening_product(extra: Vec<Instruction>) -> IrFunction {
+        let mut body = vec![
+            param(0, 0, IrType::U64),
+            param(1, 1, IrType::U64),
+            cast(2, 0, IrType::U64, IrType::U128),
+            cast(3, 1, IrType::U64, IrType::U128),
+            binop(4, IrBinOp::Mul, 2, 3, IrType::U128),
+        ];
+        body.extend(extra);
+        one_block(body, 4)
+    }
+
+    #[test]
+    fn a_wide_body_lets_its_parameters_overflow_into_the_volatile_pair() {
+        let config = RaConfig::default();
+        let mul = widening_product(vec![]);
+        assert!(!x86_param_caller_homes_safe_with_config(&mul, &config));
+        assert!(x86_wide_body_param_overflow_safe(&mul, &config));
+
+        // A narrow division next to it is an admitted %rdx class as well.
+        let with_div = widening_product(vec![binop(5, IrBinOp::UDiv, 0, 1, IrType::U64)]);
+        assert!(x86_wide_body_param_overflow_safe(&with_div, &config));
+
+        // A wide load and store: `*d = *s`.
+        let copy = one_block(
+            vec![
+                param(0, 0, IrType::Ptr),
+                param(1, 1, IrType::Ptr),
+                Instruction::Load {
+                    dest: Value(2),
+                    ptr: Value(1),
+                    ty: IrType::U128,
+                    seg_override: Default::default(),
+                    volatile: false,
+                },
+                Instruction::Store {
+                    val: v(2),
+                    ptr: Value(0),
+                    ty: IrType::U128,
+                    seg_override: Default::default(),
+                    volatile: false,
+                },
+            ],
+            2,
+        );
+        assert!(x86_wide_body_param_overflow_safe(&copy, &config));
+
+        // The switch that restores the old parameter gates restores this one.
+        let off = RaConfig {
+            no_rdx_param_homes: true,
+            ..RaConfig::default()
+        };
+        assert!(!x86_wide_body_param_overflow_safe(&mul, &off));
+    }
+
+    #[test]
+    fn a_narrow_body_stays_with_the_argument_register_model() {
+        let config = RaConfig::default();
+        let mut narrow = one_block(
+            vec![
+                param(0, 0, IrType::U64),
+                param(1, 1, IrType::U64),
+                binop(2, IrBinOp::Add, 0, 1, IrType::U64),
+            ],
+            2,
+        );
+        narrow.return_type = IrType::U64;
+        assert!(x86_param_caller_homes_safe_with_config(&narrow, &config));
+        assert!(!x86_wide_body_param_overflow_safe(&narrow, &config));
+    }
+
+    #[test]
+    fn the_overflow_wave_refuses_what_the_volatile_pair_cannot_survive() {
+        let config = RaConfig::default();
+        // A parameter read after code has run: not an entry prefix.
+        let mut late = widening_product(vec![]);
+        late.blocks[0].instructions.swap(1, 2);
+        assert!(!x86_wide_body_param_overflow_safe(&late, &config));
+
+        // A 128-bit atomic stages libatomic arguments in %rdi.
+        let atomic = widening_product(vec![Instruction::AtomicLoad {
+            dest: Value(5),
+            ptr: v(0),
+            ty: IrType::U128,
+            ordering: crate::ir::ops::AtomicOrdering::SeqCst,
+        }]);
+        assert!(!x86_wide_body_param_overflow_safe(&atomic, &config));
+
+        // An F128 store is not one of the admitted %rdx classes.
+        let f128 = widening_product(vec![Instruction::Store {
+            val: v(0),
+            ptr: Value(1),
+            ty: IrType::F128,
+            seg_override: Default::default(),
+            volatile: false,
+        }]);
+        assert!(!x86_wide_body_param_overflow_safe(&f128, &config));
+
+        // A nested function's static chain arrives in %r10.
+        let chained = widening_product(vec![Instruction::GetStaticChain { dest: Value(5) }]);
+        assert!(!x86_wide_body_param_overflow_safe(&chained, &config));
     }
 }
 

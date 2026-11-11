@@ -7097,6 +7097,10 @@ fn generate_function_body(
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         cg.begin_home_write_block(block.label);
+        // What the vector return register held at the end of the block
+        // emitted before this one says nothing about the paths that enter
+        // this one.
+        cg.state().end_call_ret_vector_residency();
         // Sibling-call site analysis (TODO-3 / §5b of the codegen-gaps
         // ledger), part 2: per-block shape. The function-level guard and
         // the whole-function use counts were computed once above
@@ -7339,6 +7343,11 @@ fn generate_function_body(
             // In particular, earlier void calls must not observe the final
             // void call's hint and have their emission suppressed.
             cg.state().sibcall_hint = sibcall_hint.filter(|hint| hint.instruction_index == idx);
+            // A vector call result is known to sit in the return register
+            // only until something other than a rename of it is reached.
+            // Decided here, ahead of every fused, deferred and MachInst
+            // path below, so no emission route can skip the question.
+            cg.state().expire_call_ret_vector_residency(inst);
             if Some(idx) == fuse_idx.map(|f| f.0) {
                 cg.state().current_program_point += 1;
                 continue;
@@ -7436,8 +7445,10 @@ fn generate_function_body(
                 continue;
             }
 
-            // Exact F128 load->store is a 16-byte copy; bypass x87/f64
-            // approximation and intermediate homes on every backend.
+            // Exact F128 load->store is a copy of the object's bytes; bypass
+            // x87/f64 approximation and intermediate homes on every backend.
+            // The pair is not a liveness call point, so the hook writes
+            // fixed scratch only (`ArchCodegen::emit_f128_exact_copy`).
             if let Instruction::Load {
                 dest,
                 ptr: src,
@@ -7460,7 +7471,7 @@ fn generate_function_body(
                             && cg.state_ref().resolve_slot_addr(dst.0).is_some()
                         {
                             cg.flush_machinst();
-                            cg.emit_memcpy(dst, src, 16);
+                            cg.emit_f128_exact_copy(dst, src);
                             skip_f128_copy_store = true;
                             cg.state().current_program_point += 1;
                             continue;
@@ -8790,6 +8801,7 @@ fn generate_instruction_body(
                 info.regparm,
                 &info.ret_eightbyte_classes,
                 info.ret_is_f128_sse,
+                info.ret_is_vector128,
             );
             clobber_after_call_like(cg);
         }
@@ -8820,6 +8832,7 @@ fn generate_instruction_body(
                 info.regparm,
                 &info.ret_eightbyte_classes,
                 info.ret_is_f128_sse,
+                info.ret_is_vector128,
             );
             clobber_after_call_like(cg);
         }
@@ -9168,8 +9181,11 @@ fn generate_load(
         // register here sound. When it is false the GEP was materialised
         // normally and `rematerialize_const_addr` below is a no-op.
         if let Some(info) = gep_fold_map.get(&ptr.0) {
-            if !is_wide_int_type(ty)
-                && can_const_addr_fold(cg, info)
+            // 16-byte types take the same fold: the backend answers false
+            // when the shape is not expressible, and the generic segment
+            // load below is exact either way. Refusing wide types here used
+            // to cost one `leaq` per element on per-CPU aggregate arrays.
+            if can_const_addr_fold(cg, info)
                 && cg.emit_seg_load_with_const_offset(
                     dest,
                     &info.base,
@@ -9300,8 +9316,7 @@ fn generate_store(
             }
         }
         if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
-            if !is_wide_int_type(ty)
-                && seg_fold_base_in_register(gep_info, global_addr_map, const_addr_vals)
+            if seg_fold_base_in_register(gep_info, global_addr_map, const_addr_vals)
                 && can_seg_const_addr_fold(cg, gep_info)
                 && cg.emit_seg_store_with_const_offset(
                     val,

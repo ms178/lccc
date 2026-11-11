@@ -2040,6 +2040,27 @@ impl Lowerer {
     }
 
     /// Resolve the register representation of an indirect call's result.
+
+    /// The two "the result arrives in `%xmm0`" facts a call site needs, read
+    /// from the callee's classification and its registered signature.
+    ///
+    /// They are deliberately returned together: both describe the SAME
+    /// register and both make the backend bypass its general-register store,
+    /// so a call site that consulted one and forgot the other would silently
+    /// fall back to the round trip this pair exists to remove.
+    ///
+    /// * `_Float128` / `_Decimal128` -- psABI `[Sse, Sse]`, `one_xmm`.
+    /// * a 16-byte vector -- psABI `[Sse, SseUp]`, `ret_is_vector128`.
+    fn vector_return_flags(
+        ret_abi: &AggregateReturn,
+        sig: Option<&super::definitions::FuncSig>,
+    ) -> (bool, bool) {
+        (
+            ret_abi.one_xmm || sig.is_some_and(|s| s.ret_is_f128_sse),
+            sig.is_some_and(|s| s.ret_is_vector128),
+        )
+    }
+
     fn indirect_call_return_type(&self, func: &Expr, ret_abi: &AggregateReturn) -> IrType {
         let mut ty = self.get_func_ptr_return_ir_type(func);
         if ret_abi.two_reg_size.is_some() {
@@ -2107,6 +2128,7 @@ impl Lowerer {
                             assume_library: false,
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: ret_abi.one_xmm,
+                            ret_is_vector128: false,
                             cold: false,
                         },
                     });
@@ -2142,8 +2164,8 @@ impl Lowerer {
                     }
                     let is_pure = self.pure_functions.contains(name.as_str());
                     let is_const = self.const_functions.contains(name.as_str());
-                    let call_ret_is_f128_sse =
-                        ret_abi.one_xmm || sig.is_some_and(|s| s.ret_is_f128_sse);
+                    let (call_ret_is_f128_sse, call_ret_is_vector128) =
+                        Self::vector_return_flags(&ret_abi, sig);
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {
@@ -2167,6 +2189,7 @@ impl Lowerer {
                             assume_library: false,
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: call_ret_is_f128_sse,
+                            ret_is_vector128: call_ret_is_vector128,
                             cold: false,
                         },
                     });
@@ -2221,6 +2244,7 @@ impl Lowerer {
                         ret_eightbyte_classes: ret_abi.classes.clone(),
                         // From the callee's type: `indirect_aggregate_return`.
                         ret_is_f128_sse: ret_abi.one_xmm,
+                        ret_is_vector128: false,
                         cold: false,
                     },
                 });
@@ -2285,8 +2309,8 @@ impl Lowerer {
                     }
                     let is_pure = self.pure_functions.contains(call_name.as_str());
                     let is_const = self.const_functions.contains(call_name.as_str());
-                    let call_ret_is_f128_sse =
-                        ret_abi.one_xmm || sig.is_some_and(|s| s.ret_is_f128_sse);
+                    let (call_ret_is_f128_sse, call_ret_is_vector128) =
+                        Self::vector_return_flags(&ret_abi, sig);
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {
@@ -2310,6 +2334,7 @@ impl Lowerer {
                             assume_library: false,
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: call_ret_is_f128_sse,
+                            ret_is_vector128: call_ret_is_vector128,
                             cold: false,
                         },
                     });
@@ -2339,6 +2364,7 @@ impl Lowerer {
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             // From the callee's type: `indirect_aggregate_return`.
                             ret_is_f128_sse: ret_abi.one_xmm,
+                            ret_is_vector128: false,
                             cold: false,
                         },
                     });

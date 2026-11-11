@@ -3325,6 +3325,86 @@ impl X86Codegen {
         self.emit_memcpy_impl_impl(size);
     }
 
+    /// The register through which the address `op` evaluates to is
+    /// reached: the pointer's own home when that is a general register, the
+    /// scratch register `stage` (loaded here) otherwise.
+    ///
+    /// A home is never `%rax` or `%rcx`.  Main register allocation does not
+    /// hand them out, and the MachInst window allocator, which does, keeps
+    /// its assignments to itself: nothing it chose is ever visible through
+    /// `reg_assignments`.  A caller may therefore use both as payload and
+    /// staging scratch while a home returned from here is still needed.
+    fn copy_address_base(&mut self, op: &Operand, stage: &'static str) -> &'static str {
+        let source = self.copy_addr_source(op);
+        if let CopyAddrSource::Gpr(reg) = source {
+            debug_assert!(
+                !matches!(reg.0, 0 | 7),
+                "copy operand homed in function scratch %{}",
+                phys_reg_name(reg)
+            );
+            return phys_reg_name(reg);
+        }
+        self.emit_copy_addr_to(op, &source, stage);
+        stage
+    }
+
+    /// The fused `Load F128; Store F128` pair: one long double copied from
+    /// `*src` to `*dest`, writing nothing but fixed scratch.
+    ///
+    /// [`Self::emit_memcpy_ir_impl`] stages its two addresses in `%rdi` and
+    /// `%rsi`.  That is right for an IR `Memcpy`, which liveness treats as a
+    /// call point: no value is kept in a caller-saved register across it.
+    /// The fused pair is two ordinary instructions to liveness, so the
+    /// allocator does keep values in `%rdi`/`%rsi` across it, and staging
+    /// the copy there destroyed them: six integers read through a pointer,
+    /// then `*out = *q`, then their sum, returned garbage at `-O1` and above
+    /// (`tests/regression/f128_copy_keeps_live_registers.c`).  A body with a
+    /// 128-bit integer instruction never showed it, because such a body
+    /// withdraws both registers from the pool for unrelated reasons.
+    ///
+    /// Here each address is reached through the pointer's own register when
+    /// it has one and through `%rcx` otherwise, and the payload crosses in
+    /// `%xmm0`: the scratch set of an ordinary 16-byte load and store, and
+    /// two instructions when both pointers are in registers.  The source
+    /// address is dead once the payload is loaded, so `%rcx` serves both
+    /// operands in turn.
+    ///
+    /// Without SSE the payload crosses in `%rax`, a word at a time, and
+    /// each word stages its addresses afresh.  That is sound because
+    /// staging only reads (a home, a frame slot, a constant) and writes
+    /// `%rcx` alone, and the copy itself writes no register but `%rax`.
+    pub(super) fn emit_f128_exact_copy_impl(&mut self, dest: &Value, src: &Value) {
+        // `%xmm0` is about to be overwritten: the same announcement every
+        // other inline copy through the scratch vector register makes.
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        self.state.reg_cache.invalidate_all();
+        let dest = Operand::Value(*dest);
+        let src = Operand::Value(*src);
+        if self.no_sse {
+            for disp in ["", "8"] {
+                let from = self.copy_address_base(&src, "rcx");
+                self.state
+                    .emit_fmt(format_args!("    movq {disp}(%{from}), %rax"));
+                let to = self.copy_address_base(&dest, "rcx");
+                self.state
+                    .emit_fmt(format_args!("    movq %rax, {disp}(%{to})"));
+            }
+        } else {
+            // The spelling of every other 16-byte relay (`movups` on an
+            // SSE1-only target).  In a function that uses 256-bit registers
+            // `vex_promote` re-encodes it on the final text with the rest.
+            let mov = self.xmm_move(false);
+            let from = self.copy_address_base(&src, "rcx");
+            self.state
+                .emit_fmt(format_args!("    {mov} (%{from}), %xmm0"));
+            let to = self.copy_address_base(&dest, "rcx");
+            self.state
+                .emit_fmt(format_args!("    {mov} %xmm0, (%{to})"));
+        }
+        self.state.reg_cache.invalidate_all();
+    }
+
     /// Materialise the call result (= dest) from the copy kept in %rdx.
     /// %rdx is untouched by both expansions, is never a home of a value live
     /// across a call point, and every parameter is dead after the expansion
@@ -4280,6 +4360,284 @@ impl X86Codegen {
     }
 
     // ---- Segment-prefixed memory ops ----
+    //
+    // A 128-bit value (`__int128`/`__uint128_t`, and `_Float128` over its
+    // `U128` carrier) has no single GPR memory operand.  Every scalar
+    // `movq`/`movl` emitter below moves exactly one 8-byte half, so routing a
+    // wide object through them left the other half of the object stale: a
+    // store silently kept the old high word, a load read whatever the
+    // destination slot already held.  There is no diagnostic for "half an
+    // object", so the defect was invisible until a `__seg_gs __int128 *`
+    // round trip compared unequal.
+    //
+    // The generic address space solved this with `Mov128`: one `movdqu` pair
+    // through the pre-coloured `%xmm0` scratch.  These are the segment twins.
+    // Every path below either transfers both halves exactly or refuses and
+    // lets the caller's generic machinery handle the object -- never a
+    // partial transfer.
+
+    /// `mem` with `delta` added to its displacement, keeping the segment
+    /// prefix and base: `%gs:16` -> `%gs:24`, `%gs:g` -> `%gs:g+8`,
+    /// `%gs:0(%rax)` -> `%gs:8(%rax)`, `%gs:g(%rip)` -> `%gs:g+8(%rip)`.
+    ///
+    /// `None` means the displacement is not a plain integer or a plain
+    /// symbol (a `sym@TPOFF` relocation, an index register, ...): an addend
+    /// there would have to be folded by the assembler into a relocation whose
+    /// wrong encoding is silent corruption, so callers fall back instead.
+    fn seg_mem_plus(mem: &str, delta: i64) -> Option<String> {
+        let (prefix, rest) = mem.split_once(':')?;
+        if !prefix.eq_ignore_ascii_case("%gs") && !prefix.eq_ignore_ascii_case("%fs") {
+            return None;
+        }
+        if rest.contains('@') || rest.contains(',') {
+            return None;
+        }
+        let (disp, base) = match rest.find('(') {
+            Some(open) => (&rest[..open], &rest[open..]),
+            None => (rest, ""),
+        };
+        let new_disp = if disp.is_empty() {
+            if delta == 0 {
+                String::new()
+            } else {
+                delta.to_string()
+            }
+        } else if let Some(value) = disp.strip_prefix('-').and_then(|d| d.parse::<i64>().ok()) {
+            let sum = (-value).checked_add(delta)?;
+            if sum == 0 {
+                String::new()
+            } else {
+                sum.to_string()
+            }
+        } else if let Ok(value) = disp.parse::<i64>() {
+            let sum = value.checked_add(delta)?;
+            if sum == 0 {
+                String::new()
+            } else {
+                sum.to_string()
+            }
+        } else {
+            // A symbol displacement, possibly already carrying an addend
+            // (`arr+16`, the constant-offset fold): split the addend off, add
+            // `delta` to it, and put it back. Only a plain identifier plus an
+            // optional decimal addend qualifies; anything else (an `@`-reloc,
+            // an expression) is refused so the caller can fall back.
+            let (sym, addend) = match disp.find(['+', '-']) {
+                Some(cut) => {
+                    let (sym, rest) = disp.split_at(cut);
+                    let sign = if rest.starts_with('-') { -1 } else { 1 };
+                    match rest[1..].parse::<i64>() {
+                        Ok(value) => (sym, Some(sign * value)),
+                        Err(_) => return None,
+                    }
+                }
+                None => (disp, None),
+            };
+            if sym.is_empty()
+                || !sym
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$'))
+            {
+                return None;
+            }
+            let total = addend.unwrap_or(0).checked_add(delta)?;
+            if total == 0 {
+                sym.to_string()
+            } else if total > 0 {
+                format!("{}+{}", sym, total)
+            } else {
+                format!("{}-{}", sym, -total)
+            }
+        };
+        Some(format!("{}:{}{}", prefix, new_disp, base))
+    }
+
+    /// Whether the pre-coloured SSE scratch registers may be clobbered here.
+    ///
+    /// `%xmm0`/`%xmm1` are `XMM0_SCRATCH`/`XMM1_SCRATCH`, outside the
+    /// allocatable pool, so the only hazard is a value the allocator
+    /// deliberately homed in one of them -- the same two-register `any_home`
+    /// test `isel::xmm_scratch_unsafe` applies before it will emit a
+    /// `Mov128`. Both registers must be checked, not just `%xmm0`: the
+    /// constant form below materialises the high half through `%xmm1`, and
+    /// checking only `%xmm0` would silently destroy a live `%xmm1` value.
+    ///
+    /// `own` is the value being defined: a LOAD rewrites its home, so it never
+    /// keeps the scratch live across itself; a STORE passes `u32::MAX`.
+    /// `-mno-sse` (`-mgeneral-regs-only`, kernel code with no XSAVE area)
+    /// forbids the SSE moves outright, exactly as `Mov128`'s lowering does.
+    fn seg_wide_scratch_free(&self, own: u32) -> bool {
+        use crate::backend::x86::codegen::machinst::{XMM0_SCRATCH, XMM1_SCRATCH};
+        crate::backend::x86::codegen::isel::sse_integer_moves()
+            && !self
+                .reg_assignments
+                .iter()
+                .any(|(&v, &r)| v != own && (r.0 == XMM0_SCRATCH.0 || r.0 == XMM1_SCRATCH.0))
+    }
+
+    /// Whether `ty` is a 16-byte object moved as two 8-byte halves.
+    ///
+    /// `_Float128` arrives in the IR as its `U128` bit carrier
+    /// (`types.rs`: "Float128 -> U128, bit-exact 16-byte moves"), so `I128`,
+    /// `U128` and `F128` all need the same treatment; the scalar emitters
+    /// below would move exactly one half of any of them.
+    fn seg_wide_type(ty: IrType) -> bool {
+        ty.is_128bit() || ty == IrType::F128
+    }
+
+    /// The low/high halves of a 16-byte segment access.
+    fn seg_wide_pair(mem: &str) -> Option<(String, String)> {
+        Some((mem.to_string(), Self::seg_mem_plus(mem, 8)?))
+    }
+
+    /// Emit an assembler-time hard error for the unsupported corner where a
+    /// 16-byte segment access has a relocation that cannot be incremented
+    /// safely. This is fail-closed (never emits a partial transfer) while
+    /// keeping backend error paths out of `panic!`/`unreachable!`.
+    fn emit_seg_wide_relocation_error(&mut self) {
+        self.state
+            .emit("    .error \"lccc: unsupported relocation-bearing 16-byte segment access\"");
+    }
+
+    /// Store the 16-byte value `val` to the segment operand `mem`.
+    pub(super) fn emit_seg_wide_store(&mut self, val: &Operand, mem: &str) {
+        let Some((lo_mem, hi_mem)) = Self::seg_wide_pair(mem) else {
+            // Relocation-bearing displacement: no addressable high half.
+            self.emit_seg_wide_store_pair(val, mem);
+            return;
+        };
+        let image = match val {
+            Operand::Const(IrConst::I128(c)) => Some(*c as u128),
+            Operand::Const(IrConst::Zero) => Some(0),
+            _ => None,
+        };
+        if let Some(image) = image {
+            // Whole image materialised in registers by construction: exact
+            // for any bit pattern, and no source register to preserve.
+            let lo = image as u64;
+            let hi = (image >> 64) as u64;
+            let lo_imm = lo as i64;
+            if self.seg_wide_scratch_free(u32::MAX) {
+                self.state
+                    .emit_fmt(format_args!("    movabsq ${}, %rax", lo_imm));
+                self.state.emit("    movq %rax, %xmm0");
+                self.state
+                    .emit_fmt(format_args!("    movabsq ${}, %rax", hi as i64));
+                self.state.emit("    movq %rax, %xmm1");
+                self.state.emit("    punpcklqdq %xmm1, %xmm0");
+                self.state
+                    .emit_fmt(format_args!("    movdqu %xmm0, {lo_mem}"));
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+            // No SSE: a constant needs no source register, so the pair form
+            // is two half stores and no staging.
+            if lo_imm >= i32::MIN as i64 && lo_imm <= i32::MAX as i64 {
+                self.state
+                    .emit_fmt(format_args!("    movq ${}, {lo_mem}", lo_imm));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    movabsq ${}, %rax", lo_imm));
+                self.state.emit_fmt(format_args!("    movq %rax, {lo_mem}"));
+            }
+            let hi_imm = hi as i64;
+            if hi_imm >= i32::MIN as i64 && hi_imm <= i32::MAX as i64 {
+                self.state
+                    .emit_fmt(format_args!("    movq ${}, {hi_mem}", hi_imm));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    movabsq ${}, %rax", hi_imm));
+                self.state.emit_fmt(format_args!("    movq %rax, {hi_mem}"));
+            }
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        if let Operand::Value(v) = val {
+            // Source already in an XMM home: one store covers both halves.
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if is_xmm_reg(reg) {
+                    let name = phys_reg_name(reg);
+                    self.state
+                        .emit_fmt(format_args!("    movdqu %{}, {lo_mem}", name));
+                    self.state.reg_cache.invalidate_all();
+                    return;
+                }
+            }
+            // Slot-homed source: reload both halves through the scratch.
+            if let Some(slot) = self.state.get_slot(v.0) {
+                if self.seg_wide_scratch_free(v.0) {
+                    self.state
+                        .out
+                        .emit_instr_rbp_reg("    movdqu", slot.0, "xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    movdqu %xmm0, {lo_mem}"));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+        self.emit_seg_wide_store_pair(val, mem);
+    }
+
+    /// Exact fallback store for a 16-byte value that the SSE route cannot
+    /// take: `%rdx:%rax` holds the halves after `operand_to_rax_rdx`, and a
+    /// single `xchgq` swaps them so both can be stored without a scratch
+    /// register, a stack round trip, or any assumption about which segments
+    /// the destination addresses.
+    fn emit_seg_wide_store_pair(&mut self, val: &Operand, mem: &str) {
+        let Some((lo_mem, hi_mem)) = Self::seg_wide_pair(mem) else {
+            self.emit_seg_wide_relocation_error();
+            return;
+        };
+        self.operand_to_rax_rdx(val);
+        // operands: low in %rax, high in %rdx. Store in that order, and let
+        // the destination be addressed by `mem`/`mem+8` only -- the registers
+        // holding the value are exactly the ones being stored.
+        self.state.emit_fmt(format_args!("    movq %rax, {lo_mem}"));
+        self.state.emit_fmt(format_args!("    movq %rdx, {hi_mem}"));
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Load the 16-byte value at the segment operand `mem` into `dest`.
+    pub(super) fn emit_seg_wide_load(&mut self, dest: &Value, mem: &str) {
+        let Some((lo_mem, hi_mem)) = Self::seg_wide_pair(mem) else {
+            self.emit_seg_wide_relocation_error();
+            return;
+        };
+        // Destination already in an XMM home: one load covers both halves.
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_xmm_reg(reg) {
+                let name = phys_reg_name(reg);
+                self.state
+                    .emit_fmt(format_args!("    movdqu {lo_mem}, %{}", name));
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+        }
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            if self.seg_wide_scratch_free(dest.0) {
+                self.state
+                    .emit_fmt(format_args!("    movdqu {lo_mem}, %xmm0"));
+                self.state
+                    .out
+                    .emit_instr_reg_rbp("    movdqu", "xmm0", slot.0);
+            } else {
+                self.state.emit_fmt(format_args!("    movq {lo_mem}, %rax"));
+                self.state.emit_fmt(format_args!("    movq {hi_mem}, %rdx"));
+                self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                self.state
+                    .out
+                    .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+        // No slot: leave the pair in %rax:%rdx, the wide accumulator home
+        // every consumer of a homed-but-unstored 128-bit value reads.
+        self.state.emit_fmt(format_args!("    movq {lo_mem}, %rax"));
+        self.state.emit_fmt(format_args!("    movq {hi_mem}, %rdx"));
+        self.state.reg_cache.invalidate_all();
+    }
 
     pub(super) fn emit_seg_load_impl(
         &mut self,
@@ -4297,6 +4655,12 @@ impl X86Codegen {
         };
         self.operand_to_rax(&Operand::Value(*ptr));
         self.state.emit("    movq %rax, %rcx");
+        // 16-byte value: both halves through the segment, at 0 and +8.
+        if Self::seg_wide_type(ty) {
+            let mem = format!("{}0(%rcx)", seg_prefix);
+            self.emit_seg_wide_load(dest, &mem);
+            return;
+        }
         // Scalar FP: load straight into the destination's XMM home rather than
         // moving the bit pattern through %rax.
         if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
@@ -4391,12 +4755,6 @@ impl X86Codegen {
             AddressSpace::SegFs => "%fs:",
             AddressSpace::Default => return false,
         };
-        // Same legality predicate as the default-space fast path
-        // (`is_foldable_mem_ty`): 128-bit values have no single
-        // memory-operand load.
-        if crate::backend::generation::is_wide_int_type(ty) || ty == IrType::F128 {
-            return false;
-        }
         // x86 displacements are sign-extended 32-bit.
         if i32::try_from(offset).is_err() {
             return false;
@@ -4408,6 +4766,21 @@ impl X86Codegen {
             return false;
         }
         let base_name = phys_reg_name(base_reg);
+        // 16-byte object: one `movdqu` pair with the displacement folded into
+        // the segment operand, exactly like the scalar form below. Without
+        // this arm the whole fold was refused for wide types, so every
+        // element of a `struct {long v[4];} __seg_gs` array cost an extra
+        // `leaq N(%base), %reg` per access -- the shape that made the
+        // aggregate copy kernel three times slower than GCC's.
+        if Self::seg_wide_type(ty) {
+            let mem = if offset == 0 {
+                format!("{}{}(%{})", seg_prefix, "", base_name)
+            } else {
+                format!("{}{}(%{})", seg_prefix, offset, base_name)
+            };
+            self.emit_seg_wide_load(dest, &mem);
+            return true;
+        }
         // Scalar FP stays in the SSE domain, like the default-space twin:
         // `movsd %gs:8(%rax), %xmm0` instead of a GPR round trip.
         if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
@@ -4486,12 +4859,27 @@ impl X86Codegen {
             AddressSpace::SegFs => "%fs:",
             AddressSpace::Default => return false,
         };
-        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
-            return false;
-        }
         // x86 displacements are sign-extended 32-bit, the same width the
         // load twin and the fold decider require.
         if i32::try_from(offset).is_err() {
+            return false;
+        }
+        // 16-byte object: the wide helper, with the displacement folded. The
+        // base must not be `%rax` because the helper stages through it, so
+        // the wide arm uses the stricter `seg_base_home` home test.
+        if Self::seg_wide_type(ty) {
+            let Some(base_reg) = self.seg_base_home(base) else {
+                return false;
+            };
+            let mem = if offset == 0 {
+                format!("{}0(%{})", seg_prefix, base_reg)
+            } else {
+                format!("{}{}(%{})", seg_prefix, offset, base_reg)
+            };
+            self.emit_seg_wide_store(val, &mem);
+            return true;
+        }
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
             return false;
         }
         let Some(base_reg) = self.seg_base_home(base) else {
@@ -4530,6 +4918,22 @@ impl X86Codegen {
         true
     }
 
+    /// The home of a segment *base* pointer that can appear inside a `%gs:`
+    /// memory operand: any general register, `%rax` included (only the value
+    /// being stored must avoid it, and the wide helpers stage into `%rax`
+    /// only after the operand text is formed).  `%rcx` is excluded: it is the
+    /// secondary scratch the caller may have just materialised into.
+    fn seg_pointer_home(&self, ptr: &Value) -> Option<&'static str> {
+        let &reg = self.reg_assignments.get(&ptr.0)?;
+        if is_xmm_reg(reg) {
+            return None;
+        }
+        match phys_reg_name(reg) {
+            "rcx" => None,
+            name => Some(name),
+        }
+    }
+
     /// The general-register home of `base` when it can address memory directly
     /// (never `rax`, which stages values, and never an xmm register).
     fn seg_base_home(&self, base: &Value) -> Option<&'static str> {
@@ -4563,6 +4967,11 @@ impl X86Codegen {
             self.emit_seg_load_xmm(dest, ty, seg_prefix, sym, Some("rip"));
             return;
         }
+        if Self::seg_wide_type(ty) {
+            let mem = format!("{}{}(%rip)", seg_prefix, sym);
+            self.emit_seg_wide_load(dest, &mem);
+            return;
+        }
         let load_instr = Self::mov_load_for_type(ty);
         let dest_reg = Self::load_dest_reg(ty);
         self.state.emit_fmt(format_args!(
@@ -4589,6 +4998,11 @@ impl X86Codegen {
             AddressSpace::SegFs => "%fs:",
             AddressSpace::Default => return false,
         };
+        if Self::seg_wide_type(ty) {
+            let mem = format!("{}{}", seg_prefix, addr);
+            self.emit_seg_wide_load(dest, &mem);
+            return true;
+        }
         if !matches!(
             ty,
             IrType::I8
@@ -4640,6 +5054,11 @@ impl X86Codegen {
             AddressSpace::SegFs => "%fs:",
             AddressSpace::Default => return false,
         };
+        if Self::seg_wide_type(ty) {
+            let mem = format!("{}{}", seg_prefix, addr);
+            self.emit_seg_wide_store(val, &mem);
+            return true;
+        }
         if !matches!(
             ty,
             IrType::I8
@@ -4966,6 +5385,23 @@ impl X86Codegen {
         // — startup SIGSEGV for every external binary (LK-24). Saving the
         // value on the stack makes the sequence correct for EVERY possible
         // home assignment of val and ptr, including rax/rcx/rdx themselves.
+        // 16-byte value: both halves through the segment. Doing this before
+        // the staging below also removes the `pushq`/`popq` pair for it,
+        // which is what the wide helper's address-independent form allows.
+        if Self::seg_wide_type(ty) {
+            let ptr_reg = self.seg_pointer_home(ptr);
+            let base = match ptr_reg {
+                Some(name) => format!("(%{})", name),
+                None => {
+                    self.operand_to_rax(&Operand::Value(*ptr));
+                    self.state.emit("    movq %rax, %rcx");
+                    "(%rcx)".to_string()
+                }
+            };
+            let mem = format!("{}0{}", seg_prefix, base);
+            self.emit_seg_wide_store(val, &mem);
+            return;
+        }
         self.operand_to_rax(val);
         self.state.emit("    pushq %rax");
         // The push moves %rsp by 8 until the pop. A pointer slot addressed
@@ -5005,6 +5441,11 @@ impl X86Codegen {
                 unreachable!("segment-prefixed op called with default address space")
             }
         };
+        if Self::seg_wide_type(ty) {
+            let mem = format!("{}{}(%rip)", seg_prefix, sym);
+            self.emit_seg_wide_store(val, &mem);
+            return;
+        }
         self.operand_to_rax(val);
         let store_instr = Self::mov_store_for_type(ty);
         let store_reg = Self::reg_for_type("rax", ty);
@@ -5058,6 +5499,24 @@ mod indexed_fold_contract_tests {
     /// ...and its scale-8 sibling.
     fn mem8() -> String {
         X86Codegen::sib_mem64("rbx", "rcx", 3, 0)
+    }
+
+    #[test]
+    fn relocation_bearing_wide_segment_access_fails_closed_without_panicking() {
+        let operand = Operand::Const(IrConst::I128(1));
+        let mut cg = X86Codegen::new();
+        cg.emit_seg_wide_store_pair(&operand, "%gs:tls_object@TPOFF");
+        assert_eq!(
+            cg.state.out.buf,
+            "    .error \"lccc: unsupported relocation-bearing 16-byte segment access\"\n"
+        );
+
+        cg.state.out.buf.clear();
+        cg.emit_seg_wide_load(&Value(1), "%gs:tls_object@TPOFF");
+        assert_eq!(
+            cg.state.out.buf,
+            "    .error \"lccc: unsupported relocation-bearing 16-byte segment access\"\n"
+        );
     }
 
     fn xmm_home(cg: &mut X86Codegen, v: u32) {
@@ -5435,6 +5894,146 @@ mod indexed_fold_contract_tests {
                 cg.indexed_fold_ok(&gep_info(vec![ty], true, 2)),
                 "{ty:?} store-fed folds must be guaranteed"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod f128_exact_copy_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+    use crate::ir::reexports::Value;
+
+    const RDI: PhysReg = PhysReg(14);
+    const RSI: PhysReg = PhysReg(15);
+    const DEST: Value = Value(1);
+    const SRC: Value = Value(2);
+
+    /// Where a pointer operand of the copy lives.
+    #[derive(Clone, Copy, Debug)]
+    enum Home {
+        Reg(PhysReg),
+        /// The pointer value is spilled to this frame slot.
+        Slot(i64),
+        /// The operand is the address of this frame object.
+        Object(i64),
+    }
+
+    fn copy(dest: Home, src: Home, no_sse: bool) -> Vec<String> {
+        let mut cg = X86Codegen::new();
+        cg.no_sse = no_sse;
+        for (value, home) in [(DEST, dest), (SRC, src)] {
+            match home {
+                Home::Reg(reg) => {
+                    cg.reg_assignments.insert(value.0, reg);
+                }
+                Home::Slot(offset) => {
+                    cg.state.value_locations.insert(value.0, StackSlot(offset));
+                }
+                Home::Object(offset) => {
+                    cg.state.value_locations.insert(value.0, StackSlot(offset));
+                    cg.state.alloca_values.insert(value.0);
+                }
+            }
+        }
+        cg.emit_f128_exact_copy_impl(&DEST, &SRC);
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn pointers_in_registers_are_used_where_they_are() {
+        assert_eq!(
+            copy(Home::Reg(RDI), Home::Reg(RSI), false),
+            ["movdqu (%rsi), %xmm0", "movdqu %xmm0, (%rdi)"]
+        );
+        // The exchange the `%rdi`/`%rsi` staging needed for crossed homes
+        // has nothing left to do.
+        assert_eq!(
+            copy(Home::Reg(RSI), Home::Reg(RDI), false),
+            ["movdqu (%rdi), %xmm0", "movdqu %xmm0, (%rsi)"]
+        );
+    }
+
+    #[test]
+    fn other_addresses_are_staged_in_rcx_one_at_a_time() {
+        assert_eq!(
+            copy(Home::Slot(-8), Home::Slot(-16), false),
+            [
+                "movq -16(%rbp), %rcx",
+                "movdqu (%rcx), %xmm0",
+                "movq -8(%rbp), %rcx",
+                "movdqu %xmm0, (%rcx)"
+            ]
+        );
+        assert_eq!(
+            copy(Home::Object(-64), Home::Reg(RSI), false),
+            [
+                "movdqu (%rsi), %xmm0",
+                "leaq -64(%rbp), %rcx",
+                "movdqu %xmm0, (%rcx)"
+            ]
+        );
+    }
+
+    #[test]
+    fn without_sse_the_payload_crosses_in_rax_a_word_at_a_time() {
+        assert_eq!(
+            copy(Home::Reg(RDI), Home::Reg(RSI), true),
+            [
+                "movq (%rsi), %rax",
+                "movq %rax, (%rdi)",
+                "movq 8(%rsi), %rax",
+                "movq %rax, 8(%rdi)"
+            ]
+        );
+        // Both addresses staged: each word stages them afresh, because the
+        // one scratch register left over has to serve both.
+        assert_eq!(
+            copy(Home::Slot(-8), Home::Object(-64), true),
+            [
+                "leaq -64(%rbp), %rcx",
+                "movq (%rcx), %rax",
+                "movq -8(%rbp), %rcx",
+                "movq %rax, (%rcx)",
+                "leaq -64(%rbp), %rcx",
+                "movq 8(%rcx), %rax",
+                "movq -8(%rbp), %rcx",
+                "movq %rax, 8(%rcx)"
+            ]
+        );
+    }
+
+    /// The defect: the pair is not a call point, so a register the allocator
+    /// handed out may hold a live value across it.  Whatever the operands'
+    /// homes, the only registers written are `%rcx`, `%rax` and `%xmm0`.
+    #[test]
+    fn no_allocatable_register_is_ever_written() {
+        let homes = [
+            Home::Reg(RDI),
+            Home::Reg(RSI),
+            Home::Reg(PhysReg(1)),
+            Home::Reg(PhysReg(12)),
+            Home::Reg(PhysReg(16)),
+            Home::Slot(-8),
+            Home::Object(-64),
+        ];
+        for dest in homes {
+            for src in homes {
+                for no_sse in [false, true] {
+                    for line in copy(dest, src, no_sse) {
+                        let written = line.rsplit(", ").next().unwrap_or_default();
+                        assert!(
+                            written.contains('(') || matches!(written, "%rcx" | "%rax" | "%xmm0"),
+                            "{dest:?} <- {src:?} (no_sse={no_sse}) writes {written}: {line}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

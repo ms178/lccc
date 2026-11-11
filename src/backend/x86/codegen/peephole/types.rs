@@ -2687,8 +2687,19 @@ pub(super) fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         // divide/multiply AX by r/m8 (quotient AL, remainder AH, product AX)
         // and never touch the %rdx family.
         b"divb" | b"idivb" | b"mulb" | b"imulb" => (RAX, RAX),
-        b"div" | b"divw" | b"divl" | b"divq" | b"idiv" | b"idivw" | b"idivl" | b"idivq"
-        | b"mul" | b"mulw" | b"mull" | b"mulq" => (RAX | RDX, RAX | RDX),
+        // A divide consumes the double-width dividend %rdx:%rax.
+        b"div" | b"divw" | b"divl" | b"divq" | b"idiv" | b"idivw" | b"idivl" | b"idivq" => {
+            (RAX | RDX, RAX | RDX)
+        }
+        // A multiply does not: `mul r/m` is %rdx:%rax <- %rax * r/m, so %rdx
+        // is an output only (SDM vol. 2, MUL).  Filing it with the divides
+        // made every value left in %rdx look live up to the next `mulq`,
+        // which kept a carry materialised in %rdx (`setb %dl; movzbl %dl,
+        // %edx; leaq (%r14,%rdx), %r11`) from folding into `adcq` in the
+        // one loop shape that multiplies every iteration: a bignum row.
+        // The word form writes only %dx; `implicit_r_w_full` keeps the
+        // family live there, exactly as for `imulw`.
+        b"mul" | b"mulw" | b"mull" | b"mulq" => (RAX, RAX | RDX),
         // imul with a single operand is the widening form (rax:rdx); the
         // two/three-operand forms name every register they touch.
         b"imul" | b"imulw" | b"imull" | b"imulq" if !rest.contains(&b',') => (RAX, RAX | RDX),
@@ -3054,6 +3065,22 @@ mod implicit_oracle_tests {
         // product AX — the %rdx family is never touched.
         assert_eq!(writes("    idivb %r11b"), RAX);
         assert_eq!(writes("    mulb %cl"), RAX);
+    }
+
+    #[test]
+    fn unsigned_multiply_reads_the_accumulator_only() {
+        // %rdx:%rax <- %rax * r/m: %rdx is written, never read.
+        for line in ["    mulq %rcx", "    mull %ecx", "    mulq 8(%rsp)"] {
+            assert_eq!(writes(line), RAX | RDX, "{line}");
+            assert_eq!(reads(line), RAX, "{line}");
+        }
+        // The word form writes %dx alone, so the family stays observable:
+        // not a full write, and therefore not a kill.
+        let (reads, writes, full) = implicit_r_w_full(b"mulw %cx");
+        assert_eq!((reads, writes), (RAX, RAX | RDX));
+        assert_eq!(full & RDX, 0, "a 16-bit write must not kill %rdx");
+        let (_, _, full) = implicit_r_w_full(b"mulq %rcx");
+        assert_eq!(full, RAX | RDX, "the 64-bit form redefines both halves");
     }
 
     #[test]

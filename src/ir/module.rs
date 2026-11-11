@@ -570,6 +570,9 @@ pub struct IrFunction {
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     /// True if the return value is _Float128 (ONE 16-byte XMM return).
     pub ret_is_f128_sse: bool,
+    /// The function returns a 16-byte vector in ONE `%xmm0`
+    /// (`Instruction::CallInfo::ret_is_vector128`).
+    pub ret_is_vector128: bool,
     /// True for `extern inline __attribute__((gnu_inline))` functions (or `extern inline`
     /// in GNU89 mode). These function bodies are lowered for inlining, but must NOT be
     /// emitted as standalone definitions. After the inlining pass, they are converted to
@@ -834,6 +837,7 @@ impl IrFunction {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
+            ret_is_vector128: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: SspInfo::default(),

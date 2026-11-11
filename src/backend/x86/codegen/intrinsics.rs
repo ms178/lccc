@@ -19,6 +19,40 @@ use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
 /// Decode bounded internal vector controls without truncating wide constants.
 /// A malformed producer must fail closed, not silently change a shuffle/store.
+/// The `__builtin_apply_args` block on x86-64: the six SysV integer argument
+/// registers (the four Microsoft ones are among them), `%rax` for the `%al`
+/// vector-register count of a variadic call, then `%xmm0`-`%xmm7`.
+pub(super) const APPLY_ARGS_GPRS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+pub(super) const APPLY_ARGS_AL_OFFSET: i64 = 48;
+pub(super) const APPLY_ARGS_XMM_OFFSET: i64 = 56;
+pub(super) const APPLY_ARGS_XMMS: i64 = 8;
+
+/// Bytes of the block that carry registers: everything up to the vector
+/// registers when the function may not touch them (`-mno-sse`).
+pub(super) const fn apply_args_block_bytes(no_sse: bool) -> i64 {
+    if no_sse {
+        APPLY_ARGS_XMM_OFFSET
+    } else {
+        APPLY_ARGS_XMM_OFFSET + 16 * APPLY_ARGS_XMMS
+    }
+}
+
+/// Whether `func` calls `__builtin_apply_args`, i.e. needs its incoming
+/// argument registers captured at entry.
+pub(super) fn function_saves_apply_args(func: &crate::ir::reexports::IrFunction) -> bool {
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                crate::ir::reexports::Instruction::Intrinsic {
+                    op: IntrinsicOp::SaveApplyArgs,
+                    ..
+                }
+            )
+        })
+    })
+}
+
 fn checked_vec_control(
     arg: Option<&Operand>,
     range: std::ops::RangeInclusive<i64>,
@@ -2975,49 +3009,38 @@ impl X86Codegen {
 
             // --- GCC __builtin_apply family ---
             //
-            // Save-area layout (x86-64 SysV, 184 bytes):
-            //   [0..48)   rdi, rsi, rdx, rcx, r8, r9   (integer argument regs)
-            //   [48]      al                            (SSE vararg count)
-            //   [56..184) xmm0..xmm7                    (SSE argument regs)
+            // The block layout is `APPLY_ARGS_*` at the top of this file.  Its size does not
+            // depend on -mno-sse, so a block can cross translation units.
             IntrinsicOp::ApplyArgsAreaSize => {
                 if let Some(d) = dest {
-                    self.state.emit("    movl $184, %eax");
+                    self.state.emit_fmt(format_args!(
+                        "    movl ${}, %eax",
+                        apply_args_block_bytes(false)
+                    ));
                     self.store_rax_to(d);
                 }
             }
             IntrinsicOp::SaveApplyArgs => {
-                let area_owned: Operand = dest_ptr
+                let area: Operand = dest_ptr
                     .as_ref()
                     .map(|v| Operand::Value(*v))
                     .or_else(|| args.first().cloned())
                     .expect("SaveApplyArgs requires an area pointer");
-                let area_op = &area_owned;
-                // Read-only on the argument registers: no live value is
-                // clobbered (r10/r11 are the reserved call-staging scratch
-                // pair).  movups keeps this correct regardless of the area's
-                // runtime alignment.
-                self.operand_to_reg(area_op, "r10");
-                self.state.emit("    movq %rdi, 0(%r10)");
-                self.state.emit("    movq %rsi, 8(%r10)");
-                self.state.emit("    movq %rdx, 16(%r10)");
-                self.state.emit("    movq %rcx, 24(%r10)");
-                self.state.emit("    movq %r8, 32(%r10)");
-                self.state.emit("    movq %r9, 40(%r10)");
-                self.state.emit("    movb %al, 48(%r10)");
-                self.state.emit("    testb %al, %al");
-                let no_sse = self.state.fresh_label("apply_args_no_sse");
-                self.state.out.emit_jmp_label(&no_sse);
-                for (i, reg) in [
-                    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
-                ]
-                .iter()
-                .enumerate()
-                {
+                // Copy the block the prologue captured at entry
+                // (`emit_apply_args_capture`).  %rax and %rcx are never
+                // homes, so nothing the allocator placed is disturbed.
+                let capture = self
+                    .apply_args_capture_offset
+                    .expect("the frame reserves a capture block for SaveApplyArgs");
+                self.operand_to_reg(&area, "rcx");
+                for offset in (0..apply_args_block_bytes(self.no_sse)).step_by(8) {
                     self.state
-                        .emit_fmt(format_args!("    movups %{}, {}(%r10)", reg, 56 + i * 16));
+                        .out
+                        .emit_instr_rbp_reg("    movq", capture + offset, "rax");
+                    self.state
+                        .emit_fmt(format_args!("    movq %rax, {offset}(%rcx)"));
                 }
-                self.state.out.emit_named_label(&no_sse);
-                self.state.reg_cache.invalidate_acc();
+                self.state.reg_cache.invalidate_all();
             }
             IntrinsicOp::DoBuiltinApply => {
                 // args: [func, save_area, result_area, size (unused: the
@@ -3034,29 +3057,32 @@ impl X86Codegen {
                 self.state.emit("    movq 24(%r10), %rcx");
                 self.state.emit("    movq 32(%r10), %r8");
                 self.state.emit("    movq 40(%r10), %r9");
+                // Every vector argument register, whatever the saved %al
+                // says: the block was captured unconditionally, and only a
+                // variadic caller gives %al a meaning.
+                if !self.no_sse {
+                    for i in 0..APPLY_ARGS_XMMS {
+                        self.state.emit_fmt(format_args!(
+                            "    movups {}(%r10), %xmm{}",
+                            APPLY_ARGS_XMM_OFFSET + 16 * i,
+                            i
+                        ));
+                    }
+                }
                 // al must hold the SSE argument count for the callee's
                 // varargs register-save prologue, whether or not it uses it.
-                self.state.emit("    movzbl 48(%r10), %eax");
-                self.state.emit("    testb %al, %al");
-                let no_sse = self.state.fresh_label("apply_no_sse");
-                self.state.out.emit_jmp_label(&no_sse);
-                for (i, reg) in [
-                    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    self.state
-                        .emit_fmt(format_args!("    movups {}(%r10), %{}", 56 + i * 16, reg));
-                }
-                self.state.out.emit_named_label(&no_sse);
+                self.state.emit_fmt(format_args!(
+                    "    movzbl {APPLY_ARGS_AL_OFFSET}(%r10), %eax"
+                ));
                 self.state.emit("    call *%r11");
                 // Capture the return value: result[0]=rax, result[8]=rdx,
                 // result[16]=xmm0 (movups: alignment-agnostic).
                 self.operand_to_reg(result, "r10");
                 self.state.emit("    movq %rax, 0(%r10)");
                 self.state.emit("    movq %rdx, 8(%r10)");
-                self.state.emit("    movups %xmm0, 16(%r10)");
+                if !self.no_sse {
+                    self.state.emit("    movups %xmm0, 16(%r10)");
+                }
                 self.state.reg_cache.invalidate_all();
             }
             IntrinsicOp::RestoreApplyResult => {
@@ -3064,7 +3090,9 @@ impl X86Codegen {
                 self.operand_to_reg(block, "r10");
                 self.state.emit("    movq 0(%r10), %rax");
                 self.state.emit("    movq 8(%r10), %rdx");
-                self.state.emit("    movups 16(%r10), %xmm0");
+                if !self.no_sse {
+                    self.state.emit("    movups 16(%r10), %xmm0");
+                }
                 self.state.reg_cache.invalidate_acc();
             }
             IntrinsicOp::FrameAddress => {

@@ -34,7 +34,10 @@
 # Each reproducer is built in four combinations (gcc/gcc reference, lccc/lccc,
 # lccc caller + gcc callee, gcc caller + lccc callee) per configuration and
 # every binary's output must equal the reference's.  Configurations:
-#   -O0/-O2 x { -mavx2, -march=x86-64-v3, -mavx512f, (none), -mno-avx }
+#   -O0/-O1/-O2 x { -mavx2, -march=x86-64-v3, -mavx512f, (none), -mno-avx }
+# -O1 is not redundant: a vector return read from a stale register-residency
+# record (`c_ptr` came back in %ymm5) showed at -O1 only, where the value
+# keeps a register home that -O0 does not have and -O2 folds away.
 # The -mavx512f configuration is run only on a host whose CPU executes
 # AVX-512F (the objects are still compiled and linked everywhere).  The
 # no-AVX configurations are also the gate's liveness proof: the same diffs
@@ -115,7 +118,7 @@ configs=(
     "noavx|-mno-avx"
 )
 ran512=0
-for opt in -O0 -O2; do
+for opt in -O0 -O1 -O2; do
     for cfg in "${configs[@]}"; do
         name=${cfg%%|*}
         extra=${cfg#*|}

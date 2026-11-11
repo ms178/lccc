@@ -15,6 +15,19 @@ fn apply(pass: Pass, body: &str) -> (bool, String) {
     (changed, store.build_result(|i| infos[i].is_nop()))
 }
 
+/// As [`apply`], with the `-g` rows hidden the way the driver hides them
+/// before the first pass runs.
+fn apply_hidden(pass: Pass, body: &str) -> (bool, String) {
+    let mut store = LineStore::new(format!("f:\n.cfi_startproc\n{body}\n.cfi_endproc\n"));
+    let mut infos: Vec<_> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    pin_inline_asm_regions(&store, &mut infos);
+    hide_debug_rows(&store, &mut infos);
+    let changed = pass(&mut store, &mut infos);
+    (changed, store.build_result(|i| infos[i].is_nop()))
+}
+
 fn code(text: &str) -> Vec<&str> {
     text.lines()
         .map(str::trim)
@@ -60,6 +73,62 @@ fn debug_attribution_does_not_break_instruction_adjacency() {
             assert!(debug.contains(marker), "attribution was discarded");
         }
     }
+}
+
+/// A scan window is a number of INSTRUCTIONS.  Hidden rows and deleted lines
+/// keep their line index, so a window bounded by index reached less far in a
+/// `-g` compilation: `simd_defer_chain.c` at `-O1` kept a reverse move that
+/// three rows had pushed past line eight, and compiled to different code.
+///
+/// Each body completes its pattern on the last instruction the window
+/// reaches, so one row anywhere inside it used to be enough.
+#[test]
+fn hidden_debug_rows_do_not_shorten_an_instruction_window() {
+    fn dead_reg_moves(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+        dead_code::eliminate_dead_reg_moves(store, infos)
+    }
+    let stores: String = (1..=6)
+        .map(|k| format!("movq %rax, -{}(%rbp)\n", 8 * k))
+        .collect();
+    let fillers = "addq $1, %rcx\n".repeat(6);
+    let cases: [(Pass, String, &str); 2] = [
+        (
+            local_patterns::combined_local_pass,
+            format!("movq %r10, %rax\n{stores}movq %rax, %r10\nret"),
+            "movq %rax, %r10",
+        ),
+        (
+            dead_reg_moves,
+            // `%r8` is read before the `ret`, so only the first move is dead.
+            format!("movq %rsi, %r8\n{fillers}movq %rdi, %r8\nmovq %r8, %rax\nret"),
+            "movq %rsi, %r8",
+        ),
+    ];
+    for (pass, body, retired) in cases {
+        let (changed, plain) = apply_hidden(pass, &body);
+        assert!(changed, "missing positive control: {body}");
+        assert!(!code(&plain).contains(&retired), "{plain}");
+        for rows in [1, 3] {
+            let marker = "\n.loc 1 7 3".repeat(rows);
+            let annotated = body
+                .lines()
+                .collect::<Vec<_>>()
+                .join(&format!("{marker}\n"));
+            let (changed, debug) = apply_hidden(pass, &annotated);
+            assert!(changed, "{annotated}");
+            assert_eq!(code(&plain), code(&debug), "{annotated}");
+        }
+    }
+    // The bound itself did not move: one instruction further and neither
+    // pattern is looked for, with or without rows.
+    let beyond_stores =
+        format!("movq %r10, %rax\n{stores}movq %rax, -56(%rbp)\nmovq %rax, %r10\nret");
+    let (_, text) = apply_hidden(local_patterns::combined_local_pass, &beyond_stores);
+    assert!(code(&text).contains(&"movq %rax, %r10"), "{text}");
+    let beyond_fillers =
+        format!("movq %rsi, %r8\n{fillers}addq $1, %rcx\nmovq %rdi, %r8\nmovq %r8, %rax\nret");
+    let (changed, text) = apply_hidden(dead_reg_moves, &beyond_fillers);
+    assert!(!changed, "{text}");
 }
 
 #[test]
