@@ -4240,7 +4240,24 @@ fn operand_is_iv(defs: &FxHashMap<u32, &Instruction>, op: &Operand, iv: Value) -
             return true;
         }
         match defs.get(&cur.0) {
-            Some(Instruction::Cast { dest, src, .. }) if *dest == cur => {
+            Some(Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if *dest == cur => {
+                // A NARROWING cast is not the identity: `p[(unsigned short)i]`
+                // reads different addresses from `p[i]` once `i` exceeds
+                // 65535, so the load the loop performs and the linear scan
+                // `memchr` performs would no longer cover the same bytes --
+                // and the rewrite discards the load address entirely.  A
+                // same-width reinterpret (U64->I64, the usual index cast) or
+                // a widening one is exact in two's complement, hence
+                // address-identical, and stays accepted.
+                if to_ty.size() < from_ty.size() {
+                    return false;
+                }
                 let Operand::Value(next) = src else {
                     return false;
                 };
@@ -4338,7 +4355,13 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
                 cold: false,
             },
         });
-    // `result != 0` is "a byte matched".
+    // `result != 0` is "a byte matched".  The IR compares pointers at the
+    // target's *integer* width with an `I64` null image -- that is the exact
+    // shape the frontend emits for `p != 0` on every target
+    // (`Cmp { ty: I64, rhs: Const(I64(0)) }` on x86-64, `ty: I32` on i686), so
+    // emitting `ty: Ptr` here would be off-convention and would make the
+    // compare's lane width depend on a pointer type the backends do not
+    // classify.
     let hit = alloc_value(func);
     func.blocks[m.preheader]
         .instructions
@@ -4347,7 +4370,7 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
             op: IrCmpOp::Ne,
             lhs: Operand::Value(result),
             rhs: Operand::Const(IrConst::I64(0)),
-            ty: IrType::Ptr,
+            ty: size_ty,
         });
     let preheader_label = func.blocks[m.preheader].label;
     func.blocks[m.preheader].terminator = Terminator::CondBranch {

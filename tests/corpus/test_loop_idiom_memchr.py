@@ -38,7 +38,19 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 LCCC = REPO / "target" / "fastbuild" / "lccc"
-GCC = "gcc-16"
+
+def gcc_oracle() -> str | None:
+    """The GCC used as an oracle, or None when this host has none.
+
+    CI pins GCC 16.2 (GCC_BIN or `gcc-16`); the reference leg is skipped rather
+    than failed on hosts without it, the compile-time assertions still run.
+    """
+    for candidate in (os.environ.get("GCC_BIN"), "gcc-16", "gcc"):
+        if candidate and shutil.which(candidate):
+            return candidate
+    return None
+
+
 FIXTURE = REPO / "tests" / "regression" / "loop_idiom_memchr.c"
 
 # The matched shape, plus the near misses.  Each near miss differs in exactly
@@ -82,6 +94,23 @@ static const unsigned char *scan(const unsigned char *p, unsigned char c, int n)
     return 0;
 }
 const unsigned char *use(const unsigned char *p, unsigned char c, int n) { return scan(p, c, n); }
+""",
+    # A NARROWING index cast: `p[(unsigned short)i]` reads different addresses
+    # than `p[i]` once i exceeds 65535, so a linear scan is a different program.
+    "narrow_index": r"""
+static const unsigned char *scan(const unsigned char *p, unsigned char c, size_t n) {
+    for (size_t i = 0; i < n; i++) if (p[(unsigned short)i] == c) return p + i;
+    return 0;
+}
+const unsigned char *use(const unsigned char *p, unsigned char c, size_t n) { return scan(p, c, n); }
+""",
+    # A same-width index cast is exact and must keep matching.
+    "reinterpret_index": r"""
+static const unsigned char *scan(const unsigned char *p, unsigned char c, size_t n) {
+    for (size_t i = 0; i < n; i++) if (p[(unsigned long)i] == c) return p + i;
+    return 0;
+}
+const unsigned char *use(const unsigned char *p, unsigned char c, size_t n) { return scan(p, c, n); }
 """,
     # Sixteen-bit elements are not bytes.
     "wide_elements": r"""
@@ -151,11 +180,29 @@ class ByteSearchIdiom(unittest.TestCase):
                                  f"{label} must keep the scalar loop")
 
     def test_near_misses_keep_their_loops(self) -> None:
-        for name in ("store_in_body", "index_result", "signed_bytes", "narrow_bound", "wide_elements"):
+        for name in ("store_in_body", "index_result", "signed_bytes", "narrow_bound",
+                     "wide_elements", "narrow_index"):
             with self.subTest(shape=name):
                 text = self.asm(SHAPES[name])
                 self.assertNotIn("call memchr", text,
                                  f"{name} must not be rewritten to memchr")
+
+    def test_value_preserving_index_cast_still_matches(self) -> None:
+        """`p[(unsigned long)i]` is the identity: the rewrite must still fire."""
+        self.assertIn("call memchr", self.asm(SHAPES["reinterpret_index"]))
+
+    def test_narrowing_index_cast_is_proven_and_declined(self) -> None:
+        """Regression: this used to be rewritten and answered 65539, not -1."""
+        fixture = REPO / "tests" / "regression" / "loop_idiom_memchr_trunc.c"
+        with tempfile.TemporaryDirectory(prefix="memchr-trunc-") as td:
+            exe = Path(td) / "trunc"
+            proc = subprocess.run([str(LCCC), "-O2", "-o", str(exe), str(fixture)],
+                                  capture_output=True, text=True, timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stderr[:2000])
+            run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=300)
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertIn("trunc -1", run.stdout)
+            self.assertIn("plain 1234", run.stdout)
 
     def test_own_memchr_definition_is_not_self_recursive(self) -> None:
         text = self.asm(OWN_MEMCHR)
@@ -193,8 +240,11 @@ int main(void) {
             asm = compile_asm(src, Path(td) / "goto.s", flags=["-O2"])
             self.assertIn("call memchr", asm,
                           "the goto-done search must be rewritten too")
+            gcc = gcc_oracle()
+            if gcc is None:
+                self.skipTest("no GCC oracle on this host")
             got = []
-            for cc in (LCCC, GCC):
+            for cc in (LCCC, gcc):
                 exe = Path(td) / ("exe-" + Path(cc).name)
                 proc = subprocess.run([str(cc), "-O2", "-o", str(exe), str(src)],
                                       capture_output=True, text=True, timeout=300)
