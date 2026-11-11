@@ -131,3 +131,45 @@ which is scheduled work, not a slice to fake.
 |------|--------|
 | `LCCC_TYPEOF_RECOVERY_TRACE` | Every `typeof` that falls back to the recovery-only `CType::Int` prints `typeof-recovery: ...` naming the operand. Off by default; a successful compile prints nothing. Used by `tests/corpus/test_typeof_unresolved_fallback.py` to check the contract in both directions. |
 | `CCC_DISABLE_PASSES=index_hoist,i128_split,i128_narrow_mul` | Existing kill switch, used above for pass attribution. |
+
+## The classification loop's second defect: constant pressure in the vector path
+
+The branchless experiment above shows the *scalar* loop is what costs 5.2x. It
+also exposed a second, independent defect that survives vectorization: the
+packed classifier spills vector temporaries to the stack because the constant
+splats occupy the register file.
+
+Measured on the vectorizing branchless kernel (`-O3`, one function, counted
+from the emitted assembly):
+
+| predicate | constants | vector spills | vector reloads | packed ALU ops |
+|-----------|-----------|---------------|----------------|----------------|
+| `[a-z] \| [A-Z]`                       | 2  | 0  | 0  | 15 |
+| full `is_name_char` (6 ranges/eq tests) | 13 | 12 | 18 | 28 |
+| same, `-mavx2`                          | 13 | 23 | 7  | 130 ymm uses |
+
+The two-constant row is the controlled experiment: with room in the register
+file the same loop spills nothing. So the constraint is *constant register
+pressure*, not an inherent allocator limitation — and it is avoidable, because
+every packed ALU op the classifier uses (`pcmpeqb`, `pcmpgtb`, `pand`,
+`pandn`, `por`, `paddb`, `psadbw`) accepts an `m128` operand, and the
+`.LCVEC` pool entries are produced as 16-byte aligned splats
+(`.p2align 4` + two `.quad`s), so they are legal aligned memory operands.
+`X86Codegen::lane_const_rip_operand` / `vec_const_rip_operand` already emit
+that exact form for the unsigned-compare bias, so the mechanism is in-tree and
+in use; what is missing is folding a const-pool *load* into its single
+consumer instead of keeping the constant resident in a register.
+
+That fold is the next scheduled change. It is a modification to
+`vector_load_op_fuse.rs` (which already owns single-use vector-load folding,
+alignment proof and a `CCC_PEEPHOLE_SKIP` switch), not a new pass. It is not
+landed here: the pass's soundness rests on a width model, an alignment proof
+and a liveness-monotonicity argument that a RIP-relative source extends, and
+landing a half-verified version of that would be exactly the kind of
+unmeasured change this document exists to prevent.
+
+What is landed is the ratchet: `tests/corpus/test_classify_predicate_codegen.py`
+records the current spill/reload counts (12/18), asserts the branchless form
+reaches the vectorizer at all, asserts both predicate forms agree with GCC and
+Clang on every byte at `-O0` and `-O3`, and asserts the kill switches bisect
+performance but never the result.
