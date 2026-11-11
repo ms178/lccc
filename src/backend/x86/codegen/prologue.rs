@@ -3560,32 +3560,7 @@ impl X86Codegen {
             }
         }
 
-        // Preserve source-level volatile semantics through the late text
-        // peephole.  The marker is a GNU-as comment and is consumed only by
-        // LCCC's peephole pre-scan; it names the final direct slot address.
-        // This avoids treating a volatile local as an ordinary dead stack
-        // temporary after register/FP shuttle rewrites.
-        let mut volatile_ids: Vec<u32> =
-            self.state.volatile_alloca_values.iter().copied().collect();
-        volatile_ids.sort_unstable();
-        for id in volatile_ids {
-            if let Some(slot) = self.state.get_slot(id) {
-                // The marker must name the slot exactly as the access
-                // instructions spell it, so it goes through the same operand
-                // splitter: `%rbp` normally, the `%rsp` anchor for a frame past
-                // imm32, `%rsp` directly when the frame pointer is omitted.
-                // A slot no anchor can name is reached through `(%rcx)`, which
-                // the peephole cannot mistake for a direct slot, so it needs
-                // no marker.
-                if let Some((disp, base)) = self.state.out.slot_operand_parts_opt(slot.0) {
-                    self.state.emit_fmt(format_args!(
-                        "    # LCCC_VOLATILE_SLOT {}{}",
-                        disp,
-                        base.spelling()
-                    ));
-                }
-            }
-        }
+        self.emit_volatile_slot_markers();
 
         // Publish the XMM return-register set so the late text peephole's FP
         // liveness oracle (`fp_liveness.rs`) knows exactly which of
@@ -3719,6 +3694,38 @@ impl X86Codegen {
             }
         }
         self.emit_apply_args_capture();
+    }
+
+    /// Preserve source-level volatile semantics through the late text
+    /// peephole.
+    ///
+    /// One `# LCCC_VOLATILE_SLOT` GNU-as comment per source-level volatile
+    /// local, naming the final direct slot address. The marker is consumed
+    /// only by LCCC's peephole pre-scan, which would otherwise treat a
+    /// volatile local as an ordinary dead stack temporary after the
+    /// register/FP shuttle rewrites.
+    fn emit_volatile_slot_markers(&mut self) {
+        let mut volatile_ids: Vec<u32> =
+            self.state.volatile_alloca_values.iter().copied().collect();
+        volatile_ids.sort_unstable();
+        for id in volatile_ids {
+            if let Some(slot) = self.state.get_slot(id) {
+                // The marker must name the slot exactly as the access
+                // instructions spell it, so it goes through the same operand
+                // splitter: `%rbp` normally, the `%rsp` anchor for a frame past
+                // imm32, `%rsp` directly when the frame pointer is omitted.
+                // A slot no anchor can name is reached through `(%rcx)`, which
+                // the peephole cannot mistake for a direct slot, so it needs
+                // no marker.
+                if let Some((disp, base)) = self.state.out.slot_operand_parts_opt(slot.0) {
+                    self.state.emit_fmt(format_args!(
+                        "    # LCCC_VOLATILE_SLOT {}{}",
+                        disp,
+                        base.spelling()
+                    ));
+                }
+            }
+        }
     }
 
     /// Fill the `__builtin_apply_args` block with the incoming argument

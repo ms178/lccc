@@ -124,3 +124,10 @@ candidates — the surviving blocks are join blocks with several predecessors,
 not chain links — so the change was reverted rather than landed as unproven
 complexity. The transform that would work is a chain-aware flattening pass,
 which is scheduled work, not a slice to fake.
+
+## Diagnostics added by this changeset
+
+| knob | effect |
+|------|--------|
+| `LCCC_TYPEOF_RECOVERY_TRACE` | Every `typeof` that falls back to the recovery-only `CType::Int` prints `typeof-recovery: ...` naming the operand. Off by default; a successful compile prints nothing. Used by `tests/corpus/test_typeof_unresolved_fallback.py` to check the contract in both directions. |
+| `CCC_DISABLE_PASSES=index_hoist,i128_split,i128_narrow_mul` | Existing kill switch, used above for pass attribution. |

@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 565,
+  "knob_literals": 566,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -564,6 +564,7 @@
     "LCCC_STRICT_MFLAGS",
     "LCCC_STRICT_OPTIONS",
     "LCCC_SYSROOT",
+    "LCCC_TYPEOF_RECOVERY_TRACE",
     "LCCC_VA_CALL",
     "LCCC_VEC_STRIDED_TRACE",
     "LCCC_VOLATILE_BEGIN",
@@ -571,7 +572,7 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 255,
+  "knobs_undocumented": 253,
   "panic_sites": 863,
   "panic_sites_hot": 94,
   "unsafe_sites": 27
