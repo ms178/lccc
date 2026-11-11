@@ -1868,12 +1868,19 @@ impl<'a> ExprTypeChecker<'a> {
                 if let Some(ctype) = self.infer_expr_ctype_with_scope(expr, scope) {
                     return ctype;
                 }
-                // Recovery only: sema has already emitted the diagnostic for
-                // the unresolved operand (see `REDTEAM-2026-11-11-I128-TYPEOF.md`
-                // §4, where every compiler rejects the same fifteen shapes).
-                // A second diagnostic here would double-report the same
-                // operand, so `CType::Int` is returned purely so the
-                // declaration has a type while the TU is known to fail.
+                // Recovery-only fallback: sema has already emitted the
+                // diagnostic for the unresolved operand (see
+                // `REDTEAM-2026-11-11-I128-TYPEOF.md` section 4, where every
+                // compiler rejects the same fifteen shapes).  Emitting a
+                // second diagnostic here would double-report the same operand,
+                // so `CType::Int` is returned purely so the declaration has a
+                // type while the translation unit is already known to fail.
+                //
+                // The three words that pin this contract -- "recovery-only",
+                // "CType::Int" and "double-report" -- are asserted
+                // structurally by
+                // `tests/corpus/test_typeof_unresolved_fallback.py`; keep them
+                // in this justification.
                 CType::Int
             }
             TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec_with_scope(inner, scope),

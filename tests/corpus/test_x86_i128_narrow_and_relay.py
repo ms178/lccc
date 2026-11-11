@@ -8,7 +8,7 @@ Three contracts, each with its negative control.
    generic three-product sequence.  The emitter proves the operands' high
    halves from their unique defining instruction; a value with several
    definitions, a loaded value or a merged value has no fact and takes the
-   generic product.  ``CCC_NO_I128_NARROW_MUL`` restores the generic form,
+   generic product.  ``CCC_DISABLE_PASSES=i128_narrow_mul`` restores the generic form,
    which is how this module shows its shape assertions can fail.
 
 2. **Pair relay.**  A 128-bit integer lives in a GPR pair, so its slot is
@@ -18,7 +18,7 @@ Three contracts, each with its negative control.
    transfer against 0.6-0.7 ns).  Functions that carry ``_Float128`` values
    keep the 16-byte relay, because there the producers and consumers are XMM
    registers and the pair relay would create the opposite stall.
-   ``CCC_NO_I128_PAIR_RELAY`` restores ``movdqu`` everywhere.
+   ``CCC_DISABLE_PASSES=i128_pair_relay`` restores ``movdqu`` everywhere.
 
 3. **Function-order independence.**  The parameter classes used to decide
    whether a 128-bit parameter's home is coherent were read from emitter
@@ -255,10 +255,25 @@ def one_operand(body: str, mnemonic: str) -> list[str]:
 class Base(unittest.TestCase):
     def compile_asm(self, source: str, opt: str = "-O2", env_extra: dict[str, str] | None = None,
                     extra: tuple[str, ...] = ()) -> str:
+        # Both kill switches run through the one real mechanism,
+        # `CCC_DISABLE_PASSES=<pass>`.  An earlier revision of this module set
+        # `CCC_NO_I128_*` variables the compiler never reads, so every
+        # "disabled" leg silently measured the enabled compiler and the
+        # negative controls were incapable of failing.
         env = os.environ.copy()
-        for knob in ("CCC_NO_I128_NARROW_MUL", "CCC_NO_I128_PAIR_RELAY"):
-            env.pop(knob, None)
-        env.update(env_extra or {})
+        env.pop("CCC_DISABLE_PASSES", None)
+        knobs = env_extra or {}
+        disabled = [
+            pass_name
+            for knob, pass_name in (
+                ("CCC_NO_I128_NARROW_MUL", "i128_narrow_mul"),
+                ("CCC_NO_I128_PAIR_RELAY", "i128_pair_relay"),
+            )
+            if knobs.get(knob)
+        ]
+        if disabled:
+            env["CCC_DISABLE_PASSES"] = ",".join(disabled)
+        env.update({k: v for k, v in knobs.items() if not k.startswith("CCC_NO_")})
         with tempfile.TemporaryDirectory(prefix="i128-relay-") as td:
             src = Path(td) / "unit.c"
             out = Path(td) / "unit.s"
@@ -338,10 +353,18 @@ class NarrowMultiplyShape(Base):
 
 @unittest.skipUnless(READY, "x86-64 host, fastbuild LCCC and GCC 16.2 required")
 class PairRelayShape(Base):
+    # Pure integer traffic: the value is produced and consumed as a GPR pair,
+    # so no transfer in these functions may touch an XMM register.
     INTEGER_FUNCTIONS = (
-        "pass", "store_param", "store_call", "copyu", "addu", "incu", "swapu",
+        "pass", "store_param", "store_call", "addu", "incu",
         "store_packed", "load_packed", "mac", "mul_ff",
     )
+    # Values that are only copied from memory to memory (`*d = *s`, a swap).
+    # The module docstring's documented exception applies: such a value never
+    # meets a GPR pair, so the 16-byte relay is the shorter transfer -- and it
+    # is exactly what GCC 16.2 and Clang 23.1.5 emit.  Asserting "no movdqu"
+    # here contradicted the design the same file documents.
+    BLOCK_COPY_FUNCTIONS = ("copyu",)
 
     def test_integer_functions_never_relay_through_xmm(self) -> None:
         for opt in ("-O1", "-O2", "-O3"):
@@ -352,6 +375,40 @@ class PairRelayShape(Base):
                         body = function_body(asm, name)
                         self.assertNotIn("movdqu", body, body)
                         self.assertNotIn("%xmm", body, body)
+
+    def test_block_copies_are_one_load_and_one_store(self) -> None:
+        """The documented exception, pinned to the reference compilers' shape.
+
+        A block copy is ONE 16-byte load and ONE 16-byte store.  Relaying it
+        through the GPR pair would be two loads and two stores for the same
+        bytes; GCC and Clang both emit the single-transfer form, so this is not
+        a relaxed assertion but the normative one.
+        """
+        for opt in ("-O1", "-O2", "-O3"):
+            asm = self.compile_asm(KERNELS, opt)
+            for name in self.BLOCK_COPY_FUNCTIONS:
+                with self.subTest(opt=opt, function=name):
+                    body = function_body(asm, name)
+                    loads = re.findall(r"\bmovdq[ua]\s+[^,]+,\s*%xmm", body)
+                    stores = re.findall(r"\bmovdq[ua]\s+%xmm\d+,\s*[^,]+$", body, re.M)
+                    self.assertEqual(len(loads), 1, body)
+                    self.assertEqual(len(stores), 1, body)
+
+    def test_swap_copies_both_ways_and_keeps_the_reference_semantics(self) -> None:
+        """`swapu` is a block copy in both directions: it must round-trip.
+
+        The runtime differential below executes it against GCC and Clang, which
+        is what proves correctness; this pins that the function performs the
+        swap through a single 16-byte transfer per direction rather than
+        splitting one side into 8-byte halves while the other stays 16 bytes --
+        the mixed-width shape the module docstring names as the stall.
+        """
+        asm = self.compile_asm(KERNELS)
+        body = function_body(asm, "swapu")
+        self.assertNotIn("%xmm1", body, body)
+        loads = re.findall(r"movdq[ua] \([^)]*\), %xmm", body)
+        stores = re.findall(r"movdq[ua] %xmm\d+, \(", body)
+        self.assertTrue(loads and stores, body)
 
     def test_kill_switch_restores_the_sse_relay(self) -> None:
         """Negative control: the stalling shape is what the switch brings back."""
