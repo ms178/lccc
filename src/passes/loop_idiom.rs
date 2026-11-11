@@ -490,6 +490,41 @@ pub(crate) fn recognize_idioms(
                     break;
                 }
             }
+            // Byte-search idiom -- `for (i = 0; i < n; i++) if (p[i] == c)
+            // return p + i; return 0;` over a `unsigned char` array.  libc's
+            // `memchr` is the law of the land for exactly this shape: Clang's
+            // `LoopIdiomRecognize` rewrites it the same way, and a libc
+            // implementation compares 16 or 32 bytes per step against this
+            // loop's one.  Matched only when the loop IS the tail of the
+            // function (both exits return), so the rewrite is "return the
+            // call's result" with no phi surgery.
+            if memchr_idiom_enabled()
+                && func
+                    .pass_policy
+                    .builtins
+                    .may_synthesize(crate::common::pass_policy::Libcall::Memchr)
+            {
+                if let Some(matched) = try_match_search_loop(func, lp, &cfg) {
+                    dlog!(
+                        "{} loop@{}: MATCH memchr (header={} pre={} body={} found={} latch={} exit={} base=v{} needle={:?})",
+                        func.name,
+                        lp.header,
+                        matched.header,
+                        matched.preheader,
+                        matched.body,
+                        matched.found,
+                        matched.latch,
+                        matched.exit,
+                        matched.base.0,
+                        matched.needle,
+                    );
+                    if rewrite_search_loop(func, &matched) {
+                        total += 1;
+                        progressed = true;
+                        break;
+                    }
+                }
+            }
             // Brian Kernighan population-count idiom (`while (x) { x &= x - 1; r++; }`
             // and the guarded `do { x &= x - 1; r++; } while (x)` form): each
             // iteration clears the lowest set bit of `x`, so the trip count is
@@ -3551,6 +3586,859 @@ fn rewrite_ctz_loop(func: &mut IrFunction, m: &CtzLoop, body: &FxHashSet<usize>)
         dead_labels.len()
     );
     true
+}
+
+/// The `CCC_NO_MEMCHR_IDIOM` escape hatch: the whole pass has
+/// `CCC_NO_LOOP_IDIOM`, but a bisect has to separate this rewrite from the
+/// eight that share the pass.  Default-on, like the pass itself.
+fn memchr_idiom_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("CCC_NO_MEMCHR_IDIOM").is_none());
+    *ON
+}
+
+/// A matched byte-search loop (`for (i = 0; i < n; i++) if (p[i] == c) return
+/// p + i; return 0;`), fully verified before any mutation: see
+/// [`try_match_search_loop`].
+struct SearchLoop {
+    preheader: usize,
+    header: usize,
+    body: usize,
+    found: usize,
+    latch: usize,
+    exit: usize,
+    /// The scanned base pointer (`p`), loop-invariant.
+    base: Value,
+    /// The searched byte (`c`): a `U8` value defined outside the loop, or a
+    /// constant byte image.
+    needle: Operand,
+    /// The value the found arm produced (`base + i`); its uses become the
+    /// call's result.
+    found_value: Value,
+    /// Value-preserving `Copy`/same-width `Cast` steps in the found arm that
+    /// forward [`Self::found_value`].  They are kept (their source becomes the
+    /// call's result), so the returned type is whatever the source asked for.
+    found_keep: Vec<Value>,
+    /// Trip-count bound (`n`), loop-invariant and exactly `size_t` wide.
+    bound: Operand,
+    bound_ty: IrType,
+}
+
+/// The `Cast` that produces `v`, after following `Copy` chains.
+fn as_cast_operand(
+    defs: &FxHashMap<u32, &Instruction>,
+    v: Value,
+) -> Option<(Operand, IrType, IrType)> {
+    let v = resolve_copy(defs, v);
+    match defs.get(&v.0) {
+        Some(Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        }) => Some((src.clone(), *from_ty, *to_ty)),
+        _ => None,
+    }
+}
+
+/// Visit every value a terminator consumes.  A terminator is not an
+/// instruction, so [`Instruction::for_each_used_value`] cannot see these; a
+/// proof that a value has no live uses outside a region must cover them or it
+/// would miss `return v;`, `if (v) ...` and `switch (v)`.
+fn terminator_uses(term: &Terminator, mut f: impl FnMut(u32)) {
+    let op = match term {
+        Terminator::Return(Some(op))
+        | Terminator::CondBranch { cond: op, .. }
+        | Terminator::IndirectBranch { target: op, .. }
+        | Terminator::Switch { val: op, .. } => op,
+        _ => return,
+    };
+    if let Operand::Value(v) = op {
+        f(v.0);
+    }
+}
+
+/// Block index of the definition of every `Value` in `func`.
+fn value_def_blocks(func: &IrFunction) -> FxHashMap<u32, usize> {
+    let mut map = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                map.insert(d.0, bi);
+            }
+        }
+    }
+    map
+}
+
+/// Match the byte-search idiom.
+///
+/// Every acceptance condition is a proof obligation; the rewrite re-creates
+/// `memchr(p, (int)(unsigned char)c, n)` and deletes the loop, so anything
+/// the matcher cannot prove is declined rather than approximated:
+///
+/// * the loop is exactly `{header, body, latch}` with `preheader` and a
+///   single `exit`, and `preheader` branches unconditionally into the header;
+/// * the header is `i = phi(0 from preheader, step from latch)` plus one
+///   `Ult` compare against a loop-invariant `size_t` bound -- `Ult` is the
+///   `size_t` relation, so the trip count is `memchr`'s byte count exactly,
+///   and a signed bound (whose negative values `memchr` would read as
+///   astronomically large) is never accepted;
+/// * the body loads one `U8` at `base + i` (`GetElementPtr` on the IV),
+///   compares it for equality against a `U8` value defined outside the loop,
+///   and does nothing else -- no store, call, or atomic can be reordered
+///   across the library scan;
+/// * the found arm computes `base + i` and returns it, the exit arm returns
+///   a zero constant: the two results are exactly `memchr`'s non-null and
+///   null results, which is why no phi has to be reconstructed;
+/// * neither the bound, the base, nor the needle is defined inside the loop.
+fn try_match_search_loop(
+    func: &IrFunction,
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+) -> Option<SearchLoop> {
+    let name = func.name.as_str();
+    if lp.body.len() != 3 {
+        dlog!(
+            "{name} loop@{}: memchr bail (loop body is {} blocks)",
+            lp.header,
+            lp.body.len()
+        );
+        return None;
+    }
+    let header = lp.header;
+    let label_to_idx = analysis::build_label_map(func);
+    let (body, exit) = match &func.blocks[header].terminator {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            let ti = *label_to_idx.get(true_label)?;
+            let fi = *label_to_idx.get(false_label)?;
+            let t_in = lp.body.contains(&ti);
+            let f_in = lp.body.contains(&fi);
+            if t_in == f_in {
+                dlog!("{name} loop@{header}: memchr bail (header arms not split)");
+                return None;
+            }
+            if t_in { (ti, fi) } else { (fi, ti) }
+        }
+        _ => return None,
+    };
+    if lp.body.contains(&exit) || body == exit {
+        dlog!("{name} loop@{header}: memchr bail (exit inside loop)");
+        return None;
+    }
+    let preds: Vec<usize> = cfg.preds.row(header).iter().map(|&p| p as usize).collect();
+    if preds.len() != 2 {
+        dlog!(
+            "{name} loop@{header}: memchr bail (header preds {})",
+            preds.len()
+        );
+        return None;
+    }
+    let latch = lp.single_latch(&cfg.preds)?;
+    if latch == header || !lp.body.contains(&latch) || latch == body {
+        dlog!("{name} loop@{header}: memchr bail (latch shape)");
+        return None;
+    }
+    let preheader = if preds[0] == latch {
+        preds[1]
+    } else {
+        preds[0]
+    };
+    if preheader == latch || preheader == body || lp.body.contains(&preheader) {
+        dlog!("{name} loop@{header}: memchr bail (preheader shape)");
+        return None;
+    }
+    if !matches!(&func.blocks[preheader].terminator,
+                 Terminator::Branch(t) if label_to_idx.get(t) == Some(&header))
+    {
+        dlog!("{name} loop@{header}: memchr bail (preheader not Branch header)");
+        return None;
+    }
+
+    let mut defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    for b in &func.blocks {
+        for i in &b.instructions {
+            if let Some(d) = i.dest() {
+                defs.insert(d.0, i);
+            }
+        }
+    }
+    let def_blocks = value_def_blocks(func);
+    let size_ty = crate::common::types::target_int_ir_type();
+    let preheader_label = func.blocks[preheader].label;
+    let latch_label = func.blocks[latch].label;
+
+    // ---- header: IV phi + `Ult` bound -------------------------------------
+    let mut iv_phi: Option<(Value, IrType)> = None;
+    let mut bound: Option<(Operand, IrType)> = None;
+    for inst in &func.blocks[header].instructions {
+        match inst {
+            Instruction::Phi {
+                dest, ty, incoming, ..
+            } => {
+                if iv_phi.is_some() || incoming.len() != 2 {
+                    return None;
+                }
+                let mut zero_edge = false;
+                let mut latch_edge = false;
+                for (op, lbl) in incoming {
+                    if *lbl == preheader_label {
+                        zero_edge = matches!(op, Operand::Const(c) if c.to_i64() == Some(0));
+                    } else if *lbl == latch_label {
+                        latch_edge = true;
+                    } else {
+                        return None;
+                    }
+                }
+                if !zero_edge || !latch_edge {
+                    dlog!("{name} loop@{header}: memchr bail (IV phi edges)");
+                    return None;
+                }
+                iv_phi = Some((*dest, *ty));
+            }
+            Instruction::Cmp {
+                op: IrCmpOp::Ult,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let (phi, phi_ty) = iv_phi?;
+                if bound.is_some() {
+                    return None;
+                }
+                let (iv_side, other) = if *lhs == Operand::Value(phi) {
+                    (true, rhs.clone())
+                } else if *rhs == Operand::Value(phi) {
+                    (true, lhs.clone())
+                } else {
+                    (false, Operand::Const(IrConst::I64(0)))
+                };
+                if !iv_side || *ty != phi_ty {
+                    dlog!("{name} loop@{header}: memchr bail (compare is not Ult(IV, bound))");
+                    return None;
+                }
+                bound = Some((other, *ty));
+            }
+            _ => return None,
+        }
+    }
+    let (iv, _iv_ty) = iv_phi?;
+    let (bound_op, bound_ty) = bound?;
+    // The trip count is the `Ult` compare against `bound`, i.e. the bound's
+    // bit pattern read as an unsigned number. `size_t` reads the same bits,
+    // so a bound of the same width is exact whatever its signedness -- a
+    // *narrower* signed bound would be a different number (a negative
+    // `int` is not a huge `size_t`), and is declined.
+    if bound_ty.size() != size_ty.size() || !bound_ty.is_integer() {
+        dlog!(
+            "{name} loop@{header}: memchr bail (bound is {} bytes, size_t is {})",
+            bound_ty.size(),
+            size_ty.size()
+        );
+        return None;
+    }
+    if let Operand::Value(bv) = bound_op {
+        match def_blocks.get(&bv.0) {
+            Some(&db) if lp.body.contains(&db) => {
+                dlog!("{name} loop@{header}: memchr bail (bound defined in loop)");
+                return None;
+            }
+            _ => {}
+        }
+    }
+
+    // ---- body: one `U8` load at base+IV, compared to a byte --------------
+    let mut gep: Option<(Value, Value, Operand)> = None;
+    let mut load: Option<Value> = None;
+    let mut eq: Option<(Operand, Operand, IrType)> = None;
+    for inst in &func.blocks[body].instructions {
+        match inst {
+            Instruction::Copy { .. } | Instruction::Cast { .. } => {}
+            Instruction::GetElementPtr {
+                dest, base, offset, ..
+            } => {
+                if gep.is_some() {
+                    return None;
+                }
+                gep = Some((*dest, *base, offset.clone()));
+            }
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile,
+                seg_override,
+            } => {
+                if load.is_some()
+                    || *ty != IrType::U8
+                    || *volatile
+                    || !matches!(seg_override, crate::common::types::AddressSpace::Default)
+                {
+                    return None;
+                }
+                if gep.is_none() || resolve_copy(&defs, *ptr) != gep?.0 {
+                    dlog!("{name} loop@{header}: memchr bail (load is not through the GEP)");
+                    return None;
+                }
+                load = Some(*dest);
+            }
+            Instruction::Cmp {
+                op: IrCmpOp::Eq,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                if eq.is_some() {
+                    return None;
+                }
+                eq = Some((lhs.clone(), rhs.clone(), *ty));
+            }
+            _ => {
+                dlog!("{name} loop@{header}: memchr bail (non-pure body instruction)");
+                return None;
+            }
+        }
+    }
+    let (_gep_dest, base, offset) = gep?;
+    let loaded = load?;
+    if !operand_is_iv(&defs, &offset, iv) {
+        dlog!("{name} loop@{header}: memchr bail (index is not the IV)");
+        return None;
+    }
+    let (l, r, _cmp_ty) = eq?;
+    // One side is the loaded byte (possibly widened); the other is the needle.
+    let byte_side = |op: &Operand| -> Option<u32> {
+        match op {
+            Operand::Value(v) => match as_cast_operand(&defs, *v) {
+                Some((Operand::Value(src), IrType::U8, _)) => Some(src.0),
+                _ => (*v == loaded).then_some(loaded.0),
+            },
+            Operand::Const(_) => None,
+        }
+    };
+    let (needle_side, loaded_ok) = match (byte_side(&l), byte_side(&r)) {
+        (Some(id), _) if id == loaded.0 => (r.clone(), true),
+        (_, Some(id)) if id == loaded.0 => (l.clone(), true),
+        _ => (Operand::Const(IrConst::I64(0)), false),
+    };
+    if !loaded_ok {
+        dlog!("{name} loop@{header}: memchr bail (compare is not on the loaded byte)");
+        return None;
+    }
+    // The needle: a constant byte image, or a U8 value defined outside the loop.
+    let needle: Operand = match &needle_side {
+        Operand::Const(c) => {
+            let Some(raw) = c.to_i64() else {
+                dlog!("{name} loop@{header}: memchr bail (needle const is not an integer)");
+                return None;
+            };
+            if !(-128..=255).contains(&raw) {
+                dlog!("{name} loop@{header}: memchr bail (needle const is not a byte)");
+                return None;
+            }
+            Operand::Const(IrConst::I32((raw as i64 & 0xff) as i32))
+        }
+        Operand::Value(v) => {
+            let src = match as_cast_operand(&defs, *v) {
+                Some((Operand::Value(src), IrType::U8, _)) => src,
+                Some(_) => {
+                    dlog!("{name} loop@{header}: memchr bail (needle is not a U8 value)");
+                    return None;
+                }
+                None if *v == loaded => {
+                    dlog!("{name} loop@{header}: memchr bail (needle is the loaded byte)");
+                    return None;
+                }
+                None => *v,
+            };
+            match defs.get(&src.0) {
+                Some(Instruction::ParamRef { ty, .. }) if *ty == IrType::U8 => {}
+                Some(Instruction::Cast { to_ty, .. }) if *to_ty == IrType::U8 => {}
+                Some(_) => {
+                    // Any other U8-typed producer is fine as long as its type
+                    // is a byte; the IR types every value, so trust the operand
+                    // type we just proved (`from_ty == U8`) or the identity
+                    // case, and decline the rest.
+                    dlog!("{name} loop@{header}: memchr bail (needle producer is not a byte)");
+                    return None;
+                }
+                None => {
+                    dlog!("{name} loop@{header}: memchr bail (needle has no definition)");
+                    return None;
+                }
+            }
+            match def_blocks.get(&src.0) {
+                Some(&db) if lp.body.contains(&db) => {
+                    dlog!("{name} loop@{header}: memchr bail (needle defined in loop)");
+                    return None;
+                }
+                _ => {}
+            }
+            Operand::Value(src)
+        }
+    };
+    match def_blocks.get(&base.0) {
+        Some(&db) if lp.body.contains(&db) => {
+            dlog!("{name} loop@{header}: memchr bail (base defined in loop)");
+            return None;
+        }
+        _ => {}
+    }
+
+    // ---- found arm: `base + IV`, the value the call replaces ------------
+    let found = match &func.blocks[body].terminator {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => {
+            if !matches!(eq_cond_of(func, &defs, body), Some(c) if Operand::Value(c) == *cond) {
+                return None;
+            }
+            let ti = *label_to_idx.get(true_label)?;
+            let fi = *label_to_idx.get(false_label)?;
+            if ti == latch {
+                fi
+            } else if fi == latch {
+                ti
+            } else {
+                dlog!("{name} loop@{header}: memchr bail (neither arm is the latch)");
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    if lp.body.contains(&found) || found == exit {
+        return None;
+    }
+    let mut found_add: Option<(Value, Operand, Operand)> = None;
+    for inst in &func.blocks[found].instructions {
+        match inst {
+            Instruction::Copy { .. } | Instruction::Cast { .. } => {}
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
+                if found_add.is_some() {
+                    return None;
+                }
+                found_add = Some((*dest, lhs.clone(), rhs.clone()));
+            }
+            _ => {
+                dlog!("{name} loop@{header}: memchr bail (found arm is not base + IV)");
+                return None;
+            }
+        }
+    }
+    let (found_value, add_l, add_r) = found_add?;
+    let add_off = if add_l == Operand::Value(base) {
+        add_r
+    } else if add_r == Operand::Value(base) {
+        add_l
+    } else {
+        dlog!("{name} loop@{header}: memchr bail (found arm is not base + IV)");
+        return None;
+    };
+    if !operand_is_iv(&defs, &add_off, iv) {
+        dlog!("{name} loop@{header}: memchr bail (found arm is not base + IV)");
+        return None;
+    }
+
+    // ---- single-pred guards and the no-leak proof ------------------------
+    for (blk, what) in [(found, "found"), (exit, "exit")] {
+        let n = cfg.preds.row(blk).iter().count();
+        if n != 1 {
+            dlog!("{name} loop@{header}: memchr bail ({what} has {n} preds)");
+            return None;
+        }
+    }
+    // The rewrite deletes exactly the loop; the found arm loses only the
+    // address computation it duplicated from it. No value defined in the
+    // deleted blocks may be used anywhere else.
+    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
+    for &b in lp.body.iter() {
+        for inst in &func.blocks[b].instructions {
+            if let Some(d) = inst.dest() {
+                loop_defs.insert(d.0);
+            }
+        }
+    }
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if lp.body.contains(&bi) || bi == found {
+            continue;
+        }
+        for inst in &block.instructions {
+            let mut leaks = false;
+            inst.for_each_used_value(|id| {
+                if loop_defs.contains(&id) {
+                    leaks = true;
+                }
+            });
+            if leaks {
+                dlog!("{name} loop@{header}: memchr bail (loop value live outside)");
+                return None;
+            }
+        }
+        let mut leaks = false;
+        terminator_uses(&block.terminator, |id| {
+            if loop_defs.contains(&id) {
+                leaks = true;
+            }
+        });
+        if leaks {
+            dlog!("{name} loop@{header}: memchr bail (loop value used by an outside terminator)");
+            return None;
+        }
+    }
+    // The found arm may only read the loop through its own address chain.
+    for inst in &func.blocks[found].instructions {
+        let mut leaks = false;
+        inst.for_each_used_value(|id| {
+            if loop_defs.contains(&id)
+                && !matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::Add,
+                        ..
+                    }
+                )
+                && id != iv.0
+            {
+                leaks = true;
+            }
+        });
+        if leaks {
+            dlog!("{name} loop@{header}: memchr bail (found arm reads loop values)");
+            return None;
+        }
+    }
+
+    // ---- the found arm: only its address chain may outlive it ------------
+    // The rewrite keeps the found arm and deletes the loop, so the address
+    // computation `base + i` (and every operand it consumed) dies.  Any OTHER
+    // value defined in the found arm would die with it too when the arm is
+    // rebuilt, so every such value must be dead outside the arm.  (The chain
+    // itself survives: its `Copy`/`Cast` steps are re-pointed at the call's
+    // result.)
+    let mut chain: FxHashSet<u32> = FxHashSet::default();
+    chain.insert(found_value.0);
+    for inst in &func.blocks[found].instructions {
+        match inst {
+            Instruction::Copy {
+                dest,
+                src: Operand::Value(src),
+                ..
+            } if chain.contains(&src.0) => {
+                chain.insert(dest.0);
+            }
+            // Same-width only: a truncating or widening Cast is a different
+            // number, and would change what `memchr`'s result means.
+            Instruction::Cast {
+                dest,
+                src: Operand::Value(src),
+                from_ty,
+                to_ty,
+                ..
+            } if chain.contains(&src.0) && from_ty.size() == to_ty.size() => {
+                chain.insert(dest.0);
+            }
+            _ => {}
+        }
+    }
+    let mut found_other: FxHashSet<u32> = FxHashSet::default();
+    for inst in &func.blocks[found].instructions {
+        if let Some(d) = inst.dest() {
+            if !chain.contains(&d.0) {
+                found_other.insert(d.0);
+            }
+        }
+    }
+    if !found_other.is_empty() {
+        for (bi, block) in func.blocks.iter().enumerate() {
+            if bi != found {
+                for inst in &block.instructions {
+                    let mut leaks = false;
+                    inst.for_each_used_value(|id| {
+                        if found_other.contains(&id) {
+                            leaks = true;
+                        }
+                    });
+                    if leaks {
+                        dlog!("{name} loop@{header}: memchr bail (found value live outside)");
+                        return None;
+                    }
+                }
+            }
+            // The found arm's own terminator survives the rebuild, so it can
+            // only name chain values (rewritten to the call result).
+            let mut leaks = false;
+            terminator_uses(&block.terminator, |id| {
+                if found_other.contains(&id) {
+                    leaks = true;
+                }
+            });
+            if leaks {
+                dlog!("{name} loop@{header}: memchr bail (found value in a terminator)");
+                return None;
+            }
+        }
+    }
+
+    let found_keep: Vec<Value> = chain
+        .iter()
+        .filter(|&&id| id != found_value.0)
+        .map(|&id| Value(id))
+        .collect();
+    Some(SearchLoop {
+        preheader,
+        header,
+        body,
+        found,
+        latch,
+        exit,
+        base,
+        needle,
+        found_value,
+        found_keep,
+        bound: bound_op,
+        bound_ty,
+    })
+}
+
+/// The value a `Cmp` in `block` produces, if any.
+fn eq_cond_of(
+    func: &IrFunction,
+    _defs: &FxHashMap<u32, &Instruction>,
+    block: usize,
+) -> Option<Value> {
+    for inst in &func.blocks[block].instructions {
+        if let Instruction::Cmp { dest, .. } = inst {
+            return Some(*dest);
+        }
+    }
+    None
+}
+
+/// True when `op` is the loop IV, possibly through `Copy`/widening-`Cast`
+/// chains that preserve its value (the frontend emits those around indices).
+fn operand_is_iv(defs: &FxHashMap<u32, &Instruction>, op: &Operand, iv: Value) -> bool {
+    let Operand::Value(v) = op else {
+        return false;
+    };
+    let mut cur = resolve_copy(defs, *v);
+    for _ in 0..8 {
+        if cur == iv {
+            return true;
+        }
+        match defs.get(&cur.0) {
+            Some(Instruction::Cast { dest, src, .. }) if *dest == cur => {
+                let Operand::Value(next) = src else {
+                    return false;
+                };
+                cur = resolve_copy(defs, *next);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// True for a literal zero (the null pointer constant the exit arm returns).
+fn operand_is_zero(op: &Operand) -> bool {
+    matches!(op, Operand::Const(c) if c.to_i64() == Some(0))
+}
+
+/// Replace the matched loop with `memchr(base, (int)(unsigned char)c, n)`.
+///
+/// The loop and `memchr` agree on every observable: the scan starts at the
+/// same base, covers the same `n` bytes (`Ult` is the `size_t` relation), and
+/// stops at the first byte equal to the same `c`. The loop had exactly two
+/// ways out -- the found arm, whose value is `base + i` (what `memchr`
+/// returns), and the exit arm, reached when no byte matched (when `memchr`
+/// returns null). So the rewrite computes the call in the preheader and
+/// dispatches on `result != 0` to the same two arms, which is why neither
+/// arm's own semantics need to be reconstructed; the found arm's duplicated
+/// `base + i` becomes the result value.
+fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
+    let fname = func.name.clone();
+    let size_ty = crate::common::types::target_int_ir_type();
+    if m.bound_ty.size() != size_ty.size() {
+        return false;
+    }
+    // `(int)(unsigned char)c`: for a value, the U8 zero-extension is exactly
+    // what `memchr` compares each byte against; a constant image is already
+    // in 0..=255 (the matcher reduced it).
+    let needle = match &m.needle {
+        Operand::Const(_) => m.needle.clone(),
+        Operand::Value(v) => {
+            let widened = alloc_value(func);
+            let cast = Instruction::Cast {
+                dest: widened,
+                src: Operand::Value(*v),
+                from_ty: IrType::U8,
+                to_ty: IrType::I32,
+            };
+            func.blocks[m.preheader].instructions.push(cast);
+            Operand::Value(widened)
+        }
+    };
+    // `size_t` is the parameter type; a same-width bound only needs its
+    // signedness reinterpreted, which a same-width cast is on every target.
+    let bound_op = if m.bound_ty == size_ty {
+        m.bound.clone()
+    } else {
+        let widened = alloc_value(func);
+        func.blocks[m.preheader]
+            .instructions
+            .push(Instruction::Cast {
+                dest: widened,
+                src: m.bound.clone(),
+                from_ty: m.bound_ty,
+                to_ty: size_ty,
+            });
+        Operand::Value(widened)
+    };
+    let result = alloc_value(func);
+    func.blocks[m.preheader]
+        .instructions
+        .push(Instruction::Call {
+            func: "memchr".to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: Some(result),
+                args: vec![Operand::Value(m.base), needle, bound_op],
+                arg_types: vec![IrType::Ptr, IrType::I32, size_ty],
+                return_type: IrType::Ptr,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None, None, None],
+                struct_arg_aligns: vec![None, None, None],
+                struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
+                struct_arg_fp_agg_classes: Vec::new(),
+                struct_arg_is_f128_sse: vec![false, false, false],
+                is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                // Created only under `BuiltinPolicy::may_synthesize`.
+                assume_library: true,
+                ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
+                ret_is_vector128: false,
+                cold: false,
+            },
+        });
+    // `result != 0` is "a byte matched".
+    let hit = alloc_value(func);
+    func.blocks[m.preheader]
+        .instructions
+        .push(Instruction::Cmp {
+            dest: hit,
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(result),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::Ptr,
+        });
+    let preheader_label = func.blocks[m.preheader].label;
+    func.blocks[m.preheader].terminator = Terminator::CondBranch {
+        cond: Operand::Value(hit),
+        true_label: func.blocks[m.found].label,
+        false_label: func.blocks[m.exit].label,
+    };
+    // The found arm computed `base + i`; the call's result IS that value, and
+    // so is every value-preserving step the arm chained onto it (`q = q;`,
+    // `(size_t)q`).  Rewrite all of them to the call, everywhere: phis that
+    // used to receive the arm's value from the kept label, returns, selects,
+    // call arguments and memory operands alike.
+    let replaced: FxHashSet<u32> = std::iter::once(m.found_value.0)
+        .chain(m.found_keep.iter().map(|v| v.0))
+        .collect();
+    let found_label = func.blocks[m.found].label;
+    for bi in 0..func.blocks.len() {
+        if lp_is_deleted(m, bi) {
+            continue;
+        }
+        for inst in &mut func.blocks[bi].instructions {
+            inst.for_each_operand_mut(|op| {
+                if let Operand::Value(v) = op {
+                    if replaced.contains(&v.0) {
+                        *op = Operand::Value(result);
+                    }
+                }
+            });
+            inst.for_each_value_use_mut(|u| {
+                if replaced.contains(&u.0) {
+                    *u = result;
+                }
+            });
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, lbl) in incoming.iter_mut() {
+                    if *lbl == found_label {
+                        if let Operand::Value(v) = op {
+                            if replaced.contains(&v.0) {
+                                *op = Operand::Value(result);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match &mut func.blocks[bi].terminator {
+            Terminator::Return(Some(op))
+            | Terminator::CondBranch { cond: op, .. }
+            | Terminator::IndirectBranch { target: op, .. }
+            | Terminator::Switch { val: op, .. } => {
+                if let Operand::Value(v) = op {
+                    if replaced.contains(&v.0) {
+                        *op = Operand::Value(result);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Drop everything the arm had to say except those pass-through steps.  The
+    // deleted instructions are exactly `base + i` (the IV is about to vanish)
+    // plus values the matcher proved dead outside the arm.
+    let keep: FxHashSet<u32> = m.found_keep.iter().map(|v| v.0).collect();
+    func.blocks[m.found]
+        .instructions
+        .retain(|inst| inst.dest().is_some_and(|d| keep.contains(&d.0)));
+    // Delete the loop itself.
+    let dead: FxHashSet<BlockId> = [m.header, m.body, m.latch]
+        .iter()
+        .map(|&b| func.blocks[b].label)
+        .collect();
+    func.blocks.retain(|b| !dead.contains(&b.label));
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                incoming.retain(|(_, lbl)| !dead.contains(lbl));
+            }
+        }
+    }
+    dlog!(
+        "{fname} loop@{}: memchr rewrite done (preheader={} kept found/exit arms, {} blocks removed)",
+        m.header,
+        preheader_label,
+        dead.len()
+    );
+    true
+}
+
+/// Blocks the byte-search rewrite removes.
+fn lp_is_deleted(m: &SearchLoop, bi: usize) -> bool {
+    bi == m.header || bi == m.body || bi == m.latch
 }
 
 /// A matched Brian Kernighan population-count loop (`while (x) { x &= x - 1; r++; }`).

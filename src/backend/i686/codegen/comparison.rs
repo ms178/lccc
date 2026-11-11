@@ -988,6 +988,13 @@ impl I686Codegen {
     /// by this select, and never for float, long-double, 128-bit or (on
     /// this 32-bit target) I64/U64 compares (`detect_cmp_select_fusion`).
     ///
+    /// Ptr compares are accepted too: a pointer is a full 32-bit unsigned
+    /// integer on this target (`IrType::Ptr` shares the `cmpl` machinery
+    /// with I32/U32), so every law above holds verbatim.  Rejecting them
+    /// here would mean a null-check select — the canonical shape of a
+    /// libcall result (`p = memchr(...); p ? p : NULL`) — either ICEs or
+    /// loses the fusion.
+    ///
     /// Same flag emitters as the fused branch, so every narrow-compare and
     /// load→memory-compare law carries over unchanged.  Register-allocator
     /// safety: the compare stages through %ecx exactly as the skipped Cmp
@@ -1008,7 +1015,8 @@ impl I686Codegen {
         sel_ty: IrType,
     ) {
         assert!(
-            cmp_ty.is_integer() && !super::emit::is_pair_scalar(cmp_ty),
+            (cmp_ty.is_integer() || matches!(cmp_ty, IrType::Ptr))
+                && !super::emit::is_pair_scalar(cmp_ty),
             "fused cmp-select reached the i686 backend with a {cmp_ty:?} compare"
         );
         let folded = self.take_load_cmp_fold(lhs, rhs, op);

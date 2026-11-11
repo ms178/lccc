@@ -3825,7 +3825,14 @@ impl ArchCodegen for I686Codegen {
     fn supports_fused_cmp_select(&self) -> bool {
         // `cmp; jCC .Lsel_true` instead of `setCC; movzbl; test; jne`
         // (emit_fused_cmp_select_impl). Kill switch: CCC_NO_FUSED_CSEL.
-        true
+        //
+        // The switch is honoured HERE, like every sibling above it
+        // (CCC_NO_BT_BRANCH_FUSION): the shared generation code only skips
+        // detect_cmp_select_fusion() when this predicate is false, so a
+        // hard-wired `true` silently turned the documented kill switch into
+        // a no-op.  A/B bisection of this fusion would then compare a build
+        // against itself and report "no effect" for a real codegen change.
+        std::env::var_os("CCC_NO_FUSED_CSEL").is_none()
     }
 
     fn supports_load_cmp_mem_fold(&self) -> bool {
