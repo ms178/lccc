@@ -107,8 +107,10 @@ impl X86Codegen {
     /// permutations -- 213 writes `%zmm1` and 231 writes `%zmm2`, exactly as
     /// their VEX counterparts do.  Emitted before this split (a=3,b=5,c=7):
     ///
-    ///     vfmadd213ps %zmm2, %zmm0, %zmm1     # result in zmm1
-    ///     vmovdqu64   %zmm0, (%rax)           # ... but zmm0 (= a) is stored
+    /// ```text
+    /// vfmadd213ps %zmm2, %zmm0, %zmm1     # result in zmm1
+    /// vmovdqu64   %zmm0, (%rax)           # ... but zmm0 (= a) is stored
+    /// ```
     ///
     /// The callers that need a non-`%zmm0` destination say so explicitly
     /// rather than the store guessing, which is what keeps the other ~40
