@@ -934,7 +934,12 @@ fn a_home_reached_through_a_derived_address_is_left_whole() {
         ty: IrType::Ptr,
     });
     let low = b.load(second, IrType::U64);
-    let widened = b.bin(IrBinOp::Mul, low, Operand::Const(IrConst::I64(3)), IrType::U64);
+    let widened = b.bin(
+        IrBinOp::Mul,
+        low,
+        Operand::Const(IrConst::I64(3)),
+        IrType::U64,
+    );
     b.store(widened, second, IrType::U64);
     let wide = b.load(home, IrType::U128);
     let scaled = Shape::Zext64.build(&mut b, 1);
@@ -981,8 +986,6 @@ fn a_local_accumulator_that_stays_local_splits_completely() {
         "the 16-byte home becomes two 8-byte slots"
     );
 }
-
-
 
 #[test]
 fn phi_and_select_merge_each_word_separately() {
