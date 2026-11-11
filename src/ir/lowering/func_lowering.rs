@@ -1092,37 +1092,27 @@ impl Lowerer {
         }
         self.materialize_undefined_user_labels(return_type);
 
-        // Merge deferred entry-block allocas into blocks[0], right after
-        // the existing parameter allocas. mem2reg skips the first N allocas
-        // (where N = param count) so deferred local allocas must come after them.
-        let entry_allocas = std::mem::take(&mut self.func_mut().entry_allocas);
-        if !entry_allocas.is_empty() {
-            if let Some(entry_block) = self.func_mut().blocks.first_mut() {
-                // Find the insertion point: right after the initial contiguous run
-                // of Alloca instructions at the start of the entry block (parameter allocas).
-                // We must NOT use rposition (last alloca anywhere in the block) because
-                // SSE intrinsic lowering emits inline allocas deep in the block via
-                // self.emit(Alloca), and placing deferred allocas after those would put
-                // them after their uses, violating dominance.
-                let insert_pos = entry_block
-                    .instructions
-                    .iter()
-                    .position(|inst| !matches!(inst, Instruction::Alloca { .. }))
-                    .unwrap_or(entry_block.instructions.len());
-                // Splice deferred allocas at the insertion point.
-                let num_allocas = entry_allocas.len();
-                entry_block
-                    .instructions
-                    .splice(insert_pos..insert_pos, entry_allocas);
-                // Insert dummy spans for the spliced allocas
-                if !entry_block.source_spans.is_empty() {
-                    let dummy_spans = vec![crate::common::source::Span::dummy(); num_allocas];
-                    entry_block
-                        .source_spans
-                        .splice(insert_pos..insert_pos, dummy_spans);
-                }
-            }
-        }
+        // Merge the deferred entry-block allocas into blocks[0].
+        //
+        // Every consumer of the entry block treats the *leading run* of
+        // `Alloca` instructions as the function's complete frame: `mem2reg`
+        // promotes that run (`find_promotable_allocas`), the register
+        // allocator's stack map places it, and the x86-64 instruction selector
+        // decides "16-byte slot is a `%rax`/`%rdx` pair home" from it.  A
+        // deferred alloca spliced in *after* an `Alloca` that lowering emitted
+        // mid-body (SSE intrinsic and `__builtin_convertvector` scratch) would
+        // therefore sit outside the run while still being a frame object, and
+        // the selector would model its home as an ordinary 16 bytes — the shape
+        // behind the Microsoft variadic miscompile
+        // (`engineering/REDTEAM-2026-11-11-PR1178.md` §1.2).
+        //
+        // So the allocas are re-laid as one contiguous run: the leading run in
+        // place, then any alloca that was emitted mid-body, then the deferred
+        // locals in their original order (the "first N allocas are the
+        // parameter homes" contract downstream depends on that order).
+        // Hoisting is dominance-safe because `Alloca` has no operands; no other
+        // instruction moves, and the span vector stays parallel throughout.
+        self.merge_entry_allocas();
 
         // Runtime CPU probe initialisation (AUD-CPU-1): one guarded call at
         // the end of the entry block for every function that reads a probe

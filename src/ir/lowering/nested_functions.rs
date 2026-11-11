@@ -1104,28 +1104,10 @@ impl Lowerer {
         }
         self.materialize_undefined_user_labels(return_type);
 
-        // Splice deferred entry instructions (frame/chain/GEPs) into the
-        // entry block, right after the leading alloca run.
-        let entry_allocas = std::mem::take(&mut self.func_mut().entry_allocas);
-        if !entry_allocas.is_empty() {
-            if let Some(entry_block) = self.func_mut().blocks.first_mut() {
-                let insert_pos = entry_block
-                    .instructions
-                    .iter()
-                    .position(|inst| !matches!(inst, Instruction::Alloca { .. }))
-                    .unwrap_or(entry_block.instructions.len());
-                let n = entry_allocas.len();
-                entry_block
-                    .instructions
-                    .splice(insert_pos..insert_pos, entry_allocas);
-                if !entry_block.source_spans.is_empty() {
-                    let dummy = vec![crate::common::source::Span::dummy(); n];
-                    entry_block
-                        .source_spans
-                        .splice(insert_pos..insert_pos, dummy);
-                }
-            }
-        }
+        // Frame, chain and GEP staging for a nested function go through the
+        // same entry-alloca merge as a top-level one, so the leading alloca run
+        // stays the complete frame on both paths.
+        self.merge_entry_allocas();
 
         // Runtime CPU probe initialisation (AUD-CPU-1), nested-function path:
         // same rule as the top-level finaliser — one guarded call, entry

@@ -271,7 +271,23 @@ impl Islands {
     }
 }
 
-/// Wide locals that are only ever loaded and stored whole.
+/// Wide locals that are only ever loaded and stored **whole, through their own
+/// address**.
+///
+/// The address half of that rule is load-bearing, and it is the same rule
+/// `mem2reg` applies (`find_promotable_allocas`): a local whose address is
+/// *derived* from — a `GetElementPtr` off it, a copy of the pointer, a call
+/// argument — is no longer a pair of words this pass may rename independently,
+/// because the derived address aliases both halves at their real offsets.  The
+/// backend already relies on that shape: a 16-byte home reached through a
+/// derived `ptr + 8` address is modelled by `isl` as a *general* 8-byte load and
+/// may take the `%rax`/`%rdx` pair relay, whose source register is the slot, not
+/// the derived address.  Splitting such a home produced exactly that miscompile
+/// in `check_ms_abi_varargs.sh` (see `engineering/REDTEAM-2026-11-11-PR1178.md`).
+///
+/// A 16-byte local that is reached only as `alloca`, or `alloca` plus a zero
+/// constant offset (`GetElementPtr { base, offset: 0 }`, which the frontend
+/// emits for an aggregate member at offset 0), is a plain home and is eligible.
 fn splittable_homes(func: &IrFunction) -> FxHashSet<u32> {
     let params: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
     let mut homes = FxHashSet::default();
@@ -295,6 +311,19 @@ fn splittable_homes(func: &IrFunction) -> FxHashSet<u32> {
     if homes.is_empty() {
         return homes;
     }
+    // A home whose address is derived — `GetElementPtr` off it, at any offset —
+    // stays in memory.  This is checked before the escape scan because a derived
+    // address is *used* by the GEP itself, so the escape scan alone would see the
+    // alloca as an ordinary operand of a "supported" instruction and keep it.
+    let mut derived = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GetElementPtr { base, .. } = inst {
+                derived.insert(base.0);
+            }
+        }
+    }
+    homes.retain(|id| !derived.contains(id));
     let mut escaped = Vec::new();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -339,16 +368,12 @@ fn splittable_homes(func: &IrFunction) -> FxHashSet<u32> {
 
 /// Build the islands of `func` with `homes` as the splittable locals.
 ///
-/// `param_homes_are_memory` is false before inlining: a parameter home is
-/// then about to become an ordinary local of the caller, and accessing its
-/// words separately here would pin it in memory there.
-fn analyse(func: &IrFunction, homes: &FxHashSet<u32>, param_homes_are_memory: bool) -> Islands {
+/// Parameter homes are never homes here: before inlining one is about to become
+/// an ordinary local of the caller (so touching its words would pin it in
+/// memory there), and after it the local it became is handled by
+/// [`splittable_homes`] on its own merits.
+fn analyse(func: &IrFunction, homes: &FxHashSet<u32>) -> Islands {
     let mut islands = Islands::new();
-    let param_homes: FxHashSet<u32> = if param_homes_are_memory {
-        FxHashSet::default()
-    } else {
-        func.param_alloca_values.iter().map(|v| v.0).collect()
-    };
 
     // Nodes.  The typing rule is the backend's (`i128_values`): a result
     // type of I128/U128, or a `Copy` of such a value or of an I128 literal.
@@ -392,7 +417,7 @@ fn analyse(func: &IrFunction, homes: &FxHashSet<u32>, param_homes_are_memory: bo
 
     for block in &func.blocks {
         for inst in &block.instructions {
-            classify(&mut islands, inst, &param_homes);
+            classify(&mut islands, inst);
         }
         block
             .terminator
@@ -401,7 +426,13 @@ fn analyse(func: &IrFunction, homes: &FxHashSet<u32>, param_homes_are_memory: bo
     islands
 }
 
-fn classify(islands: &mut Islands, inst: &Instruction, param_homes: &FxHashSet<u32>) {
+/// Classify one instruction into the union-find.
+///
+/// A wide value is only an island member when *every* definition and use of it
+/// has a two-word form.  In particular a wide load/store participates only when
+/// its address is a home local of the island; every other 16-byte access is a
+/// whole-object transfer the backend already lowers exactly, and stays whole.
+fn classify(islands: &mut Islands, inst: &Instruction) {
     match inst {
         Instruction::Alloca { .. } => {}
         Instruction::Load {
@@ -418,10 +449,20 @@ fn classify(islands: &mut Islands, inst: &Instruction, param_homes: &FxHashSet<u
             let Some(node) = islands.value(&Operand::Value(*dest)) else {
                 return;
             };
-            if !plain_access(*volatile, *seg_override) || param_homes.contains(&ptr.0) {
-                islands.taint(node);
-            } else if let Some(home) = islands.home_of(*ptr) {
-                islands.union(node, home);
+            // A 16-byte read through a pointer the IR cannot name — the
+            // Microsoft `va_arg` cursor, a parameter base, any computed
+            // address — is a whole-object load the backend already lowers
+            // exactly (one `Mov128` through `%xmm0`).  Splitting it would
+            // replace that with two 8-byte loads through the *same* pointer,
+            // which the wide-instruction model does not describe, and that is
+            // the miscompile this rule exists to prevent
+            // (`engineering/REDTEAM-2026-11-11-PR1178.md` §1.2).  Only a load
+            // through a home local joins that home's island.
+            match islands.home_of(*ptr) {
+                Some(home) if plain_access(*volatile, *seg_override) => {
+                    islands.union(node, home);
+                }
+                _ => islands.taint(node),
             }
         }
         Instruction::Store {
@@ -436,9 +477,12 @@ fn classify(islands: &mut Islands, inst: &Instruction, param_homes: &FxHashSet<u
             }
             let plain = plain_access(*volatile, *seg_override);
             let home = islands.home_of(*ptr);
+            // The storage twin of the load rule above: only a home local can
+            // hold a split value.  A store through a computed address is left
+            // whole, exactly like the read.
             match islands.value(val) {
                 Some(node) => {
-                    if !plain || param_homes.contains(&ptr.0) {
+                    if !plain || home.is_none() {
                         islands.taint(node);
                     } else if let Some(home) = home {
                         islands.union(node, home);
@@ -1194,7 +1238,13 @@ fn operand_halves(halves: &FxHashMap<u32, Halves>, op: &Operand) -> Option<Halve
 
 /// Split the closed islands of `func`.  Returns the number of 128-bit values
 /// and locals that no longer exist.
-pub(crate) fn run_function(func: &mut IrFunction, param_homes_are_memory: bool) -> usize {
+///
+/// The pass is idempotent and order-independent: an island either has a
+/// two-word form for every definition and use (and is split) or is left
+/// byte-for-byte as it was.  Running it before and after inlining therefore
+/// needs no mode flag — the second run simply sees the islands the inliner
+/// closed, and re-examines the ones the first run left whole.
+pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     if func.is_declaration || func.blocks.is_empty() {
         return 0;
     }
@@ -1223,7 +1273,7 @@ pub(crate) fn run_function(func: &mut IrFunction, param_homes_are_memory: bool) 
 
     let mut homes = splittable_homes(func);
     let mut islands = loop {
-        let mut islands = analyse(func, &homes, param_homes_are_memory);
+        let mut islands = analyse(func, &homes);
         let before = homes.len();
         homes.retain(|&id| !islands.is_tainted(id));
         if homes.len() == before {
@@ -1295,8 +1345,8 @@ pub(crate) fn run_function(func: &mut IrFunction, param_homes_are_memory: bool) 
 }
 
 /// Run on every function.  Returns the number of functions changed.
-pub(crate) fn run(module: &mut IrModule, param_homes_are_memory: bool) -> usize {
-    module.for_each_function(|func| usize::from(run_function(func, param_homes_are_memory) > 0))
+pub(crate) fn run(module: &mut IrModule) -> usize {
+    module.for_each_function(|func| usize::from(run_function(func) > 0))
 }
 
 #[cfg(test)]

@@ -2136,6 +2136,79 @@ impl Lowerer {
         self.fp_expr_tags.entry(dest.0).or_insert(root);
     }
 
+    /// Merge the deferred entry-block allocas into `blocks[0]`, keeping every
+    /// frame object inside the block's **leading contiguous `Alloca` run**.
+    ///
+    /// `mem2reg` promotes that run (`find_promotable_allocas`), the register
+    /// allocator's stack map places it, and the x86-64 selector decides "this
+    /// 16-byte slot is a `%rax`/`%rdx` pair home" from it.  Lowering can emit an
+    /// `Alloca` mid-body (SSE intrinsic and `__builtin_convertvector` scratch),
+    /// so splicing the deferred locals after the leading run used to leave both
+    /// kinds of alloca *outside* the run: they were frame objects that nothing
+    /// modelled, and a 16-byte one read through a computed address took the
+    /// pair-relay path with a non-pair source register
+    /// (`engineering/REDTEAM-2026-11-11-PR1178.md` §1.2).
+    ///
+    /// The run is therefore rebuilt as: leading run (parameter homes first, so
+    /// the "first N allocas are the parameters" contract holds), then any
+    /// alloca emitted mid-body, then the deferred locals in their original
+    /// order.  Only `Alloca` instructions move, and an `Alloca` has no
+    /// operands, so hoisting it to the block head cannot change dominance.  The
+    /// span vector is rebuilt in lockstep.
+    pub(super) fn merge_entry_allocas(&mut self) {
+        let deferred = std::mem::take(&mut self.func_mut().entry_allocas);
+        if deferred.is_empty() {
+            return;
+        }
+        let Some(entry) = self.func_mut().blocks.first_mut() else {
+            return;
+        };
+        if entry.source_spans.len() != entry.instructions.len() {
+            // The two vectors are parallel by construction; if a caller ever
+            // breaks that, leave the block alone rather than pair a span with
+            // the wrong instruction.
+            return;
+        }
+        let is_alloca = |inst: &Instruction| matches!(inst, Instruction::Alloca { .. });
+        let run_len = entry
+            .instructions
+            .iter()
+            .position(|inst| !is_alloca(inst))
+            .unwrap_or(entry.instructions.len());
+        let mut instructions = Vec::with_capacity(entry.instructions.len() + deferred.len());
+        let mut spans = Vec::with_capacity(entry.source_spans.len() + deferred.len());
+        // 1. The leading run, unchanged.
+        instructions.extend(entry.instructions.drain(..run_len));
+        spans.extend(entry.source_spans.drain(..run_len));
+        // 2. Allocas that lowering emitted after the run, in source order.
+        let mut rest_instructions = Vec::with_capacity(entry.instructions.len());
+        let mut rest_spans = Vec::with_capacity(entry.source_spans.len());
+        for (instruction, span) in std::mem::take(&mut entry.instructions)
+            .into_iter()
+            .zip(std::mem::take(&mut entry.source_spans))
+        {
+            if is_alloca(&instruction) {
+                instructions.push(instruction);
+                spans.push(span);
+            } else {
+                rest_instructions.push(instruction);
+                rest_spans.push(span);
+            }
+        }
+        // 3. The deferred locals, in their declaration order, then the body.
+        let deferred_len = deferred.len();
+        instructions.extend(deferred);
+        spans.extend(std::iter::repeat_n(
+            crate::common::source::Span::dummy(),
+            deferred_len,
+        ));
+        instructions.extend(rest_instructions);
+        spans.extend(rest_spans);
+        debug_assert_eq!(instructions.len(), spans.len());
+        entry.instructions = instructions;
+        entry.source_spans = spans;
+    }
+
     /// Emit an alloca into the entry block buffer.
     /// Used for local variable declarations so that variables whose
     /// declarations are skipped by `goto` still have valid stack slots.

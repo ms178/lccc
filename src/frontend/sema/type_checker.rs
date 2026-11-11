@@ -1150,10 +1150,11 @@ impl<'a> ExprTypeChecker<'a> {
                 CType::Vector(Box::new(self.resolve_type_spec(elem)), *total_bytes)
             }
             TypeSpecifier::Typeof(expr, _) => {
-                // typeof(expr): try to infer the expression's type
-                if self.infer_expr_ctype(expr).is_none() {
-                    tmp_typeof_probe("plain", expr);
-                }
+                // `typeof(expr)`: infer the expression's type.  An unresolved
+                // operand has already been diagnosed where it was resolved
+                // (see `resolve_type_spec_with_scope`); `CType::Int` is the
+                // recovery value that lets the rest of the declaration parse
+                // without a second, duplicate diagnostic.
                 self.infer_expr_ctype(expr).unwrap_or(CType::Int)
             }
             TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype, abi) => {
@@ -1867,9 +1868,13 @@ impl<'a> ExprTypeChecker<'a> {
                 if let Some(ctype) = self.infer_expr_ctype_with_scope(expr, scope) {
                     return ctype;
                 }
-                // TODO: report diagnostic for unresolved typeof expression
-                tmp_typeof_probe("scoped", expr);
-                CType::Int // fallback
+                // Recovery only: sema has already emitted the diagnostic for
+                // the unresolved operand (see `REDTEAM-2026-11-11-I128-TYPEOF.md`
+                // §4, where every compiler rejects the same fifteen shapes).
+                // A second diagnostic here would double-report the same
+                // operand, so `CType::Int` is returned purely so the
+                // declaration has a type while the TU is known to fail.
+                CType::Int
             }
             TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec_with_scope(inner, scope),
             _ => self.resolve_type_spec(ts),
@@ -2152,18 +2157,3 @@ mod qualifier_composition_tests {
     }
 }
 
-// TMP-PROBE-BEGIN
-fn tmp_typeof_probe(site: &str, expr: &Expr) {
-    if let Some(path) = std::env::var_os("LCCC_TMP_TYPEOF_PROBE") {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let text: String = format!("{expr:?}").chars().take(240).collect();
-            let _ = writeln!(f, "site={site} expr={text}");
-        }
-    }
-}
-// TMP-PROBE-END

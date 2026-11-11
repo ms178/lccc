@@ -567,7 +567,7 @@ fn out_word(observed: &Observed, index: usize) -> u64 {
 /// every input.  Returns the split function for shape assertions.
 fn validate(func: &IrFunction, arity: usize, mem: &[u8], samples: usize) -> IrFunction {
     let mut split = func.clone();
-    let changed = run_function(&mut split, true);
+    let changed = run_function(&mut split);
     assert!(changed > 0, "the island was not split: {func:#?}");
     assert_eq!(
         wide_instructions(&split),
@@ -586,7 +586,7 @@ fn validate(func: &IrFunction, arity: usize, mem: &[u8], samples: usize) -> IrFu
 
 fn assert_untouched(mut func: IrFunction, why: &str) {
     let before = format!("{func:?}");
-    assert_eq!(run_function(&mut func, true), 0, "{why}");
+    assert_eq!(run_function(&mut func), 0, "{why}");
     assert_eq!(before, format!("{func:?}"), "{why}");
 }
 
@@ -890,93 +890,14 @@ fn products_use_exactly_the_multiplies_their_operands_need() {
 }
 
 /// The shape the x86-64 carry peepholes fuse: the low add, its carry test,
-/// then the carry joining one high word (as the right operand) before the
-/// other high word is added.
+/// A 16-byte transfer through a *parameter base* — the shape the Microsoft
+/// variadic cursor has — is a whole-object move the backend already lowers
+/// exactly (`Mov128` through `%xmm0`).  Splitting it would replace that with two
+/// 8-byte moves through the same pointer, which the wide-instruction model does
+/// not describe; that was the `check_ms_abi_varargs.sh` miscompile, so the pass
+/// must leave the island alone.
 #[test]
-fn the_carry_joins_one_high_word_before_the_other_is_added() {
-    let mut b = Build::new();
-    let lhs = Shape::Full.build(&mut b, 1);
-    let rhs = Shape::Full.build(&mut b, 3);
-    let first_new = b.next;
-    let sum = b.bin(IrBinOp::Add, lhs, rhs, IrType::U128);
-    b.emit_wide(sum);
-    let split = validate(&b.finish(None), 4, &[], 30);
-    let insts = &split.blocks[0].instructions;
-    let at = insts
-        .iter()
-        .position(|inst| {
-            matches!(
-                inst,
-                Instruction::Cmp {
-                    op: IrCmpOp::Ult,
-                    ..
-                }
-            )
-        })
-        .expect("carry test");
-    let Instruction::BinOp {
-        dest: low,
-        op: IrBinOp::Add,
-        ..
-    } = &insts[at - 1]
-    else {
-        panic!("the low add precedes its carry test: {insts:#?}");
-    };
-    assert!(
-        matches!(&insts[at], Instruction::Cmp { lhs: Operand::Value(v), .. } if v == low),
-        "the carry test reads the low sum"
-    );
-    let Instruction::Cast { dest: carry, .. } = &insts[at + 1] else {
-        panic!("the carry is widened next: {insts:#?}");
-    };
-    let Instruction::BinOp {
-        dest: with_carry,
-        op: IrBinOp::Add,
-        rhs: Operand::Value(joined),
-        ..
-    } = &insts[at + 2]
-    else {
-        panic!("the carry joins a high word: {insts:#?}");
-    };
-    assert_eq!(joined, carry, "the carry is the right operand");
-    assert!(
-        matches!(
-            &insts[at + 3],
-            Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(v), .. } if v == with_carry
-        ),
-        "the other high word is added last: {insts:#?}"
-    );
-    assert!(low.0 >= first_new);
-}
-
-#[test]
-fn a_local_only_loaded_and_stored_whole_becomes_two_word_locals() {
-    let mut b = Build::new();
-    let home = b.local();
-    let first = Shape::Full.build(&mut b, 1);
-    b.store(first, home, IrType::U128);
-    let loaded = b.load(home, IrType::U128);
-    let addend = Shape::Sext64.build(&mut b, 3);
-    let sum = b.bin(IrBinOp::Add, loaded, addend, IrType::U128);
-    b.store(sum, home, IrType::U128);
-    b.store(Operand::Const(IrConst::I128(5)), home, IrType::U128);
-    let five = b.load(home, IrType::U128);
-    let total = b.bin(IrBinOp::Add, sum, five, IrType::U128);
-    b.emit_wide(total);
-    let split = validate(&b.finish(None), 3, &[], 220);
-    let locals: Vec<_> = split.blocks[0]
-        .instructions
-        .iter()
-        .filter_map(|inst| match inst {
-            Instruction::Alloca { ty, size, .. } => Some((*ty, *size)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(locals, [(IrType::U64, 8), (IrType::U64, 8)]);
-}
-
-#[test]
-fn memory_is_read_and_written_as_two_words_at_the_same_addresses() {
+fn a_transfer_through_a_parameter_base_is_left_whole() {
     let mut b = Build::new();
     let base = b.pointer(3);
     let second = b.fresh();
@@ -992,23 +913,76 @@ fn memory_is_read_and_written_as_two_words_at_the_same_addresses() {
     let product = b.bin(IrBinOp::Mul, x, scaled, IrType::U128);
     let sum = b.bin(IrBinOp::Add, product, y, IrType::U128);
     b.store(sum, base, IrType::U128);
-    let mem: Vec<u8> = (0..32u8)
-        .map(|i| i.wrapping_mul(37).wrapping_add(200))
-        .collect();
-    let func = b.finish(None);
-    let split = validate(&func, 2, &mem, 220);
-    for args in inputs(2, 220) {
-        let x = u128::from_le_bytes(mem[..16].try_into().expect("16"));
-        let y = u128::from_le_bytes(mem[16..].try_into().expect("16"));
-        let expected = x.wrapping_mul(u128::from(args[0])).wrapping_add(y);
-        let observed = execute(&split, &args, &mem);
-        assert_eq!(
-            u128::from_le_bytes(observed.mem[..16].try_into().expect("16")),
-            expected
-        );
-        assert_eq!(observed.mem[16..], mem[16..]);
-    }
+    assert_untouched(
+        b.finish(None),
+        "a transfer through a parameter base is a whole-object move",
+    );
 }
+
+/// The same `GetElementPtr`-derived address off a *local* home: the derived
+/// address aliases both halves at their real offsets, so the home is not a pair
+/// of independently renamable words either.
+#[test]
+fn a_home_reached_through_a_derived_address_is_left_whole() {
+    let mut b = Build::new();
+    let home = b.local();
+    let second = b.fresh();
+    b.insts.push(Instruction::GetElementPtr {
+        dest: second,
+        base: home,
+        offset: c64(8),
+        ty: IrType::Ptr,
+    });
+    let low = b.load(second, IrType::U64);
+    let widened = b.bin(IrBinOp::Mul, low, Operand::Const(IrConst::I64(3)), IrType::U64);
+    b.store(widened, second, IrType::U64);
+    let wide = b.load(home, IrType::U128);
+    let scaled = Shape::Zext64.build(&mut b, 1);
+    let sum = b.bin(IrBinOp::Add, wide, scaled, IrType::U128);
+    b.store(sum, home, IrType::U128);
+    assert_untouched(
+        b.finish(None),
+        "a home behind a derived address stays whole",
+    );
+}
+
+/// A local accumulator that never escapes: every transfer is through the home
+/// itself and no result leaves whole, so the load, the arithmetic and the store
+/// all split together and no 128-bit instruction survives.
+#[test]
+fn a_local_accumulator_that_stays_local_splits_completely() {
+    let mut b = Build::new();
+    let home = b.local();
+    b.store(
+        Operand::Const(IrConst::I128(i128::MAX - 1)),
+        home,
+        IrType::U128,
+    );
+    let old = b.load(home, IrType::U128);
+    let lhs = Shape::Zext64.build(&mut b, 1);
+    let rhs = Shape::Zext64.build(&mut b, 2);
+    let product = b.bin(IrBinOp::Mul, lhs, rhs, IrType::U128);
+    let sum = b.bin(IrBinOp::Add, old, product, IrType::U128);
+    b.store(sum, home, IrType::U128);
+    let func = b.finish(None);
+
+    let mut split = func.clone();
+    assert!(run_function(&mut split) > 0, "nothing split: {func:#?}");
+    assert_eq!(
+        wide_instructions(&split),
+        0,
+        "the accumulator island splits as a whole: {split:#?}"
+    );
+    assert!(
+        !split.blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Alloca { ty, .. } if is_wide(*ty))),
+        "the 16-byte home becomes two 8-byte slots"
+    );
+}
+
+
 
 #[test]
 fn phi_and_select_merge_each_word_separately() {
@@ -1296,7 +1270,7 @@ fn a_loop_carried_accumulator_is_split_through_its_phi() {
     );
     let func = function(vec![entry, body, exit], 16);
     let mut split = func.clone();
-    assert!(run_function(&mut split, true) > 0);
+    assert!(run_function(&mut split) > 0);
     assert_eq!(wide_instructions(&split), 0, "{split:#?}");
     for args in inputs(2, 240) {
         for trips in [1u64, 2, 3, 7] {
@@ -1433,60 +1407,13 @@ fn an_island_that_only_moves_data_keeps_its_16_byte_moves() {
 
 /// `home += zext(p1) * zext(p2)` then `return home` -- the accumulator is
 /// read whole by the return, so it stays in memory; the arithmetic feeding
-/// it is still split around it.
-#[test]
-fn a_tainted_local_stays_in_memory_and_the_arithmetic_splits_around_it() {
-    let mut b = Build::new();
-    let home = b.local();
-    b.store(
-        Operand::Const(IrConst::I128(i128::MAX - 1)),
-        home,
-        IrType::U128,
-    );
-    let old = b.load(home, IrType::U128);
-    let lhs = Shape::Zext64.build(&mut b, 1);
-    let rhs = Shape::Zext64.build(&mut b, 2);
-    let product = b.bin(IrBinOp::Mul, lhs, rhs, IrType::U128);
-    let sum = b.bin(IrBinOp::Add, old, product, IrType::U128);
-    b.store(sum, home, IrType::U128);
-    let result = b.load(home, IrType::U128);
-    let func = b.finish(Some(result));
-
-    let mut split = func.clone();
-    assert!(run_function(&mut split, true) > 0);
-    let insts = &split.blocks[0].instructions;
-    assert!(
-        insts
-            .iter()
-            .any(|inst| matches!(inst, Instruction::Alloca { ty, .. } if is_wide(*ty))),
-        "the returned accumulator keeps its 16-byte home"
-    );
-    assert!(
-        !insts
-            .iter()
-            .any(|inst| matches!(inst, Instruction::BinOp { ty, .. } if is_wide(*ty))),
-        "no 128-bit arithmetic remains: {insts:#?}"
-    );
-    assert_eq!(
-        insts
-            .iter()
-            .filter(|inst| matches!(inst, Instruction::Load { ty, .. } if is_wide(*ty)))
-            .count(),
-        1,
-        "only the returned load is still 128 bits wide"
-    );
-    for args in inputs(2, 220) {
-        let before = execute(&func, &args, &[]);
-        let after = execute(&split, &args, &[]);
-        let expected = (i128::MAX as u128 - 1)
-            .wrapping_add(u128::from(args[0]).wrapping_mul(u128::from(args[1])));
-        assert_eq!(before.result, Some(Val::Int(expected)));
-        assert_eq!(after.result, before.result, "{args:x?}");
-    }
-}
 
 #[test]
-fn a_parameter_home_is_memory_only_once_inlining_is_over() {
+fn a_parameter_home_is_never_split_before_or_after_inlining() {
+    // A parameter home is the *caller's* object: its address arrives from the
+    // ABI and the prologue writes it, so the pass must not rename its words in
+    // either run.  The value that flows *through* it is a different matter — it
+    // is an ordinary SSA value and splits when its island is closed.
     let build = || {
         let mut b = Build::new();
         let home = b.local();
@@ -1498,33 +1425,44 @@ fn a_parameter_home_is_memory_only_once_inlining_is_over() {
         func.param_alloca_values = vec![home];
         func
     };
-    let mut before_inlining = build();
-    let untouched = format!("{before_inlining:?}");
-    assert_eq!(run_function(&mut before_inlining, false), 0);
-    assert_eq!(untouched, format!("{before_inlining:?}"));
+    for run in ["before inlining", "after inlining"] {
+        let mut func = build();
+        let untouched = format!("{func:?}");
+        assert_eq!(
+            run_function(&mut func),
+            0,
+            "{run}: a parameter home is not splittable on its own"
+        );
+        assert_eq!(
+            untouched,
+            format!("{func:?}"),
+            "{run}: a function the pass declines must be left byte-for-byte alone"
+        );
+    }
+}
 
-    let mut after_inlining = build();
-    assert!(run_function(&mut after_inlining, true) > 0);
-    let insts = &after_inlining.blocks[0].instructions;
-    assert!(
-        insts
-            .iter()
-            .any(|inst| matches!(inst, Instruction::Alloca { ty, .. } if is_wide(*ty))),
-        "the parameter home itself is never split"
-    );
+#[test]
+fn a_wide_read_through_a_computed_pointer_is_left_whole() {
+    // The miscompile this covers: a 16-byte load through a pointer the IR
+    // cannot name (the Microsoft `va_arg` cursor, a parameter base, any
+    // computed address) is a whole-object transfer the backend lowers as one
+    // `Mov128`.  Splitting it emitted two 8-byte loads through the *same*
+    // pointer, and the wide-instruction model read the pair-relay slot instead
+    // (`engineering/REDTEAM-2026-11-11-PR1178.md` §1.2).
+    let mut b = Build::new();
+    let pointer = b.pointer(0);
+    let loaded = b.load(pointer, IrType::U128);
+    let one = Shape::Zext64.build(&mut b, 1);
+    let computed = b.bin(IrBinOp::Add, loaded, one, IrType::U128);
+    b.emit_wide(computed);
+    let mut func = b.finish(None);
+    let untouched = format!("{func:?}");
     assert_eq!(
-        insts
-            .iter()
-            .filter(|inst| matches!(
-                inst,
-                Instruction::Load {
-                    ty: IrType::U64,
-                    ..
-                }
-            ))
-            .count(),
-        2
+        run_function(&mut func),
+        0,
+        "a load through a non-home pointer must not open an island"
     );
+    assert_eq!(untouched, format!("{func:?}"));
 }
 
 #[test]

@@ -979,7 +979,7 @@ fn run_inline_phase(
     // promotion switched off for debugging the split is off too: its word
     // locals would stay in memory, which is the form it exists to avoid.
     let split_i128 = mem2reg && i128_split_enabled(target, disabled);
-    if split_i128 && i128_split::run(module, false) > 0 {
+    if split_i128 && i128_split::run(module) > 0 {
         crate::ir::mem2reg::promote_allocas(module);
         constant_fold::run(module);
         copy_prop::run(module);
@@ -1100,7 +1100,7 @@ fn run_inline_phase(
     // a 128-bit product whose caller only takes its halves), and the bodies
     // that read a 128-bit parameter, whose home is plain memory from here on.
     if split_i128 {
-        i128_split::run(module, true);
+        i128_split::run(module);
     }
     iphase_dump!("i128_split-after-inline");
     if !std::env::var("CCC_NO_MEM2REG_PARAMS").is_ok() {
@@ -2153,7 +2153,7 @@ pub(crate) fn run_passes(
         // 128-bit split, as in the -O2 tier: once before inlining with the
         // parameter homes left whole, once after.  One linear sweep each.
         let split_i128 = i128_split_enabled(target, &disabled);
-        if split_i128 && i128_split::run(module, false) > 0 {
+        if split_i128 && i128_split::run(module) > 0 {
             crate::ir::mem2reg::promote_allocas_with_params(module);
             constant_fold::run(module);
             copy_prop::run(module);
@@ -2175,7 +2175,7 @@ pub(crate) fn run_passes(
         }
         o1_checkpoint!("inline");
         if split_i128 {
-            i128_split::run(module, true);
+            i128_split::run(module);
         }
         o1_checkpoint!("i128_split-after-inline");
         // Post-inline parameter promotion: with the inliner done, param
