@@ -300,6 +300,16 @@ pub struct FnEntryRows {
 }
 
 pub struct CodegenState {
+    /// Values whose 16-byte vector content currently lives in `%xmm0` with no
+    /// home of its own -- an `I128`-carried vector call result whose
+    /// destination has no stack slot, and the copies propagated from it.
+    ///
+    /// The IR carries a 16-byte vector as `IrType::I128`, and `emit_copy_i128`
+    /// would otherwise route every such value through `%rax`/`%rdx`: a spill,
+    /// two reloads and two stores per copy.  A value in this set is read from
+    /// and written to `%xmm0` directly.  Membership is removed as soon as the
+    /// value acquires a home, so it can never outlive the register's content.
+    pub call_ret_vector_in_xmm0: FxHashSet<u32>,
     pub(crate) frame_report: Option<crate::backend::FrameReport>,
     pub(crate) debug_homes: Option<crate::backend::DebugHomes>,
     pub out: AsmOutput,
@@ -975,6 +985,7 @@ impl CodegenState {
 
     pub fn new_with_ra_config(ra_config: Arc<crate::backend::regalloc::RaConfig>) -> Self {
         Self {
+            call_ret_vector_in_xmm0: Default::default(),
             frame_report: None,
             debug_homes: None,
             out: AsmOutput::new(),

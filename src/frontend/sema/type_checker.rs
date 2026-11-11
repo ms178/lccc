@@ -1151,6 +1151,9 @@ impl<'a> ExprTypeChecker<'a> {
             }
             TypeSpecifier::Typeof(expr, _) => {
                 // typeof(expr): try to infer the expression's type
+                if self.infer_expr_ctype(expr).is_none() {
+                    tmp_typeof_probe("plain", expr);
+                }
                 self.infer_expr_ctype(expr).unwrap_or(CType::Int)
             }
             TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype, abi) => {
@@ -1865,6 +1868,7 @@ impl<'a> ExprTypeChecker<'a> {
                     return ctype;
                 }
                 // TODO: report diagnostic for unresolved typeof expression
+                tmp_typeof_probe("scoped", expr);
                 CType::Int // fallback
             }
             TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec_with_scope(inner, scope),
@@ -2147,3 +2151,19 @@ mod qualifier_composition_tests {
         }
     }
 }
+
+// TMP-PROBE-BEGIN
+fn tmp_typeof_probe(site: &str, expr: &Expr) {
+    if let Some(path) = std::env::var_os("LCCC_TMP_TYPEOF_PROBE") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let text: String = format!("{expr:?}").chars().take(240).collect();
+            let _ = writeln!(f, "site={site} expr={text}");
+        }
+    }
+}
+// TMP-PROBE-END

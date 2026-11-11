@@ -649,6 +649,7 @@ impl X86Codegen {
         // The def index answers for one function; the next question builds
         // this one's (see `get_defining_instruction`).
         self.def_index = std::cell::OnceCell::new();
+        self.i128_high_facts = std::cell::OnceCell::new();
         self.wide_simd_copies = func.blocks.iter().any(|block| {
             block.instructions.iter().any(|inst| {
                 matches!(
@@ -1530,19 +1531,33 @@ impl X86Codegen {
             let mut coherent_i128_homes = crate::common::fx_hash::FxHashSet::default();
             // (dest, source-value) edges for the Copy/Load propagation pass.
             let mut home_writes: Vec<(u32, Option<u32>)> = Vec::new();
+            // Does the function move 16-byte values through XMM registers?
+            // See `function_has_xmm128_traffic`; decided in this same walk.
+            let mut xmm128_traffic = false;
+            // THIS function's parameter classes, classified on the first
+            // 128-bit ParamRef (most functions have none).  The emitter's
+            // `state.param_classes` cannot answer here: it is installed by
+            // `emit_store_params_impl`, which runs after this scan, so at
+            // this point it still holds the PREVIOUSLY emitted function's
+            // classes.  Reading it marked a stack-passed 128-bit parameter
+            // coherent whenever the previous function happened to take a
+            // register pair at the same index (and refused a genuine
+            // register pair in the opposite case).
+            let mut own_param_classes: Option<Vec<ParamClass>> = None;
             for block in &func.blocks {
                 for inst in &block.instructions {
+                    xmm128_traffic = xmm128_traffic || instruction_has_xmm128_traffic(inst);
                     match inst {
                         Instruction::ParamRef {
-                            dest, param_idx, ..
-                        } => {
-                            let is_i128_param =
-                                self.state.param_classes.get(*param_idx).is_some_and(|c| {
-                                    matches!(
-                                        c,
-                                        crate::backend::call_abi::ParamClass::I128RegPair { .. }
-                                    )
-                                });
+                            dest,
+                            param_idx,
+                            ty,
+                        } if matches!(ty, IrType::I128 | IrType::U128) => {
+                            let classes = own_param_classes
+                                .get_or_insert_with(|| self.classify_params_of(func));
+                            let is_i128_param = classes
+                                .get(*param_idx)
+                                .is_some_and(|c| matches!(c, ParamClass::I128RegPair { .. }));
                             if is_i128_param {
                                 coherent_i128_homes.insert(dest.0);
                             }
@@ -1592,6 +1607,26 @@ impl X86Codegen {
                 }
             }
             self.coherent_i128_homes = coherent_i128_homes;
+            // A `_Float128` the function itself returns or receives is XMM
+            // traffic with no instruction to show for it.
+            let own_f128 = func.ret_is_f128_sse
+                || own_param_classes
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| {
+                        matches!(
+                            c,
+                            ParamClass::F128SseReg { .. } | ParamClass::F128Stack { .. }
+                        )
+                    });
+            self.i128_pair_relay =
+                super::isel::i128_pair_relay_allowed() && !xmm128_traffic && !own_f128;
+            self.i128_block_copies = if self.i128_pair_relay {
+                collect_i128_block_copies(func)
+            } else {
+                FxHashSet::default()
+            };
         }
 
         // Direct scalar global accesses and safely reconstructible global
@@ -3838,6 +3873,21 @@ impl X86Codegen {
         }
     }
 
+    /// The parameter classes of `func` under this emitter's ABI
+    /// configuration.
+    ///
+    /// One construction for every consumer: `emit_store_params_impl` installs
+    /// the result as `state.param_classes`, and the frame scan in
+    /// `calculate_stack_space_impl` -- which runs BEFORE that, while
+    /// `state.param_classes` still describes the previously emitted function
+    /// -- classifies `func` itself through this same call.
+    pub(super) fn classify_params_of(&self, func: &IrFunction) -> Vec<ParamClass> {
+        let mut config = self.call_abi_config_impl();
+        config.microsoft_x64 =
+            func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
+        classify_params(func, &config)
+    }
+
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
         // One O(instructions + params) pass replaces every
         // parameter-home full scan in this prologue.
@@ -3845,10 +3895,7 @@ impl X86Codegen {
         let xmm_regs = [
             "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
         ];
-        let mut config = self.call_abi_config_impl();
-        config.microsoft_x64 =
-            func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
-        let param_classes = classify_params(func, &config);
+        let param_classes = self.classify_params_of(func);
         self.state.param_classes = param_classes.clone();
         self.state.num_params = func.params.len();
         self.state.func_is_variadic = func.is_variadic;
@@ -5637,6 +5684,100 @@ fn emit_fpo_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, mut
     }
 }
 
+/// Whether `inst` moves a 16-byte value through an XMM register: a call
+/// taking or returning a `_Float128` or a 16-byte vector, a vector
+/// intrinsic, or one of the F128 sign-bit helpers.
+///
+/// A function with any such instruction carries 128-bit values in the XMM
+/// regime -- produced by `movdqu %xmm0, slot`, consumed by `movdqu slot,
+/// %xmm0` -- and its typed 128-bit Load/Store keep the matching 16-byte
+/// relay.  Every other function's 128-bit values are integers in the
+/// GPR-pair regime and relay as two 8-byte halves
+/// (`X86Codegen::i128_pair_relay`).  The split is per function because the
+/// IR carries both kinds as `I128`/`U128`; mixing the two widths on one slot
+/// is what defeats store forwarding, in either direction.
+fn instruction_has_xmm128_traffic(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+            info.ret_is_f128_sse
+                || info.ret_is_vector128
+                || info.struct_arg_is_f128_sse.iter().any(|&is_f128| is_f128)
+        }
+        Instruction::Intrinsic { op, .. } => {
+            op.is_vector_op()
+                || matches!(
+                    op,
+                    IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign
+                )
+        }
+        _ => false,
+    }
+}
+
+/// 128-bit values that are loaded through a pointer only to be stored again:
+/// the dest of a plain 128-bit `Load` whose address is not one of this
+/// function's own locals and whose every use is the stored value of a plain
+/// 128-bit `Store`.
+///
+/// These are block copies (`*d = *s`, a swap, a struct field assignment).
+/// They keep the 16-byte SSE relay inside a pair-relay function: the value
+/// never reaches a GPR pair, the copy is one load and one store instead of
+/// two and two, and a source reached through a pointer is not a slot this
+/// function has just written in halves.  A local's slot is exactly that, so
+/// a load from a local stays on the pair relay.
+fn collect_i128_block_copies(func: &IrFunction) -> FxHashSet<u32> {
+    let plain = |volatile: bool, seg: AddressSpace| !volatile && seg == AddressSpace::Default;
+    let wide = |ty: IrType| matches!(ty, IrType::I128 | IrType::U128);
+    let instructions = || func.blocks.iter().flat_map(|block| &block.instructions);
+    let locals: FxHashSet<u32> = instructions()
+        .filter_map(|inst| match inst {
+            Instruction::Alloca { dest, .. } => Some(dest.0),
+            _ => None,
+        })
+        .collect();
+    let mut copies: FxHashSet<u32> = instructions()
+        .filter_map(|inst| match inst {
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile,
+                seg_override,
+            } if wide(*ty) && plain(*volatile, *seg_override) && !locals.contains(&ptr.0) => {
+                Some(dest.0)
+            }
+            _ => None,
+        })
+        .collect();
+    if copies.is_empty() {
+        return copies;
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                // Stored as the value: the one use a block copy has.  Used
+                // as the address: not a copy.
+                Instruction::Store {
+                    ptr,
+                    ty,
+                    volatile,
+                    seg_override,
+                    ..
+                } if wide(*ty) && plain(*volatile, *seg_override) => {
+                    copies.remove(&ptr.0);
+                }
+                other => other.for_each_used_value(|id| {
+                    copies.remove(&id);
+                }),
+            }
+        }
+        block.terminator.for_each_used_value(|id| {
+            copies.remove(&id);
+        });
+    }
+    copies
+}
+
 /// Vector-typed operands in the guard slot of a masked reduction step (the
 /// vectorizer's hoisted preheader splat, or a copy of it). A scalar guard —
 /// a constant or an I32 SSA value — is never a vector value, so membership in
@@ -5778,5 +5919,228 @@ mod narrow_call_arg_sign_cast_tests {
         };
         let f = func(IrType::U32, vec![call], Terminator::Return(None));
         assert!(!sign_casts_read_only_as_call_args(&f).contains(&2));
+    }
+}
+
+#[cfg(test)]
+mod xmm128_traffic_tests {
+    use super::*;
+    use crate::ir::reexports::CallInfo;
+
+    fn call(info: CallInfo) -> Instruction {
+        Instruction::Call {
+            func: "callee".into(),
+            info,
+        }
+    }
+
+    /// The instructions that put a 16-byte value in an XMM register: these
+    /// keep a function's typed 128-bit Load/Store on the 16-byte relay.
+    #[test]
+    fn f128_and_vector_calls_and_intrinsics_are_xmm128_traffic() {
+        assert!(instruction_has_xmm128_traffic(&call(CallInfo {
+            ret_is_f128_sse: true,
+            ..Default::default()
+        })));
+        assert!(instruction_has_xmm128_traffic(&call(CallInfo {
+            ret_is_vector128: true,
+            ..Default::default()
+        })));
+        assert!(instruction_has_xmm128_traffic(&call(CallInfo {
+            struct_arg_is_f128_sse: vec![false, true],
+            ..Default::default()
+        })));
+        assert!(instruction_has_xmm128_traffic(&Instruction::CallIndirect {
+            func_ptr: Operand::Value(Value(1)),
+            info: CallInfo {
+                ret_is_f128_sse: true,
+                ..Default::default()
+            },
+        }));
+        for op in [
+            IntrinsicOp::F128Neg,
+            IntrinsicOp::F128Fabs,
+            IntrinsicOp::F128Copysign,
+            IntrinsicOp::VecLoadI32x4,
+        ] {
+            assert!(
+                instruction_has_xmm128_traffic(&Instruction::Intrinsic {
+                    dest: Some(Value(2)),
+                    op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(Value(1))],
+                }),
+                "{op:?}"
+            );
+        }
+    }
+
+    /// Integer code -- including calls that pass or return `__int128` in
+    /// GPR pairs and 128-bit integer arithmetic -- is not.
+    #[test]
+    fn integer_i128_code_is_not_xmm128_traffic() {
+        assert!(!instruction_has_xmm128_traffic(&call(CallInfo {
+            args: vec![Operand::Value(Value(1))],
+            arg_types: vec![IrType::U128],
+            return_type: IrType::U128,
+            struct_arg_is_f128_sse: vec![false],
+            num_fixed_args: 1,
+            ..Default::default()
+        })));
+        assert!(!instruction_has_xmm128_traffic(&Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::U128,
+        }));
+        assert!(!instruction_has_xmm128_traffic(&Instruction::Load {
+            dest: Value(3),
+            ptr: Value(1),
+            ty: IrType::U128,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }));
+        // A scalar intrinsic moves nothing through a vector register.
+        assert!(!instruction_has_xmm128_traffic(&Instruction::Intrinsic {
+            dest: Some(Value(2)),
+            op: IntrinsicOp::Crc32_64,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+        }));
+    }
+
+    fn copy_function(insts: Vec<Instruction>, result: Option<Operand>) -> IrFunction {
+        use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+        let mut func = IrFunction::new("copies".into(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(result),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        });
+        func
+    }
+
+    fn load128(dest: u32, ptr: u32) -> Instruction {
+        Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::U128,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn store128(val: u32, ptr: u32) -> Instruction {
+        Instruction::Store {
+            val: Operand::Value(Value(val)),
+            ptr: Value(ptr),
+            ty: IrType::U128,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn pointer_param(dest: u32, index: usize) -> Instruction {
+        Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx: index,
+            ty: IrType::Ptr,
+        }
+    }
+
+    /// `*d = *s` and a swap: every loaded value is only stored again.
+    #[test]
+    fn a_value_loaded_through_a_pointer_and_only_stored_is_a_block_copy() {
+        let func = copy_function(
+            vec![
+                pointer_param(1, 0),
+                pointer_param(2, 1),
+                load128(3, 1),
+                load128(4, 2),
+                store128(4, 1),
+                store128(3, 2),
+                store128(3, 1),
+            ],
+            None,
+        );
+        let copies = collect_i128_block_copies(&func);
+        assert!(copies.contains(&3) && copies.contains(&4), "{copies:?}");
+        assert_eq!(copies.len(), 2);
+    }
+
+    /// Anything that reads the value as an integer, a load from one of the
+    /// function's own locals, and volatile or segment accesses are not.
+    #[test]
+    fn computed_local_and_volatile_values_are_not_block_copies() {
+        let local = Instruction::Alloca {
+            dest: Value(9),
+            ty: IrType::U128,
+            size: 16,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let arithmetic = Instruction::BinOp {
+            dest: Value(5),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Value(Value(3)),
+            ty: IrType::U128,
+        };
+        let volatile_load = Instruction::Load {
+            dest: Value(6),
+            ptr: Value(2),
+            ty: IrType::U128,
+            seg_override: AddressSpace::Default,
+            volatile: true,
+        };
+        let segment_load = Instruction::Load {
+            dest: Value(7),
+            ptr: Value(2),
+            ty: IrType::U128,
+            seg_override: AddressSpace::SegGs,
+            volatile: false,
+        };
+        let func = copy_function(
+            vec![
+                pointer_param(1, 0),
+                pointer_param(2, 1),
+                local,
+                load128(3, 1),
+                arithmetic,
+                store128(3, 2),
+                volatile_load,
+                store128(6, 1),
+                segment_load,
+                store128(7, 1),
+                load128(8, 9),
+                store128(8, 1),
+            ],
+            None,
+        );
+        assert!(collect_i128_block_copies(&func).is_empty());
+
+        // Returned, or used as an address: read as an integer after all.
+        let returned = copy_function(
+            vec![pointer_param(1, 0), load128(3, 1), store128(3, 1)],
+            Some(Operand::Value(Value(3))),
+        );
+        assert!(collect_i128_block_copies(&returned).is_empty());
+        let as_address = copy_function(
+            vec![
+                pointer_param(1, 0),
+                load128(3, 1),
+                load128(4, 1),
+                store128(4, 3),
+            ],
+            None,
+        );
+        assert_eq!(
+            collect_i128_block_copies(&as_address),
+            [4].into_iter().collect::<FxHashSet<u32>>()
+        );
     }
 }

@@ -1152,6 +1152,12 @@ impl Lowerer {
             .get(&nf.name)
             .map(|s| s.ret_is_f128_sse)
             .unwrap_or(false);
+        let ret_is_vector128 = self
+            .func_meta
+            .sigs
+            .get(&nf.name)
+            .map(|s| s.ret_is_vector128)
+            .unwrap_or(false);
         let blocks = std::mem::take(&mut self.func_mut().blocks);
         let next_label = self.next_label;
         let calling_convention = nf.calling_convention.unwrap_or_else(|| {
@@ -1197,6 +1203,7 @@ impl Lowerer {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes,
             ret_is_f128_sse,
+            ret_is_vector128,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: crate::ir::module::SspInfo {

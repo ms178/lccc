@@ -83,6 +83,27 @@ exit "$rc"
                         self.assertEqual(runs, expected)
                     self.assertIn("--profile fastbuild --all-targets --locked -j " + jobs, isolated[0][0])
 
+    def test_caller_verified_job_budget_is_not_overridden_regardless_of_order(self):
+        """A host-verified CARGO_BUILD_JOBS must survive ci_local.sh's own setup.
+
+        `agent-env.sh` exports CARGO_BUILD_JOBS=1 exactly to protect a small
+        host, and ci_local.sh's documented policy is "1 below 6 GB RAM". Its
+        setup block nevertheless exported 2 unconditionally, so that derivation
+        was dead code and `cargo test --all-targets -j 2` was OOM-killed on the
+        3.8 GB sandbox. The setting must be order-independent: a null statement
+        is prepended to stand in for the setup block that used to run first.
+        """
+        for mem in ["1982", "3939", "5999", "6000", "65536"]:
+            for verified in ["1", "2"]:
+                with self.subTest(mem=mem, verified=verified):
+                    rc, runs = self.run_gates(":; cargo_test_repeated", mem,
+                                              {"CARGO_BUILD_JOBS": verified})
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(len(runs), 1)
+                    self.assertEqual(runs[0][1], verified)
+                    self.assertIn("--profile fastbuild --all-targets --locked -j "
+                                  + verified, runs[0][0])
+
     def test_errors_propagate_without_state_leaks(self):
         for call, overrides, expected, count in [
             ("cargo_test_repeated", {"FAIL_REPORTER": "7"}, 7, 0),

@@ -518,6 +518,15 @@ pub struct CallInfo {
     pub struct_arg_is_f128_sse: Vec<bool>,
     /// True if the return value is _Float128 (ONE 16-byte XMM register).
     pub ret_is_f128_sse: bool,
+    /// True if the return value is a 16-byte vector (`__m128`, `__m128i`,
+    /// `__m128d`): psABI classes `[Sse, SseUp]`, the whole value in `%xmm0`.
+    ///
+    /// The IR carries such a value as packed `I64` (`IrType` has no vector
+    /// variant), so without this bit the backend stores the result as two
+    /// independent I64 halves read out through `%rax`/`%rdx` -- a spill, two
+    /// reloads and two GPR stores for what is one `movdqu %xmm0` to a home or,
+    /// when the value has no home, one register left in place.
+    pub ret_is_vector128: bool,
     /// True if the call uses a hidden pointer argument for struct returns (i386 SysV ABI).
     pub is_sret: bool,
     /// True if the callee uses the fastcall calling convention.

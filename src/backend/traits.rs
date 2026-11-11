@@ -1231,6 +1231,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         _is_regparm: Option<u8>,
         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
         ret_is_f128_sse: bool,
+        ret_is_vector128: bool,
     ) {
         // Phase 2b: save caller-saved registers with live values before the call.
         self.emit_pre_call_save_caller_regs();
@@ -1261,6 +1262,11 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         // shape, but the psABI gives it no register. Classify the real
         // arguments from index 1 and store the register through the buffer
         // after the call (`emit_call_store_vector_return`).
+        // A 16-byte vector in ONE `%xmm0`: psABI classes `[Sse, SseUp]` and a
+        // 16-byte value.  (`> 16` bytes takes the `vector_return_bytes` path
+        // above, which hides the buffer behind the same class shape.)
+        let vector_ret_is_xmm0 = ret_is_vector128
+            && crate::common::sysv_classify::vector_reg_bytes_of(ret_eightbyte_classes) == Some(16);
         let vector_return_bytes =
             hidden_vector_return_bytes(is_sret, ret_eightbyte_classes).filter(|_| !args.is_empty());
         // AAPCS64 HFA / RISC-V float-struct result: the same buffer shape,
@@ -1465,6 +1471,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         } else if let Some(dest) = dest {
             self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
             self.set_call_ret_is_f128_sse(ret_is_f128_sse);
+            self.set_call_ret_is_vector128(vector_ret_is_xmm0);
             self.emit_call_store_result(&dest, return_type);
         }
 
@@ -1644,6 +1651,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     /// Stash whether the call's return value is _Float128 (ONE 16-byte XMM).
     /// x86-64 overrides this for use in emit_call_store_result.
     fn set_call_ret_is_f128_sse(&mut self, _is_f128: bool) {}
+    fn set_call_ret_is_vector128(&mut self, _is_vector128: bool) {}
 
     /// Store the function's return value from ABI registers to the destination slot.
     ///
@@ -3518,6 +3526,11 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
                     get_const_i128_halves(rhs).expect("i128 const halves (guarded by is_some)");
                 self.emit_i128_mul_const(lhs, rhs, lo, hi);
             }
+            // Operands whose high halves the backend can prove (a widened
+            // 64-bit value on either side) need fewer than three products;
+            // the hook stages its own operands and leaves the result pair
+            // exactly where the generic sequence would.
+            IrBinOp::Mul if self.emit_i128_mul_narrow(lhs, rhs) => {}
             _ => {
                 self.emit_i128_prep_binop(lhs, rhs);
                 match op {
@@ -3550,6 +3563,18 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     fn emit_i128_mul_const(&mut self, lhs: &Operand, rhs: &Operand, _lo: u64, _hi: u64) {
         self.emit_i128_prep_binop(lhs, rhs);
         self.emit_i128_mul();
+    }
+
+    /// Emit a 128-bit multiply in a form narrower than the generic product,
+    /// when the backend can prove enough about the operands' high halves
+    /// (both zero-extended from 64 bits: one widening multiply).
+    ///
+    /// Contract: return `true` with the product in the result pair -- the
+    /// caller then only stores it -- or return `false` having emitted
+    /// NOTHING, and the caller runs the generic sequence.  The default
+    /// declines, so a backend without the facts is unchanged.
+    fn emit_i128_mul_narrow(&mut self, _lhs: &Operand, _rhs: &Operand) -> bool {
+        false
     }
 
     // ---- 128-bit comparison dispatch ----

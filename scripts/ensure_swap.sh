@@ -70,11 +70,16 @@ fi
 # mkswap is idempotent for our disposable file and refreshes a partially
 # created header after an interrupted harness turn.
 "${privilege[@]}" /sbin/mkswap "$swapfile" >/dev/null
-if ! "${privilege[@]}" /sbin/swapon "$swapfile" 2>/tmp/lccc-swapon.err; then
+# A fixed /tmp path can be owned by root from an earlier sudo run, making the
+# calling user's redirection fail before swapon is even attempted. Create the
+# diagnostic file as the calling user and let the privileged child write to it.
+swapon_err=$(mktemp "${TMPDIR:-/tmp}/lccc-swapon.XXXXXX")
+trap 'rm -f "$swapon_err"' EXIT
+if ! "${privilege[@]}" /sbin/swapon "$swapfile" 2>"$swapon_err"; then
     # Some sandboxes (unprivileged containers, no CAP_SYS_ADMIN) refuse
     # swapon even as root. The 4G file is still useful as a tmp spill
     # target; do not fail the compiler build.
-    echo "warning: swapon $swapfile failed (continuing without swap): $(tr '\n' ' ' </tmp/lccc-swapon.err)" >&2
+    echo "warning: swapon $swapfile failed (continuing without swap): $(tr '\n' ' ' <"$swapon_err")" >&2
     exit 0
 fi
 

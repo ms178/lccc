@@ -3600,6 +3600,11 @@ impl ArchCodegen for I686Codegen {
         is_regparm: Option<u8>,
         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
         ret_is_f128_sse: bool,
+        // A 16-byte vector in ONE `%xmm0` is an x86-64 psABI shape.  On i686
+        // every aggregate return already travels through sret or the
+        // EAX:EDX:ECX carrier decided above, so this fact is accepted for the
+        // trait's parity and deliberately not consulted.
+        _ret_is_vector128: bool,
     ) {
         let returns_half_xmm = ret_is_f128_sse && return_type == IrType::U16;
         let returns_i686_ext_vector_gp3 = return_type == IrType::I128

@@ -207,6 +207,17 @@ impl Lowerer {
                         if sig.ret_x87_aggregate || sig.ret_x87_pair {
                             return sig.return_type;
                         }
+                        // A 16-byte vector (`__m128`/`__m128i`/`__m128d`)
+                        // returns in ONE `%xmm0` (psABI `[Sse, SseUp]`), and
+                        // the IR carries it as a 128-bit container so the
+                        // backend can store or load the whole register.
+                        // Collapsing it to I64 made every caller rebuild the
+                        // value from two independent I64 halves through
+                        // GP registers -- a spill, two reloads and two false
+                        // `%rax`/`%rdx` dependencies for one `movdqu`.
+                        if sig.ret_is_vector128 {
+                            return IrType::I128;
+                        }
                         // Small legacy vector_size returns (≤8 bytes) use I64.
                         return IrType::I64;
                     }
@@ -1172,6 +1183,12 @@ impl Lowerer {
             .get(&func.name)
             .map(|s| s.ret_is_f128_sse)
             .unwrap_or(false);
+        let ret_is_vector128 = self
+            .func_meta
+            .sigs
+            .get(&func.name)
+            .map(|s| s.ret_is_vector128)
+            .unwrap_or(false);
         // Use the lowerer's global next_label counter to ensure labels are globally unique
         let next_label = self.next_label;
         let emitted_name = self
@@ -1254,6 +1271,7 @@ impl Lowerer {
             global_init_label_blocks: global_init_labels,
             ret_eightbyte_classes,
             ret_is_f128_sse,
+            ret_is_vector128,
             is_gnu_inline_def: is_gnu_inline_no_extern_def,
             loop_promoted_f64_values: Vec::new(),
             ssp: crate::ir::module::SspInfo {

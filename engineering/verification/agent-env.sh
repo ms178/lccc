@@ -3,7 +3,7 @@
 # toolchain, cached Debian runtime packages, Python ELF/DWARF packages and
 # the strict (-D warnings) fastbuild environment. Never touches the network.
 set -euo pipefail
-LCCC_AGENT_CACHE_PREFIX="${LCCC_AGENT_CACHE_PREFIX:-/home/user/.cache/lccc/agent-tools}"
+LCCC_AGENT_CACHE_PREFIX="${LCCC_AGENT_CACHE_PREFIX:-${HOME}/.cache/lccc/agent-toolchains}"
 if [[ ! -f "$LCCC_AGENT_CACHE_PREFIX/env.sh" ]]; then
   echo "agent-env.sh: missing $LCCC_AGENT_CACHE_PREFIX/env.sh" >&2
   return 1 2>/dev/null || exit 1
@@ -25,9 +25,21 @@ export CPLUS_INCLUDE_PATH="$C_INCLUDE_PATH${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_
 export RUNNER_TEMP="${RUNNER_TEMP:-/tmp/lccc-runner-temp}"
 mkdir -p "$RUNNER_TEMP"
 export CARGO_BUILD_JOBS=1
-# Reuse the already-active 4 GiB swap instead of letting ensure_swap.sh
-# allocate a SECOND 4 GiB /swapfile and exhaust this 21 GiB sandbox.
-export LCCC_SWAPFILE="$HOME/.cache/lccc-swap.img"
+# Reuse an already-active EXACTLY 4 GiB file instead of allocating a second
+# swap image and exhausting this 21 GiB sandbox. /proc/swaps reports usable
+# pages (slightly below stat's byte count), so verify the file size itself.
+# With no qualifying active file, keep the sandbox-local fallback path.
+LCCC_SWAPFILE="$HOME/.cache/lccc-swap.img"
+if [[ -r /proc/swaps ]]; then
+    while read -r active_path active_type _; do
+        [[ $active_type == file && -f $active_path ]] || continue
+        if [[ $(stat -c %s "$active_path" 2>/dev/null || echo 0) -eq $((4 * 1024 * 1024 * 1024)) ]]; then
+            LCCC_SWAPFILE=$active_path
+            break
+        fi
+    done </proc/swaps
+fi
+export LCCC_SWAPFILE
 export RUSTFLAGS="-D warnings"
 unset RUSTUP_TOOLCHAIN RUSTUP_HOME CCC_NO_BB_SLP
 export LCCC_BIN="${LCCC_BIN:-$PWD/target/fastbuild/lccc}"

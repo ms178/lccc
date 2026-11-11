@@ -44,7 +44,9 @@ pub(crate) mod fp_const_hoist;
 pub(crate) mod fp_double;
 pub(crate) mod global_addr_cse;
 pub(crate) mod gvn;
+pub(crate) mod i128_split;
 pub(crate) mod if_convert;
+mod index_hoist;
 pub(crate) mod inline;
 pub(crate) mod instrument;
 pub(crate) mod int_const_hoist;
@@ -957,7 +959,8 @@ fn run_inline_phase(
     // them inlineable). GVN never rewrites param-alloca loads (see gvn.rs),
     // so the inliner's store-into-param-alloca argument passing stays intact.
     // Keep parameter allocas until after inlining.
-    if !std::env::var("CCC_NO_MEM2REG").is_ok() {
+    let mem2reg = std::env::var("CCC_NO_MEM2REG").is_err();
+    if mem2reg {
         crate::ir::mem2reg::promote_allocas(module);
     }
     iphase_dump!("mem2reg");
@@ -967,6 +970,22 @@ fn run_inline_phase(
     iphase_dump!("canonicalize-copyprop");
     simplify::run(module);
     iphase_dump!("canonicalize-simplify");
+    // Split closed 128-bit islands into 64-bit halves.  It needs the
+    // canonical form (shift counts are literals by now) and it runs before
+    // the inliner prices bodies; the word locals it creates are promoted at
+    // once, so everything downstream sees ordinary 64-bit SSA values.
+    // Parameter homes are left whole here: after inlining they are ordinary
+    // locals of the caller, which the second run below splits with it.  With
+    // promotion switched off for debugging the split is off too: its word
+    // locals would stay in memory, which is the form it exists to avoid.
+    let split_i128 = mem2reg && i128_split_enabled(target, disabled);
+    if split_i128 && i128_split::run(module, false) > 0 {
+        crate::ir::mem2reg::promote_allocas(module);
+        constant_fold::run(module);
+        copy_prop::run(module);
+        simplify::run(module);
+    }
+    iphase_dump!("i128_split");
     // Expose byte-decoding helpers' real cost before inlining and before GVN
     // gives their byte loads multiple users. The established late run remains
     // for chains exposed by later simplification. This is the SAME checked
@@ -1077,6 +1096,13 @@ fn run_inline_phase(
         }
     }
 
+    // Second 128-bit split: islands the inliner closed (a helper returning
+    // a 128-bit product whose caller only takes its halves), and the bodies
+    // that read a 128-bit parameter, whose home is plain memory from here on.
+    if split_i128 {
+        i128_split::run(module, true);
+    }
+    iphase_dump!("i128_split-after-inline");
     if !std::env::var("CCC_NO_MEM2REG_PARAMS").is_ok() {
         crate::ir::mem2reg::promote_allocas_with_params(module);
     }
@@ -1184,6 +1210,14 @@ pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
         let tok = tok.trim();
         tok == "all" || tok == pass
     })
+}
+
+/// Whether the 128-bit split (`i128_split`) runs.  x86-64 only: the pass
+/// relies on that backend's flags peepholes to turn the carry and borrow
+/// tests it emits back into `adc`/`sbb` (see the module documentation).
+/// `CCC_DISABLE_PASSES=i128_split` turns it off.
+fn i128_split_enabled(target: crate::backend::Target, disabled: &str) -> bool {
+    target == crate::backend::Target::X86_64 && !pass_disabled(disabled, "i128_split")
 }
 
 /// True when an inline-asm constraint can only name memory, an immediate or a
@@ -2116,6 +2150,15 @@ pub(crate) fn run_passes(
             simplify::run_with_config(module, true);
         }
         o1_checkpoint!("simplify");
+        // 128-bit split, as in the -O2 tier: once before inlining with the
+        // parameter homes left whole, once after.  One linear sweep each.
+        let split_i128 = i128_split_enabled(target, &disabled);
+        if split_i128 && i128_split::run(module, false) > 0 {
+            crate::ir::mem2reg::promote_allocas_with_params(module);
+            constant_fold::run(module);
+            copy_prop::run(module);
+        }
+        o1_checkpoint!("i128_split");
         // Inlining at -O1: GCC's -O1 tier inlines always_inline and
         // extern-inline functions plus called-once/small static helpers, and
         // several torture cases depend on the resulting constant propagation
@@ -2131,6 +2174,10 @@ pub(crate) fn run_passes(
             inline::run(module);
         }
         o1_checkpoint!("inline");
+        if split_i128 {
+            i128_split::run(module, true);
+        }
+        o1_checkpoint!("i128_split-after-inline");
         // Post-inline parameter promotion: with the inliner done, param
         // allocas can become SSA values. Constants passed through inlined
         // calls (20010119-1: a = 10) become visible to the propagation
@@ -2571,6 +2618,33 @@ pub(crate) fn run_passes(
                 run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies)
             );
             cur_pass_changes[1] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2-idx: invariant index hoisting -- iter 0, ahead of every
+        // loop transform. `a[inv + j]` becomes `(a + inv)[j]` with the
+        // invariant half in the preheader, so the unroller, the vectorizer,
+        // the idiom recognisers and `iv_widen` all see a plain indexed
+        // access instead of a sum they decline (see `index_hoist.rs`).
+        // x86-64, -O2+, not -Os/-Oz. Pass name for CCC_DISABLE_PASSES:
+        // "index_hoist".
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && target == crate::backend::Target::X86_64
+            && !pass_disabled(&disabled, "index_hoist")
+        {
+            let n = timed_pass!(
+                "index_hoist",
+                run_on_visited(module, &dirty, &mut changed, |f| {
+                    let n = index_hoist::run(f);
+                    if n > 0 {
+                        verify::verify_after_func_pass(f, "index_hoist");
+                    }
+                    n
+                })
+            );
             total_changes += n;
             total_changes_excl_dce += n;
         }
@@ -4521,6 +4595,7 @@ pub(crate) fn run_passes(
     // Runs before `fuse_vector_loads` so that pass sees the shortened chains.
     if !pass_disabled(&disabled, "vechomefwd") {
         vector_temp_promotion::forward_vector_homes(module);
+        verify::verify_after_pass(module, "vechomefwd");
     }
 
     // Phase 11b': Collapse the 16/32-byte aggregate-load -> VecLoad ->

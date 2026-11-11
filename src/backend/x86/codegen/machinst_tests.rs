@@ -4798,6 +4798,7 @@ mod typed_indirect_calls {
                 struct_arg_fp_agg_classes: vec![],
                 struct_arg_is_f128_sse: vec![],
                 ret_is_f128_sse: false,
+                ret_is_vector128: false,
                 is_sret: false,
                 calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
@@ -5079,6 +5080,215 @@ fn isel_i128_load_lowers_to_mov128() {
         }
         other => panic!("expected Mov128, got {other:?}"),
     }
+}
+
+/// A home map whose 128-bit integers live in the GPR-pair regime -- what
+/// the emitter's view answers for a function without 128-bit XMM traffic.
+struct PairRegimeHomes(crate::common::fx_hash::FxHashMap<u32, PhysReg>);
+
+impl super::isel::HomeMap for PairRegimeHomes {
+    fn get(&self, id: &u32) -> Option<&PhysReg> {
+        self.0.get(id)
+    }
+
+    fn any_home(&self, pred: &dyn Fn(PhysReg) -> bool) -> bool {
+        self.0.values().any(|&r| pred(r))
+    }
+
+    fn i128_pair_relay(&self, _id: u32) -> bool {
+        true
+    }
+}
+
+/// The relay's shape as (direction, half, memory-side operand): both loads
+/// strictly before both stores, low half first.
+fn pair_relay_shape(out: &[MachInst]) -> Vec<(&'static str, &'static str, MachOperand)> {
+    out.iter()
+        .map(|inst| match inst {
+            MachInst::Mov {
+                src,
+                dst: MachOperand::Reg(MachReg::Phys(r)),
+                size: OpSize::S64,
+            } if r.0 == RAX.0 => ("load", "lo", src.clone()),
+            MachInst::Mov {
+                src,
+                dst: MachOperand::Reg(MachReg::Phys(r)),
+                size: OpSize::S64,
+            } if r.0 == RDX.0 => ("load", "hi", src.clone()),
+            MachInst::Mov {
+                src: MachOperand::Reg(MachReg::Phys(r)),
+                dst,
+                size: OpSize::S64,
+            } if r.0 == RAX.0 => ("store", "lo", dst.clone()),
+            MachInst::Mov {
+                src: MachOperand::Reg(MachReg::Phys(r)),
+                dst,
+                size: OpSize::S64,
+            } if r.0 == RDX.0 => ("store", "hi", dst.clone()),
+            other => panic!("not a pair-relay instruction: {other:?}"),
+        })
+        .collect()
+}
+
+/// GPR-pair regime, xmm0 scratch FREE: the store still relays through
+/// rax/rdx.  An integer's slot was written as two 8-byte halves, so the
+/// `movdqu` load the scratch would permit cannot be store-forwarded.
+#[test]
+fn isel_i128_store_relays_as_a_pair_in_the_gpr_pair_regime() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    let ra = PairRegimeHomes([(2u32, PhysReg(14))].into_iter().collect()); // rdi-held ptr
+    let slots: FxHashMap<u32, i64> = [(1u32, -24i64)].into_iter().collect();
+    for ty in [IrType::I128, IrType::U128] {
+        let mut out = Vec::new();
+        assert!(super::isel::lower_instruction_typed(
+            &Instruction::Store {
+                val: Operand::Value(Value(1)),
+                ptr: Value(2),
+                ty,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            &ra,
+            &slots,
+            None,
+            &mut out,
+        ));
+        let base = MachReg::Phys(PhysReg(14));
+        assert_eq!(
+            pair_relay_shape(&out),
+            vec![
+                ("load", "lo", MachOperand::StackSlot(-24)),
+                ("load", "hi", MachOperand::StackSlot(-16)),
+                ("store", "lo", MachOperand::Mem { base, offset: 0 }),
+                ("store", "hi", MachOperand::Mem { base, offset: 8 }),
+            ],
+            "reads strictly before writes, no Mov128: {out:?}"
+        );
+    }
+}
+
+/// The mirrored load, from a GPR-held pointer and from a direct alloca slot.
+#[test]
+fn isel_i128_load_relays_as_a_pair_in_the_gpr_pair_regime() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{Instruction, Value};
+
+    let load = |ptr: u32| Instruction::Load {
+        dest: Value(1),
+        ptr: Value(ptr),
+        ty: IrType::U128,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    };
+    let ra = PairRegimeHomes([(2u32, PhysReg(14))].into_iter().collect());
+    let slots: FxHashMap<u32, i64> = [(1u32, -24i64), (3u32, -56i64)].into_iter().collect();
+
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &load(2),
+        &ra,
+        &slots,
+        None,
+        &mut out
+    ));
+    let base = MachReg::Phys(PhysReg(14));
+    assert_eq!(
+        pair_relay_shape(&out),
+        vec![
+            ("load", "lo", MachOperand::Mem { base, offset: 0 }),
+            ("load", "hi", MachOperand::Mem { base, offset: 8 }),
+            ("store", "lo", MachOperand::StackSlot(-24)),
+            ("store", "hi", MachOperand::StackSlot(-16)),
+        ]
+    );
+
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &load(3),
+        &ra,
+        &slots,
+        None,
+        &mut out
+    ));
+    assert_eq!(
+        pair_relay_shape(&out),
+        vec![
+            ("load", "lo", MachOperand::StackSlot(-56)),
+            ("load", "hi", MachOperand::StackSlot(-48)),
+            ("store", "lo", MachOperand::StackSlot(-24)),
+            ("store", "hi", MachOperand::StackSlot(-16)),
+        ]
+    );
+}
+
+/// The regime never widens the typed subset: everything the SSE relay
+/// refused (volatile, a register-homed value, a constant's own two-store
+/// form) is decided before the relay choice and is unchanged by it.
+#[test]
+fn isel_pair_regime_leaves_the_typed_subset_unchanged() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
+
+    let ra = PairRegimeHomes(
+        [(2u32, PhysReg(14)), (5u32, PhysReg(3))]
+            .into_iter()
+            .collect(),
+    );
+    let slots: FxHashMap<u32, i64> = [(1u32, -24i64)].into_iter().collect();
+    let store = |val: Operand, volatile: bool| Instruction::Store {
+        val,
+        ptr: Value(2),
+        ty: IrType::I128,
+        seg_override: AddressSpace::Default,
+        volatile,
+    };
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &store(Operand::Value(Value(1)), true),
+        &ra,
+        &slots,
+        None,
+        &mut out
+    ));
+    assert!(!super::isel::lower_instruction_typed(
+        &store(Operand::Value(Value(5)), false),
+        &ra,
+        &slots,
+        None,
+        &mut out
+    ));
+    assert!(out.is_empty(), "a refusal pushes nothing: {out:?}");
+    assert!(super::isel::lower_instruction_typed(
+        &store(Operand::Const(IrConst::I128(1)), false),
+        &ra,
+        &slots,
+        None,
+        &mut out
+    ));
+    assert!(
+        matches!(
+            out.as_slice(),
+            [
+                MachInst::Mov {
+                    src: MachOperand::Imm(1),
+                    ..
+                },
+                MachInst::Mov {
+                    src: MachOperand::Imm(0),
+                    ..
+                }
+            ]
+        ),
+        "a constant is two immediate stores in either regime: {out:?}"
+    );
 }
 
 /// A C `volatile` i128 access keeps the mature path: the

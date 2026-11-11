@@ -54,6 +54,15 @@ require_gcc_oracle "check_seg_gs_runtime" || exit 1
 #                     `p[i]` through a parameter base, for every integer width
 #                     and pointer elements, loads, stores, immediate stores and
 #                     read-modify-write, checked on a GS mirror. Oracle gcc -O2.
+#   seg_gs_i128_ptr.c 16-byte objects (`__int128`, `_Float128`) through
+#                     segment pointers and whole `__seg_gs` objects: a copy
+#                     that moved one 8-byte half used to pass unnoticed.
+#                     Oracle gcc -O2.
+#   seg_gs_wide_scratch.c live FP/wide values across a 16-byte segment store:
+#                     the store's constant form stages its high half through
+#                     the pre-coloured %xmm1, so a "scratch free" test that
+#                     looked only at %xmm0 would destroy a live value.
+#                     Oracle gcc -O2.
 programs=(
     "tests/regression/seg_gs_runtime/seg_gs_store_abi.c -O2"
     "tests/regression/seg_gs_runtime/seg_gs_runtime.c -O2"
@@ -70,6 +79,8 @@ programs=(
     "tests/regression/seg_gs_runtime/seg_gs_indexed.c -O0"
     "tests/regression/seg_gs_runtime/seg_gs_indexed.c -O2"
     "tests/regression/seg_gs_runtime/seg_gs_indexed.c -O3"
+    "tests/regression/seg_gs_runtime/seg_gs_i128_ptr.c -O2"
+    "tests/regression/seg_gs_runtime/seg_gs_wide_scratch.c -O2"
 )
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-seg-gs-runtime.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT

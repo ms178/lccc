@@ -831,6 +831,10 @@ impl super::isel::HomeMap for FreshHomes<'_> {
     fn is_rorx_masked_shift(&self, id: u32) -> bool {
         self.0.rorx_masked_shifts.contains(&id)
     }
+
+    fn i128_pair_relay(&self, id: u32) -> bool {
+        self.0.i128_pair_relay && !self.0.i128_block_copies.contains(&id)
+    }
 }
 
 pub struct X86Codegen {
@@ -852,6 +856,11 @@ pub struct X86Codegen {
     pub(super) call_ret_classes: Vec<crate::common::types::EightbyteClass>,
     /// True when the current call returns _Float128 (ONE 16-byte XMM, xmm0).
     pub(super) call_ret_is_f128_sse: bool,
+    /// The call just emitted returned a 16-byte vector in ONE `%xmm0`
+    /// (`Instruction::CallInfo::ret_is_vector128`).  Read by
+    /// `emit_call_store_result_impl`, which then stores `%xmm0` directly
+    /// instead of rebuilding the value from two I64 halves.
+    pub(super) call_ret_is_vector128: bool,
     /// For variadic functions: number of named integer/pointer parameters (excluding long double)
     pub(super) num_named_int_params: usize,
     /// For variadic functions: number of named float/double parameters (excluding long double)
@@ -1135,6 +1144,10 @@ pub struct X86Codegen {
     /// first `get_defining_instruction` of the function (see there) and reset
     /// wherever `current_func` changes.
     pub(super) def_index: std::cell::OnceCell<DefIndex>,
+    /// High-half facts of `current_func`'s single-definition 128-bit values
+    /// (`i128_ops::build_i128_high_facts`), built on the first 128-bit
+    /// multiply that asks and reset wherever `current_func` changes.
+    pub(super) i128_high_facts: std::cell::OnceCell<super::i128_ops::I128HighFacts>,
     /// When true, skip movslq sign-extension after 32-bit ALU ops on registers
     /// for values NOT in needs_sext_values. Set when no GEPs and no widening casts.
     pub(super) skip_i32_sext: bool,
@@ -1247,6 +1260,21 @@ pub struct X86Codegen {
     /// slot-homed i128 values the typed store route may read. See the
     /// prologue scan that fills it.
     pub(super) coherent_i128_homes: crate::common::fx_hash::FxHashSet<u32>,
+    /// Typed 128-bit integer Load/Store in this function relay through the
+    /// GPR pair instead of the `movdqu` scratch (`isel::HomeMap::
+    /// i128_pair_relay`).  True unless the function has 128-bit XMM traffic
+    /// -- a `_Float128` or 16-byte vector argument or result, a vector or
+    /// F128 intrinsic -- whose values are produced and consumed in an XMM
+    /// register and therefore want the 16-byte transfer.  Set per function
+    /// by the prologue scan next to `coherent_i128_homes`.
+    pub(super) i128_pair_relay: bool,
+    /// The exception inside a pair-relay function: 128-bit values that are
+    /// only loaded through a pointer and stored again (`*d = *s`).  Such a
+    /// value never meets the GPR pair, so the 16-byte relay is the shorter
+    /// transfer -- one load and one store, as GCC and Clang emit -- and it
+    /// straddles nothing this function wrote in halves.  See
+    /// `prologue::collect_i128_block_copies`.
+    pub(super) i128_block_copies: crate::common::fx_hash::FxHashSet<u32>,
     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
     /// Set by the Cmp emitter when the consumer is the next instruction.
     pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
@@ -1575,6 +1603,7 @@ impl X86Codegen {
             func_ret_classes: Vec::new(),
             func_set_second_ret: false,
             call_ret_is_f128_sse: false,
+            call_ret_is_vector128: false,
             call_ret_classes: Vec::new(),
             func_ret_is_f128_sse: false,
             num_named_int_params: 0,
@@ -1673,11 +1702,14 @@ impl X86Codegen {
             masked_guard_splats: FxHashSet::default(),
             masked_guard_zero_splats: FxHashSet::default(),
             coherent_i128_homes: crate::common::fx_hash::FxHashSet::default(),
+            i128_pair_relay: false,
+            i128_block_copies: crate::common::fx_hash::FxHashSet::default(),
             pending_cmp: None,
             pending_widen: [None, None],
             pending_fp_cmp: None,
             current_func: None,
             def_index: std::cell::OnceCell::new(),
+            i128_high_facts: std::cell::OnceCell::new(),
             ivsr_pointers: FxHashMap::default(),
             pointer_to_counter: FxHashMap::default(),
             param_source_regs: FxHashMap::default(),
@@ -3931,6 +3963,21 @@ impl X86Codegen {
         matches!(scale, 1 | 2 | 4 | 8)
     }
 
+    /// The function being emitted, once the prologue has installed it.
+    ///
+    /// The one place `current_func` is dereferenced, so every per-function
+    /// analysis the emitter builds lazily (the def index, the 128-bit
+    /// high-half facts) shares a single justification instead of repeating
+    /// the `unsafe`.
+    pub(super) fn current_function(&self) -> Option<&crate::ir::reexports::IrFunction> {
+        let func_ptr = self.current_func?;
+        // SAFETY: `calculate_stack_space_impl` stores the address of the
+        // `&IrFunction` the generation driver keeps borrowed until that
+        // function's emission is complete, and replaces it at the start of
+        // the next function; nothing mutates the function in between.
+        Some(unsafe { &*func_ptr })
+    }
+
     /// Helper function to get the instruction that defines a value.
     /// Returns None if the value isn't defined by an instruction in the current function.
     ///
@@ -3949,7 +3996,7 @@ impl X86Codegen {
         val_id: u32,
     ) -> Option<&crate::ir::reexports::Instruction> {
         let func_ptr = self.current_func?;
-        let func = unsafe { &*func_ptr };
+        let func = self.current_function()?;
         let (built_for, index) = self
             .def_index
             .get_or_init(|| (func_ptr, Self::build_def_index(func)));
@@ -5215,23 +5262,6 @@ impl X86Codegen {
             "    lock cmpxchg{suffix} %{candidate}, (%{addr})"
         ));
         self.state.out.emit_jcc_label("    jne", &loop_label);
-    }
-
-    /// Load i128 operands for binary ops: lhs → rax:rdx, rhs → rcx:rsi.
-    pub(super) fn prep_i128_binop(&mut self, lhs: &Operand, rhs: &Operand) {
-        self.operand_to_rax_rdx(lhs);
-        self.state.emit("    pushq %rdx");
-        self.state.emit("    pushq %rax");
-        self.state.out.rsp_frame_size += 16;
-        self.operand_to_rax_rdx(rhs);
-        self.state.emit("    movq %rax, %rcx");
-        self.state.emit("    movq %rdx, %rsi");
-        self.state.emit("    popq %rax");
-        self.state.emit("    popq %rdx");
-        self.state.out.rsp_frame_size -= 16;
-        self.state.reg_cache.invalidate_all();
-        self.flush_pending_vec_store_impl();
-        self.state.invalidate_vec_peephole();
     }
 
     /// Load an operand value into any GP register (returned as string).
@@ -10425,6 +10455,15 @@ impl ArchCodegen for X86Codegen {
         // with ymm/xmm registers instead of scalar movq.
         if let Operand::Value(v) = src {
             if self.state.vector_values.contains(&v.0) {
+                // A copy of a value that already sits in the return register
+                // (`return ext8(a);` -- the call result is in `%ymm0`/`%zmm0`)
+                // is likewise register-resident: the SSA rename in between
+                // must not turn one register into a store plus a reload.
+                if self.state.call_ret_vector_in_xmm0.contains(&v.0) {
+                    self.state.call_ret_vector_in_xmm0.insert(dest.0);
+                } else {
+                    self.state.call_ret_vector_in_xmm0.remove(&dest.0);
+                }
                 let debug = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
                 let is_128 = self.state.vector128_values.contains(&v.0);
                 if debug {
@@ -10975,6 +11014,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_i128_sub(&mut self) => emit_i128_sub_impl;
         fn emit_i128_mul(&mut self) => emit_i128_mul_impl;
         fn emit_i128_mul_const(&mut self, lhs: &Operand, rhs: &Operand, lo: u64, hi: u64) => emit_i128_mul_const_impl;
+        fn emit_i128_mul_narrow(&mut self, lhs: &Operand, rhs: &Operand) -> bool => emit_i128_mul_narrow_impl;
         fn emit_i128_and(&mut self) => emit_i128_and_impl;
         fn emit_i128_or(&mut self) => emit_i128_or_impl;
         fn emit_i128_xor(&mut self) => emit_i128_xor_impl;
