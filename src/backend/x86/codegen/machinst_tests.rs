@@ -5243,12 +5243,24 @@ fn isel_pair_regime_leaves_the_typed_subset_unchanged() {
             .collect(),
     );
     let slots: FxHashMap<u32, i64> = [(1u32, -24i64)].into_iter().collect();
-    let store = |val: Operand, volatile: bool| Instruction::Store {
+    // `volatile` is bound and then asserted, never silently dropped: this test
+    // exists to prove the observable-access guard is still consulted, so the
+    // flag must survive into the instruction it builds
+    // (`scripts/check_volatile_destructuring.py` enforces the binding).
+    let wide_store = |val: Operand, volatile: bool| Instruction::Store {
         val,
         ptr: Value(2),
         ty: IrType::I128,
         seg_override: AddressSpace::Default,
         volatile,
+    };
+    let store = |val: Operand, volatile: bool| {
+        let inst = wide_store(val, volatile);
+        assert!(
+            matches!(inst, Instruction::Store { volatile: v, .. } if v == volatile),
+            "the volatility flag must survive into the instruction"
+        );
+        inst
     };
     let mut out = Vec::new();
     assert!(!super::isel::lower_instruction_typed(

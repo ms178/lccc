@@ -152,11 +152,10 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
                 continue;
             }
 
-            // Find next non-NOP (skip only NOPs, not other instructions)
-            let mut j = i + 1;
-            while j < len && j < i + 4 && infos[j].is_nop() {
-                j += 1;
-            }
+            // Find the next steady line (skip only deleted rows, not other
+            // instructions).  The budget counts lines the passes can see, so a
+            // hidden `-g` row cannot consume part of it.
+            let j = next_non_debug(store, infos, i + 1, window_end(infos, i + 1, 3, len));
             if j >= len {
                 i += 1;
                 continue;

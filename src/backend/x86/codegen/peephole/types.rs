@@ -1527,6 +1527,36 @@ pub(super) fn next_non_nop(infos: &[LineInfo], start: usize, limit: usize) -> us
     j
 }
 
+/// The exclusive end index of a window that contains `lines` STEADY lines.
+///
+/// A peephole window budget is a count of *lines the passes may look at*, not
+/// of source rows: `hide_debug_rows` (x86) and [`super::hide_debug_rows`]
+/// (AArch64/RISC-V) mark every `.loc` row and inline-range endpoint deleted so
+/// the passes see exactly the non-`-g` text.  A budget expressed as a raw
+/// index (`j < i + 8`) silently spent part of itself on those hidden rows, so
+/// `-g` bought a pass fewer real lines than the same source without it -- the
+/// one way the "rows are invisible by construction" contract could still leak,
+/// and the reason `check_debug_info_invariance.sh` diverged on
+/// `simd_defer_chain.c` at `-O1` (a reverse-move fold refused under `-g` whose
+/// two lines sat 9 raw indices apart).
+///
+/// `start` is the index of the line the count begins *after* (the caller has
+/// already consumed it), and `limit` bounds the scan like any other walk.  A
+/// deleted line consumes no budget, which is the same rule every walker
+/// applies to control flow.
+#[inline]
+pub(super) fn window_end(infos: &[LineInfo], start: usize, lines: usize, limit: usize) -> usize {
+    let mut j = start;
+    let mut seen = 0;
+    while j < limit && seen < lines {
+        if !infos[j].is_nop() {
+            seen += 1;
+        }
+        j += 1;
+    }
+    j
+}
+
 /// Collect up to `N` non-NOP line indices starting after `start`.
 /// Returns the number of indices found (may be < N if we hit the end).
 #[inline]

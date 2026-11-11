@@ -94,19 +94,24 @@ impl X86Codegen {
                         self.sse_load_arg(val, "xmm0");
                         self.emit_epilogue_and_ret_impl(frame_size);
                     } else {
-                        // Already in the return register: `return
-                        // ext8(a);` leaves the call result in `%ymm0` (a
-                        // 32/64-byte return home IS `%ymm0`/`%zmm0`).  Loading
-                        // it back out of its protected slot is a store, an
-                        // aligned-slot reload and a register copy for nothing
-                        // -- measured as 12 instructions against GCC's 1 for
-                        // `v8 f(v8 a){ return ext8(a); }`.
-                        if self.state.call_ret_vector_in_xmm0.contains(&v.0) {
-                            let dirty = std::mem::replace(&mut self.state.dirty_upper_ymm, false);
-                            self.emit_epilogue_and_ret_impl(frame_size);
-                            self.state.dirty_upper_ymm = dirty;
-                            return;
-                        }
+                        // Always load the value into `%ymm0` from its home.
+                        //
+                        // A "the call result is still in `%ymm0`, so return it
+                        // in place" shortcut was tried here and removed: a wide
+                        // aggregate return is sret-lowered, so the lowering
+                        // always emits `Call; Load <sret ptr>; Memcpy; Return`,
+                        // and the `Load`/`Memcpy` between the call and the
+                        // return both retires any such fact and (because
+                        // `Memcpy` takes `%xmm0`/`%xmm1` as scratch) destroys
+                        // the register content it would rely on.  The shape the
+                        // shortcut was written for cannot reach this arm, so
+                        // the only thing it ever contributed was the hazard:
+                        // keyed on `call_ret_vector_in_xmm0` (which means "this
+                        // value is read from `%xmm0`", not "`%xmm0` still holds
+                        // it") it emitted a bare `ret` with a half-clobbered
+                        // `%ymm0`, and `check_vector_abi_wide.sh` caught it --
+                        // `c_rvo` returned 110 where the oracle returned
+                        // 305.375.  Reloading is one instruction.
                         self.avx_load_arg_to(val, "ymm0");
                         // No `vzeroupper` on this exit (see the hidden-buffer
                         // path below): it would zero the upper lanes of
@@ -147,24 +152,9 @@ impl X86Codegen {
             // this -- the caller stores the register through its own
             // buffer.
             if self.vector_ret_buffer_bytes > 0 {
-                // The register already holds the value: `return ext8(a);`
-                // leaves the call result in `%ymm0` (a 32/64-byte return
-                // home is `%ymm0`/`%zmm0` by construction, see
-                // `emit_call_store_vector_return`), and storing it to the
-                // hidden buffer only to reload it is two memory operations
-                // and a frame slot per return -- measured as
-                // `v8 f(v8 a){ return ext8(a); }`, 12 instructions against
-                // GCC's 1.  Returning it in place is exactly what the psABI
-                // asks for; the caller stores the register through its own
-                // buffer.
-                if matches!(val, Operand::Value(v)
-                        if self.state.call_ret_vector_in_xmm0.contains(&v.0))
-                {
-                    let dirty = std::mem::replace(&mut self.state.dirty_upper_ymm, false);
-                    self.emit_epilogue_and_ret_impl(frame_size);
-                    self.state.dirty_upper_ymm = dirty;
-                    return;
-                }
+                // Load the whole value into the psABI return register from its
+                // home (`emit_return_impl`'s vector_values arm above carries the
+                // note on why the "already in `%ymm0`" shortcut is not taken).
                 self.operand_to_rax(val);
                 let (mov, reg) = super::calls::vector_reg_move(self.vector_ret_buffer_bytes, 0);
                 self.state
