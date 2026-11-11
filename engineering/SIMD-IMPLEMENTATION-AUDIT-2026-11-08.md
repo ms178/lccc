@@ -1901,3 +1901,145 @@ and after the fix, `emit_evex_store_dest_from(dest_ptr, dst)`:
     vfmadd132ps %zmm1, %zmm2, %zmm0 / vmovdqu64 %zmm0, (%rax)
     vfmadd213ps %zmm2, %zmm0, %zmm1 / vmovdqu64 %zmm1, (%rax)
     vfmadd231ps %zmm1, %zmm0, %zmm2 / vmovdqu64 %zmm2, (%rax)
+
+## 9c.11 Byte-search loop → `memchr` (2026-11-11, branch `arena/96b29914-lccc`)
+
+`tests/bench/k_memchr.c` is the shape every C library writes by hand:
+
+```c
+for (size_t i = 0; i < n; i++) if (p[i] == c) return p + i;
+return 0;
+```
+
+Clang's `LoopIdiomRecognize` turns it into a libc `memchr`, which compares 16 or
+32 bytes per step; GCC never does, and this compiler did not either.  The kernel
+benchmark said exactly that: 1.251 ms (LCCC) vs 1.243 ms (GCC 16.2) vs 0.087 ms
+(Clang 23.1.5).
+
+### 9c.11.1 The transformation
+
+`loop_idiom` now emits, in the loop's preheader:
+
+```
+%r  = call memchr(%base, (int)(unsigned char)%needle, %n)   ; assume_library
+%hit = icmp ne %r, 0                                        ; ty = size_t's int width
+      condbr %hit, %found_arm, %exit_arm
+```
+
+and keeps both arms: the found arm returned `base + i`, which is *exactly* the
+call's result, so every use of that value (instruction operands, phi inputs on
+the kept edge, terminator operands) is replaced by `%r`.  The three loop blocks
+are then deleted and their phi edges pruned.  This is deliberately **not** any
+arm reconstruction: the arms already exist, they already terminate the function
+the way `memchr` does, and only their data flow changes.
+
+### 9c.11.2 Proof obligations (each has its own bail diagnostic)
+
+| obligation | why |
+| --- | --- |
+| exactly `{header, body, latch}`, one preheader branching unconditionally into the header, one exit | the rewrite deletes exactly three blocks |
+| header = `phi(0 from preheader, step from latch)` + one `Ult` against a loop-invariant bound | `Ult` is the `size_t` relation; the trip count is the byte count |
+| bound width == `target_int_ir_type().size()` | `memchr`'s third parameter *is* `size_t` |
+| body: one `U8` load through the GEP at `base + IV`, one `Eq` against that load, nothing else | no store/call/atomic may be reordered across a library scan |
+| the load index is the IV through `Copy` and **non-narrowing** casts only | see 9c.11.3 |
+| needle: constant in `-128..=255` (masked to a byte) or a `U8` value defined outside the loop | `memchr` compares `unsigned char`; values get an explicit `Cast U8 -> I32` |
+| found arm = `base + IV`, exit arm = constant, both single-predecessor | no phi has to be rebuilt |
+| no loop value is used outside the loop, instructions *and* terminators | the deleted blocks must not leave dangling operands |
+| no found-arm value outside its value-preserving `Copy`/same-width-`Cast` chain is used outside the arm or in a terminator | the arm is rebuilt; anything else it defined would dangle |
+
+### 9c.11.3 Red-team findings (all fixed in the same series)
+
+1. **Narrowing index cast — miscompile, measured.** `operand_is_iv` followed
+   `Cast` chains without a width check, so
+
+   ```c
+   for (size_t i = 0; i < n; i++) if (p[(unsigned short)i] == c) return p + i;
+   ```
+
+   was rewritten.  The loop reads `p + (i mod 65536)`; `memchr` scans `p[0..n)`
+   linearly, and the load address is discarded by the rewrite.  With N = 70000
+   and the only needle at 65539:
+
+   | compiler | result |
+   | --- | --- |
+   | LCCC (before) | 65539 |
+   | GCC 16.2 | -1 |
+   | Clang 23.1.5 | -1 |
+
+   Fixed by requiring `to_ty.size() >= from_ty.size()`; a same-width
+   reinterpret (`U64 -> I64`, the ordinary index cast) and a widening cast are
+   exact in two's complement, hence address-identical, and stay accepted.
+   `tests/regression/loop_idiom_memchr_trunc.c` pins both behaviours.
+
+2. **i686: internal compiler error on a pointer `Cmp -> Select`.** The fused
+   emitter asserted `cmp_ty.is_integer()`; on i686 a pointer is a full 32-bit
+   unsigned integer (`IrType::Ptr` shares `cmpl` with `I32`/`U32`), so
+   `p = memchr(...); return p ? p : 0;` and plain `a == b ? a : b` aborted the
+   compiler.  Ptr is now accepted.  `tests/regression/i686_cmp_select_ptr.c`
+   compiles and runs the matrix as a freestanding i386 ELF.
+
+3. **i686: `CCC_NO_FUSED_CSEL` was a no-op.** `supports_fused_cmp_select()`
+   returned a hard-wired `true`, so the documented kill switch never reached
+   the shared detection code — an A/B bisect of this fusion compared a build
+   against itself.  Verified with a temporary probe (fused path entered by
+   default, skipped with the variable set), then with the corpus test.
+
+4. **The post-call null test used `ty: Ptr`.** The IR compares pointers at the
+   target's integer width with an `I64` null image; dumping
+   `int f(int *p) { return p != 0 ? 1 : 2; }` shows `Cmp { ty: I64, rhs:
+   Const(I64(0)) }` on x86-64 and `ty: I32` on `-m32`.  Emitting `ty: Ptr`
+   was off-convention; it is now `ty: size_t`'s integer width, and the emitted
+   `testq %rax, %rax` / `cmpl $0, ...` is unchanged.
+
+### 9c.11.4 Measurements (`-O2`, best of 9 x 1000, host x86-64)
+
+| build | ms |
+| --- | --- |
+| LCCC with the idiom | **0.059** |
+| LCCC, `CCC_NO_MEMCHR_IDIOM=1` | 2.540 |
+| GCC 16.2 | 2.468 |
+| Clang 23.1.5 | 0.173 |
+
+43x over this compiler's scalar loop, 42x over GCC, 2.9x over Clang.  The
+kernel-suite geomean vs GCC moved 0.824x -> 0.981x; no row regressed (the
+`memchr` row is the entire delta).
+
+### 9c.11.5 Multi-target evidence (`-O2 -S tests/bench/k_memchr.c`)
+
+| target | emitted | `size_t` argument | checked |
+| --- | --- | --- | --- |
+| x86-64 | `call memchr@PLT` | `movl $8192, %edx` | `objdump`, runtime |
+| i686 | `call memchr@PLT` | `movl $8192, 8(%esp)` (one slot) | `readelf -h` (ELF32), runtime |
+| aarch64 | `bl memchr` | `mov x2, #8192` | text inspection |
+| riscv64 | `call memchr` | `li a2, 8192` | text inspection |
+
+The idiom is mid-end, so the *match* is target-independent; what is per-target
+is the declared `size_t` width, which is why the bound's width is compared with
+`target_int_ir_type()` rather than hard-coded.  No cross-target runtime is
+claimed: this host has no aarch64/riscv64 libc, and the cache carries only
+`qemu-user`, no sysroot — stated plainly rather than implied by a compile.
+
+### 9c.11.6 Escape hatches and the self-call hazard
+
+`CCC_NO_MEMCHR_IDIOM=1`, `-fno-builtin-memchr`, `-fno-builtin`,
+`-ffreestanding`, `-O0`/`-O1`, and a translation unit that implements `memchr`
+itself all keep the scalar loop.  The last one needs the libcall to be
+registered in three places (`Libcall` in `pass_policy`, `SYNTHESIZED` and
+`reach()` in `builtin_policy`); missing any of them made a TU-defined `memchr`
+the callee of its own loop — that was found by the corpus test, not by reading.
+
+Known, documented behaviour change: for `n == 0` the original loop never forms
+`p[i]`, while the call passes the pointer to libc.  Every libc `memchr` returns
+immediately for `n == 0` without dereferencing, and Clang makes the same
+substitution, so this is accepted — but it is written down here instead of being
+discovered later.
+
+### 9c.11.7 Test inventory
+
+| file | what it proves |
+| --- | --- |
+| `tests/regression/loop_idiom_memchr.c` | 256 needles x lengths 0..257 x every position, FNV checksum `3523653933815388291`, identical under GCC, Clang and both idiom settings |
+| `tests/regression/loop_idiom_memchr_trunc.c` | the narrowing-index decline and the same-width control, stdout-identical to GCC and Clang |
+| `tests/regression/i686_cmp_select_ptr.c` | Ptr select matrix on `-m32` (rr/ir/ri/memory shapes, all predicates) |
+| `tests/corpus/test_loop_idiom_memchr.py` | matched shape, five near misses, every escape hatch, the `goto done` variant against GCC, all four targets, and the opt-level/`-mno-sse`/`-mavx2` sweep |
+| `tests/corpus/test_i686_cmp_select_ptr.py` | the i386 ELF runs (fusion on and off), the `-m32` kernel including the 32-bit `size_t` argument, and the kill switch |

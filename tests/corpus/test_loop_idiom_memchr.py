@@ -292,6 +292,28 @@ int main(void) {
         text = self.asm(SHAPES["match"], flags=("-O0",))
         self.assertNotIn("call memchr", text, "-O0 must not run the idiom pass")
 
+    def test_fixture_holds_across_optimization_levels_and_isa_flags(self) -> None:
+        """The rewrite is mid-end: every level that runs the pass must agree.
+
+        `-mno-sse` (kernel code) and `-mavx2` change the *backend*, not the
+        match, so the checksum must stay identical and `memchr` must still be
+        the callee -- the synthesized declaration is a plain integer call.
+        """
+        cases = [("-O1",), ("-O2",), ("-O3",), ("-Os",), ("-Oz",),
+                 ("-O2", "-mno-sse"), ("-O2", "-mavx2"), ("-O3", "-march=native")]
+        with tempfile.TemporaryDirectory(prefix="memchr-levels-") as td:
+            for flags in cases:
+                with self.subTest(flags=" ".join(flags)):
+                    exe = Path(td) / ("fx-" + "-".join(f.lstrip("-") for f in flags))
+                    proc = subprocess.run(
+                        [str(LCCC), *flags, "-o", str(exe), str(FIXTURE)],
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr[:2000])
+                    run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=600)
+                    self.assertEqual(run.returncode, 0, run.stdout)
+                    self.assertEqual(run.stdout.strip(), "3523653933815388291")
+
     def test_fixture_runs_to_the_gcc_checksum(self) -> None:
         """The fixture asserts its own checksum; both settings must exit 0."""
         for label, env in (("idiom on", {}), ("idiom off", {"CCC_NO_MEMCHR_IDIOM": "1"})):
