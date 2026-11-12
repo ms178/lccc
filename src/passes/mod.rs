@@ -1958,6 +1958,10 @@ pub(crate) fn run_passes(
     // no pass reads the environment per call site (the env-read ratchet in
     // tests/regression/check_env_test_hygiene.sh). `mod.rs` is deliberately
     // outside that count.
+    loop_idiom::set_config(loop_idiom::LoopIdiomConfig {
+        enabled: std::env::var("CCC_NO_LOOP_IDIOM").is_err(),
+        memchr: std::env::var_os("CCC_NO_MEMCHR_IDIOM").is_none(),
+    });
     let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
     vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
     vectorize::set_strided_reduce_trace(std::env::var_os("LCCC_VEC_STRIDED_TRACE").is_some());

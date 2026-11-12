@@ -2034,7 +2034,22 @@ immediately for `n == 0` without dereferencing, and Clang makes the same
 substitution, so this is accepted — but it is written down here instead of being
 discovered later.
 
-### 9c.11.7 Test inventory
+### 9c.11.7 Kill switches are resolved per translation unit, not per function
+
+Adding the new switch the obvious way (`LazyLock` read inside the pass) tripped
+`tests/regression/check_env_test_hygiene.sh`, whose ratchet counts `env::var*`
+sites in `src/passes/**` (budget 148 at the time, measured count 149).  The
+budget's own rule is "lower it whenever a measurement comes in below it; never
+raise it", so instead of raising it both `loop_idiom` switches were moved to
+where the neighbouring passes already put theirs: `run_passes` (excluded from
+the count) resolves `CCC_NO_LOOP_IDIOM` and `CCC_NO_MEMCHR_IDIOM` once and
+installs a `LoopIdiomConfig` through `loop_idiom::set_config`.  That also
+removes a real cost: `CCC_NO_LOOP_IDIOM` used to be read with `getenv` inside
+`recognize_idioms`, i.e. **once per function**, so a 4000-function translation
+unit paid 4000 `getenv` calls for a switch that cannot change mid-compile.  The
+measured count is now 147 and the budget was tightened to it.
+
+### 9c.11.8 Test inventory
 
 | file | what it proves |
 | --- | --- |

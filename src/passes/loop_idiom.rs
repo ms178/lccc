@@ -387,12 +387,41 @@ macro_rules! dlog {
     };
 }
 
+/// The pass's kill switches, resolved once per translation unit by
+/// `run_passes` (see the env-read ratchet in
+/// `tests/regression/check_env_test_hygiene.sh`).  `getenv` per *function* was
+/// the old shape: `recognize_idioms` runs once per function, so a compile of a
+/// 4000-function translation unit paid 4000 `getenv` calls for a switch that
+/// cannot change mid-compile.
+pub(crate) struct LoopIdiomConfig {
+    /// `CCC_NO_LOOP_IDIOM`: off for the whole pass.
+    pub enabled: bool,
+    /// `CCC_NO_MEMCHR_IDIOM`: off for the byte-search rewrite only, so a
+    /// bisect can separate it from the eight idioms that share the pass.
+    pub memchr: bool,
+}
+
+static CONFIG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0b11);
+
+pub(crate) fn set_config(cfg: LoopIdiomConfig) {
+    let bits = u8::from(cfg.enabled) | (u8::from(cfg.memchr) << 1);
+    CONFIG.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn config_bits() -> u8 {
+    CONFIG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn pass_enabled() -> bool {
+    config_bits() & 0b01 != 0
+}
+
 pub(crate) fn recognize_idioms(
     func: &mut IrFunction,
     symbol_facts: &ModuleSymbolFacts,
     capabilities: Capabilities,
 ) -> usize {
-    if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
+    if !pass_enabled() {
         return 0;
     }
     // Default-on. For maybe-overlapping pointers, a guarded fast path keeps
@@ -3590,11 +3619,10 @@ fn rewrite_ctz_loop(func: &mut IrFunction, m: &CtzLoop, body: &FxHashSet<usize>)
 
 /// The `CCC_NO_MEMCHR_IDIOM` escape hatch: the whole pass has
 /// `CCC_NO_LOOP_IDIOM`, but a bisect has to separate this rewrite from the
-/// eight that share the pass.  Default-on, like the pass itself.
+/// eight that share the pass.  Default-on, like the pass itself, and resolved
+/// once per translation unit in [`set_config`].
 fn memchr_idiom_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("CCC_NO_MEMCHR_IDIOM").is_none());
-    *ON
+    config_bits() & 0b10 != 0
 }
 
 /// A matched byte-search loop (`for (i = 0; i < n; i++) if (p[i] == c) return
