@@ -7320,6 +7320,10 @@ fn generate_function_body(
         let mut skip_fused_logical = false;
         let mut skip_fused_and_not = false;
         let mut skip_f128_copy_store = false;
+        // The 16-byte-int twin of `skip_f128_copy_store`: the fused
+        // load/store pair emitted the store, so the loop must not emit it
+        // again (it would read the value's now-stale frame slot).
+        let mut skip_i128_copy_store = false;
 
         cg.state().block_use_counts.clear();
         cg.state().pending_load_cmp.clear();
@@ -7440,6 +7444,11 @@ fn generate_function_body(
                 cg.state().current_program_point += 1;
                 continue;
             }
+            if skip_i128_copy_store {
+                skip_i128_copy_store = false;
+                cg.state().current_program_point += 1;
+                continue;
+            }
             if bit_test_fusions.take_covered() {
                 cg.state().current_program_point += 1;
                 continue;
@@ -7475,6 +7484,44 @@ fn generate_function_body(
                             skip_f128_copy_store = true;
                             cg.state().current_program_point += 1;
                             continue;
+                        }
+                    }
+                }
+            }
+
+            // The same fusion for the 16-byte INTEGER carriers (I128/U128).
+            // Unlike the F128 pair above this one does not require slot
+            // addresses: the addresses are materialised by the emitter
+            // (`%rcx` at worst), so `__seg_gs`/`__seg_fs` copies -- whose
+            // pointers are ordinary GPRs holding an offset -- fuse too.  The
+            // pair costs two memory operations instead of four, and the four
+            // 16-byte copies of a segmented 32-byte aggregate assignment are
+            // the whole body of `k_seg_gs_copy`'s inner loop.
+            if let Instruction::Load {
+                dest,
+                ptr: src,
+                ty: load_ty @ (IrType::I128 | IrType::U128),
+                seg_override: load_seg,
+                volatile: false,
+                ..
+            } = inst
+            {
+                if value_use_counts.get(dest.0 as usize).copied() == Some(1) {
+                    if let Some(Instruction::Store {
+                        val: Operand::Value(v),
+                        ptr: dst,
+                        ty: store_ty,
+                        seg_override: store_seg,
+                        volatile: false,
+                    }) = block.instructions.get(idx + 1)
+                    {
+                        if v == dest && store_ty.size() == load_ty.size() {
+                            cg.flush_machinst();
+                            if cg.emit_i128_exact_copy(dst, src, *load_seg, *store_seg, *load_ty) {
+                                skip_i128_copy_store = true;
+                                cg.state().current_program_point += 1;
+                                continue;
+                            }
                         }
                     }
                 }

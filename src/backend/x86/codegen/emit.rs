@@ -8504,6 +8504,23 @@ impl ArchCodegen for X86Codegen {
         self.emit_f128_exact_copy_impl(dest, src);
     }
 
+    /// x86-64 override: the fused 16-byte pair keeps its payload in `%xmm0`
+    /// and stages each address in `%rcx`, so it may write neither `%rdi` nor
+    /// `%rsi` (see [`Self::emit_f128_exact_copy`]).  Segment address spaces
+    /// ride on the memory operand, which is the whole point of the pair
+    /// being one emitter rather than two: `__seg_gs`/`__seg_fs` aggregates
+    /// copy in two instructions instead of four.
+    fn emit_i128_exact_copy(
+        &mut self,
+        dest: &Value,
+        src: &Value,
+        src_seg: crate::common::types::AddressSpace,
+        dst_seg: crate::common::types::AddressSpace,
+        _ty: crate::common::types::IrType,
+    ) -> bool {
+        self.emit_i128_exact_copy_impl(dest, src, src_seg, dst_seg, false)
+    }
+
     fn flush_pending_widen(&mut self) {
         self.flush_pending_widen_impl();
     }
