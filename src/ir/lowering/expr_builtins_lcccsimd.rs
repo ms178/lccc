@@ -794,8 +794,9 @@ fn packed_map_disabled() -> bool {
 /// the twin's lane type and the register width.  A row is only present when
 /// the twin exists in `src/ir/intrinsics.rs` AND the x86 backend emits a
 /// single instruction for it; the pointer form stays for everything else
-/// (saturating arithmetic, `pandn`, `pmulhw`, variable-count shifts, byte
-/// shifts, `pmuludq`, packs/unpacks, shuffles, extracts).
+/// (word-high multiplies, variable-count shifts, byte shifts, `pmuludq`,
+/// shuffles, extracts, and the three-operand blends, whose twin takes a third
+/// vector operand that these tails do not model).
 ///
 /// The lane type is the TWIN's lane, and it is what makes the table
 /// self-checking: `Paddb` adds BYTES, so a wrong lane here is a wrong
