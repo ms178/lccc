@@ -1081,6 +1081,260 @@ fn forward_store_only_temporaries(
     changes
 }
 
+/// Forward reads of a stack temporary that is filled exactly once by a
+/// `memcpy` from another local object.
+///
+/// The inliner bridges a by-value aggregate parameter into a fresh home:
+///
+/// ```text
+///   fresh = alloca(16)
+///   memcpy(fresh, arg_ptr, 16)
+///   ... load(fresh) / vload(fresh) ...
+/// ```
+///
+/// When `fresh` is never written again and every use is a constant-offset
+/// read, the copy is pure overhead: the reads can address `arg_ptr`
+/// directly.  This is the vector-ABI hot path — the argument of a 128/256-bit
+/// SSE aggregate is the CALLER's register home, so after forwarding the read
+/// is a load off a parameter home, which the backend already forwards into
+/// the incoming `%xmm`/`%ymm` register (`direct-load home forwarding`).  The
+/// copy, the temporary and the register shuffles then disappear instead of
+/// costing a 16-byte store/load pair for every inlined intrinsic wrapper.
+///
+/// Safety.  Every candidate must fail closed on anything it does not model:
+///
+///   * the SOURCE must be an alloca of the entry block (`arg_ptr` is a local
+///     object, so no call can change what it points at), defined before the
+///     copy, and single-defined;
+///   * the DESTINATION must be a local alloca that is not a parameter home —
+///     its prologue write is invisible in IR (see the caveat in
+///     [`forward_store_only_temporaries`]) — not multi-defined, and read
+///     only through `Load`, a constant-offset `GetElementPtr` of itself, or
+///     a register-dest `VecLoad*` at index 0 with displacement 0;
+///   * every read must be in the copy's own block AFTER it, and no
+///     instruction in between may write memory.  Reads in other blocks are
+///     refused even when a dominator argument would work: a block-local
+///     proof is the whole point of this transform.
+fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
+    let multi_def = super::gvn::find_multi_def_values(func);
+    let param_roots: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
+    // Alloca dests: (block, instruction, size).
+    let mut alloca_at: FxHashMap<u32, (usize, usize, usize)> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Alloca { dest, size, .. } = inst {
+                alloca_at.insert(dest.0, (bi, ii, *size));
+            }
+        }
+    }
+    let mut candidates: Vec<(usize, usize, u32, u32, usize)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Memcpy { dest, src, size } = inst else {
+                continue;
+            };
+            let Some(&(src_block, src_index, _)) = alloca_at.get(&src.0) else {
+                continue;
+            };
+            if src_block != 0 {
+                continue;
+            }
+            if alloca_at.get(&dest.0).is_none() || param_roots.contains(&dest.0) {
+                continue;
+            }
+            if multi_def.contains(&dest.0) || multi_def.contains(&src.0) {
+                continue;
+            }
+            // The source object must already exist where the copy reads it.
+            if bi == 0 && src_index >= ii {
+                continue;
+            }
+            candidates.push((bi, ii, dest.0, src.0, *size));
+        }
+    }
+    let mut changes = 0usize;
+    for (bi, ii, dest, src, size) in candidates {
+        // Constant-offset GEPs rooted at the destination.
+        let mut derived: FxHashMap<u32, i64> = FxHashMap::default();
+        for block in func.blocks.iter() {
+            for inst in block.instructions.iter() {
+                if let Instruction::GetElementPtr {
+                    dest: gep_dest,
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } = inst
+                {
+                    if base.0 == dest {
+                        if let Some(off) = c.to_i64() {
+                            derived.insert(gep_dest.0, off);
+                        }
+                    }
+                }
+            }
+        }
+        // Every use of the destination (or a value derived from it) must be a
+        // constant-offset read in `(bi, ii)`'s own block after the copy.
+        let mut reads: Vec<usize> = Vec::new();
+        let mut ok = true;
+        'blocks: for (b, block) in func.blocks.iter().enumerate() {
+            for (i, inst) in block.instructions.iter().enumerate() {
+                let mut touches = false;
+                let mut read = false;
+                match inst {
+                    Instruction::Memcpy { dest: d, .. } => {
+                        if d.0 == dest && b == bi && i == ii {
+                            continue;
+                        }
+                        touches = d.0 == dest || derived.contains_key(&d.0);
+                    }
+                    Instruction::Store { ptr, .. } => {
+                        touches = ptr.0 == dest || derived.contains_key(&ptr.0);
+                    }
+                    Instruction::Load { ptr, ty, .. } => {
+                        touches = ptr.0 == dest || derived.contains_key(&ptr.0);
+                        // A read through a GEP must stay inside the copied
+                        // bytes; `dest` itself is offset zero by definition.
+                        read = ptr.0 == dest
+                            || derived.get(&ptr.0).is_some_and(|off| {
+                                *off >= 0 && *off + type_size(*ty) <= size as i64
+                            });
+                    }
+                    Instruction::GetElementPtr { dest: d, base, .. } => {
+                        if d.0 == dest {
+                            ok = false;
+                            break 'blocks;
+                        }
+                        if base.0 == dest && derived.contains_key(&d.0) {
+                            touches = true;
+                            read = true;
+                        }
+                    }
+                    Instruction::Intrinsic {
+                        op, dest_ptr, args, ..
+                    } => {
+                        if let Some(store_ptr) = dest_ptr {
+                            // A memory-dest intrinsic is a use only when it
+                            // addresses the temporary; other destinations are
+                            // covered by the intervening-write barrier below.
+                            touches = store_ptr.0 == dest || derived.contains_key(&store_ptr.0);
+                        } else if let Some((is_store, _, base, index, disp)) =
+                            super::alias::vec_intrinsic_access(op, args)
+                        {
+                            let Operand::Value(base_id) = base else {
+                                ok = false;
+                                break 'blocks;
+                            };
+                            let offset = match index {
+                                Operand::Const(c) => c.to_i64(),
+                                Operand::Value(_) => None,
+                            };
+                            if base_id.0 == dest || derived.contains_key(&base_id.0) {
+                                touches = true;
+                                let inner = derived.get(&base_id.0).copied().unwrap_or(0);
+                                read = !is_store
+                                    && disp == 0
+                                    && offset == Some(0)
+                                    && inner == 0
+                                    && size > 0;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Any operand that mentions the destination is an
+                        // escape this transform does not model.
+                        let mut mentions = false;
+                        inst.for_each_used_value(|id| {
+                            mentions |= id == dest || derived.contains_key(&id)
+                        });
+                        if mentions {
+                            ok = false;
+                            break 'blocks;
+                        }
+                    }
+                }
+                if touches && !read {
+                    ok = false;
+                    break 'blocks;
+                }
+                if read {
+                    if b != bi || i < ii {
+                        ok = false;
+                        break 'blocks;
+                    }
+                    reads.push(i);
+                }
+            }
+        }
+        let Some(&last_read) = reads.iter().max() else {
+            continue;
+        };
+        if !ok {
+            continue;
+        }
+        // No memory write between the copy and its last reader: the value the
+        // destination holds is the value the source holds at every read.
+        if func.blocks[bi].instructions[ii + 1..=last_read]
+            .iter()
+            .any(|inst| {
+                matches!(inst, Instruction::Store { .. } | Instruction::Memcpy { .. })
+                    || is_opaque_memory_write(inst)
+            })
+        {
+            continue;
+        }
+        // Rewrite: pointers into the destination become pointers into the
+        // source, and the copy goes away.
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                match inst {
+                    Instruction::GetElementPtr { base, .. } => {
+                        if base.0 == dest {
+                            *base = Value(src);
+                        }
+                    }
+                    Instruction::Load { ptr, .. } => {
+                        if ptr.0 == dest || derived.contains_key(&ptr.0) {
+                            if ptr.0 == dest {
+                                *ptr = Value(src);
+                            }
+                        }
+                    }
+                    Instruction::Intrinsic {
+                        op,
+                        dest_ptr: None,
+                        args,
+                        ..
+                    } => {
+                        // Only a register-dest vector READ was accepted above,
+                        // so only its base operand may be rewritten.
+                        if let Some((false, _, _, _, _)) =
+                            super::alias::vec_intrinsic_access(op, args)
+                        {
+                            if let Some(Operand::Value(base)) = args.first_mut() {
+                                if base.0 == dest {
+                                    *base = Value(src);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (b, block) in func.blocks.iter_mut().enumerate() {
+            let mut index = 0usize;
+            block.instructions.retain(|_| {
+                let keep = !(b == bi && index == ii);
+                index += 1;
+                keep
+            });
+        }
+        changes += 1;
+    }
+    changes
+}
+
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     run_impl(func, None)
 }
@@ -1105,6 +1359,17 @@ fn run_impl(
     } else {
         forward_store_only_temporaries(func, symbol_facts)
     };
+    // By-value aggregate (and vector) parameters arrive as `memcpy` into a
+    // fresh home; forwarding the reads lets the backend address the caller's
+    // register home instead.  Independent sub-pass: it never deletes or
+    // rewrites a store, so gating it on its own knob keeps a bisection of the
+    // two directions separable.
+    let reverse_changes = reverse_changes
+        + if std::env::var("CCC_NO_AGG_MEMCPY_FWD").is_ok() {
+            0
+        } else {
+            forward_memcpy_filled_reads(func)
+        };
     if std::env::var("CCC_NO_AGG_MAIN").is_ok() {
         return reverse_changes
             + if std::env::var("CCC_NO_AGG_DEAD_STORES").is_ok() {

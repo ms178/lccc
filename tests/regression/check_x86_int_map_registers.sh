@@ -204,6 +204,23 @@ done
 check map_add8m_128 3 0
 check map_add64m_256 3 0
 
+# Inlined wrappers: a `target(...)`-attributed always-inline callee with two
+# by-value 16/32-byte vector parameters.  The parameter bridge used to cost a
+# 16-byte store/load pair per parameter, so one packed instruction came with
+# a frame.  `forward_memcpy_filled_reads` forwards the reads to the caller's
+# register home, so `map_wrap_add16_128` is `vpaddw %xmm1, %xmm0, %xmm0`.
+#
+# The two extrema wrappers get a budget of 3, not 2, for the same reason GCC
+# needs `vpmaxuw`: there is no min/max-without-AVX-512 value form, so the
+# header uses the exact saturating-difference identity (`vpsubusw` plus one
+# `vpaddw`/`vpsubw`).  That is one instruction above GCC, and it is a property
+# of the target ISA, not of the parameter bridge: without the bridge the same
+# shapes cost 5 and 8.
+WRAPPERS="map_wrap_add16_128:2 map_wrap_maxu16_128:3 map_wrap_minu16_256:3 map_wrap_and256_256:2"
+for entry in $WRAPPERS; do
+    check "${entry%%:*}" "${entry##*:}" 1
+done
+
 if [ "$fail" != 0 ]; then
     if [ "$EXPECT_DEFECT" = 1 ]; then
         echo "PASS (expected defect): the instruction budgets can fail"
@@ -215,7 +232,7 @@ if [ "$EXPECT_DEFECT" = 1 ]; then
     echo "FAIL: --expect-defect expected an overrun and found none" >&2
     exit 1
 fi
-echo "  ok  every counted shape is register-homed (12 at parity, 2 memory forms)"
+echo "  ok  every counted shape is register-homed (12 at parity, 2 memory forms, 4 wrappers)"
 
 # --- 5. counterfactual -----------------------------------------------------
 # `CCC_NO_NATIVE_PACKED_MAP` reverts the routing at the one place that makes
@@ -245,6 +262,36 @@ if [ -z "${CCC_NO_NATIVE_PACKED_MAP-}" ]; then
         exit 1
     fi
     echo "  ok  counterfactual: the pre-fix lowering costs 5/9 and computes the same values"
+fi
+
+# The wrapper shapes have their own counterfactual: switching the parameter
+# forwarding off must bring the copies (and the frame) back, otherwise those
+# budgets do not measure the transform they claim to measure.
+if [ -z "${CCC_NO_AGG_MEMCPY_FWD-}" ]; then
+    CCC_NO_AGG_MEMCPY_FWD=1 "$CC" "${FLAGS[@]}" -S "$FIXTURE" -o "$WORK/nofwd.s" \
+        2>"$WORK/cc4.log" \
+        || { echo "FAIL: cannot emit the counterfactual assembly" >&2
+             cat "$WORK/cc4.log" >&2; exit 1; }
+    for entry in $WRAPPERS; do
+        name=${entry%%:*}
+        budget=${entry##*:}
+        off_body=$(awk -v F="$name:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$WORK/nofwd.s")
+        off_n=$(count "$off_body")
+        if [ "$off_n" -le "$budget" ]; then
+            echo "FAIL: with CCC_NO_AGG_MEMCPY_FWD=1, $name still costs $off_n" >&2
+            echo "      instructions (budget $budget) -- the wrapper budgets are" >&2
+            echo "      vacuous." >&2
+            exit 1
+        fi
+    done
+    if ! CCC_NO_AGG_MEMCPY_FWD=1 "$CC" "${FLAGS[@]}" "$FIXTURE" -o "$WORK/run_nofwd" 2>/dev/null \
+        || ! "$WORK/run_nofwd" >"$WORK/out_nofwd.txt" 2>&1 \
+        || ! grep -q "PASS" "$WORK/out_nofwd.txt"; then
+        echo "FAIL: switching the parameter forwarding off changed a value" >&2
+        cat "$WORK/out_nofwd.txt" >&2 2>/dev/null || true
+        exit 1
+    fi
+    echo "  ok  counterfactual: without the parameter forwarding each wrapper pays a frame"
 fi
 
 # --- 5. i686: the pointer fallback must stay correct ----------------------

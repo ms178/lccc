@@ -3346,22 +3346,42 @@ fast` in `scripts/ci_local.sh`. Counts and the full measurement table live in
 
 Every row is a *measured* defect on the current tree, not a hypothesis.
 
-1. **RH-11 (P0) — intrinsics with NO packed encoding at all.**  Found while
-   measuring RH-03: the 128-bit unsigned/signed-byte min/max builtins do not
-   exist, so `include/smmintrin.h` implements them as scalar lane loops.
-   `_mm_min_epu16` = **103** instructions vs GCC 2, `_mm_max_epi32` = **48**,
-   `_mm_min_epu32` = **37**, `_mm_max_epi8` = 3.  Fix is real encodings, not
-   routing: 14 pointer ops `P{min,max}{uw,ud,sb,sd}{128,256}`, six 128-bit
-   twins (`VecMinI8x16`, `VecMaxI8x16`, `VecMinI32x4`, `VecMaxI32x4`,
+1. **RH-11 (P1, partly landed) — intrinsics with NO packed encoding at all.**
+   Found while measuring RH-03: the 128-bit unsigned/signed-byte min/max
+   builtins do not exist, so `include/smmintrin.h` implements them as scalar
+   lane loops.  LANDED (§6.7): `_mm_min_epu16` **103 -> 3** and
+   `_mm_max_epu16` **5 -> 3** via the exact saturating-difference identity,
+   `_mm256_min/max_epu16` **now exist at all** (3 each), `Psubusw{128,256}`
+   gained its twin route, and the inlined-parameter `memcpy` bridge that made
+   every wrapped intrinsic cost a frame is gone
+   (`forward_memcpy_filled_reads`, `CCC_NO_AGG_MEMCPY_FWD`).  STILL OPEN, and
+   these need real encodings rather than routing: `_mm_max_epi32` **48 -> 2**,
+   `_mm_min_epu32` **37 -> 2** and `_mm_max_epi8` **3 -> 2** (no
+   `__builtin_ia32_pminud128`/`pmaxsd128`/`pmaxsb128` exists at all; only the
+   256-bit `pmaxsd256`/`pminsd256` do), plus `_mm256_min/max_epu32` and
+   `_mm256_min/max_epi8/epi32`, still undeclared in the headers.  Shape of the
+   work: 14 pointer ops `P{min,max}{uw,ud,sb,sd}{128,256}`, six 128-bit twins
+   (`VecMinI8x16`, `VecMaxI8x16`, `VecMinI32x4`, `VecMaxI32x4`,
    `VecMinU16x8`, `VecMaxU16x8`; all 256-bit twins exist), SSE4.1/AVX2 emitter
    arms, `__lccc_simd{128,256}_i_*` declarations, ten header rewrites.  The
-   header-only workarounds were measured and rejected (8 and 11 instructions
-   where the encoding is 2).  Plan and numbers: §6.6 of
+   second remaining class is the six builtins that cost 5 for lack of any twin
+   (`_mm_andnot_si128`, `_mm_avg_epu8`, `_mm_mulhi_epu16`, `_mm_adds_epi8`,
+   `_mm_packs_epi16`, `_mm_unpacklo_epi8`): one `Vec*` twin and one emitter
+   arm each.  Numbers and both traps: §6.6/§6.7 of
    `engineering/AUDIT-VECTOR-ABI-2026-11-10.md`.
 1a. **RH-03b (P2) — i686 twin coverage.**  The 32-bit backend asserts "only
    the dest_ptr form is supported here" for a subset of the `Vec*` twins, so
    RH-03 is x86-64 only and `-m32` keeps the pointer path.  The gate already
    runs the full value matrix for i686.
+1b. **RH-12 (P1) — the by-value vector parameter is still an `Sse,SseUp`
+   AGGREGATE passed as a pointer.**  §6.7 removed the inliner's `memcpy`
+   bridge, so the `VecLoad` off a parameter home is forwarded into the
+   incoming `%xmm`/`%ymm`; what remains is the layer below: the parameter is
+   modelled as a 16/32-byte struct argument, so the ABI prologue still writes
+   a home that the ordinary case never reads, and the memory-operand shapes
+   stay one instruction above GCC (§6.6).  The fix is in lowering/ABI (a real
+   vector parameter class whose `arg_types` is the vector type), not in the
+   backend; it subsumes RH-04 and needs the same cross-TU ABI discipline.
 2. **RH-04 (P0) — vector parameter homes.** Incoming `__m256`/`__m128`
    parameters are always stored into a 16/32-byte home by the ABI prologue,
    even when the only use is a memory operand.  Acceptance: a parameter that

@@ -329,7 +329,107 @@ Fixing them means adding real encodings, not routing: `P{min,max}{uw,ud,sb,sd}{1
 emitter arms (`pminuw`/`pmaxuw`/`pminud`/`pmaxud`/`pminsb`/`pmaxsb`/
 `pminsd`/`pmaxsd`, SSE4.1 at 128, AVX2 at 256), the `__lccc_simd{128,256}_i_*`
 declarations in `include/lcccsimd.h`, and rewriting the ten header functions.
-The header-only workaround (`min(a,b) = a - subs_epu(a,b)`, or
-compare+`blendv`) was measured and rejected as the shipping answer: 8 and 11
-instructions respectively, where a real encoding is 2 — the tricks are a
-fallback for targets without SSE4.1, not a substitute for the component.
+The header-only workaround (`min(a,b) = a - subs_epu(a,b)`) measured 8 and 11
+instructions when this row was written, which is why it was rejected.  That
+number was a *different* defect stacked on top of it (see §6.7): the
+saturating-difference identity is exact, is what GCC itself falls back to
+without AVX-512, and costs 3 instructions once the parameter bridge is fixed.
+Comparing against `blendv` is still the wrong answer for the i8/i32 signed and
+u32 families — those need the real `pminsb`/`pmaxsd`/`pminud` encodings
+(§6.7 "still open").
+
+### 6.7 The other half of RH-11 — landed: inlined vector parameters stop going through memory
+
+§6.6's numbers hid a second defect, and it is the reason the "5 instead of 2"
+cases would not move no matter how many twins were added.  Every SSE4.1+
+header intrinsic is a `target(...)`-attributed `__always_inline__` function
+whose parameters are 16/32-byte vectors *by value*, and LCCC's ABI models such
+a parameter as an `Sse,SseUp` aggregate passed as a POINTER
+(`struct_arg_sizes: Some(16)`, `arg_types: [Ptr, Ptr]`).  Inlining such a
+callee therefore bridged each parameter with a `memcpy` into a fresh home in
+the cloned body:
+
+```text
+  Alloca 9 (16 B) ;  Memcpy 9 <- %a_home ;  VecLoadI16x8 9, 0     ; one per parameter
+```
+
+`VecLoad` from a *parameter home* is what the backend already forwards into
+the incoming `%xmm`/`%ymm` (§6.2), but the copy destination is not a parameter
+home, so the bridge materialised as a real 16-byte store/load pair, plus a
+120-byte frame, plus a register shuffle per operand.  Measured before/after on
+`-O2 -mavx2` (instructions between the label and `ret`, GCC 16.2 same rule):
+
+| shape | before | now | GCC 16.2 |
+|---|---:|---:|---:|
+| `f(__m128i a, __m128i b)` → inlined `_mm_add_epi16(a,b)` | 5 (+120 B frame) | **2** | 2 |
+| the same with a `target("sse4.1")` attribute | 5 | **2** | 2 |
+| `_mm_andnot_si128`, `_mm_avg_epu8`, `_mm_mulhi_epu16`, `_mm_adds_epi8`, `_mm_packs_epi16`, `_mm_unpacklo_epi8` | 5 | **5 → 2**\* | 2 |
+| `_mm_min_epu16` / `_mm_max_epu16` | 103 / 5 | **3 / 3** | 2 / 2 |
+| `_mm256_min_epu16` / `_mm256_max_epu16` | did not compile | **3 / 3** | 2 / 2 |
+
+\* the six "5 → 2" rows are the *wrapper* path, which is now at parity: the
+5-instruction cost that remains for `_mm_andnot_si128` and friends is the
+pointer-form builtin itself (they have no register twin yet), measured
+identically to §6.6's pre-fix numbers.  They are RH-11 proper.
+
+**The fix — `forward_memcpy_filled_reads`** in
+`src/passes/aggregate_copy_forward.rs`.  When a local alloca is filled exactly
+once by a `memcpy` whose source is another local alloca of the entry block, and
+every use of the destination is a constant-offset read in the copy's own block
+(`Load`, `Load` through a constant GEP of it, or a register-dest `VecLoad*` at
+index 0), the reads are re-pointed at the source and the copy is deleted.  The
+result is a load off the caller's parameter home, which §6.2's forwarding turns
+into the incoming register.
+
+Everything else fails closed, and the list is short enough to audit: a
+parameter home as the DESTINATION (its prologue write is invisible — the reason
+`forward_store_only_temporaries` refuses those roots), a multi-defined value, a
+read in another block, a read whose constant offset plus access width leaves
+the copied range, any `Store`/`Memcpy`/opaque memory write between the copy and
+its last reader (`is_opaque_memory_write`, whose `Intrinsic` arm already covers
+`!is_pure()`, `dest_ptr.is_some()` and `writes_memory_via_args()`), any escape
+of the destination, and any memory-dest intrinsic that addresses it.
+`CCC_NO_AGG_MEMCPY_FWD=1` disables the sub-pass, the same bisection discipline
+the store-forwarding half has carried since its own miscompiles.
+
+#### Two more defects found on the way
+
+1. **The AVX2 unsigned-16 extrema did not exist.**  `_mm256_min_epu16`,
+   `_mm256_max_epu16` (and `_mm256_min/max_epu8/32/64` siblings beyond `epu8`)
+   were absent from `include/avx2intrin.h`, so `-mavx2` code that GCC compiles
+   failed here with "implicit declaration".  `min/max_epu16` are now defined in
+   both widths as the exact saturating-difference identity
+   (`subs_epu16` plus one add/sub); the 128-bit pair used to be 8-lane scalar
+   loops (`include/smmintrin.h`).  `_mm256_min/max_epu32` and
+   `_mm256_min/max_epi8/epi32` are still missing and still need the real
+   encodings — same list as RH-11, now recorded with both widths.
+2. **`Psubusw{128,256}` had no twin route**, so `_mm_subs_epu16` (and the
+   identity above) went through the pointer form and spilled an operand.  One
+   row in §6.6's table (`VecSubSatU16x8`/`x16`, which already existed and is
+   already emitted as `psubusw`) removes the spill.
+
+#### Still open (RH-11 remainder, unchanged in kind, smaller in size)
+
+* 128-bit signed/unsigned 8- and 32-bit extrema and 32-bit unsigned min/max
+  have no builtin at all (`__builtin_ia32_pminud128`, `pmaxsd128`, `pmaxsb128`
+  do not exist; only the 256-bit `pmaxsd256`/`pminsd256` do), so
+  `_mm_min_epu32` (37), `_mm_max_epi32` (48) and `_mm_max_epi8` (3) need new
+  `IntrinsicOp`s + emitters, not routing.
+* `_mm_andnot_si128`, `_mm_avg_epu8`, `_mm_mulhi_epu16`, `_mm_adds_epi8`,
+  `_mm_packs_epi16`, `_mm_unpacklo_epi8` cost 5 because their pointer builtins
+  have no twin; each needs one `Vec*` twin and one emitter arm.
+* The memory forms stay one instruction above GCC until RH-04 (the same
+  by-value-parameter home, one layer lower, in the call ABI itself).
+
+#### Gate
+
+`tests/regression/check_x86_int_map_registers.sh` gained four
+inlined-wrapper shapes (`map_wrap_add16_128`, `map_wrap_maxu16_128`,
+`map_wrap_minu16_256`, `map_wrap_and256_256`) with budgets 2/3/3/2 and the
+frame-and-stack-slot checks, plus two counterfactuals — the §6.6
+`CCC_NO_NATIVE_PACKED_MAP` one and a new `CCC_NO_AGG_MEMCPY_FWD` one that must
+put the copies back (non-vacuity: with the forwarding off the same four shapes
+cost 6, 8, 29 and 27).  The fixture's execution matrix grew to 84 value shapes
+including `_mm_min/max_epu16` at both widths and the wrappers themselves, all
+against the scalar reference at `-O0`, `-O1`, `-O2`, `-O3` and on i686.
+

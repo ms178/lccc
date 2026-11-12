@@ -121,6 +121,57 @@ __attribute__((noinline)) __m256i map_add64m_256(const void *p, __m256i b) {
     return _mm256_add_epi64(_mm256_loadu_si256((const __m256i *)p), b);
 }
 
+/* ---- inlined wrappers: by-value vector parameters ---------------------- */
+/* Everything SSE4.1 and later in the headers is a `target(...)`-attributed
+   always-inline function, so using it means INLINING a callee whose two
+   16-byte vector parameters are by value.  The inliner bridges such a
+   parameter with a `memcpy` into a fresh home; `forward_memcpy_filled_reads`
+   (passes/aggregate_copy_forward.rs) forwards the reads to the caller's home,
+   which the backend already keeps in the incoming %xmm/%ymm.  Without that
+   forwarding each wrapper paid a 16-byte store/load pair per parameter
+   (5 instructions, or 8-12 with a frame) for one packed instruction.
+   These four shapes pin the property; the counterfactual below runs them
+   with the forwarding switched off. */
+static __inline__ __m128i
+    __attribute__((__always_inline__, target("sse4.1")))
+    wrap_add16(__m128i a, __m128i b) {
+    return _mm_add_epi16(a, b);
+}
+
+static __inline__ __m128i
+    __attribute__((__always_inline__, target("sse4.1")))
+    wrap_maxu16(__m128i a, __m128i b) {
+    return _mm_max_epu16(a, b);
+}
+
+static __inline__ __m256i
+    __attribute__((__always_inline__, target("avx2")))
+    wrap_minu16_256(__m256i a, __m256i b) {
+    return _mm256_min_epu16(a, b);
+}
+
+static __inline__ __m256i
+    __attribute__((__always_inline__, target("avx2")))
+    wrap_and256(__m256i a, __m256i b) {
+    return _mm256_and_si256(a, b);
+}
+
+__attribute__((noinline)) __m128i map_wrap_add16_128(__m128i a, __m128i b) {
+    return wrap_add16(a, b);
+}
+
+__attribute__((noinline)) __m128i map_wrap_maxu16_128(__m128i a, __m128i b) {
+    return wrap_maxu16(a, b);
+}
+
+__attribute__((noinline)) __m256i map_wrap_minu16_256(__m256i a, __m256i b) {
+    return wrap_minu16_256(a, b);
+}
+
+__attribute__((noinline)) __m256i map_wrap_and256_256(__m256i a, __m256i b) {
+    return wrap_and256(a, b);
+}
+
 /* ---- scalar reference -------------------------------------------------- */
 
 enum refop {
@@ -363,6 +414,13 @@ int main(void) {
     RUN_MAP128("max_epu8", _mm_max_epu8, REF_MAXU, 1, 16);
     RUN_MAP128("min_epi16", _mm_min_epi16, REF_MINS, 2, 8);
     RUN_MAP128("max_epi16", _mm_max_epi16, REF_MAXS, 2, 8);
+    /* The unsigned 16-bit extrema have no `pminuw`/`pmaxuw` value form: the
+       headers express them as exact saturating-difference identities, and
+       the values still have to be right for every lane. */
+    RUN_MAP128("min_epu16", _mm_min_epu16, REF_MINU, 2, 8);
+    RUN_MAP128("max_epu16", _mm_max_epu16, REF_MAXU, 2, 8);
+    RUN_MAP128("wrap_add16", wrap_add16, REF_ADD, 2, 8);
+    RUN_MAP128("wrap_maxu16", wrap_maxu16, REF_MAXU, 2, 8);
 
     RUN_MAP256("add_epi8_256", _mm256_add_epi8, REF_ADD, 1, 32);
     RUN_MAP256("add_epi16_256", _mm256_add_epi16, REF_ADD, 2, 16);
@@ -381,6 +439,10 @@ int main(void) {
     RUN_MAP256("max_epu8_256", _mm256_max_epu8, REF_MAXU, 1, 32);
     RUN_MAP256("min_epi32_256", _mm256_min_epi32, REF_MINS, 4, 8);
     RUN_MAP256("max_epi32_256", _mm256_max_epi32, REF_MAXS, 4, 8);
+    RUN_MAP256("min_epu16_256", _mm256_min_epu16, REF_MINU, 2, 16);
+    RUN_MAP256("max_epu16_256", _mm256_max_epu16, REF_MAXU, 2, 16);
+    RUN_MAP256("wrap_minu16_256", wrap_minu16_256, REF_MINU, 2, 16);
+    RUN_MAP256("wrap_and256", wrap_and256, REF_AND, 4, 8);
 
     /* ---- immediate shifts -------------------------------------------- */
     RUN_SHIFT128("slli_epi16_3", _mm_slli_epi16, 2, 8, 0, 0, 3);

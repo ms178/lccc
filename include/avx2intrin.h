@@ -798,4 +798,29 @@ _mm256_subs_epu16(__m256i __a, __m256i __b)
     return (__m256i)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b));
 }
 
+/* _mm256_max_epu16 / _mm256_min_epu16: packed unsigned 16-bit extrema.
+ *
+ * There is no `vpmaxuw`/`vpminuw` value form below AVX-512, so these are the
+ * exact saturating-difference identities: with `t = subs_epu16(a, b)` (zero
+ * where `a <= b`, `a - b` otherwise) the maximum is `b + t` and the minimum
+ * is `a - t`.  Both intermediate values are in range by construction, so no
+ * lane can wrap, and every step is a single instruction (`vpsubusw`,
+ * `vpaddw`/`vpsubw`) that the backend already carries in register form.
+ */
+static __inline__ __m256i __attribute__((__always_inline__, target("avx2")))
+_mm256_max_epu16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_paddw256(
+        (__v16hi)(__b),
+        (__v16hi)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b)));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__, target("avx2")))
+_mm256_min_epu16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_psubw256(
+        (__v16hi)(__a),
+        (__v16hi)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b)));
+}
+
 #endif /* _AVX2INTRIN_H_INCLUDED */

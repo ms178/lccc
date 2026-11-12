@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 568,
+  "knob_literals": 569,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -164,6 +164,7 @@
     "CCC_NO_AGG_COPY_FWD",
     "CCC_NO_AGG_DEAD_STORES",
     "CCC_NO_AGG_MAIN",
+    "CCC_NO_AGG_MEMCPY_FWD",
     "CCC_NO_AGG_STORE_FWD",
     "CCC_NO_ANDN_FUSION",
     "CCC_NO_AND_TST_FUSION",
