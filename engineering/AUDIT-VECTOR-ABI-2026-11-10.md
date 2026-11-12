@@ -392,6 +392,26 @@ of the destination, and any memory-dest intrinsic that addresses it.
 `CCC_NO_AGG_MEMCPY_FWD=1` disables the sub-pass, the same bisection discipline
 the store-forwarding half has carried since its own miscompiles.
 
+#### The transform's own first defect (found by the ABI grid, fixed here)
+
+On i386 a 32-byte by-value vector does NOT arrive as one home: it arrives as
+two 16-byte homes, and the callee assembles its object with two `memcpy`s, the
+second writing `dest + 16`.  The first version of the transform accepted
+`memcpy(half_home, piece, 16)` as a full snapshot, re-pointed a
+`GetElementPtr(dest, +16)` at the 16-byte source, and `hash2`/`hashva` in
+`tests/regression/ext_vector_abi/abi_grid.c` read past it (`-m32 -O2`: 30 legs
+red, 954 examined, all in the by-value provider).
+
+The fix is a rule, not a patch: **the copy must fill the destination object**
+(`dest_alloca.size == memcpy.size`, and `src_alloca.size >= memcpy.size`), and
+a `Memcpy { src }` that names the destination is a READ like any other -- it
+was the one use the first version did not classify, because it looked only at
+`Memcpy { dest }`.  Both are in the candidate filter and the use allowlist;
+`GetElementPtr` re-pointing is additionally bounded to offsets the copy covers.
+`check_ext_vector_abi_grid.sh` is the regression gate: it is the only check in
+the tree that passes 16/32-byte vectors by value across the whole Clang 23.1.5
+grid on `-m32` and `-m64`, and it is what caught this.
+
 #### Two more defects found on the way
 
 1. **The AVX2 unsigned-16 extrema did not exist.**  `_mm256_min_epu16`,

@@ -1133,13 +1133,25 @@ fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
             let Instruction::Memcpy { dest, src, size } = inst else {
                 continue;
             };
-            let Some(&(src_block, src_index, _)) = alloca_at.get(&src.0) else {
+            let Some(&(src_block, src_index, src_size)) = alloca_at.get(&src.0) else {
                 continue;
             };
             if src_block != 0 {
                 continue;
             }
-            if alloca_at.get(&dest.0).is_none() || param_roots.contains(&dest.0) {
+            let Some(&(_, _, dest_size)) = alloca_at.get(&dest.0) else {
+                continue;
+            };
+            if param_roots.contains(&dest.0) {
+                continue;
+            }
+            // The copy must FILL the destination object.  A partial fill is
+            // a real shape on i386, where a 32-byte by-value vector arrives
+            // as two 16-byte homes and the callee assembles its object with
+            // two `memcpy`s: forwarding reads to one of the halves would
+            // address bytes the copy never wrote (and, for a read at +16,
+            // bytes past the end of the source).
+            if dest_size != *size || src_size < *size {
                 continue;
             }
             if multi_def.contains(&dest.0) || multi_def.contains(&src.0) {
@@ -1182,11 +1194,29 @@ fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
                 let mut touches = false;
                 let mut read = false;
                 match inst {
-                    Instruction::Memcpy { dest: d, .. } => {
+                    Instruction::Memcpy {
+                        dest: d,
+                        src: m_src,
+                        size: m_size,
+                    } => {
                         if d.0 == dest && b == bi && i == ii {
                             continue;
                         }
-                        touches = d.0 == dest || derived.contains_key(&d.0);
+                        if d.0 == dest || derived.contains_key(&d.0) {
+                            touches = true;
+                        } else if m_src.0 == dest
+                            || derived
+                                .get(&m_src.0)
+                                .is_some_and(|off| *off >= 0 && *off + *m_size as i64 <= size as i64)
+                        {
+                            // Reading the temporary as a copy SOURCE is a
+                            // read like any other -- and the one use that
+                            // used to slip through (i386 half-objects).
+                            touches = true;
+                            read = true;
+                        } else if derived.contains_key(&m_src.0) {
+                            touches = true;
+                        }
                     }
                     Instruction::Store { ptr, .. } => {
                         touches = ptr.0 == dest || derived.contains_key(&ptr.0);
@@ -1288,8 +1318,15 @@ fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 match inst {
-                    Instruction::GetElementPtr { base, .. } => {
-                        if base.0 == dest {
+                    Instruction::GetElementPtr {
+                        base,
+                        offset: Operand::Const(c),
+                        ..
+                    } if base.0 == dest => {
+                        // Only offsets the copy covers may be re-pointed;
+                        // the candidate check above already rejects the rest,
+                        // so this is the belt to that suspenders.
+                        if c.to_i64().is_some_and(|off| off >= 0 && off < size as i64) {
                             *base = Value(src);
                         }
                     }
