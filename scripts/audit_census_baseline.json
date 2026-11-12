@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 567,
+  "knob_literals": 568,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -306,6 +306,7 @@
     "CCC_NO_MULACC",
     "CCC_NO_NARROW_CMP_FOLD",
     "CCC_NO_NARROW_VALUE_ELIM",
+    "CCC_NO_NATIVE_PACKED_MAP",
     "CCC_NO_P1_WAVES",
     "CCC_NO_PARAM_DIRECT_HOME",
     "CCC_NO_PEEPHOLE",
@@ -573,7 +574,7 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 252,
+  "knobs_undocumented": 251,
   "panic_sites": 863,
   "panic_sites_hot": 94,
   "unsafe_sites": 27
