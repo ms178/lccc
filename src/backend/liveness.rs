@@ -1151,16 +1151,12 @@ fn clobber_is_allocatable_reg(c: &str) -> bool {
         return false;
     }
     let eq_ignore_ascii = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
-    if eq_ignore_ascii(c, "memory")
-        || eq_ignore_ascii(c, "cc")
-        || eq_ignore_ascii(c, "flags")
-        || eq_ignore_ascii(c, "fpsr")
-        || eq_ignore_ascii(c, "dirflag")
-        || eq_ignore_ascii(c, "uninitialized")
-    {
-        return false;
-    }
-    true
+    !eq_ignore_ascii(c, "memory")
+        && !eq_ignore_ascii(c, "cc")
+        && !eq_ignore_ascii(c, "flags")
+        && !eq_ignore_ascii(c, "fpsr")
+        && !eq_ignore_ascii(c, "dirflag")
+        && !eq_ignore_ascii(c, "uninitialized")
 }
 
 // ── GEP-fold implicit uses ───────────────────────────────────────────────────

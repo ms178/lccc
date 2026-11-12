@@ -1707,10 +1707,8 @@ fn step_rsp_depth(
             None => return false,
         }
     }
-    if *rsp_delta != 0 && matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect) {
-        return false;
-    }
-    true
+    // A branch that leaves RSP displaced cannot be folded into a bare step.
+    *rsp_delta == 0 || !matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect)
 }
 
 /// True when `line` is a LEA whose `(%rbp)` operand names a DATA register, not

@@ -1205,9 +1205,9 @@ fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
                         if d.0 == dest || derived.contains_key(&d.0) {
                             touches = true;
                         } else if m_src.0 == dest
-                            || derived
-                                .get(&m_src.0)
-                                .is_some_and(|off| *off >= 0 && *off + *m_size as i64 <= size as i64)
+                            || derived.get(&m_src.0).is_some_and(|off| {
+                                *off >= 0 && *off + *m_size as i64 <= size as i64
+                            })
                         {
                             // Reading the temporary as a copy SOURCE is a
                             // read like any other -- and the one use that
