@@ -133,7 +133,11 @@ MARKER='FIX''ME'
 #        `getenv` inside `recognize_idioms`, i.e. once per *function*; that read
 #        leaves the count as well, so the two switches now cost nothing here and
 #        the measurement dropped by one net.  Tightened to it.
-ENV_READ_BUDGET=147
+#   148  2026-11-12: the parameter-bridge forwarding's kill switch
+#        (CCC_NO_AGG_MEMCPY_FWD) in src/passes/aggregate_copy_forward.rs,
+#        read next to the store-forwarding switch it mirrors.  Raised to the
+#        measurement, exactly.
+ENV_READ_BUDGET=148
 
 fail=0
 report() { # report <label> <offending lines>
