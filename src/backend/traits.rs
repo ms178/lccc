@@ -2006,6 +2006,42 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         self.emit_memcpy(dest, src, IrType::F128.size());
     }
 
+    /// The fused `Load <16-byte>; Store <16-byte>` of the SAME value: copy
+    /// `*src` (in `src_seg`) to `*dest` (in `dst_seg`) as bytes, without
+    /// materialising the value in its 16-byte slot in between.
+    ///
+    /// Why this exists: an `__int128`/16-byte carrier is not register-homed,
+    /// so the load writes its frame slot and the store reads it back -- two
+    /// extra memory operations per copy (`movdqu %xmm0, slot` then
+    /// `movdqu slot, %xmm0`) around a payload that never changed. Fusing the
+    /// pair removes them; `k_seg_gs_copy.c` (32-byte aggregates copied
+    /// through `__seg_gs`) is 4 such pairs per iteration.
+    ///
+    /// SOUNDNESS is the same as [`Self::emit_f128_exact_copy`]: the pair is
+    /// two ordinary instructions to liveness, never a call point, so the
+    /// expansion may write only fixed scratch. The pair's two memory
+    /// accesses stay in their original order, so aliasing between `src` and
+    /// `dest` is irrelevant -- the fused copy performs exactly the load the
+    /// IR specified, then exactly the store.
+    ///
+    /// The default handles the generic address space only and declines
+    /// segment overrides; it returns whether it emitted the copy, so a
+    /// declining backend leaves the ordinary load/store pair in place.
+    fn emit_i128_exact_copy(
+        &mut self,
+        dest: &Value,
+        src: &Value,
+        src_seg: AddressSpace,
+        dst_seg: AddressSpace,
+        ty: IrType,
+    ) -> bool {
+        if src_seg != AddressSpace::Default || dst_seg != AddressSpace::Default {
+            return false;
+        }
+        self.emit_memcpy(dest, src, ty.size());
+        true
+    }
+
     /// Store accumulator to memcpy dest register.
     fn emit_memcpy_store_dest_from_acc(&mut self);
     /// Store accumulator to memcpy src register.
