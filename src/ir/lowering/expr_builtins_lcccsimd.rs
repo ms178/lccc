@@ -699,31 +699,98 @@ fn push_feature(
     }
 }
 
+/// The register-form map op a 256-bit FMA3 mnemonic denotes, with the lane
+/// type and register width.
+///
+/// The three encodings of one family (`132`/`213`/`231`) differ ONLY in which
+/// register the destructive FMA3 form overwrites; the algebra is always
+/// `±(a·b) ± c` over the builtin's `[a, b, c]` operand order (Intel SDM
+/// Vol. 2B, VFMADD132PS/VFMADD213PS/VFMADD231PS — the digit names the
+/// destination role).  The register-form emitter re-encodes any of the four
+/// sign structures into whichever 132/213/231 spelling fits the operands'
+/// allocated homes (`emit_avx_map_fma_inner`, `fma_form_reencode`), so the
+/// digit never survives into code selection — only the sign algebra does.
+///
+/// `None` for every other mnemonic, including the `fmaddsub`/`fmsubadd`
+/// alternating families: those are NOT `a·b ± c` and must never be routed
+/// through this mapping (the strict `<digits><ps|pd>256` tail parse rejects
+/// them).
+fn native_fma_256(mnemonic: &str) -> Option<(IntrinsicOp, IrType, usize)> {
+    use IntrinsicOp::*;
+    let stem = mnemonic.strip_prefix('v')?;
+    // Order matters: `fnmsub`/`fnmadd` share the `f`+`n` prefix with `fmsub`.
+    let (negative_product, negative_addend, rest) = if let Some(r) = stem.strip_prefix("fnmsub") {
+        (true, true, r)
+    } else if let Some(r) = stem.strip_prefix("fnmadd") {
+        (true, false, r)
+    } else if let Some(r) = stem.strip_prefix("fmsub") {
+        (false, true, r)
+    } else if let Some(r) = stem.strip_prefix("fmadd") {
+        (false, false, r)
+    } else {
+        return None;
+    };
+    // `rest` is `<132|213|231><ps|pd>256`; anything else (an `addsub` tail, a
+    // 128/512-bit width, a scalar form) has no 256-bit register-form twin.
+    let digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let digits_len = rest.len() - digits.len();
+    if !matches!(digits_len, 3) || !matches!(rest.get(..3), Some("132" | "213" | "231")) {
+        return None;
+    }
+    match digits {
+        "ps256" => Some((
+            VecMaddF32x8Signed(negative_product, negative_addend),
+            IrType::F32,
+            32,
+        )),
+        "pd256" => Some((
+            VecMaddF64x4Signed(negative_product, negative_addend),
+            IrType::F64,
+            32,
+        )),
+        _ => None,
+    }
+}
+
 impl Lowerer {
     /// Keep packed FP helpers in the same register-valued IR as native vector
     /// arithmetic. The legacy address result remains an addressable object;
     /// whole-vector stores/loads let vec_ssa eliminate it instead of hiding
     /// the producer behind the pointer-result instruction family.
-    fn try_native_packed_fp_helper(&mut self, op: IntrinsicOp, args: &[Expr]) -> Option<Operand> {
+    fn try_native_packed_fp_helper(
+        &mut self,
+        op: IntrinsicOp,
+        mnemonic: &str,
+        args: &[Expr],
+    ) -> Option<Operand> {
         use IntrinsicOp::*;
-        let (native, element, bytes) = match op {
-            DivPs128 => (VecDivF32x4, IrType::F32, 16),
-            MinPs128 => (VecMinF32x4, IrType::F32, 16),
-            MaxPs128 => (VecMaxF32x4, IrType::F32, 16),
-            SqrtPs128 => (VecSqrtF32x4, IrType::F32, 16),
-            DivPd128 => (VecDivF64x2, IrType::F64, 16),
-            MinPd128 => (VecMinF64x2, IrType::F64, 16),
-            MaxPd128 => (VecMaxF64x2, IrType::F64, 16),
-            SqrtPd128 => (VecSqrtF64x2, IrType::F64, 16),
-            DivPs256 => (VecDivF32x8, IrType::F32, 32),
-            MinPs256 => (VecMinF32x8, IrType::F32, 32),
-            MaxPs256 => (VecMaxF32x8, IrType::F32, 32),
-            SqrtPs256 => (VecSqrtF32x8, IrType::F32, 32),
-            DivPd256 => (VecDivF64x4, IrType::F64, 32),
-            MinPd256 => (VecMinF64x4, IrType::F64, 32),
-            MaxPd256 => (VecMaxF64x4, IrType::F64, 32),
-            SqrtPd256 => (VecSqrtF64x4, IrType::F64, 32),
-            _ => return None,
+        // The FMA3 map families have no memory-form IntrinsicOp at all: their
+        // only encoding is the destructive register form, and the `m3` table
+        // entry (`FmaPs132v256` & co.) exists purely to describe the operand
+        // list.  Keyed on the mnemonic because one opcode names four sign
+        // structures, and the sign structure — not the op — selects the op.
+        let fma = native_fma_256(mnemonic);
+        let (native, element, bytes) = match fma {
+            Some(triple) => triple,
+            None => match op {
+                DivPs128 => (VecDivF32x4, IrType::F32, 16),
+                MinPs128 => (VecMinF32x4, IrType::F32, 16),
+                MaxPs128 => (VecMaxF32x4, IrType::F32, 16),
+                SqrtPs128 => (VecSqrtF32x4, IrType::F32, 16),
+                DivPd128 => (VecDivF64x2, IrType::F64, 16),
+                MinPd128 => (VecMinF64x2, IrType::F64, 16),
+                MaxPd128 => (VecMaxF64x2, IrType::F64, 16),
+                SqrtPd128 => (VecSqrtF64x2, IrType::F64, 16),
+                DivPs256 => (VecDivF32x8, IrType::F32, 32),
+                MinPs256 => (VecMinF32x8, IrType::F32, 32),
+                MaxPs256 => (VecMaxF32x8, IrType::F32, 32),
+                SqrtPs256 => (VecSqrtF32x8, IrType::F32, 32),
+                DivPd256 => (VecDivF64x4, IrType::F64, 32),
+                MinPd256 => (VecMinF64x4, IrType::F64, 32),
+                MaxPd256 => (VecMaxF64x4, IrType::F64, 32),
+                SqrtPd256 => (VecSqrtF64x4, IrType::F64, 32),
+                _ => return None,
+            },
         };
         if self.target != crate::backend::Target::X86_64 {
             return None;
@@ -861,7 +928,7 @@ impl Lowerer {
                 self.check_x86_simd_feature(feature, flag, name, args);
             }
         }
-        if let Some(result) = self.try_native_packed_fp_helper(op, &args[1..]) {
+        if let Some(result) = self.try_native_packed_fp_helper(op, canonical, &args[1..]) {
             return Some(result);
         }
         // A compile-time immediate is a HARD REQUIREMENT, not a preference.

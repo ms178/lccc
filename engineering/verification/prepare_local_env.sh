@@ -95,6 +95,17 @@ materialise_debs_root
 
 # Valgrind needs ld.so's strlen redirection; publish libc6-dbg's build-id tree.
 link "$D/usr/lib/debug" /usr/lib/debug
+# Valgrind's tool binaries (memcheck-amd64-linux, the *-valgrind-*.xml CPU
+# description files) live in usr/libexec/valgrind, and the compiled-in search
+# path is the ABSOLUTE /usr/libexec/valgrind.  Without this link the driver
+# starts, then dies with "failed to start tool 'memcheck' for platform
+# 'amd64-linux'", which `check_hex_float_oracles.py` correctly reports as a
+# FAIL of the hexadecimal-literal oracle rather than skipping Memcheck.
+link "$D/usr/libexec/valgrind" /usr/libexec/valgrind
+# Debian's suppression file (--default-suppressions resolves it through the
+# same absolute prefix).  /usr/lib/valgrind is a REAL directory here, so the
+# member is published instead of the container (see `link`).
+link "$D/usr/lib/valgrind/debian.supp" /usr/lib/valgrind/debian.supp
 # glibc multiarch headers.  /usr/include/bits was the first symptom; the
 # -m32 GCC/LCCC rows additionally need sys/cdefs.h and gnu/stubs.h.
 link /usr/include/x86_64-linux-gnu/bits /usr/include/bits

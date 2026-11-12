@@ -1962,6 +1962,22 @@ gate "fma-digit-permutation-nonvacuity" fast \
 # way to see the operand placement as well as the crash.
 gate "i686-fma128" fast \
     bash tests/regression/check_i686_fma128.sh --lccc target/fastbuild/lccc
+# The register-homed side of the same family: `_mm256_fmadd_ps(a,b,c)` on
+# register operands emitted 28 instructions in a 408-byte frame (three
+# realign'd parameter homes + a result home) because the `m3` table entry
+# takes an address per operand and writes through a `dest_ptr`.  GCC emits one
+# `vfmadd132ps`; the native packed-FP route now emits the same, and the gate
+# counts instructions AND executes every lane against libm's fma/fmaf.
+gate "vector-fma-homing" fast \
+    bash tests/regression/check_vector_fma_homing.sh --lccc target/fastbuild/lccc \
+    --reference gcc-16
+# ... and it must go RED on the pre-fix lowering, or the budgets are decoration.
+# `vector_home_prefix_standin.sh` disables exactly the pass family the fix
+# added (`CCC_DISABLE_PASSES=vecpromote`), so the counterfactual is the real
+# code path: the emitted bodies become the pre-fix store-to-home + reload.
+gate "vector-fma-homing-nonvacuity" fast \
+    bash tests/regression/check_vector_fma_homing.sh \
+    --lccc tests/regression/vector_home_prefix_standin.sh --expect-defect
 # `-mf16c` must change the ENCODING and nothing else.  On i686 it once changed
 # neither: __F16C__ was announced while the effective feature set had no F16c
 # bit, so the option silently bought nothing.  Both paths compute correct

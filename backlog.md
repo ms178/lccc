@@ -3310,3 +3310,83 @@ executed stdout leg is explicitly skipped on any runner lacking
 `avx512f`/`bw`/`vl` (the hosted pool is heterogeneous); "beats GCC/Clang"
 refers ONLY to the measured 192 runtime-compare functions above, not to
 whole-compiler quality.
+
+## 15. Register-homing campaign (opened 2026-11-12, base `3964191`)
+
+**Mandate (owner, standing).** Demand *perfect* homing and register allocation
+for every vector type and shape: **zero memory/stack round trips**, for 128-
+and 256-bit, integer and floating point, parameters, temporaries and returns.
+No scope limit, no regressions. Supersede, but do not re-litigate, the
+individual defect rows in §9a/§9b/§9c and `docs/AUDIT-2026-11-05-open-simd-prs.md`:
+those remain the evidence base; this section is the delivered track record and
+the ordered queue.
+
+**Method.** Every claim needs four receipts: (1) a differential value proof
+against libm/GCC at run time, (2) the emitted-assembly count and shape,
+(3) a gate that fails on the tree that motivated the fix (measured, not
+asserted — disable the pass and watch the gate go red), and (4) no regression
+in `ci_local.sh --fast`. Instruction counts are taken between the function
+label and `.size` so `ret` is inside the budget on every side of a comparison;
+mixing counting conventions is how a 28-instruction body gets reported as 26.
+
+### 15.1 Landed
+
+| Item | Defect | Fix | Evidence |
+|---|---|---|---|
+| RH-01 | `_mm256_fmadd_ps/pd` reached codegen through the pointer-form `m3` table entry: three 32-byte realigned homes, three reloads, a result home and a reload (28 instructions, 408-byte frame). | `native_fma_256()` (`src/ir/lowering/expr_builtins_lcccsimd.rs`) maps the mnemonic to the register-form `VecMadd*Signed` op, keyed on the MNEMONIC because one opcode names four sign structures. | 28 → **2** instructions (`vfmadd132ps %ymm1,%ymm2,%ymm0; ret`), GCC 16.2 = 2; all six ps/pd × 132/213/231 spellings bit-exact vs `fmaf`/`fma`; gate `vector-fma-homing`. |
+| RH-02 | A direct unaligned load's scratch home was read back instead of forwarded: `_mm256_loadu_ps(p)` = `subq $72` + `vmovdqu` + spill + read, and `_mm256_fmadd_ps(loadu(p),b,c)` consumed `40(%rsp)`. | `fuse_vector_loads` also re-points a whole-register read `VecLoad* [home, 0]` at the load's source when the width matches, inheriting the audited alias/volatility barriers; the now-unread alloca is dropped. | return-of-load 10 → **2**, `fmadd(loadu(p),b,c)` 12 → **2** (`vfmadd132ps (%rdi),%ymm1,%ymm0`), GCC 16.2 = 2; gate budgets `fma_load_a/b/c/pd`, `load_only`; unit tests for the 1 accepted / 4 rejected shapes. |
+
+Both are gated by `tests/regression/check_vector_fma_homing.sh`
+(`tests/simd/vector_fma_homing.c`), registered as `gate "vector-fma-homing"
+fast` in `scripts/ci_local.sh`. Counts and the full measurement table live in
+`engineering/AUDIT-VECTOR-ABI-2026-11-10.md` §6.
+
+### 15.2 Queue (measured gaps, ROI order)
+
+Every row is a *measured* defect on the current tree, not a hypothesis.
+
+1. **RH-03 (P0) — packed integer/bitwise map ops are pointer-form.**
+   `_mm256_add_epi64(_mm256_loadu_si256(p), b)` = 8 vs GCC 2;
+   `_mm_add_epi8(_mm_loadu_si128(p), b)` = 6 vs 2.  The register-valued
+   `VecAdd*`/`VecSub*`/`VecAnd*`/`VecOr*`/`VecXor*`/`VecMul*` ops already
+   exist; route the `p*`/`v*` integer map families exactly as RH-01 did for
+   FMA (mnemonic + declared operand type, never opcode alone: one mnemonic
+   names several lane widths).  Acceptance: each shape ≤ GCC + 1, values
+   bit-exact, one gate row per family, `--fast` green.
+2. **RH-04 (P0) — vector parameter homes.** Incoming `__m256`/`__m128`
+   parameters are always stored into a 16/32-byte home by the ABI prologue,
+   even when the only use is a memory operand.  Acceptance: a parameter that
+   does not escape never touches memory; `check_param_home_contracts.py` stays
+   green; no cross-TU ABI change.
+3. **RH-05 (P1) — FMA3 operand rotation costs register copies.**
+   `_mm256_fmadd_ps(a, *(p+8), c)` = 5 vs GCC 2 (two `vmovaps`/`vmovdqa`
+   copies) and `fma_nested` = 5 vs 3.  The destructive form must be chosen so
+   that one operand already lives in the return register.
+4. **RH-06 (P1) — address arithmetic is not folded into the memory operand.**
+   `*(p+8)` emits `addq $32,%rdi` then `(%rdi)`; GCC emits `32(%rdi)`.
+5. **RH-07 (P1) — memory addend.** `_mm256_fmadd_ps(a,b,loadu(p))` = 3 vs 2:
+   needs the 213 spelling with the memory operand as the addend.
+6. **RH-08 (P1) — 128-bit double wrapper.** `_mm_fmadd_pd(loadu(p),b,c)` =
+   11 vs 2: the I128 carrier bridge documented in
+   `try_native_packed_fp_helper` must become a native bridge.
+7. **RH-09 (P2) — `fmsub`/`fnmadd` header loop bodies** (13 instructions),
+   lane extract `a[3]` (32-byte home round trip), `v8 f(v8)` 12 vs 6 (budget
+   gate `tests/regression/vector_abi/`).
+8. **RH-10 (P2) — benchmark coverage.** Add the intrinsic-homing kernels
+   (load/FMA/integer map/parameter/return) to the integrated benchmark section
+   with instruction counts AND wall-clock, so RH-03/RH-04 are ranked by real
+   workload impact rather than by count alone.  Slices to include: zlib-ng
+   `adler32`/`crc32` and `compare256`, gzip `longest_match`, expat UTF-8
+   scanning, SQLite bytecode dispatch.
+
+### 15.3 Sandbox prerequisites (do this first, every session)
+
+`engineering/verification/prepare_local_env.sh` (idempotent, symlinks only,
+no network, no live-root package mutation) is now required for a green local
+mirror: it publishes the offline i386 sysroot (headers, crt, libgcc,
+`/lib/ld-linux.so.2`, `gnu/stubs-32.h`), `/usr/lib/debug` and — added in this
+session — `/usr/libexec/valgrind` plus the Debian suppression file, without
+which valgrind cannot start `memcheck` and the hexadecimal-literal oracle
+fails rather than reporting a Memcheck result.  PyYAML
+(`python3 -m pip install --break-system-packages pyyaml`) is required by
+`check_ci_workflow_shell.py`.

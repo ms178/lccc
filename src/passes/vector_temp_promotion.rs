@@ -612,6 +612,56 @@ pub(crate) fn whole_vector_load(op: IntrinsicOp) -> bool {
     )
 }
 
+/// Byte width of a whole-register `VecLoad*`.
+///
+/// [`whole_vector_load`] proves the op reads an unaligned-safe whole register
+/// through `args[0]` at a constant byte offset; this table supplies the exact
+/// byte count so that a forwarding decision can require the reader's width to
+/// equal the width the producer wrote.  A 32-byte load feeding a 16-byte read
+/// is a partial copy and must refuse.
+fn whole_vector_load_width(op: IntrinsicOp) -> Option<usize> {
+    if !whole_vector_load(op) {
+        return None;
+    }
+    use IntrinsicOp as O;
+    Some(match op {
+        O::VecLoadI32x4
+        | O::VecLoadF32x4
+        | O::VecLoadF64x2
+        | O::VecLoadI64x2
+        | O::VecLoadI16x8
+        | O::VecLoadI8x16 => 16,
+        O::VecLoadI32x8
+        | O::VecLoadF32x8
+        | O::VecLoadF64x4
+        | O::VecLoadI64x4
+        | O::VecLoadI8x32
+        | O::VecLoadI16x16 => 32,
+        _ => return None,
+    })
+}
+
+/// The `emit_vec_load` shape `VecLoad* [base, 0]` reading a whole register of
+/// exactly `width` bytes from `base`, with no displacement.
+///
+/// This is the *register* reader of a vector home: the `VecLoad*` family turns
+/// a stack home into an SSA vector value.  It is deliberately not classified
+/// by [`pointer_vector_arg_width`], which describes intrinsic arguments that
+/// carry vector BYTES; `args[0]` here is an ADDRESS, and the result of the
+/// rewrite below re-points that address at the load's source.
+fn as_whole_vector_read(inst: &Instruction, width: usize, home: u32) -> bool {
+    let Instruction::Intrinsic { op, args, .. } = inst else {
+        return false;
+    };
+    if whole_vector_load_width(*op) != Some(width) {
+        return false;
+    }
+    matches!(
+        (args.first(), args.get(1)),
+        (Some(Operand::Value(base)), Some(off)) if base.0 == home && operand_is_const_zero(off)
+    )
+}
+
 /// Minimum stack alignment required when an intrinsic argument refers to an
 /// alloca.  `Some(0)` means the backend uses an unaligned-safe access; `None`
 /// means that this pass cannot prove the use safe.  Address-valued scalar or
@@ -2817,6 +2867,32 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
                             });
                         }
                     }
+                    // A register-valued whole-vector read of the home
+                    // (`VecLoad* [home, 0]`, exactly what `emit_vec_load`
+                    // produces) copies the bytes the direct load just wrote.
+                    // Re-pointing its base at the load's source removes the
+                    // stack round trip AND lets the backend fold the read into
+                    // the consuming instruction's memory operand.  Before this
+                    // arm, `_mm256_fmadd_ps(_mm256_loadu_ps(p), b, c)` paid a
+                    // 32-byte frame, a spill and a reload (8-9 instructions)
+                    // where GCC emits one `vfmadd132ps (%rdi), ...`.
+                    //
+                    // `available` is the audited alias/volatility barrier
+                    // state: the source may only be re-read here because no
+                    // write that may clobber it happened since the load.
+                    // Width equality is required by `as_whole_vector_read`.
+                    if let Some(Operand::Value(base)) = args.first() {
+                        if let Some(load) = available.get(&base.0).copied() {
+                            if as_whole_vector_read(inst, load.width, base.0) {
+                                plans[block_idx].push(LoadPatch {
+                                    consumer: instruction_idx,
+                                    argument: 0,
+                                    source: load.source,
+                                    producer: load.producer,
+                                });
+                            }
+                        }
+                    }
                     // The first instruction that reads a slot consumes the
                     // availability.  All compatible occurrences in this one
                     // instruction were considered above.
@@ -2966,8 +3042,18 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
             removals[block_idx].push(instruction_idx);
         }
     }
+    let mut deleted_any = false;
     for (block, removed) in func.blocks.iter_mut().zip(&mut removals) {
+        deleted_any |= !removed.is_empty();
         remove_instructions(block, removed);
+    }
+    if deleted_any {
+        // A forwarded load's home is usually read nowhere else once its single
+        // reader was re-pointed at the source.  Dropping the dead alloca is
+        // what removes the frame: `_mm256_fmadd_ps(_mm256_loadu_ps(p), b, c)`
+        // needed `subq $72` only because the load's 32-byte scratch home
+        // survived the (already deleted) store.
+        remove_unused_allocas(func);
     }
 
     patch_count
@@ -3982,6 +4068,161 @@ mod tests {
         assert_eq!(function.blocks[0].instructions.len(), 4);
     }
 
+    /// The `emit_vec_load` shape `VecLoad* [home, 0]` is the *register* reader
+    /// of a vector home: forwarding the direct load's source into it removes
+    /// the stack round trip and lets the consumer take a memory operand.
+    #[test]
+    fn register_read_of_a_direct_load_home_is_forwarded() {
+        let mut function = function(
+            "register_read",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    // _mm256_loadu_ps(p)
+                    intrinsic(
+                        Some(1),
+                        IntrinsicOp::LoaduPs256,
+                        Some(0),
+                        vec![Operand::Value(Value(10))],
+                    ),
+                    // %2 = VecLoadF32x8 [%0, 0]
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::VecLoadF32x8,
+                        None,
+                        vec![Operand::Value(Value(0)), Operand::Const(IrConst::I64(0))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(fuse_in_function(&mut function), 1);
+        // The read now addresses the load's source, and both the staged load
+        // and its scratch home are gone: no `vmovdqu`+`vmovdqu`+`vmovups`
+        // relay, and no frame for the 32-byte slot.
+        assert_eq!(function.blocks[0].instructions.len(), 1);
+        let Instruction::Intrinsic { op, args, .. } = &function.blocks[0].instructions[0] else {
+            panic!("expected the surviving register read");
+        };
+        assert_eq!(*op, IntrinsicOp::VecLoadF32x8);
+        assert_eq!(args[0], Operand::Value(Value(10)));
+        assert_eq!(args[1], Operand::Const(IrConst::I64(0)));
+    }
+
+    /// Only an exact whole-register read at offset 0 copies the same bytes the
+    /// direct load wrote.  A narrower read, or one at a non-zero offset, reads
+    /// a subrange and must keep the home.
+    #[test]
+    fn register_read_forwarding_requires_matching_width_and_zero_offset() {
+        for (op, offset) in [
+            (IntrinsicOp::VecLoadF32x4, 0i64),
+            (IntrinsicOp::VecLoadF32x8, 16),
+            (IntrinsicOp::VecLoadF32x8, 4),
+        ] {
+            let mut function = function(
+                "register_read_shape",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        intrinsic(
+                            Some(1),
+                            IntrinsicOp::LoaduPs256,
+                            Some(0),
+                            vec![Operand::Value(Value(10))],
+                        ),
+                        intrinsic(
+                            Some(2),
+                            op,
+                            None,
+                            vec![
+                                Operand::Value(Value(0)),
+                                Operand::Const(IrConst::I64(offset)),
+                            ],
+                        ),
+                    ],
+                )],
+            );
+            assert_eq!(
+                fuse_in_function(&mut function),
+                0,
+                "{op:?} at offset {offset} is not a whole-register copy"
+            );
+        }
+    }
+
+    /// The register-read forward is an *address* rewrite, so it carries the
+    /// same alias obligation as every other forward: a write that may clobber
+    /// the source between the load and the read must stop it.
+    #[test]
+    fn register_read_forwarding_respects_aliasing_writes() {
+        let mut function = function(
+            "register_read_clobber",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    intrinsic(
+                        Some(1),
+                        IntrinsicOp::LoaduPs256,
+                        Some(0),
+                        vec![Operand::Value(Value(10))],
+                    ),
+                    Instruction::Store {
+                        val: Operand::Const(IrConst::I32(1)),
+                        ptr: Value(10),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::VecLoadF32x8,
+                        None,
+                        vec![Operand::Value(Value(0)), Operand::Const(IrConst::I64(0))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(fuse_in_function(&mut function), 0);
+        assert_eq!(function.blocks[0].instructions.len(), 4);
+    }
+
+    /// A second reader of the home keeps the staged load observable, so the
+    /// pass must not rewrite anything (the forward is single-reader only).
+    #[test]
+    fn register_read_forwarding_requires_a_single_reader() {
+        let mut function = function(
+            "register_read_two_readers",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    intrinsic(
+                        Some(1),
+                        IntrinsicOp::LoaduPs256,
+                        Some(0),
+                        vec![Operand::Value(Value(10))],
+                    ),
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::VecLoadF32x8,
+                        None,
+                        vec![Operand::Value(Value(0)), Operand::Const(IrConst::I64(0))],
+                    ),
+                    // A second, pointer-form reader of the same home.
+                    intrinsic(
+                        Some(3),
+                        IntrinsicOp::Pcmpeqb256,
+                        Some(20),
+                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(fuse_in_function(&mut function), 0);
+    }
+
     #[test]
     fn fixed_address_source_is_invalidated_by_unknown_write() {
         let mut function = function(
@@ -4091,8 +4332,11 @@ mod tests {
             )],
         );
         assert_eq!(fuse_in_function(&mut function), 1);
-        assert_eq!(function.blocks[0].instructions.len(), 5);
-        let Instruction::Intrinsic { args, .. } = &function.blocks[0].instructions[4] else {
+        // The forwarded load is retired together with its now-unread home, so
+        // the block keeps the two live allocas, the (proven distinct) store
+        // and the consumer.
+        assert_eq!(function.blocks[0].instructions.len(), 4);
+        let Instruction::Intrinsic { args, .. } = &function.blocks[0].instructions[3] else {
             panic!("expected consumer");
         };
         assert!(matches!(args[0], Operand::Value(Value(10))));
