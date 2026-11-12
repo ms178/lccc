@@ -107,7 +107,17 @@ class I686PtrCompareSelect(unittest.TestCase):
         for label, env in (("fused", {}), ("kill switch", {"CCC_NO_FUSED_CSEL": "1"})):
             with self.subTest(mode=label):
                 binary = self.build(env)
-                proc = subprocess.run([str(binary)], capture_output=True, timeout=120)
+                # Executing a foreign-architecture ELF is a property of the
+                # host, not of the compiler: a kernel without IA32 support
+                # reports ENOEXEC/ENOENT here, and a seccomp policy that
+                # blocks the legacy `int $0x80` path kills the process.  Both
+                # are skips -- the compile half above still ran, and the
+                # regression fixture covers this program under the normal
+                # harness on hosts that can execute it.
+                try:
+                    proc = subprocess.run([str(binary)], capture_output=True, timeout=120)
+                except OSError as exc:
+                    self.skipTest(f"host cannot execute i386 ELF: {exc}")
                 if proc.returncode < 0 or proc.returncode == 127:
                     self.skipTest("host cannot execute i386 ELF")
                 self.assertEqual(proc.returncode, 0,

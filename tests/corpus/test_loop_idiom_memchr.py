@@ -299,8 +299,13 @@ int main(void) {
         match, so the checksum must stay identical and `memchr` must still be
         the callee -- the synthesized declaration is a plain integer call.
         """
+        # Every ISA leg is an explicit, deterministic level.  `-march=native`
+        # is deliberately absent: it makes the test's coverage -- and, if the
+        # backend has an ISA-specific defect, its result -- a function of
+        # whichever CPU the CI runner happens to have, so a green or red run
+        # would say nothing about the commit.
         cases = [("-O1",), ("-O2",), ("-O3",), ("-Os",), ("-Oz",),
-                 ("-O2", "-mno-sse"), ("-O2", "-mavx2"), ("-O3", "-march=native")]
+                 ("-O2", "-mno-sse"), ("-O2", "-mavx2"), ("-O2", "-march=x86-64-v2")]
         with tempfile.TemporaryDirectory(prefix="memchr-levels-") as td:
             for flags in cases:
                 with self.subTest(flags=" ".join(flags)):
