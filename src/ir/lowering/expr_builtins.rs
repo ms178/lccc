@@ -3627,6 +3627,14 @@ impl Lowerer {
             }
         }
         let op = x86_intrinsic_op(intrinsic);
+        // RH-03: the packed integer/bitwise map families have register-valued
+        // twins, so their pointer forms (one address per operand, one for the
+        // result) are not the only way to say the same thing.  This is a
+        // refusal-first rewrite: every shape the twin table does not own keeps
+        // the established pointer emitter below.
+        if let Some(result) = self.try_native_packed_map(op, args) {
+            return Some(result);
+        }
         match x86_intrinsic_kind(intrinsic) {
             X86IntrinsicKind::Fence => {
                 self.emit(Instruction::Intrinsic {

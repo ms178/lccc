@@ -752,6 +752,167 @@ fn native_fma_256(mnemonic: &str) -> Option<(IntrinsicOp, IrType, usize)> {
     }
 }
 
+/// What a pointer-form packed map op needs beyond its vector operands.
+///
+/// `Binary` covers the families whose only arguments are the two register
+/// images.  The other two shapes exist because the register twins are NOT
+/// drop-in renames of the pointer forms:
+///
+/// * a shift twin takes the count as an IMMEDIATE operand with a per-lane
+///   bound (`psllw` defines 1..=15, `pslld` 1..=31, `psllq` 1..=63) and
+///   asserts on anything outside it, while the C-level `_mm_slli_epi32(a, 0)`
+///   is a legal identity and `_mm_slli_epi16(a, 40)` is a legal zeroing shift;
+/// * a compare twin takes a PREDICATE immediate in the vectorizer's canonical
+///   encoding, where signed greater-than is not a predicate at all.
+#[derive(Clone, Copy)]
+enum NativeMapTail {
+    Binary,
+    /// `dst = a << k`: second argument is an immediate in `1..=max`.
+    ShiftImm {
+        max: i64,
+    },
+    /// `dst = a ? b`: the twin takes the predicate immediate; `gt` is the
+    /// signed less-than predicate with the operands swapped, because no x86
+    /// encoding has a greater-than form for every lane width.
+    Compare {
+        predicate: i64,
+        swap: bool,
+    },
+}
+
+/// `CCC_NO_NATIVE_PACKED_MAP`: revert every routed map op to its pointer
+/// form.  Read once — the lowering consults it per intrinsic.
+fn packed_map_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("CCC_NO_NATIVE_PACKED_MAP").is_some())
+}
+
+/// Pointer-form packed map op -> its register-valued twin.
+///
+/// This is the RH-03 audit table: one row per BUILTIN-VISIBLE pointer op, the
+/// twin the backend already implements and the SLP vectorizer already emits,
+/// the twin's lane type and the register width.  A row is only present when
+/// the twin exists in `src/ir/intrinsics.rs` AND the x86 backend emits a
+/// single instruction for it; the pointer form stays for everything else
+/// (saturating arithmetic, `pandn`, `pmulhw`, variable-count shifts, byte
+/// shifts, `pmuludq`, packs/unpacks, shuffles, extracts).
+///
+/// The lane type is the TWIN's lane, and it is what makes the table
+/// self-checking: `Paddb` adds BYTES, so a wrong lane here is a wrong
+/// arithmetic width that no instruction count can see (byte add and qword add
+/// are both one instruction).  The operand C types are deliberately NOT part
+/// of the key: `__m128i` is declared `long long __vector(2)` in
+/// `include/lcccsimd.h`, so `_mm_add_epi8`'s arguments are i64x2 at the C
+/// level while the operation is per-byte.  Requiring the declared lane type to
+/// match would reject every real call, and inferring the lane type from it
+/// would compute a different function.  Bitwise identity of the register image
+/// (16 or 32 bytes) plus the twin's own lane type is the whole contract.
+fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, NativeMapTail)> {
+    use IntrinsicOp::*;
+    use NativeMapTail::Binary;
+    let row = match op {
+        // ---- 128-bit register images -------------------------------------
+        Paddb128 => (VecAddI8x16, IrType::I8, 16, Binary),
+        Paddw128 => (VecAddI16x8, IrType::I16, 16, Binary),
+        Paddd128 => (VecAddI32x4, IrType::I32, 16, Binary),
+        Paddq128 => (VecAddI64x2, IrType::I64, 16, Binary),
+        Psubb128 => (VecSubI8x16, IrType::I8, 16, Binary),
+        Psubw128 => (VecSubI16x8, IrType::I16, 16, Binary),
+        Psubd128 => (VecSubI32x4, IrType::I32, 16, Binary),
+        Psubq128 => (VecSubI64x2, IrType::I64, 16, Binary),
+        // Bitwise: any lane width emits the identical encoding, so the table
+        // names the dword twin (and the byte twin is equally valid); what
+        // matters is that `pand`/`por`/`pxor` never route through an
+        // ARITHMETIC twin, where the lane width would change the answer.
+        Pand128 => (VecAndI32x4, IrType::I32, 16, Binary),
+        Por128 => (VecOrI32x4, IrType::I32, 16, Binary),
+        Pxor128 => (VecXorI32x4, IrType::I32, 16, Binary),
+        // The 128-bit float bitwise forms are the same instructions; without
+        // this they lose a home per operand and a home for the result.
+        AndPs128 => (VecAndI32x4, IrType::I32, 16, Binary),
+        OrPs128 => (VecOrI32x4, IrType::I32, 16, Binary),
+        XorPs128 => (VecXorI32x4, IrType::I32, 16, Binary),
+        Pmullw128 => (VecMulI16x8, IrType::I16, 16, Binary),
+        Pmulld128 => (VecMulI32x4, IrType::I32, 16, Binary),
+        Pmaxub128 => (VecMaxU8x16, IrType::U8, 16, Binary),
+        Pminub128 => (VecMinU8x16, IrType::U8, 16, Binary),
+        Pminsw128 => (VecMinI16x8, IrType::I16, 16, Binary),
+        Pmaxsw128 => (VecMaxI16x8, IrType::I16, 16, Binary),
+        // ---- 256-bit register images -------------------------------------
+        Paddb256 => (VecAddI8x32, IrType::I8, 32, Binary),
+        Paddw256 => (VecAddI16x16, IrType::I16, 32, Binary),
+        Paddd256 => (VecAddI32x8, IrType::I32, 32, Binary),
+        Paddq256 => (VecAddI64x4, IrType::I64, 32, Binary),
+        Psubb256 => (VecSubI8x32, IrType::I8, 32, Binary),
+        Psubw256 => (VecSubI16x16, IrType::I16, 32, Binary),
+        Psubd256 => (VecSubI32x8, IrType::I32, 32, Binary),
+        Psubq256 => (VecSubI64x4, IrType::I64, 32, Binary),
+        Pand256 => (VecAndI32x8, IrType::I32, 32, Binary),
+        Por256 => (VecOrI32x8, IrType::I32, 32, Binary),
+        Pxor256 => (VecXorI32x8, IrType::I32, 32, Binary),
+        Pmullw256 => (VecMulI16x16, IrType::I16, 32, Binary),
+        Pmulld256 => (VecMulI32x8, IrType::I32, 32, Binary),
+        Pmaxub256 => (VecMaxU8x32, IrType::U8, 32, Binary),
+        Pminub256 => (VecMinU8x32, IrType::U8, 32, Binary),
+        Pminsd256 => (VecMinI32x8, IrType::I32, 32, Binary),
+        Pmaxsd256 => (VecMaxI32x8, IrType::I32, 32, Binary),
+        _ => return None,
+    };
+    Some(row)
+}
+
+/// Pointer-form immediate-shift op -> (twin, lane, bytes, largest defined
+/// shift).  Variable-count forms (`_mm_sll_epi32` and friends) are absent on
+/// purpose: their twin would have to materialise a count vector, which is not
+/// a single instruction for every lane width.
+fn native_packed_shift(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, i64)> {
+    use IntrinsicOp::*;
+    Some(match op {
+        Psllwi128 => (VecShlI16x8, IrType::I16, 16, 15),
+        Psrlwi128 => (VecLShrI16x8, IrType::I16, 16, 15),
+        Psrawi128 => (VecAShrI16x8, IrType::I16, 16, 15),
+        Pslldi128 => (VecShlI32x4, IrType::I32, 16, 31),
+        Psrldi128 => (VecLShrI32x4, IrType::I32, 16, 31),
+        Psradi128 => (VecAShrI32x4, IrType::I32, 16, 31),
+        Psllqi128 => (VecShlI64x2, IrType::I64, 16, 63),
+        Psrlqi128 => (VecLShrI64x2, IrType::I64, 16, 63),
+        Psllwi256 => (VecShlI16x16, IrType::I16, 32, 15),
+        Psrlwi256 => (VecLShrI16x16, IrType::I16, 32, 15),
+        Psrawi256 => (VecAShrI16x16, IrType::I16, 32, 15),
+        Psllidi256 => (VecShlI32x8, IrType::I32, 32, 31),
+        Psrlidi256 => (VecLShrI32x8, IrType::I32, 32, 31),
+        Psradi256 => (VecAShrI32x8, IrType::I32, 32, 31),
+        Psllqi256 => (VecShlI64x4, IrType::I64, 32, 63),
+        Psrlqi256 => (VecLShrI64x4, IrType::I64, 32, 63),
+        _ => return None,
+    })
+}
+
+/// Pointer-form compare op -> (twin, lane, bytes, predicate, swap).
+///
+/// The predicate encoding is the vectorizer's (`emit_int_cmp`): 0 = equal,
+/// 1 = signed less-than, 2 = signed less-or-equal, 4 = not-equal, 5/6 = the
+/// unsigned forms.  `pcmpgtX` is the SIGNED greater-than of the pointer op,
+/// which is exactly `lt` with the operands exchanged.
+fn native_packed_cmp(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, i64, bool)> {
+    use IntrinsicOp::*;
+    Some(match op {
+        Pcmpeqb128 => (VecCmpI8x16, IrType::I8, 16, 0, false),
+        Pcmpeqw128 => (VecCmpI16x8, IrType::I16, 16, 0, false),
+        Pcmpeqd128 => (VecCmpI32x4, IrType::I32, 16, 0, false),
+        Pcmpgtb128 => (VecCmpI8x16, IrType::I8, 16, 1, true),
+        Pcmpgtw128 => (VecCmpI16x8, IrType::I16, 16, 1, true),
+        Pcmpgtd128 => (VecCmpI32x4, IrType::I32, 16, 1, true),
+        Pcmpeqb256 => (VecCmpI8x32, IrType::I8, 32, 0, false),
+        Pcmpeqd256 => (VecCmpI32x8, IrType::I32, 32, 0, false),
+        Pcmpeqq256 => (VecCmpI64x4, IrType::I64, 32, 0, false),
+        Pcmpgtb256 => (VecCmpI8x32, IrType::I8, 32, 1, true),
+        Pcmpgtd256 => (VecCmpI32x8, IrType::I32, 32, 1, true),
+        Pcmpgtq256 => (VecCmpI64x4, IrType::I64, 32, 1, true),
+        _ => return None,
+    })
+}
+
 impl Lowerer {
     /// Keep packed FP helpers in the same register-valued IR as native vector
     /// arithmetic. The legacy address result remains an addressable object;
@@ -828,6 +989,164 @@ impl Lowerer {
         self.emit(Instruction::Intrinsic {
             dest: Some(value),
             op: native,
+            dest_ptr: None,
+            args: operands,
+        });
+        let result = self.emit_entry_alloca(IrType::Ptr, bytes, bytes, false);
+        self.emit_vec_store(&shape, value, result);
+        Some(Operand::Value(result))
+    }
+
+    /// Is `arg` a whole 16/32-byte register image that this rewrite may copy
+    /// as ONE packed instruction?
+    ///
+    /// `simd_shape` is the same predicate the vector-extension lowering uses:
+    /// dense lanes, no bit-packed `_Bool` vector, 16 or 32 bytes, and available
+    /// on this target's vector lowering ceiling.  It deliberately accepts a
+    /// FLOAT element type — `_mm_add_epi8` may be handed a `__m128` through an
+    /// implicit conversion, and the bytewise sum of those bytes is what the
+    /// builtin computes.  Volatile objects and foreign address spaces are
+    /// refused: the `Vec*` families carry no volatility and address no segment,
+    /// so those keep the pointer path that the legacy emitter provides.
+    fn packed_map_operand_ok(&self, arg: &Expr, bytes: usize) -> bool {
+        let ty = self.expr_ctype(arg);
+        super::vector_simd::simd_shape(&ty).is_some_and(|shape| shape.bytes == bytes)
+            && !self.expr_access_is_volatile(arg)
+            && self.aggregate_lvalue_space(arg) == crate::common::types::AddressSpace::Default
+    }
+
+    /// Route a pointer-form packed integer/bitwise op through its
+    /// register-valued twin (RH-03).
+    ///
+    /// The pointer forms take one ADDRESS per operand and write their result
+    /// through a fourth, so every operand is a real frame slot even when the
+    /// value already lives in `%xmm`/`%ymm`:
+    ///
+    /// ```text
+    ///   movdqu %xmm1, 32(%rsp)          ; operand home
+    ///   vpaddb 32(%rsp), %xmm0, %xmm0   ; the operation, on memory
+    /// ```
+    ///
+    /// The twin does the same arithmetic on register values, and the entry
+    /// alloca this returns is the same address-result convention the pointer
+    /// form uses, so `vector_temp_promotion` deletes it exactly as it does for
+    /// the FP helpers -- the caller's `(A)(...)` deref becomes a whole-vector
+    /// read of the forwarded source.
+    ///
+    /// Refusal is total and silent: every shape the table does not own, every
+    /// volatile/foreign-space operand, every shift count outside the
+    /// instruction's defined range and every non-constant shift count keeps
+    /// the established pointer path, which is always correct.
+    pub(super) fn try_native_packed_map(
+        &mut self,
+        op: IntrinsicOp,
+        args: &[Expr],
+    ) -> Option<Operand> {
+        // Resolve the whole plan BEFORE lowering anything.  Lowering is not
+        // idempotent: an argument that emits IR (a call, a compound
+        // assignment) must not be evaluated once for a plan that is then
+        // abandoned and a second time by the pointer path.
+        let (twin, lane, bytes, tail) = match native_packed_map(op) {
+            Some((twin, lane, bytes, tail)) => (twin, lane, bytes, tail),
+            None => match native_packed_shift(op) {
+                Some((twin, lane, bytes, max)) => {
+                    (twin, lane, bytes, NativeMapTail::ShiftImm { max })
+                }
+                None => {
+                    let (twin, lane, bytes, predicate, swap) = native_packed_cmp(op)?;
+                    (
+                        twin,
+                        lane,
+                        bytes,
+                        NativeMapTail::Compare { predicate, swap },
+                    )
+                }
+            },
+        };
+        // Kill switch, in the same spirit as `CCC_NO_VLFOLD`: it returns to
+        // the pointer form, which is semantically identical and merely slower.
+        // It exists so the gate can prove itself non-vacuous against a real
+        // pre-fix lowering instead of against a hand-edited budget.
+        if packed_map_disabled() {
+            return None;
+        }
+        // x86-64 only.  The i686 backend implements a SUBSET of the packed
+        // families in their value form: `emit_intrinsic` asserts "only the
+        // dest_ptr form is supported here" for the rest (`VecMinU8x16` is one
+        // of them), so routing i686 through this table would turn a working
+        // program into an internal compiler error.  32-bit keeps the pointer
+        // path until those emitters grow the value form.
+        if self.target != crate::backend::Target::X86_64 {
+            return None;
+        }
+        if args.len() != 2 {
+            return None;
+        }
+        // Both register operands, or the one plus an immediate.  The
+        // register operand predicate is checked for EVERY operand before any
+        // of them is lowered.
+        if !self.packed_map_operand_ok(&args[0], bytes) {
+            return None;
+        }
+        let immediate = match tail {
+            NativeMapTail::Binary | NativeMapTail::Compare { .. } => {
+                if !self.packed_map_operand_ok(&args[1], bytes) {
+                    return None;
+                }
+                None
+            }
+            NativeMapTail::ShiftImm { max } => {
+                // A constant count in the instruction's DEFINED range only:
+                // zero is the identity and an over-wide count is defined to
+                // shift everything out, and the twin's emitter asserts on
+                // both.  Both are rare and the pointer path is exact for
+                // them, so they are refused rather than special-cased.
+                let count = self.eval_const_expr(&args[1])?.to_i64()?;
+                if !(1..=max).contains(&count) {
+                    return None;
+                }
+                Some(Operand::Const(IrConst::I64(count)))
+            }
+        };
+        let lanes = bytes / lane.size();
+        let fam = crate::passes::slp_vectorizer::family_for(lane, lanes)?;
+        let shape = super::vector_simd::SimdShape {
+            fam,
+            elem_ir: lane,
+            lanes,
+            bytes,
+        };
+
+        // From here on the answer is committed: operand homes are loaded as
+        // whole registers of the TWIN's lane type, which is a bitwise copy.
+        let mut operands = Vec::with_capacity(3);
+        for arg in args {
+            if !self.expr_ctype(arg).is_vector() {
+                continue;
+            }
+            let ty = self.expr_ctype(arg);
+            let ptr = self.vector_operand_ptr(arg, &ty);
+            operands.push(Operand::Value(self.emit_vec_load(&shape, ptr)));
+        }
+        match tail {
+            NativeMapTail::Binary => {}
+            NativeMapTail::ShiftImm { .. } => {
+                operands.push(immediate?);
+            }
+            NativeMapTail::Compare { predicate, swap } => {
+                if operands.len() != 2 {
+                    return None;
+                }
+                if swap {
+                    operands.swap(0, 1);
+                }
+                operands.push(Operand::Const(IrConst::I64(predicate)));
+            }
+        }
+        let value = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(value),
+            op: twin,
             dest_ptr: None,
             args: operands,
         });

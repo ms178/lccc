@@ -3334,6 +3334,7 @@ mixing counting conventions is how a 28-instruction body gets reported as 26.
 | Item | Defect | Fix | Evidence |
 |---|---|---|---|
 | RH-01 | `_mm256_fmadd_ps/pd` reached codegen through the pointer-form `m3` table entry: three 32-byte realigned homes, three reloads, a result home and a reload (28 instructions, 408-byte frame). | `native_fma_256()` (`src/ir/lowering/expr_builtins_lcccsimd.rs`) maps the mnemonic to the register-form `VecMadd*Signed` op, keyed on the MNEMONIC because one opcode names four sign structures. | 28 → **2** instructions (`vfmadd132ps %ymm1,%ymm2,%ymm0; ret`), GCC 16.2 = 2; all six ps/pd × 132/213/231 spellings bit-exact vs `fmaf`/`fma`; gate `vector-fma-homing`. |
+| RH-03 | Every pointer-form packed integer/bitwise map op took one ADDRESS per operand and wrote through a `dest_ptr`, so a register operand was spilled into a realigned frame slot: `_mm_add_epi8(a,b)` 5 instructions in an 88-byte frame, `_mm256_add_epi8(a,b)` 9 in 136 bytes, GCC 16.2 = 2 at both. | `try_native_packed_map()` routes 65 builtin ops (add/sub/and/or/xor/mul/min/max, immediate shifts, eq/gt compares, the `_ps` bitwise forms) to the register-valued twins the SLP vectorizer already emits. Keyed on the POINTER OP, guarded on the register IMAGE: `__m128i` is declared `long long __vector(2)`, so `_mm_add_epi8`'s arguments are i64x2 while the operation is per byte. | 5/9 → **2/2** for every family and lane width, GCC 16.2 = 2; memory shapes 6/8 → 3 (the residue is RH-04, the other operand's parameter home); exhaustive differential `tests/simd/x86_int_map_registers.c` executes every lane width at both widths at `-O0/-O1/-O2/-O3` against a scalar reference and is built by GCC too; gate `x86-int-map-registers` with a `CCC_NO_NATIVE_PACKED_MAP` counterfactual. |
 | RH-02 | A direct unaligned load's scratch home was read back instead of forwarded: `_mm256_loadu_ps(p)` = `subq $72` + `vmovdqu` + spill + read, and `_mm256_fmadd_ps(loadu(p),b,c)` consumed `40(%rsp)`. | `fuse_vector_loads` also re-points a whole-register read `VecLoad* [home, 0]` at the load's source when the width matches, inheriting the audited alias/volatility barriers; the now-unread alloca is dropped. | return-of-load 10 → **2**, `fmadd(loadu(p),b,c)` 12 → **2** (`vfmadd132ps (%rdi),%ymm1,%ymm0`), GCC 16.2 = 2; gate budgets `fma_load_a/b/c/pd`, `load_only`; unit tests for the 1 accepted / 4 rejected shapes. |
 
 Both are gated by `tests/regression/check_vector_fma_homing.sh`
@@ -3345,14 +3346,22 @@ fast` in `scripts/ci_local.sh`. Counts and the full measurement table live in
 
 Every row is a *measured* defect on the current tree, not a hypothesis.
 
-1. **RH-03 (P0) — packed integer/bitwise map ops are pointer-form.**
-   `_mm256_add_epi64(_mm256_loadu_si256(p), b)` = 8 vs GCC 2;
-   `_mm_add_epi8(_mm_loadu_si128(p), b)` = 6 vs 2.  The register-valued
-   `VecAdd*`/`VecSub*`/`VecAnd*`/`VecOr*`/`VecXor*`/`VecMul*` ops already
-   exist; route the `p*`/`v*` integer map families exactly as RH-01 did for
-   FMA (mnemonic + declared operand type, never opcode alone: one mnemonic
-   names several lane widths).  Acceptance: each shape ≤ GCC + 1, values
-   bit-exact, one gate row per family, `--fast` green.
+1. **RH-11 (P0) — intrinsics with NO packed encoding at all.**  Found while
+   measuring RH-03: the 128-bit unsigned/signed-byte min/max builtins do not
+   exist, so `include/smmintrin.h` implements them as scalar lane loops.
+   `_mm_min_epu16` = **103** instructions vs GCC 2, `_mm_max_epi32` = **48**,
+   `_mm_min_epu32` = **37**, `_mm_max_epi8` = 3.  Fix is real encodings, not
+   routing: 14 pointer ops `P{min,max}{uw,ud,sb,sd}{128,256}`, six 128-bit
+   twins (`VecMinI8x16`, `VecMaxI8x16`, `VecMinI32x4`, `VecMaxI32x4`,
+   `VecMinU16x8`, `VecMaxU16x8`; all 256-bit twins exist), SSE4.1/AVX2 emitter
+   arms, `__lccc_simd{128,256}_i_*` declarations, ten header rewrites.  The
+   header-only workarounds were measured and rejected (8 and 11 instructions
+   where the encoding is 2).  Plan and numbers: §6.6 of
+   `engineering/AUDIT-VECTOR-ABI-2026-11-10.md`.
+1a. **RH-03b (P2) — i686 twin coverage.**  The 32-bit backend asserts "only
+   the dest_ptr form is supported here" for a subset of the `Vec*` twins, so
+   RH-03 is x86-64 only and `-m32` keeps the pointer path.  The gate already
+   runs the full value matrix for i686.
 2. **RH-04 (P0) — vector parameter homes.** Incoming `__m256`/`__m128`
    parameters are always stored into a 16/32-byte home by the ABI prologue,
    even when the only use is a memory operand.  Acceptance: a parameter that

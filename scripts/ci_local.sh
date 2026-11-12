@@ -1978,6 +1978,19 @@ gate "vector-fma-homing" fast \
 gate "vector-fma-homing-nonvacuity" fast \
     bash tests/regression/check_vector_fma_homing.sh \
     --lccc tests/regression/vector_home_prefix_standin.sh --expect-defect
+# RH-03: the packed integer/bitwise map families (add/sub/and/or/xor/mul/
+# min/max, immediate shifts, eq/gt compares, the float bitwise forms) took one
+# ADDRESS per operand and wrote through a `dest_ptr`, so a register operand was
+# spilled first: `_mm_add_epi8(a,b)` was 5 instructions in an 88-byte frame at
+# 128 bits and 9 in 136 bytes at 256 bits, GCC 2 at both.  The gate runs every
+# family for every lane width at both widths against a scalar reference
+# (executed at -O0/-O1/-O2/-O3), budgets the register shapes at 2 and the two
+# memory shapes at 3, and proves itself non-vacuous against the pre-fix
+# lowering via `CCC_NO_NATIVE_PACKED_MAP`.
+gate "x86-int-map-registers" fast \
+    bash tests/regression/check_x86_int_map_registers.sh --lccc target/fastbuild/lccc \
+    --reference "${GCC:-gcc-16}"
+
 # `-mf16c` must change the ENCODING and nothing else.  On i686 it once changed
 # neither: __F16C__ was announced while the effective feature set had no F16c
 # bit, so the option silently bought nothing.  Both paths compute correct

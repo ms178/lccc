@@ -235,42 +235,101 @@ found and fixed there in this session because they turned real gates red:
 PyYAML is needed by `check_ci_workflow_shell.py`; `python3 -m pip install
 --break-system-packages pyyaml` is the sandbox-local fix.
 
-### 6.6 RH-03 implementation plan (next session's starting point)
+### 6.6 RH-03 — landed: the packed integer/bitwise map families are register-valued
 
-The pointer-form packed integer/bitwise families are the remaining large
-round trip: `Paddb128`/`Paddq256`/... take one ADDRESS per operand and write
-through a `dest_ptr`, so each operand home (including the ABI's parameter
-home) is a real frame slot and each intermediate result materialises a fresh
-one.  The register-valued twins already exist and are exercised by the
-vectorizer — every op below was verified present in `src/ir/intrinsics.rs`
-by exact-name grep on this tree:
+`try_native_packed_map` (in `src/ir/lowering/expr_builtins_lcccsimd.rs`) routes
+65 pointer-form builtin ops through the register-valued twin the SLP
+vectorizer already emits.  Measured on this tree at `-O2 -mavx2 -mfma`
+(instructions between the function label and `ret`; GCC 16.2 with the same
+flags and the same counting rule):
 
-| pointer form (128 / 256) | register twin (128 / 256) |
-|---|---|
-| `Paddb`, `Paddw`, `Paddd`, `Paddq` | `VecAddI8x16`/`VecAddI8x32`, `VecAddI16x8`/`VecAddI16x16`, `VecAddI32x4`/`VecAddI32x8`, `VecAddI64x2`/`VecAddI64x4` |
-| `Psubb`, `Psubw`, `Psubd`, `Psubq` | `VecSubI8x16`/`VecSubI8x32`, `VecSubI16x8`/`VecSubI16x16`, `VecSubI32x4`/`VecSubI32x8`, `VecSubI64x2`/`VecSubI64x4` |
-| `Pand`, `Por`, `Pxor` | `VecAndI32x4`/`VecAndI32x8`, `VecOrI32x4`/`VecOrI32x8`, `VecXorI32x4`/`VecXorI32x8` |
-| `Pmullw`, `Pmulld` | `VecMulI16x8`/`VecMulI16x16`, `VecMulI32x4`/`VecMulI32x8` |
-| `Pmaxub`, `Pminub`, `Pmaxsd`, `Pminsd` | `VecMaxU8x16`/`VecMaxU8x32`, `VecMinU8x16`/`VecMinU8x32`, `VecMaxI32x8`, `VecMinI32x8` |
+| shape (`a`, `b` register-resident) | pointer form | now | GCC 16.2 |
+|---|---:|---:|---:|
+| `_mm_add_epi8` / `_mm256_add_epi8` | 5 / 9 | **2 / 2** | 2 / 2 |
+| `_mm_add_epi{16,32,64}`, `_mm256_add_epi*` | 5 / 9 | **2 / 2** | 2 / 2 |
+| `_mm_sub_epi*`, `_mm256_sub_epi*` | 5 / 9 | **2 / 2** | 2 / 2 |
+| `_mm_and_si128`, `_mm256_and_si256` | 5 / 9 | **2 / 2** | 2 / 2 |
+| `_mm_or_*`, `_mm_xor_*` (128/256, int and `_ps`) | 5 / 9 | **2 / 2** | 2 / 2 |
+| `_mm_mullo_epi16`, `_mm256_mullo_epi32` | 5 / 9 | **2 / 2** | 2 / 2 |
+| `_mm_min_epu8`, `_mm256_max_epi32`, `_mm_min_epi16` | 5 / 9 | **2 / 2** | 2 / 2 |
+| `_mm_slli_epi32(a,3)`, `_mm256_srai_epi16(a,5)` | 5 / 8 | **2 / 2** | 2 / 2 |
+| `_mm_cmpgt_epi8`, `_mm256_cmpgt_epi64` | 5 / 9 | **2 / 2** | 2 / 2 |
+| `_mm_add_epi8(_mm_loadu_si128(p), b)` | 6 | **3** | 2 |
+| `_mm256_add_epi64(_mm256_loadu_si256(p), b)` | 8 | **3** | 2 |
 
-Shape of the change: a `native_integer_map_128(op) -> Option<(IntrinsicOp,
-IrType, usize)>` / `..._256(...)` table next to `native_fma_256`, consulted by
-the same `try_native_packed_fp_helper` mechanism (rename it), with the
-existing operand-shape/volatile/address-space guards reused verbatim.  Two
-traps that already cost time elsewhere in this family:
+The two memory shapes stop one instruction above GCC because the OTHER
+operand is a by-value vector parameter and this ABI homes it in a frame slot;
+GCC keeps it in `%xmm0`/`%ymm0`.  That is RH-04, not this family: the VEX
+memory fold requires the non-memory source in a register, and the emitter
+correcty materialises the load when the other source has no register home
+(`try_emit_avx_256_memfold`'s "no register source" arm).
 
-1. **Key on the opcode AND the declared C type, never the opcode alone.**
-   One pointer op names one exact lane structure (`Paddb128` is bytes,
-   `Paddd128` is dwords), but the *Builtin* layer maps `_mm_add_epi8` and
-   `_mm_add_epi16` to different builtins that can share an opcode path; the
-   shape guard (`simd_shape` bytes/elem) is what keeps the operand types
-   honest, and it must stay BEFORE any operand is evaluated.
-2. **`Pand`/`Por`/`Pxor` are type-agnostic bitwise ops.**  A register twin of
-   any lane width emits the identical encoding, so pick the twin that matches
-   the declared element type rather than introducing a cast; mixing widths
-   here would compile but break the 128-bit double path (G5) further.
+#### The two traps, as hit
 
-Acceptance for RH-03 is the same four receipts as RH-01/RH-02 plus one extra:
-the packed-integer gate must run every lane width (i8/i16/i32/i64) × 128/256
-against a scalar reference, because a wrong lane width in the twin table is
-invisible to an instruction-count budget.
+1. **The key is the op, the guard is the register image.**  `__m128i` is
+   `long long __vector(2)` in `include/lcccsimd.h`, so `_mm_add_epi8`'s
+   arguments are i64x2 at the C level while the operation is per byte.  A
+   table keyed on (opcode, declared lane type) rejects every real call; a
+   table that INFERS the lane type from the declared type computes a
+   different function (byte add ≠ qword add: carries propagate).  The
+   implementation therefore keys on the pointer op (`Paddb128` → bytes) and
+   only requires each argument to be a dense 16/32-byte register image of the
+   right SIZE — which is exactly what a whole-register `VecLoad`/`VecStore`
+   copies.  `tests/simd/x86_int_map_registers.c` fails immediately if a row is
+   changed to a wider lane (verified by hand: `Paddb128 → VecAddI16x8` reports
+   four disagreeing lanes).
+2. **Bitwise twins are type-agnostic; arithmetic twins are not.**  `pand`,
+   `por`, `pxor` and the `_ps` bitwise forms can use any lane width (the
+   encoding is identical), so they are routed through the dword twins and
+   never through an arithmetic one.  Everything else names the twin whose lane
+   type is the operation's own.
+
+#### Two shapes deliberately NOT routed
+
+* **Shift counts outside the instruction's defined range.**  `psllw` defines
+  1..=15, `pslld` 1..=31, `psllq` 1..=63, and the twin's emitter `assert!`s on
+  anything else, while `_mm_slli_epi32(a, 0)` is a legal identity and
+  `_mm_slli_epi16(a, 17)` a legal zeroing shift.  Counts 0 and >width keep the
+  pointer path; the fixture executes all three cases against a reference that
+  implements Intel's over-wide semantics.
+* **i686.**  The 32-bit backend implements the value form of only a subset of
+  the twins (`emit_intrinsic` panics with "only the dest_ptr form is supported
+  here" for `VecMinU8x16` and friends), so the routing is x86-64 only and
+  `-m32` keeps the pointer path.  The gate runs the FULL value matrix for
+  i686 as well, which is what keeps that path honest.  Giving i686 the value
+  form of every twin is RH-03b.
+
+#### Non-vacuity
+
+`CCC_NO_NATIVE_PACKED_MAP=1` reverts the routing at the decision point (same
+spirit as `CCC_NO_VLFOLD`).  The gate uses it as a counterfactual on every
+run: the pre-fix lowering must cost 5/9 instructions again AND must still
+compute the same values.  A gate that could only ever pass would not be a
+gate, and a quality switch that changed a value would be a bug in the switch.
+
+#### New defect class found while measuring (RH-11, next)
+
+The pointer ops that have NO twin are worse than "5 instead of 2" — several are
+implemented as scalar lane loops in `include/smmintrin.h`, because no builtin
+exists for them at 128 bits:
+
+| intrinsic | today | GCC 16.2 | why |
+|---|---:|---:|---|
+| `_mm_min_epu16` | **103** | 2 | `pminuw` builtin absent; header loops over 8 lanes |
+| `_mm_max_epi32` | **48** | 2 | `pmaxsd` absent at 128 bits |
+| `_mm_min_epu32` | **37** | 2 | `pminud` absent at 128 bits (`VecMin/MaxU32x4` twins DO exist) |
+| `_mm_max_epi8` | 3 | 2 | `pmaxsb` absent; header does compare+blend |
+| `_mm_andnot_si128`, `_mm_avg_epu8`, `_mm_mulhi_epu16`, `_mm_adds_epi8`, `_mm_packs_epi16`, `_mm_unpacklo_epi8` | 5 | 2 | pointer form; no twin exists yet |
+| `_mm_shuffle_epi32` | 2 | 2 | already at parity |
+
+Fixing them means adding real encodings, not routing: `P{min,max}{uw,ud,sb,sd}{128,256}`
+(14 pointer ops), the six 128-bit twins that do not exist yet
+(`VecMinU8x16`-style: `VecMinI8x16`, `VecMaxI8x16`, `VecMinI32x4`,
+`VecMaxI32x4`, `VecMinU16x8`, `VecMaxU16x8` — the 256-bit twins all exist),
+emitter arms (`pminuw`/`pmaxuw`/`pminud`/`pmaxud`/`pminsb`/`pmaxsb`/
+`pminsd`/`pmaxsd`, SSE4.1 at 128, AVX2 at 256), the `__lccc_simd{128,256}_i_*`
+declarations in `include/lcccsimd.h`, and rewriting the ten header functions.
+The header-only workaround (`min(a,b) = a - subs_epu(a,b)`, or
+compare+`blendv`) was measured and rejected as the shipping answer: 8 and 11
+instructions respectively, where a real encoding is 2 — the tricks are a
+fallback for targets without SSE4.1, not a substitute for the component.
