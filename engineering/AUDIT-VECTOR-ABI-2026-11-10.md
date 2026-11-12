@@ -412,6 +412,17 @@ was the one use the first version did not classify, because it looked only at
 the tree that passes 16/32-byte vectors by value across the whole Clang 23.1.5
 grid on `-m32` and `-m64`, and it is what caught this.
 
+A second shape of the same lesson: the forwarded read must be a
+**whole-object** read.  Re-pointing a NARROW read of a parameter home -- `F32`
+out of a 16-byte vector home, which is exactly what the i686
+`_mm_cvtss_si64` emulation does (`float __x = __a[0]`) -- produced a
+miscompile that `tests/regression/sse_cvt_si64_rounding_i686.c` caught
+(`-m32 -msse2`: every `cvtss_si64` returned the integer indefinite).  The
+backend's direct-load home forwarding has never seen a narrow read of a vector
+home, and it is not this transform's job to invent that shape.  Forwarding now
+requires `read_width == memcpy.size` at offset 0 for `Load`,
+register-dest `VecLoad*` and `Memcpy { src }` alike.
+
 #### Two more defects found on the way
 
 1. **The AVX2 unsigned-16 extrema did not exist.**  `_mm256_min_epu16`,

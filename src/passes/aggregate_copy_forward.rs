@@ -1204,16 +1204,12 @@ fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
                         }
                         if d.0 == dest || derived.contains_key(&d.0) {
                             touches = true;
-                        } else if m_src.0 == dest
-                            || derived.get(&m_src.0).is_some_and(|off| {
-                                *off >= 0 && *off + *m_size as i64 <= size as i64
-                            })
-                        {
+                        } else if m_src.0 == dest || derived.get(&m_src.0).copied() == Some(0) {
                             // Reading the temporary as a copy SOURCE is a
                             // read like any other -- and the one use that
                             // used to slip through (i386 half-objects).
                             touches = true;
-                            read = true;
+                            read = *m_size as i64 == size as i64;
                         } else if derived.contains_key(&m_src.0) {
                             touches = true;
                         }
@@ -1223,12 +1219,17 @@ fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
                     }
                     Instruction::Load { ptr, ty, .. } => {
                         touches = ptr.0 == dest || derived.contains_key(&ptr.0);
-                        // A read through a GEP must stay inside the copied
-                        // bytes; `dest` itself is offset zero by definition.
-                        read = ptr.0 == dest
-                            || derived.get(&ptr.0).is_some_and(|off| {
-                                *off >= 0 && *off + type_size(*ty) <= size as i64
-                            });
+                        // WHOLE-OBJECT reads only.  A narrow read of a
+                        // parameter home (F32 out of a 16-byte vector home --
+                        // the i686 `_mm_cvtss_si64` emulation) is a shape the
+                        // backend's direct-load home forwarding has never
+                        // seen, and re-pointing it at the source turns a
+                        // correct snapshot into a miscompile.  A forwarded
+                        // read must therefore cover exactly the copied bytes.
+                        let off = derived.get(&ptr.0).copied().unwrap_or(0);
+                        read = (ptr.0 == dest || derived.contains_key(&ptr.0))
+                            && off == 0
+                            && type_size(*ty) == size as i64;
                     }
                     Instruction::GetElementPtr { dest: d, base, .. } => {
                         if d.0 == dest {
@@ -1248,7 +1249,7 @@ fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
                             // addresses the temporary; other destinations are
                             // covered by the intervening-write barrier below.
                             touches = store_ptr.0 == dest || derived.contains_key(&store_ptr.0);
-                        } else if let Some((is_store, _, base, index, disp)) =
+                        } else if let Some((is_store, w_bytes, base, index, disp)) =
                             super::alias::vec_intrinsic_access(op, args)
                         {
                             let Operand::Value(base_id) = base else {
@@ -1262,11 +1263,12 @@ fn forward_memcpy_filled_reads(func: &mut IrFunction) -> usize {
                             if base_id.0 == dest || derived.contains_key(&base_id.0) {
                                 touches = true;
                                 let inner = derived.get(&base_id.0).copied().unwrap_or(0);
+                                // Same whole-object rule as `Load` above.
                                 read = !is_store
                                     && disp == 0
                                     && offset == Some(0)
                                     && inner == 0
-                                    && size > 0;
+                                    && w_bytes == size as i64;
                             }
                         }
                     }
