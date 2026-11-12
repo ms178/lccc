@@ -192,7 +192,11 @@ check() {
     fi
 }
 
-# Register-resident shapes: one packed instruction plus `ret`.
+# Register-resident shapes: one packed instruction plus `ret`.  The last eight
+# are the RH-11 remainder (`pandn`, `pavgb`, `pmulhuw`, `paddsb`, `packsswb`,
+# `punpcklbw` at 128 bits, `pandn`/`punpcklbw` at 256): they had no register
+# twin at all, so every one of them paid a frame and a memory-form operand
+# (5 instructions) for a single packed instruction.
 for name in map_add8_128 map_add8_256 map_and_128 map_and_256 \
             map_shift_128 map_shift_256 map_cmp_128 map_cmp_256 \
             map_mul16_128 map_mul32_256 map_min_128 map_max_256 \
@@ -200,7 +204,10 @@ for name in map_add8_128 map_add8_256 map_and_128 map_and_256 \
             map_min_epi32_128 map_max_epi32_128 \
             map_min_epu32_128 map_max_epu32_128 \
             map_min_epi8_256 map_max_epi8_256 \
-            map_min_epu32_256 map_max_epu32_256; do
+            map_min_epu32_256 map_max_epu32_256 \
+            map_andnot_128 map_avg_128 map_mulhi_128 map_adds_128 \
+            map_packs_128 map_unpacklo_128 \
+            map_andnot_256 map_unpacklo_256; do
     check "$name" 2 1
 done
 # Memory-operand shapes: the folded load, the operation, `ret`.  The other
@@ -239,7 +246,7 @@ if [ "$EXPECT_DEFECT" = 1 ]; then
     echo "FAIL: --expect-defect expected an overrun and found none" >&2
     exit 1
 fi
-echo "  ok  every counted shape is register-homed (22 at parity, 3 memory forms, 4 wrappers)"
+echo "  ok  every counted shape is register-homed (30 at parity, 3 memory forms, 4 wrappers)"
 
 # --- 5. counterfactual -----------------------------------------------------
 # `CCC_NO_NATIVE_PACKED_MAP` reverts the routing at the one place that makes
@@ -253,7 +260,8 @@ if [ -z "${CCC_NO_NATIVE_PACKED_MAP-}" ]; then
         || { echo "FAIL: cannot emit the counterfactual assembly" >&2
              cat "$WORK/cc3.log" >&2; exit 1; }
     for name in map_add8_128 map_add8_256 map_cmp_256 \
-                map_max_epi32_128 map_min_epu32_128 map_max_epi8_128; do
+                map_max_epi32_128 map_min_epu32_128 map_max_epi8_128 \
+                map_andnot_128 map_packs_128 map_unpacklo_256; do
         off_body=$(awk -v F="$name:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$WORK/off.s")
         off_n=$(count "$off_body")
         if [ "$off_n" -le 2 ]; then

@@ -1715,6 +1715,14 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAddI8x16
             | O::VecSubI8x16
             | O::VecMinU8x16
+            | O::VecAndNotI32x4
+            | O::VecAvgU8x16
+            | O::VecMulHiU16x8
+            | O::VecAddSatI8x16
+            | O::VecPacksswbI16x8
+            | O::VecUnpackLoI8x16
+            | O::VecAndNotI32x8
+            | O::VecUnpackLoI8x32
             | O::VecMaxU8x16
             | O::VecMinI8x16
             | O::VecMaxI8x16
@@ -2001,6 +2009,14 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecSubI8x16
             | O::VecCmpI8x16
             | O::VecMinU8x16
+            | O::VecAndNotI32x4
+            | O::VecAvgU8x16
+            | O::VecMulHiU16x8
+            | O::VecAddSatI8x16
+            | O::VecPacksswbI16x8
+            | O::VecUnpackLoI8x16
+            | O::VecAndNotI32x8
+            | O::VecUnpackLoI8x32
             | O::VecMaxU8x16
             | O::VecMinI8x16
             | O::VecMaxI8x16
@@ -2505,6 +2521,14 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // Integer min/max has none of the FP unordered/signed-zero
         // asymmetry — commutative.
         | O::VecMinU8x16
+        | O::VecAndNotI32x4
+        | O::VecAvgU8x16
+        | O::VecMulHiU16x8
+        | O::VecAddSatI8x16
+        | O::VecPacksswbI16x8
+        | O::VecUnpackLoI8x16
+        | O::VecAndNotI32x8
+        | O::VecUnpackLoI8x32
         | O::VecMaxU8x16
         | O::VecMinI8x16
         | O::VecMaxI8x16

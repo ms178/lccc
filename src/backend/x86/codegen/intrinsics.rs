@@ -4156,6 +4156,7 @@ impl X86Codegen {
             | IntrinsicOp::Punpckldq128
             | IntrinsicOp::Punpckhdq128
             | IntrinsicOp::Punpcklqdq128
+            | IntrinsicOp::Punpckhqdq128
             | IntrinsicOp::Pminud128
             | IntrinsicOp::Pmaxud128
             | IntrinsicOp::Pminsd128
@@ -7399,6 +7400,53 @@ impl X86Codegen {
             IntrinsicOp::VecMaxI8x16 => {
                 if let Some(d) = dest {
                     self.emit_sminmax_i8x16(d, args, true);
+                }
+            }
+            // The six SSE2 singles that had no register twin (RH-11): each is
+            // one instruction, and each operand order below is the C-level
+            // one, because several of these are NOT commutative or NOT
+            // symmetric in their arguments (`pandn` negates args[0];
+            // `packsswb`'s low half comes from args[0]; `punpcklbw`
+            // interleaves low bytes in operand order).
+            IntrinsicOp::VecAndNotI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pandn");
+                }
+            }
+            IntrinsicOp::VecAvgU8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pavgb");
+                }
+            }
+            IntrinsicOp::VecMulHiU16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pmulhuw");
+                }
+            }
+            IntrinsicOp::VecAddSatI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "paddsb");
+                }
+            }
+            IntrinsicOp::VecPacksswbI16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "packsswb");
+                }
+            }
+            IntrinsicOp::VecUnpackLoI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "punpcklbw");
+                }
+            }
+            IntrinsicOp::VecAndNotI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpandn", false);
+                }
+            }
+            IntrinsicOp::VecUnpackLoI8x32 => {
+                if let Some(d) = dest {
+                    // Per-128-bit-lane interleave, like the intrinsic itself.
+                    self.emit_avx_binary_256(d, args, "vpunpcklbw", false);
                 }
             }
             // BB-SLP packed lane shifts by a uniform constant. The VEX

@@ -849,6 +849,14 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Pmaxsd128 => (VecSmaxI32x4, IrType::I32, 16, Binary),
         Pminsb128 => (VecMinI8x16, IrType::I8, 16, Binary),
         Pmaxsb128 => (VecMaxI8x16, IrType::I8, 16, Binary),
+        // The six SSE2 singles that had no twin at all: one row each turns a
+        // spilled pointer form (5 instructions) into the encoding itself (2).
+        Pandn128 => (VecAndNotI32x4, IrType::I32, 16, Binary),
+        Pavgb128 => (VecAvgU8x16, IrType::U8, 16, Binary),
+        Pmulhuw128 => (VecMulHiU16x8, IrType::U16, 16, Binary),
+        Paddsb128 => (VecAddSatI8x16, IrType::I8, 16, Binary),
+        Packsswb128 => (VecPacksswbI16x8, IrType::I16, 16, Binary),
+        Punpcklbw128 => (VecUnpackLoI8x16, IrType::I8, 16, Binary),
         // Unsigned 16-bit saturating subtract — the only SATURATING map op in
         // the register set.  It is also what makes the missing `pminuw` /
         // `pmaxuw` encodings expressible without one:
@@ -879,6 +887,8 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Pmaxud256 => (VecMaxU32x8, IrType::U32, 32, Binary),
         Pminsb256 => (VecMinI8x32, IrType::I8, 32, Binary),
         Pmaxsb256 => (VecMaxI8x32, IrType::I8, 32, Binary),
+        Pandn256 => (VecAndNotI32x8, IrType::I32, 32, Binary),
+        Punpcklbw256 => (VecUnpackLoI8x32, IrType::I8, 32, Binary),
         Psubusw256 => (VecSubSatU16x16, IrType::I16, 32, Binary),
 
         _ => return None,

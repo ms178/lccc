@@ -1059,6 +1059,32 @@ pub enum IntrinsicOp {
     VecMinI8x16,
     /// SSE4.1 lane-wise SIGNED byte max at 128 bits: 16×I8 (`pmaxsb`).
     VecMaxI8x16,
+    // ---- The six SSE2 singles that had no register twin (RH-11) ----
+    //
+    // Each is ONE instruction whose pointer form (`pandn`, `pavgb`,
+    // `pmulhuw`, `paddsb`, `packsswb`, `punpcklbw`) took two addresses and a
+    // result address, so every register-resident operand was spilled into a
+    // frame slot first: 5 instructions where GCC needs 2.  These are the
+    // register-valued twins, at both widths where the pointer op exists.
+    /// `dst = (~a) & b`: `pandn`.  NOT `(a & ~b)` — the negated operand is
+    /// `args[0]`, which is what the encoding does in place.
+    VecAndNotI32x4,
+    /// Unsigned byte average with rounding up: `(a + b + 1) >> 1`, `pavgb`.
+    VecAvgU8x16,
+    /// High 16 bits of each unsigned word product: `pmulhuw`.
+    VecMulHiU16x8,
+    /// Signed saturating byte add: `paddsb` (`min(max(a+b, -128), 127)`).
+    VecAddSatI8x16,
+    /// Saturate 8 signed words from each operand into 8 bytes: `packsswb`.
+    /// args = [lo, hi]; the result's low half comes from `args[0]`.
+    VecPacksswbI16x8,
+    /// Interleave the low bytes of both operands: `punpcklbw`.
+    VecUnpackLoI8x16,
+    /// 256-bit `vpandn` twin of `VecAndNotI32x4`.
+    VecAndNotI32x8,
+    /// 256-bit `vpunpcklbw` twin of `VecUnpackLoI8x16`: the interleave is
+    /// PER 128-BIT LANE, exactly like the `_mm256_unpacklo_epi8` intrinsic.
+    VecUnpackLoI8x32,
     /// AVX2 byte splat from a GPR/XMM lane: 32×I8 (`vpbroadcastb`).
     ///
     /// Only needed for RUNTIME byte invariants; a CONSTANT byte reaches all
@@ -2259,6 +2285,7 @@ impl IntrinsicOp {
             | VecLoadI8x32 | VecBroadcastI8x32
             | VecCmpI8x32 | VecBlendvI8x32 | VecMinU8x32 | VecMaxU8x32
             | VecMinI8x32 | VecMaxI8x32
+            | VecAndNotI32x8 | VecUnpackLoI8x32
             | VecAddI8x32 | VecSubI8x32 | VecAndI8x32 | VecOrI8x32 | VecXorI8x32
             | VecAddI16x16
             | VecSubI16x16
@@ -2394,6 +2421,8 @@ impl IntrinsicOp {
             // SSE4.1 signed byte extrema: the 128-bit twins of
             // `VecMinI8x32`/`VecMaxI8x32` (16×I8 = 16 bytes).
             | VecMinI8x16 | VecMaxI8x16
+            | VecAndNotI32x4 | VecAvgU8x16 | VecMulHiU16x8 | VecAddSatI8x16
+            | VecPacksswbI16x8 | VecUnpackLoI8x16
             | VecBroadcastI8x16
             | VecAddI16x8
             | VecSubI16x8
@@ -2555,6 +2584,14 @@ impl IntrinsicOp {
             | IntrinsicOp::VecMaxI8x32
             | IntrinsicOp::VecMinI8x16
             | IntrinsicOp::VecMaxI8x16
+            | IntrinsicOp::VecAndNotI32x4
+            | IntrinsicOp::VecAvgU8x16
+            | IntrinsicOp::VecMulHiU16x8
+            | IntrinsicOp::VecAddSatI8x16
+            | IntrinsicOp::VecPacksswbI16x8
+            | IntrinsicOp::VecUnpackLoI8x16
+            | IntrinsicOp::VecAndNotI32x8
+            | IntrinsicOp::VecUnpackLoI8x32
             | IntrinsicOp::VecMinI16x16
             | IntrinsicOp::VecMaxI16x16
             | IntrinsicOp::VecMinU16x16
@@ -2881,6 +2918,14 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecMaxI8x32
                 | IntrinsicOp::VecMinI8x16
                 | IntrinsicOp::VecMaxI8x16
+                | IntrinsicOp::VecAndNotI32x4
+                | IntrinsicOp::VecAvgU8x16
+                | IntrinsicOp::VecMulHiU16x8
+                | IntrinsicOp::VecAddSatI8x16
+                | IntrinsicOp::VecPacksswbI16x8
+                | IntrinsicOp::VecUnpackLoI8x16
+                | IntrinsicOp::VecAndNotI32x8
+                | IntrinsicOp::VecUnpackLoI8x32
                 | IntrinsicOp::VecBroadcastI8x32
                 | IntrinsicOp::VecBroadcastI8x16
                 | IntrinsicOp::VecAddI16x16
@@ -3572,6 +3617,14 @@ mod vector_width_tests {
             "VecMinI8x32" => IntrinsicOp::VecMinI8x32,
             "VecMaxI8x16" => IntrinsicOp::VecMaxI8x16,
             "VecMinI8x16" => IntrinsicOp::VecMinI8x16,
+            "VecAndNotI32x4" => IntrinsicOp::VecAndNotI32x4,
+            "VecAvgU8x16" => IntrinsicOp::VecAvgU8x16,
+            "VecMulHiU16x8" => IntrinsicOp::VecMulHiU16x8,
+            "VecAddSatI8x16" => IntrinsicOp::VecAddSatI8x16,
+            "VecPacksswbI16x8" => IntrinsicOp::VecPacksswbI16x8,
+            "VecUnpackLoI8x16" => IntrinsicOp::VecUnpackLoI8x16,
+            "VecAndNotI32x8" => IntrinsicOp::VecAndNotI32x8,
+            "VecUnpackLoI8x32" => IntrinsicOp::VecUnpackLoI8x32,
             "VecSubI32x4" => IntrinsicOp::VecSubI32x4,
             "VecSubI32x8" => IntrinsicOp::VecSubI32x8,
             "VecShlvI32x8" => IntrinsicOp::VecShlvI32x8,

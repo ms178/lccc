@@ -4081,7 +4081,18 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Phaddw256
         | BuiltinIntrinsic::X86Phaddd256
         | BuiltinIntrinsic::X86Pabsd256
-        | BuiltinIntrinsic::X86Pmuludq256 => X86IntrinsicKind::Vec256,
+        | BuiltinIntrinsic::X86Pmuludq256
+        // The RH-11 AVX2 extrema.  They were added to the op table and the
+        // backend, but not here, so they fell into the `_ => Vec128`
+        // catch-all: the result temp was 16 bytes while `vpminsb %ymm` wrote
+        // 32 into it, corrupting whatever the stack layout placed next.  The
+        // miscompile only showed when the op took its POINTER path (the value
+        // form skips the temp entirely), which is exactly what
+        // `check_x86_intrinsic_kind_width.py` now forbids.
+        | BuiltinIntrinsic::X86Pminsb256
+        | BuiltinIntrinsic::X86Pmaxsb256
+        | BuiltinIntrinsic::X86Pminud256
+        | BuiltinIntrinsic::X86Pmaxud256 => X86IntrinsicKind::Vec256,
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
         // Native C vectors share object-address IR carriers on both x86 modes.
         BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => X86IntrinsicKind::Vec128,

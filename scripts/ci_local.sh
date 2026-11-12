@@ -1425,6 +1425,28 @@ gate "intrinsic-arity-selftest" fast \
     python3 scripts/check_intrinsic_arity.py --self-test
 gate "intrinsic-arity" fast \
     python3 scripts/check_intrinsic_arity.py --check
+
+# Every pointer-form intrinsic must reach a lowering.  The x86/i686 emitters
+# decide WHETHER an op reaches an arm with the outer match pattern and WHICH
+# instruction it becomes with an inner mnemonic match; when a refactor drops an
+# op from the outer list it falls through to the catch-all and ICEs at run time
+# ("unhandled intrinsic op Punpckhqdq128") -- and only for the pointer form, so
+# a register-routed fixture never sees it.  This check compares the two lists
+# for every table arm in both backends.
+gate "intrinsic-lowering-coverage-selftest" fast \
+    python3 scripts/check_intrinsic_lowering_coverage.py --self-test
+gate "intrinsic-lowering-coverage" fast \
+    python3 scripts/check_intrinsic_lowering_coverage.py
+
+# A 256-bit GCC builtin's result temporary is sized from `x86_intrinsic_kind`
+# (Vec128 -> 16 bytes) while the backend writes it at its `vector_home_width`
+# (32 bytes).  A 256-bit op missing from the Vec256 arm therefore stores 32
+# bytes into a 16-byte slot: silent stack corruption that surfaces as
+# "the upper 128-bit lane is garbage".
+gate "x86-intrinsic-kind-width-selftest" fast \
+    python3 scripts/check_x86_intrinsic_kind_width.py --self-test
+gate "x86-intrinsic-kind-width" fast \
+    python3 scripts/check_x86_intrinsic_kind_width.py
 gate "ill-typed-builtins" fast \
     env CCC="$LCCC" LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
 

@@ -1128,6 +1128,16 @@ jobs:
         set -euo pipefail
         python3 scripts/check_intrinsic_arity.py --self-test
         python3 scripts/check_intrinsic_arity.py --check
+    - name: Intrinsic lowering tables are complete (outer pattern vs mnemonic)
+      run: |
+        set -euo pipefail
+        python3 scripts/check_intrinsic_lowering_coverage.py --self-test
+        python3 scripts/check_intrinsic_lowering_coverage.py
+    - name: 256-bit builtin result widths agree with the op table
+      run: |
+        set -euo pipefail
+        python3 scripts/check_x86_intrinsic_kind_width.py --self-test
+        python3 scripts/check_x86_intrinsic_kind_width.py
     - name: GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)
       run: |
         set -o pipefail

@@ -166,6 +166,45 @@ __attribute__((noinline)) __m256i map_max_epu32_256(__m256i a, __m256i b) {
     return _mm256_max_epu32(a, b);
 }
 
+/* The twinless byte/word families (RH-11 remainder).  Each of these had NO
+   register twin in the map table, so `_mm_andnot_si128(a, b)` lowered through
+   the pointer form: `movdqu` into a frame home, a memory-form `vpandn`, and
+   the frame itself -- 5 instructions against GCC's 2.  Their results are not
+   arithmetic on the operand bytes in a form `ref_eval` models (saturation,
+   rounding, cross-byte products, lane-local shuffles), so each one also
+   carries its own reference below. */
+__attribute__((noinline)) __m128i map_andnot_128(__m128i a, __m128i b) {
+    return _mm_andnot_si128(a, b);
+}
+
+__attribute__((noinline)) __m128i map_avg_128(__m128i a, __m128i b) {
+    return _mm_avg_epu8(a, b);
+}
+
+__attribute__((noinline)) __m128i map_mulhi_128(__m128i a, __m128i b) {
+    return _mm_mulhi_epu16(a, b);
+}
+
+__attribute__((noinline)) __m128i map_adds_128(__m128i a, __m128i b) {
+    return _mm_adds_epi8(a, b);
+}
+
+__attribute__((noinline)) __m128i map_packs_128(__m128i a, __m128i b) {
+    return _mm_packs_epi16(a, b);
+}
+
+__attribute__((noinline)) __m128i map_unpacklo_128(__m128i a, __m128i b) {
+    return _mm_unpacklo_epi8(a, b);
+}
+
+__attribute__((noinline)) __m256i map_andnot_256(__m256i a, __m256i b) {
+    return _mm256_andnot_si256(a, b);
+}
+
+__attribute__((noinline)) __m256i map_unpacklo_256(__m256i a, __m256i b) {
+    return _mm256_unpacklo_epi8(a, b);
+}
+
 /* Memory-operand shapes: one operand arrives from memory.  The other is a
    by-value vector parameter, whose frame home is an ABI fact (RH-04), so the
    budget is one instruction above the register shapes. */
@@ -353,6 +392,111 @@ static void check_shift(const char *what, const unsigned char *got,
 }
 
 /* `pcmp{eq,gt}X` produce an all-ones lane where the comparison holds. */
+/* ---- byte-image reference for the saturation/rounding/shuffle families -- */
+
+enum refbyte {
+    RB_ANDNOT,  /* (~a) & b, per byte */
+    RB_AVG,     /* (a + b + 1) >> 1, unsigned bytes */
+    RB_MULHI,   /* high half of the UNSIGNED 16x16 product, per word */
+    RB_ADDS,    /* signed saturating byte add */
+    RB_PACKS,   /* signed words -> signed bytes, low half from a, high from b */
+    RB_UNPACKLO /* low 8 bytes of each 128-bit lane, a0 b0 a1 b1 ... */
+};
+
+/* Saturating add of two INT8 lanes, reported as its byte image. */
+static unsigned char sat_byte(unsigned char av, unsigned char bv) {
+    int sum = (int)(signed char)av + (int)(signed char)bv;
+    if (sum > 127) {
+        sum = 127;
+    }
+    if (sum < -128) {
+        sum = -128;
+    }
+    return (unsigned char)sum;
+}
+
+static int word_at(const unsigned char *p, int i) {
+    return (int)(short)((unsigned)p[i] | ((unsigned)p[i + 1] << 8));
+}
+
+static void ref_image(int op, unsigned char *out, const unsigned char *a,
+                      const unsigned char *b, int width) {
+    int i;
+    for (i = 0; i < width; i++) {
+        out[i] = 0;
+    }
+    switch (op) {
+    case RB_ANDNOT:
+        for (i = 0; i < width; i++) {
+            out[i] = (unsigned char)(~a[i] & b[i]);
+        }
+        break;
+    case RB_AVG:
+        for (i = 0; i < width; i++) {
+            out[i] = (unsigned char)(((unsigned)a[i] + (unsigned)b[i] + 1) >> 1);
+        }
+        break;
+    case RB_MULHI:
+        for (i = 0; i + 1 < width; i += 2) {
+            unsigned prod = (unsigned)((unsigned)a[i] | ((unsigned)a[i + 1] << 8)) *
+                            (unsigned)((unsigned)b[i] | ((unsigned)b[i + 1] << 8));
+            unsigned hi = prod >> 16;
+            out[i] = (unsigned char)(hi & 0xffu);
+            out[i + 1] = (unsigned char)(hi >> 8);
+        }
+        break;
+    case RB_ADDS:
+        for (i = 0; i < width; i++) {
+            out[i] = sat_byte(a[i], b[i]);
+        }
+        break;
+    case RB_PACKS:
+        /* `packsswb` is LANE-LOCAL: each 128-bit lane packs the eight words of
+           the first operand into its low eight bytes and the eight words of
+           the second into its high eight.  A 256-bit form that packed across
+           the lane boundary would still pass a "some bytes saturated" test, so
+           the byte ORDER is part of the reference. */
+        for (i = 0; i + 15 < width; i += 16) {
+            int j;
+            for (j = 0; j < 8; j++) {
+                int w = word_at(a, i + 2 * j);
+                out[i + j] = (unsigned char)(w > 127 ? 127 : (w < -128 ? -128 : w));
+            }
+            for (j = 0; j < 8; j++) {
+                int w = word_at(b, i + 2 * j);
+                out[i + 8 + j] = (unsigned char)(w > 127 ? 127 : (w < -128 ? -128 : w));
+            }
+        }
+        break;
+    case RB_UNPACKLO:
+        /* Also lane-local: the low eight bytes of EACH 128-bit lane, in operand
+           order, interleaved byte by byte. */
+        for (i = 0; i + 15 < width; i += 16) {
+            int j;
+            for (j = 0; j < 8; j++) {
+                out[i + 2 * j] = a[i + j];
+                out[i + 2 * j + 1] = b[i + j];
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void check_image(const char *what, const unsigned char *got,
+                        const unsigned char *a, const unsigned char *b,
+                        int width, int op) {
+    unsigned char want[32];
+    int i;
+    ref_image(op, want, a, b, width);
+    for (i = 0; i < width; i++) {
+        if (got[i] != want[i]) {
+            report(what, i, got[i], want[i]);
+        }
+    }
+}
+
 static void check_cmp(const char *what, const unsigned char *got,
                       const unsigned char *a, const unsigned char *b,
                       int bytes, int lanes, int greater) {
@@ -402,6 +546,26 @@ static void check_cmp(const char *what, const unsigned char *got,
         r = FN(va, vb);                                                        \
         check_map(NAME, (const unsigned char *)&r, A256, B256, BYTES, LANES,   \
                   OP);                                                         \
+    } while (0)
+
+/* Byte-image families: the result is compared against `ref_image` byte by
+   byte, because these six compute no per-lane arithmetic `ref_eval` models. */
+#define RUN_IMAGE128(NAME, FN, OP)                                             \
+    do {                                                                       \
+        __m128i va, vb, r;                                                     \
+        memcpy(&va, A128, 16);                                                 \
+        memcpy(&vb, B128, 16);                                                 \
+        r = FN(va, vb);                                                        \
+        check_image(NAME, (const unsigned char *)&r, A128, B128, 16, OP);      \
+    } while (0)
+
+#define RUN_IMAGE256(NAME, FN, OP)                                             \
+    do {                                                                       \
+        __m256i va, vb, r;                                                     \
+        memcpy(&va, A256, 32);                                                 \
+        memcpy(&vb, B256, 32);                                                 \
+        r = FN(va, vb);                                                        \
+        check_image(NAME, (const unsigned char *)&r, A256, B256, 32, OP);      \
     } while (0)
 
 #define RUN_SHIFT128(NAME, FN, BYTES, LANES, ARITH, RIGHT, COUNT)              \
@@ -570,6 +734,22 @@ int main(void) {
     RUN_MAP256("min_epu32_256", _mm256_min_epu32, REF_MINU, 4, 8);
     RUN_MAP256("max_epu32_256", _mm256_max_epu32, REF_MAXU, 4, 8);
     RUN_MAP256("min_epi32_256", _mm256_min_epi32, REF_MINS, 4, 8);
+
+    /* ---- byte-image families (RH-11 remainder) ------------------------ */
+    /* `pandn`, `pavgb`, `pmulhuw`, `paddsb`, `packsswb`, `punpcklbw` and
+       their AVX2 forms.  Each is a function of the operand BYTES that no
+       instruction count can verify: `pandn` negates its FIRST operand (a
+       swapped pair computes a different function at the same cost), `pavgb`
+       rounds up, `paddsb` saturates, and the two lane-local shuffles have to
+       keep their 128-bit lane boundaries. */
+    RUN_IMAGE128("andnot_si128", map_andnot_128, RB_ANDNOT);
+    RUN_IMAGE128("avg_epu8", map_avg_128, RB_AVG);
+    RUN_IMAGE128("mulhi_epu16", map_mulhi_128, RB_MULHI);
+    RUN_IMAGE128("adds_epi8", map_adds_128, RB_ADDS);
+    RUN_IMAGE128("packs_epi16", map_packs_128, RB_PACKS);
+    RUN_IMAGE128("unpacklo_epi8", map_unpacklo_128, RB_UNPACKLO);
+    RUN_IMAGE256("andnot_si256", map_andnot_256, RB_ANDNOT);
+    RUN_IMAGE256("unpacklo_epi8_256", map_unpacklo_256, RB_UNPACKLO);
 
     /* ---- immediate shifts -------------------------------------------- */
     RUN_SHIFT128("slli_epi16_3", _mm_slli_epi16, 2, 8, 0, 0, 3);

@@ -741,7 +741,13 @@ impl I686Codegen {
             | IntrinsicOp::Pminsd128
             | IntrinsicOp::Pmaxsd128
             | IntrinsicOp::Pminsb128
-            | IntrinsicOp::Pmaxsb128 => {
+            | IntrinsicOp::Pmaxsb128
+            | IntrinsicOp::VecAndNotI32x4
+            | IntrinsicOp::VecAvgU8x16
+            | IntrinsicOp::VecMulHiU16x8
+            | IntrinsicOp::VecAddSatI8x16
+            | IntrinsicOp::VecPacksswbI16x8
+            | IntrinsicOp::VecUnpackLoI8x16 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::Paddw128 => "paddw",
@@ -796,6 +802,16 @@ impl I686Codegen {
                         IntrinsicOp::Pmaxsd128 => "pmaxsd",
                         IntrinsicOp::Pminsb128 => "pminsb",
                         IntrinsicOp::Pmaxsb128 => "pmaxsb",
+                        // RH-11 remainder: the twinless mixed-width wrappers
+                        // (`_mm_andnot_si128` etc.) that used to lower through
+                        // their scalar header loops; one mnemonic per op keeps
+                        // the pointer form a single instruction on i686 too.
+                        IntrinsicOp::VecAndNotI32x4 => "pandn",
+                        IntrinsicOp::VecAvgU8x16 => "pavgb",
+                        IntrinsicOp::VecMulHiU16x8 => "pmulhuw",
+                        IntrinsicOp::VecAddSatI8x16 => "paddsb",
+                        IntrinsicOp::VecPacksswbI16x8 => "packsswb",
+                        IntrinsicOp::VecUnpackLoI8x16 => "punpcklbw",
                         _ => unreachable!("unexpected SSE binary op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
@@ -1849,7 +1865,9 @@ impl I686Codegen {
             | IntrinsicOp::Punpckldq256
             | IntrinsicOp::Punpckhdq256
             | IntrinsicOp::Punpcklqdq256
-            | IntrinsicOp::Punpckhqdq256 => {
+            | IntrinsicOp::Punpckhqdq256
+            | IntrinsicOp::VecAndNotI32x8
+            | IntrinsicOp::VecUnpackLoI8x32 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::Paddb256 => "vpaddb",
@@ -1899,6 +1917,8 @@ impl I686Codegen {
                         IntrinsicOp::Punpckhdq256 => "vpunpckhdq",
                         IntrinsicOp::Punpcklqdq256 => "vpunpcklqdq",
                         IntrinsicOp::Punpckhqdq256 => "vpunpckhqdq",
+                        IntrinsicOp::VecAndNotI32x8 => "vpandn",
+                        IntrinsicOp::VecUnpackLoI8x32 => "vpunpcklbw",
                         _ => unreachable!("unexpected AVX2 integer binary op: {:?}", op),
                     };
                     self.emit_avx_binary_256(dptr, args, inst);

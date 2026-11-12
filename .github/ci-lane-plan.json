@@ -1529,7 +1529,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 353.18,
+      "predicted_gate_seconds": 353.68,
       "shards": 3,
       "steps": [
         {
@@ -1747,6 +1747,14 @@
         {
           "measured_s": 0.25,
           "name": "Intrinsic arity table matches the headers"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Intrinsic lowering tables are complete (outer pattern vs mnemonic)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "256-bit builtin result widths agree with the op table"
         },
         {
           "measured_s": 56.0,

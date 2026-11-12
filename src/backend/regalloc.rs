@@ -8420,6 +8420,14 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecSubI8x16
                 | O::VecCmpI8x16
                 | O::VecMinU8x16
+                | O::VecAndNotI32x4
+                | O::VecAvgU8x16
+                | O::VecMulHiU16x8
+                | O::VecAddSatI8x16
+                | O::VecPacksswbI16x8
+                | O::VecUnpackLoI8x16
+                | O::VecAndNotI32x8
+                | O::VecUnpackLoI8x32
                 | O::VecMaxU8x16
                 | O::VecMinI8x16
                 | O::VecMaxI8x16
@@ -8680,6 +8688,14 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
         | O::VecCmpI8x16
         | O::VecMinU8x32
         | O::VecMinU8x16
+        | O::VecAndNotI32x4
+        | O::VecAvgU8x16
+        | O::VecMulHiU16x8
+        | O::VecAddSatI8x16
+        | O::VecPacksswbI16x8
+        | O::VecUnpackLoI8x16
+        | O::VecAndNotI32x8
+        | O::VecUnpackLoI8x32
         | O::VecMaxU8x32
         | O::VecMaxU8x16
         | O::VecMinI8x16
@@ -9042,6 +9058,14 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecAddI8x16
             | O::VecSubI8x16
             | O::VecMinU8x16
+            | O::VecAndNotI32x4
+            | O::VecAvgU8x16
+            | O::VecMulHiU16x8
+            | O::VecAddSatI8x16
+            | O::VecPacksswbI16x8
+            | O::VecUnpackLoI8x16
+            | O::VecAndNotI32x8
+            | O::VecUnpackLoI8x32
             | O::VecMaxU8x16
             | O::VecMinI8x16
             | O::VecMaxI8x16
@@ -10800,6 +10824,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecSubI8x16
                                 | O::VecBlendvI8x16
                                 | O::VecMinU8x16
+                                | O::VecAndNotI32x4
+                                | O::VecAvgU8x16
+                                | O::VecMulHiU16x8
+                                | O::VecAddSatI8x16
+                                | O::VecPacksswbI16x8
+                                | O::VecUnpackLoI8x16
+                                | O::VecAndNotI32x8
+                                | O::VecUnpackLoI8x32
                                 | O::VecMaxU8x16
                                 | O::VecMinI8x16
                                 | O::VecMaxI8x16
@@ -11007,6 +11039,71 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
 /// Loop-invariant map broadcasts whose only uses are same-width packed
 /// arithmetic. Transient map loads stay in the emitter's `%ymm0` deferred
 /// chain; these live across every iteration.
+/// Class-6 consumers of the x86 map-broadcast homing pass: the 128-bit
+/// integer map ops that read their `VecBroadcastI32x4` / `I8x16` / `I16x8`
+/// splat through a register (`sse_load_arg` consults `reg_assignments`, and
+/// `vec_home_128` stages it) instead of re-reading it from the stack.
+///
+/// Extracted verbatim from `collect_x86_map_broadcast_values`'s
+/// `legal_consumer` closure: the list is unchanged apart from the RH-11
+/// byte-lane additions, and moving it out keeps that function under the
+/// audit-census 300-line ceiling.
+fn is_x86_map_int_consumer_128(op: &IntrinsicOp) -> bool {
+    matches!(
+        op,
+        IntrinsicOp::StrictRecipMulAddPackedF64x4
+            | IntrinsicOp::VecMulI32x4
+            | IntrinsicOp::VecAddI32x4
+            // 128-bit masked reduction steps: the hoisted splat is
+            // the guard (guard slot only, enforced below), read via
+            // `vec_home_128` or staged with `sse_load_arg`.
+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
+            | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
+            | IntrinsicOp::VecMaskedAddValueI32x4
+            | IntrinsicOp::VecCmpI32x4
+            | IntrinsicOp::VecCmpI64x2
+            | IntrinsicOp::VecBlendvI32x4
+            // Bitwise lane maps: the broadcast is the operand of
+            // `x & K` / `x | K` / `x ^ K`, including the `mask & K`
+            // the select strength reduction produces.  These were
+            // missing, so a broadcast feeding a `vpand` was not
+            // recognised as a map broadcast, got no register home,
+            // and was re-read from the STACK every iteration.
+            | IntrinsicOp::VecAndI32x4
+            | IntrinsicOp::VecOrI32x4
+            | IntrinsicOp::VecXorI32x4
+            | IntrinsicOp::VecSubI32x4
+            | IntrinsicOp::VecShlvI32x4
+            | IntrinsicOp::VecLShrvI32x4
+            | IntrinsicOp::VecAShrvI32x4
+            | IntrinsicOp::VecShlvI64x2
+            | IntrinsicOp::VecLShrvI64x2
+            | IntrinsicOp::VecAddI8x16
+            | IntrinsicOp::VecSubI8x16
+            | IntrinsicOp::VecCmpI8x16
+            | IntrinsicOp::VecMinU8x16
+            | IntrinsicOp::VecAndNotI32x4
+            | IntrinsicOp::VecAvgU8x16
+            | IntrinsicOp::VecMulHiU16x8
+            | IntrinsicOp::VecAddSatI8x16
+            | IntrinsicOp::VecPacksswbI16x8
+            | IntrinsicOp::VecUnpackLoI8x16
+            | IntrinsicOp::VecAndNotI32x8
+            | IntrinsicOp::VecUnpackLoI8x32
+            | IntrinsicOp::VecMaxU8x16 | IntrinsicOp::VecMinI8x16 | IntrinsicOp::VecMaxI8x16
+            | IntrinsicOp::VecBlendvI8x16
+            // Word lanes (OP-05g) share the 128-bit integer class.
+            | IntrinsicOp::VecAddI16x8
+            | IntrinsicOp::VecSubI16x8
+            | IntrinsicOp::VecSubSatU16x8
+            | IntrinsicOp::VecMulI16x8
+            | IntrinsicOp::VecCmpI16x8
+            | IntrinsicOp::VecMinI16x8
+            | IntrinsicOp::VecMaxI16x8
+            | IntrinsicOp::VecBlendvI16x8
+    )
+}
+
 fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
     use crate::ir::intrinsics::IntrinsicOp as O;
 
@@ -11160,51 +11257,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecFmsF64x2
                     | O::VecFnmsF64x2
             ),
-            6 => matches!(
-                op,
-                O::StrictRecipMulAddPackedF64x4
-                    | O::VecMulI32x4
-                    | O::VecAddI32x4
-                    // 128-bit masked reduction steps: the hoisted splat is
-                    // the guard (guard slot only, enforced below), read via
-                    // `vec_home_128` or staged with `sse_load_arg`.
-                    | O::VecWidenMaskedAddI32x4ToI64x4
-                    | O::VecWidenMaskedAddValueI32x4ToI64x2
-                    | O::VecMaskedAddValueI32x4
-                    | O::VecCmpI32x4
-                    | O::VecCmpI64x2
-                    | O::VecBlendvI32x4
-                    // Bitwise lane maps: the broadcast is the operand of
-                    // `x & K` / `x | K` / `x ^ K`, including the `mask & K`
-                    // the select strength reduction produces.  These were
-                    // missing, so a broadcast feeding a `vpand` was not
-                    // recognised as a map broadcast, got no register home,
-                    // and was re-read from the STACK every iteration.
-                    | O::VecAndI32x4
-                    | O::VecOrI32x4
-                    | O::VecXorI32x4
-                    | O::VecSubI32x4
-                    | O::VecShlvI32x4
-                    | O::VecLShrvI32x4
-                    | O::VecAShrvI32x4
-                    | O::VecShlvI64x2
-                    | O::VecLShrvI64x2
-                    | O::VecAddI8x16
-                    | O::VecSubI8x16
-                    | O::VecCmpI8x16
-                    | O::VecMinU8x16
-                    | O::VecMaxU8x16 | O::VecMinI8x16 | O::VecMaxI8x16
-                    | O::VecBlendvI8x16
-                    // Word lanes (OP-05g) share the 128-bit integer class.
-                    | O::VecAddI16x8
-                    | O::VecSubI16x8
-                    | O::VecSubSatU16x8
-                    | O::VecMulI16x8
-                    | O::VecCmpI16x8
-                    | O::VecMinI16x8
-                    | O::VecMaxI16x8
-                    | O::VecBlendvI16x8
-            ),
+            6 => is_x86_map_int_consumer_128(op),
             // Adler-32 epic invariants: the SAD zero operand
             // (`VecZeroI64x4`) and the .rodata weight/ones tables
             // (`VecConstI8x32`) are loop-invariant 256-bit values whose
@@ -11570,6 +11623,14 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecSubI8x16
         | O::VecCmpI8x16
         | O::VecMinU8x16
+        | O::VecAndNotI32x4
+        | O::VecAvgU8x16
+        | O::VecMulHiU16x8
+        | O::VecAddSatI8x16
+        | O::VecPacksswbI16x8
+        | O::VecUnpackLoI8x16
+        | O::VecAndNotI32x8
+        | O::VecUnpackLoI8x32
         | O::VecMaxU8x16
         | O::VecMinI8x16
         | O::VecMaxI8x16
@@ -11781,6 +11842,14 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecCmpI8x16
                     | O::VecBlendvI8x16
                     | O::VecMinU8x16
+                    | O::VecAndNotI32x4
+                    | O::VecAvgU8x16
+                    | O::VecMulHiU16x8
+                    | O::VecAddSatI8x16
+                    | O::VecPacksswbI16x8
+                    | O::VecUnpackLoI8x16
+                    | O::VecAndNotI32x8
+                    | O::VecUnpackLoI8x32
                     | O::VecMaxU8x16
                     | O::VecMinI8x16
                     | O::VecMaxI8x16
@@ -11836,6 +11905,14 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecSubI8x16
                     | O::VecCmpI8x16
                     | O::VecMinU8x16
+                    | O::VecAndNotI32x4
+                    | O::VecAvgU8x16
+                    | O::VecMulHiU16x8
+                    | O::VecAddSatI8x16
+                    | O::VecPacksswbI16x8
+                    | O::VecUnpackLoI8x16
+                    | O::VecAndNotI32x8
+                    | O::VecUnpackLoI8x32
                     | O::VecMaxU8x16
                     | O::VecMinI8x16
                     | O::VecMaxI8x16
