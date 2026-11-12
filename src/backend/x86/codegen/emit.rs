@@ -8518,7 +8518,7 @@ impl ArchCodegen for X86Codegen {
         dst_seg: crate::common::types::AddressSpace,
         _ty: crate::common::types::IrType,
     ) -> bool {
-        self.emit_i128_exact_copy_impl(dest, src, src_seg, dst_seg)
+        self.emit_i128_exact_copy_impl(dest, src, src_seg, dst_seg, false)
     }
 
     fn flush_pending_widen(&mut self) {

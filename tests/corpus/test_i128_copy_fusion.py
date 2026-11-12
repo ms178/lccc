@@ -93,6 +93,18 @@ class I128CopyFusion(unittest.TestCase):
                 fused += 1
         self.assertGreaterEqual(fused, 2, "\n".join(lines))
 
+    def test_slot_source_is_declined_for_store_forwarding(self):
+        """A 16-byte slot is written 8 bytes at a time: two 8-byte reads
+        forward exactly, one 16-byte read stalls.  The fusion must decline
+        rather than trade four forwarding-friendly instructions for a stall."""
+        source = """
+typedef unsigned __int128 u128;
+void store_param(u128 v, u128 *p) { *p = v; }
+"""
+        lines = body(asm(source, flags=("-O2", "-fno-inline")), "store_param")
+        self.assertFalse([l for l in lines if re.search(r"movdqu\s+-?\d+\(%r(sp|bp)\), %xmm", l)],
+                         "16-byte slot read (store-forwarding stall):\n" + "\n".join(lines))
+
     def test_fixture_is_byte_exact_against_gcc(self):
         """The semantic half: the same source, compiled by both compilers."""
         with tempfile.TemporaryDirectory() as tmp:

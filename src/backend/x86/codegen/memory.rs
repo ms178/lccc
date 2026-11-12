@@ -3394,8 +3394,29 @@ impl X86Codegen {
         src: &Value,
         src_seg: AddressSpace,
         dst_seg: AddressSpace,
+        allow_slot_source: bool,
     ) -> bool {
         // Declining is free: nothing below has been emitted yet.
+        //
+        // STORE-FORWARDING: never fuse when the source address is a frame
+        // slot. A 16-byte slot is written by two 8-byte stores (the prologue
+        // homing an incoming pair, or a pair result), and an 8+8 write
+        // forwards exactly to two 8-byte reads but NOT to one 16-byte read --
+        // Intel's forwarding is width-matched, so `movdqu slot, %xmm0` after
+        // `movq`x2 stalls ~10-15 cycles where the pair form costs nothing.
+        // `tests/corpus/test_x86_i128_narrow_and_relay.py` is that gate: it
+        // flagged this exact shape (`store_param`, the incoming pair homed to
+        // its slot) the first time the fusion ran, and it was right.
+        // `allow_slot_source` is for the F128 caller, whose values are
+        // slot-homed by construction (x87 has no register file to copy
+        // between) and whose alternative is the x87 round trip.
+        if !allow_slot_source {
+            if let Some(crate::backend::state::SlotAddr::Direct(_)) =
+                self.state.resolve_slot_addr(src.0)
+            {
+                return false;
+            }
+        }
         for v in [src, dest] {
             if let CopyAddrSource::Gpr(r) = self.copy_addr_source(&Operand::Value(*v)) {
                 if is_xmm_reg(r) || matches!(r.0, 0 | 7) {
@@ -3443,7 +3464,13 @@ impl X86Codegen {
     /// carries the proof; x87 cannot address a segment, so both ends are
     /// `AddressSpace::Default` by construction.
     pub(super) fn emit_f128_exact_copy_impl(&mut self, dest: &Value, src: &Value) {
-        self.emit_i128_exact_copy_impl(dest, src, AddressSpace::Default, AddressSpace::Default);
+        self.emit_i128_exact_copy_impl(
+            dest,
+            src,
+            AddressSpace::Default,
+            AddressSpace::Default,
+            true,
+        );
     }
 
     /// Materialise the call result (= dest) from the copy kept in %rdx.
