@@ -3734,6 +3734,61 @@ fn try_match_search_loop(
         );
         return None;
     }
+    let label_to_idx = analysis::build_label_map(func);
+    let sh = match_search_shape(func, lp, cfg)?;
+    let mut defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    for b in &func.blocks {
+        for i in &b.instructions {
+            if let Some(d) = i.dest() {
+                defs.insert(d.0, i);
+            }
+        }
+    }
+    let def_blocks = value_def_blocks(func);
+    let size_ty = crate::common::types::target_int_ir_type();
+    let (iv, bound, bound_ty) = match_search_header(func, lp, &sh, &def_blocks, size_ty)?;
+    let (base, needle) = match_search_body(func, lp, &sh, &defs, &def_blocks, iv)?;
+    let (found, found_value, found_keep) =
+        match_search_found(func, lp, cfg, &sh, &label_to_idx, &defs, iv, base)?;
+
+    Some(SearchLoop {
+        preheader: sh.preheader,
+        header: sh.header,
+        body: sh.body,
+        found,
+        latch: sh.latch,
+        exit: sh.exit,
+        base,
+        needle,
+        found_value,
+        found_keep,
+        bound,
+        bound_ty,
+    })
+}
+
+/// The five blocks a byte-search candidate must have, plus the two labels
+/// the header proof needs.  `None` means the loop is not that shape.
+struct SearchShape {
+    header: usize,
+    preheader: usize,
+    body: usize,
+    latch: usize,
+    exit: usize,
+    preheader_label: BlockId,
+    latch_label: BlockId,
+}
+
+/// Proof obligation 1: exactly `{header, body, latch}`, one preheader that
+/// branches unconditionally into the header, one exit that is not in the
+/// loop, and a single latch.  The rewrite deletes exactly three blocks, so
+/// anything else is declined.
+fn match_search_shape(
+    func: &IrFunction,
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+) -> Option<SearchShape> {
+    let name = func.name.as_str();
     let header = lp.header;
     let label_to_idx = analysis::build_label_map(func);
     let (body, exit) = match &func.blocks[header].terminator {
@@ -3786,20 +3841,31 @@ fn try_match_search_loop(
         dlog!("{name} loop@{header}: memchr bail (preheader not Branch header)");
         return None;
     }
+    Some(SearchShape {
+        header,
+        preheader,
+        body,
+        latch,
+        exit,
+        preheader_label: func.blocks[preheader].label,
+        latch_label: func.blocks[latch].label,
+    })
+}
 
-    let mut defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
-    for b in &func.blocks {
-        for i in &b.instructions {
-            if let Some(d) = i.dest() {
-                defs.insert(d.0, i);
-            }
-        }
-    }
-    let def_blocks = value_def_blocks(func);
-    let size_ty = crate::common::types::target_int_ir_type();
-    let preheader_label = func.blocks[preheader].label;
-    let latch_label = func.blocks[latch].label;
-
+/// Proof obligation 2: the header is `phi(0 from preheader, step from
+/// latch)` plus one `Ult` against a loop-invariant bound of `size_t` width.
+/// Returns the IV, the bound operand and the bound type.
+fn match_search_header(
+    func: &IrFunction,
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    sh: &SearchShape,
+    def_blocks: &FxHashMap<u32, usize>,
+    size_ty: IrType,
+) -> Option<(Value, Operand, IrType)> {
+    let name = func.name.as_str();
+    let header = sh.header;
+    let preheader_label = sh.preheader_label;
+    let latch_label = sh.latch_label;
     // ---- header: IV phi + `Ult` bound -------------------------------------
     let mut iv_phi: Option<(Value, IrType)> = None;
     let mut bound: Option<(Operand, IrType)> = None;
@@ -3880,6 +3946,24 @@ fn try_match_search_loop(
         }
     }
 
+    Some((iv, bound_op, bound_ty))
+}
+
+/// Proof obligations 3 and 4: the body loads one `U8` through the GEP at
+/// `base + IV`, compares it for equality against a byte, and does nothing
+/// else.  Returns the base pointer and the needle operand (a constant byte
+/// image or a `U8` value defined outside the loop).
+fn match_search_body(
+    func: &IrFunction,
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    sh: &SearchShape,
+    defs: &FxHashMap<u32, &Instruction>,
+    def_blocks: &FxHashMap<u32, usize>,
+    iv: Value,
+) -> Option<(Value, Operand)> {
+    let name = func.name.as_str();
+    let header = sh.header;
+    let body = sh.body;
     // ---- body: one `U8` load at base+IV, compared to a byte --------------
     let mut gep: Option<(Value, Value, Operand)> = None;
     let mut load: Option<Value> = None;
@@ -4019,6 +4103,29 @@ fn try_match_search_loop(
         _ => {}
     }
 
+    Some((base, needle))
+}
+
+/// Proof obligations 5 to 9: the found arm computes `base + IV`, both arms
+/// have exactly one predecessor, no loop value is used outside the loop,
+/// and nothing but the found value's own value-preserving chain outlives
+/// the arm.  Returns the found block, the value the call replaces, and the
+/// chain steps that keep their place in the arm.
+fn match_search_found(
+    func: &IrFunction,
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+    sh: &SearchShape,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+    defs: &FxHashMap<u32, &Instruction>,
+    iv: Value,
+    base: Value,
+) -> Option<(usize, Value, Vec<Value>)> {
+    let name = func.name.as_str();
+    let header = sh.header;
+    let body = sh.body;
+    let latch = sh.latch;
+    let exit = sh.exit;
     // ---- found arm: `base + IV`, the value the call replaces ------------
     let found = match &func.blocks[body].terminator {
         Terminator::CondBranch {
@@ -4226,20 +4333,7 @@ fn try_match_search_loop(
         .filter(|&&id| id != found_value.0)
         .map(|&id| Value(id))
         .collect();
-    Some(SearchLoop {
-        preheader,
-        header,
-        body,
-        found,
-        latch,
-        exit,
-        base,
-        needle,
-        found_value,
-        found_keep,
-        bound: bound_op,
-        bound_ty,
-    })
+    Some((found, found_value, found_keep))
 }
 
 /// The value a `Cmp` in `block` produces, if any.

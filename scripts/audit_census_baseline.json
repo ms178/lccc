@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 566,
+  "knob_literals": 567,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -299,6 +299,7 @@
     "CCC_NO_MAP_ZERO_REM",
     "CCC_NO_MEM2REG",
     "CCC_NO_MEM2REG_PARAMS",
+    "CCC_NO_MEMCHR_IDIOM",
     "CCC_NO_MEMSET_LOOP",
     "CCC_NO_MERGE_BLOCKS",
     "CCC_NO_MSUB",
@@ -572,7 +573,7 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 253,
+  "knobs_undocumented": 252,
   "panic_sites": 863,
   "panic_sites_hot": 94,
   "unsafe_sites": 27
