@@ -22,6 +22,14 @@
  *     _mm_slli_epi32(a, 3) / _mm256_srai_epi16(a, 5)                  5/9 -> 2/2
  *     _mm_cmpeq_epi8 / _mm256_cmpgt_epi64                             5/9 -> 2/2
  *     _mm_add_epi8(_mm_loadu_si128(p), b)                             6 -> 3
+ *     _mm_max_epi32 / _mm_max_epu32 / _mm_min_epu32                  48 -> 2
+ *     _mm_max_epi8 / _mm_min_epi8                                 3 (c+b) -> 2
+ *
+ * The last two rows are not the pointer form's fault: the SSE4.1 extrema had
+ * no builtin at all, so `include/smmintrin.h` computed them with a scalar loop
+ * whose per-lane `cmov` chain the SLP vectorizer cannot fold back into
+ * `pmaxsd`/`pmaxsb` (byte lanes reached 3 only because that loop's shape does
+ * vectorize, as `pcmpgtb` + `pblendvb`).
  *
  * (The memory forms stop at 3 because the OTHER operand — a by-value vector
  * parameter — has a frame home of its own in this ABI, which is RH-04, not
@@ -110,11 +118,65 @@ __attribute__((noinline)) __m256i map_max_256(__m256i a, __m256i b) {
     return _mm256_max_epi32(a, b);
 }
 
+/* SSE4.1 extrema.  Before RH-11's second half these six were 16- and 4-way
+   scalar loops in `include/smmintrin.h`; `_mm_max_epi32` measured 48
+   instructions and `_mm_min_epu32` 37 at -O2 against GCC's 2, because a
+   per-lane `cmov` chain has no vector form the loop vectorizer recognizes.
+   They are now the `pminsb`/`pmaxsb`/`pminsd`/`pmaxsd`/`pminud`/`pmaxud`
+   encodings themselves, so each shape is one instruction plus `ret`. */
+__attribute__((noinline)) __m128i map_min_epi8_128(__m128i a, __m128i b) {
+    return _mm_min_epi8(a, b);
+}
+
+__attribute__((noinline)) __m128i map_max_epi8_128(__m128i a, __m128i b) {
+    return _mm_max_epi8(a, b);
+}
+
+__attribute__((noinline)) __m128i map_min_epi32_128(__m128i a, __m128i b) {
+    return _mm_min_epi32(a, b);
+}
+
+__attribute__((noinline)) __m128i map_max_epi32_128(__m128i a, __m128i b) {
+    return _mm_max_epi32(a, b);
+}
+
+__attribute__((noinline)) __m128i map_min_epu32_128(__m128i a, __m128i b) {
+    return _mm_min_epu32(a, b);
+}
+
+__attribute__((noinline)) __m128i map_max_epu32_128(__m128i a, __m128i b) {
+    return _mm_max_epu32(a, b);
+}
+
+/* The four AVX2 spellings that did not exist at all: `-mavx2` code that GCC
+   compiles failed here with "implicit declaration of function". */
+__attribute__((noinline)) __m256i map_min_epi8_256(__m256i a, __m256i b) {
+    return _mm256_min_epi8(a, b);
+}
+
+__attribute__((noinline)) __m256i map_max_epi8_256(__m256i a, __m256i b) {
+    return _mm256_max_epi8(a, b);
+}
+
+__attribute__((noinline)) __m256i map_min_epu32_256(__m256i a, __m256i b) {
+    return _mm256_min_epu32(a, b);
+}
+
+__attribute__((noinline)) __m256i map_max_epu32_256(__m256i a, __m256i b) {
+    return _mm256_max_epu32(a, b);
+}
+
 /* Memory-operand shapes: one operand arrives from memory.  The other is a
    by-value vector parameter, whose frame home is an ABI fact (RH-04), so the
    budget is one instruction above the register shapes. */
 __attribute__((noinline)) __m128i map_add8m_128(const void *p, __m128i b) {
     return _mm_add_epi8(_mm_loadu_si128((const __m128i *)p), b);
+}
+
+/* Same shape for the new extrema: the folded load proves the pointer form's
+   three-address ABI is not what carries the value here. */
+__attribute__((noinline)) __m128i map_maxsd32m_128(const void *p, __m128i b) {
+    return _mm_max_epi32(_mm_loadu_si128((const __m128i *)p), b);
 }
 
 __attribute__((noinline)) __m256i map_add64m_256(const void *p, __m256i b) {
@@ -320,6 +382,18 @@ static void check_cmp(const char *what, const unsigned char *got,
                   OP);                                                         \
     } while (0)
 
+/* Memory-operand form: operand A comes from the array, operand B by value.
+   Kept a separate macro because the shape under test takes a POINTER first --
+   passing the vector value would test the wrong function entirely. */
+#define RUN_MAPM128(NAME, FN, OP, BYTES, LANES)                                \
+    do {                                                                       \
+        __m128i vb, r;                                                         \
+        memcpy(&vb, B128, 16);                                                 \
+        r = FN(A128, vb);                                                      \
+        check_map(NAME, (const unsigned char *)&r, A128, B128, BYTES, LANES,   \
+                  OP);                                                         \
+    } while (0)
+
 #define RUN_MAP256(NAME, FN, OP, BYTES, LANES)                                 \
     do {                                                                       \
         __m256i va, vb, r;                                                     \
@@ -389,12 +463,51 @@ static void fill(unsigned char *p, int n, int salt) {
     }
 }
 
+/* Sign-disagreement corners for the signed/unsigned extrema families.
+ *
+ * A min/max family that reads its lanes with the WRONG signedness computes
+ * the same function whenever both operands of a lane share a sign: `pminsb`
+ * and `pminub` differ only where exactly one operand's high bit is set.  The
+ * generic pattern above does not guarantee such a lane at every width (its
+ * high bytes happen to agree in sign at most lanes), which would let a
+ * signedness bug through while every value still matched.
+ *
+ * Rows 1/2 hold the low/high byte of each operand's lane-0..3 words and
+ * dwords; `sign_corners` sets, for each lane width, ONE lane where the two
+ * operands disagree in sign -- the positive operand in `lo`, the negative one
+ * in `hi`.  One lane is enough to separate signed from unsigned for both
+ * min and max (in that lane the signed answer is `lo` for max and `hi` for
+ * min; the unsigned answer is the opposite of both).  The positions are
+ * disjoint so the four width requirements hold simultaneously:
+ *
+ *   width 1 -- byte  5  (lane 5)
+ *   width 2 -- byte  1  (word 0 high byte)
+ *   width 4 -- byte  3  (dword 0 high byte)
+ *   width 8 -- byte  7  (qword 0 high byte)
+ */
+static void sign_corners(unsigned char *lo, int lo_n, unsigned char *hi,
+                         int hi_n) {
+    static const int pos[] = {5, 1, 3, 7};
+    for (unsigned i = 0; i < sizeof(pos) / sizeof(pos[0]); i++) {
+        if (pos[i] < lo_n) {
+            lo[pos[i]] = 0x10;
+        }
+        if (pos[i] < hi_n) {
+            hi[pos[i]] = 0x90;
+        }
+    }
+}
+
 int main(void) {
     unsigned char A128[16], B128[16], A256[32], B256[32];
     fill(A128, 16, 1);
     fill(B128, 16, 2);
     fill(A256, 32, 3);
     fill(B256, 32, 4);
+    /* Every lane width gets a lane where the operands disagree in sign, so a
+       signed family lowered as unsigned (or the reverse) cannot pass. */
+    sign_corners(A128, 16, B128, 16);
+    sign_corners(A256, 32, B256, 32);
 
     /* ---- arithmetic and bitwise, every lane width, both widths -------- */
     RUN_MAP128("add_epi8", _mm_add_epi8, REF_ADD, 1, 16);
@@ -421,6 +534,15 @@ int main(void) {
     RUN_MAP128("max_epu16", _mm_max_epu16, REF_MAXU, 2, 8);
     RUN_MAP128("wrap_add16", wrap_add16, REF_ADD, 2, 8);
     RUN_MAP128("wrap_maxu16", wrap_maxu16, REF_MAXU, 2, 8);
+    /* SSE4.1 extrema: the four sign structures at the two new lane widths. */
+    RUN_MAP128("min_epi8_128", _mm_min_epi8, REF_MINS, 1, 16);
+    RUN_MAP128("max_epi8_128", _mm_max_epi8, REF_MAXS, 1, 16);
+    RUN_MAP128("min_epi32_128", _mm_min_epi32, REF_MINS, 4, 4);
+    RUN_MAP128("max_epi32_128", _mm_max_epi32, REF_MAXS, 4, 4);
+    RUN_MAP128("min_epu32_128", _mm_min_epu32, REF_MINU, 4, 4);
+    RUN_MAP128("max_epu32_128", _mm_max_epu32, REF_MAXU, 4, 4);
+    /* Memory-operand form: the folded load must not change the answer. */
+    RUN_MAPM128("maxsd32m_128", map_maxsd32m_128, REF_MAXS, 4, 4);
 
     RUN_MAP256("add_epi8_256", _mm256_add_epi8, REF_ADD, 1, 32);
     RUN_MAP256("add_epi16_256", _mm256_add_epi16, REF_ADD, 2, 16);
@@ -443,6 +565,11 @@ int main(void) {
     RUN_MAP256("max_epu16_256", _mm256_max_epu16, REF_MAXU, 2, 16);
     RUN_MAP256("wrap_minu16_256", wrap_minu16_256, REF_MINU, 2, 16);
     RUN_MAP256("wrap_and256", wrap_and256, REF_AND, 4, 8);
+    RUN_MAP256("min_epi8_256", _mm256_min_epi8, REF_MINS, 1, 32);
+    RUN_MAP256("max_epi8_256", _mm256_max_epi8, REF_MAXS, 1, 32);
+    RUN_MAP256("min_epu32_256", _mm256_min_epu32, REF_MINU, 4, 8);
+    RUN_MAP256("max_epu32_256", _mm256_max_epu32, REF_MAXU, 4, 8);
+    RUN_MAP256("min_epi32_256", _mm256_min_epi32, REF_MINS, 4, 8);
 
     /* ---- immediate shifts -------------------------------------------- */
     RUN_SHIFT128("slli_epi16_3", _mm_slli_epi16, 2, 8, 0, 0, 3);

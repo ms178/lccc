@@ -838,6 +838,17 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Pminub128 => (VecMinU8x16, IrType::U8, 16, Binary),
         Pminsw128 => (VecMinI16x8, IrType::I16, 16, Binary),
         Pmaxsw128 => (VecMaxI16x8, IrType::I16, 16, Binary),
+        // SSE4.1 extrema.  The dword twins are the vectorizer's own
+        // (`VecSminI32x4`/`VecSmaxI32x4` are `pminsd`/`pmaxsd`; the unsigned
+        // pair is `VecMinU32x4`/`VecMaxU32x4`), the byte pair needed a twin
+        // of its own.  Lane type is the TWIN's, which is why unsigned dword
+        // is `U32` even though the C argument is an i64x2 `__m128i`.
+        Pminud128 => (VecMinU32x4, IrType::U32, 16, Binary),
+        Pmaxud128 => (VecMaxU32x4, IrType::U32, 16, Binary),
+        Pminsd128 => (VecSminI32x4, IrType::I32, 16, Binary),
+        Pmaxsd128 => (VecSmaxI32x4, IrType::I32, 16, Binary),
+        Pminsb128 => (VecMinI8x16, IrType::I8, 16, Binary),
+        Pmaxsb128 => (VecMaxI8x16, IrType::I8, 16, Binary),
         // Unsigned 16-bit saturating subtract — the only SATURATING map op in
         // the register set.  It is also what makes the missing `pminuw` /
         // `pmaxuw` encodings expressible without one:
@@ -864,6 +875,10 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Pminub256 => (VecMinU8x32, IrType::U8, 32, Binary),
         Pminsd256 => (VecMinI32x8, IrType::I32, 32, Binary),
         Pmaxsd256 => (VecMaxI32x8, IrType::I32, 32, Binary),
+        Pminud256 => (VecMinU32x8, IrType::U32, 32, Binary),
+        Pmaxud256 => (VecMaxU32x8, IrType::U32, 32, Binary),
+        Pminsb256 => (VecMinI8x32, IrType::I8, 32, Binary),
+        Pmaxsb256 => (VecMaxI8x32, IrType::I8, 32, Binary),
         Psubusw256 => (VecSubSatU16x16, IrType::I16, 32, Binary),
 
         _ => return None,

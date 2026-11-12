@@ -421,6 +421,12 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Punpckhdq128
         | O::Punpcklqdq128
         | O::Punpckhqdq128
+        | O::Pminud128
+        | O::Pmaxud128
+        | O::Pminsd128
+        | O::Pmaxsd128
+        | O::Pminsb128
+        | O::Pmaxsb128
         | O::AddF64x2
         | O::MulF64x2
         | O::AddI32x4 => 16,
@@ -535,6 +541,10 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Pmulhw256
         | O::Pminsd256
         | O::Pmaxsd256
+        | O::Pminsb256
+        | O::Pmaxsb256
+        | O::Pminud256
+        | O::Pmaxud256
         | O::Packssdw256
         | O::Packuswb256
         | O::Phaddw256

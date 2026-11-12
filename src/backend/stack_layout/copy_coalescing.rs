@@ -1716,6 +1716,8 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecSubI8x16
             | O::VecMinU8x16
             | O::VecMaxU8x16
+            | O::VecMinI8x16
+            | O::VecMaxI8x16
             | O::VecAddI16x8
             | O::VecSubI16x8
             | O::VecSubSatU16x8
@@ -1849,6 +1851,12 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::Pavgw128
             | O::Pmaxsw128
             | O::Pminsw128
+            | O::Pminud128
+            | O::Pmaxud128
+            | O::Pminsd128
+            | O::Pmaxsd128
+            | O::Pminsb128
+            | O::Pmaxsb128
             | O::Paddsb128
             | O::Paddsw128
             | O::Paddusb128
@@ -1994,6 +2002,8 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecCmpI8x16
             | O::VecMinU8x16
             | O::VecMaxU8x16
+            | O::VecMinI8x16
+            | O::VecMaxI8x16
             | O::VecBlendvI8x16
             | O::VecMinI8x32
             | O::VecMaxI8x32
@@ -2496,6 +2506,8 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // asymmetry — commutative.
         | O::VecMinU8x16
         | O::VecMaxU8x16
+        | O::VecMinI8x16
+        | O::VecMaxI8x16
         | O::VecMinI16x8
         | O::VecMaxI16x8
         | O::VecSminI32x4

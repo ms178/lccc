@@ -441,14 +441,12 @@ register-dest `VecLoad*` and `Memcpy { src }` alike.
 
 #### Still open (RH-11 remainder, unchanged in kind, smaller in size)
 
-* 128-bit signed/unsigned 8- and 32-bit extrema and 32-bit unsigned min/max
-  have no builtin at all (`__builtin_ia32_pminud128`, `pmaxsd128`, `pmaxsb128`
-  do not exist; only the 256-bit `pmaxsd256`/`pminsd256` do), so
-  `_mm_min_epu32` (37), `_mm_max_epi32` (48) and `_mm_max_epi8` (3) need new
-  `IntrinsicOp`s + emitters, not routing.
 * `_mm_andnot_si128`, `_mm_avg_epu8`, `_mm_mulhi_epu16`, `_mm_adds_epi8`,
   `_mm_packs_epi16`, `_mm_unpacklo_epi8` cost 5 because their pointer builtins
   have no twin; each needs one `Vec*` twin and one emitter arm.
+* `_mm_max_epu16`/`_mm_min_epu16` (and the 256-bit pair) stay at 3, not 2:
+  `pmaxuw`/`pminuw` have no encoding below AVX-512, so the exact
+  saturating-difference identity is the floor, not a defect.
 * The memory forms stay one instruction above GCC until RH-04 (the same
   by-value-parameter home, one layer lower, in the call ABI itself).
 
@@ -463,4 +461,83 @@ put the copies back (non-vacuity: with the forwarding off the same four shapes
 cost 6, 8, 29 and 27).  The fixture's execution matrix grew to 84 value shapes
 including `_mm_min/max_epu16` at both widths and the wrappers themselves, all
 against the scalar reference at `-O0`, `-O1`, `-O2`, `-O3` and on i686.
+
+### 6.8 RH-11, second half — the SSE4.1 extrema are now encodings, not loops
+
+§6.7's remainder was one class of defect, not six: `_mm_min_epi8`,
+`_mm_max_epi8`, `_mm_min_epi32`, `_mm_max_epi32`, `_mm_min_epu32` and
+`_mm_max_epu32` are `target("sse4.1")` functions whose bodies were
+lane-at-a-time scalar loops, and their instructions (`pminsb`/`pmaxsb`,
+`pminsd`/`pmaxsd`, `pminud`/`pmaxud`) had **no `__builtin_ia32_*` primitive and
+no `IntrinsicOp` in this tree at all**.  Only the 256-bit `pmaxsd256` /
+`pminsd256` existed.  Measured on `-O2 -mavx2`, instructions between the label
+and `ret` (GCC 16.2, same rule):
+
+| shape | before | now | GCC 16.2 |
+|---|---:|---:|---:|
+| `_mm_max_epi32` / `_mm_min_epi32` | 48 / 48 | **2 / 2** | 2 / 2 |
+| `_mm_min_epu32` / `_mm_max_epu32` | 37 / 37 | **2 / 2** | 2 / 2 |
+| `_mm_max_epi8` / `_mm_min_epi8` | 3 / 3 | **2 / 2** | 2 / 2 |
+| `_mm256_max/min_epi8` | did not compile | **2 / 2** | 2 / 2 |
+| `_mm256_min/max_epu32` | did not compile | **2 / 2** | 2 / 2 |
+
+The two failure modes were different and both worth recording.  The byte pair
+was already *nearly* right (3) only because a 16-iteration signed byte loop is
+one of the few shapes the SLP vectorizer can re-fold — into `vpcmpgtb` +
+`vpblendvb`, which is SSE2-legal and one instruction short of `vpmaxsb`.  The
+dword pair was catastrophic (37/48) because per-lane `cmov` chains vectorize
+into nothing at all.  `_mm256_min/max_epi8` and `_mm256_min/max_epu32` were
+absent from `include/avx2intrin.h` entirely, so `-mavx2` code GCC compiles
+failed here with "implicit declaration of function".
+
+**What landed.**  Ten pointer-form ops — `P{min,max}{sb,sd,ud}128` and
+`P{min,max}{sb,ud}256` — each wired through the same seven places
+`Pminsw128`/`Pmaxsd256` already occupied (builtin enum + name table, arity
+from `scripts/check_intrinsic_arity.py`, the generated type facts in
+`engineering/isa/gnu-x86-builtin-types.tsv`, the feature gate, the op map, the
+lowering arm list, and both backends' `dest_ptr` emitter groups).  Two new
+register twins (`VecMinI8x16`, `VecMaxI8x16` — the dword and unsigned-dword
+twins already existed as `VecSminI32x4`/`VecSmaxI32x4` and
+`VecMinU32x4`/`VecMaxU32x4`, which is why no new dword twin was needed), plus
+the `native_packed_map` rows that route the pointer forms to them.
+
+**Three traps, all of them the kind a budget cannot see.**
+
+1. *The 256-bit extrema were never feature-gated.*  `X86Pminsd256` /
+   `X86Pmaxsd256` were missing from `x86_intrinsic_required_feature`'s AVX2
+   arm, so `-mavx` code that called `_mm256_max_epi32` emitted `vpmaxsd` with
+   no permission check and no diagnostic.  Both are gated now, with the four
+   new spellings; `-mavx` + `_mm256_max_epi8` now fails exactly where GCC
+   fails ("target specific option mismatch"), and `-msse2` +
+   `_mm_max_epi32` no longer inlines a `target("sse4.1")` body into a caller
+   that lacks the feature.
+2. *A new twin is invisible to the register allocator until it is listed.*
+   The first version of `VecMaxI8x16` emitted `vpmaxsb` — with a memory
+   operand and a 152-byte frame, because `regalloc.rs` never learned that the
+   op produces an XMM value, so the operand was homed in memory and the
+   operation folded back onto it.  Instruction count alone says "one
+   instruction"; the gate's frame-and-stack-slot assertion says otherwise.
+   The op now appears in all eight `regalloc.rs` classification lists and the
+   three in `copy_coalescing.rs` beside its `VecMinU8x16` sibling.
+3. *One list insertion pushed a function over the 300-line census ratchet*
+   (`collect_x86_map_broadcast_values`, 300 -> 302).  Fixed by folding the
+   insertion into an existing line rather than re-baselining the census: the
+   ratchet is only useful if it is never relaxed for convenience.
+
+**Gate.**  `tests/regression/check_x86_int_map_registers.sh` gained ten
+register shapes (budget 2, no frame, no stack slot), one memory-operand shape
+(`map_maxsd32m_128`, budget 3 = the RH-04 constant), and the fixture executes
+all six 128-bit and four new 256-bit families against its scalar reference at
+`-O0`, `-O1`, `-O2`, `-O3` and on i686.  The non-vacuity argument is
+two-sided: the budgets are 2 and the pre-fix bodies were 48/37/3, and the
+`CCC_NO_NATIVE_PACKED_MAP` counterfactual now also pins three of the new
+shapes, so the pointer fallback must still exceed the budget and must still
+compute the same values.
+
+A note on what the budgets *cannot* catch, and what does: `pminsb` and
+`pminub` are both one instruction, and they differ only in lanes where exactly
+one operand's sign bit is set.  The generic operand pattern in the fixture does
+not guarantee such a lane at every width, so `sign_corners()` writes one, per
+width, at a disjoint byte position — without it a signed family lowered as
+unsigned would pass every value check.
 

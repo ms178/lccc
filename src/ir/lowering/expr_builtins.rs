@@ -1799,6 +1799,16 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pmulhw256
             | BuiltinIntrinsic::X86Pminsd256
             | BuiltinIntrinsic::X86Pmaxsd256
+            | BuiltinIntrinsic::X86Pminsb128
+            | BuiltinIntrinsic::X86Pmaxsb128
+            | BuiltinIntrinsic::X86Pminsd128
+            | BuiltinIntrinsic::X86Pmaxsd128
+            | BuiltinIntrinsic::X86Pminud128
+            | BuiltinIntrinsic::X86Pmaxud128
+            | BuiltinIntrinsic::X86Pminsb256
+            | BuiltinIntrinsic::X86Pmaxsb256
+            | BuiltinIntrinsic::X86Pminud256
+            | BuiltinIntrinsic::X86Pmaxud256
             | BuiltinIntrinsic::X86Pmovzxbw256
             | BuiltinIntrinsic::X86Pmovzxbd256
             | BuiltinIntrinsic::X86Pmovzxwd256
@@ -4303,6 +4313,14 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         B::X86Paddb256
         | B::X86Paddw256
         | B::X86Paddd256
+        // The extrema family was never gated: `_mm256_max_epi32` emitted
+        // `vpmaxsd` under a plain `-mavx` permission.
+        | B::X86Pminsd256
+        | B::X86Pmaxsd256
+        | B::X86Pminsb256
+        | B::X86Pmaxsb256
+        | B::X86Pminud256
+        | B::X86Pmaxud256
         | B::X86Paddq256
         | B::X86Psubb256
         | B::X86Psubw256
@@ -4364,6 +4382,14 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pextrb128
         | B::X86Pinsrq128
         | B::X86Pextrq128
+        // SSE4.1 extrema: no SSE2 encoding exists, so a body that admits one
+        // must not be inlined into a caller without the feature either.
+        | B::X86Pminsb128
+        | B::X86Pmaxsb128
+        | B::X86Pminsd128
+        | B::X86Pmaxsd128
+        | B::X86Pminud128
+        | B::X86Pmaxud128
         | B::X86Pblendvb128
         | B::X86Pblendw128
         | B::X86Pmovzxbw128
@@ -4732,6 +4758,16 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pavgw128 => IntrinsicOp::Pavgw128,
         BuiltinIntrinsic::X86Pminsw128 => IntrinsicOp::Pminsw128,
         BuiltinIntrinsic::X86Pmaxsw128 => IntrinsicOp::Pmaxsw128,
+        BuiltinIntrinsic::X86Pminsb128 => IntrinsicOp::Pminsb128,
+        BuiltinIntrinsic::X86Pmaxsb128 => IntrinsicOp::Pmaxsb128,
+        BuiltinIntrinsic::X86Pminsd128 => IntrinsicOp::Pminsd128,
+        BuiltinIntrinsic::X86Pmaxsd128 => IntrinsicOp::Pmaxsd128,
+        BuiltinIntrinsic::X86Pminud128 => IntrinsicOp::Pminud128,
+        BuiltinIntrinsic::X86Pmaxud128 => IntrinsicOp::Pmaxud128,
+        BuiltinIntrinsic::X86Pminsb256 => IntrinsicOp::Pminsb256,
+        BuiltinIntrinsic::X86Pmaxsb256 => IntrinsicOp::Pmaxsb256,
+        BuiltinIntrinsic::X86Pminud256 => IntrinsicOp::Pminud256,
+        BuiltinIntrinsic::X86Pmaxud256 => IntrinsicOp::Pmaxud256,
         BuiltinIntrinsic::X86Pmulhuw128 => IntrinsicOp::Pmulhuw128,
         BuiltinIntrinsic::X86Paddq128 => IntrinsicOp::Paddq128,
         BuiltinIntrinsic::X86Psubq128 => IntrinsicOp::Psubq128,

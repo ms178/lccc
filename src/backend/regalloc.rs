@@ -8421,6 +8421,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecCmpI8x16
                 | O::VecMinU8x16
                 | O::VecMaxU8x16
+                | O::VecMinI8x16
+                | O::VecMaxI8x16
                 | O::VecBlendvI8x16
                 | O::VecMinI8x32
                 | O::VecMaxI8x32
@@ -8680,6 +8682,8 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
         | O::VecMinU8x16
         | O::VecMaxU8x32
         | O::VecMaxU8x16
+        | O::VecMinI8x16
+        | O::VecMaxI8x16
         // Word-lane compares (OP-05g): same [a, b, imm] shape as the
         // dword/byte forms — two vector reads plus a constant
         // predicate.
@@ -8803,7 +8807,13 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
         | O::Punpckldq128
         | O::Punpckhdq128
         | O::Punpcklqdq128
-        | O::Punpckhqdq128 => Some(2),
+        | O::Punpckhqdq128
+        | O::Pminud128
+        | O::Pmaxud128
+        | O::Pminsd128
+        | O::Pmaxsd128
+        | O::Pminsb128
+        | O::Pmaxsb128 => Some(2),
         _ => None,
     }
 }
@@ -9033,6 +9043,8 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecSubI8x16
             | O::VecMinU8x16
             | O::VecMaxU8x16
+            | O::VecMinI8x16
+            | O::VecMaxI8x16
             | O::VecAddF32x4
             | O::VecSubF32x4
             | O::VecMulF32x4
@@ -10789,6 +10801,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecBlendvI8x16
                                 | O::VecMinU8x16
                                 | O::VecMaxU8x16
+                                | O::VecMinI8x16
+                                | O::VecMaxI8x16
                                 // 256-bit halfword map ops (OP-05g word
                                 // lanes): same scratch-pair discipline as
                                 // their byte twins — without the exemption
@@ -11179,7 +11193,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecSubI8x16
                     | O::VecCmpI8x16
                     | O::VecMinU8x16
-                    | O::VecMaxU8x16
+                    | O::VecMaxU8x16 | O::VecMinI8x16 | O::VecMaxI8x16
                     | O::VecBlendvI8x16
                     // Word lanes (OP-05g) share the 128-bit integer class.
                     | O::VecAddI16x8
@@ -11557,6 +11571,8 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecCmpI8x16
         | O::VecMinU8x16
         | O::VecMaxU8x16
+        | O::VecMinI8x16
+        | O::VecMaxI8x16
         | O::VecBlendvI8x16
         | O::VecAddI16x8
         | O::VecSubI16x8
@@ -11766,6 +11782,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecBlendvI8x16
                     | O::VecMinU8x16
                     | O::VecMaxU8x16
+                    | O::VecMinI8x16
+                    | O::VecMaxI8x16
                     | O::VecStoreI8x32
                     | O::VecStoreI32x4
                     | O::VecStoreI32x4Pair
@@ -11819,6 +11837,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecCmpI8x16
                     | O::VecMinU8x16
                     | O::VecMaxU8x16
+                    | O::VecMinI8x16
+                    | O::VecMaxI8x16
                     | O::VecBlendvI8x16
                     | O::VecAddI16x8
                     | O::VecSubI16x8

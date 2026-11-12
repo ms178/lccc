@@ -735,7 +735,13 @@ impl I686Codegen {
             | IntrinsicOp::Punpckldq128
             | IntrinsicOp::Punpckhdq128
             | IntrinsicOp::Punpcklqdq128
-            | IntrinsicOp::Punpckhqdq128 => {
+            | IntrinsicOp::Punpckhqdq128
+            | IntrinsicOp::Pminud128
+            | IntrinsicOp::Pmaxud128
+            | IntrinsicOp::Pminsd128
+            | IntrinsicOp::Pmaxsd128
+            | IntrinsicOp::Pminsb128
+            | IntrinsicOp::Pmaxsb128 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::Paddw128 => "paddw",
@@ -784,6 +790,12 @@ impl I686Codegen {
                         IntrinsicOp::Punpckhdq128 => "punpckhdq",
                         IntrinsicOp::Punpcklqdq128 => "punpcklqdq",
                         IntrinsicOp::Punpckhqdq128 => "punpckhqdq",
+                        IntrinsicOp::Pminud128 => "pminud",
+                        IntrinsicOp::Pmaxud128 => "pmaxud",
+                        IntrinsicOp::Pminsd128 => "pminsd",
+                        IntrinsicOp::Pmaxsd128 => "pmaxsd",
+                        IntrinsicOp::Pminsb128 => "pminsb",
+                        IntrinsicOp::Pmaxsb128 => "pmaxsb",
                         _ => unreachable!("unexpected SSE binary op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
@@ -1818,6 +1830,10 @@ impl I686Codegen {
             | IntrinsicOp::Pcmpgtq256
             | IntrinsicOp::Pmaxub256
             | IntrinsicOp::Pmaxsd256
+            | IntrinsicOp::Pminsb256
+            | IntrinsicOp::Pmaxsb256
+            | IntrinsicOp::Pminud256
+            | IntrinsicOp::Pmaxud256
             | IntrinsicOp::Pminub256
             | IntrinsicOp::Pminsd256
             | IntrinsicOp::Psadbw256
@@ -1865,6 +1881,10 @@ impl I686Codegen {
                         IntrinsicOp::Pmaxsd256 => "vpmaxsd",
                         IntrinsicOp::Pminub256 => "vpminub",
                         IntrinsicOp::Pminsd256 => "vpminsd",
+                        IntrinsicOp::Pminsb256 => "vpminsb",
+                        IntrinsicOp::Pmaxsb256 => "vpmaxsb",
+                        IntrinsicOp::Pminud256 => "vpminud",
+                        IntrinsicOp::Pmaxud256 => "vpmaxud",
                         IntrinsicOp::Psadbw256 => "vpsadbw",
                         IntrinsicOp::Pshufb256 => "vpshufb",
                         IntrinsicOp::Packssdw256 => "vpackssdw",

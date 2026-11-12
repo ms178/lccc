@@ -4156,7 +4156,12 @@ impl X86Codegen {
             | IntrinsicOp::Punpckldq128
             | IntrinsicOp::Punpckhdq128
             | IntrinsicOp::Punpcklqdq128
-            | IntrinsicOp::Punpckhqdq128 => {
+            | IntrinsicOp::Pminud128
+            | IntrinsicOp::Pmaxud128
+            | IntrinsicOp::Pminsd128
+            | IntrinsicOp::Pmaxsd128
+            | IntrinsicOp::Pminsb128
+            | IntrinsicOp::Pmaxsb128 => {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Paddusb128 => "paddusb",
@@ -4178,6 +4183,12 @@ impl X86Codegen {
                         IntrinsicOp::Punpckhdq128 => "punpckhdq",
                         IntrinsicOp::Punpcklqdq128 => "punpcklqdq",
                         IntrinsicOp::Punpckhqdq128 => "punpckhqdq",
+                        IntrinsicOp::Pminud128 => "pminud",
+                        IntrinsicOp::Pmaxud128 => "pmaxud",
+                        IntrinsicOp::Pminsd128 => "pminsd",
+                        IntrinsicOp::Pmaxsd128 => "pmaxsd",
+                        IntrinsicOp::Pminsb128 => "pminsb",
+                        IntrinsicOp::Pmaxsb128 => "pmaxsb",
                         _ => unreachable!(),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
@@ -4234,6 +4245,10 @@ impl X86Codegen {
             | IntrinsicOp::Pmulhw256
             | IntrinsicOp::Pminsd256
             | IntrinsicOp::Pmaxsd256
+            | IntrinsicOp::Pminsb256
+            | IntrinsicOp::Pmaxsb256
+            | IntrinsicOp::Pminud256
+            | IntrinsicOp::Pmaxud256
             | IntrinsicOp::Packssdw256
             | IntrinsicOp::Packuswb256
             | IntrinsicOp::Phaddw256
@@ -4268,6 +4283,10 @@ impl X86Codegen {
                         IntrinsicOp::Pmulhw256 => ("vpmulhw", true),
                         IntrinsicOp::Pminsd256 => ("vpminsd", true),
                         IntrinsicOp::Pmaxsd256 => ("vpmaxsd", true),
+                        IntrinsicOp::Pminsb256 => ("vpminsb", true),
+                        IntrinsicOp::Pmaxsb256 => ("vpmaxsb", true),
+                        IntrinsicOp::Pminud256 => ("vpminud", true),
+                        IntrinsicOp::Pmaxud256 => ("vpmaxud", true),
                         IntrinsicOp::Packssdw256 => ("vpackssdw", false),
                         IntrinsicOp::Packuswb256 => ("vpackuswb", false),
                         IntrinsicOp::Phaddw256 => ("vphaddw", false),
@@ -7364,6 +7383,22 @@ impl X86Codegen {
             IntrinsicOp::VecMaxI16x8 => {
                 if let Some(d) = dest {
                     self.emit_sse_binary_128(d, args, "pmaxsw");
+                }
+            }
+            // SSE4.1 signed BYTE extrema at 128 bits.  The 256-bit pair lives
+            // with the AVX2 byte family above; these are the `pminsb`/
+            // `pmaxsb` twins `_mm_min_epi8`/`_mm_max_epi8` route to.  Without
+            // them the header computed the same function as a 16-iteration
+            // scalar loop, which the SLP vectorizer could only recover as
+            // `vpcmpgtb` + `vpblendvb`.
+            IntrinsicOp::VecMinI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sminmax_i8x16(d, args, false);
+                }
+            }
+            IntrinsicOp::VecMaxI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sminmax_i8x16(d, args, true);
                 }
             }
             // BB-SLP packed lane shifts by a uniform constant. The VEX
@@ -10676,6 +10711,23 @@ impl X86Codegen {
     /// Reaching this emitter without SSE4.1 is a producer bug — panic
     /// loudly rather than emit an instruction the CPU cannot decode (the
     /// VecRotlI32x4 immediate-panic discipline).
+    /// Lane-wise signed BYTE min/max, 128-bit (`VecSminI8x16`/
+    /// `VecMaxI8x16`).
+    ///
+    /// `pminsb`/`pmaxsb` are SSE4.1; there is no SSE2 encoding, so a producer
+    /// that admits this op without the feature is a bug and asserts here
+    /// rather than silently emitting an instruction the target lacks.
+    fn emit_sminmax_i8x16(&mut self, dest: &Value, args: &[Operand], is_max: bool) {
+        assert!(
+            self.isa.sse41,
+            "VecM{}I8x16 requires SSE4.1 (pminsb/pmaxsb): an x86 producer \
+             admitted it without the feature gate",
+            if is_max { "ax" } else { "in" }
+        );
+        let inst = if is_max { "pmaxsb" } else { "pminsb" };
+        self.emit_sse_binary_128(dest, args, inst);
+    }
+
     fn emit_sminmax_i32x4(&mut self, dest: &Value, args: &[Operand], is_max: bool) {
         assert!(
             self.isa.sse41,

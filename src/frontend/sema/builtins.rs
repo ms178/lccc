@@ -3375,8 +3375,48 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phaddw256),
     );
     m.insert(
+        "__builtin_ia32_pmaxsd128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsd128),
+    );
+    m.insert(
+        "__builtin_ia32_pmaxsb128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsb128),
+    );
+    m.insert(
+        "__builtin_ia32_pmaxsb256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsb256),
+    );
+    m.insert(
         "__builtin_ia32_pmaxsd256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsd256),
+    );
+    m.insert(
+        "__builtin_ia32_pmaxud128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxud128),
+    );
+    m.insert(
+        "__builtin_ia32_pmaxud256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxud256),
+    );
+    m.insert(
+        "__builtin_ia32_pminsb128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminsb128),
+    );
+    m.insert(
+        "__builtin_ia32_pminsb256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminsb256),
+    );
+    m.insert(
+        "__builtin_ia32_pminsd128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminsd128),
+    );
+    m.insert(
+        "__builtin_ia32_pminud128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminud128),
+    );
+    m.insert(
+        "__builtin_ia32_pminud256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminud256),
     );
     m.insert(
         "__builtin_ia32_pmaxsw128",
@@ -4047,6 +4087,15 @@ pub enum BuiltinIntrinsic {
     X86Pavgw128,
     X86Pminsw128,
     X86Pmaxsw128,
+    // SSE4.1 extrema: `pminud`/`pmaxud`, `pminsd`/`pmaxsd`,
+    // `pminsb`/`pmaxsb`.  None has an SSE2 encoding, so unlike the pair
+    // above they are gated on `-msse4.1`.
+    X86Pminud128,
+    X86Pmaxud128,
+    X86Pminsd128,
+    X86Pmaxsd128,
+    X86Pminsb128,
+    X86Pmaxsb128,
     X86Pmulhuw128,
     X86Paddq128,
     X86Psubq128,
@@ -4098,6 +4147,10 @@ pub enum BuiltinIntrinsic {
     X86Pmulhw256,
     X86Pminsd256,
     X86Pmaxsd256,
+    X86Pminsb256,
+    X86Pmaxsb256,
+    X86Pminud256,
+    X86Pmaxud256,
     X86Pmovzxbw256,
     X86Pmovzxbd256,
     X86Pmovzxwd256,

@@ -195,7 +195,12 @@ check() {
 # Register-resident shapes: one packed instruction plus `ret`.
 for name in map_add8_128 map_add8_256 map_and_128 map_and_256 \
             map_shift_128 map_shift_256 map_cmp_128 map_cmp_256 \
-            map_mul16_128 map_mul32_256 map_min_128 map_max_256; do
+            map_mul16_128 map_mul32_256 map_min_128 map_max_256 \
+            map_min_epi8_128 map_max_epi8_128 \
+            map_min_epi32_128 map_max_epi32_128 \
+            map_min_epu32_128 map_max_epu32_128 \
+            map_min_epi8_256 map_max_epi8_256 \
+            map_min_epu32_256 map_max_epu32_256; do
     check "$name" 2 1
 done
 # Memory-operand shapes: the folded load, the operation, `ret`.  The other
@@ -203,6 +208,8 @@ done
 # (RH-04), which is why these are one above GCC instead of at parity.
 check map_add8m_128 3 0
 check map_add64m_256 3 0
+# Same shape for the SSE4.1 extrema family (RH-11 second half).
+check map_maxsd32m_128 3 0
 
 # Inlined wrappers: a `target(...)`-attributed always-inline callee with two
 # by-value 16/32-byte vector parameters.  The parameter bridge used to cost a
@@ -232,7 +239,7 @@ if [ "$EXPECT_DEFECT" = 1 ]; then
     echo "FAIL: --expect-defect expected an overrun and found none" >&2
     exit 1
 fi
-echo "  ok  every counted shape is register-homed (12 at parity, 2 memory forms, 4 wrappers)"
+echo "  ok  every counted shape is register-homed (22 at parity, 3 memory forms, 4 wrappers)"
 
 # --- 5. counterfactual -----------------------------------------------------
 # `CCC_NO_NATIVE_PACKED_MAP` reverts the routing at the one place that makes
@@ -245,7 +252,8 @@ if [ -z "${CCC_NO_NATIVE_PACKED_MAP-}" ]; then
         2>"$WORK/cc3.log" \
         || { echo "FAIL: cannot emit the counterfactual assembly" >&2
              cat "$WORK/cc3.log" >&2; exit 1; }
-    for name in map_add8_128 map_add8_256 map_cmp_256; do
+    for name in map_add8_128 map_add8_256 map_cmp_256 \
+                map_max_epi32_128 map_min_epu32_128 map_max_epi8_128; do
         off_body=$(awk -v F="$name:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$WORK/off.s")
         off_n=$(count "$off_body")
         if [ "$off_n" -le 2 ]; then
