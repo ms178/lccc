@@ -74,6 +74,11 @@ libcalls! {
     Memset = "memset",
     Memcpy = "memcpy",
     Memmove = "memmove",
+    // Byte search, synthesized by the `loop_idiom` byte-search rewrite
+    // (`for (i = 0; i < n; i++) if (p[i] == c) return p + i; return 0;`).
+    // Withdrawing it (`-fno-builtin-memchr`, `-ffreestanding`, or a TU that
+    // defines `memchr`) keeps that loop scalar.
+    Memchr = "memchr",
     MemsetChk = "__memset_chk",
     MemcpyChk = "__memcpy_chk",
     Printf = "printf",

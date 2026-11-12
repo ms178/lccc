@@ -78,6 +78,7 @@ fn reach(f: &str) -> &'static [&'static str] {
         "fputs" => &["fputs", "fwrite", "strlen"],
         "memset" => &["memset"],
         "memcpy" => &["memcpy"],
+        "memchr" => &["memchr"],
         "putchar" => &["putchar"],
         "fputc" => &["fputc"],
         "fwrite" => &["fwrite"],
@@ -86,10 +87,14 @@ fn reach(f: &str) -> &'static [&'static str] {
 }
 
 /// The calls a pass can create (see the module docs).
-const SYNTHESIZED: [Libcall; 8] = [
+const SYNTHESIZED: [Libcall; 9] = [
     Libcall::Memset,
     Libcall::Memcpy,
     Libcall::Memmove,
+    // The byte-search rewrite synthesizes `memchr`.  Without an entry here a
+    // TU-defined `memchr` would not withdraw it, and the rewrite would turn
+    // that function's own scan loop into a call to itself.
+    Libcall::Memchr,
     Libcall::Puts,
     Libcall::Fputs,
     Libcall::Putchar,

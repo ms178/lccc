@@ -122,7 +122,18 @@ MARKER='FIX''ME'
 #        `LazyLock` in src/passes/cfg_simplify.rs next to the fold it gates,
 #        so the fold pays one read per process.  Raised to the measurement,
 #        exactly.
-ENV_READ_BUDGET=148
+#   149  2026-11-11: the byte-search idiom's kill switch (CCC_NO_MEMCHR_IDIOM),
+#        which keeps `for (i = 0; i < n; i++) if (p[i] == c) return p + i;`
+#        as a loop instead of a `memchr` call.
+#   147  2026-11-11, same series: instead of paying that read, both loop_idiom
+#        switches (CCC_NO_LOOP_IDIOM and CCC_NO_MEMCHR_IDIOM) are resolved once
+#        per translation unit in `run_passes` and installed through
+#        `loop_idiom::set_config`, the same shape as the strided-reduce and
+#        SSA-parameter switches above.  CCC_NO_LOOP_IDIOM used to be read with
+#        `getenv` inside `recognize_idioms`, i.e. once per *function*; that read
+#        leaves the count as well, so the two switches now cost nothing here and
+#        the measurement dropped by one net.  Tightened to it.
+ENV_READ_BUDGET=147
 
 fail=0
 report() { # report <label> <offending lines>
