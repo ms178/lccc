@@ -136,12 +136,22 @@ fn same_register_image(a: &CType, b: &CType) -> bool {
 impl Lowerer {
     /// `%v = VecLoad<fam>(ptr, 0)`.
     pub(super) fn emit_vec_load(&mut self, shape: &SimdShape, ptr: Value) -> Value {
+        self.emit_vec_load_at(shape, ptr, 0)
+    }
+
+    /// `VecLoad<fam>(ptr + disp)`.
+    ///
+    /// A constant byte offset belongs in the instruction's displacement, not
+    /// in a separate `leaq`/`addq` on the pointer: `vpaddq 8(%rdi), ...` is one
+    /// instruction where `addq $8, %rdi; vpaddq (%rdi), ...` is two. Consumers
+    /// that peel a constant offset off the address expression come here.
+    pub(super) fn emit_vec_load_at(&mut self, shape: &SimdShape, ptr: Value, disp: i64) -> Value {
         let dest = self.fresh_value();
         self.emit(Instruction::Intrinsic {
             dest: Some(dest),
             op: shape.fam.load,
             dest_ptr: None,
-            args: vec![Operand::Value(ptr), Operand::Const(IrConst::I64(0))],
+            args: vec![Operand::Value(ptr), Operand::Const(IrConst::I64(disp))],
         });
         dest
     }

@@ -13,7 +13,7 @@
 
 use super::lower::Lowerer;
 use crate::common::types::{AddressSpace, IrType};
-use crate::frontend::parser::ast::Expr;
+use crate::frontend::parser::ast::{BinOp, Expr};
 use crate::frontend::sema::builtins::BuiltinIntrinsic;
 use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand, Value};
 
@@ -752,6 +752,48 @@ fn native_fma_256(mnemonic: &str) -> Option<(IntrinsicOp, IrType, usize)> {
     }
 }
 
+/// The 128-bit twin of [`native_fma_256`]: `fmadd<132|213|231><ps|pd>128`
+/// (the SSE-width FMA3 spellings carry no `v` and an explicit `128`).
+///
+/// The three-digit forms differ only in which register the encoding makes
+/// destructive; the header's wrapper lists the operands so that all three
+/// compute the same function, exactly as the 256-bit arm relies on.  The SIGN
+/// structure is what selects the twin: `fmsub` is `a*b - c`, `fnmadd` is
+/// `-(a*b) + c`, `fnmsub` is `-(a*b) - c`, and the register twins say exactly
+/// that.
+fn native_fma_128(mnemonic: &str) -> Option<(IntrinsicOp, IrType, usize)> {
+    use IntrinsicOp::*;
+    // Order matters: `fnmsub`/`fnmadd` share the `f`+`n` prefix with `fmsub`.
+    let (negative_product, negative_addend, rest) = if let Some(r) = mnemonic.strip_prefix("fnmsub")
+    {
+        (true, true, r)
+    } else if let Some(r) = mnemonic.strip_prefix("fnmadd") {
+        (true, false, r)
+    } else if let Some(r) = mnemonic.strip_prefix("fmsub") {
+        (false, true, r)
+    } else if let Some(r) = mnemonic.strip_prefix("fmadd") {
+        (false, false, r)
+    } else {
+        return None;
+    };
+    let digits = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let digits_len = rest.len() - digits.len();
+    if digits_len != 3 || !matches!(rest.get(..3), Some("132" | "213" | "231")) {
+        return None;
+    }
+    match (digits, negative_product, negative_addend) {
+        ("ps128", false, false) => Some((VecFmaF32x4, IrType::F32, 16)),
+        ("ps128", false, true) => Some((VecFmsF32x4, IrType::F32, 16)),
+        ("ps128", true, false) => Some((VecFnmaF32x4, IrType::F32, 16)),
+        ("ps128", true, true) => Some((VecFnmsF32x4, IrType::F32, 16)),
+        ("pd128", false, false) => Some((VecFmaF64x2, IrType::F64, 16)),
+        ("pd128", false, true) => Some((VecFmsF64x2, IrType::F64, 16)),
+        ("pd128", true, false) => Some((VecFnmaF64x2, IrType::F64, 16)),
+        ("pd128", true, true) => Some((VecFnmsF64x2, IrType::F64, 16)),
+        _ => None,
+    }
+}
+
 /// What a pointer-form packed map op needs beyond its vector operands.
 ///
 /// `Binary` covers the families whose only arguments are the two register
@@ -966,7 +1008,12 @@ impl Lowerer {
         // entry (`FmaPs132v256` & co.) exists purely to describe the operand
         // list.  Keyed on the mnemonic because one opcode names four sign
         // structures, and the sign structure — not the op — selects the op.
-        let fma = native_fma_256(mnemonic);
+        // Both widths: the 256-bit table keys on the VEX spellings
+        // (`vfmadd132ps256`), the 128-bit one on the SSE-width spellings
+        // (`fmadd132ps128`).  Before this, every 128-bit FMA kept the pointer
+        // form: `_mm_fmadd_ps(_mm_loadu_ps(p), b, c)` cost 9 instructions and
+        // a 120-byte frame against GCC's 2.
+        let fma = native_fma_256(mnemonic).or_else(|| native_fma_128(mnemonic));
         let (native, element, bytes) = match fma {
             Some(triple) => triple,
             None => match op {
@@ -992,10 +1039,13 @@ impl Lowerer {
         if self.target != crate::backend::Target::X86_64 {
             return None;
         }
-        // The 128-bit double wrapper still crosses an I128 carrier at inline
-        // returns. Until that bridge is native, this route adds spills (the
-        // ordered FP fixture measures 74 -> 89 provider instructions). Keep
-        // its established pointer emitter; wide doubles have no I128 bridge.
+        // The 128-bit DOUBLE families are still refused: their inline
+        // returns cross an I128 carrier that is not native yet, and the
+        // ordered-FP fixture measured 74 -> 89 provider instructions when
+        // they were routed here.  The 128-bit SINGLE families have no such
+        // carrier (`__m128` returns in %xmm0), so they now take the value
+        // form: `_mm_fmadd_ps(loadu(p), b, c)` measures 9 -> 2 against
+        // GCC's 2.
         if bytes == 16 && element == IrType::F64 {
             return None;
         }
@@ -1181,11 +1231,15 @@ impl Lowerer {
                 }
             }
             let ty = self.expr_ctype(arg);
-            let ptr = match self.direct_vector_load_ptr(arg, bytes) {
-                Some(p) => p,
-                None => self.vector_operand_ptr(arg, &ty),
-            };
-            operands.push(Operand::Value(self.emit_vec_load(&shape, ptr)));
+            match self.direct_vector_load_ptr(arg, bytes) {
+                Some((ptr, disp)) => {
+                    operands.push(Operand::Value(self.emit_vec_load_at(&shape, ptr, disp)));
+                }
+                None => {
+                    let ptr = self.vector_operand_ptr(arg, &ty);
+                    operands.push(Operand::Value(self.emit_vec_load(&shape, ptr)));
+                }
+            }
         }
         match tail {
             NativeMapTail::Binary => {}
@@ -1257,7 +1311,7 @@ impl Lowerer {
     /// volatile access anywhere in the expression, a non-default address
     /// space, a load whose width differs from the operand's, or a callee
     /// that is not a plain identifier (`(*fp)(p)` may be anything).
-    fn direct_vector_load_ptr(&mut self, expr: &Expr, bytes: usize) -> Option<Value> {
+    fn direct_vector_load_ptr(&mut self, expr: &Expr, bytes: usize) -> Option<(Value, i64)> {
         let Expr::FunctionCall(callee, call_args, _) = expr else {
             return None;
         };
@@ -1276,8 +1330,49 @@ impl Lowerer {
         if self.get_addr_space_of_struct_expr(&call_args[0]) != AddressSpace::Default {
             return None;
         }
-        let ptr = self.lower_expr(&call_args[0]);
-        Some(self.operand_to_value(ptr))
+        // A CONSTANT byte offset in the address expression is the
+        // instruction's displacement: peeling it here means the `+ k`
+        // arithmetic is never lowered at all (`vpaddq 8(%rdi), %ymm0, %ymm0`
+        // instead of `addq $8, %rdi` + `vpaddq (%rdi), %ymm0, %ymm0`).
+        let (base_expr, disp) = self.split_const_offset(&call_args[0]);
+        let ptr = self.lower_expr(base_expr);
+        Some((self.operand_to_value(ptr), disp))
+    }
+
+    /// `expr` split into a base pointer expression and its constant byte
+    /// offset.  Casts are transparent (they do not move the address), and
+    /// `+`/`-` chains of constants accumulate; everything else is the base
+    /// with offset 0.  `None`-free by construction: the caller always gets a
+    /// usable base.
+    fn split_const_offset<'e>(&mut self, expr: &'e Expr) -> (&'e Expr, i64) {
+        let mut cur = expr;
+        let mut disp: i64 = 0;
+        loop {
+            match cur {
+                Expr::Cast(_, inner, _, _) => cur = inner,
+                Expr::BinaryOp(BinOp::Add, lhs, rhs, _) => {
+                    if let Some(k) = self.eval_const_expr(rhs).and_then(|c| c.to_i64()) {
+                        disp = disp.wrapping_add(k);
+                        cur = lhs;
+                    } else if let Some(k) = self.eval_const_expr(lhs).and_then(|c| c.to_i64()) {
+                        disp = disp.wrapping_add(k);
+                        cur = rhs;
+                    } else {
+                        break;
+                    }
+                }
+                Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) => {
+                    if let Some(k) = self.eval_const_expr(rhs).and_then(|c| c.to_i64()) {
+                        disp = disp.wrapping_sub(k);
+                        cur = lhs;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        (cur, disp)
     }
 
     /// The lane constant of a whole-register broadcast of a CONSTANT, when

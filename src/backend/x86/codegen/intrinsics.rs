@@ -1084,15 +1084,27 @@ impl X86Codegen {
         let Some(base) = self.operand_reg(&args[0]).filter(|r| is_gpr(*r)) else {
             return false;
         };
-        let index = match &args[1] {
-            Operand::Const(c) if c.to_i64() == Some(0) => None,
-            Operand::Const(_) => return false,
-            other => match self.operand_reg(other) {
-                Some(r) if is_gpr(r) => Some(r),
-                _ => return false,
-            },
+        // Two operand layouts reach here: the vectorizer's
+        // `(base, index, disp)` triple and the two-operand `(base, disp)`
+        // form every `VecLoad*` produced by the scalar/lowering paths uses.
+        // Reading the two-operand form with the triple's indices treated
+        // `args[1]` — a CONSTANT offset — as an index and refused the fold,
+        // which is why `*(p + 8)` streamed into a register and then folded
+        // nothing (`vmovdqu 8(%rdi), %ymm3` + `vpaddq`, GCC: one `vpaddq`).
+        let (index, disp) = if args.len() == 2 {
+            let disp = Self::vec_disp_arg(args, 1);
+            (None, disp)
+        } else {
+            let index = match &args[1] {
+                Operand::Const(c) if c.to_i64() == Some(0) => None,
+                Operand::Const(_) => return false,
+                other => match self.operand_reg(other) {
+                    Some(r) if is_gpr(r) => Some(r),
+                    _ => return false,
+                },
+            };
+            (index, Self::vec_disp_arg(args, 2))
         };
-        let disp = Self::vec_disp_arg(args, 2);
         // Deferred operands must use stable allocated homes, never scratch
         // registers whose contents can change before the consumer. Refuse
         // an unencodable displacement; the ordinary load stages it safely.
@@ -2816,7 +2828,7 @@ impl X86Codegen {
                 .iter()
                 .any(|a| matches!(a, Operand::Value(v) if v.0 == pf.val))
                 && width_matches;
-            if !consumes && !cc::is_pure_vec_load(op) {
+            if !consumes && !cc::is_vlfold_pure_load(op) {
                 self.materialize_pending_memfold();
             }
         }
@@ -9889,7 +9901,7 @@ impl X86Codegen {
                     && this.state.vec_live_regs.get(&v.0).copied() == Some(name)
             };
             let emit_2xx = |this: &mut Self,
-                            form: &'static str,
+                            form: &str,
                             src2: String,
                             dst: &'static str,
                             consumed_pending: bool| {
@@ -9974,6 +9986,35 @@ impl X86Codegen {
             // the fold — see above).
             if (m0.0 == pv || m1.0 == pv) && bias.0 != pv {
                 let other = if m0.0 == pv { m1 } else { m0 };
+                // ZERO-COPY PREFERENCE (form 132): the result's OWN home
+                // already holds the streamed multiplicand `other` — the
+                // allocator coalesced them because `other` is single-use —
+                // so the fold can be the MULTIPLIER and `other` the
+                // accumulator: `d = d * MEM + addend`, one instruction and
+                // no staging. This is the `_mm*_fma(mul_reg, *(p), addend)`
+                // shape and exactly GCC's `vfmadd132ps (%rdi), %ymm1,
+                // %ymm0`; the pre-132 emitter could only spell it as
+                // 231-into-the-addend, which cost `vmovaps` + scratch +
+                // `vmovdqa` (measured: 4 instructions vs GCC's 1, the
+                // `fma_load_a/b/pd` homing-budget failure). Gated on the
+                // DEST home so the write is one the RA already expects.
+                let dest_home = self
+                    .reg_assignments
+                    .get(&dest.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r));
+                if let Some(dh) = dest_home {
+                    if home(self, other) == Some(dh) {
+                        if let Some(src2) = home(self, bias)
+                            .map(|r| format!("%{}", phys_reg_name_256(r)))
+                            .or_else(|| held(self, bias).map(|h| format!("%{h}")))
+                        {
+                            let consumed = held(self, bias).is_some();
+                            emit_2xx(self, mnemonic, src2, phys_reg_name_256(dh), consumed);
+                            return;
+                        }
+                    }
+                }
                 let src2 = home(self, other)
                     .map(|r| format!("%{}", phys_reg_name_256(r)))
                     .or_else(|| held(self, other).map(|h| format!("%{h}")));

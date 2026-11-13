@@ -2366,16 +2366,22 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
             | O::VecLoadI8x16
             | O::VecLoadI8x32
             | O::VecLoadI16x16
-            // The raw-pointer user-facing loads are pure reads too: an
-            // adjacent `_mm*_loadu_*` must not force the pending fold to
-            // materialise (both operands of `op(load(p), load(q))` are
-            // loads, and folding ONE of them is the win).
-            | O::Loaddqu
-            | O::Loadu256
-            | O::Load256
-            | O::LoaduPs256
-            | O::LoaduPd256
     )
+}
+
+/// Pure vector loads for the VLFOLD SAFETY NET: an intervening load must not
+/// force a pending fold to materialise (both operands of
+/// `op(load(p), load(q))` are loads, and folding ONE of them is the win).
+///
+/// Deliberately separate from [`is_pure_vec_load`], which is ALSO the block-0
+/// prefix grammar of `x86_vector_param_loads`: widening that set changes which
+/// parameters the prologue preloads, and doing so silently moved a register
+/// home in the FMA/fold fixtures (measured: `fma_load_b` regressed 3 -> 4
+/// instructions with an extra `vmovaps`).  The fold-safety question and the
+/// prologue-grammar question are different questions, so they get different
+/// predicates.
+pub(crate) fn is_vlfold_pure_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    is_pure_vec_load(op) || is_memfold_rawptr_load_128(op) || is_memfold_rawptr_load_256(op)
 }
 
 /// 256-bit loads eligible for source-operand folding (VLFOLD).
