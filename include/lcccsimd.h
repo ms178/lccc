@@ -1193,13 +1193,6 @@ __m128 __lccc_simd128_ps_fmadd132ps128(long, __m128 __a, __m128 __b, __m128 __c)
 __m128d __lccc_simd128_ps_fmadd132pd128(long, __m128d __a, __m128d __b, __m128d __c);
 #define _mm_fmadd_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmadd132pd128(0, __a, __b, __c))
 
-/* The rest of the FMA3 family.  Every one of these rounds the product ONCE,
- * after the addend is applied.  They must NOT be written as a lane loop over
- * `a*b +- c`: that is two roundings, and it only ever looked correct because
- * the default -ffp-contract=fast contracted the loop back into one instruction.
- * With -ffp-contract=off the loop returned 0 where gcc-16 returns -1.42e-14.
- * The native helper emits the single instruction unconditionally. */
-
 __m128 __lccc_simd128_ps_fmsub132ps128(long, __m128 __a, __m128 __b, __m128 __c);
 #define _mm_fmsub_ps(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmsub132ps128(0, __a, __b, __c))
 
@@ -1230,14 +1223,8 @@ __m128d __lccc_simd128_ps_fmaddsub132pd128(long, __m128d __a, __m128d __b, __m12
 __m128d __lccc_simd128_ps_fmsubadd132pd128(long, __m128d __a, __m128d __b, __m128d __c);
 #define _mm_fmsubadd_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmsubadd132pd128(0, __a, __b, __c))
 
-/* Scalar FMA3.  Lane 0 is fused; the upper lanes of `a` pass through, which is
- * exactly what the 132 placement of the ss/sd encoding does. */
-
 __m128 __lccc_simd128_ps_fmadd132ss128(long, __m128 __a, __m128 __b, __m128 __c);
 #define _mm_fmadd_ss(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmadd132ss128(0, __a, __b, __c))
-
-__m128d __lccc_simd128_ps_fmadd132sd128(long, __m128d __a, __m128d __b, __m128d __c);
-#define _mm_fmadd_sd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmadd132sd128(0, __a, __b, __c))
 
 __m128 __lccc_simd128_ps_fmsub132ss128(long, __m128 __a, __m128 __b, __m128 __c);
 #define _mm_fmsub_ss(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmsub132ss128(0, __a, __b, __c))
@@ -1247,6 +1234,9 @@ __m128 __lccc_simd128_ps_fnmadd132ss128(long, __m128 __a, __m128 __b, __m128 __c
 
 __m128 __lccc_simd128_ps_fnmsub132ss128(long, __m128 __a, __m128 __b, __m128 __c);
 #define _mm_fnmsub_ss(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fnmsub132ss128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fmadd132sd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fmadd_sd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmadd132sd128(0, __a, __b, __c))
 
 __m128d __lccc_simd128_ps_fmsub132sd128(long, __m128d __a, __m128d __b, __m128d __c);
 #define _mm_fmsub_sd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmsub132sd128(0, __a, __b, __c))
