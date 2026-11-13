@@ -304,6 +304,11 @@ pub(crate) fn forward_vector_temp_stores(module: &mut IrModule) -> usize {
     module.for_each_function(forward_in_function)
 }
 
+/// Executed differential tests (byte-accurate IR model) for the pass's proof.
+#[cfg(test)]
+#[path = "vector_store_forward_interp_tests.rs"]
+mod interp_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1223,9 +1223,13 @@ fn vectorize_with_analysis_mode(
                         vec_width
                     ));
                 }
-            } else if use_sse2 || red_pattern.element_type == IrType::I64 {
-                // I64 AVX2 4-wide path not wired yet; 2-wide SSE/AVX is competitive
-                // and beats scalar (Godbolt: GCC/Clang/ICX all vectorize I64 sums).
+            } else if use_sse2 {
+                // 2-wide when the target cannot do ymm.  I64 sums also take the
+                // 4-wide path below once AVX2 is available: `vpaddq` needs no
+                // widening helper, so a 64-bit sum is a pure width win over the
+                // 128-bit arm (`transform_reduction_avx2`'s I64 arm).  The two
+                // arms are otherwise identical in shape, so a target without
+                // AVX2 keeps exactly the code it had.
                 if debug {
                     lccc::cli::stderr_line(format_args!(
                         "[VEC] Reduction pattern matched! Transforming to SSE2 2-wide"
@@ -29637,6 +29641,35 @@ fn transform_reduction_avx2(
                 Some(IntrinsicOp::VecMulF32x8),
                 IntrinsicOp::VecHorizontalAddF32x8, // pass-through (no legacy F32 form)
             ),
+            // 4-lane 64-bit SUM (`uint64_t s; for (i) s += a[i]`).  `vpaddq`
+            // is a real ADD on every lane width, so unlike the product forms
+            // this needs no emulation: 32 bytes/iteration against the 128-bit
+            // arm's 16, with the same one-instruction body and the same
+            // single `vextracti128`-free horizontal reduce
+            // (`VecHorizontalAddI64x4`).  Measured on
+            // `tests/benchmark/programs/unsigned_reduction.c`.
+            //
+            // DotProduct/Max/Min stay refused: a 64x64 low-half product has no
+            // packed form below AVX-512DQ, and the 64-bit min/max epilogue has
+            // no horizontal primitive -- `transform_reduction_avx2`'s body
+            // table `panic!`s on an unlisted element type, so this arm must
+            // bail rather than fall through.
+            IrType::I64 if pattern.kind == ReductionKind::Sum => (
+                4u64,
+                IntrinsicOp::VecLoadI64x4,
+                IntrinsicOp::VecAddI64x4,
+                None,
+                IntrinsicOp::VecHorizontalAddI64x4,
+            ),
+            IrType::I64 => {
+                if debug {
+                    lccc::cli::stderr_line(format_args!(
+                        "[VEC-RED] Unsupported I64 AVX2 reduction kind: {:?}",
+                        pattern.kind
+                    ));
+                }
+                return 0;
+            }
             _ => {
                 if debug {
                     lccc::cli::stderr_line(format_args!(
@@ -30174,6 +30207,11 @@ fn transform_reduction_avx2(
                         IntrinsicOp::VecLoadF32x8,
                         IntrinsicOp::VecAddF32x8,
                         IntrinsicOp::VecZeroF32x8,
+                    ),
+                    IrType::I64 => (
+                        IntrinsicOp::VecLoadI64x4,
+                        IntrinsicOp::VecAddI64x4,
+                        IntrinsicOp::VecZeroI64x4,
                     ),
                     _ => panic!("Unsupported AVX2 element type: {:?}", pattern.element_type),
                 };

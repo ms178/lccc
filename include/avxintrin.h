@@ -309,58 +309,60 @@ _mm256_hsub_pd(__m256d __a, __m256d __b)
 
 
 
-/* === Bitwise operations (pd) === */
+/* === Bitwise operations ===
+ *
+ * Bitwise AND/OR/XOR are lane-agnostic: the integer families are single
+ * `vpand`/`vpor`/`vpxor` instructions and the float forms are the same
+ * instruction on the same register, so each of these is a reinterpretation of
+ * the integer form rather than an element-wise loop.  The previous
+ * element-wise `union`/`for` bodies lowered to a per-lane GPR round trip
+ * (`vmovsd`/`vmovq`/`xor`/`vmovsd` x 4 with a stack temporary) because the
+ * bit-fiddle is opaque to the SLP vectorizer -- measured on
+ * `tests/regression/simd_avx256_float_bitwise.c`.  `andnot` comes straight
+ * from the frontend's `vpandn` builtin and must NOT be redefined here: the
+ * inline definition would shadow it and reintroduce the loop.
+ */
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_and_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __ua, __ub, __ur;
-        __ua.d = __a[__i]; __ub.d = __b[__i];
-        __ur.ll = __ua.ll & __ub.ll;
-        __r[__i] = __ur.d;
-    }
-    return __r;
+    return _mm256_castsi256_pd(
+        _mm256_and_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_or_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __ua, __ub, __ur;
-        __ua.d = __a[__i]; __ub.d = __b[__i];
-        __ur.ll = __ua.ll | __ub.ll;
-        __r[__i] = __ur.d;
-    }
-    return __r;
+    return _mm256_castsi256_pd(
+        _mm256_or_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_xor_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __ua, __ub, __ur;
-        __ua.d = __a[__i]; __ub.d = __b[__i];
-        __ur.ll = __ua.ll ^ __ub.ll;
-        __r[__i] = __ur.d;
-    }
-    return __r;
+    return _mm256_castsi256_pd(
+        _mm256_xor_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
 }
 
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_andnot_pd(__m256d __a, __m256d __b)
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_and_ps(__m256 __a, __m256 __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __ua, __ub, __ur;
-        __ua.d = __a[__i]; __ub.d = __b[__i];
-        __ur.ll = (~__ua.ll) & __ub.ll;
-        __r[__i] = __ur.d;
-    }
-    return __r;
+    return _mm256_castsi256_ps(
+        _mm256_and_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_or_ps(__m256 __a, __m256 __b)
+{
+    return _mm256_castsi256_ps(
+        _mm256_or_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_xor_ps(__m256 __a, __m256 __b)
+{
+    return _mm256_castsi256_ps(
+        _mm256_xor_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
 }
 
 /* === Movemask === */

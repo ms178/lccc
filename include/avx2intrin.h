@@ -75,23 +75,16 @@ _mm256_setr_epi8(
 
 /* === Bitwise === */
 
+/* `pand`/`pandn` are frontend builtins that lower to one `vpand`/`vpandn`.
+ * Expressing them as element-wise initializers (the previous form) leaves the
+ * bitwise op to the SLP vectorizer, which does not see through the
+ * per-element lane expressions in every context. */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_and_si256(__m256i __a, __m256i __b)
 {
-    return (__m256i){  __a[0] & __b[0],
-                        __a[1] & __b[1],
-                        __a[2] & __b[2],
-                        __a[3] & __b[3]  };
+    return (__m256i)__builtin_ia32_pand256((__v4di)(__a), (__v4di)(__b));
 }
 
-static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_andnot_si256(__m256i __a, __m256i __b)
-{
-    return (__m256i){  ~__a[0] & __b[0],
-                        ~__a[1] & __b[1],
-                        ~__a[2] & __b[2],
-                        ~__a[3] & __b[3]  };
-}
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_or_si256(__m256i __a, __m256i __b)
