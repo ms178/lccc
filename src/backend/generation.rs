@@ -6602,13 +6602,15 @@ fn generate_function_body(
     // need the caller-side dynamic %rsp realignment (SysV AMD64, GCC ≥ 4.6
     // ABI — see emit_call_stack_args_impl). The runtime realignment delta
     // forbids %rsp-relative slot addressing for the rest of the function,
-    // so such functions keep a frame pointer. Conservative (register-passed
-    // over-aligned structs force it too): the shape is ABI-exotic either
-    // way and the frame pointer costs nothing semantically.
+    // so such functions keep a frame pointer. The backend answers per call
+    // site (`call_arg_realignment_pins_frame`): only a MEMORY-class stack
+    // argument realigns %rsp — a register-passed over-aligned vector
+    // (`__m256`/`__m512` in %ymm/%zmm) never touches the outgoing stack
+    // area, so `v8 f(v8 a){ return ext8(a); }` keeps its %rsp-only frame.
     let has_overaligned_call_args = func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| match inst {
             Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                info.struct_arg_aligns.iter().any(|a| a.unwrap_or(0) > 16)
+                cg.call_arg_realignment_pins_frame(info)
             }
             _ => false,
         })

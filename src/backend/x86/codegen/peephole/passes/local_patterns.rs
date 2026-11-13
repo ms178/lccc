@@ -478,6 +478,175 @@ pub(super) fn forward_adjacent_gp_stack_loads(
     changed
 }
 
+/// A full-width 256-bit vector move mnemonic. All eight spellings move the
+/// same 32 bytes bit-exactly; the int/float domain distinction is a bypass
+/// hint, not a semantic one.
+fn is_ymm_full_move(mn: &str) -> bool {
+    matches!(
+        mn,
+        "vmovdqu" | "vmovdqa" | "vmovups" | "vmovaps" | "vmovupd" | "vmovapd"
+    )
+}
+
+/// Split `"<mn> <a>, <b>"` into `(mn, a, b)` for a two-operand line.
+fn split_mn_two_ops(trimmed: &str) -> Option<(&str, &str, &str)> {
+    let (mn, rest) = trimmed.split_once(char::is_whitespace)?;
+    let (a, b) = rest.split_once(',')?;
+    Some((mn, a.trim(), b.trim()))
+}
+
+/// Delete the reload of a `vmovdqu %ymmN, OFF(%rsp|%rbp)` /
+/// `vmov* OFF(...), %ymmN` ADJACENT pair: between two adjacent lines
+/// neither the slot nor the register can change, and a full-width 256-bit
+/// reload of the register just stored is the identity.
+///
+/// This is the YMM tier `store_forwarding` does not model (its slot
+/// mappings stop at `MoveSize::DQ`); the shape is the call boundary of a
+/// `%ymm`-marshalled vector — the capture store of an incoming `%ymm0`
+/// argument followed by the argument load of a forwarding call, and the
+/// hidden `%ymm0` return-buffer store followed by the `Return` reload
+/// (`v8 f(v8 a){ return ext8(a); }` pays both pairs).
+///
+/// Refusals, all fail-closed:
+/// * either line pinned, or the reload marked as a volatile access;
+/// * operands not the exact same `OFF(%rsp)`/`OFF(%rbp)` text (no index,
+///   no RIP, no symbol — textual equality of a pure frame slot);
+/// * different `%ymm` registers (a cross-register pair is forwarding, not
+///   identity; left to a stronger pass);
+/// * any `%zmm` text in the function: `vmov* mem, %ymmN` zeroes bits
+///   256..511 of the bank, so with AVX-512 state live the reload has an
+///   architectural effect beyond the 32 bytes (exactly the upper-zeroing
+///   hazard `store_forwarding` documents one tier down).
+pub(super) fn forward_adjacent_ymm_self_reloads(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    // Cheap whole-function AVX-512 screen (see the `%zmm` refusal above).
+    for i in 0..len {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        if t.contains("%zmm") || t.contains("vzeroall") {
+            return false;
+        }
+    }
+    let mut changed = false;
+    for i in 0..len {
+        let st = infos[i].trimmed(store.get(i));
+        let Some((smn, sreg, smem)) = split_mn_two_ops(st) else {
+            continue;
+        };
+        if !is_ymm_full_move(smn) || !sreg.starts_with("%ymm") {
+            continue;
+        }
+        let plain_frame_slot = smem
+            .strip_suffix("(%rsp)")
+            .or_else(|| smem.strip_suffix("(%rbp)"))
+            .is_some_and(|d| d.is_empty() || d.parse::<i64>().is_ok());
+        if !plain_frame_slot {
+            continue;
+        }
+        let j = next_non_debug(store, infos, i + 1, len);
+        if j >= len || !all_editable(infos, &[i, j]) || infos[j].volatile_access {
+            continue;
+        }
+        let ld = infos[j].trimmed(store.get(j));
+        let Some((lmn, lmem, lreg)) = split_mn_two_ops(ld) else {
+            continue;
+        };
+        if is_ymm_full_move(lmn) && lmem == smem && lreg == sreg {
+            mark_nop(&mut infos[j]);
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod ymm_self_reload_tests {
+    use super::*;
+
+    fn run(asm: &str) -> (Vec<String>, bool) {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = forward_adjacent_ymm_self_reloads(&mut store, &mut infos);
+        let lines = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (lines, changed)
+    }
+
+    #[test]
+    fn adjacent_identity_reload_is_deleted() {
+        let (out, changed) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    call ext8@PLT\n",
+            "    vmovdqu %ymm0, 48(%rsp)\n",
+            "    vmovups 48(%rsp), %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert!(!out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm0"));
+        assert!(!out.iter().any(|l| l == "vmovups 48(%rsp), %ymm0"));
+        // The stores stay: their slots may have other readers.
+        assert!(out.iter().any(|l| l == "vmovdqu %ymm0, 96(%rsp)"));
+        assert!(out.iter().any(|l| l == "vmovdqu %ymm0, 48(%rsp)"));
+    }
+
+    #[test]
+    fn different_register_slot_or_distance_refuses() {
+        // Different register.
+        let (out, _) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm1\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm1"));
+        // Different slot.
+        let (out, _) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 64(%rsp), %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "vmovdqu 64(%rsp), %ymm0"));
+        // An intervening instruction (the call clobbers %ymm0).
+        let (out, _) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    call ext8@PLT\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm0"));
+        // An indexed memory operand is not a plain frame slot.
+        let (out, _) = run(concat!(
+            "    vmovdqu %ymm0, 8(%rsp,%rax)\n",
+            "    vmovdqu 8(%rsp,%rax), %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "vmovdqu 8(%rsp,%rax), %ymm0"));
+    }
+
+    #[test]
+    fn zmm_in_function_refuses_upper_zeroing_elision() {
+        // `vmovdqu mem, %ymm0` zeroes zmm0 bits 256..511; with AVX-512
+        // state in the function the reload has an architectural effect.
+        let (out, changed) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    vmovdqu64 %zmm1, (%rdi)\n",
+            "    ret\n",
+        ));
+        assert!(!changed);
+        assert!(out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm0"));
+    }
+}
+
 /// Highest set bit: `bsr S, D; xor $W-1, D; xor $W-1, D` -> `bsr S, D`.
 ///
 /// ClzNonZero lowers to `bsr; xor $W-1`, and simplify turns the

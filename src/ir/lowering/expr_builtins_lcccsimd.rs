@@ -1387,11 +1387,15 @@ impl Lowerer {
     /// materialises values into temporaries: the consumer then reads the
     /// splat back from a fresh stack slot
     ///
-    ///     vpbroadcastq .LC0(%rip), %ymm0 ; vmovdqu %ymm0, 8(%rsp) ; vpaddq 8(%rsp), %ymm2
+    /// ```text
+    /// vpbroadcastq .LC0(%rip), %ymm0 ; vmovdqu %ymm0, 8(%rsp) ; vpaddq 8(%rsp), %ymm2
+    /// ```
     ///
     /// where the operand can be the tiled `.rodata` constant itself
     ///
-    ///     vpaddq .LC0(%rip), %ymm2, %ymm0
+    /// ```text
+    /// vpaddq .LC0(%rip), %ymm2, %ymm0
+    /// ```
     ///
     /// The backend already has that form (`try_emit_bitwise_lane_const`,
     /// used by every binary emitter); the ONLY thing missing was a lowering

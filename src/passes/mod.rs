@@ -107,6 +107,7 @@ pub(crate) mod vec_fma_contract;
 pub(crate) mod vec_interleave;
 pub(crate) mod vec_load_sink;
 mod vec_relations;
+pub(crate) mod vec_call_align_relax;
 pub(crate) mod vec_ssa;
 pub(crate) mod vector_copy_chain;
 pub(crate) mod vector_fill;
@@ -4654,6 +4655,18 @@ pub(crate) fn run_passes(
     // unaudited intrinsic positions retain their required alignment.
     if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::downgrade_nonescaping_vector_align(module);
+    }
+
+    // Phase 11d': the two call-marshalled shapes Phase 11d must refuse (a
+    // call use is an escape in its model): a register-passed `[Sse,
+    // SseUp...]` vector argument and the hidden `%ymm0`/`%zmm0` return
+    // buffer, both of which the x86-64 backend accesses exclusively through
+    // unaligned moves and whose address the callee never receives.  x86-64
+    // only: that is the backend whose marshalling the proof audits.
+    // Pass name for CCC_DISABLE_PASSES: "vecabialign".
+    if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "vecabialign") {
+        vec_call_align_relax::relax_call_marshalled_vector_align(module);
+        verify::verify_after_pass(module, "vecabialign");
     }
 
     // Phase 11e-pre: Compile-time SIMD mask facts (ISPC mask lattice).  A

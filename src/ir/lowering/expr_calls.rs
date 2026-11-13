@@ -564,6 +564,26 @@ impl Lowerer {
 
         // For two-register struct returns (9-16 bytes), unpack I128 into struct alloca
         if let Some(size) = two_reg_size {
+            // A 16-byte `[Sse, SseUp]` register return (`__m128`/`__m128i`/
+            // `__m128d`, or a struct wrapping one): the value comes back in
+            // ONE `%xmm0` and the backend homes the I128 carrier with one
+            // `movdqu` (`emit_call_store_result_impl`).  Give it object
+            // storage with ONE 16-byte store instead of
+            // `unpack_two_reg_return`'s GP-half split (Cast + LShr 64 + two
+            // I64 stores through `%rax`/`%rdx`), which cost a spill, two
+            // reloads and two false GP dependencies per vector-returning
+            // call — and made `v4 f(v4 a){ return ext4(a); }` rebuild
+            // `%xmm0` through four GP moves (RH-09 `ret128`).
+            if size == 16
+                && ret_abi.classes[..]
+                    == [
+                        crate::common::types::EightbyteClass::Sse,
+                        crate::common::types::EightbyteClass::SseUp,
+                    ]
+                && !crate::common::types::target_is_32bit()
+            {
+                return self.store_one_xmm_return(dest);
+            }
             return self.unpack_two_reg_return(dest, size);
         }
 
@@ -850,6 +870,31 @@ impl Lowerer {
     /// the object is rounded up to the 16-byte register image and the high
     /// half is stored whole: storing a full I64 at offset 8 of a 12-byte
     /// object, as this used to, writes past the allocation in IR terms.
+    /// Home a 16-byte one-`%xmm` register return (`[Sse, SseUp]`): one
+    /// 16-byte object and ONE `I128` store of the call result.  The backend
+    /// keeps the carrier's bits in the SSE file end to end (the call-result
+    /// home is written by `movdqu %xmm0` and the store below is a 16-byte
+    /// copy), so no GP register ever touches the vector.
+    fn store_one_xmm_return(&mut self, dest: Value) -> Operand {
+        let alloca = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: alloca,
+            ty: IrType::Ptr,
+            size: 16,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(dest),
+            ptr: alloca,
+            ty: IrType::I128,
+            seg_override: AddressSpace::Default,
+        });
+        Operand::Value(alloca)
+    }
+
     fn unpack_two_reg_return(&mut self, dest: Value, size: usize) -> Operand {
         debug_assert!(
             (9..=16).contains(&size),
