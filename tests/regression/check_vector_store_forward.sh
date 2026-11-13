@@ -110,13 +110,13 @@ if [ -f "$CORPUS" ]; then
     if ! "$WORK/slp-on" >"$WORK/slp-on.txt" 2>&1; then
         echo "FAIL: the SLP corpus disagrees with its scalar model with the load" >&2
         echo "      fold enabled, which is the misclassified-offset miscompile:" >&2
-        grep -E 'FAIL' "$WORK/slp-on.txt" | head -5 >&2
+        grep -E 'FAIL' "$WORK/slp-on.txt" | sed -n '1,5p' >&2
         exit 1
     fi
     if ! "$WORK/slp-off" >"$WORK/slp-off.txt" 2>&1; then
         echo "FAIL: the SLP corpus fails with the fold DISABLED too; that is not" >&2
         echo "      a fold problem and this gate cannot isolate it:" >&2
-        grep -E 'FAIL' "$WORK/slp-off.txt" | head -5 >&2
+        grep -E 'FAIL' "$WORK/slp-off.txt" | sed -n '1,5p' >&2
         exit 1
     fi
     echo "  ok  SLP indexed-load folding matches the scalar model (fold on and off)"
