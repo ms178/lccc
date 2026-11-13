@@ -69,6 +69,7 @@ WANT_LITERAL=$(sort -k2 <<'EOF'
 1 vechomefwd
 1 vecrelations
 1 vecssa
+1 vecstorefwd
 EOF
 )
 # `[a-z0-9_]*`: pass names carry digits (`aggcopy16`), and a matcher that
@@ -94,7 +95,7 @@ for funnel in iphase_dump o1_checkpoint preloop_dump timed_pass; do
     grep -q "macro_rules! $funnel" src/passes/mod.rs \
         || { echo "FAIL: hook funnel $funnel is gone from src/passes/mod.rs" >&2; exit 1; }
 done
-WANT_HOOKS=40
+WANT_HOOKS=41
 if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
     echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
     echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2
