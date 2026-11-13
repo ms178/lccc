@@ -2424,11 +2424,24 @@ impl I686Codegen {
                         match &args[0] {
                             Operand::Value(v) => {
                                 if let Some(slot) = self.state.get_slot(v.0) {
+                                    // BOTH halves are read BEFORE either push.
+                                    // A frame slot is not always %ebp-relative
+                                    // (a dynamic-alloca frame references it
+                                    // through %esp, see `slot_base_disp`), and
+                                    // `pushl` moves %esp: loading the low half
+                                    // after the high half had been pushed read
+                                    // the HIGH half a second time, so every
+                                    // runtime `_mm256_set1_epi64x(k)` staged
+                                    // `(hi,hi)` and broadcast `2^32*hi` --
+                                    // `_mm256_add_epi64(a, splat k)` then added
+                                    // zero (i686 only; measured on the
+                                    // int-map fixture, lane-exact).
                                     let sr0 = self.slot_ref(slot);
                                     let sr4 = self.slot_ref_offset(slot, 4);
-                                    emit!(self.state, "    movl {}, %eax", sr4);
-                                    self.state.emit("    pushl %eax");
                                     emit!(self.state, "    movl {}, %eax", sr0);
+                                    emit!(self.state, "    movl {}, %edx", sr4);
+                                    self.state.reg_cache.invalidate_all();
+                                    self.state.emit("    pushl %edx");
                                     self.state.emit("    pushl %eax");
                                 } else {
                                     self.operand_to_eax(&args[0]);

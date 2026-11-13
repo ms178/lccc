@@ -12,10 +12,10 @@
 //! - PtrStore: first arg is the destination pointer (masked stores, stores).
 
 use super::lower::Lowerer;
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::frontend::parser::ast::Expr;
 use crate::frontend::sema::builtins::BuiltinIntrinsic;
-use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand};
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LcccSimdClass {
@@ -1155,13 +1155,36 @@ impl Lowerer {
 
         // From here on the answer is committed: operand homes are loaded as
         // whole registers of the TWIN's lane type, which is a bitwise copy.
+        //
+        // A `_mm*_loadu_*` argument hands over ITS OWN pointer rather than a
+        // materialised copy (`direct_vector_load_ptr`): the operand is
+        // already the bytes, at an address the consumer can name.  Without
+        // this peel the lowering allocates a 32-byte temporary, emits the
+        // load into it, stores, and then re-loads it for the twin --
+        // `vmovdqu mem,%ymmN` + `vpaddq` where GCC emits `vpaddq mem,...`
+        // with no temporary at all.
         let mut operands = Vec::with_capacity(3);
-        for arg in args {
+        for (pos, arg) in args.iter().enumerate() {
             if !self.expr_ctype(arg).is_vector() {
                 continue;
             }
+            // A constant splat in the src2 position becomes the tiled
+            // `.rodata` r/m operand instead of a spilled vector (see
+            // `splat_lane_const`). Only position 1: every binary emitter's
+            // lane-constant form is `args.get(1)`, and the src2 slot is the
+            // one a memory operand can legally occupy for either
+            // commutativity class.
+            if matches!(tail, NativeMapTail::Binary) && pos == 1 && lane.size() >= 1 {
+                if let Some(c) = self.splat_lane_const(arg, lane.size(), bytes) {
+                    operands.push(Operand::Const(c));
+                    continue;
+                }
+            }
             let ty = self.expr_ctype(arg);
-            let ptr = self.vector_operand_ptr(arg, &ty);
+            let ptr = match self.direct_vector_load_ptr(arg, bytes) {
+                Some(p) => p,
+                None => self.vector_operand_ptr(arg, &ty),
+            };
             operands.push(Operand::Value(self.emit_vec_load(&shape, ptr)));
         }
         match tail {
@@ -1189,6 +1212,133 @@ impl Lowerer {
         let result = self.emit_entry_alloca(IrType::Ptr, bytes, bytes, false);
         self.emit_vec_store(&shape, value, result);
         Some(Operand::Value(result))
+    }
+
+    /// Bytes of the whole-register vector load builtin `name`, if it is one.
+    ///
+    /// Only the PLAIN loaders belong here: `_mm_loadl_epi64` reads 8 bytes
+    /// and `_mm_loadu_si32` reads 4, so neither can stand in for a whole
+    /// 16/32-byte operand, and the masked/gather families are not loads of
+    /// the operand's width either.
+    fn vector_load_builtin_bytes(name: &str) -> Option<usize> {
+        Some(match name {
+            "_mm_loadu_si128"
+            | "_mm_load_si128"
+            | "_mm_loadu_ps"
+            | "_mm_load_ps"
+            | "_mm_loadu_pd"
+            | "_mm_load_pd"
+            | "__builtin_ia32_loadups"
+            | "__builtin_ia32_loaddqu"
+            | "__builtin_ia32_loadpd" => 16,
+            "_mm256_loadu_si256"
+            | "_mm256_load_si256"
+            | "_mm256_loadu_ps"
+            | "_mm256_loadu_pd"
+            | "__builtin_ia32_loadups256"
+            | "__builtin_ia32_loaddqu256"
+            | "__builtin_ia32_loadpd256" => 32,
+            _ => return None,
+        })
+    }
+
+    /// The address a vector expression reads its bytes from, when that
+    /// expression is itself a whole-register intrinsic LOAD.
+    ///
+    /// `vector_operand_ptr` turns an rvalue into an address by
+    /// materialising it: for `_mm256_loadu_si256(p)` that is an alloca, the
+    /// load, a store, and then a re-load by the consumer.  Every one of
+    /// those bytes is already in memory at `p`, so handing back `p` is the
+    /// same read, once, at the same point in the program -- and it is what
+    /// lets the consumer's `VecLoad*` be folded into the instruction's r/m
+    /// slot by VLFOLD.
+    ///
+    /// Refusals keep the established (correct, merely slower) path: a
+    /// volatile access anywhere in the expression, a non-default address
+    /// space, a load whose width differs from the operand's, or a callee
+    /// that is not a plain identifier (`(*fp)(p)` may be anything).
+    fn direct_vector_load_ptr(&mut self, expr: &Expr, bytes: usize) -> Option<Value> {
+        let Expr::FunctionCall(callee, call_args, _) = expr else {
+            return None;
+        };
+        if call_args.len() != 1 {
+            return None;
+        }
+        let Expr::Identifier(name, _) = self.resolve_callee(callee) else {
+            return None;
+        };
+        if Self::vector_load_builtin_bytes(name) != Some(bytes) {
+            return None;
+        }
+        if self.expr_access_is_volatile(expr) || self.expr_access_is_volatile(&call_args[0]) {
+            return None;
+        }
+        if self.get_addr_space_of_struct_expr(&call_args[0]) != AddressSpace::Default {
+            return None;
+        }
+        let ptr = self.lower_expr(&call_args[0]);
+        Some(self.operand_to_value(ptr))
+    }
+
+    /// The lane constant of a whole-register broadcast of a CONSTANT, when
+    /// `expr` is exactly that.
+    ///
+    /// `_mm256_set1_epi64x(3)` lowers to a splat value, and a map operand
+    /// materialises values into temporaries: the consumer then reads the
+    /// splat back from a fresh stack slot
+    ///
+    ///     vpbroadcastq .LC0(%rip), %ymm0 ; vmovdqu %ymm0, 8(%rsp) ; vpaddq 8(%rsp), %ymm2
+    ///
+    /// where the operand can be the tiled `.rodata` constant itself
+    ///
+    ///     vpaddq .LC0(%rip), %ymm2, %ymm0
+    ///
+    /// The backend already has that form (`try_emit_bitwise_lane_const`,
+    /// used by every binary emitter); the ONLY thing missing was a lowering
+    /// that hands it the constant instead of a spilled vector. Three
+    /// instructions and a frame slot per shape, and the frame is what forced
+    /// the prologue's `subq $N, %rsp` in the loop shapes.
+    ///
+    /// Refusals keep the vector path: a non-constant argument, a broadcast
+    /// whose width or lane size does not match the consumer's family, or an
+    /// FP family (whose lane constants are not integers and whose only
+    /// tiled-constant form is the sign mask).
+    fn splat_lane_const(
+        &mut self,
+        expr: &Expr,
+        lane_bytes: usize,
+        total: usize,
+    ) -> Option<IrConst> {
+        let Expr::FunctionCall(callee, call_args, _) = expr else {
+            return None;
+        };
+        if call_args.len() != 1 {
+            return None;
+        }
+        let Expr::Identifier(name, _) = self.resolve_callee(callee) else {
+            return None;
+        };
+        let (width, elem) = match name.as_str() {
+            "_mm_set1_epi8" => (16, 1),
+            "_mm_set1_epi16" => (16, 2),
+            "_mm_set1_epi32" => (16, 4),
+            "_mm256_set1_epi8" => (32, 1),
+            "_mm256_set1_epi16" => (32, 2),
+            "_mm256_set1_epi32" => (32, 4),
+            "_mm256_set1_epi64x" => (32, 8),
+            _ => return None,
+        };
+        if width != total || elem != lane_bytes {
+            return None;
+        }
+        let value = self.eval_const_expr(&call_args[0])?.to_i64()?;
+        Some(match lane_bytes {
+            1 => IrConst::I8(value as i8),
+            2 => IrConst::I16(value as i16),
+            4 => IrConst::I32(value as i32),
+            8 => IrConst::I64(value),
+            _ => return None,
+        })
     }
 
     /// Lower a call to the generic SIMD family.

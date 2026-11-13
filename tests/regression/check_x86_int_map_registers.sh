@@ -210,18 +210,32 @@ for name in map_add8_128 map_add8_256 map_and_128 map_and_256 \
             map_andnot_256 map_unpacklo_256; do
     check "$name" 2 1
 done
-# Memory-operand shapes: the folded load, the operation, `ret`.  The other
-# operand is a by-value vector parameter whose frame home belongs to the ABI
-# (RH-04), which is why these are one above GCC instead of at parity.
-check map_add8m_128 3 0
-check map_add64m_256 3 0
+# Memory-operand shapes: the load IS the instruction's r/m operand, so the
+# operation and `ret` are all that remain.  These were 3 (and 5/9 before the
+# pointer form was retired): the operand lowering materialised the load into
+# a 16/32-byte temporary and re-read it, which no amount of backend folding
+# could see.  At parity with GCC now (`vpaddb (%rdi), %xmm0, %xmm0`, `ret`).
+check map_add8m_128 2 0
+check map_add64m_256 2 0
 # Same shape for the SSE4.1 extrema family (RH-11 second half).
-check map_maxsd32m_128 3 0
-# The asymmetric families' folded-load forms: a fold that swapped the operand
-# slots would cost the same 3 instructions and compute a different function,
-# so the fixture's byte-image check is the half that matters here.
+check map_maxsd32m_128 2 0
+# The asymmetric families' memory forms.  `pandn` negates its FIRST source and
+# `punpcklbw` interleaves in operand order, so with the load in args[0] there
+# is no legal fold at any optimization level: VEX.vvvv (args[0]) is
+# register-only and the r/m slot IS args[1].  3 is the optimal count, GCC's
+# included (`movdqu (%rdi),%xmm1` + `vpunpcklbw %xmm0,%xmm1,%xmm0` + `ret`).
+# The fixture's byte-image check is what proves the operand order, since a
+# wrong-slot fold would cost the same 3 instructions.
 check map_andnotm_128 3 0
 check map_unpacklom_128 3 0
+# `vpandn` negates args[0], so the loaded vector must be staged into a
+# register (VEX.vvvv is register-only): `vmovdqu` + `vpandn` + `vpandn`'s
+# register move = 4, exactly GCC's count for the same shape.
+check map_andnotm_256 4 0
+# Constant splats in the src2 position fold to a tiled `.rodata` operand
+# instead of a broadcast into a stack temporary (2 instructions, no frame).
+check map_add64k_256 2 0
+check map_add8k_128 2 0
 
 # Inlined wrappers: a `target(...)`-attributed always-inline callee with two
 # by-value 16/32-byte vector parameters.  The parameter bridge used to cost a
@@ -251,7 +265,7 @@ if [ "$EXPECT_DEFECT" = 1 ]; then
     echo "FAIL: --expect-defect expected an overrun and found none" >&2
     exit 1
 fi
-echo "  ok  every counted shape is register-homed (30 at parity, 5 memory forms, 4 wrappers)"
+echo "  ok  every counted shape is register-homed (30 at parity, 5 memory/constant forms, 4 wrappers)"
 
 # --- 5. counterfactual -----------------------------------------------------
 # `CCC_NO_NATIVE_PACKED_MAP` reverts the routing at the one place that makes

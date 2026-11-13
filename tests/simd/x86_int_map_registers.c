@@ -222,6 +222,33 @@ __attribute__((noinline)) __m256i map_add64m_256(const void *p, __m256i b) {
     return _mm256_add_epi64(_mm256_loadu_si256((const __m256i *)p), b);
 }
 
+/* Constant splats: a broadcast of a LITERAL in the src2 position is a tiled
+   `.rodata` memory operand, not a vector value, so it costs no register, no
+   stack temporary and no broadcast instruction.  Before this shape existed,
+   `_mm256_add_epi64(a, _mm256_set1_epi64x(3))` was seven instructions with a
+   72-byte frame; GCC needs three, and so do we. */
+__attribute__((noinline)) __m256i map_add64k_256(__m256i a) {
+    return _mm256_add_epi64(a, _mm256_set1_epi64x(3));
+}
+
+__attribute__((noinline)) __m128i map_add8k_128(__m128i a) {
+    return _mm_add_epi8(a, _mm_set1_epi8(7));
+}
+
+/* The runtime-scalar twins: the splat is a register broadcast (still a
+   vector value), so these are value rows, not budget rows. */
+__attribute__((noinline)) __m256i map_add64r_256(__m256i a, long k) {
+    return _mm256_add_epi64(a, _mm256_set1_epi64x(k));
+}
+
+__attribute__((noinline)) __m128i map_add8r_128(__m128i a, int k) {
+    return _mm_add_epi8(a, _mm_set1_epi8((char)k));
+}
+
+__attribute__((noinline)) __m256i map_andnotm_256(const void *p, __m256i b) {
+    return _mm256_andnot_si256(_mm256_loadu_si256((const __m256i *)p), b);
+}
+
 /* Asymmetric memory forms.  `pandn` negates its FIRST operand and
    `punpcklbw` interleaves in operand order, so a memory fold that put the
    loaded vector in the wrong slot would compute a different function at the
@@ -561,6 +588,83 @@ static void check_cmp(const char *what, const unsigned char *got,
         check_image(NAME, (const unsigned char *)&r, A128, B128, 16, OP);      \
     } while (0)
 
+/* 256-bit memory-operand image form: operand A from the array, B by value. */
+#define RUN_IMAGEM256(NAME, FN, OP)                                            \
+    do {                                                                       \
+        __m256i vb, r;                                                         \
+        memcpy(&vb, B256, 32);                                                 \
+        r = FN(A256, vb);                                                      \
+        check_image(NAME, (const unsigned char *)&r, A256, B256, 32, OP);      \
+    } while (0)
+
+/* 256-bit pointer-first form: operand A from the array, B by value. */
+#define RUN_MAPM256(NAME, FN, OP, BYTES, LANES)                                \
+    do {                                                                       \
+        __m256i vb, r;                                                         \
+        memcpy(&vb, B256, 32);                                                 \
+        r = FN(A256, vb);                                                      \
+        check_map(NAME, (const unsigned char *)&r, A256, B256, BYTES, LANES,  \
+                  OP);                                                         \
+    } while (0)
+
+/* Constant-splat form: `op(a, splat K)` must equal `op(a, K)` lane by lane,
+   and the budget check proves it cost the tiled constant rather than a
+   broadcast into a temporary. */
+#define RUN_KONST256(NAME, FN, OP, BYTES, LANES, K)                            \
+    do {                                                                       \
+        __m256i va, r;                                                         \
+        unsigned char sc[32];                                                  \
+        unsigned long long kv = (unsigned long long)(K);                        \
+        for (int l = 0; l < LANES; l++)                                        \
+            for (int c = 0; c < (BYTES); c++)                                  \
+                sc[l * (BYTES) + c] = (unsigned char)(kv >> (8 * c));           \
+        memcpy(&va, A256, 32);                                                 \
+        r = FN(va);                                                            \
+        check_map(NAME, (const unsigned char *)&r, A256, sc, BYTES, LANES, OP);\
+    } while (0)
+
+#define RUN_KONST128(NAME, FN, OP, BYTES, LANES, K)                            \
+    do {                                                                       \
+        __m128i va, r;                                                         \
+        unsigned char sc[16];                                                  \
+        unsigned long long kv = (unsigned long long)(K);                        \
+        for (int l = 0; l < LANES; l++)                                        \
+            for (int c = 0; c < (BYTES); c++)                                  \
+                sc[l * (BYTES) + c] = (unsigned char)(kv >> (8 * c));           \
+        memcpy(&va, A128, 16);                                                 \
+        r = FN(va);                                                            \
+        check_map(NAME, (const unsigned char *)&r, A128, sc, BYTES, LANES, OP);\
+    } while (0)
+
+/* Runtime-scalar twins: the splat is a register broadcast, so the constant is
+   an argument.  Value rows only (no budget: the broadcast sequence is the
+   subject of its own campaign item). */
+#define RUN_VARK256(NAME, FN, OP, BYTES, LANES, K)                             \
+    do {                                                                       \
+        __m256i va, r;                                                         \
+        unsigned char sc[32];                                                  \
+        unsigned long long kv = (unsigned long long)(K);                        \
+        for (int l = 0; l < LANES; l++)                                        \
+            for (int c = 0; c < (BYTES); c++)                                  \
+                sc[l * (BYTES) + c] = (unsigned char)(kv >> (8 * c));           \
+        memcpy(&va, A256, 32);                                                 \
+        r = FN(va, (long)(K));                                                 \
+        check_map(NAME, (const unsigned char *)&r, A256, sc, BYTES, LANES, OP);\
+    } while (0)
+
+#define RUN_VARK128(NAME, FN, OP, BYTES, LANES, K)                             \
+    do {                                                                       \
+        __m128i va, r;                                                         \
+        unsigned char sc[16];                                                  \
+        unsigned long long kv = (unsigned long long)(K);                        \
+        for (int l = 0; l < LANES; l++)                                        \
+            for (int c = 0; c < (BYTES); c++)                                  \
+                sc[l * (BYTES) + c] = (unsigned char)(kv >> (8 * c));           \
+        memcpy(&va, A128, 16);                                                 \
+        r = FN(va, (int)(K));                                                  \
+        check_map(NAME, (const unsigned char *)&r, A128, sc, BYTES, LANES, OP);\
+    } while (0)
+
 #define RUN_MAP256(NAME, FN, OP, BYTES, LANES)                                 \
     do {                                                                       \
         __m256i va, vb, r;                                                     \
@@ -730,6 +834,7 @@ int main(void) {
     RUN_MAP128("max_epu32_128", _mm_max_epu32, REF_MAXU, 4, 4);
     /* Memory-operand form: the folded load must not change the answer. */
     RUN_MAPM128("maxsd32m_128", map_maxsd32m_128, REF_MAXS, 4, 4);
+    RUN_VARK128("add8r_128", map_add8r_128, REF_ADD, 1, 16, 7);
 
     RUN_MAP256("add_epi8_256", _mm256_add_epi8, REF_ADD, 1, 32);
     RUN_MAP256("add_epi16_256", _mm256_add_epi16, REF_ADD, 2, 16);
@@ -777,6 +882,17 @@ int main(void) {
     RUN_IMAGEM128("andnotm_128", map_andnotm_128, RB_ANDNOT);
     RUN_IMAGEM128("unpacklom_128", map_unpacklom_128, RB_UNPACKLO);
     RUN_IMAGE256("unpacklo_epi8_256", map_unpacklo_256, RB_UNPACKLO);
+    /* The peel + fold at 256 bits: the load is the instruction's r/m slot. */
+    RUN_MAPM256("add64m_256", map_add64m_256, REF_ADD, 8, 4);
+    /* Constant splats: `op(a, splat K)` against the same reference as the
+       vector form, with K supplied by the caller so the tiled `.rodata`
+       operand is emitted per call, not constant-folded away. */
+    RUN_KONST256("add64k_256", map_add64k_256, REF_ADD, 8, 4, 3);
+    RUN_KONST128("add8k_128", map_add8k_128, REF_ADD, 1, 16, 7);
+    RUN_VARK256("add64r_256", map_add64r_256, REF_ADD, 8, 4, 3);
+    /* Both operands loaded: one of them folds, the other streams through a
+       register — the shape that used to materialise both. */
+    RUN_IMAGEM256("andnotm_256", map_andnotm_256, RB_ANDNOT);
 
     /* ---- immediate shifts -------------------------------------------- */
     RUN_SHIFT128("slli_epi16_3", _mm_slli_epi16, 2, 8, 0, 0, 3);

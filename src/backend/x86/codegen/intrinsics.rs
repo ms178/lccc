@@ -972,9 +972,14 @@ impl X86Codegen {
         let Some(d) = dest else {
             return false;
         };
+        // `args.is_empty()` and not `args.len() < 2`: the raw-pointer load
+        // families carry a single pointer operand, and the two-operand floor
+        // used to reject them here -- silently, which is why every
+        // `_mm*_op(_mm*_loadu_*(p), b)` shape kept its separate load even
+        // though the analysis had already marked it foldable.
         if !self.state.vector_memfold_values.contains(&d.0)
             || self.state.pending_vec_memfold.is_some()
-            || args.len() < 2
+            || args.is_empty()
         {
             return false;
         }
@@ -991,6 +996,24 @@ impl X86Codegen {
         {
             return false;
         }
+        // Two address spellings reach this point:
+        //
+        //   * the vectorizer's `VecLoad*` families carry `(base, index,
+        //     disp)` and fold through the SIB builder below;
+        //   * the user-facing `_mm*_loadu_*` families carry ONE pointer
+        //     operand and fold through `value_ptr_mem_operand` (a fresh GPR
+        //     home or a direct slot).
+        //
+        // Both end in the same `PendingVecMemfold`, so the consumer side is
+        // shared and a consumer can never tell which spelling fed it.
+        let raw_ptr = matches!(
+            op,
+            IntrinsicOp::Loaddqu
+                | IntrinsicOp::Loadu256
+                | IntrinsicOp::Load256
+                | IntrinsicOp::LoaduPs256
+                | IntrinsicOp::LoaduPd256
+        );
         let (mnemonic, width): (&'static str, u32) = match op {
             IntrinsicOp::VecLoadF64x4 => ("vmovupd", 32),
             IntrinsicOp::VecLoadF32x8 => ("vmovups", 32),
@@ -1015,8 +1038,46 @@ impl X86Codegen {
             {
                 ("vmovdqu", 16)
             }
+            // User-facing raw-pointer loads. `Load256` keeps its aligned
+            // mnemonic: the alignment requirement is the LOAD's, and a
+            // memory operand inherits it unchanged. The 128-bit arm is
+            // inside the AVX2 gate for the same reason as its `VecLoad`
+            // twins (legacy-SSE `paddb m128` faults on an unaligned
+            // stream). `Loadu512` is deliberately absent: the 512-bit
+            // consumer side has no fold admission table yet.
+            IntrinsicOp::LoaduPs256 => ("vmovups", 32),
+            IntrinsicOp::LoaduPd256 => ("vmovupd", 32),
+            IntrinsicOp::Loadu256 => ("vmovdqu", 32),
+            IntrinsicOp::Load256 => ("vmovdqa", 32),
+            IntrinsicOp::Loaddqu if self.avx2_enabled => ("vmovdqu", 16),
             _ => return false,
         };
+        if raw_ptr {
+            // The pointer operand is a value whose HOME must still be
+            // readable at the consumer: a fresh GPR home or a direct slot.
+            // A stale or scratch-homed pointer refuses the fold, and the
+            // ordinary load stages the address itself.
+            if args.len() != 1 {
+                return false;
+            }
+            let Some(mem) = self.operand_ptr_mem_operand(&args[0]) else {
+                return false;
+            };
+            if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
+                lccc::cli::stderr_line(format_args!(
+                    "[VLFOLD-EMIT] elide rawptr load %{} <- {} {}",
+                    d.0, mnemonic, mem
+                ));
+            }
+            self.state.vector_values.insert(d.0);
+            self.state.pending_vec_memfold = Some(crate::backend::state::PendingVecMemfold {
+                val: d.0,
+                mem,
+                mnemonic,
+                width,
+            });
+            return true;
+        }
         // The allocator only hands out rbx/r8-r15 (never rsp/rbp/rdi/rsi/rdx
         // and never the scratch pair), all legal base AND index registers.
         let is_gpr = |r: PhysReg| (1..=16).contains(&r.0);
