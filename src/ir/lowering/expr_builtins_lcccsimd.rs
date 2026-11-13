@@ -1039,16 +1039,21 @@ impl Lowerer {
         if self.target != crate::backend::Target::X86_64 {
             return None;
         }
-        // The 128-bit DOUBLE families are still refused: their inline
-        // returns cross an I128 carrier that is not native yet, and the
-        // ordered-FP fixture measured 74 -> 89 provider instructions when
-        // they were routed here.  The 128-bit SINGLE families have no such
-        // carrier (`__m128` returns in %xmm0), so they now take the value
-        // form: `_mm_fmadd_ps(loadu(p), b, c)` measures 9 -> 2 against
-        // GCC's 2.
-        if bytes == 16 && element == IrType::F64 {
-            return None;
-        }
+        // Both 128-bit families take the value form now.  The double family
+        // used to be refused because its result crosses the I128 aggregate
+        // carrier (a `__m128d` value is an I128 at the ABI boundary), and an
+        // earlier measurement saw the pointer form win: 74 -> 89 provider
+        // instructions.  That measurement predates the load-fold and
+        // zero-copy FMA work this campaign landed -- the carrier alloca is
+        // now forwarded into the consumer, so the value form is strictly
+        // cheaper on every measured shape:
+        //   _mm_fmadd_pd(loadu(p), b, c)        11 -> 2   (GCC 2)
+        //   _mm_fmadd_pd(a, b, c)                6 -> 2   (GCC 2)
+        //   nested (fma(fma(load,b,c),b,c))     14 -> 4   (GCC 4)
+        // The store-through shapes still pay a staging copy for the I128
+        // carrier; that is the general value-to-store forwarding gap shared
+        // with every packed twin (`_mm_storeu_ps(q, _mm_add_ps(...))`), not
+        // a property of this family, and it is tracked separately.
         // Resolve the complete plan before evaluating any operand. Volatile,
         // foreign address spaces and mismatched types retain the legacy path.
         let types: Vec<_> = args.iter().map(|arg| self.expr_ctype(arg)).collect();
