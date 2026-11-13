@@ -161,64 +161,52 @@ _mm256_castsi128_si256(__m128i __a)
 
 /* Extract 128-bit lane from __m256 (imm must be 0 or 1) */
 
-/* === Float Arithmetic === */
+/* === Float Arithmetic ===
+ *
+ * Each of these is one `vaddps`/`vsubps`/`vmulps` (or the `pd` spelling) and
+ * is expressed as the corresponding builtin, not as an element-wise loop.
+ * A loop body relies on the SLP vectorizer recognising the lane pattern: it
+ * does so in a plain expression, but not through a bit-level `union`
+ * (measured on the bitwise forms) and not at all at -O1, where the loop
+ * became eight scalar `vaddss`.  GCC and Clang lower these to the builtin
+ * unconditionally, and so does lccc now.
+ */
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_add_ps(__m256 __a, __m256 __b)
 {
-    __m256 __r;
-    for (int __i = 0; __i < 8; __i++)
-        __r[__i] = __a[__i] + __b[__i];
-    return __r;
+    return (__m256)__builtin_ia32_addps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_sub_ps(__m256 __a, __m256 __b)
 {
-    __m256 __r;
-    for (int __i = 0; __i < 8; __i++)
-        __r[__i] = __a[__i] - __b[__i];
-    return __r;
+    return (__m256)__builtin_ia32_subps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_mul_ps(__m256 __a, __m256 __b)
 {
-    __m256 __r;
-    for (int __i = 0; __i < 8; __i++)
-        __r[__i] = __a[__i] * __b[__i];
-    return __r;
+    return (__m256)__builtin_ia32_mulps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_add_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r[__i] = __a[__i] + __b[__i];
-    return __r;
+    return (__m256d)__builtin_ia32_addpd256((__v4df)(__a), (__v4df)(__b));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_sub_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r[__i] = __a[__i] - __b[__i];
-    return __r;
+    return (__m256d)__builtin_ia32_subpd256((__v4df)(__a), (__v4df)(__b));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_mul_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r[__i] = __a[__i] * __b[__i];
-    return __r;
+    return (__m256d)__builtin_ia32_mulpd256((__v4df)(__a), (__v4df)(__b));
 }
-
-/* === Double Arithmetic (continued) === */
-
 
 /* === Set (broadcast) === */
 
