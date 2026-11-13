@@ -8,7 +8,9 @@
 // a form that must keep a temporary (a value read back by a second store), so a
 // rewrite that is too eager changes the observed bytes rather than the count.
 #include <immintrin.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stddef.h>
 
 #define N 64
 #define BAD 0x5A5A5A5A
@@ -54,6 +56,41 @@ void two_stores(long long *q, long long *r, const long long *p, __m128i b) {
     __m128i v = _mm_add_epi64(_mm_loadu_si128((const __m128i *)p), b);
     _mm_storeu_si128((__m128i *)q, v);
     _mm_storeu_si128((__m128i *)r, v);
+}
+
+/* The loop shapes that caught a latent miscompile in the load fold: the
+ * vectorizer emits a `VecLoad` whose OFFSET operand is a RUNTIME register (not
+ * a compile-time displacement), and a fold that reads the offset as "zero"
+ * loads every iteration from the loop's base address.  Word lanes and float
+ * lanes are both here because they take different map families. */
+#define M 256
+static uint16_t w_in[M], w_out[M], w_ref[M];
+static float f_in[M], f_out[M], f_ref[M];
+
+static void k_words(void) {
+    for (size_t i = 0; i < M; i++) {
+        w_out[i] = (uint16_t)((w_in[i] * 5u + 11u) & 0xffffu);
+    }
+}
+
+static void r_words(void) {
+    for (size_t i = 0; i < M; i++) {
+        volatile uint32_t v = w_in[i];
+        w_ref[i] = (uint16_t)((v * 5u + 11u) & 0xffffu);
+    }
+}
+
+static void k_floats(void) {
+    for (size_t i = 0; i < M; i++) {
+        f_out[i] = f_in[i] * 1.5f + 2.25f;
+    }
+}
+
+static void r_floats(void) {
+    for (size_t i = 0; i < M; i++) {
+        volatile float v = f_in[i];
+        f_ref[i] = v * 1.5f + 2.25f;
+    }
 }
 
 static void check(int cond, const char *what) {
@@ -104,6 +141,23 @@ int main(void) {
     two_stores(qi, ri, pi, _mm_loadu_si128((const __m128i *)b128));
     check(qi[0] == pi[0] + 11 && qi[1] == pi[1] + 13, "two_stores first");
     check(ri[0] == pi[0] + 11 && ri[1] == pi[1] + 13, "two_stores second");
+
+    for (int i = 0; i < M; i++) {
+        w_in[i] = (unsigned short)(i * 37 + 5);
+        f_in[i] = (float)i * 0.25f - 3.0f;
+        w_out[i] = w_ref[i] = 0;
+        f_out[i] = f_ref[i] = -1.0f;
+    }
+    k_words();
+    r_words();
+    for (int i = 0; i < M; i++) {
+        check(w_out[i] == w_ref[i], "word-map lane (indexed load offset)");
+    }
+    k_floats();
+    r_floats();
+    for (int i = 0; i < M; i++) {
+        check(f_out[i] == f_ref[i], "float-map lane (indexed load offset)");
+    }
 
     if (failures == 0) {
         printf("ok  forwarded stores: 4 shapes, %d lane checks, 2 double-store "

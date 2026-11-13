@@ -1084,16 +1084,35 @@ impl X86Codegen {
         let Some(base) = self.operand_reg(&args[0]).filter(|r| is_gpr(*r)) else {
             return false;
         };
-        // Two operand layouts reach here: the vectorizer's
-        // `(base, index, disp)` triple and the two-operand `(base, disp)`
-        // form every `VecLoad*` produced by the scalar/lowering paths uses.
-        // Reading the two-operand form with the triple's indices treated
-        // `args[1]` — a CONSTANT offset — as an index and refused the fold,
-        // which is why `*(p + 8)` streamed into a register and then folded
-        // nothing (`vmovdqu 8(%rdi), %ymm3` + `vpaddq`, GCC: one `vpaddq`).
+        // Two operand layouts reach here, and the OFFSET slot means different
+        // things in each:
+        //
+        //   * the vectorizer's `(base, index, disp)` triple -- args[1] is an
+        //     index register (or a constant 0), args[2] the displacement;
+        //   * the two-operand `(base, offset)` form every `VecLoad*` emitted
+        //     by the lowering through `emit_vec_load{,_at}` uses -- args[1] is
+        //     the byte offset, EITHER a constant (the displacement) or a
+        //     register (the index).
+        //
+        // Both roles must be honoured in both layouts.  The first version of
+        // this branch read the two-operand form as "constant displacement
+        // only" and silently dropped a register offset, folding an indexed
+        // load at the base address; the SLP corpus (`word_map`, `f32_map`)
+        // reported it as a value mismatch rather than as a small measure.  So
+        // the register case is explicit here too, and anything that is
+        // neither a constant nor a GPR refuses the fold (the staged load is
+        // always correct).
         let (index, disp) = if args.len() == 2 {
-            let disp = Self::vec_disp_arg(args, 1);
-            (None, disp)
+            match &args[1] {
+                Operand::Const(c) => match c.to_i64() {
+                    Some(k) => (None, k),
+                    None => return false,
+                },
+                other => match self.operand_reg(other) {
+                    Some(r) if is_gpr(r) => (Some(r), 0),
+                    _ => return false,
+                },
+            }
         } else {
             let index = match &args[1] {
                 Operand::Const(c) if c.to_i64() == Some(0) => None,

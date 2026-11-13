@@ -58,6 +58,23 @@ else
     cat "$WORK/out.txt" >&2
     exit 1
 fi
+# The same fixture under `-march=native`: the vectorizer's ISA selection and
+# its indexed-load shapes change with the host feature set, and a load fold that
+# mishandles a register offset is invisible at -mavx2 on a host whose native set
+# takes a different path.
+if ! "$LCCC" -O2 -w -march=native "$FIXTURE" -lm -o "$WORK/run-native" 2>"$WORK/cc-native.log"; then
+    echo "FAIL: cannot build the -march=native value probe" >&2
+    cat "$WORK/cc-native.log" >&2
+    exit 1
+fi
+if "$WORK/run-native" >"$WORK/out-native.txt" 2>&1; then
+    echo "  ok  -march=native $(cat "$WORK/out-native.txt")"
+else
+    echo "FAIL: the -march=native build disagrees with the scalar model" >&2
+    cat "$WORK/out-native.txt" >&2
+    exit 1
+fi
+
 if [ -n "$REFERENCE" ]; then
     "$REFERENCE" -O2 -w -mavx2 "$FIXTURE" -lm -o "$WORK/ref" 2>/dev/null \
         || { echo "FAIL: cannot build the value probe with $REFERENCE" >&2; exit 1; }
@@ -72,6 +89,37 @@ if [ -n "$REFERENCE" ]; then
         exit 1
     fi
     echo "  ok  every shape agrees with $REFERENCE"
+fi
+
+# --- 1b. the load fold's offset classification -----------------------------
+# `try_elide_vec_load` folds a `VecLoad` into its consumer's memory operand.
+# The offset slot means different things in the two IR layouts (an index
+# register in the vectorizer's triple, a byte offset in the lowering's pair),
+# and reading a REGISTER offset as "zero" folds every iteration at the base
+# address.  The SLP object-identity corpus is the calibrated detector: its
+# `word_map`/`f32_map` kernels compare a vectorized loop against a volatile
+# scalar model, and they are wrong (values, not counts) when the fold
+# misclassifies the offset.  The control is the fold itself:
+# `CCC_NO_VLFOLD=1` keeps the staged load, which is always correct.
+CORPUS=tests/simd/slp_object_identity.c
+if [ -f "$CORPUS" ]; then
+    "$LCCC" -O2 -w -march=native "$CORPUS" -o "$WORK/slp-on" 2>/dev/null \
+        || { echo "FAIL: cannot build the SLP corpus" >&2; exit 1; }
+    CCC_NO_VLFOLD=1 "$LCCC" -O2 -w -march=native "$CORPUS" -o "$WORK/slp-off" 2>/dev/null \
+        || { echo "FAIL: cannot build the SLP corpus counterfactual" >&2; exit 1; }
+    if ! "$WORK/slp-on" >"$WORK/slp-on.txt" 2>&1; then
+        echo "FAIL: the SLP corpus disagrees with its scalar model with the load" >&2
+        echo "      fold enabled, which is the misclassified-offset miscompile:" >&2
+        grep -E 'FAIL' "$WORK/slp-on.txt" | head -5 >&2
+        exit 1
+    fi
+    if ! "$WORK/slp-off" >"$WORK/slp-off.txt" 2>&1; then
+        echo "FAIL: the SLP corpus fails with the fold DISABLED too; that is not" >&2
+        echo "      a fold problem and this gate cannot isolate it:" >&2
+        grep -E 'FAIL' "$WORK/slp-off.txt" | head -5 >&2
+        exit 1
+    fi
+    echo "  ok  SLP indexed-load folding matches the scalar model (fold on and off)"
 fi
 
 # --- 2. counts, with an isolated disable control ---------------------------
