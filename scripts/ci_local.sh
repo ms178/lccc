@@ -1425,6 +1425,28 @@ gate "intrinsic-arity-selftest" fast \
     python3 scripts/check_intrinsic_arity.py --self-test
 gate "intrinsic-arity" fast \
     python3 scripts/check_intrinsic_arity.py --check
+
+# Every pointer-form intrinsic must reach a lowering.  The x86/i686 emitters
+# decide WHETHER an op reaches an arm with the outer match pattern and WHICH
+# instruction it becomes with an inner mnemonic match; when a refactor drops an
+# op from the outer list it falls through to the catch-all and ICEs at run time
+# ("unhandled intrinsic op Punpckhqdq128") -- and only for the pointer form, so
+# a register-routed fixture never sees it.  This check compares the two lists
+# for every table arm in both backends.
+gate "intrinsic-lowering-coverage-selftest" fast \
+    python3 scripts/check_intrinsic_lowering_coverage.py --self-test
+gate "intrinsic-lowering-coverage" fast \
+    python3 scripts/check_intrinsic_lowering_coverage.py
+
+# A 256-bit GCC builtin's result temporary is sized from `x86_intrinsic_kind`
+# (Vec128 -> 16 bytes) while the backend writes it at its `vector_home_width`
+# (32 bytes).  A 256-bit op missing from the Vec256 arm therefore stores 32
+# bytes into a 16-byte slot: silent stack corruption that surfaces as
+# "the upper 128-bit lane is garbage".
+gate "x86-intrinsic-kind-width-selftest" fast \
+    python3 scripts/check_x86_intrinsic_kind_width.py --self-test
+gate "x86-intrinsic-kind-width" fast \
+    python3 scripts/check_x86_intrinsic_kind_width.py
 gate "ill-typed-builtins" fast \
     env CCC="$LCCC" LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
 
@@ -1962,6 +1984,45 @@ gate "fma-digit-permutation-nonvacuity" fast \
 # way to see the operand placement as well as the crash.
 gate "i686-fma128" fast \
     bash tests/regression/check_i686_fma128.sh --lccc target/fastbuild/lccc
+# The register-homed side of the same family: `_mm256_fmadd_ps(a,b,c)` on
+# register operands emitted 28 instructions in a 408-byte frame (three
+# realign'd parameter homes + a result home) because the `m3` table entry
+# takes an address per operand and writes through a `dest_ptr`.  GCC emits one
+# `vfmadd132ps`; the native packed-FP route now emits the same, and the gate
+# counts instructions AND executes every lane against libm's fma/fmaf.
+gate "vector-fma-homing" fast \
+    bash tests/regression/check_vector_fma_homing.sh --lccc target/fastbuild/lccc \
+    --reference gcc-16
+# ... and it must go RED on the pre-fix lowering, or the budgets are decoration.
+# `vector_home_prefix_standin.sh` disables exactly the pass family the fix
+# added (`CCC_DISABLE_PASSES=vecpromote`), so the counterfactual is the real
+# code path: the emitted bodies become the pre-fix store-to-home + reload.
+gate "vector-fma-homing-nonvacuity" fast \
+    bash tests/regression/check_vector_fma_homing.sh \
+    --lccc tests/regression/vector_home_prefix_standin.sh --expect-defect
+# RH-03: the packed integer/bitwise map families (add/sub/and/or/xor/mul/
+# min/max, immediate shifts, eq/gt compares, the float bitwise forms) took one
+# ADDRESS per operand and wrote through a `dest_ptr`, so a register operand was
+# spilled first: `_mm_add_epi8(a,b)` was 5 instructions in an 88-byte frame at
+# 128 bits and 9 in 136 bytes at 256 bits, GCC 2 at both.  The gate runs every
+# family for every lane width at both widths against a scalar reference
+# (executed at -O0/-O1/-O2/-O3), budgets the register shapes at 2 and the two
+# memory shapes at 3, and proves itself non-vacuous against the pre-fix
+# lowering via `CCC_NO_NATIVE_PACKED_MAP`.
+gate "x86-int-map-registers" fast \
+    bash tests/regression/check_x86_int_map_registers.sh --lccc target/fastbuild/lccc \
+    --reference "${GCC:-gcc-16}"
+# The pointer-form store builtins take their SOURCE as an address, so a
+# computed vector source went round the frame: `_mm256_storeu_si256(q+i,
+# _mm256_add_epi64(...))` emitted `vmovdqu %ymm, slot` then `vmovdqu slot,
+# %ymm0` then the store (8 instructions where GCC needs 3, 16 vs 11 in a loop).
+# `vector_store_forward` deletes both accesses when the temporary has exactly
+# one reader; this gate executes every shape, budgets the counts, and proves
+# itself non-vacuous against the pre-fix IR via `CCC_DISABLE_PASSES=vecstorefwd`.
+gate "vector-store-forward" fast \
+    bash tests/regression/check_vector_store_forward.sh --lccc target/fastbuild/lccc \
+    --reference "${GCC:-gcc-16}"
+
 # `-mf16c` must change the ENCODING and nothing else.  On i686 it once changed
 # neither: __F16C__ was announced while the effective feature set had no F16c
 # bit, so the option silently bought nothing.  Both paths compute correct

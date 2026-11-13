@@ -2659,11 +2659,7 @@ fn reduction_pattern_is_sound(
 
     // The transform repairs only the induction value and accumulator phis;
     // reject other loop-local values that remain live after the loop.
-    if !reduction_loop_values_do_not_escape(func, loop_blocks, accumulator_phis, iv_phi, debug) {
-        return false;
-    }
-
-    true
+    reduction_loop_values_do_not_escape(func, loop_blocks, accumulator_phis, iv_phi, debug)
 }
 
 #[cfg(test)]

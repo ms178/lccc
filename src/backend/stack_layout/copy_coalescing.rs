@@ -1715,7 +1715,17 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAddI8x16
             | O::VecSubI8x16
             | O::VecMinU8x16
+            | O::VecAndNotI32x4
+            | O::VecAvgU8x16
+            | O::VecMulHiU16x8
+            | O::VecAddSatI8x16
+            | O::VecPacksswbI16x8
+            | O::VecUnpackLoI8x16
+            | O::VecAndNotI32x8
+            | O::VecUnpackLoI8x32
             | O::VecMaxU8x16
+            | O::VecMinI8x16
+            | O::VecMaxI8x16
             | O::VecAddI16x8
             | O::VecSubI16x8
             | O::VecSubSatU16x8
@@ -1849,6 +1859,12 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::Pavgw128
             | O::Pmaxsw128
             | O::Pminsw128
+            | O::Pminud128
+            | O::Pmaxud128
+            | O::Pminsd128
+            | O::Pmaxsd128
+            | O::Pminsb128
+            | O::Pmaxsb128
             | O::Paddsb128
             | O::Paddsw128
             | O::Paddusb128
@@ -1993,7 +2009,17 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecSubI8x16
             | O::VecCmpI8x16
             | O::VecMinU8x16
+            | O::VecAndNotI32x4
+            | O::VecAvgU8x16
+            | O::VecMulHiU16x8
+            | O::VecAddSatI8x16
+            | O::VecPacksswbI16x8
+            | O::VecUnpackLoI8x16
+            | O::VecAndNotI32x8
+            | O::VecUnpackLoI8x32
             | O::VecMaxU8x16
+            | O::VecMinI8x16
+            | O::VecMaxI8x16
             | O::VecBlendvI8x16
             | O::VecMinI8x32
             | O::VecMaxI8x32
@@ -2343,6 +2369,21 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
     )
 }
 
+/// Pure vector loads for the VLFOLD SAFETY NET: an intervening load must not
+/// force a pending fold to materialise (both operands of
+/// `op(load(p), load(q))` are loads, and folding ONE of them is the win).
+///
+/// Deliberately separate from [`is_pure_vec_load`], which is ALSO the block-0
+/// prefix grammar of `x86_vector_param_loads`: widening that set changes which
+/// parameters the prologue preloads, and doing so silently moved a register
+/// home in the FMA/fold fixtures (measured: `fma_load_b` regressed 3 -> 4
+/// instructions with an extra `vmovaps`).  The fold-safety question and the
+/// prologue-grammar question are different questions, so they get different
+/// predicates.
+pub(crate) fn is_vlfold_pure_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    is_pure_vec_load(op) || is_memfold_rawptr_load_128(op) || is_memfold_rawptr_load_256(op)
+}
+
 /// 256-bit loads eligible for source-operand folding (VLFOLD).
 pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
@@ -2373,6 +2414,42 @@ pub(crate) fn is_memfold_vec_load_128(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadI16x8
             | O::VecLoadI8x16
     )
+}
+
+/// User-facing raw-pointer vector loads: `_mm_loadu_si128` /
+/// `_mm_load_si128` / `_mm_loadu_ps` / `_mm_loadu_pd` (`Loaddqu`) and
+/// `_mm256_loadu_si256` / `_mm256_load_si256` / `_mm256_loadu_ps` /
+/// `_mm256_loadu_pd`.
+///
+/// These are the SAME vector loads as the `VecLoad*` families above with a
+/// different address spelling: the source arrives as ONE pointer operand
+/// instead of the vectorizer's `(base, index, disp)` triple.  They are
+/// therefore eligible for the same elision, and the emitter derives the
+/// memory operand from the pointer value itself (`value_ptr_mem_operand`:
+/// a FRESH GPR home or a direct slot — never a staged scratch register,
+/// whose contents cannot be assumed to survive to the consumer).
+///
+/// Why this matters: the whole `_mm*_op(_mm*_loadu_*(p), b)` family — the
+/// canonical tail of every SIMD reduction and the body of every streaming
+/// map loop written with intrinsics — used to pay `vmovdqu (%rdi), %ymmN`
+/// before the operation because these ops were outside the fold set.  One
+/// instruction per shape, 33% over GCC on the two-instruction form, and one
+/// live vector register fewer once folded.
+pub(crate) fn is_memfold_rawptr_load_256(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(op, O::Loadu256 | O::Load256 | O::LoaduPs256 | O::LoaduPd256)
+}
+
+/// 128-bit twin of [`is_memfold_rawptr_load_256`].  `Loaddqu` is the single
+/// op behind every 128-bit raw-pointer load builtin (`_mm_loadu_si128`,
+/// `_mm_load_si128`, `_mm_loadu_ps`, `_mm_load_ps`, `_mm_loadu_pd`,
+/// `_mm_load_pd`), so one arm covers the family.  As for the `VecLoad`
+/// 128-bit families the emitter additionally requires AVX2 — a legacy-SSE
+/// `paddb m128` memory operand faults on an unaligned stream, while the
+/// VEX.128 encodings impose no alignment.
+pub(crate) fn is_memfold_rawptr_load_128(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(op, O::Loaddqu)
 }
 
 /// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
@@ -2495,7 +2572,15 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // Integer min/max has none of the FP unordered/signed-zero
         // asymmetry — commutative.
         | O::VecMinU8x16
+        // These three ARE symmetric: `pavgb` rounds up whichever way the
+        // operands are named, `pmulhuw` multiplies two unsigned words, and
+        // `paddsb` saturates a sum.
+        | O::VecAvgU8x16
+        | O::VecMulHiU16x8
+        | O::VecAddSatI8x16
         | O::VecMaxU8x16
+        | O::VecMinI8x16
+        | O::VecMaxI8x16
         | O::VecMinI16x8
         | O::VecMaxI16x8
         | O::VecSminI32x4
@@ -2518,7 +2603,19 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecSubI32x4
         | O::VecSubI16x8
         | O::VecSubSatU16x8
-        | O::VecSubI8x16 => Some(false),
+        | O::VecSubI8x16
+        // The RH-11 byte-lane ops that are NOT symmetric: `pandn` negates
+        // args[0], `packsswb` puts args[0] in the low half of every lane, and
+        // `punpcklbw` interleaves in operand order.  Folding args[0] into the
+        // r/m slot would swap which IR argument lands in VEX.vvvv and compute
+        // a different function at the same instruction count -- the exact
+        // failure the commutativity ratchet exists to prevent.  The fold is
+        // still admitted for the args[1] (src2/r-m) position.
+        | O::VecAndNotI32x4
+        | O::VecPacksswbI16x8
+        | O::VecUnpackLoI8x16
+        | O::VecAndNotI32x8
+        | O::VecUnpackLoI8x32 => Some(false),
         _ => None,
     }
 }
@@ -2781,6 +2878,26 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
         });
     }
 
+    // Loads the PROLOGUE ALREADY PERFORMS for free: `x86_vector_param_loads`
+    // hands the incoming ABI register straight to the load's home, so that
+    // instruction emits nothing.  Folding such a load into its consumer would
+    // be a pessimisation twice over -- it gains no instruction (there was
+    // none to remove) and it steals the single fold slot from the operand
+    // that DOES cost a load, which is the whole point of the pass.  The
+    // canonical shape this fixes is
+    //
+    //     _mm256_add_epi64(_mm256_loadu_si256(p), b)
+    //
+    // whose operand list is `[load p, load b-home]`: before this exclusion the
+    // nearer operand (the parameter home) won the slot and the streamed load
+    // stayed materialised -- three instructions where GCC needs two.
+    let param_preloaded: crate::common::fx_hash::FxHashSet<u32> =
+        super::regalloc_helpers::x86_vector_param_loads(func)
+            .into_iter()
+            .flatten()
+            .map(|(v, _)| v.0)
+            .collect();
+
     let debug = env_flag("CCC_DEBUG_VLFOLD");
     for (bi, block) in func.blocks.iter().enumerate() {
         let insts = &block.instructions;
@@ -2792,9 +2909,9 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
                 Some(Instruction::Intrinsic {
                     dest: Some(d), op, ..
                 }) if if wide {
-                    is_memfold_vec_load(op)
+                    is_memfold_vec_load(op) || is_memfold_rawptr_load_256(op)
                 } else {
-                    is_memfold_vec_load_128(op)
+                    is_memfold_vec_load_128(op) || is_memfold_rawptr_load_128(op)
                 } =>
                 {
                     Some(d.0)
@@ -2898,6 +3015,7 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             let eligible = |d: u32, is_second: bool| -> bool {
                 (is_second || commutative)
                     && !poisoned.contains(&d)
+                    && !param_preloaded.contains(&d)
                     && use_count.get(&d).copied() == Some(1)
             };
             let a_mid = match (madd, &cargs[1]) {

@@ -972,9 +972,14 @@ impl X86Codegen {
         let Some(d) = dest else {
             return false;
         };
+        // `args.is_empty()` and not `args.len() < 2`: the raw-pointer load
+        // families carry a single pointer operand, and the two-operand floor
+        // used to reject them here -- silently, which is why every
+        // `_mm*_op(_mm*_loadu_*(p), b)` shape kept its separate load even
+        // though the analysis had already marked it foldable.
         if !self.state.vector_memfold_values.contains(&d.0)
             || self.state.pending_vec_memfold.is_some()
-            || args.len() < 2
+            || args.is_empty()
         {
             return false;
         }
@@ -991,6 +996,24 @@ impl X86Codegen {
         {
             return false;
         }
+        // Two address spellings reach this point:
+        //
+        //   * the vectorizer's `VecLoad*` families carry `(base, index,
+        //     disp)` and fold through the SIB builder below;
+        //   * the user-facing `_mm*_loadu_*` families carry ONE pointer
+        //     operand and fold through `value_ptr_mem_operand` (a fresh GPR
+        //     home or a direct slot).
+        //
+        // Both end in the same `PendingVecMemfold`, so the consumer side is
+        // shared and a consumer can never tell which spelling fed it.
+        let raw_ptr = matches!(
+            op,
+            IntrinsicOp::Loaddqu
+                | IntrinsicOp::Loadu256
+                | IntrinsicOp::Load256
+                | IntrinsicOp::LoaduPs256
+                | IntrinsicOp::LoaduPd256
+        );
         let (mnemonic, width): (&'static str, u32) = match op {
             IntrinsicOp::VecLoadF64x4 => ("vmovupd", 32),
             IntrinsicOp::VecLoadF32x8 => ("vmovups", 32),
@@ -1015,23 +1038,92 @@ impl X86Codegen {
             {
                 ("vmovdqu", 16)
             }
+            // User-facing raw-pointer loads. `Load256` keeps its aligned
+            // mnemonic: the alignment requirement is the LOAD's, and a
+            // memory operand inherits it unchanged. The 128-bit arm is
+            // inside the AVX2 gate for the same reason as its `VecLoad`
+            // twins (legacy-SSE `paddb m128` faults on an unaligned
+            // stream). `Loadu512` is deliberately absent: the 512-bit
+            // consumer side has no fold admission table yet.
+            IntrinsicOp::LoaduPs256 => ("vmovups", 32),
+            IntrinsicOp::LoaduPd256 => ("vmovupd", 32),
+            IntrinsicOp::Loadu256 => ("vmovdqu", 32),
+            IntrinsicOp::Load256 => ("vmovdqa", 32),
+            IntrinsicOp::Loaddqu if self.avx2_enabled => ("vmovdqu", 16),
             _ => return false,
         };
+        if raw_ptr {
+            // The pointer operand is a value whose HOME must still be
+            // readable at the consumer: a fresh GPR home or a direct slot.
+            // A stale or scratch-homed pointer refuses the fold, and the
+            // ordinary load stages the address itself.
+            if args.len() != 1 {
+                return false;
+            }
+            let Some(mem) = self.operand_ptr_mem_operand(&args[0]) else {
+                return false;
+            };
+            if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
+                lccc::cli::stderr_line(format_args!(
+                    "[VLFOLD-EMIT] elide rawptr load %{} <- {} {}",
+                    d.0, mnemonic, mem
+                ));
+            }
+            self.state.vector_values.insert(d.0);
+            self.state.pending_vec_memfold = Some(crate::backend::state::PendingVecMemfold {
+                val: d.0,
+                mem,
+                mnemonic,
+                width,
+            });
+            return true;
+        }
         // The allocator only hands out rbx/r8-r15 (never rsp/rbp/rdi/rsi/rdx
         // and never the scratch pair), all legal base AND index registers.
         let is_gpr = |r: PhysReg| (1..=16).contains(&r.0);
         let Some(base) = self.operand_reg(&args[0]).filter(|r| is_gpr(*r)) else {
             return false;
         };
-        let index = match &args[1] {
-            Operand::Const(c) if c.to_i64() == Some(0) => None,
-            Operand::Const(_) => return false,
-            other => match self.operand_reg(other) {
-                Some(r) if is_gpr(r) => Some(r),
-                _ => return false,
-            },
+        // Two operand layouts reach here, and the OFFSET slot means different
+        // things in each:
+        //
+        //   * the vectorizer's `(base, index, disp)` triple -- args[1] is an
+        //     index register (or a constant 0), args[2] the displacement;
+        //   * the two-operand `(base, offset)` form every `VecLoad*` emitted
+        //     by the lowering through `emit_vec_load{,_at}` uses -- args[1] is
+        //     the byte offset, EITHER a constant (the displacement) or a
+        //     register (the index).
+        //
+        // Both roles must be honoured in both layouts.  The first version of
+        // this branch read the two-operand form as "constant displacement
+        // only" and silently dropped a register offset, folding an indexed
+        // load at the base address; the SLP corpus (`word_map`, `f32_map`)
+        // reported it as a value mismatch rather than as a small measure.  So
+        // the register case is explicit here too, and anything that is
+        // neither a constant nor a GPR refuses the fold (the staged load is
+        // always correct).
+        let (index, disp) = if args.len() == 2 {
+            match &args[1] {
+                Operand::Const(c) => match c.to_i64() {
+                    Some(k) => (None, k),
+                    None => return false,
+                },
+                other => match self.operand_reg(other) {
+                    Some(r) if is_gpr(r) => (Some(r), 0),
+                    _ => return false,
+                },
+            }
+        } else {
+            let index = match &args[1] {
+                Operand::Const(c) if c.to_i64() == Some(0) => None,
+                Operand::Const(_) => return false,
+                other => match self.operand_reg(other) {
+                    Some(r) if is_gpr(r) => Some(r),
+                    _ => return false,
+                },
+            };
+            (index, Self::vec_disp_arg(args, 2))
         };
-        let disp = Self::vec_disp_arg(args, 2);
         // Deferred operands must use stable allocated homes, never scratch
         // registers whose contents can change before the consumer. Refuse
         // an unencodable displacement; the ordinary load stages it safely.
@@ -2755,7 +2847,7 @@ impl X86Codegen {
                 .iter()
                 .any(|a| matches!(a, Operand::Value(v) if v.0 == pf.val))
                 && width_matches;
-            if !consumes && !cc::is_pure_vec_load(op) {
+            if !consumes && !cc::is_vlfold_pure_load(op) {
                 self.materialize_pending_memfold();
             }
         }
@@ -4156,7 +4248,13 @@ impl X86Codegen {
             | IntrinsicOp::Punpckldq128
             | IntrinsicOp::Punpckhdq128
             | IntrinsicOp::Punpcklqdq128
-            | IntrinsicOp::Punpckhqdq128 => {
+            | IntrinsicOp::Punpckhqdq128
+            | IntrinsicOp::Pminud128
+            | IntrinsicOp::Pmaxud128
+            | IntrinsicOp::Pminsd128
+            | IntrinsicOp::Pmaxsd128
+            | IntrinsicOp::Pminsb128
+            | IntrinsicOp::Pmaxsb128 => {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Paddusb128 => "paddusb",
@@ -4178,6 +4276,12 @@ impl X86Codegen {
                         IntrinsicOp::Punpckhdq128 => "punpckhdq",
                         IntrinsicOp::Punpcklqdq128 => "punpcklqdq",
                         IntrinsicOp::Punpckhqdq128 => "punpckhqdq",
+                        IntrinsicOp::Pminud128 => "pminud",
+                        IntrinsicOp::Pmaxud128 => "pmaxud",
+                        IntrinsicOp::Pminsd128 => "pminsd",
+                        IntrinsicOp::Pmaxsd128 => "pmaxsd",
+                        IntrinsicOp::Pminsb128 => "pminsb",
+                        IntrinsicOp::Pmaxsb128 => "pmaxsb",
                         _ => unreachable!(),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
@@ -4234,6 +4338,10 @@ impl X86Codegen {
             | IntrinsicOp::Pmulhw256
             | IntrinsicOp::Pminsd256
             | IntrinsicOp::Pmaxsd256
+            | IntrinsicOp::Pminsb256
+            | IntrinsicOp::Pmaxsb256
+            | IntrinsicOp::Pminud256
+            | IntrinsicOp::Pmaxud256
             | IntrinsicOp::Packssdw256
             | IntrinsicOp::Packuswb256
             | IntrinsicOp::Phaddw256
@@ -4268,6 +4376,10 @@ impl X86Codegen {
                         IntrinsicOp::Pmulhw256 => ("vpmulhw", true),
                         IntrinsicOp::Pminsd256 => ("vpminsd", true),
                         IntrinsicOp::Pmaxsd256 => ("vpmaxsd", true),
+                        IntrinsicOp::Pminsb256 => ("vpminsb", true),
+                        IntrinsicOp::Pmaxsb256 => ("vpmaxsb", true),
+                        IntrinsicOp::Pminud256 => ("vpminud", true),
+                        IntrinsicOp::Pmaxud256 => ("vpmaxud", true),
                         IntrinsicOp::Packssdw256 => ("vpackssdw", false),
                         IntrinsicOp::Packuswb256 => ("vpackuswb", false),
                         IntrinsicOp::Phaddw256 => ("vphaddw", false),
@@ -7366,6 +7478,69 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "pmaxsw");
                 }
             }
+            // SSE4.1 signed BYTE extrema at 128 bits.  The 256-bit pair lives
+            // with the AVX2 byte family above; these are the `pminsb`/
+            // `pmaxsb` twins `_mm_min_epi8`/`_mm_max_epi8` route to.  Without
+            // them the header computed the same function as a 16-iteration
+            // scalar loop, which the SLP vectorizer could only recover as
+            // `vpcmpgtb` + `vpblendvb`.
+            IntrinsicOp::VecMinI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sminmax_i8x16(d, args, false);
+                }
+            }
+            IntrinsicOp::VecMaxI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sminmax_i8x16(d, args, true);
+                }
+            }
+            // The six SSE2 singles that had no register twin (RH-11): each is
+            // one instruction, and each operand order below is the C-level
+            // one, because several of these are NOT commutative or NOT
+            // symmetric in their arguments (`pandn` negates args[0];
+            // `packsswb`'s low half comes from args[0]; `punpcklbw`
+            // interleaves low bytes in operand order).
+            IntrinsicOp::VecAndNotI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pandn");
+                }
+            }
+            IntrinsicOp::VecAvgU8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pavgb");
+                }
+            }
+            IntrinsicOp::VecMulHiU16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pmulhuw");
+                }
+            }
+            IntrinsicOp::VecAddSatI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "paddsb");
+                }
+            }
+            IntrinsicOp::VecPacksswbI16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "packsswb");
+                }
+            }
+            IntrinsicOp::VecUnpackLoI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "punpcklbw");
+                }
+            }
+            IntrinsicOp::VecAndNotI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpandn", false);
+                }
+            }
+            IntrinsicOp::VecUnpackLoI8x32 => {
+                if let Some(d) = dest {
+                    // Per-128-bit-lane interleave, like the intrinsic itself.
+                    self.emit_avx_binary_256(d, args, "vpunpcklbw", false);
+                }
+            }
             // BB-SLP packed lane shifts by a uniform constant. The VEX
             // immediate forms are three-operand; the SSE2 forms are
             // destructive (the emitters stage through the destination
@@ -9745,7 +9920,7 @@ impl X86Codegen {
                     && this.state.vec_live_regs.get(&v.0).copied() == Some(name)
             };
             let emit_2xx = |this: &mut Self,
-                            form: &'static str,
+                            form: &str,
                             src2: String,
                             dst: &'static str,
                             consumed_pending: bool| {
@@ -9830,6 +10005,35 @@ impl X86Codegen {
             // the fold — see above).
             if (m0.0 == pv || m1.0 == pv) && bias.0 != pv {
                 let other = if m0.0 == pv { m1 } else { m0 };
+                // ZERO-COPY PREFERENCE (form 132): the result's OWN home
+                // already holds the streamed multiplicand `other` — the
+                // allocator coalesced them because `other` is single-use —
+                // so the fold can be the MULTIPLIER and `other` the
+                // accumulator: `d = d * MEM + addend`, one instruction and
+                // no staging. This is the `_mm*_fma(mul_reg, *(p), addend)`
+                // shape and exactly GCC's `vfmadd132ps (%rdi), %ymm1,
+                // %ymm0`; the pre-132 emitter could only spell it as
+                // 231-into-the-addend, which cost `vmovaps` + scratch +
+                // `vmovdqa` (measured: 4 instructions vs GCC's 1, the
+                // `fma_load_a/b/pd` homing-budget failure). Gated on the
+                // DEST home so the write is one the RA already expects.
+                let dest_home = self
+                    .reg_assignments
+                    .get(&dest.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r));
+                if let Some(dh) = dest_home {
+                    if home(self, other) == Some(dh) {
+                        if let Some(src2) = home(self, bias)
+                            .map(|r| format!("%{}", phys_reg_name_256(r)))
+                            .or_else(|| held(self, bias).map(|h| format!("%{h}")))
+                        {
+                            let consumed = held(self, bias).is_some();
+                            emit_2xx(self, mnemonic, src2, phys_reg_name_256(dh), consumed);
+                            return;
+                        }
+                    }
+                }
                 let src2 = home(self, other)
                     .map(|r| format!("%{}", phys_reg_name_256(r)))
                     .or_else(|| held(self, other).map(|h| format!("%{h}")));
@@ -10676,6 +10880,23 @@ impl X86Codegen {
     /// Reaching this emitter without SSE4.1 is a producer bug — panic
     /// loudly rather than emit an instruction the CPU cannot decode (the
     /// VecRotlI32x4 immediate-panic discipline).
+    /// Lane-wise signed BYTE min/max, 128-bit (`VecSminI8x16`/
+    /// `VecMaxI8x16`).
+    ///
+    /// `pminsb`/`pmaxsb` are SSE4.1; there is no SSE2 encoding, so a producer
+    /// that admits this op without the feature is a bug and asserts here
+    /// rather than silently emitting an instruction the target lacks.
+    fn emit_sminmax_i8x16(&mut self, dest: &Value, args: &[Operand], is_max: bool) {
+        assert!(
+            self.isa.sse41,
+            "VecM{}I8x16 requires SSE4.1 (pminsb/pmaxsb): an x86 producer \
+             admitted it without the feature gate",
+            if is_max { "ax" } else { "in" }
+        );
+        let inst = if is_max { "pmaxsb" } else { "pminsb" };
+        self.emit_sse_binary_128(dest, args, inst);
+    }
+
     fn emit_sminmax_i32x4(&mut self, dest: &Value, args: &[Operand], is_max: bool) {
         assert!(
             self.isa.sse41,

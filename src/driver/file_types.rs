@@ -44,11 +44,9 @@ impl Driver {
         // passed through to the linker in their original command-line position.
         // Only match `.a.` in the filename component (after the last `/`), not
         // in directory names, to avoid false positives like `/path/to/data.a.dir/main.c`.
+        // Only match `.a.` in the filename component (after the last `/`).
         let filename = path.rsplit('/').next().unwrap_or(path);
-        if filename.contains(".a.") {
-            return true;
-        }
-        false
+        filename.contains(".a.")
     }
 
     /// Check if a file has a known C source extension.

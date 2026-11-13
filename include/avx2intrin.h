@@ -703,6 +703,36 @@ _mm256_min_epu8(__m256i __a, __m256i __b)
     return (__m256i)__builtin_ia32_pminub256((__v32qi)(__a), (__v32qi)(__b));
 }
 
+/* _mm256_max_epi8 / _mm256_min_epi8: packed SIGNED 8-bit extrema
+ * (VPMAXSB/VPMINSB).  Unlike the unsigned byte pair above these have no
+ * AVX2 spelling in this header at all until now -- `-mavx2` code that GCC
+ * compiles failed here with an implicit-declaration error. */
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_max_epi8(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_pmaxsb256((__v32qi)(__a), (__v32qi)(__b));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_min_epi8(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_pminsb256((__v32qi)(__a), (__v32qi)(__b));
+}
+
+/* _mm256_max_epu32 / _mm256_min_epu32: packed UNSIGNED 32-bit extrema
+ * (VPMAXUD/VPMINUD) -- also previously absent. */
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_max_epu32(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_pmaxud256((__v8su)(__a), (__v8su)(__b));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_min_epu32(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_pminud256((__v8su)(__a), (__v8su)(__b));
+}
+
 /* _mm256_max_epi32: maximum of signed 32-bit ints (VPMAXSD) */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_max_epi32(__m256i __a, __m256i __b)
@@ -796,6 +826,31 @@ static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_subs_epu16(__m256i __a, __m256i __b)
 {
     return (__m256i)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b));
+}
+
+/* _mm256_max_epu16 / _mm256_min_epu16: packed unsigned 16-bit extrema.
+ *
+ * There is no `vpmaxuw`/`vpminuw` value form below AVX-512, so these are the
+ * exact saturating-difference identities: with `t = subs_epu16(a, b)` (zero
+ * where `a <= b`, `a - b` otherwise) the maximum is `b + t` and the minimum
+ * is `a - t`.  Both intermediate values are in range by construction, so no
+ * lane can wrap, and every step is a single instruction (`vpsubusw`,
+ * `vpaddw`/`vpsubw`) that the backend already carries in register form.
+ */
+static __inline__ __m256i __attribute__((__always_inline__, target("avx2")))
+_mm256_max_epu16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_paddw256(
+        (__v16hi)(__b),
+        (__v16hi)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b)));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__, target("avx2")))
+_mm256_min_epu16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_psubw256(
+        (__v16hi)(__a),
+        (__v16hi)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b)));
 }
 
 #endif /* _AVX2INTRIN_H_INCLUDED */

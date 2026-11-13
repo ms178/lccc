@@ -1799,6 +1799,16 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pmulhw256
             | BuiltinIntrinsic::X86Pminsd256
             | BuiltinIntrinsic::X86Pmaxsd256
+            | BuiltinIntrinsic::X86Pminsb128
+            | BuiltinIntrinsic::X86Pmaxsb128
+            | BuiltinIntrinsic::X86Pminsd128
+            | BuiltinIntrinsic::X86Pmaxsd128
+            | BuiltinIntrinsic::X86Pminud128
+            | BuiltinIntrinsic::X86Pmaxud128
+            | BuiltinIntrinsic::X86Pminsb256
+            | BuiltinIntrinsic::X86Pmaxsb256
+            | BuiltinIntrinsic::X86Pminud256
+            | BuiltinIntrinsic::X86Pmaxud256
             | BuiltinIntrinsic::X86Pmovzxbw256
             | BuiltinIntrinsic::X86Pmovzxbd256
             | BuiltinIntrinsic::X86Pmovzxwd256
@@ -3627,6 +3637,14 @@ impl Lowerer {
             }
         }
         let op = x86_intrinsic_op(intrinsic);
+        // RH-03: the packed integer/bitwise map families have register-valued
+        // twins, so their pointer forms (one address per operand, one for the
+        // result) are not the only way to say the same thing.  This is a
+        // refusal-first rewrite: every shape the twin table does not own keeps
+        // the established pointer emitter below.
+        if let Some(result) = self.try_native_packed_map(op, args) {
+            return Some(result);
+        }
         match x86_intrinsic_kind(intrinsic) {
             X86IntrinsicKind::Fence => {
                 self.emit(Instruction::Intrinsic {
@@ -4063,7 +4081,18 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Phaddw256
         | BuiltinIntrinsic::X86Phaddd256
         | BuiltinIntrinsic::X86Pabsd256
-        | BuiltinIntrinsic::X86Pmuludq256 => X86IntrinsicKind::Vec256,
+        | BuiltinIntrinsic::X86Pmuludq256
+        // The RH-11 AVX2 extrema.  They were added to the op table and the
+        // backend, but not here, so they fell into the `_ => Vec128`
+        // catch-all: the result temp was 16 bytes while `vpminsb %ymm` wrote
+        // 32 into it, corrupting whatever the stack layout placed next.  The
+        // miscompile only showed when the op took its POINTER path (the value
+        // form skips the temp entirely), which is exactly what
+        // `check_x86_intrinsic_kind_width.py` now forbids.
+        | BuiltinIntrinsic::X86Pminsb256
+        | BuiltinIntrinsic::X86Pmaxsb256
+        | BuiltinIntrinsic::X86Pminud256
+        | BuiltinIntrinsic::X86Pmaxud256 => X86IntrinsicKind::Vec256,
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
         // Native C vectors share object-address IR carriers on both x86 modes.
         BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => X86IntrinsicKind::Vec128,
@@ -4295,6 +4324,14 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         B::X86Paddb256
         | B::X86Paddw256
         | B::X86Paddd256
+        // The extrema family was never gated: `_mm256_max_epi32` emitted
+        // `vpmaxsd` under a plain `-mavx` permission.
+        | B::X86Pminsd256
+        | B::X86Pmaxsd256
+        | B::X86Pminsb256
+        | B::X86Pmaxsb256
+        | B::X86Pminud256
+        | B::X86Pmaxud256
         | B::X86Paddq256
         | B::X86Psubb256
         | B::X86Psubw256
@@ -4356,6 +4393,14 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pextrb128
         | B::X86Pinsrq128
         | B::X86Pextrq128
+        // SSE4.1 extrema: no SSE2 encoding exists, so a body that admits one
+        // must not be inlined into a caller without the feature either.
+        | B::X86Pminsb128
+        | B::X86Pmaxsb128
+        | B::X86Pminsd128
+        | B::X86Pmaxsd128
+        | B::X86Pminud128
+        | B::X86Pmaxud128
         | B::X86Pblendvb128
         | B::X86Pblendw128
         | B::X86Pmovzxbw128
@@ -4724,6 +4769,16 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pavgw128 => IntrinsicOp::Pavgw128,
         BuiltinIntrinsic::X86Pminsw128 => IntrinsicOp::Pminsw128,
         BuiltinIntrinsic::X86Pmaxsw128 => IntrinsicOp::Pmaxsw128,
+        BuiltinIntrinsic::X86Pminsb128 => IntrinsicOp::Pminsb128,
+        BuiltinIntrinsic::X86Pmaxsb128 => IntrinsicOp::Pmaxsb128,
+        BuiltinIntrinsic::X86Pminsd128 => IntrinsicOp::Pminsd128,
+        BuiltinIntrinsic::X86Pmaxsd128 => IntrinsicOp::Pmaxsd128,
+        BuiltinIntrinsic::X86Pminud128 => IntrinsicOp::Pminud128,
+        BuiltinIntrinsic::X86Pmaxud128 => IntrinsicOp::Pmaxud128,
+        BuiltinIntrinsic::X86Pminsb256 => IntrinsicOp::Pminsb256,
+        BuiltinIntrinsic::X86Pmaxsb256 => IntrinsicOp::Pmaxsb256,
+        BuiltinIntrinsic::X86Pminud256 => IntrinsicOp::Pminud256,
+        BuiltinIntrinsic::X86Pmaxud256 => IntrinsicOp::Pmaxud256,
         BuiltinIntrinsic::X86Pmulhuw128 => IntrinsicOp::Pmulhuw128,
         BuiltinIntrinsic::X86Paddq128 => IntrinsicOp::Paddq128,
         BuiltinIntrinsic::X86Psubq128 => IntrinsicOp::Psubq128,

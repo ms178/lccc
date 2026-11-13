@@ -1050,6 +1050,41 @@ pub enum IntrinsicOp {
     VecMinI8x32,
     /// AVX2 lane-wise SIGNED byte max: 32×I8 (`vpmaxsb`).
     VecMaxI8x32,
+    /// SSE4.1 lane-wise SIGNED byte min at 128 bits: 16×I8 (`pminsb`).
+    ///
+    /// The 128-bit twin of `VecMinI8x32`.  Signed byte extrema are SSE4.1
+    /// (no SSE2 encoding), so this op asserts on `isa.sse41`; the twins the
+    /// packed-map bridge routes `_mm_min_epi8` to are what keep the call at
+    /// GCC's one instruction.
+    VecMinI8x16,
+    /// SSE4.1 lane-wise SIGNED byte max at 128 bits: 16×I8 (`pmaxsb`).
+    VecMaxI8x16,
+    // ---- The six SSE2 singles that had no register twin (RH-11) ----
+    //
+    // Each is ONE instruction whose pointer form (`pandn`, `pavgb`,
+    // `pmulhuw`, `paddsb`, `packsswb`, `punpcklbw`) took two addresses and a
+    // result address, so every register-resident operand was spilled into a
+    // frame slot first: 5 instructions where GCC needs 2.  These are the
+    // register-valued twins, at both widths where the pointer op exists.
+    /// `dst = (~a) & b`: `pandn`.  NOT `(a & ~b)` — the negated operand is
+    /// `args[0]`, which is what the encoding does in place.
+    VecAndNotI32x4,
+    /// Unsigned byte average with rounding up: `(a + b + 1) >> 1`, `pavgb`.
+    VecAvgU8x16,
+    /// High 16 bits of each unsigned word product: `pmulhuw`.
+    VecMulHiU16x8,
+    /// Signed saturating byte add: `paddsb` (`min(max(a+b, -128), 127)`).
+    VecAddSatI8x16,
+    /// Saturate 8 signed words from each operand into 8 bytes: `packsswb`.
+    /// args = [lo, hi]; the result's low half comes from `args[0]`.
+    VecPacksswbI16x8,
+    /// Interleave the low bytes of both operands: `punpcklbw`.
+    VecUnpackLoI8x16,
+    /// 256-bit `vpandn` twin of `VecAndNotI32x4`.
+    VecAndNotI32x8,
+    /// 256-bit `vpunpcklbw` twin of `VecUnpackLoI8x16`: the interleave is
+    /// PER 128-BIT LANE, exactly like the `_mm256_unpacklo_epi8` intrinsic.
+    VecUnpackLoI8x32,
     /// AVX2 byte splat from a GPR/XMM lane: 32×I8 (`vpbroadcastb`).
     ///
     /// Only needed for RUNTIME byte invariants; a CONSTANT byte reaches all
@@ -1492,6 +1527,23 @@ pub enum IntrinsicOp {
     Pavgw128,
     Pminsw128,
     Pmaxsw128,
+    // --- SSE4.1 extrema that the SSE2 baseline cannot encode ---
+    //
+    // `pminud`/`pmaxud`, `pminsd`/`pmaxsd` and `pminsb`/`pmaxsb` all arrived
+    // with SSE4.1, unlike the `sw`/`ub` pairs above (SSE2) and `sw`/`ub` at
+    // 256 bits (AVX2).  The headers used to compute these six from scalar
+    // byte/dword loops; `_mm_min_epu32` alone measured 37 instructions and
+    // `_mm_max_epi32` 48 against GCC's 2, because a lane-at-a-time loop is
+    // the one shape the SLP vectorizer cannot fold back into the encoding
+    // the ISA has.  These ops carry the encoding itself; the register twins
+    // the packed-map bridge routes them to already exist (`VecMinU32x4`,
+    // `VecSmaxI32x4`, `VecMinI8x16`, ...).
+    Pminud128,
+    Pmaxud128,
+    Pminsd128,
+    Pmaxsd128,
+    Pminsb128,
+    Pmaxsb128,
     Pmulhuw128,
     Paddq128,
     Psubq128,
@@ -1544,6 +1596,14 @@ pub enum IntrinsicOp {
     Pmulhw256,
     Pminsd256,
     Pmaxsd256,
+    // The AVX2 spellings of the SSE4.1 extrema above.  `vpminsb`/`vpmaxsb`
+    // and `vpminud`/`vpmaxud` have no 128-bit sibling in this enum's
+    // "already wired" group, so `_mm256_min_epi8` and its three siblings did
+    // not exist in `include/avx2intrin.h` at all.
+    Pminsb256,
+    Pmaxsb256,
+    Pminud256,
+    Pmaxud256,
     Pmovzxbw256,
     Pmovzxbd256,
     Pmovzxwd256,
@@ -2225,6 +2285,7 @@ impl IntrinsicOp {
             | VecLoadI8x32 | VecBroadcastI8x32
             | VecCmpI8x32 | VecBlendvI8x32 | VecMinU8x32 | VecMaxU8x32
             | VecMinI8x32 | VecMaxI8x32
+            | VecAndNotI32x8 | VecUnpackLoI8x32
             | VecAddI8x32 | VecSubI8x32 | VecAndI8x32 | VecOrI8x32 | VecXorI8x32
             | VecAddI16x16
             | VecSubI16x16
@@ -2276,6 +2337,9 @@ impl IntrinsicOp {
             | Punpckldq256 | Punpckhdq256 | Punpcklqdq256 | Punpckhqdq256
             | Pslldqi256 | Psrldqi256 | Psllqi256 | Psrlqi256
             | Pmullw256 | Pmulhw256 | Pminsd256 | Pmaxsd256
+            // The AVX2 extrema this tree could not encode at all until now:
+            // `vpminsb`/`vpmaxsb`/`vpminud`/`vpmaxud` at 32 bytes.
+            | Pminsb256 | Pmaxsb256 | Pminud256 | Pmaxud256
             | Pmovzxbw256 | Pmovzxbd256 | Pmovzxwd256
             | Pmovsxbw256 | Pmovsxbd256 | Pmovsxwd256
             | Psrawi256 | Psradi256 | Packssdw256 | Packuswb256
@@ -2354,6 +2418,11 @@ impl IntrinsicOp {
             | VecCmpI32x4 | VecCmpI64x2 | VecBlendvI32x4
             | VecAddI8x16 | VecSubI8x16 | VecCmpI8x16
             | VecMinU8x16 | VecMaxU8x16 | VecBlendvI8x16
+            // SSE4.1 signed byte extrema: the 128-bit twins of
+            // `VecMinI8x32`/`VecMaxI8x32` (16×I8 = 16 bytes).
+            | VecMinI8x16 | VecMaxI8x16
+            | VecAndNotI32x4 | VecAvgU8x16 | VecMulHiU16x8 | VecAddSatI8x16
+            | VecPacksswbI16x8 | VecUnpackLoI8x16
             | VecBroadcastI8x16
             | VecAddI16x8
             | VecSubI16x8
@@ -2397,6 +2466,8 @@ impl IntrinsicOp {
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
+            // SSE4.1 extrema: 16-byte results like the SSE2 pairs above.
+            | Pminud128 | Pmaxud128 | Pminsd128 | Pmaxsd128 | Pminsb128 | Pmaxsb128
             | Punpckldq128 | Punpckhdq128 | Punpcklqdq128 | Punpckhqdq128
             | Setzero128 | SetzeroPs128 | Extracti128
             // ARX lane family: 128-bit XMM results (pslld/pshufd/pshufb/
@@ -2474,6 +2545,14 @@ impl IntrinsicOp {
             IntrinsicOp::Packssdw128 | IntrinsicOp::Packsswb128 | IntrinsicOp::Packuswb128 |
             IntrinsicOp::Punpcklbw128 | IntrinsicOp::Punpckhbw128 |
             IntrinsicOp::Punpcklwd128 | IntrinsicOp::Punpckhwd128 |
+            // SSE4.1 packed extrema are pure register arithmetic; leaving
+            // them out would let a dead `pmaxsd` result root its whole
+            // operand chain in IR DCE.
+            IntrinsicOp::Pminud128 | IntrinsicOp::Pmaxud128 |
+            IntrinsicOp::Pminsd128 | IntrinsicOp::Pmaxsd128 |
+            IntrinsicOp::Pminsb128 | IntrinsicOp::Pmaxsb128 |
+            IntrinsicOp::Pminud256 | IntrinsicOp::Pmaxud256 |
+            IntrinsicOp::Pminsb256 | IntrinsicOp::Pmaxsb256 |
             IntrinsicOp::SetEpi16 | IntrinsicOp::Pinsrw128 |
             IntrinsicOp::Pextrw128 | IntrinsicOp::Cvtsi128Si32 |
             IntrinsicOp::Cvtsi32Si128 | IntrinsicOp::Cvtsi128Si64 |
@@ -2503,6 +2582,16 @@ impl IntrinsicOp {
             | IntrinsicOp::VecMaxU8x16
             | IntrinsicOp::VecMinI8x32
             | IntrinsicOp::VecMaxI8x32
+            | IntrinsicOp::VecMinI8x16
+            | IntrinsicOp::VecMaxI8x16
+            | IntrinsicOp::VecAndNotI32x4
+            | IntrinsicOp::VecAvgU8x16
+            | IntrinsicOp::VecMulHiU16x8
+            | IntrinsicOp::VecAddSatI8x16
+            | IntrinsicOp::VecPacksswbI16x8
+            | IntrinsicOp::VecUnpackLoI8x16
+            | IntrinsicOp::VecAndNotI32x8
+            | IntrinsicOp::VecUnpackLoI8x32
             | IntrinsicOp::VecMinI16x16
             | IntrinsicOp::VecMaxI16x16
             | IntrinsicOp::VecMinU16x16
@@ -2827,6 +2916,16 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecMaxU8x16
                 | IntrinsicOp::VecMinI8x32
                 | IntrinsicOp::VecMaxI8x32
+                | IntrinsicOp::VecMinI8x16
+                | IntrinsicOp::VecMaxI8x16
+                | IntrinsicOp::VecAndNotI32x4
+                | IntrinsicOp::VecAvgU8x16
+                | IntrinsicOp::VecMulHiU16x8
+                | IntrinsicOp::VecAddSatI8x16
+                | IntrinsicOp::VecPacksswbI16x8
+                | IntrinsicOp::VecUnpackLoI8x16
+                | IntrinsicOp::VecAndNotI32x8
+                | IntrinsicOp::VecUnpackLoI8x32
                 | IntrinsicOp::VecBroadcastI8x32
                 | IntrinsicOp::VecBroadcastI8x16
                 | IntrinsicOp::VecAddI16x16
@@ -3516,6 +3615,16 @@ mod vector_width_tests {
             "VecSubSatU16x8" => IntrinsicOp::VecSubSatU16x8,
             "VecMaxI8x32" => IntrinsicOp::VecMaxI8x32,
             "VecMinI8x32" => IntrinsicOp::VecMinI8x32,
+            "VecMaxI8x16" => IntrinsicOp::VecMaxI8x16,
+            "VecMinI8x16" => IntrinsicOp::VecMinI8x16,
+            "VecAndNotI32x4" => IntrinsicOp::VecAndNotI32x4,
+            "VecAvgU8x16" => IntrinsicOp::VecAvgU8x16,
+            "VecMulHiU16x8" => IntrinsicOp::VecMulHiU16x8,
+            "VecAddSatI8x16" => IntrinsicOp::VecAddSatI8x16,
+            "VecPacksswbI16x8" => IntrinsicOp::VecPacksswbI16x8,
+            "VecUnpackLoI8x16" => IntrinsicOp::VecUnpackLoI8x16,
+            "VecAndNotI32x8" => IntrinsicOp::VecAndNotI32x8,
+            "VecUnpackLoI8x32" => IntrinsicOp::VecUnpackLoI8x32,
             "VecSubI32x4" => IntrinsicOp::VecSubI32x4,
             "VecSubI32x8" => IntrinsicOp::VecSubI32x8,
             "VecShlvI32x8" => IntrinsicOp::VecShlvI32x8,

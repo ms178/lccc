@@ -132,14 +132,7 @@ fn has_rsp_dependent_operand(t: &str) -> bool {
     // push/pop/call/ret implicitly modify RSP — the stack slot the flags word
     // sits in would shift, so keep these conservative.
     let m = first_mnemonic(t);
-    if m.starts_with("push")
-        || m.starts_with("pop")
-        || m.starts_with("call")
-        || m.starts_with("ret")
-    {
-        return true;
-    }
-    false
+    m.starts_with("push") || m.starts_with("pop") || m.starts_with("call") || m.starts_with("ret")
 }
 fn first_mnemonic(line: &str) -> &str {
     let line = line.trim();

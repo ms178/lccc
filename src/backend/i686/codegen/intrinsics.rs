@@ -735,7 +735,19 @@ impl I686Codegen {
             | IntrinsicOp::Punpckldq128
             | IntrinsicOp::Punpckhdq128
             | IntrinsicOp::Punpcklqdq128
-            | IntrinsicOp::Punpckhqdq128 => {
+            | IntrinsicOp::Punpckhqdq128
+            | IntrinsicOp::Pminud128
+            | IntrinsicOp::Pmaxud128
+            | IntrinsicOp::Pminsd128
+            | IntrinsicOp::Pmaxsd128
+            | IntrinsicOp::Pminsb128
+            | IntrinsicOp::Pmaxsb128
+            | IntrinsicOp::VecAndNotI32x4
+            | IntrinsicOp::VecAvgU8x16
+            | IntrinsicOp::VecMulHiU16x8
+            | IntrinsicOp::VecAddSatI8x16
+            | IntrinsicOp::VecPacksswbI16x8
+            | IntrinsicOp::VecUnpackLoI8x16 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::Paddw128 => "paddw",
@@ -784,6 +796,22 @@ impl I686Codegen {
                         IntrinsicOp::Punpckhdq128 => "punpckhdq",
                         IntrinsicOp::Punpcklqdq128 => "punpcklqdq",
                         IntrinsicOp::Punpckhqdq128 => "punpckhqdq",
+                        IntrinsicOp::Pminud128 => "pminud",
+                        IntrinsicOp::Pmaxud128 => "pmaxud",
+                        IntrinsicOp::Pminsd128 => "pminsd",
+                        IntrinsicOp::Pmaxsd128 => "pmaxsd",
+                        IntrinsicOp::Pminsb128 => "pminsb",
+                        IntrinsicOp::Pmaxsb128 => "pmaxsb",
+                        // RH-11 remainder: the twinless mixed-width wrappers
+                        // (`_mm_andnot_si128` etc.) that used to lower through
+                        // their scalar header loops; one mnemonic per op keeps
+                        // the pointer form a single instruction on i686 too.
+                        IntrinsicOp::VecAndNotI32x4 => "pandn",
+                        IntrinsicOp::VecAvgU8x16 => "pavgb",
+                        IntrinsicOp::VecMulHiU16x8 => "pmulhuw",
+                        IntrinsicOp::VecAddSatI8x16 => "paddsb",
+                        IntrinsicOp::VecPacksswbI16x8 => "packsswb",
+                        IntrinsicOp::VecUnpackLoI8x16 => "punpcklbw",
                         _ => unreachable!("unexpected SSE binary op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
@@ -1818,6 +1846,10 @@ impl I686Codegen {
             | IntrinsicOp::Pcmpgtq256
             | IntrinsicOp::Pmaxub256
             | IntrinsicOp::Pmaxsd256
+            | IntrinsicOp::Pminsb256
+            | IntrinsicOp::Pmaxsb256
+            | IntrinsicOp::Pminud256
+            | IntrinsicOp::Pmaxud256
             | IntrinsicOp::Pminub256
             | IntrinsicOp::Pminsd256
             | IntrinsicOp::Psadbw256
@@ -1833,7 +1865,9 @@ impl I686Codegen {
             | IntrinsicOp::Punpckldq256
             | IntrinsicOp::Punpckhdq256
             | IntrinsicOp::Punpcklqdq256
-            | IntrinsicOp::Punpckhqdq256 => {
+            | IntrinsicOp::Punpckhqdq256
+            | IntrinsicOp::VecAndNotI32x8
+            | IntrinsicOp::VecUnpackLoI8x32 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::Paddb256 => "vpaddb",
@@ -1865,6 +1899,10 @@ impl I686Codegen {
                         IntrinsicOp::Pmaxsd256 => "vpmaxsd",
                         IntrinsicOp::Pminub256 => "vpminub",
                         IntrinsicOp::Pminsd256 => "vpminsd",
+                        IntrinsicOp::Pminsb256 => "vpminsb",
+                        IntrinsicOp::Pmaxsb256 => "vpmaxsb",
+                        IntrinsicOp::Pminud256 => "vpminud",
+                        IntrinsicOp::Pmaxud256 => "vpmaxud",
                         IntrinsicOp::Psadbw256 => "vpsadbw",
                         IntrinsicOp::Pshufb256 => "vpshufb",
                         IntrinsicOp::Packssdw256 => "vpackssdw",
@@ -1879,6 +1917,8 @@ impl I686Codegen {
                         IntrinsicOp::Punpckhdq256 => "vpunpckhdq",
                         IntrinsicOp::Punpcklqdq256 => "vpunpcklqdq",
                         IntrinsicOp::Punpckhqdq256 => "vpunpckhqdq",
+                        IntrinsicOp::VecAndNotI32x8 => "vpandn",
+                        IntrinsicOp::VecUnpackLoI8x32 => "vpunpcklbw",
                         _ => unreachable!("unexpected AVX2 integer binary op: {:?}", op),
                     };
                     self.emit_avx_binary_256(dptr, args, inst);
@@ -2384,11 +2424,24 @@ impl I686Codegen {
                         match &args[0] {
                             Operand::Value(v) => {
                                 if let Some(slot) = self.state.get_slot(v.0) {
+                                    // BOTH halves are read BEFORE either push.
+                                    // A frame slot is not always %ebp-relative
+                                    // (a dynamic-alloca frame references it
+                                    // through %esp, see `slot_base_disp`), and
+                                    // `pushl` moves %esp: loading the low half
+                                    // after the high half had been pushed read
+                                    // the HIGH half a second time, so every
+                                    // runtime `_mm256_set1_epi64x(k)` staged
+                                    // `(hi,hi)` and broadcast `2^32*hi` --
+                                    // `_mm256_add_epi64(a, splat k)` then added
+                                    // zero (i686 only; measured on the
+                                    // int-map fixture, lane-exact).
                                     let sr0 = self.slot_ref(slot);
                                     let sr4 = self.slot_ref_offset(slot, 4);
-                                    emit!(self.state, "    movl {}, %eax", sr4);
-                                    self.state.emit("    pushl %eax");
                                     emit!(self.state, "    movl {}, %eax", sr0);
+                                    emit!(self.state, "    movl {}, %edx", sr4);
+                                    self.state.reg_cache.invalidate_all();
+                                    self.state.emit("    pushl %edx");
                                     self.state.emit("    pushl %eax");
                                 } else {
                                     self.operand_to_eax(&args[0]);

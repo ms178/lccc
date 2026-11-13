@@ -1128,6 +1128,16 @@ jobs:
         set -euo pipefail
         python3 scripts/check_intrinsic_arity.py --self-test
         python3 scripts/check_intrinsic_arity.py --check
+    - name: Intrinsic lowering tables are complete (outer pattern vs mnemonic)
+      run: |
+        set -euo pipefail
+        python3 scripts/check_intrinsic_lowering_coverage.py --self-test
+        python3 scripts/check_intrinsic_lowering_coverage.py
+    - name: 256-bit builtin result widths agree with the op table
+      run: |
+        set -euo pipefail
+        python3 scripts/check_x86_intrinsic_kind_width.py --self-test
+        python3 scripts/check_x86_intrinsic_kind_width.py
     - name: GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)
       run: |
         set -o pipefail
@@ -1521,13 +1531,11 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 30 of 62 gate steps of the `codegen` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (403 s of
-    # lane-split: 806 s). The preamble above is byte-identical in every
+    # lane-split: 39 of 78 gate steps of the `codegen` lane, assigned
+    # lane-split: by longest-processing-time over measured cost (416 s of
+    # lane-split: 832 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
-    - name: i386 call-staging assembly gate
-      run: bash tests/regression/check_i386_call_staging_asm.sh
     - name: SIMD folded-index correctness and runner failure contracts
       run: |
         set -euo pipefail
@@ -1544,34 +1552,10 @@ jobs:
         python3 tests/simd/aos_pair_shapes.py --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/aos_pair_shapes.py --guarded --mixed --stride 4 \
           --lccc target/fastbuild/lccc --reference gcc-16
-    - name: Pointer IV collapse and zero-guard count instruction selection
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ptr_iv_collapse_codegen.sh
-    - name: One-level self-recursion clone shape
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_self_recursion_clone.sh
-    - name: Compile-time fold refuses an unfinishable constant recursion
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ipcp_eval_depth.sh
-    - name: Enum layout semantics (widening, packed, struct inheritance, static asserts)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_layout_semantics.sh
-    - name: One-lane FP vector ABI (AUD-VABI-4)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_one_lane_fp.sh
-    - name: Differential fuzz smoke (synthetic)
-      run: |
-        python3 scripts/fuzz_diff.py --engine synthetic --count 4 \
-          --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O2 \
-          --seed 20260906
-    - name: Verify strict packed coefficient DAG and i686 rounding
-      env:
-        CCC: target/fastbuild/lccc
-        GCC: gcc-16
-      run: bash tests/regression/check_strict_packed_dag.sh
     - name: Verify synthesized CFI invariants (corpus, x86-64 + i686)
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_cfi_invariants.sh
-    - name: Verify statement-expression address-space declarations do not leak into typeof
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_seg_typeof_stmtexpr_leak.sh
     - name: Verify ISA ceilings (no BMI/AVX escape at x86-64/v2)
       env:
         CCC: target/fastbuild/lccc
@@ -1599,16 +1583,6 @@ jobs:
         LCCC_BIN: target/fastbuild/lccc
         GCC_BIN: gcc-16
       run: python3 tests/correctness/run_correctness.py
-    - name: Loop-alignment contract gate (emitted assembly)
-      run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
-    # PR #821 F1: user-authored AArch64 assembly is exempt from the
-    # -mgeneral-regs-only SIMD guard via #APP/#NO_APP provenance brackets.
-    - name: AArch64 inline-asm provenance gate
-      run: bash tests/regression/check_arm_inline_asm_provenance.sh
-    - name: Loop-inversion census
-      run: python3 scripts/loop_invert_census.py --lccc target/fastbuild/lccc --quiet
-    - name: Record tag identity gate (nested same-tag structs)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_record_tag_identity.sh
     - name: Volatile destructuring ratchet
       run: |
         python3 scripts/check_volatile_destructuring.py --self-test
@@ -1617,49 +1591,108 @@ jobs:
       run: python3 -m unittest discover -s tests/aarch64 -p 'test_*.py'
     - name: Exact signed division and strict volatile-load legality
       run: python3 scripts/check_exact_signed_div.py
+    - name: Enum tag scope compatibility
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_tag_scope_compat.sh
+    - name: Expat JUnit comparison contract
+      run: python3 tests/workloads/expat-2.8.5/junit_check.py --self-test
+    - name: Verify declaration-level __seg_gs qualifier codegen
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_seg_named_decl_qualifier.sh
+    # PR #821 F2: gABI-merged visibility drives export, st_other and the
+    # ADR predicate; input contract and emitted ELF cannot disagree.
+    - name: AArch64 shared visibility gate
+      run: bash tests/regression/check_arm_visibility_shared.sh
+    - name: Run __seg_gs declarator-space placement check
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_seg_declarator_space.sh
+    - name: Verify segment-qualified declarator codegen
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_segfs_typeof_nosteal.sh
+    - name: Volatile bitfield lowering gate
+      run: bash tests/regression/check_volatile_bitfield_split.sh
+    # 28 of 60 gate steps of the `codegen` lane, assigned
+    # by longest-processing-time over measured cost (246 s of
+    # 493 s). The preamble above is byte-identical in every
+    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
+    # is duplicated, or a shard drifts from this record.
+    - name: i386 small-struct regparm ABI debt gate
+      run: bash tests/regression/check_i386_regparm_small_struct_abi.sh
+    - name: Verify kernel boot-path ISA contract (patch + artifact scan)
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_kernel_boot_isa.sh
+    - name: Verify the aligned-vector-reload ratchet contracts
+      run: python3 tests/simd/test_check_aligned_vector_reload.py
+    - name: Prove the vector home-homing gate goes red on the pre-fix lowering
+      run: bash tests/regression/check_vector_fma_homing.sh --lccc tests/regression/vector_home_prefix_standin.sh --expect-defect
+    - name: Compile-time fold refuses an unfinishable constant recursion
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ipcp_eval_depth.sh
+    - name: One-lane FP vector ABI (AUD-VABI-4)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_one_lane_fp.sh
+    - name: Differential fuzz smoke (synthetic)
+      run: |
+        python3 scripts/fuzz_diff.py --engine synthetic --count 4 \
+          --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O2 \
+          --seed 20260906
+    - name: Verify strict packed coefficient DAG and i686 rounding
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_strict_packed_dag.sh
+    - name: Loop-alignment contract gate (emitted assembly)
+      run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
+    - name: Record tag identity gate (nested same-tag structs)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_record_tag_identity.sh
     - name: Verify MachInst narrow-slot window allocation
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_machinst_window_alloc_wide_copy.sh
-    - name: Run kernel-tree deletion-safety regression
-      run: bash tests/regression/check_kernel_tree_clear.sh
-    # Enum/enumerator types and `_Alignas(type)` member layout, on x86-64 and
-    # i686 (the corpus covers x86-64 only; these layouts differ on i686).
-    - name: Enum type and alignas layout fixtures
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fixture_modes.sh enum_type_semantics.c alignas_type_layout.c
     - name: Verify over-aligned alloca typed-census admission
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_overalign_typed_census.sh
-    - name: Enum tag scope compatibility
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_tag_scope_compat.sh
-    - name: 64-bit divide bypass assembly contract
-      run: bash tests/regression/check_div64_bypass_asm.sh
-    - name: Verify segment-override constant-displacement fold
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_seg_const_offset_fold.sh
-    # AUD-DRV-1: `-o -` is a stream, not a filename, wherever GCC says so
-    # (measured on GCC 14.2); the gate's --self-test rejects a fake compiler
-    # with the old file-named-`-` behavior.
-    - name: Dash-output stdout gate
-      run: bash tests/regression/check_dash_output.sh
     - name: Volatile spin-loop position gate
       run: bash tests/regression/check_volatile_spin_loop.sh
-    - name: Expat JUnit comparison contract
-      run: python3 tests/workloads/expat-2.8.5/junit_check.py --self-test
-    - name: Run __seg_gs pointee-chain assembly contract
+    - name: Run __seg_gs explicit-cast warning and abstract-declarator check
       env:
         CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_seg_pointee_chain_asm.sh
-    - name: Verify unwinding through lccc frames (.eh_frame)
+      run: bash tests/regression/check_seg_cast_warning.sh
+    # Type-dependent `_Static_assert` conditions are decided by sema; false
+    # ones must be rejected, not silently accepted.
+    - name: Static assertion semantics
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_static_assert_sema.sh
+    - name: Verify segment loads land in their home register
       env:
         CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_eh_frame_unwind.sh
-    - name: Pipefail/SIGPIPE detector
-      run: |
-        python3 scripts/check_pipefail_sigpipe.py --self-test
-        python3 scripts/check_pipefail_sigpipe.py
+      run: bash tests/regression/check_seg_direct_home.sh
+    - name: Run __seg_gs conversion diagnostics check
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_seg_conv_diagnostics.sh
+    - name: Verify strict computed-reciprocal codegen
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_strict_computed_recip_codegen.sh
+    - name: Verify COMDAT groups are identified by signature (x86-64 + i686 links)
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_comdat_signature_identity.sh
+    - name: Run chroot bind regression
+      run: bash tests/regression/check_chroot_bind.sh
+    - name: Vector reloads of a just-stored aligned home must be register copies
+      run: python3 tests/simd/check_aligned_vector_reload.py --lccc target/fastbuild/lccc
+    - name: Lane-mask select must be target-invariant sign-bit semantics (SA-10)
+      run: bash tests/regression/check_blendv_lane_semantics.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: Prove the FMA digit gate goes red on the pre-fix placement
+      run: bash tests/regression/check_fma_digit_permutation.sh --lccc tests/regression/fma_prefix_standin.sh --expect-defect
+    - name: 256-bit FMA and direct-load homes must stay in registers (RH-01/RH-02)
+      run: bash tests/regression/check_vector_fma_homing.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: Whole-vector temporary stores are forwarded into the destination store
+      run: bash tests/regression/check_vector_store_forward.sh --lccc target/fastbuild/lccc --reference gcc-16
     needs:
     - build
   codegen-b:
@@ -1733,68 +1766,111 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 32 of 62 gate steps of the `codegen` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (403 s of
-    # lane-split: 806 s). The preamble above is byte-identical in every
+    # lane-split: 39 of 78 gate steps of the `codegen` lane, assigned
+    # lane-split: by longest-processing-time over measured cost (416 s of
+    # lane-split: 832 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
-    - name: Verify declaration-level __seg_gs qualifier codegen
+    - name: i386 call-staging assembly gate
+      run: bash tests/regression/check_i386_call_staging_asm.sh
+    - name: One-level self-recursion clone shape
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_self_recursion_clone.sh
+    - name: Enum layout semantics (widening, packed, struct inheritance, static asserts)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_layout_semantics.sh
+    # PR #821 F1: user-authored AArch64 assembly is exempt from the
+    # -mgeneral-regs-only SIMD guard via #APP/#NO_APP provenance brackets.
+    - name: AArch64 inline-asm provenance gate
+      run: bash tests/regression/check_arm_inline_asm_provenance.sh
+    # Enum/enumerator types and `_Alignas(type)` member layout, on x86-64 and
+    # i686 (the corpus covers x86-64 only; these layouts differ on i686).
+    - name: Enum type and alignas layout fixtures
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fixture_modes.sh enum_type_semantics.c alignas_type_layout.c
+    - name: Verify segment-override constant-displacement fold
       env:
         CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_seg_named_decl_qualifier.sh
-    - name: Run __seg_gs explicit-cast warning and abstract-declarator check
+      run: bash tests/regression/check_seg_const_offset_fold.sh
+    - name: Verify unwinding through lccc frames (.eh_frame)
       env:
         CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_seg_cast_warning.sh
-    # PR #821 F2: gABI-merged visibility drives export, st_other and the
-    # ADR predicate; input contract and emitted ELF cannot disagree.
-    - name: AArch64 shared visibility gate
-      run: bash tests/regression/check_arm_visibility_shared.sh
+      run: bash tests/regression/check_eh_frame_unwind.sh
+    - name: Pipefail/SIGPIPE detector
+      run: |
+        python3 scripts/check_pipefail_sigpipe.py --self-test
+        python3 scripts/check_pipefail_sigpipe.py
+    # PR #821 F3: shared-library ADR relocations prove the section-relative
+    # precondition through the SECTION MAP.
+    - name: AArch64 shared ADR contract gate
+      run: bash tests/regression/check_arm_adr_shared_contract.sh
+    - name: Verify differential-fuzz engine wiring
+      run: python3 scripts/fuzz_diff.py --check-engines
+    - name: Strict packed reciprocal bitwise oracle
+      run: python3 scripts/check_strict_packed_recip.py
+    - name: Verify latency-driven reassociation (reassoc_lat)
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_reassoc_latency.sh
+    - name: Linux 6.18 semantic-analysis and qualifier parity
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_kernel_618_sema_parity.sh
+    - name: Reject named address spaces on unsupported targets without an ICE
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_seg_target_diagnostics.sh
+    - name: Scoped-noreturn diagnostic gate
+      run: bash tests/regression/check_scoped_noreturn_diagnostics.sh
+    - name: Errexit-negation detector
+      run: |
+        python3 scripts/check_errexit_negation.py --self-test
+        python3 scripts/check_errexit_negation.py
+    - name: Differential fuzz smoke (address identity and value survival)
+      run: |
+        python3 scripts/fuzz_diff.py --engine addr_value --count 8 \
+          --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O1,-O2 \
+          --seed 20261022
+    - name: Verify ARX lane-frame latency (vec_arx + arx_vectorize)
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_arx_frame_latency.sh
+    - name: Every FMA3 digit permutation must compute a*b+c (SA-11)
+      run: bash tests/regression/check_fma_digit_permutation.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: Packed integer and bitwise maps must stay in registers (RH-03)
+      run: bash tests/regression/check_x86_int_map_registers.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: binary16 conversion must be value-identical with and without F16C
+      run: bash tests/regression/check_f16_conversion_parity.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: Pointer IV collapse and zero-guard count instruction selection
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ptr_iv_collapse_codegen.sh
+    - name: Verify statement-expression address-space declarations do not leak into typeof
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_seg_typeof_stmtexpr_leak.sh
+    - name: Loop-inversion census
+      run: python3 scripts/loop_invert_census.py --lccc target/fastbuild/lccc --quiet
+    - name: Run kernel-tree deletion-safety regression
+      run: bash tests/regression/check_kernel_tree_clear.sh
+    - name: 64-bit divide bypass assembly contract
+      run: bash tests/regression/check_div64_bypass_asm.sh
+    # AUD-DRV-1: `-o -` is a stream, not a filename, wherever GCC says so
+    # (measured on GCC 14.2); the gate's --self-test rejects a fake compiler
+    # with the old file-named-`-` behavior.
+    - name: Dash-output stdout gate
+      run: bash tests/regression/check_dash_output.sh
+    - name: Run __seg_gs pointee-chain assembly contract
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_seg_pointee_chain_asm.sh
     - name: Verify inline-asm UTF-8 assembly text
       run: |
         python3 scripts/check_inline_asm_utf8.py \
           --lccc target/fastbuild/lccc \
           --expect preserved \
           --json inline-asm-utf8.json
-    # PR #821 F3: shared-library ADR relocations prove the section-relative
-    # precondition through the SECTION MAP.
-    - name: AArch64 shared ADR contract gate
-      run: bash tests/regression/check_arm_adr_shared_contract.sh
-    - name: Run __seg_gs declarator-space placement check
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_seg_declarator_space.sh
-    # Type-dependent `_Static_assert` conditions are decided by sema; false
-    # ones must be rejected, not silently accepted.
-    - name: Static assertion semantics
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_static_assert_sema.sh
-    - name: Verify segment-qualified declarator codegen
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_segfs_typeof_nosteal.sh
     - name: Embedded-NUL strlen contract
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_strlen_embedded_nul.sh
-    - name: Verify differential-fuzz engine wiring
-      run: python3 scripts/fuzz_diff.py --check-engines
-    - name: Verify segment loads land in their home register
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_seg_direct_home.sh
-    - name: Volatile bitfield lowering gate
-      run: bash tests/regression/check_volatile_bitfield_split.sh
-    # 28 of 60 gate steps of the `codegen` lane, assigned
-    # by longest-processing-time over measured cost (246 s of
-    # 493 s). The preamble above is byte-identical in every
-    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
-    # is duplicated, or a shard drifts from this record.
-    - name: i386 small-struct regparm ABI debt gate
-      run: bash tests/regression/check_i386_regparm_small_struct_abi.sh
     # AUD-SILENT-ZERO-1: x86-only intrinsics are a lowering-time diagnostic
     # on aarch64/riscv64, never silent zeros (mutation-tested sweep).
     - name: foreign-intrinsics rejected gate
       run: python3 scripts/check_foreign_intrinsics.py
-    - name: Strict packed reciprocal bitwise oracle
-      run: python3 scripts/check_strict_packed_recip.py
     # One step, one run: the same script was executed twice in this lane (once
     # bare as "Observable FP environment semantics", once with an explicit CCC
     # as "Verify observable FP exception ordering"). Both resolve to the same
@@ -1809,31 +1885,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_nocfi_peephole_parity.sh
-    - name: Verify latency-driven reassociation (reassoc_lat)
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_reassoc_latency.sh
-    - name: Verify kernel boot-path ISA contract (patch + artifact scan)
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_kernel_boot_isa.sh
-    - name: Linux 6.18 semantic-analysis and qualifier parity
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_kernel_618_sema_parity.sh
     - name: Run __seg_gs runtime regression
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_seg_gs_runtime.sh
-    - name: Run __seg_gs conversion diagnostics check
-      env:
-        CCC: target/fastbuild/lccc
-        GCC: gcc-16
-      run: bash tests/regression/check_seg_conv_diagnostics.sh
-    - name: Reject named address spaces on unsupported targets without an ICE
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_seg_target_diagnostics.sh
     - name: Benchmark output gate (workload kernels vs GCC oracle)
       env:
         GCC_BIN: gcc-16
@@ -1845,53 +1900,16 @@ jobs:
         # verdict (PASS/FAIL counts, diagnostics ordered by case and level) is
         # identical to the serial gate.
         bash scripts/check_benchmark_outputs.sh --jobs 4
-    - name: Scoped-noreturn diagnostic gate
-      run: bash tests/regression/check_scoped_noreturn_diagnostics.sh
-    - name: Errexit-negation detector
-      run: |
-        python3 scripts/check_errexit_negation.py --self-test
-        python3 scripts/check_errexit_negation.py
     - name: Fuzz harness verdict tests
       run: python3 -m unittest discover -s tests/fuzz -p 'test_*.py'
-    - name: Differential fuzz smoke (address identity and value survival)
-      run: |
-        python3 scripts/fuzz_diff.py --engine addr_value --count 8 \
-          --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O1,-O2 \
-          --seed 20261022
-    - name: Verify strict computed-reciprocal codegen
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_strict_computed_recip_codegen.sh
-    - name: Verify ARX lane-frame latency (vec_arx + arx_vectorize)
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_arx_frame_latency.sh
-    - name: Verify COMDAT groups are identified by signature (x86-64 + i686 links)
-      env:
-        CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_comdat_signature_identity.sh
     - name: Run __seg_gs aggregate copy size sweep
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_seg_copy_sweep.sh
-    - name: Run chroot bind regression
-      run: bash tests/regression/check_chroot_bind.sh
-    - name: Vector reloads of a just-stored aligned home must be register copies
-      run: python3 tests/simd/check_aligned_vector_reload.py --lccc target/fastbuild/lccc
-    - name: Verify the aligned-vector-reload ratchet contracts
-      run: python3 tests/simd/test_check_aligned_vector_reload.py
-    - name: Lane-mask select must be target-invariant sign-bit semantics (SA-10)
-      run: bash tests/regression/check_blendv_lane_semantics.sh --lccc target/fastbuild/lccc --reference gcc-16
     - name: Prove the lane-mask gate goes red on the pre-fix lowering
       run: bash tests/regression/check_blendv_lane_semantics.sh --lccc tests/regression/blendv_prefix_standin.sh --expect-defect
-    - name: Every FMA3 digit permutation must compute a*b+c (SA-11)
-      run: bash tests/regression/check_fma_digit_permutation.sh --lccc target/fastbuild/lccc --reference gcc-16
-    - name: Prove the FMA digit gate goes red on the pre-fix placement
-      run: bash tests/regression/check_fma_digit_permutation.sh --lccc tests/regression/fma_prefix_standin.sh --expect-defect
     - name: i686 128-bit VEX FMA3 must compile and compute a*b+c (SA-11)
       run: bash tests/regression/check_i686_fma128.sh --lccc target/fastbuild/lccc
-    - name: binary16 conversion must be value-identical with and without F16C
-      run: bash tests/regression/check_f16_conversion_parity.sh --lccc target/fastbuild/lccc --reference gcc-16
     needs:
     - build
   backend:
