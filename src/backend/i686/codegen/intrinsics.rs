@@ -2213,7 +2213,25 @@ impl I686Codegen {
             | IntrinsicOp::FmaPs231
             | IntrinsicOp::FmaPd132
             | IntrinsicOp::FmaPd213
-            | IntrinsicOp::FmaPd231 => {
+            | IntrinsicOp::FmaPd231
+            | IntrinsicOp::FmsubPs132
+            | IntrinsicOp::FnmaddPs132
+            | IntrinsicOp::FnmsubPs132
+            | IntrinsicOp::FmaddsubPs132
+            | IntrinsicOp::FmsubaddPs132
+            | IntrinsicOp::FmsubPd132
+            | IntrinsicOp::FnmaddPd132
+            | IntrinsicOp::FnmsubPd132
+            | IntrinsicOp::FmaddsubPd132
+            | IntrinsicOp::FmsubaddPd132
+            | IntrinsicOp::FmsubSs
+            | IntrinsicOp::FnmaddSs
+            | IntrinsicOp::FnmsubSs
+            | IntrinsicOp::FmsubSd
+            | IntrinsicOp::FnmaddSd
+            | IntrinsicOp::FnmsubSd
+            | IntrinsicOp::FmaSs
+            | IntrinsicOp::FmaSd => {
                 if let Some(dptr) = dest_ptr {
                     // Total mapping, no catch-all: the arm above enumerates
                     // exactly these six ops, so anything else is a compile-time
@@ -2247,7 +2265,17 @@ impl I686Codegen {
             | IntrinsicOp::FmaPs231v256
             | IntrinsicOp::FmaPd132v256
             | IntrinsicOp::FmaPd213v256
-            | IntrinsicOp::FmaPd231v256 => {
+            | IntrinsicOp::FmaPd231v256
+            | IntrinsicOp::FmsubPs132v256
+            | IntrinsicOp::FnmaddPs132v256
+            | IntrinsicOp::FnmsubPs132v256
+            | IntrinsicOp::FmaddsubPs132v256
+            | IntrinsicOp::FmsubaddPs132v256
+            | IntrinsicOp::FmsubPd132v256
+            | IntrinsicOp::FnmaddPd132v256
+            | IntrinsicOp::FnmsubPd132v256
+            | IntrinsicOp::FmaddsubPd132v256
+            | IntrinsicOp::FmsubaddPd132v256 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = Self::fma3_mnemonic(op);
                     // Each digit triple needs its OWN placement of
@@ -3309,8 +3337,31 @@ impl I686Codegen {
             FmaPd132 | FmaPd132v256 => "vfmadd132pd",
             FmaPd213 | FmaPd213v256 => "vfmadd213pd",
             FmaPd231 | FmaPd231v256 => "vfmadd231pd",
+            // The rest of the FMA3 family.  These are ONE instruction each
+            // with a single rounding of the product; a `mul` + `add`/`sub`
+            // spelling changes the result in the last bit.
+            FmsubPs132 | FmsubPs132v256 => "vfmsub132ps",
+            FnmaddPs132 | FnmaddPs132v256 => "vfnmadd132ps",
+            FnmsubPs132 | FnmsubPs132v256 => "vfnmsub132ps",
+            FmaddsubPs132 | FmaddsubPs132v256 => "vfmaddsub132ps",
+            FmsubaddPs132 | FmsubaddPs132v256 => "vfmsubadd132ps",
+            FmsubPd132 | FmsubPd132v256 => "vfmsub132pd",
+            FnmaddPd132 | FnmaddPd132v256 => "vfnmadd132pd",
+            FnmsubPd132 | FnmsubPd132v256 => "vfnmsub132pd",
+            FmaddsubPd132 | FmaddsubPd132v256 => "vfmaddsub132pd",
+            FmsubaddPd132 | FmsubaddPd132v256 => "vfmsubadd132pd",
+            FmaSs => "vfmadd132ss",
+            FmaSd => "vfmadd132sd",
+            FmsubSs => "vfmsub132ss",
+            FnmaddSs => "vfnmadd132ss",
+            FnmsubSs => "vfnmsub132ss",
+            FmsubSd => "vfmsub132sd",
+            FnmaddSd => "vfnmadd132sd",
+            FnmsubSd => "vfnmsub132sd",
             // Every other op maps to the 132 ps form; unreachable in practice
-            // but total, so no caller can panic on it.
+            // but total, so no caller can panic on it.  `fma3_mnemonic_is_total_
+            // over_every_fma3_op` pins the family so a new op cannot silently
+            // land here and emit `fmadd` for a `fmsub` request.
             _ => "vfmadd132ps",
         }
     }
@@ -3898,5 +3949,62 @@ mod scalar_saturation_cache_tests {
             "UsubSat32 clobbers %ecx and must not retain a stale secondary value:\n{}",
             cg.state.out.buf
         );
+    }
+}
+
+#[cfg(test)]
+mod fma_family_tests {
+    use super::*;
+
+    /// `fma3_mnemonic` ends in a catch-all that yields the plain `fmadd` spelling.
+    ///
+    /// That catch-all is only safe because the two callers enumerate their ops
+    /// in the surrounding arm; if a new FMA op is added to an arm and NOT to the
+    /// table, the catch-all silently emits `vfmadd132ps` for it -- a wrong
+    /// instruction with no diagnostic, which is the worst possible failure
+    /// mode.  This test pins the whole family by name so that can never happen
+    /// unnoticed: every op below must map to its own mnemonic.
+    #[test]
+    fn fma3_mnemonic_is_total_over_every_fma3_op() {
+        use IntrinsicOp::*;
+        for (op, want) in [
+            (FmaPs132, "vfmadd132ps"),
+            (FmaPs213, "vfmadd213ps"),
+            (FmaPs231, "vfmadd231ps"),
+            (FmaPd132, "vfmadd132pd"),
+            (FmaPd213, "vfmadd213pd"),
+            (FmaPd231, "vfmadd231pd"),
+            (FmaPs132v256, "vfmadd132ps"),
+            (FmaPd231v256, "vfmadd231pd"),
+            (FmsubPs132, "vfmsub132ps"),
+            (FnmaddPs132, "vfnmadd132ps"),
+            (FnmsubPs132, "vfnmsub132ps"),
+            (FmaddsubPs132, "vfmaddsub132ps"),
+            (FmsubaddPs132, "vfmsubadd132ps"),
+            (FmsubPd132, "vfmsub132pd"),
+            (FnmaddPd132, "vfnmadd132pd"),
+            (FnmsubPd132, "vfnmsub132pd"),
+            (FmaddsubPd132, "vfmaddsub132pd"),
+            (FmsubaddPd132, "vfmsubadd132pd"),
+            (FmsubPs132v256, "vfmsub132ps"),
+            (FnmaddPd132v256, "vfnmadd132pd"),
+            (FmsubSs, "vfmsub132ss"),
+            (FnmaddSs, "vfnmadd132ss"),
+            (FnmsubSs, "vfnmsub132ss"),
+            (FmsubSd, "vfmsub132sd"),
+            (FnmaddSd, "vfnmadd132sd"),
+            (FnmsubSd, "vfnmsub132sd"),
+        ] {
+            assert_eq!(I686Codegen::fma3_mnemonic(&op), want, "{op:?}");
+        }
+        // The role order the emitter derives from each mnemonic must be the 132
+        // placement the arm loads its operands for.
+        for op in [FmsubPs132, FnmaddPs132, FmaddsubPs132, FmsubaddPd132] {
+            assert_eq!(
+                fma_role_order(I686Codegen::fma3_mnemonic(&op)),
+                FmaRoleOrder::RmBVvvvCDstA,
+                "{op:?}"
+            );
+        }
     }
 }

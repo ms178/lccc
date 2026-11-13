@@ -138,6 +138,7 @@ pub fn x86_builtin_feature_macro(name: &str) -> Option<&'static str> {
         "__builtin_ia32_punpcklwd256" => Some("__AVX2__"),
         "__builtin_ia32_pxor256" => Some("__AVX2__"),
         "__builtin_ia32_storedqu256" => Some("__AVX__"),
+        "__builtin_ia32_storeups256" | "__builtin_ia32_storeupd256" => Some("__AVX__"),
         "__builtin_ia32_subpd256" => Some("__AVX__"),
         "__builtin_ia32_subps256" => Some("__AVX__"),
         "__builtin_ia32_vextractf128_ps256" => Some("__AVX__"),

@@ -1193,6 +1193,70 @@ __m128 __lccc_simd128_ps_fmadd132ps128(long, __m128 __a, __m128 __b, __m128 __c)
 __m128d __lccc_simd128_ps_fmadd132pd128(long, __m128d __a, __m128d __b, __m128d __c);
 #define _mm_fmadd_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmadd132pd128(0, __a, __b, __c))
 
+/* The rest of the FMA3 family.  Every one of these rounds the product ONCE,
+ * after the addend is applied.  They must NOT be written as a lane loop over
+ * `a*b +- c`: that is two roundings, and it only ever looked correct because
+ * the default -ffp-contract=fast contracted the loop back into one instruction.
+ * With -ffp-contract=off the loop returned 0 where gcc-16 returns -1.42e-14.
+ * The native helper emits the single instruction unconditionally. */
+
+__m128 __lccc_simd128_ps_fmsub132ps128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fmsub_ps(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmsub132ps128(0, __a, __b, __c))
+
+__m128 __lccc_simd128_ps_fnmadd132ps128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fnmadd_ps(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fnmadd132ps128(0, __a, __b, __c))
+
+__m128 __lccc_simd128_ps_fnmsub132ps128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fnmsub_ps(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fnmsub132ps128(0, __a, __b, __c))
+
+__m128 __lccc_simd128_ps_fmaddsub132ps128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fmaddsub_ps(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmaddsub132ps128(0, __a, __b, __c))
+
+__m128 __lccc_simd128_ps_fmsubadd132ps128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fmsubadd_ps(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmsubadd132ps128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fmsub132pd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fmsub_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmsub132pd128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fnmadd132pd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fnmadd_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fnmadd132pd128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fnmsub132pd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fnmsub_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fnmsub132pd128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fmaddsub132pd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fmaddsub_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmaddsub132pd128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fmsubadd132pd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fmsubadd_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmsubadd132pd128(0, __a, __b, __c))
+
+/* Scalar FMA3.  Lane 0 is fused; the upper lanes of `a` pass through, which is
+ * exactly what the 132 placement of the ss/sd encoding does. */
+
+__m128 __lccc_simd128_ps_fmadd132ss128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fmadd_ss(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmadd132ss128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fmadd132sd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fmadd_sd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmadd132sd128(0, __a, __b, __c))
+
+__m128 __lccc_simd128_ps_fmsub132ss128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fmsub_ss(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmsub132ss128(0, __a, __b, __c))
+
+__m128 __lccc_simd128_ps_fnmadd132ss128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fnmadd_ss(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fnmadd132ss128(0, __a, __b, __c))
+
+__m128 __lccc_simd128_ps_fnmsub132ss128(long, __m128 __a, __m128 __b, __m128 __c);
+#define _mm_fnmsub_ss(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fnmsub132ss128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fmsub132sd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fmsub_sd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmsub132sd128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fnmadd132sd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fnmadd_sd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fnmadd132sd128(0, __a, __b, __c))
+
+__m128d __lccc_simd128_ps_fnmsub132sd128(long, __m128d __a, __m128d __b, __m128d __c);
+#define _mm_fnmsub_sd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fnmsub132sd128(0, __a, __b, __c))
+
 __m128 __lccc_simd128_ps_movss128(long, __m128 __a, __m128 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m128 _mm_move_ss(__m128 __a, __m128 __b)
 { return __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_movss128(0, __a, __b)); }
@@ -1461,6 +1525,36 @@ void * __lccc_simd256_ps_vfmadd132ps256(long, __m256 __a, __m256 __b, __m256 __c
 
 void * __lccc_simd256_ps_vfmadd132pd256(long, __m256d __a, __m256d __b, __m256d __c);
 #define _mm256_fmadd_pd(__a, __b, __c) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vfmadd132pd256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfmsub132ps256(long, __m256 __a, __m256 __b, __m256 __c);
+#define _mm256_fmsub_ps(__a, __b, __c) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vfmsub132ps256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfnmadd132ps256(long, __m256 __a, __m256 __b, __m256 __c);
+#define _mm256_fnmadd_ps(__a, __b, __c) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vfnmadd132ps256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfnmsub132ps256(long, __m256 __a, __m256 __b, __m256 __c);
+#define _mm256_fnmsub_ps(__a, __b, __c) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vfnmsub132ps256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfmaddsub132ps256(long, __m256 __a, __m256 __b, __m256 __c);
+#define _mm256_fmaddsub_ps(__a, __b, __c) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vfmaddsub132ps256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfmsubadd132ps256(long, __m256 __a, __m256 __b, __m256 __c);
+#define _mm256_fmsubadd_ps(__a, __b, __c) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vfmsubadd132ps256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfmsub132pd256(long, __m256d __a, __m256d __b, __m256d __c);
+#define _mm256_fmsub_pd(__a, __b, __c) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vfmsub132pd256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfnmadd132pd256(long, __m256d __a, __m256d __b, __m256d __c);
+#define _mm256_fnmadd_pd(__a, __b, __c) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vfnmadd132pd256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfnmsub132pd256(long, __m256d __a, __m256d __b, __m256d __c);
+#define _mm256_fnmsub_pd(__a, __b, __c) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vfnmsub132pd256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfmaddsub132pd256(long, __m256d __a, __m256d __b, __m256d __c);
+#define _mm256_fmaddsub_pd(__a, __b, __c) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vfmaddsub132pd256(0, __a, __b, __c))
+
+void * __lccc_simd256_ps_vfmsubadd132pd256(long, __m256d __a, __m256d __b, __m256d __c);
+#define _mm256_fmsubadd_pd(__a, __b, __c) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vfmsubadd132pd256(0, __a, __b, __c))
 
 void * __lccc_simd256_ps_vperm2f128(long, __m256 __a, __m256 __b);
 #define _mm256_permute2f128_ps(__a, __b, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vperm2f128(__imm, __a, __b))

@@ -10,12 +10,48 @@
 /* Unaligned variants */
 /* === Load / Store === */
 
+/* Every 256-bit load/store below is ONE instruction at every optimization
+ * level.  They used to be lane loops (`__r[i] = __p[i];`), which only became a
+ * single `vmovups` when SLP ran: measured at -O0 they cost 28 instructions and
+ * a 176-byte frame, i.e. the intrinsic was slower than the scalar code it was
+ * supposed to replace.  The frontend builtins lower straight to the move. */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_loadu_si256(__m256i_u const *__p)
 {
-    __m256i __r;
-    __builtin_memcpy(&__r, __p, sizeof(__r));
-    return __r;
+    return __builtin_ia32_loaddqu256(__p);
+}
+
+/* Aligned forms.  These use the same move as the unaligned ones, which is not
+ * a shortcut but the encoding this backend already uses for every vector
+ * dereference: `_mm_load_ps` (a plain `*(const __m128 *)p`) lowers to `movups`
+ * here, so emitting `vmovaps` for the 256-bit form would make the two widths
+ * disagree.  A dereference does NOT work for the 32-byte object either: the
+ * backend treats it as an aggregate copy and round-trips the value through a
+ * stack temporary (measured: 26 instructions for a load+store pair, versus 2
+ * for the builtin).  `vmovups` from aligned storage costs exactly what
+ * `vmovaps` does on every CPU that has AVX. */
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_load_ps(float const *__p)
+{
+    return __builtin_ia32_loadups256(__p);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_store_ps(float *__p, __m256 __a)
+{
+    __builtin_ia32_storeups256(__p, __a);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_load_pd(double const *__p)
+{
+    return __builtin_ia32_loadupd256(__p);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_store_pd(double *__p, __m256d __a)
+{
+    __builtin_ia32_storeupd256(__p, __a);
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
@@ -27,7 +63,7 @@ _mm256_load_si256(__m256i const *__p)
 static __inline__ void __attribute__((__always_inline__))
 _mm256_storeu_si256(__m256i_u *__p, __m256i __a)
 {
-    __builtin_memcpy(__p, &__a, sizeof(__a));
+    __builtin_ia32_storedqu256(__p, __a);
 }
 
 static __inline__ void __attribute__((__always_inline__))
@@ -39,42 +75,32 @@ _mm256_store_si256(__m256i *__p, __m256i __a)
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_lddqu_si256(__m256i_u const *__p)
 {
-    __m256i __r;
-    __builtin_memcpy(&__r, __p, sizeof(__r));
-    return __r;
+    return __builtin_ia32_loaddqu256(__p);
 }
 
 /* Float load/store */
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_loadu_ps(float const *__p)
 {
-    __m256 __r;
-    for (int __i = 0; __i < 8; __i++)
-        __r[__i] = __p[__i];
-    return __r;
+    return __builtin_ia32_loadups256(__p);
 }
 
 static __inline__ void __attribute__((__always_inline__))
 _mm256_storeu_ps(float *__p, __m256 __a)
 {
-    for (int __i = 0; __i < 8; __i++)
-        __p[__i] = __a[__i];
+    __builtin_ia32_storeups256(__p, __a);
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_loadu_pd(double const *__p)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r[__i] = __p[__i];
-    return __r;
+    return __builtin_ia32_loadupd256(__p);
 }
 
 static __inline__ void __attribute__((__always_inline__))
 _mm256_storeu_pd(double *__p, __m256d __a)
 {
-    for (int __i = 0; __i < 4; __i++)
-        __p[__i] = __a[__i];
+    __builtin_ia32_storeupd256(__p, __a);
 }
 
 /* === Set === */

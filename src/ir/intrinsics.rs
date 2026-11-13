@@ -1982,18 +1982,53 @@ pub enum IntrinsicOp {
     Movshdup128,
     FmaSs,
     FmaSd,
+    // === FMA3 beyond the plain `fmadd` spellings ===
+    //
+    // `fmsub`, `fnmadd`, `fnmsub`, `fmaddsub` and `fmsubadd` each round the
+    // product ONCE, after the addend is applied.  Implementing any of them as
+    // `mul` + `add`/`sub` changes the result in the last bit -- measured on
+    // `_mm256_fmsub_ps`, which returned 0 where gcc-16 returns -1.42e-14 once
+    // `-ffp-contract=off` removed the contraction that had been silently
+    // standing in for the intrinsic.  They are separate ops for that reason,
+    // not for convenience.
+    FmsubSs,
+    FnmaddSs,
+    FnmsubSs,
+    FmsubSd,
+    FnmaddSd,
+    FnmsubSd,
     FmaPs132,
     FmaPs213,
     FmaPs231,
     FmaPd132,
     FmaPd213,
     FmaPd231,
+    FmsubPs132,
+    FnmaddPs132,
+    FnmsubPs132,
+    FmaddsubPs132,
+    FmsubaddPs132,
+    FmsubPd132,
+    FnmaddPd132,
+    FnmsubPd132,
+    FmaddsubPd132,
+    FmsubaddPd132,
     FmaPs132v256,
     FmaPs213v256,
     FmaPs231v256,
     FmaPd132v256,
     FmaPd213v256,
     FmaPd231v256,
+    FmsubPs132v256,
+    FmsubPd132v256,
+    FnmaddPs132v256,
+    FnmaddPd132v256,
+    FnmsubPs132v256,
+    FnmsubPd132v256,
+    FmaddsubPs132v256,
+    FmaddsubPd132v256,
+    FmsubaddPs132v256,
+    FmsubaddPd132v256,
     // === 512-bit FP ===
     AddPs512,
     SubPs512,
@@ -2025,6 +2060,16 @@ pub enum IntrinsicOp {
     FmaPd132v512,
     FmaPd213v512,
     FmaPd231v512,
+    FmsubPs132v512,
+    FmsubPd132v512,
+    FnmaddPs132v512,
+    FnmaddPd132v512,
+    FnmsubPs132v512,
+    FnmsubPd132v512,
+    FmaddsubPs132v512,
+    FmaddsubPd132v512,
+    FmsubaddPs132v512,
+    FmsubaddPd132v512,
 }
 
 /// Independent test matrix: do not derive this from the predicates under test.

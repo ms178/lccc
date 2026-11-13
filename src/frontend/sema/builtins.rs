@@ -2140,6 +2140,19 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_storedqu256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storeu256),
     );
+    // Float/double spellings of the 256-bit unaligned store.  The IR side
+    // (`X86StoreuPs256`/`X86StoreuPd256`) already existed and was reachable
+    // only through the `_mm256_storeu_ps`/`_pd` names -- which the bundled
+    // header defines as lane loops, so the builtins were dead and the loop was
+    // what user code got.  gcc-16 accepts both builtin names.
+    m.insert(
+        "__builtin_ia32_storeups256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86StoreuPs256),
+    );
+    m.insert(
+        "__builtin_ia32_storeupd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86StoreuPd256),
+    );
     m.insert(
         "__builtin_ia32_paddb256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddb256),
