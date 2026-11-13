@@ -188,6 +188,7 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_punpcklqdq128"
         | "__builtin_ia32_pxor128" => CType::Vector(Box::new(CType::LongLong), 16),
         "__builtin_ia32_paddq256"
+        | "__builtin_ia32_pandn256"
         | "__builtin_ia32_pcmpeqq256"
         | "__builtin_ia32_pcmpgtq256"
         | "__builtin_ia32_pmuludq256"
@@ -491,6 +492,7 @@ pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_paddd256"
         | "__builtin_ia32_paddq256"
         | "__builtin_ia32_paddw256"
+        | "__builtin_ia32_pandn256"
         | "__builtin_ia32_pcmpeqb256"
         | "__builtin_ia32_pcmpeqd256"
         | "__builtin_ia32_pcmpeqq256"
@@ -651,6 +653,7 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_paddw256"
         | "__builtin_ia32_pand128"
         | "__builtin_ia32_pandn128"
+        | "__builtin_ia32_pandn256"
         | "__builtin_ia32_pavgb128"
         | "__builtin_ia32_pavgw128"
         | "__builtin_ia32_pcmpeqb128"

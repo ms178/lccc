@@ -2226,6 +2226,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Por256),
     );
     m.insert(
+        "__builtin_ia32_pandn256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256),
+    );
+    m.insert(
         "__builtin_ia32_pand256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pand256),
     );

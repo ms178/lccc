@@ -358,6 +358,21 @@ _mm256_xor_pd(__m256d __a, __m256d __b)
         _mm256_xor_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
 }
 
+/* The `andnot` forms are declared here as macros over the frontend builtin.
+ * They are the only operation in this family with no `__lccc_simd256_*`
+ * helper, and an inline function would shadow the builtin (the first attempt
+ * did exactly that and lowered to per-lane GPR work).  Without any declaration
+ * the names worked only because sema happens to map them, which left the
+ * public inventory reporting them missing -- see
+ * engineering/isa/sse-avx-public-api.json. */
+#define _mm256_andnot_ps(__a, __b) \
+    (__m256)__builtin_ia32_pandn256(_mm256_castps_si256(__a), \
+                                    _mm256_castps_si256(__b))
+
+#define _mm256_andnot_pd(__a, __b) \
+    (__m256d)__builtin_ia32_pandn256(_mm256_castpd_si256(__a), \
+                                     _mm256_castpd_si256(__b))
+
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_and_ps(__m256 __a, __m256 __b)
 {

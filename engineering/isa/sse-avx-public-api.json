@@ -4878,7 +4878,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_add_pd",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_addpd256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -4893,7 +4895,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_add_ps",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_addps256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -4909,7 +4913,30 @@
       "header": "avxintrin.h",
       "name": "_mm256_and_pd",
       "raw_builtins": [],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm256_and_si256",
+        "_mm256_castpd_si256",
+        "_mm256_castsi256_pd"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_and_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_and_si256",
+        "_mm256_castps_si256",
+        "_mm256_castsi256_ps"
+      ]
     },
     {
       "arities": [
@@ -4918,13 +4945,36 @@
       "canonical_override": true,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_andnot_pd",
-      "raw_builtins": [],
-      "wrapper_dependencies": []
+      "raw_builtins": [
+        "__builtin_ia32_pandn256"
+      ],
+      "wrapper_dependencies": [
+        "_mm256_castpd_si256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": true,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_andnot_ps",
+      "raw_builtins": [
+        "__builtin_ia32_pandn256"
+      ],
+      "wrapper_dependencies": [
+        "_mm256_castps_si256"
+      ]
     },
     {
       "arities": [
@@ -5133,7 +5183,43 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_lddqu_si256",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_loaddqu256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_load_pd",
+      "raw_builtins": [
+        "__builtin_ia32_loadupd256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_load_ps",
+      "raw_builtins": [
+        "__builtin_ia32_loadups256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5163,7 +5249,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_loadu_pd",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_loadupd256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5178,7 +5266,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_loadu_ps",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_loadups256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5193,7 +5283,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_loadu_si256",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_loaddqu256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5208,7 +5300,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_mul_pd",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_mulpd256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5223,7 +5317,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_mul_ps",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_mulps256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5239,7 +5335,30 @@
       "header": "avxintrin.h",
       "name": "_mm256_or_pd",
       "raw_builtins": [],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm256_castpd_si256",
+        "_mm256_castsi256_pd",
+        "_mm256_or_si256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_or_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castps_si256",
+        "_mm256_castsi256_ps",
+        "_mm256_or_si256"
+      ]
     },
     {
       "arities": [
@@ -5350,6 +5469,40 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_store_pd",
+      "raw_builtins": [
+        "__builtin_ia32_storeupd256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_store_ps",
+      "raw_builtins": [
+        "__builtin_ia32_storeups256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -5373,7 +5526,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_storeu_pd",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_storeupd256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5388,7 +5543,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_storeu_ps",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_storeups256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5403,7 +5560,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_storeu_si256",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_storedqu256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5418,7 +5577,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_sub_pd",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_subpd256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5433,7 +5594,9 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_sub_ps",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_subps256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5449,7 +5612,30 @@
       "header": "avxintrin.h",
       "name": "_mm256_xor_pd",
       "raw_builtins": [],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm256_castpd_si256",
+        "_mm256_castsi256_pd",
+        "_mm256_xor_si256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_xor_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castps_si256",
+        "_mm256_castsi256_ps",
+        "_mm256_xor_si256"
+      ]
     },
     {
       "arities": [
@@ -5580,7 +5766,9 @@
       "generic_helpers": [],
       "header": "avx2intrin.h",
       "name": "_mm256_and_si256",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_pand256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5590,12 +5778,14 @@
       "canonical_override": true,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "avx2intrin.h",
       "name": "_mm256_andnot_si256",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_pandn256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5605,13 +5795,18 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
-      "generic_helpers": [],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vblendps256"
+      ],
       "header": "avx2intrin.h",
       "name": "_mm256_blend_epi32",
       "raw_builtins": [],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm256_castps_si256",
+        "_mm256_castsi256_ps"
+      ]
     },
     {
       "arities": [
@@ -6283,7 +6478,9 @@
       "generic_helpers": [],
       "header": "avx2intrin.h",
       "name": "_mm256_movemask_epi8",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_pmovmskb256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -7385,44 +7582,16 @@
     },
     {
       "arities": [
-        3
-      ],
-      "canonical_override": false,
-      "definitions": 1,
-      "forms": [
-        "function"
-      ],
-      "generic_helpers": [],
-      "header": "fmaintrin.h",
-      "name": "_mm256_fmsub_ps",
-      "raw_builtins": [],
-      "wrapper_dependencies": []
-    },
-    {
-      "arities": [
-        3
-      ],
-      "canonical_override": false,
-      "definitions": 1,
-      "forms": [
-        "function"
-      ],
-      "generic_helpers": [],
-      "header": "fmaintrin.h",
-      "name": "_mm256_fnmadd_ps",
-      "raw_builtins": [],
-      "wrapper_dependencies": []
-    },
-    {
-      "arities": [
         2
       ],
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
-      "generic_helpers": [],
+      "generic_helpers": [
+        "__lccc_simd512_ps_vaddps512"
+      ],
       "header": "avx512fintrin.h",
       "name": "_mm512_add_ps",
       "raw_builtins": [],
@@ -7479,6 +7648,176 @@
     },
     {
       "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_pd_vfmaddsub132pd512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fmaddsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_ps_vfmaddsub132ps512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fmaddsub_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_pd_vfmsub132pd512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fmsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_ps_vfmsub132ps512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fmsub_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_pd_vfmsubadd132pd512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fmsubadd_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_ps_vfmsubadd132ps512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fmsubadd_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_pd_vfnmadd132pd512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fnmadd_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_ps_vfnmadd132ps512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fnmadd_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_pd_vfnmsub132pd512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fnmsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_ps_vfnmsub132ps512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_fnmsub_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         1
       ],
       "canonical_override": false,
@@ -7486,7 +7825,60 @@
       "forms": [
         "function"
       ],
-      "generic_helpers": [],
+      "generic_helpers": [
+        "__lccc_simd512_i_vmovdqu64_load"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_load_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vmovdqu64_load"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_load_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vmovdqu64_load"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_loadu_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vmovdqu64_load"
+      ],
       "header": "avx512fintrin.h",
       "name": "_mm512_loadu_ps",
       "raw_builtins": [],
@@ -7531,9 +7923,11 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
-      "generic_helpers": [],
+      "generic_helpers": [
+        "__lccc_simd512_ps_vmulps512"
+      ],
       "header": "avx512fintrin.h",
       "name": "_mm512_mul_ps",
       "raw_builtins": [],
@@ -7672,9 +8066,79 @@
       "forms": [
         "function"
       ],
-      "generic_helpers": [],
+      "generic_helpers": [
+        "__lccc_simd512_i_vmovdqu64_store"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_store_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vmovdqu64_store"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_store_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vmovdqu64_store"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_storeu_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_i_vmovdqu64_store"
+      ],
       "header": "avx512fintrin.h",
       "name": "_mm512_storeu_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd512_ps_vsubps512"
+      ],
+      "header": "avx512fintrin.h",
+      "name": "_mm512_sub_ps",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -8610,6 +9074,176 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm256_fmadd_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfmaddsub132pd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fmaddsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfmaddsub132ps256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fmaddsub_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfmsub132pd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fmsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfmsub132ps256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fmsub_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfmsubadd132pd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fmsubadd_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfmsubadd132ps256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fmsubadd_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfnmadd132pd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fnmadd_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfnmadd132ps256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fnmadd_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfnmsub132pd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fnmsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vfnmsub132ps256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_fnmsub_ps",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -13323,6 +13957,312 @@
     },
     {
       "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmadd132sd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmadd_sd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmadd132ss128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmadd_ss",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmaddsub132pd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmaddsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmaddsub132ps128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmaddsub_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmsub132pd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmsub132ps128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmsub_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmsub132sd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmsub_sd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmsub132ss128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmsub_ss",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmsubadd132pd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmsubadd_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fmsubadd132ps128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fmsubadd_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fnmadd132pd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fnmadd_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fnmadd132ps128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fnmadd_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fnmadd132sd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fnmadd_sd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fnmadd132ss128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fnmadd_ss",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fnmsub132pd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fnmsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fnmsub132ps128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fnmsub_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fnmsub132sd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fnmsub_sd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_fnmsub132ss128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_fnmsub_ss",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         2
       ],
       "canonical_override": false,
@@ -14277,7 +15217,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 870,
+  "declarations": 921,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -14295,8 +15235,6 @@
     "_mm256_alignr_epi32",
     "_mm256_alignr_epi64",
     "_mm256_alignr_epi8",
-    "_mm256_and_ps",
-    "_mm256_andnot_ps",
     "_mm256_avg_epu16",
     "_mm256_avg_epu8",
     "_mm256_avx512_and_si256",
@@ -14512,20 +15450,12 @@
     "_mm256_floor_ps",
     "_mm256_fmadd_pch",
     "_mm256_fmadd_ph",
-    "_mm256_fmaddsub_pd",
     "_mm256_fmaddsub_ph",
-    "_mm256_fmaddsub_ps",
-    "_mm256_fmsub_pd",
     "_mm256_fmsub_ph",
-    "_mm256_fmsubadd_pd",
     "_mm256_fmsubadd_ph",
-    "_mm256_fmsubadd_ps",
     "_mm256_fmul_pch",
-    "_mm256_fnmadd_pd",
     "_mm256_fnmadd_ph",
-    "_mm256_fnmsub_pd",
     "_mm256_fnmsub_ph",
-    "_mm256_fnmsub_ps",
     "_mm256_fpclass_pd_mask",
     "_mm256_fpclass_ph_mask",
     "_mm256_fpclass_ps_mask",
@@ -14565,9 +15495,7 @@
     "_mm256_inserti64x2",
     "_mm256_load_epi32",
     "_mm256_load_epi64",
-    "_mm256_load_pd",
     "_mm256_load_ph",
-    "_mm256_load_ps",
     "_mm256_loadu2_m128",
     "_mm256_loadu2_m128d",
     "_mm256_loadu2_m128i",
@@ -15598,7 +16526,6 @@
     "_mm256_nmsub_ps",
     "_mm256_or_epi32",
     "_mm256_or_epi64",
-    "_mm256_or_ps",
     "_mm256_packs_epi16",
     "_mm256_packus_epi32",
     "_mm256_permute2f128_si256",
@@ -15729,9 +16656,7 @@
     "_mm256_srlv_epi64",
     "_mm256_store_epi32",
     "_mm256_store_epi64",
-    "_mm256_store_pd",
     "_mm256_store_ph",
-    "_mm256_store_ps",
     "_mm256_storeu2_m128",
     "_mm256_storeu2_m128d",
     "_mm256_storeu2_m128i",
@@ -15762,7 +16687,6 @@
     "_mm256_undefined_si256",
     "_mm256_xor_epi32",
     "_mm256_xor_epi64",
-    "_mm256_xor_ps",
     "_mm256_zeroall",
     "_mm256_zeroupper",
     "_mm256_zextpd128_pd256",
@@ -16055,35 +16979,25 @@
     "_mm512_fmadd_round_pd",
     "_mm512_fmadd_round_ph",
     "_mm512_fmadd_round_ps",
-    "_mm512_fmaddsub_pd",
     "_mm512_fmaddsub_ph",
-    "_mm512_fmaddsub_ps",
     "_mm512_fmaddsub_round_pd",
     "_mm512_fmaddsub_round_ph",
     "_mm512_fmaddsub_round_ps",
-    "_mm512_fmsub_pd",
     "_mm512_fmsub_ph",
-    "_mm512_fmsub_ps",
     "_mm512_fmsub_round_pd",
     "_mm512_fmsub_round_ph",
     "_mm512_fmsub_round_ps",
-    "_mm512_fmsubadd_pd",
     "_mm512_fmsubadd_ph",
-    "_mm512_fmsubadd_ps",
     "_mm512_fmsubadd_round_pd",
     "_mm512_fmsubadd_round_ph",
     "_mm512_fmsubadd_round_ps",
     "_mm512_fmul_pch",
     "_mm512_fmul_round_pch",
-    "_mm512_fnmadd_pd",
     "_mm512_fnmadd_ph",
-    "_mm512_fnmadd_ps",
     "_mm512_fnmadd_round_pd",
     "_mm512_fnmadd_round_ph",
     "_mm512_fnmadd_round_ps",
-    "_mm512_fnmsub_pd",
     "_mm512_fnmsub_ph",
-    "_mm512_fnmsub_ps",
     "_mm512_fnmsub_round_pd",
     "_mm512_fnmsub_round_ph",
     "_mm512_fnmsub_round_ps",
@@ -16140,15 +17054,12 @@
     "_mm512_kxor",
     "_mm512_load_epi32",
     "_mm512_load_epi64",
-    "_mm512_load_pd",
     "_mm512_load_ph",
-    "_mm512_load_ps",
     "_mm512_load_si512",
     "_mm512_loadu_epi16",
     "_mm512_loadu_epi32",
     "_mm512_loadu_epi64",
     "_mm512_loadu_epi8",
-    "_mm512_loadu_pd",
     "_mm512_loadu_ph",
     "_mm512_lzcnt_epi32",
     "_mm512_lzcnt_epi64",
@@ -17590,15 +18501,12 @@
     "_mm512_srlv_epi64",
     "_mm512_store_epi32",
     "_mm512_store_epi64",
-    "_mm512_store_pd",
     "_mm512_store_ph",
-    "_mm512_store_ps",
     "_mm512_store_si512",
     "_mm512_storeu_epi16",
     "_mm512_storeu_epi32",
     "_mm512_storeu_epi64",
     "_mm512_storeu_epi8",
-    "_mm512_storeu_pd",
     "_mm512_storeu_ph",
     "_mm512_stream_load_si512",
     "_mm512_stream_pd",
@@ -17606,7 +18514,6 @@
     "_mm512_stream_si512",
     "_mm512_sub_pd",
     "_mm512_sub_ph",
-    "_mm512_sub_ps",
     "_mm512_sub_round_pd",
     "_mm512_sub_round_ph",
     "_mm512_sub_round_ps",
@@ -18008,45 +18915,27 @@
     "_mm_fmadd_round_sh",
     "_mm_fmadd_round_ss",
     "_mm_fmadd_sch",
-    "_mm_fmadd_sd",
     "_mm_fmadd_sh",
-    "_mm_fmadd_ss",
-    "_mm_fmaddsub_pd",
     "_mm_fmaddsub_ph",
-    "_mm_fmaddsub_ps",
-    "_mm_fmsub_pd",
     "_mm_fmsub_ph",
-    "_mm_fmsub_ps",
     "_mm_fmsub_round_sd",
     "_mm_fmsub_round_sh",
     "_mm_fmsub_round_ss",
-    "_mm_fmsub_sd",
     "_mm_fmsub_sh",
-    "_mm_fmsub_ss",
-    "_mm_fmsubadd_pd",
     "_mm_fmsubadd_ph",
-    "_mm_fmsubadd_ps",
     "_mm_fmul_pch",
     "_mm_fmul_round_sch",
     "_mm_fmul_sch",
-    "_mm_fnmadd_pd",
     "_mm_fnmadd_ph",
-    "_mm_fnmadd_ps",
     "_mm_fnmadd_round_sd",
     "_mm_fnmadd_round_sh",
     "_mm_fnmadd_round_ss",
-    "_mm_fnmadd_sd",
     "_mm_fnmadd_sh",
-    "_mm_fnmadd_ss",
-    "_mm_fnmsub_pd",
     "_mm_fnmsub_ph",
-    "_mm_fnmsub_ps",
     "_mm_fnmsub_round_sd",
     "_mm_fnmsub_round_sh",
     "_mm_fnmsub_round_ss",
-    "_mm_fnmsub_sd",
     "_mm_fnmsub_sh",
-    "_mm_fnmsub_ss",
     "_mm_fpclass_pd_mask",
     "_mm_fpclass_ph_mask",
     "_mm_fpclass_ps_mask",
@@ -19627,5 +20516,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 870
+  "unique_names": 921
 }
