@@ -55,6 +55,11 @@ _SEC_128 = "// ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----"
 _SEC_END = "// ---- Non-vector"
 _OP_NAME = re.compile(r"\b([A-Z][A-Za-z0-9_]*)\b")
 
+# A tree with fewer mapped-and-width-known builtins than this is a broken
+# parse, not a clean tree: the catch-all `_ => Vec128` classification makes
+# "found nothing to compare" indistinguishable from "everything agrees".
+MIN_COMPARED = 200
+
 
 def parse_op_widths(text: str) -> dict[str, int]:
     """Map IntrinsicOp variant -> SIMD home width (32 or 16)."""
@@ -239,7 +244,20 @@ def main(argv: list[str]) -> int:
         print(f"x86 intrinsic kind/width: FAIL: {error}")
         return 1
 
-    findings, compared = check(lowering, intrinsics)
+    try:
+        findings, compared = check(lowering, intrinsics)
+    except ValueError as error:
+        # The section markers moved: the parse would silently compare fewer
+        # ops than the tree has, which reads as approval.  Say so instead.
+        print(f"x86 intrinsic kind/width: FAIL: table layout changed ({error})")
+        return 1
+    if compared < MIN_COMPARED:
+        print(
+            f"x86 intrinsic kind/width: FAIL: only {compared} builtins compared "
+            f"(expected at least {MIN_COMPARED}); the parser is no longer finding "
+            "the tables, so a mismatch here would go unnoticed"
+        )
+        return 1
     if findings:
         print("x86 intrinsic kind/width: FAIL")
         for finding in findings:

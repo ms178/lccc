@@ -60,17 +60,20 @@ FILES = (
 
 INNER_ANCHOR = "let inst = match op {"
 
-# Outer pattern lines look like `IntrinsicOp::Foo` or `| IntrinsicOp::Foo`.
-# Keep this strictly anchored: anything else (e.g. a comment or a closing
-# brace) terminates the pattern list.
-# A pattern line is `IntrinsicOp::Foo`, optionally prefixed with `|` and
-# optionally carrying a trailing `|`; the last line of the pattern also opens
-# the arm body with `=> {` (there is no separate `=> {` line in this codebase).
-_PATTERN_LINE = re.compile(r"^\s*\|?\s*IntrinsicOp::([A-Za-z0-9_]+)\s*\|?\s*(=>\s*\{\s*)?$")
+# An arm pattern is one or more `IntrinsicOp::X` alternatives -- one per line
+# (`| IntrinsicOp::X`) or several on one line -- and the pattern's last line
+# opens the body with `=> {`.  Patterns are located STRUCTURALLY (brace
+# matching), not by a fixed window: the mnemonic table can sit several blocks
+# deep inside the arm body, and a window that is too small silently skips an
+# arm, which is the failure mode this checker exists to prevent.
+_PATTERN_ONLY = re.compile(
+    r"^\s*\|?\s*IntrinsicOp::[A-Za-z0-9_]+(?:\s*\|\s*IntrinsicOp::[A-Za-z0-9_]+)*\s*\|?\s*$"
+)
+_PATTERN_HEAD = re.compile(
+    r"^\s*(?:\|\s*)?IntrinsicOp::[A-Za-z0-9_]+"
+    r"(?:\s*\|\s*IntrinsicOp::[A-Za-z0-9_]+)*\s*=>\s*\{\s*$"
+)
 _ARM_END = re.compile(r"^\s*=>\s*\{\s*$")
-# Inner-match arms may name several ops per mnemonic
-# (`IntrinsicOp::Dpbusd128 | IntrinsicOp::Dpbusd256 => "vpdpbusd",`) and the
-# mnemonic may carry assembler prefixes (`"{vex} vpdpbusd"`).
 _INNER_OP = re.compile(r"IntrinsicOp::([A-Za-z0-9_]+)")
 _INNER_ARM = re.compile(r"^(?P<pattern>[^\"]*?)=>\s*(?P<body>.*)$")
 
@@ -83,63 +86,71 @@ class TableArm:
     line: int  # 1-based line of the outer pattern's first op
     outer: list[str]
     inner: dict[str, str]
+    wildcard: str | None = None
 
 
-def parse_tables(text: str, path: Path) -> list[TableArm]:
-    lines = text.splitlines()
-    arms: list[TableArm] = []
-    for idx, line in enumerate(lines):
-        if INNER_ANCHOR not in line:
-            continue
-        head = _find_arm_head(lines, idx)
-        if head is None:
-            continue
-        pattern, first_line = _collect_pattern(lines, head)
-        if not pattern:
-            continue
-        inner = _collect_inner(lines, idx)
-        arms.append(TableArm(path=path, line=first_line, outer=pattern, inner=inner))
-    return arms
+def _code_lines(text: str) -> list[str]:
+    """(`text` with comments and string literals blanked, same line count).
+
+    Brace counting must not see the `{`/`}` inside `format!("... {:?}")` or a
+    comment, and pattern matching must not see an op name quoted in prose.
+    """
+    text = re.sub(r"/\*.*?\*/", lambda m: " " * len(m.group(0)), text, flags=re.S)
+    out = []
+    for line in text.splitlines():
+        line = re.sub(r"//.*$", "", line)
+        line = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line)
+        out.append(line)
+    return out
 
 
-# The arm body prologue between the pattern and the inner match is at most a
-# couple of lines (`=> {`, `if let Some(dptr) = ...`); a generous bound keeps
-# the backward scan from wandering into the previous arm.
-_MAX_PROLOGUE = 8
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
 
 
-def _find_arm_head(lines: list[str], anchor: int) -> int | None:
-    """Index of the line that opens the arm enclosing `lines[anchor]`."""
-    for cursor in range(anchor - 1, max(anchor - _MAX_PROLOGUE, 0) - 1, -1):
-        candidate = lines[cursor]
-        match = _PATTERN_LINE.match(candidate)
-        if match and match.group(2):
-            return cursor  # `IntrinsicOp::X => {` opens the body on the same line
-        if _ARM_END.match(candidate):
-            return cursor  # bare `=> {` line
-    return None
+def _arm_head_indices(code: list[str]) -> list[int]:
+    return [
+        index
+        for index, line in enumerate(code)
+        if _PATTERN_HEAD.match(line) or _ARM_END.match(line)
+    ]
+
+
+def _body_end(code: list[str], head: int) -> int:
+    """Last line index of the arm body opened on `head`."""
+    depth = 0
+    for index in range(head, len(code)):
+        depth += code[index].count("{") - code[index].count("}")
+        if depth <= 0 and index > head:
+            return index
+    return len(code) - 1
 
 
 def _collect_pattern(lines: list[str], head: int) -> tuple[list[str], int]:
     """All ops of the pattern ending at `head`, plus its 1-based line number."""
-    match = _PATTERN_LINE.match(lines[head])
-    if not match:
+    names = _INNER_OP.findall(lines[head])
+    if not names:
         return [], 0
-    pattern = [match.group(1)]
+    column = _indent(lines[head])
     cursor = head - 1
     while cursor >= 0:
-        match = _PATTERN_LINE.match(lines[cursor])
-        if not match or match.group(2):
+        line = lines[cursor]
+        if _indent(line) != column or not _PATTERN_ONLY.match(line):
             break
-        pattern.append(match.group(1))
+        names = _INNER_OP.findall(line) + names
         cursor -= 1
-    pattern.reverse()
-    return pattern, cursor + 2  # 1-based line of the pattern's first op
+    return names, cursor + 2  # 1-based line of the pattern's first op
 
 
-def _collect_inner(lines: list[str], anchor: int) -> dict[str, str]:
-    """Map each op named by the inner `match op` to its mnemonic literal."""
+def _collect_inner(lines: list[str], anchor: int) -> tuple[dict[str, str], str | None]:
+    """Map each op named by the inner match to its mnemonic literal.
+
+    A wildcard arm that yields a literal (`_ => "vmovmskpd"`) covers every op
+    the arm pattern admits, so it is reported separately; a wildcard arm that
+    panics (`_ => unreachable!("..")`) covers nothing.
+    """
     inner: dict[str, str] = {}
+    wildcard: str | None = None
     for inner_line in lines[anchor:]:
         stripped = inner_line.strip()
         if stripped == "};":
@@ -147,20 +158,84 @@ def _collect_inner(lines: list[str], anchor: int) -> dict[str, str]:
         arm = _INNER_ARM.match(stripped)
         if not arm:
             continue
-        names = _INNER_OP.findall(arm.group("pattern"))
-        if not names:
-            continue  # wildcard arm (`_ => unreachable!(..)`)
         body = arm.group("body")
-        quote = body.find('"')
+        quote = -1
+        if not body.lstrip().startswith("unreachable!"):
+            quote = body.find('"')
         if quote < 0:
             continue
         end_quote = body.find('"', quote + 1)
         if end_quote < 0:
             continue
         mnemonic = body[quote + 1 : end_quote]
+        names = _INNER_OP.findall(arm.group("pattern"))
+        if not names:
+            wildcard = mnemonic
+            continue
         for name in names:
             inner.setdefault(name, mnemonic)
-    return inner
+    return inner, wildcard
+
+
+_FN_START = re.compile(r"^\s*(?:pub(?:\([a-z]+\))?\s+)?fn\s+[A-Za-z0-9_]+")
+
+
+def _function_spans(code: list[str]) -> list[tuple[int, int]]:
+    """(start, end) line index pairs for every function body."""
+    spans = []
+    for index, line in enumerate(code):
+        if not _FN_START.match(line):
+            continue
+        end = _body_end(code, index)
+        spans.append((index, end))
+    return spans
+
+
+def parse_tables(text: str, path: Path) -> tuple[list[TableArm], int, int]:
+    """Parse every lowering table; also return the number of anchors seen.
+
+    An anchor with no enclosing arm is invisible to this check, so the caller
+    compares the two counts and fails when they disagree.
+    """
+    lines = text.splitlines()
+    code = _code_lines(text)
+    heads = _arm_head_indices(code)
+    spans = [(head, _body_end(code, head)) for head in heads]
+    functions = _function_spans(code)
+    anchors = [i for i, line in enumerate(code) if INNER_ANCHOR in line]
+    arms: list[TableArm] = []
+    in_scope = 0
+    out_of_scope = 0
+    for anchor in anchors:
+        enclosing_fn = next(
+            ((start, end) for start, end in functions if start < anchor < end), None
+        )
+        if enclosing_fn is not None and not any(
+            enclosing_fn[0] < start < enclosing_fn[1] for start, _ in spans
+        ):
+            # A mnemonic table in a helper function: it has no arm pattern to
+            # compare against, so width/dispatch coverage is checked elsewhere.
+            out_of_scope += 1
+            continue
+        in_scope += 1
+        enclosing = [(start, end) for start, end in spans if start < anchor < end]
+        if not enclosing:
+            continue
+        head, _ = max(enclosing, key=lambda span: span[0])
+        pattern, first_line = _collect_pattern(lines, head)
+        if not pattern:
+            continue
+        inner, wildcard = _collect_inner(lines, anchor)
+        arms.append(
+            TableArm(
+                path=path,
+                line=first_line,
+                outer=pattern,
+                inner=inner,
+                wildcard=wildcard,
+            )
+        )
+    return arms, in_scope, out_of_scope
 
 
 def check_arm(arm: TableArm) -> list[str]:
@@ -175,6 +250,8 @@ def check_arm(arm: TableArm) -> list[str]:
             "the op falls through to the catch-all and ICEs at run time"
         )
     for name in sorted(outer - inner):
+        if arm.wildcard is not None:
+            continue  # a literal-yielding wildcard arm covers every remaining op
         problems.append(
             f"{arm.path}:{arm.line}: IntrinsicOp::{name} is matched by the outer "
             "arm pattern but has no mnemonic in the inner match; reaching it "
@@ -186,21 +263,33 @@ def check_arm(arm: TableArm) -> list[str]:
     return problems
 
 
-def run(paths: list[Path]) -> tuple[int, list[str]]:
+def run(paths: list[Path]) -> tuple[int, int, list[str]]:
     findings: list[str] = []
     arms_checked = 0
+    helper_anchors = 0
     for path in paths:
         if not path.exists():
             findings.append(f"{path}: file is missing")
             continue
-        arms = parse_tables(path.read_text(), path)
+        text = path.read_text()
+        arms, anchors, helpers = parse_tables(text, path)
         if not arms:
             findings.append(f"{path}: no lowering tables found (parser out of date?)")
-            return 1, findings
+            return 0, 0, findings
+        # Every inner mnemonic table must be attributed to an arm.  A skipped
+        # anchor is an arm this check does not look at, i.e. silence that reads
+        # as approval, so an unparsed anchor is a failure rather than a skip.
+        if len(arms) != anchors:
+            findings.append(
+                f"{path}: parsed {len(arms)} lowering tables but found {anchors} "
+                f"'{INNER_ANCHOR}' anchors; an arm this check cannot read is an "
+                "arm it cannot defend"
+            )
         for arm in arms:
             arms_checked += 1
             findings.extend(check_arm(arm))
-    return arms_checked, findings
+        helper_anchors += helpers
+    return arms_checked, helper_anchors, findings
 
 
 SELF_TEST_CASES = {
@@ -250,6 +339,23 @@ SELF_TEST_CASES = {
 """,
         1,
     ),
+    # A pattern written on ONE line (`A | B | C => {`) is a table too: the
+    # mnemonics are per-op even though the pattern does not use `|` lines.
+    "single_line_pattern": (
+        """            IntrinsicOp::Pabsb128 | IntrinsicOp::Pabsw128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    let inst = match op {
+                        IntrinsicOp::Pabsb128 => "pabsb",
+                        IntrinsicOp::Pabsw128 => "pabsw",
+                        IntrinsicOp::Pabsd128 => "pabsd",
+                        _ => unreachable!("unexpected abs op: {:?}", op),
+                    };
+                    self.emit_sse_unary_128(dptr, args, inst);
+                }
+            }
+""",
+        1,
+    ),
     # Arms that group two ops onto one mnemonic must still be seen as covered.
     "grouped_ops": (
         """            IntrinsicOp::Dpbusd128
@@ -272,7 +378,7 @@ def self_test() -> int:
     failures = 0
     for name, (snippet, expect_problems) in SELF_TEST_CASES.items():
         path = Path(f"<self-test:{name}>")
-        arms = parse_tables(snippet, path)
+        arms, _anchors, _helpers = parse_tables(snippet, path)
         problems: list[str] = []
         for arm in arms:
             problems.extend(check_arm(arm))
@@ -306,13 +412,16 @@ def main(argv: list[str]) -> int:
 
     root = Path(args.root)
     paths = [root / rel for rel in FILES]
-    arms_checked, findings = run(paths)
+    arms_checked, helper_anchors, findings = run(paths)
     if findings:
         print("intrinsic lowering coverage: FAIL")
         for finding in findings:
             print(f"  {finding}")
         return 1
-    print(f"intrinsic lowering coverage: OK ({arms_checked} table arms consistent)")
+    print(
+        f"intrinsic lowering coverage: OK ({arms_checked} table arms consistent, "
+        f"{helper_anchors} mnemonic table(s) in helper functions out of scope)"
+    )
     return 0
 
 

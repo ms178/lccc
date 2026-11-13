@@ -217,6 +217,11 @@ check map_add8m_128 3 0
 check map_add64m_256 3 0
 # Same shape for the SSE4.1 extrema family (RH-11 second half).
 check map_maxsd32m_128 3 0
+# The asymmetric families' folded-load forms: a fold that swapped the operand
+# slots would cost the same 3 instructions and compute a different function,
+# so the fixture's byte-image check is the half that matters here.
+check map_andnotm_128 3 0
+check map_unpacklom_128 3 0
 
 # Inlined wrappers: a `target(...)`-attributed always-inline callee with two
 # by-value 16/32-byte vector parameters.  The parameter bridge used to cost a
@@ -246,7 +251,7 @@ if [ "$EXPECT_DEFECT" = 1 ]; then
     echo "FAIL: --expect-defect expected an overrun and found none" >&2
     exit 1
 fi
-echo "  ok  every counted shape is register-homed (30 at parity, 3 memory forms, 4 wrappers)"
+echo "  ok  every counted shape is register-homed (30 at parity, 5 memory forms, 4 wrappers)"
 
 # --- 5. counterfactual -----------------------------------------------------
 # `CCC_NO_NATIVE_PACKED_MAP` reverts the routing at the one place that makes

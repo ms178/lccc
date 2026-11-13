@@ -222,6 +222,20 @@ __attribute__((noinline)) __m256i map_add64m_256(const void *p, __m256i b) {
     return _mm256_add_epi64(_mm256_loadu_si256((const __m256i *)p), b);
 }
 
+/* Asymmetric memory forms.  `pandn` negates its FIRST operand and
+   `punpcklbw` interleaves in operand order, so a memory fold that put the
+   loaded vector in the wrong slot would compute a different function at the
+   SAME instruction count -- the one failure mode a budget cannot see.  The
+   budgets below are 3 (folded load, operation, `ret`); the values are what
+   make them meaningful. */
+__attribute__((noinline)) __m128i map_andnotm_128(const void *p, __m128i b) {
+    return _mm_andnot_si128(_mm_loadu_si128((const __m128i *)p), b);
+}
+
+__attribute__((noinline)) __m128i map_unpacklom_128(const void *p, __m128i b) {
+    return _mm_unpacklo_epi8(_mm_loadu_si128((const __m128i *)p), b);
+}
+
 /* ---- inlined wrappers: by-value vector parameters ---------------------- */
 /* Everything SSE4.1 and later in the headers is a `target(...)`-attributed
    always-inline function, so using it means INLINING a callee whose two
@@ -538,6 +552,15 @@ static void check_cmp(const char *what, const unsigned char *got,
                   OP);                                                         \
     } while (0)
 
+/* Memory-operand image form: operand A from the array, operand B by value. */
+#define RUN_IMAGEM128(NAME, FN, OP)                                            \
+    do {                                                                       \
+        __m128i vb, r;                                                         \
+        memcpy(&vb, B128, 16);                                                 \
+        r = FN(A128, vb);                                                      \
+        check_image(NAME, (const unsigned char *)&r, A128, B128, 16, OP);      \
+    } while (0)
+
 #define RUN_MAP256(NAME, FN, OP, BYTES, LANES)                                 \
     do {                                                                       \
         __m256i va, vb, r;                                                     \
@@ -749,6 +772,10 @@ int main(void) {
     RUN_IMAGE128("packs_epi16", map_packs_128, RB_PACKS);
     RUN_IMAGE128("unpacklo_epi8", map_unpacklo_128, RB_UNPACKLO);
     RUN_IMAGE256("andnot_si256", map_andnot_256, RB_ANDNOT);
+    /* Folded-load forms of the two ASYMMETRIC families: the values pin the
+       operand order that the memory fold must preserve. */
+    RUN_IMAGEM128("andnotm_128", map_andnotm_128, RB_ANDNOT);
+    RUN_IMAGEM128("unpacklom_128", map_unpacklom_128, RB_UNPACKLO);
     RUN_IMAGE256("unpacklo_epi8_256", map_unpacklo_256, RB_UNPACKLO);
 
     /* ---- immediate shifts -------------------------------------------- */

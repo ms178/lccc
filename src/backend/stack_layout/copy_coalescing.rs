@@ -2521,14 +2521,12 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // Integer min/max has none of the FP unordered/signed-zero
         // asymmetry — commutative.
         | O::VecMinU8x16
-        | O::VecAndNotI32x4
+        // These three ARE symmetric: `pavgb` rounds up whichever way the
+        // operands are named, `pmulhuw` multiplies two unsigned words, and
+        // `paddsb` saturates a sum.
         | O::VecAvgU8x16
         | O::VecMulHiU16x8
         | O::VecAddSatI8x16
-        | O::VecPacksswbI16x8
-        | O::VecUnpackLoI8x16
-        | O::VecAndNotI32x8
-        | O::VecUnpackLoI8x32
         | O::VecMaxU8x16
         | O::VecMinI8x16
         | O::VecMaxI8x16
@@ -2554,7 +2552,19 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecSubI32x4
         | O::VecSubI16x8
         | O::VecSubSatU16x8
-        | O::VecSubI8x16 => Some(false),
+        | O::VecSubI8x16
+        // The RH-11 byte-lane ops that are NOT symmetric: `pandn` negates
+        // args[0], `packsswb` puts args[0] in the low half of every lane, and
+        // `punpcklbw` interleaves in operand order.  Folding args[0] into the
+        // r/m slot would swap which IR argument lands in VEX.vvvv and compute
+        // a different function at the same instruction count -- the exact
+        // failure the commutativity ratchet exists to prevent.  The fold is
+        // still admitted for the args[1] (src2/r-m) position.
+        | O::VecAndNotI32x4
+        | O::VecPacksswbI16x8
+        | O::VecUnpackLoI8x16
+        | O::VecAndNotI32x8
+        | O::VecUnpackLoI8x32 => Some(false),
         _ => None,
     }
 }
