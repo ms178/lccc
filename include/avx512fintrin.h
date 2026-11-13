@@ -110,23 +110,25 @@ _mm512_setzero_ps(void)
 
 /* === Float Arithmetic === */
 
-static __inline__ __m512 __attribute__((__always_inline__))
-_mm512_add_ps(__m512 __a, __m512 __b)
-{
-    __m512 __r;
-    for (int __i = 0; __i < 16; __i++)
-        __r[__i] = __a[__i] + __b[__i];
-    return __r;
-}
+/* 512-bit float arithmetic is ONE EVEX instruction, not a 16-iteration lane
+ * loop.  The loop was measured at 39 instructions per operation at -O2 (the
+ * vectorizer does not fold a 16-lane float loop into zmm), against one
+ * `vaddps` from the native helper.  A 512-bit value is still memory-resident
+ * in this backend (see docs/PERFORMANCE-BACKLOG.md), so the helper also pays a
+ * spill/reload; that is a separate, documented backend limitation. */
+void *__lccc_simd512_ps_vaddps512(long, __m512, __m512);
+void *__lccc_simd512_ps_vsubps512(long, __m512, __m512);
+void *__lccc_simd512_ps_vmulps512(long, __m512, __m512);
 
-static __inline__ __m512 __attribute__((__always_inline__))
-_mm512_mul_ps(__m512 __a, __m512 __b)
-{
-    __m512 __r;
-    for (int __i = 0; __i < 16; __i++)
-        __r[__i] = __a[__i] * __b[__i];
-    return __r;
-}
+#define _mm512_add_ps(__a, __b) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vaddps512(0, __a, __b))
+
+#define _mm512_sub_ps(__a, __b) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vsubps512(0, __a, __b))
+
+#define _mm512_mul_ps(__a, __b) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vmulps512(0, __a, __b))
+
 
 /* AVX-512F FMA3 helpers are single-rounding operations regardless of
  * -ffp-contract. Route through the native EVEX helper rather than a C lane

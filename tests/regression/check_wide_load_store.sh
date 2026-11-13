@@ -110,8 +110,14 @@ for fn in u_ps u_pd a_ps a_pd; do
         bad "512 $fn emits $got 'vmovdqu64' (want at least 2: load and store)"
     fi
 done
+for mnemonic in vaddps vsubps vmulps; do
+    got=$(count_in "$ASM512" arith "$mnemonic")
+    if [ "$got" -ne 1 ]; then
+        bad "512 arith emits $got '$mnemonic' (want 1)"
+    fi
+done
 if [ "$level_fail" -eq 0 ]; then
-    echo "  ok  -O2: 512-bit loads/stores are single moves"
+    echo "  ok  -O2: 512-bit loads/stores and float arithmetic are single instructions"
 fi
 
 # ── Execution: byte parity with the reference compiler ─────────────────────

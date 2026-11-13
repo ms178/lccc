@@ -95,6 +95,29 @@ static __attribute__((noinline)) void a_ps(void)
     printf("\n");
 }
 
+/* 512-bit float arithmetic was a 16-iteration lane loop; these three cover the
+ * spellings converted to native helpers. */
+static __attribute__((noinline)) void arith(void)
+{
+    /* 32 elements: `b` loads `in + 16`, and a 16-element array would read past
+     * its end (that made the first draft of this fixture disagree between
+     * compilers for a reason that had nothing to do with the intrinsic). */
+    float in[32] __attribute__((aligned(64)));
+    float o1[16] __attribute__((aligned(64)));
+    for (int i = 0; i < 32; i++)
+        in[i] = (float)i * 0.5f - 1.0f;
+    __m512 a = _mm512_loadu_ps(in);
+    __m512 b = _mm512_loadu_ps(in + 16);
+    __m512 r = _mm512_add_ps(a, b);
+    r = _mm512_sub_ps(r, a);
+    r = _mm512_mul_ps(r, b);
+    _mm512_storeu_ps(o1, r);
+    printf("512 arith");
+    for (int i = 0; i < 16; i++)
+        printf(" %08x", fbits(o1[i]));
+    printf("\n");
+}
+
 static __attribute__((noinline)) void a_pd(void)
 {
     for (int i = 0; i < 8; i++)
@@ -117,5 +140,6 @@ int main(void)
     u_pd();
     a_ps();
     a_pd();
+    arith();
     return 0;
 }
