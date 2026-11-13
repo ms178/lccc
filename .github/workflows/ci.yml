@@ -1691,6 +1691,8 @@ jobs:
       run: bash tests/regression/check_fma_digit_permutation.sh --lccc tests/regression/fma_prefix_standin.sh --expect-defect
     - name: 256-bit FMA and direct-load homes must stay in registers (RH-01/RH-02)
       run: bash tests/regression/check_vector_fma_homing.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: Whole-vector temporary stores are forwarded into the destination store
+      run: bash tests/regression/check_vector_store_forward.sh --lccc target/fastbuild/lccc --reference gcc-16
     needs:
     - build
   codegen-b:

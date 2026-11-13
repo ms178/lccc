@@ -2012,6 +2012,16 @@ gate "vector-fma-homing-nonvacuity" fast \
 gate "x86-int-map-registers" fast \
     bash tests/regression/check_x86_int_map_registers.sh --lccc target/fastbuild/lccc \
     --reference "${GCC:-gcc-16}"
+# The pointer-form store builtins take their SOURCE as an address, so a
+# computed vector source went round the frame: `_mm256_storeu_si256(q+i,
+# _mm256_add_epi64(...))` emitted `vmovdqu %ymm, slot` then `vmovdqu slot,
+# %ymm0` then the store (8 instructions where GCC needs 3, 16 vs 11 in a loop).
+# `vector_store_forward` deletes both accesses when the temporary has exactly
+# one reader; this gate executes every shape, budgets the counts, and proves
+# itself non-vacuous against the pre-fix IR via `CCC_DISABLE_PASSES=vecstorefwd`.
+gate "vector-store-forward" fast \
+    bash tests/regression/check_vector_store_forward.sh --lccc target/fastbuild/lccc \
+    --reference "${GCC:-gcc-16}"
 
 # `-mf16c` must change the ENCODING and nothing else.  On i686 it once changed
 # neither: __F16C__ was announced while the effective feature set had no F16c

@@ -110,6 +110,7 @@ mod vec_relations;
 pub(crate) mod vec_ssa;
 pub(crate) mod vector_copy_chain;
 pub(crate) mod vector_fill;
+pub(crate) mod vector_store_forward;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
@@ -4600,6 +4601,18 @@ pub(crate) fn run_passes(
     if !pass_disabled(&disabled, "vechomefwd") {
         vector_temp_promotion::forward_vector_homes(module);
         verify::verify_after_pass(module, "vechomefwd");
+    }
+
+    // Phase 11b'': a whole-vector temporary written by a `VecStore*` and read
+    // straight back by the pointer-form store that follows it is pure frame
+    // traffic: the producer's value goes to the final destination instead.
+    // Runs after the home forwarders so it sees the shortened chains, and
+    // before the load forwarder so the temporary is already gone when that
+    // pass looks at the remaining loads.
+    if !pass_disabled(&disabled, "vecstorefwd") {
+        vector_store_forward::forward_vector_temp_stores(module);
+        module.for_each_function(dce::eliminate_dead_code);
+        verify::verify_after_pass(module, "vecstorefwd");
     }
 
     // Phase 11b': Collapse the 16/32-byte aggregate-load -> VecLoad ->

@@ -1109,7 +1109,7 @@ fn hoist_block_allocas(block: &mut BasicBlock) {
 /// Remove instruction indices while maintaining BasicBlock's parallel source
 /// span table.  The input is normalized here so callers can cheaply append
 /// removals from independent rewrites.
-fn remove_instructions(block: &mut BasicBlock, removed: &mut Vec<usize>) {
+pub(crate) fn remove_instructions(block: &mut BasicBlock, removed: &mut Vec<usize>) {
     if removed.is_empty() {
         return;
     }
