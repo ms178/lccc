@@ -2520,6 +2520,27 @@ impl IntrinsicOp {
             // input dependence. Classifying it pure lets IR DCE remove a
             // dead all-off masked-load replacement instead of rooting it.
             IntrinsicOp::Setzero512 |
+            // The whole constant-materialisation family: a splat or a zero is
+            // a function of its operands alone, with no memory operand and no
+            // side effect.  Their absence from this predicate rooted every
+            // one of them in IR DCE, so a splat whose home round-trip had been
+            // forwarded away survived as a dead instruction -- and a dead
+            // register-class vector result has no home to materialise, which
+            // is a codegen ICE rather than an optimisation (measured on
+            // `simd_mask_facts_runtime_identities` and its two siblings).
+            IntrinsicOp::SetEpi8
+            | IntrinsicOp::SetEpi32
+            | IntrinsicOp::SetEpi8_256
+            | IntrinsicOp::SetEpi16_256
+            | IntrinsicOp::SetEpi32_256
+            | IntrinsicOp::SetEpi64x256
+            | IntrinsicOp::SetEpi8_512
+            | IntrinsicOp::SetEpi16_512
+            | IntrinsicOp::SetEpi32_512
+            | IntrinsicOp::SetEpi64x512
+            | IntrinsicOp::Setzero128
+            | IntrinsicOp::Setzero256
+            | IntrinsicOp::SetzeroPs128 |
             IntrinsicOp::Pdep32 | IntrinsicOp::Pdep64 |
             IntrinsicOp::Pext32 | IntrinsicOp::Pext64 |
             IntrinsicOp::VecWidenAddI32x4ToI64x4

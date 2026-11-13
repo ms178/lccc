@@ -164,32 +164,19 @@ check() {
 #   int_128     one 128-bit integer store                 3 /  4 (3)
 #   ps_256      single-shot 256-bit float store           4 /  8 (3, GCC
 #                                                        omits vzeroupper)
-#   chain_256   dependent stores, final one forwarded    23 / 25 (17)
+#   chain_256   loop-invariant splats + forwarded store 22 / 24 (17)
+#   two_stores  one value read by two whole-vector stores 4 /  9 (4)
 check float_256 14
 check int_128 3
 check ps_256 4
-check chain_256 23
+check chain_256 22
 
-# The control: this value is read by TWO stores, so its temporary is not
-# single-reader and the rewrite must leave it exactly as it was.  A count
-# difference here means the pass is not proving its premises.
-control() {
-    local name=$1 on off
-    on=$(body "$WORK/on.s" "$name")
-    off=$(body "$WORK/off.s" "$name")
-    if [ "$on" -eq 0 ] || [ "$off" -eq 0 ]; then
-        echo "FAIL: no emitted body for '$name'" >&2
-        fail=1; return
-    fi
-    if [ "$on" -ne "$off" ]; then
-        echo "FAIL: $name changed ($on with the pass, $off without) although its" >&2
-        echo "      temporary has two readers; the rewrite must refuse it" >&2
-        fail=1
-        return
-    fi
-    echo "  ok  $name is untouched (two readers of the temporary)"
-}
-control two_stores
+# A value read by TWO stores is the multi-reader case: every reader is an
+# address-form store of the same width, so the pass forwards the register
+# value to both and deletes the staging store and its frame slot.  Before the
+# generalized proof this shape kept a full stack round trip (9 instructions
+# with the pass, 9 without); it is 4 now, which is GCC's count exactly.
+check two_stores 4
 
 if [ "$fail" != 0 ]; then
     echo "FAIL: whole-vector temporary stores are not forwarded" >&2

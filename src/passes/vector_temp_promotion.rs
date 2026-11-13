@@ -768,6 +768,47 @@ fn intrinsic_dest_required_alignment(
 /// write-only full result.  These intrinsics read the old destination (or do
 /// not materialize the advertised result there), so redirecting them to the
 /// memcpy destination changes the value being computed.
+/// Ops whose x86 register-result form is SELF-CONTAINED: the emitter writes
+/// the result into `dest`'s register when `dest_ptr` is absent.
+///
+/// This is a positive allowlist, and it has to be.  The 256-bit FP family
+/// (`MinPs256`, `MaxPs256`, the FMA spellings, ...) is emitted through
+/// `emit_avx_fp_256_op`, which takes the destination POINTER by reference and
+/// has no register-destination path at all; an IR where such an op carries a
+/// `dest` but no `dest_ptr` reaches the backend's fail-closed "unhandled
+/// intrinsic op" panic.  `avx_fp_private` tripped exactly that during
+/// development of this pass, which is why removing a home write is gated on
+/// proof that the register form exists rather than on the mere presence of a
+/// `dest` field.  An op not named here keeps its home: fail closed.
+fn register_result_form_is_self_contained(op: IntrinsicOp) -> bool {
+    use IntrinsicOp::*;
+    matches!(
+        op,
+        // Constant splats (1-bit through 64-bit lanes, 128/256/512-bit).
+        SetEpi8
+            | SetEpi16
+            | SetEpi32
+            | SetEpi8_256
+            | SetEpi16_256
+            | SetEpi32_256
+            | SetEpi64x256
+            | SetEpi64x512
+            // Structural zeros.
+            | Setzero128
+            | Setzero256
+            | Setzero512
+            | SetzeroPs128
+            | VecZeroF32x4
+            | VecZeroF32x8
+            | VecZeroF64x2
+            | VecZeroF64x4
+            | VecZeroI32x4
+            | VecZeroI32x8
+            | VecZeroI64x2
+            | VecZeroI64x4
+    )
+}
+
 fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
     !matches!(
         op,
@@ -1323,6 +1364,17 @@ enum HomeBypass {
     /// reader is a full-width vector read. Hand the stored register to the
     /// readers and delete the store.
     Spill,
+    /// The home is the memory image of the producing intrinsic's OWN register
+    /// result (`dest_ptr` names the home, `dest` names the register), and
+    /// every reader is a whole-vector load of that home. Substitute the
+    /// register for each load's result and retire the memory write.
+    ///
+    /// This is the width-independent sibling of `Relay`: `Relay` requires the
+    /// read to be stored straight back (a contiguous producer/load/store
+    /// triple), while this shape consumes the value in arithmetic. It is what
+    /// `const __m256i k = _mm256_set1_epi64x(3);` inside a loop lowers to --
+    /// one `vpbroadcastq`, a spill of it to the home, and a reload per use.
+    Result,
 }
 
 /// One planned home bypass.
@@ -1337,6 +1389,10 @@ struct HomeForward {
     value: Option<u32>,
     /// `(instruction, argument index)` reads rewritten in place.
     arg_rewrites: Vec<(usize, usize)>,
+    /// Load results replaced by `value` (the `Result` shape): `(block,
+    /// instruction)` pairs whose results are substituted everywhere, and
+    /// which are then deleted.
+    load_rewrites: Vec<(usize, usize)>,
     /// Instructions removed outright: the retired producer (`Spill`) and the
     /// relay's `VecStore` (`Relay`).
     dead: Vec<usize>,
@@ -1678,6 +1734,9 @@ fn plan_home_forwards(
     roots: &FxHashMap<u32, PointerRoot>,
 ) -> Vec<HomeForward> {
     let use_index = UseIndex::build(func);
+    // Built on first use: most functions have no register-result home at all,
+    // and a per-function dominator tree is not free.
+    let mut cfg: Option<crate::ir::analysis::CfgAnalysis> = None;
     let mut plans = Vec::new();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (producer, inst) in block.instructions.iter().enumerate() {
@@ -1719,6 +1778,31 @@ fn plan_home_forwards(
             let mut forwarded: FxHashMap<(usize, usize), usize> = FxHashMap::default();
             let mut arg_rewrites = Vec::new();
             let mut dead = Vec::new();
+            // Register-result shape: the home is the memory image of this
+            // instruction's own `dest`, and every reader is a whole-vector
+            // load.  Tried first because it proves its own complete use
+            // accounting and needs no adjacency; the relay below then only has
+            // to handle the read-modify-store triple this shape rejects.
+            if let Some(register) = dest {
+                // A producer that is itself a direct full-width load has a
+                // canonical MEMORY form (`VecLoad*`), and the load
+                // canonicalizer downstream turns the home round-trip into it;
+                // a memory operand folds into the consumer, a register value
+                // does not.  Leave those to that pass -- forwarding the
+                // register here would replace a foldable load with a separate
+                // one (measured: `_mm256_storeu_ps(q, a+b)` went 4 -> 8).
+                if direct_vector_load_width(*op).is_none()
+                    && register_result_form_is_self_contained(*op)
+                {
+                    if let Some(plan) = plan_result_forward(
+                        block_idx, producer, home, width, register.0, home_uses, &use_index,
+                        &mut cfg, func,
+                    ) {
+                        plans.push(plan);
+                        continue;
+                    }
+                }
+            }
             let plan = match dest {
                 // Prove the CONTIGUOUS triple producer -> home;
                 // ld = VecLoad(home, 0); VecStore(dst) <- ld. Moving a write
@@ -1803,6 +1887,7 @@ fn plan_home_forwards(
                         kind: HomeBypass::Relay { destination },
                         value: None,
                         arg_rewrites: Vec::new(),
+                        load_rewrites: Vec::new(),
                         dead,
                     }
                 }
@@ -1910,6 +1995,7 @@ fn plan_home_forwards(
                         kind: HomeBypass::Spill,
                         value: Some(stored),
                         arg_rewrites,
+                        load_rewrites: Vec::new(),
                         dead,
                     }
                 }
@@ -1921,6 +2007,123 @@ fn plan_home_forwards(
         }
     }
     plans
+}
+
+/// Plan the register-result shape for one home.
+///
+/// Preconditions, each a correctness condition:
+///
+/// * the producing intrinsic both writes the home (`dest_ptr`) and produces a
+///   register result (`dest`), and the write covers the whole object with a
+///   non-accumulating op (checked by the caller: `width == home size`,
+///   `intrinsic_overwrites_full_result`);
+/// * the producer's single mention of the home is its `dest_ptr`, and the sole
+///   mention at the producer site is that one — a producer that also reads the
+///   home as an address operand is a read-modify-write and is refused;
+/// * every other mention of the home in the FUNCTION is a whole-vector load of
+///   the home's base at offset zero, of exactly the home's width, with no
+///   destination pointer of its own.  Any other use (an escaping pointer, a
+///   `Memcpy`, a scalar load, a store, a call argument) makes the bytes
+///   observable somewhere the substitution cannot follow, so it is refused;
+/// * the producer dominates every load, and in the producing block it precedes
+///   it.  A load before its definition would be uninitialized memory, and
+///   rewriting it to a value that does not dominate its uses would produce
+///   invalid SSA.
+///
+/// The `device` of the rewrite is the load's *result*: replacing the loads and
+/// retiring the `dest_ptr` write leaves the intrinsic as the plain register
+/// computation it already was, so no new register pressure is introduced and
+/// the value the loads read is bit-identical by construction.
+fn plan_result_forward(
+    block_idx: usize,
+    producer: usize,
+    home: u32,
+    width: usize,
+    register: u32,
+    home_uses: &FxHashMap<(usize, usize), usize>,
+    use_index: &UseIndex,
+    cfg: &mut Option<crate::ir::analysis::CfgAnalysis>,
+    func: &IrFunction,
+) -> Option<HomeForward> {
+    let builder = cfg.get_or_insert_with(|| crate::ir::analysis::CfgAnalysis::build(func));
+    let dominators = crate::ir::analysis::DominanceChecker::new(builder.num_blocks, &builder.idom);
+    let mut load_rewrites: Vec<(usize, usize)> = Vec::new();
+    for (&(bi, ii), &mentions) in home_uses {
+        if bi == block_idx && ii == producer {
+            // Exactly the `dest_ptr` write; the address operands of a
+            // read-modify-write producer would show up as extra mentions.
+            if mentions != 1 {
+                return None;
+            }
+            continue;
+        }
+        if ii == TERMINATOR || mentions != 1 {
+            return None;
+        }
+        let r_inst = func.blocks.get(bi)?.instructions.get(ii)?;
+        let Instruction::Intrinsic {
+            dest: Some(ld),
+            op: r_op,
+            dest_ptr: None,
+            args: r_args,
+        } = r_inst
+        else {
+            return None;
+        };
+        if !whole_vector_load(*r_op)
+            || temp_result_width(*r_op) != Some(width)
+            || r_args.len() != 2
+            || !matches!(&r_args[0], Operand::Value(v) if v.0 == home)
+            || !operand_is_const_zero(&r_args[1])
+        {
+            return None;
+        }
+        // A load whose single reader is a store-like intrinsic (one with a
+        // `dest_ptr`, whatever its operand spelling) is the RELAY's shape:
+        // re-pointing the producer at that destination removes both the load
+        // and the store, which is strictly less work than a register
+        // substitution plus `vector_store_forward`.  Defer to the relay so the
+        // two rewrites never fight over one home; when the relay's own
+        // preconditions fail, nothing is rewritten (fail closed) -- a
+        // malformed store must not become legal merely because a second,
+        // broader rewrite exists.
+        // A load nobody reads is dead code, not a forwarding opportunity:
+        // retiring it here would also have to argue about the home write, and
+        // DCE already owns that decision.
+        if use_index.uses(ld.0).is_none() {
+            return None;
+        }
+        if let Some(((sbi, sii), 1)) = use_index.single_use_site(ld.0) {
+            if let Some(Instruction::Intrinsic {
+                dest_ptr: Some(_), ..
+            }) = func.blocks.get(sbi).and_then(|b| b.instructions.get(sii))
+            {
+                return None;
+            }
+        }
+        // The register result must be available where the load's value is
+        // used: the producer has to dominate the load, and precede it inside
+        // one block.  Dominance then covers every transitive use, because the
+        // rest of the function already satisfies SSA dominance for `ld`.
+        if !dominators.dominates(block_idx, bi) || (bi == block_idx && ii <= producer) {
+            return None;
+        }
+        load_rewrites.push((bi, ii));
+    }
+    if load_rewrites.is_empty() {
+        return None;
+    }
+    load_rewrites.sort_unstable();
+    Some(HomeForward {
+        block: block_idx,
+        producer,
+        home,
+        kind: HomeBypass::Result,
+        value: Some(register),
+        arg_rewrites: Vec::new(),
+        load_rewrites,
+        dead: Vec::new(),
+    })
 }
 
 /// Drop plans that would depend on an instruction another plan deletes.
@@ -2037,13 +2240,48 @@ fn forward_vector_home_results(func: &mut IrFunction) -> usize {
                 }
             }
         }
-        // 2. Retire the producer's home write.
+        // 2. Substitute the register result for every load of the home, then
+        //    retire the load.  The map is built once per plan so each block is
+        //    rewritten in a single pass rather than once per load.
+        if !plan.load_rewrites.is_empty() {
+            let Some(register) = plan.value else {
+                debug_assert!(false, "result-forwarding plan without a value");
+                continue;
+            };
+            let mut map: FxHashMap<u32, u32> = FxHashMap::default();
+            for &(bi, ii) in &plan.load_rewrites {
+                if let Some(Instruction::Intrinsic { dest: Some(ld), .. }) =
+                    func.blocks[bi].instructions.get(ii)
+                {
+                    map.insert(ld.0, register);
+                }
+            }
+            for block in func.blocks.iter_mut() {
+                for inst in block.instructions.iter_mut() {
+                    replace_values_in_inst_map(inst, &map);
+                }
+                replace_values_in_terminator_map(&mut block.terminator, &map);
+            }
+            for &(bi, ii) in &plan.load_rewrites {
+                dead.push((bi, ii));
+            }
+        }
+        // 3. Retire the producer's home write.
         match plan.kind {
             HomeBypass::Relay { destination } => {
                 if let Instruction::Intrinsic { dest_ptr, .. } =
                     &mut func.blocks[plan.block].instructions[plan.producer]
                 {
                     *dest_ptr = Some(Value(destination));
+                }
+            }
+            HomeBypass::Result => {
+                // The register result already carries the bytes; the write to
+                // the (now dead) home is what kept the value in memory.
+                if let Instruction::Intrinsic { dest_ptr, .. } =
+                    &mut func.blocks[plan.block].instructions[plan.producer]
+                {
+                    *dest_ptr = None;
                 }
             }
             HomeBypass::Spill => {}
@@ -2054,7 +2292,7 @@ fn forward_vector_home_results(func: &mut IrFunction) -> usize {
         applied += 1;
     }
 
-    // 3. Drop retired instructions, then any alloca left with no remaining
+    // 4. Drop retired instructions, then any alloca left with no remaining
     //    use. `remove_instructions` sorts and de-duplicates per block.
     let mut per_block: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for (block, instr) in &dead {
@@ -6371,6 +6609,211 @@ mod tests {
         }
     }
 
+    /// The register-result shape: an intrinsic that both writes a home and
+    /// produces a register value, read back by a whole-vector load that feeds
+    /// arithmetic.  The load's result is replaced by the register and the home
+    /// write is retired, so the loop-invariant constant stops round-tripping
+    /// through the frame (measured on `_mm256_set1_epi64x` in a loop:
+    /// 23 -> 22 instructions for the whole function, with the 2 reloads gone).
+    #[test]
+    fn register_result_home_is_forwarded() {
+        let mut func = single_block(
+            "result_forward",
+            vec![
+                alloca(1, 32, 32),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::SetEpi64x256,
+                    Some(1),
+                    vec![Operand::Const(IrConst::I64(3))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadI64x4,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+                intrinsic(
+                    Some(5),
+                    IntrinsicOp::VecAddI64x4,
+                    None,
+                    vec![Operand::Value(Value(4)), Operand::Value(Value(9))],
+                ),
+            ],
+        );
+        assert_eq!(forward_vector_home_results(&mut func), 1);
+        let ops: Vec<_> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Intrinsic {
+                    dest,
+                    op,
+                    dest_ptr,
+                    args,
+                } => Some((
+                    dest.map(|d| d.0),
+                    *op,
+                    dest_ptr.map(|d| d.0),
+                    format!("{args:?}"),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert_eq!(ops[0].0, Some(3));
+        assert_eq!(ops[0].2, None, "the home write must be retired");
+        assert_eq!(ops[1].1, IntrinsicOp::VecAddI64x4);
+        assert!(
+            ops[1].3.contains("Value(3)"),
+            "the add must read the register result: {ops:?}"
+        );
+    }
+
+    /// A reader whose single consumer is store-like (it has a `dest_ptr`) is
+    /// the relay's business, and a malformed one must not become legal just
+    /// because this pass could also rewrite it.
+    #[test]
+    fn register_result_defers_store_readers_to_the_relay() {
+        let mut func = home_relay_fixture(2);
+        // Break the relay's contract: the store grows a register result.
+        if let Instruction::Intrinsic { dest, .. } = &mut func.blocks[0].instructions[4] {
+            *dest = Some(Value(8));
+        }
+        let before = func.blocks[0].instructions.clone();
+        assert_eq!(forward_vector_home_results(&mut func), 0);
+        assert_eq!(
+            format!("{:?}", func.blocks[0].instructions),
+            format!("{before:?}")
+        );
+    }
+
+    /// The producer must cover the whole object: a narrower write leaves part
+    /// of the home defined by something else, so the register cannot stand in
+    /// for the load.
+    #[test]
+    fn register_result_requires_a_full_width_producer() {
+        let mut func = single_block(
+            "result_narrow",
+            vec![
+                alloca(1, 32, 32),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::VecZeroI64x2,
+                    Some(1),
+                    vec![Operand::Const(IrConst::I64(3))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadI64x4,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+                intrinsic(
+                    Some(5),
+                    IntrinsicOp::VecAddI64x4,
+                    None,
+                    vec![Operand::Value(Value(4)), Operand::Value(Value(9))],
+                ),
+            ],
+        );
+        assert_eq!(forward_vector_home_results(&mut func), 0);
+    }
+
+    /// Any use of the home that is not a whole-vector load makes the bytes
+    /// observable elsewhere; the whole plan is refused.
+    #[test]
+    fn register_result_refuses_an_escaping_use() {
+        let mut func = single_block(
+            "result_escape",
+            vec![
+                alloca(1, 16, 16),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::VecZeroI64x2,
+                    Some(1),
+                    vec![Operand::Const(IrConst::I64(3))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadI64x2,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+                intrinsic(
+                    Some(5),
+                    IntrinsicOp::VecAddI64x2,
+                    None,
+                    vec![Operand::Value(Value(4)), Operand::Value(Value(9))],
+                ),
+                Instruction::Load {
+                    dest: Value(6),
+                    ty: IrType::Ptr,
+                    ptr: Value(1),
+                    volatile: false,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+        );
+        assert_eq!(forward_vector_home_results(&mut func), 0);
+    }
+
+    /// A producer that is itself a direct full-width load has a foldable
+    /// memory form; forwarding its register would replace a memory operand
+    /// with a separate load (measured as a 4 -> 8 instruction regression).
+    #[test]
+    fn register_result_leaves_direct_loads_to_the_load_canonicalizer() {
+        let mut func = single_block(
+            "result_load",
+            vec![
+                alloca(1, 32, 32),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::LoaduPs256,
+                    Some(1),
+                    vec![Operand::Value(Value(0))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadF32x8,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+                intrinsic(
+                    Some(5),
+                    IntrinsicOp::VecAddF32x8,
+                    None,
+                    vec![Operand::Value(Value(4)), Operand::Value(Value(9))],
+                ),
+            ],
+        );
+        assert_eq!(forward_vector_home_results(&mut func), 0);
+    }
+
+    /// A load with no readers is dead code, not a forwarding opportunity.
+    #[test]
+    fn register_result_refuses_a_dead_load() {
+        let mut func = single_block(
+            "result_dead",
+            vec![
+                alloca(1, 16, 16),
+                intrinsic(
+                    Some(3),
+                    IntrinsicOp::VecZeroI64x2,
+                    Some(1),
+                    vec![Operand::Const(IrConst::I64(3))],
+                ),
+                intrinsic(
+                    Some(4),
+                    IntrinsicOp::VecLoadI64x2,
+                    None,
+                    vec![Operand::Value(Value(1)), Operand::Const(IrConst::I64(0))],
+                ),
+            ],
+        );
+        assert_eq!(forward_vector_home_results(&mut func), 0);
+    }
+
     #[test]
     fn relay_refuses_malformed_reader_and_store_shapes() {
         // Each mutation changes exactly one part of the load/store contract.
@@ -6634,6 +7077,7 @@ mod tests {
             kind: HomeBypass::Spill,
             value: Some(3),
             arg_rewrites: vec![(4, 0)],
+            load_rewrites: Vec::new(),
             dead: vec![3],
         };
         let relay = HomeForward {
@@ -6643,6 +7087,7 @@ mod tests {
             kind: HomeBypass::Relay { destination: 2 },
             value: None,
             arg_rewrites: Vec::new(),
+            load_rewrites: Vec::new(),
             dead: vec![6, 7],
         };
         let mut defs = FxHashMap::default();
