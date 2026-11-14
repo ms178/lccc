@@ -1586,6 +1586,67 @@ impl X86Codegen {
             self.sse_store_dest(dest_ptr, "xmm0");
             return;
         }
+
+        // ── Legacy direct-to-home form ─────────────────────────────────
+        // Without VEX the encoding is destructive, so the fallback below
+        // stages args[0] through %xmm0, computes there, and then copies
+        // the result to the destination's home (`movdqa %xmm0, %xmmN`):
+        // two register moves per lane op, and one shared %xmm0
+        // accumulator that serialises every vector op in the block.
+        //
+        // Intel eliminates XMM register moves at rename, so that staging
+        // is nearly free there and the pattern survived.  AMD Zen does
+        // NOT eliminate vector-register moves: each copy is a real uop
+        // with 1-cycle latency, and on a loop-carried recurrence (an ARX
+        // cipher round, an accumulator chain) it lands on the critical
+        // path.  Measured consequence: the 4-lane ChaCha20 core is
+        // 2.26x GCC's scalar loop on EPYC 9V45 while the very same
+        // binary is at parity with GCC on Xeon.
+        //
+        // The fix is not to pick a different algorithm per vendor but to
+        // stop emitting the staging: load the first operand straight
+        // into the destination's home and destroy it there.  One
+        // instruction per lane op, no %xmm0 round trip, and the result
+        // is born in the register the rest of the block already reads —
+        // which is the same shape the VEX.128 path above produces, so
+        // both ISAs now get one non-destructive op with no copies.
+        //
+        // Declines (falling through to the staging path) when:
+        //   * the destination has no XMM home (it lives in a slot);
+        //   * either source already occupies the home register — the
+        //     in-place/coalesced paths own the `dest == src1` shape, and
+        //     `dest == src2` would clobber a live source;
+        //   * a source is a pending memfold (it has no materialised
+        //     register contents yet) or a source register was never
+        //     claimed for a 128-bit width.
+        if let (Operand::Value(a0), Operand::Value(a1)) = (&args[0], &args[1]) {
+            if a0.0 != a1.0 {
+                let memfold_blocks = self
+                    .state
+                    .pending_vec_memfold
+                    .as_ref()
+                    .is_some_and(|pf| pf.val == a0.0 || pf.val == a1.0);
+                if !memfold_blocks {
+                    if let Some(home) = self.dest_xmm_home_name(dest_ptr) {
+                        let a0_home = self.vec_operand_reg(a0) == Some(home);
+                        let a1_home = self.vec_operand_reg(a1) == Some(home);
+                        if !a0_home && !a1_home {
+                            // args[0] into the home, then args[1] into the
+                            // scratch slot the destructive form consumes.
+                            self.sse_load_arg(&args[0], home);
+                            self.sse_load_arg(&args[1], "xmm0");
+                            self.state
+                                .emit_fmt(format_args!("    {} %xmm0, %{}", sse_inst, home));
+                            if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(a1.0) {
+                                self.state.pending_vec_store = None;
+                            }
+                            self.sse_commit_dest_direct(dest_ptr, home);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         let a1_last = matches!(&args[1], Operand::Value(v)
             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
         if a1_last {
