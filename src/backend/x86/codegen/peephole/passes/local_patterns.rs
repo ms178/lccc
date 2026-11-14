@@ -478,6 +478,282 @@ pub(super) fn forward_adjacent_gp_stack_loads(
     changed
 }
 
+/// A full-width 256-bit vector move mnemonic. All eight spellings move the
+/// same 32 bytes bit-exactly; the int/float domain distinction is a bypass
+/// hint, not a semantic one.
+fn is_ymm_full_move(mn: &str) -> bool {
+    matches!(
+        mn,
+        "vmovdqu" | "vmovdqa" | "vmovups" | "vmovaps" | "vmovupd" | "vmovapd"
+    )
+}
+
+/// Split `"<mn> <a>, <b>"` into `(mn, a, b)` for a two-operand line.
+fn split_mn_two_ops(trimmed: &str) -> Option<(&str, &str, &str)> {
+    let (mn, rest) = trimmed.split_once(char::is_whitespace)?;
+    let (a, b) = rest.split_once(',')?;
+    Some((mn, a.trim(), b.trim()))
+}
+
+/// Delete the reload of a `vmovdqu %ymmN, OFF(%rsp|%rbp)` /
+/// `vmov* OFF(...), %ymmN` ADJACENT pair: between two adjacent lines
+/// neither the slot nor the register can change, and a full-width 256-bit
+/// reload of the register just stored is the identity.
+///
+/// This is the YMM tier `store_forwarding` does not model (its slot
+/// mappings stop at `MoveSize::DQ`); the shape is the call boundary of a
+/// `%ymm`-marshalled vector — the capture store of an incoming `%ymm0`
+/// argument followed by the argument load of a forwarding call, and the
+/// hidden `%ymm0` return-buffer store followed by the `Return` reload
+/// (`v8 f(v8 a){ return ext8(a); }` pays both pairs).
+///
+/// Refusals, all fail-closed:
+/// * either line pinned, or the reload marked as a volatile access;
+/// * operands not the exact same `OFF(%rsp)`/`OFF(%rbp)` text (no index,
+///   no RIP, no symbol — textual equality of a pure frame slot);
+/// * different `%ymm` registers (a cross-register pair is forwarding, not
+///   identity; left to a stronger pass);
+/// * any `%zmm` text in the ENCLOSING FUNCTION (scoped by
+///   `.cfi_startproc`/`.cfi_endproc`, translation-unit fallback without
+///   CFI): `vmov* mem, %ymmN` zeroes bits 256..511 of the bank, so with
+///   AVX-512 state live the reload has an architectural effect beyond
+///   the 32 bytes (exactly the upper-zeroing hazard `store_forwarding`
+///   documents one tier down).  Across function boundaries the uppers
+///   are dead ABI state, so a `%zmm` neighbour does not veto the fold;
+/// * any `xsave` family instruction (inline asm) in the same scope:
+///   XSAVE serialises zmm bits 256..511 to memory WITHOUT naming
+///   `%zmm`, so the saved image would observe the un-zeroed uppers.
+///   `xrstor` only writes registers and needs no screen, but the one
+///   substring covers the whole family and this shape never appears in
+///   compiled code.
+pub(super) fn forward_adjacent_ymm_self_reloads(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    // Per-FUNCTION AVX-512 screen.  The LineStore carries the whole
+    // translation unit, and zmm upper state is dead across function
+    // boundaries (caller-saved; a callee reading it unwritten is reading
+    // ABI garbage), so one `%zmm` function must not veto folds in its
+    // `%ymm`-only neighbours.  Functions are delimited by
+    // `.cfi_startproc`/`.cfi_endproc` exactly as
+    // `pin_address_taken_stack_slots` scopes its taken-slot sets; with no
+    // CFI boundaries at all (unit-test snippets, unwind info disabled)
+    // the screen falls back to one translation-unit-wide region, and any
+    // instruction in a gap BETWEEN functions sits in a region marked
+    // hazardous outright.
+    let mut region_of = vec![0u32; len];
+    let mut region_hazard: Vec<bool> = vec![false];
+    {
+        let mut cur = 0u32; // region 0: file prologue, or the whole TU
+        for i in 0..len {
+            if infos[i].is_nop() {
+                continue;
+            }
+            let t = infos[i].trimmed(store.get(i));
+            if t.starts_with(".cfi_startproc") {
+                region_hazard.push(false);
+                cur = (region_hazard.len() - 1) as u32;
+            }
+            region_of[i] = cur;
+            if t.contains("%zmm") || t.contains("vzeroall") || t.contains("xsave") {
+                region_hazard[cur as usize] = true;
+            }
+            if t.starts_with(".cfi_endproc") {
+                region_hazard.push(true); // gap region: fail closed
+                cur = (region_hazard.len() - 1) as u32;
+            }
+        }
+        // Without any `.cfi_startproc` the single region 0 already holds
+        // the translation-unit-wide answer, matching the TU fallback of
+        // `pin_address_taken_stack_slots`.
+    }
+    let mut changed = false;
+    for i in 0..len {
+        // A deleted line's LineInfo still exposes its stale text through
+        // `trimmed`; matching a store that no longer executes would let
+        // this fold delete a live reload.  Skip deleted lines outright.
+        if infos[i].is_nop() {
+            continue;
+        }
+        if region_hazard[region_of[i] as usize] {
+            continue;
+        }
+        let st = infos[i].trimmed(store.get(i));
+        let Some((smn, sreg, smem)) = split_mn_two_ops(st) else {
+            continue;
+        };
+        if !is_ymm_full_move(smn) || !sreg.starts_with("%ymm") {
+            continue;
+        }
+        let plain_frame_slot = smem
+            .strip_suffix("(%rsp)")
+            .or_else(|| smem.strip_suffix("(%rbp)"))
+            .is_some_and(|d| d.is_empty() || d.parse::<i64>().is_ok());
+        if !plain_frame_slot {
+            continue;
+        }
+        let j = next_non_debug(store, infos, i + 1, len);
+        if j >= len || !all_editable(infos, &[i, j]) || infos[j].volatile_access {
+            continue;
+        }
+        let ld = infos[j].trimmed(store.get(j));
+        let Some((lmn, lmem, lreg)) = split_mn_two_ops(ld) else {
+            continue;
+        };
+        if is_ymm_full_move(lmn) && lmem == smem && lreg == sreg {
+            mark_nop(&mut infos[j]);
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod ymm_self_reload_tests {
+    use super::*;
+
+    fn run(asm: &str) -> (Vec<String>, bool) {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = forward_adjacent_ymm_self_reloads(&mut store, &mut infos);
+        let lines = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (lines, changed)
+    }
+
+    #[test]
+    fn adjacent_identity_reload_is_deleted() {
+        let (out, changed) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    call ext8@PLT\n",
+            "    vmovdqu %ymm0, 48(%rsp)\n",
+            "    vmovups 48(%rsp), %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert!(!out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm0"));
+        assert!(!out.iter().any(|l| l == "vmovups 48(%rsp), %ymm0"));
+        // The stores stay: their slots may have other readers.
+        assert!(out.iter().any(|l| l == "vmovdqu %ymm0, 96(%rsp)"));
+        assert!(out.iter().any(|l| l == "vmovdqu %ymm0, 48(%rsp)"));
+    }
+
+    #[test]
+    fn different_register_slot_or_distance_refuses() {
+        // Different register.
+        let (out, _) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm1\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm1"));
+        // Different slot.
+        let (out, _) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 64(%rsp), %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "vmovdqu 64(%rsp), %ymm0"));
+        // An intervening instruction (the call clobbers %ymm0).
+        let (out, _) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    call ext8@PLT\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm0"));
+        // An indexed memory operand is not a plain frame slot.
+        let (out, _) = run(concat!(
+            "    vmovdqu %ymm0, 8(%rsp,%rax)\n",
+            "    vmovdqu 8(%rsp,%rax), %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "vmovdqu 8(%rsp,%rax), %ymm0"));
+    }
+
+    #[test]
+    fn nopped_store_text_is_not_matched() {
+        // A store deleted by an earlier fold still exposes stale text via
+        // LineInfo::trimmed; the pair gate must not see it as a live store.
+        let asm = concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    ret\n",
+        );
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        mark_nop(&mut infos[0]); // the store is already gone
+        let changed = forward_adjacent_ymm_self_reloads(&mut store, &mut infos);
+        assert!(!changed);
+        assert!(!infos[1].is_nop(), "reload of a deleted store must survive");
+    }
+
+    #[test]
+    fn xsave_in_function_refuses() {
+        // XSAVE serialises zmm uppers to memory without `%zmm` text; the
+        // skipped reload's upper-zeroing would be observable in the image.
+        let (out, changed) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    xsave (%rdi)\n",
+            "    ret\n",
+        ));
+        assert!(!changed);
+        assert!(out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm0"));
+    }
+
+    #[test]
+    fn zmm_in_function_refuses_upper_zeroing_elision() {
+        // `vmovdqu mem, %ymm0` zeroes zmm0 bits 256..511; with AVX-512
+        // state in the function the reload has an architectural effect.
+        let (out, changed) = run(concat!(
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    vmovdqu64 %zmm1, (%rdi)\n",
+            "    ret\n",
+        ));
+        assert!(!changed);
+        assert!(out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm0"));
+    }
+
+    #[test]
+    fn zmm_screen_is_scoped_per_function() {
+        // A `%zmm` NEIGHBOUR function must not veto the fold in a
+        // `%ymm`-only function (zmm uppers are dead across the boundary),
+        // while the hazard function itself still refuses.
+        let (out, changed) = run(concat!(
+            "    .cfi_startproc\n",
+            "    vmovdqu %ymm0, 96(%rsp)\n",
+            "    vmovdqu 96(%rsp), %ymm0\n",
+            "    ret\n",
+            "    .cfi_endproc\n",
+            "    .cfi_startproc\n",
+            "    vmovdqu %ymm0, 48(%rsp)\n",
+            "    vmovdqu 48(%rsp), %ymm0\n",
+            "    vmovdqu64 %zmm1, (%rdi)\n",
+            "    ret\n",
+            "    .cfi_endproc\n",
+        ));
+        assert!(changed);
+        assert!(
+            !out.iter().any(|l| l == "vmovdqu 96(%rsp), %ymm0"),
+            "clean function folds despite the zmm neighbour"
+        );
+        assert!(
+            out.iter().any(|l| l == "vmovdqu 48(%rsp), %ymm0"),
+            "zmm function keeps its reload"
+        );
+    }
+}
+
 /// Highest set bit: `bsr S, D; xor $W-1, D; xor $W-1, D` -> `bsr S, D`.
 ///
 /// ClzNonZero lowers to `bsr; xor $W-1`, and simplify turns the

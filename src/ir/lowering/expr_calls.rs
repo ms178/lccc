@@ -563,6 +563,22 @@ impl Lowerer {
         }
 
         // For two-register struct returns (9-16 bytes), unpack I128 into struct alloca
+        //
+        // NOTE (RH-09 `ret128`, measured): do NOT special-case the 16-byte
+        // `[Sse, SseUp]` register return into a single I128 store here.  It
+        // looks like the obvious fix for the GP-half split this path costs
+        // a `v4 f(v4 a){ return ext4(a); }` caller (12 instructions where
+        // GCC needs 2), but the downstream cleanup passes
+        // (`vector_temp_promotion` / `vector_store_forward` / scalar
+        // load-forwarding) pattern-match the two-I64 shape and collapse it
+        // completely for INLINED intrinsic wrappers; the I128-store shape
+        // survives them.  The experiment regressed
+        // `map_min_epi8_128`-style leaf maps from 2 to 10 instructions and
+        // `helpers_f` from 47 to 84 (tests/simd/x86_int_map_registers.c,
+        // tests/regression/native_packed_fp_helpers.c) — far more real
+        // code than the round-trip caller it improved.  Fixing `ret128`
+        // needs the forwarding passes to understand a 16-byte SSE carrier
+        // store, not a different store shape here.
         if let Some(size) = two_reg_size {
             return self.unpack_two_reg_return(dest, size);
         }

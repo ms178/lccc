@@ -11024,6 +11024,7 @@ impl ArchCodegen for X86Codegen {
         // returns
         fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) => emit_return_impl;
         fn arm_sibcall_candidate(&mut self, info: &CallInfo) => arm_sibcall_candidate_impl;
+        fn call_arg_realignment_pins_frame(&self, info: &CallInfo) -> bool => call_arg_realignment_pins_frame_impl;
         fn current_return_type(&self) -> IrType => current_return_type_impl;
         fn emit_return_f32_to_reg(&mut self) => emit_return_f32_to_reg_impl;
         fn emit_return_f64_to_reg(&mut self) => emit_return_f64_to_reg_impl;

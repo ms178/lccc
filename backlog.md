@@ -3406,6 +3406,19 @@ Every row is a *measured* defect on the current tree, not a hypothesis.
 7. **RH-09 (P2) — `fmsub`/`fnmadd` header loop bodies** (13 instructions),
    lane extract `a[3]` (32-byte home round trip), `v8 f(v8)` 12 vs 6 (budget
    gate `tests/regression/vector_abi/`).
+   DONE (vector-return marshalling): `v8 f(v8)` 7→5 (budget 6) and
+   `v4 f(v4)` 12→5 via (a) the `call_arg_realignment_pins_frame` FPO gate,
+   (b) the `vecabialign` Phase 11d' pass, (c) the adjacent-`%ymm`
+   self-reload peephole (per-function AVX-512 screen), (d) the one-store
+   `[Sse, SseUp]` return home in `expr_calls.rs`.  STILL OPEN, measured at
+   `-O2 -mavx2` against GCC 16.2: (i) lane extract still homes through the
+   frame (`a[3]` = 4 insns vs 2: needs register-lane `vshufps`/`vextractps`
+   extraction); (ii) float scalars live across a call round-trip through GP
+   (`movd %xmm0,%eax; movq %rax,SLOT` — IPA-RA knows the callee's clobbers
+   but the allocator never considers keeping FP temporaries in unclobbered
+   XMM registers); (iii) aggregate zero-init followed by a full-width
+   I128/vector overwrite with a call in between survives DSE
+   (`struct wrap w = { mk4(s) };` keeps two `movq $0` stores).
 8. **RH-10 (P2) — benchmark coverage.** Add the intrinsic-homing kernels
    (load/FMA/integer map/parameter/return) to the integrated benchmark section
    with instruction counts AND wall-clock, so RH-03/RH-04 are ranked by real

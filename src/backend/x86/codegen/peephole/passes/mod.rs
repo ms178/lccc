@@ -1898,6 +1898,13 @@ fn peephole_optimize_inner(
         if !sk("combined") {
             global_changed |=
                 local_patterns::forward_adjacent_gp_stack_loads(&mut store, &mut infos);
+            // The YMM tier of the same idea: an adjacent full-width
+            // `%ymm` store/reload pair at one frame slot (the call
+            // boundary of a register-marshalled 32-byte vector) is an
+            // identity reload (`store_forwarding` models slots only up
+            // to MoveSize::DQ).
+            global_changed |=
+                local_patterns::forward_adjacent_ymm_self_reloads(&mut store, &mut infos);
         }
         if !sk("mem_fold") {
             global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos);
