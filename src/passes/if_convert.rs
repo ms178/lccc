@@ -1205,6 +1205,79 @@ fn try_if_combine_loop(
     applied
 }
 
+/// Sim-only cleanup mirroring what cfg_simplify does to the LIVE IR between
+/// combine rounds.  `apply_if_combine` leaves the bypassed inner block as an
+/// unreachable shell that still TEXTUALLY branches into the chain, and those
+/// phantom edges hold predecessor counts above the detectors'
+/// single-predecessor requirements (`detect_if_combine` clause 1, the
+/// diamond/triangle arm-head checks).  The real pipeline never sees them —
+/// cfg_simplify deletes unreachable blocks before the pass re-enters — so a
+/// probe that keeps them answers the profitability question about a CFG the
+/// next round will not be looking at.  Detach every unreachable block
+/// (instructions cleared, terminator → Return(None)) and drop phi incomings
+/// from the detached labels; block indices stay stable, which the sim's
+/// `body` index set relies on.
+fn sim_prune_unreachable(probe: &mut IrFunction) {
+    let label_map = analysis::build_label_map(probe);
+    let n = probe.blocks.len();
+    if n == 0 {
+        return;
+    }
+    let mut seen = vec![false; n];
+    seen[0] = true;
+    let mut stack = vec![0usize];
+    while let Some(b) = stack.pop() {
+        let succ: Vec<BlockId> = match &probe.blocks[b].terminator {
+            Terminator::Branch(t) => vec![*t],
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => vec![*true_label, *false_label],
+            Terminator::Switch { cases, default, .. } => {
+                let mut v: Vec<BlockId> = cases.iter().map(|(_, l)| *l).collect();
+                v.push(*default);
+                v
+            }
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => possible_targets.clone(),
+            Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
+        };
+        for l in succ {
+            if let Some(&i) = label_map.get(&l) {
+                if !seen[i] {
+                    seen[i] = true;
+                    stack.push(i);
+                }
+            }
+        }
+    }
+    let dead_labels: FxHashSet<BlockId> = probe
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !seen[*i])
+        .map(|(_, b)| b.label)
+        .collect();
+    if dead_labels.is_empty() {
+        return;
+    }
+    for (i, blk) in probe.blocks.iter_mut().enumerate() {
+        if !seen[i] {
+            blk.clear_insts();
+            blk.terminator = Terminator::Return(None);
+        } else {
+            for inst in &mut blk.instructions {
+                let Instruction::Phi { incoming, .. } = inst else {
+                    break; // phis are a prefix
+                };
+                incoming.retain(|(_, l)| !dead_labels.contains(l));
+            }
+        }
+    }
+}
+
 /// Does every non-exiting, non-chain conditional branch become
 /// diamond/triangle convertible once the combines have been applied?
 ///
@@ -1214,6 +1287,21 @@ fn try_if_combine_loop(
 /// detectors are the same ones `if_convert_diamonds` uses, with the same
 /// CPU-model budgets, so this cannot drift from what the pass will actually
 /// do to the loop afterwards.
+///
+/// When neither detector fires anywhere, the fixpoint plays the caller's
+/// OTHER move: another round of `detect_if_combine` on the probe.  This is
+/// not an extra power grab — after one combine round the pass returns to its
+/// caller, whose own fixpoint re-enters and prefers combines again, so later
+/// combine rounds genuinely happen to the live IR.  The move is decisive for
+/// the jump-threaded classifier shape the frontend emits for
+/// `a||b||...||z ? n++ : n` — every link branches STRAIGHT to the shared
+/// increment block, which therefore has one predecessor per link, and the
+/// diamond/triangle detectors (single-predecessor arm heads, by design)
+/// can never touch it until the remaining combines have folded the chain
+/// into one block.  Simulated combines follow the same restrictions the
+/// real rounds enforce: candidates live inside the body and never touch the
+/// exiting block.  Diamond/triangle keeps precedence within each round,
+/// matching `if_convert_diamonds` exactly.
 ///
 /// `nl.body` is the PRE-combine body set: combines only merge blocks inside
 /// it (they retarget edges between body blocks and reuse the same labels), so
@@ -1227,17 +1315,23 @@ fn body_becomes_branch_free(
     chain_blocks: &FxHashSet<usize>,
     dbg: bool,
 ) -> bool {
+    // The batch of combines just applied to the probe left unreachable
+    // shells behind; prune them first so the detectors below see the CFG
+    // the live pipeline's next round would see.
+    sim_prune_unreachable(probe);
     let body: Vec<usize> = {
         let mut v: Vec<usize> = nl.body.iter().copied().collect();
         v.sort_unstable();
         v
     };
-    // Bounded: each conversion removes at least one conditional branch and a
-    // body of B blocks holds at most B of them. The bound is belt-and-braces
-    // against a detector/apply pair that disagrees about progress.
+    // Bounded: each conversion AND each combine removes at least one
+    // conditional branch, and a body of B blocks holds at most B of them.
+    // The bound is belt-and-braces against a detector/apply pair that
+    // disagrees about progress.
     for _ in 0..=body.len() {
         let ctx = IfConvCtx::build(probe);
         let mut plan: Option<DiamondInfo> = None;
+        let mut comb: Option<IfCombine> = None;
         for &b in &body {
             if b == exiting || b >= probe.blocks.len() {
                 continue;
@@ -1256,17 +1350,55 @@ fn body_becomes_branch_free(
                 break;
             }
         }
+        if plan.is_none() {
+            // No conversion anywhere: simulate the NEXT combine round the
+            // caller's fixpoint would run (see the doc comment).  Same
+            // restrictions as the live rounds: the candidate must stay
+            // inside the body and keep its hands off the exiting block.
+            for &b in &body {
+                if b == exiting || b >= probe.blocks.len() {
+                    continue;
+                }
+                if !matches!(probe.blocks[b].terminator, Terminator::CondBranch { .. }) {
+                    continue;
+                }
+                if let Some(c) = detect_if_combine(&ctx, b) {
+                    if c.inner_idx != exiting && body.binary_search(&c.inner_idx).is_ok() {
+                        comb = Some(c);
+                        break;
+                    }
+                }
+            }
+        }
         drop(ctx);
-        let Some(plan) = plan else { break };
-        if !apply_diamond(probe, &plan) {
+        if let Some(plan) = plan {
+            if !apply_diamond(probe, &plan) {
+                break;
+            }
+            if dbg {
+                lccc::cli::stderr_line(format_args!(
+                    "[IFCOMB]     sim: converted pred={} merge={}",
+                    plan.pred_idx, plan.merge_idx
+                ));
+            }
+        } else if let Some(c) = comb {
+            let mut next = probe.next_value_id;
+            if !apply_if_combine(probe, &c, &mut next) {
+                break;
+            }
+            probe.next_value_id = next;
+            if dbg {
+                lccc::cli::stderr_line(format_args!(
+                    "[IFCOMB]     sim: combined pred={} inner={}",
+                    c.pred_idx, c.inner_idx
+                ));
+            }
+        } else {
             break;
         }
-        if dbg {
-            lccc::cli::stderr_line(format_args!(
-                "[IFCOMB]     sim: converted pred={} merge={}",
-                plan.pred_idx, plan.merge_idx
-            ));
-        }
+        // Each apply can strand another shell; keep the probe in the
+        // cleaned-up form the live pipeline maintains between rounds.
+        sim_prune_unreachable(probe);
     }
     if dbg {
         for &b in &body {
@@ -1295,12 +1427,51 @@ fn body_becomes_branch_free(
 
 /// Is `op` provably 0 or 1?  Only then is a bitwise `and`/`or` the logical
 /// connective (see `detect_if_combine` clause 3).
+///
+/// Beyond compares, the predicate recurses through the bitwise connectives,
+/// because a chain of three or more links feeds EARLIER COMBINES' outputs
+/// back in as conditions: round 1 of `a<=x && x<=b || c<=x && x<=d || ...`
+/// folds each range test to `And(cmp, cmp)`, and round 2 then combines
+/// blocks whose branch conditions are exactly those `And`s.  A Cmp-only
+/// answer stalled the fixpoint after one round and left the classifier
+/// loops branchy (and therefore scalar).  The algebra per connective:
+///
+///   * `And`: ONE 0/1 side suffices — `x & 0 = 0`, `x & 1 ∈ {0, 1}`;
+///   * `Or`/`Xor`: both sides must be 0/1 (set bits accumulate otherwise).
+///
+/// Depth-bounded against adversarial chains; failing closed at the bound
+/// just keeps the branch, which is the pipeline's common case.
 fn is_boolean_condition(ctx: &IfConvCtx<'_>, op: &Operand) -> bool {
+    is_boolean_condition_rec(ctx, op, 8)
+}
+
+fn is_boolean_condition_rec(ctx: &IfConvCtx<'_>, op: &Operand, depth: usize) -> bool {
     match op {
         Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),
         Operand::Value(v) => {
             let root = ctx.resolve(v);
-            matches!(ctx.defs.get(&root.0), Some(Instruction::Cmp { .. }))
+            match ctx.defs.get(&root.0) {
+                Some(Instruction::Cmp { .. }) => true,
+                Some(Instruction::BinOp {
+                    op: IrBinOp::And,
+                    lhs,
+                    rhs,
+                    ..
+                }) if depth > 0 => {
+                    is_boolean_condition_rec(ctx, lhs, depth - 1)
+                        || is_boolean_condition_rec(ctx, rhs, depth - 1)
+                }
+                Some(Instruction::BinOp {
+                    op: IrBinOp::Or | IrBinOp::Xor,
+                    lhs,
+                    rhs,
+                    ..
+                }) if depth > 0 => {
+                    is_boolean_condition_rec(ctx, lhs, depth - 1)
+                        && is_boolean_condition_rec(ctx, rhs, depth - 1)
+                }
+                _ => false,
+            }
         }
     }
 }

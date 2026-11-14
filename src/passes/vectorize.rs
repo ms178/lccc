@@ -641,7 +641,12 @@ fn vectorize_with_analysis_mode(
     // `var_os(..).is_some()` is the crate's presence-means-on spelling (see
     // `vec_interleave`'s gate on these same two variables): `var` additionally
     // UTF-8-validates the value and allocates a `String` that nobody reads.
-    let debug = std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some();
+    let debug_val = std::env::var_os("LCCC_DEBUG_VECTORIZE");
+    // `LCCC_DEBUG_VECTORIZE=ir` additionally dumps each function's IR as this
+    // pass sees it (the mid-pipeline shape differs from LCCC_DUMP_IR's final
+    // form, and candidate analysis questions are about THIS shape).
+    let debug_ir = debug_val.as_deref() == Some(std::ffi::OsStr::new("ir"));
+    let debug = debug_val.is_some();
     let why_not = std::env::var_os("LCCC_WHY_NOT_VECTORIZE").is_some();
 
     // ISA gate: the x86 vector lowerings require the SIMD register file. Under
@@ -684,6 +689,15 @@ fn vectorize_with_analysis_mode(
             num_blocks,
             loops.len()
         ));
+        if debug_ir {
+            for (bi, b) in func.blocks.iter().enumerate() {
+                lccc::cli::stderr_line(format_args!("[VEC]   block {} (label {}):", bi, b.label.0));
+                for inst in &b.instructions {
+                    lccc::cli::stderr_line(format_args!("[VEC]     {:?}", inst));
+                }
+                lccc::cli::stderr_line(format_args!("[VEC]     term: {:?}", b.terminator));
+            }
+        }
         if !simd_ok {
             report_simd_disabled(&func.name);
             return 0;
@@ -963,7 +977,7 @@ fn vectorize_with_analysis_mode(
             && !late_minmax_only()
             && byte_sum_width(force_sse2).is_some()
             && normalize_byte_count
-            && let n = byte_count_normalize::transform(func, loop_info, cfg)
+            && let n = byte_count_normalize::transform(func, loop_info, cfg, debug)
             && n > 0
         {
             if debug {
