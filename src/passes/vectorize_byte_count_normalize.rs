@@ -693,7 +693,10 @@ fn flatten_pure_value_triangles(
                     let Instruction::Phi { dest, ty, incoming } = inst else {
                         break; // phis are a prefix
                     };
-                    let pv = incoming.iter().find(|(_, l)| *l == p_label).map(|(v, _)| *v);
+                    let pv = incoming
+                        .iter()
+                        .find(|(_, l)| *l == p_label)
+                        .map(|(v, _)| *v);
                     let av = incoming
                         .iter()
                         .find(|(_, l)| *l == arm_label)
@@ -774,7 +777,12 @@ fn zero_one_operand(func: &IrFunction, op: &Operand, depth: usize) -> bool {
             };
             match &func.blocks[bi].instructions[ii] {
                 Instruction::Cmp { .. } => true,
-                Instruction::Cast { src, from_ty, to_ty, .. } => {
+                Instruction::Cast {
+                    src,
+                    from_ty,
+                    to_ty,
+                    ..
+                } => {
                     from_ty.is_integer()
                         && to_ty.is_integer()
                         && zero_one_operand(func, src, depth - 1)
@@ -794,8 +802,7 @@ fn zero_one_operand(func: &IrFunction, op: &Operand, depth: usize) -> bool {
                     rhs,
                     ..
                 } => {
-                    zero_one_operand(func, lhs, depth - 1)
-                        && zero_one_operand(func, rhs, depth - 1)
+                    zero_one_operand(func, lhs, depth - 1) && zero_one_operand(func, rhs, depth - 1)
                 }
                 Instruction::Phi { incoming, .. } if incoming.len() == 1 => {
                     zero_one_operand(func, &incoming[0].0, depth - 1)
@@ -839,19 +846,16 @@ fn lower_boolean_value_selects(flat: &mut IrFunction, lp: &loop_analysis::Natura
                     ty,
                 } => {
                     let cond_is_cmp = matches!(cond, Operand::Value(c)
-                        if matches!(
-                            definition_site(flat, *c)
-                                .map(|(b, i)| &flat.blocks[b].instructions[i]),
-                            Some(Instruction::Cmp { .. })
-                        ));
+                    if matches!(
+                        definition_site(flat, *c)
+                            .map(|(b, i)| &flat.blocks[b].instructions[i]),
+                        Some(Instruction::Cmp { .. })
+                    ));
                     let cond_ty_matches = matches!(cond, Operand::Value(c)
                         if definition_site(flat, *c)
                             .and_then(|(b, i)| flat.blocks[b].instructions[i].result_type())
                             == Some(*ty));
-                    if cond_is_cmp
-                        || !cond_ty_matches
-                        || !zero_one_operand(flat, cond, 10)
-                    {
+                    if cond_is_cmp || !cond_ty_matches || !zero_one_operand(flat, cond, 10) {
                         None
                     } else if constant(*true_val) == Some(1)
                         && zero_one_operand(flat, false_val, 10)
