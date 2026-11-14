@@ -303,3 +303,56 @@ are Callgrind counts (modeled, not hardware).
   under the Slt/Sgt restriction of the reduction recognizer. A census of 74
   benchmark programs at `-O2` and `-O3 -march=x86-64-v3` found no
   occurrence, so the restriction stays.
+* **Loop-carried global accumulator round trip (measured 2026-11-14).**
+  `sqlite_vdbe_serial` is the corpus's largest LCCC/GCC gap (paired median
+  1.386, CI [1.385, 1.774]).  Callgrind on a `PASSES=1` build of the same
+  source attributes it exactly: 2,401,890 Ir for LCCC against 1,820,281 for
+  GCC 16.2 (+32 %), of which `scan_all_records` is +283 k and `main` +20 k.
+  The extra work is the FNV byte-mixing loop, which the C source writes as
+  `content = (content ^ b) * 1099511628211` on a file-scope `uint64_t`:
+
+  ```text
+      ; LCCC, 12 instructions per byte           ; GCC, 6 per byte
+      mov  content(%rip), %rdx                     movzbl (%rdx), %esi
+      mov  0x28(%rsp), %rax                        add    $1, %rdx
+      movzbl (%rax,%rsi,1), %eax                   xor    %rsi, %rax
+      xor  %rax, %rdx                              imul   %rbp, %rax
+      mov  %rdx, %rax                              cmp    %rdx, %r8
+      movabs $0x100000001b3, %rcx                  jne    .L
+      imul %rcx, %rax
+      mov  %rax, content(%rip)
+      add  $1, %esi
+      mov  0x30(%rsp), %eax
+      cmp  %eax, %esi
+      jb   .L
+  ```
+
+  Nothing in that loop aliases `content` (no call, no pointer store), so three
+  of the twelve are avoidable: the global's per-iteration load and store, and
+  the `movabs` that re-materialises the FNV prime because `imul` cannot take a
+  64-bit immediate.  The loop bound and the byte pointer are also re-read from
+  the frame every iteration.  This is register promotion of a loop-carried
+  memory location plus loop-invariant rematerialisation — the same defect
+  class the vector work fixed with `pending_vec_store`, one level down.  The
+  fix belongs in the loop optimiser (promote a non-address-taken global whose
+  loop body holds no calls or pointer stores into a virtual register, store it
+  on exit) and is worth ~6 % of that benchmark per removed instruction group.
+* **`test %R, %R` after a logical op: investigated, not worth a pass
+  (measured 2026-11-14).** The code generator turns `if (x & m)` into
+  `andq …; testq %r8, %r8; je …`, where one instruction would do: `and`
+  already clears CF/OF and sets ZF/SF/PF from the result, so `test` is
+  redundant whenever nothing flag-writing sits in between.  A
+  `fold_redundant_self_test` peephole was written and unit-tested against the
+  exact rules (same register token, same width, no label, no flag writer, no
+  intervening write, `writes_family` for partial writes), and an
+  `-O2 -march=native` sweep of all 89 corpus programs found 7 such sites: 2
+  adjacent (the pass folded them, 2 instructions total) and 5 separated by a
+  label or by a loop increment, which no local peephole may cross — deleting
+  the test across an `addq` would leave the branch reading the increment's
+  flags, and folding across a label would run the fold on paths where the
+  producer never executed.  Two instructions of 89 programs is below the noise
+  floor of every benchmark, so the pass was dropped rather than shipped as
+  unmeasured code.  The real prize in that shape is block layout: sinking the
+  loop increment below the branch (as GCC does) makes the test adjacent, and
+  then the existing compare-and-branch fusion removes it for free.  Worth
+  revisiting together with the increment sinking, not on its own.
