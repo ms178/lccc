@@ -117,9 +117,13 @@ fn is_hoistable(inst: &Instruction) -> bool {
         // intrinsic follows through the ordinary fixpoint, reproducing
         // the previous (desirable) codegen with valid SSA.  Slot
         // coalescing only ever sees a WIDER apparent lifetime from the
-        // motion, which can cost a merge but never aliases two live
-        // ranges.  `DynAlloca` (runtime stack growth, has a size operand)
-        // stays non-hoistable.
+        // motion — never two aliased live ranges — but losing merges is
+        // a real cost (struct_copy regressed 94 -> 220 instructions when
+        // every loop alloca hoisted), so `hoist_loop_invariants_with`
+        // additionally gates alloca motion on profitability: only result
+        // slots of hoist-candidate intrinsics move (see
+        // `intrinsic_slot_allocas`).  `DynAlloca` (runtime stack growth,
+        // has a size operand) stays non-hoistable.
         Instruction::Alloca { .. }
     ) || matches!(
         inst,
@@ -1728,6 +1732,35 @@ fn hoist_loop_invariants_with(
     );
     let alias_info = build_loop_alias_info(func, natural_loop);
 
+    // Fixed-size allocas are position-independent (see `is_hoistable`),
+    // but moving one is only PROFITABLE when it unblocks an intrinsic
+    // hoist: relocating an unrelated struct temporary to the preheader
+    // widens its apparent live range across the whole loop, which can
+    // block stack-slot coalescing wholesale (struct_copy: 94 -> 220
+    // instructions at -O2 -march=x86-64-v3 when every loop alloca
+    // hoists — the vector-copy-elimination gate's budget is 136).
+    // Restrict alloca motion to the result slots of intrinsics that are
+    // themselves hoist candidates, i.e. exactly the slots whose in-loop
+    // definition would otherwise strand the intrinsic (the fail-closed
+    // `dest_ptr` operand rule) in the loop.
+    let mut intrinsic_slot_allocas: FxHashSet<u32> = FxHashSet::default();
+    for &block_idx in &natural_loop.body {
+        if block_idx >= func.blocks.len() {
+            continue;
+        }
+        for inst in &func.blocks[block_idx].instructions {
+            if let Instruction::Intrinsic {
+                dest_ptr: Some(ptr),
+                ..
+            } = inst
+            {
+                if is_hoistable(inst) {
+                    intrinsic_slot_allocas.insert(ptr.0);
+                }
+            }
+        }
+    }
+
     // Iteratively identify loop-invariant instructions.
     // An instruction is loop-invariant if:
     // 1. It is hoistable (pure, no side effects) OR it is a safe-to-hoist load
@@ -1757,7 +1790,12 @@ fn hoist_loop_invariants_with(
                 }
 
                 // Determine if this instruction can be hoisted
-                let can_hoist = if is_hoistable(inst) {
+                let can_hoist = if matches!(inst, Instruction::Alloca { .. })
+                    && !intrinsic_slot_allocas.contains(&dest.0)
+                {
+                    // Legal but unprofitable: see `intrinsic_slot_allocas`.
+                    false
+                } else if is_hoistable(inst) {
                     // Pure instruction: check all operands are loop-invariant
                     // Use callback to avoid Vec allocation in this hot loop
                     let mut all_invariant = true;
@@ -2622,6 +2660,47 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, Instruction::Intrinsic { .. })),
             "no intrinsic may reach the preheader (pre-fix behaviour hoisted it)"
+        );
+    }
+
+    /// Profitability half of the alloca-hoist rule: a loop alloca that is
+    /// NOT the result slot of a hoist-candidate intrinsic stays in the
+    /// body.  Hoisting it is position-independently legal, but widening
+    /// an unrelated temporary's apparent live range across the loop can
+    /// block stack-slot coalescing wholesale (struct_copy regressed
+    /// 94 -> 220 instructions, blowing the vector-copy-elimination
+    /// budget of 136, when every loop alloca hoisted).
+    #[test]
+    fn plain_loop_alloca_is_not_hoisted() {
+        let mut func = make_loop_func();
+        func.blocks[2].instructions.insert(
+            0,
+            Instruction::Alloca {
+                dest: Value(6),
+                ty: IrType::Ptr,
+                size: 48,
+                align: 16,
+                volatile: false,
+                semantic_volatile: false,
+            },
+        );
+        func.next_value_id = 7;
+        let alloca_info = analyze_allocas(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+        let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+
+        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info);
+
+        // Only the invariant multiply hoists; the bare alloca stays put.
+        assert_eq!(hoisted, 1, "only n*4 may hoist");
+        assert!(
+            func.blocks[2]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { dest, .. } if dest.0 == 6)),
+            "a plain loop alloca (no intrinsic result slot) must stay in the body"
         );
     }
 

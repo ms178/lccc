@@ -44,7 +44,7 @@ check_verify_clean() {
         fail "$name failed to build: $(head -2 "$tmp/$name.err" | tr '\n' ' ')"
     fi
     if grep -q '\[ir-verify\]' "$tmp/$name.err"; then
-        grep '\[ir-verify\]' "$tmp/$name.err" | head -3 >&2
+        grep '\[ir-verify\]' "$tmp/$name.err" | sed -n '1,3p' >&2
         fail "$name: licm/ivsr dominance violations are back (intrinsic dest_ptr hoisted without its slot)"
     fi
 }
