@@ -86,7 +86,7 @@ _mm256_and_si256(__m256i __a, __m256i __b)
 }
 
 #define _mm256_andnot_si256(__a, __b) \
-    (__m256i)__builtin_ia32_pandn256(__a, __b)
+    (__m256i)__builtin_ia32_andnotsi256(__a, __b)
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_or_si256(__m256i __a, __m256i __b)

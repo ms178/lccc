@@ -4951,7 +4951,7 @@
       "header": "avxintrin.h",
       "name": "_mm256_andnot_pd",
       "raw_builtins": [
-        "__builtin_ia32_pandn256"
+        "__builtin_ia32_andnotsi256"
       ],
       "wrapper_dependencies": [
         "_mm256_castpd_si256"
@@ -4970,7 +4970,7 @@
       "header": "avxintrin.h",
       "name": "_mm256_andnot_ps",
       "raw_builtins": [
-        "__builtin_ia32_pandn256"
+        "__builtin_ia32_andnotsi256"
       ],
       "wrapper_dependencies": [
         "_mm256_castps_si256"
@@ -5784,7 +5784,7 @@
       "header": "avx2intrin.h",
       "name": "_mm256_andnot_si256",
       "raw_builtins": [
-        "__builtin_ia32_pandn256"
+        "__builtin_ia32_andnotsi256"
       ],
       "wrapper_dependencies": []
     },

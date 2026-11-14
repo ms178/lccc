@@ -366,11 +366,11 @@ _mm256_xor_pd(__m256d __a, __m256d __b)
  * public inventory reporting them missing -- see
  * engineering/isa/sse-avx-public-api.json. */
 #define _mm256_andnot_ps(__a, __b) \
-    (__m256)__builtin_ia32_pandn256(_mm256_castps_si256(__a), \
+    (__m256)__builtin_ia32_andnotsi256(_mm256_castps_si256(__a), \
                                     _mm256_castps_si256(__b))
 
 #define _mm256_andnot_pd(__a, __b) \
-    (__m256d)__builtin_ia32_pandn256(_mm256_castpd_si256(__a), \
+    (__m256d)__builtin_ia32_andnotsi256(_mm256_castpd_si256(__a), \
                                      _mm256_castpd_si256(__b))
 
 static __inline__ __m256 __attribute__((__always_inline__))
