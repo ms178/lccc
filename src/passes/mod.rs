@@ -2687,8 +2687,14 @@ pub(crate) fn run_passes(
         // to extract the high 32 bits of a widened multiplication. The i686 backend
         // cannot execute 64-bit arithmetic correctly (it truncates to 32 bits), so these
         // sequences produce wrong results. Fall back to hardware idiv/div instead.
-        // TODO: Re-enable once i686 has proper 64-bit arithmetic support, or implement
-        // a 32-bit-aware variant that uses single-operand imull for mulhi.
+        //
+        // The "or implement a 32-bit-aware variant" half of the former marker is DONE,
+        // just not here: `backend::i686::codegen::magic_div` (driven from
+        // `i686/codegen/alu.rs::emit_*_div_by_const`) folds `Div`/`Rem` by a constant
+        // into the exact 32-bit `mull`/`imull` mulhi sequences GCC/Clang/ICX emit, so
+        // i686 already gets strength reduction without this pass. Do NOT re-enable the
+        // pass on i686 to "fix" this: it would re-introduce the I64 widening sequence
+        // above and double-apply the transform. Audit CD-01, 2026-11-13.
         if !pass_disabled(&disabled, "divconst") && !target.is_32bit() {
             let n = timed_pass!(
                 "div_by_const",

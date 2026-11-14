@@ -176,6 +176,21 @@ gate "archived-bulk-absent-selftest" fast \
 gate "archived-bulk-absent" fast \
     python3 scripts/check_archived_bulk_absent.py
 
+# backlog.md §15 is a census of every TODO/FIXME claim in src/, and a census
+# that is re-derived by hand every session decays: two of the 45 markers
+# adjudicated on 2026-11-13 described capabilities that already existed, and
+# one of the two (CD-01, the i686 div_by_const gate) would have turned a
+# "fix" into a miscompile. The ratchet pins the historical unqualified counts
+# in scripts/todo_census_baseline.txt; counts may only shrink, and a marker
+# whose item is closed fails. Self-test first: the gate's own lexer must not
+# count a marker inside a byte-string blob (the generated Unicode-name table
+# contains real character names with the substring TODO), or the ratchet
+# measures the data instead of the debt.
+gate "todo-census-selftest" fast \
+    python3 scripts/check_todo_census.py --self-test
+gate "todo-census" fast \
+    python3 scripts/check_todo_census.py --gate
+
 # Same reasoning, and equally compiler-independent: a workflow file is not a
 # shell script, so Actions step scaffolding pasted into a `run: |` block is
 # valid YAML that dies with exit 127 on the hosted runner. It is invisible

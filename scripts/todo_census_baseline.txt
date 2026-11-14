@@ -1,0 +1,38 @@
+# Unqualified TODO/FIXME ratchet for src/ (see backlog.md §15.6).
+#
+# Counts may only SHRINK.  Qualify a marker as TODO(<item-id>): or
+# TODO(no-item): <reason>, then lower this count in the same commit.
+# Regenerate with: scripts/check_todo_census.py --write-baseline
+backend/arm/assembler/encoder/load_store.rs:1
+backend/arm/assembler/encoder/mod.rs:1
+backend/arm/assembler/mod.rs:1
+backend/arm/assembler/parser.rs:1
+backend/arm/codegen/intrinsics.rs:1
+backend/arm/linker/link.rs:1
+backend/generation.rs:5
+backend/i686/codegen/peephole.rs:3
+backend/linker_common/args.rs:1
+backend/mod.rs:1
+backend/ret_dup.rs:1
+backend/riscv/assembler/encoder/mod.rs:1
+backend/riscv/assembler/encoder/pseudo.rs:1
+backend/riscv/codegen/inline_asm.rs:1
+backend/riscv/codegen/intrinsics.rs:1
+backend/state.rs:2
+backend/x86/assembler/encoder/mod.rs:1
+backend/x86/codegen/asm_emitter.rs:1
+backend/x86/codegen/calls.rs:2
+backend/x86/codegen/emit.rs:3
+backend/x86/codegen/peephole/passes/push_pop.rs:1
+backend/x86/codegen/returns.rs:1
+driver/external_tools.rs:1
+driver/pipeline.rs:1
+frontend/sema/analysis.rs:1
+frontend/sema/type_checker.rs:1
+ir/lowering/const_eval_global_addr.rs:1
+ir/lowering/expr_builtins.rs:1
+ir/lowering/expr_builtins_fpclass.rs:2
+ir/lowering/expr_calls.rs:1
+ir/lowering/expr_sizeof.rs:1
+ir/lowering/expr_types.rs:1
+ir/lowering/lower.rs:1

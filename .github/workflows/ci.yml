@@ -1303,6 +1303,14 @@ jobs:
       run: |
         python3 scripts/check_archived_bulk_absent.py --self-test
         python3 scripts/check_archived_bulk_absent.py
+    - name: TODO/FIXME census ratchet (backlog.md §15)
+      # The census is only worth taking once if a gate keeps it true: the two
+      # stale markers fixed on 2026-11-13 (CD-01, CD-02) each described a
+      # capability that already existed, and CD-01's "fix" is a miscompile.
+      # Counts live in scripts/todo_census_baseline.txt and may only shrink.
+      run: |
+        python3 scripts/check_todo_census.py --self-test
+        python3 scripts/check_todo_census.py --gate
     - name: Check GOT-slot references to local symbols
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
     - name: No merge conflict markers

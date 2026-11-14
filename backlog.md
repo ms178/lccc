@@ -3424,3 +3424,335 @@ which valgrind cannot start `memcheck` and the hexadecimal-literal oracle
 fails rather than reporting a Memcheck result.  PyYAML
 (`python3 -m pip install --break-system-packages pyyaml`) is required by
 `check_ci_workflow_shell.py`.
+
+---
+
+## 15. Code-debt census — every in-tree marker, adjudicated (2026-11-13, `4c3c081`)
+
+**Why this section exists.** The tree carried 45 markers in `src/` at the start of this session
+(44 `TODO`/`FIXME` in comments, measured by `scripts/check_todo_census.py`, plus
+one `unimplemented!` in `backend/traits.rs::unimplemented_target`).  A marker is a *claim about the
+future*; when the claim is stale it is worse than no marker at all, because the
+next agent either duplicates finished work or designs around a limitation that
+no longer exists.  Two of the 45 were verifiably wrong about the current tree and
+are corrected in the same commit (§15.1).  Everything else is adjudicated here so
+that a fresh agent can start from this table instead of re-deriving it.
+
+### 15.0 Method
+
+```sh
+grep -rn "TODO\|FIXME\|XXX\|unimplemented!(\|todo!()" src/ --include=*.rs
+```
+
+Each hit was classified **by reading the code the marker points at**, not by
+reading the marker:
+
+| Class | Meaning | Action |
+|---|---|---|
+| **STALE** | The capability exists elsewhere in the tree today. | Fix the claim in place; keep a pointer to the implementation (CD-01, CD-02). |
+| **REAL-BUG** | A reproducer exists that shows the compiler accepting or producing something GCC rejects/rejects-differently. | New item with reproducer + gates (CD-03, CD-04). |
+| **REAL-GAP** | Capability genuinely missing; no reproducer necessary because the comment is accurate. | New item, ranked by payoff. |
+| **HAZARD** | No live reproducer, but the code path can silently produce wrong output by construction. | Item with a fail-closed acceptance criterion. |
+| **HISTORY** | Marker is narrative about an adjudicated past defect. | Keep, but reword so it cannot be read as open work (CD-23, CD-40). |
+| **BY-DESIGN** | `unimplemented!`/panic is the intended fail-closed behaviour. | Document as intentional; no work (CD-41). |
+
+Performance items discovered by the same session's oracle run live in §15.2 and
+carry the evidence pack in
+[`engineering/evidence/2026-11-13-codegen-oracle-baseline/`](engineering/evidence/2026-11-13-codegen-oracle-baseline/README.md).
+
+### 15.1 Closed in this session
+
+#### CD-01 · STALE (fixed) · R — `divconst` is *not* missing on i686
+
+`src/passes/mod.rs`, the `div_by_const` gate.  The former comment ended with
+`TODO: Re-enable once i686 has proper 64-bit arithmetic support, or implement a
+32-bit-aware variant that uses single-operand imull for mulhi.`  The second half
+is DONE and has been for several sessions: `src/backend/i686/codegen/magic_div.rs`
+drives `i686/codegen/alu.rs`'s `emit_*_div_by_const`, which emits the exact
+32-bit `mull`/`imull` mulhi sequences GCC/Clang/ICX emit (the `q = ((n - mulhi)
+>> 1) + mulhi) >> (s-1)` fixup is at `alu.rs`, `mull %ecx` sites).  i686 therefore
+already has strength reduction; the IR pass stays off there so the transform is
+not applied twice through a widening sequence the backend would truncate.
+
+**Hazard if misread:** a future agent "fixing" the TODO by re-enabling the pass
+on i686 re-introduces the I64-widening sequence — a *miscompile*, not a
+regression.  The rewritten comment says so explicitly.
+**Accept:** `grep -n "32-bit-aware variant" src/passes/mod.rs` finds the closure
+note, and `i686/codegen/magic_div.rs` still owns the transform.
+
+#### CD-02 · STALE (fixed) · R — writes to global register variables are implemented
+
+`src/ir/lowering/lvalue.rs`, the `&global_regvar` guard.  The former comment said
+writes were "silently dropped" and carried a TODO asking for an empty inline-asm
+input constraint.  That is exactly what `expr_assign.rs::lower_assign` does today
+(`Instruction::InlineAsm { template: "", inputs: [(format!("{{{}}}", reg_name),
+value, None)], .. }`).  The `lvalue` site is the *address-of* path, which is
+correctly refused because a fixed-register variable has no storage.
+
+**Accept:** a regression test that writes `register long x asm("r12")` and reads
+it back still passes; the comment names `lower_assign` as the implementation.
+
+### 15.2 New performance items from the 2026-11-13 oracle baseline
+
+Ranked by expected payoff × affected workloads ÷ cost.  All four are wins at the
+**`-march=x86-64-v3` baseline** — no CPU-specific versioning needed.
+
+#### CD-21 · P0 · R — unroll constant-trip-count loops with an early exit (biggest gap)
+
+**Why.** `zlib_ng_compare256` is **1.205× slower than Clang** (paired CI
+[1.098, 1.350], 11 rounds) and the entire ratio is this: Clang fully unrolls the
+32-iteration `do { … } while (len < 256)` with its data-dependent early return
+into 32 straight-line blocks (4 instructions per 8 bytes, one branch each); LCCC
+keeps it rolled (6 instructions per 8 bytes plus a loop-carried `cmpl`/`jb`).
+The idiom is the inner loop of `memcmp`, `ZSTD_count`, `compare256`, and
+`longest_match` — `gzip_longest_match` is **1.185×** behind Clang for the same
+reason.  Two kernels, one mechanism, both in the compression workload family that
+§50 of the programme ranks as golden.
+**Where.** `src/passes/` loop transforms (unroller) and its trip-count reasoning;
+`tests/benchmark/programs/zlib_ng_compare256.c` is the reproducer.
+**Plan.**
+1. Census first: instrument the unroller to report *why* it declined
+   (`--explain-unroll`, or a `CCC_UNROLL_REPORT=1` dump) over the 87-kernel
+   corpus; the existing compiler-explainability convention (§57).
+2. Enable unrolling when the trip count is a compile-time constant ≤ N, the latch
+   has one data-dependent exit, and the body is below a size threshold; keep a
+   rolled remainder so the transform is never partial.
+3. Cost model: admit only when `body_insns × unroll ≤ I-cache budget` **and**
+   register pressure after unrolling stays under the pressure that would force a
+   spill (see §25 — never trade instructions for spills).
+**Gates.** A `check_compare256_unroll.py`-style assembly contract (unrolled body
+present, no loop-carried branch) plus the existing paired-runtime runner on
+`zlib_ng_compare256`, `gzip_longest_match`, `glibc_memcmp`, `zstd_count`.
+**Accept.** `zlib_ng_compare256` ratio ≤ 1.05 vs Clang; no kernel in the corpus
+regresses > 2 %; `-O2` binary size on the corpus grows < 3 %.
+**Risks.** Unrolling an early-exit loop duplicates the exit path — verify with
+the differential fuzz corpus (alias/volatile/`-fwrapv` barriers untouched), and
+pin `volatile_reduce` + `check_array_bound_contract.py` in the gate set.
+**Effort/ROI:** M / 5.
+
+#### CD-22 · P0 · R — hoist FP/vector constants into registers instead of re-materialising them
+
+**Why.** Every `.LCFP_n(%rip)` operand is re-loaded at each use.  Measured in
+`libm_round_family`: LCCC issues **two** constant loads per `copysign` per
+element (8 per unrolled iteration); GCC hoists the mask into an XMM register
+outside the loop and issues **zero** inside it.  On Raptor Lake this is
+load-port pressure in exactly the FP loops that dominate `fir_filter`,
+`fp_product_map`, `matmul`, `spectral_norm`.  The smallest instance is
+`copysign` itself: LCCC needs two distinct masks (`vandpd sign` + `vandpd abs` +
+`vorpd`); GCC holds `abs` in a register and extracts the sign with `vandnpd`
+(one mask, 8 fewer rodata bytes per function, one fewer distinct cache line).
+**Why it is a design item, not a patch:** the `vandnpd` form only wins once the
+constant lives in a register — in straight-line code it costs an extra `vmovsd`.
+Doing it at the `emit` site is therefore the wrong fix; the right one is a
+rematerialisation policy the register allocator can answer.
+**Where.** `src/backend/x86/codegen/` (`get_fp_const_label` is called from ~every
+FP emitter), the register allocator's rematerialisation hooks, and the
+`reg_assignments`/`fp_arg_xmm_home` machinery in `float_ops.rs`.
+**Plan.**
+1. Classify constants: loop-invariant, use-count > 1, encodable as a 16-byte
+   rodata slot → candidate for a register home.
+2. Give the allocator a *rematerialisable* attribute on such constants so it can
+   choose "hold in register" vs "fold into the memory operand" by pressure, with
+   the cost model from §25.
+3. Implement the `copysign` single-mask form behind that policy (it is the
+   visible symptom, not the fix).
+**Gates.** Assembly contract that a loop containing ≥ 2 uses of the same FP
+constant has ≤ 1 constant memory operand in the body; bit-exactness of
+`copysign`/`fneg`/`fabs` over ±0, ±Inf, NaN, sNaN payloads, denormals
+(`tests/regression/copysign_union_mem.c`, `fp_sign_and_vector_fms_cross.c`,
+`nan_builtin_payloads.c` already exist and must stay green).
+**Accept.** `libm_round_family` body ≤ 1 constant load per element; no corpus
+kernel regresses > 2 %.
+**Effort/ROI:** M / 4.5.
+
+#### CD-20 · P1 · R — eliminate phi-copy trampolines after jump-table dispatch
+
+**Why.** `expat_siphash24:sip24_final` is 158 instructions against GCC's 81;
+**16 of the difference** is eight `movq %rsi,%rN; jmp .LBBy` pairs — one per
+switch arm.  The jump table itself is correct; each arm is entered through a
+trampoline block whose only content is a phi copy plus an unconditional jump.
+**Where.** The block-shape/phi materialisation path used by switch lowering
+(`src/passes/` switch lowering → `src/backend/generation.rs` block emission);
+`tests/benchmark/programs/expat_siphash24.c` is the reproducer.
+**Plan.** Coalesce a copy-only block into its predecessor when the copy
+destination is not live across the edge, and prefer letting the dispatcher
+materialise the phi directly (the arm's chain should start operating on the
+dispatch register).  If coalescing is unsafe, at minimum merge identical
+trampolines.
+**Gates.** Assembly contract on `sip24_final`: no `movq %rsi,%rN` immediately
+followed by an unconditional `jmp`; the existing `check_switch_bound_shape.py`
+and `switch_lut_*` benchmarks must stay green.
+**Accept.** `sip24_final` ≤ 120 instructions; runtime parity or better on
+`expat_siphash24`.
+**Effort/ROI:** M / 3.
+
+#### CD-23 · P2 · S — the nine `TODO-3 / §5b` markers are cross-references, not open work
+
+Nine markers in `backend/{state,generation,ret_dup,x86/codegen/{calls,emit,returns}}.rs`
+read `Sibling call (TODO-3 / §5b): …`.  The sibling-call conversion is
+**implemented** (`generation::sibcall_block_hint`, `backend/state.rs::SibcallHint`,
+`ret_dup.rs`), and `TODO-3` names an entry in
+[`engineering/subsystems/codegen-gaps-2026-10-22.md`](engineering/subsystems/codegen-gaps-2026-10-22.md),
+not outstanding work.  They are documentation debt with a real cost: a census
+that counts 9 "TODOs" here hides 9 real ones elsewhere.
+**Plan.** Reword to `sibcall (codegen-gaps §5b/TODO-3, IMPLEMENTED)` in one
+mechanical commit, and land the census gate in §15.6 in the same change so the
+distinction is enforced rather than remembered.
+**Effort/ROI:** S / 3.
+
+### 15.3 Correctness and trust items (reproducers attached)
+
+#### CD-03 · P0 · R — a call to an `error`-attributed function is accepted silently
+
+**Reproducer (4 lines, runs in < 1 s):**
+
+```c
+__attribute__((error("must not call bad()"))) void bad(void);
+int f(int x){ if (x > 100) bad(); return x*2; }
+int main(void){ return f(3); }
+```
+
+GCC 16.2: `error: call to 'bad' declared with attribute error: must not call bad()`.
+LCCC today: **exit 0, no diagnostic**, and the call is lowered to `Const(0)`
+(`src/ir/lowering/expr_calls.rs`, the `error_functions` branch, which returns
+`Operand::Const(IrConst::ptr_int(0))`).
+**Why the current behaviour exists (and is not simply a bug to flip):** the Linux
+kernel uses `__compiletime_error` inside `always_inline` functions
+(`cpucap_is_possible`), where the call is *supposed* to disappear during
+inlining.  The existing TODO's condition is exactly right: diagnose only once the
+inliner can guarantee every `always_inline` chain is inlined (CD-27).  Emitting
+the error at lowering time would be a false positive on kernel builds.
+**Plan.**
+1. Mark the IR call site as `from_error_function` when lowering (no diagnostic).
+2. At the end of the pass pipeline (post-inline, post-DCE), diagnose every
+   surviving *reachable* call to a marked function, with GCC's wording.
+3. Dead-code-eliminated call sites must not diagnose — that is what makes it
+   compatible with the kernel.
+**Gates.** A new `error_attribute_diagnostic` regression test: (a) the reproducer
+above fails with GCC's message, (b) an `always_inline` wrapper that folds the call
+away still compiles clean, (c) `#if 0`-style unreachable calls stay silent.
+**Accept.** (a) diagnosed; (b) and (c) clean; kernel boot smoke unchanged.
+**Effort/ROI:** S / 4 — it is a fail-open in the "Trust" pillar (§1.1).
+
+#### CD-04 · P1 · R — `__builtin_frame_address(n>0)` returns NULL
+
+**Reproducer:**
+
+```c
+__attribute__((noinline)) void *lvl1(void){ return __builtin_frame_address(1); }
+```
+
+LCCC: NULL.  GCC 16.2: the caller's frame pointer.  Source:
+`src/ir/lowering/expr_builtins.rs` (`// TODO: support non-zero levels by walking
+the frame pointer chain` — level 0 is implemented and correct).
+**Why it matters.** Backtraces, tracing shims and `glibc`'s `backtrace()`-adjacent
+code use it; returning NULL silently produces "no caller" instead of an error.
+**Plan.** Level *n* = load `(%rbp)` *n* times from the level-0 frame (the guard is
+that the function must not be frameless — force frame-pointer emission for the
+caller chain, which `-fno-omit-frame-pointer` already models), then return that
+address.  On i686 the same walk through `%ebp`.
+**Gates.** A cross-executed test that compares levels 0..3 against GCC-built and
+LCCC-built binaries on x86-64 and i686.
+**Accept.** Levels 0..3 agree with GCC for a fixed 4-deep call chain under
+`-fno-omit-frame-pointer`; a documented diagnostic when the frame chain is
+unavailable (`-fomit-frame-pointer`) instead of a silent NULL.
+**Effort/ROI:** S / 3.
+
+#### CD-05 · P2 · S — `operand_to_imm_i64` fails open (returns 0 for a non-constant)
+
+`src/backend/x86/codegen/emit.rs::operand_to_imm_i64` maps any
+`Operand::Value(_)` to `0`.  Every caller is an intrinsic immediate
+(`_mm_shuffle_epi32` lane, shift counts, `pslldq` bytes).  C requires those
+arguments to be integer constant expressions, so a `Value` reaching here means an
+upstream lowering accepted something malformed — and the failure mode is *silently
+wrong code*, not a diagnostic.
+**Plan.** Make the miss observable: `debug_assert!` in debug profiles plus a
+one-shot `lccc::cli::stderr_line` warning naming the intrinsic; audit the
+intrinsic-arity/kind gates (`check_intrinsic_arity.py`,
+`check_x86_intrinsic_kind_width.py`) for a case that can produce it.
+**Accept.** A fuzz target that binds an intrinsic's immediate argument to a
+variable produces a warning (and, if the frontend allows it, an error) instead of
+a wrong constant.
+**Effort/ROI:** S / 2.5.
+
+#### CD-06 · P2 · S — `ExprId` is a pointer address, with an ABA workaround
+
+`src/ir/lowering/{expr_types,lower}.rs`.  The type memo cache is keyed by
+`ExprId` = the AST node's address, and because `TypeSpecifier` trees
+(`typeof`, `_Generic`) can be dropped and have their addresses reused, every cache
+hit re-checks the Expr discriminant to avoid returning a stale type.  The TODO
+is correct: counter-based IDs delete the workaround.
+**Why it is a performance item as well as a hygiene item.** It costs a
+`Discriminant` comparison per type query (hot: `get_expr_ctype` is called per
+expression), it makes cache behaviour depend on the allocator, and it is the
+mechanism behind at least one class of historical miscompile.
+**Plan.** Introduce a counter-based `ExprId` allocated at parse time; keep the
+discriminant check as a debug assertion for one release, then delete it.
+**Gates.** Existing type-inference tests plus a `-Zself-test` that asserts
+`ExprId` uniqueness across a torture corpus; determinism check that two runs with
+different allocator seeds produce identical caches/statistics.
+**Effort/ROI:** M / 2.5.
+
+#### CD-27 · P2 · S — inliner must *guarantee* `always_inline` chains
+
+Prerequisite for CD-03 step 3 and for GCC's "always_inline function might not be
+inlinable" diagnostic parity.  `src/ir/lowering/expr_calls.rs` documents that
+surviving calls are currently possible.  **Accept:** a corpus run where
+`CCC_DEBUG_INLINE=1` reports zero surviving `always_inline` calls at `-O2`.
+**Effort/ROI:** M / 3 (unlocks a P0 trust item).
+
+### 15.4 Structural debt
+
+| ID | Class | Site | Finding | Plan / accept | Effort |
+|---|---|---|---|---|---|
+| CD-07 | STALE-PARTIAL | `arm/assembler/parser.rs`, `x86/assembler/parser.rs` vs `backend/asm_preprocess.rs` | The TODO says "extract `expand_rept_blocks` to a shared module (duplicated in ARM, RISC-V, x86)". A shared, growth-guarded implementation **exists**; RISC-V already uses it, x86 and ARM still carry local copies (both growth-guarded — verified, so this is *not* a `.rept`-bomb hole). Three implementations of one directive is drift risk. | Delete both local copies, call `asm_preprocess::expand_rept_blocks`; accept: identical assembly text for the `.rept` fixture corpus. | S |
+| CD-08 | REAL-GAP | `ir/lowering/expr_builtins_fpclass.rs` (2 sites) | `FP_NORMAL = 4`, `FP_SUBNORMAL = 3`, … assume glibc/Linux; musl and BSD differ. Silently wrong `__builtin_isnormal` on non-glibc targets. | Drive the values from the target's libc personality (already a `-mtarget-os` concept in the driver) or from `__FP_FAST_FMA`-style predefined macros; accept: a musl-profile compile emits musl's numbering. | S |
+| CD-09 | REAL-GAP | `backend/mod.rs::general_regs_only` | `-mgeneral-regs-only` gates only the variadic ABI path on AArch64; popcount, bswap, float casts and other FP codegen paths still touch NEON/FP. Documented as sufficient for the kernel, which is a *scope* statement, not a correctness proof. | Either complete the gate or make the flag's contract explicit in `option_table.rs` (refuse with a diagnostic where the mode cannot be honoured). Trust pillar: no silent partial no-op. | S-M |
+| CD-24 | REAL-GAP | `driver/pipeline.rs` (`#pragma redefine_extname`) | Implemented via `.set` aliases, which only works when *both* symbols are defined locally; an external `new_name` silently keeps the old symbol. | Rename symbol references during lowering (the `aliases` mechanism already exists in the linker layer). Accept: `-D__redefine_extname` fixture with an external target links and binds correctly. | S |
+| CD-25 | REAL-GAP | `ir/lowering/const_eval_global_addr.rs` | Global-address constant folding handles `global_struct.field[i]` but not `MemberAccess`/`Cast` bases; those fall back to non-constant addresses (static initializers that GCC accepts). | Extend the resolver to peel `Cast` and recurse through `MemberAccess`; accept: kernel-style `&rcu_state.node[0]` initializer folds to a constant. | S |
+| CD-26 | HAZARD | `ir/lowering/expr_sizeof.rs` | Nested-deref pointer size uses `target_ptr_size()` rather than the type's own pointer width. Harmless on LP64/i686 today; wrong for a mixed-width pointer type (address-space pointers, `__ptr32`). | Thread the actual pointee type; accept: an `__ptr32` fixture yields 4. | S |
+| CD-28 | REAL-GAP (large) | `frontend/sema/analysis.rs` | The module docstring says the pass "does NOT reject programs with type errors (yet); full type checking is TODO." Accurate. This is the largest single item in the census and is **not** proposed for a single session. | Scope it as its own register (§16 candidate) with a conformance inventory against `edg`'s diagnostics; do not start without a clone-by-clone plan. | L |
+| CD-29 | HAZARD | `frontend/sema/type_checker.rs::builtin_return_ctype` vs the lowerer's `builtin_return_type` | Two independent tables mapping a builtin name to a type. They agree today; a new builtin added to one and not the other yields a silently mistyped expression. | Generate both from one table (the `x86_builtin_types` module is already the shared source for part of it). Accept: a build-time assertion that the two tables cover the same key set. | S |
+
+### 15.5 Non-x86 backends (out of codegen-performance scope, in-tree accuracy scope)
+
+None of these affect the x86-64/i686 performance programme; they are listed so
+the census is complete and so a non-x86 session has a starting table.
+
+| ID | Site | Finding | Effort |
+|---|---|---|---|
+| CD-30 | `arm/codegen/intrinsics.rs`, `riscv/codegen/intrinsics.rs` | x86-only intrinsics (AES/PCLMUL/shift) lower to **silent zeros** on these targets. Dead-code-eliminated in correct code, but a wrong answer if reached. Prefer a trap or a hard error (the comment already suggests the trap). | S |
+| CD-31 | `arm/assembler/mod.rs` | `.long` literal-pool entries do not track W-vs-X, so a 4-byte entry may be emitted for a W register that needs 8-byte semantics. | S |
+| CD-32 | `arm/assembler/encoder/load_store.rs` | Load/store encoder handles integer registers only (V=0); FP/SIMD (V=1) unencoded. | M |
+| CD-33 | `arm/assembler/encoder/mod.rs` | "handle remaining instructions" — long-tail ARM encodings. | L |
+| CD-34 | `x86/assembler/encoder/mod.rs` | "many more instructions to handle" — long-tail x86 encodings; the ISA gap report (`isa_gap_sweep.py`, MB-45) is the authoritative list. | L |
+| CD-35 | `riscv/assembler/encoder/pseudo.rs` | `la`/`lla` low-12 relocation references the symbol instead of the `auipc` label. Correct for now because linker relaxation is off; wrong if relaxation is enabled. | S |
+| CD-36 | `riscv/assembler/encoder/mod.rs` | Masked vector variants (`v0.t`) not encoded; `vm` hardcoded to 1. | M |
+| CD-37 | `riscv/codegen/inline_asm.rs`, `x86/codegen/asm_emitter.rs` | Multi-alternative constraint parsing (`"rm"`, `"Ir"`) exists on x86 only. | S |
+| CD-38 | `arm/linker/link.rs`, `linker_common/args.rs` | Symbol-to-symbol aliasing only; arbitrary expressions in linker scripts unsupported. | M |
+| CD-42 | `driver/external_tools.rs` | `-m16` delegates the whole compilation to GCC (`gcc_m16` feature) because the i686 backend's code exceeds the 32 KiB real-mode boot limit. Still true; the fix is i686 code size, tracked by MB-32/§7. Marker is accurate — keep. | L |
+
+### 15.6 Marker hygiene — make the census self-maintaining
+
+The two stale markers fixed above survived several sessions because nothing
+distinguishes "work to do" from "history" from "cross-reference".  Proposal
+(land with CD-23):
+
+- Every new `TODO`/`FIXME` in `src/` must name an item: `TODO(CD-xx):` or
+  `TODO(MB-xx):` or `TODO(GP-xx):`, or `TODO(no-item):` with a one-line reason.
+  A `scripts/check_todo_census.py` gate enumerates markers, groups them by ID, and
+  fails when an ID is absent from `backlog.md`, when a `TODO(CD-xx)` refers to a
+  CD item whose status is CLOSED, or when an unqualified `TODO` appears.
+- History and cross-references must not use the `TODO` token at all (§15.1 CD-23
+  is the worked example) — the gate makes that mechanical.
+
+### 15.7 Mapping to the existing registers (do not double-track)
+
+| Census item | Existing entry it belongs to |
+|---|---|
+| CD-21 (unroll) | §20 loop optimisation; interacts with §25 (pressure) and §22 (versioning) |
+| CD-22 (constant remat) | §24 register allocation / §26 instruction selection |
+| CD-20 (trampolines) | §30 block layout; §24 coalescing |
+| CD-03, CD-27 | MB-02/§1 Trust; GP register (diagnostics) |
+| CD-08, CD-09, CD-24–CD-26 | MB-01 option contract / MB-11 C23 conformance |
+| CD-30…CD-38 (non-x86 backends) | §7 i686/linker verification (MB-32/MB-33) |

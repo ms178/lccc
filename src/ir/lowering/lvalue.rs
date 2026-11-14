@@ -95,10 +95,14 @@ impl Lowerer {
                     return Some(LValue::address(addr, AddressSpace::Default, vol));
                 }
                 if let Some(ginfo) = self.globals.get(name) {
-                    // Global register variables have no storage, so they are not
-                    // addressable. Writes are silently dropped (read-only in practice).
-                    // TODO: support writes to global register variables via inline asm
-                    // with an input constraint (e.g., `asm("" : : "{rsp}"(val))`)
+                    // Global register variables (`register void *p asm("rbx")`) have
+                    // no addressable storage, so `&p` cannot be formed here. This
+                    // branch is about ADDRESS-TAKING only: plain writes ARE
+                    // implemented, by staging the value into the fixed physical
+                    // register through an empty inline-asm input constraint in
+                    // `expr_assign.rs::lower_assign`. (The former marker here asked
+                    // for exactly that implementation — it has existed for several
+                    // sessions; only the comment was stale. Audit CD-02, 2026-11-13.)
                     if ginfo.asm_register.is_some() {
                         return None;
                     }
