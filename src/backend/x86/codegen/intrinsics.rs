@@ -1587,39 +1587,60 @@ impl X86Codegen {
             return;
         }
 
-        // ── Legacy direct-to-home form ─────────────────────────────────
-        // Without VEX the encoding is destructive, so the fallback below
-        // stages args[0] through %xmm0, computes there, and then copies
-        // the result to the destination's home (`movdqa %xmm0, %xmmN`):
-        // two register moves per lane op, and one shared %xmm0
-        // accumulator that serialises every vector op in the block.
-        //
-        // Intel eliminates XMM register moves at rename, so that staging
-        // is nearly free there and the pattern survived.  AMD Zen does
-        // NOT eliminate vector-register moves: each copy is a real uop
-        // with 1-cycle latency, and on a loop-carried recurrence (an ARX
-        // cipher round, an accumulator chain) it lands on the critical
-        // path.  Measured consequence: the 4-lane ChaCha20 core is
-        // 2.26x GCC's scalar loop on EPYC 9V45 while the very same
-        // binary is at parity with GCC on Xeon.
-        //
-        // The fix is not to pick a different algorithm per vendor but to
-        // stop emitting the staging: load the first operand straight
-        // into the destination's home and destroy it there.  One
-        // instruction per lane op, no %xmm0 round trip, and the result
-        // is born in the register the rest of the block already reads —
-        // which is the same shape the VEX.128 path above produces, so
-        // both ISAs now get one non-destructive op with no copies.
-        //
-        // Declines (falling through to the staging path) when:
-        //   * the destination has no XMM home (it lives in a slot);
-        //   * either source already occupies the home register — the
-        //     in-place/coalesced paths own the `dest == src1` shape, and
-        //     `dest == src2` would clobber a live source;
-        //   * a source is a pending memfold (it has no materialised
-        //     register contents yet) or a source register was never
-        //     claimed for a 128-bit width.
-        if let (Operand::Value(a0), Operand::Value(a1)) = (&args[0], &args[1]) {
+        if self.emit_sse_legacy_home_form(dest_ptr, &args[0], &args[1], sse_inst) {
+            return;
+        }
+
+        let a1_last = matches!(&args[1], Operand::Value(v)
+            if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+        if a1_last {
+            self.sse_load_arg(&args[1], "xmm1");
+            self.sse_load_arg(&args[0], "xmm0");
+        } else {
+            self.sse_load_arg(&args[0], "xmm0");
+            self.sse_load_arg(&args[1], "xmm1");
+        }
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0", sse_inst));
+        self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
+    /// Emit a 128-bit SSE binary op directly into the destination's home
+    /// register, without the `%xmm0` staging the destructive form needs.
+    ///
+    /// Intel eliminates XMM register moves at rename, so staging
+    /// (`movdqa` in, op, `movdqa` out to the home) is nearly free there and
+    /// the pattern survived in this emitter.  AMD Zen does NOT eliminate
+    /// vector register moves: each copy is a real uop with 1-cycle latency
+    /// and, inside a loop-carried recurrence (an ARX cipher round, an
+    /// accumulator chain), it lands on the critical path.  Measured: the
+    /// 4-lane ChaCha20 core was 2.26x GCC's scalar loop on EPYC 9V45 while
+    /// the same binary was at parity with GCC on Xeon.
+    ///
+    /// The fix is not to pick a different algorithm per vendor but to stop
+    /// emitting the staging: load args[0] straight into the destination's
+    /// home and destroy it there.  One instruction per lane op, no %xmm0
+    /// round trip, and the result is born in the register the rest of the
+    /// block already reads — the same shape the VEX.128 path produces, so
+    /// both ISAs get one non-destructive op with no copies.  Nothing here
+    /// branches on CPU vendor: the form is chosen on ISA feature, and it is
+    /// never worse than the staging form on either vendor.
+    ///
+    /// Declines (returns false, letting the caller stage through %xmm0)
+    /// when the destination has no XMM home (it lives in a slot); when
+    /// either source already occupies the home register (the in-place and
+    /// copy-coalesced paths own the `dest == src1` shape, and `dest ==
+    /// src2` would clobber a live source); when a source is a pending
+    /// memory fold (it has no materialised register contents); or when a
+    /// source register was never claimed for a 128-bit width.
+    fn emit_sse_legacy_home_form(
+        &mut self,
+        dest_ptr: &Value,
+        arg0: &Operand,
+        arg1: &Operand,
+        sse_inst: &str,
+    ) -> bool {
+        if let (Operand::Value(a0), Operand::Value(a1)) = (arg0, arg1) {
             if a0.0 != a1.0 {
                 let memfold_blocks = self
                     .state
@@ -1633,32 +1654,21 @@ impl X86Codegen {
                         if !a0_home && !a1_home {
                             // args[0] into the home, then args[1] into the
                             // scratch slot the destructive form consumes.
-                            self.sse_load_arg(&args[0], home);
-                            self.sse_load_arg(&args[1], "xmm0");
+                            self.sse_load_arg(arg0, home);
+                            self.sse_load_arg(arg1, "xmm0");
                             self.state
                                 .emit_fmt(format_args!("    {} %xmm0, %{}", sse_inst, home));
                             if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(a1.0) {
                                 self.state.pending_vec_store = None;
                             }
                             self.sse_commit_dest_direct(dest_ptr, home);
-                            return;
+                            return true;
                         }
                     }
                 }
             }
         }
-        let a1_last = matches!(&args[1], Operand::Value(v)
-            if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
-        if a1_last {
-            self.sse_load_arg(&args[1], "xmm1");
-            self.sse_load_arg(&args[0], "xmm0");
-        } else {
-            self.sse_load_arg(&args[0], "xmm0");
-            self.sse_load_arg(&args[1], "xmm1");
-        }
-        self.state
-            .emit_fmt(format_args!("    {} %xmm1, %xmm0", sse_inst));
-        self.sse_store_dest(dest_ptr, "xmm0");
+        false
     }
 
     /// Emit SSE unary 128-bit op with immediate: load xmm0 from arg0 ptr,
