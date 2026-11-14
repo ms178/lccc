@@ -4,6 +4,62 @@ Keep unimplemented opportunities here only when a reproducible workload or
 assembly witness exists. Move completed work to its change review with measured
 results; do not turn unmeasured expectations into claims.
 
+## Vector-returning C inline functions in the intrinsic headers: 10x on hot loops
+
+**Measured, not estimated.** A 256-bit FIR kernel (`acc = _mm256_fmsub_ps(a, k, acc)`
+and `_mm256_fnmadd_ps` over 64 KiB, 400 rounds, `-O2 -mavx2 -mfma`) runs in
+**23.5 ms** when `_mm256_fmsub_ps`/`_mm256_fnmadd_ps` are C `static __inline__`
+functions and in **2.3 ms** when they are macros over the native helpers — a
+10.2x difference with identical output (`sum -1634931.500000` in both, three
+runs each).
+
+The instruction diff is the whole story. The function form, once inlined,
+materialises its `__m256` return value in memory and copies it back:
+
+    vfmsub132ps 368(%rsp), %ymm1, %ymm0
+    vmovups %ymm0, 568(%rsp)          ; aggregate return lands in a stack slot
+    leaq 600(%rsp), %rdi              ; ... and is copied again, 16 bytes at a time
+    vmovdqu (%rsi), %xmm0
+    vmovdqu %xmm0, (%rdi)
+    vmovdqu 16(%rsi), %xmm0
+    vmovdqu %xmm0, 16(%rdi)
+
+The macro form keeps the result in `%ymm`:
+
+    vmovups (%r8), %ymm0
+    vmovups 32(%r8), %ymm14
+    vfmsub132ps 176(%rsp), %ymm4, %ymm0
+    vfnmadd132ps 176(%rsp), %ymm5, %ymm0
+
+**Status.** `include/lcccsimd.h` already uses the macro form everywhere, and
+the FMA3 family, the AVX-256 bitwise family and the 256/512-bit load/store
+family have been converted. **140 vector-returning `static __inline__`
+functions remain** in `include/avxintrin.h` (39), `include/avx2intrin.h` (84)
+and `include/avx512fintrin.h` (17); each needs a registered native helper
+before it can be converted, so the conversion is a per-family change with a
+per-family gate (`check_fma3_family.sh`, `check_avx256_float_bitwise.sh`,
+`check_wide_load_store.sh` are the pattern). Until then, any of them used in a
+loop pays the aggregate round trip above.
+
+## 512-bit vector values are memory-resident: no zmm register class
+
+Every AVX-512 operation spills its operands to 64-byte-aligned stack slots and
+reloads them: measured `_mm512_fmadd_pd` is **38 instructions** (three argument
+spills, three reloads, one `vfmadd132pd`, a store of the result, two 16-byte
+copies and a reload) where gcc-16 emits one. A 4-line AVX-512 kernel with a
+`_mm512_loadu_ps`/`fmsub`/`storeu_ps` loop body compiles to a 728-byte frame
+with a spill/reload pair per operation.
+
+The IR has no vector types at all (`IrType` stops at `I128`), so a 512-bit
+value can only live in an alloca; the 256-bit path avoids the round trip with
+the `pending_vec_store`/deferred-result machinery, which covers `ymm` but not
+`zmm`. Giving `zmm` the same treatment (or a real vector register class) is the
+single largest AVX-512 opportunity in the tree and is **not** attempted here:
+it changes register allocation, the call ABI and the whole 512-bit emit path
+at once. The load/store and FMA spellings added in this tree are already in
+their final form — they will become single instructions automatically once the
+values stop being memory-resident.
+
 ## Split-latch diamond coalescing: shape implemented, reachability open
 
 `phi_update_region` admits the load-before-if/latch-copy diamond
@@ -247,3 +303,56 @@ are Callgrind counts (modeled, not hardware).
   under the Slt/Sgt restriction of the reduction recognizer. A census of 74
   benchmark programs at `-O2` and `-O3 -march=x86-64-v3` found no
   occurrence, so the restriction stays.
+* **Loop-carried global accumulator round trip (measured 2026-11-14).**
+  `sqlite_vdbe_serial` is the corpus's largest LCCC/GCC gap (paired median
+  1.386, CI [1.385, 1.774]).  Callgrind on a `PASSES=1` build of the same
+  source attributes it exactly: 2,401,890 Ir for LCCC against 1,820,281 for
+  GCC 16.2 (+32 %), of which `scan_all_records` is +283 k and `main` +20 k.
+  The extra work is the FNV byte-mixing loop, which the C source writes as
+  `content = (content ^ b) * 1099511628211` on a file-scope `uint64_t`:
+
+  ```text
+      ; LCCC, 12 instructions per byte           ; GCC, 6 per byte
+      mov  content(%rip), %rdx                     movzbl (%rdx), %esi
+      mov  0x28(%rsp), %rax                        add    $1, %rdx
+      movzbl (%rax,%rsi,1), %eax                   xor    %rsi, %rax
+      xor  %rax, %rdx                              imul   %rbp, %rax
+      mov  %rdx, %rax                              cmp    %rdx, %r8
+      movabs $0x100000001b3, %rcx                  jne    .L
+      imul %rcx, %rax
+      mov  %rax, content(%rip)
+      add  $1, %esi
+      mov  0x30(%rsp), %eax
+      cmp  %eax, %esi
+      jb   .L
+  ```
+
+  Nothing in that loop aliases `content` (no call, no pointer store), so three
+  of the twelve are avoidable: the global's per-iteration load and store, and
+  the `movabs` that re-materialises the FNV prime because `imul` cannot take a
+  64-bit immediate.  The loop bound and the byte pointer are also re-read from
+  the frame every iteration.  This is register promotion of a loop-carried
+  memory location plus loop-invariant rematerialisation — the same defect
+  class the vector work fixed with `pending_vec_store`, one level down.  The
+  fix belongs in the loop optimiser (promote a non-address-taken global whose
+  loop body holds no calls or pointer stores into a virtual register, store it
+  on exit) and is worth ~6 % of that benchmark per removed instruction group.
+* **`test %R, %R` after a logical op: investigated, not worth a pass
+  (measured 2026-11-14).** The code generator turns `if (x & m)` into
+  `andq …; testq %r8, %r8; je …`, where one instruction would do: `and`
+  already clears CF/OF and sets ZF/SF/PF from the result, so `test` is
+  redundant whenever nothing flag-writing sits in between.  A
+  `fold_redundant_self_test` peephole was written and unit-tested against the
+  exact rules (same register token, same width, no label, no flag writer, no
+  intervening write, `writes_family` for partial writes), and an
+  `-O2 -march=native` sweep of all 89 corpus programs found 7 such sites: 2
+  adjacent (the pass folded them, 2 instructions total) and 5 separated by a
+  label or by a loop increment, which no local peephole may cross — deleting
+  the test across an `addq` would leave the branch reading the increment's
+  flags, and folding across a label would run the fold on paths where the
+  producer never executed.  Two instructions of 89 programs is below the noise
+  floor of every benchmark, so the pass was dropped rather than shipped as
+  unmeasured code.  The real prize in that shape is block layout: sinking the
+  loop increment below the branch (as GCC does) makes the test adjacent, and
+  then the existing compare-and-branch fusion removes it for free.  Worth
+  revisiting together with the increment sinking, not on its own.

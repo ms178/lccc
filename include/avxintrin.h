@@ -10,12 +10,48 @@
 /* Unaligned variants */
 /* === Load / Store === */
 
+/* Every 256-bit load/store below is ONE instruction at every optimization
+ * level.  They used to be lane loops (`__r[i] = __p[i];`), which only became a
+ * single `vmovups` when SLP ran: measured at -O0 they cost 28 instructions and
+ * a 176-byte frame, i.e. the intrinsic was slower than the scalar code it was
+ * supposed to replace.  The frontend builtins lower straight to the move. */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_loadu_si256(__m256i_u const *__p)
 {
-    __m256i __r;
-    __builtin_memcpy(&__r, __p, sizeof(__r));
-    return __r;
+    return __builtin_ia32_loaddqu256(__p);
+}
+
+/* Aligned forms.  These use the same move as the unaligned ones, which is not
+ * a shortcut but the encoding this backend already uses for every vector
+ * dereference: `_mm_load_ps` (a plain `*(const __m128 *)p`) lowers to `movups`
+ * here, so emitting `vmovaps` for the 256-bit form would make the two widths
+ * disagree.  A dereference does NOT work for the 32-byte object either: the
+ * backend treats it as an aggregate copy and round-trips the value through a
+ * stack temporary (measured: 26 instructions for a load+store pair, versus 2
+ * for the builtin).  `vmovups` from aligned storage costs exactly what
+ * `vmovaps` does on every CPU that has AVX. */
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_load_ps(float const *__p)
+{
+    return __builtin_ia32_loadups256(__p);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_store_ps(float *__p, __m256 __a)
+{
+    __builtin_ia32_storeups256(__p, __a);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_load_pd(double const *__p)
+{
+    return __builtin_ia32_loadupd256(__p);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_store_pd(double *__p, __m256d __a)
+{
+    __builtin_ia32_storeupd256(__p, __a);
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
@@ -27,7 +63,7 @@ _mm256_load_si256(__m256i const *__p)
 static __inline__ void __attribute__((__always_inline__))
 _mm256_storeu_si256(__m256i_u *__p, __m256i __a)
 {
-    __builtin_memcpy(__p, &__a, sizeof(__a));
+    __builtin_ia32_storedqu256(__p, __a);
 }
 
 static __inline__ void __attribute__((__always_inline__))
@@ -39,42 +75,32 @@ _mm256_store_si256(__m256i *__p, __m256i __a)
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_lddqu_si256(__m256i_u const *__p)
 {
-    __m256i __r;
-    __builtin_memcpy(&__r, __p, sizeof(__r));
-    return __r;
+    return __builtin_ia32_loaddqu256(__p);
 }
 
 /* Float load/store */
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_loadu_ps(float const *__p)
 {
-    __m256 __r;
-    for (int __i = 0; __i < 8; __i++)
-        __r[__i] = __p[__i];
-    return __r;
+    return __builtin_ia32_loadups256(__p);
 }
 
 static __inline__ void __attribute__((__always_inline__))
 _mm256_storeu_ps(float *__p, __m256 __a)
 {
-    for (int __i = 0; __i < 8; __i++)
-        __p[__i] = __a[__i];
+    __builtin_ia32_storeups256(__p, __a);
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_loadu_pd(double const *__p)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r[__i] = __p[__i];
-    return __r;
+    return __builtin_ia32_loadupd256(__p);
 }
 
 static __inline__ void __attribute__((__always_inline__))
 _mm256_storeu_pd(double *__p, __m256d __a)
 {
-    for (int __i = 0; __i < 4; __i++)
-        __p[__i] = __a[__i];
+    __builtin_ia32_storeupd256(__p, __a);
 }
 
 /* === Set === */
@@ -161,64 +187,52 @@ _mm256_castsi128_si256(__m128i __a)
 
 /* Extract 128-bit lane from __m256 (imm must be 0 or 1) */
 
-/* === Float Arithmetic === */
+/* === Float Arithmetic ===
+ *
+ * Each of these is one `vaddps`/`vsubps`/`vmulps` (or the `pd` spelling) and
+ * is expressed as the corresponding builtin, not as an element-wise loop.
+ * A loop body relies on the SLP vectorizer recognising the lane pattern: it
+ * does so in a plain expression, but not through a bit-level `union`
+ * (measured on the bitwise forms) and not at all at -O1, where the loop
+ * became eight scalar `vaddss`.  GCC and Clang lower these to the builtin
+ * unconditionally, and so does lccc now.
+ */
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_add_ps(__m256 __a, __m256 __b)
 {
-    __m256 __r;
-    for (int __i = 0; __i < 8; __i++)
-        __r[__i] = __a[__i] + __b[__i];
-    return __r;
+    return (__m256)__builtin_ia32_addps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_sub_ps(__m256 __a, __m256 __b)
 {
-    __m256 __r;
-    for (int __i = 0; __i < 8; __i++)
-        __r[__i] = __a[__i] - __b[__i];
-    return __r;
+    return (__m256)__builtin_ia32_subps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_mul_ps(__m256 __a, __m256 __b)
 {
-    __m256 __r;
-    for (int __i = 0; __i < 8; __i++)
-        __r[__i] = __a[__i] * __b[__i];
-    return __r;
+    return (__m256)__builtin_ia32_mulps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_add_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r[__i] = __a[__i] + __b[__i];
-    return __r;
+    return (__m256d)__builtin_ia32_addpd256((__v4df)(__a), (__v4df)(__b));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_sub_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r[__i] = __a[__i] - __b[__i];
-    return __r;
+    return (__m256d)__builtin_ia32_subpd256((__v4df)(__a), (__v4df)(__b));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_mul_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r[__i] = __a[__i] * __b[__i];
-    return __r;
+    return (__m256d)__builtin_ia32_mulpd256((__v4df)(__a), (__v4df)(__b));
 }
-
-/* === Double Arithmetic (continued) === */
-
 
 /* === Set (broadcast) === */
 
@@ -309,58 +323,75 @@ _mm256_hsub_pd(__m256d __a, __m256d __b)
 
 
 
-/* === Bitwise operations (pd) === */
+/* === Bitwise operations ===
+ *
+ * Bitwise AND/OR/XOR are lane-agnostic: the integer families are single
+ * `vpand`/`vpor`/`vpxor` instructions and the float forms are the same
+ * instruction on the same register, so each of these is a reinterpretation of
+ * the integer form rather than an element-wise loop.  The previous
+ * element-wise `union`/`for` bodies lowered to a per-lane GPR round trip
+ * (`vmovsd`/`vmovq`/`xor`/`vmovsd` x 4 with a stack temporary) because the
+ * bit-fiddle is opaque to the SLP vectorizer -- measured on
+ * `tests/regression/simd_avx256_float_bitwise.c`.  `andnot` comes straight
+ * from the frontend's `vpandn` builtin and must NOT be redefined here: the
+ * inline definition would shadow it and reintroduce the loop.
+ */
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_and_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __ua, __ub, __ur;
-        __ua.d = __a[__i]; __ub.d = __b[__i];
-        __ur.ll = __ua.ll & __ub.ll;
-        __r[__i] = __ur.d;
-    }
-    return __r;
+    return _mm256_castsi256_pd(
+        _mm256_and_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_or_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __ua, __ub, __ur;
-        __ua.d = __a[__i]; __ub.d = __b[__i];
-        __ur.ll = __ua.ll | __ub.ll;
-        __r[__i] = __ur.d;
-    }
-    return __r;
+    return _mm256_castsi256_pd(
+        _mm256_or_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_xor_pd(__m256d __a, __m256d __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __ua, __ub, __ur;
-        __ua.d = __a[__i]; __ub.d = __b[__i];
-        __ur.ll = __ua.ll ^ __ub.ll;
-        __r[__i] = __ur.d;
-    }
-    return __r;
+    return _mm256_castsi256_pd(
+        _mm256_xor_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
 }
 
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_andnot_pd(__m256d __a, __m256d __b)
+/* The `andnot` forms are declared here as macros over the frontend builtin.
+ * They are the only operation in this family with no `__lccc_simd256_*`
+ * helper, and an inline function would shadow the builtin (the first attempt
+ * did exactly that and lowered to per-lane GPR work).  Without any declaration
+ * the names worked only because sema happens to map them, which left the
+ * public inventory reporting them missing -- see
+ * engineering/isa/sse-avx-public-api.json. */
+#define _mm256_andnot_ps(__a, __b) \
+    (__m256)__builtin_ia32_andnotsi256(_mm256_castps_si256(__a), \
+                                    _mm256_castps_si256(__b))
+
+#define _mm256_andnot_pd(__a, __b) \
+    (__m256d)__builtin_ia32_andnotsi256(_mm256_castpd_si256(__a), \
+                                     _mm256_castpd_si256(__b))
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_and_ps(__m256 __a, __m256 __b)
 {
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __ua, __ub, __ur;
-        __ua.d = __a[__i]; __ub.d = __b[__i];
-        __ur.ll = (~__ua.ll) & __ub.ll;
-        __r[__i] = __ur.d;
-    }
-    return __r;
+    return _mm256_castsi256_ps(
+        _mm256_and_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_or_ps(__m256 __a, __m256 __b)
+{
+    return _mm256_castsi256_ps(
+        _mm256_or_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_xor_ps(__m256 __a, __m256 __b)
+{
+    return _mm256_castsi256_ps(
+        _mm256_xor_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
 }
 
 /* === Movemask === */

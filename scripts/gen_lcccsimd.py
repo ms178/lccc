@@ -309,6 +309,33 @@ FP128_BLENDV = [
 FP128_FMA = [
     ("fmadd_ps", "fmadd132ps128", "__m128", "M128"),
     ("fmadd_pd", "fmadd132pd128", "__m128d", "M128D"),
+    # The rest of the FMA3 family.  Each is ONE instruction that rounds the
+    # product once, after the addend is applied; a lane loop over `a*b +- c`
+    # rounds twice and only agreed with the reference compilers while
+    # -ffp-contract=fast contracted it back into the single instruction.
+    ("fmsub_ps", "fmsub132ps128", "__m128", "M128"),
+    ("fnmadd_ps", "fnmadd132ps128", "__m128", "M128"),
+    ("fnmsub_ps", "fnmsub132ps128", "__m128", "M128"),
+    ("fmaddsub_ps", "fmaddsub132ps128", "__m128", "M128"),
+    ("fmsubadd_ps", "fmsubadd132ps128", "__m128", "M128"),
+    ("fmsub_pd", "fmsub132pd128", "__m128d", "M128D"),
+    ("fnmadd_pd", "fnmadd132pd128", "__m128d", "M128D"),
+    ("fnmsub_pd", "fnmsub132pd128", "__m128d", "M128D"),
+    ("fmaddsub_pd", "fmaddsub132pd128", "__m128d", "M128D"),
+    ("fmsubadd_pd", "fmsubadd132pd128", "__m128d", "M128D"),
+]
+
+# Scalar FMA3: lane 0 is fused, the upper lanes of `a` pass through, which is
+# exactly the 132 placement of the ss/sd encodings.
+FP128_FMA_SCALAR = [
+    ("fmadd_ss", "fmadd132ss128", "__m128", "M128"),
+    ("fmsub_ss", "fmsub132ss128", "__m128", "M128"),
+    ("fnmadd_ss", "fnmadd132ss128", "__m128", "M128"),
+    ("fnmsub_ss", "fnmsub132ss128", "__m128", "M128"),
+    ("fmadd_sd", "fmadd132sd128", "__m128d", "M128D"),
+    ("fmsub_sd", "fmsub132sd128", "__m128d", "M128D"),
+    ("fnmadd_sd", "fnmadd132sd128", "__m128d", "M128D"),
+    ("fnmsub_sd", "fnmsub132sd128", "__m128d", "M128D"),
 ]
 FP128_MOV = [
     ("move_ss", "movss128", "__m128", "M128"),
@@ -376,6 +403,16 @@ FP256_BLENDV = [
 FP256_FMA = [
     ("fmadd_ps", "vfmadd132ps256", "__m256", "M256"),
     ("fmadd_pd", "vfmadd132pd256", "__m256d", "M256D"),
+    ("fmsub_ps", "vfmsub132ps256", "__m256", "M256"),
+    ("fnmadd_ps", "vfnmadd132ps256", "__m256", "M256"),
+    ("fnmsub_ps", "vfnmsub132ps256", "__m256", "M256"),
+    ("fmaddsub_ps", "vfmaddsub132ps256", "__m256", "M256"),
+    ("fmsubadd_ps", "vfmsubadd132ps256", "__m256", "M256"),
+    ("fmsub_pd", "vfmsub132pd256", "__m256d", "M256D"),
+    ("fnmadd_pd", "vfnmadd132pd256", "__m256d", "M256D"),
+    ("fnmsub_pd", "vfnmsub132pd256", "__m256d", "M256D"),
+    ("fmaddsub_pd", "vfmaddsub132pd256", "__m256d", "M256D"),
+    ("fmsubadd_pd", "vfmsubadd132pd256", "__m256d", "M256D"),
 ]
 FP256_MISC = [
     ("permute2f128_ps", "vperm2f128", "__m256", "M256"),
@@ -756,6 +793,10 @@ for name, mn, rty, m in FP128_BLENDV:
     wrap(f"{rty} _mm_{name}({rty} __a, {rty} __b, {rty} __mask)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __mask, __a, __b)); }}")
 for name, mn, rty, m in FP128_FMA:
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b", rty + " __c"])
+    macro(f"_mm_{name}(__a, __b, __c)",
+          f"__CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b, __c))")
+for name, mn, rty, m in FP128_FMA_SCALAR:
     proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b", rty + " __c"])
     macro(f"_mm_{name}(__a, __b, __c)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b, __c))")

@@ -755,14 +755,35 @@ pub(crate) enum FmaRoleOrder {
 /// `expr_builtins_lcccsimd`), so the operation field always starts right after
 /// `fmadd`.
 pub(crate) fn fma_role_digits(mnemonic: &str) -> &str {
-    let after = match mnemonic.find("fmadd") {
-        Some(i) => &mnemonic[i + "fmadd".len()..],
-        None => mnemonic,
-    };
-    let end = after
+    // The stem is part of the contract, not an implementation detail: the
+    // digits only start after the WHOLE mnemonic stem.  Matching just `fmadd`
+    // worked while `fmadd` was the only family; `vfmsub132ps` then had no
+    // match at all and `vfmaddsub213ps` left `sub213ps`, whose first character
+    // is not a digit, so both decoded to `""` and fell through to the 132
+    // default.  For `sub`-family 213/231 spellings that default is the WRONG
+    // placement, i.e. exactly the silent mis-computation the per-digit
+    // placement exists to prevent.  Longest stem first: `fmaddsub` must win
+    // over `fmadd`.
+    let mut rest = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+    for stem in [
+        "fnmaddsub",
+        "fnmsubadd",
+        "fmaddsub",
+        "fmsubadd",
+        "fnmadd",
+        "fnmsub",
+        "fmadd",
+        "fmsub",
+    ] {
+        if let Some(tail) = rest.strip_prefix(stem) {
+            rest = tail;
+            break;
+        }
+    }
+    let end = rest
         .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(after.len());
-    &after[..end]
+        .unwrap_or(rest.len());
+    &rest[..end]
 }
 
 /// Map a `vfmadd{digits}{ps,pd}[v]{width}` mnemonic onto its role order.
@@ -809,6 +830,20 @@ mod fma_role_tests {
             ("vfmadd231pd256", FmaRoleOrder::RmBVvvvADstC),
             ("vfmadd213pd512", FmaRoleOrder::RmCVvvvADstB),
             ("vfmadd231ps512", FmaRoleOrder::RmBVvvvADstC),
+            // Every other stem the headers emit, in all three widths: the
+            // digits start after the WHOLE stem, so the `fmsub`/`fnmadd`/
+            // `fmaddsub` forms must decode their own placement instead of
+            // falling back to 132 (which is only correct for the 132 spelling).
+            ("vfmsub132ps", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfnmadd213ps", FmaRoleOrder::RmCVvvvADstB),
+            ("vfnmsub231pd", FmaRoleOrder::RmBVvvvADstC),
+            ("vfmaddsub213ps", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmsubadd231pd", FmaRoleOrder::RmBVvvvADstC),
+            ("fmaddsub132ps128", FmaRoleOrder::RmBVvvvCDstA),
+            ("fnmadd231ps128", FmaRoleOrder::RmBVvvvADstC),
+            ("fmsub132sd128", FmaRoleOrder::RmBVvvvCDstA),
+            ("vfnmadd213pd256", FmaRoleOrder::RmCVvvvADstB),
+            ("vfmaddsub231ps512", FmaRoleOrder::RmBVvvvADstC),
             // The `...v{width}` shape the 256-bit dispatch used to present.
             ("vfmadd213pdv256", FmaRoleOrder::RmCVvvvADstB),
             ("vfmadd231psv512", FmaRoleOrder::RmBVvvvADstC),
@@ -832,10 +867,18 @@ mod fma_role_tests {
         assert_eq!(fma_role_digits("vfmadd213ps128"), "213");
         assert_eq!(fma_role_digits("vfmadd231pd512"), "231");
         assert_eq!(fma_role_digits("vfmadd213pdv256"), "213");
-        // No `fmadd` at all: the whole string is scanned, and a leading
-        // non-digit means an empty field rather than a panic.
-        assert_eq!(fma_role_digits("vfmsub132ps"), "");
+        // Every stem the headers emit, not just `fmadd`: a `sub`-family name
+        // used to yield an empty field (and therefore the 132 default) for ALL
+        // of its spellings.
+        assert_eq!(fma_role_digits("vfmsub132ps"), "132");
+        assert_eq!(fma_role_digits("vfnmadd231pd256"), "231");
+        assert_eq!(fma_role_digits("vfmaddsub213ps"), "213");
+        assert_eq!(fma_role_digits("vfmsubadd132ps512"), "132");
+        assert_eq!(fma_role_digits("fmsub132ss128"), "132");
+        // A name with no stem and no digits still yields an empty field rather
+        // than a panic, which keeps the 132 default.
         assert_eq!(fma_role_digits(""), "");
+        assert_eq!(fma_role_digits("vxorps256"), "");
     }
 
     /// The table is only worth anything if the three placements really compute

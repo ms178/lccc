@@ -85,14 +85,22 @@ if re.search(rf"paddd {stack}", sse):
 if not re.search(r"pxor %xmm([2-9]|1[0-5]), %xmm\1", sse):
     raise SystemExit("SSE2: zero producer did not initialize an assigned XMM home directly")
 
-# I64 sums and software-lane dots use a two-lane 128-bit class (VEX forms
-# at x86-64-v3, hence the optional `v` and the in-place spelling).
-if not re.search(r"vpaddq .*, %(xmm(?:[2-9]|1[0-5])), %\1", i64):
-    raise SystemExit("I64: accumulator is not updated in an XMM home")
+# I64 sums accumulate FOUR lanes per iteration at x86-64-v3
+# (`vpaddq (%rdi,%r9), %ymm2, %ymm2`, 32 bytes per step).  The gate used to
+# demand a two-lane XMM home, which the 4-wide lowering deliberately replaced:
+# measured 1.40x -> 1.32x against gcc-16 on `unsigned_reduction`.  What must
+# hold is the property the gate exists for -- an in-place update in an assigned
+# SIMD home, never a stack slot -- so both widths are accepted for the general
+# contract and the 256-bit form is required on this AVX2 target, where the
+# narrower one would be a regression rather than a variant.
+if not re.search(r"vpaddq .*, %(ymm(?:[2-9]|1[0-5])), %\1", i64):
+    raise SystemExit("I64: accumulator is not updated in-place in a 256-bit home")
+if not re.search(r"vpaddq .*, %(xmm(?:[2-9]|1[0-5])|ymm(?:[2-9]|1[0-5])), %\1", i64):
+    raise SystemExit("I64: accumulator is not updated in an assigned SIMD home")
 if re.search(rf"v?paddq {stack}", i64):
     raise SystemExit("I64: packed accumulator still reads a stack home")
-if not re.search(r"pxor %xmm([2-9]|1[0-5]), %xmm\1", i64):
-    raise SystemExit("I64: zero producer did not initialize an assigned XMM home directly")
+if not re.search(r"v?pxor %(xmm|ymm)([2-9]|1[0-5]), %\1\2, %\1\2|pxor %xmm([2-9]|1[0-5]), %xmm\3", i64):
+    raise SystemExit("I64: zero producer did not initialize an assigned SIMD home directly")
 
 # I64 (and widening I32->I64) DOTS stay scalar, on cost: no SSE2/AVX2
 # instruction produces a 64x64 low-half product (`vpmullq` is AVX-512DQ), so the

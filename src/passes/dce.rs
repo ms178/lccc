@@ -1549,6 +1549,81 @@ mod tests {
         assert!(func.blocks[0].instructions.is_empty());
     }
 
+    /// The constant-materialisation family is pure: a splat or zero whose
+    /// result nobody reads must not root itself (and its operand chain) in
+    /// DCE.  A dead register-class vector result has no home for the emitter
+    /// to materialise, so surviving one is an ICE, not just wasted work --
+    /// `_mm_and_si128(v, _mm_setzero_si128())` folds to a constant and leaves
+    /// exactly this shape behind.
+    #[test]
+    fn dead_constant_splats_are_removed() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        for op in [
+            O::Setzero128,
+            O::Setzero256,
+            O::SetEpi8,
+            O::SetEpi16,
+            O::SetEpi32,
+            O::SetEpi8_256,
+            O::SetEpi16_256,
+            O::SetEpi32_256,
+            O::SetEpi64x256,
+            O::SetEpi8_512,
+            O::SetEpi16_512,
+            O::SetEpi32_512,
+            O::SetEpi64x512,
+            O::SetzeroPs128,
+        ] {
+            assert!(op.is_pure(), "{op:?} must be pure");
+            let mut func = IrFunction::new("splat".to_string(), IrType::Void, vec![], false);
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![Instruction::Intrinsic {
+                    dest: Some(Value(10)),
+                    op,
+                    dest_ptr: None,
+                    args: vec![Operand::Const(IrConst::I64(1))],
+                }],
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            });
+            assert_eq!(eliminate_dead_code(&mut func), 1, "{op:?}");
+            assert!(func.blocks[0].instructions.is_empty(), "{op:?}");
+        }
+    }
+
+    /// A splat that still writes a stack home is a store: purity must not let
+    /// DCE drop the write.
+    #[test]
+    fn splat_with_a_home_is_kept() {
+        let mut func = IrFunction::new("splat_home".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 16,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Intrinsic {
+                    dest: Some(Value(10)),
+                    op: crate::ir::intrinsics::IntrinsicOp::Setzero128,
+                    dest_ptr: Some(Value(1)),
+                    args: vec![],
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        });
+        assert_eq!(eliminate_dead_code(&mut func), 0);
+        assert_eq!(func.blocks[0].instructions.len(), 2);
+    }
+
     #[test]
     fn vector_store_intrinsics_are_never_removed_by_purity() {
         // The mirror image: a store-shaped vector intrinsic must survive DCE
