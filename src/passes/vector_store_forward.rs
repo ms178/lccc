@@ -18,10 +18,13 @@
 //!   vmovdqu  %ymm0, (%rdi)            ; the store the source asked for
 //! ```
 //!
-//! The temporary is written once by a whole-vector `VecStore` and read once,
-//! by the store that follows it.  Both ends are whole-register copies of the
-//! same 16 or 32 bytes, so the temporary and its two accesses can be deleted:
-//! the producer's value goes straight to the final destination.
+//! The temporary is written once by a whole-vector `VecStore` and read *only*
+//! by whole-vector address-form stores of the same width -- one of them, or
+//! several.  Every read is a whole-register copy of the same 16 or 32 bytes,
+//! so the temporary and its accesses can all be deleted: the producer's
+//! register value goes straight to every final destination.  The multi-reader
+//! form is what `__m128i v = f(); _mm_storeu_si128(q, v); _mm_storeu_si128(r,
+//! v);` lowers to, and it is the common shape in copy/checksum kernels.
 //!
 //! This is not a peephole for one spelling.  It is the general case of the
 //! value-to-store path: every packed op family, every load fold and every
@@ -41,15 +44,20 @@
 //! The rewrite is a memory-effect change, so every condition below is a
 //! correctness condition, not a profitability heuristic:
 //!
-//! * the temporary's address is used **exactly three times in the whole
-//!   function** -- twice by the `VecStore` (`dest_ptr` and the address
-//!   operand) and once by the consuming store's source operand.  Any fourth
-//!   use (an escaping pointer, a scalar read, a `Memcpy`, a call argument)
-//!   means the bytes are observable somewhere other than this store, and the
-//!   shape is refused.  Counting over the FUNCTION, not the block, is what
-//!   makes that a proof rather than a hope.
-//! * the two instructions are adjacent in one block, with the store second,
-//!   so no instruction can read the temporary in between.
+//! * **every** use of the temporary's address in the whole function is
+//!   accounted for: the writing `VecStore`'s two operands (`dest_ptr` and the
+//!   address) plus exactly one source operand per reader, and each reader is
+//!   an address-form store of the same width reading the temporary's base.
+//!   Any other use -- an escaping pointer, a scalar read, a `Memcpy`, a call
+//!   argument, a second `VecStore` -- means the bytes are observable
+//!   somewhere the rewrite cannot see, and the shape is refused.  Counting
+//!   over the FUNCTION, not the block, is what makes that a proof rather
+//!   than a hope, and it is why the readers may live in other blocks.
+//! * the producing value dominates every reader (and, inside the producing
+//!   block, precedes it).  Substituting a register for a memory read is only
+//!   legal where the definition is available; the dominator tree decides that
+//!   in O(1) per query, and an unreachable reader is refused rather than
+//!   rewritten.
 //! * the temporary is a non-volatile `Alloca` of exactly the store's width,
 //!   so the two accesses cover the same bytes with no overrun.
 //! * both ops are the unaligned whole-register families: the `VecStore*`
@@ -99,110 +107,192 @@ fn canonical_store_op(width: usize) -> Option<IntrinsicOp> {
     })
 }
 
-/// Forward every matching temporary store in one function; returns the number
-/// of rewrites performed.
-fn forward_in_function(func: &mut IrFunction) -> usize {
+/// One planned rewrite: a whole-vector temporary store whose every reader is
+/// an address-form store of the same width.
+struct ForwardPlan {
+    store_block: usize,
+    store_idx: usize,
+    value: u32,
+    /// `(block, index)` of each reader, in program order.
+    readers: Vec<(usize, usize)>,
+    width: usize,
+}
+
+/// Collect the forwarding plans for one function, read-only.
+///
+/// A plan is admitted only when the temporary's *entire* use set in the
+/// function is: the writing `VecStore`'s two address operands plus one source
+/// operand per reader. That is the aliasing proof -- a temporary nobody can
+/// name cannot be written or read behind the rewrite's back.
+fn plan_function(func: &IrFunction) -> Vec<ForwardPlan> {
     let info = UseDefInfo::build(func);
-    // (block, vecstore index, consuming store index) triples, resolved read-only
-    // before anything is mutated so the use-def indices stay valid.
-    let mut hits: Vec<(usize, usize, usize, Operand, u32, usize)> = Vec::new();
+    let dominators = crate::ir::analysis::CfgAnalysis::build(func);
+    let dom = crate::ir::analysis::DominanceChecker::new(dominators.num_blocks, &dominators.idom);
+    let mut plans = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
-        for ii in 0..block.instructions.len().saturating_sub(1) {
-            let (
-                Instruction::Intrinsic {
-                    dest: None,
-                    op: store_op,
-                    dest_ptr: Some(temp),
-                    args: store_args,
-                },
-                Instruction::Intrinsic {
-                    dest: None,
-                    op: consumer_op,
-                    dest_ptr: Some(consumer_dest),
-                    args: consumer_args,
-                },
-            ) = (&block.instructions[ii], &block.instructions[ii + 1])
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Intrinsic {
+                dest: None,
+                op: store_op,
+                dest_ptr: Some(temp),
+                args: store_args,
+            } = inst
             else {
                 continue;
             };
             let Some(width) = whole_vector_store_width(*store_op) else {
                 continue;
             };
-            let [Operand::Value(value), operand_t, disp_t] = store_args.as_slice() else {
+            let [
+                Operand::Value(value),
+                Operand::Value(addr),
+                Operand::Const(IrConst::I64(0)),
+            ] = store_args.as_slice()
+            else {
                 continue;
             };
-            if address_form_store_width(*consumer_op) != Some(width) {
+            // The store must write the base of the temporary itself.
+            if addr != temp {
                 continue;
             }
-            // The temporary store must be an UNALIGNED whole-register store of
-            // the base of `temp`, and the consumer must read that same base.
-            if !matches!(operand_t, Operand::Value(v) if v == temp)
-                || !matches!(disp_t, Operand::Const(IrConst::I64(0)))
-            {
-                continue;
-            }
-            let [Operand::Value(read_base)] = consumer_args.as_slice() else {
-                continue;
-            };
-            if read_base != temp || consumer_dest == temp {
-                continue;
-            }
-            // Exactly three uses, in exactly these two instructions.
-            if info.use_count.get(temp.0 as usize).copied() != Some(3) {
-                continue;
-            }
-            // `use_insts_of` collapses repeated reads inside ONE instruction,
-            // so the count of 3 (checked above) is two sites here: the
-            // temporary store reads its address twice, the consumer once.
-            let want_store = crate::passes::use_def::UseLoc::instruction(bi as u32, ii as u32);
-            let want_consumer =
-                crate::passes::use_def::UseLoc::instruction(bi as u32, (ii + 1) as u32);
-            let mut sites = info.use_insts_of(temp.0);
-            if sites.next() != Some(want_store)
-                || sites.next() != Some(want_consumer)
-                || sites.next().is_some()
-            {
-                continue;
-            }
-            // The temporary must be a plain alloca of exactly this width.
+            // The temporary must be a plain alloca of exactly this width: the
+            // two accesses then cover the same bytes with no overrun, and the
+            // object has no address-taken identity the rewrite could expose.
             let is_temp_alloca = func.blocks.iter().any(|b| {
                 b.instructions.iter().any(|inst| {
                     matches!(
                         inst,
-                        Instruction::Alloca { dest, size, volatile: false, .. }
-                            if dest.0 == temp.0 && *size == width
+                        Instruction::Alloca { dest, size, align, volatile: false,
+                                              semantic_volatile: false, .. }
+                            if dest.0 == temp.0 && *size == width && *align <= 64
                     )
                 })
             });
             if !is_temp_alloca {
                 continue;
             }
-            hits.push((bi, ii, ii + 1, Operand::Value(*value), temp.0, width));
+            // Every other use of the temporary must be a whole-vector read by
+            // an address-form store of the same width. `use_insts_of` collapses
+            // the two mentions inside the writing store into one site, so the
+            // expected site count is exactly `1 + readers`.
+            let mut readers: Vec<(usize, usize)> = Vec::new();
+            let mut well_formed = true;
+            for loc in info.use_insts_of(temp.0) {
+                if loc.inst_idx == crate::passes::use_def::UseLoc::TERMINATOR {
+                    well_formed = false;
+                    break;
+                }
+                let (rbi, rii) = (loc.block_idx as usize, loc.inst_idx as usize);
+                if rbi == bi && rii == ii {
+                    continue;
+                }
+                let Some(r_inst) = func.blocks.get(rbi).and_then(|b| b.instructions.get(rii))
+                else {
+                    well_formed = false;
+                    break;
+                };
+                let Instruction::Intrinsic {
+                    dest: None,
+                    op: reader_op,
+                    dest_ptr: Some(reader_dest),
+                    args: reader_args,
+                } = r_inst
+                else {
+                    well_formed = false;
+                    break;
+                };
+                if address_form_store_width(*reader_op) != Some(width)
+                    || !matches!(reader_args.as_slice(), [Operand::Value(base)] if base == temp)
+                    || reader_dest == temp
+                {
+                    well_formed = false;
+                    break;
+                }
+                // The forwarded value must dominate the reader: a register
+                // definition cannot be used before it executes. Same-block
+                // readers additionally have to come after the store.
+                if !dom.dominates(bi, rbi) || (rbi == bi && rii < ii) {
+                    well_formed = false;
+                    break;
+                }
+                readers.push((rbi, rii));
+            }
+            if !well_formed || readers.is_empty() {
+                continue;
+            }
+            readers.sort_unstable();
+            plans.push(ForwardPlan {
+                store_block: bi,
+                store_idx: ii,
+                value: value.0,
+                readers,
+                width,
+            });
         }
     }
+    plans
+}
+
+/// Forward every matching temporary store in one function; returns the number
+/// of rewrites performed.
+///
+/// # Index discipline
+///
+/// Every plan is computed against the pre-transform IR, so the rewrite runs in
+/// two phases: first every reader is re-pointed **in place** (a same-index
+/// write, which cannot invalidate another plan's indices), and only then are
+/// the retired stores deleted, all of a block's deletions in one
+/// `remove_instructions` call.  Deleting a store between two plans would shift
+/// the later plan's reader index by one and silently rewrite the wrong
+/// instruction -- a value miscompile, and the reason the original single-reader
+/// form was restricted to an adjacent pair.  Measured on
+/// `tests/regression/simd_crc_adler.c`, where the adler kernel has two
+/// independent staged pairs in one block: the buggy order stored the LOW
+/// unpack where the HIGH one belonged and the checksum diverged at size 16.
+fn forward_in_function(func: &mut IrFunction) -> usize {
+    let plans = plan_function(func);
+    if plans.is_empty() {
+        return 0;
+    }
+    // Phase 1: rewrite readers.  Same-index writes only.
     let mut rewrites = 0usize;
-    for (bi, vecstore_idx, consumer_idx, value, _temp, width) in hits {
-        let Some(op) = canonical_store_op(width) else {
+    let mut retired: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for plan in &plans {
+        let Some(op) = canonical_store_op(plan.width) else {
             continue;
         };
-        let block = &mut func.blocks[bi];
-        let Instruction::Intrinsic {
-            dest_ptr: Some(dest),
-            ..
-        } = &block.instructions[consumer_idx]
-        else {
-            continue;
-        };
-        let dest = *dest;
-        block.instructions[consumer_idx] = Instruction::Intrinsic {
-            dest: None,
-            op,
-            dest_ptr: Some(dest),
-            args: vec![value, Operand::Value(dest), Operand::Const(IrConst::I64(0))],
-        };
-        let mut removed = vec![vecstore_idx];
-        remove_instructions(block, &mut removed);
+        let value = Operand::Value(crate::ir::reexports::Value(plan.value));
+        for &(rbi, rii) in &plan.readers {
+            let Some(block) = func.blocks.get_mut(rbi) else {
+                continue;
+            };
+            let Some(Instruction::Intrinsic {
+                dest_ptr: Some(dest),
+                ..
+            }) = block.instructions.get(rii)
+            else {
+                continue;
+            };
+            let dest = *dest;
+            block.instructions[rii] = Instruction::Intrinsic {
+                dest: None,
+                op,
+                dest_ptr: Some(dest),
+                args: vec![value, Operand::Value(dest), Operand::Const(IrConst::I64(0))],
+            };
+        }
+        retired
+            .entry(plan.store_block)
+            .or_default()
+            .push(plan.store_idx);
         rewrites += 1;
+    }
+    // Phase 2: retire the stores.  `remove_instructions` sorts and
+    // de-duplicates, so the per-block lists can arrive in any order.
+    for (block_idx, mut removed) in retired {
+        if let Some(block) = func.blocks.get_mut(block_idx) {
+            remove_instructions(block, &mut removed);
+        }
     }
     rewrites
 }
@@ -213,6 +303,11 @@ fn forward_in_function(func: &mut IrFunction) -> usize {
 pub(crate) fn forward_vector_temp_stores(module: &mut IrModule) -> usize {
     module.for_each_function(forward_in_function)
 }
+
+/// Executed differential tests (byte-accurate IR model) for the pass's proof.
+#[cfg(test)]
+#[path = "vector_store_forward_interp_tests.rs"]
+mod interp_tests;
 
 #[cfg(test)]
 mod tests {
@@ -314,18 +409,138 @@ mod tests {
         );
     }
 
-    /// A temporary with TWO readers keeps its store: forwarding would leave the
-    /// second reader with no value to read.
+    /// Two readers are two whole-vector reads of the same bytes: the register
+    /// value reaches both and the staging store disappears.  This is the shape
+    /// `__m128i v = ...; _mm_storeu_si128(q, v); _mm_storeu_si128(r, v);`
+    /// lowers to (9 instructions before this generalization, 4 after -- GCC's
+    /// count).
     #[test]
-    fn two_readers_are_refused() {
+    fn two_readers_are_forwarded() {
         let mut func = function(vec![
             alloca(20, 32),
             vec_store(IntrinsicOp::VecStoreF32x8, 11, 20),
             point_store(IntrinsicOp::StoreuPs256, 20, 3),
             point_store(IntrinsicOp::StoreuPs256, 20, 4),
         ]);
+        assert_eq!(forward_in_function(&mut func), 1);
+        let instructions = &func.blocks[0].instructions;
+        assert_eq!(instructions.len(), 3, "{instructions:?}");
+        assert_eq!(
+            stores_value_at(&instructions[1]),
+            Some((IntrinsicOp::VecStoreI64x4, 11, 3))
+        );
+        assert_eq!(
+            stores_value_at(&instructions[2]),
+            Some((IntrinsicOp::VecStoreI64x4, 11, 4))
+        );
+    }
+
+    /// Three readers, in three different blocks, all of which the producing
+    /// value dominates: still one staging store, zero reloads.  Dominance is
+    /// what makes the register substitution legal, so a fan-out across a
+    /// diamond has to work.
+    #[test]
+    fn three_readers_across_blocks_are_forwarded() {
+        let mut func = function(vec![
+            alloca(20, 16),
+            vec_store(IntrinsicOp::VecStoreI64x2, 11, 20),
+            point_store(IntrinsicOp::Storedqu, 20, 3),
+        ]);
+        let mut second = crate::ir::reexports::BasicBlock {
+            label: crate::ir::reexports::BlockId(1),
+            source_spans: vec![Span::dummy(); 2],
+            source_inline_ids: Vec::new(),
+            instructions: vec![
+                point_store(IntrinsicOp::Storedqu, 20, 4),
+                point_store(IntrinsicOp::Storedqu, 20, 5),
+            ],
+            terminator: Terminator::Return(None),
+        };
+        second.source_spans.truncate(second.instructions.len());
+        func.blocks[0].terminator = Terminator::Branch(crate::ir::reexports::BlockId(1));
+        func.blocks.push(second);
+        assert_eq!(forward_in_function(&mut func), 1);
+        assert_eq!(func.blocks[0].instructions.len(), 2);
+        assert_eq!(func.blocks[1].instructions.len(), 2);
+        assert_eq!(
+            stores_value_at(&func.blocks[1].instructions[0]),
+            Some((IntrinsicOp::VecStoreI64x2, 11, 4))
+        );
+    }
+
+    /// A reader whose block the producing value does NOT dominate cannot use
+    /// the register: the substitution would reference a value before its
+    /// definition.  The plan must be refused whole.
+    #[test]
+    fn non_dominated_reader_is_refused() {
+        let mut func = function(vec![
+            alloca(20, 16),
+            point_store(IntrinsicOp::Storedqu, 20, 3),
+        ]);
+        func.blocks[0].terminator = Terminator::Branch(crate::ir::reexports::BlockId(1));
+        let mut second = crate::ir::reexports::BasicBlock {
+            label: crate::ir::reexports::BlockId(1),
+            source_spans: vec![Span::dummy(); 2],
+            source_inline_ids: Vec::new(),
+            instructions: vec![
+                vec_store(IntrinsicOp::VecStoreI64x2, 11, 20),
+                point_store(IntrinsicOp::Storedqu, 20, 4),
+            ],
+            terminator: Terminator::Return(None),
+        };
+        second.source_spans.truncate(second.instructions.len());
+        func.blocks.push(second);
+        assert_eq!(forward_in_function(&mut func), 0);
+    }
+
+    /// Any use that is not an address-form store of the same width makes the
+    /// temporary observable, so the whole plan is refused -- here a scalar
+    /// pointer load of the temporary would let the bytes escape.
+    #[test]
+    fn escaping_use_refuses_every_reader() {
+        let mut func = function(vec![
+            alloca(20, 16),
+            vec_store(IntrinsicOp::VecStoreI64x2, 11, 20),
+            point_store(IntrinsicOp::Storedqu, 20, 3),
+            Instruction::Load {
+                dest: Value(12),
+                ty: IrType::Ptr,
+                ptr: Value(20),
+                volatile: false,
+                seg_override: crate::common::types::AddressSpace::Default,
+            },
+        ]);
         assert_eq!(forward_in_function(&mut func), 0);
         assert_eq!(func.blocks[0].instructions.len(), 4);
+    }
+
+    /// Two independent staged pairs in ONE block must each keep their own
+    /// value.  Deleting the first store before re-pointing the second reader
+    /// shifts that reader's index by one and rewrites the wrong instruction;
+    /// this is the shape `adler32_simd` has (low and high unpacks staged into
+    /// two 16-byte temporaries), and the value bug it caused was caught by the
+    /// `simd_crc_adler` runtime oracle, not by an instruction count.
+    #[test]
+    fn two_independent_pairs_in_one_block_keep_their_own_values() {
+        let mut func = function(vec![
+            alloca(20, 16),
+            alloca(21, 16),
+            vec_store(IntrinsicOp::VecStoreI64x2, 11, 20),
+            vec_store(IntrinsicOp::VecStoreI64x2, 12, 21),
+            point_store(IntrinsicOp::Storedqu, 20, 3),
+            point_store(IntrinsicOp::Storedqu, 21, 4),
+        ]);
+        assert_eq!(forward_in_function(&mut func), 2);
+        let instructions = &func.blocks[0].instructions;
+        assert_eq!(instructions.len(), 4, "{instructions:?}");
+        assert_eq!(
+            stores_value_at(&instructions[2]),
+            Some((IntrinsicOp::VecStoreI64x2, 11, 3))
+        );
+        assert_eq!(
+            stores_value_at(&instructions[3]),
+            Some((IntrinsicOp::VecStoreI64x2, 12, 4))
+        );
     }
 
     /// An instruction between the two means the bytes in between are

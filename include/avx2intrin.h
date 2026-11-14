@@ -75,23 +75,18 @@ _mm256_setr_epi8(
 
 /* === Bitwise === */
 
+/* `pand`/`pandn` are frontend builtins that lower to one `vpand`/`vpandn`.
+ * Expressing them as element-wise initializers (the previous form) leaves the
+ * bitwise op to the SLP vectorizer, which does not see through the
+ * per-element lane expressions in every context. */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_and_si256(__m256i __a, __m256i __b)
 {
-    return (__m256i){  __a[0] & __b[0],
-                        __a[1] & __b[1],
-                        __a[2] & __b[2],
-                        __a[3] & __b[3]  };
+    return (__m256i)__builtin_ia32_pand256((__v4di)(__a), (__v4di)(__b));
 }
 
-static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_andnot_si256(__m256i __a, __m256i __b)
-{
-    return (__m256i){  ~__a[0] & __b[0],
-                        ~__a[1] & __b[1],
-                        ~__a[2] & __b[2],
-                        ~__a[3] & __b[3]  };
-}
+#define _mm256_andnot_si256(__a, __b) \
+    (__m256i)__builtin_ia32_andnotsi256(__a, __b)
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_or_si256(__m256i __a, __m256i __b)
@@ -292,17 +287,17 @@ _mm256_inserti128_si256(__m256i __a, __m128i __b, int __imm)
 /* === Blend === */
 
 /* _mm256_blend_epi32: VPBLENDD - blend 32-bit elements by immediate mask */
-static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_blend_epi32(__m256i __a, __m256i __b, int __imm)
-{
-    int *__pa = (int *)&__a;
-    int *__pb = (int *)&__b;
-    __m256i __r;
-    int *__pr = (int *)&__r;
-    for (int __i = 0; __i < 8; __i++)
-        __pr[__i] = (__imm & (1 << __i)) ? __pb[__i] : __pa[__i];
-    return __r;
-}
+/* `_mm256_blend_epi32` selects 32-bit elements by the immediate, exactly like
+ * `vblendps` -- the two differ only in the mnemonic and the domain, and both
+ * leave unselected elements bit-identical.  The lane loop it used to be spilled
+ * both inputs to the stack and wrote the result lane by lane.
+ *
+ * A macro, not an inline function: the immediate must stay a constant
+ * expression at the call site, and a function parameter is not one. */
+#define _mm256_blend_epi32(__a, __b, __imm) \
+    _mm256_castps_si256(__CCC_M256_FROM_BUILTIN( \
+        __lccc_simd256_ps_vblendps256(__imm, _mm256_castsi256_ps(__a), \
+                                      _mm256_castsi256_ps(__b))))
 
 /* === Shuffle (32-bit) === */
 
@@ -322,17 +317,17 @@ _mm256_blend_epi32(__m256i __a, __m256i __b, int __imm)
 
 /* === Movemask === */
 
-/* _mm256_movemask_epi8: VPMOVMSKB - create 32-bit mask from MSBs of bytes */
+/* _mm256_movemask_epi8: VPMOVMSKB - create 32-bit mask from MSBs of bytes.
+ *
+ * This was a 32-iteration scalar loop that stored the vector to the stack and
+ * tested each byte, i.e. 32 branches per call for one instruction.  It is the
+ * inner operation of every byte-classification loop (JSON/XML scanning, UTF-8
+ * validation, `memchr` overlays), so the loop was also the hottest thing in
+ * the function that used it.  `__builtin_ia32_pmovmskb256` is the instruction. */
 static __inline__ int __attribute__((__always_inline__))
 _mm256_movemask_epi8(__m256i __a)
 {
-    unsigned char *__pa = (unsigned char *)&__a;
-    int __mask = 0;
-    for (int __i = 0; __i < 32; __i++) {
-        if (__pa[__i] & 0x80)
-            __mask |= (1 << __i);
-    }
-    return __mask;
+    return __builtin_ia32_pmovmskb256(__a);
 }
 
 /* === Permute (64-bit) === */

@@ -1327,6 +1327,50 @@ impl X86Codegen {
                 self.emit_evex_fma_512(dptr, args, "vfmadd231pd");
                 true
             }
+            // The rest of the FMA3 family.  Each is ONE instruction with a
+            // single rounding of the product; spelling them as `mul` plus
+            // `add`/`sub` in the header (as `_mm256_fmsub_ps` used to be)
+            // changes the result in the last bit.
+            FmsubPs132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmsub132ps");
+                true
+            }
+            FnmaddPs132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfnmadd132ps");
+                true
+            }
+            FnmsubPs132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfnmsub132ps");
+                true
+            }
+            FmaddsubPs132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmaddsub132ps");
+                true
+            }
+            FmsubaddPs132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmsubadd132ps");
+                true
+            }
+            FmsubPd132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmsub132pd");
+                true
+            }
+            FnmaddPd132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfnmadd132pd");
+                true
+            }
+            FnmsubPd132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfnmsub132pd");
+                true
+            }
+            FmaddsubPd132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmaddsub132pd");
+                true
+            }
+            FmsubaddPd132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmsubadd132pd");
+                true
+            }
             // ---- 128/256-bit FP (via VEX, mirroring the 256-bit AVX pattern) ----
             DivPs128 | MinPs128 | MaxPs128 | AndPs128 | AndnPs128 | OrPs128 | XorPs128
             | AddSs128 | SubSs128 | MulSs128 | DivSs128 | MinSs128 | MaxSs128 | DivPd128
@@ -1378,7 +1422,10 @@ impl X86Codegen {
             | CvtSi2Ss128 | CvtSi2Sd128 | CvtSi2Ss64_128 | CvtSi2Sd64_128 | CvtSs2Sd128
             | CvtSd2Ss128 | CvtPs2Ep32_128 | CvtEp32ToPs128 | CvttPs2Ep32_128 | CvtPs2Pd128
             | CvtPd2Ps128 | CvtPd2Ep32_128 | CvtEp32ToPd128 | CvttPd2Ep32_128 | FmaPs132
-            | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 => {
+            | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 | FmsubPs132 | FnmaddPs132
+            | FnmsubPs132 | FmaddsubPs132 | FmsubaddPs132 | FmsubPd132 | FnmaddPd132
+            | FnmsubPd132 | FmaddsubPd132 | FmsubaddPd132 | FmsubSs | FnmaddSs | FnmsubSs
+            | FmsubSd | FnmaddSd | FnmsubSd | FmaSs | FmaSd => {
                 self.emit_sse_fp_128_op(dptr, op, args);
                 true
             }
@@ -1390,7 +1437,9 @@ impl X86Codegen {
             | Vbroadcastss | Vbroadcastsd | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256
             | CvtPs2Pd256 | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256
             | VpermilvarPs256 | VpermilvarPd256 | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
-            | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 => {
+            | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 | FmsubPs132v256 | FnmaddPs132v256
+            | FnmsubPs132v256 | FmaddsubPs132v256 | FmsubaddPs132v256 | FmsubPd132v256
+            | FnmaddPd132v256 | FnmsubPd132v256 | FmaddsubPd132v256 | FmsubaddPd132v256 => {
                 self.emit_avx_fp_256_op(dptr, op, args);
                 true
             }
@@ -2176,7 +2225,14 @@ impl X86Codegen {
                 self.emit_sse_binary_128(dest_ptr, args, inst);
             }
             // FMA 128 (a, b, c): vfmadd132ps %xmm_c, %xmm_b, %xmm_a
-            FmaPs132 | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 => {
+            // FMA 128 (packed and scalar).  Every spelling here is the 132
+            // placement -- the public headers never emit 213/231 for the
+            // operations added below, and `fma_role_order` decodes the digits
+            // from the mnemonic rather than assuming them.
+            FmaPs132 | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 | FmsubPs132
+            | FnmaddPs132 | FnmsubPs132 | FmaddsubPs132 | FmsubaddPs132 | FmsubPd132
+            | FnmaddPd132 | FnmsubPd132 | FmaddsubPd132 | FmsubaddPd132 | FmsubSs | FnmaddSs
+            | FnmsubSs | FmsubSd | FnmaddSd | FnmsubSd | FmaSs | FmaSd => {
                 let inst = match op {
                     FmaPs132 => "vfmadd132ps",
                     FmaPs213 => "vfmadd213ps",
@@ -2184,6 +2240,24 @@ impl X86Codegen {
                     FmaPd132 => "vfmadd132pd",
                     FmaPd213 => "vfmadd213pd",
                     FmaPd231 => "vfmadd231pd",
+                    FmsubPs132 => "vfmsub132ps",
+                    FnmaddPs132 => "vfnmadd132ps",
+                    FnmsubPs132 => "vfnmsub132ps",
+                    FmaddsubPs132 => "vfmaddsub132ps",
+                    FmsubaddPs132 => "vfmsubadd132ps",
+                    FmsubPd132 => "vfmsub132pd",
+                    FnmaddPd132 => "vfnmadd132pd",
+                    FnmsubPd132 => "vfnmsub132pd",
+                    FmaddsubPd132 => "vfmaddsub132pd",
+                    FmsubaddPd132 => "vfmsubadd132pd",
+                    FmaSs => "vfmadd132ss",
+                    FmaSd => "vfmadd132sd",
+                    FmsubSs => "vfmsub132ss",
+                    FnmaddSs => "vfnmadd132ss",
+                    FnmsubSs => "vfnmsub132ss",
+                    FmsubSd => "vfmsub132sd",
+                    FnmaddSd => "vfnmadd132sd",
+                    FnmsubSd => "vfnmsub132sd",
                     _ => unreachable!(),
                 };
                 // SA-11: place the operands in the roles this spelling's
@@ -2447,7 +2521,9 @@ impl X86Codegen {
             }
             // FMA 256 (a, b, c)
             FmaPs132v256 | FmaPs213v256 | FmaPs231v256 | FmaPd132v256 | FmaPd213v256
-            | FmaPd231v256 => {
+            | FmaPd231v256 | FmsubPs132v256 | FnmaddPs132v256 | FnmsubPs132v256
+            | FmaddsubPs132v256 | FmsubaddPs132v256 | FmsubPd132v256 | FnmaddPd132v256
+            | FnmsubPd132v256 | FmaddsubPd132v256 | FmsubaddPd132v256 => {
                 let inst = match op {
                     FmaPs132v256 => "vfmadd132ps",
                     FmaPs213v256 => "vfmadd213ps",
@@ -2455,6 +2531,16 @@ impl X86Codegen {
                     FmaPd132v256 => "vfmadd132pd",
                     FmaPd213v256 => "vfmadd213pd",
                     FmaPd231v256 => "vfmadd231pd",
+                    FmsubPs132v256 => "vfmsub132ps",
+                    FnmaddPs132v256 => "vfnmadd132ps",
+                    FnmsubPs132v256 => "vfnmsub132ps",
+                    FmaddsubPs132v256 => "vfmaddsub132ps",
+                    FmsubaddPs132v256 => "vfmsubadd132ps",
+                    FmsubPd132v256 => "vfmsub132pd",
+                    FnmaddPd132v256 => "vfnmadd132pd",
+                    FnmsubPd132v256 => "vfnmsub132pd",
+                    FmaddsubPd132v256 => "vfmaddsub132pd",
+                    FmsubaddPd132v256 => "vfmsubadd132pd",
                     _ => unreachable!(),
                 };
                 // SA-11: role placement per digit order; see `FmaRoleOrder`.

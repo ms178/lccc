@@ -187,7 +187,8 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_punpckhqdq128"
         | "__builtin_ia32_punpcklqdq128"
         | "__builtin_ia32_pxor128" => CType::Vector(Box::new(CType::LongLong), 16),
-        "__builtin_ia32_paddq256"
+        "__builtin_ia32_andnotsi256"
+        | "__builtin_ia32_paddq256"
         | "__builtin_ia32_pcmpeqq256"
         | "__builtin_ia32_pcmpgtq256"
         | "__builtin_ia32_pmuludq256"
@@ -262,6 +263,8 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_sfence"
         | "__builtin_ia32_storedqu"
         | "__builtin_ia32_storedqu256"
+        | "__builtin_ia32_storeupd256"
+        | "__builtin_ia32_storeups256"
         | "__builtin_ia32_vzeroupper" => CType::Void,
         _ => return None,
     })
@@ -311,7 +314,9 @@ pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_movntpd"
         | "__builtin_ia32_movntps"
         | "__builtin_ia32_storedqu" => &[0, 16],
-        "__builtin_ia32_storedqu256" => &[0, 32],
+        "__builtin_ia32_storedqu256"
+        | "__builtin_ia32_storeupd256"
+        | "__builtin_ia32_storeups256" => &[0, 32],
         "__builtin_ia32_aesimc128"
         | "__builtin_ia32_cvtpd2ps"
         | "__builtin_ia32_cvtsd2si64"
@@ -476,6 +481,7 @@ pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_vextractf128_ps256" => &[32, 0],
         "__builtin_ia32_addpd256"
         | "__builtin_ia32_addps256"
+        | "__builtin_ia32_andnotsi256"
         | "__builtin_ia32_andps256"
         | "__builtin_ia32_maxps256"
         | "__builtin_ia32_minps256"
@@ -602,6 +608,7 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_aesdeclast128"
         | "__builtin_ia32_aesenc128"
         | "__builtin_ia32_aesenclast128"
+        | "__builtin_ia32_andnotsi256"
         | "__builtin_ia32_andnpd"
         | "__builtin_ia32_andnps"
         | "__builtin_ia32_andpd"
@@ -745,6 +752,8 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_pxor256"
         | "__builtin_ia32_storedqu"
         | "__builtin_ia32_storedqu256"
+        | "__builtin_ia32_storeupd256"
+        | "__builtin_ia32_storeups256"
         | "__builtin_ia32_subpd"
         | "__builtin_ia32_subpd256"
         | "__builtin_ia32_subps"
