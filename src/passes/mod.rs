@@ -110,6 +110,7 @@ mod vec_relations;
 pub(crate) mod vec_ssa;
 pub(crate) mod vector_copy_chain;
 pub(crate) mod vector_fill;
+pub(crate) mod vector_lane_patch;
 pub(crate) mod vector_store_forward;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
@@ -4613,6 +4614,17 @@ pub(crate) fn run_passes(
         vector_store_forward::forward_vector_temp_stores(module);
         module.for_each_function(dce::eliminate_dead_code);
         verify::verify_after_pass(module, "vecstorefwd");
+    }
+
+    // Phase 11b'a: a whole-vector reload that follows 32-bit lane writes to
+    // the same temporary is replaced by a register chain of broadcasts and
+    // lane blends.  The reload's memory read is what stalls: a 32-byte load
+    // over an unretired 4-byte store cannot be store-forwarded.  Separately
+    // gated so the win is A/B measurable.
+    if !pass_disabled(&disabled, "vecstorelane") {
+        vector_lane_patch::forward_lane_patched_reloads(module);
+        module.for_each_function(dce::eliminate_dead_code);
+        verify::verify_after_pass(module, "vecstorelane");
     }
 
     // Phase 11b': Collapse the 16/32-byte aggregate-load -> VecLoad ->

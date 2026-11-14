@@ -629,7 +629,7 @@ pub(crate) fn whole_vector_load(op: IntrinsicOp) -> bool {
 /// byte count so that a forwarding decision can require the reader's width to
 /// equal the width the producer wrote.  A 32-byte load feeding a 16-byte read
 /// is a partial copy and must refuse.
-fn whole_vector_load_width(op: IntrinsicOp) -> Option<usize> {
+pub(crate) fn whole_vector_load_width(op: IntrinsicOp) -> Option<usize> {
     if !whole_vector_load(op) {
         return None;
     }
