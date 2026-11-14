@@ -10537,8 +10537,11 @@ impl X86Codegen {
             self.state.resolve_slot_addr(dest_ptr.0)
         {
             if !deferred {
-                self.state
-                    .emit_fmt(format_args!("    movdqu %{}, {}", reg, self.slot_ref(slot.0)));
+                self.state.emit_fmt(format_args!(
+                    "    movdqu %{}, {}",
+                    reg,
+                    self.slot_ref(slot.0)
+                ));
             } else {
                 self.state.pending_vec_store = Some((dest_ptr.0, reg, false));
             }
@@ -14442,13 +14445,19 @@ mod intrinsic_destination_contract_tests {
         // No last-use premise on either operand: decline, emit nothing.
         let mut cg = setup([2, 3, 1]);
         assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"));
-        assert!(cg.state.out.buf.trim().is_empty(), "declined form emitted text");
+        assert!(
+            cg.state.out.buf.trim().is_empty(),
+            "declined form emitted text"
+        );
 
         // Non-commutative mnemonic: swapping operands changes the result, so the
         // form must never fire even with a perfect liveness premise.
         let mut cg = setup([2, 1, 1]);
         assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "psubd"));
-        assert!(cg.state.out.buf.trim().is_empty(), "psubd reached the commutative form");
+        assert!(
+            cg.state.out.buf.trim().is_empty(),
+            "psubd reached the commutative form"
+        );
 
         // Destination homed to a THIRD register: destroying either operand would
         // clobber a register the allocator expects to hold the result.
