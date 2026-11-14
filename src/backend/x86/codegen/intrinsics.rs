@@ -1587,7 +1587,9 @@ impl X86Codegen {
             return;
         }
 
-        if self.emit_sse_legacy_home_form(dest_ptr, &args[0], &args[1], sse_inst) {
+        if self.emit_sse_legacy_home_form(dest_ptr, &args[0], &args[1], sse_inst)
+            || self.emit_sse_dying_operand_form(dest_ptr, args, sse_inst)
+        {
             return;
         }
 
@@ -1603,6 +1605,96 @@ impl X86Codegen {
         self.state
             .emit_fmt(format_args!("    {} %xmm1, %xmm0", sse_inst));
         self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
+    /// Emit a commutative 128-bit op into the operand that is dying,
+    /// instead of staging a copy of the live one.
+    ///
+    /// SSE is destructive, so `op a, b` has to destroy one operand.  When
+    /// the SECOND operand's value is at its last use (`value_use_counts`,
+    /// the same map the ALU and cast emitters use for their last-use folds)
+    /// and already lives in a register, destroy THAT one and read the live
+    /// operand as the source: `op %live, %dying`.  SLP-vectorized FP loops
+    /// are the payoff — `c[j] += s * b[j]` used to emit a copy of the
+    /// loop-invariant `s` into scratch per iteration (`movdqa %xmm15,
+    /// %xmm0`) purely to have a destructible operand, where `mulpd %xmm15,
+    /// %loaded` costs nothing extra.
+    ///
+    /// Declines (returns false) whenever the liveness premise is
+    /// unavailable (no use count, or more than one use), the dying value
+    /// has no materialised register, a deferred store still names it, the
+    /// live operand is not itself in a register, both operands resolve to
+    /// one register, or the destination's allocated home is some other
+    /// register — the caller then stages as before.
+    fn emit_sse_dying_operand_form(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        sse_inst: &str,
+    ) -> bool {
+        // Dying-operand (commutative) form: no staging copy, no broadcast
+        // copy.  SSE is destructive, so `op a, b` has to destroy one
+        // operand.  When the SECOND operand's value is at its last use and
+        // already lives in a register, destroy THAT one and read the live
+        // operand as the source: `op %live, %dying`.  SLP-vectorized FP
+        // loops are the payoff — `c[j] += s * b[j]` used to emit a copy of
+        // the loop-invariant `s` into a scratch register per iteration
+        // (`movdqa %xmm15, %xmm0`) purely to have a destructible operand,
+        // where `mulpd %xmm15, %loaded` costs nothing extra.
+        //
+        // The liveness premise comes from `value_use_counts` (the same map
+        // the ALU and cast emitters use for their last-use folds): a value
+        // with exactly one use cannot be read again, so destroying its home
+        // is safe.  The form declines whenever that premise is unavailable
+        // (no use count, more than one use), the value has no materialised
+        // register, a deferred store still names it, the live operand is
+        // not itself in a register, or the destination's allocated home is
+        // some other register — the caller then stages as before.
+        if Self::sse128_mnemonic_commutative(sse_inst) {
+            if let (Operand::Value(live), Operand::Value(dying)) = (&args[0], &args[1]) {
+                let last_use = self.value_use_counts.get(&dying.0).copied() == Some(1)
+                    && self.value_use_counts.get(&live.0).copied() != Some(1);
+                if last_use
+                    && live.0 != dying.0
+                    && self.state.pending_vec_store.map(|(p, _, _)| p) != Some(dying.0)
+                {
+                    let dying_reg = self.vec_operand_reg(dying);
+                    let live_reg = self.vec_operand_reg(live);
+                    if let (Some(dst_reg), Some(src_reg)) = (dying_reg, live_reg)
+                        && src_reg != dst_reg
+                    {
+                        let dest_home = self.dest_xmm_home_name(dest_ptr);
+                        if dest_home.is_none() || dest_home == Some(dst_reg) {
+                            self.state.emit_fmt(format_args!(
+                                "    {} %{}, %{}",
+                                sse_inst, src_reg, dst_reg
+                            ));
+                            self.sse_commit_dest_direct(dest_ptr, dst_reg);
+                            if dest_home.is_none() {
+                                let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
+                                use crate::backend::state::SlotAddr;
+                                if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                                    self.state.resolve_slot_addr(dest_ptr.0)
+                                {
+                                    if !deferred {
+                                        self.state.emit_fmt(format_args!(
+                                            "    movdqu %{}, {}",
+                                            dst_reg,
+                                            self.slot_ref(slot.0)
+                                        ));
+                                    } else {
+                                        self.state.pending_vec_store =
+                                            Some((dest_ptr.0, dst_reg, false));
+                                    }
+                                }
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Emit a 128-bit SSE binary op directly into the destination's home

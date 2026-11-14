@@ -124,6 +124,29 @@ fluctuation in a byte-identical executable to optimization.
   loop assembly. gzip's helper is already inlined; byte-load induction already
   widened. Acceptance: a generic sound lowering change, negative width/alias
   witnesses, native paired gain and no full-corpus codegen regression.
+- **SE2 baseline vector load folding is AVX2-gated (open, highest value):**
+  the VLFOLD consumer in `emit_sse_binary_128` sits behind `if
+  self.avx2_enabled`, so at the SSE2 baseline — the configuration the
+  benchmark report compiles with — every single-use 128-bit load is
+  materialised. `matmul` emits `movupd (%rdx,%r10),%xmm2 ; addpd
+  %xmm2,%xmm0` (2 instructions) where gcc-16 emits `addpd (%rdx,%rax),
+  %xmm0` (1); the `ax` shape is 5 instructions per vector pair versus
+  gcc's 4. Blocker to shipping it: the elided load's own RA home is reused
+  as the destination's home, so the fold needs that reservation released
+  (or the consumer re-homed consistently with `reg_assignments`) before a
+  folded `op MEM, %reg` can be emitted without a miscompile.
+- **Scaled induction variables are not strength-reduced:** `matmul`'s
+  hottest loop recomputes `movq %r11,%r10 ; shlq $5,%r10` every iteration
+  (2 of ~12 uops) instead of stepping a byte pointer as gcc does.
+- **A loop-carried scan index is spilled:** `glibc_strstr`'s inner
+  character scan reloads `j` from the frame every iteration (`movq
+  16(%rsp),%r8`) where gcc keeps it in a register — allocator family, not
+  a vector issue.
+- **A load is not placed adjacent to its consumer, so it cannot fold:**
+  `linux_find_bit` emits `movq (%rdi,%r10,8),%r14 ; notq %r8 ; andq
+  %r14,%r8` versus gcc's folded `andq (%rdi,%rdx,8),%rcx`; rewriting the
+  consumer in place needs an alias-safe justification for the intervening
+  store-free region.
 - **AMD Zen vector register moves (vendor asymmetry in the cost model):**
   SOLVED for the emitter, OPEN for the model's reach. Intel eliminates XMM
   register moves at rename, so the legacy SSE2 lane emitter used to stage
@@ -152,6 +175,13 @@ fluctuation in a byte-identical executable to optimization.
   session notes, and `-march=x86-64-v3`/`v4` already emit the optimal
   copy-free lane loop (28/24 cycles), which is what the CI benchmark
   report compiles with.
+  Follow-up landed: the commutative **dying-operand form**
+  (`emit_sse_dying_operand_form`) emits `op %live, %dying` when the second
+  operand's value is at its last use (`value_use_counts == 1`) instead of
+  copying the live operand into scratch, which removed the per-iteration
+  `movdqa` of the loop-invariant broadcast in every SLP-vectorized FP
+  loop (`ax`: 6 -> 5 instructions per vector pair; `matmul`, `nbody`,
+  `f32_sse1_map`, `fp32/fp64_product_map` are the affected family).
 - **expat_xml_scan / chacha20_block:** 1.2569 / 1.1947 versus Clang. Separate
   loop instructions, register pressure and scheduling; chacha's baseline
   simulated Ir is already lower than Clang, so count reduction is not enough.
