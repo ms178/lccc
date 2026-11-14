@@ -714,6 +714,15 @@ fn vectorize_with_analysis_mode(
 
     let mut total_changes = 0;
 
+    // Volatile-access map for the per-loop legality gate below.  Computed
+    // HERE, on the exact block numbering the loop forest uses: both are
+    // rebuilt together after any transform, so the indices cannot be stale.
+    // Empty (one alloca scan, no chain walk) for the common volatile-free
+    // function.  Placing the gate in this shared ladder also covers the
+    // TwoWide/NEON entry, which reaches this function directly without
+    // `vectorize_function_mode`'s prelude.
+    let volatile_blocks = volatile_access_block_flags(func);
+
     // Process innermost loops (loops that don't contain other loops).
     for (idx, loop_info) in loops.iter().enumerate() {
         // Check if this is an innermost loop (no other loop nests strictly inside it).
@@ -746,6 +755,22 @@ fn vectorize_with_analysis_mode(
             if debug || why_not {
                 lccc::cli::stderr_line(format_args!(
                     "[VEC] Loop {} (header block {}) not vectorized: named address space access",
+                    idx, loop_info.header
+                ));
+            }
+            continue;
+        }
+
+        // A loop that reads or writes a volatile object keeps its scalar
+        // form: every packed transform below changes the number, width and
+        // order of memory accesses, and for volatile objects that sequence
+        // is observable behaviour (C11 6.7.3p7). Scoped per loop — see
+        // `volatile_access_block_flags` for why this must not be a
+        // function-wide refusal.
+        if loop_touches_volatile(&volatile_blocks, loop_info) {
+            if debug || why_not {
+                lccc::cli::stderr_line(format_args!(
+                    "[VEC] Loop {} (header block {}) not vectorized: volatile access in body",
                     idx, loop_info.header
                 ));
             }
@@ -35757,17 +35782,16 @@ pub(crate) fn vectorize_const_trip_map_loops(
         return 0;
     }
     // Same scoped legality gates as the main vectorizer: a DynAlloca breaks
-    // the transform's fixed-address assumptions, volatile accesses are
-    // observable and must keep their scalar width/order.
+    // the transform's fixed-address assumptions; volatile accesses are
+    // observable and must keep their scalar width/order, judged PER LOOP in
+    // the candidate walk below (matching the main ladder — a volatile
+    // object elsewhere in the function does not disqualify this one).
     if func.blocks.iter().any(|block| {
         block
             .instructions
             .iter()
             .any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
     }) {
-        return 0;
-    }
-    if func_has_volatile_loop_access(func) {
         return 0;
     }
     if no_map_vec {
@@ -35788,11 +35812,18 @@ pub(crate) fn vectorize_const_trip_map_loops(
             &cfg.succs,
             &cfg.idom,
         );
+        // Recomputed per round: a committed transform renumbers blocks, and
+        // every round breaks back here before consulting the flags again.
+        let volatile_blocks = volatile_access_block_flags(func);
         for lp in &loops {
             // Match the main entry's address-space guard: packed loads have
             // no segment override, even when the trip count is tiny/constant.
             if lp.body.len() > 4 || loop_touches_named_space(func, lp) {
                 continue; // the unroller's tiny/general 2-3-block window
+            }
+            // Match the main entry's per-loop volatile guard.
+            if loop_touches_volatile(&volatile_blocks, lp) {
+                continue;
             }
             let companion_backup = try_canonicalize_companion_pointer_ivs(func, lp);
             let Some(pattern) = analyze_map_pattern(func, lp, false, symbol_facts) else {
@@ -35933,13 +35964,18 @@ fn vectorize_function_mode(
     // loop that reads or writes volatile objects changes the number, width,
     // and order of memory accesses (C11 6.7.3p7: "Any attempt to refer to a
     // volatile object through a non-volatile lvalue is undefined behaviour"
-    // — a vector load is exactly such an access). Bail out for any function
-    // whose loop loads/stores chain to a volatile alloca.
+    // — a vector load is exactly such an access).
     // (Reproducer: tests/correctness volatile_access — volatile int array
     // sum produced garbage at -O2 when vectorized.)
-    if func_has_volatile_loop_access(func) {
-        return 0;
-    }
+    //
+    // The LOOP ladder answers this per loop (`loop_touches_volatile` inside
+    // `vectorize_with_analysis_mode`): only loops whose bodies touch a
+    // volatile object stay scalar; sibling loops in the same function keep
+    // their packed forms.  The function-level answer below gates only the
+    // two straight-line transforms that have no loop scope to judge — the
+    // fixed-distance SLP fold and the generator-map rewrite — which remain
+    // fail-closed exactly as before.
+    let has_volatile_access = func_has_volatile_access(func);
 
     // Diamond/if-chain pre-conversion: the map parser bails on any internal
     // `CondBranch` ("BAIL: internal condbranch"), and the short-circuit
@@ -35972,7 +36008,7 @@ fn vectorize_function_mode(
         }
     }
 
-    let slp_changes = if fp_reassoc && enable_fixed_slp {
+    let slp_changes = if fp_reassoc && enable_fixed_slp && !has_volatile_access {
         transform_fixed_distance_slp(func)
     } else {
         0
@@ -35990,11 +36026,12 @@ fn vectorize_function_mode(
     // skipped for the late min/max rerun, and the CCC_NO_GENERATOR_MAP kill
     // switch restores the scalar generator for A/B measurement.
     let (gen_enabled, gen_trace) = generator_map_policy();
-    let gen_changes = if gen_enabled && !late_minmax_only() && x86_avx2_width_wanted() {
-        generator_map::transform_function(func, gen_trace)
-    } else {
-        0
-    };
+    let gen_changes =
+        if gen_enabled && !has_volatile_access && !late_minmax_only() && x86_avx2_width_wanted() {
+            generator_map::transform_function(func, gen_trace)
+        } else {
+            0
+        };
 
     let cfg = CfgAnalysis::build(func);
     let loop_changes = vectorize_with_analysis_mode(
@@ -36022,11 +36059,26 @@ fn vectorize_function_mode(
     changes
 }
 
-/// True if any Load/Store in `func` chains (through GEP/Cast/Copy) to an
-/// alloca declared `volatile` or `semantic_volatile`. Such loops must never be
-/// vectorized: vector loads/stores would observe or mutate volatile objects
-/// with different width/count/order than the source program.
-fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
+/// Per-block map of volatile accesses: `flags[bi]` is true when block `bi`
+/// contains a Load/Store whose pointer chains (through GEP/Cast/Copy) to an
+/// alloca declared `volatile` or `semantic_volatile`.
+///
+/// The judgment this feeds is PER LOOP, not per function: a loop whose body
+/// touches a volatile object must keep its scalar form (vector loads/stores
+/// would observe or mutate the object with different width, count and order
+/// — C11 6.7.3p7 makes the access sequence observable), but a volatile
+/// object elsewhere in the function must not cost unrelated loops their
+/// packed form.  The previous function-wide bail did exactly that: one
+/// `volatile` scratch variable anywhere — even a single access outside every
+/// loop, or an inlined volatile-using helper — left every other loop in the
+/// function scalar.  (Reproducer: a byte-classifier loop next to a volatile
+/// accumulator loop in the same function; GCC 16 and Clang 23 vectorize the
+/// classifier, the function-wide bail refused it.)
+///
+/// Returns an EMPTY vec when the function declares no volatile allocas — the
+/// common case — so callers can skip the chain walk entirely; treat an empty
+/// result as "no block flagged".
+fn volatile_access_block_flags(func: &IrFunction) -> Vec<bool> {
     use crate::ir::instruction::Instruction;
 
     let mut volatile_allocas: FxHashSet<u32> = FxHashSet::default();
@@ -36046,7 +36098,7 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
         }
     }
     if volatile_allocas.is_empty() {
-        return false;
+        return Vec::new();
     }
 
     // Union-find style root map: pointer value -> alloca root it derives from.
@@ -36099,9 +36151,13 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
         }
     }
 
-    // Any Load/Store whose pointer chains to a volatile alloca disqualifies
-    // the whole function from vectorization.
-    for block in &func.blocks {
+    // Flag every block holding a Load/Store whose pointer chains to a
+    // volatile alloca.  The access is attributed to the block of the
+    // Load/Store itself (not of the pointer derivation): that is the block
+    // whose membership in a loop body decides whether the loop performs the
+    // volatile access.
+    let mut flags = vec![false; func.blocks.len()];
+    for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             let ptr: Option<u32> = match inst {
                 Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => Some(ptr.0),
@@ -36110,12 +36166,33 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
             if let Some(p) = ptr {
                 let root = find(&mut parent, p);
                 if volatile_allocas.contains(&root) {
-                    return true;
+                    flags[bi] = true;
+                    break;
                 }
             }
         }
     }
-    false
+    flags
+}
+
+/// True when any body block of `loop_info` carries a volatile access per
+/// `flags` (a `volatile_access_block_flags` result for the SAME block
+/// numbering — the flags must be recomputed after any pass that renumbers
+/// blocks).  An empty `flags` means the function has no volatile allocas.
+fn loop_touches_volatile(flags: &[bool], loop_info: &loop_analysis::NaturalLoop) -> bool {
+    !flags.is_empty()
+        && loop_info
+            .body
+            .iter()
+            .any(|&bi| flags.get(bi).copied().unwrap_or(false))
+}
+
+/// True if any Load/Store in `func` chains to a volatile alloca.  This
+/// function-level answer is ONLY for the straight-line transforms that have
+/// no loop scope to judge (fixed-distance SLP, the generator-map rewrite);
+/// loop vectorization decisions use `loop_touches_volatile` instead.
+fn func_has_volatile_access(func: &IrFunction) -> bool {
+    volatile_access_block_flags(func).iter().any(|&f| f)
 }
 
 /// AArch64 NEON has 128-bit vectors, matching the two-wide F64 transform.

@@ -95,4 +95,105 @@ fi
 grep -Eq '(^|[[:space:]])v?psadbw' "$tmp/count_sse2.s" ||
     fail "the counting form lost the SSE2-baseline packed lowering"
 
-echo "PASS: both classifier spellings reach psadbw; the store arm stays scalar"
+# RUNTIME trip counts (the shape real parsers call): a zero-based strict
+# `i < n` loop with a loop-invariant limit is already canonical, so the
+# adapter admits it with no endpoint arithmetic (`iv < n` never computes
+# `n + 1`).  Both spellings, matching IV/limit types.
+cat >"$tmp/count_rt.c" <<'EOF'
+unsigned long long count_name_chars(const char *p, unsigned long n) {
+    unsigned long long count = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        char c = p[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+            count++;
+    }
+    return count;
+}
+EOF
+cat >"$tmp/sum_rt.c" <<'EOF'
+static int is_name_char(char ch) {
+    return ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.');
+}
+unsigned long long sum_name_chars(const char *p, unsigned long n) {
+    unsigned long long c = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        c += (unsigned)is_name_char(p[i]);
+    }
+    return c;
+}
+EOF
+"$ccc" -O3 -march=x86-64-v3 -S "$tmp/count_rt.c" -o "$tmp/count_rt.s"
+"$ccc" -O3 -march=x86-64-v3 -S "$tmp/sum_rt.c" -o "$tmp/sum_rt.s"
+"$ccc" -O3 -S "$tmp/count_rt.c" -o "$tmp/count_rt_sse2.s"
+grep -Eq '(^|[[:space:]])v?psadbw' "$tmp/count_rt.s" ||
+    fail "the counting form with a RUNTIME trip count no longer vectorizes"
+grep -Eq '(^|[[:space:]])v?psadbw' "$tmp/sum_rt.s" ||
+    fail "the summed-predicate form with a RUNTIME trip count no longer vectorizes"
+grep -Eq '(^|[[:space:]])v?psadbw' "$tmp/count_rt_sse2.s" ||
+    fail "the runtime-trip counting form lost the SSE2-baseline packed lowering"
+
+# Semantics negative row: a MIXED-width compare (`unsigned i < unsigned
+# long n`) makes the IV wrap observable — `n > UINT_MAX` denotes an
+# infinite loop — so the adapter must keep it scalar, not guess.
+cat >"$tmp/count_mixed.c" <<'EOF'
+unsigned long long count_mixed(const char *p, unsigned long n) {
+    unsigned long long count = 0;
+    for (unsigned i = 0; i < n; i++) {
+        char c = p[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+            count++;
+    }
+    return count;
+}
+EOF
+"$ccc" -O3 -march=x86-64-v3 -S "$tmp/count_mixed.c" -o "$tmp/count_mixed.s"
+if grep -Eq '(^|[[:space:]])v?psadbw' "$tmp/count_mixed.s"; then
+    fail "a mixed-width IV/limit compare was packed: the wrap semantics gate is broken"
+fi
+
+# VOLATILE SCOPE rows.  The volatile legality gate is PER LOOP, not per
+# function: a volatile object elsewhere in the function (here: a volatile
+# oracle loop, the shape every differential test in this repo uses) must
+# not cost the sibling classifier its packed form.  Conversely the loop
+# that actually touches the volatile object must keep its scalar access
+# sequence — one load per element, in order (C11 6.7.3p7).
+cat >"$tmp/vol_scope.c" <<'EOF'
+unsigned long long classify_with_oracle(const char *p, unsigned long n,
+                                        unsigned long long *oracle) {
+    volatile unsigned long long check = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        volatile char c = p[i];
+        check += (c >= 'a' && c <= 'z');
+    }
+    *oracle = check;
+    unsigned long long count = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        char c = p[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+            count++;
+    }
+    return count;
+}
+EOF
+"$ccc" -O3 -march=x86-64-v3 -S "$tmp/vol_scope.c" -o "$tmp/vol_scope.s"
+grep -Eq '(^|[[:space:]])v?psadbw' "$tmp/vol_scope.s" ||
+    fail "a volatile oracle loop in the same function cost the sibling classifier its packed form (the volatile gate regressed to function-wide)"
+cat >"$tmp/vol_self.c" <<'EOF'
+unsigned long long volatile_count(unsigned long n) {
+    volatile char buf[256];
+    for (unsigned long i = 0; i < n && i < 256; i++) buf[i] = (char)i;
+    unsigned long long count = 0;
+    for (unsigned long i = 0; i < n && i < 256; i++)
+        count += (buf[i] >= 'a' && buf[i] <= 'z');
+    return count;
+}
+EOF
+"$ccc" -O3 -march=x86-64-v3 -S "$tmp/vol_self.c" -o "$tmp/vol_self.s"
+if grep -Eq '(^|[[:space:]])v?psadbw|(^|[[:space:]])v?movdq[ua].*%x?y?mm' "$tmp/vol_self.s"; then
+    fail "a loop whose body accesses a volatile object was vectorized: the per-loop volatile gate failed open"
+fi
+
+echo "PASS: both classifier spellings reach psadbw (constant AND runtime trip counts); the store arm, the mixed-width compare and the volatile loop stay scalar; a volatile sibling does not deny the classifier"

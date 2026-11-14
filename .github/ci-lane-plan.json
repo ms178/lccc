@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 539.32,
+      "predicted_gate_seconds": 539.46,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -162,6 +162,10 @@
         {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_ifconv_arm_budget_switch.sh"
+        },
+        {
+          "measured_s": 0.14,
+          "name": "bash tests/regression/check_byte_count_classifier_vectorize.sh"
         },
         {
           "measured_s": 0.46,

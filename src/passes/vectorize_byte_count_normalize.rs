@@ -235,8 +235,28 @@ fn body_symbol_name(
     }
 }
 
+/// The loop's upper bound, after endpoint canonicalization.
+///
+/// * `Const(end)` — a compile-time EXCLUSIVE endpoint.  Inclusive spellings
+///   are folded (`<= k` becomes `< k+1`, overflow-checked against the IV
+///   type), and a nonzero start is rebased by the mutation phase below.
+/// * `Runtime(v)` — a loop-invariant runtime limit, accepted ONLY in the
+///   already-canonical form: start 0 and a STRICT compare.  There the
+///   rebase is the identity, no endpoint arithmetic exists to overflow
+///   (`iv < n` never computes `n+1`), and the packed emitter's own
+///   trip-count division handles `n == 0` and negative signed limits with
+///   zero vector iterations.  An inclusive runtime endpoint (`i <= n`)
+///   fails closed: `n` at the type maximum denotes 2^N trips, which no
+///   finite rewrite of this shape expresses.
+enum Bound {
+    Const(i64),
+    Runtime(Value),
+}
+
 /// Canonicalization is deliberately restricted to direct, nonnegative 32/64-bit
-/// IVs (including exact 32-to-64-bit address casts) and constant bounds. Runtime starts, truncating index casts, zero-trip
+/// IVs (including exact 32-to-64-bit address casts) and constant bounds, plus
+/// the already-canonical zero-based strict form with a loop-invariant runtime
+/// limit. Runtime starts, truncating index casts, constant zero-trip
 /// cases, escaping IVs and overflowing inclusive endpoints fail closed.
 fn normalize(
     func: &IrFunction,
@@ -272,15 +292,30 @@ fn normalize(
             | (IrType::U32 | IrType::U64, IrCmpOp::Ule) => true,
             _ => return None,
         };
-    let end = constant(rhs)?.checked_add(i64::from(inclusive))?;
-    let max = match ty {
-        IrType::I32 => i64::from(i32::MAX),
-        IrType::U32 => i64::from(u32::MAX),
-        _ => i64::MAX,
+    let bound = match rhs {
+        Operand::Const(_) => {
+            let end = constant(rhs)?.checked_add(i64::from(inclusive))?;
+            let max = match ty {
+                IrType::I32 => i64::from(i32::MAX),
+                IrType::U32 => i64::from(u32::MAX),
+                _ => i64::MAX,
+            };
+            if end > max {
+                return None;
+            }
+            Bound::Const(end)
+        }
+        Operand::Value(b) => {
+            if inclusive {
+                return None;
+            }
+            let (db, _) = definition_site(func, b)?;
+            if lp.contains(db) {
+                return None;
+            }
+            Bound::Runtime(b)
+        }
     };
-    if end > max {
-        return None;
-    }
     let (phi_block, phi_index) = definition_site(func, iv)?;
     if phi_block != header {
         return None;
@@ -299,8 +334,20 @@ fn normalize(
     let latch_label = func.blocks[latch].label;
     let (initial, pre_label) = incoming.iter().find(|(_, l)| *l != latch_label)?;
     let start = constant(*initial)?;
-    if start < 0 || end <= start {
-        return None;
+    match bound {
+        Bound::Const(end) => {
+            if start < 0 || end <= start {
+                return None;
+            }
+        }
+        // Runtime limits only in the canonical zero-based form: with any
+        // other start, rebasing would need `n - start` arithmetic whose
+        // wrap behaviour this adapter does not model.
+        Bound::Runtime(_) => {
+            if start != 0 {
+                return None;
+            }
+        }
     }
     let pre = func.blocks.iter().position(|b| b.label == *pre_label)?;
     if lp.contains(pre)
@@ -427,14 +474,20 @@ fn normalize(
             }
         }
     }
-    if let Instruction::Cmp { rhs, op, .. } = &mut candidate.blocks[header].instructions[cmp_index]
-    {
-        *rhs = Operand::Const(IrConst::I64(end - start));
-        *op = if matches!(ty, IrType::I32 | IrType::I64) {
-            IrCmpOp::Slt
-        } else {
-            IrCmpOp::Ult
-        };
+    // A runtime bound is only accepted in the zero-based strict form, where
+    // the comparison is ALREADY canonical (`iv <u n` / `iv <s n`): rewriting
+    // it would only destroy the invariant operand the packed analyzer reads.
+    if let Bound::Const(end) = bound {
+        if let Instruction::Cmp { rhs, op, .. } =
+            &mut candidate.blocks[header].instructions[cmp_index]
+        {
+            *rhs = Operand::Const(IrConst::I64(end - start));
+            *op = if matches!(ty, IrType::I32 | IrType::I64) {
+                IrCmpOp::Slt
+            } else {
+                IrCmpOp::Ult
+            };
+        }
     }
     // One preheader `GlobalAddr` per symbol, then (for a nonzero start) one
     // rebased GEP per stream.
@@ -904,7 +957,10 @@ pub(super) fn transform(
                 return changed;
             }
         }
-        return 0;
+        // The normalized clone was declined by the analyzer or emitter;
+        // discard it and fall through — a loop can normalize AND still owe
+        // its vectorizability to a triangle flatten of the ORIGINAL body,
+        // and every path below is equally transactional.
     }
     // The straight-line paths declined.  If the body's only internal
     // control is pure value triangles (the budget-protected remnant of a

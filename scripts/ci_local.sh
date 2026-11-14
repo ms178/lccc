@@ -3461,6 +3461,15 @@ gate "i686-small-vector-crash-diagnostic" fast \
 gate "ifconv-arm-budget-switch" fast \
     env CCC="$LCCC" bash tests/regression/check_ifconv_arm_budget_switch.sh
 
+# Both byte-classifier loop spellings (the ||-chain count and the summed
+# range predicate) must reach the psadbw reduction at -O3 on x86-64-v3 AND
+# the SSE2 baseline, and the store-arm negative row must stay scalar: a
+# regression shows up here as a missing opcode, not as a silent 3-10x
+# runtime loss one release later.  Mirrored in the hosted fast-contracts
+# lane (parity-checked).
+gate "byte-count-classifier-vectorize" fast \
+    env CCC="$LCCC" bash tests/regression/check_byte_count_classifier_vectorize.sh
+
 # The peephole used to change its mind about a line because of a trailing blank:
 # a padded load stopped forwarding the constant store above it (lccc's own
 # sha256 output), the %rcx address-copy fold was lost when the CONSUMER line was

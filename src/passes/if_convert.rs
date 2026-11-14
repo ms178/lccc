@@ -1288,20 +1288,28 @@ fn sim_prune_unreachable(probe: &mut IrFunction) {
 /// CPU-model budgets, so this cannot drift from what the pass will actually
 /// do to the loop afterwards.
 ///
-/// When neither detector fires anywhere, the fixpoint plays the caller's
-/// OTHER move: another round of `detect_if_combine` on the probe.  This is
-/// not an extra power grab — after one combine round the pass returns to its
-/// caller, whose own fixpoint re-enters and prefers combines again, so later
-/// combine rounds genuinely happen to the live IR.  The move is decisive for
-/// the jump-threaded classifier shape the frontend emits for
-/// `a||b||...||z ? n++ : n` — every link branches STRAIGHT to the shared
-/// increment block, which therefore has one predecessor per link, and the
-/// diamond/triangle detectors (single-predecessor arm heads, by design)
-/// can never touch it until the remaining combines have folded the chain
-/// into one block.  Simulated combines follow the same restrictions the
-/// real rounds enforce: candidates live inside the body and never touch the
-/// exiting block.  Diamond/triangle keeps precedence within each round,
-/// matching `if_convert_diamonds` exactly.
+/// The fixpoint replays the caller's moves in the caller's ORDER: after one
+/// combine round the pass returns, its caller's fixpoint re-enters, and the
+/// re-entry PREFERS combines again (`try_if_combine_loop` returns before
+/// `if_convert_diamonds` whenever a combine lands), so the live pipeline
+/// exhausts every combine round before a single diamond converts.  Each sim
+/// iteration therefore first simulates a whole combine ROUND under the same
+/// batch rules the live round enforces — candidates collected over the body
+/// in ascending block order, first-owner-wins overlap filtering, and
+/// REJECT-ALL if any candidate touches the exiting block — and only when no
+/// combine round is possible does it fall back to one diamond/triangle
+/// conversion (diamond before triangle, matching `if_convert_diamonds`).
+/// The combine round is decisive for the jump-threaded classifier shape the
+/// frontend emits for `a||b||...||z ? n++ : n` — every link branches
+/// STRAIGHT to the shared increment block, which therefore has one
+/// predecessor per link, and the diamond/triangle detectors
+/// (single-predecessor arm heads, by design) can never touch it until the
+/// remaining combines have folded the chain into one block.
+///
+/// Candidate generation reads the PRE-combine `nl.body` superset, exactly
+/// as the diamond half always has: the superset can only offer extra
+/// candidates whose blocks left the loop, and those still face the final
+/// survivor test below, which the same superset makes strictly harsher.
 ///
 /// `nl.body` is the PRE-combine body set: combines only merge blocks inside
 /// it (they retarget edges between body blocks and reuse the same labels), so
@@ -1324,37 +1332,46 @@ fn body_becomes_branch_free(
         v.sort_unstable();
         v
     };
-    // Bounded: each conversion AND each combine removes at least one
+    // Bounded: each combine ROUND and each conversion removes at least one
     // conditional branch, and a body of B blocks holds at most B of them.
     // The bound is belt-and-braces against a detector/apply pair that
     // disagrees about progress.
     for _ in 0..=body.len() {
         let ctx = IfConvCtx::build(probe);
-        let mut plan: Option<DiamondInfo> = None;
-        let mut comb: Option<IfCombine> = None;
+        // The caller's fixpoint prefers combines on every re-entry
+        // (`try_if_combine_loop` returns before `if_convert_diamonds`
+        // whenever a round lands), so the sim does too.  The round follows
+        // the LIVE batch rules verbatim: ascending block order,
+        // first-owner-wins overlap filter, and reject-all if any candidate
+        // touches the exiting block — a sim allowed to cherry-pick around
+        // that veto would approve chains the live pipeline refuses to
+        // finish.
+        let mut round: Vec<IfCombine> = Vec::new();
+        let mut seen: FxHashSet<usize> = FxHashSet::default();
         for &b in &body {
-            if b == exiting || b >= probe.blocks.len() {
+            if b >= probe.blocks.len() {
                 continue;
             }
-            if !matches!(probe.blocks[b].terminator, Terminator::CondBranch { .. }) {
-                continue;
-            }
-            // Same precedence as `if_convert_diamonds` (diamond, else
-            // triangle), same detectors, same CPU-model budgets.
-            if let Some(d) = detect_diamond_inner(&ctx, b, true) {
-                plan = Some(d);
-                break;
-            }
-            if let Some(t) = detect_triangle_inner(&ctx, b, true) {
-                plan = Some(t);
-                break;
+            if let Some(c) = detect_if_combine(&ctx, b) {
+                if seen.insert(c.pred_idx) && seen.insert(c.inner_idx) {
+                    round.push(c);
+                }
             }
         }
-        if plan.is_none() {
-            // No conversion anywhere: simulate the NEXT combine round the
-            // caller's fixpoint would run (see the doc comment).  Same
-            // restrictions as the live rounds: the candidate must stay
-            // inside the body and keep its hands off the exiting block.
+        // The veto tests the OVERLAP-FILTERED list, exactly like the live
+        // round: a touching candidate that lost the first-owner-wins race
+        // never reaches `try_if_combine_loop` and must not veto here either.
+        if round
+            .iter()
+            .any(|c| c.pred_idx == exiting || c.inner_idx == exiting)
+        {
+            round.clear();
+        }
+        let mut plan: Option<DiamondInfo> = None;
+        if round.is_empty() {
+            // No combine round: the live fixpoint falls through to
+            // `if_convert_diamonds`.  Same precedence (diamond, else
+            // triangle), same detectors, same CPU-model budgets.
             for &b in &body {
                 if b == exiting || b >= probe.blocks.len() {
                     continue;
@@ -1362,16 +1379,38 @@ fn body_becomes_branch_free(
                 if !matches!(probe.blocks[b].terminator, Terminator::CondBranch { .. }) {
                     continue;
                 }
-                if let Some(c) = detect_if_combine(&ctx, b) {
-                    if c.inner_idx != exiting && body.binary_search(&c.inner_idx).is_ok() {
-                        comb = Some(c);
-                        break;
-                    }
+                if let Some(d) = detect_diamond_inner(&ctx, b, true) {
+                    plan = Some(d);
+                    break;
+                }
+                if let Some(t) = detect_triangle_inner(&ctx, b, true) {
+                    plan = Some(t);
+                    break;
                 }
             }
         }
         drop(ctx);
-        if let Some(plan) = plan {
+        if !round.is_empty() {
+            let mut next = probe.next_value_id;
+            let applied = round
+                .iter()
+                .filter(|c| apply_if_combine(probe, c, &mut next))
+                .count();
+            probe.next_value_id = next;
+            if dbg {
+                lccc::cli::stderr_line(format_args!(
+                    "[IFCOMB]     sim: combine round applied {applied}/{} candidate(s)",
+                    round.len()
+                ));
+            }
+            if applied == 0 {
+                // Every candidate was stale (cannot normally happen: they
+                // were detected on this very probe).  Retrying would
+                // re-derive the same stale round forever, so fail closed —
+                // rejecting keeps the short circuit, which is always safe.
+                break;
+            }
+        } else if let Some(plan) = plan {
             if !apply_diamond(probe, &plan) {
                 break;
             }
@@ -1379,18 +1418,6 @@ fn body_becomes_branch_free(
                 lccc::cli::stderr_line(format_args!(
                     "[IFCOMB]     sim: converted pred={} merge={}",
                     plan.pred_idx, plan.merge_idx
-                ));
-            }
-        } else if let Some(c) = comb {
-            let mut next = probe.next_value_id;
-            if !apply_if_combine(probe, &c, &mut next) {
-                break;
-            }
-            probe.next_value_id = next;
-            if dbg {
-                lccc::cli::stderr_line(format_args!(
-                    "[IFCOMB]     sim: combined pred={} inner={}",
-                    c.pred_idx, c.inner_idx
                 ));
             }
         } else {

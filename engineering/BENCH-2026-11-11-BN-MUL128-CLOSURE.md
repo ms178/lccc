@@ -173,3 +173,32 @@ records the current spill/reload counts (12/18), asserts the branchless form
 reaches the vectorizer at all, asserts both predicate forms agree with GCC and
 Clang on every byte at `-O0` and `-O3`, and asserts the kill switches bisect
 performance but never the result.
+
+## 2026-11-13 update: the chain flattening landed — ratchet flipped
+
+The "scheduled work, not a slice to fake" above is now in-tree
+(PR #1185): `if_convert`'s `body_becomes_branch_free()` simulates the
+later combine rounds, `vectorize_byte_count_normalize` flattens the
+residual pure value triangles on a private clone, and runtime trip
+counts are accepted in the canonical zero-based strict-compare form.
+The branchy `a||b||c||d||e||f` predicate now reaches the same `psadbw`
+reduction as the branchless rewrite, with no source change.
+
+Re-measured on the same kernels (`driver.c`, arg 2000, best of 5,
+checksums identical to GCC in every arm):
+
+| kernel, flags | lccc (s) | GCC 16.2 (s) | Clang 23 (s) | vs GCC |
+|---------------|----------|--------------|--------------|--------|
+| `classify`, `-O3`                     | 0.002879 | 0.003358 | 0.007584 | 1.17x |
+| `namechars`, `-O3`                    | 0.000924 | 0.003321 | 0.006188 | 3.59x |
+| `classify`, `-O3 -march=x86-64-v3`    | 0.002427 | 0.001723 | —        | 0.71x |
+| `namechars`, `-O3 -march=x86-64-v3`   | 0.000470 | 0.001713 | —        | 3.65x |
+
+The 0.19x / 0.25x table rows above are therefore historical. The
+remaining honest gap is `classify` at v3, where GCC's AVX2 arm is
+1.4x ahead; the `.LCVEC` RIP-folding item above is still the measured
+lever for that. `test_branchy_classifier_is_not_vectorized` has been
+flipped to `test_branchy_classifier_is_vectorized` per the ratchet's
+own instruction, and the end-to-end behaviour is additionally pinned by
+`tests/regression/byte_count_classifier_chain.c` and
+`tests/regression/check_byte_count_classifier_vectorize.sh`.
