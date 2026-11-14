@@ -2012,6 +2012,25 @@ gate "vector-fma-homing-nonvacuity" fast \
 gate "x86-int-map-registers" fast \
     bash tests/regression/check_x86_int_map_registers.sh --lccc target/fastbuild/lccc \
     --reference "${GCC:-gcc-16}"
+# The AVX header families this campaign rewrote.  Each gate asserts three
+# things per spelling: the emitted shape (one instruction for a map/bitwise/FMA
+# op, one move for a load/store), the numbers (a fused identity that only holds
+# if the operation is really fused, exact integer lanes), and executed output
+# parity against the reference compiler.  They are separate gates because they
+# fail independently: the FMA family can be shape-perfect while a `vblendps`
+# immediate is wrong, and vice versa.
+gate "avx256-float-bitwise" fast \
+    bash tests/regression/check_avx256_float_bitwise.sh --lccc target/fastbuild/lccc \
+    --reference "${GCC:-gcc-16}"
+gate "fma3-family" fast \
+    bash tests/regression/check_fma3_family.sh --lccc target/fastbuild/lccc \
+    --reference "${GCC:-gcc-16}"
+gate "wide-load-store" fast \
+    bash tests/regression/check_wide_load_store.sh --lccc target/fastbuild/lccc \
+    --reference "${GCC:-gcc-16}"
+gate "avx2-mask-blend" fast \
+    bash tests/regression/check_avx2_mask_blend.sh --lccc target/fastbuild/lccc \
+    --reference "${GCC:-gcc-16}"
 # The pointer-form store builtins take their SOURCE as an address, so a
 # computed vector source went round the frame: `_mm256_storeu_si256(q+i,
 # _mm256_add_epi64(...))` emitted `vmovdqu %ymm, slot` then `vmovdqu slot,

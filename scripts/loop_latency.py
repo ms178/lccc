@@ -18,7 +18,9 @@ so a new instruction can never silently count as free.
 Latencies are 1 cycle for every simple vector/GPR integer op (add, xor, or,
 and, shifts, pshufb, pshufd, pshuflw, pshufhw, vprold, rol/ror/rorx) and 0
 for reg-reg moves
-(eliminated at rename).  These values hold on Zen 3/4/5, Golden Cove,
+(eliminated at rename — Intel's model; pass --move-latency 1 for AMD Zen,
+which does NOT eliminate vector register moves, so every `movdqa` in a
+recurrence costs a cycle there).  These values hold on Zen 3/4/5, Golden Cove,
 Raptor Cove and Skylake-SP alike (Agner Fog's tables, uops.info), so the
 bound is microarchitecture-neutral for the ops it accepts.
 
@@ -67,6 +69,15 @@ LAT1 = {
 NONDESTRUCTIVE = {"rorxl", "rorxq", "andnl", "andnq", "shlxl", "shlxq",
                   "shrxl", "shrxq", "sarxl", "sarxq", "leal", "leaq"}
 LOAD_LATENCY = 5
+# Cost of a register-to-register move. 0 is the Intel model (moves are
+# eliminated at rename); 1 models AMD Zen, which does NOT eliminate vector
+# register moves (see --move-latency).
+MOVE_LATENCY = 0
+
+
+def set_move_latency(n: int) -> None:
+    global MOVE_LATENCY
+    MOVE_LATENCY = n
 MOVES = {"movdqa", "movaps", "vmovdqa", "vmovaps", "movl", "movq", "vmovdqu",
          "movdqu", "vmovups", "movups"}
 BRANCH = re.compile(r"^j[a-z]+$")
@@ -178,7 +189,9 @@ def analyse(insns: list[str], iterations: int = 64, loads: bool = False) -> dict
                 load_t = max((ready.get(r, 0) for r in addr), default=0) + LOAD_LATENCY
             if mnem in MOVES and len(ops) == 2 and ops[1].startswith("%"):
                 if ops[0].startswith("%"):
-                    ready[canon(ops[1][1:])] = ready.get(canon(ops[0][1:]), 0)
+                    ready[canon(ops[1][1:])] = (
+                        ready.get(canon(ops[0][1:]), 0) + MOVE_LATENCY
+                    )
                     continue
                 if load_t is not None:
                     ready[canon(ops[1][1:])] = load_t
@@ -217,7 +230,13 @@ def main() -> int:
     ap.add_argument("--loads", action="store_true",
                     help="accept memory source operands (5-cycle loads); skip storing loops")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--move-latency", type=int, default=0, metavar="N",
+        help="cost of a reg-reg move: 0 = Intel (moves eliminated at rename, "
+             "the default), 1 = AMD Zen (vector moves are NOT eliminated)",
+    )
     args = ap.parse_args()
+    set_move_latency(args.move_latency)
     lines = open(args.asm, encoding="utf-8").read().splitlines()
     insns = pick_loop(function_lines(lines, args.function), args.label, skip_stores=args.loads)
     res = analyse(insns, loads=args.loads)

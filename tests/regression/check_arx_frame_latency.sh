@@ -132,6 +132,31 @@ check() {
     echo "FAIL [$tag]: recurrence $got cycles/double-round, anchored optimum is $max"
     fail=1
   fi
+  # Intel eliminates XMM register moves at rename, so `movdqa` costs 0 in the
+  # model above and the destructiveness of the legacy SSE encoding is free
+  # there.  AMD Zen does NOT eliminate vector moves: every staging copy is a
+  # real uop with 1-cycle latency and, inside an ARX recurrence, it lands on
+  # the critical path.  Price the same loop under that model (moves = 1) and
+  # bound the gap.  At the SSE2 baseline the only copies left are the
+  # unavoidable pre-shift copy of each `pslld`/`psrld`/`por` rotate triple
+  # (one per nontrivial rotate, six per double round across the two lane
+  # groups); everything else is a VEX three-operand form with no copies at
+  # all, so the gap there must be exactly zero.  If the backend ever goes
+  # back to staging a lane op through %xmm0 (`movdqa %xmm0, %xmmN` after the
+  # op), this bound fails and names the vendor asymmetry that caused the
+  # 2.26x EPYC regression on chacha20_block.
+  local zslack=0
+  case "$flags" in ""|"-march=x86-64") zslack=6 ;; esac
+  local zmax=$((max + zslack)) zgot
+  zgot=$($lat "$tmp/$form.s" --function "$func" --move-latency 1 --json |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["cycles_per_iteration"])')
+  if python3 -c "import sys; sys.exit(0 if $zgot <= $zmax else 1)"; then
+    echo "ok   [$tag]: Zen-priced recurrence $zgot cycles/double-round (<= $zmax)"
+  else
+    echo "FAIL [$tag]: Zen-priced recurrence $zgot cycles/double-round (<= $zmax):" >&2
+    echo "      vector register moves are not eliminated on AMD; a staging copy is back" >&2
+    fail=1
+  fi
   [[ $run == run ]] || return 0
   # shellcheck disable=SC2086
   "$CCC" -O2 $flags -DBLOCK_COUNT=4096U -DPASSES=2U "$tmp/$form.c" -o "$tmp/$form.bin"

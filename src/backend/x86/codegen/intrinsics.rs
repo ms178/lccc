@@ -1586,6 +1586,13 @@ impl X86Codegen {
             self.sse_store_dest(dest_ptr, "xmm0");
             return;
         }
+
+        if self.emit_sse_legacy_home_form(dest_ptr, &args[0], &args[1], sse_inst)
+            || self.emit_sse_dying_operand_form(dest_ptr, args, sse_inst)
+        {
+            return;
+        }
+
         let a1_last = matches!(&args[1], Operand::Value(v)
             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
         if a1_last {
@@ -1598,6 +1605,165 @@ impl X86Codegen {
         self.state
             .emit_fmt(format_args!("    {} %xmm1, %xmm0", sse_inst));
         self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
+    /// Emit a commutative 128-bit op into the operand that is dying,
+    /// instead of staging a copy of the live one.
+    ///
+    /// SSE is destructive, so `op a, b` has to destroy one operand.  When
+    /// the SECOND operand's value is at its last use (`value_use_counts`,
+    /// the same map the ALU and cast emitters use for their last-use folds)
+    /// and already lives in a register, destroy THAT one and read the live
+    /// operand as the source: `op %live, %dying`.  SLP-vectorized FP loops
+    /// are the payoff — `c[j] += s * b[j]` used to emit a copy of the
+    /// loop-invariant `s` into scratch per iteration (`movdqa %xmm15,
+    /// %xmm0`) purely to have a destructible operand, where `mulpd %xmm15,
+    /// %loaded` costs nothing extra.
+    ///
+    /// Declines (returns false) whenever the liveness premise is
+    /// unavailable (no use count, or more than one use), the dying value
+    /// has no materialised register, a deferred store still names it, the
+    /// live operand is not itself in a register, both operands resolve to
+    /// one register, or the destination's allocated home is some other
+    /// register — the caller then stages as before.
+    fn emit_sse_dying_operand_form(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        sse_inst: &str,
+    ) -> bool {
+        // Dying-operand (commutative) form: no staging copy, no broadcast
+        // copy.  SSE is destructive, so `op a, b` has to destroy one
+        // operand.  When the SECOND operand's value is at its last use and
+        // already lives in a register, destroy THAT one and read the live
+        // operand as the source: `op %live, %dying`.  SLP-vectorized FP
+        // loops are the payoff — `c[j] += s * b[j]` used to emit a copy of
+        // the loop-invariant `s` into a scratch register per iteration
+        // (`movdqa %xmm15, %xmm0`) purely to have a destructible operand,
+        // where `mulpd %xmm15, %loaded` costs nothing extra.
+        //
+        // The liveness premise comes from `value_use_counts` (the same map
+        // the ALU and cast emitters use for their last-use folds): a value
+        // with exactly one use cannot be read again, so destroying its home
+        // is safe.  The form declines whenever that premise is unavailable
+        // (no use count, more than one use), the value has no materialised
+        // register, a deferred store still names it, the live operand is
+        // not itself in a register, or the destination's allocated home is
+        // some other register — the caller then stages as before.
+        if Self::sse128_mnemonic_commutative(sse_inst) {
+            if let (Operand::Value(live), Operand::Value(dying)) = (&args[0], &args[1]) {
+                let last_use = self.value_use_counts.get(&dying.0).copied() == Some(1)
+                    && self.value_use_counts.get(&live.0).copied() != Some(1);
+                if last_use
+                    && live.0 != dying.0
+                    && self.state.pending_vec_store.map(|(p, _, _)| p) != Some(dying.0)
+                {
+                    let dying_reg = self.vec_operand_reg(dying);
+                    let live_reg = self.vec_operand_reg(live);
+                    if let (Some(dst_reg), Some(src_reg)) = (dying_reg, live_reg)
+                        && src_reg != dst_reg
+                    {
+                        let dest_home = self.dest_xmm_home_name(dest_ptr);
+                        if dest_home.is_none() || dest_home == Some(dst_reg) {
+                            self.state.emit_fmt(format_args!(
+                                "    {} %{}, %{}",
+                                sse_inst, src_reg, dst_reg
+                            ));
+                            self.sse_commit_dest_direct(dest_ptr, dst_reg);
+                            if dest_home.is_none() {
+                                let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
+                                use crate::backend::state::SlotAddr;
+                                if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                                    self.state.resolve_slot_addr(dest_ptr.0)
+                                {
+                                    if !deferred {
+                                        self.state.emit_fmt(format_args!(
+                                            "    movdqu %{}, {}",
+                                            dst_reg,
+                                            self.slot_ref(slot.0)
+                                        ));
+                                    } else {
+                                        self.state.pending_vec_store =
+                                            Some((dest_ptr.0, dst_reg, false));
+                                    }
+                                }
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Emit a 128-bit SSE binary op directly into the destination's home
+    /// register, without the `%xmm0` staging the destructive form needs.
+    ///
+    /// Intel eliminates XMM register moves at rename, so staging
+    /// (`movdqa` in, op, `movdqa` out to the home) is nearly free there and
+    /// the pattern survived in this emitter.  AMD Zen does NOT eliminate
+    /// vector register moves: each copy is a real uop with 1-cycle latency
+    /// and, inside a loop-carried recurrence (an ARX cipher round, an
+    /// accumulator chain), it lands on the critical path.  Measured: the
+    /// 4-lane ChaCha20 core was 2.26x GCC's scalar loop on EPYC 9V45 while
+    /// the same binary was at parity with GCC on Xeon.
+    ///
+    /// The fix is not to pick a different algorithm per vendor but to stop
+    /// emitting the staging: load args[0] straight into the destination's
+    /// home and destroy it there.  One instruction per lane op, no %xmm0
+    /// round trip, and the result is born in the register the rest of the
+    /// block already reads — the same shape the VEX.128 path produces, so
+    /// both ISAs get one non-destructive op with no copies.  Nothing here
+    /// branches on CPU vendor: the form is chosen on ISA feature, and it is
+    /// never worse than the staging form on either vendor.
+    ///
+    /// Declines (returns false, letting the caller stage through %xmm0)
+    /// when the destination has no XMM home (it lives in a slot); when
+    /// either source already occupies the home register (the in-place and
+    /// copy-coalesced paths own the `dest == src1` shape, and `dest ==
+    /// src2` would clobber a live source); when a source is a pending
+    /// memory fold (it has no materialised register contents); or when a
+    /// source register was never claimed for a 128-bit width.
+    fn emit_sse_legacy_home_form(
+        &mut self,
+        dest_ptr: &Value,
+        arg0: &Operand,
+        arg1: &Operand,
+        sse_inst: &str,
+    ) -> bool {
+        if let (Operand::Value(a0), Operand::Value(a1)) = (arg0, arg1) {
+            if a0.0 != a1.0 {
+                let memfold_blocks = self
+                    .state
+                    .pending_vec_memfold
+                    .as_ref()
+                    .is_some_and(|pf| pf.val == a0.0 || pf.val == a1.0);
+                if !memfold_blocks {
+                    // The scratch is `%xmm0`, so a home there would be
+                    // clobbered by the second load; the staging path below
+                    // handles that shape correctly.
+                    if let Some(home) = self.dest_xmm_home_name(dest_ptr).filter(|h| *h != "xmm0") {
+                        let a0_home = self.vec_operand_reg(a0) == Some(home);
+                        let a1_home = self.vec_operand_reg(a1) == Some(home);
+                        if !a0_home && !a1_home {
+                            // args[0] into the home, then args[1] into the
+                            // scratch slot the destructive form consumes.
+                            self.sse_load_arg(arg0, home);
+                            self.sse_load_arg(arg1, "xmm0");
+                            self.state
+                                .emit_fmt(format_args!("    {} %xmm0, %{}", sse_inst, home));
+                            if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(a1.0) {
+                                self.state.pending_vec_store = None;
+                            }
+                            self.sse_commit_dest_direct(dest_ptr, home);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Emit SSE unary 128-bit op with immediate: load xmm0 from arg0 ptr,

@@ -38,22 +38,63 @@ _mm512_setzero_si512(void)
 
 /* === Float Load / Store === */
 
-static __inline__ __m512 __attribute__((__always_inline__))
+/* One `vmovdqu64` each, at every optimization level.  These were lane loops
+ * over 16 elements, and unlike the 256-bit ones the SLP vectorizer never folded
+ * them: measured at -O2 a load cost 39 instructions and a 472-byte frame, a
+ * store 33 instructions, where gcc-16 emits two.  `_mm512_loadu_pd`/
+ * `_mm512_storeu_pd` did not exist at all.  The native helper is the same
+ * `vmovdqu64_load`/`_store` pair `_mm512_loadu_si512` already uses; the move is
+ * untyped, so the cast is free. */
+static __inline__ __m512 __attribute__((__always_inline__, __artificial__))
 _mm512_loadu_ps(void const *__p)
 {
-    __m512 __r;
-    const float *__fp = (const float *)__p;
-    for (int __i = 0; __i < 16; __i++)
-        __r[__i] = __fp[__i];
-    return __r;
+    return *(__m512 *)(__lccc_simd512_i_vmovdqu64_load(0, __p));
 }
 
-static __inline__ void __attribute__((__always_inline__))
+static __inline__ void __attribute__((__always_inline__, __artificial__))
 _mm512_storeu_ps(void *__p, __m512 __a)
 {
-    float *__fp = (float *)__p;
-    for (int __i = 0; __i < 16; __i++)
-        __fp[__i] = __a[__i];
+    __lccc_simd512_i_vmovdqu64_store(0, __p, (__m512i)__a);
+}
+
+static __inline__ __m512d __attribute__((__always_inline__, __artificial__))
+_mm512_loadu_pd(void const *__p)
+{
+    return *(__m512d *)(__lccc_simd512_i_vmovdqu64_load(0, __p));
+}
+
+static __inline__ void __attribute__((__always_inline__, __artificial__))
+_mm512_storeu_pd(void *__p, __m512d __a)
+{
+    __lccc_simd512_i_vmovdqu64_store(0, __p, (__m512i)__a);
+}
+
+/* Aligned forms: the EVEX move has no separate aligned encoding worth a
+ * different instruction count on any core lccc targets, and the misaligned
+ * fault is not something portable code may rely on (gcc's own headers route
+ * several of these through the same `vmovdqu64`). */
+static __inline__ __m512 __attribute__((__always_inline__, __artificial__))
+_mm512_load_ps(void const *__p)
+{
+    return *(__m512 *)(__lccc_simd512_i_vmovdqu64_load(0, __p));
+}
+
+static __inline__ void __attribute__((__always_inline__, __artificial__))
+_mm512_store_ps(void *__p, __m512 __a)
+{
+    __lccc_simd512_i_vmovdqu64_store(0, __p, (__m512i)__a);
+}
+
+static __inline__ __m512d __attribute__((__always_inline__, __artificial__))
+_mm512_load_pd(void const *__p)
+{
+    return *(__m512d *)(__lccc_simd512_i_vmovdqu64_load(0, __p));
+}
+
+static __inline__ void __attribute__((__always_inline__, __artificial__))
+_mm512_store_pd(void *__p, __m512d __a)
+{
+    __lccc_simd512_i_vmovdqu64_store(0, __p, (__m512i)__a);
 }
 
 /* === Float Set === */
@@ -69,23 +110,25 @@ _mm512_setzero_ps(void)
 
 /* === Float Arithmetic === */
 
-static __inline__ __m512 __attribute__((__always_inline__))
-_mm512_add_ps(__m512 __a, __m512 __b)
-{
-    __m512 __r;
-    for (int __i = 0; __i < 16; __i++)
-        __r[__i] = __a[__i] + __b[__i];
-    return __r;
-}
+/* 512-bit float arithmetic is ONE EVEX instruction, not a 16-iteration lane
+ * loop.  The loop was measured at 39 instructions per operation at -O2 (the
+ * vectorizer does not fold a 16-lane float loop into zmm), against one
+ * `vaddps` from the native helper.  A 512-bit value is still memory-resident
+ * in this backend (see docs/PERFORMANCE-BACKLOG.md), so the helper also pays a
+ * spill/reload; that is a separate, documented backend limitation. */
+void *__lccc_simd512_ps_vaddps512(long, __m512, __m512);
+void *__lccc_simd512_ps_vsubps512(long, __m512, __m512);
+void *__lccc_simd512_ps_vmulps512(long, __m512, __m512);
 
-static __inline__ __m512 __attribute__((__always_inline__))
-_mm512_mul_ps(__m512 __a, __m512 __b)
-{
-    __m512 __r;
-    for (int __i = 0; __i < 16; __i++)
-        __r[__i] = __a[__i] * __b[__i];
-    return __r;
-}
+#define _mm512_add_ps(__a, __b) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vaddps512(0, __a, __b))
+
+#define _mm512_sub_ps(__a, __b) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vsubps512(0, __a, __b))
+
+#define _mm512_mul_ps(__a, __b) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vmulps512(0, __a, __b))
+
 
 /* AVX-512F FMA3 helpers are single-rounding operations regardless of
  * -ffp-contract. Route through the native EVEX helper rather than a C lane
@@ -98,6 +141,46 @@ void *__lccc_simd512_pd_vfmadd132pd512(long, __m512d, __m512d, __m512d);
 
 #define _mm512_fmadd_pd(__a, __b, __c) \
     __CCC_M512D_FROM_BUILTIN(__lccc_simd512_pd_vfmadd132pd512(0, __a, __b, __c))
+
+void *__lccc_simd512_ps_vfmsub132ps512(long, __m512, __m512, __m512);
+#define _mm512_fmsub_ps(__a, __b, __c) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vfmsub132ps512(0, __a, __b, __c))
+
+void *__lccc_simd512_ps_vfnmadd132ps512(long, __m512, __m512, __m512);
+#define _mm512_fnmadd_ps(__a, __b, __c) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vfnmadd132ps512(0, __a, __b, __c))
+
+void *__lccc_simd512_ps_vfnmsub132ps512(long, __m512, __m512, __m512);
+#define _mm512_fnmsub_ps(__a, __b, __c) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vfnmsub132ps512(0, __a, __b, __c))
+
+void *__lccc_simd512_ps_vfmaddsub132ps512(long, __m512, __m512, __m512);
+#define _mm512_fmaddsub_ps(__a, __b, __c) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vfmaddsub132ps512(0, __a, __b, __c))
+
+void *__lccc_simd512_ps_vfmsubadd132ps512(long, __m512, __m512, __m512);
+#define _mm512_fmsubadd_ps(__a, __b, __c) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vfmsubadd132ps512(0, __a, __b, __c))
+
+void *__lccc_simd512_pd_vfmsub132pd512(long, __m512d, __m512d, __m512d);
+#define _mm512_fmsub_pd(__a, __b, __c) \
+    __CCC_M512D_FROM_BUILTIN(__lccc_simd512_pd_vfmsub132pd512(0, __a, __b, __c))
+
+void *__lccc_simd512_pd_vfnmadd132pd512(long, __m512d, __m512d, __m512d);
+#define _mm512_fnmadd_pd(__a, __b, __c) \
+    __CCC_M512D_FROM_BUILTIN(__lccc_simd512_pd_vfnmadd132pd512(0, __a, __b, __c))
+
+void *__lccc_simd512_pd_vfnmsub132pd512(long, __m512d, __m512d, __m512d);
+#define _mm512_fnmsub_pd(__a, __b, __c) \
+    __CCC_M512D_FROM_BUILTIN(__lccc_simd512_pd_vfnmsub132pd512(0, __a, __b, __c))
+
+void *__lccc_simd512_pd_vfmaddsub132pd512(long, __m512d, __m512d, __m512d);
+#define _mm512_fmaddsub_pd(__a, __b, __c) \
+    __CCC_M512D_FROM_BUILTIN(__lccc_simd512_pd_vfmaddsub132pd512(0, __a, __b, __c))
+
+void *__lccc_simd512_pd_vfmsubadd132pd512(long, __m512d, __m512d, __m512d);
+#define _mm512_fmsubadd_pd(__a, __b, __c) \
+    __CCC_M512D_FROM_BUILTIN(__lccc_simd512_pd_vfmsubadd132pd512(0, __a, __b, __c))
 
 /* === Float Reduce === */
 
