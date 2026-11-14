@@ -3470,6 +3470,14 @@ gate "ifconv-arm-budget-switch" fast \
 gate "byte-count-classifier-vectorize" fast \
     env CCC="$LCCC" bash tests/regression/check_byte_count_classifier_vectorize.sh
 
+# LICM must see an intrinsic's `dest_ptr` as a value operand: the Setzero128
+# result-slot hoist used to leave its in-loop alloca behind (260 CCC_VERIFY_IR
+# dominance violations on simd_crc_adler). Pins verify-clean output on all
+# three reproducer TUs and the preserved slot+intrinsic hoist. Mirrored in the
+# hosted fast-contracts lane (parity-checked).
+gate "licm-verify-intrinsic-slots" fast \
+    env CCC="$LCCC" bash tests/regression/check_licm_verify_intrinsic_slots.sh
+
 # The peephole used to change its mind about a line because of a trailing blank:
 # a padded load stopped forwarding the constant store above it (lccc's own
 # sha256 output), the %rcx address-copy fold was lost when the CONSUMER line was

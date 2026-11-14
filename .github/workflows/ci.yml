@@ -2728,6 +2728,14 @@ jobs:
         # not as a silent 3-10x runtime loss one release later.  Mirrored in
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_byte_count_classifier_vectorize.sh
+        # LICM must see an intrinsic's `dest_ptr` as a value operand:
+        # `Setzero128 { dest_ptr: %slot }` once hoisted ABOVE the in-loop
+        # alloca defining its result slot (260 CCC_VERIFY_IR dominance
+        # violations on simd_crc_adler alone). Pins verify-clean output on
+        # the three reproducer TUs AND that slot+intrinsic still hoist
+        # together (no pxor back inside the chunk loop). Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_licm_verify_intrinsic_slots.sh
         # `_mm_max_sd` / `_mm_min_sd` must be the single hardware `maxsd` /
         # `minsd` with Intel's second-operand-wins tie/NaN semantics bit-exact
         # (signed zeros and the preserved high lane included), differentially
