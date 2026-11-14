@@ -1836,6 +1836,14 @@ jobs:
       run: bash tests/regression/check_fma_digit_permutation.sh --lccc target/fastbuild/lccc --reference gcc-16
     - name: Packed integer and bitwise maps must stay in registers (RH-03)
       run: bash tests/regression/check_x86_int_map_registers.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: AVX-256 float bitwise forms are one instruction
+      run: bash tests/regression/check_avx256_float_bitwise.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: Every FMA3 spelling is one fused instruction
+      run: bash tests/regression/check_fma3_family.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: 256- and 512-bit load/store intrinsics are single moves
+      run: bash tests/regression/check_wide_load_store.sh --lccc target/fastbuild/lccc --reference gcc-16
+    - name: movemask and blend_epi32 are one instruction
+      run: bash tests/regression/check_avx2_mask_blend.sh --lccc target/fastbuild/lccc --reference gcc-16
     - name: binary16 conversion must be value-identical with and without F16C
       run: bash tests/regression/check_f16_conversion_parity.sh --lccc target/fastbuild/lccc --reference gcc-16
     - name: Pointer IV collapse and zero-guard count instruction selection
