@@ -1648,7 +1648,10 @@ impl X86Codegen {
                     .as_ref()
                     .is_some_and(|pf| pf.val == a0.0 || pf.val == a1.0);
                 if !memfold_blocks {
-                    if let Some(home) = self.dest_xmm_home_name(dest_ptr) {
+                    // The scratch is `%xmm0`, so a home there would be
+                    // clobbered by the second load; the staging path below
+                    // handles that shape correctly.
+                    if let Some(home) = self.dest_xmm_home_name(dest_ptr).filter(|h| *h != "xmm0") {
                         let a0_home = self.vec_operand_reg(a0) == Some(home);
                         let a1_home = self.vec_operand_reg(a1) == Some(home);
                         if !a0_home && !a1_home {
