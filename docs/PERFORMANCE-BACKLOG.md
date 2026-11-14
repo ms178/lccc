@@ -124,6 +124,34 @@ fluctuation in a byte-identical executable to optimization.
   loop assembly. gzip's helper is already inlined; byte-load induction already
   widened. Acceptance: a generic sound lowering change, negative width/alias
   witnesses, native paired gain and no full-corpus codegen regression.
+- **AMD Zen vector register moves (vendor asymmetry in the cost model):**
+  SOLVED for the emitter, OPEN for the model's reach. Intel eliminates XMM
+  register moves at rename, so the legacy SSE2 lane emitter used to stage
+  every binary vector op through `%xmm0` (`movdqa` in, op, `movdqa` out to
+  the destination's home) — harmless on Xeon, 2.26x on EPYC 9V45 for
+  `chacha20_block`, because Zen does not eliminate vector moves and the
+  copies sit on the ARX recurrence. The emitter now loads args[0] into the
+  destination's home and destroys it there (same shape as the VEX.128
+  path), ISA-feature-gated, no vendor dispatch: `chacha20_block` core
+  195 -> 189 instructions, `movdqa` 15 -> 9, loop body 61 -> 55, local
+  265 -> 257 ms against gcc-16's 290 ms. `scripts/loop_latency.py` gained
+  `--move-latency` (0 = Intel, 1 = Zen) and
+  `tests/regression/check_arx_frame_latency.sh` pins both price lists
+  (32/38, 28/28, 24/24 for x86-64 / v3 / v4) so a staging copy cannot come
+  back unnoticed. Residual, measured not guessed: with the copies gone the
+  SSE2 lane form's Zen-priced recurrence is 38 cycles/double round against
+  Intel's 32, and the remaining 6 copies are the unavoidable pre-shift
+  copies of the `pslld`/`psrld`/`por` rotate triples (one per nontrivial
+  rotate). GCC's scalar form is ~24-30 cycles per double round on a wide
+  Zen core, so at the SSE2 baseline the lane form cannot win on EPYC by
+  instruction selection alone; the only remaining lever is a
+  register-resident scalar ARX form, which needs the allocator to keep 16
+  live 32-bit values in GPRs instead of spilling them all (today the
+  scalar form is 355 ms local versus 257 ms for the lane form). Do not
+  ship that without the allocator work: the measured regressions are in
+  session notes, and `-march=x86-64-v3`/`v4` already emit the optimal
+  copy-free lane loop (28/24 cycles), which is what the CI benchmark
+  report compiles with.
 - **expat_xml_scan / chacha20_block:** 1.2569 / 1.1947 versus Clang. Separate
   loop instructions, register pressure and scheduling; chacha's baseline
   simulated Ir is already lower than Clang, so count reduction is not enough.
