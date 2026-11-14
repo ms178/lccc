@@ -476,7 +476,7 @@ fn imm_fits_store(imm: i64, size: MoveSize) -> bool {
         // FP/SSE moves carry no immediate: an immediate-backed mapping can
         // never be created for them (parse_imm_slot_store only matches the
         // integer mov mnemonics).
-        MoveSize::SLQ | MoveSize::SD | MoveSize::SS | MoveSize::DQ => false,
+        MoveSize::SLQ | MoveSize::SD | MoveSize::SS | MoveSize::DQ | MoveSize::QQ => false,
     }
 }
 
@@ -487,7 +487,7 @@ fn mov_imm_store_mnemonic(size: MoveSize) -> &'static str {
         MoveSize::L => "movl",
         MoveSize::W => "movw",
         MoveSize::B => "movb",
-        MoveSize::SLQ | MoveSize::SD | MoveSize::SS | MoveSize::DQ => "movq",
+        MoveSize::SLQ | MoveSize::SD | MoveSize::SS | MoveSize::DQ | MoveSize::QQ => "movq",
     }
 }
 
@@ -499,25 +499,39 @@ fn line_mnemonic(text: &str) -> &str {
     text.split_whitespace().next().unwrap_or("")
 }
 
-/// Parse the first `%xmmN` operand in `text` into its XMM family id
-/// (`24..=39`, the space [`is_xmm_family`] defines). Lines classified as
-/// `StoreXmmRbp`/`LoadXmmRbp` carry exactly one XMM operand by construction
-/// (the other end of the move is the frame slot), so "first" is also "the".
+/// Parse the first `%xmmN`/`%ymmN`/`%zmmN` operand in `text` into its XMM
+/// family id (`24..=39`, the space [`is_xmm_family`] defines — all three
+/// spellings alias one physical register bank, so they share the family).
+/// Lines classified as `StoreXmmRbp`/`LoadXmmRbp` carry exactly one vector
+/// operand by construction (the other end of the move is the frame slot),
+/// so "first" is also "the". The wider spellings matter for INVALIDATION:
+/// a `%ymm` slot load rewrites the family's register, so every mapping
+/// backed by it must die even though no forwarding is attempted
+/// (`MoveSize::QQ` is screened out of the mapping paths).
 fn parse_xmm_family(text: &str) -> Option<RegId> {
-    let mut rest = text;
-    while let Some(pos) = rest.find("%xmm") {
-        let after = &rest[pos + 4..];
-        let end = after
+    let bytes = text.as_bytes();
+    let mut rest = 0usize;
+    while rest + 5 <= bytes.len() {
+        let Some(pos) = text[rest..].find('%') else {
+            break;
+        };
+        let at = rest + pos;
+        rest = at + 1;
+        let tail = &bytes[at + 1..];
+        if tail.len() < 4 || !matches!(tail[0], b'x' | b'y' | b'z') || &tail[1..3] != b"mm" {
+            continue;
+        }
+        let digits = &text[at + 4..];
+        let end = digits
             .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(after.len());
+            .unwrap_or(digits.len());
         if end > 0 {
-            if let Ok(n) = after[..end].parse::<u8>() {
+            if let Ok(n) = digits[..end].parse::<u8>() {
                 if n < 16 {
                     return Some(24 + n);
                 }
             }
         }
-        rest = &rest[pos + 4..];
     }
     None
 }
@@ -1108,6 +1122,14 @@ fn gsf_handle_load_xmm(
     let Some(dst) = parse_xmm_family(infos[i].trimmed(store.get(i))) else {
         return false;
     };
+    // A 32-byte reload is never forwarded (no register form we emit
+    // reproduces both the 32 copied bytes and the VEX upper-zeroing of
+    // bits 256..MAXVL), but it DOES rewrite the destination family: every
+    // mapping backed by that register is stale from here on.
+    if load_size == MoveSize::QQ {
+        invalidate_reg_flat(slot_entries, reg_offsets, dst);
+        return false;
+    }
     let mapping = slot_entries
         .iter()
         .rev()
@@ -1712,6 +1734,18 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             LineKind::StoreXmmRbp { offset, size } => {
                 if !rbp_is_frame && infos[i].reg_refs & (1u16 << REG_RBP) != 0 {
                     invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
+                } else if size == MoveSize::QQ {
+                    // 32-byte stores never create a mapping (fail closed: a
+                    // narrower reload served from the register would need
+                    // the ymm→xmm low-lane equivalence proven path by path,
+                    // and a full 32-byte forward would have to reproduce the
+                    // VEX upper-zeroing). Range-invalidate exactly.
+                    invalidate_slots_at(
+                        &mut slot_entries,
+                        &mut reg_offsets,
+                        offset,
+                        size.byte_size(),
+                    );
                 } else if xmm_forward_ok
                     && (rbp_is_frame || !line_base_is_rbp(infos[i].trimmed(store.get(i))))
                 {
@@ -2833,5 +2867,116 @@ mod tests {
                 "{line} is a half-width move and must keep its old classification"
             );
         }
+    }
+
+    #[test]
+    fn qq_slot_moves_are_classified_with_their_full_extent() {
+        // `%ymm` upgrades the packed spellings to the 32-byte class; the
+        // dead-store passes then see the true extent instead of a
+        // conservative self-read `Other` line.
+        for line in [
+            "vmovdqu %ymm0, 96(%rsp)",
+            "vmovdqu 96(%rsp), %ymm0",
+            "vmovups %ymm7, -64(%rbp)",
+            "vmovaps 32(%rsp), %ymm15",
+            "vmovdqa %ymm3, 0(%rsp)",
+        ] {
+            let kind = classify_line(&format!("    {line}")).kind;
+            let got = match kind {
+                LineKind::StoreXmmRbp { size, .. } | LineKind::LoadXmmRbp { size, .. } => size,
+                other => panic!("{line} classified as {other:?}"),
+            };
+            assert_eq!(got, MoveSize::QQ, "{line}");
+            assert_eq!(got.byte_size(), 32, "{line} must cover 32 bytes");
+        }
+        // ZMM (64-byte), EVEX-masked and EVEX-suffixed spellings stay
+        // unclassified: their extents or lane semantics are not plain
+        // full-width slot facts.
+        for line in [
+            "vmovdqu %zmm0, 96(%rsp)",
+            "vmovups 96(%rsp), %zmm1",
+            "vmovdqu %ymm0 {%k1}, 96(%rsp)",
+            "vmovdqu64 %ymm0, 96(%rsp)",
+            "vmovdqu32 96(%rsp), %ymm2",
+        ] {
+            assert!(
+                !matches!(
+                    classify_line(&format!("    {line}")).kind,
+                    LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. }
+                ),
+                "{line} must keep its conservative classification"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_xmm_family_reads_all_three_vector_spellings() {
+        assert_eq!(parse_xmm_family("vmovdqu %ymm3, 96(%rsp)"), Some(24 + 3));
+        assert_eq!(parse_xmm_family("vmovdqu 96(%rsp), %ymm15"), Some(24 + 15));
+        assert_eq!(parse_xmm_family("movsd %xmm7, 8(%rbp)"), Some(24 + 7));
+        assert_eq!(parse_xmm_family("vmovups %zmm2, (%rsp)"), Some(24 + 2));
+        assert_eq!(parse_xmm_family("movq %rax, 8(%rsp)"), None);
+        assert_eq!(parse_xmm_family("vmovdqu %ymm16, (%rsp)"), None);
+    }
+
+    #[test]
+    fn qq_store_invalidates_overlapping_scalar_mapping() {
+        // A scalar store maps slot 24; the 32-byte store starting at 16
+        // covers [16, 48) and must kill that mapping even though the start
+        // offsets differ — the reload may NOT forward from %xmm1.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $72, %rsp\n",
+            "    movsd %xmm1, 24(%rsp)\n",
+            "    vmovdqu %ymm0, 16(%rsp)\n",
+            "    movsd 24(%rsp), %xmm2\n",
+            "    addq $72, %rsp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        global_store_forwarding(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        assert!(
+            out.iter().any(|l| l == "movsd 24(%rsp), %xmm2"),
+            "reload must stay a memory load, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn qq_load_kills_dest_register_mappings() {
+        // %xmm1's slot-8 mapping dies at the 32-byte reload of %ymm1 (same
+        // family): the later scalar reload of slot 8 must not forward from
+        // a register that no longer holds the stored value.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $72, %rsp\n",
+            "    movsd %xmm1, 8(%rsp)\n",
+            "    vmovdqu 32(%rsp), %ymm1\n",
+            "    movsd 8(%rsp), %xmm3\n",
+            "    addq $72, %rsp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        global_store_forwarding(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        assert!(
+            !out.iter()
+                .any(|l| l.contains("%xmm1, %xmm3") || l.contains("%xmm1,%xmm3")),
+            "stale %xmm1 must not be forwarded after the %ymm1 reload: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movsd 8(%rsp), %xmm3"),
+            "the slot reload must survive: {out:?}"
+        );
     }
 }

@@ -609,6 +609,276 @@ pub(super) fn forward_adjacent_ymm_self_reloads(
     changed
 }
 
+/// A full-width 128-bit vector move mnemonic (SSE and VEX spellings).
+fn is_xmm_full_move(mn: &str) -> bool {
+    matches!(
+        mn,
+        "movdqu" | "movdqa" | "movups" | "movaps" | "movupd" | "movapd"
+    ) || is_ymm_full_move(mn)
+}
+
+/// The displacement of a plain `D(%rsp)` suffix, `(%rsp)` counting as 0.
+/// `None` for anything else (index, `%rbp`, symbol, RIP).
+fn rsp_disp_of(mem: &str) -> Option<i64> {
+    let d = mem.strip_suffix("(%rsp)")?;
+    if d.is_empty() {
+        Some(0)
+    } else {
+        d.parse::<i64>().ok()
+    }
+}
+
+/// Every `D(%rsp)` displacement mentioned anywhere in `line`, with `None`
+/// yielded for a malformed or indexed `(%rsp` form so the caller can
+/// refuse. Scans RIGHT-anchored on `(%rsp)` occurrences and back-parses
+/// the displacement digits.
+fn each_rsp_disp(line: &str, mut f: impl FnMut(Option<i64>)) {
+    let bytes = line.as_bytes();
+    let mut from = 0usize;
+    while let Some(pos) = line[from..].find("(%rsp") {
+        let open = from + pos;
+        let after = open + 5; // index just past "(%rsp"
+        if bytes.get(after) != Some(&b')') {
+            f(None); // "(%rsp," indexed or truncated: not a plain slot
+            from = after;
+            continue;
+        }
+        // Back-parse [-+]?digits immediately before '('.
+        let mut start = open;
+        while start > 0 && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        if start > 0 && (bytes[start - 1] == b'-' || bytes[start - 1] == b'+') {
+            start -= 1;
+        }
+        let disp = if start == open {
+            Some(0)
+        } else {
+            line[start..open].parse::<i64>().ok()
+        };
+        f(disp);
+        from = after + 1;
+    }
+}
+
+/// Delete a full-width `%xmm`/`%ymm` store to a plain `D(%rsp)` frame slot
+/// whose SUFFIX — every line from the store to the function's `ret` — is a
+/// straight-line run that provably cannot observe the slot.  The shape is
+/// the hidden vector-return buffer write after the last call of a
+/// round-trip caller (`v8 f(v8 a){ return ext8(a); }` keeps
+/// `vmovdqu %ymm0, 48(%rsp)` in its epilogue once the paired reload is
+/// folded away): the value is already in the return register, the slot is
+/// dead, and the store costs a cacheline dirty + a store-buffer entry on
+/// every call.
+///
+/// Soundness is purely suffix-local, which sidesteps the two channels that
+/// make whole-function textual stack DSE unsound at this level:
+/// * OUTGOING STACK ARGUMENTS: a callee reads the caller's `[0, K)` slots
+///   with no textual `(%rsp)` reference in the caller — any `call` (or any
+///   control transfer at all) in the suffix refuses the deletion;
+/// * PRE-STORE POINTER ESCAPES: a `leaq D(%rsp), %r..` taken BEFORE the
+///   store can be dereferenced later through a plain GP operand — any
+///   indirect memory operand in the suffix refuses, so no read through
+///   any pointer survives the screen.
+///
+/// Allowed suffix lines, everything else fail-closed:
+/// * debug-transparent lines and deleted lines;
+/// * memory-free instructions (no parenthesis at all, or `(%rip)`-only
+///   constant pool reads — but no `xsave`/`xrstor`/`fnsave`/`fsave`/
+///   `frstor` family, whose implicit windows exceed any operand text, and
+///   no `push`/`pop`/`leave`/`enter`/`lea`, whose `%rsp` effects or
+///   address materialisation are not memory operands);
+/// * a plain `D(%rsp)` access whose conservative 64-byte window (the
+///   widest single x86 access through a displacement operand) does not
+///   overlap the stored `[D, D+width)` — refused outright once the stack
+///   pointer has shifted;
+/// * `addq $N, %rsp` (epilogue pop), after which any further `(%rsp)`
+///   text refuses;
+/// * the terminating `ret` — reaching it proves the store dead.
+pub(super) fn delete_dead_vector_epilogue_stores(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    'cand: for i in 0..len {
+        if infos[i].is_nop() || infos[i].pinned || infos[i].volatile_access {
+            continue;
+        }
+        let st = infos[i].trimmed(store.get(i));
+        let Some((smn, sreg, smem)) = split_mn_two_ops(st) else {
+            continue;
+        };
+        let width: i64 = if sreg.starts_with("%ymm") && is_ymm_full_move(smn) {
+            32
+        } else if sreg.starts_with("%xmm") && is_xmm_full_move(smn) {
+            16
+        } else {
+            continue;
+        };
+        if st.contains('{') {
+            continue; // EVEX writemask: not a plain full-width store
+        }
+        let Some(sdisp) = rsp_disp_of(smem) else {
+            continue;
+        };
+        // Walk the suffix: at most SUFFIX_CAP live lines (epilogues are
+        // short; anything longer is not the shape this pass is for).
+        const SUFFIX_CAP: usize = 48;
+        let mut live = 0usize;
+        let mut frame_size: Option<i64> = None; // from `addq $N, %rsp`
+        let mut j = i + 1;
+        while j < len {
+            if infos[j].is_nop() || debug_transparent(store, infos[j], j) {
+                j += 1;
+                continue;
+            }
+            // Directives do not execute; only the function-end marker
+            // matters (reached without `ret`: refuse).
+            if infos[j].kind == LineKind::Directive {
+                if infos[j].trimmed(store.get(j)).starts_with(".cfi_endproc") {
+                    continue 'cand;
+                }
+                j += 1;
+                continue;
+            }
+            live += 1;
+            if live > SUFFIX_CAP {
+                continue 'cand;
+            }
+            let t = infos[j].trimmed(store.get(j));
+            if t == "ret" || t == "retq" {
+                // The return-address read is implicit: at `ret` the slot
+                // sits at `frame_size(%rsp)` of the body (0 with no
+                // `addq`), and everything at or above it is the caller's
+                // (or the return address itself — the `movq %rax,(%rsp);
+                // ret` computed-jump idiom must never lose its store).
+                // Below it, the slot is this function's dead frame.
+                let fsz = frame_size.unwrap_or(0);
+                let in_dead_frame = if fsz > 0 {
+                    sdisp >= 0 && sdisp + width <= fsz
+                } else {
+                    // Frameless: [0,8) is the return address; at/above 8
+                    // is the callee-owned incoming-argument home area,
+                    // dead at `ret`.
+                    sdisp >= 8
+                };
+                if in_dead_frame {
+                    mark_nop(&mut infos[i]);
+                    changed = true;
+                }
+                continue 'cand;
+            }
+            // Control transfers, pointer-width stack ops, address
+            // materialisation, frame-pointer text, implicit-window
+            // save/restore families: refuse. (A label alone is refused
+            // for strictness even though suffix reads are screened.)
+            if infos[j].kind == LineKind::Label
+                || infos[j].kind == LineKind::InlineAsm
+                || t.starts_with('j')
+                || t.starts_with("call")
+                || t.starts_with("push")
+                || t.starts_with("pop")
+                || t.starts_with("lea")
+                || t == "leave"
+                || t.starts_with("enter")
+                || t.contains("%rbp")
+                || t.contains("xsave")
+                || t.contains("xrstor")
+                || t.contains("fnsave")
+                || t.contains("fsave")
+                || t.contains("frstor")
+            {
+                continue 'cand;
+            }
+            // The epilogue stack-pointer pop: records the frame size and
+            // forbids any later `(%rsp)` text (displacements re-map).
+            if let Some(n) = t
+                .strip_prefix("addq $")
+                .and_then(|r| r.strip_suffix(", %rsp"))
+                .and_then(|n| n.parse::<i64>().ok())
+            {
+                if frame_size.replace(n).is_some() {
+                    continue 'cand; // two pops: not a plain epilogue
+                }
+                j += 1;
+                continue;
+            }
+            // Every remaining `%rsp` mention must be the base of a plain
+            // memory operand — i.e. immediately preceded by `(`. This
+            // refuses `subq $N, %rsp`, `movq %rsp, %r..`,
+            // `andq $-32, %rsp`, AND the mixed form
+            // `movq %rsp, 8(%rsp)` whose first `%rsp` is a value escape.
+            {
+                let bytes = t.as_bytes();
+                let mut from = 0usize;
+                while let Some(p) = t[from..].find("%rsp") {
+                    let at = from + p;
+                    if at == 0 || bytes[at - 1] != b'(' {
+                        continue 'cand;
+                    }
+                    from = at + 4;
+                }
+            }
+            if t.contains('(') {
+                // Memory operands: only RIP-relative constant reads and
+                // non-overlapping plain `D(%rsp)` slots may pass.
+                let mut ok = true;
+                let mut saw_rsp = false;
+                each_rsp_disp(t, |d| match d {
+                    Some(d) => {
+                        saw_rsp = true;
+                        // Conservative 64-byte access window (the widest
+                        // single access through a displacement operand),
+                        // and no slot access at all once the stack
+                        // pointer has been popped.
+                        if frame_size.is_some() || (d < sdisp + width && d + 64 > sdisp) {
+                            ok = false;
+                        }
+                    }
+                    None => ok = false,
+                });
+                if !ok {
+                    continue 'cand;
+                }
+                if !saw_rsp {
+                    let parens = t.matches('(').count();
+                    if t.matches("(%rip)").count() != parens {
+                        continue 'cand;
+                    }
+                }
+            } else if !t.contains('%') {
+                // Operand-less text: implicit-memory string/system ops
+                // (`rep movsq`, `stosq`, ...) hide here. Allow only the
+                // known memory-free set.
+                if !matches!(
+                    t,
+                    "vzeroupper"
+                        | "vzeroall"
+                        | "endbr64"
+                        | "cltq"
+                        | "cltd"
+                        | "cqto"
+                        | "cwtl"
+                        | "cbtw"
+                        | "nop"
+                        | "mfence"
+                        | "lfence"
+                        | "sfence"
+                ) {
+                    continue 'cand;
+                }
+            }
+            // Register-only instructions (operands present, no memory
+            // operand) are memory-free on x86-64 compiled C (`xlat`, the
+            // lone implicit-memory register-form, is never emitted).
+            j += 1;
+        }
+        // Fell off the line store without `ret`: refuse (loop ends).
+    }
+    changed
+}
+
 #[cfg(test)]
 mod ymm_self_reload_tests {
     use super::*;
@@ -751,6 +1021,173 @@ mod ymm_self_reload_tests {
             out.iter().any(|l| l == "vmovdqu 48(%rsp), %ymm0"),
             "zmm function keeps its reload"
         );
+    }
+}
+
+#[cfg(test)]
+mod dead_vector_epilogue_store_tests {
+    use super::*;
+
+    fn run(asm: &str) -> (Vec<String>, bool) {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = delete_dead_vector_epilogue_stores(&mut store, &mut infos);
+        let lines = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (lines, changed)
+    }
+
+    #[test]
+    fn framed_epilogue_ymm_store_is_deleted() {
+        // The ret256 round-trip epilogue: the slot [48,80) lies inside the
+        // 104-byte popped frame and nothing between store and ret reads it.
+        let (out, changed) = run(concat!(
+            "    vmovdqu %ymm0, 48(%rsp)\n",
+            "    addq $104, %rsp\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert!(!out.iter().any(|l| l == "vmovdqu %ymm0, 48(%rsp)"));
+        assert!(out.iter().any(|l| l == "ret"));
+    }
+
+    #[test]
+    fn framed_epilogue_xmm_store_is_deleted() {
+        let (out, changed) = run(concat!(
+            "    movaps %xmm1, 16(%rsp)\n",
+            "    addq $40, %rsp\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert!(!out.iter().any(|l| l == "movaps %xmm1, 16(%rsp)"));
+    }
+
+    #[test]
+    fn slot_at_or_past_frame_edge_is_kept() {
+        // [40, 72) straddles the 64-byte frame: above the pop it is the
+        // caller's memory (return address / caller frame) — must stay.
+        for asm in [
+            concat!(
+                "    vmovdqu %ymm0, 40(%rsp)\n",
+                "    addq $64, %rsp\n",
+                "    ret\n",
+            ),
+            concat!(
+                "    vmovdqu %ymm0, 64(%rsp)\n",
+                "    addq $64, %rsp\n",
+                "    ret\n",
+            ),
+            // Negative displacement: not this function's popped frame.
+            concat!(
+                "    vmovdqu %ymm0, -32(%rsp)\n",
+                "    addq $64, %rsp\n",
+                "    ret\n",
+            ),
+        ] {
+            let (_, changed) = run(asm);
+            assert!(!changed, "frame-edge store must be kept:\n{asm}");
+        }
+    }
+
+    #[test]
+    fn frameless_return_address_region_is_kept() {
+        // No `addq`: [0,8) is the return address; `movq %rax, (%rsp); ret`
+        // style rewrites (and anything below 8) must never be deleted.
+        let (_, changed) = run(concat!("    movaps %xmm0, (%rsp)\n", "    ret\n",));
+        assert!(!changed);
+        // At/above 8 in a frameless function is the dead incoming-argument
+        // area: deletable.
+        let (out, changed) = run(concat!("    movaps %xmm0, 16(%rsp)\n", "    ret\n",));
+        assert!(changed);
+        assert!(!out.iter().any(|l| l == "movaps %xmm0, 16(%rsp)"));
+    }
+
+    #[test]
+    fn any_suffix_hazard_refuses() {
+        for suffix in [
+            "    call ext@PLT\n",            // outgoing stack args invisible
+            "    jmp .Ltail\n",              // control leaves the suffix
+            "    popq %rbx\n",               // pointer-width stack op
+            "    leaq 48(%rsp), %rdi\n",     // address escape
+            "    leave\n",                   // frame-pointer epilogue
+            "    movq %rbp, %rsp\n",         // frame-pointer text
+            "    xsave 0(%rsp)\n",           // implicit-window state save
+            "    movq (%rax), %rcx\n",       // indirect read (escaped ptr)
+            "    movq %rsp, %rax\n",         // stack-pointer value escape
+            "    subq $32, %rsp\n",          // stack re-extension
+            "    vmovdqu 48(%rsp), %ymm1\n", // direct overlapping read
+            "    vmovdqu 16(%rsp), %ymm1\n", // 64-byte window overlap
+            "    rep movsq\n",               // implicit-memory string op
+            "    movq %rax, 0(%rsp,%rcx)\n", // indexed rsp operand
+        ] {
+            let asm =
+                format!("    vmovdqu %ymm0, 48(%rsp)\n{suffix}    addq $104, %rsp\n    ret\n");
+            let (out, changed) = run(&asm);
+            assert!(!changed, "hazard must refuse deletion: {suffix:?}");
+            assert!(out.iter().any(|l| l == "vmovdqu %ymm0, 48(%rsp)"));
+        }
+    }
+
+    #[test]
+    fn disjoint_slot_access_and_rip_reads_are_transparent() {
+        // A read ≥64 bytes below the slot start cannot reach [48,80) even
+        // through the widest access window; RIP-relative constant reads and
+        // register-only ALU are memory-free.
+        let (out, changed) = run(concat!(
+            "    vmovdqu %ymm0, 112(%rsp)\n",
+            "    movq 8(%rsp), %rbx\n",
+            "    vpaddd .LC0(%rip), %ymm1, %ymm1\n",
+            "    addl %ecx, %eax\n",
+            "    vzeroupper\n",
+            "    addq $152, %rsp\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert!(!out.iter().any(|l| l == "vmovdqu %ymm0, 112(%rsp)"));
+        assert!(out.iter().any(|l| l == "movq 8(%rsp), %rbx"));
+    }
+
+    #[test]
+    fn slot_access_after_pop_and_double_pop_refuse() {
+        // After `addq $N, %rsp` every `D(%rsp)` means different memory.
+        let (_, changed) = run(concat!(
+            "    vmovdqu %ymm0, 48(%rsp)\n",
+            "    addq $104, %rsp\n",
+            "    movq 200(%rsp), %rbx\n",
+            "    ret\n",
+        ));
+        assert!(!changed);
+        // Two pops: not the plain epilogue shape.
+        let (_, changed) = run(concat!(
+            "    vmovdqu %ymm0, 48(%rsp)\n",
+            "    addq $64, %rsp\n",
+            "    addq $40, %rsp\n",
+            "    ret\n",
+        ));
+        assert!(!changed);
+    }
+
+    #[test]
+    fn masked_pinned_and_partial_stores_are_kept() {
+        // EVEX writemask: not a plain full-width store.
+        let (_, changed) = run(concat!(
+            "    vmovdqu %ymm0 {%k1}, 48(%rsp)\n",
+            "    addq $104, %rsp\n",
+            "    ret\n",
+        ));
+        assert!(!changed);
+        // Scalar store: below full width, left to eliminate_dead_stores.
+        let (_, changed) = run(concat!(
+            "    movsd %xmm0, 48(%rsp)\n",
+            "    addq $104, %rsp\n",
+            "    ret\n",
+        ));
+        assert!(!changed);
     }
 }
 

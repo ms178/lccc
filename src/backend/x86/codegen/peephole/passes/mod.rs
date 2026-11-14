@@ -1905,6 +1905,15 @@ fn peephole_optimize_inner(
             // to MoveSize::DQ).
             global_changed |=
                 local_patterns::forward_adjacent_ymm_self_reloads(&mut store, &mut infos);
+            // Suffix-local vector DSE: a full-width `%xmm`/`%ymm` store
+            // to a plain `D(%rsp)` slot that no line between it and
+            // `ret` can observe (the hidden return-buffer store left
+            // behind once its reload is forwarded above) is deleted.
+            // `eliminate_dead_stores` cannot see these: its byte-range
+            // model stops at MoveSize::DQ and the 32-byte spellings
+            // classify as `Other`.
+            global_changed |=
+                local_patterns::delete_dead_vector_epilogue_stores(&mut store, &mut infos);
         }
         if !sk("mem_fold") {
             global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos);
