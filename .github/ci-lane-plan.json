@@ -1129,7 +1129,7 @@
     "codegen-b": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 420.97,
+      "predicted_gate_seconds": 422.87,
       "shards": 2,
       "steps": [
         {
@@ -1231,6 +1231,10 @@
         {
           "measured_s": 1.89,
           "name": "Verify ARX lane-frame latency (vec_arx + arx_vectorize)"
+        },
+        {
+          "measured_s": 1.9,
+          "name": "Verify ARX boundary absorption (entry pack + guarded feed-forward)"
         },
         {
           "measured_s": 1.76,

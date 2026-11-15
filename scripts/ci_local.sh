@@ -1811,6 +1811,9 @@ gate "cfi-invariants" fast \
 gate "arx-frame-latency" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_arx_frame_latency.sh
 
+gate "arx-boundary-absorb" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_arx_boundary_absorb.sh
+
 gate "reassoc-latency" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_reassoc_latency.sh
 

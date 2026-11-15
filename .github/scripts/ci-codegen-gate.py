@@ -48,6 +48,24 @@ tree differ only where this tree emits less: glibc_memcmp 185→159 insns and
 206→195 and 8→3, portable_bit_counts 247→241, chacha20_block 200→199; the
 other six workloads are identical.
 
+Baseline notes (2026-11-15): `--update-baseline` for the ARX boundary
+absorber (PR #1187). Only chacha20_block is that PR's doing — every other
+workload measures IDENTICAL between ms178/lccc main (b3fe7bf) and the PR
+tree, so those deltas (gzip_crc32 69→70, expat_xml_scan 203→204, and the
+never-re-pinned improvements zlib_ng_adler32 210→209, glibc_memcmp 159→152
+insns / 18→14 moves, zstd_count 116→115, stencil5 127→123,
+portable_bit_counts 241→231 insns / 77→71 moves) are pre-existing main
+drift this refresh re-pins. chacha20_block 189→243 insns / 7→12 moves is
+the guarded dual exit path (vectorized feed-forward when `out` provably
+does not alias the input block, scalar fallback otherwise): static size is
+the wrong metric for a two-path shape, same charter as the stencil5 note
+above. Measured with callgrind on the full benchmark (16 × 2^17 blocks):
+1,388,428,509 → 1,373,748,438 executed instructions (−14.68M, −1.06%) with
+byte-identical output, stackmem 37→33 (LESS spill traffic), and interleaved
+wall clock 259 → 245-254 ms vs gcc-16's 291-299 ms on the same host; the
+absorbed shape also removes the Zen 5 store-forwarding round-trip that
+caused the 2.26x EPYC cliff.
+
 Usage:
     python3 ci-codegen-gate.py --lccc target/fastbuild/lccc
     python3 ci-codegen-gate.py --lccc ... --update-baseline
