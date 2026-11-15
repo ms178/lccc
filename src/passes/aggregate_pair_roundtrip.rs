@@ -63,7 +63,7 @@ use super::module_symbol_facts::ModuleSymbolFacts;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::provenance::{ChainStep, RootLeaf, chain_step, root_leaf};
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value};
 
 /// Bytes covered by the pattern: two 8-byte halves.
 const COPY_BYTES: usize = 16;
@@ -327,7 +327,19 @@ pub(crate) fn run_with_symbol_facts(func: &mut IrFunction, facts: &ModuleSymbolF
         apply(func, &c);
         total += 1;
     }
-    let collapsed = collapse_carrier_reloads(func);
+    let mut collapsed = 0;
+    // Round-trip forwarding can expose a carrier collapse and vice versa
+    // (a forwarded vector feeds a staging slot whose reload was the only
+    // thing keeping the carrier split alive), so iterate the pair to a
+    // fixpoint; each round removes at least one instruction, and the bound
+    // is a belt-and-braces guard against malformed IR.
+    for _ in 0..8 {
+        let round = forward_vector_roundtrips(func) + collapse_carrier_reloads(func);
+        if round == 0 {
+            break;
+        }
+        collapsed += round;
+    }
     if collapsed > 0 {
         // The collapse just removed the only READ of the staging home: the
         // split-half stores (and any zero-prefill of the same home) are now
@@ -341,7 +353,8 @@ pub(crate) fn run_with_symbol_facts(func: &mut IrFunction, facts: &ModuleSymbolF
 }
 
 /// Delete every store to a stack object that is provably never read and
-/// never escapes.
+/// never escapes — and then the object itself (alloca plus derived GEPs),
+/// unless it is a parameter home the prologue writes behind the IR's back.
 ///
 /// The proof is a closed-world walk over the object's pointer web, fail
 /// closed at every step: starting from each non-volatile `Alloca`, a derived
@@ -431,6 +444,24 @@ fn purge_unread_local_stores(func: &mut IrFunction) {
                         web.contains(&ptr.0)
                             && !matches!(val, Operand::Value(v) if web.contains(&v.0))
                     }
+                    // A whole-vector store INTO the object: a plain write,
+                    // deletable like `Store` — the stored value must not be
+                    // a web pointer and both pointer slots must stay inside
+                    // the web (the intrinsic names the destination twice).
+                    Instruction::Intrinsic {
+                        dest: None,
+                        op,
+                        dest_ptr: Some(dp),
+                        args,
+                    } if is_vec16_store_op(*op) => {
+                        web.contains(&dp.0)
+                            && matches!(
+                                args.as_slice(),
+                                [val, Operand::Value(p2), _]
+                                    if web.contains(&p2.0)
+                                        && !matches!(val, Operand::Value(v) if web.contains(&v.0))
+                            )
+                    }
                     _ => false,
                 };
                 if !ok {
@@ -448,14 +479,34 @@ fn purge_unread_local_stores(func: &mut IrFunction) {
             }
         }
 
-        // Proven write-only and local: every store to the web is dead.
+        // Proven write-only and local: every store to the web is dead, and
+        // once the stores are gone nothing reads a web pointer at all (the
+        // proof above admitted ONLY GEP-base and store-pointer uses), so the
+        // GEPs and the alloca itself are dead too.  Parameter homes are the
+        // one exception: the prologue writes them through `param_alloca_values`
+        // identity, so the slot must survive even when IR-visible stores die.
+        // Retiring the object matters as much as retiring the stores — a
+        // surviving 16-byte/16-align alloca costs 32 frame bytes (slot plus
+        // alignment padding) that no later pass reclaims, because generic DCE
+        // must preserve allocas in any function that contains a call
+        // (measured on `_mm_add_epi32(f(p), w)`: 184- vs 152-byte frame).
+        let drop_object = !func.param_alloca_values.iter().any(|pv| *pv == root);
         for block in &mut func.blocks {
             let mut i = 0;
             while i < block.instructions.len() {
-                let drop = matches!(
-                    &block.instructions[i],
-                    Instruction::Store { ptr, .. } if web.contains(&ptr.0)
-                );
+                let drop = match &block.instructions[i] {
+                    Instruction::Store { ptr, .. } => web.contains(&ptr.0),
+                    Instruction::Intrinsic {
+                        dest: None,
+                        op,
+                        dest_ptr: Some(dp),
+                        ..
+                    } => is_vec16_store_op(*op) && web.contains(&dp.0),
+                    Instruction::Alloca { dest, .. } | Instruction::GetElementPtr { dest, .. } => {
+                        drop_object && web.contains(&dest.0)
+                    }
+                    _ => false,
+                };
                 if drop {
                     block.remove_inst(i);
                 } else {
@@ -502,33 +553,180 @@ fn purge_unread_local_stores(func: &mut IrFunction) {
 /// * both stores are plain `I64`/default-address-space/non-volatile;
 /// * `%x` and `%v` are single-definition values (`find_multi_def_values`),
 ///   so the substitution cannot change a position-dependent web.
+/// The four whole-register 16-byte vector LOAD intrinsics.  They differ
+/// only in lane interpretation; all read exactly 16 bytes at `ptr + off`
+/// into one XMM-class SSA value, so for bit-identity reasoning they are
+/// interchangeable.
+fn is_vec16_load_op(op: crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    matches!(
+        op,
+        I::VecLoadI64x2 | I::VecLoadI32x4 | I::VecLoadF32x4 | I::VecLoadF64x2
+    )
+}
+
+/// The four whole-register 16-byte vector STORE intrinsics (same lane
+/// interpretations as [`is_vec16_load_op`]; all write exactly 16 bytes).
+fn is_vec16_store_op(op: crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    matches!(
+        op,
+        I::VecStoreI64x2 | I::VecStoreI32x4 | I::VecStoreF32x4 | I::VecStoreF64x2
+    )
+}
+
+/// Replace every use of `v` with `x` (instruction operands and terminators,
+/// all blocks) and remove `v`'s defining instruction.  `v` must be a
+/// single-definition value; `x`'s definition dominates `v`'s by
+/// construction in both callers (same block, strictly earlier).
+fn substitute_and_drop(func: &mut IrFunction, v: Value, x: Value) {
+    for block in &mut func.blocks {
+        let drop_at = block
+            .instructions
+            .iter()
+            .position(|inst| inst.dest() == Some(v));
+        if let Some(at) = drop_at {
+            block.remove_inst(at);
+        }
+        for inst in &mut block.instructions {
+            inst.for_each_operand_mut(|op| {
+                if matches!(op, Operand::Value(u) if *u == v) {
+                    *op = Operand::Value(x);
+                }
+            });
+        }
+        block.terminator.for_each_operand_mut(|op| {
+            if matches!(op, Operand::Value(u) if *u == v) {
+                *op = Operand::Value(x);
+            }
+        });
+    }
+}
+
+/// Forward a whole-vector store straight to a whole-vector reload of the
+/// same 16 bytes:
+///
+/// ```text
+///   VecStore<T>  %val -> %p + off      ; writes all 16 bytes
+///   ...                                ; no memory-motion barrier
+///   %v = VecLoad<U> %p + off           ; reads the same 16 bytes
+/// ```
+///
+/// `%v` is bit-for-bit `%val` — both live in the XMM register file and the
+/// lane types only label the bits — so every use of `%v` is rewritten to
+/// `%val` and the load is dropped.  This is the post-vectorizer staging
+/// shape (`_mm_add_epi32(f(p), w)` stores the sum into a private home and
+/// reloads it for the return; `_mm_set1_ps(x)` is stored and reloaded as
+/// I64x2 before a call), measured at two instructions and one
+/// store-to-load-forwarding stall per occurrence.
+///
+/// Fail-closed discipline, same as the carrier collapse: single block,
+/// backward scan from the load so the LATEST store wins, any intervening
+/// memory-motion barrier declines (every other store IS a barrier, so a
+/// clobbered slot can never forward), addresses proven with `offset_from`,
+/// single-definition values only, and the argument shapes are matched
+/// exactly (`[val, ptr, off]` / `[ptr, off]` with constant offsets) so any
+/// future intrinsic signature change fails the match instead of silently
+/// mis-pairing.
+fn forward_vector_roundtrips(func: &mut IrFunction) -> usize {
+    let mut total = 0;
+    loop {
+        let Some((v, val)) = find_vector_roundtrip(func) else {
+            break;
+        };
+        substitute_and_drop(func, v, val);
+        total += 1;
+    }
+    total
+}
+
+/// Locate one forwardable store/reload pair: `(reload dest, stored value)`.
+fn find_vector_roundtrip(func: &IrFunction) -> Option<(Value, Value)> {
+    let multi_def = super::gvn::find_multi_def_values(func);
+    for block in &func.blocks {
+        'load: for (li, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Intrinsic {
+                dest: Some(v),
+                op: load_op,
+                dest_ptr: None,
+                args,
+            } = inst
+            else {
+                continue;
+            };
+            if !is_vec16_load_op(*load_op) || multi_def.contains(&v.0) {
+                continue;
+            }
+            let [Operand::Value(q), off_arg] = args.as_slice() else {
+                continue;
+            };
+            let load_off = match off_arg {
+                Operand::Const(IrConst::I64(n)) => *n,
+                Operand::Const(IrConst::I32(n)) => i64::from(*n),
+                _ => continue,
+            };
+
+            // Walk BACKWARD: the first store hit is the latest one — the
+            // one whose bytes the load observes.  Anything else that can
+            // move memory declines before an older store can mis-match.
+            for si in (0..li).rev() {
+                let cand = &block.instructions[si];
+                if let Instruction::Intrinsic {
+                    dest: None,
+                    op: store_op,
+                    dest_ptr: Some(_),
+                    args: sargs,
+                } = cand
+                {
+                    if is_vec16_store_op(*store_op) {
+                        let [Operand::Value(val), Operand::Value(p2), soff_arg] = sargs.as_slice()
+                        else {
+                            continue 'load;
+                        };
+                        let store_off = match soff_arg {
+                            Operand::Const(IrConst::I64(n)) => *n,
+                            Operand::Const(IrConst::I32(n)) => i64::from(*n),
+                            _ => continue 'load,
+                        };
+                        let Some(delta) = offset_from(func, *q, *p2) else {
+                            continue 'load; // may alias: fail closed
+                        };
+                        if delta + load_off != store_off || multi_def.contains(&val.0) || *val == *v
+                        {
+                            continue 'load;
+                        }
+                        // The forwarded value must come from a vector
+                        // intrinsic (broadcast, arithmetic, load…): a true
+                        // XMM-class SSA value every consumer can read.  An
+                        // I128 call carrier stored via VecStore would trip
+                        // the same backend hole the carrier collapse fails
+                        // closed on (see collapse_carrier_reloads).
+                        let vector_producer = matches!(
+                            unique_def(func, *val),
+                            Some(Instruction::Intrinsic { dest: Some(_), .. })
+                        );
+                        if !vector_producer {
+                            continue 'load;
+                        }
+                        return Some((*v, *val));
+                    }
+                }
+                if memory_motion_barrier(cand) {
+                    continue 'load;
+                }
+            }
+        }
+    }
+    None
+}
+
 fn collapse_carrier_reloads(func: &mut IrFunction) -> usize {
     let mut total = 0;
     loop {
         let Some((v, x)) = find_carrier_reload(func) else {
             break;
         };
-        for block in &mut func.blocks {
-            let drop_at = block
-                .instructions
-                .iter()
-                .position(|inst| inst.dest() == Some(v));
-            if let Some(at) = drop_at {
-                block.remove_inst(at);
-            }
-            for inst in &mut block.instructions {
-                inst.for_each_operand_mut(|op| {
-                    if matches!(op, Operand::Value(u) if *u == v) {
-                        *op = Operand::Value(x);
-                    }
-                });
-            }
-            block.terminator.for_each_operand_mut(|op| {
-                if matches!(op, Operand::Value(u) if *u == v) {
-                    *op = Operand::Value(x);
-                }
-            });
-        }
+        substitute_and_drop(func, v, x);
         total += 1;
     }
     total
@@ -541,14 +739,17 @@ fn find_carrier_reload(func: &IrFunction) -> Option<(Value, Value)> {
         'load: for (li, inst) in block.instructions.iter().enumerate() {
             let Instruction::Intrinsic {
                 dest: Some(v),
-                op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
+                op: load_op,
                 dest_ptr: None,
                 args,
             } = inst
             else {
                 continue;
             };
-            if multi_def.contains(&v.0) {
+            // Any whole-register 16-byte load: the lane type only labels
+            // the bits (observed live: the vectorizer reloads the carrier
+            // staging as I32x4 when the consumer is a 32-bit lane op).
+            if !is_vec16_load_op(*load_op) || multi_def.contains(&v.0) {
                 continue;
             }
             let [Operand::Value(p), off_arg] = args.as_slice() else {
@@ -629,6 +830,37 @@ fn find_carrier_reload(func: &IrFunction) -> Option<(Value, Value)> {
                 ) if info.ret_is_vector128
             );
             if !carrier_in_xmm {
+                continue;
+            }
+            // Every use of the reload must be a RETURN operand: the
+            // backend's vector128 return path consumes an I128 carrier
+            // directly (proven by `return f()` probes), but its vector
+            // INTRINSIC operand path does not — substituting the carrier
+            // into a `VecAddI32x4` argument materialized an unrelated
+            // register (observed live: `movdqa %xmm15, %xmm0` reading an
+            // uninitialized %xmm15).  Until the backend homes [Sse, SseUp]
+            // call results for arbitrary vector consumers, any
+            // non-terminator use fails closed.
+            let mut non_return_use = false;
+            for b in &func.blocks {
+                for i2 in &b.instructions {
+                    i2.for_each_used_value(|u| {
+                        if u == v.0 {
+                            non_return_use = true;
+                        }
+                    });
+                }
+                let mut term_uses = false;
+                b.terminator.for_each_used_value(|u| {
+                    if u == v.0 {
+                        term_uses = true;
+                    }
+                });
+                if term_uses && !matches!(&b.terminator, Terminator::Return(_)) {
+                    non_return_use = true;
+                }
+            }
+            if non_return_use {
                 continue;
             }
 
@@ -1799,6 +2031,188 @@ mod tests {
             }
         }
         assert_eq!(run(&mut f), 0);
+    }
+
+    // ── Whole-vector round-trip forwarding ──────────────────────────────
+    //
+    // The post-vectorizer staging shape: a vector intrinsic result is
+    // stored whole into a private slot and immediately reloaded whole
+    // (possibly under a different lane label).  The forwarder hands the
+    // producer's register value straight to the reload's users; the purge
+    // then retires the store, the slot and the slot's alloca.
+
+    fn vecstore_f32(val: u32, ptr: u32, off: i64) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op: crate::ir::intrinsics::IntrinsicOp::VecStoreF32x4,
+            dest_ptr: Some(Value(ptr)),
+            args: vec![
+                Operand::Value(Value(val)),
+                Operand::Value(Value(ptr)),
+                Operand::Const(IrConst::I64(off)),
+            ],
+        }
+    }
+
+    fn broadcast_f32(dest: u32, src: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op: crate::ir::intrinsics::IntrinsicOp::VecBroadcastF32x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(src))],
+        }
+    }
+
+    /// broadcast %5, staging alloca %6, store, reload %11; `Return %11`.
+    fn vector_roundtrip(insts_between: &mut Vec<Instruction>) -> IrFunction {
+        let mut insts = vec![
+            param_ref(2, 0),
+            alloca(6, 16),
+            broadcast_f32(5, 2),
+            vecstore_f32(5, 6, 0),
+        ];
+        insts.append(insts_between);
+        insts.push(vecload(11, 6, 0));
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(11))));
+        f
+    }
+
+    #[test]
+    fn a_vector_roundtrip_forwards_the_stored_value() {
+        let mut f = vector_roundtrip(&mut Vec::new());
+        assert_eq!(run(&mut f), 1, "the forward must be counted");
+        assert!(
+            matches!(
+                f.blocks[0].terminator,
+                Terminator::Return(Some(Operand::Value(Value(5))))
+            ),
+            "the return must read the producer directly: {:?}",
+            f.blocks[0].terminator
+        );
+        let insts = &f.blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2
+                        | crate::ir::intrinsics::IntrinsicOp::VecStoreF32x4,
+                    ..
+                }
+            )),
+            "the store and the reload are both frame traffic: {insts:?}"
+        );
+        assert!(
+            !insts
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { .. })),
+            "the staging object is dead and must not cost frame bytes: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn the_latest_store_wins_a_forwarded_roundtrip() {
+        // Two whole-vector stores to the same slot: the reload observes the
+        // SECOND one's bytes, so the backward scan must forward %15, not %5.
+        let mut f = vector_roundtrip(&mut vec![broadcast_f32(15, 2), vecstore_f32(15, 6, 0)]);
+        assert_eq!(run(&mut f), 1);
+        assert!(
+            matches!(
+                f.blocks[0].terminator,
+                Terminator::Return(Some(Operand::Value(Value(15))))
+            ),
+            "the reload observes the latest store: {:?}",
+            f.blocks[0].terminator
+        );
+    }
+
+    #[test]
+    fn a_roundtrip_of_a_non_vector_producer_declines() {
+        // The stored value is an I128 call carrier, not a vector intrinsic
+        // result.  Forwarding it into the reload's users would hand an
+        // [Sse, SseUp] carrier to consumers the backend only serves through
+        // memory (observed live as a read of an uninitialized register:
+        // `movdqa %xmm15, %xmm0`), so the producer gate must fail closed.
+        let mut f = vector_roundtrip(&mut Vec::new());
+        f.blocks[0].instructions[2] = vec128_call(5, 2);
+        assert_eq!(run(&mut f), 0, "a call carrier is not a vector producer");
+        assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Intrinsic {
+                op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_barrier_between_vector_store_and_reload_declines() {
+        // A store through an unrelated pointer may alias the slot.
+        let mut f = vector_roundtrip(&mut vec![store_const(2)]);
+        assert_eq!(run(&mut f), 0);
+    }
+
+    #[test]
+    fn a_roundtrip_at_a_different_offset_declines() {
+        let mut f = vector_roundtrip(&mut Vec::new());
+        for inst in &mut f.blocks[0].instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(Value(11)),
+                args,
+                ..
+            } = inst
+            {
+                args[1] = Operand::Const(IrConst::I64(8));
+            }
+        }
+        assert_eq!(run(&mut f), 0, "offset 8 reads bytes the store never wrote");
+    }
+
+    #[test]
+    fn a_param_home_survives_the_dead_object_purge() {
+        // Same proven-dead web, but the alloca is a parameter home: the
+        // prologue writes it behind the IR's back, so only the IR-visible
+        // store may die — the slot itself must stay.
+        let mut f = vector_roundtrip(&mut Vec::new());
+        f.param_alloca_values = vec![Value(6)];
+        assert_eq!(run(&mut f), 1, "the forward itself still fires");
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { dest: Value(6), .. })),
+            "a parameter home must survive: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn a_carrier_reload_with_a_non_return_use_declines() {
+        // The reload feeds a vector intrinsic, not a Return.  The backend's
+        // vector128 return path consumes an I128 carrier directly, but its
+        // intrinsic operand path does not (observed live: `movdqa %xmm15,
+        // %xmm0` reading an uninitialized register), so the collapse must
+        // fail closed on any non-terminator use.
+        let mut f = carrier_split(&mut Vec::new());
+        f.blocks[0].instructions.push(Instruction::Intrinsic {
+            dest: Some(Value(12)),
+            op: crate::ir::intrinsics::IntrinsicOp::VecAddI32x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(11)), Operand::Value(Value(11))],
+        });
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(12))));
+        assert_eq!(
+            run(&mut f),
+            0,
+            "an intrinsic use of the reload fails closed"
+        );
+        assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Intrinsic {
+                op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
+                ..
+            }
+        )));
     }
 
     #[test]
