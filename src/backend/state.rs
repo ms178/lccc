@@ -2311,7 +2311,7 @@ impl CodegenState {
 /// "ymm3" → 3, "zmm0" → 0). The xmm/ymm/zmm spellings of one bank name
 /// the SAME physical storage viewed at different widths, so alias
 /// decisions in `vec_claim_live_reg` compare bank numbers, not strings.
-fn vector_reg_bank(reg: &str) -> u32 {
+pub(crate) fn vector_reg_bank(reg: &str) -> u32 {
     reg.trim_start_matches(|c: char| !c.is_ascii_digit())
         .parse()
         .unwrap_or(u32::MAX)

@@ -1982,6 +1982,14 @@ gate "fma-digit-permutation" fast \
 gate "fma-digit-permutation-nonvacuity" fast \
     bash tests/regression/check_fma_digit_permutation.sh \
     --lccc tests/regression/fma_prefix_standin.sh --expect-defect
+
+# An integer lane broadcast stages around a live %ymm0 base instead of spilling
+# it. The non-vacuity leg checks the pre-fix assembly fixture and must go red.
+gate "broadcast-pending-codegen" fast \
+    python3 tests/regression/check_broadcast_pending_codegen.py --lccc target/fastbuild/lccc
+gate "broadcast-pending-codegen-nonvacuity" fast \
+    python3 tests/regression/check_broadcast_pending_codegen.py \
+    --shape-only tests/regression/fixtures/avx_fp_private_prefix.s --expect-defect
 # SA-11 at 128 bits on i686: the arm did not exist, so `_mm_fmadd_ps`
 # PANICKED the compiler.  This gate executes the values, which is the only
 # way to see the operand placement as well as the crash.

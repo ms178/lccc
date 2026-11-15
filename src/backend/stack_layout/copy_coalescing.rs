@@ -3349,6 +3349,20 @@ pub(super) fn compute_vector_defer_values(
                 if elided_load {
                     continue;
                 }
+                // The integer broadcast writes only the staging bank when a
+                // bank-0/1 deferred result is live (`broadcast_keeps_pending`
+                // in intrinsics.rs), and otherwise commits that result before
+                // any write to its bank. The deferred value therefore survives
+                // the window in its register.
+                if matches!(
+                    ik,
+                    Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::VecBroadcastI32x8,
+                        ..
+                    }
+                ) {
+                    continue;
+                }
                 if is_vec_invalidator(ik) || matches!(ik, Instruction::Intrinsic { .. }) {
                     ok = false;
                     break;

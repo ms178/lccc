@@ -1637,6 +1637,14 @@ jobs:
       run: bash tests/regression/check_blendv_lane_semantics.sh --lccc target/fastbuild/lccc --reference gcc-16
     - name: Prove the FMA digit gate goes red on the pre-fix placement
       run: bash tests/regression/check_fma_digit_permutation.sh --lccc tests/regression/fma_prefix_standin.sh --expect-defect
+    # An integer lane broadcast must stage around a live %ymm0 value: the base
+    # of a lane patch stays in its register instead of a 32-byte stack round
+    # trip on the loop-carried chain. The non-vacuity leg must go red on the
+    # pre-fix assembly checked in as a fixture.
+    - name: Broadcast pending value stays in its register (no spill of the live base)
+      run: python3 tests/regression/check_broadcast_pending_codegen.py --lccc target/fastbuild/lccc
+    - name: Prove the broadcast gate goes red on the pre-fix spill
+      run: python3 tests/regression/check_broadcast_pending_codegen.py --shape-only tests/regression/fixtures/avx_fp_private_prefix.s --expect-defect
     - name: Enum layout semantics (widening, packed, struct inheritance, static asserts)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_layout_semantics.sh
     # PR #821 F1: user-authored AArch64 assembly is exempt from the
