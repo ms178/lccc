@@ -31,6 +31,7 @@ mod copy_coalesce;
 mod copy_propagation;
 mod dead_code;
 mod dead_writes;
+mod disp_absorb;
 mod div_rem_fusion;
 mod ebb_reuse;
 mod epilogue_merge;
@@ -69,6 +70,7 @@ mod store_forwarding;
 mod tail_call;
 mod vector_broadcast;
 mod vector_copy;
+mod vector_lane_reload;
 mod vector_load_op_fuse;
 mod vex_promote;
 
@@ -2431,6 +2433,26 @@ fn peephole_optimize_inner(
     // `CCC_PEEPHOLE_SKIP=lea_add_fuse` disables it for bisection.
     if !sk("lea_add_fuse") {
         lea_add_fuse::run(&mut store, &mut infos);
+    }
+
+    // Phase 8b': a constant pointer adjustment absorbed into its single
+    // memory consumer's displacement (`addq $256, %rdi; op (%rdi)` →
+    // `op 256(%rdi)`).  Same flags oracle and editing discipline as 8b;
+    // placed here so 8c..8e and the final dead sweep see the shorter form.
+    // `CCC_PEEPHOLE_SKIP=disp_absorb` disables it for bisection.
+    if !sk("disp_absorb") {
+        disp_absorb::run(&mut store, &mut infos);
+    }
+
+    // Phase 8b'': a narrow reload of a just-homed vector register becomes a
+    // register lane extraction (`vmovdqu %ymm0, 8(%rsp); vmovss 20(%rsp),
+    // %xmm2` → `vinsertps`).  Placed with the other post-allocation memory
+    // rewrites so the dead sweep can then retire the store when the slot
+    // has no remaining readers.  `CCC_PEEPHOLE_SKIP=vector_lane_reload`
+    // disables it for bisection.
+    if !sk("vector_lane_reload") {
+        let isa = crate::backend::x86::isa::current();
+        vector_lane_reload::run(&mut store, &mut infos, isa.sse41, isa.avx);
     }
 
     // Phase 8c: terminal return-home coalescing.  Runs after every rewrite
