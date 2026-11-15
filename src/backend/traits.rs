@@ -1204,6 +1204,22 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     /// is x86-64 only; every other backend leaves the state unset).
     fn arm_sibcall_candidate(&mut self, _info: &CallInfo) {}
 
+    /// Whether this call site pins a frame pointer because its emission
+    /// dynamically realigns `%rsp`: a MEMORY-class stack argument whose
+    /// natural alignment exceeds 16 bytes (SysV AMD64, GCC ≥ 4.6 — see
+    /// `emit_call_stack_args_impl`). The runtime realignment delta forbids
+    /// `%rsp`-relative slot addressing for the rest of the function, so
+    /// `generation.rs` keeps `%rbp` for any function containing such a
+    /// call. The default is the conservative answer — ANY argument with
+    /// natural alignment above 16 — which a register-passed over-aligned
+    /// vector (`__m256`/`__m512` in `%ymm`/`%zmm` at the AVX ABI level)
+    /// satisfies without ever touching the stack; a backend with the
+    /// caller-side classification at hand overrides it with the exact
+    /// stack-argument answer.
+    fn call_arg_realignment_pins_frame(&self, info: &CallInfo) -> bool {
+        info.struct_arg_aligns.iter().any(|a| a.unwrap_or(0) > 16)
+    }
+
     /// Emit a function call (direct or indirect).
     ///
     /// The default implementation provides the shared algorithmic skeleton that all four

@@ -391,12 +391,23 @@ fn writes_reg(_store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> bo
 }
 
 /// Does the instruction at index `idx` read or write stack slot `offset`?
+/// The tracked slot is a GP spill: model it as the full 8 bytes and compare
+/// BYTE RANGES, not start offsets — a 16/32-byte vector store beginning
+/// below the slot (`vmovups %xmm0, off-8(%rbp)`) overwrites it without ever
+/// matching `o == offset`, and forwarding the stale register value across
+/// such a store would be unsound.
 fn accesses_slot(_store: &LineStore, infos: &[LineInfo], idx: usize, offset: i32) -> bool {
     match infos[idx].kind {
-        LineKind::StoreRbp { offset: o, .. }
-        | LineKind::LoadRbp { offset: o, .. }
-        | LineKind::StoreXmmRbp { offset: o, .. }
-        | LineKind::LoadXmmRbp { offset: o, .. } => o == offset,
+        LineKind::StoreRbp {
+            offset: o, size, ..
+        }
+        | LineKind::LoadRbp {
+            offset: o, size, ..
+        }
+        | LineKind::StoreXmmRbp { offset: o, size }
+        | LineKind::LoadXmmRbp { offset: o, size } => {
+            ranges_overlap(o, size.byte_size(), offset, 8)
+        }
         _ => false,
     }
 }

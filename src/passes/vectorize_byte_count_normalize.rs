@@ -168,11 +168,22 @@ fn find_count_reduction(
     reduction
 }
 
-/// The IV itself plus every exact widening cast of it in the body, and the
-/// cast sites.  Only exact widening address casts are admitted: the finite
-/// nonnegative trajectory makes sign- and zero-extension identical, while a
-/// truncation or arbitrary arithmetic index is not an alias of the rebased
-/// IV.
+/// The IV itself plus every exact value-preserving cast of it in the body,
+/// and the cast sites.  Two cast families are admitted, both identities on
+/// the proven trajectory (`normalize` requires a nonnegative start and an
+/// end at most the signed maximum of the IV type, so every value the IV
+/// takes is nonnegative and fits its signed reading):
+///
+///   * widening 32→64 casts: sign- and zero-extension agree on nonnegative
+///     values;
+///   * same-width 64-bit reinterpretations (`U64→I64`, `I64→U64`): a no-op
+///     bit cast, and the frontend's canonical spelling of a `u64`-indexed
+///     `arr[i]` is exactly `Cast U64→I64` feeding the GEP offset — without
+///     this arm every such count loop stayed scalar.
+///
+/// A truncation, a 32-bit same-width reinterpretation (whose GEP-offset
+/// extension semantics this adapter does not model) or arbitrary arithmetic
+/// index is not an alias of the rebased IV and fails closed.
 fn widening_index_casts(
     func: &IrFunction,
     lp: &loop_analysis::NaturalLoop,
@@ -190,11 +201,11 @@ fn widening_index_casts(
                 to_ty,
             } = inst
             {
-                if *src == iv
-                    && *from_ty == ty
-                    && matches!(ty, IrType::I32 | IrType::U32)
-                    && matches!(to_ty, IrType::I64 | IrType::U64)
-                {
+                let widening = matches!(ty, IrType::I32 | IrType::U32)
+                    && matches!(to_ty, IrType::I64 | IrType::U64);
+                let reinterpret64 = matches!(ty, IrType::I64 | IrType::U64)
+                    && matches!(to_ty, IrType::I64 | IrType::U64);
+                if *src == iv && *from_ty == ty && (widening || reinterpret64) {
                     indices.insert(*dest);
                     cast_sites.insert((bi, ii));
                 }
@@ -224,8 +235,28 @@ fn body_symbol_name(
     }
 }
 
+/// The loop's upper bound, after endpoint canonicalization.
+///
+/// * `Const(end)` — a compile-time EXCLUSIVE endpoint.  Inclusive spellings
+///   are folded (`<= k` becomes `< k+1`, overflow-checked against the IV
+///   type), and a nonzero start is rebased by the mutation phase below.
+/// * `Runtime(v)` — a loop-invariant runtime limit, accepted ONLY in the
+///   already-canonical form: start 0 and a STRICT compare.  There the
+///   rebase is the identity, no endpoint arithmetic exists to overflow
+///   (`iv < n` never computes `n+1`), and the packed emitter's own
+///   trip-count division handles `n == 0` and negative signed limits with
+///   zero vector iterations.  An inclusive runtime endpoint (`i <= n`)
+///   fails closed: `n` at the type maximum denotes 2^N trips, which no
+///   finite rewrite of this shape expresses.
+enum Bound {
+    Const(i64),
+    Runtime(Value),
+}
+
 /// Canonicalization is deliberately restricted to direct, nonnegative 32/64-bit
-/// IVs (including exact 32-to-64-bit address casts) and constant bounds. Runtime starts, truncating index casts, zero-trip
+/// IVs (including exact 32-to-64-bit address casts) and constant bounds, plus
+/// the already-canonical zero-based strict form with a loop-invariant runtime
+/// limit. Runtime starts, truncating index casts, constant zero-trip
 /// cases, escaping IVs and overflowing inclusive endpoints fail closed.
 fn normalize(
     func: &IrFunction,
@@ -261,15 +292,30 @@ fn normalize(
             | (IrType::U32 | IrType::U64, IrCmpOp::Ule) => true,
             _ => return None,
         };
-    let end = constant(rhs)?.checked_add(i64::from(inclusive))?;
-    let max = match ty {
-        IrType::I32 => i64::from(i32::MAX),
-        IrType::U32 => i64::from(u32::MAX),
-        _ => i64::MAX,
+    let bound = match rhs {
+        Operand::Const(_) => {
+            let end = constant(rhs)?.checked_add(i64::from(inclusive))?;
+            let max = match ty {
+                IrType::I32 => i64::from(i32::MAX),
+                IrType::U32 => i64::from(u32::MAX),
+                _ => i64::MAX,
+            };
+            if end > max {
+                return None;
+            }
+            Bound::Const(end)
+        }
+        Operand::Value(b) => {
+            if inclusive {
+                return None;
+            }
+            let (db, _) = definition_site(func, b)?;
+            if lp.contains(db) {
+                return None;
+            }
+            Bound::Runtime(b)
+        }
     };
-    if end > max {
-        return None;
-    }
     let (phi_block, phi_index) = definition_site(func, iv)?;
     if phi_block != header {
         return None;
@@ -288,8 +334,20 @@ fn normalize(
     let latch_label = func.blocks[latch].label;
     let (initial, pre_label) = incoming.iter().find(|(_, l)| *l != latch_label)?;
     let start = constant(*initial)?;
-    if start < 0 || end <= start {
-        return None;
+    match bound {
+        Bound::Const(end) => {
+            if start < 0 || end <= start {
+                return None;
+            }
+        }
+        // Runtime limits only in the canonical zero-based form: with any
+        // other start, rebasing would need `n - start` arithmetic whose
+        // wrap behaviour this adapter does not model.
+        Bound::Runtime(_) => {
+            if start != 0 {
+                return None;
+            }
+        }
     }
     let pre = func.blocks.iter().position(|b| b.label == *pre_label)?;
     if lp.contains(pre)
@@ -416,57 +474,22 @@ fn normalize(
             }
         }
     }
-    if let Instruction::Cmp { rhs, op, .. } = &mut candidate.blocks[header].instructions[cmp_index]
-    {
-        *rhs = Operand::Const(IrConst::I64(end - start));
-        *op = if matches!(ty, IrType::I32 | IrType::I64) {
-            IrCmpOp::Slt
-        } else {
-            IrCmpOp::Ult
-        };
-    }
-    // One preheader `GlobalAddr` per symbol, then (for a nonzero start) one
-    // rebased GEP per stream.
-    let mut hoisted: FxHashMap<String, Value> = FxHashMap::default();
-    for (bi, ii, base, global) in geps {
-        let base = match global {
-            Some(name) => match hoisted.get(&name) {
-                Some(v) => *v,
-                None => {
-                    let dest = fresh(&mut next);
-                    push_preheader_inst(
-                        &mut candidate.blocks[pre],
-                        Instruction::GlobalAddr {
-                            dest,
-                            name: name.clone(),
-                        },
-                    );
-                    hoisted.insert(name, dest);
-                    dest
-                }
-            },
-            None => base,
-        };
-        let new_base = if start == 0 {
-            base
-        } else {
-            let shifted = fresh(&mut next);
-            push_preheader_inst(
-                &mut candidate.blocks[pre],
-                Instruction::GetElementPtr {
-                    dest: shifted,
-                    base,
-                    offset: Operand::Const(IrConst::I64(start)),
-                    ty: IrType::Ptr,
-                },
-            );
-            shifted
-        };
-        if let Instruction::GetElementPtr { base, .. } = &mut candidate.blocks[bi].instructions[ii]
+    // A runtime bound is only accepted in the zero-based strict form, where
+    // the comparison is ALREADY canonical (`iv <u n` / `iv <s n`): rewriting
+    // it would only destroy the invariant operand the packed analyzer reads.
+    if let Bound::Const(end) = bound {
+        if let Instruction::Cmp { rhs, op, .. } =
+            &mut candidate.blocks[header].instructions[cmp_index]
         {
-            *base = new_base;
+            *rhs = Operand::Const(IrConst::I64(end - start));
+            *op = if matches!(ty, IrType::I32 | IrType::I64) {
+                IrCmpOp::Slt
+            } else {
+                IrCmpOp::Ult
+            };
         }
     }
+    rebase_gep_streams(&mut candidate, pre, geps, start, &mut next);
     let truth = fresh(&mut next);
     let promoted = fresh(&mut next);
     for (bi, block) in candidate.blocks.iter_mut().enumerate() {
@@ -527,6 +550,59 @@ fn normalize(
     Some(candidate)
 }
 
+/// Point every accepted byte-stream GEP at a preheader-available base:
+/// one hoisted `GlobalAddr` per symbol (rematerialised — the in-body copy
+/// stays for its other uses and dies in DCE), then, for a nonzero start,
+/// one rebased GEP per stream so the zero-based IV reads the same bytes.
+fn rebase_gep_streams(
+    candidate: &mut IrFunction,
+    pre: usize,
+    geps: Vec<(usize, usize, Value, Option<String>)>,
+    start: i64,
+    next: &mut u32,
+) {
+    let mut hoisted: FxHashMap<String, Value> = FxHashMap::default();
+    for (bi, ii, base, global) in geps {
+        let base = match global {
+            Some(name) => match hoisted.get(&name) {
+                Some(v) => *v,
+                None => {
+                    let dest = fresh(next);
+                    push_preheader_inst(
+                        &mut candidate.blocks[pre],
+                        Instruction::GlobalAddr {
+                            dest,
+                            name: name.clone(),
+                        },
+                    );
+                    hoisted.insert(name, dest);
+                    dest
+                }
+            },
+            None => base,
+        };
+        let new_base = if start == 0 {
+            base
+        } else {
+            let shifted = fresh(next);
+            push_preheader_inst(
+                &mut candidate.blocks[pre],
+                Instruction::GetElementPtr {
+                    dest: shifted,
+                    base,
+                    offset: Operand::Const(IrConst::I64(start)),
+                    ty: IrType::Ptr,
+                },
+            );
+            shifted
+        };
+        if let Instruction::GetElementPtr { base, .. } = &mut candidate.blocks[bi].instructions[ii]
+        {
+            *base = new_base;
+        }
+    }
+}
+
 /// Append to the preheader, keeping a complete span table complete (and
 /// dropping a partial one, as every other preheader edit here does).
 fn push_preheader_inst(block: &mut BasicBlock, inst: Instruction) {
@@ -552,15 +628,420 @@ fn push_preheader_inst(block: &mut BasicBlock, inst: Instruction) {
     block.instructions.push(inst);
 }
 
+/// Pure, trap-free computation that may execute unconditionally when its
+/// triangle arm is flattened.  Deliberately excludes memory reads: a
+/// speculated load can trap on an address the scalar path never touched,
+/// and the classifier arms this exists for (`ch >= 'a' && ch <= 'z'`
+/// chains over an already-loaded byte) are pure flag math.  Address
+/// FORMATION (GEP/GlobalAddr) is pure and admitted; the dereference is not.
+fn speculatable_pure(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::BinOp { op, .. } => !op.can_trap(),
+        Instruction::UnaryOp { .. }
+        | Instruction::Cmp { .. }
+        | Instruction::Cast { .. }
+        | Instruction::Copy { .. }
+        | Instruction::Select { .. }
+        | Instruction::GetElementPtr { .. }
+        | Instruction::GlobalAddr { .. } => true,
+        _ => false,
+    }
+}
+
+/// Flatten every PURE VALUE TRIANGLE in the loop body of a private clone:
+///
+/// ```text
+///     P:  ...; CondBranch(c, A, M)        (or (c, M, A))
+///     A:  pure insts; Branch(M)           single-pred, no loads
+///     M:  phi [pv, P], [av, A], ...; ...  P and A both feed every phi
+/// ```
+///
+/// becomes `P: ...; A's insts; Select(c, ...); Branch(M)`.  A FULL merge
+/// (preds exactly {P, A}) loses its phis to in-place selects; a PARTIAL
+/// merge (other predecessors remain — the shared landing pad of a cascaded
+/// `||` classifier) keeps each phi, with the A edge removed and the P edge
+/// rewritten to a fresh select — the same inside-out scheme
+/// `detect_diamond`'s partial conversion uses, which is what lets a
+/// three-link cascade collapse link by link.
+///
+/// This is if-conversion, but NOT a second cmov heuristic: the in-loop
+/// speculative-arm budget (3 effective instructions, see
+/// `cpu_model::if_convert_arm_budget_in_loop`) answers the scalar question
+/// "is a cmov cheaper than this branch?", and correctly says no for a
+/// 10-instruction classifier arm.  The question HERE is "does flattening
+/// let the packed byte-count emitter take the whole loop?", and the caller
+/// only commits the clone when the existing packed analyzer AND emitter
+/// both accept it — on every other path the clone is discarded and the
+/// scalar branch keeps its budget-protected form.  Speculation safety is
+/// the arm's purity (no loads, no traps, no side effects), checked per
+/// instruction above.
+///
+/// Returns `None` when nothing flattened; block count and labels are
+/// preserved (the arm is left as an unreachable shell for cfg_simplify,
+/// exactly like `if_convert`'s combine does on the live IR).
+fn flatten_pure_value_triangles(
+    func: &IrFunction,
+    lp: &loop_analysis::NaturalLoop,
+) -> Option<IrFunction> {
+    let mut flat = func.clone();
+    let mut next = reserve_adapter_ids(func)?;
+    let mut changed = false;
+    let body: Vec<usize> = {
+        let mut v: Vec<usize> = lp.body.iter().copied().collect();
+        v.sort_unstable();
+        v
+    };
+    // Each flatten removes one conditional branch; the body holds at most
+    // one per block, so this bounds the fixpoint.
+    'rounds: for _ in 0..body.len() {
+        let cfg = CfgAnalysis::build(&flat);
+        let labels: FxHashMap<BlockId, usize> = flat
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.label, i))
+            .collect();
+        for &p in &body {
+            if p == lp.header {
+                continue;
+            }
+            let Terminator::CondBranch {
+                cond: Operand::Value(cond),
+                true_label,
+                false_label,
+            } = flat.blocks[p].terminator
+            else {
+                continue;
+            };
+            let (Some(&t), Some(&f)) = (labels.get(&true_label), labels.get(&false_label)) else {
+                continue;
+            };
+            for (arm, merge, arm_is_true) in [(t, f, true), (f, t, false)] {
+                if arm == merge
+                    || arm == p
+                    || merge == p
+                    || arm == lp.header
+                    || merge == lp.header
+                    || !lp.contains(arm)
+                    || !lp.contains(merge)
+                {
+                    continue;
+                }
+                // The arm: single-pred, pure, falls through to the merge.
+                if cfg.preds.row(arm) != [p as u32] {
+                    continue;
+                }
+                if !matches!(flat.blocks[arm].terminator, Terminator::Branch(l)
+                    if l == flat.blocks[merge].label)
+                {
+                    continue;
+                }
+                if !flat.blocks[arm].instructions.iter().all(speculatable_pure) {
+                    continue;
+                }
+                // Both triangle edges must reach the merge, and every phi
+                // must name both (a phi missing one edge has no select
+                // spelling).  Other predecessors make the merge PARTIAL.
+                let mp = cfg.preds.row(merge);
+                if !mp.contains(&(p as u32)) || !mp.contains(&(arm as u32)) {
+                    continue;
+                }
+                let full_merge = mp.len() == 2;
+                let p_label = flat.blocks[p].label;
+                let arm_label = flat.blocks[arm].label;
+                let mut selects = Vec::new();
+                // Partial merge: phi index → the fresh select replacing the
+                // P edge's value once the A edge is removed.
+                let mut phi_rewrites: Vec<(usize, Value)> = Vec::new();
+                let mut ok = true;
+                for (pi, inst) in flat.blocks[merge].instructions.iter().enumerate() {
+                    let Instruction::Phi { dest, ty, incoming } = inst else {
+                        break; // phis are a prefix
+                    };
+                    let pv = incoming
+                        .iter()
+                        .find(|(_, l)| *l == p_label)
+                        .map(|(v, _)| *v);
+                    let av = incoming
+                        .iter()
+                        .find(|(_, l)| *l == arm_label)
+                        .map(|(v, _)| *v);
+                    let (Some(pv), Some(av)) = (pv, av) else {
+                        ok = false;
+                        break;
+                    };
+                    if ty.is_long_double() || ty.is_128bit() {
+                        ok = false; // multi-register select: no spelling
+                        break;
+                    }
+                    let select_dest = if full_merge {
+                        *dest
+                    } else {
+                        let d = fresh(&mut next);
+                        phi_rewrites.push((pi, d));
+                        d
+                    };
+                    let (true_val, false_val) = if arm_is_true { (av, pv) } else { (pv, av) };
+                    selects.push(Instruction::Select {
+                        dest: select_dest,
+                        cond: Operand::Value(cond),
+                        true_val,
+                        false_val,
+                        ty: *ty,
+                    });
+                }
+                if !ok {
+                    continue;
+                }
+                // Hoist the arm, append the selects, fall through to merge.
+                let hoisted: Vec<Instruction> = flat.blocks[arm].instructions.clone();
+                let span = crate::common::source::Span::dummy();
+                flat.blocks[p].extend_insts(hoisted, span);
+                flat.blocks[p].extend_insts(selects, span);
+                flat.blocks[p].terminator = Terminator::Branch(flat.blocks[merge].label);
+                if full_merge {
+                    flat.blocks[merge].retain_insts(|i| !matches!(i, Instruction::Phi { .. }));
+                } else {
+                    for (pi, select_dest) in phi_rewrites {
+                        if let Instruction::Phi { incoming, .. } =
+                            &mut flat.blocks[merge].instructions[pi]
+                        {
+                            incoming.retain(|(_, l)| *l != arm_label);
+                            for (v, l) in incoming.iter_mut() {
+                                if *l == p_label {
+                                    *v = Operand::Value(select_dest);
+                                }
+                            }
+                        }
+                    }
+                }
+                flat.blocks[arm].clear_insts();
+                changed = true;
+                continue 'rounds; // CFG changed; rebuild and rescan
+            }
+        }
+        break; // a full scan found nothing: fixpoint
+    }
+    flat.next_value_id = next;
+    changed.then_some(flat)
+}
+
+/// Is `op` provably 0 or 1?  Depth-bounded structural proof over the
+/// def-use graph: compares are 0/1 by construction, integer casts preserve
+/// 0/1 at every width (truncation included), and the bitwise connectives /
+/// selects / copies of 0/1 values stay 0/1.  Fails closed at the bound.
+fn zero_one_operand(func: &IrFunction, op: &Operand, depth: usize) -> bool {
+    match op {
+        Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),
+        Operand::Value(v) => {
+            if depth == 0 {
+                return false;
+            }
+            let Some((bi, ii)) = definition_site(func, *v) else {
+                return false;
+            };
+            match &func.blocks[bi].instructions[ii] {
+                Instruction::Cmp { .. } => true,
+                Instruction::Cast {
+                    src,
+                    from_ty,
+                    to_ty,
+                    ..
+                } => {
+                    from_ty.is_integer()
+                        && to_ty.is_integer()
+                        && zero_one_operand(func, src, depth - 1)
+                }
+                Instruction::Copy { src, .. } => zero_one_operand(func, src, depth - 1),
+                Instruction::Select {
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    zero_one_operand(func, true_val, depth - 1)
+                        && zero_one_operand(func, false_val, depth - 1)
+                }
+                Instruction::BinOp {
+                    op: IrBinOp::And | IrBinOp::Or | IrBinOp::Xor,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    zero_one_operand(func, lhs, depth - 1) && zero_one_operand(func, rhs, depth - 1)
+                }
+                Instruction::Phi { incoming, .. } if incoming.len() == 1 => {
+                    zero_one_operand(func, &incoming[0].0, depth - 1)
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Clean up the clone after triangle flattening so the byte-map parser can
+/// read the value tree:
+///
+///   * a phi left with ONE incoming (both triangle edges folded away) is
+///     exactly a Copy of that value;
+///   * `Select(x, 1, y)` and `Select(x, y, 0)` whose condition `x` is a 0/1
+///     VALUE (a folded inner select, not a compare) are the cascaded `||` /
+///     `&&` spellings; the packed blends need mask conditions, but for
+///     proven 0/1 operands the exact bitwise forms are `x | y` and `x & y`.
+///
+/// Both rewrites are value-exact (no encoding assumptions): they happen on
+/// the discarded-unless-committed clone, and the condition's definition must
+/// NOT be a compare — mask-condition selects are the parser's native food
+/// and keep their blend spelling.
+fn lower_boolean_value_selects(flat: &mut IrFunction, lp: &loop_analysis::NaturalLoop) {
+    let body: Vec<usize> = lp.body.iter().copied().collect();
+    for &bi in &body {
+        for ii in 0..flat.blocks[bi].instructions.len() {
+            let replacement = match &flat.blocks[bi].instructions[ii] {
+                Instruction::Phi { dest, incoming, .. } if incoming.len() == 1 => {
+                    Some(Instruction::Copy {
+                        dest: *dest,
+                        src: incoming[0].0,
+                    })
+                }
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ty,
+                } => {
+                    let cond_is_cmp = matches!(cond, Operand::Value(c)
+                    if matches!(
+                        definition_site(flat, *c)
+                            .map(|(b, i)| &flat.blocks[b].instructions[i]),
+                        Some(Instruction::Cmp { .. })
+                    ));
+                    let cond_ty_matches = matches!(cond, Operand::Value(c)
+                        if definition_site(flat, *c)
+                            .and_then(|(b, i)| flat.blocks[b].instructions[i].result_type())
+                            == Some(*ty));
+                    if cond_is_cmp || !cond_ty_matches || !zero_one_operand(flat, cond, 10) {
+                        None
+                    } else if constant(*true_val) == Some(1)
+                        && zero_one_operand(flat, false_val, 10)
+                    {
+                        Some(Instruction::BinOp {
+                            dest: *dest,
+                            op: IrBinOp::Or,
+                            lhs: *cond,
+                            rhs: *false_val,
+                            ty: *ty,
+                        })
+                    } else if constant(*false_val) == Some(0)
+                        && zero_one_operand(flat, true_val, 10)
+                    {
+                        Some(Instruction::BinOp {
+                            dest: *dest,
+                            op: IrBinOp::And,
+                            lhs: *cond,
+                            rhs: *true_val,
+                            ty: *ty,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(inst) = replacement {
+                flat.blocks[bi].instructions[ii] = inst;
+            }
+        }
+    }
+}
+
 pub(super) fn transform(
     func: &mut IrFunction,
     lp: &loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
+    debug: bool,
 ) -> usize {
-    let Some(mut candidate) = normalize(func, lp, cfg) else {
+    if let Some(mut candidate) = normalize(func, lp, cfg) {
+        if let Some(pattern) = analyze_byte_count_loop(&candidate, lp, cfg) {
+            let changed = transform_byte_count_reduction(&mut candidate, &pattern);
+            if changed != 0 {
+                *func = candidate;
+                return changed;
+            }
+        }
+        // The normalized clone was declined by the analyzer or emitter;
+        // discard it and fall through — a loop can normalize AND still owe
+        // its vectorizability to a triangle flatten of the ORIGINAL body,
+        // and every path below is equally transactional.
+    }
+    // The straight-line paths declined.  If the body's only internal
+    // control is pure value triangles (the budget-protected remnant of a
+    // partially if-converted classifier), flatten them on a private clone
+    // and put the SAME fail-closed pipeline in judgment of the result;
+    // the clone is discarded unless the packed emitter commits.
+    if debug {
+        lccc::cli::stderr_line(format_args!(
+            "[VEC-BCN] {}: normalize declined for loop@{}; trying triangle flatten",
+            func.name, lp.header
+        ));
+    }
+    let Some(mut flat) = flatten_pure_value_triangles(func, lp) else {
+        if debug {
+            lccc::cli::stderr_line(format_args!(
+                "[VEC-BCN] {}: no flattenable pure value triangle",
+                func.name
+            ));
+        }
         return 0;
     };
-    let Some(pattern) = analyze_byte_count_loop(&candidate, lp, cfg) else {
+    if debug {
+        lccc::cli::stderr_line(format_args!(
+            "[VEC-BCN] {}: flattened pure value triangle(s) in loop@{}",
+            func.name, lp.header
+        ));
+    }
+    let flat_cfg = CfgAnalysis::build(&flat);
+    let loops = loop_analysis::find_natural_loops(
+        flat.blocks.len(),
+        &flat_cfg.preds,
+        &flat_cfg.succs,
+        &flat_cfg.idom,
+    );
+    let header_label = func.blocks[lp.header].label;
+    let Some(flp) = loops
+        .iter()
+        .find(|l| flat.blocks[l.header].label == header_label)
+    else {
+        return 0;
+    };
+    lower_boolean_value_selects(&mut flat, flp);
+    // Sum form first (`acc += value_tree(s[i])`, the flattened classifier),
+    // then the Select count form through `normalize`, mirroring the main
+    // vectorizer's arm order.
+    if let Some(pattern) = analyze_byte_count_loop(&flat, flp, &flat_cfg) {
+        let changed = transform_byte_count_reduction(&mut flat, &pattern);
+        if debug {
+            lccc::cli::stderr_line(format_args!(
+                "[VEC-BCN] {}: flattened sum form: emitter changed {changed}",
+                func.name
+            ));
+        }
+        if changed != 0 {
+            *func = flat;
+            return changed;
+        }
+        return 0;
+    }
+    if debug {
+        lccc::cli::stderr_line(format_args!(
+            "[VEC-BCN] {}: flattened loop declined by analyze_byte_count_loop; trying normalize",
+            func.name
+        ));
+    }
+    let Some(mut candidate) = normalize(&flat, flp, &flat_cfg) else {
+        return 0;
+    };
+    let Some(pattern) = analyze_byte_count_loop(&candidate, flp, &flat_cfg) else {
         return 0;
     };
     let changed = transform_byte_count_reduction(&mut candidate, &pattern);
@@ -984,7 +1465,7 @@ mod tests {
         let before = format!("{overflowing:?}");
         let cfg = CfgAnalysis::build(&overflowing);
         assert!(normalize(&overflowing, &lp(), &cfg).is_none());
-        assert_eq!(transform(&mut overflowing, &lp(), &cfg), 0);
+        assert_eq!(transform(&mut overflowing, &lp(), &cfg, false), 0);
         assert_eq!(format!("{overflowing:?}"), before);
 
         // The immediately preceding inclusive bound is legal: its failing
@@ -1057,7 +1538,7 @@ mod tests {
         for mut f in bad {
             let before = format!("{f:?}");
             let cfg = CfgAnalysis::build(&f);
-            assert_eq!(transform(&mut f, &lp(), &cfg), 0);
+            assert_eq!(transform(&mut f, &lp(), &cfg, false), 0);
             assert_eq!(format!("{f:?}"), before);
         }
     }

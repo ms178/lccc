@@ -217,6 +217,17 @@ pub(super) enum MoveSize {
     /// briefly leaves its register, and forwarding it is the difference
     /// between two instructions and five.
     DQ,
+    /// A 32-byte vector move between a YMM register and a frame slot (the
+    /// VEX packed spellings with a `%ymm` operand). Modeled so the
+    /// byte-range passes see the true 32-byte extent — as `Other` lines
+    /// these moves registered a conservative READ of their own slot and
+    /// the never-read elimination could never delete a dead `%ymm`
+    /// return-buffer or argument-home store. Store FORWARDING never maps
+    /// QQ slots (`xmm_mnemonic` has no QQ arm and the gsf handlers screen
+    /// it): a forwarded 32-byte reload would have to reproduce the VEX
+    /// upper-zeroing of bits 256..MAXVL, which the 16-byte register forms
+    /// do not.
+    QQ,
 }
 
 impl MoveSize {
@@ -230,6 +241,8 @@ impl MoveSize {
             MoveSize::SD => "movsd",
             MoveSize::SS => "movss",
             MoveSize::DQ => "movdqu",
+            // Only the VEX spelling can encode a 32-byte move.
+            MoveSize::QQ => "vmovdqu",
         }
     }
 
@@ -241,6 +254,7 @@ impl MoveSize {
             MoveSize::W => 2,
             MoveSize::B => 1,
             MoveSize::DQ => 16,
+            MoveSize::QQ => 32,
         }
     }
 }
@@ -1348,18 +1362,26 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
     }
     // The packed mnemonics are width-polymorphic: the SAME spelling moves
     // 16 bytes with an XMM register, 32 with YMM, 64 with ZMM.  `DQ` models
-    // exactly 16, so a wider register operand must be rejected here or every
-    // consumer of the classification (store forwarding, write-region
-    // liveness) will model a 32/64-byte slot access as 16 bytes -- the
-    // liveness half then proves the upper chunk-stores of a 32-byte
-    // parameter copy dead and deletes them, leaving the vector's upper
-    // lanes uninitialised.  Rejecting is not a workaround: YMM/ZMM slot
-    // moves keep the conservative `Other` classification they had before
-    // `DQ` existed.
+    // exactly 16 and `QQ` exactly 32, so the size must be chosen by the
+    // register operand or every consumer of the classification (store
+    // forwarding, write-region liveness) would model a wider slot access
+    // as 16 bytes -- the liveness half then proves the upper chunk-stores
+    // of a 32-byte parameter copy dead and deletes them, leaving the
+    // vector's upper lanes uninitialised.  A `%ymm` operand upgrades the
+    // size to `QQ`; `%zmm` (and anything else) is rejected, keeping the
+    // conservative `Other` classification 64-byte slot moves have always
+    // had.  (Only the VEX spellings can encode a `%ymm` operand, so a
+    // legacy-SSE mnemonic never reaches the `QQ` arm with valid input.)
     let reg = if store { src } else { dst };
-    if body.1 == MoveSize::DQ && !reg.starts_with("%xmm") {
-        return None;
-    }
+    let body = if body.1 == MoveSize::DQ && !reg.starts_with("%xmm") {
+        if reg.starts_with("%ymm") {
+            (body.0, MoveSize::QQ)
+        } else {
+            return None;
+        }
+    } else {
+        body
+    };
     let mem = if store { dst } else { src };
     if mem.ends_with("(%rbp)") {
         Some((store, &mem[..mem.len() - 6], body.1))
@@ -2981,8 +3003,10 @@ pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
         // and consumed exclusively by the XMM forwarding paths, which name
         // their operands with `%xmmN` text. No caller can reach this row
         // with a GP register, so the 64-bit row is inert here; the
-        // `id <= 15` assertion above still holds.
-        MoveSize::DQ => 0,
+        // `id <= 15` assertion above still holds. `QQ` is likewise
+        // vector-only (produced by `parse_fp_slot_move` for `%ymm`
+        // operands) and can never name a GP register here.
+        MoveSize::DQ | MoveSize::QQ => 0,
     };
     REG_NAMES[row][id as usize]
 }
@@ -3729,22 +3753,27 @@ mod fp_slot_move_width_tests {
     }
 
     /// The packed mnemonics are width-polymorphic in the register operand:
-    /// YMM moves 32 bytes and ZMM 64, but `DQ` models exactly 16.  Letting a
-    /// YMM/ZMM slot move classify as DQ makes write-region liveness model a
-    /// 32/64-byte access as 16 bytes and prove the upper chunk-stores of a
-    /// wide parameter copy dead -- the miscompile behind the
-    /// `vector-abi-wide` failure (upper lanes of stack-passed `__m256`
-    /// arguments read back uninitialised).  Wide forms must keep the
-    /// conservative unclassified path.
+    /// a YMM operand moves 32 bytes and must parse as `QQ`, never as `DQ`
+    /// (a 16-byte model proves the upper chunk-stores of a wide parameter
+    /// copy dead -- the miscompile behind the `vector-abi-wide` failure:
+    /// upper lanes of stack-passed `__m256` arguments read back
+    /// uninitialised).  ZMM (64 bytes) stays rejected: no `MoveSize`
+    /// models it, so those moves keep the conservative unclassified path.
     #[test]
-    fn ymm_and_zmm_packed_slot_moves_are_not_dq() {
-        for line in [
-            "vmovups 136(%rsp), %ymm10",
-            "vmovups %ymm10, 136(%rsp)",
-            "vmovdqu %ymm0, -32(%rbp)",
-            "vmovaps 64(%rsp), %zmm3",
-            "vmovapd %zmm3, 64(%rsp)",
-        ] {
+    fn ymm_packed_slot_moves_are_qq_and_zmm_stays_unclassified() {
+        assert_eq!(
+            parse_fp_slot_move("vmovups 136(%rsp), %ymm10"),
+            Some((false, "136", MoveSize::QQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("vmovups %ymm10, 136(%rsp)"),
+            Some((true, "136", MoveSize::QQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("vmovdqu %ymm0, -32(%rbp)"),
+            Some((true, "-32", MoveSize::QQ))
+        );
+        for line in ["vmovaps 64(%rsp), %zmm3", "vmovapd %zmm3, 64(%rsp)"] {
             assert_eq!(parse_fp_slot_move(line), None, "{line}");
         }
     }
