@@ -813,7 +813,11 @@ fn try_fold_xmm_at_ret(store: &mut LineStore, infos: &mut [LineInfo], r: usize) 
     }
     mark_nop(&mut infos[exit]);
     // A root copy whose source was already %xmm0 collapsed to a self-move.
-    let root = *chain.last().expect("found_root implies a collected chain");
+    // `found_root` implies a collected chain, so the tail always exists;
+    // fail closed (skip the self-move cleanup) rather than panic if not.
+    let Some(&root) = chain.last() else {
+        return true;
+    };
     let rt = infos[root].trimmed(store.get(root)).to_string();
     if let Some((m2, r2)) = rt.split_once(char::is_whitespace) {
         if XMM_FULL_COPIES.contains(&m2) {
