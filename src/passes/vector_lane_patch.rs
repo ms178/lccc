@@ -13,8 +13,9 @@
 //! ```
 //!
 //! The 32-byte load overlaps a 4-byte store that has not yet retired, so the
-//! load cannot be store-forwarded.  Intel cores then stall the load until the
-//! store commits, roughly 15-20 cycles per occurrence.  In
+//! load cannot be store-forwarded.  The load then waits for the store to
+//! commit; the cost is commonly cited as roughly 15-20 cycles per occurrence,
+//! a figure this pass has not measured with PMU counters.  In
 //! `tests/benchmark/programs/avx_fp_private.c` this one reload per iteration
 //! accounted for most of the gap to Clang.  Measured on the same 2-core host
 //! (three runs each, identical checksums): baseline lccc 34-36 ms; this pass
@@ -59,8 +60,21 @@
 //!   read that reaches a lane no write in the block has touched may see the
 //!   previous iteration's bytes, so such lanes keep every write in the block
 //!   alive.  Rewritten reloads read no memory.
-//! * **x86-64 only.**  `BlendPs256`/`VecBroadcast*x8` exist only in the x86
-//!   backend.  The pass is a no-op on every other target.
+//! * **x86-64 with AVX2 only.**  The rewrite needs both ops lowered, and the
+//!   backends disagree about them (checked against the sources, not assumed):
+//!
+//!   | target              | `VecBroadcastI32x8`/`F32x8`            | `BlendPs256`        |
+//!   |---------------------|----------------------------------------|---------------------|
+//!   | x86-64 + AVX2       | lowered (`vpbroadcastd`/`vbroadcastss`) | lowered (`vblendps`) |
+//!   | AArch64             | listed unsupported: `emit_unreachable` | not lowered         |
+//!   | i686                | not lowered                            | lowered (`vblendps`) |
+//!   | RISC-V              | not lowered                            | not lowered         |
+//!
+//!   Emitting the rewrite anywhere else would turn a stall into a trap or an
+//!   unhandled-intrinsic panic, so the gate stays.  Extending it to another
+//!   target means lowering the broadcast there first.  AVX-only x86-64 is out
+//!   too: a register-source broadcast is AVX2-only (`vpbroadcastd`, and the
+//!   `vbroadcastss ymm, xmm` form).
 //!
 //! Known residual (follow-up): the broadcast is emitted between the base
 //! load and the blend, and its emitter flushes the base's pending register
@@ -69,10 +83,17 @@
 //! hand-patched loop.  Removing it needs the broadcast to keep the pending
 //! value live, which is an emitter change rather than an IR one.
 //!
-//! The pass iterates to a fixpoint.  Each application retires at least one
-//! reload with pending lanes and creates none, so it terminates.
+//! Rounds.  Each round plans every candidate temporary against one
+//! `UseDefInfo`, admits plans whose instructions are disjoint, and applies
+//! them in a single sweep.  Each admitted plan retires at least one reload
+//! with pending lanes and creates none, so the rounds terminate.
+//!
+//! Budget.  At most `MAX_REWRITES_PER_FUNCTION` temporaries are rewritten per
+//! function.  The backend peephole re-analyses the function after each fold,
+//! so its cost grows super-linearly with the rewrite count, and the budget
+//! bounds that cost (see the constant for the measurements).
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, IrType, target_arch_name};
 use crate::ir::instruction::{replace_values_in_inst_map, replace_values_in_terminator_map};
@@ -91,6 +112,20 @@ const LANE_BYTES: usize = 4;
 
 /// Number of 32-bit lanes in the temporary.
 const LANES: usize = TEMP_BYTES / LANE_BYTES;
+
+/// Upper bound on temporaries rewritten per function.
+///
+/// Every rewrite adds instructions the backend peephole must re-analyse, and
+/// its liveness oracle is re-run in full after each fold (`refresh_at`).  The
+/// measured cost of that is super-linear in the number of rewrites: over the
+/// pass-disabled build, compiling a function with 25 / 50 / 100 / 200 / 400
+/// rewritable temporaries added 16 / 39 / 105 / 465 / 1773 ms.  The budget
+/// keeps the added compile time to tens of milliseconds for any function.
+/// Temporaries beyond the budget keep their reloads, which is correct, and
+/// only forgoes the rewrite.  The budget is a containment for that peephole
+/// cost, not a claim about the right size; the peephole fix is tracked
+/// separately.
+const MAX_REWRITES_PER_FUNCTION: usize = 64;
 
 /// Size in bytes of a scalar type a memory access can move.
 fn access_size(ty: IrType) -> Option<usize> {
@@ -196,6 +231,12 @@ fn classify(inst: &Instruction, temp: Value, offsets: &FxHashMap<u32, usize>) ->
                     Operand::Value(addr),
                     Operand::Const(IrConst::I64(0)),
                 ] if *addr == temp && width == TEMP_BYTES && *value != temp => {
+                    // The stored value becomes the temporary's vector base.  A
+                    // derived address is a pointer, not a vector, so it can
+                    // never be the base.
+                    if offsets.contains_key(&value.0) {
+                        return None;
+                    }
                     Some(Access::Define { value: *value })
                 }
                 _ => None,
@@ -463,98 +504,125 @@ fn prepend_to_entry(block: &mut BasicBlock, prefix: Vec<Instruction>) {
 }
 
 /// Replace the planned reloads with register chains and delete retired
-/// accesses.
+/// accesses, for every plan in one sweep over the function.
 ///
 /// Vector values are homes: a vector-producing op writes its home through
 /// `dest_ptr`, and the home *is* the value.  Each blend therefore writes a
 /// fresh 32-byte home, and the last home replaces the reload's result
 /// everywhere it is used.  The homes are allocated in the entry block so the
 /// frame layout stays static.
-fn apply_plan(func: &mut IrFunction, plan: Plan) {
+///
+/// Every plan was made against the function as it is now, and
+/// `lane_patch_in_function` admits only plans whose instructions are disjoint,
+/// so all indices below refer to the unmodified blocks.  Each block is rebuilt
+/// once, however many temporaries it holds, and the value renaming is applied
+/// once over the whole function.
+fn apply_plans(func: &mut IrFunction, plans: Vec<Plan>) {
     let mut next_value = func.next_value_id;
     let mut fresh = || {
         let v = Value(next_value);
         next_value += 1;
         v
     };
-    let rewrite_at: FxHashMap<usize, Rewrite> =
-        plan.rewrites.into_iter().map(|rw| (rw.index, rw)).collect();
-    let retired: Vec<usize> = plan.retire;
     let mut renamed: FxHashMap<u32, u32> = FxHashMap::default();
     let mut hoisted_homes: Vec<Instruction> = Vec::new();
 
-    let block: &mut BasicBlock = &mut func.blocks[plan.block];
-    let old = std::mem::take(&mut block.instructions);
-    let old_spans = std::mem::take(&mut block.source_spans);
-    let old_ids = std::mem::take(&mut block.source_inline_ids);
-    let spans_in_lockstep = old_spans.len() == old.len();
-    let ids_in_lockstep = old_ids.len() == old.len();
+    let mut by_block: std::collections::BTreeMap<usize, (Vec<Rewrite>, Vec<usize>)> =
+        Default::default();
+    for plan in plans {
+        let slot = by_block.entry(plan.block).or_default();
+        slot.0.extend(plan.rewrites);
+        slot.1.extend(plan.retire);
+    }
 
-    let mut instructions: Vec<Instruction> = Vec::with_capacity(old.len());
-    let mut spans: Vec<Span> = Vec::new();
-    let mut ids: Vec<u32> = Vec::new();
-    for (index, inst) in old.into_iter().enumerate() {
-        if retired.binary_search(&index).is_ok() {
-            continue;
-        }
-        let span = spans_in_lockstep.then(|| old_spans[index].clone());
-        let id = ids_in_lockstep.then(|| old_ids[index]);
-        let mut push = |inst: Instruction| {
-            instructions.push(inst);
-            if let Some(span) = &span {
-                spans.push(span.clone());
+    for (bi, (rewrites, mut retired)) in by_block {
+        retired.sort_unstable();
+        retired.dedup();
+        let rewrite_at: FxHashMap<usize, Rewrite> =
+            rewrites.into_iter().map(|rw| (rw.index, rw)).collect();
+
+        let block: &mut BasicBlock = &mut func.blocks[bi];
+        let old = std::mem::take(&mut block.instructions);
+        let old_spans = std::mem::take(&mut block.source_spans);
+        let old_ids = std::mem::take(&mut block.source_inline_ids);
+        let spans_in_lockstep = old_spans.len() == old.len();
+        let ids_in_lockstep = old_ids.len() == old.len();
+
+        let mut instructions: Vec<Instruction> = Vec::with_capacity(old.len());
+        let mut spans: Vec<Span> = Vec::new();
+        let mut ids: Vec<u32> = Vec::new();
+        for (index, inst) in old.into_iter().enumerate() {
+            if retired.binary_search(&index).is_ok() {
+                continue;
             }
-            if let Some(id) = id {
-                ids.push(id);
-            }
-        };
-        match rewrite_at.get(&index) {
-            Some(rw) => {
-                let mut current = rw.base;
-                for (lane, val, ty) in &rw.pending {
-                    let broadcast = fresh();
-                    push(Instruction::Intrinsic {
-                        dest: Some(broadcast),
-                        op: lane_broadcast(*ty),
-                        dest_ptr: None,
-                        args: vec![val.clone()],
-                    });
-                    let home = fresh();
-                    hoisted_homes.push(Instruction::Alloca {
-                        dest: home,
-                        ty: IrType::Ptr,
-                        size: TEMP_BYTES,
-                        align: TEMP_BYTES,
-                        volatile: false,
-                        semantic_volatile: false,
-                    });
-                    push(Instruction::Intrinsic {
-                        dest: None,
-                        op: IntrinsicOp::BlendPs256,
-                        dest_ptr: Some(home),
-                        args: vec![
-                            Operand::Value(current),
-                            Operand::Value(broadcast),
-                            Operand::Const(IrConst::I64(1i64 << lane)),
-                        ],
-                    });
-                    current = home;
+            let span = spans_in_lockstep.then(|| old_spans[index].clone());
+            let id = ids_in_lockstep.then(|| old_ids[index]);
+            let mut push = |inst: Instruction| {
+                instructions.push(inst);
+                if let Some(span) = &span {
+                    spans.push(span.clone());
                 }
-                renamed.insert(rw.dest.0, current.0);
+                if let Some(id) = id {
+                    ids.push(id);
+                }
+            };
+            match rewrite_at.get(&index) {
+                Some(rw) => {
+                    // One home per chain.  Each blend reads the previous
+                    // blend's value and writes the same home.  The emitter
+                    // loads every operand before it stores the destination,
+                    // so the in-place update is exact.  The intermediate
+                    // values have no other reader.
+                    let mut current = rw.base;
+                    if !rw.pending.is_empty() {
+                        let home = fresh();
+                        hoisted_homes.push(Instruction::Alloca {
+                            dest: home,
+                            ty: IrType::Ptr,
+                            size: TEMP_BYTES,
+                            align: TEMP_BYTES,
+                            volatile: false,
+                            semantic_volatile: false,
+                        });
+                        for (lane, val, ty) in &rw.pending {
+                            let broadcast = fresh();
+                            push(Instruction::Intrinsic {
+                                dest: Some(broadcast),
+                                op: lane_broadcast(*ty),
+                                dest_ptr: None,
+                                args: vec![val.clone()],
+                            });
+                            push(Instruction::Intrinsic {
+                                dest: None,
+                                op: IntrinsicOp::BlendPs256,
+                                dest_ptr: Some(home),
+                                args: vec![
+                                    Operand::Value(current),
+                                    Operand::Value(broadcast),
+                                    Operand::Const(IrConst::I64(1i64 << lane)),
+                                ],
+                            });
+                            current = home;
+                        }
+                    }
+                    renamed.insert(rw.dest.0, current.0);
+                }
+                None => push(inst),
             }
-            None => push(inst),
         }
-    }
-    block.instructions = instructions;
-    if spans_in_lockstep {
-        block.source_spans = spans;
-    }
-    if ids_in_lockstep {
-        block.source_inline_ids = ids;
+        block.instructions = instructions;
+        if spans_in_lockstep {
+            block.source_spans = spans;
+        }
+        if ids_in_lockstep {
+            block.source_inline_ids = ids;
+        }
     }
     func.next_value_id = next_value;
 
-    prepend_to_entry(&mut func.blocks[0], hoisted_homes);
+    if let Some(entry) = func.blocks.first_mut() {
+        prepend_to_entry(entry, hoisted_homes);
+    }
     for block in func.blocks.iter_mut() {
         for inst in block.instructions.iter_mut() {
             replace_values_in_inst_map(inst, &renamed);
@@ -563,11 +631,25 @@ fn apply_plan(func: &mut IrFunction, plan: Plan) {
     }
 }
 
-/// Rewrite one function to a fixpoint.  Returns the number of temporaries
-/// rewritten.
+/// Rewrite one function to a fixpoint.  Each round plans every candidate
+/// temporary against a single `UseDefInfo`, admits plans whose instructions
+/// are disjoint from every plan admitted before them, and applies them in one
+/// sweep.  A plan that collides with an admitted one is deferred to the next
+/// round, so the rewrite never depends on the disjointness of plans alone.
+///
+/// Termination: a round that finds any plan admits at least one (the first
+/// has nothing to collide with), and every admitted plan retires at least one
+/// whole-width reload that has pending lanes.  Rewritten reloads create no new
+/// such reload, so the count of them strictly falls each round.
+///
+/// Returns the number of temporaries rewritten.  Stops once
+/// `MAX_REWRITES_PER_FUNCTION` temporaries are rewritten.
 fn lane_patch_in_function(func: &mut IrFunction) -> usize {
     let mut rewritten = 0usize;
     loop {
+        if rewritten >= MAX_REWRITES_PER_FUNCTION {
+            break;
+        }
         let info = UseDefInfo::build(func);
         let candidates: Vec<Value> = func
             .blocks
@@ -584,14 +666,33 @@ fn lane_patch_in_function(func: &mut IrFunction) -> usize {
                 _ => None,
             })
             .collect();
-        let Some(plan) = candidates
-            .into_iter()
-            .find_map(|temp| plan_temp(func, &info, temp))
-        else {
+        let mut claimed: FxHashSet<(usize, usize)> = FxHashSet::default();
+        let mut admitted: Vec<Plan> = Vec::new();
+        for temp in candidates {
+            if rewritten + admitted.len() >= MAX_REWRITES_PER_FUNCTION {
+                break;
+            }
+            let Some(plan) = plan_temp(func, &info, temp) else {
+                continue;
+            };
+            let claims: Vec<(usize, usize)> = plan
+                .rewrites
+                .iter()
+                .map(|rw| rw.index)
+                .chain(plan.retire.iter().copied())
+                .map(|index| (plan.block, index))
+                .collect();
+            if claims.iter().any(|claim| claimed.contains(claim)) {
+                continue;
+            }
+            claimed.extend(claims);
+            admitted.push(plan);
+        }
+        if admitted.is_empty() {
             break;
-        };
-        apply_plan(func, plan);
-        rewritten += 1;
+        }
+        rewritten += admitted.len();
+        apply_plans(func, admitted);
     }
     rewritten
 }
@@ -813,6 +914,164 @@ mod tests {
             0,
             "the define is shadowed in every lane that is read"
         );
+    }
+
+    #[test]
+    fn scalar_read_before_the_define_keeps_the_define_and_lane_store() {
+        // The block's first access is a scalar read of lane 0.  It sees
+        // whatever an earlier execution of this block left in the frame (the
+        // previous loop iteration), so the define that supplies lanes 1..7 and
+        // the lane store that last wrote lane 0 are both observable through it
+        // and must survive.  The reload still becomes a blend over them.
+        let func = run(function(vec![vec![
+            alloca32(20),
+            Instruction::Load {
+                dest: Value(29),
+                ptr: Value(20),
+                ty: IrType::U32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            define(11, 20),
+            lane_store(12, 20, IrType::U32),
+            reload(30, 20),
+        ]]));
+        assert_eq!(count(&func, is_reload), 0, "reload must be gone");
+        assert_eq!(count(&func, is_blend), 1);
+        assert_eq!(
+            count(&func, is_store),
+            1,
+            "the lane store that wrote lane 0 must stay"
+        );
+        assert_eq!(
+            count(&func, |i| matches!(i, Instruction::Load { .. })),
+            1,
+            "the incoming scalar read must stay"
+        );
+        assert_eq!(
+            count(&func, |i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::VecStoreF32x8,
+                    ..
+                }
+            )),
+            1,
+            "the define reaches the incoming read in lanes 1..7 and must stay"
+        );
+    }
+
+    #[test]
+    fn two_temporaries_in_one_block_are_rewritten_in_one_sweep() {
+        // Two independent temporaries, each accessed only in block 0.  One
+        // round admits both plans; each reload becomes a blend over its own
+        // chain, and both temporaries' stores retire.
+        let func = run(function(vec![vec![
+            alloca32(20),
+            alloca32(40),
+            define(11, 20),
+            lane_store(12, 20, IrType::U32),
+            define(13, 40),
+            lane_store(14, 40, IrType::F32),
+            reload(30, 20),
+            reload(31, 40),
+        ]]));
+        assert_eq!(count(&func, is_reload), 0, "both reloads must be gone");
+        assert_eq!(count(&func, is_blend), 2, "one blend per temporary");
+        assert_eq!(count(&func, is_store), 0, "no memory reader: stores retire");
+        assert_eq!(
+            count(&func, |i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::VecStoreF32x8,
+                    ..
+                }
+            )),
+            0,
+            "both defines retire"
+        );
+    }
+
+    #[test]
+    fn rewrites_stop_at_the_per_function_budget() {
+        // One more independent temporary than the budget allows.  The budget
+        // caps the rewrites; the surplus temporary keeps its reload.
+        let n = MAX_REWRITES_PER_FUNCTION + 1;
+        let mut insts = Vec::new();
+        for i in 0..n as u32 {
+            let temp = 1000 + 10 * i;
+            insts.push(alloca32(temp));
+            insts.push(define(temp + 1, temp));
+            insts.push(lane_store(temp + 2, temp, IrType::U32));
+        }
+        for i in 0..n as u32 {
+            insts.push(reload(5000 + i, 1000 + 10 * i));
+        }
+        let func = run(function(vec![insts]));
+        assert_eq!(
+            count(&func, is_blend),
+            MAX_REWRITES_PER_FUNCTION,
+            "exactly the budget is rewritten"
+        );
+        assert_eq!(
+            count(&func, is_reload),
+            1,
+            "the surplus temporary keeps its reload"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_lane_writes_shares_one_home() {
+        // Two pending lanes in one chain: two blends, but one new 32-byte home
+        // (the temporary's own alloca is the other).  Both blends write it.
+        let func = run(function(vec![vec![
+            alloca32(20),
+            define(11, 20),
+            lane_store(12, 20, IrType::U32),
+            gep(21, 20, Operand::Const(IrConst::I64(4))),
+            lane_store(13, 21, IrType::U32),
+            reload(30, 20),
+        ]]));
+        assert_eq!(count(&func, is_blend), 2, "one blend per pending lane");
+        assert_eq!(
+            count(&func, |i| matches!(i, Instruction::Alloca { .. })),
+            2,
+            "one home for the chain, plus the temporary"
+        );
+        let homes: std::collections::BTreeSet<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| match i {
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::BlendPs256,
+                    dest_ptr: Some(d),
+                    ..
+                } => Some(d.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(homes.len(), 1, "every blend writes the same home");
+    }
+
+    #[test]
+    fn define_of_a_derived_address_is_refused() {
+        // A `VecStoreF32x8` whose stored value is a GEP of the temporary is
+        // ill-typed, but the pass must not treat that pointer as a vector
+        // base.  The whole temporary is refused, so the reload stays.
+        let func = run(function(vec![vec![
+            alloca32(20),
+            gep(21, 20, Operand::Const(IrConst::I64(4))),
+            define(11, 21),
+            lane_store(12, 20, IrType::U32),
+            reload(30, 20),
+        ]]));
+        assert_eq!(
+            count(&func, is_blend),
+            0,
+            "no blend may use a pointer as a vector"
+        );
+        assert_eq!(count(&func, is_reload), 1, "the reload must stay");
     }
 
     #[test]
