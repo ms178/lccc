@@ -333,20 +333,24 @@ pub(crate) fn run_with_symbol_facts(func: &mut IrFunction, facts: &ModuleSymbolF
     // thing keeping the carrier split alive), so iterate the pair to a
     // fixpoint; each round removes at least one instruction, and the bound
     // is a belt-and-braces guard against malformed IR.
+    //
+    // The purge runs INSIDE the loop: a collapse or forward removes the
+    // only READ of a staging home, and the dead store left behind is often
+    // the one non-return use that keeps the next collapse fail-closed.
+    // Observed on `__m128i v = _mm_setzero_si128(); v = f(p); return v;`:
+    // the forwarder hands the carrier reload to the home's reader, the
+    // reload's remaining use is the (now unreadable) home store, and only
+    // after that store is purged does the carrier collapse see a
+    // return-only reload.  The generic DSE phases all ran before this
+    // pass, so nobody else retires these stores — unpurged they survive
+    // to codegen as two stores plus the frame slot (measured: 12
+    // instructions instead of 5 on `return f()`).
     for _ in 0..8 {
         let round = forward_vector_roundtrips(func) + collapse_carrier_reloads(func);
         if round == 0 {
             break;
         }
         collapsed += round;
-    }
-    if collapsed > 0 {
-        // The collapse just removed the only READ of the staging home: the
-        // split-half stores (and any zero-prefill of the same home) are now
-        // writes nobody can observe.  The generic DSE phases all ran before
-        // this pass, so retire them here — otherwise they survive to codegen
-        // as two stores plus the frame slot (measured on `return f()` for a
-        // 16-byte vector aggregate: 12 instructions instead of 5).
         purge_unread_local_stores(func);
     }
     total + collapsed
@@ -368,8 +372,16 @@ pub(crate) fn run_with_symbol_facts(func: &mut IrFunction, facts: &ModuleSymbolF
 fn purge_unread_local_stores(func: &mut IrFunction) {
     let multi_def = super::gvn::find_multi_def_values(func);
     let mut allocas: Vec<Value> = Vec::new();
+    // Every value id read anywhere (instruction operands and terminators):
+    // the zero-fill intrinsics carry a VALUE destination alongside their
+    // pointer write, and deleting one is only sound when that value is
+    // provably unused.
+    let mut used_values: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
+            inst.for_each_used_value(|v| {
+                used_values.insert(v);
+            });
             if let Instruction::Alloca {
                 dest,
                 volatile: false,
@@ -382,6 +394,9 @@ fn purge_unread_local_stores(func: &mut IrFunction) {
                 }
             }
         }
+        block.terminator.for_each_used_value(|v| {
+            used_values.insert(v);
+        });
     }
 
     'alloca: for root in allocas {
@@ -462,6 +477,37 @@ fn purge_unread_local_stores(func: &mut IrFunction) {
                                         && !matches!(val, Operand::Value(v) if web.contains(&v.0))
                             )
                     }
+                    // A zero-fill INTO the object (`_mm_setzero_*` written
+                    // straight to the variable's home): a plain write of
+                    // constant bytes, deletable like `Store` — but only when
+                    // its VALUE destination is provably unused, because the
+                    // instruction also defines the zero vector as an SSA
+                    // value and deleting a used definition is never sound.
+                    Instruction::Intrinsic {
+                        dest: Some(zdest),
+                        op,
+                        dest_ptr: Some(dp),
+                        args,
+                    } if is_zero_fill_op(*op) => {
+                        args.is_empty() && web.contains(&dp.0) && !used_values.contains(&zdest.0)
+                    }
+                    // A whole-vector load FROM the object whose result is
+                    // provably unused: a read in form only.  The collapse
+                    // rounds orphan these (the forwarder rewrote the load's
+                    // consumers), and left in place the dead read pins the
+                    // object's zero-prefill — observed as a lone `pxor`
+                    // plus a frame slot after everything else collapsed.
+                    Instruction::Intrinsic {
+                        dest: Some(ld),
+                        op,
+                        dest_ptr: None,
+                        args,
+                    } if is_vec16_load_op(*op) => {
+                        matches!(
+                            args.as_slice(),
+                            [Operand::Value(p), Operand::Const(_)] if web.contains(&p.0)
+                        ) && !used_values.contains(&ld.0)
+                    }
                     _ => false,
                 };
                 if !ok {
@@ -502,6 +548,25 @@ fn purge_unread_local_stores(func: &mut IrFunction) {
                         dest_ptr: Some(dp),
                         ..
                     } => is_vec16_store_op(*op) && web.contains(&dp.0),
+                    Instruction::Intrinsic {
+                        dest: Some(_),
+                        op,
+                        dest_ptr: Some(dp),
+                        ..
+                    } => is_zero_fill_op(*op) && web.contains(&dp.0),
+                    Instruction::Intrinsic {
+                        dest: Some(ld),
+                        op,
+                        dest_ptr: None,
+                        args,
+                    } => {
+                        is_vec16_load_op(*op)
+                            && matches!(
+                                args.as_slice(),
+                                [Operand::Value(p), Operand::Const(_)] if web.contains(&p.0)
+                            )
+                            && !used_values.contains(&ld.0)
+                    }
                     Instruction::Alloca { dest, .. } | Instruction::GetElementPtr { dest, .. } => {
                         drop_object && web.contains(&dest.0)
                     }
@@ -572,6 +637,18 @@ fn is_vec16_store_op(op: crate::ir::intrinsics::IntrinsicOp) -> bool {
     matches!(
         op,
         I::VecStoreI64x2 | I::VecStoreI32x4 | I::VecStoreF32x4 | I::VecStoreF64x2
+    )
+}
+
+/// The zero-fill intrinsics: a constant write of 16/32/64 zero bytes to
+/// `dest_ptr` that ALSO defines the zero vector as an SSA value.  For the
+/// write-only purge they are plain stores; the value destination is the
+/// caller's problem (deletable only when provably unused).
+fn is_zero_fill_op(op: crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    matches!(
+        op,
+        I::Setzero128 | I::SetzeroPs128 | I::Setzero256 | I::Setzero512
     )
 }
 
@@ -2182,6 +2259,139 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, Instruction::Alloca { dest: Value(6), .. })),
             "a parameter home must survive: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    fn setzero(dest: u32, ptr: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op: crate::ir::intrinsics::IntrinsicOp::Setzero128,
+            dest_ptr: Some(Value(ptr)),
+            args: vec![],
+        }
+    }
+
+    fn vecstore_i64(val: u32, ptr: u32, off: i64) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op: crate::ir::intrinsics::IntrinsicOp::VecStoreI64x2,
+            dest_ptr: Some(Value(ptr)),
+            args: vec![
+                Operand::Value(Value(val)),
+                Operand::Value(Value(ptr)),
+                Operand::Const(IrConst::I64(off)),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_zero_initialized_home_collapses_through_the_purge_interleave() {
+        // `__m128i v = _mm_setzero_si128(); v = f(p); return v;` — the
+        // chain only collapses when the purge runs INSIDE the fixpoint:
+        // the forwarder hands the carrier reload to the home's reader, the
+        // reload's remaining use is the now-unreadable home store, and the
+        // next collapse round needs that store gone to see a return-only
+        // reload.  End state: `Return %carrier`, no stores, no loads, no
+        // zero fill, no staging objects.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16), // zero-prefill slot
+            alloca(40, 16), // v's home
+            setzero(31, 30),
+            vecload(32, 30, 0),
+            vecstore_i64(32, 40, 0),
+            vec128_call(5, 2),
+            alloca(6, 16), // carrier staging
+            cast(7, 5, IrType::I128, IrType::I64),
+            store(7, 6),
+            bin(
+                IrBinOp::LShr,
+                8,
+                5,
+                Operand::Const(IrConst::I64(64)),
+                IrType::I128,
+            ),
+            cast(9, 8, IrType::I128, IrType::I64),
+            gep(10, 6, 8),
+            store(9, 10),
+            vecload(11, 6, 0),
+            vecstore_i64(11, 40, 0),
+            vecload(14, 40, 0),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(14))));
+        assert!(run(&mut f) >= 2, "forward + collapse must both fire");
+        assert!(
+            matches!(
+                f.blocks[0].terminator,
+                Terminator::Return(Some(Operand::Value(Value(5))))
+            ),
+            "the return must read the carrier directly: {:?}",
+            f.blocks[0].terminator
+        );
+        let insts = &f.blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|i| matches!(
+                i,
+                Instruction::Store { .. }
+                    | Instruction::Alloca { .. }
+                    | Instruction::Intrinsic { .. }
+            )),
+            "every store, staging object, zero fill and dead load must be \
+             retired: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_fill_with_a_used_value_destination_keeps_its_object() {
+        // The zero intrinsic's VALUE feeds a real consumer: deleting the
+        // instruction would orphan it, so the web fails closed even though
+        // the pointer write itself is unread.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            setzero(31, 30),
+            // The zero VALUE escapes through a whole-vector store to the
+            // caller's buffer — a live use the purge must respect.
+            Instruction::Intrinsic {
+                dest: None,
+                op: crate::ir::intrinsics::IntrinsicOp::VecStoreI64x2,
+                dest_ptr: Some(Value(2)),
+                args: vec![
+                    Operand::Value(Value(31)),
+                    Operand::Value(Value(2)),
+                    Operand::Const(IrConst::I64(0)),
+                ],
+            },
+            vec128_call(5, 2),
+            alloca(6, 16),
+            cast(7, 5, IrType::I128, IrType::I64),
+            store(7, 6),
+            bin(
+                IrBinOp::LShr,
+                8,
+                5,
+                Operand::Const(IrConst::I64(64)),
+                IrType::I128,
+            ),
+            cast(9, 8, IrType::I128, IrType::I64),
+            gep(10, 6, 8),
+            store(9, 10),
+            vecload(11, 6, 0),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(11))));
+        assert_eq!(run(&mut f), 1, "the carrier collapse itself still fires");
+        assert!(
+            f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::Setzero128,
+                    ..
+                }
+            )),
+            "a zero fill whose value is consumed must survive: {:?}",
             f.blocks[0].instructions
         );
     }
