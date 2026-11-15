@@ -489,48 +489,7 @@ fn normalize(
             };
         }
     }
-    // One preheader `GlobalAddr` per symbol, then (for a nonzero start) one
-    // rebased GEP per stream.
-    let mut hoisted: FxHashMap<String, Value> = FxHashMap::default();
-    for (bi, ii, base, global) in geps {
-        let base = match global {
-            Some(name) => match hoisted.get(&name) {
-                Some(v) => *v,
-                None => {
-                    let dest = fresh(&mut next);
-                    push_preheader_inst(
-                        &mut candidate.blocks[pre],
-                        Instruction::GlobalAddr {
-                            dest,
-                            name: name.clone(),
-                        },
-                    );
-                    hoisted.insert(name, dest);
-                    dest
-                }
-            },
-            None => base,
-        };
-        let new_base = if start == 0 {
-            base
-        } else {
-            let shifted = fresh(&mut next);
-            push_preheader_inst(
-                &mut candidate.blocks[pre],
-                Instruction::GetElementPtr {
-                    dest: shifted,
-                    base,
-                    offset: Operand::Const(IrConst::I64(start)),
-                    ty: IrType::Ptr,
-                },
-            );
-            shifted
-        };
-        if let Instruction::GetElementPtr { base, .. } = &mut candidate.blocks[bi].instructions[ii]
-        {
-            *base = new_base;
-        }
-    }
+    rebase_gep_streams(&mut candidate, pre, geps, start, &mut next);
     let truth = fresh(&mut next);
     let promoted = fresh(&mut next);
     for (bi, block) in candidate.blocks.iter_mut().enumerate() {
@@ -589,6 +548,59 @@ fn normalize(
     }
     candidate.next_value_id = next;
     Some(candidate)
+}
+
+/// Point every accepted byte-stream GEP at a preheader-available base:
+/// one hoisted `GlobalAddr` per symbol (rematerialised — the in-body copy
+/// stays for its other uses and dies in DCE), then, for a nonzero start,
+/// one rebased GEP per stream so the zero-based IV reads the same bytes.
+fn rebase_gep_streams(
+    candidate: &mut IrFunction,
+    pre: usize,
+    geps: Vec<(usize, usize, Value, Option<String>)>,
+    start: i64,
+    next: &mut u32,
+) {
+    let mut hoisted: FxHashMap<String, Value> = FxHashMap::default();
+    for (bi, ii, base, global) in geps {
+        let base = match global {
+            Some(name) => match hoisted.get(&name) {
+                Some(v) => *v,
+                None => {
+                    let dest = fresh(next);
+                    push_preheader_inst(
+                        &mut candidate.blocks[pre],
+                        Instruction::GlobalAddr {
+                            dest,
+                            name: name.clone(),
+                        },
+                    );
+                    hoisted.insert(name, dest);
+                    dest
+                }
+            },
+            None => base,
+        };
+        let new_base = if start == 0 {
+            base
+        } else {
+            let shifted = fresh(next);
+            push_preheader_inst(
+                &mut candidate.blocks[pre],
+                Instruction::GetElementPtr {
+                    dest: shifted,
+                    base,
+                    offset: Operand::Const(IrConst::I64(start)),
+                    ty: IrType::Ptr,
+                },
+            );
+            shifted
+        };
+        if let Instruction::GetElementPtr { base, .. } = &mut candidate.blocks[bi].instructions[ii]
+        {
+            *base = new_base;
+        }
+    }
 }
 
 /// Append to the preheader, keeping a complete span table complete (and
