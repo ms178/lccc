@@ -40,6 +40,23 @@ __attribute__((noinline)) __m128i h0(const int *p) {
     return v;
 }
 
+/* Negative control: an [Integer, Integer] I128 carrier.  `__int128`
+ * returns in RAX:RDX, not XMM0; the collapse must fail closed (the
+ * matcher requires a vector128-class call return), and the union pun
+ * must still read back both halves in little-endian lane order. */
+__attribute__((noinline)) __int128 mki(const long *p) {
+    return ((__int128)p[1] << 64) | (unsigned long)p[0];
+}
+
+__attribute__((noinline)) __m128i hgp(const long *p) {
+    union {
+        __int128 i;
+        __m128i v;
+    } u;
+    u.i = mki(p);
+    return u.v;
+}
+
 int main(void) {
     int src[4] = {0x01020304, 0x11223344, -100, 0x7ffffff0};
     int out[4], bad = 0;
@@ -53,6 +70,12 @@ int main(void) {
     if (out[0] != 0x01020305 || out[1] != 0x11223346 || out[2] != -97 ||
         out[3] != 0x7ffffff4)
         bad |= 2;
+
+    long lsrc[2] = {0x1111222233334444L, 0x5555666677778888L};
+    long lout[2];
+    _mm_storeu_si128((__m128i *)lout, hgp(lsrc));
+    if (lout[0] != 0x1111222233334444L || lout[1] != 0x5555666677778888L)
+        bad |= 4;
 
     printf("%08x %08x %08x %08x bad=%d\n", out[0], out[1], out[2], out[3],
            bad);

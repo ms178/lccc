@@ -86,7 +86,15 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo], sse41: bool, av
             i += 1;
             continue;
         }
-        let line = infos[i].trimmed(raw).to_string();
+        // Byte screen before the per-line allocation: only `(v)mov…` lines
+        // can open a window, and the owned copy exists solely because the
+        // borrow of `store` must end before `replace_line` mutates it.
+        let trimmed = infos[i].trimmed(raw);
+        if !looks_like_mov(trimmed) {
+            i += 1;
+            continue;
+        }
+        let line = trimmed.to_string();
         let Some(pending) = parse_vector_store(&line) else {
             i += 1;
             continue;
@@ -106,7 +114,11 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo], sse41: bool, av
             if raw_j.contains('#') {
                 break;
             }
-            let reload = infos[j].trimmed(raw_j).to_string();
+            let reload_ref = infos[j].trimmed(raw_j);
+            if !looks_like_mov(reload_ref) {
+                break;
+            }
+            let reload = reload_ref.to_string();
             let Some((text, clobbers_source)) = rewrite_reload(&pending, &reload, avx) else {
                 break; // not a matching reload: the blunt clear
             };
@@ -178,11 +190,23 @@ fn rewrite_reload(p: &PendingStore<'_>, line: &str, avx: bool) -> Option<(String
     // The stored register spelled as an XMM, for 128-bit replacements.
     let xmm_src = format!("%xmm{}", &p.reg[4..]);
     let clobbers_source = dst == xmm_src || dst == p.reg;
+    // A reload whose destination is the SLOT'S BASE REGISTER redefines what
+    // every later `D(base)` means: forwarding this line is still correct
+    // (same value, same write), but the scan must not continue past it —
+    // and the shape is pathological enough (a lane extract into %rsp/%rbp)
+    // that refusing outright is both simpler and safer.  Every width
+    // spelling of the two frame bases aliases the same family.
+    if matches!(
+        dst,
+        "%rsp" | "%esp" | "%sp" | "%spl" | "%rbp" | "%ebp" | "%bp" | "%bpl"
+    ) {
+        return None;
+    }
 
     let text = match body {
         "movss" if dst.starts_with("%xmm") => {
-            if delta % 4 != 0 || delta + 4 > p.width.min(16) || delta < 0 {
-                return None; // upper YMM half: no single-instruction form
+            if delta < 0 || delta % 4 != 0 || delta > p.width.min(16) - 4 {
+                return None; // outside the low 128 bits: no 1-insn form
             }
             let lane = delta / 4;
             let imm = (lane << 6) | 0b1110;
@@ -196,7 +220,7 @@ fn rewrite_reload(p: &PendingStore<'_>, line: &str, avx: bool) -> Option<(String
             }
         }
         "movsd" | "movq" if dst.starts_with("%xmm") => {
-            if delta % 8 != 0 || delta + 8 > p.width.min(16) || delta < 0 {
+            if delta < 0 || delta % 8 != 0 || delta > p.width.min(16) - 8 {
                 return None;
             }
             match delta / 8 {
@@ -215,7 +239,7 @@ fn rewrite_reload(p: &PendingStore<'_>, line: &str, avx: bool) -> Option<(String
         // may be dirty, and the extract must be VEX to avoid the legacy-SSE
         // transition stall; a legacy store answers with legacy SSE4.1.
         "movl" if is_gp_operand(dst) => {
-            if delta % 4 != 0 || delta + 4 > p.width.min(16) || delta < 0 {
+            if delta < 0 || delta % 4 != 0 || delta > p.width.min(16) - 4 {
                 return None; // GP forms have no scratch for the upper half
             }
             let gv = if p.vex { "v" } else { "" };
@@ -223,7 +247,7 @@ fn rewrite_reload(p: &PendingStore<'_>, line: &str, avx: bool) -> Option<(String
             Some(format!("    {gv}extractps ${lane}, {xmm_src}, {dst}"))
         }
         "movq" if is_gp_operand(dst) => {
-            if delta % 8 != 0 || delta + 8 > p.width.min(16) || delta < 0 {
+            if delta < 0 || delta % 8 != 0 || delta > p.width.min(16) - 8 {
                 return None;
             }
             let gv = if p.vex { "v" } else { "" };
@@ -233,6 +257,13 @@ fn rewrite_reload(p: &PendingStore<'_>, line: &str, avx: bool) -> Option<(String
         _ => None,
     }?;
     Some((text, clobbers_source))
+}
+
+/// `mov…` or `vmov…` at the start of the trimmed line — the only shapes
+/// either parser can accept, screened before any allocation.
+fn looks_like_mov(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.starts_with(b"mov") || b.starts_with(b"vmov")
 }
 
 /// A plain general-purpose register operand: `%r…`/`%e…` spelling with no
@@ -337,6 +368,19 @@ mod tests {
             "    ret\n",
         )));
         assert!(out.contains("vpsrldq $8, %xmm3, %xmm0"), "{out}");
+    }
+
+    #[test]
+    fn a_reload_into_the_slot_base_register_declines() {
+        // Writing the base register redefines every later `D(%rsp)`; the
+        // pass must refuse the line entirely (which also ends the window
+        // before any later reload can be mis-forwarded).
+        let out = run_pass(&frame(concat!(
+            "    vmovdqu %xmm2, (%rsp)\n",
+            "    movq 8(%rsp), %rbp\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("movq 8(%rsp), %rbp"), "{out}");
     }
 
     #[test]

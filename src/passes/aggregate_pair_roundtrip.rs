@@ -613,6 +613,24 @@ fn find_carrier_reload(func: &IrFunction) -> Option<(Value, Value)> {
             if lo_x != hi_x {
                 continue;
             }
+            // The carrier must be a call return that ALREADY lives in an
+            // XMM register (`ret_is_vector128`: SysV classes [Sse, SseUp]).
+            // That is the whole safety argument for the substitution — the
+            // reload's users receive the bit-identical value in the same
+            // register file.  An [Integer, Integer] I128 (e.g. `__int128`
+            // punned to a vector through a union) reaches this pass as a
+            // single un-split `Store I128` today and so never matches, but
+            // that is an accident of lowering, not a guarantee; encode the
+            // requirement instead of inheriting it.
+            let carrier_in_xmm = matches!(
+                unique_def(func, lo_x),
+                Some(
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
+                ) if info.ret_is_vector128
+            );
+            if !carrier_in_xmm {
+                continue;
+            }
 
             // Nothing between the first matched store and the load may move
             // memory, the matched stores themselves excepted.
@@ -1631,12 +1649,29 @@ mod tests {
         }
     }
 
-    /// carrier %5 (I128), staging alloca %6, reload %11; `Return %11`.
+    /// A call returning a 16-byte vector through the I128 carrier:
+    /// SysV classes [Sse, SseUp], i.e. the value arrives in %xmm0.
+    fn vec128_call(dest: u32, arg: u32) -> Instruction {
+        Instruction::Call {
+            func: "mk4".to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: Some(Value(dest)),
+                args: vec![Operand::Value(Value(arg))],
+                arg_types: vec![IrType::Ptr],
+                num_fixed_args: 1,
+                return_type: IrType::I128,
+                ret_is_vector128: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// carrier %5 (I128 vector128 call return), staging alloca %6,
+    /// reload %11; `Return %11`.
     fn carrier_split(insts_before_load: &mut Vec<Instruction>) -> IrFunction {
         let mut insts = vec![
             param_ref(2, 0),
-            load(4, 2),
-            cast(5, 4, IrType::U64, IrType::I128),
+            vec128_call(5, 2),
             alloca(6, 16),
             cast(7, 5, IrType::I128, IrType::I64),
             store(7, 6),
@@ -1692,7 +1727,7 @@ mod tests {
         // `__m128i v = _mm_setzero_si128(); v = f(p); return v;` leaves an
         // extra constant store into the same home before the split.
         let mut f = carrier_split(&mut Vec::new());
-        f.blocks[0].instructions.insert(4, store_const(6));
+        f.blocks[0].instructions.insert(3, store_const(6));
         assert_eq!(run(&mut f), 1);
         assert!(
             !f.blocks[0]
@@ -1722,9 +1757,7 @@ mod tests {
     fn halves_of_two_different_carriers_decline() {
         let mut f = carrier_split(&mut Vec::new());
         // Retarget the high half's shift onto a second carrier %25.
-        f.blocks[0]
-            .instructions
-            .insert(3, cast(25, 4, IrType::U64, IrType::I128));
+        f.blocks[0].instructions.insert(2, vec128_call(25, 2));
         for inst in &mut f.blocks[0].instructions {
             if let Instruction::BinOp {
                 dest: Value(8),
@@ -1736,6 +1769,25 @@ mod tests {
             }
         }
         assert_eq!(run(&mut f), 0);
+    }
+
+    #[test]
+    fn a_carrier_that_is_not_a_vector128_call_return_declines() {
+        // An [Integer, Integer] I128 — `__int128` punned to a vector — must
+        // not be forwarded into vector users: the value lives in a GP pair,
+        // not an XMM, and the substitution's safety argument does not hold.
+        let mut f = carrier_split(&mut Vec::new());
+        for inst in &mut f.blocks[0].instructions {
+            if let Instruction::Call { info, .. } = inst {
+                info.ret_is_vector128 = false;
+            }
+        }
+        assert_eq!(run(&mut f), 0, "GP-pair carriers must fail closed");
+
+        // Same for a carrier that is not a call return at all.
+        let mut g = carrier_split(&mut Vec::new());
+        g.blocks[0].instructions[1] = cast(5, 2, IrType::U64, IrType::I128);
+        assert_eq!(run(&mut g), 0, "non-call carriers must fail closed");
     }
 
     #[test]

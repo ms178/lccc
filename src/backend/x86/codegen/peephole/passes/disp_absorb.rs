@@ -129,6 +129,20 @@ fn absorb_pair(store: &LineStore, infos: &[LineInfo], adj_i: usize) -> Option<(u
     if line_refs_family(&remainder, fam) {
         return None;
     }
+    // Inside the memory operand the register may appear ONLY as the base.
+    // `(%rdi, %rdi, 2)` computes base + index*scale = 3*%rdi, so absorbing
+    // the adjustment as ONE displacement add is wrong by `imm*scale`
+    // (caught live: `addq $11, %rdi; leaq (%rdi,%rdi,2), %rax` folded to
+    // `leaq 11(...)` where only `3*(%rdi+11)` = +33 is correct).  The scan
+    // is family-level, so a differently-sized spelling of the same
+    // register in the index slot is refused too.
+    let close = mem_and_tail.find(')')?;
+    let after_base = mem_and_tail[..close]
+        .split_once(',')
+        .map_or("", |(_, rest)| rest);
+    if line_refs_family(after_base, fam) {
+        return None;
+    }
     let total = disp.checked_add(imm)?;
     i32::try_from(total).ok()?;
 
@@ -243,6 +257,34 @@ mod tests {
 
     fn frame(body: &str) -> String {
         format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n")
+    }
+
+    #[test]
+    fn a_self_scaled_lea_consumer_declines() {
+        // regress_lea_self_scaled_after_lea_producer: `(%rdi,%rdi,2)` is
+        // 3*%rdi — one displacement add is wrong by imm*scale.  This exact
+        // shape shipped broken in the first revision of the pass and was
+        // caught by the corpus at run time; it must never fold.
+        let out = run_pass(&frame(concat!(
+            "    addq $11, %rdi\n",
+            "    leaq (%rdi, %rdi, 2), %rax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("addq $11, %rdi"), "{out}");
+        assert!(out.contains("leaq (%rdi, %rdi, 2), %rax"), "{out}");
+    }
+
+    #[test]
+    fn an_index_only_use_of_the_register_declines() {
+        // The adjusted register as INDEX scales the adjustment; the base
+        // check refuses it before any displacement math.
+        let out = run_pass(&frame(concat!(
+            "    addq $16, %rdi\n",
+            "    movq (%rax, %rdi, 2), %rcx\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("addq $16, %rdi"), "{out}");
+        assert!(out.contains("movq (%rax, %rdi, 2), %rcx"), "{out}");
     }
 
     #[test]
