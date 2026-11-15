@@ -1201,40 +1201,7 @@ fn try_transform_loop(
     // counter update) are read with forwardable element loads.
     let entry_copy = match_entry_copy(func, dom, preheader, base, nslots);
     let gather_base = entry_copy.as_ref().map_or(base, |c| c.src);
-    let mut v_init: Vec<Value> = Vec::with_capacity(groups);
-    let mut entry_insts: Vec<Instruction> = Vec::with_capacity(groups * 9);
-    for g in 0..groups {
-        let mut lanes: Vec<Operand> = Vec::with_capacity(LANES);
-        for l in 0..LANES {
-            let p = Value(next_val);
-            next_val += 1;
-            entry_insts.push(Instruction::GetElementPtr {
-                dest: p,
-                base: gather_base,
-                offset: Operand::Const(IrConst::I64((16 * g + 4 * l) as i64)),
-                ty: IrType::Ptr,
-            });
-            let t = Value(next_val);
-            next_val += 1;
-            entry_insts.push(Instruction::Load {
-                dest: t,
-                ptr: p,
-                ty: IrType::U32,
-                seg_override: crate::common::types::AddressSpace::Default,
-                volatile: false,
-            });
-            lanes.push(Operand::Value(t));
-        }
-        let d = Value(next_val);
-        next_val += 1;
-        v_init.push(d);
-        entry_insts.push(Instruction::Intrinsic {
-            dest: Some(d),
-            op: IntrinsicOp::VecPackI32x4,
-            dest_ptr: None,
-            args: lanes,
-        });
-    }
+    let (v_init, mut entry_insts) = build_entry_pack(gather_base, groups, &mut next_val);
 
     // ── 2. Loop-carried phis in the header: V_g = phi(init, latch). ─────
     let preheader_label = func.blocks[preheader].label.0;
@@ -1353,27 +1320,8 @@ fn try_transform_loop(
     // ── 4b. Commit the entry loads (all decline points are past). ─────
     func.blocks[preheader].extend_insts(entry_insts, Span::dummy());
 
-    // Absorbed entry copy: the pack now reads `src` directly, so the
-    // staging loop is dead.  Route the outside entry straight to the
-    // preheader and gut the two copy blocks (their values are proven
-    // loop-internal, so nothing can reference them).  The blocks stay in
-    // place — unreachable and empty — for the CFG cleanup passes to drop;
-    // removing Vec entries here would shift every later block index this
-    // function still holds.
     if let Some(ec) = &entry_copy {
-        let ph_label = func.blocks[preheader].label.0;
-        let hdr_label = func.blocks[ec.copy_header].label.0;
-        retarget_terminator(
-            &mut func.blocks[ec.entry_pred].terminator,
-            hdr_label,
-            ph_label,
-        );
-        for &bi in &[ec.copy_header, ec.copy_body] {
-            let blk = &mut func.blocks[bi];
-            let _ = blk.take_parallel_debug();
-            blk.instructions.clear();
-            blk.terminator = Terminator::Branch(BlockId(ph_label));
-        }
+        delete_entry_copy(func, ec, preheader);
     }
 
     // ── 5. Rewrite the work (latch) block. ─────────────────────────────
@@ -1829,6 +1777,140 @@ struct ExitCombine {
     state_dead_after: bool,
 }
 
+/// `out` provenance + state-alloca escape proof for the feed-forward
+/// absorber: `out` must be a ParamRef/Alloca/GlobalAddr dominating the
+/// exit block and distinct from the state alloca, the state base must
+/// BE an alloca, and that alloca must never escape (its only permitted
+/// uses are GEP bases, scalar load/store addresses, and the pointer
+/// lane of the pass's own vector intrinsics).  The presence test is
+/// the CANONICAL `for_each_used_value` traversal (every operand
+/// position, including pointers and call arguments); the whitelist
+/// then re-derives which positions carried it, so a use in a position
+/// the whitelist does not name can never slip by.  `out == src` is
+/// fine (distance 0 takes the fast path, which was proven exact).
+fn exit_destination_is_safe(
+    func: &IrFunction,
+    dom: &DominanceChecker,
+    exit_idx: usize,
+    base: Value,
+    out_base: Value,
+) -> bool {
+    if out_base == base {
+        return false;
+    }
+    let mut out_ok = false;
+    let mut base_is_alloca = false;
+    'defs: for (bi, blk) in func.blocks.iter().enumerate() {
+        for inst in &blk.instructions {
+            match inst {
+                Instruction::ParamRef { dest, .. }
+                | Instruction::Alloca { dest, .. }
+                | Instruction::GlobalAddr { dest, .. }
+                    if *dest == out_base =>
+                {
+                    out_ok = dom.dominates(bi, exit_idx);
+                    if base_is_alloca {
+                        break 'defs;
+                    }
+                }
+                Instruction::Alloca { dest, .. } if *dest == base => {
+                    base_is_alloca = true;
+                    if out_ok {
+                        break 'defs;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !out_ok || !base_is_alloca {
+        return false;
+    }
+    for blk in &func.blocks {
+        for inst in &blk.instructions {
+            let mut uses_base = false;
+            inst.for_each_used_value(|v| {
+                if v == base.0 {
+                    uses_base = true;
+                }
+            });
+            if !uses_base {
+                continue;
+            }
+            let ok = match inst {
+                Instruction::GetElementPtr {
+                    base: gb, offset, ..
+                } => *gb == base && !matches!(offset, Operand::Value(v) if *v == base),
+                Instruction::Load { ptr, .. } => *ptr == base,
+                Instruction::Store { ptr, val, .. } => {
+                    *ptr == base && !matches!(val, Operand::Value(v) if *v == base)
+                }
+                Instruction::Intrinsic { op, args, .. } => match op {
+                    // args = [ptr, offset]: only the pointer lane may
+                    // carry the alloca.
+                    IntrinsicOp::VecLoadI32x4 => {
+                        matches!(args.first(), Some(Operand::Value(v)) if *v == base)
+                            && !args[1..]
+                                .iter()
+                                .any(|a| matches!(a, Operand::Value(v) if *v == base))
+                    }
+                    // args = [val, ptr, offset]: only the pointer lane.
+                    IntrinsicOp::VecStoreI32x4 => {
+                        matches!(args.get(1), Some(Operand::Value(v)) if *v == base)
+                            && !matches!(args.first(), Some(Operand::Value(v)) if *v == base)
+                            && !args[2..]
+                                .iter()
+                                .any(|a| matches!(a, Operand::Value(v) if *v == base))
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        let mut used_in_term = false;
+        blk.terminator.for_each_used_value(|v| {
+            if v == base.0 {
+                used_in_term = true;
+            }
+        });
+        if used_in_term {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when any value in `defined` is used by an instruction or
+/// terminator of a block OUTSIDE `inside` (canonical traversal: every
+/// operand position, including pointers).
+fn values_leak_outside(func: &IrFunction, defined: &FxHashSet<Value>, inside: &[usize]) -> bool {
+    for (bi, blk) in func.blocks.iter().enumerate() {
+        if inside.contains(&bi) {
+            continue;
+        }
+        let mut leaked = false;
+        for inst in &blk.instructions {
+            inst.for_each_used_value(|v| {
+                if defined.contains(&Value(v)) {
+                    leaked = true;
+                }
+            });
+        }
+        blk.terminator.for_each_used_value(|v| {
+            if defined.contains(&Value(v)) {
+                leaked = true;
+            }
+        });
+        if leaked {
+            return true;
+        }
+    }
+    false
+}
+
 /// Recognize the finalization loop `out[i] = x[i] + src[i]` that
 /// follows a ChaCha-style round loop, so the exit can compute
 /// `out_g = V_final_g + vecload(src)_g`: the permuted state comes
@@ -2068,102 +2150,8 @@ fn match_exit_combine(
         }
     }
 
-    // `out` provenance: a pointer that dominates the exit block and
-    // provably cannot address the state alloca.  `out == src` is fine
-    // (distance 0 takes the fast path, which was proven exact).
-    if out_base == base {
+    if !exit_destination_is_safe(func, dom, exit_idx, base, out_base) {
         return None;
-    }
-    let mut out_ok = false;
-    let mut base_is_alloca = false;
-    'defs: for (bi, blk) in func.blocks.iter().enumerate() {
-        for inst in &blk.instructions {
-            match inst {
-                Instruction::ParamRef { dest, .. }
-                | Instruction::Alloca { dest, .. }
-                | Instruction::GlobalAddr { dest, .. }
-                    if *dest == out_base =>
-                {
-                    out_ok = dom.dominates(bi, exit_idx);
-                    if base_is_alloca {
-                        break 'defs;
-                    }
-                }
-                Instruction::Alloca { dest, .. } if *dest == base => {
-                    base_is_alloca = true;
-                    if out_ok {
-                        break 'defs;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if !out_ok || !base_is_alloca {
-        return None;
-    }
-    // The state alloca must not escape: its only permitted uses are as
-    // a GEP base, a scalar load/store ADDRESS, or the pointer operand
-    // of the pass's own vector load/store intrinsics.  Any other
-    // appearance (stored as a value, passed to a call, phi/copy/cast
-    // input, ...) could give `out` a path to alias it.  The presence
-    // test is the CANONICAL `for_each_used_value` traversal (every
-    // operand position, including pointers and call arguments); the
-    // whitelist then re-derives which positions carried it, so a use
-    // in a position the whitelist does not name can never slip by.
-    for blk in &func.blocks {
-        for inst in &blk.instructions {
-            let mut uses_base = false;
-            inst.for_each_used_value(|v| {
-                if v == base.0 {
-                    uses_base = true;
-                }
-            });
-            if !uses_base {
-                continue;
-            }
-            let ok = match inst {
-                Instruction::GetElementPtr {
-                    base: gb, offset, ..
-                } => *gb == base && !matches!(offset, Operand::Value(v) if *v == base),
-                Instruction::Load { ptr, .. } => *ptr == base,
-                Instruction::Store { ptr, val, .. } => {
-                    *ptr == base && !matches!(val, Operand::Value(v) if *v == base)
-                }
-                Instruction::Intrinsic { op, args, .. } => match op {
-                    // args = [ptr, offset]: only the pointer lane may
-                    // carry the alloca.
-                    IntrinsicOp::VecLoadI32x4 => {
-                        matches!(args.first(), Some(Operand::Value(v)) if *v == base)
-                            && !args[1..]
-                                .iter()
-                                .any(|a| matches!(a, Operand::Value(v) if *v == base))
-                    }
-                    // args = [val, ptr, offset]: only the pointer lane.
-                    IntrinsicOp::VecStoreI32x4 => {
-                        matches!(args.get(1), Some(Operand::Value(v)) if *v == base)
-                            && !matches!(args.first(), Some(Operand::Value(v)) if *v == base)
-                            && !args[2..]
-                                .iter()
-                                .any(|a| matches!(a, Operand::Value(v) if *v == base))
-                    }
-                    _ => false,
-                },
-                _ => false,
-            };
-            if !ok {
-                return None;
-            }
-        }
-        let mut used_in_term = false;
-        blk.terminator.for_each_used_value(|v| {
-            if v == base.0 {
-                used_in_term = true;
-            }
-        });
-        if used_in_term {
-            return None;
-        }
     }
 
     // No finalization-loop value may be used outside it.
@@ -2177,26 +2165,8 @@ fn match_exit_combine(
     if let Some(o) = off_dest {
         defined.insert(o);
     }
-    for (bi, blk) in func.blocks.iter().enumerate() {
-        if bi == p || bi == b_idx {
-            continue;
-        }
-        let mut leaked = false;
-        for inst in &blk.instructions {
-            inst.for_each_used_value(|v| {
-                if defined.contains(&Value(v)) {
-                    leaked = true;
-                }
-            });
-        }
-        blk.terminator.for_each_used_value(|v| {
-            if defined.contains(&Value(v)) {
-                leaked = true;
-            }
-        });
-        if leaked {
-            return None;
-        }
+    if values_leak_outside(func, &defined, &[p, b_idx]) {
+        return None;
     }
 
     // Does anything OTHER than the finalization loop read the state
@@ -2230,6 +2200,77 @@ fn match_exit_combine(
         src,
         state_dead_after,
     })
+}
+
+/// Build the preheader pack: per group, four 4-byte `Load U32` of
+/// `gather_base` feeding one `VecPackI32x4`.  Returns the packed value
+/// per group and the instruction sequence (not yet committed — the
+/// caller stays fail-closed until every decline point is past).
+fn build_entry_pack(
+    gather_base: Value,
+    groups: usize,
+    next_val: &mut u32,
+) -> (Vec<Value>, Vec<Instruction>) {
+    let mut fresh = || {
+        let v = Value(*next_val);
+        *next_val += 1;
+        v
+    };
+    let mut v_init: Vec<Value> = Vec::with_capacity(groups);
+    let mut insts: Vec<Instruction> = Vec::with_capacity(groups * 9);
+    for g in 0..groups {
+        let mut lanes: Vec<Operand> = Vec::with_capacity(LANES);
+        for l in 0..LANES {
+            let p = fresh();
+            insts.push(Instruction::GetElementPtr {
+                dest: p,
+                base: gather_base,
+                offset: Operand::Const(IrConst::I64((16 * g + 4 * l) as i64)),
+                ty: IrType::Ptr,
+            });
+            let t = fresh();
+            insts.push(Instruction::Load {
+                dest: t,
+                ptr: p,
+                ty: IrType::U32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+            lanes.push(Operand::Value(t));
+        }
+        let d = fresh();
+        v_init.push(d);
+        insts.push(Instruction::Intrinsic {
+            dest: Some(d),
+            op: IntrinsicOp::VecPackI32x4,
+            dest_ptr: None,
+            args: lanes,
+        });
+    }
+    (v_init, insts)
+}
+
+/// Absorbed entry copy: the pack now reads `src` directly, so the
+/// staging loop is dead.  Route the outside entry straight to the
+/// preheader and gut the two copy blocks (their values are proven
+/// loop-internal, so nothing can reference them).  The blocks stay in
+/// place — unreachable and empty — for the CFG cleanup passes to drop;
+/// removing Vec entries here would shift every later block index this
+/// function still holds.
+fn delete_entry_copy(func: &mut IrFunction, ec: &EntryCopy, preheader: usize) {
+    let ph_label = func.blocks[preheader].label.0;
+    let hdr_label = func.blocks[ec.copy_header].label.0;
+    retarget_terminator(
+        &mut func.blocks[ec.entry_pred].terminator,
+        hdr_label,
+        ph_label,
+    );
+    for &bi in &[ec.copy_header, ec.copy_body] {
+        let blk = &mut func.blocks[bi];
+        let _ = blk.take_parallel_debug();
+        blk.instructions.clear();
+        blk.terminator = Terminator::Branch(BlockId(ph_label));
+    }
 }
 
 /// The canonical rolled entry-copy loop `for (i = 0; i < nslots; i++)
@@ -2532,31 +2573,11 @@ fn match_entry_copy(
 
     // No copy-loop value may be used outside the loop (canonical
     // traversal: every operand position, including pointers).
-    let copy_vals: FxHashSet<u32> = [
-        iv.0, cmp_dest.0, cast.0, shl_d.0, gx_d.0, gs_d.0, ld_d.0, add_d.0,
-    ]
-    .into_iter()
-    .collect();
-    for (bi, blk) in func.blocks.iter().enumerate() {
-        if bi == p || bi == b_idx {
-            continue;
-        }
-        let mut esc = false;
-        for inst in &blk.instructions {
-            inst.for_each_used_value(|v| {
-                if copy_vals.contains(&v) {
-                    esc = true;
-                }
-            });
-        }
-        blk.terminator.for_each_used_value(|v| {
-            if copy_vals.contains(&v) {
-                esc = true;
-            }
-        });
-        if esc {
-            return None;
-        }
+    let copy_vals: FxHashSet<Value> = [*iv, *cmp_dest, cast, shl_d, gx_d, gs_d, ld_d, add_d]
+        .into_iter()
+        .collect();
+    if values_leak_outside(func, &copy_vals, &[p, b_idx]) {
+        return None;
     }
 
     Some(EntryCopy {
