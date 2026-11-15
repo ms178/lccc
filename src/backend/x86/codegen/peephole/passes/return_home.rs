@@ -522,6 +522,311 @@ fn try_fold_at_ret(store: &mut LineStore, infos: &mut [LineInfo], r: usize) -> b
     true
 }
 
+// ── XMM analogue ─────────────────────────────────────────────────────────────
+//
+// FP- and vector-returning functions end the same way the GP ones did: the
+// allocator homes the result in some `%xmmN` and the exit pays one full
+// register copy into `%xmm0` — `movaps %xmm2, %xmm0; ret` on probe after
+// probe (`a*b + c`, every scalar chain whose accumulator the RA parked
+// outside the return register).  GCC aims the producer chain at `%xmm0`
+// directly.
+//
+// The rewrite is PURE RENAMING — simpler and strictly safer than the GP
+// fold above, which must re-issue its root in a different form (`add` →
+// `lea`) and therefore polices flags.  Here every instruction keeps its
+// exact mnemonic; only `%xmmS` tokens become `%xmm0`, the terminal copy is
+// deleted, and a root that collapses to `movaps %xmm0, %xmm0` is deleted
+// with it.  No flag behaviour changes because no instruction changes form.
+//
+// When it is legal (every rule fails closed):
+//
+// 1. The copy is a FULL 128-bit register copy `movaps|movapd|movdqa` (or
+//    the VEX spellings) `%xmmS, %xmm0`, `S ≠ 0`, last value instruction
+//    before `ret` modulo terminal silence and GP pops (which cannot touch
+//    the XMM file).
+// 2. The chain is the contiguous run of instructions above it whose
+//    trailing operand is exactly `%xmmS`: each one (re)defines `%xmmS`,
+//    possibly reading it (the destructive SSE forms).  Any other line —
+//    label, call, jump, push/pop, store, comment-bearing text, pinned or
+//    volatile line — ends the walk.
+// 3. The walk must reach a PROVEN full definition of `%xmmS` that does not
+//    read it (`is_full_xmm_def_line` plus a single-mention check, or a
+//    recognised zero idiom): that line is the root, and `%xmmS` is
+//    provably dead above the window.  A walk that runs out of lines
+//    without finding one declines — `%xmmS` may be live-in.
+// 4. No MIDDLE line mentions `%xmm0`: after the rename their results live
+//    in `%xmm0`, so an explicit `%xmm0` source would read the chain value
+//    where the original read the old register.  The ROOT may read `%xmm0`
+//    freely — nothing above it is renamed, so it sees the same value the
+//    original saw.
+// 5. No line mentions `%ymm`/`%zmm` (the copy moves 128 bits; renaming a
+//    wider write would alias upper lanes this proof never looked at), no
+//    line carries implicit vector effects (gathers, string compares, EVEX
+//    masks — `has_implicit_vector_effects_line`), and the read-only
+//    trailing-register forms (`comis*`/`ucomis*`/`ptest`/`vtest*`/
+//    `pcmp?str*`) are refused by name: their last operand is read, not
+//    written, and treating one as a definition would rename a read.
+
+/// Full 128-bit XMM register-to-register copy mnemonics.  `movss`/`movsd`
+/// merge into the destination's upper lanes and `movq` zeroes them — none
+/// of those spellings appear here, because the rename needs the copy to be
+/// bit-exact for the whole register.
+const XMM_FULL_COPIES: [&str; 6] = [
+    "movaps", "movapd", "movdqa", "vmovaps", "vmovapd", "vmovdqa",
+];
+
+/// Mnemonics whose TRAILING register operand is read, not written: flag
+/// writers and the SSE4.2 string family.  `has_implicit_vector_effects_line`
+/// already refuses the `…strm` forms; the list is the belt for the rest.
+fn xmm_trailing_operand_is_read(mn: &str) -> bool {
+    let base = mn.strip_prefix('v').unwrap_or(mn);
+    base.starts_with("comis")
+        || base.starts_with("ucomis")
+        || base == "ptest"
+        || base.starts_with("testp")
+        || base.starts_with("pcmpistr")
+        || base.starts_with("pcmpestr")
+}
+
+/// Parse a plain `%xmmN` operand (N < 16).  Memory operands, `%ymm`/`%zmm`
+/// spellings and decorated destinations all answer `None`.
+fn plain_xmm_operand(text: &str) -> Option<u32> {
+    let rest = text.strip_prefix("%xmm")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || digits > 2 || rest.len() != digits {
+        return None;
+    }
+    let n: u32 = rest.parse().ok()?;
+    (n < 16).then_some(n)
+}
+
+/// Token-exact occurrence count of `%xmmN` in `text` (`%xmm1` never
+/// matches inside `%xmm12`).
+fn count_xmm_token(text: &str, n: u32) -> usize {
+    let needle = format!("%xmm{n}");
+    let b = text.as_bytes();
+    let nb = needle.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while i + nb.len() <= b.len() {
+        if &b[i..i + nb.len()] == nb && b.get(i + nb.len()).is_none_or(|c| !c.is_ascii_digit()) {
+            count += 1;
+            i += nb.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// Rewrite every token-exact `%xmmS` in `text` to `%xmm0`.
+fn replace_xmm_token(text: &str, s: u32) -> String {
+    let needle = format!("%xmm{s}");
+    let b = text.as_bytes();
+    let nb = needle.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        if i + nb.len() <= b.len()
+            && &b[i..i + nb.len()] == nb
+            && b.get(i + nb.len()).is_none_or(|c| !c.is_ascii_digit())
+        {
+            out.push_str("%xmm0");
+            i += nb.len();
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A zero idiom defines its destination without reading it even though the
+/// register names itself: `xorps %x, %x`, `pxor %x, %x`, and the VEX
+/// three-operand spellings with all operands equal.
+fn is_zero_idiom(mn: &str, ops: &str, s: u32) -> bool {
+    let base = mn.strip_prefix('v').unwrap_or(mn);
+    if !matches!(base, "xorps" | "xorpd" | "pxor") {
+        return false;
+    }
+    ops.split(',')
+        .all(|op| plain_xmm_operand(op.trim()) == Some(s))
+}
+
+/// Terminal XMM return-copy coalescing; returns `true` when a copy was
+/// retired.  `CCC_PEEPHOLE_SKIP=xmm_return_home`.
+pub(super) fn run_xmm(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    for r in 0..infos.len() {
+        if infos[r].is_nop() || infos[r].kind != LineKind::Ret {
+            continue;
+        }
+        if try_fold_xmm_at_ret(store, infos, r) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn try_fold_xmm_at_ret(store: &mut LineStore, infos: &mut [LineInfo], r: usize) -> bool {
+    use crate::backend::peephole_common::last_top_level_comma;
+
+    // ── 1. suffix window: silence and GP pops (never XMM traffic) ──────────
+    let mut exit = r;
+    loop {
+        if exit == 0 {
+            return false;
+        }
+        let prev = exit - 1;
+        if terminal_silence(store, &infos[prev], prev) {
+            exit = prev;
+            continue;
+        }
+        if matches!(infos[prev].kind, LineKind::Pop { .. }) {
+            exit = prev;
+            continue;
+        }
+        exit = prev;
+        break;
+    }
+    if exit == r {
+        return false;
+    }
+
+    // ── 2. the return copy itself ──────────────────────────────────────────
+    if !all_editable(infos, &[exit]) {
+        return false;
+    }
+    let raw = store.get(exit);
+    if raw.contains('#') {
+        return false;
+    }
+    let t = infos[exit].trimmed(raw);
+    let Some((mnem, rest)) = t.split_once(char::is_whitespace) else {
+        return false;
+    };
+    if !XMM_FULL_COPIES.contains(&mnem) {
+        return false;
+    }
+    let Some((src, dst)) = split_two_operands(rest) else {
+        return false;
+    };
+    if plain_xmm_operand(dst) != Some(0) {
+        return false;
+    }
+    let Some(s) = plain_xmm_operand(src) else {
+        return false;
+    };
+    if s == 0 {
+        return false;
+    }
+
+    // ── 3. walk the contiguous chain of %xmmS definitions ─────────────────
+    let mut chain: Vec<usize> = Vec::new();
+    let mut found_root = false;
+    let mut c = exit;
+    loop {
+        if c == 0 {
+            break;
+        }
+        c -= 1;
+        if terminal_silence(store, &infos[c], c) {
+            continue;
+        }
+        if matches!(
+            infos[c].kind,
+            LineKind::Label
+                | LineKind::Call
+                | LineKind::Jmp
+                | LineKind::JmpIndirect
+                | LineKind::CondJmp
+                | LineKind::Ret
+                | LineKind::Push { .. }
+                | LineKind::Pop { .. }
+                | LineKind::InlineAsm
+        ) {
+            break;
+        }
+        if infos[c].pinned || infos[c].volatile_access {
+            break;
+        }
+        let raw = store.get(c);
+        if raw.contains('#') {
+            break;
+        }
+        let line = infos[c].trimmed(raw);
+        let Some((mn, ops)) = line.split_once(char::is_whitespace) else {
+            break;
+        };
+        let Some(comma) = last_top_level_comma(ops.as_bytes()) else {
+            break;
+        };
+        if plain_xmm_operand(ops[comma + 1..].trim()) != Some(s) {
+            break;
+        }
+        if xmm_trailing_operand_is_read(mn)
+            || super::fp_liveness::has_implicit_vector_effects_line(line)
+            || line.contains("%ymm")
+            || line.contains("%zmm")
+        {
+            break;
+        }
+        chain.push(c);
+        if chain.len() > 64 {
+            return false;
+        }
+        // A proven full definition that does not read %xmmS roots the
+        // chain: %xmmS is dead above it, so the rename cannot observe a
+        // live-in value.
+        let s_count = count_xmm_token(line, s);
+        if (s_count == 1 && super::fp_liveness::is_full_xmm_def_line(line))
+            || is_zero_idiom(mn, ops, s)
+        {
+            found_root = true;
+            break;
+        }
+        // Middles (every collected line that is not the root) must not
+        // mention %xmm0: after the rename they write %xmm0, so an explicit
+        // %xmm0 source would read the chain value where the original read
+        // the old register.  The root is exempt (checked after the loop) —
+        // nothing above it is renamed.
+        if count_xmm_token(line, 0) != 0 {
+            return false;
+        }
+    }
+    if !found_root {
+        return false;
+    }
+
+    // ── 4. commit: pure rename, then retire the copy ───────────────────────
+    let mut editables = chain.clone();
+    editables.push(exit);
+    if !all_editable(infos, &editables) {
+        return false;
+    }
+    for &i in &chain {
+        let before = infos[i].trimmed(store.get(i)).to_string();
+        let after = replace_xmm_token(&before, s);
+        if after != before {
+            replace_line(store, &mut infos[i], i, format!("    {after}"));
+        }
+    }
+    mark_nop(&mut infos[exit]);
+    // A root copy whose source was already %xmm0 collapsed to a self-move.
+    let root = *chain.last().expect("found_root implies a collected chain");
+    let rt = infos[root].trimmed(store.get(root)).to_string();
+    if let Some((m2, r2)) = rt.split_once(char::is_whitespace) {
+        if XMM_FULL_COPIES.contains(&m2) {
+            if let Some((s2, d2)) = split_two_operands(r2) {
+                if s2 == d2 {
+                    mark_nop(&mut infos[root]);
+                }
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,5 +1308,158 @@ mod tests {
         let out = peephole_optimize(body.to_string());
         assert!(!out.contains("movl %edi, %eax"), "enabled:\n{out}");
         assert!(out.contains("leal (%rdi,%rsi), %eax"), "enabled:\n{out}");
+    }
+
+    // ── XMM analogue ────────────────────────────────────────────────────────
+
+    /// Run ONLY `run_xmm`, same discipline as `run_home`.
+    fn run_xmm_only(asm: &str) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        run_xmm(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_scalar_fp_chain_lands_in_xmm0_and_the_self_copy_root_dies() {
+        // The fmadd probe: root copies %xmm0 into the home, two destructive
+        // middles, terminal copy back.  After the rename the root is a
+        // self-move and both copies vanish.
+        let out = run_xmm_only(concat!(
+            "    movaps %xmm0, %xmm2\n",
+            "    mulss %xmm1, %xmm2\n",
+            "    addss %xmm4, %xmm2\n",
+            "    movaps %xmm2, %xmm0\n",
+            "    ret\n",
+        ));
+        assert_eq!(
+            out, "mulss %xmm1, %xmm0\naddss %xmm4, %xmm0\nret",
+            "chain must compute straight into %xmm0"
+        );
+    }
+
+    #[test]
+    fn a_zero_idiom_roots_the_chain() {
+        // `pxor %x, %x` names its destination twice but reads nothing.
+        let out = run_xmm_only(concat!(
+            "    pxor %xmm3, %xmm3\n",
+            "    cvtsi2ss %edi, %xmm3\n",
+            "    movaps %xmm3, %xmm0\n",
+            "    ret\n",
+        ));
+        assert_eq!(out, "pxor %xmm0, %xmm0\ncvtsi2ss %edi, %xmm0\nret");
+    }
+
+    #[test]
+    fn a_middle_reading_xmm0_declines() {
+        // `mulss %xmm0, %xmm4` reads the register the rename would
+        // redefine: the fchain probe shape must survive unchanged.
+        let body = concat!(
+            "    movaps %xmm0, %xmm4\n",
+            "    addss %xmm1, %xmm4\n",
+            "    mulss %xmm0, %xmm4\n",
+            "    subss %xmm1, %xmm4\n",
+            "    movaps %xmm4, %xmm0\n",
+            "    ret\n",
+        );
+        let out = run_xmm_only(body);
+        assert!(out.contains("movaps %xmm4, %xmm0"), "{out}");
+    }
+
+    #[test]
+    fn an_unproven_root_declines() {
+        // The walk runs out of lines while every collected one still reads
+        // its destination (merge forms): %xmm5 may be live-in.
+        let out = run_xmm_only(concat!(
+            "    addss %xmm1, %xmm5\n",
+            "    movaps %xmm5, %xmm0\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movaps %xmm5, %xmm0"), "{out}");
+    }
+
+    #[test]
+    fn a_merge_copy_is_not_a_return_copy() {
+        // `movss %xmmS, %xmm0` keeps %xmm0's upper lanes: not a full copy,
+        // never folded.
+        let out = run_xmm_only(concat!(
+            "    movaps %xmm1, %xmm3\n",
+            "    movss %xmm3, %xmm0\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movss %xmm3, %xmm0"), "{out}");
+    }
+
+    #[test]
+    fn an_implicit_xmm0_reader_declines() {
+        // Legacy blendvps reads %xmm0 implicitly; the central effects
+        // oracle must end the walk before it joins a chain.
+        let out = run_xmm_only(concat!(
+            "    movaps %xmm3, %xmm2\n",
+            "    blendvps %xmm4, %xmm2\n",
+            "    movaps %xmm2, %xmm0\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movaps %xmm2, %xmm0"), "{out}");
+    }
+
+    #[test]
+    fn a_wider_spelling_in_the_chain_declines() {
+        // A %ymm write renames 256 bits the 128-bit proof never audited.
+        let out = run_xmm_only(concat!(
+            "    vmovaps %ymm1, %ymm2\n",
+            "    movaps %xmm2, %xmm0\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movaps %xmm2, %xmm0"), "{out}");
+    }
+
+    #[test]
+    fn a_flag_writing_compare_does_not_join_a_chain() {
+        // `ucomiss %xmm1, %xmm2` READS its trailing operand; treating it
+        // as a definition would rename a read.  The chain below it still
+        // folds — the compare simply is not part of the window.
+        let out = run_xmm_only(concat!(
+            "    ucomiss %xmm1, %xmm2\n",
+            "    movaps %xmm1, %xmm2\n",
+            "    addss %xmm5, %xmm2\n",
+            "    movaps %xmm2, %xmm0\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("ucomiss %xmm1, %xmm2"), "{out}");
+        assert!(out.contains("movaps %xmm1, %xmm0"), "{out}");
+        assert!(out.contains("addss %xmm5, %xmm0"), "{out}");
+        assert!(!out.contains("movaps %xmm2, %xmm0"), "{out}");
+    }
+
+    #[test]
+    fn gp_pops_between_copy_and_ret_are_spanned() {
+        let out = run_xmm_only(concat!(
+            "    movaps %xmm0, %xmm2\n",
+            "    addsd %xmm1, %xmm2\n",
+            "    movaps %xmm2, %xmm0\n",
+            "    popq %rbx\n",
+            "    ret\n",
+        ));
+        assert_eq!(out, "addsd %xmm1, %xmm0\npopq %rbx\nret");
+    }
+
+    #[test]
+    fn xmm_token_rename_respects_register_digit_boundaries() {
+        // %xmm1 inside %xmm12 must never match: the rename of a %xmm1
+        // chain may not corrupt a %xmm12 operand.
+        let out = run_xmm_only(concat!(
+            "    movaps %xmm12, %xmm1\n",
+            "    addss %xmm12, %xmm1\n",
+            "    movaps %xmm1, %xmm0\n",
+            "    ret\n",
+        ));
+        assert_eq!(out, "movaps %xmm12, %xmm0\naddss %xmm12, %xmm0\nret");
     }
 }
