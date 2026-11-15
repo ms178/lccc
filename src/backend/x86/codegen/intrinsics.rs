@@ -1377,32 +1377,7 @@ impl X86Codegen {
                             "    v{} {}, {}, {}",
                             sse_inst, mem_operand, reg_operand, dst
                         ));
-                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-                        // Commit BEFORE creating the dest's own deferred
-                        // store: the commit clears a pending that names the
-                        // committed value (a SOURCE whose data flowed through
-                        // the write), and a pending created here belongs to
-                        // THIS dest — creating it first made the commit kill
-                        // the dest's only written-home (the hsum stale-slot
-                        // miscompile).
-                        self.sse_commit_dest_direct(dest_ptr, dst_static);
-                        if dst_home.is_none() {
-                            let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
-                            use crate::backend::state::SlotAddr;
-                            if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
-                                self.state.resolve_slot_addr(dest_ptr.0)
-                            {
-                                if !deferred {
-                                    self.state.emit_fmt(format_args!(
-                                        "    movdqu %xmm0, {}",
-                                        self.slot_ref(slot.0)
-                                    ));
-                                } else {
-                                    self.state.pending_vec_store =
-                                        Some((dest_ptr.0, "xmm0", false));
-                                }
-                            }
-                        }
+                        self.finish_lane_dest(dest_ptr, dst_home.unwrap_or("xmm0"));
                         self.state.pending_vec_memfold = None;
                         return;
                     } else if at0 || at1 {
@@ -1525,31 +1500,7 @@ impl X86Codegen {
                     "    v{} {}, {}, {}",
                     sse_inst, src2, src1, dst
                 ));
-                let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-                // Commit BEFORE creating the dest's own deferred store: the
-                // commit clears a pending naming the committed value (a SOURCE
-                // whose data flowed through this write), and a pending created
-                // here belongs to THIS dest — creating it first let the commit
-                // kill the dest's only materialization (the hsum stale-slot
-                // miscompile: the deferred store vanished, the later consumer
-                // reloaded never-written memory).
-                self.sse_commit_dest_direct(dest_ptr, dst_static);
-                if dst_home.is_none() {
-                    let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
-                    use crate::backend::state::SlotAddr;
-                    if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
-                        self.state.resolve_slot_addr(dest_ptr.0)
-                    {
-                        if !deferred {
-                            self.state.emit_fmt(format_args!(
-                                "    movdqu %xmm0, {}",
-                                self.slot_ref(slot.0)
-                            ));
-                        } else {
-                            self.state.pending_vec_store = Some((dest_ptr.0, "xmm0", false));
-                        }
-                    }
-                }
+                self.finish_lane_dest(dest_ptr, dst_home.unwrap_or("xmm0"));
                 return;
             }
         }
@@ -1607,92 +1558,72 @@ impl X86Codegen {
         self.sse_store_dest(dest_ptr, "xmm0");
     }
 
-    /// Emit a commutative 128-bit op into the operand that is dying,
-    /// instead of staging a copy of the live one.
+    /// Emit a commutative 128-bit op into an operand that is dying, instead
+    /// of staging a copy of the live one.
     ///
-    /// SSE is destructive, so `op a, b` has to destroy one operand.  When
-    /// the SECOND operand's value is at its last use (`value_use_counts`,
-    /// the same map the ALU and cast emitters use for their last-use folds)
-    /// and already lives in a register, destroy THAT one and read the live
-    /// operand as the source: `op %live, %dying`.  SLP-vectorized FP loops
-    /// are the payoff — `c[j] += s * b[j]` used to emit a copy of the
-    /// loop-invariant `s` into scratch per iteration (`movdqa %xmm15,
-    /// %xmm0`) purely to have a destructible operand, where `mulpd %xmm15,
-    /// %loaded` costs nothing extra.
+    /// SSE is destructive: `op a, b` must destroy one operand.  When one of
+    /// them is at its last use (`value_use_counts`, the map the ALU and cast
+    /// emitters already fold on) and lives in a register, destroy THAT one
+    /// and read the other as the source: `op %live, %dying` — legal because
+    /// `sse128_mnemonic_commutative` proved the swap is value-preserving.
     ///
-    /// Declines (returns false) whenever the liveness premise is
-    /// unavailable (no use count, or more than one use), the dying value
-    /// has no materialised register, a deferred store still names it, the
-    /// live operand is not itself in a register, both operands resolve to
-    /// one register, or the destination's allocated home is some other
-    /// register — the caller then stages as before.
+    /// SLP-vectorized FP loops are the payoff: `c[j] += s * b[j]` used to
+    /// copy the loop-invariant broadcast into scratch every iteration
+    /// (`movdqa %xmm15, %xmm0`) purely to have a destructible operand.
+    ///
+    /// Candidates are tried best-first: `args[1]` then `args[0]` (historical
+    /// operand order when both are dying), and within that an operand whose
+    /// register already IS the destination's home — nothing to destroy,
+    /// nothing to move — before one that merely happens to be free.  When
+    /// the destination has no home, any last-use register serves: the result
+    /// is claimed there and `finish_lane_dest` materialises the slot.
+    ///
+    /// Declines (returns false, letting the caller stage through %xmm0) on
+    /// any missing premise: no use count or more than one use, no
+    /// materialised register for the dying value, a deferred store still
+    /// naming it, both operands resolving to one register, or a destination
+    /// allocated to some third register.
     fn emit_sse_dying_operand_form(
         &mut self,
         dest_ptr: &Value,
         args: &[Operand],
         sse_inst: &str,
     ) -> bool {
-        // Dying-operand (commutative) form: no staging copy, no broadcast
-        // copy.  SSE is destructive, so `op a, b` has to destroy one
-        // operand.  When the SECOND operand's value is at its last use and
-        // already lives in a register, destroy THAT one and read the live
-        // operand as the source: `op %live, %dying`.  SLP-vectorized FP
-        // loops are the payoff — `c[j] += s * b[j]` used to emit a copy of
-        // the loop-invariant `s` into a scratch register per iteration
-        // (`movdqa %xmm15, %xmm0`) purely to have a destructible operand,
-        // where `mulpd %xmm15, %loaded` costs nothing extra.
-        //
-        // The liveness premise comes from `value_use_counts` (the same map
-        // the ALU and cast emitters use for their last-use folds): a value
-        // with exactly one use cannot be read again, so destroying its home
-        // is safe.  The form declines whenever that premise is unavailable
-        // (no use count, more than one use), the value has no materialised
-        // register, a deferred store still names it, the live operand is
-        // not itself in a register, or the destination's allocated home is
-        // some other register — the caller then stages as before.
-        if Self::sse128_mnemonic_commutative(sse_inst) {
-            if let (Operand::Value(live), Operand::Value(dying)) = (&args[0], &args[1]) {
-                let last_use = self.value_use_counts.get(&dying.0).copied() == Some(1)
-                    && self.value_use_counts.get(&live.0).copied() != Some(1);
-                if last_use
-                    && live.0 != dying.0
-                    && self.state.pending_vec_store.map(|(p, _, _)| p) != Some(dying.0)
-                {
-                    let dying_reg = self.vec_operand_reg(dying);
-                    let live_reg = self.vec_operand_reg(live);
-                    if let (Some(dst_reg), Some(src_reg)) = (dying_reg, live_reg)
-                        && src_reg != dst_reg
-                    {
-                        let dest_home = self.dest_xmm_home_name(dest_ptr);
-                        if dest_home.is_none() || dest_home == Some(dst_reg) {
-                            self.state.emit_fmt(format_args!(
-                                "    {} %{}, %{}",
-                                sse_inst, src_reg, dst_reg
-                            ));
-                            self.sse_commit_dest_direct(dest_ptr, dst_reg);
-                            if dest_home.is_none() {
-                                let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
-                                use crate::backend::state::SlotAddr;
-                                if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
-                                    self.state.resolve_slot_addr(dest_ptr.0)
-                                {
-                                    if !deferred {
-                                        self.state.emit_fmt(format_args!(
-                                            "    movdqu %{}, {}",
-                                            dst_reg,
-                                            self.slot_ref(slot.0)
-                                        ));
-                                    } else {
-                                        self.state.pending_vec_store =
-                                            Some((dest_ptr.0, dst_reg, false));
-                                    }
-                                }
-                            }
-                            return true;
-                        }
-                    }
-                }
+        if !Self::sse128_mnemonic_commutative(sse_inst) {
+            return false;
+        }
+        let (Operand::Value(v0), Operand::Value(v1)) = (&args[0], &args[1]) else {
+            return false;
+        };
+        if v0.0 == v1.0 {
+            return false;
+        }
+        let dest_home = self.dest_xmm_home_name(dest_ptr);
+        for (live, dying) in [(v0, v1), (v1, v0)] {
+            if self.value_use_counts.get(&dying.0).copied() != Some(1) {
+                continue;
             }
+            if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(dying.0) {
+                continue;
+            }
+            let Some(dying_reg) = self.vec_operand_reg(dying) else {
+                continue;
+            };
+            if dest_home.is_some_and(|home| home != dying_reg) {
+                continue;
+            }
+            let Some(live_reg) = self.vec_operand_reg(live) else {
+                continue;
+            };
+            if live_reg == dying_reg {
+                continue;
+            }
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                sse_inst, live_reg, dying_reg
+            ));
+            self.finish_lane_dest(dest_ptr, dying_reg);
+            return true;
         }
         false
     }
@@ -10580,6 +10511,43 @@ impl X86Codegen {
         }
     }
 
+    /// Claim `reg` as the destination's home and materialise the slot when
+    /// the allocator gave the value none.
+    ///
+    /// This is the single tail of every non-staging lane form (VEX.128
+    /// three-operand, legacy direct-to-home, dying-operand).  It exists
+    /// because the same bookkeeping had to be fixed once already: the commit
+    /// MUST happen before a deferred store is created for this destination,
+    /// since the commit clears any pending store naming the destination and a
+    /// pending created first would kill the destination's only
+    /// materialisation (the hsum stale-slot miscompile).  Three copies of
+    /// that rule is three chances to drift; there is now one.
+    fn finish_lane_dest(&mut self, dest_ptr: &Value, reg: &'static str) {
+        // A value with a register home lives there: its slot (if any) is not
+        // kept up to date, and `resolve_slot_addr` reports vec values as
+        // Direct regardless of homing, so the homed check must come first.
+        let homed = self.dest_xmm_home_name(dest_ptr).is_some();
+        self.sse_commit_dest_direct(dest_ptr, reg);
+        if homed {
+            return;
+        }
+        let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
+        use crate::backend::state::SlotAddr;
+        if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+            self.state.resolve_slot_addr(dest_ptr.0)
+        {
+            if !deferred {
+                self.state.emit_fmt(format_args!(
+                    "    movdqu %{}, {}",
+                    reg,
+                    self.slot_ref(slot.0)
+                ));
+            } else {
+                self.state.pending_vec_store = Some((dest_ptr.0, reg, false));
+            }
+        }
+    }
+
     /// The static register NAME ("xmm5") for a homed destination, if the
     /// RA assigned it an XMM register.
     fn dest_xmm_home_name(&self, d: &Value) -> Option<&'static str> {
@@ -14424,6 +14392,120 @@ mod intrinsic_destination_contract_tests {
                 "{op:?} both-spelling form regressed: {both}"
             );
         }
+    }
+
+    /// The dying-operand form destroys an operand that is at its LAST use,
+    /// in either position, and only then.  Pinned in both directions: the
+    /// positive shapes must emit exactly one instruction into the dying
+    /// value's own register (no copy of the live operand), and every missing
+    /// premise must decline so the caller stages instead.
+    #[test]
+    fn dying_operand_form_destroys_a_last_use_operand_in_either_position() {
+        // live = v0 in xmm6 (PhysReg 24); dying = v1 in xmm7 (PhysReg 25);
+        // destination v2 is slot-homed (no XMM home).
+        fn setup(uc: [u32; 3]) -> X86Codegen {
+            let mut cg = X86Codegen::new();
+            slot_homed(&mut cg, 2);
+            cg.reg_assignments.insert(0, PhysReg(24));
+            cg.reg_assignments.insert(1, PhysReg(25));
+            cg.state.vector_values.insert(0);
+            cg.state.vector_values.insert(1);
+            cg.value_use_counts.insert(0, uc[0]);
+            cg.value_use_counts.insert(1, uc[1]);
+            cg.value_use_counts.insert(2, uc[2]);
+            cg
+        }
+        let args = [Operand::Value(Value(0)), Operand::Value(Value(1))];
+
+        // args[1] is the last use: destroy it (xmm7), read args[0] (xmm6).
+        let mut cg = setup([2, 1, 1]);
+        assert!(
+            cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"),
+            "last-use args[1] must fire"
+        );
+        assert_eq!(
+            cg.state.out.buf.lines().map(str::trim).collect::<Vec<_>>(),
+            ["paddd %xmm6, %xmm7", "movdqu %xmm7, -32(%rbp)"],
+            "args[1]-dying form: one op into the dying home, then the slot store"
+        );
+
+        // args[0] is the last use and the op commutes: destroy args[0] (xmm6),
+        // read args[1] (xmm7) -- the generalisation the candidate loop adds.
+        let mut cg = setup([1, 2, 1]);
+        assert!(
+            cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"),
+            "last-use args[0] must fire for a commutative op"
+        );
+        assert_eq!(
+            cg.state.out.buf.lines().map(str::trim).collect::<Vec<_>>(),
+            ["paddd %xmm7, %xmm6", "movdqu %xmm6, -32(%rbp)"],
+            "args[0]-dying form must destroy args[0], not copy the live one"
+        );
+
+        // No last-use premise on either operand: decline, emit nothing.
+        let mut cg = setup([2, 3, 1]);
+        assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"));
+        assert!(
+            cg.state.out.buf.trim().is_empty(),
+            "declined form emitted text"
+        );
+
+        // Non-commutative mnemonic: swapping operands changes the result, so the
+        // form must never fire even with a perfect liveness premise.
+        let mut cg = setup([2, 1, 1]);
+        assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "psubd"));
+        assert!(
+            cg.state.out.buf.trim().is_empty(),
+            "psubd reached the commutative form"
+        );
+
+        // Destination homed to a THIRD register: destroying either operand would
+        // clobber a register the allocator expects to hold the result.
+        let mut cg = setup([2, 1, 1]);
+        cg.reg_assignments.insert(2, PhysReg(26));
+        assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"));
+        assert!(cg.state.out.buf.trim().is_empty());
+
+        // Both operands resolving to one register would compute `x op x`.
+        let mut cg = setup([2, 1, 1]);
+        cg.reg_assignments.insert(0, PhysReg(25));
+        assert!(!cg.emit_sse_dying_operand_form(&Value(2), &args, "paddd"));
+        assert!(cg.state.out.buf.trim().is_empty());
+    }
+
+    /// `finish_lane_dest` is the single tail of every non-staging lane form.
+    /// A homed destination is never re-stored (its slot is deliberately
+    /// stale); a slot-homed one is stored to that slot; a deferred one
+    /// records the pending store instead.  Ordering matters: the commit runs
+    /// before the pending store is created, or the commit would clear it.
+    #[test]
+    fn lane_result_tail_stores_only_slot_homed_destinations() {
+        // Homed: no store, and the value is claimed in the register.
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 3);
+        xmm_homed(&mut cg, 3);
+        cg.finish_lane_dest(&Value(3), "xmm7");
+        assert!(
+            !cg.state.out.buf.contains("movdqu"),
+            "a register-homed destination must not be re-stored: {}",
+            cg.state.out.buf
+        );
+        assert_eq!(cg.state.sse_last_store_reg_name, Some("xmm7"));
+
+        // Slot-homed, not deferred: exactly one store to the slot.
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 3);
+        cg.finish_lane_dest(&Value(3), "xmm7");
+        assert_eq!(cg.state.out.buf.trim(), "movdqu %xmm7, -32(%rbp)");
+
+        // Slot-homed, deferred: no store yet, and the pending store names the
+        // destination in that register.
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 3);
+        cg.state.vector_defer_values.insert(3);
+        cg.finish_lane_dest(&Value(3), "xmm7");
+        assert!(!cg.state.out.buf.contains("movdqu"));
+        assert_eq!(cg.state.pending_vec_store, Some((3, "xmm7", false)));
     }
 
     /// Round 8: the AVX-512 masked-memory folds need an EXACT 64-byte zero

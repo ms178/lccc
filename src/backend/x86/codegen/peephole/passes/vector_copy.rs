@@ -1839,6 +1839,11 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
     let len = store.len();
     let mut changed = false;
     let mut fp: Option<FpLiveness> = None;
+    // No line insertion or CFI mutation happens in this pass (a copy line
+    // is nopped, vector lines are rewritten in place), so the marker index
+    // stays exact for the whole loop. A per-candidate `function_range` scan
+    // is O(function length) and made this pass quadratic on large functions.
+    let cfi = super::relay_and_lea::CfiIndex::build(store, infos);
     let mut j = 0;
     while j < len {
         if infos[j].is_nop() || infos[j].pinned {
@@ -1913,7 +1918,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
-        let Some((fstart, fend)) = function_range(store, infos, j) else {
+        let Some((fstart, fend)) = cfi.function_range(j, len) else {
             j += 1;
             continue;
         };
@@ -3409,6 +3414,115 @@ mod tests {
         let text =
             "    vaddps %ymm1, %ymm0, %ymm14\n    call f\n    vmovdqa %ymm14, %ymm0\n    ret\n";
         assert_eq!(retarget_only(text), insns(text));
+    }
+
+    /// Retarget `text` and return the live (non-nopped) lines, trimmed. A
+    /// nopped line keeps its text in the store (`mark_nop` only sets the
+    /// kind), so comparisons must filter on `is_nop`, not on emptiness.
+    fn live_after_retarget(text: &str) -> Vec<String> {
+        let mut store = LineStore::new(text.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        retarget_vex_result(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn retarget_scopes_each_fold_to_its_own_function() {
+        // Both functions fold, each within its own bracket.
+        let f1 = "f1:\n.cfi_startproc\n    vaddps %ymm1, %ymm0, %ymm4\n    vmovdqa %ymm4, %ymm0\n    ret\n.cfi_endproc\n";
+        let f2 = "f2:\n.cfi_startproc\n    vpaddd %ymm1, %ymm0, %ymm4\n    vmovdqa %ymm4, %ymm0\n    ret\n.cfi_endproc\n";
+        let out = live_after_retarget(&format!("{f1}{f2}"));
+        let want = [
+            "f1:",
+            ".cfi_startproc",
+            "vaddps %ymm1, %ymm0, %ymm0",
+            "ret",
+            ".cfi_endproc",
+            "f2:",
+            ".cfi_startproc",
+            "vpaddd %ymm1, %ymm0, %ymm0",
+            "ret",
+            ".cfi_endproc",
+        ];
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn retarget_never_pairs_a_producer_with_a_copy_in_the_next_function() {
+        // Isolates the `.cfi_endproc` bracket. The first function produces
+        // %ymm4 and has no barrier (no label, no `ret`) before its end; the
+        // second function copies %ymm4 to %ymm0 with no label in front of
+        // it. `.cfi_*` directives are benign, so a copy-out search that
+        // ignored the bracket would cross into the second function and fold
+        // this pair, changing the first function's result. (Real functions
+        // are normally protected by their symbol label, which is a barrier;
+        // the bracket is what keeps the rule local when that is absent.)
+        let text = ".cfi_startproc\n    vaddps %ymm1, %ymm0, %ymm4\n.cfi_endproc\n\
+                    .cfi_startproc\n    vmovdqa %ymm4, %ymm0\n    ret\n.cfi_endproc\n";
+        let out = live_after_retarget(text);
+        assert_eq!(
+            out,
+            [
+                ".cfi_startproc",
+                "vaddps %ymm1, %ymm0, %ymm4",
+                ".cfi_endproc",
+                ".cfi_startproc",
+                "vmovdqa %ymm4, %ymm0",
+                "ret",
+                ".cfi_endproc",
+            ],
+            "producer folded across a function boundary"
+        );
+    }
+
+    #[test]
+    fn retarget_on_a_large_function_matches_per_unit_decisions() {
+        // The cached boundary index must not change what the pass decides.
+        // Reference: every candidate is retargeted as its own one-fold
+        // function, so no index is shared between candidates. The combined
+        // run must keep exactly the same live lines, in order, once each
+        // unit's brackets and trailing `ret` are removed.
+        const N: usize = 300;
+        let mut src = String::from(".cfi_startproc\n");
+        let mut want: Vec<String> = Vec::new();
+        for i in 0..N {
+            let d = 4 + (i % 8);
+            src.push_str(&format!(
+                "    vaddps %ymm1, %ymm0, %ymm{d}\n    vmovdqa %ymm{d}, %ymm0\n"
+            ));
+            let unit = format!(
+                ".cfi_startproc\n    vaddps %ymm1, %ymm0, %ymm{d}\n    vmovdqa %ymm{d}, %ymm0\n    ret\n.cfi_endproc\n"
+            );
+            let live = live_after_retarget(&unit);
+            // [".cfi_startproc", body..., "ret", ".cfi_endproc"]
+            assert_eq!(live.first().map(String::as_str), Some(".cfi_startproc"));
+            assert_eq!(live.last().map(String::as_str), Some(".cfi_endproc"));
+            want.extend(live[1..live.len() - 2].iter().cloned());
+        }
+        src.push_str("    ret\n.cfi_endproc\n");
+
+        let got = live_after_retarget(&src);
+        assert_eq!(got.first().map(String::as_str), Some(".cfi_startproc"));
+        assert_eq!(got.last().map(String::as_str), Some(".cfi_endproc"));
+        let got_body = &got[1..got.len() - 2];
+        assert_eq!(got[got.len() - 2], "ret");
+        assert_eq!(got_body.len(), want.len());
+        assert_eq!(
+            got_body,
+            want.as_slice(),
+            "per-candidate decisions diverged"
+        );
+        // Every candidate folded: no copy survives as a live line.
+        assert!(
+            got_body.iter().all(|l| !l.starts_with("vmovdqa")),
+            "{got_body:?}"
+        );
     }
 
     #[test]
