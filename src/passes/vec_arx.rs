@@ -91,6 +91,28 @@
 //!   Exit-block predecessors outside the loop must be dominated by the
 //!   preheader (V_init live-in) — otherwise the transform bails.
 //!
+//! # Boundary absorption (entry copy and feed-forward)
+//!
+//! The round loop rarely travels alone: ChaCha-style kernels copy the
+//! caller's input into the state first (`x[i] = in[i]`) and feed it
+//! forward at the end (`out[i] = x[i] + in[i]`).  Left to the general
+//! vectorizer, both loops stage 16-byte vector traffic through the
+//! state alloca that the pack/exit immediately re-touch with scalar
+//! accesses — the exact store-to-load-forwarding shape that cratered
+//! chacha20_block on Zen 5 (see `match_entry_copy`).  Two fail-closed
+//! matchers absorb them:
+//!
+//! * `match_entry_copy`: the preheader pack reads `in` directly with
+//!   per-element 4-byte loads and the copy loop is deleted.
+//! * `match_exit_combine`: the exit computes `out_g = V_exit_g +
+//!   vecload(in)_g` — the state straight from registers, the input via
+//!   wide loads that are plain L1 hits by exit time — behind a
+//!   one-sided runtime overlap guard (scalar fallback kept cold; see
+//!   `install_exit_materialization`).
+//!   When nothing else reads the state array, its spill stores move to
+//!   the fallback path and the hot exit touches memory only to store
+//!   `out`.
+//!
 //! # Placement
 //!
 //! Runs BEFORE loop unrolling (Phase 2b, `-O2+`, x86-64, not `-Os/-Oz`):
@@ -108,10 +130,10 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::instruction::{Instruction, Terminator};
-use crate::ir::ops::IrBinOp;
+use crate::ir::instruction::{BasicBlock, Instruction, Terminator};
+use crate::ir::ops::{IrBinOp, IrCmpOp};
 use crate::ir::reexports::IrFunction;
 use crate::ir::reexports::{BlockId, IntrinsicOp, IrConst, Operand, Value};
 use crate::passes::loop_analysis::{self, DominanceChecker};
@@ -1010,7 +1032,7 @@ fn try_transform_loop(
             .iter()
             .filter_map(|&i| {
                 let inst = &func.blocks[work].instructions[i];
-                inst_dest_value(inst).map(|v| v.0)
+                inst.dest().map(|v| v.0)
             })
             .collect();
         for (bi, b) in func.blocks.iter().enumerate() {
@@ -1019,11 +1041,9 @@ fn try_transform_loop(
                     continue;
                 }
                 let mut esc = false;
-                for_each_operand_in(inst, &mut |op| {
-                    if let Operand::Value(v) = op {
-                        if consumed_vals.contains(&v.0) {
-                            esc = true;
-                        }
+                inst.for_each_used_value(|v| {
+                    if consumed_vals.contains(&v) {
+                        esc = true;
                     }
                 });
                 if esc {
@@ -1031,11 +1051,9 @@ fn try_transform_loop(
                 }
             }
             let mut esc_term = false;
-            for_each_operand_in_terminator(&b.terminator, &mut |op| {
-                if let Operand::Value(v) = op {
-                    if consumed_vals.contains(&v.0) {
-                        esc_term = true;
-                    }
+            b.terminator.for_each_used_value(|v| {
+                if consumed_vals.contains(&v) {
+                    esc_term = true;
                 }
             });
             if esc_term {
@@ -1146,25 +1164,75 @@ fn try_transform_loop(
     let groups = nslots as usize / LANES;
     let mut next_val = func.next_value_id.max(scan_max_value(func) + 1);
 
-    // ── 1. Preheader: V_g = VecLoadI32x4(base, 16g). ────────────────────
+    // ── 1. Preheader pack: V_g from sixteen 4-byte loads. ──────────────
     // Built WITHOUT mutating the function: the chunk emission below can
     // still decline, and a bail after this point would leave orphaned
     // (dead) loads in the preheader — every decision is made before the
     // first mutation (the fail-closed discipline the map transform uses).
+    //
+    // The pack is ELEMENT-WISE on purpose (4 × `Load U32` +
+    // `VecPackI32x4` per group, never a 16-byte `VecLoadI32x4`).  The
+    // chacha20_block regression on Zen 5 (EPYC 9V45: 2.26x vs GCC at
+    // -O2, while the same binary WON on Intel) was store-to-load
+    // forwarding pathology around the state staging, and the control
+    // experiment matters: GCC's own codegen performs the identical
+    // "caller `movl` → `call` → 16-byte `movdqu` partial-overlap" read
+    // of the input block and is fast on Zen 5, so that bounded stall
+    // (~2 per call, both vendors) is NOT the cliff.  What only this
+    // pass's old shape did was the staging ROUND-TRIP: a 16-byte vector
+    // store to the state alloca immediately re-read by sixteen 4-byte
+    // GPR loads for the pack.  Narrow GPR loads forwarded out of
+    // vector-domain stores are the documented weak spot of the Zen
+    // store queue (domain-crossing penalty / no-forward retry per
+    // load), sixteen times per call, two million calls — invisible on
+    // Intel, which forwards narrow-from-wide across domains cheaply.
+    //
+    // Element loads sidestep every variant of the problem: a 4-byte
+    // load forwards exactly from a 4-byte store, as a contained load
+    // from anything wider, and never crosses the vector/GPR domain
+    // boundary, so the pack is on the fast path on BOTH vendors at the
+    // cost of a handful of once-per-call pack µops that the ~460
+    // dynamic instructions of the round loop dwarf.
+    //
+    // When the entry copy loop `x[i] = src[i]` is proven
+    // (`match_entry_copy`), the pack reads `src` directly and the copy
+    // loop is deleted at commit time: the staging store/reload round-trip
+    // vanishes and the caller's freshly-stored words (the RFC 7539
+    // counter update) are read with forwardable element loads.
+    let entry_copy = match_entry_copy(func, dom, preheader, base, nslots);
+    let gather_base = entry_copy.as_ref().map_or(base, |c| c.src);
     let mut v_init: Vec<Value> = Vec::with_capacity(groups);
-    let mut entry_insts: Vec<Instruction> = Vec::with_capacity(groups);
+    let mut entry_insts: Vec<Instruction> = Vec::with_capacity(groups * 9);
     for g in 0..groups {
+        let mut lanes: Vec<Operand> = Vec::with_capacity(LANES);
+        for l in 0..LANES {
+            let p = Value(next_val);
+            next_val += 1;
+            entry_insts.push(Instruction::GetElementPtr {
+                dest: p,
+                base: gather_base,
+                offset: Operand::Const(IrConst::I64((16 * g + 4 * l) as i64)),
+                ty: IrType::Ptr,
+            });
+            let t = Value(next_val);
+            next_val += 1;
+            entry_insts.push(Instruction::Load {
+                dest: t,
+                ptr: p,
+                ty: IrType::U32,
+                seg_override: crate::common::types::AddressSpace::Default,
+                volatile: false,
+            });
+            lanes.push(Operand::Value(t));
+        }
         let d = Value(next_val);
         next_val += 1;
         v_init.push(d);
         entry_insts.push(Instruction::Intrinsic {
             dest: Some(d),
-            op: IntrinsicOp::VecLoadI32x4,
+            op: IntrinsicOp::VecPackI32x4,
             dest_ptr: None,
-            args: vec![
-                Operand::Value(base),
-                Operand::Const(IrConst::I64(16 * g as i64)),
-            ],
+            args: lanes,
         });
     }
 
@@ -1285,6 +1353,29 @@ fn try_transform_loop(
     // ── 4b. Commit the entry loads (all decline points are past). ─────
     func.blocks[preheader].extend_insts(entry_insts, Span::dummy());
 
+    // Absorbed entry copy: the pack now reads `src` directly, so the
+    // staging loop is dead.  Route the outside entry straight to the
+    // preheader and gut the two copy blocks (their values are proven
+    // loop-internal, so nothing can reference them).  The blocks stay in
+    // place — unreachable and empty — for the CFG cleanup passes to drop;
+    // removing Vec entries here would shift every later block index this
+    // function still holds.
+    if let Some(ec) = &entry_copy {
+        let ph_label = func.blocks[preheader].label.0;
+        let hdr_label = func.blocks[ec.copy_header].label.0;
+        retarget_terminator(
+            &mut func.blocks[ec.entry_pred].terminator,
+            hdr_label,
+            ph_label,
+        );
+        for &bi in &[ec.copy_header, ec.copy_body] {
+            let blk = &mut func.blocks[bi];
+            let _ = blk.take_parallel_debug();
+            blk.instructions.clear();
+            blk.terminator = Terminator::Branch(BlockId(ph_label));
+        }
+    }
+
     // ── 5. Rewrite the work (latch) block. ─────────────────────────────
     {
         let block = &mut func.blocks[work];
@@ -1377,6 +1468,29 @@ fn try_transform_loop(
     // Value on an exit edge: from the header (guard-style exit, state =
     // phi after the last completed backedge) → v_phi; from the latch
     // (body-style exit, state = this iteration's writes) → v_latch.
+    //
+    // When the entry copy was absorbed (so `v_init` holds the packed
+    // ORIGINAL input) and the single exit falls into the canonical
+    // finalization loop `out[i] = x[i] + src[i]`, the exit also absorbs
+    // that loop: `out_g = V_exit_g + vecload(src)_g`, with the state
+    // taken straight from vector registers, behind a runtime overlap
+    // guard that keeps the scalar loop as the cold fallback.
+    let exit_combine = match (&entry_copy, exits.as_slice()) {
+        (Some(ec), [(_, target)]) => func
+            .blocks
+            .iter()
+            .position(|b| b.label.0 == *target)
+            .and_then(|exit_idx| {
+                // Blocks whose `base` references are accounted for by the
+                // transform itself (pack, rounds, gutted copy loop).  The
+                // entry predecessor is deliberately NOT excluded: only the
+                // Alloca definition may appear there.
+                let mut round_blocks = vec![preheader, header, latch];
+                round_blocks.extend([ec.copy_header, ec.copy_body]);
+                match_exit_combine(func, dom, exit_idx, base, ec.src, nslots, &round_blocks)
+            }),
+        _ => None,
+    };
     install_exit_materialization(
         func,
         &exits,
@@ -1390,6 +1504,7 @@ fn try_transform_loop(
         preheader,
         header,
         latch,
+        exit_combine.as_ref(),
     );
 
     func.next_value_id = next_val.max(func.next_value_id);
@@ -1411,6 +1526,7 @@ fn install_exit_materialization(
     preheader: usize,
     header: usize,
     latch: usize,
+    combine: Option<&ExitCombine>,
 ) {
     let groups = nslots as usize / LANES;
     // Group exits by target block.
@@ -1496,11 +1612,992 @@ fn install_exit_materialization(
             });
         }
         *next_val = nv;
-        let block = &mut func.blocks[exit_idx];
-        block.insert_insts(0, head.into_iter().chain(stores), Span::dummy());
-        let _ = dom;
-        let _ = preheader;
-        let _ = srcs;
+        let absorb = combine.filter(|c| c.exit_idx == exit_idx);
+        let Some(c) = absorb else {
+            let block = &mut func.blocks[exit_idx];
+            block.insert_insts(0, head.into_iter().chain(stores), Span::dummy());
+            let _ = dom;
+            let _ = preheader;
+            let _ = srcs;
+            continue;
+        };
+
+        // ── Finalization-loop absorption ───────────────────────────────
+        // exit_blk:  [head phis] (+ state spill stores if still needed)
+        //            guard: scalar iff (out - src) - e  u<  (nslots-2)e+1
+        //            CondBranch(overlap → scalar path, else → fast_blk)
+        // spill_blk: [state spill stores] → scalar header   (only when
+        //            the state is otherwise dead; keeps the hot path
+        //            free of the dead stack traffic)
+        // fast_blk:  out_g = VecAdd(V_exit_g, VecLoad(src, 16g));
+        //            VecStore(out) → after
+        //
+        // The guard is one-sided ON PURPOSE: the packed `v_init` values
+        // diverge from the scalar loop's reads only when `out` sits
+        // 1..nslots-1 elements above `src` (see `match_exit_combine`).
+        // Distances below one element are misaligned-lvalue UB on the
+        // typed streams, the same element-granular contract
+        // `emit_alias_guards` documents.
+        let src = c.src;
+        let elem = 4i64;
+        let span = (i64::from(nslots) - 2) * elem + 1;
+        let hdr_label = func.blocks[c.ep_hdr].label.0;
+        let exit_label = func.blocks[exit_idx].label.0;
+        // `next_label == 0` is the documented "not yet computed" state;
+        // allocating from it would collide with existing labels.  Seed
+        // it from the actual label population first.
+        let max_label = func.blocks.iter().map(|b| b.label.0 + 1).max().unwrap_or(0);
+        func.next_label = func.next_label.max(max_label);
+        let fast_label = BlockId(func.next_label);
+        func.next_label += 1;
+        let spill_label = if c.state_dead_after {
+            let l = BlockId(func.next_label);
+            func.next_label += 1;
+            Some(l)
+        } else {
+            None
+        };
+
+        let mut nv = *next_val;
+        let mut fresh = || {
+            let v = Value(nv);
+            nv += 1;
+            v
+        };
+        let d_out = fresh();
+        let d_src = fresh();
+        let dist = fresh();
+        let dist_e = fresh();
+        let overlap = fresh();
+        let guard = [
+            Instruction::Cast {
+                dest: d_out,
+                src: Operand::Value(c.out_base),
+                from_ty: IrType::Ptr,
+                to_ty: IrType::I64,
+            },
+            Instruction::Cast {
+                dest: d_src,
+                src: Operand::Value(src),
+                from_ty: IrType::Ptr,
+                to_ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: dist,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(d_out),
+                rhs: Operand::Value(d_src),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: dist_e,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(dist),
+                rhs: Operand::Const(IrConst::I64(elem)),
+                ty: IrType::I64,
+            },
+            Instruction::Cmp {
+                dest: overlap,
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(dist_e),
+                rhs: Operand::Const(IrConst::I64(span)),
+                ty: IrType::I64,
+            },
+        ];
+
+        // The feed-forward RE-LOADS `src` with full 16-byte vector loads
+        // instead of reusing the preheader pack's `v_init` registers.
+        // Reusing them reads nicer but keeps four extra XMM registers
+        // live across the whole round loop, and at x86-64-v3 (where the
+        // two pshufb rotate masks already occupy registers) that
+        // overflows the register file and puts a spill/reload pair
+        // INSIDE the hot loop — strictly worse than any exit cost.  The
+        // wide loads are safe from the store-forwarding cliff that
+        // motivated the element-wise ENTRY pack: by exit time the
+        // caller's narrow stores retired hundreds of cycles ago (the
+        // round loop alone is ~400+ cycles), so these are plain L1 hits
+        // overlapping nothing in the store queue.  All fast-path loads
+        // execute before any `out` store, which is exactly the ordering
+        // the overlap guard's one-sided check was proven against.
+        let mut fast: Vec<Instruction> = Vec::with_capacity(groups * 3);
+        for g in 0..groups {
+            let w = fresh();
+            fast.push(Instruction::Intrinsic {
+                dest: Some(w),
+                op: IntrinsicOp::VecLoadI32x4,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(src),
+                    Operand::Const(IrConst::I64(16 * g as i64)),
+                ],
+            });
+            let d = fresh();
+            fast.push(Instruction::Intrinsic {
+                dest: Some(d),
+                op: IntrinsicOp::VecAddI32x4,
+                dest_ptr: None,
+                args: vec![Operand::Value(store_vals[g]), Operand::Value(w)],
+            });
+            fast.push(Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::VecStoreI32x4,
+                dest_ptr: Some(c.out_base),
+                args: vec![
+                    Operand::Value(d),
+                    Operand::Value(c.out_base),
+                    Operand::Const(IrConst::I64(16 * g as i64)),
+                ],
+            });
+        }
+        *next_val = nv;
+
+        let scalar_target = spill_label.unwrap_or(BlockId(hdr_label));
+        {
+            let block = &mut func.blocks[exit_idx];
+            let spilled_here: Vec<Instruction> = if spill_label.is_some() {
+                Vec::new()
+            } else {
+                stores.clone()
+            };
+            block.insert_insts(0, head.into_iter().chain(spilled_here), Span::dummy());
+            block.extend_insts(guard, Span::dummy());
+            block.terminator = Terminator::CondBranch {
+                cond: Operand::Value(overlap),
+                true_label: scalar_target,
+                false_label: fast_label,
+            };
+        }
+        if let Some(sl) = spill_label {
+            // The scalar fallback still reads the state array, so the
+            // spill stores live on its (cold) path.  Its iv phi's
+            // incoming edge moves from the exit block to the new one.
+            func.blocks.push(BasicBlock {
+                label: sl,
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(BlockId(hdr_label)),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            });
+            let si = func.blocks.len() - 1;
+            func.blocks[si].extend_insts(stores, Span::dummy());
+            for inst in func.blocks[c.ep_hdr].instructions.iter_mut() {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (_, lbl) in incoming.iter_mut() {
+                        if lbl.0 == exit_label {
+                            *lbl = sl;
+                        }
+                    }
+                }
+            }
+        }
+        func.blocks.push(BasicBlock {
+            label: fast_label,
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(c.after_label)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let fi = func.blocks.len() - 1;
+        func.blocks[fi].extend_insts(fast, Span::dummy());
+    }
+}
+
+/// The canonical rolled finalization loop `for (i = 0; i < nslots; i++)
+/// out[i] = x[i] + src[i];` following the matched round loop, resolved
+/// to its CFG pieces so the exit can absorb it (see
+/// `match_exit_combine`).
+struct ExitCombine {
+    /// Block index of the round loop's exit block (sole predecessor of
+    /// the finalization loop from outside).
+    exit_idx: usize,
+    /// Block index of the finalization loop's header (phi + bound cmp).
+    ep_hdr: usize,
+    /// Block index of the finalization loop's body.
+    ep_body: usize,
+    /// Label of the block control reaches after the finalization loop.
+    after_label: u32,
+    /// Destination base pointer (`out`) — ParamRef/Alloca/GlobalAddr
+    /// dominating the exit block.
+    out_base: Value,
+    /// The original input pointer whose packed values `v_init` holds
+    /// (the matched entry copy's `src`); the runtime overlap guard
+    /// compares `out` against it.
+    src: Value,
+    /// Whether the state array has no readers besides the finalization
+    /// loop, so the exit stores of the packed state can move onto the
+    /// (cold) scalar-fallback path only.
+    state_dead_after: bool,
+}
+
+/// Recognize the finalization loop `out[i] = x[i] + src[i]` that
+/// follows a ChaCha-style round loop, so the exit can compute
+/// `out_g = V_final_g + vecload(src)_g`: the permuted state comes
+/// straight from vector registers and the input via wide vector loads
+/// (no reloads of `x`, no scalar walk of `src`).
+///
+/// `src` is unchanged since function entry — the round loop was proven
+/// to write only the state alloca — so the exit-time loads see exactly
+/// the values the scalar loop would read.  The caller gates this on a
+/// successful `match_entry_copy` of the same `src` (the canonical
+/// paired shape; it also guarantees `src`'s provenance was vetted).
+///
+/// Aliasing between `out` and `src` is handled by a RUNTIME guard the
+/// absorber emits (see `install_exit_materialization`): the fast path
+/// issues ALL its `src` loads before ANY `out` store, which diverges
+/// from the scalar loop's interleaved reads/writes only when `out`
+/// sits 1..nslots-1 elements ABOVE `src` (iteration i's store to
+/// `out[i]` lands on a not-yet-read `src[j]`, j > i).  `out == src`
+/// exactly, `out` below `src`, and disjoint buffers are all
+/// read-before-clobber under either order.  The guard is the element-granular
+/// one-sided check the general vectorizer's `emit_alias_guards` uses:
+/// scalar iff `(out - src) - e` is unsigned-below `(nslots-2)*e + 1`.
+///
+/// `out` vs the state array needs no guard: the matcher requires the
+/// state base to be a non-escaping `Alloca`, which no pointer the
+/// caller supplied (ParamRef/GlobalAddr) and no distinct alloca can
+/// address.
+fn match_exit_combine(
+    func: &IrFunction,
+    dom: &DominanceChecker,
+    exit_idx: usize,
+    base: Value,
+    src: Value,
+    nslots: u8,
+    round_blocks: &[usize],
+) -> Option<ExitCombine> {
+    // Exit block falls through to the loop header unconditionally.
+    let Terminator::Branch(BlockId(hdr_label)) = func.blocks[exit_idx].terminator else {
+        return None;
+    };
+    let exit_label = func.blocks[exit_idx].label.0;
+    let p = func.blocks.iter().position(|b| b.label.0 == hdr_label)?;
+    if p == exit_idx {
+        return None;
+    }
+
+    // Header: exactly [Phi(I32), Cmp(Slt, iv, nslots)] + CondBranch.
+    let hdr = &func.blocks[p];
+    if hdr.instructions.len() != 2 {
+        return None;
+    }
+    let Instruction::Phi {
+        dest: iv,
+        ty: IrType::I32,
+        incoming,
+    } = &hdr.instructions[0]
+    else {
+        return None;
+    };
+    let iv = *iv;
+    let Instruction::Cmp {
+        dest: cmp_dest,
+        op: IrCmpOp::Slt,
+        lhs: Operand::Value(cmp_lhs),
+        rhs: Operand::Const(IrConst::I32(bound)),
+        ty: IrType::I32,
+    } = hdr.instructions[1]
+    else {
+        return None;
+    };
+    if cmp_lhs != iv || bound != i32::from(nslots) {
+        return None;
+    }
+    let Terminator::CondBranch {
+        cond: Operand::Value(cond),
+        true_label: BlockId(body_label),
+        false_label: BlockId(after_label),
+    } = hdr.terminator
+    else {
+        return None;
+    };
+    if cond != cmp_dest || body_label == hdr_label || after_label == hdr_label {
+        return None;
+    }
+    let b_idx = func.blocks.iter().position(|b| b.label.0 == body_label)?;
+    if b_idx == p || b_idx == exit_idx || body_label == after_label {
+        return None;
+    }
+    // The after-block must exist and carry no phis (the absorber adds a
+    // new incoming edge to it; fail closed rather than patch phis).
+    let after_idx = func.blocks.iter().position(|b| b.label.0 == after_label)?;
+    if after_idx == p || after_idx == b_idx || after_idx == exit_idx {
+        return None;
+    }
+    if func.blocks[after_idx]
+        .instructions
+        .iter()
+        .any(|i| matches!(i, Instruction::Phi { .. }))
+    {
+        return None;
+    }
+
+    // Phi incoming: exactly {0 from the exit block, step from the body}.
+    if incoming.len() != 2 {
+        return None;
+    }
+    let mut init_ok = false;
+    let mut step_val: Option<Value> = None;
+    for (op, BlockId(from)) in incoming {
+        match op {
+            Operand::Const(IrConst::I32(0)) if *from == exit_label => init_ok = true,
+            Operand::Value(v) if *from == body_label => step_val = Some(*v),
+            _ => return None,
+        }
+    }
+    let step = step_val?;
+    if !init_ok {
+        return None;
+    }
+
+    // Body: exactly the ten instructions of `out[i] = x[i] + src[i];
+    // i++`, wired together, ending in a branch back to the header.
+    let body = &func.blocks[b_idx];
+    if !matches!(body.terminator, Terminator::Branch(BlockId(l)) if l == hdr_label) {
+        return None;
+    }
+    if body.instructions.len() != 10 {
+        return None;
+    }
+    let mut cast_dest: Option<Value> = None;
+    let mut off_dest: Option<Value> = None;
+    let mut geps: Vec<(Value, Value)> = Vec::new(); // (dest, base)
+    let mut loads: Vec<(Value, Value)> = Vec::new(); // (dest, ptr)
+    let mut sum: Option<(Value, Value, Value)> = None; // (dest, lhs, rhs)
+    let mut store: Option<(Value, Value)> = None; // (val, ptr)
+    let mut step_ok = false;
+    for inst in &body.instructions {
+        match inst {
+            Instruction::Cast {
+                dest,
+                src: Operand::Value(s),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            } if *s == iv && cast_dest.is_none() => cast_dest = Some(*dest),
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(l),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::I64,
+            } if Some(*l) == cast_dest && off_dest.is_none() => off_dest = Some(*dest),
+            Instruction::GetElementPtr {
+                dest,
+                base: gb,
+                offset: Operand::Value(o),
+                ..
+            } if Some(*o) == off_dest => geps.push((*dest, *gb)),
+            Instruction::Load {
+                dest,
+                ptr,
+                ty: IrType::U32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            } => loads.push((*dest, *ptr)),
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(l),
+                rhs: Operand::Value(r),
+                ty: IrType::U32,
+            } if sum.is_none() => sum = Some((*dest, *l, *r)),
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(l),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            } if *l == iv && *dest == step => step_ok = true,
+            Instruction::Store {
+                val: Operand::Value(v),
+                ptr,
+                ty: IrType::U32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            } if store.is_none() => store = Some((*v, *ptr)),
+            _ => return None,
+        }
+    }
+    if !step_ok || geps.len() != 3 || loads.len() != 2 {
+        return None;
+    }
+    let (sum_dest, sum_l, sum_r) = sum?;
+    let (store_val, store_ptr) = store?;
+    if store_val != sum_dest {
+        return None;
+    }
+    // Resolve the three GEPs: one over `base`, one over `src`, and the
+    // store target over a third pointer `out`.
+    let gep_of = |b: Value| -> Option<Value> {
+        let mut found = None;
+        for &(d, gb) in &geps {
+            if gb == b {
+                if found.is_some() {
+                    return None; // ambiguous
+                }
+                found = Some(d);
+            }
+        }
+        found
+    };
+    let g_x = gep_of(base)?;
+    let g_s = gep_of(src)?;
+    let (out_base, g_out) = geps
+        .iter()
+        .find(|&&(d, gb)| d != g_x && d != g_s && gb != base && gb != src)
+        .map(|&(d, gb)| (gb, d))?;
+    if store_ptr != g_out {
+        return None;
+    }
+    // The two loads read x[i] and src[i]; the sum adds exactly them.
+    let load_from =
+        |ptr: Value| -> Option<Value> { loads.iter().find(|&&(_, p)| p == ptr).map(|&(d, _)| d) };
+    let xv = load_from(g_x)?;
+    let sv = load_from(g_s)?;
+    if xv == sv || !((sum_l == xv && sum_r == sv) || (sum_l == sv && sum_r == xv)) {
+        return None;
+    }
+
+    // Sole entries: header from {exit, body} only; body from header only.
+    for (bi, blk) in func.blocks.iter().enumerate() {
+        let targets = terminator_targets(&blk.terminator);
+        if targets.contains(&hdr_label) && bi != exit_idx && bi != b_idx {
+            return None;
+        }
+        if targets.contains(&body_label) && bi != p {
+            return None;
+        }
+    }
+
+    // `out` provenance: a pointer that dominates the exit block and
+    // provably cannot address the state alloca.  `out == src` is fine
+    // (distance 0 takes the fast path, which was proven exact).
+    if out_base == base {
+        return None;
+    }
+    let mut out_ok = false;
+    let mut base_is_alloca = false;
+    'defs: for (bi, blk) in func.blocks.iter().enumerate() {
+        for inst in &blk.instructions {
+            match inst {
+                Instruction::ParamRef { dest, .. }
+                | Instruction::Alloca { dest, .. }
+                | Instruction::GlobalAddr { dest, .. }
+                    if *dest == out_base =>
+                {
+                    out_ok = dom.dominates(bi, exit_idx);
+                    if base_is_alloca {
+                        break 'defs;
+                    }
+                }
+                Instruction::Alloca { dest, .. } if *dest == base => {
+                    base_is_alloca = true;
+                    if out_ok {
+                        break 'defs;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !out_ok || !base_is_alloca {
+        return None;
+    }
+    // The state alloca must not escape: its only permitted uses are as
+    // a GEP base, a scalar load/store ADDRESS, or the pointer operand
+    // of the pass's own vector load/store intrinsics.  Any other
+    // appearance (stored as a value, passed to a call, phi/copy/cast
+    // input, ...) could give `out` a path to alias it.  The presence
+    // test is the CANONICAL `for_each_used_value` traversal (every
+    // operand position, including pointers and call arguments); the
+    // whitelist then re-derives which positions carried it, so a use
+    // in a position the whitelist does not name can never slip by.
+    for blk in &func.blocks {
+        for inst in &blk.instructions {
+            let mut uses_base = false;
+            inst.for_each_used_value(|v| {
+                if v == base.0 {
+                    uses_base = true;
+                }
+            });
+            if !uses_base {
+                continue;
+            }
+            let ok = match inst {
+                Instruction::GetElementPtr {
+                    base: gb, offset, ..
+                } => *gb == base && !matches!(offset, Operand::Value(v) if *v == base),
+                Instruction::Load { ptr, .. } => *ptr == base,
+                Instruction::Store { ptr, val, .. } => {
+                    *ptr == base && !matches!(val, Operand::Value(v) if *v == base)
+                }
+                Instruction::Intrinsic { op, args, .. } => match op {
+                    // args = [ptr, offset]: only the pointer lane may
+                    // carry the alloca.
+                    IntrinsicOp::VecLoadI32x4 => {
+                        matches!(args.first(), Some(Operand::Value(v)) if *v == base)
+                            && !args[1..]
+                                .iter()
+                                .any(|a| matches!(a, Operand::Value(v) if *v == base))
+                    }
+                    // args = [val, ptr, offset]: only the pointer lane.
+                    IntrinsicOp::VecStoreI32x4 => {
+                        matches!(args.get(1), Some(Operand::Value(v)) if *v == base)
+                            && !matches!(args.first(), Some(Operand::Value(v)) if *v == base)
+                            && !args[2..]
+                                .iter()
+                                .any(|a| matches!(a, Operand::Value(v) if *v == base))
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !ok {
+                return None;
+            }
+        }
+        let mut used_in_term = false;
+        blk.terminator.for_each_used_value(|v| {
+            if v == base.0 {
+                used_in_term = true;
+            }
+        });
+        if used_in_term {
+            return None;
+        }
+    }
+
+    // No finalization-loop value may be used outside it.
+    let mut defined: FxHashSet<Value> = FxHashSet::default();
+    defined.extend([
+        iv, cmp_dest, step, sum_dest, store_val, g_x, g_s, g_out, xv, sv,
+    ]);
+    if let Some(c) = cast_dest {
+        defined.insert(c);
+    }
+    if let Some(o) = off_dest {
+        defined.insert(o);
+    }
+    for (bi, blk) in func.blocks.iter().enumerate() {
+        if bi == p || bi == b_idx {
+            continue;
+        }
+        let mut leaked = false;
+        for inst in &blk.instructions {
+            inst.for_each_used_value(|v| {
+                if defined.contains(&Value(v)) {
+                    leaked = true;
+                }
+            });
+        }
+        blk.terminator.for_each_used_value(|v| {
+            if defined.contains(&Value(v)) {
+                leaked = true;
+            }
+        });
+        if leaked {
+            return None;
+        }
+    }
+
+    // Does anything OTHER than the finalization loop read the state
+    // array after the rounds?  If not, the packed-state spill stores
+    // only need to exist on the scalar-fallback path.
+    let mut known: FxHashSet<usize> = round_blocks.iter().copied().collect();
+    known.extend([exit_idx, p, b_idx]);
+    let mut state_dead_after = true;
+    for (bi, blk) in func.blocks.iter().enumerate() {
+        if known.contains(&bi) {
+            continue;
+        }
+        for inst in &blk.instructions {
+            // The canonical traversal covers every use position (GEP
+            // bases, load/store pointers, call arguments, casts); the
+            // Alloca definition itself reports no uses.
+            inst.for_each_used_value(|v| {
+                if v == base.0 {
+                    state_dead_after = false;
+                }
+            });
+        }
+    }
+
+    Some(ExitCombine {
+        exit_idx,
+        ep_hdr: p,
+        ep_body: b_idx,
+        after_label,
+        out_base,
+        src,
+        state_dead_after,
+    })
+}
+
+/// The canonical rolled entry-copy loop `for (i = 0; i < nslots; i++)
+/// x[i] = src[i];` feeding the matched state array, resolved to its CFG
+/// pieces so the pack can absorb it (see `match_entry_copy`).
+struct EntryCopy {
+    /// Loop-invariant source base pointer (a `ParamRef`, a distinct
+    /// `Alloca`, or a `GlobalAddr` — the three shapes that provably
+    /// cannot alias the state alloca).
+    src: Value,
+    /// Block index of the copy loop's header (phi + bound compare).
+    copy_header: usize,
+    /// Block index of the copy loop's body (the load/store pair).
+    copy_body: usize,
+    /// Block index whose terminator enters the copy loop from outside;
+    /// its edge is re-targeted straight to the round preheader.
+    entry_pred: usize,
+}
+
+/// Recognize the entry-copy loop so the preheader pack can read the
+/// ORIGINAL source array element-wise instead of staging through the
+/// state alloca.
+///
+/// # Why this transform exists (the Zen store-forwarding cliff)
+///
+/// The measured 2.26x chacha20_block regression vs GCC on EPYC 9V45
+/// (Zen 5) — while the identical binary beat GCC on Intel hosts — came
+/// from the staging shape this matcher removes.  The copy loop was
+/// vectorized by the general vectorizer into 16-byte `movdqu` loads of
+/// `src` and 16-byte vector STORES into the state alloca, which the
+/// preheader pack then immediately re-read with sixteen 4-byte GPR
+/// loads.  Forwarding a narrow integer load out of a vector-domain
+/// store is the Zen store queue's documented weak spot (domain-crossing
+/// penalty per load), ×16 per call, ×2M calls; Intel forwards
+/// narrow-from-wide across domains cheaply, which is why the Intel
+/// numbers never showed it.  The control experiment that pins this
+/// down: GCC's winning Zen 5 code performs the very same caller-`movl`
+/// → `call` → partial-overlap `movdqu` reads of the input block, so
+/// that bounded (~2 per call) stall is demonstrably not the cliff —
+/// the round-trip through the alloca is.
+///
+/// Absorbing the copy loop deletes the round-trip entirely: the pack
+/// issues four 4-byte loads per group (`VecPackI32x4` of four scalar
+/// `Load U32`) straight from `src`.  A 4-byte load forwards exactly
+/// from the caller's 4-byte store, as a contained load from anything
+/// wider, and never crosses the vector/GPR domain boundary — the fast
+/// path on every Intel and AMD core.  The copy loop's 4+4 vector
+/// load/store pairs plus the pack's 16 reloads collapse into 16 loads
+/// with no intermediate stores, shortening the per-call critical path
+/// on hazard-free microarchitectures too.
+///
+/// # Fail-closed matching rules (every one is load-bearing)
+///
+/// * The preheader must be instruction-free: anything there executes
+///   between the copy and the pack and could redefine either array.
+/// * The preheader's ONLY predecessor is the copy-loop header; the
+///   header is exactly `[Phi(i: 0 | step), Cmp(i <s nslots)]` +
+///   `CondBranch(body | preheader)`; the body is exactly the seven
+///   instructions of `x[i] = src[i]; i++` and branches back.  Any extra
+///   instruction, a volatile access, or a non-default address space
+///   rejects (the transform then keeps the state-array pack, which is
+///   correct for every shape).
+/// * `i` runs 0..nslots by 1 (`Slt` against exactly `nslots`), so every
+///   slot the round loop reads is covered — a partial copy must keep
+///   staging through the array.
+/// * `src` must be a `ParamRef`, a different `Alloca`, or a
+///   `GlobalAddr`, defined in a block dominating the copy header.  Each
+///   of the three provably cannot alias the state alloca (a fresh
+///   non-escaped alloca is disjoint from caller memory, from every other
+///   alloca, and from globals), so the copy's loads read memory the
+///   copy's own stores never touch, and moving those loads to the
+///   preheader — past the deleted stores — reads identical bytes.  A
+///   computed pointer (loaded from memory, GEP result, call result)
+///   could point INTO the state array and is rejected.
+/// * The copy loop has no other entries (header preds = {entry, body},
+///   body preds = {header}) and none of its values escape — deleting it
+///   cannot orphan a use.
+fn match_entry_copy(
+    func: &IrFunction,
+    dom: &DominanceChecker,
+    preheader: usize,
+    base: Value,
+    nslots: u8,
+) -> Option<EntryCopy> {
+    if !func.blocks[preheader].instructions.is_empty() {
+        return None;
+    }
+    let ph_label = func.blocks[preheader].label.0;
+
+    // Sole predecessor of the preheader = candidate copy header.
+    let mut ph_preds = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| terminator_targets(&b.terminator).contains(&ph_label))
+        .map(|(bi, _)| bi);
+    let p = ph_preds.next()?;
+    if ph_preds.next().is_some() || p == preheader {
+        return None;
+    }
+    let p_label = func.blocks[p].label.0;
+
+    // Header: CondBranch { body | preheader } over exactly [Phi, Cmp].
+    let hdr = &func.blocks[p];
+    let (hdr_cond, body_label) = match &hdr.terminator {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } if false_label.0 == ph_label && true_label.0 != p_label && true_label.0 != ph_label => {
+            (cond, true_label.0)
+        }
+        _ => return None,
+    };
+    if hdr.instructions.len() != 2 {
+        return None;
+    }
+    let Instruction::Phi {
+        dest: iv,
+        ty: IrType::I32,
+        incoming,
+    } = &hdr.instructions[0]
+    else {
+        return None;
+    };
+    let Instruction::Cmp {
+        dest: cmp_dest,
+        op: crate::ir::ops::IrCmpOp::Slt,
+        lhs: Operand::Value(cmp_lhs),
+        rhs: Operand::Const(cmp_rhs),
+        ty: IrType::I32,
+    } = &hdr.instructions[1]
+    else {
+        return None;
+    };
+    if cmp_lhs != iv
+        || cmp_rhs.to_i64() != Some(i64::from(nslots))
+        || *hdr_cond != Operand::Value(*cmp_dest)
+    {
+        return None;
+    }
+    // Phi: (Const 0 from the outside entry, step from the body).
+    let [a, b] = &incoming[..] else { return None };
+    let ((init, entry_label), (step_op, step_label)) = if a.1.0 == body_label {
+        ((&b.0, b.1.0), (&a.0, a.1.0))
+    } else {
+        ((&a.0, a.1.0), (&b.0, b.1.0))
+    };
+    if step_label != body_label || entry_label == body_label {
+        return None;
+    }
+    match init {
+        Operand::Const(c) if c.to_i64() == Some(0) => {}
+        _ => return None,
+    }
+    let Operand::Value(step) = step_op else {
+        return None;
+    };
+
+    // Body: exactly the seven instructions of `x[i] = src[i]; i++`.
+    let b_idx = func.blocks.iter().position(|b| b.label.0 == body_label)?;
+    let body = &func.blocks[b_idx];
+    match &body.terminator {
+        Terminator::Branch(t) if t.0 == p_label => {}
+        _ => return None,
+    }
+    if body.instructions.len() != 7 {
+        return None;
+    }
+    fn set_once<T>(slot: &mut Option<T>, v: T) -> Option<()> {
+        if slot.is_some() {
+            return None; // duplicate role: not the canonical shape
+        }
+        *slot = Some(v);
+        Some(())
+    }
+    let mut cast: Option<Value> = None; // i widened to I64
+    let mut shl: Option<(Value, Value)> = None; // (dest, lhs)
+    let mut gep_x: Option<(Value, Value)> = None; // (dest, offset)
+    let mut gep_s: Option<(Value, Value, Value)> = None; // (dest, base, offset)
+    let mut load: Option<(Value, Value)> = None; // (dest, ptr)
+    let mut store: Option<(Value, Value)> = None; // (val, ptr)
+    let mut add: Option<Value> = None; // i + 1
+    for inst in &body.instructions {
+        match inst {
+            Instruction::Cast {
+                dest,
+                src: Operand::Value(s),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            } if s == iv => set_once(&mut cast, *dest)?,
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(l),
+                rhs: Operand::Const(c),
+                ty: IrType::I64,
+            } if c.to_i64() == Some(2) => set_once(&mut shl, (*dest, *l))?,
+            Instruction::GetElementPtr {
+                dest,
+                base: gb,
+                offset: Operand::Value(o),
+                ..
+            } => {
+                if *gb == base {
+                    set_once(&mut gep_x, (*dest, *o))?
+                } else {
+                    set_once(&mut gep_s, (*dest, *gb, *o))?
+                }
+            }
+            Instruction::Load {
+                dest,
+                ptr,
+                ty: IrType::U32,
+                seg_override: crate::common::types::AddressSpace::Default,
+                volatile: false,
+            } => set_once(&mut load, (*dest, *ptr))?,
+            Instruction::Store {
+                val: Operand::Value(v),
+                ptr,
+                ty: IrType::U32,
+                seg_override: crate::common::types::AddressSpace::Default,
+                volatile: false,
+            } => set_once(&mut store, (*v, *ptr))?,
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty: IrType::I32,
+            } => {
+                let one = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64() == Some(1));
+                let is_iv = |o: &Operand| matches!(o, Operand::Value(v) if v == iv);
+                if (is_iv(lhs) && one(rhs)) || (is_iv(rhs) && one(lhs)) {
+                    set_once(&mut add, *dest)?
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (cast, (shl_d, shl_l)) = (cast?, shl?);
+    let ((gx_d, gx_o), (gs_d, src, gs_o)) = (gep_x?, gep_s?);
+    let ((ld_d, ld_p), (st_v, st_p), add_d) = (load?, store?, add?);
+    // Wire the roles together; any mismatch is a different loop.
+    if shl_l != cast
+        || gx_o != shl_d
+        || gs_o != shl_d
+        || ld_p != gs_d
+        || st_v != ld_d
+        || st_p != gx_d
+        || add_d != *step
+    {
+        return None;
+    }
+
+    // Outside entry block: targets the header, is none of the loop blocks.
+    let entry_pred = func.blocks.iter().position(|b| b.label.0 == entry_label)?;
+    if entry_pred == p
+        || entry_pred == b_idx
+        || entry_pred == preheader
+        || !terminator_targets(&func.blocks[entry_pred].terminator).contains(&p_label)
+    {
+        return None;
+    }
+
+    // No other entries into the loop.
+    for (bi, blk) in func.blocks.iter().enumerate() {
+        let targets = terminator_targets(&blk.terminator);
+        if targets.contains(&p_label) && bi != entry_pred && bi != b_idx {
+            return None;
+        }
+        if targets.contains(&body_label) && bi != p {
+            return None;
+        }
+    }
+
+    // `src` must provably not alias the state alloca: its defining
+    // instruction (the canonical `dest()` accessor sees every
+    // def-bearing variant) must be a ParamRef, a distinct Alloca, or a
+    // GlobalAddr dominating the copy loop.
+    let mut src_ok = false;
+    'outer: for (bi, blk) in func.blocks.iter().enumerate() {
+        for inst in &blk.instructions {
+            if inst.dest() == Some(src) {
+                src_ok = matches!(
+                    inst,
+                    Instruction::ParamRef { .. }
+                        | Instruction::Alloca { .. }
+                        | Instruction::GlobalAddr { .. }
+                ) && dom.dominates(bi, p);
+                break 'outer;
+            }
+        }
+    }
+    if !src_ok {
+        return None;
+    }
+
+    // No copy-loop value may be used outside the loop (canonical
+    // traversal: every operand position, including pointers).
+    let copy_vals: FxHashSet<u32> = [
+        iv.0, cmp_dest.0, cast.0, shl_d.0, gx_d.0, gs_d.0, ld_d.0, add_d.0,
+    ]
+    .into_iter()
+    .collect();
+    for (bi, blk) in func.blocks.iter().enumerate() {
+        if bi == p || bi == b_idx {
+            continue;
+        }
+        let mut esc = false;
+        for inst in &blk.instructions {
+            inst.for_each_used_value(|v| {
+                if copy_vals.contains(&v) {
+                    esc = true;
+                }
+            });
+        }
+        blk.terminator.for_each_used_value(|v| {
+            if copy_vals.contains(&v) {
+                esc = true;
+            }
+        });
+        if esc {
+            return None;
+        }
+    }
+
+    Some(EntryCopy {
+        src,
+        copy_header: p,
+        copy_body: b_idx,
+        entry_pred,
+    })
+}
+
+/// Replace every occurrence of label `from` with `to` in a terminator.
+fn retarget_terminator(t: &mut Terminator, from: u32, to: u32) {
+    let fix = |b: &mut BlockId| {
+        if b.0 == from {
+            b.0 = to;
+        }
+    };
+    match t {
+        Terminator::Branch(b) => fix(b),
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            fix(true_label);
+            fix(false_label);
+        }
+        Terminator::Switch { cases, default, .. } => {
+            for (_, b) in cases.iter_mut() {
+                fix(b);
+            }
+            fix(default);
+        }
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => {
+            for b in possible_targets.iter_mut() {
+                fix(b);
+            }
+        }
+        Terminator::Return(_) | Terminator::Unreachable => {}
     }
 }
 
@@ -1532,67 +2629,20 @@ fn terminator_targets(t: &Terminator) -> Vec<u32> {
     }
 }
 
-fn inst_dest_value(inst: &Instruction) -> Option<Value> {
-    use Instruction::*;
-    match inst {
-        BinOp { dest, .. }
-        | Load { dest, .. }
-        | Phi { dest, .. }
-        | GetElementPtr { dest, .. }
-        | Copy { dest, .. }
-        | Cmp { dest, .. } => Some(*dest),
-        Intrinsic { dest, .. } => *dest,
-        _ => None,
-    }
-}
-
-fn for_each_operand_in(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
-    use Instruction::*;
-    match inst {
-        BinOp { lhs, rhs, .. } | Cmp { lhs, rhs, .. } => {
-            f(lhs);
-            f(rhs);
-        }
-        Store { val, .. } => f(val),
-        Phi { incoming, .. } => {
-            for (o, _) in incoming {
-                f(o);
-            }
-        }
-        Intrinsic { args, .. } => {
-            for a in args {
-                f(a);
-            }
-        }
-        Copy { src, .. } => f(src),
-        _ => {}
-    }
-}
-
-fn for_each_operand_in_terminator(t: &Terminator, f: &mut dyn FnMut(&Operand)) {
-    if let Terminator::CondBranch { cond, .. } = t {
-        f(cond);
-    }
-}
-
 fn scan_max_value(func: &IrFunction) -> u32 {
+    // Canonical def/use traversals: the old narrow local walkers missed
+    // Cast destinations and pointer-position uses, so a function whose
+    // numerically largest value id sat in one of those positions could
+    // hand out a COLLIDING id for the pass's fresh values.
     let mut max = 0u32;
     for b in &func.blocks {
         for inst in &b.instructions {
-            if let Some(v) = inst_dest_value(inst) {
+            if let Some(v) = inst.dest() {
                 max = max.max(v.0);
             }
-            for_each_operand_in(inst, &mut |op| {
-                if let Operand::Value(v) = op {
-                    max = max.max(v.0);
-                }
-            });
+            inst.for_each_used_value(|v| max = max.max(v));
         }
-        for_each_operand_in_terminator(&b.terminator, &mut |op| {
-            if let Operand::Value(v) = op {
-                max = max.max(v.0);
-            }
-        });
+        b.terminator.for_each_used_value(|v| max = max.max(v));
     }
     max
 }
@@ -1693,5 +2743,340 @@ mod tests {
         );
         assert!(terminator_targets(&Terminator::Return(None)).is_empty());
         assert!(terminator_targets(&Terminator::Unreachable).is_empty());
+    }
+
+    // ───────────────────── boundary-absorption matchers ─────────────────
+    //
+    // Fixture: the canonical ChaCha20 block-function CFG exactly as the
+    // frontend lowers it (labels == indices):
+    //
+    //   b0 entry (alloca x, params out/in)      → b1
+    //   b1 copy header  (i phi, i <s 16)        → b2 | b3
+    //   b2 copy body    (x[i] = in[i]; i++)     → b1
+    //   b3 round preheader (empty)              → b4
+    //   b4 round loop   (self-loop stand-in)    → b4 | b5
+    //   b5 round exit   (empty)                 → b6
+    //   b6 final header (j phi, j <s 16)        → b7 | b8
+    //   b7 final body   (out[j] = x[j] + in[j]) → b6
+    //   b8 after                                → ret
+    const X: Value = Value(4); // state alloca
+    const OUT: Value = Value(2); // param 0
+    const IN: Value = Value(3); // param 1
+
+    fn u32_load(dest: u32, ptr: u32) -> Instruction {
+        Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::U32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+    fn u32_store(val: u32, ptr: u32) -> Instruction {
+        Instruction::Store {
+            val: Operand::Value(Value(val)),
+            ptr: Value(ptr),
+            ty: IrType::U32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+    fn iv_block(phi: u32, step: u32, cmp: u32, bound: i32, from: (u32, u32)) -> Vec<Instruction> {
+        vec![
+            Instruction::Phi {
+                dest: Value(phi),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(from.0)),
+                    (Operand::Value(Value(step)), BlockId(from.1)),
+                ],
+            },
+            Instruction::Cmp {
+                dest: Value(cmp),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(phi)),
+                rhs: Operand::Const(IrConst::I32(bound)),
+                ty: IrType::I32,
+            },
+        ]
+    }
+    fn addr_insts(iv: u32, cast: u32, shl: u32) -> Vec<Instruction> {
+        vec![
+            Instruction::Cast {
+                dest: Value(cast),
+                src: Operand::Value(Value(iv)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(shl),
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(Value(cast)),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::I64,
+            },
+        ]
+    }
+    fn gep(dest: u32, base: Value, off: u32) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base,
+            offset: Operand::Value(Value(off)),
+            ty: IrType::Ptr,
+        }
+    }
+    fn iv_step(dest: u32, iv: u32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(iv)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        }
+    }
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }
+    }
+    fn cond(cmp: u32, t: u32, f: u32) -> Terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(Value(cmp)),
+            true_label: BlockId(t),
+            false_label: BlockId(f),
+        }
+    }
+    fn chacha_fixture() -> IrFunction {
+        let mut f = IrFunction::new("chacha_core".to_string(), IrType::Void, vec![], false);
+        let b0 = block(
+            0,
+            vec![
+                Instruction::Alloca {
+                    dest: X,
+                    ty: IrType::Ptr,
+                    size: 64,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::ParamRef {
+                    dest: OUT,
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: IN,
+                    param_idx: 1,
+                    ty: IrType::Ptr,
+                },
+            ],
+            Terminator::Branch(BlockId(1)),
+        );
+        let b1 = block(1, iv_block(100, 105, 101, 16, (0, 2)), cond(101, 2, 3));
+        let mut copy_body = addr_insts(100, 102, 103);
+        copy_body.push(gep(104, X, 103));
+        copy_body.push(gep(106, IN, 103));
+        copy_body.push(u32_load(107, 106));
+        copy_body.push(u32_store(107, 104));
+        copy_body.push(iv_step(105, 100));
+        let b2 = block(2, copy_body, Terminator::Branch(BlockId(1)));
+        let b3 = block(3, vec![], Terminator::Branch(BlockId(4)));
+        let mut round = iv_block(110, 111, 112, 10, (3, 4));
+        round.insert(1, iv_step(111, 110));
+        let b4 = block(4, round, cond(112, 4, 5));
+        let b5 = block(5, vec![], Terminator::Branch(BlockId(6)));
+        let b6 = block(6, iv_block(120, 121, 122, 16, (5, 7)), cond(122, 7, 8));
+        let mut fin_body = addr_insts(120, 123, 124);
+        fin_body.push(gep(125, OUT, 124));
+        fin_body.push(gep(126, X, 124));
+        fin_body.push(u32_load(127, 126));
+        fin_body.push(gep(128, IN, 124));
+        fin_body.push(u32_load(129, 128));
+        fin_body.push(Instruction::BinOp {
+            dest: Value(130),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(127)),
+            rhs: Operand::Value(Value(129)),
+            ty: IrType::U32,
+        });
+        fin_body.push(u32_store(130, 125));
+        fin_body.push(iv_step(121, 120));
+        let b7 = block(7, fin_body, Terminator::Branch(BlockId(6)));
+        let b8 = block(8, vec![], Terminator::Return(None));
+        f.blocks = vec![b0, b1, b2, b3, b4, b5, b6, b7, b8];
+        f.next_value_id = 200;
+        f.next_label = 9;
+        f
+    }
+    fn dom_of(f: &IrFunction) -> DominanceChecker {
+        let cfg = CfgAnalysis::build(f);
+        DominanceChecker::new(cfg.num_blocks, &cfg.idom)
+    }
+    const ROUND_BLOCKS: [usize; 4] = [3, 4, 1, 2];
+
+    #[test]
+    fn entry_copy_matches_the_canonical_chacha_shape() {
+        let f = chacha_fixture();
+        let dom = dom_of(&f);
+        let ec = match_entry_copy(&f, &dom, 3, X, 16).expect("canonical shape must match");
+        assert_eq!(ec.src, IN);
+        assert_eq!(ec.copy_header, 1);
+        assert_eq!(ec.copy_body, 2);
+        assert_eq!(ec.entry_pred, 0);
+    }
+
+    #[test]
+    fn entry_copy_declines_on_any_perturbation() {
+        // Volatile load: the copy is observable, absorbing it would
+        // delete a side effect.
+        let mut f = chacha_fixture();
+        if let Instruction::Load { volatile, .. } = &mut f.blocks[2].instructions[4] {
+            *volatile = true;
+        }
+        assert!(match_entry_copy(&f, &dom_of(&f), 3, X, 16).is_none());
+
+        // Bound mismatch: a partial copy must not seed the full pack.
+        let mut f = chacha_fixture();
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[1].instructions[1] {
+            *rhs = Operand::Const(IrConst::I32(12));
+        }
+        assert!(match_entry_copy(&f, &dom_of(&f), 3, X, 16).is_none());
+
+        // Copied value escapes the loop: deleting the loop would orphan
+        // the use.
+        let mut f = chacha_fixture();
+        f.blocks[8].instructions.push(Instruction::Copy {
+            dest: Value(140),
+            src: Operand::Value(Value(107)),
+        });
+        assert!(match_entry_copy(&f, &dom_of(&f), 3, X, 16).is_none());
+
+        // Store aimed at the SOURCE array (reversed copy direction).
+        let mut f = chacha_fixture();
+        f.blocks[2].instructions[2] = gep(104, IN, 103);
+        f.blocks[2].instructions[3] = gep(106, X, 103);
+        assert!(match_entry_copy(&f, &dom_of(&f), 3, X, 16).is_none());
+
+        // Second predecessor of the copy header (goto back into the
+        // loop): iteration count is no longer provable.
+        let mut f = chacha_fixture();
+        f.blocks[8].terminator = Terminator::Branch(BlockId(1));
+        assert!(match_entry_copy(&f, &dom_of(&f), 3, X, 16).is_none());
+
+        // Non-empty preheader: code would execute between copy and pack.
+        let mut f = chacha_fixture();
+        f.blocks[3].instructions.push(iv_step(141, 100));
+        assert!(match_entry_copy(&f, &dom_of(&f), 3, X, 16).is_none());
+    }
+
+    #[test]
+    fn exit_combine_matches_and_proves_state_death() {
+        let f = chacha_fixture();
+        let dom = dom_of(&f);
+        let c = match_exit_combine(&f, &dom, 5, X, IN, 16, &ROUND_BLOCKS)
+            .expect("canonical feed-forward must match");
+        assert_eq!(c.exit_idx, 5);
+        assert_eq!(c.ep_hdr, 6);
+        assert_eq!(c.ep_body, 7);
+        assert_eq!(c.after_label, 8);
+        assert_eq!(c.out_base, OUT);
+        assert_eq!(c.src, IN);
+        assert!(
+            c.state_dead_after,
+            "nothing outside the matched loops reads x[]"
+        );
+    }
+
+    #[test]
+    fn exit_combine_keeps_spill_stores_when_state_is_read_later() {
+        let mut f = chacha_fixture();
+        // The after-block inspects x[0]: the packed state must still be
+        // spilled on every path.
+        f.blocks[8].instructions.push(Instruction::Cast {
+            dest: Value(151),
+            src: Operand::Const(IrConst::I32(0)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        f.blocks[8].instructions.push(gep(150, X, 151));
+        f.blocks[8].instructions.push(u32_load(152, 150));
+        let dom = dom_of(&f);
+        let c = match_exit_combine(&f, &dom, 5, X, IN, 16, &ROUND_BLOCKS)
+            .expect("extra reader only demotes the spill, not the match");
+        assert!(!c.state_dead_after);
+    }
+
+    #[test]
+    fn exit_combine_declines_on_any_perturbation() {
+        // A phi in the after-block: the absorber adds an incoming edge
+        // it would have to patch.
+        let mut f = chacha_fixture();
+        f.blocks[8].instructions.push(Instruction::Phi {
+            dest: Value(160),
+            ty: IrType::I32,
+            incoming: vec![(Operand::Const(IrConst::I32(0)), BlockId(6))],
+        });
+        assert!(match_exit_combine(&f, &dom_of(&f), 5, X, IN, 16, &ROUND_BLOCKS).is_none());
+
+        // An 11th instruction in the body: not the canonical loop.
+        let mut f = chacha_fixture();
+        f.blocks[7].instructions.push(iv_step(161, 120));
+        assert!(match_exit_combine(&f, &dom_of(&f), 5, X, IN, 16, &ROUND_BLOCKS).is_none());
+
+        // The destination is the state array itself.
+        let mut f = chacha_fixture();
+        f.blocks[7].instructions[2] = gep(125, X, 124);
+        assert!(match_exit_combine(&f, &dom_of(&f), 5, X, IN, 16, &ROUND_BLOCKS).is_none());
+
+        // The state alloca escapes (stored as a value): `out` could
+        // alias it through the escaped copy.
+        let mut f = chacha_fixture();
+        f.blocks[0].instructions.push(Instruction::Store {
+            val: Operand::Value(X),
+            ptr: OUT,
+            ty: IrType::Ptr,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        assert!(match_exit_combine(&f, &dom_of(&f), 5, X, IN, 16, &ROUND_BLOCKS).is_none());
+
+        // A finalization value leaks out of the loop.
+        let mut f = chacha_fixture();
+        f.blocks[8].instructions.push(Instruction::Copy {
+            dest: Value(162),
+            src: Operand::Value(Value(130)),
+        });
+        assert!(match_exit_combine(&f, &dom_of(&f), 5, X, IN, 16, &ROUND_BLOCKS).is_none());
+
+        // The sum reads something other than x[j] + in[j].
+        let mut f = chacha_fixture();
+        if let Instruction::BinOp { lhs, .. } = &mut f.blocks[7].instructions[7] {
+            *lhs = Operand::Value(Value(129));
+        }
+        assert!(match_exit_combine(&f, &dom_of(&f), 5, X, IN, 16, &ROUND_BLOCKS).is_none());
+    }
+
+    #[test]
+    fn retarget_terminator_rewrites_each_edge_kind() {
+        let mut t = Terminator::Branch(BlockId(1));
+        retarget_terminator(&mut t, 1, 9);
+        assert_eq!(terminator_targets(&t), vec![9]);
+
+        let mut t = cond(0, 1, 2);
+        retarget_terminator(&mut t, 2, 9);
+        assert_eq!(terminator_targets(&t), vec![1, 9]);
+
+        let mut t = Terminator::Switch {
+            val: Operand::Const(IrConst::I32(0)),
+            cases: vec![(0, BlockId(1)), (1, BlockId(2))],
+            default: BlockId(1),
+            ty: IrType::I32,
+        };
+        retarget_terminator(&mut t, 1, 9);
+        assert_eq!(terminator_targets(&t), vec![9, 2, 9]);
     }
 }

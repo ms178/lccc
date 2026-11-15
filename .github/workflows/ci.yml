@@ -1857,6 +1857,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_arx_frame_latency.sh
+    - name: Verify ARX boundary absorption (entry pack + guarded feed-forward)
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_arx_boundary_absorb.sh
     - name: Every FMA3 digit permutation must compute a*b+c (SA-11)
       run: bash tests/regression/check_fma_digit_permutation.sh --lccc target/fastbuild/lccc --reference gcc-16
     - name: Packed integer and bitwise maps must stay in registers (RH-03)
