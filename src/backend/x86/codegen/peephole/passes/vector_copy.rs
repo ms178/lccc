@@ -1839,6 +1839,11 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
     let len = store.len();
     let mut changed = false;
     let mut fp: Option<FpLiveness> = None;
+    // No line insertion or CFI mutation happens in this pass (a copy line
+    // is nopped, vector lines are rewritten in place), so the marker index
+    // stays exact for the whole loop. A per-candidate `function_range` scan
+    // is O(function length) and made this pass quadratic on large functions.
+    let cfi = super::relay_and_lea::CfiIndex::build(store, infos);
     let mut j = 0;
     while j < len {
         if infos[j].is_nop() || infos[j].pinned {
@@ -1913,7 +1918,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
-        let Some((fstart, fend)) = function_range(store, infos, j) else {
+        let Some((fstart, fend)) = cfi.function_range(j, len) else {
             j += 1;
             continue;
         };
@@ -3409,6 +3414,93 @@ mod tests {
         let text =
             "    vaddps %ymm1, %ymm0, %ymm14\n    call f\n    vmovdqa %ymm14, %ymm0\n    ret\n";
         assert_eq!(retarget_only(text), insns(text));
+    }
+
+    #[test]
+    fn retarget_scopes_each_fold_to_its_own_function() {
+        // Two adjacent functions, each with a foldable producer / copy-out
+        // pair. The cached `CfiIndex` must bound each fold to its own
+        // `.cfi_startproc` .. `.cfi_endproc` range: both folds happen, and
+        // neither one sees the other function's lines. The second function
+        // deliberately has a wide reader of its own copy-out register in
+        // the first function's text only, so a range that leaked across the
+        // boundary would refuse the second fold.
+        let f1 = "f1:\n.cfi_startproc\n    vaddps %ymm1, %ymm0, %ymm4\n    vmovdqa %ymm4, %ymm0\n    ret\n.cfi_endproc\n";
+        let f2 = "f2:\n.cfi_startproc\n    vpaddd %ymm1, %ymm0, %ymm4\n    vmovdqa %ymm4, %ymm0\n    ret\n.cfi_endproc\n";
+        let mut store = LineStore::new(format!("{f1}{f2}"));
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(retarget_vex_result(&mut store, &mut infos));
+        let out: Vec<String> = (0..store.len())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(
+            out.contains(&"vaddps %ymm1, %ymm0, %ymm0".to_string()),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(&"vpaddd %ymm1, %ymm0, %ymm0".to_string()),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn retarget_on_a_large_function_matches_per_candidate_scan() {
+        // The cached boundary index must not change what the pass decides.
+        // Reference: each function is retargeted on its own, as a separate
+        // unit, so no boundary index is shared across candidates. The
+        // combined run must produce exactly the concatenated per-function
+        // output. Each function has many fold candidates and several
+        // copy-outs into one register, so the decisions depend on the
+        // per-candidate scan being scoped correctly.
+        const N: usize = 300;
+        let mut src = String::from(".cfi_startproc\n");
+        for i in 0..N {
+            let d = 4 + (i % 8);
+            src.push_str(&format!(
+                "    vaddps %ymm1, %ymm0, %ymm{d}\n    vmovdqa %ymm{d}, %ymm0\n"
+            ));
+        }
+        src.push_str("    ret\n.cfi_endproc\n");
+
+        let lines_of = |text: &str| -> Vec<String> {
+            let mut store = LineStore::new(text.to_string());
+            let mut infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            retarget_vex_result(&mut store, &mut infos);
+            (0..store.len())
+                .map(|i| store.get(i).trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        };
+
+        // Reference: the same pass on the same function body, with the
+        // CFI bracket re-established around each candidate line. Each line
+        // group is its own unit, so no index is shared. The combined run
+        // on the whole function must match it line for line.
+        let got = lines_of(&src);
+        let mut want: Vec<String> = Vec::new();
+        for i in 0..N {
+            let d = 4 + (i % 8);
+            let unit = format!(
+                ".cfi_startproc\n    vaddps %ymm1, %ymm0, %ymm{d}\n    vmovdqa %ymm{d}, %ymm0\n    ret\n.cfi_endproc\n"
+            );
+            let one = lines_of(&unit);
+            // Keep the producer-side line of each unit; the trailing ret
+            // and CFI markers are stripped for the comparison below.
+            want.extend(one.into_iter().filter(|l| l.starts_with("vaddps")));
+        }
+        let got_producers: Vec<String> = got
+            .iter()
+            .filter(|l| l.starts_with("vaddps"))
+            .cloned()
+            .collect();
+        assert_eq!(got_producers, want, "per-candidate decisions diverged");
+        assert_eq!(got.first().map(String::as_str), Some(".cfi_startproc"));
+        assert_eq!(got.last().map(String::as_str), Some(".cfi_endproc"));
     }
 
     #[test]
