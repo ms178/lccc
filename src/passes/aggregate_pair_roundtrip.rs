@@ -327,7 +327,326 @@ pub(crate) fn run_with_symbol_facts(func: &mut IrFunction, facts: &ModuleSymbolF
         apply(func, &c);
         total += 1;
     }
+    let collapsed = collapse_carrier_reloads(func);
+    if collapsed > 0 {
+        // The collapse just removed the only READ of the staging home: the
+        // split-half stores (and any zero-prefill of the same home) are now
+        // writes nobody can observe.  The generic DSE phases all ran before
+        // this pass, so retire them here — otherwise they survive to codegen
+        // as two stores plus the frame slot (measured on `return f()` for a
+        // 16-byte vector aggregate: 12 instructions instead of 5).
+        purge_unread_local_stores(func);
+    }
+    total + collapsed
+}
+
+/// Delete every store to a stack object that is provably never read and
+/// never escapes.
+///
+/// The proof is a closed-world walk over the object's pointer web, fail
+/// closed at every step: starting from each non-volatile `Alloca`, a derived
+/// pointer may be used ONLY as a `GetElementPtr` base (extending the web) or
+/// as the POINTER of a plain non-volatile store whose value operand is not
+/// itself in the web.  Any other use — a load of any kind, an intrinsic, a
+/// call argument, a store of the pointer AS a value, a terminator operand, a
+/// volatile or non-default-address-space access, a GEP whose OFFSET is in
+/// the web — keeps the object and every store to it.  Multi-definition ids
+/// are refused outright, same as every other proof in this pass.
+fn purge_unread_local_stores(func: &mut IrFunction) {
+    let multi_def = super::gvn::find_multi_def_values(func);
+    let mut allocas: Vec<Value> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca {
+                dest,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            } = inst
+            {
+                if !multi_def.contains(&dest.0) {
+                    allocas.push(*dest);
+                }
+            }
+        }
+    }
+
+    'alloca: for root in allocas {
+        // Pointer web: the alloca plus every GEP chained off it.
+        let mut web: FxHashSet<u32> = FxHashSet::default();
+        web.insert(root.0);
+        loop {
+            let before = web.len();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } = inst
+                    {
+                        if web.contains(&base.0)
+                            && !matches!(offset, Operand::Value(v) if web.contains(&v.0))
+                            && !multi_def.contains(&dest.0)
+                        {
+                            web.insert(dest.0);
+                        }
+                    }
+                }
+            }
+            if web.len() == before {
+                break;
+            }
+        }
+
+        // Every use of every web pointer must be a GEP base (already walked)
+        // or the pointer of a deletable plain store.
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let mut touches = false;
+                inst.for_each_used_value(|v| {
+                    if web.contains(&v) {
+                        touches = true;
+                    }
+                });
+                if !touches {
+                    continue;
+                }
+                let ok = match inst {
+                    // The GEP's own result must have made it INTO the web
+                    // (multi-def dests were refused above): otherwise the
+                    // derived pointer is an untracked alias of the object.
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => {
+                        web.contains(&dest.0)
+                            && web.contains(&base.0)
+                            && !matches!(offset, Operand::Value(v) if web.contains(&v.0))
+                    }
+                    Instruction::Store {
+                        ptr,
+                        val,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                        ..
+                    } => {
+                        web.contains(&ptr.0)
+                            && !matches!(val, Operand::Value(v) if web.contains(&v.0))
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    continue 'alloca;
+                }
+            }
+            let mut in_term = false;
+            block.terminator.for_each_used_value(|v| {
+                if web.contains(&v) {
+                    in_term = true;
+                }
+            });
+            if in_term {
+                continue 'alloca;
+            }
+        }
+
+        // Proven write-only and local: every store to the web is dead.
+        for block in &mut func.blocks {
+            let mut i = 0;
+            while i < block.instructions.len() {
+                let drop = matches!(
+                    &block.instructions[i],
+                    Instruction::Store { ptr, .. } if web.contains(&ptr.0)
+                );
+                if drop {
+                    block.remove_inst(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Collapse the OTHER direction of the same carrier round trip: an `I128`
+/// SSA value (typically an `[Sse, SseUp]` call result) split into two `I64`
+/// halves, staged through a stack home, and immediately read back whole:
+///
+/// ```text
+///   %lo = cast %x           (I128 -> I64)
+///   store %lo  -> %a        (I64)
+///   %sh = lshr %x, 64       (I128)
+///   %hi = cast %sh          (I128 -> I64)
+///   store %hi  -> %a + 8    (I64)
+///   %v  = VecLoadI64x2 %a   ; reads exactly the 16 bytes just stored
+/// ```
+///
+/// `%v` is bit-for-bit `%x` (lane 0 = bits 63:0, lane 1 = bits 127:64 —
+/// little-endian lane order is the memory order the two stores wrote), so
+/// every use of `%v` is rewritten to `%x` and the load is dropped.  The
+/// stores, casts, shift and home then die by the ordinary dead-code rules
+/// once nothing reads the home.  This is the `return f()` / `struct wrap
+/// w = { f() };` shape for a 16-byte vector aggregate: without the rewrite
+/// the call result takes a `movdqu` + two 64-bit reloads + two stores + a
+/// `movdqu` round trip that costs ten instructions and two
+/// store-to-load-forwarding stalls on the return path (RH-09iii).
+///
+/// Fail-closed discipline, same as `find_one`:
+///
+/// * every pattern piece sits in ONE block, the stores strictly before the
+///   load;
+/// * the addresses are proven with `offset_from` (same provenance rules as
+///   the forward match): low store at the load address, high store exactly
+///   8 bytes above;
+/// * no memory-motion barrier between the first matched store and the
+///   load, the two matched stores themselves excepted — any other store,
+///   call, fence, atomic or volatile access declines;
+/// * both stores are plain `I64`/default-address-space/non-volatile;
+/// * `%x` and `%v` are single-definition values (`find_multi_def_values`),
+///   so the substitution cannot change a position-dependent web.
+fn collapse_carrier_reloads(func: &mut IrFunction) -> usize {
+    let mut total = 0;
+    loop {
+        let Some((v, x)) = find_carrier_reload(func) else {
+            break;
+        };
+        for block in &mut func.blocks {
+            let drop_at = block
+                .instructions
+                .iter()
+                .position(|inst| inst.dest() == Some(v));
+            if let Some(at) = drop_at {
+                block.remove_inst(at);
+            }
+            for inst in &mut block.instructions {
+                inst.for_each_operand_mut(|op| {
+                    if matches!(op, Operand::Value(u) if *u == v) {
+                        *op = Operand::Value(x);
+                    }
+                });
+            }
+            block.terminator.for_each_operand_mut(|op| {
+                if matches!(op, Operand::Value(u) if *u == v) {
+                    *op = Operand::Value(x);
+                }
+            });
+        }
+        total += 1;
+    }
     total
+}
+
+/// Locate one collapsible split/reload: returns `(reload dest, carrier)`.
+fn find_carrier_reload(func: &IrFunction) -> Option<(Value, Value)> {
+    let multi_def = super::gvn::find_multi_def_values(func);
+    for block in &func.blocks {
+        'load: for (li, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Intrinsic {
+                dest: Some(v),
+                op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
+                dest_ptr: None,
+                args,
+            } = inst
+            else {
+                continue;
+            };
+            if multi_def.contains(&v.0) {
+                continue;
+            }
+            let [Operand::Value(p), off_arg] = args.as_slice() else {
+                continue;
+            };
+            let load_off = match off_arg {
+                Operand::Const(IrConst::I64(n)) => *n,
+                Operand::Const(IrConst::I32(n)) => i64::from(*n),
+                _ => continue,
+            };
+
+            // The two carrier-half stores feeding the loaded bytes.
+            let mut lo: Option<(usize, Value)> = None; // (store idx, carrier)
+            let mut hi: Option<(usize, Value)> = None;
+            for (si, st) in block.instructions.iter().enumerate().take(li) {
+                let Instruction::Store {
+                    val: Operand::Value(sv),
+                    ptr,
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                } = st
+                else {
+                    continue;
+                };
+                let Some(Instruction::Cast {
+                    src: Operand::Value(cast_src),
+                    from_ty: IrType::I128,
+                    to_ty: IrType::I64,
+                    ..
+                }) = unique_def(func, *sv)
+                else {
+                    continue;
+                };
+                let Some(delta) = offset_from(func, *ptr, *p) else {
+                    continue;
+                };
+                if delta == load_off {
+                    // Low half: the cast reads the carrier directly.
+                    if !multi_def.contains(&cast_src.0) {
+                        lo = Some((si, *cast_src));
+                    }
+                } else if delta == load_off + 8 {
+                    // High half: the cast reads `lshr %x, 64`.
+                    if let Some(Instruction::BinOp {
+                        op: IrBinOp::LShr,
+                        lhs: Operand::Value(shift_src),
+                        rhs,
+                        ty: IrType::I128,
+                        ..
+                    }) = unique_def(func, *cast_src)
+                    {
+                        if is_cst(rhs, 64) && !multi_def.contains(&shift_src.0) {
+                            hi = Some((si, *shift_src));
+                        }
+                    }
+                }
+            }
+            let (Some((lo_i, lo_x)), Some((hi_i, hi_x))) = (lo, hi) else {
+                continue;
+            };
+            if lo_x != hi_x {
+                continue;
+            }
+            // The carrier must be a call return that ALREADY lives in an
+            // XMM register (`ret_is_vector128`: SysV classes [Sse, SseUp]).
+            // That is the whole safety argument for the substitution — the
+            // reload's users receive the bit-identical value in the same
+            // register file.  An [Integer, Integer] I128 (e.g. `__int128`
+            // punned to a vector through a union) reaches this pass as a
+            // single un-split `Store I128` today and so never matches, but
+            // that is an accident of lowering, not a guarantee; encode the
+            // requirement instead of inheriting it.
+            let carrier_in_xmm = matches!(
+                unique_def(func, lo_x),
+                Some(
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
+                ) if info.ret_is_vector128
+            );
+            if !carrier_in_xmm {
+                continue;
+            }
+
+            // Nothing between the first matched store and the load may move
+            // memory, the matched stores themselves excepted.
+            let first = lo_i.min(hi_i);
+            for (mi, mid) in block.instructions.iter().enumerate().take(li).skip(first) {
+                if mi == lo_i || mi == hi_i {
+                    continue;
+                }
+                if memory_motion_barrier(mid) {
+                    continue 'load;
+                }
+            }
+            return Some((*v, lo_x));
+        }
+    }
+    None
 }
 
 fn find_one(func: &IrFunction, facts: &ModuleSymbolFacts) -> Option<Candidate> {
@@ -1308,5 +1627,200 @@ mod tests {
         *high_cast = cast(13, 12, IrType::U32, IrType::I128);
         let mut f = func_with(insts);
         assert_eq!(run(&mut f), 0);
+    }
+
+    // ── Carrier reload collapse ─────────────────────────────────────────────
+    //
+    // The post-call shape of `return f()` for a 16-byte vector aggregate:
+    // the I128 carrier is split into two 64-bit stores and immediately
+    // reassembled by a `VecLoadI64x2` of the same staging slot.  The
+    // collapse forwards the carrier to the load's users and then retires
+    // the now-unreadable staging stores.
+
+    fn vecload(dest: u32, ptr: u32, off: i64) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
+            dest_ptr: None,
+            args: vec![
+                Operand::Value(Value(ptr)),
+                Operand::Const(IrConst::I64(off)),
+            ],
+        }
+    }
+
+    /// A call returning a 16-byte vector through the I128 carrier:
+    /// SysV classes [Sse, SseUp], i.e. the value arrives in %xmm0.
+    fn vec128_call(dest: u32, arg: u32) -> Instruction {
+        Instruction::Call {
+            func: "mk4".to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: Some(Value(dest)),
+                args: vec![Operand::Value(Value(arg))],
+                arg_types: vec![IrType::Ptr],
+                num_fixed_args: 1,
+                return_type: IrType::I128,
+                ret_is_vector128: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// carrier %5 (I128 vector128 call return), staging alloca %6,
+    /// reload %11; `Return %11`.
+    fn carrier_split(insts_before_load: &mut Vec<Instruction>) -> IrFunction {
+        let mut insts = vec![
+            param_ref(2, 0),
+            vec128_call(5, 2),
+            alloca(6, 16),
+            cast(7, 5, IrType::I128, IrType::I64),
+            store(7, 6),
+            bin(
+                IrBinOp::LShr,
+                8,
+                5,
+                Operand::Const(IrConst::I64(64)),
+                IrType::I128,
+            ),
+            cast(9, 8, IrType::I128, IrType::I64),
+            gep(10, 6, 8),
+            store(9, 10),
+        ];
+        insts.append(insts_before_load);
+        insts.push(vecload(11, 6, 0));
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(11))));
+        f
+    }
+
+    #[test]
+    fn a_carrier_split_reload_collapses_to_the_carrier() {
+        let mut f = carrier_split(&mut Vec::new());
+        assert_eq!(run(&mut f), 1, "the collapse must be counted");
+        let insts = &f.blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
+                    ..
+                }
+            )),
+            "the reload must be gone"
+        );
+        assert!(
+            matches!(
+                f.blocks[0].terminator,
+                Terminator::Return(Some(Operand::Value(Value(5))))
+            ),
+            "the return must read the carrier directly: {:?}",
+            f.blocks[0].terminator
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Instruction::Store { .. })),
+            "the staging stores are unreadable and must be purged: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_prefill_of_the_staging_home_is_purged_with_the_split() {
+        // `__m128i v = _mm_setzero_si128(); v = f(p); return v;` leaves an
+        // extra constant store into the same home before the split.
+        let mut f = carrier_split(&mut Vec::new());
+        f.blocks[0].instructions.insert(3, store_const(6));
+        assert_eq!(run(&mut f), 1);
+        assert!(
+            !f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Store { .. })),
+            "the zero prefill writes a slot nobody reads any more"
+        );
+    }
+
+    #[test]
+    fn a_memory_barrier_between_split_and_reload_declines() {
+        // A store through an unrelated pointer may alias the staging home's
+        // observers; the window scan must refuse to forward across it.
+        let mut f = carrier_split(&mut vec![store_const(2)]);
+        assert_eq!(run(&mut f), 0);
+        assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Intrinsic {
+                op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn halves_of_two_different_carriers_decline() {
+        let mut f = carrier_split(&mut Vec::new());
+        // Retarget the high half's shift onto a second carrier %25.
+        f.blocks[0].instructions.insert(2, vec128_call(25, 2));
+        for inst in &mut f.blocks[0].instructions {
+            if let Instruction::BinOp {
+                dest: Value(8),
+                lhs,
+                ..
+            } = inst
+            {
+                *lhs = Operand::Value(Value(25));
+            }
+        }
+        assert_eq!(run(&mut f), 0);
+    }
+
+    #[test]
+    fn a_carrier_that_is_not_a_vector128_call_return_declines() {
+        // An [Integer, Integer] I128 — `__int128` punned to a vector — must
+        // not be forwarded into vector users: the value lives in a GP pair,
+        // not an XMM, and the substitution's safety argument does not hold.
+        let mut f = carrier_split(&mut Vec::new());
+        for inst in &mut f.blocks[0].instructions {
+            if let Instruction::Call { info, .. } = inst {
+                info.ret_is_vector128 = false;
+            }
+        }
+        assert_eq!(run(&mut f), 0, "GP-pair carriers must fail closed");
+
+        // Same for a carrier that is not a call return at all.
+        let mut g = carrier_split(&mut Vec::new());
+        g.blocks[0].instructions[1] = cast(5, 2, IrType::U64, IrType::I128);
+        assert_eq!(run(&mut g), 0, "non-call carriers must fail closed");
+    }
+
+    #[test]
+    fn a_reload_at_the_wrong_offset_declines() {
+        let mut f = carrier_split(&mut Vec::new());
+        for inst in &mut f.blocks[0].instructions {
+            if let Instruction::Intrinsic { args, .. } = inst {
+                args[1] = Operand::Const(IrConst::I64(8));
+            }
+        }
+        assert_eq!(run(&mut f), 0);
+    }
+
+    #[test]
+    fn an_escaping_staging_home_keeps_its_stores() {
+        // The home's address is returned alongside: the stores stay even
+        // though the reload itself still collapses.
+        let mut f = carrier_split(&mut Vec::new());
+        f.blocks[0].instructions.push(store_ptr(6, 2));
+        assert_eq!(run(&mut f), 1, "the reload itself still collapses");
+        let stores = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Store {
+                        ty: IrType::I64,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(stores, 2, "an escaped home's stores must survive");
     }
 }

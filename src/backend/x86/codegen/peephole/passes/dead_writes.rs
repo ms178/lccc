@@ -38,12 +38,36 @@ fn is_register_operand(text: &str) -> bool {
     text.starts_with('%') && !text.contains('(')
 }
 
+/// True when `src` is a memory operand this pass may still delete: a plain
+/// `%rsp`-relative slot, bare base, displacement within the SysV red zone or
+/// above.  Stack memory at `%rsp - 128` and every address above it toward
+/// the stack base is mapped by construction (the red zone below the stack
+/// pointer, the frame and the callers' frames above it), so the load cannot
+/// fault and its only effect is the register write being retired.  Anything
+/// else — an indexed form, another base register, a lower displacement —
+/// keeps the conservative "loads may fault" rule below.
+fn nonfaulting_frame_source(src: &str) -> bool {
+    let Some(disp_txt) = src.strip_suffix("(%rsp)") else {
+        return false;
+    };
+    if disp_txt.contains('(') || disp_txt.contains('%') {
+        return false;
+    }
+    if disp_txt.is_empty() {
+        return true;
+    }
+    disp_txt.parse::<i64>().is_ok_and(|d| d >= -128)
+}
+
 /// True when `src` is safe to drop: a register, an immediate, or an address
 /// computation (`lea` never dereferences). A memory SOURCE is deliberately not
 /// accepted — deleting a load can remove a fault the program relied on
 /// (volatile / MMIO / a trapping access the surrounding code expects).
 fn droppable_source(op: &str, src: &str) -> bool {
     if op.starts_with("lea") {
+        return true;
+    }
+    if op.starts_with("mov") && nonfaulting_frame_source(src) {
         return true;
     }
     is_register_operand(src) || src.starts_with('$')
@@ -1609,6 +1633,56 @@ mod tests {
     // `shlq $2, %r13` and — through it — the `movl` that fed it.  Neither
     // instruction may survive, and the flags written by the `shlq` must not be
     // mistaken for live.
+
+    // ── Non-faulting frame sources ──────────────────────────────────────────
+    //
+    // A dead `mov` LOAD is droppable only when its address provably cannot
+    // fault: a plain `%rsp`-relative slot at or above the red-zone floor.
+    // Everything else keeps the conservative "loads may fault" refusal.
+
+    #[test]
+    fn frame_slot_sources_within_the_mapped_stack_are_droppable() {
+        assert!(super::nonfaulting_frame_source("(%rsp)"));
+        assert!(super::nonfaulting_frame_source("8(%rsp)"));
+        assert!(super::nonfaulting_frame_source("-128(%rsp)")); // red-zone floor
+        assert!(super::nonfaulting_frame_source("4096(%rsp)")); // caller frames
+    }
+
+    #[test]
+    fn faultable_or_indexed_sources_are_refused() {
+        assert!(!super::nonfaulting_frame_source("-129(%rsp)")); // below red zone
+        assert!(!super::nonfaulting_frame_source("8(%rbp)")); // not %rsp-anchored
+        assert!(!super::nonfaulting_frame_source("(%rsp,%rax)")); // indexed
+        assert!(!super::nonfaulting_frame_source("8(%rsp,%rax,4)"));
+        assert!(!super::nonfaulting_frame_source("(%rdi)"));
+        assert!(!super::nonfaulting_frame_source("glob(%rip)"));
+        assert!(!super::nonfaulting_frame_source("x(%rsp)")); // symbolic disp
+    }
+
+    #[test]
+    fn a_dead_reload_from_a_frame_slot_is_retired() {
+        use super::super::super::peephole_optimize;
+        // `%r10` is never read again: the reload's only effect is the
+        // register write, and the address cannot fault.
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    movq 8(%rsp), %r10\n    movl $7, %eax\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(!out.contains("movq 8(%rsp), %r10"), "{out}");
+        assert!(out.contains("movl $7, %eax"), "{out}");
+    }
+
+    #[test]
+    fn a_dead_load_through_a_pointer_register_survives() {
+        use super::super::super::peephole_optimize;
+        // Same liveness, but the address is an arbitrary pointer: dropping
+        // it would delete the fault the program may rely on.
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    movq (%rdi), %r10\n    movl $7, %eax\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(out.contains("movq (%rdi), %r10"), "{out}");
+    }
 
     #[test]
     fn dead_shift_and_feeding_move_are_retired() {
