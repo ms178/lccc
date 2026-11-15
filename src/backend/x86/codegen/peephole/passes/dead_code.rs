@@ -2289,6 +2289,43 @@ mod tests {
         infos[idx].is_nop()
     }
 
+    /// The hidden `%ymm` return-buffer / argument-home store of a vector
+    /// round-trip caller (`v8 f(v8 a){ return ext8(a); }`): once the paired
+    /// reload is forwarded away, the 32-byte store is never read and must
+    /// be deleted — before `MoveSize::QQ`, the line classified `Other` and
+    /// registered a conservative READ of its own slot, pinning itself.
+    #[test]
+    fn dse_removes_never_read_ymm_store() {
+        let asm = "f:\n\
+.cfi_startproc\n\
+    subq $136, %rsp\n\
+    vmovdqu %ymm0, 96(%rsp)\n\
+    call ext8@PLT\n\
+    addq $136, %rsp\n\
+    ret\n\
+.cfi_endproc\n";
+        assert!(dse_removed(asm, "vmovdqu %ymm0, 96(%rsp)"));
+        // Mutation 1: a 32-byte reload of the slot is a read — kept.
+        let read = asm.replace(
+            "call ext8@PLT\n",
+            "call ext8@PLT\n    vmovdqu 96(%rsp), %ymm1\n",
+        );
+        assert!(!dse_removed(&read, "vmovdqu %ymm0, 96(%rsp)"));
+        // Mutation 2: a SCALAR read inside the upper half of the 32-byte
+        // range observes the store — byte-range, not point, semantics.
+        let tail = asm.replace(
+            "call ext8@PLT\n",
+            "call ext8@PLT\n    movq 120(%rsp), %rax\n",
+        );
+        assert!(!dse_removed(&tail, "vmovdqu %ymm0, 96(%rsp)"));
+        // Mutation 3: a frame-address escape bails the whole function.
+        let escape = asm.replace(
+            "call ext8@PLT\n",
+            "leaq 96(%rsp), %rdi\n    call ext8@PLT\n",
+        );
+        assert!(!dse_removed(&escape, "vmovdqu %ymm0, 96(%rsp)"));
+    }
+
     /// A `24(%rsp)` read inside a 16-byte push window (delta +16) addresses
     /// the same slot as the canonical `8(%rsp)` store: the store must be
     /// kept, while an unrelated never-read vector store is still removed.

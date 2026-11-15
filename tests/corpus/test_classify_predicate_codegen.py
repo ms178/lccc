@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Pin the multi-range byte-classifier codegen and its measured ceiling.
 
-`k_classify.c` and `k_namechars.c` are the widest remaining runtime gap against
-GCC 16.2 (0.19x / 0.25x at `-O3`; see
-`engineering/BENCH-2026-11-11-BN-MUL128-CLOSURE.md`). The cause is measured,
-not guessed: the `a||b||c||d||e||f` predicate lowers to a partially
-if-converted loop -- `orl` of the two letter-range `setcc` results, then a
-data-dependent `je`, with the digit/equality half as a `Select` chain -- and
-the loop vectorizer bails on the residual branch. The same predicate written
-branchlessly runs 5.2x faster and reaches parity with GCC's own best arm.
+`k_classify.c` and `k_namechars.c` were the widest runtime gap against
+GCC 16.2 (0.19x / 0.25x at `-O3`) until the chain-aware flattening landed
+(PR #1185; see the 2026-11-13 update in
+`engineering/BENCH-2026-11-11-BN-MUL128-CLOSURE.md` — now 1.17x / 3.59x).
+The original cause was measured, not guessed: the `a||b||c||d||e||f`
+predicate lowered to a partially if-converted loop -- `orl` of the two
+letter-range `setcc` results, then a data-dependent `je`, with the
+digit/equality half as a `Select` chain -- and the loop vectorizer bailed on
+the residual branch, while the same predicate written branchlessly ran 5.2x
+faster.
 
-This module does not pretend to fix that; it makes the state of the art
-checkable so the fix has a target and the winning path cannot rot silently:
+This module keeps that state of the art checkable so the winning path cannot
+rot silently:
 
 1. **Correctness, both forms, every compiler.** The branchy and the branchless
    predicate must agree with GCC/Clang on every byte 0..255, at `-O0` and
@@ -20,10 +22,10 @@ checkable so the fix has a target and the winning path cannot rot silently:
    vectorized by LCCC (packed byte compares, no scalar setcc chain). If a
    future change closes that path, the ceiling this document measures becomes
    unreachable, and the test says so instead of leaving it to a benchmark run.
-3. **The branchy form stays scalar, and that is recorded as a ratchet.** The
-   expectation is currently "not vectorized"; when the chain-aware flattening
-   lands, flip this expectation deliberately, with the benchmark number that
-   justified it.
+3. **The branchy form stays vectorized.** The original ratchet asserted "not
+   vectorized" and instructed its own flip when the chain flattening landed;
+   that flip happened with the 2026-11-13 measurement, and the assertion now
+   guards the landed path against regression.
 """
 
 from __future__ import annotations
@@ -174,18 +176,25 @@ class ClassifierPredicateContract(unittest.TestCase):
                 f"vector reload count grew to {reloads} (was 18)",
             )
 
-    def test_branchy_classifier_is_not_vectorized(self) -> None:
-        """Ratchet on the measured gap: flip this when the chain flattening lands.
+    def test_branchy_classifier_is_vectorized(self) -> None:
+        """The flipped ratchet: the chain flattening landed (PR #1185).
 
-        Until then, asserting the scalar form keeps the finding honest: the
-        benchmark difference is a vectorization difference, not a peephole
-        difference, so a "faster" branchy loop would mean something changed
-        that the benchmark document must be updated to describe.
+        `if_convert`'s `body_becomes_branch_free()` now simulates the later
+        combine rounds and `vectorize_byte_count_normalize` flattens the
+        residual pure value triangles, so the branchy `a||b||...` predicate
+        reaches the same packed byte-compare reduction as the branchless
+        rewrite. Re-measured per the original ratchet's instruction
+        (driver 2000, best of 5, checksums equal to GCC in every arm):
+        classify 1.17x GCC 16.2 at -O3 (was 0.19x), namechars 3.59x (was
+        0.25x); see the 2026-11-13 update in
+        engineering/BENCH-2026-11-11-BN-MUL128-CLOSURE.md. If this assertion
+        fires, the flattening path regressed and the benchmark gap is back —
+        do not weaken it without a new measurement in that document.
         """
         source = BENCH / "k_classify.c"
         if not source.is_file():
             self.skipTest("k_classify.c not present")
-        with tempfile.TemporaryDirectory(prefix="classify-scalar-") as td:
+        with tempfile.TemporaryDirectory(prefix="classify-packed-") as td:
             asm = Path(td) / "classify.s"
             proc = subprocess.run(
                 [str(LCCC), "-O3", "-S", "-o", str(asm), str(source), "-I", str(BENCH)],
@@ -193,13 +202,19 @@ class ClassifierPredicateContract(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             text = asm.read_text()
-            self.assertNotIn(
+            self.assertIn(
                 "pcmpgtb", text,
-                "the branchy classifier became vectorized: the chain flattening "
-                "landed or the if-conversion changed. Re-measure "
-                "k_classify/k_namechars and update "
-                "engineering/BENCH-2026-11-11-BN-MUL128-CLOSURE.md, then flip "
-                "this assertion.",
+                "the branchy classifier is no longer vectorized: the chain "
+                "flattening (if_convert combine simulation + "
+                "vectorize_byte_count_normalize triangle flatten) regressed. "
+                "Re-measure k_classify/k_namechars against "
+                "engineering/BENCH-2026-11-11-BN-MUL128-CLOSURE.md before "
+                "touching this assertion.",
+            )
+            self.assertIn(
+                "psadbw", text,
+                "packed compares exist but the counting reduction no longer "
+                "reaches the psadbw accumulator",
             )
 
     def test_disable_switches_do_not_change_the_result(self) -> None:

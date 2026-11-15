@@ -65,6 +65,7 @@ WANT_LITERAL=$(sort -k2 <<'EOF'
 1 slp_late
 2 sret_copy_elision
 1 vec_interleave_late
+1 vecabialign
 1 vecaddr
 1 veccopychain
 1 vecfma

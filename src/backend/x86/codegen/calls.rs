@@ -2031,6 +2031,81 @@ impl X86Codegen {
         }
     }
 
+    /// The x86-64 answer to `call_arg_realignment_pins_frame`: a call site
+    /// pins `%rbp` exactly when its emission realigns `%rsp`, i.e. when a
+    /// MEMORY-class STACK argument has natural alignment > 16 (the
+    /// `dyn_align` arm of `emit_call_stack_args_impl`). A register-passed
+    /// over-aligned vector (`__m256`/`__m512` in `%ymm`/`%zmm`,
+    /// `CallArgClass::StructXmmReg`) never touches the outgoing stack area
+    /// and must not cost the whole function its %rsp-only frame.
+    ///
+    /// Mirrors `emit_call`'s classification exactly — same config, same
+    /// hidden vector/FP-aggregate return-buffer skip, same variadic
+    /// wide-vector demotion — so the frame decision and the emission can
+    /// never disagree (the emission's `debug_assert!(dyn_align_a <= 16 ||
+    /// !use_rsp_addressing)` is the tripwire). Any shape outside that
+    /// model keeps the conservative answer (pin the frame pointer).
+    pub(super) fn call_arg_realignment_pins_frame_impl(&self, info: &CallInfo) -> bool {
+        use crate::backend::call_abi::{
+            classify_call_args, hidden_fp_agg_return, hidden_vector_return_bytes,
+            max_stack_arg_alignment,
+        };
+        if !info.struct_arg_aligns.iter().any(|a| a.unwrap_or(0) > 16) {
+            return false;
+        }
+        // i686-style conventions never reach the x86-64 SysV realign path
+        // through this backend's model: fail closed.
+        if info.is_fastcall || info.regparm.is_some() {
+            return true;
+        }
+        // psABI §3.2.3: an UNNAMED `__m256`/`__m512` argument of a variadic
+        // call is demoted to MEMORY (see `emit_call`) and lands in a 32- or
+        // 64-byte aligned stack slot — exactly the realignment case.
+        let wide_vector = |classes: &[crate::common::types::EightbyteClass]| {
+            crate::common::sysv_classify::vector_reg_bytes_of(classes).is_some_and(|b| b > 16)
+        };
+        if info.is_variadic
+            && info
+                .struct_arg_classes
+                .iter()
+                .skip(info.num_fixed_args)
+                .any(|c| wide_vector(c))
+        {
+            return true;
+        }
+        // The hidden `%ymm0`/`%zmm0` (or FP-aggregate) return buffer takes
+        // no argument register: skip it before classifying, as the
+        // emission does.
+        let vector_return_bytes =
+            hidden_vector_return_bytes(info.is_sret, &info.ret_eightbyte_classes)
+                .filter(|_| !info.args.is_empty());
+        let fp_agg_return = hidden_fp_agg_return(
+            info.is_sret,
+            info.struct_arg_fp_agg_classes.first().copied().flatten(),
+        )
+        .filter(|_| !info.args.is_empty() && vector_return_bytes.is_none());
+        let skip = usize::from(vector_return_bytes.is_some() || fp_agg_return.is_some());
+        let mut config = self.call_abi_config_impl();
+        config.microsoft_x64 =
+            info.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
+        let classes = classify_call_args(
+            &info.args[skip..],
+            info.arg_types.get(skip..).unwrap_or(&[]),
+            info.struct_arg_sizes.get(skip..).unwrap_or(&[]),
+            info.struct_arg_aligns.get(skip..).unwrap_or(&[]),
+            info.struct_arg_classes.get(skip..).unwrap_or(&[]),
+            info.struct_arg_fp_agg_classes.get(skip..).unwrap_or(&[]),
+            info.struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
+            info.is_variadic
+                .then(|| info.num_fixed_args.saturating_sub(skip)),
+            &config,
+        );
+        if classes.len() + skip != info.args.len() {
+            return true; // classification surprise: fail closed, keep %rbp
+        }
+        max_stack_arg_alignment(&classes, info.struct_arg_aligns.get(skip..).unwrap_or(&[])) > 16
+    }
+
     pub(super) fn arm_sibcall_candidate_impl(&mut self, info: &CallInfo) {
         // One conversion in flight at a time; the driver arms at most one
         // site per block and `emit_return_impl` consumes it before the
