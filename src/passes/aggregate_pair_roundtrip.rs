@@ -381,7 +381,67 @@ pub(crate) fn run_with_symbol_facts(
     // purge is idempotent and fully proof-gated, so running it when there
     // is nothing to do costs one scan and changes nothing.
     purge_unread_local_stores(func);
+    sink_second_return_sets(func);
     total + collapsed
+}
+
+/// Move every `SetReturn*Second` to immediately before its block's
+/// `Return`.
+///
+/// `SetReturn*Second` pins the second return register (`%xmm1` for the
+/// two-eightbyte `[Sse, Sse]` shapes) from its emission point to the
+/// `ret`, but the lane-extract and staging emitters treat `%xmm1` as free
+/// scratch — any instruction the rewrites above leave inside that window
+/// silently destroys the high half of the return value (caught by the
+/// SysV ABI differential on `struct { v2f; v2i }`: the lane-0 extract's
+/// `movdqu %xmm0, %xmm1` staging overwrote the just-placed high
+/// eightbyte).  The only observer of the pinned register is the `Return`
+/// itself, so sinking the set to the terminator is semantically free and
+/// collapses the hazard window to zero instructions.  Call-like
+/// instructions and `GetReturn*Second` never sit between a correct set
+/// and its return (they clobber/read the same registers), so crossing
+/// them is refused — fail closed, keep the original position.
+fn sink_second_return_sets(func: &mut IrFunction) {
+    for block in &mut func.blocks {
+        if !matches!(block.terminator, Terminator::Return(_)) {
+            continue;
+        }
+        let n = block.instructions.len();
+        let Some(si) = block.instructions.iter().position(|i| {
+            matches!(
+                i,
+                Instruction::SetReturnF64Second { .. }
+                    | Instruction::SetReturnF32Second { .. }
+                    | Instruction::SetReturnF128Second { .. }
+            )
+        }) else {
+            continue;
+        };
+        if si + 1 == n {
+            continue; // already adjacent to the terminator
+        }
+        let blocked = block.instructions[si + 1..].iter().any(|i| {
+            matches!(
+                i,
+                Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::InlineAsm { .. }
+                    | Instruction::GetReturnF64Second { .. }
+                    | Instruction::GetReturnF32Second { .. }
+                    | Instruction::GetReturnF128Second { .. }
+                    | Instruction::SetReturnF64Second { .. }
+                    | Instruction::SetReturnF32Second { .. }
+                    | Instruction::SetReturnF128Second { .. }
+            )
+        });
+        if blocked {
+            continue;
+        }
+        let span = block.span_at(si);
+        let set = block.remove_inst(si);
+        let end = block.instructions.len();
+        block.insert_inst(end, set, span);
+    }
 }
 
 /// Delete every store to a stack object that is provably never read and
@@ -3726,6 +3786,89 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, Instruction::Load { .. })),
             "no extract may be minted without backend support: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn second_return_sets_sink_to_the_terminator() {
+        // The SysV `[Sse, Sse]` provider shape: a staging slot is stored,
+        // the high eightbyte is extracted and pinned into %xmm1
+        // (`SetReturnF64Second`), and the LOW eightbyte's load sits after
+        // the pin.  The lane forward turns that load into an extract whose
+        // emitter stages through %xmm1 — which destroyed the pinned high
+        // half (caught by check_sysv_aggregate_abi on `struct{v2f;v2i}`).
+        // After the pass, every instruction between the set and the
+        // `Return` must be gone: the set is the LAST instruction.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            vecload(4, 2, 0),
+            vecstore_i64(4, 30, 0),
+            gep(31, 30, 8),
+            Instruction::Load {
+                dest: Value(10),
+                ptr: Value(31),
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::SetReturnF64Second {
+                src: Operand::Value(Value(10)),
+            },
+            Instruction::Load {
+                dest: Value(11),
+                ptr: Value(30),
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(11))));
+        assert!(run(&mut f) >= 1, "the lane forwards must fire");
+        let insts = &f.blocks[0].instructions;
+        assert!(
+            matches!(insts.last(), Some(Instruction::SetReturnF64Second { .. })),
+            "the second-return set must be the last instruction: {insts:?}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Instruction::Load { .. })),
+            "both lane loads forward to extracts: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_return_set_does_not_cross_a_call() {
+        // A call between the set and the return would clobber %xmm1
+        // regardless of placement — the sink must refuse to cross it and
+        // keep the original position (fail closed).
+        let insts = vec![
+            param_ref(2, 0),
+            Instruction::SetReturnF64Second {
+                src: Operand::Value(Value(2)),
+            },
+            Instruction::Call {
+                func: "ext".to_string(),
+                info: crate::ir::reexports::CallInfo {
+                    dest: None,
+                    args: Vec::new(),
+                    arg_types: Vec::new(),
+                    num_fixed_args: 0,
+                    return_type: IrType::Void,
+                    ..Default::default()
+                },
+            },
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(None);
+        run(&mut f);
+        assert!(
+            matches!(
+                f.blocks[0].instructions.get(1),
+                Some(Instruction::SetReturnF64Second { .. })
+            ),
+            "the set must not move past a call: {:?}",
             f.blocks[0].instructions
         );
     }

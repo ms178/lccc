@@ -12183,7 +12183,149 @@ fn drop_return_only_vector_results(func: &IrFunction, set: &mut FxHashSet<u32>) 
             return_used.insert(v.0);
         }
     }
-    set.retain(|v| inst_used.contains(v) || !return_used.contains(v));
+    // A return-only result is only a LOSS when its home must be COMMITTED
+    // with a copy: the producer writes a scratch, `movdqa scratch, home`,
+    // and the return reads the home back out — h3's two dead `movdqa`s
+    // around a call.  When the destructive handoff can recycle a dying
+    // operand's register into the result instead, the home is produced in
+    // place and the function matches GCC exactly (`vfmadd132ps …, %xmm0;
+    // ret` — the RH-01 ceilings): those results must KEEP their homes.
+    // The handoff needs an operand that is
+    //   (a) itself a homed candidate (same `set`),
+    //   (b) single-def and dead after the producer (its register is free
+    //       to be recycled), and
+    //   (c) not severed from the producer by a call-like instruction —
+    //       the caller-saved XMM pool cannot carry a value across one, so
+    //       the per-segment veto would strip the operand's home and with
+    //       it the handoff.  This is exactly what separates the two CI
+    //       shapes: `return a*b+c` (no call, keep) from
+    //       `return _mm_add_epi32(f(p), w)` (operand defined before the
+    //       call, consumed after — drop, the result rides %xmm0).
+    // Same-block only: every shape this gate serves is straight-line, and
+    // a cross-block def is opaque here (fail toward dropping, the h3-safe
+    // side).
+    //
+    // One pass builds the def/use geometry; each candidate check is then
+    // a bounded scan of its producer block.
+    let mut def_at: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    let mut multi_def: FxHashSet<u32> = FxHashSet::default();
+    let mut use_blocks: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    let mut term_used: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(d) = inst.dest() {
+                if def_at.insert(d.0, (bi, ii)).is_some() {
+                    multi_def.insert(d.0);
+                }
+            }
+            if let Instruction::InlineAsm { outputs, .. } = inst {
+                for (_, v, _) in outputs {
+                    if def_at.insert(v.0, (bi, ii)).is_some() {
+                        multi_def.insert(v.0);
+                    }
+                }
+            }
+            let mut record = |v: u32| use_blocks.entry(v).or_default().push(bi);
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    record(v.0);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                record(v.0);
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                term_used.insert(v.0);
+            }
+        });
+    }
+    let keep_for_handoff = |v: u32| -> bool {
+        let Some(&(bi, pi)) = def_at.get(&v) else {
+            return false;
+        };
+        if multi_def.contains(&v) {
+            return false;
+        }
+        let block = &func.blocks[bi];
+        let mut operand_ids: Vec<u32> = Vec::new();
+        for_each_operand_in_instruction(&block.instructions[pi], |op| {
+            if let Operand::Value(o) = op {
+                operand_ids.push(o.0);
+            }
+        });
+        'cand: for o in operand_ids {
+            if o == v || !set.contains(&o) || multi_def.contains(&o) || term_used.contains(&o) {
+                continue;
+            }
+            // (a) same-block def above the producer.
+            let Some(&(obi, di)) = def_at.get(&o) else {
+                continue;
+            };
+            if obi != bi || di >= pi {
+                continue;
+            }
+            // (c) no call-like instruction between def and producer.
+            if block.instructions[di + 1..pi].iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::Call { .. }
+                        | Instruction::CallIndirect { .. }
+                        | Instruction::InlineAsm { .. }
+                )
+            }) {
+                continue;
+            }
+            // (b) dead after the producer: every instruction use sits in
+            // the producer's block (cross-block uses fail closed) …
+            if use_blocks
+                .get(&o)
+                .is_some_and(|bs| bs.iter().any(|&b| b != bi))
+            {
+                continue;
+            }
+            // … and nothing in this block reads it after the producer.
+            for later in &block.instructions[pi + 1..] {
+                let mut used = false;
+                for_each_operand_in_instruction(later, |op| {
+                    if matches!(op, Operand::Value(x) if x.0 == o) {
+                        used = true;
+                    }
+                });
+                for_each_value_use_in_instruction(later, |x| {
+                    if x.0 == o {
+                        used = true;
+                    }
+                });
+                if used {
+                    continue 'cand;
+                }
+            }
+            return true;
+        }
+        false
+    };
+    // A MULTI-DEF returned value is a phi web (`c ? a+b : a-b` merges each
+    // arm through a `Copy` into the same id): its home IS the cross-block
+    // transport — every arm materialises into the home register and the
+    // return reads it once.  Dropping it forces each arm into a slot store
+    // plus an exit reload (observed: 13 instructions against the 9-ceiling
+    // conditional shapes).  Only straight-line single-def results can ride
+    // the accumulator to the return, so only those are droppable.
+    let doomed: Vec<u32> = set
+        .iter()
+        .copied()
+        .filter(|v| {
+            !inst_used.contains(v)
+                && return_used.contains(v)
+                && !multi_def.contains(v)
+                && !keep_for_handoff(*v)
+        })
+        .collect();
+    for v in doomed {
+        set.remove(&v);
+    }
 }
 
 /// 128/256-bit vector SSA values for the AArch64 NEON pool (40..47 → v16..v23).
@@ -18232,14 +18374,12 @@ mod map_collector_tests {
     }
 
     #[test]
-    fn return_only_results_are_not_homed() {
-        // `return min(a, a);` — the packed result's ONLY consumer is the
-        // Return terminator.  The return path can legally read a home (one
-        // move), but homing a return-only value always nets a loss: one
-        // committed copy into the home plus one copy back out at the
-        // return, against the unhomed form whose result simply stays in
-        // %xmm0/%ymm0 for the return to consume in place (measured as
-        // three extra instructions on `return _mm_add_epi32(f(p), w);`).
+    fn return_only_results_with_a_dying_operand_keep_their_home() {
+        // `return min(a, a);` — the result's ONLY consumer is the Return,
+        // but its operand is a homed candidate that DIES at the producer
+        // with no call in between: the destructive handoff produces the
+        // result in place (the RH-01 `vfmadd132ps …; ret` ceilings), so
+        // the home is kept.
         let f = func(
             vec![
                 intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
@@ -18254,8 +18394,47 @@ mod map_collector_tests {
         let set = collect_x86_map_intermediate_values(&f);
         assert!(set.contains(&1), "load admitted: {set:?}");
         assert!(
+            set.contains(&2),
+            "a handoff-eligible return-only result keeps its home: {set:?}"
+        );
+    }
+
+    #[test]
+    fn call_severed_return_only_results_are_not_homed() {
+        // `return min(a, a)` where the operand's def is separated from the
+        // producer by a call: the caller-saved pool cannot carry the
+        // operand across it, no handoff is possible, and homing the
+        // return-only result would buy two dead `movdqa`s around the call
+        // (the h3 shape, measured as three extra instructions on
+        // `return _mm_add_epi32(f(p), w);`).  The result must stay
+        // unhomed and ride %xmm0/%ymm0 to the return.
+        let call = Instruction::Call {
+            func: "ext".to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: None,
+                args: Vec::new(),
+                arg_types: Vec::new(),
+                num_fixed_args: 0,
+                return_type: crate::common::types::IrType::Void,
+                ..Default::default()
+            },
+        };
+        let f = func(
+            vec![
+                intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
+                call,
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        );
+        let set = collect_x86_map_intermediate_values(&f);
+        assert!(
             !set.contains(&2),
-            "a return-only result must not pay for a home: {set:?}"
+            "a call-severed return-only result must not pay for a home: {set:?}"
         );
     }
 
