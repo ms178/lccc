@@ -4980,6 +4980,78 @@
       "arities": [
         1
       ],
+      "canonical_override": false,
+      "definitions": 2,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_broadcast_pd",
+      "raw_builtins": [
+        "__builtin_ia32_vbroadcasti128"
+      ],
+      "wrapper_dependencies": [
+        "_mm_loadu_pd"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 2,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_broadcast_ps",
+      "raw_builtins": [
+        "__builtin_ia32_vbroadcasti128"
+      ],
+      "wrapper_dependencies": [
+        "_mm_loadu_ps"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 2,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_broadcast_sd",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set1_pd"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 2,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_broadcast_ss",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set1_ps"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -5034,6 +5106,23 @@
       "header": "avxintrin.h",
       "name": "_mm256_castpd_si256",
       "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": true,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_castps128_ps256",
+      "raw_builtins": [
+        "__builtin_ia32_vbroadcasti128"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -15217,7 +15306,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 921,
+  "declarations": 926,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -15272,10 +15361,6 @@
     "_mm256_broadcast_i32x2",
     "_mm256_broadcast_i32x4",
     "_mm256_broadcast_i64x2",
-    "_mm256_broadcast_pd",
-    "_mm256_broadcast_ps",
-    "_mm256_broadcast_sd",
-    "_mm256_broadcast_ss",
     "_mm256_broadcastb_epi8",
     "_mm256_broadcastd_epi32",
     "_mm256_broadcastmb_epi64",
@@ -15292,7 +15377,6 @@
     "_mm256_castph_pd",
     "_mm256_castph_ps",
     "_mm256_castph_si256",
-    "_mm256_castps128_ps256",
     "_mm256_castps_ph",
     "_mm256_castsi256_ph",
     "_mm256_ceil_pd",
@@ -20516,5 +20600,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 921
+  "unique_names": 926
 }
