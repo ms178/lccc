@@ -4144,12 +4144,14 @@ impl X86Codegen {
             }
             IntrinsicOp::Zext128to256 => {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
-                    // Zero-extend 128→256: VEX insert of the 128-bit value into
-                    // a zeroed ymm. A lone vinserti128 $1 of the same xmm would
-                    // DUPLICATE the low lane into the high lane (miscompile).
+                    // Zero-extend 128→256. Any VEX-encoded 128-bit write zeroes
+                    // bits 255:128 of its destination YMM register, so the
+                    // zero-extension is one register move. This needs only AVX1.
+                    // The former vpxor %ymm1 + vinserti128 pair was AVX2-only, so
+                    // an AVX1 translation unit emitted instructions its target
+                    // cannot execute; it was also two uops where this is one.
                     self.sse_load_arg(&args[0], "xmm0");
-                    self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
-                    self.state.emit("    vinserti128 $0, %xmm0, %ymm1, %ymm0");
+                    self.state.emit("    vmovdqa %xmm0, %xmm0");
                     self.avx_store_dest(dptr);
                 }
             }

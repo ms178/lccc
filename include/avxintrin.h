@@ -261,6 +261,78 @@ _mm256_set_ps(float __f7, float __f6, float __f5, float __f4,
     return (__m256){  __f0, __f1, __f2, __f3, __f4, __f5, __f6, __f7  };
 }
 
+/* === Broadcast from memory (AVX1) ===
+ * Each returns every destination lane as the exact bits loaded from memory:
+ * a scalar source is broadcast to all lanes and a 128-bit source is repeated
+ * into both halves. Sources are read with unaligned loads, matching the Intel
+ * definition, which requires no alignment for them.
+ *
+ * The lowering is chosen by the enabled ISA, and AVX1-only code never reaches
+ * an AVX2 instruction:
+ *  - AVX2: the scalar forms are _mm256_set1_*, which lower to one
+ *    vbroadcastss/vbroadcastsd from memory (identical to GCC); the 128-bit
+ *    forms are __builtin_ia32_vbroadcasti128 on a register value, which lowers
+ *    to a register-only vinserti128 with no stack round trip.
+ *  - AVX1: plain vector operations (set1 and an 8-lane shuffle), correct on
+ *    any AVX CPU. They currently materialise through the stack; selecting
+ *    vbroadcastss/vbroadcastsd/vbroadcastf128 under AVX1 is an open codegen
+ *    item. */
+#ifdef __AVX2__
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_broadcast_ss(float const *__p)
+{
+    return _mm256_set1_ps(*__p);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_broadcast_sd(double const *__p)
+{
+    return _mm256_set1_pd(*__p);
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_broadcast_ps(__m128 const *__p)
+{
+    __m128 __x = _mm_loadu_ps((float const *)__p);
+    __m256i __r = __builtin_ia32_vbroadcasti128((__m128i)__x);
+    return (__m256)__r;
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_broadcast_pd(__m128d const *__p)
+{
+    __m128d __x = _mm_loadu_pd((double const *)__p);
+    __m256i __r = __builtin_ia32_vbroadcasti128((__m128i)__x);
+    return (__m256d)__r;
+}
+#else
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_broadcast_ss(float const *__p)
+{
+    return _mm256_set1_ps(*__p);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_broadcast_sd(double const *__p)
+{
+    return _mm256_set1_pd(*__p);
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_broadcast_ps(__m128 const *__p)
+{
+    __m128 __x = _mm_loadu_ps((float const *)__p);
+    return (__m256)__builtin_shufflevector(__x, __x, 0, 1, 2, 3, 0, 1, 2, 3);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_broadcast_pd(__m128d const *__p)
+{
+    __m128d __x = _mm_loadu_pd((double const *)__p);
+    return (__m256d)__builtin_shufflevector(__x, __x, 0, 1, 0, 1);
+}
+#endif
+
 /* === Cast 256->128 for pd === */
 
 /* Extract low 128 bits of __m256d as __m128d */
@@ -268,6 +340,19 @@ static __inline__ __m128d __attribute__((__always_inline__))
 _mm256_castpd256_pd128(__m256d __a)
 {
     return (__m128d){  __a[0], __a[1]  };
+}
+
+/* Widen __m128 to __m256 (upper 128 bits undefined per Intel; the low half is
+ * repeated into both halves so every lane is defined). */
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_castps128_ps256(__m128 __a)
+{
+#ifdef __AVX2__
+    __m256i __r = __builtin_ia32_vbroadcasti128((__m128i)__a);
+    return (__m256)__r;
+#else
+    return (__m256)__builtin_shufflevector(__a, __a, 0, 1, 2, 3, 0, 1, 2, 3);
+#endif
 }
 
 /* Zero-extend __m128d to __m256d (upper 128 bits undefined/zero) */

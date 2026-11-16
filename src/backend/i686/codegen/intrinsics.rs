@@ -2151,12 +2151,14 @@ impl I686Codegen {
                 }
             }
 
-            // Zero-extend 128 -> 256 (high lane zero, NOT a duplicate).
+            // Zero-extend 128 -> 256 (high lane zero, NOT a duplicate). A VEX
+            // 128-bit write zeroes bits 255:128 of its destination, so one VEX
+            // register move is the zero-extension and needs only AVX1 (the former
+            // vpxor + vinserti128 pair was AVX2-only).
             IntrinsicOp::Zext128to256 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_avx_load128(&args[0], "xmm0");
-                    self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
-                    self.state.emit("    vinserti128 $0, %xmm0, %ymm1, %ymm0");
+                    self.state.emit("    vmovdqa %xmm0, %xmm0");
                     self.emit_avx_store_dest(dptr);
                 } else if dest.is_some() {
                     self.reject_value_form(op);
