@@ -2731,19 +2731,39 @@ mod avx_fp_order_tests {
             ),
             "VecLoadF32x8 is a raw reader: the slot must be written first"
         );
-        // An op that writes through args carries its destination there, so
-        // nothing at this level can tell datum from destination. The whole
-        // family is refused rather than guessed at. (The emitter for the
-        // VecStore family IS pending-aware on all three of its paths, so this
-        // is deliberate conservatism costing a redundant store in rare cases,
-        // not a correctness requirement -- soundness must not depend on which
-        // arg position happens to be the destination.)
+        // `VecStoreF32x8` writes through args, so its datum and address both
+        // sit in `args`. Its emitter clears the deferral on every path where
+        // the datum is the pending value, so a pending DATUM is consumed.
         assert!(
-            !cg.pending_vec_store_consumed_by(
+            cg.pending_vec_store_consumed_by(
                 &IntrinsicOp::VecStoreF32x8,
                 &[Operand::Value(Value(0)), Operand::Value(Value(1))]
             ),
-            "ops writing through args are refused wholesale"
+            "a pending datum is consumed by its own whole-vector store"
+        );
+        // A pending ADDRESS is not consumed: the store must flush first.
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::VecStoreF32x8,
+                &[Operand::Value(Value(1)), Operand::Value(Value(0))]
+            ),
+            "a pending address is refused"
+        );
+        // Pending in both positions: refused, the conservative flush stays.
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::VecStoreF32x8,
+                &[Operand::Value(Value(0)), Operand::Value(Value(0))]
+            ),
+            "a value in both datum and address position is refused"
+        );
+        // The 128-bit store is outside this rule and stays refused.
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::VecStoreF32x4,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))]
+            ),
+            "VecStoreF32x4 keeps the conservative flush"
         );
         // No pending store at all: not a consumer.
         cg.state.pending_vec_store = None;

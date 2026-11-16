@@ -53,6 +53,40 @@ def check_shape(asm_lines):
     return None
 
 
+# A 256-bit store that writes a vector to memory, in any of the spellings the
+# backend emits: the source is a %ymm register and the destination is memory.
+YMM_STORE = re.compile(r"^\s*v(?:movups|movdqu|movdqa|movaps|movapd)\s+%ymm\d+,\s*-?\d*\(%[a-z0-9]+\)\s*$")
+CALL = re.compile(r"^\s*call[lq]?\s")
+
+
+def check_blend_publish(asm_lines):
+    """(1b) PUBLISH: a blend result is stored exactly once before the next call.
+
+    The blend result is the new `input[0]`, and the callee reads it through
+    memory, so one store that publishes it is required.  Any second vector
+    store before the call is a copy of a value nothing reads: the frame home
+    of the blend result, flushed because the publishing store was refused as
+    its consumer.  Measured on avx_fp_private: the pre-fix loop stored the
+    blend result to 751(%rsp) and then to input[0] before the call.
+    """
+    blends = [i for i, l in enumerate(asm_lines) if BLEND0.search(l)]
+    if not blends:
+        return "no blend into %ymm0 in the output: the check would be vacuous"
+    for b in blends:
+        stores = []
+        for k in range(b + 1, min(len(asm_lines), b + 24)):
+            if CALL.search(asm_lines[k]):
+                break
+            if YMM_STORE.search(asm_lines[k]):
+                stores.append(k)
+        if len(stores) != 1:
+            where = ", ".join(str(k + 1) for k in stores) or "none"
+            return (f"blend at line {b + 1} is followed by {len(stores)} vector stores "
+                    f"before the call (lines {where}); exactly one (the publishing store) "
+                    f"is required")
+    return None
+
+
 def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180, **kw)
 
@@ -68,7 +102,8 @@ def main():
     a = ap.parse_args()
     if a.shape_only:
         with open(a.shape_only) as f:
-            msg = check_shape(f.read().splitlines())
+            lines = f.read().splitlines()
+        msg = check_shape(lines) or check_blend_publish(lines)
         if a.expect_defect:
             if msg is None:
                 print("FAIL: expected the stack round trip to be detected, but the shape passed",
@@ -91,11 +126,17 @@ def main():
             failures.append(f"(1) compile failed: {r.stderr.decode(errors='replace')}")
         else:
             with open(asm) as f:
-                msg = check_shape(f.read().splitlines())
+                lines = f.read().splitlines()
+            msg = check_shape(lines)
             if msg:
                 failures.append(f"(1) SHAPE: {msg}")
             else:
                 print("(1) SHAPE ok: no stack round trip of the live base around the broadcast")
+            msg = check_blend_publish(lines)
+            if msg:
+                failures.append(f"(1b) PUBLISH: {msg}")
+            else:
+                print("(1b) PUBLISH ok: the blend result is stored once, before the call")
 
         exe = os.path.join(d, "fp")
         r = run([a.lccc, "-O2", "-mavx2", "-std=gnu17", bench, "-o", exe])

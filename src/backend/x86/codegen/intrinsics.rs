@@ -1339,6 +1339,20 @@ impl X86Codegen {
             return false;
         };
         use crate::ir::intrinsics::IntrinsicOp as O;
+        // `VecStoreF32x8` takes its datum in `args[0]` and its address in
+        // `dest_ptr` and `args[1]`. The emitter reads the datum from its
+        // register and clears the deferral on every path where the datum is
+        // the pending value (see its arm), so the deferral is consumed here
+        // rather than committed to its home: that commit is a store nothing
+        // reads. The refusal below exists for ops whose destination may be
+        // the pending value; a pending value in an address position is
+        // refused, so that case keeps the conservative flush.
+        if matches!(op, O::VecStoreF32x8) && !is_raw_reader_intrinsic(op) {
+            return matches!(args.first(), Some(Operand::Value(v)) if v.0 == pval)
+                && !args[1..]
+                    .iter()
+                    .any(|a| matches!(a, Operand::Value(v) if v.0 == pval));
+        }
         args.iter()
             .any(|a| matches!(a, Operand::Value(v) if v.0 == pval))
             && !is_raw_reader_intrinsic(op)
