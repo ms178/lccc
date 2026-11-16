@@ -289,6 +289,24 @@ impl X86Codegen {
     /// computed pointers, constants, and over-aligned allocas. The slot
     /// remains the value's home, so this is purely an addressing
     /// optimization — no semantic change.
+    /// XMM register currently holding a 128-bit source VALUE, for lane
+    /// extracts that can fold the staging copy into the shuffle/move that
+    /// reads it.  Mirrors the `sse_load_arg` lookup order (allocator home
+    /// first — the cross-block source of truth — then an in-block
+    /// `vec_live_regs` claim).  Callers must have flushed the pending
+    /// deferred store first; the register content is then current.
+    pub(super) fn extract_src_xmm(&self, arg: &Operand) -> Option<&'static str> {
+        let Operand::Value(v) = arg else {
+            return None;
+        };
+        self.reg_assignments
+            .get(&v.0)
+            .copied()
+            .filter(|r| is_xmm_reg(*r))
+            .map(phys_reg_name)
+            .or_else(|| self.state.vec_live_xmm(v.0))
+    }
+
     pub(super) fn sse_load_arg(&mut self, arg: &Operand, xmm: &'static str) {
         if let Operand::Value(v) = arg {
             // Register-allocated vector value (Phase 3b vecreg): its CONTENT
@@ -6806,11 +6824,32 @@ impl X86Codegen {
                 };
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                self.sse_load_arg(&args[0], "xmm1");
-                if lane & 1 != 0 {
-                    self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
+                // REGISTER-SOURCED fast path (the vector-parameter lane
+                // read): the staging copy folds into the instruction that
+                // reads the home — lane 0 is a direct `movq %home, %rax`,
+                // lane 1 one `pshufd` with the home as source.  The
+                // pending store was flushed above, so the home content is
+                // current.
+                if let Some(src) = self.extract_src_xmm(&args[0]) {
+                    if lane & 1 != 0 {
+                        self.state
+                            .emit_fmt(format_args!("    pshufd $0x0E, %{src}, %xmm1"));
+                        // The shuffle overwrites %xmm1: every live-register
+                        // claim on that bank — including a stale
+                        // `sse_last_store_reg` single-entry claim — dies.
+                        self.state.vec_evict_bank("xmm1");
+                        self.state.sse_last_store_reg = false;
+                        self.state.emit("    movq %xmm1, %rax");
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq %{src}, %rax"));
+                    }
+                } else {
+                    self.sse_load_arg(&args[0], "xmm1");
+                    if lane & 1 != 0 {
+                        self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
+                    }
+                    self.state.emit("    movq %xmm1, %rax");
                 }
-                self.state.emit("    movq %xmm1, %rax");
                 if let Some(d) = dest {
                     self.store_rax_to(d);
                 }
@@ -7004,10 +7043,26 @@ impl X86Codegen {
                 };
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                self.sse_load_arg(&args[0], "xmm1");
-                if lane != 0 {
-                    self.state
-                        .emit_fmt(format_args!("    pshufd ${}, %xmm1, %xmm1", lane & 3));
+                // REGISTER-SOURCED non-zero lane: the dword select reads
+                // the home directly instead of a staging copy first.
+                // Lane 0 keeps the staging path — `store_f32_lane_dest`
+                // reads %xmm1 and the copy is the cheapest way there.
+                match self.extract_src_xmm(&args[0]) {
+                    Some(src) if lane != 0 => {
+                        self.state
+                            .emit_fmt(format_args!("    pshufd ${}, %{src}, %xmm1", lane & 3));
+                        // %xmm1 overwritten: bank claims and the stale
+                        // single-entry last-store claim both die.
+                        self.state.vec_evict_bank("xmm1");
+                        self.state.sse_last_store_reg = false;
+                    }
+                    _ => {
+                        self.sse_load_arg(&args[0], "xmm1");
+                        if lane != 0 {
+                            self.state
+                                .emit_fmt(format_args!("    pshufd ${}, %xmm1, %xmm1", lane & 3));
+                        }
+                    }
                 }
                 if let Some(d) = dest {
                     self.store_f32_lane_dest(d);

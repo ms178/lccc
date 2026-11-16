@@ -4553,8 +4553,17 @@ pub(crate) fn run_passes(
     // engineering/SSE2-CODEGEN-MATRIX.md.
     if !pass_disabled(&disabled, "aggcopy16") {
         let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+        // Value-form `VecExtractLane*` is an x86-64-only shape: the i686
+        // backend implements only the pointer form (`reject_value_form`
+        // ICEs otherwise), and the aarch64/riscv64 lanes never reach this
+        // pattern but must still fail closed.
+        let value_lane_extracts = target == crate::backend::Target::X86_64;
         module.for_each_function(|func| {
-            aggregate_pair_roundtrip::run_with_symbol_facts(func, &symbol_facts)
+            aggregate_pair_roundtrip::run_with_symbol_facts(
+                func,
+                &symbol_facts,
+                value_lane_extracts,
+            )
         });
         verify::verify_after_pass(module, "aggcopy16");
     }

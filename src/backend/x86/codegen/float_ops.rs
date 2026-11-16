@@ -243,6 +243,7 @@ impl X86Codegen {
                 // Definition-writes-home accounting: the store wrote the
                 // dest's XMM home with its value.
                 self.note_inplace_compute(reg, dest.0);
+                self.state.direct_fp_result = Some(dest.0);
                 return;
             }
         }
@@ -251,12 +252,26 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    {} %xmm0, {}", mov_instr, sr));
             self.state.reg_cache.invalidate_acc();
+            // %xmm0 still holds the value just committed: record it for the
+            // return fast path (`direct_fp_result`).  Every path through
+            // this helper ends with the value in %xmm0, the flag is cleared
+            // by `clobber_after_call_like` after every non-intrinsic
+            // instruction and by `invalidate_vec_peephole` at the start of
+            // every intrinsic emitter, and the audited intrinsic callers
+            // (fabs, lane extracts, fixed-distance kernels) all END their
+            // emission here — so a terminal `return <dest>` elides the slot
+            // reload instead of paying a store-forward round trip
+            // (measured: `movss %xmm0, 12(%rsp); movss 12(%rsp), %xmm0`
+            // on `return _mm_cvtss_f32(f(p))` after the lane-forward
+            // rewrite, where GCC emits nothing).
+            self.state.direct_fp_result = Some(dest.0);
             return;
         }
         let f32ish = matches!(ty, IrType::F32 | IrType::D32);
         self.emit_scalar_xmm_to_gpr("xmm0", "rax", f32ish.then_some("eax"));
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
+        self.state.direct_fp_result = Some(dest.0);
     }
 
     /// Load an F32/F64 operand into a NAMED xmm register (xmm3-xmm7 target for
