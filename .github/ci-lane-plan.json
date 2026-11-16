@@ -953,7 +953,7 @@
     "codegen-a": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 421.21,
+      "predicted_gate_seconds": 422.38,
       "shards": 2,
       "steps": [
         {
@@ -989,14 +989,6 @@
           "name": "Enum tag scope compatibility"
         },
         {
-          "measured_s": 0.42,
-          "name": "Verify declaration-level __seg_gs qualifier codegen"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "AArch64 shared visibility gate"
-        },
-        {
           "measured_s": 0.33,
           "name": "Run __seg_gs declarator-space placement check"
         },
@@ -1009,10 +1001,6 @@
           "name": "i386 small-struct regparm ABI debt gate"
         },
         {
-          "measured_s": 0.25,
-          "name": "Compile-time fold refuses an unfinishable constant recursion"
-        },
-        {
           "measured_s": 2.45,
           "name": "One-lane FP vector ABI (AUD-VABI-4)"
         },
@@ -1021,20 +1009,8 @@
           "name": "Verify strict packed coefficient DAG and i686 rounding"
         },
         {
-          "measured_s": 1.82,
-          "name": "Loop-alignment contract gate (emitted assembly)"
-        },
-        {
-          "measured_s": 1.27,
-          "name": "Record tag identity gate (nested same-tag structs)"
-        },
-        {
           "measured_s": 0.25,
           "name": "Volatile spin-loop position gate"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Static assertion semantics"
         },
         {
           "measured_s": 0.25,
@@ -1045,16 +1021,8 @@
           "name": "Lane-mask select must be target-invariant sign-bit semantics (SA-10)"
         },
         {
-          "measured_s": 1.51,
-          "name": "Prove the FMA digit gate goes red on the pre-fix placement"
-        },
-        {
           "measured_s": 0.31,
           "name": "Enum layout semantics (widening, packed, struct inheritance, static asserts)"
-        },
-        {
-          "measured_s": 0.26,
-          "name": "AArch64 inline-asm provenance gate"
         },
         {
           "measured_s": 0.25,
@@ -1063,10 +1031,6 @@
         {
           "measured_s": 0.85,
           "name": "Verify unwinding through lccc frames (.eh_frame)"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "AArch64 shared ADR contract gate"
         },
         {
           "measured_s": 1.65,
@@ -1079,10 +1043,6 @@
         {
           "measured_s": 0.42,
           "name": "Reject named address spaces on unsupported targets without an ICE"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Errexit-negation detector"
         },
         {
           "measured_s": 2.07,
@@ -1101,48 +1061,16 @@
           "name": "Pointer IV collapse and zero-guard count instruction selection"
         },
         {
-          "measured_s": 0.37,
-          "name": "Verify statement-expression address-space declarations do not leak into typeof"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Run kernel-tree deletion-safety regression"
-        },
-        {
-          "measured_s": 0.33,
-          "name": "Dash-output stdout gate"
-        },
-        {
           "measured_s": 0.25,
           "name": "Run __seg_gs pointee-chain assembly contract"
         },
         {
           "measured_s": 0.25,
-          "name": "Embedded-NUL strlen contract"
-        },
-        {
-          "measured_s": 0.25,
           "name": "i686 128-bit VEX FMA3 must compile and compute a*b+c (SA-11)"
-        }
-      ]
-    },
-    "codegen-b": {
-      "group": "codegen",
-      "mode": "steps",
-      "predicted_gate_seconds": 422.87,
-      "shards": 2,
-      "steps": [
-        {
-          "measured_s": 0.25,
-          "name": "AArch64 dispatcher region contract"
         },
         {
           "measured_s": 0.25,
           "name": "Expat JUnit comparison contract"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Verify segment-qualified declarator codegen"
         },
         {
           "measured_s": 0.37,
@@ -1157,32 +1085,8 @@
           "name": "Prove the vector home-homing gate goes red on the pre-fix lowering"
         },
         {
-          "measured_s": 0.58,
-          "name": "Differential fuzz smoke (synthetic)"
-        },
-        {
-          "measured_s": 0.36,
-          "name": "Verify MachInst narrow-slot window allocation"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Verify over-aligned alloca typed-census admission"
-        },
-        {
           "measured_s": 0.25,
           "name": "Run __seg_gs explicit-cast warning and abstract-declarator check"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Verify segment loads land in their home register"
-        },
-        {
-          "measured_s": 0.88,
-          "name": "Run __seg_gs conversion diagnostics check"
-        },
-        {
-          "measured_s": 0.32,
-          "name": "Verify strict computed-reciprocal codegen"
         },
         {
           "measured_s": 0.27,
@@ -1191,14 +1095,6 @@
         {
           "measured_s": 1.7,
           "name": "Vector reloads of a just-stored aligned home must be register copies"
-        },
-        {
-          "measured_s": 2.6,
-          "name": "256-bit FMA and direct-load homes must stay in registers (RH-01/RH-02)"
-        },
-        {
-          "measured_s": 1.4,
-          "name": "Whole-vector temporary stores are forwarded into the destination store"
         },
         {
           "measured_s": 1.32,
@@ -1214,11 +1110,139 @@
         },
         {
           "measured_s": 0.25,
-          "name": "Pipefail/SIGPIPE detector"
+          "name": "Verify differential-fuzz engine wiring"
+        },
+        {
+          "measured_s": 1.89,
+          "name": "Verify ARX lane-frame latency (vec_arx + arx_vectorize)"
         },
         {
           "measured_s": 0.25,
-          "name": "Verify differential-fuzz engine wiring"
+          "name": "64-bit divide bypass assembly contract"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify peephole parity with and without unwind tables"
+        },
+        {
+          "measured_s": 0.92,
+          "name": "Prove the lane-mask gate goes red on the pre-fix lowering"
+        }
+      ]
+    },
+    "codegen-b": {
+      "group": "codegen",
+      "mode": "steps",
+      "predicted_gate_seconds": 422.25,
+      "shards": 2,
+      "steps": [
+        {
+          "measured_s": 0.42,
+          "name": "Verify declaration-level __seg_gs qualifier codegen"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "AArch64 shared visibility gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Compile-time fold refuses an unfinishable constant recursion"
+        },
+        {
+          "measured_s": 1.82,
+          "name": "Loop-alignment contract gate (emitted assembly)"
+        },
+        {
+          "measured_s": 1.27,
+          "name": "Record tag identity gate (nested same-tag structs)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Static assertion semantics"
+        },
+        {
+          "measured_s": 1.51,
+          "name": "Prove the FMA digit gate goes red on the pre-fix placement"
+        },
+        {
+          "measured_s": 0.3,
+          "name": "Broadcast pending value stays in its register (no spill of the live base)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Prove the broadcast gate goes red on the pre-fix spill"
+        },
+        {
+          "measured_s": 0.26,
+          "name": "AArch64 inline-asm provenance gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "AArch64 shared ADR contract gate"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Errexit-negation detector"
+        },
+        {
+          "measured_s": 0.37,
+          "name": "Verify statement-expression address-space declarations do not leak into typeof"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Run kernel-tree deletion-safety regression"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "Dash-output stdout gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Embedded-NUL strlen contract"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "AArch64 dispatcher region contract"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify segment-qualified declarator codegen"
+        },
+        {
+          "measured_s": 0.58,
+          "name": "Differential fuzz smoke (synthetic)"
+        },
+        {
+          "measured_s": 0.36,
+          "name": "Verify MachInst narrow-slot window allocation"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify over-aligned alloca typed-census admission"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify segment loads land in their home register"
+        },
+        {
+          "measured_s": 0.88,
+          "name": "Run __seg_gs conversion diagnostics check"
+        },
+        {
+          "measured_s": 0.32,
+          "name": "Verify strict computed-reciprocal codegen"
+        },
+        {
+          "measured_s": 2.6,
+          "name": "256-bit FMA and direct-load homes must stay in registers (RH-01/RH-02)"
+        },
+        {
+          "measured_s": 1.4,
+          "name": "Whole-vector temporary stores are forwarded into the destination store"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Pipefail/SIGPIPE detector"
         },
         {
           "measured_s": 2.46,
@@ -1227,10 +1251,6 @@
         {
           "measured_s": 2.0,
           "name": "Scoped-noreturn diagnostic gate"
-        },
-        {
-          "measured_s": 1.89,
-          "name": "Verify ARX lane-frame latency (vec_arx + arx_vectorize)"
         },
         {
           "measured_s": 1.9,
@@ -1262,10 +1282,6 @@
         },
         {
           "measured_s": 0.25,
-          "name": "64-bit divide bypass assembly contract"
-        },
-        {
-          "measured_s": 0.25,
           "name": "Verify inline-asm UTF-8 assembly text"
         },
         {
@@ -1275,10 +1291,6 @@
         {
           "measured_s": 4.06,
           "name": "Observable FP environment semantics and exception ordering"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Verify peephole parity with and without unwind tables"
         },
         {
           "measured_s": 17.63,
@@ -1295,10 +1307,6 @@
         {
           "measured_s": 34.5,
           "name": "Run __seg_gs aggregate copy size sweep"
-        },
-        {
-          "measured_s": 0.92,
-          "name": "Prove the lane-mask gate goes red on the pre-fix lowering"
         }
       ]
     },
@@ -2034,8 +2042,8 @@
       "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s); vec-store-contracts and its self-test measured locally as worst-of-5 (1.36 s each; static scan, no compiler); SV-03 four-ISA cross, same-width cast-range, best-tool and matrix gates remeasured locally with the pinned cache toolchain (cross full 0.41 s / self-test 0.04 s, cast full 1.44 s / self-test 0.06 s (32-bit induction proof, worst-of-3), best-tools full 2.13 s / self-test 0.04 s, matrix full 16.63 s / self-test 0.04 s; bit-select fold remeasured worst-of-3 at 3.59 s after the induction runtime oracle); hosted Clang path is pinned on the command line; guarded folds remeasured worst-of-3 at 2.80 s with 21 verdict mutations, Clang 23.1.5 and a strict hosted ICX 2026.2 contract"
     },
     "codegen": {
-      "costs": "/tmp/costs.tsv",
-      "measured_seconds_total": 842.18,
+      "costs": "/home/user/lccc-bench/split/costs.tsv",
+      "measured_seconds_total": 844.63,
       "source": "measured by scripts/ci_gate_costs.py"
     },
     "frontend": {
