@@ -2464,6 +2464,15 @@ fn peephole_optimize_inner(
         return_home::run(&mut store, &mut infos);
     }
 
+    // Phase 8c': the XMM analogue — `movaps %xmmS, %xmm0; ret` retires by
+    // renaming the producer chain's `%xmmS` into the return register.  Pure
+    // renaming (no instruction changes form, so no flag concerns); every
+    // gate fails closed on implicit-xmm0 readers (legacy blendv/sha), wider
+    // spellings and unproven roots.  `CCC_PEEPHOLE_SKIP=xmm_return_home`.
+    if !sk("xmm_return_home") {
+        return_home::run_xmm(&mut store, &mut infos);
+    }
+
     // Phase 8d: the signed power-of-two division bias-add identity into the
     // conditional-add/cmov machine idiom — four instructions, no sign
     // scratch, and the arms land directly in the return register on terminal

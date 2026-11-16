@@ -486,3 +486,97 @@ fn pushed_frame_refusals() {
         assert_eq!(count(&out, &format!("addq {kept}")), 1, "{why}:\n{out}");
     }
 }
+
+// ── D. sibling-call epilogues ───────────────────────────────────────────────
+//
+// The tail-call fold (phase 5) turns `call g; addq $N, %rsp; ret` into
+// `addq $N, %rsp; jmp g`: the frame ends at the jmp exactly as it would at
+// a ret.  A dead frame around such an exit must fold the same way —
+// measured live as `subq $24, %rsp; addq $24, %rsp; jmp mk4@PLT` for
+// `return f()` of every 16-byte vector flavour.
+
+#[test]
+fn d_a_dead_frame_around_a_sibling_call_folds() {
+    let out = run(&f(concat!(
+        "    subq $24, %rsp\n",
+        "    .cfi_def_cfa_offset 32\n",
+        "    addq $24, %rsp\n",
+        "    jmp g@PLT",
+    )));
+    assert_eq!(count(&out, "subq $24, %rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "addq $24, %rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "jmp g@PLT"), 1, "{}", out);
+}
+
+#[test]
+fn d_a_mixed_ret_and_sibling_call_exit_folds() {
+    // One conditional path returns normally, the other leaves via the
+    // sibling call; both exits carry the full epilogue.
+    let out = run(&f(concat!(
+        "    subq $24, %rsp\n",
+        "    .cfi_def_cfa_offset 32\n",
+        "    testl %edi, %edi\n",
+        "    je .LBB1\n",
+        "    addq $24, %rsp\n",
+        "    jmp g@PLT\n",
+        ".LBB1:\n",
+        "    movl $7, %eax\n",
+        "    addq $24, %rsp\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "subq $24, %rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "addq $24, %rsp"), 0, "{}", out);
+}
+
+#[test]
+fn d_an_unpaired_external_jmp_fails_closed() {
+    // The external jmp is NOT preceded by the epilogue addq: whatever
+    // produced this shape, the pass must not touch the frame.
+    let out = run(&f(concat!(
+        "    subq $24, %rsp\n",
+        "    .cfi_def_cfa_offset 32\n",
+        "    testl %edi, %edi\n",
+        "    je .LBB1\n",
+        "    jmp g@PLT\n",
+        ".LBB1:\n",
+        "    addq $24, %rsp\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "subq $24, %rsp"), 1, "{}", out);
+    assert_eq!(count(&out, "addq $24, %rsp"), 1, "{}", out);
+}
+
+#[test]
+fn d_a_local_jmp_is_not_a_sibling_call() {
+    // `addq; jmp .LBB…` is a shared-epilogue tail, not a function exit;
+    // only the ret at the join may classify the addq, and here the join
+    // re-enters the body, so the whole fold must decline.
+    let out = run(&f(concat!(
+        "    subq $24, %rsp\n",
+        "    .cfi_def_cfa_offset 32\n",
+        "    addq $24, %rsp\n",
+        "    jmp .LBB1\n",
+        ".LBB1:\n",
+        "    subq $24, %rsp\n",
+        "    addq $24, %rsp\n",
+        "    ret",
+    )));
+    // Two subq/addq pairs survive untouched: the mid-body pair makes the
+    // audit fail closed (body push/sub reference to %rsp).
+    assert_eq!(count(&out, "subq $24, %rsp"), 2, "{}", out);
+}
+
+#[test]
+fn d_an_indirect_jmp_is_not_a_sibling_call() {
+    // A computed goto / indirect tail stays inside the audit's "unknown"
+    // class: the frame must survive.
+    let out = run(&f(concat!(
+        "    subq $24, %rsp\n",
+        "    .cfi_def_cfa_offset 32\n",
+        "    movq %rdi, %rax\n",
+        "    addq $24, %rsp\n",
+        "    jmp *%rax",
+    )));
+    assert_eq!(count(&out, "subq $24, %rsp"), 1, "{}", out);
+    assert_eq!(count(&out, "addq $24, %rsp"), 1, "{}", out);
+}

@@ -466,7 +466,13 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                         q += 1;
                         continue;
                     }
-                    ret_paired = pops.len() == pushes && matches!(infos[q].kind, LineKind::Ret);
+                    // A sibling call's `jmp ext` ends the frame exactly like
+                    // `ret`: the tail-call fold (phase 5) placed it after the
+                    // full epilogue, so the stack is at entry depth here and
+                    // deleting the subq/addq pair preserves that invariant.
+                    ret_paired = pops.len() == pushes
+                        && (matches!(infos[q].kind, LineKind::Ret)
+                            || is_direct_sibcall_jmp(&infos[q], infos[q].trimmed(store.get(q))));
                     break;
                 }
                 if ret_paired {
@@ -499,6 +505,30 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                     // epilogue's own pops) from a collected epilogue addq,
                     // or this path would return with an unbalanced stack
                     // under the fold.
+                    let mut p = j;
+                    let mut paired = false;
+                    while p > i {
+                        p -= 1;
+                        if super::helpers::steps_over_line(
+                            &infos[p],
+                            infos[p].trimmed(store.get(p)),
+                        ) || epilogue_pops.contains(&p)
+                        {
+                            continue;
+                        }
+                        paired = epilogues.contains(&p);
+                        break;
+                    }
+                    decline |= !paired;
+                    j += 1;
+                    continue;
+                }
+                LineKind::Jmp if is_direct_sibcall_jmp(&infos[j], body) => {
+                    // A sibling-call jmp leaves the function and must be
+                    // reached from a collected epilogue addq, same contract
+                    // as `ret`.  An unpaired external jmp fails closed —
+                    // whatever produced it, this pass does not understand
+                    // the frame discipline on that path.
                     let mut p = j;
                     let mut paired = false;
                     while p > i {
@@ -643,6 +673,21 @@ fn drop_restated_cfa(store: &LineStore, infos: &mut [LineInfo], start: usize, en
 }
 
 /// Parse `subq $N, %rsp` (constant adjustment only).
+/// A direct jump OUT of the function: the tail-call fold's `jmp sym` /
+/// `jmp sym@PLT` sibling call.  Function-local control flow always targets
+/// a dot-prefixed assembler label (`.LBB*`), and indirect jumps (computed
+/// goto, retpoline thunks) are classified `JmpIndirect`; both are refused.
+fn is_direct_sibcall_jmp(info: &LineInfo, trimmed: &str) -> bool {
+    if !matches!(info.kind, LineKind::Jmp) {
+        return false;
+    }
+    let Some(target) = trimmed.strip_prefix("jmp ") else {
+        return false;
+    };
+    let target = target.trim();
+    !target.is_empty() && !target.starts_with('.') && !target.starts_with('*')
+}
+
 fn parse_subq_rsp(line: &str) -> Option<i64> {
     let rest = line.strip_prefix("subq $")?;
     let val = rest.strip_suffix(", %rsp")?;
