@@ -302,6 +302,11 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     /// Called at block boundaries and before instructions that can't be lowered to MachInst.
     /// Default: no-op.
     fn flush_machinst(&mut self) {}
+    /// Flush before an integer broadcast (`VecBroadcastI32x8`). Default: the
+    /// generic boundary flush.
+    fn flush_machinst_before_broadcast(&mut self) {
+        self.flush_machinst();
+    }
     /// CCC_ENABLE_VECREG: at the end of a block, flush register-held vector
     /// values that are live-out to their home slots. Default no-op; only the
     /// x86-64 backend implements it.

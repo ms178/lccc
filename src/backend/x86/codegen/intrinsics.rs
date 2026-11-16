@@ -13,7 +13,7 @@
 
 use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_256};
 use crate::backend::regalloc::PhysReg;
-use crate::backend::state::StackSlot;
+use crate::backend::state::{StackSlot, vector_reg_bank};
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
@@ -1255,6 +1255,75 @@ impl X86Codegen {
         }
     }
 
+    /// True when a deferred vector result is pending in bank 0 or 1: the two
+    /// banks of the scratch pair. Only then does the broadcast have to stage
+    /// around it. A pending value in a claimable bank is untouched by any
+    /// scratch write, and `service_pending_vec_store` covers the rest.
+    pub(super) fn broadcast_keeps_pending(&self) -> bool {
+        self.state
+            .pending_vec_store
+            .is_some_and(|(_, reg, _)| vector_reg_bank(reg) < 2)
+    }
+
+    /// The `(xmm, ymm)` pair an integer broadcast stages in. A bank-0 pending
+    /// result is preserved by staging in bank 1. Every other case uses bank 0,
+    /// which holds no state that must survive: `pending_vec_store` is the only
+    /// deferred scratch state, and `broadcast_keeps_pending` covers it.
+    pub(super) fn broadcast_scratch_pair(&self) -> (&'static str, &'static str) {
+        match self.state.pending_vec_store {
+            Some((_, reg, _)) if vector_reg_bank(reg) == 0 => ("xmm1", "ymm1"),
+            _ => ("xmm0", "ymm0"),
+        }
+    }
+
+    /// General `_mm256_set1_epi32` lowering: `vmovd` the scalar into the
+    /// staging XMM, `vpbroadcastd` it across the staging YMM, then home the
+    /// result. Writes only the staging bank, never a live pending bank.
+    fn emit_broadcast_i32x8_general(&mut self, args: &[Operand], dest: &Option<Value>) {
+        if !self.broadcast_keeps_pending() {
+            // Commit any pending result before a write could reach its bank.
+            self.flush_pending_vec_store_impl();
+        }
+        let (xmm_stage, ymm_stage) = self.broadcast_scratch_pair();
+        self.operand_to_reg(&args[0], "rax");
+        // VEX `vmovd`: this AVX2-only op must not mix in a legacy-SSE write
+        // (an SSE/AVX transition with a dirty upper half on pre-Skylake/Zen
+        // parts).
+        self.state
+            .emit_fmt(format_args!("    vmovd %eax, %{xmm_stage}"));
+        self.state
+            .emit_fmt(format_args!("    vpbroadcastd %{xmm_stage}, %{ymm_stage}"));
+        // Only the staging bank was written. Claims never name banks 0/1
+        // (`vec_claim_live_reg` refuses them) and `vec_home_reg` records only
+        // banks >= 2, so the scratch-only invalidation is exact: it drops the
+        // `*_last_store_*` records that may name the bank and keeps every live
+        // claim and the pending record.
+        self.state.invalidate_vec_scratch_peephole();
+        if let Some(d) = dest {
+            self.state.vector_values.insert(d.0);
+            // A deferred destination takes the single pending slot, so commit
+            // the current pending value first or its store obligation is lost.
+            if self.vec_dest_defers(d) {
+                self.flush_pending_vec_store_impl();
+            }
+            // Homed like every other 256-bit result: a deferred destination
+            // becomes the pending value, a register-homed one is claimed, and
+            // a plain one is stored. No unconditional commit here.
+            self.avx_store_dest_from(d, ymm_stage);
+        }
+    }
+
+    /// True when a vector result `d` would take the single pending-store slot
+    /// if it were stored from a scratch register: it has no register home and
+    /// is deferred. The current pending value must be committed first.
+    pub(super) fn vec_dest_defers(&self, d: &Value) -> bool {
+        let register_homed = self
+            .reg_assignments
+            .get(&d.0)
+            .is_some_and(|&reg| is_xmm_reg(reg));
+        !register_homed && self.state.vector_defer_values.contains(&d.0)
+    }
+
     /// True when a pending deferred vector result is read by THIS intrinsic as
     /// a whole-vector operand, so the store may stay pending and the operand
     /// load may be elided.
@@ -1300,6 +1369,11 @@ impl X86Codegen {
     /// cache-aware consumer of that value, flush the store first — this
     /// instruction may clobber the holding register or rely on slot contents.
     fn service_pending_vec_store(&mut self, op: &IntrinsicOp, args: &[Operand]) {
+        // The integer broadcast stages around a live bank-0/1 result, so it
+        // neither clobbers that result nor needs to commit it.
+        if matches!(op, IntrinsicOp::VecBroadcastI32x8) && self.broadcast_keeps_pending() {
+            return;
+        }
         if !self.pending_vec_store_consumed_by(op, args) {
             self.flush_pending_vec_store_impl();
         }
@@ -8581,23 +8655,15 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecBroadcastI32x8 => {
-                // All-ones splat: one vpcmpeqd instead of the staged chain.
-                if !self.try_all_ones_splat(args, dest, true)
+                if self.broadcast_keeps_pending() {
+                    // A deferred bank-0/1 result is live: the fast paths
+                    // stage in %ymm0/%xmm0 and flush on entry, so take the
+                    // general path, which stages in the other bank.
+                    self.emit_broadcast_i32x8_general(args, dest);
+                } else if !self.try_all_ones_splat(args, dest, true)
                     && !self.try_const_splat_load(args, dest, 4, true)
                 {
-                    self.flush_pending_vec_store_impl();
-                    self.state.invalidate_vec_peephole();
-                    self.operand_to_reg(&args[0], "rax");
-                    // VEX `vmovd`: this AVX2-only op must not mix in a
-                    // legacy-SSE write (an SSE/AVX transition with a dirty
-                    // upper half on pre-Skylake/Zen parts).
-                    self.state.emit("    vmovd %eax, %xmm0");
-                    self.state.emit("    vpbroadcastd %xmm0, %ymm0");
-                    if let Some(d) = dest {
-                        self.state.vector_values.insert(d.0);
-                        self.avx_store_dest(d);
-                        self.flush_pending_vec_store_impl();
-                    }
+                    self.emit_broadcast_i32x8_general(args, dest);
                 }
             }
             IntrinsicOp::VecStoreI32x4 => {
@@ -15436,5 +15502,132 @@ mod vec_store_source_identity_tests {
         let mut cg = fresh();
         cg.state.vec_claim_live_reg(FRESH, "ymm2");
         assert_eq!(cg.state.vec_live_regs.get(&FRESH), Some(&"ymm2"));
+    }
+}
+
+#[cfg(test)]
+mod broadcast_pending_bank_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+    use crate::ir::reexports::IrConst;
+
+    /// Home `id` to a plain frame slot so a deferred commit has a direct slot
+    /// to write, the same shape a real 256-bit temporary has.
+    fn slot_homed(cg: &mut X86Codegen, id: u32) {
+        cg.state.value_locations.insert(id, StackSlot(-32));
+        cg.state.vector_values.insert(id);
+    }
+
+    fn fresh() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 0);
+        slot_homed(&mut cg, 1);
+        cg
+    }
+
+    fn scalar() -> Operand {
+        Operand::Const(IrConst::I32(0x3f80_0000))
+    }
+
+    /// The staging pair follows the pending bank, and the keep decision is
+    /// exactly "a pending value sits in bank 0 or 1". Bank 2+ is never kept.
+    #[test]
+    fn staging_pair_and_keep_decision_follow_the_pending_bank() {
+        let mut cg = fresh();
+        assert_eq!(cg.broadcast_scratch_pair(), ("xmm0", "ymm0"));
+        assert!(!cg.broadcast_keeps_pending());
+
+        let cases: [(&'static str, bool, (&str, &str)); 5] = [
+            ("ymm0", true, ("xmm1", "ymm1")),
+            ("xmm0", true, ("xmm1", "ymm1")),
+            ("ymm1", true, ("xmm0", "ymm0")),
+            ("ymm2", false, ("xmm0", "ymm0")),
+            ("ymm15", false, ("xmm0", "ymm0")),
+        ];
+        for (reg, keeps, pair) in cases {
+            cg.state.pending_vec_store = Some((0, reg, true));
+            assert_eq!(cg.broadcast_keeps_pending(), keeps, "pending {reg}");
+            assert_eq!(cg.broadcast_scratch_pair(), pair, "pending {reg}");
+        }
+    }
+
+    /// The fix's core property: a live bank-0 operand is neither clobbered nor
+    /// committed by a general broadcast, and the broadcast writes only bank 1.
+    #[test]
+    fn bank0_pending_operand_survives_a_general_broadcast_untouched() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        cg.emit_broadcast_i32x8_general(&[scalar()], &None);
+        let out = cg.state.out.buf.clone();
+        assert_eq!(
+            cg.state.pending_vec_store,
+            Some((0, "ymm0", true)),
+            "the live operand must stay pending: {out}"
+        );
+        assert!(
+            out.contains("vmovd %eax, %xmm1") && out.contains("vpbroadcastd %xmm1, %ymm1"),
+            "the broadcast must stage in bank 1: {out}"
+        );
+        assert!(
+            !out.contains("%xmm0") && !out.contains("%ymm0"),
+            "bank 0 must not be written or spilled: {out}"
+        );
+    }
+
+    /// A pending value in a claimable bank is not in the scratch pair, so the
+    /// broadcast stages in bank 0 and commits that value before the write.
+    #[test]
+    fn claimable_bank_pending_is_committed_before_bank0_is_written() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((0, "ymm2", true));
+        cg.emit_broadcast_i32x8_general(&[scalar()], &None);
+        let out = cg.state.out.buf.clone();
+        assert_eq!(cg.state.pending_vec_store, None, "{out}");
+        let commit = out
+            .find("vmovdqu %ymm2")
+            .expect("the pending value is committed");
+        let stage = out.find("vmovd %eax, %xmm0").expect("bank 0 is the stage");
+        assert!(commit < stage, "the commit must precede the write: {out}");
+    }
+
+    /// A non-deferred destination is stored from the stage, claims nothing in
+    /// the scratch pair, and the live bank-0 operand keeps its pending record
+    /// with no commit. Before the fix this path always spilled the operand.
+    #[test]
+    fn non_deferred_destination_stores_from_the_stage_and_keeps_the_operand() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        cg.emit_broadcast_i32x8_general(&[scalar()], &Some(Value(1)));
+        let out = cg.state.out.buf.clone();
+        assert_eq!(cg.state.pending_vec_store, Some((0, "ymm0", true)), "{out}");
+        assert!(
+            out.contains("vmovdqu %ymm1, "),
+            "the destination is stored from the stage: {out}"
+        );
+        assert!(!out.contains("vmovdqu %ymm0"), "no operand commit: {out}");
+    }
+
+    /// A deferred destination takes the single pending slot. The live bank-0
+    /// operand must be committed first, or its store obligation is lost.
+    #[test]
+    fn deferred_destination_commits_the_operand_then_takes_the_slot() {
+        let mut cg = fresh();
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        cg.state.vector_defer_values.insert(1);
+        cg.emit_broadcast_i32x8_general(&[scalar()], &Some(Value(1)));
+        let out = cg.state.out.buf.clone();
+        assert_eq!(
+            cg.state.pending_vec_store,
+            Some((1, "ymm1", true)),
+            "the destination owns the slot: {out}"
+        );
+        assert!(
+            out.contains("vmovdqu %ymm0, "),
+            "the operand must be committed before the slot is taken: {out}"
+        );
+        assert!(
+            !out.contains("vmovdqu %ymm1, "),
+            "a deferred dest is not stored: {out}"
+        );
     }
 }

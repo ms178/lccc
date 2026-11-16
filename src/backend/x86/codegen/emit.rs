@@ -9393,382 +9393,19 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn flush_machinst(&mut self) {
-        if self.machinst_buf.is_empty() {
-            // No machine instructions pending: nothing to emit. The IR shadow
-            // (`machinst_buf_ir`) may still hold entries from no-op lowerings
-            // — a coalesced Copy whose src and dest resolve to the same home
-            // (value_to_reg(src) == value_to_reg(dest)) emits zero MachInsts
-            // but is still recorded in the shadow. Drop the shadow too:
-            // leaving it behind lets a later flush — possibly in a *different
-            // function* after the boundary — replay stale IR whose values
-            // have no homes there, tripping the operand_to_rax hard gate
-            // (kernel drivers/tty/tty_io.c: tty_tiocmget replayed
-            // tty_get_tiocm's tail `Copy v19 = v12`). A no-op window needs no
-            // replay: the values are already at their destinations.
-            self.machinst_buf_ir.clear();
-            return;
-        }
+        self.flush_machinst_impl(true);
+    }
 
-        use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
-
-        if mi_stream_dbg() {
-            lccc::cli::stderr_line(format_args!(
-                "### MI-STREAM fn={} n={}",
-                self.state.current_func_name,
-                self.machinst_buf.len()
-            ));
-            for mi in &self.machinst_buf {
-                lccc::cli::stderr_line(format_args!("  {mi:?}"));
-            }
-        }
-
-        // ── Window register allocation pipeline ─────────────────────────
-        // (1) Classify which vregs must get window registers (BEFORE
-        //     resolution, so the resolver can skip substituting exactly
-        //     those — mixing a slot-substituted read with a register-held
-        //     def of the same SSA value in one window would read a stale
-        //     slot image).
-        // (2) Resolve memory-form vreg positions to stack-slot operands
-        //     (the optimal folded-memory access, unchanged behavior).
-        // (3) Allocate window scratch registers for the classified vregs,
-        //     inserting reloads (arriving values) and stores (live-out
-        //     defs) — SSA-exact within the window.
-        // (4) A vreg that survives all three stages still trips the
-        //     unresolvable gate and replays the window through the default
-        //     path: the fail-safe, now the exception instead of the cliff.
-        let window_last_writes_fast: Option<FxHashMap<u8, super::machinst_alloc::WindowWriteKind>>;
-        let mut window_vreg_writers: FxHashMap<u8, u32> = FxHashMap::default();
-        let reg_classified = super::machinst_alloc::classify_window(
-            &self.machinst_buf,
-            Some(&self.state.small_slot_values),
-        );
-        // ACC-RESIDENT SUBSTITUTION eligibility, fail-closed on both
-        // axes: the window owns no scratch registers (an owned window may
-        // assign %rax to a vreg behind the substitution's back), and no
-        // instruction in the window touches %rax in any way.
-        let window_rax_free =
-            reg_classified.is_empty() && machinst_window_rax_free(&self.machinst_buf);
-        let acc_subst = window_rax_free;
-        let window_defs = if acc_subst {
-            machinst_window_defs(&self.machinst_buf)
-        } else {
-            crate::common::fx_hash::FxHashSet::default()
-        };
-        let resolved: Vec<MachInst> = self
-            .machinst_buf
-            .iter()
-            .map(|inst| {
-                resolve_stack_vregs(
-                    inst,
-                    &self.reg_assignments,
-                    &self.state,
-                    &reg_classified,
-                    acc_subst,
-                    &window_defs,
-                )
-            })
-            .collect();
-        let final_insts = if reg_classified.is_empty() {
-            // Fast path: nothing needs a window register — the resolution
-            // result is the emission input, exactly as before.
-            window_last_writes_fast =
-                Some(super::machinst_alloc::window_last_writes_core(&resolved));
-            window_vreg_writers.clear();
-            resolved
-        } else {
-            let ir_len = self.machinst_buf_ir.len() as u32;
-            let pp_end = self.state.current_program_point;
-            let window_span = (pp_end.saturating_sub(ir_len), pp_end.saturating_sub(1));
-            let ctx = super::machinst_alloc::WindowCtx {
-                slots: &self.state.value_locations,
-                small_slots: &self.state.small_slot_values,
-                types: &self.value_types,
-                total_uses: &self.value_use_counts,
-                alloca_values: &self.state.alloca_values,
-                reg_busy: &self.machine_reg_busy,
-                window_span,
-            };
-            let (insts, writes, vreg_writers) =
-                match super::machinst_alloc::allocate_window(resolved, &ctx) {
-                    Some(v) => v,
-                    None => {
-                        // Allocation refused (XMM domain, SSA discipline, pool
-                        // exhaustion, …): the skip-set vregs never got
-                        // substituted, so re-resolve WITHOUT the skip set —
-                        // giving the memory-operand path its chance before the
-                        // replay decides. The re-resolved sequence (when it
-                        // fully resolves, no replay) is what gets emitted, so
-                        // its writes must be classified by the core
-                        // classifier — an empty map here would let the
-                        // overlay skip the window entirely and leave stale
-                        // write-state facts pinned across it.
-                        let re_resolved: Vec<MachInst> = self
-                            .machinst_buf
-                            .iter()
-                            .map(|inst| {
-                                resolve_stack_vregs(
-                                    inst,
-                                    &self.reg_assignments,
-                                    &self.state,
-                                    &crate::common::fx_hash::FxHashSet::default(),
-                                    false,
-                                    &crate::common::fx_hash::FxHashSet::default(),
-                                )
-                            })
-                            .collect();
-                        let core_writes =
-                            super::machinst_alloc::window_last_writes_core(&re_resolved);
-                        (re_resolved, core_writes, FxHashMap::default())
-                    }
-                };
-            window_last_writes_fast = Some(writes);
-            window_vreg_writers = vreg_writers;
-            insts
-        };
-
-        let has_bad = final_insts
-            .iter()
-            .any(|mi| machinst_needs_text_fallback(mi, Some(&self.state.out)));
-        if has_bad {
-            if self.state.ra_config.mi_debug {
-                lccc::cli::stderr_line(format_args!(
-                    "[MI-FALLBACK] {} instructions -> default path",
-                    self.machinst_buf_ir.len()
-                ));
-                for mi in &final_insts {
-                    if has_unresolvable_vreg(mi, &self.reg_assignments) {
-                        lccc::cli::stderr_line(format_args!(
-                            "[MI-FALLBACK]   unresolvable: {mi:?}"
-                        ));
-                    }
-                }
-                for inst in &self.machinst_buf_ir {
-                    lccc::cli::stderr_line(format_args!("[MI-FALLBACK]   ir: {inst:?}"));
-                }
-            }
-            // CORRECTNESS: never delete instructions. Re-emit the buffered IR
-            // through the default (accumulator) codegen path, which handles
-            // stack-backed values in every position. The buffer is a
-            // straight-line sequence (flushed before calls and at block ends),
-            // the register cache is still valid for the pre-buffer state, and
-            // GEP folding is a pure optimization — an empty fold map keeps the
-            // default path semantics-identical.
-            let ir = std::mem::take(&mut self.machinst_buf_ir);
-            // The main dispatch loop already advanced once for each buffered
-            // instruction. Replay at those original points, then finish at
-            // exactly the same point; advancing from the current endpoint
-            // would double-count the whole fallback window and misalign later
-            // call-spanning save/restore intervals.
-            let replay_endpoint = self.state.current_program_point;
-            let replay_len = u32::try_from(ir.len())
-                .expect("MachInst replay window exceeds u32 program-point space");
-            self.state.current_program_point = replay_endpoint
-                .checked_sub(replay_len)
-                .expect("MachInst replay exceeds emitted IR program points");
-            for inst in ir {
-                crate::backend::generation::generate_instruction(
-                    self,
-                    &inst,
-                    &crate::common::fx_hash::FxHashMap::default(),
-                    &crate::common::fx_hash::FxHashMap::default(),
-                    &crate::common::fx_hash::FxHashMap::default(),
-                    &crate::common::fx_hash::FxHashMap::default(),
-                    &crate::common::fx_hash::FxHashSet::default(),
-                    &crate::common::fx_hash::FxHashSet::default(),
-                    &crate::common::fx_hash::FxHashSet::default(),
-                    &crate::common::fx_hash::FxHashMap::default(),
-                );
-                self.state.current_program_point += 1;
-            }
-            assert_eq!(
-                self.state.current_program_point, replay_endpoint,
-                "MachInst replay changed the IR program-point endpoint"
-            );
-            self.machinst_buf.clear();
-            return;
-        }
-
-        super::machinst_emit::emit_machinsts_with_tune(
-            &final_insts,
-            &mut self.state.out,
-            &self.tune,
-            crate::backend::x86::cpu_model::div64_bypass_killed(),
-        );
-
-        // Register-cache coherence (SOUNDNESS): the window's instructions
-        // may write %rax/%rcx (pre-colored div staging, Phys destinations)
-        // without the text-path cache ever seeing it. A stale acc/sec
-        // entry after the window would hand a later text consumer the
-        // wrong register content. The replay path above needs no such
-        // invalidation — it IS text emission, cache-maintained throughout.
-        self.state.reg_cache.invalidate_all();
-
-        // Home-freshness bookkeeping (SOUNDNESS): MachInst-buffered
-        // instructions bypass generate_instruction, so their destinations
-        // never passed through note_dest_defined at their own position. The
-        // whole window has now been emitted at this program point. Only a
-        // dest that was PRE-COLORED to its (then-fresh) home is actually in
-        // that home now — mark it. Every other homed dest was written to a
-        // window scratch register and/or its slot: invalidate its home so
-        // later consumers reload instead of reading whatever the window or
-        // an earlier in-place chain left there (kernel 6.18.50
-        // free_area_init_node: the fused mul-add consumed the zone POINTER
-        // as the loop index after the MachInst chain reused %r11 in place).
-        {
-            let ir_shadow = std::mem::take(&mut self.machinst_buf_ir);
-            // Invalidate EVERY shadow dest's freshness: a pre-colored dest's
-            // home may have been overwritten afterwards by a window scratch
-            // assignment to the same register (the window allocator does not
-            // model pre-colored operands as interference), and a Vreg dest
-            // landed in a scratch register whose identity is not tracked
-            // here. Consumers after the window rebuild the value through
-            // the slot/reload/remat paths (kernel 6.18.50
-            // free_area_init_node: a MachInst [Cast→%r11][Mul %r11,%r11]
-            // window left the sign-extended loop index marked fresh in %r11
-            // after the multiply had already replaced it, so the following
-            // fused mul-add consumed the ZONE POINTER as the index).
-            for inst in &ir_shadow {
-                let Some(dest) = inst.dest() else { continue };
-                if !self.reg_assignments.contains_key(&dest.0) {
-                    continue;
-                }
-                // Typed calls are emitted with their return move explicitly
-                // targeted at the allocator's home register (try_lower_call_
-                // typed builds CallRetMove from reg_assignments).  That home
-                // may already be marked clobbered by an earlier instruction
-                // in the same function; using home_clobbered as the sole
-                // "was this pre-colored?" test would then leave the freshly
-                // returned value falsely stale.  A call result is a new
-                // definition, so it re-establishes its home unconditionally.
-                let typed_call_home_def = matches!(
-                    inst,
-                    crate::ir::reexports::Instruction::Call { info, .. }
-                        | crate::ir::reexports::Instruction::CallIndirect { info, .. }
-                        if info.dest.as_ref().is_some_and(|d| d.0 == dest.0)
-                );
-                if typed_call_home_def || !self.home_clobbered.contains(&dest.0) {
-                    // Pre-colored destination (or a typed call return): the
-                    // window wrote the value into its home. Mark it fresh so
-                    // later consumers may read the home.
-                    self.note_home_written(dest.0);
-                } else {
-                    // Not pre-colored: the window's result went to scratch
-                    // and/or a slot; the home holds whatever preceded it.
-                    self.home_fresh.remove(&dest.0);
-                    self.mark_home_clobbered(dest.0, "asm-window");
-                }
-            }
-            // ── S11 write-state overlay (EXACT window accounting) ────────
-            // The note-bit loop above keeps the coarse freshness bits, but
-            // the write-state law needs the register-truth: which home
-            // registers did the EMITTED window actually write last, and
-            // was that write a pre-colored definition (Def) or scratch/
-            // clobber traffic (Clobber)? The classifier derives this from
-            // the post-allocation instruction sequence, so a pre-colored
-            // def is recognized even when an OLD clobber mark made the
-            // heuristic above believe the home was not written (the
-            // replay-min/max shape: `cmoval %esi, %r14d` targets the
-            // accumulator's home regardless of earlier marks).
-            let Some(last_writes) = &window_last_writes_fast else {
-                self.machinst_buf_ir = ir_shadow;
-                return;
-            };
-            for (reg_id, kind) in last_writes.iter() {
-                let home = PhysReg(*reg_id);
-                // `home_sharers` is the inverse of the function's final
-                // `reg_assignments` (built with it in the prologue): an O(1)
-                // answer where filtering the whole assignment map cost
-                // O(values) per written register per window -- quadratic in
-                // call-dense functions, which flush a window per call.
-                if self.home_sharers.get(reg_id).is_none_or(|s| s.is_empty()) {
-                    // Not a home register in this function: nothing to track.
-                    continue;
-                }
-                match kind {
-                    super::machinst_alloc::WindowWriteKind::Precolor => {
-                        // The last shadow dest homed in this register owns
-                        // the surviving pre-colored definition (multiple
-                        // same-home defs in one window are impossible for
-                        // simultaneously-live values; the LAST one is the
-                        // register's content).
-                        let owner = ir_shadow
-                            .iter()
-                            .filter_map(|inst| inst.dest())
-                            .rev()
-                            .find(|d| self.reg_assignments.get(&d.0).is_some_and(|&r| r == home));
-                        match owner {
-                            Some(v) => {
-                                self.home_write_state.insert(*reg_id, HomeWrite::Def(v.0));
-                            }
-                            None => {
-                                self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
-                            }
-                        }
-                    }
-                    super::machinst_alloc::WindowWriteKind::ScratchOrClobber => {
-                        // A window Vreg dst whose OWN home is this register
-                        // realized the group's next lineage member — a
-                        // definition, not scratch (the allocator may only
-                        // pick a dead-inside-the-window home for it, so
-                        // the disjoint-live-range invariant holds).
-                        match window_vreg_writers.get(reg_id) {
-                            // A Vreg whose own home is this register: a
-                            // group-member definition (the allocator may
-                            // only reuse a dead-inside-the-window home).
-                            Some(&v)
-                                if self.reg_assignments.get(&v).is_some_and(|&r| r == home) =>
-                            {
-                                if ws_watch(*reg_id) {
-                                    lccc::cli::stderr_line(format_args!(
-                                        "[WS-win] blk={} r{} vreg Def({})",
-                                        self.home_dbg_block, reg_id, v
-                                    ));
-                                }
-                                self.home_write_state.insert(*reg_id, HomeWrite::Def(v));
-                            }
-                            // Inserted reload into foreign scratch, an
-                            // unnamed-Raw touch, or an unsaved call
-                            // clobber: foreign content.
-                            other => {
-                                if ws_watch(*reg_id) {
-                                    lccc::cli::stderr_line(format_args!(
-                                        "[WS-win] blk={} r{} Clobber writer={:?} kind={:?} state_before={:?}",
-                                        self.home_dbg_block,
-                                        reg_id,
-                                        other,
-                                        window_last_writes_fast
-                                            .as_ref()
-                                            .and_then(|m| m.get(reg_id)),
-                                        self.home_write_state.get(reg_id)
-                                    ));
-                                }
-                                self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
-                            }
-                        }
-                    }
-                }
-            }
-            self.machinst_buf_ir = ir_shadow;
-        }
-
-        self.machinst_buf.clear();
-        self.machinst_buf_ir.clear();
-        self.state.reg_cache.invalidate_all();
-        self.flush_pending_vec_store_impl();
-        // A BOOKKEEPING flush, not a register clobber: every instruction in
-        // `machinst_buf` was already accounted for when it was generated (its
-        // emitter ran `set_vec_home_reg` / `vec_evict_bank_*` / the store
-        // helpers), so committing the buffer changes no vector register.
-        //
-        // `invalidate_vec_peephole` nevertheless clears the home-content map,
-        // because for every OTHER caller (calls, unknown control flow, opaque
-        // asm) the registers really are dead. Preserving just that map here is
-        // what lets a loop-invariant vector constant stay in its YMM register
-        // past a buffer boundary: without it the clamp bounds were re-read
-        // from their stack slots on every iteration after the first.
-        let home_reg = std::mem::take(&mut self.state.vec_home_reg);
-        self.state.invalidate_vec_peephole();
-        self.state.vec_home_reg = home_reg;
+    /// The boundary before an integer broadcast. A live bank-0/1 deferred
+    /// vector result is kept in its register across the broadcast, which
+    /// stages around it (`broadcast_keeps_pending`). The generic boundary
+    /// would commit that result first: a 32-byte store the consumer then
+    /// reloads on the loop-carried chain. The commit is skipped only when the
+    /// buffered run cannot write the scratch pair, because only then can the
+    /// result be clobbered by the run itself.
+    fn flush_machinst_before_broadcast(&mut self) {
+        let commit = self.broadcast_boundary_commits_pending();
+        self.flush_machinst_impl(commit);
     }
 
     fn emit_reg_to_reg_move(&mut self, src: PhysReg, dest: PhysReg) {
@@ -11096,6 +10733,439 @@ impl ArchCodegen for X86Codegen {
 impl Default for X86Codegen {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl X86Codegen {
+    /// The commit decision for the broadcast boundary: commit the pending
+    /// vector result unless the broadcast keeps it live AND the buffered run
+    /// cannot write the scratch pair.
+    pub(super) fn broadcast_boundary_commits_pending(&self) -> bool {
+        !self.broadcast_keeps_pending() || self.machinst_buf_may_write_scratch_pair()
+    }
+
+    /// Whether the buffered MachInst run may write vector bank 0 or 1, the
+    /// scratch pair. Conservative by construction: an implicit or opaque
+    /// writer (`Raw`, `Call`, `CallTyped`, `Cqto`, `XorRdx`, `Div`), a virtual
+    /// destination, or a physical destination that is not a known
+    /// non-scratch register counts as a write. The classification reads the
+    /// numeric PhysReg id directly: `phys_reg_name` is total only over the
+    /// ids it names and aborts on the XMM scratch ids 18/19.
+    fn machinst_buf_may_write_scratch_pair(&self) -> bool {
+        use super::machinst::{MachInst, MachReg};
+        // The scratch pair's PhysReg ids are XMM0_SCRATCH=18 and XMM1_SCRATCH=19.
+        // Known non-scratch destinations: GPRs (rax..rdi incl. rcx, the
+        // accumulator-pool ids 0-7/10-16, EGPR 40-55) and the allocatable XMM
+        // pool 20-33 (xmm2-xmm15, bank >= 2).
+        fn may_write_scratch_pair(p: crate::backend::regalloc::PhysReg) -> bool {
+            !matches!(p.0, 0..=7 | 10..=16 | 20..=33 | 40..=55)
+        }
+        let mut dsts = Vec::new();
+        for mi in &self.machinst_buf {
+            if matches!(
+                mi,
+                MachInst::Raw(..)
+                    | MachInst::Call { .. }
+                    | MachInst::CallTyped { .. }
+                    | MachInst::Cqto { .. }
+                    | MachInst::XorRdx { .. }
+                    | MachInst::Div { .. }
+            ) {
+                return true;
+            }
+            dsts.clear();
+            mi.dst_write_regs(&mut dsts);
+            for r in &dsts {
+                match r {
+                    MachReg::Phys(p) if !may_write_scratch_pair(*p) => {}
+                    _ => return true,
+                }
+            }
+        }
+        false
+    }
+
+    /// Body of the generic boundary flush. `commit_pending` decides whether a
+    /// deferred vector result is committed to its home slot here.
+    fn flush_machinst_impl(&mut self, commit_pending: bool) {
+        if self.machinst_buf.is_empty() {
+            // No machine instructions pending: nothing to emit. The IR shadow
+            // (`machinst_buf_ir`) may still hold entries from no-op lowerings
+            // — a coalesced Copy whose src and dest resolve to the same home
+            // (value_to_reg(src) == value_to_reg(dest)) emits zero MachInsts
+            // but is still recorded in the shadow. Drop the shadow too:
+            // leaving it behind lets a later flush — possibly in a *different
+            // function* after the boundary — replay stale IR whose values
+            // have no homes there, tripping the operand_to_rax hard gate
+            // (kernel drivers/tty/tty_io.c: tty_tiocmget replayed
+            // tty_get_tiocm's tail `Copy v19 = v12`). A no-op window needs no
+            // replay: the values are already at their destinations.
+            self.machinst_buf_ir.clear();
+            return;
+        }
+
+        use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
+
+        if mi_stream_dbg() {
+            lccc::cli::stderr_line(format_args!(
+                "### MI-STREAM fn={} n={}",
+                self.state.current_func_name,
+                self.machinst_buf.len()
+            ));
+            for mi in &self.machinst_buf {
+                lccc::cli::stderr_line(format_args!("  {mi:?}"));
+            }
+        }
+
+        // ── Window register allocation pipeline ─────────────────────────
+        // (1) Classify which vregs must get window registers (BEFORE
+        //     resolution, so the resolver can skip substituting exactly
+        //     those — mixing a slot-substituted read with a register-held
+        //     def of the same SSA value in one window would read a stale
+        //     slot image).
+        // (2) Resolve memory-form vreg positions to stack-slot operands
+        //     (the optimal folded-memory access, unchanged behavior).
+        // (3) Allocate window scratch registers for the classified vregs,
+        //     inserting reloads (arriving values) and stores (live-out
+        //     defs) — SSA-exact within the window.
+        // (4) A vreg that survives all three stages still trips the
+        //     unresolvable gate and replays the window through the default
+        //     path: the fail-safe, now the exception instead of the cliff.
+        let window_last_writes_fast: Option<FxHashMap<u8, super::machinst_alloc::WindowWriteKind>>;
+        let mut window_vreg_writers: FxHashMap<u8, u32> = FxHashMap::default();
+        let reg_classified = super::machinst_alloc::classify_window(
+            &self.machinst_buf,
+            Some(&self.state.small_slot_values),
+        );
+        // ACC-RESIDENT SUBSTITUTION eligibility, fail-closed on both
+        // axes: the window owns no scratch registers (an owned window may
+        // assign %rax to a vreg behind the substitution's back), and no
+        // instruction in the window touches %rax in any way.
+        let window_rax_free =
+            reg_classified.is_empty() && machinst_window_rax_free(&self.machinst_buf);
+        let acc_subst = window_rax_free;
+        let window_defs = if acc_subst {
+            machinst_window_defs(&self.machinst_buf)
+        } else {
+            crate::common::fx_hash::FxHashSet::default()
+        };
+        let resolved: Vec<MachInst> = self
+            .machinst_buf
+            .iter()
+            .map(|inst| {
+                resolve_stack_vregs(
+                    inst,
+                    &self.reg_assignments,
+                    &self.state,
+                    &reg_classified,
+                    acc_subst,
+                    &window_defs,
+                )
+            })
+            .collect();
+        let final_insts = if reg_classified.is_empty() {
+            // Fast path: nothing needs a window register — the resolution
+            // result is the emission input, exactly as before.
+            window_last_writes_fast =
+                Some(super::machinst_alloc::window_last_writes_core(&resolved));
+            window_vreg_writers.clear();
+            resolved
+        } else {
+            let ir_len = self.machinst_buf_ir.len() as u32;
+            let pp_end = self.state.current_program_point;
+            let window_span = (pp_end.saturating_sub(ir_len), pp_end.saturating_sub(1));
+            let ctx = super::machinst_alloc::WindowCtx {
+                slots: &self.state.value_locations,
+                small_slots: &self.state.small_slot_values,
+                types: &self.value_types,
+                total_uses: &self.value_use_counts,
+                alloca_values: &self.state.alloca_values,
+                reg_busy: &self.machine_reg_busy,
+                window_span,
+            };
+            let (insts, writes, vreg_writers) =
+                match super::machinst_alloc::allocate_window(resolved, &ctx) {
+                    Some(v) => v,
+                    None => {
+                        // Allocation refused (XMM domain, SSA discipline, pool
+                        // exhaustion, …): the skip-set vregs never got
+                        // substituted, so re-resolve WITHOUT the skip set —
+                        // giving the memory-operand path its chance before the
+                        // replay decides. The re-resolved sequence (when it
+                        // fully resolves, no replay) is what gets emitted, so
+                        // its writes must be classified by the core
+                        // classifier — an empty map here would let the
+                        // overlay skip the window entirely and leave stale
+                        // write-state facts pinned across it.
+                        let re_resolved: Vec<MachInst> = self
+                            .machinst_buf
+                            .iter()
+                            .map(|inst| {
+                                resolve_stack_vregs(
+                                    inst,
+                                    &self.reg_assignments,
+                                    &self.state,
+                                    &crate::common::fx_hash::FxHashSet::default(),
+                                    false,
+                                    &crate::common::fx_hash::FxHashSet::default(),
+                                )
+                            })
+                            .collect();
+                        let core_writes =
+                            super::machinst_alloc::window_last_writes_core(&re_resolved);
+                        (re_resolved, core_writes, FxHashMap::default())
+                    }
+                };
+            window_last_writes_fast = Some(writes);
+            window_vreg_writers = vreg_writers;
+            insts
+        };
+
+        let has_bad = final_insts
+            .iter()
+            .any(|mi| machinst_needs_text_fallback(mi, Some(&self.state.out)));
+        if has_bad {
+            if self.state.ra_config.mi_debug {
+                lccc::cli::stderr_line(format_args!(
+                    "[MI-FALLBACK] {} instructions -> default path",
+                    self.machinst_buf_ir.len()
+                ));
+                for mi in &final_insts {
+                    if has_unresolvable_vreg(mi, &self.reg_assignments) {
+                        lccc::cli::stderr_line(format_args!(
+                            "[MI-FALLBACK]   unresolvable: {mi:?}"
+                        ));
+                    }
+                }
+                for inst in &self.machinst_buf_ir {
+                    lccc::cli::stderr_line(format_args!("[MI-FALLBACK]   ir: {inst:?}"));
+                }
+            }
+            // CORRECTNESS: never delete instructions. Re-emit the buffered IR
+            // through the default (accumulator) codegen path, which handles
+            // stack-backed values in every position. The buffer is a
+            // straight-line sequence (flushed before calls and at block ends),
+            // the register cache is still valid for the pre-buffer state, and
+            // GEP folding is a pure optimization — an empty fold map keeps the
+            // default path semantics-identical.
+            let ir = std::mem::take(&mut self.machinst_buf_ir);
+            // The main dispatch loop already advanced once for each buffered
+            // instruction. Replay at those original points, then finish at
+            // exactly the same point; advancing from the current endpoint
+            // would double-count the whole fallback window and misalign later
+            // call-spanning save/restore intervals.
+            let replay_endpoint = self.state.current_program_point;
+            let replay_len = u32::try_from(ir.len())
+                .expect("MachInst replay window exceeds u32 program-point space");
+            self.state.current_program_point = replay_endpoint
+                .checked_sub(replay_len)
+                .expect("MachInst replay exceeds emitted IR program points");
+            for inst in ir {
+                crate::backend::generation::generate_instruction(
+                    self,
+                    &inst,
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                );
+                self.state.current_program_point += 1;
+            }
+            assert_eq!(
+                self.state.current_program_point, replay_endpoint,
+                "MachInst replay changed the IR program-point endpoint"
+            );
+            self.machinst_buf.clear();
+            return;
+        }
+
+        super::machinst_emit::emit_machinsts_with_tune(
+            &final_insts,
+            &mut self.state.out,
+            &self.tune,
+            crate::backend::x86::cpu_model::div64_bypass_killed(),
+        );
+
+        // Register-cache coherence (SOUNDNESS): the window's instructions
+        // may write %rax/%rcx (pre-colored div staging, Phys destinations)
+        // without the text-path cache ever seeing it. A stale acc/sec
+        // entry after the window would hand a later text consumer the
+        // wrong register content. The replay path above needs no such
+        // invalidation — it IS text emission, cache-maintained throughout.
+        self.state.reg_cache.invalidate_all();
+
+        // Home-freshness bookkeeping (SOUNDNESS): MachInst-buffered
+        // instructions bypass generate_instruction, so their destinations
+        // never passed through note_dest_defined at their own position. The
+        // whole window has now been emitted at this program point. Only a
+        // dest that was PRE-COLORED to its (then-fresh) home is actually in
+        // that home now — mark it. Every other homed dest was written to a
+        // window scratch register and/or its slot: invalidate its home so
+        // later consumers reload instead of reading whatever the window or
+        // an earlier in-place chain left there (kernel 6.18.50
+        // free_area_init_node: the fused mul-add consumed the zone POINTER
+        // as the loop index after the MachInst chain reused %r11 in place).
+        {
+            let ir_shadow = std::mem::take(&mut self.machinst_buf_ir);
+            // Invalidate EVERY shadow dest's freshness: a pre-colored dest's
+            // home may have been overwritten afterwards by a window scratch
+            // assignment to the same register (the window allocator does not
+            // model pre-colored operands as interference), and a Vreg dest
+            // landed in a scratch register whose identity is not tracked
+            // here. Consumers after the window rebuild the value through
+            // the slot/reload/remat paths (kernel 6.18.50
+            // free_area_init_node: a MachInst [Cast→%r11][Mul %r11,%r11]
+            // window left the sign-extended loop index marked fresh in %r11
+            // after the multiply had already replaced it, so the following
+            // fused mul-add consumed the ZONE POINTER as the index).
+            for inst in &ir_shadow {
+                let Some(dest) = inst.dest() else { continue };
+                if !self.reg_assignments.contains_key(&dest.0) {
+                    continue;
+                }
+                // Typed calls are emitted with their return move explicitly
+                // targeted at the allocator's home register (try_lower_call_
+                // typed builds CallRetMove from reg_assignments).  That home
+                // may already be marked clobbered by an earlier instruction
+                // in the same function; using home_clobbered as the sole
+                // "was this pre-colored?" test would then leave the freshly
+                // returned value falsely stale.  A call result is a new
+                // definition, so it re-establishes its home unconditionally.
+                let typed_call_home_def = matches!(
+                    inst,
+                    crate::ir::reexports::Instruction::Call { info, .. }
+                        | crate::ir::reexports::Instruction::CallIndirect { info, .. }
+                        if info.dest.as_ref().is_some_and(|d| d.0 == dest.0)
+                );
+                if typed_call_home_def || !self.home_clobbered.contains(&dest.0) {
+                    // Pre-colored destination (or a typed call return): the
+                    // window wrote the value into its home. Mark it fresh so
+                    // later consumers may read the home.
+                    self.note_home_written(dest.0);
+                } else {
+                    // Not pre-colored: the window's result went to scratch
+                    // and/or a slot; the home holds whatever preceded it.
+                    self.home_fresh.remove(&dest.0);
+                    self.mark_home_clobbered(dest.0, "asm-window");
+                }
+            }
+            // ── S11 write-state overlay (EXACT window accounting) ────────
+            // The note-bit loop above keeps the coarse freshness bits, but
+            // the write-state law needs the register-truth: which home
+            // registers did the EMITTED window actually write last, and
+            // was that write a pre-colored definition (Def) or scratch/
+            // clobber traffic (Clobber)? The classifier derives this from
+            // the post-allocation instruction sequence, so a pre-colored
+            // def is recognized even when an OLD clobber mark made the
+            // heuristic above believe the home was not written (the
+            // replay-min/max shape: `cmoval %esi, %r14d` targets the
+            // accumulator's home regardless of earlier marks).
+            let Some(last_writes) = &window_last_writes_fast else {
+                self.machinst_buf_ir = ir_shadow;
+                return;
+            };
+            for (reg_id, kind) in last_writes.iter() {
+                let home = PhysReg(*reg_id);
+                // `home_sharers` is the inverse of the function's final
+                // `reg_assignments` (built with it in the prologue): an O(1)
+                // answer where filtering the whole assignment map cost
+                // O(values) per written register per window -- quadratic in
+                // call-dense functions, which flush a window per call.
+                if self.home_sharers.get(reg_id).is_none_or(|s| s.is_empty()) {
+                    // Not a home register in this function: nothing to track.
+                    continue;
+                }
+                match kind {
+                    super::machinst_alloc::WindowWriteKind::Precolor => {
+                        // The last shadow dest homed in this register owns
+                        // the surviving pre-colored definition (multiple
+                        // same-home defs in one window are impossible for
+                        // simultaneously-live values; the LAST one is the
+                        // register's content).
+                        let owner = ir_shadow
+                            .iter()
+                            .filter_map(|inst| inst.dest())
+                            .rev()
+                            .find(|d| self.reg_assignments.get(&d.0).is_some_and(|&r| r == home));
+                        match owner {
+                            Some(v) => {
+                                self.home_write_state.insert(*reg_id, HomeWrite::Def(v.0));
+                            }
+                            None => {
+                                self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
+                            }
+                        }
+                    }
+                    super::machinst_alloc::WindowWriteKind::ScratchOrClobber => {
+                        // A window Vreg dst whose OWN home is this register
+                        // realized the group's next lineage member — a
+                        // definition, not scratch (the allocator may only
+                        // pick a dead-inside-the-window home for it, so
+                        // the disjoint-live-range invariant holds).
+                        match window_vreg_writers.get(reg_id) {
+                            // A Vreg whose own home is this register: a
+                            // group-member definition (the allocator may
+                            // only reuse a dead-inside-the-window home).
+                            Some(&v)
+                                if self.reg_assignments.get(&v).is_some_and(|&r| r == home) =>
+                            {
+                                if ws_watch(*reg_id) {
+                                    lccc::cli::stderr_line(format_args!(
+                                        "[WS-win] blk={} r{} vreg Def({})",
+                                        self.home_dbg_block, reg_id, v
+                                    ));
+                                }
+                                self.home_write_state.insert(*reg_id, HomeWrite::Def(v));
+                            }
+                            // Inserted reload into foreign scratch, an
+                            // unnamed-Raw touch, or an unsaved call
+                            // clobber: foreign content.
+                            other => {
+                                if ws_watch(*reg_id) {
+                                    lccc::cli::stderr_line(format_args!(
+                                        "[WS-win] blk={} r{} Clobber writer={:?} kind={:?} state_before={:?}",
+                                        self.home_dbg_block,
+                                        reg_id,
+                                        other,
+                                        window_last_writes_fast
+                                            .as_ref()
+                                            .and_then(|m| m.get(reg_id)),
+                                        self.home_write_state.get(reg_id)
+                                    ));
+                                }
+                                self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
+                            }
+                        }
+                    }
+                }
+            }
+            self.machinst_buf_ir = ir_shadow;
+        }
+
+        self.machinst_buf.clear();
+        self.machinst_buf_ir.clear();
+        self.state.reg_cache.invalidate_all();
+        if commit_pending {
+            self.flush_pending_vec_store_impl();
+        }
+        // A BOOKKEEPING flush, not a register clobber: every instruction in
+        // `machinst_buf` was already accounted for when it was generated (its
+        // emitter ran `set_vec_home_reg` / `vec_evict_bank_*` / the store
+        // helpers), so committing the buffer changes no vector register.
+        //
+        // `invalidate_vec_peephole` nevertheless clears the home-content map,
+        // because for every OTHER caller (calls, unknown control flow, opaque
+        // asm) the registers really are dead. Preserving just that map here is
+        // what lets a loop-invariant vector constant stay in its YMM register
+        // past a buffer boundary: without it the clamp bounds were re-read
+        // from their stack slots on every iteration after the first.
+        let home_reg = std::mem::take(&mut self.state.vec_home_reg);
+        self.state.invalidate_vec_peephole();
+        self.state.vec_home_reg = home_reg;
     }
 }
 
@@ -12870,6 +12940,108 @@ mod target_feature_isa_tests {
                 popcnt: true,
                 ..none
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod machinst_scratch_flush_tests {
+    use super::*;
+    use crate::backend::x86::codegen::machinst::{
+        MachInst, MachOperand, MachReg, OpSize, R12, RAX, XMM0_SCRATCH, XMM1_SCRATCH,
+    };
+
+    fn gpr_mov() -> MachInst {
+        MachInst::Mov {
+            src: MachOperand::Reg(MachReg::Phys(RAX)),
+            dst: MachOperand::Reg(MachReg::Phys(R12)),
+            size: OpSize::S64,
+        }
+    }
+
+    fn fmov_to(reg: PhysReg) -> MachInst {
+        MachInst::FMov {
+            src: MachOperand::Reg(MachReg::Phys(reg)),
+            dst: MachOperand::Reg(MachReg::Phys(reg)),
+            size: OpSize::S64,
+        }
+    }
+
+    fn buffered(insts: Vec<MachInst>) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.machinst_buf.extend(insts);
+        cg
+    }
+
+    /// The `vmovd` staging write and the GP lowering are the only instructions
+    /// in the broadcast window, so a GP-only run must be recognised as safe.
+    #[test]
+    fn gp_only_and_pool_xmm_runs_cannot_write_the_scratch_pair() {
+        assert!(!X86Codegen::new().machinst_buf_may_write_scratch_pair());
+        assert!(!buffered(vec![gpr_mov()]).machinst_buf_may_write_scratch_pair());
+        // xmm2 is the first allocatable XMM (PhysReg 20): bank >= 2.
+        assert!(
+            !buffered(vec![fmov_to(PhysReg(20)), gpr_mov()]).machinst_buf_may_write_scratch_pair()
+        );
+    }
+
+    /// The XMM scratch registers are PhysReg 18/19. Naming them through
+    /// `phys_reg_name` aborts the compiler, so this must classify them by id.
+    #[test]
+    fn xmm_scratch_writes_are_detected_without_naming_them() {
+        assert!(buffered(vec![fmov_to(XMM0_SCRATCH)]).machinst_buf_may_write_scratch_pair());
+        assert!(buffered(vec![fmov_to(XMM1_SCRATCH)]).machinst_buf_may_write_scratch_pair());
+    }
+
+    /// Unknown ids, virtual destinations and implicit or opaque writers are
+    /// conservative writes. A missed write is a miscompile; a false one is only
+    /// a lost optimisation.
+    #[test]
+    fn unknown_virtual_and_opaque_writers_are_conservative() {
+        assert!(buffered(vec![fmov_to(PhysReg(9))]).machinst_buf_may_write_scratch_pair());
+        let vreg = MachInst::FMov {
+            src: MachOperand::Reg(MachReg::Phys(RAX)),
+            dst: MachOperand::Reg(MachReg::Vreg(7)),
+            size: OpSize::S64,
+        };
+        assert!(buffered(vec![vreg]).machinst_buf_may_write_scratch_pair());
+        assert!(
+            buffered(vec![MachInst::Raw("vzeroupper".into())])
+                .machinst_buf_may_write_scratch_pair()
+        );
+        assert!(
+            buffered(vec![MachInst::Call { target: "f".into() }])
+                .machinst_buf_may_write_scratch_pair()
+        );
+    }
+
+    /// The commit decision: commit unless the broadcast keeps a bank-0/1 value
+    /// AND the buffered run cannot write the scratch pair.
+    #[test]
+    fn broadcast_boundary_commits_unless_the_run_is_scratch_safe() {
+        let mut cg = buffered(vec![gpr_mov()]);
+        assert!(
+            cg.broadcast_boundary_commits_pending(),
+            "no pending value: nothing to protect"
+        );
+
+        cg.state.pending_vec_store = Some((0, "ymm0", true));
+        assert!(
+            !cg.broadcast_boundary_commits_pending(),
+            "a safe run keeps the bank-0 value"
+        );
+
+        cg.machinst_buf.push(fmov_to(XMM0_SCRATCH));
+        assert!(
+            cg.broadcast_boundary_commits_pending(),
+            "a scratch write forces the commit"
+        );
+
+        let mut claimable = buffered(vec![gpr_mov()]);
+        claimable.state.pending_vec_store = Some((0, "ymm2", true));
+        assert!(
+            claimable.broadcast_boundary_commits_pending(),
+            "bank >= 2 is never kept"
         );
     }
 }

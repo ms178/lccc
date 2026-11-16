@@ -7933,7 +7933,17 @@ fn generate_function_body(
                 cg.state().current_program_point += 1;
                 continue;
             }
-            cg.flush_machinst();
+            if matches!(
+                inst,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::VecBroadcastI32x8,
+                    ..
+                }
+            ) {
+                cg.flush_machinst_before_broadcast();
+            } else {
+                cg.flush_machinst();
+            }
 
             // Fold `load; cmp { Eq|Ne, 0 }` into a memory compare: skip the
             // load and hand its (ptr, ty) to the Cmp, which emits
