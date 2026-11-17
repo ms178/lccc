@@ -4350,7 +4350,11 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Psrawi256
         | B::X86Psradi256
         | B::X86Pslldqi256
-        | B::X86Psrldqi256 => IntrinsicRequirement {
+        | B::X86Psrldqi256
+        // `vbroadcasti128` (`_mm256_broadcastsi128_si256` and the bundled
+        // header's `__builtin_ia32_vbroadcasti128`) is AVX2, not AVX: without
+        // this arm an `-mavx` translation unit compiled it silently.
+        | B::X86Broadcast128to256 => IntrinsicRequirement {
             feature: F::Avx2,
             flag: "-mavx2",
             also: None,

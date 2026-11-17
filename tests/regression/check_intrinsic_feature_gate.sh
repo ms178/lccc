@@ -118,6 +118,39 @@ reject vpclmul256.c -mvpclmulqdq -mvaes -march=alderlake -mno-vpclmulqdq
 accept vpclmul256.c vpclmulqdq -mvpclmulqdq
 accept vpclmul256.c vpclmulqdq -march=alderlake
 
+# AVX2 broadcast.  `vbroadcasti128` is an AVX2 instruction, so the raw builtin
+# (which the bundled header calls on the AVX2 path) and the public AVX2 wrapper
+# `_mm256_broadcastsi128_si256` both need -mavx2.  Before this gate an -mavx
+# translation unit compiled them silently to AVX2 code.
+cat >"$tmp/bc128.c" <<'EOF'
+typedef long long v2di __attribute__((vector_size(16)));
+typedef long long v4di __attribute__((vector_size(32)));
+v4di bc128(v2di x) { return __builtin_ia32_vbroadcasti128(x); }
+EOF
+cat >"$tmp/bc128_wrap.c" <<'EOF'
+#include <immintrin.h>
+__m256i bc128_wrap(__m128i x) { return _mm256_broadcastsi128_si256(x); }
+EOF
+reject bc128.c -mavx2 -mavx
+reject bc128.c -mavx2 -march=x86-64-v2   # no AVX at all
+accept bc128.c vbroadcasti128 -mavx2
+accept bc128.c vbroadcasti128 -march=x86-64-v3
+reject bc128_wrap.c -mavx2 -mavx
+accept bc128_wrap.c vbroadcasti128 -mavx2
+
+# The AVX1 broadcast path must stay available: `_mm256_broadcast_ps` under
+# -mavx may not use the AVX2 builtin (its header branch is the AVX1 one).
+cat >"$tmp/bc_avx1.c" <<'EOF'
+#include <immintrin.h>
+__m256 bc_avx1(const float *p) { return _mm256_broadcast_ps((const __m128 *)p); }
+EOF
+if ! "$ccc" -O2 -mavx -S "$tmp/bc_avx1.c" -o "$tmp/bc_avx1.s"; then
+    fail "_mm256_broadcast_ps was rejected under -mavx; its AVX1 path must compile"
+fi
+if grep -q 'vbroadcasti128' "$tmp/bc_avx1.s"; then
+    fail "_mm256_broadcast_ps under -mavx emitted the AVX2 vbroadcasti128"
+fi
+
 # The 32-bit target has the same rule and the same escape hatch: i686 has no
 # SSE4.2 by default, and `-msse4.2` is what grants it.
 reject crc.c -msse4.2 -m32
