@@ -1127,10 +1127,17 @@ pub struct X86Codegen {
     pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
     /// True when the target has AVX2; gates YMM constant-size copies.
     pub(super) avx2_enabled: bool,
-    /// VEX (AVX1) permission, separate from `avx2_enabled`. The 256-bit FLOAT
-    /// bitwise emitters need only AVX; keying them on AVX2 emitted a legacy
-    /// 128-bit `xorps` for a 256-bit operand under `-mavx`, dropping the upper
-    /// lanes. The 128-bit encodings still key on `avx2_enabled` (follow-up).
+    /// VEX (AVX1) permission, separate from `avx2_enabled`. It is read by
+    /// `try_emit_bitwise_lane_const` (both the float `xorps`/`andps` forms and
+    /// the integer `vpand`/`vpor`/`vpxor` forms reach it) and by the register
+    /// broadcast helper `emit_vbroadcast_xmm_to_ymm`. Keying the 256-bit FLOAT
+    /// bitwise forms on AVX2 emitted a legacy 128-bit `xorps` for a 256-bit
+    /// operand under `-mavx`, dropping the upper lanes.
+    ///
+    /// Caveat: the integer 256-bit logic forms are reachable through this cell
+    /// too, so under `-mavx` they can emit AVX2 `vpand`/`vpor`/`vpxor` with a
+    /// constant operand. That is an open ISA-gate defect (see the PR body audit);
+    /// it is not fixed by this cell.
     pub(super) avx_enabled: bool,
     /// Code-generation ISA permission for the current TU (VEX / SSE4.1 /
     /// FMA3 / ymm).  Every text emitter consults this instead of assuming a
