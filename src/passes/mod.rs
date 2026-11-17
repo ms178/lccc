@@ -67,6 +67,7 @@ pub(crate) mod loop_analysis;
 pub(crate) mod loop_bound;
 pub(crate) mod loop_carried_forward;
 pub(crate) mod loop_idiom;
+pub(crate) mod loop_idiom_fill;
 pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_memset;
@@ -585,6 +586,33 @@ where
         }
     }
     total
+}
+
+/// In-pipeline copy propagation that spares deliberate constant homes.
+///
+/// `fp_const_hoist` and `int_const_hoist` materialize loop-invariant
+/// constants as `Copy dest = Const` in preheaders so register allocation can
+/// keep them live across the loop. Any later cleanup that runs the PLAIN
+/// propagator forwards those copies straight back into their uses and
+/// re-sinks the per-iteration materialization (movabsq / movz+movk /
+/// lui+addi) the hoist existed to remove. Every `propagate_copies` call site
+/// that executes after the hoists MUST go through this wrapper; the driver's
+/// final cleanup (`driver/pipeline.rs`) applies the same criterion with its
+/// own live-range-splitter floor.
+fn propagate_copies_sparing_const_homes(
+    func: &mut crate::ir::reexports::IrFunction,
+    target: crate::backend::Target,
+) -> usize {
+    let int_homes = match int_const_hoist::model_for(target) {
+        Some(m) => int_const_hoist::const_homes(func, m),
+        None => Default::default(),
+    };
+    let spare = |v: crate::ir::reexports::Value, c: &crate::ir::reexports::IrConst| {
+        fp_const_hoist::is_hoisted_fp_const(c) || int_homes.contains(&v.0)
+    };
+    // u32::MAX floor: every constant copy consults `spare` (there is no
+    // splitter-freshness distinction inside the pass pipeline).
+    copy_prop::propagate_copies_sparing(func, u32::MAX, &spare)
 }
 
 /// Run GVN, LICM, and IVSR with shared CFG analysis per function.
@@ -1145,7 +1173,7 @@ fn run_inline_phase(
     // Promote loop-carried memory locations (struct fields / array cells with
     // invariant addresses) into SSA values across the loop body.
     if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
-        module.for_each_function(loop_memory_promote::run);
+        loop_memory_promote::run_module(module);
     }
     iphase_dump!("cleanup-loop-memory-promote");
     // Loop-carried store-to-load forwarding (distance-1 predictive
@@ -2894,7 +2922,7 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "loop_idiom",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    loop_idiom::run_function(func, &symbol_facts, loop_idiom_capabilities)
+                    loop_idiom::run_function(func, &symbol_facts, loop_idiom_capabilities, target)
                 })
             );
             total_changes += n;
@@ -4329,13 +4357,28 @@ pub(crate) fn run_passes(
     // Run memory-recurrence promotion again after CFG and copy cleanup have
     // exposed canonical natural loops.
     if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
-        module.for_each_function(loop_memory_promote::run);
+        loop_memory_promote::run_module(module);
         module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
     }
     // Late loop-carried forwarding: IVSR / CFG cleanup expose marching-pointer
     // recurrences that the early run could not normalise.
     loop_carried_forward::run_module(module);
     verify::verify_after_pass(module, "loop_carried_forward_late");
+    // Re-CSE global address webs one last time. The loop passes above
+    // (iv_widen, loop_rotate, ivsr/univsr, loop_memory_promote,
+    // loop_carried_forward) run AFTER the "post_unroll" global_addr_cse and
+    // can leave duplicate same-symbol GlobalAddrs behind (promote's
+    // preheader rewrite left `sqlite_varint_bytes` materialized twice in
+    // one block; the loop body then used the un-CSE'd copy and the
+    // register allocator rematerialized a `leaq sym(%rip)` + `addq` chain
+    // inside the hot decode loop, every iteration). The pass is O(n) and
+    // idempotent by design — same justification as the post-unroll run —
+    // and its site-local classification is position-independent, so
+    // running it after the loop passes cannot disturb SIB selection.
+    if !pass_disabled(&disabled, "gaddrcse") {
+        global_addr_cse::run_module(module);
+        verify::verify_after_pass(module, "global_addr_cse_late");
+    }
     // Loop-memset recognition (LMR): constant-byte fill loops → memset(3).
     // Companion to the early loop_idiom pass (byte-COPY loops → memcpy):
     // its census refuses stored load results, so the two passes are
@@ -4498,8 +4541,20 @@ pub(crate) fn run_passes(
         if n > 0 {
             // Clones end in jumps to single-predecessor blocks and carry
             // phi-turned-Copy instructions: merge, propagate, collect.
+            // Constant homes are spared: jump_thread runs AFTER
+            // fp/int_const_hoist, and the plain propagator used to forward
+            // each hoisted `Copy K` straight back into its loop-body uses —
+            // re-sinking the movabsq/movz+movk materialization into every
+            // iteration the hoist had just lifted it out of (fold-style FNV
+            // loops lost their prime register whenever the promote
+            // guarded-writeback diamond gave jump_thread something to
+            // thread).
             module.for_each_function(cfg_simplify::simplify_cfg);
-            module.for_each_function(copy_prop::propagate_copies);
+            for func in &mut module.functions {
+                if !func.is_declaration {
+                    propagate_copies_sparing_const_homes(func, target);
+                }
+            }
             module.for_each_function(dce::eliminate_dead_code);
             verify::verify_after_pass(module, "jump_thread_cleanup");
         }
@@ -4571,8 +4626,17 @@ pub(crate) fn run_passes(
     // engineering/SSE2-CODEGEN-MATRIX.md.
     if !pass_disabled(&disabled, "aggcopy16") {
         let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+        // Value-form `VecExtractLane*` is an x86-64-only shape: the i686
+        // backend implements only the pointer form (`reject_value_form`
+        // ICEs otherwise), and the aarch64/riscv64 lanes never reach this
+        // pattern but must still fail closed.
+        let value_lane_extracts = target == crate::backend::Target::X86_64;
         module.for_each_function(|func| {
-            aggregate_pair_roundtrip::run_with_symbol_facts(func, &symbol_facts)
+            aggregate_pair_roundtrip::run_with_symbol_facts(
+                func,
+                &symbol_facts,
+                value_lane_extracts,
+            )
         });
         verify::verify_after_pass(module, "aggcopy16");
     }
@@ -4791,12 +4855,14 @@ pub(crate) fn run_passes(
 
     // Producer ranges survive copies/casts without conflating carrier widths.
     // Run after transformations that reason about signed integer domains.
+    // The cleanup spares constant homes for the same reason as
+    // jump_thread's: this site also runs after fp/int_const_hoist.
     if !pass_disabled(&disabled, "intbounds") {
         module.for_each_function(|f| {
             let changed = integer_bounds::run(f);
             if changed != 0 {
                 if !pass_disabled(&disabled, "copyprop") {
-                    copy_prop::propagate_copies(f);
+                    propagate_copies_sparing_const_homes(f, target);
                 }
                 if !pass_disabled(&disabled, "dce") {
                     dce::eliminate_dead_code(f);

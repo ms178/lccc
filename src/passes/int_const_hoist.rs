@@ -285,38 +285,86 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     // possible and inner loops can reuse the dominating value.
     loops.sort_by_key(|l| l.body.len());
     loops.reverse();
-    // The candidate constants of every loop body, taken before any rewrite
-    // (an outer hoist turns the inner loops' operands into values).
-    let consts_in: Vec<FxHashSet<u64>> = loops
+    // The blocks of each loop that execute on EVERY iteration: blocks that
+    // dominate every latch. Only uses there justify a hoist — a use on a
+    // conditional path pays its materialization only when that path runs,
+    // while the hoisted value occupies a register (and, under pressure, a
+    // callee-saved push/pop) for the whole loop. Measured: sqlite_varint's
+    // 9-byte-decode constants (2^63, 2^35) sit on a path taken on a
+    // fraction of iterations; pinning them cost two callee-saved registers
+    // across the main encode loop for no per-iteration saving. A use on a
+    // conditional path still REUSES a value hoisted for an every-iteration
+    // use (the rewrite below covers the whole body).
+    let every_iter: Vec<Vec<usize>> = loops
         .iter()
         .map(|lp| {
-            let mut set = FxHashSet::default();
-            for &bi in &lp.body {
+            let latches: Vec<usize> = cfg
+                .preds
+                .row(lp.header)
+                .iter()
+                .map(|&v| v as usize)
+                .filter(|b| lp.body.contains(b))
+                .collect();
+            lp.body
+                .iter()
+                .copied()
+                .filter(|&b| {
+                    latches
+                        .iter()
+                        .all(|&l| analysis::dominates_idom(&cfg.idom, b, l))
+                })
+                .collect()
+        })
+        .collect();
+    // The whole-body candidate constants of every loop, taken before any
+    // rewrite (an outer hoist turns the inner loops' operands into values).
+    // Blocks are walked in sorted order so the census is deterministic
+    // regardless of the loop body's set iteration order.
+    let whole_body: Vec<Vec<u64>> = loops
+        .iter()
+        .map(|lp| {
+            let mut blocks: Vec<usize> = lp.body.iter().copied().collect();
+            blocks.sort_unstable();
+            let mut consts: Vec<u64> = Vec::new();
+            let mut seen: FxHashSet<u64> = FxHashSet::default();
+            for &bi in &blocks {
                 for inst in &func.blocks[bi].instructions {
                     for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
                         if let Some(bits) = large_int_const(op, need, imm32_exact) {
-                            set.insert(bits);
+                            if seen.insert(bits) {
+                                consts.push(bits);
+                            }
                         }
                     });
                 }
             }
-            set
+            consts
         })
         .collect();
-    let leaves_in = leaf_subloops(&loops);
-    let model = MODEL.with(|c| c.get());
-
-    // const bits -> (hoisted value id, body of the loop whose preheader defines it)
-    let mut hoisted: FxHashMap<u64, (u32, FxHashSet<usize>)> = FxHashMap::default();
-    let mut count = 0;
-    for (li, lp) in loops.iter().enumerate() {
-        let Some(preheader) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else {
-            continue;
-        };
-        // Distinct large constants used in this loop body, in program order.
+    // What each loop will consider hoisting, in lockstep with the per-loop
+    // candidate walk below: the leaf-loop rule reads this census to predict
+    // whether a nested leaf will hoist the same constant, and the two views
+    // must not diverge.
+    //
+    // Selection rule. Every-iteration candidates always qualify: each one
+    // earns its register on every trip. A candidate that appears ONLY on
+    // conditional paths qualifies exactly when it is the loop's sole such
+    // constant: pinning one register for it is bounded — the trade GCC
+    // takes universally (expat_xml_scan's FNV prime sits on the hot name
+    // path of a three-way dispatch, and re-materializing it per name cost
+    // ~2% of the kernel) — while pinning several is the measured
+    // sqlite_varint loss (four switch-arm decode constants evicting the
+    // working set). The competition metric deliberately counts only the
+    // CONDITIONAL candidates: an every-iteration constant is hoisted no
+    // matter what, so it cannot make a lone rare-path constant any less
+    // worth a register (on RISC-V a branch-fused compare bound like
+    // `p[i] >= 64` is itself a register candidate, and counting it against
+    // a five-instruction `li` multiplier left that expansion inside the
+    // loop arm).
+    let every_iter_consts = |li: usize| -> Vec<u64> {
         let mut consts: Vec<u64> = Vec::new();
         let mut seen: FxHashSet<u64> = FxHashSet::default();
-        for &bi in &lp.body {
+        for &bi in &every_iter[li] {
             for inst in &func.blocks[bi].instructions {
                 for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
                     if let Some(bits) = large_int_const(op, need, imm32_exact) {
@@ -327,6 +375,77 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 });
             }
         }
+        consts
+    };
+    let selected = |li: usize, every: Vec<u64>| -> Vec<u64> {
+        let mut consts = every;
+        let in_every: FxHashSet<u64> = consts.iter().copied().collect();
+        let conditional: Vec<u64> = whole_body[li]
+            .iter()
+            .copied()
+            .filter(|bits| !in_every.contains(bits))
+            .collect();
+        if let [lone] = conditional[..] {
+            consts.push(lone);
+        }
+        consts
+    };
+    let consts_in: Vec<FxHashSet<u64>> = (0..loops.len())
+        .map(|li| selected(li, every_iter_consts(li)).into_iter().collect())
+        .collect();
+    let leaves_in = leaf_subloops(&loops);
+    let model = MODEL.with(|c| c.get());
+    let dbg = std::env::var_os("CCC_DEBUG_INTCONST").is_some();
+    if dbg {
+        lccc::cli::stderr_line(format_args!(
+            "[intconst] fn={} blocks={} loops={}",
+            func.name,
+            func.blocks.len(),
+            loops.len()
+        ));
+    }
+
+    // const bits -> (hoisted value id, body of the loop whose preheader defines it)
+    let mut hoisted: FxHashMap<u64, (u32, FxHashSet<usize>)> = FxHashMap::default();
+    let mut count = 0;
+    for (li, lp) in loops.iter().enumerate() {
+        let Some(preheader) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else {
+            if dbg {
+                lccc::cli::stderr_line(format_args!(
+                    "[intconst]  loop hdr={} NO PREHEADER",
+                    lp.header
+                ));
+            }
+            continue;
+        };
+        // Distinct large constants used on every iteration of this loop
+        // (blocks dominating every latch), in program order — plus the
+        // loop's lone conditional-path candidate, if any (the selection
+        // rule documented at the census above; the two selections MUST
+        // stay in lockstep). The rewrite below still covers the whole
+        // body: once a constant earns its register, conditional-path uses
+        // of the same constant ride along for free.
+        let mut consts: Vec<u64> = Vec::new();
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
+        for &bi in &every_iter[li] {
+            for inst in &func.blocks[bi].instructions {
+                for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                    if let Some(bits) = large_int_const(op, need, imm32_exact) {
+                        if seen.insert(bits) {
+                            consts.push(bits);
+                        }
+                    }
+                });
+            }
+        }
+        let conditional: Vec<u64> = whole_body[li]
+            .iter()
+            .copied()
+            .filter(|bits| !seen.contains(bits))
+            .collect();
+        if let [lone] = conditional[..] {
+            consts.push(lone);
+        }
         // A constant one register-free instruction rematerializes leaves
         // this loop only if every leaf loop nested in it uses the constant:
         // otherwise the hoisted register stays live through a hot leaf loop
@@ -336,12 +455,21 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         // across the byte loop and spilled the block bound, +2 stack
         // operands and a callee-saved push/pop). A leaf loop that uses it
         // still hoists it to its own preheader when its turn comes.
+        if dbg {
+            lccc::cli::stderr_line(format_args!(
+                "[intconst]  loop hdr={} preheader={} candidates={:?}",
+                lp.header, preheader, consts
+            ));
+        }
         consts.retain(|&bits| {
             !single_insn_materialization(model, &IrConst::I64(bits as i64))
                 || leaves_in[li]
                     .iter()
                     .all(|&leaf| consts_in[leaf].contains(&bits))
         });
+        if dbg {
+            lccc::cli::stderr_line(format_args!("[intconst]  after leaf-rule: {:?}", consts));
+        }
 
         for bits in consts {
             // Reuse a previously hoisted value when its definition dominates

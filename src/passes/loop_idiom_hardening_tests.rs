@@ -222,7 +222,8 @@ fn native_permission_is_explicit_and_does_not_leak_between_invocations() {
                 Capabilities {
                     native_popcount: enabled,
                     i686_sse: false,
-                }
+                },
+                crate::backend::Target::X86_64
             ),
             usize::from(enabled)
         );

@@ -1124,13 +1124,24 @@ fi
 # larger, and the two are measurably identical at runtime (110.61 vs 110.52 ms,
 # ratio 1.0008, min of 9 interleaved samples). The count moved because a
 # placement decision was reconsidered, not because code quality regressed.
+# Budget move, 2026-11-13 (global-address web merge): reduction_vecreg
+# 104 -> 105. global_addr_cse now gives a symbol ONE web once a call
+# forces its address into a register (the sqlite_varint fix: the split
+# webs cost a rematerialized leaq+addq every hot-loop iteration there).
+# Here the merged input_a/input_b webs live across main's timing loop in
+# callee-saved registers: +2 push/pop pairs in the prologue/epilogue,
+# while the per-rep call arguments become movq reg,reg instead of
+# rematerialized leaq sym(%rip) — same count, same cost. Measured
+# identical at runtime: 800.6 vs 799.9 ms median, ratio 0.9992 (min
+# ratio 1.0006), 15 interleaved samples. Instructions moved to the
+# prologue; nothing regressed per iteration.
 declare -A BUDGET=(
     [chacha20_block]=258
     [double_reduction]=140
     [libm_round_family]=207
     [matmul]=126
     [nbody]=312
-    [reduction_vecreg]=104
+    [reduction_vecreg]=105
     [sha256_transform]=355
     [spectral_norm]=287
     [struct_copy]=136

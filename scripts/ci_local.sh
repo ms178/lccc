@@ -372,6 +372,8 @@ gate "x86-scalar-intrinsics" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" sh tests/regression/check_x86_scalar_intrinsics.sh
 gate "atomic16-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_atomic16_runtime.sh
+gate "rw-data-page-alignment" fast \
+    env CCC="$LCCC" bash tests/regression/check_rw_data_page_alignment.sh
 gate "i128-atomic-call-clobber" fast \
     env CCC="$LCCC" GCC16="${GCC16:-gcc-16}" \
     bash tests/regression/check_i128_atomic_call_clobber.sh
@@ -2606,6 +2608,11 @@ gate "round-cap-observability" fast \
 # T6: the IR verifier (CCC_VERIFY_IR=abort) stays clean on a fixed 80-file subset.
 gate "verify-ir-clean" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_verify_ir_clean.sh
+
+# Wide-constant hoist placement: hoists survive jump_thread's cleanup,
+# rare-path constants stay at their conditional sites.
+gate "int-const-hoist-loop" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_int_const_hoist_loop.sh
 
 # The dual-layout tie rule: the fixture still ties, the two arms differ, the
 # default arm emits one fewer conditional branch, and both agree with the

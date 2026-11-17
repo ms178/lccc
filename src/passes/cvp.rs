@@ -184,6 +184,98 @@ fn proves_nonzero(
     })
 }
 
+/// Whether `value`'s definition (read through copies) is a two-operand
+/// difference — `Xor` or wrapping `Sub` — whose operands an active fact
+/// proves unequal. A difference of unequal values is nonzero, so a
+/// `Ctz`/`Clz` reading it satisfies the nonzero contract.
+///
+/// This is the fact channel `bit_idioms`'s difference-branch rewrite relies
+/// on: it turns `CondBranch(a ^ b)` into `CondBranch(a != b)`, which trades
+/// the direct nonzero edge fact about the difference for a boolean fact
+/// about the comparison. Reading the comparison's operands back here keeps
+/// the `CtzNonZero` promotion (bare `bsf`/`tzcnt`, no zero guard) that the
+/// pre-rewrite shape already earned — zlib-ng's `compare256` consumes
+/// `ctz(sv ^ mv)` exactly one edge below `if (sv != mv)`.
+fn difference_proves_nonzero(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    facts: &[Fact],
+    mut value: Value,
+) -> bool {
+    for _ in 0..16 {
+        let Some(&(bi, ii)) = defs.get(&value) else {
+            return false;
+        };
+        match &func.blocks[bi].instructions[ii] {
+            Instruction::Copy {
+                src: Operand::Value(v),
+                ..
+            } => value = *v,
+            Instruction::BinOp {
+                op: crate::ir::reexports::IrBinOp::Xor | crate::ir::reexports::IrBinOp::Sub,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if ty.is_integer() => {
+                return facts
+                    .iter()
+                    .any(|f| fact_proves_unequal(func, defs, f, lhs, rhs, *ty));
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether fact `f` pins an integer comparison of `a` against `b` — at the
+/// width of `ty` — to an outcome that implies `a != b`: a strict ordering or
+/// `Ne` known true, or a non-strict ordering or `Eq` known false. The fact's
+/// subject must itself be defined by the comparison; the match is on the
+/// operand pair in either order, since every listed predicate's implication
+/// is symmetric in the pair.
+///
+/// Width discipline: the comparison proves the operands differ *as
+/// `cmp_ty`-wide values*, which only transfers to a difference computed at
+/// the same width — a 32-bit disequality says nothing about bits 32..64 of
+/// a 64-bit `Xor` of the same registers.
+fn fact_proves_unequal(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    f: &Fact,
+    a: &Operand,
+    b: &Operand,
+    ty: IrType,
+) -> bool {
+    let Some(&(bi, ii)) = defs.get(&f.value) else {
+        return false;
+    };
+    let Instruction::Cmp {
+        op,
+        lhs,
+        rhs,
+        ty: cmp_ty,
+        ..
+    } = &func.blocks[bi].instructions[ii]
+    else {
+        return false;
+    };
+    if !cmp_ty.is_integer() || cmp_ty.size() != ty.size() {
+        return false;
+    }
+    if !((lhs == a && rhs == b) || (lhs == b && rhs == a)) {
+        return false;
+    }
+    // The fact pins the comparison's boolean carrier: excluded zero means
+    // the compare held, the singleton zero set means it did not.
+    let known_true = !f.set.is_empty() && f.set.iter().all(|&(lo, hi)| !(lo <= 0 && 0 <= hi));
+    let known_false = f.set.as_slice() == [(0, 0)];
+    match op {
+        IrCmpOp::Ne | IrCmpOp::Slt | IrCmpOp::Sgt | IrCmpOp::Ult | IrCmpOp::Ugt => known_true,
+        IrCmpOp::Eq | IrCmpOp::Sle | IrCmpOp::Sge | IrCmpOp::Ule | IrCmpOp::Uge => known_false,
+    }
+}
+
 /// Resolve an operand to the integer constant it must hold, looking through
 /// copies and constant casts, together with the bit width it is seen at.
 /// Frontends routinely materialise small literals as `Cast(Const)` pairs, so a
@@ -1349,7 +1441,8 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
                         src: Operand::Value(src),
                         ty,
                     } if proves_nonzero(&stack, *src, &casts)
-                        || def_proves_nonzero(func, &defs, &casts, *src) =>
+                        || def_proves_nonzero(func, &defs, &casts, *src)
+                        || difference_proves_nonzero(func, &defs, &stack, *src) =>
                     {
                         Some(Instruction::UnaryOp {
                             dest: *dest,
@@ -1678,6 +1771,103 @@ mod tests {
             0,
             "specialization is idempotent"
         );
+    }
+
+    /// `b0: c = Cmp(a, b); br c, b1, b2`, with `ctz(a <diff_op> b)` computed
+    /// in BOTH arms — the zlib-ng `compare256` exit shape after bit_idioms
+    /// rewrites `if (a ^ b)` into `if (a != b)`.
+    fn diff_guarded_ctz(cmp_op: IrCmpOp, cmp_ty: IrType, diff_op: IrBinOp) -> IrFunction {
+        let (a, b) = (Operand::Value(Value(1)), Operand::Value(Value(2)));
+        let arm = |xor_dest: u32, ctz_dest: u32| {
+            mk(
+                if xor_dest == 4 { 1 } else { 2 },
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(xor_dest),
+                        op: diff_op,
+                        // Swapped relative to the compare: the disequality
+                        // proof is symmetric in the pair.
+                        lhs: b,
+                        rhs: a,
+                        ty: IrType::U64,
+                    },
+                    Instruction::UnaryOp {
+                        dest: Value(ctz_dest),
+                        op: IrUnaryOp::Ctz,
+                        src: Operand::Value(Value(xor_dest)),
+                        ty: IrType::U64,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(ctz_dest)))),
+            )
+        };
+        let mut f = IrFunction::new("diff_ctz".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![Instruction::Cmp {
+                    dest: Value(3),
+                    op: cmp_op,
+                    lhs: a,
+                    rhs: b,
+                    ty: cmp_ty,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(3)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            arm(4, 5),
+            arm(6, 7),
+        ];
+        f.next_value_id = 8;
+        f
+    }
+
+    fn arm_count_op(f: &IrFunction, block: usize) -> IrUnaryOp {
+        match f.blocks[block].instructions[1] {
+            Instruction::UnaryOp { op, .. } => op,
+            _ => panic!("count instruction"),
+        }
+    }
+
+    #[test]
+    fn disequality_edge_promotes_ctz_of_the_difference() {
+        // True edge of `a != b`: `b ^ a` is nonzero there, and ONLY there —
+        // the false edge proves the operands equal, so its Ctz(0) keeps the
+        // defined-zero form.
+        for diff_op in [IrBinOp::Xor, IrBinOp::Sub] {
+            let mut f = diff_guarded_ctz(IrCmpOp::Ne, IrType::U64, diff_op);
+            assert_eq!(run_function_with_symbols(&mut f, &bench_syms()), 1);
+            assert_eq!(arm_count_op(&f, 1), IrUnaryOp::CtzNonZero);
+            assert_eq!(arm_count_op(&f, 2), IrUnaryOp::Ctz);
+            assert_eq!(
+                run_function_with_symbols(&mut f, &bench_syms()),
+                0,
+                "promotion is idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn false_nonstrict_ordering_proves_disequality_too() {
+        // `a <=u b` FALSE is `a >u b`, which implies `a != b`: the false arm
+        // is promoted, the true arm (where equality is possible) is not.
+        let mut f = diff_guarded_ctz(IrCmpOp::Ule, IrType::U64, IrBinOp::Xor);
+        assert_eq!(run_function_with_symbols(&mut f, &bench_syms()), 1);
+        assert_eq!(arm_count_op(&f, 1), IrUnaryOp::Ctz);
+        assert_eq!(arm_count_op(&f, 2), IrUnaryOp::CtzNonZero);
+    }
+
+    #[test]
+    fn narrower_compare_does_not_prove_a_wider_difference_nonzero() {
+        // A 32-bit `a != b` says nothing about bits 32..64 of a 64-bit XOR
+        // of the same values: no promotion on either edge.
+        let mut f = diff_guarded_ctz(IrCmpOp::Ne, IrType::U32, IrBinOp::Xor);
+        assert_eq!(run_function_with_symbols(&mut f, &bench_syms()), 0);
+        assert_eq!(arm_count_op(&f, 1), IrUnaryOp::Ctz);
+        assert_eq!(arm_count_op(&f, 2), IrUnaryOp::Ctz);
     }
 
     #[test]

@@ -46,8 +46,12 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand, Value};
 
+fn debug_on() -> bool {
+    std::env::var_os("CCC_DEBUG_GADDR_CSE").is_some()
+}
+
 fn debug_merged(name: &str, n: usize) {
-    if std::env::var_os("CCC_DEBUG_GADDR_CSE").is_some() {
+    if debug_on() {
         lccc::cli::stderr_line(format_args!("[GADDR_CSE] fn={} merged={}", name, n));
     }
 }
@@ -369,6 +373,164 @@ pub(crate) fn run_with_aliases(
     run_with_aliases_tls(func, aliases, &FxHashSet::default())
 }
 
+/// Liveness-aware cross-class merge, as a per-loop carve-out.
+///
+/// A symbol's foldable web joins its must-materialize web only when ALL of
+/// the following hold, each one tied to a measured gate outcome
+/// (gzip_crc32 / glibc_memcmp / zstd_count / stencil5 regressed under the
+/// unconditional merge; sqlite_varint's decode loop won):
+///
+/// 1. Every occurrence of BOTH webs sits inside one common natural loop
+///    (smallest such loop, intrinsic-free, with a real preheader). The
+///    merged web is then hoisted to that preheader by choose_placement,
+///    so its live range is bounded by the loop that profits from it —
+///    never stretched across unrelated regions.
+///      * zstd_count: foldable occurrence in the entry block, call
+///        arguments in the query loop -> no common loop -> no merge
+///        (the shipped merge put 6 stack slots into that loop).
+///      * stencil5: init/checksum-loop foldable uses vs call loop ->
+///        no common loop -> no merge (+2 callee-saved pushes before).
+/// 2. At least one must-materialize occurrence feeds a variable-offset
+///    GEP. Only then does the merge delete per-iteration work: the
+///    rematerialized `leaq sym(%rip), %rdi` + `addq %off, %rdi` pair
+///    collapses to a single `leaq (%base, %off), %rdi` off the hoisted
+///    register. A plain base argument costs one instruction either way
+///    (remat leaq vs. register move), so merging buys nothing and pins a
+///    register:
+///      * gzip_crc32 / glibc_memcmp / stencil5 pass the bare array to
+///        the kernel call -> no variable-offset feed -> no merge
+///        (these were the +moves regressions before).
+///      * sqlite_varint decodes at `bytes + offsets[i]` -> variable GEP
+///        feeds the call -> merge: the hot loop drops from leaq+addq per
+///        iteration to one indexed leaq, which is also one instruction
+///        FEWER than gcc-16's no-pie absolute-address form pays there.
+///
+/// Scope note: the merge is a per-loop CARVE-OUT, not a whole-group
+/// union. After inlining a symbol routinely has must-materialize
+/// occurrences in several sibling loops (sqlite_varint: the inlined
+/// corpus encoder's call argument AND the decode loop's call argument).
+/// Unioning all of them would hand choose_placement a blockset with no
+/// common loop, whose dominator fallback stretches one definition across
+/// unrelated loops — the exact long-live-range failure the gate measured.
+/// Carving moves ONLY the occurrences inside the qualifying loop into
+/// their own region-tagged web; every outside occurrence keeps its
+/// original web and placement.
+fn carve_cross_class_loops(
+    func: &IrFunction,
+    groups: &mut FxHashMap<(String, bool, u32), Vec<(usize, usize, Value)>>,
+    loops: &[super::loop_analysis::NaturalLoop],
+    cfg: &crate::ir::analysis::CfgAnalysis,
+    intrinsic_blocks: &FxHashSet<usize>,
+) {
+    let cross_class_names: Vec<String> = groups
+        .keys()
+        .filter(|(name, class, region)| {
+            !*class && *region == 0 && groups.contains_key(&(name.clone(), true, 0u32))
+        })
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    for name in cross_class_names {
+        let foldable = &groups[&(name.clone(), false, 0u32)];
+        let materialized = &groups[&(name.clone(), true, 0u32)];
+        // Smallest loop that contains occurrences of BOTH classes, is
+        // intrinsic-free (choose_placement refuses to extend new homes
+        // across hidden accumulator state), has a real preheader for the
+        // hoisted definition, and whose in-loop must-materialize
+        // occurrence feeds a variable-offset GEP (the merged form then
+        // deletes a per-iteration instruction; a plain base argument
+        // costs one instruction either way and must not pin a register).
+        let carve = loops
+            .iter()
+            .filter(|lp| {
+                let mat_in: Vec<u32> = materialized
+                    .iter()
+                    .filter(|occ| lp.body.contains(&occ.0))
+                    .map(|occ| occ.2.0)
+                    .collect();
+                let fold_in = foldable.iter().any(|occ| lp.body.contains(&occ.0));
+                if debug_on() {
+                    let preheader = cfg.idom.get(lp.header).copied().unwrap_or(usize::MAX);
+                    lccc::cli::stderr_line(format_args!(
+                        "[GADDR_CSE] {} carve-pre {} header=b{} mat_in={:?} fold_in={} ph={} intr={}",
+                        func.name,
+                        name,
+                        lp.header,
+                        mat_in,
+                        fold_in,
+                        preheader,
+                        lp.body.iter().any(|b| intrinsic_blocks.contains(b)),
+                    ));
+                }
+                if lp.body.iter().any(|b| intrinsic_blocks.contains(b)) {
+                    return false;
+                }
+                let preheader = cfg.idom.get(lp.header).copied().unwrap_or(usize::MAX);
+                if preheader == usize::MAX || preheader == lp.header {
+                    return false;
+                }
+                if mat_in.is_empty() || !fold_in {
+                    return false;
+                }
+                // Variable-offset feed, and it must happen INSIDE this
+                // loop — that is where the per-iteration leaq+addq pair
+                // collapses to one indexed leaq. The frontend emits
+                // `base + idx` either as a GetElementPtr with a Value
+                // offset or as an integer BinOp Add whose other operand
+                // is a Value (the sqlite decode loop takes the Add form
+                // by the time this pass first runs).
+                func.blocks.iter().enumerate().any(|(bi, block)| {
+                    lp.body.contains(&bi)
+                        && block.instructions.iter().any(|inst| match inst {
+                        Instruction::GetElementPtr {
+                            base,
+                            offset: Operand::Value(_),
+                            ..
+                        } => mat_in.contains(&base.0),
+                        Instruction::BinOp {
+                            op: crate::ir::reexports::IrBinOp::Add,
+                            lhs,
+                            rhs,
+                            ..
+                        } => matches!(
+                            (lhs, rhs),
+                            (Operand::Value(a), Operand::Value(b))
+                                if mat_in.contains(&a.0) || mat_in.contains(&b.0)
+                        ),
+                        _ => false,
+                    })
+                })
+            })
+            .min_by_key(|lp| lp.body.len());
+        let Some(lp) = carve else { continue };
+        let region = u32::try_from(lp.header).ok().and_then(|h| h.checked_add(1));
+        let Some(region) = region else { continue };
+        let mut carved: Vec<(usize, usize, Value)> = Vec::new();
+        for class in [false, true] {
+            let key = (name.clone(), class, 0u32);
+            if let Some(web) = groups.get_mut(&key) {
+                let mut kept = Vec::with_capacity(web.len());
+                for occ in web.drain(..) {
+                    if lp.body.contains(&occ.0) {
+                        carved.push(occ);
+                    } else {
+                        kept.push(occ);
+                    }
+                }
+                if kept.is_empty() {
+                    groups.remove(&key);
+                } else {
+                    *web = kept;
+                }
+            }
+        }
+        debug_assert!(carved.len() >= 2, "carve requires both classes in-loop");
+        groups
+            .entry((name, true, region))
+            .or_default()
+            .extend(carved);
+    }
+}
+
 pub(crate) fn run_with_aliases_tls(
     func: &mut IrFunction,
     aliases: &FxHashMap<String, String>,
@@ -390,11 +552,27 @@ pub(crate) fn run_with_aliases_tls(
     // sole safe exception to the class split: unlike a normal GlobalAddr it
     // cannot become a RIP/SIB memory operand, so both classes must materialize
     // the same thread-relative base. Sharing it avoids repeated `%fs:0` reads.
-    let mut groups: FxHashMap<(String, bool), Vec<(usize, usize, Value)>> = FxHashMap::default();
+    // Key: (canonical symbol, must-materialize class, region tag). Tag 0 is
+    // the whole-function web for the class; a nonzero tag (loop header + 1)
+    // names a loop-scoped web carved out by carve_cross_class_loops so
+    // its placement and live range stay bounded by that loop.
+    let mut groups: FxHashMap<(String, bool, u32), Vec<(usize, usize, Value)>> =
+        FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Instruction::GlobalAddr { dest, name } = inst {
                 let is_tls = tls_symbols.contains(name);
+                if debug_on() {
+                    lccc::cli::stderr_line(format_args!(
+                        "[GADDR_CSE] {} b{} v{} {} site_local={} must_mat={}",
+                        func.name,
+                        bi,
+                        dest.0,
+                        name,
+                        site_local.contains(&dest.0),
+                        must_mat.contains(&dest.0)
+                    ));
+                }
                 if site_local.contains(&dest.0) && !is_tls {
                     continue;
                 }
@@ -402,6 +580,7 @@ pub(crate) fn run_with_aliases_tls(
                     .entry((
                         canon_name(name, aliases).to_string(),
                         !is_tls && must_mat.contains(&dest.0),
+                        0u32,
                     ))
                     .or_default()
                     .push((bi, ii, *dest));
@@ -409,6 +588,22 @@ pub(crate) fn run_with_aliases_tls(
         }
     }
 
+    // The foldable/must-materialize class split above is load-bearing. An
+    // UNCONDITIONAL merge of a symbol's two webs ("a call use already
+    // forces a register, so separate foldable materializations are pure
+    // duplicates") was shipped once and measured as a loss on the golden
+    // gate, locally and on CI: zstd_count insns 115 -> 120 with stackmem
+    // 2 -> 8 (real in-loop spills), stencil5 insns 123 -> 130 with pushes
+    // 3 -> 5, gzip_crc32 / glibc_memcmp over the move tolerance. The
+    // flaw: a site-local foldable value is rematerialized adjacent to its
+    // use — many SHORT live ranges served by any free scratch register —
+    // while a merged web is one LONG live range that demands a
+    // callee-saved register (pushes) and, under loop pressure, spills.
+    // "Pays a register" is not "pays a long-lived register".
+    //
+    // The liveness-aware merge that IS profitable lives below, after loop
+    // analysis: see the comment at the merge site for the criterion and
+    // the per-workload evidence that derived it.
     if groups.is_empty()
         || groups
             .values()
@@ -437,6 +632,8 @@ pub(crate) fn run_with_aliases_tls(
         })
         .collect();
 
+    carve_cross_class_loops(func, &mut groups, &loops, &cfg, &intrinsic_blocks);
+
     let mut next_id = func
         .next_value_id
         .max(func.max_value_id().saturating_add(1));
@@ -444,7 +641,7 @@ pub(crate) fn run_with_aliases_tls(
     let mut delete_ids: FxHashSet<u32> = FxHashSet::default();
     let mut inserts: FxHashMap<usize, Vec<(String, bool, Value)>> = FxHashMap::default();
 
-    for ((name, class), occurrences) in groups {
+    for ((name, class, _region), occurrences) in groups {
         let blocks: Vec<usize> = occurrences.iter().map(|x| x.0).collect();
         let Some(place) = choose_placement(&blocks, &cfg, &loops, &intrinsic_blocks) else {
             continue;
@@ -859,8 +1056,12 @@ mod tests {
     #[test]
     fn does_not_mix_foldable_with_must_materialize() {
         // v1 is only a load pointer (foldable). v2 is passed to a call
-        // (must materialize). CSE must not merge them: that would pin the
-        // RIP-foldable address in a register.
+        // (must materialize). CSE must not merge them, even though the
+        // call forces a register for `g`: the load is RIP-foldable and
+        // costs zero registers where it stands, while a merged web is one
+        // long live range. When a merge shipped, the golden gate measured
+        // zstd_count stackmem 2 -> 8 and stencil5 pushes 3 -> 5 — see the
+        // comment at the class-merge tombstone in run_with_aliases_tls.
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -1436,7 +1637,8 @@ mod tests {
     #[test]
     fn cold_singletons_preserve_class_split() {
         // Foldable load and call-arg classes of the same symbol must remain
-        // distinct. As cold singletons they also stay in their original block.
+        // distinct — see does_not_mix_foldable_with_must_materialize. As
+        // cold singletons they also stay in their original block.
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -1498,5 +1700,274 @@ mod tests {
             .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
             .count();
         assert_eq!(local_gaddrs, 2);
+    }
+
+    /// `call use_ptr(Value(arg))` — the escape that forces must-materialize.
+    fn call_with_arg(arg: u32) -> Instruction {
+        Instruction::Call {
+            func: "use_ptr".to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: None,
+                args: vec![Operand::Value(Value(arg))],
+                arg_types: vec![IrType::Ptr],
+                return_type: IrType::Void,
+                is_variadic: false,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: vec![],
+                struct_arg_fp_agg_classes: vec![],
+                struct_arg_is_f128_sse: Vec::new(),
+                is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                assume_library: false,
+                ret_eightbyte_classes: vec![],
+                ret_is_f128_sse: false,
+                ret_is_vector128: false,
+                cold: false,
+            },
+        }
+    }
+
+    /// `dest = a + b` with both operands Values — the variable-offset
+    /// address form the sqlite decode loop feeds its call argument with.
+    fn add_vv(dest: u32, a: u32, b: u32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs: Operand::Value(Value(a)),
+            rhs: Operand::Value(Value(b)),
+            ty: IrType::I64,
+        }
+    }
+
+    /// b0 -> b1 (header) -> {b2 (body) -> b1 | b3 (exit)}, body from `insts`.
+    fn loop_func(insts: Vec<Instruction>) -> IrFunction {
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: insts,
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func
+    }
+
+    fn gaddr(dest: u32, name: &str) -> Instruction {
+        Instruction::GlobalAddr {
+            dest: Value(dest),
+            name: name.to_string(),
+        }
+    }
+
+    fn gaddr_count(func: &IrFunction, bi: usize) -> usize {
+        func.blocks[bi]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
+            .count()
+    }
+
+    #[test]
+    fn carves_loop_web_for_variable_indexed_call() {
+        // The sqlite_varint decode-loop shape: a foldable load of `g` and a
+        // call argument computed as `g + i` (variable offset) in the same
+        // loop body. The cross-class carve must merge both webs into ONE
+        // definition hoisted to the preheader, so the hot loop's
+        // leaq+addq pair collapses to a single indexed leaq off a register
+        // that the foldable web already paid for.
+        let mut func = loop_func(vec![
+            gaddr(5, "g"),
+            load(6, 5),
+            gaddr(7, "g"),
+            add_vv(8, 7, 9),
+            call_with_arg(8),
+        ]);
+        assert_eq!(run(&mut func), 2);
+        assert_eq!(gaddr_count(&func, 0), 1, "one merged def in the preheader");
+        assert_eq!(gaddr_count(&func, 2), 0, "loop body derives, never defines");
+        let Instruction::GlobalAddr { dest, .. } = &func.blocks[0].instructions[0] else {
+            panic!("expected preheader GlobalAddr");
+        };
+        let shared = dest.0;
+        for inst in &func.blocks[2].instructions {
+            match inst {
+                Instruction::Load { ptr, .. } => assert_eq!(ptr.0, shared),
+                Instruction::BinOp { lhs, .. } => {
+                    assert!(matches!(lhs, Operand::Value(v) if v.0 == shared));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn no_carve_for_plain_base_call_in_loop() {
+        // The gzip_crc32 / glibc_memcmp shape: the call takes the BARE
+        // array base, so a merge saves nothing (remat leaq and register
+        // move both cost one instruction) and may pin a register. The
+        // classes hoist to the preheader separately — the split survives.
+        let mut func = loop_func(vec![
+            gaddr(5, "g"),
+            load(6, 5),
+            gaddr(7, "g"),
+            call_with_arg(7),
+        ]);
+        run(&mut func);
+        assert_eq!(
+            gaddr_count(&func, 0),
+            2,
+            "both class webs hoist, but stay distinct"
+        );
+        assert_eq!(gaddr_count(&func, 2), 0);
+    }
+
+    #[test]
+    fn no_carve_when_foldable_use_is_outside_the_loop() {
+        // The zstd_count shape: the foldable occurrence lives in the entry
+        // block, the variable-indexed call argument inside the loop. There
+        // is no common loop, so no carve: merging would stretch one live
+        // range from the entry block across the loop (measured before as
+        // stackmem 2 -> 8 in that workload).
+        let mut func = loop_func(vec![gaddr(7, "g"), add_vv(8, 7, 9), call_with_arg(8)]);
+        func.blocks[0].instructions = vec![gaddr(5, "g"), load(6, 5)];
+        run(&mut func);
+        let total: usize = (0..func.blocks.len())
+            .map(|bi| gaddr_count(&func, bi))
+            .sum();
+        assert_eq!(total, 2, "webs remain separate");
+        // The foldable entry-block def must still feed the load directly
+        // (the hoisted must-mat web inserts at the block's head, so locate
+        // the def through the load's pointer rather than by position).
+        let load_ptr = func.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|inst| match inst {
+                Instruction::Load { ptr, .. } => Some(ptr.0),
+                _ => None,
+            })
+            .expect("entry load survives");
+        assert!(func.blocks[0].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::GlobalAddr { dest, .. } if dest.0 == load_ptr
+        )));
+    }
+
+    #[test]
+    fn sibling_loop_occurrence_stays_out_of_the_carve() {
+        // The post-inline sqlite_varint shape: a SECOND must-materialize
+        // occurrence lives in a sibling loop (the inlined corpus encoder's
+        // call argument). The carve takes only the qualifying loop's
+        // occurrences; the sibling web keeps its own placement instead of
+        // being unioned into a cross-loop live range.
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        // Loop A: header b1, body b2 — foldable load + variable-add call.
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                gaddr(5, "g"),
+                load(6, 5),
+                gaddr(7, "g"),
+                add_vv(8, 7, 9),
+                call_with_arg(8),
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        // Loop B: header b4, body b5 — a bare-base call argument.
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(5),
+                false_label: BlockId(6),
+            },
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![gaddr(1, "g"), call_with_arg(1)],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(6),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        run(&mut func);
+        assert_eq!(
+            gaddr_count(&func, 0),
+            1,
+            "carved web lands in loop A's preheader"
+        );
+        assert_eq!(gaddr_count(&func, 2), 0);
+        assert_eq!(
+            gaddr_count(&func, 3),
+            1,
+            "sibling web hoists to its own preheader, not into the carve"
+        );
+        assert_eq!(gaddr_count(&func, 5), 0);
     }
 }

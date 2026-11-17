@@ -2933,6 +2933,15 @@ pub(crate) fn recognize_function(
     predicate_folds: bool,
 ) -> usize {
     let pre_changes = canonicalize_narrow_crc_casts(func);
+    // Difference-branch canonicalization runs BEFORE the def/use snapshot
+    // below: its appended `Cmp Ne(a, b)` adds reads of `a` and `b` that a
+    // stale `use_counts` would miss, and a missed read is exactly what a
+    // later single-use repurposing proof must never be handed.
+    let diff_branch_changes = if facts::diff_branch_disabled() {
+        0
+    } else {
+        diff_branch::rewrite_diff_zero_branches(func)
+    };
     let shared_bit_changes = if !facts::bit_select_disabled() {
         bit_test::fold_shared_masks_then_tests(func)
     } else {
@@ -2971,7 +2980,8 @@ pub(crate) fn recognize_function(
 
     // Union-punned copysign first: it mints fresh IDs (written back to
     // `func.next_value_id`) before the main scan seeds its own counter.
-    let mut changes = pre_changes + shared_bit_changes + recognize_copysign_mem(func);
+    let mut changes =
+        pre_changes + diff_branch_changes + shared_bit_changes + recognize_copysign_mem(func);
     let mut next_value_id = func.max_value_id().saturating_add(1);
     // Boolean mux/majority algebra kill switch (same authority contract as
     // the vectorizer's CCC_NO_* gates; A/B for the differential batteries).
@@ -6572,6 +6582,13 @@ mod lowest_bit_tests;
 
 #[path = "bit_idioms_compare_dominance.rs"]
 mod compare_dominance;
+
+#[path = "bit_idioms_diff_branch.rs"]
+mod diff_branch;
+
+#[cfg(test)]
+#[path = "bit_idioms_diff_branch_tests.rs"]
+mod diff_branch_tests;
 
 #[path = "bit_idioms_bit_select.rs"]
 mod bit_select;
