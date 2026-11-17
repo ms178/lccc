@@ -424,34 +424,22 @@ pub(crate) fn run_with_aliases_tls(
         }
     }
 
-    // One web per symbol once a register is forced: when the same symbol has
-    // BOTH a must-materialize web and a foldable web, the must-materialize
-    // uses pay for a register holding `sym` no matter what, so a second web
-    // for the same symbol can only duplicate materializations — and the
-    // register allocator remats each web separately at its own uses.
-    // sqlite_varint's encode/decode loops re-derived
-    // `leaq sqlite_varint_bytes(%rip)` + `addq` per iteration for a call
-    // argument (the must-materialize web) while the foldable web already
-    // held that exact address in a callee-saved register across the same
-    // loops. Folding the foldable web into the must-materialize one is
-    // pressure-neutral or better (two live webs become one), and the
-    // RIP/SIB fold contract is unaffected: a folded memory use addresses
-    // off the shared register or RIP exactly as the backend prefers.
-    // A symbol with ONLY foldable webs keeps today's behaviour — nothing
-    // forces a materialization there, so there is no register to share.
-    let both_class_names: Vec<String> = groups
-        .keys()
-        .filter(|(name, class)| !*class && groups.contains_key(&(name.clone(), true)))
-        .map(|(name, _)| name.clone())
-        .collect();
-    for name in both_class_names {
-        if let Some(foldable) = groups.remove(&(name.clone(), false)) {
-            if let Some(materialized) = groups.get_mut(&(name, true)) {
-                materialized.extend(foldable);
-            }
-        }
-    }
-
+    // The foldable/must-materialize class split above is load-bearing; do
+    // NOT merge a symbol's two webs even when a call use already forces a
+    // register. A merge was shipped on the theory that the forced register
+    // makes the foldable web's separate materializations pure duplicates.
+    // The golden-workload gate measured the opposite, locally and on CI:
+    // zstd_count insns 115 -> 120 with stackmem 2 -> 8 (real in-loop
+    // spills), stencil5 insns 123 -> 130 with pushes 3 -> 5, and
+    // gzip_crc32 / glibc_memcmp over the move tolerance. The flaw: a
+    // site-local foldable value is rematerialized adjacent to its use —
+    // many SHORT live ranges the allocator serves from any free scratch
+    // register — while the merged web is one LONG live range spanning
+    // every use, which demands a callee-saved register (pushes) and, under
+    // loop pressure, spills. "Pays a register" is not "pays a long-lived
+    // register". Reinstating a merge requires a liveness-aware criterion
+    // (e.g. both webs already simultaneously live across the same loop,
+    // as in sqlite_varint's encode/decode loops) proven against the gate.
     if groups.is_empty()
         || groups
             .values()
@@ -900,16 +888,14 @@ mod tests {
     }
 
     #[test]
-    fn foldable_web_joins_forced_materialization() {
+    fn does_not_mix_foldable_with_must_materialize() {
         // v1 is only a load pointer (foldable). v2 is passed to a call
-        // (must materialize). The call pins `g` in a register no matter
-        // what, so keeping v1 as a separate web buys nothing: the load can
-        // address off that same register (or RIP — the backend's choice),
-        // while the duplicate GlobalAddr costs an extra materialization
-        // and a second live range the allocator remats independently.
-        // sqlite_varint's decode loop paid leaq+addq per iteration for
-        // exactly this split. Expect ONE web: the duplicate is deleted and
-        // both uses share the survivor.
+        // (must materialize). CSE must not merge them, even though the
+        // call forces a register for `g`: the load is RIP-foldable and
+        // costs zero registers where it stands, while a merged web is one
+        // long live range. When a merge shipped, the golden gate measured
+        // zstd_count stackmem 2 -> 8 and stencil5 pushes 3 -> 5 — see the
+        // comment at the class-merge tombstone in run_with_aliases_tls.
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -955,29 +941,8 @@ mod tests {
             source_spans: Vec::new(),
             source_inline_ids: Vec::new(),
         });
-        assert_eq!(run(&mut func), 1);
-        assert_eq!(func.blocks[0].instructions.len(), 3);
-        // Both the load pointer and the call argument now reference the
-        // single surviving materialization.
-        let survivors: Vec<u32> = func.blocks[0]
-            .instructions
-            .iter()
-            .filter_map(|i| match i {
-                Instruction::GlobalAddr { dest, .. } => Some(dest.0),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(survivors.len(), 1);
-        let shared = survivors[0];
-        for inst in &func.blocks[0].instructions {
-            match inst {
-                Instruction::Load { ptr, .. } => assert_eq!(ptr.0, shared),
-                Instruction::Call { info, .. } => {
-                    assert!(matches!(info.args[0], Operand::Value(v) if v.0 == shared));
-                }
-                _ => {}
-            }
-        }
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(func.blocks[0].instructions.len(), 4);
     }
 
     #[test]
@@ -1504,11 +1469,10 @@ mod tests {
     }
 
     #[test]
-    fn cold_singletons_of_forced_symbol_merge_in_place() {
-        // Foldable load and call-arg webs of the same symbol merge even as
-        // singletons: the call already forces a register for `g`, so the
-        // second GlobalAddr is a pure duplicate. Placement stays in their
-        // shared block — the entry block gains nothing.
+    fn cold_singletons_preserve_class_split() {
+        // Foldable load and call-arg classes of the same symbol must remain
+        // distinct — see does_not_mix_foldable_with_must_materialize. As
+        // cold singletons they also stay in their original block.
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -1562,13 +1526,13 @@ mod tests {
             source_inline_ids: Vec::new(),
         });
         let n = run(&mut func);
-        assert_eq!(n, 1);
+        assert_eq!(n, 0);
         assert!(func.blocks[0].instructions.is_empty());
         let local_gaddrs = func.blocks[1]
             .instructions
             .iter()
             .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
             .count();
-        assert_eq!(local_gaddrs, 1);
+        assert_eq!(local_gaddrs, 2);
     }
 }
