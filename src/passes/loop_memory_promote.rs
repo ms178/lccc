@@ -37,7 +37,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
-    BasicBlock, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
     replace_operand_value, replace_terminator_value,
 };
 use std::sync::OnceLock;
@@ -262,6 +262,57 @@ fn alloca_access_is_nonfaulting(
     } else {
         *align
     };
+    object_align % required_align == 0 && offset % required_align == 0
+}
+
+/// A bounded, aligned access to an UNEXPOSED static global can never fault:
+/// the storage is defined in this module and the offset/size are proven
+/// within it. This licenses hoisting the preheader LOAD. It does NOT
+/// license an unconditional exit STORE — unlike an alloca, the global may
+/// be reached concurrently by other threads running this module's code, so
+/// a store the original program did not perform (zero-trip path) could
+/// revert another thread's write. The caller must pair this with a
+/// guarded writeback.
+fn global_access_is_nonfaulting(
+    defs: &FxHashMap<u32, &Instruction>,
+    paths: &FxHashMap<u32, Path>,
+    ptr: Value,
+    access_ty: IrType,
+    segment: AddressSpace,
+    safe_globals: &UnexposedGlobals,
+) -> bool {
+    if segment != AddressSpace::Default {
+        return false;
+    }
+    let Some(path) = paths.get(&ptr.0) else {
+        return false;
+    };
+    if tag_of(path.root) != TAG_GLOBAL {
+        return false;
+    }
+    let Some((root_vid, _)) = resolve_ptr_chain(defs, ptr) else {
+        return false;
+    };
+    let Some(Instruction::GlobalAddr { name, .. }) = defs.get(&root_vid) else {
+        return false;
+    };
+    let Some(&(size, align)) = safe_globals.get(name.as_str()) else {
+        return false;
+    };
+    let (Ok(offset), Some(access_size)) = (
+        usize::try_from(path.offset),
+        byte_size(access_ty).and_then(|n| usize::try_from(n).ok()),
+    ) else {
+        return false;
+    };
+    let Some(end) = offset.checked_add(access_size) else {
+        return false;
+    };
+    if end > size {
+        return false;
+    }
+    let required_align = access_ty.align();
+    let object_align = if align == 0 { 1 } else { align };
     object_align % required_align == 0 && offset % required_align == 0
 }
 
@@ -823,8 +874,17 @@ fn rewrite_uses_in_terminator(term: &mut Terminator, from: u32, to: u32) {
 
 /// Value that must be written on the unique exit so memory matches the
 /// original last store that actually executed.
-fn memory_on_exit(exit_from: usize, latch: usize, phi: Value, store_val: &Operand) -> Operand {
-    if exit_from == latch {
+///
+/// `store_dominates_exit` is the decisive fact, computed by the finder from
+/// the dominator tree: when the store block dominates the exiting block,
+/// every header->exit path of the final (partial) iteration passed the
+/// store, so the freshest value is the store's operand. Otherwise the exit
+/// fired before this iteration's store and the header phi carries the last
+/// completed iteration's value. (The old `exit_from == latch` test was a
+/// special case of this: a store in the latch trivially dominates a
+/// latch-exit and never dominates an earlier exit.)
+fn memory_on_exit(store_dominates_exit: bool, phi: Value, store_val: &Operand) -> Operand {
+    if store_dominates_exit {
         store_val.clone()
     } else {
         Operand::Value(phi)
@@ -880,14 +940,196 @@ struct PromotePlan {
     latch: usize,
     exit_from: usize,
     exit_block: usize,
+    /// The store block dominates the exiting block: the final (partial)
+    /// iteration executed the store, so the writeback must use the store's
+    /// value rather than the header phi.
+    store_dominates_exit: bool,
+    /// Writeback must execute only when the loop body ran at least once:
+    /// route the exit edge through a did-iterate check (see
+    /// `find_promotion` tier 2).
+    guarded_writeback: bool,
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
+    run_with(func, &FxHashMap::default())
+}
+
+/// `name -> (size, align)` of the module's unexposed static globals.
+type UnexposedGlobals = FxHashMap<String, (usize, usize)>;
+
+/// Module-entry wrapper: computes the set of internal globals whose address
+/// is provably never exposed, then promotes with that knowledge. A load or
+/// store through a pointer the function cannot trace to a known object can
+/// never touch such a global, so the FNV/CRC-style `global = f(global,
+/// buf[k])` byte loops — where `buf` is an unknown caller pointer — promote
+/// the accumulator out of memory (sqlite_vdbe_serial kept the digest
+/// round-tripping through `content(%rip)` on the loop-carried path, a
+/// store+load added to every byte).
+pub(crate) fn run_module(module: &mut crate::ir::module::IrModule) -> usize {
+    let safe = unexposed_static_globals(module);
+    let mut total = 0;
+    for func in &mut module.functions {
+        if !func.is_declaration {
+            total += run_with(func, &safe);
+        }
+    }
+    total
+}
+
+/// Names of `static` globals whose address is NEVER exposed anywhere in the
+/// module, so a pointer that cannot be traced to a known object cannot
+/// legally point into them (forming such a pointer would require taking the
+/// address somewhere, and internal linkage confines "somewhere" to this
+/// module).
+///
+/// Exposure is judged strictly; a name survives only if ALL of these hold:
+///   * defined here, `static`, not weak/common/extern, not
+///     `__attribute__((used))` (a `used` symbol is advertised to forces
+///     outside the IR, e.g. module-external asm), not thread-local — a
+///     different addressing model entirely;
+///   * no symbol alias involves it (an alias is a second name for the same
+///     storage whose uses this analysis does not see);
+///   * no global initializer anywhere references its address;
+///   * the module has no top-level asm and no function contains inline asm:
+///     asm text can name even a local symbol without any IR-visible use;
+///   * in every function, every use of every `GlobalAddr` of the name —
+///     followed transitively through `Copy` — is a direct `Load.ptr` or
+///     `Store.ptr` (the STORED VALUE being the address is an escape, as is
+///     any GEP/Cast/Phi/Select/call/compare/terminator use).
+fn unexposed_static_globals(module: &crate::ir::module::IrModule) -> UnexposedGlobals {
+    let mut cand: UnexposedGlobals = module
+        .globals
+        .iter()
+        .filter(|g| {
+            g.is_static
+                && !g.is_extern
+                && !g.is_weak
+                && !g.is_common
+                && !g.is_used
+                && !g.is_thread_local
+        })
+        .map(|g| (g.name.clone(), (g.size, g.align)))
+        .collect();
+    if cand.is_empty() {
+        return cand;
+    }
+    if !module.toplevel_asm.is_empty() {
+        cand.clear();
+        return cand;
+    }
+    for (alias, target, _) in &module.aliases {
+        cand.remove(alias);
+        cand.remove(target);
+    }
+    for g in &module.globals {
+        g.init.for_each_ref(&mut |name| {
+            cand.remove(name);
+        });
+    }
+    for func in &module.functions {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if matches!(inst, Instruction::InlineAsm { .. }) {
+                    cand.clear();
+                    return cand;
+                }
+            }
+        }
+    }
+    for func in &module.functions {
+        if cand.is_empty() {
+            break;
+        }
+        // Tracked = GlobalAddr of a candidate, closed over `Copy`. SSA gives
+        // every id one def, so a fixpoint over blocks terminates.
+        let mut tracked: FxHashMap<u32, usize> = FxHashMap::default();
+        let names: Vec<&String> = cand.keys().collect();
+        let name_idx: FxHashMap<&str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i))
+            .collect();
+        loop {
+            let mut grew = false;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    match inst {
+                        Instruction::GlobalAddr { dest, name } => {
+                            if let Some(&i) = name_idx.get(name.as_str())
+                                && tracked.insert(dest.0, i).is_none()
+                            {
+                                grew = true;
+                            }
+                        }
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Value(v),
+                            ..
+                        } => {
+                            if let Some(&i) = tracked.get(&v.0)
+                                && tracked.insert(dest.0, i).is_none()
+                            {
+                                grew = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        if tracked.is_empty() {
+            continue;
+        }
+        let mut exposed: FxHashSet<usize> = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    // The pointer POSITION of a direct load/store is the one
+                    // sanctioned use. A stored VALUE that is the address
+                    // escapes.
+                    Instruction::Load { .. } => {}
+                    Instruction::Store {
+                        val: Operand::Value(v),
+                        ..
+                    } => {
+                        if let Some(&i) = tracked.get(&v.0) {
+                            exposed.insert(i);
+                        }
+                    }
+                    Instruction::Store { .. } => {}
+                    // Copy propagation was handled above; the Copy itself
+                    // does not escape.
+                    Instruction::Copy { .. } => {}
+                    other => other.for_each_used_value(|id| {
+                        if let Some(&i) = tracked.get(&id) {
+                            exposed.insert(i);
+                        }
+                    }),
+                }
+            }
+            block.terminator.for_each_used_value(|id| {
+                if let Some(&i) = tracked.get(&id) {
+                    exposed.insert(i);
+                }
+            });
+        }
+        let doomed: Vec<String> = exposed.iter().map(|&i| names[i].clone()).collect();
+        for name in doomed {
+            cand.remove(&name);
+        }
+    }
+    cand
+}
+
+fn run_with(func: &mut IrFunction, safe_globals: &UnexposedGlobals) -> usize {
     // One pointer per `run_once`: indices stay honest and a promoted loop
     // no longer matches. Each success strictly drops the loop's memop count.
     let mut total = 0;
     for _ in 0..MAX_PROMOTIONS {
-        let n = run_once(func);
+        let n = run_once(func, safe_globals);
         if n == 0 {
             break;
         }
@@ -896,14 +1138,79 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     total
 }
 
-fn run_once(func: &mut IrFunction) -> usize {
-    let Some(plan) = find_promotion(func) else {
+fn run_once(func: &mut IrFunction, safe_globals: &UnexposedGlobals) -> usize {
+    let Some(plan) = find_promotion(func, safe_globals) else {
         return 0;
     };
     apply_promotion(func, plan)
 }
 
-fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
+/// Canonical single-latch / single-exit frame of a promotable loop.
+struct LoopShape {
+    preheader: usize,
+    latch: usize,
+    exit_from: usize,
+    exit_block: usize,
+}
+
+/// Vet the loop's control shape: a dedicated preheader, exactly one latch,
+/// exactly one exit edge, and an exit block whose ONLY predecessor is the
+/// exiting block (so the exit store is the unique writeback and the exit
+/// block is not also a join or the preheader).
+fn loop_shape(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    lp: &loop_analysis::NaturalLoop,
+) -> Option<LoopShape> {
+    let preheader = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds)?;
+    if preheader == lp.header {
+        return None;
+    }
+    let latches: Vec<usize> = cfg
+        .preds
+        .row(lp.header)
+        .iter()
+        .map(|&v| v as usize)
+        .filter(|b| lp.body.contains(b))
+        .collect();
+    if latches.len() != 1 {
+        return None;
+    }
+    let exits: Vec<(usize, usize)> = lp
+        .body
+        .iter()
+        .flat_map(|&from| {
+            cfg.succs
+                .row(from)
+                .iter()
+                .map(move |&to| (from, to as usize))
+        })
+        .filter(|(_, to)| !lp.body.contains(to))
+        .collect();
+    if exits.len() != 1 {
+        return None;
+    }
+    let (exit_from, exit_block) = exits[0];
+    if exit_block >= func.blocks.len() {
+        return None;
+    }
+    if cfg
+        .preds
+        .row(exit_block)
+        .iter()
+        .any(|&p| p as usize != exit_from)
+    {
+        return None;
+    }
+    Some(LoopShape {
+        preheader,
+        latch: latches[0],
+        exit_from,
+        exit_block,
+    })
+}
+
+fn find_promotion(func: &IrFunction, safe_globals: &UnexposedGlobals) -> Option<PromotePlan> {
     let cfg = CfgAnalysis::build(func);
     let loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
         cfg.num_blocks,
@@ -932,52 +1239,16 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
         })
         .collect();
 
-    for lp in loops {
-        let Some(preheader) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else {
+    for lp in &loops {
+        let Some(LoopShape {
+            preheader,
+            latch,
+            exit_from,
+            exit_block,
+        }) = loop_shape(func, &cfg, lp)
+        else {
             continue;
         };
-        if preheader == lp.header {
-            continue;
-        }
-        let latches: Vec<usize> = cfg
-            .preds
-            .row(lp.header)
-            .iter()
-            .map(|&v| v as usize)
-            .filter(|b| lp.body.contains(b))
-            .collect();
-        if latches.len() != 1 {
-            continue;
-        }
-        let latch = latches[0];
-        let exits: Vec<(usize, usize)> = lp
-            .body
-            .iter()
-            .flat_map(|&from| {
-                cfg.succs
-                    .row(from)
-                    .iter()
-                    .map(move |&to| (from, to as usize))
-            })
-            .filter(|(_, to)| !lp.body.contains(to))
-            .collect();
-        if exits.len() != 1 {
-            continue;
-        }
-        let (exit_from, exit_block) = exits[0];
-        if exit_block >= func.blocks.len() {
-            continue;
-        }
-        // Unique predecessor so the exit store is the unique writeback
-        // (and so the exit block is not also a join / the preheader).
-        if cfg
-            .preds
-            .row(exit_block)
-            .iter()
-            .any(|&p| p as usize != exit_from)
-        {
-            continue;
-        }
 
         let mut loads: FxHashMap<u32, Vec<(usize, usize, Value, IrType, AddressSpace)>> =
             FxHashMap::default();
@@ -1035,16 +1306,46 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
             }
             let (load_b, load_i, load_dest, load_ty, load_seg) = load_list[0];
             let (store_b, store_i, store_val, store_ty, store_seg) = &store_list[0];
-            if *store_b != latch || load_ty != *store_ty || load_seg != *store_seg {
+            if load_ty != *store_ty || load_seg != *store_seg {
                 continue;
             }
             if !is_promotable_type(load_ty) {
                 continue;
             }
-            if load_b == *store_b && load_i > *store_i {
+            // The store need not sit IN the latch — a rotated-later loop
+            // keeps `load; op; store` in a body block that branches to a
+            // separate increment latch. It must execute exactly once per
+            // completed iteration AFTER the load:
+            //   * `store_b` dominates the latch: every header->latch path
+            //     passes it (a bypassing path appended to the loop-free
+            //     preheader->header entry would contradict dominance);
+            //   * neither access sits in a NESTED loop of this loop, which
+            //     would re-execute it within one outer iteration and
+            //     re-read a value the rewrite no longer reloads;
+            //   * the load precedes the store: same-block index order, or
+            //     `load_b` strictly dominates `store_b` (both dominate the
+            //     latch, and dominators of a node form a chain, so the two
+            //     blocks are always ordered by dominance).
+            if !dominates(&cfg.idom, latch, *store_b) {
                 continue;
             }
             if !dominates(&cfg.idom, latch, load_b) {
+                continue;
+            }
+            if load_b == *store_b {
+                if load_i > *store_i {
+                    continue;
+                }
+            } else if !dominates(&cfg.idom, *store_b, load_b) {
+                continue;
+            }
+            if *store_b != latch
+                && loops.iter().any(|lp2| {
+                    lp2.header != lp.header
+                        && lp.body.contains(&lp2.header)
+                        && (lp2.body.contains(store_b) || lp2.body.contains(&load_b))
+                })
+            {
                 continue;
             }
             if def_block.get(&ptr_id).is_some_and(|b| lp.body.contains(b)) {
@@ -1059,16 +1360,76 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
             }
 
             // The transformation may execute both a preheader load and an exit
-            // store on a source-level zero-trip path. Require either a proved
-            // safe local access or must-execute proofs for both operations.
-            if !accesses_may_be_speculated(
+            // store on a source-level zero-trip path. Three admission tiers:
+            //   1. must-execute proofs or a proved-safe LOCAL access — the
+            //      unconditional exit writeback is exactly as observable as
+            //      the original accesses;
+            //   2. an unexposed static global — the preheader load cannot
+            //      fault, but the writeback must be GUARDED by a did-iterate
+            //      flag so the zero-trip path stores nothing the original
+            //      program did not store (an unconditional writeback could
+            //      revert a concurrent thread's update);
+            //   3. anything else — decline.
+            let guarded_writeback;
+            if accesses_may_be_speculated(
                 &defs, &paths, ptr, load_ty, load_seg, &cfg.idom, load_b, *store_b, exit_from,
             ) {
+                guarded_writeback = false;
+            } else if global_access_is_nonfaulting(
+                &defs,
+                &paths,
+                ptr,
+                load_ty,
+                load_seg,
+                safe_globals,
+            )
+                // The guard retargets the exit edge, giving the exit block a
+                // second predecessor; a phi there would need a new incoming.
+                && !func.blocks[exit_block]
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(i, Instruction::Phi { .. }))
+                // Retargeting rewrites a Branch/CondBranch label; any other
+                // exit terminator (switch, computed goto) is not handled.
+                && matches!(
+                    func.blocks[exit_from].terminator,
+                    Terminator::Branch(_) | Terminator::CondBranch { .. }
+                )
+            {
+                guarded_writeback = true;
+            } else {
                 continue;
             }
 
             let mut alias = false;
+            // An unexposed static global can only be reached through its own
+            // `GlobalAddr`: a pointer whose path is unknown (loaded, a
+            // parameter, call-produced) cannot point into it, and a pointer
+            // rooted at a DIFFERENT object is handled by `disjoint`. So when
+            // either side is such a global, the only aliasing candidate is a
+            // path rooted at the same object — everything else is provably
+            // apart. (Root-hash equality is judged conservatively: a
+            // colliding root falls through to the precise check.)
+            let unexposed_root = |v: Value| -> Option<u64> {
+                let p = paths.get(&v.0)?;
+                match defs.get(&resolve_ptr_chain(&defs, v)?.0) {
+                    Some(Instruction::GlobalAddr { name, .. })
+                        if safe_globals.contains_key(name.as_str()) =>
+                    {
+                        Some(p.root)
+                    }
+                    _ => None,
+                }
+            };
+            let ptr_safe_root = unexposed_root(ptr);
             let may_alias = |other: Value, other_ty: IrType| {
+                for (safe, that) in [(ptr_safe_root, other), (unexposed_root(other), ptr)] {
+                    if let Some(root) = safe
+                        && paths.get(&that.0).is_none_or(|p| p.root != root)
+                    {
+                        return false;
+                    }
+                }
                 !disjoint(&paths, ptr, load_ty, other, other_ty)
                     && !affine_disjoint(
                         func, &defs, &lp.body, &def_block, &multi_def, lp.header, ptr, load_ty,
@@ -1124,6 +1485,8 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
                 latch,
                 exit_from,
                 exit_block,
+                store_dominates_exit: dominates(&cfg.idom, exit_from, *store_b),
+                guarded_writeback,
             });
         }
     }
@@ -1137,9 +1500,28 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
     let Some(phi) = next_value(func) else {
         return 0;
     };
+    // Guarded writeback: allocate everything BEFORE mutating, so a failed
+    // allocation leaves the function untouched.
+    let guard = if plan.guarded_writeback {
+        let Some(flag) = next_value(func) else {
+            return 0;
+        };
+        let Some(cond) = next_value(func) else {
+            return 0;
+        };
+        let max_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+        let first = func.next_label.max(max_label.saturating_add(1));
+        let Some(end) = first.checked_add(2) else {
+            return 0;
+        };
+        func.next_label = end;
+        Some((flag, cond, BlockId(first), BlockId(first + 1)))
+    } else {
+        None
+    };
 
     let latch_incoming = subst_operand(&plan.store_val, plan.load_dest.0, phi.0);
-    let exit_val = memory_on_exit(plan.exit_from, plan.latch, phi, &latch_incoming);
+    let exit_val = memory_on_exit(plan.store_dominates_exit, phi, &latch_incoming);
 
     let preheader_end = func.blocks[plan.preheader].instructions.len();
     insert_inst(
@@ -1170,6 +1552,23 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
     if plan.load_ty == IrType::F64 {
         func.loop_promoted_f64_values.push(phi);
     }
+    if let Some((flag, _, _, _)) = guard {
+        // Did-iterate flag: 0 from the preheader, 1 from the latch. Placed
+        // right after the value phi, so the header insertion shift below is
+        // 2 when guarded.
+        insert_inst(
+            &mut func.blocks[plan.header],
+            1,
+            Instruction::Phi {
+                dest: flag,
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), pre_label),
+                    (Operand::Const(IrConst::I32(1)), latch_label),
+                ],
+            },
+        );
+    }
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
@@ -1178,8 +1577,9 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
         rewrite_uses_in_terminator(&mut block.terminator, plan.load_dest.0, phi.0);
     }
 
-    // Phi at header[0] shifted every later index in the header.
-    let shift = |bi: usize, ii: usize| ii + usize::from(bi == plan.header);
+    // Phis at header[0..] shifted every later index in the header.
+    let header_phis = 1 + usize::from(guard.is_some());
+    let shift = |bi: usize, ii: usize| ii + if bi == plan.header { header_phis } else { 0 };
     let li = shift(plan.load_b, plan.load_i);
     let si = shift(plan.store_b, plan.store_i);
     if plan.load_b == plan.store_b {
@@ -1191,18 +1591,86 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
         remove_inst(&mut func.blocks[plan.store_b], si);
     }
 
-    let exit_insert = first_non_phi(&func.blocks[plan.exit_block]);
-    insert_inst(
-        &mut func.blocks[plan.exit_block],
-        exit_insert,
-        Instruction::Store {
-            volatile: false,
-            val: exit_val,
-            ptr: plan.ptr,
-            ty: plan.load_ty,
-            seg_override: plan.load_seg,
-        },
-    );
+    match guard {
+        None => {
+            let exit_insert = first_non_phi(&func.blocks[plan.exit_block]);
+            insert_inst(
+                &mut func.blocks[plan.exit_block],
+                exit_insert,
+                Instruction::Store {
+                    volatile: false,
+                    val: exit_val,
+                    ptr: plan.ptr,
+                    ty: plan.load_ty,
+                    seg_override: plan.load_seg,
+                },
+            );
+        }
+        Some((flag, cond, check_label, store_label)) => {
+            // Route the single exit edge through `check`: writeback runs
+            // only when the latch executed at least once, so the zero-trip
+            // path performs exactly the accesses the original program did
+            // (plus the benign speculative preheader load).
+            let exit_label = func.blocks[plan.exit_block].label;
+            let retarget = |l: &mut BlockId| {
+                if *l == exit_label {
+                    *l = check_label;
+                }
+            };
+            match &mut func.blocks[plan.exit_from].terminator {
+                Terminator::Branch(t) => retarget(t),
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => {
+                    retarget(true_label);
+                    retarget(false_label);
+                }
+                // find_promotion only admits Branch/CondBranch exit edges;
+                // anything else means the plan is stale — leave the exit
+                // store out rather than corrupt the CFG. The loop itself is
+                // already rewritten consistently (phi + removed accesses),
+                // so memory would be stale: panic in debug to surface it.
+                other => {
+                    debug_assert!(
+                        false,
+                        "guarded writeback with non-branch exit terminator {other:?}"
+                    );
+                }
+            }
+            func.blocks.push(BasicBlock {
+                label: check_label,
+                instructions: vec![Instruction::Cmp {
+                    dest: cond,
+                    op: crate::ir::reexports::IrCmpOp::Ne,
+                    lhs: Operand::Value(flag),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                }],
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(cond),
+                    true_label: store_label,
+                    false_label: exit_label,
+                },
+            });
+            func.blocks.push(BasicBlock {
+                label: store_label,
+                instructions: vec![Instruction::Store {
+                    volatile: false,
+                    val: exit_val,
+                    ptr: plan.ptr,
+                    ty: plan.load_ty,
+                    seg_override: plan.load_seg,
+                }],
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+                terminator: Terminator::Branch(exit_label),
+            });
+        }
+    }
     1
 }
 
@@ -1287,13 +1755,13 @@ mod tests {
     fn memory_on_exit_latch_writes_new_value() {
         let phi = Value(10);
         let new = Operand::Value(Value(11));
-        assert!(matches!(
-            memory_on_exit(2, 2, phi, &new),
-            Operand::Value(Value(11))
-        ));
         assert!(
-            matches!(memory_on_exit(0, 2, phi, &new), Operand::Value(Value(10))),
-            "exit from header must write the pre-store phi"
+            matches!(memory_on_exit(true, phi, &new), Operand::Value(Value(11))),
+            "a store dominating the exit must write the just-stored value"
+        );
+        assert!(
+            matches!(memory_on_exit(false, phi, &new), Operand::Value(Value(10))),
+            "an exit the store does not dominate must write the pre-store phi"
         );
     }
 

@@ -1146,7 +1146,7 @@ fn run_inline_phase(
     // Promote loop-carried memory locations (struct fields / array cells with
     // invariant addresses) into SSA values across the loop body.
     if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
-        module.for_each_function(loop_memory_promote::run);
+        loop_memory_promote::run_module(module);
     }
     iphase_dump!("cleanup-loop-memory-promote");
     // Loop-carried store-to-load forwarding (distance-1 predictive
@@ -4312,7 +4312,7 @@ pub(crate) fn run_passes(
     // Run memory-recurrence promotion again after CFG and copy cleanup have
     // exposed canonical natural loops.
     if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
-        module.for_each_function(loop_memory_promote::run);
+        loop_memory_promote::run_module(module);
         module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
     }
     // Late loop-carried forwarding: IVSR / CFG cleanup expose marching-pointer

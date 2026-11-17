@@ -1010,11 +1010,27 @@ fn is_load_hoistable(
     // Check if loading from an alloca.
     if alloca_info.alloca_values.contains(&ptr_id) {
         // If the alloca is address-taken (used in GEP, passed to call, etc.),
-        // it can be modified through derived pointers. These stores won't
-        // appear in stored_allocas under the alloca's own Value ID, so we
-        // cannot prove the memory is unmodified. Reject unconditionally.
+        // it can be modified through derived pointers — but every write
+        // channel is modeled by `analyze_loop_memory`, so reject only the
+        // channels that can actually reach THIS frame slot:
+        //   * a call-class barrier (calls, asm, atomics, fences, unmodeled
+        //     writers — all funneled into `has_calls`) can write anything;
+        //   * a store through an untraceable pointer (`has_unknown_derived_
+        //     stores`) can alias any object;
+        //   * a direct store to this alloca value, or a store through a
+        //     GEP/Copy chain resolving to it (`modified_base_allocas`).
+        // What REMAINS are stores that trace to a different alloca or to a
+        // global object — distinct storage that cannot overlap this frame
+        // slot. (sqlite_vdbe_serial: the FNV byte loop re-loaded `cell.z`
+        // from the escaped decode cell every iteration; the only in-loop
+        // store is to the global digest, which cannot alias the cell.)
+        // The direct alloca access cannot fault, exactly as in the
+        // non-address-taken arm below.
         if alloca_info.address_taken.contains(&ptr_id) {
-            return false;
+            return !loop_mem.has_calls
+                && !loop_mem.has_unknown_derived_stores
+                && !loop_mem.modified_base_allocas.contains(&ptr_id)
+                && !loop_mem.stored_allocas.contains(&ptr_id);
         }
 
         // The alloca itself must not be stored to inside the loop.
@@ -1593,6 +1609,60 @@ fn speculation_safe_addresses<'a>(
     }
 }
 
+/// `value -> (object_size, constant byte offset)` for every non-volatile
+/// `Alloca` and every constant-offset GEP chain from one. A bounded access
+/// through such a pointer cannot fault (the frame slot exists for the whole
+/// function), so it is speculation-safe exactly like the bounded
+/// defined-global accesses in [`speculation_safe_addresses`].
+fn speculation_safe_alloca_addresses(func: &IrFunction) -> FxHashMap<u32, (i64, i64)> {
+    let mut map: FxHashMap<u32, (i64, i64)> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca {
+                dest,
+                size,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            } = inst
+            {
+                map.insert(dest.0, (*size as i64, 0));
+            }
+        }
+    }
+    // GEP chains may be listed before their base in block order; iterate to
+    // a fixpoint (each round adds at least one value or stops).
+    loop {
+        let mut grew = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } = inst
+                {
+                    if map.contains_key(&dest.0) {
+                        continue;
+                    }
+                    let (Some(&(size, off)), Some(delta)) = (map.get(&base.0), c.to_i64()) else {
+                        continue;
+                    };
+                    let Some(total) = off.checked_add(delta) else {
+                        continue;
+                    };
+                    map.insert(dest.0, (size, total));
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return map;
+        }
+    }
+}
+
 fn hoist_loop_invariants_with(
     func: &mut IrFunction,
     natural_loop: &NaturalLoop,
@@ -1602,6 +1672,7 @@ fn hoist_loop_invariants_with(
     safe_globals: &SpeculationSafeGlobals,
 ) -> usize {
     let safe_addresses = speculation_safe_addresses(func, safe_globals);
+    let safe_alloca_addresses = speculation_safe_alloca_addresses(func);
     let header = natural_loop.header;
 
     // Find the preheader: the single predecessor of the header outside the loop.
@@ -1923,6 +1994,16 @@ fn hoist_loop_invariants_with(
                                 && off
                                     .checked_add(ty.size() as i64)
                                     .is_some_and(|end| end <= size as i64)
+                        })
+                        // A bounded access to a frame slot cannot fault
+                        // either: the alloca exists for the whole function,
+                        // so the load may run on iterations (or zero-trip
+                        // paths) where the original would not have.
+                        && !safe_alloca_addresses.get(&ptr.0).is_some_and(|&(size, off)| {
+                            off >= 0
+                                && off
+                                    .checked_add(ty.size() as i64)
+                                    .is_some_and(|end| end <= size)
                         })
                     {
                         licm_debug(|| {
