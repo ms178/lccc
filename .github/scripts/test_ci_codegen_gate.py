@@ -180,6 +180,61 @@ class BaselinePublicationTests(unittest.TestCase):
             self.assertFalse(list(Path(td).glob("*.tmp.*")))
 
 
+class FailureEvidenceTests(unittest.TestCase):
+    """A red gate must publish its own diagnosis as API-visible annotations.
+
+    The job log cannot be read through the checks API, and the opt-in
+    --annotate repository variable needs admin rights, so a failure that
+    reproduces only on the hosted runner is otherwise a bare "exit 1".
+    These tests pin that main()'s failure path emits (a) an ::error
+    workflow command naming every breached metric and (b) the measured
+    metrics table — and that a green run stays annotation-free.
+    """
+
+    def _run_main(self, metrics):
+        """Drive main() with one fake workload; return (stdout, exit code)."""
+        import contextlib
+        import io
+        argv = ["ci-codegen-gate.py", "--lccc", sys.executable]
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "w.c"
+            src.write_text("int main(void){return 0;}\n")
+            baseline = Path(td) / "baseline.json"
+            baseline.write_text(json.dumps({"w": {"insns": 10, "stackmem": 2}}))
+            code = 0
+            with patch.object(gate, "WORKLOADS", [("w.c", "w")]), \
+                 patch.object(gate, "PROGRAMS", Path(td)), \
+                 patch.object(gate, "BASELINE", baseline), \
+                 patch.object(gate, "compile_metrics", lambda *a: metrics), \
+                 patch.object(sys, "argv", argv), \
+                 contextlib.redirect_stdout(out), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    gate.main()
+                except SystemExit as e:
+                    code = e.code or 0
+        return out.getvalue(), code
+
+    def test_red_run_emits_error_and_metrics_annotations(self):
+        stdout, code = self._run_main(
+            {"insns": 50, "stackmem": 2, "pushes": 0, "moves": 0,
+             "ymm": 0, "fma": 0})
+        self.assertEqual(code, 1)
+        self.assertIn("::error title=Codegen quality gate::", stdout)
+        self.assertIn("insns 10 -> 50", stdout)
+        # The measured table rides along for a justified baseline refresh.
+        self.assertIn("::warning title=codegen-gate-metrics::", stdout)
+
+    def test_green_run_emits_no_annotations(self):
+        stdout, code = self._run_main(
+            {"insns": 10, "stackmem": 2, "pushes": 0, "moves": 0,
+             "ymm": 0, "fma": 0})
+        self.assertEqual(code, 0)
+        self.assertNotIn("::error", stdout)
+        self.assertNotIn("::warning", stdout)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=2)
     sys.exit(0 if result.result.wasSuccessful() else 1)
