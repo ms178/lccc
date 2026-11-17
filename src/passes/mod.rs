@@ -29,6 +29,7 @@ pub(crate) mod builtin_policy;
 pub(crate) mod byte_load;
 pub(crate) mod cfg_simplify;
 pub(crate) mod const_array_promote;
+pub(crate) mod const_hoist;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod cvp;
@@ -4899,6 +4900,20 @@ pub(crate) fn run_passes(
     // Kill switch: CCC_DISABLE_PASSES=inertasm.
     if !pass_disabled(&disabled, "inertasm") {
         module.for_each_function(remove_inert_inline_asm);
+    }
+
+    // Loop-invariant wide-constant hoisting (see const_hoist.rs): a 64-bit
+    // immediate outside the imm32 range used by a BinOp inside a loop gets a
+    // preheader `Copy`, so the backend materializes it once instead of per
+    // iteration (FNV/xxhash primes: `movabsq` inside the hot loop on x86-64,
+    // mov/movk chains on AArch64). ORDER: last value-level transform — every
+    // constant-fold / copy-propagation / GVN round would fold the copy
+    // straight back into the use, so it runs after them all; phi
+    // elimination in the driver does not propagate constants and keeps it
+    // intact. Pass name for CCC_DISABLE_PASSES: "consthoist".
+    if matches!(opt_level, 2 | 3) && !pass_disabled(&disabled, "consthoist") {
+        const_hoist::run_module(module);
+        verify::verify_after_pass(module, "consthoist");
     }
 
     if time_passes {
