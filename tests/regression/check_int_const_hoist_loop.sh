@@ -36,11 +36,17 @@
 #   (3) THE PASS IS REAL — (2) recompiled with CCC_DISABLE_PASSES=intconst
 #       must differ; otherwise some other mechanism produced the shape and
 #       this gate would keep passing with the pass deleted.
-#   (4) RARE-PATH DECLINES — a wide constant used only under a
-#       data-dependent branch inside the loop must NOT be materialized ahead
-#       of the loop (the every-iteration dominance gate; the sqlite_varint
-#       lesson).
-#   (5) EXECUTION — all kernels run; stdout must equal gcc-16's.
+#   (4) COMPETING RARE-PATH CONSTANTS DECLINE — two wide constants, each
+#       used only under its own data-dependent branch inside the loop, must
+#       BOTH stay at their conditional sites (the every-iteration dominance
+#       gate; the sqlite_varint lesson — four switch-arm decode constants
+#       pre-pinned across the main loop evicted the working set).
+#   (5) A SOLE CANDIDATE HOISTS EVEN FROM A CONDITIONAL PATH — with exactly
+#       one wide constant in the whole loop body at most one register is
+#       pinned, and that is the trade GCC takes universally (the
+#       expat_xml_scan lesson: re-materializing the FNV prime per name on
+#       the conditional name path cost ~2% of the kernel).
+#   (6) EXECUTION — all kernels run; stdout must equal gcc-16's.
 set -uo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -143,6 +149,9 @@ unsigned long long scan(const unsigned char *p, unsigned long n,
     if (p[i] == 0x7fu) {
       *hits += 1;
       h ^= 0x123456789abcdefULL; /* rare path: must NOT be pre-pinned */
+    } else if (p[i] == 0x3fu) {
+      *hits += 1;
+      h ^= 0x111111111111111ULL; /* second candidate: forces competition */
     }
     h += p[i];
   }
@@ -158,6 +167,36 @@ int main(void) {
    * legitimately print the pre-call value. */
   unsigned long long r = scan(buf, sizeof buf, 99u, &hits);
   printf("%llx %lu\n", r, hits);
+  return 0;
+}
+EOF
+
+cat > "$work/k4.c" <<'EOF'
+#include <stdio.h>
+/* expat_xml_scan shape: the loop's SOLE wide constant is used on a
+ * conditional path (the store keeps the arm genuinely conditional). With
+ * no competing candidate at most one register is pinned, so the constant
+ * must be materialized exactly once, ahead of the loop. If the backend
+ * if-converts the multiply instead, the use becomes every-iteration and
+ * the same assertion holds. */
+unsigned long long mix(const unsigned char *p, unsigned long n,
+                       unsigned long long h, unsigned long *names) {
+  for (unsigned long i = 0; i < n; i++) {
+    if (p[i] >= 0x40u) {
+      *names += 1;
+      h *= 1099511628211ULL;
+    }
+    h += p[i];
+  }
+  return h;
+}
+int main(void) {
+  unsigned char buf[4096];
+  unsigned long names = 0;
+  for (unsigned i = 0; i < sizeof buf; i++)
+    buf[i] = (unsigned char)(i * 73u + 5u);
+  unsigned long long r = mix(buf, sizeof buf, 7u, &names);
+  printf("%llx %lu\n", r, names);
   return 0;
 }
 EOF
@@ -201,22 +240,37 @@ else
     ok "k2: intconst kill switch verified against the same shape"
 fi
 
-# ── (4) rare-path constant must not be pinned ahead of the loop ────────
+# ── (4) competing rare-path constants must not be pinned ahead ─────────
 "$LCCC" -O2 -S -o "$work/k3.s" "$work/k3.c" 2>/dev/null \
     || bad "k3: compile failed"
 extract_fn "$work/k3.s" scan "$work/k3.scan.s"
-total=$(grep -c 'movabsq \$81985529216486895' "$work/k3.scan.s" || true)
-in_loop=$(in_any_loop "$work/k3.scan.s" 'movabsq \$81985529216486895')
-if [[ "$total" -eq 0 ]]; then
-    bad "k3: rare-path constant not found at all"
-elif [[ "$in_loop" -ne "$total" ]]; then
-    bad "k3: rare-path constant pre-pinned outside the loop (every-iteration gate lost: $in_loop of $total inside)"
+# 0x123456789abcdef = 81985529216486895; 0x111111111111111 = 76861433640456465
+for dec in 81985529216486895 76861433640456465; do
+    total=$(grep -c "movabsq \\\$$dec" "$work/k3.scan.s" || true)
+    in_loop=$(in_any_loop "$work/k3.scan.s" "movabsq \\\$$dec")
+    if [[ "$total" -eq 0 ]]; then
+        bad "k3: rare-path constant $dec not found at all"
+    elif [[ "$in_loop" -ne "$total" ]]; then
+        bad "k3: rare-path constant $dec pre-pinned outside the loop (every-iteration gate lost: $in_loop of $total inside)"
+    else
+        ok "k3: rare-path constant $dec left at its conditional in-loop site"
+    fi
+done
+
+# ── (5) the loop's sole wide constant hoists even from a cond. path ────
+"$LCCC" -O2 -S -o "$work/k4.s" "$work/k4.c" 2>/dev/null \
+    || bad "k4: compile failed"
+extract_fn "$work/k4.s" mix "$work/k4.mix.s"
+total=$(grep -c 'movabsq \$1099511628211' "$work/k4.mix.s" || true)
+in_loop=$(in_any_loop "$work/k4.mix.s" 'movabsq \$1099511628211')
+if [[ "$total" -ne 1 || "$in_loop" -ne 0 ]]; then
+    bad "k4: sole candidate must be materialized exactly once, outside every loop (count=$total, in-loop=$in_loop)"
 else
-    ok "k3: rare-path constant left at its conditional in-loop site"
+    ok "k4: sole conditional-path constant hoisted out of the loop"
 fi
 
-# ── (5) execution against the GCC oracle ───────────────────────────────
-for k in k1 k2 k3; do
+# ── (6) execution against the GCC oracle ───────────────────────────────
+for k in k1 k2 k3 k4; do
     "$LCCC" -O2 -o "$work/$k.lccc" "$work/$k.c" 2>/dev/null \
         || { bad "$k: lccc link failed"; continue; }
     "$GCC" -O2 -o "$work/$k.gcc" "$work/$k.c" 2>/dev/null \

@@ -316,16 +316,50 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 .collect()
         })
         .collect();
-    // The candidate constants of every loop body, taken before any rewrite
-    // (an outer hoist turns the inner loops' operands into values).
-    // Restricted to every-iteration blocks, in lockstep with the per-loop
+    // The whole-body candidate constants of every loop, taken before any
+    // rewrite (an outer hoist turns the inner loops' operands into values).
+    // Blocks are walked in sorted order so the census is deterministic
+    // regardless of the loop body's set iteration order.
+    let whole_body: Vec<Vec<u64>> = loops
+        .iter()
+        .map(|lp| {
+            let mut blocks: Vec<usize> = lp.body.iter().copied().collect();
+            blocks.sort_unstable();
+            let mut consts: Vec<u64> = Vec::new();
+            let mut seen: FxHashSet<u64> = FxHashSet::default();
+            for &bi in &blocks {
+                for inst in &func.blocks[bi].instructions {
+                    for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                        if let Some(bits) = large_int_const(op, need, imm32_exact) {
+                            if seen.insert(bits) {
+                                consts.push(bits);
+                            }
+                        }
+                    });
+                }
+            }
+            consts
+        })
+        .collect();
+    // What each loop will consider hoisting, in lockstep with the per-loop
     // candidate walk below: the leaf-loop rule reads this census to predict
     // whether a nested leaf will hoist the same constant, and the two views
-    // must not diverge.
+    // must not diverge. Every-iteration uses always qualify. A loop whose
+    // whole body has exactly ONE wide-constant candidate also hoists it
+    // from a conditional path: at most one register is pinned, which is
+    // the trade GCC takes universally — expat_xml_scan's FNV prime sits on
+    // the (hot) name path of a three-way dispatch and re-materializing it
+    // per name cost ~2% of the kernel. With competing candidates only the
+    // every-iteration ones hoist: pinning several registers across a loop
+    // for conditional paths is the measured sqlite_varint loss (four
+    // switch-arm decode constants evicting the working set).
     let consts_in: Vec<FxHashSet<u64>> = loops
         .iter()
         .enumerate()
         .map(|(li, _)| {
+            if whole_body[li].len() == 1 {
+                return whole_body[li].iter().copied().collect();
+            }
             let mut set = FxHashSet::default();
             for &bi in &every_iter[li] {
                 for inst in &func.blocks[bi].instructions {
@@ -365,21 +399,28 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             continue;
         };
         // Distinct large constants used on every iteration of this loop
-        // (blocks dominating every latch), in program order. The rewrite
+        // (blocks dominating every latch), in program order — or the body's
+        // single candidate when there is no competition (see the census
+        // above; the two selections MUST stay in lockstep). The rewrite
         // below still covers the whole body: once a constant earns its
         // register, conditional-path uses of the same constant ride along
         // for free.
-        let mut consts: Vec<u64> = Vec::new();
-        let mut seen: FxHashSet<u64> = FxHashSet::default();
-        for &bi in &every_iter[li] {
-            for inst in &func.blocks[bi].instructions {
-                for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
-                    if let Some(bits) = large_int_const(op, need, imm32_exact) {
-                        if seen.insert(bits) {
-                            consts.push(bits);
+        let mut consts: Vec<u64>;
+        if whole_body[li].len() == 1 {
+            consts = whole_body[li].clone();
+        } else {
+            consts = Vec::new();
+            let mut seen: FxHashSet<u64> = FxHashSet::default();
+            for &bi in &every_iter[li] {
+                for inst in &func.blocks[bi].instructions {
+                    for_each_int_operand(&branch_cmps, inst, &mut |op, need, imm32_exact| {
+                        if let Some(bits) = large_int_const(op, need, imm32_exact) {
+                            if seen.insert(bits) {
+                                consts.push(bits);
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
         // A constant one register-free instruction rematerializes leaves
