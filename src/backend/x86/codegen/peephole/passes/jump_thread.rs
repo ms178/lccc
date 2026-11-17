@@ -8,6 +8,19 @@
 //! registers, memory and flags are unchanged. Keep function scope, inline asm,
 //! pinned lines, semantic directives (including CFI and alignment padding),
 //! short-only counter branches and cyclic/overlong chains fail-closed.
+//!
+//! Switch jump-table ENTRIES thread through the same proof. A shared-body
+//! `switch` routinely dispatches a case through a relay the branch rewrites
+//! cannot retire — the table mention keeps the label alive, so every NULL
+//! record sqlite_vdbe_serial decodes ran `jmp <next instruction>` straight
+//! off the indirect dispatch. An entry is rewritten only inside a table the
+//! codegen itself laid down (a run of entries directly under a `.Ljt_*:`
+//! label, in both the absolute `.quad .LBBn` and the PIC
+//! `.long .LBBn - .Ljt_k` spellings), so a user's computed-goto array —
+//! whose element VALUES a program may compare — is never touched: those
+//! arrive through `&&label` materialisation, not through a `.Ljt` table.
+//! Retargeting an entry does not move, grow or renumber anything; the relay
+//! itself then becomes unreferenced and the ordinary orphan sweep deletes it.
 use super::super::types::*;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -120,6 +133,8 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
     for i in lo..hi {
         if infos[i].pinned
             // DIRECTIVE-LAW: selecting -- rewrite branches only, never directives.
+            // (Jump-table entries, the one directive family whose retarget is
+            // proven by the same redirect map, have their own gated loop below.)
             || matches!(
                 infos[i].kind,
                 LineKind::Nop
@@ -143,7 +158,72 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
         replace_line(store, &mut infos[i], i, replacement);
         changed = true;
     }
+
+    // ── Jump-table entries (see the module documentation) ──────────────────
+    //
+    // Dispatching through a table entry and executing the label's relay
+    // window are the same transfer the branch loop above retargets: the
+    // backward scan built `redirects` only across lines that emit no bytes
+    // and carry no CFG or unwind meaning, so landing at the final target is
+    // observationally identical.  The `in_table` gate restricts the rewrite
+    // to entry runs directly under a `.Ljt_*:` label — the codegen's own
+    // switch tables — and any other line (a section switch, an alignment
+    // directive, an instruction) closes the run, so no `.quad .LBBn` that
+    // happens to live elsewhere in the file is ever touched.
+    let mut in_table = false;
+    for i in lo..hi {
+        let info = infos[i];
+        let s = info.trimmed(store.get(i));
+        if info.is_nop() || info.kind == LineKind::Empty || inert_comment(s) {
+            continue;
+        }
+        if info.kind == LineKind::Label {
+            in_table = label_text(s).starts_with(".Ljt_");
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        // DIRECTIVE-LAW: selecting -- this loop reads directives to find the
+        // exact two table-entry spellings the switch emitter produces and
+        // rewrites nothing else; any other directive (section switch, align,
+        // data) closes the run below instead of being stepped over.
+        let entry = (info.kind == LineKind::Directive && !info.pinned)
+            .then(|| table_entry_target(s))
+            .flatten();
+        let Some((target, pic_base)) = entry else {
+            in_table = false; // any non-entry line ends the table run
+            continue;
+        };
+        let Some(final_target) = resolved.get(&target) else {
+            continue; // still a valid entry: the run continues
+        };
+        let replacement = match pic_base {
+            Some(base) => format!("    .long .LBB{final_target} - {base}"),
+            None => format!("    .quad .LBB{final_target}"),
+        };
+        replace_line(store, &mut infos[i], i, replacement);
+        changed = true;
+    }
     changed
+}
+
+/// Parse one switch-table entry: the absolute `.quad .LBBn` or the PIC
+/// `.long .LBBn - .Ljt_k`, returning the target label and, for the PIC form,
+/// the table-base symbol to reproduce verbatim.  Anything else — an extra
+/// token, a non-`.LBB` target, a difference against something that is not a
+/// `.Ljt_*` base — answers `None` (fail closed).
+fn table_entry_target(s: &str) -> Option<(u32, Option<&str>)> {
+    if let Some(rest) = s.strip_prefix(".quad ") {
+        return Some((local_label(rest.trim())?, None));
+    }
+    let rest = s.strip_prefix(".long ")?;
+    let (target, base) = rest.split_once('-')?;
+    let base = base.trim();
+    if !base.starts_with(".Ljt_") || base.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((local_label(target.trim())?, Some(base)))
 }
 
 /// The prefix that makes a `#` comment compiler-owned rather than a human's.
@@ -242,10 +322,13 @@ fn remove_dead_relays(store: &LineStore, infos: &mut [LineInfo], lo: usize, hi: 
                 }
             }
             let mnemonic = s.split_whitespace().next().unwrap_or("");
+            // `jmpq` is the indirect-dispatch spelling (`jmpq *%rdx`,
+            // `jmpq *tbl(,%rax,8)`): unconditional like `jmp`, it never
+            // falls through into the line below it.
             prev_transfers = !info.pinned
                 && info.kind != LineKind::InlineAsm
                 && info.kind != LineKind::Label
-                && matches!(mnemonic, "jmp" | "ret" | "retq" | "ud2");
+                && matches!(mnemonic, "jmp" | "jmpq" | "ret" | "retq" | "ud2");
             k += 1;
         }
         let Some(lines) = found else {
@@ -1109,6 +1192,95 @@ mod tests {
         for label in [".LBB01", ".LBB4294967296", ".LBB", ".LBB-1"] {
             assert!(local_label(label).is_none());
         }
+    }
+
+    /// The sqlite_vdbe_serial witness: a shared-body switch case dispatches
+    /// through a relay only the TABLE references, so the branch loop cannot
+    /// retire it — the entry itself must thread. Absolute (`.quad`) form; the
+    /// bypassed relay then orphans and the sweep removes it (the indirect
+    /// `jmpq *` above it never falls through).
+    #[test]
+    fn absolute_table_entries_thread_through_relays() {
+        let body = concat!(
+            "jmpq *.Ljt_0(,%rax,8)\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "ret\n",
+            ".section .rodata\n",
+            ".align 8\n",
+            ".Ljt_0:\n",
+            ".quad .LBB1\n",
+            ".quad .LBB2\n",
+            ".section .text\n",
+        );
+        let (changed, out) = apply(body, None);
+        assert!(changed, "{out}");
+        assert!(!out.contains(".quad .LBB1"), "entry threaded:\n{out}");
+        assert_eq!(out.matches(".quad .LBB2").count(), 2, "{out}");
+        assert!(!out.contains(".LBB1:"), "orphaned relay swept:\n{out}");
+    }
+
+    /// The PIC (`.long target - table`) spelling threads identically and
+    /// reproduces the base symbol verbatim.
+    #[test]
+    fn pic_table_entries_thread_through_relays() {
+        let body = concat!(
+            "leaq .Ljt_0(%rip), %rcx\n",
+            "movslq (%rcx,%rax,4), %rdx\n",
+            "addq %rcx, %rdx\n",
+            "jmpq *%rdx\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "ret\n",
+            ".section .rodata\n",
+            ".align 4\n",
+            ".Ljt_0:\n",
+            ".long .LBB1 - .Ljt_0\n",
+            ".long .LBB2 - .Ljt_0\n",
+            ".section .text\n",
+        );
+        let (changed, out) = apply(body, None);
+        assert!(changed, "{out}");
+        assert!(!out.contains(".long .LBB1"), "entry threaded:\n{out}");
+        assert_eq!(out.matches(".long .LBB2 - .Ljt_0").count(), 2, "{out}");
+    }
+
+    /// A `.quad .LBBn` outside a `.Ljt_*` run is somebody's data — a
+    /// computed-goto array whose element values a program may compare — and
+    /// must never be rewritten. A non-entry line inside a table closes the
+    /// run for the same reason.
+    #[test]
+    fn table_entry_threading_fails_closed() {
+        // No .Ljt label anywhere: the data mention pins the relay, nothing
+        // changes.
+        let body = "jmp .LBB2\n.LBB1:\njmp .LBB2\n.LBB2:\nret\n.quad .LBB1\n";
+        let (_, out) = apply(body, None);
+        assert!(out.contains(".quad .LBB1"), "{out}");
+        // A foreign directive inside the run closes it: the entry after it
+        // keeps its target.
+        let body = concat!(
+            "jmpq *.Ljt_0(,%rax,8)\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "ret\n",
+            ".Ljt_0:\n",
+            ".byte 0\n",
+            ".quad .LBB1\n",
+        );
+        let (_, out) = apply(body, None);
+        assert!(out.contains(".quad .LBB1"), "{out}");
+        // An entry difference against a non-.Ljt base is not a table entry.
+        assert_eq!(table_entry_target(".long .LBB1 - .LBB2"), None);
+        assert_eq!(table_entry_target(".quad .LBB1 + 8"), None);
+        assert_eq!(table_entry_target(".quad other"), None);
+        assert_eq!(
+            table_entry_target(".long .LBB7 - .Ljt_3"),
+            Some((7, Some(".Ljt_3")))
+        );
+        assert_eq!(table_entry_target(".quad .LBB7"), Some((7, None)));
     }
 
     #[test]

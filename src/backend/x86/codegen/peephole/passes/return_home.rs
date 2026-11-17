@@ -68,10 +68,14 @@
 //!    immediate source → `lea`, the only three-address form in the GP ALU —
 //!    and `lea` also replaces the flag write with nothing, which is why rule 5
 //!    exists), `sub` by an immediate (→ `lea` with the negated displacement),
-//!    an existing `lea`, or a zero/sign-extending `movz*`/`movs*`.  Everything
-//!    else (`and`, `or`, `xor`, variable shifts, `imul`, `neg`, memory-sourced
-//!    `add`, …) would need a staging `mov` — the very copy being removed — so
-//!    it aborts.
+//!    an existing `lea`, or a zero/sign-extending `movz*`/`movs*`.  One more
+//!    family re-issues without staging: a commutative two-operand ALU
+//!    (`and`/`or`/`xor`/2-op `imul`) whose OTHER source is `%rax` itself swaps
+//!    its operands (`imulq %rax, %D; movq %D, %rax` → `imulq %D, %rax`) — the
+//!    result and, at equal width, every flag are operand-order independent.
+//!    Everything else (variable shifts, `neg`, memory-sourced `add`, the same
+//!    ALU ops with a non-`%rax` source, …) would need a staging `mov` — the
+//!    very copy being removed — so it aborts.
 //! 7. **No middle chain line mentions `%rax` explicitly.** After the rename its
 //!    destination *is* `%rax`, so a pre-existing `%rax` source would silently
 //!    alias the chain value against whatever `%rax` held before (e.g.
@@ -310,6 +314,52 @@ fn reissue_root(text: &str, d_fam: RegId, force_32: bool) -> Option<String> {
         let disp = imm_disp(src)?;
         let neg = i64::from(i32::try_from(disp).ok()?.checked_neg()?);
         return Some(format!("    {lea_mnem} {neg}({d64}), {lea_dst}"));
+    }
+
+    // Commutative two-operand ALU whose OTHER source is already the
+    // accumulator: `imulq %rax, %D; movq %D, %rax; ret` pays a register
+    // move AFTER the multiply — one cycle appended to the return value's
+    // critical path, and one Raptor Cove does not hide (its renamer ships
+    // with integer move elimination fused off, so hot_web_loop's `helper`
+    // paid it 40 million times per run while Gracemont, which still
+    // eliminates the move, ran at GCC parity).  No staging copy is needed
+    // to re-issue these roots at `%rax`: the missing third address is the
+    // very register the copy dies into, so the operands simply swap —
+    // `imulq %D, %rax`.  Both operands are read before the destination is
+    // written, the result is operand-order independent, and at equal width
+    // EVERY flag is too: ZF/SF/PF come from the result, `and`/`or`/`xor`
+    // clear CF and OF, and `add`'s carry and `imul`'s overflow are
+    // symmetric in their operands.  Under `force_32` a q-form re-issues as
+    // its l-sibling: bitwise ops, addition and the low half of a product
+    // all commute with low-32 truncation, and the flags the width change
+    // alters are unreadable (the window ends at `ret`, and rule 5 refused
+    // flag readers inside it — the same licence the `add` → `lea` arm
+    // uses to drop its flag write entirely).  `add`/`sub` keep their
+    // three-address arms above, which fire for ANY register source;
+    // these are the families with no such escape.
+    if matches!(
+        mnem,
+        "andl" | "andq" | "orl" | "orq" | "xorl" | "xorq" | "imull" | "imulq"
+    ) {
+        let suffix_tier = if mnem.ends_with('q') { 0 } else { 1 };
+        // The other source must be the accumulator itself, spelled at the
+        // mnemonic's width, and the destination spelling must agree with
+        // that width too.  Any disagreement is text the emitters never
+        // produce; decline fail-closed rather than reason about it.
+        if plain_gp_operand(src) != Some(0)
+            || width_tier(src, 0) != Some(suffix_tier)
+            || natural_tier != suffix_tier
+        {
+            return None;
+        }
+        let out_mnem = if dst_tier == suffix_tier {
+            mnem.to_string()
+        } else {
+            // force_32 width-down of a q-form: the l-sibling.
+            format!("{}l", &mnem[..mnem.len() - 1])
+        };
+        let d_src = REG_NAMES[dst_tier][d_fam as usize];
+        return Some(format!("    {out_mnem} {d_src}, {}", rax_alias(dst_tier)));
     }
 
     None
@@ -1276,6 +1326,83 @@ mod tests {
             "root kept:\n{out}"
         );
         assert!(out.contains("movl %r9d, %eax"), "copy kept:\n{out}");
+    }
+
+    #[test]
+    fn imul_root_with_rax_source_swaps_into_the_accumulator() {
+        // The hot_web_loop `helper` witness verbatim: `(x ^ salt) * C` homes
+        // the product in the argument register and pays `movq %rdi, %rax`
+        // after the imul — one unhidden cycle per call on Raptor Cove.
+        let out = run_home(&frame(concat!(
+            "    xorq salt(%rip), %rdi\n",
+            "    movabsq $-2960836687051489901, %rax\n",
+            "    imulq %rax, %rdi\n",
+            "    movq %rdi, %rax\n",
+            "    ret\n",
+        )));
+        assert!(!out.contains("movq %rdi, %rax"), "copy retired:\n{out}");
+        assert!(out.contains("imulq %rdi, %rax"), "operands swapped:\n{out}");
+        // The lines above the root are not part of the pattern and keep
+        // their exact text — the movabs still materialises into %rax, which
+        // the swapped root then reads as its implicit accumulator source.
+        assert!(out.contains("xorq salt(%rip), %rdi"), "{out}");
+        assert!(out.contains("movabsq $-2960836687051489901, %rax"), "{out}");
+    }
+
+    #[test]
+    fn xor_root_with_rax_source_swaps_at_32_bits() {
+        let out = run_home(&frame(concat!(
+            "    xorl %eax, %edi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+        )));
+        assert!(!out.contains("movl %edi, %eax"), "{out}");
+        assert!(out.contains("xorl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn commutative_root_with_a_non_rax_source_declines() {
+        // `imulq %rsi, %rdi` has no third address and its source is not the
+        // accumulator: re-issuing it would need the very staging copy the
+        // pass exists to remove, so the window declines and nothing changes.
+        let body = concat!(
+            "    imulq %rsi, %rdi\n",
+            "    movq %rdi, %rax\n",
+            "    ret\n",
+        );
+        let out = run_home(&frame(body));
+        assert!(out.contains("imulq %rsi, %rdi"), "{out}");
+        assert!(out.contains("movq %rdi, %rax"), "copy must stay:\n{out}");
+    }
+
+    #[test]
+    fn commutative_q_root_widths_down_under_a_32_bit_copy() {
+        // `movl %edi, %eax` keeps only the low 32 bits, and the low half of
+        // a 64-bit product IS the 32-bit product of the low halves, so the
+        // single-instruction chain re-issues as the l-sibling.
+        let out = run_home(&frame(concat!(
+            "    imulq %rax, %rdi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+        )));
+        assert!(!out.contains("movl %edi, %eax"), "{out}");
+        assert!(out.contains("imull %edi, %eax"), "widthed down:\n{out}");
+    }
+
+    #[test]
+    fn commutative_root_below_middles_renames_the_chain() {
+        // The swap arm must compose with the established middle rename: the
+        // root's product lands in %rax and the trailing adjustment follows
+        // it there.
+        let out = run_home(&frame(concat!(
+            "    imulq %rax, %rdi\n",
+            "    addq $5, %rdi\n",
+            "    movq %rdi, %rax\n",
+            "    ret\n",
+        )));
+        assert!(!out.contains("movq %rdi, %rax"), "{out}");
+        assert!(out.contains("imulq %rdi, %rax"), "{out}");
+        assert!(out.contains("addq $5, %rax"), "middle renamed:\n{out}");
     }
 
     #[test]
