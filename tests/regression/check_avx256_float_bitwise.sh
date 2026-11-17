@@ -62,25 +62,26 @@ check_op() {
 }
 
 # Four operations per float function: and, or, xor, andnot.
-check_op pd_ops vpand 1
-check_op pd_ops vpor 1
-check_op pd_ops vpxor 1
-check_op pd_ops vpandn 1
-check_op ps_ops vpand 1
-check_op ps_ops vpor 1
-check_op ps_ops vpxor 1
-check_op ps_ops vpandn 1
+check_op pd_ops vandpd 1
+check_op pd_ops vorpd 1
+check_op pd_ops vxorpd 1
+check_op pd_ops vandnpd 1
+check_op ps_ops vandps 1
+check_op ps_ops vorps 1
+check_op ps_ops vxorps 1
+check_op ps_ops vandnps 1
 check_op si_ops vpand 1
 check_op si_ops vpor 1
 check_op si_ops vpxor 1
 check_op si_ops vpandn 1
-# The loop carries one xor, one and, one or and one andnot.  The second
-# `vpxor` is the accumulator's zeroing idiom (`vpxor %ymm,%ymm,%ymm`), which
-# is the cheapest way to materialise the zero vector.
-check_op loop_mix vpxor 2
-check_op loop_mix vpand 1
-check_op loop_mix vpor 1
-check_op loop_mix vpandn 1
+# The loop carries one xor, one and, one or and one andnot, all in the
+# float domain (GCC 16.2 emits the same four).  The `vpxor` is the
+# accumulator's zeroing idiom (`vpxor %xmm,%xmm,%xmm`).
+check_op loop_mix vpxor 1
+check_op loop_mix vxorpd 1
+check_op loop_mix vandpd 1
+check_op loop_mix vorpd 1
+check_op loop_mix vandnpd 1
 
 # ── Shape: no per-lane GPR round trip anywhere in the file ──────────────────
 # `vmovq %xmmN, %r..` is the lane-extraction signature of the old lowering.  A
@@ -107,6 +108,47 @@ if command -v "$REFERENCE" >/dev/null 2>&1; then
     fi
 else
     echo "  ..  reference '$REFERENCE' unavailable; executed comparison skipped"
+fi
+
+# ── AVX1 only: the float logic family must not leak AVX2 ───────────────────
+# `-mavx` has no 256-bit integer logic.  The float forms are AVX1, so a `-mavx`
+# build must use them and must never emit a VEX-256 `vp{and,andn,or,xor}`.
+AVX1_FIXTURE=tests/regression/avx1_fp256_logic_only.c
+AVX1_ASM="$WORK/avx1.s"
+if "$LCCC" -O2 -mavx -S -o "$AVX1_ASM" "$AVX1_FIXTURE"; then
+    avx1_op() {  # fn mnemonic want
+        local got
+        got=$(awk -v fn="$1:" 'index($0, fn) == 1 {inside=1; next} /^[a-z_][A-Za-z_0-9.]*:/ {inside=0} inside' \
+                  "$AVX1_ASM" | grep -cE "^[[:space:]]+$2[[:space:]]")
+        if [ "$got" -ne "$3" ]; then
+            bad "AVX1 $1 emits $got '$2' (want $3)"
+        else
+            echo "  ok  AVX1 $1: $got x $2"
+        fi
+    }
+    avx1_op pd_and vandpd 1
+    avx1_op pd_andn vandnpd 1
+    avx1_op ps_or vorps 1
+    avx1_op ps_xor vxorps 1
+    leaks=$(grep -cE '^[[:space:]]+vp(and|andn|or|xor)[[:space:]]' "$AVX1_ASM")
+    if [ "$leaks" -ne 0 ]; then
+        bad "$leaks AVX2 integer logic ops under -mavx (AVX1 leak)"
+    else
+        echo "  ok  no AVX2 integer logic under -mavx"
+    fi
+    if command -v "$REFERENCE" >/dev/null 2>&1; then
+        "$LCCC" -O2 -mavx "$AVX1_FIXTURE" -o "$WORK/avx1.bin" && "$WORK/avx1.bin" > "$WORK/avx1.out" \
+            || bad "AVX1 fixture does not build or run under -mavx"
+        "$REFERENCE" -O2 -mavx "$AVX1_FIXTURE" -o "$WORK/avx1_ref.bin" && "$WORK/avx1_ref.bin" > "$WORK/avx1_ref.out" \
+            || bad "reference does not build the AVX1 fixture"
+        if cmp -s "$WORK/avx1.out" "$WORK/avx1_ref.out"; then
+            echo "  ok  AVX1 executed output matches $REFERENCE"
+        else
+            bad "AVX1 executed output differs from $REFERENCE"
+        fi
+    fi
+else
+    bad "AVX1 fixture does not compile under -mavx"
 fi
 
 if [ "$fail" -ne 0 ]; then

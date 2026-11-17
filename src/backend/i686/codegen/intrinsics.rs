@@ -2525,7 +2525,7 @@ impl I686Codegen {
                         if self.avx2_enabled {
                             self.state.emit("    vpbroadcastq %xmm0, %ymm0");
                         } else {
-                            self.emit_avx1_splat_xmm0(8);
+                            self.emit_avx1_splat_xmm0(crate::backend::x86_common::SplatLane::B8);
                         }
                         self.state.emit("    addl $8, %esp");
                     } else {
@@ -2536,9 +2536,9 @@ impl I686Codegen {
                                 .emit_fmt(format_args!("    {} %xmm0, %ymm0", inst));
                         } else {
                             self.emit_avx1_splat_xmm0(match inst {
-                                "vpbroadcastb" => 1,
-                                "vpbroadcastw" => 2,
-                                _ => 4,
+                                "vpbroadcastb" => crate::backend::x86_common::SplatLane::B1,
+                                "vpbroadcastw" => crate::backend::x86_common::SplatLane::B2,
+                                _ => crate::backend::x86_common::SplatLane::B4,
                             });
                         }
                     }
@@ -4057,8 +4057,8 @@ mod fma_family_tests {
 impl I686Codegen {
     /// AVX1 256-bit splat of the scalar staged in the low bits of `%xmm0`.
     /// Shuffle and insert come from `x86_common::avx1_splat_xmm_lines`.
-    fn emit_avx1_splat_xmm0(&mut self, lane_bytes: u8) {
-        for line in crate::backend::x86_common::avx1_splat_xmm_lines(lane_bytes, "xmm0", "ymm0") {
+    fn emit_avx1_splat_xmm0(&mut self, lane: crate::backend::x86_common::SplatLane) {
+        for line in crate::backend::x86_common::avx1_splat_xmm_lines(lane, "xmm0", "ymm0") {
             self.state.emit(&line);
         }
     }

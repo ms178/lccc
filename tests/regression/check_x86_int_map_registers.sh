@@ -243,13 +243,12 @@ check map_add8k_128 2 0
 # a frame.  `forward_memcpy_filled_reads` forwards the reads to the caller's
 # register home, so `map_wrap_add16_128` is `vpaddw %xmm1, %xmm0, %xmm0`.
 #
-# The two extrema wrappers get a budget of 3, not 2, for the same reason GCC
-# needs `vpmaxuw`: there is no min/max-without-AVX-512 value form, so the
-# header uses the exact saturating-difference identity (`vpsubusw` plus one
-# `vpaddw`/`vpsubw`).  That is one instruction above GCC, and it is a property
-# of the target ISA, not of the parameter bridge: without the bridge the same
-# shapes cost 5 and 8.
-WRAPPERS="map_wrap_add16_128:2 map_wrap_maxu16_128:3 map_wrap_minu16_256:3 map_wrap_and256_256:2"
+# The extrema wrappers are budgeted at GCC parity (2): `_mm_max_epu16` and
+# `_mm256_min_epu16` are the single instructions `pmaxuw`/`vpminuw`, and the
+# 16-bit extrema builtins reach the register twin table as identity rows.
+# Before those rows, the same wrappers were measured at 5 (128-bit) and 25
+# (256-bit, dynamically realigned frame) instructions.
+WRAPPERS="map_wrap_add16_128:2 map_wrap_maxu16_128:2 map_wrap_minu16_256:2 map_wrap_and256_256:2"
 for entry in $WRAPPERS; do
     check "${entry%%:*}" "${entry##*:}" 1
 done
@@ -280,7 +279,8 @@ if [ -z "${CCC_NO_NATIVE_PACKED_MAP-}" ]; then
              cat "$WORK/cc3.log" >&2; exit 1; }
     for name in map_add8_128 map_add8_256 map_cmp_256 \
                 map_max_epi32_128 map_min_epu32_128 map_max_epi8_128 \
-                map_andnot_128 map_packs_128 map_unpacklo_256; do
+                map_andnot_128 map_packs_128 map_unpacklo_256 \
+                map_wrap_maxu16_128 map_wrap_minu16_256; do
         off_body=$(awk -v F="$name:" '$0==F{on=1;next} on&&/^[[:space:]]*\.size/{exit} on' "$WORK/off.s")
         off_n=$(count "$off_body")
         if [ "$off_n" -le 2 ]; then

@@ -1295,7 +1295,10 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    vpbroadcastd %{xmm_stage}, %{ymm_stage}"));
         } else {
-            self.emit_avx1_splat_from_gpr(4, (xmm_stage, ymm_stage));
+            self.emit_avx1_splat_from_gpr(
+                crate::backend::x86_common::SplatLane::B4,
+                (xmm_stage, ymm_stage),
+            );
         }
         // Only the staging bank was written. Claims never name banks 0/1
         // (`vec_claim_live_reg` refuses them) and `vec_home_reg` records only
@@ -2072,16 +2075,18 @@ impl X86Codegen {
     /// `broadcast_scratch_pair` returns.
     pub(super) fn emit_avx1_splat_from_gpr(
         &mut self,
-        lane_bytes: u8,
+        lane: crate::backend::x86_common::SplatLane,
         pair: (&'static str, &'static str),
     ) {
         let (x, y) = pair;
         debug_assert_eq!(&x[3..], &y[3..], "splat pair must name one register");
-        match lane_bytes {
-            8 => self.state.emit_fmt(format_args!("    vmovq %rax, %{x}")),
+        match lane {
+            crate::backend::x86_common::SplatLane::B8 => {
+                self.state.emit_fmt(format_args!("    vmovq %rax, %{x}"))
+            }
             _ => self.state.emit_fmt(format_args!("    vmovd %eax, %{x}")),
         }
-        for line in crate::backend::x86_common::avx1_splat_xmm_lines(lane_bytes, x, y) {
+        for line in crate::backend::x86_common::avx1_splat_xmm_lines(lane, x, y) {
             self.state.emit(&line);
         }
     }
@@ -4248,13 +4253,22 @@ impl X86Codegen {
                     // which is 1 uop handled by the load port (the modern best
                     // choice — no movd, no port-5 shuffle). Runtime values use
                     // vmovd+vbroadcast (matches GCC/LLVM on AVX2).
-                    let (inst, bits) = match op {
-                        IntrinsicOp::SetEpi8_256 => ("vpbroadcastb", 1u8),
-                        IntrinsicOp::SetEpi16_256 => ("vpbroadcastw", 2u8),
-                        IntrinsicOp::SetEpi32_256 => ("vpbroadcastd", 4u8),
-                        IntrinsicOp::SetEpi64x256 => ("vpbroadcastq", 8u8),
+                    let (inst, lane) = match op {
+                        IntrinsicOp::SetEpi8_256 => {
+                            ("vpbroadcastb", crate::backend::x86_common::SplatLane::B1)
+                        }
+                        IntrinsicOp::SetEpi16_256 => {
+                            ("vpbroadcastw", crate::backend::x86_common::SplatLane::B2)
+                        }
+                        IntrinsicOp::SetEpi32_256 => {
+                            ("vpbroadcastd", crate::backend::x86_common::SplatLane::B4)
+                        }
+                        IntrinsicOp::SetEpi64x256 => {
+                            ("vpbroadcastq", crate::backend::x86_common::SplatLane::B8)
+                        }
                         _ => unreachable!(),
                     };
+                    let bits = lane.bytes();
                     if let Operand::Const(_) = &args[0] {
                         let v = self.operand_to_imm_i64(&args[0]);
                         let mask = if bits == 8 {
@@ -4284,7 +4298,7 @@ impl X86Codegen {
                         }
                     } else if !self.avx2_enabled {
                         self.operand_to_reg(&args[0], "rax");
-                        self.emit_avx1_splat_from_gpr(bits, ("xmm0", "ymm0"));
+                        self.emit_avx1_splat_from_gpr(lane, ("xmm0", "ymm0"));
                     } else if self.avx512_enabled {
                         // EVEX GPR-source vpbroadcast: 1 uop on port 5, no movd.
                         // operand_to_reg materialises through a 64-bit `movq`,
@@ -7994,7 +8008,10 @@ impl X86Codegen {
                         self.state.emit("    movd %eax, %xmm0");
                         self.state.emit("    vpbroadcastw %xmm0, %ymm0");
                     } else {
-                        self.emit_avx1_splat_from_gpr(2, ("xmm0", "ymm0"));
+                        self.emit_avx1_splat_from_gpr(
+                            crate::backend::x86_common::SplatLane::B2,
+                            ("xmm0", "ymm0"),
+                        );
                     }
                     self.state.dirty_upper_ymm = true;
                     if let Some(d) = dest {
@@ -8043,7 +8060,10 @@ impl X86Codegen {
                         self.state.emit("    movd %eax, %xmm0");
                         self.state.emit("    vpbroadcastb %xmm0, %ymm0");
                     } else {
-                        self.emit_avx1_splat_from_gpr(1, ("xmm0", "ymm0"));
+                        self.emit_avx1_splat_from_gpr(
+                            crate::backend::x86_common::SplatLane::B1,
+                            ("xmm0", "ymm0"),
+                        );
                     }
                     self.state.dirty_upper_ymm = true;
                     if let Some(d) = dest {

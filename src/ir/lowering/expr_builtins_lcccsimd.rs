@@ -919,6 +919,14 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Pminub128 => (VecMinU8x16, IrType::U8, 16, Binary),
         Pminsw128 => (VecMinI16x8, IrType::I16, 16, Binary),
         Pmaxsw128 => (VecMaxI16x8, IrType::I16, 16, Binary),
+        // The 16-bit extrema builtins lower straight to these value ops
+        // (x86_intrinsic_op), so the row is the identity twin: the register
+        // op is its own twin, and without it the pointer form spills both
+        // operands to frame slots.
+        VecMaxU16x8 => (VecMaxU16x8, IrType::U16, 16, Binary),
+        VecMinU16x8 => (VecMinU16x8, IrType::U16, 16, Binary),
+        VecMaxI16x8 => (VecMaxI16x8, IrType::I16, 16, Binary),
+        VecMinI16x8 => (VecMinI16x8, IrType::I16, 16, Binary),
         // SSE4.1 extrema.  The dword twins are the vectorizer's own
         // (`VecSminI32x4`/`VecSmaxI32x4` are `pminsd`/`pmaxsd`; the unsigned
         // pair is `VecMinU32x4`/`VecMaxU32x4`), the byte pair needed a twin
@@ -970,6 +978,10 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Pandn256 => (VecAndNotI32x8, IrType::I32, 32, Binary),
         Punpcklbw256 => (VecUnpackLoI8x32, IrType::I8, 32, Binary),
         Psubusw256 => (VecSubSatU16x16, IrType::I16, 32, Binary),
+        VecMaxU16x16 => (VecMaxU16x16, IrType::U16, 32, Binary),
+        VecMinU16x16 => (VecMinU16x16, IrType::U16, 32, Binary),
+        VecMaxI16x16 => (VecMaxI16x16, IrType::I16, 32, Binary),
+        VecMinI16x16 => (VecMinI16x16, IrType::I16, 32, Binary),
 
         _ => return None,
     };

@@ -934,25 +934,46 @@ pub(crate) fn vextract128_name(avx2: bool) -> &'static str {
     if avx2 { "vextracti128" } else { "vextractf128" }
 }
 
+/// Element width of an AVX1 splat.  A closed set: the replication sequence
+/// is total over it, so no width needs a runtime check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SplatLane {
+    B1,
+    B2,
+    B4,
+    B8,
+}
+
+impl SplatLane {
+    /// Width in bytes.
+    pub(crate) fn bytes(self) -> u8 {
+        match self {
+            SplatLane::B1 => 1,
+            SplatLane::B2 => 2,
+            SplatLane::B4 => 4,
+            SplatLane::B8 => 8,
+        }
+    }
+}
+
 /// AVX1 replication of the scalar staged in the low `lane_bytes` of `%x` (a
 /// VEX.128 register) across all of `%x`, then the low half copied into the high
 /// half of `%y` (`y` names the same register as the ymm). Only AVX1 mnemonics:
 /// `vpbroadcast*` is AVX2. Returns the instruction lines, without staging.
-pub(crate) fn avx1_splat_xmm_lines(lane_bytes: u8, x: &str, y: &str) -> Vec<String> {
+pub(crate) fn avx1_splat_xmm_lines(lane: SplatLane, x: &str, y: &str) -> Vec<String> {
     let mut lines = Vec::with_capacity(4);
-    match lane_bytes {
-        1 => {
+    match lane {
+        SplatLane::B1 => {
             lines.push(format!("    vpunpcklbw %{x}, %{x}, %{x}"));
             lines.push(format!("    vpshuflw $0, %{x}, %{x}"));
             lines.push(format!("    vpshufd $0, %{x}, %{x}"));
         }
-        2 => {
+        SplatLane::B2 => {
             lines.push(format!("    vpshuflw $0, %{x}, %{x}"));
             lines.push(format!("    vpshufd $0, %{x}, %{x}"));
         }
-        4 => lines.push(format!("    vpshufd $0, %{x}, %{x}")),
-        8 => lines.push(format!("    vpunpcklqdq %{x}, %{x}, %{x}")),
-        _ => unreachable!("AVX1 splat lane width {lane_bytes} is not 1, 2, 4 or 8"),
+        SplatLane::B4 => lines.push(format!("    vpshufd $0, %{x}, %{x}")),
+        SplatLane::B8 => lines.push(format!("    vpunpcklqdq %{x}, %{x}, %{x}")),
     }
     lines.push(format!("    vinsertf128 $1, %{x}, %{y}, %{y}"));
     lines
