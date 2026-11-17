@@ -1816,6 +1816,8 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pminuw128
             | BuiltinIntrinsic::X86Pmaxuw256
             | BuiltinIntrinsic::X86Pminuw256
+            | BuiltinIntrinsic::X86Pmaxsw256
+            | BuiltinIntrinsic::X86Pminsw256
             | BuiltinIntrinsic::X86Pminsb256
             | BuiltinIntrinsic::X86Pmaxsb256
             | BuiltinIntrinsic::X86Pminud256
@@ -4105,6 +4107,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Pminud256
         | BuiltinIntrinsic::X86Pmaxuw256
         | BuiltinIntrinsic::X86Pminuw256
+        | BuiltinIntrinsic::X86Pmaxsw256
+        | BuiltinIntrinsic::X86Pminsw256
         | BuiltinIntrinsic::X86Pmaxud256 => X86IntrinsicKind::Vec256,
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
         // Native C vectors share object-address IR carriers on both x86 modes.
@@ -4361,6 +4365,8 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pmaxud256
         | B::X86Pmaxuw256
         | B::X86Pminuw256
+        | B::X86Pmaxsw256
+        | B::X86Pminsw256
         | B::X86Paddq256
         | B::X86Psubb256
         | B::X86Psubw256
@@ -4861,6 +4867,8 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pmaxud256 => IntrinsicOp::Pmaxud256,
         BuiltinIntrinsic::X86Pmaxuw256 => IntrinsicOp::VecMaxU16x16,
         BuiltinIntrinsic::X86Pminuw256 => IntrinsicOp::VecMinU16x16,
+        BuiltinIntrinsic::X86Pmaxsw256 => IntrinsicOp::VecMaxI16x16,
+        BuiltinIntrinsic::X86Pminsw256 => IntrinsicOp::VecMinI16x16,
         BuiltinIntrinsic::X86Pmaxuw128 => IntrinsicOp::VecMaxU16x8,
         BuiltinIntrinsic::X86Pminuw128 => IntrinsicOp::VecMinU16x8,
         BuiltinIntrinsic::X86Pmulhuw128 => IntrinsicOp::Pmulhuw128,
@@ -5071,6 +5079,8 @@ mod legacy_constructor_permission_tests {
             ("__builtin_ia32_pminuw128", F::Sse41),
             ("__builtin_ia32_pmaxuw256", F::Avx2),
             ("__builtin_ia32_pminuw256", F::Avx2),
+            ("__builtin_ia32_pmaxsw256", F::Avx2),
+            ("__builtin_ia32_pminsw256", F::Avx2),
         ] {
             let info = builtins::resolve_builtin(name).expect("known pmaxuw/pminuw builtin");
             let BuiltinKind::Intrinsic(intrinsic) = &info.kind else {

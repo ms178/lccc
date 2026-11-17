@@ -7735,7 +7735,7 @@ impl X86Codegen {
             // Signed word min/max are SSE2 BASELINE (unlike both the byte and
             // the dword signed forms), so both widths have them.
             IntrinsicOp::VecMinI16x16 => {
-                if let Some(d) = dest {
+                if let Some(d) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(d, args, "vpminsw", true);
                 }
             }
@@ -7766,7 +7766,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecMaxI16x16 => {
-                if let Some(d) = dest {
+                if let Some(d) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(d, args, "vpmaxsw", true);
                 }
             }

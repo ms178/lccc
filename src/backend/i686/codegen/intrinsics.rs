@@ -1856,6 +1856,8 @@ impl I686Codegen {
             | IntrinsicOp::Pmaxud256
             | IntrinsicOp::VecMinU16x16
             | IntrinsicOp::VecMaxU16x16
+            | IntrinsicOp::VecMinI16x16
+            | IntrinsicOp::VecMaxI16x16
             | IntrinsicOp::Pminub256
             | IntrinsicOp::Pminsd256
             | IntrinsicOp::Psadbw256
@@ -1911,6 +1913,8 @@ impl I686Codegen {
                         IntrinsicOp::Pmaxud256 => "vpmaxud",
                         IntrinsicOp::VecMinU16x16 => "vpminuw",
                         IntrinsicOp::VecMaxU16x16 => "vpmaxuw",
+                        IntrinsicOp::VecMinI16x16 => "vpminsw",
+                        IntrinsicOp::VecMaxI16x16 => "vpmaxsw",
                         IntrinsicOp::Psadbw256 => "vpsadbw",
                         IntrinsicOp::Pshufb256 => "vpshufb",
                         IntrinsicOp::Packssdw256 => "vpackssdw",

@@ -263,6 +263,8 @@ run_i686_freestanding() {
 }
 run_i686_freestanding "-mavx2 -DUSE_AVX2" i686_epu16_avx2
 run_i686_freestanding "-msse4.1" i686_epu16_sse41
+run_i686_freestanding "-msse2 -DSIGNED16" i686_epi16_sse2
+run_i686_freestanding "-mavx2 -DUSE_AVX2 -DSIGNED16" i686_epi16_avx2
 
 # i686 has no unsigned word min/max of its own: the 128- and 256-bit forms must
 # lower to pmaxuw/pminuw. They must never fall back to the saturating identity,
@@ -283,6 +285,15 @@ accept i686_u16_256.c vpmaxuw -m32 -mavx2
 accept i686_u16_256.c vpminuw -m32 -mavx2
 accept i686_u16_128.c pmaxuw -m32 -msse4.1
 accept i686_u16_128.c pminuw -m32 -msse4.1
+cat >"$tmp/epi16_256.c" <<'SRC'
+#include <immintrin.h>
+__m256i smax256(__m256i a, __m256i b) { return _mm256_max_epi16(a, b); }
+__m256i smin256(__m256i a, __m256i b) { return _mm256_min_epi16(a, b); }
+SRC
+reject epi16_256.c avx2 -mavx
+reject epi16_256.c avx2 -m32 -mavx
+accept epi16_256.c vpmaxsw -mavx2
+accept epi16_256.c vpminsw -m32 -mavx2
 # The saturating-difference identity must not come back on i686.
 for f in i686_u16_256.c i686_u16_128.c; do
     if "$ccc" -O2 -m32 -mavx2 -S "$tmp/$f" -o "$tmp/$f.s" 2>/dev/null &&
@@ -353,6 +364,8 @@ compare o_sse41_max.c -msse4.1
 compare o_sse41_min.c -msse4.1
 compare o_avx2_max.c -march=x86-64
 compare plain_sse41_call.c -march=x86-64
+compare epi16_256.c -mavx
+compare epi16_256.c -mavx2
 
 cat >"$tmp/o_crc.c" <<'EOF'
 #include <nmmintrin.h>

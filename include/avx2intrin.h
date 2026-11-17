@@ -844,4 +844,19 @@ _mm256_min_epu16(__m256i __a, __m256i __b)
     return (__m256i)__builtin_ia32_pminuw256((__v16hi)(__a), (__v16hi)(__b));
 }
 
+/* _mm256_max_epi16 / _mm256_min_epi16: packed SIGNED 16-bit extrema
+ * (VPMAXSW/VPMINSW, AVX2).  These were absent from the header, so `-mavx2`
+ * code that GCC compiles failed with an implicit-declaration error. */
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_max_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_pmaxsw256((__v16hi)(__a), (__v16hi)(__b));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_min_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_pminsw256((__v16hi)(__a), (__v16hi)(__b));
+}
+
 #endif /* _AVX2INTRIN_H_INCLUDED */

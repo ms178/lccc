@@ -6369,6 +6369,23 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_max_epi16",
+      "raw_builtins": [
+        "__builtin_ia32_pmaxsw256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -6447,6 +6464,23 @@
       "name": "_mm256_max_epu8",
       "raw_builtins": [
         "__builtin_ia32_pmaxub256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_min_epi16",
+      "raw_builtins": [
+        "__builtin_ia32_pminsw256"
       ],
       "wrapper_dependencies": []
     },
@@ -15286,7 +15320,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 926,
+  "declarations": 928,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -16545,11 +16579,9 @@
     "_mm256_maskz_xor_epi64",
     "_mm256_maskz_xor_pd",
     "_mm256_maskz_xor_ps",
-    "_mm256_max_epi16",
     "_mm256_max_epi64",
     "_mm256_max_epu64",
     "_mm256_max_ph",
-    "_mm256_min_epi16",
     "_mm256_min_epi64",
     "_mm256_min_epu64",
     "_mm256_min_ph",
@@ -20580,5 +20612,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 926
+  "unique_names": 928
 }

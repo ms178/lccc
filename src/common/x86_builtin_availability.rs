@@ -100,6 +100,8 @@ pub fn x86_builtin_feature_macro(name: &str) -> Option<&'static str> {
         "__builtin_ia32_pmaxub256" => Some("__AVX2__"),
         "__builtin_ia32_pmaxuw256" => Some("__AVX2__"),
         "__builtin_ia32_pminuw256" => Some("__AVX2__"),
+        "__builtin_ia32_pmaxsw256" => Some("__AVX2__"),
+        "__builtin_ia32_pminsw256" => Some("__AVX2__"),
         "__builtin_ia32_pminsd256" => Some("__AVX2__"),
         "__builtin_ia32_pminub256" => Some("__AVX2__"),
         "__builtin_ia32_pmovmskb256" => Some("__AVX2__"),
