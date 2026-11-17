@@ -67,9 +67,40 @@
 //! have kept. `andl $0xFFFF, %R` is six bytes with a 32-bit immediate; the
 //! `movzwl %Rw, %Rl` that computes the same value is three.
 //!
-//! Both rules are skip-switchable (`CCC_PEEPHOLE_SKIP=mask_test`) and both are
-//! idempotent: neither output contains an `and{l,q} $imm, %R` line with a mask
-//! in range.
+//! ## 3. The mask moved registers on its way to the test
+//!
+//! When the masked value's home differs from the masked register, the back end
+//! spells the byte mask as a zero-extension into the home and tests THAT:
+//!
+//! ```text
+//!     movzbl %al, %r11d
+//!     testq %r11, %r11    ->      testb %al, %al
+//!     je .L1                      je .L1
+//! ```
+//!
+//! This is `if ((h & 255) == 0)` on a call result whose `And` was allocated
+//! away from `%rax` — hot_web_loop's rare-arm guard, one `movzbl` per loop
+//! iteration on the hot path. The zero-extended value and the source byte are
+//! zero together, so ZF is exact; PF is set from the LOW BYTE of the result in
+//! both forms, which is the same byte; CF and OF are cleared by both. SF is
+//! the one flag that differs — the wide test's SF is always 0, `testb`'s is
+//! bit 7 of the byte — so the rewrite carries rule 1's exact obligations: an
+//! SF-blind reader ([`condition_ignores_sf`]), dead flags after it
+//! ([`flags_dead_after`]), and a dead destination value afterwards
+//! ([`FileLiveness::live_after`]). Deleting the `movzx` also moves the
+//! source's last read DOWN to the test line, so both families take the dirty-
+//! liveness discipline below, and the straight-line window between the three
+//! lines is enforced by the same [`next_non_debug`] walk as rule 1 — the test
+//! must be present (a `movzx` writes no flags, so a bare `jcc` after one
+//! consumes some OLDER computation's flags and is no candidate), and nothing
+//! else may intervene. A memory-sourced `movzbl (%mem), %R` is a load, not a
+//! mask, and stays with `load_mask_test`; a non-canonical high-byte spelling
+//! (`%ah`) fails the exact-spelling parse closed.
+//!
+//! All three rules are skip-switchable (`CCC_PEEPHOLE_SKIP=mask_test`) and all
+//! are idempotent: no output contains an `and{l,q} $imm, %R` line with a mask
+//! in range, nor a register-to-register `movzx` whose destination's only duty
+//! was a zero test.
 //!
 //! ## Relation to `fold_copy_and_mask_into_test`
 //!
@@ -149,6 +180,36 @@ fn parse_inplace_mask(t: &str) -> Option<(u64, RegId)> {
         imm.parse::<u64>().ok()?
     };
     (1..=MAX_MASK).contains(&imm).then_some((imm, fam))
+}
+
+/// Parse `movzbl %Sb, %D32` / `movzwl %Sw, %D32` with plain, canonically
+/// spelled GP registers, returning `(source REG_NAMES row, source family,
+/// destination family)`.  A memory source is a load (out of scope here, see
+/// `load_mask_test`), a clipped or high-byte spelling never round-trips
+/// through the exact `REG_NAMES` comparison, and anything else fails closed.
+fn parse_zext_pair(t: &str) -> Option<(usize, RegId, RegId)> {
+    let (row, rest) = if let Some(r) = t.strip_prefix("movzbl ") {
+        (3usize, r)
+    } else if let Some(r) = t.strip_prefix("movzwl ") {
+        (2usize, r)
+    } else {
+        return None;
+    };
+    let (src, dst) = rest.split_once(',')?;
+    let (src, dst) = (src.trim(), dst.trim());
+    if !src.starts_with('%') || src.contains('(') || !dst.starts_with('%') || dst.contains('(') {
+        return None;
+    }
+    let s_fam = register_family_fast(src);
+    let d_fam = register_family_fast(dst);
+    if s_fam > REG_GP_MAX || d_fam > REG_GP_MAX {
+        return None;
+    }
+    // Exact-spelling law: the source must be the canonical low-byte/word name
+    // and the destination the 32-bit name — `movzbl %ah, %r11d` masks a
+    // DIFFERENT byte than `%al`, and only the canonical rows prove identity.
+    (src == REG_NAMES[row][s_fam as usize] && dst == REG_NAMES[1][d_fam as usize])
+        .then_some((row, s_fam, d_fam))
 }
 
 /// A `setcc`/`jcc` whose condition does not consult `%sf`.
@@ -272,6 +333,60 @@ fn emit_byte_test(
     }
 }
 
+/// Rule 3 (see the module documentation): `movzx %S, %D; test %D, %D; jcc`
+/// becomes `test{b,w} %S, %S` when the condition is SF-blind, the flags die at
+/// the reader, and `%D`'s value dies with them.  Returns `true` on a rewrite.
+fn fold_zext_test(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    i: usize,
+    liveness: &mut Option<FileLiveness>,
+    dirty: &mut u16,
+) -> bool {
+    let Some((row, s_fam, d_fam)) = parse_zext_pair(infos[i].trimmed(store.get(i))) else {
+        return false;
+    };
+    // Never the stack or frame family, in either role — same refusal and same
+    // reasoning as rule 1.
+    if s_fam == REG_RSP || s_fam == REG_RBP || d_fam == REG_RSP || d_fam == REG_RBP {
+        return false;
+    }
+    // The explicit zero test MUST be present: a `movzx` writes no flags, so a
+    // bare `jcc` directly after one reads some older computation's flags and
+    // has nothing to do with this value.
+    let Some((reader, Some(mid))) = find_reader(store, infos, i, d_fam) else {
+        return false;
+    };
+    if !condition_ignores_sf(infos[reader].trimmed(store.get(reader))) {
+        return false;
+    }
+    // Dirty-liveness discipline (see the pass body): a prior rewrite of either
+    // family invalidates the cached solution before it is consulted.
+    for fam in [s_fam, d_fam] {
+        let bit = 1u16 << fam;
+        if *dirty & bit != 0 {
+            *dirty &= !bit;
+            *liveness = None;
+        }
+    }
+    let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+    if !lv.same_function(i, reader)
+        || lv.live_after(reader, d_fam) != Some(false)
+        || !flags_dead_after(store, infos, reader + 1)
+    {
+        return false;
+    }
+    let s = REG_NAMES[row][s_fam as usize];
+    let mnem = if row == 3 { "testb" } else { "testw" };
+    replace_line(store, &mut infos[mid], mid, format!("    {mnem} {s}, {s}"));
+    mark_nop(&mut infos[i]);
+    // The movzx (a write of %D) is gone and the source's last read moved DOWN
+    // to the test: both changes can only grow a live set, so both families'
+    // next queries must re-solve.
+    *dirty |= (1u16 << s_fam) | (1u16 << d_fam);
+    true
+}
+
 /// Fold in-place byte masks (see the module documentation).
 pub(super) fn fold_inplace_mask_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
@@ -293,6 +408,11 @@ pub(super) fn fold_inplace_mask_test(store: &mut LineStore, infos: &mut [LineInf
         }
         let t = infos[i].trimmed(store.get(i));
         let Some((imm, fam)) = parse_inplace_mask(t) else {
+            // Rule 3: the mask spelled as a register-to-register `movzx`
+            // whose destination exists only to be zero-tested.
+            if fold_zext_test(store, infos, i, &mut liveness, &mut dirty) {
+                changed = true;
+            }
             i += 1;
             continue;
         };
@@ -568,6 +688,83 @@ mod mask_test_tests {
         let again = fold_inplace_mask_test(&mut store, &mut infos);
         assert!(!again, "{once}");
         assert_eq!(once, store.build_result(|i| infos[i].is_nop()), "{once}");
+    }
+
+    /// Rule 3's witness, verbatim from hot_web_loop's hot path: the call
+    /// result's low byte is zero-tested through a zero-extension into the
+    /// comparison's own home.
+    #[test]
+    fn moved_byte_mask_tests_the_source_byte_directly() {
+        let out = run(
+            "    movzbl %al, %r11d\n    testq %r11, %r11\n    je .L1\n    ret\n.L1:\n    ret\n",
+        );
+        assert!(out.contains("testb %al, %al"), "{out}");
+        assert!(!out.contains("movzbl"), "{out}");
+        assert!(!out.contains("testq"), "{out}");
+    }
+
+    /// The word-width sibling.
+    #[test]
+    fn moved_word_mask_tests_the_source_word() {
+        let out = run(
+            "    movzwl %di, %esi\n    testl %esi, %esi\n    jne .L1\n    ret\n.L1:\n    ret\n",
+        );
+        assert!(out.contains("testw %di, %di"), "{out}");
+        assert!(!out.contains("movzwl"), "{out}");
+    }
+
+    /// SF is the flag the byte test changes, so an SF-consulting reader
+    /// keeps the wide shape.
+    #[test]
+    fn sf_reader_keeps_the_moved_mask() {
+        let out = run(
+            "    movzbl %al, %r11d\n    testq %r11, %r11\n    js .L1\n    ret\n.L1:\n    ret\n",
+        );
+        assert!(out.contains("movzbl %al, %r11d"), "{out}");
+        assert!(out.contains("testq %r11, %r11"), "{out}");
+    }
+
+    /// A destination that outlives the reader is a value, not just a test
+    /// input; the extension must stay.
+    #[test]
+    fn live_destination_keeps_the_moved_mask() {
+        let out = run(concat!(
+            "    movzbl %al, %r11d\n",
+            "    testq %r11, %r11\n",
+            "    je .L1\n",
+            "    movq %r11, %rdx\n",
+            "    ret\n",
+            ".L1:\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movzbl %al, %r11d"), "{out}");
+        assert!(out.contains("movq %r11, %rdx"), "{out}");
+    }
+
+    /// A memory-sourced `movzbl` is a load; that shape belongs to
+    /// `load_mask_test` and is refused here.
+    #[test]
+    fn memory_sourced_zext_is_not_a_moved_mask() {
+        let out = run(
+            "    movzbl (%rdi), %r11d\n    testq %r11, %r11\n    je .L1\n    ret\n.L1:\n    ret\n",
+        );
+        assert!(out.contains("movzbl (%rdi), %r11d"), "{out}");
+    }
+
+    /// A `movzx` writes no flags: a bare `jcc` directly after one is reading
+    /// some OLDER computation's flags and is no candidate.
+    #[test]
+    fn zext_without_a_test_is_left_alone() {
+        let out = run(concat!(
+            "    cmpq %rsi, %rdx\n",
+            "    movzbl %al, %r11d\n",
+            "    je .L1\n",
+            "    ret\n",
+            ".L1:\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movzbl %al, %r11d"), "{out}");
+        assert!(out.contains("cmpq %rsi, %rdx"), "{out}");
     }
 
     /// Every GP family has a byte name, including the REX-only ones.
