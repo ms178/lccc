@@ -146,7 +146,13 @@ MARKER='FIX''ME'
 #        once-per-process LazyLock saves nothing structural (the probe is
 #        already once per function, not per block).  Raised to the
 #        measurement, exactly.
-ENV_READ_BUDGET=149
+#   150  2026-11-17: the difference-branch kill switch (CCC_NO_DIFF_BRANCH,
+#        which keeps `if (a ^ b)` / `if (a - b)` branching on the difference
+#        instead of `if (a != b)`), resolved once in a `LazyLock` in
+#        src/passes/bit_idioms_facts.rs next to the other bit_idioms gates,
+#        so the rewrite pays one read per process.  Raised to the
+#        measurement, exactly.
+ENV_READ_BUDGET=150
 
 fail=0
 report() { # report <label> <offending lines>

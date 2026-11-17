@@ -373,148 +373,55 @@ pub(crate) fn run_with_aliases(
     run_with_aliases_tls(func, aliases, &FxHashSet::default())
 }
 
-pub(crate) fn run_with_aliases_tls(
-    func: &mut IrFunction,
-    aliases: &FxHashMap<String, String>,
-    tls_symbols: &FxHashSet<String>,
-) -> usize {
-    if func.blocks.is_empty() {
-        debug_merged(&func.name, 0);
-        return 0;
-    }
-    if std::env::var_os("CCC_NO_GADDR_CSE").is_some() {
-        debug_merged(&func.name, 0);
-        return 0;
-    }
-    let must_mat = classify_must_materialize(func);
-    let site_local = classify_site_local_indexed(func);
-
-    // Group every movable materialization by canonical symbol and use class.
-    // Site-local indexed bases deliberately keep distinct webs. TLS is the
-    // sole safe exception to the class split: unlike a normal GlobalAddr it
-    // cannot become a RIP/SIB memory operand, so both classes must materialize
-    // the same thread-relative base. Sharing it avoids repeated `%fs:0` reads.
-    // Key: (canonical symbol, must-materialize class, region tag). Tag 0 is
-    // the whole-function web for the class; a nonzero tag (loop header + 1)
-    // names a loop-scoped web carved out by the cross-class merge below so
-    // its placement and live range stay bounded by that loop.
-    let mut groups: FxHashMap<(String, bool, u32), Vec<(usize, usize, Value)>> =
-        FxHashMap::default();
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::GlobalAddr { dest, name } = inst {
-                let is_tls = tls_symbols.contains(name);
-                if debug_on() {
-                    lccc::cli::stderr_line(format_args!(
-                        "[GADDR_CSE] {} b{} v{} {} site_local={} must_mat={}",
-                        func.name,
-                        bi,
-                        dest.0,
-                        name,
-                        site_local.contains(&dest.0),
-                        must_mat.contains(&dest.0)
-                    ));
-                }
-                if site_local.contains(&dest.0) && !is_tls {
-                    continue;
-                }
-                groups
-                    .entry((
-                        canon_name(name, aliases).to_string(),
-                        !is_tls && must_mat.contains(&dest.0),
-                        0u32,
-                    ))
-                    .or_default()
-                    .push((bi, ii, *dest));
-            }
-        }
-    }
-
-    // The foldable/must-materialize class split above is load-bearing. An
-    // UNCONDITIONAL merge of a symbol's two webs ("a call use already
-    // forces a register, so separate foldable materializations are pure
-    // duplicates") was shipped once and measured as a loss on the golden
-    // gate, locally and on CI: zstd_count insns 115 -> 120 with stackmem
-    // 2 -> 8 (real in-loop spills), stencil5 insns 123 -> 130 with pushes
-    // 3 -> 5, gzip_crc32 / glibc_memcmp over the move tolerance. The
-    // flaw: a site-local foldable value is rematerialized adjacent to its
-    // use — many SHORT live ranges served by any free scratch register —
-    // while a merged web is one LONG live range that demands a
-    // callee-saved register (pushes) and, under loop pressure, spills.
-    // "Pays a register" is not "pays a long-lived register".
-    //
-    // The liveness-aware merge that IS profitable lives below, after loop
-    // analysis: see the comment at the merge site for the criterion and
-    // the per-workload evidence that derived it.
-    if groups.is_empty()
-        || groups
-            .values()
-            .all(|occurs| occurs.len() == 1 && occurs[0].0 == 0)
-    {
-        debug_merged(&func.name, 0);
-        return 0;
-    }
-    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
-    let loops = super::loop_analysis::find_natural_loops(
-        func.blocks.len(),
-        &cfg.preds,
-        &cfg.succs,
-        &cfg.idom,
-    );
-    let intrinsic_blocks: FxHashSet<usize> = func
-        .blocks
-        .iter()
-        .enumerate()
-        .filter_map(|(bi, block)| {
-            block
-                .instructions
-                .iter()
-                .any(|inst| matches!(inst, Instruction::Intrinsic { .. }))
-                .then_some(bi)
-        })
-        .collect();
-
-    // Liveness-aware cross-class merge. A symbol's foldable web joins its
-    // must-materialize web only when ALL of the following hold, each one
-    // tied to a measured gate outcome (gzip_crc32 / glibc_memcmp /
-    // zstd_count / stencil5 regressed under the unconditional merge;
-    // sqlite_varint's decode loop won):
-    //
-    // 1. Every occurrence of BOTH webs sits inside one common natural
-    //    loop (smallest such loop, intrinsic-free, with a real
-    //    preheader). The merged web is then hoisted to that preheader by
-    //    choose_placement, so its live range is bounded by the loop that
-    //    profits from it — never stretched across unrelated regions.
-    //      * zstd_count: foldable occurrence in the entry block, call
-    //        arguments in the query loop -> no common loop -> no merge
-    //        (the shipped merge put 6 stack slots into that loop).
-    //      * stencil5: init/checksum-loop foldable uses vs call loop ->
-    //        no common loop -> no merge (+2 callee-saved pushes before).
-    // 2. At least one must-materialize occurrence feeds a variable-offset
-    //    GEP. Only then does the merge delete per-iteration work: the
-    //    rematerialized `leaq sym(%rip), %rdi` + `addq %off, %rdi` pair
-    //    collapses to a single `leaq (%base, %off), %rdi` off the hoisted
-    //    register. A plain base argument costs one instruction either way
-    //    (remat leaq vs. register move), so merging buys nothing and
-    //    pins a register:
-    //      * gzip_crc32 / glibc_memcmp / stencil5 pass the bare array to
-    //        the kernel call -> no variable-offset feed -> no merge
-    //        (these were the +moves regressions before).
-    //      * sqlite_varint decodes at `bytes + offsets[i]` -> variable
-    //        GEP feeds the call -> merge: the hot loop drops from
-    //        leaq+addq per iteration to one indexed leaq, which is also
-    //        one instruction FEWER than gcc-16's no-pie absolute-address
-    //        form pays there.
-    // Scope note: the merge is a per-loop CARVE-OUT, not a whole-group
-    // union. After inlining a symbol routinely has must-materialize
-    // occurrences in several sibling loops (sqlite_varint: the inlined
-    // corpus encoder's call argument AND the decode loop's call
-    // argument). Unioning all of them would hand choose_placement a
-    // blockset with no common loop, whose dominator fallback stretches
-    // one definition across unrelated loops — the exact long-live-range
-    // failure the gate measured. Carving moves ONLY the occurrences
-    // inside the qualifying loop into their own region-tagged web; every
-    // outside occurrence keeps its original web and placement.
+/// Liveness-aware cross-class merge, as a per-loop carve-out.
+///
+/// A symbol's foldable web joins its must-materialize web only when ALL of
+/// the following hold, each one tied to a measured gate outcome
+/// (gzip_crc32 / glibc_memcmp / zstd_count / stencil5 regressed under the
+/// unconditional merge; sqlite_varint's decode loop won):
+///
+/// 1. Every occurrence of BOTH webs sits inside one common natural loop
+///    (smallest such loop, intrinsic-free, with a real preheader). The
+///    merged web is then hoisted to that preheader by choose_placement,
+///    so its live range is bounded by the loop that profits from it —
+///    never stretched across unrelated regions.
+///      * zstd_count: foldable occurrence in the entry block, call
+///        arguments in the query loop -> no common loop -> no merge
+///        (the shipped merge put 6 stack slots into that loop).
+///      * stencil5: init/checksum-loop foldable uses vs call loop ->
+///        no common loop -> no merge (+2 callee-saved pushes before).
+/// 2. At least one must-materialize occurrence feeds a variable-offset
+///    GEP. Only then does the merge delete per-iteration work: the
+///    rematerialized `leaq sym(%rip), %rdi` + `addq %off, %rdi` pair
+///    collapses to a single `leaq (%base, %off), %rdi` off the hoisted
+///    register. A plain base argument costs one instruction either way
+///    (remat leaq vs. register move), so merging buys nothing and pins a
+///    register:
+///      * gzip_crc32 / glibc_memcmp / stencil5 pass the bare array to
+///        the kernel call -> no variable-offset feed -> no merge
+///        (these were the +moves regressions before).
+///      * sqlite_varint decodes at `bytes + offsets[i]` -> variable GEP
+///        feeds the call -> merge: the hot loop drops from leaq+addq per
+///        iteration to one indexed leaq, which is also one instruction
+///        FEWER than gcc-16's no-pie absolute-address form pays there.
+///
+/// Scope note: the merge is a per-loop CARVE-OUT, not a whole-group
+/// union. After inlining a symbol routinely has must-materialize
+/// occurrences in several sibling loops (sqlite_varint: the inlined
+/// corpus encoder's call argument AND the decode loop's call argument).
+/// Unioning all of them would hand choose_placement a blockset with no
+/// common loop, whose dominator fallback stretches one definition across
+/// unrelated loops — the exact long-live-range failure the gate measured.
+/// Carving moves ONLY the occurrences inside the qualifying loop into
+/// their own region-tagged web; every outside occurrence keeps its
+/// original web and placement.
+fn carve_cross_class_loops(
+    func: &IrFunction,
+    groups: &mut FxHashMap<(String, bool, u32), Vec<(usize, usize, Value)>>,
+    loops: &[super::loop_analysis::NaturalLoop],
+    cfg: &crate::ir::analysis::CfgAnalysis,
+    intrinsic_blocks: &FxHashSet<usize>,
+) {
     let cross_class_names: Vec<String> = groups
         .keys()
         .filter(|(name, class, region)| {
@@ -622,6 +529,110 @@ pub(crate) fn run_with_aliases_tls(
             .or_default()
             .extend(carved);
     }
+}
+
+pub(crate) fn run_with_aliases_tls(
+    func: &mut IrFunction,
+    aliases: &FxHashMap<String, String>,
+    tls_symbols: &FxHashSet<String>,
+) -> usize {
+    if func.blocks.is_empty() {
+        debug_merged(&func.name, 0);
+        return 0;
+    }
+    if std::env::var_os("CCC_NO_GADDR_CSE").is_some() {
+        debug_merged(&func.name, 0);
+        return 0;
+    }
+    let must_mat = classify_must_materialize(func);
+    let site_local = classify_site_local_indexed(func);
+
+    // Group every movable materialization by canonical symbol and use class.
+    // Site-local indexed bases deliberately keep distinct webs. TLS is the
+    // sole safe exception to the class split: unlike a normal GlobalAddr it
+    // cannot become a RIP/SIB memory operand, so both classes must materialize
+    // the same thread-relative base. Sharing it avoids repeated `%fs:0` reads.
+    // Key: (canonical symbol, must-materialize class, region tag). Tag 0 is
+    // the whole-function web for the class; a nonzero tag (loop header + 1)
+    // names a loop-scoped web carved out by carve_cross_class_loops so
+    // its placement and live range stay bounded by that loop.
+    let mut groups: FxHashMap<(String, bool, u32), Vec<(usize, usize, Value)>> =
+        FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::GlobalAddr { dest, name } = inst {
+                let is_tls = tls_symbols.contains(name);
+                if debug_on() {
+                    lccc::cli::stderr_line(format_args!(
+                        "[GADDR_CSE] {} b{} v{} {} site_local={} must_mat={}",
+                        func.name,
+                        bi,
+                        dest.0,
+                        name,
+                        site_local.contains(&dest.0),
+                        must_mat.contains(&dest.0)
+                    ));
+                }
+                if site_local.contains(&dest.0) && !is_tls {
+                    continue;
+                }
+                groups
+                    .entry((
+                        canon_name(name, aliases).to_string(),
+                        !is_tls && must_mat.contains(&dest.0),
+                        0u32,
+                    ))
+                    .or_default()
+                    .push((bi, ii, *dest));
+            }
+        }
+    }
+
+    // The foldable/must-materialize class split above is load-bearing. An
+    // UNCONDITIONAL merge of a symbol's two webs ("a call use already
+    // forces a register, so separate foldable materializations are pure
+    // duplicates") was shipped once and measured as a loss on the golden
+    // gate, locally and on CI: zstd_count insns 115 -> 120 with stackmem
+    // 2 -> 8 (real in-loop spills), stencil5 insns 123 -> 130 with pushes
+    // 3 -> 5, gzip_crc32 / glibc_memcmp over the move tolerance. The
+    // flaw: a site-local foldable value is rematerialized adjacent to its
+    // use — many SHORT live ranges served by any free scratch register —
+    // while a merged web is one LONG live range that demands a
+    // callee-saved register (pushes) and, under loop pressure, spills.
+    // "Pays a register" is not "pays a long-lived register".
+    //
+    // The liveness-aware merge that IS profitable lives below, after loop
+    // analysis: see the comment at the merge site for the criterion and
+    // the per-workload evidence that derived it.
+    if groups.is_empty()
+        || groups
+            .values()
+            .all(|occurs| occurs.len() == 1 && occurs[0].0 == 0)
+    {
+        debug_merged(&func.name, 0);
+        return 0;
+    }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let loops = super::loop_analysis::find_natural_loops(
+        func.blocks.len(),
+        &cfg.preds,
+        &cfg.succs,
+        &cfg.idom,
+    );
+    let intrinsic_blocks: FxHashSet<usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(bi, block)| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Intrinsic { .. }))
+                .then_some(bi)
+        })
+        .collect();
+
+    carve_cross_class_loops(func, &mut groups, &loops, &cfg, &intrinsic_blocks);
 
     let mut next_id = func
         .next_value_id

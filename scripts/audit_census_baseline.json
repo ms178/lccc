@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 570,
+  "knob_literals": 571,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -204,6 +204,7 @@
     "CCC_NO_DEAD_FLAG_WRITES",
     "CCC_NO_DEAD_PRE_RET",
     "CCC_NO_DEMORGAN",
+    "CCC_NO_DIFF_BRANCH",
     "CCC_NO_DIV64_BYPASS",
     "CCC_NO_DIV_FUSION",
     "CCC_NO_DSE",
