@@ -343,12 +343,12 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     let model = MODEL.with(|c| c.get());
     let dbg = std::env::var_os("CCC_DEBUG_INTCONST").is_some();
     if dbg {
-        eprintln!(
+        lccc::cli::stderr_line(format_args!(
             "[intconst] fn={} blocks={} loops={}",
             func.name,
             func.blocks.len(),
             loops.len()
-        );
+        ));
     }
 
     // const bits -> (hoisted value id, body of the loop whose preheader defines it)
@@ -357,7 +357,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     for (li, lp) in loops.iter().enumerate() {
         let Some(preheader) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else {
             if dbg {
-                eprintln!("[intconst]  loop hdr={} NO PREHEADER", lp.header);
+                lccc::cli::stderr_line(format_args!(
+                    "[intconst]  loop hdr={} NO PREHEADER",
+                    lp.header
+                ));
             }
             continue;
         };
@@ -389,10 +392,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         // operands and a callee-saved push/pop). A leaf loop that uses it
         // still hoists it to its own preheader when its turn comes.
         if dbg {
-            eprintln!(
+            lccc::cli::stderr_line(format_args!(
                 "[intconst]  loop hdr={} preheader={} candidates={:?}",
                 lp.header, preheader, consts
-            );
+            ));
         }
         consts.retain(|&bits| {
             !single_insn_materialization(model, &IrConst::I64(bits as i64))
@@ -401,7 +404,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     .all(|&leaf| consts_in[leaf].contains(&bits))
         });
         if dbg {
-            eprintln!("[intconst]  after leaf-rule: {:?}", consts);
+            lccc::cli::stderr_line(format_args!("[intconst]  after leaf-rule: {:?}", consts));
         }
 
         for bits in consts {

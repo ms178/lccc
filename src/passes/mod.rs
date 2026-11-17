@@ -4346,6 +4346,21 @@ pub(crate) fn run_passes(
     // recurrences that the early run could not normalise.
     loop_carried_forward::run_module(module);
     verify::verify_after_pass(module, "loop_carried_forward_late");
+    // Re-CSE global address webs one last time. The loop passes above
+    // (iv_widen, loop_rotate, ivsr/univsr, loop_memory_promote,
+    // loop_carried_forward) run AFTER the "post_unroll" global_addr_cse and
+    // can leave duplicate same-symbol GlobalAddrs behind (promote's
+    // preheader rewrite left `sqlite_varint_bytes` materialized twice in
+    // one block; the loop body then used the un-CSE'd copy and the
+    // register allocator rematerialized a `leaq sym(%rip)` + `addq` chain
+    // inside the hot decode loop, every iteration). The pass is O(n) and
+    // idempotent by design — same justification as the post-unroll run —
+    // and its site-local classification is position-independent, so
+    // running it after the loop passes cannot disturb SIB selection.
+    if !pass_disabled(&disabled, "gaddrcse") {
+        global_addr_cse::run_module(module);
+        verify::verify_after_pass(module, "global_addr_cse_late");
+    }
     // Loop-memset recognition (LMR): constant-byte fill loops → memset(3).
     // Companion to the early loop_idiom pass (byte-COPY loops → memcpy):
     // its census refuses stored load results, so the two passes are
