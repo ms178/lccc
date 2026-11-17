@@ -667,10 +667,10 @@ impl Lowerer {
             // POINTER to the 32-byte result slot everywhere (sret convention).
             // The 128-bit raw builtins (maxps, minps, shufps, vextractf128_*)
             // and the 256-bit vinsertf128_* forms are typed by
-            // `x86_builtin_types::result_type`, which the caller consults
-            // first and which returns for every such name; they are not
-            // repeated here (a second copy made this function 7 lines
-            // longer than the audit census allows, and was unreachable).
+            // `x86_builtin_types::result_type`. `builtin_return_type` returns
+            // from that table before it reaches this match, so those names
+            // are not repeated here: a repeated arm is unreachable, and it
+            // pushed this function past the 300-line audit census limit.
             "__builtin_ia32_maxps256"
             | "__builtin_ia32_minps256"
             | "__builtin_ia32_andps256"

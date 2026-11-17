@@ -31,6 +31,8 @@ pub(crate) mod type_builder;
 pub(crate) mod types;
 pub(crate) mod x86_builtin_availability;
 pub(crate) mod x86_builtin_types;
+#[cfg(test)]
+mod x86_builtin_types_tests;
 pub(crate) mod x86_features;
 
 pub(crate) mod pass_policy;
