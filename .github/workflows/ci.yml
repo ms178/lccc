@@ -301,6 +301,7 @@ jobs:
           --config 'profile.fastbuild.debug-assertions=true' \
           --config 'profile.fastbuild.incremental=false' \
           --config 'profile.fastbuild.debug=0'
+        python3 tests/regression/check_isa_fixture_flags.py
         python3 tests/regression/run_regression.py \
           --lccc target/fastbuild/lccc \
           -j 2 \
