@@ -74,11 +74,18 @@ pub(super) struct SimdShape {
 /// The packed family for a vector CType, or `None` when the shape has no
 /// exact single-register form on this target (the caller scalarizes).
 pub(super) fn simd_shape(vec_ct: &CType) -> Option<SimdShape> {
-    let ceiling = target_vector_lowering_bytes();
+    let mut ceiling = target_vector_lowering_bytes();
     if ceiling == 0 {
         return None;
     }
     let (elem_ct, lanes) = vec_ct.vector_info()?;
+    // The 32-byte ceiling means AVX2 for the integer families and for the
+    // shift and 64-bit compare paths that test it, so it is not raised for
+    // them. A 256-bit FLOAT shape needs only VEX (AVX1), so under `-mavx`
+    // alone the float families may be formed even though the ceiling is 16.
+    if elem_ct.is_floating() && ceiling == 16 && crate::passes::vectorize::x86_avx_available_pub() {
+        ceiling = 32;
+    }
     if vec_ct.is_bitpacked_bool_vector() || vec_ct.is_x87_lane_vector() {
         return None;
     }
@@ -1088,6 +1095,22 @@ impl Lowerer {
         {
             return false;
         }
+        // Uniform NON-constant float list (`(v8sf){w, w, ..., w}`, the body of
+        // `_mm256_set1_ps(w)`): one scalar read, one broadcast. Every lane
+        // must name the same side-effect-free source, so one evaluation
+        // yields the value the per-lane evaluations would all read.
+        if matches!(shape.elem_ir, IrType::F32 | IrType::F64) && items.len() == num_elems {
+            if let Some(source) = self.uniform_stable_lane_source(items) {
+                let raw = self.lower_expr(source);
+                let src_ty = self.value_ir_type(source);
+                let src_ct = self.get_expr_ctype(source);
+                let lane =
+                    self.convert_assign_value(raw, src_ty, src_ct.as_ref(), elem_ct, shape.elem_ir);
+                let value = self.emit_vec_splat(&shape, lane);
+                self.emit_vec_store(&shape, value, destination);
+                return true;
+            }
+        }
         // Every mentioned lane as a lane-typed constant.
         let mut lanes: Vec<IrConst> = Vec::with_capacity(items.len());
         for item in items {
@@ -1127,6 +1150,56 @@ impl Lowerer {
         let value = self.emit_vec_splat(&shape, Operand::Const(splat));
         self.emit_vec_store(&shape, value, destination);
         true
+    }
+
+    /// The one source expression every lane of `items` reads, when that is a
+    /// stable read: a non-volatile identifier, or a non-volatile dereference
+    /// of a non-volatile identifier. Anything else (calls, side effects,
+    /// volatile objects, distinct sources) returns `None`.
+    fn uniform_stable_lane_source<'a>(&self, items: &'a [InitializerItem]) -> Option<&'a Expr> {
+        let mut first: Option<&'a Expr> = None;
+        for item in items {
+            let expr = match &item.init {
+                Initializer::Expr(e) => e,
+                Initializer::List(sub) => Self::unwrap_nested_init_expr(sub)?,
+            };
+            match first {
+                None => {
+                    if !Self::is_stable_lane_source_shape(expr)
+                        || self.expr_access_is_volatile(expr)
+                        || matches!(expr, Expr::Deref(inner, _) if self.expr_access_is_volatile(inner))
+                    {
+                        return None;
+                    }
+                    first = Some(expr);
+                }
+                Some(f) => {
+                    if !Self::same_lane_source(f, expr) {
+                        return None;
+                    }
+                }
+            }
+        }
+        first
+    }
+
+    fn is_stable_lane_source_shape(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(..) => true,
+            Expr::Deref(inner, _) => matches!(inner.as_ref(), Expr::Identifier(..)),
+            _ => false,
+        }
+    }
+
+    fn same_lane_source(a: &Expr, b: &Expr) -> bool {
+        match (a, b) {
+            (Expr::Identifier(x, _), Expr::Identifier(y, _)) => x == y,
+            (Expr::Deref(x, _), Expr::Deref(y, _)) => match (x.as_ref(), y.as_ref()) {
+                (Expr::Identifier(p, _), Expr::Identifier(q, _)) => p == q,
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// `c` converted to the lane type `elem_ir` exactly as the scalar init

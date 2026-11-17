@@ -188,6 +188,7 @@ thread_local! {
     // vectorizer to 128-bit forms rather than disable it — `-mno-avx2` (or no
     // AVX2 grant at all) still leaves the SSE2 register file legal.
     static X86_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static X86_AVX_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Preferred vector register width in bits (128/256), from
     // `-mprefer-vector-width=` and the `-mtune=` row's SIMD datapath.
     // 256 default: the widest class these passes implement (there is no
@@ -307,7 +308,7 @@ fn no_fixed_slp() -> bool {
 ///
 /// AArch64 needs no gate: its entry points pass `neon = true` and NEON is
 /// baseline ISA for every supported ARMv8/v9 target.
-pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool, avx512vl: bool) {
+pub(crate) fn set_x86_simd_isa(simd: bool, avx: bool, avx2: bool, sse41: bool, avx512vl: bool) {
     X86_SIMD_AVAILABLE.with(|available| available.set(simd));
     X86_SSE1_AVAILABLE.with(|available| available.set(simd));
     // AVX2 is a subset of "SIMD at all"; never let a caller assert AVX2 while
@@ -318,6 +319,11 @@ pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool, avx512vl: bo
     // *preference* is a separate question asked at every auto-vectorization
     // width choice through [`x86_avx2_width_wanted`].
     X86_AVX2_AVAILABLE.with(|available| available.set(avx2 && simd));
+    // VEX (AVX1) permission for the 256-bit FLOAT families: VEX.256 vmovups,
+    // vbroadcastss/sd, vxorps/vxorpd, vaddps and the other float ops are AVX1.
+    // Only the integer ymm families need `avx2`. Kept a separate cell so the
+    // float 256-bit SLP shapes do not wait for AVX2.
+    X86_AVX_AVAILABLE.with(|available| available.set(avx && simd));
     X86_SSE41_AVAILABLE.with(|available| available.set(sse41 && simd));
     // Same subset discipline: VL permission without the SIMD register file
     // is meaningless.
@@ -416,6 +422,11 @@ fn x86_avx2_width_wanted() -> bool {
 /// intrinsics directly (the BB-SLP vectorizer's width selection).
 pub(crate) fn x86_avx2_available_pub() -> bool {
     x86_avx2_available()
+}
+
+/// VEX (AVX1, 256-bit float) permission for the same callers.
+pub(crate) fn x86_avx_available_pub() -> bool {
+    X86_AVX_AVAILABLE.with(|available| available.get())
 }
 
 fn x86_avx2_available() -> bool {
@@ -32677,9 +32688,9 @@ mod map_unroll_policy_tests {
         let avx2 = x86_avx2_width_wanted();
         let sse41 = x86_sse41_available();
         let vl = x86_avx512vl_available_pub();
-        set_x86_simd_isa(false, false, false, false);
+        set_x86_simd_isa(false, false, false, false, false);
         assert!(!x86_sse1_available() && !x86_simd_available());
-        set_x86_simd_isa(simd, avx2, sse41, vl);
+        set_x86_simd_isa(simd, avx2, avx2, sse41, vl);
         set_x86_sse1_available(previous);
     }
 
@@ -39242,7 +39253,7 @@ mod prefer_vector_width_tests {
     fn a_128_bit_preference_withholds_the_256_bit_class_only() {
         // Baseline: AVX2 permission without a preference uses 256-bit shapes.
         set_x86_prefer_vector_bits(256);
-        set_x86_simd_isa(true, true, true, false);
+        set_x86_simd_isa(true, true, true, true, false);
         assert!(x86_avx2_available_pub());
         assert!(x86_avx2_width_wanted());
         assert!(x86_sse41_available_pub());
@@ -39251,7 +39262,7 @@ mod prefer_vector_width_tests {
         // stay legal (so an explicit `vector_size(32)` type keeps its `ymm`
         // image), the auto-vectorizers stop *choosing* 256-bit shapes.
         set_x86_prefer_vector_bits(128);
-        set_x86_simd_isa(true, true, true, true);
+        set_x86_simd_isa(true, true, true, true, true);
         assert!(
             x86_avx2_available_pub(),
             "the hardware permission is unchanged"
@@ -39267,19 +39278,19 @@ mod prefer_vector_width_tests {
         // emitter), and the stored value says what was asked for.
         set_x86_prefer_vector_bits(512);
         assert_eq!(x86_prefer_vector_bits_pub(), 512);
-        set_x86_simd_isa(true, true, true, false);
+        set_x86_simd_isa(true, true, true, true, false);
         assert!(x86_avx2_width_wanted());
 
         // An ISA denial still wins over any preference.
         set_x86_prefer_vector_bits(256);
-        set_x86_simd_isa(true, false, true, false);
+        set_x86_simd_isa(true, false, false, true, false);
         assert!(!x86_avx2_available_pub() && !x86_avx2_width_wanted());
-        set_x86_simd_isa(false, true, true, false);
+        set_x86_simd_isa(false, true, true, true, false);
         assert!(!x86_avx2_available_pub() && !x86_avx2_width_wanted());
 
         // Leave the thread-local state as the default for any test that runs
         // next on this thread under `--test-threads=1`.
-        set_x86_simd_isa(false, false, false, false);
+        set_x86_simd_isa(false, false, false, false, false);
         set_x86_prefer_vector_bits(256);
     }
 }

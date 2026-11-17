@@ -5125,8 +5125,9 @@ impl X86Codegen {
                 // xmm1 otherwise.  Placed before the vectorized j-loop.
                 //
                 // The width is chosen from the register file, NOT from FMA3.
-                // `vbroadcastsd %xmm1, %ymm1` is an AVX (VEX.256) form and
-                // needs no FMA unit, while the 128-bit `unpcklpd` form only
+                // `vbroadcastsd %xmm1, %ymm1` (register source, AVX2, emitted
+                // only under `isa.ymm`) needs no FMA unit, while the 128-bit
+                // `unpcklpd` form only
                 // ever fills two lanes.  Gating the wide form on `isa.fma`
                 // made every non-FMA 256-bit consumer -- `-mno-fma`, and
                 // `-ffp-contract=off`, which takes the unfused
@@ -8805,10 +8806,7 @@ impl X86Codegen {
                     if !done {
                         if let Some(&reg) = self.reg_assignments.get(&v.0) {
                             if is_xmm_reg(reg) {
-                                self.state.emit_fmt(format_args!(
-                                    "    vbroadcastsd %{}, %ymm0",
-                                    phys_reg_name(reg)
-                                ));
+                                self.emit_vbroadcast_xmm_to_ymm(true, phys_reg_name(reg), "ymm0");
                                 done = true;
                             }
                         }
@@ -8816,7 +8814,7 @@ impl X86Codegen {
                 }
                 if !done {
                     self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");
-                    self.state.emit("    vbroadcastsd %xmm0, %ymm0");
+                    self.emit_vbroadcast_xmm_to_ymm(true, "xmm0", "ymm0");
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -8949,8 +8947,7 @@ impl X86Codegen {
                         if let Some(&reg) = self.reg_assignments.get(&v.0) {
                             if is_xmm_reg(reg) {
                                 let name = phys_reg_name(reg);
-                                self.state
-                                    .emit_fmt(format_args!("    vbroadcastss %{}, %ymm0", name));
+                                self.emit_vbroadcast_xmm_to_ymm(false, name, "ymm0");
                                 done = true;
                             }
                         }
@@ -8958,7 +8955,7 @@ impl X86Codegen {
                 }
                 if !done {
                     self.emit_fp_operand_to_xmm(&args[0], IrType::F32, "xmm0");
-                    self.state.emit("    vbroadcastss %xmm0, %ymm0");
+                    self.emit_vbroadcast_xmm_to_ymm(false, "xmm0", "ymm0");
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -10936,6 +10933,41 @@ impl X86Codegen {
         }
     }
 
+    /// Broadcast the low F32 (`f64_lane == false`) or F64 lane of xmm register
+    /// `src` (a bare name such as `xmm1`) to every lane of ymm `dst`.
+    ///
+    /// AVX2 has the register-source `vbroadcastss/sd %xmm, %ymm`. Plain AVX
+    /// has only the memory-source forms, so under AVX1 the splat is built in
+    /// the 128-bit half (`vshufps`, or `vmovddup` for F64; the VEX.128 write
+    /// also zeroes the ymm upper half) and copied up with `vinsertf128`.
+    /// Both spellings produce the same 256-bit value.
+    pub(super) fn emit_vbroadcast_xmm_to_ymm(&mut self, f64_lane: bool, src: &str, dst: &str) {
+        if self.avx2_enabled {
+            let mnemonic = if f64_lane {
+                "vbroadcastsd"
+            } else {
+                "vbroadcastss"
+            };
+            self.state
+                .emit_fmt(format_args!("    {} %{}, %{}", mnemonic, src, dst));
+            return;
+        }
+        let dst_x = dst.replacen("ymm", "xmm", 1);
+        if f64_lane {
+            self.state
+                .emit_fmt(format_args!("    vmovddup %{}, %{}", src, dst_x));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    vshufps $0, %{}, %{}, %{}",
+                src, src, dst_x
+            ));
+        }
+        self.state.emit_fmt(format_args!(
+            "    vinsertf128 $1, %{}, %{}, %{}",
+            dst_x, dst, dst
+        ));
+    }
+
     fn try_emit_bitwise_lane_const(
         &mut self,
         dest: &Value,
@@ -10984,8 +11016,8 @@ impl X86Codegen {
         // Legacy SSE2 (128-bit only — the 256-bit families require AVX):
         // the destructive two-operand form stages the source into the
         // destination, then XORs the aligned mask memory in place.
-        if !self.avx2_enabled {
-            debug_assert!(!wide, "256-bit families require AVX");
+        if !(self.avx_enabled || self.avx2_enabled) {
+            assert!(!wide, "256-bit families require AVX");
             let legacy = &vex_mnemonic[1..]; // "xorps" / "xorpd"
             match self.dest_xmm_home_name(dest) {
                 Some(name) => {

@@ -377,7 +377,7 @@ fn the_loop(f: &IrFunction) -> (loop_analysis::NaturalLoop, CfgAnalysis) {
 
 /// x86-64 ISA for this test thread: SSE2 baseline, optionally AVX2.
 fn set_isa(avx2: bool) {
-    set_x86_simd_isa(true, avx2, avx2, false);
+    set_x86_simd_isa(true, avx2, avx2, avx2, false);
     set_x86_64_vector_intrinsics_available(true);
 }
 
@@ -1077,7 +1077,7 @@ fn byte_sum_width_follows_the_target() {
     set_x86_64_vector_intrinsics_available(false);
     assert_eq!(byte_sum_width(false), None);
     // -mno-sse / -mgeneral-regs-only: none.
-    set_x86_simd_isa(false, false, false, false);
+    set_x86_simd_isa(false, false, false, false, false);
     set_x86_64_vector_intrinsics_available(true);
     assert_eq!(byte_sum_width(false), None);
     set_isa(false);

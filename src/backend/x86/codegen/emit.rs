@@ -1127,6 +1127,11 @@ pub struct X86Codegen {
     pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
     /// True when the target has AVX2; gates YMM constant-size copies.
     pub(super) avx2_enabled: bool,
+    /// VEX (AVX1) permission, separate from `avx2_enabled`. The 256-bit FLOAT
+    /// bitwise emitters need only AVX; keying them on AVX2 emitted a legacy
+    /// 128-bit `xorps` for a 256-bit operand under `-mavx`, dropping the upper
+    /// lanes. The 128-bit encodings still key on `avx2_enabled` (follow-up).
+    pub(super) avx_enabled: bool,
     /// Code-generation ISA permission for the current TU (VEX / SSE4.1 /
     /// FMA3 / ymm).  Every text emitter consults this instead of assuming a
     /// baseline; the x86-64 default is SSE2 — see `backend::x86::isa`.
@@ -1693,6 +1698,7 @@ impl X86Codegen {
             apx_enabled: false,
             tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
             avx2_enabled: false,
+            avx_enabled: false,
             isa: super::super::isa::X86Isa::default(),
             avx512_enabled: false,
             wide_simd_copies: false,
@@ -1859,6 +1865,7 @@ impl X86Codegen {
         // its 256-bit source through movdqa/xorps and silently dropped the
         // upper lanes under VEX.256 loads/stores.
         self.avx2_enabled = opts.isa.ymm;
+        self.avx_enabled = opts.isa.avx;
         self.avx512_enabled = opts.avx512 && opts.isa.ymm;
         // VL carries the same ymm precondition as F here: the ARX rotator
         // only ever lowers a 128-bit xmm form, and the option already
@@ -8451,6 +8458,7 @@ impl ArchCodegen for X86Codegen {
             self.isa = vec_isa;
             self.no_sse = want_no_sse;
             self.avx2_enabled = vec_isa.ymm;
+            self.avx_enabled = vec_isa.avx;
             self.fma_enabled = vec_isa.fma;
             self.avx512_enabled = want_avx512;
             self.avx512vl_enabled = want_avx512vl;

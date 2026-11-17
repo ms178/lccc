@@ -27,7 +27,9 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = ('avx_broadcast_intrinsics', 'avx_zext_upper_zero')
+# 256-bit float arithmetic, broadcast and blend mnemonics with a %ymm operand.
+WIDE_FLOAT_OP = re.compile(r'\s(v(?:add|sub|mul|div|xor|and|or|broadcast|blend|cmp)p[sd]|vbroadcast\w+)\s.*%ymm')
+FIXTURES = ('avx_broadcast_intrinsics', 'avx_zext_upper_zero', 'avx1_float256_families', 'avx1_float256_ops')
 # Fixtures whose -mavx2 object must contain a memory-source broadcast.
 MEMORY_FORM_FIXTURE = 'avx2_broadcast_memory_form'
 MEMORY_FORM = re.compile(r'\s(vbroadcastss|vbroadcastsd)\s+[^,]*\(%')
@@ -130,6 +132,13 @@ def main() -> None:
                 run([args.lccc_i686, *strict, '-m32', '-mavx', '-c', str(source), '-o', str(obj)])
                 hits = avx2_hits(args.objdump, obj)
                 assert not hits, f'{name}: AVX2 instructions under -m32 -mavx:\n' + '\n'.join(hits)
+                # i686 has no 256-bit float lowering: the F32x8/F64x4 families
+                # are x86-64 only. Plain 32-byte copies (`vmovdqu %ymm`) are
+                # legal AVX1 and allowed; float arithmetic, broadcasts and
+                # blends on %ymm are not.
+                wide_float = [line for line in run([args.objdump, '-d', str(obj)]).stdout.splitlines()
+                              if WIDE_FLOAT_OP.search(line)]
+                assert not wide_float, f'{name}: 256-bit float ops under -m32 -mavx:\n' + '\n'.join(wide_float[:5])
                 exe = tmp / (name + '.i686.avx')
                 run([args.lccc_i686, *strict, '-m32', '-mavx', str(source), '-o', str(exe)])
                 gcc32 = tmp / (name + '.gcc32')

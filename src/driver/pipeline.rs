@@ -3320,6 +3320,7 @@ impl Driver {
             );
             crate::passes::vectorize::set_x86_simd_isa(
                 isa.simd,
+                self.target == Target::X86_64 && isa.avx,
                 isa.ymm,
                 isa.sse41,
                 self.target == Target::X86_64

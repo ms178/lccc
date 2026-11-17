@@ -51,7 +51,8 @@ use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
 use crate::ir::reexports::IrFunction;
 use crate::passes::CfgAnalysis;
 use crate::passes::vectorize::{
-    x86_avx2_available_pub, x86_prefer_wide_pub, x86_simd_available_pub, x86_sse41_available_pub,
+    x86_avx_available_pub, x86_avx2_available_pub, x86_prefer_wide_pub, x86_simd_available_pub,
+    x86_sse41_available_pub,
 };
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
@@ -702,6 +703,7 @@ pub(crate) struct VecFamily {
 }
 
 pub(crate) fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
+    let avx = x86_avx_available_pub();
     let avx2 = x86_avx2_available_pub();
     match (ty, width) {
         // HALF-WIDE dword pairs: 2 lanes of 4 bytes in the low 64 bits of
@@ -733,7 +735,7 @@ pub(crate) fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             extract: Some(IntrinsicOp::VecExtractLaneF64x2),
             size: 8,
         }),
-        (IrType::F64, 4) if avx2 => Some(VecFamily {
+        (IrType::F64, 4) if avx => Some(VecFamily {
             load: IntrinsicOp::VecLoadF64x4,
             store: IntrinsicOp::VecStoreF64x4,
             broadcast: IntrinsicOp::VecBroadcastF64x4,
@@ -753,7 +755,7 @@ pub(crate) fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             extract: Some(IntrinsicOp::VecExtractLaneF32x4),
             size: 4,
         }),
-        (IrType::F32, 8) if avx2 => Some(VecFamily {
+        (IrType::F32, 8) if avx => Some(VecFamily {
             load: IntrinsicOp::VecLoadF32x8,
             store: IntrinsicOp::VecStoreF32x8,
             broadcast: IntrinsicOp::VecBroadcastF32x8,
@@ -8322,11 +8324,12 @@ mod tests {
         use crate::passes::vectorize as v;
         let saved = (
             v::x86_simd_available_pub(),
+            v::x86_avx_available_pub(),
             v::x86_avx2_available_pub(),
             v::x86_sse41_available_pub(),
             v::x86_avx512vl_available_pub(),
         );
-        v::set_x86_simd_isa(true, true, true, false);
+        v::set_x86_simd_isa(true, true, true, true, false);
         assert_eq!(preferred_width(8, 4, IrType::U32, true), Some(8));
         assert_eq!(preferred_width(4, 4, IrType::U32, false), Some(4));
         assert_eq!(preferred_width(2, 4, IrType::U32, false), Some(2));
@@ -8334,7 +8337,7 @@ mod tests {
         assert_eq!(preferred_width(2, 8, IrType::I64, false), Some(2));
         assert_eq!(preferred_width(2, 1, IrType::U8, false), None);
         assert_eq!(preferred_width(1, 4, IrType::U32, false), None);
-        v::set_x86_simd_isa(saved.0, saved.1, saved.2, saved.3);
+        v::set_x86_simd_isa(saved.0, saved.1, saved.2, saved.3, saved.4);
     }
 
     #[test]
@@ -8485,22 +8488,45 @@ mod tests {
         f
     }
 
+    /// The 256-bit FLOAT families need only VEX (AVX1); the integer 256-bit
+    /// families stay AVX2-gated. Pins the permission cells `family_for` reads.
+    #[test]
+    fn float_256_families_need_only_avx() {
+        use crate::passes::vectorize as v;
+        let saved = (
+            v::x86_simd_available_pub(),
+            v::x86_avx_available_pub(),
+            v::x86_avx2_available_pub(),
+            v::x86_sse41_available_pub(),
+            v::x86_avx512vl_available_pub(),
+        );
+        v::set_x86_simd_isa(true, true, false, true, false);
+        assert!(family_for(IrType::F32, 8).is_some());
+        assert!(family_for(IrType::F64, 4).is_some());
+        assert!(family_for(IrType::I32, 8).is_none());
+        v::set_x86_simd_isa(true, false, false, true, false);
+        assert!(family_for(IrType::F32, 8).is_none());
+        assert!(family_for(IrType::F64, 4).is_none());
+        v::set_x86_simd_isa(saved.0, saved.1, saved.2, saved.3, saved.4);
+    }
+
     /// The ISA gate is thread-local state shared by libtest's worker threads;
     /// save/set/restore so parallel test execution cannot leak into others.
     fn with_isa_gate<T>(f: impl FnOnce() -> T) -> T {
         use crate::passes::vectorize as v;
         let saved = (
             v::x86_simd_available_pub(),
+            v::x86_avx_available_pub(),
             v::x86_avx2_available_pub(),
             v::x86_sse41_available_pub(),
             v::x86_avx512vl_available_pub(),
             v::x86_prefer_vector_bits_pub(),
         );
-        v::set_x86_simd_isa(true, true, true, false);
+        v::set_x86_simd_isa(true, true, true, true, false);
         v::set_x86_prefer_vector_bits(256);
         let out = f();
-        v::set_x86_prefer_vector_bits(saved.4);
-        v::set_x86_simd_isa(saved.0, saved.1, saved.2, saved.3);
+        v::set_x86_prefer_vector_bits(saved.5);
+        v::set_x86_simd_isa(saved.0, saved.1, saved.2, saved.3, saved.4);
         out
     }
 
