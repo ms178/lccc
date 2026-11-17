@@ -66,6 +66,27 @@ wall clock 259 → 245-254 ms vs gcc-16's 291-299 ms on the same host; the
 absorbed shape also removes the Zen 5 store-forwarding round-trip that
 caused the 2.26x EPYC cliff.
 
+Baseline notes (2026-11-17): `--update-baseline` for the difference-branch
+canonicalization (`if (a ^ b)` -> `if (a != b)`, bit_idioms diff_branch).
+Two workloads carry the compare256/ZSTD_count idiom and re-pin:
+zlib_ng_adler32 209→214 insns / 43→46 moves, zstd_count 115→118 / 19→20.
+The static growth is the idiom's cost model working as designed: the match
+loop drops the non-fusing `xor mem,reg`+`jne` flag producer for a fusible
+`cmp`+`jne` (4 uops → 3 per iteration) and the XOR is re-materialized once
+on the mismatch exit — the exact loop GCC 16.2 emits for both kernels
+(movq/movq/cmpq/jne, byte-identical shape). Paired wall clock on the same
+host, 41 medians, checksum-identical output: zlib_ng_compare256 (the
+idiom's home) 1.1973→1.0315 vs gcc-16, zlib_ng_adler32 0.9953 vs its own
+old code (now at gcc parity, 0.9990), zstd_count 1.0318 vs old — the one
+regression, pinned to its short-match data (the mismatch exit is the hot
+edge there, and pays the one re-materialized XOR). The remaining
+zstd_count gap against gcc predates this change (old/gcc 1.1038) and is
+register allocation, not shape: the loop limit reloads from `0(%rsp)`
+every iteration where gcc keeps it in `%r12`, and the exit XOR copies
+through `%rax` instead of clobbering its dead source. Static size is the
+wrong metric for a hot-path/cold-path split, same charter as the stencil5
+and chacha20 notes above.
+
 Usage:
     python3 ci-codegen-gate.py --lccc target/fastbuild/lccc
     python3 ci-codegen-gate.py --lccc ... --update-baseline

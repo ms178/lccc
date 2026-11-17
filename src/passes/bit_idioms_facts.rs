@@ -957,6 +957,20 @@ pub(super) fn bit_select_disabled() -> bool {
     *FLAG
 }
 
+/// The single authority for the `CCC_NO_DIFF_BRANCH` kill switch.
+///
+/// Same contract as [`compare_dominance_disabled`]: presence of the variable
+/// is the answer, not its text, and the answer is cached for the process
+/// lifetime. The gate exists so the differential batteries can A/B the
+/// difference-branch rewrite (`if (a ^ b)` / `if (a - b)` -> `if (a != b)`)
+/// without a second binary, and so a miscompile can be bisected to this one
+/// rule in a single run.
+pub(super) fn diff_branch_disabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_DIFF_BRANCH").is_some());
+    *FLAG
+}
+
 pub(super) fn run(func: &mut IrFunction) -> usize {
     use crate::ir::reexports::Terminator;
     if func
