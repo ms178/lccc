@@ -5,8 +5,10 @@ Every compilation is injected. Real subprocess tests elsewhere run Python,
 never a compiler. Legacy substring/broadcast/XFAIL-collapse assertions are
 replaced by strict v2 behavioral contracts rather than preserving false PASS.
 """
+import contextlib
 import copy
 import importlib.util
+import io
 from pathlib import Path
 import subprocess
 import sys
@@ -243,13 +245,20 @@ class PairingContract(Harness):
 class CliContract(unittest.TestCase):
     def test_invalid_category_usage_no_probe(self):
         with mock.patch.object(runner,'spawn_process',side_effect=AssertionError('unexpected compiler call')):
-            self.assertEqual(runner.main(['--category','NoSuchCategory','--cc','true']),2)
+            err=io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc=runner.main(['--category','NoSuchCategory','--cc','true'])
+            self.assertEqual(rc,2)
+            self.assertIn("unknown category 'NoSuchCategory'",err.getvalue())
     def test_invalid_budgets_usage_error(self):
         for flags in [('--jobs','0'),('--limit','-1'),('--timeout','nan')]:
-            self.assertEqual(runner.main(list(flags)),2)
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(runner.main(list(flags)),2)
     def test_removed_collapse_XFAIL_flag_rejected(self):
-        with self.assertRaises(SystemExit) as ctx:runner.main(['--xfail-as-pass'])
+        err=io.StringIO()
+        with contextlib.redirect_stderr(err),self.assertRaises(SystemExit) as ctx:runner.main(['--xfail-as-pass'])
         self.assertEqual(ctx.exception.code,2)
+        self.assertIn('unrecognized arguments: --xfail-as-pass',err.getvalue())
     def test_plan_REPORT_complete_zero_execution(self):
         with tempfile.TemporaryDirectory() as td,mock.patch.object(runner,'spawn_process',side_effect=AssertionError('compiler invoked')):
             report=Path(td)/'report.json'
