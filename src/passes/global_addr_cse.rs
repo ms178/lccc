@@ -46,8 +46,12 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand, Value};
 
+fn debug_on() -> bool {
+    std::env::var_os("CCC_DEBUG_GADDR_CSE").is_some()
+}
+
 fn debug_merged(name: &str, n: usize) {
-    if std::env::var_os("CCC_DEBUG_GADDR_CSE").is_some() {
+    if debug_on() {
         lccc::cli::stderr_line(format_args!("[GADDR_CSE] fn={} merged={}", name, n));
     }
 }
@@ -395,6 +399,17 @@ pub(crate) fn run_with_aliases_tls(
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Instruction::GlobalAddr { dest, name } = inst {
                 let is_tls = tls_symbols.contains(name);
+                if debug_on() {
+                    lccc::cli::stderr_line(format_args!(
+                        "[GADDR_CSE] {} b{} v{} {} site_local={} must_mat={}",
+                        func.name,
+                        bi,
+                        dest.0,
+                        name,
+                        site_local.contains(&dest.0),
+                        must_mat.contains(&dest.0)
+                    ));
+                }
                 if site_local.contains(&dest.0) && !is_tls {
                     continue;
                 }
@@ -409,6 +424,22 @@ pub(crate) fn run_with_aliases_tls(
         }
     }
 
+    // The foldable/must-materialize class split above is load-bearing; do
+    // NOT merge a symbol's two webs even when a call use already forces a
+    // register. A merge was shipped on the theory that the forced register
+    // makes the foldable web's separate materializations pure duplicates.
+    // The golden-workload gate measured the opposite, locally and on CI:
+    // zstd_count insns 115 -> 120 with stackmem 2 -> 8 (real in-loop
+    // spills), stencil5 insns 123 -> 130 with pushes 3 -> 5, and
+    // gzip_crc32 / glibc_memcmp over the move tolerance. The flaw: a
+    // site-local foldable value is rematerialized adjacent to its use —
+    // many SHORT live ranges the allocator serves from any free scratch
+    // register — while the merged web is one LONG live range spanning
+    // every use, which demands a callee-saved register (pushes) and, under
+    // loop pressure, spills. "Pays a register" is not "pays a long-lived
+    // register". Reinstating a merge requires a liveness-aware criterion
+    // (e.g. both webs already simultaneously live across the same loop,
+    // as in sqlite_varint's encode/decode loops) proven against the gate.
     if groups.is_empty()
         || groups
             .values()
@@ -859,8 +890,12 @@ mod tests {
     #[test]
     fn does_not_mix_foldable_with_must_materialize() {
         // v1 is only a load pointer (foldable). v2 is passed to a call
-        // (must materialize). CSE must not merge them: that would pin the
-        // RIP-foldable address in a register.
+        // (must materialize). CSE must not merge them, even though the
+        // call forces a register for `g`: the load is RIP-foldable and
+        // costs zero registers where it stands, while a merged web is one
+        // long live range. When a merge shipped, the golden gate measured
+        // zstd_count stackmem 2 -> 8 and stencil5 pushes 3 -> 5 — see the
+        // comment at the class-merge tombstone in run_with_aliases_tls.
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -1436,7 +1471,8 @@ mod tests {
     #[test]
     fn cold_singletons_preserve_class_split() {
         // Foldable load and call-arg classes of the same symbol must remain
-        // distinct. As cold singletons they also stay in their original block.
+        // distinct — see does_not_mix_foldable_with_must_materialize. As
+        // cold singletons they also stay in their original block.
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),

@@ -2400,6 +2400,31 @@ impl X86Codegen {
             // copy of this value must see the whole register, not one half.
             self.state.i128_values.insert(dest.0);
         }
+        // Register-homed carrier (an allocator assigned this call result an
+        // XMM home): initialise the home.  Every consumer of a homed value
+        // reads the REGISTER (`sse_load_arg` checks `reg_assignments`
+        // first), and a call is the one producer with no committing store
+        // path of its own — leaving the home unwritten hands consumers an
+        // uninitialized register (the `movdqa %xmm15, %xmm0` class of
+        // miscompile).  The slot store above stays: spill paths and memory
+        // folds read the slot, and dead-store elimination in the peephole
+        // retires it when nothing does.
+        if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+            if super::emit::is_xmm_reg(phys) {
+                let home = super::emit::phys_reg_name(phys);
+                if home != "xmm0" {
+                    let mov = if crate::common::x86_features::effective()
+                        .contains(crate::common::x86_features::X86Feature::Sse2)
+                    {
+                        "movdqa"
+                    } else {
+                        "movaps"
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {mov} %xmm0, %{home}"));
+                }
+            }
+        }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();

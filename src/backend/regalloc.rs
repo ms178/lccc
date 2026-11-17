@@ -9164,6 +9164,38 @@ fn is_vector_broadcast_op(op: &IntrinsicOp) -> bool {
 
 fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
     let mut out: FxHashSet<u32> = FxHashSet::default();
+    // Values whose PRODUCER commits an XMM register home when the value is
+    // allocated one: intrinsic results (`sse_store_dest` / `finish_lane_dest`
+    // and friends all honor `reg_assignments`), extended through `Copy`
+    // chains (the copy emitter materialises into the destination's home).
+    // Everything else — above all a CALL result carried as `IrType::I128`
+    // ([Sse, SseUp] vector returns) — writes ONLY its stack slot, so homing
+    // such a value as a chain OPERAND hands every consumer a register that
+    // no instruction ever wrote (observed live once the aggregate
+    // round-trip pass forwarded a carrier into `VecAddI32x4`: the emitted
+    // `movdqa %xmm15, %xmm0` read an uninitialized %xmm15).  Operand
+    // admission below is therefore gated on this set; result admission
+    // needs no gate because the collecting instruction IS the committing
+    // producer.
+    // Intrinsic results commit; so does EVERY `Copy` destination —
+    // `emit_copy_value` materialises into the destination's home whatever
+    // the source is (slot-held carrier included), which is exactly the web
+    // transport the map collector documents.  A Copy FROM a carrier is
+    // therefore a legal homed value, while the carrier itself stays out.
+    let mut committing: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Intrinsic { dest: Some(d), .. } => {
+                    committing.insert(d.0);
+                }
+                Instruction::Copy { dest, .. } => {
+                    committing.insert(dest.0);
+                }
+                _ => {}
+            }
+        }
+    }
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Intrinsic {
@@ -9211,7 +9243,11 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                             // pair (measured: 26 of 74 instructions in the
                             // ChaCha double round were that roundtrip).
                             out.insert(d.0);
-                            out.insert(a0.0);
+                            // Operand admission: committing producers only
+                            // (see the gate's rationale above).
+                            if committing.contains(&a0.0) {
+                                out.insert(a0.0);
+                            }
                             // The second operand when it is a value
                             // (pshufb's loop-invariant MASK, a second
                             // stream): homed with its own register for its
@@ -9221,7 +9257,9 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                             // double round).  Const operands (rotate
                             // amounts, compare predicates) stay out.
                             if let Some(Operand::Value(a1)) = args.get(1) {
-                                out.insert(a1.0);
+                                if committing.contains(&a1.0) {
+                                    out.insert(a1.0);
+                                }
                             }
                         }
                     }
@@ -9229,6 +9267,31 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
             }
         }
     }
+    // RETURN-ONLY chain results never earn a home (see
+    // `drop_return_only_vector_results`).
+    drop_return_only_vector_results(func, &mut out);
+
+    // Entry vector-parameter loads (the preload shape recognised by
+    // `x86_vector_param_loads`): with a home, the prologue moves the
+    // incoming ABI register straight there and the load emits nothing —
+    // the `((long long *)&a)[1]` lane read then extracts from the home
+    // register instead of round-tripping the parameter through its slot.
+    // Without the grant nothing changes (capture store + real load), so
+    // admission is unconditionally sound.  Chain-consumed loads are
+    // already admitted above; this covers extract-only consumption.
+    // Admitted AFTER the return-only drop on purpose: even a return-only
+    // param load (the `return a;` identity) wins with a home — the
+    // preload replaces a spill+reload round trip, unlike chain results
+    // whose home costs a committed copy.
+    for load in crate::backend::stack_layout::x86_vector_param_loads(func)
+        .into_iter()
+        .flatten()
+    {
+        if load.1 == 16 {
+            out.insert(load.0.0);
+        }
+    }
+
     // Backward copy propagation of chain homes: the ARX vectorizer lowers
     // a loop-header phi's ENTRY edge to `Copy { dest: entry_val, src:
     // preheader_pack }`, and the same shape appears wherever a chain
@@ -9249,7 +9312,11 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                 if let Instruction::Copy { dest, src } = inst {
                     if out.contains(&dest.0) {
                         if let Operand::Value(s) = src {
-                            if out.insert(s.0) {
+                            // Same committing-producer gate as direct
+                            // operand admission: a copy FROM a call
+                            // carrier must read the slot, not a register
+                            // home nothing initialises.
+                            if committing.contains(&s.0) && out.insert(s.0) {
                                 changed = true;
                             }
                         }
@@ -10497,8 +10564,17 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecFmsF32x4
                     | O::VecFnmsF32x4
                     // BB-SLP lane extract (128-bit F32): reads the XMM
-                    // home; scratch confined to xmm1.
+                    // home; scratch confined to xmm1.  Cross-width lane
+                    // extracts are bit-level reinterpretations of the same
+                    // 16 home bytes (`((int *)&v)[k]`): every 128-bit
+                    // extract emitter reads the home through xmm0/xmm1
+                    // staging (or directly in the register-sourced fast
+                    // paths) and never writes a pool register, so all four
+                    // are read-only consumers of any 128-bit home class.
                     | O::VecExtractLaneF32x4
+                    | O::VecExtractLaneF64x2
+                    | O::VecExtractLaneI32x4
+                    | O::VecExtractLaneI64x2
             ),
             4 => matches!(
                 op,
@@ -10511,7 +10587,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // directly (vec_store_source_128); the lane extract
                     // stages through xmm1 only (sse_load_arg discipline).
                     | O::VecStoreF64x2
+                    // All 128-bit lane extracts are read-only bit-level
+                    // consumers of the 16 home bytes (see class 3).
                     | O::VecExtractLaneF64x2
+                    | O::VecExtractLaneF32x4
+                    | O::VecExtractLaneI32x4
+                    | O::VecExtractLaneI64x2
             ),
             5 => matches!(
                 op,
@@ -10591,8 +10672,15 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // source path (vec_store_source_128).
                     | O::VecStoreI32x4Pair
                     | O::VecStoreNarrowMaxU8x4
-                    // BB-SLP lane extract: xmm1-only staging.
+                    // BB-SLP lane extract: xmm1-only staging.  All
+                    // 128-bit lane extracts are read-only bit-level
+                    // consumers of the 16 home bytes (see class 3) —
+                    // `((long long *)&v)[1]` of an I32x4-classed
+                    // parameter web must not evict the home.
                     | O::VecExtractLaneI32x4
+                    | O::VecExtractLaneI64x2
+                    | O::VecExtractLaneF32x4
+                    | O::VecExtractLaneF64x2
             ),
             7 => matches!(
                 op,
@@ -10607,9 +10695,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecWidenAddValueI32x4ToI64x2
                     | O::VecWidenMaskedAddValueI32x4ToI64x2
                     // BB-SLP sinks: 128-bit store (register-home source)
-                    // and lane extract (xmm1-only staging).
+                    // and lane extract (xmm1-only staging).  All 128-bit
+                    // lane extracts are read-only bit-level consumers of
+                    // the 16 home bytes (see class 3).
                     | O::VecStoreI64x2
                     | O::VecExtractLaneI64x2
+                    | O::VecExtractLaneI32x4
+                    | O::VecExtractLaneF32x4
+                    | O::VecExtractLaneF64x2
                     // BB-SLP bitwise consumes a homed I64x2 through the
                     // emit_sse_binary_128 home/memfold paths.
                     | O::VecAndI64x2
@@ -12054,7 +12147,185 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
     }
     poison_copy_webs(func, &candidates, &mut bad);
     candidates.retain(|value, _| !bad.contains(value));
-    candidates.into_keys().collect()
+    let mut out: FxHashSet<u32> = candidates.into_keys().collect();
+    // The return consumer above is LEGAL (the return path reads a home
+    // with one move), but a value whose ONLY use is the return still nets
+    // a loss from homing — drop those.
+    drop_return_only_vector_results(func, &mut out);
+    out
+}
+
+/// Remove from `set` every value whose ONLY consumer is a `Return`
+/// terminator.  Such a value wants to END in the return register
+/// (`%xmm0`/`%ymm0`), so a private XMM home guarantees one committed copy
+/// into the home plus one copy back out at the return — measured on
+/// `return _mm_add_epi32(f(p), w);` as three extra instructions
+/// (`movdqu %xmm0, %xmm15` … `movdqa %xmm15, %xmm0`) against the unhomed
+/// form, whose result simply stays in `%xmm0` (the accumulator path) for
+/// the return to consume in place.  Values with ANY instruction use keep
+/// their homes: in-place handoffs, loop webs and multi-consumer results
+/// are exactly what register homing is for.
+fn drop_return_only_vector_results(func: &IrFunction, set: &mut FxHashSet<u32>) {
+    let mut inst_used: FxHashSet<u32> = FxHashSet::default();
+    let mut return_used: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    inst_used.insert(v.0);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                inst_used.insert(v.0);
+            });
+        }
+        if let Terminator::Return(Some(Operand::Value(v))) = &block.terminator {
+            return_used.insert(v.0);
+        }
+    }
+    // A return-only result is only a LOSS when its home must be COMMITTED
+    // with a copy: the producer writes a scratch, `movdqa scratch, home`,
+    // and the return reads the home back out — h3's two dead `movdqa`s
+    // around a call.  When the destructive handoff can recycle a dying
+    // operand's register into the result instead, the home is produced in
+    // place and the function matches GCC exactly (`vfmadd132ps …, %xmm0;
+    // ret` — the RH-01 ceilings): those results must KEEP their homes.
+    // The handoff needs an operand that is
+    //   (a) itself a homed candidate (same `set`),
+    //   (b) single-def and dead after the producer (its register is free
+    //       to be recycled), and
+    //   (c) not severed from the producer by a call-like instruction —
+    //       the caller-saved XMM pool cannot carry a value across one, so
+    //       the per-segment veto would strip the operand's home and with
+    //       it the handoff.  This is exactly what separates the two CI
+    //       shapes: `return a*b+c` (no call, keep) from
+    //       `return _mm_add_epi32(f(p), w)` (operand defined before the
+    //       call, consumed after — drop, the result rides %xmm0).
+    // Same-block only: every shape this gate serves is straight-line, and
+    // a cross-block def is opaque here (fail toward dropping, the h3-safe
+    // side).
+    //
+    // One pass builds the def/use geometry; each candidate check is then
+    // a bounded scan of its producer block.
+    let mut def_at: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    let mut multi_def: FxHashSet<u32> = FxHashSet::default();
+    let mut use_blocks: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    let mut term_used: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(d) = inst.dest() {
+                if def_at.insert(d.0, (bi, ii)).is_some() {
+                    multi_def.insert(d.0);
+                }
+            }
+            if let Instruction::InlineAsm { outputs, .. } = inst {
+                for (_, v, _) in outputs {
+                    if def_at.insert(v.0, (bi, ii)).is_some() {
+                        multi_def.insert(v.0);
+                    }
+                }
+            }
+            let mut record = |v: u32| use_blocks.entry(v).or_default().push(bi);
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    record(v.0);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                record(v.0);
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                term_used.insert(v.0);
+            }
+        });
+    }
+    let keep_for_handoff = |v: u32| -> bool {
+        let Some(&(bi, pi)) = def_at.get(&v) else {
+            return false;
+        };
+        if multi_def.contains(&v) {
+            return false;
+        }
+        let block = &func.blocks[bi];
+        let mut operand_ids: Vec<u32> = Vec::new();
+        for_each_operand_in_instruction(&block.instructions[pi], |op| {
+            if let Operand::Value(o) = op {
+                operand_ids.push(o.0);
+            }
+        });
+        'cand: for o in operand_ids {
+            if o == v || !set.contains(&o) || multi_def.contains(&o) || term_used.contains(&o) {
+                continue;
+            }
+            // (a) same-block def above the producer.
+            let Some(&(obi, di)) = def_at.get(&o) else {
+                continue;
+            };
+            if obi != bi || di >= pi {
+                continue;
+            }
+            // (c) no call-like instruction between def and producer.
+            if block.instructions[di + 1..pi].iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::Call { .. }
+                        | Instruction::CallIndirect { .. }
+                        | Instruction::InlineAsm { .. }
+                )
+            }) {
+                continue;
+            }
+            // (b) dead after the producer: every instruction use sits in
+            // the producer's block (cross-block uses fail closed) …
+            if use_blocks
+                .get(&o)
+                .is_some_and(|bs| bs.iter().any(|&b| b != bi))
+            {
+                continue;
+            }
+            // … and nothing in this block reads it after the producer.
+            for later in &block.instructions[pi + 1..] {
+                let mut used = false;
+                for_each_operand_in_instruction(later, |op| {
+                    if matches!(op, Operand::Value(x) if x.0 == o) {
+                        used = true;
+                    }
+                });
+                for_each_value_use_in_instruction(later, |x| {
+                    if x.0 == o {
+                        used = true;
+                    }
+                });
+                if used {
+                    continue 'cand;
+                }
+            }
+            return true;
+        }
+        false
+    };
+    // A MULTI-DEF returned value is a phi web (`c ? a+b : a-b` merges each
+    // arm through a `Copy` into the same id): its home IS the cross-block
+    // transport — every arm materialises into the home register and the
+    // return reads it once.  Dropping it forces each arm into a slot store
+    // plus an exit reload (observed: 13 instructions against the 9-ceiling
+    // conditional shapes).  Only straight-line single-def results can ride
+    // the accumulator to the return, so only those are droppable.
+    let doomed: Vec<u32> = set
+        .iter()
+        .copied()
+        .filter(|v| {
+            !inst_used.contains(v)
+                && return_used.contains(v)
+                && !multi_def.contains(v)
+                && !keep_for_handoff(*v)
+        })
+        .collect();
+    for v in doomed {
+        set.remove(&v);
+    }
 }
 
 /// 128/256-bit vector SSA values for the AArch64 NEON pool (40..47 → v16..v23).
@@ -18103,10 +18374,12 @@ mod map_collector_tests {
     }
 
     #[test]
-    fn admits_register_valued_vector_return() {
-        // `return a + b;` as the SIMD lowering shapes it: the packed result
-        // is the Return operand (`emit_return_impl` resolves it through the
-        // register home), so the value keeps its home.
+    fn return_only_results_with_a_dying_operand_keep_their_home() {
+        // `return min(a, a);` — the result's ONLY consumer is the Return,
+        // but its operand is a homed candidate that DIES at the producer
+        // with no call in between: the destructive handoff produces the
+        // result in place (the RH-01 `vfmadd132ps …; ret` ceilings), so
+        // the home is kept.
         let f = func(
             vec![
                 intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
@@ -18120,7 +18393,75 @@ mod map_collector_tests {
         );
         let set = collect_x86_map_intermediate_values(&f);
         assert!(set.contains(&1), "load admitted: {set:?}");
-        assert!(set.contains(&2), "returned result keeps its home: {set:?}");
+        assert!(
+            set.contains(&2),
+            "a handoff-eligible return-only result keeps its home: {set:?}"
+        );
+    }
+
+    #[test]
+    fn call_severed_return_only_results_are_not_homed() {
+        // `return min(a, a)` where the operand's def is separated from the
+        // producer by a call: the caller-saved pool cannot carry the
+        // operand across it, no handoff is possible, and homing the
+        // return-only result would buy two dead `movdqa`s around the call
+        // (the h3 shape, measured as three extra instructions on
+        // `return _mm_add_epi32(f(p), w);`).  The result must stay
+        // unhomed and ride %xmm0/%ymm0 to the return.
+        let call = Instruction::Call {
+            func: "ext".to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: None,
+                args: Vec::new(),
+                arg_types: Vec::new(),
+                num_fixed_args: 0,
+                return_type: crate::common::types::IrType::Void,
+                ..Default::default()
+            },
+        };
+        let f = func(
+            vec![
+                intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
+                call,
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        );
+        let set = collect_x86_map_intermediate_values(&f);
+        assert!(
+            !set.contains(&2),
+            "a call-severed return-only result must not pay for a home: {set:?}"
+        );
+    }
+
+    #[test]
+    fn returned_results_with_instruction_uses_keep_their_homes() {
+        // The result feeds a legal store consumer AND the return: the
+        // instruction use is what the home pays for, and the return
+        // consuming a homed value stays legal (`emit_return_impl` resolves
+        // the operand through the register home with one move).
+        let f = func(
+            vec![
+                intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
+                store(O::VecStoreF32x8, 2, Some(101)),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        );
+        let set = collect_x86_map_intermediate_values(&f);
+        assert!(set.contains(&1), "load admitted: {set:?}");
+        assert!(
+            set.contains(&2),
+            "an instruction use plus the return keeps the home: {set:?}"
+        );
     }
 
     #[test]
@@ -19990,6 +20331,18 @@ mod sse_destructive_tests {
         }
     }
 
+    /// Whole-vector store of `val` — a real instruction consumer, so the
+    /// stored chain result keeps its home (a RETURN-ONLY result is
+    /// deliberately unhomed: see `drop_return_only_vector_results`).
+    fn sink(val: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op: O::VecStoreI32x4,
+            dest_ptr: Some(Value(90)),
+            args: vec![v(val), v(90), Operand::Const(IrConst::I64(0))],
+        }
+    }
+
     fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
         BasicBlock {
             label: BlockId(label),
@@ -20027,8 +20380,9 @@ mod sse_destructive_tests {
                 root(2),                        // @1
                 chain(3, O::VecXorI32x4, 1, 2), // @2
                 chain(4, O::VecAddI32x4, 3, 2), // @3
+                sink(4),                        // @4: keeps v4 homed
             ],
-            Terminator::Return(Some(v(4))),
+            Terminator::Return(None),
         )]);
         let pool = vec![PhysReg(21), PhysReg(22)];
         let home = run(&func, &pool);
@@ -20063,8 +20417,9 @@ mod sse_destructive_tests {
                 root(9), // @3
                 chain(3, O::VecXorI32x4, 9, 8), // @4
                 chain(5, O::VecAddI32x4, 2, 3), // @5
+                sink(5), // @6: keeps v5 homed
             ],
-            Terminator::Return(Some(v(5))),
+            Terminator::Return(None),
         )]);
         let pool = vec![PhysReg(21), PhysReg(22)];
         let home = run(&func, &pool);
@@ -20143,8 +20498,9 @@ mod sse_destructive_tests {
                     size: 16,
                 }, // @5: call point
                 chain(5, O::VecAddI32x4, 3, 1), // @6
+                sink(5),                        // @7: keeps v5 homed
             ],
-            Terminator::Return(Some(v(5))),
+            Terminator::Return(None),
         )]);
         let pool = vec![PhysReg(21), PhysReg(22)];
         let home = run(&func, &pool);

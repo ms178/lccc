@@ -137,7 +137,16 @@ MARKER='FIX''ME'
 #        (CCC_NO_AGG_MEMCPY_FWD) in src/passes/aggregate_copy_forward.rs,
 #        read next to the store-forwarding switch it mirrors.  Raised to the
 #        measurement, exactly.
-ENV_READ_BUDGET=148
+#   149  2026-11-13: int_const_hoist's decision trace (CCC_DEBUG_INTCONST,
+#        documented in docs/optimization-passes.md), one var_os probe per
+#        run() call.  The knob exists because the pass's failure mode is
+#        silent — its hoist was being re-folded by a later cleanup for
+#        months with every test green — and the trace is what pinpointed
+#        that; it needs to see each function's per-loop decisions, so a
+#        once-per-process LazyLock saves nothing structural (the probe is
+#        already once per function, not per block).  Raised to the
+#        measurement, exactly.
+ENV_READ_BUDGET=149
 
 fail=0
 report() { # report <label> <offending lines>

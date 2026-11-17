@@ -73,8 +73,9 @@ pub(crate) fn run_function(
     func: &mut IrFunction,
     symbol_facts: &ModuleSymbolFacts,
     capabilities: Capabilities,
+    target: crate::backend::Target,
 ) -> usize {
-    recognize_idioms(func, symbol_facts, capabilities)
+    recognize_idioms(func, symbol_facts, capabilities, target)
 }
 
 /// Maximum loops rewritten per function per fixpoint run. Each rewrite
@@ -420,6 +421,7 @@ pub(crate) fn recognize_idioms(
     func: &mut IrFunction,
     symbol_facts: &ModuleSymbolFacts,
     capabilities: Capabilities,
+    target: crate::backend::Target,
 ) -> usize {
     if !pass_enabled() {
         return 0;
@@ -496,6 +498,24 @@ pub(crate) fn recognize_idioms(
                     progressed = true;
                     break;
                 }
+            }
+            // Dual-bound buffer-fill widening — the streaming-update shape
+            // `while (s < se && H->p < buf_end) *H->p++ = *s++;` whose trip
+            // count is a min() of two bounds and whose destination pointer
+            // lives in memory: unrepresentable for the counted matcher
+            // above. The rewrite versions the loop (guards + 8-byte chunks,
+            // original loop kept as tail/fallback), so the header is
+            // registered exactly like a guarded copy rewrite.
+            if crate::passes::loop_idiom_fill::try_rewrite(func, lp, &cfg, target) {
+                dlog!(
+                    "{} loop@{}: MATCH dual-bound fill (versioned, widened to 8-byte chunks)",
+                    func.name,
+                    lp.header
+                );
+                versioned_headers.insert(header_label);
+                total += 1;
+                progressed = true;
+                break;
             }
             // Trailing-zero-count idiom (the portable `ffs` shape): the
             // shift-and-count loop is exactly `r0 + ctz(x0)` guarded
@@ -5441,6 +5461,7 @@ mod tests {
                 native_popcount: true,
                 i686_sse: false,
             },
+            crate::backend::Target::X86_64,
         )
     }
 
@@ -5605,7 +5626,12 @@ mod tests {
             ..ModuleSymbolFacts::default()
         };
         assert_eq!(
-            super::run_function(&mut f, &symbol_facts, Capabilities::default()),
+            super::run_function(
+                &mut f,
+                &symbol_facts,
+                Capabilities::default(),
+                crate::backend::Target::X86_64
+            ),
             1
         );
         assert!(has_call(&f, "memmove"));
@@ -5620,7 +5646,8 @@ mod tests {
             super::run_function(
                 &mut f,
                 &ModuleSymbolFacts::default(),
-                Capabilities::default()
+                Capabilities::default(),
+                crate::backend::Target::X86_64
             ),
             1
         );
@@ -6792,7 +6819,8 @@ mod tests {
             super::run_function(
                 &mut f,
                 &ModuleSymbolFacts::default(),
-                Capabilities::default()
+                Capabilities::default(),
+                crate::backend::Target::X86_64
             ),
             0
         );
@@ -6808,6 +6836,202 @@ mod tests {
         assert_eq!(run_function(&mut f), 0);
         assert!(!has_popcount(&f));
     }
+    /// Dual-bound fill widening (loop_idiom_fill): the Expat `sip24_update`
+    /// buffer-fill shape, exactly as the frontend + cleanup pipeline hands it
+    /// to the loop pass (verified against a CCC_DUMP_EACH_PASS trace):
+    ///
+    ///   P(0) -> H(1): s-phi, `s < se`        -> D(4) | E(3)
+    ///   D(4): cell load `d = h->p`, `d < de` -> B(2) | E(3)
+    ///   B(2): cell reload, cell bump store, `*d = *s`, `s+1` -> H
+    ///   E(3): return s
+    ///
+    /// Values: 4..=7 params h/s/se/de, 24 s-phi, 10/15 cmps, 13/18 cell
+    /// loads, 19/21 bumps, 22 byte.
+    mod dual_bound_fill {
+        use super::*;
+
+        fn fill_func() -> IrFunction {
+            let mut f =
+                IrFunction::new("fill_ring".into(), IrType::Ptr, vec![ptr_param(); 4], false);
+            f.next_value_id = 30;
+            f.next_label = 5;
+            f.blocks.push(block(
+                0, // P
+                vec![
+                    param_def(4, 0),
+                    param_def(5, 1),
+                    param_def(6, 2),
+                    param_def(7, 3),
+                ],
+                Terminator::Branch(BlockId(1)),
+            ));
+            f.blocks.push(block(
+                1, // H: s < se
+                vec![
+                    Instruction::Phi {
+                        dest: Value(24),
+                        ty: IrType::Ptr,
+                        incoming: vec![(val(5), BlockId(0)), (val(21), BlockId(2))],
+                    },
+                    Instruction::Cmp {
+                        dest: Value(10),
+                        op: IrCmpOp::Ult,
+                        lhs: val(24),
+                        rhs: val(6),
+                        ty: IrType::I64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: val(10),
+                    true_label: BlockId(4),
+                    false_label: BlockId(3),
+                },
+            ));
+            f.blocks.push(block(
+                4, // D: d = h->p; d < de
+                vec![
+                    load(13, 4, IrType::Ptr),
+                    Instruction::Cmp {
+                        dest: Value(15),
+                        op: IrCmpOp::Ult,
+                        lhs: val(13),
+                        rhs: val(7),
+                        ty: IrType::I64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: val(15),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ));
+            f.blocks.push(block(
+                2, // B: *h->p++ = *s++
+                vec![
+                    load(18, 4, IrType::Ptr),
+                    Instruction::BinOp {
+                        dest: Value(19),
+                        op: IrBinOp::Add,
+                        lhs: val(18),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::I64,
+                    },
+                    store(val(19), 4, IrType::Ptr),
+                    Instruction::BinOp {
+                        dest: Value(21),
+                        op: IrBinOp::Add,
+                        lhs: val(24),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::I64,
+                    },
+                    load(22, 24, IrType::U8),
+                    store(val(22), 18, IrType::U8),
+                ],
+                Terminator::Branch(BlockId(1)),
+            ));
+            f.blocks
+                .push(block(3, vec![], Terminator::Return(Some(val(24)))));
+            f
+        }
+
+        fn run_with_target(f: &mut IrFunction, target: crate::backend::Target) -> usize {
+            super::super::run_function(
+                f,
+                &ModuleSymbolFacts::default(),
+                Capabilities {
+                    native_popcount: true,
+                    i686_sse: false,
+                },
+                target,
+            )
+        }
+
+        fn has_u64_chunk_copy(f: &IrFunction) -> bool {
+            f.blocks.iter().any(|b| {
+                b.instructions.iter().any(|i| {
+                    matches!(
+                        i,
+                        Instruction::Load {
+                            ty: IrType::U64,
+                            ..
+                        }
+                    )
+                }) && b.instructions.iter().any(|i| {
+                    matches!(
+                        i,
+                        Instruction::Store {
+                            ty: IrType::U64,
+                            ..
+                        }
+                    )
+                })
+            })
+        }
+
+        #[test]
+        fn widens_to_u64_chunks_and_keeps_byte_loop() {
+            let mut f = fill_func();
+            let blocks_before = f.blocks.len();
+            assert_eq!(
+                run_with_target(&mut f, crate::backend::Target::X86_64),
+                1,
+                "Expat fill shape must version-widen"
+            );
+            assert!(has_u64_chunk_copy(&f), "wide loop must move U64 chunks");
+            for label in [1u32, 4, 2, 3] {
+                assert!(
+                    f.blocks.iter().any(|b| b.label == BlockId(label)),
+                    "original block {label} must survive as guarded fallback/tail"
+                );
+            }
+            assert!(
+                f.blocks.len() > blocks_before,
+                "versioning adds guard + wide blocks"
+            );
+        }
+
+        #[test]
+        fn narrow_store_targets_are_rejected() {
+            // riscv64 has no cheap unaligned 8-byte access; the widening
+            // must stay off and the function must be left untouched.
+            let mut f = fill_func();
+            let blocks_before = f.blocks.len();
+            assert_eq!(run_with_target(&mut f, crate::backend::Target::Riscv64), 0);
+            assert_eq!(f.blocks.len(), blocks_before);
+            assert!(!has_u64_chunk_copy(&f));
+        }
+
+        #[test]
+        fn volatile_cell_load_blocks_widening() {
+            let mut f = fill_func();
+            for b in &mut f.blocks {
+                for i in &mut b.instructions {
+                    if let Instruction::Load {
+                        ty: IrType::Ptr,
+                        volatile,
+                        ..
+                    } = i
+                    {
+                        *volatile = true;
+                    }
+                }
+            }
+            assert_eq!(run_with_target(&mut f, crate::backend::Target::X86_64), 0);
+            assert!(!has_u64_chunk_copy(&f));
+        }
+
+        #[test]
+        fn extra_store_in_body_blocks_widening() {
+            // A second unrelated byte store makes the chunk rewrite unsound
+            // (it would reorder against the fill stores).
+            let mut f = fill_func();
+            let body = f.blocks.iter_mut().find(|b| b.label == BlockId(2)).unwrap();
+            body.instructions.push(store(val(22), 7, IrType::U8));
+            assert_eq!(run_with_target(&mut f, crate::backend::Target::X86_64), 0);
+            assert!(!has_u64_chunk_copy(&f));
+        }
+    }
+
     mod hardening {
         include!("loop_idiom_hardening_tests.rs");
     }

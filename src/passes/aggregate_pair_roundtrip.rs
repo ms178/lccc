@@ -313,10 +313,22 @@ fn provably_disjoint(func: &IrFunction, src: Value, dst: Value, facts: &ModuleSy
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
-    run_with_symbol_facts(func, &ModuleSymbolFacts::default())
+    run_with_symbol_facts(func, &ModuleSymbolFacts::default(), true)
 }
 
-pub(crate) fn run_with_symbol_facts(func: &mut IrFunction, facts: &ModuleSymbolFacts) -> usize {
+/// `value_lane_extracts`: may this pass introduce VALUE-form
+/// `VecExtractLane*` intrinsics?  True on x86-64 (the emitters produce
+/// `movss`/`movsd`/`movd`/`movq`/`pextr*` from a register image); false on
+/// targets whose backends implement only the pointer form (i686's
+/// `reject_value_form` ICEs on a value-form extract) or that never route
+/// x86 SIMD shapes here at all.  Only the scalar-lane store-to-load
+/// forwarding is gated: every other rewrite in this pass removes or
+/// substitutes existing instructions without minting new op kinds.
+pub(crate) fn run_with_symbol_facts(
+    func: &mut IrFunction,
+    facts: &ModuleSymbolFacts,
+    value_lane_extracts: bool,
+) -> usize {
     let mut total = 0;
     // Each successful rewrite removes at least five instructions, so the loop
     // terminates; the bound is a belt-and-braces guard for a malformed IR.
@@ -346,14 +358,90 @@ pub(crate) fn run_with_symbol_facts(func: &mut IrFunction, facts: &ModuleSymbolF
     // to codegen as two stores plus the frame slot (measured: 12
     // instructions instead of 5 on `return f()`).
     for _ in 0..8 {
-        let round = forward_vector_roundtrips(func) + collapse_carrier_reloads(func);
+        let round = forward_vector_roundtrips(func)
+            + collapse_carrier_reloads(func)
+            + kill_overwritten_vec16_stores(func)
+            + if value_lane_extracts {
+                forward_scalar_lane_loads(func) + forward_param_lane_loads(func)
+            } else {
+                0
+            };
         if round == 0 {
             break;
         }
         collapsed += round;
         purge_unread_local_stores(func);
     }
+    // One unconditional purge: the rewrites above may have completed in an
+    // EARLIER invocation of this pass (the pipeline runs it more than once),
+    // leaving a dead zero-fill or staging store behind with zero productive
+    // rounds here — observed as a lone `pxor` + frame slot surviving on
+    // `__m128i v = _mm_setzero_si128(); v = f(p); return v;` once the
+    // carrier collapse started firing a pipeline iteration sooner.  The
+    // purge is idempotent and fully proof-gated, so running it when there
+    // is nothing to do costs one scan and changes nothing.
+    purge_unread_local_stores(func);
+    sink_second_return_sets(func);
     total + collapsed
+}
+
+/// Move every `SetReturn*Second` to immediately before its block's
+/// `Return`.
+///
+/// `SetReturn*Second` pins the second return register (`%xmm1` for the
+/// two-eightbyte `[Sse, Sse]` shapes) from its emission point to the
+/// `ret`, but the lane-extract and staging emitters treat `%xmm1` as free
+/// scratch — any instruction the rewrites above leave inside that window
+/// silently destroys the high half of the return value (caught by the
+/// SysV ABI differential on `struct { v2f; v2i }`: the lane-0 extract's
+/// `movdqu %xmm0, %xmm1` staging overwrote the just-placed high
+/// eightbyte).  The only observer of the pinned register is the `Return`
+/// itself, so sinking the set to the terminator is semantically free and
+/// collapses the hazard window to zero instructions.  Call-like
+/// instructions and `GetReturn*Second` never sit between a correct set
+/// and its return (they clobber/read the same registers), so crossing
+/// them is refused — fail closed, keep the original position.
+fn sink_second_return_sets(func: &mut IrFunction) {
+    for block in &mut func.blocks {
+        if !matches!(block.terminator, Terminator::Return(_)) {
+            continue;
+        }
+        let n = block.instructions.len();
+        let Some(si) = block.instructions.iter().position(|i| {
+            matches!(
+                i,
+                Instruction::SetReturnF64Second { .. }
+                    | Instruction::SetReturnF32Second { .. }
+                    | Instruction::SetReturnF128Second { .. }
+            )
+        }) else {
+            continue;
+        };
+        if si + 1 == n {
+            continue; // already adjacent to the terminator
+        }
+        let blocked = block.instructions[si + 1..].iter().any(|i| {
+            matches!(
+                i,
+                Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::InlineAsm { .. }
+                    | Instruction::GetReturnF64Second { .. }
+                    | Instruction::GetReturnF32Second { .. }
+                    | Instruction::GetReturnF128Second { .. }
+                    | Instruction::SetReturnF64Second { .. }
+                    | Instruction::SetReturnF32Second { .. }
+                    | Instruction::SetReturnF128Second { .. }
+            )
+        });
+        if blocked {
+            continue;
+        }
+        let span = block.span_at(si);
+        let set = block.remove_inst(si);
+        let end = block.instructions.len();
+        block.insert_inst(end, set, span);
+    }
 }
 
 /// Delete every store to a stack object that is provably never read and
@@ -640,6 +728,139 @@ fn is_vec16_store_op(op: crate::ir::intrinsics::IntrinsicOp) -> bool {
     )
 }
 
+/// 16-byte vector COMPUTE ops whose every `Operand::Value` argument is
+/// consumed as whole-register vector DATA (through `sse_load_arg` /
+/// `vec_arg_mem` and the AVX loaders, all of which read a value's 16-byte
+/// slot) — never as a pointer, lane index, shift count or other scalar.
+/// The allowlist is the safety proof for substituting an `[Sse, SseUp]`
+/// call carrier into an argument position: loads, gathers, broadcasts and
+/// every other op with a POINTER value argument stay out, as do the
+/// irregular multi-role ops (`VecMaskedAddValueI32x4`, `VecSadalpI32x4`,
+/// `VecSmlalLo/HiI32x4`), so an unproven consumer fails the gate instead
+/// of guessing.
+fn is_vec16_value_compute_op(op: crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    matches!(
+        op,
+        // Arithmetic (integer lanes).
+        I::VecAddI8x16 | I::VecAddI16x8 | I::VecAddI32x4 | I::VecAddI64x2
+            | I::VecAddSatI8x16
+            | I::VecSubI8x16 | I::VecSubI16x8 | I::VecSubI32x4 | I::VecSubI64x2
+            | I::VecMulI16x8 | I::VecMulI32x4 | I::VecMulI64x2 | I::VecMulHiU16x8
+            // Arithmetic (FP lanes).
+            | I::VecAddF32x4 | I::VecAddF64x2
+            | I::VecSubF32x4 | I::VecSubF64x2
+            | I::VecMulF32x4 | I::VecMulF64x2
+            | I::VecDivF32x4 | I::VecDivF64x2
+            | I::VecSqrtF32x4 | I::VecSqrtF64x2
+            | I::VecRoundF32x4 | I::VecRoundF64x2
+            | I::VecFmaF32x4 | I::VecFmaF64x2
+            | I::VecFmsF32x4 | I::VecFmsF64x2
+            | I::VecFnmaF32x4 | I::VecFnmaF64x2
+            | I::VecFnmsF32x4 | I::VecFnmsF64x2
+            // Bitwise.
+            | I::VecAndI8x16 | I::VecAndI16x8 | I::VecAndI32x4 | I::VecAndI64x2
+            | I::VecAndNotI32x4
+            | I::VecOrI8x16 | I::VecOrI16x8 | I::VecOrI32x4 | I::VecOrI64x2
+            | I::VecXorI8x16 | I::VecXorI16x8 | I::VecXorI32x4 | I::VecXorI64x2
+            | I::VecXorF32x4 | I::VecXorF64x2
+            // Min/max and compares.
+            | I::VecMinI8x16 | I::VecMinU8x16 | I::VecMinI16x8 | I::VecMinU32x4
+            | I::VecMaxI8x16 | I::VecMaxU8x16 | I::VecMaxI16x8 | I::VecMaxU32x4
+            | I::VecSminI32x4 | I::VecSmaxI32x4
+            | I::VecMinF32x4 | I::VecMinF64x2
+            | I::VecMaxF32x4 | I::VecMaxF64x2
+            | I::VecCmpI8x16 | I::VecCmpI16x8 | I::VecCmpI32x4 | I::VecCmpI64x2
+            | I::VecCmpF32x4 | I::VecCmpF64x2
+            | I::VecBlendvI8x16 | I::VecBlendvI16x8 | I::VecBlendvI32x4
+            | I::VecBlendvF32x4 | I::VecBlendvF64x2
+            // Shifts, rotates, shuffles (counts/immediates are consts).
+            | I::VecShlI16x8 | I::VecShlI32x4 | I::VecShlI64x2
+            | I::VecLShrI16x8 | I::VecLShrI32x4 | I::VecLShrI64x2
+            | I::VecAShrI16x8 | I::VecAShrI32x4
+            | I::VecShlvI32x4 | I::VecShlvI64x2
+            | I::VecLShrvI32x4 | I::VecLShrvI64x2
+            | I::VecAShrvI32x4
+            | I::VecRotlI32x4 | I::VecShufdI32x4 | I::VecShufbI32x4
+            | I::VecUnpackLoI8x16
+            // Reductions and lane extracts (consumed lanes → scalar dest).
+            | I::VecHorizontalAddI32x4 | I::VecHorizontalAddI64x2
+            | I::VecHorizontalAddF32x4 | I::VecHorizontalAddF64x2
+            | I::VecHorizontalMaxI32x4
+            | I::VecExtractLaneI16x8
+            | I::VecExtractLaneI32x4 | I::VecExtractLaneI64x2
+            | I::VecExtractLaneF32x4 | I::VecExtractLaneF64x2
+    )
+}
+
+/// May the uses of `v` (a whole-register 16-byte vector SSA value) be
+/// rewritten to read an `[Sse, SseUp]` I128 call carrier instead?  True
+/// only when EVERY use is one of the three proven consumer paths:
+///
+/// * a `Return` operand — the backend's vector128 return path reads the
+///   carrier's slot (or forwards `%xmm0` directly);
+/// * a vector-data argument of a compute op from the
+///   [`is_vec16_value_compute_op`] allowlist — those emitters read the
+///   16-byte slot that `emit_call_store_vector128` fills and marks wide;
+/// * the PAYLOAD (argument 0) of a whole-vector 16-byte store — the same
+///   slot-read discipline, with the pointer argument positions checked to
+///   NOT be `v`.
+///
+/// Anything else — a scalar `Store`/`Cast`/`BinOp`/`Copy`, a call
+/// argument, an intrinsic `dest_ptr`, a load's pointer operand, a
+/// non-return terminator — fails closed: those consumers route I128
+/// values through the GP-register splitter or reinterpret the value as an
+/// address, and the substitution must never feed them.
+fn carrier_substitution_uses_safe(func: &IrFunction, v: Value) -> bool {
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            let mut used_here = false;
+            inst.for_each_used_value(|u| {
+                if u == v.0 {
+                    used_here = true;
+                }
+            });
+            if !used_here {
+                continue;
+            }
+            let safe = match inst {
+                Instruction::Intrinsic {
+                    op, dest_ptr, args, ..
+                } => {
+                    if matches!(dest_ptr, Some(dp) if dp.0 == v.0) {
+                        false
+                    } else if is_vec16_value_compute_op(*op) {
+                        true
+                    } else if is_vec16_store_op(*op) {
+                        // Payload position only: args[1] is the pointer.
+                        matches!(args.first(), Some(Operand::Value(a0)) if a0.0 == v.0)
+                            && !args
+                                .iter()
+                                .skip(1)
+                                .any(|a| matches!(a, Operand::Value(av) if av.0 == v.0))
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if !safe {
+                return false;
+            }
+        }
+        let mut term_uses = false;
+        b.terminator.for_each_used_value(|u| {
+            if u == v.0 {
+                term_uses = true;
+            }
+        });
+        if term_uses && !matches!(&b.terminator, Terminator::Return(_)) {
+            return false;
+        }
+    }
+    true
+}
+
 /// The zero-fill intrinsics: a constant write of 16/32/64 zero bytes to
 /// `dest_ptr` that ALSO defines the zero vector as an SSA value.  For the
 /// write-only purge they are plain stores; the value destination is the
@@ -797,6 +1018,659 @@ fn find_vector_roundtrip(func: &IrFunction) -> Option<(Value, Value)> {
     None
 }
 
+/// Forward a SCALAR load out of a whole-vector 16-byte store as a lane
+/// extract: `VecStore<T>x<N> X -> [w+s]` followed by `Load <scalar> from
+/// [w+s+k*size]` becomes `VecExtractLane(X, k)` — the store-to-load round
+/// trip through the stack (4-7 cycle store-forward latency plus a frame
+/// slot) is replaced by a register-file lane read (lane 0: one `movss` /
+/// `movsd` / `movd` / `movq`; other lanes: shuffle + move).
+///
+/// Observed shape (`float f(const float *p) { __m128 v = mkf(p); return
+/// _mm_cvtss_f32(v); }`): the callee's result is stored to `v`'s home and
+/// lane 0 reloaded as an F32 — after this rewrite and the write-only purge
+/// the function is `call; ret` with no frame, exactly the oracle output.
+///
+/// Fail-closed discipline, same as the carrier collapse: single block,
+/// backward scan so the LATEST store wins, every intervening barrier
+/// declines, addresses proven with `offset_from`, single-definition values
+/// only, exact argument-shape matches, and the lane byte range must sit
+/// wholly inside the stored 16 bytes at a lane-aligned offset.  The lane
+/// EXTRACT op is chosen by the SCALAR type (bytes are bytes: an F64 read
+/// of two F32 lanes is a legal pun and extracts the same bits).
+fn forward_scalar_lane_loads(func: &mut IrFunction) -> usize {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    let mut total = 0;
+    loop {
+        let multi_def = super::gvn::find_multi_def_values(func);
+        let mut found: Option<(usize, usize, Value, Value, I, i64)> = None;
+        'outer: for (bi, block) in func.blocks.iter().enumerate() {
+            'load: for (li, inst) in block.instructions.iter().enumerate() {
+                let Instruction::Load {
+                    dest: d,
+                    ptr,
+                    ty,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                } = inst
+                else {
+                    continue;
+                };
+                let (size, extract_op) = match ty {
+                    IrType::F32 => (4i64, I::VecExtractLaneF32x4),
+                    IrType::F64 => (8, I::VecExtractLaneF64x2),
+                    IrType::I32 => (4, I::VecExtractLaneI32x4),
+                    IrType::I64 => (8, I::VecExtractLaneI64x2),
+                    _ => continue,
+                };
+                if multi_def.contains(&d.0) {
+                    continue;
+                }
+                for si in (0..li).rev() {
+                    let cand = &block.instructions[si];
+                    if let Instruction::Intrinsic {
+                        dest: None,
+                        op: store_op,
+                        dest_ptr: Some(_),
+                        args: sargs,
+                    } = cand
+                    {
+                        if is_vec16_store_op(*store_op) {
+                            let [Operand::Value(x), Operand::Value(p2), soff_arg] =
+                                sargs.as_slice()
+                            else {
+                                continue 'load;
+                            };
+                            let store_off = match soff_arg {
+                                Operand::Const(IrConst::I64(n)) => *n,
+                                Operand::Const(IrConst::I32(n)) => i64::from(*n),
+                                _ => continue 'load,
+                            };
+                            let Some(delta) = offset_from(func, *ptr, *p2) else {
+                                continue 'load; // may alias: fail closed
+                            };
+                            let pos = delta - store_off;
+                            if pos < 0
+                                || pos + size > 16
+                                || pos % size != 0
+                                || multi_def.contains(&x.0)
+                                || x.0 == d.0
+                            {
+                                continue 'load;
+                            }
+                            // The payload must be a whole-register 16-byte
+                            // producer — a vector intrinsic result or an
+                            // [Sse, SseUp] call carrier.  Anything else
+                            // (and any unknown producer) fails closed: the
+                            // extract emitters read 16 bytes of `x`'s
+                            // home, which only those producers guarantee.
+                            let wide_producer = match unique_def(func, *x) {
+                                Some(Instruction::Intrinsic { dest: Some(_), .. }) => true,
+                                Some(
+                                    Instruction::Call { info, .. }
+                                    | Instruction::CallIndirect { info, .. },
+                                ) => info.ret_is_vector128,
+                                _ => false,
+                            };
+                            if !wide_producer {
+                                continue 'load;
+                            }
+                            found = Some((bi, li, *d, *x, extract_op, pos / size));
+                            break 'outer;
+                        }
+                    }
+                    if memory_motion_barrier(cand) {
+                        continue 'load;
+                    }
+                }
+            }
+        }
+        let Some((bi, li, d, x, op, lane)) = found else {
+            break;
+        };
+        func.blocks[bi].instructions[li] = Instruction::Intrinsic {
+            dest: Some(d),
+            op,
+            dest_ptr: None,
+            args: vec![Operand::Value(x), Operand::Const(IrConst::I32(lane as i32))],
+        };
+        total += 1;
+    }
+    total
+}
+
+/// Destination of a full-width 16-byte store, as `(pointer id, offset)`:
+/// the `VecStore*` family (`args`: value, pointer, offset) and the
+/// slot-to-slot `Storedqu` copy (writes 16 bytes at its `dest_ptr`).
+fn vec16_store_dest(inst: &Instruction) -> Option<(u32, i64)> {
+    let Instruction::Intrinsic {
+        dest: None,
+        op,
+        dest_ptr: Some(dp),
+        args,
+    } = inst
+    else {
+        return None;
+    };
+    if is_vec16_store_op(*op) {
+        let Some(Operand::Value(p)) = args.get(1) else {
+            return None;
+        };
+        // The emitters keep `dest_ptr` and the pointer argument in sync;
+        // treat any divergence as an unknown store (fail closed).
+        if dp.0 != p.0 {
+            return None;
+        }
+        let off = match args.get(2) {
+            Some(Operand::Const(c)) => c.to_i64()?,
+            None => 0,
+            _ => return None,
+        };
+        Some((p.0, off))
+    } else if matches!(op, crate::ir::intrinsics::IntrinsicOp::Storedqu) {
+        Some((dp.0, 0))
+    } else {
+        None
+    }
+}
+
+/// An alloca whose ADDRESS provably never escapes: every mention across
+/// the function sits in a pointer slot of the 16-byte vector move family
+/// (`VecStore*` pointer/`dest_ptr`, `Storedqu`/`Loaddqu` source, pure
+/// `VecLoad*` base).  Such a slot cannot alias any pointer not derived
+/// from it — and derivation (GEP, cast, call, scalar store of the
+/// address) is exactly what disqualifies.
+fn non_escaping_vec_slot(func: &IrFunction, a: u32) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    let mut is_alloca = false;
+    for inst in func.blocks.first().map_or(&[][..], |b| &b.instructions) {
+        if let Instruction::Alloca {
+            dest,
+            volatile: false,
+            semantic_volatile: false,
+            ..
+        } = inst
+        {
+            if dest.0 == a {
+                is_alloca = true;
+                break;
+            }
+        }
+    }
+    if !is_alloca {
+        return false;
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let mut mentioned = false;
+            inst.for_each_used_value(|v| {
+                if v == a {
+                    mentioned = true;
+                }
+            });
+            if !mentioned {
+                continue;
+            }
+            // Position-exact: the id must sit ONLY in pointer slots.  An
+            // appearance in a value or offset position (storing or
+            // computing with the address itself) is an escape.
+            let ok = match inst {
+                Instruction::Intrinsic {
+                    op, dest_ptr, args, ..
+                } => {
+                    if is_vec16_store_op(*op) {
+                        // args: [value, pointer, offset] — pointer only.
+                        !matches!(args.first(), Some(Operand::Value(v)) if v.0 == a)
+                            && !args
+                                .iter()
+                                .skip(2)
+                                .any(|arg| matches!(arg, Operand::Value(v) if v.0 == a))
+                    } else if matches!(op, I::Storedqu | I::Loaddqu) {
+                        // Single pointer argument (plus `dest_ptr`): every
+                        // mention is a pointer role.
+                        true
+                    } else {
+                        crate::backend::stack_layout::copy_coalescing::is_pure_vec_load(op)
+                            && matches!(args.first(), Some(Operand::Value(v)) if v.0 == a)
+                            && !args
+                                .iter()
+                                .skip(1)
+                                .any(|arg| matches!(arg, Operand::Value(v) if v.0 == a))
+                            && dest_ptr.is_none()
+                    }
+                }
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        let mut term_use = false;
+        block.terminator.for_each_used_value(|v| {
+            if v == a {
+                term_use = true;
+            }
+        });
+        if term_use {
+            return false;
+        }
+    }
+    true
+}
+
+/// May `inst` sit between a 16-byte store to `[p, p+16)` and the
+/// same-address store that overwrites it, without observing the dead
+/// bytes?  Writes never block — the killer overwrites the full region
+/// either way — so only potential READS (and ordering primitives) do.
+///
+/// Two disjointness proofs apply, either sufficing:
+/// * `p_clean` — the DEAD destination is a non-escaping staging slot: no
+///   pointer not derived from `p` can reach it (and derivation is exactly
+///   what `non_escaping_vec_slot` excludes), so every instruction that
+///   does not mention `p` is transparent, calls included — the standard
+///   DSE argument for address-not-taken locals.  Inline asm stays a
+///   blocker (it could scan the frame), as does any mention of `p`.
+/// * the READER is clean — a pure vector load (or `Loaddqu`) whose base
+///   is a non-escaping slot distinct from `p` reads provably disjoint
+///   bytes regardless of what `p` is.
+///
+/// Everything unproven fails closed.
+///
+/// `memo` caches `non_escaping_vec_slot` per id so each proof runs once
+/// per `kill_overwritten_vec16_stores` invocation (the scan is otherwise
+/// quadratic in pathological all-SIMD blocks).
+fn cached_clean(
+    func: &IrFunction,
+    memo: &mut crate::common::fx_hash::FxHashMap<u32, bool>,
+    id: u32,
+) -> bool {
+    *memo
+        .entry(id)
+        .or_insert_with(|| non_escaping_vec_slot(func, id))
+}
+
+fn vec16_dse_transparent(
+    func: &IrFunction,
+    inst: &Instruction,
+    p: u32,
+    p_clean: bool,
+    memo: &mut crate::common::fx_hash::FxHashMap<u32, bool>,
+) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    if p_clean {
+        if matches!(inst, Instruction::InlineAsm { .. }) {
+            return false;
+        }
+        let mut mentions_p = false;
+        inst.for_each_used_value(|v| {
+            if v == p {
+                mentions_p = true;
+            }
+        });
+        return !mentions_p;
+    }
+    match inst {
+        Instruction::Alloca { .. }
+        | Instruction::BinOp { .. }
+        | Instruction::UnaryOp { .. }
+        | Instruction::Cmp { .. }
+        | Instruction::GetElementPtr { .. }
+        | Instruction::Cast { .. }
+        | Instruction::Copy { .. }
+        | Instruction::GlobalAddr { .. }
+        | Instruction::LabelAddr { .. }
+        | Instruction::ParamRef { .. }
+        | Instruction::Phi { .. }
+        | Instruction::Select { .. }
+        // Scalar `Store` is write-only (val, ptr).
+        | Instruction::Store { .. } => true,
+        Instruction::Intrinsic {
+            op,
+            args,
+            dest_ptr: None,
+            ..
+        } if crate::backend::stack_layout::copy_coalescing::is_pure_vec_load(op)
+            || matches!(op, I::Loaddqu) =>
+        {
+            matches!(
+                args.first(),
+                Some(Operand::Value(b)) if b.0 != p && cached_clean(func, memo, b.0)
+            )
+        }
+        Instruction::Intrinsic { op, .. } => {
+            !op.may_read_memory() && !matches!(op, I::Lfence | I::Mfence | I::Sfence)
+        }
+        _ => false,
+    }
+}
+
+/// Backlog item (b): a full-width 16-byte vector store overwritten by a
+/// later full-width store to the SAME pointer and offset in the same
+/// block, with only read-free instructions in between, is dead — the
+/// classic `_mm_storeu_si128(p, a); ...; _mm_storeu_si128(p, b)` shape,
+/// where GCC drops both the first store and its computation.  Deleting
+/// the store here lets ordinary DCE retire the computation.
+///
+/// A `Storedqu` KILLER also reads 16 bytes from its source slot; it only
+/// proves the earlier store dead when that read is provably disjoint —
+/// the source is a non-escaping staging alloca distinct from the dest.
+fn kill_overwritten_vec16_stores(func: &mut IrFunction) -> usize {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    let multi_def = super::gvn::find_multi_def_values(func);
+    let mut clean_memo: crate::common::fx_hash::FxHashMap<u32, bool> =
+        crate::common::fx_hash::FxHashMap::default();
+    let mut total = 0;
+    for bi in 0..func.blocks.len() {
+        let mut dead: Vec<usize> = Vec::new();
+        {
+            let insts = &func.blocks[bi].instructions;
+            for (i, s1) in insts.iter().enumerate() {
+                let Some((p, off)) = vec16_store_dest(s1) else {
+                    continue;
+                };
+                // A multi-defined pointer id may name different objects at
+                // the two stores: fail closed.
+                if multi_def.contains(&p) {
+                    continue;
+                }
+                let p_clean = cached_clean(func, &mut clean_memo, p);
+                for cand in insts.iter().skip(i + 1) {
+                    if let Some((p2, off2)) = vec16_store_dest(cand) {
+                        if p2 == p && off2 == off {
+                            // The killer overwrites every dead byte; a
+                            // `Storedqu` killer additionally READS 16
+                            // bytes from its source slot, which must be
+                            // provably disjoint from the dead region
+                            // (either proof suffices — see
+                            // `vec16_dse_transparent`).
+                            let kills = match cand {
+                                Instruction::Intrinsic {
+                                    op: I::Storedqu,
+                                    args,
+                                    ..
+                                } => match args.first() {
+                                    Some(Operand::Value(src)) => {
+                                        src.0 != p
+                                            && (p_clean
+                                                || cached_clean(func, &mut clean_memo, src.0))
+                                    }
+                                    _ => false,
+                                },
+                                // The VecStore* family reads no memory.
+                                _ => true,
+                            };
+                            if kills {
+                                dead.push(i);
+                            }
+                            break;
+                        }
+                        // A full-width store elsewhere: a plain write never
+                        // blocks, but a `Storedqu` also READS its source.
+                        if let Instruction::Intrinsic {
+                            op: I::Storedqu,
+                            args,
+                            ..
+                        } = cand
+                        {
+                            let disjoint = match args.first() {
+                                Some(Operand::Value(src)) => {
+                                    src.0 != p
+                                        && (p_clean || cached_clean(func, &mut clean_memo, src.0))
+                                }
+                                _ => false,
+                            };
+                            if !disjoint {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if !vec16_dse_transparent(func, cand, p, p_clean, &mut clean_memo) {
+                        break;
+                    }
+                }
+            }
+        }
+        for i in dead.into_iter().rev() {
+            func.blocks[bi].remove_inst(i);
+            total += 1;
+        }
+    }
+    total
+}
+
+/// `((long long *)&a)[1]`-class lane reads of a 16-byte vector-register
+/// parameter.
+///
+/// The parameter's alloca has no IR writes — the prologue fills it from the
+/// incoming XMM register — and every use is a lane-aligned scalar load,
+/// directly or through a constant-offset GEP used only by such loads.
+/// Rewriting each load to `VecExtractLane*` of one fresh entry-prefix
+/// full-width `VecLoad` leaves the alloca with exactly one mention:
+/// `x86_vector_param_loads` then routes the incoming register straight to
+/// the load's XMM home, the prologue spill dies, and each read becomes a
+/// register lane extract (`pshufd`+`movq` / `pextrq`) instead of a
+/// 16-byte stack round trip.
+fn forward_param_lane_loads(func: &mut IrFunction) -> usize {
+    use crate::ir::intrinsics::IntrinsicOp as I;
+    if func.param_alloca_values.is_empty()
+        || func.blocks.is_empty()
+        || func.calling_convention != crate::common::types::CallingConvention::Default
+    {
+        return 0;
+    }
+    // Only parameters the SysV classifier placed in ONE XMM register take
+    // the prologue preload path; an XMM-budget overflow (9th vector
+    // argument) arrives on the stack, where the rewrite would trade a
+    // scalar reload for a full `movdqu` + extract.  Count the budget the
+    // way `classify_params` does: scalar F32/F64 and single-register
+    // vectors consume one XMM argument register each.
+    let mut float_idx = 0usize;
+    let mut sse_param: Vec<bool> = Vec::with_capacity(func.params.len());
+    for p in &func.params {
+        let one_vec_reg = p.struct_size == Some(16)
+            && crate::common::sysv_classify::vector_reg_bytes_of(&p.struct_eightbyte_classes)
+                == Some(16);
+        sse_param.push(one_vec_reg && float_idx < 8);
+        if one_vec_reg
+            || p.is_f128_sse
+            || (p.struct_size.is_none() && matches!(p.ty, IrType::F32 | IrType::F64))
+        {
+            float_idx += 1;
+        }
+    }
+    if !sse_param.contains(&true) {
+        return 0;
+    }
+    let candidates: crate::common::fx_hash::FxHashSet<u32> = func
+        .param_alloca_values
+        .iter()
+        .enumerate()
+        .take(func.params.len())
+        .filter(|(i, _)| sse_param[*i])
+        .map(|(_, v)| v.0)
+        .collect();
+    // The candidate must be a plain non-volatile 16-byte entry alloca.
+    let mut allocas: crate::common::fx_hash::FxHashSet<u32> =
+        crate::common::fx_hash::FxHashSet::default();
+    for inst in &func.blocks[0].instructions {
+        if let Instruction::Alloca {
+            dest,
+            size: 16,
+            volatile: false,
+            semantic_volatile: false,
+            ..
+        } = inst
+        {
+            if candidates.contains(&dest.0) {
+                allocas.insert(dest.0);
+            }
+        }
+    }
+    let multi_def = super::gvn::find_multi_def_values(func);
+    let lane_of = |ty: &IrType, off: i64| -> Option<(I, i64)> {
+        let (size, op) = match ty {
+            IrType::F32 => (4i64, I::VecExtractLaneF32x4),
+            IrType::F64 => (8, I::VecExtractLaneF64x2),
+            IrType::I32 => (4, I::VecExtractLaneI32x4),
+            IrType::I64 => (8, I::VecExtractLaneI64x2),
+            _ => return None,
+        };
+        if off >= 0 && off % size == 0 && off + size <= 16 {
+            Some((op, off / size))
+        } else {
+            None
+        }
+    };
+    let mut total = 0usize;
+    'alloca: for a in allocas {
+        if multi_def.contains(&a) {
+            continue;
+        }
+        // Classify every mention of the alloca and of its constant-offset
+        // GEPs.  Anything that is not a lane-aligned scalar load (or a GEP
+        // feeding only such loads) disqualifies the whole web: an escape,
+        // a store, a volatile access or a terminator use all mean the slot
+        // bytes — or their address — are observable.
+        let mut geps: crate::common::fx_hash::FxHashMap<u32, i64> =
+            crate::common::fx_hash::FxHashMap::default();
+        let mut gep_pos: Vec<(usize, usize)> = Vec::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } = inst
+                {
+                    if base.0 == a && !multi_def.contains(&dest.0) {
+                        if let Some(off) = c.to_i64() {
+                            geps.insert(dest.0, off);
+                        }
+                    }
+                }
+            }
+        }
+        // (dest block, dest index, load dest, extract op, lane)
+        let mut rewrites: Vec<(usize, usize, Value, I, i64)> = Vec::new();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (li, inst) in block.instructions.iter().enumerate() {
+                match inst {
+                    Instruction::Alloca { .. } => continue,
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } if base.0 == a => {
+                        // Admitted above only in the const-offset single-def
+                        // form; anything else disqualifies.
+                        if !geps.contains_key(&dest.0) || !matches!(offset, Operand::Const(_)) {
+                            continue 'alloca;
+                        }
+                        gep_pos.push((bi, li));
+                        continue;
+                    }
+                    Instruction::Load {
+                        dest,
+                        ptr,
+                        ty,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    } => {
+                        let off = if ptr.0 == a {
+                            Some(0i64)
+                        } else {
+                            geps.get(&ptr.0).copied()
+                        };
+                        if let Some(off) = off {
+                            let Some((op, lane)) = lane_of(ty, off) else {
+                                continue 'alloca;
+                            };
+                            if multi_def.contains(&dest.0) {
+                                continue 'alloca;
+                            }
+                            rewrites.push((bi, li, *dest, op, lane));
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+                // Any other mention of the alloca or of one of its GEPs —
+                // including a GEP result flowing anywhere but a lane load —
+                // fails the web closed.
+                let mut dirty = false;
+                inst.for_each_used_value(|v| {
+                    if v == a || geps.contains_key(&v) {
+                        dirty = true;
+                    }
+                });
+                if dirty {
+                    continue 'alloca;
+                }
+            }
+            let mut dirty = false;
+            block.terminator.for_each_used_value(|v| {
+                if v == a || geps.contains_key(&v) {
+                    dirty = true;
+                }
+            });
+            if dirty {
+                continue 'alloca;
+            }
+        }
+        if rewrites.is_empty() {
+            continue;
+        }
+        let fresh = Value(func.sound_next_value_id());
+        func.next_value_id = fresh.0 + 1;
+        for (bi, li, d, op, lane) in &rewrites {
+            func.blocks[*bi].instructions[*li] = Instruction::Intrinsic {
+                dest: Some(*d),
+                op: *op,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(fresh),
+                    Operand::Const(IrConst::I32(*lane as i32)),
+                ],
+            };
+        }
+        gep_pos.sort_unstable();
+        for (bi, li) in gep_pos.into_iter().rev() {
+            func.blocks[bi].remove_inst(li);
+        }
+        // The VecLoad must sit inside the entry prefix (allocas, ParamRefs
+        // and other whole-vector parameter loads) for
+        // `x86_vector_param_loads` to see it.
+        let at = func.blocks[0]
+            .instructions
+            .iter()
+            .position(|i| match i {
+                Instruction::Alloca { .. } | Instruction::ParamRef { .. } => false,
+                Instruction::Intrinsic {
+                    dest: Some(_),
+                    op,
+                    dest_ptr: None,
+                    args,
+                } => {
+                    !(crate::backend::stack_layout::copy_coalescing::is_pure_vec_load(op)
+                        && args.len() == 2)
+                }
+                _ => true,
+            })
+            .unwrap_or(func.blocks[0].instructions.len());
+        func.blocks[0].insert_inst(
+            at,
+            Instruction::Intrinsic {
+                dest: Some(fresh),
+                op: I::VecLoadI32x4,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(a)), Operand::Const(IrConst::I64(0))],
+            },
+            crate::common::source::Span::dummy(),
+        );
+        total += rewrites.len();
+    }
+    total
+}
+
 fn collapse_carrier_reloads(func: &mut IrFunction) -> usize {
     let mut total = 0;
     loop {
@@ -909,35 +1783,17 @@ fn find_carrier_reload(func: &IrFunction) -> Option<(Value, Value)> {
             if !carrier_in_xmm {
                 continue;
             }
-            // Every use of the reload must be a RETURN operand: the
-            // backend's vector128 return path consumes an I128 carrier
-            // directly (proven by `return f()` probes), but its vector
-            // INTRINSIC operand path does not — substituting the carrier
-            // into a `VecAddI32x4` argument materialized an unrelated
-            // register (observed live: `movdqa %xmm15, %xmm0` reading an
-            // uninitialized %xmm15).  Until the backend homes [Sse, SseUp]
-            // call results for arbitrary vector consumers, any
-            // non-terminator use fails closed.
-            let mut non_return_use = false;
-            for b in &func.blocks {
-                for i2 in &b.instructions {
-                    i2.for_each_used_value(|u| {
-                        if u == v.0 {
-                            non_return_use = true;
-                        }
-                    });
-                }
-                let mut term_uses = false;
-                b.terminator.for_each_used_value(|u| {
-                    if u == v.0 {
-                        term_uses = true;
-                    }
-                });
-                if term_uses && !matches!(&b.terminator, Terminator::Return(_)) {
-                    non_return_use = true;
-                }
-            }
-            if non_return_use {
+            // Every use of the reload must be a proven carrier-consumer
+            // path (return operand, allowlisted vector-compute argument,
+            // whole-vector store payload); the full safety argument lives
+            // on `carrier_substitution_uses_safe`.  The historic hazard —
+            // a register-homed carrier whose home no instruction ever
+            // wrote (`movdqa %xmm15, %xmm0` reading an uninitialized
+            // %xmm15) — is closed at both ends: the SSE chain collector no
+            // longer admits non-committing producers as operand homes, and
+            // `emit_call_store_vector128` initialises an assigned home
+            // regardless.
+            if !carrier_substitution_uses_safe(func, *v) {
                 continue;
             }
 
@@ -1687,7 +2543,7 @@ mod tests {
         };
         let mut f = func_with(global_roundtrip("source", "destination"));
         assert_eq!(
-            run_with_symbol_facts(&mut f, &facts),
+            run_with_symbol_facts(&mut f, &facts, true),
             1,
             "unredirected strong private globals retain the copy optimization"
         );
@@ -1710,7 +2566,7 @@ mod tests {
         };
         let mut f = func_with(global_roundtrip("source", "alias_source"));
         assert_eq!(
-            run_with_symbol_facts(&mut f, &facts),
+            run_with_symbol_facts(&mut f, &facts, true),
             0,
             "a GNU alias can make distinct GlobalAddr names overlap"
         );
@@ -2192,7 +3048,9 @@ mod tests {
         // Two whole-vector stores to the same slot: the reload observes the
         // SECOND one's bytes, so the backward scan must forward %15, not %5.
         let mut f = vector_roundtrip(&mut vec![broadcast_f32(15, 2), vecstore_f32(15, 6, 0)]);
-        assert_eq!(run(&mut f), 1);
+        // >= 1: the forward plus (since kill_overwritten_vec16_stores) the
+        // now-dead FIRST store to the slot.
+        assert!(run(&mut f) >= 1);
         assert!(
             matches!(
                 f.blocks[0].terminator,
@@ -2396,13 +3254,684 @@ mod tests {
         );
     }
 
+    fn scalar_load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
     #[test]
-    fn a_carrier_reload_with_a_non_return_use_declines() {
-        // The reload feeds a vector intrinsic, not a Return.  The backend's
-        // vector128 return path consumes an I128 carrier directly, but its
-        // intrinsic operand path does not (observed live: `movdqa %xmm15,
-        // %xmm0` reading an uninitialized register), so the collapse must
-        // fail closed on any non-terminator use.
+    fn a_scalar_lane_0_load_forwards_as_an_extract() {
+        // `VecStore X -> [w]` then `Load F32 [w]`: lane 0 of X, extracted
+        // directly — the `_mm_cvtss_f32(f(p))` shape that previously paid a
+        // 16-byte store plus a 4-byte reload through the stack.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            vecload(4, 2, 0), // 16-byte producer for the payload
+            vecstore_i64(4, 30, 0),
+            scalar_load(6, 30, IrType::F32),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(6))));
+        assert!(run(&mut f) >= 1, "the lane forward must fire");
+        let extract = f.blocks[0].instructions.iter().find_map(|i| match i {
+            Instruction::Intrinsic {
+                dest: Some(d),
+                op: crate::ir::intrinsics::IntrinsicOp::VecExtractLaneF32x4,
+                args,
+                ..
+            } => Some((d, args)),
+            _ => None,
+        });
+        let Some((d, args)) = extract else {
+            panic!("expected a lane extract: {:?}", f.blocks[0].instructions);
+        };
+        assert_eq!(d.0, 6, "the extract takes the load's SSA id");
+        assert!(
+            matches!(
+                args.as_slice(),
+                [Operand::Value(Value(4)), Operand::Const(IrConst::I32(0))]
+            ),
+            "lane 0 of the stored payload: {args:?}"
+        );
+        assert!(
+            !f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "the scalar load must be gone"
+        );
+    }
+
+    #[test]
+    fn a_high_half_i64_load_forwards_as_lane_1() {
+        // `Load I64 [w+8]` out of a 16-byte store at [w]: lane 1 — the
+        // `((long long *)&v)[1]` shape (movhlps/pextrq instead of a stack
+        // round trip).
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            vecload(4, 2, 0),
+            vecstore_i64(4, 30, 0),
+            gep(31, 30, 8),
+            scalar_load(6, 31, IrType::I64),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(6))));
+        assert!(run(&mut f) >= 1, "the lane forward must fire");
+        assert!(
+            f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::VecExtractLaneI64x2,
+                    args,
+                    ..
+                } if matches!(
+                    args.as_slice(),
+                    [Operand::Value(Value(4)), Operand::Const(IrConst::I32(1))]
+                )
+            )),
+            "lane 1 extract expected: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn a_lane_load_with_an_intervening_call_declines() {
+        // A call between the store and the load can rewrite the slot:
+        // memory-motion barrier, fail closed.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            vecload(4, 2, 0),
+            vecstore_i64(4, 30, 0),
+            vec128_call(40, 2),
+            scalar_load(6, 30, IrType::F32),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(6))));
+        run(&mut f);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "the load must survive a barrier: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn a_misaligned_lane_load_declines() {
+        // `Load F64 [w+4]` straddles lanes: not lane-aligned, fail closed.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            vecload(4, 2, 0),
+            vecstore_i64(4, 30, 0),
+            gep(31, 30, 4),
+            scalar_load(6, 31, IrType::F64),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(6))));
+        run(&mut f);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "a straddling load must survive: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    fn storedqu(src: u32, dst: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op: crate::ir::intrinsics::IntrinsicOp::Storedqu,
+            dest_ptr: Some(Value(dst)),
+            args: vec![Operand::Value(Value(src))],
+        }
+    }
+
+    // ---- kill_overwritten_vec16_stores -----------------------------------
+
+    #[test]
+    fn an_overwritten_vec_store_dies() {
+        // Two full-width stores to the same pointer+offset, pure compute
+        // between: the first is dead (`_mm_storeu(p, a); _mm_storeu(p, b)`).
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(40, 16),
+            vecload(4, 40, 0),
+            vecload(5, 40, 0),
+            vecstore_i64(4, 2, 0),
+            vecstore_i64(5, 2, 0),
+        ];
+        let mut f = func_with(insts);
+        assert!(run(&mut f) >= 1, "the dead store must be counted");
+        let stores = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| vec16_store_dest(i).is_some())
+            .count();
+        assert_eq!(stores, 1, "only the killer survives");
+        assert!(
+            f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::VecStoreI64x2,
+                    args,
+                    ..
+                } if matches!(args.first(), Some(Operand::Value(v)) if v.0 == 5)
+            )),
+            "the SECOND store survives: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn a_read_between_vec_stores_blocks_the_kill() {
+        // A scalar load of the stored bytes observes the first store.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(40, 16),
+            vecload(4, 40, 0),
+            vecload(5, 40, 0),
+            vecstore_i64(4, 2, 0),
+            // I16 is outside the lane-forwarder's type map, so the read
+            // stays a real load and must block the kill.
+            scalar_load(7, 2, IrType::I16),
+            vecstore_i64(5, 2, 0),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(7))));
+        run(&mut f);
+        let stores = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| vec16_store_dest(i).is_some())
+            .count();
+        assert_eq!(stores, 2, "both stores survive a read between them");
+    }
+
+    #[test]
+    fn a_call_between_vec_stores_blocks_the_kill() {
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            vecload(4, 2, 0),
+            vecstore_i64(4, 2, 0), // store through the PARAM pointer
+            vec128_call(40, 2),    // callee may read [param]
+            vecload(5, 2, 0),
+            vecstore_i64(5, 2, 0),
+        ];
+        let mut f = func_with(insts);
+        run(&mut f);
+        let stores = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| vec16_store_dest(i).is_some())
+            .count();
+        assert_eq!(stores, 2, "a call is an opaque reader");
+    }
+
+    #[test]
+    fn different_offsets_do_not_kill() {
+        // [w+0] and [w+16] are disjoint: neither store is dead.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(40, 16),
+            vecload(4, 40, 0),
+            vecload(5, 40, 0),
+            vecstore_i64(4, 2, 0),
+            vecstore_i64(5, 2, 16),
+        ];
+        let mut f = func_with(insts);
+        run(&mut f);
+        let stores = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| vec16_store_dest(i).is_some())
+            .count();
+        assert_eq!(stores, 2, "disjoint offsets both survive");
+    }
+
+    #[test]
+    fn a_storedqu_killer_with_a_clean_staging_slot_kills() {
+        // The ds1 shape: `Storedqu [p] <- (w1); VecStore [w2]; Storedqu
+        // [p] <- (w2)`.  The killer reads w2 — a non-escaping staging
+        // alloca distinct from p — so the first copy to [p] is dead.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            alloca(31, 16),
+            alloca(40, 16),
+            vecload(4, 40, 0),
+            vecstore_i64(4, 30, 0),
+            storedqu(30, 2),
+            vecload(5, 40, 0),
+            vecstore_i64(5, 31, 0),
+            storedqu(31, 2),
+        ];
+        let mut f = func_with(insts);
+        assert!(run(&mut f) >= 1, "the first slot-to-dest copy is dead");
+        let dqus = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::Storedqu,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(dqus, 1, "only the final copy survives");
+    }
+
+    #[test]
+    fn a_storedqu_killer_reading_an_escaping_slot_declines() {
+        // The killer's source slot address escapes through a call: its
+        // 16-byte read might alias the dead region — fail closed.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            alloca(31, 16),
+            alloca(41, 16),
+            vecload(4, 41, 0),
+            vecstore_i64(4, 30, 0),
+            storedqu(30, 2),
+            vec128_call(40, 31), // 31 escapes (and is an opaque reader too)
+            vecload(5, 41, 0),
+            vecstore_i64(5, 31, 0),
+            storedqu(31, 2),
+        ];
+        let mut f = func_with(insts);
+        run(&mut f);
+        let dqus = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::Storedqu,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(dqus, 2, "an escaping source blocks the kill");
+    }
+
+    /// A function with one 16-byte `[Sse, SseUp]` vector parameter whose
+    /// alloca is `Value(0)` — the `((long long *)&a)[1]` test bed.
+    fn vec_param_func(insts: Vec<Instruction>) -> IrFunction {
+        use crate::common::types::EightbyteClass as E;
+        let mut f = func_with(insts);
+        f.params = vec![crate::ir::reexports::IrParam {
+            ty: IrType::I128,
+            noalias: false,
+            struct_size: Some(16),
+            struct_align: Some(16),
+            param_align: None,
+            struct_eightbyte_classes: vec![E::Sse, E::SseUp],
+            is_f128_sse: false,
+            fp_agg_class: None,
+        }];
+        f.param_alloca_values = vec![Value(0)];
+        f
+    }
+
+    #[test]
+    fn a_param_lane_read_becomes_a_preloadable_extract() {
+        // `((long long *)&a)[1]`: GEP +8 and an I64 load collapse to one
+        // entry-prefix VecLoad plus a lane-1 extract; the GEP dies.
+        let insts = vec![alloca(0, 16), gep(2, 0, 8), load(3, 2)];
+        let mut f = vec_param_func(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(3))));
+        assert!(run(&mut f) >= 1, "the param lane forward must fire");
+        let insts = &f.blocks[0].instructions;
+        assert!(
+            matches!(&insts[0], Instruction::Alloca { dest, .. } if dest.0 == 0),
+            "alloca first: {insts:?}"
+        );
+        let Instruction::Intrinsic {
+            dest: Some(vl),
+            op: crate::ir::intrinsics::IntrinsicOp::VecLoadI32x4,
+            args,
+            ..
+        } = &insts[1]
+        else {
+            panic!("entry-prefix VecLoad expected: {insts:?}");
+        };
+        assert!(
+            matches!(
+                args.as_slice(),
+                [Operand::Value(Value(0)), Operand::Const(IrConst::I64(0))]
+            ),
+            "full-width load of the param slot: {args:?}"
+        );
+        assert!(
+            matches!(
+                &insts[2],
+                Instruction::Intrinsic {
+                    dest: Some(d),
+                    op: crate::ir::intrinsics::IntrinsicOp::VecExtractLaneI64x2,
+                    args,
+                    ..
+                } if d.0 == 3 && matches!(
+                    args.as_slice(),
+                    [Operand::Value(x), Operand::Const(IrConst::I32(1))] if x.0 == vl.0
+                )
+            ),
+            "lane-1 extract with the load's id: {insts:?}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(
+                i,
+                Instruction::Load { .. } | Instruction::GetElementPtr { .. }
+            )),
+            "the scalar load and the GEP must be gone: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn both_param_lanes_share_one_vec_load() {
+        // `p[0] + p[1]`: two lane reads, one VecLoad, two extracts.
+        let insts = vec![
+            alloca(0, 16),
+            load(3, 0),
+            gep(4, 0, 8),
+            load(5, 4),
+            bin(IrBinOp::Add, 6, 3, Operand::Value(Value(5)), IrType::I64),
+        ];
+        let mut f = vec_param_func(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(6))));
+        assert_eq!(run(&mut f), 2, "both lane reads forward");
+        let loads = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::VecLoadI32x4,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(loads, 1, "one shared VecLoad");
+        let extracts = f.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::VecExtractLaneI64x2,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(extracts, 2, "one extract per lane read");
+    }
+
+    #[test]
+    fn a_written_param_slot_declines_the_lane_forward() {
+        // A store through the alias means the slot bytes diverge from the
+        // incoming register: fail closed.
+        let insts = vec![alloca(0, 16), store(9, 0), gep(2, 0, 8), load(3, 2)];
+        let mut f = vec_param_func(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(3))));
+        run(&mut f);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "a written slot must keep its loads: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn an_escaping_param_slot_declines_the_lane_forward() {
+        // The slot address flows into a call: anybody may rewrite it.
+        let insts = vec![
+            alloca(0, 16),
+            Instruction::Call {
+                func: "sink".to_string(),
+                info: crate::ir::reexports::CallInfo {
+                    dest: None,
+                    args: vec![Operand::Value(Value(0))],
+                    arg_types: vec![IrType::Ptr],
+                    num_fixed_args: 1,
+                    return_type: IrType::Void,
+                    ..Default::default()
+                },
+            },
+            gep(2, 0, 8),
+            load(3, 2),
+        ];
+        let mut f = vec_param_func(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(3))));
+        run(&mut f);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "an escaping slot must keep its loads: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn an_integer_class_param_declines_the_lane_forward() {
+        // A 16-byte {long, long} struct arrives in GP registers — no XMM
+        // home exists for an extract to read.
+        use crate::common::types::EightbyteClass as E;
+        let insts = vec![alloca(0, 16), gep(2, 0, 8), load(3, 2)];
+        let mut f = vec_param_func(insts);
+        f.params[0].struct_eightbyte_classes = vec![E::Integer, E::Integer];
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(3))));
+        run(&mut f);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "an INTEGER-class parameter must keep its loads: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn a_misaligned_param_lane_read_declines() {
+        // `Load I64 [slot+4]` straddles lanes: not extractable.
+        let insts = vec![alloca(0, 16), gep(2, 0, 4), load(3, 2)];
+        let mut f = vec_param_func(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(3))));
+        run(&mut f);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "a straddling read must keep its load: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn the_param_lane_forward_is_fenced_off_without_value_extract_support() {
+        let insts = vec![alloca(0, 16), gep(2, 0, 8), load(3, 2)];
+        let mut f = vec_param_func(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(3))));
+        run_with_symbol_facts(&mut f, &ModuleSymbolFacts::default(), false);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "no extract may be minted without backend support: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn second_return_sets_sink_to_the_terminator() {
+        // The SysV `[Sse, Sse]` provider shape: a staging slot is stored,
+        // the high eightbyte is extracted and pinned into %xmm1
+        // (`SetReturnF64Second`), and the LOW eightbyte's load sits after
+        // the pin.  The lane forward turns that load into an extract whose
+        // emitter stages through %xmm1 — which destroyed the pinned high
+        // half (caught by check_sysv_aggregate_abi on `struct{v2f;v2i}`).
+        // After the pass, every instruction between the set and the
+        // `Return` must be gone: the set is the LAST instruction.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            vecload(4, 2, 0),
+            vecstore_i64(4, 30, 0),
+            gep(31, 30, 8),
+            Instruction::Load {
+                dest: Value(10),
+                ptr: Value(31),
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::SetReturnF64Second {
+                src: Operand::Value(Value(10)),
+            },
+            Instruction::Load {
+                dest: Value(11),
+                ptr: Value(30),
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(11))));
+        assert!(run(&mut f) >= 1, "the lane forwards must fire");
+        let insts = &f.blocks[0].instructions;
+        assert!(
+            matches!(insts.last(), Some(Instruction::SetReturnF64Second { .. })),
+            "the second-return set must be the last instruction: {insts:?}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Instruction::Load { .. })),
+            "both lane loads forward to extracts: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_return_set_does_not_cross_a_call() {
+        // A call between the set and the return would clobber %xmm1
+        // regardless of placement — the sink must refuse to cross it and
+        // keep the original position (fail closed).
+        let insts = vec![
+            param_ref(2, 0),
+            Instruction::SetReturnF64Second {
+                src: Operand::Value(Value(2)),
+            },
+            Instruction::Call {
+                func: "ext".to_string(),
+                info: crate::ir::reexports::CallInfo {
+                    dest: None,
+                    args: Vec::new(),
+                    arg_types: Vec::new(),
+                    num_fixed_args: 0,
+                    return_type: IrType::Void,
+                    ..Default::default()
+                },
+            },
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(None);
+        run(&mut f);
+        assert!(
+            matches!(
+                f.blocks[0].instructions.get(1),
+                Some(Instruction::SetReturnF64Second { .. })
+            ),
+            "the set must not move past a call: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn the_lane_forward_is_fenced_off_without_value_extract_support() {
+        // i686 implements only the pointer form of `VecExtractLane*`
+        // (`reject_value_form` ICEs on a value dest): with the capability
+        // flag off the load must survive untouched.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            vecload(4, 2, 0),
+            vecstore_i64(4, 30, 0),
+            scalar_load(6, 30, IrType::F32),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(6))));
+        run_with_symbol_facts(&mut f, &ModuleSymbolFacts::default(), false);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "no lane extract may be minted without backend support: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn a_lane_load_from_a_scalar_payload_declines() {
+        // The stored "payload" is a scalar Cast result, not a 16-byte
+        // producer: the extract emitters would read 16 bytes of its home,
+        // which nothing guarantees — fail closed.
+        let insts = vec![
+            param_ref(2, 0),
+            alloca(30, 16),
+            cast(4, 2, IrType::Ptr, IrType::I64),
+            vecstore_i64(4, 30, 0),
+            scalar_load(6, 30, IrType::I64),
+        ];
+        let mut f = func_with(insts);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(6))));
+        run(&mut f);
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "a narrow payload must fail closed: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn a_carrier_reload_feeding_a_compute_op_collapses() {
+        // The reload feeds `VecAddI32x4` (both operand positions): a
+        // compute op from the proven allowlist, whose emitters read a
+        // value's 16-byte slot — the same bytes through the same paths the
+        // reload would have taken.  The collapse substitutes the carrier
+        // and retires the whole staging dance (`return _mm_add_epi32(v,
+        // v)` where `v = f(p)`: measured 13 instructions and a 152-byte
+        // frame down to 6 instructions).
         let mut f = carrier_split(&mut Vec::new());
         f.blocks[0].instructions.push(Instruction::Intrinsic {
             dest: Some(Value(12)),
@@ -2411,18 +3940,106 @@ mod tests {
             args: vec![Operand::Value(Value(11)), Operand::Value(Value(11))],
         });
         f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(12))));
-        assert_eq!(
-            run(&mut f),
-            0,
-            "an intrinsic use of the reload fails closed"
+        assert!(run(&mut f) >= 1, "a compute-op use collapses");
+        let add = f.blocks[0]
+            .instructions
+            .iter()
+            .find(|i| {
+                matches!(
+                    i,
+                    Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::VecAddI32x4,
+                        ..
+                    }
+                )
+            })
+            .expect("the add survives");
+        let Instruction::Intrinsic { args, .. } = add else {
+            unreachable!()
+        };
+        assert!(
+            args.iter().all(|a| matches!(a, Operand::Value(Value(5)))),
+            "both operands must read the carrier directly: {args:?}"
         );
-        assert!(f.blocks[0].instructions.iter().any(|i| matches!(
-            i,
-            Instruction::Intrinsic {
-                op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
-                ..
-            }
-        )));
+        assert!(
+            !f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::VecLoadI64x2,
+                    ..
+                }
+            )),
+            "the staging reload must be retired"
+        );
+    }
+
+    #[test]
+    fn a_carrier_reload_with_a_scalar_store_use_declines() {
+        // The reload's value escapes through a scalar I64-typed `Store`:
+        // that consumer routes an I128 value through the GP-register
+        // splitter, which the substitution must never feed.
+        let mut f = carrier_split(&mut Vec::new());
+        f.blocks[0].instructions.push(alloca(20, 16));
+        f.blocks[0].instructions.push(Instruction::Store {
+            val: Operand::Value(Value(11)),
+            ptr: Value(20),
+            ty: IrType::I64,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(11))));
+        assert_eq!(run(&mut f), 0, "a scalar store use fails closed");
+    }
+
+    #[test]
+    fn a_carrier_reload_used_as_a_store_pointer_declines() {
+        // The reload appears in a vector store's POINTER positions (a
+        // nonsense shape, but exactly what the positional gate exists
+        // for): consuming it as an address reinterprets vector data as a
+        // pointer.
+        let mut f = carrier_split(&mut Vec::new());
+        f.blocks[0].instructions.push(Instruction::Intrinsic {
+            dest: None,
+            op: crate::ir::intrinsics::IntrinsicOp::VecStoreI64x2,
+            dest_ptr: Some(Value(11)),
+            args: vec![
+                Operand::Value(Value(11)),
+                Operand::Value(Value(11)),
+                Operand::Const(IrConst::I64(0)),
+            ],
+        });
+        f.blocks[0].terminator = Terminator::Return(None);
+        assert_eq!(run(&mut f), 0, "a pointer-position use fails closed");
+    }
+
+    #[test]
+    fn a_carrier_reload_feeding_a_load_pointer_declines() {
+        // The reload is the POINTER argument of a whole-vector load — not
+        // a compute op, so the allowlist refuses it even though the
+        // instruction is an intrinsic.
+        let mut f = carrier_split(&mut Vec::new());
+        f.blocks[0].instructions.push(Instruction::Intrinsic {
+            dest: Some(Value(21)),
+            op: crate::ir::intrinsics::IntrinsicOp::VecLoadI32x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(11)), Operand::Const(IrConst::I64(0))],
+        });
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(21))));
+        assert_eq!(run(&mut f), 0, "a load-pointer use fails closed");
+    }
+
+    #[test]
+    fn a_carrier_reload_in_a_non_return_terminator_declines() {
+        // The reload feeds a conditional branch: a non-return terminator
+        // reads the value as a scalar condition.
+        let mut f = carrier_split(&mut Vec::new());
+        let exit = f.blocks[0].label;
+        f.blocks[0].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(11)),
+            true_label: exit,
+            false_label: exit,
+        };
+        assert_eq!(run(&mut f), 0, "a branch-condition use fails closed");
     }
 
     #[test]

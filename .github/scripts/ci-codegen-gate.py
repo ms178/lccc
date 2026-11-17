@@ -472,6 +472,19 @@ def main():
             "--update-baseline in the landing PR.",
             file=sys.stderr,
         )
+        # A RED gate must carry its own evidence: the job log is not
+        # queryable from the API, so without these two annotations a failure
+        # reproducible only in CI (environment-dependent headers, a
+        # runner-built binary) is undiagnosable from outside — exactly the
+        # hole the opt-in --annotate flag cannot fill, because setting the
+        # repository variable requires admin rights the auditing agent does
+        # not have. The error annotation names every breached metric; the
+        # metrics annotation carries the full measured table so a justified
+        # baseline refresh can be written without re-running the job.
+        print("::error title=Codegen quality gate::"
+              + gha_escape("; ".join(failures)))
+        if not (args.annotate or annotate_asm):
+            emit_metrics_annotation(results)
         sys.exit(1)
     print("Codegen gate: all golden workloads within tolerance.", file=sys.stderr)
 
