@@ -2605,6 +2605,11 @@ gate "round-cap-observability" fast \
 gate "verify-ir-clean" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_verify_ir_clean.sh
 
+# Wide-constant hoist placement: hoists survive jump_thread's cleanup,
+# rare-path constants stay at their conditional sites.
+gate "int-const-hoist-loop" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_int_const_hoist_loop.sh
+
 # The dual-layout tie rule: the fixture still ties, the two arms differ, the
 # default arm emits one fewer conditional branch, and both agree with the
 # oracle on the program's output.

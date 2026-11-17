@@ -29,7 +29,6 @@ pub(crate) mod builtin_policy;
 pub(crate) mod byte_load;
 pub(crate) mod cfg_simplify;
 pub(crate) mod const_array_promote;
-pub(crate) mod const_hoist;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod cvp;
@@ -587,6 +586,33 @@ where
         }
     }
     total
+}
+
+/// In-pipeline copy propagation that spares deliberate constant homes.
+///
+/// `fp_const_hoist` and `int_const_hoist` materialize loop-invariant
+/// constants as `Copy dest = Const` in preheaders so register allocation can
+/// keep them live across the loop. Any later cleanup that runs the PLAIN
+/// propagator forwards those copies straight back into their uses and
+/// re-sinks the per-iteration materialization (movabsq / movz+movk /
+/// lui+addi) the hoist existed to remove. Every `propagate_copies` call site
+/// that executes after the hoists MUST go through this wrapper; the driver's
+/// final cleanup (`driver/pipeline.rs`) applies the same criterion with its
+/// own live-range-splitter floor.
+fn propagate_copies_sparing_const_homes(
+    func: &mut crate::ir::reexports::IrFunction,
+    target: crate::backend::Target,
+) -> usize {
+    let int_homes = match int_const_hoist::model_for(target) {
+        Some(m) => int_const_hoist::const_homes(func, m),
+        None => Default::default(),
+    };
+    let spare = |v: crate::ir::reexports::Value, c: &crate::ir::reexports::IrConst| {
+        fp_const_hoist::is_hoisted_fp_const(c) || int_homes.contains(&v.0)
+    };
+    // u32::MAX floor: every constant copy consults `spare` (there is no
+    // splitter-freshness distinction inside the pass pipeline).
+    copy_prop::propagate_copies_sparing(func, u32::MAX, &spare)
 }
 
 /// Run GVN, LICM, and IVSR with shared CFG analysis per function.
@@ -4482,8 +4508,20 @@ pub(crate) fn run_passes(
         if n > 0 {
             // Clones end in jumps to single-predecessor blocks and carry
             // phi-turned-Copy instructions: merge, propagate, collect.
+            // Constant homes are spared: jump_thread runs AFTER
+            // fp/int_const_hoist, and the plain propagator used to forward
+            // each hoisted `Copy K` straight back into its loop-body uses —
+            // re-sinking the movabsq/movz+movk materialization into every
+            // iteration the hoist had just lifted it out of (fold-style FNV
+            // loops lost their prime register whenever the promote
+            // guarded-writeback diamond gave jump_thread something to
+            // thread).
             module.for_each_function(cfg_simplify::simplify_cfg);
-            module.for_each_function(copy_prop::propagate_copies);
+            for func in &mut module.functions {
+                if !func.is_declaration {
+                    propagate_copies_sparing_const_homes(func, target);
+                }
+            }
             module.for_each_function(dce::eliminate_dead_code);
             verify::verify_after_pass(module, "jump_thread_cleanup");
         }
@@ -4784,12 +4822,14 @@ pub(crate) fn run_passes(
 
     // Producer ranges survive copies/casts without conflating carrier widths.
     // Run after transformations that reason about signed integer domains.
+    // The cleanup spares constant homes for the same reason as
+    // jump_thread's: this site also runs after fp/int_const_hoist.
     if !pass_disabled(&disabled, "intbounds") {
         module.for_each_function(|f| {
             let changed = integer_bounds::run(f);
             if changed != 0 {
                 if !pass_disabled(&disabled, "copyprop") {
-                    copy_prop::propagate_copies(f);
+                    propagate_copies_sparing_const_homes(f, target);
                 }
                 if !pass_disabled(&disabled, "dce") {
                     dce::eliminate_dead_code(f);
@@ -4900,20 +4940,6 @@ pub(crate) fn run_passes(
     // Kill switch: CCC_DISABLE_PASSES=inertasm.
     if !pass_disabled(&disabled, "inertasm") {
         module.for_each_function(remove_inert_inline_asm);
-    }
-
-    // Loop-invariant wide-constant hoisting (see const_hoist.rs): a 64-bit
-    // immediate outside the imm32 range used by a BinOp inside a loop gets a
-    // preheader `Copy`, so the backend materializes it once instead of per
-    // iteration (FNV/xxhash primes: `movabsq` inside the hot loop on x86-64,
-    // mov/movk chains on AArch64). ORDER: last value-level transform — every
-    // constant-fold / copy-propagation / GVN round would fold the copy
-    // straight back into the use, so it runs after them all; phi
-    // elimination in the driver does not propagate constants and keeps it
-    // intact. Pass name for CCC_DISABLE_PASSES: "consthoist".
-    if matches!(opt_level, 2 | 3) && !pass_disabled(&disabled, "consthoist") {
-        const_hoist::run_module(module);
-        verify::verify_after_pass(module, "consthoist");
     }
 
     if time_passes {

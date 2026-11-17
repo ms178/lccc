@@ -381,6 +381,7 @@ documented in a tracked markdown file.
 | `CCC_DEBUG_VOLRED=1` | `volatile_reduce`'s interleave budget: how many lanes the pass admitted, which bound (lane count vs. budget) bound the group, and why a candidate was dropped. Budget exhaustion is a normal outcome, not a defect, so it is silent by default. |
 | `CCC_DEBUG_STATIC_INIT=1` | The static-initializer builder's decision for an element it cannot fold: which evaluator ran (scalar constant, sema's folded value, address constant, byte fill), and the offset each one wrote. |
 | `CCC_DEBUG_TYPES_COMPATIBLE=1` | `__builtin_types_compatible_p`'s verdict for each query with the two resolved types in canonical form, i.e. exactly the pair the predicate compared after qualification stripping and parameter-name erasure. |
+| `CCC_DEBUG_INTCONST=1` | `int_const_hoist`'s per-loop decisions: the function and loop under consideration, whether a preheader exists, the wide-constant candidates found in every-iteration blocks, and which survived the leaf-loop pressure rule. Written for the silent failure mode where the hoist fires but a later cleanup re-folds it — compare this trace against the final assembly. |
 
 Debug traces are opt-in and rate-limited by construction: each is a
 `std::env::var_os` probe per decision site, so a knob left exported in a
