@@ -67,6 +67,7 @@ pub(crate) mod loop_analysis;
 pub(crate) mod loop_bound;
 pub(crate) mod loop_carried_forward;
 pub(crate) mod loop_idiom;
+pub(crate) mod loop_idiom_fill;
 pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_memset;
@@ -2876,7 +2877,7 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "loop_idiom",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    loop_idiom::run_function(func, &symbol_facts, loop_idiom_capabilities)
+                    loop_idiom::run_function(func, &symbol_facts, loop_idiom_capabilities, target)
                 })
             );
             total_changes += n;
