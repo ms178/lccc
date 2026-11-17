@@ -1313,7 +1313,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 367.57,
+      "predicted_gate_seconds": 368.17,
       "shards": 3,
       "steps": [
         {
@@ -1343,6 +1343,10 @@
         {
           "measured_s": 1.0,
           "name": "Check 16-byte atomic load/store/RMW semantics (full 128 bits, vs GCC oracle)"
+        },
+        {
+          "measured_s": 0.6,
+          "name": "Linked executables keep writable data page-aligned (hot-global page-straddle gate)"
         },
         {
           "measured_s": 0.25,

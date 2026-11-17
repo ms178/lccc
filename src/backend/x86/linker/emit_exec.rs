@@ -1169,6 +1169,32 @@ pub(super) fn emit_executable(
     let rela_iplt_size = if is_static { num_ifunc as u64 * 24 } else { 0 };
     offset += rela_iplt_size;
 
+    // Hot-data page alignment: start the writable data block (.data, then
+    // .bss right behind it) on a fresh page. Dense packing left `.data` at
+    // whatever page remainder the preceding sections produced — e.g. 0xf60,
+    // 160 bytes before a page boundary — so a small hot global could
+    // straddle a 4 KiB page and every 16-byte access to it became a
+    // page-split (measured: 1.55x on the nbody benchmark, where a 280-byte
+    // body array crossed 0x...f70 -> 0x...000 and the inner-loop velocity
+    // store split the page 5M times). BFD gets this for free: it rounds the
+    // RELRO end up to a page (DATA_SEGMENT_RELRO_END), so the writable tail
+    // always begins page-aligned. Pay the same <= 1 page of file zeros, and
+    // only when there is writable data to protect. Congruence
+    // `p_offset ≡ p_vaddr (mod page)` is preserved: the pad advances offset
+    // and vaddr by the same amount.
+    let has_rw_data = output_sections.iter().any(|sec| {
+        sec.flags & SHF_ALLOC != 0
+            && sec.flags & SHF_WRITE != 0
+            && sec.flags & SHF_TLS == 0
+            && sec.mem_size > 0
+            && sec.name != ".init_array"
+            && sec.name != ".fini_array"
+            && sec.name != ".preinit_array"
+            && sec.name != ".data.rel.ro"
+    });
+    if has_rw_data {
+        offset += packer.padding_to_page(offset);
+    }
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_ALLOC != 0
             && sec.flags & SHF_WRITE != 0

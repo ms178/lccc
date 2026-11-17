@@ -625,6 +625,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_attribute_diagnostics.sh
     - name: Check 16-byte atomic load/store/RMW semantics (full 128 bits, vs GCC oracle)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_atomic16_runtime.sh
+    - name: Linked executables keep writable data page-aligned (hot-global page-straddle gate)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_rw_data_page_alignment.sh
     - name: Check SSE2 4-lane widening sums (plain + masked) and AVX2 composite
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_widening_4lane_sum.sh
     - name: x86 execute regression fixes on both ABIs

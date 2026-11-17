@@ -372,6 +372,8 @@ gate "x86-scalar-intrinsics" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" sh tests/regression/check_x86_scalar_intrinsics.sh
 gate "atomic16-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_atomic16_runtime.sh
+gate "rw-data-page-alignment" fast \
+    env CCC="$LCCC" bash tests/regression/check_rw_data_page_alignment.sh
 gate "i128-atomic-call-clobber" fast \
     env CCC="$LCCC" GCC16="${GCC16:-gcc-16}" \
     bash tests/regression/check_i128_atomic_call_clobber.sh

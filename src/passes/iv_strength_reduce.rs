@@ -1933,6 +1933,129 @@ fn find_derived_exprs(
         }
     }
 
+    // ── Chained scalings: `Shl/Mul(Shl/Mul(iv, c1), c2)` ───────────────────
+    //
+    // The vectorizer emits the chunked-loop byte offset as a CHAIN — matmul's
+    // packed j-loop carries `(iv << 3) << 2` (element index scaled to bytes,
+    // then to the 4-lane chunk) — and IVSR can run before the canonicalizer
+    // folds it to a single `iv << 5`. The direct arms above then see only the
+    // INNER scaling (stride 8), the group looks SIB-friendly, and the x86
+    // cost rule skips it — but the COMPOSED stride (32) is not SIB-encodable,
+    // so the loop re-derives the offset with a `mov`+`shl` pair every
+    // iteration. Compose one level here so the group is judged at its real
+    // stride no matter when the canonicalizer runs.
+    //
+    // Soundness: composition is EXACT in the wrapping ring — for a total
+    // shift below the type width, `(x << a) << b  ==  x << (a + b)` holds
+    // modulo 2^w with no precondition, and `(x * c1) * c2 == x * (c1 * c2)`
+    // is associativity of modular multiplication. An affine chain composes
+    // as `((iv + k) * s1) * f == (iv + k) * (s1 * f)`: the stride multiplies,
+    // the PRE-scaling constant `k` does not. The composed group therefore
+    // describes the chain's value bit-for-bit, and every downstream legality
+    // gate (modular-IV proof, offset-product overflow, SIB cost) evaluates
+    // it exactly as it would the pre-folded single scaling. `checked_mul` +
+    // the `MAX_IV_STRIDE` bound reject anything that cannot be represented.
+    {
+        let by_root: FxHashMap<u32, usize> = derived
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (alias_root(&aliases, d.mul_dest.0), i))
+            .collect();
+        let mut composed: Vec<DerivedExpr> = Vec::new();
+        for &bi in loop_body {
+            let Some(block) = func.blocks.get(bi) else {
+                continue;
+            };
+            for inst in &block.instructions {
+                let Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } = inst
+                else {
+                    continue;
+                };
+                let (v, c) = match (op, lhs, rhs) {
+                    (IrBinOp::Shl, Operand::Value(v), Operand::Const(c)) => (v, c),
+                    (IrBinOp::Mul, Operand::Value(v), Operand::Const(c))
+                    | (IrBinOp::Mul, Operand::Const(c), Operand::Value(v)) => (v, c),
+                    _ => continue,
+                };
+                let Some(&di) = by_root.get(&alias_root(&aliases, v.0)) else {
+                    continue;
+                };
+                let d = &derived[di];
+                // Same-type chains only: a cast between the scalings changes
+                // the ring width and is a different proof. Address-add
+                // pseudo-groups carry stride 1 byte-walk semantics, not a
+                // scaling, and do not compose.
+                if d.mul_ty != *ty || d.from_address_add {
+                    continue;
+                }
+                let factor = match op {
+                    IrBinOp::Shl => match c.to_i64() {
+                        Some(s) if (0..64).contains(&s) => 1i64 << s,
+                        _ => continue,
+                    },
+                    _ => match c.to_i64() {
+                        Some(m) => m,
+                        _ => continue,
+                    },
+                };
+                let Some(stride) = d.stride.checked_mul(factor) else {
+                    continue;
+                };
+                if stride <= 0 || stride > MAX_IV_STRIDE {
+                    continue;
+                }
+                // `add_offset` is the constant added to the IV BEFORE the
+                // scaling (`(iv + k) * stride`), so it is INVARIANT under
+                // composition: `((iv + k) * s1) * f == (iv + k) * (s1 * f)`.
+                // Scaling `k` here double-counted the lane offset of
+                // unrolled affine chains (`(i + 1) * 3 << 2` walked 48 bytes
+                // instead of 12 — caught by iv_widen_derived_closure).
+                let add_offset = d.add_offset;
+                let dest_root = alias_root(&aliases, dest.0);
+                let gep_uses = gep_uses_by_index
+                    .get(&dest_root)
+                    .cloned()
+                    .unwrap_or_default();
+                let vec_uses = vec_uses_by_index
+                    .get(&dest_root)
+                    .cloned()
+                    .unwrap_or_default();
+                // Only address groups: a composed scaling nobody dereferences
+                // is plain integer arithmetic and stays untouched.
+                if gep_uses.is_empty() && vec_uses.is_empty() {
+                    continue;
+                }
+                let iv_index = d.iv_index;
+                composed.push(DerivedExpr {
+                    stride,
+                    iv_index,
+                    add_offset,
+                    gep_uses,
+                    vec_uses,
+                    mul_dest: *dest,
+                    mul_ty: *ty,
+                    has_uses: used_values.contains(&dest.0),
+                    from_address_add: false,
+                });
+                if dbg {
+                    lccc::cli::stderr_line(format_args!(
+                        "[IVSR-DERIV] composed chain v{} stride {} ({} gep uses)",
+                        dest.0,
+                        stride,
+                        composed.last().map_or(0, |d| d.gep_uses.len()),
+                    ));
+                }
+            }
+        }
+        derived.extend(composed);
+    }
+
     // ── Address-forming Adds: `Add(ptr, byte_offset)` ──────────────────────
     //
     // LCCC lowers EVERY C subscript to pointer-width integer arithmetic rather

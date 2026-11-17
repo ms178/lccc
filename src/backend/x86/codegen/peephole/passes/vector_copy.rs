@@ -1704,6 +1704,20 @@ fn vex_plain_output(mn: &str) -> bool {
     VEX_PLAIN_OUTPUT_BASES.contains(&base)
 }
 
+/// Legacy-SSE immediate shuffles whose destination is a PLAIN output written
+/// entirely from the source register and the immediate: `pshufd` (dwords),
+/// `pshuflw`/`pshufhw` (words; both write all 128 bits — the half they do
+/// not shuffle is copied from the source). The destination's prior value is
+/// never read, and — being legacy encodings — bits above 127 of the
+/// destination are left unchanged. That makes retargeting onto a LEGACY
+/// full-width copy-out bit-exact with no upper-half argument at all: both
+/// the original `movdqa %T, %D` and the retargeted producer write exactly
+/// `D[127:0]` and leave `D`'s upper bits alone. (The VEX forms `vpshufd`
+/// etc. are already classified by [`vex_int_plain_output`].)
+fn legacy_imm_shuffle(mn: &str) -> bool {
+    matches!(mn, "pshufd" | "pshuflw" | "pshufhw")
+}
+
 /// VEX/AVX2 packed-integer instructions whose destination is a plain output:
 /// every source is read before the write, the full spelled width of the
 /// destination is written from the sources alone, and the bits above the
@@ -1856,7 +1870,12 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         let is_legacy_load = legacy_full_width_load(mn);
         let is_full_load = is_vex_load || is_legacy_load;
         let is_broadcast = vex_broadcast(mn);
-        if !(vex_plain_output(mn) || vex_int_plain_output(mn) || is_full_load || is_broadcast)
+        let is_legacy_shuf = legacy_imm_shuffle(mn);
+        if !(vex_plain_output(mn)
+            || vex_int_plain_output(mn)
+            || is_full_load
+            || is_broadcast
+            || is_legacy_shuf)
             || operands.contains('{')
         {
             j += 1;
@@ -1875,6 +1894,16 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         // A broadcast: two operands, the source a vector register or a
         // memory operand; folded only into the full-width VEX copy-out.
         if is_broadcast && !(ops.len() == 2 && !ops[0].starts_with('$')) {
+            j += 1;
+            continue;
+        }
+        // A legacy immediate shuffle: exactly `$imm, %xmmS, %xmmT` (the
+        // memory-source form is not retargeted — the reload would need its
+        // own alias argument), folded only into an ADJACENT legacy
+        // full-width copy-out below.
+        if is_legacy_shuf
+            && !(ops.len() == 3 && ops[0].starts_with('$') && ops[1].starts_with("%xmm"))
+        {
             j += 1;
             continue;
         }
@@ -2032,6 +2061,17 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         if ((is_vex_load || is_broadcast) && !(full_vex_copy_out || legacy_full_copy_out))
             || (is_legacy_load && !legacy_full_copy_out)
         {
+            j += 1;
+            continue;
+        }
+        // A legacy immediate shuffle pairs ONLY with an adjacent legacy
+        // full-width copy-out: that pairing is bit-exact (both write
+        // `D[127:0]` from the same value and leave `D`'s upper bits alone),
+        // whereas a VEX copy-out zeroes `D`'s upper bits where the
+        // retargeted legacy producer would not. Adjacency (no interior)
+        // keeps the source register provably unmodified between producer
+        // and copy.
+        if is_legacy_shuf && !(legacy_full_copy_out && interior.is_empty()) {
             j += 1;
             continue;
         }
