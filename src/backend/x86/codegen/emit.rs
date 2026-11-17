@@ -5146,6 +5146,22 @@ impl X86Codegen {
 
     /// Store %rax:%rdx (128-bit) to a value's 16-byte stack slot.
     pub(super) fn store_rax_rdx_to(&mut self, dest: &Value) {
+        // A destination homed in an XMM register is read through that register.
+        // Assemble the pair there first: the slot store below cannot serve a
+        // value that has no slot, and dropping it silently leaves the consumer
+        // reading whatever the register held before. The pending deferred vector
+        // store is flushed first, since it may occupy this register.
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_xmm_reg(reg) {
+                let name = phys_reg_name(reg);
+                self.flush_pending_vec_store_impl();
+                self.state.emit_fmt(format_args!("    movq %rax, %{name}"));
+                self.state.emit_fmt(format_args!("    movq %rdx, %xmm1"));
+                self.state
+                    .emit_fmt(format_args!("    punpcklqdq %xmm1, %{name}"));
+                self.state.vec_claim_live_reg(dest.0, name);
+            }
+        }
         if let Some(slot) = self.state.get_slot(dest.0) {
             if crate::backend::traits::trace_i128_enabled() {
                 lccc::cli::stderr_line(format_args!(
