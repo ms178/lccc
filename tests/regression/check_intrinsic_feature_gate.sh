@@ -51,6 +51,62 @@ typedef long long v4di __attribute__((vector_size(32)));
 v4di clmul256(v4di a, v4di b) { return __builtin_ia32_vpclmulqdq256(a, b, 0); }
 EOF
 
+# verdict <source> <flags...>: print "accept" or "reject" for compiler $1
+# verdict <compiler> <source> <flags...> -> accept | reject | host-gap
+#
+# The third answer exists because a failure only means "reject" when the
+# compiler actually got as far as deciding. An image without the 32-bit libc
+# headers cannot preprocess `<immintrin.h>` in `-m32` mode at all, and
+# collapsing that into "reject" made this gate claim agreement it never
+# measured (`ok: i686_ymm_int.c -m32 -mavx -mno-avx2 -> reject (gcc agrees)`)
+# and then report a real divergence where there was only a header gap
+# (`FAIL: i686_ymm_float.c with -m32 -mavx -mno-avx2: lccc accept, gcc
+# reject`) -- measured on the campaign image, where `gcc-16 -m32` and the
+# distro `gcc -m32` both stop at `bits/libc-header-start.h`. On a host with
+# the multilib installed the third answer never occurs, so no cell goes
+# unmeasured in CI.
+verdict() {
+    local cc=$1 src=$2
+    shift 2
+    local out rc
+    set +e
+    out=$("$cc" -O2 "$@" -c "$tmp/$src" -o /dev/null 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+        echo accept
+    elif grep -q 'fatal error: .*: No such file or directory' <<<"$out"; then
+        echo host-gap
+    else
+        echo reject
+    fi
+}
+
+host_gaps=0
+
+compare() {
+    local src=$1
+    shift
+    local ours theirs
+    ours=$(verdict "$ccc" "$src" "$@")
+    theirs=$(verdict "$gcc_bin" "$src" "$@")
+    if [ "$theirs" = host-gap ]; then
+        # The oracle could not preprocess the probe, so it has no verdict to
+        # compare against. Its own gap is not evidence about lccc.
+        host_gaps=$((host_gaps + 1))
+        echo "skip: $src $* -> lccc $ours; the oracle cannot preprocess this probe on this host"
+        return 0
+    fi
+    # The mirror case is NOT a host gap in the image: the oracle compiled the
+    # same probe, so lccc is the one that cannot find a header and that is a
+    # real defect.
+    [ "$ours" != host-gap ] ||
+        fail "$src with $*: lccc cannot preprocess the probe although gcc can"
+    [ "$ours" = "$theirs" ] ||
+        fail "$src with $*: lccc $ours, gcc $theirs (the oracle is the tie-breaker)"
+    echo "ok: $src $* -> $ours (gcc agrees)"
+}
+
 # reject <source> <flag-expected-in-message> <flags...>
 reject() {
     local src=$1 want=$2
@@ -151,6 +207,118 @@ if grep -q 'vbroadcasti128' "$tmp/bc_avx1.s"; then
     fail "_mm256_broadcast_ps under -mavx emitted the AVX2 vbroadcasti128"
 fi
 
+# AVX2 integer 256-bit intrinsics. Both are AVX2 instructions on the ymm
+# class; -mavx grants VEX.256 for float only, so the integer forms are AVX2
+# and must be rejected under -mavx. `_mm256_max_epu16` also covers the
+# inlined-always_inline path (its diagnostic names the inner builtin).
+cat >"$tmp/o_avx2_max.c" <<'EOF'
+#include <immintrin.h>
+__m256i max_u16(__m256i a, __m256i b) { return _mm256_max_epu16(a, b); }
+EOF
+cat >"$tmp/o_avx2_and.c" <<'EOF'
+#include <immintrin.h>
+__m256i and_si(__m256i a, __m256i b) { return _mm256_and_si256(a, b); }
+EOF
+reject o_avx2_max.c avx2 -mavx
+reject o_avx2_and.c avx2 -mavx
+accept o_avx2_max.c vpmaxuw -mavx2
+accept o_avx2_and.c vpand -mavx2
+
+# Unsigned 16-bit min/max, 128 bits (GCC 16.2: `pmaxuw` / `pminuw` under
+# SSE4.1). `_mm_max_epu16` carries target("sse4.1"). A baseline caller is
+# refused as GCC refuses it (always_inline target mismatch) and is never handed
+# a call to a body that executes pmaxuw on an SSE2-only processor.
+cat >"$tmp/o_sse41_max.c" <<'EOF'
+#include <immintrin.h>
+__m128i max_u16(__m128i a, __m128i b) { return _mm_max_epu16(a, b); }
+EOF
+cat >"$tmp/o_sse41_min.c" <<'EOF'
+#include <immintrin.h>
+__m128i min_u16(__m128i a, __m128i b) { return _mm_min_epu16(a, b); }
+EOF
+reject o_sse41_max.c "inlining failed in call to 'always_inline'" -march=x86-64
+reject o_sse41_min.c "inlining failed in call to 'always_inline'" -march=x86-64
+reject o_avx2_max.c avx2 -march=x86-64
+accept o_sse41_max.c pmaxuw -msse4.1
+accept o_sse41_min.c pminuw -msse4.1
+accept o_sse41_max.c pmaxuw -mavx
+
+# Runtime, not only codegen: build the freestanding i686 program with lccc and
+# run it. Exit 0 means every lane matches the scalar result. 126/127 mean this
+# host cannot execute 32-bit programs, which is a reported skip. Anything else
+# is a miscompile.
+run_i686_freestanding() {
+    local flags=$1 name=$2
+    local exe=$tmp/$name.exe
+    "$ccc" -m32 -O2 -static -nostdlib -ffreestanding -fno-stack-protector $flags \
+        "$repo/tests/regression/freestanding/i686_epu16_freestanding.c" -o "$exe" ||
+        fail "$name: lccc could not build the freestanding i686 program"
+    local rc=0
+    "$exe" || rc=$?
+    case $rc in
+        0) echo "ok: $name runs clean on i686 (every lane matches scalar)" ;;
+        126|127) echo "SKIP: $name: this host cannot execute 32-bit programs" >&2 ;;
+        *) fail "$name: i686 miscompile (exit $rc)" ;;
+    esac
+}
+run_i686_freestanding "-mavx2 -DUSE_AVX2" i686_epu16_avx2
+run_i686_freestanding "-msse4.1" i686_epu16_sse41
+
+# i686 has no unsigned word min/max of its own: the 128- and 256-bit forms must
+# lower to pmaxuw/pminuw. They must never fall back to the saturating identity,
+# and -m32 must never panic: the 256-bit form once hit "VecMaxU16x16 produces a
+# value" on i686 because its backend had no arm for the op.
+cat >"$tmp/i686_u16_256.c" <<'SRC'
+#include <immintrin.h>
+__m256i max256(__m256i a, __m256i b) { return _mm256_max_epu16(a, b); }
+__m256i min256(__m256i a, __m256i b) { return _mm256_min_epu16(a, b); }
+SRC
+cat >"$tmp/i686_u16_128.c" <<'SRC'
+#include <immintrin.h>
+__m128i max128(__m128i a, __m128i b) { return _mm_max_epu16(a, b); }
+__m128i min128(__m128i a, __m128i b) { return _mm_min_epu16(a, b); }
+SRC
+reject i686_u16_256.c avx2 -m32 -mavx
+accept i686_u16_256.c vpmaxuw -m32 -mavx2
+accept i686_u16_256.c vpminuw -m32 -mavx2
+accept i686_u16_128.c pmaxuw -m32 -msse4.1
+accept i686_u16_128.c pminuw -m32 -msse4.1
+# The saturating-difference identity must not come back on i686.
+for f in i686_u16_256.c i686_u16_128.c; do
+    if "$ccc" -O2 -m32 -mavx2 -S "$tmp/$f" -o "$tmp/$f.s" 2>/dev/null &&
+       grep -q 'vpsubusw' "$tmp/$f.s"; then
+        fail "$f: i686 lowered max/min_epu16 through the saturating identity"
+    fi
+done
+
+# A plain (non-inline) call to a function that carries target("sse4.1") is
+# legal everywhere: GCC compiles the call, and the callee is the only code that
+# runs the SSE4.1 instruction. Only always_inline edges are refused.
+cat >"$tmp/plain_sse41_call.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("sse4.1"))) __m128i sse41_max(__m128i a, __m128i b) { return _mm_max_epu32(a, b); }
+__m128i call_it(__m128i a, __m128i b) { return sse41_max(a, b); }
+EOF
+accept plain_sse41_call.c call -march=x86-64
+
+# A target-less always_inline wrapper hands the SSE4.1 requirement to its
+# callers (lccc's deferred-requirement design). A baseline caller is refused,
+# as GCC refuses it. The SSE4.1 caller is an lccc extension: GCC 16.2 refuses
+# that TU too (the wrapper's own body cannot inline `_mm_max_epu32`), so it is
+# accepted here without a GCC `compare`, like the nested_512 case above.
+cat >"$tmp/chain_plain.c" <<'EOF'
+#include <immintrin.h>
+static inline __attribute__((always_inline)) __m128i wrap_max(__m128i a, __m128i b) { return _mm_max_epu32(a, b); }
+__m128i chain_plain(__m128i a, __m128i b) { return wrap_max(a, b); }
+EOF
+cat >"$tmp/chain_sse41.c" <<'EOF'
+#include <immintrin.h>
+static inline __attribute__((always_inline)) __m128i wrap_max(__m128i a, __m128i b) { return _mm_max_epu32(a, b); }
+__attribute__((target("sse4.1"))) __m128i chain_sse41(__m128i a, __m128i b) { return wrap_max(a, b); }
+EOF
+reject chain_plain.c "inlining failed in call to 'always_inline'" -march=x86-64
+accept chain_sse41.c pmaxud -march=x86-64
+
 # The 32-bit target has the same rule and the same escape hatch: i686 has no
 # SSE4.2 by default, and `-msse4.2` is what grants it.
 reject crc.c -msse4.2 -m32
@@ -178,6 +346,14 @@ if ! command -v "$gcc_bin" >/dev/null 2>&1; then
     exit 0
 fi
 
+# Oracle comparisons for the SSE4.1 pmaxuw/pminuw and always_inline cases above.
+# Their fixtures are written in section 2; they run only once GCC is available.
+compare o_sse41_max.c -march=x86-64
+compare o_sse41_max.c -msse4.1
+compare o_sse41_min.c -msse4.1
+compare o_avx2_max.c -march=x86-64
+compare plain_sse41_call.c -march=x86-64
+
 cat >"$tmp/o_crc.c" <<'EOF'
 #include <nmmintrin.h>
 unsigned crc_u8(unsigned c, unsigned char x) { return _mm_crc32_u8(c, x); }
@@ -187,61 +363,6 @@ cat >"$tmp/o_aes.c" <<'EOF'
 __m128i aes_enc(__m128i a, __m128i b) { return _mm_aesenc_si128(a, b); }
 EOF
 
-# verdict <source> <flags...>: print "accept" or "reject" for compiler $1
-# verdict <compiler> <source> <flags...> -> accept | reject | host-gap
-#
-# The third answer exists because a failure only means "reject" when the
-# compiler actually got as far as deciding. An image without the 32-bit libc
-# headers cannot preprocess `<immintrin.h>` in `-m32` mode at all, and
-# collapsing that into "reject" made this gate claim agreement it never
-# measured (`ok: i686_ymm_int.c -m32 -mavx -mno-avx2 -> reject (gcc agrees)`)
-# and then report a real divergence where there was only a header gap
-# (`FAIL: i686_ymm_float.c with -m32 -mavx -mno-avx2: lccc accept, gcc
-# reject`) -- measured on the campaign image, where `gcc-16 -m32` and the
-# distro `gcc -m32` both stop at `bits/libc-header-start.h`. On a host with
-# the multilib installed the third answer never occurs, so no cell goes
-# unmeasured in CI.
-verdict() {
-    local cc=$1 src=$2
-    shift 2
-    local out rc
-    set +e
-    out=$("$cc" -O2 "$@" -c "$tmp/$src" -o /dev/null 2>&1)
-    rc=$?
-    set -e
-    if [ "$rc" -eq 0 ]; then
-        echo accept
-    elif grep -q 'fatal error: .*: No such file or directory' <<<"$out"; then
-        echo host-gap
-    else
-        echo reject
-    fi
-}
-
-host_gaps=0
-
-compare() {
-    local src=$1
-    shift
-    local ours theirs
-    ours=$(verdict "$ccc" "$src" "$@")
-    theirs=$(verdict "$gcc_bin" "$src" "$@")
-    if [ "$theirs" = host-gap ]; then
-        # The oracle could not preprocess the probe, so it has no verdict to
-        # compare against. Its own gap is not evidence about lccc.
-        host_gaps=$((host_gaps + 1))
-        echo "skip: $src $* -> lccc $ours; the oracle cannot preprocess this probe on this host"
-        return 0
-    fi
-    # The mirror case is NOT a host gap in the image: the oracle compiled the
-    # same probe, so lccc is the one that cannot find a header and that is a
-    # real defect.
-    [ "$ours" != host-gap ] ||
-        fail "$src with $*: lccc cannot preprocess the probe although gcc can"
-    [ "$ours" = "$theirs" ] ||
-        fail "$src with $*: lccc $ours, gcc $theirs (the oracle is the tie-breaker)"
-    echo "ok: $src $* -> $ours (gcc agrees)"
-}
 
 # Native packed integer operations are not baseline SSE2 merely because
 # their C arguments fit in 128 bits. Raw and public names share permission.
@@ -309,6 +430,13 @@ compare o_vpclmul256.c -march=x86-64-v3
 compare o_vpclmul256.c -march=x86-64-v3 -mvaes
 compare o_vpclmul256.c -march=x86-64-v3 -mvpclmulqdq
 compare o_vpclmul256.c -march=alderlake
+
+# AVX2 integer rows: GCC rejects the 256-bit integer forms under -mavx and
+# accepts them under -mavx2. The sources are the ones written above.
+compare o_avx2_max.c -mavx
+compare o_avx2_max.c -mavx2
+compare o_avx2_and.c -mavx
+compare o_avx2_and.c -mavx2
 
 # VAES and VPCLMULQDQ at 256 bits are VEX.256 forms whose class is AVX, not
 # AVX2 (measured gcc 14: `-mvaes -mno-avx2` and bare `-mvaes` accept the

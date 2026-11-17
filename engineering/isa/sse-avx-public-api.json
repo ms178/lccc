@@ -4727,11 +4727,10 @@
       "generic_helpers": [],
       "header": "smmintrin.h",
       "name": "_mm_max_epu16",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm_add_epi16",
-        "_mm_subs_epu16"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_pmaxuw128"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4796,11 +4795,10 @@
       "generic_helpers": [],
       "header": "smmintrin.h",
       "name": "_mm_min_epu16",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm_sub_epi16",
-        "_mm_subs_epu16"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_pminuw128"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4912,12 +4910,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_and_pd",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_and_si256",
-        "_mm256_castpd_si256",
-        "_mm256_castsi256_pd"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_andpd256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4931,12 +4927,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_and_ps",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_and_si256",
-        "_mm256_castps_si256",
-        "_mm256_castsi256_ps"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_andps256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4951,11 +4945,9 @@
       "header": "avxintrin.h",
       "name": "_mm256_andnot_pd",
       "raw_builtins": [
-        "__builtin_ia32_andnotsi256"
+        "__builtin_ia32_andnpd256"
       ],
-      "wrapper_dependencies": [
-        "_mm256_castpd_si256"
-      ]
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4970,11 +4962,9 @@
       "header": "avxintrin.h",
       "name": "_mm256_andnot_ps",
       "raw_builtins": [
-        "__builtin_ia32_andnotsi256"
+        "__builtin_ia32_andnps256"
       ],
-      "wrapper_dependencies": [
-        "_mm256_castps_si256"
-      ]
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -5423,12 +5413,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_or_pd",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_castpd_si256",
-        "_mm256_castsi256_pd",
-        "_mm256_or_si256"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_orpd256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -5442,12 +5430,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_or_ps",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_castps_si256",
-        "_mm256_castsi256_ps",
-        "_mm256_or_si256"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_orps256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -5700,12 +5686,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_xor_pd",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_castpd_si256",
-        "_mm256_castsi256_pd",
-        "_mm256_xor_si256"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_xorpd256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -5719,12 +5703,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_xor_ps",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_castps_si256",
-        "_mm256_castsi256_ps",
-        "_mm256_xor_si256"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_xorps256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -6430,8 +6412,7 @@
       "header": "avx2intrin.h",
       "name": "_mm256_max_epu16",
       "raw_builtins": [
-        "__builtin_ia32_paddw256",
-        "__builtin_ia32_psubusw256"
+        "__builtin_ia32_pmaxuw256"
       ],
       "wrapper_dependencies": []
     },
@@ -6516,8 +6497,7 @@
       "header": "avx2intrin.h",
       "name": "_mm256_min_epu16",
       "raw_builtins": [
-        "__builtin_ia32_psubusw256",
-        "__builtin_ia32_psubw256"
+        "__builtin_ia32_pminuw256"
       ],
       "wrapper_dependencies": []
     },

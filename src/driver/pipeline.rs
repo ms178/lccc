@@ -4796,6 +4796,16 @@ impl Driver {
         if let Some(diagnostic) = unsettled_x86_requirement(module) {
             return Err(format!("{input_file}: {diagnostic}"));
         }
+        if matches!(self.target, Target::X86_64 | Target::I686) {
+            if let Some(diagnostic) = always_inline_isa_mismatch(
+                module,
+                self.effective_x86_features().raw(),
+                self.x86_explicit_feature_bits(),
+                self.target == Target::X86_64,
+            ) {
+                return Err(format!("{input_file}: {diagnostic}"));
+            }
+        }
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
         // The codegen mode and the link mode are one decision. A FULL
@@ -4918,6 +4928,7 @@ impl Driver {
             avx512: self.enable_avx512f,
             avx512vl: self.enable_avx512f && self.enable_avx512vl,
             isa: self.x86_isa(),
+            i686_avx2: self.target == Target::I686 && self.enable_avx2,
             no_relax: self.riscv_no_relax,
             debug_info: self.debug_info,
             function_sections: self.function_sections,
@@ -5973,6 +5984,122 @@ fn unsettled_x86_requirement(module: &crate::ir::module::IrModule) -> Option<Str
         flags.join(" "),
         unsettled.name,
     ))
+}
+
+/// The first call that reaches an `always_inline` function whose `target(...)`
+/// options the calling function does not carry.
+///
+/// GCC refuses such a call at every optimization level: "inlining failed in
+/// call to 'always_inline': target specific option mismatch". lccc emitted a
+/// plain call instead, so `_mm_max_epu32` (`pmaxud`, SSE4.1) compiled into a
+/// baseline x86-64 caller and executed on hardware the flags name as lacking
+/// it (SIGILL).
+///
+/// Two rules, both from GCC's inliner:
+/// - A target-less `always_inline` wrapper hands its callees' requirements to
+///   its own callers, so the obligation is checked where a function that is
+///   not itself such a wrapper calls it (directly or through a chain of them).
+///   This keeps lccc's deferred-requirement design for the builtin-level checks.
+/// - A plain (non-inline) call to a target-attributed function is legal and
+///   stays a call; only `always_inline` edges are checked.
+fn always_inline_isa_mismatch(
+    module: &crate::ir::module::IrModule,
+    tu: u64,
+    tu_explicit: u64,
+    x86_64: bool,
+) -> Option<String> {
+    use crate::backend::x86::isa::function_feature_bits;
+    use crate::common::x86_features::X86Feature;
+    use crate::ir::instruction::Instruction;
+    use std::collections::HashMap;
+
+    let defined = || module.functions.iter().filter(|f| !f.is_declaration);
+    let by_name: HashMap<&str, &crate::ir::module::IrFunction> =
+        defined().map(|f| (f.name.as_str(), f)).collect();
+    let bits = |f: &crate::ir::module::IrFunction| {
+        function_feature_bits(tu, tu_explicit, &f.target_features, x86_64)
+    };
+    let wrapper =
+        |f: &crate::ir::module::IrFunction| f.is_always_inline && f.target_features.is_empty();
+    let calls = |f: &crate::ir::module::IrFunction| -> Vec<String> {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| match inst {
+                Instruction::Call { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Bits each target-less wrapper demands of its callers: fixed point over
+    // the wrapper call graph (bits only grow, so this terminates).
+    let mut demand: HashMap<&str, u64> = defined()
+        .filter(|f| wrapper(f))
+        .map(|f| (f.name.as_str(), 0))
+        .collect();
+    loop {
+        let mut changed = false;
+        for w in defined().filter(|f| wrapper(f)) {
+            let mut want = 0u64;
+            for callee in calls(w) {
+                if let Some(g) = by_name.get(callee.as_str()) {
+                    want |= if g.is_always_inline && !g.target_features.is_empty() {
+                        bits(g)
+                    } else if wrapper(g) {
+                        demand.get(g.name.as_str()).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
+                }
+            }
+            let slot = demand.entry(w.name.as_str()).or_insert(0);
+            if *slot | want != *slot {
+                *slot |= want;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for caller in defined().filter(|f| !wrapper(f)) {
+        let have = bits(caller);
+        for callee in calls(caller) {
+            let Some(g) = by_name.get(callee.as_str()) else {
+                continue;
+            };
+            if !g.is_always_inline {
+                continue;
+            }
+            let need = if g.target_features.is_empty() {
+                demand.get(g.name.as_str()).copied().unwrap_or(0)
+            } else {
+                bits(g)
+            };
+            let missing = need & !have;
+            if missing == 0 {
+                continue;
+            }
+            let names: Vec<&str> = X86Feature::ALL
+                .into_iter()
+                .filter(|&f| missing & (1 << f as u8) != 0)
+                .map(|f| f.name())
+                .collect();
+            let flags: Vec<String> = names.iter().map(|n| format!("-m{n}")).collect();
+            return Some(format!(
+                "in function '{}': inlining failed in call to 'always_inline' '{}': target \
+                 specific option mismatch; the callee requires {} ({}), which the requested \
+                 target does not have",
+                caller.name,
+                g.name,
+                names.join(", "),
+                flags.join(" "),
+            ));
+        }
+    }
+    None
 }
 
 fn first_target_attribute_leak(

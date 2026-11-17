@@ -938,11 +938,10 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Paddsb128 => (VecAddSatI8x16, IrType::I8, 16, Binary),
         Packsswb128 => (VecPacksswbI16x8, IrType::I16, 16, Binary),
         Punpcklbw128 => (VecUnpackLoI8x16, IrType::I8, 16, Binary),
-        // Unsigned 16-bit saturating subtract — the only SATURATING map op in
-        // the register set.  It is also what makes the missing `pminuw` /
-        // `pmaxuw` encodings expressible without one:
-        // `min(a,b) = a - subs_epu(a,b)` and `max(a,b) = b + subs_epu(a,b)`
-        // are exact for every lane (see include/smmintrin.h and
+        // Unsigned 16-bit saturating subtract, the only SATURATING map op in
+        // the register set.  `pminuw`/`pmaxuw` are no longer expressed
+        // through it: `_mm_min/max_epu16` and `_mm256_min/max_epu16` reach
+        // their own instructions (see include/smmintrin.h and
         // include/avx2intrin.h).
         Psubusw128 => (VecSubSatU16x8, IrType::I16, 16, Binary),
 

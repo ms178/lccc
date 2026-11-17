@@ -270,6 +270,10 @@ pub(crate) struct CodegenOptions {
     /// every VEX / SSE4.1 / FMA3 / ymm emission decision in the backend; see
     /// `x86::isa`).  `NONE` on non-x86-64 targets.
     pub(crate) isa: x86::isa::X86Isa,
+    /// AVX2 (ymm integer) permission for the i686 backend, which carries no
+    /// `isa` (its `x86_isa()` is NONE). Keys the AVX1-legal fallbacks of the
+    /// 256-bit splat and extract families. `false` on every other target.
+    pub(crate) i686_avx2: bool,
     /// Whether to suppress linker relaxation (-mno-relax, RISC-V only).
     /// When true, the codegen emits `.option norelax` at the top of the
     /// assembly output, which prevents the GNU assembler from generating

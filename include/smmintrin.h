@@ -125,28 +125,18 @@ _mm_min_epu32(__m128i __a, __m128i __b)
     return (__m128i)__builtin_ia32_pminud128((__v4su)(__a), (__v4su)(__b));
 }
 
-/* _mm_max_epu16: packed unsigned 16-bit max (PMAXUW).
- *
- * Identity, exact for every 16-bit lane without needing the SSE4.1-only
- * `pmaxuw` encoding to be present: let `t = subs_epu16(a, b)` (the
- * saturating unsigned difference, SSE2 `psubusw`).  Then `t` is `a - b`
- * when `a > b` and zero otherwise, so `b + t` is `max(a, b)` with no
- * intermediate that can wrap.  Both halves are single instructions. */
+/* _mm_max_epu16: packed unsigned 16-bit max (PMAXUW), one instruction. */
 static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
 _mm_max_epu16(__m128i __a, __m128i __b)
 {
-    return _mm_add_epi16(__b, _mm_subs_epu16(__a, __b));
+    return (__m128i)__builtin_ia32_pmaxuw128((__v8hi)(__a), (__v8hi)(__b));
 }
 
-/* _mm_min_epu16: packed unsigned 16-bit min (PMINUW).
- *
- * Same identity the other way round: `a - subs_epu16(a, b)` subtracts the
- * excess only where `a` exceeds `b`, so every lane ends up holding the
- * smaller of the two. */
+/* _mm_min_epu16: packed unsigned 16-bit min (PMINUW), one instruction. */
 static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
 _mm_min_epu16(__m128i __a, __m128i __b)
 {
-    return _mm_sub_epi16(__a, _mm_subs_epu16(__a, __b));
+    return (__m128i)__builtin_ia32_pminuw128((__v8hi)(__a), (__v8hi)(__b));
 }
 
 /* _mm_max_epi16: packed signed 16-bit max - already in SSE2 (PMAXSW)

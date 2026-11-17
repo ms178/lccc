@@ -425,22 +425,19 @@ _mm256_hsub_pd(__m256d __a, __m256d __b)
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_and_pd(__m256d __a, __m256d __b)
 {
-    return _mm256_castsi256_pd(
-        _mm256_and_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
+    return (__m256d)__builtin_ia32_andpd256((__v4df)(__a), (__v4df)(__b));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_or_pd(__m256d __a, __m256d __b)
 {
-    return _mm256_castsi256_pd(
-        _mm256_or_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
+    return (__m256d)__builtin_ia32_orpd256((__v4df)(__a), (__v4df)(__b));
 }
 
 static __inline__ __m256d __attribute__((__always_inline__))
 _mm256_xor_pd(__m256d __a, __m256d __b)
 {
-    return _mm256_castsi256_pd(
-        _mm256_xor_si256(_mm256_castpd_si256(__a), _mm256_castpd_si256(__b)));
+    return (__m256d)__builtin_ia32_xorpd256((__v4df)(__a), (__v4df)(__b));
 }
 
 /* The `andnot` forms are declared here as macros over the frontend builtin.
@@ -451,32 +448,27 @@ _mm256_xor_pd(__m256d __a, __m256d __b)
  * public inventory reporting them missing -- see
  * engineering/isa/sse-avx-public-api.json. */
 #define _mm256_andnot_ps(__a, __b) \
-    (__m256)__builtin_ia32_andnotsi256(_mm256_castps_si256(__a), \
-                                    _mm256_castps_si256(__b))
+    (__m256)__builtin_ia32_andnps256((__v8sf)(__a), (__v8sf)(__b))
 
 #define _mm256_andnot_pd(__a, __b) \
-    (__m256d)__builtin_ia32_andnotsi256(_mm256_castpd_si256(__a), \
-                                     _mm256_castpd_si256(__b))
+    (__m256d)__builtin_ia32_andnpd256((__v4df)(__a), (__v4df)(__b))
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_and_ps(__m256 __a, __m256 __b)
 {
-    return _mm256_castsi256_ps(
-        _mm256_and_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
+    return (__m256)__builtin_ia32_andps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_or_ps(__m256 __a, __m256 __b)
 {
-    return _mm256_castsi256_ps(
-        _mm256_or_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
+    return (__m256)__builtin_ia32_orps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_xor_ps(__m256 __a, __m256 __b)
 {
-    return _mm256_castsi256_ps(
-        _mm256_xor_si256(_mm256_castps_si256(__a), _mm256_castps_si256(__b)));
+    return (__m256)__builtin_ia32_xorps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
 /* === Movemask === */

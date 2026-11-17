@@ -926,3 +926,34 @@ mod fma_role_tests {
         }
     }
 }
+
+/// Mnemonic of the 256-to-128-bit integer lane extract. `vextracti128` is
+/// AVX2; its AVX1 twin `vextractf128` moves the same 128 bits with the same
+/// uops, so the AVX1 build uses it.
+pub(crate) fn vextract128_name(avx2: bool) -> &'static str {
+    if avx2 { "vextracti128" } else { "vextractf128" }
+}
+
+/// AVX1 replication of the scalar staged in the low `lane_bytes` of `%x` (a
+/// VEX.128 register) across all of `%x`, then the low half copied into the high
+/// half of `%y` (`y` names the same register as the ymm). Only AVX1 mnemonics:
+/// `vpbroadcast*` is AVX2. Returns the instruction lines, without staging.
+pub(crate) fn avx1_splat_xmm_lines(lane_bytes: u8, x: &str, y: &str) -> Vec<String> {
+    let mut lines = Vec::with_capacity(4);
+    match lane_bytes {
+        1 => {
+            lines.push(format!("    vpunpcklbw %{x}, %{x}, %{x}"));
+            lines.push(format!("    vpshuflw $0, %{x}, %{x}"));
+            lines.push(format!("    vpshufd $0, %{x}, %{x}"));
+        }
+        2 => {
+            lines.push(format!("    vpshuflw $0, %{x}, %{x}"));
+            lines.push(format!("    vpshufd $0, %{x}, %{x}"));
+        }
+        4 => lines.push(format!("    vpshufd $0, %{x}, %{x}")),
+        8 => lines.push(format!("    vpunpcklqdq %{x}, %{x}, %{x}")),
+        _ => unreachable!("AVX1 splat lane width {lane_bytes} is not 1, 2, 4 or 8"),
+    }
+    lines.push(format!("    vinsertf128 $1, %{x}, %{y}, %{y}"));
+    lines
+}

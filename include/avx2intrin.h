@@ -770,6 +770,7 @@ _mm256_packus_epi16(__m256i __a, __m256i __b)
 
 /* === Gather === */
 
+#if defined(__AVX2__)
 /* _mm256_i32gather_epi32: gather 32-bit ints using 32-bit indices (VPGATHERDD) */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_i32gather_epi32(int const *__base, __m256i __index, int __scale)
@@ -782,6 +783,7 @@ _mm256_i32gather_epi32(int const *__base, __m256i __index, int __scale)
         __pr[__i] = *(int *)(__b + (long long)__pi[__i] * __scale);
     return __r;
 }
+#endif /* __AVX2__ */
 
 
 /* === Cast / move between 128-bit and 256-bit === */
@@ -825,27 +827,21 @@ _mm256_subs_epu16(__m256i __a, __m256i __b)
 
 /* _mm256_max_epu16 / _mm256_min_epu16: packed unsigned 16-bit extrema.
  *
- * There is no `vpmaxuw`/`vpminuw` value form below AVX-512, so these are the
- * exact saturating-difference identities: with `t = subs_epu16(a, b)` (zero
- * where `a <= b`, `a - b` otherwise) the maximum is `b + t` and the minimum
- * is `a - t`.  Both intermediate values are in range by construction, so no
- * lane can wrap, and every step is a single instruction (`vpsubusw`,
- * `vpaddw`/`vpsubw`) that the backend already carries in register form.
+ * One `vpmaxuw` / `vpminuw` (AVX2) each, through the same builtins GCC 16.2
+ * uses.  Like the other AVX2 wrappers in this header the requirement is
+ * deferred to the caller, so a caller without AVX2 is diagnosed rather than
+ * handed a sequence that merely looks equivalent.
  */
-static __inline__ __m256i __attribute__((__always_inline__, target("avx2")))
+static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_max_epu16(__m256i __a, __m256i __b)
 {
-    return (__m256i)__builtin_ia32_paddw256(
-        (__v16hi)(__b),
-        (__v16hi)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b)));
+    return (__m256i)__builtin_ia32_pmaxuw256((__v16hi)(__a), (__v16hi)(__b));
 }
 
-static __inline__ __m256i __attribute__((__always_inline__, target("avx2")))
+static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_min_epu16(__m256i __a, __m256i __b)
 {
-    return (__m256i)__builtin_ia32_psubw256(
-        (__v16hi)(__a),
-        (__v16hi)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b)));
+    return (__m256i)__builtin_ia32_pminuw256((__v16hi)(__a), (__v16hi)(__b));
 }
 
 #endif /* _AVX2INTRIN_H_INCLUDED */

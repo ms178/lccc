@@ -1732,6 +1732,8 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecMulI16x8
             | O::VecMinI16x8
             | O::VecMaxI16x8
+            | O::VecMinU16x8
+            | O::VecMaxU16x8
             // BB-SLP families: the I64x2/I64x4 bitwise + add/sub chains
             // (emit_sse_binary_128 / emit_avx_binary_256 two-operand
             // forms), the byte/halfword bitwise, and the FP sub/div map
@@ -2042,6 +2044,8 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecCmpI16x8
             | O::VecMinI16x8
             | O::VecMaxI16x8
+            | O::VecMinU16x8
+            | O::VecMaxU16x8
             | O::VecBlendvI16x8
             | O::VecBroadcastI16x16
             | O::VecBroadcastI16x8
@@ -2583,6 +2587,8 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecMaxI8x16
         | O::VecMinI16x8
         | O::VecMaxI16x8
+        | O::VecMinU16x8
+        | O::VecMaxU16x8
         | O::VecSminI32x4
         | O::VecMinU32x4
         | O::VecMaxU32x4

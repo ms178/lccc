@@ -1149,6 +1149,12 @@ pub enum IntrinsicOp {
     VecMaxI16x16,
     /// SSE2 lane-wise signed word max: 8×I16 (`pmaxsw`).
     VecMaxI16x8,
+    /// SSE4.1 lane-wise unsigned word min: 8×U16 (`pminuw`), the 128-bit
+    /// twin of `VecMinU16x16`.
+    VecMinU16x8,
+    /// SSE4.1 lane-wise unsigned word max: 8×U16 (`pmaxuw`), the 128-bit
+    /// twin of `VecMaxU16x16`.
+    VecMaxU16x8,
     /// AVX2 lane-wise UNSIGNED word min: 16×U16 (`vpminuw`) -- SSE4.1, so
     /// AVX2-only; the 128-bit path keeps compare+blend.
     VecMinU16x16,
@@ -1568,6 +1574,20 @@ pub enum IntrinsicOp {
     Extracti128,
     Setzero256,
     AddPs256,
+    /// Bitwise FP logic on 8xF32 / 4xF64 lanes, AVX (VEX.256) only.
+    /// Pure bit operations: no NaN canonicalisation, no signed-zero merge.
+    /// `AndNot` computes `~args[0] & args[1]` (the VANDNPS/VANDNPD
+    /// operand order, which is not commutative). Domain-typed: the `ps`
+    /// forms are `vand/or/xorps` and the `pd` forms `vand/or/xorpd`, so
+    /// float data never crosses the integer or domain bypass network.
+    AndPs256,
+    OrPs256,
+    XorPs256,
+    AndNotPs256,
+    AndPd256,
+    OrPd256,
+    XorPd256,
+    AndNotPd256,
     SubPs256,
     MulPs256,
     AddPd256,
@@ -2367,6 +2387,8 @@ impl IntrinsicOp {
             | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
             | Setzero256 | AddPs256 | SubPs256 | MulPs256 | AddPd256
             | SubPd256 | MulPd256
+            | AndPs256 | OrPs256 | XorPs256 | AndNotPs256
+            | AndPd256 | OrPd256 | XorPd256 | AndNotPd256
             // Explicit AVX FP producers use the same 32-byte result homes
             // as add/mul. Omitting them leaves private min/max/compare
             // temporaries opaque to promotion and alignment relaxation.
@@ -2476,6 +2498,8 @@ impl IntrinsicOp {
             | VecCmpI16x8
             | VecMinI16x8
             | VecMaxI16x8
+            | VecMinU16x8
+            | VecMaxU16x8
             | VecBlendvI16x8
             | VecBroadcastI16x8
             // BB-SLP 128-bit packed lane shifts (word/dword/qword).
@@ -2664,6 +2688,8 @@ impl IntrinsicOp {
             | IntrinsicOp::VecMaxU16x16
             | IntrinsicOp::VecMinI16x8
             | IntrinsicOp::VecMaxI16x8
+            | IntrinsicOp::VecMinU16x8
+            | IntrinsicOp::VecMaxU16x8
             | IntrinsicOp::VecHorizontalMaxI32x8
             | IntrinsicOp::VecHorizontalMinI32x8
         ) ||
@@ -3012,6 +3038,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecCmpI16x8
                 | IntrinsicOp::VecMinI16x8
                 | IntrinsicOp::VecMaxI16x8
+                | IntrinsicOp::VecMinU16x8
+                | IntrinsicOp::VecMaxU16x8
                 | IntrinsicOp::VecBlendvI16x8
                 | IntrinsicOp::VecBroadcastI16x8
                 // BB-SLP packed lane shifts (both widths; pure compute,
@@ -3669,9 +3697,11 @@ mod vector_width_tests {
             "VecCmpI16x8" => IntrinsicOp::VecCmpI16x8,
             "VecMaxI16x16" => IntrinsicOp::VecMaxI16x16,
             "VecMaxI16x8" => IntrinsicOp::VecMaxI16x8,
+            "VecMaxU16x8" => IntrinsicOp::VecMaxU16x8,
             "VecMaxU16x16" => IntrinsicOp::VecMaxU16x16,
             "VecMinI16x16" => IntrinsicOp::VecMinI16x16,
             "VecMinI16x8" => IntrinsicOp::VecMinI16x8,
+            "VecMinU16x8" => IntrinsicOp::VecMinU16x8,
             "VecMinU16x16" => IntrinsicOp::VecMinU16x16,
             "VecMulI16x16" => IntrinsicOp::VecMulI16x16,
             "VecMulI16x8" => IntrinsicOp::VecMulI16x8,
@@ -4326,6 +4356,10 @@ mod unsigned_dword_minmax_contract_tests {
             (IntrinsicOp::VecMaxU32x4, 16),
             (IntrinsicOp::VecMinU32x8, 32),
             (IntrinsicOp::VecMaxU32x8, 32),
+            (IntrinsicOp::VecMinU16x8, 16),
+            (IntrinsicOp::VecMaxU16x8, 16),
+            (IntrinsicOp::VecMinU16x16, 32),
+            (IntrinsicOp::VecMaxU16x16, 32),
         ] {
             assert_eq!(op.vector_result_width(), Some(width));
             assert_eq!(op.vector_home_width(), Some(width));
