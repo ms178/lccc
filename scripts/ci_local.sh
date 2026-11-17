@@ -1553,6 +1553,10 @@ cargo_test_dbgassert() {
 }
 gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
 
+# Static lint over the regression fixtures: an ISA-gated intrinsic must have
+# its ISA in the fixture flags (mirrors the hosted debug-job step).
+gate "isa-fixture-flags" fast python3 tests/regression/check_isa_fixture_flags.py
+
 # CCC_VALIDATE_SSA is what CI sets; without it the corpus does not verify SSA
 # form after every pass and a malformed-IR bug can hide behind a correct
 # result.
