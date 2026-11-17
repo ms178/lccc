@@ -3587,6 +3587,23 @@ impl Lowerer {
         name: &str,
         args: &[Expr],
     ) -> Option<Operand> {
+        // One-bit lane immediates must be a constant 0 or 1 (see
+        // `x86_lane_immediate_bits`). The check runs before any operand is
+        // lowered, so a rejected call leaves no half-built expressions.
+        if let Some(bits) = x86_lane_immediate_bits(intrinsic) {
+            let in_range = args
+                .last()
+                .and_then(|arg| self.eval_const_expr(arg))
+                .and_then(|value| value.to_i64())
+                .is_some_and(|value| (0..(1i64 << bits)).contains(&value));
+            if !in_range {
+                return self.reject_builtin_call(
+                    format!("the last argument to '{name}' must be an {bits}-bit immediate"),
+                    args,
+                    16,
+                );
+            }
+        }
         // AUD-SILENT-ZERO-1: an x86-only intrinsic compiled for a foreign
         // target used to lower to a silently zeroed result in the ARM/RISC-V
         // backends -- a wrong answer instead of a rejection.  GCC rejects the
@@ -3944,6 +3961,20 @@ impl Lowerer {
                 .map_or(PrefetchArg::NotConstant, |v| PrefetchArg::Value(v as i128)),
             None => PrefetchArg::NotConstant,
         }
+    }
+}
+
+/// Width in bits of the lane-select immediate of a builtin whose instruction
+/// encodes only one bit of it. GCC 16.2 rejects any other value ("the last
+/// argument must be an 1-bit immediate"). The operand lowering masks the
+/// immediate (`& 1`), so without this check an out-of-range constant compiled
+/// to the wrong lane and a runtime value compiled to lane 0, with no diagnostic.
+fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
+    match intrinsic {
+        BuiltinIntrinsic::X86Extracti128
+        | BuiltinIntrinsic::X86Vextractf128V
+        | BuiltinIntrinsic::X86Insert128to256 => Some(1),
+        _ => None,
     }
 }
 

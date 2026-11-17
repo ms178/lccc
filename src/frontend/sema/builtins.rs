@@ -2140,6 +2140,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256),
     );
     m.insert(
+        "__builtin_ia32_insert128i256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256),
+    );
+    m.insert(
         "_mm256_set1_epi8",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi8_256),
     );
@@ -2672,20 +2676,8 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256),
     );
     m.insert(
-        "__builtin_ia32_vinserti128",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256),
-    );
-    m.insert(
-        "__builtin_ia32_vextracti128",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cast256to128),
-    );
-    m.insert(
         "__builtin_ia32_vbroadcasti128",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Broadcast128to256),
-    );
-    m.insert(
-        "__builtin_ia32_inserti128",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256),
     );
     m.insert(
         "__builtin_ia32_extracti128",
@@ -2991,6 +2983,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm256_extracti128_si256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128),
+    );
+    m.insert(
+        "__builtin_ia32_extract128i256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128),
     );
     m.insert(

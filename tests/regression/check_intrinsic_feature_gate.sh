@@ -294,6 +294,25 @@ reject epi16_256.c avx2 -mavx
 reject epi16_256.c avx2 -m32 -mavx
 accept epi16_256.c vpmaxsw -mavx2
 accept epi16_256.c vpminsw -m32 -mavx2
+# One-bit lane immediates: GCC 16.2 rejects a value other than 0 or 1, and a
+# runtime index. lccc used to mask the immediate and compile to lane 0 silently.
+cat >"$tmp/lane_imm.c" <<'SRC'
+#include <immintrin.h>
+__m128i ext_const2(__m256i a) { return _mm256_extracti128_si256(a, 2); }
+SRC
+cat >"$tmp/lane_idx.c" <<'SRC'
+#include <immintrin.h>
+__m256i ins_var(__m256i a, __m128i b, int k) { return _mm256_inserti128_si256(a, b, k); }
+SRC
+reject lane_imm.c 'must be an 1-bit immediate' -mavx2
+reject lane_idx.c 'must be an 1-bit immediate' -mavx2
+# Lane builtins GCC does not define must stay undeclared (no silent alias).
+cat >"$tmp/lane_alias.c" <<'SRC'
+typedef long long v4di __attribute__((vector_size(32)));
+#include <immintrin.h>
+void f(void) { (void)&__builtin_ia32_vextracti128; }
+SRC
+reject lane_alias.c '__builtin_ia32_vextracti128' -mavx2
 # The saturating-difference identity must not come back on i686.
 for f in i686_u16_256.c i686_u16_128.c; do
     if "$ccc" -O2 -m32 -mavx2 -S "$tmp/$f" -o "$tmp/$f.s" 2>/dev/null &&
