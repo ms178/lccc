@@ -1529,6 +1529,8 @@ impl Lowerer {
                                     | "__builtin_ia32_minps"
                                     | "__builtin_ia32_shufps"
                                     | "__builtin_ia32_vextractf128_ps256"
+                                    | "__builtin_ia32_vextractf128_pd256"
+                                    | "__builtin_ia32_vextractf128_si256"
                             ) {
                                 let slot = self.fresh_value();
                                 self.emit(Instruction::Alloca {

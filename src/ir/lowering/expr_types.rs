@@ -672,6 +672,8 @@ impl Lowerer {
             | "__builtin_ia32_minps"
             | "__builtin_ia32_shufps"
             | "__builtin_ia32_vextractf128_ps256"
+            | "__builtin_ia32_vextractf128_pd256"
+            | "__builtin_ia32_vextractf128_si256"
                 if self.target == crate::backend::Target::I686 =>
             {
                 Some(IrType::Ptr)
@@ -679,13 +681,18 @@ impl Lowerer {
             "__builtin_ia32_maxps"
             | "__builtin_ia32_minps"
             | "__builtin_ia32_shufps"
-            | "__builtin_ia32_vextractf128_ps256" => Some(IrType::I128),
+            | "__builtin_ia32_vextractf128_ps256"
+            | "__builtin_ia32_vextractf128_pd256"
+            | "__builtin_ia32_vextractf128_si256" => Some(IrType::I128),
             // 256-bit raw builtins return v8sf, which lccc represents as a
             // POINTER to the 32-byte result slot everywhere (sret convention).
             "__builtin_ia32_maxps256"
             | "__builtin_ia32_minps256"
             | "__builtin_ia32_andps256"
-            | "__builtin_ia32_cmpps256" => Some(IrType::Ptr),
+            | "__builtin_ia32_cmpps256"
+            | "__builtin_ia32_vinsertf128_ps256"
+            | "__builtin_ia32_vinsertf128_pd256"
+            | "__builtin_ia32_vinsertf128_si256" => Some(IrType::Ptr),
             // I/O builtins return int
             "__builtin_printf" | "__builtin_fprintf" | "__builtin_sprintf"
             | "__builtin_snprintf" | "__builtin_puts" | "__builtin_putchar" => Some(IrType::I32),

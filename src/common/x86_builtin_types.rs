@@ -71,6 +71,7 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_orpd"
         | "__builtin_ia32_subpd"
         | "__builtin_ia32_subsd"
+        | "__builtin_ia32_vextractf128_pd256"
         | "__builtin_ia32_xorpd" => CType::Vector(Box::new(CType::Double), 16),
         "__builtin_ia32_addpd256"
         | "__builtin_ia32_andnpd256"
@@ -79,6 +80,7 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_mulpd256"
         | "__builtin_ia32_orpd256"
         | "__builtin_ia32_subpd256"
+        | "__builtin_ia32_vinsertf128_pd256"
         | "__builtin_ia32_xorpd256" => CType::Vector(Box::new(CType::Double), 32),
         "__builtin_ia32_addps"
         | "__builtin_ia32_addss"
@@ -108,6 +110,7 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_mulps256"
         | "__builtin_ia32_orps256"
         | "__builtin_ia32_subps256"
+        | "__builtin_ia32_vinsertf128_ps256"
         | "__builtin_ia32_xorps256" => CType::Vector(Box::new(CType::Float), 32),
         "__builtin_ia32_pabsd128"
         | "__builtin_ia32_paddd128"
@@ -130,6 +133,7 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_psubd128"
         | "__builtin_ia32_punpckhdq128"
         | "__builtin_ia32_punpckldq128"
+        | "__builtin_ia32_vextractf128_si256"
         | "__builtin_ia32_vpdpbssd128"
         | "__builtin_ia32_vpdpbssds128"
         | "__builtin_ia32_vpdpbsud128"
@@ -163,6 +167,7 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_psubd256"
         | "__builtin_ia32_punpckhdq256"
         | "__builtin_ia32_punpckldq256"
+        | "__builtin_ia32_vinsertf128_si256"
         | "__builtin_ia32_vpdpbssd256"
         | "__builtin_ia32_vpdpbssds256"
         | "__builtin_ia32_vpdpbsud256"
@@ -493,7 +498,12 @@ pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_psrldqi256"
         | "__builtin_ia32_psrlqi256"
         | "__builtin_ia32_psrlwi256"
-        | "__builtin_ia32_vextractf128_ps256" => &[32, 0],
+        | "__builtin_ia32_vextractf128_pd256"
+        | "__builtin_ia32_vextractf128_ps256"
+        | "__builtin_ia32_vextractf128_si256" => &[32, 0],
+        "__builtin_ia32_vinsertf128_pd256"
+        | "__builtin_ia32_vinsertf128_ps256"
+        | "__builtin_ia32_vinsertf128_si256" => &[32, 16, 0],
         "__builtin_ia32_addpd256"
         | "__builtin_ia32_addps256"
         | "__builtin_ia32_andnotsi256"
@@ -621,7 +631,9 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_psrlqi256"
         | "__builtin_ia32_psrlwi128"
         | "__builtin_ia32_psrlwi256"
-        | "__builtin_ia32_vextractf128_ps256" => &[None, Some(IrType::I32)],
+        | "__builtin_ia32_vextractf128_pd256"
+        | "__builtin_ia32_vextractf128_ps256"
+        | "__builtin_ia32_vextractf128_si256" => &[None, Some(IrType::I32)],
         "__builtin_ia32_movnti64" => &[None, Some(IrType::I64)],
         "__builtin_ia32_movntq" => &[None, Some(IrType::U64)],
         "__builtin_ia32_addpd"
@@ -805,7 +817,10 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_palignr128"
         | "__builtin_ia32_pblendw128"
         | "__builtin_ia32_pclmulqdq128"
-        | "__builtin_ia32_shufps" => &[None, None, Some(IrType::I32)],
+        | "__builtin_ia32_shufps"
+        | "__builtin_ia32_vinsertf128_pd256"
+        | "__builtin_ia32_vinsertf128_ps256"
+        | "__builtin_ia32_vinsertf128_si256" => &[None, None, Some(IrType::I32)],
         "__builtin_ia32_pblendvb128"
         | "__builtin_ia32_vpdpbssd128"
         | "__builtin_ia32_vpdpbssd256"

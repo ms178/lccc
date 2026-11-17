@@ -1703,6 +1703,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Zext128to256
             | BuiltinIntrinsic::X86Cast256to128
             | BuiltinIntrinsic::X86Insert128to256
+            | BuiltinIntrinsic::X86Vinsertf128
             | BuiltinIntrinsic::X86SetEpi8_256
             | BuiltinIntrinsic::X86SetEpi16_256
             | BuiltinIntrinsic::X86SetEpi32_256
@@ -3973,7 +3974,8 @@ fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
     match intrinsic {
         BuiltinIntrinsic::X86Extracti128
         | BuiltinIntrinsic::X86Vextractf128V
-        | BuiltinIntrinsic::X86Insert128to256 => Some(1),
+        | BuiltinIntrinsic::X86Insert128to256
+        | BuiltinIntrinsic::X86Vinsertf128 => Some(1),
         _ => None,
     }
 }
@@ -4051,6 +4053,7 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Broadcast128to256
         | BuiltinIntrinsic::X86Zext128to256
         | BuiltinIntrinsic::X86Insert128to256
+        | BuiltinIntrinsic::X86Vinsertf128
         | BuiltinIntrinsic::X86SetEpi8_256
         | BuiltinIntrinsic::X86SetEpi16_256
         | BuiltinIntrinsic::X86SetEpi32_256
@@ -4471,6 +4474,13 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             flag: "-mavx",
             also: None,
         },
+        // AVX1 128-bit lane moves. GCC gates both on -mavx; without this arm
+        // lccc accepted them under the baseline ISA.
+        B::X86Vextractf128V | B::X86Vinsertf128 => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
         // Public headers must not silently introduce SSSE3 above a declared
         // SSE2 ceiling. Include the raw builtin aliases in this same gate.
         B::X86Pmaddubsw128
@@ -4647,6 +4657,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86ShufPsValue => IntrinsicOp::ShufPs128,
         BuiltinIntrinsic::X86CvtPd2PsValue => IntrinsicOp::CvtPd2Ps128,
         BuiltinIntrinsic::X86Vextractf128V => IntrinsicOp::Vextractf128,
+        BuiltinIntrinsic::X86Vinsertf128 => IntrinsicOp::Vinsertf128,
         BuiltinIntrinsic::X86MaxPs256V => IntrinsicOp::MaxPs256,
         BuiltinIntrinsic::X86MinPs256V => IntrinsicOp::MinPs256,
         // Bitwise FP logic keeps its own typed op: the AVX1 `vandps`/`vandpd`

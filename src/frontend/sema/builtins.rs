@@ -1871,6 +1871,26 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vextractf128V),
     );
     m.insert(
+        "__builtin_ia32_vextractf128_pd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vextractf128V),
+    );
+    m.insert(
+        "__builtin_ia32_vextractf128_si256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vextractf128V),
+    );
+    m.insert(
+        "__builtin_ia32_vinsertf128_ps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vinsertf128),
+    );
+    m.insert(
+        "__builtin_ia32_vinsertf128_pd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vinsertf128),
+    );
+    m.insert(
+        "__builtin_ia32_vinsertf128_si256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vinsertf128),
+    );
+    m.insert(
         "__builtin_ia32_vzeroupper",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vzeroupper),
     );
@@ -4063,6 +4083,9 @@ pub enum BuiltinIntrinsic {
     X86Zext128to256,
     X86Cast256to128,
     X86Insert128to256,
+    /// AVX1 `vinsertf128`: a 256-bit value with one 128-bit half replaced.
+    /// Distinct from `X86Insert128to256`, which is the AVX2 `vinserti128`.
+    X86Vinsertf128,
     X86SetEpi8_256,
     X86SetEpi16_256,
     X86SetEpi32_256,
