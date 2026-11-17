@@ -870,3 +870,57 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::result_type;
+    use crate::common::types::CType;
+
+    /// The 128-bit lane extracts return a 16-byte vector and the 256-bit lane
+    /// inserts return a 32-byte vector. `builtin_return_type` relies on
+    /// `result_type` for these names (it returns before consulting any other
+    /// table), so each must have exactly this width. A missing or wrongly
+    /// sized entry would silently change the ABI type of the call result.
+    #[test]
+    fn lane_builtins_have_result_types_of_the_architectural_width() {
+        let extracts = [
+            "__builtin_ia32_vextractf128_ps256",
+            "__builtin_ia32_vextractf128_pd256",
+            "__builtin_ia32_vextractf128_si256",
+        ];
+        for name in extracts {
+            assert!(
+                matches!(result_type(name), Some(CType::Vector(_, 16))),
+                "{name} must return a 16-byte vector"
+            );
+        }
+        let inserts = [
+            "__builtin_ia32_vinsertf128_ps256",
+            "__builtin_ia32_vinsertf128_pd256",
+            "__builtin_ia32_vinsertf128_si256",
+        ];
+        for name in inserts {
+            assert!(
+                matches!(result_type(name), Some(CType::Vector(_, 32))),
+                "{name} must return a 32-byte vector"
+            );
+        }
+    }
+
+    /// The 128-bit raw builtins that used to be duplicated in
+    /// `builtin_return_type` must stay typed here, or their call results
+    /// would fall through to the generic path.
+    #[test]
+    fn wide_raw_builtins_keep_their_result_types() {
+        for name in [
+            "__builtin_ia32_maxps",
+            "__builtin_ia32_minps",
+            "__builtin_ia32_shufps",
+        ] {
+            assert!(
+                matches!(result_type(name), Some(CType::Vector(_, 16))),
+                "{name} must return a 16-byte vector"
+            );
+        }
+    }
+}
