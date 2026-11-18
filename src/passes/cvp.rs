@@ -1284,6 +1284,61 @@ fn promote_guarded_counts(func: &mut IrFunction) -> usize {
     promoted.len()
 }
 
+/// Fold the terminator of `blk` under the active facts: a decided conditional
+/// branch becomes unconditional, and a switch loses the cases its selector
+/// cannot take. Returns the number of terminators changed (0 or 1).
+///
+/// Both folds delete CFG edges, so both obey one rule for the phi inputs those
+/// edges carried: an input stays when an `asm goto` in the same block still
+/// jumps to that successor. That jump is taken inside the asm, before the
+/// terminator is reached, whatever the terminator has been folded to.
+fn fold_terminator(
+    func: &mut IrFunction,
+    blk: usize,
+    stack: &[Fact],
+    defs: &FxHashMap<Value, (usize, usize)>,
+    defined_syms: &FxHashSet<String>,
+    asm_edges: &FxHashSet<(usize, BlockId)>,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> usize {
+    let this_label = func.blocks[blk].label;
+    let drop_edge = |func: &mut IrFunction, target: BlockId| {
+        if !asm_edges.contains(&(blk, target))
+            && let Some(&di) = label_to_idx.get(&target)
+        {
+            remove_phi_incoming(func, di, this_label);
+        }
+    };
+    let decided = match &func.blocks[blk].terminator {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } if true_label != false_label => {
+            decide_bool(stack, func, defs, defined_syms, cond).map(|t| {
+                if t {
+                    (*true_label, *false_label)
+                } else {
+                    (*false_label, *true_label)
+                }
+            })
+        }
+        _ => None,
+    };
+    if let Some((keep, drop)) = decided {
+        func.blocks[blk].terminator = Terminator::Branch(keep);
+        drop_edge(func, drop);
+        1
+    } else if let Some(dropped) = prune_switch_cases(&mut func.blocks[blk].terminator, stack) {
+        for target in dropped {
+            drop_edge(func, target);
+        }
+        1
+    } else {
+        0
+    }
+}
+
 pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet<String>) -> usize {
     // Straight-line functions have no predicates to propagate, but the
     // definition-based zero-guard proof below needs no CFG at all: run it first
@@ -1526,44 +1581,15 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
                 }
                 i += 1;
             }
-            let decided = match &func.blocks[blk].terminator {
-                Terminator::CondBranch {
-                    cond,
-                    true_label,
-                    false_label,
-                } if true_label != false_label => {
-                    decide_bool(&stack, func, &defs, defined_syms, cond).map(|t| {
-                        if t {
-                            (*true_label, *false_label)
-                        } else {
-                            (*false_label, *true_label)
-                        }
-                    })
-                }
-                _ => None,
-            };
-            if let Some((keep, drop)) = decided {
-                let this_label = func.blocks[blk].label;
-                if !asm_edges.contains(&(blk, drop))
-                    && let Some(&di) = label_to_idx.get(&drop)
-                {
-                    remove_phi_incoming(func, di, this_label);
-                }
-                func.blocks[blk].terminator = Terminator::Branch(keep);
-                changes += 1;
-            } else if let Some(dropped) =
-                prune_switch_cases(&mut func.blocks[blk].terminator, &stack)
-            {
-                let this_label = func.blocks[blk].label;
-                for target in dropped {
-                    if !asm_edges.contains(&(blk, target))
-                        && let Some(&di) = label_to_idx.get(&target)
-                    {
-                        remove_phi_incoming(func, di, this_label);
-                    }
-                }
-                changes += 1;
-            }
+            changes += fold_terminator(
+                func,
+                blk,
+                &stack,
+                &defs,
+                defined_syms,
+                &asm_edges,
+                &label_to_idx,
+            );
             // Singleton substitution (see `substitute_singletons`) runs LAST:
             // the folds above decide compares, selects and branches from
             // `Value` operands, and a compare whose operand had already been
