@@ -33,7 +33,7 @@
 #     `-DMOLD_TARGETS=` preset were removed upstream.  The equivalent
 #     x86-only preset is Cargo's per-target feature set in cli/Cargo.toml:
 #     `cargo build --release -p mold-cli --no-default-features
-#      --features x86_64,i386`.  Each target is a separate crate, so
+#      --features x86_64,i386,system-allocator`. Each target is a separate crate, so
 #     restricting it to the two x86 ELF targets drops the other eighteen
 #     target crates from the build.  Then ./install-mold.sh installs bin/
 #     plus lib/mold/mold-wrapper.so and the libexec/mold/ld sibling.
@@ -89,6 +89,14 @@ MOLD_FEATURES='x86_64,i386,system-allocator'
 # source = the -C target-cpu=native, system-allocator research build,
 #          required when the oracle is used for LINK TIMING.
 MOLD_PREFER="${MOLD_PREFER:-cache}"
+case $MOLD_PREFER in
+    cache|source) ;;
+    *) printf 'invalid MOLD_PREFER: %s (expected cache or source)\n' "$MOLD_PREFER" >&2; exit 2 ;;
+esac
+# The mode is part of the install/archive key. A warm functional-test cache
+# must never satisfy an explicitly requested native timing build.
+mold_cache="mold-$MOLD_VER-release"
+mold_source="mold-$MOLD_VER-x86-native"
 LLD_MAJOR=23
 LLD_MINOR_PIN=23.1
 WITH_WILD="${WITH_WILD:-1}"
@@ -132,7 +140,6 @@ restore_cached "bfd-$BINUTILS_VER" bin/ld || need git python3
 [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
 # cargo/cc are only needed for the source fallback below, not for the
 # verified-cache path; requiring them here broke cache-only hosts.
-restore_cached "mold-$MOLD_VER" bin/mold || true
 if [ "$WITH_WILD" = 1 ]; then
     # rustup installs cargo outside the default PATH.
     [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
@@ -172,41 +179,44 @@ fi
 
 oracle_require_version "$PREFIX/bfd-$BINUTILS_VER/bin/ld" "$BINUTILS_VER"
 
-# ── mold 3.0.0 (Rust build; upstream defaults, self-contained binary) ──────
-if [ -x "$PREFIX/mold-$MOLD_VER/bin/mold" ]; then
-    mold_build_receipt="existing binary; build features not re-probed"
-    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (restored from $ARTIFACTS)"
-elif [ "$MOLD_PREFER" = cache ] && \
+# ── mold 3.0.0 ──────────────────────────────────────────────────────────────
+if [[ "$MOLD_PREFER" == cache ]] &&
+   { restore_cached "$mold_cache" bin/mold ||
      PATH="$PREFIX/bfd-$BINUTILS_VER/bin:$PATH" \
-     bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$PREFIX/mold-$MOLD_VER"; then
-    mold_build_receipt="upstream release v$MOLD_VER (agent cache, digest-pinned); elf_i386+elf_x86_64 probed"
-    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (verified cache binary)"
+       bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$PREFIX/$mold_cache"; }; then
+    mold_install=$mold_cache
+    mold_build_receipt="digest-pinned release cache v$MOLD_VER (x86 ELF targets probed on install)"
 else
-    need cargo cc
-    TARBALL="$SRC/mold-$MOLD_VER.tar.gz"
-    [ -f "$TARBALL" ] || { note "mold  : fetching mold $MOLD_VER"; \
-        curl -fsSL -o "$TARBALL" "https://github.com/rui314/mold/archive/refs/tags/v$MOLD_VER.tar.gz"; }
-    MT="$SRC/mold-$MOLD_VER"
-    rm -rf "$MT"; tar -xzf "$TARBALL" -C "$SRC"
-    ( cd "$MT"
-      # mold 3.x has no CMake/MOLD_TARGETS: one Cargo feature per target
-      # (cli/Cargo.toml).  -C target-cpu=native is the Rust spelling of
-      # the oracles' -march=native policy.
-      RUSTFLAGS='-C target-cpu=native' \
-      cargo build --release --locked -j "$JOBS" -p mold-cli \
-            --no-default-features --features "$MOLD_FEATURES"
-      PREFIX="$PREFIX/mold-$MOLD_VER" ./install-mold.sh
-      strip "$PREFIX/mold-$MOLD_VER/bin/mold" 2>/dev/null || true )
-    rm -rf "$MT"
-    cache_prefix "mold-$MOLD_VER"
-    mold_build_receipt="cargo features $MOLD_FEATURES"
-    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, features $MOLD_FEATURES)"
+    mold_install=$mold_source
+    if ! restore_cached "$mold_install" bin/mold; then
+        need cargo cc
+        TARBALL="$SRC/mold-$MOLD_VER.tar.gz"
+        [ -f "$TARBALL" ] || { note "mold  : fetching mold $MOLD_VER"; \
+            curl -fsSL -o "$TARBALL" "https://github.com/rui314/mold/archive/refs/tags/v$MOLD_VER.tar.gz"; }
+        MT="$SRC/mold-$MOLD_VER"
+        rm -rf "$MT"; tar -xzf "$TARBALL" -C "$SRC"
+        ( cd "$MT"
+          RUSTFLAGS='-C target-cpu=native' \
+          cargo build --release --locked -j "$JOBS" -p mold-cli \
+                --no-default-features --features "$MOLD_FEATURES"
+          PREFIX="$PREFIX/$mold_install" ./install-mold.sh
+          strip "$PREFIX/$mold_install/bin/mold" 2>/dev/null || true )
+        rm -rf "$MT"
+        oracle_require_version "$PREFIX/$mold_install/bin/mold" "$MOLD_VER"
+        cache_prefix "$mold_install"
+    fi
+    mold_build_receipt="native source v$MOLD_VER; features=$MOLD_FEATURES; target-cpu=native"
 fi
-
-oracle_require_version "$PREFIX/mold-$MOLD_VER/bin/mold" "$MOLD_VER"
+mold_bin="$PREFIX/$mold_install/bin/mold"
+oracle_require_version "$mold_bin" "$MOLD_VER"
+note "mold  : $("$mold_bin" --version) ($mold_build_receipt)"
 
 # ── LLVM lld 23.1.x (apt.llvm.org release build) ───────────────────────────
-LLD_BIN=/usr/bin/ld.lld-$LLD_MAJOR
+if [[ -n ${LLD_BIN:-} && ( $LLD_BIN != /* || ! -x $LLD_BIN ) ]]; then
+    note "lld   : LLD_BIN must be an absolute executable path ($LLD_BIN)"
+    exit 1
+fi
+LLD_BIN=${LLD_BIN:-/usr/bin/ld.lld-$LLD_MAJOR}
 if [ ! -x "$LLD_BIN" ]; then
     codename=$( . /etc/os-release && echo "${VERSION_CODENAME:-}" )
     [ -n "$codename" ] || { note "lld   : cannot determine distro codename"; exit 1; }
@@ -220,11 +230,14 @@ if [ ! -x "$LLD_BIN" ]; then
         -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 >/dev/null
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "lld-$LLD_MAJOR" >/dev/null
 fi
-lld_banner=$("$LLD_BIN" --version | head -1)
-case "$lld_banner" in
-    *" $LLD_MINOR_PIN."*) note "lld   : $lld_banner" ;;
-    *) note "lld   : version pin violated (want $LLD_MINOR_PIN.*): $lld_banner"; exit 1 ;;
-esac
+lld_banner=$("$LLD_BIN" --version)
+lld_banner=${lld_banner%%$'\n'*}
+lld_line=${LLD_MINOR_PIN//./\\.}
+if [[ ! $lld_banner =~ (^|[[:space:]])$lld_line\.[0-9]+($|[[:space:]]) ]]; then
+    note "lld   : version pin violated (want $LLD_MINOR_PIN.*): $lld_banner"
+    exit 1
+fi
+note "lld   : $lld_banner"
 
 # ── wild, git HEAD (Rust; revision stamped in REVISION) ─────────────────────
 if [ "$WITH_WILD" != 1 ]; then
@@ -258,7 +271,7 @@ WILD_BIN="$PREFIX/wild-git/bin/wild"
 wild_enabled=0
 [ "$WITH_WILD" = 1 ] && [ -x "$WILD_BIN" ] && wild_enabled=1
 for pair in "ld-$BINUTILS_VER:$PREFIX/bfd-$BINUTILS_VER/bin/ld" \
-            "mold-$MOLD_VER:$PREFIX/mold-$MOLD_VER/bin/mold" \
+            "mold-$MOLD_VER:$mold_bin" \
             "ld.lld-$LLD_MINOR_PIN:$LLD_BIN" \
             "wild:$WILD_BIN"; do
     name="${pair%%:*}"; target="${pair#*:}"
@@ -269,7 +282,7 @@ for pair in "ld-$BINUTILS_VER:$PREFIX/bfd-$BINUTILS_VER/bin/ld" \
     if [ "$name" = "ld-$BINUTILS_VER" ]; then
         write_native_bfd_wrapper "$LINKDIR/$name.tmp" "$target" "$native_lib_path"
     else
-        printf '#!/bin/sh\nexec %s "$@"\n' "$target" > "$LINKDIR/$name.tmp"
+        printf '#!/bin/bash\nexec %q "$@"\n' "$target" > "$LINKDIR/$name.tmp"
         chmod +x "$LINKDIR/$name.tmp"
     fi
     mv -f "$LINKDIR/$name.tmp" "$LINKDIR/$name"
@@ -279,7 +292,7 @@ done
 {
     printf '# %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) setup_oracles.sh"
     printf 'ld      %s\n' "$("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1)"
-    printf 'mold    %s (%s)\n' "$("$PREFIX/mold-$MOLD_VER/bin/mold" --version)" "$mold_build_receipt"
+    printf 'mold    %s (%s)\n' "$("$mold_bin" --version)" "$mold_build_receipt"
     printf 'ld.lld  %s\n' "$lld_banner"
     if [ "$wild_enabled" = 1 ]; then
         printf 'wild    %s (rev %s)\n' "$("$WILD_BIN" --version 2>&1 | head -1)" \

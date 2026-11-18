@@ -29,13 +29,17 @@ reports divergences both in the accept/reject verdict and in the bytes written.
 ## `setup_oracles.sh` — build the corroborating linkers
 
 Pinned oracles (user directive): **GNU ld 2.47** (bfd + ld only), **mold
-3.0.0** built with the mold-cli Cargo preset
-`--no-default-features --features x86_64,i386` (mold 3.x removed the CMake
-build and its `-DMOLD_TARGETS=` cache variable; one Cargo feature per target
-crate under `arch/` replaced it — the x86-only preset drops the other
-eighteen target crates on the 2-vCPU host),
-**LLVM lld 23.1.x** (apt.llvm.org release build; the script asserts the `23.1.`
-banner) and wild at git HEAD. The binutils release download is SHA-256-pinned
+3.0.0**, **LLVM lld 23.1.x**, and wild at git HEAD. For functional
+checks `MOLD_PREFER=cache` (default) prefers the digest-pinned upstream mold
+release, probed for both x86 ELF targets on install. For native link timings,
+use `MOLD_PREFER=source`: the mold-cli build uses `-C target-cpu=native` and
+`--no-default-features --features x86_64,i386,system-allocator`. Mold 3.x
+removed CMake and `-DMOLD_TARGETS=`. The two variants have separate backing
+paths, so a warm release cache cannot satisfy a source request. The wrapper
+and inventory refer to the selected variant. Do not share a `native` prefix
+across dissimilar CPUs. LLD comes from apt.llvm.org unless `LLD_BIN` names an
+existing absolute executable; either way, a complete `23.1.<patch>` token
+is required on the version line. The binutils release download is SHA-256-pinned
 like the GAS oracle. Its actual banner is `2.47.20260726`, which the version
 check accepts explicitly alongside `2.47`; it still rejects `2.470`, `2.47.1`,
 and other dated snapshots. This is not permission to substitute any version
