@@ -1136,6 +1136,8 @@ jobs:
         --lccc target/fastbuild/lccc --seed-list 1,2,3,4,5,6,11,14,16,26,30
         run_gate licm_global_speculation python3 tests/regression/check_licm_global_speculation.py \
         --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate call_return_facts python3 tests/regression/check_call_return_facts.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
         run_gate return_local_addr python3 tests/regression/check_return_local_addr.py \
         --lccc target/fastbuild/lccc --gcc gcc-16 --m32
         run_gate qualifier_composition python3 tests/regression/check_qualifier_composition.py \

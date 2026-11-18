@@ -752,6 +752,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
@@ -2689,6 +2690,7 @@ impl Lowerer {
                     is_const: false,
                     assume_library: false,
                     is_pure: false,
+                    memory: Default::default(),
                     cold: false,
                 },
             });
@@ -2741,6 +2743,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 assume_library: false,
                 ret_eightbyte_classes: ret_classes,
                 ret_is_f128_sse: ret_is_f128,
@@ -3216,6 +3219,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // Compiler-generated aggregate copy/clear: GCC's freestanding contract requires memcpy/memset to exist with library semantics.
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
@@ -3260,6 +3264,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // Compiler-generated aggregate copy/clear: GCC's freestanding contract requires memcpy/memset to exist with library semantics.
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
@@ -3300,6 +3305,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,

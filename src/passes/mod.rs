@@ -75,6 +75,7 @@ pub(crate) mod loop_memset;
 pub(crate) mod loop_preheader;
 pub(crate) mod loop_rotate;
 pub(crate) mod loop_square;
+pub(crate) mod loop_termination;
 pub(crate) mod loop_unroll;
 mod module_symbol_facts;
 pub(crate) mod narrow;

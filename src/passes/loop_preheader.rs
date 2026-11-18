@@ -202,9 +202,13 @@ struct Plan {
 /// True when inserting a dedicated preheader could actually let LICM hoist
 /// something out of this loop.
 ///
-/// A dedicated preheader unlocks exactly one class of hoist: a **derived
-/// pointer** load (a parameter, a call result, a GEP chain — anything that can
-/// fault).  Loads through an alloca or a direct `GlobalAddr` are already
+/// A dedicated preheader unlocks the hoists of what can fault: a **derived
+/// pointer** load (a parameter, a call result, a GEP chain), and a **call**
+/// other than to a C library function defined for every argument -- a
+/// read-only callee dereferences, and a read-none one that is not `fabs` or
+/// `sqrt` can still divide (`div` does).  LICM moves neither to a block that
+/// also branches around the loop (`licm.rs`).  Loads through an alloca or a
+/// direct `GlobalAddr` and calls to those library functions are already
 /// hoistable without one, so a loop with none of the former gains nothing and
 /// would only carry an empty block.
 ///
@@ -272,18 +276,62 @@ fn preheader_would_unlock_a_hoist(
     let block_idx = natural_loop.header;
     if block_idx < func.blocks.len() {
         for inst in &func.blocks[block_idx].instructions {
-            if let Instruction::Load { ptr, volatile, .. } = inst {
-                if *volatile || alloca_values.contains(&ptr.0) {
-                    continue;
+            match inst {
+                Instruction::Load { ptr, volatile, .. } => {
+                    if *volatile || alloca_values.contains(&ptr.0) {
+                        continue;
+                    }
+                    if global_derived.contains(&ptr.0) {
+                        continue; // LICM's global path does not need this shape
+                    }
+                    return true;
                 }
-                if global_derived.contains(&ptr.0) {
-                    continue; // LICM's global path does not need this shape
+                Instruction::Call { func: callee, info }
+                    if call_needs_dedicated_preheader(callee, info)
+                        && args_defined_outside(func, natural_loop, info) =>
+                {
+                    return true;
                 }
-                return true;
+                _ => {}
             }
         }
     }
     false
+}
+
+/// A call LICM would hoist, but only into a preheader that always enters the
+/// loop.  Mirrors the shape test in `licm.rs`; the one call it hoists anywhere
+/// is to a C library function that is defined for every argument
+/// ([`super::licm::call_may_be_speculated`]).
+fn call_needs_dedicated_preheader(callee: &str, info: &crate::ir::reexports::CallInfo) -> bool {
+    use crate::common::types::IrType;
+    let hoistable_shape = (info.is_pure || info.is_const)
+        && !info.is_sret
+        && !info.is_variadic
+        && info.dest.is_some()
+        && info.return_type != IrType::Void
+        && !info.return_type.is_long_double()
+        && !info.return_type.is_128bit();
+    hoistable_shape && !super::licm::call_may_be_speculated(callee, info)
+}
+
+/// Whether every argument of the call is a constant or a value no loop block
+/// defines: the cheap half of loop invariance.  An argument computed in the
+/// loop keeps the call there, and a preheader spent on it unlocks nothing.
+fn args_defined_outside(
+    func: &IrFunction,
+    natural_loop: &NaturalLoop,
+    info: &crate::ir::reexports::CallInfo,
+) -> bool {
+    info.args.iter().all(|arg| match arg {
+        Operand::Const(_) => true,
+        Operand::Value(value) => !natural_loop
+            .body
+            .iter()
+            .filter(|&&block| block < func.blocks.len())
+            .flat_map(|&block| &func.blocks[block].instructions)
+            .any(|inst| inst.dest() == Some(*value)),
+    })
 }
 
 /// `true` when `a` dominates `b` in the immediate-dominator tree.

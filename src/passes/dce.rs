@@ -537,6 +537,9 @@ fn dump_dead_instructions(func: &IrFunction, live: &[u8], block_off: &[u32]) {
 #[inline]
 pub(crate) fn has_side_effects(inst: &Instruction) -> bool {
     // Calls first: a pure/const call is droppable when its result is unused —
+    // those flags promise that the call returns, which `CallInfo::memory`
+    // alone does not: a callee that writes nothing may still trap or park,
+    // and then the call is the point of the statement.
     // EXCEPT for sret returns. The observable result of an sret call is the
     // memory write through the hidden sret pointer, not the (always unused)
     // dest value. On i686 every struct/_Complex return is sret, so dropping
@@ -760,6 +763,45 @@ mod tests {
         });
         assert_eq!(eliminate_dead_code(&mut func), 1);
         assert!(func.blocks[0].instructions.is_empty());
+    }
+
+    /// `check(i, n);` -- the callee writes nothing, and the statement exists
+    /// because it may not return.  Only `is_pure`/`is_const` make a call
+    /// droppable; what it leaves alone in memory does not.
+    #[test]
+    fn a_call_that_writes_nothing_but_may_not_return_is_kept() {
+        use crate::ir::reexports::MemoryEffect;
+        for memory in [MemoryEffect::ReadNone, MemoryEffect::ReadOnly] {
+            for indirect in [false, true] {
+                let info = CallInfo {
+                    dest: Some(Value(0)),
+                    memory,
+                    ..CallInfo::default()
+                };
+                let call = if indirect {
+                    Instruction::CallIndirect {
+                        func_ptr: Operand::Value(Value(4)),
+                        info,
+                    }
+                } else {
+                    Instruction::Call {
+                        func: "check".to_string(),
+                        info,
+                    }
+                };
+                assert!(has_side_effects(&call), "{memory:?} indirect={indirect}");
+                let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+                func.blocks.push(BasicBlock {
+                    label: BlockId(0),
+                    instructions: vec![call],
+                    terminator: Terminator::Return(None),
+                    source_spans: Vec::new(),
+                    source_inline_ids: Vec::new(),
+                });
+                eliminate_dead_code(&mut func);
+                assert_eq!(func.blocks[0].instructions.len(), 1);
+            }
+        }
     }
 
     #[test]

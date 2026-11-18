@@ -491,6 +491,31 @@ impl BasicBlock {
     }
 }
 
+/// What a callee may do to memory its caller can see, *if the call returns*.
+///
+/// It says nothing about whether the call returns.  A callee that parks in
+/// `for (;;) {}` or traps on a failed check writes nothing either, and the
+/// caller that does get control back finds memory as it left it: an earlier
+/// result of the same call can be reused and a value loaded before the call
+/// is still current.  That is all this fact licenses.  GCC keeps the same
+/// distinction as "looping pure" and "looping const".
+///
+/// Deleting a call or running it earlier needs more -- that the call comes
+/// back -- and that is what [`CallInfo::is_pure`] and [`CallInfo::is_const`]
+/// add.  Read this fact through [`CallInfo::memory_effect`], which folds the
+/// stronger two in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemoryEffect {
+    /// Nothing is known: the callee may read and write anything.
+    #[default]
+    ReadWrite,
+    /// The callee writes nothing; its result may depend on what it reads.
+    ReadOnly,
+    /// The callee neither reads nor writes; its result depends on its
+    /// arguments alone.
+    ReadNone,
+}
+
 /// Shared call metadata for both direct and indirect function calls.
 ///
 /// This struct consolidates the fields that are common to `Instruction::Call` and
@@ -547,10 +572,19 @@ pub struct CallInfo {
     /// i686: `__attribute__((regparm(N)))` on the callee — per-function
     /// override of the global -mregparm flag. None = attribute absent.
     pub regparm: Option<u8>,
-    /// True if the callee is marked pure (no memory writes outside local allocas, no side effects).
+    /// True if the callee is marked pure: no memory writes outside local
+    /// allocas, no side effects, and the call returns.  A call whose result is
+    /// unused may be deleted, so a callee that can trap or loop without end is
+    /// not pure, whatever it leaves alone; see `memory`.
     pub is_pure: bool,
-    /// True if the callee is marked const (no memory reads or writes outside local allocas, no side effects).
+    /// True if the callee is marked const: pure, and it reads no memory
+    /// outside local allocas either.
     pub is_const: bool,
+    /// What the callee may do to memory when it is not known to return; see
+    /// [`MemoryEffect`].  `ReadWrite` (the default) claims nothing.  A pure or
+    /// const call need not repeat itself here: [`CallInfo::memory_effect`]
+    /// answers for both.
+    pub memory: MemoryEffect,
     /// Return carrier classes. SysV AMD64 uses one entry per eightbyte for
     /// aggregate returns; on i686, three INTEGER entries mark a Clang integer
     /// ExtVector result carried in EAX:EDX:ECX.
@@ -571,6 +605,23 @@ pub struct CallInfo {
     /// stack home on the hot path.  A pure placement hint: `false` is always
     /// correct.
     pub cold: bool,
+}
+
+impl CallInfo {
+    /// The callee's effect on memory if this call returns: `const` and `pure`
+    /// where they hold, else whatever `memory` records.
+    ///
+    /// For reusing results and loaded values across the call.  It is not a
+    /// licence to delete the call or to move it: test `is_pure`/`is_const`.
+    pub fn memory_effect(&self) -> MemoryEffect {
+        if self.is_const || self.memory == MemoryEffect::ReadNone {
+            MemoryEffect::ReadNone
+        } else if self.is_pure || self.memory == MemoryEffect::ReadOnly {
+            MemoryEffect::ReadOnly
+        } else {
+            MemoryEffect::ReadWrite
+        }
+    }
 }
 
 /// An IR instruction.

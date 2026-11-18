@@ -244,6 +244,11 @@ mod tests {
                 };
                 assert_eq!(info.is_pure, !fenv);
                 assert_eq!(info.is_const, !fenv);
+                // Nor may an earlier result be reused: the call raises flags.
+                assert_eq!(
+                    info.memory_effect() == crate::ir::reexports::MemoryEffect::ReadWrite,
+                    fenv
+                );
             }
             crate::passes::ipcp::run(&mut m);
             let calls = m.functions[3].blocks[0]
