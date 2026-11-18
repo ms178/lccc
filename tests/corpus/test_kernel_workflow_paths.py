@@ -44,7 +44,9 @@ class KernelWorkflowPaths(unittest.TestCase):
                      "scripts/kernel_version.sh", "scripts/kernel_tool_identity.sh",
                      "scripts/kconfig_query.sh", "scripts/build_kernel_full.sh",
                      "scripts/build_kernel_boot.sh", "scripts/prepare_kernel_tree.sh",
-                     "scripts/qemu_defconfig_smoke.sh", "scripts/qemu_firmware.sh"]:
+                     "scripts/qemu_defconfig_smoke.sh", "scripts/qemu_firmware.sh",
+                     "scripts/ensure_qemu_system.sh", "scripts/kernel_objtool_census.sh",
+                     "tests/corpus/test_kernel_observability.py"]:
             with self.subTest(path=path):
                 self.assertTrue(self.selected(path), path)
 

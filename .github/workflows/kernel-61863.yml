@@ -38,6 +38,9 @@ on:
       - 'scripts/prepare_kernel_tree.sh'
       - 'scripts/qemu_defconfig_smoke.sh'
       - 'scripts/qemu_firmware.sh'
+      - 'scripts/ensure_qemu_system.sh'
+      - 'scripts/kernel_objtool_census.sh'
+      - 'tests/corpus/test_kernel_observability.py'
       - 'tests/regression/check_qemu_defconfig_smoke.sh'
   workflow_dispatch:
     inputs:
@@ -95,7 +98,7 @@ jobs:
             apt-get update -qq
             # Name the required firmware provider explicitly, even when
             # qemu-system-common already pulls it in transitively.
-            apt-get -y --no-install-recommends --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file
+            apt-get -y --no-install-recommends --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file pahole
             cp /var/cache/apt/archives/*.deb /out/
           '
           cd "$RUNNER_TEMP/kernel-host-debs"
@@ -139,6 +142,7 @@ jobs:
       KVER: 6.18.63
       LCCC_KERNEL_SOURCE_MODE: git
       LCCC_JOBS: '2'
+      LCCC_SWAP_SIZE: 4G
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_FASTBUILD_DEBUG: '0'
     steps:
