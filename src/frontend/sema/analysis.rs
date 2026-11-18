@@ -39,6 +39,7 @@ use crate::frontend::parser::ast::{
 };
 use crate::frontend::sema::builtins;
 use crate::frontend::sema::intrinsic_arity;
+use crate::frontend::sema::libc_builtin_arity;
 use crate::frontend::sema::operand_constraints::{self, AssignmentCtx, MemberOperand, Operand};
 use crate::ir::reexports::IrConst;
 
@@ -418,7 +419,12 @@ fn param_top_const_source(
 
 impl SemanticAnalyzer {
     pub fn new() -> Self {
-        let mut analyzer = Self {
+        // Not `mut`: the constructor used to pre-populate a table of implicit
+        // libc declarations through a `&mut self` helper.  That table is gone --
+        // it made 23 library names unprototyped declarations, which silently
+        // disabled all argument checking for them -- so nothing mutates the
+        // value before it is returned, and `-D warnings` rejects a stale `mut`.
+        let analyzer = Self {
             symbol_table: SymbolTable::new(),
             result: SemaResult::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
@@ -451,8 +457,6 @@ impl SemanticAnalyzer {
             function_scope_floor: usize::MAX,
             weak_symbols: FxHashSet::default(),
         };
-        // Pre-populate with common implicit declarations
-        analyzer.declare_implicit_functions();
         analyzer
     }
 
@@ -4160,6 +4164,28 @@ impl SemanticAnalyzer {
                 if self.symbol_table.lookup(name).is_none()
                     && !self.result.functions.contains_key(name)
                 {
+                    // Names reaching this branch are `builtins::is_builtin`:
+                    // compiler builtins, available without a prototype by
+                    // definition, so this branch must NOT emit an
+                    // implicit-declaration diagnostic.  Measured, not assumed:
+                    // adding one here, gated on the `__builtin_` spelling,
+                    // failed 66 of 1378 corpus tests, because that gate misses
+                    // three populations which are equally builtins --
+                    //
+                    //   * this compiler's own bundled headers call AVX2 helpers
+                    //     before their declaration (`include/avxintrin.h:344`
+                    //     uses `_mm256_and_si256`, defined in `avx2intrin.h`,
+                    //     which `immintrin.h` includes later): 55 tests;
+                    //   * `alloca`, which needs no <stdlib.h>;
+                    //   * the `__atomic_*`/`__sync_*` family, dispatched by name
+                    //     pattern (`is_atomic_builtin`) rather than through
+                    //     `BUILTIN_MAP`, so no `__builtin_` prefix to gate on.
+                    //
+                    // The unprefixed *library* names are not `is_builtin` at all
+                    // -- `memcpy` is only the `BuiltinKind::LibcAlias` target of
+                    // `__builtin_memcpy` -- so they fall to the implicit
+                    // declaration branch below, which is where the
+                    // silently-accepted-`memcpy(d, s)` defect was fixed.
                     if let Some(expected) = intrinsic_arity::builtin_intrinsic_arity(name) {
                         if args.len() != expected {
                             self.diagnostics.borrow_mut().error(
@@ -4189,6 +4215,25 @@ impl SemanticAnalyzer {
                     *callee_span,
                     crate::common::error::WarningKind::ImplicitFunctionDeclaration,
                 );
+                // GCC also knows the argument count of a libc builtin it
+                // recognises, and reports a mismatch as an error in every
+                // dialect -- including the pre-C99 ones, where the implicit
+                // declaration above is only a suppressed-by-default warning.
+                // Ordered after that warning because it is the order GCC prints
+                // them in, and
+                // tests/regression/check_gcc162_diagnostic_severity.sh compares
+                // the *first* diagnostic line verbatim.
+                //
+                // Once per name, not once per call site as GCC does: the
+                // registration below makes every later call site take the
+                // ordinary declared-function path instead of this one.  The
+                // property that matters is unchanged -- a wrong-arity call to a
+                // known libc builtin is refused in every dialect, with GCC's
+                // wording at GCC's column -- and re-checking later sites would
+                // mean threading this name set through the argument checker
+                // that validates real prototypes, to change a diagnostic count
+                // and nothing else.
+                self.check_libc_builtin_arity(name, args.len(), *callee_span);
                 let func_info = FunctionInfo {
                     calling_convention: Default::default(),
                     return_type: CType::Int, // implicit return int
@@ -8126,6 +8171,75 @@ dereference it before applying '->' to it?"
         None
     }
 
+    /// GCC's argument-count check for an implicitly declared libc builtin.
+    ///
+    /// `memcpy(d, s)` in a translation unit that never included <string.h> is
+    /// not only an implicit declaration: GCC knows `memcpy` takes three
+    /// arguments and says so, in *every* dialect and as an `error:` -- including
+    /// `-std=gnu90`, where the implicit declaration itself is only a
+    /// suppressed-by-default warning.  Measured with gcc-16 (GCC) 16.2.0:
+    ///
+    /// ```text
+    /// $ gcc-16 -std=gnu90 -fsyntax-only t.c   // char d[4], s[4]; memcpy(d, s);
+    /// t.c:1:34: error: too few arguments to function 'memcpy'; expected 3, have 2
+    /// ```
+    ///
+    /// Without this check the pre-C99 dialects accepted the call, lowered it
+    /// through the libc-alias path with a garbage third argument, and the binary
+    /// segfaulted at run time (measured: exit 139).  From C99 on the implicit
+    /// declaration already refuses the translation unit, so the gap was exactly
+    /// the legacy dialects, where nothing stood between the programmer and a
+    /// crashing binary.
+    ///
+    /// Two properties here are GCC's rather than ours, and both live in
+    /// `libc_builtin_arity` because they were measured instead of authored:
+    ///
+    ///   * the wording distinguishes variadic from fixed arity (`expected at
+    ///     least 1` for `printf`, `expected 3` for `memcpy`), and GCC never
+    ///     reports too many arguments to a variadic builtin;
+    ///   * the coverage is not uniform.  GCC arity-checks `memcpy` and `free`
+    ///     but stays silent for `puts`, `putchar`, `abs`, `strcmp`, `strncmp`,
+    ///     `memcmp` and `dprintf` -- verified: `-std=gnu90` on a translation
+    ///     unit calling all seven with wrong argument counts exits 0 and prints
+    ///     nothing, while the same compiler reports seven arity errors on a
+    ///     `memcpy` probe.  Those names are absent from the table, so this stays
+    ///     silent for them too; a table derived from the C standard instead
+    ///     would have rejected correct programs.
+    ///
+    /// Diagnostics only.  Nothing here feeds lowering, so it cannot change
+    /// generated code: the implicit declaration registered by the caller stays
+    /// unprototyped, because inventing parameter and return *types* for 127 libc
+    /// names would risk far worse than it fixes -- a wrong return type silently
+    /// miscompiles every caller that uses the value, whereas a wrong count only
+    /// ever produces a diagnostic.
+    fn check_libc_builtin_arity(&self, name: &str, argc: usize, span: Span) {
+        let Some(arity) = libc_builtin_arity::libc_builtin_arity(name) else {
+            return;
+        };
+        let too_few = argc < arity.min_args;
+        // GCC never reports too many arguments to a variadic builtin, so
+        // `expected` below only has to spell out `at least` for the too-few case.
+        let too_many = !arity.variadic && argc > arity.min_args;
+        if !too_few && !too_many {
+            return;
+        }
+        let expected = if arity.variadic {
+            format!("at least {}", arity.min_args)
+        } else {
+            arity.min_args.to_string()
+        };
+        self.diagnostics.borrow_mut().error(
+            format!(
+                "{} arguments to function '{}'; expected {}, have {}",
+                if too_few { "too few" } else { "too many" },
+                name,
+                expected,
+                argc
+            ),
+            span,
+        );
+    }
+
     fn check_c2y_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
         // These GCC 17 compatibility intrinsics have no ordinary
         // declaration in the translation unit. Validate their implicit
@@ -10665,84 +10779,6 @@ dereference it before applying '->' to it?"
     fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
         self.eval_const_expr_value(expr)?.to_i64()
     }
-
-    // === Implicit declarations ===
-
-    /// Pre-declare common implicit functions that C programs expect.
-    fn declare_implicit_functions(&mut self) {
-        // Common libc functions that tests may use without headers
-        let implicit_funcs = [
-            ("printf", CType::Int, true),
-            ("fprintf", CType::Int, true),
-            ("sprintf", CType::Int, true),
-            ("snprintf", CType::Int, true),
-            ("puts", CType::Int, false),
-            ("putchar", CType::Int, false),
-            ("getchar", CType::Int, false),
-            (
-                "malloc",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            (
-                "calloc",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            (
-                "realloc",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            ("free", CType::Void, false),
-            ("exit", CType::Void, false),
-            ("abort", CType::Void, false),
-            (
-                "memcpy",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            (
-                "memmove",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            (
-                "memset",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            ("memcmp", CType::Int, false),
-            ("strlen", CType::ULong, false),
-            ("strcmp", CType::Int, false),
-            (
-                "strcpy",
-                CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC),
-                false,
-            ),
-            ("atoi", CType::Int, false),
-            ("atol", CType::Long, false),
-            ("abs", CType::Int, false),
-        ];
-
-        for (name, ret_type, variadic) in &implicit_funcs {
-            let is_noreturn = matches!(*name, "exit" | "abort" | "_Exit" | "quick_exit");
-            let func_info = FunctionInfo {
-                calling_convention: Default::default(),
-                return_type: ret_type.clone(),
-                params: Vec::new(),
-                variadic: *variadic,
-                prototype: None,
-                is_defined: false,
-                is_noreturn,
-                return_base_const: false,
-                return_pointer_const_levels: 0,
-                param_typedefs: Vec::new(),
-                return_typedef: None,
-            };
-            self.result.functions.insert(name.to_string(), func_info);
-        }
-    }
 }
 
 /// Member-type comparison that sees through anonymous record keys.
@@ -11647,6 +11683,7 @@ mod record_layouts_correspond_tests {
             object_const: false,
             counted_by: None,
             pointer_quals: Vec::new(),
+            user_align: None,
         }
     }
 

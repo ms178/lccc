@@ -33,8 +33,47 @@ use std::sync::OnceLock;
 /// the environment-hygiene contract (one read per translation unit).
 static SIBCALL_DISABLED: OnceLock<bool> = OnceLock::new();
 
+/// The driver's `-f[no-]optimize-sibling-calls` request.  GCC defaults the
+/// conversion ON at `-O2` and above and lets the option withdraw it, so the
+/// default here is `true` and the driver records every invocation's answer
+/// before lowering runs (the same process-global contract `set_char_unsigned`
+/// uses: one target and one option set per driver process, re-recorded per
+/// compilation so a flag cannot leak into the next one).
+///
+/// This is a *user-facing option*, not a debugging switch: the Linux kernel
+/// passes `-fno-optimize-sibling-calls` in every translation unit, because a
+/// tail `jmp` destroys the caller's frame and with it frame-pointer
+/// unwinding, ftrace function-graph and objtool's ORC/CFI expectations.
+/// Accepting the spelling while performing the conversion anyway is the
+/// option-effect ledger's failure state, not a compatibility no-op.
+static SIBCALL_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Record the invocation's `-f[no-]optimize-sibling-calls` answer.  Called
+/// once by the driver before any lowering, next to the other per-invocation
+/// process globals.
+pub fn set_sibling_calls_requested(enabled: bool) {
+    SIBCALL_REQUESTED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the invocation asked for sibling calls at all.  The IR rewrite
+/// that enables them (`backend::ret_dup`) must consult the same answer as
+/// the backend that emits them, or the two halves disagree about a
+/// conversion that is then only half withdrawn.
+pub(crate) fn sibling_calls_requested() -> bool {
+    SIBCALL_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the sibling-call conversion may run for this invocation: the user
+/// asked for it *and* the `CCC_NO_SIBCALL` kill switch is not set.  Both the
+/// generation driver and the driver-side `ret_dup` rewrite go through this
+/// single answer, so the option and the kill switch cannot disagree.
+pub(crate) fn sibcall_conversion_enabled() -> bool {
+    sibcall_enabled()
+}
+
 fn sibcall_enabled() -> bool {
-    !*SIBCALL_DISABLED.get_or_init(|| std::env::var_os("CCC_NO_SIBCALL").is_some())
+    sibling_calls_requested()
+        && !*SIBCALL_DISABLED.get_or_init(|| std::env::var_os("CCC_NO_SIBCALL").is_some())
 }
 
 /// GCC condition-code suffix of a single-output `=@cc<suffix>` constraint.

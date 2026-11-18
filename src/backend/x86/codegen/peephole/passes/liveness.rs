@@ -98,9 +98,16 @@ pub(super) fn tail_call_marked(store: &LineStore, infos: &[LineInfo], n: usize) 
 const CALL_MARKER_WINDOW: usize = 6;
 
 /// The marker protocol of the `call` on line `n`, parsed from the contiguous
-/// block of comment/directive lines that directly follows the call text (the
-/// block ends at the first real instruction, so a later call's markers can
-/// never be attributed to this one).
+/// block of comment/directive lines that directly follows the call text.
+///
+/// The block ends at the first real instruction or label, which keeps a *later
+/// call's* markers out — but comments do not end it, so a marker block that was
+/// published without a call text above it (a stranded sibling-call block, see
+/// `x86::codegen::calls::emit_call_marker`) IS reachable from the call above
+/// it. Every counted field therefore latches its FIRST legible occurrence: the
+/// codegen publishes each marker exactly once per call text, directly after it,
+/// so the first one in the block is this call's own and any later one belongs
+/// to a different call and must never overwrite it.
 ///
 /// One parser for every consumer. The variadic and static-chain markers used
 /// to be searched only on lines `n+1..=n+2`, which a variadic static-chain
@@ -132,6 +139,11 @@ pub(crate) fn call_markers(store: &LineStore, infos: &[LineInfo], n: usize) -> C
         gp_args: 6,
         ipa_keep: 0,
     };
+    // `variadic` and `chain` are monotone: a second block can only add reads,
+    // which is the conservative direction. `gp_args` and `ipa_keep` are values,
+    // so each latches its first legible occurrence (see the fn docs).
+    let mut gp_args_seen = false;
+    let mut ipa_keep_seen = false;
     for k in n + 1..(n + 1 + CALL_MARKER_WINDOW).min(infos.len()) {
         if infos[k].is_nop() {
             continue;
@@ -152,17 +164,40 @@ pub(crate) fn call_markers(store: &LineStore, infos: &[LineInfo], n: usize) -> C
         } else if mk.starts_with("# LCCC_CHAIN_CALL") {
             m.chain = true;
         } else if let Some(rest) = mk.strip_prefix("# LCCC_CALL_ARGS ") {
-            if let Ok(v) = rest.trim_ascii().parse::<usize>() {
-                m.gp_args = v.min(6);
+            // First legible marker wins, and an illegible one still counts as
+            // this call's (fail-closed to all six argument registers, exactly
+            // as an absent marker does) so a later block cannot sneak in.
+            // Last-wins once let a stranded sibling-call block downgrade a
+            // 1-argument call to 0 arguments: `%rdi` became provably dead and
+            // `eliminate_dead_pure_writes` deleted the argument staging of the
+            // call above it (Linux 6.18.63 `addrconf_verify_work`, guest panic
+            // at t=0.87 s).
+            debug_assert!(
+                !gp_args_seen,
+                "two `# LCCC_CALL_ARGS` markers in one call's window: the \
+                 protocol publishes exactly one per call text"
+            );
+            if !gp_args_seen {
+                gp_args_seen = true;
+                m.gp_args = rest.trim_ascii().parse::<usize>().map_or(6, |v| v.min(6));
             }
         } else if let Some(rest) = mk.strip_prefix("# LCCC_IPA_KEEP ") {
             // Fail-closed parse: an illegible mask keeps every caller-saved
-            // family live (read) at the call.
-            m.ipa_keep = rest
-                .trim_ascii()
-                .strip_prefix("0x")
-                .and_then(|h| u16::from_str_radix(h, 16).ok())
-                .map_or(CALLER_SAVED, |v| v & CALLER_SAVED);
+            // family live (read) at the call. First legible marker wins, for
+            // the same reason as `# LCCC_CALL_ARGS`.
+            debug_assert!(
+                !ipa_keep_seen,
+                "two `# LCCC_IPA_KEEP` markers in one call's window: the \
+                 protocol publishes exactly one per call text"
+            );
+            if !ipa_keep_seen {
+                ipa_keep_seen = true;
+                m.ipa_keep = rest
+                    .trim_ascii()
+                    .strip_prefix("0x")
+                    .and_then(|h| u16::from_str_radix(h, 16).ok())
+                    .map_or(CALLER_SAVED, |v| v & CALLER_SAVED);
+            }
         }
     }
     m

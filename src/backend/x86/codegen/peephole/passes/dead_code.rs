@@ -321,6 +321,114 @@ pub(super) fn eliminate_dead_fp_moves(store: &LineStore, infos: &mut [LineInfo])
     changed
 }
 
+/// True when `trimmed` has at least one parenthesised memory operand and every
+/// one of them dereferences `%rbp`.
+///
+/// This is what lets the "opaque indirect access may read the slot" guard stand
+/// down for a line like `movdqu %gs:16(%rbp), %xmm0` once `%rbp` is proven to
+/// hold a RIP-relative static address: the line's ONLY memory access is through
+/// that proven-non-stack pointer, so it cannot touch an `%rsp`-relative slot.
+///
+/// A line that mixes bases -- `movq (%r12), %r11`, or the kernel per-CPU copy
+/// body's `movdqu %xmm0, %gs:16(%r15)` -- returns false, because `%r12`/`%r15`
+/// have no provenance the peephole can see.  That is the honest limit of this
+/// relaxation: it covers segment copy loops whose source pointer is in `%rbp`,
+/// not the general "some data register might point at the stack" question.
+fn memory_operands_all_rbp(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    let mut any = false;
+    while i < bytes.len() {
+        if bytes[i] != b'(' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut depth = 1;
+        let mut j = i + 1;
+        while j < bytes.len() && depth > 0 {
+            if bytes[j] == b'(' {
+                depth += 1;
+            } else if bytes[j] == b')' {
+                depth -= 1;
+            }
+            j += 1;
+        }
+        any = true;
+        if !trimmed[start..j].contains("%rbp") {
+            return false;
+        }
+        i = j;
+    }
+    any
+}
+
+/// True when every write to `%rbp` inside `[start, end)` loads a RIP-relative
+/// address -- `leaq SYMBOL(%rip), %rbp`, the shape codegen emits for the address
+/// of a static object.
+///
+/// A register written only that way provably holds the address of a static
+/// object, which is never inside this function's stack frame.  So a dereference
+/// of it -- plain `(%rbp)` or segment-qualified `%gs:(%rbp)` -- cannot alias an
+/// `%rsp`-relative slot, and the "opaque pointer dereference may read the slot"
+/// guard does not have to fire for it.
+///
+/// That guard is what kept dead vector spills alive in tests/bench/k_seg_gs_copy.c:
+/// the kernel per-CPU copy idiom puts the source buffer in `%rbp`
+/// (`leaq bench_seg_src(%rip), %rbp`) and reaches it through `%gs:`, so with no
+/// `movq %rsp, %rbp` anywhere in the function every `movdqu %gs:16(%rbp), %xmm0`
+/// was read as a possible access to the spilled slot and the scan stopped before
+/// it reached the store that overwrote it.  Eight spills against three reloads
+/// survived; five were dead.
+///
+/// Deliberately conservative in three ways.  It returns false when `%rbp` is
+/// never written (the value arrives from the caller, so nothing is known), when
+/// any write is not RIP-relative (`popq %rbp`, `movq %rsp, %rbp`,
+/// `movq %rax, %rbp`), and when any write is RIP-relative *through an index*
+/// (`leaq tbl(%rip,%rax,8), %rbp`) -- that is a computed address, not a proven
+/// static one.  Callers only consult it when `%rbp` is not the frame pointer, so
+/// a frame-pointer function is unaffected either way.
+fn rbp_only_loaded_rip_relative(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+) -> bool {
+    let mut any = false;
+    for k in start..end {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let t = infos[k].trimmed(store.get(k));
+        // A write is anything whose destination operand is %rbp: the last
+        // comma-separated operand of a two-operand move, or the single operand of
+        // a pop.  Reads (`movq %rbp, %rax`, `leaq 16(%rbp), %r11`) end elsewhere.
+        let writes_rbp =
+            t.ends_with(", %rbp") || t.ends_with(",%rbp") || t == "popq %rbp" || t == "pop %rbp";
+        if !writes_rbp {
+            continue;
+        }
+        any = true;
+        // `split_once`, not `rsplit_once`: the SOURCE is the operand before the
+        // comma.  Taking the field after it handed this check the destination
+        // `%rbp` itself, so `src.ends_with("(%rip)")` was false for every line
+        // and the function returned false unconditionally -- the relaxation
+        // silently never fired.
+        let Some((src, _)) = t.split_once(',') else {
+            return false; // popq %rbp: restored from the stack, unknown value
+        };
+        let src = src.trim();
+        if !src.ends_with("(%rip)") || !src.starts_with("lea") {
+            return false;
+        }
+        // `leaq sym(%rip,%rax,8), %rbp` computes an address; not a proven static.
+        if src.contains(',') {
+            return false;
+        }
+    }
+    any
+}
+
 // ── Dead store elimination (local, windowed) ─────────────────────────────────
 
 pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
@@ -335,6 +443,9 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
     // the frame pointer, `offset(%rbp)` accesses are pointer dereferences and
     // must never be treated as stack slots.
     let mut rbp_is_frame = false;
+    // Set at each `.cfi_startproc` from a scan of the whole function; see
+    // `rbp_only_loaded_rip_relative`.  False when there are no CFI boundaries.
+    let mut rbp_is_static = false;
 
     for i in 0..len {
         match infos[i].kind {
@@ -342,6 +453,18 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                 let d = infos[i].trimmed(store.get(i));
                 if d == ".cfi_startproc" {
                     rbp_is_frame = false;
+                    // Rescan the function that starts here.  Provenance is a
+                    // whole-function property: a `movq %rax, %rbp` *after* the
+                    // candidate would invalidate it, and the forward walk has not
+                    // seen that line yet.
+                    let mut fend = len;
+                    for k in (i + 1)..len {
+                        if infos[k].trimmed(store.get(k)) == ".cfi_endproc" {
+                            fend = k;
+                            break;
+                        }
+                    }
+                    rbp_is_static = rbp_only_loaded_rip_relative(store, infos, i, fend);
                 }
             }
             LineKind::Other { .. } => {
@@ -357,18 +480,64 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
             // mark_nop refuses pinned lines (notably address-taken slots).
             // Skip them before the scan so an unchanged line cannot falsely
             // keep the post-global fixpoint alive.
+            //
+            // The vector-slot arm is here because the scan below was already
+            // XMM-aware while the candidate selection was not: `LoadXmmRbp` and
+            // `StoreXmmRbp` are matched with the same byte-range model
+            // (`ranges_overlap`, full-cover -> `slot_overwritten`), so an XMM
+            // store could *kill* a GP store but was never itself a candidate.
+            // That asymmetry is the defect; the fix is one match arm.
+            //
+            // `eliminate_never_read_stores` cannot cover it: that is a
+            // whole-function "is this slot ever read" test, and a spill slot that
+            // is reloaded once is read, so only the windowed pass can see that a
+            // *later* store to the same bytes makes an earlier one dead.
+            //
+            // SCOPE, MEASURED RATHER THAN ASSUMED.  This does NOT retire the five
+            // dead spills in tests/bench/k_seg_gs_copy.c at -O2 (eight
+            // `movdqu %xmm0, 16(%rsp)` against three reloads, 401 emitted lines
+            // against gcc-16's 252).  Reading them as dead is a HUMAN judgement
+            // about the dataflow; the pass is text-based and has to be sound
+            // about aliasing instead.  Between each spill and the store that
+            // overwrites it sit indirect accesses through data registers --
+            // `movq (%r12), %r11`, `movdqu (%r12), %xmm0`,
+            // `movdqu %xmm0, %gs:16(%r15)` -- and an opaque indirect access may
+            // read the slot, so the scan stops before it ever reaches the
+            // overwrite.  Proving those registers cannot point into the frame is
+            // pointer provenance for arbitrary registers, which this peephole
+            // does not have.  `rbp_only_loaded_rip_relative` below is the narrow
+            // slice of that which IS decidable textually, and it is what lets a
+            // `%gs:(%rbp)` segment-copy line stand down; the `%r12`/`%r15`
+            // accesses in that kernel remain opaque.  The 0.53x `seg_gs_copy`
+            // regression is therefore still open, and its largest component is
+            // aggregate lowering (27.25 instructions per element against
+            // gcc-16's 10), not this arm.
+            //
+            // Soundness of widening the arm rests on `byte_size()` modelling the
+            // vector widths exactly (SD 8, SS 4, Q 8, DQ 16, QQ 32) and on the
+            // classifier rejecting EVEX/masked forms -- `parse_fp_slot_move`
+            // bails on a `{` in the operand text, so a `%zmm` or masked move
+            // stays `Other` and is never a candidate.  Deleting a store cannot
+            // change register state, so the VEX upper-zeroing hazard belongs to
+            // store *forwarding*, which deliberately never maps QQ.
             LineKind::StoreRbp { offset, size, .. } if !infos[i].pinned => (offset, size),
+            LineKind::StoreXmmRbp { offset, size } if !infos[i].pinned => (offset, size),
             _ => continue,
         };
 
         // SOUNDNESS: if %rbp is not the frame pointer and this store uses an
         // `(%rbp)` memory operand, it writes ARBITRARY memory (pointer deref), not
         // a stack slot. Never delete it as a dead stack store.
-        if !rbp_is_frame && uses_rbp_mem_operand(infos[i].trimmed(store.get(i))) {
+        if !rbp_is_frame && !rbp_is_static && uses_rbp_mem_operand(infos[i].trimmed(store.get(i))) {
             continue;
         }
 
         let store_bytes = store_size.byte_size();
+        // b's' when the candidate's slot is %rsp-relative, b'b' when %rbp-relative.
+        // The textual last resort below has to spell the slot the way THIS store
+        // did; `frame_base` falls back to %rbp for a line it cannot read, which is
+        // the historical behaviour.
+        let store_base = frame_base(infos[i].trimmed(store.get(i)), b'b');
 
         let mut slot_read = false;
         let mut slot_overwritten = false;
@@ -426,8 +595,13 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
 
             // SOUNDNESS: a `(%rbp)` access when %rbp is not the frame pointer
             // is an opaque pointer dereference that may READ or WRITE the slot.
-            // Conservatively treat it as a read.
-            if !rbp_is_frame && uses_rbp_mem_operand(infos[j].trimmed(store.get(j))) {
+            // Conservatively treat it as a read -- unless %rbp is proven to hold
+            // a RIP-relative static address, which cannot be inside this frame
+            // and therefore cannot alias an %rsp-relative slot.
+            if !rbp_is_frame
+                && !rbp_is_static
+                && uses_rbp_mem_operand(infos[j].trimmed(store.get(j)))
+            {
                 slot_read = true;
                 break;
             }
@@ -495,7 +669,12 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
             // Check Other and Cmp lines for rbp references. Cmp lines can
             // have memory operands after memory fold (e.g., cmpq -N(%rbp), %rax).
             if matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp) {
-                if infos[j].has_indirect_mem {
+                // An opaque indirect access may read the slot -- unless its only
+                // memory operand is a dereference of a `%rbp` that provably holds
+                // a RIP-relative static address, which cannot be in this frame.
+                let only_proven_rbp =
+                    rbp_is_static && memory_operands_all_rbp(infos[j].trimmed(store.get(j)));
+                if infos[j].has_indirect_mem && !only_proven_rbp {
                     slot_read = true;
                     break;
                 }
@@ -528,10 +707,27 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                     continue;
                 }
                 if pattern_len == 0 {
-                    pattern_len = write_rbp_pattern(&mut pattern_bytes, store_offset);
+                    // Spell the pattern with the base the CANDIDATE actually used.
+                    // `store_offset` alone does not record it, and the only writer
+                    // available for years was `write_rbp_pattern`, so a store to
+                    // `16(%rsp)` went looking for the text `16(%rbp)` -- a string
+                    // that never names its own slot, but that unrelated lines do
+                    // contain.  `movdqu %gs:16(%rbp), %xmm0`, a per-CPU read
+                    // through a proven-static pointer, ends with `16(%rbp)` and so
+                    // was counted as a read of the rsp-relative slot, keeping dead
+                    // spills alive in tests/bench/k_seg_gs_copy.c.
+                    //
+                    // Checking BOTH spellings is not the fix: that only adds
+                    // matches, and the `%rbp` text still fires on the segment
+                    // line.  The base has to be the candidate's own.
+                    pattern_len = if store_base == b's' {
+                        write_rsp_pattern(&mut pattern_bytes, store_offset)
+                    } else {
+                        write_rbp_pattern(&mut pattern_bytes, store_offset)
+                    };
                 }
-                let pattern = std::str::from_utf8(&pattern_bytes[..pattern_len])
-                    .expect("rbp pattern produced non-UTF8");
+                let pattern =
+                    std::str::from_utf8(&pattern_bytes[..pattern_len]).expect("slot pattern UTF8");
                 let line = infos[j].trimmed(store.get(j));
                 if line.contains(pattern) {
                     slot_read = true;
@@ -541,9 +737,13 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                     let mut sub_pattern_bytes = [0u8; 24];
                     for byte_off in 1..store_bytes {
                         let check_off = store_offset + byte_off;
-                        let check_len = write_rbp_pattern(&mut sub_pattern_bytes, check_off);
+                        let check_len = if store_base == b's' {
+                            write_rsp_pattern(&mut sub_pattern_bytes, check_off)
+                        } else {
+                            write_rbp_pattern(&mut sub_pattern_bytes, check_off)
+                        };
                         let check_pattern = std::str::from_utf8(&sub_pattern_bytes[..check_len])
-                            .expect("rbp pattern produced non-UTF8");
+                            .expect("slot pattern UTF8");
                         let line = infos[j].trimmed(store.get(j));
                         if line.contains(check_pattern) {
                             slot_read = true;
@@ -1820,6 +2020,275 @@ mod tests {
         assert!(!infos[stores[0]].is_nop() && !infos[stores[1]].is_nop());
         assert!(infos[stores[2]].is_nop() && !infos[stores[3]].is_nop());
         assert!(!eliminate_dead_stores(&store, &mut infos));
+    }
+
+    /// A vector spill overwritten by a later spill of the same bytes, with no
+    /// load in between, is dead -- the case the candidate arm used to miss
+    /// because it matched `StoreRbp` only while the scan below was already
+    /// XMM-aware.
+    #[test]
+    fn windowed_dse_eliminates_dead_vector_slot_store() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    movdqu %xmm1, 16(%rsp)\n    movdqu 16(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spills: Vec<usize> = (0..store.len())
+            .filter(|&i| {
+                matches!(
+                    infos[i].kind,
+                    LineKind::StoreXmmRbp {
+                        offset: 16,
+                        size: MoveSize::DQ
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            spills.len(),
+            2,
+            "both spills classify as vector slot stores"
+        );
+        assert!(spills.iter().all(|&i| !infos[i].pinned));
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(infos[spills[0]].is_nop(), "the overwritten spill is dead");
+        assert!(!infos[spills[1]].is_nop(), "the reloaded spill survives");
+        assert!(!eliminate_dead_stores(&store, &mut infos), "fixpoint");
+    }
+
+    /// A general-purpose load of the same bytes keeps a vector store alive: the
+    /// scan's reader arm is byte-range based, not family based, so `movq` out of
+    /// a slot written by `movdqu` counts as a read of those bytes.
+    #[test]
+    fn windowed_dse_keeps_vector_store_a_gp_load_reads() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    movq 16(%rsp), %rax\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spill = (0..store.len())
+            .find(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .expect("the vector spill is in the fixture");
+        assert!(matches!(
+            infos[spill + 1].kind,
+            LineKind::LoadRbp { offset: 16, .. }
+        ));
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(!infos[spill].is_nop(), "a GP load reads those bytes");
+    }
+
+    /// A call inside the window is a barrier, so a vector store before it is
+    /// never retired: the callee may read the slot through a pointer.
+    #[test]
+    fn windowed_dse_keeps_vector_store_across_a_call() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    call g\n    movdqu 16(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spill = (0..store.len())
+            .find(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .expect("the vector spill is in the fixture");
+        assert!(infos[spill + 1].is_barrier(), "call is a barrier");
+        assert!(matches!(infos[spill + 1].kind, LineKind::Call));
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(!infos[spill].is_nop());
+    }
+
+    /// `%ymm` spills are modelled as QQ (32 bytes), so a 16-byte load of the
+    /// same slot reads only the low half and must not retire the wide store.
+    #[test]
+    fn windowed_dse_models_a_ymm_slot_as_thirty_two_bytes() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    vmovdqu %ymm0, 16(%rsp)\n    movdqu 16(%rsp), %xmm1\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spill = (0..store.len())
+            .find(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .expect("the wide spill is in the fixture");
+        assert_eq!(
+            match infos[spill].kind {
+                LineKind::StoreXmmRbp { size, .. } => size.byte_size(),
+                _ => 0,
+            },
+            32,
+            "a %ymm slot move is QQ, 32 bytes"
+        );
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(!infos[spill].is_nop(), "the low-half load reads it");
+    }
+
+    /// Width is what makes the kill exact: a narrow store inside a wide one is
+    /// dead only because the wide store covers all of its bytes. The trailing
+    /// reload is a `LoadXmmRbp`, so it is not in the store list.
+    #[test]
+    fn windowed_dse_kills_a_vector_store_a_wider_one_covers() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movsd %xmm0, 16(%rsp)\n    movdqu %xmm1, 16(%rsp)\n    movdqu 16(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let narrow: Vec<usize> = (0..store.len())
+            .filter(|&i| {
+                matches!(
+                    infos[i].kind,
+                    LineKind::StoreXmmRbp {
+                        offset: 16,
+                        size: MoveSize::SD
+                    }
+                )
+            })
+            .collect();
+        let wide: Vec<usize> = (0..store.len())
+            .filter(|&i| {
+                matches!(
+                    infos[i].kind,
+                    LineKind::StoreXmmRbp {
+                        offset: 16,
+                        size: MoveSize::DQ
+                    }
+                )
+            })
+            .collect();
+        assert_eq!((narrow.len(), wide.len()), (1, 1));
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(infos[narrow[0]].is_nop(), "the 8-byte store is covered");
+        assert!(!infos[wide[0]].is_nop(), "the covering store is reloaded");
+    }
+
+    /// An address-taken vector slot is pinned by the real pipeline and must not
+    /// be reported as deletable, exactly as the GP case above pins.
+    /// `pin_address_taken_stack_slots` is textual and kind-agnostic, and
+    /// `direct_stack_slot` checks `(%rsp)` before `(%rbp)`, so a `leaq` of an
+    /// rsp-relative vector slot pins it.
+    #[test]
+    fn windowed_dse_does_not_report_pinned_vector_stores_as_deleted() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    movdqu %xmm1, 16(%rsp)\n    leaq 16(%rsp), %rcx\n    movdqu 16(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        super::super::pin_address_taken_stack_slots(&store, &mut infos);
+        let spills: Vec<usize> = (0..store.len())
+            .filter(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .collect();
+        assert_eq!(spills.len(), 2);
+        assert!(
+            spills.iter().all(|&i| infos[i].pinned),
+            "an address-taken vector slot is pinned"
+        );
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(spills.iter().all(|&i| !infos[i].is_nop()));
+    }
+
+    /// `%rbp` holding a RIP-relative static address cannot point into the frame,
+    /// so its dereferences -- including the `%gs:`-qualified ones the kernel
+    /// per-CPU copy idiom uses -- do not have to be treated as possible readers
+    /// of an `%rsp` slot.  This is the shape that kept five dead spills alive in
+    /// tests/bench/k_seg_gs_copy.c: no `movq %rsp, %rbp` anywhere, the source
+    /// buffer loaded with `leaq bench_seg_src(%rip), %rbp`, and every iteration
+    /// reading it through `%gs:`.
+    #[test]
+    fn windowed_dse_retires_a_dead_spill_beside_a_proven_static_rbp_deref() {
+        // No `pushq %rbp` / `popq %rbp`: the pop restores the caller's value, so
+        // %rbp is NOT written only by RIP-relative leas and the provenance
+        // legitimately does not hold.  A frame-pointer-less function that borrows
+        // %rbp as a data register is the shape codegen actually emits here.
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    leaq bench_seg_src(%rip), %rbp\n    movdqu %gs:(%rbp), %xmm0\n    movdqu %xmm0, 16(%rsp)\n    movdqu %gs:16(%rbp), %xmm0\n    movdqu %xmm0, 16(%rsp)\n    movdqu 16(%rsp), %xmm1\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        assert!(
+            !(0..store.len()).any(|i| infos[i].trimmed(store.get(i)) == "movq %rsp, %rbp"),
+            "the fixture has no frame pointer, so the guard would otherwise fire"
+        );
+        let spills: Vec<usize> = (0..store.len())
+            .filter(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .collect();
+        assert_eq!(
+            spills.len(),
+            2,
+            "both spills classify as vector slot stores"
+        );
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(
+            infos[spills[0]].is_nop(),
+            "the first spill is dead: overwritten before the only reload"
+        );
+        assert!(!infos[spills[1]].is_nop(), "the reloaded spill survives");
+    }
+
+    /// The relaxation is provenance-gated, not blanket: as soon as `%rbp` is
+    /// written by anything that is not a RIP-relative `lea`, its dereferences are
+    /// opaque again and the spill must survive.  Each fixture differs from the one
+    /// above by a single `%rbp` write.
+    #[test]
+    fn windowed_dse_keeps_the_spill_when_rbp_provenance_is_not_proven() {
+        for writer in [
+            "    movq %rax, %rbp",             // an arbitrary register
+            "    movq %rsp, %rbp",             // a frame pointer after all
+            "    leaq tbl(%rip,%rax,8), %rbp", // RIP-relative but indexed
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    subq $56, %rsp\n    leaq bench_seg_src(%rip), %rbp\n{writer}\n    movdqu %gs:(%rbp), %xmm0\n    movdqu %xmm0, 16(%rsp)\n    movdqu %gs:16(%rbp), %xmm0\n    movdqu %xmm0, 16(%rsp)\n    movdqu 16(%rsp), %xmm1\n    addq $56, %rsp\n    ret\n.cfi_endproc\n"
+            );
+            let (store, mut infos) = build(&asm);
+            let spills: Vec<usize> = (0..store.len())
+                .filter(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+                .collect();
+            assert_eq!(spills.len(), 2, "{writer}");
+            eliminate_dead_stores(&store, &mut infos);
+            assert!(
+                !infos[spills[0]].is_nop(),
+                "with `{writer}` in the function, (%rbp) is opaque again and the \
+                 first spill must survive"
+            );
+        }
+        // A function that never writes %rbp knows nothing about it -- the value
+        // arrives from the caller -- so an opaque `(%rbp)` dereference BETWEEN the
+        // two spills is honoured as a possible reader and keeps the first alive.
+        // (The same line placed BEFORE the candidate observes neither store, and
+        // there the first spill really is dead: the scan only looks forward.)
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    movdqu %gs:(%rbp), %xmm1\n    movdqu %xmm0, 16(%rsp)\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spills: Vec<usize> = (0..store.len())
+            .filter(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .collect();
+        assert_eq!(spills.len(), 2);
+        assert!(
+            !rbp_only_loaded_rip_relative(&store, &infos, 0, store.len()),
+            "%rbp is never written, so no provenance is proven"
+        );
+        eliminate_dead_stores(&store, &mut infos);
+        assert!(
+            !infos[spills[0]].is_nop(),
+            "the opaque (%rbp) dereference between the spills may read the slot"
+        );
+    }
+
+    /// A segment-qualified store is not a frame-slot store, so it is never a
+    /// dead-store candidate. Operand shape taken verbatim from
+    /// tests/bench/k_seg_gs_copy.c at -O2 (`movdqu %xmm0, %gs:(%rbp)`, which
+    /// writes through the pointer in %rbp via the %gs base).  Before
+    /// `is_direct_frame_slot` guarded the slot parsers this line classified as
+    /// `StoreXmmRbp { offset: 0, size: DQ }` -- `fast_parse_i32("%gs:")` answers
+    /// 0 because its first byte is not a digit -- so a real slot store at 0
+    /// "covered" it and this pass deleted a `__seg_gs` write.  The window
+    /// compares offsets without bases, which is what made the two lines look
+    /// like the same slot.
+    #[test]
+    fn windowed_dse_never_deletes_a_segment_qualified_store() {
+        // Two vector spills at 32(%rsp), the first genuinely dead, so the pass
+        // has real work to do: the assertion that matters is that it does that
+        // work WITHOUT touching the segment store.
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, %gs:(%rbp)\n    movdqu %xmm3, 32(%rsp)\n    movdqu %xmm4, 32(%rsp)\n    movdqu 32(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let seg = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).contains("%gs:"))
+            .expect("the segment store is in the fixture");
+        assert!(
+            !matches!(
+                infos[seg].kind,
+                LineKind::StoreXmmRbp { .. } | LineKind::StoreRbp { .. }
+            ),
+            "a segment-qualified operand must not classify as a slot store"
+        );
+        assert!(
+            infos[seg].has_indirect_mem,
+            "it must be marked opaque so every offset-tracking pass bails"
+        );
+        let spills: Vec<usize> = (0..store.len())
+            .filter(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 32, .. }))
+            .collect();
+        assert_eq!(spills.len(), 2, "only the plain spills are slot stores");
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(
+            !infos[seg].is_nop(),
+            "the __seg_gs write must survive: it is not a stack slot"
+        );
+        assert!(infos[spills[0]].is_nop(), "the first spill is dead");
+        assert!(!infos[spills[1]].is_nop(), "the reloaded spill survives");
     }
 
     /// The windowed DSE models NOP'd lines as absent: a forwarded (NOP'd)

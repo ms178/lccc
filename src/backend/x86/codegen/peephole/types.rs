@@ -1380,11 +1380,90 @@ pub(super) fn strip_mov_prefix(s: &str, allow_slq: bool) -> Option<(&str, MoveSi
     }
 }
 
+/// True when the memory operand opening at byte index `i` of `s` (i.e. the `(`
+/// of `disp(%base)`) is qualified by a segment override -- `%gs:`, `%fs:`,
+/// `%ds:`, `%es:`, `%cs:` or `%ss:` immediately before it.
+///
+/// A segment-qualified access resolves through a segment base, so it addresses
+/// whatever the descriptor points at, never a frame slot of this function.  In
+/// the kernel that is how `__seg_gs` reaches its per-CPU data, and the same
+/// spelling reaches TLS in user code.
+///
+/// `i < 4` is checked before the slice, and the bytes compared are ASCII, so the
+/// index arithmetic is char-boundary safe even though assembly text may contain
+/// UTF-8 identifiers (UCN spellings).
+#[inline]
+fn preceded_by_segment_override(s: &str, i: usize) -> bool {
+    let b = s.as_bytes();
+    // Step back over the displacement, if any: `%gs:(%rbp)` has none, but
+    // `%gs:16(%rbp)` puts `16` between the override and the `(`.  Only digits
+    // and a leading sign are stepped over, so the walk stops at the `:` of an
+    // override and at anything else (a `,` between operands, a `)` from a
+    // previous operand, a space) without ever crossing into another operand.
+    let mut j = i;
+    while j > 0 && (b[j - 1].is_ascii_digit() || b[j - 1] == b'-') {
+        j -= 1;
+    }
+    // j is now the first byte of the displacement, or i when there is none.  A
+    // segment override is `%gs:` -- FOUR bytes, `%` + two letters + `:` -- so the
+    // `%` sits at j - 4.  (Counting it at j - 3 was an off-by-one that let every
+    // displaced form through: `%gs:16(%rbp)` parsed as frame slot 16.)
+    j >= 4
+        && b[j - 1] == b':'
+        && b[j - 4] == b'%'
+        && b[j - 3].is_ascii_lowercase()
+        && matches!(b[j - 2], b'g' | b'f' | b'd' | b'e' | b'c' | b's')
+}
+
+/// True when `mem` is a *direct frame-slot* operand: an optional decimal
+/// displacement immediately followed by `(%rbp)` or `(%rsp)`, and nothing else.
+///
+/// A segment override is not a frame slot.  `%gs:(%rbp)` and `%gs:16(%rbp)`
+/// dereference the pointer held in `%rbp` through a segment base, so they address
+/// arbitrary memory -- but the bare suffix test the slot parsers used
+/// (`ends_with("(%rbp)")`) accepts both, and `fast_parse_i32` then answers 0 for
+/// the displacement `"%gs:16"`, because its first byte is not a digit and the
+/// scan stops there.  So `movdqu %xmm0, %gs:(%rbp)` classified as a store to
+/// frame slot 0, and `movq %rax, %gs:(%rbp)` as a GP store to slot 0: candidates
+/// that windowed dead-store elimination may delete as soon as another store
+/// covers those bytes, silently losing a `__seg_gs` write -- and `%gs` is how the
+/// kernel reaches its per-CPU data.  Measured on tests/bench/k_seg_gs_copy.c at
+/// -O2: five segment-qualified `%rbp` operands, one of them a store
+/// (`movdqu %xmm0, %gs:(%rbp)`).
+///
+/// Rejecting is the conservative direction.  The line falls back to `Other`,
+/// which every slot pass already treats as "may read or write memory", so a
+/// rejected operand forgoes an optimization and can never justify a deletion.
+#[inline]
+pub(super) fn is_direct_frame_slot(mem: &str) -> bool {
+    let disp = if mem.ends_with("(%rbp)") || mem.ends_with("(%rsp)") {
+        &mem[..mem.len() - 6]
+    } else {
+        return false;
+    };
+    // A bare `(%rsp)` has no displacement and is a slot at offset 0.
+    if disp.is_empty() {
+        return true;
+    }
+    // Otherwise the displacement must be plain decimal.  A `%`, a `:` or an
+    // index register means the operand is not a slot this compiler can reason
+    // about -- and, before this guard, never was.
+    let bytes = disp.as_bytes();
+    let digits = if bytes[0] == b'-' { &bytes[1..] } else { bytes };
+    // The digit test alone is not enough: `%gs:16(%rbp)` has displacement
+    // `%gs:16`, whose digits would pass if the `%gs:` prefix were stripped by
+    // anything upstream of here.  Requiring every byte to be a digit rejects it,
+    // and the explicit `:` test documents why.
+    !digits.is_empty() && !digits.contains(&b':') && digits.iter().all(u8::is_ascii_digit)
+}
+
 /// Parse a scalar-FP / SSE stack move: `movsd`, `movss`, `movd` (or AVX
 /// `vmovsd`/`vmovss`) between an XMM register and a frame slot. Returns
 /// (is_store, offset_str, size). The string-op and reg-reg forms are
 /// rejected by construction (the slot operand, not `%ds:/%es:` or an XMM,
-/// must be one of the two ends).
+/// must be one of the two ends), and `is_direct_frame_slot` is what enforces
+/// the "not `%ds:/%es:`" half: a segment-qualified operand addresses arbitrary
+/// memory, so it is no slot at all.
 pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
     let body = if let Some(r) = s.strip_prefix("vmovdqu ") {
         (r, MoveSize::DQ)
@@ -1429,8 +1508,8 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
     let (src, dst) = body.0.split_once(',')?;
     let src = src.trim_ascii();
     let dst = dst.trim_ascii();
-    let store = src.starts_with('%') && (dst.ends_with("(%rbp)") || dst.ends_with("(%rsp)"));
-    let load = dst.starts_with('%') && (src.ends_with("(%rbp)") || src.ends_with("(%rsp)"));
+    let store = src.starts_with('%') && is_direct_frame_slot(dst);
+    let load = dst.starts_with('%') && is_direct_frame_slot(src);
     if !store && !load {
         return None;
     }
@@ -1485,12 +1564,12 @@ pub(super) fn parse_store_to_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)> 
     if !src.starts_with('%') {
         return None;
     }
-    // Accept both (%rbp) and (%rsp) for frame pointer / frame-pointer-less modes
-    if dst.ends_with("(%rbp)") {
-        let offset = &dst[..dst.len() - 6];
-        return Some((src, offset, size));
-    }
-    if dst.ends_with("(%rsp)") {
+    // Accept both (%rbp) and (%rsp) for frame pointer / frame-pointer-less
+    // modes.  `is_direct_frame_slot` is what keeps a segment-qualified operand
+    // (`movq %rax, %gs:(%rbp)`, a write through the pointer in %rbp) out of the
+    // slot model: it is arbitrary memory, and classifying it as slot 0 made it a
+    // dead-store candidate.
+    if is_direct_frame_slot(dst) {
         let offset = &dst[..dst.len() - 6];
         return Some((src, offset, size));
     }
@@ -1511,12 +1590,13 @@ pub(super) fn parse_load_from_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)>
         return None;
     }
 
-    // Accept both (%rbp) and (%rsp) for frame pointer / frame-pointer-less modes
-    if src.ends_with("(%rbp)") {
-        let offset = &src[..src.len() - 6];
-        return Some((offset, dst, size));
-    }
-    if src.ends_with("(%rsp)") {
+    // Accept both (%rbp) and (%rsp) for frame pointer / frame-pointer-less
+    // modes, and reject a segment-qualified operand: `movdqu %gs:16(%rbp),
+    // %xmm0` reads through the pointer held in %rbp, not a frame slot, and the
+    // bare suffix test parsed its displacement `"%gs:16"` as 0.  A load claimed
+    // at the wrong offset is not merely conservative -- store forwarding may
+    // then satisfy it from a register instead of performing the segment read.
+    if is_direct_frame_slot(src) {
         let offset = &src[..src.len() - 6];
         return Some((offset, dst, size));
     }
@@ -1726,6 +1806,17 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     let mut i = 0;
     while i < len {
         if bytes[i] == b'(' && i + 2 < len && bytes[i + 1] == b'%' {
+            // A segment override makes the address arbitrary even when the base
+            // register is %rbp/%rsp: `%gs:(%rbp)` dereferences the pointer held
+            // in %rbp through the %gs base, so it is no frame-slot access and no
+            // slot reasoning may assume it touches one known slot.  Without this
+            // the line reported a *known* frame offset -- 0, because parsing the
+            // displacement `"%gs:"` stops at the first non-digit -- and
+            // dead-store elimination then skipped it as an access to a different
+            // slot instead of treating it as opaque memory.
+            if preceded_by_segment_override(s, i) {
+                return true;
+            }
             // Found "(%" - check if it's %rbp or %rsp (which are not indirect aliasing)
             let rest = &s[i + 2..];
             let r8 = first8(rest);
@@ -1867,6 +1958,15 @@ pub(super) fn parse_rbp_offset(s: &str) -> i32 {
                 || (bytes[i + 3] == b's' && bytes[i + 4] == b'p'))
             && bytes[i + 5] == b')'
         {
+            // `%gs:(%rbp)` is a write through the pointer in %rbp, not a frame
+            // slot: reporting offset 0 for it would let any caller that reads
+            // `rbp_offset` reason about a slot that does not exist.  Every
+            // current caller gates on `has_indirect_mem` first (which the
+            // segment override also sets), so this is defence in depth for the
+            // next one.
+            if preceded_by_segment_override(s, i) {
+                return RBP_OFFSET_NONE;
+            }
             // Found "(%rbp)" at position i. Parse the offset before '('.
             // The offset is the integer immediately before the '(' character.
             let offset = if i == 0 {
@@ -3047,6 +3147,35 @@ pub(super) fn write_rbp_pattern(buf: &mut [u8; 24], offset: i32) -> usize {
     pos + 6
 }
 
+/// The `write_rbp_pattern` sibling for an `%rsp`-relative slot.
+///
+/// Dead-store elimination's textual last resort asks "does this line mention the
+/// candidate's slot?" and for years the only spelling it could build was
+/// `N(%rbp)`.  A store to `16(%rsp)` therefore went looking for `16(%rbp)` -- a
+/// string that never names its own slot, but which unrelated lines do contain:
+/// `movdqu %gs:16(%rbp), %xmm0` (a per-CPU read through a static pointer) ends
+/// with `16(%rbp)`, so it was counted as a read of stack slot 16 and kept dead
+/// spills alive.  Callers that cannot tell which base the slot uses check both
+/// patterns, which is strictly more conservative than checking one.
+#[inline]
+pub(super) fn write_rsp_pattern(buf: &mut [u8; 24], offset: i32) -> usize {
+    let mut pos = 0;
+    if offset < 0 {
+        buf[pos] = b'-';
+        pos += 1;
+        let abs = if offset == i32::MIN {
+            (i32::MIN as i64).unsigned_abs() as u32
+        } else {
+            (-offset) as u32
+        };
+        pos += write_u32_digits(&mut buf[pos..], abs);
+    } else if offset > 0 {
+        pos += write_u32_digits(&mut buf[pos..], offset as u32);
+    }
+    buf[pos..pos + 6].copy_from_slice(b"(%rsp)");
+    pos + 6
+}
+
 /// Write decimal digits of a u32 into a buffer. Returns the number of bytes written.
 #[inline]
 fn write_u32_digits(buf: &mut [u8], mut v: u32) -> usize {
@@ -4030,5 +4159,240 @@ mod tls_descriptor_tests {
             LineKind::Call
         ));
         assert!(!classify_line("    leaq sl(%rip), %rax").pinned);
+    }
+}
+
+/// A segment-qualified `%rbp`/`%rsp` operand addresses arbitrary memory, not a
+/// frame slot.  The suffix test the slot parsers used (`ends_with("(%rbp)")`)
+/// accepted `%gs:(%rbp)`, and `fast_parse_i32` answered 0 for the displacement
+/// `"%gs:16"` because its first byte is not a digit -- so a `__seg_gs` write
+/// classified as a store to slot 0 and became a dead-store candidate.  These
+/// pin the guard and the classification it restores.
+#[cfg(test)]
+mod segment_override_slot_tests {
+    use super::{
+        LineKind, MoveSize, RBP_OFFSET_NONE, classify_line, has_indirect_memory_access,
+        is_direct_frame_slot, parse_fp_slot_move, parse_load_from_rbp_str, parse_rbp_offset,
+        parse_store_to_rbp_str,
+    };
+
+    /// True when `line` was filed as a frame-slot access of any family.
+    fn is_slot_kind(line: &str) -> bool {
+        matches!(
+            classify_line(line).kind,
+            LineKind::StoreRbp { .. }
+                | LineKind::LoadRbp { .. }
+                | LineKind::StoreXmmRbp { .. }
+                | LineKind::LoadXmmRbp { .. }
+        )
+    }
+
+    #[test]
+    fn direct_frame_slots_are_accepted() {
+        for mem in [
+            "16(%rsp)",
+            "(%rbp)",
+            "(%rsp)",
+            "-8(%rbp)",
+            "0(%rsp)",
+            "232(%rsp)",
+        ] {
+            assert!(is_direct_frame_slot(mem), "{mem} is a frame slot");
+        }
+    }
+
+    #[test]
+    fn segment_overrides_are_not_frame_slots() {
+        // Every segment override, and both a bare and a displaced form: these
+        // dereference the pointer in %rbp/%rsp through a segment base.
+        for mem in [
+            "%gs:(%rbp)",
+            "%gs:16(%rbp)",
+            "%gs:48(%rbp)",
+            "%fs:8(%rsp)",
+            "%ds:(%rbp)",
+            "%es:16(%rsp)",
+            "%cs:(%rbp)",
+            "%ss:0(%rsp)",
+        ] {
+            assert!(!is_direct_frame_slot(mem), "{mem} is not a frame slot");
+        }
+    }
+
+    #[test]
+    fn foreign_bases_and_malformed_displacements_are_not_frame_slots() {
+        for mem in [
+            "16(%r15)",        // another base register
+            "(%rax)",          //
+            "16(%rbp,%rax,4)", // indexed: does not even end with (%rbp)
+            "16(%rip)",        // PC-relative
+            "%gs:",            // segment with no memory operand
+            "",                //
+            "abc(%rbp)",       // non-numeric displacement
+            "0x10(%rbp)",      // hexadecimal is not what the emitter writes
+            "-(%rsp)",         // sign with no digits
+            "1 6(%rsp)",       // embedded space
+        ] {
+            assert!(!is_direct_frame_slot(mem), "{mem:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn the_three_slot_parsers_reject_segment_qualified_operands() {
+        // The store form that made a `__seg_gs` write a dead-store candidate.
+        assert_eq!(parse_store_to_rbp_str("movq %rax, %gs:(%rbp)"), None);
+        assert_eq!(parse_fp_slot_move("movdqu %xmm0, %gs:(%rbp)"), None);
+        // The load form: a wrong offset here is not merely conservative, store
+        // forwarding may satisfy the load from a register instead of reading
+        // through the segment.
+        assert_eq!(parse_load_from_rbp_str("movq %gs:(%rbp), %rax"), None);
+        assert_eq!(parse_fp_slot_move("movdqu %gs:16(%rbp), %xmm0"), None);
+        assert_eq!(parse_fp_slot_move("movsd %gs:8(%rbp), %xmm0"), None);
+    }
+
+    #[test]
+    fn the_three_slot_parsers_still_accept_plain_slots() {
+        assert_eq!(
+            parse_store_to_rbp_str("movq %rax, -8(%rbp)"),
+            Some(("%rax", "-8", MoveSize::Q))
+        );
+        assert_eq!(
+            parse_load_from_rbp_str("movslq -24(%rbp), %rax"),
+            Some(("-24", "%rax", MoveSize::SLQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("movdqu %xmm6, 72(%rsp)"),
+            Some((true, "72", MoveSize::DQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("vmovdqu %ymm0, 16(%rsp)"),
+            Some((true, "16", MoveSize::QQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("movsd 16(%rsp), %xmm0"),
+            Some((false, "16", MoveSize::SD))
+        );
+        // A bare `(%rsp)` is slot 0, with an empty displacement.
+        assert_eq!(
+            parse_fp_slot_move("movdqu %xmm0, (%rsp)"),
+            Some((true, "", MoveSize::DQ))
+        );
+        // Same for the GP arms, so the guard costs no existing optimization.
+        assert_eq!(
+            parse_store_to_rbp_str("movq %rax, (%rsp)"),
+            Some(("%rax", "", MoveSize::Q))
+        );
+        assert_eq!(
+            parse_load_from_rbp_str("movq (%rbp), %rax"),
+            Some(("", "%rax", MoveSize::Q))
+        );
+    }
+
+    #[test]
+    fn segment_qualified_accesses_classify_outside_the_slot_model() {
+        // Shapes measured in tests/bench/k_seg_gs_copy.c at -O2.
+        for line in [
+            "    movdqu %xmm0, %gs:(%rbp)",
+            "    movdqu %gs:(%rbp), %xmm0",
+            "    movdqu %gs:16(%rbp), %xmm0",
+            "    movdqu %gs:48(%rbp), %xmm0",
+            "    movq %rax, %gs:(%rbp)",
+            "    movsd %xmm0, %gs:8(%rbp)",
+        ] {
+            assert!(!is_slot_kind(line), "{line} must not be a slot access");
+        }
+        // The plain slot forms keep their precise classification, so the guard
+        // costs nothing where the operand really is a slot.
+        assert_eq!(
+            classify_line("    movdqu %xmm0, 16(%rsp)").kind,
+            LineKind::StoreXmmRbp {
+                offset: 16,
+                size: MoveSize::DQ
+            }
+        );
+        assert_eq!(
+            classify_line("    movdqu 16(%rsp), %xmm2").kind,
+            LineKind::LoadXmmRbp {
+                offset: 16,
+                size: MoveSize::DQ
+            }
+        );
+        assert!(matches!(
+            classify_line("    movq %rax, -8(%rbp)").kind,
+            LineKind::StoreRbp { offset: -8, .. }
+        ));
+    }
+    /// The marker that makes every slot pass conservative about a segment
+    /// access.  Classification alone is not enough: the line still reports an
+    /// `rbp_offset`, and a pass that reasons about that offset must be told the
+    /// address is opaque.
+    #[test]
+    fn a_segment_override_is_an_indirect_memory_access() {
+        for line in [
+            "    movdqu %xmm0, %gs:(%rbp)",
+            "    movdqu %gs:(%rbp), %xmm0",
+            "    movdqu %gs:16(%rbp), %xmm0",
+            "    movq %rax, %fs:8(%rbp)",
+            "    movl %eax, %gs:16(%rsp)",
+            "    movsd %xmm0, %gs:8(%rbp)",
+        ] {
+            assert!(
+                has_indirect_memory_access(line),
+                "{line} addresses arbitrary memory"
+            );
+            assert!(
+                classify_line(line).has_indirect_mem,
+                "{line} must carry the marker into LineInfo"
+            );
+        }
+        // The plain frame forms must stay precise: marking them indirect would
+        // cost every slot optimization in ordinary code.
+        for line in [
+            "    movdqu %xmm0, 16(%rsp)",
+            "    movq %rax, -8(%rbp)",
+            "    movdqu 16(%rsp), %xmm2",
+        ] {
+            assert!(
+                !has_indirect_memory_access(line),
+                "{line} is a plain frame slot"
+            );
+        }
+        // RIP-relative stays a fixed global address, not indirect.
+        assert!(!has_indirect_memory_access(
+            "    movq x@GOTTPOFF(%rip), %rax"
+        ));
+    }
+    /// `rbp_offset` is what every offset-tracking pass reads, so a segment-
+    /// qualified operand must report NONE rather than 0.  All four current
+    /// callers gate on `has_indirect_mem` first, which the override also sets,
+    /// so this pins the defence-in-depth guard in `parse_rbp_offset` itself.
+    #[test]
+    fn parse_rbp_offset_reports_none_for_a_segment_override() {
+        for line in [
+            "movdqu %xmm0, %gs:(%rbp)",
+            "movdqu %gs:16(%rbp), %xmm0",
+            "movq %rax, %fs:8(%rsp)",
+        ] {
+            assert_eq!(
+                parse_rbp_offset(line),
+                RBP_OFFSET_NONE,
+                "{line} has no frame offset"
+            );
+        }
+        // Plain slots keep their exact offsets, including the negative and the
+        // bare form, so the guard costs nothing where it does not apply.
+        assert_eq!(parse_rbp_offset("movdqu %xmm0, 16(%rsp)"), 16);
+        assert_eq!(parse_rbp_offset("movq %rax, -24(%rbp)"), -24);
+        assert_eq!(parse_rbp_offset("movq %rax, (%rsp)"), 0);
+        // RIP-relative addressing is a fixed address, not a segment override.
+        assert_eq!(
+            parse_rbp_offset("movq x@GOTTPOFF(%rip), %rax"),
+            RBP_OFFSET_NONE
+        );
+        // The marker reaches LineInfo through the classifier, which is the path
+        // every pass actually consults.
+        let info = classify_line("    movdqu %xmm0, %gs:(%rbp)");
+        assert!(info.has_indirect_mem);
+        assert_eq!(info.rbp_offset, RBP_OFFSET_NONE);
     }
 }

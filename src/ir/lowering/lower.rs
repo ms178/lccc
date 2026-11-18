@@ -1106,6 +1106,55 @@ impl Lowerer {
                 if func.attrs.is_const_attr() {
                     self.const_functions.insert(func.name.clone());
                 }
+                // Call-termination facts of a DEFINITION, collected here beside
+                // `pure`/`const` and before any body is lowered (the third pass
+                // does that), so every call site in the TU sees them — including
+                // a caller that precedes the definition.
+                //
+                // This fact used to be collected from *declarations* only
+                // (`ExternalDecl::Declaration` below, and the block-scope
+                // prototypes in `stmt_init`), so a function DEFINED in this TU
+                // and never separately prototyped was invisible to it. The
+                // measured consequence: `expr_calls` did not terminate the
+                // caller with `Terminator::Unreachable`, the implicit `Return`
+                // survived, and the backend emitted a full epilogue after a call
+                // that provably never returns. objtool then reported the dead
+                // epilogue as
+                //   start_kernel+0x3a5: rest_init() missing __noreturn in .c/.h
+                //   or NORETURN() in noreturns.h
+                // even though `rest_init` IS in noreturns.h — the message names
+                // the callee of the dead-end call that precedes unreachable code
+                // (`check.c:validate_reachable_instructions`). Linux 6.18.63
+                // `rest_init` is `static noinline void __ref __noreturn`,
+                // defined in init/main.c and called from `start_kernel` in the
+                // same TU: definition-only, so the fact was lost. The same shape
+                // accounted for `io_worker_exit` (io_uring/io-wq.c) and
+                // `__sysvec_reboot` (arch/x86/kernel/smp.c, two call sites).
+                // A declaration-only control (`static void
+                // __attribute__((noreturn)) g(void);` called from another
+                // function) emits `call g; ud2` correctly, which is what pinned
+                // the gap to the definition path.
+                if func.attrs.is_noreturn() {
+                    self.noreturn_functions.insert(func.name.clone());
+                }
+                // There is no `error_functions` insert here, and adding one on
+                // this channel would not be correct anyway. Measured with
+                // gcc-16 16.2 (`error: call to 'f' declared with attribute
+                // error: boom`), the diagnostic depends on whether the CALL
+                // survives optimisation, which lowering cannot know:
+                //   `static void __attribute__((error("m"))) f(void) {}` called
+                //   in-TU -> gcc errors at -O0, silent at -O2 (the empty body
+                //   lets the call fold away);
+                //   `void f(void) __attribute__((error("m")));` (declaration, no
+                //   body) -> gcc errors at -O0 and -O2;
+                //   lccc -> silent in all four cases.
+                // So the gap is the attribute as a whole, not a missing insert
+                // site: `parsing_error_attr` is a bare bool, so the message text
+                // is not even retained, and the decision point gcc uses is after
+                // DCE. Closing it means keeping name->message for both the
+                // declaration channel (below, and the block-scope prototypes in
+                // `stmt_init`) and this definition channel, then diagnosing the
+                // `Call`s that survive optimisation.
                 self.register_function_meta(
                     &func.name,
                     &func.return_type,

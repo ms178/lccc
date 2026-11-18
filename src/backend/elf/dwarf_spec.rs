@@ -166,6 +166,12 @@ pub(crate) struct DwarfMember {
     /// For a bit-field: its width and its bit offset inside that storage unit
     /// (`StructFieldLayout::bit_offset`, which is the layout's own answer).
     pub bit: Option<(u32, u32)>,
+    /// `DW_AT_alignment`, stated only where the member's alignment was
+    /// explicitly requested (`StructFieldLayout::user_align`), which is where
+    /// gcc-16 states it. A member at its type's natural alignment carries no
+    /// attribute, so a consumer can tell a hole an attribute forced from one
+    /// packing left -- pahole prints these as "forced alignments".
+    pub align: Option<u64>,
 }
 
 /// Whether a record is a struct or a union.
@@ -173,6 +179,62 @@ pub(crate) struct DwarfMember {
 pub(crate) enum RecordKind {
     Struct,
     Union,
+}
+
+/// How one array dimension states its extent in DWARF.
+///
+/// Three spellings, because DWARF has three: `DW_AT_upper_bound: n` for a
+/// dimension of `n + 1` elements, `DW_AT_count: n` for a dimension of exactly
+/// `n`, and neither attribute for the incomplete `int a[]`.
+///
+/// A zero-length array has to be `Count(0)`. It has no upper bound at all --
+/// `count - 1` underflows -- and the saturating subtraction this replaces
+/// produced `DW_AT_upper_bound: 0`, which every consumer reads as ONE element.
+/// Measured against gcc-16 16.2 on `struct { char zero[0]; char two[2]; }`:
+///
+/// ```text
+///   gcc-16: DW_AT_count: 0         DW_AT_upper_bound: 1
+///   lccc:   DW_AT_upper_bound: 0   DW_AT_upper_bound: 1     (before this fix)
+/// ```
+///
+/// pahole read the lccc form as `char zero[1]`, which inflated each of the
+/// eight `__cacheline_group_{begin,end,pad}__*` marker arrays of Linux
+/// 6.18.63 `struct netns_ipv4` by a byte (`sum members` 788 against gcc-16's
+/// 780) and ended in `BRAIN FART ALERT! 896 bytes != 788 (member bytes) + 98
+/// (byte holes)`. `elements` is what makes the array type's own
+/// `DW_AT_byte_size` come out as 0 instead of one element's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ArrayBound {
+    /// `int a[]`: no extent stated, so the array type has no size.
+    Incomplete,
+    /// `DW_AT_count: n` -- a dimension of exactly `n` elements. `n == 0` is the
+    /// GNU zero-length array, which has no representable upper bound.
+    Count(u64),
+    /// `DW_AT_upper_bound: n` -- a dimension of `n + 1` elements.
+    UpperBound(u64),
+}
+
+impl ArrayBound {
+    /// The DWARF spelling of a C dimension of `count` elements (`None` is the
+    /// incomplete `int a[]`).
+    pub(crate) fn of(count: Option<u64>) -> Self {
+        match count {
+            None => Self::Incomplete,
+            Some(0) => Self::Count(0),
+            Some(n) => Self::UpperBound(n - 1),
+        }
+    }
+
+    /// How many elements this dimension holds, or `None` when it states no
+    /// extent. The product over the dimensions is the array type's size in
+    /// elements.
+    pub(crate) fn elements(&self) -> Option<u64> {
+        match *self {
+            Self::Incomplete => None,
+            Self::Count(n) => Some(n),
+            Self::UpperBound(n) => n.checked_add(1),
+        }
+    }
 }
 
 /// An interned type.  Children are indices into [`DwarfUnitSpec::types`], so
@@ -196,13 +258,12 @@ pub(crate) enum DwarfType {
         name: String,
         target: u32,
     },
-    /// A C array.  The bounds are the *upper* bounds, outermost dimension
+    /// A C array.  One [`ArrayBound`] per dimension, outermost dimension
     /// first, because that is the order `int a[2][3]` prints and the order
-    /// GCC 16.2 numbers its subranges (measured); `None` is the incomplete
-    /// `int a[]`.
+    /// GCC 16.2 numbers its subranges (measured).
     Array {
         element: u32,
-        bounds: Vec<Option<u64>>,
+        bounds: Vec<ArrayBound>,
         /// `DW_AT_GNU_vector`: the array is a `vector_size` object, which a
         /// consumer must not treat as a subscriptable array.
         vector: bool,
@@ -211,6 +272,11 @@ pub(crate) enum DwarfType {
         name: Option<String>,
         kind: RecordKind,
         size: u64,
+        /// `DW_AT_alignment` of the record itself: `StructLayout::align` when
+        /// `StructLayout::user_align` says an explicit request raised it, and
+        /// `None` otherwise (gcc-16 states the attribute only for a
+        /// user-aligned `TYPE_ALIGN`, measured).
+        alignment: Option<u64>,
         /// A declaration (`struct S;`) has no members and says so with
         /// `DW_AT_declaration`, so a consumer does not conclude `S` is empty.
         complete: bool,
@@ -797,7 +863,7 @@ impl<'a> TypeGraph<'a> {
             CType::NullPtr => self.intern(DwarfType::Unspecified { name: "nullptr_t" }),
             CType::Array(element, count) => {
                 let element = self.intern_ctype(element);
-                let bounds = vec![count.map(|count| (count as u64).saturating_sub(1))];
+                let bounds = vec![ArrayBound::of(count.map(|count| count as u64))];
                 self.intern(DwarfType::Array {
                     element,
                     bounds,
@@ -814,7 +880,7 @@ impl<'a> TypeGraph<'a> {
                 let count = (*bytes as u64).div_ceil(lane).max(1);
                 self.intern(DwarfType::Array {
                     element: element_index,
-                    bounds: vec![Some(count - 1)],
+                    bounds: vec![ArrayBound::UpperBound(count - 1)],
                     vector: true,
                 })
             }
@@ -823,7 +889,7 @@ impl<'a> TypeGraph<'a> {
                 let count = layout.lanes.max(1) as u64;
                 self.intern(DwarfType::Array {
                     element: element_index,
-                    bounds: vec![Some(count - 1)],
+                    bounds: vec![ArrayBound::UpperBound(count - 1)],
                     vector: true,
                 })
             }
@@ -909,7 +975,7 @@ impl<'a> TypeGraph<'a> {
                 }
                 Layer::Array(count) => self.intern(DwarfType::Array {
                     element: index,
-                    bounds: vec![count.map(|count| (count as u64).saturating_sub(1))],
+                    bounds: vec![ArrayBound::of(count.map(|count| count as u64))],
                     vector: false,
                 }),
             };
@@ -990,6 +1056,7 @@ impl<'a> TypeGraph<'a> {
             name: None,
             kind,
             size: 0,
+            alignment: None,
             complete: false,
             members: Vec::new(),
         };
@@ -1007,6 +1074,7 @@ impl<'a> TypeGraph<'a> {
                     name: record_name(key),
                     kind,
                     size: 0,
+                    alignment: None,
                     complete: false,
                     members: Vec::new(),
                 },
@@ -1024,6 +1092,7 @@ impl<'a> TypeGraph<'a> {
                     (Some(width), Some(offset)) if width > 0 => Some((width, offset)),
                     _ => None,
                 },
+                align: field.user_align.map(|align| align as u64),
             });
         }
         self.fill(
@@ -1032,6 +1101,10 @@ impl<'a> TypeGraph<'a> {
                 name: record_name(key),
                 kind,
                 size: layout.size as u64,
+                // gcc-16 states the record's own alignment only when an
+                // explicit request raised it above the members' natural
+                // alignment, which is what `user_align` records.
+                alignment: layout.user_align.then_some(layout.align as u64),
                 complete: layout.is_complete,
                 members,
             },
@@ -1159,6 +1232,7 @@ mod tests {
                     counted_by: None,
                     pointer_quals: Vec::new(),
                     own_cvr: None,
+                    user_align: None,
                 }],
                 size: 8,
                 align: 8,
@@ -1220,6 +1294,7 @@ mod tests {
                     counted_by: None,
                     pointer_quals: Vec::new(),
                     own_cvr: None,
+                    user_align: None,
                 })
                 .collect(),
             size,
@@ -1403,7 +1478,7 @@ mod tests {
         else {
             panic!("`myint[4]` is an array");
         };
-        assert_eq!(bounds, &vec![Some(3)]);
+        assert_eq!(bounds, &vec![ArrayBound::UpperBound(3)]);
         assert!(
             matches!(&built[*element as usize], DwarfType::Typedef { name, .. } if name == "myint"),
             "the element keeps the alias the declaration wrote"
@@ -1436,6 +1511,7 @@ mod tests {
                     counted_by: None,
                     pointer_quals: Vec::new(),
                     own_cvr: None,
+                    user_align: None,
                 }],
                 size: 8,
                 align: 8,
@@ -1476,12 +1552,14 @@ mod tests {
         let (inner, outer) = (&built[inner as usize], &built[outer as usize]);
         assert!(matches!(
             inner,
-            DwarfType::Array { bounds, vector: false, .. } if bounds == &vec![Some(2)]
+            DwarfType::Array { bounds, vector: false, .. }
+                if bounds == &vec![ArrayBound::UpperBound(2)]
         ));
         assert!(
             matches!(
                 outer,
-                DwarfType::Array { bounds, vector: false, .. } if bounds == &vec![Some(1)]
+                DwarfType::Array { bounds, vector: false, .. }
+                if bounds == &vec![ArrayBound::UpperBound(1)]
             ),
             "the outer dimension is its own array type: {outer:?}"
         );
@@ -1496,8 +1574,156 @@ mod tests {
         let built = types.into_types();
         assert!(matches!(
             &built[id as usize],
-            DwarfType::Array { bounds, .. } if bounds == &vec![None]
+            DwarfType::Array { bounds, .. } if bounds == &vec![ArrayBound::Incomplete]
         ));
+    }
+
+    #[test]
+    fn a_zero_length_array_states_its_count_not_an_upper_bound() {
+        // `char pad[0]` has no upper bound: `count - 1` underflows, and the
+        // saturating subtraction this replaced stated `DW_AT_upper_bound: 0`,
+        // which reads as ONE element. gcc-16 16.2 states `DW_AT_count: 0`
+        // (measured), and pahole printed the lccc form as `char pad[1]`, which
+        // inflated the eight `__cacheline_group_*` markers of Linux 6.18.63
+        // `struct netns_ipv4` by a byte each and ended in `BRAIN FART ALERT!`.
+        let layouts = empty_layouts();
+        let typedefs = FxHashMap::default();
+        let mut types = graph(&layouts, &typedefs);
+        let zero = types.intern_ctype(&CType::Array(Box::new(CType::Char), Some(0)));
+        let one = types.intern_ctype(&CType::Array(Box::new(CType::Char), Some(1)));
+        let two = types.intern_ctype(&CType::Array(Box::new(CType::Char), Some(2)));
+        let built = types.into_types();
+        assert!(matches!(
+            &built[zero as usize],
+            DwarfType::Array { bounds, .. } if bounds == &vec![ArrayBound::Count(0)]
+        ));
+        assert!(matches!(
+            &built[one as usize],
+            DwarfType::Array { bounds, .. } if bounds == &vec![ArrayBound::UpperBound(0)]
+        ));
+        assert!(matches!(
+            &built[two as usize],
+            DwarfType::Array { bounds, .. } if bounds == &vec![ArrayBound::UpperBound(1)]
+        ));
+        // The element count, which is what sizes the array type: zero elements
+        // for the GNU zero-length array, one for `[1]`.
+        assert_eq!(ArrayBound::of(Some(0)).elements(), Some(0));
+        assert_eq!(ArrayBound::of(Some(1)).elements(), Some(1));
+        assert_eq!(ArrayBound::of(Some(2)).elements(), Some(2));
+        assert_eq!(ArrayBound::of(None).elements(), None);
+        assert_eq!(ArrayBound::of(Some(4)), ArrayBound::UpperBound(3));
+    }
+
+    #[test]
+    fn an_explicit_alignment_is_stated_on_the_record_and_its_member() {
+        // Linux 6.18.63 `struct netns_ipv4`: `__cacheline_group_begin__icmp` is
+        // `__u8 [0] __attribute__((aligned(64)))` and the record's alignment is
+        // raised to 64 by those markers. gcc-16 states `DW_AT_alignment: 64` on
+        // the record DIE and on exactly the explicitly aligned member DIEs;
+        // plain members carry none. lccc stated none anywhere, so pahole could
+        // not account for the holes the attribute forces -- gcc's report ends
+        // `forced alignments: 4, forced holes: 2, sum forced holes: 64` and
+        // `} __attribute__((__aligned__(64)));`, lccc's had neither.
+        fn field(
+            name: &str,
+            ty: CType,
+            offset: usize,
+            user_align: Option<usize>,
+        ) -> StructFieldLayout {
+            StructFieldLayout {
+                name: name.to_string(),
+                offset,
+                ty,
+                bit_offset: None,
+                bit_width: None,
+                sso: SsoMode::None,
+                sso_storage_ty: None,
+                base_volatile: false,
+                base_const: false,
+                object_volatile: false,
+                object_const: false,
+                counted_by: None,
+                pointer_quals: Vec::new(),
+                own_cvr: None,
+                written_typedef: None,
+                user_align,
+            }
+        }
+        let mut layouts = empty_layouts();
+        layouts.insert(
+            "struct.grouped".to_string(),
+            Rc::new(StructLayout {
+                is_complete: true,
+                fields: vec![
+                    field(
+                        "__cacheline_group_begin__icmp",
+                        CType::Array(Box::new(CType::Char), Some(0)),
+                        64,
+                        Some(64),
+                    ),
+                    field("icmp_global_credit", CType::Int, 64, None),
+                ],
+                size: 896,
+                align: 64,
+                is_union: false,
+                is_transparent_union: false,
+                requires_designators: false,
+                reverse_sso: false,
+                user_align: true,
+                member_align: 8,
+            }),
+        );
+        // A record whose alignment nothing raised states no attribute.
+        layouts.insert(
+            "struct.plain".to_string(),
+            Rc::new(StructLayout {
+                is_complete: true,
+                fields: vec![field("a", CType::Int, 0, None)],
+                size: 4,
+                align: 4,
+                is_union: false,
+                is_transparent_union: false,
+                requires_designators: false,
+                reverse_sso: false,
+                user_align: false,
+                member_align: 4,
+            }),
+        );
+        let typedefs = FxHashMap::default();
+        let mut types = graph(&layouts, &typedefs);
+        let grouped = types.intern_ctype(&CType::Struct("struct.grouped".into()));
+        let plain = types.intern_ctype(&CType::Struct("struct.plain".into()));
+        let built = types.into_types();
+        let DwarfType::Record {
+            alignment, members, ..
+        } = &built[grouped as usize]
+        else {
+            panic!("expected a record");
+        };
+        assert_eq!(
+            *alignment,
+            Some(64),
+            "the record states its raised alignment"
+        );
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members[0].align,
+            Some(64),
+            "the explicitly aligned marker states it"
+        );
+        assert_eq!(members[1].align, None, "a plain member states nothing");
+        // The marker is still a zero-length array, not a one-byte one.
+        assert!(matches!(
+            &built[members[0].ty as usize],
+            DwarfType::Array { bounds, .. } if bounds == &vec![ArrayBound::Count(0)]
+        ));
+        let DwarfType::Record { alignment, .. } = &built[plain as usize] else {
+            panic!("expected a record");
+        };
+        assert_eq!(
+            *alignment, None,
+            "a naturally aligned record states nothing"
+        );
     }
 
     #[test]
@@ -1523,6 +1749,7 @@ mod tests {
                     counted_by: None,
                     pointer_quals: Vec::new(),
                     own_cvr: None,
+                    user_align: None,
                 }],
                 size: 8,
                 align: 4,
@@ -1566,7 +1793,8 @@ mod tests {
         let built = types.into_types();
         assert!(matches!(
             &built[id as usize],
-            DwarfType::Array { bounds, vector: true, .. } if bounds == &vec![Some(3)]
+            DwarfType::Array { bounds, vector: true, .. }
+            if bounds == &vec![ArrayBound::UpperBound(3)]
         ));
     }
 

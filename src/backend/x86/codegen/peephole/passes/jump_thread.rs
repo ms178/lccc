@@ -1,13 +1,19 @@
 //! Bypass empty direct-jump trampolines left by allocation and dead copies.
 //!
-//! Retarget edges, never reorder code. The only deletion is a relay the
-//! retargeting orphaned: labels no line of the file mentions (so no computed
-//! goto, jump table or address comparison can observe them), entered by no
-//! fallthrough, holding one direct `jmp`. The skipped window
-//! contains only labels, comments, deleted lines and one unconditional jump:
-//! registers, memory and flags are unchanged. Keep function scope, inline asm,
+//! Retarget edges, never reorder code. Two deletions, both proved by the same
+//! retargeting. The first is a relay the retargeting orphaned: labels no line
+//! of the file mentions (so no computed goto, jump table or address comparison
+//! can observe them), entered by no fallthrough, holding one direct `jmp`. The
+//! skipped window contains only labels, comments, deleted lines and one
+//! unconditional jump: registers, memory and flags are unchanged. The second is
+//! a branch the retargeting landed on the label it already falls through to,
+//! which is a no-op whichever way it is spelled — see [`falls_through_to`].
+//! Keep function scope, inline asm,
 //! pinned lines, semantic directives (including CFI and alignment padding),
-//! short-only counter branches and cyclic/overlong chains fail-closed.
+//! short-only counter branches and cyclic/overlong chains fail-closed. Section
+//! switches are the one directive family the sweep READS rather than refuses:
+//! they do not emit bytes into the section being left, so they say something
+//! precise about fallthrough (see [`remove_dead_relays`]).
 //!
 //! Switch jump-table ENTRIES thread through the same proof. A shared-body
 //! `switch` routinely dispatches a case through a relay the branch rewrites
@@ -20,8 +26,15 @@
 //! whose element VALUES a program may compare — is never touched: those
 //! arrive through `&&label` materialisation, not through a `.Ljt` table.
 //! Retargeting an entry does not move, grow or renumber anything; the relay
-//! itself then becomes unreferenced and the ordinary orphan sweep deletes it.
+//! itself then becomes unreferenced and the ordinary orphan sweep deletes it —
+//! provided the sweep can still see that nothing falls through into it. A relay
+//! emitted AFTER its table sits behind the directive that returns from the
+//! table, so the sweep carries that verdict across the excursion instead of
+//! reading the return as an ordinary line: GAS resumes each section where it
+//! left off, and `remove_dead_relays` documents the identity gate that keeps
+//! this from restoring a verdict into a different section.
 use super::super::types::*;
+use crate::backend::peephole_common::{SectionKind, SectionSwitch, SectionTracker, section_switch};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 pub(super) fn local_label(s: &str) -> Option<u32> {
@@ -67,6 +80,53 @@ fn branch(s: &str) -> Option<(&str, u32)> {
         return None;
     }
     Some((mnemonic, local_label(target)?))
+}
+
+/// Does control fall from line `i` to `.LBB<target>` without executing anything?
+///
+/// Labels, deleted lines, inert comments and byteless debug attribution emit no
+/// bytes, so the answer is yes when the target's definition comes before any
+/// line that does emit. That is exactly the question a retarget needs answered
+/// before it can delete the branch it was about to rewrite: if control arrives
+/// at the target either way, the branch is a no-op — for a `jmp` because it is
+/// unconditional, and for a `jcc` because both of its outcomes then lead to the
+/// same instruction. Flags are not touched by a branch, so nothing else is
+/// observable.
+///
+/// Scoped to the function window, and every line that could emit a byte — an
+/// instruction, a data or alignment directive, inline asm, a pinned line —
+/// answers no. Stacked labels answer yes: falling through `.LBB26:` into
+/// `.LBB27:` executes the same instructions as jumping to `.LBB27` directly,
+/// and `.LBB26` keeps its own references either way.
+fn falls_through_to(
+    store: &LineStore,
+    infos: &[LineInfo],
+    i: usize,
+    hi: usize,
+    target: u32,
+) -> bool {
+    for j in (i + 1)..hi {
+        let info = infos[j];
+        let s = info.trimmed(store.get(j));
+        if info.is_nop() || info.kind == LineKind::Empty || inert_comment(s) {
+            continue;
+        }
+        if info.kind == LineKind::Label {
+            if local_label(label_text(s)) == Some(target) {
+                return true;
+            }
+            continue;
+        }
+        if info.kind == LineKind::Directive
+            && !info.pinned
+            && info.is_steppable()
+            && is_debug_marker_directive(s)
+        {
+            continue;
+        }
+        return false;
+    }
+    false
 }
 
 fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi: usize) -> bool {
@@ -154,6 +214,21 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
             continue;
         };
         let comment = s.find('#').map(|at| &s[at..]).unwrap_or("");
+        // A retarget can land the branch on the label it ALREADY falls through
+        // to, which makes it a no-op: `loop_global_promote.c` at -O2 carries
+        // `    jmp .LBB27` directly above `.LBB27:` after the peepholes and no
+        // such jump before them (measured on that TU with LCCC_NO_PEEPHOLE=1: 0
+        // against 2), so the retargeting created it — and
+        // `eliminate_redundant_jumps` ran three phases earlier, so nobody else
+        // will notice.  Delete instead of write.  A compiler-owned marker in the
+        // trailing comment has to survive, so such a line is still rewritten.
+        if (comment.is_empty() || inert_comment(comment))
+            && falls_through_to(store, infos, i, hi, *final_target)
+        {
+            mark_nop(&mut infos[i]);
+            changed = true;
+            continue;
+        }
         let replacement = format!("    {mnemonic} .LBB{final_target} {comment}");
         replace_line(store, &mut infos[i], i, replacement);
         changed = true;
@@ -274,11 +349,194 @@ fn label_uses(store: &LineStore, infos: &[LineInfo]) -> (FxHashSet<u32>, FxHashS
     (used, duplicate)
 }
 
+/// The identity of the section an `Enter`/`Push` switch selects: the name GAS
+/// keys the section by, with the flag/type/align arguments dropped (they do not
+/// make it a different section) and the bare forms spelled the way `.section`
+/// spells them, so `.text` and `.section .text,"ax",@progbits` compare equal —
+/// which matters because the emitter uses both for one section (a bare `.text`
+/// in `ipa_ra`'s hot/cold text against `EmitState::restore_current_text_section`
+/// returning from a switch table). A subsection argument is KEPT, so `.text 1`
+/// stays distinct from `.text`: another chunk of the same section is not a place
+/// the previous chunk falls through into.
+///
+/// Only called on a line [`section_switch`] classified as `Enter`/`Push`, which
+/// has already certified it is a single statement, so the name is the first
+/// token and the identity ends at the first comma. `None` costs the restore,
+/// never soundness.
+fn section_identity(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    let stmt = trimmed.strip_prefix('.')?;
+    let end = stmt.find(char::is_whitespace).unwrap_or(stmt.len());
+    match &stmt[..end] {
+        "section" | "pushsection" => {
+            let ident = stmt[end..].trim_start().split(',').next()?.trim();
+            (ident.starts_with('.') && !ident.contains(char::is_whitespace)).then_some(ident)
+        }
+        // The bare forms GAS accepts — measured on binutils 2.47 `as`, which
+        // assembles `.text`, `.data`, `.bss` and `.text 1` and REJECTS a bare
+        // `.rodata`/`.tdata`/`.tbss` ("unknown pseudo-op").  This arm list has
+        // to agree with `section_switch`'s: an identity for a spelling the
+        // shared classifier does not report would be dead code, and a spelling
+        // it reports but this refuses would silently cost the restore.
+        "text" | "data" | "bss" => {
+            if stmt[end..].trim().is_empty() {
+                Some(&trimmed[..1 + end])
+            } else {
+                Some(trimmed)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Where the assembly text is in section-IDENTITY terms. [`SectionTracker`]
+/// answers "code or not" and handles `.pushsection`/`.previous` exactly, but a
+/// fallthrough verdict may only be restored into the section that EARNED it, and
+/// two code sections (`.text` against `.text.hot`) are two places in the object
+/// file. So the sweep tracks names beside the shared tracker's kinds, with the
+/// same push/pop shape GAS has.
+#[derive(Clone, Debug)]
+struct SectionIdentity {
+    current: Option<String>,
+    pushed: Vec<Option<String>>,
+}
+
+impl Default for SectionIdentity {
+    /// A translation unit starts in `.text`: GAS's initial section, the one
+    /// `SectionTracker::default` assumes and the value
+    /// `EmitState::current_text_section` is constructed with.
+    fn default() -> Self {
+        Self::at(Some(".text"))
+    }
+}
+
+impl SectionIdentity {
+    /// A scan that starts inside a function body: the identity [`run`] tracked
+    /// to that function's `.cfi_startproc`, or unknown.
+    fn at(entry: Option<&str>) -> Self {
+        SectionIdentity {
+            current: entry.map(str::to_string),
+            pushed: Vec::new(),
+        }
+    }
+
+    fn current(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
+
+    /// Follow one switch and report the identity it lands in. `.popsection`
+    /// hands back the name the matching `.pushsection` saved, so a round trip
+    /// through a data section is still provable; `.previous` swaps two sections
+    /// whose names the text does not carry, and an opaque (compound) statement
+    /// may have done anything, so both end in unknown.
+    fn apply(&mut self, switch: SectionSwitch, text: &str) -> Option<&str> {
+        self.current = match switch {
+            SectionSwitch::Enter(_) => section_identity(text).map(str::to_string),
+            SectionSwitch::Push(_) => {
+                self.pushed.push(self.current.take());
+                section_identity(text).map(str::to_string)
+            }
+            SectionSwitch::Pop => self.pushed.pop().unwrap_or(None),
+            SectionSwitch::Previous | SectionSwitch::Opaque => None,
+        };
+        self.current()
+    }
+
+    /// Opaque text — an `#APP` region, a pinned line, conditional assembly —
+    /// forgets everything: a wrong name restores a verdict into a section that
+    /// never earned it, which is a miscompile, while an unknown name only costs
+    /// the deletion.
+    fn forget(&mut self) {
+        self.current = None;
+        self.pushed.clear();
+    }
+}
+
+/// Cheap gate in front of [`section_switch`], which scans the whole statement
+/// (quoting, separators) before it can answer. Only these first letters can
+/// start a section pseudo-op, so the directives that dominate a real
+/// translation unit — `.loc`, `.cfi_*`, `.quad`, `.long`, `.align`, `.globl`,
+/// `.ident`, `.file` — are rejected on one byte instead of one scan. A false
+/// positive costs nothing: [`section_switch`] still decides.
+fn may_switch_section(s: &str) -> bool {
+    matches!(
+        s.trim_start().as_bytes().get(1),
+        Some(b't' | b'd' | b'b' | b's' | b'p')
+    )
+}
+
+/// Directives that can move the next bytes somewhere this scan cannot follow
+/// WITHOUT being a section switch [`section_switch`] reports: conditional
+/// assembly can delete or duplicate a switch wholesale, `.subsection` moves to
+/// another chunk of the same section, and a mode or syntax change re-spells
+/// every line after it. Data directives are deliberately ABSENT — `.quad` and
+/// `.align` are the switch table this proof exists to carry a verdict across,
+/// and `.cfi_*` is absent too: it moves no bytes and changes no section, so the
+/// generic arm below already reads it as the non-terminator it is.
+fn section_proof_ends(s: &str) -> bool {
+    let stmt = s.trim_start().strip_prefix('.').unwrap_or("");
+    let name = stmt
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()
+        .unwrap_or("");
+    matches!(
+        name,
+        "if" | "ifdef"
+            | "ifndef"
+            | "elseif"
+            | "else"
+            | "endif"
+            | "macro"
+            | "endm"
+            | "rept"
+            | "irp"
+            | "irpc"
+            | "altmacro"
+            | "subsection"
+            | "code16"
+            | "code32"
+            | "code64"
+            | "intel_syntax"
+            | "att_syntax"
+            | "arch"
+    )
+}
+
 /// Delete the relays [`thread_function`] orphaned: a run of unreferenced,
 /// uniquely defined, unpinned labels (inert comments between them stay) that
 /// follows an unconditional transfer and ends in one direct `jmp`. Nothing
 /// can reach the run, so dropping it changes no execution, only dead bytes.
-fn remove_dead_relays(store: &LineStore, infos: &mut [LineInfo], lo: usize, hi: usize) -> bool {
+///
+/// "Follows an unconditional transfer" is a property of the SECTION, not of the
+/// line above it: GAS resumes every section exactly where it left off, so the
+/// excursion a switch table makes — `.section .rodata`, the entries, then
+/// `.section .text,"ax",@progbits` from `restore_current_text_section` — does
+/// not interrupt the text section's control flow. Reading that returning
+/// directive as an ordinary non-terminator is what left a relay emitted AFTER
+/// the table alive: the entry rewrite had already retired its last reference,
+/// so the object file carried a label nothing mentions and no fallthrough can
+/// enter, which is precisely objtool's `unreachable instruction` (witness:
+/// `nla_validate_int_range` in a 6.18.63 `lib/nlattr.o`, and
+/// `tests/regression/switch_lut_bitpack.c` locally).
+///
+/// So the verdict earned before the excursion is carried across it — gated on
+/// section IDENTITY, not on [`SectionKind`]: returning to a *different* code
+/// section (`.text` into `.text.hot`) appends after bytes this scan never saw,
+/// and only a same-section round trip may reuse the verdict. Nothing is ever
+/// restored INTO a non-code section, where no instruction executes and this
+/// sweep has no business deleting. One slot suffices because the emitter nests
+/// no excursion inside an excursion; anything that could break the same-section
+/// proof — `.pushsection`/`.popsection`/`.previous`, `.subsection`, a mode or
+/// conditional-assembly directive, inline asm, a pinned line — drops the slot
+/// instead of guessing. `entry_section` is the identity in effect at the
+/// function's `.cfi_startproc`, tracked by [`run`]; `None` restores nothing.
+fn remove_dead_relays(
+    store: &LineStore,
+    infos: &mut [LineInfo],
+    lo: usize,
+    hi: usize,
+    entry_section: Option<&str>,
+) -> bool {
     let mut changed = false;
     loop {
         let (used, duplicate) = label_uses(store, infos);
@@ -290,6 +548,14 @@ fn remove_dead_relays(store: &LineStore, infos: &mut [LineInfo], lo: usize, hi: 
         };
         let mut found = None;
         let mut prev_transfers = false;
+        // Section state for THIS scan (see the function documentation): the
+        // shared tracker answers code/non-code with GAS's push/pop semantics,
+        // `identity` names the section so a round trip can be proven to return
+        // to the same one, and `excursion` carries the single verdict a
+        // code-to-non-code round trip may restore.
+        let mut tracker = SectionTracker::default();
+        let mut identity = SectionIdentity::at(entry_section);
+        let mut excursion: Option<(String, bool)> = None;
         let mut k = lo;
         while k < hi && found.is_none() {
             let info = infos[k];
@@ -321,6 +587,54 @@ fn remove_dead_relays(store: &LineStore, infos: &mut [LineInfo], lo: usize, hi: 
                     found = Some(labels);
                 }
             }
+            // A section switch this scan can read: carry the verdict across an
+            // excursion that returns to the SAME section, forget the proof on
+            // anything else.
+            if info.kind == LineKind::Directive
+                && !info.pinned
+                && may_switch_section(s)
+                && let Some(switch) = section_switch(s)
+            {
+                let leaving = tracker.current();
+                let before = identity.current().map(str::to_string);
+                tracker.apply(switch);
+                let entering = tracker.current();
+                let after = identity.apply(switch, s);
+                // Restore BEFORE re-arming: the returning switch is itself a
+                // switch, and it still has to see what the excursion saved.
+                let restored = match (leaving, entering, after, &excursion) {
+                    (
+                        SectionKind::NonCode,
+                        SectionKind::Code,
+                        Some(name),
+                        Some((from, verdict)),
+                    ) if from == name => Some(*verdict),
+                    _ => None,
+                };
+                excursion = match (leaving, entering) {
+                    (SectionKind::Code, SectionKind::NonCode) => {
+                        before.map(|from| (from, prev_transfers))
+                    }
+                    _ => None,
+                };
+                prev_transfers = restored.unwrap_or(false);
+                k += 1;
+                continue;
+            }
+            // Everything that can move the next bytes somewhere this scan
+            // cannot follow ends the same-section proof: `pin_inline_asm_regions`
+            // reclassifies and pins each line between `#APP` and `#NO_APP`, so a
+            // `.pushsection` with label arithmetic inside one is invisible here;
+            // a prefixed control transfer is pinned for the same reason; and
+            // `section_proof_ends` names the directives that reshape assembly
+            // without naming a section.
+            if info.pinned
+                || info.kind == LineKind::InlineAsm
+                || (info.kind == LineKind::Directive && section_proof_ends(s))
+            {
+                identity.forget();
+                excursion = None;
+            }
             let mnemonic = s.split_whitespace().next().unwrap_or("");
             // `jmpq` is the indirect-dispatch spelling (`jmpq *%rdx`,
             // `jmpq *tbl(,%rax,8)`): unconditional like `jmp`, it never
@@ -344,22 +658,49 @@ fn remove_dead_relays(store: &LineStore, infos: &mut [LineInfo], lo: usize, hi: 
 pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut start = None;
     let mut changed = false;
+    // The section identity in effect at each function's `.cfi_startproc`, which
+    // [`remove_dead_relays`] needs to prove that a switch-table excursion
+    // returns to the SAME section. Seeded with `.text`: that is GAS's initial
+    // section (`SectionTracker::default` starts there too) and the value
+    // `EmitState::current_text_section` is constructed with, so the first
+    // function of a TU that never emits an explicit switch still has an
+    // identity. `None` means unknown, and unknown restores nothing.
+    let mut section = SectionIdentity::default();
+    let mut start_section: Option<String> = None;
     for i in 0..store.len() {
+        let info = infos[i];
+        let mut endproc = None;
+        if info.pinned || info.kind == LineKind::InlineAsm {
+            // Opaque text — `pin_inline_asm_regions` pins every line of an
+            // `#APP` region, and a prefixed control transfer is pinned too. A
+            // wrong name would restore a fallthrough verdict into a section
+            // that never earned it, so forget the identity instead.
+            section.forget();
+        } else if info.kind == LineKind::Directive {
+            let s = info.trimmed(store.get(i));
+            if s == ".cfi_startproc" {
+                start = Some(i + 1);
+                start_section = section.current().map(str::to_string);
+            } else if s == ".cfi_endproc" {
+                // Deferred: `thread_function` below needs `store` mutably.
+                endproc = Some(i);
+            } else if may_switch_section(s)
+                && let Some(switch) = section_switch(s)
+            {
+                section.apply(switch, s);
+            }
+        }
         // DIRECTIVE-LAW: selecting function-boundary markers, not skipping
         // directives in a motion window (only inert debug attribution is transparent).
-        if infos[i].pinned || infos[i].kind != LineKind::Directive {
-            continue;
+        if let Some(hi) = endproc
+            && let Some(lo) = start.take()
+            && thread_function(store, infos, lo, hi)
+        {
+            remove_dead_relays(store, infos, lo, hi, start_section.as_deref());
+            changed = true;
         }
-        let s = infos[i].trimmed(store.get(i));
-        if s == ".cfi_startproc" {
-            start = Some(i + 1);
-        } else if s == ".cfi_endproc" {
-            if let Some(lo) = start.take() {
-                if thread_function(store, infos, lo, i) {
-                    remove_dead_relays(store, infos, lo, i);
-                    changed = true;
-                }
-            }
+        if endproc.is_some() {
+            start_section = None;
         }
     }
     changed
@@ -1245,6 +1586,411 @@ mod tests {
         assert!(changed, "{out}");
         assert!(!out.contains(".long .LBB1"), "entry threaded:\n{out}");
         assert_eq!(out.matches(".long .LBB2 - .Ljt_0").count(), 2, "{out}");
+    }
+
+    /// The witness for the section-scoped verdict. `switch_lut_bitpack.c` in the
+    /// regression corpus and `nla_validate_int_range` in a 6.18.63 `lib/nlattr.o`
+    /// both put the relay AFTER the table, so the line above it is
+    /// `restore_current_text_section`'s `.section .text,"ax",@progbits`. Read as
+    /// an ordinary directive that clears `prev_transfers`, the orphaned relay
+    /// survives into the object file as a label nothing mentions and no
+    /// fallthrough can enter: objtool's `unreachable instruction`. GAS resumes
+    /// `.text` where the dispatch left it and `jmpq *%rdx` never falls through,
+    /// so the verdict the excursion carried is the true one.
+    #[test]
+    fn relay_after_the_table_excursion_is_swept() {
+        let body = concat!(
+            "jmpq *%rdx\n",
+            ".section .rodata\n",
+            ".align 4\n",
+            ".Ljt_0:\n",
+            ".long .LBB1 - .Ljt_0\n",
+            ".long .LBB2 - .Ljt_0\n",
+            ".section .text,\"ax\",@progbits\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "movl $42, %eax\n",
+            "ret\n",
+        );
+        let (changed, out) = apply(body, None);
+        assert!(changed, "{out}");
+        assert!(!out.contains(".long .LBB1"), "entry threaded:\n{out}");
+        assert!(
+            !out.contains(".LBB1:"),
+            "relay behind the section return swept:\n{out}"
+        );
+        // The returning directive is not part of the relay: what follows the
+        // table still assembles into `.text`.
+        assert!(out.contains(".section .text,\"ax\",@progbits"), "{out}");
+        assert!(out.contains("movl $42, %eax"), "{out}");
+    }
+
+    /// The same shape with a predecessor that DOES fall through. The verdict
+    /// carried across the excursion has to be the one the text section earned:
+    /// `addq` falls into `.LBB1`, so retiring the relay would remove the only
+    /// path that fallthrough has \u2014 a miscompile. This is the assertion that
+    /// makes the identity gate load-bearing instead of decorative.
+    #[test]
+    fn fallthrough_before_the_excursion_keeps_the_relay() {
+        let body = concat!(
+            "addq $1, %rax\n",
+            ".section .rodata\n",
+            ".Ljt_0:\n",
+            ".long .LBB1 - .Ljt_0\n",
+            ".long .LBB2 - .Ljt_0\n",
+            ".section .text,\"ax\",@progbits\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "ret\n",
+        );
+        let (_, out) = apply(body, None);
+        assert!(
+            out.contains(".LBB1:"),
+            "reachable relay must survive:\n{out}"
+        );
+        assert!(out.contains("jmp .LBB2"), "{out}");
+        assert!(
+            !out.contains(".long .LBB1"),
+            "the entry itself still threads:\n{out}"
+        );
+    }
+
+    /// Returning to a DIFFERENT code section appends after bytes this scan never
+    /// saw, so the verdict stays behind in `.text` and the relay survives.
+    #[test]
+    fn a_different_code_section_does_not_inherit_the_verdict() {
+        let body = concat!(
+            "jmpq *%rdx\n",
+            ".section .rodata\n",
+            ".Ljt_0:\n",
+            ".long .LBB1 - .Ljt_0\n",
+            ".long .LBB2 - .Ljt_0\n",
+            ".section .text.hot,\"ax\"\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "ret\n",
+        );
+        let (_, out) = apply(body, None);
+        assert!(
+            out.contains(".LBB1:"),
+            "verdict must not cross sections:\n{out}"
+        );
+    }
+
+    /// `.text` IS `.section .text,"ax",@progbits` \u2014 one section, two spellings,
+    /// and the emitter uses both (`ipa_ra` the bare one,
+    /// `restore_current_text_section` the full one), so the identity has to be
+    /// the name rather than the line.
+    #[test]
+    fn both_text_spellings_are_one_identity() {
+        for ret in [".text", ".section .text,\"ax\",@progbits"] {
+            let body = format!(
+                "jmpq *%rdx\n.section .rodata\n.Ljt_0:\n.long .LBB1 - .Ljt_0\n\
+                 .long .LBB2 - .Ljt_0\n{ret}\n.LBB1:\njmp .LBB2\n.LBB2:\nret\n"
+            );
+            let (_, out) = apply(&body, None);
+            assert!(!out.contains(".LBB1:"), "return via {ret}:\n{out}");
+        }
+    }
+
+    /// `.pushsection`/`.popsection` restore what GAS restores \u2014 the section AND
+    /// the position within it \u2014 so the verdict survives the round trip, in both
+    /// directions.
+    #[test]
+    fn pushsection_round_trip_carries_the_verdict_both_ways() {
+        let tail = concat!(
+            ".pushsection .data\n",
+            ".quad 1\n",
+            ".popsection\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "ret\n",
+        );
+        // The `jne .LBB1` is what makes the sweep run at all: it threads to
+        // `.LBB2`, which both orphans the relay and is the "changed" `run`
+        // requires before it sweeps — `thread_function`'s contract is that the
+        // only deletion is a relay the retargeting orphaned.
+        let (_, out) = apply(&format!("jne .LBB1\nret\n{tail}"), None);
+        assert!(out.contains("jne .LBB2"), "threaded:\n{out}");
+        assert!(!out.contains(".LBB1:"), "`ret` cannot fall through:\n{out}");
+        let (_, out) = apply(&format!("jne .LBB1\naddq $1, %rax\n{tail}"), None);
+        assert!(out.contains(".LBB1:"), "`addq` falls through:\n{out}");
+    }
+
+    /// An `#APP` region between the dispatch and the table ends the proof:
+    /// `pin_inline_asm_regions` reclassifies and pins every line of it, so a
+    /// `.pushsection` with label arithmetic inside one (which kernel asm does
+    /// use) is invisible here, and the markers themselves are barriers.
+    #[test]
+    fn inline_asm_between_dispatch_and_table_ends_the_proof() {
+        let body = concat!(
+            "jmpq *%rdx\n",
+            "#APP\n",
+            "    .pushsection .note.lccc\n",
+            "#NO_APP\n",
+            ".section .rodata\n",
+            ".Ljt_0:\n",
+            ".long .LBB1 - .Ljt_0\n",
+            ".long .LBB2 - .Ljt_0\n",
+            ".section .text,\"ax\",@progbits\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "ret\n",
+        );
+        let (_, out) = apply(body, None);
+        assert!(
+            out.contains(".LBB1:"),
+            "opaque text must end the proof:\n{out}"
+        );
+    }
+
+    /// `.subsection` moves to another chunk of the SAME section: the chunk the
+    /// next bytes land in is not the one that earned the verdict.
+    #[test]
+    fn subsection_ends_the_proof() {
+        let body = concat!(
+            "jmpq *%rdx\n",
+            ".subsection 1\n",
+            ".section .rodata\n",
+            ".Ljt_0:\n",
+            ".long .LBB1 - .Ljt_0\n",
+            ".long .LBB2 - .Ljt_0\n",
+            ".section .text,\"ax\",@progbits\n",
+            ".LBB1:\n",
+            "jmp .LBB2\n",
+            ".LBB2:\n",
+            "ret\n",
+        );
+        let (_, out) = apply(body, None);
+        assert!(
+            out.contains(".LBB1:"),
+            "subsection must end the proof:\n{out}"
+        );
+    }
+
+    #[test]
+    fn section_identity_normalises_spellings_and_keeps_chunks_apart() {
+        for (text, want) in [
+            (".text", Some(".text")),
+            (".section .text", Some(".text")),
+            (".section .text,\"ax\",@progbits", Some(".text")),
+            (".section .text,\"axR\",@progbits", Some(".text")),
+            ("  .section .rodata  ", Some(".rodata")),
+            (
+                ".section .rodata.str1.1,\"aMS\",@progbits,1",
+                Some(".rodata.str1.1"),
+            ),
+            (".data", Some(".data")),
+            (".bss", Some(".bss")),
+            (".pushsection .data", Some(".data")),
+            // Another chunk of the same section is another identity.
+            (".text 1", Some(".text 1")),
+            // No name to read, or not a name at all.
+            (".popsection", None),
+            (".previous", None),
+            (".section", None),
+            (".section text", None),
+            (".section .text 1", None),
+            (".quad .LBB1", None),
+            (".align 4", None),
+            (".rodata", None),
+        ] {
+            assert_eq!(section_identity(text), want, "{text}");
+        }
+        // The two parsers must agree: every spelling `section_switch` reports as
+        // entering a section has an identity, and `.rodata` bare is one GAS
+        // rejects (measured on binutils 2.47 `as`), so neither accepts it.
+        for text in [
+            ".text",
+            ".data",
+            ".bss",
+            ".section .rodata",
+            ".pushsection .data",
+        ] {
+            assert!(
+                section_switch(text).is_some() && section_identity(text).is_some(),
+                "{text}"
+            );
+        }
+        for text in [".rodata", ".tdata", ".loc 1 1", ".quad 0"] {
+            assert!(section_switch(text).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn section_proof_ends_names_the_invisible_switches() {
+        for ends in [
+            ".if 0",
+            ".else",
+            ".endif",
+            ".ifdef X",
+            ".ifndef X",
+            ".macro m",
+            ".endm",
+            ".rept 4",
+            ".irp x,1",
+            ".irpc x,ab",
+            ".altmacro",
+            ".subsection 2",
+            ".code16",
+            ".code32",
+            ".intel_syntax noprefix",
+            ".att_syntax prefix",
+            ".arch i386",
+        ] {
+            assert!(section_proof_ends(ends), "{ends}");
+        }
+        // Data, alignment and unwind directives are the switch table's own
+        // furniture: ending the proof on them would undo the whole point.
+        for keeps in [
+            ".quad .LBB1",
+            ".long .LBB2 - .Ljt_0",
+            ".byte 0",
+            ".align 4",
+            ".p2align 4,,10",
+            ".ascii \"x\"",
+            ".cfi_def_cfa_offset 16",
+            ".loc 1 7 3",
+            ".text",
+            ".section .rodata",
+        ] {
+            assert!(!section_proof_ends(keeps), "{keeps}");
+        }
+    }
+
+    #[test]
+    fn may_switch_section_filters_on_one_byte() {
+        for yes in [
+            ".text",
+            ".data",
+            ".bss",
+            ".section .rodata",
+            ".pushsection .data",
+            ".popsection",
+            ".previous",
+            "  .text",
+        ] {
+            assert!(may_switch_section(yes), "{yes}");
+        }
+        // The directives that dominate a real TU must not reach the parser.
+        for no in [
+            ".loc 1 7 3",
+            ".cfi_startproc",
+            ".cfi_def_cfa_offset 16",
+            ".quad 0",
+            ".long 1",
+            ".align 4",
+            ".globl f",
+            ".ident \"x\"",
+            ".file 1 \"x.c\"",
+            "jmp .LBB1",
+            "",
+            ".",
+        ] {
+            assert!(!may_switch_section(no), "{no}");
+        }
+    }
+
+    /// A retarget that lands a branch on the label it already falls through to
+    /// leaves a no-op branch behind.  Witness: `tests/regression/loop_global_promote.c`
+    /// at -O2 carries `    jmp .LBB27` directly above `.LBB27:` after the
+    /// peepholes and no such jump before them (measured on that TU with
+    /// `LCCC_NO_PEEPHOLE=1`: 0 against 2), so the retargeting created it and
+    /// `eliminate_redundant_jumps` had run three phases earlier.  Both spellings
+    /// go: a `jmp` is unconditional, and a `jcc` whose two outcomes both arrive
+    /// at the next instruction cannot be observed.
+    #[test]
+    fn a_retarget_onto_the_next_label_deletes_the_branch() {
+        for head in ["jmp", "jne", "jb", "jge"] {
+            let body = format!(
+                "jb .LBB21\n{head} .LBB9\n.LBB27:\nret\n.LBB21:\nret\n.LBB9:\njmp .LBB27\n"
+            );
+            let (changed, out) = apply(&body, None);
+            assert!(changed, "{head}: {out}");
+            assert_eq!(
+                out, "f:\n.cfi_startproc\njb .LBB21\n.LBB27:\nret\n.LBB21:\nret\n.cfi_endproc",
+                "{head}: the no-op branch and the relay it targeted both go"
+            );
+        }
+    }
+
+    /// Stacked labels are transparent to fallthrough: arriving at `.LBB26:` and
+    /// walking into `.LBB27:` executes the same instructions as jumping to
+    /// `.LBB27`, and `.LBB26` keeps its own references either way.  This is the
+    /// shape `eliminate_redundant_jumps` breaks on (it compares only the first
+    /// label it finds), and 13 of the 24 survivors in a 1335-file census of the
+    /// regression corpus are exactly this.
+    #[test]
+    fn a_retarget_onto_a_label_behind_stacked_labels_deletes_the_branch() {
+        let body = "jmp .LBB9\n.LBB26:\n.LBB27:\nret\n.LBB9:\njmp .LBB27\n";
+        let (changed, out) = apply(body, None);
+        assert!(changed, "{out}");
+        assert_eq!(
+            out, "f:\n.cfi_startproc\n.LBB26:\n.LBB27:\nret\n.cfi_endproc",
+            "both labels stay, the no-op branch goes:\n{out}"
+        );
+    }
+
+    /// Byteless debug attribution between the branch and its target emits
+    /// nothing, so the branch is still a no-op — and the marker itself is not
+    /// part of the deletion.
+    #[test]
+    fn a_debug_marker_between_branch_and_target_is_transparent() {
+        for marker in [".loc 1 7 3", r#".file 2 "x.c""#] {
+            let body = format!("jmp .LBB9\n{marker}\n.LBB27:\nret\n.LBB9:\njmp .LBB27\n");
+            let (_, out) = apply(&body, None);
+            assert!(out.contains(marker), "{marker}: {out}");
+            assert!(
+                !out.contains("jmp .LBB27\n"),
+                "no-op branch deleted:\n{out}"
+            );
+            assert!(!out.contains(".LBB9:"), "relay swept:\n{out}");
+        }
+    }
+
+    /// Anything that emits a byte between the branch and the target makes the
+    /// branch load-bearing, so it is rewritten, never deleted.
+    #[test]
+    fn a_retarget_past_emitting_lines_rewrites_instead_of_deleting() {
+        let body = "jmp .LBB9\naddq $1, %rax\n.LBB27:\nret\n.LBB9:\njmp .LBB27\n";
+        let (_, out) = apply(body, None);
+        assert!(out.contains("jmp .LBB27\naddq $1, %rax"), "{out}");
+        assert!(out.contains(".LBB27:"), "{out}");
+        // A data directive is bytes too, and alignment padding is a fill.
+        for between in [".quad 0", ".byte 0x90", ".p2align 4,0xf8"] {
+            let body = format!("jmp .LBB9\n{between}\n.LBB27:\nret\n.LBB9:\njmp .LBB27\n");
+            let (_, out) = apply(&body, None);
+            assert!(out.contains("jmp .LBB27"), "{between}: {out}");
+            assert!(out.contains(between), "{between}: {out}");
+        }
+        // Inline asm between the two is opaque and pinned.
+        let body = "jmp .LBB9\n#APP\n    nop\n#NO_APP\n.LBB27:\nret\n.LBB9:\njmp .LBB27\n";
+        let (_, out) = apply(body, None);
+        assert!(out.contains("jmp .LBB27"), "{out}");
+    }
+
+    /// A compiler-owned marker on the branch line has to reach the assembler, so
+    /// such a line is rewritten with its comment rather than deleted.  Built from
+    /// the constant `inert_comment` matches, so the fixture cannot drift from the
+    /// rule.
+    #[test]
+    fn a_marker_comment_on_the_branch_is_rewritten_not_deleted() {
+        let marked = format!("jmp .LBB9 # {COMPILER_MARKER}keep");
+        let body = format!("{marked}\n.LBB27:\nret\n.LBB9:\njmp .LBB27\n");
+        let (_, out) = apply(&body, None);
+        assert!(
+            out.contains(&format!("jmp .LBB27 # {COMPILER_MARKER}keep")),
+            "{out}"
+        );
+        // An ordinary human comment carries no contract, so that branch goes.
+        let body = "jmp .LBB9 # edge\n.LBB27:\nret\n.LBB9:\njmp .LBB27\n";
+        let (_, out) = apply(body, None);
+        assert!(!out.contains("jmp .LBB9"), "{out}");
     }
 
     /// A `.quad .LBBn` outside a `.Ljt_*` run is somebody's data — a

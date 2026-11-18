@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 # Keep hosted kernel compilation under the same explicit swap policy as the
 # local acceptance build; no validator or security setting changes with it.
-grep -q 'LCCC_CI_SWAP_SIZE: 4G' "$root/.github/workflows/kernel-61858.yml"
+grep -q 'LCCC_CI_SWAP_SIZE: 4G' "$root/.github/workflows/kernel-61863.yml"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/firmware" "$work/bin"
@@ -166,7 +166,7 @@ while IFS= read -r install; do
     exit 1
   }
   install_paths=$((install_paths + 1))
-done < <(grep -E 'apt-get .*install .*qemu-system-x86' "$root/.github/workflows/kernel-61858.yml")
+done < <(grep -E 'apt-get .*install .*qemu-system-x86' "$root/.github/workflows/kernel-61863.yml")
 [[ $install_paths -eq 2 ]] || {
   echo "FAIL: expected both kernel QEMU installation paths, found $install_paths" >&2
   exit 1

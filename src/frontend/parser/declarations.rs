@@ -2256,6 +2256,39 @@ impl Parser {
                     Self::eval_const_int_expr_with_enums(else_expr, enum_consts, tag_aligns)
                 }
             }
+            // GNU `a ?: b`, the two-operand conditional: `a` is evaluated once
+            // and the result is `a` when it is nonzero, `b` otherwise.
+            //
+            // This arm was missing, so an elvis expression in any parser-side
+            // constant context evaluated to `None` — and every caller here
+            // reads "no value" as "no attribute", so the attribute was
+            // SILENTLY DROPPED rather than diagnosed. Measured consequence in
+            // Linux 6.18.63: `__cacheline_group_begin_aligned(GROUP)` expands
+            // to
+            //   __u8 __cacheline_group_begin__GROUP[0]
+            //       __attribute__((__aligned__(( + 0) ? : (1 << (6)))));
+            // (an empty `__VA_ARGS__` leaves the condition as the unary plus of
+            // a literal), so the group's 64-byte alignment vanished:
+            // `struct netns_ipv4` came out 832 bytes instead of gcc-16's 896
+            // and `struct net` 2496 instead of 2560 — a 64-byte ABI divergence
+            // (`offsetof(struct net, ipv6.addr_chk_work)` 0x890 vs 0x8d0) that
+            // also forfeits the cache-line isolation the attribute exists for,
+            // on a struct every network namespace embeds.
+            //
+            // `sema`'s folder (`sema/const_eval.rs`, `Expr::GnuConditional`)
+            // already folds this correctly, which is why runtime elvis, enum
+            // constants and array sizes were all fine while alignment
+            // expressions were not: this is the parser's own folder, consulted
+            // for `__attribute__((aligned(EXPR)))`, `_Alignas(EXPR)`, range
+            // designator bounds and `asm "i"` operands.
+            Expr::GnuConditional(cond, else_expr, _) => {
+                let c = Self::eval_const_int_expr_with_enums(cond, enum_consts, tag_aligns)?;
+                if c != 0 {
+                    Some(c)
+                } else {
+                    Self::eval_const_int_expr_with_enums(else_expr, enum_consts, tag_aligns)
+                }
+            }
             Expr::Cast(target_type, inner, _, _) => {
                 let val = Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns)?;
                 // Apply the cast: truncate to target type's bit width

@@ -41,11 +41,11 @@ class DiagnosticSelection(unittest.TestCase):
 
     def test_requires_exact_evidence_name_and_live_artifact(self):
         sha = 'a' * 40
-        for prefix in ['kernel-61858-', 'intel-icx-provenance-']:
+        for prefix in ['kernel-61863-', 'intel-icx-provenance-']:
             self.assertTrue(export.retained_artifact(dict(name=prefix + sha, expired=False)))
             self.assertFalse(export.retained_artifact(dict(name=prefix + sha, expired=True)))
-        for name in ['compiler-' + sha, 'kernel-61858-short',
-                     'intel-icx-provenance-' + sha + '.zip', 'kernel-61858-../secret']:
+        for name in ['compiler-' + sha, 'kernel-61863-short',
+                     'intel-icx-provenance-' + sha + '.zip', 'kernel-61863-../secret']:
             self.assertFalse(export.retained_artifact(dict(name=name, expired=False)))
 
     def test_fork_event_is_rejected_before_any_api_request(self):

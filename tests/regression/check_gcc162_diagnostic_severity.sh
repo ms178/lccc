@@ -114,6 +114,36 @@ C
 cat > implicit_fn.c <<'C'
 int main(void){ return foo(); }
 C
+# The library-name subclass of the same diagnostic.  `strlen` is not an unknown
+# name to a compiler: it is a builtin whose argument count GCC knows, so GCC
+# checks the call against that knowledge in addition to reporting the implicit
+# declaration -- and the arity half is an `error:` even in gnu90, where the
+# implicit declaration itself is only a suppressed-by-default warning.  Before
+# this was fixed the pre-C99 dialects accepted `memcpy(d, s)` and the binary
+# segfaulted at run time (measured: exit 139).
+cat > implicit_builtin.c <<'C'
+int main(void){ return strlen("x"); }
+C
+cat > implicit_builtin_arity.c <<'C'
+int main(void){ char d[4], s[4]; memcpy(d, s); return 0; }
+C
+cat > implicit_builtin_ok.c <<'C'
+int main(void){ char d[4], s[4]="ab"; long n=2; memcpy(d, s, n); return d[0]!='a'; }
+C
+cat > implicit_builtin_prefixed.c <<'C'
+int main(void){ char d[4]="abc", s[4]="abd"; __builtin_memcpy(d,s,3); return __builtin_strcmp(d,s)==0; }
+C
+cat > implicit_builtin_twice.c <<'C'
+int main(void){ printf("a"); printf("b"); return 0; }
+C
+# Names GCC arity-checks at *warning* severity only, with its own separate
+# wording (`too many arguments to built-in function 'abs' expecting 1`).  These
+# must stay warnings here too: turning them into errors would reject programs
+# GCC compiles, which is worse than the defect being fixed.  Measured -- gcc-16
+# `-std=gnu90` exits 0 on this translation unit.
+cat > implicit_builtin_warn_only.c <<'C'
+int main(void){ abs(1,2); puts(1,2); strcmp(1); memcmp(1,2); putchar(1,2); return 0; }
+C
 cat > implicit_int.c <<'C'
 main(void){ return 0; }
 C
@@ -161,11 +191,26 @@ declare -A want90=(
     [assign_const]=1 [bad_cast]=0 [empty_body]=0 [implicit_fn]=0
     [implicit_int]=0 [implicit_void_ret]=0 [incompat_ptr]=0 [int_conv]=0
     [old_style]=0 [ptr_to_int]=0 [ret_mismatch]=0 [ro]=1 [void_arith]=0
+    # Library names GCC knows as builtins.  The arity column is what makes
+    # `implicit_builtin_arity` a 1 here and not a 0 like every other
+    # pre-C99 implicit declaration: GCC's argument-count check is an error in
+    # gnu90 too.  `implicit_builtin_warn_only` is 0 because GCC only warns for
+    # that subclass, and `implicit_builtin_prefixed` is 0 because the reserved
+    # `__builtin_` spelling needs no prototype in any dialect.
+    [implicit_builtin]=0 [implicit_builtin_arity]=1 [implicit_builtin_ok]=0
+    [implicit_builtin_prefixed]=0 [implicit_builtin_twice]=0
+    [implicit_builtin_warn_only]=0
 )
 declare -A want17=(
     [assign_const]=1 [bad_cast]=0 [empty_body]=0 [implicit_fn]=1
     [implicit_int]=1 [implicit_void_ret]=1 [incompat_ptr]=1 [int_conv]=1
     [old_style]=0 [ptr_to_int]=0 [ret_mismatch]=1 [ro]=1 [void_arith]=0
+    # From C99 on the implicit declaration is itself an error, so every
+    # undeclared library name is a 1 -- except the reserved spelling, which is
+    # never an implicit declaration at all.
+    [implicit_builtin]=1 [implicit_builtin_arity]=1 [implicit_builtin_ok]=1
+    [implicit_builtin_prefixed]=0 [implicit_builtin_twice]=1
+    [implicit_builtin_warn_only]=1
 )
 for file in "${!want90[@]}"; do
     expect_exit gnu90 "$file.c" "${want90[$file]}"
@@ -293,6 +338,64 @@ run_exit "$CCC" implicit_fn.c gnu90 >/dev/null
 expect_silent gnu90 implicit_fn.c
 run_exit "$CCC" ret_mismatch.c gnu90 >/dev/null
 expect_silent gnu90 ret_mismatch.c
+
+# -------- library names GCC knows as builtins: a different pre-C99 posture ----
+# This subclass is where the missing check used to cost a crash rather than a
+# message.  GCC knows `memcpy` takes three arguments, so it arity-checks the
+# call in gnu90 too, where the implicit declaration itself is only a
+# suppressed-by-default warning; before this was fixed `memcpy(d, s)` compiled
+# under every dialect and the binary segfaulted at run time (measured: exit 139).
+# All expectations below were recorded from gcc-16.2.0 (and clang 23.1.5 agrees
+# on every exit code) before being encoded.
+#
+# Two GCC *warnings* are deliberately not reproduced, and neither changes an
+# exit code, which is what this gate pins:
+#
+#   warning: incompatible implicit declaration of built-in function 'memcpy'
+#            [-Wbuiltin-declaration-mismatch]
+#   warning: too many arguments to built-in function 'abs' expecting 1
+#
+# The first accompanies every undeclared libc builtin (so `strlen("x")` is not
+# silent under gcc-16 in gnu90 either); the second is a *warning*-severity arity
+# check for the nine names GCC does not error on -- `abs`, `puts`, `putchar`,
+# `strcmp`, `strncmp`, `memcmp`, `dprintf`, `__copysigntf3`, `__fabstf2` -- which
+# is exactly why `scripts/check_libc_builtin_arity.py` measures the table instead
+# of deriving it from the C standard.  Promoting that subclass to an error here
+# would reject programs gcc-16 compiles (exit 0), so
+# `implicit_builtin_warn_only.c` is asserted silent below to pin the boundary.
+run_exit "$CCC" implicit_builtin.c gnu90 >/dev/null
+expect_silent gnu90 implicit_builtin.c
+run_exit "$CCC" implicit_builtin_ok.c gnu90 >/dev/null
+expect_silent gnu90 implicit_builtin_ok.c
+run_exit "$CCC" implicit_builtin_prefixed.c gnu90 >/dev/null
+expect_silent gnu90 implicit_builtin_prefixed.c
+run_exit "$CCC" implicit_builtin_warn_only.c gnu90 >/dev/null
+expect_silent gnu90 implicit_builtin_warn_only.c
+# gnu90: the arity error is the whole verdict, at gcc's column with gcc's words.
+run_exit "$CCC" implicit_builtin_arity.c gnu90 >/dev/null
+expect_first gnu90 implicit_builtin_arity.c \
+    'implicit_builtin_arity\.c:1:34: error: too few arguments to function .memcpy.; expected 3, have 2'
+# gnu17: the implicit declaration comes first, exactly as gcc prints them, and
+# the arity error still follows it.
+run_exit "$CCC" implicit_builtin_arity.c gnu17 >/dev/null
+expect_first gnu17 implicit_builtin_arity.c \
+    'implicit_builtin_arity\.c:1:34: error: implicit declaration of function .memcpy. \[-Wimplicit-function-declaration\]'
+if ! grep -q "error: too few arguments to function 'memcpy'; expected 3, have 2" \
+        implicit_builtin_arity.c.err; then
+    cat implicit_builtin_arity.c.err >&2
+    fail "gnu17: the arity error must follow the implicit declaration, as gcc-16.2 prints it"
+fi
+run_exit "$CCC" implicit_builtin.c gnu17 >/dev/null
+expect_first gnu17 implicit_builtin.c \
+    'implicit_builtin\.c:1:24: error: implicit declaration of function .strlen. \[-Wimplicit-function-declaration\]'
+# Once per name, not once per call site: gcc-16.2 reports `printf` once for two
+# calls, and so must this.
+run_exit "$CCC" implicit_builtin_twice.c gnu17 >/dev/null
+count=$(grep -c "implicit declaration of function 'printf'" implicit_builtin_twice.c.err || true)
+if [ "$count" != 1 ]; then
+    cat implicit_builtin_twice.c.err >&2
+    fail "gnu17: implicit declaration reported $count times for one name; gcc-16.2 reports it once"
+fi
 set +e
 "$CCC" -std=gnu90 -Wreturn-mismatch -fsyntax-only -c ret_mismatch.c 2>rm90.err
 set -e

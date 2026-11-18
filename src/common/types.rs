@@ -1489,14 +1489,15 @@ impl StructLayoutBuilder {
         }
     }
 
-    /// Compute the effective alignment and size for a field.
+    /// Compute the effective alignment and size for a field, plus the field's
+    /// own `DECL_USER_ALIGN` fact (see [`StructFieldLayout::user_align`]).
     fn compute_field_alignment(
         &mut self,
         field: &StructField,
         max_field_align: Option<usize>,
         pragma_pack: Option<usize>,
         ctx: &dyn StructLayoutProvider,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, Option<usize>) {
         let natural_align = field.type_align.unwrap_or_else(|| field.ty.align_ctx(ctx));
         let field_align = if field.is_packed {
             // Per-field __attribute__((packed)) forces alignment to 1 unless an
@@ -1524,11 +1525,16 @@ impl StructLayoutBuilder {
         // AArch64 counts anonymous bitfields for aggregate alignment; the
         // x86 and RISC-V ABIs do not. A zero-width AArch64 field retains its
         // uncapped boundary alignment even inside a packed record.
-        if !field.name.is_empty() || field.bit_width.is_none() || target_elf_machine() == 183 {
-            self.max_align = self.max_align.max(field_align);
-            self.user_align |= field_contributes_user_align(field, natural_align, ctx);
-        }
-        (field_align, field_size)
+        let field_user_align =
+            if !field.name.is_empty() || field.bit_width.is_none() || target_elf_machine() == 183 {
+                self.max_align = self.max_align.max(field_align);
+                let contributes = field_contributes_user_align(field, natural_align, ctx);
+                self.user_align |= contributes;
+                contributes.then_some(field_align)
+            } else {
+                None
+            };
+        (field_align, field_size, field_user_align)
     }
 
     /// Handle zero-width bitfield: force alignment to next storage unit boundary.
@@ -1548,7 +1554,13 @@ impl StructLayoutBuilder {
     }
 
     /// Layout a bitfield with pack(1) — contiguous bit stream, may span storage units.
-    fn layout_packed_bitfield(&mut self, field: &StructField, bw: u32, field_size: usize) {
+    fn layout_packed_bitfield(
+        &mut self,
+        field: &StructField,
+        bw: u32,
+        field_size: usize,
+        field_user_align: Option<usize>,
+    ) {
         let unit_bits = (field_size * 8) as u32;
         if !self.in_bitfield {
             self.bf_unit_offset = self.offset;
@@ -1593,6 +1605,7 @@ impl StructLayoutBuilder {
             bit_width: Some(bw),
             sso,
             sso_storage_ty: None,
+            user_align: field_user_align,
         });
         self.bf_bit_pos += bw;
     }
@@ -1604,6 +1617,7 @@ impl StructLayoutBuilder {
         bw: u32,
         field_size: usize,
         field_align: usize,
+        field_user_align: Option<usize>,
     ) {
         let unit_bits = (field_size * 8) as u32;
 
@@ -1690,6 +1704,7 @@ impl StructLayoutBuilder {
             bit_width: Some(bw),
             sso,
             sso_storage_ty,
+            user_align: field_user_align,
         });
 
         // Update bitfield tracking state
@@ -1710,7 +1725,13 @@ impl StructLayoutBuilder {
     }
 
     /// Layout a regular (non-bitfield) field.
-    fn layout_regular_field(&mut self, field: &StructField, field_size: usize, field_align: usize) {
+    fn layout_regular_field(
+        &mut self,
+        field: &StructField,
+        field_size: usize,
+        field_align: usize,
+        field_user_align: Option<usize>,
+    ) {
         self.close_bitfield_run();
         self.offset = align_up(self.offset, field_align);
 
@@ -1739,6 +1760,7 @@ impl StructLayoutBuilder {
             bit_width: None,
             sso,
             sso_storage_ty: None,
+            user_align: field_user_align,
         });
 
         let is_flexible_array = matches!(&field.ty, CType::Array(_, None));
@@ -1921,6 +1943,17 @@ pub struct StructFieldLayout {
     /// See [`StructField::written_typedef`]: the alias the member declared its
     /// type with, which debug information prints instead of the underlying type.
     pub written_typedef: Option<String>,
+    /// GCC `DECL_USER_ALIGN` for this field, paired with the alignment the field
+    /// ended up with: `Some(n)` when an explicit request (`_Alignas(n)`,
+    /// `aligned(n)` at or above the type's natural alignment) or a user-aligned
+    /// field type raised it, `None` when the field simply has its type's natural
+    /// alignment.  This is [`field_contributes_user_align`]'s answer kept per
+    /// field instead of only OR-ed into the record's
+    /// [`StructLayout::user_align`], so DWARF can state `DW_AT_alignment` on the
+    /// member DIE exactly where gcc-16 states it (measured on Linux 6.18.63
+    /// `struct netns_ipv4`: `__cacheline_group_pad__icmp` and `tcp_death_row`
+    /// carry `DW_AT_alignment: 64`, plain members carry none).
+    pub user_align: Option<usize>,
 }
 
 impl StructLayout {
@@ -1964,7 +1997,7 @@ impl StructLayout {
         let mut b = StructLayoutBuilder::new(fields.len(), max_field_align, reverse_sso);
 
         for field in fields {
-            let (field_align, field_size) =
+            let (field_align, field_size, field_user_align) =
                 b.compute_field_alignment(field, max_field_align, pragma_pack, ctx);
 
             if let Some(bw) = field.bit_width {
@@ -1977,13 +2010,19 @@ impl StructLayout {
                         b.offset = align_up(b.offset, placement);
                     }
                     if b.is_packed_1 || field.is_packed {
-                        b.layout_packed_bitfield(field, bw, field_size);
+                        b.layout_packed_bitfield(field, bw, field_size, field_user_align);
                     } else {
-                        b.layout_standard_bitfield(field, bw, field_size, field_align);
+                        b.layout_standard_bitfield(
+                            field,
+                            bw,
+                            field_size,
+                            field_align,
+                            field_user_align,
+                        );
                     }
                 }
             } else {
-                b.layout_regular_field(field, field_size, field_align);
+                b.layout_regular_field(field, field_size, field_align, field_user_align);
             }
         }
 
@@ -2029,10 +2068,17 @@ impl StructLayout {
                 pragma_pack.map_or(field_align, |cap| field_align.min(cap))
             };
             let field_size = field.ty.size_ctx(ctx);
-            if !field.name.is_empty() || field.bit_width.is_none() || target_elf_machine() == 183 {
+            let field_user_align = if !field.name.is_empty()
+                || field.bit_width.is_none()
+                || target_elf_machine() == 183
+            {
                 max_align = max_align.max(field_align);
-                user_align |= field_contributes_user_align(field, natural_align, ctx);
-            }
+                let contributes = field_contributes_user_align(field, natural_align, ctx);
+                user_align |= contributes;
+                contributes.then_some(field_align)
+            } else {
+                None
+            };
             // Unnamed bitfields are never accessed and contribute only the
             // bytes covered by their width. Named fields retain the declared
             // storage unit until lowering supports exact-width accesses for
@@ -2113,6 +2159,7 @@ impl StructLayout {
                 bit_width: bf_width,
                 sso,
                 sso_storage_ty,
+                user_align: field_user_align,
             });
         }
 

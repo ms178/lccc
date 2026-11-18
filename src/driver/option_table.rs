@@ -190,6 +190,26 @@ pub(super) const CONTRACTS: &[Contract] = &[
         rationale: "No dereference-implies-nonnull fold exists, so no null guard is ever deleted; the requested state is the emitted state.",
         probe_id: Some("probe-nullptr-checks-inert"),
     },
+    // The kernel passes this to every translation unit too, and unlike the row
+    // above the request is NOT already satisfied: lccc converts a call whose
+    // result is returned verbatim into a tail `jmp` at -O2 and above
+    // (TODO-3 / §5b), and a tail jump reuses the caller's frame. That breaks
+    // frame-pointer unwinding (`UNWINDER_FRAME_POINTER=y`), ftrace
+    // function-graph and objtool's ORC/CFI checks, which is exactly why the
+    // kernel withdraws the conversion. Accepting the spelling while emitting
+    // the tail jump anyway was a live defect, not a compatibility no-op, so
+    // this row is `Implemented` and its probe is measured in both directions:
+    // the tail jump must be present without the flag and gone with it.
+    // `-foptimize-sibling-calls` (the positive spelling, also parsed) asks for
+    // the default lccc already performs, so — like `-fno-delete-null-pointer-
+    // checks` above — its requested state is the emitted state and it needs no
+    // row of its own.
+    Contract {
+        spelling: "-fno-optimize-sibling-calls",
+        class: Class::Implemented,
+        rationale: "Withdraws the sibling-call conversion: a tail call keeps `call` + `ret` instead of collapsing into a tail `jmp`, preserving the caller's frame for unwinders and objtool.",
+        probe_id: Some("probe-no-sibling-calls"),
+    },
 ];
 
 /// Look up an option's contract.  Returns `None` for spellings not in the

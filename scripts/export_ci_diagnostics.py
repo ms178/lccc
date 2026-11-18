@@ -52,7 +52,7 @@ def automatic_run_ids(runs, pr_number):
 def retained_artifact(artifact):
     """Only the exact kernel/Intel evidence names, never arbitrary artifacts."""
     return (not artifact['expired'] and re.fullmatch(
-        r'(?:kernel-61858|intel-icx-provenance)-[0-9a-f]{40}', artifact['name']) is not None)
+        r'(?:kernel-61863|intel-icx-provenance)-[0-9a-f]{40}', artifact['name']) is not None)
 
 
 def gh(path, payload=None, *, allow_binary=False):

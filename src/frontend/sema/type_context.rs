@@ -677,6 +677,7 @@ impl TypeContext {
                     counted_by: None,
                     pointer_quals: Vec::new(),
                     own_cvr: Some(0),
+                    user_align: None,
                 },
             )
             .collect();

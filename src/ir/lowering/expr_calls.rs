@@ -101,11 +101,10 @@ impl Lowerer {
     /// The same holds at file scope, and the `known_functions` veto that used to
     /// exempt it was the bug: `globals` only ever holds *objects* (see
     /// `global_decl.rs`/`stmt_init.rs`), while `known_functions` holds every
-    /// function name sema reported -- including the implicit library prototypes
-    /// `declare_implicit_functions` pre-declares (`strlen`, `memcpy`, `malloc`,
-    /// `printf`, ...) and the basenames of nested functions. A name present in
-    /// both is therefore exactly a data object shadowing a library name, which
-    /// is the one case that must answer "indirect call". Answering "direct call"
+    /// function name sema reported -- the prototypes a header supplied and the
+    /// basenames of nested functions. A name present in both is therefore exactly
+    /// a data object shadowing a library name, which is the one case that must
+    /// answer "indirect call". Answering "direct call"
     /// instead emitted `call strlen` against a `size_t (*)(const char *)` object,
     /// the linker happily bound it to that object's address, and the program
     /// jumped into its own data (measured: SIGSEGV, gcc 14.2 exits 0). A C

@@ -12,12 +12,13 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('transport', Path(__file__).resolve().parents[2]/'scripts/export_ci_diagnostics.py')
 transport = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(transport)
+export_module = transport  # the filter under test, named for the fixture contract
 
 
 class TransportTests(unittest.TestCase):
     def test_workflow_has_minimal_transport_permissions(self):
         workflow = (Path(__file__).resolve().parents[2] /
-                    '.github/workflows/kernel-61858.yml').read_text()
+                    '.github/workflows/kernel-61863.yml').read_text()
         job = workflow.split('  diagnostic-transport:\n', 1)[1].split(
             '\n  host-prerequisites:', 1)[0]
         block = re.search(r'(?m)^    permissions:\n((?:      [^\n]*\n)+)', job)
@@ -124,8 +125,20 @@ class TransportTests(unittest.TestCase):
             if '/jobs?' in path:
                 result = {'jobs': [{'id': 7, 'conclusion': 'failure'}]}
             elif '/artifacts?' in path:
+                # This fixture must be a name `retained_artifact` ACCEPTS, i.e.
+                # the exact evidence shape `kernel-<pinned release>-<40 hex>`.
+                # It once read `kernel-61858-test` -- a *negative* shape lifted
+                # from tests/corpus/test_ci_diagnostic_export.py -- so the
+                # artifact was filtered out, the /zip download never happened,
+                # and the assertions below died with a bare IndexError instead
+                # of naming the real cause. The explicit contract check turns
+                # that silent drift into a message that says what broke.
+                evidence = 'kernel-61863-' + 'a' * 40
+                self.assertTrue(export_module.retained_artifact(
+                    dict(name=evidence, expired=False)),
+                    'fixture must satisfy the evidence-name contract')
                 result = {'artifacts': [{'id': 8, 'expired': False,
-                                        'name': 'kernel-61858-test'}]}
+                                        'name': evidence}]}
             else:
                 result = {'repository': {'full_name': 'a/b'}, 'status': 'completed',
                           'head_sha': 'abc', 'conclusion': 'failure'}

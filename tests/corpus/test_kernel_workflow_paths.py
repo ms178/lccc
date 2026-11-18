@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class KernelWorkflowPaths(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        workflow = yaml.safe_load((ROOT / ".github/workflows/kernel-61858.yml").read_text())
+        workflow = yaml.safe_load((ROOT / ".github/workflows/kernel-61863.yml").read_text())
         # PyYAML's YAML1.1 resolver reads the unquoted Actions `on` key as True.
         events = workflow.get("on", workflow.get(True))
         cls.patterns = events["pull_request"]["paths"]
@@ -73,7 +73,7 @@ class KernelJobIsOnDemandOrWeekly(unittest.TestCase):
     def setUpClass(cls):
         import yaml
         workflow = yaml.safe_load(
-            (ROOT / ".github/workflows/kernel-61858.yml").read_text())
+            (ROOT / ".github/workflows/kernel-61863.yml").read_text())
         cls.events = workflow.get("on", workflow.get(True))
         cls.job_if = workflow["jobs"]["kernel"]["if"]
 
@@ -122,7 +122,7 @@ class KernelVersionPinsAgree(unittest.TestCase):
         cls.sh = (ROOT / "scripts/kernel_version.sh").read_text()
         cls.py = (ROOT / "scripts/lccc_paths.py").read_text()
         cls.workflow = (
-            ROOT / ".github/workflows/kernel-61858.yml"
+            ROOT / ".github/workflows/kernel-61863.yml"
         ).read_text()
 
     def _sh_fallback(self):

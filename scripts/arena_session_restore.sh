@@ -39,8 +39,32 @@ fi
 
 
 # ---- 1. swap (compiler/linker peaks exceed the 1.9 GB RAM) ------------------
-if [[ $(awk 'NR>1 {n++} END {print n+0}' /proc/swaps) -eq 0 ]]; then
-    log 'creating 8G /swapfile'
+# Delegate to scripts/ensure_swap.sh, the repository's ONE swap policy.  It
+# enforces the measured 8 GiB size (an inherited wrong-size image is corrected,
+# not accepted), pins the file to /swapfile, persists it in /etc/fstab, biases
+# vm.swappiness, and degrades to a loud warning instead of a hard failure on a
+# host that forbids swapon.  This block used to hand-roll its own image, which
+# contradicted that policy twice over: a size ensure_swap.sh documented as a
+# defect, and a second implementation of the same job left to drift.  The size
+# itself moved 4 GiB -> 8 GiB on measurement, not on preference: see
+# ensure_swap.sh for the OOM record.
+#
+# THE LOCATION IS A DELIVERY CONSTRAINT, NOT A TASTE.  Swap must never live
+# under the user-facing workspace (/home/user): scripts/lccc-snapshot.sh
+# censuses that tree against a 64 MiB / 256-file delivery budget, so a
+# multi-GiB image there fails EVERY snapshot publication at its final step --
+# after the patch, series, bundle, source archive and ledger were all built
+# (observed 2026-11-17: census reported 8.6 GB / 115 files, "workspace budget
+# exceeded", exit 1, no deliverable published).  /swapfile is outside the
+# workspace and on the same filesystem, so nothing is lost by keeping it there.
+swap_helper="$repo_root/scripts/ensure_swap.sh"
+if [[ -r $swap_helper ]]; then
+    bash "$swap_helper" || log 'WARNING: ensure_swap.sh reported a problem; keep builds at -j2'
+elif [[ $(awk 'NR>1 {n++} END {print n+0}' /proc/swaps) -eq 0 ]]; then
+    # Self-contained fallback: a recovery test (and a partial restore) copies
+    # this script ALONE, so the helper may legitimately be absent.  Same
+    # location and size contract as the helper, no second policy invented.
+    log 'creating 8G /swapfile (ensure_swap.sh absent; fallback path)'
     sudo fallocate -l 8G /swapfile 2>/dev/null \
         || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
     sudo chmod 600 /swapfile

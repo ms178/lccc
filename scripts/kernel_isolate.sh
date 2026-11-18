@@ -64,7 +64,8 @@ else
     qdir=$(dirname "$(command -v "$QEMU")")
     for d in "$qdir/../share/qemu" "$qdir/../share/seabios"; do
         if [[ -f "$d/bios-256k.bin" && -f "$d/linuxboot_dma.bin" \
-              && -f "$d/kvmvapic.bin" && -f "$d/efi-e1000.rom" ]]; then
+              && -f "$d/kvmvapic.bin" && -f "$d/efi-e1000.rom" \
+              && -f "$d/vgabios-stdvga.bin" ]]; then
             qemu_l=(-L "$d"); break
         fi
     done

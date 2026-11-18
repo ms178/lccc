@@ -1133,6 +1133,16 @@ jobs:
         set -euo pipefail
         python3 scripts/check_intrinsic_arity.py --self-test
         python3 scripts/check_intrinsic_arity.py --check
+    # Same shape as the step above, different provenance: that table is derived
+    # from include/*.h, this one is measured from GCC itself, because GCC's
+    # coverage is not uniform (it arity-checks `memcpy` and stays silent for
+    # `puts`).  The check reports and passes where GCC is unavailable, so a
+    # runner without the oracle is not reported as a stale table.
+    - name: Libc builtin arity table matches GCC 16.2
+      run: |
+        set -euo pipefail
+        python3 scripts/check_libc_builtin_arity.py --self-test
+        python3 scripts/check_libc_builtin_arity.py --gcc gcc-16 --check
     - name: Intrinsic lowering tables are complete (outer pattern vs mnemonic)
       run: |
         set -euo pipefail
