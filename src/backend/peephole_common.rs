@@ -314,6 +314,113 @@ pub(crate) fn find_lbb(s: &str) -> Option<usize> {
     None
 }
 
+/// A `starts_with` prefix of ANY length, probed branch-only through its
+/// first eight bytes.  A prefix longer than eight bytes confirms a probe
+/// hit with one full `starts_with` — the eight matched bytes make such
+/// confirms vanishingly rare, so ladders of long SSE/AVX spellings
+/// (`cvttsd2si `, `pbroadcast`) still cost one AND and one compare per
+/// entry on the overwhelmingly common miss path.
+#[derive(Clone, Copy)]
+pub(crate) struct LPfx {
+    packed: u64,
+    mask: u64,
+    full: &'static str,
+}
+
+impl LPfx {
+    /// Pack the first `min(len, 8)` bytes of `s` (non-empty, no NUL among
+    /// the packed bytes) for probing; keep the full text for the confirm.
+    pub(crate) const fn new(s: &'static str) -> LPfx {
+        let b = s.as_bytes();
+        assert!(!b.is_empty(), "LPfx wants a non-empty prefix");
+        let n = if b.len() < 8 { b.len() } else { 8 };
+        let mut packed = 0u64;
+        let mut i = 0;
+        while i < n {
+            assert!(b[i] != 0, "LPfx cannot contain NUL");
+            packed |= (b[i] as u64) << (8 * i);
+            i += 1;
+        }
+        let mask = if n == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * n)) - 1
+        };
+        LPfx {
+            packed,
+            mask,
+            full: s,
+        }
+    }
+
+    /// `t.starts_with(self.full())`, given `first8(t)` and `t` itself.
+    #[inline]
+    pub(crate) fn matches(self, first8: u64, t: &str) -> bool {
+        first8 & self.mask == self.packed && (self.full.len() <= 8 || t.starts_with(self.full))
+    }
+
+    /// The original prefix text.
+    #[inline]
+    pub(crate) fn full(self) -> &'static str {
+        self.full
+    }
+}
+
+/// Branch-only `set.iter().any(|p| t.starts_with(p))` (same entries, same
+/// order, same early exit).
+#[inline]
+pub(crate) fn any_pfx(t: &str, set: &'static [LPfx]) -> bool {
+    let f8 = first8(t);
+    set.iter().any(|p| p.matches(f8, t))
+}
+
+#[cfg(test)]
+mod lpfx_oracle_tests {
+    use super::{LPfx, any_pfx};
+
+    /// `LPfx::matches`/`any_pfx` must agree with `str::starts_with` for
+    /// short and long prefixes, including the probe-hit/confirm-miss edge
+    /// where the first eight bytes match but the tail does not.
+    #[test]
+    fn any_pfx_is_any_starts_with() {
+        const SET: &[LPfx] = &[
+            LPfx::new("mov"),
+            LPfx::new("cvttsd2si "),
+            LPfx::new("pbroadcast"),
+        ];
+        let strs = ["mov", "cvttsd2si ", "pbroadcast"];
+        let probes = [
+            "",
+            "m",
+            "mov",
+            "movq %rax, %rbx",
+            "cvttsd2s",
+            "cvttsd2si",
+            "cvttsd2si %xmm0, %eax",
+            "cvttsd2siq %xmm0, %rax",
+            "pbroadcas",
+            "pbroadcast",
+            "pbroadcastb %xmm0, %ymm1",
+            "pbroadcasX",
+            "xor %eax, %eax",
+        ];
+        for t in probes {
+            for (p, raw) in SET.iter().zip(strs) {
+                assert_eq!(
+                    p.matches(super::first8(t), t),
+                    t.starts_with(raw),
+                    "LPfx({raw:?}) on {t:?}"
+                );
+            }
+            assert_eq!(
+                any_pfx(t, SET),
+                strs.iter().any(|p| t.starts_with(p)),
+                "any_pfx on {t:?}"
+            );
+        }
+    }
+}
+
 /// `t.starts_with(PREFIX)` as a branch-only probe of a compile-time-packed
 /// constant: `pfx!(f8, "movslq ")`, where `f8` is `first8(t)` of the probed
 /// text, computed once per line.  Expands to one AND and one compare; the

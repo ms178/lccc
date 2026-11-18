@@ -97,75 +97,87 @@ pub(super) fn flags_written_mask(t: &str) -> u8 {
 }
 
 /// Mnemonic prefixes that never touch EFLAGS.
-const FLAG_NEUTRAL_PREFIXES: &[&str] = &[
-    "movl ",
-    "movq ",
-    "movb ",
-    "movw ",
-    "movabsq ",
-    "movabs ",
-    "movzbl ",
-    "movzbq ",
-    "movzwl ",
-    "movzwq ",
-    "movsbl ",
-    "movsbq ",
-    "movswl ",
-    "movswq ",
-    "movslq ",
-    "leal ",
-    "leaq ",
-    "movss ",
-    "movsd ",
-    "movaps ",
-    "movapd ",
-    "movups ",
-    "movupd ",
-    "movdqa ",
-    "movdqu ",
-    "movd ",
-    "movq2dq ",
-    "vmovss ",
-    "vmovsd ",
-    "vmovaps ",
-    "vmovapd ",
-    "vmovups ",
-    "vmovupd ",
-    "vmovdqa ",
-    "vmovdqu ",
-    "cvtsi2sd ",
-    "cvtsi2ss ",
-    "cvttsd2si ",
-    "cvttss2si ",
-    "cvtss2sd ",
-    "cvtsd2ss ",
-    "bswap ",
-    "bswapl ",
-    "bswapq ",
-    "xchg ",
-    "nop",
-    "prefetch",
+const FLAG_NEUTRAL_PREFIXES: &[crate::backend::peephole_common::LPfx] = &[
+    crate::backend::peephole_common::LPfx::new("movl "),
+    crate::backend::peephole_common::LPfx::new("movq "),
+    crate::backend::peephole_common::LPfx::new("movb "),
+    crate::backend::peephole_common::LPfx::new("movw "),
+    crate::backend::peephole_common::LPfx::new("movabsq "),
+    crate::backend::peephole_common::LPfx::new("movabs "),
+    crate::backend::peephole_common::LPfx::new("movzbl "),
+    crate::backend::peephole_common::LPfx::new("movzbq "),
+    crate::backend::peephole_common::LPfx::new("movzwl "),
+    crate::backend::peephole_common::LPfx::new("movzwq "),
+    crate::backend::peephole_common::LPfx::new("movsbl "),
+    crate::backend::peephole_common::LPfx::new("movsbq "),
+    crate::backend::peephole_common::LPfx::new("movswl "),
+    crate::backend::peephole_common::LPfx::new("movswq "),
+    crate::backend::peephole_common::LPfx::new("movslq "),
+    crate::backend::peephole_common::LPfx::new("leal "),
+    crate::backend::peephole_common::LPfx::new("leaq "),
+    crate::backend::peephole_common::LPfx::new("movss "),
+    crate::backend::peephole_common::LPfx::new("movsd "),
+    crate::backend::peephole_common::LPfx::new("movaps "),
+    crate::backend::peephole_common::LPfx::new("movapd "),
+    crate::backend::peephole_common::LPfx::new("movups "),
+    crate::backend::peephole_common::LPfx::new("movupd "),
+    crate::backend::peephole_common::LPfx::new("movdqa "),
+    crate::backend::peephole_common::LPfx::new("movdqu "),
+    crate::backend::peephole_common::LPfx::new("movd "),
+    crate::backend::peephole_common::LPfx::new("movq2dq "),
+    crate::backend::peephole_common::LPfx::new("vmovss "),
+    crate::backend::peephole_common::LPfx::new("vmovsd "),
+    crate::backend::peephole_common::LPfx::new("vmovaps "),
+    crate::backend::peephole_common::LPfx::new("vmovapd "),
+    crate::backend::peephole_common::LPfx::new("vmovups "),
+    crate::backend::peephole_common::LPfx::new("vmovupd "),
+    crate::backend::peephole_common::LPfx::new("vmovdqa "),
+    crate::backend::peephole_common::LPfx::new("vmovdqu "),
+    crate::backend::peephole_common::LPfx::new("cvtsi2sd "),
+    crate::backend::peephole_common::LPfx::new("cvtsi2ss "),
+    crate::backend::peephole_common::LPfx::new("cvttsd2si "),
+    crate::backend::peephole_common::LPfx::new("cvttss2si "),
+    crate::backend::peephole_common::LPfx::new("cvtss2sd "),
+    crate::backend::peephole_common::LPfx::new("cvtsd2ss "),
+    crate::backend::peephole_common::LPfx::new("bswap "),
+    crate::backend::peephole_common::LPfx::new("bswapl "),
+    crate::backend::peephole_common::LPfx::new("bswapq "),
+    crate::backend::peephole_common::LPfx::new("xchg "),
+    crate::backend::peephole_common::LPfx::new("nop"),
+    crate::backend::peephole_common::LPfx::new("prefetch"),
 ];
 
 /// Mnemonic prefixes that read the flags.
-const FLAG_READER_PREFIXES: &[&str] = &[
-    "set", "cmov", "adc", "sbb", "rcl", "rcr", "pushf", "lahf", "into", "cmc", "salc",
+const FLAG_READER_PREFIXES: &[crate::backend::peephole_common::LPfx] = &[
+    crate::backend::peephole_common::LPfx::new("set"),
+    crate::backend::peephole_common::LPfx::new("cmov"),
+    crate::backend::peephole_common::LPfx::new("adc"),
+    crate::backend::peephole_common::LPfx::new("sbb"),
+    crate::backend::peephole_common::LPfx::new("rcl"),
+    crate::backend::peephole_common::LPfx::new("rcr"),
+    crate::backend::peephole_common::LPfx::new("pushf"),
+    crate::backend::peephole_common::LPfx::new("lahf"),
+    crate::backend::peephole_common::LPfx::new("into"),
+    crate::backend::peephole_common::LPfx::new("cmc"),
+    crate::backend::peephole_common::LPfx::new("salc"),
 ];
 
 /// Classify a trimmed instruction's effect on EFLAGS.
 pub(super) fn flags_effect(t: &str) -> FlagsEffect {
+    use crate::backend::peephole_common::pfx;
+    let f8t = crate::backend::peephole_common::first8(t);
     // Conditional jumps read; `jmp` is control flow but flag-neutral.
     if t.starts_with('j') {
-        return if t.starts_with("jmp") {
+        return if pfx!(f8t, "jmp") {
             FlagsEffect::Neutral
         } else {
             FlagsEffect::Reads
         };
     }
-    if FLAG_READER_PREFIXES.iter().any(|p| t.starts_with(p)) {
+    if crate::backend::peephole_common::any_pfx(t, FLAG_READER_PREFIXES) {
         return FlagsEffect::Reads;
     }
-    if FLAG_NEUTRAL_PREFIXES.iter().any(|p| t.starts_with(p)) {
+    if crate::backend::peephole_common::any_pfx(t, FLAG_NEUTRAL_PREFIXES) {
         return FlagsEffect::Neutral;
     }
     // Bare mnemonics (no operand) that are flag-neutral.
@@ -211,7 +223,7 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     }
     // A call clobbers flags (they are not preserved across the SysV boundary),
     // which for our purposes is exactly a write.
-    if t.starts_with("call") {
+    if pfx!(f8t, "call") {
         return FlagsEffect::Writes;
     }
     // BMI2 VEX shifts (`shlx/shrx/sarx`) and the other flag-neutral BMI2
@@ -227,13 +239,13 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     // as writers in the WRITERS table below: in `cmp; andn; je` the branch
     // reads ANDN's flags, so the cmp's flags are dead, not live — the old
     // comment had the dataflow exactly backwards.
-    if t.starts_with("shlx")
-        || t.starts_with("shrx")
-        || t.starts_with("sarx")
-        || t.starts_with("rorx")
-        || t.starts_with("pdep")
-        || t.starts_with("pext")
-        || t.starts_with("mulx")
+    if pfx!(f8t, "shlx")
+        || pfx!(f8t, "shrx")
+        || pfx!(f8t, "sarx")
+        || pfx!(f8t, "rorx")
+        || pfx!(f8t, "pdep")
+        || pfx!(f8t, "pext")
+        || pfx!(f8t, "mulx")
     {
         return FlagsEffect::Neutral;
     }
@@ -305,26 +317,59 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     // `andn`/`bextr`/`bzhi`/`blsi`/`blsmsk`/`blsr` stems below are exact
     // writers — the SSE `andnps`/`andnpd` do NOT match: `ps`/`pd` are not
     // integer suffixes, and the FP table above claims them first anyway).
-    const WRITERS: &[&str] = &[
-        "add", "sub", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "imul", "mul", "div",
-        "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bsf", "bsr", "popcnt", "lzcnt",
-        "tzcnt", "cmpxchg", "xadd", "andn", "bextr", "bzhi", "blsi", "blsmsk", "blsr",
+    const WRITERS: &[crate::backend::peephole_common::Pfx] = &[
+        crate::backend::peephole_common::Pfx::new("add"),
+        crate::backend::peephole_common::Pfx::new("sub"),
+        crate::backend::peephole_common::Pfx::new("and"),
+        crate::backend::peephole_common::Pfx::new("or"),
+        crate::backend::peephole_common::Pfx::new("xor"),
+        crate::backend::peephole_common::Pfx::new("cmp"),
+        crate::backend::peephole_common::Pfx::new("test"),
+        crate::backend::peephole_common::Pfx::new("inc"),
+        crate::backend::peephole_common::Pfx::new("dec"),
+        crate::backend::peephole_common::Pfx::new("neg"),
+        crate::backend::peephole_common::Pfx::new("imul"),
+        crate::backend::peephole_common::Pfx::new("mul"),
+        crate::backend::peephole_common::Pfx::new("div"),
+        crate::backend::peephole_common::Pfx::new("idiv"),
+        crate::backend::peephole_common::Pfx::new("shl"),
+        crate::backend::peephole_common::Pfx::new("shr"),
+        crate::backend::peephole_common::Pfx::new("sar"),
+        crate::backend::peephole_common::Pfx::new("sal"),
+        crate::backend::peephole_common::Pfx::new("rol"),
+        crate::backend::peephole_common::Pfx::new("ror"),
+        crate::backend::peephole_common::Pfx::new("bt"),
+        crate::backend::peephole_common::Pfx::new("bsf"),
+        crate::backend::peephole_common::Pfx::new("bsr"),
+        crate::backend::peephole_common::Pfx::new("popcnt"),
+        crate::backend::peephole_common::Pfx::new("lzcnt"),
+        crate::backend::peephole_common::Pfx::new("tzcnt"),
+        crate::backend::peephole_common::Pfx::new("cmpxchg"),
+        crate::backend::peephole_common::Pfx::new("xadd"),
+        crate::backend::peephole_common::Pfx::new("andn"),
+        crate::backend::peephole_common::Pfx::new("bextr"),
+        crate::backend::peephole_common::Pfx::new("bzhi"),
+        crate::backend::peephole_common::Pfx::new("blsi"),
+        crate::backend::peephole_common::Pfx::new("blsmsk"),
+        crate::backend::peephole_common::Pfx::new("blsr"),
     ];
-    if WRITERS.iter().any(|p| suffix_exact_writer(base, p)) {
+    let f8b = crate::backend::peephole_common::first8(base);
+    if WRITERS
+        .iter()
+        .any(|p| p.matches(f8b) && writer_suffix_exact(&base[p.text().len()..]))
+    {
         return FlagsEffect::Writes;
     }
     // Unknown: assume the worst (both).
     FlagsEffect::Reads
 }
 
-/// `stem` is a flag-writing mnemonic when it is followed by nothing, a blank
-/// (operands follow), or an integer size suffix (l/q/w/b).  A suffix that
-/// starts a different mnemonic (`addsd`, `andn`, `shld`, `btc`) is not one.
+/// The matched stem is a flag-writing mnemonic when `rest` (the text after
+/// it) is empty, a blank (operands follow), or an integer size suffix
+/// (l/q/w/b).  A suffix that starts a different mnemonic (`addsd`, `andn`,
+/// `shld`, `btc`) is not one.
 #[inline]
-fn suffix_exact_writer(base: &str, stem: &str) -> bool {
-    let Some(rest) = base.strip_prefix(stem) else {
-        return false;
-    };
+fn writer_suffix_exact(rest: &str) -> bool {
     rest.is_empty() || matches!(rest.as_bytes()[0], b' ' | b'l' | b'q' | b'w' | b'b')
 }
 
@@ -332,152 +377,152 @@ fn suffix_exact_writer(base: &str, stem: &str) -> bool {
 /// caller's base) that never read or write EFLAGS.
 #[inline]
 fn fp_data_op(base: &str) -> bool {
-    const FP_NEUTRAL: &[&str] = &[
+    const FP_NEUTRAL: &[crate::backend::peephole_common::LPfx] = &[
         // scalar/vector FP arithmetic, compares, rounding, sqrt, rcps
-        "addsd",
-        "addss",
-        "addps",
-        "addpd",
-        "addsubps",
-        "addsubpd",
-        "subsd",
-        "subss",
-        "subps",
-        "subpd",
-        "mulsd",
-        "mulss",
-        "mulps",
-        "mulpd",
-        "divsd",
-        "divss",
-        "divps",
-        "divpd",
-        "minss",
-        "minsd",
-        "minps",
-        "minpd",
-        "maxss",
-        "maxsd",
-        "maxps",
-        "maxpd",
-        "cmpps",
-        "cmppd",
-        "blendvps",
-        "blendvpd",
-        "sqrtss",
-        "sqrtsd",
-        "sqrtps",
-        "sqrtpd",
-        "roundss",
-        "roundsd",
-        "roundps",
-        "roundpd",
-        "rcpss",
-        "rcpps",
-        "rsqrtss",
-        "rsqrtps",
-        "shufps",
-        "shufpd",
-        "andps",
-        "andpd",
-        "andnps",
-        "andnpd",
-        "orps",
-        "orpd",
-        "xorps",
-        "xorpd",
-        "unpcklps",
-        "unpckhps",
-        "unpcklpd",
-        "unpckhpd",
-        "cvt",
-        "cvtt",
-        "hadd",
-        "hsub",
+        crate::backend::peephole_common::LPfx::new("addsd"),
+        crate::backend::peephole_common::LPfx::new("addss"),
+        crate::backend::peephole_common::LPfx::new("addps"),
+        crate::backend::peephole_common::LPfx::new("addpd"),
+        crate::backend::peephole_common::LPfx::new("addsubps"),
+        crate::backend::peephole_common::LPfx::new("addsubpd"),
+        crate::backend::peephole_common::LPfx::new("subsd"),
+        crate::backend::peephole_common::LPfx::new("subss"),
+        crate::backend::peephole_common::LPfx::new("subps"),
+        crate::backend::peephole_common::LPfx::new("subpd"),
+        crate::backend::peephole_common::LPfx::new("mulsd"),
+        crate::backend::peephole_common::LPfx::new("mulss"),
+        crate::backend::peephole_common::LPfx::new("mulps"),
+        crate::backend::peephole_common::LPfx::new("mulpd"),
+        crate::backend::peephole_common::LPfx::new("divsd"),
+        crate::backend::peephole_common::LPfx::new("divss"),
+        crate::backend::peephole_common::LPfx::new("divps"),
+        crate::backend::peephole_common::LPfx::new("divpd"),
+        crate::backend::peephole_common::LPfx::new("minss"),
+        crate::backend::peephole_common::LPfx::new("minsd"),
+        crate::backend::peephole_common::LPfx::new("minps"),
+        crate::backend::peephole_common::LPfx::new("minpd"),
+        crate::backend::peephole_common::LPfx::new("maxss"),
+        crate::backend::peephole_common::LPfx::new("maxsd"),
+        crate::backend::peephole_common::LPfx::new("maxps"),
+        crate::backend::peephole_common::LPfx::new("maxpd"),
+        crate::backend::peephole_common::LPfx::new("cmpps"),
+        crate::backend::peephole_common::LPfx::new("cmppd"),
+        crate::backend::peephole_common::LPfx::new("blendvps"),
+        crate::backend::peephole_common::LPfx::new("blendvpd"),
+        crate::backend::peephole_common::LPfx::new("sqrtss"),
+        crate::backend::peephole_common::LPfx::new("sqrtsd"),
+        crate::backend::peephole_common::LPfx::new("sqrtps"),
+        crate::backend::peephole_common::LPfx::new("sqrtpd"),
+        crate::backend::peephole_common::LPfx::new("roundss"),
+        crate::backend::peephole_common::LPfx::new("roundsd"),
+        crate::backend::peephole_common::LPfx::new("roundps"),
+        crate::backend::peephole_common::LPfx::new("roundpd"),
+        crate::backend::peephole_common::LPfx::new("rcpss"),
+        crate::backend::peephole_common::LPfx::new("rcpps"),
+        crate::backend::peephole_common::LPfx::new("rsqrtss"),
+        crate::backend::peephole_common::LPfx::new("rsqrtps"),
+        crate::backend::peephole_common::LPfx::new("shufps"),
+        crate::backend::peephole_common::LPfx::new("shufpd"),
+        crate::backend::peephole_common::LPfx::new("andps"),
+        crate::backend::peephole_common::LPfx::new("andpd"),
+        crate::backend::peephole_common::LPfx::new("andnps"),
+        crate::backend::peephole_common::LPfx::new("andnpd"),
+        crate::backend::peephole_common::LPfx::new("orps"),
+        crate::backend::peephole_common::LPfx::new("orpd"),
+        crate::backend::peephole_common::LPfx::new("xorps"),
+        crate::backend::peephole_common::LPfx::new("xorpd"),
+        crate::backend::peephole_common::LPfx::new("unpcklps"),
+        crate::backend::peephole_common::LPfx::new("unpckhps"),
+        crate::backend::peephole_common::LPfx::new("unpcklpd"),
+        crate::backend::peephole_common::LPfx::new("unpckhpd"),
+        crate::backend::peephole_common::LPfx::new("cvt"),
+        crate::backend::peephole_common::LPfx::new("cvtt"),
+        crate::backend::peephole_common::LPfx::new("hadd"),
+        crate::backend::peephole_common::LPfx::new("hsub"),
         // integer SIMD data ops
-        "pshufb",
-        "pshufd",
-        "pshufhw",
-        "pshuflw",
-        "palignr",
-        "padd",
-        "psub",
-        "pmul",
-        "pmadd",
-        "pavg",
-        "psll",
-        "psrl",
-        "psra",
-        "pand",
-        "pandn",
-        "por",
-        "pxor",
-        "pcmpeq",
-        "pcmpgt",
-        "pmins",
-        "pminu",
-        "pmaxs",
-        "pmaxu",
-        "psadbw",
-        "pmuludq",
-        "mpsadbw",
-        "phadd",
-        "phsub",
-        "psign",
-        "pabs",
-        "pmaddubsw",
-        "pack",
-        "punpck",
-        "pinsr",
-        "pextr",
-        "extract",
-        "insert",
-        "insertps",
-        "extractps",
-        "blend",
-        "pblend",
-        "perm",
-        "maskmov",
+        crate::backend::peephole_common::LPfx::new("pshufb"),
+        crate::backend::peephole_common::LPfx::new("pshufd"),
+        crate::backend::peephole_common::LPfx::new("pshufhw"),
+        crate::backend::peephole_common::LPfx::new("pshuflw"),
+        crate::backend::peephole_common::LPfx::new("palignr"),
+        crate::backend::peephole_common::LPfx::new("padd"),
+        crate::backend::peephole_common::LPfx::new("psub"),
+        crate::backend::peephole_common::LPfx::new("pmul"),
+        crate::backend::peephole_common::LPfx::new("pmadd"),
+        crate::backend::peephole_common::LPfx::new("pavg"),
+        crate::backend::peephole_common::LPfx::new("psll"),
+        crate::backend::peephole_common::LPfx::new("psrl"),
+        crate::backend::peephole_common::LPfx::new("psra"),
+        crate::backend::peephole_common::LPfx::new("pand"),
+        crate::backend::peephole_common::LPfx::new("pandn"),
+        crate::backend::peephole_common::LPfx::new("por"),
+        crate::backend::peephole_common::LPfx::new("pxor"),
+        crate::backend::peephole_common::LPfx::new("pcmpeq"),
+        crate::backend::peephole_common::LPfx::new("pcmpgt"),
+        crate::backend::peephole_common::LPfx::new("pmins"),
+        crate::backend::peephole_common::LPfx::new("pminu"),
+        crate::backend::peephole_common::LPfx::new("pmaxs"),
+        crate::backend::peephole_common::LPfx::new("pmaxu"),
+        crate::backend::peephole_common::LPfx::new("psadbw"),
+        crate::backend::peephole_common::LPfx::new("pmuludq"),
+        crate::backend::peephole_common::LPfx::new("mpsadbw"),
+        crate::backend::peephole_common::LPfx::new("phadd"),
+        crate::backend::peephole_common::LPfx::new("phsub"),
+        crate::backend::peephole_common::LPfx::new("psign"),
+        crate::backend::peephole_common::LPfx::new("pabs"),
+        crate::backend::peephole_common::LPfx::new("pmaddubsw"),
+        crate::backend::peephole_common::LPfx::new("pack"),
+        crate::backend::peephole_common::LPfx::new("punpck"),
+        crate::backend::peephole_common::LPfx::new("pinsr"),
+        crate::backend::peephole_common::LPfx::new("pextr"),
+        crate::backend::peephole_common::LPfx::new("extract"),
+        crate::backend::peephole_common::LPfx::new("insert"),
+        crate::backend::peephole_common::LPfx::new("insertps"),
+        crate::backend::peephole_common::LPfx::new("extractps"),
+        crate::backend::peephole_common::LPfx::new("blend"),
+        crate::backend::peephole_common::LPfx::new("pblend"),
+        crate::backend::peephole_common::LPfx::new("perm"),
+        crate::backend::peephole_common::LPfx::new("maskmov"),
         // data movement / mask extraction / broadcasts / gathers / FMA / AES
-        "movdqa",
-        "movdqu",
-        "movaps",
-        "movups",
-        "movapd",
-        "movupd",
-        "movdq",
-        "movhlps",
-        "movlhps",
-        "movnti",
-        "movntq",
-        "movntdqa",
-        "lddqu",
-        "movshdup",
-        "movsldup",
-        "movddup",
-        "movmskps",
-        "movmskpd",
-        "pmovmskb",
-        "broadcast",
-        "pbroadcast",
-        "gather",
-        "pgather",
-        "fmadd",
-        "fmsub",
-        "fnmadd",
-        "fnmsub",
-        "aes",
-        "pclmul",
-        "zero",
-        "ldmxcsr",
-        "stmxcsr",
+        crate::backend::peephole_common::LPfx::new("movdqa"),
+        crate::backend::peephole_common::LPfx::new("movdqu"),
+        crate::backend::peephole_common::LPfx::new("movaps"),
+        crate::backend::peephole_common::LPfx::new("movups"),
+        crate::backend::peephole_common::LPfx::new("movapd"),
+        crate::backend::peephole_common::LPfx::new("movupd"),
+        crate::backend::peephole_common::LPfx::new("movdq"),
+        crate::backend::peephole_common::LPfx::new("movhlps"),
+        crate::backend::peephole_common::LPfx::new("movlhps"),
+        crate::backend::peephole_common::LPfx::new("movnti"),
+        crate::backend::peephole_common::LPfx::new("movntq"),
+        crate::backend::peephole_common::LPfx::new("movntdqa"),
+        crate::backend::peephole_common::LPfx::new("lddqu"),
+        crate::backend::peephole_common::LPfx::new("movshdup"),
+        crate::backend::peephole_common::LPfx::new("movsldup"),
+        crate::backend::peephole_common::LPfx::new("movddup"),
+        crate::backend::peephole_common::LPfx::new("movmskps"),
+        crate::backend::peephole_common::LPfx::new("movmskpd"),
+        crate::backend::peephole_common::LPfx::new("pmovmskb"),
+        crate::backend::peephole_common::LPfx::new("broadcast"),
+        crate::backend::peephole_common::LPfx::new("pbroadcast"),
+        crate::backend::peephole_common::LPfx::new("gather"),
+        crate::backend::peephole_common::LPfx::new("pgather"),
+        crate::backend::peephole_common::LPfx::new("fmadd"),
+        crate::backend::peephole_common::LPfx::new("fmsub"),
+        crate::backend::peephole_common::LPfx::new("fnmadd"),
+        crate::backend::peephole_common::LPfx::new("fnmsub"),
+        crate::backend::peephole_common::LPfx::new("aes"),
+        crate::backend::peephole_common::LPfx::new("pclmul"),
+        crate::backend::peephole_common::LPfx::new("zero"),
+        crate::backend::peephole_common::LPfx::new("ldmxcsr"),
+        crate::backend::peephole_common::LPfx::new("stmxcsr"),
         // moves and LEAs (covers v-prefixed data moves too: vmovq, vmovd)
-        "mov",
-        "lea",
-        "xchg",
-        "not",
+        crate::backend::peephole_common::LPfx::new("mov"),
+        crate::backend::peephole_common::LPfx::new("lea"),
+        crate::backend::peephole_common::LPfx::new("xchg"),
+        crate::backend::peephole_common::LPfx::new("not"),
     ];
-    FP_NEUTRAL.iter().any(|p| base.starts_with(p))
+    crate::backend::peephole_common::any_pfx(base, FP_NEUTRAL)
 }
 
 /// A whole-line comment (`#` first, GAS x86 syntax): it emits no bytes, so it
