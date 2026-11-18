@@ -42,7 +42,7 @@ mod branch_inversion_tests {
         combined_local_pass(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -67,7 +67,7 @@ mod branch_inversion_tests {
                 combined_local_pass(&mut store, &mut infos);
                 let out: Vec<_> = (0..store.len())
                     .filter(|&i| !infos[i].is_nop())
-                    .map(|i| store.get(i).trim())
+                    .map(|i| store.get(i).trim_ascii())
                     .collect();
                 assert_eq!(out, asm.lines().collect::<Vec<_>>(), "pin={pin}");
                 assert!(infos[pin].pinned);
@@ -171,7 +171,7 @@ mod nonzero_bitcount_staging_tests {
         combined_local_pass(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -380,7 +380,7 @@ fn stack_offset_str(offset: i32, context: &str) -> String {
 /// writes are observable, even when source and destination share a family.
 /// Exact address equality avoids the global offset map's base/alias questions.
 fn adjacent_gp_stack_load(store: &str, load: &str) -> Option<String> {
-    let (sm, so) = store.trim().split_once(char::is_whitespace)?;
+    let (sm, so) = store.trim_ascii().split_once(char::is_whitespace)?;
     let sw = match sm {
         "movb" => MoveSize::B,
         "movw" => MoveSize::W,
@@ -389,8 +389,8 @@ fn adjacent_gp_stack_load(store: &str, load: &str) -> Option<String> {
         _ => return None,
     };
     let (src, address) = so.split_once(',')?;
-    let src = src.trim();
-    let address = address.trim();
+    let src = src.trim_ascii();
+    let address = address.trim_ascii();
     let sr = register_family_fast(src);
     if !is_valid_gp_reg(sr) || matches!(sr, 4 | 5) || src != reg_id_to_name(sr, sw) {
         return None; // In particular, AH is not AL despite the same family.
@@ -401,7 +401,7 @@ fn adjacent_gp_stack_load(store: &str, load: &str) -> Option<String> {
     if !displacement.is_empty() && displacement.parse::<i32>().is_err() {
         return None;
     }
-    let (lm, lo) = load.trim().split_once(char::is_whitespace)?;
+    let (lm, lo) = load.trim_ascii().split_once(char::is_whitespace)?;
     let (rw, dw) = match lm {
         "movb" => (MoveSize::B, MoveSize::B),
         "movw" => (MoveSize::W, MoveSize::W),
@@ -416,9 +416,9 @@ fn adjacent_gp_stack_load(store: &str, load: &str) -> Option<String> {
         _ => return None,
     };
     let (memory, dst) = lo.split_once(',')?;
-    let dst = dst.trim();
+    let dst = dst.trim_ascii();
     let dr = register_family_fast(dst);
-    if memory.trim() != address
+    if memory.trim_ascii() != address
         || sw.byte_size() < rw.byte_size()
         || !is_valid_gp_reg(dr)
         || matches!(dr, 4 | 5)
@@ -492,7 +492,7 @@ fn is_ymm_full_move(mn: &str) -> bool {
 fn split_mn_two_ops(trimmed: &str) -> Option<(&str, &str, &str)> {
     let (mn, rest) = trimmed.split_once(char::is_whitespace)?;
     let (a, b) = rest.split_once(',')?;
-    Some((mn, a.trim(), b.trim()))
+    Some((mn, a.trim_ascii(), b.trim_ascii()))
 }
 
 /// Delete the reload of a `vmovdqu %ymmN, OFF(%rsp|%rbp)` /
@@ -550,16 +550,16 @@ pub(super) fn forward_adjacent_ymm_self_reloads(
             if infos[i].is_nop() {
                 continue;
             }
-            let t = infos[i].trimmed(store.get(i));
-            if t.starts_with(".cfi_startproc") {
+            if infos[i].is_cfi_start() {
                 region_hazard.push(false);
                 cur = (region_hazard.len() - 1) as u32;
             }
             region_of[i] = cur;
+            let t = infos[i].trimmed(store.get(i));
             if t.contains("%zmm") || t.contains("vzeroall") || t.contains("xsave") {
                 region_hazard[cur as usize] = true;
             }
-            if t.starts_with(".cfi_endproc") {
+            if infos[i].is_cfi_end() {
                 region_hazard.push(true); // gap region: fail closed
                 cur = (region_hazard.len() - 1) as u32;
             }
@@ -733,10 +733,17 @@ pub(super) fn delete_dead_vector_epilogue_stores(
                 j += 1;
                 continue;
             }
-            // Directives do not execute; only the function-end marker
-            // matters (reached without `ret`: refuse).
+            // DIRECTIVE-LAW: selecting -- the walk reads each directive only
+            // to find the function-end marker (CfiMark::End decodes exactly
+            // the `.cfi_endproc` text this site compared before
+            // classification cached it); reaching it without `ret` refuses
+            // the candidate.  Every other directive is stepped because the
+            // walk counts LIVE INSTRUCTIONS toward the epilogue shape and
+            // rewrites none of the stepped lines -- a data-emitting
+            // directive in the window changes no rsp-displacement fact the
+            // shape match consumes.
             if infos[j].kind == LineKind::Directive {
-                if infos[j].trimmed(store.get(j)).starts_with(".cfi_endproc") {
+                if infos[j].cfi == CfiMark::End {
                     continue 'cand;
                 }
                 j += 1;
@@ -891,7 +898,7 @@ mod ymm_self_reload_tests {
         let changed = forward_adjacent_ymm_self_reloads(&mut store, &mut infos);
         let lines = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (lines, changed)
     }
@@ -1036,7 +1043,7 @@ mod dead_vector_epilogue_store_tests {
         let changed = delete_dead_vector_epilogue_stores(&mut store, &mut infos);
         let lines = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (lines, changed)
     }
@@ -1856,7 +1863,7 @@ mod highbit_sub_tests {
         fold_highbit_subs(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -2138,7 +2145,7 @@ mod highbit_sub_tests {
         fold_guarded_scan_selects(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -2229,7 +2236,7 @@ mod highbit_sub_tests {
         retarget_preloaded_scan_copies(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -2483,7 +2490,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                     .splitn(2, char::is_whitespace)
                                     .nth(1)
                                     .unwrap_or("")
-                                    .trim();
+                                    .trim_ascii();
                                 let src_fam = register_family_fast(src);
                                 // Source must not reference the %rax family —
                                 // register form (family 0) or memory/index form
@@ -2622,8 +2629,8 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 // Parse "movq %srcReg, %dstReg" pattern
                 if let Some(rest) = line_i.strip_prefix("movq ") {
                     if let Some((src_str, dst_str)) = rest.split_once(',') {
-                        let src = src_str.trim();
-                        let dst = dst_str.trim();
+                        let src = src_str.trim_ascii();
+                        let dst = dst_str.trim_ascii();
                         let src_fam = register_family_fast(src);
                         let dst_fam = register_family_fast(dst);
                         // Both must be GP registers, different families, both register operands
@@ -2664,8 +2671,8 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                         let line_j = infos[j].trimmed(store.get(j));
                                         if let Some(rest_j) = line_j.strip_prefix("movq ") {
                                             if let Some((src_j, dst_j)) = rest_j.split_once(',') {
-                                                let src_j = src_j.trim();
-                                                let dst_j = dst_j.trim();
+                                                let src_j = src_j.trim_ascii();
+                                                let dst_j = dst_j.trim_ascii();
                                                 let src_j_fam = register_family_fast(src_j);
                                                 let dst_j_fam = register_family_fast(dst_j);
                                                 if src_j_fam == dst_fam && dst_j_fam == src_fam {
@@ -2689,7 +2696,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         if infos[i].kind == LineKind::Jmp {
             let jmp_line = infos[i].trimmed(store.get(i));
             if let Some(target) = jmp_line.strip_prefix("jmp ") {
-                let target = target.trim();
+                let target = target.trim_ascii();
                 // Find the next non-NOP, non-empty line
                 let mut found_redundant = false;
                 for j in (i + 1)..len {
@@ -2737,7 +2744,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             // Parse: "jCC target" -> extract CC and target
             if let Some(space_pos) = cond_line.find(' ') {
                 let cc = &cond_line[1..space_pos]; // e.g., "l", "ge", "ne"
-                let cond_target = cond_line[space_pos + 1..].trim();
+                let cond_target = cond_line[space_pos + 1..].trim_ascii();
                 // Find the next non-NOP line (should be jmp)
                 let mut j = i + 1;
                 while j < len
@@ -2747,7 +2754,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             && infos[j]
                                 .trimmed(store.get(j))
                                 .strip_suffix(':')
-                                .is_some_and(|l| l.trim() != cond_target)
+                                .is_some_and(|l| l.trim_ascii() != cond_target)
                             && label_refs.is_fallthrough_only(store, infos, j)))
                 {
                     j += 1;
@@ -2755,7 +2762,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 if j < len && infos[j].kind == LineKind::Jmp {
                     let jmp_line = infos[j].trimmed(store.get(j));
                     if let Some(jmp_target) = jmp_line.strip_prefix("jmp ") {
-                        let jmp_target = jmp_target.trim();
+                        let jmp_target = jmp_target.trim_ascii();
                         // Find the next non-NOP/non-empty line after jmp (should be a label)
                         let mut k = j + 1;
                         while k < len && (infos[k].is_nop() || infos[k].kind == LineKind::Empty) {
@@ -2808,7 +2815,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             let cond = infos[i].trimmed(store.get(i));
             if let Some(sp) = cond.find(' ') {
                 let cc = &cond[1..sp];
-                let alt_target = cond[sp + 1..].trim();
+                let alt_target = cond[sp + 1..].trim_ascii();
                 let next_live = |mut p: usize| {
                     while p < len && (infos[p].is_nop() || infos[p].kind == LineKind::Empty) {
                         p += 1;
@@ -2851,17 +2858,17 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         && let (Some((init_src, init_dst)), Some((alt_src, alt_dst))) =
                             (init_ops.rsplit_once(','), alt_ops.rsplit_once(','))
                     {
-                        let dst = init_dst.trim();
+                        let dst = init_dst.trim_ascii();
                         let dst_fam = register_family_fast(dst);
                         let alt_label = infos[l].trimmed(store.get(l)).trim_end_matches(':');
                         let merge = infos[n].trimmed(store.get(n)).trim_end_matches(':');
                         let jump_merge = infos[k]
                             .trimmed(store.get(k))
                             .strip_prefix("jmp ")
-                            .map(str::trim);
+                            .map(str::trim_ascii);
                         if hoistable_mov_source(init_src)
                             && is_valid_gp_reg(dst_fam)
-                            && register_family_fast(alt_dst.trim()) == dst_fam
+                            && register_family_fast(alt_dst.trim_ascii()) == dst_fam
                             && !line_refs_gp_family(alt_src, dst_fam)
                             && alt_label == alt_target
                             && jump_merge == Some(merge)
@@ -3346,7 +3353,7 @@ pub(super) fn eliminate_dead_sign_extensions(
                             match infos[k].kind {
                                 LineKind::LoadRbp { offset: lo, .. } if lo == n => {
                                     saw_load = true;
-                                    let tk = infos[k].trimmed(store.get(k)).trim_start();
+                                    let tk = infos[k].trimmed(store.get(k)).trim_ascii_start();
                                     if tk.starts_with("movq ") {
                                         safe = false; // full-width read of upper half
                                         break;
@@ -3615,14 +3622,14 @@ fn compose_self_scaled_lea(
         .get(..5)
         .filter(|o| *o == "leal " || (*o == "leaq " && !producer_is_leal))?;
     let (addr, dest) = next[5..].rsplit_once(',')?;
-    let (addr, dest) = (addr.trim(), dest.trim());
+    let (addr, dest) = (addr.trim_ascii(), dest.trim_ascii());
     let d_fam = register_family_fast(dest);
     if d_fam == REG_NONE || d_fam > REG_GP_MAX {
         return None;
     }
     let open = addr.find('(')?;
     let inner = addr.strip_suffix(')')?.get(open + 1..)?;
-    let f: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let f: Vec<&str> = inner.split(',').map(str::trim_ascii).collect();
     let t64 = REG_NAMES[0][t_u];
     if f.len() != 3 || f[0] != t64 || f[1] != t64 {
         return None;
@@ -3712,8 +3719,8 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         };
-        let addr_text = addr_text.trim();
-        let dst_text = dst_text.trim();
+        let addr_text = addr_text.trim_ascii();
+        let dst_text = dst_text.trim_ascii();
         if !dst_text.starts_with('%') {
             i += 1;
             continue;
@@ -3737,7 +3744,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
         }
         let fields: Vec<&str> = addr_text[open + 1..close]
             .split(',')
-            .map(str::trim)
+            .map(str::trim_ascii)
             .collect();
         // Single-base form: `leaq disp(%base), %dst` with no index/scale.
         // This is the dominant shape emitted for pointer induction in hot
@@ -3779,7 +3786,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             ) {
                 let redefines = composed
                     .rsplit_once(',')
-                    .is_some_and(|(_, d)| register_family_fast(d.trim()) == dst_family);
+                    .is_some_and(|(_, d)| register_family_fast(d.trim_ascii()) == dst_family);
                 if redefines || dead.dead_after(store, infos, j, dst_family, &[i, j]) {
                     mark_nop(&mut infos[i]);
                     replace_line(store, &mut infos[j], j, format!("    {composed}"));
@@ -3910,8 +3917,8 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                 .strip_prefix("movq ")
                 .and_then(|rest| rest.split_once(','))
             {
-                let src = src.trim();
-                let tmp = tmp.trim();
+                let src = src.trim_ascii();
+                let tmp = tmp.trim_ascii();
                 let tmp_family = register_family_fast(tmp);
                 if src == dst_text
                     && tmp.starts_with('%')
@@ -3999,7 +4006,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
 /// frame. The alternate arm is never moved by the pattern, so only the
 /// init source needs this classification.
 fn hoistable_mov_source(src: &str) -> bool {
-    let s = src.trim();
+    let s = src.trim_ascii();
     if let Some(imm) = s.strip_prefix('$') {
         return !imm.is_empty();
     }
@@ -4113,7 +4120,7 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         };
-        let (addr_text, dst_text) = (addr_text.trim(), dst_text.trim());
+        let (addr_text, dst_text) = (addr_text.trim_ascii(), dst_text.trim_ascii());
         if !dst_text.starts_with('%') {
             i += 1;
             continue;
@@ -4134,7 +4141,7 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
         }
         let fields: Vec<&str> = addr_text[open + 1..close]
             .split(',')
-            .map(str::trim)
+            .map(str::trim_ascii)
             .collect();
         // Only the two- and three-field SIB forms; the single-base form is
         // already handled (and folding it here would duplicate that work).
@@ -4482,7 +4489,7 @@ fn pure_family_write(td: &str, fam: RegId) -> bool {
     // destination token to be exactly the 32-/64-bit register name excludes
     // them; byte/word destinations are excluded the same way (partial write)
     // and so is any memory destination such as `movl $0, (%r8)`.
-    let dest = td[comma + 1..].trim();
+    let dest = td[comma + 1..].trim_ascii();
     if dest != name32 && dest != name64 {
         return false;
     }
@@ -4563,7 +4570,7 @@ pub(super) fn fold_accumulator_alu_store(store: &mut LineStore, infos: &mut [Lin
                 i += 1;
                 continue;
             }
-            let ms = tj[ao.len() + 1..tj.len() - 6].trim().to_string();
+            let ms = tj[ao.len() + 1..tj.len() - 6].trim_ascii().to_string();
             if !ms.ends_with("(%rsp)") && !ms.ends_with("(%rbp)") {
                 i += 1;
                 continue;
@@ -4782,8 +4789,8 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                 i += 1;
                 continue;
             };
-            let src = src.trim();
-            let dst_gpr = dst_gpr.trim();
+            let src = src.trim_ascii();
+            let dst_gpr = dst_gpr.trim_ascii();
             let gpr_family = register_family_fast(dst_gpr);
             if (dst_gpr == "%rax" || dst_gpr == "%rcx")
                 && gpr_family <= REG_GP_MAX
@@ -4799,7 +4806,7 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                     if relay.starts_with(&expected) {
                         let dst_xmm = relay
                             .rsplit_once(',')
-                            .map(|(_, dst)| dst.trim())
+                            .map(|(_, dst)| dst.trim_ascii())
                             .unwrap_or("");
                         if !dst_xmm.is_empty()
                             && gp_dead.dead_after(store, infos, j, gpr_family, &[i, j])
@@ -6048,7 +6055,7 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
                                 i += 1;
                                 continue;
                             };
-                            if destination.trim() == "(%rcx)" && !source.contains("%rcx") {
+                            if destination.trim_ascii() == "(%rcx)" && !source.contains("%rcx") {
                                 let replacement =
                                     line_j.replacen("(%rcx)", &format!("(%{})", src_reg), 1);
                                 if replacement != line_j && !replacement.contains("%rcx") {
@@ -6347,7 +6354,7 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
         let movq_line = infos[i].trimmed(store.get(i));
         let src_family = if let Some(rest) = movq_line.strip_prefix("movq ") {
             if let Some((src, _dst)) = rest.split_once(',') {
-                let src = src.trim();
+                let src = src.trim_ascii();
                 let fam = register_family_fast(src);
                 // This fusion indexes the 16-entry GPR name table. XMM/MMX
                 // register families are recognized by the parser but have no
@@ -6797,7 +6804,7 @@ mod extension_chain_tests {
         collapse_extension_chains(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| l.starts_with("mov"))
             .collect()
     }
@@ -7084,7 +7091,7 @@ mod narrow_signext_copy_tests {
         narrow_signext_into_32bit_copy(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| !l.is_empty())
             .collect()
     }
@@ -7597,23 +7604,19 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         }
         // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
         let jmp_text = infos[i].trimmed(store.get(i));
-        let target = if jmp_text.starts_with("jmp ") {
-            jmp_text[4..].to_string()
-        } else if jmp_text.starts_with("jl ") {
-            jmp_text[3..].to_string()
-        } else if jmp_text.starts_with("jle ") {
-            jmp_text[4..].to_string()
-        } else if jmp_text.starts_with("jne ") {
-            jmp_text[4..].to_string()
-        } else if jmp_text.starts_with("jge ") {
-            jmp_text[4..].to_string()
-        } else if jmp_text.starts_with("jg ") {
-            jmp_text[3..].to_string()
-        } else if jmp_text.starts_with("jb ") {
-            jmp_text[3..].to_string()
-        } else if jmp_text.starts_with("ja ") {
-            jmp_text[3..].to_string()
-        } else {
+        const BACK_EDGES: &[crate::backend::peephole_common::Pfx] = &[
+            crate::backend::peephole_common::Pfx::new("jmp "),
+            crate::backend::peephole_common::Pfx::new("jl "),
+            crate::backend::peephole_common::Pfx::new("jle "),
+            crate::backend::peephole_common::Pfx::new("jne "),
+            crate::backend::peephole_common::Pfx::new("jge "),
+            crate::backend::peephole_common::Pfx::new("jg "),
+            crate::backend::peephole_common::Pfx::new("jb "),
+            crate::backend::peephole_common::Pfx::new("ja "),
+        ];
+        let Some(target) = crate::backend::peephole_common::find_pfx(jmp_text, BACK_EDGES)
+            .map(|p| jmp_text[p.len()..].to_string())
+        else {
             i += 1;
             continue;
         };
@@ -7999,8 +8002,8 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                 let Some(comma) = after_lea.find(", %") else {
                     continue;
                 };
-                let src_part = after_lea[..comma].trim();
-                let dst_part = after_lea[comma + 2..].trim();
+                let src_part = after_lea[..comma].trim_ascii();
+                let dst_part = after_lea[comma + 2..].trim_ascii();
                 // Exactly `SYM(%rip)` / `SYM+OFF(%rip)`: no base register,
                 // no index/scale — anything else reads a register and is
                 // not a constant.
@@ -8022,7 +8025,7 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                     continue;
                 }
                 let lea_text = store.get(pos).to_string();
-                let lea_text = lea_text.trim_end().to_string();
+                let lea_text = lea_text.trim_ascii_end().to_string();
                 match insert_entry {
                     Some(ins) => {
                         // Fall-through entry: INSERT the LEA after the
@@ -8128,7 +8131,7 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                 store,
                 &mut infos[entry],
                 entry,
-                load_text.trim_end().to_string(),
+                load_text.trim_ascii_end().to_string(),
             );
             mark_nop(&mut infos[pos]); // remove original in-loop load
             changed = true;
@@ -8785,11 +8788,11 @@ pub(super) fn rotate_loops(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             }
             // Emit: movslq %Xd, %Y (for next iter's index)
             let first_setup = store.get(header_instrs[0]).to_string();
-            replacement_lines.push(first_setup.trim_end().to_string());
+            replacement_lines.push(first_setup.trim_ascii_end().to_string());
             // Emit remaining setup except the compare, then emit optimized compare
             for &setup_idx in &header_instrs[1..header_instrs.len() - 1] {
                 let text = store.get(setup_idx).to_string();
-                replacement_lines.push(text.trim_end().to_string());
+                replacement_lines.push(text.trim_ascii_end().to_string());
             }
             // Emit compare with source register instead of destination register
             let first_text = infos[header_instrs[0]].trimmed(store.get(header_instrs[0]));
@@ -8802,14 +8805,14 @@ pub(super) fn rotate_loops(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
                 let dst_32 = reg_64_to_32(dst_64);
                 let last_setup_idx = *header_instrs.last().unwrap();
                 let cmp_text = store.get(last_setup_idx).to_string();
-                let optimized_cmp = cmp_text.trim_end().replace(&dst_32, src_32);
+                let optimized_cmp = cmp_text.trim_ascii_end().replace(&dst_32, src_32);
                 replacement_lines.push(optimized_cmp);
             }
         } else {
             // Standard: duplicate all setup instructions verbatim
             for &setup_idx in &header_instrs {
                 let text = store.get(setup_idx).to_string();
-                replacement_lines.push(text.trim_end().to_string());
+                replacement_lines.push(text.trim_ascii_end().to_string());
             }
         }
         replacement_lines.push(format!("    {} {}", inv_cond, body_label));
@@ -8998,7 +9001,7 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
         // %r10d`, `movslq ...`) carry a wide dest spelling and fully
         // redefine the family even though their memory operand is narrow.
         let partial_def = |t: &str, fam: u16, uses: &mut u16| {
-            let tt = t.trim_end();
+            let tt = t.trim_ascii_end();
             if tt.ends_with(REG_NAMES[2][fam as usize]) || tt.ends_with(REG_NAMES[3][fam as usize])
             {
                 *uses |= 1u16 << fam;
@@ -9147,8 +9150,8 @@ pub(super) fn fold_copy_shift_copyback(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         };
-        let src = register_family_fast(a_src.trim());
-        let tmp = register_family_fast(a_dst.trim());
+        let src = register_family_fast(a_src.trim_ascii());
+        let tmp = register_family_fast(a_dst.trim_ascii());
         if !is_valid_gp_reg(src) || !is_valid_gp_reg(tmp) || src == tmp {
             i += 1;
             continue;
@@ -9250,7 +9253,7 @@ pub(super) fn fold_copy_logical_shift_signext(
             continue;
         };
         let gp32 = |text: &str| {
-            let text = text.trim();
+            let text = text.trim_ascii();
             let fam = register_family_fast(text);
             (is_valid_gp_reg(fam) && REG_NAMES[1][fam as usize] == text).then_some(fam)
         };
@@ -9273,7 +9276,7 @@ pub(super) fn fold_copy_logical_shift_signext(
             i += 1;
             continue;
         };
-        if count.trim() != "$24" || gp32(b_dst) != Some(tmp) {
+        if count.trim_ascii() != "$24" || gp32(b_dst) != Some(tmp) {
             i += 1;
             continue;
         }
@@ -9296,7 +9299,7 @@ pub(super) fn fold_copy_logical_shift_signext(
             i += 1;
             continue;
         };
-        if c_src.trim() != REG_NAMES[3][tmp as usize]
+        if c_src.trim_ascii() != REG_NAMES[3][tmp as usize]
             || dst == tmp
             || get_dest_reg(&infos[j]) != tmp
             || get_dest_reg(&infos[k]) != dst
@@ -9354,7 +9357,7 @@ mod copy_logical_shift_signext_tests {
         fold_copy_logical_shift_signext(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -9545,7 +9548,7 @@ mod copy_logical_shift_signext_tests {
                 .map(|i| classify_line(store.get(i)))
                 .collect();
             let at = (0..store.len())
-                .find(|&i| store.get(i).trim() == pinned)
+                .find(|&i| store.get(i).trim_ascii() == pinned)
                 .unwrap();
             infos[at].pinned = true;
             assert!(!fold_copy_logical_shift_signext(&mut store, &mut infos));
@@ -9580,7 +9583,7 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         };
-        let breg = register_family_fast(shdst.trim());
+        let breg = register_family_fast(shdst.trim_ascii());
         if !is_valid_gp_reg(breg) {
             i += 1;
             continue;
@@ -9600,8 +9603,8 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         };
-        let areg = register_family_fast(asrc.trim());
-        let treg = register_family_fast(tdst.trim());
+        let areg = register_family_fast(asrc.trim_ascii());
+        let treg = register_family_fast(tdst.trim_ascii());
         if !is_valid_gp_reg(areg)
             || !is_valid_gp_reg(treg)
             || areg == treg
@@ -9744,8 +9747,8 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         };
-        let sreg = register_family_fast(ss.trim());
-        let areg = register_family_fast(aa.trim());
+        let sreg = register_family_fast(ss.trim_ascii());
+        let areg = register_family_fast(aa.trim_ascii());
         if !is_valid_gp_reg(sreg) || !is_valid_gp_reg(areg) || sreg == areg {
             i += 1;
             continue;
@@ -9791,8 +9794,8 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         };
-        let breg = register_family_fast(b2.trim());
-        if register_family_fast(s2.trim()) != sreg
+        let breg = register_family_fast(b2.trim_ascii());
+        if register_family_fast(s2.trim_ascii()) != sreg
             || !is_valid_gp_reg(breg)
             || breg == sreg
             || breg == areg
@@ -10127,7 +10130,7 @@ fn vex_self_move_zeroes_live_upper(
         }
         if tj.starts_with('v') {
             if let Some((_, dst)) = tj.rsplit_once(',') {
-                let dst = dst.split('{').next().unwrap_or(dst).trim();
+                let dst = dst.split('{').next().unwrap_or(dst).trim_ascii();
                 if dst == reg {
                     return false;
                 }
@@ -10148,30 +10151,35 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
             continue;
         }
         let t = infos[i].trimmed(store.get(i));
-        let Some(rest) = t
-            .strip_prefix("vmovdqu ")
-            .or_else(|| t.strip_prefix("vmovdqa "))
-            .or_else(|| t.strip_prefix("vmovupd "))
-            .or_else(|| t.strip_prefix("vmovups "))
-            .or_else(|| t.strip_prefix("vmovapd "))
-            .or_else(|| t.strip_prefix("vmovaps "))
-            .or_else(|| t.strip_prefix("vmovsd "))
-            .or_else(|| t.strip_prefix("vmovss "))
-            .or_else(|| t.strip_prefix("movdqu "))
-            .or_else(|| t.strip_prefix("movdqa "))
-            .or_else(|| t.strip_prefix("movupd "))
-            .or_else(|| t.strip_prefix("movups "))
-            .or_else(|| t.strip_prefix("movapd "))
-            .or_else(|| t.strip_prefix("movaps "))
-            .or_else(|| t.strip_prefix("movsd "))
-            .or_else(|| t.strip_prefix("movss "))
+        // Packed-prefix probe of the 16 vector-move spellings (954K
+        // strip_prefix calls per mixed TU); same list, same order.
+        const VEC_MOVES: &[crate::backend::peephole_common::Pfx] = &[
+            crate::backend::peephole_common::Pfx::new("vmovdqu "),
+            crate::backend::peephole_common::Pfx::new("vmovdqa "),
+            crate::backend::peephole_common::Pfx::new("vmovupd "),
+            crate::backend::peephole_common::Pfx::new("vmovups "),
+            crate::backend::peephole_common::Pfx::new("vmovapd "),
+            crate::backend::peephole_common::Pfx::new("vmovaps "),
+            crate::backend::peephole_common::Pfx::new("vmovsd "),
+            crate::backend::peephole_common::Pfx::new("vmovss "),
+            crate::backend::peephole_common::Pfx::new("movdqu "),
+            crate::backend::peephole_common::Pfx::new("movdqa "),
+            crate::backend::peephole_common::Pfx::new("movupd "),
+            crate::backend::peephole_common::Pfx::new("movups "),
+            crate::backend::peephole_common::Pfx::new("movapd "),
+            crate::backend::peephole_common::Pfx::new("movaps "),
+            crate::backend::peephole_common::Pfx::new("movsd "),
+            crate::backend::peephole_common::Pfx::new("movss "),
+        ];
+        let Some(rest) =
+            crate::backend::peephole_common::find_pfx(t, VEC_MOVES).map(|p| &t[p.len()..])
         else {
             continue;
         };
         // Every operand must be the same vector register: two for the
         // ordinary forms, three for the VEX scalar merge.  A memory operand
         // (or a GPR) is not a vector register and fails the test.
-        let mut ops = rest.split(',').map(str::trim);
+        let mut ops = rest.split(',').map(str::trim_ascii);
         let Some(first) = ops.next() else { continue };
         let is_vec =
             first.starts_with("%xmm") || first.starts_with("%ymm") || first.starts_with("%zmm");
@@ -10680,9 +10688,9 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let disp_prefix = disp_prefix.trim();
+        let disp_prefix = disp_prefix.trim_ascii();
         // A trailing `,s` scale suffix refuses the fold.
-        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let parts: Vec<&str> = inner.split(',').map(str::trim_ascii).collect();
         // The base-only arm carries `disp` to the rewritten LEA verbatim
         // (same single-displacement slot). The SIB arm parses it into a
         // VALUE because the rewritten `disp(B,C)` must carry it: dropping
@@ -10947,7 +10955,7 @@ fn lea_op_name(w: u8) -> &'static str {
 /// Empty means zero. Accepts the spellings this backend emits — signed
 /// decimal and `0x` hex — with checked negation for `-i64::MIN`.
 pub(super) fn parse_lea_disp(text: &str) -> Option<i64> {
-    let t = text.trim();
+    let t = text.trim_ascii();
     if t.is_empty() {
         return Some(0);
     }
@@ -11075,7 +11083,7 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         };
-        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let parts: Vec<&str> = inner.split(',').map(str::trim_ascii).collect();
         let b_fam = match parts.as_slice() {
             [a, b] => {
                 let (Some(af), Some(bf)) = (plain_gp_operand(a), plain_gp_operand(b)) else {
@@ -11258,7 +11266,7 @@ pub(super) fn fold_staged_imm_into_alu(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         };
-        let dst = dst.trim();
+        let dst = dst.trim_ascii();
         // Plain decimal immediate only: hex, symbols, and expressions are
         // rejected (their immediate forms may not exist or may relocate).
         let imm: i64 = match imm_str.parse() {
@@ -11316,14 +11324,14 @@ pub(super) fn fold_staged_imm_into_alu(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         };
-        let body = line_j[op.len() + 1..].trim_start();
+        let body = line_j[op.len() + 1..].trim_ascii_start();
         // First operand must be exactly the staged register: `%FAM,`.
         let staged_full = format!("%{},", &expected[1..]);
         let Some(rest) = body.strip_prefix(&staged_full) else {
             i += 1;
             continue;
         };
-        let rest = rest.trim_start();
+        let rest = rest.trim_ascii_start();
         // The remainder (the consumer's destination, register or memory)
         // must not mention the staged family in any width.
         if rest.is_empty() || line_refs_family(rest, fam) {
@@ -11359,7 +11367,7 @@ mod redundant_leaq_tests {
         eliminate_redundant_leaq(&store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -11606,8 +11614,8 @@ pub(super) fn fuse_mov_scalar_fp_into_vex_op(
             i += 1;
             continue;
         };
-        let dst_d = dst_d.trim();
-        let src_a = src_a.trim();
+        let dst_d = dst_d.trim_ascii();
+        let src_a = src_a.trim_ascii();
         if !src_a.starts_with("xmm") || !dst_d.starts_with("xmm") || src_a == dst_d {
             i += 1;
             continue;
@@ -11645,7 +11653,7 @@ pub(super) fn fuse_mov_scalar_fp_into_vex_op(
                 .or_else(|| binary_vex_scalar_mnemonic(line_j, "ss")),
         };
         let (vop, body) = match consumer {
-            Some((m, rest)) => (m, rest.trim_start()),
+            Some((m, rest)) => (m, rest.trim_ascii_start()),
             None => {
                 i += 1;
                 continue;
@@ -11655,19 +11663,19 @@ pub(super) fn fuse_mov_scalar_fp_into_vex_op(
             i += 1;
             continue;
         };
-        let tail = tail.trim_start();
+        let tail = tail.trim_ascii_start();
         let Some((mid, last)) = tail.split_once(',') else {
             i += 1;
             continue;
         };
-        let mid = mid.trim();
-        let last = last.trim();
+        let mid = mid.trim_ascii();
+        let last = last.trim_ascii();
         // The two trailing operands must both be exactly the mov's dst.
         if mid != dst_d_full(dst_d) || last != dst_d_full(dst_d) {
             i += 1;
             continue;
         }
-        let s_operand = s_operand.trim();
+        let s_operand = s_operand.trim_ascii();
         // S must not read D (the register whose mov we are deleting).
         let d_full = dst_d_full(dst_d);
         if s_operand.contains(d_full.as_str()) {
@@ -11707,7 +11715,7 @@ mod vex_copy_fusion_tests {
         super::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|t| !t.is_empty())
             .collect()
     }
@@ -11792,8 +11800,8 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
             i += 1;
             continue;
         };
-        let dst_d = dst_d.trim();
-        let mem = mem.trim();
+        let dst_d = dst_d.trim_ascii();
+        let mem = mem.trim_ascii();
         if !dst_d.starts_with("xmm")
             || !dst_d[3..].chars().all(|c| c.is_ascii_digit())
             || mem.starts_with('%')
@@ -11822,19 +11830,19 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
             i += 1;
             continue;
         };
-        let body = body.trim_start();
+        let body = body.trim_ascii_start();
         let Some((s_operand, tail)) = body.split_once(',') else {
             i += 1;
             continue;
         };
-        let tail = tail.trim_start();
+        let tail = tail.trim_ascii_start();
         let Some((mid, last)) = tail.split_once(',') else {
             i += 1;
             continue;
         };
-        let mid = mid.trim();
-        let last = last.trim();
-        let s_operand = s_operand.trim();
+        let mid = mid.trim_ascii();
+        let last = last.trim_ascii();
+        let s_operand = s_operand.trim_ascii();
         // Memory case shape: `vOP %D, %X, %X` — the loaded register is the
         // FIRST source; the other value X occupies both the middle source
         // and the destination slot. X must be a register distinct from D.
@@ -11939,8 +11947,8 @@ pub(super) fn fold_broadcast_load_into_broadcast(
             i += 1;
             continue;
         };
-        let dst_d = dst_d.trim();
-        let mem = mem.trim();
+        let dst_d = dst_d.trim_ascii();
+        let mem = mem.trim_ascii();
         if !dst_d.starts_with("xmm")
             || !dst_d[3..].chars().all(|c| c.is_ascii_digit())
             || mem.starts_with('%')
@@ -11974,11 +11982,11 @@ pub(super) fn fold_broadcast_load_into_broadcast(
             i += 1;
             continue;
         };
-        if src.trim() != d_full {
+        if src.trim_ascii() != d_full {
             i += 1;
             continue;
         }
-        let dst_m = dst_m.trim();
+        let dst_m = dst_m.trim_ascii();
         let dst_is_vec_reg = dst_m
             .strip_prefix("%xmm")
             .or_else(|| dst_m.strip_prefix("%ymm"))
@@ -12346,7 +12354,7 @@ mod windowed_liveness_tests {
         let changed = collapse_increment_chain(&mut store, &mut infos);
         let live: Vec<&str> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim())
+            .map(|i| store.get(i).trim_ascii())
             .collect();
         assert!(
             !changed && live.contains(&"leaq 1(%rbx), %rdi"),
@@ -12494,7 +12502,7 @@ mod acc_fold_src_kill_tests {
         fold_accumulator_alu_store(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -12621,7 +12629,7 @@ mod staged_imm_alu_tests {
         fold_staged_imm_into_alu(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -12815,7 +12823,7 @@ mod staged_add_relay_tests {
         fuse_staged_add_and_relay(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -13392,7 +13400,7 @@ mod load_lea_add_tests {
         fuse_load_lea_add(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -13923,7 +13931,7 @@ mod load_lea_base_tests {
         fuse_load_lea_into_base(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -14306,7 +14314,7 @@ mod loop_hoist_tests {
         hoist_loop_invariant_gpr_load(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -14318,7 +14326,7 @@ mod loop_hoist_tests {
         promote_loop_invariant_fp_load(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -14896,7 +14904,7 @@ mod loop_hoist_tests {
                 .map(|i| classify_line(store.get(i)))
                 .collect();
             let at = (0..store.len())
-                .find(|&i| store.get(i).trim() == pinned)
+                .find(|&i| store.get(i).trim_ascii() == pinned)
                 .unwrap();
             infos[at].pinned = true;
             let original = store.build_result(|_| false);
@@ -15332,7 +15340,7 @@ mod broadcast_fold_tests {
         fold_broadcast_load_into_broadcast(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -15472,7 +15480,7 @@ mod broadcast_fold_tests {
             super::fuse_movq_ext_truncation(&mut store, &mut infos);
             (0..store.len())
                 .filter(|&i| !infos[i].is_nop())
-                .map(|i| store.get(i).trim().to_string())
+                .map(|i| store.get(i).trim_ascii().to_string())
                 .filter(|line| !line.is_empty())
                 .collect()
         };
@@ -15493,7 +15501,7 @@ mod broadcast_fold_tests {
             assert_eq!(
                 run(&xmm),
                 xmm.lines()
-                    .map(str::trim)
+                    .map(str::trim_ascii)
                     .map(str::to_string)
                     .collect::<Vec<_>>(),
                 "XMM source reached the {consumer} fusion"
@@ -15520,7 +15528,7 @@ mod broadcast_fold_tests {
             super::eliminate_vector_self_moves(&mut store, &mut infos);
             (0..store.len())
                 .filter(|&i| !infos[i].is_nop())
-                .map(|i| store.get(i).trim().to_string())
+                .map(|i| store.get(i).trim_ascii().to_string())
                 .filter(|t| !t.is_empty())
                 .collect()
         };
@@ -15577,7 +15585,7 @@ mod broadcast_fold_tests {
             super::eliminate_vector_self_moves(&mut store, &mut infos);
             (0..store.len())
                 .filter(|&i| !infos[i].is_nop())
-                .map(|i| store.get(i).trim().to_string())
+                .map(|i| store.get(i).trim_ascii().to_string())
                 .filter(|t| !t.is_empty())
                 .collect()
         };
@@ -15655,7 +15663,7 @@ mod broadcast_fold_tests {
             super::eliminate_vector_self_moves(&mut store, &mut infos);
             (0..store.len())
                 .filter(|&i| !infos[i].is_nop())
-                .map(|i| store.get(i).trim().to_string())
+                .map(|i| store.get(i).trim_ascii().to_string())
                 .filter(|t| !t.is_empty())
                 .collect()
         };
@@ -16039,7 +16047,7 @@ fn parse_shift_imm(t: &str) -> Option<(u32, &str)> {
     if !matches!(mnemonic, "shlq" | "shll" | "salq" | "sall") {
         return None;
     }
-    let (imm, dst) = split_two_operands(rest.trim_start())?;
+    let (imm, dst) = split_two_operands(rest.trim_ascii_start())?;
     let k: u32 = imm.strip_prefix('$')?.parse().ok()?;
     if !dst.starts_with('%') || dst.contains('(') {
         return None;
@@ -16069,7 +16077,7 @@ mod shift_into_mem_index_tests {
         super::fold_shift_into_sib(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
             .collect()
     }
@@ -16189,7 +16197,7 @@ mod shift_into_sib_tests {
         fold_shift_into_sib(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -16425,7 +16433,7 @@ mod extending_stack_tests {
             None,
         );
         assert!(!infos[2].is_nop(), "32-bit load is an upper-half write");
-        assert!(store.get(2).trim().starts_with("movl "));
+        assert!(store.get(2).trim_ascii().starts_with("movl "));
     }
 
     #[test]
@@ -16443,7 +16451,7 @@ mod extending_stack_tests {
         for pin in [0, 1] {
             let (store, infos) =
                 run_plain("movl %eax, 8(%rsp)\nmovl 8(%rsp), %ecx\nret\n", Some(pin));
-            assert_eq!(store.get(1).trim(), "movl 8(%rsp), %ecx");
+            assert_eq!(store.get(1).trim_ascii(), "movl 8(%rsp), %ecx");
             assert!(infos[pin].pinned);
         }
     }
@@ -16455,8 +16463,8 @@ mod extending_stack_tests {
                 "movl %eax, 8(%rsp)\naddl $1, %eax\nmovl 8(%rsp), %ecx\nret\n",
                 Some(pin),
             );
-            assert_eq!(store.get(1).trim(), "addl $1, %eax");
-            assert_eq!(store.get(2).trim(), "movl 8(%rsp), %ecx");
+            assert_eq!(store.get(1).trim_ascii(), "addl $1, %eax");
+            assert_eq!(store.get(2).trim_ascii(), "movl 8(%rsp), %ecx");
             assert!(infos[pin].pinned);
         }
     }
@@ -16784,7 +16792,7 @@ mod highbit_bsr_tests {
         combined_local_pass(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 

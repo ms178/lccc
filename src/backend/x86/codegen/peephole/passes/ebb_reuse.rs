@@ -112,7 +112,7 @@ fn flags_fact(t: &str, st: &State) -> Option<String> {
     if !matches!(base, "test" | "cmp") || !matches!(suffix, "b" | "w" | "l" | "q") {
         return None;
     }
-    let (a, b) = split_two_operands(t[mnemonic.len()..].trim_start())?;
+    let (a, b) = split_two_operands(t[mnemonic.len()..].trim_ascii_start())?;
     let mut out = String::from(mnemonic);
     for op in [a, b] {
         out.push(' ');
@@ -137,7 +137,7 @@ fn written_families(info: &LineInfo, t: &str) -> u16 {
     let mnemonic = t.split_ascii_whitespace().next().unwrap_or("");
     // Compares and plain stores name registers they only read.
     let plain_store = matches!(mnemonic, "movb" | "movw" | "movl" | "movq")
-        && split_two_operands(t[mnemonic.len()..].trim_start())
+        && split_two_operands(t[mnemonic.len()..].trim_ascii_start())
             .is_some_and(|(_, dst)| dst.contains('('));
     if info.kind == LineKind::Cmp || matches!(info.kind, LineKind::StoreRbp { .. }) || plain_store {
         return w;
@@ -412,7 +412,7 @@ mod tests {
         let changed = pass(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| !l.is_empty())
             .collect();
         (changed, out.join("\n"))
@@ -540,14 +540,14 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         let dead = (0..store.len())
-            .find(|&i| store.get(i).trim() == "movq %rdi, %r8")
+            .find(|&i| store.get(i).trim_ascii() == "movq %rdi, %r8")
             .unwrap();
         mark_nop(&mut infos[dead]);
         assert!(sink_copies_into_fallthrough(&mut store, &mut infos));
         assert!(infos[dead].is_nop(), "the retired slot must stay retired");
         let live: Vec<&str> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim())
+            .map(|i| store.get(i).trim_ascii())
             .filter(|l| !l.is_empty())
             .collect();
         assert!(!live.contains(&"movq %rdi, %r8"), "{live:?}");

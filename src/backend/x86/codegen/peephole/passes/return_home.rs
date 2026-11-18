@@ -122,7 +122,7 @@ fn terminal_silence(store: &LineStore, info: &LineInfo, i: usize) -> bool {
         return true;
     }
     let t = info.trimmed(store.get(i));
-    t.trim_start().starts_with('#')
+    t.trim_ascii_start().starts_with('#')
 }
 
 /// The width tier of a register spelling for family `fam` (0 = 64-bit,
@@ -450,7 +450,7 @@ fn try_fold_at_ret(store: &mut LineStore, infos: &mut [LineInfo], r: usize) -> b
         let line = store.get(c);
         let line = infos[c].trimmed(line);
         let line = match line.split_once('#') {
-            Some((before, _)) => before.trim_end(),
+            Some((before, _)) => before.trim_ascii_end(),
             None => line,
         };
         let mnem = line
@@ -700,7 +700,7 @@ fn is_zero_idiom(mn: &str, ops: &str, s: u32) -> bool {
         return false;
     }
     ops.split(',')
-        .all(|op| plain_xmm_operand(op.trim()) == Some(s))
+        .all(|op| plain_xmm_operand(op.trim_ascii()) == Some(s))
 }
 
 /// Terminal XMM return-copy coalescing; returns `true` when a copy was
@@ -811,7 +811,7 @@ fn try_fold_xmm_at_ret(store: &mut LineStore, infos: &mut [LineInfo], r: usize) 
         let Some(comma) = last_top_level_comma(ops.as_bytes()) else {
             break;
         };
-        if plain_xmm_operand(ops[comma + 1..].trim()) != Some(s) {
+        if plain_xmm_operand(ops[comma + 1..].trim_ascii()) != Some(s) {
             break;
         }
         if xmm_trailing_operand_is_read(mn)
@@ -896,7 +896,7 @@ mod tests {
         run(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1178,13 +1178,13 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         let root = (0..store.len())
-            .find(|&i| store.get(i).trim() == "movl %esi, %edi")
+            .find(|&i| store.get(i).trim_ascii() == "movl %esi, %edi")
             .expect("root line present");
         infos[root].pinned = true;
         assert!(!run(&mut store, &mut infos), "pinned root refused");
         let joined: String = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("movl %esi, %edi"), "{joined}");
@@ -1452,7 +1452,7 @@ mod tests {
         run_xmm(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }

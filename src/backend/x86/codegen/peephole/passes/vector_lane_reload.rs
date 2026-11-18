@@ -295,7 +295,7 @@ fn parse_frame_slot(op: &str) -> Option<(i64, &str)> {
 /// Split `a, b` at the top-level comma (no nested parens in these shapes).
 fn split_operands(rest: &str) -> Option<(&str, &str)> {
     let (a, b) = rest.split_once(',')?;
-    Some((a.trim(), b.trim()))
+    Some((a.trim_ascii(), b.trim_ascii()))
 }
 
 #[cfg(test)]
@@ -310,7 +310,7 @@ mod tests {
         run(&mut store, &mut infos, true, true);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }

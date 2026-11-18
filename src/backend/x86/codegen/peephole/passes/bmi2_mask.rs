@@ -15,8 +15,8 @@ fn parse(line: &str) -> Option<Op<'_>> {
     if line.contains([';', '#', '\n']) {
         return None;
     }
-    let (mnemonic, args) = line.trim().split_once(char::is_whitespace)?;
-    let args: Vec<_> = args.split(',').map(str::trim).collect();
+    let (mnemonic, args) = line.trim_ascii().split_once(char::is_whitespace)?;
+    let args: Vec<_> = args.split(',').map(str::trim_ascii).collect();
     if args.iter().any(|s| s.is_empty()) {
         return None;
     }

@@ -433,7 +433,7 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                     break;
                 }
                 if let Some(v) = dj.strip_prefix(".cfi_def_cfa_offset ") {
-                    match v.trim().parse::<i64>() {
+                    match v.trim_ascii().parse::<i64>() {
                         Ok(v) => cfa_rows.push((j, v)),
                         Err(_) => decline = true,
                     }
@@ -624,7 +624,7 @@ fn fpo_prologue_pushes(store: &LineStore, infos: &[LineInfo], at: usize) -> Opti
         p -= 1;
         let line = infos[p].trimmed(store.get(p));
         if super::helpers::steps_over_line(&infos[p], line) {
-            if line.starts_with(".cfi_startproc") {
+            if infos[p].is_cfi_start() {
                 return Some((p, pushes));
             }
             continue;
@@ -662,7 +662,7 @@ fn drop_restated_cfa(store: &LineStore, infos: &mut [LineInfo], start: usize, en
         else {
             continue;
         };
-        let Ok(v) = v.trim().parse::<i64>() else {
+        let Ok(v) = v.trim_ascii().parse::<i64>() else {
             return;
         };
         if v == current {
@@ -684,7 +684,7 @@ fn is_direct_sibcall_jmp(info: &LineInfo, trimmed: &str) -> bool {
     let Some(target) = trimmed.strip_prefix("jmp ") else {
         return false;
     };
-    let target = target.trim();
+    let target = target.trim_ascii();
     !target.is_empty() && !target.starts_with('.') && !target.starts_with('*')
 }
 

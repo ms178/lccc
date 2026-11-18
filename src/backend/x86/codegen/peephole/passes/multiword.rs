@@ -100,7 +100,7 @@ impl Width {
 /// Split a line into mnemonic and operand text at the first blank.
 fn mnemonic(t: &str) -> Option<(&str, &str)> {
     let at = t.find([' ', '\t'])?;
-    Some((&t[..at], t[at..].trim()))
+    Some((&t[..at], t[at..].trim_ascii()))
 }
 
 /// `OPl A, B` / `OPq A, B` for the given stem.
@@ -181,7 +181,7 @@ struct Tail<'a> {
 /// `(%A,%B)` / `(%A,%B,1)`: a two-register sum with no displacement.
 fn lea_sum(address: &str) -> Option<(RegId, RegId)> {
     let inner = address.strip_prefix('(')?.strip_suffix(')')?;
-    let mut parts = inner.split(',').map(str::trim);
+    let mut parts = inner.split(',').map(str::trim_ascii);
     let (base, index) = (parts.next()?, parts.next()?);
     match parts.next() {
         None | Some("1") => {}
@@ -196,8 +196,11 @@ fn lea_sum(address: &str) -> Option<(RegId, RegId)> {
 /// `K(%A)`: one register plus a non-zero displacement.
 fn lea_offset(address: &str) -> Option<(i64, RegId)> {
     let open = address.find('(')?;
-    let offset = address[..open].trim().parse::<i64>().ok()?;
-    let base = address[open..].strip_prefix('(')?.strip_suffix(')')?.trim();
+    let offset = address[..open].trim_ascii().parse::<i64>().ok()?;
+    let base = address[open..]
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim_ascii();
     (offset != 0 && i32::try_from(offset).is_ok()).then_some(())?;
     Some((offset, Width::Q.register(base)?))
 }

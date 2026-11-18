@@ -101,7 +101,7 @@ enum Source<'a> {
 /// is `setne`).
 fn parse_sign_compare(t: &str) -> Option<SignCompare<'_>> {
     let (mn, rest) = t.split_once(' ')?;
-    let (src, dst) = split_two_operands(rest.trim_start())?;
+    let (src, dst) = split_two_operands(rest.trim_ascii_start())?;
     let width = suffix_width(mn.chars().last()?)?;
     const LESS: &[&str] = &["setl", "sets"];
     const NONZERO: &[&str] = &["setne", "setnz"];
@@ -248,7 +248,7 @@ fn match_at(
         let (set, x) = infos[k].trimmed(store.get(k)).split_once(' ')?;
         if s == d
             || !c.setcc.contains(&set)
-            || reg_of_width(x.trim(), 1) != Some(d)
+            || reg_of_width(x.trim_ascii(), 1) != Some(d)
             || [j, k].iter().any(|&n| infos[n].pinned)
             || !flags_dead_after(store, infos, k + 1)
         {
@@ -269,7 +269,7 @@ fn match_at(
     if !c.setcc.contains(&set) {
         return None;
     }
-    let x = reg_of_width(x.trim(), 1)?;
+    let x = reg_of_width(x.trim_ascii(), 1)?;
     let k = next_live(store, infos, j)?;
     let (a, b) = split_two_operands(infos[k].trimmed(store.get(k)).strip_prefix("movzbl ")?)?;
     let d = reg_of_width(b, 4)?;
@@ -316,7 +316,7 @@ mod tests {
         let changed = materialize_sign_tests(&mut store, &mut infos);
         let out = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| {
                 !l.is_empty()
                     && !l.starts_with('.')

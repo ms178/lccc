@@ -312,11 +312,19 @@ fn gsf_update_zext(
             // TRUE on the swapped family would let a later Q→L self-reload
             // be nop'd although the upper half is the swapped-in memory
             // bits. These are rare atomic forms — clear everything.
-            if t.starts_with("xchg")
-                || t.starts_with("lock xchg")
-                || t.starts_with("cmpxchg")
-                || t.starts_with("lock cmpxchg")
-                || t.starts_with("vzeroall")
+            use crate::backend::peephole_common::{first8, pfx};
+            let f8 = first8(t);
+            // "lock xchg"/"lock cmpxchg" exceed eight bytes; probing the
+            // "lock " prefix and re-dispatching on the suffix is exact (the
+            // original ladder accepted exactly these two lock-prefixed
+            // spellings).
+            if pfx!(f8, "xchg")
+                || pfx!(f8, "cmpxchg")
+                || pfx!(f8, "vzeroall")
+                || (pfx!(f8, "lock ") && {
+                    let r8 = first8(&t["lock ".len()..]);
+                    pfx!(r8, "xchg") || pfx!(r8, "cmpxchg")
+                })
             {
                 *reg_zext = [false; 16];
                 return;
@@ -363,7 +371,7 @@ fn dest_range_ok(dest: RegId) -> Option<u8> {
 /// destinations, sub-32-bit names, and unrecognized forms.
 fn dest_write_width(trimmed: &str) -> Option<u32> {
     let comma = trimmed.rfind(',')?;
-    let dest = trimmed[comma + 1..].trim();
+    let dest = trimmed[comma + 1..].trim_ascii();
     if dest.len() < 2 || !dest.starts_with('%') {
         return None;
     }
@@ -1445,7 +1453,7 @@ fn parse_imm_slot_store(raw: &str, preparsed_offset: i32) -> Option<(i64, i32, M
     if preparsed_offset == RBP_OFFSET_NONE {
         return None;
     }
-    let s = raw.trim_start();
+    let s = raw.trim_ascii_start();
     // Two operands exactly.
     let mut parts = s.split(", ");
     let head = parts.next()?;
@@ -1533,7 +1541,9 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             // destination; vzeroall zeroes ALL 128 bits of every XMM (unlike
             // vzeroupper, which preserves the low 128 every scalar mapping
             // tracks).
-            !(t.starts_with("xrstor") || t.starts_with("fxrstor") || t.starts_with("vzeroall"))
+            let f8 = crate::backend::peephole_common::first8(t);
+            use crate::backend::peephole_common::pfx;
+            !(pfx!(f8, "xrstor") || pfx!(f8, "fxrstor") || pfx!(f8, "vzeroall"))
         });
 
     for i in 0..len {
@@ -1847,6 +1857,7 @@ mod tests {
                     pinned: true,
                     inert_dir: false,
                     volatile_access: false,
+                    cfi: CfiMark::None,
                 };
             }
         }
@@ -2403,8 +2414,9 @@ mod tests {
         let (mut store, mut infos) = build_pinned(asm);
         assert!(global_store_forwarding(&mut store, &mut infos));
         assert!(
-            (0..store.len())
-                .any(|i| { !infos[i].is_nop() && store.get(i).trim() == "movq %xmm0, %xmm6" })
+            (0..store.len()).any(|i| {
+                !infos[i].is_nop() && store.get(i).trim_ascii() == "movq %xmm0, %xmm6"
+            })
         );
     }
 
@@ -2939,7 +2951,7 @@ mod tests {
         global_store_forwarding(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         assert!(
             out.iter().any(|l| l == "movsd 24(%rsp), %xmm2"),
@@ -2967,7 +2979,7 @@ mod tests {
         global_store_forwarding(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         assert!(
             !out.iter()

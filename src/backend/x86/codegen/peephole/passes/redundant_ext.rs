@@ -194,8 +194,8 @@ fn split_two_operands(t: &str) -> Option<(&str, &str)> {
     while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
         so += 1;
     }
-    let src = t[so..comma].trim();
-    let dst = t[comma + 1..].trim();
+    let src = t[so..comma].trim_ascii();
+    let dst = t[comma + 1..].trim_ascii();
     if src.is_empty() || dst.is_empty() {
         return None;
     }
@@ -445,7 +445,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
 
     for i in 0..lines.len() {
         let line = &lines[i];
-        let t = line.trim();
+        let t = line.trim_ascii();
         if t.is_empty() {
             continue;
         }
@@ -516,20 +516,24 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             continue;
         }
 
+        use crate::backend::peephole_common::pfx;
+        // One packed load serves every mnemonic probe in this iteration.
+        let f8 = crate::backend::peephole_common::first8(t);
+
         // --- Pattern: movslq %R15D, %R15 twice on the same family ---
         // The second is a no-op: after the first, the family already holds
         // sext(its low 32 bits), and nothing in between redefined it (any
         // write clears the fact). Source and destination must be the SAME
         // family -- `movslq %eax, %r15` moves a different value and must stay.
-        if t.starts_with("movslq ") || t.starts_with("movsxd ") {
+        if pfx!(f8, "movslq ") || pfx!(f8, "movsxd ") {
             if let Some(comma) = t.rfind(',') {
                 let mut so = t.find(' ').unwrap_or(0) + 1;
                 if so <= comma && comma < t.len() {
                     while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                         so += 1;
                     }
-                    let src = t[so..comma].trim();
-                    let dst = t[comma + 1..].trim();
+                    let src = t[so..comma].trim_ascii();
+                    let dst = t[comma + 1..].trim_ascii();
                     // Register source only: a memory source is a real load.
                     if src.starts_with('%') {
                         if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
@@ -554,7 +558,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         }
 
         // --- Pattern: movzbl %AL, %EAX (redundant re-zero-extend) ---
-        if t.starts_with("movzbl ") || t.starts_with("movzbq ") {
+        if pfx!(f8, "movzbl ") || pfx!(f8, "movzbq ") {
             if let Some(comma) = t.rfind(',') {
                 // Guard the operand slice.
                 //
@@ -585,8 +589,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                     so += 1;
                 }
-                let src = t[so..comma].trim();
-                let dst = t[comma + 1..].trim();
+                let src = t[so..comma].trim_ascii();
+                let dst = t[comma + 1..].trim_ascii();
                 let src_fam = family_of_reg(src);
                 let dst_fam = family_of_reg(dst);
                 if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
@@ -646,10 +650,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
 
         // --- Pattern: movzwl %AX, %EAX / movzwq %AX, %RAX (redundant
         //    16-bit re-zero-extension of a value already zero-extended) ---
-        if ext16_enabled
-            && (t.starts_with("movzwl ") || t.starts_with("movzwq "))
-            && !t.contains('(')
-        {
+        if ext16_enabled && (pfx!(f8, "movzwl ") || pfx!(f8, "movzwq ")) && !t.contains('(') {
             // reg-reg form only (memory sources are handled by the flag
             // update below: movzwl mem,%eax already zero-extends).
             if let Some(comma) = t.rfind(',') {
@@ -682,8 +683,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                     so += 1;
                 }
-                let src = t[so..comma].trim();
-                let dst = t[comma + 1..].trim();
+                let src = t[so..comma].trim_ascii();
+                let dst = t[comma + 1..].trim_ascii();
                 let src_fam = family_of_reg(src);
                 let dst_fam = family_of_reg(dst);
                 if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
@@ -734,12 +735,12 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         //    is_byte / is_16 rules above) ---
         // Proof obligations live in rewrite_sign_reextension.
         if sext_enabled
-            && (t.starts_with("movsbq ")
-                || t.starts_with("movswq ")
-                || t.starts_with("movsbl ")
-                || t.starts_with("movswl ")
-                || t.starts_with("movslq ")
-                || t.starts_with("movsxd "))
+            && (pfx!(f8, "movsbq ")
+                || pfx!(f8, "movswq ")
+                || pfx!(f8, "movsbl ")
+                || pfx!(f8, "movswl ")
+                || pfx!(f8, "movslq ")
+                || pfx!(f8, "movsxd "))
         {
             let mut facts = ExtFacts {
                 upper32_zero: &mut upper32_zero,
@@ -763,7 +764,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         // A U32 -> U64 zero-extension cast whose source and destination share
         // a register emits `movl %r32, %r32`. When a preceding 32-bit write
         // already cleared bits 32..63, the self-move is a pure no-op.
-        if t.starts_with("movl ") && !t.contains('(') {
+        if pfx!(f8, "movl ") && !t.contains('(') {
             if let Some((src, dst)) = split_two_operands(t) {
                 if src == dst && src.starts_with('%') {
                     if let Some(sf) = family_of_reg(src) {
@@ -793,7 +794,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         // Only register-to-register copies are rewritten: a memory source may
         // contain an arbitrary 64-bit value, and immediate operands are left
         // to other constant-materialization patterns.
-        if t.starts_with("movq") && !t.contains('(') {
+        if pfx!(f8, "movq") && !t.contains('(') {
             if let Some(comma) = t.rfind(',') {
                 const MOVQ_LEN: usize = "movq".len();
                 let so = MOVQ_LEN;
@@ -802,8 +803,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     so += 1;
                 }
                 if so < comma && comma < t.len() {
-                    let src = t[so..comma].trim();
-                    let dst = t[comma + 1..].trim();
+                    let src = t[so..comma].trim_ascii();
+                    let dst = t[comma + 1..].trim_ascii();
                     if src.starts_with('%') && dst.starts_with('%') {
                         if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
                             if (sf as usize) < GP_FAMILIES && (df as usize) < GP_FAMILIES {
@@ -825,7 +826,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                                 if upper32_zero[sf as usize] {
                                     if let Some(d32) = reg32_name(df) {
                                         let next = (i + 1..lines.len())
-                                            .map(|j| lines[j].trim())
+                                            .map(|j| lines[j].trim_ascii())
                                             .find(|candidate| {
                                                 !candidate.is_empty()
                                                     && !candidate.starts_with('.')
@@ -1121,9 +1122,11 @@ fn rewrite_sign_reextension(t: &str, facts: &mut ExtFacts<'_>) -> Option<ExtRewr
                     // so in the match itself rather than relying
                     // on that table never growing an "ah" entry.
                     let src_name = src.trim_start_matches('%');
-                    let src_is_low = if t.starts_with("movsb") {
+                    use crate::backend::peephole_common::pfx;
+                    let f8 = crate::backend::peephole_common::first8(t);
+                    let src_is_low = if pfx!(f8, "movsb") {
                         reg8_name(sf) == Some(src_name)
-                    } else if t.starts_with("movsw") {
+                    } else if pfx!(f8, "movsw") {
                         reg16_name(sf) == Some(src_name)
                     } else {
                         reg32_name(sf) == Some(src_name)
@@ -1133,9 +1136,9 @@ fn rewrite_sign_reextension(t: &str, facts: &mut ExtFacts<'_>) -> Option<ExtRewr
                     // sext-from-8 would produce ...FF80 -- rewriting
                     // on the wider fact alone would miscompile.
                     let proven = src_is_low
-                        && if t.starts_with("movsb") {
+                        && if pfx!(f8, "movsb") {
                             facts.sext8[sfi]
-                        } else if t.starts_with("movsw") {
+                        } else if pfx!(f8, "movsw") {
                             facts.sext16[sfi]
                         } else {
                             facts.sext32[sfi]
@@ -1211,8 +1214,8 @@ fn update_facts_for_movq(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
             clear_mentioned_families(t, facts);
             return;
         }
-        let src = t[so..comma].trim();
-        let dst = t[comma + 1..].trim();
+        let src = t[so..comma].trim_ascii();
+        let dst = t[comma + 1..].trim_ascii();
         let src_fam = family_of_reg(src);
         let dst_fam = family_of_reg(dst);
         if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
@@ -1298,11 +1301,11 @@ fn wide_scan_preload(t: &str) -> Option<u8> {
     if !matches!(op, "movl" | "movq" | "movabsq") {
         return None;
     }
-    let imm = rest.trim_start().strip_prefix('$')?;
+    let imm = rest.trim_ascii_start().strip_prefix('$')?;
     let DstKind::Reg(df) = classify_dst(t) else {
         return None;
     };
-    let imm = imm.split(',').next()?.trim();
+    let imm = imm.split(',').next()?.trim_ascii();
     let (neg, mag) = match imm.strip_prefix('-') {
         Some(m) => (true, m),
         None => (false, imm),

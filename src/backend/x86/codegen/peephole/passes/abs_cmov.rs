@@ -320,8 +320,8 @@ fn next_non_silence(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<u
     while c < infos.len() {
         if !infos[c].is_steppable() {
             let raw = store.get(c);
-            if !(raw.trim_start().starts_with('#')
-                || raw.trim().is_empty()
+            if !(raw.trim_ascii_start().starts_with('#')
+                || raw.trim_ascii().is_empty()
                 || crate::backend::peephole_common::inert_directive(raw))
             {
                 return Some(c);
@@ -345,7 +345,7 @@ mod tests {
         run(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join("\n")

@@ -162,7 +162,7 @@ fn parse_inplace_mask(t: &str) -> Option<(u64, RegId)> {
         .strip_prefix("andl $")
         .or_else(|| t.strip_prefix("andq $"))?;
     let (imm, dst) = rest.split_once(',')?;
-    let dst = dst.trim();
+    let dst = dst.trim_ascii();
     // A memory destination (`andl $255, -8(%rbp)`) masks a slot; there is no
     // register whose value could be left unmasked, and the byte form would
     // change the memory traffic. Only a bare register is in scope.
@@ -173,7 +173,7 @@ fn parse_inplace_mask(t: &str) -> Option<(u64, RegId)> {
     if fam > REG_GP_MAX {
         return None;
     }
-    let imm = imm.trim();
+    let imm = imm.trim_ascii();
     let imm = if let Some(hex) = imm.strip_prefix("0x").or_else(|| imm.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()?
     } else {
@@ -196,7 +196,7 @@ fn parse_zext_pair(t: &str) -> Option<(usize, RegId, RegId)> {
         return None;
     };
     let (src, dst) = rest.split_once(',')?;
-    let (src, dst) = (src.trim(), dst.trim());
+    let (src, dst) = (src.trim_ascii(), dst.trim_ascii());
     if !src.starts_with('%') || src.contains('(') || !dst.starts_with('%') || dst.contains('(') {
         return None;
     }

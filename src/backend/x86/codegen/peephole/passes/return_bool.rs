@@ -20,22 +20,18 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut rdx_dead_at_ret = false;
     for a in 0..infos.len() {
         if !infos[a].is_nop() {
-            let t = infos[a].trimmed(store.get(a));
-            if t.starts_with(".cfi_startproc") {
+            if infos[a].is_cfi_start() {
                 // Bound the marker scan by this function's `.cfi_endproc`
                 // (as `FileLiveness` does). Defence in depth: the scan also
                 // stops at the first `ret`, which any matching function has.
                 let end = (a + 1..infos.len())
-                    .find(|&n| {
-                        !infos[n].is_nop()
-                            && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc")
-                    })
+                    .find(|&n| infos[n].is_cfi_end())
                     .unwrap_or(infos.len());
                 rdx_dead_at_ret =
                     FileLiveness::ret_rdx_marker(store, infos, a + 1, end) == Some(false);
                 continue;
             }
-            if t.starts_with(".cfi_endproc") {
+            if infos[a].is_cfi_end() {
                 rdx_dead_at_ret = false;
                 continue;
             }
@@ -76,7 +72,7 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((_, byte)) = set.split_once(char::is_whitespace) else {
             continue;
         };
-        let byte = byte.trim();
+        let byte = byte.trim_ascii();
         let Some(family) = REG_NAMES[3].iter().position(|&r| r == byte) else {
             continue;
         };
@@ -96,12 +92,12 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((src, dst)) = rest.split_once(',') else {
             continue;
         };
-        if src.trim() != byte || !matches!(dst.trim(), "%eax" | "%rax") {
+        if src.trim_ascii() != byte || !matches!(dst.trim_ascii(), "%eax" | "%rax") {
             continue;
         }
         // Enforce the destination spelling appropriate to the extension.
-        if (ext.starts_with("movzbl ") && dst.trim() != "%eax")
-            || (ext.starts_with("movzbq ") && dst.trim() != "%rax")
+        if (ext.starts_with("movzbl ") && dst.trim_ascii() != "%eax")
+            || (ext.starts_with("movzbq ") && dst.trim_ascii() != "%rax")
         {
             continue;
         }
@@ -171,7 +167,7 @@ fn retarget_zeroed_setcc(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
         let Some((x, y)) = ops.split_once(',') else {
             continue;
         };
-        let (x, y) = (x.trim(), y.trim());
+        let (x, y) = (x.trim_ascii(), y.trim_ascii());
         if x != y {
             continue;
         }
@@ -192,7 +188,9 @@ fn retarget_zeroed_setcc(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
             }
             let line = infos[c].trimmed(store.get(c));
             if let Some(cc) = parse_setcc(line) {
-                let target = line.split_once(char::is_whitespace).map(|(_, t)| t.trim());
+                let target = line
+                    .split_once(char::is_whitespace)
+                    .map(|(_, t)| t.trim_ascii());
                 if target == Some(REG_NAMES[3][r]) {
                     setcc = Some((c, cc.to_string()));
                     break;
@@ -220,10 +218,10 @@ fn retarget_zeroed_setcc(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
                 .or_else(|| line.strip_prefix("movq ").map(|o| (0usize, o)));
             if let Some((width, o)) = parsed {
                 if let Some((src, dst)) = o.split_once(',') {
-                    if src.trim() == REG_NAMES[width][r] {
+                    if src.trim_ascii() == REG_NAMES[width][r] {
                         copy = REG_NAMES[width]
                             .iter()
-                            .position(|n| *n == dst.trim())
+                            .position(|n| *n == dst.trim_ascii())
                             .map(|dfam| (d, dfam));
                         break;
                     }
@@ -292,7 +290,7 @@ fn fold_negated_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((s, d)) = ops.split_once(',') else {
             continue;
         };
-        let (s, d) = (s.trim(), d.trim());
+        let (s, d) = (s.trim_ascii(), d.trim_ascii());
         if !REG_NAMES[width].contains(&s) {
             continue;
         }
@@ -376,7 +374,7 @@ fn fold_return_select(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((src, dst)) = operands.split_once(',') else {
             continue;
         };
-        let (src, dst) = (src.trim(), dst.trim());
+        let (src, dst) = (src.trim_ascii(), dst.trim_ascii());
         let Some(sfam) = REG_NAMES[width].iter().position(|r| *r == src) else {
             continue;
         };
