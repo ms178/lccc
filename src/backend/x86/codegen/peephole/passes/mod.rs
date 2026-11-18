@@ -646,9 +646,9 @@ fn peephole_optimize_inner(
     ra_config: &RaConfig,
     optimize_for_size: bool,
 ) -> String {
-    // ms178 debug: dump pre-peephole asm
+    // Keep the two pre-peephole metric dumps separate from the full TU.
     if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
-        let _ = std::fs::write(path, &asm);
+        let _ = std::fs::write(candidate_path(&path), &asm);
     }
     // Always-on, provably-safe pass: eliminate redundant pushfq/popfq pairs
     // (flag-neutral window). Runs before the peephole gate.

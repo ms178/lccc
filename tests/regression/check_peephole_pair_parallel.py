@@ -18,6 +18,9 @@ candidates:
    iterated a `std::collections::HashMap`, so its per-process hash seed decided
    `.Lskip_N` labels and block placement, and five serial compilations produced
    five different objects.
+4. *Debug evidence* — on x86-64, `CCC_DUMP_ASM` preserves separate raw
+   metric-candidate dumps alongside the full TU and leaves final assembly
+   identical to the uninstrumented run.
 
 The cross backends are driven with a header-free fixture that triggers ten
 explorations per compile (`peephole_pair/chain_wide.c`), so the gate needs no
@@ -92,7 +95,7 @@ def effective_threads():
     return max(1, threads)
 
 
-def compile_asm(compiler, source, knob, workdir, tag, opt="-O1"):
+def compile_asm(compiler, source, knob, workdir, tag, opt="-O1", *, dump=None):
     """Compile one source in one scheduling mode.
 
     Returns `(sha256, modes, counters)` where `modes` holds one entry per pair
@@ -101,6 +104,9 @@ def compile_asm(compiler, source, knob, workdir, tag, opt="-O1"):
     out = workdir / f"{source.stem}-{tag}.s"
     env = dict(os.environ)
     env.pop("LCCC_PEEPHOLE_PAIR_PARALLEL", None)
+    env.pop("CCC_DUMP_ASM", None)
+    if dump is not None:
+        env["CCC_DUMP_ASM"] = str(dump)
     if knob is not None:
         env["LCCC_PEEPHOLE_PAIR_PARALLEL"] = knob
     env["CCC_TIME_PEEPHOLE"] = "1"
@@ -130,6 +136,21 @@ def check_accounting(label, source_name, opt, modes, counters, failures):
             f"{label}/{source_name} {opt}: counters {counters} do not account for "
             f"{len(modes)} pairs"
         )
+
+
+def check_debug_dump(compiler, workdir, expected_sha, failures):
+    dump = workdir / "peephole.raw.s"
+    digest, modes, _ = compile_asm(compiler, ROOT / WIDE, "1", workdir, "dump", dump=dump)
+    paths = [dump, workdir / "peephole.raw-chain.s", workdir / "peephole.raw-orig.s"]
+    if not any(mode in ("parallel", "serial") for mode in modes):
+        failures.append("CCC_DUMP_ASM: fixture did not run two distinct candidates")
+    missing = [p.name for p in paths if not p.is_file() or not p.stat().st_size]
+    if missing:
+        failures.append(f"CCC_DUMP_ASM: missing or empty dumps: {missing}")
+    elif len({p.read_bytes() for p in paths}) != len(paths):
+        failures.append("CCC_DUMP_ASM: expected three distinct dumps (TU, chain, original)")
+    if digest != expected_sha:
+        failures.append("CCC_DUMP_ASM: instrumentation changed final assembly")
 
 
 def main():
@@ -206,6 +227,8 @@ def main():
                         "pairs_forced": modes["forced"],
                         "counters_auto": counters["auto"],
                     }
+            if label == "x86-64" and f"{WIDE} -O1" in rows:
+                check_debug_dump(binary, workdir, rows[f"{WIDE} -O1"]["assembly_sha256"], failures)
             if arch_pairs == 0:
                 failures.append(f"{label}: no dual-layout pair measured; the contract is void")
             total_pairs += arch_pairs
