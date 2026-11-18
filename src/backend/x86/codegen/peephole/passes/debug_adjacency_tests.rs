@@ -30,7 +30,7 @@ fn apply_hidden(pass: Pass, body: &str) -> (bool, String) {
 
 fn code(text: &str) -> Vec<&str> {
     text.lines()
-        .map(str::trim)
+        .map(str::trim_ascii)
         .filter(|s| !s.is_empty() && !is_debug_marker_directive(s))
         .collect()
 }

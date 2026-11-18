@@ -66,7 +66,7 @@ fn a_32_bit_self_move_survives_when_the_upper_half_is_unknown() {
     ));
     let body: Vec<&str> = out
         .lines()
-        .map(str::trim)
+        .map(str::trim_ascii)
         .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
         .collect();
     assert!(
@@ -671,7 +671,7 @@ fn ext_parse_shapes_unit() {
 /// `movslq MEM,%rax`).
 fn rax_sign_extensions(out: &str) -> usize {
     out.lines()
-        .map(str::trim)
+        .map(str::trim_ascii)
         .filter(|l| *l == "cltq" || l.starts_with("movslq") && l.ends_with("%rax"))
         .count()
 }

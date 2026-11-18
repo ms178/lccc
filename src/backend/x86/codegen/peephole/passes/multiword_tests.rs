@@ -77,7 +77,7 @@ impl Cpu {
             literal => literal.parse().expect("displacement"),
         };
         let inner = text[open + 1..].strip_suffix(')').expect("closing paren");
-        let mut parts = inner.split(',').map(str::trim);
+        let mut parts = inner.split(',').map(str::trim_ascii);
         let reg = |name: &str| {
             let fam = REG_NAMES[0]
                 .iter()
@@ -209,7 +209,7 @@ impl Cpu {
     }
 
     fn run(mut self, body: &str) -> Self {
-        for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        for line in body.lines().map(str::trim_ascii).filter(|l| !l.is_empty()) {
             self.step(line);
         }
         self
@@ -314,7 +314,7 @@ fn unchanged(body: &str) {
 }
 
 fn lines(text: &str) -> Vec<&str> {
-    text.lines().map(str::trim).collect()
+    text.lines().map(str::trim_ascii).collect()
 }
 
 /// `setb; movzbl` into %r10 after whatever set the flags.

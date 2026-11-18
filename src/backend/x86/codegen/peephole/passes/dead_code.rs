@@ -652,7 +652,7 @@ fn sib_frame_read_range(
     let mut fields = inside.split(',');
     fields.next()?;
     let idx = fields.next()?.trim_ascii();
-    let scale: i32 = match fields.next().map(str::trim) {
+    let scale: i32 = match fields.next().map(str::trim_ascii) {
         None | Some("") => 1,
         Some(s) => s.parse().ok()?,
     };
@@ -778,12 +778,12 @@ fn sib_frame_read_range(
                         let inside = &mem[open + 1..close];
                         let mut comps = inside.split(',');
                         let base = comps.next().unwrap_or("").trim_ascii();
-                        let stride_idx = comps.next().map(str::trim);
+                        let stride_idx = comps.next().map(str::trim_ascii);
                         let stride = if let Some(si) = stride_idx {
                             if !si.is_empty() && si != idx {
                                 false
                             } else {
-                                let sc = comps.next().map(str::trim).unwrap_or("1");
+                                let sc = comps.next().map(str::trim_ascii).unwrap_or("1");
                                 sc.parse::<i64>().map(|v| v >= 1).unwrap_or(false)
                                     && (si.is_empty() || si == idx)
                             }
@@ -881,7 +881,7 @@ fn sib_frame_read_range(
                     .ok()
             })
         } else if t.starts_with("xorl ") || t.starts_with("xorq ") {
-            let ps: Vec<&str> = t.split(',').map(str::trim).collect();
+            let ps: Vec<&str> = t.split(',').map(str::trim_ascii).collect();
             (ps.len() == 2 && ps[0] == ps[1]).then_some(0)
         } else {
             None

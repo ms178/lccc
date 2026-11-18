@@ -1395,7 +1395,10 @@ fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
     }
     let disp = addr[..open].trim_ascii();
     let mut fams = Vec::new();
-    let fields: Vec<&str> = addr[open + 1..close].split(',').map(str::trim).collect();
+    let fields: Vec<&str> = addr[open + 1..close]
+        .split(',')
+        .map(str::trim_ascii)
+        .collect();
     if fields.is_empty() || fields.len() > 3 {
         return None;
     }
@@ -9550,7 +9553,7 @@ mod chain_rename_tests {
     fn chain_rename_on_coalesce_refusal_shapes_is_value_preserving() {
         let body = |out: &str| -> Vec<String> {
             out.lines()
-                .map(str::trim)
+                .map(str::trim_ascii)
                 .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
                 .map(str::to_string)
                 .collect()

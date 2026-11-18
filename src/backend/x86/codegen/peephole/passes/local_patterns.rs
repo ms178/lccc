@@ -2858,7 +2858,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         let jump_merge = infos[k]
                             .trimmed(store.get(k))
                             .strip_prefix("jmp ")
-                            .map(str::trim);
+                            .map(str::trim_ascii);
                         if hoistable_mov_source(init_src)
                             && is_valid_gp_reg(dst_fam)
                             && register_family_fast(alt_dst.trim_ascii()) == dst_fam
@@ -3622,7 +3622,7 @@ fn compose_self_scaled_lea(
     }
     let open = addr.find('(')?;
     let inner = addr.strip_suffix(')')?.get(open + 1..)?;
-    let f: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let f: Vec<&str> = inner.split(',').map(str::trim_ascii).collect();
     let t64 = REG_NAMES[0][t_u];
     if f.len() != 3 || f[0] != t64 || f[1] != t64 {
         return None;
@@ -3737,7 +3737,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
         }
         let fields: Vec<&str> = addr_text[open + 1..close]
             .split(',')
-            .map(str::trim)
+            .map(str::trim_ascii)
             .collect();
         // Single-base form: `leaq disp(%base), %dst` with no index/scale.
         // This is the dominant shape emitted for pointer induction in hot
@@ -4134,7 +4134,7 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
         }
         let fields: Vec<&str> = addr_text[open + 1..close]
             .split(',')
-            .map(str::trim)
+            .map(str::trim_ascii)
             .collect();
         // Only the two- and three-field SIB forms; the single-base form is
         // already handled (and folding it here would duplicate that work).
@@ -10148,30 +10148,35 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
             continue;
         }
         let t = infos[i].trimmed(store.get(i));
-        let Some(rest) = t
-            .strip_prefix("vmovdqu ")
-            .or_else(|| t.strip_prefix("vmovdqa "))
-            .or_else(|| t.strip_prefix("vmovupd "))
-            .or_else(|| t.strip_prefix("vmovups "))
-            .or_else(|| t.strip_prefix("vmovapd "))
-            .or_else(|| t.strip_prefix("vmovaps "))
-            .or_else(|| t.strip_prefix("vmovsd "))
-            .or_else(|| t.strip_prefix("vmovss "))
-            .or_else(|| t.strip_prefix("movdqu "))
-            .or_else(|| t.strip_prefix("movdqa "))
-            .or_else(|| t.strip_prefix("movupd "))
-            .or_else(|| t.strip_prefix("movups "))
-            .or_else(|| t.strip_prefix("movapd "))
-            .or_else(|| t.strip_prefix("movaps "))
-            .or_else(|| t.strip_prefix("movsd "))
-            .or_else(|| t.strip_prefix("movss "))
+        // Packed-prefix probe of the 16 vector-move spellings (954K
+        // strip_prefix calls per mixed TU); same list, same order.
+        const VEC_MOVES: &[crate::backend::peephole_common::Pfx] = &[
+            crate::backend::peephole_common::Pfx::new("vmovdqu "),
+            crate::backend::peephole_common::Pfx::new("vmovdqa "),
+            crate::backend::peephole_common::Pfx::new("vmovupd "),
+            crate::backend::peephole_common::Pfx::new("vmovups "),
+            crate::backend::peephole_common::Pfx::new("vmovapd "),
+            crate::backend::peephole_common::Pfx::new("vmovaps "),
+            crate::backend::peephole_common::Pfx::new("vmovsd "),
+            crate::backend::peephole_common::Pfx::new("vmovss "),
+            crate::backend::peephole_common::Pfx::new("movdqu "),
+            crate::backend::peephole_common::Pfx::new("movdqa "),
+            crate::backend::peephole_common::Pfx::new("movupd "),
+            crate::backend::peephole_common::Pfx::new("movups "),
+            crate::backend::peephole_common::Pfx::new("movapd "),
+            crate::backend::peephole_common::Pfx::new("movaps "),
+            crate::backend::peephole_common::Pfx::new("movsd "),
+            crate::backend::peephole_common::Pfx::new("movss "),
+        ];
+        let Some(rest) =
+            crate::backend::peephole_common::find_pfx(t, VEC_MOVES).map(|p| &t[p.len()..])
         else {
             continue;
         };
         // Every operand must be the same vector register: two for the
         // ordinary forms, three for the VEX scalar merge.  A memory operand
         // (or a GPR) is not a vector register and fails the test.
-        let mut ops = rest.split(',').map(str::trim);
+        let mut ops = rest.split(',').map(str::trim_ascii);
         let Some(first) = ops.next() else { continue };
         let is_vec =
             first.starts_with("%xmm") || first.starts_with("%ymm") || first.starts_with("%zmm");
@@ -10682,7 +10687,7 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
         }
         let disp_prefix = disp_prefix.trim_ascii();
         // A trailing `,s` scale suffix refuses the fold.
-        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let parts: Vec<&str> = inner.split(',').map(str::trim_ascii).collect();
         // The base-only arm carries `disp` to the rewritten LEA verbatim
         // (same single-displacement slot). The SIB arm parses it into a
         // VALUE because the rewritten `disp(B,C)` must carry it: dropping
@@ -11075,7 +11080,7 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         };
-        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let parts: Vec<&str> = inner.split(',').map(str::trim_ascii).collect();
         let b_fam = match parts.as_slice() {
             [a, b] => {
                 let (Some(af), Some(bf)) = (plain_gp_operand(a), plain_gp_operand(b)) else {
@@ -15493,7 +15498,7 @@ mod broadcast_fold_tests {
             assert_eq!(
                 run(&xmm),
                 xmm.lines()
-                    .map(str::trim)
+                    .map(str::trim_ascii)
                     .map(str::to_string)
                     .collect::<Vec<_>>(),
                 "XMM source reached the {consumer} fusion"

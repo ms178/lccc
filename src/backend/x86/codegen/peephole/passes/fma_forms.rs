@@ -201,7 +201,10 @@ pub(super) fn parse_scalar_fma(t: &str) -> Option<ScalarFma<'_>> {
     if operands.contains('{') {
         return None;
     }
-    let ops: Vec<&str> = operand_list(operands).into_iter().map(str::trim).collect();
+    let ops: Vec<&str> = operand_list(operands)
+        .into_iter()
+        .map(str::trim_ascii)
+        .collect();
     let [op0, op1, dst] = <[&str; 3]>::try_from(ops).ok()?;
     if xmm_reg(dst).is_none() || xmm_reg(op1).is_none() {
         return None;

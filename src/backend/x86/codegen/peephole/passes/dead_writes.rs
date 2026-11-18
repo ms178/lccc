@@ -420,7 +420,7 @@ impl LabelRefs {
         label_idx: usize,
     ) -> bool {
         let t = infos[label_idx].trimmed(store.get(label_idx));
-        let Some(name) = t.strip_suffix(':').map(str::trim) else {
+        let Some(name) = t.strip_suffix(':').map(str::trim_ascii) else {
             return false;
         };
         // A name outside the symbol alphabet (a quoted symbol) can never be
@@ -1619,7 +1619,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
         //   accumulator carries exactly the value the scratch held. Only the
         //   exact scratch text is rewritten (width-exact, mirroring the
         //   move-relay pass); any width-variant alias rejects instead.
-        let mut src_tokens: Vec<&str> = op_src.split(',').map(str::trim).collect();
+        let mut src_tokens: Vec<&str> = op_src.split(',').map(str::trim_ascii).collect();
         let mut reject = false;
         for tok in src_tokens.iter_mut() {
             if let Some(src_fam) = plain_gp_operand(tok) {

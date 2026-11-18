@@ -317,7 +317,7 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let ops: Vec<&str> = arith_operands.split(',').map(str::trim).collect();
+        let ops: Vec<&str> = arith_operands.split(',').map(str::trim_ascii).collect();
         // Conversion to a GPR: `cvt(t)s?2si %xmmS, %gpr` reads the loaded
         // register once and writes only the GPR.  VEX 3-operand form (dst ==
         // src2 required, and dst may not be the loaded register: the removed

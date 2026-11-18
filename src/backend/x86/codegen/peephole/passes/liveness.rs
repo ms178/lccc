@@ -1854,7 +1854,7 @@ impl FileLiveness {
             };
             let mem = &mov_rest[..close];
             // `(%rB,%rA,4)` — the base must match the addq base.
-            let parts: Vec<&str> = mem.split(',').map(str::trim).collect();
+            let parts: Vec<&str> = mem.split(',').map(str::trim_ascii).collect();
             if parts.len() != 3 || parts[0] != base_reg || parts[2] != "4" {
                 continue;
             }

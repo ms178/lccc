@@ -584,7 +584,7 @@ fn forward_jump_target(store: &LineStore, infos: &[LineInfo], n: usize, t: &str)
             && infos[k]
                 .trimmed(store.get(k))
                 .strip_suffix(':')
-                .map(str::trim)
+                .map(str::trim_ascii)
                 == Some(target)
     })
 }
@@ -2846,7 +2846,7 @@ pub(super) fn walk_flag_consumers_seeded(
     for n in fs..fe {
         if infos[n].kind == LineKind::Label {
             let t = infos[n].trimmed(store.get(n));
-            if let Some(name) = t.strip_suffix(':').map(str::trim) {
+            if let Some(name) = t.strip_suffix(':').map(str::trim_ascii) {
                 labels.push((name, n));
             }
         }
@@ -3086,7 +3086,7 @@ pub(super) fn flags_reach_consumer_after_branch(
         if let Some(name) = infos[n]
             .trimmed(store.get(n))
             .strip_suffix(':')
-            .map(str::trim)
+            .map(str::trim_ascii)
         {
             if name == target {
                 target_idx = Some(n);

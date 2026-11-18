@@ -181,7 +181,7 @@ struct Tail<'a> {
 /// `(%A,%B)` / `(%A,%B,1)`: a two-register sum with no displacement.
 fn lea_sum(address: &str) -> Option<(RegId, RegId)> {
     let inner = address.strip_prefix('(')?.strip_suffix(')')?;
-    let mut parts = inner.split(',').map(str::trim);
+    let mut parts = inner.split(',').map(str::trim_ascii);
     let (base, index) = (parts.next()?, parts.next()?);
     match parts.next() {
         None | Some("1") => {}

@@ -1626,7 +1626,7 @@ fn parse_lea_add(t: &str) -> Option<(bool, RegId, RegId, RegId)> {
     }
     // SRC must be exactly `(%a,%b)` / `(%a, %b)` / `(%a, %b, 1)`.
     let inner = src.strip_prefix('(')?.strip_suffix(')')?;
-    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let parts: Vec<&str> = inner.split(',').map(str::trim_ascii).collect();
     if parts.len() != 2 && parts.len() != 3 {
         return None;
     }
@@ -4399,7 +4399,7 @@ mod zec_tests {
             // Keep instructions only: drop directives, labels, comments, blanks.
             let body: Vec<&str> = asm
                 .lines()
-                .map(str::trim)
+                .map(str::trim_ascii)
                 .filter(|l| {
                     !l.is_empty() && !l.starts_with('.') && !l.starts_with('#') && !l.ends_with(':')
                 })

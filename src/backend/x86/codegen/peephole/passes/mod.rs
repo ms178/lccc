@@ -377,7 +377,7 @@ fn pin_address_taken_global(store: &LineStore, infos: &mut [LineInfo]) {
             _ => None,
         };
         let is_taken = operand
-            .map(str::trim)
+            .map(str::trim_ascii)
             .and_then(direct_stack_slot)
             .is_some_and(|slot| address_taken.contains(&slot));
         if is_taken {
@@ -452,7 +452,7 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
                     _ => None,
                 };
                 let is_taken = operand
-                    .map(str::trim)
+                    .map(str::trim_ascii)
                     .and_then(direct_stack_slot)
                     .is_some_and(|slot| taken.contains(&slot));
                 if is_taken {

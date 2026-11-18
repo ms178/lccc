@@ -975,7 +975,7 @@ mod tests {
         run(&frame(asm))
             .lines()
             .filter(|l| !l.starts_with(".type ") && !l.starts_with(".size ") && l != &"f:")
-            .map(str::trim)
+            .map(str::trim_ascii)
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -983,7 +983,10 @@ mod tests {
     /// The same normalisation applied to an *expected* body written with the
     /// indentation of the surrounding source.
     fn norm(asm: &str) -> String {
-        asm.lines().map(str::trim).collect::<Vec<_>>().join("\n")
+        asm.lines()
+            .map(str::trim_ascii)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The pass must leave `asm` byte-identical (modulo indentation).
