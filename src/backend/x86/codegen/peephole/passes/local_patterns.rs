@@ -1506,6 +1506,12 @@ pub(super) fn retarget_preloaded_scan_copies(
 }
 
 /// Pure matcher for [`retarget_preloaded_scan_copies`].
+///
+/// BSF/BSR only, by design: a preloaded scan is only ever EMITTED with the
+/// plain spellings (`emit_zero_defined_scan_direct` keeps `bsf` exactly so
+/// that its semantic preload lives inside the RMW model), so a
+/// `tzcnt`-spelled triple does not occur and adding it here would create
+/// an untestable arm.
 fn match_preloaded_scan_copy(t: &[&str; 3]) -> Option<GuardedScanRewrite> {
     let (mn, q, scan_ops) = [("bsf", false), ("bsf", true), ("bsr", false), ("bsr", true)]
         .into_iter()
@@ -1602,6 +1608,14 @@ fn is_imm_move_to(t: &str, fam: RegId) -> bool {
 
 /// Pure matcher for [`fold_guarded_scan_selects`]: `t` is the scan, then the
 /// test and the constant move in either order, then the cmov.
+///
+/// BSF/BSR only, by design. The rewrite's whole soundness argument is the
+/// destination PASSTHROUGH on a zero source, which only the plain
+/// spellings guarantee on every CPU: a `tzcnt`-spelled scan decodes as
+/// TZCNT on BMI1 silicon and overwrites a preloaded select constant with
+/// the operand width, so folding it would turn `x ? ctz(x) : C` into
+/// `x ? ctz(x) : width` there. A guarded select around a `tzcnt` scan is
+/// therefore left exactly as written.
 fn match_guarded_scan_select(t: &[&str; 4]) -> Option<GuardedScanRewrite> {
     let (mn, q, scan_ops) = [("bsf", false), ("bsf", true), ("bsr", false), ("bsr", true)]
         .into_iter()
@@ -2350,17 +2364,18 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             }
         }
 
-        // --- Pattern: dead staging move before two-operand BSR/BSF ---
+        // --- Pattern: dead staging move before a two-operand scan ---
         // Direct nonzero bitcount lowering can meet a conservative allocator
         // preload at the textual boundary:
         //
         //   movq %rdi, %rax
-        //   bsfq %rdi, %rax
+        //   tzcntq %rdi, %rax     (or bsfq/bsrq)
         //
-        // BSR/BSF fully define the destination on their nonzero domain, so the
-        // identical-source preload is dead. Defined-zero IR reaches this shape
-        // only inside its already-taken nonzero arm; ClzNonZero/CtzNonZero make
-        // the same precondition explicit. Exact source+destination equality
+        // BSR/BSF fully define the destination on their nonzero domain, and
+        // TZCNT fully defines it on EVERY input, so the identical-source
+        // preload is dead. Defined-zero IR reaches this shape only inside
+        // its already-taken nonzero arm; ClzNonZero/CtzNonZero make the
+        // same precondition explicit. Exact source+destination equality
         // keeps this independent of register aliases and memory effects.
         {
             let cur = infos[i].trimmed(store.get(i));
@@ -2378,10 +2393,12 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                     let bit_ops = match width {
                         'q' => next
                             .strip_prefix("bsfq ")
-                            .or_else(|| next.strip_prefix("bsrq ")),
+                            .or_else(|| next.strip_prefix("bsrq "))
+                            .or_else(|| next.strip_prefix("tzcntq ")),
                         _ => next
                             .strip_prefix("bsfl ")
-                            .or_else(|| next.strip_prefix("bsrl ")),
+                            .or_else(|| next.strip_prefix("bsrl "))
+                            .or_else(|| next.strip_prefix("tzcntl ")),
                     };
                     if bit_ops == Some(ops) {
                         label_refs.mark_nop(store, &mut infos[i], i);

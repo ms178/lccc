@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 571,
+  "knob_literals": 572,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -431,6 +431,7 @@
     "CCC_RA_GLOBAL_LOCATION_MAX",
     "CCC_RA_LOOP_SPAN_RESERVE",
     "CCC_RA_NO_RECURRENCE_FLOOR",
+    "CCC_RA_NO_RECURRENCE_KEEP",
     "CCC_RA_REMAT_MAX_USES",
     "CCC_REASSOC_ACCUM_FORCE",
     "CCC_SCCP_NO_DEFS",

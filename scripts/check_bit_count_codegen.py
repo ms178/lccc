@@ -29,7 +29,12 @@ def require(condition: bool, message: str) -> None:
 
 
 def check(directory: Path) -> None:
-    for arch, leading, trailing in [("x86-64", "bsrl", "bsfq"),
+    # Nonzero-domain CTZ is tzcnt-spelled at BOTH tiers: F3 0F BC is
+    # `rep bsf`, which pre-BMI1 CPUs execute as BSF with the same nonzero
+    # result (GCC emits the same bytes at plain -O2).  CLZ has no such
+    # compatible spelling (F3 0F BD = LZCNT computes 63-BSR), so the
+    # leading scan stays BSR until -march grants ABM.
+    for arch, leading, trailing in [("x86-64", "bsrl", "tzcntq"),
                                     ("x86-64-v3", "lzcntl", "tzcntq")]:
         path = directory / f"count-{arch}.s"
         for name, opcode in [("clz_full", leading), ("ctz_full", trailing)]:

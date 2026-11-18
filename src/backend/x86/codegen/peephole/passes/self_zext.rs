@@ -1,5 +1,6 @@
 use super::super::types::*;
 use super::helpers::*;
+use super::relay_and_lea::LazyDeadness;
 
 // ── Redundant self-zext elimination ────────────────────────────────────────
 
@@ -35,6 +36,11 @@ fn eliminate_redundant_self_zext_with_policy(
     let mut changed = false;
     // (self-zext line, destination family) deferred to the rewrite phase.
     let mut self_zext_candidates: Vec<(usize, u8)> = Vec::new();
+    // (copy line, source family, destination family): a CROSS-register
+    // `movl %Es, %Ed` whose source family's upper half is proven zero at
+    // that point. Deferred like the self-zext notes; see
+    // `fold_zext_copies_into_addresses` for what becomes of them.
+    let mut zext_copy_candidates: Vec<(usize, u8, u8)> = Vec::new();
     // zero_upper[family] = upper 32 bits provably zero.
     let mut zero_upper = [false; 16];
     // Caller-saved GP families: rax,rcx,rdx,rsi,rdi,r8,r9,r10,r11.
@@ -159,6 +165,23 @@ fn eliminate_redundant_self_zext_with_policy(
                     if let Some((s1, s2)) = t["movl ".len()..].split_once(',') {
                         let a = register_family_fast(s1.trim());
                         let b = register_family_fast(s2.trim());
+                        // Cross-register zext copy with a proven-zero source
+                        // upper half: recorded here, where the fact is a
+                        // property of THIS program point, and folded after
+                        // the scan (no line borrow is outstanding there).
+                        // %rsp/%rbp stay out: frame reasoning elsewhere keys
+                        // on those spellings.
+                        if a != b
+                            && a <= 15
+                            && b <= 15
+                            && !matches!(a, 4 | 5)
+                            && !matches!(b, 4 | 5)
+                            && s1.trim() == REG_NAMES[1][a as usize]
+                            && s2.trim() == REG_NAMES[1][b as usize]
+                            && zero_upper[a as usize]
+                        {
+                            zext_copy_candidates.push((i, a, b));
+                        }
                         a == b && a <= 15 && zero_upper[a as usize]
                     } else {
                         false
@@ -251,8 +274,156 @@ fn eliminate_redundant_self_zext_with_policy(
             changed = true;
         }
     }
+    if fold_zext_copies_into_addresses(store, infos, &zext_copy_candidates) {
+        changed = true;
+    }
 
     changed
+}
+
+/// Cross-register zero-extension copies that only feed an address die:
+///
+/// ```text
+///     movl %Es, %Ed                        (deleted)
+///     op   ... K(%Rd[,%Ri,c]) ...    ->    op ... K(%Rs[,%Ri,c]) ...
+/// ```
+///
+/// The copy materializes `zext(%Es)` in `%Rd` solely so 64-bit address
+/// arithmetic can consume it. When the upper half of `%Rs` is already zero
+/// (the scan's `zero_upper` fact at the copy), `%Rs` IS that value, the
+/// memory operand reads it directly, and the copy is dead. The emitter
+/// produces this pair for every `base[u32_index]` whose index lives in a
+/// different register from the pointer scratch (two per query in
+/// zstd_count's offset setup; GCC indexes through the masked register
+/// directly).
+///
+/// Conditions, all fail-closed:
+///  * the use is the NEXT instruction (only debug-transparent lines
+///    between), unpinned, classified `Other` -- control transfers with
+///    memory operands (`jmp *`/`call *`) never match;
+///  * every mention of family `d` in the use sits inside its single memory
+///    operand (counted with the same complete-token rule the rewriter
+///    uses), EXCEPT a full-width `lea`/`mov`-class destination `%Rd`/`%Ed`,
+///    which re-defines `%Rd` with the identical value and so needs no
+///    liveness proof;
+///  * otherwise `%Rd` is dead after the use under exact CFG liveness
+///    ([`LazyDeadness`]) -- the deleted copy was its last definition;
+///  * sub-register (16/8-bit, and the four high-byte) spellings of `d`
+///    anywhere in the use decline the fold: those read bits the rewrite
+///    does not track.
+///
+/// Reading `%Rs` at the use instead of at the copy is sound because the
+/// two lines are adjacent and the use reads its address registers before
+/// it writes anything (x86 operand order), even when `%Rs` is also its
+/// destination.
+fn fold_zext_copies_into_addresses(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    candidates: &[(usize, u8, u8)],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut dead = LazyDeadness::new();
+    for &(i, s_fam, d_fam) in candidates {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let j = next_non_debug(store, infos, i + 1, len);
+        if j >= len || infos[j].is_nop() || !all_editable(infos, &[i, j]) {
+            continue;
+        }
+        if !matches!(infos[j].kind, LineKind::Other { .. }) {
+            continue;
+        }
+        let t_j = infos[j].trimmed(store.get(j)).to_string();
+        let Some((new_text, needs_deadness)) = rewrite_address_zext_use(&t_j, s_fam, d_fam) else {
+            continue;
+        };
+        if needs_deadness && !dead.dead_after(store, infos, j, d_fam, &[i, j]) {
+            continue;
+        }
+        replace_line(store, &mut infos[j], j, new_text);
+        mark_nop(&mut infos[i]);
+        dead.invalidate(store, infos, j);
+        changed = true;
+    }
+    changed
+}
+
+/// Pure rewriter for [`fold_zext_copies_into_addresses`]: the use line with
+/// family `d` replaced by family `s` inside its memory operand, plus
+/// whether the fold still needs the liveness proof (false exactly when the
+/// use itself fully re-defines `%Rd`).
+fn rewrite_address_zext_use(t: &str, s_fam: u8, d_fam: u8) -> Option<(String, bool)> {
+    let open = t.find('(')?;
+    let close = open + t[open..].find(')')?;
+    // One memory operand only; a second '(' (another operand, or comment
+    // text) declines.
+    if t[close + 1..].contains('(') {
+        return None;
+    }
+    let paren = &t[open..=close];
+    let d64 = REG_NAMES[0][d_fam as usize];
+    let d32 = REG_NAMES[1][d_fam as usize];
+    let in_paren = count_reg_name_exact(paren, d64);
+    if in_paren == 0 {
+        return None;
+    }
+    let total64 = count_reg_name_exact(t, d64);
+    let n32 = count_reg_name_exact(t, d32);
+    if count_reg_name_exact(t, REG_NAMES[2][d_fam as usize]) != 0
+        || count_reg_name_exact(t, REG_NAMES[3][d_fam as usize]) != 0
+    {
+        return None;
+    }
+    if d_fam <= 3 && t.contains(["%ah", "%ch", "%dh", "%bh"][d_fam as usize]) {
+        return None;
+    }
+    let mnem = t.split_whitespace().next().unwrap_or("");
+    let dest = explicit_dest_token(t);
+    // `lea`/`mov`-class (incl. movz*/movs*) register destinations write the
+    // full 64-bit family: a 64-bit name directly, a 32-bit name by
+    // architectural zero-extension. `cmov` must NOT land here (it keeps the
+    // stale destination on a false condition) and cannot: it starts with
+    // 'c'.
+    let full_write_dest = (mnem.starts_with("lea") || mnem.starts_with("mov"))
+        && ((dest == d64 && total64 == in_paren + 1 && n32 == 0)
+            || (dest == d32 && total64 == in_paren && n32 == 1));
+    let mem_only = total64 == in_paren && n32 == 0;
+    if !full_write_dest && !mem_only {
+        return None;
+    }
+    let s64 = REG_NAMES[0][s_fam as usize];
+    let new_paren = replace_reg_name_exact(paren, d64, s64);
+    let mut out = String::with_capacity(t.len() + 8);
+    out.push_str("    ");
+    out.push_str(&t[..open]);
+    out.push_str(&new_paren);
+    out.push_str(&t[close + 1..]);
+    Some((out, !full_write_dest))
+}
+
+/// Complete-token occurrence count, the counting twin of
+/// [`replace_reg_name_exact`]: an occurrence ends the string or is followed
+/// by `,`, `)`, space, tab or newline, so `%r8` never counts inside `%r8d`.
+fn count_reg_name_exact(hay: &str, name: &str) -> usize {
+    let bytes = hay.as_bytes();
+    let nb = name.as_bytes();
+    let n = nb.len();
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    while pos + n <= bytes.len() {
+        if &bytes[pos..pos + n] == nb {
+            let after = pos + n;
+            if after == bytes.len() || matches!(bytes[after], b',' | b')' | b' ' | b'\t' | b'\n') {
+                count += 1;
+                pos = after;
+                continue;
+            }
+        }
+        pos += 1;
+    }
+    count
 }
 
 /// The `movd`/`vmovd` that replaces `movq %xmmN, %rX` when the line at `i` is
@@ -421,6 +592,124 @@ mod tests {
         (0..store.len())
             .filter(|&i| !infos[i].is_nop() && store.get(i).trim() == self_zext)
             .count()
+    }
+
+    /// Runs the pass and returns the surviving (non-nop) trimmed lines.
+    fn run_lines(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        eliminate_redundant_self_zext(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// The zstd_count offset-setup witness, literal shape: a 32-bit AND
+    /// proves the source's upper half zero, the copy exists only to give
+    /// the address a 64-bit register, and the lea re-defines the copy's
+    /// destination itself (no liveness proof needed).
+    #[test]
+    fn zext_copy_into_lea_self_destination_folds() {
+        let asm = "    andl $1048319, %r10d\n    movl %r10d, %ebx\n    leaq 4210720(%rbx), %rbx\n    movzbl (%rbx), %eax\n    ret\n";
+        assert_eq!(
+            run_lines(asm),
+            vec![
+                "andl $1048319, %r10d",
+                "leaq 4210720(%r10), %rbx",
+                "movzbl (%rbx), %eax",
+                "ret",
+            ]
+        );
+    }
+
+    /// The second zstd_count site's shape: the lea writes a THIRD register,
+    /// so the copy's destination must be provably dead -- here it is
+    /// re-defined on the next line, which exact liveness sees. (The real
+    /// site stages through %ebp; %rbp and %rsp are excluded as both ends of
+    /// the fold because the frame passes reason about those spellings
+    /// textually, so the witness uses %esi.)
+    #[test]
+    fn zext_copy_into_lea_other_destination_needs_and_gets_deadness() {
+        let asm = "    andl $1048319, %esi\n    movl %esi, %ebx\n    leaq 4210720(%rbx), %r14\n    movl $7, %ebx\n    movq %rbx, %rcx\n    ret\n";
+        assert_eq!(
+            run_lines(asm),
+            vec![
+                "andl $1048319, %esi",
+                "leaq 4210720(%rsi), %r14",
+                "movl $7, %ebx",
+                "movq %rbx, %rcx",
+                "ret",
+            ]
+        );
+    }
+
+    /// %rbp/%rsp are refused at BOTH ends of the fold even with a valid
+    /// fact: frame passes reason about those spellings textually, so no
+    /// rewrite may mint new `K(%rbp)` operands or delete copies of them.
+    #[test]
+    fn zext_copy_fold_refuses_frame_register_families() {
+        let asm = "    andl $1048319, %ebp\n    movl %ebp, %ebx\n    leaq 4210720(%rbx), %r14\n    movl $7, %ebx\n    movq %rbx, %rcx\n    ret\n";
+        assert!(
+            run_lines(asm).contains(&"movl %ebp, %ebx".to_string()),
+            "an %ebp-sourced copy must survive"
+        );
+    }
+
+    /// A later read of the copy's destination blocks the memory-only form:
+    /// the copy was its last definition, so deleting it would feed the read
+    /// a stale value. Exact liveness must refuse.
+    #[test]
+    fn zext_copy_with_live_destination_is_refused() {
+        let asm = "    andl $255, %eax\n    movl %eax, %ebx\n    movzbl (%rbx), %ecx\n    movq %rbx, %r9\n    ret\n";
+        let out = run_lines(asm);
+        assert!(
+            out.contains(&"movl %eax, %ebx".to_string()),
+            "copy must survive while %rbx is read later: {out:?}"
+        );
+    }
+
+    /// An index-only scaled operand (the fill-loop shape) folds through the
+    /// liveness arm when the destination dies.
+    #[test]
+    fn zext_copy_into_scaled_index_folds_when_dead() {
+        let asm = "    shrl $12, %r9d\n    movl %r9d, %r11d\n    movzbl 4210720(,%r11,1), %edx\n    xorl %r11d, %r11d\n    movq %r11, %rax\n    ret\n";
+        let out = run_lines(asm);
+        assert!(
+            out.contains(&"movzbl 4210720(,%r9,1), %edx".to_string())
+                && !out.contains(&"movl %r9d, %r11d".to_string()),
+            "scaled-index fold expected: {out:?}"
+        );
+    }
+
+    /// Fail-closed family: no fold without the upper-zero fact (64-bit
+    /// source write), none through an intervening instruction, none when a
+    /// sub-register of the destination appears, and never into a cmov
+    /// (stale destination on a false condition).
+    #[test]
+    fn zext_copy_fold_fail_closed() {
+        for asm in [
+            // Source written 64-bit: no fact.
+            "    movq %rcx, %rax\n    movl %eax, %ebx\n    leaq 8(%rbx), %rbx\n    ret\n",
+            // Intervening instruction: the use is not adjacent.
+            "    andl $255, %eax\n    movl %eax, %ebx\n    movq %rcx, %rdx\n    leaq 8(%rbx), %rbx\n    ret\n",
+            // 8-bit sub-register read of the destination inside the use.
+            "    andl $255, %eax\n    movl %eax, %ebx\n    movb %bl, (%rbx)\n    ret\n",
+            // cmov keeps its old destination on a false condition.
+            "    andl $255, %eax\n    movl %eax, %ebx\n    cmovneq (%rbx), %rbx\n    movq %rbx, %rcx\n    ret\n",
+            // A call clears caller-saved facts before the copy.
+            "    andl $255, %r10d\n    call f\n    movl %r10d, %ebx\n    leaq 8(%rbx), %rbx\n    ret\n",
+        ] {
+            let out = run_lines(asm);
+            assert!(
+                out.iter()
+                    .any(|l| l.starts_with("movl %")
+                        && (l.ends_with("%ebx") || l.ends_with("%ebx\n"))),
+                "copy must survive in fail-closed case {asm:?}: {out:?}"
+            );
+        }
     }
 
     #[test]

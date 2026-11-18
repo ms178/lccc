@@ -97,6 +97,14 @@ pub(crate) struct RaConfig {
     /// when function-spanning webs fill the pool (linux_rbtree's outer
     /// loop). Diagnostic/A-B switch only: load-bearing, never default off.
     pub(crate) no_recurrence_floor: bool,
+    /// `CCC_RA_NO_RECURRENCE_KEEP`: disable the recurrence-victim veto in
+    /// ordinary eviction (default: false — the veto is on). Eviction is
+    /// whole-value demotion, so evicting a resident loop recurrence
+    /// retroactively reprices its loop-hot reads into slot traffic; the
+    /// veto is what kept zstd_count's setup-loop counter homed (its
+    /// eviction cost ~3M stack round-trips, +5.3M Ir, 1.15x vs GCC).
+    /// Diagnostic/A-B switch only: load-bearing, never default off.
+    pub(crate) no_recurrence_keep: bool,
     /// `CCC_NO_LOAD_HAZARD_REFINE`: disable i686 load hazard refinement (default: false).
     pub(crate) no_load_hazard_refine: bool,
     /// `CCC_NO_EAX_ALLOC`: disable the i686 eax allocation phase (default: false).
@@ -389,6 +397,7 @@ impl RaConfig {
             no_span_valve: present("CCC_NO_SPAN_VALVE"),
             no_web_inloop_use: present("CCC_NO_WEB_INLOOP_USE"),
             no_recurrence_floor: present("CCC_RA_NO_RECURRENCE_FLOOR"),
+            no_recurrence_keep: present("CCC_RA_NO_RECURRENCE_KEEP"),
             no_load_hazard_refine: present("CCC_NO_LOAD_HAZARD_REFINE"),
             no_eax_alloc: present("CCC_NO_EAX_ALLOC"),
             no_loop_pin: present("CCC_NO_LOOP_PIN"),
@@ -15612,6 +15621,7 @@ mod ra_config_tests {
         switch!(no_span_valve, "CCC_NO_SPAN_VALVE");
         switch!(no_web_inloop_use, "CCC_NO_WEB_INLOOP_USE");
         switch!(no_recurrence_floor, "CCC_RA_NO_RECURRENCE_FLOOR");
+        switch!(no_recurrence_keep, "CCC_RA_NO_RECURRENCE_KEEP");
         switch!(no_load_hazard_refine, "CCC_NO_LOAD_HAZARD_REFINE");
         switch!(no_eax_alloc, "CCC_NO_EAX_ALLOC");
         switch!(no_loop_pin, "CCC_NO_LOOP_PIN");

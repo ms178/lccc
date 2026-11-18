@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Emission + semantics gate for the x86 SIMD ISA contract of the middle end.
 #
-#   default (no -march)              -> AVX2 vectorization + TZCNT/LZCNT
-#                                       (project baseline is x86-64-v3, SIMD
-#                                       AND integer halves; measured benchmark
-#                                       data depends on this, so it must not
-#                                       silently regress)
-#   -march=x86-64 (explicit v1)      -> BSR/BSF clz/ctz fallback (the
-#                                       explicit ceiling denies the v3 grant)
+#   default (no -march)              -> x86-64 baseline: SSE2 vectorization,
+#                                       no ymm, no LZCNT. Nonzero-domain CTZ
+#                                       is spelled TZCNT anyway: F3 0F BC is
+#                                       `rep bsf`, which pre-BMI1 CPUs run as
+#                                       BSF (same result on nonzero input),
+#                                       and GCC emits the same bytes at plain
+#                                       -O2. LZCNT gets no such treatment --
+#                                       F3 0F BD computes a different
+#                                       function than BSR, so CLZ stays BSR
+#                                       until -march grants ABM.
+#   -march=x86-64 (explicit v1)      -> same integer contract as default:
+#                                       BSR clz, TZCNT-spelled nonzero ctz
 #   -mno-avx / -mno-avx2             -> 128-bit SSE2 vectorization: downgraded,
 #                                       NOT disabled, and zero ymm
 #   -mno-sse -mno-mmx -mno-sse2
@@ -64,23 +69,30 @@ run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
 # ---- 1. default: the x86-64 baseline (SSE2, no post-baseline ISA) ---------
 run_cfg default
 check_eq "default: no ymm (x86-64 baseline)" "$(count_ymm $tmp/default.s)" 0
-check_eq "default: no TZCNT (post-baseline)" "$(count_tzcnt $tmp/default.s)" 0
 check_eq "default: no LZCNT (post-baseline)" "$(count_lzcnt $tmp/default.s)" 0
-check_gt0 "default nonzero ctz uses BSF" "$(count_bsf $tmp/default.s)"
+check_gt0 "default nonzero ctz spelled TZCNT (= rep bsf)" "$(count_tzcnt $tmp/default.s)"
+check_eq "default nonzero ctz left as plain BSF (slower on AMD)" \
+    "$(count_bsf $tmp/default.s)" 0
 check_gt0 "default nonzero clz uses BSR" "$(count_bsr $tmp/default.s)"
-# __builtin_clz/ctz have a nonzero source precondition.  The default
-# code-generation baseline is x86-64-v3, which GRANTS LZCNT (the integer
-# half of v3 rides with the AVX2 SIMD ceiling), so the optimal lowering is
-# TZCNT/LZCNT — strictly better than BSR/BSF, which they supersede (defined
-# on zero input too).  The zero-fixup guards (.Lclz_nz/.Lctz_nz) exist only
-# for the BSR/BSF fallback and must never appear on the default path.
+# __builtin_clz/ctz have a nonzero source precondition.  On that domain BSF
+# and TZCNT return the same index, and TZCNT's encoding (F3 0F BC) is
+# `rep bsf`: pre-BMI1 CPUs ignore the prefix and execute BSF, while BMI1
+# CPUs run the cheaper TZCNT (AMD Zen 1-3: BSF is 6-8 macro-ops, TZCNT 2).
+# GCC emits the same bytes at plain -O2, so the TZCNT spelling is the
+# baseline contract for every proven-nonzero scan.  LZCNT is NOT the same
+# trick -- F3 0F BD computes 63-BSR, a different function -- so CLZ keeps
+# BSR until -march grants ABM.  The zero-fixup guards (.Lclz_nz/.Lctz_nz)
+# exist only for the zero-defined fallback and must never appear on the
+# nonzero-domain default path.
 check_eq "default nonzero clz/ctz zero-fixup guards" \
     "$(count_bitcount_zero_guards $tmp/default.s)" 0
 
-# A sticky -mno-lzcnt denial removes ABM from the v3 projection; the lowering
-# must fall back to the classical branchless BSR/BSF pair.
+# A sticky -mno-lzcnt denial removes ABM: CLZ must fall back to BSR.  The
+# TZCNT spelling of nonzero ctz is unaffected -- it is an encoding of
+# `rep bsf`, legal on every x86-64 CPU, not an ABM grant.
 run_cfg nolzcnt -mno-lzcnt
-check_gt0 "-mno-lzcnt nonzero ctz falls back to BSF" "$(count_bsf $tmp/nolzcnt.s)"
+check_eq "-mno-lzcnt: no LZCNT" "$(count_lzcnt $tmp/nolzcnt.s)" 0
+check_gt0 "-mno-lzcnt nonzero ctz keeps the TZCNT spelling" "$(count_tzcnt $tmp/nolzcnt.s)"
 check_gt0 "-mno-lzcnt nonzero clz falls back to BSR" "$(count_bsr $tmp/nolzcnt.s)"
 check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
     "$(grep -c 'movq %rdi, %rax' "$tmp/default.s" || true)" 0
@@ -89,7 +101,9 @@ check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
 run_cfg march-baseline -march=x86-64
 check_eq "baseline nonzero clz/ctz zero-fixup guards" \
     "$(count_bitcount_zero_guards $tmp/march-baseline.s)" 0
-check_gt0 "baseline nonzero ctz uses BSF" "$(count_bsf $tmp/march-baseline.s)"
+check_gt0 "baseline nonzero ctz spelled TZCNT (= rep bsf)" \
+    "$(count_tzcnt $tmp/march-baseline.s)"
+check_eq "baseline: no LZCNT" "$(count_lzcnt $tmp/march-baseline.s)" 0
 check_gt0 "baseline nonzero clz uses BSR" "$(count_bsr $tmp/march-baseline.s)"
 check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
     "$(grep -c 'movq %rdi, %rax' "$tmp/march-baseline.s" || true)" 0

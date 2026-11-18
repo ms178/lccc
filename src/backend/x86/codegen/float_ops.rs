@@ -1235,10 +1235,22 @@ impl X86Codegen {
         true
     }
 
-    /// Baseline BSR/BSF direct form for a source that is explicit nonzero IR.
-    /// Both instructions are two-operand and do not require staging through
+    /// Baseline direct form for a source that is explicit nonzero IR.
+    /// Both scans are two-operand and do not require staging through
     /// `%rax`; keeping the allocator's source and destination registers saves
     /// a move in hot bit-walking loops.
+    ///
+    /// The trailing scan is spelled `tzcnt` (F3 0F BC = `rep bsf`): on the
+    /// nonzero domain BSF and TZCNT return the same index, pre-BMI1 CPUs
+    /// ignore the prefix and execute BSF, and AMD Zen 1-3 run TZCNT at a
+    /// fraction of BSF's macro-op cost (GCC spells the same bytes
+    /// `rep bsf` at plain -O2). The leading scan stays BSR: F3 0F BD is
+    /// LZCNT, a different function, so BSR has no faster compatible
+    /// spelling and keeps its `xor width-1` epilogue. No false-dependency
+    /// break is needed where BSF would not have one: BSF carries a true
+    /// dependency on its destination (dest unchanged on zero source), so
+    /// the tzcnt spelling is never worse than the bsf spelling it replaces
+    /// on any core.
     fn emit_nonzero_bitcount_direct(
         &mut self,
         dest: &Value,
@@ -1269,7 +1281,7 @@ impl X86Codegen {
         };
         self.state.emit_fmt(format_args!(
             "    {}{} %{}, %{}",
-            if leading { "bsr" } else { "bsf" },
+            if leading { "bsr" } else { "tzcnt" },
             suffix,
             s_name,
             d_name
@@ -1289,7 +1301,7 @@ impl X86Codegen {
         true
     }
 
-    /// Zero-defined CLZ/CTZ without LZCNT/TZCNT and without a branch.
+    /// Zero-defined CLZ/CTZ without LZCNT/BMI1 and without a branch.
     ///
     /// BSR/BSF leave their destination unmodified when the source is zero:
     /// AMD has always documented this and Intel's SDM now does too (LLVM
@@ -1300,6 +1312,22 @@ impl X86Codegen {
     /// The IR's `Clz(0) == Ctz(0) == width` contract is preserved without the
     /// `test; jnz; mov $w; jmp` fix-up (3 executed instructions and a branch
     /// per count in zstd's `ZSTD_highbit32` price loops).
+    ///
+    /// Both scans keep their PLAIN spellings here, deliberately. The
+    /// nonzero-domain forms spell their scan `tzcnt` (F3 0F BC = `rep bsf`,
+    /// see `emit_nonzero_bitcount_direct`), but this form's preload is
+    /// SEMANTIC -- it is the zero result on the BSF decoding -- and the
+    /// peephole liveness model classifies `tzcnt` as a pure destination
+    /// write (true on BMI1 silicon, where TZCNT ignores its destination).
+    /// Under that classification a `tzcnt`-spelled scan would mark the
+    /// preload as a dead write and dead-store elimination could delete the
+    /// very instruction the pre-BMI1 decoding depends on. Spelling the
+    /// preloaded scan `bsf` keeps the pair inside the model that knows the
+    /// destination is read (`bsf` is RMW in `liveness.rs`), so no pass can
+    /// take the preload away. BMI1 builds never reach this function (the
+    /// `Ctz if !bmi1_enabled` gate), so no fast-TZCNT opportunity is lost.
+    /// CLZ has no compatible fast spelling at all: F3 0F BD is LZCNT,
+    /// which computes a different function than BSR.
     ///
     /// The preload is a 32-bit `movl`, so the whole 64-bit destination holds
     /// the preload; the SDM's footnote that some older CPUs clear bits 63:32
