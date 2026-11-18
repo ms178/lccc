@@ -471,6 +471,240 @@ _mm256_xor_ps(__m256 __a, __m256 __b)
     return (__m256)__builtin_ia32_xorps256((__v8sf)(__a), (__v8sf)(__b));
 }
 
+/* === Pure-C AVX1 completions ===
+ * Each function below is a plain lane rearrangement or a scalar conversion
+ * over the existing 128/256-bit builtins: no new IR is needed. The set of
+ * names is the GCC 16.2 `-mavx` declaration surface that lccc did not yet
+ * provide. Lane order follows the Intel definitions: `_mm256_set_*` lists the
+ * highest lane first, `_mm256_setr_*` the lowest first, and `_mm256_set_m128*`
+ * takes (hi, lo). Shuffle indices are constant, so every operation lowers to
+ * a single register rearrangement rather than a memory round trip. */
+
+static __inline__ float __attribute__((__always_inline__))
+_mm256_cvtss_f32(__m256 __a)
+{
+    return _mm_cvtss_f32(_mm256_castps256_ps128(__a));
+}
+
+static __inline__ double __attribute__((__always_inline__))
+_mm256_cvtsd_f64(__m256d __a)
+{
+    return _mm_cvtsd_f64(_mm256_castpd256_pd128(__a));
+}
+
+static __inline__ int __attribute__((__always_inline__))
+_mm256_cvtsi256_si32(__m256i __a)
+{
+    return _mm_cvtsi128_si32(_mm256_castsi256_si128(__a));
+}
+
+/* "Undefined" values may be any value; a defined zero is the portable choice
+ * and avoids reading an indeterminate register. */
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_undefined_ps(void)
+{
+    return _mm256_setzero_ps();
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_undefined_pd(void)
+{
+    return _mm256_setzero_pd();
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_undefined_si256(void)
+{
+    return _mm256_setzero_si256();
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_zeroupper(void)
+{
+    __builtin_ia32_vzeroupper();
+}
+
+/* Zero-extend a 128-bit value: lanes 4..7 are the zero vector's lanes. */
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_zextps128_ps256(__m128 __a)
+{
+    return __builtin_shufflevector(_mm256_castps128_ps256(__a),
+                                   _mm256_setzero_ps(), 0, 1, 2, 3, 8, 9, 10, 11);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_zextpd128_pd256(__m128d __a)
+{
+    return __builtin_shufflevector(_mm256_castpd128_pd256(__a),
+                                   _mm256_setzero_pd(), 0, 1, 6, 7);
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_set_m128(__m128 __hi, __m128 __lo)
+{
+    return __builtin_shufflevector(_mm256_castps128_ps256(__lo),
+                                   _mm256_castps128_ps256(__hi),
+                                   0, 1, 2, 3, 8, 9, 10, 11);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_set_m128d(__m128d __hi, __m128d __lo)
+{
+    return __builtin_shufflevector(_mm256_castpd128_pd256(__lo),
+                                   _mm256_castpd128_pd256(__hi), 0, 1, 4, 5);
+}
+
+/* __m256i has four 64-bit lanes: lo is lanes 0-1, hi is lanes 2-3. */
+static __inline__ __m256i __attribute__((__always_inline__))
+__lccc_set_m128i_avx(__m128i __hi, __m128i __lo)
+{
+    return __builtin_shufflevector(_mm256_castsi128_si256(__lo),
+                                   _mm256_castsi128_si256(__hi), 0, 1, 4, 5);
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_setr_m128(__m128 __lo, __m128 __hi)
+{
+    return _mm256_set_m128(__hi, __lo);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_setr_m128d(__m128d __lo, __m128d __hi)
+{
+    return _mm256_set_m128d(__hi, __lo);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_setr_m128i(__m128i __lo, __m128i __hi)
+{
+    return __lccc_set_m128i_avx(__hi, __lo);
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_setr_ps(float __f0, float __f1, float __f2, float __f3,
+               float __f4, float __f5, float __f6, float __f7)
+{
+    return _mm256_set_ps(__f7, __f6, __f5, __f4, __f3, __f2, __f1, __f0);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_setr_pd(double __d0, double __d1, double __d2, double __d3)
+{
+    return _mm256_set_pd(__d3, __d2, __d1, __d0);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_setr_epi64x(long long __e0, long long __e1, long long __e2, long long __e3)
+{
+    return (__m256i){__e0, __e1, __e2, __e3};
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_set_epi16(short __e15, short __e14, short __e13, short __e12,
+                 short __e11, short __e10, short __e9, short __e8,
+                 short __e7, short __e6, short __e5, short __e4,
+                 short __e3, short __e2, short __e1, short __e0)
+{
+    return __lccc_set_m128i_avx(_mm_set_epi16(__e15, __e14, __e13, __e12,
+                                              __e11, __e10, __e9, __e8),
+                                _mm_set_epi16(__e7, __e6, __e5, __e4,
+                                              __e3, __e2, __e1, __e0));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_setr_epi16(short __e0, short __e1, short __e2, short __e3,
+                  short __e4, short __e5, short __e6, short __e7,
+                  short __e8, short __e9, short __e10, short __e11,
+                  short __e12, short __e13, short __e14, short __e15)
+{
+    return _mm256_set_epi16(__e15, __e14, __e13, __e12, __e11, __e10, __e9, __e8,
+                            __e7, __e6, __e5, __e4, __e3, __e2, __e1, __e0);
+}
+
+/* loadu2/storeu2: the first pointer addresses the high half, the second the
+ * low half, exactly as Intel defines them. */
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_loadu2_m128(float const *__hi, float const *__lo)
+{
+    return _mm256_set_m128(_mm_loadu_ps(__hi), _mm_loadu_ps(__lo));
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_loadu2_m128d(double const *__hi, double const *__lo)
+{
+    return _mm256_set_m128d(_mm_loadu_pd(__hi), _mm_loadu_pd(__lo));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_loadu2_m128i(__m128i const *__hi, __m128i const *__lo)
+{
+    return __lccc_set_m128i_avx(_mm_loadu_si128(__hi), _mm_loadu_si128(__lo));
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_storeu2_m128(float *__hi, float *__lo, __m256 __a)
+{
+    _mm_storeu_ps(__lo, _mm256_castps256_ps128(__a));
+    _mm_storeu_ps(__hi, __builtin_shufflevector(__a, __a, 4, 5, 6, 7));
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_storeu2_m128d(double *__hi, double *__lo, __m256d __a)
+{
+    _mm_storeu_pd(__lo, _mm256_castpd256_pd128(__a));
+    _mm_storeu_pd(__hi, __builtin_shufflevector(__a, __a, 2, 3));
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_storeu2_m128i(__m128i *__hi, __m128i *__lo, __m256i __a)
+{
+    _mm_storeu_si128(__lo, _mm256_castsi256_si128(__a));
+    _mm_storeu_si128(__hi, (__m128i)__builtin_shufflevector(__a, __a, 2, 3));
+}
+
+/* Duplicate even or odd lanes. */
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_movedup_pd(__m256d __a)
+{
+    return __builtin_shufflevector(__a, __a, 0, 0, 2, 2);
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_movehdup_ps(__m256 __a)
+{
+    return __builtin_shufflevector(__a, __a, 1, 1, 3, 3, 5, 5, 7, 7);
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_moveldup_ps(__m256 __a)
+{
+    return __builtin_shufflevector(__a, __a, 0, 0, 2, 2, 4, 4, 6, 6);
+}
+
+static __inline__ __m128 __attribute__((__always_inline__))
+_mm_broadcast_ss(float const *__p)
+{
+    return _mm_set1_ps(*__p);
+}
+
+/* In-lane permutes with an immediate selector. The selector must be a
+ * constant, so these are macros: the shuffle indices are then constant
+ * expressions as `__builtin_shufflevector` requires. */
+#define _mm_permute_ps(__a, __imm)                                              \
+    __builtin_shufflevector((__a), (__a), ((__imm) >> 0) & 3, ((__imm) >> 2) & 3, \
+                            ((__imm) >> 4) & 3, ((__imm) >> 6) & 3)
+#define _mm_permute_pd(__a, __imm)                                              \
+    __builtin_shufflevector((__a), (__a), ((__imm) >> 0) & 1, ((__imm) >> 1) & 1)
+
+#define _mm256_ceil_ps(__a) _mm256_round_ps((__a), _MM_FROUND_CEIL)
+#define _mm256_floor_ps(__a) _mm256_round_ps((__a), _MM_FROUND_FLOOR)
+#define _mm256_ceil_pd(__a) _mm256_round_pd((__a), _MM_FROUND_CEIL)
+#define _mm256_floor_pd(__a) _mm256_round_pd((__a), _MM_FROUND_FLOOR)
+
+#define _mm256_permute2f128_si256(__a, __b, __imm)                              \
+    _mm256_castps_si256(_mm256_permute2f128_ps(_mm256_castsi256_ps(__a),        \
+                                               _mm256_castsi256_ps(__b), (__imm)))
+
 /* === Movemask === */
 
 
