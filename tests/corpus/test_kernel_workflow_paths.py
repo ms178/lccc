@@ -34,7 +34,7 @@ class KernelWorkflowPaths(unittest.TestCase):
     def test_compiler_build_inputs_select_kernel_validation(self):
         for path in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml",
                      "scripts/build_lccc_fast.sh", "scripts/rust_toolchain.sh",
-                     "scripts/ensure_swap.sh", "scripts/ci_provision_toolchain.sh",
+                     "scripts/ensure_swap.sh", "scripts/ci_enable_swap.sh",
                      "engineering/toolchains/agent-cache-lock.json"]:
             with self.subTest(path=path):
                 self.assertTrue(self.selected(path), path)
@@ -77,7 +77,8 @@ class KernelJobIsOnDemandOrWeekly(unittest.TestCase):
         workflow = yaml.safe_load(
             (ROOT / ".github/workflows/kernel-61863.yml").read_text())
         cls.events = workflow.get("on", workflow.get(True))
-        cls.job_if = workflow["jobs"]["kernel"]["if"]
+        cls.kernel_job = workflow["jobs"]["kernel"]
+        cls.job_if = cls.kernel_job["if"]
 
     def test_weekly_schedule_exists(self):
         crons = self.events["schedule"]
@@ -105,6 +106,15 @@ class KernelJobIsOnDemandOrWeekly(unittest.TestCase):
         # Regression guard for the visible-skip property: a compiler-only PR
         # must still trigger the workflow, otherwise the skip would be silent.
         self.assertTrue(self.events["pull_request"]["paths"])
+
+    def test_host_tools_need_no_gcc_oracle_install(self):
+        # Only host tools use GCC. A cold oracle cache or unavailable GCC 16
+        # multilib packages must not block the LCCC kernel build.
+        self.assertEqual(self.kernel_job.get("env", {}).get("HOSTCC"), "gcc")
+        commands = "\n".join(step.get("run", "") for step in self.kernel_job["steps"])
+        self.assertNotRegex(
+            commands, r"ci_(?:provision_toolchain|install_gcc16|install_gcc_oracle)\.sh"
+                      r"|(?:gcc|g\+\+)-16|multilib")
 
 
 class KernelVersionPinsAgree(unittest.TestCase):
