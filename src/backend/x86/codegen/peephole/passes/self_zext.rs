@@ -335,8 +335,11 @@ fn fold_zext_copies_into_addresses(
         if !matches!(infos[j].kind, LineKind::Other { .. }) {
             continue;
         }
-        let t_j = infos[j].trimmed(store.get(j)).to_string();
-        let Some((new_text, needs_deadness)) = rewrite_address_zext_use(&t_j, s_fam, d_fam) else {
+        // Filter on borrowed text: the rewriter rejects most candidates,
+        // and the owned `new_text` it returns on acceptance is the only
+        // allocation this loop makes (allocate-before-filter ratchet).
+        let rewritten = rewrite_address_zext_use(infos[j].trimmed(store.get(j)), s_fam, d_fam);
+        let Some((new_text, needs_deadness)) = rewritten else {
             continue;
         };
         if needs_deadness && !dead.dead_after(store, infos, j, d_fam, &[i, j]) {
