@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Paired compiler-work profiles; simulated Ir is NOT compilation wall time.
 
-Both compiler executables are frozen into equal-length paths. Every arm must
-produce identical assembly natively and under Callgrind. Shared event parsing,
-cache geometry and atomic publication come from the existing research tools.
+Both compiler executables are frozen into equal-length paths. Each source must
+produce the same assembly bytes and stdout across both arms, all rounds, and
+native/Callgrind execution. Shared event parsing, cache geometry and atomic
+publication come from the existing research tools.
 An interrupted/failed sweep leaves complete=false, never a successful subset.
 """
 from __future__ import annotations
@@ -65,6 +66,7 @@ def main(argv=None):
             for index, source in enumerate(sources):
                 row = {"source": str(source), "source_sha256": cg.schema.file_hash(source), "rounds": []}
                 report["results"].append(row)
+                baseline = None
                 for repetition in range(args.rounds):
                     order = ["mine", "ref"] if repetition % 2 == 0 else ["ref", "mine"]
                     pair = {"order": order, "arms": {}}
@@ -76,6 +78,17 @@ def main(argv=None):
                         assembly.unlink(missing_ok=True)
                         native = subprocess.run(command, capture_output=True, timeout=args.timeout, check=True)
                         expected = assembly.read_bytes()
+                        # Matching each arm against its own instrumented run
+                        # is insufficient: two stable but distinct outputs
+                        # would yield a bogus identity-preserving Ir delta.
+                        if baseline is None:
+                            baseline = expected, native.stdout
+                        else:
+                            where = f"{source}: round {repetition + 1}, {name}"
+                            if expected != baseline[0]:
+                                raise ValueError(f"{where}: native assembly differs from round 1 mine")
+                            if native.stdout != baseline[1]:
+                                raise ValueError(f"{where}: native stdout differs from round 1 mine")
                         assembly.unlink()
                         profile = directory / f"case-{index}-round-{repetition}.cg"
                         profile.unlink(missing_ok=True)
