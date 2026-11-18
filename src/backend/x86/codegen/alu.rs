@@ -3212,6 +3212,46 @@ impl X86Codegen {
                 return;
             }
             // A non-XMM register home falls through to the generic copy.
+        } else if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            // NON-resident source into an XMM-homed destination: a source
+            // whose 16 bytes sit in a Direct slot (a vector call return
+            // already stored to its — possibly coalesced — slot, or any
+            // `f128_direct_slots` I128) takes ONE unaligned load into the
+            // home. The sink below would read the same slot as two GPR
+            // halves and reassemble them (movq+movq+movq+movq+punpcklqdq:
+            // five instructions and two GPR→XMM domain crossings) for the
+            // same bytes. Measured at -O2 (public_simd_abi, BITS=128): this
+            // is the direct-call arm of the `?:` join — the web homed in
+            // %xmm2 receives the slot image in one movdqu.
+            if super::emit::is_xmm_reg(reg) {
+                if let Operand::Value(v) = src {
+                    // An alloca's "value" is its ADDRESS (`operand_to_rax_rdx`
+                    // emits leaq, not a load); only a data-carrying slot may
+                    // take the 16-byte content load. generate_copy intercepts
+                    // alloca sources upstream — this guard keeps the arm
+                    // locally sound regardless of caller discipline.
+                    if !self.state.is_alloca(v.0)
+                        && let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                            self.state.resolve_slot_addr(v.0)
+                    {
+                        let name = phys_reg_name(reg);
+                        // The load overwrites `name`: a pending deferred
+                        // vector store may occupy it (same discipline as
+                        // `store_rax_rdx_to`'s XMM-home arm).
+                        self.flush_pending_vec_store_impl();
+                        let mem = self.slot_ref(slot.0);
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, %{}",
+                            self.xmm_move(false),
+                            mem,
+                            name
+                        ));
+                        self.state.vec_claim_live_reg(dest.0, name);
+                        self.state.reg_cache.invalidate_all();
+                        return;
+                    }
+                }
+            }
         }
         // Every other source: build the pair, then store_rax_rdx_to writes the
         // destination's home (XMM register or slot).
@@ -3293,6 +3333,7 @@ mod bit_test_width_tests {
 #[cfg(test)]
 mod i128_copy_call_carrier_tests {
     use super::*;
+    use crate::backend::state::StackSlot;
 
     /// The first allocatable XMM register (`xmm2`).
     const XMM2: PhysReg = PhysReg(20);
@@ -3346,5 +3387,47 @@ mod i128_copy_call_carrier_tests {
         cg.emit_copy_i128_impl(&Value(2), &Operand::Value(Value(1)));
         assert!(cg.state.out.buf.is_empty(), "{:?}", cg.state.out.buf);
         assert!(cg.state.call_ret_vector_in_xmm0.contains(&2));
+    }
+
+    /// A NON-resident source whose 16 bytes sit in a Direct slot (the vector
+    /// call return already stored to its — possibly coalesced — slot) must
+    /// reach an XMM-homed destination as ONE unaligned load, not the sink's
+    /// five-instruction GPR reassembly. This is the direct-call arm of the
+    /// `?:` join measured in public_simd_abi (BITS=128): the old path read
+    /// and rewrote the same slot through `%rax:%rdx` — a no-op the peephole
+    /// erased, leaving the home register holding callee garbage.
+    #[test]
+    fn slot_homed_source_copy_loads_into_the_destinations_xmm_home() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, XMM2);
+        cg.state.value_locations.insert(1, StackSlot(-48));
+        cg.state.i128_values.insert(1);
+        cg.state.f128_direct_slots.insert(1);
+        cg.emit_copy_i128_impl(&Value(2), &Operand::Value(Value(1)));
+        let out = &cg.state.out.buf;
+        assert!(
+            out.contains("-48(%rbp), %xmm2"),
+            "the copy must load the slot-homed source into the web's home:\n{out}"
+        );
+        assert!(
+            !out.contains("punpcklqdq"),
+            "one 16-byte load, not the GPR pair reassembly:\n{out}"
+        );
+    }
+
+    /// No XMM assignment for the destination: the established shapes keep
+    /// their emission (a resident source still takes the one-store slot
+    /// path).
+    #[test]
+    fn resident_copy_into_a_slot_homed_destination_keeps_the_store_shape() {
+        let mut cg = X86Codegen::new();
+        cg.state.call_ret_vector_in_xmm0.insert(1);
+        cg.state.value_locations.insert(2, StackSlot(-32));
+        cg.emit_copy_i128_impl(&Value(2), &Operand::Value(Value(1)));
+        let out = &cg.state.out.buf;
+        assert!(
+            out.contains("%xmm0, -32(%rbp)"),
+            "a slot-homed destination still takes the store:\n{out}"
+        );
     }
 }
