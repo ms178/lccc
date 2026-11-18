@@ -115,7 +115,7 @@ static int check_tree(const node_t *tree, int root, const node_t *histogram)
         total += histogram[n].freq;
         weights[active++] = histogram[n].freq;
     }
-    if (root != SYMBOLS + active - 2 || tree[root].freq != total)
+    if (root != SYMBOLS + active - 2 || (uint32_t)tree[root].freq != total)
         return 0;
     for (int n = 0; n < root; ++n) {
         if (n < SYMBOLS && !histogram[n].freq)
@@ -126,7 +126,7 @@ static int check_tree(const node_t *tree, int root, const node_t *histogram)
         child_sum[dad] += tree[n].freq;
     }
     for (int n = SYMBOLS; n <= root; ++n) {
-        if (have_children[n] != 2 || child_sum[n] != tree[n].freq)
+        if (have_children[n] != 2 || child_sum[n] != (uint32_t)tree[n].freq)
             return 0;
         cost += child_sum[n];
     }
