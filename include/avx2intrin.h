@@ -1201,13 +1201,8 @@ _mm_srav_epi32(__m128i __a, __m128i __count)
     return (__m128i)((__lccc_v4si)__a >> (__lccc_v4si)__kk);
 }
 
-/* --- 128-bit broadcasts of the low element (VBROADCASTSD / VBROADCASTSS). --- */
-
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_broadcastsd_pd(__m128d __a)
-{
-    return _mm_unpacklo_pd(__a, __a);
-}
+/* --- 128-bit broadcasts of the low element (VBROADCASTSS). ---
+ * _mm_broadcastsd_pd is AVX1 and lives in avxintrin.h. */
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_broadcastss_ps(__m128 __a)

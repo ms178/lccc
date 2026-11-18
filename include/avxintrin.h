@@ -524,6 +524,15 @@ _mm256_zeroupper(void)
     __builtin_ia32_vzeroupper();
 }
 
+/* _mm_broadcastsd_pd (VMOVDDUP / VPERMILPD $0): duplicate the low double.
+   GCC defines it as _mm_movedup_pd, the same unpacklo of a value with
+   itself.  It is AVX1, so it is not behind __AVX2__. */
+static __inline__ __m128d __attribute__((__always_inline__))
+_mm_broadcastsd_pd(__m128d __a)
+{
+    return _mm_unpacklo_pd(__a, __a);
+}
+
 /* vzeroall writes every YMM register (and zeroes bits 128..255 of each).
    The asm clobber list names all sixteen registers so that a YMM value
    live across the call is spilled and reloaded rather than kept in a
