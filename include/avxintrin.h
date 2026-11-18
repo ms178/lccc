@@ -524,6 +524,21 @@ _mm256_zeroupper(void)
     __builtin_ia32_vzeroupper();
 }
 
+/* vzeroall writes every YMM register (and zeroes bits 128..255 of each).
+   The asm clobber list names all sixteen registers so that a YMM value
+   live across the call is spilled and reloaded rather than kept in a
+   register that vzeroall destroys. */
+static __inline__ void __attribute__((__always_inline__))
+_mm256_zeroall(void)
+{
+    __asm__ volatile("vzeroall"
+                     :
+                     :
+                     : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6",
+                       "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
+                       "xmm13", "xmm14", "xmm15", "memory");
+}
+
 /* Zero-extend a 128-bit value: lanes 4..7 are the zero vector's lanes. */
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_zextps128_ps256(__m128 __a)
