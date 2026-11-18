@@ -859,10 +859,14 @@ fn peephole_optimize_inner(
     // on the 40-function mixed TU — skips every pass that already proved
     // itself clean on bit-identical input.  Soundness contract and both
     // knobs are documented on `PassTicks`:
-    //   CCC_PEEPHOLE_NO_DIRTY_SKIP=1  pre-tracker behaviour (bisection, and
-    //                                 required under CCC_LCR_LIMIT, whose
-    //                                 process-global budget makes the opt-in
-    //                                 relay pass call-count-dependent);
+    //   CCC_PEEPHOLE_NO_DIRTY_SKIP=1  pre-tracker behaviour (bisection).
+    //                                 NOT needed under CCC_LCR_LIMIT: that
+    //                                 budget decrements per MUTATION, never
+    //                                 per call, and is monotone — a clean
+    //                                 run consumes nothing and a candidate
+    //                                 declined for budget can never become
+    //                                 accepted, so a skipped clean re-run
+    //                                 is still provably a no-op;
     //   CCC_PEEPHOLE_VERIFY_DIRTY=1   digest the state around every pass and
     //                                 panic when one mutates it while
     //                                 reporting "no change" (the one lie that
