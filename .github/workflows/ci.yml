@@ -3622,8 +3622,9 @@ jobs:
       # process spawns on the hosted runner), assigned longest-processing-
       # time first by scripts/ci_bench_shards.py.
       # Original assignment: predicted 389 s of 771 s for 23 kernels.
-      # The bounded F32 map and zlib-ng compare256 extend this shard; F64
-      # extends shard b. Rebalance from a fresh report if the cost shifts.
+      # The bounded F32 maps and two zlib-ng kernels (compare256 and the
+      # Huffman heap) extend this shard; F64 extends shard b. Rebalance from
+      # a fresh report if the cost shifts.
       only: >-
           fp32_product_map,
           f32_sse1_map,
@@ -3651,6 +3652,7 @@ jobs:
           zlib_ng_adler32,
           zlib_ng_adler32_combine,
           zlib_ng_compare256,
+          zlib_ng_huffman_heap,
   benchmark-b:
     name: Benchmark corpus (shard b)
     needs: [build]
