@@ -191,49 +191,53 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     if nb.len() < 3 {
         return false;
     }
+    use crate::backend::peephole_common::pfx;
+    // One packed load serves every prefix probe below (each probe is then
+    // an AND and a compare -- no `memcmp`, no per-prefix length test).
+    let f8 = crate::backend::peephole_common::first8(trimmed);
     // Fast-reject common mnemonics with no implicit GP usage.
     match nb[0] {
         b'm' if nb[1] == b'o' && nb[2] == b'v' => {
             if nb.len() > 3 && nb[3] != b's' {
                 return false;
             }
-            if nb.starts_with(b"movslq ")
-                || nb.starts_with(b"movsbl ")
-                || nb.starts_with(b"movswl ")
-                || nb.starts_with(b"movsd ")
-                || nb.starts_with(b"movss ")
+            if pfx!(f8, "movslq ")
+                || pfx!(f8, "movsbl ")
+                || pfx!(f8, "movswl ")
+                || pfx!(f8, "movsd ")
+                || pfx!(f8, "movss ")
             {
                 return false;
             }
         }
-        b'l' if nb.starts_with(b"leaq ") || nb.starts_with(b"leal ") => return false,
-        b'a' if nb.starts_with(b"add") || nb.starts_with(b"and") => return false,
-        b's' if nb.starts_with(b"sub")
-            || nb.starts_with(b"set")
-            || nb.starts_with(b"shlq ")
-            || nb.starts_with(b"shll ")
-            || nb.starts_with(b"shrq ")
-            || nb.starts_with(b"shrl ")
-            || nb.starts_with(b"sarq ")
-            || nb.starts_with(b"sarl ") =>
+        b'l' if pfx!(f8, "leaq ") || pfx!(f8, "leal ") => return false,
+        b'a' if pfx!(f8, "add") || pfx!(f8, "and") => return false,
+        b's' if pfx!(f8, "sub")
+            || pfx!(f8, "set")
+            || pfx!(f8, "shlq ")
+            || pfx!(f8, "shll ")
+            || pfx!(f8, "shrq ")
+            || pfx!(f8, "shrl ")
+            || pfx!(f8, "sarq ")
+            || pfx!(f8, "sarl ") =>
         {
             return false;
         }
-        b'o' if nb.starts_with(b"orq ") || nb.starts_with(b"orl ") => return false,
-        b'x' if nb.starts_with(b"xor") => return false,
-        b'c' if nb.starts_with(b"cmpq ")
-            || nb.starts_with(b"cmpl ")
-            || nb.starts_with(b"cmpw ")
-            || nb.starts_with(b"cmpb ")
-            || nb.starts_with(b"cmov")
-            || nb.starts_with(b"call") =>
+        b'o' if pfx!(f8, "orq ") || pfx!(f8, "orl ") => return false,
+        b'x' if pfx!(f8, "xor") => return false,
+        b'c' if pfx!(f8, "cmpq ")
+            || pfx!(f8, "cmpl ")
+            || pfx!(f8, "cmpw ")
+            || pfx!(f8, "cmpb ")
+            || pfx!(f8, "cmov")
+            || pfx!(f8, "call") =>
         {
             return false;
         }
-        b't' if nb.starts_with(b"test") => return false,
+        b't' if pfx!(f8, "test") => return false,
         b'j' | b'n' | b'b' => return false,
-        b'p' if nb.starts_with(b"pushq ") || nb.starts_with(b"popq ") => return false,
-        b'r' if nb.starts_with(b"ret") => return false,
+        b'p' if pfx!(f8, "pushq ") || pfx!(f8, "popq ") => return false,
+        b'r' if pfx!(f8, "ret") => return false,
         _ => {}
     }
     // Integer div/mul use implicit rax:rdx. Exclude SSE variants (divsd/mulsd/etc.)
@@ -243,25 +247,25 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     (nb[0] == b'i' && nb[1] == b'd' && nb[2] == b'i') || // idiv
     (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l'
         && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p'))) || // mul, mulq (not mulsd/mulpd)
-    trimmed.starts_with("cltq") || // sign-extend eax -> rax (implicit read+write rax)
-    trimmed.starts_with("cbw") ||  // sign-extend al -> ax (implicit read+write rax)
-    trimmed.starts_with("cqto") || trimmed.starts_with("cdq") ||
-    trimmed.starts_with("cqo") || trimmed.starts_with("cwd") ||
-    trimmed.starts_with("rep ") || trimmed.starts_with("repne ") ||
-    trimmed.starts_with("cpuid") || trimmed.starts_with("syscall") ||
-    trimmed.starts_with("rdtsc") || trimmed.starts_with("rdmsr") ||
-    trimmed.starts_with("wrmsr") ||
-    trimmed.starts_with("xchg") || trimmed.starts_with("xadd") || trimmed.starts_with("cmpxchg") ||
-    trimmed.starts_with("lock ") ||
+    pfx!(f8, "cltq") || // sign-extend eax -> rax (implicit read+write rax)
+    pfx!(f8, "cbw") ||  // sign-extend al -> ax (implicit read+write rax)
+    pfx!(f8, "cqto") || pfx!(f8, "cdq") ||
+    pfx!(f8, "cqo") || pfx!(f8, "cwd") ||
+    pfx!(f8, "rep ") || pfx!(f8, "repne ") ||
+    pfx!(f8, "cpuid") || pfx!(f8, "syscall") ||
+    pfx!(f8, "rdtsc") || pfx!(f8, "rdmsr") ||
+    pfx!(f8, "wrmsr") ||
+    pfx!(f8, "xchg") || pfx!(f8, "xadd") || pfx!(f8, "cmpxchg") ||
+    pfx!(f8, "lock ") ||
     // shld/shrd use %cl implicitly (i128 shifts); treat like other shifts.
-    trimmed.starts_with("shld") || trimmed.starts_with("shrd") ||
+    pfx!(f8, "shld") || pfx!(f8, "shrd") ||
     // x87 FPU status/control instructions that write to %ax or memory.
     // fnstsw writes to %ax (implicit destination), and the peephole's
     // copy propagation must not rewrite %ax to another register since
     // the x86 ISA only allows %ax or memory for fnstsw.
-    trimmed.starts_with("fnstsw") || trimmed.starts_with("fnstcw") ||
-    trimmed.starts_with("fstcw") || trimmed.starts_with("fnstenv") ||
-    trimmed.starts_with("fldenv") || trimmed.starts_with("fldcw") ||
+    pfx!(f8, "fnstsw") || pfx!(f8, "fnstcw") ||
+    pfx!(f8, "fstcw") || pfx!(f8, "fnstenv") ||
+    pfx!(f8, "fldenv") || pfx!(f8, "fldcw") ||
     has_bare_implicit_gp_effect(trimmed)
 }
 

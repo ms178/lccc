@@ -263,7 +263,7 @@ fn label_uses(store: &LineStore, infos: &[LineInfo]) -> (FxHashSet<u32>, FxHashS
             s = s.split_once(':').map_or("", |(_, rest)| rest);
         }
         let mut rest = s;
-        while let Some(at) = find_lbb(rest) {
+        while let Some(at) = crate::backend::peephole_common::find_lbb(rest) {
             rest = &rest[at + 4..];
             let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
             if let Ok(label) = rest[..digits].parse() {
@@ -341,26 +341,6 @@ fn remove_dead_relays(store: &LineStore, infos: &mut [LineInfo], lo: usize, hi: 
     }
 }
 
-/// Position of the first `.LBB` in `s` — exact `s.find(".LBB")` semantics.
-///
-/// `str::find(&str)` builds a `StrSearcher` per call (two-way search
-/// preprocessing); at 700K calls per mixed TU that setup alone was ~2% of
-/// the compile's instructions. This scans for `'.'` with the memchr fast
-/// path and confirms the three following bytes inline.
-#[inline]
-fn find_lbb(s: &str) -> Option<usize> {
-    let b = s.as_bytes();
-    let mut pos = 0usize;
-    while pos < b.len() {
-        let dot = s[pos..].find('.')? + pos;
-        if b.len() - dot >= 4 && b[dot + 1] == b'L' && b[dot + 2] == b'B' && b[dot + 3] == b'B' {
-            return Some(dot);
-        }
-        pos = dot + 1;
-    }
-    None
-}
-
 pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut start = None;
     let mut changed = false;
@@ -428,7 +408,7 @@ fn scan_label_mentions(store: &LineStore, infos: &[LineInfo]) -> LabelCounts {
             s = s.split_once(':').map_or("", |(_, rest)| rest);
         }
         let mut rest = s;
-        while let Some(at) = find_lbb(rest) {
+        while let Some(at) = crate::backend::peephole_common::find_lbb(rest) {
             rest = &rest[at + 4..];
             let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
             if let Ok(label) = rest[..digits].parse() {
@@ -974,32 +954,6 @@ fn relay_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `find_lbb` must have the exact semantics of `s.find(".LBB")`,
-    /// including dots that don't open a label, trailing partial matches,
-    /// and a match at the very end of the line.
-    #[test]
-    fn find_lbb_is_find() {
-        let cases = [
-            "",
-            ".",
-            ".L",
-            ".LB",
-            ".LBB",
-            "jmp .LBB0_3",
-            "jne .Ltmp4",
-            "leaq .Lconst(%rip), %rax # .LBB1_2",
-            "movsd .LCPI0_0(%rip), %xmm0",
-            "..LBB",
-            ".X.LBB2_7",
-            "no label here",
-            "ends with .LB",
-            "text .LBB",
-        ];
-        for s in cases {
-            assert_eq!(find_lbb(s), s.find(".LBB"), "on {s:?}");
-        }
-    }
 
     fn apply(body: &str, pin: Option<&str>) -> (bool, String) {
         let mut store = LineStore::new(format!("f:\n.cfi_startproc\n{body}\n.cfi_endproc\n"));

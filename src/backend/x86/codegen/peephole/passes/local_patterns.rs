@@ -7597,23 +7597,19 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         }
         // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
         let jmp_text = infos[i].trimmed(store.get(i));
-        let target = if jmp_text.starts_with("jmp ") {
-            jmp_text[4..].to_string()
-        } else if jmp_text.starts_with("jl ") {
-            jmp_text[3..].to_string()
-        } else if jmp_text.starts_with("jle ") {
-            jmp_text[4..].to_string()
-        } else if jmp_text.starts_with("jne ") {
-            jmp_text[4..].to_string()
-        } else if jmp_text.starts_with("jge ") {
-            jmp_text[4..].to_string()
-        } else if jmp_text.starts_with("jg ") {
-            jmp_text[3..].to_string()
-        } else if jmp_text.starts_with("jb ") {
-            jmp_text[3..].to_string()
-        } else if jmp_text.starts_with("ja ") {
-            jmp_text[3..].to_string()
-        } else {
+        const BACK_EDGES: &[crate::backend::peephole_common::Pfx] = &[
+            crate::backend::peephole_common::Pfx::new("jmp "),
+            crate::backend::peephole_common::Pfx::new("jl "),
+            crate::backend::peephole_common::Pfx::new("jle "),
+            crate::backend::peephole_common::Pfx::new("jne "),
+            crate::backend::peephole_common::Pfx::new("jge "),
+            crate::backend::peephole_common::Pfx::new("jg "),
+            crate::backend::peephole_common::Pfx::new("jb "),
+            crate::backend::peephole_common::Pfx::new("ja "),
+        ];
+        let Some(target) = crate::backend::peephole_common::find_pfx(jmp_text, BACK_EDGES)
+            .map(|p| jmp_text[p.len()..].to_string())
+        else {
             i += 1;
             continue;
         };

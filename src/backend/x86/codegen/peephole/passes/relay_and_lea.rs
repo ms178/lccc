@@ -2426,12 +2426,9 @@ pub(super) fn cse_symbol_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> b
 /// Pure producers: instructions whose ONLY effect is writing their trailing
 /// register operand. Read-modify-write forms (`addl %ecx, %eax`) are excluded —
 /// retargeting them would change which register is read.
-const PURE_PRODUCERS: &[&str] = &[
-    "movzbl ", "movzbq ", "movzwl ", "movzwq ", "movsbl ", "movsbq ", "movswl ", "movswq ",
-    "movslq ", "movl ", "movq ", "leal ", "leaq ",
-];
-
-/// `PURE_PRODUCERS` packed for branch-only probing (same list and order).
+///
+/// Packed as [`crate::backend::peephole_common::Pfx`] constants so every
+/// probe is branch-only (one AND and one compare per entry, no `memcmp`).
 const PURE_PRODUCERS_PFX: &[crate::backend::peephole_common::Pfx] = &[
     crate::backend::peephole_common::Pfx::new("movzbl "),
     crate::backend::peephole_common::Pfx::new("movzbq "),
@@ -2448,7 +2445,9 @@ const PURE_PRODUCERS_PFX: &[crate::backend::peephole_common::Pfx] = &[
     crate::backend::peephole_common::Pfx::new("leaq "),
 ];
 
-/// `PURE_PRODUCERS_3OP` packed likewise.
+/// Flag-neutral BMI2 three-operand shifts/rotates (`op src1, src2, dst`):
+/// read all source operands before writing their trailing register destination
+/// and leave EFLAGS untouched.  Packed like [`PURE_PRODUCERS_PFX`].
 const PURE_PRODUCERS_3OP_PFX: &[crate::backend::peephole_common::Pfx] = &[
     crate::backend::peephole_common::Pfx::new("rorxl "),
     crate::backend::peephole_common::Pfx::new("rorxq "),
@@ -2458,13 +2457,6 @@ const PURE_PRODUCERS_3OP_PFX: &[crate::backend::peephole_common::Pfx] = &[
     crate::backend::peephole_common::Pfx::new("shlxq "),
     crate::backend::peephole_common::Pfx::new("sarxl "),
     crate::backend::peephole_common::Pfx::new("sarxq "),
-];
-
-/// Flag-neutral BMI2 three-operand shifts/rotates (`op src1, src2, dst`):
-/// read all source operands before writing their trailing register destination
-/// and leave EFLAGS untouched.
-const PURE_PRODUCERS_3OP: &[&str] = &[
-    "rorxl ", "rorxq ", "shrxl ", "shrxq ", "shlxl ", "shlxq ", "sarxl ", "sarxq ",
 ];
 
 /// Split `src1, src2, dst` into `("src1, src2", "dst")`, keeping the sources
@@ -2610,7 +2602,7 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
 }
 
 /// The late form of [`retarget_producer_into_copy`]: the producer's sources
-/// may name either register. Every `PURE_PRODUCERS` form reads all of its
+/// may name either register. Every `PURE_PRODUCERS_PFX` form reads all of its
 /// operands before writing its one destination and never reads that
 /// destination implicitly (no `cmov`, no `bsf`), so
 ///
@@ -2871,7 +2863,7 @@ fn names_family_narrow(line: &str, fam: RegId) -> bool {
 ///    `has_implicit_reg_usage`), and none is a barrier, label or pinned line:
 ///    `D`'s old value is unobserved after the producer and overwritten by the
 ///    copy anyway, so writing it from the producer on is unobservable. The
-///    producer's SOURCES may name `D`: every `PURE_PRODUCERS` form reads all
+///    producer's SOURCES may name `D`: every `PURE_PRODUCERS_PFX` form reads all
 ///    operands before writing (the aliasing argument of
 ///    [`retarget_producer_into_copy_aliasing`]).
 /// 3. Every `T` mention is a 32/64-bit name, so renaming every mention
@@ -2905,18 +2897,21 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         // `T`'s pre-window value once, at the producer, and writes `D`
         // (`shared_four`: `addl %esi, %edi; ...; adcl %edx, %edi; movl %edi,
         // %eax` becomes `leal (%rdi, %rsi), %eax; ...; adcl %edx, %eax`).
-        let (op, is_add) = match PURE_PRODUCERS.iter().find(|p| prod.starts_with(**p)) {
-            Some(op) => (*op, false),
-            None => match ["addl ", "addq "]
-                .into_iter()
-                .find(|p| prod.starts_with(*p))
-            {
-                Some(op) => (op, true),
-                None => {
+        let (op, is_add) = match crate::backend::peephole_common::find_pfx(prod, PURE_PRODUCERS_PFX)
+        {
+            Some(op) => (op, false),
+            None => {
+                use crate::backend::peephole_common::pfx;
+                let f8 = crate::backend::peephole_common::first8(prod);
+                if pfx!(f8, "addl ") {
+                    ("addl ", true)
+                } else if pfx!(f8, "addq ") {
+                    ("addq ", true)
+                } else {
                     i += 1;
                     continue;
                 }
-            },
+            }
         };
         let Some((prod_src, prod_dst)) = split_two_operands(&prod[op.len()..]) else {
             i += 1;

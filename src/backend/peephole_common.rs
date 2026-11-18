@@ -235,6 +235,11 @@ impl Pfx {
         let mut packed = 0u64;
         let mut i = 0;
         while i < b.len() {
+            // `first8` zero-pads lines shorter than eight bytes, so a prefix
+            // containing NUL could match the padding of a shorter line.  No
+            // assembly mnemonic contains NUL; enforce the soundness argument
+            // at constant evaluation instead of in a doc comment.
+            assert!(b[i] != 0, "Pfx cannot contain NUL");
             packed |= (b[i] as u64) << (8 * i);
             i += 1;
         }
@@ -287,6 +292,167 @@ pub(crate) fn first8(t: &str) -> u64 {
 pub(crate) fn find_pfx(t: &str, set: &'static [Pfx]) -> Option<&'static str> {
     let f8 = first8(t);
     set.iter().find(|p| p.matches(f8)).map(|p| p.text)
+}
+
+/// Position of the first `.LBB` in `s` — exact `s.find(".LBB")` semantics.
+///
+/// `str::find(&str)` builds a `StrSearcher` per call (two-way search
+/// preprocessing); at 700K calls per mixed TU that setup alone was ~2% of
+/// the compile's instructions. This scans for `'.'` with the memchr fast
+/// path and confirms the three following bytes inline.
+#[inline]
+pub(crate) fn find_lbb(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut pos = 0usize;
+    while pos < b.len() {
+        let dot = s[pos..].find('.')? + pos;
+        if b.len() - dot >= 4 && b[dot + 1] == b'L' && b[dot + 2] == b'B' && b[dot + 3] == b'B' {
+            return Some(dot);
+        }
+        pos = dot + 1;
+    }
+    None
+}
+
+/// `t.starts_with(PREFIX)` as a branch-only probe of a compile-time-packed
+/// constant: `pfx!(f8, "movslq ")`, where `f8` is `first8(t)` of the probed
+/// text, computed once per line.  Expands to one AND and one compare; the
+/// `Pfx` constant (and its 1..=8-byte / no-NUL invariants) are checked at
+/// constant evaluation.
+macro_rules! pfx {
+    ($f8:expr, $s:expr) => {{
+        const P: $crate::backend::peephole_common::Pfx =
+            $crate::backend::peephole_common::Pfx::new($s);
+        P.matches($f8)
+    }};
+}
+pub(crate) use pfx;
+
+/// A compile-time-packed token for branch-only EQUALITY matching (the
+/// whole-token analogue of [`Pfx`]): `op == "add"` over a mnemonic table
+/// becomes one length compare plus one `u64` compare per entry, no `memcmp`.
+///
+/// The length is matched exactly, so the probe equals `str` equality even
+/// for probed text containing NUL bytes (where a padding-only compare could
+/// false-positive on zero-padded packings).
+#[derive(Clone, Copy)]
+pub(crate) struct Tok8 {
+    packed: u64,
+    len: u8,
+    text: &'static str,
+}
+
+impl Tok8 {
+    /// Pack `s` (1..=8 bytes, no NUL) for equality matching.
+    pub(crate) const fn new(s: &'static str) -> Tok8 {
+        let b = s.as_bytes();
+        assert!(!b.is_empty() && b.len() <= 8, "Tok8 wants 1..=8 bytes");
+        let mut packed = 0u64;
+        let mut i = 0;
+        while i < b.len() {
+            assert!(b[i] != 0, "Tok8 cannot contain NUL");
+            packed |= (b[i] as u64) << (8 * i);
+            i += 1;
+        }
+        Tok8 {
+            packed,
+            len: b.len() as u8,
+            text: s,
+        }
+    }
+
+    /// The original token text.
+    #[inline]
+    pub(crate) fn text(self) -> &'static str {
+        self.text
+    }
+
+    /// `op == self.text()`, given `first8(op)` and `op.len()`.
+    #[inline]
+    pub(crate) fn matches(self, first8: u64, len: usize) -> bool {
+        len == self.len as usize && first8 == self.packed
+    }
+}
+
+/// First entry of `set` equal to `op`, in table order (the exact semantics
+/// of `set.iter().find(|e| *e == op)` on the same list).
+#[inline]
+pub(crate) fn find_tok8(op: &str, set: &'static [Tok8]) -> Option<&'static str> {
+    let w = first8(op);
+    let n = op.len();
+    set.iter().find(|e| e.matches(w, n)).map(|e| e.text)
+}
+
+#[cfg(test)]
+mod tok8_oracle_tests {
+    use super::{Tok8, find_tok8};
+
+    /// `find_tok8` must agree with linear `==` search for every probe,
+    /// including same-prefix longer/shorter tokens, 8-byte entries, and a
+    /// NUL-bearing probe that a padding-only compare would false-match.
+    #[test]
+    fn find_tok8_is_eq_find() {
+        const SET: &[Tok8] = &[
+            Tok8::new("add"),
+            Tok8::new("sub"),
+            Tok8::new("popcnt"),
+            Tok8::new("cmpxchg8"),
+        ];
+        let strs = ["add", "sub", "popcnt", "cmpxchg8"];
+        let probes = [
+            "",
+            "a",
+            "ad",
+            "add",
+            "addq",
+            "addresses",
+            "sub",
+            "subb",
+            "popcnt",
+            "popcntq",
+            "cmpxchg8",
+            "cmpxchg8b",
+            "add\0",
+            "ad\0",
+            "xor",
+        ];
+        for op in probes {
+            assert_eq!(
+                find_tok8(op, SET),
+                strs.iter().find(|s| **s == op).copied(),
+                "on {op:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod find_lbb_oracle_tests {
+    /// `find_lbb` must have the exact semantics of `s.find(".LBB")`,
+    /// including dots that don't open a label, trailing partial matches,
+    /// and a match at the very end of the line.
+    #[test]
+    fn find_lbb_is_find() {
+        let cases = [
+            "",
+            ".",
+            ".L",
+            ".LB",
+            ".LBB",
+            "jmp .LBB0_3",
+            "jne .Ltmp4",
+            "leaq .Lconst(%rip), %rax # .LBB1_2",
+            "movsd .LCPI0_0(%rip), %xmm0",
+            "..LBB",
+            ".X.LBB2_7",
+            "no label here",
+            "ends with .LB",
+            "text .LBB",
+        ];
+        for s in cases {
+            assert_eq!(super::find_lbb(s), s.find(".LBB"), "on {s:?}");
+        }
+    }
 }
 
 #[cfg(test)]

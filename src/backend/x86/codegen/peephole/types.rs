@@ -1672,7 +1672,10 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     // They also modify %rdi, %rsi, and %rcx. Treat them as indirect memory access
     // to ensure store forwarding and dead store elimination are conservative.
     let trimmed = s.trim_ascii_start();
-    if trimmed.starts_with("rep ") || trimmed.starts_with("rep\t") {
+    use crate::backend::peephole_common::{first8, pfx};
+    // One packed load serves every mnemonic probe below.
+    let f8 = first8(trimmed);
+    if pfx!(f8, "rep ") || pfx!(f8, "rep\t") {
         return true;
     }
 
@@ -1700,16 +1703,16 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     //   iret    -> restores rip, cs, rflags, rsp, ss from stack
     // Treat these as barriers for store forwarding since parse_dest_reg_fast
     // cannot detect their implicit register writes.
-    if trimmed.starts_with("rdmsr")
-        || trimmed.starts_with("wrmsr")
-        || trimmed.starts_with("cpuid")
-        || trimmed.starts_with("rdtsc")
-        || trimmed.starts_with("xgetbv")
-        || trimmed.starts_with("syscall")
-        || trimmed.starts_with("sysenter")
-        || trimmed.starts_with("int ")
-        || trimmed.starts_with("int\t")
-        || trimmed.starts_with("iret")
+    if pfx!(f8, "rdmsr")
+        || pfx!(f8, "wrmsr")
+        || pfx!(f8, "cpuid")
+        || pfx!(f8, "rdtsc")
+        || pfx!(f8, "xgetbv")
+        || pfx!(f8, "syscall")
+        || pfx!(f8, "sysenter")
+        || pfx!(f8, "int ")
+        || pfx!(f8, "int\t")
+        || pfx!(f8, "iret")
     {
         return true;
     }
@@ -1732,8 +1735,9 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
         if bytes[i] == b'(' && i + 2 < len && bytes[i + 1] == b'%' {
             // Found "(%" - check if it's %rbp or %rsp (which are not indirect aliasing)
             let rest = &s[i + 2..];
-            let is_frame_base = rest.starts_with("rbp") || rest.starts_with("rsp");
-            if rest.starts_with("rip") {
+            let r8 = first8(rest);
+            let is_frame_base = pfx!(r8, "rbp") || pfx!(r8, "rsp");
+            if pfx!(r8, "rip") {
                 // RIP-relative: a fixed global/rodata address, not a stack slot.
             } else if !is_frame_base {
                 return true;

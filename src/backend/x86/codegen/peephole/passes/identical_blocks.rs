@@ -89,7 +89,7 @@ fn line_is_identity_transparent(store: &LineStore, infos: &[LineInfo], j: usize)
 /// checks can never drift apart in what they consider a label token.
 fn collect_lbb_tokens(line: &str, out: &mut FxHashSet<String>) {
     let mut rest = line;
-    while let Some(pos) = rest.find(".LBB") {
+    while let Some(pos) = crate::backend::peephole_common::find_lbb(rest) {
         let name_start = pos + ".LBB".len();
         let mut j = name_start;
         while j < rest.len()

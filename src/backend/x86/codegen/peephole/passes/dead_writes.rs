@@ -98,33 +98,6 @@ fn droppable_source(op: &str, src: &str) -> bool {
 
 // ── Dead flag-writing arithmetic ────────────────────────────────────────────
 
-/// Base mnemonics of GP integer operations whose only effects are the
-/// destination register and (for all but `not`) the flags: no memory operand,
-/// no implicit register.  The width suffix is stripped before the lookup, so
-/// `shlq`/`shll`/`addw` all resolve here.
-///
-/// This set is the exact complement of `PURE_WRITE_PREFIXES`: the pure-write
-/// pass cannot retire an instruction that writes flags, so a dead address
-/// computation left behind by a SIB fold survived forever and kept the write
-/// feeding it alive through the deadness proof.
-///
-/// Measured with `scripts/callgrind_ab.py` (-O2, fast corpus, identical stdout
-/// on every program): bitops -100,000,000 Ir (-3.39%, five dead instructions
-/// per iteration), zstd_count -1.86%, linux_find_bit -0.14%, nothing slower.
-///
-/// Coverage is bounded by `flags_dead_after`: its walk runs through labels
-/// (the fall-through path), follows forward branches whose condition reads
-/// none of the live flags, and ends with the flags dead at `ret` and at a
-/// codegen-marked sibling call.  A backward branch, or an edge beyond the
-/// walk's window or budget, answers "live", which only costs a deletion.
-/// At a sibling call the destination's own liveness still comes from the
-/// call's argument markers, so a staged argument register is never dead.
-const FLAG_WRITING_PURE_ARITH: &[&str] = &[
-    "shl", "shr", "sar", "sal", "rol", "ror", "shld", "shrd", "add", "sub", "and", "or", "xor",
-    "inc", "dec", "neg", "not", "imul", "bt", "bts", "btr", "btc", "bsf", "bsr", "popcnt", "lzcnt",
-    "tzcnt",
-];
-
 /// One-operand forms are accepted for exactly these base mnemonics.  Every
 /// other entry needs the explicit `SRC, DST` shape: `imul %rcx` is the
 /// implicit `%rdx:%rax` form (its "destination" is not `%rcx`), and
@@ -137,19 +110,80 @@ const ONE_OPERAND_PURE_ARITH: &[&str] = &["inc", "dec", "neg", "not"];
 /// mnemonics.  The exact token is probed first so a name that merely ends in a
 /// width letter (`popcnt`, `bt`) is never truncated.
 fn pure_arith_base(t: &str) -> Option<&'static str> {
-    let op = t.split_whitespace().next()?;
-    if let Some(base) = FLAG_WRITING_PURE_ARITH.iter().find(|b| **b == op) {
-        return Some(base);
-    }
-    let last = op.as_bytes().last().copied()?;
-    if !matches!(last, b'b' | b'w' | b'l' | b'q') {
+    use crate::backend::peephole_common::{Tok8, find_tok8};
+    /// Base mnemonics of GP integer operations whose only effects are the
+    /// destination register and (for all but `not`) the flags: no memory operand,
+    /// no implicit register.  The width suffix is stripped before the lookup, so
+    /// `shlq`/`shll`/`addw` all resolve here.
+    ///
+    /// This set is the exact complement of `PURE_WRITE_PREFIXES`: the pure-write
+    /// pass cannot retire an instruction that writes flags, so a dead address
+    /// computation left behind by a SIB fold survived forever and kept the write
+    /// feeding it alive through the deadness proof.
+    ///
+    /// Measured with `scripts/callgrind_ab.py` (-O2, fast corpus, identical stdout
+    /// on every program): bitops -100,000,000 Ir (-3.39%, five dead instructions
+    /// per iteration), zstd_count -1.86%, linux_find_bit -0.14%, nothing slower.
+    ///
+    /// Coverage is bounded by `flags_dead_after`: its walk runs through labels
+    /// (the fall-through path), follows forward branches whose condition reads
+    /// none of the live flags, and ends with the flags dead at `ret` and at a
+    /// codegen-marked sibling call.  A backward branch, or an edge beyond the
+    /// walk's window or budget, answers "live", which only costs a deletion.
+    /// At a sibling call the destination's own liveness still comes from the
+    /// call's argument markers, so a staged argument register is never dead.
+    ///
+    /// Packed as [`Tok8`] constants for branch-only equality probing:
+    /// `pure_arith_base` is the only prober (~1M calls per mixed TU), and
+    /// the `&[&str]` form of this table ran up to 54 `memcmp`s per call.
+    const TOKS: &[Tok8] = &[
+        Tok8::new("shl"),
+        Tok8::new("shr"),
+        Tok8::new("sar"),
+        Tok8::new("sal"),
+        Tok8::new("rol"),
+        Tok8::new("ror"),
+        Tok8::new("shld"),
+        Tok8::new("shrd"),
+        Tok8::new("add"),
+        Tok8::new("sub"),
+        Tok8::new("and"),
+        Tok8::new("or"),
+        Tok8::new("xor"),
+        Tok8::new("inc"),
+        Tok8::new("dec"),
+        Tok8::new("neg"),
+        Tok8::new("not"),
+        Tok8::new("imul"),
+        Tok8::new("bt"),
+        Tok8::new("bts"),
+        Tok8::new("btr"),
+        Tok8::new("btc"),
+        Tok8::new("bsf"),
+        Tok8::new("bsr"),
+        Tok8::new("popcnt"),
+        Tok8::new("lzcnt"),
+        Tok8::new("tzcnt"),
+    ];
+    // First token by ASCII-whitespace byte scan: `t` is store-trimmed text,
+    // so the token starts at byte 0 (`split_whitespace` only ever skipped
+    // leading blanks that cannot be present here).
+    let b = t.as_bytes();
+    let end = b
+        .iter()
+        .position(|c| c.is_ascii_whitespace())
+        .unwrap_or(b.len());
+    let op = &t[..end];
+    if op.is_empty() {
         return None;
     }
-    let stem = &op[..op.len() - 1];
-    FLAG_WRITING_PURE_ARITH
-        .iter()
-        .find(|b| **b == stem)
-        .copied()
+    if let Some(base) = find_tok8(op, TOKS) {
+        return Some(base);
+    }
+    if !matches!(b[end - 1], b'b' | b'w' | b'l' | b'q') {
+        return None;
+    }
+    find_tok8(&op[..op.len() - 1], TOKS)
 }
 
 /// Delete GP integer arithmetic whose destination register AND whose flags are
@@ -1322,18 +1356,19 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
 /// why the transform was rejected in an earlier session. [`FileLiveness`]
 /// answers it directly.
 pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    const SIGNED: &[(&str, &str)] = &[
-        ("movsbq ", "cmpb"),
-        ("movsbl ", "cmpb"),
-        ("movswq ", "cmpw"),
-        ("movswl ", "cmpw"),
-        ("movslq ", "cmpl"),
+    use crate::backend::peephole_common::{Pfx, first8};
+    const SIGNED: &[(Pfx, &str)] = &[
+        (Pfx::new("movsbq "), "cmpb"),
+        (Pfx::new("movsbl "), "cmpb"),
+        (Pfx::new("movswq "), "cmpw"),
+        (Pfx::new("movswl "), "cmpw"),
+        (Pfx::new("movslq "), "cmpl"),
     ];
-    const UNSIGNED: &[(&str, &str)] = &[
-        ("movzbq ", "cmpb"),
-        ("movzbl ", "cmpb"),
-        ("movzwq ", "cmpw"),
-        ("movzwl ", "cmpw"),
+    const UNSIGNED: &[(Pfx, &str)] = &[
+        (Pfx::new("movzbq "), "cmpb"),
+        (Pfx::new("movzbl "), "cmpb"),
+        (Pfx::new("movzwq "), "cmpw"),
+        (Pfx::new("movzwl "), "cmpw"),
     ];
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
@@ -1345,15 +1380,16 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
         let load = infos[i].trimmed(store.get(i));
+        let lf8 = first8(load);
         let entry = SIGNED
             .iter()
             .chain(UNSIGNED.iter())
-            .find(|(p, _)| load.starts_with(*p));
+            .find(|(p, _)| p.matches(lf8));
         let Some((prefix, cmp_mnemonic)) = entry else {
             i += 1;
             continue;
         };
-        let Some((mem, dst)) = split_two_operands(&load[prefix.len()..]) else {
+        let Some((mem, dst)) = split_two_operands(&load[prefix.text().len()..]) else {
             i += 1;
             continue;
         };
@@ -1391,20 +1427,21 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             // its `(...)` operand is syntax, not an access.  mov is pure
             // only in the register/immediate forms (no memory operand).
             let dest_j = get_dest_reg(&infos[j]);
-            let staging =
-                if st.starts_with("leaq ") || st.starts_with("leal ") || st.starts_with("leaw ") {
-                    true
-                } else if st.starts_with("movq ")
-                    || st.starts_with("movl ")
-                    || st.starts_with("movw ")
-                    || st.starts_with("movb ")
-                {
-                    !st.contains('(')
-                } else {
-                    false
-                } && infos[j].reg_refs & fam_mask == 0
-                    && dest_j <= REG_GP_MAX
-                    && addr_mask & (1u16 << dest_j) == 0;
+            let sf8 = first8(st);
+            use crate::backend::peephole_common::pfx;
+            let staging = if pfx!(sf8, "leaq ") || pfx!(sf8, "leal ") || pfx!(sf8, "leaw ") {
+                true
+            } else if pfx!(sf8, "movq ")
+                || pfx!(sf8, "movl ")
+                || pfx!(sf8, "movw ")
+                || pfx!(sf8, "movb ")
+            {
+                !st.contains('(')
+            } else {
+                false
+            } && infos[j].reg_refs & fam_mask == 0
+                && dest_j <= REG_GP_MAX
+                && addr_mask & (1u16 << dest_j) == 0;
             if !staging {
                 break;
             }
@@ -1464,8 +1501,8 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
         // A test whose width matches the loaded width reads exactly the
         // memory bytes (the low byte / low word are identical under sign
         // AND zero extension), so SF is provably identical to the compare.
-        let signed_64 = matches!(*prefix, "movsbq " | "movswq " | "movslq ");
-        let signed_32 = matches!(*prefix, "movsbl " | "movswl ");
+        let signed_64 = matches!(prefix.text(), "movsbq " | "movswq " | "movslq ");
+        let signed_32 = matches!(prefix.text(), "movsbl " | "movswl ");
         let test_is_q = width == 'q';
         let width_matched =
             (*cmp_mnemonic == "cmpb" && width == 'b') || (*cmp_mnemonic == "cmpw" && width == 'w');
