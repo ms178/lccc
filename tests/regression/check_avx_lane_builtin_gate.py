@@ -17,7 +17,9 @@ Cases cover:
   * the ISA gate: without -mavx every lane builtin is rejected (GCC: "target
     specific option mismatch" / undeclared). LCCC previously accepted them;
   * the immediate: selectors 0 and 1 are accepted, 2, -1 and a runtime value
-    are rejected ("the last argument must be an 1-bit immediate");
+    are rejected ("the last argument must be an 1-bit immediate"). The same
+    rule applies to the public _mm256_*f128_* macros, which reach the generic
+    __lccc_simd helper path rather than the raw builtin; MACRO_CASES pins them;
   * AVX2 implies AVX, so -mavx2 accepts the AVX1 forms.
 
 The codegen check compiles one function per insert and extract form to
@@ -92,6 +94,40 @@ CASES: list[tuple[str, str, str]] = [
     ("__builtin_ia32_vextractf128_si256(i, 1)", "-O2 -mavx2", ACC),
 ]
 
+# The public wrappers need the header. Kept separate from PRELUDE so the raw
+# builtin cases above are byte-identical to before.
+MACRO_PRELUDE = """\
+#include <immintrin.h>
+int s;
+volatile long long sink;
+void f(__m256 a, __m128 b, __m256d d, __m128d e, __m256i i, __m128i j) {
+"""
+
+# (expression, flags, pinned verdict) for the public _mm256_*f128_* wrappers.
+MACRO_CASES: list[tuple[str, str, str]] = [
+    # Lane 0 and 1 are accepted with -mavx.
+    ("_mm256_extractf128_si256(i, 1)", "-O2 -mavx", ACC),
+    ("_mm256_extractf128_si256(i, 0)", "-O2 -mavx", ACC),
+    ("_mm256_insertf128_si256(i, j, 1)", "-O2 -mavx", ACC),
+    ("_mm256_insertf128_si256(i, j, 0)", "-O2 -mavx", ACC),
+    ("_mm256_extractf128_ps(a, 1)", "-O2 -mavx", ACC),
+    ("_mm256_insertf128_pd(d, e, 0)", "-O2 -mavx", ACC),
+    # An out-of-range selector is rejected. These were silently accepted:
+    # the generic helper path checked only that the immediate was an integer.
+    ("_mm256_extractf128_si256(i, 3)", "-O2 -mavx", REJ),
+    ("_mm256_extractf128_si256(i, 2)", "-O2 -mavx", REJ),
+    ("_mm256_insertf128_si256(i, j, 2)", "-O2 -mavx", REJ),
+    ("_mm256_insertf128_si256(i, j, -1)", "-O2 -mavx", REJ),
+    ("_mm256_extractf128_ps(a, 3)", "-O2 -mavx", REJ),
+    ("_mm256_insertf128_pd(d, e, 4)", "-O2 -mavx", REJ),
+    # A runtime selector is rejected.
+    ("_mm256_extractf128_si256(i, s)", "-O2 -mavx", REJ),
+    ("_mm256_insertf128_si256(i, j, s)", "-O2 -mavx", REJ),
+    # ISA gate: without -mavx the wrappers are unavailable.
+    ("_mm256_extractf128_si256(i, 1)", "-O2", REJ),
+    ("_mm256_insertf128_si256(i, j, 1)", "-O2", REJ),
+]
+
 # (C function, required mnemonic, forbidden mnemonics)
 CODEGEN: list[tuple[str, str, tuple[str, ...]]] = [
     ("void g(v8sf a, v4sf b, v8sf *o) { *o = __builtin_ia32_vinsertf128_ps256(a, b, 1); }",
@@ -121,7 +157,9 @@ def verdict(cc: str, flags: str, src: Path, out_dir: Path, asm: bool = False) ->
 def run_case(job: tuple[int, str, str, str, str, str, Path]) -> dict:
     idx, expr, flags, pinned, lccc, gcc, tmp = job
     src = tmp / f"case_{idx}.c"
-    src.write_text(PRELUDE + BODY % (expr, expr))
+    # A macro case names a wrapper that needs the header; a raw builtin does not.
+    prelude = MACRO_PRELUDE if expr.startswith("_mm") else PRELUDE
+    src.write_text(prelude + BODY % (expr, expr))
     lc, lerr = verdict(lccc, flags, src, tmp)
     gc, gerr = verdict(gcc, flags, src, tmp)
     return {
@@ -171,7 +209,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="avx-lane-gate-") as tmp_s:
         tmp = Path(tmp_s)
         self_test(str(args.lccc), args.gcc, tmp)
-        jobs = [(i, e, f, p, str(args.lccc), args.gcc, tmp) for i, (e, f, p) in enumerate(CASES)]
+        all_cases = CASES + MACRO_CASES
+        jobs = [(i, e, f, p, str(args.lccc), args.gcc, tmp) for i, (e, f, p) in enumerate(all_cases)]
         with cf.ThreadPoolExecutor(max_workers=max(1, os.cpu_count() or 2)) as pool:
             results = list(pool.map(run_case, jobs))
         failures = codegen_check(str(args.lccc), tmp)

@@ -13,9 +13,10 @@
  * element width changes the printed value. The program is differential:
  * lccc's stdout must equal GCC 16.2's, byte for byte.
  *
- * The fixture deliberately avoids _mm256_setr_ps, _mm256_setr_pd,
- * _mm256_extractf128_si256 and _mm256_insertf128_si256, which lccc does not
- * declare under -mavx. Vector literals and casts express the same values.
+ * The fixture deliberately avoids _mm256_setr_ps and _mm256_setr_pd, which
+ * lccc does not declare under -mavx. Vector literals and casts express the
+ * same values. The integer wrappers _mm256_extractf128_si256 and
+ * _mm256_insertf128_si256 are covered by avx_lane128_int_builtins.
  *
  * The lane selector is always a literal at the builtin call site (macros
  * below), so the immediate never depends on inlining. Compiled with -O2 -mavx.

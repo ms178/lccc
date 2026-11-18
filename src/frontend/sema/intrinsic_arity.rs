@@ -433,6 +433,8 @@ const ARITY_TABLE: &[(&str, u8)] = &[
     ("__lccc_simd128_ps_unpcklps128", 3),
     ("__lccc_simd128_ps_xorpd128", 3),
     ("__lccc_simd128_ps_xorps128", 3),
+    ("__lccc_simd256_i_vextractf128", 2),
+    ("__lccc_simd256_i_vinsertf128", 3),
     ("__lccc_simd256_i_vpternlogd256", 4),
     ("__lccc_simd256_pd_vextractf128", 2),
     ("__lccc_simd256_pd_vinsertf128", 3),
