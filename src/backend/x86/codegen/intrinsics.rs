@@ -1186,6 +1186,83 @@ impl X86Codegen {
         }
     }
 
+    /// Narrow a pending VLFOLD load of `arg` to its low 16 bytes.
+    ///
+    /// Only the low half of a 256-bit value is consumed by a 256→128 cast,
+    /// and that half sits at offset 0 of the same address, so the elided
+    /// load can be re-issued as a VEX.128 load of identical mnemonic
+    /// (`vmovdqu`/`vmovups`/`vmovupd`/`vmovdqa`: the 32-byte alignment
+    /// requirement implies the 16-byte one). Every width-32 fold is one of
+    /// those plain loads (`try_elide_vec_load`), so no broadcast or
+    /// arithmetic fold can be narrowed by mistake. Returns `true` when the
+    /// load is pending for `arg` and is now a 16-byte fold.
+    fn narrow_pending_memfold_to_low_half(&mut self, arg: &Operand) -> bool {
+        match (arg, self.state.pending_vec_memfold.as_mut()) {
+            (Operand::Value(v), Some(pf)) if v.0 == pf.val => {
+                pf.width = 16;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Memory operand of `arg`'s 256-bit data, when that data is current in
+    /// memory and not held in any register.
+    ///
+    /// Every register-resident state of the value is excluded: a live YMM
+    /// claim, the last register store, a deferred store of the value, and an
+    /// XMM home (a register is authoritative even when a memory copy exists).
+    /// Only then is the memory image the value's current contents, so a
+    /// 16-byte read of its first half is exact. Other values' deferred
+    /// stores are flushed first, exactly as the 256-bit reload does.
+    fn low_half_memory_operand(&mut self, arg: &Operand) -> Option<String> {
+        let Operand::Value(v) = arg else {
+            return None;
+        };
+        if self
+            .reg_assignments
+            .get(&v.0)
+            .is_some_and(|r| is_xmm_reg(*r))
+            || self.state.vec_live_ymm(v.0).is_some()
+            || (self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0))
+            || self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0)
+        {
+            return None;
+        }
+        self.flush_pending_vec_store_impl();
+        self.value_ptr_mem_operand(v.0)
+    }
+
+    /// The XMM alias of `arg`'s register home, when the value lives in one.
+    ///
+    /// Mirrors the register-home arm of `avx_load_arg_to`: a deferred store
+    /// of the same value is retired (the register is its home), any other
+    /// deferred store is flushed first. A value still pending as an elided
+    /// load is not in its register yet, so it returns `None`.
+    fn xmm_home_of(&mut self, arg: &Operand) -> Option<&'static str> {
+        let Operand::Value(v) = arg else {
+            return None;
+        };
+        if self
+            .state
+            .pending_vec_memfold
+            .as_ref()
+            .is_some_and(|pf| pf.val == v.0)
+        {
+            return None;
+        }
+        let reg = *self.reg_assignments.get(&v.0)?;
+        if !is_xmm_reg(reg) {
+            return None;
+        }
+        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+            self.state.pending_vec_store = None;
+        } else {
+            self.flush_pending_vec_store_impl();
+        }
+        Some(phys_reg_name(reg))
+    }
+
     /// Materialise a pending VLFOLD load through the scratch register and
     /// its ordinary home (register or slot). Never expected on the analysed
     /// shapes; keeps the elision sound if an unexpected instruction
@@ -3106,7 +3183,9 @@ impl X86Codegen {
             let width_matches = if pf.width == 16 {
                 cc::memfold_consumer_128(op).is_some() || cc::memfold_consumer_fma_128(op)
             } else {
-                cc::memfold_consumer_256(op).is_some() || cc::memfold_consumer_madd_256(op)
+                cc::memfold_consumer_256(op).is_some()
+                    || cc::memfold_consumer_madd_256(op)
+                    || matches!(op, IntrinsicOp::Cast256to128)
             };
             let consumes = args
                 .iter()
@@ -4240,13 +4319,42 @@ impl X86Codegen {
                 // Nothing to emit (lowering returns the operand directly).
             }
             IntrinsicOp::Cast256to128 => {
+                // The low 128 bits of a 256-bit value are the value's XMM
+                // view. Three operand shapes, cheapest first:
+                //   * a pending 32-byte load: narrow the load to its low 16
+                //     bytes (same address; the low half is at offset 0), so
+                //     no 32-byte read and no `dirty_upper_ymm` arming;
+                //   * a register home: read the XMM alias directly, no
+                //     `vextractf128` and no full YMM copy;
+                //   * anything else: the full 256-bit load then `vextractf128`.
+                // GCC lowers the same casts to zero instructions or a single
+                // VEX.128 move, so this is the parity target.
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
-                    self.avx_load_arg(&args[0]);
-                    self.state.emit_fmt(format_args!(
-                        "    {} $0, %ymm0, %xmm0",
-                        crate::backend::x86_common::vextract128_name(self.avx2_enabled)
-                    ));
-                    self.sse_store_dest(dptr, "xmm0");
+                    if self.narrow_pending_memfold_to_low_half(&args[0]) {
+                        self.avx_load_arg_to(&args[0], "ymm0");
+                        self.sse_store_dest(dptr, "xmm0");
+                    } else if let Some(src) = self.xmm_home_of(&args[0]) {
+                        self.sse_store_dest(dptr, src);
+                    } else if let Some(mem) = self.low_half_memory_operand(&args[0]) {
+                        // The vector lives in memory (a stack temporary or a
+                        // GPR-addressed buffer): read its low 16 bytes with one
+                        // VEX.128 load. This is the dominant shape, since a
+                        // 256-bit result that feeds a cast is spilled first.
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqu {}, %xmm0", mem));
+                        // Only the XMM half of `ymm0` is written, so no value's
+                        // full-width claim on that bank survives this load.
+                        self.state.vec_evict_bank_except("ymm0", u32::MAX);
+                        self.state.vec_last_store_reg = false;
+                        self.sse_store_dest(dptr, "xmm0");
+                    } else {
+                        self.avx_load_arg(&args[0]);
+                        self.state.emit_fmt(format_args!(
+                            "    {} $0, %ymm0, %xmm0",
+                            crate::backend::x86_common::vextract128_name(self.avx2_enabled)
+                        ));
+                        self.sse_store_dest(dptr, "xmm0");
+                    }
                 }
             }
             IntrinsicOp::Insert128to256 => {
@@ -15906,5 +16014,125 @@ mod broadcast_pending_bank_tests {
             !out.contains("vmovdqu %ymm1, "),
             "a deferred dest is not stored: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cast256_low_half_tests {
+    use super::*;
+    use crate::backend::state::PendingVecMemfold;
+
+    /// Emit `dest = cast256to128(arg0)` and return the emitted text.
+    fn emit_cast(cg: &mut X86Codegen) -> String {
+        cg.emit_intrinsic_impl(
+            &Some(Value(2)),
+            &IntrinsicOp::Cast256to128,
+            &None,
+            &[Operand::Value(Value(0))],
+        );
+        cg.state.out.buf.clone()
+    }
+
+    fn fold(val: u32, width: u32, mnemonic: &'static str) -> PendingVecMemfold {
+        PendingVecMemfold {
+            val,
+            mem: "(%rdi)".to_string(),
+            mnemonic,
+            width,
+        }
+    }
+
+    #[test]
+    fn pending_256_bit_load_narrows_to_one_xmm_load() {
+        // The low half of `vmovdqu (%rdi)` is a 16-byte load of the same
+        // address: no 32-byte read, no full YMM register, no `vzeroupper`.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6 / ymm6
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.vector_values.extend([0, 2]);
+        cg.state.pending_vec_memfold = Some(fold(0, 32, "vmovdqu"));
+        let out = emit_cast(&mut cg);
+        assert!(out.contains("vmovdqu (%rdi), %xmm0"), "{out}");
+        assert!(!out.contains("ymm") && !out.contains("vextract"), "{out}");
+        assert!(!cg.state.dirty_upper_ymm, "{out}");
+        assert!(cg.state.pending_vec_memfold.is_none(), "{out}");
+    }
+
+    #[test]
+    fn pending_256_bit_aligned_load_keeps_its_aligned_mnemonic() {
+        // `vmovdqa` at 32-byte alignment is also 16-byte aligned, so the
+        // narrowed form keeps the aligned mnemonic and stays legal.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24));
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.vector_values.extend([0, 2]);
+        cg.state.pending_vec_memfold = Some(fold(0, 32, "vmovdqa"));
+        let out = emit_cast(&mut cg);
+        assert!(out.contains("vmovdqa (%rdi), %xmm0"), "{out}");
+        assert!(!out.contains("vextract"), "{out}");
+    }
+
+    #[test]
+    fn register_home_reads_its_xmm_alias_without_extract() {
+        // The low alias of `ymm5` is `xmm5`: a register-homed cast is a
+        // register-to-register move at most, never a YMM copy plus extract.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, PhysReg(23)); // xmm5 / ymm5
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6 / ymm6
+        cg.state.vector_values.extend([0, 2]);
+        let out = emit_cast(&mut cg);
+        assert!(out.contains("%xmm5"), "{out}");
+        assert!(!out.contains("%ymm5") && !out.contains("vextract"), "{out}");
+        assert!(!cg.state.dirty_upper_ymm, "{out}");
+    }
+
+    #[test]
+    fn slot_resident_operand_reads_its_low_half_with_one_xmm_load() {
+        // The dominant real shape: a 256-bit result spilled to its stack
+        // slot. The cast reads the first 16 bytes of that slot directly; the
+        // 32-byte reload and `vextractf128` are not needed.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6 / ymm6
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.vector_values.extend([0, 2]);
+        let out = emit_cast(&mut cg);
+        assert!(out.contains("vmovdqu -64(%rbp), %xmm0"), "{out}");
+        assert!(!out.contains("ymm") && !out.contains("vextract"), "{out}");
+        assert!(!cg.state.dirty_upper_ymm, "{out}");
+    }
+
+    #[test]
+    fn live_ymm_claim_keeps_the_register_path() {
+        // A value still held in a YMM register is authoritative. Memory may
+        // be stale, so the cast must read the register (move-aside + extract),
+        // never the slot.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24));
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.vector_values.extend([0, 2]);
+        cg.state.vec_claim_live_reg(0, "ymm3");
+        let out = emit_cast(&mut cg);
+        assert!(!out.contains("-64(%rbp)"), "{out}");
+        assert!(out.contains("%ymm3") && out.contains("vextract"), "{out}");
+    }
+
+    #[test]
+    fn fold_of_another_value_is_not_narrowed() {
+        // A pending load belongs to one value only. Narrowing a different
+        // operand would re-issue the wrong load.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24));
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.value_locations.insert(7, StackSlot(-96));
+        cg.state.vector_values.extend([0, 2, 7]);
+        cg.state.pending_vec_memfold = Some(fold(7, 32, "vmovdqu"));
+        let out = emit_cast(&mut cg);
+        // The foreign pending load is materialised first (its own width-32
+        // load, stored to its home), and the cast then reads value 0's slot.
+        assert!(out.contains("vmovdqu (%rdi), %ymm0"), "{out}");
+        assert!(!out.contains("(%rdi), %xmm0"), "{out}");
+        assert!(out.contains("vmovdqu -64(%rbp), %xmm0"), "{out}");
+        assert!(!out.contains("vextract"), "{out}");
+        assert!(cg.state.pending_vec_memfold.is_none(), "{out}");
     }
 }

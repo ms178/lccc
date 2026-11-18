@@ -2826,6 +2826,7 @@ pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u3
                 && memfold_consumer_128(op).is_none()
                 && !memfold_consumer_fma_128(op)
                 && !memfold_consumer_madd_256(op)
+                && !matches!(op, crate::ir::intrinsics::IntrinsicOp::Cast256to128)
             {
                 continue;
             }
@@ -2938,6 +2939,32 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             else {
                 continue;
             };
+            // 256→128 cast: a UNARY consumer that reads only the low 16 bytes
+            // of its operand. An adjacent, single-use 32-byte load folds here
+            // and the emitter narrows it to the same address's 16-byte load
+            // (`Cast256to128` arm). The binary table below cannot express a
+            // unary consumer, so the cast is decided on its own.
+            if matches!(cop, crate::ir::intrinsics::IntrinsicOp::Cast256to128) {
+                if let [Operand::Value(src)] = cargs.as_slice() {
+                    let d = src.0;
+                    let adjacent = (j >= 1 && load_at(j - 1, true) == Some(d))
+                        || (j >= 2 && pure_load_at(j - 1) && load_at(j - 2, true) == Some(d));
+                    if adjacent
+                        && !poisoned.contains(&d)
+                        && !param_preloaded.contains(&d)
+                        && use_count.get(&d).copied() == Some(1)
+                    {
+                        if debug {
+                            lccc::cli::stderr_line(format_args!(
+                                "[VLFOLD-IR] {} b{} i{} fold load %{} into {:?}",
+                                func.name, bi, j, d, cop
+                            ));
+                        }
+                        result.insert(d);
+                    }
+                }
+                continue;
+            }
             // Madd `a*b + c`: every position may fold (the multiplicands
             // commute; the emitter picks the 213/231 form and keeps the
             // XMM-homed broadcast as the register source). 256-bit only.
@@ -3999,5 +4026,77 @@ mod cfg_copy_coalesce_tests {
         let skip = compute_immediately_consumed(&func, false);
         assert!(skip.contains(&0), "src of dead copy should stay in acc");
         assert!(skip.contains(&1), "copy dest consumed by cast");
+    }
+}
+
+#[cfg(test)]
+mod cast256_fold_admission_tests {
+    use super::*;
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Operand, Value};
+
+    fn load256(dest: u32, ptr: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op: O::VecLoadI32x8,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(ptr))],
+        }
+    }
+
+    fn cast(dest: u32, src: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op: O::Cast256to128,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(src))],
+        }
+    }
+
+    fn scalar(dest: u32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Const(crate::ir::constants::IrConst::I32(1)),
+            rhs: Operand::Const(crate::ir::constants::IrConst::I32(0)),
+            ty: crate::common::types::IrType::I32,
+        }
+    }
+
+    fn folds(insts: Vec<Instruction>) -> FxHashSet<u32> {
+        let mut func = IrFunction::new("cast_fold".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+        });
+        compute_vector_memfold_values(&func)
+    }
+
+    #[test]
+    fn adjacent_single_use_256_bit_load_folds_into_its_cast() {
+        // The emitter narrows this fold to the low 16 bytes (`Cast256to128`).
+        assert!(folds(vec![load256(0, 9), cast(1, 0)]).contains(&0));
+    }
+
+    #[test]
+    fn second_use_of_the_loaded_value_blocks_the_fold() {
+        // A second reader needs the full 256-bit register, which the elided
+        // load never wrote.
+        let extra = Instruction::Intrinsic {
+            dest: Some(Value(2)),
+            op: O::Cast256to128,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(0))],
+        };
+        assert!(!folds(vec![load256(0, 9), cast(1, 0), extra]).contains(&0));
+    }
+
+    #[test]
+    fn non_adjacent_load_is_not_folded() {
+        // Only a pure vector load may sit between the load and its consumer.
+        assert!(!folds(vec![load256(0, 9), scalar(5), cast(1, 0)]).contains(&0));
     }
 }
