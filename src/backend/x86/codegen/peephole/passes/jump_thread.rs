@@ -590,6 +590,8 @@ fn remove_dead_relays(
             // A section switch this scan can read: carry the verdict across an
             // excursion that returns to the SAME section, forget the proof on
             // anything else.
+            // DIRECTIVE-LAW: classifying -- these specific switches update
+            // section state; they are not interchangeable with other directives.
             if info.kind == LineKind::Directive
                 && !info.pinned
                 && may_switch_section(s)
@@ -630,6 +632,7 @@ fn remove_dead_relays(
             // without naming a section.
             if info.pinned
                 || info.kind == LineKind::InlineAsm
+                // DIRECTIVE-LAW: bails -- an opaque directive kills the proof.
                 || (info.kind == LineKind::Directive && section_proof_ends(s))
             {
                 identity.forget();
