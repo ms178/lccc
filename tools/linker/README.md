@@ -19,12 +19,20 @@ arm that got the wrong number — plus an i686 `R_386_TLS_LE_32` and a name,
 `R_386_32S`, that does not exist in the i386 ABI at all. Run it after touching
 any `R_*` constant.
 
-## `oracle_cmp.py` — differential comparison against another linker
+## Linker differential tests and same-object package replay
 
-Links the same inputs with lccc-ld and with an oracle (GNU ld by default) and
-reports divergences both in the accept/reject verdict and in the bytes written.
+[`run_linker_tests.py`](../../tests/linker/run_linker_tests.py) checks feature
+fixtures against GNU ld and available corroborating oracles.
+[`real_workloads.py`](../../tests/linker/real_workloads.py) captures a GCC driver
+link invocation and replays it with the same objects, CRT, and options for each
+linker. Compare the resulting programs' outputs before interpreting link times.
+The latter reports grouped medians; use interleaved pairs for performance claims.
 
-    python3 tools/linker/oracle_cmp.py --help
+    python3 tests/linker/run_linker_tests.py --help
+    python3 tests/linker/real_workloads.py --help
+
+`tools/linker/oracle_cmp.py` is a legacy static i686 compiler-assembly counter,
+not a linker oracle. Its output cannot substitute for either test.
 
 ## `setup_oracles.sh` — build the corroborating linkers
 
