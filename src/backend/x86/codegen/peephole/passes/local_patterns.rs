@@ -733,8 +733,15 @@ pub(super) fn delete_dead_vector_epilogue_stores(
                 j += 1;
                 continue;
             }
-            // Directives do not execute; only the function-end marker
-            // matters (reached without `ret`: refuse).
+            // DIRECTIVE-LAW: selecting -- the walk reads each directive only
+            // to find the function-end marker (CfiMark::End decodes exactly
+            // the `.cfi_endproc` text this site compared before
+            // classification cached it); reaching it without `ret` refuses
+            // the candidate.  Every other directive is stepped because the
+            // walk counts LIVE INSTRUCTIONS toward the epilogue shape and
+            // rewrites none of the stepped lines -- a data-emitting
+            // directive in the window changes no rsp-displacement fact the
+            // shape match consumes.
             if infos[j].kind == LineKind::Directive {
                 if infos[j].cfi == CfiMark::End {
                     continue 'cand;

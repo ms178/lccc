@@ -858,19 +858,12 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             } else {
                 parse_rbp_offset(s)
             };
-            let reg_refs = scan_register_refs(sb);
-            return LineInfo {
-                kind: LineKind::Other { dest_reg },
-                ext_kind: ext,
-                trim_start: ts,
-                has_indirect_mem: has_indirect,
-                rbp_offset: rbp_off,
-                reg_refs,
-                pinned: false,
-                inert_dir: false,
-                volatile_access: false,
-                cfi: CfiMark::None,
-            };
+            let mut info = line_info(LineKind::Other { dest_reg }, ts);
+            info.ext_kind = ext;
+            info.has_indirect_mem = has_indirect;
+            info.rbp_offset = rbp_off;
+            info.reg_refs = scan_register_refs(sb);
+            return info;
         }
     }
 
