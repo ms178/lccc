@@ -129,59 +129,7 @@ impl Lowerer {
                 variadic,
             );
             self.shadow_local_for_scope(&declarator.name);
-            // Propagate __attribute__((error("..."))) and __attribute__((noreturn)) / _Noreturn
-            // from block-scope function declarations. Without this, the kernel's BUILD_BUG_ON
-            // macro (which uses block-scope `extern void __compiletime_assert_NNN(void)
-            // __attribute__((error(...)))`) would emit real calls to undefined symbols
-            // instead of replacing them with Unreachable.
-            // Same scoping law as the signature table above: these sets are
-            // keyed by symbol, so an `auto` declaration must not attach its
-            // attributes to the file-scope entity of the same basename -- an
-            // `error` would reject a legal call elsewhere in the TU, and a
-            // `noreturn` would let code after an unrelated call be dropped as
-            // unreachable. When the entity is a nested one (mangled key
-            // available) the fact is recorded there; when it is a nested
-            // prototype with no definition in this TU, nothing can call it, so
-            // the fact has no carrier and is dropped.
-            let attr_key =
-                self.block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
-            let attr_key = attr_key.filter(|_| !declarator.name.is_empty());
-            if declarator.attrs.is_error_attr() {
-                if let Some(k) = &attr_key {
-                    self.error_functions.insert(k.clone());
-                }
-            }
-            if declarator.attrs.is_noreturn() {
-                if let Some(k) = &attr_key {
-                    self.noreturn_functions.insert(k.clone());
-                }
-            }
-            if declarator.attrs.is_pure() {
-                if let Some(k) = &attr_key {
-                    self.pure_functions.insert(k.clone());
-                }
-            }
-            if declarator.attrs.is_const_attr() {
-                if let Some(k) = &attr_key {
-                    self.const_functions.insert(k.clone());
-                }
-            }
-            // Propagate __attribute__((weak)) and __attribute__((visibility(...)))
-            // from block-scope extern function declarations.
-            // `weak`/`visibility` are properties of the *linker symbol*: a
-            // nested function is not the file-scope symbol of that basename, so
-            // an `auto` declaration must not retag it. The nested definition
-            // carries its own attributes for its own symbol.
-            if !declarator.attrs.is_nested_fn()
-                && !declarator.name.is_empty()
-                && (declarator.attrs.is_weak() || declarator.attrs.visibility.is_some())
-            {
-                self.module.symbol_attrs.push((
-                    declarator.name.clone(),
-                    declarator.attrs.is_weak(),
-                    declarator.attrs.visibility.clone(),
-                ));
-            }
+            self.register_block_func_attrs(declarator, entity.as_deref());
             return true;
         }
 
@@ -201,19 +149,7 @@ impl Lowerer {
                         fti.variadic,
                     );
                     self.shadow_local_for_scope(&declarator.name);
-                    if declarator.attrs.is_error_attr() && !declarator.name.is_empty() {
-                        self.error_functions.insert(declarator.name.clone());
-                    }
-                    if declarator.attrs.is_noreturn() && !declarator.name.is_empty() {
-                        self.noreturn_functions.insert(declarator.name.clone());
-                    }
-                    if declarator.attrs.is_weak() || declarator.attrs.visibility.is_some() {
-                        self.module.symbol_attrs.push((
-                            declarator.name.clone(),
-                            declarator.attrs.is_weak(),
-                            declarator.attrs.visibility.clone(),
-                        ));
-                    }
+                    self.register_block_func_attrs(declarator, entity.as_deref());
                     return true;
                 }
             }
@@ -222,10 +158,36 @@ impl Lowerer {
         false
     }
 
-    /// Register function metadata for a block-scope function declaration.
-    /// Must compute the same ABI metadata as `register_function_meta` so that
-    /// member access on struct return values (e.g., `stfunc1().field`) works
-    /// correctly even when the function is only forward-declared at block scope.
+    /// Record declaration attributes under the same key as the signature,
+    /// whether the function type came from a declarator or a typedef.
+    fn register_block_func_attrs(&mut self, declarator: &InitDeclarator, entity: Option<&str>) {
+        let Some(key) = entity.filter(|_| !declarator.name.is_empty()) else {
+            return;
+        };
+        let attrs = &declarator.attrs;
+        if attrs.is_error_attr() {
+            self.error_functions.insert(key.to_string());
+        }
+        if attrs.is_noreturn() {
+            self.noreturn_functions.insert(key.to_string());
+        }
+        if attrs.is_pure() {
+            self.pure_functions.insert(key.to_string());
+        }
+        if attrs.is_const_attr() {
+            self.const_functions.insert(key.to_string());
+        }
+        // An `auto` declaration names a distinct nested function; it must
+        // not retag the file-scope linker symbol that shares its basename.
+        if !attrs.is_nested_fn() && (attrs.is_weak() || attrs.visibility.is_some()) {
+            self.module.symbol_attrs.push((
+                declarator.name.clone(),
+                attrs.is_weak(),
+                attrs.visibility.clone(),
+            ));
+        }
+    }
+
     /// The symbol under which a block-scope function declaration's module-level
     /// facts (signature, `error`/`noreturn`/`pure`/`const`, weak/visibility) are
     /// recorded -- or `None` when there is no module-level fact to record.
@@ -264,6 +226,8 @@ impl Lowerer {
             .map(|e| e.mangled.clone())
     }
 
+    /// Match `register_function_meta` even for functions only declared at block
+    /// scope: callers need the same ABI facts, e.g. for struct-valued returns.
     fn register_block_func_meta(
         &mut self,
         entity_key: Option<&str>,
