@@ -1967,9 +1967,10 @@ impl LinearScanAllocator {
             // hole-contained incoming is served by the segment-aware
             // hole-filling waves. `CCC_RA_NO_RECURRENCE_KEEP` is the A/B
             // switch.
+            let victim_cost_at = interval.range.spill_cost_at(pos);
             if interval.range.span_recurrence
                 && !self.ra_config.no_recurrence_keep
-                && interval.range.spill_cost_at(pos) == 0
+                && victim_cost_at == 0
                 && !interval.range.conflicts_with_segments(incoming)
             {
                 continue;
@@ -2004,7 +2005,7 @@ impl LinearScanAllocator {
             let priority = if free_victim {
                 0
             } else if cost_order {
-                interval.range.spill_cost_at(pos)
+                victim_cost_at
             } else {
                 interval.range.priority
             };
@@ -4596,6 +4597,38 @@ mod tests {
         assert!(
             alloc.assignments.contains_key(&2),
             "a really-conflicting short keeps its profitable steal"
+        );
+        assert!(!alloc.assignments.contains_key(&1));
+    }
+
+    /// The third quadrant of the two-condition gate: remaining cost ZERO
+    /// but a REAL segment overlap also stays an ordinary victim. This is
+    /// the gzip_longest_match shape that rejected the zero-cost-only
+    /// gate (+0.6% Ir): costat=0 recurrences whose live segments really
+    /// covered hot incomings kept the register pool, and the cascade
+    /// slotted the hot values instead. Zero remaining cost alone proves
+    /// nothing when the incoming genuinely needs the victim's register
+    /// at points where the victim is live — the rank comparison decides.
+    #[test]
+    fn zero_cost_recurrence_with_real_overlap_stays_an_ordinary_victim() {
+        let mut counter = spanned(1, 0, 900, vec![10, 20, 30], 60);
+        counter.span_marked = true;
+        counter.span_recurrence = true;
+        counter.span_has_in_loop_use = true;
+        // All uses behind the incoming's start (remaining cost 0 at 400),
+        // but live through [380, 900]: the incoming [400, 450] REALLY
+        // conflicts — no phantom, so the veto must not fire.
+        counter.set_segments(vec![(0, 36), (380, 900)]);
+        let hot_short = lr(2, 400, 450, vec![410, 440], 100);
+        let mut alloc = LinearScanAllocator::new_with_config(
+            vec![counter, hot_short],
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        assert!(
+            alloc.assignments.contains_key(&2),
+            "zero remaining cost without a phantom conflict is no shield"
         );
         assert!(!alloc.assignments.contains_key(&1));
     }
