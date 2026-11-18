@@ -2282,6 +2282,25 @@ impl X86Codegen {
         }
     }
 
+    /// `vdpps $imm, %ymm1, %ymm0, %ymm0`: two independent 128-bit dot products.
+    fn emit_avx_dpps_256(&mut self, dest_ptr: &Value, args: &[Operand]) {
+        let imm = self.simd_imm(&args[2]);
+        self.avx_load_arg(&args[0]);
+        self.avx_load_arg_to(&args[1], "ymm1");
+        self.state
+            .emit_fmt(format_args!("    vdpps ${}, %ymm1, %ymm0, %ymm0", imm));
+        self.avx_store_dest(dest_ptr);
+    }
+
+    /// `vpermilps`/`vpermilpd` (xmm, variable index): `mnemonic %xmm1, %xmm0, %xmm0`.
+    fn emit_avx_vpermilvar_128(&mut self, dest_ptr: &Value, args: &[Operand], mnemonic: &str) {
+        self.sse_load_arg(&args[0], "xmm0");
+        self.sse_load_arg(&args[1], "xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0, %xmm0", mnemonic));
+        self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
     /// 256-bit AVX FP op dispatch (all shapes).
     fn emit_avx_fp_256_op(&mut self, dest_ptr: &Value, op: &IntrinsicOp, args: &[Operand]) {
         use IntrinsicOp::*;
@@ -2405,27 +2424,10 @@ impl X86Codegen {
             CvtPd2Ep32_256 => narrow(self, "vcvtpd2dq"),
             CvttPd2Ep32_256 => narrow(self, "vcvttpd2dq"),
             // vdpps: two independent 128-bit dot products selected by imm.
-            DpPs256 => {
-                let imm = self.simd_imm(&args[2]);
-                self.avx_load_arg(&args[0]);
-                self.avx_load_arg_to(&args[1], "ymm1");
-                self.state
-                    .emit_fmt(format_args!("    vdpps ${}, %ymm1, %ymm0, %ymm0", imm));
-                self.avx_store_dest(dest_ptr);
-            }
-            // 128-bit variable-index permute (xmm): idx in arg 1.
-            VpermilvarPs128 => {
-                self.sse_load_arg(&args[0], "xmm0");
-                self.sse_load_arg(&args[1], "xmm1");
-                self.state.emit("    vpermilps %xmm1, %xmm0, %xmm0");
-                self.sse_store_dest(dest_ptr, "xmm0");
-            }
-            VpermilvarPd128 => {
-                self.sse_load_arg(&args[0], "xmm0");
-                self.sse_load_arg(&args[1], "xmm1");
-                self.state.emit("    vpermilpd %xmm1, %xmm0, %xmm0");
-                self.sse_store_dest(dest_ptr, "xmm0");
-            }
+            DpPs256 => self.emit_avx_dpps_256(dest_ptr, args),
+            // 128-bit variable-index permutes (xmm): idx in arg 1.
+            VpermilvarPs128 => self.emit_avx_vpermilvar_128(dest_ptr, args, "vpermilps"),
+            VpermilvarPd128 => self.emit_avx_vpermilvar_128(dest_ptr, args, "vpermilpd"),
             // 3-op with imm: vcmpps/vcmppd/vshufps/vshufpd/vblendps/vblendpd (a, b, imm)
             CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | BlendPs256 | BlendPd256 => {
                 let inst = match op {

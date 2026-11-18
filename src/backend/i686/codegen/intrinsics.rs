@@ -32,6 +32,33 @@ impl I686Codegen {
         }
     }
 
+    /// 128-bit variable-index permute (AVX `vpermilps`/`vpermilpd`, memory
+    /// destination form): `mnemonic %xmm1, %xmm0, %xmm0`. The value form is
+    /// rejected because lowering never produces it.
+    fn emit_i686_vpermilvar_128(
+        &mut self,
+        dest: &Option<Value>,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+        mnemonic: &str,
+        op: &IntrinsicOp,
+    ) {
+        let Some(dptr) = dest_ptr else {
+            if dest.is_some() {
+                self.reject_value_form(op);
+            }
+            return;
+        };
+        self.operand_to_eax(&args[0]);
+        self.state.emit("    movups (%eax), %xmm0");
+        self.operand_to_eax(&args[1]);
+        self.state.emit("    movups (%eax), %xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0, %xmm0", mnemonic));
+        self.operand_to_eax(&Operand::Value(*dptr));
+        self.state.emit("    movups %xmm0, (%eax)");
+    }
+
     pub(super) fn emit_intrinsic_impl(
         &mut self,
         dest: &Option<Value>,
@@ -985,24 +1012,11 @@ impl I686Codegen {
 
             // 128-bit variable-index permutes (AVX): vpermilps/vpermilpd
             // %idx, %src, %dst. Loads follow the 128-bit operand pattern above.
-            IntrinsicOp::VpermilvarPs128 | IntrinsicOp::VpermilvarPd128 => {
-                if let Some(dptr) = dest_ptr {
-                    let inst = match op {
-                        IntrinsicOp::VpermilvarPs128 => "vpermilps",
-                        IntrinsicOp::VpermilvarPd128 => "vpermilpd",
-                        _ => unreachable!("unexpected 128-bit vpermilvar op: {:?}", op),
-                    };
-                    self.operand_to_eax(&args[0]);
-                    self.state.emit("    movups (%eax), %xmm0");
-                    self.operand_to_eax(&args[1]);
-                    self.state.emit("    movups (%eax), %xmm1");
-                    self.state
-                        .emit_fmt(format_args!("    {} %xmm1, %xmm0, %xmm0", inst));
-                    self.operand_to_eax(&Operand::Value(*dptr));
-                    self.state.emit("    movups %xmm0, (%eax)");
-                } else if dest.is_some() {
-                    self.reject_value_form(op);
-                }
+            IntrinsicOp::VpermilvarPs128 => {
+                self.emit_i686_vpermilvar_128(dest, dest_ptr, args, "vpermilps", op)
+            }
+            IntrinsicOp::VpermilvarPd128 => {
+                self.emit_i686_vpermilvar_128(dest, dest_ptr, args, "vpermilpd", op)
             }
 
             // Blend with immediate (SSE4.1): blendps/blendpd/dpps/dppd (a, b, imm).
