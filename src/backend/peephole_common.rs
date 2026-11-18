@@ -395,6 +395,23 @@ pub(crate) struct LineStore {
     original: String,
     entries: Vec<LineEntry>,
     replacements: Vec<String>,
+    /// Lazily computed per-line content digests (0 = not yet computed; a
+    /// computed digest always has its low bit set so it can never be 0).
+    ///
+    /// `FileLiveness`' per-function memo keys re-hash every line of a
+    /// function on every `FileLiveness::new` — 64 pass call sites times one
+    /// string hash per line made the key derivation alone 4% of a compile's
+    /// instructions (Callgrind, 40-function mixed TU at -O1).  A line's text
+    /// changes only through [`replace`]/[`insert_line`], so the store is the
+    /// one place that can memoize the text half of those keys exactly.
+    ///
+    /// `Cell` keeps `get`-side laziness without threading `&mut` through
+    /// every reader: the store is used strictly thread-locally (each
+    /// metric-pair candidate builds its own), so no `Sync` is required.
+    ///
+    /// [`replace`]: LineStore::replace
+    /// [`insert_line`]: LineStore::insert_line
+    digests: Vec<std::cell::Cell<u64>>,
 }
 
 /// Length of `line` excluding its trailing ASCII blanks — the same set
@@ -487,11 +504,39 @@ impl LineStore {
                 line_len_without_trailing_blanks(&bytes[start..total]),
             ));
         }
+        let digests = vec![std::cell::Cell::new(0u64); entries.len()];
         LineStore {
             original: asm,
             entries,
             replacements: Vec::new(),
+            digests,
         }
+    }
+
+    /// Content digest of line `idx`'s stored text (leading indentation
+    /// included), computed on first use and cached until the line changes.
+    ///
+    /// Only equality of the underlying text is promised: equal text yields
+    /// equal digests, and a digest survives exactly as long as the text it
+    /// was computed from.  Callers fold it into wider keys (see
+    /// `FileLiveness::hash_function`), which is why it is deliberately the
+    /// raw `FxHasher` word fold of the bytes — the caller applies its own
+    /// finalizer.
+    #[inline]
+    pub(crate) fn line_digest(&self, idx: usize) -> u64 {
+        let cell = &self.digests[idx];
+        let cached = cell.get();
+        if cached != 0 {
+            return cached;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = crate::common::fx_hash::FxHasher::default();
+        self.get(idx).hash(&mut h);
+        // `| 1` reserves 0 as the "not computed" sentinel; losing one bit of
+        // the 64 is immaterial for a key that is folded twice downstream.
+        let d = h.finish() | 1;
+        cell.set(d);
+        d
     }
 
     #[inline]
@@ -529,6 +574,7 @@ impl LineStore {
     pub(crate) fn replace(&mut self, idx: usize, mut new_text: String) {
         let end = line_len_without_trailing_blanks(new_text.as_bytes());
         new_text.truncate(end);
+        self.digests[idx].set(0);
         let e = &mut self.entries[idx];
         if e.len == REPLACED {
             self.replacements[e.start as usize] = new_text;
@@ -565,6 +611,7 @@ impl LineStore {
                 len: REPLACED,
             },
         );
+        self.digests.insert(idx, std::cell::Cell::new(0));
     }
 
     /// Concatenate kept lines, each followed by `\n`.

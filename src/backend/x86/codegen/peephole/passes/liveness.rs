@@ -663,9 +663,17 @@ impl FileLiveness {
         let mut h1 = 0x243f_6a88_85a3_08d3u64 ^ len as u64;
         let mut h2 = 0x1319_8a2e_0370_7344u64 ^ (len as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
         for n in start..end {
+            // The text half of the digest comes from the store's per-line
+            // cache: it covers the raw stored text, which `trimmed` is a
+            // pure prefix-slice of (`trim_start` is itself hashed as a
+            // `LineInfo` field), so the pair (raw-text digest, LineInfo
+            // hash) separates at least every pair the old
+            // (trimmed-text, LineInfo) fold separated.  Re-hashing the
+            // string per call was 4% of all instructions on a 40-function
+            // TU; the cache makes it one cached-u64 fold per unchanged line.
             let mut line = crate::common::fx_hash::FxHasher::default();
             infos[n].hash(&mut line);
-            infos[n].trimmed(store.get(n)).hash(&mut line);
+            line.write_u64(store.line_digest(n));
             let w = line.finish();
             h1 = fold(h1, w);
             h2 = fold(h2, w ^ 0xa409_3822_299f_31d0);
