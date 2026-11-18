@@ -187,9 +187,17 @@ GP-22 (option-effect ledger, 4.5), GP-01 (`-Wattributes` truth, 4.6 — but GP-2
 first because it makes every later item a ratchet), GP-05 (macro hygiene, 4.4),
 GP-23 (macro-diff gate, 4.0), GP-09 (warning registry, 4.0).
 
-Suggested start for a single agent with one session: MB-20 (hoist `LabelRefs`:
-a one-function change worth ~30 % of compile instructions) → MB-01 → MB-05; for two agents in parallel: [MB-01, MB-04, MB-13] on the driver/linker
-side and [MB-20, MB-21, MB-05] on the backend side (disjoint files).
+Suggested start at the original baseline: MB-20 (hoist `LabelRefs`) →
+MB-01 → MB-05; for two agents in parallel, [MB-01, MB-04, MB-13] on the
+driver/linker side and [MB-20, MB-21, MB-05] on the backend side. The lazy
+reference work has landed; the original ~30% hotspot is not a current estimate.
+
+**2026-11-18 performance worklist:** see the [evidence-ranked ten-item queue](engineering/BACKLOG-ROI-2026-11-18.md).
+Current VM screens favor bounded match extension and Huffman heap codegen over
+reusing the historical nbody/LZ4 order. For compiler throughput, start with a
+fresh-solver/invalidation contract for MB-20 step 5, scope-review metric-pair
+sharing, and only screen global allocators on byte-identity and paired wall time.
+These are separate workstreams; passing a compile-cost gate is not a runtime win.
 
 ---
 
