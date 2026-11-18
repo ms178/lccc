@@ -37,23 +37,26 @@ def main(argv=None):
     flags = shlex.split(args.flags)
     if any(f in ("-o", "-c", "-S", "-E") or f.startswith("-o") for f in flags):
         parser.error("output/mode flags are owned by the harness")
-    sources = [s.resolve(strict=True) for s in args.source]
-    if len(set(sources)) != len(sources):
-        parser.error("duplicate source selection")
-    binaries = {"mine": args.mine.resolve(strict=True), "ref": args.ref.resolve(strict=True)}
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out.resolve()
-    geometry, overrides = cg.geometry()
     report = {"complete": False, "metric": "simulated compiler work; NOT wall-clock speedup",
-              "flags": flags, "geometry": geometry, "geometry_overrides": overrides,
-              "valgrind": cg.tool_identity("valgrind"), "binaries": {}, "results": [], "error": None}
+              "flags": flags, "geometry": None, "geometry_overrides": None,
+              "valgrind": None, "binaries": {}, "results": [], "error": None}
 
     def save():
         publication.atomic_bytes(out / "summary.json", (json.dumps(report, indent=2) + "\n").encode())
 
     with publication.lock(out / ".compiler-work.lock"):
+        # Invalidate any previous success before preflight, not just before
+        # compilation. A missing input or tool must not leave a stale verdict.
         save()
         try:
+            sources = [s.resolve(strict=True) for s in args.source]
+            if len(set(sources)) != len(sources):
+                raise ValueError("duplicate source selection")
+            binaries = {"mine": args.mine.resolve(strict=True), "ref": args.ref.resolve(strict=True)}
+            geometry, overrides = cg.geometry()
+            report.update(geometry=geometry, geometry_overrides=overrides, valgrind=cg.tool_identity("valgrind"))
             for name, short in (("mine", "aa"), ("ref", "bb")):
                 directory = out / short
                 directory.mkdir(exist_ok=True)
@@ -104,6 +107,7 @@ def main(argv=None):
                         pair["arms"][name] = {"command": instrument, "events": cg.parse_summary(profile),
                                               "profile_sha256": cg.schema.file_hash(profile),
                                               "assembly_sha256": hashlib.sha256(expected).hexdigest(),
+                                              "stdout_sha256": hashlib.sha256(native.stdout).hexdigest(),
                                               "stderr": result.stderr.decode(errors="replace"),
                                               "native_stderr": native.stderr.decode(errors="replace")}
                         save()
