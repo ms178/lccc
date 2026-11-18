@@ -611,6 +611,26 @@ fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) {
     }
 }
 
+/// Digest of everything a phase-1 sub-pass can observe and mutate: the line
+/// count, every line's current text and every line's metadata (`LineInfo` is
+/// `Hash`; deletions are `kind = Nop` flips in `infos`, which the store text
+/// alone would miss).  Only computed under `CCC_PEEPHOLE_VERIFY_DIRTY=1`,
+/// where it arms the honesty assertion that backs dirty-tick skipping — see
+/// [`crate::backend::peephole_common::PassTicks`].
+fn dirty_state_digest(
+    store: &crate::backend::peephole_common::LineStore,
+    infos: &[LineInfo],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::common::fx_hash::FxHasher::default();
+    store.len().hash(&mut h);
+    for i in 0..store.len() {
+        store.get(i).hash(&mut h);
+    }
+    infos.hash(&mut h);
+    h.finish()
+}
+
 fn peephole_optimize_inner(
     mut asm: String,
     ra_config: &RaConfig,
@@ -832,6 +852,62 @@ fn peephole_optimize_inner(
     // Phase 1: Iterative cheap local passes.
     let mut changed = true;
     let mut pass_count = 0;
+
+    // Pass-level dirty ticks (MB-20 step 5): a sub-pass re-runs only when a
+    // change was reported since it last started, so the fixpoint's final
+    // iteration — a pure re-verification sweep that was 27% of peephole time
+    // on the 40-function mixed TU — skips every pass that already proved
+    // itself clean on bit-identical input.  Soundness contract and both
+    // knobs are documented on `PassTicks`:
+    //   CCC_PEEPHOLE_NO_DIRTY_SKIP=1  pre-tracker behaviour (bisection, and
+    //                                 required under CCC_LCR_LIMIT, whose
+    //                                 process-global budget makes the opt-in
+    //                                 relay pass call-count-dependent);
+    //   CCC_PEEPHOLE_VERIFY_DIRTY=1   digest the state around every pass and
+    //                                 panic when one mutates it while
+    //                                 reporting "no change" (the one lie that
+    //                                 would make a skip unsound).
+    // Both are read once per function: `environ` scans inside the loop cost
+    // a scan per pass per iteration (the CCC_PEEPHOLE_RELAY lesson above).
+    let skip_enabled = std::env::var_os("CCC_PEEPHOLE_NO_DIRTY_SKIP").is_none();
+    let verify_dirty = std::env::var_os("CCC_PEEPHOLE_VERIFY_DIRTY").is_some();
+    // Shadowed (not `mut`): the thread-local test overrides only exist in
+    // test builds, and shadowing keeps the release path immutable.
+    #[cfg(test)]
+    let (skip_enabled, verify_dirty) = (
+        skip_enabled && !dirty_tick_test::no_skip(),
+        verify_dirty || dirty_tick_test::verify(),
+    );
+    let mut ticks = crate::backend::peephole_common::PassTicks::new(skip_enabled);
+    // Cumulative skip count at the end of the previous timed iteration
+    // (CCC_TIME_PEEPHOLE reporting only).
+    let mut skipped_before_iter = 0u64;
+    // One phase-1 sub-pass invocation under the dirty-tick protocol: record
+    // the start, run, verify honesty (opt-in), publish the change.  A macro
+    // rather than a closure because the call sites need simultaneous `&mut`
+    // access to `store`/`infos` (the pass), `ticks`, `trace` and `changed`.
+    macro_rules! fix1 {
+        ($name:literal, $call:expr) => {
+            if ticks.should_run($name) {
+                let pre = verify_dirty.then(|| dirty_state_digest(&store, &infos));
+                let c = $call;
+                if let Some(pre) = pre {
+                    assert!(
+                        c || pre == dirty_state_digest(&store, &infos),
+                        "peephole pass {} mutated the function but reported no change \
+                         (unsound under dirty-tick skipping)",
+                        $name
+                    );
+                }
+                if c {
+                    ticks.note_change();
+                }
+                trace($name, pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        };
+    }
+
     while changed && pass_count < max_phase1_iters && !skip_phase1 {
         let iter_start = if time_peephole {
             Some(std::time::Instant::now())
@@ -839,10 +915,26 @@ fn peephole_optimize_inner(
             None
         };
         changed = false;
-        let local_changed = if sk("combined") {
+        // Inlined dirty-tick protocol (the one `fix1!` spells for every other
+        // pass): the change flag must stay in scope as `local_changed`, which
+        // gates the entry-shape passes at the bottom of this loop.  The `sk`
+        // check comes first so a user-skipped pass never registers a start.
+        let local_changed = if sk("combined") || !ticks.should_run("combined_local_pass") {
             false
         } else {
-            local_patterns::combined_local_pass(&mut store, &mut infos)
+            let pre = verify_dirty.then(|| dirty_state_digest(&store, &infos));
+            let c = local_patterns::combined_local_pass(&mut store, &mut infos);
+            if let Some(pre) = pre {
+                assert!(
+                    c || pre == dirty_state_digest(&store, &infos),
+                    "peephole pass combined_local_pass mutated the function but \
+                     reported no change (unsound under dirty-tick skipping)"
+                );
+            }
+            if c {
+                ticks.note_change();
+            }
+            c
         };
         trace(
             "combined_local_pass",
@@ -854,34 +946,32 @@ fn peephole_optimize_inner(
         changed |= local_changed;
         if !sk("lea_mem_sib") {
             {
-                let c = local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
-                trace("fold_lea_into_memory_op", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_lea_into_memory_op",
+                    local_patterns::fold_lea_into_memory_op(&mut store, &mut infos)
+                );
             }
         }
         if !sk("scaled_index_temp") {
-            let c = relay_and_lea::fold_scaled_index_temp_into_mem(&mut store, &mut infos);
-            trace(
+            fix1!(
                 "fold_scaled_index_temp_into_mem",
-                pass_count,
-                c,
-                &store,
-                &infos,
+                relay_and_lea::fold_scaled_index_temp_into_mem(&mut store, &mut infos)
             );
-            changed |= c;
         }
         if !sk("lea_all_uses") {
             {
-                let c = local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
-                trace("fold_lea_all_uses_in_block", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_lea_all_uses_in_block",
+                    local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos)
+                );
             }
         }
         if !sk("staged_imm_alu") {
             {
-                let c = local_patterns::fold_staged_imm_into_alu(&mut store, &mut infos);
-                trace("fold_staged_imm_into_alu", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_staged_imm_into_alu",
+                    local_patterns::fold_staged_imm_into_alu(&mut store, &mut infos)
+                );
             }
         }
         if !sk("shl_sib") {
@@ -889,93 +979,85 @@ fn peephole_optimize_inner(
             // operand, which the LEA-splicing passes then fold into whatever
             // consumes the address.  With `mem_rmw` this is what turns
             // `table[idx]++` into one `addq $1,(base,idx,8)`.
-            let c = local_patterns::fold_shift_into_sib(&mut store, &mut infos);
-            trace("fold_shift_into_sib", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fold_shift_into_sib",
+                local_patterns::fold_shift_into_sib(&mut store, &mut infos)
+            );
         }
         if !sk("mem_rmw") {
             // Memory read-modify-write: `mov MEM,%d; <inc %d>; mov %d,MEM`
             // -> `add $imm,MEM`.  The `table[idx]++` shape.
-            let c = memory_fold::fold_memory_rmw(&mut store, &mut infos);
-            trace("fold_memory_rmw", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fold_memory_rmw",
+                memory_fold::fold_memory_rmw(&mut store, &mut infos)
+            );
         }
         if !sk("fuse_movq_ext") {
             {
-                let c = local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
-                trace("fuse_movq_ext_truncation", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fuse_movq_ext_truncation",
+                    local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos)
+                );
             }
             // VEX 3-operand exploitation: `movsd %A,%D; vOP %S,%D,%D` ->
             // `vOP %S,%A,%D`. Removes the 2-operand-ISA staging copy the
             // scalar FP emitters insert before every binary op.
             {
-                let c = local_patterns::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fuse_mov_scalar_fp_into_vex_op",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos)
                 );
-                changed |= c;
             }
             // Memory-source half: fold a dead staged load into a commutative
             // scalar VEX op's memory operand slot.
             {
-                let c = local_patterns::fold_scalar_fp_memory_into_vex_op(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_scalar_fp_memory_into_vex_op",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::fold_scalar_fp_memory_into_vex_op(&mut store, &mut infos)
                 );
-                changed |= c;
             }
             // Broadcast half: fold a dead staged scalar load into an AVX
             // broadcast-from-memory (`vmovsd MEM,%xmmD; vbroadcastsd %xmmD,%ymmM`
             // -> `vbroadcastsd MEM,%ymmM`). Same skip key: one VEX mem-fold family.
             {
-                let c = local_patterns::fold_broadcast_load_into_broadcast(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_broadcast_load_into_broadcast",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::fold_broadcast_load_into_broadcast(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("fp_roundtrips") {
             {
-                let c = local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
-                trace("eliminate_fp_xmm_roundtrips", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "eliminate_fp_xmm_roundtrips",
+                    local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos)
+                );
             }
         }
         if !sk("fp_mem_fold") {
             {
-                let c = memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
-                trace("fold_fp_memory_operands", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_fp_memory_operands",
+                    memory_fold::fold_fp_memory_operands(&mut store, &mut infos)
+                );
             }
         }
         if !sk("fp_reg_mem_fold") {
             {
-                let c = memory_fold::fold_fp_register_loads(&mut store, &mut infos);
-                trace("fold_fp_register_loads", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_fp_register_loads",
+                    memory_fold::fold_fp_register_loads(&mut store, &mut infos)
+                );
             }
         }
         // Load straight into the register a whole-register copy fills from
         // the loaded one (`movsd M, %xmmA; …; movapd %xmmA, %xmmB`).
         if !sk("fp_load_retarget") {
             {
-                let c = memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos);
-                trace("retarget_fp_load_into_copy", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "retarget_fp_load_into_copy",
+                    memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos)
+                );
             }
         }
         // Fold a single-use scalar FP load into an adjacent scalar FMA's
@@ -983,9 +1065,10 @@ fn peephole_optimize_inner(
         // dot-product src2 shape is just the most common one).
         if !sk("fma_mem_fold") {
             {
-                let c = memory_fold::fold_fma_memory_operand(&mut store, &mut infos);
-                trace("fold_fma_memory_operand", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_fma_memory_operand",
+                    memory_fold::fold_fma_memory_operand(&mut store, &mut infos)
+                );
             }
         }
         // Constant-accumulator FMA shaping: 213-form with a just-loaded
@@ -993,26 +1076,16 @@ fn peephole_optimize_inner(
         // memory slot, and repeated %xmm0 zeroings die block-locally.
         if !sk("fma132_zero") {
             {
-                let c = memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_zero_addend_fma213_to_132",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos)
                 );
-                changed |= c;
             }
             {
-                let c = memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "eliminate_redundant_xmm0_zeroing",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         // Repeated RIP-relative loads of the same FP pool constant become a
@@ -1020,15 +1093,10 @@ fn peephole_optimize_inner(
         // NOP slot must dominate all uses by fall-through).
         if !sk("fp_const_hoist") {
             {
-                let c = memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "hoist_repeated_fp_constant_loads",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
@@ -1036,103 +1104,90 @@ fn peephole_optimize_inner(
         // full pass mix — root cause still open, so keep it off by default.
         if relay_opt_in && !sk("load_copy_relay") {
             {
-                let c = memory_fold::fold_load_copy_relay(&mut store, &mut infos);
-                trace("fold_load_copy_relay", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_load_copy_relay",
+                    memory_fold::fold_load_copy_relay(&mut store, &mut infos)
+                );
             }
         }
         if !sk("rcx_copy") {
             {
-                let c = local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
-                trace("eliminate_rcx_address_copy", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "eliminate_rcx_address_copy",
+                    local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos)
+                );
             }
         }
         if !sk("ptr_deref") {
             {
-                let c = local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_ptr_deref_through_stack",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("fp_spill") {
             {
-                let c = local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "eliminate_fp_spill_around_load",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("fuse_copy_op") {
             {
-                let c = local_patterns::fuse_copy_and_operation(&mut store, &mut infos);
-                trace("fuse_copy_and_operation", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fuse_copy_and_operation",
+                    local_patterns::fuse_copy_and_operation(&mut store, &mut infos)
+                );
             }
         }
         if !sk("staged_add_lea") {
             {
-                let c = local_patterns::fuse_staged_add_and_relay(&mut store, &mut infos);
-                trace("fuse_staged_add_and_relay", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fuse_staged_add_and_relay",
+                    local_patterns::fuse_staged_add_and_relay(&mut store, &mut infos)
+                );
             }
         }
         if !sk("load_lea_add") {
             {
-                let c = local_patterns::fuse_load_lea_add(&mut store, &mut infos);
-                trace("fuse_load_lea_add", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fuse_load_lea_add",
+                    local_patterns::fuse_load_lea_add(&mut store, &mut infos)
+                );
             }
         }
         if !sk("load_lea_base") {
             {
-                let c = local_patterns::fuse_load_lea_into_base(&mut store, &mut infos);
-                trace("fuse_load_lea_into_base", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fuse_load_lea_into_base",
+                    local_patterns::fuse_load_lea_into_base(&mut store, &mut infos)
+                );
             }
         }
         if !sk("fp_hoist") {
             {
-                let c = local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "promote_loop_invariant_fp_load",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("dead_signext") {
             {
-                let c = local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "eliminate_dead_sign_extensions",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("dead_leaq") {
             {
-                let c = local_patterns::eliminate_redundant_leaq(&store, &mut infos);
-                trace("eliminate_redundant_leaq", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "eliminate_redundant_leaq",
+                    local_patterns::eliminate_redundant_leaq(&store, &mut infos)
+                );
             }
         }
         // Symbol-LEA CSE for every GPR and generic load->ALU memory-operand
@@ -1140,50 +1195,43 @@ fn peephole_optimize_inner(
         // load_op_fuse.rs for the soundness argument.
         if !sk("symbol_lea_cse") {
             {
-                let c = load_op_fuse::eliminate_redundant_symbol_lea(&store, &mut infos);
-                trace(
+                fix1!(
                     "eliminate_redundant_symbol_lea",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    load_op_fuse::eliminate_redundant_symbol_lea(&store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("recurrence_inplace") {
             {
-                let c = load_op_fuse::fold_recurrence_update(&mut store, &mut infos);
-                trace("fold_recurrence_update", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_recurrence_update",
+                    load_op_fuse::fold_recurrence_update(&mut store, &mut infos)
+                );
             }
         }
         if !sk("copy_dying_operand") {
             {
-                let c = load_op_fuse::fold_copy_into_dying_operand(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_copy_into_dying_operand",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    load_op_fuse::fold_copy_into_dying_operand(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("load_alu_fuse") {
-            let c = load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
-            trace("fuse_load_into_alu", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fuse_load_into_alu",
+                load_op_fuse::fuse_load_into_alu(&mut store, &mut infos)
+            );
         }
         // Vector (SSE/AVX) load -> ALU memory-operand fusion: the packed and
         // scalar half of the transform above, which cannot share its GP-only
         // register model.  See vector_load_op_fuse.rs for the soundness
         // argument and the liveness-monotonicity proof.
         if !sk("vector_load_fuse") {
-            let c = vector_load_op_fuse::fuse_vector_load_into_op(&mut store, &mut infos);
-            trace("fuse_vector_load_into_op", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fuse_vector_load_into_op",
+                vector_load_op_fuse::fuse_vector_load_into_op(&mut store, &mut infos)
+            );
         }
         // Load -> LEA-add in-place (`mov MEM,%t; leaq (%acc,%t,1),%s` ->
         // `add MEM,%acc` + rename the chain uses). One transform, one switch:
@@ -1192,9 +1240,10 @@ fn peephole_optimize_inner(
         // the pre-existing `load_lea_add` switch; see load_op_fuse.rs for this
         // transform's soundness argument).
         if !sk("load_lea_inplace") {
-            let c = load_op_fuse::fuse_load_into_lea_add(&mut store, &mut infos);
-            trace("fuse_load_into_lea_add", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fuse_load_into_lea_add",
+                load_op_fuse::fuse_load_into_lea_add(&mut store, &mut infos)
+            );
         }
         // `fuse_zero_ext_cmp` has its OWN skip name. It used to share
         // `load_alu_fuse` with `fuse_load_into_alu`, which made the two
@@ -1202,23 +1251,26 @@ fn peephole_optimize_inner(
         // both, so a differential attributed to this fold could actually have
         // been the sibling's win. One transform, one switch.
         if !sk("zero_ext_cmp") {
-            let c = load_op_fuse::fuse_zero_ext_cmp(&mut store, &mut infos);
-            trace("fuse_zero_ext_cmp", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fuse_zero_ext_cmp",
+                load_op_fuse::fuse_zero_ext_cmp(&mut store, &mut infos)
+            );
         }
         if !sk("zero_ext_imm_cmp") {
-            let c = load_op_fuse::narrow_zero_ext_imm_cmp(&mut store, &mut infos);
-            trace("narrow_zero_ext_imm_cmp", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "narrow_zero_ext_imm_cmp",
+                load_op_fuse::narrow_zero_ext_imm_cmp(&mut store, &mut infos)
+            );
         }
         // Generic move-relay elimination and windowed lea->memory folding.
         // Both are block-local; see relay_and_lea.rs for the two deadness
         // proofs (block-local write-before-read, whole-function uniqueness).
         if !sk("move_relay") {
             {
-                let c = relay_and_lea::eliminate_move_relays(&mut store, &mut infos);
-                trace("eliminate_move_relays", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "eliminate_move_relays",
+                    relay_and_lea::eliminate_move_relays(&mut store, &mut infos)
+                );
             }
         }
         if !sk("lea_load_window") {
@@ -1228,19 +1280,22 @@ fn peephole_optimize_inner(
             // absorb the staged address (csv/rbtree main's
             // `leaq 4(%r13),%r10; …; cltq; movl %eax,(%r10)` chain).
             {
-                let c = narrow_copy_fold::eliminate_dead_inplace_ext(&mut store, &mut infos);
-                trace("eliminate_dead_inplace_ext", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "eliminate_dead_inplace_ext",
+                    narrow_copy_fold::eliminate_dead_inplace_ext(&mut store, &mut infos)
+                );
             }
             {
-                let c = relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
-                trace("fold_lea_into_load", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_lea_into_load",
+                    relay_and_lea::fold_lea_into_load(&mut store, &mut infos)
+                );
             }
             if !sk("cse_symbol_lea") {
-                let c = relay_and_lea::cse_symbol_lea(&mut store, &mut infos);
-                trace("cse_symbol_lea", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "cse_symbol_lea",
+                    relay_and_lea::cse_symbol_lea(&mut store, &mut infos)
+                );
             }
         }
         // Flags-aware cleanups: copy+add -> lea (also removes a flags write
@@ -1248,9 +1303,10 @@ fn peephole_optimize_inner(
         // boolean round-trip in front of a cmov, and copy+mask -> movzx.
         if !sk("producer_retarget") {
             {
-                let c = relay_and_lea::retarget_producer_into_copy(&mut store, &mut infos);
-                trace("retarget_producer_into_copy", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "retarget_producer_into_copy",
+                    relay_and_lea::retarget_producer_into_copy(&mut store, &mut infos)
+                );
             }
         }
         // Loop-latch shape the two passes above decline: the copy dest is
@@ -1260,56 +1316,57 @@ fn peephole_optimize_inner(
         // of the following %rB reads.
         if !sk("lea_base_fold") {
             {
-                let c = relay_and_lea::fold_copy_into_lea_base(&mut store, &mut infos);
-                trace("fold_copy_into_lea_base", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_copy_into_lea_base",
+                    relay_and_lea::fold_copy_into_lea_base(&mut store, &mut infos)
+                );
             }
         }
         if !sk("copy_add_lea") {
             {
-                let c = flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
-                trace("fold_copy_add_into_lea", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_copy_add_into_lea",
+                    flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos)
+                );
             }
         }
         if !sk("lea_add_lea") {
             {
-                let c = flag_peepholes::fold_lea_add_into_lea(&mut store, &mut infos);
-                trace("fold_lea_add_into_lea", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_lea_add_into_lea",
+                    flag_peepholes::fold_lea_add_into_lea(&mut store, &mut infos)
+                );
             }
         }
         if !sk("inplace_add_copy_lea") {
             {
-                let c = flag_peepholes::fold_inplace_add_copy_into_lea(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_inplace_add_copy_into_lea",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    flag_peepholes::fold_inplace_add_copy_into_lea(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("copy_shift_lea") {
             {
-                let c = flag_peepholes::fold_copy_shift_into_lea(&mut store, &mut infos);
-                trace("fold_copy_shift_into_lea", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_copy_shift_into_lea",
+                    flag_peepholes::fold_copy_shift_into_lea(&mut store, &mut infos)
+                );
             }
         }
         if !sk("setcc_cmov") {
             {
-                let c = flag_peepholes::fold_setcc_test_cmov(&mut store, &mut infos);
-                trace("fold_setcc_test_cmov", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_setcc_test_cmov",
+                    flag_peepholes::fold_setcc_test_cmov(&mut store, &mut infos)
+                );
             }
         }
         if !sk("conditional_increment") {
-            let c = flag_peepholes::fold_conditional_increment(&mut store, &mut infos);
-            trace("fold_conditional_increment", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fold_conditional_increment",
+                flag_peepholes::fold_conditional_increment(&mut store, &mut infos)
+            );
         }
         // Sound dead-write elimination (LEAs, widened copies, setCC) and
         // repeated-load reuse; both use the relay/lea deadness proofs.
@@ -1318,9 +1375,10 @@ fn peephole_optimize_inner(
         // shuffle the allocator emits at every function entry).
         if !sk("copy_coalesce") {
             {
-                let c = copy_coalesce::coalesce_register_copies(&mut store, &mut infos);
-                trace("coalesce_register_copies", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "coalesce_register_copies",
+                    copy_coalesce::coalesce_register_copies(&mut store, &mut infos)
+                );
             }
         }
         // The vector counterpart of the two GP copy passes above.  The codegen
@@ -1339,15 +1397,17 @@ fn peephole_optimize_inner(
         // form needs a destination, and `pshufd` does not.  Runs before the
         // copy bracket and propagation passes so they never see the pair.
         {
-            let c = vector_broadcast::fold_broadcast_copies(&mut store, &mut infos);
-            trace("fold_broadcast_copies", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fold_broadcast_copies",
+                vector_broadcast::fold_broadcast_copies(&mut store, &mut infos)
+            );
         }
         if !sk("vector_copy_widen") {
             {
-                let c = vector_copy::widen_private_vector_copies(&mut store, &mut infos);
-                trace("widen_private_vector_copies", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "widen_private_vector_copies",
+                    vector_copy::widen_private_vector_copies(&mut store, &mut infos)
+                );
             }
         }
         // The FMA accumulator bracket.  Every FMA form reads its destination as
@@ -1359,38 +1419,38 @@ fn peephole_optimize_inner(
         // widening so the copy spellings it matches are already normalised.
         if !sk("vector_copy_fma") {
             {
-                let c = vector_copy::coalesce_packed_fma_prefix(&mut store, &mut infos);
-                trace("coalesce_packed_fma_prefix", pass_count, c, &store, &infos);
-                changed |= c;
-                let c = vector_copy::reassociate_fma_accumulator(&mut store, &mut infos);
-                trace("reassociate_fma_accumulator", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "coalesce_packed_fma_prefix",
+                    vector_copy::coalesce_packed_fma_prefix(&mut store, &mut infos)
+                );
+                fix1!(
+                    "reassociate_fma_accumulator",
+                    vector_copy::reassociate_fma_accumulator(&mut store, &mut infos)
+                );
             }
         }
         if !sk("vector_copy_retarget") {
             {
-                let c = vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_composed_dword_shuffles",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos)
                 );
-                changed |= c;
-                let c = vector_copy::fold_uniform_vector_shift(&mut store, &mut infos);
-                trace("fold_uniform_vector_shift", pass_count, c, &store, &infos);
-                changed |= c;
-                let c = vector_copy::retarget_vex_result(&mut store, &mut infos);
-                trace("retarget_vex_result", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_uniform_vector_shift",
+                    vector_copy::fold_uniform_vector_shift(&mut store, &mut infos)
+                );
+                fix1!(
+                    "retarget_vex_result",
+                    vector_copy::retarget_vex_result(&mut store, &mut infos)
+                );
             }
         }
         if !sk("vector_copy_bracket") {
             {
-                let c = vector_copy::coalesce_vector_brackets(&mut store, &mut infos);
-                trace("coalesce_vector_brackets", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "coalesce_vector_brackets",
+                    vector_copy::coalesce_vector_brackets(&mut store, &mut infos)
+                );
             }
         }
         // Full-width vector reloads of a just-stored over-aligned frame
@@ -1408,78 +1468,75 @@ fn peephole_optimize_inner(
         // 1 695 212 on tests/simd/vector_home_call_loop.c.  This ordering buys
         // that difference without adding a single new pass invocation.
         if !sk("aligned_vec_reload") {
-            let c = aligned_vector_reload::forward_aligned_vector_reload(&mut store, &mut infos);
-            trace("aligned_vec_reload", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "aligned_vec_reload",
+                aligned_vector_reload::forward_aligned_vector_reload(&mut store, &mut infos)
+            );
         }
         if !sk("vector_copy_prop") {
             {
-                let c = vector_copy::propagate_vector_copies(&mut store, &mut infos);
-                trace("propagate_vector_copies", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "propagate_vector_copies",
+                    vector_copy::propagate_vector_copies(&mut store, &mut infos)
+                );
             }
         }
         if !sk("vector_copy_dead") {
             {
-                let c = vector_copy::eliminate_dead_vector_copies(&store, &mut infos);
-                trace(
+                fix1!(
                     "eliminate_dead_vector_copies",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    vector_copy::eliminate_dead_vector_copies(&store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("vzeroupper_entry_state") {
             {
-                let c = vector_copy::elide_vzeroupper_without_upper_writes(&store, &mut infos);
-                trace(
+                fix1!(
                     "elide_vzeroupper_without_upper_writes",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    vector_copy::elide_vzeroupper_without_upper_writes(&store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("dead_pure_writes") {
             {
-                let c = dead_writes::eliminate_dead_pure_writes(&store, &mut infos);
-                trace("eliminate_dead_pure_writes", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "eliminate_dead_pure_writes",
+                    dead_writes::eliminate_dead_pure_writes(&store, &mut infos)
+                );
             }
         }
         if !sk("dead_flag_writes") {
             {
-                let c = dead_writes::eliminate_dead_flag_writes(&store, &mut infos);
-                trace("eliminate_dead_flag_writes", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "eliminate_dead_flag_writes",
+                    dead_writes::eliminate_dead_flag_writes(&store, &mut infos)
+                );
             }
         }
         // Give the stronger branch fusion first ownership of materialized
         // booleans, before load/test folding erases the reload it proves.
         if !sk("cmp_branch") {
-            let c = compare_branch::fuse_compare_and_branch(&mut store, &mut infos);
-            trace("fuse_compare_and_branch", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fuse_compare_and_branch",
+                compare_branch::fuse_compare_and_branch(&mut store, &mut infos)
+            );
         }
         if !sk("load_test_cmp") {
             {
-                let c = dead_writes::fold_load_test_into_cmp(&mut store, &mut infos);
-                trace("fold_load_test_into_cmp", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_load_test_into_cmp",
+                    dead_writes::fold_load_test_into_cmp(&mut store, &mut infos)
+                );
             }
         }
         // After the load/test fold, so `movsbq m, %r; testb; setne; movzbl;
         // add` first becomes `cmpb $0, m` and then `cmpb $1, m; sbb $-1`
         // (in the other order the register compare would strand the load).
         if !sk("setcc_increment") {
-            let c = flag_peepholes::fold_setcc_increment(&mut store, &mut infos);
-            trace("fold_setcc_increment", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fold_setcc_increment",
+                flag_peepholes::fold_setcc_increment(&mut store, &mut infos)
+            );
         }
         // The carry twins of that fold (`s = a + b; hi += s < a`): drop the
         // compare that recomputes the carry of the add before it, turn the
@@ -1487,41 +1544,41 @@ fn peephole_optimize_inner(
         // follows a carry-in into it.  Any order is sound; this one settles
         // in a single iteration.
         if !sk("multiword") {
-            let c = multiword::fold_carry_compare(&mut store, &mut infos);
-            trace("fold_carry_compare", pass_count, c, &store, &infos);
-            changed |= c;
-            let c = multiword::fold_carry_into_adc(&mut store, &mut infos);
-            trace("fold_carry_into_adc", pass_count, c, &store, &infos);
-            changed |= c;
-            let c = multiword::fold_carry_addend(&mut store, &mut infos);
-            trace("fold_carry_addend", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "fold_carry_compare",
+                multiword::fold_carry_compare(&mut store, &mut infos)
+            );
+            fix1!(
+                "fold_carry_into_adc",
+                multiword::fold_carry_into_adc(&mut store, &mut infos)
+            );
+            fix1!(
+                "fold_carry_addend",
+                multiword::fold_carry_addend(&mut store, &mut infos)
+            );
         }
         if !sk("acc_roundtrip") {
             {
-                let c = dead_writes::fold_accumulator_roundtrip(&mut store, &mut infos);
-                trace("fold_accumulator_roundtrip", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_accumulator_roundtrip",
+                    dead_writes::fold_accumulator_roundtrip(&mut store, &mut infos)
+                );
             }
         }
         if !sk("load_reuse") {
             {
-                let c = dead_writes::reuse_redundant_loads(&mut store, &mut infos);
-                trace("reuse_redundant_loads", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "reuse_redundant_loads",
+                    dead_writes::reuse_redundant_loads(&mut store, &mut infos)
+                );
             }
         }
         if !sk("flags_compare") {
             {
-                let c = flag_peepholes::fold_redundant_flags_compare(&store, &mut infos);
-                trace(
+                fix1!(
                     "fold_redundant_flags_compare",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    flag_peepholes::fold_redundant_flags_compare(&store, &mut infos)
                 );
-                changed |= c;
             }
         }
         // Dedicated switch: the sign-CMOV fold has its own flag-lifetime
@@ -1530,132 +1587,103 @@ fn peephole_optimize_inner(
         // walk, not the sign/SF proof this one performs).
         if !sk("sign_test_cmov") {
             {
-                let c = flag_peepholes::fold_arithmetic_test_sign_cmov(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_arithmetic_test_sign_cmov",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    flag_peepholes::fold_arithmetic_test_sign_cmov(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("self_test") {
             {
-                let c = flag_peepholes::eliminate_redundant_self_test(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "eliminate_redundant_self_test",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    flag_peepholes::eliminate_redundant_self_test(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("narrow_signext") {
             {
-                let c = flag_peepholes::narrow_dead_sign_extension(&mut store, &mut infos);
-                trace("narrow_dead_sign_extension", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "narrow_dead_sign_extension",
+                    flag_peepholes::narrow_dead_sign_extension(&mut store, &mut infos)
+                );
             }
         }
         if !sk("copy_mask_movz") {
             {
-                let c = flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_copy_and_mask_into_movz",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("copy_mask_test") {
             {
-                let c = flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_copy_and_mask_into_test",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("load_mask_test") {
-            let c = load_mask_test::fold_load_mask_into_memory_test(&mut store, &mut infos);
-            trace(
+            fix1!(
                 "fold_load_mask_into_memory_test",
-                pass_count,
-                c,
-                &store,
-                &infos,
+                load_mask_test::fold_load_mask_into_memory_test(&mut store, &mut infos)
             );
-            changed |= c;
         }
         if !sk("base_index") {
             {
-                let c = local_patterns::fold_base_index_addressing(&mut store, &mut infos);
-                trace("fold_base_index_addressing", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_base_index_addressing",
+                    local_patterns::fold_base_index_addressing(&mut store, &mut infos)
+                );
             }
         }
         if !sk("acc_alu") {
             {
-                let c = local_patterns::fold_accumulator_alu_store(&mut store, &mut infos);
-                trace("fold_accumulator_alu_store", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_accumulator_alu_store",
+                    local_patterns::fold_accumulator_alu_store(&mut store, &mut infos)
+                );
             }
         }
         if !sk("phi_coalesce") {
             {
-                let c = local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "coalesce_phi_register_copies",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::coalesce_phi_register_copies(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if !sk("signext_move") {
             {
-                let c = local_patterns::fuse_signext_and_move(&mut store, &mut infos);
-                trace("fuse_signext_and_move", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fuse_signext_and_move",
+                    local_patterns::fuse_signext_and_move(&mut store, &mut infos)
+                );
             }
         }
         if !sk("ext_chain") {
             // `ext S,%X; ext %X_w,%Y` -> `ext S,%Y`; runs first so the
             // narrowing below sees the collapsed form.
-            let c = local_patterns::collapse_extension_chains(&mut store, &mut infos);
-            trace("collapse_extension_chains", pass_count, c, &store, &infos);
-            changed |= c;
+            fix1!(
+                "collapse_extension_chains",
+                local_patterns::collapse_extension_chains(&mut store, &mut infos)
+            );
         }
         if !sk("signext_narrow") {
             // `movsbq SRC,%rA; movl %eA,%eB` -> `movsbl SRC,%eB` (%rA dead).
-            let c = local_patterns::narrow_signext_into_32bit_copy(&mut store, &mut infos);
-            trace(
+            fix1!(
                 "narrow_signext_into_32bit_copy",
-                pass_count,
-                c,
-                &store,
-                &infos,
+                local_patterns::narrow_signext_into_32bit_copy(&mut store, &mut infos)
             );
-            changed |= c;
         }
         if !sk("inc_chain") {
             {
-                let c = local_patterns::collapse_increment_chain(&mut store, &mut infos);
-                trace("collapse_increment_chain", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "collapse_increment_chain",
+                    local_patterns::collapse_increment_chain(&mut store, &mut infos)
+                );
             }
         }
         // add_signext (fuse_add_sign_extend) REMOVED: it rewrote
@@ -1669,33 +1697,24 @@ fn peephole_optimize_inner(
         // pass is deleted rather than gated.
         if !sk("copy_shift_back") {
             {
-                let c = local_patterns::fold_copy_shift_copyback(&mut store, &mut infos);
-                trace("fold_copy_shift_copyback", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_copy_shift_copyback",
+                    local_patterns::fold_copy_shift_copyback(&mut store, &mut infos)
+                );
             }
         }
         if !sk("shift_signext") {
-            let c = local_patterns::fold_copy_logical_shift_signext(&mut store, &mut infos);
-            trace(
+            fix1!(
                 "fold_copy_logical_shift_signext",
-                pass_count,
-                c,
-                &store,
-                &infos,
+                local_patterns::fold_copy_logical_shift_signext(&mut store, &mut infos)
             );
-            changed |= c;
         }
         if !sk("xor_move_fold") {
             {
-                let c = local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "fold_zero_extended_xor_moves",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         // Copy-into-RMW coalescing: `mov %S,%D` feeding a read-modify-write
@@ -1708,108 +1727,107 @@ fn peephole_optimize_inner(
         // commutative dying-operand shapes — this pass takes the remainder.
         if !sk("copy_rmw_coalesce") {
             {
-                let c = relay_and_lea::coalesce_copy_into_rmw(&mut store, &mut infos);
-                trace("coalesce_copy_into_rmw", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "coalesce_copy_into_rmw",
+                    relay_and_lea::coalesce_copy_into_rmw(&mut store, &mut infos)
+                );
             }
         }
         if !sk("rotate_idiom") {
             {
-                let c = local_patterns::fold_rotate_idiom(&mut store, &mut infos);
-                trace("fold_rotate_idiom", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_rotate_idiom",
+                    local_patterns::fold_rotate_idiom(&mut store, &mut infos)
+                );
             }
         }
         if !sk("vec_self_move") {
             {
-                let c = local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
-                trace("eliminate_vector_self_moves", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "eliminate_vector_self_moves",
+                    local_patterns::eliminate_vector_self_moves(&mut store, &mut infos)
+                );
             }
         }
         if !sk("cascaded_shifts") {
             {
-                let c = local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
-                trace("fold_cascaded_shifts", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_cascaded_shifts",
+                    local_patterns::fold_cascaded_shifts(&mut store, &mut infos)
+                );
             }
         }
         if !sk("gpr_hoist") {
             {
-                let c = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "hoist_loop_invariant_gpr_load",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos)
                 );
-                changed |= c;
             }
         }
         if local_changed || pass_count == 0 {
             if !sk("push_pop") {
                 {
-                    let c = push_pop::eliminate_push_pop_pairs(&store, &mut infos);
-                    trace("eliminate_push_pop_pairs", pass_count, c, &store, &infos);
-                    changed |= c;
+                    fix1!(
+                        "eliminate_push_pop_pairs",
+                        push_pop::eliminate_push_pop_pairs(&store, &mut infos)
+                    );
                 }
             }
             if !sk("highbit_sub") {
-                let c = local_patterns::fold_highbit_subs(&mut store, &mut infos);
-                trace("fold_highbit_subs", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_highbit_subs",
+                    local_patterns::fold_highbit_subs(&mut store, &mut infos)
+                );
             }
             if !sk("guarded_scan") {
-                let c = local_patterns::fold_guarded_scan_selects(&mut store, &mut infos);
-                trace("fold_guarded_scan_selects", pass_count, c, &store, &infos);
-                changed |= c;
+                fix1!(
+                    "fold_guarded_scan_selects",
+                    local_patterns::fold_guarded_scan_selects(&mut store, &mut infos)
+                );
             }
             if !sk("scan_copy") {
-                let c = local_patterns::retarget_preloaded_scan_copies(&mut store, &mut infos);
-                trace(
+                fix1!(
                     "retarget_preloaded_scan_copies",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    local_patterns::retarget_preloaded_scan_copies(&mut store, &mut infos)
                 );
-                changed |= c;
             }
             if !sk("dead_scratch_saves") {
-                let c = push_pop::eliminate_dead_scratch_saves(&store, &mut infos);
-                trace(
+                fix1!(
                     "eliminate_dead_scratch_saves",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
+                    push_pop::eliminate_dead_scratch_saves(&store, &mut infos)
                 );
-                changed |= c;
             }
             if !sk("binop_push_pop") {
                 {
-                    let c = push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
-                    trace(
+                    fix1!(
                         "eliminate_binop_push_pop_pattern",
-                        pass_count,
-                        c,
-                        &store,
-                        &infos,
+                        push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos)
                     );
-                    changed |= c;
                 }
             }
         }
         if let Some(s) = iter_start {
+            // The skip count makes the dirty-tick savings directly visible in
+            // the same instrument that motivated them (iteration 1 was a pure
+            // re-verification sweep: 108.7 of 404.6 ms on the 40-function
+            // mixed TU, zero changes); `skipped()` is cumulative, so report
+            // the per-iteration delta.
+            let skipped = ticks.skipped();
             lccc::cli::stderr_line(format_args!(
-                "[PEEPHOLE-TIME] phase1 iteration {}: {:.1} ms",
+                "[PEEPHOLE-TIME] phase1 iteration {}: {:.1} ms ({} clean sub-pass runs skipped)",
                 pass_count,
-                s.elapsed().as_secs_f64() * 1e3
+                s.elapsed().as_secs_f64() * 1e3,
+                skipped - skipped_before_iter
             ));
+            skipped_before_iter = skipped;
         }
         pass_count += 1;
     }
+    // Publish the skip count so the equality oracle can prove it compared a
+    // run where skipping actually fired (not two identical no-skip runs).
+    #[cfg(test)]
+    dirty_tick_test::record_skipped(ticks.skipped());
 
     // Phase 2: Expensive global passes (run once)
     let phase2_start = if time_peephole {
@@ -6572,7 +6590,70 @@ mod regression_tests {
 mod debug_adjacency_tests;
 
 #[cfg(test)]
+mod dirty_ticks_tests;
+
+#[cfg(test)]
 mod scalar_transfer_tests;
+
+/// Thread-local test overrides for the dirty-tick knobs, the `test_skips`
+/// pattern: `std::env::set_var` is unsafe under the multithreaded harness
+/// (edition 2024), so tests force the modes through per-thread state that
+/// `peephole_optimize_inner` consults after the env reads.  Single-text
+/// `peephole_optimize` runs on the caller's thread, so the overrides are
+/// visible to the code under test (same constraint as `test_skips`).
+#[cfg(test)]
+pub(crate) mod dirty_tick_test {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Force `CCC_PEEPHOLE_NO_DIRTY_SKIP` semantics on this thread.
+        static FORCE_NO_SKIP: Cell<bool> = const { Cell::new(false) };
+        /// Force `CCC_PEEPHOLE_VERIFY_DIRTY` semantics on this thread.
+        static FORCE_VERIFY: Cell<bool> = const { Cell::new(false) };
+        /// Skipped-start count of the most recent phase-1 fixpoint on this
+        /// thread (proves the equality oracle is not vacuous).
+        static LAST_SKIPPED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Restores both modes on drop (panics included).
+    pub(crate) struct ModeGuard {
+        no_skip: bool,
+        verify: bool,
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            FORCE_NO_SKIP.with(|f| f.set(self.no_skip));
+            FORCE_VERIFY.with(|f| f.set(self.verify));
+        }
+    }
+
+    /// Force the given modes on this thread until the guard drops.
+    #[must_use]
+    pub(crate) fn force_modes(no_skip: bool, verify: bool) -> ModeGuard {
+        let guard = ModeGuard {
+            no_skip: FORCE_NO_SKIP.with(|f| f.replace(no_skip)),
+            verify: FORCE_VERIFY.with(|f| f.replace(verify)),
+        };
+        guard
+    }
+
+    pub(super) fn no_skip() -> bool {
+        FORCE_NO_SKIP.with(Cell::get)
+    }
+
+    pub(super) fn verify() -> bool {
+        FORCE_VERIFY.with(Cell::get)
+    }
+
+    pub(super) fn record_skipped(n: u64) {
+        LAST_SKIPPED.with(|c| c.set(n));
+    }
+
+    pub(crate) fn last_skipped() -> u64 {
+        LAST_SKIPPED.with(Cell::get)
+    }
+}
 
 /// Test-only, per-thread counterpart of `CCC_PEEPHOLE_SKIP` (the env var is
 /// process-global and races between parallel tests). Pipeline tests that pin

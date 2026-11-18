@@ -233,6 +233,22 @@ passes; the backend peepholes are documented per backend
   files `-chain`/`-orig` so an explored function keeps both candidates instead
   of one overwriting the other.
 
+- **Phase-1 dirty-tick skipping** (x86-64, MB-20 step 5) — the peephole's
+  phase-1 fixpoint re-runs a sub-pass only when a change was reported since
+  that pass last started; the final convergence iteration (a pure
+  re-verification sweep, measured at 27% of peephole time on a 40-function
+  mixed TU) skips every pass that already proved itself clean on
+  bit-identical input. Soundness contract documented on
+  `backend::peephole_common::PassTicks`; the equality oracle lives in
+  `peephole/passes/dirty_ticks_tests.rs`. Two knobs:
+  `CCC_PEEPHOLE_NO_DIRTY_SKIP=1` restores the pre-tracker behaviour (for
+  bisection, and required under `CCC_LCR_LIMIT`, whose process-global budget
+  makes the opt-in relay pass call-count-dependent);
+  `CCC_PEEPHOLE_VERIFY_DIRTY=1` digests the function state around every
+  executed pass and panics if one mutates it while reporting "no change" —
+  the one lie that would make a skip unsound. `CCC_TIME_PEEPHOLE=1` reports
+  the per-iteration skip count on its `phase1 iteration` lines.
+
 - **Identical basic-block merging** (`merge_identical_blocks`) — a block is
   deleted and its predecessors retargeted when its instruction text matches
   another block's and either (a) both have the **same non-empty predecessor
