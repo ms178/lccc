@@ -90,6 +90,17 @@ jobs:
         env:
           LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
         run: bash scripts/ci_provision_toolchain.sh
+      # Keep the bundle for system headers and multilib, but do not time
+      # whatever GCC 16 snapshot the runner's apt archive happened to have.
+      - name: Cache the GCC 16.2 oracle
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc/gcc-oracle
+          key: lccc-gcc-oracle-${{ runner.os }}-16.2-${{ hashFiles('scripts/ci_install_gcc_oracle.sh') }}
+      - name: Install the GCC 16.2 oracle
+        run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
+      - name: Verify the lane's oracle toolchain
+        run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2
 
       - uses: actions/download-artifact@v8
         with:

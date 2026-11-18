@@ -331,10 +331,12 @@ research pin. See [linker version/build policy](../tools/linker/README.md):
 for native timing use source-mode mold 3.0.0 (`mold-cli`, Rust features
 `x86_64,i386,system-allocator`, not a CMake `MOLD_TARGETS` option). This
 session exercised warm-cache switching offline and real release-cache
-ELF32/ELF64 linking. The v3.0.0 source at `8de38c35a2df` was retrieved, but
-`cargo fetch --offline --locked` could not resolve the locked `mimalloc_rust`
-Git dependency; no native mold executable was tested. Record the resolved
-GNU ld, lld, mold and lccc-ld identity per comparison; do not silently substitute.
+ELF32/ELF64 linking. The v3.0.0 source at `8de38c35a2df` was retrieved and
+hash-checked. An offline locked fetch missed `mimalloc_rust`; the subsequent
+bounded online fetch reached that Git repository but failed at the crates.io
+registry TLS connection. No native mold executable was tested. Record the
+resolved GNU ld, lld, mold and lccc-ld identity per comparison; do not silently
+substitute.
 
 ## Corpus and pipeline follow-up
 
@@ -419,5 +421,15 @@ GNU ld, lld, mold and lccc-ld identity per comparison; do not silently substitut
   lines. Both mold setup paths check the installed release digest
   extracted from the pinned archive, before running its version command. A
   same-banner replacement must not run. LLD's pin is matched to its actual
-  version field, not a version mentioned later in a banner. This audit does
-  not certify a native mold build or alter the known i686 symbol policy.
+  version field, not a version mentioned later in a banner. A hosted shard
+  exposed the research installer's Cargo search-order bug: a home rustup
+  shim shadowed the explicitly selected executable on `PATH`. Source builds
+  now use the home shim only as a fallback, and verified cache reuse needs
+  neither Cargo on `PATH` nor a home shim. This audit does not certify a
+  native mold build or alter the known i686 symbol policy.
+- **Hosted benchmark provenance.** The timed shards install and verify the
+  cached GCC 16.2 oracle before compiling. The base apt bundle remains for
+  system dependencies, not as the measurement compiler. The clock, shard
+  coverage, and strict correctness gates are unchanged. Clang 23.1.5 and
+  authenticated ICX 2026.2 participate in the separate Huffman correctness
+  contract; neither is silently treated as a timing reference for that lane.
