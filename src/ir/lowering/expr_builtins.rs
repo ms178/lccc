@@ -1832,6 +1832,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Psrawi256
             | BuiltinIntrinsic::X86Psradi256
             | BuiltinIntrinsic::X86Packssdw256
+            | BuiltinIntrinsic::X86Packsswb256
             | BuiltinIntrinsic::X86Packuswb256
             | BuiltinIntrinsic::X86Phaddw256
             | BuiltinIntrinsic::X86Phaddd256
@@ -4124,6 +4125,7 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Psrawi256
         | BuiltinIntrinsic::X86Psradi256
         | BuiltinIntrinsic::X86Packssdw256
+        | BuiltinIntrinsic::X86Packsswb256
         | BuiltinIntrinsic::X86Packuswb256
         | BuiltinIntrinsic::X86Phaddw256
         | BuiltinIntrinsic::X86Phaddd256
@@ -4445,6 +4447,7 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pminub256
         | B::X86Pmovmskb256
         | B::X86Packssdw256
+        | B::X86Packsswb256
         | B::X86Packuswb256
         | B::X86Permutevar8x32
         | B::X86Psadbw256
@@ -4998,6 +5001,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Psrawi256 => IntrinsicOp::Psrawi256,
         BuiltinIntrinsic::X86Psradi256 => IntrinsicOp::Psradi256,
         BuiltinIntrinsic::X86Packssdw256 => IntrinsicOp::Packssdw256,
+        BuiltinIntrinsic::X86Packsswb256 => IntrinsicOp::Packsswb256,
         BuiltinIntrinsic::X86Packuswb256 => IntrinsicOp::Packuswb256,
         BuiltinIntrinsic::X86Phaddw256 => IntrinsicOp::Phaddw256,
         BuiltinIntrinsic::X86Phaddd256 => IntrinsicOp::Phaddd256,

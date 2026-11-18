@@ -1633,6 +1633,7 @@ pub enum IntrinsicOp {
     Psrawi256,
     Psradi256,
     Packssdw256,
+    Packsswb256,
     Packuswb256,
     Phaddw256,
     Phaddd256,
@@ -2422,7 +2423,7 @@ impl IntrinsicOp {
             | Pminsb256 | Pmaxsb256 | Pminud256 | Pmaxud256
             | Pmovzxbw256 | Pmovzxbd256 | Pmovzxwd256
             | Pmovsxbw256 | Pmovsxbd256 | Pmovsxwd256
-            | Psrawi256 | Psradi256 | Packssdw256 | Packuswb256
+            | Psrawi256 | Psradi256 | Packssdw256 | Packsswb256 | Packuswb256
             | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256
             // `VecMaskedAddI32x8` folds eight I32 lanes into an I32x8
             // accumulator: a 256-bit result, emitted with `vpaddd %ymm`.

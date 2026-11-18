@@ -1899,6 +1899,7 @@ impl I686Codegen {
             | IntrinsicOp::Psadbw256
             | IntrinsicOp::Pshufb256
             | IntrinsicOp::Packssdw256
+            | IntrinsicOp::Packsswb256
             | IntrinsicOp::Packuswb256
             | IntrinsicOp::Phaddw256
             | IntrinsicOp::Phaddd256
@@ -1954,6 +1955,7 @@ impl I686Codegen {
                         IntrinsicOp::Psadbw256 => "vpsadbw",
                         IntrinsicOp::Pshufb256 => "vpshufb",
                         IntrinsicOp::Packssdw256 => "vpackssdw",
+                        IntrinsicOp::Packsswb256 => "vpacksswb",
                         IntrinsicOp::Packuswb256 => "vpackuswb",
                         IntrinsicOp::Phaddw256 => "vphaddw",
                         IntrinsicOp::Phaddd256 => "vphaddd",

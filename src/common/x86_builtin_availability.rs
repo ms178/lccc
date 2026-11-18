@@ -54,6 +54,7 @@ pub fn x86_builtin_feature_macro(name: &str) -> Option<&'static str> {
         "__builtin_ia32_pabsw128" => Some("__SSSE3__"),
         "__builtin_ia32_pabsw256" => Some("__AVX2__"),
         "__builtin_ia32_packssdw256" => Some("__AVX2__"),
+        "__builtin_ia32_packsswb256" => Some("__AVX2__"),
         "__builtin_ia32_packuswb256" => Some("__AVX2__"),
         "__builtin_ia32_paddb256" => Some("__AVX2__"),
         "__builtin_ia32_paddd256" => Some("__AVX2__"),

@@ -560,6 +560,7 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Pminud256
         | O::Pmaxud256
         | O::Packssdw256
+        | O::Packsswb256
         | O::Packuswb256
         | O::Phaddw256
         | O::Phaddd256

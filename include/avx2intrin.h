@@ -768,6 +768,13 @@ _mm256_packs_epi32(__m256i __a, __m256i __b)
     return (__m256i)__builtin_ia32_packssdw256((__v8si)(__a), (__v8si)(__b));
 }
 
+/* _mm256_packs_epi16: pack 16-bit to 8-bit with signed saturation within lanes (VPACKSSWB) */
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_packs_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_packsswb256((__v16hi)(__a), (__v16hi)(__b));
+}
+
 /* _mm256_packus_epi16: pack 16-bit to 8-bit with unsigned saturation within lanes (VPACKUSWB) */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_packus_epi16(__m256i __a, __m256i __b)

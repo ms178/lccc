@@ -108,6 +108,7 @@ const ARITY_TABLE: &[(&str, u8)] = &[
     ("__builtin_ia32_packssdw128", 2),
     ("__builtin_ia32_packssdw256", 2),
     ("__builtin_ia32_packsswb128", 2),
+    ("__builtin_ia32_packsswb256", 2),
     ("__builtin_ia32_packuswb128", 2),
     ("__builtin_ia32_packuswb256", 2),
     ("__builtin_ia32_paddb128", 2),

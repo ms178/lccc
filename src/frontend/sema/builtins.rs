@@ -3352,6 +3352,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packssdw256),
     );
     m.insert(
+        "__builtin_ia32_packsswb256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packsswb256),
+    );
+    m.insert(
         "__builtin_ia32_packuswb256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packuswb256),
     );
@@ -4253,6 +4257,7 @@ pub enum BuiltinIntrinsic {
     X86Psrawi256,
     X86Psradi256,
     X86Packssdw256,
+    X86Packsswb256,
     X86Packuswb256,
     X86Phaddw256,
     X86Phaddd256,

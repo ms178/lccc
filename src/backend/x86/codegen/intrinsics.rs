@@ -4766,6 +4766,7 @@ impl X86Codegen {
             | IntrinsicOp::Pminud256
             | IntrinsicOp::Pmaxud256
             | IntrinsicOp::Packssdw256
+            | IntrinsicOp::Packsswb256
             | IntrinsicOp::Packuswb256
             | IntrinsicOp::Phaddw256
             | IntrinsicOp::Phaddd256
@@ -4820,6 +4821,7 @@ impl X86Codegen {
                         IntrinsicOp::Pminud256 => ("vpminud", true),
                         IntrinsicOp::Pmaxud256 => ("vpmaxud", true),
                         IntrinsicOp::Packssdw256 => ("vpackssdw", false),
+                        IntrinsicOp::Packsswb256 => ("vpacksswb", false),
                         IntrinsicOp::Packuswb256 => ("vpackuswb", false),
                         IntrinsicOp::Phaddw256 => ("vphaddw", false),
                         IntrinsicOp::Phaddd256 => ("vphaddd", false),
