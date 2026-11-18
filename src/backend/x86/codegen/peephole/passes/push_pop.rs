@@ -213,7 +213,7 @@ pub(super) fn eliminate_binop_push_pop_pattern(
 
         let push_line = infos[i].trimmed(store.get(i));
         let push_reg = match push_line.strip_prefix("pushq ") {
-            Some(r) => r.trim(),
+            Some(r) => r.trim_ascii(),
             None => {
                 i += 1;
                 continue;
@@ -603,7 +603,7 @@ mod pinned_push_pop_tests {
             .collect();
         assert!(eliminate_binop_push_pop_pattern(&mut store, &mut infos));
         assert_eq!(
-            store.build_result(|i| infos[i].is_nop()).trim(),
+            store.build_result(|i| infos[i].is_nop()).trim_ascii(),
             "movq %r10, %rcx"
         );
     }

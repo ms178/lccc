@@ -623,10 +623,10 @@ fn parse_vector_load(t: &str) -> Option<(&str, &str)> {
     if !VEC_LOADS.contains(&mnemonic) {
         return None;
     }
-    let rest = rest.trim();
+    let rest = rest.trim_ascii();
     let comma = crate::backend::peephole_common::last_top_level_comma(rest.as_bytes())?;
-    let src = rest[..comma].trim();
-    let dst = rest[comma + 1..].trim();
+    let src = rest[..comma].trim_ascii();
+    let dst = rest[comma + 1..].trim_ascii();
     if !is_plain_memory_operand(src) {
         return None;
     }
@@ -641,7 +641,7 @@ fn parse_vector_load(t: &str) -> Option<(&str, &str)> {
 /// read-modify-write, string primitives, `xchg`, unknown mnemonics — is
 /// answered "no", which makes the caller refuse.
 fn is_pure_load(t: &str) -> bool {
-    let t = t.trim();
+    let t = t.trim_ascii();
     // A `lock` prefix turns any read-modify-write into an observable store;
     // no locked form is a pure load.
     if t.starts_with("lock ") {
@@ -653,12 +653,12 @@ fn is_pure_load(t: &str) -> bool {
     if mnemonic.starts_with("lea") || mnemonic.starts_with("prefetch") {
         return true;
     }
-    let ops = operand_spans(rest.trim());
+    let ops = operand_spans(rest.trim_ascii());
     if ops.len() != 2 {
         return false;
     }
-    let src = rest.trim()[ops[0].0..ops[0].1].trim();
-    let dst = rest.trim()[ops[1].0..ops[1].1].trim();
+    let src = rest.trim_ascii()[ops[0].0..ops[0].1].trim_ascii();
+    let dst = rest.trim_ascii()[ops[1].0..ops[1].1].trim_ascii();
     // Destination must be a bare register (a memory destination is a store),
     // source must be memory (neither `%reg` nor `$imm`).
     if !dst.starts_with('%') || dst.contains('(') {
@@ -722,7 +722,7 @@ fn slot_foldable(mnemonic: &str, operands: &str, spans: &[(usize, usize)], slot:
         return false;
     }
     let base = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
-    let first = operands[spans[0].0..spans[0].1].trim();
+    let first = operands[spans[0].0..spans[0].1].trim_ascii();
     match spans.len() {
         2 => slot == 0 && FOLDABLE_BASES.binary_search(&base).is_ok(),
         n if n >= 3 => {
@@ -867,7 +867,7 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        if load_text.trim_start().starts_with('v') && !oracle.upper_regions_dead_after(j, t_num) {
+        if load_text.trim_ascii_start().starts_with('v') && !oracle.upper_regions_dead_after(j, t_num) {
             i += 1;
             continue;
         }
@@ -883,13 +883,13 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
 /// memory operand in the slot the loaded register occupies.
 fn try_fold(cons: &str, mem: &str, t_reg: &str) -> Option<String> {
     let (mnemonic, operands) = cons.split_once(char::is_whitespace)?;
-    let operands = operands.trim();
+    let operands = operands.trim_ascii();
     let spans = operand_spans(operands);
     // The destination is the trailing operand and must not be the temporary:
     // a legacy two-operand op reads it, and a VEX destination that aliases the
     // source is a shape this pass declines rather than models.
     let last = spans.len() - 1;
-    let dst = operands[spans[last].0..spans[last].1].trim();
+    let dst = operands[spans[last].0..spans[last].1].trim_ascii();
     if dst == t_reg {
         return None;
     }
@@ -909,7 +909,7 @@ fn try_fold(cons: &str, mem: &str, t_reg: &str) -> Option<String> {
     }
     let slot = spans[..last]
         .iter()
-        .position(|(lo, hi)| operands[*lo..*hi].trim() == t_reg)?;
+        .position(|(lo, hi)| operands[*lo..*hi].trim_ascii() == t_reg)?;
     // `%xmmT` must appear in exactly one source slot.  A second occurrence
     // stays behind when the load retires and would then read whatever the
     // register held *before* the load instead of the loaded value — the
@@ -921,7 +921,7 @@ fn try_fold(cons: &str, mem: &str, t_reg: &str) -> Option<String> {
     if spans[..last]
         .iter()
         .enumerate()
-        .any(|(k, (lo, hi))| k != slot && operands[*lo..*hi].trim() == t_reg)
+        .any(|(k, (lo, hi))| k != slot && operands[*lo..*hi].trim_ascii() == t_reg)
     {
         return None;
     }
@@ -934,7 +934,7 @@ fn try_fold(cons: &str, mem: &str, t_reg: &str) -> Option<String> {
     // instruction already reads memory the window rules never proved
     // reorderable.
     for &(a, b) in &spans[slot + 1..] {
-        if !operands[a..b].trim().starts_with('%') {
+        if !operands[a..b].trim_ascii().starts_with('%') {
             return None;
         }
     }
@@ -959,7 +959,7 @@ mod tests {
         fuse_vector_load_into_op(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim())
+            .map(|i| store.get(i).trim_ascii())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1293,7 +1293,7 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         let load = (0..store.len())
-            .find(|&i| store.get(i).trim().starts_with("movups"))
+            .find(|&i| store.get(i).trim_ascii().starts_with("movups"))
             .unwrap();
         infos[load].pinned = true;
         infos[load].volatile_access = true;

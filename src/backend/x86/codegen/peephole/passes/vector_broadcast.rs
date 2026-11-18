@@ -52,7 +52,7 @@ use super::super::types::*;
 fn move_defines(line: &str) -> Option<(&str, &str, bool)> {
     let (mnemonic, rest) = line.split_once(char::is_whitespace)?;
     let (src, dst) = rest.split_once(',')?;
-    let (src, dst) = (src.trim(), dst.trim());
+    let (src, dst) = (src.trim_ascii(), dst.trim_ascii());
     if !src.starts_with("%xmm") || !dst.starts_with("%xmm") || src == dst {
         return None;
     }
@@ -70,7 +70,7 @@ fn move_defines(line: &str) -> Option<(&str, &str, bool)> {
 fn splat_of(line: &str, dst: &str) -> Option<&'static str> {
     let (mnemonic, rest) = line.split_once(char::is_whitespace)?;
     let (src, dest) = rest.split_once(',')?;
-    if src.trim() != dst || dest.trim() != dst {
+    if src.trim_ascii() != dst || dest.trim_ascii() != dst {
         return None;
     }
     match mnemonic {

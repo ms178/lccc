@@ -197,7 +197,7 @@ fn try_propagate_into(
         let src_direct_count = trimmed.matches(src_name).count();
         let src_paren_count = trimmed.matches(src_paren.as_str()).count();
         let is_dest_only = if let Some((_before, after_comma)) = trimmed.rsplit_once(',') {
-            after_comma.trim() == src_name
+            after_comma.trim_ascii() == src_name
         } else {
             false
         };
@@ -660,7 +660,7 @@ mod tests {
         }
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -716,7 +716,7 @@ mod tests {
         let (mut store, mut infos) =
             build_pinned("f:\n    movq %rcx, %r8\n.LBB43:\n    testl %r8d, %r8d\n    ret\n");
         let label = (0..store.len())
-            .find(|&i| store.get(i).trim() == ".LBB43:")
+            .find(|&i| store.get(i).trim_ascii() == ".LBB43:")
             .expect("label line");
         infos[label].pinned = true;
         propagate_register_copies(&mut store, &mut infos);
@@ -1084,7 +1084,7 @@ mod tests {
         let (mut store, mut infos) = build_pinned(asm);
         propagate_register_copies(&mut store, &mut infos);
         assert!(
-            (0..store.len()).any(|i| store.get(i).trim() == "addq $1, %rax"),
+            (0..store.len()).any(|i| store.get(i).trim_ascii() == "addq $1, %rax"),
             "user asm bytes are immutable"
         );
     }

@@ -182,7 +182,7 @@ fn imm_adjust(t: &str) -> Option<(i64, &str)> {
     let (src, dst) = split_two_operands(rest)?;
     let imm: i64 = src.strip_prefix('$')?.parse().ok()?;
     let imm = if negate { imm.checked_neg()? } else { imm };
-    Some((imm, dst.trim()))
+    Some((imm, dst.trim_ascii()))
 }
 
 /// Split `use_line` around its single `D(%reg…)` memory operand whose BASE
@@ -199,7 +199,7 @@ fn split_base_mem_operand<'a>(
     }
     let close = open + line[open..].find(')')?;
     let inner = &line[open + 1..close];
-    let base = inner.split(',').next()?.trim();
+    let base = inner.split(',').next()?.trim_ascii();
     if base != reg {
         return None; // the register is the index, not the base
     }
@@ -250,7 +250,7 @@ mod tests {
         run(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }

@@ -228,7 +228,7 @@ struct PendingStore {
 /// zero-operand form can never be misread.
 fn two_ops(t: &str) -> Option<(&str, &str, &str)> {
     let (mnem, rest) = t.split_once(|c: char| c.is_ascii_whitespace())?;
-    let rest = rest.trim();
+    let rest = rest.trim_ascii();
     // A memory operand may contain commas of its own (`(%rax,%rbx,4)`), and
     // it may be EITHER operand (`vmovdqu %ymm0, (%rax)` as well as
     // `vmovdqu (%rax), %ymm0`), so the split has to be paren-aware in both
@@ -257,7 +257,7 @@ fn two_ops(t: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
     let k = split?;
-    let (a, b) = (rest[..k].trim(), rest[k + 1..].trim());
+    let (a, b) = (rest[..k].trim_ascii(), rest[k + 1..].trim_ascii());
     if a.is_empty() || b.is_empty() {
         return None;
     }

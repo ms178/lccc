@@ -35,10 +35,10 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((source, destination)) = operands.split_once(',') else {
             continue;
         };
-        let source_reg = register_at_width(source.trim(), width);
-        let stack_slot = direct_stack_slot(source.trim());
+        let source_reg = register_at_width(source.trim_ascii(), width);
+        let stack_slot = direct_stack_slot(source.trim_ascii());
         let stack_base = stack_slot.map(|(base, _)| usize::from(base));
-        if destination.trim() != REG_NAMES[width][0]
+        if destination.trim_ascii() != REG_NAMES[width][0]
             || source_reg.is_none() && stack_base.is_none()
             || source_reg.is_some_and(|reg| matches!(reg, 0 | 2 | 4))
         {
@@ -71,7 +71,7 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some(divisor) = div.strip_prefix(div_opcode) else {
             continue;
         };
-        let Some(divisor_reg) = register_at_width(divisor.trim(), width) else {
+        let Some(divisor_reg) = register_at_width(divisor.trim_ascii(), width) else {
             continue;
         };
         if matches!(divisor_reg, 0 | 2 | 4) {
@@ -105,12 +105,12 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 let cmp_width =
                     usize::from(opcode.starts_with("cmpl") || opcode.starts_with("testl"));
                 if let Some((src, dst)) = args.split_once(',') {
-                    let src = src.trim();
+                    let src = src.trim_ascii();
                     let source_ok = register_at_width(src, cmp_width).is_some()
                         || src
                             .strip_prefix('$')
                             .is_some_and(|v| v.parse::<i64>().is_ok());
-                    if source_ok && register_at_width(dst.trim(), cmp_width).is_some() {
+                    if source_ok && register_at_width(dst.trim_ascii(), cmp_width).is_some() {
                         copies += 1;
                         cursor = i + 1;
                         continue;
@@ -122,8 +122,8 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // dividend. Distinct stack bases may alias and are not compared.
             if let Some(args) = text.strip_prefix(if width == 1 { "movl " } else { "movq " }) {
                 if let Some((src, dst)) = args.split_once(',') {
-                    if register_at_width(src.trim(), width).is_some() {
-                        if let Some((base, offset)) = direct_stack_slot(dst.trim()) {
+                    if register_at_width(src.trim_ascii(), width).is_some() {
+                        if let Some((base, offset)) = direct_stack_slot(dst.trim_ascii()) {
                             let size = if width == 1 { 4_i64 } else { 8_i64 };
                             let safe = stack_slot.is_none_or(|(read_base, read_offset)| {
                                 let a = i64::from(offset);
@@ -146,10 +146,10 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             let Some((src, dst)) = args.split_once(',') else {
                 break;
             };
-            if register_at_width(src.trim(), width).is_none() {
+            if register_at_width(src.trim_ascii(), width).is_none() {
                 break;
             }
-            let Some(dest) = register_at_width(dst.trim(), width) else {
+            let Some(dest) = register_at_width(dst.trim_ascii(), width) else {
                 break;
             };
             if matches!(dest, 0 | 2 | 4)

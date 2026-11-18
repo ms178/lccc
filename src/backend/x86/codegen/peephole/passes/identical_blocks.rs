@@ -320,7 +320,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             let trimmed = infos[i].trimmed(store.get(i));
             if let Some(space_pos) = trimmed.find(' ') {
                 let target = trimmed[space_pos + 1..]
-                    .trim()
+                    .trim_ascii()
                     .trim_end_matches(':')
                     .to_string();
                 if let Some(&src_bidx) = block_of_line.get(i) {
@@ -691,7 +691,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                 let line = store.get(i).to_string();
                 let trimmed = infos[i].trimmed(&line);
                 if let Some(space_pos) = trimmed.find(' ') {
-                    let target = trimmed[space_pos + 1..].trim();
+                    let target = trimmed[space_pos + 1..].trim_ascii();
                     if let Some(canonical) = redirects.get(target) {
                         let prefix = &trimmed[..space_pos + 1];
                         let new_line = format!("    {}{}", prefix, canonical);
@@ -1161,13 +1161,13 @@ mod tests {
     fn trailing_debug_markers_leave_the_pipeline_result_unchanged() {
         let plain: String = TRAILING_LOC
             .lines()
-            .filter(|l| !l.trim_start().starts_with(".loc"))
+            .filter(|l| !l.trim_ascii_start().starts_with(".loc"))
             .map(|l| format!("{l}\n"))
             .collect();
         let out = run(TRAILING_LOC);
         let code: String = out
             .lines()
-            .filter(|l| !l.trim_start().starts_with(".loc"))
+            .filter(|l| !l.trim_ascii_start().starts_with(".loc"))
             .map(|l| format!("{l}\n"))
             .collect();
         assert_eq!(code, run(&plain));

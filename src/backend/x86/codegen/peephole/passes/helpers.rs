@@ -68,7 +68,7 @@ pub(super) fn is_callee_saved_reg(reg: RegId) -> bool {
 /// function start (harmless: reasoning starts after the prologue).
 #[inline]
 pub(super) fn is_rsp_shift_line(t: &str) -> bool {
-    let t = t.trim();
+    let t = t.trim_ascii();
     if t.starts_with("push") || t.starts_with("pop") {
         return true;
     }
@@ -186,7 +186,7 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     // input, and an empty mnemonic models as "no effects". Trim here so the
     // answer cannot depend on formatting. Callers that already pass a
     // trimmed slice pay one byte comparison.
-    let trimmed = trimmed.trim_start();
+    let trimmed = trimmed.trim_ascii_start();
     let nb = trimmed.as_bytes();
     if nb.len() < 3 {
         return false;
@@ -379,8 +379,8 @@ pub(super) fn parse_reg_to_reg_movq(info: &LineInfo, trimmed: &str) -> Option<(R
         }
         if let Some(rest) = trimmed.strip_prefix("movq ") {
             if let Some((src_part, dst_part)) = rest.split_once(',') {
-                let src = src_part.trim();
-                let dst = dst_part.trim();
+                let src = src_part.trim_ascii();
+                let dst = dst_part.trim_ascii();
                 if !src.starts_with("%r") || !dst.starts_with("%r") {
                     return None;
                 }
@@ -424,8 +424,8 @@ pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(R
         }
         if let Some(rest) = trimmed.strip_prefix("movl ") {
             if let Some((src_part, dst_part)) = rest.split_once(',') {
-                let src = src_part.trim();
-                let dst = dst_part.trim();
+                let src = src_part.trim_ascii();
+                let dst = dst_part.trim_ascii();
                 if !src.starts_with('%') || !dst.starts_with('%') {
                     return None;
                 }
@@ -482,7 +482,7 @@ pub(super) fn is_self_zeroing_idiom(trimmed: &str) -> bool {
     let Some((a, b)) = rest.split_once(',') else {
         return false;
     };
-    let (a, b) = (a.trim(), b.trim());
+    let (a, b) = (a.trim_ascii(), b.trim_ascii());
     !a.is_empty() && a == b && a.starts_with('%')
 }
 
@@ -610,7 +610,7 @@ fn dest_operand_is_full_width(info: &LineInfo, trimmed: &str, fam: RegId) -> boo
     if let LineKind::Pop { reg } = info.kind {
         return reg == fam;
     }
-    let dest = trimmed.rsplit(',').next().unwrap_or(trimmed).trim();
+    let dest = trimmed.rsplit(',').next().unwrap_or(trimmed).trim_ascii();
     dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize]
 }
 
@@ -667,8 +667,8 @@ pub(super) fn self_zeroing_full_write(trimmed: &str, fam: RegId) -> bool {
         Some(pair) => pair,
         None => return false,
     };
-    let dest = dest.trim();
-    source.trim() == dest
+    let dest = dest.trim_ascii();
+    source.trim_ascii() == dest
         && (dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize])
 }
 
@@ -704,12 +704,12 @@ pub(super) fn parse_dotl_number(s: &str) -> Option<u32> {
 pub(super) fn extract_jump_target(s: &str) -> Option<&str> {
     // Handle: jmp .LBB1, je .LBB1, jne .LBB1, etc.
     if let Some(rest) = s.strip_prefix("jmp ") {
-        return Some(rest.trim());
+        return Some(rest.trim_ascii());
     }
     // Conditional jumps: j<cc> <target>
     if s.starts_with('j') {
         if let Some(space) = s.find(' ') {
-            return Some(s[space + 1..].trim());
+            return Some(s[space + 1..].trim_ascii());
         }
     }
     None
@@ -773,7 +773,7 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
         // which every caller treating a dest-only line as a fresh overwrite
         // must consult as well (see its contract).
         if let Some(comma) = trimmed.rfind(',') {
-            let dest_part = trimmed[comma + 1..].trim();
+            let dest_part = trimmed[comma + 1..].trim_ascii();
             let src_part = &trimmed[..comma];
             // If the dest register name appears in the source part, it's a read
             if src_part.contains(dest_part) {
@@ -1007,14 +1007,14 @@ pub(super) fn src_mentions_family(trimmed: &str, fam: RegId) -> bool {
 /// address's internal commas (`disp(%base,%idx,4)`) never split an operand.
 pub(super) fn count_top_level_operands(ops: &str) -> usize {
     let mut n = 0usize;
-    let mut rest = ops.trim();
+    let mut rest = ops.trim_ascii();
     if rest.is_empty() {
         return 0;
     }
     loop {
         n += 1;
         match crate::backend::peephole_common::last_top_level_comma(rest.as_bytes()) {
-            Some(i) => rest = rest[..i].trim(),
+            Some(i) => rest = rest[..i].trim_ascii(),
             None => return n,
         }
     }
@@ -1405,7 +1405,7 @@ mod writes_family_tests {
         for fam in 0..=REG_GP_MAX {
             let q = format!("    popq {}", REG_NAMES[0][fam as usize]);
             let info = classify_line(&q);
-            let t = q.trim();
+            let t = q.trim_ascii();
             assert!(writes_family_full(&info, t, fam), "{t}");
             for other in 0..=REG_GP_MAX {
                 if other != fam {

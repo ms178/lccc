@@ -63,7 +63,7 @@ fn split_lines(text: &str) -> Vec<&str> {
 fn normalize(asm: &str) -> Vec<String> {
     split_lines(asm)
         .into_iter()
-        .map(|line| line.trim_end().to_string())
+        .map(|line| line.trim_ascii_end().to_string())
         .collect()
 }
 
@@ -422,7 +422,7 @@ fn collect_asm(root: &std::path::Path, subdirs: &[&str]) -> Vec<(String, String)
             let text = std::fs::read_to_string(&path).ok()?;
             // Nothing to learn from an empty text, and a binary that happens to
             // end in .s is not assembly.
-            if text.trim().is_empty() || text.contains('\0') {
+            if text.trim_ascii().is_empty() || text.contains('\0') {
                 return None;
             }
             let label = path
@@ -592,7 +592,7 @@ fn the_padding_is_stopped_at_the_store_boundary() {
         let line = store.get(i);
         assert_eq!(
             line,
-            line.trim_end(),
+            line.trim_ascii_end(),
             "LineStore::get handed a pass trailing whitespace: {line:?}"
         );
     }

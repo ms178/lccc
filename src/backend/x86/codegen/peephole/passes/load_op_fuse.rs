@@ -131,7 +131,7 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
         return ALL_GPR;
     }
     let mnemonic = t.split_whitespace().next().unwrap_or("");
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
 
     // Flag-only / no-write instructions.
     if mnemonic.starts_with("cmp")
@@ -366,7 +366,7 @@ pub(super) fn accesses_memory(t: &str, info: &LineInfo) -> bool {
     }
     // Absolute-symbol operands (`movl counter, %eax`) carry neither `%` nor
     // `$`; any such operand is a memory access.
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     if rest.is_empty() {
         return false;
     }
@@ -443,7 +443,7 @@ fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
     let mnemonic = t.split_whitespace().next()?;
     let (op, is_q) = split_lq_mnemonic(mnemonic)?;
     let op = *FUSIBLE_OPS.iter().find(|o| **o == op)?;
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     let (a, b) = split_two_operands(rest)?;
     let src = plain_gp_operand(a)?;
     let dst = plain_gp_operand(b)?;
@@ -468,7 +468,7 @@ fn parse_imm_reg_flag(t: &str) -> Option<(&'static str, bool, &str, RegId)> {
     }
     // Reborrow from the static spelling (the split borrows `t`).
     let op: &'static str = if op == "cmp" { "cmp" } else { "test" };
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     let (a, b) = split_two_operands(rest)?;
     if !a.starts_with('$') {
         return None;
@@ -535,13 +535,13 @@ fn try_fold_bmi_andn(
     let rest = cons
         .strip_prefix("andn")
         .and_then(|r| r.strip_prefix(suffix))?;
-    let rest = rest.trim_start();
+    let rest = rest.trim_ascii_start();
     // Three operands: src2, src1, dst — split on the first two commas.
     let (a, tail) = rest.split_once(',')?;
     let (b, c) = tail.split_once(',')?;
-    let a = a.trim();
-    let b = b.trim();
-    let c = c.trim().trim_end();
+    let a = a.trim_ascii();
+    let b = b.trim_ascii();
+    let c = c.trim_ascii().trim_ascii_end();
     let width = if load_q { 0 } else { 1 };
     let s2 = plain_gp_operand(a)?;
     let s1 = plain_gp_operand(b)?;
@@ -661,9 +661,9 @@ fn parse_andn_reg_reg_reg(trimmed: &str) -> Option<(bool, RegId, RegId, RegId)> 
         return None;
     };
     let mut parts = rest.split(',');
-    let op1 = parts.next()?.trim();
-    let op2 = parts.next()?.trim();
-    let op3 = parts.next()?.trim();
+    let op1 = parts.next()?.trim_ascii();
+    let op2 = parts.next()?.trim_ascii();
+    let op3 = parts.next()?.trim_ascii();
     if parts.next().is_some() {
         return None;
     }
@@ -901,7 +901,7 @@ fn rbp_pointer_load(
     let t = infos[i].trimmed(store.get(i));
     let rbp_base = t
         .split_once(',')
-        .is_some_and(|(src, _)| src.trim_end().ends_with("(%rbp)"));
+        .is_some_and(|(src, _)| src.trim_ascii_end().ends_with("(%rbp)"));
     if !rbp_base {
         return false;
     }
@@ -1345,7 +1345,7 @@ const INPLACE_UNARY: &[&str] = &["not", "neg", "inc", "dec"];
 fn parse_inplace_op(t: &str) -> Option<(bool, RegId, &str, bool)> {
     let mnemonic = t.split_whitespace().next()?;
     let (op, is_q) = split_lq_mnemonic(mnemonic)?;
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     let width = if is_q { 0 } else { 1 };
     if INPLACE_UNARY.contains(&op) {
         let dst = plain_gp_operand(rest)?;
@@ -1375,8 +1375,8 @@ fn parse_inplace_op(t: &str) -> Option<(bool, RegId, &str, bool)> {
     // register source equals the destination, and the caller's retarget then
     // drops to the equivalent 2-operand form (`imulq $imm, %A`).
     if let Some(comma) = last_top_level_comma(src.as_bytes()) {
-        let imm = src[..comma].trim();
-        let reg = src[comma + 1..].trim();
+        let imm = src[..comma].trim_ascii();
+        let reg = src[comma + 1..].trim_ascii();
         if !imm.starts_with('$') || imm.contains(',') {
             return None;
         }
@@ -1592,7 +1592,7 @@ fn parse_lea_add(t: &str) -> Option<(bool, RegId, RegId, RegId)> {
         _ => return None,
     };
     let width = if is_q { 0 } else { 1 };
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     let (src, dst) = split_two_operands(rest)?;
     let dst_fam = plain_gp_operand(dst)?;
     if dst != REG_NAMES[width][dst_fam as usize] {
@@ -1817,7 +1817,7 @@ fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
     // explicitly but cannot encode another byte register. This helper also
     // accepts isolated source expressions (no mnemonic), which have no such
     // instruction effects. Keep ordinary RCX addressing and BMI2 shifts legal.
-    let trimmed = text.trim();
+    let trimmed = text.trim_ascii();
     if from >= 16 || to >= 16 {
         return None;
     }
@@ -1826,7 +1826,7 @@ fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
         return None;
     }
     let mn = trimmed.split_whitespace().next().unwrap_or("");
-    let operands = trimmed[mn.len()..].trim();
+    let operands = trimmed[mn.len()..].trim_ascii();
     let fixed_shift = [
         "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "shld", "shrd",
     ]
@@ -1842,7 +1842,7 @@ fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
         && operands
             .split(',')
             .next()
-            .is_some_and(|count| count.trim() == "%cl")
+            .is_some_and(|count| count.trim_ascii() == "%cl")
     {
         return None;
     }
@@ -1921,7 +1921,7 @@ fn source_reads_family(t: &str, fam: RegId) -> bool {
     if mnemonic.is_empty() {
         return true;
     }
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     let Some((src, dst)) = split_two_operands(rest) else {
         // These explicit single-operand instructions overwrite their register
         // destination without reading its old value. Other opaque/implicit
@@ -1951,7 +1951,7 @@ fn has_full_width_register_dest(t: &str, from: RegId) -> bool {
     let Some(mnemonic) = t.split_whitespace().next() else {
         return false;
     };
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     let Some((_, dst)) = split_two_operands(rest) else {
         return false;
     };
@@ -1972,7 +1972,7 @@ fn is_rehomeable_full_width_rmw(t: &str, from: RegId) -> bool {
     let Some(mnemonic) = t.split_whitespace().next() else {
         return false;
     };
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     let Some((base, width)) = mnemonic.split_at_checked(mnemonic.len().saturating_sub(1)) else {
         return false;
     };
@@ -2094,7 +2094,7 @@ fn rename_full_def_source(t: &str, from: RegId, to: RegId) -> Option<String> {
     {
         return None;
     }
-    let rest = t[mnemonic.len()..].trim();
+    let rest = t[mnemonic.len()..].trim_ascii();
     let (src, dst) = split_two_operands(rest)?;
     if plain_gp_operand(dst) != Some(from)
         || !has_full_width_register_dest(t, from)
@@ -2357,7 +2357,7 @@ fn kills_family_only(insn: &str, fam: RegId) -> bool {
     let Some((_, rest)) = insn.split_once(char::is_whitespace) else {
         return false;
     };
-    let Some((src, dst)) = split_two_operands(rest.trim()) else {
+    let Some((src, dst)) = split_two_operands(rest.trim_ascii()) else {
         return false;
     };
     (dst == REG_NAMES[0][fam as usize] || dst == REG_NAMES[1][fam as usize])
@@ -2518,7 +2518,7 @@ mod tests {
 
     fn body(s: &str) -> Vec<String> {
         s.lines()
-            .map(|l| l.trim().to_string())
+            .map(|l| l.trim_ascii().to_string())
             .filter(|l| !l.is_empty())
             .collect()
     }
@@ -2816,7 +2816,7 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         let load = (0..store.len())
-            .find(|&i| store.get(i).trim().starts_with("mov"))
+            .find(|&i| store.get(i).trim_ascii().starts_with("mov"))
             .unwrap();
         infos[load].pinned = true;
         infos[load].volatile_access = true;
@@ -2847,7 +2847,7 @@ mod tests {
                     assert!(infos[load].is_nop());
                     let expected = format!("{op}{suffix} {mem}, {dest}");
                     let consumer = (0..store.len())
-                        .find(|&i| store.get(i).trim() == expected)
+                        .find(|&i| store.get(i).trim_ascii() == expected)
                         .unwrap();
                     assert!(infos[consumer].pinned && infos[consumer].volatile_access);
                     assert!(!fuse_load_into_alu(&mut store, &mut infos));
@@ -3647,25 +3647,25 @@ mod tests {
     fn may_write_model_is_conservative() {
         let li = |s: &str| classify_line(s);
         let t = "    notl %ecx";
-        assert_eq!(may_write_families(t.trim(), &li(t)), RCX);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), RCX);
         let t = "    divl %ecx";
-        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), RAX | RDX);
         let t = "    rep stosq";
         assert_eq!(
-            may_write_families(t.trim(), &li(t)) & ALL_STRING_REGS,
+            may_write_families(t.trim_ascii(), &li(t)) & ALL_STRING_REGS,
             ALL_STRING_REGS
         );
         let t = "    cmpl %ecx, %eax";
-        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), 0);
         let t = "    addl %ecx, (%rax)";
-        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), 0);
         let t = "    frobnicate";
-        assert_eq!(may_write_families(t.trim(), &li(t)), ALL_GPR);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), ALL_GPR);
         let t = "    vmovd %xmm0, %eax";
-        assert_eq!(may_write_families(t.trim(), &li(t)), RAX);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), RAX);
         let t = "    cmpxchg16b (%rdi)";
         assert_eq!(
-            may_write_families(t.trim(), &li(t)) & (RAX | RDX),
+            may_write_families(t.trim_ascii(), &li(t)) & (RAX | RDX),
             RAX | RDX
         );
     }
@@ -3693,17 +3693,17 @@ mod tests {
         // private table returned RAX | RDX, freezing cache invalidation for
         // an accumulator it never touched.
         let t = "    cqto";
-        assert_eq!(may_write_families(t.trim(), &li(t)), RDX);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), RDX);
         // rdtsc vs rdtscp: only the latter reports the TSC_AUX in %rcx.
         let t = "    rdtsc";
-        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), RAX | RDX);
         let t = "    rdtscp";
-        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RCX | RDX);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), RAX | RCX | RDX);
         // SSE arithmetic does not inherit the integer accumulator pair.
         let t = "    mulsd %xmm0, %xmm1";
-        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), 0);
         let t = "    divsd %xmm1, %xmm0";
-        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        assert_eq!(may_write_families(t.trim_ascii(), &li(t)), 0);
     }
 }
 
@@ -4075,7 +4075,7 @@ mod zeic_tests {
         store
             .build_result(|i| infos[i].is_nop())
             .lines()
-            .map(|l| l.trim().to_string())
+            .map(|l| l.trim_ascii().to_string())
             .filter(|l| !l.is_empty())
             .collect()
     }
@@ -4157,7 +4157,7 @@ mod zec_tests {
 
     fn lines(asm: &str) -> Vec<String> {
         asm.lines()
-            .map(|l| l.trim().to_string())
+            .map(|l| l.trim_ascii().to_string())
             .filter(|l| !l.is_empty())
             .collect()
     }
@@ -4416,7 +4416,7 @@ mod zec_tests {
                 .output()
                 .map_err(|e| format!("{tag}: cannot execute: {e}"))?;
             let t: i64 = String::from_utf8_lossy(&st.stdout)
-                .trim()
+                .trim_ascii()
                 .parse()
                 .map_err(|_| {
                     format!(
@@ -4593,7 +4593,7 @@ mod lea_fold_tests {
         store
             .build_result(|i| infos[i].is_nop())
             .lines()
-            .map(|l| l.trim().to_string())
+            .map(|l| l.trim_ascii().to_string())
             .filter(|l| !l.is_empty())
             .collect()
     }

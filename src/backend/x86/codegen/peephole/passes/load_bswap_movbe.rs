@@ -103,7 +103,7 @@ fn parse_bswap(t: &str) -> Option<(u8, RegId)> {
     } else {
         return None;
     };
-    let reg = rest.trim();
+    let reg = rest.trim_ascii();
     let fam = plain_gp_operand(reg)?;
     let bank = if width == 8 { 0 } else { 1 };
     if reg != REG_NAMES[bank][fam as usize] {

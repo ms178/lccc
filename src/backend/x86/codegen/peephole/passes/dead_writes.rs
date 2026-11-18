@@ -185,7 +185,7 @@ pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInf
             .trim_start_matches(|c: char| matches!(c, 'b' | 'w' | 'l' | 'q' | ' ' | '\t'));
         let (_src, dst) = match split_two_operands(rest) {
             Some((s, d)) => (s, d),
-            None if ONE_OPERAND_PURE_ARITH.contains(&base) => ("", rest.trim()),
+            None if ONE_OPERAND_PURE_ARITH.contains(&base) => ("", rest.trim_ascii()),
             None => {
                 i += 1;
                 continue;
@@ -244,7 +244,7 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
         // `setCC %al` has a single operand; everything else is `SRC, DST`.
         let (src, dst) = match split_two_operands(&t[op.len()..]) {
             Some((s, d)) => (s, d),
-            None if op.starts_with("set") => ("", t[op.len()..].trim()),
+            None if op.starts_with("set") => ("", t[op.len()..].trim_ascii()),
             None => {
                 i += 1;
                 continue;
@@ -344,7 +344,7 @@ impl LabelRefs {
                 continue;
             }
             if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
-                lines_naming.insert(name.trim().to_string(), 0);
+                lines_naming.insert(name.trim_ascii().to_string(), 0);
             }
         }
         let mut refs = Self { lines_naming };
@@ -487,7 +487,7 @@ fn load_operand(t: &str) -> Option<(&'static str, &str, &str, Vec<RegId>)> {
     }
     let mut fams = Vec::new();
     for f in src[open + 1..close].split(',') {
-        let f = f.trim();
+        let f = f.trim_ascii();
         if f.is_empty() || matches!(f, "1" | "2" | "4" | "8") {
             continue;
         }
@@ -835,7 +835,7 @@ pub(super) fn parse_frame_slot(mem: &str, width: i64) -> Option<FrameSlot> {
         "%rbp" | "%ebp" => 5,
         _ => return None,
     };
-    let disp_txt = mem[..open].trim();
+    let disp_txt = mem[..open].trim_ascii();
     let disp = if disp_txt.is_empty() {
         0
     } else {
@@ -893,12 +893,12 @@ fn store_destination(t: &str) -> Option<&str> {
         return None;
     }
     if let Some(comma) = last_top_level_comma(t.as_bytes()) {
-        let dst = t[comma + 1..].trim();
+        let dst = t[comma + 1..].trim_ascii();
         return if dst.contains('(') { Some(dst) } else { None };
     }
     // Single-operand read-modify-write form: `incl 24(%rsp)`, `negq (%rax)`.
     let sp = t.find(' ')?;
-    let only = t[sp + 1..].trim();
+    let only = t[sp + 1..].trim_ascii();
     if !t.starts_with('j') && only.contains('(') {
         Some(only)
     } else {
@@ -955,7 +955,7 @@ fn store_destination(t: &str) -> Option<&str> {
 ///   `fstenv` 28/32, `stmxcsr`/`sgdt`/`sidt`/`sldt`/`smsw` unrecognized
 ///   suffix anyway, `enter`'s stacked frame).
 fn bounded_store_mem_width(t: &str) -> Option<i64> {
-    let mut s = t.trim();
+    let mut s = t.trim_ascii();
     if let Some(rest) = s.strip_prefix("lock ") {
         s = rest;
     }
@@ -1233,7 +1233,7 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
         // Single-operand forms that write memory (`incl (%rax)`, `negq (%rax)`).
         return t.contains('(') && !t.starts_with("lea") && !t.starts_with("j");
     };
-    let dst = t[comma + 1..].trim();
+    let dst = t[comma + 1..].trim_ascii();
     dst.contains('(') && !t.starts_with("lea")
 }
 
@@ -1531,7 +1531,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
         // form does not produce from the accumulator's high half; a 64-bit
         // staging copy followed by a 32-bit op is fine (the op truncates in
         // both forms) and is left as the historical behaviour.
-        if !wide && !op.trim_end().ends_with('l') {
+        if !wide && !op.trim_ascii_end().ends_with('l') {
             i += 1;
             continue;
         }
@@ -1802,7 +1802,7 @@ mod tests {
         reuse_redundant_loads_with(&mut store, &mut infos, policy);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1822,7 +1822,7 @@ mod tests {
         eliminate_dead_flag_writes(&store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1844,7 +1844,7 @@ mod tests {
         }
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -2635,7 +2635,7 @@ mod tests {
         fold_load_test_into_cmp(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }

@@ -28,7 +28,7 @@ pub(crate) fn strip_volatile_markers(asm: String) -> String {
     }
     asm.split_inclusive('\n')
         .filter(|line| {
-            let t = line.trim();
+            let t = line.trim_ascii();
             t != "# LCCC_VOLATILE_BEGIN" && t != "# LCCC_VOLATILE_END"
         })
         .collect()
@@ -185,13 +185,13 @@ pub(crate) fn rename_register_operand(line: &str, old: &str, new: &str) -> Strin
     if old.is_empty() || old == new {
         return line.to_owned();
     }
-    let trimmed = line.trim();
+    let trimmed = line.trim_ascii();
     let Some((lo, hi)) = register_operand_span(trimmed) else {
         return line.to_owned();
     };
     match rename_in_span(trimmed, lo, hi, old, new) {
         Some(renamed) => {
-            let leading = line.len() - line.trim_start().len();
+            let leading = line.len() - line.trim_ascii_start().len();
             format!("{}{renamed}", &line[..leading])
         }
         None => line.to_owned(),
@@ -309,7 +309,7 @@ fn splice_source_rewrite(
     if rewritten == src {
         return None;
     }
-    let leading = line.len() - line.trim_start().len();
+    let leading = line.len() - line.trim_ascii_start().len();
     let mut out = String::with_capacity(leading + trimmed.len() + new_reg.len());
     out.push_str(&line[..leading]);
     out.push_str(&trimmed[..src_abs_lo]);
@@ -335,7 +335,7 @@ pub(crate) fn replace_source_reg_in_instruction(
     if old_reg.is_empty() || old_reg == new_reg {
         return None;
     }
-    let trimmed = line.trim();
+    let trimmed = line.trim_ascii();
     let op_at = operands_start(trimmed)?;
     let comma = trimmed[op_at..].find(',')?;
     let src_lo = op_at + comma;
@@ -345,7 +345,7 @@ pub(crate) fn replace_source_reg_in_instruction(
         return None;
     }
     let renamed = rename_in_span(trimmed, src_lo, hi, old_reg, new_reg)?;
-    let leading = line.len() - line.trim_start().len();
+    let leading = line.len() - line.trim_ascii_start().len();
     Some(format!("{}{renamed}", &line[..leading]))
 }
 
@@ -363,7 +363,7 @@ pub(crate) fn replace_source_reg_att(line: &str, old_reg: &str, new_reg: &str) -
     if old_reg.is_empty() || old_reg == new_reg {
         return None;
     }
-    let trimmed = line.trim();
+    let trimmed = line.trim_ascii();
     let op_at = operands_start(trimmed)?;
     let args = &trimmed[op_at..];
     // Top-level split only: `movb %al, (%r10,%r12)` has its LAST comma inside
@@ -655,13 +655,13 @@ impl LineStore {
                 result.push_str(self.get(i));
                 result.push('\n');
             } else {
-                let text = self.get(i).trim();
+                let text = self.get(i).trim_ascii();
                 if is_inline_range_marker(text) {
                     held.push(i);
                 } else if is_loc_directive(text) {
                     if let Some(pos) = held
                         .iter()
-                        .rposition(|&row| is_loc_directive(self.get(row).trim()))
+                        .rposition(|&row| is_loc_directive(self.get(row).trim_ascii()))
                     {
                         held.remove(pos);
                     }
@@ -670,7 +670,7 @@ impl LineStore {
             }
         }
         for row in held {
-            if is_inline_range_marker(self.get(row).trim()) {
+            if is_inline_range_marker(self.get(row).trim_ascii()) {
                 result.push_str(self.get(row));
                 result.push('\n');
             }
@@ -685,7 +685,7 @@ impl LineStore {
 /// puts the rows back.
 pub(crate) fn hide_debug_rows<K: Copy>(lines: &[String], kinds: &mut [K], deleted: K) {
     for (line, kind) in lines.iter().zip(kinds.iter_mut()) {
-        let text = line.trim();
+        let text = line.trim_ascii();
         if is_loc_directive(text) || is_inline_range_marker(text) {
             *kind = deleted;
         }
@@ -711,11 +711,11 @@ pub(crate) fn join_with_debug_rows(lines: &[String], kept: impl Fn(usize) -> boo
             result.push_str(line);
             result.push('\n');
         } else {
-            let text = line.trim();
+            let text = line.trim_ascii();
             if is_inline_range_marker(text) {
                 held.push(line);
             } else if is_loc_directive(text) {
-                if let Some(pos) = held.iter().rposition(|row| is_loc_directive(row.trim())) {
+                if let Some(pos) = held.iter().rposition(|row| is_loc_directive(row.trim_ascii())) {
                     held.remove(pos);
                 }
                 held.push(line);
@@ -723,7 +723,7 @@ pub(crate) fn join_with_debug_rows(lines: &[String], kept: impl Fn(usize) -> boo
         }
     }
     for row in held {
-        if is_inline_range_marker(row.trim()) {
+        if is_inline_range_marker(row.trim_ascii()) {
             result.push_str(row);
             result.push('\n');
         }
@@ -844,7 +844,7 @@ pub(crate) fn is_inline_range_marker(trimmed: &str) -> bool {
 /// (`alignment_fill_is_explicit`), while `.p2align 4,,10` -- empty fill, `max`
 /// only -- stays benign.
 pub(crate) fn directive_emits_data(text: &str) -> bool {
-    let trimmed = text.trim();
+    let trimmed = text.trim_ascii();
     if !trimmed.starts_with('.') {
         return false;
     }
@@ -930,7 +930,7 @@ pub(crate) fn directive_emits_data(text: &str) -> bool {
 pub(crate) fn alignment_fill_is_explicit(args: &str) -> bool {
     let mut fields = args.split(',');
     let _ = fields.next(); // <align>
-    matches!(fields.next(), Some(fill) if !fill.trim().is_empty())
+    matches!(fields.next(), Some(fill) if !fill.trim_ascii().is_empty())
 }
 
 /// Byte length of `b` with a trailing, unquoted `#` comment removed.
@@ -1024,7 +1024,7 @@ pub(crate) enum SectionSwitch {
 /// sections keeps treating it as possibly executed). The compound-statement
 /// keyword test over-matches on purpose for the same reason.
 pub(crate) fn section_switch(text: &str) -> Option<SectionSwitch> {
-    let trimmed = text.trim();
+    let trimmed = text.trim_ascii();
     let Some(stmt) = single_asm_statement(trimmed) else {
         let mentions = ["section", ".text", ".data", ".bss", ".previous"]
             .iter()
@@ -1053,7 +1053,7 @@ pub(crate) fn section_switch(text: &str) -> Option<SectionSwitch> {
 /// applies the defaults of the special section names, and gives every other
 /// name no flags at all (so not executable).
 fn section_kind_from_args(args: &str) -> SectionKind {
-    let args = args.trim();
+    let args = args.trim_ascii();
     let (name, after) = if let Some(q) = args.strip_prefix('"') {
         match q.find('"') {
             Some(end) => (&q[..end], &q[end + 1..]),
@@ -1073,7 +1073,7 @@ fn section_kind_from_args(args: &str) -> SectionKind {
         || name == ".init"
         || name == ".fini"
         || name.starts_with(".gnu.linkonce.t.");
-    let after = after.trim_start();
+    let after = after.trim_ascii_start();
     if after.is_empty() {
         return if code_name {
             SectionKind::Code
@@ -1180,7 +1180,7 @@ fn single_asm_statement(text: &str) -> Option<&str> {
         } else {
             match b {
                 b'"' | b'\'' => quote = Some(b),
-                b'#' => return Some(text[..i].trim_end()),
+                b'#' => return Some(text[..i].trim_ascii_end()),
                 b';' | b'\n' | b'\r' => return None,
                 _ => {}
             }
@@ -1192,7 +1192,7 @@ fn single_asm_statement(text: &str) -> Option<&str> {
 /// Exact debug-attribution tokens, excluding compound assembler statements.
 /// Honor quoted filenames, escapes and trailing comments without allocation.
 pub(crate) fn is_debug_marker_directive(text: &str) -> bool {
-    let text = text.trim();
+    let text = text.trim_ascii();
     matches!(text.split_whitespace().next(), Some(".loc" | ".file"))
         && single_asm_statement(text).is_some()
 }
@@ -1229,7 +1229,7 @@ pub(crate) fn is_debug_marker_directive(text: &str) -> bool {
 /// Unknown directives are opaque: the cost of a missed fold is a few bytes, the
 /// cost of a wrong one is a miscompiled object.
 pub(crate) fn inert_directive(text: &str) -> bool {
-    let t = text.trim();
+    let t = text.trim_ascii();
     if !t.starts_with('.') {
         return false;
     }
@@ -1292,7 +1292,7 @@ pub(crate) fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::o
     let mut depth = 0usize;
     let mut region_start: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
-        let t = line.trim();
+        let t = line.trim_ascii();
         if t == "#APP" {
             match function.as_mut() {
                 Some((_, _, has_asm)) => *has_asm = true,
@@ -1316,20 +1316,20 @@ pub(crate) fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::o
             let Some((name, kind)) = rest.split_once(',') else {
                 continue;
             };
-            if matches!(kind.trim(), "%function" | "@function") {
+            if matches!(kind.trim_ascii(), "%function" | "@function") {
                 if function.is_some() {
                     return None;
                 }
-                function = Some((name.trim(), i, false));
+                function = Some((name.trim_ascii(), i, false));
             }
             continue;
         }
         if let Some(rest) = t.strip_prefix(".size ")
             && let Some((name, expr)) = rest.split_once(',')
             && let Some((open, start, has_asm)) = function
-            && name.trim() == open
+            && name.trim_ascii() == open
         {
-            if expr.trim().strip_prefix(".-") != Some(open) {
+            if expr.trim_ascii().strip_prefix(".-") != Some(open) {
                 return None;
             }
             if has_asm {
@@ -1599,7 +1599,7 @@ mod directive_law_enforcement {
                         || lines[..i]
                             .iter()
                             .rev()
-                            .take_while(|l| l.trim_start().starts_with("//"))
+                            .take_while(|l| l.trim_ascii_start().starts_with("//"))
                             .any(|l| l.contains("DIRECTIVE-LAW:"));
                     if marked {
                         continue;
@@ -1608,7 +1608,7 @@ mod directive_law_enforcement {
                         "{}:{}: {}",
                         path.strip_prefix(root).unwrap_or(&path).display(),
                         i + 1,
-                        line.trim()
+                        line.trim_ascii()
                     ));
                 }
             }
@@ -1772,13 +1772,13 @@ mod tests {
                 let line = store.get(i);
                 assert_eq!(
                     line,
-                    line.trim_end(),
+                    line.trim_ascii_end(),
                     "padding {padding:?} survived into line {i}: {line:?}"
                 );
             }
             let built = store.build_result(|_| false);
             assert!(
-                built.split('\n').all(|line| line.trim_end() == line),
+                built.split('\n').all(|line| line.trim_ascii_end() == line),
                 "build_result re-emitted trailing whitespace for {padding:?}: {built:?}"
             );
         }
@@ -1888,20 +1888,20 @@ mod tests {
         // so a plain rfind(',') would report `%r12)` as the destination.
         let l = "movb %al, (%r10,%r12)";
         let c = last_top_level_comma(l.as_bytes()).unwrap();
-        assert_eq!(l[..c].trim(), "movb %al");
-        assert_eq!(l[c + 1..].trim(), "(%r10,%r12)");
+        assert_eq!(l[..c].trim_ascii(), "movb %al");
+        assert_eq!(l[c + 1..].trim_ascii(), "(%r10,%r12)");
         // A scale field adds a third comma inside the address.
         let l = "movq %rax, 16(%rbx,%rcx,8)";
         let c = last_top_level_comma(l.as_bytes()).unwrap();
-        assert_eq!(l[c + 1..].trim(), "16(%rbx,%rcx,8)");
+        assert_eq!(l[c + 1..].trim_ascii(), "16(%rbx,%rcx,8)");
         // Load: the destination is the register; address commas are skipped.
         let l = "movzbl (%r10,%r12), %edx";
         let c = last_top_level_comma(l.as_bytes()).unwrap();
-        assert_eq!(l[c + 1..].trim(), "%edx");
+        assert_eq!(l[c + 1..].trim_ascii(), "%edx");
         // Plain register-register form is unaffected by the depth tracking.
         let l = "addq %rax, %rbx";
         let c = last_top_level_comma(l.as_bytes()).unwrap();
-        assert_eq!(l[c + 1..].trim(), "%rbx");
+        assert_eq!(l[c + 1..].trim_ascii(), "%rbx");
         // A single-operand form has NO top-level comma; rfind(',') would
         // invent a destination out of the SIB field.
         assert_eq!(last_top_level_comma("incl (%rbx,%rcx,4)".as_bytes()), None);
@@ -2071,7 +2071,7 @@ mod debug_row_tests {
             ".Llccc_inline_e_12_34_pq_frame:  # endpoint",
             "\t.Llccc_inline_b_7_9_foo.bar$baz:\r",
         ] {
-            assert!(is_inline_range_marker(t.trim()), "{t}");
+            assert!(is_inline_range_marker(t.trim_ascii()), "{t}");
         }
         for t in [
             "main:",

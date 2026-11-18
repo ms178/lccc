@@ -314,11 +314,11 @@ struct Candidate {
 fn candidate(store: &LineStore, infos: &[LineInfo], i: usize, len: usize) -> Option<Candidate> {
     let load = infos[i].trimmed(store.get(i));
     let (mnemonic, rest) = load.split_once(' ')?;
-    if mnemonic == "movabsq" || rest.trim_start().starts_with('$') {
-        return immediate_candidate(store, infos, i, len, mnemonic, rest.trim());
+    if mnemonic == "movabsq" || rest.trim_ascii_start().starts_with('$') {
+        return immediate_candidate(store, infos, i, len, mnemonic, rest.trim_ascii());
     }
     let (shape, wide_dst) = load_shape(mnemonic)?;
-    let (mem, dst) = split_two_operands(rest.trim())?;
+    let (mem, dst) = split_two_operands(rest.trim_ascii())?;
     if !mem.contains('(') || mem.contains(':') || mem.contains('@') {
         return None;
     }

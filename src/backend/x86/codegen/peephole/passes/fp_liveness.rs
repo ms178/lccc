@@ -156,7 +156,7 @@ impl FpLiveness {
             }
             let is_start = infos[i].is_cfi_start() || {
                 let t = infos[i].trimmed(store.get(i));
-                t.starts_with(".type ") && t.trim_end().ends_with("@function")
+                t.starts_with(".type ") && t.trim_ascii_end().ends_with("@function")
             };
             if !is_start {
                 i += 1;
@@ -313,7 +313,7 @@ impl FpLiveness {
             has_implicit_vector_effects_line(text)
                 || mn.starts_with('v')
                     && dest_operand(operands)
-                        .and_then(|dst| xmm_index(dst.split('{').next().unwrap_or(dst).trim_end()))
+                        .and_then(|dst| xmm_index(dst.split('{').next().unwrap_or(dst).trim_ascii_end()))
                         == Some(n)
         });
         let footprint = low
@@ -357,7 +357,7 @@ impl FpLiveness {
                 && f.live_out[k - f.start] & bit != 0
         });
         let why = match reader {
-            Some(k) => format!("line {} `{}`", k, store.get(k).trim()),
+            Some(k) => format!("line {} `{}`", k, store.get(k).trim_ascii()),
             None => {
                 let mut ranges = String::new();
                 let mut k = f.start;
@@ -374,7 +374,7 @@ impl FpLiveness {
                         " [{}..{}] ends at `{}`",
                         s0,
                         k - 1,
-                        store.get(k.min(f.end - 1)).trim()
+                        store.get(k.min(f.end - 1)).trim_ascii()
                     ));
                 }
                 format!("no textual reader below; live ranges:{ranges}")
@@ -384,7 +384,7 @@ impl FpLiveness {
             "fp_liveness: xmm{} live after line {} `{}` - {}",
             n,
             idx,
-            store.get(idx).trim(),
+            store.get(idx).trim_ascii(),
             why
         ));
     }
@@ -513,7 +513,7 @@ pub(super) fn has_implicit_vector_effects_line(t: &str) -> bool {
 /// Split `t` into (mnemonic, operand text).
 fn split_mnemonic(t: &str) -> (&str, &str) {
     match t.find(|c: char| c.is_ascii_whitespace()) {
-        Some(p) => (&t[..p], t[p..].trim()),
+        Some(p) => (&t[..p], t[p..].trim_ascii()),
         None => (t, ""),
     }
 }
@@ -540,7 +540,7 @@ fn is_full_xmm_def(mn: &str, operands: &str) -> bool {
             // A (upper lanes) and B (low lane) only — a full definition
             // whether or not D is among the sources.
             let src = match last_top_level_comma(operands.as_bytes()) {
-                Some(c) => operands[..c].trim(),
+                Some(c) => operands[..c].trim_ascii(),
                 None => return false,
             };
             if !src.starts_with('%') {
@@ -967,8 +967,8 @@ fn dest_operand(operands: &str) -> Option<&str> {
         return None;
     }
     Some(match last_top_level_comma(operands.as_bytes()) {
-        Some(c) => operands[c + 1..].trim(),
-        None => operands.trim(),
+        Some(c) => operands[c + 1..].trim_ascii(),
+        None => operands.trim_ascii(),
     })
 }
 
@@ -982,13 +982,13 @@ fn operand_list(operands: &str) -> Vec<&str> {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
             b',' if depth == 0 => {
-                out.push(operands[start..i].trim());
+                out.push(operands[start..i].trim_ascii());
                 start = i + 1;
             }
             _ => {}
         }
     }
-    let last = operands[start..].trim();
+    let last = operands[start..].trim_ascii();
     if !last.is_empty() {
         out.push(last);
     }
@@ -1018,7 +1018,7 @@ fn frame_operand(op: &str) -> Result<Option<(u8, i32)>, ()> {
             return Ok(None);
         }
     };
-    let disp = op[..p].trim();
+    let disp = op[..p].trim_ascii();
     if disp.is_empty() {
         return Ok(Some((base, 0)));
     }
@@ -1219,7 +1219,7 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
         }
         let mk = infos[k].trimmed(store.get(k));
         if let Some(rest) = mk.strip_prefix("# LCCC_CALL_FP ") {
-            if let Ok(v) = rest.trim().parse::<u32>() {
+            if let Ok(v) = rest.trim_ascii().parse::<u32>() {
                 if v <= 8 {
                     return (1u128 << v) - 1;
                 }
@@ -1419,7 +1419,7 @@ fn ret_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, end: usize
         }
         let t = infos[n].trimmed(store.get(n));
         if let Some(m) = t.strip_prefix("# LCCC_RET_XMM ") {
-            if let Ok(mask) = m.trim().parse::<u128>() {
+            if let Ok(mask) = m.trim_ascii().parse::<u128>() {
                 return mask & 0xffff;
             }
         }
@@ -1505,7 +1505,7 @@ pub(super) fn ret_xmm_read_bits(
         }
         let t = infos[n].trimmed(store.get(n));
         if let Some(bits) = t.strip_prefix("# LCCC_RET_XMM_BITS ") {
-            return bits.trim().parse::<u16>().unwrap_or(512);
+            return bits.trim_ascii().parse::<u16>().unwrap_or(512);
         }
         if infos[n].kind == LineKind::Ret {
             break;
@@ -1521,7 +1521,7 @@ fn debug_unknown(store: &LineStore, n: usize, why: &str) {
             "fp_liveness: line {} unanalysable ({}): {}",
             n,
             why,
-            store.get(n).trim()
+            store.get(n).trim_ascii()
         ));
     }
 }
@@ -1571,7 +1571,7 @@ fn upper_effect(t: &str) -> Effect {
     };
     // GAS permits whitespace before/inside EVEX decorations. Strip the
     // decoration and trailing whitespace, but retain its partial-write flag.
-    let bare_dst = dst.split('{').next().unwrap_or(dst).trim_end();
+    let bare_dst = dst.split('{').next().unwrap_or(dst).trim_ascii_end();
     let Some(n) = xmm_index(bare_dst) else {
         return Effect { reads, writes };
     };

@@ -174,7 +174,7 @@ pub(super) struct FmaRoles<'a> {
 
 /// Number of the `%xmm` register an operand names, if it is one.
 pub(super) fn xmm_reg(op: &str) -> Option<u8> {
-    let d = op.trim().strip_prefix("%xmm")?;
+    let d = op.trim_ascii().strip_prefix("%xmm")?;
     if d.is_empty() || d.len() > 2 || !d.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -185,7 +185,7 @@ pub(super) fn xmm_reg(op: &str) -> Option<u8> {
 /// An operand that is neither a register nor an immediate: a memory reference
 /// of any addressing form.
 pub(super) fn is_memory(op: &str) -> bool {
-    let op = op.trim();
+    let op = op.trim_ascii();
     !op.is_empty() && !op.starts_with('%') && !op.starts_with('$')
 }
 
@@ -364,9 +364,9 @@ impl<'a> FmaRoles<'a> {
 
 /// Split a line into its mnemonic and its operand text.
 fn split_mnemonic(t: &str) -> (&str, &str) {
-    let t = t.trim();
+    let t = t.trim_ascii();
     match t.find(|c: char| c == ' ' || c == '\t') {
-        Some(p) => (&t[..p], t[p..].trim()),
+        Some(p) => (&t[..p], t[p..].trim_ascii()),
         None => (t, ""),
     }
 }

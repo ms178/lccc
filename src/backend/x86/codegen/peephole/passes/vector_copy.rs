@@ -144,7 +144,7 @@ struct VecCopy {
 /// Split a line into its mnemonic and its operand text.
 fn split_mn(t: &str) -> (&str, &str) {
     match t.split_once(char::is_whitespace) {
-        Some((mn, rest)) => (mn, rest.trim_start()),
+        Some((mn, rest)) => (mn, rest.trim_ascii_start()),
         None => (t, ""),
     }
 }
@@ -162,13 +162,13 @@ fn operand_list(operands: &str) -> Vec<&str> {
             '(' | '{' => depth += 1,
             ')' | '}' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
-                out.push(operands[start..i].trim());
+                out.push(operands[start..i].trim_ascii());
                 start = i + 1;
             }
             _ => {}
         }
     }
-    let tail = operands[start..].trim();
+    let tail = operands[start..].trim_ascii();
     if !tail.is_empty() {
         out.push(tail);
     }
@@ -179,7 +179,7 @@ fn operand_list(operands: &str) -> Vec<&str> {
 /// `%zmm1{1to8}` → `%zmm1`) so the register underneath can be parsed.
 fn strip_evex(op: &str) -> &str {
     match op.find('{') {
-        Some(i) => op[..i].trim_end(),
+        Some(i) => op[..i].trim_ascii_end(),
         None => op,
     }
 }
@@ -543,7 +543,7 @@ fn replace_vec_reads(t: &str, old: u8, new: u8) -> Option<String> {
 /// region this predicate just certified as contiguous is exactly a broken
 /// bracket.  Hence the fill check rather than the prefix.
 fn benign_directive(t: &str) -> bool {
-    let t = t.trim();
+    let t = t.trim_ascii();
     if t.starts_with(".cfi_")
         || t.starts_with(".LFB")
         || t.starts_with(".loc ")
@@ -1065,7 +1065,7 @@ fn copy_spelled_width(t: &str) -> Option<u16> {
     let (_, ops) = split_mn(t);
     let mut width = None;
     for op in operand_list(ops) {
-        let (_, w) = vec_operand(op.trim())?;
+        let (_, w) = vec_operand(op.trim_ascii())?;
         match width {
             None => width = Some(w),
             Some(seen) if seen == w => {}
@@ -1881,7 +1881,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
-        let ops: Vec<&str> = operand_list(operands).iter().map(|o| o.trim()).collect();
+        let ops: Vec<&str> = operand_list(operands).iter().map(|o| o.trim_ascii()).collect();
         // A full-width load: two operands, the source a memory operand
         // (a register-to-register `vmovdqa` is itself a copy, handled by
         // the copy rules), folded only into the full-width VEX copy-out
@@ -2183,7 +2183,7 @@ pub(super) fn elide_vzeroupper_without_upper_writes(
             }
             let ops = operand_list(operands);
             ops.last()
-                .is_some_and(|last| vec_operand(last.trim()).is_some_and(|(_, w)| w > W128))
+                .is_some_and(|last| vec_operand(last.trim_ascii()).is_some_and(|(_, w)| w > W128))
         });
         if writes_upper {
             j = fend;
@@ -2634,19 +2634,19 @@ mod tests {
             let names: FxHashSet<_> = fixture
                 .lines()
                 .filter_map(|line| {
-                    line.trim()
+                    line.trim_ascii()
                         .strip_prefix(".type ")
                         .and_then(|rest| rest.split(',').next())
                 })
                 .collect();
             let mut input = String::new();
             for line in fixture.lines() {
-                if line.trim().starts_with(".size ") {
+                if line.trim_ascii().starts_with(".size ") {
                     input.push_str(".cfi_endproc\n");
                 }
                 input.push_str(line);
                 input.push('\n');
-                if names.contains(line.trim().trim_end_matches(':')) {
+                if names.contains(line.trim_ascii().trim_end_matches(':')) {
                     input.push_str(".cfi_startproc\n");
                 }
             }
@@ -2832,7 +2832,7 @@ mod tests {
                     let Some((address, text)) = line.split_once("\t>") else {
                         continue;
                     };
-                    let text = text.trim();
+                    let text = text.trim_ascii();
                     if text.starts_with(".globl ")
                         || text.starts_with(".type ")
                         || text.starts_with(".size ")
@@ -2918,10 +2918,10 @@ mod tests {
         asm.lines()
             .map(str::trim_end)
             .filter(|l| {
-                let t = l.trim();
+                let t = l.trim_ascii();
                 !t.is_empty() && !t.starts_with('.') && !t.starts_with('#') && !t.ends_with(':')
             })
-            .map(|l| l.trim().to_string())
+            .map(|l| l.trim_ascii().to_string())
             .collect()
     }
 
@@ -2939,10 +2939,10 @@ mod tests {
                 .map(|i| classify_line(store.get(i)))
                 .collect();
             let producer = (0..store.len())
-                .rfind(|&i| store.get(i).trim() == op)
+                .rfind(|&i| store.get(i).trim_ascii() == op)
                 .unwrap();
             let header = (0..store.len())
-                .find(|&i| store.get(i).trim() == head)
+                .find(|&i| store.get(i).trim_ascii() == head)
                 .unwrap();
             let mut fp = PropagationLiveness::default();
             assert_eq!(
@@ -3028,7 +3028,7 @@ mod tests {
         let elapsed = start.elapsed();
         let refreshes = super::super::fp_liveness::take_refresh_count();
         let forwarded = (0..store.len())
-            .filter(|&i| store.get(i).trim() == "vaddsd %xmm1, %xmm0, %xmm10")
+            .filter(|&i| store.get(i).trim_ascii() == "vaddsd %xmm1, %xmm0, %xmm10")
             .count();
         assert_eq!(
             forwarded, groups,
@@ -3258,7 +3258,7 @@ mod tests {
                 .collect();
             propagate_vector_copies(&mut store, &mut infos);
             assert!(
-                (0..store.len()).any(|i| store.get(i).trim() == "movaps %xmm2, %xmm3"),
+                (0..store.len()).any(|i| store.get(i).trim_ascii() == "movaps %xmm2, %xmm3"),
                 "old XMM0 copy must not be replaced with the implicit output: {op}"
             );
         }
@@ -3281,7 +3281,7 @@ mod tests {
                 .collect();
             propagate_vector_copies(&mut store, &mut infos);
             assert!(
-                (0..store.len()).any(|i| store.get(i).trim() == "vmovupd %ymm2, (%rsi)"),
+                (0..store.len()).any(|i| store.get(i).trim_ascii() == "vmovupd %ymm2, (%rsi)"),
                 "the gather rewrites its nontrailing mask: {mnemonic}"
             );
         }
@@ -3295,7 +3295,7 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         assert!(propagate_vector_copies(&mut store, &mut infos));
-        assert!((0..store.len()).any(|i| store.get(i).trim() == "vaddps %xmm0, %xmm5, %xmm7"));
+        assert!((0..store.len()).any(|i| store.get(i).trim_ascii() == "vaddps %xmm0, %xmm5, %xmm7"));
     }
 
     #[test]
@@ -3467,7 +3467,7 @@ mod tests {
         retarget_vex_result(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| !l.is_empty())
             .collect()
     }
@@ -4256,7 +4256,7 @@ mod tests {
                 .map(|i| classify_line(store.get(i)))
                 .collect();
             assert!(!propagate_vector_copies(&mut store, &mut infos));
-            assert!((0..store.len()).any(|i| store.get(i).trim() == "vmovq %xmm2, %rax"));
+            assert!((0..store.len()).any(|i| store.get(i).trim_ascii() == "vmovq %xmm2, %rax"));
         }
     }
 
@@ -4721,7 +4721,7 @@ mod tests {
         assert!(widen_private_vector_copies(&mut store, &mut infos));
         let widened: Vec<&str> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim())
+            .map(|i| store.get(i).trim_ascii())
             .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
             .collect();
         assert_eq!(
@@ -4794,7 +4794,7 @@ mod tests {
         reassociate_fma_accumulator(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
             .collect()
     }
@@ -5289,7 +5289,7 @@ mod tests {
         elide_vzeroupper_without_upper_writes(&store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
             .collect()
     }
@@ -5348,7 +5348,7 @@ mod tests {
         retarget_vex_result(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
             .collect()
     }
@@ -5569,7 +5569,7 @@ mod zeroing_self_move_tests {
         eliminate_unobserved_zeroing_self_moves(&store, &mut infos);
         let at = (0..store.len())
             .find(|&i| {
-                let t = store.get(i).trim();
+                let t = store.get(i).trim_ascii();
                 t.starts_with("movq %xmm") && {
                     let ops = operand_list(&t[5..]);
                     ops.len() == 2 && ops[0] == ops[1]

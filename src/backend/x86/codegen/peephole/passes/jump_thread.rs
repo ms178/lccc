@@ -41,7 +41,7 @@ pub(super) fn label_text(s: &str) -> &str {
     s.split('#')
         .next()
         .unwrap_or("")
-        .trim()
+        .trim_ascii()
         .trim_end_matches(':')
 }
 
@@ -215,15 +215,15 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
 /// `.Ljt_*` base — answers `None` (fail closed).
 fn table_entry_target(s: &str) -> Option<(u32, Option<&str>)> {
     if let Some(rest) = s.strip_prefix(".quad ") {
-        return Some((local_label(rest.trim())?, None));
+        return Some((local_label(rest.trim_ascii())?, None));
     }
     let rest = s.strip_prefix(".long ")?;
     let (target, base) = rest.split_once('-')?;
-    let base = base.trim();
+    let base = base.trim_ascii();
     if !base.starts_with(".Ljt_") || base.contains(char::is_whitespace) {
         return None;
     }
-    Some((local_label(target.trim())?, Some(base)))
+    Some((local_label(target.trim_ascii())?, Some(base)))
 }
 
 /// The prefix that makes a `#` comment compiler-owned rather than a human's.
@@ -963,7 +963,7 @@ mod tests {
         super::super::pin_inline_asm_regions(&store, &mut infos);
         if let Some(line) = pin {
             for (i, info) in infos.iter_mut().enumerate() {
-                if store.get(i).trim() == line {
+                if store.get(i).trim_ascii() == line {
                     info.pinned = true;
                 }
             }
@@ -971,7 +971,7 @@ mod tests {
         let changed = run(&mut store, &mut infos);
         let text = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim())
+            .map(|i| store.get(i).trim_ascii())
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
@@ -1527,7 +1527,7 @@ mod conditional_tail_call_tests {
             .collect();
         let lv = FileLiveness::new(&store, &infos);
         let test = (0..store.len())
-            .find(|&i| store.get(i).trim() == "testl %edx, %edx")
+            .find(|&i| store.get(i).trim_ascii() == "testl %edx, %edx")
             .unwrap();
         assert_eq!(
             lv.live_after(test, 7),

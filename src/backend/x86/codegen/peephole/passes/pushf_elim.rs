@@ -41,7 +41,7 @@
 /// 3. **Everything else is admitted only by an explicit mnemonic rule**, and
 ///    anything not named is treated as flag-clobbering.
 fn is_flag_neutral_line(m: &str) -> bool {
-    let m = m.trim();
+    let m = m.trim_ascii();
     if m.is_empty() || m.starts_with('#') || m.starts_with("//") || m.starts_with(';') {
         return true; // comment / blank
     }
@@ -135,7 +135,7 @@ fn has_rsp_dependent_operand(t: &str) -> bool {
     m.starts_with("push") || m.starts_with("pop") || m.starts_with("call") || m.starts_with("ret")
 }
 fn first_mnemonic(line: &str) -> &str {
-    let line = line.trim();
+    let line = line.trim_ascii();
     // Take text up to first ';' that isn't a comment.
     match line.find(';') {
         Some(i) => &line[..i],
@@ -170,7 +170,7 @@ pub(super) fn eliminate_redundant_pushfq(asm: &mut String) -> bool {
     // rewritten (the `xorl → movq $0` rewrite included).
     let mut in_asm = false;
     while i < lines.len() {
-        let trimmed = lines[i].trim();
+        let trimmed = lines[i].trim_ascii();
         if trimmed == "#APP" {
             in_asm = true;
             i += 1;
@@ -198,7 +198,7 @@ pub(super) fn eliminate_redundant_pushfq(asm: &mut String) -> bool {
         let mut safe = true;
         let mut found_pop = false;
         while j < lines.len() {
-            let t = lines[j].trim();
+            let t = lines[j].trim_ascii();
             if t == "#APP" {
                 // The window would span into user asm: its flag effects are
                 // unanalyzable and its bytes untouchable. Abort the pair.
@@ -260,13 +260,13 @@ pub(super) fn eliminate_redundant_pushfq(asm: &mut String) -> bool {
 
 /// Parse a `xorl %reg, %reg` (self-zeroing) instruction; return the register name.
 fn parse_self_xor(line: &str) -> Option<String> {
-    let line = line.trim();
+    let line = line.trim_ascii();
     if !line.starts_with("xorl ") && !line.starts_with("xorq ") {
         return None;
     }
     // Expect form: xorl %reg, %reg
     let rest = &line[line.find(' ')? + 1..];
-    let parts: Vec<&str> = rest.split(',').map(|s| s.trim()).collect();
+    let parts: Vec<&str> = rest.split(',').map(|s| s.trim_ascii()).collect();
     if parts.len() != 2 {
         return None;
     }

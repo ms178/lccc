@@ -363,7 +363,7 @@ fn dest_range_ok(dest: RegId) -> Option<u8> {
 /// destinations, sub-32-bit names, and unrecognized forms.
 fn dest_write_width(trimmed: &str) -> Option<u32> {
     let comma = trimmed.rfind(',')?;
-    let dest = trimmed[comma + 1..].trim();
+    let dest = trimmed[comma + 1..].trim_ascii();
     if dest.len() < 2 || !dest.starts_with('%') {
         return None;
     }
@@ -1445,7 +1445,7 @@ fn parse_imm_slot_store(raw: &str, preparsed_offset: i32) -> Option<(i64, i32, M
     if preparsed_offset == RBP_OFFSET_NONE {
         return None;
     }
-    let s = raw.trim_start();
+    let s = raw.trim_ascii_start();
     // Two operands exactly.
     let mut parts = s.split(", ");
     let head = parts.next()?;
@@ -2405,7 +2405,7 @@ mod tests {
         assert!(global_store_forwarding(&mut store, &mut infos));
         assert!(
             (0..store.len())
-                .any(|i| { !infos[i].is_nop() && store.get(i).trim() == "movq %xmm0, %xmm6" })
+                .any(|i| { !infos[i].is_nop() && store.get(i).trim_ascii() == "movq %xmm0, %xmm6" })
         );
     }
 
@@ -2940,7 +2940,7 @@ mod tests {
         global_store_forwarding(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         assert!(
             out.iter().any(|l| l == "movsd 24(%rsp), %xmm2"),
@@ -2968,7 +2968,7 @@ mod tests {
         global_store_forwarding(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         assert!(
             !out.iter()

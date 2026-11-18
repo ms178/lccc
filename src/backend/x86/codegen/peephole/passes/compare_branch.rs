@@ -20,13 +20,13 @@ const CMP_FUSION_LOOKAHEAD: usize = 12;
 fn parse_stack_operand(text: &str, source: bool) -> Option<(u8, i32)> {
     let (_, operands) = text.split_once(char::is_whitespace)?;
     let (src, dst) = operands.split_once(',')?;
-    let op = if source { src.trim() } else { dst.trim() };
+    let op = if source { src.trim_ascii() } else { dst.trim_ascii() };
     for (suffix, base) in [("(%rsp)", 4u8), ("(%rbp)", 5u8)] {
         if let Some(n) = op.strip_suffix(suffix) {
-            let off = if n.trim().is_empty() {
+            let off = if n.trim_ascii().is_empty() {
                 0
             } else {
-                n.trim().parse::<i32>().ok()?
+                n.trim_ascii().parse::<i32>().ok()?
             };
             return Some((base, off));
         }
@@ -45,8 +45,8 @@ fn parse_self_test(t: &str) -> Option<&str> {
     for mnem in ["testq ", "testl ", "testw ", "testb "] {
         if let Some(rest) = t.strip_prefix(mnem) {
             let mut parts = rest.split(", ");
-            let a = parts.next()?.trim();
-            let b = parts.next()?.trim();
+            let a = parts.next()?.trim_ascii();
+            let b = parts.next()?.trim_ascii();
             if a == b && !a.contains(',') && !a.contains('(') {
                 // Return a 'static slice of the register text.
                 let start = mnem.len();
@@ -89,10 +89,10 @@ fn parse_bool_extension(line: &str, setcc_text: &str) -> Option<Result<RegId, ()
     for (prefix, row) in [("movzbl ", 1usize), ("movzbq ", 0usize)] {
         if let Some(rest) = line.strip_prefix(prefix) {
             let (src, dst) = rest.split_once(',')?;
-            if src.trim() != setcc_text {
+            if src.trim_ascii() != setcc_text {
                 return None;
             }
-            let dst = dst.trim();
+            let dst = dst.trim_ascii();
             match REG_NAMES[row].iter().position(|&n| n == dst) {
                 Some(f) => return Some(Ok(f as RegId)),
                 None => return Some(Err(())),
@@ -109,8 +109,8 @@ fn parse_bool_extension(line: &str, setcc_text: &str) -> Option<Result<RegId, ()
 fn parse_movslq_regs(line: &str) -> Option<(RegId, RegId)> {
     let rest = line.strip_prefix("movslq ")?;
     let (src, dst) = rest.split_once(',')?;
-    let src = src.trim();
-    let dst = dst.trim();
+    let src = src.trim_ascii();
+    let dst = dst.trim_ascii();
     if src.contains('(') || dst.contains('(') || src.contains(' ') || dst.contains(' ') {
         return None;
     }
@@ -403,7 +403,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                 // land here with no stack slot: a carrier destination then
                 // correctly refuses, anything else falls through.)
                 if let Some(comma) = line.rfind(',') {
-                    let dst = line[comma + 1..].trim();
+                    let dst = line[comma + 1..].trim_ascii();
                     if !dst.contains('(') && !dst.contains(' ') {
                         // The `*b*` forms read 1 byte, the `*w*` forms 2
                         // (5th mnemonic character).
@@ -540,7 +540,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                 let off = if matches!(infos[ri].kind, LineKind::LoadRbp { .. }) {
                     parse_stack_operand(text, true)
                 } else if infos[ri].kind == LineKind::Nop {
-                    let raw = store.get(ri).trim();
+                    let raw = store.get(ri).trim_ascii();
                     parse_stack_operand(raw, true)
                 } else if text.starts_with("movsbq ")
                     || text.starts_with("movswq ")
@@ -578,9 +578,9 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         let jmp_line =
             infos[seq_indices[test_scan + 1]].trimmed(store.get(seq_indices[test_scan + 1]));
         let (is_jne, branch_target) = if let Some(target) = jmp_line.strip_prefix("jne ") {
-            (true, target.trim())
+            (true, target.trim_ascii())
         } else if let Some(target) = jmp_line.strip_prefix("je ") {
-            (false, target.trim())
+            (false, target.trim_ascii())
         } else {
             i += 1;
             continue;

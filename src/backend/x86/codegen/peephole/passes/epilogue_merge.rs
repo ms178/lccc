@@ -119,7 +119,7 @@ fn occupied_label_names(store: &LineStore) -> FxHashSet<String> {
     let mut labels = FxHashSet::default();
     for i in 0..store.len() {
         for line in store.get(i).lines() {
-            let text = line.trim();
+            let text = line.trim_ascii();
             if let Some(label) = text.strip_suffix(':') {
                 if !label.is_empty() {
                     labels.insert(label.to_string());
@@ -276,7 +276,7 @@ fn merge_one_function(
             } else {
                 let label = fresh_label(label_seq, occupied);
                 let at = exits[host].line_of[host_parts.len() - guest_parts.len()];
-                store.replace(at, format!("{}:\n{}", label, store.get(at).trim_end()));
+                store.replace(at, format!("{}:\n{}", label, store.get(at).trim_ascii_end()));
                 infos[at] = classify_line(store.get(at));
                 host_labels.insert(key, label.clone());
                 label

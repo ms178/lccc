@@ -1499,7 +1499,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             continue;
         };
         let (cc_txt, breg) = rest.split_at(sp);
-        let (Some(cc), breg) = (canonical_cc(cc_txt), breg.trim()) else {
+        let (Some(cc), breg) = (canonical_cc(cc_txt), breg.trim_ascii()) else {
             i += 1;
             continue;
         };
@@ -2279,7 +2279,7 @@ fn is_pure_reg_bump(t: &str, info: &LineInfo) -> bool {
         .or_else(|| t.strip_prefix("subl $"))
     {
         if let Some((_, reg)) = split_two_operands(rest) {
-            return plain_gp_operand(reg.trim()) == Some(dst);
+            return plain_gp_operand(reg.trim_ascii()) == Some(dst);
         }
         return false;
     }
@@ -2289,7 +2289,7 @@ fn is_pure_reg_bump(t: &str, info: &LineInfo) -> bool {
         .or_else(|| t.strip_prefix("decq "))
         .or_else(|| t.strip_prefix("decl "))
     {
-        return plain_gp_operand(rest.trim()) == Some(dst);
+        return plain_gp_operand(rest.trim_ascii()) == Some(dst);
     }
     false
 }
@@ -2449,7 +2449,7 @@ pub(super) fn fold_arithmetic_test_sign_cmov(
                     {
                         break;
                     }
-                    let new_line = format!("    cmov{replacement}{width} {src}, {}", dst.trim());
+                    let new_line = format!("    cmov{replacement}{width} {src}, {}", dst.trim_ascii());
                     replace_line(store, &mut infos[n], n, new_line);
                     mark_nop(&mut infos[test_idx]);
                     cmov_idx = Some(n);
@@ -3577,7 +3577,7 @@ fn strip_width_suffix<'a>(t: &'a str, base: &str) -> Option<&'a str> {
     if !rest.starts_with(' ') {
         return None;
     }
-    Some(rest.trim_start())
+    Some(rest.trim_ascii_start())
 }
 
 #[cfg(test)]
@@ -4135,7 +4135,7 @@ mod tests {
         assert!(!out.contains("leal"), "{out}");
         assert!(
             out.lines().any(|l| {
-                let l = l.trim();
+                let l = l.trim_ascii();
                 l.starts_with("addl $1, ") && (l.ends_with("%r8d") || l.ends_with("%ebx"))
             }),
             "{out}"
@@ -4469,7 +4469,7 @@ mod tests {
             assert!(!super::fold_copy_and_mask_into_test(&mut store, &mut infos));
             (0..store.len())
                 .filter(|&i| !infos[i].is_nop())
-                .map(|i| store.get(i).trim().to_string())
+                .map(|i| store.get(i).trim_ascii().to_string())
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -4513,7 +4513,7 @@ mod tests {
         assert!(super::fold_copy_and_mask_into_test(&mut store, &mut infos));
         let out = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(out.contains("testb %al, %al"), "{out}");
@@ -5625,7 +5625,7 @@ pub(super) fn fold_setcc_increment(store: &mut LineStore, infos: &mut [LineInfo]
             "sete" => false,
             _ => continue,
         };
-        let b = b.trim();
+        let b = b.trim_ascii();
         let Some(b_fam) = plain_gp_operand(b) else {
             continue;
         };
@@ -6538,7 +6538,7 @@ mod walker_comment_and_sibling_tests {
 
     fn line(store: &LineStore, text: &str) -> usize {
         (0..store.len())
-            .find(|&i| store.get(i).trim() == text)
+            .find(|&i| store.get(i).trim_ascii() == text)
             .unwrap()
     }
 

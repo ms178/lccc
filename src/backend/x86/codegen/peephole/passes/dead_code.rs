@@ -268,7 +268,7 @@ fn parse_fp_reg_move(t: &str) -> Option<(u32, u32)> {
     let mut idxs = [u32::MAX; 3];
     let mut n = 0usize;
     for op in rest.split(',') {
-        let op = op.trim();
+        let op = op.trim_ascii();
         let name = op.strip_prefix('%')?;
         let num = name.strip_prefix("xmm")?.parse::<u32>().ok()?;
         if n == 3 {
@@ -587,7 +587,7 @@ fn frame_base(line: &str, default: u8) -> u8 {
 /// N and `addq $N,%rsp` subtracts N. `None` means the shift cannot be parsed
 /// as a constant, so the caller must keep its historical fail-closed rule.
 fn rsp_delta_step(t: &str) -> Option<i64> {
-    let t = t.trim();
+    let t = t.trim_ascii();
     if t.starts_with("push") {
         return Some(8);
     }
@@ -651,7 +651,7 @@ fn sib_frame_read_range(
     let inside = &line[lp + 1..rp];
     let mut fields = inside.split(',');
     fields.next()?;
-    let idx = fields.next()?.trim();
+    let idx = fields.next()?.trim_ascii();
     let scale: i32 = match fields.next().map(str::trim) {
         None | Some("") => 1,
         Some(s) => s.parse().ok()?,
@@ -726,7 +726,7 @@ fn sib_frame_read_range(
 
     /// Parse `$N` (decimal or 0x hex) into a positive i64.
     fn pos_imm(s: &str) -> Option<i64> {
-        let s = s.trim();
+        let s = s.trim_ascii();
         let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
             i64::from_str_radix(h, 16).ok()?
         } else {
@@ -758,7 +758,7 @@ fn sib_frame_read_range(
                 for pre in ["addq $", "addl $"] {
                     if let Some(rest) = t.strip_prefix(pre) {
                         let (imm_str, dst) = rest.split_once(',')?;
-                        if register_family_fast(dst.trim()) == family {
+                        if register_family_fast(dst.trim_ascii()) == family {
                             legal_step = pos_imm(imm_str).is_some();
                         }
                         break;
@@ -772,12 +772,12 @@ fn sib_frame_read_range(
             if !legal_step && t.starts_with("leaq ") {
                 let rest = t.strip_prefix("leaq ").unwrap_or("");
                 if let Some((mem, dst)) = rest.split_once(',') {
-                    if register_family_fast(dst.trim()) == family {
+                    if register_family_fast(dst.trim_ascii()) == family {
                         let open = mem.find('(')?;
                         let close = mem.rfind(')')?;
                         let inside = &mem[open + 1..close];
                         let mut comps = inside.split(',');
-                        let base = comps.next().unwrap_or("").trim();
+                        let base = comps.next().unwrap_or("").trim_ascii();
                         let stride_idx = comps.next().map(str::trim);
                         let stride = if let Some(si) = stride_idx {
                             if !si.is_empty() && si != idx {
@@ -790,7 +790,7 @@ fn sib_frame_read_range(
                         } else {
                             true
                         };
-                        let disp_txt = mem[..open].trim();
+                        let disp_txt = mem[..open].trim_ascii();
                         let disp = if disp_txt.is_empty() {
                             Some(0i64)
                         } else {
@@ -820,8 +820,8 @@ fn sib_frame_read_range(
             .or_else(|| t.strip_prefix("cmpl $"))
         {
             let (imm_str, cmp_reg) = rest.split_once(',')?;
-            if register_family_fast(cmp_reg.trim()) == family {
-                let imm: i32 = imm_str.trim().parse().ok()?;
+            if register_family_fast(cmp_reg.trim_ascii()) == family {
+                let imm: i32 = imm_str.trim_ascii().parse().ok()?;
                 // Find the next non-nop conditional jump.
                 let mut j = k + 1;
                 while j < block_end && infos[j].is_nop() {
@@ -874,7 +874,7 @@ fn sib_frame_read_range(
         }
         let a = if t.starts_with("movq $") || t.starts_with("movl $") {
             t.split(',').next().and_then(|p| {
-                p.trim()
+                p.trim_ascii()
                     .trim_start_matches("movq $")
                     .trim_start_matches("movl $")
                     .parse::<i32>()
@@ -946,9 +946,9 @@ fn slot_is_ever_read(
 // an arbitrary 16/32/64-byte ceiling is not a bound on state images or future
 // instructions. Unknown extents make this function's slot analysis opaque.
 fn frame_read_extent(line: &str) -> Option<i32> {
-    let code = line.split('#').next()?.trim();
+    let code = line.split('#').next()?.trim_ascii();
     let (mnemonic, operands) = code.split_once(char::is_whitespace)?;
-    super::fp_liveness::read_extent(mnemonic, operands.trim())
+    super::fp_liveness::read_extent(mnemonic, operands.trim_ascii())
 }
 
 pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
@@ -1831,7 +1831,7 @@ mod tests {
         let (store, mut infos) = build(asm);
         let line = |text: &str, nth: usize| {
             (0..store.len())
-                .filter(|&i| store.get(i).trim() == text)
+                .filter(|&i| store.get(i).trim_ascii() == text)
                 .nth(nth)
                 .unwrap()
         };
@@ -1879,7 +1879,7 @@ mod tests {
         eliminate_never_read_stores(&store, &mut infos);
         let kept: Vec<&str> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim())
+            .map(|i| store.get(i).trim_ascii())
             .filter(|t| t.contains("(%rsp)"))
             .collect();
         assert!(
@@ -1910,7 +1910,7 @@ mod tests {
         eliminate_never_read_stores(&store, &mut infos);
         let kept: Vec<&str> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim())
+            .map(|i| store.get(i).trim_ascii())
             .filter(|t| t.contains("(%rsp)"))
             .collect();
         assert!(
@@ -2280,7 +2280,7 @@ mod tests {
     fn dse_removed(asm: &str, text: &str) -> bool {
         let (store, mut infos) = build(asm);
         let idx = (0..store.len())
-            .find(|&i| store.get(i).trim() == text)
+            .find(|&i| store.get(i).trim_ascii() == text)
             .expect("probe line present");
         eliminate_never_read_stores(&store, &mut infos);
         infos[idx].is_nop()

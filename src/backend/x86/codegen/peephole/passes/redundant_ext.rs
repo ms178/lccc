@@ -194,8 +194,8 @@ fn split_two_operands(t: &str) -> Option<(&str, &str)> {
     while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
         so += 1;
     }
-    let src = t[so..comma].trim();
-    let dst = t[comma + 1..].trim();
+    let src = t[so..comma].trim_ascii();
+    let dst = t[comma + 1..].trim_ascii();
     if src.is_empty() || dst.is_empty() {
         return None;
     }
@@ -445,7 +445,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
 
     for i in 0..lines.len() {
         let line = &lines[i];
-        let t = line.trim();
+        let t = line.trim_ascii();
         if t.is_empty() {
             continue;
         }
@@ -528,8 +528,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                         so += 1;
                     }
-                    let src = t[so..comma].trim();
-                    let dst = t[comma + 1..].trim();
+                    let src = t[so..comma].trim_ascii();
+                    let dst = t[comma + 1..].trim_ascii();
                     // Register source only: a memory source is a real load.
                     if src.starts_with('%') {
                         if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
@@ -585,8 +585,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                     so += 1;
                 }
-                let src = t[so..comma].trim();
-                let dst = t[comma + 1..].trim();
+                let src = t[so..comma].trim_ascii();
+                let dst = t[comma + 1..].trim_ascii();
                 let src_fam = family_of_reg(src);
                 let dst_fam = family_of_reg(dst);
                 if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
@@ -682,8 +682,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                     so += 1;
                 }
-                let src = t[so..comma].trim();
-                let dst = t[comma + 1..].trim();
+                let src = t[so..comma].trim_ascii();
+                let dst = t[comma + 1..].trim_ascii();
                 let src_fam = family_of_reg(src);
                 let dst_fam = family_of_reg(dst);
                 if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
@@ -802,8 +802,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     so += 1;
                 }
                 if so < comma && comma < t.len() {
-                    let src = t[so..comma].trim();
-                    let dst = t[comma + 1..].trim();
+                    let src = t[so..comma].trim_ascii();
+                    let dst = t[comma + 1..].trim_ascii();
                     if src.starts_with('%') && dst.starts_with('%') {
                         if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
                             if (sf as usize) < GP_FAMILIES && (df as usize) < GP_FAMILIES {
@@ -825,7 +825,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                                 if upper32_zero[sf as usize] {
                                     if let Some(d32) = reg32_name(df) {
                                         let next = (i + 1..lines.len())
-                                            .map(|j| lines[j].trim())
+                                            .map(|j| lines[j].trim_ascii())
                                             .find(|candidate| {
                                                 !candidate.is_empty()
                                                     && !candidate.starts_with('.')
@@ -1211,8 +1211,8 @@ fn update_facts_for_movq(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
             clear_mentioned_families(t, facts);
             return;
         }
-        let src = t[so..comma].trim();
-        let dst = t[comma + 1..].trim();
+        let src = t[so..comma].trim_ascii();
+        let dst = t[comma + 1..].trim_ascii();
         let src_fam = family_of_reg(src);
         let dst_fam = family_of_reg(dst);
         if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
@@ -1298,11 +1298,11 @@ fn wide_scan_preload(t: &str) -> Option<u8> {
     if !matches!(op, "movl" | "movq" | "movabsq") {
         return None;
     }
-    let imm = rest.trim_start().strip_prefix('$')?;
+    let imm = rest.trim_ascii_start().strip_prefix('$')?;
     let DstKind::Reg(df) = classify_dst(t) else {
         return None;
     };
-    let imm = imm.split(',').next()?.trim();
+    let imm = imm.split(',').next()?.trim_ascii();
     let (neg, mag) = match imm.strip_prefix('-') {
         Some(m) => (true, m),
         None => (false, imm),

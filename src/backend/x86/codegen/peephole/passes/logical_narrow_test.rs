@@ -24,7 +24,7 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((_, destination)) = operands.rsplit_once(',') else {
             continue;
         };
-        let destination = destination.trim();
+        let destination = destination.trim_ascii();
         let valid = if test == "testb" {
             REG_NAMES[3].contains(&destination)
                 || ["%ah", "%bh", "%ch", "%dh"].contains(&destination)

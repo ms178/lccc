@@ -163,8 +163,8 @@ fn eliminate_redundant_self_zext_with_policy(
                 // is a no-op.
                 let is_redundant_self_zext = if t.starts_with("movl ") && dest_reg <= 15 {
                     if let Some((s1, s2)) = t["movl ".len()..].split_once(',') {
-                        let a = register_family_fast(s1.trim());
-                        let b = register_family_fast(s2.trim());
+                        let a = register_family_fast(s1.trim_ascii());
+                        let b = register_family_fast(s2.trim_ascii());
                         // Cross-register zext copy with a proven-zero source
                         // upper half: recorded here, where the fact is a
                         // property of THIS program point, and folded after
@@ -176,8 +176,8 @@ fn eliminate_redundant_self_zext_with_policy(
                             && b <= 15
                             && !matches!(a, 4 | 5)
                             && !matches!(b, 4 | 5)
-                            && s1.trim() == REG_NAMES[1][a as usize]
-                            && s2.trim() == REG_NAMES[1][b as usize]
+                            && s1.trim_ascii() == REG_NAMES[1][a as usize]
+                            && s2.trim_ascii() == REG_NAMES[1][b as usize]
                             && zero_upper[a as usize]
                         {
                             zext_copy_candidates.push((i, a, b));
@@ -464,7 +464,7 @@ fn xmm_bitcast_self_zext(
         return None;
     };
     let (src, dst) = rest.split_once(',')?;
-    let (src, dst) = (src.trim(), dst.trim());
+    let (src, dst) = (src.trim_ascii(), dst.trim_ascii());
     if !src.starts_with("%xmm") || !dst.starts_with("%r") {
         return None;
     }
@@ -475,7 +475,7 @@ fn xmm_bitcast_self_zext(
     }
     let self_zext = infos[i].trimmed(store.get(i));
     let (a, b) = self_zext["movl ".len()..].split_once(',')?;
-    if register_family_fast(a.trim()) != register_family_fast(b.trim()) {
+    if register_family_fast(a.trim_ascii()) != register_family_fast(b.trim_ascii()) {
         return None;
     }
     Some((
@@ -514,7 +514,7 @@ fn top_level_operand_count(t: &str) -> usize {
         return 0;
     };
     let mut depth = 0i32;
-    let mut count = usize::from(!ops.trim().is_empty());
+    let mut count = usize::from(!ops.trim_ascii().is_empty());
     for c in ops.chars() {
         match c {
             '(' => depth += 1,
@@ -530,10 +530,10 @@ fn top_level_operand_count(t: &str) -> usize {
 /// only operand of a one-operand instruction.
 fn explicit_dest_token(t: &str) -> &str {
     match t.rsplit_once(',') {
-        Some((_, last)) => last.trim(),
+        Some((_, last)) => last.trim_ascii(),
         None => t
             .split_once(char::is_whitespace)
-            .map_or("", |(_, op)| op.trim()),
+            .map_or("", |(_, op)| op.trim_ascii()),
     }
 }
 
@@ -582,7 +582,7 @@ mod tests {
             .collect();
         eliminate_redundant_self_zext(&mut store, &mut infos);
         (0..store.len())
-            .filter(|&i| !infos[i].is_nop() && store.get(i).trim() == self_zext)
+            .filter(|&i| !infos[i].is_nop() && store.get(i).trim_ascii() == self_zext)
             .count()
     }
 
@@ -593,7 +593,7 @@ mod tests {
             .collect();
         eliminate_redundant_self_zext_with_policy(&mut store, &mut infos, preserve_fallthrough);
         (0..store.len())
-            .filter(|&i| !infos[i].is_nop() && store.get(i).trim() == self_zext)
+            .filter(|&i| !infos[i].is_nop() && store.get(i).trim_ascii() == self_zext)
             .count()
     }
 
@@ -606,7 +606,7 @@ mod tests {
         eliminate_redundant_self_zext(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect()
     }
 
@@ -810,8 +810,8 @@ mod tests {
             .collect();
         eliminate_redundant_self_zext(&mut store, &mut infos);
         (0..store.len())
-            .filter(|&i| !infos[i].is_nop() && !store.get(i).trim().is_empty())
-            .map(|i| store.get(i).trim().to_string())
+            .filter(|&i| !infos[i].is_nop() && !store.get(i).trim_ascii().is_empty())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| !l.starts_with('.'))
             .collect()
     }
@@ -850,7 +850,7 @@ mod tests {
             .collect();
         mark_nop(&mut infos[1]);
         assert!(eliminate_redundant_self_zext(&mut store, &mut infos));
-        assert_eq!(store.get(0).trim(), "movd %xmm9, %eax");
+        assert_eq!(store.get(0).trim_ascii(), "movd %xmm9, %eax");
         assert!(infos[1].is_nop() && infos[2].is_nop());
     }
 
@@ -873,7 +873,7 @@ mod tests {
             let got = fuse(asm);
             let want: Vec<String> = asm
                 .lines()
-                .map(|l| l.trim().to_string())
+                .map(|l| l.trim_ascii().to_string())
                 .filter(|l| !l.is_empty())
                 .collect();
             assert_eq!(got, want, "must refuse: {asm:?}");
@@ -890,8 +890,8 @@ mod tests {
             .collect();
         infos[0].pinned = true;
         eliminate_redundant_self_zext(&mut store, &mut infos);
-        assert_eq!(store.get(0).trim(), "movq %xmm9, %rax");
-        assert_eq!(store.get(1).trim(), "movl %eax, %eax");
+        assert_eq!(store.get(0).trim_ascii(), "movq %xmm9, %rax");
+        assert_eq!(store.get(1).trim_ascii(), "movl %eax, %eax");
     }
 
     /// A memory-destination ALU/`mov` writes no register: the index's

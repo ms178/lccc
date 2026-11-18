@@ -399,7 +399,7 @@ fn rsp_imm(line: &str, prefix: &str) -> Option<i64> {
 /// `(%register, offset)` of `.cfi_offset %reg, -O`.
 fn cfi_offset_operands(line: &str) -> Option<(&str, i64)> {
     let (reg, off) = line.strip_prefix(".cfi_offset ")?.split_once(',')?;
-    Some((reg.trim(), off.trim().parse::<i64>().ok()?))
+    Some((reg.trim_ascii(), off.trim_ascii().parse::<i64>().ok()?))
 }
 
 fn next_insn(store: &LineStore, infos: &[LineInfo], from: usize, end: usize) -> usize {
@@ -538,7 +538,7 @@ fn fpo_function(store: &mut LineStore, infos: &mut [LineInfo], start: usize, fun
             LineKind::Call => has_call = true,
             LineKind::Directive => {
                 if let Some(v) = line.strip_prefix(".cfi_def_cfa_offset ") {
-                    let Ok(v) = v.trim().parse::<i64>() else {
+                    let Ok(v) = v.trim_ascii().parse::<i64>() else {
                         return;
                     };
                     cfa_lines.push((k, v));
@@ -687,7 +687,7 @@ fn collapse_superseded_cfa(
             if let Some(prev) = pending.replace(k) {
                 mark_nop(&mut infos[prev]);
             }
-            if at_entry && v.trim() == "8" {
+            if at_entry && v.trim_ascii() == "8" {
                 mark_nop(&mut infos[k]);
                 pending = None;
             }

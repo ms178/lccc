@@ -167,8 +167,8 @@ fn parse_reg_to_reg_mov(trimmed: &str) -> Option<(usize, RegId, RegId)> {
         return None;
     };
     let (src_part, dst_part) = mnemonic.split_once(',')?;
-    let src = src_part.trim();
-    let dst = dst_part.trim();
+    let src = src_part.trim_ascii();
+    let dst = dst_part.trim_ascii();
     if !src.starts_with('%') || !dst.starts_with('%') || src.contains('(') || dst.contains('(') {
         return None;
     }
@@ -310,7 +310,7 @@ fn update_upper32_zero(t: &str, upper32_zero: &mut [bool]) {
 
     if writes_zx32 {
         if let Some(comma) = t.rfind(',') {
-            let dst = t[comma + 1..].trim();
+            let dst = t[comma + 1..].trim_ascii();
             if let Some(df) = family_of_reg_name(dst) {
                 if (df as usize) < upper32_zero.len() {
                     upper32_zero[df as usize] = true;
@@ -328,7 +328,7 @@ fn update_upper32_zero(t: &str, upper32_zero: &mut [bool]) {
     // 64-bit reader in the same block.
     if op == "andq" {
         if let Some(comma) = t.rfind(',') {
-            let dst = t[comma + 1..].trim();
+            let dst = t[comma + 1..].trim_ascii();
             if let Some(df) = family_of_reg_name(dst) {
                 if (df as usize) < upper32_zero.len()
                     && super::relay_and_lea::and_imm_narrow_width(t, df).is_some()
@@ -406,8 +406,8 @@ fn parse_reg_to_reg_ext(trimmed: &str) -> Option<(usize, RegId, RegId)> {
         return None; // not an extension
     }
     let (src_part, dst_part) = operands.split_once(',')?;
-    let src = src_part.trim();
-    let dst = dst_part.trim();
+    let src = src_part.trim_ascii();
+    let dst = dst_part.trim_ascii();
     if !src.starts_with('%') || !dst.starts_with('%') || src.contains('(') || dst.contains('(') {
         return None;
     }
@@ -614,11 +614,11 @@ fn loop_latch_increment_bounds_identity(
         let Some((imm, dst)) = rest.rsplit_once(',') else {
             return false;
         };
-        if dst.trim() != i32_name {
+        if dst.trim_ascii() != i32_name {
             return false;
         }
         return imm
-            .trim()
+            .trim_ascii()
             .parse::<i64>()
             .ok()
             .is_some_and(|value| (0..i32::MAX as i64).contains(&value));
@@ -676,10 +676,10 @@ fn sign_extend_is_identity(store: &LineStore, infos: &[LineInfo], at: usize, fam
         let Some((src, dst)) = args.rsplit_once(',') else {
             return false;
         };
-        let dst = dst.trim();
+        let dst = dst.trim_ascii();
         // A loop latch's `addl $1` has no static bound of its own; the counted
         // loop around it does (see the proof).
-        if op == "addl" && src.trim() == "$1" && dst == REG_NAMES[W32][fam as usize] {
+        if op == "addl" && src.trim_ascii() == "$1" && dst == REG_NAMES[W32][fam as usize] {
             return loop_latch_increment_bounds_identity(store, infos, at, fam);
         }
         if !((op == "andl" || op == "movl") && dst == REG_NAMES[W32][fam as usize]
@@ -687,7 +687,7 @@ fn sign_extend_is_identity(store: &LineStore, infos: &[LineInfo], at: usize, fam
         {
             return false;
         }
-        let Some(imm) = src.trim().strip_prefix('$') else {
+        let Some(imm) = src.trim_ascii().strip_prefix('$') else {
             return false;
         };
         let value = if let Some(hex) = imm.strip_prefix("0x") {
@@ -1172,8 +1172,8 @@ fn parse_copyback_producer(trimmed: &str) -> Option<(CopybackProducer<'_>, RegId
     {
         let is_q = trimmed.starts_with("movq ");
         let (src, dst) = rest.rsplit_once(',')?;
-        let src = src.trim();
-        let dst = dst.trim();
+        let src = src.trim_ascii();
+        let dst = dst.trim_ascii();
         // Memory source only (register copies are fold_register_copies'
         // job) and a plain GP destination of the load's own width.
         if !src.contains('(') || !src.ends_with(')') || src.starts_with('%') {
@@ -1192,23 +1192,23 @@ fn parse_copyback_producer(trimmed: &str) -> Option<(CopybackProducer<'_>, RegId
     }
     if let Some(rest) = trimmed.strip_prefix("leaq ") {
         let (src, dst) = rest.rsplit_once(',')?;
-        let dst = dst.trim();
+        let dst = dst.trim_ascii();
         let fam = plain_reg_family(dst)?;
         if dst != REG_NAMES[W64][fam as usize] {
             return None;
         }
         // `disp(%base)` — plain base, no index/scale (the induction bump).
-        let src = src.trim();
+        let src = src.trim_ascii();
         let Some(open) = src.find('(') else {
             return None;
         };
         if !src.ends_with(')') {
             return None;
         }
-        let disp = src[..open].trim();
+        let disp = src[..open].trim_ascii();
         let base_str = &src[open + 1..src.len() - 1];
         if !base_str.contains(',') {
-            let base = plain_reg_family(base_str.trim())?;
+            let base = plain_reg_family(base_str.trim_ascii())?;
             return Some((CopybackProducer::Lea { disp, base }, fam));
         }
         return Some((CopybackProducer::LeaMem { mem: src }, fam));
@@ -1592,7 +1592,7 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
             mark_nop(&mut infos[c]);
         }
         for (j, rw) in rewritten_uses {
-            replace_line(store, &mut infos[j], j, format!("    {}", rw.trim_start()));
+            replace_line(store, &mut infos[j], j, format!("    {}", rw.trim_ascii_start()));
         }
         // Edits: the producer `i`, the copy `c` and the uses, all inside the
         // barrier-free windows `[i, c]` and `(c, dead_at]` (`dead_at` < `c`
@@ -1668,7 +1668,7 @@ mod inline_asm_tests {
         fold_register_copies(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len()).map(|i| store.get(i).to_string()).collect();
         assert!(
-            out.iter().any(|l| l.trim() == "movq %r10, %r11"),
+            out.iter().any(|l| l.trim_ascii() == "movq %r10, %r11"),
             "user asm bytes must be immutable; got:\n{}",
             out.join("\n")
         );
@@ -1690,7 +1690,7 @@ mod inline_asm_tests {
         let (mut store, mut infos) = build_pinned(asm);
         let _ = fold_register_copies(&mut store, &mut infos);
         assert!(
-            (0..store.len()).any(|i| store.get(i).trim() == "movq %rax, %rax"),
+            (0..store.len()).any(|i| store.get(i).trim_ascii() == "movq %rax, %rax"),
             "the placeholder must reach the assembler"
         );
     }

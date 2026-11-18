@@ -34,7 +34,7 @@ fn count(hay: &str, needle: &str) -> usize {
 
 /// Count lines that are exactly `ret` (a `.Lret…` label must not match).
 fn count_rets(hay: &str) -> usize {
-    hay.lines().filter(|l| l.trim() == "ret").count()
+    hay.lines().filter(|l| l.trim_ascii() == "ret").count()
 }
 
 // ── A. positives: genuinely dead leaf frames fold ──────────────────────────
@@ -265,8 +265,8 @@ fn a_tls_descriptor_call_keeps_the_alignment_frame_and_its_live_values() {
 /// The CFA rows of `out`, in order.
 fn cfa_rows(out: &str) -> Vec<i64> {
     out.lines()
-        .filter_map(|l| l.trim().strip_prefix(".cfi_def_cfa_offset "))
-        .map(|v| v.trim().parse().unwrap())
+        .filter_map(|l| l.trim_ascii().strip_prefix(".cfi_def_cfa_offset "))
+        .map(|v| v.trim_ascii().parse().unwrap())
         .collect()
 }
 

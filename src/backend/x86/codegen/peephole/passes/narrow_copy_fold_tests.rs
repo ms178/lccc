@@ -946,7 +946,7 @@ mod frame_register_gate {
         fold_register_copies(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1513,7 +1513,7 @@ fn an_inplace_zext_whose_cleared_bits_are_read_stays() {
         "    movzbl %r11b, %r11d\n    movb %r11b, (%rdi)\n    jmp .LBB1\n.LBB1:\n    movl %r11d, %eax\n    ret",
     ] {
         let out = run(&f(body));
-        let ext = body.lines().next().unwrap().trim();
+        let ext = body.lines().next().unwrap().trim_ascii();
         assert_eq!(count(&out, ext), 1, "{body}:\n{out}");
     }
 }

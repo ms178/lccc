@@ -152,14 +152,14 @@ pub(crate) fn call_markers(store: &LineStore, infos: &[LineInfo], n: usize) -> C
         } else if mk.starts_with("# LCCC_CHAIN_CALL") {
             m.chain = true;
         } else if let Some(rest) = mk.strip_prefix("# LCCC_CALL_ARGS ") {
-            if let Ok(v) = rest.trim().parse::<usize>() {
+            if let Ok(v) = rest.trim_ascii().parse::<usize>() {
                 m.gp_args = v.min(6);
             }
         } else if let Some(rest) = mk.strip_prefix("# LCCC_IPA_KEEP ") {
             // Fail-closed parse: an illegible mask keeps every caller-saved
             // family live (read) at the call.
             m.ipa_keep = rest
-                .trim()
+                .trim_ascii()
                 .strip_prefix("0x")
                 .and_then(|h| u16::from_str_radix(h, 16).ok())
                 .map_or(CALLER_SAVED, |v| v & CALLER_SAVED);
@@ -475,7 +475,7 @@ pub(crate) fn is_string_instruction(t: &str) -> bool {
     if m.as_bytes()[0] == b'r' {
         for p in ["repne ", "repnz ", "repe ", "repz ", "rep "] {
             if let Some(rest) = m.strip_prefix(p) {
-                m = rest.trim_start();
+                m = rest.trim_ascii_start();
                 break;
             }
         }
@@ -616,7 +616,7 @@ fn mnemonic_is_known(t: &str) -> bool {
         // any instruction whose implicit register contract it knows is as
         // trustworthy as the explicit list (this is what lets `cltd` —
         // emitted for every 32-bit division — take the precise path).
-        || implicit_reg_refs(t.trim().as_bytes()) != 0
+        || implicit_reg_refs(t.trim_ascii().as_bytes()) != 0
 }
 
 impl FileLiveness {
@@ -1204,7 +1204,7 @@ impl FileLiveness {
             }
             let t = infos[n].trimmed(store.get(n));
             if let Some(m) = t.strip_prefix("# LCCC_RET_RDX ") {
-                match m.trim() {
+                match m.trim_ascii() {
                     "1" => return Some(true),
                     "0" => return Some(false),
                     _ => {} // illegible: keep looking, then fall back
@@ -1236,7 +1236,7 @@ impl FileLiveness {
             }
             let t = infos[n].trimmed(store.get(n));
             if let Some(m) = t.strip_prefix("# LCCC_RET_RAX ") {
-                match m.trim() {
+                match m.trim_ascii() {
                     "1" => return Some(true),
                     "0" => return Some(false),
                     _ => {} // illegible: keep looking, then fall back
@@ -1839,8 +1839,8 @@ impl FileLiveness {
                 continue;
             };
             let (Some(base_reg), Some(add_dst)) = (
-                add_rest.split_once(',').map(|(b, _)| b.trim()),
-                add_rest.split_once(',').map(|(_, d)| d.trim()),
+                add_rest.split_once(',').map(|(b, _)| b.trim_ascii()),
+                add_rest.split_once(',').map(|(_, d)| d.trim_ascii()),
             ) else {
                 continue;
             };
@@ -1859,7 +1859,7 @@ impl FileLiveness {
             if parts.len() != 3 || parts[0] != base_reg || parts[2] != "4" {
                 continue;
             }
-            let mov_dst = mov_rest[close + 1..].trim_start_matches(',').trim();
+            let mov_dst = mov_rest[close + 1..].trim_start_matches(',').trim_ascii();
             if mov_dst.trim_start_matches('%') != target_bare {
                 continue;
             }
@@ -1874,10 +1874,10 @@ impl FileLiveness {
             let Some((lea_op, lea_dst)) = lea_rest.split_once(',') else {
                 continue;
             };
-            if lea_dst.trim() != base_reg {
+            if lea_dst.trim_ascii() != base_reg {
                 continue;
             }
-            let lea_op = lea_op.trim();
+            let lea_op = lea_op.trim_ascii();
             let Some(table_name) = lea_op.strip_suffix("(%rip)") else {
                 continue;
             };
@@ -1901,7 +1901,7 @@ impl FileLiveness {
                 if let Some(entry) = kt.strip_prefix(".long ") {
                     // `.long .LBBa - .LjtN` (the subtractand is the table
                     // itself; accept the plain `.long .LBBa` spelling too).
-                    let sym = entry.split('-').next().unwrap_or(entry).trim();
+                    let sym = entry.split('-').next().unwrap_or(entry).trim_ascii();
                     match resolve(sym) {
                         Some(idx) => targets.push(idx),
                         None => {
@@ -2182,7 +2182,7 @@ impl FileLiveness {
                         let name32 = REG_NAMES[1][dest as usize];
                         // A partial write (8/16-bit destination) preserves the
                         // rest of the register, so the old value stays live.
-                        let dst_text = t[t.rfind(',').map(|c| c + 1).unwrap_or(0)..].trim();
+                        let dst_text = t[t.rfind(',').map(|c| c + 1).unwrap_or(0)..].trim_ascii();
                         let full = dst_text == name64 || dst_text == name32;
                         if !src_reads_dest && full {
                             reads &= !bit;
@@ -2200,7 +2200,7 @@ impl FileLiveness {
                         // accumulator live across whole regions and blocked
                         // every copy fold feeding a later zeroing.
                         let ops = t.split_once(' ').and_then(|(_, rest)| {
-                            rest.split_once(',').map(|(a, b)| (a.trim(), b.trim()))
+                            rest.split_once(',').map(|(a, b)| (a.trim_ascii(), b.trim_ascii()))
                         });
                         if let Some((a, b)) = ops {
                             if a == b {
@@ -2320,7 +2320,7 @@ fn may_write_families(info: &LineInfo, t: &str) -> u16 {
 /// `xorq`/`subq` self, `movq $imm`, `movabs[q] $imm`.  Skips its operand
 /// parse on the common 64-bit and memory-destination writes.
 fn write_may_prove_upper_zero(t: &str, fam: RegId) -> bool {
-    let t = t.trim_end();
+    let t = t.trim_ascii_end();
     let dword = REG_NAMES[1][fam as usize];
     if let Some(head) = t.strip_suffix(dword)
         && head.ends_with([',', ' ', '\t'])
@@ -2415,7 +2415,7 @@ mod tests {
             .collect();
         let line = |text: &str| {
             (0..store.len())
-                .find(|&i| store.get(i).trim() == text)
+                .find(|&i| store.get(i).trim_ascii() == text)
                 .unwrap()
         };
         let mut lv = FileLiveness::new(&store, &infos);
@@ -2597,7 +2597,7 @@ mod tests {
             ".cfi_endproc\n",
         ));
         let copy = (0..store.len())
-            .find(|&n| store.get(n).trim() == "movq %rdx, %rax")
+            .find(|&n| store.get(n).trim_ascii() == "movq %rdx, %rax")
             .expect("fixture has the copy");
         assert_eq!(lv.live_after(copy, 0), Some(false));
     }
@@ -3743,11 +3743,11 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         let starts: Vec<usize> = (0..store.len())
-            .filter(|&i| store.get(i).trim() == ".cfi_startproc")
+            .filter(|&i| store.get(i).trim_ascii() == ".cfi_startproc")
             .collect();
         assert_eq!(starts.len(), 2);
         let ends: Vec<usize> = (0..store.len())
-            .filter(|&i| store.get(i).trim() == ".cfi_endproc")
+            .filter(|&i| store.get(i).trim_ascii() == ".cfi_endproc")
             .collect();
         assert_eq!(ends.len(), 2);
 

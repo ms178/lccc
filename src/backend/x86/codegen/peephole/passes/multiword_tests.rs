@@ -24,7 +24,7 @@ fn run_folds(body: &str) -> (bool, String) {
     }
     let out = (0..store.len())
         .filter(|&i| !infos[i].is_nop())
-        .map(|i| store.get(i).trim())
+        .map(|i| store.get(i).trim_ascii())
         .filter(|line| !line.starts_with(".cfi") && *line != "foo:")
         .collect::<Vec<_>>()
         .join("\n");
@@ -54,7 +54,7 @@ enum Place {
 
 impl Cpu {
     fn place(&self, text: &str) -> Place {
-        let text = text.trim();
+        let text = text.trim_ascii();
         if let Some(value) = text.strip_prefix('$') {
             return Place::Imm(value.parse::<i64>().expect("immediate") as u64);
         }
@@ -72,7 +72,7 @@ impl Cpu {
     /// `disp(%base)`, `(%base,%index)`, `(%base,%index,scale)`.
     fn address(&self, text: &str) -> u64 {
         let open = text.find('(').expect("memory operand");
-        let disp = match text[..open].trim() {
+        let disp = match text[..open].trim_ascii() {
             "" => 0i64,
             literal => literal.parse().expect("displacement"),
         };
@@ -127,7 +127,7 @@ impl Cpu {
         let (mnem, args) = line.split_once(' ').unwrap_or((line, ""));
         let operands: Vec<&str> = match top_level_operands(args) {
             Some((a, b)) => vec![a, b],
-            None => vec![args.trim()],
+            None => vec![args.trim_ascii()],
         };
         let size = match mnem.chars().last() {
             Some('q') => Size::Q,
@@ -227,7 +227,7 @@ fn top_level_operands(args: &str) -> Option<(&str, &str)> {
             _ => {}
         }
     }
-    at.map(|i| (args[..i].trim(), args[i + 1..].trim()))
+    at.map(|i| (args[..i].trim_ascii(), args[i + 1..].trim_ascii()))
 }
 
 fn states() -> Vec<Cpu> {
