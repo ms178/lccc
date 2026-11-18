@@ -3346,6 +3346,12 @@ mod tests {
         assert_eq!(orig, std::path::PathBuf::from("/tmp/dump-orig.s"));
         assert_ne!(chain, orig);
         assert_eq!(
+            tag_metric_candidate(MetricCandidate::Deduplicated, || candidate_path(
+                "/tmp/dump.s"
+            )),
+            std::path::PathBuf::from("/tmp/dump-dedup.s")
+        );
+        assert_eq!(
             tag_metric_candidate(MetricCandidate::Chain, || candidate_path("/tmp/dump")),
             std::path::PathBuf::from("/tmp/dump-chain"),
             "a path without an extension still gains the suffix"

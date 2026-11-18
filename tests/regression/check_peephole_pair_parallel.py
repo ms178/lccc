@@ -9,9 +9,9 @@ Scheduling, accounting and reproducibility are checked on **every backend**
    assembly-level difference is permitted; the only observable proof that the
    concurrent branch ran is the `[pair] … mode=…` telemetry, which also pins
    the kill switch and the single-thread fallback.
-2. *Accounting* — the counters on the `[pair]` line must add up to the number
-   of pairs the compilation reported. A split that silently stops counting
-   would pass the identity check while proving nothing about which path ran.
+2. *Accounting* — the serial and parallel counters must match their reported
+   modes. Identical candidates increment the dedupe counter but aren't
+   scheduled, so they don't produce a `[pair]` line.
 3. *Reproducibility* — repeated compilation of one source must produce one
    assembly hash. This is what caught RS-1: the RISC-V identical-block pass
    iterated a `std::collections::HashMap`, so its per-process hash seed decided
@@ -124,16 +124,17 @@ def compile_asm(compiler, source, knob, workdir, tag, opt="-O1", *, dump=None):
 
 
 def check_accounting(label, source_name, opt, modes, counters, failures):
-    """`parallel + serial + deduped` must equal the number of reported pairs."""
+    """Only scheduled pairs emit mode lines; deduped is a separate counter."""
     if not modes:
         return
     if counters is None:
         failures.append(f"{label}/{source_name} {opt}: telemetry without counters")
         return
-    if sum(counters) != len(modes):
+    expected = (modes.count("parallel"), modes.count("serial"))
+    if counters[:2] != expected or sum(expected) != len(modes):
         failures.append(
-            f"{label}/{source_name} {opt}: counters {counters} do not account for "
-            f"{len(modes)} pairs"
+            f"{label}/{source_name} {opt}: counters {counters} do not match "
+            f"reported modes {modes}"
         )
 
 
@@ -257,8 +258,8 @@ def main():
     detail = ", ".join(f"{label} {row['pairs']}" for label, row in observed.items())
     print(
         f"PASS {len(observed)} backends ({detail} pairs), threads={threads}: "
-        f"identical assembly across serial/auto/forced and across repeats, "
-        f"counters account for every pair"
+        f"identical assembly across serial/auto/forced and across repeats; "
+        f"scheduled pair counters and x86-64 dump bytes match"
     )
     return 0
 

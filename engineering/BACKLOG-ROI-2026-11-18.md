@@ -413,8 +413,10 @@ GNU ld, lld, mold and lccc-ld identity per comparison; do not silently substitut
   receipts.
 - **Diagnostic and linker evidence.** The four-backend scheduling contract
   ran with one and two available CPUs; the three x86-64 dump files are now
-  also compared byte-for-byte between serial and forced scheduling. Both mold
-  setup paths revalidate the installed release executable against the digest
+  also compared byte-for-byte between serial and forced scheduling. A
+  deduplicated pair gets its own `-dedup` slot, preserving the last distinct
+  pair. Only serial/parallel counters are compared to the scheduled mode
+  lines. Both mold setup paths check the installed release digest
   extracted from the pinned archive, before running its version command. A
   same-banner replacement must not run. LLD's pin is matched to its actual
   version field, not a version mentioned later in a banner. This audit does
