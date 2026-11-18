@@ -861,9 +861,17 @@ impl<'a> TypeGraph<'a> {
                 })
             }
             CType::NullPtr => self.intern(DwarfType::Unspecified { name: "nullptr_t" }),
-            CType::Array(element, count) => {
+            CType::Array(..) => {
+                // One subrange per written dimension, outermost first. A
+                // chain of array DIEs has the same total size, but pahole
+                // reconstructs e.g. `char [2][3]` as `char [3][2]` from it.
+                let mut element = ty;
+                let mut bounds = Vec::new();
+                while let CType::Array(inner, count) = element {
+                    bounds.push(ArrayBound::of(count.map(|n| n as u64)));
+                    element = inner;
+                }
                 let element = self.intern_ctype(element);
-                let bounds = vec![ArrayBound::of(count.map(|count| count as u64))];
                 self.intern(DwarfType::Array {
                     element,
                     bounds,
@@ -938,18 +946,24 @@ impl<'a> TypeGraph<'a> {
         // pointer to a `const pair_t` and not a `pair_t` to a `const struct`.
         enum Layer {
             Pointer(PtrQuals),
-            Array(Option<usize>),
+            Array(Vec<ArrayBound>),
         }
         let mut layers: Vec<Layer> = Vec::new();
         let mut core: &CType = ty;
-        loop {
+        // Stop at the written typedef, even if it names a derived type.
+        while *core != named {
             match core {
                 CType::Pointer(inner, quals) => {
                     layers.push(Layer::Pointer(*quals));
                     core = inner;
                 }
                 CType::Array(inner, count) => {
-                    layers.push(Layer::Array(*count));
+                    let bound = ArrayBound::of(count.map(|n| n as u64));
+                    if let Some(Layer::Array(bounds)) = layers.last_mut() {
+                        bounds.push(bound);
+                    } else {
+                        layers.push(Layer::Array(vec![bound]));
+                    }
                     core = inner;
                 }
                 _ => break,
@@ -963,19 +977,19 @@ impl<'a> TypeGraph<'a> {
         }
         let target = self.intern_ctype(&named);
         let mut index = self.intern_typedef(alias, target);
-        for layer in layers.iter().rev() {
+        for layer in layers.into_iter().rev() {
             index = match layer {
                 Layer::Pointer(quals) => {
                     let sized = self.inner(index);
-                    let target = self.wrap_quals(sized, *quals);
+                    let target = self.wrap_quals(sized, quals);
                     self.intern(DwarfType::Pointer {
                         pointee: Some(target),
                         size: self.pointer_size,
                     })
                 }
-                Layer::Array(count) => self.intern(DwarfType::Array {
+                Layer::Array(bounds) => self.intern(DwarfType::Array {
                     element: index,
-                    bounds: vec![ArrayBound::of(count.map(|count| count as u64))],
+                    bounds,
                     vector: false,
                 }),
             };
@@ -1541,28 +1555,37 @@ mod tests {
     #[test]
     fn multidimension_arrays_keep_declaration_order() {
         let layouts = empty_layouts();
-        let typedefs = FxHashMap::default();
+        let mut typedefs = FxHashMap::default();
+        typedefs.insert("row_t".into(), CType::Array(Box::new(CType::Int), Some(3)));
+        typedefs.insert("cell_t".into(), CType::Int);
         let mut types = graph(&layouts, &typedefs);
-        let inner = types.intern_ctype(&CType::Array(Box::new(CType::Int), Some(3)));
-        let outer = types.intern_ctype(&CType::Array(
-            Box::new(CType::Array(Box::new(CType::Int), Some(3))),
-            Some(2),
-        ));
+        let array = CType::Array(Box::new(typedefs["row_t"].clone()), Some(2));
+        let plain = types.intern_ctype(&array);
+        let rows = types.intern_written(&array, Some("row_t"));
+        let cells = types.intern_written(&array, Some("cell_t"));
         let built = types.into_types();
-        let (inner, outer) = (&built[inner as usize], &built[outer as usize]);
+        let dimensions = [ArrayBound::UpperBound(1), ArrayBound::UpperBound(2)];
         assert!(matches!(
-            inner,
-            DwarfType::Array { bounds, vector: false, .. }
-                if bounds == &vec![ArrayBound::UpperBound(2)]
+            &built[plain as usize],
+            DwarfType::Array { bounds, vector: false, .. } if bounds == &dimensions
         ));
-        assert!(
-            matches!(
-                outer,
-                DwarfType::Array { bounds, vector: false, .. }
-                if bounds == &vec![ArrayBound::UpperBound(1)]
-            ),
-            "the outer dimension is its own array type: {outer:?}"
-        );
+        for (index, expected, alias) in [
+            (rows, &dimensions[..1], "row_t"),
+            (cells, &dimensions[..], "cell_t"),
+        ] {
+            let DwarfType::Array {
+                bounds,
+                element,
+                vector: false,
+            } = &built[index as usize]
+            else {
+                panic!("expected array of {alias}");
+            };
+            assert_eq!(bounds, expected);
+            assert!(
+                matches!(&built[*element as usize], DwarfType::Typedef { name, .. } if name == alias)
+            );
+        }
     }
 
     #[test]

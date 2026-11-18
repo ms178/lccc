@@ -118,6 +118,7 @@ DW_AT_BIT_OFFSET = 0x0C
 DW_AT_DATA_BIT_OFFSET = 0x6B
 DW_AT_UPPER_BOUND = 0x2F
 DW_AT_COUNT = 0x37
+DW_AT_ALIGNMENT = 0x88
 DW_AT_PROTOTYPED = 0x27
 DW_AT_DECLARATION = 0x3C
 DW_AT_CONST_VALUE = 0x1C
@@ -3213,8 +3214,58 @@ def unit_length(elf: Elf, unit: Unit) -> int:
 
 
 
+def check_array_alignment(report: Report, lccc: list[str], gcc: list[str] | None,
+                          workdir: Path) -> None:
+    """Protect the consumer-visible record ABI independently of total size."""
+    fixture = Path(__file__).resolve().with_name("dwarf_array_alignment.c")
+    expected_bounds = {
+        "empty": [(0, None)], "single": [(None, 0)],
+        "matrix": [(None, 1), (None, 2)], "flexible": [(None, None)],
+    }
+    for name, compiler in (("lccc", lccc), ("gcc", gcc)):
+        if compiler is None:
+            continue
+        for version in (4, 5):
+            label = f"{name}-alignment-dwarf{version}"
+            path = workdir / f"{label}.o"
+            if not build(report, compiler, ["-std=gnu11", "-g", f"-gdwarf-{version}"],
+                         [fixture], path, workdir, link=False):
+                continue
+            try:
+                (unit,) = units(read_elf(path))
+                record = die_by_tag_name(unit, DW_TAG_STRUCTURE_TYPE, "audit_record")
+                natural = die_by_tag_name(unit, DW_TAG_STRUCTURE_TYPE, "audit_natural")
+                if record is None or natural is None:
+                    raise ValueError("missing record or natural-alignment control")
+                if (record.attrs.get(DW_AT_BYTE_SIZE), record.attrs.get(DW_AT_ALIGNMENT)) != (64, 64):
+                    raise ValueError("record size/alignment must both be 64")
+                if DW_AT_ALIGNMENT in natural.attrs:
+                    raise ValueError("natural record has a fabricated explicit alignment")
+                members = {die_name(die, unit): die for die in children(unit, record)
+                           if die.tag == DW_TAG_MEMBER}
+                for field, offset in (("tag", 0), ("value", 16), ("empty", 24), ("single", 24),
+                                      ("matrix", 25), ("flexible", 31)):
+                    member = members[field]
+                    alignment = 16 if field == "value" else None
+                    if (member_offset(member), member.attrs.get(DW_AT_ALIGNMENT)) != (offset, alignment):
+                        raise ValueError(f"{field}: expected offset {offset} and alignment {alignment}")
+                    if field not in expected_bounds:
+                        continue
+                    array = type_of(member, unit)
+                    if array is None or array.tag != DW_TAG_ARRAY_TYPE:
+                        raise ValueError(f"{field}: no array type")
+                    got = [(d.attrs.get(DW_AT_COUNT), d.attrs.get(DW_AT_UPPER_BOUND))
+                           for d in children(unit, array) if d.tag == DW_TAG_SUBRANGE_TYPE]
+                    if got != expected_bounds[field]:
+                        raise ValueError(f"{field}: (count, upper) {got} != {expected_bounds[field]}")
+                report.measurements.setdefault("array_alignment", {})[label] = "passed"
+            except (ValueError, KeyError) as error:
+                report.fail("array_alignment", f"{label}: {error}")
+
+
 def run_gate(lccc: list[str], gcc: list[str] | None, workdir: Path) -> Report:
     report = Report()
+    check_array_alignment(report, lccc, gcc, workdir)
     probes = write_probes(workdir)
     spans = {name: function_spans(PROBES[name]) for name in PROBES}
     matrices = (("2", "-O0"), ("3", "-O0"), ("4", "-O0"), ("5", "-O0"), ("5", "-O1"), ("5", "-O2"))
