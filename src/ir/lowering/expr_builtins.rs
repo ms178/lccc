@@ -4432,6 +4432,7 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pcmpeqd256
         | B::X86Pcmpeqq256
         | B::X86Pcmpeqb256
+        | B::X86Pcmpgtb256
         | B::X86Pcmpgtd256
         | B::X86Pcmpgtq256
         | B::X86Phaddw256

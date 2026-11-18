@@ -17,6 +17,14 @@
 
 /* _mm_hsub_ps: horizontal subtract packed single-precision (HSUBPS) */
 
+/* _mm_movedup_pd: duplicate the low double (MOVDDUP). GCC defines it as
+ * _mm_shuffle_pd(x, x, 0), which is the same unpacklo of x with itself. */
+static __inline__ __m128d __attribute__((__always_inline__))
+_mm_movedup_pd(__m128d __a)
+{
+    return _mm_unpacklo_pd(__a, __a);
+}
+
 /* _mm_movehdup_ps: duplicate odd-indexed single-precision elements (MOVSHDUP) */
 
 /* _mm_moveldup_ps: duplicate even-indexed single-precision elements (MOVSLDUP) */
