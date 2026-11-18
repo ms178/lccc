@@ -249,6 +249,17 @@ passes; the backend peepholes are documented per backend
   the one lie that would make a skip unsound. `CCC_TIME_PEEPHOLE=1` reports
   the per-iteration skip count on its `phase1 iteration` lines.
 
+  The same step's trigger-presence rule gates the audited FP/vector pass
+  family (28 pass names, 44 call sites across all phases) on one entry
+  probe: a function whose text never names `%xmm`/`%ymm`/`%zmm` or
+  `vzeroupper` cannot be mutated by passes whose rewrites are anchored on a
+  parsed vector operand, so they are not invoked at all. The probe is
+  monotone (no pass synthesizes a vector register into a function that has
+  none), and it removed the 13.35% of compile instructions those passes
+  spent scanning the all-integer 40-function TU. `CCC_PEEPHOLE_NO_VEC_GATE=1`
+  disables the gate for bisection; the equality oracle covers both
+  directions in `dirty_ticks_tests.rs`.
+
 - **Identical basic-block merging** (`merge_identical_blocks`) — a block is
   deleted and its predecessors retargeted when its instruction text matches
   another block's and either (a) both have the **same non-empty predecessor

@@ -73,6 +73,12 @@ fn snippets() -> Vec<(&'static str, String)> {
             ),
         ),
         (
+            "ymm copy + vzeroupper (AVX probe spellings)",
+            f("vmovapd (%rdi), %ymm0\nvmovapd %ymm0, %ymm1\n\
+               vaddpd %ymm1, %ymm1, %ymm2\nvmovapd %ymm2, (%rdi)\n\
+               vzeroupper\nret"),
+        ),
+        (
             "two functions in one unit",
             format!(
                 ".text\nf:\n.cfi_startproc\n\
@@ -116,4 +122,29 @@ fn dirty_tick_skipping_is_output_invariant() {
         "no sub-pass run was ever skipped across the whole snippet set — \
          the equality oracle is vacuous"
     );
+}
+
+/// The vector-presence gate: on functions whose text never names an
+/// `%xmm`/`%ymm`/`%zmm` register or `vzeroupper`, the audited FP/vector
+/// passes are not invoked at all.  The audit says they could only have
+/// scanned and declined, so output must be identical to a run with the
+/// gate forced off — for integer-only AND vector-carrying inputs alike
+/// (the latter proves forcing the gate off is itself inert, i.e. the
+/// comparison is meaningful in both directions).
+#[test]
+fn vector_presence_gate_is_output_invariant() {
+    for (name, input) in snippets() {
+        let gated = {
+            let _g = dirty_tick_test::force_modes(false, true);
+            peephole_optimize(input.clone())
+        };
+        let ungated = {
+            let _g = dirty_tick_test::force_modes_no_vec_gate(false, true);
+            peephole_optimize(input.clone())
+        };
+        assert_eq!(
+            gated, ungated,
+            "vector-presence gating changed the peephole output for: {name}"
+        );
+    }
 }

@@ -871,12 +871,33 @@ fn peephole_optimize_inner(
     // a scan per pass per iteration (the CCC_PEEPHOLE_RELAY lesson above).
     let skip_enabled = std::env::var_os("CCC_PEEPHOLE_NO_DIRTY_SKIP").is_none();
     let verify_dirty = std::env::var_os("CCC_PEEPHOLE_VERIFY_DIRTY").is_some();
+    // Vector-presence gate (MB-20 step 5, "skip a pass when its trigger
+    // opcode never occurs"): every FP/vector pass's mutation path is
+    // anchored on a parsed `%xmm`/`%ymm`/`%zmm` operand or a literal
+    // `vzeroupper` (per-pass audit in the gating commit), so on a function
+    // whose text never names one, those passes can only scan and decline —
+    // which was 13.35% of total compile instructions on the 40-function
+    // mixed TU, all 40 of whose functions are pure-integer.  The probe is
+    // monotone: no pass synthesizes a vector register into a function that
+    // has none (rewrites only respell existing operands), so one substring
+    // scan at entry stays valid for the whole pipeline.  A stale `true`
+    // (every vector line later deleted) only forfeits the skip.
+    // `CCC_PEEPHOLE_NO_VEC_GATE=1` disables the gate for bisection.
+    let has_vec = std::env::var_os("CCC_PEEPHOLE_NO_VEC_GATE").is_some()
+        || (0..store.len()).any(|i| {
+            let t = store.get(i);
+            t.contains("%xmm")
+                || t.contains("%ymm")
+                || t.contains("%zmm")
+                || t.contains("vzeroupper")
+        });
     // Shadowed (not `mut`): the thread-local test overrides only exist in
     // test builds, and shadowing keeps the release path immutable.
     #[cfg(test)]
-    let (skip_enabled, verify_dirty) = (
+    let (skip_enabled, verify_dirty, has_vec) = (
         skip_enabled && !dirty_tick_test::no_skip(),
         verify_dirty || dirty_tick_test::verify(),
+        has_vec || dirty_tick_test::no_vec_gate(),
     );
     let mut ticks = crate::backend::peephole_common::PassTicks::new(skip_enabled);
     // Cumulative skip count at the end of the previous timed iteration
@@ -1029,61 +1050,75 @@ fn peephole_optimize_inner(
             // `vOP %S,%A,%D`. Removes the 2-operand-ISA staging copy the
             // scalar FP emitters insert before every binary op.
             {
-                fix1!(
-                    "fuse_mov_scalar_fp_into_vex_op",
-                    local_patterns::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "fuse_mov_scalar_fp_into_vex_op",
+                        local_patterns::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos)
+                    );
+                }
             }
             // Memory-source half: fold a dead staged load into a commutative
             // scalar VEX op's memory operand slot.
             {
-                fix1!(
-                    "fold_scalar_fp_memory_into_vex_op",
-                    local_patterns::fold_scalar_fp_memory_into_vex_op(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "fold_scalar_fp_memory_into_vex_op",
+                        local_patterns::fold_scalar_fp_memory_into_vex_op(&mut store, &mut infos)
+                    );
+                }
             }
             // Broadcast half: fold a dead staged scalar load into an AVX
             // broadcast-from-memory (`vmovsd MEM,%xmmD; vbroadcastsd %xmmD,%ymmM`
             // -> `vbroadcastsd MEM,%ymmM`). Same skip key: one VEX mem-fold family.
             {
-                fix1!(
-                    "fold_broadcast_load_into_broadcast",
-                    local_patterns::fold_broadcast_load_into_broadcast(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "fold_broadcast_load_into_broadcast",
+                        local_patterns::fold_broadcast_load_into_broadcast(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("fp_roundtrips") {
             {
-                fix1!(
-                    "eliminate_fp_xmm_roundtrips",
-                    local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "eliminate_fp_xmm_roundtrips",
+                        local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("fp_mem_fold") {
             {
-                fix1!(
-                    "fold_fp_memory_operands",
-                    memory_fold::fold_fp_memory_operands(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "fold_fp_memory_operands",
+                        memory_fold::fold_fp_memory_operands(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("fp_reg_mem_fold") {
             {
-                fix1!(
-                    "fold_fp_register_loads",
-                    memory_fold::fold_fp_register_loads(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "fold_fp_register_loads",
+                        memory_fold::fold_fp_register_loads(&mut store, &mut infos)
+                    );
+                }
             }
         }
         // Load straight into the register a whole-register copy fills from
         // the loaded one (`movsd M, %xmmA; …; movapd %xmmA, %xmmB`).
         if !sk("fp_load_retarget") {
             {
-                fix1!(
-                    "retarget_fp_load_into_copy",
-                    memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "retarget_fp_load_into_copy",
+                        memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos)
+                    );
+                }
             }
         }
         // Fold a single-use scalar FP load into an adjacent scalar FMA's
@@ -1091,10 +1126,12 @@ fn peephole_optimize_inner(
         // dot-product src2 shape is just the most common one).
         if !sk("fma_mem_fold") {
             {
-                fix1!(
-                    "fold_fma_memory_operand",
-                    memory_fold::fold_fma_memory_operand(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "fold_fma_memory_operand",
+                        memory_fold::fold_fma_memory_operand(&mut store, &mut infos)
+                    );
+                }
             }
         }
         // Constant-accumulator FMA shaping: 213-form with a just-loaded
@@ -1102,16 +1139,20 @@ fn peephole_optimize_inner(
         // memory slot, and repeated %xmm0 zeroings die block-locally.
         if !sk("fma132_zero") {
             {
-                fix1!(
-                    "fold_zero_addend_fma213_to_132",
-                    memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "fold_zero_addend_fma213_to_132",
+                        memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos)
+                    );
+                }
             }
             {
-                fix1!(
-                    "eliminate_redundant_xmm0_zeroing",
-                    memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "eliminate_redundant_xmm0_zeroing",
+                        memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos)
+                    );
+                }
             }
         }
         // Repeated RIP-relative loads of the same FP pool constant become a
@@ -1119,10 +1160,12 @@ fn peephole_optimize_inner(
         // NOP slot must dominate all uses by fall-through).
         if !sk("fp_const_hoist") {
             {
-                fix1!(
-                    "hoist_repeated_fp_constant_loads",
-                    memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "hoist_repeated_fp_constant_loads",
+                        memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos)
+                    );
+                }
             }
         }
         // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
@@ -1154,10 +1197,12 @@ fn peephole_optimize_inner(
         }
         if !sk("fp_spill") {
             {
-                fix1!(
-                    "eliminate_fp_spill_around_load",
-                    local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "eliminate_fp_spill_around_load",
+                        local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("fuse_copy_op") {
@@ -1194,10 +1239,12 @@ fn peephole_optimize_inner(
         }
         if !sk("fp_hoist") {
             {
-                fix1!(
-                    "promote_loop_invariant_fp_load",
-                    local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "promote_loop_invariant_fp_load",
+                        local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("dead_signext") {
@@ -1254,10 +1301,12 @@ fn peephole_optimize_inner(
         // register model.  See vector_load_op_fuse.rs for the soundness
         // argument and the liveness-monotonicity proof.
         if !sk("vector_load_fuse") {
-            fix1!(
-                "fuse_vector_load_into_op",
-                vector_load_op_fuse::fuse_vector_load_into_op(&mut store, &mut infos)
-            );
+            if has_vec {
+                fix1!(
+                    "fuse_vector_load_into_op",
+                    vector_load_op_fuse::fuse_vector_load_into_op(&mut store, &mut infos)
+                );
+            }
         }
         // Load -> LEA-add in-place (`mov MEM,%t; leaq (%acc,%t,1),%s` ->
         // `add MEM,%acc` + rename the chain uses). One transform, one switch:
@@ -1423,17 +1472,21 @@ fn peephole_optimize_inner(
         // form needs a destination, and `pshufd` does not.  Runs before the
         // copy bracket and propagation passes so they never see the pair.
         {
-            fix1!(
-                "fold_broadcast_copies",
-                vector_broadcast::fold_broadcast_copies(&mut store, &mut infos)
-            );
+            if has_vec {
+                fix1!(
+                    "fold_broadcast_copies",
+                    vector_broadcast::fold_broadcast_copies(&mut store, &mut infos)
+                );
+            }
         }
         if !sk("vector_copy_widen") {
             {
-                fix1!(
-                    "widen_private_vector_copies",
-                    vector_copy::widen_private_vector_copies(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "widen_private_vector_copies",
+                        vector_copy::widen_private_vector_copies(&mut store, &mut infos)
+                    );
+                }
             }
         }
         // The FMA accumulator bracket.  Every FMA form reads its destination as
@@ -1445,38 +1498,50 @@ fn peephole_optimize_inner(
         // widening so the copy spellings it matches are already normalised.
         if !sk("vector_copy_fma") {
             {
-                fix1!(
-                    "coalesce_packed_fma_prefix",
-                    vector_copy::coalesce_packed_fma_prefix(&mut store, &mut infos)
-                );
-                fix1!(
-                    "reassociate_fma_accumulator",
-                    vector_copy::reassociate_fma_accumulator(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "coalesce_packed_fma_prefix",
+                        vector_copy::coalesce_packed_fma_prefix(&mut store, &mut infos)
+                    );
+                }
+                if has_vec {
+                    fix1!(
+                        "reassociate_fma_accumulator",
+                        vector_copy::reassociate_fma_accumulator(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("vector_copy_retarget") {
             {
-                fix1!(
-                    "fold_composed_dword_shuffles",
-                    vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos)
-                );
-                fix1!(
-                    "fold_uniform_vector_shift",
-                    vector_copy::fold_uniform_vector_shift(&mut store, &mut infos)
-                );
-                fix1!(
-                    "retarget_vex_result",
-                    vector_copy::retarget_vex_result(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "fold_composed_dword_shuffles",
+                        vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos)
+                    );
+                }
+                if has_vec {
+                    fix1!(
+                        "fold_uniform_vector_shift",
+                        vector_copy::fold_uniform_vector_shift(&mut store, &mut infos)
+                    );
+                }
+                if has_vec {
+                    fix1!(
+                        "retarget_vex_result",
+                        vector_copy::retarget_vex_result(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("vector_copy_bracket") {
             {
-                fix1!(
-                    "coalesce_vector_brackets",
-                    vector_copy::coalesce_vector_brackets(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "coalesce_vector_brackets",
+                        vector_copy::coalesce_vector_brackets(&mut store, &mut infos)
+                    );
+                }
             }
         }
         // Full-width vector reloads of a just-stored over-aligned frame
@@ -1494,33 +1559,41 @@ fn peephole_optimize_inner(
         // 1 695 212 on tests/simd/vector_home_call_loop.c.  This ordering buys
         // that difference without adding a single new pass invocation.
         if !sk("aligned_vec_reload") {
-            fix1!(
-                "aligned_vec_reload",
-                aligned_vector_reload::forward_aligned_vector_reload(&mut store, &mut infos)
-            );
+            if has_vec {
+                fix1!(
+                    "aligned_vec_reload",
+                    aligned_vector_reload::forward_aligned_vector_reload(&mut store, &mut infos)
+                );
+            }
         }
         if !sk("vector_copy_prop") {
             {
-                fix1!(
-                    "propagate_vector_copies",
-                    vector_copy::propagate_vector_copies(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "propagate_vector_copies",
+                        vector_copy::propagate_vector_copies(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("vector_copy_dead") {
             {
-                fix1!(
-                    "eliminate_dead_vector_copies",
-                    vector_copy::eliminate_dead_vector_copies(&store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "eliminate_dead_vector_copies",
+                        vector_copy::eliminate_dead_vector_copies(&store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("vzeroupper_entry_state") {
             {
-                fix1!(
-                    "elide_vzeroupper_without_upper_writes",
-                    vector_copy::elide_vzeroupper_without_upper_writes(&store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "elide_vzeroupper_without_upper_writes",
+                        vector_copy::elide_vzeroupper_without_upper_writes(&store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("dead_pure_writes") {
@@ -1769,10 +1842,12 @@ fn peephole_optimize_inner(
         }
         if !sk("vec_self_move") {
             {
-                fix1!(
-                    "eliminate_vector_self_moves",
-                    local_patterns::eliminate_vector_self_moves(&mut store, &mut infos)
-                );
+                if has_vec {
+                    fix1!(
+                        "eliminate_vector_self_moves",
+                        local_patterns::eliminate_vector_self_moves(&mut store, &mut infos)
+                    );
+                }
             }
         }
         if !sk("cascaded_shifts") {
@@ -1871,7 +1946,7 @@ fn peephole_optimize_inner(
         // Store forwarding replaces same-register scalar reloads with an
         // exact zeroing `movq %xmmN, %xmmN`; drop the ones whose upper-half
         // zeroing nothing observes.
-        if !sk("zeroing_self_move") {
+        if has_vec && !sk("zeroing_self_move") {
             global_changed |=
                 vector_copy::eliminate_unobserved_zeroing_self_moves(&store, &mut infos);
         }
@@ -1916,7 +1991,9 @@ fn peephole_optimize_inner(
         }
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
-            global_changed |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+            if has_vec {
+                global_changed |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+            }
             global_changed |= self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
         }
         if !sk("lea_narrow") {
@@ -1939,8 +2016,10 @@ fn peephole_optimize_inner(
             // boundary of a register-marshalled 32-byte vector) is an
             // identity reload (`store_forwarding` models slots only up
             // to MoveSize::DQ).
-            global_changed |=
-                local_patterns::forward_adjacent_ymm_self_reloads(&mut store, &mut infos);
+            if has_vec {
+                global_changed |=
+                    local_patterns::forward_adjacent_ymm_self_reloads(&mut store, &mut infos);
+            }
             // Suffix-local vector DSE: a full-width `%xmm`/`%ymm` store
             // to a plain `D(%rsp)` slot that no line between it and
             // `ret` can observe (the hidden return-buffer store left
@@ -1948,8 +2027,10 @@ fn peephole_optimize_inner(
             // `eliminate_dead_stores` cannot see these: its byte-range
             // model stops at MoveSize::DQ and the 32-byte spellings
             // classify as `Other`.
-            global_changed |=
-                local_patterns::delete_dead_vector_epilogue_stores(&mut store, &mut infos);
+            if has_vec {
+                global_changed |=
+                    local_patterns::delete_dead_vector_epilogue_stores(&mut store, &mut infos);
+            }
         }
         if !sk("mem_fold") {
             global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos);
@@ -2124,41 +2205,51 @@ fn peephole_optimize_inner(
                 "fuse_movq_ext_truncation",
                 local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos)
             );
-            run_tracked!(
-                ticks2,
-                changed2,
-                "eliminate_fp_xmm_roundtrips",
-                local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos)
-            );
-            run_tracked!(
-                ticks2,
-                changed2,
-                "fold_fp_memory_operands",
-                memory_fold::fold_fp_memory_operands(&mut store, &mut infos)
-            );
-            if !sk("fp_reg_mem_fold") {
+            if has_vec {
                 run_tracked!(
                     ticks2,
                     changed2,
-                    "fold_fp_register_loads",
-                    memory_fold::fold_fp_register_loads(&mut store, &mut infos)
+                    "eliminate_fp_xmm_roundtrips",
+                    local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos)
                 );
+            }
+            if has_vec {
+                run_tracked!(
+                    ticks2,
+                    changed2,
+                    "fold_fp_memory_operands",
+                    memory_fold::fold_fp_memory_operands(&mut store, &mut infos)
+                );
+            }
+            if !sk("fp_reg_mem_fold") {
+                if has_vec {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "fold_fp_register_loads",
+                        memory_fold::fold_fp_register_loads(&mut store, &mut infos)
+                    );
+                }
             }
             if !sk("fp_load_retarget") {
-                run_tracked!(
-                    ticks2,
-                    changed2,
-                    "retarget_fp_load_into_copy",
-                    memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos)
-                );
+                if has_vec {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "retarget_fp_load_into_copy",
+                        memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos)
+                    );
+                }
             }
             if !sk("fp_const_hoist") {
-                run_tracked!(
-                    ticks2,
-                    changed2,
-                    "hoist_repeated_fp_constant_loads",
-                    memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos)
-                );
+                if has_vec {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "hoist_repeated_fp_constant_loads",
+                        memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos)
+                    );
+                }
             }
             if relay_opt_in && !sk("load_copy_relay") {
                 run_tracked!(
@@ -2208,12 +2299,14 @@ fn peephole_optimize_inner(
                 "fold_ptr_deref_through_stack",
                 local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos)
             );
-            run_tracked!(
-                ticks2,
-                changed2,
-                "eliminate_fp_spill_around_load",
-                local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos)
-            );
+            if has_vec {
+                run_tracked!(
+                    ticks2,
+                    changed2,
+                    "eliminate_fp_spill_around_load",
+                    local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos)
+                );
+            }
             if !sk("dead_regs") {
                 run_tracked!(
                     ticks2,
@@ -2221,12 +2314,14 @@ fn peephole_optimize_inner(
                     "eliminate_dead_reg_moves",
                     dead_code::eliminate_dead_reg_moves(&store, &mut infos)
                 );
-                run_tracked!(
-                    ticks2,
-                    changed2,
-                    "eliminate_dead_fp_moves",
-                    dead_code::eliminate_dead_fp_moves(&store, &mut infos)
-                );
+                if has_vec {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "eliminate_dead_fp_moves",
+                        dead_code::eliminate_dead_fp_moves(&store, &mut infos)
+                    );
+                }
                 run_tracked!(
                     ticks2,
                     changed2,
@@ -2397,12 +2492,14 @@ fn peephole_optimize_inner(
                 );
             }
             if !sk("vec_self_move") {
-                run_tracked!(
-                    ticks2,
-                    changed2,
-                    "eliminate_vector_self_moves",
-                    local_patterns::eliminate_vector_self_moves(&mut store, &mut infos)
-                );
+                if has_vec {
+                    run_tracked!(
+                        ticks2,
+                        changed2,
+                        "eliminate_vector_self_moves",
+                        local_patterns::eliminate_vector_self_moves(&mut store, &mut infos)
+                    );
+                }
             }
             // Orphan retirement inside the fixpoint: folds above orphan pure
             // writes; retiring them lets the next iteration see the cleaner
@@ -2505,33 +2602,41 @@ fn peephole_optimize_inner(
                 "fuse_movq_ext_truncation",
                 local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos)
             );
-            run_tracked!(
-                ticks3,
-                changed3,
-                "eliminate_fp_xmm_roundtrips",
-                local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos)
-            );
-            run_tracked!(
-                ticks3,
-                changed3,
-                "fold_fp_memory_operands",
-                memory_fold::fold_fp_memory_operands(&mut store, &mut infos)
-            );
-            if !sk("fp_reg_mem_fold") {
+            if has_vec {
                 run_tracked!(
                     ticks3,
                     changed3,
-                    "fold_fp_register_loads",
-                    memory_fold::fold_fp_register_loads(&mut store, &mut infos)
+                    "eliminate_fp_xmm_roundtrips",
+                    local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos)
                 );
             }
-            if !sk("fp_load_retarget") {
+            if has_vec {
                 run_tracked!(
                     ticks3,
                     changed3,
-                    "retarget_fp_load_into_copy",
-                    memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos)
+                    "fold_fp_memory_operands",
+                    memory_fold::fold_fp_memory_operands(&mut store, &mut infos)
                 );
+            }
+            if !sk("fp_reg_mem_fold") {
+                if has_vec {
+                    run_tracked!(
+                        ticks3,
+                        changed3,
+                        "fold_fp_register_loads",
+                        memory_fold::fold_fp_register_loads(&mut store, &mut infos)
+                    );
+                }
+            }
+            if !sk("fp_load_retarget") {
+                if has_vec {
+                    run_tracked!(
+                        ticks3,
+                        changed3,
+                        "retarget_fp_load_into_copy",
+                        memory_fold::retarget_fp_load_into_copy(&mut store, &mut infos)
+                    );
+                }
             }
             run_tracked!(
                 ticks3,
@@ -2552,12 +2657,14 @@ fn peephole_optimize_inner(
                     "eliminate_dead_reg_moves",
                     dead_code::eliminate_dead_reg_moves(&store, &mut infos)
                 );
-                run_tracked!(
-                    ticks3,
-                    changed3,
-                    "eliminate_dead_fp_moves",
-                    dead_code::eliminate_dead_fp_moves(&store, &mut infos)
-                );
+                if has_vec {
+                    run_tracked!(
+                        ticks3,
+                        changed3,
+                        "eliminate_dead_fp_moves",
+                        dead_code::eliminate_dead_fp_moves(&store, &mut infos)
+                    );
+                }
                 run_tracked!(
                     ticks3,
                     changed3,
@@ -7011,29 +7118,46 @@ pub(crate) mod dirty_tick_test {
         /// Skipped-start count of the most recent phase-1 fixpoint on this
         /// thread (proves the equality oracle is not vacuous).
         static LAST_SKIPPED: Cell<u64> = const { Cell::new(0) };
+        /// Force `CCC_PEEPHOLE_NO_VEC_GATE` semantics on this thread (treat
+        /// every function as containing vector text).
+        static FORCE_NO_VEC_GATE: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Restores both modes on drop (panics included).
+    /// Restores all modes on drop (panics included).
     pub(crate) struct ModeGuard {
         no_skip: bool,
         verify: bool,
+        no_vec_gate: bool,
     }
 
     impl Drop for ModeGuard {
         fn drop(&mut self) {
             FORCE_NO_SKIP.with(|f| f.set(self.no_skip));
             FORCE_VERIFY.with(|f| f.set(self.verify));
+            FORCE_NO_VEC_GATE.with(|f| f.set(self.no_vec_gate));
         }
     }
 
-    /// Force the given modes on this thread until the guard drops.
+    /// Force the given skip/verify modes on this thread until the guard
+    /// drops (vector gate left as-is).
     #[must_use]
     pub(crate) fn force_modes(no_skip: bool, verify: bool) -> ModeGuard {
-        let guard = ModeGuard {
+        ModeGuard {
             no_skip: FORCE_NO_SKIP.with(|f| f.replace(no_skip)),
             verify: FORCE_VERIFY.with(|f| f.replace(verify)),
-        };
-        guard
+            no_vec_gate: FORCE_NO_VEC_GATE.with(Cell::get),
+        }
+    }
+
+    /// Additionally force the vector-presence gate off (every function is
+    /// treated as containing vector text), with skip/verify as given.
+    #[must_use]
+    pub(crate) fn force_modes_no_vec_gate(no_skip: bool, verify: bool) -> ModeGuard {
+        ModeGuard {
+            no_skip: FORCE_NO_SKIP.with(|f| f.replace(no_skip)),
+            verify: FORCE_VERIFY.with(|f| f.replace(verify)),
+            no_vec_gate: FORCE_NO_VEC_GATE.with(|f| f.replace(true)),
+        }
     }
 
     pub(super) fn no_skip() -> bool {
@@ -7042,6 +7166,10 @@ pub(crate) mod dirty_tick_test {
 
     pub(super) fn verify() -> bool {
         FORCE_VERIFY.with(Cell::get)
+    }
+
+    pub(super) fn no_vec_gate() -> bool {
+        FORCE_NO_VEC_GATE.with(Cell::get)
     }
 
     pub(super) fn record_skipped(n: u64) {
