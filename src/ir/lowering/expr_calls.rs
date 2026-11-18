@@ -2117,40 +2117,13 @@ impl Lowerer {
         );
         let indirect_ret_ty = self.indirect_call_return_type(func, ret_abi);
 
-        match func {
+        // The pointer to call through.  A callee that can be named is called
+        // directly where it is found, and that arm answers at once.
+        let func_ptr = match func {
             Expr::Identifier(name, _) => {
                 if self.is_func_ptr_variable(name) {
                     // Function pointer variable: load pointer and call indirect
-                    let func_ptr = self.load_func_ptr_variable(name);
-                    self.emit(Instruction::CallIndirect {
-                        func_ptr: Operand::Value(func_ptr),
-                        info: CallInfo {
-                            dest: Some(dest),
-                            args: arg_vals,
-                            arg_types,
-                            return_type: indirect_ret_ty,
-                            is_variadic,
-                            num_fixed_args,
-                            struct_arg_sizes,
-                            struct_arg_aligns,
-                            struct_arg_classes,
-                            struct_arg_fp_agg_classes,
-                            struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                            is_sret: ret_abi.sret_size.is_some(),
-                            calling_convention,
-                            is_fastcall: typed_fastcall,
-                            regparm: None,
-                            is_pure: false,
-                            is_const: false,
-                            memory: Default::default(),
-                            assume_library: false,
-                            ret_eightbyte_classes: ret_abi.classes.clone(),
-                            ret_is_f128_sse: ret_abi.one_xmm,
-                            ret_is_vector128: false,
-                            cold: false,
-                        },
-                    });
-                    indirect_ret_ty
+                    Operand::Value(self.load_func_ptr_variable(name))
                 } else {
                     // Direct call - apply __asm__("label") linker symbol redirect if present
                     let call_name = self.resolve_ref_name(name.as_str());
@@ -2197,7 +2170,7 @@ impl Lowerer {
                             struct_arg_aligns,
                             struct_arg_classes,
                             struct_arg_fp_agg_classes,
-                            struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
+                            struct_arg_is_f128_sse,
                             is_sret: ret_abi.sret_size.is_some(),
                             calling_convention,
                             is_fastcall: callee_is_fastcall,
@@ -2212,7 +2185,7 @@ impl Lowerer {
                             cold: false,
                         },
                     });
-                    ret_ty
+                    return ret_ty;
                 }
             }
             Expr::Deref(inner, _) => {
@@ -2228,53 +2201,15 @@ impl Lowerer {
                 // A hard-coded `false` sent the 5.0 of `(*fp)(buf, "%.0f",
                 // 5.0)` to fa0 instead of a2 and aborted glibc's vsprintf on
                 // rv64 (gcc.c-torture 930513-1).
-                let sas = struct_arg_sizes;
-                let saa = struct_arg_aligns;
-                let sac = struct_arg_classes;
-                let sarfc = struct_arg_fp_agg_classes;
-                let func_ptr = if is_noop_deref {
+                if is_noop_deref {
                     // No-op dereference: (*fp)() == fp()
                     self.lower_expr(inner)
                 } else {
                     // Real dereference needed: load through the pointer to get the func ptr
                     self.lower_expr(func)
-                };
-                self.emit(Instruction::CallIndirect {
-                    func_ptr,
-                    info: CallInfo {
-                        dest: Some(dest),
-                        args: arg_vals,
-                        arg_types,
-                        return_type: indirect_ret_ty,
-                        is_variadic,
-                        num_fixed_args,
-                        struct_arg_sizes: sas,
-                        struct_arg_aligns: saa,
-                        struct_arg_classes: sac,
-                        struct_arg_fp_agg_classes: sarfc,
-                        struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                        is_sret: ret_abi.sret_size.is_some(),
-                        calling_convention,
-                        is_fastcall: typed_fastcall,
-                        regparm: None,
-                        is_pure: false,
-                        is_const: false,
-                        memory: Default::default(),
-                        assume_library: false,
-                        ret_eightbyte_classes: ret_abi.classes.clone(),
-                        // From the callee's type: `indirect_aggregate_return`.
-                        ret_is_f128_sse: ret_abi.one_xmm,
-                        ret_is_vector128: false,
-                        cold: false,
-                    },
-                });
-                indirect_ret_ty
+                }
             }
             _ => {
-                let sas = struct_arg_sizes;
-                let saa = struct_arg_aligns;
-                let sac = struct_arg_classes;
-                let sarfc = struct_arg_fp_agg_classes;
                 let func_ptr = self.lower_expr(func);
 
                 // Check if the lowered expression is a GlobalAddr of a known function.
@@ -2340,11 +2275,11 @@ impl Lowerer {
                             return_type: ret_ty,
                             is_variadic,
                             num_fixed_args,
-                            struct_arg_sizes: sas,
-                            struct_arg_aligns: saa,
-                            struct_arg_classes: sac,
-                            struct_arg_fp_agg_classes: sarfc,
-                            struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
+                            struct_arg_sizes,
+                            struct_arg_aligns,
+                            struct_arg_classes,
+                            struct_arg_fp_agg_classes,
+                            struct_arg_is_f128_sse,
                             is_sret: ret_abi.sret_size.is_some(),
                             calling_convention,
                             is_fastcall: callee_is_fastcall,
@@ -2359,41 +2294,43 @@ impl Lowerer {
                             cold: false,
                         },
                     });
-                    ret_ty
-                } else {
-                    self.emit(Instruction::CallIndirect {
-                        func_ptr,
-                        info: CallInfo {
-                            dest: Some(dest),
-                            args: arg_vals,
-                            arg_types,
-                            return_type: indirect_ret_ty,
-                            is_variadic,
-                            num_fixed_args,
-                            struct_arg_sizes: sas,
-                            struct_arg_aligns: saa,
-                            struct_arg_classes: sac,
-                            struct_arg_fp_agg_classes: sarfc,
-                            struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                            is_sret: ret_abi.sret_size.is_some(),
-                            calling_convention,
-                            is_fastcall: typed_fastcall,
-                            regparm: None,
-                            is_pure: false,
-                            is_const: false,
-                            memory: Default::default(),
-                            assume_library: false,
-                            ret_eightbyte_classes: ret_abi.classes.clone(),
-                            // From the callee's type: `indirect_aggregate_return`.
-                            ret_is_f128_sse: ret_abi.one_xmm,
-                            ret_is_vector128: false,
-                            cold: false,
-                        },
-                    });
-                    indirect_ret_ty
+                    return ret_ty;
                 }
+                func_ptr
             }
-        }
+        };
+        // A call through a pointer: the callee is known by its type alone,
+        // so nothing is claimed about what it does.
+        self.emit(Instruction::CallIndirect {
+            func_ptr,
+            info: CallInfo {
+                dest: Some(dest),
+                args: arg_vals,
+                arg_types,
+                return_type: indirect_ret_ty,
+                is_variadic,
+                num_fixed_args,
+                struct_arg_sizes,
+                struct_arg_aligns,
+                struct_arg_classes,
+                struct_arg_fp_agg_classes,
+                struct_arg_is_f128_sse,
+                is_sret: ret_abi.sret_size.is_some(),
+                calling_convention,
+                is_fastcall: typed_fastcall,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                memory: Default::default(),
+                assume_library: false,
+                ret_eightbyte_classes: ret_abi.classes.clone(),
+                // From the callee's type: `indirect_aggregate_return`.
+                ret_is_f128_sse: ret_abi.one_xmm,
+                ret_is_vector128: false,
+                cold: false,
+            },
+        });
+        indirect_ret_ty
     }
 
     /// Load a function pointer from a local or global variable.
