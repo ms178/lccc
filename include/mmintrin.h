@@ -29,6 +29,13 @@ typedef unsigned char __v16qu __attribute__((__vector_size__(16)));
 typedef unsigned short __v8hu __attribute__((__vector_size__(16)));
 typedef unsigned int __v4su __attribute__((__vector_size__(16)));
 
+/* Form the bit images directly. A zero-initialized 128-bit temporary followed
+ * by two memcpy calls obscures both the low lane and the known-zero high lane,
+ * and leaves whole-vector stack stores in otherwise small packed wrappers. */
+typedef long long __lccc_mmx_image __attribute__((__vector_size__(16)));
+#define __LCCC_MMX_EXTEND(type, v) ((type)(__lccc_mmx_image){(long long)(v), 0})
+#define __LCCC_MMX_LOW(v) ((__m64)(((__lccc_mmx_image)(v))[0]))
+
 /* === Empty (EMMS) === */
 
 /* Signal end of MMX state usage (EMMS). No-op in our scalar implementation
@@ -164,37 +171,28 @@ _mm_xor_si64(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_add_pi8(__m64 __a, __m64 __b)
 {
-    __v16qu __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x + __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v16qu __x = __LCCC_MMX_EXTEND(__v16qu, __a);
+    __v16qu __y = __LCCC_MMX_EXTEND(__v16qu, __b);
+    __v16qu __v = __x + __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_add_pi16(__m64 __a, __m64 __b)
 {
-    __v8hu __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x + __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hu __x = __LCCC_MMX_EXTEND(__v8hu, __a);
+    __v8hu __y = __LCCC_MMX_EXTEND(__v8hu, __b);
+    __v8hu __v = __x + __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_add_pi32(__m64 __a, __m64 __b)
 {
-    __v4su __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x + __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v4su __x = __LCCC_MMX_EXTEND(__v4su, __a);
+    __v4su __y = __LCCC_MMX_EXTEND(__v4su, __b);
+    __v4su __v = __x + __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 /* === Packed Subtract (8/16/32-bit) === */
@@ -202,37 +200,28 @@ _mm_add_pi32(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_sub_pi8(__m64 __a, __m64 __b)
 {
-    __v16qu __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x - __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v16qu __x = __LCCC_MMX_EXTEND(__v16qu, __a);
+    __v16qu __y = __LCCC_MMX_EXTEND(__v16qu, __b);
+    __v16qu __v = __x - __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_sub_pi16(__m64 __a, __m64 __b)
 {
-    __v8hu __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x - __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hu __x = __LCCC_MMX_EXTEND(__v8hu, __a);
+    __v8hu __y = __LCCC_MMX_EXTEND(__v8hu, __b);
+    __v8hu __v = __x - __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_sub_pi32(__m64 __a, __m64 __b)
 {
-    __v4su __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x - __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v4su __x = __LCCC_MMX_EXTEND(__v4su, __a);
+    __v4su __y = __LCCC_MMX_EXTEND(__v4su, __b);
+    __v4su __v = __x - __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 /* === Packed Saturating Add (8/16-bit signed and unsigned) === */
@@ -240,49 +229,37 @@ _mm_sub_pi32(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_adds_pi8(__m64 __a, __m64 __b)
 {
-    __v16qq __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_paddsb128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v16qq __x = __LCCC_MMX_EXTEND(__v16qq, __a);
+    __v16qq __y = __LCCC_MMX_EXTEND(__v16qq, __b);
+    __v16qq __v = __builtin_ia32_paddsb128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_adds_pi16(__m64 __a, __m64 __b)
 {
-    __v8hh __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_paddsw128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hh __x = __LCCC_MMX_EXTEND(__v8hh, __a);
+    __v8hh __y = __LCCC_MMX_EXTEND(__v8hh, __b);
+    __v8hh __v = __builtin_ia32_paddsw128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_adds_pu8(__m64 __a, __m64 __b)
 {
-    __v16qq __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_paddusb128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v16qq __x = __LCCC_MMX_EXTEND(__v16qq, __a);
+    __v16qq __y = __LCCC_MMX_EXTEND(__v16qq, __b);
+    __v16qq __v = __builtin_ia32_paddusb128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_adds_pu16(__m64 __a, __m64 __b)
 {
-    __v8hh __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_paddusw128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hh __x = __LCCC_MMX_EXTEND(__v8hh, __a);
+    __v8hh __y = __LCCC_MMX_EXTEND(__v8hh, __b);
+    __v8hh __v = __builtin_ia32_paddusw128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 /* === Packed Saturating Subtract (8/16-bit signed and unsigned) === */
@@ -290,49 +267,37 @@ _mm_adds_pu16(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_subs_pi8(__m64 __a, __m64 __b)
 {
-    __v16qq __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_psubsb128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v16qq __x = __LCCC_MMX_EXTEND(__v16qq, __a);
+    __v16qq __y = __LCCC_MMX_EXTEND(__v16qq, __b);
+    __v16qq __v = __builtin_ia32_psubsb128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_subs_pi16(__m64 __a, __m64 __b)
 {
-    __v8hh __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_psubsw128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hh __x = __LCCC_MMX_EXTEND(__v8hh, __a);
+    __v8hh __y = __LCCC_MMX_EXTEND(__v8hh, __b);
+    __v8hh __v = __builtin_ia32_psubsw128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_subs_pu8(__m64 __a, __m64 __b)
 {
-    __v16qq __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_psubusb128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v16qq __x = __LCCC_MMX_EXTEND(__v16qq, __a);
+    __v16qq __y = __LCCC_MMX_EXTEND(__v16qq, __b);
+    __v16qq __v = __builtin_ia32_psubusb128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_subs_pu16(__m64 __a, __m64 __b)
 {
-    __v8hh __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_psubusw128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hh __x = __LCCC_MMX_EXTEND(__v8hh, __a);
+    __v8hh __y = __LCCC_MMX_EXTEND(__v8hh, __b);
+    __v8hh __v = __builtin_ia32_psubusw128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 /* === Packed Multiply === */
@@ -341,26 +306,20 @@ _mm_subs_pu16(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_mullo_pi16(__m64 __a, __m64 __b)
 {
-    __v8hh __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x * __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hh __x = __LCCC_MMX_EXTEND(__v8hh, __a);
+    __v8hh __y = __LCCC_MMX_EXTEND(__v8hh, __b);
+    __v8hh __v = __x * __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 /* Multiply packed 16-bit signed integers, return high 16 bits of each 32-bit result */
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_mulhi_pi16(__m64 __a, __m64 __b)
 {
-    __v8hh __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __builtin_ia32_pmulhw128(__x, __y);
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hh __x = __LCCC_MMX_EXTEND(__v8hh, __a);
+    __v8hh __y = __LCCC_MMX_EXTEND(__v8hh, __b);
+    __v8hh __v = __builtin_ia32_pmulhw128(__x, __y);
+    return __LCCC_MMX_LOW(__v);
 }
 
 /* Multiply and add: (a0*b0 + a1*b1), (a2*b2 + a3*b3) */
@@ -547,73 +506,55 @@ _mm_packs_pu16(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpeq_pi8(__m64 __a, __m64 __b)
 {
-    __v16qu __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x == __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v16qu __x = __LCCC_MMX_EXTEND(__v16qu, __a);
+    __v16qu __y = __LCCC_MMX_EXTEND(__v16qu, __b);
+    __v16qu __v = __x == __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpeq_pi16(__m64 __a, __m64 __b)
 {
-    __v8hu __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x == __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hu __x = __LCCC_MMX_EXTEND(__v8hu, __a);
+    __v8hu __y = __LCCC_MMX_EXTEND(__v8hu, __b);
+    __v8hu __v = __x == __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpeq_pi32(__m64 __a, __m64 __b)
 {
-    __v4su __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x == __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v4su __x = __LCCC_MMX_EXTEND(__v4su, __a);
+    __v4su __y = __LCCC_MMX_EXTEND(__v4su, __b);
+    __v4su __v = __x == __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpgt_pi8(__m64 __a, __m64 __b)
 {
-    __v16qq __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x > __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v16qq __x = __LCCC_MMX_EXTEND(__v16qq, __a);
+    __v16qq __y = __LCCC_MMX_EXTEND(__v16qq, __b);
+    __v16qq __v = __x > __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpgt_pi16(__m64 __a, __m64 __b)
 {
-    __v8hh __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x > __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v8hh __x = __LCCC_MMX_EXTEND(__v8hh, __a);
+    __v8hh __y = __LCCC_MMX_EXTEND(__v8hh, __b);
+    __v8hh __v = __x > __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpgt_pi32(__m64 __a, __m64 __b)
 {
-    __v4ss __x = {0}, __y = {0}, __v;
-    __builtin_memcpy(&__x, &__a, 8);
-    __builtin_memcpy(&__y, &__b, 8);
-    __v = __x > __y;
-    __m64 __r;
-    __builtin_memcpy(&__r, &__v, 8);
-    return __r;
+    __v4ss __x = __LCCC_MMX_EXTEND(__v4ss, __a);
+    __v4ss __y = __LCCC_MMX_EXTEND(__v4ss, __b);
+    __v4ss __v = __x > __y;
+    return __LCCC_MMX_LOW(__v);
 }
 
 /* === Unpack / Interleave === */
@@ -772,5 +713,8 @@ _mm_cvtm64_si64(__m64 __a)
 #define _m_punpckhwd _mm_unpackhi_pi16
 #define _m_punpckhdq _mm_unpackhi_pi32
 #define _m_empty _mm_empty
+
+#undef __LCCC_MMX_LOW
+#undef __LCCC_MMX_EXTEND
 
 #endif /* _MMINTRIN_H_INCLUDED */
