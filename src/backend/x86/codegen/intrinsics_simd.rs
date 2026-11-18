@@ -2487,16 +2487,18 @@ impl X86Codegen {
                 // (EVEX producers), neither of which is a legal VEX.256
                 // source -- a raw read would splice the wrong bank width into
                 // the operand and the emitter does no width check.
+                // The register-source form is AVX2 (`vbroadcastss %xmm, %ymm`);
+                // under plain AVX the splat goes through the AVX1 helper.
+                let f64_lane = matches!(op, Vbroadcastsd);
                 if let Some(held) = self.state.vec_live_ymm(simd_value_id(&args[0])) {
-                    self.state
-                        .emit_fmt(format_args!("    {} %{}, %ymm0", inst, held));
+                    let xmm = held.replacen("ymm", "xmm", 1);
+                    self.emit_vbroadcast_xmm_to_ymm(f64_lane, &xmm, "ymm0");
                 } else if let Some(m) = self.evex_arg_mem(&args[0]) {
                     self.state
                         .emit_fmt(format_args!("    {} {}, %ymm0", inst, m));
                 } else {
                     self.sse_load_arg(&args[0], "xmm1");
-                    self.state
-                        .emit_fmt(format_args!("    {} %xmm1, %ymm0", inst));
+                    self.emit_vbroadcast_xmm_to_ymm(f64_lane, "xmm1", "ymm0");
                 }
                 self.avx_store_dest(dest_ptr);
             }
@@ -2731,19 +2733,39 @@ mod avx_fp_order_tests {
             ),
             "VecLoadF32x8 is a raw reader: the slot must be written first"
         );
-        // An op that writes through args carries its destination there, so
-        // nothing at this level can tell datum from destination. The whole
-        // family is refused rather than guessed at. (The emitter for the
-        // VecStore family IS pending-aware on all three of its paths, so this
-        // is deliberate conservatism costing a redundant store in rare cases,
-        // not a correctness requirement -- soundness must not depend on which
-        // arg position happens to be the destination.)
+        // `VecStoreF32x8` writes through args, so its datum and address both
+        // sit in `args`. Its emitter clears the deferral on every path where
+        // the datum is the pending value, so a pending DATUM is consumed.
         assert!(
-            !cg.pending_vec_store_consumed_by(
+            cg.pending_vec_store_consumed_by(
                 &IntrinsicOp::VecStoreF32x8,
                 &[Operand::Value(Value(0)), Operand::Value(Value(1))]
             ),
-            "ops writing through args are refused wholesale"
+            "a pending datum is consumed by its own whole-vector store"
+        );
+        // A pending ADDRESS is not consumed: the store must flush first.
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::VecStoreF32x8,
+                &[Operand::Value(Value(1)), Operand::Value(Value(0))]
+            ),
+            "a pending address is refused"
+        );
+        // Pending in both positions: refused, the conservative flush stays.
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::VecStoreF32x8,
+                &[Operand::Value(Value(0)), Operand::Value(Value(0))]
+            ),
+            "a value in both datum and address position is refused"
+        );
+        // The 128-bit store is outside this rule and stays refused.
+        assert!(
+            !cg.pending_vec_store_consumed_by(
+                &IntrinsicOp::VecStoreF32x4,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))]
+            ),
+            "VecStoreF32x4 keeps the conservative flush"
         );
         // No pending store at all: not a consumer.
         cg.state.pending_vec_store = None;
@@ -3427,8 +3449,16 @@ mod simd_operand_role_and_upper_state_tests {
     /// every broadcast after a 256-bit producer would reload.
     #[test]
     fn avx_broadcast_ignores_claims_of_the_wrong_width() {
-        for wrong in ["xmm3", "zmm3"] {
+        // Both permissions: AVX2 has the register-source broadcast; plain AVX
+        // must reach the same value through its AVX1 spelling.
+        for (wrong, avx2) in [
+            ("xmm3", true),
+            ("zmm3", true),
+            ("xmm3", false),
+            ("zmm3", false),
+        ] {
             let mut cg = X86Codegen::new();
+            cg.avx2_enabled = avx2;
             slot_vector(&mut cg, 0);
             // The result needs a home of its own: `avx_store_dest` resolves the
             // destination's slot or register, and asserts (debug builds) when
@@ -3453,9 +3483,12 @@ mod simd_operand_role_and_upper_state_tests {
             // staging load (`%xmm1`) when it is not. Pinning only the wrong
             // register is the invariant; pinning which fallback runs would
             // forbid an improvement.
+            // Under AVX1 the staged register form does not exist: the AVX1
+            // splat is `vshufps` on the staged %xmm1 plus a `vinsertf128`.
             assert!(
                 out.contains("vbroadcastss -32(%rbp), %ymm0")
-                    || out.contains("vbroadcastss %xmm1, %ymm0"),
+                    || out.contains("vbroadcastss %xmm1, %ymm0")
+                    || (!avx2 && out.contains("vshufps $0, %xmm1, %xmm1, %xmm0")),
                 "a wrong-width claim must fall back to the slot (fold or \
                  staging load): {out}"
             );
@@ -3479,9 +3512,12 @@ mod simd_operand_role_and_upper_state_tests {
         // into `%ymm0` first would be a wasted instruction. Assert the
         // instruction count, not which of the two optimal spellings wins, so a
         // better emitter is never regressed into a test failure.
+        // Plain AVX (this control's default) spells the same use as the AVX1
+        // staging: `vshufps` reads the claim's low lane, no `%ymm` copy.
         assert!(
             out.contains("vbroadcastss %ymm3, %ymm0")
-                || out.contains("vbroadcastss -32(%rbp), %ymm0"),
+                || out.contains("vbroadcastss -32(%rbp), %ymm0")
+                || out.contains("vshufps $0, %xmm3, %xmm3, %xmm0"),
             "a width-matched claim must reach the broadcast without a register \
              copy: {out}"
         );

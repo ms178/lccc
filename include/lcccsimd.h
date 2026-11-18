@@ -1564,6 +1564,12 @@ void * __lccc_simd256_ps_vextractf128(long, __m256 __a);
 void * __lccc_simd256_pd_vextractf128(long, __m256d __a);
 #define _mm256_extractf128_pd(__a, __imm) __CCC_M128D_FROM_BUILTIN(__lccc_simd256_pd_vextractf128(__imm, __a))
 
+void * __lccc_simd256_i_vinsertf128(long, __m256i __a, __m128i __b);
+#define _mm256_insertf128_si256(__a, __b, __imm) __CCC_M256I_FROM_BUILTIN(__lccc_simd256_i_vinsertf128(__imm, __a, __b))
+
+void * __lccc_simd256_i_vextractf128(long, __m256i __a);
+#define _mm256_extractf128_si256(__a, __imm) __CCC_M128I_FROM_BUILTIN(__lccc_simd256_i_vextractf128(__imm, __a))
+
 void * __lccc_simd256_ps_vcmpps256(long, __m256 __a, __m256 __b);
 void * __lccc_simd256_ps_vcmppd256(long, __m256d __a, __m256d __b);
 #define _mm256_cmp_ps(__a, __b, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vcmpps256(__imm, __a, __b))

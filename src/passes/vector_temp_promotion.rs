@@ -526,6 +526,14 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::AddPs256
         | O::SubPs256
         | O::MulPs256
+        | O::AndPs256
+        | O::OrPs256
+        | O::XorPs256
+        | O::AndNotPs256
+        | O::AndPd256
+        | O::OrPd256
+        | O::XorPd256
+        | O::AndNotPd256
         | O::AddPd256
         | O::SubPd256
         | O::MulPd256

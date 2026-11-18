@@ -1186,6 +1186,83 @@ impl X86Codegen {
         }
     }
 
+    /// Narrow a pending VLFOLD load of `arg` to its low 16 bytes.
+    ///
+    /// Only the low half of a 256-bit value is consumed by a 256→128 cast,
+    /// and that half sits at offset 0 of the same address, so the elided
+    /// load can be re-issued as a VEX.128 load of identical mnemonic
+    /// (`vmovdqu`/`vmovups`/`vmovupd`/`vmovdqa`: the 32-byte alignment
+    /// requirement implies the 16-byte one). Every width-32 fold is one of
+    /// those plain loads (`try_elide_vec_load`), so no broadcast or
+    /// arithmetic fold can be narrowed by mistake. Returns `true` when the
+    /// load is pending for `arg` and is now a 16-byte fold.
+    fn narrow_pending_memfold_to_low_half(&mut self, arg: &Operand) -> bool {
+        match (arg, self.state.pending_vec_memfold.as_mut()) {
+            (Operand::Value(v), Some(pf)) if v.0 == pf.val => {
+                pf.width = 16;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Memory operand of `arg`'s 256-bit data, when that data is current in
+    /// memory and not held in any register.
+    ///
+    /// Every register-resident state of the value is excluded: a live YMM
+    /// claim, the last register store, a deferred store of the value, and an
+    /// XMM home (a register is authoritative even when a memory copy exists).
+    /// Only then is the memory image the value's current contents, so a
+    /// 16-byte read of its first half is exact. Other values' deferred
+    /// stores are flushed first, exactly as the 256-bit reload does.
+    fn low_half_memory_operand(&mut self, arg: &Operand) -> Option<String> {
+        let Operand::Value(v) = arg else {
+            return None;
+        };
+        if self
+            .reg_assignments
+            .get(&v.0)
+            .is_some_and(|r| is_xmm_reg(*r))
+            || self.state.vec_live_ymm(v.0).is_some()
+            || (self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0))
+            || self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0)
+        {
+            return None;
+        }
+        self.flush_pending_vec_store_impl();
+        self.value_ptr_mem_operand(v.0)
+    }
+
+    /// The XMM alias of `arg`'s register home, when the value lives in one.
+    ///
+    /// Mirrors the register-home arm of `avx_load_arg_to`: a deferred store
+    /// of the same value is retired (the register is its home), any other
+    /// deferred store is flushed first. A value still pending as an elided
+    /// load is not in its register yet, so it returns `None`.
+    fn xmm_home_of(&mut self, arg: &Operand) -> Option<&'static str> {
+        let Operand::Value(v) = arg else {
+            return None;
+        };
+        if self
+            .state
+            .pending_vec_memfold
+            .as_ref()
+            .is_some_and(|pf| pf.val == v.0)
+        {
+            return None;
+        }
+        let reg = *self.reg_assignments.get(&v.0)?;
+        if !is_xmm_reg(reg) {
+            return None;
+        }
+        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+            self.state.pending_vec_store = None;
+        } else {
+            self.flush_pending_vec_store_impl();
+        }
+        Some(phys_reg_name(reg))
+    }
+
     /// Materialise a pending VLFOLD load through the scratch register and
     /// its ordinary home (register or slot). Never expected on the analysed
     /// shapes; keeps the elision sound if an unexpected instruction
@@ -1307,10 +1384,17 @@ impl X86Codegen {
         // VEX `vmovd`: this AVX2-only op must not mix in a legacy-SSE write
         // (an SSE/AVX transition with a dirty upper half on pre-Skylake/Zen
         // parts).
-        self.state
-            .emit_fmt(format_args!("    vmovd %eax, %{xmm_stage}"));
-        self.state
-            .emit_fmt(format_args!("    vpbroadcastd %{xmm_stage}, %{ymm_stage}"));
+        if self.avx2_enabled {
+            self.state
+                .emit_fmt(format_args!("    vmovd %eax, %{xmm_stage}"));
+            self.state
+                .emit_fmt(format_args!("    vpbroadcastd %{xmm_stage}, %{ymm_stage}"));
+        } else {
+            self.emit_avx1_splat_from_gpr(
+                crate::backend::x86_common::SplatLane::B4,
+                (xmm_stage, ymm_stage),
+            );
+        }
         // Only the staging bank was written. Claims never name banks 0/1
         // (`vec_claim_live_reg` refuses them) and `vec_home_reg` records only
         // banks >= 2, so the scratch-only invalidation is exact: it drops the
@@ -1357,6 +1441,20 @@ impl X86Codegen {
             return false;
         };
         use crate::ir::intrinsics::IntrinsicOp as O;
+        // `VecStoreF32x8` takes its datum in `args[0]` and its address in
+        // `dest_ptr` and `args[1]`. The emitter reads the datum from its
+        // register and clears the deferral on every path where the datum is
+        // the pending value (see its arm), so the deferral is consumed here
+        // rather than committed to its home: that commit is a store nothing
+        // reads. The refusal below exists for ops whose destination may be
+        // the pending value; a pending value in an address position is
+        // refused, so that case keeps the conservative flush.
+        if matches!(op, O::VecStoreF32x8) && !is_raw_reader_intrinsic(op) {
+            return matches!(args.first(), Some(Operand::Value(v)) if v.0 == pval)
+                && !args[1..]
+                    .iter()
+                    .any(|a| matches!(a, Operand::Value(v) if v.0 == pval));
+        }
         args.iter()
             .any(|a| matches!(a, Operand::Value(v) if v.0 == pval))
             && !is_raw_reader_intrinsic(op)
@@ -2040,8 +2138,12 @@ impl X86Codegen {
         }
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
-        if avx {
+        if avx && self.avx2_enabled {
             self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+            self.state.dirty_upper_ymm = true;
+        } else if avx {
+            // AVX1: `vxorps %xmm` is legal and VEX.128 zeroes bits 255:128.
+            self.state.emit("    vxorps %xmm0, %xmm0, %xmm0");
             self.state.dirty_upper_ymm = true;
         } else {
             self.state.emit("    pxor %xmm0, %xmm0");
@@ -2055,6 +2157,33 @@ impl X86Codegen {
             }
         }
         true
+    }
+
+    /// AVX1 256-bit splat of the GPR value in `%rax` (`lane_bytes` 1, 2, 4 or
+    /// 8). AVX1 has no `vpbroadcast{b,w,d,q}` ymm form, so each step is AVX1
+    /// legal: `vmovd`/`vmovq` stage the scalar in the XMM half, the VEX
+    /// unpack/shuffle replicates it across that half, and `vinsertf128` copies
+    /// the low half into the high half. A VEX.128 write zeroes bits 255:128,
+    /// so the staging YMM's low half is exactly the replicated XMM value.
+    ///
+    /// `pair` must name one register twice, `(xmmN, ymmN)`, which is what
+    /// `broadcast_scratch_pair` returns.
+    pub(super) fn emit_avx1_splat_from_gpr(
+        &mut self,
+        lane: crate::backend::x86_common::SplatLane,
+        pair: (&'static str, &'static str),
+    ) {
+        let (x, y) = pair;
+        debug_assert_eq!(&x[3..], &y[3..], "splat pair must name one register");
+        match lane {
+            crate::backend::x86_common::SplatLane::B8 => {
+                self.state.emit_fmt(format_args!("    vmovq %rax, %{x}"))
+            }
+            _ => self.state.emit_fmt(format_args!("    vmovd %eax, %{x}")),
+        }
+        for line in crate::backend::x86_common::avx1_splat_xmm_lines(lane, x, y) {
+            self.state.emit(&line);
+        }
     }
 
     /// All-ones splat fast path for the integer broadcast families.
@@ -2091,8 +2220,20 @@ impl X86Codegen {
                 if is_xmm_reg(reg) {
                     if avx {
                         let name = phys_reg_name_256(reg);
-                        self.state
-                            .emit_fmt(format_args!("    vpcmpeqd %{}, %{}, %{}", name, name, name));
+                        if self.avx2_enabled {
+                            self.state.emit_fmt(format_args!(
+                                "    vpcmpeqd %{}, %{}, %{}",
+                                name, name, name
+                            ));
+                        } else {
+                            // AVX1 has no 256-bit integer compare. VCMPPS
+                            // predicate 0x1F (TRUE_US) is all-ones for every
+                            // input and does not signal on NaN operands.
+                            self.state.emit_fmt(format_args!(
+                                "    vcmpps $0x1f, %{}, %{}, %{}",
+                                name, name, name
+                            ));
+                        }
                         self.note_vec_dest_in_home(d, &format!("%{}", name));
                     } else {
                         let name: &'static str = phys_reg_name(reg);
@@ -2113,7 +2254,11 @@ impl X86Codegen {
             }
         }
         if avx {
-            self.state.emit("    vpcmpeqd %ymm0, %ymm0, %ymm0");
+            if self.avx2_enabled {
+                self.state.emit("    vpcmpeqd %ymm0, %ymm0, %ymm0");
+            } else {
+                self.state.emit("    vcmpps $0x1f, %ymm0, %ymm0, %ymm0");
+            }
         } else if self.avx2_enabled {
             self.state.emit("    vpcmpeqd %xmm0, %xmm0, %xmm0");
         } else {
@@ -2178,7 +2323,9 @@ impl X86Codegen {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         let label = self.state.get_vec_const_label(&bytes);
-        let mnemonic = if self.avx2_enabled {
+        // A 256-bit load is VEX-only: legacy `movdqa` cannot name a ymm
+        // register, so the wide form is `vmovdqa` even under AVX1 alone.
+        let mnemonic = if wide || self.avx2_enabled {
             "vmovdqa"
         } else {
             "movdqa"
@@ -2287,8 +2434,11 @@ impl X86Codegen {
                 let ymm = phys_reg_name_256(reg);
                 let xmm = phys_reg_name(reg);
                 if half == 1 {
-                    self.state
-                        .emit_fmt(format_args!("    vextracti128 $1, %{}, %xmm1", ymm));
+                    self.state.emit_fmt(format_args!(
+                        "    {} $1, %{}, %xmm1",
+                        crate::backend::x86_common::vextract128_name(self.avx2_enabled),
+                        ymm
+                    ));
                 } else if xmm != "xmm1" {
                     self.state
                         .emit_fmt(format_args!("    movdqa %{}, %xmm1", xmm));
@@ -2298,8 +2448,11 @@ impl X86Codegen {
         }
         if let Some(held) = self.state.vec_live_ymm(v.0) {
             if half == 1 {
-                self.state
-                    .emit_fmt(format_args!("    vextracti128 $1, %{}, %xmm1", held));
+                self.state.emit_fmt(format_args!(
+                    "    {} $1, %{}, %xmm1",
+                    crate::backend::x86_common::vextract128_name(self.avx2_enabled),
+                    held
+                ));
             } else {
                 let xmm = Self::ymm_name_to_xmm(held);
                 if xmm != "xmm1" {
@@ -3030,7 +3183,9 @@ impl X86Codegen {
             let width_matches = if pf.width == 16 {
                 cc::memfold_consumer_128(op).is_some() || cc::memfold_consumer_fma_128(op)
             } else {
-                cc::memfold_consumer_256(op).is_some() || cc::memfold_consumer_madd_256(op)
+                cc::memfold_consumer_256(op).is_some()
+                    || cc::memfold_consumer_madd_256(op)
+                    || matches!(op, IntrinsicOp::Cast256to128)
             };
             let consumes = args
                 .iter()
@@ -4148,12 +4303,14 @@ impl X86Codegen {
             }
             IntrinsicOp::Zext128to256 => {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
-                    // Zero-extend 128→256: VEX insert of the 128-bit value into
-                    // a zeroed ymm. A lone vinserti128 $1 of the same xmm would
-                    // DUPLICATE the low lane into the high lane (miscompile).
+                    // Zero-extend 128→256. Any VEX-encoded 128-bit write zeroes
+                    // bits 255:128 of its destination YMM register, so the
+                    // zero-extension is one register move. This needs only AVX1.
+                    // The former vpxor %ymm1 + vinserti128 pair was AVX2-only, so
+                    // an AVX1 translation unit emitted instructions its target
+                    // cannot execute; it was also two uops where this is one.
                     self.sse_load_arg(&args[0], "xmm0");
-                    self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
-                    self.state.emit("    vinserti128 $0, %xmm0, %ymm1, %ymm0");
+                    self.state.emit("    vmovdqa %xmm0, %xmm0");
                     self.avx_store_dest(dptr);
                 }
             }
@@ -4162,10 +4319,42 @@ impl X86Codegen {
                 // Nothing to emit (lowering returns the operand directly).
             }
             IntrinsicOp::Cast256to128 => {
+                // The low 128 bits of a 256-bit value are the value's XMM
+                // view. Three operand shapes, cheapest first:
+                //   * a pending 32-byte load: narrow the load to its low 16
+                //     bytes (same address; the low half is at offset 0), so
+                //     no 32-byte read and no `dirty_upper_ymm` arming;
+                //   * a register home: read the XMM alias directly, no
+                //     `vextractf128` and no full YMM copy;
+                //   * anything else: the full 256-bit load then `vextractf128`.
+                // GCC lowers the same casts to zero instructions or a single
+                // VEX.128 move, so this is the parity target.
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
-                    self.avx_load_arg(&args[0]);
-                    self.state.emit("    vextracti128 $0, %ymm0, %xmm0");
-                    self.sse_store_dest(dptr, "xmm0");
+                    if self.narrow_pending_memfold_to_low_half(&args[0]) {
+                        self.avx_load_arg_to(&args[0], "ymm0");
+                        self.sse_store_dest(dptr, "xmm0");
+                    } else if let Some(src) = self.xmm_home_of(&args[0]) {
+                        self.sse_store_dest(dptr, src);
+                    } else if let Some(mem) = self.low_half_memory_operand(&args[0]) {
+                        // The vector lives in memory (a stack temporary or a
+                        // GPR-addressed buffer): read its low 16 bytes with one
+                        // VEX.128 load. This is the dominant shape, since a
+                        // 256-bit result that feeds a cast is spilled first.
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqu {}, %xmm0", mem));
+                        // Only the XMM half of `ymm0` is written, so no value's
+                        // full-width claim on that bank survives this load.
+                        self.state.vec_evict_bank_except("ymm0", u32::MAX);
+                        self.state.vec_last_store_reg = false;
+                        self.sse_store_dest(dptr, "xmm0");
+                    } else {
+                        self.avx_load_arg(&args[0]);
+                        self.state.emit_fmt(format_args!(
+                            "    {} $0, %ymm0, %xmm0",
+                            crate::backend::x86_common::vextract128_name(self.avx2_enabled)
+                        ));
+                        self.sse_store_dest(dptr, "xmm0");
+                    }
                 }
             }
             IntrinsicOp::Insert128to256 => {
@@ -4190,13 +4379,22 @@ impl X86Codegen {
                     // which is 1 uop handled by the load port (the modern best
                     // choice — no movd, no port-5 shuffle). Runtime values use
                     // vmovd+vbroadcast (matches GCC/LLVM on AVX2).
-                    let (inst, bits) = match op {
-                        IntrinsicOp::SetEpi8_256 => ("vpbroadcastb", 1u8),
-                        IntrinsicOp::SetEpi16_256 => ("vpbroadcastw", 2u8),
-                        IntrinsicOp::SetEpi32_256 => ("vpbroadcastd", 4u8),
-                        IntrinsicOp::SetEpi64x256 => ("vpbroadcastq", 8u8),
+                    let (inst, lane) = match op {
+                        IntrinsicOp::SetEpi8_256 => {
+                            ("vpbroadcastb", crate::backend::x86_common::SplatLane::B1)
+                        }
+                        IntrinsicOp::SetEpi16_256 => {
+                            ("vpbroadcastw", crate::backend::x86_common::SplatLane::B2)
+                        }
+                        IntrinsicOp::SetEpi32_256 => {
+                            ("vpbroadcastd", crate::backend::x86_common::SplatLane::B4)
+                        }
+                        IntrinsicOp::SetEpi64x256 => {
+                            ("vpbroadcastq", crate::backend::x86_common::SplatLane::B8)
+                        }
                         _ => unreachable!(),
                     };
+                    let bits = lane.bytes();
                     if let Operand::Const(_) = &args[0] {
                         let v = self.operand_to_imm_i64(&args[0]);
                         let mask = if bits == 8 {
@@ -4204,9 +4402,29 @@ impl X86Codegen {
                         } else {
                             (1u64 << (bits * 8)) - 1
                         };
-                        let operand = self.vec_const_rip_operand((v as u64) & mask, bits);
-                        self.state
-                            .emit_fmt(format_args!("    {} {}, %ymm0", inst, operand));
+                        if self.avx2_enabled {
+                            let operand = self.vec_const_rip_operand((v as u64) & mask, bits);
+                            self.state
+                                .emit_fmt(format_args!("    {} {}, %ymm0", inst, operand));
+                        } else {
+                            // AVX1 memory broadcast is vbroadcastss/sd only. Replicate
+                            // the lane into a 4- or 8-byte pool entry so the load never
+                            // reads past its label (1- and 2-byte labels are `.byte`
+                            // and `.short`).
+                            let lane = (v as u64) & mask;
+                            let (bcast, width, value) = match bits {
+                                1 => ("vbroadcastss", 4u8, lane * 0x0101_0101),
+                                2 => ("vbroadcastss", 4u8, lane * 0x0001_0001),
+                                4 => ("vbroadcastss", 4u8, lane),
+                                _ => ("vbroadcastsd", 8u8, lane),
+                            };
+                            let operand = self.vec_const_rip_operand(value, width);
+                            self.state
+                                .emit_fmt(format_args!("    {} {}, %ymm0", bcast, operand));
+                        }
+                    } else if !self.avx2_enabled {
+                        self.operand_to_reg(&args[0], "rax");
+                        self.emit_avx1_splat_from_gpr(lane, ("xmm0", "ymm0"));
                     } else if self.avx512_enabled {
                         // EVEX GPR-source vpbroadcast: 1 uop on port 5, no movd.
                         // operand_to_reg materialises through a 64-bit `movq`,
@@ -4535,9 +4753,25 @@ impl X86Codegen {
             | IntrinsicOp::Packuswb256
             | IntrinsicOp::Phaddw256
             | IntrinsicOp::Phaddd256
-            | IntrinsicOp::Pmuludq256 => {
+            | IntrinsicOp::Pmuludq256
+            | IntrinsicOp::AndPs256
+            | IntrinsicOp::OrPs256
+            | IntrinsicOp::XorPs256
+            | IntrinsicOp::AndNotPs256
+            | IntrinsicOp::AndPd256
+            | IntrinsicOp::OrPd256
+            | IntrinsicOp::XorPd256
+            | IntrinsicOp::AndNotPd256 => {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let (inst, comm) = match op {
+                        IntrinsicOp::AndPs256 => ("vandps", true),
+                        IntrinsicOp::OrPs256 => ("vorps", true),
+                        IntrinsicOp::XorPs256 => ("vxorps", true),
+                        IntrinsicOp::AndNotPs256 => ("vandnps", false),
+                        IntrinsicOp::AndPd256 => ("vandpd", true),
+                        IntrinsicOp::OrPd256 => ("vorpd", true),
+                        IntrinsicOp::XorPd256 => ("vxorpd", true),
+                        IntrinsicOp::AndNotPd256 => ("vandnpd", false),
                         IntrinsicOp::Pmulld256 => ("vpmulld", true),
                         IntrinsicOp::Psubd256 => ("vpsubd", false),
                         IntrinsicOp::Paddq256 => ("vpaddq", true),
@@ -4590,8 +4824,15 @@ impl X86Codegen {
                 if let Some(dptr) = dest_ptr {
                     self.avx_load_arg(&args[0]);
                     let lane = self.operand_to_imm_i64(&args[1]) & 1;
-                    self.state
-                        .emit_fmt(format_args!("    vextracti128 ${}, %ymm0, %xmm0", lane));
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %ymm0, %xmm0",
+                        if self.avx2_enabled {
+                            "vextracti128"
+                        } else {
+                            "vextractf128"
+                        },
+                        lane
+                    ));
                     self.sse_store_dest(dptr, "xmm0");
                 } else if dest.is_some() {
                     panic!(
@@ -5127,8 +5368,9 @@ impl X86Codegen {
                 // xmm1 otherwise.  Placed before the vectorized j-loop.
                 //
                 // The width is chosen from the register file, NOT from FMA3.
-                // `vbroadcastsd %xmm1, %ymm1` is an AVX (VEX.256) form and
-                // needs no FMA unit, while the 128-bit `unpcklpd` form only
+                // `vbroadcastsd %xmm1, %ymm1` (register source, AVX2, emitted
+                // only under `isa.ymm`) needs no FMA unit, while the 128-bit
+                // `unpcklpd` form only
                 // ever fills two lanes.  Gating the wide form on `isa.fma`
                 // made every non-FMA 256-bit consumer -- `-mno-fma`, and
                 // `-ffp-contract=off`, which takes the unfused
@@ -5439,7 +5681,10 @@ impl X86Codegen {
                 // Reduce 8×I32 → 1×I32
                 self.operand_to_reg(&args[0], "rax");
                 self.state.emit("    vmovdqu (%rax), %ymm0"); // Load 8 ints
-                self.state.emit("    vextracti128 $1, %ymm0, %xmm1"); // Extract upper 128 (8→4)
+                self.state.emit_fmt(format_args!(
+                    "    {} $1, %ymm0, %xmm1",
+                    crate::backend::x86_common::vextract128_name(self.avx2_enabled)
+                )); // Extract upper 128 (8→4)
                 self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0"); // Add halves (8→4)
                 self.state.emit("    vpsrldq $8, %xmm0, %xmm1"); // Shift 8 bytes (4→2)
                 self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0"); // Add (4→2)
@@ -7315,7 +7560,10 @@ impl X86Codegen {
                 // assembler and made `-S` output unassemblable by GNU as.
                 // Only the low 128 bits feed the rest of the fold, so the
                 // add is 128-bit as well.
-                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit_fmt(format_args!(
+                    "    {} $1, %ymm0, %xmm1",
+                    crate::backend::x86_common::vextract128_name(self.avx2_enabled)
+                ));
                 self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
                 self.state.emit("    vpshufd $0xEE, %xmm0, %xmm1");
                 self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
@@ -7664,7 +7912,7 @@ impl X86Codegen {
             // Signed word min/max are SSE2 BASELINE (unlike both the byte and
             // the dword signed forms), so both widths have them.
             IntrinsicOp::VecMinI16x16 => {
-                if let Some(d) = dest {
+                if let Some(d) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(d, args, "vpminsw", true);
                 }
             }
@@ -7695,13 +7943,28 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecMaxI16x16 => {
-                if let Some(d) = dest {
+                if let Some(d) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(d, args, "vpmaxsw", true);
                 }
             }
             IntrinsicOp::VecMaxI16x8 => {
                 if let Some(d) = dest {
                     self.emit_sse_binary_128(d, args, "pmaxsw");
+                }
+            }
+            // SSE4.1 unsigned word extrema at 128 bits: one `pminuw`/`pmaxuw`,
+            // the twins of `VecMinU16x16`/`VecMaxU16x16` (and of the unsigned
+            // dword pair above).  The SSE2 saturating-difference identity this
+            // replaces cost two uops per operation.
+            IntrinsicOp::VecMinU16x8 | IntrinsicOp::VecMaxU16x8 => {
+                assert!(self.isa.sse41, "unsigned word min/max requires SSE4.1");
+                if let Some(d) = result_dest(dest, dest_ptr) {
+                    let inst = if *op == IntrinsicOp::VecMaxU16x8 {
+                        "pmaxuw"
+                    } else {
+                        "pminuw"
+                    };
+                    self.emit_sse_binary_128(d, args, inst);
                 }
             }
             // SSE4.1 signed BYTE extrema at 128 bits.  The 256-bit pair lives
@@ -7854,12 +8117,12 @@ impl X86Codegen {
             }
             // Unsigned word min/max are SSE4.1, hence AVX2-only here.
             IntrinsicOp::VecMinU16x16 => {
-                if let Some(d) = dest {
+                if let Some(d) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(d, args, "vpminuw", true);
                 }
             }
             IntrinsicOp::VecMaxU16x16 => {
-                if let Some(d) = dest {
+                if let Some(d) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(d, args, "vpmaxuw", true);
                 }
             }
@@ -7904,8 +8167,15 @@ impl X86Codegen {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movd %eax, %xmm0");
-                    self.state.emit("    vpbroadcastw %xmm0, %ymm0");
+                    if self.avx2_enabled {
+                        self.state.emit("    movd %eax, %xmm0");
+                        self.state.emit("    vpbroadcastw %xmm0, %ymm0");
+                    } else {
+                        self.emit_avx1_splat_from_gpr(
+                            crate::backend::x86_common::SplatLane::B2,
+                            ("xmm0", "ymm0"),
+                        );
+                    }
                     self.state.dirty_upper_ymm = true;
                     if let Some(d) = dest {
                         self.state.vector_values.insert(d.0);
@@ -7949,8 +8219,15 @@ impl X86Codegen {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movd %eax, %xmm0");
-                    self.state.emit("    vpbroadcastb %xmm0, %ymm0");
+                    if self.avx2_enabled {
+                        self.state.emit("    movd %eax, %xmm0");
+                        self.state.emit("    vpbroadcastb %xmm0, %ymm0");
+                    } else {
+                        self.emit_avx1_splat_from_gpr(
+                            crate::backend::x86_common::SplatLane::B1,
+                            ("xmm0", "ymm0"),
+                        );
+                    }
                     self.state.dirty_upper_ymm = true;
                     if let Some(d) = dest {
                         self.state.vector_values.insert(d.0);
@@ -8844,10 +9121,7 @@ impl X86Codegen {
                     if !done {
                         if let Some(&reg) = self.reg_assignments.get(&v.0) {
                             if is_xmm_reg(reg) {
-                                self.state.emit_fmt(format_args!(
-                                    "    vbroadcastsd %{}, %ymm0",
-                                    phys_reg_name(reg)
-                                ));
+                                self.emit_vbroadcast_xmm_to_ymm(true, phys_reg_name(reg), "ymm0");
                                 done = true;
                             }
                         }
@@ -8855,7 +9129,7 @@ impl X86Codegen {
                 }
                 if !done {
                     self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");
-                    self.state.emit("    vbroadcastsd %xmm0, %ymm0");
+                    self.emit_vbroadcast_xmm_to_ymm(true, "xmm0", "ymm0");
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -8988,8 +9262,7 @@ impl X86Codegen {
                         if let Some(&reg) = self.reg_assignments.get(&v.0) {
                             if is_xmm_reg(reg) {
                                 let name = phys_reg_name(reg);
-                                self.state
-                                    .emit_fmt(format_args!("    vbroadcastss %{}, %ymm0", name));
+                                self.emit_vbroadcast_xmm_to_ymm(false, name, "ymm0");
                                 done = true;
                             }
                         }
@@ -8997,7 +9270,7 @@ impl X86Codegen {
                 }
                 if !done {
                     self.emit_fp_operand_to_xmm(&args[0], IrType::F32, "xmm0");
-                    self.state.emit("    vbroadcastss %xmm0, %ymm0");
+                    self.emit_vbroadcast_xmm_to_ymm(false, "xmm0", "ymm0");
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -9450,7 +9723,10 @@ impl X86Codegen {
                 // The generic loader handles both a protected stack home and
                 // a width-aware register assignment.
                 self.avx_load_arg(&args[0]);
-                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit_fmt(format_args!(
+                    "    {} $1, %ymm0, %xmm1",
+                    crate::backend::x86_common::vextract128_name(self.avx2_enabled)
+                ));
                 self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");
                 self.state.emit("    vpsrldq $8, %xmm0, %xmm1");
                 self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");
@@ -9470,7 +9746,10 @@ impl X86Codegen {
                 // not vpsrldq (zero-filling byte shift) is mandatory.
                 self.avx_load_arg(&args[0]);
                 // Halve 8->4: min of low 128 and high 128.
-                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit_fmt(format_args!(
+                    "    {} $1, %ymm0, %xmm1",
+                    crate::backend::x86_common::vextract128_name(self.avx2_enabled)
+                ));
                 self.state.emit("    vpminsd %xmm1, %xmm0, %xmm0");
                 // Reduce 4->2: permute lanes {2,3,0,1}, min-merge.
                 self.state.emit("    vpshufd $0x4e, %xmm0, %xmm1");
@@ -9496,7 +9775,10 @@ impl X86Codegen {
                 // the true signed maximum.
                 self.avx_load_arg(&args[0]);
                 // Halve 8→4: max of low 128 and high 128.
-                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit_fmt(format_args!(
+                    "    {} $1, %ymm0, %xmm1",
+                    crate::backend::x86_common::vextract128_name(self.avx2_enabled)
+                ));
                 self.state.emit("    vpmaxsd %xmm1, %xmm0, %xmm0");
                 // Reduce 4→2: permute lanes {2,3,0,1}, max-merge.
                 self.state.emit("    vpshufd $0x4e, %xmm0, %xmm1");
@@ -10975,6 +11257,41 @@ impl X86Codegen {
         }
     }
 
+    /// Broadcast the low F32 (`f64_lane == false`) or F64 lane of xmm register
+    /// `src` (a bare name such as `xmm1`) to every lane of ymm `dst`.
+    ///
+    /// AVX2 has the register-source `vbroadcastss/sd %xmm, %ymm`. Plain AVX
+    /// has only the memory-source forms, so under AVX1 the splat is built in
+    /// the 128-bit half (`vshufps`, or `vmovddup` for F64; the VEX.128 write
+    /// also zeroes the ymm upper half) and copied up with `vinsertf128`.
+    /// Both spellings produce the same 256-bit value.
+    pub(super) fn emit_vbroadcast_xmm_to_ymm(&mut self, f64_lane: bool, src: &str, dst: &str) {
+        if self.avx2_enabled {
+            let mnemonic = if f64_lane {
+                "vbroadcastsd"
+            } else {
+                "vbroadcastss"
+            };
+            self.state
+                .emit_fmt(format_args!("    {} %{}, %{}", mnemonic, src, dst));
+            return;
+        }
+        let dst_x = dst.replacen("ymm", "xmm", 1);
+        if f64_lane {
+            self.state
+                .emit_fmt(format_args!("    vmovddup %{}, %{}", src, dst_x));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    vshufps $0, %{}, %{}, %{}",
+                src, src, dst_x
+            ));
+        }
+        self.state.emit_fmt(format_args!(
+            "    vinsertf128 $1, %{}, %{}, %{}",
+            dst_x, dst, dst
+        ));
+    }
+
     fn try_emit_bitwise_lane_const(
         &mut self,
         dest: &Value,
@@ -11023,8 +11340,8 @@ impl X86Codegen {
         // Legacy SSE2 (128-bit only — the 256-bit families require AVX):
         // the destructive two-operand form stages the source into the
         // destination, then XORs the aligned mask memory in place.
-        if !self.avx2_enabled {
-            debug_assert!(!wide, "256-bit families require AVX");
+        if !(self.avx_enabled || self.avx2_enabled) {
+            assert!(!wide, "256-bit families require AVX");
             let legacy = &vex_mnemonic[1..]; // "xorps" / "xorpd"
             match self.dest_xmm_home_name(dest) {
                 Some(name) => {
@@ -15610,23 +15927,36 @@ mod broadcast_pending_bank_tests {
     /// committed by a general broadcast, and the broadcast writes only bank 1.
     #[test]
     fn bank0_pending_operand_survives_a_general_broadcast_untouched() {
-        let mut cg = fresh();
-        cg.state.pending_vec_store = Some((0, "ymm0", true));
-        cg.emit_broadcast_i32x8_general(&[scalar()], &None);
-        let out = cg.state.out.buf.clone();
-        assert_eq!(
-            cg.state.pending_vec_store,
-            Some((0, "ymm0", true)),
-            "the live operand must stay pending: {out}"
-        );
-        assert!(
-            out.contains("vmovd %eax, %xmm1") && out.contains("vpbroadcastd %xmm1, %ymm1"),
-            "the broadcast must stage in bank 1: {out}"
-        );
-        assert!(
-            !out.contains("%xmm0") && !out.contains("%ymm0"),
-            "bank 0 must not be written or spilled: {out}"
-        );
+        // Both permissions. AVX2 emits `vpbroadcastd`; AVX1 emits the VEX.128
+        // shuffle plus `vinsertf128` form. The bank-1 property is shared.
+        for avx2 in [true, false] {
+            let mut cg = fresh();
+            cg.avx2_enabled = avx2;
+            cg.state.pending_vec_store = Some((0, "ymm0", true));
+            cg.emit_broadcast_i32x8_general(&[scalar()], &None);
+            let out = cg.state.out.buf.clone();
+            assert_eq!(
+                cg.state.pending_vec_store,
+                Some((0, "ymm0", true)),
+                "avx2={avx2}: the live operand must stay pending: {out}"
+            );
+            let staged_in_bank1 = if avx2 {
+                out.contains("vmovd %eax, %xmm1") && out.contains("vpbroadcastd %xmm1, %ymm1")
+            } else {
+                out.contains("vmovd %eax, %xmm1")
+                    && out.contains("vpshufd $0, %xmm1, %xmm1")
+                    && out.contains("vinsertf128 $1, %xmm1, %ymm1, %ymm1")
+                    && !out.contains("vpbroadcastd")
+            };
+            assert!(
+                staged_in_bank1,
+                "avx2={avx2}: the broadcast must stage in bank 1: {out}"
+            );
+            assert!(
+                !out.contains("%xmm0") && !out.contains("%ymm0"),
+                "avx2={avx2}: bank 0 must not be written or spilled: {out}"
+            );
+        }
     }
 
     /// A pending value in a claimable bank is not in the scratch pair, so the
@@ -15684,5 +16014,125 @@ mod broadcast_pending_bank_tests {
             !out.contains("vmovdqu %ymm1, "),
             "a deferred dest is not stored: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cast256_low_half_tests {
+    use super::*;
+    use crate::backend::state::PendingVecMemfold;
+
+    /// Emit `dest = cast256to128(arg0)` and return the emitted text.
+    fn emit_cast(cg: &mut X86Codegen) -> String {
+        cg.emit_intrinsic_impl(
+            &Some(Value(2)),
+            &IntrinsicOp::Cast256to128,
+            &None,
+            &[Operand::Value(Value(0))],
+        );
+        cg.state.out.buf.clone()
+    }
+
+    fn fold(val: u32, width: u32, mnemonic: &'static str) -> PendingVecMemfold {
+        PendingVecMemfold {
+            val,
+            mem: "(%rdi)".to_string(),
+            mnemonic,
+            width,
+        }
+    }
+
+    #[test]
+    fn pending_256_bit_load_narrows_to_one_xmm_load() {
+        // The low half of `vmovdqu (%rdi)` is a 16-byte load of the same
+        // address: no 32-byte read, no full YMM register, no `vzeroupper`.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6 / ymm6
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.vector_values.extend([0, 2]);
+        cg.state.pending_vec_memfold = Some(fold(0, 32, "vmovdqu"));
+        let out = emit_cast(&mut cg);
+        assert!(out.contains("vmovdqu (%rdi), %xmm0"), "{out}");
+        assert!(!out.contains("ymm") && !out.contains("vextract"), "{out}");
+        assert!(!cg.state.dirty_upper_ymm, "{out}");
+        assert!(cg.state.pending_vec_memfold.is_none(), "{out}");
+    }
+
+    #[test]
+    fn pending_256_bit_aligned_load_keeps_its_aligned_mnemonic() {
+        // `vmovdqa` at 32-byte alignment is also 16-byte aligned, so the
+        // narrowed form keeps the aligned mnemonic and stays legal.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24));
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.vector_values.extend([0, 2]);
+        cg.state.pending_vec_memfold = Some(fold(0, 32, "vmovdqa"));
+        let out = emit_cast(&mut cg);
+        assert!(out.contains("vmovdqa (%rdi), %xmm0"), "{out}");
+        assert!(!out.contains("vextract"), "{out}");
+    }
+
+    #[test]
+    fn register_home_reads_its_xmm_alias_without_extract() {
+        // The low alias of `ymm5` is `xmm5`: a register-homed cast is a
+        // register-to-register move at most, never a YMM copy plus extract.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, PhysReg(23)); // xmm5 / ymm5
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6 / ymm6
+        cg.state.vector_values.extend([0, 2]);
+        let out = emit_cast(&mut cg);
+        assert!(out.contains("%xmm5"), "{out}");
+        assert!(!out.contains("%ymm5") && !out.contains("vextract"), "{out}");
+        assert!(!cg.state.dirty_upper_ymm, "{out}");
+    }
+
+    #[test]
+    fn slot_resident_operand_reads_its_low_half_with_one_xmm_load() {
+        // The dominant real shape: a 256-bit result spilled to its stack
+        // slot. The cast reads the first 16 bytes of that slot directly; the
+        // 32-byte reload and `vextractf128` are not needed.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6 / ymm6
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.vector_values.extend([0, 2]);
+        let out = emit_cast(&mut cg);
+        assert!(out.contains("vmovdqu -64(%rbp), %xmm0"), "{out}");
+        assert!(!out.contains("ymm") && !out.contains("vextract"), "{out}");
+        assert!(!cg.state.dirty_upper_ymm, "{out}");
+    }
+
+    #[test]
+    fn live_ymm_claim_keeps_the_register_path() {
+        // A value still held in a YMM register is authoritative. Memory may
+        // be stale, so the cast must read the register (move-aside + extract),
+        // never the slot.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24));
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.vector_values.extend([0, 2]);
+        cg.state.vec_claim_live_reg(0, "ymm3");
+        let out = emit_cast(&mut cg);
+        assert!(!out.contains("-64(%rbp)"), "{out}");
+        assert!(out.contains("%ymm3") && out.contains("vextract"), "{out}");
+    }
+
+    #[test]
+    fn fold_of_another_value_is_not_narrowed() {
+        // A pending load belongs to one value only. Narrowing a different
+        // operand would re-issue the wrong load.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(24));
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        cg.state.value_locations.insert(7, StackSlot(-96));
+        cg.state.vector_values.extend([0, 2, 7]);
+        cg.state.pending_vec_memfold = Some(fold(7, 32, "vmovdqu"));
+        let out = emit_cast(&mut cg);
+        // The foreign pending load is materialised first (its own width-32
+        // load, stored to its home), and the cast then reads value 0's slot.
+        assert!(out.contains("vmovdqu (%rdi), %ymm0"), "{out}");
+        assert!(!out.contains("(%rdi), %xmm0"), "{out}");
+        assert!(out.contains("vmovdqu -64(%rbp), %xmm0"), "{out}");
+        assert!(!out.contains("vextract"), "{out}");
+        assert!(cg.state.pending_vec_memfold.is_none(), "{out}");
     }
 }

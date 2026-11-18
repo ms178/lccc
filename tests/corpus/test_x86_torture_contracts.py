@@ -545,10 +545,13 @@ class EvidenceContract(unittest.TestCase):
             report = Path(td) / "report.json"
             report.write_text(json.dumps(empty))
             out = Path(td) / "evidence.json"
+            err = io.StringIO()
             with self.assertRaises(SystemExit) as ctx:
-                with redirect_stdout(io.StringIO()):
+                with redirect_stdout(io.StringIO()), redirect_stderr(err):
                     evidence.main([f"{report}:target", "--out", str(out)])
             self.assertEqual(ctx.exception.code, 2)
+            # The refusal names its reason; the test asserts it, not just rc 2.
+            self.assertIn("flags is empty", err.getvalue())
             self.assertFalse(out.exists(), "an empty evidence table must not be published")
 
     def test_digest_checked_even_when_nothing_was_seen(self):

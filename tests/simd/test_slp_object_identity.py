@@ -861,8 +861,12 @@ int main(void) {
         non-x86 backend must never accidentally take the SSE4.1 joint path.
         """
         src = self.d / "cross_matrix.c"
+        # Self-contained on purpose: this is a cross-target `-S` compile, and a
+        # host libc header would make the result depend on which multiarch
+        # sysroot the runner has installed (i686/arm/riscv bits/ are absent
+        # unless provisioned).  `uint32_t` is the only libc name used.
         src.write_text(r"""
-#include <stdint.h>
+typedef unsigned int uint32_t;
 uint32_t g[16];
 int main(int argc, char **argv) {
     (void)argv; uint32_t s = (uint32_t)argc;
@@ -871,6 +875,8 @@ int main(int argc, char **argv) {
 }
 """)
         flags = ["-O2", "-Wall", "-Wextra", "-Werror", "-Wpedantic", "-S"]
+        # Hermeticity guard: no libc header may reach a cross-target compile.
+        self.assertNotIn("#include", src.read_text())
         bins = ["lccc", "lccc-i686", "lccc-arm", "lccc-riscv", "lccc-x86"]
         for name in bins:
             binary = ROOT / "target" / "fastbuild" / name
@@ -1006,7 +1012,9 @@ int main(int argc, char **argv) {
         assembly.  On the host x86-64 backend, GCC 16.2, Clang 23.1.5 and
         LCCC must additionally agree on the native runtime result.
         """
-        lines = ["#include <stdint.h>", "uint32_t g[128];"]
+        # Self-contained: see test_36 -- a cross-target `-S` compile must not
+        # depend on a host multiarch sysroot.
+        lines = ["typedef unsigned int uint32_t;", "uint32_t g[128];"]
         for j in range(32):
             lines.append(f"uint32_t h{j}[4];")
         lines += ["int main(void) {", "    uint32_t *p = g;"]
@@ -1031,6 +1039,8 @@ int main(int argc, char **argv) {
         src = self.d / "cross_seed_stress.c"
         src.write_text("\n".join(lines) + "\n")
         flags = ["-O2", "-Wall", "-Wextra", "-Werror", "-Wpedantic", "-S"]
+        # Hermeticity guard: no libc header may reach a cross-target compile.
+        self.assertNotIn("#include", src.read_text())
         bins = ["lccc", "lccc-i686", "lccc-arm", "lccc-riscv", "lccc-x86"]
         for name in bins:
             binary = ROOT / "target" / "fastbuild" / name

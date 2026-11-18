@@ -770,6 +770,7 @@ _mm256_packus_epi16(__m256i __a, __m256i __b)
 
 /* === Gather === */
 
+#if defined(__AVX2__)
 /* _mm256_i32gather_epi32: gather 32-bit ints using 32-bit indices (VPGATHERDD) */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_i32gather_epi32(int const *__base, __m256i __index, int __scale)
@@ -782,6 +783,7 @@ _mm256_i32gather_epi32(int const *__base, __m256i __index, int __scale)
         __pr[__i] = *(int *)(__b + (long long)__pi[__i] * __scale);
     return __r;
 }
+#endif /* __AVX2__ */
 
 
 /* === Cast / move between 128-bit and 256-bit === */
@@ -825,27 +827,394 @@ _mm256_subs_epu16(__m256i __a, __m256i __b)
 
 /* _mm256_max_epu16 / _mm256_min_epu16: packed unsigned 16-bit extrema.
  *
- * There is no `vpmaxuw`/`vpminuw` value form below AVX-512, so these are the
- * exact saturating-difference identities: with `t = subs_epu16(a, b)` (zero
- * where `a <= b`, `a - b` otherwise) the maximum is `b + t` and the minimum
- * is `a - t`.  Both intermediate values are in range by construction, so no
- * lane can wrap, and every step is a single instruction (`vpsubusw`,
- * `vpaddw`/`vpsubw`) that the backend already carries in register form.
+ * One `vpmaxuw` / `vpminuw` (AVX2) each, through the same builtins GCC 16.2
+ * uses.  Like the other AVX2 wrappers in this header the requirement is
+ * deferred to the caller, so a caller without AVX2 is diagnosed rather than
+ * handed a sequence that merely looks equivalent.
  */
-static __inline__ __m256i __attribute__((__always_inline__, target("avx2")))
+static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_max_epu16(__m256i __a, __m256i __b)
 {
-    return (__m256i)__builtin_ia32_paddw256(
-        (__v16hi)(__b),
-        (__v16hi)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b)));
+    return (__m256i)__builtin_ia32_pmaxuw256((__v16hi)(__a), (__v16hi)(__b));
 }
 
-static __inline__ __m256i __attribute__((__always_inline__, target("avx2")))
+static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_min_epu16(__m256i __a, __m256i __b)
 {
-    return (__m256i)__builtin_ia32_psubw256(
-        (__v16hi)(__a),
-        (__v16hi)__builtin_ia32_psubusw256((__v16hi)(__a), (__v16hi)(__b)));
+    return (__m256i)__builtin_ia32_pminuw256((__v16hi)(__a), (__v16hi)(__b));
 }
+
+/* _mm256_max_epi16 / _mm256_min_epi16: packed SIGNED 16-bit extrema
+ * (VPMAXSW/VPMINSW, AVX2).  These were absent from the header, so `-mavx2`
+ * code that GCC compiles failed with an implicit-declaration error. */
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_max_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_pmaxsw256((__v16hi)(__a), (__v16hi)(__b));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_min_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_pminsw256((__v16hi)(__a), (__v16hi)(__b));
+}
+
+/* Everything below is AVX2-only: GCC defines these with target("avx2"), so
+ * under -mavx they must not exist. -mavx2 defines __AVX2__; -mavx does not. */
+#ifdef __AVX2__
+
+/* === Vector-extension AVX2 completions ===
+ * Written with the portable GCC/Clang vector operators instead of per-element
+ * loops, so each operator lowers to one native AVX2 instruction (vpaddw,
+ * vpsllvd, vpcmpgtb, vpblendvb-equivalent AND/OR) and no lane value takes a
+ * memory round trip. Saturation is the standard exact construction: compute the
+ * wrapped result and the overflow predicate, then select the saturated bound by
+ * the sign of the first operand (signed) or by the carry/borrow (unsigned).
+ * Immediate and count operands are reduced to the architectural range before
+ * the shift, so no lane ever sees an out-of-range vector shift count. */
+
+typedef unsigned char __lccc_v32qu __attribute__((__vector_size__(32)));
+typedef unsigned short __lccc_v16hu __attribute__((__vector_size__(32)));
+typedef int __lccc_v8si __attribute__((__vector_size__(32)));
+typedef unsigned char __lccc_v16qu __attribute__((__vector_size__(16)));
+typedef char __lccc_v16qi __attribute__((__vector_size__(16)));
+typedef short __lccc_v8hi __attribute__((__vector_size__(16)));
+typedef unsigned short __lccc_v8hu __attribute__((__vector_size__(16)));
+typedef int __lccc_v4si __attribute__((__vector_size__(16)));
+typedef unsigned int __lccc_v4su __attribute__((__vector_size__(16)));
+typedef long long __lccc_v2di __attribute__((__vector_size__(16)));
+typedef unsigned long long __lccc_v2du __attribute__((__vector_size__(16)));
+typedef long long __lccc_v4di __attribute__((__vector_size__(32)));
+typedef unsigned long long __lccc_v4du __attribute__((__vector_size__(32)));
+typedef unsigned int __lccc_v8su __attribute__((__vector_size__(32)));
+
+/* --- Saturating add/subtract (VPADDSB/W, VPADDUSB/W, VPSUBSB/W, VPSUBUSB/W) --- */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_adds_epi8(__m256i __a, __m256i __b)
+{
+    __v32qi __x = (__v32qi)__a, __y = (__v32qi)__b;
+    __v32qi __s = __x + __y;
+    /* Signed overflow iff both operands share a sign and the sum does not. */
+    __v32qi __ovf = ((__x ^ __s) & (__y ^ __s)) < 0;
+    __v32qi __sat = (__x >> 7) ^ 0x7F; /* 0x7F for x >= 0, 0x80 for x < 0 */
+    return (__m256i)((__s & ~__ovf) | (__sat & __ovf));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_adds_epi16(__m256i __a, __m256i __b)
+{
+    __v16hi __x = (__v16hi)__a, __y = (__v16hi)__b;
+    __v16hi __s = __x + __y;
+    __v16hi __ovf = ((__x ^ __s) & (__y ^ __s)) < 0;
+    __v16hi __sat = (__x >> 15) ^ 0x7FFF;
+    return (__m256i)((__s & ~__ovf) | (__sat & __ovf));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_subs_epi8(__m256i __a, __m256i __b)
+{
+    __v32qi __x = (__v32qi)__a, __y = (__v32qi)__b;
+    __v32qi __d = __x - __y;
+    /* Signed overflow iff the operands differ in sign and the result's sign
+     * differs from the minuend. */
+    __v32qi __ovf = ((__x ^ __y) & (__x ^ __d)) < 0;
+    __v32qi __sat = (__x >> 7) ^ 0x7F;
+    return (__m256i)((__d & ~__ovf) | (__sat & __ovf));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_subs_epi16(__m256i __a, __m256i __b)
+{
+    __v16hi __x = (__v16hi)__a, __y = (__v16hi)__b;
+    __v16hi __d = __x - __y;
+    __v16hi __ovf = ((__x ^ __y) & (__x ^ __d)) < 0;
+    __v16hi __sat = (__x >> 15) ^ 0x7FFF;
+    return (__m256i)((__d & ~__ovf) | (__sat & __ovf));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_adds_epu8(__m256i __a, __m256i __b)
+{
+    __lccc_v32qu __x = (__lccc_v32qu)__a, __y = (__lccc_v32qu)__b;
+    __lccc_v32qu __s = __x + __y;
+    /* Unsigned overflow iff the wrapped sum is below an operand. */
+    __lccc_v32qu __ovf = (__lccc_v32qu)(__s < __x);
+    return (__m256i)(__s | __ovf);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_adds_epu16(__m256i __a, __m256i __b)
+{
+    __lccc_v16hu __x = (__lccc_v16hu)__a, __y = (__lccc_v16hu)__b;
+    __lccc_v16hu __s = __x + __y;
+    __lccc_v16hu __ovf = (__lccc_v16hu)(__s < __x);
+    return (__m256i)(__s | __ovf);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_subs_epu8(__m256i __a, __m256i __b)
+{
+    __lccc_v32qu __x = (__lccc_v32qu)__a, __y = (__lccc_v32qu)__b;
+    __lccc_v32qu __d = __x - __y;
+    /* Unsigned borrow iff x < y: the saturated result is zero. */
+    __lccc_v32qu __borrow = (__lccc_v32qu)(__x < __y);
+    return (__m256i)(__d & ~__borrow);
+}
+
+/* --- Rounding average (VPAVGB/W): (a + b + 1) >> 1 without widening.
+ * (a|b) - ((a^b)>>1) equals ceil((a+b)/2) for unsigned operands. --- */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_avg_epu8(__m256i __a, __m256i __b)
+{
+    __lccc_v32qu __x = (__lccc_v32qu)__a, __y = (__lccc_v32qu)__b;
+    return (__m256i)((__x | __y) - ((__x ^ __y) >> 1));
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_avg_epu16(__m256i __a, __m256i __b)
+{
+    __lccc_v16hu __x = (__lccc_v16hu)__a, __y = (__lccc_v16hu)__b;
+    return (__m256i)((__x | __y) - ((__x ^ __y) >> 1));
+}
+
+/* --- Compare equal for words (VPCMPEQW). The byte form is a frontend builtin. --- */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_cmpeq_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)((__v16hi)__a == (__v16hi)__b);
+}
+
+/* GCC's 128-bit spelling of the AVX2 broadcast; it is an alias, not a new op. */
+#define _mm_broadcastsi128_si256(__X) _mm256_broadcastsi128_si256((__X))
+
+/* --- Compare greater-than for words (VPCMPGTW). The byte form
+ * _mm256_cmpgt_epi8 is a frontend builtin (X86Pcmpgtb256) and is not redefined
+ * here. --- */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_cmpgt_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)((__v16hi)__a > (__v16hi)__b);
+}
+
+/* --- Sign (VPSIGNB/W/D): negate a where b < 0, keep a where b > 0, zero where
+ * b == 0. Conditional negate is (x ^ m) - m with m = -1 for negative lanes. --- */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sign_epi8(__m256i __a, __m256i __b)
+{
+    __v32qi __x = (__v32qi)__a, __y = (__v32qi)__b;
+    __v32qi __m = __y >> 7;
+    __v32qi __z = __y == 0;
+    return (__m256i)(((__x ^ __m) - __m) & ~__z);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sign_epi16(__m256i __a, __m256i __b)
+{
+    __v16hi __x = (__v16hi)__a, __y = (__v16hi)__b;
+    __v16hi __m = __y >> 15;
+    __v16hi __z = __y == 0;
+    return (__m256i)(((__x ^ __m) - __m) & ~__z);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sign_epi32(__m256i __a, __m256i __b)
+{
+    __lccc_v8si __x = (__lccc_v8si)__a, __y = (__lccc_v8si)__b;
+    __lccc_v8si __m = __y >> 31;
+    __lccc_v8si __z = __y == 0;
+    return (__m256i)(((__x ^ __m) - __m) & ~__z);
+}
+
+/* --- Byte blend under a mask (VPBLENDVB): select b where the mask's sign bit
+ * is set. The sign bit is widened to a full-byte mask by a compare. --- */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_blendv_epi8(__m256i __a, __m256i __b, __m256i __mask)
+{
+    __v32qi __m = (__v32qi)__mask < 0;
+    return (__m256i)(((__v32qi)__a & ~__m) | ((__v32qi)__b & __m));
+}
+
+/* --- Shifts by a scalar count taken from the low 64 bits of an XMM register.
+ * A count at or above the element width gives zero (logical) or the sign fill
+ * (arithmetic), per the Intel definition. --- */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sll_epi16(__m256i __a, __m128i __count)
+{
+    unsigned long long __c = ((__lccc_v2du)__count)[0];
+    if (__c > 15)
+        return _mm256_setzero_si256();
+    return (__m256i)((__lccc_v16hu)__a << (int)__c);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sll_epi32(__m256i __a, __m128i __count)
+{
+    unsigned long long __c = ((__lccc_v2du)__count)[0];
+    if (__c > 31)
+        return _mm256_setzero_si256();
+    return (__m256i)((__lccc_v8su)__a << (int)__c);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sll_epi64(__m256i __a, __m128i __count)
+{
+    unsigned long long __c = ((__lccc_v2du)__count)[0];
+    if (__c > 63)
+        return _mm256_setzero_si256();
+    return (__m256i)((__lccc_v4du)__a << (int)__c);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_srl_epi16(__m256i __a, __m128i __count)
+{
+    unsigned long long __c = ((__lccc_v2du)__count)[0];
+    if (__c > 15)
+        return _mm256_setzero_si256();
+    return (__m256i)((__lccc_v16hu)__a >> (int)__c);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_srl_epi32(__m256i __a, __m128i __count)
+{
+    unsigned long long __c = ((__lccc_v2du)__count)[0];
+    if (__c > 31)
+        return _mm256_setzero_si256();
+    return (__m256i)((__lccc_v8su)__a >> (int)__c);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_srl_epi64(__m256i __a, __m128i __count)
+{
+    unsigned long long __c = ((__lccc_v2du)__count)[0];
+    if (__c > 63)
+        return _mm256_setzero_si256();
+    return (__m256i)((__lccc_v4du)__a >> (int)__c);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sra_epi16(__m256i __a, __m128i __count)
+{
+    unsigned long long __c = ((__lccc_v2du)__count)[0];
+    int __k = __c > 15 ? 15 : (int)__c;
+    return (__m256i)((__v16hi)__a >> __k);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sra_epi32(__m256i __a, __m128i __count)
+{
+    unsigned long long __c = ((__lccc_v2du)__count)[0];
+    int __k = __c > 31 ? 31 : (int)__c;
+    return (__m256i)((__lccc_v8si)__a >> __k);
+}
+
+/* --- Per-element variable shifts (VPSLLV/VPSRLV/VPSRAV). An out-of-range count
+ * gives zero (logical) or the sign fill (arithmetic). The count is masked to
+ * the element width before the hardware shift, and the out-of-range lanes are
+ * then cleared or saturated by a lane mask. --- */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sllv_epi32(__m256i __a, __m256i __count)
+{
+    __lccc_v8su __k = (__lccc_v8su)__count;
+    __lccc_v8su __in = (__lccc_v8su)(__k < 32);
+    return (__m256i)(((__lccc_v8su)__a << (__k & 31)) & __in);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sllv_epi64(__m256i __a, __m256i __count)
+{
+    __lccc_v4du __k = (__lccc_v4du)__count;
+    __lccc_v4du __in = (__lccc_v4du)(__k < 64);
+    return (__m256i)(((__lccc_v4du)__a << (__k & 63)) & __in);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_srlv_epi32(__m256i __a, __m256i __count)
+{
+    __lccc_v8su __k = (__lccc_v8su)__count;
+    __lccc_v8su __in = (__lccc_v8su)(__k < 32);
+    return (__m256i)(((__lccc_v8su)__a >> (__k & 31)) & __in);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_srlv_epi64(__m256i __a, __m256i __count)
+{
+    __lccc_v4du __k = (__lccc_v4du)__count;
+    __lccc_v4du __in = (__lccc_v4du)(__k < 64);
+    return (__m256i)(((__lccc_v4du)__a >> (__k & 63)) & __in);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_srav_epi32(__m256i __a, __m256i __count)
+{
+    __lccc_v8su __k = (__lccc_v8su)__count;
+    __lccc_v8su __big = (__lccc_v8su)(__k > 31);
+    __lccc_v8su __kk = (__k & ~__big) | (31 & __big);
+    return (__m256i)((__lccc_v8si)__a >> (__lccc_v8si)__kk);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_sllv_epi32(__m128i __a, __m128i __count)
+{
+    __lccc_v4su __k = (__lccc_v4su)__count;
+    __lccc_v4su __in = (__lccc_v4su)(__k < 32);
+    return (__m128i)(((__lccc_v4su)__a << (__k & 31)) & __in);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_sllv_epi64(__m128i __a, __m128i __count)
+{
+    __lccc_v2du __k = (__lccc_v2du)__count;
+    __lccc_v2du __in = (__lccc_v2du)(__k < 64);
+    return (__m128i)(((__lccc_v2du)__a << (__k & 63)) & __in);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_srlv_epi32(__m128i __a, __m128i __count)
+{
+    __lccc_v4su __k = (__lccc_v4su)__count;
+    __lccc_v4su __in = (__lccc_v4su)(__k < 32);
+    return (__m128i)(((__lccc_v4su)__a >> (__k & 31)) & __in);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_srlv_epi64(__m128i __a, __m128i __count)
+{
+    __lccc_v2du __k = (__lccc_v2du)__count;
+    __lccc_v2du __in = (__lccc_v2du)(__k < 64);
+    return (__m128i)(((__lccc_v2du)__a >> (__k & 63)) & __in);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_srav_epi32(__m128i __a, __m128i __count)
+{
+    __lccc_v4su __k = (__lccc_v4su)__count;
+    __lccc_v4su __big = (__lccc_v4su)(__k > 31);
+    __lccc_v4su __kk = (__k & ~__big) | (31 & __big);
+    return (__m128i)((__lccc_v4si)__a >> (__lccc_v4si)__kk);
+}
+
+/* --- 128-bit broadcasts of the low element (VBROADCASTSD / VBROADCASTSS). --- */
+
+static __inline__ __m128d __attribute__((__always_inline__))
+_mm_broadcastsd_pd(__m128d __a)
+{
+    return _mm_unpacklo_pd(__a, __a);
+}
+
+static __inline__ __m128 __attribute__((__always_inline__))
+_mm_broadcastss_ps(__m128 __a)
+{
+    return _mm_shuffle_ps(__a, __a, 0x00);
+}
+
+#endif /* __AVX2__ */
 
 #endif /* _AVX2INTRIN_H_INCLUDED */

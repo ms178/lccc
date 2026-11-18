@@ -1127,6 +1127,19 @@ pub struct X86Codegen {
     pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
     /// True when the target has AVX2; gates YMM constant-size copies.
     pub(super) avx2_enabled: bool,
+    /// VEX (AVX1) permission, separate from `avx2_enabled`. `try_emit_bitwise_lane_const`
+    /// reads it for BOTH widths. Its 256-bit callers (`wide`) are the float
+    /// `vxorps`/`vxorpd` families, which need only AVX. Its 128-bit callers
+    /// (`!wide`) emit VEX.128 forms, which are AVX1-legal. The integer 256-bit
+    /// `vpand`/`vpor`/`vpxor` callers need AVX2, and the feature table rejects
+    /// them under `-mavx` before any emitter runs. `emit_vbroadcast_xmm_to_ymm`
+    /// reads this cell too.
+    ///
+    /// Keying the 256-bit FLOAT bitwise forms on AVX2 emitted a legacy 128-bit
+    /// `xorps` for a 256-bit operand under `-mavx`, dropping the upper lanes.
+    /// Other 128-bit emitters still key their VEX choice on `avx2_enabled`; that
+    /// is tracked as an open item and is not changed here.
+    pub(super) avx_enabled: bool,
     /// Code-generation ISA permission for the current TU (VEX / SSE4.1 /
     /// FMA3 / ymm).  Every text emitter consults this instead of assuming a
     /// baseline; the x86-64 default is SSE2 — see `backend::x86::isa`.
@@ -1693,6 +1706,7 @@ impl X86Codegen {
             apx_enabled: false,
             tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
             avx2_enabled: false,
+            avx_enabled: false,
             isa: super::super::isa::X86Isa::default(),
             avx512_enabled: false,
             wide_simd_copies: false,
@@ -1859,6 +1873,7 @@ impl X86Codegen {
         // its 256-bit source through movdqa/xorps and silently dropped the
         // upper lanes under VEX.256 loads/stores.
         self.avx2_enabled = opts.isa.ymm;
+        self.avx_enabled = opts.isa.avx;
         self.avx512_enabled = opts.avx512 && opts.isa.ymm;
         // VL carries the same ymm precondition as F here: the ARX rotator
         // only ever lowers a 128-bit xmm form, and the option already
@@ -5131,6 +5146,22 @@ impl X86Codegen {
 
     /// Store %rax:%rdx (128-bit) to a value's 16-byte stack slot.
     pub(super) fn store_rax_rdx_to(&mut self, dest: &Value) {
+        // A destination homed in an XMM register is read through that register.
+        // Assemble the pair there first: the slot store below cannot serve a
+        // value that has no slot, and dropping it silently leaves the consumer
+        // reading whatever the register held before. The pending deferred vector
+        // store is flushed first, since it may occupy this register.
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_xmm_reg(reg) {
+                let name = phys_reg_name(reg);
+                self.flush_pending_vec_store_impl();
+                self.state.emit_fmt(format_args!("    movq %rax, %{name}"));
+                self.state.emit_fmt(format_args!("    movq %rdx, %xmm1"));
+                self.state
+                    .emit_fmt(format_args!("    punpcklqdq %xmm1, %{name}"));
+                self.state.vec_claim_live_reg(dest.0, name);
+            }
+        }
         if let Some(slot) = self.state.get_slot(dest.0) {
             if crate::backend::traits::trace_i128_enabled() {
                 lccc::cli::stderr_line(format_args!(
@@ -8451,6 +8482,7 @@ impl ArchCodegen for X86Codegen {
             self.isa = vec_isa;
             self.no_sse = want_no_sse;
             self.avx2_enabled = vec_isa.ymm;
+            self.avx_enabled = vec_isa.avx;
             self.fma_enabled = vec_isa.fma;
             self.avx512_enabled = want_avx512;
             self.avx512vl_enabled = want_avx512vl;

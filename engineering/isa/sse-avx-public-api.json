@@ -4078,6 +4078,23 @@
       "arities": [
         1
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "pmmintrin.h",
+      "name": "_mm_movedup_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_unpacklo_pd"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -4727,11 +4744,10 @@
       "generic_helpers": [],
       "header": "smmintrin.h",
       "name": "_mm_max_epu16",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm_add_epi16",
-        "_mm_subs_epu16"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_pmaxuw128"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4796,11 +4812,10 @@
       "generic_helpers": [],
       "header": "smmintrin.h",
       "name": "_mm_min_epu16",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm_sub_epi16",
-        "_mm_subs_epu16"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_pminuw128"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4912,12 +4927,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_and_pd",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_and_si256",
-        "_mm256_castpd_si256",
-        "_mm256_castsi256_pd"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_andpd256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4931,12 +4944,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_and_ps",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_and_si256",
-        "_mm256_castps_si256",
-        "_mm256_castsi256_ps"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_andps256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4951,11 +4962,9 @@
       "header": "avxintrin.h",
       "name": "_mm256_andnot_pd",
       "raw_builtins": [
-        "__builtin_ia32_andnotsi256"
+        "__builtin_ia32_andnpd256"
       ],
-      "wrapper_dependencies": [
-        "_mm256_castpd_si256"
-      ]
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -4970,10 +4979,80 @@
       "header": "avxintrin.h",
       "name": "_mm256_andnot_ps",
       "raw_builtins": [
-        "__builtin_ia32_andnotsi256"
+        "__builtin_ia32_andnps256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 2,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_broadcast_pd",
+      "raw_builtins": [
+        "__builtin_ia32_vbroadcasti128"
       ],
       "wrapper_dependencies": [
-        "_mm256_castps_si256"
+        "_mm_loadu_pd"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 2,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_broadcast_ps",
+      "raw_builtins": [
+        "__builtin_ia32_vbroadcasti128"
+      ],
+      "wrapper_dependencies": [
+        "_mm_loadu_ps"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 2,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_broadcast_sd",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set1_pd"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 2,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_broadcast_ss",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set1_ps"
       ]
     },
     {
@@ -5034,6 +5113,23 @@
       "header": "avxintrin.h",
       "name": "_mm256_castpd_si256",
       "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": true,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_castps128_ps256",
+      "raw_builtins": [
+        "__builtin_ia32_vbroadcasti128"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5143,6 +5239,146 @@
     },
     {
       "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_ceil_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_round_pd"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_ceil_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_round_ps"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_cvtsd_f64",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castpd256_pd128",
+        "_mm_cvtsd_f64"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_cvtsi256_si32",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castsi256_si128",
+        "_mm_cvtsi128_si32"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_cvtss_f32",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castps256_ps128",
+        "_mm_cvtss_f32"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_extract_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_extractf128_si256",
+        "_mm_extract_epi16"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_floor_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_round_pd"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_floor_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_round_ps"
+      ]
+    },
+    {
+      "arities": [
         2
       ],
       "canonical_override": false,
@@ -5170,6 +5406,25 @@
       "name": "_mm256_hsub_pd",
       "raw_builtins": [],
       "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_insert_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_extractf128_si256",
+        "_mm256_insertf128_si256",
+        "_mm_insert_epi16"
+      ]
     },
     {
       "arities": [
@@ -5239,6 +5494,59 @@
     },
     {
       "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_loadu2_m128",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set_m128",
+        "_mm_loadu_ps"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_loadu2_m128d",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set_m128d",
+        "_mm_loadu_pd"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_loadu2_m128i",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_loadu_si128"
+      ]
+    },
+    {
+      "arities": [
         1
       ],
       "canonical_override": true,
@@ -5290,6 +5598,51 @@
     },
     {
       "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_movedup_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_movehdup_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_moveldup_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         2
       ],
       "canonical_override": true,
@@ -5334,12 +5687,10 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_or_pd",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_castpd_si256",
-        "_mm256_castsi256_pd",
-        "_mm256_or_si256"
-      ]
+      "raw_builtins": [
+        "__builtin_ia32_orpd256"
+      ],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -5353,11 +5704,28 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_or_ps",
+      "raw_builtins": [
+        "__builtin_ia32_orps256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": true,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_permute2f128_si256",
       "raw_builtins": [],
       "wrapper_dependencies": [
         "_mm256_castps_si256",
         "_mm256_castsi256_ps",
-        "_mm256_or_si256"
+        "_mm256_permute2f128_ps"
       ]
     },
     {
@@ -5392,6 +5760,57 @@
     },
     {
       "arities": [
+        16
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_set_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_set_epi16"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_set_m128",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castps128_ps256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_set_m128d",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castpd128_pd256"
+      ]
+    },
+    {
+      "arities": [
         4
       ],
       "canonical_override": false,
@@ -5419,6 +5838,121 @@
       "name": "_mm256_set_ps",
       "raw_builtins": [],
       "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        16
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_setr_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set_epi16"
+      ]
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_setr_epi64x",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_setr_m128",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set_m128"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_setr_m128d",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set_m128d"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_setr_m128i",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        4
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_setr_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set_pd"
+      ]
+    },
+    {
+      "arities": [
+        8
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_setr_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_set_ps"
+      ]
     },
     {
       "arities": [
@@ -5516,6 +6050,60 @@
     },
     {
       "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_storeu2_m128",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castps256_ps128",
+        "_mm_storeu_ps"
+      ]
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_storeu2_m128d",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castpd256_pd128",
+        "_mm_storeu_pd"
+      ]
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_storeu2_m128i",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castsi256_si128",
+        "_mm_storeu_si128"
+      ]
+    },
+    {
+      "arities": [
         2
       ],
       "canonical_override": true,
@@ -5601,7 +6189,7 @@
     },
     {
       "arities": [
-        2
+        0
       ],
       "canonical_override": false,
       "definitions": 1,
@@ -5610,12 +6198,44 @@
       ],
       "generic_helpers": [],
       "header": "avxintrin.h",
-      "name": "_mm256_xor_pd",
+      "name": "_mm256_undefined_pd",
       "raw_builtins": [],
       "wrapper_dependencies": [
-        "_mm256_castpd_si256",
-        "_mm256_castsi256_pd",
-        "_mm256_xor_si256"
+        "_mm256_setzero_pd"
+      ]
+    },
+    {
+      "arities": [
+        0
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_undefined_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_setzero_ps"
+      ]
+    },
+    {
+      "arities": [
+        0
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_undefined_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_setzero_si256"
       ]
     },
     {
@@ -5629,13 +6249,128 @@
       ],
       "generic_helpers": [],
       "header": "avxintrin.h",
+      "name": "_mm256_xor_pd",
+      "raw_builtins": [
+        "__builtin_ia32_xorpd256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
       "name": "_mm256_xor_ps",
+      "raw_builtins": [
+        "__builtin_ia32_xorps256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        0
+      ],
+      "canonical_override": true,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_zeroupper",
+      "raw_builtins": [
+        "__builtin_ia32_vzeroupper"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_zextpd128_pd256",
       "raw_builtins": [],
       "wrapper_dependencies": [
-        "_mm256_castps_si256",
-        "_mm256_castsi256_ps",
-        "_mm256_xor_si256"
+        "_mm256_castpd128_pd256",
+        "_mm256_setzero_pd"
       ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_zextps128_ps256",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_castps128_ps256",
+        "_mm256_setzero_ps"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm_broadcast_ss",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_set1_ps"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm_permute_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm_permute_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -5758,6 +6493,66 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_adds_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_adds_epi8",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_adds_epu16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_adds_epu8",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -5790,6 +6585,36 @@
     },
     {
       "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_avg_epu16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_avg_epu8",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         3
       ],
       "canonical_override": false,
@@ -5810,6 +6635,21 @@
     },
     {
       "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_blendv_epi8",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         1
       ],
       "canonical_override": true,
@@ -5825,6 +6665,21 @@
         "_mm256_castsi128_si256",
         "_mm256_inserti128_si256"
       ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_cmpeq_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -5875,6 +6730,21 @@
       "raw_builtins": [
         "__builtin_ia32_pcmpeqb256"
       ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_cmpgt_epi16",
+      "raw_builtins": [],
       "wrapper_dependencies": []
     },
     {
@@ -6298,6 +7168,23 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_max_epi16",
+      "raw_builtins": [
+        "__builtin_ia32_pmaxsw256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -6341,8 +7228,7 @@
       "header": "avx2intrin.h",
       "name": "_mm256_max_epu16",
       "raw_builtins": [
-        "__builtin_ia32_paddw256",
-        "__builtin_ia32_psubusw256"
+        "__builtin_ia32_pmaxuw256"
       ],
       "wrapper_dependencies": []
     },
@@ -6377,6 +7263,23 @@
       "name": "_mm256_max_epu8",
       "raw_builtins": [
         "__builtin_ia32_pmaxub256"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_min_epi16",
+      "raw_builtins": [
+        "__builtin_ia32_pminsw256"
       ],
       "wrapper_dependencies": []
     },
@@ -6427,8 +7330,7 @@
       "header": "avx2intrin.h",
       "name": "_mm256_min_epu16",
       "raw_builtins": [
-        "__builtin_ia32_psubusw256",
-        "__builtin_ia32_psubw256"
+        "__builtin_ia32_pminuw256"
       ],
       "wrapper_dependencies": []
     },
@@ -6854,6 +7756,102 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sign_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sign_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sign_epi8",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sll_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_setzero_si256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sll_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_setzero_si256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sll_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_setzero_si256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -6922,6 +7920,66 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sllv_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sllv_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sra_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_sra_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -6951,6 +8009,72 @@
         "__builtin_ia32_psradi256"
       ],
       "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_srav_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_srl_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_setzero_si256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_srl_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_setzero_si256"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_srl_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_setzero_si256"
+      ]
     },
     {
       "arities": [
@@ -7024,6 +8148,36 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_srlv_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_srlv_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -7088,6 +8242,36 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_subs_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_subs_epi8",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -7099,6 +8283,21 @@
       "raw_builtins": [
         "__builtin_ia32_psubusw256"
       ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm256_subs_epu8",
+      "raw_builtins": [],
       "wrapper_dependencies": []
     },
     {
@@ -7270,6 +8469,132 @@
       "wrapper_dependencies": [
         "_mm256_castsi128_si256"
       ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm_broadcastsd_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_unpacklo_pd"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm_broadcastsi128_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm256_broadcastsi128_si256"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm_broadcastss_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_shuffle_ps"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm_sllv_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm_sllv_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm_srav_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm_srlv_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avx2intrin.h",
+      "name": "_mm_srlv_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -9045,6 +10370,23 @@
     },
     {
       "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_i_vextractf128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_extractf128_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         3
       ],
       "canonical_override": false,
@@ -9312,6 +10654,23 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm256_insertf128_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_i_vinsertf128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_insertf128_si256",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -15217,7 +16576,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 921,
+  "declarations": 1005,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -15227,16 +16586,10 @@
     "_mm256_abs_epi64",
     "_mm256_abs_ph",
     "_mm256_add_ph",
-    "_mm256_adds_epi16",
-    "_mm256_adds_epi8",
-    "_mm256_adds_epu16",
-    "_mm256_adds_epu8",
     "_mm256_addsub_pd",
     "_mm256_alignr_epi32",
     "_mm256_alignr_epi64",
     "_mm256_alignr_epi8",
-    "_mm256_avg_epu16",
-    "_mm256_avg_epu8",
     "_mm256_avx512_and_si256",
     "_mm256_avx512_castsi256_ps",
     "_mm256_avx512_cvtepi16_epi32",
@@ -15263,7 +16616,6 @@
     "_mm256_bitrev_epi8",
     "_mm256_bitshuffle_epi64_mask",
     "_mm256_blend_epi16",
-    "_mm256_blendv_epi8",
     "_mm256_bmacor16x16x16",
     "_mm256_bmacxor16x16x16",
     "_mm256_broadcast_f32x2",
@@ -15272,10 +16624,6 @@
     "_mm256_broadcast_i32x2",
     "_mm256_broadcast_i32x4",
     "_mm256_broadcast_i64x2",
-    "_mm256_broadcast_pd",
-    "_mm256_broadcast_ps",
-    "_mm256_broadcast_sd",
-    "_mm256_broadcast_ss",
     "_mm256_broadcastb_epi8",
     "_mm256_broadcastd_epi32",
     "_mm256_broadcastmb_epi64",
@@ -15292,15 +16640,11 @@
     "_mm256_castph_pd",
     "_mm256_castph_ps",
     "_mm256_castph_si256",
-    "_mm256_castps128_ps256",
     "_mm256_castps_ph",
     "_mm256_castsi256_ph",
-    "_mm256_ceil_pd",
-    "_mm256_ceil_ps",
     "_mm256_cmp_pd_mask",
     "_mm256_cmp_ph_mask",
     "_mm256_cmp_ps_mask",
-    "_mm256_cmpeq_epi16",
     "_mm256_cmpge_epi16_mask",
     "_mm256_cmpge_epi32_mask",
     "_mm256_cmpge_epi64_mask",
@@ -15309,7 +16653,6 @@
     "_mm256_cmpge_epu32_mask",
     "_mm256_cmpge_epu64_mask",
     "_mm256_cmpge_epu8_mask",
-    "_mm256_cmpgt_epi16",
     "_mm256_cmpgt_epi16_mask",
     "_mm256_cmpgt_epi32_mask",
     "_mm256_cmpgt_epi64_mask",
@@ -15382,7 +16725,6 @@
     "_mm256_cvtps_epi64",
     "_mm256_cvtps_epu32",
     "_mm256_cvtps_epu64",
-    "_mm256_cvtsd_f64",
     "_mm256_cvtsepi16_epi8",
     "_mm256_cvtsepi32_epi16",
     "_mm256_cvtsepi32_epi8",
@@ -15390,8 +16732,6 @@
     "_mm256_cvtsepi64_epi32",
     "_mm256_cvtsepi64_epi8",
     "_mm256_cvtsh_h",
-    "_mm256_cvtsi256_si32",
-    "_mm256_cvtss_f32",
     "_mm256_cvttpd_epi64",
     "_mm256_cvttpd_epu32",
     "_mm256_cvttpd_epu64",
@@ -15436,8 +16776,6 @@
     "_mm256_dpwusds_avx_epi32",
     "_mm256_dpwuud_avx_epi32",
     "_mm256_dpwuuds_avx_epi32",
-    "_mm256_extract_epi16",
-    "_mm256_extractf128_si256",
     "_mm256_extractf32x4_ps",
     "_mm256_extractf64x2_pd",
     "_mm256_extracti32x4_epi32",
@@ -15446,8 +16784,6 @@
     "_mm256_fcmul_pch",
     "_mm256_fixupimm_pd",
     "_mm256_fixupimm_ps",
-    "_mm256_floor_pd",
-    "_mm256_floor_ps",
     "_mm256_fmadd_pch",
     "_mm256_fmadd_ph",
     "_mm256_fmaddsub_ph",
@@ -15487,8 +16823,6 @@
     "_mm256_i64scatter_epi64",
     "_mm256_i64scatter_pd",
     "_mm256_i64scatter_ps",
-    "_mm256_insert_epi16",
-    "_mm256_insertf128_si256",
     "_mm256_insertf32x4",
     "_mm256_insertf64x2",
     "_mm256_inserti32x4",
@@ -15496,9 +16830,6 @@
     "_mm256_load_epi32",
     "_mm256_load_epi64",
     "_mm256_load_ph",
-    "_mm256_loadu2_m128",
-    "_mm256_loadu2_m128d",
-    "_mm256_loadu2_m128i",
     "_mm256_loadu_epi16",
     "_mm256_loadu_epi32",
     "_mm256_loadu_epi64",
@@ -16481,11 +17812,9 @@
     "_mm256_maskz_xor_epi64",
     "_mm256_maskz_xor_pd",
     "_mm256_maskz_xor_ps",
-    "_mm256_max_epi16",
     "_mm256_max_epi64",
     "_mm256_max_epu64",
     "_mm256_max_ph",
-    "_mm256_min_epi16",
     "_mm256_min_epi64",
     "_mm256_min_epu64",
     "_mm256_min_ph",
@@ -16497,9 +17826,6 @@
     "_mm256_mmask_i64gather_epi64",
     "_mm256_mmask_i64gather_pd",
     "_mm256_mmask_i64gather_ps",
-    "_mm256_movedup_pd",
-    "_mm256_movehdup_ps",
-    "_mm256_moveldup_ps",
     "_mm256_movepi16_mask",
     "_mm256_movepi32_mask",
     "_mm256_movepi64_mask",
@@ -16528,7 +17854,6 @@
     "_mm256_or_epi64",
     "_mm256_packs_epi16",
     "_mm256_packus_epi32",
-    "_mm256_permute2f128_si256",
     "_mm256_permute4x64_pd",
     "_mm256_permutevar8x32_ps",
     "_mm256_permutex2var_epi16",
@@ -16600,18 +17925,8 @@
     "_mm256_scalef_ps",
     "_mm256_set1_pch",
     "_mm256_set1_ph",
-    "_mm256_set_epi16",
-    "_mm256_set_m128",
-    "_mm256_set_m128d",
     "_mm256_set_ph",
-    "_mm256_setr_epi16",
-    "_mm256_setr_epi64x",
-    "_mm256_setr_m128",
-    "_mm256_setr_m128d",
-    "_mm256_setr_m128i",
-    "_mm256_setr_pd",
     "_mm256_setr_ph",
-    "_mm256_setr_ps",
     "_mm256_setzero_ph",
     "_mm256_shldi_epi16",
     "_mm256_shldi_epi32",
@@ -16631,35 +17946,16 @@
     "_mm256_shuffle_i64x2",
     "_mm256_shufflehi_epi16",
     "_mm256_shufflelo_epi16",
-    "_mm256_sign_epi16",
-    "_mm256_sign_epi32",
-    "_mm256_sign_epi8",
-    "_mm256_sll_epi16",
-    "_mm256_sll_epi32",
-    "_mm256_sll_epi64",
     "_mm256_sllv_epi16",
-    "_mm256_sllv_epi32",
-    "_mm256_sllv_epi64",
     "_mm256_sqrt_ph",
-    "_mm256_sra_epi16",
-    "_mm256_sra_epi32",
     "_mm256_sra_epi64",
     "_mm256_srai_epi64",
     "_mm256_srav_epi16",
-    "_mm256_srav_epi32",
     "_mm256_srav_epi64",
-    "_mm256_srl_epi16",
-    "_mm256_srl_epi32",
-    "_mm256_srl_epi64",
     "_mm256_srlv_epi16",
-    "_mm256_srlv_epi32",
-    "_mm256_srlv_epi64",
     "_mm256_store_epi32",
     "_mm256_store_epi64",
     "_mm256_store_ph",
-    "_mm256_storeu2_m128",
-    "_mm256_storeu2_m128d",
-    "_mm256_storeu2_m128i",
     "_mm256_storeu_epi16",
     "_mm256_storeu_epi32",
     "_mm256_storeu_epi64",
@@ -16670,9 +17966,6 @@
     "_mm256_stream_ps",
     "_mm256_stream_si256",
     "_mm256_sub_ph",
-    "_mm256_subs_epi16",
-    "_mm256_subs_epi8",
-    "_mm256_subs_epu8",
     "_mm256_test_epi16_mask",
     "_mm256_test_epi32_mask",
     "_mm256_test_epi64_mask",
@@ -16681,17 +17974,11 @@
     "_mm256_testn_epi32_mask",
     "_mm256_testn_epi64_mask",
     "_mm256_testn_epi8_mask",
-    "_mm256_undefined_pd",
     "_mm256_undefined_ph",
-    "_mm256_undefined_ps",
-    "_mm256_undefined_si256",
     "_mm256_xor_epi32",
     "_mm256_xor_epi64",
     "_mm256_zeroall",
-    "_mm256_zeroupper",
-    "_mm256_zextpd128_pd256",
     "_mm256_zextph128_ph256",
-    "_mm256_zextps128_ps256",
     "_mm512_2intersect_epi32",
     "_mm512_2intersect_epi64",
     "_mm512_abs_pd",
@@ -18590,15 +19877,11 @@
     "_mm_bitshuffle_epi64_mask",
     "_mm_blend_epi32",
     "_mm_broadcast_i32x2",
-    "_mm_broadcast_ss",
     "_mm_broadcastb_epi8",
     "_mm_broadcastd_epi32",
     "_mm_broadcastmb_epi64",
     "_mm_broadcastmw_epi32",
     "_mm_broadcastq_epi64",
-    "_mm_broadcastsd_pd",
-    "_mm_broadcastsi128_si256",
-    "_mm_broadcastss_ps",
     "_mm_broadcastw_epi16",
     "_mm_bslli_si128",
     "_mm_bsrli_si128",
@@ -20273,7 +21556,6 @@
     "_mm_mmask_i64gather_ps",
     "_mm_move_epi64",
     "_mm_move_sh",
-    "_mm_movedup_pd",
     "_mm_movepi16_mask",
     "_mm_movepi32_mask",
     "_mm_movepi64_mask",
@@ -20314,8 +21596,6 @@
     "_mm_nmsub_ss",
     "_mm_or_epi32",
     "_mm_or_epi64",
-    "_mm_permute_pd",
-    "_mm_permute_ps",
     "_mm_permutevar_pd",
     "_mm_permutevar_ps",
     "_mm_permutex2var_epi16",
@@ -20436,8 +21716,6 @@
     "_mm_sll_epi32",
     "_mm_sll_epi64",
     "_mm_sllv_epi16",
-    "_mm_sllv_epi32",
-    "_mm_sllv_epi64",
     "_mm_sqrt_ph",
     "_mm_sqrt_round_sd",
     "_mm_sqrt_round_sh",
@@ -20448,14 +21726,11 @@
     "_mm_sra_epi64",
     "_mm_srai_epi64",
     "_mm_srav_epi16",
-    "_mm_srav_epi32",
     "_mm_srav_epi64",
     "_mm_srl_epi16",
     "_mm_srl_epi32",
     "_mm_srl_epi64",
     "_mm_srlv_epi16",
-    "_mm_srlv_epi32",
-    "_mm_srlv_epi64",
     "_mm_store_epi32",
     "_mm_store_epi64",
     "_mm_store_ph",
@@ -20516,5 +21791,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 921
+  "unique_names": 1005
 }

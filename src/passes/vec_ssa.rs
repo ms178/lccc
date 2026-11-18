@@ -1204,7 +1204,7 @@ mod tests {
 
     #[test]
     fn straight_line_store_load_is_forwarded() {
-        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+        crate::passes::vectorize::set_x86_simd_isa(true, false, false, true, false);
         let table = family_table();
         let f32x4 = fam(&table, IntrinsicOp::VecLoadF32x4);
         let a = Value(0);
@@ -1272,7 +1272,7 @@ mod tests {
 
     #[test]
     fn equal_width_bitcast_families_forward_the_exact_register_image() {
-        crate::passes::vectorize::set_x86_simd_isa(true, true, true, false);
+        crate::passes::vectorize::set_x86_simd_isa(true, true, true, true, false);
         let table = family_table();
         for bytes in [16usize, 32] {
             for source_ty in [
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn different_width_bitcast_and_volatile_images_stay_in_memory() {
-        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+        crate::passes::vectorize::set_x86_simd_isa(true, false, false, true, false);
         let table = family_table();
         for (load, volatile, semantic_volatile, offset) in [
             (IntrinsicOp::VecLoadF64x4, false, false, 0),
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn lane_access_keeps_the_object_in_memory() {
-        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+        crate::passes::vectorize::set_x86_simd_isa(true, false, false, true, false);
         let table = family_table();
         let f32x4 = fam(&table, IntrinsicOp::VecLoadF32x4);
         let a = Value(0);
@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     fn fold_ops(instructions: Vec<Instruction>) -> (usize, IrFunction) {
-        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+        crate::passes::vectorize::set_x86_simd_isa(true, false, false, true, false);
         let mut f = func_with_blocks(vec![block(
             0,
             instructions,
@@ -1519,7 +1519,7 @@ mod tests {
     fn mask_and_or_select_idiom_becomes_a_byte_blend() {
         use crate::ir::reexports::IrConst;
         // The 32-byte families are AVX2.
-        crate::passes::vectorize::set_x86_simd_isa(true, true, true, false);
+        crate::passes::vectorize::set_x86_simd_isa(true, true, true, true, false);
         // m = a < b (compare); (m & x) | (~m & y) in mixed operand orders.
         let base =
             |xor_args: Vec<Operand>, and1: Vec<Operand>, and2: Vec<Operand>, or: Vec<Operand>| {
@@ -1590,7 +1590,7 @@ mod tests {
         )]);
         f.next_value_id = 20;
         assert_eq!(fold_select_idioms(&mut f), 0);
-        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+        crate::passes::vectorize::set_x86_simd_isa(true, false, false, true, false);
     }
 
     #[test]

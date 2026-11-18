@@ -76,12 +76,13 @@
 //!   too: a register-source broadcast is AVX2-only (`vpbroadcastd`, and the
 //!   `vbroadcastss ymm, xmm` form).
 //!
-//! Known residual (follow-up): the broadcast is emitted between the base
-//! load and the blend, and its emitter flushes the base's pending register
-//! value to a stack home and reloads it.  That costs one 32-byte store and
-//! reload per rewrite, which accounts for the remaining gap to the
-//! hand-patched loop.  Removing it needs the broadcast to keep the pending
-//! value live, which is an emitter change rather than an IR one.
+//! Broadcast-to-blend stall: resolved.  The broadcast arm keeps the base's
+//! pending register value live, so the rewritten reload is a
+//! `vmovd`/`vpbroadcastd`/`vblendps` chain with no stack store or reload
+//! between the base and the blend (checked on `avx_fp_private`, and pinned by
+//! `tests/regression/check_broadcast_pending_codegen.py`).  What remains of the
+//! gap to Clang on that kernel is not this pass's rewrite: it is the frame
+//! stores of the blend result, which this pass does not remove.
 //!
 //! Rounds.  Each round plans every candidate temporary against one
 //! `UseDefInfo`, admits plans whose instructions are disjoint, and applies

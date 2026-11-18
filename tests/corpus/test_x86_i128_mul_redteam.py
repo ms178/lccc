@@ -148,6 +148,43 @@ def has_pyelf_and_capstone() -> bool:
     )
 
 
+def i386_multilib_headers_present() -> bool:
+    """True when the i386 multilib libc headers are visible to lccc-i686.
+
+    Probes for gnu/stubs-32.h, which only the i386 multilib package ships, so
+    the i686 carrier leg can be skipped with a reason on hosts without it.
+    """
+    probe = subprocess.run(
+        [str(I686), "-E", "-x", "c", "-", "-o", os.devnull],
+        input="#include <gnu/stubs-32.h>\n", capture_output=True, text=True,
+        timeout=60,
+    )
+    return probe.returncode == 0
+
+
+def cross_source() -> str:
+    """Freestanding wide_mul probe for the cross-ISA assemble check.
+
+    The cross wrappers target AArch64/RISC-V, whose libc headers are not on
+    the host, so the check must not include <stdio.h>/<stdint.h>. Only the
+    code generated for wide_mul is inspected, so no libc is needed.
+    """
+    return (
+        "typedef unsigned __int128 u128;\n"
+        "typedef unsigned long long u64;\n"
+        "volatile u64 lo_a, hi_a, lo_b, hi_b;\n"
+        "__attribute__((noinline)) static u128 wide_mul(void) {\n"
+        "    u128 a = ((u128)hi_a << 64) | lo_a;\n"
+        "    u128 b = ((u128)hi_b << 64) | lo_b;\n"
+        "    return a * b;\n"
+        "}\n"
+        "int main(void) {\n"
+        "    u128 r = wide_mul();\n"
+        "    return (int)(r & 0xff);\n"
+        "}\n"
+    )
+
+
 def elf_machine(path: Path) -> str | None:
     """Return the ELF e_machine string via pyelftools, else readelf, else None."""
     if importlib.util.find_spec("elftools") is not None:
@@ -355,11 +392,24 @@ class X86I128MulRedteam(unittest.TestCase):
         ARM.is_file() and RISCV.is_file() and I686.is_file(),
         "all four fastbuild target wrappers required",
     )
+    def test_i386_multilib_probe_tracks_the_header(self) -> None:
+        """The i686 skip must key on the multilib header, not on wishful thinking.
+
+        The probe is the only thing that turns the i686 carrier leg into a skip,
+        so it must agree with the preprocessor on whether gnu/stubs-32.h exists.
+        """
+        header = (I686 and subprocess.run(
+            [str(I686), "-E", "-x", "c", "-", "-o", os.devnull],
+            input="#include <gnu/stubs-32.h>\n", capture_output=True, text=True,
+            timeout=60,
+        ).returncode == 0)
+        self.assertEqual(i386_multilib_headers_present(), header)
+
     def test_cross_isa_sequences_are_unchanged_and_assemble(self) -> None:
         with tempfile.TemporaryDirectory(prefix="i128-cross-") as td:
             root = Path(td)
             source = root / "probe.c"
-            source.write_text(runtime_source())
+            source.write_text(cross_source())
             env = os.environ.copy()
             env["LCCC_NO_PEEPHOLE"] = "1"
             for wrapper, machine_tokens, needle in (
@@ -393,6 +443,13 @@ class X86I128MulRedteam(unittest.TestCase):
                         )
             # i686 has no C `__int128`; compile the existing 16-byte struct
             # return carrier to prove the distinct esp_adjust path still works.
+            # The carrier includes the i386 libc headers, which only the
+            # i386 multilib provides (CI provisions it on every lane). Without
+            # them the leg cannot compile at all, so skip it LOUDLY, keyed on
+            # the multilib-only header, and never on a real i686 failure.
+            if not i386_multilib_headers_present():
+                self.skipTest("i386 multilib headers (gnu/stubs-32.h) absent; "
+                              "the i686 carrier leg runs where multilib is provisioned")
             carrier = REPO / "tests/regression/two_reg_return_carrier.c"
             i686_obj = root / "i686.o"
             proc = subprocess.run(

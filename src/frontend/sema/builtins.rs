@@ -1835,12 +1835,60 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndPs256V),
     );
     m.insert(
+        "__builtin_ia32_orps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86OrPs256V),
+    );
+    m.insert(
+        "__builtin_ia32_xorps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86XorPs256V),
+    );
+    m.insert(
+        "__builtin_ia32_andnps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndNotPs256V),
+    );
+    m.insert(
+        "__builtin_ia32_andpd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndPd256V),
+    );
+    m.insert(
+        "__builtin_ia32_orpd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86OrPd256V),
+    );
+    m.insert(
+        "__builtin_ia32_xorpd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86XorPd256V),
+    );
+    m.insert(
+        "__builtin_ia32_andnpd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndNotPd256V),
+    );
+    m.insert(
         "__builtin_ia32_cmpps256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86CmpPs256V),
     );
     m.insert(
         "__builtin_ia32_vextractf128_ps256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vextractf128V),
+    );
+    m.insert(
+        "__builtin_ia32_vextractf128_pd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vextractf128V),
+    );
+    m.insert(
+        "__builtin_ia32_vextractf128_si256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vextractf128V),
+    );
+    m.insert(
+        "__builtin_ia32_vinsertf128_ps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vinsertf128),
+    );
+    m.insert(
+        "__builtin_ia32_vinsertf128_pd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vinsertf128),
+    );
+    m.insert(
+        "__builtin_ia32_vinsertf128_si256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vinsertf128),
     );
     m.insert(
         "__builtin_ia32_vzeroupper",
@@ -2109,6 +2157,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm256_inserti128_si256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256),
+    );
+    m.insert(
+        "__builtin_ia32_insert128i256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256),
     );
     m.insert(
@@ -2644,20 +2696,8 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256),
     );
     m.insert(
-        "__builtin_ia32_vinserti128",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256),
-    );
-    m.insert(
-        "__builtin_ia32_vextracti128",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cast256to128),
-    );
-    m.insert(
         "__builtin_ia32_vbroadcasti128",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Broadcast128to256),
-    );
-    m.insert(
-        "__builtin_ia32_inserti128",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256),
     );
     m.insert(
         "__builtin_ia32_extracti128",
@@ -2963,6 +3003,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm256_extracti128_si256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128),
+    );
+    m.insert(
+        "__builtin_ia32_extract128i256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128),
     );
     m.insert(
@@ -3414,6 +3458,30 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "__builtin_ia32_pmaxud256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxud256),
+    );
+    m.insert(
+        "__builtin_ia32_pmaxuw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxuw128),
+    );
+    m.insert(
+        "__builtin_ia32_pminuw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminuw128),
+    );
+    m.insert(
+        "__builtin_ia32_pmaxuw256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxuw256),
+    );
+    m.insert(
+        "__builtin_ia32_pminuw256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminuw256),
+    );
+    m.insert(
+        "__builtin_ia32_pmaxsw256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsw256),
+    );
+    m.insert(
+        "__builtin_ia32_pminsw256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminsw256),
     );
     m.insert(
         "__builtin_ia32_pminsb128",
@@ -3967,6 +4035,13 @@ pub enum BuiltinIntrinsic {
     X86MaxPs256V,     // __builtin_ia32_maxps256 (VMAXPS ymm)
     X86MinPs256V,     // __builtin_ia32_minps256 (VMINPS ymm)
     X86AndPs256V,     // __builtin_ia32_andps256 (VANDPS ymm, bitwise)
+    X86OrPs256V,      // __builtin_ia32_orps256 (bitwise, AVX)
+    X86XorPs256V,     // __builtin_ia32_xorps256 (bitwise, AVX)
+    X86AndNotPs256V,  // __builtin_ia32_andnps256 (bitwise, AVX)
+    X86AndPd256V,     // __builtin_ia32_andpd256 (bitwise, AVX)
+    X86OrPd256V,      // __builtin_ia32_orpd256 (bitwise, AVX)
+    X86XorPd256V,     // __builtin_ia32_xorpd256 (bitwise, AVX)
+    X86AndNotPd256V,  // __builtin_ia32_andnpd256 (bitwise, AVX)
     X86CmpPs256V,     // __builtin_ia32_cmpps256 (VCMPPS ymm, imm8)
     X86Vextractf128V, // __builtin_ia32_vextractf128_ps256 (VEXTRACTF128)
     X86Pblendvb128,   // _mm_blendv_epi8 (PBLENDVB, SSE4.1)
@@ -4008,6 +4083,9 @@ pub enum BuiltinIntrinsic {
     X86Zext128to256,
     X86Cast256to128,
     X86Insert128to256,
+    /// AVX1 `vinsertf128`: a 256-bit value with one 128-bit half replaced.
+    /// Distinct from `X86Insert128to256`, which is the AVX2 `vinserti128`.
+    X86Vinsertf128,
     X86SetEpi8_256,
     X86SetEpi16_256,
     X86SetEpi32_256,
@@ -4168,6 +4246,12 @@ pub enum BuiltinIntrinsic {
     X86Pmaxsb256,
     X86Pminud256,
     X86Pmaxud256,
+    X86Pmaxuw128,
+    X86Pminuw128,
+    X86Pmaxuw256,
+    X86Pminuw256,
+    X86Pmaxsw256,
+    X86Pminsw256,
     X86Pmovzxbw256,
     X86Pmovzxbd256,
     X86Pmovzxwd256,

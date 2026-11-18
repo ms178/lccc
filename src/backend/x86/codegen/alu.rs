@@ -1,6 +1,6 @@
 //! X86Codegen: integer/float arithmetic, unary ops, binop, copy.
 
-use super::emit::{X86Codegen, phys_reg_name, shift_mnemonic};
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, shift_mnemonic};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
@@ -3151,18 +3151,35 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
-        // A 16-byte value that lives in `%xmm0` (a vector argument or a
-        // vector return) copies register-to-register.  `operand_to_rax_rdx`
-        // would first spill it to the stack and read it back as two GPR
-        // halves, and `store_rax_rdx_to` would then rebuild it from those
-        // halves -- four memory operations and two false GPR dependencies to
-        // move one `%xmm` register.
+        // A 16-byte value that lives in `%xmm0` (a vector argument or a vector
+        // return) copies register-to-register.  `operand_to_rax_rdx` would first
+        // spill it to the stack and read it back as two GPR halves, and
+        // `store_rax_rdx_to` would then rebuild it from those halves -- four
+        // memory operations and two false GPR dependencies to move one `%xmm`.
         //
-        // Only the SOURCE decides.  The destination is being defined here;
-        // asking whether it is resident let a redefinition (a sequenced
-        // parallel copy, or simply a stale id) store whatever `%xmm0` held
-        // into its home instead of copying `src`.
+        // Only the SOURCE decides residency.  The destination is being defined
+        // here; asking whether it is resident let a redefinition (a sequenced
+        // parallel copy, or simply a stale id) store whatever `%xmm0` held into
+        // its home instead of copying `src`.
         if matches!(src, Operand::Value(v) if self.state.call_ret_vector_in_xmm0.contains(&v.0)) {
+            // A destination homed in an XMM register is read through that
+            // register: move the value there. %xmm0 still holds it, so the
+            // residency mark stays valid for the destination too.
+            if let Some(home) = self
+                .reg_assignments
+                .get(&dest.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r))
+            {
+                let target = phys_reg_name(home);
+                let mov = self.xmm_move(true);
+                self.state
+                    .emit_fmt(format_args!("    {mov} %xmm0, %{target}"));
+                self.state.vec_claim_live_reg(dest.0, target);
+                self.state.call_ret_vector_in_xmm0.insert(dest.0);
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
             if let Some(slot) = self.state.get_slot(dest.0) {
                 let (mov, reg) = super::calls::vector_reg_move(16, 0);
                 self.state
@@ -3170,12 +3187,20 @@ impl X86Codegen {
                     .emit_instr_reg_rbp(&format!("    {mov}"), &reg, slot.0);
                 self.state.i128_values.insert(dest.0);
                 self.state.f128_direct_slots.insert(dest.0);
-            } else {
-                self.state.call_ret_vector_in_xmm0.insert(dest.0);
+                self.state.reg_cache.invalidate_all();
+                return;
             }
-            self.state.reg_cache.invalidate_all();
-            return;
+            if !self.reg_assignments.contains_key(&dest.0) {
+                // No home at all: the value is only ever read through the
+                // residency mark, which is valid until the next block.
+                self.state.call_ret_vector_in_xmm0.insert(dest.0);
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+            // A non-XMM register home falls through to the generic copy.
         }
+        // Every other source: build the pair, then store_rax_rdx_to writes the
+        // destination's home (XMM register or slot).
         self.operand_to_rax_rdx(src);
         self.store_rax_rdx_to(dest);
     }
@@ -3244,5 +3269,68 @@ mod bit_test_width_tests {
         );
         let asm = cg.state.out.buf;
         assert!(asm.contains("btl $1, %eax"), "9 mod 8 is 1:\n{asm}");
+    }
+}
+
+/// A 128-bit copy of a value still resident in `%xmm0` (a vector call result)
+/// must deliver its bits to the destination's own home. Regression for the
+/// `?:` join over two call results: the copy into an XMM-homed web was aliased
+/// to `%xmm0` and emitted nothing, so the join read a stale `%xmm2`.
+#[cfg(test)]
+mod i128_copy_call_carrier_tests {
+    use super::*;
+
+    /// The first allocatable XMM register (`xmm2`).
+    const XMM2: PhysReg = PhysReg(20);
+
+    #[test]
+    fn resident_copy_into_xmm_home_moves_the_value() {
+        let mut cg = X86Codegen::new();
+        cg.state.call_ret_vector_in_xmm0.insert(1);
+        cg.reg_assignments.insert(2, XMM2);
+        cg.emit_copy_i128_impl(&Value(2), &Operand::Value(Value(1)));
+        let expected = format!("    {} %xmm0, %xmm2", cg.xmm_move(true));
+        assert!(
+            cg.state.out.buf.contains(&expected),
+            "missing {expected:?} in {:?}",
+            cg.state.out.buf
+        );
+        assert!(cg.state.call_ret_vector_in_xmm0.contains(&2));
+    }
+
+    #[test]
+    fn non_resident_copy_into_xmm_home_assembles_both_halves_in_it() {
+        // The source is an ordinary constant, not an %xmm0 resident: the GPR
+        // pair is built and then placed in the destination's XMM register.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, XMM2);
+        cg.emit_copy_i128_impl(&Value(2), &Operand::Const(IrConst::I64(5)));
+        let out = &cg.state.out.buf;
+        assert!(out.contains("movq %rax, %xmm2"), "{out:?}");
+        assert!(out.contains("movq %rdx, %xmm1"), "{out:?}");
+        assert!(out.contains("punpcklqdq %xmm1, %xmm2"), "{out:?}");
+        assert!(!cg.state.call_ret_vector_in_xmm0.contains(&2));
+    }
+
+    #[test]
+    fn store_rax_rdx_to_writes_an_xmm_home_without_a_slot() {
+        // The central sink: a pair built in rax:rdx for a destination whose only
+        // home is an XMM register must reach that register (it was dropped before).
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, XMM2);
+        cg.store_rax_rdx_to(&Value(2));
+        let out = &cg.state.out.buf;
+        assert!(out.contains("movq %rax, %xmm2"), "{out:?}");
+        assert!(out.contains("movq %rdx, %xmm1"), "{out:?}");
+        assert!(out.contains("punpcklqdq %xmm1, %xmm2"), "{out:?}");
+    }
+
+    #[test]
+    fn resident_copy_without_any_home_stays_an_xmm0_alias() {
+        let mut cg = X86Codegen::new();
+        cg.state.call_ret_vector_in_xmm0.insert(1);
+        cg.emit_copy_i128_impl(&Value(2), &Operand::Value(Value(1)));
+        assert!(cg.state.out.buf.is_empty(), "{:?}", cg.state.out.buf);
+        assert!(cg.state.call_ret_vector_in_xmm0.contains(&2));
     }
 }

@@ -1659,6 +1659,13 @@ impl Lowerer {
             | BuiltinIntrinsic::X86MaxPs256V
             | BuiltinIntrinsic::X86MinPs256V
             | BuiltinIntrinsic::X86AndPs256V
+            | BuiltinIntrinsic::X86OrPs256V
+            | BuiltinIntrinsic::X86XorPs256V
+            | BuiltinIntrinsic::X86AndNotPs256V
+            | BuiltinIntrinsic::X86AndPd256V
+            | BuiltinIntrinsic::X86OrPd256V
+            | BuiltinIntrinsic::X86XorPd256V
+            | BuiltinIntrinsic::X86AndNotPd256V
             | BuiltinIntrinsic::X86CmpPs256V
             | BuiltinIntrinsic::X86Pblendw128
             | BuiltinIntrinsic::X86Pmovzxbw128
@@ -1696,6 +1703,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Zext128to256
             | BuiltinIntrinsic::X86Cast256to128
             | BuiltinIntrinsic::X86Insert128to256
+            | BuiltinIntrinsic::X86Vinsertf128
             | BuiltinIntrinsic::X86SetEpi8_256
             | BuiltinIntrinsic::X86SetEpi16_256
             | BuiltinIntrinsic::X86SetEpi32_256
@@ -1805,6 +1813,12 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pmaxsd128
             | BuiltinIntrinsic::X86Pminud128
             | BuiltinIntrinsic::X86Pmaxud128
+            | BuiltinIntrinsic::X86Pmaxuw128
+            | BuiltinIntrinsic::X86Pminuw128
+            | BuiltinIntrinsic::X86Pmaxuw256
+            | BuiltinIntrinsic::X86Pminuw256
+            | BuiltinIntrinsic::X86Pmaxsw256
+            | BuiltinIntrinsic::X86Pminsw256
             | BuiltinIntrinsic::X86Pminsb256
             | BuiltinIntrinsic::X86Pmaxsb256
             | BuiltinIntrinsic::X86Pminud256
@@ -3574,6 +3588,23 @@ impl Lowerer {
         name: &str,
         args: &[Expr],
     ) -> Option<Operand> {
+        // One-bit lane immediates must be a constant 0 or 1 (see
+        // `x86_lane_immediate_bits`). The check runs before any operand is
+        // lowered, so a rejected call leaves no half-built expressions.
+        if let Some(bits) = x86_lane_immediate_bits(intrinsic) {
+            let in_range = args
+                .last()
+                .and_then(|arg| self.eval_const_expr(arg))
+                .and_then(|value| value.to_i64())
+                .is_some_and(|value| (0..(1i64 << bits)).contains(&value));
+            if !in_range {
+                return self.reject_builtin_call(
+                    format!("the last argument to '{name}' must be an {bits}-bit immediate"),
+                    args,
+                    16,
+                );
+            }
+        }
         // AUD-SILENT-ZERO-1: an x86-only intrinsic compiled for a foreign
         // target used to lower to a silently zeroed result in the ARM/RISC-V
         // backends -- a wrong answer instead of a rejection.  GCC rejects the
@@ -3934,6 +3965,21 @@ impl Lowerer {
     }
 }
 
+/// Width in bits of the lane-select immediate of a builtin whose instruction
+/// encodes only one bit of it. GCC 16.2 rejects any other value ("the last
+/// argument must be an 1-bit immediate"). The operand lowering masks the
+/// immediate (`& 1`), so without this check an out-of-range constant compiled
+/// to the wrong lane and a runtime value compiled to lane 0, with no diagnostic.
+fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
+    match intrinsic {
+        BuiltinIntrinsic::X86Extracti128
+        | BuiltinIntrinsic::X86Vextractf128V
+        | BuiltinIntrinsic::X86Insert128to256
+        | BuiltinIntrinsic::X86Vinsertf128 => Some(1),
+        _ => None,
+    }
+}
+
 fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
     match intrinsic {
         BuiltinIntrinsic::X86Lfence
@@ -4007,6 +4053,7 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Broadcast128to256
         | BuiltinIntrinsic::X86Zext128to256
         | BuiltinIntrinsic::X86Insert128to256
+        | BuiltinIntrinsic::X86Vinsertf128
         | BuiltinIntrinsic::X86SetEpi8_256
         | BuiltinIntrinsic::X86SetEpi16_256
         | BuiltinIntrinsic::X86SetEpi32_256
@@ -4092,6 +4139,10 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Pminsb256
         | BuiltinIntrinsic::X86Pmaxsb256
         | BuiltinIntrinsic::X86Pminud256
+        | BuiltinIntrinsic::X86Pmaxuw256
+        | BuiltinIntrinsic::X86Pminuw256
+        | BuiltinIntrinsic::X86Pmaxsw256
+        | BuiltinIntrinsic::X86Pminsw256
         | BuiltinIntrinsic::X86Pmaxud256 => X86IntrinsicKind::Vec256,
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
         // Native C vectors share object-address IR carriers on both x86 modes.
@@ -4102,6 +4153,13 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         BuiltinIntrinsic::X86MaxPs256V
         | BuiltinIntrinsic::X86MinPs256V
         | BuiltinIntrinsic::X86AndPs256V
+        | BuiltinIntrinsic::X86OrPs256V
+        | BuiltinIntrinsic::X86XorPs256V
+        | BuiltinIntrinsic::X86AndNotPs256V
+        | BuiltinIntrinsic::X86AndPd256V
+        | BuiltinIntrinsic::X86OrPd256V
+        | BuiltinIntrinsic::X86XorPd256V
+        | BuiltinIntrinsic::X86AndNotPd256V
         | BuiltinIntrinsic::X86CmpPs256V => X86IntrinsicKind::Vec256,
         _ => X86IntrinsicKind::Vec128,
     }
@@ -4316,6 +4374,13 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86MaxPs256V
         | B::X86MinPs256V
         | B::X86AndPs256V
+        | B::X86OrPs256V
+        | B::X86XorPs256V
+        | B::X86AndNotPs256V
+        | B::X86AndPd256V
+        | B::X86OrPd256V
+        | B::X86XorPd256V
+        | B::X86AndNotPd256V
         | B::X86CmpPs256V => IntrinsicRequirement {
             feature: F::Avx,
             flag: "-mavx",
@@ -4332,6 +4397,10 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pmaxsb256
         | B::X86Pminud256
         | B::X86Pmaxud256
+        | B::X86Pmaxuw256
+        | B::X86Pminuw256
+        | B::X86Pmaxsw256
+        | B::X86Pminsw256
         | B::X86Paddq256
         | B::X86Psubb256
         | B::X86Psubw256
@@ -4350,7 +4419,48 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Psrawi256
         | B::X86Psradi256
         | B::X86Pslldqi256
-        | B::X86Psrldqi256 => IntrinsicRequirement {
+        | B::X86Psrldqi256
+        // `vbroadcasti128` (`_mm256_broadcastsi128_si256` and the bundled
+        // header's `__builtin_ia32_vbroadcasti128`) is AVX2, not AVX: without
+        // this arm an `-mavx` translation unit compiled it silently.
+        | B::X86Pabsw256
+        | B::X86Pabsd256
+        | B::X86Pabsb256
+        | B::X86Pand256
+        | B::X86Por256
+        | B::X86Pxor256
+        | B::X86Pcmpeqd256
+        | B::X86Pcmpeqq256
+        | B::X86Pcmpeqb256
+        | B::X86Pcmpgtb256
+        | B::X86Pcmpgtd256
+        | B::X86Pcmpgtq256
+        | B::X86Phaddw256
+        | B::X86Phaddd256
+        | B::X86Pmaddwd256
+        | B::X86Pmaddubsw256
+        | B::X86Psubusw256
+        | B::X86Pmaxub256
+        | B::X86Pminub256
+        | B::X86Pmovmskb256
+        | B::X86Packssdw256
+        | B::X86Packuswb256
+        | B::X86Permutevar8x32
+        | B::X86Psadbw256
+        | B::X86Pshufb256
+        | B::X86Punpckhwd256
+        | B::X86Punpckhdq256
+        | B::X86Punpckhqdq256
+        | B::X86Punpckhbw256
+        | B::X86Punpcklwd256
+        | B::X86Punpckldq256
+        | B::X86Punpcklqdq256
+        | B::X86Punpcklbw256
+        | B::X86Extracti128
+        | B::X86Insert128to256
+        | B::X86Permute2x128
+        | B::X86Permute4x64
+        | B::X86Broadcast128to256 => IntrinsicRequirement {
             feature: F::Avx2,
             flag: "-mavx2",
             also: None,
@@ -4361,6 +4471,13 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             also: None,
         },
         B::X86AvxTest(_) => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
+        // AVX1 128-bit lane moves. GCC gates both on -mavx; without this arm
+        // lccc accepted them under the baseline ISA.
+        B::X86Vextractf128V | B::X86Vinsertf128 => IntrinsicRequirement {
             feature: F::Avx,
             flag: "-mavx",
             also: None,
@@ -4401,6 +4518,8 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pmaxsd128
         | B::X86Pminud128
         | B::X86Pmaxud128
+        | B::X86Pmaxuw128
+        | B::X86Pminuw128
         | B::X86Pblendvb128
         | B::X86Pblendw128
         | B::X86Pmovzxbw128
@@ -4539,10 +4658,20 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86ShufPsValue => IntrinsicOp::ShufPs128,
         BuiltinIntrinsic::X86CvtPd2PsValue => IntrinsicOp::CvtPd2Ps128,
         BuiltinIntrinsic::X86Vextractf128V => IntrinsicOp::Vextractf128,
+        BuiltinIntrinsic::X86Vinsertf128 => IntrinsicOp::Vinsertf128,
         BuiltinIntrinsic::X86MaxPs256V => IntrinsicOp::MaxPs256,
         BuiltinIntrinsic::X86MinPs256V => IntrinsicOp::MinPs256,
-        // andps is pure bitwise: pand256 is bit-identical on any lane type.
-        BuiltinIntrinsic::X86AndPs256V => IntrinsicOp::Pand256,
+        // Bitwise FP logic keeps its own typed op: the AVX1 `vandps`/`vandpd`
+        // family. Lowering it to the integer `Pand256` emitted `vpand`, an AVX2
+        // encoding, under `-mavx`.
+        BuiltinIntrinsic::X86AndPs256V => IntrinsicOp::AndPs256,
+        BuiltinIntrinsic::X86OrPs256V => IntrinsicOp::OrPs256,
+        BuiltinIntrinsic::X86XorPs256V => IntrinsicOp::XorPs256,
+        BuiltinIntrinsic::X86AndNotPs256V => IntrinsicOp::AndNotPs256,
+        BuiltinIntrinsic::X86AndPd256V => IntrinsicOp::AndPd256,
+        BuiltinIntrinsic::X86OrPd256V => IntrinsicOp::OrPd256,
+        BuiltinIntrinsic::X86XorPd256V => IntrinsicOp::XorPd256,
+        BuiltinIntrinsic::X86AndNotPd256V => IntrinsicOp::AndNotPd256,
         BuiltinIntrinsic::X86CmpPs256V => IntrinsicOp::CmpPs256,
         BuiltinIntrinsic::X86Clflush => IntrinsicOp::Clflush,
         BuiltinIntrinsic::X86Movnti => IntrinsicOp::Movnti,
@@ -4779,6 +4908,12 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pmaxsb256 => IntrinsicOp::Pmaxsb256,
         BuiltinIntrinsic::X86Pminud256 => IntrinsicOp::Pminud256,
         BuiltinIntrinsic::X86Pmaxud256 => IntrinsicOp::Pmaxud256,
+        BuiltinIntrinsic::X86Pmaxuw256 => IntrinsicOp::VecMaxU16x16,
+        BuiltinIntrinsic::X86Pminuw256 => IntrinsicOp::VecMinU16x16,
+        BuiltinIntrinsic::X86Pmaxsw256 => IntrinsicOp::VecMaxI16x16,
+        BuiltinIntrinsic::X86Pminsw256 => IntrinsicOp::VecMinI16x16,
+        BuiltinIntrinsic::X86Pmaxuw128 => IntrinsicOp::VecMaxU16x8,
+        BuiltinIntrinsic::X86Pminuw128 => IntrinsicOp::VecMinU16x8,
         BuiltinIntrinsic::X86Pmulhuw128 => IntrinsicOp::Pmulhuw128,
         BuiltinIntrinsic::X86Paddq128 => IntrinsicOp::Paddq128,
         BuiltinIntrinsic::X86Psubq128 => IntrinsicOp::Psubq128,
@@ -4978,6 +5113,29 @@ mod prefetch_hint_tests {
 mod legacy_constructor_permission_tests {
     use super::{BuiltinKind, builtins, x86_intrinsic_required_feature};
     use crate::common::x86_features::X86Feature as F;
+
+    #[test]
+    fn unsigned_word_minmax_builtins_require_their_isa() {
+        // GCC 16.2 reference: pmaxuw/pminuw need SSE4.1 (128-bit) and AVX2 (256-bit).
+        for (name, expected) in [
+            ("__builtin_ia32_pmaxuw128", F::Sse41),
+            ("__builtin_ia32_pminuw128", F::Sse41),
+            ("__builtin_ia32_pmaxuw256", F::Avx2),
+            ("__builtin_ia32_pminuw256", F::Avx2),
+            ("__builtin_ia32_pmaxsw256", F::Avx2),
+            ("__builtin_ia32_pminsw256", F::Avx2),
+        ] {
+            let info = builtins::resolve_builtin(name).expect("known pmaxuw/pminuw builtin");
+            let BuiltinKind::Intrinsic(intrinsic) = &info.kind else {
+                panic!("{name} is not an intrinsic");
+            };
+            assert_eq!(
+                x86_intrinsic_required_feature(intrinsic).map(|r| r.feature),
+                Some(expected),
+                "{name}",
+            );
+        }
+    }
 
     #[test]
     fn zero_constructors_keep_their_api_feature_identity() {

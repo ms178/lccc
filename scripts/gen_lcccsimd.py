@@ -421,6 +421,8 @@ FP256_MISC = [
     ("insertf128_pd", "vinsertf128", "__m256d", "M256D"),
     ("extractf128_ps", "vextractf128", "__m128", "M128"),
     ("extractf128_pd", "vextractf128", "__m128d", "M128D"),
+    ("insertf128_si256", "vinsertf128", "__m256i", "M256I"),
+    ("extractf128_si256", "vextractf128", "__m128i", "M128I"),
 ]
 
 # ------------------------------------------------------------- emit -------
@@ -890,13 +892,18 @@ for name, mn, rty, m in FP256_FMA:
     macro(f"_mm256_{name}(__a, __b, __c)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b, __c))")
 for name, mn, rty, m in FP256_MISC:
-    family = "pd" if name.endswith("_pd") else "ps"
+    # Integer rows use the "i" class, the only integer class the compiler
+    # recognises (builtins.rs resolve_builtin). Naming them "si" would leave
+    # the call unrecognised and fail at link time.
+    family = "i" if name.endswith("_si256") else ("pd" if name.endswith("_pd") else "ps")
     if name.startswith("extract"):
-        proto(f"256_{family}_{mn}", rty[2:], ["long", ("__m256" if m == "M128" else "__m256d") + " __a"])
+        src_ty = {"M128": "__m256", "M128D": "__m256d", "M128I": "__m256i"}[m]
+        proto(f"256_{family}_{mn}", rty[2:], ["long", src_ty + " __a"])
         macro(f"_mm256_{name}(__a, __imm)",
               f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_{family}_{mn}(__imm, __a))")
     elif name.startswith("insert"):
-        proto(f"256_{family}_{mn}", rty[2:], ["long", rty + " __a", ("__m128" if m == "M256" else "__m128d") + " __b"])
+        half_ty = {"M256": "__m128", "M256D": "__m128d", "M256I": "__m128i"}[m]
+        proto(f"256_{family}_{mn}", rty[2:], ["long", rty + " __a", half_ty + " __b"])
         macro(f"_mm256_{name}(__a, __b, __imm)",
               f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_{family}_{mn}(__imm, __a, __b))")
     else:

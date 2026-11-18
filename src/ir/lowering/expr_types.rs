@@ -663,25 +663,14 @@ impl Lowerer {
             "__builtin_memchr" | "__builtin_strpbrk" | "__builtin_strncat"
             | "__builtin_stpncpy" => Some(IrType::Ptr),
             "__builtin_strspn" | "__builtin_strcspn" => Some(IrType::U64),
-            // Raw GCC 128-bit vector builtins return the vector BY VALUE;
-            // lccc's value representation for 16-byte vectors is I128.
-            // Without this the result defaulted to I64 and the RETURN path
-            // sign-extended half the vector away (cqto), zeroing lanes 2-3
-            // and corrupting lane 1 (kernel NAP governor v4sf clamp).
-            "__builtin_ia32_maxps"
-            | "__builtin_ia32_minps"
-            | "__builtin_ia32_shufps"
-            | "__builtin_ia32_vextractf128_ps256"
-                if self.target == crate::backend::Target::I686 =>
-            {
-                Some(IrType::Ptr)
-            }
-            "__builtin_ia32_maxps"
-            | "__builtin_ia32_minps"
-            | "__builtin_ia32_shufps"
-            | "__builtin_ia32_vextractf128_ps256" => Some(IrType::I128),
             // 256-bit raw builtins return v8sf, which lccc represents as a
             // POINTER to the 32-byte result slot everywhere (sret convention).
+            // The 128-bit raw builtins (maxps, minps, shufps, vextractf128_*)
+            // and the 256-bit vinsertf128_* forms are typed by
+            // `x86_builtin_types::result_type`. `builtin_return_type` returns
+            // from that table before it reaches this match, so those names
+            // are not repeated here: a repeated arm is unreachable, and it
+            // pushed this function past the 300-line audit census limit.
             "__builtin_ia32_maxps256"
             | "__builtin_ia32_minps256"
             | "__builtin_ia32_andps256"

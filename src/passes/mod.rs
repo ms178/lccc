@@ -1776,11 +1776,23 @@ pub(crate) fn with_function_x86_vec_isa<R>(
     let fn_avx512vl = fn_isa.ymm
         && set.contains(crate::common::x86_features::X86Feature::Avx512F)
         && set.contains(crate::common::x86_features::X86Feature::Avx512Vl);
-    vectorize::set_x86_simd_isa(fn_isa.simd, fn_isa.ymm, fn_isa.sse41, fn_avx512vl);
+    vectorize::set_x86_simd_isa(
+        fn_isa.simd,
+        target == crate::backend::Target::X86_64 && fn_isa.avx,
+        fn_isa.ymm,
+        fn_isa.sse41,
+        fn_avx512vl,
+    );
     vectorize::set_x86_fma_enabled(fn_isa.fma);
     vectorize::set_x86_strict_recip_avx2_enabled(fn_isa.ymm && fn_isa.sse41);
     let result = body(fn_isa);
-    vectorize::set_x86_simd_isa(base_isa.simd, base_isa.ymm, base_isa.sse41, base_avx512vl);
+    vectorize::set_x86_simd_isa(
+        base_isa.simd,
+        target == crate::backend::Target::X86_64 && base_isa.avx,
+        base_isa.ymm,
+        base_isa.sse41,
+        base_avx512vl,
+    );
     vectorize::set_x86_fma_enabled(base_isa.fma);
     vectorize::set_x86_strict_recip_avx2_enabled(base_isa.ymm && base_isa.sse41);
     result
@@ -1863,7 +1875,13 @@ pub(crate) fn run_passes(
     // the vectorizer must not rewrite a single loop (see the gate in
     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
     // 128-bit SSE2 instead of disabling vectorization outright.
-    vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41, x86_avx512vl);
+    vectorize::set_x86_simd_isa(
+        x86_isa.simd,
+        target == crate::backend::Target::X86_64 && x86_isa.avx,
+        x86_isa.ymm,
+        x86_isa.sse41,
+        x86_avx512vl,
+    );
     vectorize::set_x86_sse1_available(target == crate::backend::Target::X86_64 && x86_sse1);
     // I64 maps and unfused packed multiply/add are x86-64-only lowerings.
     // Refresh the per-thread gate for every TU: a worker may compile i686

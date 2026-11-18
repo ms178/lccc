@@ -43,6 +43,35 @@ fn exact_immediate_operand(op: &Operand) -> bool {
     }
 }
 
+/// Width in bits of the lane selector of a generic helper whose instruction
+/// encodes only one bit of its immediate. `vinsertf128` and `vextractf128`
+/// select lane 0 or 1; GCC 16.2 rejects any other value with "the last argument
+/// must be a 1-bit immediate". The `_mm256_*f128_*` macros reach this generic
+/// path, which only checked that the value was an exact integer, so an
+/// out-of-range selector compiled silently to the masked lane.
+fn lane_selector_bits(mnemonic: &str) -> Option<u32> {
+    match mnemonic {
+        "vinsertf128" | "vinsertf128ps" | "vinsertf128pd" | "vextractf128" | "vextractf128ps"
+        | "vextractf128pd" => Some(1),
+        _ => None,
+    }
+}
+
+/// `true` when `op` is a constant that fits the `bits`-wide selector `mnemonic`
+/// requires, or when that mnemonic has no width contract. A runtime value is
+/// refused earlier by `exact_immediate_operand`, so only constants reach here.
+fn lane_selector_in_range(mnemonic: &str, op: &Operand) -> bool {
+    let Some(bits) = lane_selector_bits(mnemonic) else {
+        return true;
+    };
+    match op {
+        Operand::Const(c) => c
+            .to_i128()
+            .is_some_and(|v| (0..(1i128 << bits)).contains(&v)),
+        Operand::Value(_) => false,
+    }
+}
+
 pub(crate) fn lccc_simd_lookup(
     mnemonic: &str,
 ) -> Option<(LcccSimdClass, IntrinsicOp, bool, usize)> {
@@ -919,6 +948,14 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Pminub128 => (VecMinU8x16, IrType::U8, 16, Binary),
         Pminsw128 => (VecMinI16x8, IrType::I16, 16, Binary),
         Pmaxsw128 => (VecMaxI16x8, IrType::I16, 16, Binary),
+        // The 16-bit extrema builtins lower straight to these value ops
+        // (x86_intrinsic_op), so the row is the identity twin: the register
+        // op is its own twin, and without it the pointer form spills both
+        // operands to frame slots.
+        VecMaxU16x8 => (VecMaxU16x8, IrType::U16, 16, Binary),
+        VecMinU16x8 => (VecMinU16x8, IrType::U16, 16, Binary),
+        VecMaxI16x8 => (VecMaxI16x8, IrType::I16, 16, Binary),
+        VecMinI16x8 => (VecMinI16x8, IrType::I16, 16, Binary),
         // SSE4.1 extrema.  The dword twins are the vectorizer's own
         // (`VecSminI32x4`/`VecSmaxI32x4` are `pminsd`/`pmaxsd`; the unsigned
         // pair is `VecMinU32x4`/`VecMaxU32x4`), the byte pair needed a twin
@@ -938,11 +975,10 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Paddsb128 => (VecAddSatI8x16, IrType::I8, 16, Binary),
         Packsswb128 => (VecPacksswbI16x8, IrType::I16, 16, Binary),
         Punpcklbw128 => (VecUnpackLoI8x16, IrType::I8, 16, Binary),
-        // Unsigned 16-bit saturating subtract — the only SATURATING map op in
-        // the register set.  It is also what makes the missing `pminuw` /
-        // `pmaxuw` encodings expressible without one:
-        // `min(a,b) = a - subs_epu(a,b)` and `max(a,b) = b + subs_epu(a,b)`
-        // are exact for every lane (see include/smmintrin.h and
+        // Unsigned 16-bit saturating subtract, the only SATURATING map op in
+        // the register set.  `pminuw`/`pmaxuw` are no longer expressed
+        // through it: `_mm_min/max_epu16` and `_mm256_min/max_epu16` reach
+        // their own instructions (see include/smmintrin.h and
         // include/avx2intrin.h).
         Psubusw128 => (VecSubSatU16x8, IrType::I16, 16, Binary),
 
@@ -971,6 +1007,10 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Pandn256 => (VecAndNotI32x8, IrType::I32, 32, Binary),
         Punpcklbw256 => (VecUnpackLoI8x32, IrType::I8, 32, Binary),
         Psubusw256 => (VecSubSatU16x16, IrType::I16, 32, Binary),
+        VecMaxU16x16 => (VecMaxU16x16, IrType::U16, 32, Binary),
+        VecMinU16x16 => (VecMinU16x16, IrType::U16, 32, Binary),
+        VecMaxI16x16 => (VecMaxI16x16, IrType::I16, 32, Binary),
+        VecMinI16x16 => (VecMinI16x16, IrType::I16, 32, Binary),
 
         _ => return None,
     };
@@ -1601,6 +1641,14 @@ impl Lowerer {
                     width.max(16),
                 );
             }
+            if !lane_selector_in_range(canonical, &op) {
+                let bits = lane_selector_bits(canonical).unwrap_or(1);
+                return self.reject_builtin_call(
+                    format!("the last argument to '{name}' must be an {bits}-bit immediate"),
+                    args,
+                    width.max(16),
+                );
+            }
             Some(op)
         } else {
             None
@@ -1871,7 +1919,7 @@ mod portable_subset_tests {
 
 #[cfg(test)]
 mod immediate_diagnostic_tests {
-    use super::exact_immediate_operand;
+    use super::{exact_immediate_operand, lane_selector_bits, lane_selector_in_range};
     use crate::ir::reexports::{IrConst as C, Operand, Value};
 
     /// GCC 16.2 / Clang 23.1.5 hard-error on a runtime `vpcmp` predicate;
@@ -1914,6 +1962,47 @@ mod immediate_diagnostic_tests {
         }
         assert!(!exact_immediate_operand(&Operand::Value(Value(0))));
         assert!(!exact_immediate_operand(&Operand::Value(Value(u32::MAX))));
+    }
+
+    /// The one-bit lane selector of `vinsertf128`/`vextractf128` must be 0 or 1.
+    /// GCC 16.2 rejects anything else, so every spelling of the mnemonic is
+    /// pinned here, along with a value just past each boundary.
+    #[test]
+    fn lane_selector_accepts_only_zero_and_one() {
+        for mn in [
+            "vinsertf128",
+            "vinsertf128ps",
+            "vinsertf128pd",
+            "vextractf128",
+            "vextractf128ps",
+            "vextractf128pd",
+        ] {
+            for v in [0i64, 1] {
+                assert!(
+                    lane_selector_in_range(mn, &Operand::Const(C::I64(v))),
+                    "{mn} selector {v} is a valid lane"
+                );
+            }
+            for v in [-1i64, 2, 3, 4, i64::MAX, i64::MIN] {
+                assert!(
+                    !lane_selector_in_range(mn, &Operand::Const(C::I64(v))),
+                    "{mn} selector {v} must be rejected"
+                );
+            }
+        }
+    }
+
+    /// A mnemonic without a width contract is unconstrained, so the rule
+    /// cannot leak onto unrelated immediates.
+    #[test]
+    fn lane_selector_leaves_other_immediates_alone() {
+        for mn in ["vpermilps256", "vcmpps256", "vshufps256", "vinserti128"] {
+            assert_eq!(lane_selector_bits(mn), None, "{mn} has no 1-bit contract");
+            assert!(
+                lane_selector_in_range(mn, &Operand::Const(C::I64(7))),
+                "{mn} is not governed by the lane-selector width"
+            );
+        }
     }
 
     /// Every lookup row that declares `has_imm` must have its leading control

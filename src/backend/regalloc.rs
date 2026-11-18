@@ -8453,6 +8453,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecCmpI16x8
                 | O::VecMinI16x8
                 | O::VecMaxI16x8
+                | O::VecMinU16x8
+                | O::VecMaxU16x8
                 | O::VecBlendvI16x8
                 | O::VecBroadcastI16x16
                 | O::VecBroadcastI16x8
@@ -9130,6 +9132,8 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecSubSatU16x8
             | O::VecMinI16x8
             | O::VecMaxI16x8
+            | O::VecMinU16x8
+            | O::VecMaxU16x8
             | O::VecCmpI32x4
             | O::VecCmpI64x2
             | O::VecCmpI16x8
@@ -10885,6 +10889,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecSminI32x4
                                 | O::VecMinU32x4
                                 | O::VecMaxU32x4
+                                | O::VecMinU16x8
+                                | O::VecMaxU16x8
                                 | O::VecLoadWidenI32ToI64x2
                                 // Byte-predicate counting loops carry the
                                 // map-family byte ops (compare masks, the
@@ -11193,6 +11199,8 @@ fn is_x86_map_int_consumer_128(op: &IntrinsicOp) -> bool {
             | IntrinsicOp::VecCmpI16x8
             | IntrinsicOp::VecMinI16x8
             | IntrinsicOp::VecMaxI16x8
+            | IntrinsicOp::VecMinU16x8
+            | IntrinsicOp::VecMaxU16x8
             | IntrinsicOp::VecBlendvI16x8
     )
 }
@@ -11735,6 +11743,8 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecCmpI16x8
         | O::VecMinI16x8
         | O::VecMaxI16x8
+        | O::VecMinU16x8
+        | O::VecMaxU16x8
      | O::VecBlendvI16x8
         // BB-SLP 128-bit packed lane shifts (word/dword/qword): same
         // 128-bit integer class, same XMM file.
@@ -12017,6 +12027,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecCmpI16x8
                     | O::VecMinI16x8
                     | O::VecMaxI16x8
+                    | O::VecMinU16x8
+                    | O::VecMaxU16x8
                     | O::VecBlendvI16x8
                     // ARX lane ops: scratch-only emitters (xmm0/xmm1 pair,
                     // the source home is never written) — a register-homed

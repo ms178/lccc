@@ -738,6 +738,8 @@ impl I686Codegen {
             | IntrinsicOp::Punpckhqdq128
             | IntrinsicOp::Pminud128
             | IntrinsicOp::Pmaxud128
+            | IntrinsicOp::VecMinU16x8
+            | IntrinsicOp::VecMaxU16x8
             | IntrinsicOp::Pminsd128
             | IntrinsicOp::Pmaxsd128
             | IntrinsicOp::Pminsb128
@@ -798,6 +800,8 @@ impl I686Codegen {
                         IntrinsicOp::Punpckhqdq128 => "punpckhqdq",
                         IntrinsicOp::Pminud128 => "pminud",
                         IntrinsicOp::Pmaxud128 => "pmaxud",
+                        IntrinsicOp::VecMinU16x8 => "pminuw",
+                        IntrinsicOp::VecMaxU16x8 => "pmaxuw",
                         IntrinsicOp::Pminsd128 => "pminsd",
                         IntrinsicOp::Pmaxsd128 => "pmaxsd",
                         IntrinsicOp::Pminsb128 => "pminsb",
@@ -1850,6 +1854,10 @@ impl I686Codegen {
             | IntrinsicOp::Pmaxsb256
             | IntrinsicOp::Pminud256
             | IntrinsicOp::Pmaxud256
+            | IntrinsicOp::VecMinU16x16
+            | IntrinsicOp::VecMaxU16x16
+            | IntrinsicOp::VecMinI16x16
+            | IntrinsicOp::VecMaxI16x16
             | IntrinsicOp::Pminub256
             | IntrinsicOp::Pminsd256
             | IntrinsicOp::Psadbw256
@@ -1903,6 +1911,10 @@ impl I686Codegen {
                         IntrinsicOp::Pmaxsb256 => "vpmaxsb",
                         IntrinsicOp::Pminud256 => "vpminud",
                         IntrinsicOp::Pmaxud256 => "vpmaxud",
+                        IntrinsicOp::VecMinU16x16 => "vpminuw",
+                        IntrinsicOp::VecMaxU16x16 => "vpmaxuw",
+                        IntrinsicOp::VecMinI16x16 => "vpminsw",
+                        IntrinsicOp::VecMaxI16x16 => "vpmaxsw",
                         IntrinsicOp::Psadbw256 => "vpsadbw",
                         IntrinsicOp::Pshufb256 => "vpshufb",
                         IntrinsicOp::Packssdw256 => "vpackssdw",
@@ -1948,7 +1960,15 @@ impl I686Codegen {
             | IntrinsicOp::UnpcklPd256
             | IntrinsicOp::UnpckhPd256
             | IntrinsicOp::VpermilvarPs256
-            | IntrinsicOp::VpermilvarPd256 => {
+            | IntrinsicOp::VpermilvarPd256
+            | IntrinsicOp::AndPs256
+            | IntrinsicOp::OrPs256
+            | IntrinsicOp::XorPs256
+            | IntrinsicOp::AndNotPs256
+            | IntrinsicOp::AndPd256
+            | IntrinsicOp::OrPd256
+            | IntrinsicOp::XorPd256
+            | IntrinsicOp::AndNotPd256 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::AddPs256 => "vaddps",
@@ -1972,6 +1992,14 @@ impl I686Codegen {
                         IntrinsicOp::UnpckhPd256 => "vunpckhpd",
                         IntrinsicOp::VpermilvarPs256 => "vpermilps",
                         IntrinsicOp::VpermilvarPd256 => "vpermilpd",
+                        IntrinsicOp::AndPs256 => "vandps",
+                        IntrinsicOp::OrPs256 => "vorps",
+                        IntrinsicOp::XorPs256 => "vxorps",
+                        IntrinsicOp::AndNotPs256 => "vandnps",
+                        IntrinsicOp::AndPd256 => "vandpd",
+                        IntrinsicOp::OrPd256 => "vorpd",
+                        IntrinsicOp::XorPd256 => "vxorpd",
+                        IntrinsicOp::AndNotPd256 => "vandnpd",
                         _ => unreachable!("unexpected AVX float binary op: {:?}", op),
                     };
                     self.emit_avx_binary_256(dptr, args, inst);
@@ -2109,7 +2137,7 @@ impl I686Codegen {
                     let inst = if matches!(op, IntrinsicOp::Vextractf128) {
                         "vextractf128"
                     } else {
-                        "vextracti128"
+                        crate::backend::x86_common::vextract128_name(self.avx2_enabled)
                     };
                     let imm = Self::operand_to_imm_i64(&args[1]) & 1;
                     self.emit_avx_load(&args[0], "ymm0");
@@ -2151,12 +2179,14 @@ impl I686Codegen {
                 }
             }
 
-            // Zero-extend 128 -> 256 (high lane zero, NOT a duplicate).
+            // Zero-extend 128 -> 256 (high lane zero, NOT a duplicate). A VEX
+            // 128-bit write zeroes bits 255:128 of its destination, so one VEX
+            // register move is the zero-extension and needs only AVX1 (the former
+            // vpxor + vinserti128 pair was AVX2-only).
             IntrinsicOp::Zext128to256 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_avx_load128(&args[0], "xmm0");
-                    self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
-                    self.state.emit("    vinserti128 $0, %xmm0, %ymm1, %ymm0");
+                    self.state.emit("    vmovdqa %xmm0, %xmm0");
                     self.emit_avx_store_dest(dptr);
                 } else if dest.is_some() {
                     self.reject_value_form(op);
@@ -2167,7 +2197,10 @@ impl I686Codegen {
             IntrinsicOp::Cast256to128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_avx_load(&args[0], "ymm0");
-                    self.state.emit("    vextracti128 $0, %ymm0, %xmm0");
+                    self.state.emit_fmt(format_args!(
+                        "    {} $0, %ymm0, %xmm0",
+                        crate::backend::x86_common::vextract128_name(self.avx2_enabled)
+                    ));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    vmovdqu %xmm0, (%eax)");
                 } else if dest.is_some() {
@@ -2489,13 +2522,25 @@ impl I686Codegen {
                             }
                         }
                         self.state.emit("    vmovsd (%esp), %xmm0");
-                        self.state.emit("    vpbroadcastq %xmm0, %ymm0");
+                        if self.avx2_enabled {
+                            self.state.emit("    vpbroadcastq %xmm0, %ymm0");
+                        } else {
+                            self.emit_avx1_splat_xmm0(crate::backend::x86_common::SplatLane::B8);
+                        }
                         self.state.emit("    addl $8, %esp");
                     } else {
                         self.operand_to_eax(&args[0]);
                         self.state.emit("    vmovd %eax, %xmm0");
-                        self.state
-                            .emit_fmt(format_args!("    {} %xmm0, %ymm0", inst));
+                        if self.avx2_enabled {
+                            self.state
+                                .emit_fmt(format_args!("    {} %xmm0, %ymm0", inst));
+                        } else {
+                            self.emit_avx1_splat_xmm0(match inst {
+                                "vpbroadcastb" => crate::backend::x86_common::SplatLane::B1,
+                                "vpbroadcastw" => crate::backend::x86_common::SplatLane::B2,
+                                _ => crate::backend::x86_common::SplatLane::B4,
+                            });
+                        }
                     }
                     self.emit_avx_store_dest(dptr);
                 } else if dest.is_some() {
@@ -4005,6 +4050,16 @@ mod fma_family_tests {
                 FmaRoleOrder::RmBVvvvCDstA,
                 "{op:?}"
             );
+        }
+    }
+}
+
+impl I686Codegen {
+    /// AVX1 256-bit splat of the scalar staged in the low bits of `%xmm0`.
+    /// Shuffle and insert come from `x86_common::avx1_splat_xmm_lines`.
+    fn emit_avx1_splat_xmm0(&mut self, lane: crate::backend::x86_common::SplatLane) {
+        for line in crate::backend::x86_common::avx1_splat_xmm_lines(lane, "xmm0", "ymm0") {
+            self.state.emit(&line);
         }
     }
 }
