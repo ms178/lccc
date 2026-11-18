@@ -181,9 +181,10 @@ oracle_require_version "$PREFIX/bfd-$BINUTILS_VER/bin/ld" "$BINUTILS_VER"
 
 # ── mold 3.0.0 ──────────────────────────────────────────────────────────────
 if [[ "$MOLD_PREFER" == cache ]] &&
-   { restore_cached "$mold_cache" bin/mold ||
-     PATH="$PREFIX/bfd-$BINUTILS_VER/bin:$PATH" \
-       bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$PREFIX/$mold_cache"; }; then
+   { { restore_cached "$mold_cache" bin/mold && oracle_mold_release_matches "$PREFIX/$mold_cache/bin/mold"; } ||
+     { PATH="$PREFIX/bfd-$BINUTILS_VER/bin:$PATH" \
+         bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$PREFIX/$mold_cache" &&
+       oracle_mold_release_matches "$PREFIX/$mold_cache/bin/mold"; }; }; then
     mold_install=$mold_cache
     mold_build_receipt="digest-pinned release cache v$MOLD_VER (x86 ELF targets probed on install)"
 else
@@ -233,7 +234,7 @@ fi
 lld_banner=$("$LLD_BIN" --version)
 lld_banner=${lld_banner%%$'\n'*}
 lld_line=${LLD_MINOR_PIN//./\\.}
-if [[ ! $lld_banner =~ (^|[[:space:]])$lld_line\.[0-9]+($|[[:space:]]) ]]; then
+if [[ ! $lld_banner =~ ^((Debian|Ubuntu)[[:blank:]]+)?LLD[[:blank:]]+$lld_line\.[0-9]+($|[[:space:]]) ]]; then
     note "lld   : version pin violated (want $LLD_MINOR_PIN.*): $lld_banner"
     exit 1
 fi

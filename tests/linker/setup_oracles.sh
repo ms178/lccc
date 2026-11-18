@@ -132,9 +132,10 @@ if want mold; then
   MOLD_NAME="mold$(ref_suffix "$MOLD_REF")"
   release="$MOLD_NAME-release"
   if [[ $MOLD_PREFER == cache && ($MOLD_REF == v3.0.0 || $MOLD_REF == 3.0.0) ]] &&
-     { have "$release" ||
+     { { have "$release" && oracle_mold_release_matches "$BIN/$release"; } ||
        { bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$SRC/mold-cache-v3.0.0" &&
-         install -m755 "$SRC/mold-cache-v3.0.0/bin/mold" "$BIN/$release"; }; }; then
+         install -m755 "$SRC/mold-cache-v3.0.0/bin/mold" "$BIN/$release" &&
+         oracle_mold_release_matches "$BIN/$release"; }; }; then
     mold_selected=$release
     mold_provenance="digest-pinned release cache v3.0.0 (x86 ELF targets probed on install)"
   else

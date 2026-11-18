@@ -1,5 +1,6 @@
 """Exercise mold cache/source switching without building or fetching a linker."""
 
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -21,6 +22,7 @@ chmod +x "$PREFIX/bin/mold"
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_STUB = "#!/bin/sh\necho 'mold 3.0.0 release-cache'\n"
 
 
 class MoldOracleModeTests(unittest.TestCase):
@@ -37,15 +39,17 @@ class MoldOracleModeTests(unittest.TestCase):
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, dest)
         (self.root / "scripts").mkdir()
+        self.release = self.root / "mold-release"
+        self.release.write_text(RELEASE_STUB)
+        # Exercise the real byte check against a small, offline release fixture.
+        versions = self.root / "tools/linker/oracle_versions.sh"
+        digest = "ada05c08a5686fdc8cf047f946f6c9b5163b7181ee7c500f7a904bcb750642a3"
+        versions.write_text(versions.read_text().replace(digest, hashlib.sha256(self.release.read_bytes()).hexdigest()))
         self.script(self.root / "scripts/ensure_mold_300_binary.sh", """
 set -eu
 [ "$1" = --prefix ]
 mkdir -p "$2/bin"
-cat > "$2/bin/mold" <<'STUB'
-#!/bin/sh
-echo 'mold 3.0.0 release-cache'
-STUB
-chmod +x "$2/bin/mold"
+install -m755 "$MOLD_TEST_RELEASE" "$2/bin/mold"
 """)
         self.script(self.root / "install-mold.sh", INSTALL_SOURCE_STUB)
         self.script(self.stub_bin / "git", """
@@ -68,12 +72,16 @@ mkdir -p "$2/bin"
 printf '#!/bin/sh\\necho "GNU ld 2.47.20260726"\\n' > "$2/bin/ld"
 chmod +x "$2/bin/ld"
 """)
-        self.script(self.stub_bin / "cargo", """printf '%s\\n' "$*" >> "$MOLD_TEST_CARGO_LOG"
+        self.script(self.stub_bin / "cargo", """
+set -eu
+printf '%s\\n' "$*" >> "$MOLD_TEST_CARGO_LOG"
+printf '%s\\n' "$RUSTFLAGS" >> "$MOLD_TEST_CARGO_LOG.rustflags"
 """)
         self.cargo_log = self.root / "cargo.log"
         self.env = dict(os.environ, PATH=f"{self.stub_bin}{os.pathsep}{os.environ['PATH']}",
                         MOLD_REF="v3.0.0", MOLD_TEST_CARGO_LOG=str(self.cargo_log),
-                        MOLD_TEST_INSTALL=str(self.root / "install-mold.sh"))
+                        MOLD_TEST_INSTALL=str(self.root / "install-mold.sh"),
+                        MOLD_TEST_RELEASE=str(self.release))
 
     @staticmethod
     def script(path, text):
@@ -103,6 +111,8 @@ chmod +x "$2/bin/ld"
         args = self.cargo_log.read_text().splitlines()
         self.assertEqual(args, ["build --release --locked -j 2 -p mold-cli "
                                 "--no-default-features --features x86_64,i386,system-allocator"])
+        self.assertEqual(self.cargo_log.with_suffix(".log.rustflags").read_text(),
+                         "-C target-cpu=native\n")
         self.assertIn("release-cache", cached)
         self.assertNotIn("source-build", self.setup_mold("cache"))
         self.assertIn("source-build", self.setup_mold("source"))
@@ -145,7 +155,26 @@ chmod +x "$2/bin/ld"
         self.assertIn("source-build", self.setup_tools("source", lld))
         self.assertEqual(len(self.cargo_log.read_text().splitlines()), 1)
 
+    def test_warm_releases_are_verified_before_execution(self):
+        lld = "LLD 23.1.5 (compatible with GNU linkers)"
+        self.setup_mold("cache")
+        self.setup_tools("cache", lld)
+        invoked = self.root / "altered-release-ran"
+        for setup, executable in (
+            (lambda: self.setup_mold("cache"), self.prefix / "bin/mold-v3_0_0-release"),
+            (lambda: self.setup_tools("cache", lld), self.root / "oracle outputs/mold-3.0.0-release/bin/mold"),
+        ):
+            with self.subTest(executable=executable):
+                invoked.unlink(missing_ok=True)
+                # Same version and the same banner, but not the restored bytes.
+                self.script(executable, f"touch '{invoked}'\necho 'mold 3.0.0 release-cache'\n")
+                setup()
+                self.assertFalse(invoked.exists())
+                self.assertEqual(executable.read_text(), RELEASE_STUB)
+        self.assertFalse(self.cargo_log.exists())
+
     def test_tools_do_not_accept_a_prerelease_or_wrong_lld_branch(self):
-        for banner in ("LLD 23.1.0-rc1", "LLD 23.10.0", "LLD 23.1.old"):
+        for banner in ("LLD 23.1.0-rc1", "LLD 23.10.0", "LLD 23.1.old",
+                       "Debian LLD 22.0.1 (LLVM tools 23.1.5 installed)"):
             with self.subTest(banner=banner):
                 self.setup_tools("cache", banner, expect_ok=False)
