@@ -5,8 +5,7 @@
 
 static int check_generated_histograms(void)
 {
-    if (!init_histograms())
-        return 0;
+    init_histograms();
     for (int c = 0; c < CASES; ++c) {
         unsigned active = 0;
         uint32_t total = 0;

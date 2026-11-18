@@ -11,9 +11,11 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
+SOURCE = ROOT / "tests/benchmark/programs/zlib_ng_huffman_heap.c"
 FIXTURE = ROOT / "tests/regression/fixtures/zlib/huffman_heap_contract.c"
 EXPECTED = b"de85215d22629785\n"  # PASSES=8; GCC 16.2 and Clang 23.1.5 agree.
 LEVELS = ("-O0", "-O1", "-O2", "-O3", "-Os")
+INVALID_PASSES = ("0", "-1", "4294967296ULL", "2.5")
 
 
 def checked(argv):
@@ -47,6 +49,12 @@ def main():
         with tempfile.TemporaryDirectory(prefix="lccc-huffman-contract-") as work:
             out = Path(work) / "contract"
             for compiler, widths in compilers:
+                for passes in INVALID_PASSES:
+                    result = subprocess.run([compiler, "-m64", "-std=c11", "-fsyntax-only",
+                                             f"-DPASSES={passes}", str(SOURCE)],
+                                            capture_output=True, timeout=45)
+                    if result.returncode <= 0 or b"PASSES must be a positive 32-bit integer" not in result.stderr:
+                        raise ValueError(f"{compiler}: PASSES={passes} was not diagnosed: {result.stderr!r}")
                 for width in widths:
                     for level in LEVELS:
                         out.unlink(missing_ok=True)

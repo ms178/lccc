@@ -379,3 +379,43 @@ GNU ld, lld, mold and lccc-ld identity per comparison; do not silently substitut
   fastbuilds, save every validated patch immediately, replay the base-to-head
   delta, run fast CI then hosted PR gates; report incomplete and skipped
   checks rather than borrowing the previous PR's green status.
+
+## Delivery audit
+
+- **Compiler-work reports.** Independent controls falsified both cross-arm
+  and cross-round output equality. A failed source/tool/geometry preflight
+  also used to leave a previous successful `summary.json` visible. Publish
+  the new incomplete receipt under the existing lock before preflight; keep
+  the byte comparisons and record stdout hashes rather than substituting hash
+  equality for byte equality. The offline controls and a real two-order
+  Valgrind A/A passed. No compiler hot path changes here.
+- **Huffman correctness.** On x86-64 and i686, LCCC, GCC 16.2 and Clang
+  23.1.5 each compile and run at `-O0/-O1/-O2/-O3/-Os` with warnings as
+  errors. Test every active count from 2 to 286 at total `UINT16_MAX`, with
+  an independent closed-form weighted cost. Reject impossible roots, too few
+  leaves, wrong weights and broken parents. `PASSES` must fit a positive 32-bit
+  integer; invalid build defines are compile-fail controls. GDB's layout view
+  confirms a four-byte node and the first merge's parent/root values. LCCC
+  output ran under Memcheck with zero errors. The authenticated ICX 2026.2
+  lane runs the same contract on x86-64, not a substituted local compiler.
+- **Keep input validation out of the timing shape.** The benchmark has no
+  input histogram API; its generator guarantees two positive weights and
+  never approaches the 16-bit total limit. Test this separately before calling
+  the heap. Keep the malformed-root guard in the cold tree verifier. A fused
+  startup histogram check took 1.0299× Clang elapsed time on an isolated
+  32-pair repeat (sign p=0.0021), despite unchanged optimized hot-function
+  bytes. An outlined check measured 1.0187×, versus 0.9749× for the root-only
+  change on 24 pairs each. The selected source rebuilt to the same bytes as
+  the measured root-only arm for LCCC, GCC and Clang. Its LCCC and GCC median
+  ratios were 0.9981× and 0.9995× (p=0.84 and p=0.54). Linked code addresses
+  moved; these are VM workload-shape checks, not causal cycle estimates or an
+  LCCC speedup. Raw pairs are in the ignored `artifacts/snapshots/roi-20261118-huffman-audit-*.json`
+  receipts.
+- **Diagnostic and linker evidence.** The four-backend scheduling contract
+  ran with one and two available CPUs; the three x86-64 dump files are now
+  also compared byte-for-byte between serial and forced scheduling. Both mold
+  setup paths revalidate the installed release executable against the digest
+  extracted from the pinned archive, before running its version command. A
+  same-banner replacement must not run. LLD's pin is matched to its actual
+  version field, not a version mentioned later in a banner. This audit does
+  not certify a native mold build or alter the known i686 symbol policy.
