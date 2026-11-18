@@ -4643,8 +4643,31 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             flag: "-mavxvnniint16",
             also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
         },
-        _ => return None,
+        _ => return avx2_shuffle_widen_requirement(intrinsic),
     })
+}
+
+/// AVX2 256-bit lane shuffle and widening-move builtins.  Split out of
+/// `x86_intrinsic_required_feature` so that match stays under the census
+/// function-length ratchet (`fns_over_300`).  Each name is 256-bit AVX2 only:
+/// GCC 16.2 rejects it under `-mavx` ("target specific option mismatch").
+fn avx2_shuffle_widen_requirement(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    match intrinsic {
+        B::X86Pshufd256
+        | B::X86Pmovzxbw256
+        | B::X86Pmovzxbd256
+        | B::X86Pmovzxwd256
+        | B::X86Pmovsxbw256
+        | B::X86Pmovsxbd256
+        | B::X86Pmovsxwd256 => Some(IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        }),
+        _ => None,
+    }
 }
 
 fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {

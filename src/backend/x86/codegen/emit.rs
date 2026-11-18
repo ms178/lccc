@@ -1137,8 +1137,8 @@ pub struct X86Codegen {
     ///
     /// Keying the 256-bit FLOAT bitwise forms on AVX2 emitted a legacy 128-bit
     /// `xorps` for a 256-bit operand under `-mavx`, dropping the upper lanes.
-    /// Other 128-bit emitters still key their VEX choice on `avx2_enabled`; that
-    /// is tracked as an open item and is not changed here.
+    /// The 128-bit VEX choices key on this cell through [`X86Codegen::vex128`]
+    /// (AVX1).  The former `avx2_enabled` keying of those forms is gone.
     pub(super) avx_enabled: bool,
     /// Code-generation ISA permission for the current TU (VEX / SSE4.1 /
     /// FMA3 / ymm).  Every text emitter consults this instead of assuming a
@@ -1526,6 +1526,19 @@ fn alias_refuse_dbg() -> bool {
 }
 
 impl X86Codegen {
+    /// VEX.128 encoding permission.  The 128-bit `v<op> xmm` family, the VEX.128
+    /// moves, compares, shifts, shuffles, packs and scalar-GPR moves this backend
+    /// emits are AVX1-legal, so they key on the AVX1 cell (`isa.avx`, which the
+    /// ISA contract says "governs every `v*` mnemonic").  `avx2_enabled`
+    /// (`isa.ymm`) stays for YMM register forms and the genuinely AVX2-only
+    /// mnemonics (`vpbroadcast{b,w}` from xmm, `vpblend*d`, `vpsllv*`, `vpermd`).
+    /// Keying the 128-bit forms on AVX2 emitted legacy SSE under `-mavx`, which
+    /// mixes with the dirty upper state of the surrounding 256-bit code.
+    #[inline]
+    pub(super) fn vex128(&self) -> bool {
+        self.avx_enabled
+    }
+
     /// IPA-RA keep mask for a call at program point `pp`: the families
     /// holding a value that is live across the call. Exact rather than the
     /// function-wide union, so at a call no IPA value survives the peephole

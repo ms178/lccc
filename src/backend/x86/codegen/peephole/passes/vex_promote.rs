@@ -544,6 +544,50 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
 /// Prologue marker written by the emitter for every VEX-legal function.
 pub(crate) const VEX_LEGAL_MARKER: &str = "# LCCC_VEX_LEGAL 1";
 
+/// `true` when one line of an inline-asm body (`#APP` ... `#NO_APP`) can be
+/// treated as opaque straight-line code by the promotion pass.
+///
+/// The body is user text, so the pass cannot see what it reads or writes.  It
+/// is safe to step over only when it cannot observe or redefine upper YMM
+/// state and cannot redirect control flow: no `%ymm`/`%zmm` operand (the
+/// substituted operands are part of this text), no branch, call, return,
+/// interrupt or label, no assembler directive (`.byte` could encode anything),
+/// and no `xsave`/`xrstor` family instruction, which reads or writes the full
+/// upper state.  Anything else makes the whole function opaque, as before.
+fn asm_line_is_straight_line_safe(t: &str) -> bool {
+    if t.is_empty() || t.starts_with('#') {
+        return true;
+    }
+    if t.contains("%ymm") || t.contains("%zmm") || t.starts_with('.') || t.ends_with(':') {
+        return false;
+    }
+    let mnem = t
+        .split_ascii_whitespace()
+        .find(|w| {
+            !w.ends_with(':')
+                && *w != "lock"
+                && *w != "rep"
+                && *w != "repz"
+                && *w != "repnz"
+                && *w != "rex"
+                && *w != "notrack"
+                && *w != "bnd"
+        })
+        .unwrap_or("");
+    let mnem = mnem.trim_end_matches(',');
+    !(mnem.starts_with('j')
+        || mnem.starts_with("loop")
+        || mnem.starts_with("call")
+        || mnem.starts_with("ret")
+        || mnem.starts_with("int")
+        || mnem.starts_with("sys")
+        || mnem.starts_with("iret")
+        || mnem.starts_with("xsave")
+        || mnem.starts_with("xrstor")
+        || mnem.starts_with("fxsave")
+        || mnem.starts_with("fxrstor"))
+}
+
 /// Promote legacy SSE to VEX in every function that uses `%ymm` or whose
 /// prologue marks it VEX-legal.  Returns the number of rewritten lines.
 pub fn promote_legacy_sse_to_vex(asm: &mut String) -> usize {
@@ -568,13 +612,19 @@ pub fn promote_legacy_sse_to_vex(asm: &mut String) -> usize {
     for (start, end) in ranges {
         let body = &lines[start..end];
         let mut ymm_used = 0u32;
-        let mut has_asm = false;
+        let mut in_asm = false;
+        let mut asm_opaque = false;
         for l in body {
             if l.contains("%ymm") {
                 ymm_used |= ymm_mask(l);
             }
-            if l.trim_ascii() == "#APP" {
-                has_asm = true;
+            let t = l.trim_ascii();
+            if t == "#APP" {
+                in_asm = true;
+            } else if t == "#NO_APP" {
+                in_asm = false;
+            } else if in_asm && !asm_line_is_straight_line_safe(t) {
+                asm_opaque = true;
             }
         }
         // A function that emitted no `%ymm` is still promoted when its
@@ -583,14 +633,28 @@ pub fn promote_legacy_sse_to_vex(asm: &mut String) -> usize {
         // only evidence that VEX is legal here: SSE2-only code, naked
         // functions and thunks carry none and keep their legacy encodings.
         let vex_legal = body.iter().any(|l| l.trim() == VEX_LEGAL_MARKER);
-        if (ymm_used == 0 && !vex_legal) || has_asm {
+        if (ymm_used == 0 && !vex_legal) || asm_opaque {
             for l in body {
                 out.push_str(l);
             }
             continue;
         }
         let allowed = allowed_masks(body);
+        let mut in_asm = false;
         for (idx, l) in body.iter().enumerate() {
+            // Asm regions are copied verbatim: their text is the user's and
+            // is never re-encoded.  Only the compiler's own code around them
+            // is promoted (see rule 4).
+            let t = l.trim_ascii();
+            if t == "#APP" {
+                in_asm = true;
+            } else if t == "#NO_APP" {
+                in_asm = false;
+            }
+            if in_asm {
+                out.push_str(l);
+                continue;
+            }
             let content = l.strip_suffix('\n').unwrap_or(l);
             let t = content.trim_ascii_start();
             if is_insn_line(t) {
@@ -655,16 +719,53 @@ mod tests {
         assert_eq!(out, src);
     }
 
-    /// Inline asm wins over the marker: an `#APP` region is opaque, so the
-    /// whole function is left alone even when it carries the marker.
+    /// An inline-asm region that is straight-line code and names no YMM
+    /// state is stepped over: the compiler's own legacy SSE around it is
+    /// promoted, and the asm text itself is copied verbatim.
     #[test]
-    fn vex_legal_function_with_inline_asm_is_not_rewritten() {
+    fn vex_legal_function_with_straight_line_asm_promotes_around_it() {
         let src = format!(
             "f:\n    {VEX_LEGAL_MARKER}\n    #APP\n    nop\n    #NO_APP\n    addss %xmm1, %xmm0\n    ret\n"
         );
         let (out, n) = run(&src);
-        assert_eq!(n, 0, "{out}");
-        assert_eq!(out, src);
+        assert_eq!(n, 1, "{out}");
+        assert!(out.contains("\n    #APP\n    nop\n    #NO_APP\n"), "{out}");
+        assert!(out.contains("vaddss %xmm1, %xmm0, %xmm0"), "{out}");
+    }
+
+    /// Asm text is user text: a legacy SSE instruction inside `#APP` is never
+    /// re-encoded, even in a function that is otherwise promoted.
+    #[test]
+    fn inline_asm_body_is_copied_verbatim() {
+        let src = format!(
+            "f:\n    {VEX_LEGAL_MARKER}\n    #APP\n    movss %xmm1, %xmm2\n    #NO_APP\n    addss %xmm1, %xmm0\n    ret\n"
+        );
+        let (out, n) = run(&src);
+        assert_eq!(n, 1, "{out}");
+        assert!(
+            out.contains("#APP\n    movss %xmm1, %xmm2\n    #NO_APP\n"),
+            "{out}"
+        );
+    }
+
+    /// Asm regions that could observe or redefine upper YMM state, redirect
+    /// control flow, or hide encodings make the whole function opaque.
+    #[test]
+    fn unsafe_inline_asm_makes_the_function_opaque() {
+        for body in [
+            "    #APP\n    vmovaps %ymm1, %ymm2\n    #NO_APP\n",
+            "    #APP\n    jmp 1f\n    #NO_APP\n",
+            "    #APP\n1:\n    #NO_APP\n",
+            "    #APP\n    .byte 0xc5\n    #NO_APP\n",
+            "    #APP\n    xsave (%rdi)\n    #NO_APP\n",
+            "    #APP\n    call foo\n    #NO_APP\n",
+        ] {
+            let src =
+                format!("f:\n    {VEX_LEGAL_MARKER}\n{body}    addss %xmm1, %xmm0\n    ret\n");
+            let (out, n) = run(&src);
+            assert_eq!(n, 0, "{out}");
+            assert_eq!(out, src);
+        }
     }
 
     #[test]
@@ -1084,8 +1185,8 @@ g:
         let (out, n) = run(plain);
         assert_eq!(n, 0);
         assert_eq!(out, plain);
-        let asm =
-            "k:\n\tvpxor %ymm0, %ymm0, %ymm0\n#APP\n\tnop\n#NO_APP\n\tmovss (%rdi), %xmm1\n\tret\n";
+        // A YMM-naming asm region keeps the whole function untouched.
+        let asm = "k:\n\tvpxor %ymm0, %ymm0, %ymm0\n#APP\n\tvmovaps %ymm1, %ymm2\n#NO_APP\n\tmovss (%rdi), %xmm1\n\tret\n";
         let (out, n) = run(asm);
         assert_eq!(n, 0);
         assert_eq!(out, asm);

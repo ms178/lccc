@@ -504,6 +504,10 @@ pub(crate) fn lccc_simd_lookup(
         "vroundps256" => ui(Vec256, RoundPs256),
         "vroundpd256" => ui(Vec256, RoundPd256),
         "vblendps256" => s2(Vec256, BlendPs256),
+        // VPBLENDD: same lane select as VBLENDPS on the 32-bit lanes; the
+        // permission is AVX2 (see `legacy_simd_feature`), not AVX.
+        "vpblendd256" => s2(Vec256, BlendPs256),
+        "vpblendd128" => s2(Vec128, BlendPs128),
         "vblendpd256" => s2(Vec256, BlendPd256),
         "vblendvps256" => m3(Vec256, BlendvPs256),
         "vblendvpd256" => m3(Vec256, BlendvPd256),
@@ -568,6 +572,9 @@ fn legacy_simd_feature(mnemonic: &str) -> Option<SimdFeatureRequirement> {
         .any(|stem| fma_stem.starts_with(stem));
     Some(if is_fma3 {
         (F::Fma, "-mfma")
+    } else if matches!(mnemonic, "vpblendd256" | "vpblendd128") {
+        // VPBLENDD is AVX2; a `v`-prefix default would fail open to AVX.
+        (F::Avx2, "-mavx2")
     } else if mnemonic.starts_with('v') {
         (F::Avx, "-mavx")
     } else {
@@ -1861,6 +1868,8 @@ mod legacy_permission_tests {
             ("vcvtpd2ps256", F::Avx),
             ("vextractf128", F::Avx),
             ("vpermilps128", F::Avx),
+            ("vpblendd256", F::Avx2),
+            ("vpblendd128", F::Avx2),
             ("fmadd132ps128", F::Fma),
         ] {
             assert_eq!(legacy_simd_feature(mnemonic).unwrap().0, feature);

@@ -152,11 +152,20 @@ _mm256_add_epi8(__m256i __a, __m256i __b)
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_add_epi16(__m256i a, __m256i b) { __m256i r; unsigned short *x=(unsigned short*)&a,*y=(unsigned short*)&b,*z=(unsigned short*)&r; for(int i=0;i<16;i++)z[i]=x[i]+y[i]; return r; }
+_mm256_add_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_paddw256((__v16hi)(__a), (__v16hi)(__b));
+}
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_sub_epi8(__m256i a, __m256i b) { __m256i r; unsigned char *x=(unsigned char*)&a,*y=(unsigned char*)&b,*z=(unsigned char*)&r; for(int i=0;i<32;i++)z[i]=x[i]-y[i]; return r; }
+_mm256_sub_epi8(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_psubb256((__v32qi)(__a), (__v32qi)(__b));
+}
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_sub_epi16(__m256i a, __m256i b) { __m256i r; unsigned short *x=(unsigned short*)&a,*y=(unsigned short*)&b,*z=(unsigned short*)&r; for(int i=0;i<16;i++)z[i]=x[i]-y[i]; return r; }
+_mm256_sub_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_psubw256((__v16hi)(__a), (__v16hi)(__b));
+}
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_add_epi32(__m256i __a, __m256i __b)
@@ -293,17 +302,25 @@ _mm256_inserti128_si256(__m256i __a, __m128i __b, int __imm)
  * both inputs to the stack and wrote the result lane by lane.
  *
  * A macro, not an inline function: the immediate must stay a constant
- * expression at the call site, and a function parameter is not one. */
+ * expression at the call site, and a function parameter is not one.
+ *
+ * AVX2 only (VPBLENDD, VPSHUFD-256).  Outside `__AVX2__` the names are
+ * undeclared, matching GCC 16.2, which rejects them under -mavx. */
+#if defined(__AVX2__)
 #define _mm256_blend_epi32(__a, __b, __imm) \
-    _mm256_castps_si256(__CCC_M256_FROM_BUILTIN( \
-        __lccc_simd256_ps_vblendps256(__imm, _mm256_castsi256_ps(__a), \
-                                      _mm256_castsi256_ps(__b))))
+    (__CCC_M256I_FROM_BUILTIN( \
+        __lccc_simd256_i_vpblendd256((__imm), (__m256i)(__a), (__m256i)(__b))))
+
+#define _mm_blend_epi32(__a, __b, __imm) \
+    (__CCC_M128I_FROM_BUILTIN( \
+        __lccc_simd128_i_vpblendd128((__imm), (__m128i)(__a), (__m128i)(__b))))
 
 /* === Shuffle (32-bit) === */
 
 /* _mm256_shuffle_epi32: VPSHUFD - shuffle 32-bit ints within 128-bit lanes */
 #define _mm256_shuffle_epi32(__a, __imm) \
     ((__m256i)__builtin_ia32_pshufd256((__v8si)(__a), (int)(__imm)))
+#endif /* __AVX2__ */
 
 /* === Shift (16-bit) === */
 

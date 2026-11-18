@@ -958,7 +958,7 @@ impl X86Codegen {
     /// one instruction and one live register fewer per iteration.  GCC's byte
     /// clamp is exactly the folded form (`vpminub (%rsi,%rax), %ymm3, %ymm0`).
     ///
-    /// 128-bit loads join under `avx2_enabled`: the VEX.128 encoding of the
+    /// 128-bit loads join under `vex128()` (AVX1): the VEX.128 encoding of the
     /// consumer reads r/m128 with NO alignment requirement, exactly like the
     /// VEX.256 forms (the whole point of VEX). Legacy SSE memory operands
     /// would require 16-byte alignment the streamed objects do not carry, so
@@ -1046,20 +1046,20 @@ impl X86Codegen {
             IntrinsicOp::VecLoadI64x4 => ("vmovdqu", 32),
             // The 128-bit twins (VEX.128 forms are alignment-free, hence the
             // avx2 gate — see the doc comment above).
-            IntrinsicOp::VecLoadF64x2 if self.avx2_enabled => ("vmovupd", 16),
-            IntrinsicOp::VecLoadF32x4 if self.avx2_enabled => ("vmovups", 16),
+            IntrinsicOp::VecLoadF64x2 if self.vex128() => ("vmovupd", 16),
+            IntrinsicOp::VecLoadF32x4 if self.vex128() => ("vmovups", 16),
             IntrinsicOp::VecLoadI32x4
             | IntrinsicOp::VecLoadI64x2
             | IntrinsicOp::VecLoadI16x8
             | IntrinsicOp::VecLoadI8x16
-                if self.avx2_enabled =>
+                if self.vex128() =>
             {
                 ("vmovdqu", 16)
             }
             // User-facing raw-pointer loads. `Load256` keeps its aligned
             // mnemonic: the alignment requirement is the LOAD's, and a
             // memory operand inherits it unchanged. The 128-bit arm is
-            // inside the AVX2 gate for the same reason as its `VecLoad`
+            // inside the VEX.128 gate (`vex128`, AVX1) for the same reason as its `VecLoad`
             // twins (legacy-SSE `paddb m128` faults on an unaligned
             // stream). `Loadu512` is deliberately absent: the 512-bit
             // consumer side has no fold admission table yet.
@@ -1067,7 +1067,7 @@ impl X86Codegen {
             IntrinsicOp::LoaduPd256 => ("vmovupd", 32),
             IntrinsicOp::Loadu256 => ("vmovdqu", 32),
             IntrinsicOp::Load256 => ("vmovdqa", 32),
-            IntrinsicOp::Loaddqu if self.avx2_enabled => ("vmovdqu", 16),
+            IntrinsicOp::Loaddqu if self.vex128() => ("vmovdqu", 16),
             _ => return false,
         };
         if raw_ptr {
@@ -1538,7 +1538,7 @@ impl X86Codegen {
         //     instead of guessing.
         // Width-matched to 16: a foreign-width fold can never reach here
         // (the safety net materialises it first); this is defense.
-        if self.avx2_enabled {
+        if self.vex128() {
             if let Some(pf) = self.state.pending_vec_memfold.clone() {
                 if pf.width == 16 {
                     let at1 = matches!(&args[1], Operand::Value(v) if v.0 == pf.val);
@@ -1599,7 +1599,7 @@ impl X86Codegen {
                                 if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(a1.0) {
                                     self.state.pending_vec_store = None;
                                 }
-                                // VEX form under AVX2: the legacy 2-operand
+                                // VEX form under AVX: the legacy 2-operand
                                 // `op %src, %target` is SSE-encoded, and
                                 // mixing it with the VEX shift/load forms
                                 // in one loop pays a SSE→VEX transition
@@ -1607,7 +1607,7 @@ impl X86Codegen {
                                 // mixing follow-up). The non-destructive
                                 // encoding with dst == src1 is
                                 // semantically identical.
-                                if self.avx2_enabled {
+                                if self.vex128() {
                                     self.state.emit_fmt(format_args!(
                                         "    v{} %{}, %{}, %{}",
                                         sse_inst, src, target, target
@@ -1643,10 +1643,10 @@ impl X86Codegen {
                     if acc_same && fresh_held {
                         let held = self.state.sse_last_store_reg_name.unwrap_or("xmm0");
                         let target = phys_reg_name(dest_reg);
-                        // VEX form under AVX2 (same reasoning as the
+                        // VEX form under AVX (same reasoning as the
                         // in-place path above: no legacy/VEX mixing in
                         // one loop body).
-                        if self.avx2_enabled {
+                        if self.vex128() {
                             self.state.emit_fmt(format_args!(
                                 "    v{} %{}, %{}, %{}",
                                 sse_inst, held, target, target
@@ -1677,7 +1677,7 @@ impl X86Codegen {
         // allocation builds (ARX rounds, accumulator chains) lower
         // without any movdqa at all.  Operand order follows the legacy
         // contract: args[0] is src1, args[1] is src2 (sub: src1-src2).
-        if self.avx2_enabled {
+        if self.vex128() {
             let src1 = self.vex128_source(&args[0], "xmm0");
             let src2 = self.vex128_source(&args[1], "xmm1");
             let dst_home = self.dest_xmm_home_name(dest_ptr);
@@ -2259,7 +2259,7 @@ impl X86Codegen {
             } else {
                 self.state.emit("    vcmpps $0x1f, %ymm0, %ymm0, %ymm0");
             }
-        } else if self.avx2_enabled {
+        } else if self.vex128() {
             self.state.emit("    vpcmpeqd %xmm0, %xmm0, %xmm0");
         } else {
             self.state.emit("    pcmpeqd %xmm0, %xmm0");
@@ -2325,7 +2325,7 @@ impl X86Codegen {
         let label = self.state.get_vec_const_label(&bytes);
         // A 256-bit load is VEX-only: legacy `movdqa` cannot name a ymm
         // register, so the wide form is `vmovdqa` even under AVX1 alone.
-        let mnemonic = if wide || self.avx2_enabled {
+        let mnemonic = if wide || self.vex128() {
             "vmovdqa"
         } else {
             "movdqa"
@@ -6826,7 +6826,7 @@ impl X86Codegen {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 self.operand_to_reg(&args[0], "rax");
-                let prefix = if self.avx2_enabled { "v" } else { "" };
+                let prefix = if self.vex128() { "v" } else { "" };
                 self.state
                     .emit_fmt(format_args!("    {}movd %eax, %xmm0", prefix));
                 self.state
@@ -6851,7 +6851,7 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 let disp = Self::vec_disp_arg(args, 2);
                 let count = checked_vec_control(args.get(4), 3..=4, "widening byte count");
-                let prefix = if self.avx2_enabled { "v" } else { "" };
+                let prefix = if self.vex128() { "v" } else { "" };
                 if count == 4 {
                     let mem = self.vec_mem_operand(&args[0], &args[1], disp);
                     self.state
@@ -6869,7 +6869,7 @@ impl X86Codegen {
                         &args[1],
                         disp.checked_add(2).expect("widening displacement overflow"),
                     );
-                    if self.avx2_enabled {
+                    if self.vex128() {
                         self.state
                             .emit_fmt(format_args!("    vpinsrb $2, {}, %xmm0, %xmm0", mem));
                     } else {
@@ -6899,7 +6899,7 @@ impl X86Codegen {
                 // 8-byte fold would need width-8 pending machinery, and
                 // the half-wide shapes want the explicit pair load).
                 let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
-                let mnemonic = if self.avx2_enabled { "vmovq" } else { "movq" };
+                let mnemonic = if self.vex128() { "vmovq" } else { "movq" };
                 let mut loaded_home = false;
                 if let Some(d) = dest {
                     if let Some(&reg) = self.reg_assignments.get(&d.0) {
@@ -6940,7 +6940,7 @@ impl X86Codegen {
                 // Range proof belongs to the producer. In [0,255], signed
                 // dword->unsigned word and signed word->unsigned byte packing
                 // are exact, and byte-domain max commutes with narrowing.
-                if self.avx2_enabled {
+                if self.vex128() {
                     self.state.emit("    vpackusdw %xmm0, %xmm0, %xmm0");
                     self.state.emit("    vpackuswb %xmm0, %xmm0, %xmm0");
                 } else {
@@ -6957,7 +6957,7 @@ impl X86Codegen {
                     let mut mask: Vec<u8> = (0..16).collect();
                     mask[alpha] = lane as u8;
                     let label = self.state.get_vec_const_label(&mask);
-                    if self.avx2_enabled {
+                    if self.vex128() {
                         self.state
                             .emit_fmt(format_args!("    vpshufb {}(%rip), %xmm0, %xmm1", label));
                         self.state.emit("    vpmaxub %xmm1, %xmm0, %xmm0");
@@ -6968,7 +6968,7 @@ impl X86Codegen {
                         self.state.emit("    pmaxub %xmm1, %xmm0");
                     }
                 }
-                let mnemonic = if self.avx2_enabled { "vmovd" } else { "movd" };
+                let mnemonic = if self.vex128() { "vmovd" } else { "movd" };
                 if store {
                     self.emit_vec_store_addr(args, dest_ptr, mnemonic, "xmm0");
                 } else if let Some(d) = dest {
@@ -6984,7 +6984,7 @@ impl X86Codegen {
                 // I32x4-family web's value, read through the shared
                 // vec_store_source_128 path.
                 let src = self.vec_store_source_128(&args[0]);
-                let mnemonic = if self.avx2_enabled { "vmovq" } else { "movq" };
+                let mnemonic = if self.vex128() { "vmovq" } else { "movq" };
                 if src != "xmm0" {
                     if let Operand::Value(v) = &args[0] {
                         if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
@@ -8661,7 +8661,7 @@ impl X86Codegen {
                                 }
                             }
                         }
-                    } else if self.avx2_enabled {
+                    } else if self.vex128() {
                         let src = self.vex128_source(&args[0], "xmm0");
                         let dst_home = self.dest_xmm_home_name(d);
                         let dst = match dst_home {
@@ -8718,7 +8718,7 @@ impl X86Codegen {
                         "VecShufdI32x4 imm8 out of range: {imm}"
                     );
                     self.state.invalidate_vec_peephole();
-                    if self.avx2_enabled {
+                    if self.vex128() {
                         let src = self.vex128_source(&args[0], "xmm0");
                         let dst_home = self.dest_xmm_home_name(d);
                         let dst = match dst_home {
@@ -8760,7 +8760,7 @@ impl X86Codegen {
             IntrinsicOp::VecShufbI32x4 => {
                 if let Some(d) = dest {
                     self.state.invalidate_vec_peephole();
-                    if self.avx2_enabled {
+                    if self.vex128() {
                         let mask = self.vex128_source(&args[1], "xmm1");
                         let src = self.vex128_source(&args[0], "xmm0");
                         let dst_home = self.dest_xmm_home_name(d);
@@ -8973,7 +8973,7 @@ impl X86Codegen {
                     // when late VEX promotion is deliberately disabled.
                     let home = dest.and_then(|d| self.dest_xmm_home_name(&d));
                     let target = home.unwrap_or("xmm0");
-                    if self.avx2_enabled {
+                    if self.vex128() {
                         // This intrinsic owns its new home or scratch xmm0.
                         // Upper bits are dead: emit VEX at
                         // source instead of hoping a later text pass can
@@ -9158,7 +9158,7 @@ impl X86Codegen {
                 // from memory (`vmovddup SLOT, %xmmD`) — ONE instruction
                 // where the SSE staging paid movsd+unpcklpd+movdqa (and
                 // the staging copy `vmovsd %xmmN, %xmmN` was pure waste).
-                if self.avx2_enabled {
+                if self.vex128() {
                     if let Some(d) = dest {
                         let dst_home = self.dest_xmm_home_name(d);
                         let mut done = false;
@@ -11456,7 +11456,7 @@ impl X86Codegen {
     }
 
     /// Lane-wise signed dword min/max, 128-bit (`VecSminI32x4`/`VecSmaxI32x4`).
-    /// SSE4.1 `pminsd`/`pmaxsd` (the VEX form under AVX2 — memory-foldable
+    /// SSE4.1 `pminsd`/`pmaxsd` (the VEX form under AVX — memory-foldable
     /// through `emit_sse_binary_128`'s audited branch). x86 producers
     /// (the BB-SLP min/max fold) gate on SSE4.1 exactly like the loop
     /// vectorizer's dword min/max ("the SSE2 baseline lacks dword min/max
@@ -11533,7 +11533,7 @@ impl X86Codegen {
         // cache hit (the load below moves it aside).  Both operands are read
         // through registers only, so no slot can be observed stale.
         self.state.invalidate_vec_peephole();
-        if self.avx2_enabled {
+        if self.vex128() {
             // All-homed fast path: one instruction, no staging. A homed
             // destination may ALIAS a source home — the VEX form reads
             // every source before writing the destination. The homes are
@@ -11790,7 +11790,7 @@ impl X86Codegen {
             }
             self.state.vec_last_store_reg = false;
             self.avx_store_dest(dest);
-        } else if self.avx2_enabled {
+        } else if self.vex128() {
             // VEX.128: the same non-destructive three-operand forms on the
             // XMM file (`emit_vex_binary_128`'s source/commit discipline).
             // The qword forms need SSE4.2 (`pcmpgtq`), which VEX implies.
@@ -12341,7 +12341,7 @@ impl X86Codegen {
             "emit_sse_shift_imm_128: shift amount {amount} outside the defined range 1..={max_amount}"
         );
         self.state.invalidate_vec_peephole();
-        if self.avx2_enabled {
+        if self.vex128() {
             // NO VLFOLD here, ever: the VEX.128 immediate-shift encoding is
             // REGISTER-ONLY (the memory form exists solely under EVEX /
             // AVX-512 — see the ISA NOTE on `memfold_consumer_128`). The
@@ -12572,14 +12572,14 @@ impl X86Codegen {
                 bytes[i * 4..i * 4 + 4].copy_from_slice(&l.to_le_bytes());
             }
             let label = self.state.get_vec_const_label(&bytes);
-            // VEX.128 aligned load under AVX2+, the legacy aligned form on
+            // VEX.128 aligned load under AVX+, the legacy aligned form on
             // the SSE2 baseline — the pool's per-entry `.p2align 4`
             // satisfies both.  Dest-homed values load straight into their
             // home (zero staging); unhomed values stream through %xmm0
             // into the dest's slot exactly like the staging path's tail.
             match self.dest_xmm_home_name(dest) {
                 Some(name) => {
-                    if self.avx2_enabled {
+                    if self.vex128() {
                         self.state
                             .emit_fmt(format_args!("    vmovdqa {}(%rip), %{}", label, name));
                     } else {
@@ -12589,7 +12589,7 @@ impl X86Codegen {
                     self.sse_commit_dest_direct(dest, name);
                 }
                 None => {
-                    if self.avx2_enabled {
+                    if self.vex128() {
                         self.state
                             .emit_fmt(format_args!("    vmovdqa {}(%rip), %xmm0", label));
                     } else {

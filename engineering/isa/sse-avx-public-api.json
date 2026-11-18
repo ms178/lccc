@@ -6467,7 +6467,9 @@
       "generic_helpers": [],
       "header": "avx2intrin.h",
       "name": "_mm256_add_epi16",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_paddw256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -6655,15 +6657,12 @@
         "macro"
       ],
       "generic_helpers": [
-        "__lccc_simd256_ps_vblendps256"
+        "__lccc_simd256_i_vpblendd256"
       ],
       "header": "avx2intrin.h",
       "name": "_mm256_blend_epi32",
       "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm256_castps_si256",
-        "_mm256_castsi256_ps"
-      ]
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -8218,7 +8217,9 @@
       "generic_helpers": [],
       "header": "avx2intrin.h",
       "name": "_mm256_sub_epi16",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_psubw256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -8267,7 +8268,9 @@
       "generic_helpers": [],
       "header": "avx2intrin.h",
       "name": "_mm256_sub_epi8",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_psubb256"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -8501,6 +8504,23 @@
       "wrapper_dependencies": [
         "_mm256_castsi128_si256"
       ]
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_i_vpblendd128"
+      ],
+      "header": "avx2intrin.h",
+      "name": "_mm_blend_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
     },
     {
       "arities": [
@@ -16693,7 +16713,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 1012,
+  "declarations": 1013,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -19987,7 +20007,6 @@
     "_mm_avx512_undefined_ps",
     "_mm_avx512_undefined_si128",
     "_mm_bitshuffle_epi64_mask",
-    "_mm_blend_epi32",
     "_mm_broadcast_i32x2",
     "_mm_broadcastb_epi8",
     "_mm_broadcastd_epi32",
@@ -21901,5 +21920,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 1012
+  "unique_names": 1013
 }
