@@ -690,13 +690,13 @@ impl FileLiveness {
         };
         let mut i = 0;
         while i < len {
-            if infos[i].is_nop() || !infos[i].trimmed(store.get(i)).starts_with(".cfi_startproc") {
+            if !infos[i].is_cfi_start() {
                 i += 1;
                 continue;
             }
             let mut end = len;
             for n in i + 1..len {
-                if !infos[n].is_nop() && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc")
+                if infos[n].is_cfi_end()
                 {
                     end = n;
                     break;
@@ -845,19 +845,18 @@ impl FileLiveness {
             if infos[n].is_nop() {
                 continue;
             }
-            let t = infos[n].trimmed(store.get(n));
-            if t.starts_with(".cfi_startproc") {
+            if infos[n].is_cfi_start() {
                 start = Some(n);
                 break;
             }
-            if t.starts_with(".cfi_endproc") {
+            if infos[n].is_cfi_end() {
                 return;
             }
         }
         let Some(start) = start else { return };
         let mut end = len;
         for n in start + 1..len {
-            if !infos[n].is_nop() && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc") {
+            if infos[n].is_cfi_end() {
                 end = n;
                 break;
             }
@@ -1604,7 +1603,7 @@ impl FileLiveness {
             let info = &infos[k];
             let t = info.trimmed(store.get(k));
             if super::helpers::steps_over_line(info, t) {
-                if !info.is_nop() && t.starts_with(".cfi_startproc") {
+                if info.is_cfi_start() {
                     return true; // the entry: argument upper halves unspecified
                 }
                 continue;

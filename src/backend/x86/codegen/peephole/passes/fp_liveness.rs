@@ -154,9 +154,10 @@ impl FpLiveness {
                 i += 1;
                 continue;
             }
-            let t = infos[i].trimmed(store.get(i));
-            let is_start = t.starts_with(".cfi_startproc")
-                || t.starts_with(".type ") && t.trim_end().ends_with("@function");
+            let is_start = infos[i].is_cfi_start() || {
+                let t = infos[i].trimmed(store.get(i));
+                t.starts_with(".type ") && t.trim_end().ends_with("@function")
+            };
             if !is_start {
                 i += 1;
                 continue;
@@ -168,8 +169,7 @@ impl FpLiveness {
                 if infos[n].is_nop() || infos[n].kind != LineKind::Directive {
                     continue;
                 }
-                let tn = infos[n].trimmed(store.get(n));
-                if tn.starts_with(".cfi_endproc") || tn.starts_with(".size ") {
+                if infos[n].is_cfi_end() || infos[n].trimmed(store.get(n)).starts_with(".size ") {
                     end = n;
                     break;
                 }

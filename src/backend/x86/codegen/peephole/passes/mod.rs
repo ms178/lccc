@@ -299,19 +299,19 @@ fn pin_param_abi_reads(store: &LineStore, infos: &mut [LineInfo]) {
 fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     let mut volatile_slots: Vec<(u8, i32)> = Vec::new();
     for i in 0..store.len() {
-        let trimmed = infos[i].trimmed(store.get(i));
         // Function boundary: volatile markers are function-local.
-        if trimmed.starts_with(".cfi_startproc") {
+        if infos[i].cfi == CfiMark::Start {
             volatile_slots.clear();
             continue;
         }
+        let trimmed = infos[i].trimmed(store.get(i));
         if let Some(slot_text) = trimmed.strip_prefix("# LCCC_VOLATILE_SLOT ") {
             if let Some(slot) = direct_stack_slot(slot_text) {
                 volatile_slots.push(slot);
             }
             continue;
         }
-        if trimmed.starts_with(".cfi_endproc") {
+        if infos[i].cfi == CfiMark::End {
             volatile_slots.clear();
             continue;
         }
@@ -397,9 +397,7 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     // unwind info disabled): fall back to the translation-unit-wide scan.
     // The cross-function bleed this avoids is impossible to scope without
     // boundaries, and such TUs contain at most one emitted function.
-    let has_any_startproc = (0..store.len()).any(|k| {
-        !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_startproc")
-    });
+    let has_any_startproc = (0..store.len()).any(|k| infos[k].is_cfi_start());
     if !has_any_startproc {
         pin_address_taken_global(store, infos);
         return;
@@ -407,22 +405,14 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     let mut start = 0;
     while start < store.len() {
         // Find the next .cfi_startproc.
-        while start < store.len()
-            && !infos[start]
-                .trimmed(store.get(start))
-                .starts_with(".cfi_startproc")
-        {
+        while start < store.len() && infos[start].cfi != CfiMark::Start {
             start += 1;
         }
         if start >= store.len() {
             break;
         }
         let mut end = start + 1;
-        while end < store.len()
-            && !infos[end]
-                .trimmed(store.get(end))
-                .starts_with(".cfi_endproc")
-        {
+        while end < store.len() && infos[end].cfi != CfiMark::End {
             end += 1;
         }
         let slot_of = |k: usize| -> Option<(u8, i32)> {
@@ -718,11 +708,11 @@ fn peephole_optimize_inner(
     {
         let mut in_prologue = false;
         for idx in 0..line_count {
-            let trimmed = infos[idx].trimmed(store.get(idx));
-            if trimmed.starts_with(".cfi_startproc") {
+            if infos[idx].cfi == CfiMark::Start {
                 in_prologue = true;
                 continue;
             }
+            let trimmed = infos[idx].trimmed(store.get(idx));
             if !in_prologue {
                 continue;
             }

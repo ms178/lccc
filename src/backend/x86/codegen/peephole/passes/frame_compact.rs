@@ -624,7 +624,7 @@ fn fpo_prologue_pushes(store: &LineStore, infos: &[LineInfo], at: usize) -> Opti
         p -= 1;
         let line = infos[p].trimmed(store.get(p));
         if super::helpers::steps_over_line(&infos[p], line) {
-            if line.starts_with(".cfi_startproc") {
+            if infos[p].is_cfi_start() {
                 return Some((p, pushes));
             }
             continue;

@@ -370,13 +370,13 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
     let len = store.len();
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || !infos[i].trimmed(store.get(i)).starts_with(".cfi_startproc") {
+        if !infos[i].is_cfi_start() {
             i += 1;
             continue;
         }
         let func_end = (i + 1..len)
             .find(|&k| {
-                !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_endproc")
+                infos[k].is_cfi_end()
             })
             .unwrap_or(len);
         fpo_function(store, infos, i, func_end);
@@ -695,7 +695,7 @@ fn collapse_superseded_cfa(
         }
         // Only CFI bookkeeping is address-neutral: an alignment directive
         // pads, so CFA lines on either side of it are distinct rows.
-        if !line.starts_with(".cfi_") {
+        if infos[k].cfi == CfiMark::None {
             pending = None;
             at_entry = false;
         }
@@ -787,13 +787,13 @@ pub(super) fn rename_saved_values_into_free_scratch(
     let mut lv: Option<FileLiveness> = None;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || !infos[i].trimmed(store.get(i)).starts_with(".cfi_startproc") {
+        if !infos[i].is_cfi_start() {
             i += 1;
             continue;
         }
         let end = (i + 1..len)
             .find(|&k| {
-                !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_endproc")
+                infos[k].is_cfi_end()
             })
             .unwrap_or(len);
         rename_in_function(store, infos, i, end, &mut lv, &mut out);
@@ -883,7 +883,7 @@ fn rename_in_function(
             match infos[k].kind {
                 LineKind::Pop { reg } if reg == fam && fpo_epilogue_pop(store, infos, k, end) => {}
                 LineKind::Push { .. } | LineKind::Pop { .. } => legal = false,
-                LineKind::Directive if t.starts_with(".cfi_") => {}
+                LineKind::Directive if infos[k].cfi != CfiMark::None => {}
                 LineKind::Directive | LineKind::Label => legal = false,
                 _ if HIGH_BYTES.iter().any(|h| t.contains(h)) => legal = false,
                 _ => body.push(k),

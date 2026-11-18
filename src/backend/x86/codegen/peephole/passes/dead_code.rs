@@ -1081,7 +1081,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         found_cfi = true;
                         break;
                     }
-                    if dl.starts_with(".cfi_") {
+                    if infos[k].cfi != CfiMark::None {
                         continue;
                     }
                     break;
@@ -1099,10 +1099,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             // class would step the prologue walk over any directive, including a
             // `.long` that emits instructions, and the callee-save scan below would
             // then start inside data.  // DIRECTIVE-LAW: selecting
-            if j < len
-                && infos[j].kind == LineKind::Directive
-                && infos[j].trimmed(store.get(j)).starts_with(".cfi_")
-            {
+            if j < len && infos[j].is_cfi_dir() {
                 j = next_non_nop(infos, j + 1, len);
             }
             let mut callee_save_end = j;

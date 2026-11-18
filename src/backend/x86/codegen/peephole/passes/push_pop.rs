@@ -408,7 +408,9 @@ fn matching_scratch_pop(
             // Inert directives (`.loc`, alignment hints) emit nothing the
             // span could observe. CFI is inert for windows but not here: an
             // adjustment inside the span describes the push being removed.
-            LineKind::Directive if !infos[k].inert_dir || t.starts_with(".cfi_") => return None,
+            LineKind::Directive if !infos[k].inert_dir || infos[k].cfi != CfiMark::None => {
+                return None
+            }
             _ => {
                 // Any stack-pointer dependence, textual or architectural --
                 // `leave`/`enter`/`pushf` name no register, so a text-only test
@@ -441,8 +443,7 @@ fn cfi_follows(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
             !infos[k].is_nop()
                 && !infos[k].is_unwind_inert_directive(infos[k].trimmed(store.get(k)))
         })
-        .map(|k| infos[k].trimmed(store.get(k)))
-        .is_some_and(|t| t.starts_with(".cfi_") && !t.starts_with(".cfi_endproc"))
+        .is_some_and(|k| matches!(infos[k].cfi, CfiMark::Start | CfiMark::Other))
 }
 
 #[cfg(test)]

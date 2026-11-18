@@ -35,6 +35,36 @@ pub(super) const VEC_FAMILY_BASE: RegId = 24;
 /// Sentinel value for `rbp_offset` meaning "no %rbp reference" or "multiple/complex references".
 pub(super) const RBP_OFFSET_NONE: i32 = i32::MIN;
 
+/// Pre-decoded function-boundary marker for `LineKind::Directive` lines.
+///
+/// `.cfi_startproc` / `.cfi_endproc` delimit every function the peephole
+/// reasons about, and more than forty scan sites (function discovery in
+/// `FileLiveness::new`, `function_range`, `CfiIndex::build`, the prologue
+/// walkers, ...) used to re-derive the answer with
+/// `trimmed(store.get(n)).starts_with(".cfi_startproc")` — a text fetch, a
+/// slice and a `memcmp` per line per pass per iteration.  Callgrind on a
+/// 40-function mixed TU attributed 1.77 M `starts_with` calls to
+/// `FileLiveness::new` alone.  Decoding the mark once in `classify_line`
+/// turns every one of those probes into a one-byte integer compare.
+///
+/// The decode uses the same predicate the scan sites used
+/// (`starts_with(".cfi_startproc")` on the comment-free trimmed text), so a
+/// directive with arguments (`.cfi_startproc simple`) classifies exactly as
+/// before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum CfiMark {
+    /// Not a `.cfi_*` directive (including every non-directive line).
+    None,
+    /// `.cfi_startproc`
+    Start,
+    /// `.cfi_endproc`
+    End,
+    /// Any other `.cfi_*` directive (`.cfi_def_cfa_offset`, `.cfi_offset`,
+    /// ...): the unwind-bookkeeping lines several passes must step over or
+    /// refuse, previously re-identified with `starts_with(".cfi_")`.
+    Other,
+}
+
 /// Compact classification of a single assembly line.
 /// Stored in a parallel array alongside the raw text, so hot loops
 /// can check integer fields instead of re-parsing strings.
@@ -82,6 +112,11 @@ pub(super) struct LineInfo {
     /// direct load-to-ALU fold may also transfer this protection to its single
     /// surviving read after proving equal width and a dead load temporary.
     pub(super) volatile_access: bool,
+    /// For `LineKind::Directive` only: whether this line is a
+    /// `.cfi_startproc` / `.cfi_endproc` function boundary.  Decoded once at
+    /// classification so function discovery is an integer scan (see
+    /// [`CfiMark`]).
+    pub(super) cfi: CfiMark,
 }
 
 /// What kind of assembly line this is, with pre-extracted fields for the
@@ -266,6 +301,29 @@ impl LineInfo {
     pub(super) fn is_nop(self) -> bool {
         self.kind == LineKind::Nop
     }
+
+    /// True for a live (non-nop) `.cfi_startproc` line.  The nop check is
+    /// folded in because every converted scan site paired the two tests; a
+    /// deleted line must never open a function.
+    #[inline]
+    pub(super) fn is_cfi_start(self) -> bool {
+        self.cfi == CfiMark::Start && self.kind != LineKind::Nop
+    }
+
+    /// True for a live (non-nop) `.cfi_endproc` line (see [`is_cfi_start`]).
+    ///
+    /// [`is_cfi_start`]: LineInfo::is_cfi_start
+    #[inline]
+    pub(super) fn is_cfi_end(self) -> bool {
+        self.cfi == CfiMark::End && self.kind != LineKind::Nop
+    }
+
+    /// True for a live line of the `.cfi_*` directive family (the integer
+    /// form of `trimmed(..).starts_with(".cfi_")`).
+    #[inline]
+    pub(super) fn is_cfi_dir(self) -> bool {
+        self.cfi != CfiMark::None && self.kind != LineKind::Nop
+    }
     /// True when a locality window may step over this line entirely: a nop or an
     /// inert directive. The "next real instruction" walkers use it, so a line a
     /// window may not span is also a line they may not skip on the way to the
@@ -395,6 +453,7 @@ pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -422,6 +481,7 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -461,6 +521,7 @@ pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) ->
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -510,6 +571,7 @@ pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> Lin
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -526,6 +588,7 @@ pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -533,6 +596,21 @@ pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
 fn directive_line_info(text: &str, ts: u16) -> LineInfo {
     let mut info = line_info(LineKind::Directive, ts);
     info.inert_dir = crate::backend::peephole_common::inert_directive(text);
+    // Same predicate the per-pass scans used before the mark existed: a
+    // prefix match on the comment-free trimmed text, so `.cfi_startproc
+    // simple` still opens a function.  `.cfi_endproc` has no argument form,
+    // but the prefix match keeps the conversion observationally exact.
+    info.cfi = if let Some(rest) = text.strip_prefix(".cfi_") {
+        if rest.starts_with("startproc") {
+            CfiMark::Start
+        } else if rest.starts_with("endproc") {
+            CfiMark::End
+        } else {
+            CfiMark::Other
+        }
+    } else {
+        CfiMark::None
+    };
     info
 }
 
@@ -617,6 +695,7 @@ pub(super) fn opaque_line_info(ts: u16) -> LineInfo {
         // `LineKind::Directive`, and false is the fail-closed value.
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -790,6 +869,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
                 pinned: false,
                 inert_dir: false,
                 volatile_access: false,
+                cfi: CfiMark::None,
             };
         }
     }
@@ -948,6 +1028,7 @@ fn classify_other_line_info(s: &str, sb: &[u8], first: u8, ts: u16) -> LineInfo 
             && (s.contains("@TLSDESC") || s.contains("@tlsdesc")),
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -1471,6 +1552,7 @@ pub(super) fn mark_nop(info: &mut LineInfo) {
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     };
 }
 

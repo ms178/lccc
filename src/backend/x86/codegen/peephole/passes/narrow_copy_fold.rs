@@ -571,10 +571,10 @@ fn loop_latch_increment_bounds_identity(
         if infos[k].is_nop() {
             continue;
         }
-        let text = infos[k].trimmed(store.get(k));
-        if text.starts_with(".cfi_startproc") {
+        if infos[k].is_cfi_start() {
             return false;
         }
+        let text = infos[k].trimmed(store.get(k));
         match infos[k].kind {
             LineKind::Label => {
                 let name = text.strip_suffix(':').unwrap_or(text);
@@ -1640,6 +1640,7 @@ mod inline_asm_tests {
                     pinned: true,
                     inert_dir: false,
                     volatile_access: false,
+                    cfi: CfiMark::None,
                 };
             }
         }

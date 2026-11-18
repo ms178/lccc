@@ -20,22 +20,18 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut rdx_dead_at_ret = false;
     for a in 0..infos.len() {
         if !infos[a].is_nop() {
-            let t = infos[a].trimmed(store.get(a));
-            if t.starts_with(".cfi_startproc") {
+            if infos[a].is_cfi_start() {
                 // Bound the marker scan by this function's `.cfi_endproc`
                 // (as `FileLiveness` does). Defence in depth: the scan also
                 // stops at the first `ret`, which any matching function has.
                 let end = (a + 1..infos.len())
-                    .find(|&n| {
-                        !infos[n].is_nop()
-                            && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc")
-                    })
+                    .find(|&n| infos[n].is_cfi_end())
                     .unwrap_or(infos.len());
                 rdx_dead_at_ret =
                     FileLiveness::ret_rdx_marker(store, infos, a + 1, end) == Some(false);
                 continue;
             }
-            if t.starts_with(".cfi_endproc") {
+            if infos[a].is_cfi_end() {
                 rdx_dead_at_ret = false;
                 continue;
             }

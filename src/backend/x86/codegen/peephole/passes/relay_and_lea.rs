@@ -422,12 +422,11 @@ pub(super) fn function_range(
         if infos[n].is_nop() {
             continue;
         }
-        let t = infos[n].trimmed(store.get(n));
-        if t.starts_with(".cfi_startproc") {
+        if infos[n].is_cfi_start() {
             start = Some(n);
             break;
         }
-        if t.starts_with(".cfi_endproc") {
+        if infos[n].is_cfi_end() {
             return None; // `idx` sits between two functions
         }
     }
@@ -435,7 +434,7 @@ pub(super) fn function_range(
     let mut end = len;
     let mut n = idx;
     while n < len {
-        if !infos[n].is_nop() && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc") {
+        if infos[n].is_cfi_end() {
             end = n;
             break;
         }
@@ -463,10 +462,9 @@ impl CfiIndex {
             if info.is_nop() {
                 continue;
             }
-            let t = info.trimmed(store.get(n));
-            if t.starts_with(".cfi_startproc") {
+            if info.is_cfi_start() {
                 marks.push((n, true));
-            } else if t.starts_with(".cfi_endproc") {
+            } else if info.is_cfi_end() {
                 marks.push((n, false));
             }
         }

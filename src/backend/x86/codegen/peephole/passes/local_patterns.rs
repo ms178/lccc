@@ -550,16 +550,16 @@ pub(super) fn forward_adjacent_ymm_self_reloads(
             if infos[i].is_nop() {
                 continue;
             }
-            let t = infos[i].trimmed(store.get(i));
-            if t.starts_with(".cfi_startproc") {
+            if infos[i].is_cfi_start() {
                 region_hazard.push(false);
                 cur = (region_hazard.len() - 1) as u32;
             }
             region_of[i] = cur;
+            let t = infos[i].trimmed(store.get(i));
             if t.contains("%zmm") || t.contains("vzeroall") || t.contains("xsave") {
                 region_hazard[cur as usize] = true;
             }
-            if t.starts_with(".cfi_endproc") {
+            if infos[i].is_cfi_end() {
                 region_hazard.push(true); // gap region: fail closed
                 cur = (region_hazard.len() - 1) as u32;
             }
@@ -736,7 +736,7 @@ pub(super) fn delete_dead_vector_epilogue_stores(
             // Directives do not execute; only the function-end marker
             // matters (reached without `ret`: refuse).
             if infos[j].kind == LineKind::Directive {
-                if infos[j].trimmed(store.get(j)).starts_with(".cfi_endproc") {
+                if infos[j].cfi == CfiMark::End {
                     continue 'cand;
                 }
                 j += 1;

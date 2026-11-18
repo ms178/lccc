@@ -644,6 +644,7 @@ mod tests {
                     pinned: true,
                     inert_dir: false,
                     volatile_access: false,
+                    cfi: CfiMark::None,
                 };
             }
         }

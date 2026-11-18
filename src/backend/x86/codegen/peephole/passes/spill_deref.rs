@@ -51,10 +51,10 @@ use super::helpers::*;
 fn rbp_is_frame_at(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
     let mut j = idx;
     loop {
-        let trimmed = infos[j].trimmed(store.get(j));
-        if trimmed.starts_with(".cfi_startproc") {
+        if infos[j].cfi == CfiMark::Start && !infos[j].is_nop() {
             return false;
         }
+        let trimmed = infos[j].trimmed(store.get(j));
         if trimmed == "movq %rsp, %rbp" || trimmed == "movl %esp, %ebp" {
             return true;
         }
@@ -716,10 +716,9 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
         if infos[k].is_nop() {
             continue;
         }
-        let t = infos[k].trimmed(store.get(k));
-        if t.starts_with(".cfi_startproc") && start.is_none() {
+        if infos[k].is_cfi_start() && start.is_none() {
             start = Some(k);
-        } else if t.starts_with(".size ") {
+        } else if infos[k].trimmed(store.get(k)).starts_with(".size ") {
             if let Some(s) = start.take() {
                 funcs.push((s, k));
             }
@@ -742,7 +741,7 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 rbp_frame = true;
                 break;
             }
-            if t.starts_with(".cfi_endproc")
+            if infos[k].is_cfi_end()
                 || t.starts_with(".size ")
                 || infos[k].kind == LineKind::Ret
             {
