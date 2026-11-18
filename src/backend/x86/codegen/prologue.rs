@@ -3419,6 +3419,17 @@ impl X86Codegen {
         ));
     }
 
+    /// The `# LCCC_VEX_LEGAL 1` marker: this function may be encoded with VEX
+    /// (AVX1) instructions.  It is written only when the per-function ISA
+    /// (`avx_enabled`) permits VEX, and the late text peephole's legacy-to-VEX
+    /// promotion (`vex_promote`) reads it.  Absence fails closed: SSE2-only
+    /// code, naked functions and thunks keep their legacy encodings.
+    fn emit_vex_legal_marker(&mut self) {
+        if self.avx_enabled {
+            self.state.emit("    # LCCC_VEX_LEGAL 1");
+        }
+    }
+
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
         // The document buffer is shared by every function in the module, so the
         // huge-frame anchor is re-decided here rather than inherited.
@@ -3623,6 +3634,7 @@ impl X86Codegen {
             .emit_fmt(format_args!("    # LCCC_RET_XMM_BITS {}", ret_xmm_bits));
 
         self.emit_gp_return_liveness_markers(func, vector_ret_in_xmm0);
+        self.emit_vex_legal_marker();
 
         if func.is_variadic
             && func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64

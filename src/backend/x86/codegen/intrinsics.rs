@@ -1538,7 +1538,7 @@ impl X86Codegen {
         //     instead of guessing.
         // Width-matched to 16: a foreign-width fold can never reach here
         // (the safety net materialises it first); this is defense.
-        if self.avx2_enabled {
+        if self.avx_enabled {
             if let Some(pf) = self.state.pending_vec_memfold.clone() {
                 if pf.width == 16 {
                     let at1 = matches!(&args[1], Operand::Value(v) if v.0 == pf.val);
@@ -1607,7 +1607,7 @@ impl X86Codegen {
                                 // mixing follow-up). The non-destructive
                                 // encoding with dst == src1 is
                                 // semantically identical.
-                                if self.avx2_enabled {
+                                if self.avx_enabled {
                                     self.state.emit_fmt(format_args!(
                                         "    v{} %{}, %{}, %{}",
                                         sse_inst, src, target, target
@@ -1646,7 +1646,7 @@ impl X86Codegen {
                         // VEX form under AVX2 (same reasoning as the
                         // in-place path above: no legacy/VEX mixing in
                         // one loop body).
-                        if self.avx2_enabled {
+                        if self.avx_enabled {
                             self.state.emit_fmt(format_args!(
                                 "    v{} %{}, %{}, %{}",
                                 sse_inst, held, target, target
@@ -1677,7 +1677,7 @@ impl X86Codegen {
         // allocation builds (ARX rounds, accumulator chains) lower
         // without any movdqa at all.  Operand order follows the legacy
         // contract: args[0] is src1, args[1] is src2 (sub: src1-src2).
-        if self.avx2_enabled {
+        if self.avx_enabled {
             let src1 = self.vex128_source(&args[0], "xmm0");
             let src2 = self.vex128_source(&args[1], "xmm1");
             let dst_home = self.dest_xmm_home_name(dest_ptr);
@@ -12630,7 +12630,13 @@ impl X86Codegen {
         self.state.emit("    movd %ecx, %xmm1");
         self.state.emit("    punpckldq %xmm1, %xmm0"); // xmm0 = [x0, x1, ..]
         self.operand_to_reg(&args[2], "rax");
+        // Lanes 2 and 3 share one 64-bit GPR. `operand_to_reg` sign-extends
+        // a stored i32 into all 64 bits, so a negative lane 2 would fill the
+        // high dword with ones and corrupt lane 3 in the OR. `movl %eax,
+        // %eax` zero-extends lane 2 to exactly its 32 bits.
+        self.state.emit("    movl %eax, %eax");
         self.operand_to_reg(&args[3], "rcx");
+        self.state.emit("    movl %ecx, %ecx");
         self.state.emit("    shlq $32, %rcx");
         self.state.emit("    orq %rcx, %rax"); // rax = x2 | (x3 << 32)
         self.state.emit("    movq %rax, %xmm1"); // xmm1 = [x2, x3, 0, 0]

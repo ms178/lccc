@@ -35,8 +35,16 @@
 //! upper half, and that is only observable if the function *reads*
 //! `%ymmN` after writing `%xmmN` legacy-style.  Rules:
 //!
-//! 1. Only functions that mention `%ymm` at all are touched (no 256-bit use
-//!    → no dirty state → legacy encodings are shorter and cost nothing).
+//! 1. Only functions whose prologue carries `# LCCC_VEX_LEGAL 1` (the emitter
+//!    writes it exactly when the per-function ISA permits AVX), or that
+//!    mention `%ymm`, are touched.  SSE2-only functions, naked functions and
+//!    thunks carry no marker and keep their legacy encodings: no VEX can
+//!    reach a non-AVX target.  A marked function without any `%ymm` is
+//!    promoted for encoding parity with GCC 16.2, which emits such code
+//!    entirely in VEX under `-mavx`.  The rewrite is exact for bits 127:0.
+//!    Bits 255:128 are unobservable only where no live upper state reaches a
+//!    callee or a later reader; rule 2 and the external-jump model below
+//!    enforce that per instruction.
 //! 2. An instruction whose destination is `%xmmN` is rewritten only if no
 //!    *control-flow-reachable* later line reads `%ymmN`.  Reachability is
 //!    computed over the emitted text: labels, fall-through, `jmp`/`jcc`
@@ -533,8 +541,11 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
     allowed
 }
 
-/// Promote legacy SSE to VEX in every function that uses `%ymm`.  Returns
-/// the number of rewritten lines.
+/// Prologue marker written by the emitter for every VEX-legal function.
+pub(crate) const VEX_LEGAL_MARKER: &str = "# LCCC_VEX_LEGAL 1";
+
+/// Promote legacy SSE to VEX in every function that uses `%ymm` or whose
+/// prologue marks it VEX-legal.  Returns the number of rewritten lines.
 pub fn promote_legacy_sse_to_vex(asm: &mut String) -> usize {
     let lines: Vec<&str> = asm.split_inclusive('\n').collect();
     // Function ranges: [start, end) line indices.
@@ -566,7 +577,13 @@ pub fn promote_legacy_sse_to_vex(asm: &mut String) -> usize {
                 has_asm = true;
             }
         }
-        if ymm_used == 0 || has_asm {
+        // A function that emitted no `%ymm` is still promoted when its
+        // prologue marks it VEX-legal (`# LCCC_VEX_LEGAL 1`, written from the
+        // same per-function ISA that gates the emitters).  The marker is the
+        // only evidence that VEX is legal here: SSE2-only code, naked
+        // functions and thunks carry none and keep their legacy encodings.
+        let vex_legal = body.iter().any(|l| l.trim() == VEX_LEGAL_MARKER);
+        if (ymm_used == 0 && !vex_legal) || has_asm {
             for l in body {
                 out.push_str(l);
             }
@@ -603,6 +620,51 @@ mod tests {
         let mut s = src.to_string();
         let n = promote_legacy_sse_to_vex(&mut s);
         (s, n)
+    }
+
+    /// The marker text the emitter writes (prologue.rs) must be the exact
+    /// line this pass matches; a drift would silently disable the promotion.
+    #[test]
+    fn vex_legal_marker_matches_emitter_text() {
+        assert_eq!(VEX_LEGAL_MARKER, "# LCCC_VEX_LEGAL 1");
+    }
+
+    #[test]
+    fn vex_legal_function_without_ymm_is_promoted() {
+        let src = format!(
+            "f:\n    {VEX_LEGAL_MARKER}\n    movss (%rdi), %xmm0\n    addss %xmm1, %xmm0\n    ret\n"
+        );
+        let (out, n) = run(&src);
+        assert!(n > 0, "marked function must be promoted: {out}");
+        assert!(out.contains("vmovss (%rdi), %xmm0"), "{out}");
+        assert!(out.contains("vaddss %xmm1, %xmm0, %xmm0"), "{out}");
+        assert!(
+            !out.contains("\n    addss"),
+            "no legacy add may remain: {out}"
+        );
+    }
+
+    /// Fail-closed: without the marker, a function that mentions no %ymm is
+    /// byte-identical after the pass (SSE2-only code, naked functions,
+    /// thunks).
+    #[test]
+    fn unmarked_function_without_ymm_keeps_legacy_encoding() {
+        let src = "f:\n    movss (%rdi), %xmm0\n    addss %xmm1, %xmm0\n    ret\n";
+        let (out, n) = run(src);
+        assert_eq!(n, 0, "{out}");
+        assert_eq!(out, src);
+    }
+
+    /// Inline asm wins over the marker: an `#APP` region is opaque, so the
+    /// whole function is left alone even when it carries the marker.
+    #[test]
+    fn vex_legal_function_with_inline_asm_is_not_rewritten() {
+        let src = format!(
+            "f:\n    {VEX_LEGAL_MARKER}\n    #APP\n    nop\n    #NO_APP\n    addss %xmm1, %xmm0\n    ret\n"
+        );
+        let (out, n) = run(&src);
+        assert_eq!(n, 0, "{out}");
+        assert_eq!(out, src);
     }
 
     #[test]
