@@ -350,8 +350,9 @@ fn label_uses(store: &LineStore, infos: &[LineInfo]) -> (FxHashSet<u32>, FxHashS
 }
 
 /// The identity of the section an `Enter`/`Push` switch selects: the name GAS
-/// keys the section by, with the flag/type/align arguments dropped (they do not
-/// make it a different section) and the bare forms spelled the way `.section`
+/// keys an ordinary section by, with flag/type/align arguments dropped.
+/// A group, explicit unique ID or subsection cannot be collapsed to a name.
+/// The bare forms are spelled the way `.section`
 /// spells them, so `.text` and `.section .text,"ax",@progbits` compare equal —
 /// which matters because the emitter uses both for one section (a bare `.text`
 /// in `ipa_ra`'s hot/cold text against `EmitState::restore_current_text_section`
@@ -369,7 +370,15 @@ fn section_identity(text: &str) -> Option<&str> {
     let end = stmt.find(char::is_whitespace).unwrap_or(stmt.len());
     match &stmt[..end] {
         "section" | "pushsection" => {
-            let ident = stmt[end..].trim_start().split(',').next()?.trim();
+            let mut parts = stmt[end..].trim_start().split(',').map(str::trim);
+            let ident = parts.next()?;
+            if let Some(flags) = parts.next() {
+                // `.pushsection name, subsection, ...` is also legal GAS.
+                let flags = flags.strip_prefix('"')?.strip_suffix('"')?;
+                if flags.contains(['G', '?']) || parts.any(|p| p == "unique") {
+                    return None;
+                }
+            }
             (ident.starts_with('.') && !ident.contains(char::is_whitespace)).then_some(ident)
         }
         // The bare forms GAS accepts — measured on binutils 2.47 `as`, which
@@ -462,7 +471,7 @@ fn may_switch_section(s: &str) -> bool {
     matches!(
         s.trim_start().as_bytes().get(1),
         Some(b't' | b'd' | b'b' | b's' | b'p')
-    )
+    ) || s.contains(';')
 }
 
 /// Directives that can move the next bytes somewhere this scan cannot follow
@@ -479,27 +488,29 @@ fn section_proof_ends(s: &str) -> bool {
         .split(|c: char| c.is_whitespace() || c == ',')
         .next()
         .unwrap_or("");
-    matches!(
-        name,
-        "if" | "ifdef"
-            | "ifndef"
-            | "elseif"
-            | "else"
-            | "endif"
-            | "macro"
-            | "endm"
-            | "rept"
-            | "irp"
-            | "irpc"
-            | "altmacro"
-            | "subsection"
-            | "code16"
-            | "code32"
-            | "code64"
-            | "intel_syntax"
-            | "att_syntax"
-            | "arch"
-    )
+    name.starts_with("if")
+        || matches!(
+            name,
+            "elseif"
+                | "else"
+                | "endif"
+                | "macro"
+                | "endm"
+                | "rept"
+                | "irp"
+                | "irpc"
+                | "endr"
+                | "include"
+                | "altmacro"
+                | "subsection"
+                | "code16"
+                | "code16gcc"
+                | "code32"
+                | "code64"
+                | "intel_syntax"
+                | "att_syntax"
+                | "arch"
+        )
 }
 
 /// Delete the relays [`thread_function`] orphaned: a run of unreferenced,
@@ -691,6 +702,8 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 && let Some(switch) = section_switch(s)
             {
                 section.apply(switch, s);
+            } else if section_proof_ends(s) {
+                section.forget();
             }
         }
         // DIRECTIVE-LAW: selecting function-boundary markers, not skipping
@@ -1799,6 +1812,10 @@ mod tests {
             (".section", None),
             (".section text", None),
             (".section .text 1", None),
+            (".pushsection .text,1,\"ax\",@progbits", None),
+            (".section .text,\"axG\",@progbits,grp,comdat", None),
+            (".section .text,\"ax?\",@progbits", None),
+            (".section .text,\"ax\",@progbits,unique,7", None),
             (".quad .LBB1", None),
             (".align 4", None),
             (".rodata", None),
@@ -1832,6 +1849,8 @@ mod tests {
             ".else",
             ".endif",
             ".ifdef X",
+            ".ifc 1,1",
+            ".include \"another.s\"",
             ".ifndef X",
             ".macro m",
             ".endm",

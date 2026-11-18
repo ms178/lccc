@@ -3104,7 +3104,9 @@ fn peephole_optimize_inner(
     // which pattern 3 cannot see because it compares the first label it finds),
     // and gcc-16 and clang emit none.  Last of the four so it also retires
     // anything the three above expose.
-    let _ = late_branch::eliminate_branch_to_next_label(&mut result);
+    if !sk("late_branch") {
+        let _ = late_branch::eliminate_branch_to_next_label(&mut result);
+    }
     result
 }
 
@@ -3405,6 +3407,17 @@ mod tests {
         assert_eq!((m.base, m.disp, m.sib), (b'b', 0, true));
         assert!(f("    movl (%rsi, %r11, 4), %eax").is_none());
         assert!(f("    movq %rax, %rbx").is_none());
+        for noncanonical in [
+            "(%rsp",
+            "%gs:8(%rsp)",
+            "010(%rsp)",
+            "2147483648(%rsp, %rax, 4)",
+        ] {
+            assert!(
+                f(&format!("movq {noncanonical}, %rax")).is_none(),
+                "{noncanonical}"
+            );
+        }
     }
 
     /// sha256_transform-shaped frame: a leaq floor for the w[] buffer at

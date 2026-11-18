@@ -465,11 +465,15 @@ fn rsp_delta_step(t: &str) -> Option<i64> {
         return Some(-8);
     }
     if let Some(rest) = t.strip_prefix("subq $") {
-        return rest.strip_suffix(", %rsp")?.parse::<i64>().ok();
+        return rest
+            .strip_suffix(", %rsp")?
+            .parse::<i32>()
+            .ok()
+            .map(i64::from);
     }
     if let Some(rest) = t.strip_prefix("addq $") {
-        let n = rest.strip_suffix(", %rsp")?.parse::<i64>().ok()?;
-        return Some(-n);
+        let n = rest.strip_suffix(", %rsp")?.parse::<i32>().ok()?;
+        return Some(-i64::from(n));
     }
     None
 }
@@ -480,12 +484,8 @@ fn rsp_delta_step(t: &str) -> Option<i64> {
 /// textual `disp(%rsp)` addresses canonical byte `disp - D` (e.g. after two
 /// pushes, `24(%rsp)` reads canonical slot 8). `%rbp`-relative operands are
 /// unaffected because the frame pointer never moves inside a function.
-fn canonical_frame_off(base: u8, off: i32, rsp_delta: i64) -> i32 {
-    if base == b's' && rsp_delta != 0 {
-        off - rsp_delta as i32
-    } else {
-        off
-    }
+fn canonical_frame_off(base: u8, off: i64, rsp_delta: i64) -> i64 {
+    if base == b's' { off - rsp_delta } else { off }
 }
 
 /// Effective byte range read by an SIB frame operand
@@ -514,7 +514,7 @@ fn sib_frame_read_range(
     use_idx: usize,
     line: &str,
     fm: FrameMem,
-) -> Option<(i32, i32)> {
+) -> Option<(i64, i64)> {
     // Parse "disp(%base,%idx,scale)".
     let lp = line.find('(')?;
     let rp = line[lp..].find(')')? + lp;
@@ -526,6 +526,9 @@ fn sib_frame_read_range(
         None | Some("") => 1,
         Some(s) => s.parse().ok()?,
     };
+    if !matches!(scale, 1 | 2 | 4 | 8) {
+        return None;
+    }
     let family = register_family_fast(idx);
     if family as usize > 15 {
         return None;
@@ -762,8 +765,9 @@ fn sib_frame_read_range(
     }
     let a = lower?;
 
-    let lo = fm.disp + a * scale;
-    let hi = fm.disp + b * scale + width;
+    let scaled = |index| i64::from(fm.disp) + i64::from(index) * i64::from(scale);
+    let lo = scaled(a);
+    let hi = scaled(b) + i64::from(width);
     if hi <= lo {
         return None;
     }
@@ -780,7 +784,7 @@ fn sib_frame_observation(
     infos: &[LineInfo],
     use_idx: usize,
     line: &str,
-) -> Option<(u8, i32, i32, bool)> {
+) -> Option<(u8, i64, i64, bool)> {
     let fm = parse_frame_mem(line)?;
     if !fm.sib {
         return None;
@@ -789,7 +793,7 @@ fn sib_frame_observation(
         return Some((fm.base, off, len, false));
     }
     if fm.disp >= 0 {
-        Some((fm.base, fm.disp, 0, true))
+        Some((fm.base, i64::from(fm.disp), 0, true))
     } else {
         None
     }
@@ -801,15 +805,17 @@ fn slot_is_ever_read(
     base: u8,
     offset: i32,
     store_bytes: i32,
-    read_ranges: &[(u8, i32, i32)],
-    read_floors: &[(u8, i32)],
+    read_ranges: &[(u8, i64, i64)],
+    read_floors: &[(u8, i64)],
 ) -> bool {
+    let lo = i64::from(offset);
+    let hi = lo + i64::from(store_bytes);
+    // The analysis does not establish a fixed relationship between frame
+    // bases. An observation on the other one cannot prove disjointness.
     read_ranges
         .iter()
-        .any(|&(rb, ro, rs)| rb == base && ranges_overlap(offset, store_bytes, ro, rs))
-        || read_floors
-            .iter()
-            .any(|&(rb, d)| rb == base && i64::from(offset) + i64::from(store_bytes) > i64::from(d))
+        .any(|&(rb, ro, rs)| rb != base || (lo < ro + rs && ro < hi))
+        || read_floors.iter().any(|&(rb, d)| rb != base || hi > d)
 }
 
 // Share the architectural read contract with FP slot liveness. A suffix or
@@ -1025,7 +1031,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             frame_base_escapes(store, infos, body_start, func_end, rbp_is_frame);
         // Base-tagged frame reads and unbounded-upward "floors" (escaped
         // addresses and SIB array accesses). Base: b'b' = %rbp, b's' = %rsp.
-        let mut read_ranges: Vec<(u8, i32, i32)> = Vec::new();
+        let mut read_ranges: Vec<(u8, i64, i64)> = Vec::new();
         // A floor at displacement D conservatively observes every frame
         // byte from D upward: an escaped `leaq D(%base)` pointer or an SIB
         // operand `D(%base,%idx,scale)` names an array whose element
@@ -1034,7 +1040,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // never relies on downward reach). Stores ending at or below D stay
         // deletable; this is what distinguishes the home-slot spills at
         // 16/32(%rsp) from a frame buffer based at 40(%rsp).
-        let mut read_floors: Vec<(u8, i32)> = Vec::new();
+        let mut read_floors: Vec<(u8, i64)> = Vec::new();
         // Stores proven to be the ONLY writers a plain slot load observes
         // (see `locally_covering_stores`): such a load is attributed to them
         // instead of being published as a function-wide read range.
@@ -1122,10 +1128,10 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     };
                     // Map a shifted-depth operand back to its canonical slot so
                     // it is compared against the canonical store offsets.
-                    let coff = canonical_frame_off(base, offset, rsp_delta);
+                    let coff = canonical_frame_off(base, i64::from(offset), rsp_delta);
                     match locally_covering_stores(store, infos, k, body_start, base, coff, width) {
                         Some(writers) => locally_read.extend(writers),
-                        None => read_ranges.push((base, coff, width)),
+                        None => read_ranges.push((base, coff, i64::from(width))),
                     }
                 }
                 LineKind::Other { .. } => {
@@ -1147,11 +1153,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                                 has_unparseable_indirect = true;
                                 break;
                             }
-                            let off = canonical_frame_off(fm.base, fm.disp, rsp_delta);
+                            let off = canonical_frame_off(fm.base, i64::from(fm.disp), rsp_delta);
                             read_floors.push((fm.base, off));
                         } else if rbp_off != RBP_OFFSET_NONE {
                             let base = frame_base(line, b's');
-                            let off = canonical_frame_off(base, rbp_off, rsp_delta);
+                            let off = canonical_frame_off(base, i64::from(rbp_off), rsp_delta);
                             read_floors.push((base, off));
                         }
                     } else if rbp_off != RBP_OFFSET_NONE {
@@ -1160,8 +1166,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        let off = canonical_frame_off(base, rbp_off, rsp_delta);
-                        read_ranges.push((base, off, width));
+                        let off = canonical_frame_off(base, i64::from(rbp_off), rsp_delta);
+                        read_ranges.push((base, off, i64::from(width)));
                     } else if let Some(fm) = parse_frame_mem(line) {
                         // Frame operand that was neither a leaq, a cached
                         // plain access, nor a provably bounded SIB: fail
@@ -1211,8 +1217,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        let off = canonical_frame_off(fm.base, fm.disp, rsp_delta);
-                        read_ranges.push((fm.base, off, width));
+                        let off = canonical_frame_off(fm.base, i64::from(fm.disp), rsp_delta);
+                        read_ranges.push((fm.base, off, i64::from(width)));
                     }
                 }
                 _ => {
@@ -1227,8 +1233,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        let off = canonical_frame_off(base, rbp_off, rsp_delta);
-                        read_ranges.push((base, off, width));
+                        let off = canonical_frame_off(base, i64::from(rbp_off), rsp_delta);
+                        read_ranges.push((base, off, i64::from(width)));
                     } else if let Some(fm) = parse_frame_mem(line) {
                         if fm.sib && rsp_delta != 0 {
                             has_unparseable_indirect = true;
@@ -1356,13 +1362,12 @@ fn locally_covering_stores(
     load: usize,
     body_start: usize,
     base: u8,
-    offset: i32,
+    lo: i64,
     bytes: i32,
 ) -> Option<Vec<usize>> {
     if !(1..=64).contains(&bytes) {
         return None;
     }
-    let lo = i64::from(offset);
     let hi = lo + i64::from(bytes);
     let mut uncovered: u64 = if bytes == 64 {
         u64::MAX
@@ -1569,7 +1574,17 @@ fn step_rsp_depth(
             return false;
         }
         match rsp_delta_step(t) {
-            Some(step) => *rsp_delta += step,
+            Some(step) => {
+                // The frame model uses disp32 operands. An unrepresentable
+                // sequence must not wrap back onto an unrelated slot.
+                let Some(delta) = rsp_delta
+                    .checked_add(step)
+                    .and_then(|n| i32::try_from(n).ok())
+                else {
+                    return false;
+                };
+                *rsp_delta = i64::from(delta);
+            }
             None if is_epilogue_rsp_shift(store, infos, k, func_end) => {}
             None => return false,
         }
@@ -2047,21 +2062,41 @@ mod tests {
     }
 
     #[test]
-    fn slot_read_floor_endpoint_does_not_wrap() {
+    fn canonical_frame_offsets_and_endpoints_do_not_wrap() {
+        assert_eq!(
+            canonical_frame_off(b's', i64::from(i32::MIN), 16),
+            -2147483664
+        );
+        assert_eq!(rsp_delta_step("addq $-2147483648, %rsp"), Some(2147483648));
+        assert_eq!(rsp_delta_step("addq $-9223372036854775808, %rsp"), None);
         assert!(slot_is_ever_read(
             b's',
             i32::MAX - 3,
             8,
             &[],
-            &[(b's', i32::MAX)]
+            &[(b's', i64::from(i32::MAX))]
         ));
         assert!(!slot_is_ever_read(
-            b'b',
+            b's',
             i32::MAX - 3,
             8,
             &[],
-            &[(b's', i32::MAX)]
+            &[(b's', i64::from(i32::MAX) + 5)]
         ));
+    }
+
+    #[test]
+    fn global_dse_does_not_infer_disjointness_from_different_bases() {
+        let asm = "f:\n.cfi_startproc\n pushq %rbp\n movq %rsp, %rbp\n subq $32, %rsp\n movq %rdi, -16(%rbp)\n movq 16(%rsp), %rax\n addq $32, %rsp\n popq %rbp\n ret\n.cfi_endproc\n.size f, .-f\n";
+        let (store, mut infos) = build(asm);
+        let i = (0..store.len())
+            .find(|&i| store.get(i).contains("movq %rdi"))
+            .unwrap();
+        eliminate_never_read_stores(&store, &mut infos);
+        assert!(
+            !infos[i].is_nop(),
+            "the load on rsp can read the store on rbp"
+        );
     }
 
     #[test]

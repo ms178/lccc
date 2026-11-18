@@ -1391,11 +1391,18 @@ pub(super) fn is_direct_frame_slot(mem: &str) -> bool {
     else {
         return false;
     };
+    canonical_frame_displacement(disp).is_some()
+}
+
+fn canonical_frame_displacement(disp: &str) -> Option<i32> {
     if disp.is_empty() || disp == "0" {
-        return true;
+        return Some(0);
     }
     let digits = disp.strip_prefix('-').unwrap_or(disp).as_bytes();
-    matches!(digits.first(), Some(b'1'..=b'9')) && disp.parse::<i32>().is_ok()
+    if !matches!(digits.first(), Some(b'1'..=b'9')) {
+        return None;
+    }
+    disp.parse::<i32>().ok()
 }
 
 #[inline]
@@ -1853,9 +1860,10 @@ pub(super) struct FrameMem {
 /// first frame-base match is the only one. A `%rsp`/`%rbp` appearing as an
 /// INDEX (`(%rax,%rsp,s)`) is rejected via the preceding-comma guard.
 pub(super) fn parse_frame_mem(s: &str) -> Option<FrameMem> {
+    let s = s.split('#').next()?;
     let b = s.as_bytes();
     let mut i = 1;
-    while i + 5 <= b.len() {
+    while i + 5 < b.len() {
         if b[i] == b'('
             && b[i + 1] == b'%'
             && b[i + 2] == b'r'
@@ -1867,15 +1875,11 @@ pub(super) fn parse_frame_mem(s: &str) -> Option<FrameMem> {
             && b[i - 1] != b','
         {
             let sib = b[i + 5] == b',';
-            let mut start = i;
-            while start > 0 && (b[start - 1].is_ascii_digit() || b[start - 1] == b'-') {
-                start -= 1;
+            if sib && !b[i + 6..].contains(&b')') {
+                return None;
             }
-            let disp = if start == i {
-                0
-            } else {
-                fast_parse_i32(&s[start..i])
-            };
+            let start = frame_operand_start(&b[..i]);
+            let disp = canonical_frame_displacement(&s[start..i])?;
             return Some(FrameMem {
                 base: b[i + 3],
                 disp,
