@@ -132,41 +132,39 @@ impl I686Codegen {
         }
     }
 
-    /// Ctz with the IR's defined-zero semantics (`Ctz(0)` = width). TZCNT
-    /// is BMI1 (`bmi1_enabled`); without it F3 0F BC decodes as BSF, equal
-    /// for every nonzero input. Narrow widths OR a stop bit just above the
-    /// operand, so the scanned value is never zero: a zero operand yields
-    /// 8 / 16 on both forms without a branch, and bits above the stop bit
-    /// can never be the lowest set bit (no zero-extension needed).
+    /// Ctz with the IR's defined-zero semantics (`Ctz(0)` = width). TZCNT's
+    /// defined-zero result is a BMI1 guarantee; without BMI1 the F3 0F BC
+    /// bytes decode as BSF, equal for every nonzero input, so a 32-bit scan
+    /// that can see zero takes the preloaded `emit_ctz32_baseline` pair.
+    /// Narrow widths OR a stop bit just above the operand, so the scanned
+    /// value is never zero: a zero operand yields 8 / 16 on both decodings
+    /// without a branch, bits above the stop bit can never be the lowest
+    /// set bit (no zero-extension needed), and the proven-nonzero scan is
+    /// always spelled `tzcnt` -- pre-BMI1 CPUs execute it as BSF with the
+    /// same result, AMD cores run it fast (see `emit_ctz32_baseline`).
     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
-        let tz = if self.bmi1_enabled {
-            "    tzcntl %eax, %eax"
-        } else {
-            "    bsfl %eax, %eax"
-        };
         match ty {
             IrType::I8 | IrType::U8 => {
                 self.state.emit("    orl $0x100, %eax");
-                self.state.emit(tz);
+                self.state.emit("    tzcntl %eax, %eax");
             }
             IrType::I16 | IrType::U16 => {
                 self.state.emit("    orl $0x10000, %eax");
-                self.state.emit(tz);
+                self.state.emit("    tzcntl %eax, %eax");
             }
-            _ if self.bmi1_enabled => self.state.emit(tz),
+            _ if self.bmi1_enabled => self.state.emit("    tzcntl %eax, %eax"),
             _ => self.emit_ctz32_baseline("eax", "eax", Some("ecx")),
         }
     }
 
-    /// CTZ for a value whose nonzero precondition is explicit in IR. A
-    /// narrow operand's lowest set bit lies in its low lane, so the bits
-    /// above it never matter and no zero-extension is emitted.
+    /// CTZ for a value whose nonzero precondition is explicit in IR. On
+    /// that domain BSF and TZCNT return the same index, so the scan is
+    /// always spelled `tzcnt` (F3 0F BC = `rep bsf`; pre-BMI1 CPUs ignore
+    /// the prefix and execute BSF). A narrow operand's lowest set bit lies
+    /// in its low lane, so the bits above it never matter and no
+    /// zero-extension is emitted.
     pub(super) fn emit_int_ctz_nonzero_impl(&mut self, _ty: IrType) {
-        self.state.emit(if self.bmi1_enabled {
-            "    tzcntl %eax, %eax"
-        } else {
-            "    bsfl %eax, %eax"
-        });
+        self.state.emit("    tzcntl %eax, %eax");
     }
 
     pub(super) fn emit_int_bswap_impl(&mut self, ty: IrType) {

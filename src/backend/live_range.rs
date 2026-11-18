@@ -1931,6 +1931,50 @@ impl LinearScanAllocator {
             if !self.register_steal_is_safe(interval.range.value_id, incoming) {
                 continue;
             }
+            // RECURRENCE-VICTIM VETO (RA-RECURRENCE-KEEP): a resident loop
+            // recurrence is never whole-value demoted for a PHANTOM
+            // conflict that the rank key prices at ZERO. Both conditions
+            // are required.
+            //
+            //  * Remaining spill cost 0 is exactly where the rank key
+            //    lies for a recurrence: eviction removes the final home
+            //    (`try_evict`), so EVERY reference — including the
+            //    loop-hot reads *behind* the scan point that the
+            //    position-relative model no longer counts — becomes slot
+            //    traffic, while the model prices the victim as free.
+            //  * No segment overlap means the conflict is a fat-interval
+            //    artifact: the victim is provably dead at every point the
+            //    incoming lives, so the eviction frees nothing the
+            //    incoming actually needs.
+            //
+            // The motivating shape is zstd_count's setup-loop counter
+            // (priority 60, remaining cost 0, fat interval stretched over
+            // the later loops because layout parks the loop's tail block
+            // last): a single-use cast living wholly inside the counter's
+            // liveness hole evicted it, turning ~3M loop-1 register reads
+            // into stack round-trips (+5.3M Ir, 1.15x vs GCC). Both
+            // single-condition gates were measured and REJECTED: a
+            // hole-containment-only veto cost +3.5% Ir on
+            // gzip_longest_match (a costat=50 recurrence was protected
+            // from two hot prio=1000 hole-contained incomings and the
+            // cascade slotted uses=1000 values; a blanket recurrence veto
+            // was worse still, +6.8% on zstd_double_fast), and a
+            // zero-cost-only veto cost +0.6% on the same benchmark
+            // (costat=0 recurrences whose segments REALLY overlapped hot
+            // prio=50000 incomings kept the pool). The vetoed shape is
+            // not starved: its remaining uses are behind the scan point,
+            // so it only needs to KEEP the home it already holds, and the
+            // hole-contained incoming is served by the segment-aware
+            // hole-filling waves. `CCC_RA_NO_RECURRENCE_KEEP` is the A/B
+            // switch.
+            let victim_cost_at = interval.range.spill_cost_at(pos);
+            if interval.range.span_recurrence
+                && !self.ra_config.no_recurrence_keep
+                && victim_cost_at == 0
+                && !interval.range.conflicts_with_segments(incoming)
+            {
+                continue;
+            }
             // ABI-hinted values (leading ParamRefs) are a codegen contract:
             // the ordered parallel-copy emitter elides the entry copy when a
             // param's home equals its ABI register. Evicting such a value
@@ -1961,7 +2005,7 @@ impl LinearScanAllocator {
             let priority = if free_victim {
                 0
             } else if cost_order {
-                interval.range.spill_cost_at(pos)
+                victim_cost_at
             } else {
                 interval.range.priority
             };
@@ -4468,6 +4512,125 @@ mod tests {
             "one hot chain is never a fair price for another"
         );
         assert!(alloc.spill_slots.contains_key(&2));
+    }
+
+    /// RA-RECURRENCE-KEEP: ordinary eviction never whole-value demotes a
+    /// resident loop recurrence for a PHANTOM conflict priced at ZERO —
+    /// i.e. when the recurrence's position-relative remaining spill cost
+    /// reads 0 (exactly where the rank key lies for a recurrence: the
+    /// loop-hot reads BEHIND the scan point would be retroactively
+    /// repriced into slot traffic by `try_evict`'s final-home removal)
+    /// AND the incoming lives entirely inside the recurrence's liveness
+    /// hole (the eviction frees nothing the incoming actually needs).
+    /// This is the zstd_count shape: the setup-loop counter's uses all
+    /// sit behind the second loop's admission point (remaining cost 0,
+    /// priority 60, fat interval stretched over the later loops by the
+    /// layout of the loop's tail block), and a priority-100 single-use
+    /// temp living wholly inside the counter's hole evicted it, turning
+    /// ~3M register reads into stack round-trips.
+    #[test]
+    fn ordinary_eviction_never_takes_a_recurrence_for_a_zero_cost_phantom_conflict() {
+        // Every use of the recurrence lies behind the incoming's start
+        // (remaining cost 0); its fat interval still spans the incoming,
+        // so pre-veto it is active and the cheapest victim under both
+        // rank keys (priority 60 < 100, remaining cost 0, next use past
+        // the incoming's death). The segment data proves the hole
+        // [37, 599] that contains the incoming [400, 450] in full — and
+        // lets the short share the register instead of starving.
+        let mut counter = spanned(1, 0, 900, vec![10, 20, 30], 60);
+        counter.span_marked = true;
+        counter.span_recurrence = true;
+        counter.span_has_in_loop_use = true;
+        counter.set_segments(vec![(0, 36), (600, 900)]);
+        let hot_short = lr(2, 400, 450, vec![410, 440], 100);
+        let mut alloc = LinearScanAllocator::new_with_config(
+            vec![counter, hot_short],
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        assert!(
+            alloc.assignments.contains_key(&1),
+            "the resident recurrence keeps its register"
+        );
+        assert!(
+            !alloc.spill_slots.contains_key(&1),
+            "the recurrence must not be whole-value demoted for a phantom conflict"
+        );
+        // The short is NOT starved by the veto: segment-aware occupancy
+        // places it inside the recurrence's hole (both values share
+        // PhysReg(1) at disjoint points). The contract pinned here is that
+        // the recurrence is never the victim; the short's home is the
+        // hole, not the recurrence's register.
+        assert_eq!(alloc.assignments.get(&2), Some(&PhysReg(1)));
+    }
+
+    /// The veto requires BOTH conditions — a recurrence with real
+    /// remaining spill cost or a real segment overlap stays an ordinary
+    /// victim, because then the position-relative model tells the truth
+    /// and the rank comparison decides. Measured rejections of wider
+    /// gates: a blanket recurrence veto cost +6.8% Ir on
+    /// zstd_double_fast (hot incomings slotted while cold resident
+    /// recurrences kept the pool), a hole-containment-only gate cost
+    /// +3.5% on gzip_longest_match (a costat=50 recurrence was protected
+    /// from two hot prio=1000 incomings living in its hole and the
+    /// cascade slotted uses=1000 values), and a zero-cost-only gate cost
+    /// +0.6% on the same benchmark (really-overlapping costat=0
+    /// recurrences kept the pool against prio=50000 incomings).
+    #[test]
+    fn recurrence_with_remaining_cost_and_real_overlap_stays_an_ordinary_victim() {
+        let mut counter = spanned(1, 0, 900, vec![10, 20, 800], 60);
+        counter.span_marked = true;
+        counter.span_recurrence = true;
+        counter.span_has_in_loop_use = true;
+        // Live through [380, 900] with a use at 800 ahead of the incoming:
+        // the remaining cost at the incoming's start is non-zero and the
+        // incoming [400, 450] really conflicts.
+        counter.set_segments(vec![(0, 36), (380, 900)]);
+        let hot_short = lr(2, 400, 450, vec![410, 440], 100);
+        let mut alloc = LinearScanAllocator::new_with_config(
+            vec![counter, hot_short],
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        assert!(
+            alloc.assignments.contains_key(&2),
+            "a really-conflicting short keeps its profitable steal"
+        );
+        assert!(!alloc.assignments.contains_key(&1));
+    }
+
+    /// The third quadrant of the two-condition gate: remaining cost ZERO
+    /// but a REAL segment overlap also stays an ordinary victim. This is
+    /// the gzip_longest_match shape that rejected the zero-cost-only
+    /// gate (+0.6% Ir): costat=0 recurrences whose live segments really
+    /// covered hot incomings kept the register pool, and the cascade
+    /// slotted the hot values instead. Zero remaining cost alone proves
+    /// nothing when the incoming genuinely needs the victim's register
+    /// at points where the victim is live — the rank comparison decides.
+    #[test]
+    fn zero_cost_recurrence_with_real_overlap_stays_an_ordinary_victim() {
+        let mut counter = spanned(1, 0, 900, vec![10, 20, 30], 60);
+        counter.span_marked = true;
+        counter.span_recurrence = true;
+        counter.span_has_in_loop_use = true;
+        // All uses behind the incoming's start (remaining cost 0 at 400),
+        // but live through [380, 900]: the incoming [400, 450] REALLY
+        // conflicts — no phantom, so the veto must not fire.
+        counter.set_segments(vec![(0, 36), (380, 900)]);
+        let hot_short = lr(2, 400, 450, vec![410, 440], 100);
+        let mut alloc = LinearScanAllocator::new_with_config(
+            vec![counter, hot_short],
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        assert!(
+            alloc.assignments.contains_key(&2),
+            "zero remaining cost without a phantom conflict is no shield"
+        );
+        assert!(!alloc.assignments.contains_key(&1));
     }
 
     #[test]

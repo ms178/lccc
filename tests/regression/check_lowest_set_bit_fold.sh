@@ -10,8 +10,10 @@
 #      show ( `__builtin_ctz(0)` is C undefined behaviour, but the IR's `Ctz`
 #      is the zero-defined variant and must stay exact ).
 #      On x86-64 this replaces
-#          not / bts $32 / bsfq / mov $1 / mov / shl        (32-bit operands)
-#          test / jnz / mov $64 / jmp / bsfq / ...          (64-bit operands)
+#          not / bts $32 / tzcnt / mov $1 / mov / shl       (32-bit operands)
+#          test / jnz / mov $64 / jmp / tzcnt / ...         (64-bit operands)
+#      (the count scans are tzcnt-SPELLED on their proven-nonzero domains:
+#      F3 0F BC is `rep bsf`, baseline-legal, same nonzero result)
 #      with `not` (or `add`) / `and` / `cmov` in both cases.
 #   2. `0 - x` folds to `Neg`: on x86 that is one `negl` instead of
 #      `xorl` + `subl`, and it is what makes `x & (0u - x)` recognisable.
@@ -79,7 +81,7 @@ if ! has "$body" 'cmov'; then
     echo "$body" >&2
     exit 1
 fi
-lacks "$body" 'bsf' "l32 still counts trailing zeroes"
+lacks "$body" 'bsf\|tzcnt' "l32 still counts trailing zeroes"
 lacks "$body" 'bts' "l32 still pays the stop-bit fixup"
 lacks "$body" '[[:space:]]shl[lq]\? ' "l32 still shifts"
 lacks "$body" 'test[lq]\? %' "l32 re-tests flags the and already set"
@@ -91,7 +93,7 @@ if ! has "$body" 'cmov'; then
     echo "$body" >&2
     exit 1
 fi
-lacks "$body" 'bsf' "l64 still counts trailing zeroes"
+lacks "$body" 'bsf\|tzcnt' "l64 still counts trailing zeroes"
 lacks "$body" 'jnz\|jmp' "l64 still carries the Ctz(0) diamond"
 lacks "$body" '[[:space:]]shl[lq]\? ' "l64 still shifts"
 
@@ -114,13 +116,13 @@ fi
 # With the lowest-set-bit rule off, the count path must come back; that is what
 # proves the shapes above belong to this rule and not to an unrelated one.
 body=$(fn_body "$tmp/shapes_nolsb.s" l32)
-if ! has "$body" 'bsf\|shl'; then
+if ! has "$body" 'bsf\|tzcnt\|shl'; then
     echo "CCC_NO_LOWEST_SET_BIT=1 does not restore the count path:" >&2
     echo "$body" >&2
     exit 1
 fi
 body=$(fn_body "$tmp/shapes_nolsb.s" l64)
-if ! has "$body" 'bsf'; then
+if ! has "$body" 'bsf\|tzcnt'; then
     echo "CCC_NO_LOWEST_SET_BIT=1 does not restore the 64-bit count:" >&2
     echo "$body" >&2
     exit 1
@@ -131,7 +133,7 @@ fi
 for f in "$tmp/shapes.s" "$tmp/shapes_nolsb.s"; do
     for plain in plain32 plain64; do
         body=$(fn_body "$f" "$plain")
-        if ! has "$body" 'bsf'; then
+        if ! has "$body" 'bsf\|tzcnt'; then
             echo "$plain lost its count path in $f (pessimisation):" >&2
             echo "$body" >&2
             exit 1

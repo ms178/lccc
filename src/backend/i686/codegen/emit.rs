@@ -2399,16 +2399,22 @@ impl I686Codegen {
         }
     }
 
-    /// ctz32 on a 32-bit register without TZCNT: BSF(src) into dst, with
+    /// ctz32 on a 32-bit register without BMI1: BSF(src) into dst, with
     /// the zero fixup so Ctz(0) == 32 holds.
     pub(super) fn emit_ctz32_baseline(&mut self, src: &str, dst: &str, scratch: Option<&str>) {
         // `bsf` leaves its destination untouched when its source is zero, so a
         // destination preloaded with 32 answers the IR's defined Ctz(0) == 32
         // without a branch -- the pair x86-64 emits, and the pair that makes
-        // `check_clz_zero_sentinel.sh` certifiable on both backends.  When
-        // source and destination are one register the operand has to step
-        // aside first; `scratch` names the register that carries it (dead at
-        // every call site, see below).
+        // `check_clz_zero_sentinel.sh` certifiable on both backends.  The scan
+        // deliberately keeps the PLAIN `bsf` spelling: the nonzero-domain
+        // forms spell theirs `tzcnt` (F3 0F BC = `rep bsf`, equal there), but
+        // this preload is SEMANTIC -- it is the zero result -- and the
+        // peephole model classifies `tzcnt` as a pure destination write, under
+        // which dead-store elimination could delete the preload the BSF
+        // decoding depends on.  `bsf` is read-modify-write in that model, so
+        // the pair is safe from every pass.  When source and destination are
+        // one register the operand has to step aside first; `scratch` names
+        // the register that carries it (dead at every call site, see below).
         if src == dst {
             let t = scratch.expect("ctz32 staging requires a dead scratch register");
             // The scratch carries the operand, so it must not be the operand.

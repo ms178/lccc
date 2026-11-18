@@ -13,10 +13,13 @@
 # historical 2-site cap at EVERY level: a deliberate, measured
 # divergence from the -O3 oracle row. Revisit with backend evidence.
 #
-# Both shapes must keep the idiom distillations: the generic __ffs
-# decision tree folded to tzcnt and the `& ~addr2` arm folded to andn.
-# Both hold WITHOUT an explicit -march because the absent-march baseline
-# projects x86-64-v3 (BMI1 carries ANDN, ABM carries TZCNT).
+# Both shapes must keep the idiom distillations.  The generic __ffs
+# decision tree folds to a tzcnt-SPELLED scan at every tier: __ffs has a
+# nonzero precondition, and on that domain TZCNT's encoding (F3 0F BC =
+# `rep bsf`) runs as BSF on pre-BMI1 CPUs with the same result, so the
+# spelling needs no ISA grant (GCC emits the same bytes at plain -O2).
+# ANDN is different: a VEX encoding that #UDs without BMI1, so the
+# `& ~addr2` arm may fold to andn only under an explicit v3 -march.
 #
 # Runtime differentials belong to the benchmark-output gate (204 cases);
 # this gate pins the CODEGEN contract and fails loudly if future
@@ -54,14 +57,15 @@ check_cfg() {
   TZ=$(grep -cE '^[[:space:]]*tzcnt[lq]' "$TMP/fb.s" || true)
   ANDN=$(grep -cE '^[[:space:]]*andn[lq]' "$TMP/fb.s" || true)
   BSF=$(grep -cE '^[[:space:]]*bsf[lq]' "$TMP/fb.s" || true)
+  # The __ffs tree folds to a tzcnt-spelled scan at EVERY tier (nonzero
+  # domain; the encoding is `rep bsf`, baseline-legal -- see header).
+  [ "$TZ" -ge 1 ] || bad "$CFG: generic __ffs tree did not fold to tzcnt (got $TZ)"
+  [ "$BSF" -eq 0 ] || bad "$CFG: nonzero scan left as plain bsf (slower on AMD, got $BSF)"
   if [ "$TIER" = bmi ]; then
-    [ "$TZ" -ge 1 ] || bad "$CFG: generic __ffs tree did not fold to tzcnt (got $TZ)"
     [ "$ANDN" -ge 1 ] || bad "$CFG: & ~addr2 arm did not fold to andn (got $ANDN)"
   else
-    # Baseline: TZCNT/ANDN are post-x86-64; the __ffs tree lowers to bsf.
-    [ "$TZ" -eq 0 ] || bad "$CFG: baseline emitted $TZ tzcnt (post-baseline)"
+    # Baseline: ANDN is a VEX encoding, #UD without BMI1 -- never baseline.
     [ "$ANDN" -eq 0 ] || bad "$CFG: baseline emitted $ANDN andn (post-baseline)"
-    [ "$BSF" -ge 1 ] || bad "$CFG: baseline __ffs did not lower to bsf (got $BSF)"
   fi
 
   # Bit-exact runtime differential vs the host C compiler.
