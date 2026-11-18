@@ -27,7 +27,7 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let Some((src, dst)) = args.split_once(',') else {
             continue;
         };
-        let (src, dst) = (src.trim(), dst.trim());
+        let (src, dst) = (src.trim_ascii(), dst.trim_ascii());
         let Some(fam) = REG_NAMES[dest_width].iter().position(|&name| name == dst) else {
             continue;
         };

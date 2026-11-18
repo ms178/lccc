@@ -328,7 +328,7 @@ pub(super) fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
 /// value stay observable.
 #[inline]
 fn dest_is_full_width(t: &str, fam: RegId) -> bool {
-    let dest = t.rsplit(',').next().unwrap_or(t).trim();
+    let dest = t.rsplit(',').next().unwrap_or(t).trim_ascii();
     dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize]
 }
 
@@ -381,7 +381,7 @@ fn setcc_zext_kills(store: &LineStore, infos: &[LineInfo], n: usize, t: &str, fa
     let Some((mnem, dst)) = t.split_once(' ') else {
         return false;
     };
-    if !mnem.starts_with("set") || dst.trim() != low {
+    if !mnem.starts_with("set") || dst.trim_ascii() != low {
         return false;
     }
     let mut m = n + 1;
@@ -422,12 +422,11 @@ pub(super) fn function_range(
         if infos[n].is_nop() {
             continue;
         }
-        let t = infos[n].trimmed(store.get(n));
-        if t.starts_with(".cfi_startproc") {
+        if infos[n].is_cfi_start() {
             start = Some(n);
             break;
         }
-        if t.starts_with(".cfi_endproc") {
+        if infos[n].is_cfi_end() {
             return None; // `idx` sits between two functions
         }
     }
@@ -435,7 +434,7 @@ pub(super) fn function_range(
     let mut end = len;
     let mut n = idx;
     while n < len {
-        if !infos[n].is_nop() && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc") {
+        if infos[n].is_cfi_end() {
             end = n;
             break;
         }
@@ -463,10 +462,9 @@ impl CfiIndex {
             if info.is_nop() {
                 continue;
             }
-            let t = info.trimmed(store.get(n));
-            if t.starts_with(".cfi_startproc") {
+            if info.is_cfi_start() {
                 marks.push((n, true));
-            } else if t.starts_with(".cfi_endproc") {
+            } else if info.is_cfi_end() {
                 marks.push((n, false));
             }
         }
@@ -742,7 +740,7 @@ fn family_private_in(
                 if implicit_at_transfer(fam)
                     && !t
                         .trim_start_matches(|c: char| c != ' ')
-                        .trim()
+                        .trim_ascii()
                         .starts_with('.') =>
             {
                 return false;
@@ -919,7 +917,7 @@ pub(super) fn split_two_operands(rest: &str) -> Option<(&str, &str)> {
     // store as a register-only move and deletes it. Use the shared balanced-
     // parentheses scanner that line classification already relies on.
     let comma = last_top_level_comma(rest.as_bytes())?;
-    Some((rest[..comma].trim(), rest[comma + 1..].trim()))
+    Some((rest[..comma].trim_ascii(), rest[comma + 1..].trim_ascii()))
 }
 
 /// Parse a bare register operand into its GP family, rejecting anything that
@@ -1283,15 +1281,15 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
 /// destination last (`imul %esi, (%r9,%r11,8), %r11d`); one-operand RMW
 /// (`incq %r11`) names it only.
 fn consumer_writes_dst_as_reg(t: &str, fam: RegId) -> bool {
-    let trimmed = t.trim_start();
+    let trimmed = t.trim_ascii_start();
     let Some(sp) = trimmed.find(' ') else {
         let dst = trimmed;
         return dst.starts_with('%') && !dst.contains('(') && line_refs_family(dst, fam);
     };
-    let ops = trimmed[sp + 1..].trim_start();
+    let ops = trimmed[sp + 1..].trim_ascii_start();
     let dst = match last_top_level_comma(ops.as_bytes()) {
-        Some(c) => ops[c + 1..].trim(),
-        None => ops.trim(),
+        Some(c) => ops[c + 1..].trim_ascii(),
+        None => ops.trim_ascii(),
     };
     dst.starts_with('%') && !dst.contains('(') && line_refs_family(dst, fam)
 }
@@ -1315,19 +1313,21 @@ pub(super) fn fam_written_only_as_dest(t: &str, fam: RegId) -> bool {
     // test (`leaq (%r11,%r11,2), %r11` → RMW, the 32-bit twin `leal (%r11,
     // %r11,2), %r11d` → not), so consulting it here refused the 64-bit form
     // of a fold it admitted at 32 bits (`usel(a) * 3` kept its relay copy).
-    let is_lea = t.trim_start().starts_with("lea");
-    if !consumer_writes_dst_as_reg(t, fam) || (!is_lea && is_read_modify_write(t.trim_start())) {
+    let is_lea = t.trim_ascii_start().starts_with("lea");
+    if !consumer_writes_dst_as_reg(t, fam)
+        || (!is_lea && is_read_modify_write(t.trim_ascii_start()))
+    {
         return false;
     }
-    let trimmed = t.trim_start();
+    let trimmed = t.trim_ascii_start();
     let Some(sp) = trimmed.find(' ') else {
         return false;
     };
-    let ops = trimmed[sp + 1..].trim_start();
+    let ops = trimmed[sp + 1..].trim_ascii_start();
     let Some(c) = last_top_level_comma(ops.as_bytes()) else {
         return false;
     };
-    let (src_part, dst_part) = (ops[..c].trim(), ops[c + 1..].trim());
+    let (src_part, dst_part) = (ops[..c].trim_ascii(), ops[c + 1..].trim_ascii());
     if !line_refs_family(dst_part, fam) {
         return false;
     }
@@ -1382,7 +1382,7 @@ fn replace_reg_family_in_source(t: &str, old_id: RegId, new_id: RegId) -> Option
 fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
     let rest = lea.strip_prefix("leaq ")?;
     let (addr, dst) = rest.rsplit_once(',')?;
-    let (addr, dst) = (addr.trim(), dst.trim());
+    let (addr, dst) = (addr.trim_ascii(), dst.trim_ascii());
     // `rsplit_once(',')` split inside the SIB list when a scale is present;
     // detect that by an unbalanced parenthesis and re-split at the real end.
     if addr.matches('(').count() != addr.matches(')').count() {
@@ -1393,9 +1393,12 @@ fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
     if close + 1 != addr.len() || close <= open {
         return None;
     }
-    let disp = addr[..open].trim();
+    let disp = addr[..open].trim_ascii();
     let mut fams = Vec::new();
-    let fields: Vec<&str> = addr[open + 1..close].split(',').map(str::trim).collect();
+    let fields: Vec<&str> = addr[open + 1..close]
+        .split(',')
+        .map(str::trim_ascii)
+        .collect();
     if fields.is_empty() || fields.len() > 3 {
         return None;
     }
@@ -1534,7 +1537,7 @@ struct SibAddr {
 /// `table+8`, `table-8`.  Returns `None` for anything else so callers fail
 /// closed rather than invent an address.
 fn parse_disp(text: &str) -> Option<(Option<String>, i64)> {
-    let text = text.trim();
+    let text = text.trim_ascii();
     if text.is_empty() {
         return Some((None, 0));
     }
@@ -1695,7 +1698,7 @@ impl SibAddr {
             return None;
         }
         let (sym, disp) = parse_disp(&text[..open])?;
-        let inner = text[open + 1..close].trim();
+        let inner = text[open + 1..close].trim_ascii();
         // x86-64 RIP-relative addressing is ModRM mod=00 r/m=101: there is no
         // SIB byte, so no index register can be encoded.  An assembler may
         // silently DROP the index instead of erroring (observed:
@@ -1705,7 +1708,7 @@ impl SibAddr {
             return None;
         }
         let mut fields = inner.split(',');
-        let base = fields.next()?.trim();
+        let base = fields.next()?.trim_ascii();
         let base = if base.is_empty() {
             None
         } else {
@@ -1716,12 +1719,12 @@ impl SibAddr {
         };
         let mut index = None;
         if let Some(idx) = fields.next() {
-            let idx = idx.trim();
+            let idx = idx.trim_ascii();
             if !idx.starts_with('%') {
                 return None;
             }
             let scale = match fields.next() {
-                Some(s) => match s.trim() {
+                Some(s) => match s.trim_ascii() {
                     "1" => 1,
                     "2" => 2,
                     "4" => 4,
@@ -1939,7 +1942,7 @@ fn compose_indexed_relay(
     // It sits between the operand boundary and the displacement, and the caller
     // keeps `line[..pos]` in the rewritten line — so it is stripped here and
     // never becomes part of the composed operand.
-    let trimmed = cons_text.trim_start();
+    let trimmed = cons_text.trim_ascii_start();
     let (cons_text, has_seg) = match segment_prefix_len(trimmed) {
         Some(n) => (trimmed[n..].to_string(), true),
         None => (cons_text, false),
@@ -2026,7 +2029,7 @@ pub(super) fn splice_lea_into_mem_operand(
     }
     let close = pos + line[pos..].find(')')?;
     let op_start = operand_start(line, pos);
-    let raw_disp = line[op_start..pos].trim();
+    let raw_disp = line[op_start..pos].trim_ascii();
     // `%gs:(%T)` / `%fs:8(%T)`: keep the validated override (it belongs to the
     // same memory operand and the fold does not move it) and compose only the
     // address text behind it.  Anything else in the displacement slot is still
@@ -2068,7 +2071,7 @@ pub(super) fn splice_lea_into_mem_operand(
     }
     // Keep the whitespace that separated the operand from the mnemonic or the
     // previous comma; replace exactly `disp(...)`.
-    let lead = line[op_start..pos].len() - line[op_start..pos].trim_start().len();
+    let lead = line[op_start..pos].len() - line[op_start..pos].trim_ascii_start().len();
     let start = op_start + lead;
     Some(format!(
         "{}{}{}{}",
@@ -2204,7 +2207,7 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                 let seg_sib_blocked = |pos: usize| {
                     !seg_sib_enabled()
                         && folded_addr.contains(',')
-                        && segment_prefix_len(t[operand_start(t, pos)..pos].trim()).is_some()
+                        && segment_prefix_len(t[operand_start(t, pos)..pos].trim_ascii()).is_some()
                 };
                 if let Some((pos, _)) = t
                     .match_indices(&addr_pat)
@@ -2294,10 +2297,10 @@ fn compose_displaced_relay(
     if sib.contains("%rip") {
         return None;
     }
-    let d1: i64 = if d1_text.trim().is_empty() {
+    let d1: i64 = if d1_text.trim_ascii().is_empty() {
         0
     } else {
-        d1_text.trim().parse().ok()?
+        d1_text.trim_ascii().parse().ok()?
     };
     let b = t.as_bytes();
     for (pos, _) in t.match_indices(addr_pat) {
@@ -2335,7 +2338,7 @@ fn compose_displaced_relay(
 fn parse_rip_symbol_lea(t: &str) -> Option<(String, RegId)> {
     let rest = t.strip_prefix("leaq ")?;
     let (addr, dst) = rest.rsplit_once(',')?;
-    let (addr, dst) = (addr.trim(), dst.trim());
+    let (addr, dst) = (addr.trim_ascii(), dst.trim_ascii());
     let displacement = addr.strip_suffix("(%rip)")?;
     // `parse_disp` also accepts absolute numeric displacements. Only a true
     // relocatable symbol expression names a stable address across instructions.
@@ -2423,16 +2426,37 @@ pub(super) fn cse_symbol_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> b
 /// Pure producers: instructions whose ONLY effect is writing their trailing
 /// register operand. Read-modify-write forms (`addl %ecx, %eax`) are excluded —
 /// retargeting them would change which register is read.
-const PURE_PRODUCERS: &[&str] = &[
-    "movzbl ", "movzbq ", "movzwl ", "movzwq ", "movsbl ", "movsbq ", "movswl ", "movswq ",
-    "movslq ", "movl ", "movq ", "leal ", "leaq ",
+///
+/// Packed as [`crate::backend::peephole_common::Pfx`] constants so every
+/// probe is branch-only (one AND and one compare per entry, no `memcmp`).
+const PURE_PRODUCERS_PFX: &[crate::backend::peephole_common::Pfx] = &[
+    crate::backend::peephole_common::Pfx::new("movzbl "),
+    crate::backend::peephole_common::Pfx::new("movzbq "),
+    crate::backend::peephole_common::Pfx::new("movzwl "),
+    crate::backend::peephole_common::Pfx::new("movzwq "),
+    crate::backend::peephole_common::Pfx::new("movsbl "),
+    crate::backend::peephole_common::Pfx::new("movsbq "),
+    crate::backend::peephole_common::Pfx::new("movswl "),
+    crate::backend::peephole_common::Pfx::new("movswq "),
+    crate::backend::peephole_common::Pfx::new("movslq "),
+    crate::backend::peephole_common::Pfx::new("movl "),
+    crate::backend::peephole_common::Pfx::new("movq "),
+    crate::backend::peephole_common::Pfx::new("leal "),
+    crate::backend::peephole_common::Pfx::new("leaq "),
 ];
 
 /// Flag-neutral BMI2 three-operand shifts/rotates (`op src1, src2, dst`):
 /// read all source operands before writing their trailing register destination
-/// and leave EFLAGS untouched.
-const PURE_PRODUCERS_3OP: &[&str] = &[
-    "rorxl ", "rorxq ", "shrxl ", "shrxq ", "shlxl ", "shlxq ", "sarxl ", "sarxq ",
+/// and leave EFLAGS untouched.  Packed like [`PURE_PRODUCERS_PFX`].
+const PURE_PRODUCERS_3OP_PFX: &[crate::backend::peephole_common::Pfx] = &[
+    crate::backend::peephole_common::Pfx::new("rorxl "),
+    crate::backend::peephole_common::Pfx::new("rorxq "),
+    crate::backend::peephole_common::Pfx::new("shrxl "),
+    crate::backend::peephole_common::Pfx::new("shrxq "),
+    crate::backend::peephole_common::Pfx::new("shlxl "),
+    crate::backend::peephole_common::Pfx::new("shlxq "),
+    crate::backend::peephole_common::Pfx::new("sarxl "),
+    crate::backend::peephole_common::Pfx::new("sarxq "),
 ];
 
 /// Split `src1, src2, dst` into `("src1, src2", "dst")`, keeping the sources
@@ -2448,12 +2472,12 @@ const PURE_PRODUCERS_3OP: &[&str] = &[
 /// instead of a bogus pair.
 fn split_three_operands_last(rest: &str) -> Option<(&str, &str)> {
     let comma = last_top_level_comma(rest.as_bytes())?;
-    let (prefix, last) = (rest[..comma].trim(), rest[comma + 1..].trim());
+    let (prefix, last) = (rest[..comma].trim_ascii(), rest[comma + 1..].trim_ascii());
     if last.is_empty() {
         return None;
     }
     let inner = last_top_level_comma(prefix.as_bytes())?;
-    if prefix[..inner].trim().is_empty() || prefix[inner + 1..].trim().is_empty() {
+    if prefix[..inner].trim_ascii().is_empty() || prefix[inner + 1..].trim_ascii().is_empty() {
         return None;
     }
     Some((prefix, last))
@@ -2520,7 +2544,7 @@ mod splitter_tests {
 /// forms load 4 bytes).
 fn narrowed_producer(op: &str, src: &str, d_fam: RegId) -> Option<String> {
     let d32 = REG_NAMES[1][d_fam as usize];
-    let narrow_op = match op.trim_end() {
+    let narrow_op = match op.trim_ascii_end() {
         "leaq" => "leal",
         "movq" => {
             let s = plain_gp_operand(src)?;
@@ -2578,7 +2602,7 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
 }
 
 /// The late form of [`retarget_producer_into_copy`]: the producer's sources
-/// may name either register. Every `PURE_PRODUCERS` form reads all of its
+/// may name either register. Every `PURE_PRODUCERS_PFX` form reads all of its
 /// operands before writing its one destination and never reads that
 /// destination implicitly (no `cmov`, no `bsf`), so
 ///
@@ -2620,18 +2644,15 @@ fn retarget_producer_into_copy_impl(
             continue;
         }
         let prod = infos[i].trimmed(store.get(i));
-        let Some((op, prod_src, prod_dst)) = PURE_PRODUCERS
-            .iter()
-            .find(|p| prod.starts_with(**p))
-            .and_then(|&p| split_two_operands(&prod[p.len()..]).map(|(s, d)| (p, s, d)))
-            .or_else(|| {
-                PURE_PRODUCERS_3OP
-                    .iter()
-                    .find(|p| prod.starts_with(**p))
-                    .and_then(|&p| {
-                        split_three_operands_last(&prod[p.len()..]).map(|(s, d)| (p, s, d))
-                    })
-            })
+        let Some((op, prod_src, prod_dst)) =
+            crate::backend::peephole_common::find_pfx(prod, PURE_PRODUCERS_PFX)
+                .and_then(|p| split_two_operands(&prod[p.len()..]).map(|(s, d)| (p, s, d)))
+                .or_else(|| {
+                    crate::backend::peephole_common::find_pfx(prod, PURE_PRODUCERS_3OP_PFX)
+                        .and_then(|p| {
+                            split_three_operands_last(&prod[p.len()..]).map(|(s, d)| (p, s, d))
+                        })
+                })
         else {
             i += 1;
             continue;
@@ -2774,7 +2795,7 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        if rmws.is_empty() && op.trim_end() == "movq" && prod_src == new_dst {
+        if rmws.is_empty() && op.trim_ascii_end() == "movq" && prod_src == new_dst {
             // `movq %rax, %rdx; movq %rdx, %rax`: the pair is the identity.
             mark_nop(&mut infos[i]);
             mark_nop(&mut infos[j]);
@@ -2842,7 +2863,7 @@ fn names_family_narrow(line: &str, fam: RegId) -> bool {
 ///    `has_implicit_reg_usage`), and none is a barrier, label or pinned line:
 ///    `D`'s old value is unobserved after the producer and overwritten by the
 ///    copy anyway, so writing it from the producer on is unobservable. The
-///    producer's SOURCES may name `D`: every `PURE_PRODUCERS` form reads all
+///    producer's SOURCES may name `D`: every `PURE_PRODUCERS_PFX` form reads all
 ///    operands before writing (the aliasing argument of
 ///    [`retarget_producer_into_copy_aliasing`]).
 /// 3. Every `T` mention is a 32/64-bit name, so renaming every mention
@@ -2876,18 +2897,21 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         // `T`'s pre-window value once, at the producer, and writes `D`
         // (`shared_four`: `addl %esi, %edi; ...; adcl %edx, %edi; movl %edi,
         // %eax` becomes `leal (%rdi, %rsi), %eax; ...; adcl %edx, %eax`).
-        let (op, is_add) = match PURE_PRODUCERS.iter().find(|p| prod.starts_with(**p)) {
-            Some(op) => (*op, false),
-            None => match ["addl ", "addq "]
-                .into_iter()
-                .find(|p| prod.starts_with(*p))
-            {
-                Some(op) => (op, true),
-                None => {
+        let (op, is_add) = match crate::backend::peephole_common::find_pfx(prod, PURE_PRODUCERS_PFX)
+        {
+            Some(op) => (op, false),
+            None => {
+                use crate::backend::peephole_common::pfx;
+                let f8 = crate::backend::peephole_common::first8(prod);
+                if pfx!(f8, "addl ") {
+                    ("addl ", true)
+                } else if pfx!(f8, "addq ") {
+                    ("addq ", true)
+                } else {
                     i += 1;
                     continue;
                 }
-            },
+            }
         };
         let Some((prod_src, prod_dst)) = split_two_operands(&prod[op.len()..]) else {
             i += 1;
@@ -2978,7 +3002,7 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
             if writes_family(&infos[k], t_k, t) {
                 let last = t_k.rsplit_once(',').map_or_else(
                     || t_k.split_whitespace().last().unwrap_or(""),
-                    |(_, d)| d.trim(),
+                    |(_, d)| d.trim_ascii(),
                 );
                 match dest_width(last) {
                     Some(w) if register_family_fast(last) == t => last_w = w,
@@ -4187,10 +4211,13 @@ fn parse_imm64(src: &str) -> Option<u64> {
 /// The destination operand's text of `t` (past the mnemonic): the last
 /// top-level operand, or the sole operand when there is no comma.
 fn dest_operand_text(t: &str) -> &str {
-    let rest = t.find(' ').map(|i| t[i + 1..].trim_start()).unwrap_or("");
+    let rest = t
+        .find(' ')
+        .map(|i| t[i + 1..].trim_ascii_start())
+        .unwrap_or("");
     match last_top_level_comma(rest.as_bytes()) {
-        Some(c) => rest[c + 1..].trim(),
-        None => rest.trim(),
+        Some(c) => rest[c + 1..].trim_ascii(),
+        None => rest.trim_ascii(),
     }
 }
 
@@ -4214,7 +4241,7 @@ pub(super) fn and_imm_narrow_width(t: &str, fam: RegId) -> Option<u8> {
         "andl" => 1,
         _ => return None,
     };
-    let rest = t[mnemonic.len()..].trim_start();
+    let rest = t[mnemonic.len()..].trim_ascii_start();
     let (src, dst) = split_two_operands(rest)?;
     if dst != REG_NAMES[reg_width][fam as usize] {
         return None;
@@ -4274,7 +4301,7 @@ pub(super) fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
         return true;
     }
     let mnemonic = t.split_whitespace().next().unwrap_or("");
-    let rest = t[mnemonic.len()..].trim_start();
+    let rest = t[mnemonic.len()..].trim_ascii_start();
     let qword = REG_NAMES[0][fam as usize];
     if mnemonic == "xorq" || mnemonic == "subq" {
         if let Some((s0, s1)) = split_two_operands(rest) {
@@ -4385,7 +4412,7 @@ fn is_rmw_of_family(t: &str, fam: RegId) -> bool {
     if !dest_is_full_width(t, fam) {
         return false;
     }
-    let trimmed = t.trim_start();
+    let trimmed = t.trim_ascii_start();
     let Some(sp) = trimmed.find(' ') else {
         return false;
     };
@@ -4414,7 +4441,7 @@ fn is_rmw_of_family(t: &str, fam: RegId) -> bool {
     ) {
         return false;
     }
-    let Some((s0, _)) = split_two_operands(trimmed[sp + 1..].trim_start()) else {
+    let Some((s0, _)) = split_two_operands(trimmed[sp + 1..].trim_ascii_start()) else {
         return false;
     };
     // A top-level comma inside the first operand means three operands (the
@@ -4822,10 +4849,10 @@ fn copy_back_width(t: &str, d: RegId, s: RegId) -> Option<bool> {
 /// (whose "destination" is flags); callers must have excluded RMW and
 /// full-write lines before calling.
 fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> {
-    let trimmed = t.trim_start();
+    let trimmed = t.trim_ascii_start();
     let sp = trimmed.find(' ')?;
     let (mnemonic, rest) = trimmed.split_at(sp);
-    let rest = rest.trim_start();
+    let rest = rest.trim_ascii_start();
     let (s0, s1) = split_two_operands(rest)?;
     // The shift/rotate count register is FIXED by the ISA: only `%cl` is
     // encodable there, so a `%cl` source on these mnemonics can neither be
@@ -5011,7 +5038,7 @@ fn scaled_temp_producer(
         return Some(found);
     }
     let (addr_text, dst) = t.strip_prefix("leaq ")?.rsplit_once(',')?;
-    let (addr_text, dst) = (addr_text.trim(), dst.trim());
+    let (addr_text, dst) = (addr_text.trim_ascii(), dst.trim_ascii());
     let fam = register_family_fast(dst);
     if fam == REG_NONE || fam > REG_GP_MAX || REG_NAMES[0][fam as usize] != dst {
         return None;
@@ -5036,7 +5063,7 @@ fn scaled_temp_producer(
     if !matches!(mnemonic, "shlq" | "salq") {
         return None;
     }
-    let (imm, reg) = split_two_operands(rest.trim_start())?;
+    let (imm, reg) = split_two_operands(rest.trim_ascii_start())?;
     let s: u32 = imm.strip_prefix('$')?.parse().ok()?;
     if reg != dst || !(1..=3).contains(&s) {
         return None;
@@ -5074,7 +5101,7 @@ fn bare_shift_producer(
     if !matches!(mnemonic, "shlq" | "salq") {
         return None;
     }
-    let (imm, reg) = split_two_operands(rest.trim_start())?;
+    let (imm, reg) = split_two_operands(rest.trim_ascii_start())?;
     let s: u32 = imm.strip_prefix('$')?.parse().ok()?;
     if !(1..=3).contains(&s) {
         return None;
@@ -5151,7 +5178,7 @@ fn splice_temp_into_mem_operand(
     }
     let close = pos + line[pos..].find(')')?;
     let op_start = operand_start(line, open);
-    let disp_text = line[op_start..open].trim();
+    let disp_text = line[op_start..open].trim_ascii();
     if disp_text.contains(['%', ':', '*', '(', ')', '$', ' ', '\t']) {
         return None;
     }
@@ -5193,7 +5220,7 @@ fn splice_temp_into_mem_operand(
         return None;
     }
     let composed = compose_sib(producer, &rest)?;
-    let lead = line[op_start..open].len() - line[op_start..open].trim_start().len();
+    let lead = line[op_start..open].len() - line[op_start..open].trim_ascii_start().len();
     let start = op_start + lead;
     Some(format!(
         "{}{}{}",
@@ -5305,7 +5332,7 @@ mod tests {
             .map(|i| super::classify_line(store.get(i)))
             .collect();
         let stray = (0..store.len())
-            .filter(|&i| store.get(i).trim() == ".cfi_endproc")
+            .filter(|&i| store.get(i).trim_ascii() == ".cfi_endproc")
             .nth(1)
             .expect("fixture has a second endproc");
         super::mark_nop(&mut infos[stray]);
@@ -5330,7 +5357,7 @@ mod tests {
             Some(store.len())
         );
         let gap = (0..store.len())
-            .find(|&i| store.get(i).trim() == ".p2align 4")
+            .find(|&i| store.get(i).trim_ascii() == ".p2align 4")
             .unwrap();
         assert_eq!(idx.function_range(gap, store.len()), None);
 
@@ -5525,7 +5552,7 @@ mod tests {
         infos[3].pinned = true;
         assert!(!super::cse_symbol_lea(&mut store, &mut infos));
         assert!(infos[3].pinned);
-        assert_eq!(store.get(3).trim(), "leaq bins(%rip), %r10");
+        assert_eq!(store.get(3).trim_ascii(), "leaq bins(%rip), %r10");
     }
 
     #[test]
@@ -5554,7 +5581,7 @@ mod tests {
                 "stale home after {writer}"
             );
             assert!(!infos[4].is_nop());
-            assert_eq!(store.get(4).trim(), "leaq bins(%rip), %r10");
+            assert_eq!(store.get(4).trim_ascii(), "leaq bins(%rip), %r10");
         }
     }
 
@@ -5589,7 +5616,7 @@ mod tests {
                 super::cse_symbol_lea(&mut store, &mut infos),
                 "missed {expr}"
             );
-            assert_eq!(store.get(4).trim(), "movq %r9, %r10");
+            assert_eq!(store.get(4).trim_ascii(), "movq %r9, %r10");
         }
         for expr in [
             ".", ".+8", ".-8", "8", "-8", "0x10", "-0x10", "1f", "1b", ".+0x10",
@@ -5637,7 +5664,7 @@ mod tests {
         let changed = super::rename_chain_into_copy(&mut store, &mut infos);
         let out = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| !l.starts_with('.') && !l.ends_with(':'))
             .collect();
         (out, changed)
@@ -5769,7 +5796,7 @@ mod tests {
         let changed = super::fold_copy_into_lea_base(&mut store, &mut infos);
         let out = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\\n");
         (out, changed)
@@ -5904,14 +5931,14 @@ mod tests {
         ));
         let src_of = |dst: &str| -> String {
             out.lines()
-                .find(|l| l.trim().starts_with("addl") && l.trim().ends_with(dst))
+                .find(|l| l.trim_ascii().starts_with("addl") && l.trim_ascii().ends_with(dst))
                 .unwrap_or_else(|| panic!("missing `addl ..., {dst}`:\n{out}"))
-                .trim()
+                .trim_ascii()
                 .trim_start_matches("addl ")
                 .split(',')
                 .next()
                 .unwrap()
-                .trim()
+                .trim_ascii()
                 .to_string()
         };
         let a = src_of("%r8d");
@@ -9315,7 +9342,7 @@ mod rmw_window_tests {
         super::retarget_producer_into_copy(&mut store, &mut infos);
         let emitted = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>();
         let removed = (0..store.len()).filter(|&i| infos[i].is_nop()).count();
         (emitted, removed)
@@ -9521,7 +9548,7 @@ mod chain_rename_tests {
     fn chain_rename_on_coalesce_refusal_shapes_is_value_preserving() {
         let body = |out: &str| -> Vec<String> {
             out.lines()
-                .map(str::trim)
+                .map(str::trim_ascii)
                 .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
                 .map(str::to_string)
                 .collect()
@@ -9586,7 +9613,7 @@ mod chain_rename_tests {
         );
         let strip = |s: String| -> String {
             s.lines()
-                .filter(|l| !l.trim_start().starts_with(".loc"))
+                .filter(|l| !l.trim_ascii_start().starts_with(".loc"))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -9618,7 +9645,7 @@ mod scaled_index_temp_tests {
         let changed = fold_scaled_index_temp_into_mem(&mut store, &mut infos);
         let lines = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| l.starts_with(|c: char| c.is_ascii_lowercase()) && !l.ends_with(':'))
             .collect();
         (changed, lines)
@@ -9839,7 +9866,7 @@ mod rbp_role_and_span_tests {
 
     fn line_of(store: &LineStore, text: &str) -> usize {
         (0..store.len())
-            .find(|&i| store.get(i).trim() == text)
+            .find(|&i| store.get(i).trim_ascii() == text)
             .unwrap_or_else(|| panic!("fixture lacks `{text}`"))
     }
 
@@ -9937,7 +9964,7 @@ mod rbp_role_and_span_tests {
                     lv.live_after(n, fam),
                     fresh.live_after(n, fam),
                     "line {n} `{}`, family {fam}",
-                    store.get(n).trim()
+                    store.get(n).trim_ascii()
                 );
             }
         }

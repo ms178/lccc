@@ -106,7 +106,7 @@ fn is_opaque_control_transfer(text: &str) -> bool {
 /// intentionally not guessed: a failure only forgoes a pin, while a pin is
 /// always conservative.
 fn direct_stack_slot(operand: &str) -> Option<(u8, i32)> {
-    let operand = operand.trim();
+    let operand = operand.trim_ascii();
     for (base, id) in [("(%rsp)", 4u8), ("(%rbp)", 5u8)] {
         if let Some(pos) = operand.find(base) {
             if pos + base.len() != operand.len() {
@@ -115,7 +115,7 @@ fn direct_stack_slot(operand: &str) -> Option<(u8, i32)> {
             let offset = if pos == 0 {
                 0
             } else {
-                operand[..pos].trim().parse::<i32>().ok()?
+                operand[..pos].trim_ascii().parse::<i32>().ok()?
             };
             return Some((id, offset));
         }
@@ -299,19 +299,19 @@ fn pin_param_abi_reads(store: &LineStore, infos: &mut [LineInfo]) {
 fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     let mut volatile_slots: Vec<(u8, i32)> = Vec::new();
     for i in 0..store.len() {
-        let trimmed = infos[i].trimmed(store.get(i));
         // Function boundary: volatile markers are function-local.
-        if trimmed.starts_with(".cfi_startproc") {
+        if infos[i].cfi == CfiMark::Start {
             volatile_slots.clear();
             continue;
         }
+        let trimmed = infos[i].trimmed(store.get(i));
         if let Some(slot_text) = trimmed.strip_prefix("# LCCC_VOLATILE_SLOT ") {
             if let Some(slot) = direct_stack_slot(slot_text) {
                 volatile_slots.push(slot);
             }
             continue;
         }
-        if trimmed.starts_with(".cfi_endproc") {
+        if infos[i].cfi == CfiMark::End {
             volatile_slots.clear();
             continue;
         }
@@ -377,7 +377,7 @@ fn pin_address_taken_global(store: &LineStore, infos: &mut [LineInfo]) {
             _ => None,
         };
         let is_taken = operand
-            .map(str::trim)
+            .map(str::trim_ascii)
             .and_then(direct_stack_slot)
             .is_some_and(|slot| address_taken.contains(&slot));
         if is_taken {
@@ -397,9 +397,7 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     // unwind info disabled): fall back to the translation-unit-wide scan.
     // The cross-function bleed this avoids is impossible to scope without
     // boundaries, and such TUs contain at most one emitted function.
-    let has_any_startproc = (0..store.len()).any(|k| {
-        !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_startproc")
-    });
+    let has_any_startproc = (0..store.len()).any(|k| infos[k].is_cfi_start());
     if !has_any_startproc {
         pin_address_taken_global(store, infos);
         return;
@@ -407,22 +405,14 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     let mut start = 0;
     while start < store.len() {
         // Find the next .cfi_startproc.
-        while start < store.len()
-            && !infos[start]
-                .trimmed(store.get(start))
-                .starts_with(".cfi_startproc")
-        {
+        while start < store.len() && infos[start].cfi != CfiMark::Start {
             start += 1;
         }
         if start >= store.len() {
             break;
         }
         let mut end = start + 1;
-        while end < store.len()
-            && !infos[end]
-                .trimmed(store.get(end))
-                .starts_with(".cfi_endproc")
-        {
+        while end < store.len() && infos[end].cfi != CfiMark::End {
             end += 1;
         }
         let slot_of = |k: usize| -> Option<(u8, i32)> {
@@ -462,7 +452,7 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
                     _ => None,
                 };
                 let is_taken = operand
-                    .map(str::trim)
+                    .map(str::trim_ascii)
                     .and_then(direct_stack_slot)
                     .is_some_and(|slot| taken.contains(&slot));
                 if is_taken {
@@ -718,11 +708,11 @@ fn peephole_optimize_inner(
     {
         let mut in_prologue = false;
         for idx in 0..line_count {
-            let trimmed = infos[idx].trimmed(store.get(idx));
-            if trimmed.starts_with(".cfi_startproc") {
+            if infos[idx].cfi == CfiMark::Start {
                 in_prologue = true;
                 continue;
             }
+            let trimmed = infos[idx].trimmed(store.get(idx));
             if !in_prologue {
                 continue;
             }
@@ -794,7 +784,7 @@ fn peephole_optimize_inner(
     let skip_set: crate::common::fx_hash::FxHashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
         .unwrap_or_default()
         .split(',')
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim_ascii().to_string())
         .collect();
     #[cfg(test)]
     let skip_set = {
@@ -2612,7 +2602,7 @@ mod tests {
     fn code_of(asm: &str) -> String {
         asm.lines()
             .filter(|l| {
-                let t = l.trim();
+                let t = l.trim_ascii();
                 !crate::backend::peephole_common::is_loc_directive(t)
                     && !crate::backend::peephole_common::is_inline_range_marker(t)
             })
@@ -3934,7 +3924,7 @@ mod tests {
         assert!(local_patterns::fold_lea_into_memory_op(
             &mut store, &mut infos
         ));
-        assert_eq!(store.get(3).trim(), "movq 16(%r13, %r10), %rcx");
+        assert_eq!(store.get(3).trim_ascii(), "movq 16(%r13, %r10), %rcx");
         let result = peephole_optimize(asm);
         assert!(
             !result.contains("88("),
@@ -3959,9 +3949,9 @@ mod tests {
             &mut store, &mut infos
         ));
         assert!(infos[2].is_nop());
-        assert_eq!(store.get(3).trim(), "movq 16(%r13, %r10), %rcx");
-        assert_eq!(store.get(4).trim(), "movl 8(%r13, %r10), %edx");
-        assert_eq!(store.get(5).trim(), "movq %rax, 24(%r13, %r10)");
+        assert_eq!(store.get(3).trim_ascii(), "movq 16(%r13, %r10), %rcx");
+        assert_eq!(store.get(4).trim_ascii(), "movl 8(%r13, %r10), %edx");
+        assert_eq!(store.get(5).trim_ascii(), "movq %rax, 24(%r13, %r10)");
     }
 
     /// A definition at the bottom of a loop whose value is read at the TOP of
@@ -4099,7 +4089,7 @@ mod tests {
     fn test_redundant_store_load() {
         let asm = "    movq %rax, -8(%rbp)\n    movq -8(%rbp), %rax\n".to_string();
         let result = peephole_optimize(asm);
-        assert_eq!(result.trim(), "movq %rax, -8(%rbp)");
+        assert_eq!(result.trim_ascii(), "movq %rax, -8(%rbp)");
     }
 
     #[test]
@@ -4219,7 +4209,7 @@ mod tests {
     fn test_self_move() {
         let asm = "    movq %rax, %rax\n".to_string();
         let result = peephole_optimize(asm);
-        assert_eq!(result.trim(), "");
+        assert_eq!(result.trim_ascii(), "");
     }
 
     #[test]
@@ -4312,10 +4302,10 @@ mod tests {
     fn has_fused_branch(result: &str, want_true: &str, want_false: &str) -> bool {
         result
             .lines()
-            .any(|l| l.trim_start().starts_with(want_true))
+            .any(|l| l.trim_ascii_start().starts_with(want_true))
             || result
                 .lines()
-                .any(|l| l.trim_start().starts_with(want_false))
+                .any(|l| l.trim_ascii_start().starts_with(want_false))
     }
 
     #[test]
@@ -5160,7 +5150,7 @@ mod tests {
             result
         );
         assert!(
-            result.trim_end().ends_with("cltq"),
+            result.trim_ascii_end().ends_with("cltq"),
             "the surviving cltq must be the one after the call: {}",
             result
         );
@@ -5490,12 +5480,12 @@ mod regression_tests {
         // the cmpl that reads it. The cmpl must compare the correct value.
         let lines: Vec<&str> = result.lines().collect();
         for (idx, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
+            let trimmed = line.trim_ascii();
             if trimmed == "cmpl -144(%rbp), %eax" {
                 // Scan backward for a store to -144
                 let mut found_store = false;
                 for k in (0..idx).rev() {
-                    let prev = lines[k].trim();
+                    let prev = lines[k].trim_ascii();
                     if prev.ends_with("-144(%rbp)") && prev.starts_with("mov") {
                         found_store = true;
                         break;
@@ -5608,7 +5598,7 @@ mod regression_tests {
         let result = peephole_optimize(asm);
         // The store to -8(%rbp) must survive because the read at -4(%rbp) overlaps it.
         // The load must also survive.
-        let lines: Vec<&str> = result.lines().map(|l| l.trim()).collect();
+        let lines: Vec<&str> = result.lines().map(|l| l.trim_ascii()).collect();
         let has_store = lines
             .iter()
             .any(|l| l.contains("%rsi") && l.contains("(%rbp)"));
@@ -5759,7 +5749,7 @@ mod regression_tests {
         assert!(super::local_patterns::fold_base_index_addressing(
             &mut store, &mut infos
         ));
-        assert_eq!(store.get(5).trim(), "movb $0, (%rcx, %r14)");
+        assert_eq!(store.get(5).trim_ascii(), "movb $0, (%rcx, %r14)");
         // Pipeline level: with exact liveness an earlier pass may retarget
         // the add onto %rcx first (`addq %r14, %rcx; movb $0, (%rcx)`); either
         // way the accumulator round-trip must be gone.
@@ -6403,7 +6393,7 @@ mod regression_tests {
         assert!(out.contains("movdqu %xmm0, %xmm1"), "{out}");
         assert!(out.contains("movdqu %xmm1, (%rsi)"), "{out}");
         assert_eq!(
-            out.lines().filter(|l| l.trim() == "ret").count(),
+            out.lines().filter(|l| l.trim_ascii() == "ret").count(),
             2,
             "{out}"
         );
@@ -6462,7 +6452,7 @@ mod regression_tests {
         let epi = &out[out.find("addq $24, %rsp").unwrap()..];
         let order: Vec<&str> = epi
             .lines()
-            .filter(|l| l.trim().starts_with("popq"))
+            .filter(|l| l.trim_ascii().starts_with("popq"))
             .collect();
         assert_eq!(order, ["    popq %rbp", "    popq %rbx"], "{out}");
     }

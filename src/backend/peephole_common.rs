@@ -28,7 +28,7 @@ pub(crate) fn strip_volatile_markers(asm: String) -> String {
     }
     asm.split_inclusive('\n')
         .filter(|line| {
-            let t = line.trim();
+            let t = line.trim_ascii();
             t != "# LCCC_VOLATILE_BEGIN" && t != "# LCCC_VOLATILE_END"
         })
         .collect()
@@ -185,13 +185,13 @@ pub(crate) fn rename_register_operand(line: &str, old: &str, new: &str) -> Strin
     if old.is_empty() || old == new {
         return line.to_owned();
     }
-    let trimmed = line.trim();
+    let trimmed = line.trim_ascii();
     let Some((lo, hi)) = register_operand_span(trimmed) else {
         return line.to_owned();
     };
     match rename_in_span(trimmed, lo, hi, old, new) {
         Some(renamed) => {
-            let leading = line.len() - line.trim_start().len();
+            let leading = line.len() - line.trim_ascii_start().len();
             format!("{}{renamed}", &line[..leading])
         }
         None => line.to_owned(),
@@ -202,6 +202,422 @@ pub(crate) fn rename_register_operand(line: &str, old: &str, new: &str) -> Strin
 /// a match (vacuous empty matches at punctuation / EOF are not useful).
 pub(crate) fn has_whole_word(text: &str, word: &str) -> bool {
     find_whole_word(text.as_bytes(), word.as_bytes(), 0).is_some()
+}
+
+// ── Fast instruction-prefix probing ─────────────────────────────────────────
+
+/// A compile-time-packed instruction prefix for branch-only matching.
+///
+/// The peephole's recognizer ladders (`PURE_WRITE_PREFIXES.iter().find(|p|
+/// t.starts_with(p))` and friends) called `memcmp` once per prefix per line
+/// per pass per iteration: Callgrind attributed over 10% of a 40-function
+/// TU's instructions to `<[u8]>::starts_with` plus `__memcmp_avx2_movbe`,
+/// 2.2M probe calls from `eliminate_dead_pure_writes` alone.  Packing each
+/// prefix (they are all ≤ 8 bytes) into a `u64` constant turns a probe into
+/// `first8 & mask == packed`: one AND and one compare, no call, no loop.
+///
+/// Matching is exact `starts_with` semantics: a line shorter than the
+/// prefix zero-pads, and no prefix contains a NUL byte, so the padded
+/// compare can never false-positive.
+#[derive(Clone, Copy)]
+pub(crate) struct Pfx {
+    packed: u64,
+    mask: u64,
+    text: &'static str,
+}
+
+impl Pfx {
+    /// Pack `s` (1..=8 bytes) for prefix matching.  Compile-time: a longer
+    /// string fails the `assert!` during constant evaluation.
+    pub(crate) const fn new(s: &'static str) -> Pfx {
+        let b = s.as_bytes();
+        assert!(!b.is_empty() && b.len() <= 8, "Pfx wants 1..=8 bytes");
+        let mut packed = 0u64;
+        let mut i = 0;
+        while i < b.len() {
+            // `first8` zero-pads lines shorter than eight bytes, so a prefix
+            // containing NUL could match the padding of a shorter line.  No
+            // assembly mnemonic contains NUL; enforce the soundness argument
+            // at constant evaluation instead of in a doc comment.
+            assert!(b[i] != 0, "Pfx cannot contain NUL");
+            packed |= (b[i] as u64) << (8 * i);
+            i += 1;
+        }
+        let mask = if b.len() == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * b.len())) - 1
+        };
+        Pfx {
+            packed,
+            mask,
+            text: s,
+        }
+    }
+
+    /// The original prefix text (so converted call sites can keep slicing
+    /// operands with `&t[p.len()..]` exactly as before).
+    #[inline]
+    pub(crate) fn text(self) -> &'static str {
+        self.text
+    }
+
+    /// `t.starts_with(self.text)`, given `first8(t)`.
+    #[inline]
+    pub(crate) fn matches(self, first8: u64) -> bool {
+        first8 & self.mask == self.packed
+    }
+}
+
+/// The first eight bytes of `t`, little-endian packed, zero-padded.
+#[inline]
+pub(crate) fn first8(t: &str) -> u64 {
+    let b = t.as_bytes();
+    if b.len() >= 8 {
+        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    } else {
+        let mut buf = [0u8; 8];
+        let mut i = 0;
+        while i < b.len() {
+            buf[i] = b[i];
+            i += 1;
+        }
+        u64::from_le_bytes(buf)
+    }
+}
+
+/// First match of `set` against `t`, in table order (the exact semantics of
+/// `set.iter().find(|p| t.starts_with(p))` on the same list).
+#[inline]
+pub(crate) fn find_pfx(t: &str, set: &'static [Pfx]) -> Option<&'static str> {
+    let f8 = first8(t);
+    set.iter().find(|p| p.matches(f8)).map(|p| p.text)
+}
+
+/// Position of the first `.LBB` in `s` — exact `s.find(".LBB")` semantics.
+///
+/// `str::find(&str)` builds a `StrSearcher` per call (two-way search
+/// preprocessing); at 700K calls per mixed TU that setup alone was ~2% of
+/// the compile's instructions. This scans for `'.'` with the memchr fast
+/// path and confirms the three following bytes inline.
+#[inline]
+pub(crate) fn find_lbb(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut pos = 0usize;
+    while pos < b.len() {
+        let dot = s[pos..].find('.')? + pos;
+        if b.len() - dot >= 4 && b[dot + 1] == b'L' && b[dot + 2] == b'B' && b[dot + 3] == b'B' {
+            return Some(dot);
+        }
+        pos = dot + 1;
+    }
+    None
+}
+
+/// A `starts_with` prefix of ANY length, probed branch-only through its
+/// first eight bytes.  A prefix longer than eight bytes confirms a probe
+/// hit with one full `starts_with` — the eight matched bytes make such
+/// confirms vanishingly rare, so ladders of long SSE/AVX spellings
+/// (`cvttsd2si `, `pbroadcast`) still cost one AND and one compare per
+/// entry on the overwhelmingly common miss path.
+#[derive(Clone, Copy)]
+pub(crate) struct LPfx {
+    packed: u64,
+    mask: u64,
+    full: &'static str,
+}
+
+impl LPfx {
+    /// Pack the first `min(len, 8)` bytes of `s` (non-empty, no NUL among
+    /// the packed bytes) for probing; keep the full text for the confirm.
+    pub(crate) const fn new(s: &'static str) -> LPfx {
+        let b = s.as_bytes();
+        assert!(!b.is_empty(), "LPfx wants a non-empty prefix");
+        let n = if b.len() < 8 { b.len() } else { 8 };
+        let mut packed = 0u64;
+        let mut i = 0;
+        while i < n {
+            assert!(b[i] != 0, "LPfx cannot contain NUL");
+            packed |= (b[i] as u64) << (8 * i);
+            i += 1;
+        }
+        let mask = if n == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * n)) - 1
+        };
+        LPfx {
+            packed,
+            mask,
+            full: s,
+        }
+    }
+
+    /// `t.starts_with(self.full())`, given `first8(t)` and `t` itself.
+    #[inline]
+    pub(crate) fn matches(self, first8: u64, t: &str) -> bool {
+        first8 & self.mask == self.packed && (self.full.len() <= 8 || t.starts_with(self.full))
+    }
+
+    /// The original prefix text.
+    #[inline]
+    pub(crate) fn full(self) -> &'static str {
+        self.full
+    }
+}
+
+/// Branch-only `set.iter().any(|p| t.starts_with(p))` (same entries, same
+/// order, same early exit).
+#[inline]
+pub(crate) fn any_pfx(t: &str, set: &'static [LPfx]) -> bool {
+    let f8 = first8(t);
+    set.iter().any(|p| p.matches(f8, t))
+}
+
+#[cfg(test)]
+mod lpfx_oracle_tests {
+    use super::{LPfx, any_pfx};
+
+    /// `LPfx::matches`/`any_pfx` must agree with `str::starts_with` for
+    /// short and long prefixes, including the probe-hit/confirm-miss edge
+    /// where the first eight bytes match but the tail does not.
+    #[test]
+    fn any_pfx_is_any_starts_with() {
+        const SET: &[LPfx] = &[
+            LPfx::new("mov"),
+            LPfx::new("cvttsd2si "),
+            LPfx::new("pbroadcast"),
+        ];
+        let strs = ["mov", "cvttsd2si ", "pbroadcast"];
+        let probes = [
+            "",
+            "m",
+            "mov",
+            "movq %rax, %rbx",
+            "cvttsd2s",
+            "cvttsd2si",
+            "cvttsd2si %xmm0, %eax",
+            "cvttsd2siq %xmm0, %rax",
+            "pbroadcas",
+            "pbroadcast",
+            "pbroadcastb %xmm0, %ymm1",
+            "pbroadcasX",
+            "xor %eax, %eax",
+        ];
+        for t in probes {
+            for (p, raw) in SET.iter().zip(strs) {
+                assert_eq!(
+                    p.matches(super::first8(t), t),
+                    t.starts_with(raw),
+                    "LPfx({raw:?}) on {t:?}"
+                );
+            }
+            assert_eq!(
+                any_pfx(t, SET),
+                strs.iter().any(|p| t.starts_with(p)),
+                "any_pfx on {t:?}"
+            );
+        }
+    }
+}
+
+/// `t.starts_with(PREFIX)` as a branch-only probe of a compile-time-packed
+/// constant: `pfx!(f8, "movslq ")`, where `f8` is `first8(t)` of the probed
+/// text, computed once per line.  Expands to one AND and one compare; the
+/// `Pfx` constant (and its 1..=8-byte / no-NUL invariants) are checked at
+/// constant evaluation.
+macro_rules! pfx {
+    ($f8:expr, $s:expr) => {{
+        const P: $crate::backend::peephole_common::Pfx =
+            $crate::backend::peephole_common::Pfx::new($s);
+        P.matches($f8)
+    }};
+}
+pub(crate) use pfx;
+
+/// A compile-time-packed token for branch-only EQUALITY matching (the
+/// whole-token analogue of [`Pfx`]): `op == "add"` over a mnemonic table
+/// becomes one length compare plus one `u64` compare per entry, no `memcmp`.
+///
+/// The length is matched exactly, so the probe equals `str` equality even
+/// for probed text containing NUL bytes (where a padding-only compare could
+/// false-positive on zero-padded packings).
+#[derive(Clone, Copy)]
+pub(crate) struct Tok8 {
+    packed: u64,
+    len: u8,
+    text: &'static str,
+}
+
+impl Tok8 {
+    /// Pack `s` (1..=8 bytes, no NUL) for equality matching.
+    pub(crate) const fn new(s: &'static str) -> Tok8 {
+        let b = s.as_bytes();
+        assert!(!b.is_empty() && b.len() <= 8, "Tok8 wants 1..=8 bytes");
+        let mut packed = 0u64;
+        let mut i = 0;
+        while i < b.len() {
+            assert!(b[i] != 0, "Tok8 cannot contain NUL");
+            packed |= (b[i] as u64) << (8 * i);
+            i += 1;
+        }
+        Tok8 {
+            packed,
+            len: b.len() as u8,
+            text: s,
+        }
+    }
+
+    /// The original token text.
+    #[inline]
+    pub(crate) fn text(self) -> &'static str {
+        self.text
+    }
+
+    /// `op == self.text()`, given `first8(op)` and `op.len()`.
+    #[inline]
+    pub(crate) fn matches(self, first8: u64, len: usize) -> bool {
+        len == self.len as usize && first8 == self.packed
+    }
+}
+
+/// First entry of `set` equal to `op`, in table order (the exact semantics
+/// of `set.iter().find(|e| *e == op)` on the same list).
+#[inline]
+pub(crate) fn find_tok8(op: &str, set: &'static [Tok8]) -> Option<&'static str> {
+    let w = first8(op);
+    let n = op.len();
+    set.iter().find(|e| e.matches(w, n)).map(|e| e.text)
+}
+
+#[cfg(test)]
+mod tok8_oracle_tests {
+    use super::{Tok8, find_tok8};
+
+    /// `find_tok8` must agree with linear `==` search for every probe,
+    /// including same-prefix longer/shorter tokens, 8-byte entries, and a
+    /// NUL-bearing probe that a padding-only compare would false-match.
+    #[test]
+    fn find_tok8_is_eq_find() {
+        const SET: &[Tok8] = &[
+            Tok8::new("add"),
+            Tok8::new("sub"),
+            Tok8::new("popcnt"),
+            Tok8::new("cmpxchg8"),
+        ];
+        let strs = ["add", "sub", "popcnt", "cmpxchg8"];
+        let probes = [
+            "",
+            "a",
+            "ad",
+            "add",
+            "addq",
+            "addresses",
+            "sub",
+            "subb",
+            "popcnt",
+            "popcntq",
+            "cmpxchg8",
+            "cmpxchg8b",
+            "add\0",
+            "ad\0",
+            "xor",
+        ];
+        for op in probes {
+            assert_eq!(
+                find_tok8(op, SET),
+                strs.iter().find(|s| **s == op).copied(),
+                "on {op:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod find_lbb_oracle_tests {
+    /// `find_lbb` must have the exact semantics of `s.find(".LBB")`,
+    /// including dots that don't open a label, trailing partial matches,
+    /// and a match at the very end of the line.
+    #[test]
+    fn find_lbb_is_find() {
+        let cases = [
+            "",
+            ".",
+            ".L",
+            ".LB",
+            ".LBB",
+            "jmp .LBB0_3",
+            "jne .Ltmp4",
+            "leaq .Lconst(%rip), %rax # .LBB1_2",
+            "movsd .LCPI0_0(%rip), %xmm0",
+            "..LBB",
+            ".X.LBB2_7",
+            "no label here",
+            "ends with .LB",
+            "text .LBB",
+        ];
+        for s in cases {
+            assert_eq!(super::find_lbb(s), s.find(".LBB"), "on {s:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pfx_oracle_tests {
+    use super::{Pfx, find_pfx, first8};
+
+    /// `Pfx::matches(first8(t))` must agree with `t.starts_with(p)` for
+    /// every prefix length 1..=8 against lines shorter, equal, and longer
+    /// than the prefix — including the zero-padding edge where `t` is
+    /// shorter than eight bytes.
+    #[test]
+    fn matches_is_starts_with() {
+        const PREFIXES: &[Pfx] = &[
+            Pfx::new("j"),
+            Pfx::new("cmp"),
+            Pfx::new("test"),
+            Pfx::new("movdqu "),
+            Pfx::new("vmovdqa "),
+        ];
+        let lines = [
+            "",
+            "j",
+            "jmp .L1",
+            "cmp",
+            "cmpl $1, %eax",
+            "cmovne %eax, %ebx",
+            "test",
+            "testb $1, (%rax)",
+            "testament",
+            "movdqu",
+            "movdqu %xmm0, (%rdi)",
+            "movdqa %xmm0, %xmm1",
+            "vmovdqa %ymm0, %ymm1",
+            "vmovdqa ",
+            "vmovdq",
+            "xchg %rax, %rbx",
+        ];
+        for t in lines {
+            let f8 = first8(t);
+            for p in PREFIXES {
+                assert_eq!(
+                    p.matches(f8),
+                    t.starts_with(p.text()),
+                    "Pfx({:?}) vs starts_with on {t:?}",
+                    p.text()
+                );
+            }
+            // find_pfx keeps table order: first starts_with winner.
+            assert_eq!(
+                find_pfx(t, PREFIXES),
+                PREFIXES
+                    .iter()
+                    .find(|p| t.starts_with(p.text()))
+                    .map(|p| p.text()),
+                "find_pfx order on {t:?}"
+            );
+        }
+    }
 }
 
 // ── Source-operand rewrite ───────────────────────────────────────────────────
@@ -309,7 +725,7 @@ fn splice_source_rewrite(
     if rewritten == src {
         return None;
     }
-    let leading = line.len() - line.trim_start().len();
+    let leading = line.len() - line.trim_ascii_start().len();
     let mut out = String::with_capacity(leading + trimmed.len() + new_reg.len());
     out.push_str(&line[..leading]);
     out.push_str(&trimmed[..src_abs_lo]);
@@ -335,7 +751,7 @@ pub(crate) fn replace_source_reg_in_instruction(
     if old_reg.is_empty() || old_reg == new_reg {
         return None;
     }
-    let trimmed = line.trim();
+    let trimmed = line.trim_ascii();
     let op_at = operands_start(trimmed)?;
     let comma = trimmed[op_at..].find(',')?;
     let src_lo = op_at + comma;
@@ -345,7 +761,7 @@ pub(crate) fn replace_source_reg_in_instruction(
         return None;
     }
     let renamed = rename_in_span(trimmed, src_lo, hi, old_reg, new_reg)?;
-    let leading = line.len() - line.trim_start().len();
+    let leading = line.len() - line.trim_ascii_start().len();
     Some(format!("{}{renamed}", &line[..leading]))
 }
 
@@ -363,7 +779,7 @@ pub(crate) fn replace_source_reg_att(line: &str, old_reg: &str, new_reg: &str) -
     if old_reg.is_empty() || old_reg == new_reg {
         return None;
     }
-    let trimmed = line.trim();
+    let trimmed = line.trim_ascii();
     let op_at = operands_start(trimmed)?;
     let args = &trimmed[op_at..];
     // Top-level split only: `movb %al, (%r10,%r12)` has its LAST comma inside
@@ -395,6 +811,23 @@ pub(crate) struct LineStore {
     original: String,
     entries: Vec<LineEntry>,
     replacements: Vec<String>,
+    /// Lazily computed per-line content digests (0 = not yet computed; a
+    /// computed digest always has its low bit set so it can never be 0).
+    ///
+    /// `FileLiveness`' per-function memo keys re-hash every line of a
+    /// function on every `FileLiveness::new` — 64 pass call sites times one
+    /// string hash per line made the key derivation alone 4% of a compile's
+    /// instructions (Callgrind, 40-function mixed TU at -O1).  A line's text
+    /// changes only through [`replace`]/[`insert_line`], so the store is the
+    /// one place that can memoize the text half of those keys exactly.
+    ///
+    /// `Cell` keeps `get`-side laziness without threading `&mut` through
+    /// every reader: the store is used strictly thread-locally (each
+    /// metric-pair candidate builds its own), so no `Sync` is required.
+    ///
+    /// [`replace`]: LineStore::replace
+    /// [`insert_line`]: LineStore::insert_line
+    digests: Vec<std::cell::Cell<u64>>,
 }
 
 /// Length of `line` excluding its trailing ASCII blanks — the same set
@@ -487,11 +920,39 @@ impl LineStore {
                 line_len_without_trailing_blanks(&bytes[start..total]),
             ));
         }
+        let digests = vec![std::cell::Cell::new(0u64); entries.len()];
         LineStore {
             original: asm,
             entries,
             replacements: Vec::new(),
+            digests,
         }
+    }
+
+    /// Content digest of line `idx`'s stored text (leading indentation
+    /// included), computed on first use and cached until the line changes.
+    ///
+    /// Only equality of the underlying text is promised: equal text yields
+    /// equal digests, and a digest survives exactly as long as the text it
+    /// was computed from.  Callers fold it into wider keys (see
+    /// `FileLiveness::hash_function`), which is why it is deliberately the
+    /// raw `FxHasher` word fold of the bytes — the caller applies its own
+    /// finalizer.
+    #[inline]
+    pub(crate) fn line_digest(&self, idx: usize) -> u64 {
+        let cell = &self.digests[idx];
+        let cached = cell.get();
+        if cached != 0 {
+            return cached;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = crate::common::fx_hash::FxHasher::default();
+        self.get(idx).hash(&mut h);
+        // `| 1` reserves 0 as the "not computed" sentinel; losing one bit of
+        // the 64 is immaterial for a key that is folded twice downstream.
+        let d = h.finish() | 1;
+        cell.set(d);
+        d
     }
 
     #[inline]
@@ -529,6 +990,7 @@ impl LineStore {
     pub(crate) fn replace(&mut self, idx: usize, mut new_text: String) {
         let end = line_len_without_trailing_blanks(new_text.as_bytes());
         new_text.truncate(end);
+        self.digests[idx].set(0);
         let e = &mut self.entries[idx];
         if e.len == REPLACED {
             self.replacements[e.start as usize] = new_text;
@@ -565,6 +1027,7 @@ impl LineStore {
                 len: REPLACED,
             },
         );
+        self.digests.insert(idx, std::cell::Cell::new(0));
     }
 
     /// Concatenate kept lines, each followed by `\n`.
@@ -608,13 +1071,13 @@ impl LineStore {
                 result.push_str(self.get(i));
                 result.push('\n');
             } else {
-                let text = self.get(i).trim();
+                let text = self.get(i).trim_ascii();
                 if is_inline_range_marker(text) {
                     held.push(i);
                 } else if is_loc_directive(text) {
                     if let Some(pos) = held
                         .iter()
-                        .rposition(|&row| is_loc_directive(self.get(row).trim()))
+                        .rposition(|&row| is_loc_directive(self.get(row).trim_ascii()))
                     {
                         held.remove(pos);
                     }
@@ -623,7 +1086,7 @@ impl LineStore {
             }
         }
         for row in held {
-            if is_inline_range_marker(self.get(row).trim()) {
+            if is_inline_range_marker(self.get(row).trim_ascii()) {
                 result.push_str(self.get(row));
                 result.push('\n');
             }
@@ -638,7 +1101,7 @@ impl LineStore {
 /// puts the rows back.
 pub(crate) fn hide_debug_rows<K: Copy>(lines: &[String], kinds: &mut [K], deleted: K) {
     for (line, kind) in lines.iter().zip(kinds.iter_mut()) {
-        let text = line.trim();
+        let text = line.trim_ascii();
         if is_loc_directive(text) || is_inline_range_marker(text) {
             *kind = deleted;
         }
@@ -664,11 +1127,14 @@ pub(crate) fn join_with_debug_rows(lines: &[String], kept: impl Fn(usize) -> boo
             result.push_str(line);
             result.push('\n');
         } else {
-            let text = line.trim();
+            let text = line.trim_ascii();
             if is_inline_range_marker(text) {
                 held.push(line);
             } else if is_loc_directive(text) {
-                if let Some(pos) = held.iter().rposition(|row| is_loc_directive(row.trim())) {
+                if let Some(pos) = held
+                    .iter()
+                    .rposition(|row| is_loc_directive(row.trim_ascii()))
+                {
                     held.remove(pos);
                 }
                 held.push(line);
@@ -676,7 +1142,7 @@ pub(crate) fn join_with_debug_rows(lines: &[String], kept: impl Fn(usize) -> boo
         }
     }
     for row in held {
-        if is_inline_range_marker(row.trim()) {
+        if is_inline_range_marker(row.trim_ascii()) {
             result.push_str(row);
             result.push('\n');
         }
@@ -797,7 +1263,7 @@ pub(crate) fn is_inline_range_marker(trimmed: &str) -> bool {
 /// (`alignment_fill_is_explicit`), while `.p2align 4,,10` -- empty fill, `max`
 /// only -- stays benign.
 pub(crate) fn directive_emits_data(text: &str) -> bool {
-    let trimmed = text.trim();
+    let trimmed = text.trim_ascii();
     if !trimmed.starts_with('.') {
         return false;
     }
@@ -883,7 +1349,7 @@ pub(crate) fn directive_emits_data(text: &str) -> bool {
 pub(crate) fn alignment_fill_is_explicit(args: &str) -> bool {
     let mut fields = args.split(',');
     let _ = fields.next(); // <align>
-    matches!(fields.next(), Some(fill) if !fill.trim().is_empty())
+    matches!(fields.next(), Some(fill) if !fill.trim_ascii().is_empty())
 }
 
 /// Byte length of `b` with a trailing, unquoted `#` comment removed.
@@ -977,7 +1443,7 @@ pub(crate) enum SectionSwitch {
 /// sections keeps treating it as possibly executed). The compound-statement
 /// keyword test over-matches on purpose for the same reason.
 pub(crate) fn section_switch(text: &str) -> Option<SectionSwitch> {
-    let trimmed = text.trim();
+    let trimmed = text.trim_ascii();
     let Some(stmt) = single_asm_statement(trimmed) else {
         let mentions = ["section", ".text", ".data", ".bss", ".previous"]
             .iter()
@@ -1006,7 +1472,7 @@ pub(crate) fn section_switch(text: &str) -> Option<SectionSwitch> {
 /// applies the defaults of the special section names, and gives every other
 /// name no flags at all (so not executable).
 fn section_kind_from_args(args: &str) -> SectionKind {
-    let args = args.trim();
+    let args = args.trim_ascii();
     let (name, after) = if let Some(q) = args.strip_prefix('"') {
         match q.find('"') {
             Some(end) => (&q[..end], &q[end + 1..]),
@@ -1026,7 +1492,7 @@ fn section_kind_from_args(args: &str) -> SectionKind {
         || name == ".init"
         || name == ".fini"
         || name.starts_with(".gnu.linkonce.t.");
-    let after = after.trim_start();
+    let after = after.trim_ascii_start();
     if after.is_empty() {
         return if code_name {
             SectionKind::Code
@@ -1133,7 +1599,7 @@ fn single_asm_statement(text: &str) -> Option<&str> {
         } else {
             match b {
                 b'"' | b'\'' => quote = Some(b),
-                b'#' => return Some(text[..i].trim_end()),
+                b'#' => return Some(text[..i].trim_ascii_end()),
                 b';' | b'\n' | b'\r' => return None,
                 _ => {}
             }
@@ -1145,7 +1611,7 @@ fn single_asm_statement(text: &str) -> Option<&str> {
 /// Exact debug-attribution tokens, excluding compound assembler statements.
 /// Honor quoted filenames, escapes and trailing comments without allocation.
 pub(crate) fn is_debug_marker_directive(text: &str) -> bool {
-    let text = text.trim();
+    let text = text.trim_ascii();
     matches!(text.split_whitespace().next(), Some(".loc" | ".file"))
         && single_asm_statement(text).is_some()
 }
@@ -1182,7 +1648,7 @@ pub(crate) fn is_debug_marker_directive(text: &str) -> bool {
 /// Unknown directives are opaque: the cost of a missed fold is a few bytes, the
 /// cost of a wrong one is a miscompiled object.
 pub(crate) fn inert_directive(text: &str) -> bool {
-    let t = text.trim();
+    let t = text.trim_ascii();
     if !t.starts_with('.') {
         return false;
     }
@@ -1245,7 +1711,7 @@ pub(crate) fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::o
     let mut depth = 0usize;
     let mut region_start: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
-        let t = line.trim();
+        let t = line.trim_ascii();
         if t == "#APP" {
             match function.as_mut() {
                 Some((_, _, has_asm)) => *has_asm = true,
@@ -1269,20 +1735,20 @@ pub(crate) fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::o
             let Some((name, kind)) = rest.split_once(',') else {
                 continue;
             };
-            if matches!(kind.trim(), "%function" | "@function") {
+            if matches!(kind.trim_ascii(), "%function" | "@function") {
                 if function.is_some() {
                     return None;
                 }
-                function = Some((name.trim(), i, false));
+                function = Some((name.trim_ascii(), i, false));
             }
             continue;
         }
         if let Some(rest) = t.strip_prefix(".size ")
             && let Some((name, expr)) = rest.split_once(',')
             && let Some((open, start, has_asm)) = function
-            && name.trim() == open
+            && name.trim_ascii() == open
         {
-            if expr.trim().strip_prefix(".-") != Some(open) {
+            if expr.trim_ascii().strip_prefix(".-") != Some(open) {
                 return None;
             }
             if has_asm {
@@ -1552,7 +2018,7 @@ mod directive_law_enforcement {
                         || lines[..i]
                             .iter()
                             .rev()
-                            .take_while(|l| l.trim_start().starts_with("//"))
+                            .take_while(|l| l.trim_ascii_start().starts_with("//"))
                             .any(|l| l.contains("DIRECTIVE-LAW:"));
                     if marked {
                         continue;
@@ -1561,7 +2027,7 @@ mod directive_law_enforcement {
                         "{}:{}: {}",
                         path.strip_prefix(root).unwrap_or(&path).display(),
                         i + 1,
-                        line.trim()
+                        line.trim_ascii()
                     ));
                 }
             }
@@ -1725,13 +2191,13 @@ mod tests {
                 let line = store.get(i);
                 assert_eq!(
                     line,
-                    line.trim_end(),
+                    line.trim_ascii_end(),
                     "padding {padding:?} survived into line {i}: {line:?}"
                 );
             }
             let built = store.build_result(|_| false);
             assert!(
-                built.split('\n').all(|line| line.trim_end() == line),
+                built.split('\n').all(|line| line.trim_ascii_end() == line),
                 "build_result re-emitted trailing whitespace for {padding:?}: {built:?}"
             );
         }
@@ -1841,20 +2307,20 @@ mod tests {
         // so a plain rfind(',') would report `%r12)` as the destination.
         let l = "movb %al, (%r10,%r12)";
         let c = last_top_level_comma(l.as_bytes()).unwrap();
-        assert_eq!(l[..c].trim(), "movb %al");
-        assert_eq!(l[c + 1..].trim(), "(%r10,%r12)");
+        assert_eq!(l[..c].trim_ascii(), "movb %al");
+        assert_eq!(l[c + 1..].trim_ascii(), "(%r10,%r12)");
         // A scale field adds a third comma inside the address.
         let l = "movq %rax, 16(%rbx,%rcx,8)";
         let c = last_top_level_comma(l.as_bytes()).unwrap();
-        assert_eq!(l[c + 1..].trim(), "16(%rbx,%rcx,8)");
+        assert_eq!(l[c + 1..].trim_ascii(), "16(%rbx,%rcx,8)");
         // Load: the destination is the register; address commas are skipped.
         let l = "movzbl (%r10,%r12), %edx";
         let c = last_top_level_comma(l.as_bytes()).unwrap();
-        assert_eq!(l[c + 1..].trim(), "%edx");
+        assert_eq!(l[c + 1..].trim_ascii(), "%edx");
         // Plain register-register form is unaffected by the depth tracking.
         let l = "addq %rax, %rbx";
         let c = last_top_level_comma(l.as_bytes()).unwrap();
-        assert_eq!(l[c + 1..].trim(), "%rbx");
+        assert_eq!(l[c + 1..].trim_ascii(), "%rbx");
         // A single-operand form has NO top-level comma; rfind(',') would
         // invent a destination out of the SIB field.
         assert_eq!(last_top_level_comma("incl (%rbx,%rcx,4)".as_bytes()), None);
@@ -2024,7 +2490,7 @@ mod debug_row_tests {
             ".Llccc_inline_e_12_34_pq_frame:  # endpoint",
             "\t.Llccc_inline_b_7_9_foo.bar$baz:\r",
         ] {
-            assert!(is_inline_range_marker(t.trim()), "{t}");
+            assert!(is_inline_range_marker(t.trim_ascii()), "{t}");
         }
         for t in [
             "main:",

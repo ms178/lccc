@@ -137,7 +137,7 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
                     *d += 8;
                 }
             } else if trimmed.starts_with("popq ") || trimmed.starts_with("pop ") {
-                let rhs = trimmed[trimmed.find(' ').unwrap() + 1..].trim();
+                let rhs = trimmed[trimmed.find(' ').unwrap() + 1..].trim_ascii();
                 if rhs == "%rsp" {
                     // `popq %rsp` reassigns the pointer itself.
                     depth = None;

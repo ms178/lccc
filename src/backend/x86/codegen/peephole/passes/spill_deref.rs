@@ -51,10 +51,10 @@ use super::helpers::*;
 fn rbp_is_frame_at(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
     let mut j = idx;
     loop {
-        let trimmed = infos[j].trimmed(store.get(j));
-        if trimmed.starts_with(".cfi_startproc") {
+        if infos[j].cfi == CfiMark::Start && !infos[j].is_nop() {
             return false;
         }
+        let trimmed = infos[j].trimmed(store.get(j));
         if trimmed == "movq %rsp, %rbp" || trimmed == "movl %esp, %ebp" {
             return true;
         }
@@ -433,12 +433,12 @@ fn reads_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> bool
 /// Returns (mnemonic, base_reg_family, dest_text) or None.
 /// base_reg must equal `expected_base`.
 fn parse_plain_deref(line: &str, expected_base: u8) -> Option<(&'static str, u8, String)> {
-    let t = line.trim();
+    let t = line.trim_ascii();
     for mnem in [
         "movzbl", "movzwl", "movb", "movw", "movl", "movq", "movzbq", "movzwq",
     ] {
         if let Some(rest) = t.strip_prefix(mnem) {
-            let rest = rest.trim_start();
+            let rest = rest.trim_ascii_start();
             // format: (%reg), %dest
             if let Some(mem) = rest.strip_prefix('(') {
                 let paren_end = mem.find(')')?;
@@ -448,8 +448,8 @@ fn parse_plain_deref(line: &str, expected_base: u8) -> Option<(&'static str, u8,
                     if base_fam != expected_base {
                         return None;
                     }
-                    let after = mem[paren_end + 1..].trim_start();
-                    let after = after.strip_prefix(',')?.trim_start();
+                    let after = mem[paren_end + 1..].trim_ascii_start();
+                    let after = after.strip_prefix(',')?.trim_ascii_start();
                     if !after.starts_with('%') {
                         return None;
                     }
@@ -630,10 +630,10 @@ fn first_top_level_comma(bytes: &[u8]) -> Option<usize> {
 fn parse_2op_store(line: &str) -> Option<(&str, &str, &str)> {
     let mnem_end = line.find(' ')?;
     let mnem = &line[..mnem_end];
-    let rest = line[mnem_end..].trim_start();
+    let rest = line[mnem_end..].trim_ascii_start();
     let comma = first_top_level_comma(rest.as_bytes())?;
-    let src = rest[..comma].trim();
-    let mem = rest[comma + 1..].trim();
+    let src = rest[..comma].trim_ascii();
+    let mem = rest[comma + 1..].trim_ascii();
     if !src.starts_with('%') || !(mem.ends_with("(%rsp)") || mem.ends_with("(%rbp)")) {
         return None;
     }
@@ -645,10 +645,10 @@ fn parse_2op_store(line: &str) -> Option<(&str, &str, &str)> {
 fn parse_2op_load(line: &str) -> Option<(&str, &str, &str)> {
     let mnem_end = line.find(' ')?;
     let mnem = &line[..mnem_end];
-    let rest = line[mnem_end..].trim_start();
+    let rest = line[mnem_end..].trim_ascii_start();
     let comma = first_top_level_comma(rest.as_bytes())?;
-    let mem = rest[..comma].trim();
-    let dst = rest[comma + 1..].trim();
+    let mem = rest[..comma].trim_ascii();
+    let dst = rest[comma + 1..].trim_ascii();
     let ok_mem = mem.starts_with('(') || mem.ends_with("(%rsp)") || mem.ends_with("(%rbp)");
     if !ok_mem || !dst.starts_with('%') {
         return None;
@@ -659,10 +659,10 @@ fn parse_2op_load(line: &str) -> Option<(&str, &str, &str)> {
 /// Parse `off(%rsp)` or `off(%rbp)` → (offset, base) with base 4=rsp 5=rbp.
 fn parse_slot(mem: &str) -> Option<(i32, u8)> {
     if let Some(rest) = mem.strip_suffix("(%rsp)") {
-        return rest.trim().parse::<i32>().ok().map(|n| (n, 4));
+        return rest.trim_ascii().parse::<i32>().ok().map(|n| (n, 4));
     }
     if let Some(rest) = mem.strip_suffix("(%rbp)") {
-        return rest.trim().parse::<i32>().ok().map(|n| (n, 5));
+        return rest.trim_ascii().parse::<i32>().ok().map(|n| (n, 5));
     }
     None
 }
@@ -716,10 +716,9 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
         if infos[k].is_nop() {
             continue;
         }
-        let t = infos[k].trimmed(store.get(k));
-        if t.starts_with(".cfi_startproc") && start.is_none() {
+        if infos[k].is_cfi_start() && start.is_none() {
             start = Some(k);
-        } else if t.starts_with(".size ") {
+        } else if infos[k].trimmed(store.get(k)).starts_with(".size ") {
             if let Some(s) = start.take() {
                 funcs.push((s, k));
             }
@@ -742,10 +741,7 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 rbp_frame = true;
                 break;
             }
-            if t.starts_with(".cfi_endproc")
-                || t.starts_with(".size ")
-                || infos[k].kind == LineKind::Ret
-            {
+            if infos[k].is_cfi_end() || t.starts_with(".size ") || infos[k].kind == LineKind::Ret {
                 break;
             }
         }
@@ -1004,7 +1000,7 @@ pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineI
                     .collect();
                 let load = lines[0].strip_prefix("movl ")?;
                 let comma = first_top_level_comma(load.as_bytes())?;
-                let (mem, scratch) = (load[..comma].trim(), load[comma + 1..].trim());
+                let (mem, scratch) = (load[..comma].trim_ascii(), load[comma + 1..].trim_ascii());
                 if !mem.contains('(') || !mem.ends_with(')') || mem.contains(':') {
                     return None;
                 }
@@ -1025,7 +1021,7 @@ pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineI
                 let (t, tb) = parse_slot(temp)?;
                 let ext = lines[2].strip_prefix("movslq ")?;
                 let comma = first_top_level_comma(ext.as_bytes())?;
-                let (dest, wide) = (ext[..comma].trim(), ext[comma + 1..].trim());
+                let (dest, wide) = (ext[..comma].trim_ascii(), ext[comma + 1..].trim_ascii());
                 let df = register_family_fast(dest);
                 if df > REG_GP_MAX
                     || df == REG_RSP
@@ -1200,7 +1196,7 @@ pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo
         let Some(comma) = first_top_level_comma(args.as_bytes()) else {
             continue;
         };
-        let (mem, src) = (args[..comma].trim(), args[comma + 1..].trim());
+        let (mem, src) = (args[..comma].trim_ascii(), args[comma + 1..].trim_ascii());
         let sf = register_family_fast(src);
         if !mem.contains('(')
             || !mem.ends_with(')')
@@ -1237,12 +1233,12 @@ pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo
             }
             if mnemonic == "movq" {
                 if let Some((s, d)) = rest.split_once(',') {
-                    let df = register_family_fast(d.trim());
-                    if s.trim() == REG_NAMES[0][sf as usize]
+                    let df = register_family_fast(d.trim_ascii());
+                    if s.trim_ascii() == REG_NAMES[0][sf as usize]
                         && df <= REG_GP_MAX
                         && df != sf
                         && df != REG_RSP
-                        && d.trim() == REG_NAMES[0][df as usize]
+                        && d.trim_ascii() == REG_NAMES[0][df as usize]
                         && (i + 1..j)
                             .all(|k| infos[k].is_nop() || infos[k].reg_refs & (1u16 << df) == 0)
                         && live.live_after(j, sf) == Some(false)

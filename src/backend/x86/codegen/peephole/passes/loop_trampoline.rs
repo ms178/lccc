@@ -235,7 +235,7 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
             if let Some(rest) = trimmed.strip_prefix("movq %") {
                 if let Some((src_str, dst_str)) = rest.split_once(", %") {
                     let src_fam = register_family_no_prefix(src_str);
-                    let dst_fam = register_family_no_prefix(dst_str.trim());
+                    let dst_fam = register_family_no_prefix(dst_str.trim_ascii());
                     if src_fam != REG_NONE && dst_fam != REG_NONE && src_fam != dst_fam {
                         tramp_moves.push((src_fam, dst_fam));
                         tramp_all_lines.push(j);
@@ -249,7 +249,7 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
             if let Some(rest) = trimmed.strip_prefix("movslq %") {
                 if let Some((src_str, dst_str)) = rest.split_once(", %") {
                     let src_fam = register_family_no_prefix(src_str);
-                    let dst_fam = register_family_no_prefix(dst_str.trim());
+                    let dst_fam = register_family_no_prefix(dst_str.trim_ascii());
                     if src_fam != REG_NONE && dst_fam != REG_NONE && src_fam != dst_fam {
                         tramp_moves.push((src_fam, dst_fam));
                         tramp_all_lines.push(j);
@@ -268,7 +268,7 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
                 if k < len {
                     let next_trimmed = infos[k].trimmed(store.get(k));
                     if let Some(rest) = next_trimmed.strip_prefix("movq %rax, %") {
-                        let dst_fam = register_family_no_prefix(rest.trim());
+                        let dst_fam = register_family_no_prefix(rest.trim_ascii());
                         if dst_fam != REG_NONE && dst_fam != 0 {
                             has_stack_load = true;
                             tramp_stack_loads.push((offset, dst_fam, j, k));

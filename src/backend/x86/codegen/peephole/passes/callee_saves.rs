@@ -370,15 +370,11 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
     let len = store.len();
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || !infos[i].trimmed(store.get(i)).starts_with(".cfi_startproc") {
+        if !infos[i].is_cfi_start() {
             i += 1;
             continue;
         }
-        let func_end = (i + 1..len)
-            .find(|&k| {
-                !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_endproc")
-            })
-            .unwrap_or(len);
+        let func_end = (i + 1..len).find(|&k| infos[k].is_cfi_end()).unwrap_or(len);
         fpo_function(store, infos, i, func_end);
         i = func_end.max(i + 1);
     }
@@ -399,7 +395,7 @@ fn rsp_imm(line: &str, prefix: &str) -> Option<i64> {
 /// `(%register, offset)` of `.cfi_offset %reg, -O`.
 fn cfi_offset_operands(line: &str) -> Option<(&str, i64)> {
     let (reg, off) = line.strip_prefix(".cfi_offset ")?.split_once(',')?;
-    Some((reg.trim(), off.trim().parse::<i64>().ok()?))
+    Some((reg.trim_ascii(), off.trim_ascii().parse::<i64>().ok()?))
 }
 
 fn next_insn(store: &LineStore, infos: &[LineInfo], from: usize, end: usize) -> usize {
@@ -538,7 +534,7 @@ fn fpo_function(store: &mut LineStore, infos: &mut [LineInfo], start: usize, fun
             LineKind::Call => has_call = true,
             LineKind::Directive => {
                 if let Some(v) = line.strip_prefix(".cfi_def_cfa_offset ") {
-                    let Ok(v) = v.trim().parse::<i64>() else {
+                    let Ok(v) = v.trim_ascii().parse::<i64>() else {
                         return;
                     };
                     cfa_lines.push((k, v));
@@ -687,7 +683,7 @@ fn collapse_superseded_cfa(
             if let Some(prev) = pending.replace(k) {
                 mark_nop(&mut infos[prev]);
             }
-            if at_entry && v.trim() == "8" {
+            if at_entry && v.trim_ascii() == "8" {
                 mark_nop(&mut infos[k]);
                 pending = None;
             }
@@ -695,7 +691,7 @@ fn collapse_superseded_cfa(
         }
         // Only CFI bookkeeping is address-neutral: an alignment directive
         // pads, so CFA lines on either side of it are distinct rows.
-        if !line.starts_with(".cfi_") {
+        if infos[k].cfi == CfiMark::None {
             pending = None;
             at_entry = false;
         }
@@ -787,15 +783,11 @@ pub(super) fn rename_saved_values_into_free_scratch(
     let mut lv: Option<FileLiveness> = None;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || !infos[i].trimmed(store.get(i)).starts_with(".cfi_startproc") {
+        if !infos[i].is_cfi_start() {
             i += 1;
             continue;
         }
-        let end = (i + 1..len)
-            .find(|&k| {
-                !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_endproc")
-            })
-            .unwrap_or(len);
+        let end = (i + 1..len).find(|&k| infos[k].is_cfi_end()).unwrap_or(len);
         rename_in_function(store, infos, i, end, &mut lv, &mut out);
         i = end.max(i + 1);
     }
@@ -883,7 +875,7 @@ fn rename_in_function(
             match infos[k].kind {
                 LineKind::Pop { reg } if reg == fam && fpo_epilogue_pop(store, infos, k, end) => {}
                 LineKind::Push { .. } | LineKind::Pop { .. } => legal = false,
-                LineKind::Directive if t.starts_with(".cfi_") => {}
+                LineKind::Directive if infos[k].cfi != CfiMark::None => {}
                 LineKind::Directive | LineKind::Label => legal = false,
                 _ if HIGH_BYTES.iter().any(|h| t.contains(h)) => legal = false,
                 _ => body.push(k),

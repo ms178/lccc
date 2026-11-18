@@ -162,13 +162,13 @@ fn split_operands(s: &str) -> Vec<&str> {
             b'(' => depth += 1,
             b')' => depth -= 1,
             b',' if depth == 0 => {
-                out.push(s[start..i].trim());
+                out.push(s[start..i].trim_ascii());
                 start = i + 1;
             }
             _ => {}
         }
     }
-    let last = s[start..].trim();
+    let last = s[start..].trim_ascii();
     if !last.is_empty() {
         out.push(last);
     }
@@ -217,7 +217,7 @@ fn is_gpr32(op: &str) -> bool {
 /// upper half cannot be observed after this line (no control-flow-reachable
 /// later read).  Returns the new text or `None` to keep it.
 fn rewrite_line(line: &str, allowed: u32) -> Option<String> {
-    let trimmed = line.trim_start();
+    let trimmed = line.trim_ascii_start();
     let indent = &line[..line.len() - trimmed.len()];
     // Lines with comments are left alone: the emitter's annotated lines are
     // rare and never in hot scalar tails.
@@ -225,7 +225,7 @@ fn rewrite_line(line: &str, allowed: u32) -> Option<String> {
         return None;
     }
     let (mnemonic, rest) = match trimmed.find(|c: char| c.is_ascii_whitespace()) {
-        Some(p) => (&trimmed[..p], trimmed[p..].trim()),
+        Some(p) => (&trimmed[..p], trimmed[p..].trim_ascii()),
         None => return None,
     };
     if mnemonic.starts_with('v') {
@@ -325,7 +325,7 @@ fn rewrite_line(line: &str, allowed: u32) -> Option<String> {
 }
 
 fn is_function_label(line: &str) -> bool {
-    let t = line.trim_end();
+    let t = line.trim_ascii_end();
     if !t.ends_with(':') || t.starts_with(".L") || t.starts_with(' ') || t.starts_with('\t') {
         return false;
     }
@@ -343,7 +343,7 @@ fn is_insn_line(t: &str) -> bool {
 
 /// A label line (`foo:` / `.LBB2:`) → its name, else `None`.
 fn label_name(l: &str) -> Option<&str> {
-    let t = l.trim_end();
+    let t = l.trim_ascii_end();
     if !t.ends_with(':') || t.is_empty() || t.contains(' ') || t.contains('\t') {
         return None;
     }
@@ -354,7 +354,7 @@ fn label_name(l: &str) -> Option<&str> {
 /// original instruction. Prefixes can be stacked and separated by tabs; both
 /// observer classification and CFG successors must use the same opcode.
 fn control_instruction(text: &str) -> (&str, &str) {
-    let mut text = text.trim();
+    let mut text = text.trim_ascii();
     loop {
         let (mn, operands) = text
             .split_once(|c: char| c.is_ascii_whitespace())
@@ -389,9 +389,9 @@ fn control_instruction(text: &str) -> (&str, &str) {
                 | "rex"
                 | "rex64"
         ) {
-            return (mn, operands.trim());
+            return (mn, operands.trim_ascii());
         }
-        text = operands.trim_start();
+        text = operands.trim_ascii_start();
     }
 }
 
@@ -413,7 +413,7 @@ fn successor_lines(
             v.push(i + 1);
         }
     };
-    let t = body[i].trim();
+    let t = body[i].trim_ascii();
     if !is_insn_line(t) {
         let mut v = Vec::new();
         fall(&mut v);
@@ -472,7 +472,7 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
     let mut read_lines: [Vec<usize>; 16] = std::array::from_fn(|_| Vec::new());
     let mut kill = vec![0u32; n];
     for (i, line) in body.iter().enumerate() {
-        let text = line.trim();
+        let text = line.trim_ascii();
         if !is_insn_line(text) {
             continue;
         }
@@ -573,7 +573,7 @@ pub fn promote_legacy_sse_to_vex(asm: &mut String) -> usize {
             if l.contains("%ymm") {
                 ymm_used |= ymm_mask(l);
             }
-            if l.trim() == "#APP" {
+            if l.trim_ascii() == "#APP" {
                 has_asm = true;
             }
         }
@@ -592,7 +592,7 @@ pub fn promote_legacy_sse_to_vex(asm: &mut String) -> usize {
         let allowed = allowed_masks(body);
         for (idx, l) in body.iter().enumerate() {
             let content = l.strip_suffix('\n').unwrap_or(l);
-            let t = content.trim_start();
+            let t = content.trim_ascii_start();
             if is_insn_line(t) {
                 if let Some(new) = rewrite_line(content, allowed[idx]) {
                     out.push_str(&new);

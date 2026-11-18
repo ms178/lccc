@@ -280,7 +280,7 @@ impl Block {
             (self.lines[3], sar_text),
         ];
         for (line, text) in edits {
-            if text.trim().is_empty() {
+            if text.trim_ascii().is_empty() {
                 return false;
             }
             replace_line(store, &mut infos[line], line, text);
@@ -355,7 +355,7 @@ fn sib_pair(mem: &str) -> Option<(&str, &str)> {
     if it.next().is_some() {
         return None; // explicit scale: not the plain bias add
     }
-    Some((base.trim(), index.trim()))
+    Some((base.trim_ascii(), index.trim_ascii()))
 }
 
 pub(super) fn width_letter(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<char> {
@@ -378,7 +378,7 @@ pub(super) fn prev_non_silence(store: &LineStore, infos: &[LineInfo], i: usize) 
             continue;
         }
         let raw = store.get(c);
-        if raw.trim_start().starts_with('#') || raw.trim().is_empty() {
+        if raw.trim_ascii_start().starts_with('#') || raw.trim_ascii().is_empty() {
             continue;
         }
         if crate::backend::peephole_common::inert_directive(raw) {
@@ -420,8 +420,8 @@ pub(super) fn scratch_live_after(
         let code = raw
             .split_once('#')
             .map_or(raw, |(before, _)| before)
-            .trim_end();
-        if code.trim().is_empty() {
+            .trim_ascii_end();
+        if code.trim_ascii().is_empty() {
             continue;
         }
         if infos[j].is_steppable() || infos[j].kind == LineKind::Empty {
@@ -510,7 +510,7 @@ fn full_register_overwrite(text: &str, fam: RegId) -> bool {
     let Some((src, dst)) = split_two_operands(rest) else {
         return false;
     };
-    plain_gp_operand(dst.trim()) == Some(fam) && !operand_fragment_mentions(src, fam)
+    plain_gp_operand(dst.trim_ascii()) == Some(fam) && !operand_fragment_mentions(src, fam)
 }
 
 /// Does any token in an operand fragment name family `fam` as a plain register?
@@ -542,7 +542,7 @@ mod tests {
         run(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }

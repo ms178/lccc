@@ -35,6 +35,36 @@ pub(super) const VEC_FAMILY_BASE: RegId = 24;
 /// Sentinel value for `rbp_offset` meaning "no %rbp reference" or "multiple/complex references".
 pub(super) const RBP_OFFSET_NONE: i32 = i32::MIN;
 
+/// Pre-decoded function-boundary marker for `LineKind::Directive` lines.
+///
+/// `.cfi_startproc` / `.cfi_endproc` delimit every function the peephole
+/// reasons about, and more than forty scan sites (function discovery in
+/// `FileLiveness::new`, `function_range`, `CfiIndex::build`, the prologue
+/// walkers, ...) used to re-derive the answer with
+/// `trimmed(store.get(n)).starts_with(".cfi_startproc")` — a text fetch, a
+/// slice and a `memcmp` per line per pass per iteration.  Callgrind on a
+/// 40-function mixed TU attributed 1.77 M `starts_with` calls to
+/// `FileLiveness::new` alone.  Decoding the mark once in `classify_line`
+/// turns every one of those probes into a one-byte integer compare.
+///
+/// The decode uses the same predicate the scan sites used
+/// (`starts_with(".cfi_startproc")` on the comment-free trimmed text), so a
+/// directive with arguments (`.cfi_startproc simple`) classifies exactly as
+/// before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum CfiMark {
+    /// Not a `.cfi_*` directive (including every non-directive line).
+    None,
+    /// `.cfi_startproc`
+    Start,
+    /// `.cfi_endproc`
+    End,
+    /// Any other `.cfi_*` directive (`.cfi_def_cfa_offset`, `.cfi_offset`,
+    /// ...): the unwind-bookkeeping lines several passes must step over or
+    /// refuse, previously re-identified with `starts_with(".cfi_")`.
+    Other,
+}
+
 /// Compact classification of a single assembly line.
 /// Stored in a parallel array alongside the raw text, so hot loops
 /// can check integer fields instead of re-parsing strings.
@@ -82,6 +112,11 @@ pub(super) struct LineInfo {
     /// direct load-to-ALU fold may also transfer this protection to its single
     /// surviving read after proving equal width and a dead load temporary.
     pub(super) volatile_access: bool,
+    /// For `LineKind::Directive` only: whether this line is a
+    /// `.cfi_startproc` / `.cfi_endproc` function boundary.  Decoded once at
+    /// classification so function discovery is an integer scan (see
+    /// [`CfiMark`]).
+    pub(super) cfi: CfiMark,
 }
 
 /// What kind of assembly line this is, with pre-extracted fields for the
@@ -266,6 +301,29 @@ impl LineInfo {
     pub(super) fn is_nop(self) -> bool {
         self.kind == LineKind::Nop
     }
+
+    /// True for a live (non-nop) `.cfi_startproc` line.  The nop check is
+    /// folded in because every converted scan site paired the two tests; a
+    /// deleted line must never open a function.
+    #[inline]
+    pub(super) fn is_cfi_start(self) -> bool {
+        self.cfi == CfiMark::Start && self.kind != LineKind::Nop
+    }
+
+    /// True for a live (non-nop) `.cfi_endproc` line (see [`is_cfi_start`]).
+    ///
+    /// [`is_cfi_start`]: LineInfo::is_cfi_start
+    #[inline]
+    pub(super) fn is_cfi_end(self) -> bool {
+        self.cfi == CfiMark::End && self.kind != LineKind::Nop
+    }
+
+    /// True for a live line of the `.cfi_*` directive family (the integer
+    /// form of `trimmed(..).starts_with(".cfi_")`).
+    #[inline]
+    pub(super) fn is_cfi_dir(self) -> bool {
+        self.cfi != CfiMark::None && self.kind != LineKind::Nop
+    }
     /// True when a locality window may step over this line entirely: a nop or an
     /// inert directive. The "next real instruction" walkers use it, so a line a
     /// window may not span is also a line they may not skip on the way to the
@@ -373,7 +431,7 @@ impl LineInfo {
         let start = self.trim_start as usize;
         if start >= line.len() {
             // Line was replaced with shorter/empty text after classification
-            line.trim()
+            line.trim_ascii()
         } else {
             &line[start..]
         }
@@ -395,6 +453,7 @@ pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -422,6 +481,7 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -461,6 +521,7 @@ pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) ->
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -510,6 +571,7 @@ pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> Lin
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -526,6 +588,7 @@ pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -533,6 +596,21 @@ pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
 fn directive_line_info(text: &str, ts: u16) -> LineInfo {
     let mut info = line_info(LineKind::Directive, ts);
     info.inert_dir = crate::backend::peephole_common::inert_directive(text);
+    // Same predicate the per-pass scans used before the mark existed: a
+    // prefix match on the comment-free trimmed text, so `.cfi_startproc
+    // simple` still opens a function.  `.cfi_endproc` has no argument form,
+    // but the prefix match keeps the conversion observationally exact.
+    info.cfi = if let Some(rest) = text.strip_prefix(".cfi_") {
+        if rest.starts_with("startproc") {
+            CfiMark::Start
+        } else if rest.starts_with("endproc") {
+            CfiMark::End
+        } else {
+            CfiMark::Other
+        }
+    } else {
+        CfiMark::None
+    };
     info
 }
 
@@ -617,6 +695,7 @@ pub(super) fn opaque_line_info(ts: u16) -> LineInfo {
         // `LineKind::Directive`, and false is the fail-closed value.
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -779,18 +858,12 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             } else {
                 parse_rbp_offset(s)
             };
-            let reg_refs = scan_register_refs(sb);
-            return LineInfo {
-                kind: LineKind::Other { dest_reg },
-                ext_kind: ext,
-                trim_start: ts,
-                has_indirect_mem: has_indirect,
-                rbp_offset: rbp_off,
-                reg_refs,
-                pinned: false,
-                inert_dir: false,
-                volatile_access: false,
-            };
+            let mut info = line_info(LineKind::Other { dest_reg }, ts);
+            info.ext_kind = ext;
+            info.has_indirect_mem = has_indirect;
+            info.rbp_offset = rbp_off;
+            info.reg_refs = scan_register_refs(sb);
+            return info;
         }
     }
 
@@ -867,7 +940,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     // Push / Pop (extract register for fast checks)
     if first == b'p' {
         if let Some(rest) = s.strip_prefix("pushq ") {
-            let reg = register_family_fast(rest.trim());
+            let reg = register_family_fast(rest.trim_ascii());
             // Only use reg for bitmask if it's a GP register; otherwise use full scan
             let rr = if reg <= REG_GP_MAX {
                 1u16 << reg
@@ -877,7 +950,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             return line_info_with_regs(LineKind::Push { reg }, ts, rr);
         }
         if let Some(rest) = s.strip_prefix("popq ") {
-            let reg = register_family_fast(rest.trim());
+            let reg = register_family_fast(rest.trim_ascii());
             let rr = if reg <= REG_GP_MAX {
                 1u16 << reg
             } else {
@@ -908,7 +981,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     if first == b's' && sb.len() >= 4 && sb[1] == b'e' && sb[2] == b't' && parse_setcc(s).is_some()
     {
         let setcc_reg = if let Some(space_pos) = s.rfind(' ') {
-            register_family_fast(s[space_pos + 1..].trim())
+            register_family_fast(s[space_pos + 1..].trim_ascii())
         } else {
             0
         };
@@ -948,6 +1021,7 @@ fn classify_other_line_info(s: &str, sb: &[u8], first: u8, ts: u16) -> LineInfo 
             && (s.contains("@TLSDESC") || s.contains("@tlsdesc")),
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     }
 }
 
@@ -1034,7 +1108,7 @@ pub(super) fn classify_mov_ext(s: &str, sb: &[u8]) -> ExtKind {
         // Unparsed expressions/hex spellings conservatively retain it.
         if s[6..]
             .rsplit_once(',')
-            .is_some_and(|(imm, _)| imm.trim().parse::<i32>().is_ok())
+            .is_some_and(|(imm, _)| imm.trim_ascii().parse::<i32>().is_ok())
         {
             return ExtKind::ProducerMovqConstRax;
         }
@@ -1202,7 +1276,7 @@ pub(super) fn parse_dest_reg_fast(s: &str) -> RegId {
     // remove the live index producer.  Ignore commas nested in parentheses.
     if let Some(comma_pos) = last_top_level_comma(b) {
         let after_comma = &s[comma_pos + 1..];
-        let trimmed = after_comma.trim();
+        let trimmed = after_comma.trim_ascii();
         if !trimmed.starts_with('%') {
             return REG_NONE;
         }
@@ -1229,7 +1303,7 @@ pub(super) fn parse_dest_reg_fast(s: &str) -> RegId {
                     || s.starts_with("rcl"));
         if is_single_op_modifier {
             if let Some(space_pos) = s.find(' ') {
-                let operand = s[space_pos + 1..].trim();
+                let operand = s[space_pos + 1..].trim_ascii();
                 return register_family(operand).unwrap_or(REG_NONE);
             }
         }
@@ -1353,8 +1427,8 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
         return None;
     }
     let (src, dst) = body.0.split_once(',')?;
-    let src = src.trim();
-    let dst = dst.trim();
+    let src = src.trim_ascii();
+    let dst = dst.trim_ascii();
     let store = src.starts_with('%') && (dst.ends_with("(%rbp)") || dst.ends_with("(%rsp)"));
     let load = dst.starts_with('%') && (src.ends_with("(%rbp)") || src.ends_with("(%rsp)"));
     if !store && !load {
@@ -1405,8 +1479,8 @@ pub(super) fn parse_store_to_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)> 
     let (rest, size) = strip_mov_prefix(s, false)?;
 
     let (src, dst) = rest.split_once(',')?;
-    let src = src.trim();
-    let dst = dst.trim();
+    let src = src.trim_ascii();
+    let dst = dst.trim_ascii();
 
     if !src.starts_with('%') {
         return None;
@@ -1430,8 +1504,8 @@ pub(super) fn parse_load_from_rbp_str(s: &str) -> Option<(&str, &str, MoveSize)>
     let (rest, size) = strip_mov_prefix(s, true)?;
 
     let (src, dst) = rest.split_once(',')?;
-    let src = src.trim();
-    let dst = dst.trim();
+    let src = src.trim_ascii();
+    let dst = dst.trim_ascii();
 
     if !dst.starts_with('%') {
         return None;
@@ -1471,6 +1545,7 @@ pub(super) fn mark_nop(info: &mut LineInfo) {
         pinned: false,
         inert_dir: false,
         volatile_access: false,
+        cfi: CfiMark::None,
     };
 }
 
@@ -1589,8 +1664,11 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     // %rdi (dest) and %rsi (source) that aren't visible in the instruction text.
     // They also modify %rdi, %rsi, and %rcx. Treat them as indirect memory access
     // to ensure store forwarding and dead store elimination are conservative.
-    let trimmed = s.trim_start();
-    if trimmed.starts_with("rep ") || trimmed.starts_with("rep\t") {
+    let trimmed = s.trim_ascii_start();
+    use crate::backend::peephole_common::{first8, pfx};
+    // One packed load serves every mnemonic probe below.
+    let f8 = first8(trimmed);
+    if pfx!(f8, "rep ") || pfx!(f8, "rep\t") {
         return true;
     }
 
@@ -1618,16 +1696,16 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     //   iret    -> restores rip, cs, rflags, rsp, ss from stack
     // Treat these as barriers for store forwarding since parse_dest_reg_fast
     // cannot detect their implicit register writes.
-    if trimmed.starts_with("rdmsr")
-        || trimmed.starts_with("wrmsr")
-        || trimmed.starts_with("cpuid")
-        || trimmed.starts_with("rdtsc")
-        || trimmed.starts_with("xgetbv")
-        || trimmed.starts_with("syscall")
-        || trimmed.starts_with("sysenter")
-        || trimmed.starts_with("int ")
-        || trimmed.starts_with("int\t")
-        || trimmed.starts_with("iret")
+    if pfx!(f8, "rdmsr")
+        || pfx!(f8, "wrmsr")
+        || pfx!(f8, "cpuid")
+        || pfx!(f8, "rdtsc")
+        || pfx!(f8, "xgetbv")
+        || pfx!(f8, "syscall")
+        || pfx!(f8, "sysenter")
+        || pfx!(f8, "int ")
+        || pfx!(f8, "int\t")
+        || pfx!(f8, "iret")
     {
         return true;
     }
@@ -1650,8 +1728,9 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
         if bytes[i] == b'(' && i + 2 < len && bytes[i + 1] == b'%' {
             // Found "(%" - check if it's %rbp or %rsp (which are not indirect aliasing)
             let rest = &s[i + 2..];
-            let is_frame_base = rest.starts_with("rbp") || rest.starts_with("rsp");
-            if rest.starts_with("rip") {
+            let r8 = first8(rest);
+            let is_frame_base = pfx!(r8, "rbp") || pfx!(r8, "rsp");
+            if pfx!(r8, "rip") {
                 // RIP-relative: a fixed global/rodata address, not a stack slot.
             } else if !is_frame_base {
                 return true;
@@ -1865,8 +1944,8 @@ pub(super) fn parse_reg_to_reg_move<'a>(line: &'a str, expected_src: &str) -> Op
     for prefix in &["movq ", "movl "] {
         if let Some(rest) = line.strip_prefix(prefix) {
             if let Some((src, dst)) = rest.split_once(',') {
-                let src = src.trim();
-                let dst = dst.trim();
+                let src = src.trim_ascii();
+                let dst = dst.trim_ascii();
                 if src == expected_src && dst.starts_with('%') {
                     return Some(dst);
                 }
@@ -1880,7 +1959,7 @@ pub(super) fn parse_reg_to_reg_move<'a>(line: &'a str, expected_src: &str) -> Op
 pub(super) fn instruction_writes_to(inst: &str, reg: &str) -> bool {
     if let Some((_op, operands)) = inst.split_once(' ') {
         if let Some((_src, dst)) = operands.rsplit_once(',') {
-            let dst = dst.trim();
+            let dst = dst.trim_ascii();
             if dst == reg || register_overlaps(dst, reg) {
                 return true;
             }
@@ -1909,8 +1988,8 @@ pub(super) fn replace_dest_register(inst: &str, old_reg: &str, new_reg: &str) ->
     // Handle `xorq %reg, %reg` or `xorl %ereg, %ereg` (zero idiom)
     if let Some(rest) = inst.strip_prefix("xorq ") {
         if let Some((src, dst)) = rest.split_once(',') {
-            let src = src.trim();
-            let dst = dst.trim();
+            let src = src.trim_ascii();
+            let dst = dst.trim_ascii();
             if src == old_reg && dst == old_reg {
                 return Some(format!("xorq {}, {}", new_reg, new_reg));
             }
@@ -1918,8 +1997,8 @@ pub(super) fn replace_dest_register(inst: &str, old_reg: &str, new_reg: &str) ->
     }
     if let Some(rest) = inst.strip_prefix("xorl ") {
         if let Some((src, dst)) = rest.split_once(',') {
-            let src = src.trim();
-            let dst = dst.trim();
+            let src = src.trim_ascii();
+            let dst = dst.trim_ascii();
             // Check if this is a zero idiom (same 32-bit reg) and the old_reg matches
             if src == dst {
                 // Map old_reg (64-bit) to its 32-bit name to check if it matches
@@ -1971,8 +2050,8 @@ pub(super) fn replace_dest_register(inst: &str, old_reg: &str, new_reg: &str) ->
     for prefix in &["movq ", "movslq ", "leaq ", "movzbq "] {
         if let Some(rest) = inst.strip_prefix(prefix) {
             if let Some((src, dst)) = rest.rsplit_once(',') {
-                let src = src.trim();
-                let dst = dst.trim();
+                let src = src.trim_ascii();
+                let dst = dst.trim_ascii();
                 if dst == old_reg && !src.contains(old_reg) {
                     return Some(format!("{}{}, {}", prefix, src, new_reg));
                 }
@@ -2525,7 +2604,7 @@ pub(super) fn unadorned_mnemonic(text: &str) -> &str {
     let mut rest = text;
     loop {
         let (head, tail) = match rest.split_once([' ', '\t']) {
-            Some((head, tail)) => (head, tail.trim_start()),
+            Some((head, tail)) => (head, tail.trim_ascii_start()),
             None => (rest, ""),
         };
         match head {
@@ -3029,13 +3108,13 @@ mod implicit_oracle_tests {
     const R11: u16 = 1 << 11;
 
     fn reads(line: &str) -> u16 {
-        implicit_read_refs(line.trim().as_bytes())
+        implicit_read_refs(line.trim_ascii().as_bytes())
     }
     fn writes(line: &str) -> u16 {
-        implicit_write_refs(line.trim().as_bytes())
+        implicit_write_refs(line.trim_ascii().as_bytes())
     }
     fn touches(line: &str) -> u16 {
-        implicit_reg_refs(line.trim().as_bytes())
+        implicit_reg_refs(line.trim_ascii().as_bytes())
     }
 
     #[test]
@@ -3725,7 +3804,7 @@ mod classify_directive_tests {
             let i = classify_line(text);
             assert_eq!(
                 i.is_steppable(),
-                crate::backend::peephole_common::inert_directive(text.trim()),
+                crate::backend::peephole_common::inert_directive(text.trim_ascii()),
                 "{text}"
             );
         }

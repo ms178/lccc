@@ -68,7 +68,7 @@ pub(super) fn is_callee_saved_reg(reg: RegId) -> bool {
 /// function start (harmless: reasoning starts after the prologue).
 #[inline]
 pub(super) fn is_rsp_shift_line(t: &str) -> bool {
-    let t = t.trim();
+    let t = t.trim_ascii();
     if t.starts_with("push") || t.starts_with("pop") {
         return true;
     }
@@ -186,54 +186,58 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     // input, and an empty mnemonic models as "no effects". Trim here so the
     // answer cannot depend on formatting. Callers that already pass a
     // trimmed slice pay one byte comparison.
-    let trimmed = trimmed.trim_start();
+    let trimmed = trimmed.trim_ascii_start();
     let nb = trimmed.as_bytes();
     if nb.len() < 3 {
         return false;
     }
+    use crate::backend::peephole_common::pfx;
+    // One packed load serves every prefix probe below (each probe is then
+    // an AND and a compare -- no `memcmp`, no per-prefix length test).
+    let f8 = crate::backend::peephole_common::first8(trimmed);
     // Fast-reject common mnemonics with no implicit GP usage.
     match nb[0] {
         b'm' if nb[1] == b'o' && nb[2] == b'v' => {
             if nb.len() > 3 && nb[3] != b's' {
                 return false;
             }
-            if nb.starts_with(b"movslq ")
-                || nb.starts_with(b"movsbl ")
-                || nb.starts_with(b"movswl ")
-                || nb.starts_with(b"movsd ")
-                || nb.starts_with(b"movss ")
+            if pfx!(f8, "movslq ")
+                || pfx!(f8, "movsbl ")
+                || pfx!(f8, "movswl ")
+                || pfx!(f8, "movsd ")
+                || pfx!(f8, "movss ")
             {
                 return false;
             }
         }
-        b'l' if nb.starts_with(b"leaq ") || nb.starts_with(b"leal ") => return false,
-        b'a' if nb.starts_with(b"add") || nb.starts_with(b"and") => return false,
-        b's' if nb.starts_with(b"sub")
-            || nb.starts_with(b"set")
-            || nb.starts_with(b"shlq ")
-            || nb.starts_with(b"shll ")
-            || nb.starts_with(b"shrq ")
-            || nb.starts_with(b"shrl ")
-            || nb.starts_with(b"sarq ")
-            || nb.starts_with(b"sarl ") =>
+        b'l' if pfx!(f8, "leaq ") || pfx!(f8, "leal ") => return false,
+        b'a' if pfx!(f8, "add") || pfx!(f8, "and") => return false,
+        b's' if pfx!(f8, "sub")
+            || pfx!(f8, "set")
+            || pfx!(f8, "shlq ")
+            || pfx!(f8, "shll ")
+            || pfx!(f8, "shrq ")
+            || pfx!(f8, "shrl ")
+            || pfx!(f8, "sarq ")
+            || pfx!(f8, "sarl ") =>
         {
             return false;
         }
-        b'o' if nb.starts_with(b"orq ") || nb.starts_with(b"orl ") => return false,
-        b'x' if nb.starts_with(b"xor") => return false,
-        b'c' if nb.starts_with(b"cmpq ")
-            || nb.starts_with(b"cmpl ")
-            || nb.starts_with(b"cmpw ")
-            || nb.starts_with(b"cmpb ")
-            || nb.starts_with(b"cmov")
-            || nb.starts_with(b"call") =>
+        b'o' if pfx!(f8, "orq ") || pfx!(f8, "orl ") => return false,
+        b'x' if pfx!(f8, "xor") => return false,
+        b'c' if pfx!(f8, "cmpq ")
+            || pfx!(f8, "cmpl ")
+            || pfx!(f8, "cmpw ")
+            || pfx!(f8, "cmpb ")
+            || pfx!(f8, "cmov")
+            || pfx!(f8, "call") =>
         {
             return false;
         }
-        b't' if nb.starts_with(b"test") => return false,
+        b't' if pfx!(f8, "test") => return false,
         b'j' | b'n' | b'b' => return false,
-        b'p' if nb.starts_with(b"pushq ") || nb.starts_with(b"popq ") => return false,
-        b'r' if nb.starts_with(b"ret") => return false,
+        b'p' if pfx!(f8, "pushq ") || pfx!(f8, "popq ") => return false,
+        b'r' if pfx!(f8, "ret") => return false,
         _ => {}
     }
     // Integer div/mul use implicit rax:rdx. Exclude SSE variants (divsd/mulsd/etc.)
@@ -243,25 +247,25 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     (nb[0] == b'i' && nb[1] == b'd' && nb[2] == b'i') || // idiv
     (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l'
         && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p'))) || // mul, mulq (not mulsd/mulpd)
-    trimmed.starts_with("cltq") || // sign-extend eax -> rax (implicit read+write rax)
-    trimmed.starts_with("cbw") ||  // sign-extend al -> ax (implicit read+write rax)
-    trimmed.starts_with("cqto") || trimmed.starts_with("cdq") ||
-    trimmed.starts_with("cqo") || trimmed.starts_with("cwd") ||
-    trimmed.starts_with("rep ") || trimmed.starts_with("repne ") ||
-    trimmed.starts_with("cpuid") || trimmed.starts_with("syscall") ||
-    trimmed.starts_with("rdtsc") || trimmed.starts_with("rdmsr") ||
-    trimmed.starts_with("wrmsr") ||
-    trimmed.starts_with("xchg") || trimmed.starts_with("xadd") || trimmed.starts_with("cmpxchg") ||
-    trimmed.starts_with("lock ") ||
+    pfx!(f8, "cltq") || // sign-extend eax -> rax (implicit read+write rax)
+    pfx!(f8, "cbw") ||  // sign-extend al -> ax (implicit read+write rax)
+    pfx!(f8, "cqto") || pfx!(f8, "cdq") ||
+    pfx!(f8, "cqo") || pfx!(f8, "cwd") ||
+    pfx!(f8, "rep ") || pfx!(f8, "repne ") ||
+    pfx!(f8, "cpuid") || pfx!(f8, "syscall") ||
+    pfx!(f8, "rdtsc") || pfx!(f8, "rdmsr") ||
+    pfx!(f8, "wrmsr") ||
+    pfx!(f8, "xchg") || pfx!(f8, "xadd") || pfx!(f8, "cmpxchg") ||
+    pfx!(f8, "lock ") ||
     // shld/shrd use %cl implicitly (i128 shifts); treat like other shifts.
-    trimmed.starts_with("shld") || trimmed.starts_with("shrd") ||
+    pfx!(f8, "shld") || pfx!(f8, "shrd") ||
     // x87 FPU status/control instructions that write to %ax or memory.
     // fnstsw writes to %ax (implicit destination), and the peephole's
     // copy propagation must not rewrite %ax to another register since
     // the x86 ISA only allows %ax or memory for fnstsw.
-    trimmed.starts_with("fnstsw") || trimmed.starts_with("fnstcw") ||
-    trimmed.starts_with("fstcw") || trimmed.starts_with("fnstenv") ||
-    trimmed.starts_with("fldenv") || trimmed.starts_with("fldcw") ||
+    pfx!(f8, "fnstsw") || pfx!(f8, "fnstcw") ||
+    pfx!(f8, "fstcw") || pfx!(f8, "fnstenv") ||
+    pfx!(f8, "fldenv") || pfx!(f8, "fldcw") ||
     has_bare_implicit_gp_effect(trimmed)
 }
 
@@ -327,16 +331,28 @@ pub(super) fn implicit_read_reg_family(trimmed: &str) -> Option<RegId> {
     //   cqto/cqo:  read %rax (family 0), write %rdx
     //   cdq:       read %eax (family 0), write %edx
     //   cbw/cwtl/cwd: read %ax (family 0), write wider accumulator
-    if trimmed.starts_with("cltq")
-        || trimmed.starts_with("cdqe")
-        || trimmed.starts_with("cqto")
-        || trimmed.starts_with("cqo")
-        || trimmed.starts_with("cdq")
-        || trimmed.starts_with("cwd")
-        || trimmed.starts_with("cbw")
-        || trimmed.starts_with("cwtl")
     {
-        return Some(0);
+        use crate::backend::peephole_common::{Pfx, first8};
+        let f8 = first8(trimmed);
+        const CLTQ: Pfx = Pfx::new("cltq");
+        const CDQE: Pfx = Pfx::new("cdqe");
+        const CQTO: Pfx = Pfx::new("cqto");
+        const CQO: Pfx = Pfx::new("cqo");
+        const CDQ: Pfx = Pfx::new("cdq");
+        const CWD: Pfx = Pfx::new("cwd");
+        const CBW: Pfx = Pfx::new("cbw");
+        const CWTL: Pfx = Pfx::new("cwtl");
+        if CLTQ.matches(f8)
+            || CDQE.matches(f8)
+            || CQTO.matches(f8)
+            || CQO.matches(f8)
+            || CDQ.matches(f8)
+            || CWD.matches(f8)
+            || CBW.matches(f8)
+            || CWTL.matches(f8)
+        {
+            return Some(0);
+        }
     }
     // Integer div/idiv read %rax:%rdx (families 0 and 2); mul reads %rax.
     // Exclude SSE variants (divsd/mulsd/...) which have explicit operands.
@@ -354,8 +370,14 @@ pub(super) fn implicit_read_reg_family(trimmed: &str) -> Option<RegId> {
         return Some(0);
     }
     // Double-precision shifts read %cl implicitly (family 1).
-    if trimmed.starts_with("shld") || trimmed.starts_with("shrd") {
-        return Some(1);
+    {
+        use crate::backend::peephole_common::{Pfx, first8};
+        let f8 = first8(trimmed);
+        const SHLD: Pfx = Pfx::new("shld");
+        const SHRD: Pfx = Pfx::new("shrd");
+        if SHLD.matches(f8) || SHRD.matches(f8) {
+            return Some(1);
+        }
     }
     None
 }
@@ -379,8 +401,8 @@ pub(super) fn parse_reg_to_reg_movq(info: &LineInfo, trimmed: &str) -> Option<(R
         }
         if let Some(rest) = trimmed.strip_prefix("movq ") {
             if let Some((src_part, dst_part)) = rest.split_once(',') {
-                let src = src_part.trim();
-                let dst = dst_part.trim();
+                let src = src_part.trim_ascii();
+                let dst = dst_part.trim_ascii();
                 if !src.starts_with("%r") || !dst.starts_with("%r") {
                     return None;
                 }
@@ -424,8 +446,8 @@ pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(R
         }
         if let Some(rest) = trimmed.strip_prefix("movl ") {
             if let Some((src_part, dst_part)) = rest.split_once(',') {
-                let src = src_part.trim();
-                let dst = dst_part.trim();
+                let src = src_part.trim_ascii();
+                let dst = dst_part.trim_ascii();
                 if !src.starts_with('%') || !dst.starts_with('%') {
                     return None;
                 }
@@ -482,7 +504,7 @@ pub(super) fn is_self_zeroing_idiom(trimmed: &str) -> bool {
     let Some((a, b)) = rest.split_once(',') else {
         return false;
     };
-    let (a, b) = (a.trim(), b.trim());
+    let (a, b) = (a.trim_ascii(), b.trim_ascii());
     !a.is_empty() && a == b && a.starts_with('%')
 }
 
@@ -610,7 +632,7 @@ fn dest_operand_is_full_width(info: &LineInfo, trimmed: &str, fam: RegId) -> boo
     if let LineKind::Pop { reg } = info.kind {
         return reg == fam;
     }
-    let dest = trimmed.rsplit(',').next().unwrap_or(trimmed).trim();
+    let dest = trimmed.rsplit(',').next().unwrap_or(trimmed).trim_ascii();
     dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize]
 }
 
@@ -667,8 +689,8 @@ pub(super) fn self_zeroing_full_write(trimmed: &str, fam: RegId) -> bool {
         Some(pair) => pair,
         None => return false,
     };
-    let dest = dest.trim();
-    source.trim() == dest
+    let dest = dest.trim_ascii();
+    source.trim_ascii() == dest
         && (dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize])
 }
 
@@ -704,12 +726,12 @@ pub(super) fn parse_dotl_number(s: &str) -> Option<u32> {
 pub(super) fn extract_jump_target(s: &str) -> Option<&str> {
     // Handle: jmp .LBB1, je .LBB1, jne .LBB1, etc.
     if let Some(rest) = s.strip_prefix("jmp ") {
-        return Some(rest.trim());
+        return Some(rest.trim_ascii());
     }
     // Conditional jumps: j<cc> <target>
     if s.starts_with('j') {
         if let Some(space) = s.find(' ') {
-            return Some(s[space + 1..].trim());
+            return Some(s[space + 1..].trim_ascii());
         }
     }
     None
@@ -773,7 +795,7 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
         // which every caller treating a dest-only line as a fresh overwrite
         // must consult as well (see its contract).
         if let Some(comma) = trimmed.rfind(',') {
-            let dest_part = trimmed[comma + 1..].trim();
+            let dest_part = trimmed[comma + 1..].trim_ascii();
             let src_part = &trimmed[..comma];
             // If the dest register name appears in the source part, it's a read
             if src_part.contains(dest_part) {
@@ -1007,14 +1029,14 @@ pub(super) fn src_mentions_family(trimmed: &str, fam: RegId) -> bool {
 /// address's internal commas (`disp(%base,%idx,4)`) never split an operand.
 pub(super) fn count_top_level_operands(ops: &str) -> usize {
     let mut n = 0usize;
-    let mut rest = ops.trim();
+    let mut rest = ops.trim_ascii();
     if rest.is_empty() {
         return 0;
     }
     loop {
         n += 1;
         match crate::backend::peephole_common::last_top_level_comma(rest.as_bytes()) {
-            Some(i) => rest = rest[..i].trim(),
+            Some(i) => rest = rest[..i].trim_ascii(),
             None => return n,
         }
     }
@@ -1405,7 +1427,7 @@ mod writes_family_tests {
         for fam in 0..=REG_GP_MAX {
             let q = format!("    popq {}", REG_NAMES[0][fam as usize]);
             let info = classify_line(&q);
-            let t = q.trim();
+            let t = q.trim_ascii();
             assert!(writes_family_full(&info, t, fam), "{t}");
             for other in 0..=REG_GP_MAX {
                 if other != fam {

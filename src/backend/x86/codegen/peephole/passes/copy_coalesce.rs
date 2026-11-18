@@ -159,7 +159,7 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
                     matches!(d_fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10)
                 }
                 LineKind::Jmp => {
-                    let target = t.trim_start_matches(|c: char| c != ' ').trim();
+                    let target = t.trim_start_matches(|c: char| c != ' ').trim_ascii();
                     !target.starts_with('.') && matches!(d_fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10)
                 }
                 // An implicit read OR write of the destination family is an

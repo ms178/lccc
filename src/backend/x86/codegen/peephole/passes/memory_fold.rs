@@ -91,10 +91,10 @@ fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
     }
     let op_with_suffix = &trimmed[..op_len + 1];
 
-    let rest = trimmed[op_len + 1..].trim();
+    let rest = trimmed[op_len + 1..].trim_ascii();
     let (src_str, dst_str) = rest.split_once(',')?;
-    let src_str = src_str.trim();
-    let dst_str = dst_str.trim();
+    let src_str = src_str.trim_ascii();
+    let dst_str = dst_str.trim_ascii();
 
     if !src_str.starts_with('%') || !dst_str.starts_with('%') {
         return None;
@@ -274,8 +274,8 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
-        let mem = mem.trim();
-        let src_reg = src_reg.trim();
+        let mem = mem.trim_ascii();
+        let src_reg = src_reg.trim_ascii();
         if !src_reg.starts_with("%xmm") || !mem.contains('(') || mem.starts_with('%') {
             i += 1;
             continue;
@@ -317,7 +317,7 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let ops: Vec<&str> = arith_operands.split(',').map(str::trim).collect();
+        let ops: Vec<&str> = arith_operands.split(',').map(str::trim_ascii).collect();
         // Conversion to a GPR: `cvt(t)s?2si %xmmS, %gpr` reads the loaded
         // register once and writes only the GPR.  VEX 3-operand form (dst ==
         // src2 required, and dst may not be the loaded register: the removed
@@ -435,7 +435,7 @@ pub(super) fn retarget_fp_load_into_copy(store: &mut LineStore, infos: &mut [Lin
         let Some((mem, a_reg)) = operands.rsplit_once(',') else {
             continue;
         };
-        let (mem, a_reg) = (mem.trim(), a_reg.trim());
+        let (mem, a_reg) = (mem.trim_ascii(), a_reg.trim_ascii());
         let Some(a) = xmm_number(a_reg) else {
             continue;
         };
@@ -467,7 +467,7 @@ pub(super) fn retarget_fp_load_into_copy(store: &mut LineStore, infos: &mut [Lin
                 ) && copy_op.starts_with('v') == vex;
                 if whole {
                     if let Some((src, dst)) = copy_ops.split_once(',') {
-                        let (src, dst) = (src.trim(), dst.trim());
+                        let (src, dst) = (src.trim_ascii(), dst.trim_ascii());
                         if xmm_number(src) == Some(a) {
                             break xmm_number(dst).filter(|&b| b != a).map(|_| (k, dst));
                         }
@@ -530,7 +530,7 @@ fn mentions_xmm(t: &str, n: u32) -> bool {
 /// `xlat`, `maskmovdqu`, `enter`/`leave`, a `rep` prefix) or a fence.
 fn touches_memory(t: &str) -> bool {
     let (mnemonic, operands) = t.split_once(' ').unwrap_or((t, ""));
-    let operands = operands.trim();
+    let operands = operands.trim_ascii();
     operands.contains('(')
         || mnemonic.starts_with("rep")
         || mnemonic.starts_with("lock")
@@ -1371,7 +1371,7 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
                 };
                 let line = infos[j].trimmed(store.get(j));
                 if let Some(comma) = line.rfind(',') {
-                    let mem_part = line[comma + 1..].trim();
+                    let mem_part = line[comma + 1..].trim_ascii();
                     // REG_NAMES entries already include the leading '%' — do NOT add
                     // another one (the old double-'%' produced `movl %%ebp, ...`).
                     let new_inst = format!("    {} {}, {}", mnem, reg_name, mem_part);
@@ -1663,8 +1663,8 @@ fn is_dst_establishing_move(
         return None;
     }
     let (src, dst) = operands.split_once(',')?;
-    let src = src.trim();
-    let dst = dst.trim();
+    let src = src.trim_ascii();
+    let dst = dst.trim_ascii();
     if src.contains('(') || dst.contains('(') {
         return None;
     }
@@ -1938,7 +1938,7 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
             }
             let tj = infos[j].trimmed(store.get(j));
             let (mn, operands) = match tj.split_once(char::is_whitespace) {
-                Some((m, o)) => (m, o.trim()),
+                Some((m, o)) => (m, o.trim_ascii()),
                 None => {
                     // A no-operand line is normally an empty/directive line,
                     // but a block label (` .LBB34:`) has no whitespace too.
@@ -1977,8 +1977,8 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
             if !infos[j].pinned {
                 if let Some(alu_size) = alu_memop_size(mn) {
                     if let Some((a, b)) = operands.split_once(',') {
-                        let src = a.trim();
-                        let dstr = b.trim();
+                        let src = a.trim_ascii();
+                        let dstr = b.trim_ascii();
                         if src == slot_text
                             && !dstr.contains(',')
                             && dstr.starts_with('%')
@@ -2405,8 +2405,8 @@ pub(super) fn fold_fma_memory_operand(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         };
-        let addr = addr.trim();
-        let Some(n) = xmm_num(dst.trim()) else {
+        let addr = addr.trim_ascii();
+        let Some(n) = xmm_num(dst.trim_ascii()) else {
             i += 1;
             continue;
         };
@@ -2691,7 +2691,7 @@ pub(super) fn hoist_repeated_fp_constant_loads(
         let last = sites[sites.len() - 1];
         let Some(slot) = (0..first).rev().find(|&p| {
             infos[p].is_nop()
-                && !crate::backend::peephole_common::is_loc_directive(store.get(p).trim())
+                && !crate::backend::peephole_common::is_loc_directive(store.get(p).trim_ascii())
         }) else {
             continue;
         };
@@ -2707,7 +2707,7 @@ pub(super) fn hoist_repeated_fp_constant_loads(
         let any_double = sites.iter().any(|&k| {
             store
                 .get(k)
-                .trim()
+                .trim_ascii()
                 .split_once(' ')
                 .is_some_and(|(op, _)| op.ends_with("sd"))
         });
@@ -2755,7 +2755,7 @@ fn mentions_token(text: &str, token: &str) -> usize {
 
 /// True for the canonical zero materializations of %xmm0.
 fn is_xmm0_zeroing(t: &str) -> bool {
-    let t = t.trim();
+    let t = t.trim_ascii();
     t == "xorpd %xmm0, %xmm0"
         || t == "xorps %xmm0, %xmm0"
         || t == "pxor %xmm0, %xmm0"
@@ -2783,10 +2783,10 @@ fn is_xmm0_zeroing(t: &str) -> bool {
 /// overwrites; only their memory-source forms are.  VEX-encoded xor keeps
 /// the full self-xor spelling (`vxorpd %r, %r, %r`) as an overwrite.
 fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
-    let t = t.trim();
+    let t = t.trim_ascii();
     for z in ["xorpd", "xorps", "pxor", "vxorpd", "vxorps", "vpxor"] {
         if let Some(rest) = t.strip_prefix(z) {
-            let rest = rest.trim_start();
+            let rest = rest.trim_ascii_start();
             if rest == format!("{}, {}", reg, reg) || rest == format!("{}, {}, {}", reg, reg, reg) {
                 return true;
             }
@@ -2797,10 +2797,10 @@ fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
     const MERGE_MOVS: &[&str] = &["vmovsd ", "vmovss ", "movsd ", "movss "];
     for m in MERGE_MOVS {
         if let Some(rest) = t.strip_prefix(m) {
-            if let Some((srcs, dst)) = rest.trim().rsplit_once(',') {
-                if dst.trim() == reg
+            if let Some((srcs, dst)) = rest.trim_ascii().rsplit_once(',') {
+                if dst.trim_ascii() == reg
                     && mentions_token(srcs, reg) == 0
-                    && !srcs.trim_start().starts_with('%')
+                    && !srcs.trim_ascii_start().starts_with('%')
                 {
                     return true;
                 }
@@ -2815,8 +2815,8 @@ fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
     ];
     for m in FULL_MOVS {
         if let Some(rest) = t.strip_prefix(m) {
-            if let Some((srcs, dst)) = rest.trim().rsplit_once(',') {
-                if dst.trim() == reg && mentions_token(srcs, reg) == 0 {
+            if let Some((srcs, dst)) = rest.trim_ascii().rsplit_once(',') {
+                if dst.trim_ascii() == reg && mentions_token(srcs, reg) == 0 {
                     return true;
                 }
             }
@@ -2889,8 +2889,8 @@ pub(super) fn fold_zero_addend_fma213_to_132(
             i += 1;
             continue;
         };
-        let addr = addr.trim();
-        let Some(b) = xmm_num(dst.trim()) else {
+        let addr = addr.trim_ascii();
+        let Some(b) = xmm_num(dst.trim_ascii()) else {
             i += 1;
             continue;
         };
@@ -2918,7 +2918,7 @@ pub(super) fn fold_zero_addend_fma213_to_132(
             i += 1;
             continue;
         };
-        let ops: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
+        let ops: Vec<&str> = body.split(',').map(|s| s.trim_ascii()).collect();
         let ok =
             ops.len() == 3 && ops[0] == "%xmm0" && ops[1] == b_tok && xmm_num(ops[2]) != Some(b);
         if !ok {
@@ -2990,7 +2990,7 @@ pub(super) fn eliminate_redundant_xmm0_zeroing(
             _ => {
                 // Writes %xmm0 exactly when the last AT&T operand is %xmm0.
                 if t.rsplit_once(',')
-                    .map(|(_, last)| last.trim() == "%xmm0")
+                    .map(|(_, last)| last.trim_ascii() == "%xmm0")
                     .unwrap_or(false)
                 {
                     zero_live = false;
@@ -3022,8 +3022,8 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
             .find(|m| t.starts_with(*m) && t.as_bytes().get(m.len()) == Some(&b' '))?;
         let rest = &t[mnem.len() + 1..];
         let comma = rest.rfind(',')?;
-        let mem = rest[..comma].trim();
-        let dst = rest[comma + 1..].trim();
+        let mem = rest[..comma].trim_ascii();
+        let dst = rest[comma + 1..].trim_ascii();
         // A validated segment override (`%gs:8(%rsi)`) qualifies the address
         // space and travels with the operand, so strip it and judge the
         // address body; `*%gs:…`, `%gss:…` and lock/rep-prefixed spellings
@@ -3357,7 +3357,7 @@ mod fold_load_copy_relay_tests {
             "a zero-argument call clobbers %rdi unread: {out:?}"
         );
         assert!(
-            out.iter().any(|l| l.trim() == "movq 8(%rbx), %r12"),
+            out.iter().any(|l| l.trim_ascii() == "movq 8(%rbx), %r12"),
             "{out:?}"
         );
     }
@@ -3468,7 +3468,7 @@ mod fma_mem_fold_tests {
         let changed = fold_fma_memory_operand(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -3768,7 +3768,7 @@ mod fma132_zero_tests {
         changed |= eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -3879,7 +3879,7 @@ mod fma132_reuse_tests {
         let changed = fold_zero_addend_fma213_to_132(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -3989,7 +3989,7 @@ mod fp_reg_load_tests {
         let changed = fold_fp_register_loads(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -4248,7 +4248,7 @@ mod fp_load_retarget_tests {
         let changed = retarget_fp_load_into_copy(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .filter(|l| !l.starts_with(".cfi") && l != "f:")
             .collect();
         (changed, out)
@@ -4425,7 +4425,7 @@ mod fp_const_hoist_tests {
         let changed = hoist_repeated_fp_constant_loads(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -4607,7 +4607,7 @@ mod store_alu_memop_tests {
         let changed = fold_store_alu_memop(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -4696,7 +4696,7 @@ mod store_alu_cross_join_tests {
         let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
         let changed = fold_store_alu_memop(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -4802,7 +4802,7 @@ mod memfold_dst_move_tests {
         let changed = fold_memory_operands(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -4915,7 +4915,7 @@ mod movslq_relay_call_tests {
         let changed = fold_movslq_relay(&mut store, &mut infos);
         let out = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -5420,7 +5420,7 @@ fn parse_load_mem_to_reg(t: &str) -> Option<(RmwWidth, RmwWidth, &str, &str)> {
     let sp = t.find(' ')?;
     let (mnemonic, rest) = t.split_at(sp);
     let (mem_width, reg_width) = load_widths(mnemonic)?;
-    let (src, dst) = split_two_operands(rest.trim_start())?;
+    let (src, dst) = split_two_operands(rest.trim_ascii_start())?;
     if !src.contains('(') || !dst.starts_with('%') || dst.contains('(') {
         return None;
     }
@@ -5432,7 +5432,7 @@ fn parse_store_reg_to_mem(t: &str) -> Option<(RmwWidth, &str, &str)> {
     let sp = t.find(' ')?;
     let (mnemonic, rest) = t.split_at(sp);
     let width = RmwWidth::from_mov(mnemonic)?;
-    let (src, dst) = split_two_operands(rest.trim_start())?;
+    let (src, dst) = split_two_operands(rest.trim_ascii_start())?;
     if !src.starts_with('%') || src.contains('(') || !dst.contains('(') {
         return None;
     }
@@ -5475,7 +5475,7 @@ fn parse_const_increment<'a>(
 ) -> Option<(&'a str, &'a str, IncOp)> {
     let sp = t.find(' ')?;
     let (mnemonic, rest) = t.split_at(sp);
-    let rest = rest.trim_start();
+    let rest = rest.trim_ascii_start();
     // The increment may be spelled at ANY width that is not narrower than the
     // load's register width.  The fused form only has to reproduce the value's
     // LOW `mem_width` bits -- `add{b,w,l,q} $imm,MEM` wraps modulo the same
@@ -5626,7 +5626,7 @@ fn parse_same_width_copy<'a>(t: &'a str, width: RmwWidth, loaded_reg: &str) -> O
     if mnemonic != want {
         return None;
     }
-    let (src, dst) = split_two_operands(rest.trim_start())?;
+    let (src, dst) = split_two_operands(rest.trim_ascii_start())?;
     if src != loaded_reg || !dst.starts_with('%') || dst.contains('(') || dst == loaded_reg {
         return None;
     }
@@ -5651,7 +5651,7 @@ fn parse_narrow_copy(t: &str, mem_width: RmwWidth) -> Option<RegId> {
     if mem_w != mem_width {
         return None;
     }
-    let (src, dst) = split_two_operands(rest.trim_start())?;
+    let (src, dst) = split_two_operands(rest.trim_ascii_start())?;
     let fam = register_family_fast(src);
     if fam == REG_NONE || fam > REG_GP_MAX {
         return None;
@@ -5684,7 +5684,7 @@ mod rmw_increment_form_tests {
         let changed = fold_memory_rmw(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, out)
     }
@@ -5912,7 +5912,7 @@ mod debug_and_pin_memfold_tests {
         let changed = fold_memory_operands(&mut store, &mut infos);
         let output = (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect();
         (changed, output, predicted)
     }

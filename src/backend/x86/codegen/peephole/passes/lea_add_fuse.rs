@@ -94,7 +94,7 @@ fn fuse_pair(store: &LineStore, infos: &[LineInfo], lea_i: usize) -> Option<(usi
         return None;
     }
     let (src, dst) = split_two_operands(add_rest)?;
-    if dst.trim() != t_spelling {
+    if dst.trim_ascii() != t_spelling {
         return None; // not the LEA's destination
     }
 
@@ -200,24 +200,24 @@ fn index_only_lea(lea: &str) -> Option<(char, &str, u8, &str)> {
         return None;
     }
     let (addr, dst) = split_two_operands(rest)?;
-    let addr = addr.trim();
+    let addr = addr.trim_ascii();
     let inner = addr.strip_prefix("0(")?.strip_suffix(')')?;
     let mut it = inner.split(',');
     let empty = it.next()?;
     let index = it.next()?;
     let scale = it.next()?;
-    if !empty.trim().is_empty() || it.next().is_some() {
+    if !empty.trim_ascii().is_empty() || it.next().is_some() {
         return None; // has a base register or extra fields: not index-only
     }
-    let scale_v: u8 = scale.trim().parse().ok()?;
+    let scale_v: u8 = scale.trim_ascii().parse().ok()?;
     if !matches!(scale_v, 1 | 2 | 4 | 8) {
         return None;
     }
-    Some((width, index.trim(), scale_v, dst.trim()))
+    Some((width, index.trim_ascii(), scale_v, dst.trim_ascii()))
 }
 
 fn replace(store: &mut LineStore, infos: &mut [LineInfo], idx: usize, text: String) -> bool {
-    if text.trim().is_empty() {
+    if text.trim_ascii().is_empty() {
         return false;
     }
     replace_line(store, &mut infos[idx], idx, text);
@@ -242,7 +242,7 @@ mod tests {
         run(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
-            .map(|i| store.get(i).trim().to_string())
+            .map(|i| store.get(i).trim_ascii().to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
