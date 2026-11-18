@@ -140,6 +140,15 @@ edge. The renamer snapshots the definition stacks before processing asm goto out
 those snapshots when filling in phi incoming values for goto targets and when recursing into
 dominator-tree children that are goto targets.
 
+**Asm-goto block ends.** A snapshot alone is not enough when a promoted alloca is stored
+*behind* the asm goto in the same block: phi placement works on whole blocks, takes the store
+to reach the label too, and one predecessor label cannot name two values for a label that the
+block reaches by its asm goto and by its terminator (`err = -EFAULT; asm goto(out); err = 0;
+out: return err;` returned `-EFAULT` after falling through). Before placing phis the pass ends
+such a block at the asm goto (`isolate_asm_goto_edges`): the tail becomes its own block, the
+label is reached from the head with the old value and from the tail with the new one, and the
+ordinary dominance frontier puts the phi there. Blocks that do not need it keep their shape.
+
 **Cleanup.** After renaming completes, the pass removes all promoted `Alloca`, `Store`, and
 `Load` instructions from the IR. Parameter allocas in the entry block are retained even if
 promoted, because the backend prologue spills incoming ABI registers into them

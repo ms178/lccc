@@ -54,6 +54,10 @@ FIXTURES = (
     # A block-scope function declared through a typedef or typeof is called,
     # not loaded as an object and jumped into.
     "block_extern_function_typedef",
+    # A label reached by an asm goto and by falling through from its block
+    # sees what each way in brings: a store or a copy behind the asm goto
+    # has not run on the asm goto's way out.
+    "asm_goto_joins_fallthrough",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
@@ -61,6 +65,7 @@ LEVELS = {
     "scoped_retry_state": ("-O2", "-O3", "-Os"),
     "sroa_overlapping_carriers": ALL_LEVELS + ("-O3",),
     "block_extern_function_typedef": ALL_LEVELS + ("-O3",),
+    "asm_goto_joins_fallthrough": ALL_LEVELS + ("-O3",),
     # A copied aggregate is a snapshot even when a later call or aliased store
     # modifies its original source.
     "memcpy_snapshot_alias": ALL_LEVELS + ("-O3",),

@@ -15,7 +15,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::ir::reexports::{
-    BlockId, Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value,
 };
 use std::collections::VecDeque;
 
@@ -120,6 +120,16 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
     }
     if alloca_infos.is_empty() {
         return;
+    }
+
+    // Step 1b: give every asm-goto edge that matters a block to leave from.
+    let promoted: FxHashSet<u32> = alloca_infos
+        .iter()
+        .map(|info| info.alloca_value.0)
+        .collect();
+    if isolate_asm_goto_edges(func, &promoted) {
+        // The blocks were renumbered; the candidates are the same ones.
+        alloca_infos = find_promotable_allocas(func, promote_params);
     }
 
     // Step 2: Build CFG
@@ -632,6 +642,181 @@ fn rename_variables(
     func.next_value_id = next_value;
 }
 
+/// Split blocks until no promoted alloca is defined behind an asm goto in
+/// that asm goto's own block; returns whether a block was split.
+///
+/// An asm goto leaves its block from where it stands, not from the end.
+/// Renaming knows that -- its label edges carry the values live at the asm
+/// (`goto_label_snapshots`) -- but phi placement works on whole blocks and
+/// did not: a store behind the asm goto was taken to reach every successor of
+/// the block, the label included.  In
+///
+/// ```c
+/// int err = -EFAULT;
+/// asm goto("..." : : : : out);    /* unsafe_put_user(), a static branch */
+/// err = 0;
+/// out:
+///     return err;
+/// ```
+///
+/// one block defines `err` and dominates `out`, so `out` got no phi and read
+/// the value from before the store on both ways in: the function returned
+/// `-EFAULT` after falling through (GCC 16.2 and Clang 23.1.5: 0), at every
+/// optimization level.  Nor can one predecessor label name the two values a
+/// label needs when its block reaches it by the asm goto *and* by the
+/// terminator, or by two asm gotos with a store between them.
+///
+/// Ending the block at the asm goto makes each of those an ordinary edge: the
+/// label is reached from the head with the old value and from the tail with
+/// the new one, the tail does not dominate it, and the dominance frontier
+/// puts the phi there.  Only a block that needs it is split.  One whose asm
+/// goto is followed by nothing a promotion defines keeps its shape -- every
+/// edge out of it carries the same values -- and `cfg_simplify` does not merge
+/// across an asm goto, so a tail stays a block of its own.
+fn isolate_asm_goto_edges(func: &mut IrFunction, promoted: &FxHashSet<u32>) -> bool {
+    let defines_promoted = |inst: &Instruction| match inst {
+        Instruction::Store { ptr, .. } => promoted.contains(&ptr.0),
+        Instruction::InlineAsm { outputs, .. } => {
+            outputs.iter().any(|(_, ptr, _)| promoted.contains(&ptr.0))
+        }
+        _ => false,
+    };
+    let first_label = func.next_label.max(
+        func.blocks
+            .iter()
+            .map(|block| block.label.0)
+            .max()
+            .map_or(1, |max| max + 1),
+    );
+    let mut next_label = first_label;
+    let mut idx = 0;
+    while idx < func.blocks.len() {
+        // The asm goto nearest ahead of the first promoted definition that
+        // has one ahead of it.  Asm gotos before that one see the same
+        // values as the head's end, and stay where they are.
+        let mut nearest_asm_goto = None;
+        let mut split_at = None;
+        for (position, inst) in func.blocks[idx].instructions.iter().enumerate() {
+            if is_asm_goto(inst) {
+                nearest_asm_goto = Some(position);
+            } else if nearest_asm_goto.is_some() && defines_promoted(inst) {
+                split_at = nearest_asm_goto;
+                break;
+            }
+        }
+        if let Some(at) = split_at {
+            split_block_after(func, idx, at, BlockId(next_label));
+            next_label += 1;
+        }
+        // A tail is the next block, and may hold the next such asm goto.
+        idx += 1;
+    }
+    if next_label == first_label {
+        return false;
+    }
+    func.next_label = next_label;
+    true
+}
+
+fn is_asm_goto(inst: &Instruction) -> bool {
+    matches!(inst, Instruction::InlineAsm { goto_labels, .. } if !goto_labels.is_empty())
+}
+
+/// The labels the asm gotos among `instructions` may jump to.
+fn asm_goto_targets(instructions: &[Instruction]) -> Vec<BlockId> {
+    let mut targets = Vec::new();
+    for inst in instructions {
+        if let Instruction::InlineAsm { goto_labels, .. } = inst {
+            for (_, label) in goto_labels {
+                if !targets.contains(label) {
+                    targets.push(*label);
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// End block `idx` after its instruction `at`.  What followed, and the
+/// terminator, become the block `tail` right behind it; the head branches
+/// there.
+fn split_block_after(func: &mut IrFunction, idx: usize, at: usize, tail: BlockId) {
+    let block = &mut func.blocks[idx];
+    let head = block.label;
+    // Asked before the instructions are cut: both tests compare lengths.
+    let spans_parallel = block.spans_parallel();
+    let ids_parallel = block.inline_ids_parallel();
+    let instructions = block.instructions.split_off(at + 1);
+    let source_spans = if spans_parallel {
+        block.source_spans.split_off(at + 1)
+    } else {
+        // A list that had drifted must not come to fit the shorter head.
+        block.source_spans.clear();
+        Vec::new()
+    };
+    let source_inline_ids = if ids_parallel {
+        block.source_inline_ids.split_off(at + 1)
+    } else {
+        block.source_inline_ids.clear();
+        Vec::new()
+    };
+    let terminator = std::mem::replace(&mut block.terminator, Terminator::Branch(tail));
+    let head_targets = asm_goto_targets(&block.instructions);
+
+    // The statement a terminator belongs to goes where the terminator goes.
+    if let Some(span) = func.terminator_spans.span_of(head, &terminator) {
+        let inline_id = func.terminator_spans.inline_of(head, &terminator);
+        func.terminator_spans
+            .record_inline(tail, span, inline_id, &terminator);
+    }
+
+    // A successor names its incoming edges by predecessor label.  An edge
+    // that leaves from the tail now is renamed.  A successor both halves
+    // reach had one value for the two edges, and keeps it on each.
+    let mut tail_targets = asm_goto_targets(&instructions);
+    for label in get_successor_labels(&terminator) {
+        if !tail_targets.contains(&label) {
+            tail_targets.push(label);
+        }
+    }
+    for successor in &mut func.blocks {
+        if !tail_targets.contains(&successor.label) {
+            continue;
+        }
+        let also_from_head = head_targets.contains(&successor.label);
+        for inst in &mut successor.instructions {
+            let Instruction::Phi { incoming, .. } = inst else {
+                break; // Phis are always at the start of a block
+            };
+            if also_from_head {
+                let on_the_tail_edge: Vec<(Operand, BlockId)> = incoming
+                    .iter()
+                    .filter(|(_, from)| *from == head)
+                    .map(|(value, _)| (*value, tail))
+                    .collect();
+                incoming.extend(on_the_tail_edge);
+            } else {
+                for (_, from) in incoming.iter_mut() {
+                    if *from == head {
+                        *from = tail;
+                    }
+                }
+            }
+        }
+    }
+
+    func.blocks.insert(
+        idx + 1,
+        BasicBlock {
+            label: tail,
+            instructions,
+            terminator,
+            source_spans,
+            source_inline_ids,
+        },
+    );
+}
+
 /// Push `val` as the current definition of alloca `ai`, logging the push so
 /// the dominator-tree walk can undo exactly this block's definitions.
 #[inline]
@@ -1030,6 +1215,380 @@ mod tests {
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{BasicBlock, CallInfo, IrBinOp, IrCmpOp, IrParam};
 
+    /// Shapes for the asm-goto edge tests: one `int` in `Value(0)`.
+    mod asm_goto_edges {
+        use super::*;
+
+        const SLOT: Value = Value(0);
+
+        fn slot() -> Instruction {
+            Instruction::Alloca {
+                dest: SLOT,
+                ty: IrType::I32,
+                size: 4,
+                align: 0,
+                volatile: false,
+                semantic_volatile: false,
+            }
+        }
+
+        fn number(n: i32) -> Operand {
+            Operand::Const(IrConst::I32(n))
+        }
+
+        fn store(val: Operand) -> Instruction {
+            Instruction::Store {
+                volatile: false,
+                val,
+                ptr: SLOT,
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            }
+        }
+
+        fn load(dest: u32) -> Instruction {
+            Instruction::Load {
+                volatile: false,
+                dest: Value(dest),
+                ptr: SLOT,
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            }
+        }
+
+        fn asm_goto(label: u32) -> Instruction {
+            Instruction::InlineAsm {
+                template: "jmp %l0".into(),
+                outputs: vec![],
+                inputs: vec![],
+                clobbers: vec![],
+                operand_types: vec![],
+                goto_labels: vec![("out".into(), BlockId(label))],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            }
+        }
+
+        fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+            BasicBlock {
+                label: BlockId(label),
+                instructions,
+                terminator,
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            }
+        }
+
+        fn promoted(blocks: Vec<BasicBlock>, next_value_id: u32) -> IrFunction {
+            let mut func = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+            func.blocks = blocks;
+            func.next_value_id = next_value_id;
+            promote_function(&mut func, false);
+            func
+        }
+
+        fn by_label(func: &IrFunction, label: u32) -> &BasicBlock {
+            func.blocks
+                .iter()
+                .find(|block| block.label == BlockId(label))
+                .expect("the block")
+        }
+
+        /// The incoming edges of the first phi of block `label`, in a fixed
+        /// order.
+        fn first_phi(func: &IrFunction, label: u32) -> Vec<(Operand, u32)> {
+            let Some(Instruction::Phi { incoming, .. }) =
+                by_label(func, label).instructions.first()
+            else {
+                panic!(
+                    "block {label} starts with a phi: {:?}",
+                    by_label(func, label)
+                );
+            };
+            let mut edges: Vec<(Operand, u32)> = incoming
+                .iter()
+                .map(|(value, from)| (*value, from.0))
+                .collect();
+            edges.sort_by_key(|(_, from)| *from);
+            edges
+        }
+
+        /// `int err = 5; asm goto(out); err = 7; out: return err;`
+        ///
+        /// The label is reached by the asm goto with 5 and by falling through
+        /// with 7.  One block defined `err` and dominated the label, so no
+        /// phi was placed and both ways in read 5.
+        #[test]
+        fn a_store_behind_an_asm_goto_meets_the_old_value_in_a_phi() {
+            let func = promoted(
+                vec![
+                    block(
+                        0,
+                        vec![slot(), store(number(5)), asm_goto(1), store(number(7))],
+                        Terminator::Branch(BlockId(1)),
+                    ),
+                    block(
+                        1,
+                        vec![load(1)],
+                        Terminator::Return(Some(Operand::Value(Value(1)))),
+                    ),
+                ],
+                2,
+            );
+            assert_eq!(func.blocks.len(), 3, "the block ends at the asm goto");
+            let head = &func.blocks[0];
+            assert!(is_asm_goto(head.instructions.last().unwrap()));
+            let Terminator::Branch(tail) = head.terminator else {
+                panic!("the head falls through: {:?}", head.terminator);
+            };
+            assert_eq!(func.blocks[1].label, tail, "the tail follows its head");
+            assert!(matches!(
+                func.blocks[1].terminator,
+                Terminator::Branch(BlockId(1))
+            ));
+            assert!(tail.0 < func.next_label, "the label is accounted for");
+            assert_eq!(
+                first_phi(&func, 1),
+                [(number(5), 0), (number(7), tail.0)],
+                "each edge brings the value live where it leaves"
+            );
+        }
+
+        /// `r = 1; asm goto(out); r = 2; asm goto(out); r = 3; out:` -- three
+        /// edges into the label, three values.
+        #[test]
+        fn every_asm_goto_with_a_store_behind_it_ends_a_block() {
+            let func = promoted(
+                vec![
+                    block(
+                        0,
+                        vec![
+                            slot(),
+                            store(number(1)),
+                            asm_goto(1),
+                            store(number(2)),
+                            asm_goto(1),
+                            store(number(3)),
+                        ],
+                        Terminator::Branch(BlockId(1)),
+                    ),
+                    block(
+                        1,
+                        vec![load(1)],
+                        Terminator::Return(Some(Operand::Value(Value(1)))),
+                    ),
+                ],
+                2,
+            );
+            assert_eq!(func.blocks.len(), 4);
+            let values: Vec<Operand> = first_phi(&func, 1).into_iter().map(|(v, _)| v).collect();
+            assert_eq!(values, [number(1), number(2), number(3)]);
+        }
+
+        /// `r = 1; asm goto(out); asm goto(out); r = 2; out:` -- the two asm
+        /// gotos leave with the same value, so one block end serves both.
+        #[test]
+        fn asm_gotos_that_see_the_same_values_share_a_block() {
+            let func = promoted(
+                vec![
+                    block(
+                        0,
+                        vec![
+                            slot(),
+                            store(number(1)),
+                            asm_goto(1),
+                            asm_goto(1),
+                            store(number(2)),
+                        ],
+                        Terminator::Branch(BlockId(1)),
+                    ),
+                    block(
+                        1,
+                        vec![load(1)],
+                        Terminator::Return(Some(Operand::Value(Value(1)))),
+                    ),
+                ],
+                2,
+            );
+            assert_eq!(func.blocks.len(), 3);
+            let head = &func.blocks[0];
+            assert_eq!(
+                head.instructions.iter().filter(|i| is_asm_goto(i)).count(),
+                2
+            );
+            let values: Vec<Operand> = first_phi(&func, 1).into_iter().map(|(v, _)| v).collect();
+            assert_eq!(values, [number(1), number(2)]);
+        }
+
+        /// A bottom-tested loop whose exit is also the label:
+        /// `do { asm goto(out); s += 1; } while (c); out: return s;`
+        /// The back edge and the exit leave from the tail with the new sum;
+        /// the asm goto leaves from the head with the old one.
+        #[test]
+        fn a_loop_that_falls_out_at_the_label_carries_the_new_value() {
+            let func = promoted(
+                vec![
+                    block(
+                        0,
+                        vec![slot(), store(number(0))],
+                        Terminator::Branch(BlockId(1)),
+                    ),
+                    block(
+                        1,
+                        vec![
+                            asm_goto(2),
+                            load(1),
+                            Instruction::BinOp {
+                                dest: Value(2),
+                                op: IrBinOp::Add,
+                                lhs: Operand::Value(Value(1)),
+                                rhs: number(1),
+                                ty: IrType::I32,
+                            },
+                            store(Operand::Value(Value(2))),
+                        ],
+                        Terminator::CondBranch {
+                            cond: Operand::Value(Value(2)),
+                            true_label: BlockId(1),
+                            false_label: BlockId(2),
+                        },
+                    ),
+                    block(
+                        2,
+                        vec![load(3)],
+                        Terminator::Return(Some(Operand::Value(Value(3)))),
+                    ),
+                ],
+                4,
+            );
+            assert_eq!(func.blocks.len(), 4);
+            let Terminator::Branch(tail) = by_label(&func, 1).terminator else {
+                panic!("the loop head falls through to its tail");
+            };
+            let Some(Instruction::Phi { dest: sum, .. }) = by_label(&func, 1).instructions.first()
+            else {
+                panic!("the loop carries the sum in a phi");
+            };
+            let new_sum = Operand::Value(Value(2));
+            // The back edge comes from the tail now.
+            assert_eq!(first_phi(&func, 1), [(number(0), 0), (new_sum, tail.0)]);
+            assert_eq!(
+                first_phi(&func, 2),
+                [(Operand::Value(*sum), 1), (new_sum, tail.0)]
+            );
+        }
+
+        /// A phi that was already there names the split block as one
+        /// predecessor.  It had one value for the asm-goto edge and the
+        /// terminator edge, and has it on both afterwards.
+        #[test]
+        fn a_phi_of_an_earlier_promotion_follows_the_split() {
+            let existing = Instruction::Phi {
+                dest: Value(9),
+                ty: IrType::I32,
+                incoming: vec![(number(11), BlockId(0)), (number(22), BlockId(1))],
+            };
+            let func = promoted(
+                vec![
+                    block(
+                        0,
+                        vec![slot(), store(number(5)), asm_goto(2), store(number(7))],
+                        Terminator::CondBranch {
+                            cond: number(1),
+                            true_label: BlockId(1),
+                            false_label: BlockId(2),
+                        },
+                    ),
+                    block(1, vec![], Terminator::Branch(BlockId(2))),
+                    block(
+                        2,
+                        vec![existing, load(1)],
+                        Terminator::Return(Some(Operand::Value(Value(1)))),
+                    ),
+                ],
+                10,
+            );
+            let Terminator::Branch(tail) = func.blocks[0].terminator else {
+                panic!("the head falls through");
+            };
+            let phis: Vec<Vec<(Operand, u32)>> = by_label(&func, 2)
+                .instructions
+                .iter()
+                .map_while(|inst| match inst {
+                    Instruction::Phi { incoming, .. } => {
+                        let mut edges: Vec<(Operand, u32)> = incoming
+                            .iter()
+                            .map(|(value, from)| (*value, from.0))
+                            .collect();
+                        edges.sort_by_key(|(_, from)| *from);
+                        Some(edges)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let old = [(number(11), 0), (number(22), 1), (number(11), tail.0)];
+            let new = [(number(5), 0), (number(7), 1), (number(7), tail.0)];
+            assert_eq!(phis.len(), 2);
+            assert!(phis.contains(&old.to_vec()), "{phis:?}");
+            assert!(phis.contains(&new.to_vec()), "{phis:?}");
+        }
+
+        /// Nothing is split for an asm goto with no promoted store behind it:
+        /// every edge out of that block carries the same values.
+        #[test]
+        fn a_block_keeps_its_shape_when_nothing_is_stored_behind_the_asm_goto() {
+            let last = promoted(
+                vec![
+                    block(
+                        0,
+                        vec![slot(), store(number(5)), asm_goto(1)],
+                        Terminator::Branch(BlockId(1)),
+                    ),
+                    block(
+                        1,
+                        vec![load(1)],
+                        Terminator::Return(Some(Operand::Value(Value(1)))),
+                    ),
+                ],
+                2,
+            );
+            assert_eq!(last.blocks.len(), 2);
+            // A store to a slot that stays in memory is not this pass's edge
+            // to get right: the load at the label reads memory.
+            let volatile = Instruction::Alloca {
+                dest: Value(5),
+                ty: IrType::I32,
+                size: 4,
+                align: 0,
+                volatile: true,
+                semantic_volatile: true,
+            };
+            let to_memory = Instruction::Store {
+                volatile: true,
+                val: number(7),
+                ptr: Value(5),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            };
+            let kept = promoted(
+                vec![
+                    block(
+                        0,
+                        vec![slot(), volatile, store(number(5)), asm_goto(1), to_memory],
+                        Terminator::Branch(BlockId(1)),
+                    ),
+                    block(
+                        1,
+                        vec![load(1)],
+                        Terminator::Return(Some(Operand::Value(Value(1)))),
+                    ),
+                ],
+                6,
+            );
+            assert_eq!(kept.blocks.len(), 2);
+        }
+    }
+
     /// Helper to build a simple function with one local variable.
     /// int f() { int x = 42; return x; }
     fn make_simple_function() -> IrFunction {
@@ -1391,6 +1950,7 @@ mod tests {
                         regparm: None,
                         is_pure: false,
                         is_const: false,
+                        memory: Default::default(),
                         assume_library: false,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,

@@ -235,14 +235,31 @@ fn successor_count(block: &BasicBlock) -> usize {
     seen.len()
 }
 
-/// Replace one occurrence of `old_target` with `new_target` in a block's
-/// terminator or InlineAsm goto_labels.
-fn retarget_block_edge_once(block: &mut BasicBlock, old_target: BlockId, new_target: BlockId) {
-    match &mut block.terminator {
+/// Send the edges from `block` to `old_target` to `new_target` instead: one
+/// occurrence in the terminator, and every asm goto label.
+///
+/// The asm gotos are not an alternative to the terminator.  A block may reach
+/// the target both ways, the phi has one entry for the block either way, and
+/// the copies of that entry have to run on each of the edges.
+fn retarget_block_edges(block: &mut BasicBlock, old_target: BlockId, new_target: BlockId) {
+    retarget_terminator_once(&mut block.terminator, old_target, new_target);
+    for inst in &mut block.instructions {
+        if let Instruction::InlineAsm { goto_labels, .. } = inst {
+            for (_, label) in goto_labels.iter_mut() {
+                if *label == old_target {
+                    *label = new_target;
+                }
+            }
+        }
+    }
+}
+
+/// Replace one occurrence of `old_target` with `new_target` in a terminator.
+fn retarget_terminator_once(terminator: &mut Terminator, old_target: BlockId, new_target: BlockId) {
+    match terminator {
         Terminator::Branch(t) => {
             if *t == old_target {
                 *t = new_target;
-                return;
             }
         }
         Terminator::CondBranch {
@@ -253,47 +270,25 @@ fn retarget_block_edge_once(block: &mut BasicBlock, old_target: BlockId, new_tar
             // Only retarget one edge to avoid changing both sides of a diamond
             if *true_label == old_target {
                 *true_label = new_target;
-                return;
             } else if *false_label == old_target {
                 *false_label = new_target;
-                return;
             }
         }
         Terminator::IndirectBranch {
             possible_targets, ..
         } => {
-            for t in possible_targets.iter_mut() {
-                if *t == old_target {
-                    *t = new_target;
-                    return;
-                }
+            if let Some(t) = possible_targets.iter_mut().find(|t| **t == old_target) {
+                *t = new_target;
             }
         }
         Terminator::Switch { cases, default, .. } => {
             if *default == old_target {
                 *default = new_target;
-                return;
-            } else {
-                for (_, t) in cases.iter_mut() {
-                    if *t == old_target {
-                        *t = new_target;
-                        return;
-                    }
-                }
+            } else if let Some((_, t)) = cases.iter_mut().find(|(_, t)| *t == old_target) {
+                *t = new_target;
             }
         }
         _ => {}
-    }
-    // Check InlineAsm goto_labels for implicit control flow edges.
-    for inst in &mut block.instructions {
-        if let Instruction::InlineAsm { goto_labels, .. } = inst {
-            for (_, label) in goto_labels.iter_mut() {
-                if *label == old_target {
-                    *label = new_target;
-                    return;
-                }
-            }
-        }
     }
 }
 
@@ -631,6 +626,8 @@ struct PhiElimCtx<'a> {
     label_to_idx: FxHashMap<BlockId, usize>,
     multi_succ: Vec<bool>,
     is_indirect_branch: Vec<bool>,
+    /// The `(block, label)` pairs joined by an asm-goto edge.
+    asm_goto_edges: FxHashSet<(usize, BlockId)>,
     pred_copies: FxHashMap<usize, Vec<Instruction>>,
     /// Backedge copies for blocks that are their own phi target, buffered so
     /// they can be validated as a whole before deciding between absorbing them
@@ -677,6 +674,14 @@ fn eliminate_phis_with_policy(
             .blocks
             .iter()
             .map(|b| matches!(&b.terminator, Terminator::IndirectBranch { .. }))
+            .collect(),
+        asm_goto_edges: func
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, block)| {
+                crate::ir::analysis::asm_goto_successors(block).map(move |label| (idx, label))
+            })
             .collect(),
         pred_copies: FxHashMap::default(),
         self_loop_copies: vec![Vec::new(); func.blocks.len()],
@@ -1059,6 +1064,15 @@ fn classify_placement(
     pred_idx: usize,
     target_block_id: BlockId,
 ) -> CopyPlacement {
+    if ctx.asm_goto_edges.contains(&(pred_idx, target_block_id)) {
+        // An asm goto leaves the predecessor ahead of anything put at its
+        // end.  Copies placed there ran only when the block fell through:
+        // `asm goto(... : out); f(); out:` reached `out` by the asm goto
+        // with whatever the phi homes held.  The same goes for a block that
+        // is its own target.  The edge gets a block of its own, shared with
+        // the terminator if that goes to the target too.
+        return CopyPlacement::Trampoline;
+    }
     if !ctx.multi_succ[pred_idx] || ctx.is_indirect_branch[pred_idx] {
         // No critical edge to split: the predecessor reaches the target and
         // nothing else. (An indirect branch is left alone because its target
@@ -1477,7 +1491,7 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
 
     // Retarget predecessors that need trampolines
     for trampoline in &ctx.trampolines {
-        retarget_block_edge_once(
+        retarget_block_edges(
             &mut func.blocks[trampoline.pred_idx],
             trampoline.old_target,
             trampoline.label,
