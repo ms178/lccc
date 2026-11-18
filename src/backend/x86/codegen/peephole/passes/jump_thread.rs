@@ -513,10 +513,43 @@ fn section_proof_ends(s: &str) -> bool {
         )
 }
 
+/// Skip the marker block directly attached to an unconditional sibling jump.
+/// The markers stay on that jump; for the fallthrough proof they emit no bytes.
+/// Do not step over markers elsewhere or through a directive or opaque line.
+fn after_tail_markers(store: &LineStore, infos: &[LineInfo], start: usize, hi: usize) -> usize {
+    let marker = |k: usize| {
+        let info = infos[k];
+        (!info.pinned && !info.is_nop() && info.kind != LineKind::InlineAsm)
+            .then(|| info.trimmed(store.get(k)))
+    };
+    if start >= hi || marker(start) != Some("# LCCC_TAIL_CALL") {
+        return start;
+    }
+    let mut k = start + 1;
+    while k < hi
+        && marker(k).is_some_and(|s| match s {
+            "# LCCC_VA_CALL" | "# LCCC_CHAIN_CALL" => true,
+            _ => {
+                s.strip_prefix("# LCCC_CALL_ARGS ")
+                    .or_else(|| s.strip_prefix("# LCCC_CALL_FP "))
+                    .is_some_and(|n| n.parse::<u8>().is_ok())
+                    || s.strip_prefix("# LCCC_IPA_KEEP 0x")
+                        .is_some_and(|n| u16::from_str_radix(n, 16).is_ok())
+            }
+        })
+    {
+        k += 1;
+    }
+    k
+}
+
 /// Delete the relays [`thread_function`] orphaned: a run of unreferenced,
 /// uniquely defined, unpinned labels (inert comments between them stay) that
 /// follows an unconditional transfer and ends in one direct `jmp`. Nothing
 /// can reach the run, so dropping it changes no execution, only dead bytes.
+/// The ABI comments published on a sibling jump do not re-open fallthrough:
+/// stopping at them left dead relays in Linux's `acpi_rs_move_data` and
+/// `acpi_ds_exec_end_control_op` that objtool diagnosed as unreachable.
 ///
 /// "Follows an unconditional transfer" is a property of the SECTION, not of the
 /// line above it: GAS resumes every section exactly where it left off, so the
@@ -658,6 +691,9 @@ fn remove_dead_relays(
                 && info.kind != LineKind::Label
                 && matches!(mnemonic, "jmp" | "jmpq" | "ret" | "retq" | "ud2");
             k += 1;
+            if prev_transfers && matches!(info.kind, LineKind::Jmp | LineKind::JmpIndirect) {
+                k = after_tail_markers(store, infos, k, hi);
+            }
         }
         let Some(lines) = found else {
             return changed;
@@ -1510,6 +1546,42 @@ mod tests {
         assert!(out.contains(".LBB3:"), "{marked}: {out}");
         let body = "jle .LBB3\nret\n.LBB3:\njmp .LBB2\n.LBB2:\nret";
         assert!(apply(body, Some(".LBB3:")).1.contains(".LBB3:"));
+    }
+
+    #[test]
+    fn a_tail_jumps_own_markers_do_not_reopen_fallthrough() {
+        let tail = format!(
+            "# {COMPILER_MARKER}TAIL_CALL\n# {COMPILER_MARKER}CALL_ARGS 2\n# {COMPILER_MARKER}CALL_FP 0"
+        );
+        let body = |jump: &str, markers: &str| {
+            format!("jle .LBB3\n{jump}\n{markers}\n.LBB3:\njmp .LBB2\n.LBB2:\nret")
+        };
+        let direct = body("jmp hook@PLT", &tail);
+        let (_, out) = apply(&direct, None);
+        assert!(!out.contains(".LBB3"), "orphan should be gone: {out}");
+        assert!(
+            out.contains(&format!("jle .LBB2\njmp hook@PLT\n{tail}")),
+            "{out}"
+        );
+        for (jump, extra) in [
+            ("je hook@PLT", ""), // a conditional tail call DOES fall through
+            ("jmp hook@PLT", "\n.cfi_restore_state"),
+            ("jmp hook@PLT", "\n.p2align 4"),
+        ] {
+            assert!(
+                apply(&body(jump, &format!("{tail}{extra}")), None)
+                    .1
+                    .contains(".LBB3:")
+            );
+        }
+        let unknown = format!("{tail}\n# {COMPILER_MARKER}UNKNOWN");
+        assert!(
+            apply(&body("jmp hook@PLT", &unknown), None)
+                .1
+                .contains(".LBB3:")
+        );
+        let pinned = format!("# {COMPILER_MARKER}CALL_ARGS 2");
+        assert!(apply(&direct, Some(&pinned)).1.contains(".LBB3:"));
     }
 
     #[test]
