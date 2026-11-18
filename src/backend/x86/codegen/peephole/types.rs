@@ -818,7 +818,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             }
             if is_xmm_family(reg) {
                 let offset = fast_parse_i32(offset_str);
-                return line_info(LineKind::StoreXmmRbp { offset, size }, ts);
+                return xmm_slot_line_info(LineKind::StoreXmmRbp { offset, size }, ts, s, sb);
             }
         }
         if let Some((offset_str, reg_str, size)) = parse_load_from_rbp_str(s) {
@@ -841,7 +841,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             }
             if is_xmm_family(reg) {
                 let offset = fast_parse_i32(offset_str);
-                return line_info(LineKind::LoadXmmRbp { offset, size }, ts);
+                return xmm_slot_line_info(LineKind::LoadXmmRbp { offset, size }, ts, s, sb);
             }
         }
         // Check for self-move: movq %reg, %reg (same src and dst)
@@ -1380,81 +1380,30 @@ pub(super) fn strip_mov_prefix(s: &str, allow_slq: bool) -> Option<(&str, MoveSi
     }
 }
 
-/// True when the memory operand opening at byte index `i` of `s` (i.e. the `(`
-/// of `disp(%base)`) is qualified by a segment override -- `%gs:`, `%fs:`,
-/// `%ds:`, `%es:`, `%cs:` or `%ss:` immediately before it.
-///
-/// A segment-qualified access resolves through a segment base, so it addresses
-/// whatever the descriptor points at, never a frame slot of this function.  In
-/// the kernel that is how `__seg_gs` reaches its per-CPU data, and the same
-/// spelling reaches TLS in user code.
-///
-/// `i < 4` is checked before the slice, and the bytes compared are ASCII, so the
-/// index arithmetic is char-boundary safe even though assembly text may contain
-/// UTF-8 identifiers (UCN spellings).
-#[inline]
-fn preceded_by_segment_override(s: &str, i: usize) -> bool {
-    let b = s.as_bytes();
-    // Step back over the displacement, if any: `%gs:(%rbp)` has none, but
-    // `%gs:16(%rbp)` puts `16` between the override and the `(`.  Only digits
-    // and a leading sign are stepped over, so the walk stops at the `:` of an
-    // override and at anything else (a `,` between operands, a `)` from a
-    // previous operand, a space) without ever crossing into another operand.
-    let mut j = i;
-    while j > 0 && (b[j - 1].is_ascii_digit() || b[j - 1] == b'-') {
-        j -= 1;
-    }
-    // j is now the first byte of the displacement, or i when there is none.  A
-    // segment override is `%gs:` -- FOUR bytes, `%` + two letters + `:` -- so the
-    // `%` sits at j - 4.  (Counting it at j - 3 was an off-by-one that let every
-    // displaced form through: `%gs:16(%rbp)` parsed as frame slot 16.)
-    j >= 4
-        && b[j - 1] == b':'
-        && b[j - 4] == b'%'
-        && b[j - 3].is_ascii_lowercase()
-        && matches!(b[j - 2], b'g' | b'f' | b'd' | b'e' | b'c' | b's')
-}
-
-/// True when `mem` is a *direct frame-slot* operand: an optional decimal
-/// displacement immediately followed by `(%rbp)` or `(%rsp)`, and nothing else.
-///
-/// A segment override is not a frame slot.  `%gs:(%rbp)` and `%gs:16(%rbp)`
-/// dereference the pointer held in `%rbp` through a segment base, so they address
-/// arbitrary memory -- but the bare suffix test the slot parsers used
-/// (`ends_with("(%rbp)")`) accepts both, and `fast_parse_i32` then answers 0 for
-/// the displacement `"%gs:16"`, because its first byte is not a digit and the
-/// scan stops there.  So `movdqu %xmm0, %gs:(%rbp)` classified as a store to
-/// frame slot 0, and `movq %rax, %gs:(%rbp)` as a GP store to slot 0: candidates
-/// that windowed dead-store elimination may delete as soon as another store
-/// covers those bytes, silently losing a `__seg_gs` write -- and `%gs` is how the
-/// kernel reaches its per-CPU data.  Measured on tests/bench/k_seg_gs_copy.c at
-/// -O2: five segment-qualified `%rbp` operands, one of them a store
-/// (`movdqu %xmm0, %gs:(%rbp)`).
-///
-/// Rejecting is the conservative direction.  The line falls back to `Other`,
-/// which every slot pass already treats as "may read or write memory", so a
-/// rejected operand forgoes an optimization and can never justify a deletion.
+/// A direct frame slot uses a canonical signed decimal displacement in the
+/// encodable i32 range. Segment, symbolic, indexed and octal spellings are not
+/// stack-slot facts that later passes may use to remove a memory operation.
 #[inline]
 pub(super) fn is_direct_frame_slot(mem: &str) -> bool {
-    let disp = if mem.ends_with("(%rbp)") || mem.ends_with("(%rsp)") {
-        &mem[..mem.len() - 6]
-    } else {
+    let Some(disp) = mem
+        .strip_suffix("(%rbp)")
+        .or_else(|| mem.strip_suffix("(%rsp)"))
+    else {
         return false;
     };
-    // A bare `(%rsp)` has no displacement and is a slot at offset 0.
-    if disp.is_empty() {
+    if disp.is_empty() || disp == "0" {
         return true;
     }
-    // Otherwise the displacement must be plain decimal.  A `%`, a `:` or an
-    // index register means the operand is not a slot this compiler can reason
-    // about -- and, before this guard, never was.
-    let bytes = disp.as_bytes();
-    let digits = if bytes[0] == b'-' { &bytes[1..] } else { bytes };
-    // The digit test alone is not enough: `%gs:16(%rbp)` has displacement
-    // `%gs:16`, whose digits would pass if the `%gs:` prefix were stripped by
-    // anything upstream of here.  Requiring every byte to be a digit rejects it,
-    // and the explicit `:` test documents why.
-    !digits.is_empty() && !digits.contains(&b':') && digits.iter().all(u8::is_ascii_digit)
+    let digits = disp.strip_prefix('-').unwrap_or(disp).as_bytes();
+    matches!(digits.first(), Some(b'1'..=b'9')) && disp.parse::<i32>().is_ok()
+}
+
+#[inline]
+fn frame_operand_start(prefix: &[u8]) -> usize {
+    prefix
+        .iter()
+        .rposition(|&byte| byte == b',' || byte.is_ascii_whitespace())
+        .map_or(0, |at| at + 1)
 }
 
 /// Parse a scalar-FP / SSE stack move: `movsd`, `movss`, `movd` (or AVX
@@ -1805,36 +1754,30 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     let len = bytes.len();
     let mut i = 0;
     while i < len {
-        if bytes[i] == b'(' && i + 2 < len && bytes[i + 1] == b'%' {
-            // A segment override makes the address arbitrary even when the base
-            // register is %rbp/%rsp: `%gs:(%rbp)` dereferences the pointer held
-            // in %rbp through the %gs base, so it is no frame-slot access and no
-            // slot reasoning may assume it touches one known slot.  Without this
-            // the line reported a *known* frame offset -- 0, because parsing the
-            // displacement `"%gs:"` stops at the first non-digit -- and
-            // dead-store elimination then skipped it as an access to a different
-            // slot instead of treating it as opaque memory.
-            if preceded_by_segment_override(s, i) {
+        if bytes[i] == b'%' && bytes.get(i + 3) == Some(&b':') {
+            let seg = (
+                bytes[i + 1].to_ascii_lowercase(),
+                bytes[i + 2].to_ascii_lowercase(),
+            );
+            if matches!(seg, (b'c' | b'd' | b'e' | b'f' | b'g' | b's', b's')) {
                 return true;
             }
-            // Found "(%" - check if it's %rbp or %rsp (which are not indirect aliasing)
-            let rest = &s[i + 2..];
-            let r8 = first8(rest);
-            let is_frame_base = pfx!(r8, "rbp") || pfx!(r8, "rsp");
-            if pfx!(r8, "rip") {
-                // RIP-relative: a fixed global/rodata address, not a stack slot.
-            } else if !is_frame_base {
-                return true;
-            } else {
-                // (%rsp,...) / (%rbp,...): INDEXED addressing computes the slot
-                // at runtime, so no text-level offset can describe it. Treat it
-                // as indirect; a missed marker here let dead-store elimination
-                // drop stores read through an index.
-                let after_base = &rest[3..];
-                if !after_base.starts_with(')') {
+        }
+        if bytes[i] == b'(' && bytes.get(i + 1) == Some(&b'%') {
+            let rest = &s[i..];
+            if rest.starts_with("(%rip)") {
+                // RIP-relative, with no segment override: a fixed address.
+            } else if rest.starts_with("(%rbp)") || rest.starts_with("(%rsp)") {
+                let start = frame_operand_start(&bytes[..i]);
+                if !is_direct_frame_slot(&s[start..i + 6]) {
                     return true;
                 }
+            } else {
+                return true;
             }
+        } else if bytes[i] == b'(' && bytes.get(i + 1) == Some(&b',') {
+            // SIB with no base: (,%rcx,8).
+            return true;
         }
         i += 1;
     }
@@ -1958,32 +1901,11 @@ pub(super) fn parse_rbp_offset(s: &str) -> i32 {
                 || (bytes[i + 3] == b's' && bytes[i + 4] == b'p'))
             && bytes[i + 5] == b')'
         {
-            // `%gs:(%rbp)` is a write through the pointer in %rbp, not a frame
-            // slot: reporting offset 0 for it would let any caller that reads
-            // `rbp_offset` reason about a slot that does not exist.  Every
-            // current caller gates on `has_indirect_mem` first (which the
-            // segment override also sets), so this is defence in depth for the
-            // next one.
-            if preceded_by_segment_override(s, i) {
+            let start = frame_operand_start(&bytes[..i]);
+            if !is_direct_frame_slot(&s[start..i + 6]) {
                 return RBP_OFFSET_NONE;
             }
-            // Found "(%rbp)" at position i. Parse the offset before '('.
-            // The offset is the integer immediately before the '(' character.
-            let offset = if i == 0 {
-                0 // bare (%rbp) with no offset
-            } else {
-                // Scan backwards for digits/minus sign
-                let end = i;
-                let mut start = end;
-                while start > 0 && (bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'-') {
-                    start -= 1;
-                }
-                if start == end {
-                    0 // no numeric prefix, bare (%rbp) after space/comma
-                } else {
-                    fast_parse_i32(&s[start..end])
-                }
-            };
+            let offset = fast_parse_i32(&s[start..i]);
             if found_offset == RBP_OFFSET_NONE {
                 found_offset = offset;
             } else if found_offset != offset {
@@ -3147,35 +3069,6 @@ pub(super) fn write_rbp_pattern(buf: &mut [u8; 24], offset: i32) -> usize {
     pos + 6
 }
 
-/// The `write_rbp_pattern` sibling for an `%rsp`-relative slot.
-///
-/// Dead-store elimination's textual last resort asks "does this line mention the
-/// candidate's slot?" and for years the only spelling it could build was
-/// `N(%rbp)`.  A store to `16(%rsp)` therefore went looking for `16(%rbp)` -- a
-/// string that never names its own slot, but which unrelated lines do contain:
-/// `movdqu %gs:16(%rbp), %xmm0` (a per-CPU read through a static pointer) ends
-/// with `16(%rbp)`, so it was counted as a read of stack slot 16 and kept dead
-/// spills alive.  Callers that cannot tell which base the slot uses check both
-/// patterns, which is strictly more conservative than checking one.
-#[inline]
-pub(super) fn write_rsp_pattern(buf: &mut [u8; 24], offset: i32) -> usize {
-    let mut pos = 0;
-    if offset < 0 {
-        buf[pos] = b'-';
-        pos += 1;
-        let abs = if offset == i32::MIN {
-            (i32::MIN as i64).unsigned_abs() as u32
-        } else {
-            (-offset) as u32
-        };
-        pos += write_u32_digits(&mut buf[pos..], abs);
-    } else if offset > 0 {
-        pos += write_u32_digits(&mut buf[pos..], offset as u32);
-    }
-    buf[pos..pos + 6].copy_from_slice(b"(%rsp)");
-    pos + 6
-}
-
 /// Write decimal digits of a u32 into a buffer. Returns the number of bytes written.
 #[inline]
 fn write_u32_digits(buf: &mut [u8], mut v: u32) -> usize {
@@ -4196,6 +4089,8 @@ mod segment_override_slot_tests {
             "-8(%rbp)",
             "0(%rsp)",
             "232(%rsp)",
+            "2147483647(%rbp)",
+            "-2147483648(%rsp)",
         ] {
             assert!(is_direct_frame_slot(mem), "{mem} is a frame slot");
         }
@@ -4230,8 +4125,11 @@ mod segment_override_slot_tests {
             "",                //
             "abc(%rbp)",       // non-numeric displacement
             "0x10(%rbp)",      // hexadecimal is not what the emitter writes
-            "-(%rsp)",         // sign with no digits
-            "1 6(%rsp)",       // embedded space
+            "010(%rbp)",       // assembler interprets this as octal
+            "2147483648(%rsp)",
+            "-2147483649(%rbp)",
+            "-(%rsp)",   // sign with no digits
+            "1 6(%rsp)", // embedded space
         ] {
             assert!(!is_direct_frame_slot(mem), "{mem:?} must be rejected");
         }
