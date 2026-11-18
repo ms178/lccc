@@ -100,7 +100,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{
-    BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
 };
 use crate::passes::round_cap;
 
@@ -133,12 +133,39 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     total
 }
 
-/// Canonicalize a branch-only integer cast of a local {0,1} phi. Narrowing
-/// arbitrary integers is NOT truth-preserving (256 -> u8 is zero), so require
-/// every incoming arm to be an exact integer zero or one. No instruction is
-/// cloned or moved across asm: removing the cast exposes the existing phi-only
-/// threader, including constant edges following SMAP-style state changes.
-/// Count uses once for the function, rather than rescanning it per candidate.
+/// A local integer cast of a {0,1} phi preserves the result of testing
+/// that value for zero, even when it narrows. Both threaders use the same
+/// proof; an arbitrary narrow cast cannot be peeled (e.g. 256 -> u8 is 0).
+pub(super) fn boolean_phi_cast_source(block: &BasicBlock, cast: Value) -> Option<(usize, Value)> {
+    let (position, source) =
+        block
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(i, inst)| match inst {
+                Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    from_ty,
+                    to_ty,
+                } if *dest == cast && from_ty.is_integer() && to_ty.is_integer() => Some((i, *src)),
+                _ => None,
+            })?;
+    let boolean_phi = block.instructions.iter().any(|inst| {
+        matches!(inst, Instruction::Phi { dest, incoming, ty }
+        if ty.is_integer() && *dest == source && !incoming.is_empty() && incoming.iter().all(|(op, _)| {
+            match op {
+                Operand::Const(c) => matches!(const_to_i64(c), Some(0 | 1))
+                    || matches!(c, IrConst::I128(0 | 1)),
+                Operand::Value(_) => false,
+            }
+        }))
+    });
+    boolean_phi.then_some((position, source))
+}
+
+/// Remove branch-only casts to expose the no-duplication threader. Count
+/// uses once for the function, rather than rescanning it per candidate.
 fn remove_boolean_phi_branch_casts(func: &mut IrFunction) -> usize {
     let mut candidates = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -149,36 +176,7 @@ fn remove_boolean_phi_branch_casts(func: &mut IrFunction) -> usize {
         else {
             continue;
         };
-        let Some((position, source)) =
-            block
-                .instructions
-                .iter()
-                .enumerate()
-                .find_map(|(i, inst)| match inst {
-                    Instruction::Cast {
-                        dest,
-                        src: Operand::Value(src),
-                        from_ty,
-                        to_ty,
-                    } if dest == cond && from_ty.is_integer() && to_ty.is_integer() => {
-                        Some((i, *src))
-                    }
-                    _ => None,
-                })
-        else {
-            continue;
-        };
-        let boolean_phi = block.instructions.iter().any(|inst| {
-            matches!(inst, Instruction::Phi { dest, incoming, ty }
-            if ty.is_integer() && *dest == source && !incoming.is_empty() && incoming.iter().all(|(op, _)| {
-                match op {
-                    Operand::Const(c) => matches!(const_to_i64(c), Some(0 | 1))
-                        || matches!(c, IrConst::I128(0 | 1)),
-                    Operand::Value(_) => false,
-                }
-            }))
-        });
-        if boolean_phi {
+        if let Some((position, source)) = boolean_phi_cast_source(block, *cond) {
             candidates.push((bi, position, source, *cond));
         }
     }

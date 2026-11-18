@@ -457,7 +457,15 @@ impl Search<'_> {
         {
             return None;
         }
-        if let Some(incoming) = phi_def(head_block, val) {
+        // Inlining can test a narrow boolean cast of a merge phi while a
+        // live loop setup instruction keeps that merge from being phi-only.
+        // Look through the cast for the edge decision, but keep it in the
+        // clone so other users still see the original integer conversion.
+        let incoming = phi_def(head_block, val).or_else(|| {
+            let (_, source) = super::bool_thread::boolean_phi_cast_source(head_block, val)?;
+            phi_def(head_block, source)
+        });
+        if let Some(incoming) = incoming {
             for &p in &self.cfg.preds[head] {
                 if path.contains(&p) || !self.cfg.reachable(p) {
                     continue;
@@ -604,6 +612,16 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
 fn apply(func: &mut IrFunction, t: &Thread) -> Option<()> {
     let pred_label = func.blocks[t.pred].label;
     let orig_labels: Vec<BlockId> = t.path.iter().map(|&b| func.blocks[b].label).collect();
+    // Redirecting the explicit branch must remove the old edge entirely.
+    // An asm-goto edge with the same source and target still needs the
+    // original phi arm, and can observe state from earlier in the block.
+    let head = *orig_labels.first()?;
+    if func.blocks[t.pred].instructions.iter().any(|inst| {
+        matches!(inst, Instruction::InlineAsm { goto_labels, .. }
+            if goto_labels.iter().any(|(_, label)| *label == head))
+    }) {
+        return None;
+    }
     let clone_labels: Vec<BlockId> = t.path.iter().map(|_| fresh_label(func)).collect();
     let mut map: FxHashMap<u32, u32> = FxHashMap::default();
     let mut types: FxHashMap<u32, IrType> = FxHashMap::default();
@@ -1307,6 +1325,110 @@ mod tests {
             true_label: BlockId(t),
             false_label: BlockId(f),
         }
+    }
+
+    fn bool_cast_merge(second_arm: i32) -> IrFunction {
+        use crate::ir::module::IrParam;
+        use crate::ir::reexports::IrConst;
+        let param = IrParam {
+            ty: IrType::U32,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: vec![],
+            is_f128_sse: false,
+            fp_agg_class: None,
+        };
+        let mut f = IrFunction::new("cast_merge".into(), IrType::U64, vec![param], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::U32,
+                }],
+                cbr(0, 1, 2),
+            ),
+            block(1, vec![], Terminator::Branch(BlockId(3))),
+            block(2, vec![], Terminator::Branch(BlockId(3))),
+            block(
+                3,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::I32,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I32(0)), BlockId(1)),
+                            (Operand::Const(IrConst::I32(second_arm)), BlockId(2)),
+                        ],
+                    },
+                    Instruction::Cast {
+                        dest: Value(2),
+                        src: v(1),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::U8,
+                    },
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: v(0),
+                        from_ty: IrType::U32,
+                        to_ty: IrType::U64,
+                    },
+                ],
+                cbr(2, 4, 5),
+            ),
+            block(4, vec![], Terminator::Return(Some(v(3)))),
+            block(
+                5,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(-1)))),
+            ),
+        ];
+        f
+    }
+
+    #[test]
+    fn threads_through_boolean_cast_in_a_nonempty_merge() {
+        let mut f = bool_cast_merge(1);
+        assert_eq!(thread_decided_branches(&mut f), 2);
+        assert_eq!(
+            f.blocks
+                .iter()
+                .filter(|b| matches!(b.terminator, Terminator::CondBranch { .. }))
+                .count(),
+            1,
+            "only the entry branch should survive"
+        );
+        let mut f = bool_cast_merge(256);
+        assert_eq!(
+            thread_decided_branches(&mut f),
+            0,
+            "a narrowing cast can erase nonzero bits"
+        );
+    }
+
+    #[test]
+    fn cannot_redirect_an_explicit_edge_shared_with_asm_goto() {
+        let mut f = bool_cast_merge(1);
+        f.blocks[2].instructions.push(Instruction::InlineAsm {
+            template: "jmp %l[merge]".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("merge".into(), BlockId(3))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        });
+        let thread = Thread {
+            pred: 2,
+            path: vec![3],
+            target: Some(BlockId(4)),
+        };
+        assert!(apply(&mut f, &thread).is_none());
+        assert!(unique_arm(phi_def(&f.blocks[3], Value(1)).unwrap(), BlockId(2)).is_some());
     }
 
     /// The list merge loop of the module docs.
