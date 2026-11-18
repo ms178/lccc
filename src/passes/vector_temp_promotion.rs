@@ -468,7 +468,9 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::RoundPs256
         | O::RoundPd256
         | O::VpermilPs256
-        | O::VpermilPd256 => {
+        | O::VpermilPd256
+        | O::RcpPs256
+        | O::RsqrtPs256 => {
             return (index == 0).then_some(32);
         }
 
@@ -491,10 +493,14 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::HaddPs256
         | O::HsubPs256
         | O::AddsubPs256
+        | O::AddsubPd256
+        | O::DpPs256
         | O::VpermilvarPs256
         | O::VpermilvarPd256
         | O::BlendPs256
         | O::BlendPd256 => 32,
+        // 128-bit variable permutes: 16-byte source and index.
+        O::VpermilvarPs128 | O::VpermilvarPd128 => 16,
 
         // Binary 256-bit vector operations.
         O::Paddb256
@@ -5038,11 +5044,15 @@ mod tests {
             (HaddPs256, 2),
             (HsubPs256, 2),
             (AddsubPs256, 2),
+            (AddsubPd256, 2),
+            (DpPs256, 2),
             (VpermilvarPs256, 2),
             (VpermilvarPd256, 2),
             (BlendPs256, 2),
             (BlendPd256, 2),
             (SqrtPs256, 1),
+            (RcpPs256, 1),
+            (RsqrtPs256, 1),
             (SqrtPd256, 1),
             (RoundPs256, 1),
             (RoundPd256, 1),
@@ -5056,6 +5066,18 @@ mod tests {
                 assert_eq!(
                     pointer_vector_arg_width(op, index),
                     (index < vectors).then_some(32),
+                    "{op:?} arg {index}"
+                );
+            }
+        }
+        // 128-bit variable permutes are 16-byte values, not 32-byte ones.
+        for (op, vectors) in [(VpermilvarPs128, 2), (VpermilvarPd128, 2)] {
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?}");
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?}");
+            for index in 0..4 {
+                assert_eq!(
+                    pointer_vector_arg_width(op, index),
+                    (index < vectors).then_some(16),
                     "{op:?} arg {index}"
                 );
             }

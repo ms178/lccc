@@ -1434,6 +1434,7 @@ impl X86Codegen {
             | UnpckhPs256 | UnpcklPd256 | UnpckhPd256 | HaddPs256 | HsubPs256 | AddsubPs256
             | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256 | BlendvPs256 | BlendvPd256
             | VpermilPs256 | VpermilPd256 | Vperm2f128 | Vinsertf128 | Vextractf128
+            | AddsubPd256 | DpPs256 | RcpPs256 | RsqrtPs256 | VpermilvarPs128 | VpermilvarPd128
             | Vbroadcastss | Vbroadcastsd | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256
             | CvtPs2Pd256 | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256
             | VpermilvarPs256 | VpermilvarPd256 | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
@@ -2381,6 +2382,9 @@ impl X86Codegen {
             HaddPs256 => binary(self, "vhaddps", false),
             HsubPs256 => binary(self, "vhsubps", false),
             AddsubPs256 => binary(self, "vaddsubps", false),
+            AddsubPd256 => binary(self, "vaddsubpd", false),
+            RcpPs256 => unary(self, "vrcpps"),
+            RsqrtPs256 => unary(self, "vrsqrtps"),
             // The 256-bit unpack family previously had NO arm here: the ops
             // were routed to this dispatcher but silently emitted nothing,
             // leaving the result alloca uninitialized (garbage output for
@@ -2400,6 +2404,28 @@ impl X86Codegen {
             CvtPd2Ps256 => narrow(self, "vcvtpd2ps"),
             CvtPd2Ep32_256 => narrow(self, "vcvtpd2dq"),
             CvttPd2Ep32_256 => narrow(self, "vcvttpd2dq"),
+            // vdpps: two independent 128-bit dot products selected by imm.
+            DpPs256 => {
+                let imm = self.simd_imm(&args[2]);
+                self.avx_load_arg(&args[0]);
+                self.avx_load_arg_to(&args[1], "ymm1");
+                self.state
+                    .emit_fmt(format_args!("    vdpps ${}, %ymm1, %ymm0, %ymm0", imm));
+                self.avx_store_dest(dest_ptr);
+            }
+            // 128-bit variable-index permute (xmm): idx in arg 1.
+            VpermilvarPs128 => {
+                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[1], "xmm1");
+                self.state.emit("    vpermilps %xmm1, %xmm0, %xmm0");
+                self.sse_store_dest(dest_ptr, "xmm0");
+            }
+            VpermilvarPd128 => {
+                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[1], "xmm1");
+                self.state.emit("    vpermilpd %xmm1, %xmm0, %xmm0");
+                self.sse_store_dest(dest_ptr, "xmm0");
+            }
             // 3-op with imm: vcmpps/vcmppd/vshufps/vshufpd/vblendps/vblendpd (a, b, imm)
             CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | BlendPs256 | BlendPd256 => {
                 let inst = match op {

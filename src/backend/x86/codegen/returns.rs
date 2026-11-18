@@ -150,7 +150,8 @@ impl X86Codegen {
                 if let Operand::Value(v) = val {
                     if self.state.f128_direct_slots.contains(&v.0) {
                         if let Some(slot) = self.state.get_slot(v.0) {
-                            self.state.out.emit_instr_rbp("    fldt", slot.0);
+                            self.state
+                                .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                             self.emit_epilogue_and_ret_impl(frame_size);
                             return;
                         }
@@ -159,7 +160,8 @@ impl X86Codegen {
                         if let Some(addr) = self.state.resolve_slot_addr(ptr_id) {
                             match addr {
                                 SlotAddr::Direct(slot) => {
-                                    self.state.out.emit_instr_rbp("    fldt", slot.0);
+                                    self.state
+                                        .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                                 }
                                 SlotAddr::OverAligned(slot, id) => {
                                     self.emit_alloca_aligned_addr_impl(slot, id);
@@ -342,8 +344,10 @@ impl X86Codegen {
 
     pub(super) fn emit_get_return_f128_second_impl(&mut self, dest: &Value) {
         if let Some(slot) = self.state.get_slot(dest.0) {
-            self.state.out.emit_instr_rbp("    fstpt", slot.0);
-            self.state.out.emit_instr_rbp("    fldt", slot.0);
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp("    fstpt", slot.0));
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
             self.state.emit("    subq $8, %rsp");
             self.state.emit("    fstpl (%rsp)");
             self.state.emit("    popq %rax");
@@ -358,7 +362,8 @@ impl X86Codegen {
         match src {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    self.state.out.emit_instr_rbp("    fldt", slot.0);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                 }
             }
             _ => {

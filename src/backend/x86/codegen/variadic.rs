@@ -322,13 +322,15 @@ impl X86Codegen {
         if gp_count > 0 {
             let thr = GP_MAX - gp_count * GP_SLOT;
             self.state.emit("    movl (%rcx), %eax");
-            self.state.out.emit_instr_imm_reg("    cmpl", thr, "eax");
+            self.state
+                .with_out_checked(|o| o.emit_instr_imm_reg("    cmpl", thr, "eax"));
             self.state.out.emit_jcc_label("    ja", &label_mem);
         }
         if fp_count > 0 {
             let thr = FP_MAX - fp_count * FP_SLOT;
             self.state.emit("    movl 4(%rcx), %edx");
-            self.state.out.emit_instr_imm_reg("    cmpl", thr, "edx");
+            self.state
+                .with_out_checked(|o| o.emit_instr_imm_reg("    cmpl", thr, "edx"));
             self.state.out.emit_jcc_label("    ja", &label_mem);
         }
 
@@ -510,9 +512,11 @@ impl X86Codegen {
                 .emit_instr_reg_reg("    movq", reg_name, "rax");
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
-                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, "rax"));
             } else {
-                self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rax"));
             }
         }
 

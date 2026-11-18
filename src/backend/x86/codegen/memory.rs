@@ -705,7 +705,8 @@ impl X86Codegen {
                 if self.state.f128_direct_slots.contains(&v.0) {
                     if let Some(src_slot) = self.state.get_slot(v.0) {
                         if let Some(dest_addr) = self.state.resolve_slot_addr(ptr.0) {
-                            self.state.out.emit_instr_rbp("    fldt", src_slot.0);
+                            self.state
+                                .with_out_checked(|o| o.emit_instr_rbp("    fldt", src_slot.0));
                             self.emit_f128_fstpt(&dest_addr, ptr.0, 0);
                             return;
                         }
@@ -739,7 +740,8 @@ impl X86Codegen {
             match addr {
                 Some(SlotAddr::Direct(slot)) => {
                     let src = self.fp_store_value_xmm(val, ty);
-                    self.state.out.emit_instr_reg_rbp(store_instr, src, slot.0);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_rbp(store_instr, src, slot.0));
                     return;
                 }
                 Some(SlotAddr::Indirect(slot)) => {
@@ -1368,7 +1370,8 @@ impl X86Codegen {
                 if self.state.f128_direct_slots.contains(&v.0) {
                     if let Some(src_slot) = self.state.get_slot(v.0) {
                         if let Some(addr) = self.state.resolve_slot_addr(base.0) {
-                            self.state.out.emit_instr_rbp("    fldt", src_slot.0);
+                            self.state
+                                .with_out_checked(|o| o.emit_instr_rbp("    fldt", src_slot.0));
                             self.emit_f128_fstpt(&addr, base.0, offset);
                             return;
                         }
@@ -2846,7 +2849,8 @@ impl X86Codegen {
                 .out
                 .emit_instr_reg_reg("    movq", reg_name, "rcx");
         } else {
-            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rcx"));
         }
     }
 
@@ -2872,13 +2876,15 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_add_offset_to_addr_reg_impl(&mut self, offset: i64) {
-        self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+        self.state
+            .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
     }
 
     /// Compute the address of an alloca into `reg`, handling over-aligned allocas.
     pub(super) fn emit_alloca_addr_to(&mut self, reg: &str, val_id: u32, offset: i64) {
         if let Some(align) = self.state.alloca_over_align(val_id) {
-            self.state.out.emit_instr_rbp_reg("    leaq", offset, reg);
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", offset, reg));
             self.state
                 .out
                 .emit_instr_imm_reg("    addq", (align - 1) as i64, reg);
@@ -2886,7 +2892,8 @@ impl X86Codegen {
                 .out
                 .emit_instr_imm_reg("    andq", -(align as i64), reg);
         } else {
-            self.state.out.emit_instr_rbp_reg("    leaq", offset, reg);
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", offset, reg));
         }
     }
 
@@ -2905,7 +2912,8 @@ impl X86Codegen {
                 .out
                 .emit_instr_reg_reg("    movq", reg_name, "rcx");
         } else {
-            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rcx"));
         }
     }
 
@@ -2916,7 +2924,8 @@ impl X86Codegen {
 
     pub(super) fn emit_gep_direct_const_impl(&mut self, slot: StackSlot, offset: i64) {
         let folded = slot.0 + offset;
-        self.state.out.emit_instr_rbp_reg("    leaq", folded, "rax");
+        self.state
+            .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", folded, "rax"));
         self.state.reg_cache.invalidate_acc();
     }
 
@@ -2932,7 +2941,8 @@ impl X86Codegen {
                 .out
                 .emit_instr_reg_reg("    movq", reg_name, "rax");
         } else {
-            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rax"));
         }
         if offset != 0 {
             self.state
@@ -3055,13 +3065,15 @@ impl X86Codegen {
 
     pub(super) fn emit_gep_add_const_to_acc_impl(&mut self, offset: i64) {
         if offset != 0 {
-            self.state.out.emit_instr_imm_reg("    addq", offset, "rax");
+            self.state
+                .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rax"));
         }
         self.state.reg_cache.invalidate_acc();
     }
 
     pub(super) fn emit_add_imm_to_acc_impl(&mut self, imm: i64) {
-        self.state.out.emit_instr_imm_reg("    addq", imm, "rax");
+        self.state
+            .with_out_checked(|o| o.emit_instr_imm_reg("    addq", imm, "rax"));
         self.state.reg_cache.invalidate_acc();
     }
 
@@ -3079,11 +3091,14 @@ impl X86Codegen {
             let rem_lbl = self.state.fresh_label("dalloca_rem");
             let done_lbl = self.state.fresh_label("dalloca_done");
             self.state.out.emit_named_label(&loop_lbl);
-            self.state.out.emit_instr_imm_reg("    cmpq", 4096, "rax");
+            self.state
+                .with_out_checked(|o| o.emit_instr_imm_reg("    cmpq", 4096, "rax"));
             self.state.out.emit_jcc_label("    jb", &rem_lbl);
-            self.state.out.emit_instr_imm_reg("    subq", 4096, "rsp");
+            self.state
+                .with_out_checked(|o| o.emit_instr_imm_reg("    subq", 4096, "rsp"));
             self.state.emit("    orl $0, (%rsp)");
-            self.state.out.emit_instr_imm_reg("    subq", 4096, "rax");
+            self.state
+                .with_out_checked(|o| o.emit_instr_imm_reg("    subq", 4096, "rax"));
             self.state.out.emit_jmp_label(&loop_lbl);
             self.state.out.emit_named_label(&rem_lbl);
             self.state.emit("    testq %rax, %rax");
@@ -3136,7 +3151,8 @@ impl X86Codegen {
                 .out
                 .emit_instr_reg_reg("    movq", reg_name, "rdi");
         } else {
-            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rdi");
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rdi"));
         }
     }
 
@@ -3154,7 +3170,8 @@ impl X86Codegen {
                 .out
                 .emit_instr_reg_reg("    movq", reg_name, "rsi");
         } else {
-            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rsi");
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rsi"));
         }
     }
 
@@ -3163,7 +3180,8 @@ impl X86Codegen {
             .state
             .alloca_over_align(val_id)
             .expect("alloca must have over-alignment for aligned addr emission");
-        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rcx");
+        self.state
+            .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, "rcx"));
         self.state
             .out
             .emit_instr_imm_reg("    addq", (align - 1) as i64, "rcx");
@@ -3177,7 +3195,8 @@ impl X86Codegen {
             .state
             .alloca_over_align(val_id)
             .expect("alloca must have over-alignment for aligned addr emission");
-        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+        self.state
+            .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, "rax"));
         self.state
             .out
             .emit_instr_imm_reg("    addq", (align - 1) as i64, "rax");
@@ -3255,7 +3274,8 @@ impl X86Codegen {
             CopyAddrSource::Gpr(reg) => {
                 let name = phys_reg_name(reg);
                 if name != target {
-                    self.state.out.emit_instr_reg_reg("    movq", name, target);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_reg("    movq", name, target));
                 }
             }
             CopyAddrSource::Xmm(reg) => {
@@ -4692,7 +4712,8 @@ impl X86Codegen {
             } else {
                 self.state.emit_fmt(format_args!("    movq {lo_mem}, %rax"));
                 self.state.emit_fmt(format_args!("    movq {hi_mem}, %rdx"));
-                self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", slot.0));
                 self.state
                     .out
                     .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);

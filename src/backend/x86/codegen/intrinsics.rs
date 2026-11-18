@@ -2669,7 +2669,8 @@ impl X86Codegen {
     fn emit_f128_operand_to_xmm(&mut self, arg: &Operand, xmm: &str) {
         if let Operand::Value(v) = arg {
             if let Some(slot) = self.state.get_slot(v.0) {
-                self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, xmm);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    movdqu", slot.0, xmm));
                 return;
             }
             if let Some(held) = self.state.vec_live_xmm(v.0) {
@@ -2710,7 +2711,8 @@ impl X86Codegen {
         match op {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rax"));
                     self.state
                         .emit_fmt(format_args!("    movq %rax, {}(%rsp)", off));
                     self.state
@@ -3760,17 +3762,21 @@ impl X86Codegen {
                     };
                     let sd = self.state.get_slot(d.0).map(|s| s.0);
                     if let (Some(sx), Some(sd)) = (sx, sd) {
-                        self.state.out.emit_instr_rbp_reg("    movq", sx, "rax");
-                        self.state.out.emit_instr_reg_rbp("    movq", "rax", sd);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", sx, "rax"));
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", sd));
                         self.state
                             .out
                             .emit_instr_rbp_reg("    movzbl", sx + 8, "ecx");
-                        self.state.out.emit_instr_reg_rbp("    movb", "cl", sd + 8);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movb", "cl", sd + 8));
                         self.state
                             .out
                             .emit_instr_rbp_reg("    movzbl", sx + 9, "ecx");
                         self.state.emit("    andb $0x7f, %cl");
-                        self.state.out.emit_instr_reg_rbp("    movb", "cl", sd + 9);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movb", "cl", sd + 9));
                         // x87-format result: the F128 return path must fldt
                         // from this slot, not fildq-convert a U128 integer.
                         if let Some(d) = dest {
@@ -3786,15 +3792,18 @@ impl X86Codegen {
                         let high = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
                         self.state
                             .emit_fmt(format_args!("    movabsq ${}, %rax", low as i64));
-                        self.state.out.emit_instr_reg_rbp("    movq", "rax", sd);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", sd));
                         self.state
                             .emit_fmt(format_args!("    movabsq ${}, %rax", high as i64));
-                        self.state.out.emit_instr_reg_rbp("    movq", "rax", sd + 8);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", sd + 8));
                         self.state
                             .out
                             .emit_instr_rbp_reg("    movzbl", sd + 9, "ecx");
                         self.state.emit("    andb $0x7f, %cl");
-                        self.state.out.emit_instr_reg_rbp("    movb", "cl", sd + 9);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movb", "cl", sd + 9));
                         return;
                     }
                     panic!("LDFabs: unsupported operand shape");
@@ -3814,12 +3823,15 @@ impl X86Codegen {
                     };
                     let sd = self.state.get_slot(d.0).map(|s| s.0);
                     if let (Some(sx), Some(sy), Some(sd)) = (sx, sy, sd) {
-                        self.state.out.emit_instr_rbp_reg("    movq", sx, "rax");
-                        self.state.out.emit_instr_reg_rbp("    movq", "rax", sd);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", sx, "rax"));
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", sd));
                         self.state
                             .out
                             .emit_instr_rbp_reg("    movzbl", sx + 8, "ecx");
-                        self.state.out.emit_instr_reg_rbp("    movb", "cl", sd + 8);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movb", "cl", sd + 8));
                         self.state
                             .out
                             .emit_instr_rbp_reg("    movzbl", sy + 9, "eax");
@@ -3829,7 +3841,8 @@ impl X86Codegen {
                             .emit_instr_rbp_reg("    movzbl", sx + 9, "ecx");
                         self.state.emit("    andb $0x7f, %cl");
                         self.state.emit("    orb %cl, %al");
-                        self.state.out.emit_instr_reg_rbp("    movb", "al", sd + 9);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movb", "al", sd + 9));
                         if let Some(d) = dest {
                             self.state.f128_direct_slots.insert(d.0);
                         }
@@ -3849,11 +3862,14 @@ impl X86Codegen {
                     self.state.emit("    movb %al, 9(%rsp)");
                     if let Some(sd) = sd {
                         self.state.emit("    movq (%rsp), %rax");
-                        self.state.out.emit_instr_reg_rbp("    movq", "rax", sd);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", sd));
                         self.state.emit("    movzbl 8(%rsp), %ecx");
-                        self.state.out.emit_instr_reg_rbp("    movb", "cl", sd + 8);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movb", "cl", sd + 8));
                         self.state.emit("    movzbl 9(%rsp), %ecx");
-                        self.state.out.emit_instr_reg_rbp("    movb", "cl", sd + 9);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_rbp("    movb", "cl", sd + 9));
                     } else {
                         // dest without slot: 16-byte copy through %xmm0
                         self.state.emit("    movdqu (%rsp), %xmm0");
@@ -6314,11 +6330,9 @@ impl X86Codegen {
                                     ));
                                 }
                             } else if let Some(slot) = self.state.get_slot(v.0) {
-                                self.state.out.emit_instr_rbp_reg(
-                                    "    movq",
-                                    slot.0 as i64,
-                                    "xmm0",
-                                );
+                                self.state.with_out_checked(|o| {
+                                    o.emit_instr_rbp_reg("    movq", slot.0 as i64, "xmm0")
+                                });
                             } else {
                                 self.operand_to_reg(&args[0], "rax");
                                 self.state.emit("    movq %rax, %xmm0");
@@ -6553,11 +6567,9 @@ impl X86Codegen {
                                     ));
                                 }
                             } else if let Some(slot) = self.state.get_slot(v.0) {
-                                self.state.out.emit_instr_rbp_reg(
-                                    "    movq",
-                                    slot.0 as i64,
-                                    "xmm0",
-                                );
+                                self.state.with_out_checked(|o| {
+                                    o.emit_instr_rbp_reg("    movq", slot.0 as i64, "xmm0")
+                                });
                             } else {
                                 self.operand_to_reg(&args[0], "rax");
                                 self.state.emit("    movq %rax, %xmm0");

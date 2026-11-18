@@ -1934,6 +1934,10 @@ pub enum IntrinsicOp {
     MinPs256,
     MaxPs256,
     SqrtPs256,
+    /// 256-bit reciprocal approximation: `vrcpps ymm`.
+    RcpPs256,
+    /// 256-bit reciprocal-square-root approximation: `vrsqrtps ymm`.
+    RsqrtPs256,
     CmpPs256,
     ShufPs256,
     UnpcklPs256,
@@ -1963,6 +1967,10 @@ pub enum IntrinsicOp {
     VpermilvarPs256,
     /// 256-bit variable-index permute (double): `vpermilpd %idx, %src, %dst`.
     VpermilvarPd256,
+    /// 128-bit variable-index permute: `vpermilps %idx, %src, %dst` (xmm).
+    VpermilvarPs128,
+    /// 128-bit variable-index permute (double): `vpermilpd %idx, %src, %dst` (xmm).
+    VpermilvarPd128,
     Vperm2f128,
     Vinsertf128,
     Vextractf128,
@@ -1984,6 +1992,8 @@ pub enum IntrinsicOp {
     BlendvPd256,
     DpPs128,
     DpPd128,
+    /// 256-bit dot product, two independent 128-bit lanes: `vdpps ymm`.
+    DpPs256,
     InsertPs128,
     ExtractPs128,
     InsertPd128,
@@ -1997,6 +2007,8 @@ pub enum IntrinsicOp {
     HaddPs256,
     HsubPs256,
     AddsubPs256,
+    /// 256-bit alternating subtract/add, double: `vaddsubpd ymm`.
+    AddsubPd256,
     Movddup128,
     Movsldup128,
     Movshdup128,
@@ -2395,7 +2407,8 @@ impl IntrinsicOp {
             | DivPs256 | MinPs256 | MaxPs256 | SqrtPs256 | CmpPs256 | ShufPs256
             | DivPd256 | MinPd256 | MaxPd256 | SqrtPd256 | CmpPd256 | ShufPd256
             | UnpcklPs256 | UnpckhPs256 | UnpcklPd256 | UnpckhPd256
-            | HaddPs256 | HsubPs256 | AddsubPs256
+            | HaddPs256 | HsubPs256 | AddsubPs256 | AddsubPd256
+            | DpPs256 | RcpPs256 | RsqrtPs256
             | RoundPs256 | RoundPd256 | VpermilPs256 | VpermilPd256
             | VpermilvarPs256 | VpermilvarPd256 | BlendPs256 | BlendPd256
             | LoaduPs256 | StoreuPs256 | LoaduPd256
@@ -2542,6 +2555,7 @@ impl IntrinsicOp {
             // ARX lane family: 128-bit XMM results (pslld/pshufd/pshufb/
             // pack are x4-lane).
             | VecRotlI32x4 | VecShufdI32x4 | VecShufbI32x4 | VecPackI32x4
+            | VpermilvarPs128 | VpermilvarPd128
             => Some(16),
             // Everything else produces a scalar GPR/x87 result, no result, or
             // is an F128 helper handled by the dedicated f128 slot path.
@@ -3258,6 +3272,26 @@ mod vector_width_tests {
             assert!(op.is_pure());
             assert!(!op.may_read_memory());
             assert!(!op.writes_memory_via_args());
+        }
+    }
+
+    /// AVX1 mirror ops are whole-register values. Pin their home widths so a
+    /// missing row falls through `vector_home_width`'s silent `_ => None` and
+    /// cannot reach the stack layout with an undersized destination slot.
+    #[test]
+    fn avx1_mirror_intrinsics_have_full_register_homes() {
+        for op in [
+            IntrinsicOp::AddsubPd256,
+            IntrinsicOp::DpPs256,
+            IntrinsicOp::RcpPs256,
+            IntrinsicOp::RsqrtPs256,
+        ] {
+            assert_eq!(op.vector_home_width(), Some(32), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(32), "{op:?} result");
+        }
+        for op in [IntrinsicOp::VpermilvarPs128, IntrinsicOp::VpermilvarPd128] {
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?} result");
         }
     }
 

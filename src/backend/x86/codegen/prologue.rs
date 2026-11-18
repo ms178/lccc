@@ -3657,11 +3657,9 @@ impl X86Codegen {
                 let gp_start = self.num_named_int_params.min(6);
                 let gp_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
                 for i in gp_start..6 {
-                    self.state.out.emit_instr_reg_rbp(
-                        "    movq",
-                        gp_regs[i],
-                        base + (i as i64) * 8,
-                    );
+                    self.state.with_out_checked(|o| {
+                        o.emit_instr_reg_rbp("    movq", gp_regs[i], base + (i as i64) * 8)
+                    });
                 }
             }
 
@@ -3683,11 +3681,9 @@ impl X86Codegen {
                         // rsp-aware emitter: emits `offset(%rbp)` in rbp mode
                         // and `(frame_size + offset)(%rsp)` in FPO mode.
                         let xmm = format!("xmm{}", i);
-                        self.state.out.emit_instr_reg_rbp(
-                            "    movdqu",
-                            &xmm,
-                            base + 48 + (i as i64) * 16,
-                        );
+                        self.state.with_out_checked(|o| {
+                            o.emit_instr_reg_rbp("    movdqu", &xmm, base + 48 + (i as i64) * 16)
+                        });
                     }
                     self.state.out.emit_named_label(&skip);
                 }
@@ -3752,19 +3748,23 @@ impl X86Codegen {
                 .out
                 .emit_instr_reg_rbp("    movq", reg, base + 8 * i as i64);
         }
-        self.state.out.emit_instr_reg_rbp(
-            "    movq",
-            "rax",
-            base + super::intrinsics::APPLY_ARGS_AL_OFFSET,
-        );
+        self.state.with_out_checked(|o| {
+            o.emit_instr_reg_rbp(
+                "    movq",
+                "rax",
+                base + super::intrinsics::APPLY_ARGS_AL_OFFSET,
+            )
+        });
         if !self.no_sse {
             for i in 0..super::intrinsics::APPLY_ARGS_XMMS {
                 let xmm = format!("xmm{i}");
-                self.state.out.emit_instr_reg_rbp(
-                    "    movdqu",
-                    &xmm,
-                    base + super::intrinsics::APPLY_ARGS_XMM_OFFSET + 16 * i,
-                );
+                self.state.with_out_checked(|o| {
+                    o.emit_instr_reg_rbp(
+                        "    movdqu",
+                        &xmm,
+                        base + super::intrinsics::APPLY_ARGS_XMM_OFFSET + 16 * i,
+                    )
+                });
             }
         }
     }
@@ -3885,7 +3885,8 @@ impl X86Codegen {
         };
         match dst {
             CaptureDst::Raw(b) => {
-                self.state.out.emit_instr_reg_rbp(mov, src_reg, b + off);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg_rbp(mov, src_reg, b + off));
             }
             CaptureDst::Aligned => self
                 .state
@@ -3923,7 +3924,8 @@ impl X86Codegen {
     fn emit_capture_fstpt(&mut self, dst: CaptureDst, off: i64) {
         match dst {
             CaptureDst::Raw(b) => {
-                self.state.out.emit_instr_rbp("    fstpt", b + off);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fstpt", b + off));
             }
             CaptureDst::Aligned => self.state.emit_fmt(format_args!("    fstpt {}(%r11)", off)),
         }
@@ -4052,7 +4054,8 @@ impl X86Codegen {
                 // address on demand.
                 if let Some((slot, _, _)) = self.state.param_alloca_slots[i] {
                     self.emit_vector_ret_buffer_addr("rax");
-                    self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", slot.0));
                 }
                 continue;
             }
@@ -4285,11 +4288,13 @@ impl X86Codegen {
                                 if is_callee_saved {
                                     let dest_reg = phys_reg_name(phys_reg);
                                     if let ParamClass::IntReg { reg_idx } = class {
-                                        self.state.out.emit_instr_reg_reg(
-                                            "    movq",
-                                            X86_ARG_REGS[reg_idx],
-                                            dest_reg,
-                                        );
+                                        self.state.with_out_checked(|o| {
+                                            o.emit_instr_reg_reg(
+                                                "    movq",
+                                                X86_ARG_REGS[reg_idx],
+                                                dest_reg,
+                                            )
+                                        });
                                         self.state.param_pre_stored.insert(i);
                                         self.param_source_regs
                                             .insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
@@ -4329,7 +4334,8 @@ impl X86Codegen {
             // reserves only %rax.
             let over_align = self.state.alloca_over_align(dest_id).filter(|&a| a > 16);
             if let Some(a) = over_align {
-                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "r11");
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, "r11"));
                 self.state
                     .out
                     .emit_instr_imm_reg("    addq", (a - 1) as i64, "r11");
@@ -4427,12 +4433,12 @@ impl X86Codegen {
                 }
                 ParamClass::F128AlwaysStack { offset } => {
                     let src = stack_base + offset;
-                    self.state.out.emit_instr_rbp("    fldt", src);
+                    self.state.with_out_checked(|o| o.emit_instr_rbp("    fldt", src));
                     self.emit_capture_fstpt(dst, 0);
                 }
                 ParamClass::I128Stack { offset } => {
                     let src = stack_base + offset;
-                    self.state.out.emit_instr_rbp_reg("    movq", src, "rax");
+                    self.state.with_out_checked(|o| o.emit_instr_rbp_reg("    movq", src, "rax"));
                     self.emit_capture_store_qword(dst, "rax", 0);
                     self.state
                         .out
@@ -4443,7 +4449,7 @@ impl X86Codegen {
                     // Load from caller's stack frame and store full 8 bytes to ensure
                     // the entire slot is initialized (see IntReg comment above).
                     let src = stack_base + offset;
-                    self.state.out.emit_instr_rbp_reg("    movq", src, "rax");
+                    self.state.with_out_checked(|o| o.emit_instr_rbp_reg("    movq", src, "rax"));
                     self.emit_capture_store_qword(dst, "rax", 0);
                 }
                 ParamClass::StructStack { offset, size }
@@ -4604,7 +4610,8 @@ impl X86Codegen {
                 if let Some(idx) = ready {
                     let (param_idx, source, original_source, dest, home) = pending.remove(idx);
                     if source != dest {
-                        self.state.out.emit_instr_reg_reg("    movq", source, dest);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_reg("    movq", source, dest));
                     }
                     self.state.param_pre_stored.insert(param_idx);
                     self.param_source_regs.insert(home.0, original_source);
@@ -4612,7 +4619,8 @@ impl X86Codegen {
                     // Parallel-copy cycle. RAX is excluded from allocation and
                     // is not an incoming integer argument register.
                     let source = pending[0].1;
-                    self.state.out.emit_instr_reg_reg("    movq", source, "rax");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_reg("    movq", source, "rax"));
                     pending[0].1 = "rax";
                 }
             }
@@ -5356,9 +5364,15 @@ impl X86Codegen {
             // Full-register copies: the home is fresh, so its old upper
             // lanes are dead, and the reg-reg `movss`/`movsd` merge forms
             // would make the copy depend on them (no move elimination).
-            FpPrestoreKind::F32 => self.state.out.emit_instr_reg_reg("    movaps", src, dst),
-            FpPrestoreKind::F64 => self.state.out.emit_instr_reg_reg("    movapd", src, dst),
-            FpPrestoreKind::V128 => self.state.out.emit_instr_reg_reg("    movaps", src, dst),
+            FpPrestoreKind::F32 => self
+                .state
+                .with_out_checked(|o| o.emit_instr_reg_reg("    movaps", src, dst)),
+            FpPrestoreKind::F64 => self
+                .state
+                .with_out_checked(|o| o.emit_instr_reg_reg("    movapd", src, dst)),
+            FpPrestoreKind::V128 => self
+                .state
+                .with_out_checked(|o| o.emit_instr_reg_reg("    movaps", src, dst)),
             FpPrestoreKind::V256 => {
                 self.state.dirty_upper_ymm = true;
                 self.state
@@ -5644,7 +5658,7 @@ fn emit_stack_adjust_x86(
             "    # LCCC_STACK_ADJUST {}",
             direction.signed_amount(amount)
         ));
-        state.out.emit_instr_imm_reg("    movq", amount, "r11");
+        state.with_out_checked(|o| o.emit_instr_imm_reg("    movq", amount, "r11"));
         state.emit(direction.register_form());
     }
 }
@@ -5692,11 +5706,11 @@ fn emit_fp_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, size
     if size <= UNROLL_LIMIT {
         let mut left = size;
         while left > PAGE_SIZE {
-            state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+            state.with_out_checked(|o| o.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp"));
             state.emit("    orl $0, (%rsp)");
             left -= PAGE_SIZE;
         }
-        state.out.emit_instr_imm_reg("    subq", left, "rsp");
+        state.with_out_checked(|o| o.emit_instr_imm_reg("    subq", left, "rsp"));
         state.emit("    orl $0, (%rsp)");
         return;
     }
@@ -5704,12 +5718,12 @@ fn emit_fp_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, size
     // not emitted anything that reads it, and the register allocator never
     // allocates it across the prologue.
     let probe_label = state.fresh_label("stack_probe");
-    state.out.emit_instr_imm_reg("    movq", size, "r11");
+    state.with_out_checked(|o| o.emit_instr_imm_reg("    movq", size, "r11"));
     state.out.emit_named_label(&probe_label);
-    state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+    state.with_out_checked(|o| o.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp"));
     state.emit("    orl $0, (%rsp)");
-    state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
-    state.out.emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
+    state.with_out_checked(|o| o.emit_instr_imm_reg("    subq", PAGE_SIZE, "r11"));
+    state.with_out_checked(|o| o.emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11"));
     state.out.emit_jcc_label("    ja", &probe_label);
     // Tail: `size % PAGE_SIZE`, or a full page when `size` is a multiple of it.
     state.emit("    subq %r11, %rsp");
@@ -5727,12 +5741,12 @@ fn emit_fpo_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, mut
     const PAGE_SIZE: i64 = 4096;
     if state.stack_clash_protection {
         while size > PAGE_SIZE {
-            state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+            state.with_out_checked(|o| o.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp"));
             state.emit("    orl $0, (%rsp)");
             size -= PAGE_SIZE;
         }
         if size > 0 {
-            state.out.emit_instr_imm_reg("    subq", size, "rsp");
+            state.with_out_checked(|o| o.emit_instr_imm_reg("    subq", size, "rsp"));
             state.emit("    orl $0, (%rsp)");
         }
     } else {

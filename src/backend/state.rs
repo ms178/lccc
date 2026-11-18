@@ -1266,8 +1266,75 @@ impl CodegenState {
     }
 
     pub fn emit(&mut self, s: &str) {
+        let before = self.out.buf.len();
         self.x87_pre_emit(s);
         self.out.emit(s);
+        self.vec_peephole_hazard_since(before);
+    }
+
+    /// Run an `AsmOutput` helper and apply the same physical-register write
+    /// check as [`Self::emit`] to every line it appended. Direct
+    /// `state.out.emit_instr_*` callers route through here so a vector load
+    /// into the register a last-store peephole holds cannot slip past the
+    /// check.
+    pub fn with_out_checked<R>(&mut self, f: impl FnOnce(&mut AsmOutput) -> R) -> R {
+        let before = self.out.buf.len();
+        let r = f(&mut self.out);
+        self.vec_peephole_hazard_since(before);
+        r
+    }
+
+    /// Enforce the last-store peephole invariant over text appended since
+    /// `before`.
+    ///
+    /// `sse_last_store_reg` and `vec_last_store_reg` promise that the named
+    /// register still holds the value they name. Any later instruction whose
+    /// destination is that register breaks the promise, and a consumer that
+    /// trusts the flag then reads the clobbered register instead of the
+    /// value's slot. Clearing the flag on every such write makes the consumer
+    /// fall back to the slot, which the store path always writes or defers
+    /// explicitly.
+    ///
+    /// Checking the emitted text, not each emitter, is what makes this
+    /// complete: a write from any emitter (a 256-bit operand load, an
+    /// `xchg`, a call, a direct `AsmOutput` helper) is observed the same way.
+    /// The check runs after the line is written, against the flags that are
+    /// current at that moment, so a write emitted before a flag is set can
+    /// never invalidate it.
+    pub fn vec_peephole_hazard_since(&mut self, before: usize) {
+        if !self.sse_last_store_reg && !self.vec_last_store_reg {
+            return;
+        }
+        let sse_bank = self
+            .sse_last_store_reg
+            .then(|| vector_reg_index(self.sse_last_store_reg_name.unwrap_or("xmm0")))
+            .flatten();
+        let vec_bank = self
+            .vec_last_store_reg
+            .then(|| vector_reg_index(self.vec_last_store_reg_name.unwrap_or("ymm0")))
+            .flatten();
+        if sse_bank.is_none() && vec_bank.is_none() {
+            return;
+        }
+        let mut sse_clobbered = false;
+        let mut vec_clobbered = false;
+        for line in self.out.buf[before..].lines() {
+            if sse_bank.is_some_and(|b| !sse_clobbered && vector_line_writes_bank(line, b)) {
+                sse_clobbered = true;
+            }
+            if vec_bank.is_some_and(|b| !vec_clobbered && vector_line_writes_bank(line, b)) {
+                vec_clobbered = true;
+            }
+            if sse_clobbered && vec_clobbered {
+                break;
+            }
+        }
+        if sse_clobbered {
+            self.sse_last_store_reg = false;
+        }
+        if vec_clobbered {
+            self.vec_last_store_reg = false;
+        }
     }
 
     /// Get or create a .rodata label for a floating-point constant.
@@ -1357,6 +1424,7 @@ impl CodegenState {
     pub fn emit_fmt(&mut self, args: std::fmt::Arguments<'_>) {
         // Only pay for string formatting when a pending x87 copy is live
         // (the flush gate needs the fully-formatted line to classify it).
+        let before = self.out.buf.len();
         if self.x87_pending.is_some() && !self.x87_suppress {
             let s = std::fmt::format(args);
             self.x87_pre_emit(&s);
@@ -1364,6 +1432,7 @@ impl CodegenState {
         } else {
             self.out.emit_fmt(args);
         }
+        self.vec_peephole_hazard_since(before);
     }
 
     /// Emit a visibility directive (.hidden, .protected, .internal) if the symbol
@@ -2842,5 +2911,206 @@ mod block_address_identity_tests {
         state.begin_block_address_identity(true);
         state.out.buf.clear();
         assert!(state.fallthrough_would_alias_observable_label());
+    }
+}
+
+/// Bank index of a vector register name: `"xmm3"`, `"ymm3"` and `"zmm3"` all
+/// name bank 3. Returns `None` for any other spelling.
+pub(crate) fn vector_reg_index(name: &str) -> Option<u32> {
+    let digits = name
+        .strip_prefix("xmm")
+        .or_else(|| name.strip_prefix("ymm"))
+        .or_else(|| name.strip_prefix("zmm"))?;
+    digits.parse().ok()
+}
+
+/// Whether one emitted assembly line writes vector bank `bank`.
+///
+/// AT&T syntax puts the destination last, so only the last top-level operand
+/// is a write target. Compares (`ucomi*`, `comi*`, `ptest`) only set flags.
+/// Calls, `vzeroall`, `vzeroupper`, `xchg` and `syscall`/`cpuid` may write any
+/// bank, so they are treated as writes. Labels, directives and comments never
+/// write a register.
+pub(crate) fn vector_line_writes_bank(line: &str, bank: u32) -> bool {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('.') || line.starts_with('#') || line.ends_with(':') {
+        return false;
+    }
+    let (mnemonic, operands) = match line.find(char::is_whitespace) {
+        Some(i) => (&line[..i], line[i..].trim()),
+        None => (line, ""),
+    };
+    // `xchg` carries an operand-size suffix in AT&T syntax (`xchgq`).
+    if mnemonic.starts_with("xchg")
+        || matches!(
+            mnemonic,
+            "call" | "callq" | "vzeroall" | "vzeroupper" | "syscall" | "cpuid"
+        )
+    {
+        return true;
+    }
+    if mnemonic.contains("ucomi") || mnemonic.contains("comi") || mnemonic.contains("ptest") {
+        return false;
+    }
+    mentions_vector_bank(last_top_level_operand(operands), bank)
+}
+
+/// The last comma-separated operand that is not inside parentheses.
+fn last_top_level_operand(operands: &str) -> &str {
+    let mut depth = 0i32;
+    let mut split = None;
+    for (i, c) in operands.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => split = Some(i),
+            _ => {}
+        }
+    }
+    match split {
+        Some(i) => operands[i + 1..].trim(),
+        None => operands.trim(),
+    }
+}
+
+/// Whether an operand names a vector register of bank `bank` (`%xmm3`,
+/// `%ymm3`, `%zmm3`).
+fn mentions_vector_bank(operand: &str, bank: u32) -> bool {
+    let bytes = operand.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let alpha_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        let digit_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let alpha = &operand[alpha_start..digit_start];
+        if matches!(alpha, "xmm" | "ymm" | "zmm") {
+            if let Ok(n) = operand[digit_start..i].parse::<u32>() {
+                if n == bank {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod last_store_hazard_tests {
+    use super::*;
+
+    fn writes(line: &str, bank: u32) -> bool {
+        vector_line_writes_bank(line, bank)
+    }
+
+    #[test]
+    fn vector_destinations_are_writes_stores_and_compares_are_not() {
+        // A 256-bit load into %ymm0 is the clobber that corrupted the xor
+        // reproducer: bank 0 is written.
+        assert!(writes("    vmovdqu 136(%rsp), %ymm0", 0));
+        assert!(writes("    vshufps $27, %xmm1, %xmm0, %xmm0", 0));
+        // The source operands are reads: only the destination counts.
+        assert!(!writes("    vshufps $27, %xmm1, %xmm0, %xmm0", 1));
+        assert!(!writes("    vmovdqu %xmm0, 272(%rsp)", 0));
+        assert!(!writes("    movq %xmm0, %rax", 0));
+        // Flag-only instructions never clobber a register.
+        assert!(!writes("    vucomisd %xmm1, %xmm0", 0));
+        assert!(!writes("    vptest %xmm0, %xmm0", 0));
+        assert!(!writes("    vucomiss %xmm0, %xmm0", 0));
+    }
+
+    #[test]
+    fn xmm_and_ymm_spellings_share_one_bank() {
+        assert!(writes("    vmovdqa %ymm3, %ymm2", 2));
+        assert!(writes("    movd %eax, %xmm2", 2));
+        assert!(writes("    vextractf128 $1, %ymm0, %xmm1", 1));
+        assert!(!writes("    vextractf128 $1, %ymm0, %xmm1", 0));
+    }
+
+    #[test]
+    fn parenthesised_memory_operands_do_not_split_the_destination() {
+        // The comma inside (%rax,%rcx,4) must not make `4)` the destination.
+        assert!(writes("    vmovdqu (%rax,%rcx,4), %xmm3", 3));
+        assert!(!writes("    vmovdqu %xmm3, (%rax,%rcx,4)", 3));
+    }
+
+    #[test]
+    fn implicit_writers_clobber_every_bank() {
+        assert!(writes("    call memcpy@PLT", 0));
+        assert!(writes("    vzeroupper", 5));
+        assert!(writes("    vzeroall", 7));
+        assert!(writes("    xchgq %rax, %rbx", 0));
+    }
+
+    #[test]
+    fn labels_and_directives_never_write() {
+        assert!(!writes(".LBB1:", 0));
+        assert!(!writes("    .p2align 4", 0));
+        assert!(!writes("", 0));
+        assert!(!writes("# comment %xmm0", 0));
+    }
+
+    #[test]
+    fn vector_reg_index_accepts_only_vector_names() {
+        assert_eq!(vector_reg_index("xmm0"), Some(0));
+        assert_eq!(vector_reg_index("ymm15"), Some(15));
+        assert_eq!(vector_reg_index("zmm31"), Some(31));
+        assert_eq!(vector_reg_index("rax"), None);
+    }
+
+    #[test]
+    fn clobbered_xmm_peephole_is_cleared_and_store_is_not() {
+        let mut st = CodegenState::new();
+        st.sse_last_store_reg = true;
+        st.sse_last_store_reg_name = Some("xmm0");
+        // A store that only reads %xmm0 keeps the peephole alive.
+        st.emit("    vmovdqu %xmm0, 80(%rsp)");
+        assert!(st.sse_last_store_reg);
+        // The 256-bit reload that clobbered %xmm0 in the reproducer clears it.
+        st.emit("    vmovdqu 136(%rsp), %ymm0");
+        assert!(!st.sse_last_store_reg);
+    }
+
+    #[test]
+    fn write_emitted_before_flag_is_set_does_not_invalidate() {
+        // Exactness: a clobber that precedes the peephole's own set must not
+        // be attributed to it.
+        let mut st = CodegenState::new();
+        st.emit("    vmovdqu 136(%rsp), %ymm0");
+        st.sse_last_store_reg = true;
+        st.sse_last_store_reg_name = Some("xmm0");
+        st.emit("    vmovdqu %xmm0, 80(%rsp)");
+        assert!(st.sse_last_store_reg);
+    }
+
+    #[test]
+    fn ymm_peephole_is_cleared_by_an_sse_write_to_its_bank() {
+        let mut st = CodegenState::new();
+        st.vec_last_store_reg = true;
+        st.vec_last_store_reg_name = Some("ymm2");
+        st.emit("    vaddps %xmm1, %xmm0, %xmm0");
+        assert!(st.vec_last_store_reg, "bank 0 write leaves bank 2 alone");
+        st.emit("    vaddps %xmm1, %xmm0, %xmm2");
+        assert!(!st.vec_last_store_reg);
+    }
+
+    #[test]
+    fn direct_out_helper_writes_are_checked() {
+        // Direct AsmOutput helpers bypass `emit`; `with_out_checked` must
+        // still observe their destination.
+        let mut st = CodegenState::new();
+        st.sse_last_store_reg = true;
+        st.sse_last_store_reg_name = Some("xmm0");
+        st.with_out_checked(|o| o.emit_instr_rbp_reg("    movdqu", 48, "xmm0"));
+        assert!(!st.sse_last_store_reg);
     }
 }

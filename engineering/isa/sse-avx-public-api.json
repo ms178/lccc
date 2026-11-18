@@ -4953,7 +4953,7 @@
       "arities": [
         2
       ],
-      "canonical_override": true,
+      "canonical_override": false,
       "definitions": 1,
       "forms": [
         "macro"
@@ -4970,7 +4970,7 @@
       "arities": [
         2
       ],
-      "canonical_override": true,
+      "canonical_override": false,
       "definitions": 1,
       "forms": [
         "macro"
@@ -6570,7 +6570,7 @@
       "arities": [
         2
       ],
-      "canonical_override": true,
+      "canonical_override": false,
       "definitions": 1,
       "forms": [
         "macro"
@@ -9511,6 +9511,23 @@
         "function"
       ],
       "generic_helpers": [
+        "__lccc_simd256_ps_vaddsubpd256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_addsub_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
         "__lccc_simd256_ps_vaddsubps256"
       ],
       "header": "lcccsimd.h",
@@ -10336,6 +10353,23 @@
     },
     {
       "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vdpps256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_dp_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         2
       ],
       "canonical_override": true,
@@ -10931,6 +10965,23 @@
     },
     {
       "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vrcpps256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_rcp_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         2
       ],
       "canonical_override": false,
@@ -10960,6 +11011,23 @@
       ],
       "header": "lcccsimd.h",
       "name": "_mm256_round_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd256_ps_vrsqrtps256"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm256_rsqrt_ps",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -16081,6 +16149,40 @@
     },
     {
       "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_vpermilvarpd128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_permutevar_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [
+        "__lccc_simd128_ps_vpermilvarps128"
+      ],
+      "header": "lcccsimd.h",
+      "name": "_mm_permutevar_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
         1
       ],
       "canonical_override": false,
@@ -16576,7 +16678,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 1005,
+  "declarations": 1011,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -16586,7 +16688,6 @@
     "_mm256_abs_epi64",
     "_mm256_abs_ph",
     "_mm256_add_ph",
-    "_mm256_addsub_pd",
     "_mm256_alignr_epi32",
     "_mm256_alignr_epi64",
     "_mm256_alignr_epi8",
@@ -16754,7 +16855,6 @@
     "_mm256_cvtxps_ph",
     "_mm256_dbsad_epu8",
     "_mm256_div_ph",
-    "_mm256_dp_ps",
     "_mm256_dpbf16_ps",
     "_mm256_dpbssd_epi32",
     "_mm256_dpbssds_epi32",
@@ -17881,7 +17981,6 @@
     "_mm256_rcp14_pd",
     "_mm256_rcp14_ps",
     "_mm256_rcp_ph",
-    "_mm256_rcp_ps",
     "_mm256_reduce_add_epi16",
     "_mm256_reduce_add_epi8",
     "_mm256_reduce_add_ph",
@@ -17919,7 +18018,6 @@
     "_mm256_rsqrt14_pd",
     "_mm256_rsqrt14_ps",
     "_mm256_rsqrt_ph",
-    "_mm256_rsqrt_ps",
     "_mm256_scalef_pd",
     "_mm256_scalef_ph",
     "_mm256_scalef_ps",
@@ -21596,8 +21694,6 @@
     "_mm_nmsub_ss",
     "_mm_or_epi32",
     "_mm_or_epi64",
-    "_mm_permutevar_pd",
-    "_mm_permutevar_ps",
     "_mm_permutex2var_epi16",
     "_mm_permutex2var_epi32",
     "_mm_permutex2var_epi64",
@@ -21791,5 +21887,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 1005
+  "unique_names": 1011
 }

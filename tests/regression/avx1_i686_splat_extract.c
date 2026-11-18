@@ -70,7 +70,13 @@ __attribute__((noinline)) static void extract(void) {
     bad += (l[0] != 0x10) + (l[1] != 0x21) + (l[2] != 0x32) + (l[3] != 0x43);
 }
 
-__attribute__((noreturn)) void _start(void) {
+/* Entry stub: realign %esp before entering C (see avx1_mirror_completions_i686.c).
+ * A compiler-generated _start that pushes registers breaks the 16-byte stack
+ * assumption of the aligned vector spills. */
+__asm__(".text\n.globl _start\n.type _start, @function\n_start:\n"
+        "\tandl $-16, %esp\n\tcall c_start\n\tud2\n");
+
+__attribute__((noreturn)) void c_start(void) {
     splats();
     extract();
     int status = bad ? 1 : 0;

@@ -1173,6 +1173,14 @@ __m128d __lccc_simd128_ps_cmppd128(long, __m128d __a, __m128d __b);
 
 #define _mm_cmp_pd(__a, __b, __imm) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_cmppd128(__imm, __a, __b))
 
+__m128 __lccc_simd128_ps_vpermilvarps128(long, __m128 __a, __m128i __b);
+static __inline__ __attribute__((__always_inline__, __artificial__)) __m128 _mm_permutevar_ps(__m128 __a, __m128i __b)
+{ return __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_vpermilvarps128(0, __a, __b)); }
+
+__m128d __lccc_simd128_ps_vpermilvarpd128(long, __m128d __a, __m128i __b);
+static __inline__ __attribute__((__always_inline__, __artificial__)) __m128d _mm_permutevar_pd(__m128d __a, __m128i __b)
+{ return __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_vpermilvarpd128(0, __a, __b)); }
+
 __m128 __lccc_simd128_ps_shufps128(long, __m128 __a, __m128 __b);
 #define _mm_shuffle_ps(__a, __b, __imm) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_shufps128(__imm, __a, __b))
 
@@ -1327,9 +1335,13 @@ void * __lccc_simd256_ps_vhsubps256(long, __m256 __a, __m256 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_hsub_ps(__m256 __a, __m256 __b)
 { return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vhsubps256(0, __a, __b)); }
 
-void * __lccc_simd256_ps_vaddsubps256(long, __m256 __a, __m256 __b);
+__m256 __lccc_simd256_ps_vaddsubps256(long, __m256 __a, __m256 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_addsub_ps(__m256 __a, __m256 __b)
-{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vaddsubps256(0, __a, __b)); }
+{ return __CCC_M256_FROM_NATIVE(__lccc_simd256_ps_vaddsubps256(0, __a, __b)); }
+
+__m256d __lccc_simd256_ps_vaddsubpd256(long, __m256d __a, __m256d __b);
+static __inline__ __attribute__((__always_inline__, __artificial__)) __m256d _mm256_addsub_pd(__m256d __a, __m256d __b)
+{ return __CCC_M256D_FROM_NATIVE(__lccc_simd256_ps_vaddsubpd256(0, __a, __b)); }
 
 __m256 __lccc_simd256_ps_vsqrtps256(long, __m256 __a);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_sqrt_ps(__m256 __a)
@@ -1338,6 +1350,14 @@ static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm2
 __m256d __lccc_simd256_ps_vsqrtpd256(long, __m256d __a);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256d _mm256_sqrt_pd(__m256d __a)
 { return __CCC_M256D_FROM_NATIVE(__lccc_simd256_ps_vsqrtpd256(0, __a)); }
+
+__m256 __lccc_simd256_ps_vrcpps256(long, __m256 __a);
+static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_rcp_ps(__m256 __a)
+{ return __CCC_M256_FROM_NATIVE(__lccc_simd256_ps_vrcpps256(0, __a)); }
+
+__m256 __lccc_simd256_ps_vrsqrtps256(long, __m256 __a);
+static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_rsqrt_ps(__m256 __a)
+{ return __CCC_M256_FROM_NATIVE(__lccc_simd256_ps_vrsqrtps256(0, __a)); }
 
 void * __lccc_simd256_ps_vpermilvarps256(long, __m256 __a, __m256i __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_permutevar_ps(__m256 __a, __m256i __b)
@@ -1447,6 +1467,9 @@ void * __lccc_simd256_ps_vblendps256(long, __m256 __a, __m256 __b);
 
 void * __lccc_simd256_ps_vblendpd256(long, __m256d __a, __m256d __b);
 #define _mm256_blend_pd(__a, __b, __imm) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vblendpd256(__imm, __a, __b))
+
+__m256 __lccc_simd256_ps_vdpps256(long, __m256 __a, __m256 __b);
+#define _mm256_dp_ps(__a, __b, __imm) __CCC_M256_FROM_NATIVE(__lccc_simd256_ps_vdpps256(__imm, __a, __b))
 
 void * __lccc_simd256_ps_vcmpps256(long, __m256 __a, __m256 __b);
 #define _mm256_cmpeq_ps(__a, __b) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vcmpps256(0, __a, __b))

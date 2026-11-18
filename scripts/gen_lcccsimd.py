@@ -298,6 +298,10 @@ FP128_CMP = [
     ("cmpneq_pd", "cmppd128", "__m128d", "M128D", 4), ("cmpnlt_pd", "cmppd128", "__m128d", "M128D", 5),
     ("cmpnle_pd", "cmppd128", "__m128d", "M128D", 6), ("cmpord_pd", "cmppd128", "__m128d", "M128D", 7),
 ]
+FP128_VAR = [
+    ("permutevar_ps", "vpermilvarps128", "__m128", "M128"),
+    ("permutevar_pd", "vpermilvarpd128", "__m128d", "M128D"),
+]
 FP128_SHUF = [
     ("shuffle_ps", "shufps128", "__m128", "M128"),
     ("shuffle_pd", "shufpd128", "__m128d", "M128D"),
@@ -358,6 +362,7 @@ FP256_BIN = [
     ("div_pd", "vdivpd256"), ("min_pd", "vminpd256"), ("max_pd", "vmaxpd256"),
     ("unpacklo_pd", "vunpcklpd256"), ("unpackhi_pd", "vunpckhpd256"),
     ("hadd_ps", "vhaddps256"), ("hsub_ps", "vhsubps256"), ("addsub_ps", "vaddsubps256"),
+    ("addsub_pd", "vaddsubpd256"),
 ]
 FP256_UNI = [
     ("sqrt_ps", "vsqrtps256"), ("sqrt_pd", "vsqrtpd256"),
@@ -367,6 +372,7 @@ FP256_UNI = [
     ("cvtepi32_pd", "vcvtdq2pd256"), ("cvttpd_epi32", "vcvttpd2dq256"),
     ("permutevar_ps", "vpermilvarps256"),
     ("permutevar_pd", "vpermilvarpd256"),
+    ("rcp_ps", "vrcpps256"), ("rsqrt_ps", "vrsqrtps256"),
 ]
 FP256_SCALAR = [
     ("movemask_ps", "vmovmskps256", "int", "M256"),
@@ -381,6 +387,7 @@ FP256_UIMM = [
 FP256_BIMM = [
     ("blend_ps", "vblendps256", "__m256", "M256"),
     ("blend_pd", "vblendpd256", "__m256d", "M256D"),
+    ("dp_ps", "vdpps256", "__m256", "M256"),
 ]
 FP256_CMP = [
     ("cmpeq_ps", "vcmpps256", "__m256", "M256", 0), ("cmplt_ps", "vcmpps256", "__m256", "M256", 1),
@@ -511,6 +518,11 @@ ALWAYS = "__attribute__((__always_inline__, __artificial__))"
 
 NATIVE_256_FP = {f"256_ps_v{op}{kind}256"
                  for op in ("div", "min", "max", "sqrt") for kind in ("ps", "pd")}
+# Every 256-bit FP builtin must return its vector type by value. A name missing
+# here falls back to `void *` and is read through the wrong ABI slot (the
+# AVX1 mirror `vaddsubpd256` returned garbage until it was listed).
+NATIVE_256_FP |= {"256_ps_vaddsubpd256", "256_ps_vaddsubps256", "256_ps_vdpps256",
+                  "256_ps_vrcpps256", "256_ps_vrsqrtps256"}
 
 def proto(name, ret, params):
     assert ret == "void" or ret.startswith("m"), f"invalid vector builtin result: {name}: {ret}"
@@ -786,6 +798,10 @@ macro("_mm_cmp_ps(__a, __b, __imm)",
 macro("_mm_cmp_pd(__a, __b, __imm)",
       "__CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cmppd128(__imm, __a, __b))")
 
+for name, mn, rty, m in FP128_VAR:
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", "__m128i __b"])
+    wrap(f"{rty} _mm_{name}({rty} __a, __m128i __b)",
+         f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b)); }}")
 for name, mn, rty, m in FP128_SHUF:
     proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     macro(f"_mm_{name}(__a, __b, __imm)",

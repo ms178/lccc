@@ -26,21 +26,24 @@ impl X86Codegen {
             SlotAddr::OverAligned(slot, id) => {
                 self.emit_alloca_aligned_addr(*slot, *id);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 None
             }
             SlotAddr::Indirect(slot) => {
                 self.emit_load_ptr_from_slot(*slot, ptr_id);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 None
             }
             SlotAddr::Reg(reg) => {
                 self.emit_reg_to_addr(*reg);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 None
             }
@@ -112,7 +115,8 @@ impl X86Codegen {
             SlotAddr::OverAligned(slot, id) => {
                 self.emit_alloca_aligned_addr(*slot, *id);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 self.state
                     .out
@@ -130,7 +134,8 @@ impl X86Codegen {
             SlotAddr::Indirect(slot) => {
                 self.emit_load_ptr_from_slot(*slot, ptr_id);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 self.state
                     .out
@@ -148,7 +153,8 @@ impl X86Codegen {
             SlotAddr::Reg(reg) => {
                 self.emit_reg_to_addr(*reg);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 self.state
                     .out
@@ -181,13 +187,15 @@ impl X86Codegen {
                 self.state.emit("    pushq %rax");
                 self.state.emit("    fldl (%rsp)");
                 self.state.emit("    addq $8, %rsp");
-                self.state.out.emit_instr_rbp("    fstpt", rbp_off);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fstpt", rbp_off));
             }
             SlotAddr::OverAligned(slot, id) => {
                 self.state.emit("    movq %rax, %rdx");
                 self.emit_alloca_aligned_addr(*slot, *id);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 self.state.emit("    pushq %rdx");
                 self.state.emit("    fldl (%rsp)");
@@ -198,7 +206,8 @@ impl X86Codegen {
                 self.state.emit("    movq %rax, %rdx");
                 self.emit_load_ptr_from_slot(*slot, ptr_id);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 self.state.emit("    pushq %rdx");
                 self.state.emit("    fldl (%rsp)");
@@ -209,7 +218,8 @@ impl X86Codegen {
                 self.state.emit("    movq %rax, %rdx");
                 self.emit_reg_to_addr(*reg);
                 if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    addq", offset, "rcx"));
                 }
                 self.state.emit("    pushq %rdx");
                 self.state.emit("    fldl (%rsp)");
@@ -224,8 +234,10 @@ impl X86Codegen {
     /// a truncated f64 copy in %rax for backward compatibility.
     pub(super) fn emit_f128_load_finish(&mut self, dest: &Value) {
         if let Some(dest_slot) = self.state.get_slot(dest.0) {
-            self.state.out.emit_instr_rbp("    fstpt", dest_slot.0);
-            self.state.out.emit_instr_rbp("    fldt", dest_slot.0);
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp("    fstpt", dest_slot.0));
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp("    fldt", dest_slot.0));
             self.state.emit("    subq $8, %rsp");
             self.state.emit("    fstpl (%rsp)");
             self.state.emit("    popq %rax");
@@ -250,7 +262,8 @@ impl X86Codegen {
         use crate::backend::state::SlotAddr;
         match addr {
             SlotAddr::Direct(slot) => {
-                self.state.out.emit_instr_rbp("    fldt", slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
             }
             SlotAddr::OverAligned(slot, id) => {
                 self.emit_alloca_aligned_addr(*slot, *id);
@@ -678,7 +691,8 @@ impl X86Codegen {
                 if self.state.f128_direct_slots.contains(&v.0) {
                     // Full 80-bit x87 precision in the slot; use fldt
                     if let Some(slot) = self.state.get_slot(v.0) {
-                        self.state.out.emit_instr_rbp("    fldt", slot.0);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                     } else {
                         // Fallback: load f64 from rax
                         self.operand_to_rax(operand);
@@ -707,14 +721,16 @@ impl X86Codegen {
                         // va_arg(long double) whose result was not registered
                         // in f128_direct_slots (va-arg-pack-1, both x86
                         // backends, -O1/-O2).
-                        self.state.out.emit_instr_rbp("    fldt", slot.0);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                         self.state.reg_cache.invalidate_all();
                     } else {
                         // Provably F32/F64-typed payload reaching an F128
                         // compare (widening is the lowering's job, but if a
                         // raw narrow FP value arrives its slot holds the
                         // IEEE bit pattern); reinterpret via fldl/flds.
-                        self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rax"));
                         self.state.emit("    subq $8, %rsp");
                         self.state.emit("    movq %rax, (%rsp)");
                         self.state.emit("    fldl (%rsp)");

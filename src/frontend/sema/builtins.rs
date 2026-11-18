@@ -2973,18 +2973,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "_mm256_sub_epi64",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubq256),
     );
-    m.insert(
-        "_mm256_andnot_si256",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256),
-    );
-    m.insert(
-        "_mm256_andnot_pd",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256),
-    );
-    m.insert(
-        "_mm256_andnot_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256),
-    );
+    // `_mm256_andnot_{si256,ps,pd}` are header macros (avx2intrin.h /
+    // avxintrin.h) over the correct builtins. A frontend entry here made the
+    // public names visible without <immintrin.h> and bound the float forms to
+    // the integer VPANDN (AVX2) under -mavx, which GCC never does.
     m.insert(
         "_mm256_cmpeq_epi32",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpeqd256),

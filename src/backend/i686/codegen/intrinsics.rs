@@ -983,6 +983,28 @@ impl I686Codegen {
                 }
             }
 
+            // 128-bit variable-index permutes (AVX): vpermilps/vpermilpd
+            // %idx, %src, %dst. Loads follow the 128-bit operand pattern above.
+            IntrinsicOp::VpermilvarPs128 | IntrinsicOp::VpermilvarPd128 => {
+                if let Some(dptr) = dest_ptr {
+                    let inst = match op {
+                        IntrinsicOp::VpermilvarPs128 => "vpermilps",
+                        IntrinsicOp::VpermilvarPd128 => "vpermilpd",
+                        _ => unreachable!("unexpected 128-bit vpermilvar op: {:?}", op),
+                    };
+                    self.operand_to_eax(&args[0]);
+                    self.state.emit("    movups (%eax), %xmm0");
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    movups (%eax), %xmm1");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm1, %xmm0, %xmm0", inst));
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movups %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+
             // Blend with immediate (SSE4.1): blendps/blendpd/dpps/dppd (a, b, imm).
             IntrinsicOp::BlendPs128
             | IntrinsicOp::BlendPd128
@@ -1955,6 +1977,7 @@ impl I686Codegen {
             | IntrinsicOp::HaddPs256
             | IntrinsicOp::HsubPs256
             | IntrinsicOp::AddsubPs256
+            | IntrinsicOp::AddsubPd256
             | IntrinsicOp::UnpcklPs256
             | IntrinsicOp::UnpckhPs256
             | IntrinsicOp::UnpcklPd256
@@ -1986,6 +2009,7 @@ impl I686Codegen {
                         IntrinsicOp::HaddPs256 => "vhaddps",
                         IntrinsicOp::HsubPs256 => "vhsubps",
                         IntrinsicOp::AddsubPs256 => "vaddsubps",
+                        IntrinsicOp::AddsubPd256 => "vaddsubpd",
                         IntrinsicOp::UnpcklPs256 => "vunpcklps",
                         IntrinsicOp::UnpckhPs256 => "vunpckhps",
                         IntrinsicOp::UnpcklPd256 => "vunpcklpd",
@@ -2011,6 +2035,8 @@ impl I686Codegen {
             // --- AVX packed float unary (256-bit) ---
             IntrinsicOp::SqrtPs256
             | IntrinsicOp::SqrtPd256
+            | IntrinsicOp::RcpPs256
+            | IntrinsicOp::RsqrtPs256
             | IntrinsicOp::CvtPs2Ep32_256
             | IntrinsicOp::CvttPs2Ep32_256
             | IntrinsicOp::CvtEp32ToPs256
@@ -2022,6 +2048,8 @@ impl I686Codegen {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::SqrtPs256 => "vsqrtps",
+                        IntrinsicOp::RcpPs256 => "vrcpps",
+                        IntrinsicOp::RsqrtPs256 => "vrsqrtps",
                         IntrinsicOp::SqrtPd256 => "vsqrtpd",
                         IntrinsicOp::CvtPs2Ep32_256 => "vcvtps2dq",
                         IntrinsicOp::CvttPs2Ep32_256 => "vcvttps2dq",
@@ -2046,6 +2074,7 @@ impl I686Codegen {
             IntrinsicOp::CmpPs256
             | IntrinsicOp::CmpPd256
             | IntrinsicOp::ShufPs256
+            | IntrinsicOp::DpPs256
             | IntrinsicOp::ShufPd256
             | IntrinsicOp::BlendPs256
             | IntrinsicOp::BlendPd256 => {
@@ -2056,6 +2085,7 @@ impl I686Codegen {
                         IntrinsicOp::ShufPs256 => "vshufps",
                         IntrinsicOp::ShufPd256 => "vshufpd",
                         IntrinsicOp::BlendPs256 => "vblendps",
+                        IntrinsicOp::DpPs256 => "vdpps",
                         IntrinsicOp::BlendPd256 => "vblendpd",
                         _ => unreachable!("unexpected AVX fp imm op: {:?}", op),
                     };
