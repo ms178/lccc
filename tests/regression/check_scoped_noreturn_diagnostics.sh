@@ -240,10 +240,28 @@ done
 # noreturn call the epilogue must be gone.  A compiler free to keep unreachable
 # code is weaker rather than wrong, and pinning GCC's choice here would measure
 # GCC instead of us.
+#
+# The second pair has no attribute at all: `die` is a static function without a
+# returning path, which makes every direct call to it a dead end (GCC's noreturn
+# discovery, and objtool's rule for a local symbol without a return
+# instruction).  `maybe` returns on one path, so its caller's epilogue is live.
 SHAPES=(
 "same_signature_calls_in_both_scopes.c|h|live|yes"
 "same_signature_calls_in_both_scopes.c|f|dead|no"
+"unannotated_static_callee_without_return.c|h|live|yes"
+"unannotated_static_callee_without_return.c|f|dead|no"
 )
+
+# The self-test sweeps one fixture, so it sees that fixture's shapes only: its
+# canned transcripts describe one program, and a row about another would fail
+# for a reason that has nothing to do with the witness.
+if [[ -n ${CCC_CASE:-} ]]; then
+    swept=()
+    for row in "${SHAPES[@]}"; do
+        [[ ${row%%|*} == "${CCC_CASE%%|*}" ]] && swept+=("$row")
+    done
+    SHAPES=("${swept[@]}")
+fi
 
 asm_body() { # $1=compiler $2=file $3=function -> indented instruction lines
     local out=$WORK/$(basename "$2").$(basename "$1" | tr -c 'A-Za-z0-9' '_').s

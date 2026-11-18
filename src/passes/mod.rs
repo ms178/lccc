@@ -52,6 +52,7 @@ pub(crate) mod instrument;
 pub(crate) mod int_const_hoist;
 pub(crate) mod integer_bounds;
 pub(crate) mod interval_compare;
+pub(crate) mod ip_noreturn;
 pub(crate) mod ip_purity;
 pub(crate) mod ipa_pta;
 pub(crate) mod ipcp;
@@ -3960,6 +3961,14 @@ pub(crate) fn run_passes(
         if !dis.ipcp {
             ipcp_changes = timed_pass!("ipcp", ipcp::run(module));
             purity_changes = ip_purity::run(module);
+            // Internal functions that cannot return end their callers' blocks
+            // (GCC's noreturn discovery; objtool's `missing __noreturn`).
+            // After purity, so a call DCE may delete is never cut after, and
+            // counted with IPCP: the callers need the same cleanup iteration.
+            // Pass name for CCC_DISABLE_PASSES: "ip_noreturn".
+            if !dis.cfg && !pass_disabled(&disabled, "ip_noreturn") {
+                ipcp_changes += timed_pass!("ip_noreturn", ip_noreturn::run(module));
+            }
             if ipcp_changes > 0 || purity_changes > 0 {
                 changed.iter_mut().for_each(|c| *c = true);
             }
