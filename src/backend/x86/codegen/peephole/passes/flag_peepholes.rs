@@ -2449,7 +2449,8 @@ pub(super) fn fold_arithmetic_test_sign_cmov(
                     {
                         break;
                     }
-                    let new_line = format!("    cmov{replacement}{width} {src}, {}", dst.trim_ascii());
+                    let new_line =
+                        format!("    cmov{replacement}{width} {src}, {}", dst.trim_ascii());
                     replace_line(store, &mut infos[n], n, new_line);
                     mark_nop(&mut infos[test_idx]);
                     cmov_idx = Some(n);

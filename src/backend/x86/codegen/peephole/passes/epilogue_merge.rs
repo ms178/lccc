@@ -276,7 +276,10 @@ fn merge_one_function(
             } else {
                 let label = fresh_label(label_seq, occupied);
                 let at = exits[host].line_of[host_parts.len() - guest_parts.len()];
-                store.replace(at, format!("{}:\n{}", label, store.get(at).trim_ascii_end()));
+                store.replace(
+                    at,
+                    format!("{}:\n{}", label, store.get(at).trim_ascii_end()),
+                );
                 infos[at] = classify_line(store.get(at));
                 host_labels.insert(key, label.clone());
                 label

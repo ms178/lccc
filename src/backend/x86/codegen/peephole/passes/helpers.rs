@@ -327,16 +327,28 @@ pub(super) fn implicit_read_reg_family(trimmed: &str) -> Option<RegId> {
     //   cqto/cqo:  read %rax (family 0), write %rdx
     //   cdq:       read %eax (family 0), write %edx
     //   cbw/cwtl/cwd: read %ax (family 0), write wider accumulator
-    if trimmed.starts_with("cltq")
-        || trimmed.starts_with("cdqe")
-        || trimmed.starts_with("cqto")
-        || trimmed.starts_with("cqo")
-        || trimmed.starts_with("cdq")
-        || trimmed.starts_with("cwd")
-        || trimmed.starts_with("cbw")
-        || trimmed.starts_with("cwtl")
     {
-        return Some(0);
+        use crate::backend::peephole_common::{Pfx, first8};
+        let f8 = first8(trimmed);
+        const CLTQ: Pfx = Pfx::new("cltq");
+        const CDQE: Pfx = Pfx::new("cdqe");
+        const CQTO: Pfx = Pfx::new("cqto");
+        const CQO: Pfx = Pfx::new("cqo");
+        const CDQ: Pfx = Pfx::new("cdq");
+        const CWD: Pfx = Pfx::new("cwd");
+        const CBW: Pfx = Pfx::new("cbw");
+        const CWTL: Pfx = Pfx::new("cwtl");
+        if CLTQ.matches(f8)
+            || CDQE.matches(f8)
+            || CQTO.matches(f8)
+            || CQO.matches(f8)
+            || CDQ.matches(f8)
+            || CWD.matches(f8)
+            || CBW.matches(f8)
+            || CWTL.matches(f8)
+        {
+            return Some(0);
+        }
     }
     // Integer div/idiv read %rax:%rdx (families 0 and 2); mul reads %rax.
     // Exclude SSE variants (divsd/mulsd/...) which have explicit operands.
@@ -354,8 +366,14 @@ pub(super) fn implicit_read_reg_family(trimmed: &str) -> Option<RegId> {
         return Some(0);
     }
     // Double-precision shifts read %cl implicitly (family 1).
-    if trimmed.starts_with("shld") || trimmed.starts_with("shrd") {
-        return Some(1);
+    {
+        use crate::backend::peephole_common::{Pfx, first8};
+        let f8 = first8(trimmed);
+        const SHLD: Pfx = Pfx::new("shld");
+        const SHRD: Pfx = Pfx::new("shrd");
+        if SHLD.matches(f8) || SHRD.matches(f8) {
+            return Some(1);
+        }
     }
     None
 }

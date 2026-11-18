@@ -1881,7 +1881,10 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
-        let ops: Vec<&str> = operand_list(operands).iter().map(|o| o.trim_ascii()).collect();
+        let ops: Vec<&str> = operand_list(operands)
+            .iter()
+            .map(|o| o.trim_ascii())
+            .collect();
         // A full-width load: two operands, the source a memory operand
         // (a register-to-register `vmovdqa` is itself a copy, handled by
         // the copy rules), folded only into the full-width VEX copy-out
@@ -3295,7 +3298,9 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         assert!(propagate_vector_copies(&mut store, &mut infos));
-        assert!((0..store.len()).any(|i| store.get(i).trim_ascii() == "vaddps %xmm0, %xmm5, %xmm7"));
+        assert!(
+            (0..store.len()).any(|i| store.get(i).trim_ascii() == "vaddps %xmm0, %xmm5, %xmm7")
+        );
     }
 
     #[test]

@@ -2404,8 +2404,9 @@ mod tests {
         let (mut store, mut infos) = build_pinned(asm);
         assert!(global_store_forwarding(&mut store, &mut infos));
         assert!(
-            (0..store.len())
-                .any(|i| { !infos[i].is_nop() && store.get(i).trim_ascii() == "movq %xmm0, %xmm6" })
+            (0..store.len()).any(|i| {
+                !infos[i].is_nop() && store.get(i).trim_ascii() == "movq %xmm0, %xmm6"
+            })
         );
     }
 

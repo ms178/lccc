@@ -741,10 +741,7 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 rbp_frame = true;
                 break;
             }
-            if infos[k].is_cfi_end()
-                || t.starts_with(".size ")
-                || infos[k].kind == LineKind::Ret
-            {
+            if infos[k].is_cfi_end() || t.starts_with(".size ") || infos[k].kind == LineKind::Ret {
                 break;
             }
         }

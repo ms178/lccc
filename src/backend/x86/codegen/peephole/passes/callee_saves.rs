@@ -374,11 +374,7 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
             i += 1;
             continue;
         }
-        let func_end = (i + 1..len)
-            .find(|&k| {
-                infos[k].is_cfi_end()
-            })
-            .unwrap_or(len);
+        let func_end = (i + 1..len).find(|&k| infos[k].is_cfi_end()).unwrap_or(len);
         fpo_function(store, infos, i, func_end);
         i = func_end.max(i + 1);
     }
@@ -791,11 +787,7 @@ pub(super) fn rename_saved_values_into_free_scratch(
             i += 1;
             continue;
         }
-        let end = (i + 1..len)
-            .find(|&k| {
-                infos[k].is_cfi_end()
-            })
-            .unwrap_or(len);
+        let end = (i + 1..len).find(|&k| infos[k].is_cfi_end()).unwrap_or(len);
         rename_in_function(store, infos, i, end, &mut lv, &mut out);
         i = end.max(i + 1);
     }

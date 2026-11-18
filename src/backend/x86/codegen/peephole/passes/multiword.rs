@@ -197,7 +197,10 @@ fn lea_sum(address: &str) -> Option<(RegId, RegId)> {
 fn lea_offset(address: &str) -> Option<(i64, RegId)> {
     let open = address.find('(')?;
     let offset = address[..open].trim_ascii().parse::<i64>().ok()?;
-    let base = address[open..].strip_prefix('(')?.strip_suffix(')')?.trim_ascii();
+    let base = address[open..]
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim_ascii();
     (offset != 0 && i32::try_from(offset).is_ok()).then_some(())?;
     Some((offset, Width::Q.register(base)?))
 }

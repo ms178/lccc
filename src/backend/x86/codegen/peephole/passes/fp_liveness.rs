@@ -312,9 +312,9 @@ impl FpLiveness {
             let (mn, operands) = split_mnemonic(text);
             has_implicit_vector_effects_line(text)
                 || mn.starts_with('v')
-                    && dest_operand(operands)
-                        .and_then(|dst| xmm_index(dst.split('{').next().unwrap_or(dst).trim_ascii_end()))
-                        == Some(n)
+                    && dest_operand(operands).and_then(|dst| {
+                        xmm_index(dst.split('{').next().unwrap_or(dst).trim_ascii_end())
+                    }) == Some(n)
         });
         let footprint = low
             | if has_upper_write {

@@ -409,7 +409,7 @@ fn matching_scratch_pop(
             // span could observe. CFI is inert for windows but not here: an
             // adjustment inside the span describes the push being removed.
             LineKind::Directive if !infos[k].inert_dir || infos[k].cfi != CfiMark::None => {
-                return None
+                return None;
             }
             _ => {
                 // Any stack-pointer dependence, textual or architectural --

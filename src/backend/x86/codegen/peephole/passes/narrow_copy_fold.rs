@@ -1592,7 +1592,12 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
             mark_nop(&mut infos[c]);
         }
         for (j, rw) in rewritten_uses {
-            replace_line(store, &mut infos[j], j, format!("    {}", rw.trim_ascii_start()));
+            replace_line(
+                store,
+                &mut infos[j],
+                j,
+                format!("    {}", rw.trim_ascii_start()),
+            );
         }
         // Edits: the producer `i`, the copy `c` and the uses, all inside the
         // barrier-free windows `[i, c]` and `(c, dead_at]` (`dead_at` < `c`

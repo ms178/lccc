@@ -867,7 +867,9 @@ pub(super) fn fuse_vector_load_into_op(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        if load_text.trim_ascii_start().starts_with('v') && !oracle.upper_regions_dead_after(j, t_num) {
+        if load_text.trim_ascii_start().starts_with('v')
+            && !oracle.upper_regions_dead_after(j, t_num)
+        {
             i += 1;
             continue;
         }

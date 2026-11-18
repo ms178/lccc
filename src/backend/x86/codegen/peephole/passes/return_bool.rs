@@ -188,7 +188,9 @@ fn retarget_zeroed_setcc(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
             }
             let line = infos[c].trimmed(store.get(c));
             if let Some(cc) = parse_setcc(line) {
-                let target = line.split_once(char::is_whitespace).map(|(_, t)| t.trim_ascii());
+                let target = line
+                    .split_once(char::is_whitespace)
+                    .map(|(_, t)| t.trim_ascii());
                 if target == Some(REG_NAMES[3][r]) {
                     setcc = Some((c, cc.to_string()));
                     break;

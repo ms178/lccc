@@ -204,6 +204,91 @@ pub(crate) fn has_whole_word(text: &str, word: &str) -> bool {
     find_whole_word(text.as_bytes(), word.as_bytes(), 0).is_some()
 }
 
+// ── Fast instruction-prefix probing ─────────────────────────────────────────
+
+/// A compile-time-packed instruction prefix for branch-only matching.
+///
+/// The peephole's recognizer ladders (`PURE_WRITE_PREFIXES.iter().find(|p|
+/// t.starts_with(p))` and friends) called `memcmp` once per prefix per line
+/// per pass per iteration: Callgrind attributed over 10% of a 40-function
+/// TU's instructions to `<[u8]>::starts_with` plus `__memcmp_avx2_movbe`,
+/// 2.2M probe calls from `eliminate_dead_pure_writes` alone.  Packing each
+/// prefix (they are all ≤ 8 bytes) into a `u64` constant turns a probe into
+/// `first8 & mask == packed`: one AND and one compare, no call, no loop.
+///
+/// Matching is exact `starts_with` semantics: a line shorter than the
+/// prefix zero-pads, and no prefix contains a NUL byte, so the padded
+/// compare can never false-positive.
+#[derive(Clone, Copy)]
+pub(crate) struct Pfx {
+    packed: u64,
+    mask: u64,
+    text: &'static str,
+}
+
+impl Pfx {
+    /// Pack `s` (1..=8 bytes) for prefix matching.  Compile-time: a longer
+    /// string fails the `assert!` during constant evaluation.
+    pub(crate) const fn new(s: &'static str) -> Pfx {
+        let b = s.as_bytes();
+        assert!(!b.is_empty() && b.len() <= 8, "Pfx wants 1..=8 bytes");
+        let mut packed = 0u64;
+        let mut i = 0;
+        while i < b.len() {
+            packed |= (b[i] as u64) << (8 * i);
+            i += 1;
+        }
+        let mask = if b.len() == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * b.len())) - 1
+        };
+        Pfx {
+            packed,
+            mask,
+            text: s,
+        }
+    }
+
+    /// The original prefix text (so converted call sites can keep slicing
+    /// operands with `&t[p.len()..]` exactly as before).
+    #[inline]
+    pub(crate) fn text(self) -> &'static str {
+        self.text
+    }
+
+    /// `t.starts_with(self.text)`, given `first8(t)`.
+    #[inline]
+    pub(crate) fn matches(self, first8: u64) -> bool {
+        first8 & self.mask == self.packed
+    }
+}
+
+/// The first eight bytes of `t`, little-endian packed, zero-padded.
+#[inline]
+pub(crate) fn first8(t: &str) -> u64 {
+    let b = t.as_bytes();
+    if b.len() >= 8 {
+        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    } else {
+        let mut buf = [0u8; 8];
+        let mut i = 0;
+        while i < b.len() {
+            buf[i] = b[i];
+            i += 1;
+        }
+        u64::from_le_bytes(buf)
+    }
+}
+
+/// First match of `set` against `t`, in table order (the exact semantics of
+/// `set.iter().find(|p| t.starts_with(p))` on the same list).
+#[inline]
+pub(crate) fn find_pfx(t: &str, set: &'static [Pfx]) -> Option<&'static str> {
+    let f8 = first8(t);
+    set.iter().find(|p| p.matches(f8)).map(|p| p.text)
+}
+
 // ── Source-operand rewrite ───────────────────────────────────────────────────
 
 /// Byte index of the first operand after the mnemonic, or `None`.
@@ -715,7 +800,10 @@ pub(crate) fn join_with_debug_rows(lines: &[String], kept: impl Fn(usize) -> boo
             if is_inline_range_marker(text) {
                 held.push(line);
             } else if is_loc_directive(text) {
-                if let Some(pos) = held.iter().rposition(|row| is_loc_directive(row.trim_ascii())) {
+                if let Some(pos) = held
+                    .iter()
+                    .rposition(|row| is_loc_directive(row.trim_ascii()))
+                {
                     held.remove(pos);
                 }
                 held.push(line);

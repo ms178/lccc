@@ -33,6 +33,29 @@ const PURE_WRITE_PREFIXES: &[&str] = &[
     "movsbl ", "movsbq ", "movswl ", "movswq ", "movslq ", "leal ", "leaq ", "cmov", "set",
 ];
 
+/// `PURE_WRITE_PREFIXES` packed for branch-only probing (same list, same
+/// order, so the first match is the same prefix `iter().find` returned).
+const PURE_WRITE_PFX: &[crate::backend::peephole_common::Pfx] = &[
+    crate::backend::peephole_common::Pfx::new("movl "),
+    crate::backend::peephole_common::Pfx::new("movq "),
+    crate::backend::peephole_common::Pfx::new("movb "),
+    crate::backend::peephole_common::Pfx::new("movw "),
+    crate::backend::peephole_common::Pfx::new("movabsq "),
+    crate::backend::peephole_common::Pfx::new("movzbl "),
+    crate::backend::peephole_common::Pfx::new("movzbq "),
+    crate::backend::peephole_common::Pfx::new("movzwl "),
+    crate::backend::peephole_common::Pfx::new("movzwq "),
+    crate::backend::peephole_common::Pfx::new("movsbl "),
+    crate::backend::peephole_common::Pfx::new("movsbq "),
+    crate::backend::peephole_common::Pfx::new("movswl "),
+    crate::backend::peephole_common::Pfx::new("movswq "),
+    crate::backend::peephole_common::Pfx::new("movslq "),
+    crate::backend::peephole_common::Pfx::new("leal "),
+    crate::backend::peephole_common::Pfx::new("leaq "),
+    crate::backend::peephole_common::Pfx::new("cmov"),
+    crate::backend::peephole_common::Pfx::new("set"),
+];
+
 /// True when the operand text is a register (no memory reference).
 fn is_register_operand(text: &str) -> bool {
     text.starts_with('%') && !text.contains('(')
@@ -237,7 +260,7 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
             continue;
         }
         let t = infos[i].trimmed(store.get(i));
-        let Some(op) = PURE_WRITE_PREFIXES.iter().find(|p| t.starts_with(**p)) else {
+        let Some(op) = crate::backend::peephole_common::find_pfx(t, PURE_WRITE_PFX) else {
             i += 1;
             continue;
         };
@@ -466,11 +489,22 @@ impl LazyLabelRefs {
 /// Memory operand of a simple load `mov* MEM, %reg`, plus the register families
 /// the address reads.
 fn load_operand(t: &str) -> Option<(&'static str, &str, &str, Vec<RegId>)> {
-    const LOADS: &[&str] = &[
-        "movl ", "movq ", "movb ", "movw ", "movzbl ", "movzbq ", "movzwl ", "movzwq ", "movsbl ",
-        "movsbq ", "movswl ", "movswq ", "movslq ",
+    const LOADS: &[crate::backend::peephole_common::Pfx] = &[
+        crate::backend::peephole_common::Pfx::new("movl "),
+        crate::backend::peephole_common::Pfx::new("movq "),
+        crate::backend::peephole_common::Pfx::new("movb "),
+        crate::backend::peephole_common::Pfx::new("movw "),
+        crate::backend::peephole_common::Pfx::new("movzbl "),
+        crate::backend::peephole_common::Pfx::new("movzbq "),
+        crate::backend::peephole_common::Pfx::new("movzwl "),
+        crate::backend::peephole_common::Pfx::new("movzwq "),
+        crate::backend::peephole_common::Pfx::new("movsbl "),
+        crate::backend::peephole_common::Pfx::new("movsbq "),
+        crate::backend::peephole_common::Pfx::new("movswl "),
+        crate::backend::peephole_common::Pfx::new("movswq "),
+        crate::backend::peephole_common::Pfx::new("movslq "),
     ];
-    let op = LOADS.iter().find(|p| t.starts_with(**p))?;
+    let op = crate::backend::peephole_common::find_pfx(t, LOADS)?;
     let (src, dst) = split_two_operands(&t[op.len()..])?;
     if !src.contains('(') || !is_register_operand(dst) {
         return None;
@@ -1189,7 +1223,15 @@ pub(super) fn frame_slot_stable_in_range(
 /// `GlobalAddr` base into a register — a legitimate, profitable mid-end
 /// transform — exposed it. Regression: `pic_indexed_store_static_global.c`.
 pub(super) fn line_writes_memory(t: &str) -> bool {
-    if t.starts_with("lock") || t.starts_with("rep") || t.starts_with("movs") && !t.contains('%') {
+    use crate::backend::peephole_common::{Pfx, first8};
+    // One packed load serves every probe below (exact `starts_with`
+    // semantics, see `Pfx`); 400K calls per mixed TU made the memcmp
+    // ladder measurable.
+    let f8 = first8(t);
+    const LOCK: Pfx = Pfx::new("lock");
+    const REP: Pfx = Pfx::new("rep");
+    const MOVS: Pfx = Pfx::new("movs");
+    if LOCK.matches(f8) || REP.matches(f8) || MOVS.matches(f8) && !t.contains('%') {
         return true;
     }
     // Implicit memory WRITERS with no AT&T memory-operand convention to
@@ -1202,19 +1244,34 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
     // in `xchg (%rax), %rbx`). Every addition here is toward `true`, so
     // both consumers (dead store removal, store-forwarding barriers) only
     // get more conservative.
-    if t.starts_with("stos")
-        || t.starts_with("clzero")
-        || t.starts_with("ins") && t.as_bytes().get(3).is_none_or(u8::is_ascii_whitespace)
-        || t.starts_with("insb")
-        || t.starts_with("insw")
-        || t.starts_with("insl")
-        || t.starts_with("insd")
-        || t.starts_with("maskmov")
-        || t.starts_with("vmaskmovdqu")
-        || t.starts_with("movdir64b")
-        || t.starts_with("enqcmd")
-        || t.starts_with("xchg")
-        || t.starts_with("cmpxchg")
+    const STOS: Pfx = Pfx::new("stos");
+    const CLZERO: Pfx = Pfx::new("clzero");
+    const INS: Pfx = Pfx::new("ins");
+    const INSB: Pfx = Pfx::new("insb");
+    const INSW: Pfx = Pfx::new("insw");
+    const INSL: Pfx = Pfx::new("insl");
+    const INSD: Pfx = Pfx::new("insd");
+    const MASKMOV: Pfx = Pfx::new("maskmov");
+    const MOVDIR64: Pfx = Pfx::new("movdir64");
+    const ENQCMD: Pfx = Pfx::new("enqcmd");
+    const XCHG: Pfx = Pfx::new("xchg");
+    const CMPXCHG: Pfx = Pfx::new("cmpxchg");
+    // `vmaskmovdqu` exceeds 8 bytes; its first 8 ("vmaskmov") are unique
+    // enough that the rare hit re-checks the full text.
+    const VMASKMOV8: Pfx = Pfx::new("vmaskmov");
+    if STOS.matches(f8)
+        || CLZERO.matches(f8)
+        || INS.matches(f8) && t.as_bytes().get(3).is_none_or(u8::is_ascii_whitespace)
+        || INSB.matches(f8)
+        || INSW.matches(f8)
+        || INSL.matches(f8)
+        || INSD.matches(f8)
+        || MASKMOV.matches(f8)
+        || VMASKMOV8.matches(f8) && t.starts_with("vmaskmovdqu")
+        || MOVDIR64.matches(f8) && t.starts_with("movdir64b")
+        || ENQCMD.matches(f8)
+        || XCHG.matches(f8)
+        || CMPXCHG.matches(f8)
     {
         return true;
     }
@@ -1222,19 +1279,21 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
     // AT&T destination position (`cmpb $0, (%rdx)`, `testq %rax, (%rbx)`):
     // the last-operand rule below would misfile them as writers. (`cmpxchg*`
     // is a genuine RMW writer and was handled above.)
-    if t.starts_with("cmp")
-        || t.starts_with("test")
-        || t.starts_with("ucomi")
-        || t.starts_with("comi")
-    {
+    const CMP: Pfx = Pfx::new("cmp");
+    const TEST: Pfx = Pfx::new("test");
+    const UCOMI: Pfx = Pfx::new("ucomi");
+    const COMI: Pfx = Pfx::new("comi");
+    const LEA: Pfx = Pfx::new("lea");
+    const J: Pfx = Pfx::new("j");
+    if CMP.matches(f8) || TEST.matches(f8) || UCOMI.matches(f8) || COMI.matches(f8) {
         return false;
     }
     let Some(comma) = last_top_level_comma(t.as_bytes()) else {
         // Single-operand forms that write memory (`incl (%rax)`, `negq (%rax)`).
-        return t.contains('(') && !t.starts_with("lea") && !t.starts_with("j");
+        return t.contains('(') && !LEA.matches(f8) && !J.matches(f8);
     };
     let dst = t[comma + 1..].trim_ascii();
-    dst.contains('(') && !t.starts_with("lea")
+    dst.contains('(') && !LEA.matches(f8)
 }
 
 // ── load + self-test → compare against memory ────────────────────────────────

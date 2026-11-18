@@ -704,8 +704,7 @@ impl FileLiveness {
             }
             let mut end = len;
             for n in i + 1..len {
-                if infos[n].is_cfi_end()
-                {
+                if infos[n].is_cfi_end() {
                     end = n;
                     break;
                 }
@@ -2200,7 +2199,8 @@ impl FileLiveness {
                         // accumulator live across whole regions and blocked
                         // every copy fold feeding a later zeroing.
                         let ops = t.split_once(' ').and_then(|(_, rest)| {
-                            rest.split_once(',').map(|(a, b)| (a.trim_ascii(), b.trim_ascii()))
+                            rest.split_once(',')
+                                .map(|(a, b)| (a.trim_ascii(), b.trim_ascii()))
                         });
                         if let Some((a, b)) = ops {
                             if a == b {

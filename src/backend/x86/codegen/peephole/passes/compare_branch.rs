@@ -20,7 +20,11 @@ const CMP_FUSION_LOOKAHEAD: usize = 12;
 fn parse_stack_operand(text: &str, source: bool) -> Option<(u8, i32)> {
     let (_, operands) = text.split_once(char::is_whitespace)?;
     let (src, dst) = operands.split_once(',')?;
-    let op = if source { src.trim_ascii() } else { dst.trim_ascii() };
+    let op = if source {
+        src.trim_ascii()
+    } else {
+        dst.trim_ascii()
+    };
     for (suffix, base) in [("(%rsp)", 4u8), ("(%rbp)", 5u8)] {
         if let Some(n) = op.strip_suffix(suffix) {
             let off = if n.trim_ascii().is_empty() {

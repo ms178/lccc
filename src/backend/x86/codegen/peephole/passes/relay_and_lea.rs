@@ -1314,7 +1314,9 @@ pub(super) fn fam_written_only_as_dest(t: &str, fam: RegId) -> bool {
     // %r11,2), %r11d` → not), so consulting it here refused the 64-bit form
     // of a fold it admitted at 32 bits (`usel(a) * 3` kept its relay copy).
     let is_lea = t.trim_ascii_start().starts_with("lea");
-    if !consumer_writes_dst_as_reg(t, fam) || (!is_lea && is_read_modify_write(t.trim_ascii_start())) {
+    if !consumer_writes_dst_as_reg(t, fam)
+        || (!is_lea && is_read_modify_write(t.trim_ascii_start()))
+    {
         return false;
     }
     let trimmed = t.trim_ascii_start();
@@ -2426,6 +2428,35 @@ const PURE_PRODUCERS: &[&str] = &[
     "movslq ", "movl ", "movq ", "leal ", "leaq ",
 ];
 
+/// `PURE_PRODUCERS` packed for branch-only probing (same list and order).
+const PURE_PRODUCERS_PFX: &[crate::backend::peephole_common::Pfx] = &[
+    crate::backend::peephole_common::Pfx::new("movzbl "),
+    crate::backend::peephole_common::Pfx::new("movzbq "),
+    crate::backend::peephole_common::Pfx::new("movzwl "),
+    crate::backend::peephole_common::Pfx::new("movzwq "),
+    crate::backend::peephole_common::Pfx::new("movsbl "),
+    crate::backend::peephole_common::Pfx::new("movsbq "),
+    crate::backend::peephole_common::Pfx::new("movswl "),
+    crate::backend::peephole_common::Pfx::new("movswq "),
+    crate::backend::peephole_common::Pfx::new("movslq "),
+    crate::backend::peephole_common::Pfx::new("movl "),
+    crate::backend::peephole_common::Pfx::new("movq "),
+    crate::backend::peephole_common::Pfx::new("leal "),
+    crate::backend::peephole_common::Pfx::new("leaq "),
+];
+
+/// `PURE_PRODUCERS_3OP` packed likewise.
+const PURE_PRODUCERS_3OP_PFX: &[crate::backend::peephole_common::Pfx] = &[
+    crate::backend::peephole_common::Pfx::new("rorxl "),
+    crate::backend::peephole_common::Pfx::new("rorxq "),
+    crate::backend::peephole_common::Pfx::new("shrxl "),
+    crate::backend::peephole_common::Pfx::new("shrxq "),
+    crate::backend::peephole_common::Pfx::new("shlxl "),
+    crate::backend::peephole_common::Pfx::new("shlxq "),
+    crate::backend::peephole_common::Pfx::new("sarxl "),
+    crate::backend::peephole_common::Pfx::new("sarxq "),
+];
+
 /// Flag-neutral BMI2 three-operand shifts/rotates (`op src1, src2, dst`):
 /// read all source operands before writing their trailing register destination
 /// and leave EFLAGS untouched.
@@ -2618,18 +2649,15 @@ fn retarget_producer_into_copy_impl(
             continue;
         }
         let prod = infos[i].trimmed(store.get(i));
-        let Some((op, prod_src, prod_dst)) = PURE_PRODUCERS
-            .iter()
-            .find(|p| prod.starts_with(**p))
-            .and_then(|&p| split_two_operands(&prod[p.len()..]).map(|(s, d)| (p, s, d)))
-            .or_else(|| {
-                PURE_PRODUCERS_3OP
-                    .iter()
-                    .find(|p| prod.starts_with(**p))
-                    .and_then(|&p| {
-                        split_three_operands_last(&prod[p.len()..]).map(|(s, d)| (p, s, d))
-                    })
-            })
+        let Some((op, prod_src, prod_dst)) =
+            crate::backend::peephole_common::find_pfx(prod, PURE_PRODUCERS_PFX)
+                .and_then(|p| split_two_operands(&prod[p.len()..]).map(|(s, d)| (p, s, d)))
+                .or_else(|| {
+                    crate::backend::peephole_common::find_pfx(prod, PURE_PRODUCERS_3OP_PFX)
+                        .and_then(|p| {
+                            split_three_operands_last(&prod[p.len()..]).map(|(s, d)| (p, s, d))
+                        })
+                })
         else {
             i += 1;
             continue;
@@ -4185,7 +4213,10 @@ fn parse_imm64(src: &str) -> Option<u64> {
 /// The destination operand's text of `t` (past the mnemonic): the last
 /// top-level operand, or the sole operand when there is no comma.
 fn dest_operand_text(t: &str) -> &str {
-    let rest = t.find(' ').map(|i| t[i + 1..].trim_ascii_start()).unwrap_or("");
+    let rest = t
+        .find(' ')
+        .map(|i| t[i + 1..].trim_ascii_start())
+        .unwrap_or("");
     match last_top_level_comma(rest.as_bytes()) {
         Some(c) => rest[c + 1..].trim_ascii(),
         None => rest.trim_ascii(),
