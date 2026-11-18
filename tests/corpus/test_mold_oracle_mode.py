@@ -78,7 +78,15 @@ printf '%s\\n' "$*" >> "$MOLD_TEST_CARGO_LOG"
 printf '%s\\n' "$RUSTFLAGS" >> "$MOLD_TEST_CARGO_LOG.rustflags"
 """)
         self.cargo_log = self.root / "cargo.log"
-        self.env = dict(os.environ, PATH=f"{self.stub_bin}{os.pathsep}{os.environ['PATH']}",
+        self.home = self.root / "runner home"
+        self.home_cargo = self.home / ".cargo/bin/cargo"
+        self.home_cargo.parent.mkdir(parents=True)
+        # Like a hosted runner, HOME has another Cargo, but this caller chose
+        # a different toolchain on PATH. Never let the real runner's HOME leak
+        # into the fixture, even if the installer regresses.
+        self.script(self.home_cargo, 'echo "home Cargo shadowed PATH" >&2\nexit 97\n')
+        self.env = dict(os.environ, HOME=str(self.home),
+                        PATH=f"{self.stub_bin}{os.pathsep}{os.environ['PATH']}",
                         MOLD_REF="v3.0.0", MOLD_TEST_CARGO_LOG=str(self.cargo_log),
                         MOLD_TEST_INSTALL=str(self.root / "install-mold.sh"),
                         MOLD_TEST_RELEASE=str(self.release))
@@ -154,6 +162,22 @@ printf '%s\\n' "$RUSTFLAGS" >> "$MOLD_TEST_CARGO_LOG.rustflags"
         self.assertIn("release-cache", self.setup_tools("cache", lld))
         self.assertIn("source-build", self.setup_tools("source", lld))
         self.assertEqual(len(self.cargo_log.read_text().splitlines()), 1)
+
+    def test_home_cargo_is_only_needed_for_a_source_build_without_path_cargo(self):
+        # Hide system Cargo as well as the PATH fixture to exercise rustup's
+        # fallback on hosts with and without a system toolchain installed.
+        for name in ("bash", "cat", "cc", "chmod", "curl", "date", "dirname", "gcc", "gzip",
+                     "head", "install", "mkdir", "mv", "python3", "rm", "sha256sum", "tar", "xz"):
+            self.stub_bin.joinpath(name).symlink_to(shutil.which(name))
+        self.env["PATH"] = str(self.stub_bin)
+        self.home_cargo.unlink()
+        cargo = (self.stub_bin / "cargo").rename(self.root / "selected-cargo")
+        lld = "LLD 23.1.5 (compatible with GNU linkers)"
+        self.assertIn("release-cache", self.setup_tools("cache", lld))
+        self.assertFalse(self.cargo_log.exists())
+        cargo.rename(self.home_cargo)
+        self.assertIn("source-build", self.setup_tools("source", lld))
+        self.assertTrue(self.cargo_log.is_file())
 
     def test_warm_releases_are_verified_before_execution(self):
         lld = "LLD 23.1.5 (compatible with GNU linkers)"

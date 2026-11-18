@@ -133,17 +133,20 @@ cache_prefix() {    # <prefix dir>
     mv -f "$CACHE/$1.tar.xz.tmp" "$CACHE/$1.tar.xz"
 }
 
+need_cargo() {
+    # A caller may have selected a pinned toolchain on PATH. The usual
+    # rustup directory is a fallback, not a reason to override that choice.
+    if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/cargo" ]; then
+        PATH="$PATH:$HOME/.cargo/bin"
+    fi
+    need cargo
+}
+
 need curl tar xz sha256sum git python3
 restore_cached "bfd-$BINUTILS_VER" bin/ld || need git python3
-# rustup installs cargo outside the default PATH; mold 3.x needs it (and a
-# C compiler for its two small C parts: mold-wrapper.so, lto-message).
-[ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
-# cargo/cc are only needed for the source fallback below, not for the
-# verified-cache path; requiring them here broke cache-only hosts.
+# cargo/cc are only needed on source builds, not for a verified cache hit.
 if [ "$WITH_WILD" = 1 ]; then
-    # rustup installs cargo outside the default PATH.
-    [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
-    restore_cached wild-git bin/wild || need git cargo
+    restore_cached wild-git bin/wild || need_cargo
 fi
 
 # ── GNU ld 2.47 (primary oracle) ────────────────────────────────────────────
@@ -190,7 +193,8 @@ if [[ "$MOLD_PREFER" == cache ]] &&
 else
     mold_install=$mold_source
     if ! restore_cached "$mold_install" bin/mold; then
-        need cargo cc
+        need_cargo
+        need cc
         TARBALL="$SRC/mold-$MOLD_VER.tar.gz"
         [ -f "$TARBALL" ] || { note "mold  : fetching mold $MOLD_VER"; \
             curl -fsSL -o "$TARBALL" "https://github.com/rui314/mold/archive/refs/tags/v$MOLD_VER.tar.gz"; }
@@ -246,6 +250,7 @@ if [ "$WITH_WILD" != 1 ]; then
 elif [ -x "$PREFIX/wild-git/bin/wild" ] && [ -f "$PREFIX/wild-git/REVISION" ]; then
     note "wild  : $("$PREFIX/wild-git/bin/wild" --version 2>&1 | head -1) (restored from $ARTIFACTS; rev $(cat "$PREFIX/wild-git/REVISION"))"
 else
+    need_cargo
     WT="$SRC/wild"
     rm -rf "$WT"; git clone --depth 1 "$WILD_REPO" "$WT"
     ( cd "$WT"
