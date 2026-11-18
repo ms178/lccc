@@ -1582,7 +1582,7 @@ impl SectionTracker {
 /// Return one complete statement, without a trailing comment. Unknown quoting
 /// and statement separators fail closed. This is shared by both directive
 /// predicates so metadata cannot hide executable statements from either one.
-fn single_asm_statement(text: &str) -> Option<&str> {
+pub(crate) fn single_asm_statement(text: &str) -> Option<&str> {
     let mut quote = None;
     let mut escaped = false;
     for (i, b) in text.bytes().enumerate() {

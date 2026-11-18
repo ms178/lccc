@@ -1,259 +1,106 @@
-//! Late redundant-branch retirement — peephole Phase 9.
-//!
-//! A branch whose target is the label control already falls through to is a
-//! no-op: both outcomes arrive at the same instruction, and a branch writes no
-//! flags.  `local_patterns::combined_local_pass` deletes those (its pattern 3,
-//! `eliminate_redundant_jumps`), but it runs in Phases 1–4b, and **nine phases
-//! after it can create new ones**: 4c late hoisting, 4d loop rotation, 4e
-//! extended-basic-block reuse, 5 tail calls, 5b global dead-store elimination,
-//! 8 identical-block merging, `jump_thread::run`, 8b terminal epilogue
-//! cross-jumping and 8c–8e.  Nothing looks again, so they reach the assembler.
-//!
-//! Measured over the 1335 assembly files the regression and bench corpora
-//! produce at `-O2 -S` (`scratch/branch_to_next.py`): 26 such branches, of which
-//! `jump_thread`'s own retargeting accounts for 4 (retired where they are
-//! created, in `thread_function`) and the other 21 survive to the object file —
-//! 20 `jmp` and 1 `jne`, 8 adjacent to their target and 13 separated only by a
-//! stacked label.  gcc-16 16.2.0 and clang 23.1.5 emit none of them, and for
-//! `tests/regression/loop_global_promote.c` the raw codegen has none either
-//! (`LCCC_NO_PEEPHOLE=1`: 0 against 2), so the pipeline creates them.
-//!
-//! This is the Phase-9 companion to `pushf_elim` and `redundant_ext`: a narrow,
-//! always-on text pass over the FINAL assembly, run last so it also cleans up
-//! behind the three passes before it.
-//!
-//! # Why a text pass and not another `combined_local_pass` round
-//!
-//! `combined_local_pass` is seven patterns fused into one scan over
-//! `store`/`infos`, several of which carry soundness assumptions about their
-//! position in the pipeline (register-state mappings, frame-slot stability).
-//! Re-running all seven after Phase 8e would re-open every one of those
-//! assumptions to earn one pattern's worth of cleanup.  Phase 9 already exists
-//! for exactly this shape of problem — its own comment says the early passes
-//! "frequently remove/rewrite exactly those instructions" — and its three passes
-//! all take the built text.  This follows that contract.
-//!
-//! # Soundness
-//!
-//! Deleting the branch is justified only when control demonstrably reaches the
-//! target label from the branch without executing anything in between.  The
-//! forward walk therefore treats as transparent *only*:
-//!
-//! * blank lines and comment lines that carry no compiler marker,
-//! * labels — a label emits no bytes, so a stacked run (`.LBB26:` then
-//!   `.LBB27:`) is transparent, which is the shape `eliminate_redundant_jumps`
-//!   cannot see (it compares only the first label it finds),
-//! * the debug/unwind directives that emit no bytes: `.loc`, `.file`, `.line`,
-//!   `.cfi_*`, `.ident`,
-//! * lines this same pass already deleted, so a chain of no-op branches retires
-//!   in one scan (the walk runs backwards, and a deleted no-op branch emits
-//!   nothing).
-//!
-//! Anything else ends the walk and keeps the branch.  The allowlist is by
-//! directive *name token*, so `.local` (a symbol directive) is not mistaken for
-//! `.loc`, and everything that emits bytes — instructions, `.p2align`, `.quad`,
-//! `.byte`, `.ascii` — as well as everything that changes meaning (`.section`,
-//! `.text`, `.pushsection`, `.popsection`, `.previous`, `.subsection`, a symbol
-//! directive, `.size`, `.globl`, `.type`) is rejected by not being listed.
-//!
-//! Two opacities are refused outright, matching `pushf_elim`:
-//!
-//! * a `#APP` … `#NO_APP` region.  No line inside one is ever touched, and no
-//!   window may span one: user bytes are immutable and a template can define the
-//!   very label being looked for (`tests/regression/static_label_difference_alias.c`
-//!   and `nested_fn_chain_goto_cross.c` both rely on asm-defined aliases).
-//! * a comment carrying `LCCC_` — the compiler-owned marker convention.  Such a
-//!   comment has to reach the assembler, so a branch line carrying one is kept,
-//!   and a standalone one ends the walk.
-//!
-//! Only a *direct* branch to a local label is a candidate: the mnemonic must be
-//! in [`BRANCH_MNEMONICS`] and the operand a single `.L`-prefixed token, so an
-//! indirect dispatch (`jmpq *%rdx`, `jmp *.Ljt_0(,%rax,8)`), a far jump and a
-//! tail call to a named symbol (`jmp sym`) are all structurally excluded.
+//! Remove direct branches to the next executable address in the final x86
+//! assembly. Later phases can create these after the ordinary local pass runs.
+//! A run of labels and debug/unwind directives shares an address only while
+//! no bytes, section changes, compiler markers or inline asm intervene.
 
-/// The compiler-owned marker prefix.  A comment carrying one is a contract with
-/// a later stage, not decoration — the same constant and the same refusal as
-/// `jump_thread::inert_comment`.
+use crate::backend::peephole_common::single_asm_statement;
+use crate::common::fx_hash::FxHashMap;
+
 const COMPILER_MARKER: &str = "LCCC_";
 
-/// Direct branches.  Every x86 conditional jump plus the two unconditional
-/// spellings; `jcxz`/`jecxz`/`jrcxz` are conditional (on a register) and are
-/// equally no-ops when the target is the fallthrough, and no mnemonic here
-/// writes flags.
+// No instruction in this list writes registers or flags. In particular,
+// LOOP is not here: it decrements a counter even if both edges reach one PC.
 const BRANCH_MNEMONICS: &[&str] = &[
     "jmp", "jmpq", "ja", "jae", "jb", "jbe", "jc", "je", "jg", "jge", "jl", "jle", "jna", "jnae",
     "jnb", "jnbe", "jnc", "jne", "jng", "jnge", "jnl", "jnle", "jno", "jnp", "jns", "jnz", "jo",
     "jp", "jpe", "jpo", "js", "jcxz", "jecxz", "jrcxz",
 ];
 
-/// Directives that describe code but emit none, so control flows straight
-/// through them.  Matched on the name token, never by prefix, so `.local` is not
-/// `.loc` and `.size` is not `.sym`.
-fn is_byteless_directive(name: &str) -> bool {
-    matches!(name, ".loc" | ".file" | ".line" | ".ident") || name.starts_with(".cfi_")
+fn is_local_label(name: &str) -> bool {
+    name.starts_with(".L")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'))
 }
 
-/// The directive name of a line (`.cfi_def_cfa_offset 8136` → `.cfi_def_cfa_offset`).
-fn directive_name(trimmed: &str) -> Option<&str> {
-    let t = trimmed.strip_prefix('.')?;
-    let end = t
-        .find(|c: char| c.is_whitespace() || c == ',')
-        .unwrap_or(t.len());
-    Some(&trimmed[..end + 1])
-}
-
-/// Split a line into code and trailing comment.  `None` for the comment when
-/// there is none.
-fn split_comment(trimmed: &str) -> (&str, Option<&str>) {
-    match trimmed.find('#') {
-        Some(i) => (trimmed[..i].trim_end(), Some(&trimmed[i..])),
-        None => (trimmed.trim_end(), None),
+fn branch_target(code: &str) -> Option<&str> {
+    let mut words = code.split_ascii_whitespace();
+    if !BRANCH_MNEMONICS.contains(&words.next()?) {
+        return None;
     }
+    let name = words.next()?;
+    (words.next().is_none() && is_local_label(name)).then_some(name)
 }
 
-/// A comment this pass may see through: decoration only.  A compiler marker is
-/// a contract with a later stage and is never transparent.
-fn is_inert_comment(comment: &str) -> bool {
-    !comment.contains(COMPILER_MARKER)
+fn is_byteless_directive(code: &str) -> bool {
+    let token = code.split_ascii_whitespace().next().unwrap_or("");
+    matches!(token, ".loc" | ".file" | ".line" | ".ident")
+        || (token.starts_with(".cfi_")
+            && !matches!(token, ".cfi_sections" | ".cfi_startproc" | ".cfi_endproc"))
 }
 
-/// The label a direct branch jumps to, when this line is one and retiring it
-/// cannot lose a marker.
-fn branch_label(line: &str) -> Option<&str> {
-    let (code, comment) = split_comment(line);
-    if let Some(c) = comment {
-        if !is_inert_comment(c) {
-            return None;
+fn asm_regions_are_balanced(asm: &str) -> bool {
+    let mut inside = false;
+    for line in asm.lines() {
+        match line.trim() {
+            "#APP" if !inside => inside = true,
+            "#NO_APP" if inside => inside = false,
+            "#APP" | "#NO_APP" => return false,
+            _ => {}
         }
     }
-    let mut words = code.split_whitespace();
-    let mnemonic = words.next()?;
-    if !BRANCH_MNEMONICS.contains(&mnemonic) {
-        return None;
-    }
-    let operand = words.next()?;
-    // Exactly one operand, and a local label: no `*` (indirect), no `,` (far or
-    // two-operand), no `(` (memory), no `$` (immediate), no bare symbol (a tail
-    // call to a named function).
-    if words.next().is_some() || !operand.starts_with('.') {
-        return None;
-    }
-    if operand
-        .chars()
-        .any(|c| c == '*' || c == ',' || c == '(' || c == '$')
-    {
-        return None;
-    }
-    Some(operand)
+    !inside
 }
 
-/// The label a line defines, when it defines one.  A label carrying a compiler
-/// marker is not transparent — the marker has to reach the assembler in place.
-fn label_name(line: &str) -> Option<&str> {
-    let (code, comment) = split_comment(line);
-    if let Some(c) = comment {
-        if !is_inert_comment(c) {
-            return None;
-        }
-    }
-    let name = code.strip_suffix(':')?;
-    if !name.starts_with('.') || name[1..].contains(char::is_whitespace) {
-        return None;
-    }
-    Some(name)
-}
-
-/// Delete every branch whose target is the label control falls through to.
-/// Returns true when at least one line was deleted.
-///
-/// Scans backwards so that a chain of no-op branches retires in one pass: by the
-/// time line `i` is considered, every line after it has already been decided,
-/// and the forward walk can treat a line this pass deleted as emitting nothing.
 pub(super) fn eliminate_branch_to_next_label(asm: &mut String) -> bool {
-    if std::env::var("CCC_NO_LATE_BRANCH_ELIM").is_ok() {
+    if !asm_regions_are_balanced(asm) {
         return false;
     }
-    let lines: Vec<&str> = asm.lines().collect();
-    let mut keep = vec![true; lines.len()];
-    let mut changed = false;
-
-    // A branch inside a user region is user text, not ours to retire.
-    let mut in_asm = vec![false; lines.len()];
+    let mut labels = FxHashMap::default();
+    let mut deleted = Vec::new();
+    let mut offset = asm.len();
+    let mut barrier = offset;
     let mut inside = false;
-    for (i, line) in lines.iter().enumerate() {
-        match line.trim() {
-            "#APP" => inside = true,
-            "#NO_APP" => inside = false,
-            _ => in_asm[i] = inside,
+    for raw in asm.split_inclusive('\n').rev() {
+        let end = offset;
+        offset -= raw.len();
+        let text = raw.trim();
+        if text == "#NO_APP" {
+            inside = true;
+        } else if text == "#APP" {
+            inside = false;
         }
-    }
-
-    for i in (0..lines.len()).rev() {
-        if in_asm[i] {
+        if inside || text == "#APP" || text.contains(COMPILER_MARKER) {
+            barrier = offset;
             continue;
         }
-        let Some(target) = branch_label(lines[i].trim()) else {
+        let Some(code) = single_asm_statement(text) else {
+            barrier = offset;
             continue;
         };
-        let mut reaches = false;
-        let mut j = i + 1;
-        while j < lines.len() {
-            if in_asm[j] {
-                // The window would span user asm: opaque, and its bytes are not
-                // ours to reason about.
-                break;
-            }
-            let t = lines[j].trim();
-            if !keep[j] || t.is_empty() {
-                j += 1;
-                continue;
-            }
-            if t == "#APP" || t == "#NO_APP" {
-                break;
-            }
-            if t.starts_with('#') {
-                if !is_inert_comment(t) {
-                    break;
-                }
-                j += 1;
-                continue;
-            }
-            if let Some(name) = label_name(t) {
-                if name == target {
-                    reaches = true;
-                }
-                // A label emits no bytes either way, so a stacked run is walked
-                // through; a different label simply is not the target yet.
-                j += 1;
-                continue;
-            }
-            if t.starts_with('.') {
-                if let Some(name) = directive_name(t) {
-                    if is_byteless_directive(name) {
-                        j += 1;
-                        continue;
-                    }
-                }
-            }
-            break; // emits bytes, or changes section/symbol state
-        }
-        if reaches {
-            keep[i] = false;
-            changed = true;
+        if let Some(label) = code.strip_suffix(':').filter(|s| is_local_label(s)) {
+            labels.insert(label, offset);
+        } else if let Some(target) = branch_target(code)
+            && labels.get(target).is_some_and(|&label| label < barrier)
+        {
+            // A deleted branch is transparent to candidates earlier in the file.
+            deleted.push(offset..end);
+        } else if !code.is_empty() && !is_byteless_directive(code) {
+            barrier = offset;
         }
     }
-
-    if changed {
-        let mut out = String::with_capacity(asm.len());
-        for (idx, line) in lines.iter().enumerate() {
-            if keep[idx] {
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        *asm = out;
+    if deleted.is_empty() {
+        return false;
     }
-    changed
+    let mut result = String::with_capacity(asm.len());
+    let mut start = 0;
+    for range in deleted.into_iter().rev() {
+        result.push_str(&asm[start..range.start]);
+        start = range.end;
+    }
+    result.push_str(&asm[start..]);
+    *asm = result;
+    true
 }
 
 #[cfg(test)]
@@ -338,6 +185,12 @@ mod tests {
             ".text",
             ".pushsection .text.hot",
             ".subsection 1",
+            ".cfi_sections .debug_frame",
+            ".cfi_endproc",
+            ".loc 1 2; .byte 0xcc",
+            ".file 1 \"unterminated",
+            ".L8:; .byte 0xcc",
+            "loop .L9",
             ".size f, .-f",
             ".globl sym",
             ".type sym, @function",
@@ -384,6 +237,22 @@ mod tests {
         let (changed, out) = run(input);
         assert!(!changed, "{out}");
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn malformed_asm_markers_disable_the_pass() {
+        for input in [
+            "#APP\n jmp .L1\n.L1:\nret\n",
+            "#NO_APP\n jmp .L1\n.L1:\nret\n",
+        ] {
+            assert_eq!(run(input), (false, input.to_owned()));
+        }
+    }
+
+    #[test]
+    fn repeated_redundant_transfers_do_not_rescan_the_suffix() {
+        let input = "jmp .Lend\r\n".repeat(10_000) + ".Lend:\r\nret";
+        assert_eq!(run(&input), (true, ".Lend:\r\nret".to_owned()));
     }
 
     /// A compiler-owned marker must reach the assembler, so it is never
