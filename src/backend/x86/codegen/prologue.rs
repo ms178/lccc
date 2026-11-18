@@ -3421,11 +3421,13 @@ impl X86Codegen {
 
     /// The `# LCCC_VEX_LEGAL 1` marker: this function may be encoded with VEX
     /// (AVX1) instructions.  It is written only when the per-function ISA
-    /// (`avx_enabled`) permits VEX, and the late text peephole's legacy-to-VEX
-    /// promotion (`vex_promote`) reads it.  Absence fails closed: SSE2-only
-    /// code, naked functions and thunks keep their legacy encodings.
-    fn emit_vex_legal_marker(&mut self) {
-        if self.avx_enabled {
+    /// (`avx_enabled`) permits VEX and the function does not pin a legacy
+    /// spelling (`function_pins_strict_recip_spelling`).  The late text
+    /// peephole's legacy-to-VEX promotion (`vex_promote`) reads it.  Absence
+    /// fails closed: SSE2-only code, naked functions, thunks and pinned
+    /// kernels keep their legacy encodings.
+    fn emit_vex_legal_marker(&mut self, func: &IrFunction) {
+        if self.avx_enabled && !function_pins_strict_recip_spelling(func) {
             self.state.emit("    # LCCC_VEX_LEGAL 1");
         }
     }
@@ -3634,7 +3636,7 @@ impl X86Codegen {
             .emit_fmt(format_args!("    # LCCC_RET_XMM_BITS {}", ret_xmm_bits));
 
         self.emit_gp_return_liveness_markers(func, vector_ret_in_xmm0);
-        self.emit_vex_legal_marker();
+        self.emit_vex_legal_marker(func);
 
         if func.is_variadic
             && func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
@@ -5414,6 +5416,71 @@ fn fpo_frame_size(raw_space: i64, has_calls: bool) -> i64 {
         return if has_calls { 8 } else { 0 };
     }
     ((raw_space + 7) & !15) + 8
+}
+
+/// A function containing a PERF-41 strict-reciprocal op keeps its contracted
+/// SSE2 two-packet spelling under AVX-only (tests/regression/
+/// check_strict_computed_recip_codegen.sh). Such a function must not carry the
+/// VEX-legal marker, so `vex_promote` leaves its packed ops legacy.
+fn function_pins_strict_recip_spelling(func: &IrFunction) -> bool {
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::StrictRecipMulAddF64x4
+                        | IntrinsicOp::StrictRecipMulAddPackedF64x4,
+                    ..
+                }
+            )
+        })
+    })
+}
+
+#[cfg(test)]
+mod vex_legal_marker_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    fn block(label: u32, instructions: Vec<Instruction>) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+            terminator: Terminator::Return(None),
+        }
+    }
+
+    fn intrinsic(op: IntrinsicOp) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op,
+            dest_ptr: None,
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn strict_reciprocal_functions_withhold_the_vex_marker() {
+        for op in [
+            IntrinsicOp::StrictRecipMulAddF64x4,
+            IntrinsicOp::StrictRecipMulAddPackedF64x4,
+        ] {
+            let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+            f.blocks = vec![block(0, vec![intrinsic(op)])];
+            assert!(function_pins_strict_recip_spelling(&f), "{op:?} must pin");
+        }
+    }
+
+    #[test]
+    fn ordinary_functions_keep_the_vex_marker() {
+        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks = vec![block(0, vec![intrinsic(IntrinsicOp::VecDivF64x2)])];
+        assert!(!function_pins_strict_recip_spelling(&f));
+        f.blocks = vec![block(0, Vec::new())];
+        assert!(!function_pins_strict_recip_spelling(&f));
+    }
 }
 
 #[cfg(test)]

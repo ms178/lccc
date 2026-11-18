@@ -1538,7 +1538,7 @@ impl X86Codegen {
         //     instead of guessing.
         // Width-matched to 16: a foreign-width fold can never reach here
         // (the safety net materialises it first); this is defense.
-        if self.avx_enabled {
+        if self.avx2_enabled {
             if let Some(pf) = self.state.pending_vec_memfold.clone() {
                 if pf.width == 16 {
                     let at1 = matches!(&args[1], Operand::Value(v) if v.0 == pf.val);
@@ -1607,7 +1607,7 @@ impl X86Codegen {
                                 // mixing follow-up). The non-destructive
                                 // encoding with dst == src1 is
                                 // semantically identical.
-                                if self.avx_enabled {
+                                if self.avx2_enabled {
                                     self.state.emit_fmt(format_args!(
                                         "    v{} %{}, %{}, %{}",
                                         sse_inst, src, target, target
@@ -1646,7 +1646,7 @@ impl X86Codegen {
                         // VEX form under AVX2 (same reasoning as the
                         // in-place path above: no legacy/VEX mixing in
                         // one loop body).
-                        if self.avx_enabled {
+                        if self.avx2_enabled {
                             self.state.emit_fmt(format_args!(
                                 "    v{} %{}, %{}, %{}",
                                 sse_inst, held, target, target
@@ -1677,7 +1677,7 @@ impl X86Codegen {
         // allocation builds (ARX rounds, accumulator chains) lower
         // without any movdqa at all.  Operand order follows the legacy
         // contract: args[0] is src1, args[1] is src2 (sub: src1-src2).
-        if self.avx_enabled {
+        if self.avx2_enabled {
             let src1 = self.vex128_source(&args[0], "xmm0");
             let src2 = self.vex128_source(&args[1], "xmm1");
             let dst_home = self.dest_xmm_home_name(dest_ptr);

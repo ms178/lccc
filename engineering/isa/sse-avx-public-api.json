@@ -6276,6 +6276,21 @@
       "arities": [
         0
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_zeroall",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        0
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -6340,6 +6355,23 @@
       "raw_builtins": [],
       "wrapper_dependencies": [
         "_mm_set1_ps"
+      ]
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm_broadcastsd_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_unpacklo_pd"
       ]
     },
     {
@@ -8468,23 +8500,6 @@
       "raw_builtins": [],
       "wrapper_dependencies": [
         "_mm256_castsi128_si256"
-      ]
-    },
-    {
-      "arities": [
-        1
-      ],
-      "canonical_override": false,
-      "definitions": 1,
-      "forms": [
-        "function"
-      ],
-      "generic_helpers": [],
-      "header": "avx2intrin.h",
-      "name": "_mm_broadcastsd_pd",
-      "raw_builtins": [],
-      "wrapper_dependencies": [
-        "_mm_unpacklo_pd"
       ]
     },
     {
@@ -16678,7 +16693,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 1011,
+  "declarations": 1012,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -18075,7 +18090,6 @@
     "_mm256_undefined_ph",
     "_mm256_xor_epi32",
     "_mm256_xor_epi64",
-    "_mm256_zeroall",
     "_mm256_zextph128_ph256",
     "_mm512_2intersect_epi32",
     "_mm512_2intersect_epi64",
@@ -21887,5 +21901,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 1011
+  "unique_names": 1012
 }
