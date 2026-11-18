@@ -141,6 +141,8 @@ pub struct FunctionInfo {
     /// definition a prototype (C11 6.7.6.3p14).
     pub prototype: Option<FunctionType>,
     pub is_defined: bool,
+    /// No written declaration has replaced this legacy implicit declaration.
+    is_implicit: bool,
     /// Whether the function is declared with __attribute__((noreturn)) or _Noreturn
     pub is_noreturn: bool,
     /// Whether the function's return type has a `const` base specifier (`const T *f()`).
@@ -698,6 +700,7 @@ impl SemanticAnalyzer {
             variadic: func.variadic,
             prototype,
             is_defined: true,
+            is_implicit: false,
             is_noreturn: func.attrs.is_noreturn(),
             return_base_const: self
                 .resolve_return_base_const(&func.return_type, func.return_base_const),
@@ -984,6 +987,7 @@ impl SemanticAnalyzer {
             variadic: func.variadic,
             prototype,
             is_defined: true,
+            is_implicit: false,
             is_noreturn: func.attrs.is_noreturn() || prior_noreturn,
             return_base_const: self
                 .resolve_return_base_const(&func.return_type, func.return_base_const)
@@ -1834,6 +1838,7 @@ impl SemanticAnalyzer {
                                         variadic: ft.variadic,
                                         prototype,
                                         is_defined: false,
+                                        is_implicit: false,
                                         is_noreturn,
                                         return_base_const: self.resolve_return_base_const(
                                             &decl.type_spec,
@@ -1897,15 +1902,17 @@ impl SemanticAnalyzer {
                     existing.is_noreturn |= is_noreturn;
                     existing.return_base_const |= return_base_const;
                     existing.return_pointer_const_levels |= return_levels;
+                    // Even an old-style declaration replaces an implicit
+                    // signature. Never replace a definition's body types.
+                    if !existing.is_defined && (existing.is_implicit || prototype.is_some()) {
+                        existing.calling_convention = ft.calling_convention;
+                        existing.return_type = ft.return_type.clone();
+                        existing.params = ft.params.clone();
+                        existing.variadic = ft.variadic;
+                    }
+                    existing.is_implicit = false;
                     if prototype.is_some() {
                         existing.prototype = prototype;
-                        // A later prototype refines an implicit declaration;
-                        // it must not overwrite a definition's body types.
-                        if !existing.is_defined {
-                            existing.return_type = ft.return_type.clone();
-                            existing.params = ft.params.clone();
-                            existing.variadic = ft.variadic;
-                        }
                     }
                 } else {
                     self.result.functions.insert(
@@ -1917,6 +1924,7 @@ impl SemanticAnalyzer {
                             variadic: ft.variadic,
                             prototype,
                             is_defined: false,
+                            is_implicit: false,
                             is_noreturn,
                             return_base_const,
                             return_pointer_const_levels: return_levels,
@@ -4203,51 +4211,13 @@ impl SemanticAnalyzer {
                                 *callee_span,
                             );
                         }
+                    } else if name.starts_with("__builtin_") {
+                        self.check_libc_builtin_arity(name, args.len(), *callee_span);
                     }
                     self.check_c2y_builtin_call(name, args, *callee_span);
                 }
-            } else if !self.result.functions.contains_key(name)
-                && self.symbol_table.lookup(name).is_none()
-            {
-                // Implicit function declaration (C89 style) - register it
-                self.diagnostics.borrow_mut().warning_with_kind(
-                    format!("implicit declaration of function '{}'", name),
-                    *callee_span,
-                    crate::common::error::WarningKind::ImplicitFunctionDeclaration,
-                );
-                // GCC also knows the argument count of a libc builtin it
-                // recognises, and reports a mismatch as an error in every
-                // dialect -- including the pre-C99 ones, where the implicit
-                // declaration above is only a suppressed-by-default warning.
-                // Ordered after that warning because it is the order GCC prints
-                // them in, and
-                // tests/regression/check_gcc162_diagnostic_severity.sh compares
-                // the *first* diagnostic line verbatim.
-                //
-                // Once per name, not once per call site as GCC does: the
-                // registration below makes every later call site take the
-                // ordinary declared-function path instead of this one.  The
-                // property that matters is unchanged -- a wrong-arity call to a
-                // known libc builtin is refused in every dialect, with GCC's
-                // wording at GCC's column -- and re-checking later sites would
-                // mean threading this name set through the argument checker
-                // that validates real prototypes, to change a diagnostic count
-                // and nothing else.
-                self.check_libc_builtin_arity(name, args.len(), *callee_span);
-                let func_info = FunctionInfo {
-                    calling_convention: Default::default(),
-                    return_type: CType::Int, // implicit return int
-                    params: Vec::new(),
-                    variadic: true, // unknown params
-                    prototype: None,
-                    is_defined: false,
-                    is_noreturn: false,
-                    return_base_const: false,
-                    return_pointer_const_levels: 0,
-                    param_typedefs: Vec::new(),
-                    return_typedef: None,
-                };
-                self.result.functions.insert(name.clone(), func_info);
+            } else if self.symbol_table.lookup(name).is_none() {
+                self.analyze_unbound_function_call(name, args.len(), *callee_span);
             }
         }
         // C11 6.2.1p4 settles a call's binding at the call, so that is
@@ -8171,70 +8141,60 @@ dereference it before applying '->' to it?"
         None
     }
 
-    /// GCC's argument-count check for an implicitly declared libc builtin.
-    ///
-    /// `memcpy(d, s)` in a translation unit that never included <string.h> is
-    /// not only an implicit declaration: GCC knows `memcpy` takes three
-    /// arguments and says so, in *every* dialect and as an `error:` -- including
-    /// `-std=gnu90`, where the implicit declaration itself is only a
-    /// suppressed-by-default warning.  Measured with gcc-16 (GCC) 16.2.0:
-    ///
-    /// ```text
-    /// $ gcc-16 -std=gnu90 -fsyntax-only t.c   // char d[4], s[4]; memcpy(d, s);
-    /// t.c:1:34: error: too few arguments to function 'memcpy'; expected 3, have 2
-    /// ```
-    ///
-    /// Without this check the pre-C99 dialects accepted the call, lowered it
-    /// through the libc-alias path with a garbage third argument, and the binary
-    /// segfaulted at run time (measured: exit 139).  From C99 on the implicit
-    /// declaration already refuses the translation unit, so the gap was exactly
-    /// the legacy dialects, where nothing stood between the programmer and a
-    /// crashing binary.
-    ///
-    /// Two properties here are GCC's rather than ours, and both live in
-    /// `libc_builtin_arity` because they were measured instead of authored:
-    ///
-    ///   * the wording distinguishes variadic from fixed arity (`expected at
-    ///     least 1` for `printf`, `expected 3` for `memcpy`), and GCC never
-    ///     reports too many arguments to a variadic builtin;
-    ///   * the coverage is not uniform.  GCC arity-checks `memcpy` and `free`
-    ///     but stays silent for `puts`, `putchar`, `abs`, `strcmp`, `strncmp`,
-    ///     `memcmp` and `dprintf` -- verified: `-std=gnu90` on a translation
-    ///     unit calling all seven with wrong argument counts exits 0 and prints
-    ///     nothing, while the same compiler reports seven arity errors on a
-    ///     `memcpy` probe.  Those names are absent from the table, so this stays
-    ///     silent for them too; a table derived from the C standard instead
-    ///     would have rejected correct programs.
-    ///
-    /// Diagnostics only.  Nothing here feeds lowering, so it cannot change
-    /// generated code: the implicit declaration registered by the caller stays
-    /// unprototyped, because inventing parameter and return *types* for 127 libc
-    /// names would risk far worse than it fixes -- a wrong return type silently
-    /// miscompiles every caller that uses the value, whereas a wrong count only
-    /// ever produces a diagnostic.
+    /// Keep the declaration diagnostic once per name, but check the arity
+    /// of every implicit call: a valid first call proves nothing about later
+    /// arguments. A visible declaration or object uses its own callable type.
+    fn analyze_unbound_function_call(&mut self, name: &str, argc: usize, span: Span) {
+        match self.result.functions.get(name) {
+            Some(info) if !info.is_implicit => return,
+            Some(_) => {}
+            None => {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!("implicit declaration of function '{}'", name),
+                    span,
+                    crate::common::error::WarningKind::ImplicitFunctionDeclaration,
+                );
+                self.result.functions.insert(
+                    name.to_owned(),
+                    FunctionInfo {
+                        calling_convention: Default::default(),
+                        return_type: CType::Int,
+                        params: Vec::new(),
+                        variadic: true,
+                        prototype: None,
+                        is_defined: false,
+                        is_implicit: true,
+                        is_noreturn: false,
+                        return_base_const: false,
+                        return_pointer_const_levels: 0,
+                        param_typedefs: Vec::new(),
+                        return_typedef: None,
+                    },
+                );
+            }
+        }
+        if self.builtin_policy.recognizes_unprefixed_builtin(name) {
+            self.check_libc_builtin_arity(name, argc, span);
+        }
+    }
+
     fn check_libc_builtin_arity(&self, name: &str, argc: usize, span: Span) {
         let Some(arity) = libc_builtin_arity::libc_builtin_arity(name) else {
             return;
         };
         let too_few = argc < arity.min_args;
-        // GCC never reports too many arguments to a variadic builtin, so
-        // `expected` below only has to spell out `at least` for the too-few case.
-        let too_many = !arity.variadic && argc > arity.min_args;
-        if !too_few && !too_many {
+        if !too_few && (arity.variadic || argc == arity.min_args) {
             return;
         }
-        let expected = if arity.variadic {
-            format!("at least {}", arity.min_args)
-        } else {
-            arity.min_args.to_string()
-        };
+        let expected = if arity.variadic { "at least " } else { "" };
         self.diagnostics.borrow_mut().error(
             format!(
-                "{} arguments to function '{}'; expected {}, have {}",
+                "{} arguments to function '{}'; expected {}{}, have {}",
                 if too_few { "too few" } else { "too many" },
                 name,
                 expected,
-                argc
+                arity.min_args,
+                argc,
             ),
             span,
         );

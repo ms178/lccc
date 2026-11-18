@@ -1427,6 +1427,12 @@ gate "intrinsic-arity-selftest" fast \
     python3 scripts/check_intrinsic_arity.py --self-test
 gate "intrinsic-arity" fast \
     python3 scripts/check_intrinsic_arity.py --check
+gate "libc-builtin-arity-selftest" fast \
+    python3 scripts/check_libc_builtin_arity.py --self-test
+gate "libc-builtin-arity" fast \
+    python3 scripts/check_libc_builtin_arity.py --gcc "${GCC16:-gcc-16}" --check
+gate "libc-builtin-calls" fast \
+    python3 tests/regression/check_libc_builtin_calls.py --gcc "${GCC16:-gcc-16}" --lccc "$LCCC"
 
 # Every pointer-form intrinsic must reach a lowering.  The x86/i686 emitters
 # decide WHETHER an op reaches an arm with the outer match pattern and WHICH
