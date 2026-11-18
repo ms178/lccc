@@ -8,7 +8,9 @@ grep -q 'LCCC_CI_SWAP_SIZE: 4G' "$root/.github/workflows/kernel-61863.yml"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/firmware" "$work/bin"
-for f in bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom; do : > "$work/firmware/$f"; done
+for f in bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom vgabios-stdvga.bin; do
+  printf '%s' "$f" > "$work/firmware/$f"
+done
 : > "$work/image"
 # Verdict isolation: no installed BusyBox, cpio or QEMU firmware is needed.
 # These stand-ins do not run an initramfs or claim to test its bytes.
@@ -34,12 +36,16 @@ set -euo pipefail
 log=
 while (($#)); do
   case $1 in
+    -L) firmware=$2; shift 2 ;;
     -serial) log=${2#file:}; shift 2 ;;
     -append) append=$2; shift 2 ;;
     *) shift ;;
   esac
 done
-[[ -n "$log" ]]
+[[ -n "$log" && -d "$firmware" ]]
+for rom in bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom vgabios-stdvga.bin; do
+  [[ $(cat "$firmware/$rom") == "$rom" ]]
+done
 expected='console=ttyS0,115200 nokaslr panic=-1 vga=normal'
 [[ ${EXPECT_INITCALL_TRACE:-0} == 0 ]] || expected+=' initcall_debug ignore_loglevel'
 [[ $append == "$expected" ]]
@@ -142,20 +148,28 @@ GEN_INIT_CPIO= FAKE_QEMU_CASE=pass \
 # Nothing from the machine's own /usr/share or /usr/lib may satisfy these tests.
 source "$root/scripts/qemu_firmware.sh"
 mkdir -p "$work/sysroot/usr/share/qemu" "$work/sysroot/usr/share/seabios" \
-  "$work/sysroot/usr/lib/ipxe/qemu" "$work/staged" "$work/missing-stage"
+  "$work/sysroot/usr/lib/ipxe/qemu" "$work/staged" "$work/missing-stage" "$work/missing-vga"
 for f in linuxboot_dma.bin kvmvapic.bin; do
   printf '%s' "$f" > "$work/sysroot/usr/share/qemu/$f"
 done
 printf bios > "$work/sysroot/usr/share/seabios/bios-256k.bin"
+printf vga > "$work/sysroot/usr/share/seabios/vgabios-stdvga.bin"
 printf ipxe > "$work/sysroot/usr/lib/ipxe/qemu/efi-e1000.rom"
 QEMU_DATA_DIR= lccc_qemu_stage_firmware "$work/staged" "$work/sysroot"
 [[ $(cat "$work/staged/efi-e1000.rom") == ipxe ]]
 [[ $(cat "$work/staged/bios-256k.bin") == bios ]]
+[[ $(cat "$work/staged/vgabios-stdvga.bin") == vga ]]
 rm "$work/sysroot/usr/lib/ipxe/qemu/efi-e1000.rom"
 if QEMU_DATA_DIR= lccc_qemu_stage_firmware "$work/missing-stage" "$work/sysroot" >"$work/missing-out" 2>&1; then
   echo 'FAIL: firmware staging accepted an absent iPXE ROM' >&2; exit 1
 fi
 grep -q 'missing QEMU firmware: efi-e1000.rom' "$work/missing-out"
+printf ipxe > "$work/sysroot/usr/lib/ipxe/qemu/efi-e1000.rom"
+rm "$work/sysroot/usr/share/seabios/vgabios-stdvga.bin"
+if QEMU_DATA_DIR= lccc_qemu_stage_firmware "$work/missing-vga" "$work/sysroot" >"$work/missing-out" 2>&1; then
+  echo 'FAIL: firmware staging accepted an absent VGA ROM' >&2; exit 1
+fi
+grep -q 'missing QEMU firmware: vgabios-stdvga.bin' "$work/missing-out"
 # Also pin the explicit provider in both install paths, even though the current
 # Debian dependency graph already installs it transitively. No guest boot is
 # claimed by these dependency and layout checks.

@@ -190,7 +190,7 @@ _firmware_ok() {
 #      registry loads) and that it offers the CPU model qemu_boot_test.sh
 #      passes; --version alone would not notice a broken loader path, since it
 #      exits before machine init;
-#   3. the four firmware files qemu_boot_test.sh requires are present.
+#   3. the five firmware files qemu_boot_test.sh requires are present.
 _version_ok() {
     local p=$1 banner line
     [ -x "$p/bin/qemu-system-x86_64" ] || return 1
@@ -223,7 +223,7 @@ if [[ $self_test == 1 ]]; then
              "$td/splitfw/bin" "$td/splitfw/share/qemu" "$td/splitfw/share/seabios"
     # A fake wrapper stands in for the real one: --version, -machine help and
     # -cpu help are the whole contract _version_ok checks. The firmware files
-    # are the four required names.
+    # are the five required names.
     _mk() {  # _mk <dir> <banner-version>
         cat > "$1/bin/qemu-system-x86_64" <<FAKE
 #!/bin/sh
@@ -254,13 +254,13 @@ case "\$1" in
 esac
 FAKE
     chmod +x "$td/noboot/bin/qemu-system-x86_64"
-    # Every case except `nofw` carries a self-contained union — all four
+    # Every case except `nofw` carries a self-contained union — all five
     # required files in share/qemu — which is the shape the prefix must present.
     for d in good oldver lookalike noboot splitfw; do
         for f in "${FIRMWARE[@]}"; do : > "$td/$d/share/qemu/$f"; done
     done
     # `splitfw` is the raw Debian split layout instead: complete ACROSS the two
-    # directories, but no single one holds all four. qemu_boot_test.sh would
+    # directories, but no single one holds all five. qemu_boot_test.sh would
     # paper over that by symlinking a throwaway union under $WORK;
     # kernel_isolate.sh would exit 1 with "no firmware union dir". The prefix
     # must not ship it, so the acceptance rule rejects it.
