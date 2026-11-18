@@ -70,16 +70,22 @@ jobs:
           key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
           restore-keys: |
             lccc-apt-debs-v1-${{ runner.os }}-
-      # Same key as ci.yml: one bundle serves every lane, so whichever lane
-      # misses first pays the apt transaction and the rest restore it.  The
+      # Same key as ci.yml (explained on its `build` job): one bundle per runner
+      # image serves every lane, so whichever lane misses first pays the apt
+      # transaction and the rest restore it.  The
       # historical `--base` mode is gone because a 64-bit-only bundle cannot
       # satisfy the shared `verify` contract (gcc-16 -m32) and would therefore
       # be rejected -- and re-installed -- by every other lane.
+      - name: Identify the toolchain bundle for this runner image
+        id: toolchain-key
+        run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
       - name: Cache the provisioned oracle toolchain
         uses: actions/cache@v6
         with:
           path: ~/.cache/lccc-toolchain
-          key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+          key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+          restore-keys: |
+            lccc-toolchain-v2-
       - name: Provision oracle toolchain (cached bundle, else apt)
         env:
           LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
