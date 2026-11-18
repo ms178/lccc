@@ -47,6 +47,10 @@ static inline void pqdownheap(const unsigned char *depth, int *heap, int heap_le
     heap[k] = v;
 }
 
+/* At least two nonzero leaves, with their sum <= UINT16_MAX. After each
+ * merge, remaining weights are no smaller than either child. The weights
+ * along a path thus grow at least as 1, 2, 3, 5, ...; a uint16_t total bounds
+ * the depth to 22, well within the byte used by the upstream tie rule. */
 __attribute__((noinline))
 static int huffman_merge(node_t *tree)
 {
@@ -101,6 +105,8 @@ static uint32_t reference_cost(uint32_t *weights, int len)
 
 static int check_tree(const node_t *tree, int root, const node_t *histogram)
 {
+    if (root < SYMBOLS || root > 2 * SYMBOLS - 2)
+        return 0;
     uint32_t weights[SYMBOLS];
     uint32_t child_sum[HEAP_SIZE] = {0};
     unsigned char have_children[HEAP_SIZE] = {0};
@@ -156,12 +162,14 @@ static int check_ties(void)
     return heap[1] == 0 && heap[2] == 1 && heap[3] == 2;
 }
 
-static void init_histograms(void)
+static int init_histograms(void)
 {
     const int span[CASES] = {2, 3, 19, 30, 64, 96, 160, 249,
                              286, 286, 286, 286, 286, 286, 286, 286};
     uint32_t rng = 0xb5d693e1u;
     for (int c = 0; c < CASES; ++c) {
+        unsigned active = 0;
+        uint32_t total = 0;
         for (int n = 0; n < span[c]; ++n) {
             rng ^= rng << 13;
             rng ^= rng >> 17;
@@ -175,14 +183,23 @@ static void init_histograms(void)
             }
             /* Rotate symbol placement between cases without changing weights. */
             histograms[c][(n + 23 * c) % SYMBOLS].freq = (uint16_t)freq;
+            active += freq != 0;
+            total += freq;
+        }
+        /* Validate once per histogram, not once per pass. */
+        if (active < 2 || total > UINT16_MAX) {
+            fprintf(stderr, "invalid Huffman histogram %d\n", c);
+            return 0;
         }
     }
+    return 1;
 }
 
 int main(void)
 {
     node_t tree[HEAP_SIZE];
-    init_histograms();
+    if (!init_histograms())
+        return 1;
     if (!check_ties()) {
         fputs("Huffman heap tie-break mismatch\n", stderr);
         return 1;

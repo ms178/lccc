@@ -700,6 +700,9 @@ gate "benchmark-hybrid-perf-contracts" fast \
     python3 scripts/test_benchmark_hybrid_perf.py
 gate "zlib-compare256-correctness" fast \
     python3 tests/regression/check_zlib_compare256.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
+gate "zlib-huffman-heap-correctness" fast \
+    python3 tests/regression/check_zlib_huffman_heap.py --lccc "$LCCC" \
+        --gcc "${GCC16:-gcc-16}" --clang "${CLANG:-clang-23}"
 
 gate "label-reference-cost-contracts" fast \
     python3 scripts/test_measure_label_ref_cost.py

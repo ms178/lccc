@@ -3891,6 +3891,12 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: Huffman heap boundaries and checksum against GCC, Clang and ICX
+      run: |
+        set -euo pipefail
+        python3 tests/regression/check_zlib_huffman_heap.py \
+          --lccc target/fastbuild/lccc --gcc "$GCC16" --clang "$CLANG" \
+          --icx "$LCCC_ICX_BIN" 2>&1 | tee intel-evidence/huffman-heap.log
     - name: Pragma pack underflow layout and diagnostic contracts
       run: |
         set -euo pipefail
