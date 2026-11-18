@@ -17,6 +17,23 @@ from urllib.parse import quote
 
 PART_BYTES = 8 * 1024 * 1024
 MAX_API_ATTEMPTS = 4
+# Job conclusions whose logs are evidence. A job that exhausts
+# `timeout-minutes` is reported as `cancelled`, not `failure`: on PR #1196 the
+# AVX-512VL lane spent 1756 s of its 30-minute budget in one provisioning
+# step, and an export keyed on `failure` carried only the six-second aggregate
+# job that depends on it -- everything except the log that explained the red.
+EVIDENCE_JOB_CONCLUSIONS = ('failure', 'cancelled', 'timed_out')
+# "There is no log": never produced (the job was cancelled while still
+# queued) or no longer retained.
+NO_LOG_STATUSES = (404, 410)
+
+
+class ApiError(RuntimeError):
+    """A failed GitHub API request, with the HTTP status when gh reported one."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 def parse_run_ids(text):
@@ -85,7 +102,26 @@ def gh(path, payload=None, *, allow_binary=False):
                 if token:
                     detail = detail.replace(token, '<token redacted>')
             reason = 'timed out' if timed_out else f'failed ({error.returncode})'
-            raise RuntimeError(f'GitHub API request {reason}: {detail[:1500]}') from error
+            status = re.search(r'HTTP (\d{3})\b', detail)
+            raise ApiError(f'GitHub API request {reason}: {detail[:1500]}',
+                           int(status.group(1)) if status else None) from error
+
+
+def job_log(repo, job):
+    """The raw log of a terminal non-green job, or None when it has none.
+
+    A job cancelled before a runner picked it up never ran a step, and the log
+    endpoint answers 404 for it. That is absence of evidence, not a transport
+    failure, so the export continues -- but only for a job that did not fail.
+    A FAILED job always has a log; the same answer there is a real error, and
+    so is every other status (403, 5xx) for any job.
+    """
+    try:
+        return gh(f'repos/{repo}/actions/jobs/{int(job["id"])}/logs', allow_binary=True)
+    except ApiError as error:
+        if job['conclusion'] == 'failure' or error.status not in NO_LOG_STATUSES:
+            raise
+        return None
 
 
 
@@ -137,11 +173,16 @@ def main():
                 page += 1
         manifest = [f'run {run_id} {run["head_sha"]} {run["conclusion"]}']
         for job in pages('jobs', 'jobs'):
-            if job['conclusion'] != 'failure':
+            if job['conclusion'] not in EVIDENCE_JOB_CONCLUSIONS:
                 continue
-            data = gh(f'repos/{repo}/actions/jobs/{int(job["id"])}/logs', allow_binary=True)
-            manifest += export_file(repo, f'run{run_id}-job{job["id"]}.log.gz',
-                                    gzip.compress(data, mtime=0))
+            name = f'run{run_id}-job{int(job["id"])}.log.gz'
+            data = job_log(repo, job)
+            if data is None:
+                # Named in the manifest so a reader can tell "this job had no
+                # log" from "the export never looked at this job".
+                manifest.append(f'nolog {name} {job["conclusion"]}')
+                continue
+            manifest += export_file(repo, name, gzip.compress(data, mtime=0))
         for artifact in pages('artifacts', 'artifacts'):
             if not retained_artifact(artifact):
                 continue

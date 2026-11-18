@@ -1,6 +1,8 @@
 """Diagnostic transport never changes validation outcomes or repository refs."""
+import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -69,6 +71,69 @@ class DiagnosticSelection(unittest.TestCase):
                             status=status, repository=dict(full_name=repository))).encode()):
                         with self.assertRaisesRegex(ValueError, 'completed runs of this repository'):
                             export.main()
+
+    def export_run(self, jobs, logs):
+        """Run the exporter over one fake run; return (exported names, notices)."""
+        def api(path, payload=None, *, allow_binary=False):
+            if path.endswith('/logs'):
+                answer = logs[int(path.split('/')[-2])]
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            if '/jobs?' in path:
+                return json.dumps(dict(jobs=jobs)).encode()
+            if '/artifacts?' in path:
+                return json.dumps(dict(artifacts=[])).encode()
+            return json.dumps(dict(repository=dict(full_name='ms178/lccc'), status='completed',
+                                   head_sha='abc', conclusion='cancelled')).encode()
+        output = io.StringIO()
+        with mock.patch.dict(export.os.environ, dict(
+                GITHUB_REPOSITORY='ms178/lccc', SOURCE_RUN_IDS='42')), \
+                mock.patch.object(export, 'gh', api), \
+                mock.patch.object(export, 'export_file',
+                                  side_effect=lambda repo, name, data: [f'file {name}']) as sent, \
+                mock.patch('sys.stdout', output):
+            export.main()
+        notices = output.getvalue().replace('%0A', '\n')
+        return [call.args[1] for call in sent.call_args_list], notices
+
+    def test_timed_out_job_is_exported_although_github_reports_it_cancelled(self):
+        """PR #1196: the lane that hit `timeout-minutes` was `cancelled`, and
+        only the aggregate job that depends on it was `failure`."""
+        jobs = [dict(id=7, conclusion='cancelled'), dict(id=8, conclusion='failure'),
+                dict(id=9, conclusion='success'), dict(id=10, conclusion='skipped'),
+                dict(id=11, conclusion='timed_out'), dict(id=12, conclusion=None)]
+        names, notices = self.export_run(jobs, {7: b'timeout', 8: b'aggregate', 11: b'late'})
+        self.assertEqual(names, ['run42-job7.log.gz', 'run42-job8.log.gz', 'run42-job11.log.gz'])
+        self.assertNotIn('nolog', notices)
+
+    def test_cancelled_job_without_a_log_is_named_and_does_not_stop_the_export(self):
+        """A job a newer push cancelled while it was queued never ran a step."""
+        for status in export.NO_LOG_STATUSES:
+            with self.subTest(status=status):
+                jobs = [dict(id=7, conclusion='cancelled'), dict(id=8, conclusion='failure')]
+                names, notices = self.export_run(
+                    jobs, {7: export.ApiError('gh: Not Found', status), 8: b'real failure'})
+                self.assertEqual(names, ['run42-job8.log.gz'])
+                self.assertIn('nolog run42-job7.log.gz cancelled', notices.splitlines())
+
+    def test_missing_log_is_still_an_error_for_a_failed_job_or_any_other_status(self):
+        for conclusion, status in [('failure', 404), ('failure', 410), ('cancelled', 403),
+                                   ('cancelled', 500), ('timed_out', None)]:
+            with self.subTest(conclusion=conclusion, status=status):
+                with self.assertRaises(export.ApiError):
+                    self.export_run([dict(id=7, conclusion=conclusion)],
+                                    {7: export.ApiError('gh: refused', status)})
+
+    def test_api_error_carries_the_http_status_gh_reported(self):
+        for detail, status in [(b'gh: Not Found (HTTP 404)', 404), (b'HTTP 403: denied', 403),
+                               (b'connection reset', None)]:
+            error = subprocess.CalledProcessError(1, ['gh'], stderr=detail)
+            with self.subTest(detail=detail), \
+                    mock.patch.object(export.subprocess, 'run', side_effect=error):
+                with self.assertRaises(export.ApiError) as caught:
+                    export.gh('repos/ms178/lccc/actions/jobs/7/logs')
+                self.assertEqual(caught.exception.status, status)
 
     def test_label_workflow_is_separate_and_does_not_replace_kernel_check(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ci-diagnostics.yml').read_text())
