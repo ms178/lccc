@@ -975,6 +975,32 @@ fn relay_plan(
 mod tests {
     use super::*;
 
+    /// `find_lbb` must have the exact semantics of `s.find(".LBB")`,
+    /// including dots that don't open a label, trailing partial matches,
+    /// and a match at the very end of the line.
+    #[test]
+    fn find_lbb_is_find() {
+        let cases = [
+            "",
+            ".",
+            ".L",
+            ".LB",
+            ".LBB",
+            "jmp .LBB0_3",
+            "jne .Ltmp4",
+            "leaq .Lconst(%rip), %rax # .LBB1_2",
+            "movsd .LCPI0_0(%rip), %xmm0",
+            "..LBB",
+            ".X.LBB2_7",
+            "no label here",
+            "ends with .LB",
+            "text .LBB",
+        ];
+        for s in cases {
+            assert_eq!(find_lbb(s), s.find(".LBB"), "on {s:?}");
+        }
+    }
+
     fn apply(body: &str, pin: Option<&str>) -> (bool, String) {
         let mut store = LineStore::new(format!("f:\n.cfi_startproc\n{body}\n.cfi_endproc\n"));
         let mut infos: Vec<_> = (0..store.len())

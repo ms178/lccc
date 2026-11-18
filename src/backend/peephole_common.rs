@@ -289,6 +289,64 @@ pub(crate) fn find_pfx(t: &str, set: &'static [Pfx]) -> Option<&'static str> {
     set.iter().find(|p| p.matches(f8)).map(|p| p.text)
 }
 
+#[cfg(test)]
+mod pfx_oracle_tests {
+    use super::{Pfx, find_pfx, first8};
+
+    /// `Pfx::matches(first8(t))` must agree with `t.starts_with(p)` for
+    /// every prefix length 1..=8 against lines shorter, equal, and longer
+    /// than the prefix — including the zero-padding edge where `t` is
+    /// shorter than eight bytes.
+    #[test]
+    fn matches_is_starts_with() {
+        const PREFIXES: &[Pfx] = &[
+            Pfx::new("j"),
+            Pfx::new("cmp"),
+            Pfx::new("test"),
+            Pfx::new("movdqu "),
+            Pfx::new("vmovdqa "),
+        ];
+        let lines = [
+            "",
+            "j",
+            "jmp .L1",
+            "cmp",
+            "cmpl $1, %eax",
+            "cmovne %eax, %ebx",
+            "test",
+            "testb $1, (%rax)",
+            "testament",
+            "movdqu",
+            "movdqu %xmm0, (%rdi)",
+            "movdqa %xmm0, %xmm1",
+            "vmovdqa %ymm0, %ymm1",
+            "vmovdqa ",
+            "vmovdq",
+            "xchg %rax, %rbx",
+        ];
+        for t in lines {
+            let f8 = first8(t);
+            for p in PREFIXES {
+                assert_eq!(
+                    p.matches(f8),
+                    t.starts_with(p.text()),
+                    "Pfx({:?}) vs starts_with on {t:?}",
+                    p.text()
+                );
+            }
+            // find_pfx keeps table order: first starts_with winner.
+            assert_eq!(
+                find_pfx(t, PREFIXES),
+                PREFIXES
+                    .iter()
+                    .find(|p| t.starts_with(p.text()))
+                    .map(|p| p.text()),
+                "find_pfx order on {t:?}"
+            );
+        }
+    }
+}
+
 // ── Source-operand rewrite ───────────────────────────────────────────────────
 
 /// Byte index of the first operand after the mnemonic, or `None`.
