@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Dual-layout metric pairs: scheduling contract and reproducible output.
 
-Three properties are checked for **every backend** (x86-64, i686, AArch64,
-RISC-V), because all four run a text peephole over both exploration
-candidates:
+Scheduling, accounting and reproducibility are checked on **every backend**
+(x86-64, i686, AArch64, RISC-V). The x86-64 debug dumps have a separate check:
 
 1. *Scheduling* — `LCCC_PEEPHOLE_PAIR_PARALLEL=0`, unset (heuristic) and `=1`
    must emit byte-identical assembly. The split is latency-only, so no
@@ -138,19 +137,28 @@ def check_accounting(label, source_name, opt, modes, counters, failures):
         )
 
 
-def check_debug_dump(compiler, workdir, expected_sha, failures):
-    dump = workdir / "peephole.raw.s"
-    digest, modes, _ = compile_asm(compiler, ROOT / WIDE, "1", workdir, "dump", dump=dump)
-    paths = [dump, workdir / "peephole.raw-chain.s", workdir / "peephole.raw-orig.s"]
-    if not any(mode in ("parallel", "serial") for mode in modes):
-        failures.append("CCC_DUMP_ASM: fixture did not run two distinct candidates")
-    missing = [p.name for p in paths if not p.is_file() or not p.stat().st_size]
-    if missing:
-        failures.append(f"CCC_DUMP_ASM: missing or empty dumps: {missing}")
-    elif len({p.read_bytes() for p in paths}) != len(paths):
-        failures.append("CCC_DUMP_ASM: expected three distinct dumps (TU, chain, original)")
-    if digest != expected_sha:
-        failures.append("CCC_DUMP_ASM: instrumentation changed final assembly")
+def check_debug_dump(compiler, workdir, expected_sha, threads, failures):
+    dumps = []
+    for knob, mode in (("0", "serial"), ("1", "parallel" if threads > 1 else "serial")):
+        folder = workdir / f"dump-{knob}"
+        folder.mkdir()
+        dump = folder / "peephole.raw.s"
+        digest, modes, _ = compile_asm(compiler, ROOT / WIDE, knob, folder, "dump", dump=dump)
+        paths = [dump, folder / "peephole.raw-chain.s", folder / "peephole.raw-orig.s"]
+        if mode not in modes:
+            failures.append(f"CCC_DUMP_ASM ({knob}): fixture did not run a {mode} pair")
+        missing = [p.name for p in paths if not p.is_file() or not p.stat().st_size]
+        if missing:
+            failures.append(f"CCC_DUMP_ASM ({knob}): missing or empty dumps: {missing}")
+        else:
+            rows = tuple(p.read_bytes() for p in paths)
+            if len(set(rows)) != len(paths):
+                failures.append(f"CCC_DUMP_ASM ({knob}): expected distinct TU/chain/original dumps")
+            dumps.append(rows)
+        if digest != expected_sha:
+            failures.append(f"CCC_DUMP_ASM ({knob}): instrumentation changed final assembly")
+    if len(dumps) == 2 and dumps[0] != dumps[1]:
+        failures.append("CCC_DUMP_ASM: serial and forced dumps differ at the same candidate path")
 
 
 def main():
@@ -228,7 +236,7 @@ def main():
                         "counters_auto": counters["auto"],
                     }
             if label == "x86-64" and f"{WIDE} -O1" in rows:
-                check_debug_dump(binary, workdir, rows[f"{WIDE} -O1"]["assembly_sha256"], failures)
+                check_debug_dump(binary, workdir, rows[f"{WIDE} -O1"]["assembly_sha256"], threads, failures)
             if arch_pairs == 0:
                 failures.append(f"{label}: no dual-layout pair measured; the contract is void")
             total_pairs += arch_pairs
