@@ -96,7 +96,6 @@
 set -euo pipefail
 
 QEMU_VERSION=11.1.3
-DEB_VERSION=11.1.3+ds-1
 
 # package<TAB>version<TAB>pool path<TAB>bytes<TAB>sha256<TAB>sha1
 PINS=$(cat <<'TABLE'
@@ -111,7 +110,7 @@ libslirp0	4.9.5-1	pool/main/libs/libslirp/libslirp0_4.9.5-1_amd64.deb	71872	3fad
 TABLE
 )
 
-# The four files a QEMU firmware directory must hold for these harnesses.
+# Files a QEMU firmware directory must hold for these harnesses.
 # vgabios-stdvga.bin belongs to the contract because `-machine pc` defaults to
 # `-vga std` and resolves that ROM from the -L directory the harnesses pass,
 # which replaces the compiled-in data dir. See scripts/qemu_firmware.sh.
@@ -138,13 +137,15 @@ for arg in "$@"; do
 done
 prefix=${prefix:-${LCCC_QEMU_SYSTEM_PREFIX:-$HOME/.cache/lccc/qemu-system-$QEMU_VERSION}}
 dl_dir=${QEMU_DL_DIR:-$HOME/.cache/dl}
-bindir=$prefix/bin
-wrapper=$bindir/qemu-system-x86_64
+if ((print_bin && print_env)); then
+    echo 'ensure_qemu_system: choose either --print-bin or --print-env' >&2
+    exit 2
+fi
 
 _sha256_is() {  # _sha256_is <file> <expected-hex>: whole-digest equality
     local got
-    got=$(sha256sum "$1" 2>/dev/null | awk '{print $1}') || return 1
-    [[ $got == "$2" ]]
+    got=$(sha256sum 2>/dev/null < "$1") || return 1
+    [[ ${got%% *} == "$2" ]]
 }
 
 # _loader <prefix>: the prefix's own ld.so, or empty when there is none.
@@ -191,15 +192,20 @@ _firmware_ok() {
 #      exits before machine init;
 #   3. the four firmware files qemu_boot_test.sh requires are present.
 _version_ok() {
-    local p=$1 line
+    local p=$1 banner line
     [ -x "$p/bin/qemu-system-x86_64" ] || return 1
-    line=$("$p/bin/qemu-system-x86_64" --version 2>/dev/null | head -n 1) || return 1
+    banner=$(timeout 120 "$p/bin/qemu-system-x86_64" --version 2>/dev/null) || return 1
+    line=${banner%%$'\n'*}
     case $line in
         *" version $QEMU_VERSION "*|*" version $QEMU_VERSION") ;;
         *) return 1 ;;
     esac
-    timeout 120 "$p/bin/qemu-system-x86_64" -machine help 2>/dev/null | grep -qE '^[[:space:]]*pc' || return 1
-    timeout 120 "$p/bin/qemu-system-x86_64" -cpu help 2>/dev/null | grep -qw 'qemu64' || return 1
+    # Consume all output: grep -q can SIGPIPE QEMU under pipefail, making
+    # a valid installation appear broken when the help exceeds a pipe buffer.
+    timeout 120 "$p/bin/qemu-system-x86_64" -machine help 2>/dev/null \
+        | grep -E '^[[:space:]]*pc([[:space:]]|$)' >/dev/null || return 1
+    timeout 120 "$p/bin/qemu-system-x86_64" -cpu help 2>/dev/null \
+        | grep -w 'qemu64' >/dev/null || return 1
     _firmware_ok "$p"
 }
 
@@ -271,57 +277,86 @@ FAKE
     exit 0
 fi
 
-for tool in curl sha256sum timeout; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "ensure_qemu_system: $tool is required" >&2; exit 2; }
-done
-command -v dpkg-deb >/dev/null 2>&1 || {
-    echo "ensure_qemu_system: dpkg-deb is required to unpack the .deb files" >&2; exit 2; }
-
-if _version_ok "$prefix"; then
-    if [[ $print_bin == 1 ]]; then printf '%s\n' "$wrapper"; exit 0; fi
-    if [[ $print_env == 1 ]]; then
-        printf 'export QEMU=%s\n' "$wrapper"
-        printf 'export QEMU_DATA_DIR=%s\n' "$prefix/share/qemu"
-        printf 'export QEMU_ROM_DIR=%s\n' "$prefix/share/qemu"
-        printf 'export QEMU_BIOS_DIR=%s\n' "$prefix/share/seabios"
-        exit 0
+# Publish shell-quoted assignments and nothing else on stdout in either
+# machine-readable mode, including on a cold install.
+report() {
+    if ((print_bin)); then
+        printf '%s\n' "$wrapper"
+    elif ((print_env)); then
+        printf 'export QEMU=%q\n' "$wrapper"
+        printf 'export QEMU_DATA_DIR=%q\n' "$prefix/share/qemu"
+        printf 'export QEMU_ROM_DIR=%q\n' "$prefix/share/qemu"
+        printf 'export QEMU_BIOS_DIR=%q\n' "$prefix/share/seabios"
+    else
+        printf 'ensure_qemu_system: qemu-system-x86_64 %s at %s\n  QEMU=%s\n' \
+            "$QEMU_VERSION" "$prefix" "$wrapper"
     fi
-    echo "ensure_qemu_system: $prefix already holds qemu-system-x86_64 $QEMU_VERSION"
-    echo "  QEMU=$wrapper"
+}
+
+# Resolve the parent, not the final path component. Refuse symlink prefixes
+# and never delete or replace a nonempty directory on a failed version check.
+leaf=$(basename -- "$prefix")
+case $leaf in
+    /|.|..) echo "ensure_qemu_system: expected a dedicated install directory: $prefix" >&2; exit 2 ;;
+esac
+parent=$(realpath -m -- "$(dirname -- "$prefix")")
+prefix=${parent%/}/$leaf
+wrapper=$prefix/bin/qemu-system-x86_64
+if [[ -L $prefix || (-e $prefix && ! -d $prefix) ]]; then
+    echo "ensure_qemu_system: not a regular install directory: $prefix" >&2
+    exit 2
+fi
+if _version_ok "$prefix"; then
+    report
     exit 0
 fi
+if [[ -d $prefix ]]; then
+    entry=$(find "$prefix" -mindepth 1 -maxdepth 1 -print -quit)
+    if [[ -n $entry ]]; then
+        echo "ensure_qemu_system: refusing to replace nonempty prefix $prefix; choose a fresh directory" >&2
+        exit 2
+    fi
+fi
 
-mkdir -p "$dl_dir"
-staging=$(mktemp -d "${TMPDIR:-/tmp}/lccc-qemu-system.XXXXXX")
-trap 'rm -rf "$staging"' EXIT
-mkdir -p "$staging/root"
+for tool in curl sha256sum timeout dpkg-deb; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "ensure_qemu_system: $tool is required" >&2; exit 2; }
+done
+mkdir -p -- "$dl_dir" "$parent"
+# Keep staging beside its destination so the final publication is a rename,
+# not an observable cross-filesystem copy. Concurrent installers cannot
+# replace the nonempty directory published by the winner.
+staging=$(mktemp -d -- "$parent/.qemu-system.XXXXXX")
+downloads=
+trap 'rm -rf -- "$staging"; if [[ -n $downloads ]]; then rm -rf -- "$downloads"; fi' EXIT
+downloads=$(mktemp -d -- "$dl_dir/.qemu-system.XXXXXX")
+mkdir -p "$staging/prefix"
 
 # ---- fetch and verify every pinned .deb ------------------------------------
 while IFS=$'\t' read -r pkg ver pool size sha256 sha1; do
     [[ -z $pkg ]] && continue
-    deb=$dl_dir/$(basename "$pool")
+    deb=$dl_dir/${pool##*/}
+    part=$downloads/${pool##*/}
     if [[ -f $deb ]] && _sha256_is "$deb" "$sha256"; then
-        echo "ensure_qemu_system: cached  $pkg $ver"
+        echo "ensure_qemu_system: cached  $pkg $ver" >&2
     else
-        echo "ensure_qemu_system: fetching $pkg $ver ($(numfmt --to=iec "${size:-0}" 2>/dev/null || echo "$size") bytes)"
+        echo "ensure_qemu_system: fetching $pkg $ver ($size bytes)" >&2
         ok=0
         for url in "https://deb.debian.org/debian/$pool" "https://snapshot.debian.org/file/$sha1"; do
-            if curl -fsSL --retry 3 --retry-delay 2 -o "$deb.part" "$url" 2>/dev/null; then
-                if _sha256_is "$deb.part" "$sha256"; then
-                    mv "$deb.part" "$deb"; ok=1; break
+            if curl -fsSL --retry 3 --retry-delay 2 -o "$part" "$url" 2>/dev/null; then
+                if _sha256_is "$part" "$sha256"; then
+                    mv -fT -- "$part" "$deb"; ok=1; break
                 fi
                 echo "  digest MISMATCH from $url — trying the next source" >&2
-                rm -f "$deb.part"
+                rm -f -- "$part"
             fi
         done
         [[ $ok == 1 ]] || { echo "ensure_qemu_system: cannot fetch a verified $pkg $ver" >&2; exit 1; }
     fi
-    dpkg-deb -x "$deb" "$staging/root"
+    dpkg-deb -x "$deb" "$staging/prefix"
 done <<< "$PINS"
 
 # ---- assemble the prefix ----------------------------------------------------
 mkdir -p "$staging/prefix/bin" "$staging/prefix/share"
-cp -a "$staging/root/." "$staging/prefix/"
 ln -sfn ../usr/share/seabios "$staging/prefix/share/seabios"
 
 # share/qemu is a REAL directory holding a symlink union of both dpkg firmware
@@ -335,12 +370,12 @@ ln -sfn ../usr/share/seabios "$staging/prefix/share/seabios"
 mkdir -p "$staging/prefix/share/qemu"
 for f in "$staging/prefix/usr/share/qemu"/*; do
     [[ -e $f ]] || continue
-    ln -sfn "../../usr/share/qemu/$(basename "$f")" \
-        "$staging/prefix/share/qemu/$(basename "$f")"
+    ln -sfn "../../usr/share/qemu/${f##*/}" \
+        "$staging/prefix/share/qemu/${f##*/}"
 done
 for f in "$staging/prefix/usr/share/seabios"/*; do
     [[ -e $f ]] || continue
-    b=$(basename "$f")
+    b=${f##*/}
     [[ -e $staging/prefix/share/qemu/$b ]] && continue
     ln -sfn "../../usr/share/seabios/$b" "$staging/prefix/share/qemu/$b"
 done
@@ -380,28 +415,14 @@ _version_ok "$staging/prefix" || {
     exit 1
 }
 
-mkdir -p "$(dirname "$prefix")"
-rm -rf "$prefix"
-mv "$staging/prefix" "$prefix"
-trap - EXIT
-rm -rf "$staging"
-
-# Re-check in the FINAL location: the acceptance rules must hold for the
-# artifact as installed, not only for the staging copy it was assembled from.
-_version_ok "$prefix" || {
-    echo "ensure_qemu_system: the installed prefix at $prefix is not usable" >&2
-    rm -rf "$prefix"
-    exit 1
-}
-
-if [[ $print_bin == 1 ]]; then printf '%s\n' "$wrapper"; exit 0; fi
-if [[ $print_env == 1 ]]; then
-    printf 'export QEMU=%s\n' "$wrapper"
-    printf 'export QEMU_DATA_DIR=%s\n' "$prefix/share/qemu"
-    printf 'export QEMU_ROM_DIR=%s\n' "$prefix/share/qemu"
-    printf 'export QEMU_BIOS_DIR=%s\n' "$prefix/share/seabios"
-    exit 0
+if ! mv -T -- "$staging/prefix" "$prefix"; then
+    # A concurrent installer may already have published the same version.
+    if [[ -L $prefix ]] || ! _version_ok "$prefix"; then
+        echo "ensure_qemu_system: could not publish a usable prefix at $prefix" >&2
+        exit 1
+    fi
 fi
-echo "ensure_qemu_system: installed qemu-system-x86_64 $QEMU_VERSION at $prefix"
-echo "  QEMU=$wrapper"
-echo "  firmware: $prefix/share/qemu (+ $prefix/share/seabios)"
+_version_ok "$prefix" || {
+    echo "ensure_qemu_system: the installed prefix at $prefix is not usable" >&2; exit 1;
+}
+report
