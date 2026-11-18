@@ -130,20 +130,41 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
     if info.pinned {
         return ALL_GPR;
     }
-    let mnemonic = t.split_whitespace().next().unwrap_or("");
+    // First token by ASCII-whitespace byte scan: `t` is store-trimmed
+    // text, so the token starts at byte 0 (the old `split_whitespace`
+    // sliced `t[mnemonic.len()..]`, which already assumed exactly that).
+    let ws = t
+        .as_bytes()
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .unwrap_or(t.len());
+    let mnemonic = &t[..ws];
     let rest = t[mnemonic.len()..].trim_ascii();
 
-    // Flag-only / no-write instructions.
-    if mnemonic.starts_with("cmp")
-        && !mnemonic.starts_with("cmpxchg")
+    // Flag-only / no-write instructions.  One packed load serves every
+    // prefix probe (exact `starts_with` semantics, see `Pfx`): 922K calls
+    // per mixed TU made this ladder's memcmp traffic measurable.
+    use crate::backend::peephole_common::{Pfx, first8};
+    let m8 = first8(mnemonic);
+    const CMP: Pfx = Pfx::new("cmp");
+    const CMPXCHG: Pfx = Pfx::new("cmpxchg");
+    const TEST: Pfx = Pfx::new("test");
+    const UCOMIS: Pfx = Pfx::new("ucomis");
+    const COMIS: Pfx = Pfx::new("comis");
+    const VUCOMIS: Pfx = Pfx::new("vucomis");
+    const VCOMIS: Pfx = Pfx::new("vcomis");
+    const PREFETCH: Pfx = Pfx::new("prefetch");
+    const NOP: Pfx = Pfx::new("nop");
+    if CMP.matches(m8)
+        && !CMPXCHG.matches(m8)
         && !matches!(mnemonic, "cmpsb" | "cmpsw" | "cmpsl" | "cmpsq")
-        || mnemonic.starts_with("test")
-        || mnemonic.starts_with("ucomis")
-        || mnemonic.starts_with("comis")
-        || mnemonic.starts_with("vucomis")
-        || mnemonic.starts_with("vcomis")
-        || mnemonic.starts_with("prefetch")
-        || mnemonic.starts_with("nop")
+        || TEST.matches(m8)
+        || UCOMIS.matches(m8)
+        || COMIS.matches(m8)
+        || VUCOMIS.matches(m8)
+        || VCOMIS.matches(m8)
+        || PREFETCH.matches(m8)
+        || NOP.matches(m8)
         || mnemonic.ends_with("fence")
         || matches!(
             mnemonic,
@@ -180,12 +201,17 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
     // accumulator AND a conditionally-written explicit destination, so the
     // implicit write set alone would under-approximate. (With the central
     // union, `info.reg_refs` here already includes the implicit bits too.)
-    if mnemonic.starts_with("xchg")
-        || mnemonic.starts_with("cmpxchg")
-        || mnemonic.starts_with("xadd")
-        || mnemonic.starts_with("lock")
-        || mnemonic.starts_with("mulx")
-        || mnemonic.starts_with("rep")
+    const XCHG: Pfx = Pfx::new("xchg");
+    const XADD: Pfx = Pfx::new("xadd");
+    const LOCK: Pfx = Pfx::new("lock");
+    const MULX: Pfx = Pfx::new("mulx");
+    const REP: Pfx = Pfx::new("rep");
+    if XCHG.matches(m8)
+        || CMPXCHG.matches(m8)
+        || XADD.matches(m8)
+        || LOCK.matches(m8)
+        || MULX.matches(m8)
+        || REP.matches(m8)
     {
         return info.reg_refs | RAX | RDX | RCX | ALL_STRING_REGS;
     }
