@@ -387,8 +387,12 @@ substitute.
 - **Compiler-work reports.** Independent controls falsified both cross-arm
   and cross-round output equality. A failed source/tool/geometry preflight
   also used to leave a previous successful `summary.json` visible. Publish
-  the new incomplete receipt under the existing lock before preflight; keep
-  the byte comparisons and record stdout hashes rather than substituting hash
+  the new incomplete receipt under the existing lock before preflight,
+  including validation of parsed run options. The arm directories are
+  reserved outputs: an input there could have been overwritten by the other
+  arm before it was frozen. Replace staged compiler files instead of
+  truncating a reused slot that may share an inode with an input. Keep the
+  byte comparisons and record stdout hashes rather than substituting hash
   equality for byte equality. The offline controls and a real two-order
   Valgrind A/A passed. No compiler hot path changes here.
 - **Huffman correctness.** On x86-64 and i686, LCCC, GCC 16.2 and Clang

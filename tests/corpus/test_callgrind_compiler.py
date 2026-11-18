@@ -70,14 +70,14 @@ if outputs is not None:
 sys.stdout.write(stdout)
 """)
 
-    def measure(self, mine, ref, **overrides):
+    def measure(self, mine, ref, *, extra=(), **overrides):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("LCCC_CG_") and k != "TEST_UNDER_CALLGRIND"}
         env["PATH"] = os.pathsep.join((str(self.root), env["PATH"]))
         env.update(overrides)
         run = subprocess.run(
             [sys.executable, str(SCRIPT), "--mine", str(mine), "--ref", str(ref),
-             "--source", str(self.source), "--rounds", "2", "--out", str(self.out)],
+             "--source", str(self.source), "--rounds", "2", "--out", str(self.out), *extra],
             env=env, cwd=self.root, capture_output=True, text=True, timeout=20,
         )
         self.assertTrue((self.out / "summary.json").is_file(), run.stderr)
@@ -125,6 +125,72 @@ sys.stdout.write(stdout)
         self.assertEqual(row["rounds"][0]["ir_ratio"], 1.0)
         self.assertNotIn("ir_ratio", row["rounds"][1])
         self.assertNotIn("median_ir_ratio", row)
+
+    def test_bad_run_options_invalidate_a_previous_complete_report(self):
+        mine, ref = self.compiler("mine"), self.compiler("ref")
+        for extra, diagnostic in (
+            (("--rounds", "0"), "rounds and timeout must be positive"),
+            (("--timeout", "0"), "rounds and timeout must be positive"),
+            (("--flags=-oother.s",), "output/mode flags are owned by the harness"),
+            (("--flags='-O1",), "No closing quotation"),
+        ):
+            with self.subTest(extra=extra):
+                run, report = self.measure(mine, ref)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertTrue(report["complete"])
+                run, report = self.measure(mine, ref, extra=extra)
+                self.assertFalse(report["complete"], "failed setup left a stale success")
+                self.assertEqual(run.returncode, 1, run.stderr)
+                self.assertEqual(report["results"], [])
+                self.assertIn(diagnostic, report["error"])
+                self.assertIn(diagnostic, run.stderr)
+
+    def test_an_input_in_a_frozen_output_slot_cannot_be_replaced_by_the_other_arm(self):
+        mine, ref = self.compiler("mine"), self.compiler("ref", "nop\nret\n")
+        owned = self.out / "aa/compiler"
+        owned.parent.mkdir(parents=True)
+        owned.write_bytes(ref.read_bytes())
+        owned.chmod(0o755)
+        run, report = self.measure(mine, owned)
+        self.assertEqual(owned.read_bytes(), ref.read_bytes(), "freezing mine rewrote ref")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertFalse(report["complete"])
+        self.assertIn("reserved compiler-work output directory", report["error"])
+        self.assertEqual(report["results"], [])
+
+    def test_a_hard_link_to_a_stale_frozen_compiler_does_not_change_the_reference(self):
+        mine, ref = self.compiler("mine"), self.compiler("ref", "nop\nret\n")
+        owned = self.out / "aa/compiler"
+        owned.parent.mkdir(parents=True)
+        owned.hardlink_to(ref)
+        original = ref.read_bytes()
+        run, report = self.measure(mine, ref)
+        self.assertEqual(ref.read_bytes(), original, "freezing mine changed the reference's inode")
+        self.assert_rejected(run, report, "native assembly differs")
+
+    def test_an_arm_directory_symlink_does_not_redirect_profile_writes(self):
+        mine, ref = self.compiler("mine"), self.compiler("ref")
+        original = self.root / "unrelated"
+        original.mkdir()
+        self.out.mkdir()
+        (self.out / "aa").symlink_to(original, target_is_directory=True)
+        run, report = self.measure(mine, ref)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertFalse(report["complete"])
+        self.assertIn("output directory must not be a symlink", report["error"])
+        self.assertEqual(list(original.iterdir()), [])
+
+    def test_writing_a_new_stderr_receipt_does_not_change_an_input_inode(self):
+        mine, ref = self.compiler("mine"), self.compiler("ref")
+        stderr_path = self.out / "aa/case-0-round-0.stderr"
+        stderr_path.parent.mkdir(parents=True)
+        stderr_path.hardlink_to(self.source)
+        original = self.source.read_bytes()
+        run, report = self.measure(mine, ref)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(report["complete"])
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertEqual(stderr_path.read_bytes(), b"")
 
     def test_failed_preflight_invalidates_a_previous_complete_report(self):
         mine, ref = self.compiler("mine"), self.compiler("ref")
