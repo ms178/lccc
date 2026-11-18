@@ -40,7 +40,11 @@
 //!    segment, in-bounds (`off >= 0 && off + width <= size`), and each offset
 //!    must be covered by exactly one scalar type: two accesses at the same
 //!    offset with different types, or accesses whose widths overlap, refuse the
-//!    object, because then the bytes are not independent storage.
+//!    object, because then the bytes are not independent storage. An exact
+//!    pointer-width integer store of zero is a null store when it matches a
+//!    pointer field (all supported targets represent null as all zero bits).
+//!    This admits zero fills emitted for aggregate initialization, without
+//!    treating arbitrary pointer/integer aliases as interchangeable.
 //!    **3b. Covering accesses** are the one admitted overlap: an *integer*
 //!    access that wholly contains *integer* fields (`I64 @0` over two `U32`
 //!    members -- how every 9..=16-byte struct crosses a call in two
@@ -52,7 +56,8 @@
 //!    byte it moves has an owner. A covering access spans at most
 //!    `MAX_COVERING_PARTS` (4) parts: past that the rebuild costs more than
 //!    the memory round trip it removes. `field_layout` holds the exact
-//!    conditions.
+//!    conditions. A covering view containing a pointer is allowed only if
+//!    every access through that view is a store of zero, never a load.
 //! 4. **The object is not claimed by forms 1-3.** No access instruction may sit
 //!    at a position already in the plan (`plan.remove`, `load_ptr`,
 //!    `store_ptr`, `insert`), and no `Memcpy` may still name it. Two rewrites
@@ -196,6 +201,12 @@ enum AccessOp {
     Load(Value),
     /// `store val -> ptr`.
     Store(Operand),
+}
+
+impl AccessOp {
+    fn is_zero_store(self) -> bool {
+        matches!(self, Self::Store(Operand::Const(c)) if c.to_i128() == Some(0))
+    }
 }
 
 /// One scalar access of a candidate object.
@@ -865,8 +876,8 @@ pub(super) fn run_function(
             };
             let fty = field_ty[&a.off];
             if fty != a.ty {
-                // A sign variant of the field's type (`field_layout` merged
-                // it): access the field at its own type, cast at the point.
+                // A same-width sign variant or an integer zero fill of a
+                // pointer field (`field_layout` proved the byte match).
                 for inst in retyped_access(a.op, a.ty, fty, id, next) {
                     plan.insert.push(Insert {
                         block: a.block,
@@ -1059,17 +1070,19 @@ pub(super) fn run_function(
 /// The fields are the MINIMAL views (those containing no other view);
 /// a view that contains another is covering and must:
 ///   * be an integer type (`Ptr` and floats need a bit cast, not a shift);
-///   * contain only integer fields, each entirely (a field straddling the
-///     covering view's edge means the bytes are not independent storage);
+///   * contain only whole integer fields (a straddling field means the bytes
+///     are not independent); whole pointer fields are also allowed when the
+///     covering view only stores zero, e.g. two pointers in an ILP32 fill;
 ///   * and have every byte owned: a gap inside it (padding between two
 ///     members) gets a carrier field, the widest naturally aligned integer
 ///     that fits, which reads back the bytes the wide access last wrote.
 /// Two INTEGER views of the same bytes that differ only in signedness
 /// (`I32` zero-fill store, `U32` carrier load) are one view: the field takes
 /// the type of the first access in program order and the run rewrites the
-/// others with a same-width cast (mem2reg promotes only exact-type
-/// accesses). Any other pair of views on the same bytes with different types
-/// (`I32`/`F32`, `I64`/`Ptr`) still refuses the object, as before.
+/// others with a same-width cast (mem2reg promotes only exact-type accesses).
+/// A same-width integer zero store at a pointer field's exact offset is
+/// normalized to a null store before grouping. Integer loads, nonzero stores,
+/// partial pointer accesses and float/integer aliases are still refused.
 ///
 /// A covering view may span at most [`MAX_COVERING_PARTS`] parts (fields
 /// plus carriers); see there for the cost model.
@@ -1077,17 +1090,33 @@ fn field_layout(
     accesses: &[Access],
     size: i64,
 ) -> Option<(Vec<(i64, IrType, i64)>, FxHashSet<(i64, i64)>)> {
+    let pointer_offsets: FxHashSet<_> = accesses
+        .iter()
+        .filter(|a| a.ty == IrType::Ptr)
+        .map(|a| a.off)
+        .collect();
+    let pointer_width = ty_size(IrType::Ptr);
     let mut views: Vec<(i64, IrType, i64)> = Vec::new();
     for a in accesses {
         let w = promotable_width(a.ty)?;
-        if a.off + w > size {
+        if a.off < 0 || a.off.checked_add(w)? > size {
             return None;
         }
+        let ty = if !pointer_offsets.is_empty()
+            && w == pointer_width
+            && a.ty.is_integer()
+            && a.op.is_zero_store()
+            && pointer_offsets.contains(&a.off)
+        {
+            IrType::Ptr
+        } else {
+            a.ty
+        };
         if !views
             .iter()
-            .any(|&(o, t, tw)| o == a.off && (t == a.ty || same_bits(t, a.ty, tw, w)))
+            .any(|&(o, t, tw)| o == a.off && (t == ty || same_bits(t, ty, tw, w)))
         {
-            views.push((a.off, a.ty, w));
+            views.push((a.off, ty, w));
         }
     }
     let contains = |outer: &(i64, IrType, i64), inner: &(i64, IrType, i64)| {
@@ -1124,9 +1153,24 @@ fn field_layout(
         let carriers_before = carriers.len();
         let mut parts = 0usize;
         let mut pos = lo;
+        let mut zero_only = None;
         for f in fields.iter().filter(|f| f.0 < hi && f.0 + f.2 > lo) {
-            if !contains(cv, f) || !f.1.is_integer() {
+            if !contains(cv, f) {
                 return None;
+            }
+            // A pointer field can be filled with a typed null. Do not cast
+            // arbitrary integer bits to/from a pointer: even one load or
+            // runtime store through this wide view rules out the split.
+            match f.1 {
+                ty if ty.is_integer() => {}
+                IrType::Ptr
+                    if *zero_only.get_or_insert_with(|| {
+                        accesses
+                            .iter()
+                            .filter(|a| a.off == lo && ty_size(a.ty) == cv.2)
+                            .all(|a| a.op.is_zero_store())
+                    }) => {}
+                _ => return None,
             }
             fill_gap(&mut carriers, pos, f.0);
             pos = f.0 + f.2;
@@ -1139,9 +1183,12 @@ fn field_layout(
         }
         covering.insert((cv.0, cv.2));
     }
-    // Two covering views may share a gap; keep one carrier per offset.
-    carriers.sort_by_key(|&(o, _, _)| o);
-    carriers.dedup_by_key(|c| c.0);
+    // Two covering views may share a gap. Merge only identical carriers;
+    // otherwise the overlap check below must see both. If a short view ends
+    // inside a wider carrier at the same offset, choosing one would either
+    // leave bytes unowned or let the short store clobber its neighbour.
+    carriers.sort_by_key(|&(o, _, w)| (o, w));
+    carriers.dedup();
     fields.extend(carriers);
     fields.sort_by_key(|&(o, _, _)| o);
     if fields.windows(2).any(|w2| w2[0].0 + w2[0].2 > w2[1].0) {
@@ -1270,10 +1317,18 @@ fn covering_load(
     out
 }
 
-/// A field access whose type is a sign variant of the field's (same width,
-/// both integer; see `field_layout`): `dest = cast(load fty field)` for a
-/// load, `store fty cast(val) -> field` for a store. The casts change no
-/// bits, so they cost nothing once the field is a register.
+fn zero_fill(field: u32, ty: IrType) -> Instruction {
+    Instruction::Store {
+        volatile: false,
+        val: Operand::Const(IrConst::from_i64(0, ty)),
+        ptr: Value(field),
+        ty,
+        seg_override: AddressSpace::Default,
+    }
+}
+
+/// Rebuild a same-width integer sign variant with a cast at the access, or
+/// emit a typed null directly for a zero fill accepted by `field_layout`.
 fn retyped_access(
     op: AccessOp,
     ty: IrType,
@@ -1281,6 +1336,11 @@ fn retyped_access(
     field: u32,
     next: &mut u32,
 ) -> Vec<Instruction> {
+    if fty == IrType::Ptr {
+        debug_assert!(ty.is_integer() && ty_size(ty) == ty_size(fty));
+        debug_assert!(op.is_zero_store());
+        return vec![zero_fill(field, fty)];
+    }
     let v = Value(*next);
     *next += 1;
     match op {
@@ -1317,15 +1377,22 @@ fn retyped_access(
     }
 }
 
-/// Rule 3b, store side: one `trunc(val >> 8*rel_i)` store per field.
+/// Rule 3b, store side: one typed zero or `trunc(val >> 8*rel_i)` per field.
 fn covering_store(
     val: Operand,
     ty: IrType,
     parts: &[(i64, IrType, u32)],
     next: &mut u32,
 ) -> Vec<Instruction> {
+    if AccessOp::Store(val).is_zero_store() {
+        return parts
+            .iter()
+            .map(|&(_, ty, field)| zero_fill(field, ty))
+            .collect();
+    }
     let mut out = Vec::new();
     for &(rel, fty, field) in parts {
+        debug_assert!(fty.is_integer());
         let mut part = val;
         if rel > 0 {
             let sh = Value(*next);
@@ -2213,13 +2280,76 @@ mod layout_tests {
     #[test]
     fn same_bytes_with_a_non_integer_type_still_refuse() {
         for (x, y) in [(IrType::I32, IrType::F32), (IrType::I64, IrType::Ptr)] {
-            let a = [
-                acc(0, x, false),
-                acc(0, y, true),
-                acc(8, IrType::I32, false),
-            ];
+            let a = [acc(0, x, true), acc(0, y, true), acc(8, IrType::I32, false)];
             assert!(field_layout(&a, 12).is_none(), "{x:?} vs {y:?}");
         }
+    }
+
+    #[test]
+    fn pointer_field_merges_with_only_an_exact_zero_fill() {
+        let int = if ty_size(IrType::Ptr) == 4 {
+            IrType::I32
+        } else {
+            IrType::I64
+        };
+        let mut a = [
+            acc(0, int, false),
+            acc(0, IrType::Ptr, true),
+            acc(8, IrType::I32, false),
+        ];
+        let (fields, covering) = field_layout(&a, 16).expect("typed null fill is exact");
+        assert_eq!(
+            fields,
+            vec![(0, IrType::Ptr, ty_size(IrType::Ptr)), (8, IrType::I32, 4)]
+        );
+        assert!(covering.is_empty());
+        for op in [
+            AccessOp::Store(Operand::Const(IrConst::I64(1))),
+            AccessOp::Store(Operand::Value(Value(1))),
+            AccessOp::Load(Value(2)),
+        ] {
+            a[0].op = op;
+            assert!(field_layout(&a, 16).is_none());
+        }
+        a[0] = acc(0, IrType::I16, false);
+        assert!(field_layout(&a, 16).is_none(), "partial pointer overwrite");
+    }
+
+    #[test]
+    fn a_wide_ilp32_zero_fill_can_cover_two_pointers() {
+        use crate::common::types::{set_target_ptr_size, target_ptr_size};
+        let old_width = target_ptr_size();
+        set_target_ptr_size(4);
+        let mut a = [
+            acc(0, IrType::I64, false),
+            acc(0, IrType::Ptr, true),
+            acc(4, IrType::Ptr, true),
+        ];
+        let zero = field_layout(&a, 8);
+        a[0].op = AccessOp::Load(Value(1));
+        let read = field_layout(&a, 8);
+        a[0].op = AccessOp::Store(Operand::Const(IrConst::I64(1)));
+        let nonzero = field_layout(&a, 8);
+        set_target_ptr_size(old_width);
+        assert_eq!(
+            zero.expect("known zero fill").0,
+            vec![(0, IrType::Ptr, 4), (4, IrType::Ptr, 4)]
+        );
+        assert!(read.is_none() && nonzero.is_none());
+    }
+
+    #[test]
+    fn shared_carrier_requires_both_views_to_own_the_same_bytes() {
+        // The wide view wants I16 @2; the short view wants I8 @2. Keeping
+        // either carrier alone loses byte 3, or lets the short store overwrite it.
+        let mut a = [
+            acc(1, IrType::I8, true),
+            acc(0, IrType::I64, true),
+            acc(1, IrType::I16, false),
+        ];
+        assert!(field_layout(&a, 8).is_none());
+        a.swap(1, 2);
+        assert!(field_layout(&a, 8).is_none());
     }
 
     #[test]

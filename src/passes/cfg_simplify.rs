@@ -18,6 +18,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::IrType;
+use crate::ir::analysis::asm_goto_successors;
 use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator,
     Value,
@@ -315,8 +316,10 @@ fn fold_constant_cond_branches(
     // Apply the folds and clean up phi nodes.
     for &(idx, taken, not_taken, block_label) in &folds {
         func.blocks[idx].terminator = Terminator::Branch(taken);
-        // Remove phi entries in the not-taken target (if it differs from taken).
-        if taken != not_taken {
+        // The dropped branch arm might share its target with an asm-goto edge.
+        if taken != not_taken
+            && !asm_goto_successors(&func.blocks[idx]).any(|label| label == not_taken)
+        {
             if let Some(&block_idx) = label_to_idx.get(&not_taken) {
                 remove_phi_entries_from(&mut func.blocks[block_idx], block_label);
             }
@@ -423,7 +426,9 @@ fn fold_constant_switches(
     for (idx, taken, not_taken, block_label) in &folds {
         func.blocks[*idx].terminator = Terminator::Branch(*taken);
         for nt_target in not_taken {
-            if let Some(&block_idx) = label_to_idx.get(nt_target) {
+            if !asm_goto_successors(&func.blocks[*idx]).any(|label| label == *nt_target)
+                && let Some(&block_idx) = label_to_idx.get(nt_target)
+            {
                 remove_phi_entries_from(&mut func.blocks[block_idx], *block_label);
             }
         }
@@ -1693,6 +1698,69 @@ mod tests {
             resolve_value_globally(&f, Value(0), &build_global_value_map(&f), 0)
         } else {
             resolve_value_to_const_in_block(&f.blocks[0], Value(0))
+        }
+    }
+
+    #[test]
+    fn folding_a_terminator_preserves_an_asm_goto_phi_arm() {
+        for term in [
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            Terminator::Switch {
+                val: Operand::Const(IrConst::I32(0)),
+                cases: vec![(1, BlockId(1))],
+                default: BlockId(2),
+                ty: IrType::I32,
+            },
+        ] {
+            let mut f = IrFunction::new("asm_edge".into(), IrType::I32, vec![], false);
+            let from = (Operand::Const(IrConst::I32(11)), BlockId(0));
+            f.blocks = vec![
+                make_block(
+                    BlockId(0),
+                    vec![Instruction::InlineAsm {
+                        template: "jmp %l[case]".into(),
+                        outputs: vec![],
+                        inputs: vec![],
+                        clobbers: vec![],
+                        operand_types: vec![],
+                        goto_labels: vec![("case".into(), BlockId(1))],
+                        input_symbols: vec![],
+                        seg_overrides: vec![],
+                    }],
+                    term,
+                ),
+                make_block(
+                    BlockId(1),
+                    vec![Instruction::Phi {
+                        dest: Value(0),
+                        ty: IrType::I32,
+                        incoming: vec![from],
+                    }],
+                    Terminator::Return(Some(Operand::Value(Value(0)))),
+                ),
+                make_block(
+                    BlockId(2),
+                    vec![],
+                    Terminator::Return(Some(Operand::Const(IrConst::I32(22)))),
+                ),
+            ];
+            let labels = crate::ir::analysis::build_label_map(&f);
+            assert_eq!(
+                fold_constant_cond_branches(&mut f, &labels)
+                    + fold_constant_switches(&mut f, &labels),
+                1
+            );
+            assert!(matches!(
+                f.blocks[0].terminator,
+                Terminator::Branch(BlockId(2))
+            ));
+            assert!(
+                matches!(&f.blocks[1].instructions[0], Instruction::Phi { incoming, .. } if incoming.as_slice() == [from])
+            );
         }
     }
 

@@ -247,6 +247,25 @@ fn implied_cmp(
     }
 }
 
+/// A test outcome applies only on an explicit, unambiguous branch edge.
+fn tested_edge(block: &BasicBlock, to: BlockId) -> Option<(Value, bool)> {
+    let Terminator::CondBranch {
+        cond: Operand::Value(c),
+        true_label,
+        false_label,
+    } = block.terminator
+    else {
+        return None;
+    };
+    if true_label == false_label
+        || (to != true_label && to != false_label)
+        || analysis::asm_goto_successors(block).any(|label| label == to)
+    {
+        return None;
+    }
+    Some((c, to == true_label))
+}
+
 /// Is `v` known non-zero (`Some(true)`) or zero (`Some(false)`) at the end
 /// of block `at`?  Facts come from the edge into a single-predecessor block
 /// dominating `at` whose predecessor branches on `v` (or on `v ==/!= 0`, or
@@ -262,15 +281,9 @@ fn known_truth(
     let mut x = at;
     loop {
         if let [d] = cfg.preds[x][..]
-            && let Terminator::CondBranch {
-                cond: Operand::Value(c),
-                true_label,
-                false_label,
-            } = &func.blocks[d].terminator
-            && true_label != false_label
+            && let Some((c, on_true)) = tested_edge(&func.blocks[d], func.blocks[x].label)
         {
-            let on_true = *true_label == func.blocks[x].label;
-            if *c == v {
+            if c == v {
                 return Some(on_true);
             }
             if let Some(&(t, nonzero_on_true)) = tests.get(&c.0)
@@ -527,19 +540,8 @@ impl Search<'_> {
     /// The truth of comparison `c` on the edge `p -> to` implied by `p`'s own
     /// branch (the loop-exit edge of `while (j >= 0 ...)` knows `j < 0`).
     fn edge_truth(&self, p: usize, to: BlockId, c: Value) -> Option<bool> {
-        let Terminator::CondBranch {
-            cond: Operand::Value(pc),
-            true_label,
-            false_label,
-        } = &self.func.blocks[p].terminator
-        else {
-            return None;
-        };
-        if true_label == false_label {
-            return None;
-        }
-        let on_true = *true_label == to;
-        if *pc == c {
+        let (pc, on_true) = tested_edge(&self.func.blocks[p], to)?;
+        if pc == c {
             return Some(on_true);
         }
         implied_cmp(*self.cmps.get(&pc.0)?, on_true, *self.cmps.get(&c.0)?)
@@ -616,10 +618,7 @@ fn apply(func: &mut IrFunction, t: &Thread) -> Option<()> {
     // An asm-goto edge with the same source and target still needs the
     // original phi arm, and can observe state from earlier in the block.
     let head = *orig_labels.first()?;
-    if func.blocks[t.pred].instructions.iter().any(|inst| {
-        matches!(inst, Instruction::InlineAsm { goto_labels, .. }
-            if goto_labels.iter().any(|(_, label)| *label == head))
-    }) {
+    if analysis::asm_goto_successors(&func.blocks[t.pred]).any(|label| label == head) {
         return None;
     }
     let clone_labels: Vec<BlockId> = t.path.iter().map(|_| fresh_label(func)).collect();
@@ -1429,6 +1428,37 @@ mod tests {
         };
         assert!(apply(&mut f, &thread).is_none());
         assert!(unique_arm(phi_def(&f.blocks[3], Value(1)).unwrap(), BlockId(2)).is_some());
+    }
+
+    #[test]
+    fn only_the_actual_branch_edge_has_a_truth_value() {
+        let mut f = bool_cast_merge(1);
+        f.blocks[0].instructions.push(Instruction::InlineAsm {
+            template: "j %l[next]".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("next".into(), BlockId(5)), ("shared".into(), BlockId(1))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        });
+        let b = &f.blocks[0];
+        assert_eq!(tested_edge(b, BlockId(5)), None);
+        assert_eq!(tested_edge(b, BlockId(1)), None);
+        assert_eq!(tested_edge(b, BlockId(2)), Some((Value(0), false)));
+        let cfg = Cfg::build(&f);
+        assert_eq!(
+            known_truth(
+                &f,
+                &cfg,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                Value(0),
+                5
+            ),
+            None
+        );
     }
 
     /// The list merge loop of the module docs.

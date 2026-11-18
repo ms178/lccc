@@ -48,9 +48,15 @@ FIXTURES = (
     # Every atomic builtin at every width (8..128 bits) and ordering, with
     # register-homed pointers and values live across the sequences.
     "atomic_ops_cross", "memcpy_snapshot_alias",
+    # A jump which bypasses a C branch must not inherit its test result.
+    # A guarded switch in a scoped retry loop must avoid its impossible arm.
+    "asm_goto_branch_fact", "scoped_retry_state", "sroa_overlapping_carriers",
 )
 ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
 LEVELS = {
+    "asm_goto_branch_fact": ALL_LEVELS + ("-O3",),
+    "scoped_retry_state": ("-O2", "-O3", "-Os"),
+    "sroa_overlapping_carriers": ALL_LEVELS + ("-O3",),
     # A copied aggregate is a snapshot even when a later call or aliased store
     # modifies its original source.
     "memcpy_snapshot_alias": ALL_LEVELS + ("-O3",),
