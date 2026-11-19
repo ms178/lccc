@@ -22,8 +22,8 @@
 //! A *strong* global defined in every copy (hand-written or C COMDAT code,
 //! `-fno-weak`) was worse: resolution saw two strong definitions and failed
 //! with "multiple definition". A discarded copy's definitions do not take
-//! part in resolution in GNU ld or lld; `in_discarded_group` gives symbol
-//! registration the same answer where a definition would displace another.
+//! part in resolution in GNU ld or lld; `discarded_members` gives symbol
+//! registration the same answer before any of its definitions are entered.
 //!
 //! Measured on three small C++ TUs sharing one header
 //! (`g++ -O0 -fno-inline`), searching the linked image for the exact byte
@@ -88,9 +88,8 @@ fn members(words: &[u8]) -> impl Iterator<Item = usize> + '_ {
 /// The link's input objects in link order, together with the COMDAT group
 /// signatures they claim.
 ///
-/// Symbol registration asks, for a definition that would displace or clash
-/// with an existing one, whether its section belongs to a group some earlier
-/// object already claimed (`in_discarded_group`). Answering that by
+/// Symbol registration asks which sections belong to groups an earlier
+/// object already claimed (`discarded_members`). Answering that by
 /// rescanning every earlier object's groups made registration quadratic: a
 /// link of N objects whose overriding definitions sit in COMDAT members took
 /// 0.04 s at N = 500 and 1.75 s at N = 4000. Objects only ever enter the link
@@ -109,6 +108,7 @@ fn members(words: &[u8]) -> impl Iterator<Item = usize> + '_ {
 pub struct ObjectSet {
     objects: Vec<Elf64Object>,
     claimed: FxHashSet<String>,
+    allow_multiple_definition: bool,
     dso_names: FxHashSet<String>,
     /// `--warn-common` diagnostics over the inputs in registration order;
     /// `None` (no work at all) unless the link asked for them.
@@ -124,6 +124,14 @@ pub struct ObjectSet {
 impl ObjectSet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_allow_multiple_definition(&mut self, allow: bool) {
+        self.allow_multiple_definition = allow;
+    }
+
+    pub(super) fn allow_multiple_definition(&self) -> bool {
+        self.allow_multiple_definition
     }
 
     /// Append the next object in link order and record the group
@@ -257,16 +265,17 @@ impl<'a> IntoIterator for &'a mut ObjectSet {
     }
 }
 
-/// Is section `shndx` of `obj` a member of a COMDAT group whose signature
-/// an object in `prior` (the objects registered before it, in link order)
-/// already claimed? Such a copy is discarded -- `plan_comdat` makes the same
-/// first-wins decision over the same order -- so its definitions must not
-/// compete with the kept copy's. O(groups of `obj`): the prior claims are
-/// one hash lookup (see `ObjectSet`).
-pub fn in_discarded_group(prior: &ObjectSet, obj: &Elf64Object, shndx: usize) -> bool {
+/// Gather the COMDAT losers once per object rather than walking its group
+/// table for every symbol. Keep the no-COMDAT path allocation-free.
+pub(super) fn discarded_members(prior: &ObjectSet, obj: &Elf64Object) -> FxHashSet<usize> {
+    if prior.claimed.is_empty() {
+        return FxHashSet::default();
+    }
     comdat_groups(obj)
-        .find(|(_, words)| members(words).any(|m| m == shndx))
-        .is_some_and(|(sig, _)| prior.claims(sig))
+        .filter(|(sig, _)| prior.claims(sig))
+        .flat_map(|(_, words)| members(words))
+        .filter(|&member| member < obj.sections.len())
+        .collect()
 }
 
 /// Decide which COMDAT group members lose.
@@ -278,10 +287,14 @@ pub fn in_discarded_group(prior: &ObjectSet, obj: &Elf64Object, shndx: usize) ->
 /// `SHT_GROUP` sections themselves are never emitted into an executable, so
 /// they do not need to be marked dead here; the emitter already skips them.
 pub fn plan_comdat(objects: &[Elf64Object]) -> ComdatPlan {
+    plan_comdat_iter(objects.iter())
+}
+
+pub(crate) fn plan_comdat_iter<'a>(objects: impl Iterator<Item = &'a Elf64Object>) -> ComdatPlan {
     let mut plan = ComdatPlan::default();
     // Signatures claimed so far (borrowed from the objects: no allocation).
     let mut winners: FxHashSet<&str> = FxHashSet::default();
-    for (oi, obj) in objects.iter().enumerate() {
+    for (oi, obj) in objects.enumerate() {
         for (sig, words) in comdat_groups(obj) {
             if winners.insert(sig) {
                 continue;
@@ -289,7 +302,7 @@ pub fn plan_comdat(objects: &[Elf64Object]) -> ComdatPlan {
             plan.groups_discarded += 1;
             for member in members(words) {
                 if member < obj.sections.len() && plan.dead.insert((oi, member)) {
-                    plan.bytes_saved += obj.sections[member].size;
+                    plan.bytes_saved = plan.bytes_saved.saturating_add(obj.sections[member].size);
                 }
             }
         }
@@ -415,7 +428,7 @@ mod tests {
     /// Symbol registration's view of the same first-wins decision: only a
     /// member of a later copy of a claimed signature is discarded.
     #[test]
-    fn in_discarded_group_matches_the_plan() {
+    fn discarded_members_matches_the_plan() {
         let objs: ObjectSet = [
             comdat_object("sig_a", &[16, 8], true),
             comdat_object("sig_b", &[16], true),
@@ -426,16 +439,16 @@ mod tests {
         let later_a = comdat_object("sig_a", &[16, 8], true);
         let later_plain = comdat_object("sig_a", &[16], false);
         let later_unnamed = comdat_object("", &[16], true);
-        assert!(in_discarded_group(&objs, &later_a, 1));
-        assert!(in_discarded_group(&objs, &later_a, 2));
+        assert!(discarded_members(&objs, &later_a).contains(&1));
+        assert!(discarded_members(&objs, &later_a).contains(&2));
         // The group section itself is not a member.
-        assert!(!in_discarded_group(&objs, &later_a, 3));
+        assert!(!discarded_members(&objs, &later_a).contains(&3));
         assert!(
-            !in_discarded_group(&ObjectSet::new(), &later_a, 1),
+            !discarded_members(&ObjectSet::new(), &later_a).contains(&1),
             "first copy wins"
         );
-        assert!(!in_discarded_group(&objs, &later_plain, 1));
-        assert!(!in_discarded_group(&objs, &later_unnamed, 1));
+        assert!(!discarded_members(&objs, &later_plain).contains(&1));
+        assert!(!discarded_members(&objs, &later_unnamed).contains(&1));
     }
 
     /// An object with several groups: `(signature, member sizes)` each, the
@@ -474,7 +487,7 @@ mod tests {
     /// reproducible without a dependency). Objects draw 0..=3 groups from a
     /// pool of 6 signatures, so claims, repeats and fresh signatures mix.
     #[test]
-    fn in_discarded_group_agrees_with_plan_comdat_on_random_links() {
+    fn discarded_members_agrees_with_plan_comdat_on_random_links() {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move |n: u64| {
             state ^= state << 13;
@@ -505,7 +518,7 @@ mod tests {
             for (oi, obj) in objs.into_iter().enumerate() {
                 for shndx in 0..obj.sections.len() {
                     assert_eq!(
-                        in_discarded_group(&prior, &obj, shndx),
+                        discarded_members(&prior, &obj).contains(&shndx),
                         plan.dead.contains(&(oi, shndx)),
                         "object {oi} section {shndx}"
                     );

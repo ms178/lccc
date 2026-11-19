@@ -50,6 +50,7 @@ pub fn link_builtin(
     let all_lib_paths: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
     let parsed_common = linker_common::parse_linker_args(user_args);
+    objects.set_allow_multiple_definition(parsed_common.allow_multiple_definition());
     parsed_common.validate_common_options()?;
     parsed_common.warn_unimplemented_keyword_options(super::types::PAGE_SIZE)?;
     if parsed_common.warn_common {
@@ -412,7 +413,7 @@ pub fn link_builtin(
 
     // Allocate COMMON symbols (using shared implementation)
     // No --sort-common on this path yet: default (unsorted) order.
-    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, false);
+    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, false)?;
 
     // Check if we have any dynamic symbols
     let has_dynamic_syms = globals.values().any(|g| g.is_dynamic);
@@ -476,6 +477,7 @@ pub fn link_shared(
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
     let parsed_args = linker_common::parse_linker_args(user_args);
+    objects.set_allow_multiple_definition(parsed_args.allow_multiple_definition());
     parsed_args.validate_common_options()?;
     parsed_args.warn_unimplemented_keyword_options(super::types::PAGE_SIZE)?;
     if parsed_args.warn_common {
@@ -566,20 +568,29 @@ pub fn link_shared(
         parsed_args.fatal_warnings,
     )?;
 
-    // Merge sections (no gc-sections for shared libraries)
+    // Select COMDAT members even when this link does not run section GC.
+    let discarded = linker_common::comdat::plan_comdat(&objects).dead;
+    if !discarded.is_empty() {
+        linker_common::prune_dead_fdes(&mut objects, &discarded);
+    }
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
-    linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
+    linker_common::merge_sections_elf64_gc(
+        &objects,
+        &mut output_sections,
+        &mut section_map,
+        &discarded,
+    );
     if !parsed_args.strip_all && !parsed_args.strip_debug {
         linker_common::merge_debug_sections_elf64(
             &objects,
             &mut output_sections,
             &mut section_map,
-            &FxHashSet::default(),
+            &discarded,
         )?;
     }
     // No --sort-common on this path yet: default (unsorted) order.
-    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, false);
+    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, false)?;
 
     // Resolve undefined symbols against system shared libraries to discover
     // NEEDED dependencies. Without this, the shared library would be missing

@@ -255,12 +255,6 @@ impl LinkerArgs {
     /// `-z KEYWORD[=VALUE]` spellings kept in `z_other_keywords` that are
     /// neither implemented nor equivalent to the linker's default.  These
     /// spellings must remain visible to each target's warning policy.
-    pub fn z_other_keyword_warnings(&self) -> Vec<String> {
-        self.z_other_keyword_warnings_except(&[])
-    }
-
-    /// As above, for a link path that implements additional keywords beyond
-    /// the shared default-equivalent options.
     pub fn z_other_keyword_warnings_except(&self, implemented: &[&str]) -> Vec<String> {
         self.z_other_keywords
             .iter()
@@ -283,7 +277,7 @@ impl LinkerArgs {
             .iter()
             .map(|kw| format!("-z {kw} ignored"))
             .collect();
-        warnings.extend(self.z_other_keyword_warnings());
+        warnings.extend(self.z_other_keyword_warnings_except(&["muldefs"]));
         // AArch64 and RISC-V call this shared policy but do not emit the
         // requested DT_FLAGS/DT_FLAGS_1 bits. Keep these options visible
         // instead of accepting nodelete/origin/initfirst and their peers
@@ -1628,7 +1622,10 @@ mod map_arg_tests {
         ] {
             let parsed = parse_linker_args(&args(flags));
             assert!(parsed.allow_multiple_definition(), "{flags:?}");
-            assert_eq!(parsed.z_other_keyword_warnings(), ["-z muldefs ignored"]);
+            assert_eq!(
+                parsed.z_other_keyword_warnings_except(&[]),
+                ["-z muldefs ignored"]
+            );
             assert!(parsed.inputs.is_empty() && parsed.missing_inputs.is_empty());
         }
         for flags in [&[][..], &["-z"], &["-zmuldefs=1"], &["-Wl,-z,nomuldefs"]] {
@@ -2257,7 +2254,7 @@ mod z_isa_level_tests {
             "-Wl,-z,not-a-real-keyword",
         ]));
         assert_eq!(
-            parsed.z_other_keyword_warnings(),
+            parsed.z_other_keyword_warnings_except(&[]),
             vec!["-z global ignored", "-z not-a-real-keyword ignored"]
         );
         assert_eq!(

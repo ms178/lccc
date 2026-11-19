@@ -71,6 +71,14 @@ impl GlobalSymbolOps for GlobalSymbol {
     fn size(&self) -> u64 {
         self.size
     }
+    fn defined_in(&self) -> Option<usize> {
+        self.defined_in
+    }
+    fn merge_common(&mut self, sym: &Elf64Symbol) {
+        // A smaller declaration can impose the larger alignment.
+        self.value = self.value.max(sym.value);
+        self.size = self.size.max(sym.size);
+    }
     fn visibility(&self) -> u8 {
         self.visibility
     }

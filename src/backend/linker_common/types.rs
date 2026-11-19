@@ -6,7 +6,7 @@
 use super::secdata::SectionData;
 use super::symstr::SymStr;
 use crate::backend::elf::SHN_UNDEF;
-use crate::backend::elf::{STB_GLOBAL, STB_LOCAL, STB_WEAK};
+use crate::backend::elf::{STB_GLOBAL, STB_GNU_UNIQUE, STB_LOCAL, STB_WEAK};
 
 /// Parsed ELF64 section header.
 #[derive(Debug, Clone)]
@@ -54,6 +54,10 @@ impl Elf64Symbol {
     }
     pub fn is_global(&self) -> bool {
         self.binding() == STB_GLOBAL
+    }
+    /// GNU UNIQUE follows strong-definition precedence, not WEAK precedence.
+    pub fn is_strong(&self) -> bool {
+        matches!(self.binding(), STB_GLOBAL | STB_GNU_UNIQUE)
     }
     pub fn is_weak(&self) -> bool {
         self.binding() == STB_WEAK

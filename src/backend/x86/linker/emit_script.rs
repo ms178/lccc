@@ -10,7 +10,7 @@
 //! static ET_EXEC image with no dynamic sections; relocation types are the
 //! static x86-64 set (PC32/PLT32/32/32S/64 and TLS LE forms).
 
-use crate::backend::elf::{STT_NOTYPE, elf64_sym_entry, push_strtab_name};
+use crate::backend::elf::{SHF_EXCLUDE, STT_NOTYPE, elf64_sym_entry, push_strtab_name};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::elf::*;
@@ -954,23 +954,33 @@ impl ScriptDefsyms {
 
 /// Ordinary ELF tables are bookkeeping, not user script inputs.
 fn is_script_input(section: &linker_common::Elf64Section) -> bool {
-    !matches!(
-        section.sh_type,
-        SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_
-    ) && !(section.sh_type == SHT_STRTAB_ && section.flags & SHF_ALLOC_ == 0)
+    section.flags & SHF_EXCLUDE == 0
+        && !matches!(
+            section.sh_type,
+            SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_
+        )
+        && !(section.sh_type == SHT_STRTAB_ && section.flags & SHF_ALLOC_ == 0)
         && !(section.size == 0 && section.name.is_empty())
 }
 
-fn is_script_orphan(script: &LinkerScript, section: &linker_common::Elf64Section) -> bool {
-    is_script_input(section)
-        && section.flags & 0x8000_0000 == 0 // SHF_EXCLUDE
-        && !script.sections.iter().any(|item| {
-            let SectionsItem::Output(def) = item else { return false; };
-            def.items.iter().any(|body| {
+/// Placement is first-match-wins, including an explicit /DISCARD/ rule.
+fn script_destination<'a>(script: &'a LinkerScript, name: &str) -> Option<&'a str> {
+    script.sections.iter().find_map(|item| {
+        let SectionsItem::Output(def) = item else {
+            return None;
+        };
+        def.items
+            .iter()
+            .any(|body| {
                 matches!(body, SecItem::Input(spec)
-                    if spec.patterns.iter().any(|pattern| glob_match(pattern, &section.name)))
+                if spec.patterns.iter().any(|pattern| glob_match(pattern, name)))
             })
-        })
+            .then_some(def.name.as_str())
+    })
+}
+
+fn is_script_orphan(script: &LinkerScript, section: &linker_common::Elf64Section) -> bool {
+    is_script_input(section) && script_destination(script, &section.name).is_none()
 }
 
 /// Treatment of live input sections unmatched by the caller's script.
@@ -1003,6 +1013,7 @@ pub struct ScriptLinkExtras {
     pub print_memory_usage: bool,
     pub orphan_handling: OrphanHandling,
     pub fatal_warnings: bool,
+    pub allow_multiple_definition: bool,
 }
 
 pub fn link_with_script(
@@ -1144,7 +1155,6 @@ fn non_alloc_orphan_names(
     objects: &[Object],
     candidates: &[(usize, usize)],
 ) -> Vec<String> {
-    const SHF_EXCLUDE: u64 = 0x8000_0000;
     let matched = |name: &str| {
         sections.iter().any(|item| {
             let SectionsItem::Output(def) = item else {
@@ -1229,13 +1239,55 @@ fn link_with_script_machine(
 ) -> Result<(), String> {
     let mut script: LinkerScript = linker_script::parse_linker_script(script_src)?;
 
+    let mut dead_sections = linker_common::comdat::plan_comdat(objects).dead;
+
+    // ── Global symbol table from objects (defined globals + weak) ──
+    // name -> (obj_idx, sec_idx(SHN), value, size, info)
+    let mut def_syms: FxHashMap<String, (usize, u16, u64, u64, u8)> = FxHashMap::default();
+    for (oi, obj) in objects.iter().enumerate() {
+        for sym in &obj.symbols {
+            if sym.name.is_empty() || sym.is_local() {
+                continue;
+            }
+            if dead_sections.contains(&(oi, sym.shndx as usize)) {
+                continue;
+            }
+            if sym.is_undefined() || sym.shndx == SHN_COMMON {
+                continue;
+            }
+            let replace = match def_syms.get(sym.name.as_str()) {
+                None => true,
+                Some(&(old, shndx, value, _, info)) => {
+                    let weak = (info >> 4) == STB_WEAK;
+                    if sym.is_strong()
+                        && !weak
+                        && !extras.allow_multiple_definition
+                        && !(shndx == SHN_ABS && sym.shndx == SHN_ABS && value == sym.value)
+                    {
+                        return Err(format!(
+                            "multiple definition of '{}' in {}; first defined in {}",
+                            sym.name, obj.source_name, objects[old].source_name,
+                        ));
+                    }
+                    weak && sym.is_strong()
+                }
+            };
+            if replace {
+                def_syms.insert(
+                    sym.name.to_string(),
+                    (oi, sym.shndx, sym.value, sym.size, sym.info),
+                );
+            }
+        }
+    }
+
     // `--gc-sections` for script links uses the same relocation-reachability
     // engine as ordinary links, with two script-specific root classes:
     // ENTRY(symbol) and every input section matched by KEEP(...).  Merely
     // assigning `start = .; *(registry); stop = .` does not root a registry in
     // GNU ld; the script author must say KEEP, which is why the distinction is
     // retained in the parsed AST.
-    let mut dead_sections: FxHashSet<(usize, usize)> = if gc_sections {
+    if gc_sections {
         let mut kept: FxHashSet<(usize, usize)> = FxHashSet::default();
         for item in &script.sections {
             let SectionsItem::Output(def) = item else {
@@ -1263,42 +1315,25 @@ fn link_with_script_machine(
         }
         let roots: Vec<String> = script.entry.iter().cloned().collect();
         let dead =
-            linker_common::gc_collect_sections_elf64_roots_and_sections(objects, &roots, &kept);
-        // Drop the FDEs describing collected functions (see
-        // `eh_frame::prune_dead_fdes`).  Kernel links with
-        // CONFIG_LD_DEAD_CODE_DATA_ELIMINATION pass --gc-sections and would
-        // otherwise ship an .eh_frame_hdr table full of stale entries.
-        if !dead.is_empty() {
-            linker_common::prune_dead_fdes(objects, &dead);
-        }
-        dead
-    } else {
-        FxHashSet::default()
-    };
+            linker_common::gc_collect_sections_elf64_full(objects, &roots, &kept, &dead_sections);
+        dead_sections.extend(dead);
+    }
 
-    // ── Global symbol table from objects (defined globals + weak) ──
-    // name -> (obj_idx, sec_idx(SHN), value, size, info)
-    let mut def_syms: FxHashMap<String, (usize, u16, u64, u64, u8)> = FxHashMap::default();
-    for (oi, obj) in objects.iter().enumerate() {
-        for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.is_local() {
-                continue;
-            }
-            if dead_sections.contains(&(oi, sym.shndx as usize)) {
-                continue;
-            }
-            if sym.is_undefined() || sym.shndx == SHN_COMMON {
-                continue;
-            }
-            let replace = match def_syms.get(sym.name.as_str()) {
-                None => true,
-                Some(&(_, _, _, _, info)) => (info >> 4) == STB_WEAK && sym.is_global(),
-            };
-            if replace {
-                def_syms.insert(
-                    sym.name.to_string(),
-                    (oi, sym.shndx, sym.value, sym.size, sym.info),
-                );
+    let explicit_discard = script
+        .sections
+        .iter()
+        .any(|item| matches!(item, SectionsItem::Output(def) if def.name == "/DISCARD/"));
+    if explicit_discard {
+        // GNU applies /DISCARD/ at placement, after the GC sweep. A retained
+        // input can still keep its referents even when the script omits it.
+        // Keep the omission visible to FDE and dynamic-export planning.
+        for (oi, obj) in objects.iter().enumerate() {
+            for (si, sec) in obj.sections.iter().enumerate() {
+                if is_script_input(sec)
+                    && script_destination(&script, &sec.name) == Some("/DISCARD/")
+                {
+                    dead_sections.insert((oi, si));
+                }
             }
         }
     }
@@ -1315,6 +1350,8 @@ fn link_with_script_machine(
                 }
             }
         }
+    }
+    if !dead_sections.is_empty() {
         linker_common::prune_dead_fdes(objects, &dead_sections);
     }
 
@@ -1322,10 +1359,10 @@ fn link_with_script_machine(
     // (its section address is zero). Expose that temporary absolute view to
     // the expression planner, not to ordinary relocations or output symbols.
     let mut discarded_values = Vec::new();
-    if extras.orphan_handling == OrphanHandling::Discard {
+    if extras.orphan_handling == OrphanHandling::Discard && !defsym_defs.is_empty() {
         for (name, row) in &mut def_syms {
-            if dead_sections.contains(&(row.0, row.1 as usize)) {
-                discarded_values.push((name.clone(), row.2));
+            if row.1 != SHN_ABS && dead_sections.contains(&(row.0, row.1 as usize)) {
+                discarded_values.push((name.clone(), *row));
                 *row = defsym_row(row.2);
             }
         }
@@ -1364,14 +1401,14 @@ fn link_with_script_machine(
     if !discarded_values.is_empty() {
         let overrides: FxHashSet<&str> =
             defsym_defs.iter().map(|(name, _)| name.as_str()).collect();
-        for (name, value) in discarded_values {
+        for (name, row) in discarded_values {
             // Deferred expressions can mix this absolute with a live address.
             script_defsyms
                 .shadow
                 .entry(name.clone())
-                .or_insert_with(|| defsym_row(value));
+                .or_insert_with(|| defsym_row(row.2));
             if !overrides.contains(name.as_str()) {
-                def_syms.remove(&name);
+                def_syms.insert(name, row);
             }
         }
     }
@@ -1382,7 +1419,7 @@ fn link_with_script_machine(
     let mut hidden_object_syms: FxHashSet<String> = FxHashSet::default();
     for obj in objects.iter() {
         for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.is_undefined() {
+            if sym.name.is_empty() || sym.is_local() {
                 continue;
             }
             // STV_HIDDEN = 2, STV_INTERNAL = 1, STV_PROTECTED = 3 (still exported).
@@ -1415,6 +1452,9 @@ fn link_with_script_machine(
             // a script-linked shared object.
             let mut exports: Vec<String> = def_syms
                 .iter()
+                .filter(|&(_, &(oi, shndx, _, _, _))| {
+                    shndx == SHN_ABS || !dead_sections.contains(&(oi, shndx as usize))
+                })
                 .filter(|(name, _)| version.matches_global(name))
                 .filter(|(name, _)| !hidden_object_syms.contains(name.as_str()))
                 .map(|(name, _)| name.clone())
@@ -1499,8 +1539,6 @@ fn link_with_script_machine(
         if extras.orphan_handling == OrphanHandling::Discard && !orphans.is_empty() {
             dead_sections.extend(orphans);
             unassigned.retain(|input| !dead_sections.contains(input));
-            def_syms
-                .retain(|_, location| !dead_sections.contains(&(location.0, location.1 as usize)));
             linker_common::prune_dead_fdes(objects, &dead_sections);
         }
     }
@@ -2506,7 +2544,7 @@ fn link_with_script_machine(
                 }
                 return placed_map.get(&(doi, shndx as usize)).map(|b| b + value);
             }
-            if sym.is_weak() {
+            if sym.is_undefined() && sym.is_weak() {
                 return Some(0);
             }
             return None;

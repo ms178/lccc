@@ -446,3 +446,8 @@ substitute.
   coverage, and strict correctness gates are unchanged. Clang 23.1.5 and
   authenticated ICX 2026.2 participate in the separate Huffman correctness
   contract; neither is silently treated as a timing reference for that lane.
+
+The next pass addresses standalone, script-driven, relocatable, and shared
+ELF link paths with independent failure witnesses. See [the ELF mode and
+symbol-provenance audit](ELF-SYMBOL-RESOLUTION-AUDIT.md) for the 23 changes,
+reference policy, remaining scope, and exact replay commands.

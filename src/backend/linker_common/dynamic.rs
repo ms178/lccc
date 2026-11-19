@@ -12,7 +12,7 @@ use super::resolve_lib::resolve_lib;
 use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
 use super::types::{DynSymbol, Elf64Object};
 use crate::backend::elf::{
-    ELF_MAGIC, LinkerScriptEntry, SHN_COMMON, SHN_UNDEF, STB_WEAK, STT_FILE, STT_OBJECT,
+    ELF_MAGIC, LinkerScriptEntry, SHN_ABS, SHN_COMMON, SHN_UNDEF, STB_WEAK, STT_FILE, STT_OBJECT,
     STT_SECTION, STV_DEFAULT, parse_linker_script_entries,
 };
 
@@ -378,8 +378,7 @@ fn import_shared_data<G: GlobalSymbolOps>(
 /// and undefined references. For defined symbols, a GLOBAL definition
 /// replaces a WEAK one. The `should_replace_extra` callback allows x86's
 /// linker to also check `is_dynamic` when deciding whether to replace an
-/// existing symbol. A definition in a discarded COMDAT copy never displaces
-/// another (see `comdat::in_discarded_group`).
+/// existing symbol. Discarded COMDAT members do not supply definitions.
 pub fn register_symbols_elf64<G: GlobalSymbolOps>(
     prior: &super::ObjectSet,
     obj: &Elf64Object,
@@ -390,7 +389,11 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
     // WHOLE table (re-hash every existing key string); with 40k-symbol
     // objects the doubling cascade dominated registration time.
     let obj_idx = prior.len();
-    globals.reserve(obj.symbols.len());
+    let discarded = super::comdat::discarded_members(prior, obj);
+    // ELF places locals before non-locals. This is a capacity hint, not a
+    // traversal bound, so even irregular input ordering cannot lose a name.
+    let first_global = obj.symbols.partition_point(|sym| sym.is_local());
+    globals.reserve(obj.symbols.len() - first_global);
     // PERF: single-lookup registration via get_mut + in-place replacement.
     // The old shape did `globals.get(&name)` followed by
     // `globals.insert(name.clone(), ..)` — two hashes of the string PLUS a
@@ -402,7 +405,10 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
         if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE {
             continue;
         }
-        if sym.name.is_empty() || sym.is_local() {
+        if sym.name.is_empty()
+            || sym.is_local()
+            || (!discarded.is_empty() && discarded.contains(&(sym.shndx as usize)))
+        {
             continue;
         }
 
@@ -415,32 +421,33 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                 }
                 Some(e) => {
                     let e_weak = e.info() >> 4 == STB_WEAK;
-                    // A tentative (COMMON) definition is superseded by any
-                    // real definition (GNU ld / mold behavior).
                     let e_common = e.section_idx() == SHN_COMMON;
-                    // Only asked where this definition would displace or
-                    // clash with an existing one (see the doc comment).
-                    let discarded_copy =
-                        || super::comdat::in_discarded_group(prior, obj, sym.shndx as usize);
-                    if !e.is_defined() || should_replace_extra(e) {
+                    if !e.is_defined()
+                        || should_replace_extra(e)
+                        || (sym.is_strong() && (e_common || e_weak))
+                    {
                         replace_keeping_visibility(e, G::new_defined(obj_idx, sym));
-                    } else if (e_common || (e_weak && sym.is_global())) && !discarded_copy() {
-                        replace_keeping_visibility(e, G::new_defined(obj_idx, sym));
-                    } else if sym.is_global()
+                    } else if sym.is_strong()
                         && !e_weak
                         && !e.is_dynamic()
-                        && e.is_defined()
-                        && !discarded_copy()
+                        && !prior.allow_multiple_definition()
+                        && !(e.section_idx() == SHN_ABS
+                            && sym.shndx == SHN_ABS
+                            && e.value() == sym.value)
                     {
-                        // Two strong definitions of the same symbol: this is a
-                        // hard error in every mainstream linker. Silently keeping
-                        // the first definition produces subtly wrong programs.
+                        let first = e.defined_in().and_then(|i| {
+                            if i == obj_idx {
+                                Some(obj)
+                            } else {
+                                prior.get(i)
+                            }
+                        });
+                        let source = first.map_or("<linker>", |o| o.source_name.as_str());
                         return Err(format!(
-                            "multiple definition of '{}' (duplicate in {})",
-                            sym.name, obj.source_name
+                            "multiple definition of '{}' in {}; first defined in {}",
+                            sym.name, obj.source_name, source
                         ));
                     }
-                    // else: new definition is weak and existing is strong; keep existing.
                 }
             }
         } else if sym.shndx == SHN_COMMON {
@@ -467,7 +474,9 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                         && sym.visibility() == STV_DEFAULT
                         && e.visibility() == STV_DEFAULT
                         && super::symbols::shared_def_overrides_common(e.info());
-                    if !e.is_defined() && !keeps {
+                    if e.section_idx() == SHN_COMMON {
+                        e.merge_common(sym);
+                    } else if !keeps && (!e.is_defined() || e.info() >> 4 == STB_WEAK) {
                         // A reference registered since that library was
                         // loaded is bound to it just the same; one already
                         // bound to another export (a function) is not.
@@ -477,11 +486,8 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                         } else {
                             replace_keeping_visibility(e, G::new_common(obj_idx, sym));
                         }
-                    } else if e.section_idx() == SHN_COMMON && sym.size > e.size() {
-                        // COMMON vs COMMON: the largest instance wins (GNU semantics).
-                        replace_keeping_visibility(e, G::new_common(obj_idx, sym));
                     }
-                    // COMMON vs real definition: the real definition wins; ignore.
+                    // A strong regular definition takes precedence over COMMON.
                 }
             }
             if let Some((soname, dsym, exports)) = import {
@@ -551,10 +557,11 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
             || sym.name.is_empty()
             || sym.is_local()
             || sym.is_undefined()
+            || (!discarded.is_empty() && discarded.contains(&(sym.shndx as usize)))
         {
             continue;
         }
-        let full_name = sym.name.to_string();
+        let full_name = sym.name.as_str();
         let Some(pos) = full_name.find("@@") else {
             continue;
         };
@@ -572,7 +579,7 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                     || should_replace_extra(existing)
                     || (existing.info() >> 4 == STB_WEAK) =>
             {
-                *existing = alias;
+                replace_keeping_visibility(existing, alias);
             }
             Some(_) => {}
         }

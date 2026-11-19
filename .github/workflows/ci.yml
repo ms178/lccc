@@ -2507,6 +2507,7 @@ jobs:
     - name: Linker test suite (lccc-ld vs GNU ld, x86-64 + i386)
       env:
         LCCC_I386_SCRATCH_ROOT: ${{ runner.temp }}/i386-linker-scratch
+        LCCC_REQUIRE_SYMBOL_CROSS: '1'
       run: |
         LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
@@ -3891,6 +3892,12 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: Native ELF selection across GCC, Clang and authenticated ICX objects
+      run: |
+        set -euo pipefail
+        python3 tests/linker/elf_symbol_contract.py --ld target/fastbuild/lccc-ld \
+          --vendor-cc "gcc=$GCC16" --vendor-cc "clang=$CLANG" \
+          --vendor-cc "icx=$LCCC_ICX_BIN" 2>&1 | tee intel-evidence/elf-symbol-selection.log
     - name: Huffman heap boundaries and checksum against GCC, Clang and ICX
       run: |
         set -euo pipefail

@@ -17,7 +17,7 @@
 //!   symbol: the first instance wins, later instances' member sections are
 //!   dropped along with their relocations and local symbols.
 //! * Global symbols are deduplicated: strong beats weak, defined beats
-//!   undefined, largest COMMON wins, duplicate strong definitions error.
+//!   undefined, COMMON size/alignment merge, duplicate strong definitions error by default.
 //! * Local symbols (including STT_FILE) are all preserved, values rebased.
 
 use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
@@ -26,8 +26,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::elf::{
     ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ELFOSABI_GNU, EM_X86_64, ET_REL, SHF_GNU_RETAIN, SHN_ABS,
     SHN_COMMON, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA,
-    SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_GNU_IFUNC, STT_SECTION,
-    read_u32, w16, w32, w64,
+    SHT_STRTAB, SHT_SYMTAB, STB_WEAK, STT_FILE, STT_GNU_IFUNC, STT_SECTION, w16, w32, w64,
 };
 use crate::backend::linker_common::{Elf64Object, write_elf64_shdr};
 
@@ -43,48 +42,13 @@ struct RelOutSec {
     inputs: Vec<(usize, usize, u64)>,
 }
 
-pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<(), String> {
+pub fn link_relocatable(
+    objects: &[Elf64Object],
+    output_path: &str,
+    allow_multiple_definition: bool,
+) -> Result<(), String> {
     // ── 1. COMDAT group deduplication ──────────────────────────────────
-    // dead: input sections dropped because their group lost.
-    let mut dead: FxHashSet<(usize, usize)> = FxHashSet::default();
-    let mut group_signatures: FxHashSet<String> = FxHashSet::default();
-    for (oi, obj) in objects.iter().enumerate() {
-        for (si, sec) in obj.sections.iter().enumerate() {
-            if sec.sh_type != SHT_GROUP {
-                continue;
-            }
-            let data = &obj.section_data[si];
-            if data.len() < 4 {
-                continue;
-            }
-            let flags = read_u32(data, 0);
-            if flags & 1 == 0 {
-                continue;
-            } // not GRP_COMDAT
-            // Signature symbol: symtab entry sec.info
-            let sig_idx = sec.info as usize;
-            let sig = obj
-                .symbols
-                .get(sig_idx)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            if sig.is_empty() {
-                continue;
-            }
-            let is_dup = !group_signatures.insert(sig.to_string());
-            if is_dup {
-                for k in (4..data.len()).step_by(4) {
-                    if k + 4 > data.len() {
-                        break;
-                    }
-                    let member = read_u32(data, k) as usize;
-                    if member < obj.sections.len() {
-                        dead.insert((oi, member));
-                    }
-                }
-            }
-        }
-    }
+    let dead = crate::backend::linker_common::comdat::plan_comdat(objects).dead;
 
     // ── 2. Merge input sections by name and GNU retention ──────────────
     // GNU ld keeps same-named R and non-R sections distinct under -r:
@@ -158,6 +122,7 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
         value: u64,
         size: u64,
     }
+    #[derive(Clone, Copy)]
     enum SymShndx {
         OutSec(usize),
         Abs,
@@ -245,97 +210,102 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
     }
     let n_local = out_syms.len() + 1; // + NULL entry
 
-    // Second pass: globals with deduplication.
-    // name -> index into out_syms
-    let mut global_idx: FxHashMap<String, usize> = FxHashMap::default();
+    // Second pass: globals with deduplication. Borrow input names for the
+    // index; output rows own their names and can be updated in place.
+    let mut global_idx: FxHashMap<&str, usize> = FxHashMap::default();
     for (oi, obj) in objects.iter().enumerate() {
+        let has_discard = !dead.is_empty()
+            && obj
+                .sections
+                .iter()
+                .enumerate()
+                .any(|(si, _)| dead.contains(&(oi, si)));
+        let live_refs: FxHashSet<u32> = if has_discard {
+            obj.relocations
+                .iter()
+                .enumerate()
+                .filter(|(si, _)| sec_map.contains_key(&(oi, *si)))
+                .flat_map(|(_, rs)| rs.iter().map(|r| r.sym_idx))
+                .collect()
+        } else {
+            FxHashSet::default()
+        };
         for (yi, sym) in obj.symbols.iter().enumerate() {
-            if sym.is_local() || sym.name.is_empty() {
+            if sym.is_local()
+                || sym.name.is_empty()
+                || matches!(sym.sym_type(), STT_SECTION | STT_FILE)
+            {
                 continue;
             }
-            if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE {
+            let in_dead = has_discard && dead.contains(&(oi, sym.shndx as usize));
+            if in_dead && !live_refs.contains(&(yi as u32)) {
                 continue;
             }
-
-            // Definitions inside dead COMDAT sections become non-definitions
-            // (their surviving twin provides the symbol).
-            let in_dead = sym.shndx != SHN_UNDEF
-                && sym.shndx != SHN_ABS
-                && sym.shndx != SHN_COMMON
-                && dead.contains(&(oi, sym.shndx as usize));
-
-            let is_defined = !sym.is_undefined() && sym.shndx != SHN_COMMON && !in_dead;
-            let is_common = sym.shndx == SHN_COMMON;
-
-            let (shndx_kind, value): (SymShndx, u64) = if in_dead || sym.is_undefined() {
-                (SymShndx::Undef, 0)
+            let (kind, value, size) = if in_dead || sym.is_undefined() {
+                (SymShndx::Undef, 0, 0)
             } else if sym.shndx == SHN_ABS {
-                (SymShndx::Abs, sym.value)
-            } else if is_common {
-                (SymShndx::Common, sym.value) // value = alignment for COMMON
+                (SymShndx::Abs, sym.value, sym.size)
+            } else if sym.shndx == SHN_COMMON {
+                (SymShndx::Common, sym.value, sym.size)
             } else if let Some(&(out_i, off)) = sec_map.get(&(oi, sym.shndx as usize)) {
-                (SymShndx::OutSec(out_i), sym.value + off)
+                (SymShndx::OutSec(out_i), sym.value + off, sym.size)
             } else {
-                (SymShndx::Undef, 0)
+                (SymShndx::Undef, 0, 0)
             };
-
-            match global_idx.get(sym.name.as_str()) {
+            let rank = |kind, info: u8| match kind {
+                SymShndx::Undef => i32::from(info >> 4 != STB_WEAK),
+                SymShndx::Common => 3,
+                _ if info >> 4 == STB_WEAK => 2,
+                _ => 4,
+            };
+            let name = sym.name.as_str();
+            let idx = match global_idx.get(name) {
                 None => {
                     let idx = out_syms.len();
-                    global_idx.insert(sym.name.to_string(), idx);
-                    remaps[oi].insert(yi as u32, ((idx + 1) as u32, 0));
+                    global_idx.insert(name, idx);
                     out_syms.push(OutSym {
                         name: sym.name.to_string(),
                         info: sym.info,
                         other: sym.other,
-                        shndx_kind,
+                        shndx_kind: kind,
                         value,
-                        size: sym.size,
+                        size,
                     });
+                    idx
                 }
                 Some(&idx) => {
-                    remaps[oi].insert(yi as u32, ((idx + 1) as u32, 0));
-                    let existing = &mut out_syms[idx];
-                    let e_defined =
-                        !matches!(existing.shndx_kind, SymShndx::Undef | SymShndx::Common);
-                    let e_weak = existing.info >> 4 == STB_WEAK;
-                    let e_common = matches!(existing.shndx_kind, SymShndx::Common);
-                    if is_defined {
-                        if !e_defined || (e_weak && sym.is_global()) {
-                            *existing = OutSym {
-                                name: sym.name.to_string(),
-                                info: sym.info,
-                                other: sym.other,
-                                shndx_kind,
-                                value,
-                                size: sym.size,
-                            };
-                        } else if e_defined && !e_weak && sym.is_global() {
-                            return Err(format!(
-                                "-r: multiple definition of '{}' (duplicate in {})",
-                                sym.name, obj.source_name
-                            ));
-                        }
-                    } else if is_common {
-                        if e_common && sym.size > existing.size {
-                            existing.size = sym.size;
-                            if sym.value > existing.value {
-                                existing.value = sym.value;
-                            }
-                        } else if !e_defined && !e_common {
-                            *existing = OutSym {
-                                name: sym.name.to_string(),
-                                info: sym.info,
-                                other: sym.other,
-                                shndx_kind: SymShndx::Common,
-                                value,
-                                size: sym.size,
-                            };
-                        }
+                    use crate::backend::linker_common::most_constraining_visibility;
+                    let e = &mut out_syms[idx];
+                    let visibility = most_constraining_visibility(e.other, sym.other);
+                    let new_rank = rank(kind, sym.info);
+                    let old_rank = rank(e.shndx_kind, e.info);
+                    if matches!(kind, SymShndx::Common) && matches!(e.shndx_kind, SymShndx::Common)
+                    {
+                        e.value = e.value.max(value);
+                        e.size = e.size.max(size);
+                    } else if new_rank > old_rank {
+                        e.info = sym.info;
+                        e.other = sym.other;
+                        e.shndx_kind = kind;
+                        e.value = value;
+                        e.size = size;
+                    } else if new_rank == 4
+                        && old_rank == 4
+                        && !allow_multiple_definition
+                        && !(matches!(kind, SymShndx::Abs)
+                            && matches!(e.shndx_kind, SymShndx::Abs)
+                            && e.value == value)
+                    {
+                        return Err(format!(
+                            "-r: multiple definition of '{}' (duplicate in {})",
+                            name, obj.source_name,
+                        ));
                     }
-                    // undefined ref against anything existing: no change
+                    e.other = (e.other & !3) | visibility;
+                    idx
                 }
-            }
+            };
+            remaps[oi].insert(yi as u32, ((idx + 1) as u32, 0));
         }
     }
 
@@ -629,13 +599,10 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
         .map_err(|e| format!("failed to write '{}': {}", output_path, e))
 }
 
-// STB_LOCAL/STB_GLOBAL imported for potential callers; silence unused warnings.
-#[allow(dead_code)]
-const _: (u8, u8) = (STB_LOCAL, STB_GLOBAL);
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::elf::STB_GLOBAL;
     use crate::backend::linker_common::{
         Elf64Section, Elf64Symbol, SectionData, parse_elf64_object,
     };
@@ -699,7 +666,7 @@ mod tests {
         let objs = vec![make_obj("f1"), make_obj("f2")];
         let tmp = std::env::temp_dir().join(format!("lccc_lk20_{}.o", std::process::id()));
         let path = tmp.to_string_lossy().into_owned();
-        link_relocatable(&objs, &path).expect("link_relocatable should succeed");
+        link_relocatable(&objs, &path, false).expect("link_relocatable should succeed");
         let bytes = std::fs::read(&tmp).expect("read output .o");
         let _ = std::fs::remove_file(&tmp);
         let parsed = parse_elf64_object(&bytes, "merged.o", EM_X86_64).expect("parse merged .o");
