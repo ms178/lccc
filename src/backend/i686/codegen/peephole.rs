@@ -6969,6 +6969,29 @@ fn compute_gpr_live_out_hypothetical(
     live_out
 }
 
+/// Classify a `Cmp`-kind line as a compare of register `rn` that can be
+/// re-pointed at the register's stack slot, returning the immediate to use.
+///
+/// Zero-allocation forms of the old `format!`-built patterns:
+/// `testl RN, RN` is prefix + one split + two operand compares,
+/// `..., RN` is two chained suffix strips (`RN` then `", "`, both
+/// mandatory) — each accepts exactly the strings the owned concatenation
+/// accepted, without the two per-Cmp-line heap allocations the caller's
+/// scan loop used to make.
+fn slot_compare_immediate<'a>(s: &'a str, rn: &str) -> Option<&'a str> {
+    let is_test = s
+        .strip_prefix("testl ")
+        .and_then(|o| o.split_once(", "))
+        .is_some_and(|(a, b)| a == rn && b == rn);
+    if is_test {
+        return Some("$0");
+    }
+    s.strip_prefix("cmpl ")
+        .and_then(|rest| rest.strip_suffix(rn))
+        .and_then(|rest| rest.strip_suffix(", "))
+        .filter(|lhs| lhs.starts_with('$') && !lhs.contains(rn))
+}
+
 /// Use whole-function GPR liveness to remove dead moves and retarget safe
 /// accumulator update/copy-back chains.  The earlier bounded scans intentionally
 /// stop at branches, so they cannot reason about loop backedges or both sides of
@@ -7213,26 +7236,7 @@ fn optimize_cfg_register_liveness(
                 continue;
             }
             let s = trimmed(store, &infos[j], j);
-            let rn = reg32_name(reg);
-            // Zero-allocation forms of the old `format!`-built patterns:
-            // `testl RN, RN` is prefix + one split + two operand compares,
-            // `..., RN` is two chained suffix strips (`RN` then `", "`,
-            // both mandatory) — each accepts exactly the strings the owned
-            // concatenation accepted, without the two per-Cmp-line heap
-            // allocations this loop used to make.
-            let is_test = s
-                .strip_prefix("testl ")
-                .and_then(|o| o.split_once(", "))
-                .is_some_and(|(a, b)| a == rn && b == rn);
-            let imm: Option<&str> = if is_test {
-                Some("$0")
-            } else {
-                s.strip_prefix("cmpl ")
-                    .and_then(|rest| rest.strip_suffix(rn))
-                    .and_then(|rest| rest.strip_suffix(", "))
-                    .filter(|lhs| lhs.starts_with('$') && !lhs.contains(rn))
-            };
-            let Some(imm) = imm else {
+            let Some(imm) = slot_compare_immediate(s, reg32_name(reg)) else {
                 local += 1;
                 continue;
             };
