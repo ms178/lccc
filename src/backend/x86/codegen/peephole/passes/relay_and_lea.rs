@@ -4777,67 +4777,108 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
 
-        // --- apply, prove, or roll back (same discipline as
-        // --- `fold_copy_into_lea_base`) -----------------------------------
-        let orig_copy = store.get(li).to_string();
-        mark_nop(&mut infos[li]);
-        for &(idx, _, ref new_t) in &rewrites {
-            replace_line(store, &mut infos[idx], idx, new_t.clone());
-        }
-        let orig_copy_back = dropped_copy_back.map(|idx| {
-            let orig = store.get(idx).to_string();
-            mark_nop(&mut infos[idx]);
-            (idx, orig)
-        });
-        // The proof needs the solution of the REWRITTEN text.  Every edit
-        // lies in `li..=last` (the copy, the consumer at `j > li`, and the
-        // renamed reads / dropped copy-back after it), so a splice of a copy
-        // of `lv` over that span is that solution (`refresh_span` falls back
-        // to re-solving the one function when the span is not straight-line).
-        // Re-solving the whole file per candidate made this pass 3% of
-        // compiling zstd's huf_compress.c.
-        let last = rewrites
-            .iter()
-            .map(|r| r.0)
-            .chain(orig_copy_back.as_ref().map(|c| c.0))
-            .fold(j, usize::max);
-        // Probe in place with an exact span snapshot instead of cloning the
-        // whole-file `FileLiveness` per candidate (889 clones per profiling
-        // TU, ~1.3B instructions of memcpy): `refresh_span`'s write-set is
-        // bounded to the enclosing function's span, which the snapshot
-        // restores bit for bit on rollback.  When the span is unavailable
-        // (edited CFI delimiters — never happens mid-pass), fail closed by
-        // rolling back the rewrite.
-        let snap = lv.snapshot_function(store, infos, li);
-        let proven = snap.is_some() && {
-            lv.refresh_span(store, infos, li, last);
-            // The deadness query is anchored at the consumer line, NOT at the
-            // copy: the copy is NOP-marked at this point and `FileLiveness` only
-            // marks real instructions as known, so a query at its index would
-            // answer `None` and silently degrade the proof to its syntactic
-            // fallbacks. Nothing between the copy and the consumer touches `%D`,
-            // so "dead after the consumer" is exactly "dead after the (deleted)
-            // copy" on the rewritten text.
-            provably_dead_lv(&lv, store, infos, j, d_fam, &[li, j])
+        let plan = RmwRewritePlan {
+            li,
+            j,
+            d_fam,
+            rewrites,
+            dropped_copy_back,
         };
-        if proven {
+        if apply_and_prove_rmw_rewrite(store, infos, &mut lv, plan) {
             changed = true;
             i = j + 1;
-        } else {
-            if let Some(snap) = &snap {
-                lv.restore_function(snap);
-            }
-            replace_line(store, &mut infos[li], li, orig_copy);
-            for (idx, orig, _) in rewrites {
-                replace_line(store, &mut infos[idx], idx, orig);
-            }
-            if let Some((idx, orig)) = orig_copy_back {
-                replace_line(store, &mut infos[idx], idx, orig);
-            }
-            // `lv` still describes the restored text.
         }
     }
     changed
+}
+
+/// One coalescing candidate of [`coalesce_copy_into_rmw`], ready to apply:
+/// the copy at `li`, its RMW consumer at `j` writing family `d_fam`, the
+/// text `rewrites` (index, raw stored original for rollback, new text), and
+/// the optional now-redundant copy-back line to drop.
+struct RmwRewritePlan {
+    li: usize,
+    j: usize,
+    d_fam: RegId,
+    rewrites: Vec<(usize, String, String)>,
+    dropped_copy_back: Option<usize>,
+}
+
+/// Apply-prove-rollback tail of [`coalesce_copy_into_rmw`] (same discipline
+/// as `fold_copy_into_lea_base`): NOP the copy, splice in the rewrites, drop
+/// the optional copy-back, and prove `d_fam` dead after the consumer on the
+/// REWRITTEN text.  On failure every edit is rolled back — the text from the
+/// saved originals, the liveness bit for bit from the span snapshot — and
+/// `false` is returned; `lv` then still describes the restored text.
+fn apply_and_prove_rmw_rewrite(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    lv: &mut FileLiveness,
+    plan: RmwRewritePlan,
+) -> bool {
+    let RmwRewritePlan {
+        li,
+        j,
+        d_fam,
+        rewrites,
+        dropped_copy_back,
+    } = plan;
+    let orig_copy = store.get(li).to_string();
+    mark_nop(&mut infos[li]);
+    for &(idx, _, ref new_t) in &rewrites {
+        replace_line(store, &mut infos[idx], idx, new_t.clone());
+    }
+    let orig_copy_back = dropped_copy_back.map(|idx| {
+        let orig = store.get(idx).to_string();
+        mark_nop(&mut infos[idx]);
+        (idx, orig)
+    });
+    // The proof needs the solution of the REWRITTEN text.  Every edit
+    // lies in `li..=last` (the copy, the consumer at `j > li`, and the
+    // renamed reads / dropped copy-back after it), so a splice of a copy
+    // of `lv` over that span is that solution (`refresh_span` falls back
+    // to re-solving the one function when the span is not straight-line).
+    // Re-solving the whole file per candidate made this pass 3% of
+    // compiling zstd's huf_compress.c.
+    let last = rewrites
+        .iter()
+        .map(|r| r.0)
+        .chain(orig_copy_back.as_ref().map(|c| c.0))
+        .fold(j, usize::max);
+    // Probe in place with an exact span snapshot instead of cloning the
+    // whole-file `FileLiveness` per candidate (889 clones per profiling
+    // TU, ~1.3B instructions of memcpy): `refresh_span`'s write-set is
+    // bounded to the enclosing function's span, which the snapshot
+    // restores bit for bit on rollback.  When the span is unavailable
+    // (edited CFI delimiters — never happens mid-pass), fail closed by
+    // rolling back the rewrite.
+    let snap = lv.snapshot_function(store, infos, li);
+    let proven = snap.is_some() && {
+        lv.refresh_span(store, infos, li, last);
+        // The deadness query is anchored at the consumer line, NOT at the
+        // copy: the copy is NOP-marked at this point and `FileLiveness` only
+        // marks real instructions as known, so a query at its index would
+        // answer `None` and silently degrade the proof to its syntactic
+        // fallbacks. Nothing between the copy and the consumer touches `%D`,
+        // so "dead after the consumer" is exactly "dead after the (deleted)
+        // copy" on the rewritten text.
+        provably_dead_lv(lv, store, infos, j, d_fam, &[li, j])
+    };
+    if proven {
+        return true;
+    }
+    if let Some(snap) = &snap {
+        lv.restore_function(snap);
+    }
+    replace_line(store, &mut infos[li], li, orig_copy);
+    for (idx, orig, _) in rewrites {
+        replace_line(store, &mut infos[idx], idx, orig);
+    }
+    if let Some((idx, orig)) = orig_copy_back {
+        replace_line(store, &mut infos[idx], idx, orig);
+    }
+    // `lv` still describes the restored text.
+    false
 }
 
 /// `Some(is_qword)` when `t` is exactly the full-width copy `mov{l,q} %D, %S`
