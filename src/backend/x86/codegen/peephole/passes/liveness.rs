@@ -1374,12 +1374,26 @@ impl FileLiveness {
                 if let Some((cached, tret)) = banks.0.get(&key)
                     && cached.len() == fn_len
                 {
-                    for (i, c) in cached.iter().enumerate() {
-                        self.live_out[start + i] = c.live_out;
-                        self.live_in[start + i] = c.live_in;
-                        self.known[start + i] = c.known;
-                        self.structural[start + i] = c.structural;
-                        self.effect[start + i] = c.effect;
+                    // Five zipped streams: equal-length slices let the
+                    // compiler drop every per-element bounds check (the
+                    // indexed spelling cost ~0.5B instructions per TU).
+                    let lo = &mut self.live_out[start..end];
+                    let li = &mut self.live_in[start..end];
+                    let kn = &mut self.known[start..end];
+                    let st = &mut self.structural[start..end];
+                    let ef = &mut self.effect[start..end];
+                    for (c, ((((lo, li), kn), st), ef)) in cached.iter().zip(
+                        lo.iter_mut()
+                            .zip(li.iter_mut())
+                            .zip(kn.iter_mut())
+                            .zip(st.iter_mut())
+                            .zip(ef.iter_mut()),
+                    ) {
+                        *lo = c.live_out;
+                        *li = c.live_in;
+                        *kn = c.known;
+                        *st = c.structural;
+                        *ef = c.effect;
                     }
                     if *tret {
                         self.textual_ret.insert(start);
@@ -1417,15 +1431,23 @@ impl FileLiveness {
                     banks.1 = std::mem::take(&mut banks.0);
                 }
                 let mut cached = Vec::with_capacity(fn_len);
-                for i in start..end {
-                    cached.push(CachedLine {
-                        live_out: self.live_out[i],
-                        live_in: self.live_in[i],
-                        effect: self.effect[i],
-                        known: self.known[i],
-                        structural: self.structural[i],
-                    });
-                }
+                // Zipped gather for the same reason as the hit path: the
+                // indexed loop re-checked five slice bounds per line.
+                cached.extend(
+                    self.live_out[start..end]
+                        .iter()
+                        .zip(self.live_in[start..end].iter())
+                        .zip(self.known[start..end].iter())
+                        .zip(self.structural[start..end].iter())
+                        .zip(self.effect[start..end].iter())
+                        .map(|((((&lo, &li), &kn), &st), &ef)| CachedLine {
+                            live_out: lo,
+                            live_in: li,
+                            effect: ef,
+                            known: kn,
+                            structural: st,
+                        }),
+                );
                 banks
                     .0
                     .insert(key, (cached, self.textual_ret.contains(&start)));
