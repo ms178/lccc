@@ -212,6 +212,7 @@ pub fn build_global_symbols(
                 sh_type: SHT_NOBITS,
                 sh_flags: SHF_ALLOC | SHF_WRITE,
                 data: Vec::new(),
+                nobits_size: 0,
                 vaddr: 0,
                 entsize: 0,
                 script_write: false,
@@ -221,23 +222,17 @@ pub fn build_global_symbols(
         });
         let bss = &mut merged_sections[bss_idx];
         let align = sym.value.max(1);
-        let cur = bss.data.len() as u64;
+        let cur = bss.size();
         let Some(off) = cur
             .checked_next_multiple_of(align)
             .filter(|_| align.is_power_of_two())
         else {
             return Err(format!("invalid COMMON alignment {align} for '{name}'"));
         };
-        let Some(end) = off
+        let end = off
             .checked_add(sym.size)
-            .and_then(|end| usize::try_from(end).ok())
-        else {
-            return Err(format!("COMMON symbol '{name}' exceeds address space"));
-        };
-        bss.data
-            .try_reserve(end - bss.data.len())
-            .map_err(|_| format!("cannot allocate COMMON symbol '{name}' ({end} bytes of .bss)"))?;
-        bss.data.resize(end, 0);
+            .ok_or_else(|| format!("COMMON symbol '{name}' exceeds address space"))?;
+        bss.zero_extend_to(end)?;
         bss.align = bss.align.max(align);
         sym.value = off;
         sym.section_idx = Some(bss_idx);

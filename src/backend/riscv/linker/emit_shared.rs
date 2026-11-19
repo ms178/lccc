@@ -15,7 +15,8 @@ use super::got::{
 use super::relax::{LayoutProbe, RelaxProbeLayout, fill_relax_probe};
 use super::relocations::{
     GlobalSym, MergedSection, R_RISCV_64, R_RISCV_CALL, R_RISCV_CALL_PLT, R_RISCV_JAL,
-    R_RISCV_RVC_JUMP, align_up, section_order, write_phdr_at,
+    R_RISCV_RVC_JUMP, align_up, checked_layout_add, checked_layout_align, section_order,
+    write_phdr_at,
 };
 use super::{debug, reloc, symbols};
 use crate::backend::linker_common::build_id::BuildIdStyle;
@@ -162,6 +163,7 @@ pub fn emit_shared_library(
             sh_type: SHT_PROGBITS,
             sh_flags: SHF_ALLOC,
             data: vec![0u8; eh_frame_hdr_size],
+            nobits_size: 0,
             vaddr: 0,
             entsize: 0,
             script_write: false,
@@ -246,7 +248,7 @@ pub fn emit_shared_library(
     let mut prev_note = false;
     for &si in &sec_indices {
         let ms = &merged_sections[si];
-        if ms.sh_flags & SHF_ALLOC == 0 || ms.data.is_empty() || ms.name == ".riscv.attributes" {
+        if ms.sh_flags & SHF_ALLOC == 0 || ms.size() == 0 || ms.name == ".riscv.attributes" {
             continue;
         }
         let is_note = ms.sh_type == SHT_NOTE;
@@ -622,17 +624,18 @@ pub fn emit_shared_library(
         let flags = merged_sections[si].sh_flags;
         let sh_type = merged_sections[si].sh_type;
         let a = merged_sections[si].align.max(1);
-        let dlen = merged_sections[si].data.len() as u64;
+        let dlen = merged_sections[si].size();
         if flags & SHF_TLS != 0 && sh_type == SHT_NOBITS {
-            let aligned = align_up(tls_mem_size, a);
-            merged_sections[si].vaddr = tls_vaddr + aligned;
-            tls_mem_size = aligned + dlen;
+            let aligned = checked_layout_align(tls_mem_size, a)?;
+            merged_sections[si].vaddr = checked_layout_add(tls_vaddr, aligned)?;
+            tls_mem_size = checked_layout_add(aligned, dlen)?;
             if a > tls_align {
                 tls_align = a;
             }
         }
     }
-    tls_mem_size = align_up(tls_mem_size, tls_align);
+    tls_mem_size = checked_layout_align(tls_mem_size, tls_align)?;
+    checked_layout_add(tls_vaddr, tls_mem_size)?;
 
     // BSS
     let bss_addr = base_addr + offset;
@@ -641,10 +644,10 @@ pub fn emit_shared_library(
         let sh_type = merged_sections[si].sh_type;
         let flags = merged_sections[si].sh_flags;
         let a = merged_sections[si].align.max(1);
-        let dlen = merged_sections[si].data.len() as u64;
+        let dlen = merged_sections[si].size();
         if sh_type == SHT_NOBITS && flags & SHF_ALLOC != 0 && flags & SHF_TLS == 0 {
-            let aligned = align_up(bss_addr + bss_size, a);
-            bss_size = aligned - bss_addr + dlen;
+            let aligned = checked_layout_align(checked_layout_add(bss_addr, bss_size)?, a)?;
+            bss_size = checked_layout_add(aligned, dlen)? - bss_addr;
             merged_sections[si].vaddr = aligned;
         }
     }

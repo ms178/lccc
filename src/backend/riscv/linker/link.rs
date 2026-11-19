@@ -432,7 +432,7 @@ fn link_objects(
     // ── Phase 2: Merge sections ─────────────────────────────────────────
 
     let (mut merged_sections, mut merged_map, input_sec_refs) =
-        sections::merge_sections(input_objs, merge_aliases);
+        sections::merge_sections(input_objs, merge_aliases)?;
     let attr_warnings =
         super::attributes::merge_into_output(input_objs, &mut merged_sections, &merged_map)?;
     if probe.is_none() {
@@ -765,7 +765,7 @@ fn link_shared_objects(
     // ── Phase 2: Merge sections ─────────────────────────────────────
 
     let (mut merged_sections, mut merged_map, input_sec_refs) =
-        sections::merge_sections(input_objs, link.merge_aliases);
+        sections::merge_sections(input_objs, link.merge_aliases)?;
     let attr_warnings =
         super::attributes::merge_into_output(input_objs, &mut merged_sections, &merged_map)?;
     if probe.is_none() {
