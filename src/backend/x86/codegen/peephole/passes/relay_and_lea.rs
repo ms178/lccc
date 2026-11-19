@@ -4801,20 +4801,32 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
             .map(|r| r.0)
             .chain(orig_copy_back.as_ref().map(|c| c.0))
             .fold(j, usize::max);
-        let mut lv2 = lv.clone();
-        lv2.refresh_span(store, infos, li, last);
-        // The deadness query is anchored at the consumer line, NOT at the
-        // copy: the copy is NOP-marked at this point and `FileLiveness` only
-        // marks real instructions as known, so a query at its index would
-        // answer `None` and silently degrade the proof to its syntactic
-        // fallbacks. Nothing between the copy and the consumer touches `%D`,
-        // so "dead after the consumer" is exactly "dead after the (deleted)
-        // copy" on the rewritten text.
-        if provably_dead_lv(&lv2, store, infos, j, d_fam, &[li, j]) {
-            lv = lv2;
+        // Probe in place with an exact span snapshot instead of cloning the
+        // whole-file `FileLiveness` per candidate (889 clones per profiling
+        // TU, ~1.3B instructions of memcpy): `refresh_span`'s write-set is
+        // bounded to the enclosing function's span, which the snapshot
+        // restores bit for bit on rollback.  When the span is unavailable
+        // (edited CFI delimiters — never happens mid-pass), fail closed by
+        // rolling back the rewrite.
+        let snap = lv.snapshot_function(store, infos, li);
+        let proven = snap.is_some() && {
+            lv.refresh_span(store, infos, li, last);
+            // The deadness query is anchored at the consumer line, NOT at the
+            // copy: the copy is NOP-marked at this point and `FileLiveness` only
+            // marks real instructions as known, so a query at its index would
+            // answer `None` and silently degrade the proof to its syntactic
+            // fallbacks. Nothing between the copy and the consumer touches `%D`,
+            // so "dead after the consumer" is exactly "dead after the (deleted)
+            // copy" on the rewritten text.
+            provably_dead_lv(&lv, store, infos, j, d_fam, &[li, j])
+        };
+        if proven {
             changed = true;
             i = j + 1;
         } else {
+            if let Some(snap) = &snap {
+                lv.restore_function(snap);
+            }
             replace_line(store, &mut infos[li], li, orig_copy);
             for (idx, orig, _) in rewrites {
                 replace_line(store, &mut infos[idx], idx, orig);

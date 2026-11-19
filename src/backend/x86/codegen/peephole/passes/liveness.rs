@@ -387,6 +387,19 @@ impl DeadWriteRefresh {
     }
 }
 
+/// Saved span of one function inside a [`FileLiveness`]; see
+/// [`FileLiveness::snapshot_function`].
+pub(super) struct FnSpanSnapshot {
+    start: usize,
+    end: usize,
+    live_out: Vec<u16>,
+    live_in: Vec<u16>,
+    known: Vec<bool>,
+    structural: Vec<bool>,
+    effect: Vec<(u16, u16)>,
+    textual_ret: bool,
+}
+
 #[derive(Clone)]
 pub(super) struct FileLiveness {
     /// Registers live immediately AFTER each line, when its function could be
@@ -835,6 +848,46 @@ impl FileLiveness {
     /// contains every mention of the mask families that it deletes
     /// (`compare_branch` re-verifies mentionedness of its transparent lines
     /// against the final carrier mask; labels are never transparent there).
+    /// Exact saved state of one function's span: everything a span-bounded
+    /// re-derivation (`reanalyse_with`, `refresh_span`, `refresh_at`) can
+    /// write.  Restoring it reproduces the pre-probe `FileLiveness` bit for
+    /// bit: the five per-line arrays are only ever published into
+    /// `start..end` by those paths, `textual_ret` only gains or loses
+    /// `start`, and `func_of` is written exclusively by `new()`.
+    pub(super) fn snapshot_function(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+    ) -> Option<FnSpanSnapshot> {
+        let (start, end) = self.recorded_function(store, infos, idx)?;
+        Some(FnSpanSnapshot {
+            start,
+            end,
+            live_out: self.live_out[start..end].to_vec(),
+            live_in: self.live_in[start..end].to_vec(),
+            known: self.known[start..end].to_vec(),
+            structural: self.structural[start..end].to_vec(),
+            effect: self.effect[start..end].to_vec(),
+            textual_ret: self.textual_ret.contains(&start),
+        })
+    }
+
+    /// Restore a span saved by [`FileLiveness::snapshot_function`].
+    pub(super) fn restore_function(&mut self, snap: &FnSpanSnapshot) {
+        let (start, end) = (snap.start, snap.end);
+        self.live_out[start..end].copy_from_slice(&snap.live_out);
+        self.live_in[start..end].copy_from_slice(&snap.live_in);
+        self.known[start..end].copy_from_slice(&snap.known);
+        self.structural[start..end].copy_from_slice(&snap.structural);
+        self.effect[start..end].copy_from_slice(&snap.effect);
+        if snap.textual_ret {
+            self.textual_ret.insert(start);
+        } else {
+            self.textual_ret.remove(&start);
+        }
+    }
+
     pub(super) fn live_after_dropping_region(
         &mut self,
         store: &LineStore,
@@ -847,37 +900,15 @@ impl FileLiveness {
         if idx >= self.known.len() || lo > hi || hi >= self.known.len() {
             return None;
         }
-        let (start, end) = self.recorded_function(store, infos, idx)?;
         // Probe in place, then restore the saved span exactly.  The probe
         // used to clone all seven whole-file vectors to protect the
-        // caller's (unmodified-program) solution — ~2.3% of all compile
-        // instructions on a 400-function TU for questions about ONE
-        // function.  `reanalyse_with`'s write-set is exactly: the five
-        // per-line arrays over `start..end` (solve_function publishes into
-        // `lines ⊆ start..end` and `structural[start..end]`) plus
-        // `textual_ret`'s membership of `start`; `func_of` is only written
-        // by `new()`.  Saving and restoring that span reproduces the
-        // caller-visible state bit for bit.
-        let saved_lo = self.live_out[start..end].to_vec();
-        let saved_li = self.live_in[start..end].to_vec();
-        let saved_kn = self.known[start..end].to_vec();
-        let saved_st = self.structural[start..end].to_vec();
-        let saved_ef = self.effect[start..end].to_vec();
-        let saved_tret = self.textual_ret.contains(&start);
-
-        self.reanalyse_with(store, infos, start, end, Some((lo, hi, mask)));
+        // caller's (unmodified-program) solution — O(file) copies for a
+        // question about ONE function.  See `snapshot_function` for the
+        // write-set argument.
+        let snap = self.snapshot_function(store, infos, idx)?;
+        self.reanalyse_with(store, infos, snap.start, snap.end, Some((lo, hi, mask)));
         let answer = self.known[idx].then(|| self.live_out[idx]);
-
-        self.live_out[start..end].copy_from_slice(&saved_lo);
-        self.live_in[start..end].copy_from_slice(&saved_li);
-        self.known[start..end].copy_from_slice(&saved_kn);
-        self.structural[start..end].copy_from_slice(&saved_st);
-        self.effect[start..end].copy_from_slice(&saved_ef);
-        if saved_tret {
-            self.textual_ret.insert(start);
-        } else {
-            self.textual_ret.remove(&start);
-        }
+        self.restore_function(&snap);
         answer
     }
 
