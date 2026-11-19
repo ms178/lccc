@@ -6,6 +6,25 @@
 /* SSE4.2 shipped POPCNT; GCC's smmintrin.h carries its intrinsics too. */
 #include <popcntintrin.h>
 
+/* Rounding-mode macros for _mm_round_* and _mm256_round_* (and therefore the
+ * AVX1 _mm256_ceil/floor_{ps,pd}, which expand to _mm256_round_* with these
+ * constants).  Values and composition match GCC 16.2 smmintrin.h exactly. */
+#define _MM_FROUND_TO_NEAREST_INT 0x00
+#define _MM_FROUND_TO_NEG_INF 0x01
+#define _MM_FROUND_TO_POS_INF 0x02
+#define _MM_FROUND_TO_ZERO 0x03
+#define _MM_FROUND_CUR_DIRECTION 0x04
+
+#define _MM_FROUND_RAISE_EXC 0x00
+#define _MM_FROUND_NO_EXC 0x08
+
+#define _MM_FROUND_NINT (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_FLOOR (_MM_FROUND_TO_NEG_INF | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_CEIL (_MM_FROUND_TO_POS_INF | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_TRUNC (_MM_FROUND_TO_ZERO | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_RINT (_MM_FROUND_CUR_DIRECTION | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_NEARBYINT (_MM_FROUND_CUR_DIRECTION | _MM_FROUND_NO_EXC)
+
 /* === SSE4.1 insert/extract intrinsics === */
 
 /* _mm_extract_epi8: extract 8-bit int from lane (PEXTRB) */
