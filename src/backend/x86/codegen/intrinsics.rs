@@ -250,6 +250,14 @@ impl X86Codegen {
                     IntrinsicOp::Movntps => ("movups", "movntps"),
                     _ => ("movdqu", "movntdq"),
                 };
+                // Under -mavx the VEX.128 spellings: a legacy store here would
+                // mix with dirty upper YMM state whenever `vex_promote` declines.
+                let (load, inst) = if self.vex128() {
+                    (format!("v{load}"), format!("v{inst}"))
+                } else {
+                    (load.to_string(), inst.to_string())
+                };
+                let (load, inst) = (load.as_str(), inst.as_str());
                 if let Some(mem) = self.vec_arg_mem(&args[0]) {
                     self.state
                         .emit_fmt(format_args!("    {} {}, %xmm0", load, mem));

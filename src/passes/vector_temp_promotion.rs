@@ -7299,10 +7299,19 @@ mod masked_nontemporal_contract_tests {
 
     #[test]
     fn streaming_load_source_is_aligned_to_its_width() {
-        assert_eq!(intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa128, 0), Some(16));
-        assert_eq!(intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa256, 0), Some(32));
+        assert_eq!(
+            intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa128, 0),
+            Some(16)
+        );
+        assert_eq!(
+            intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa256, 0),
+            Some(32)
+        );
         // Only the source (arg 0) carries the alignment contract.
-        assert_eq!(intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa256, 1), None);
+        assert_eq!(
+            intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa256, 1),
+            None
+        );
     }
 
     #[test]
@@ -7317,7 +7326,10 @@ mod masked_nontemporal_contract_tests {
             IntrinsicOp::MaskStoreD256,
             IntrinsicOp::MaskStoreQ256,
         ] {
-            assert!(!intrinsic_overwrites_full_result(op), "{op:?} is a partial write");
+            assert!(
+                !intrinsic_overwrites_full_result(op),
+                "{op:?} is a partial write"
+            );
         }
     }
 }

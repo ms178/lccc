@@ -2808,7 +2808,8 @@ impl I686Codegen {
         };
         self.emit_avx_load(&args[0], "ymm0");
         self.operand_to_eax(&Operand::Value(*ptr));
-        self.state.emit_fmt(format_args!("    {} %ymm0, (%eax)", inst));
+        self.state
+            .emit_fmt(format_args!("    {} %ymm0, (%eax)", inst));
         self.state.reg_cache.invalidate_acc();
     }
 
@@ -2824,19 +2825,31 @@ impl I686Codegen {
         let Some(dst) = dest_ptr.as_ref().or(dest.as_ref()) else {
             return;
         };
-        match op {
-            IntrinsicOp::Movntdqa128 => {
-                self.operand_to_eax(&args[0]);
-                self.state.emit("    movntdqa (%eax), %xmm0");
-                self.emit_sse_store_dest_from(dst, "xmm0");
-            }
-            IntrinsicOp::Movntdqa256 => {
-                self.operand_to_eax(&args[0]);
-                self.state.emit("    vmovntdqa (%eax), %ymm0");
-                self.emit_avx_store_dest(dst);
-            }
-            _ => {}
+        if matches!(op, IntrinsicOp::Movntdqa256) {
+            // Routed here only under AVX2 (lowering gate), so VEX is implied.
+            self.operand_to_eax(&args[0]);
+            self.state.emit("    vmovntdqa (%eax), %ymm0");
+            self.emit_avx_store_dest(dst);
+        } else if self.avx_enabled {
+            // -m32 -mavx: the VEX.128 spellings, so no legacy SSE mixes with
+            // dirty upper YMM state. i686 has no text-level promotion pass.
+            self.operand_to_eax(&args[0]);
+            self.state.emit("    vmovntdqa (%eax), %xmm0");
+            self.emit_vex128_store_dest_from(dst, "xmm0");
+        } else {
+            self.operand_to_eax(&args[0]);
+            self.state.emit("    movntdqa (%eax), %xmm0");
+            self.emit_sse_store_dest_from(dst, "xmm0");
         }
+    }
+
+    /// `emit_sse_store_dest_from` with the VEX.128 store spelling. The
+    /// register file and store width are identical; only the encoding differs.
+    fn emit_vex128_store_dest_from(&mut self, dptr: &Value, src: &'static str) {
+        self.operand_to_eax(&Operand::Value(*dptr));
+        self.state
+            .emit_fmt(format_args!("    vmovdqu %{}, (%eax)", src));
+        self.state.reg_cache.invalidate_acc();
     }
 
     /// Sign-bit-masked load and store, the i686 twin of
@@ -2856,7 +2869,11 @@ impl I686Codegen {
         let wide = width == 32;
         if is_store {
             let Some(ptr) = dest_ptr else { return };
-            let (mask, value) = if wide { ("ymm1", "ymm0") } else { ("xmm1", "xmm0") };
+            let (mask, value) = if wide {
+                ("ymm1", "ymm0")
+            } else {
+                ("xmm1", "xmm0")
+            };
             if wide {
                 self.emit_avx_load(&args[0], mask);
                 self.emit_avx_load(&args[1], value);
@@ -2915,25 +2932,36 @@ impl I686Codegen {
                 self.state.emit("    movnti %eax, (%ecx)");
                 self.state.emit("    movnti %edx, 4(%ecx)");
             }
+            // Under -m32 -mavx every instruction takes its VEX.128 spelling, so
+            // no legacy SSE mixes with dirty upper YMM state. Without AVX the
+            // SSE1/SSE2 spellings are kept: an SSE1-only target has MOVUPS and
+            // MOVNTPS but neither MOVDQU nor MOVUPD.
             IntrinsicOp::Movntdq => {
+                let v = if self.avx_enabled { "v" } else { "" };
                 self.operand_to_eax(&args[0]);
-                self.state.emit("    movdqu (%eax), %xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {v}movdqu (%eax), %xmm0"));
                 self.operand_to_eax(&Operand::Value(*ptr));
-                self.state.emit("    movntdq %xmm0, (%eax)");
+                self.state
+                    .emit_fmt(format_args!("    {v}movntdq %xmm0, (%eax)"));
             }
             IntrinsicOp::Movntpd => {
+                let v = if self.avx_enabled { "v" } else { "" };
                 self.operand_to_eax(&args[0]);
-                self.state.emit("    movupd (%eax), %xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {v}movupd (%eax), %xmm0"));
                 self.operand_to_eax(&Operand::Value(*ptr));
-                self.state.emit("    movntpd %xmm0, (%eax)");
+                self.state
+                    .emit_fmt(format_args!("    {v}movntpd %xmm0, (%eax)"));
             }
             IntrinsicOp::Movntps => {
-                // SSE1 throughout: an SSE1-only i686 target has MOVUPS and
-                // MOVNTPS but neither MOVDQU nor MOVUPD.
+                let v = if self.avx_enabled { "v" } else { "" };
                 self.operand_to_eax(&args[0]);
-                self.state.emit("    movups (%eax), %xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {v}movups (%eax), %xmm0"));
                 self.operand_to_eax(&Operand::Value(*ptr));
-                self.state.emit("    movntps %xmm0, (%eax)");
+                self.state
+                    .emit_fmt(format_args!("    {v}movntps %xmm0, (%eax)"));
             }
             _ => {}
         }

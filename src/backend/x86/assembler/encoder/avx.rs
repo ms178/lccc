@@ -7312,9 +7312,7 @@ mod masked_memory_golden_tests {
         assert_eq!(&bytes[0..4], b"\x7fELF");
         assert_eq!(bytes[4], 2, "ELFCLASS64 expected");
         let rd16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize;
-        let rd32 = |o: usize| {
-            u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize
-        };
+        let rd32 = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
         let rd64 = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()) as usize;
         let shoff = rd64(0x28);
         let shentsize = rd16(0x3a);

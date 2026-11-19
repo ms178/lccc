@@ -63,16 +63,19 @@ impl X86Codegen {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         self.operand_to_reg(&args[0], "rax");
-        match op {
-            IntrinsicOp::Movntdqa128 => {
-                self.state.emit("    movntdqa (%rax), %xmm0");
-                self.sse_store_dest(dst, "xmm0");
-            }
-            IntrinsicOp::Movntdqa256 => {
-                self.state.emit("    vmovntdqa (%rax), %ymm0");
-                self.avx_store_dest(dst);
-            }
-            _ => {}
+        if matches!(op, IntrinsicOp::Movntdqa256) {
+            // Only routed here under AVX2 (lowering gate), so VEX is implied.
+            self.state.emit("    vmovntdqa (%rax), %ymm0");
+            self.avx_store_dest(dst);
+        } else if self.vex128() {
+            // Emit the VEX.128 form directly under -mavx. Relying on the
+            // text-level `vex_promote` rewrite would leave legacy SSE whenever
+            // that pass declines (its upper-state soundness rule).
+            self.state.emit("    vmovntdqa (%rax), %xmm0");
+            self.vex128_commit_dest(dst, None);
+        } else {
+            self.state.emit("    movntdqa (%rax), %xmm0");
+            self.sse_store_dest(dst, "xmm0");
         }
     }
 
@@ -119,18 +122,14 @@ impl X86Codegen {
         if width == 32 {
             self.avx_load_arg_to(&args[1], "ymm1");
             self.operand_to_reg(&args[0], "rax");
-            self.state.emit_fmt(format_args!(
-                "    {} (%rax), %ymm1, %ymm0",
-                mnemonic
-            ));
+            self.state
+                .emit_fmt(format_args!("    {} (%rax), %ymm1, %ymm0", mnemonic));
             self.avx_store_dest(dst);
         } else {
             let mask = self.vex128_source(&args[1], "xmm1");
             self.operand_to_reg(&args[0], "rax");
-            self.state.emit_fmt(format_args!(
-                "    {} (%rax), {}, %xmm0",
-                mnemonic, mask
-            ));
+            self.state
+                .emit_fmt(format_args!("    {} (%rax), {}, %xmm0", mnemonic, mask));
             self.vex128_commit_dest(dst, None);
         }
     }
