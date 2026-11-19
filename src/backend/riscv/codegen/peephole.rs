@@ -6079,6 +6079,10 @@ fn fold_fp_bounces(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bo
                 continue;
             };
             let ta_name = reg_name(ta);
+            // Static bit-move probe hoisted out of the window walk below:
+            // `width` is pinned to {w, d} above, and the `format!`-per-line
+            // form allocated on every window step at both probe sites.
+            let fmv_probe = if width == "w" { "fmv.w.x " } else { "fmv.d.x " };
             let mut j = i + 1;
             let mut steps = 0;
             let mut found = None;
@@ -6125,7 +6129,7 @@ fn fold_fp_bounces(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bo
             let new_line = if fs_clobbered {
                 lines[j]
                     .trim()
-                    .strip_prefix(&format!("fmv.{width}.x "))
+                    .strip_prefix(fmv_probe)
                     .and_then(|ops| ops.split_once(','))
                     .filter(|(fd, src)| {
                         src.trim() == ta_name
@@ -6159,7 +6163,7 @@ fn fold_fp_bounces(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bo
                     }
                     _ => None,
                 }
-            } else if let Some(ops) = lines[j].trim().strip_prefix(&format!("fmv.{width}.x ")) {
+            } else if let Some(ops) = lines[j].trim().strip_prefix(fmv_probe) {
                 // The FP-to-FP move is `fmv.s`/`fmv.d` (fsgnj); `fmv.w`
                 // names only the bit moves `fmv.w.x`/`fmv.x.w`.
                 let fmt = if width == "w" { "s" } else { "d" };
@@ -11482,5 +11486,57 @@ mod tail_frame_tests {
         // The inverted value is still read after the branch.
         let out = rows(&asm.replace("    li a0, 1\n", "    mv a0, t1\n"));
         assert!(out.iter().any(|l| l == "xori t1, t1, 1"), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod fp_bounce_probe_tests {
+    //! Oracles for the `fmv.x.{w,d} tA, fS; ...; fmv.{w,d}.x fD, tA`
+    //! bounce elimination after its bit-move probe was hoisted out of the
+    //! window walk as a static spelling (the `format!`-per-line form
+    //! allocated on every window step at both probe sites).  One positive
+    //! and one negative case per width pin the probe's acceptance.
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        fold_fp_bounces(&mut lines, &mut kinds, n);
+        lines
+            .iter()
+            .zip(&kinds)
+            .filter(|(_, k)| **k != LineKind::Nop)
+            .map(|(l, _)| l.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn w_width_bounce_becomes_one_fp_move() {
+        let out = run("f:\n    fmv.x.w t0, fa1\n    fmv.w.x fa0, t0\n    ret\n");
+        assert!(out.iter().any(|l| l == "fmv.s fa0, fa1"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("fmv.x.w")), "{out:?}");
+    }
+
+    #[test]
+    fn d_width_bounce_becomes_one_fp_move() {
+        let out = run("f:\n    fmv.x.d t0, fa1\n    fmv.d.x fa0, t0\n    ret\n");
+        assert!(out.iter().any(|l| l == "fmv.d fa0, fa1"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("fmv.x.d")), "{out:?}");
+    }
+
+    #[test]
+    fn width_mismatch_does_not_fold() {
+        // The probe is width-exact: a w-export must not satisfy the
+        // d-import spelling (the hoisted probe pins `fmv.{w|d}.x` per i).
+        let out = run("f:\n    fmv.x.w t0, fa1\n    fmv.d.x fa0, t0\n    ret\n");
+        assert!(out.iter().any(|l| l.starts_with("fmv.x.w")), "{out:?}");
+        assert!(out.iter().any(|l| l.starts_with("fmv.d.x")), "{out:?}");
+    }
+
+    #[test]
+    fn different_transfer_register_does_not_fold() {
+        let out = run("f:\n    fmv.x.w t0, fa1\n    fmv.w.x fa0, t1\n    ret\n");
+        assert!(out.iter().any(|l| l.starts_with("fmv.x.w")), "{out:?}");
     }
 }

@@ -713,6 +713,12 @@ gate "peephole-alloc-before-filter" fast \
 gate "peephole-alloc-before-filter-contracts" fast \
     python3 tests/regression/test_check_peephole_alloc_before_filter.py
 
+gate "format-probe-census" fast \
+    python3 tests/regression/check_format_probe_census.py
+
+gate "format-probe-census-contracts" fast \
+    python3 tests/regression/test_check_format_probe_census.py
+
 gate "simd-commutativity-agreement" fast \
     python3 tests/regression/check_simd_commutativity_agreement.py
 

@@ -1377,6 +1377,10 @@ jobs:
       run: python3 tests/regression/check_peephole_alloc_before_filter.py
     - name: Verify the allocate-before-filter ratchet contracts
       run: python3 tests/regression/test_check_peephole_alloc_before_filter.py
+    - name: Backend probes must not allocate their pattern (format! census)
+      run: python3 tests/regression/check_format_probe_census.py
+    - name: Verify the format!-probe census contracts
+      run: python3 tests/regression/test_check_format_probe_census.py
     - name: SIMD commutativity must agree across the 128/256/512-bit layers
       run: python3 tests/regression/check_simd_commutativity_agreement.py
     - name: Verify the SIMD commutativity ratchet contracts

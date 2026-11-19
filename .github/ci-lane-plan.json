@@ -1821,7 +1821,7 @@
     "frontend-c": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 353.52,
+      "predicted_gate_seconds": 355.02,
       "shards": 3,
       "steps": [
         {
@@ -2043,6 +2043,14 @@
         {
           "measured_s": 60.0,
           "name": "Check driver option contracts (core)"
+        },
+        {
+          "measured_s": 0.5,
+          "name": "Backend probes must not allocate their pattern (format! census)"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Verify the format!-probe census contracts"
         }
       ]
     }
