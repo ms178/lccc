@@ -2623,6 +2623,15 @@ fn resolve_inline_asm_symbols(func: &mut IrFunction) {
                                     ));
                                 }
                                 input_symbols[sym_idx] = Some(sym_name);
+                                // The operand is printed as that symbol
+                                // (`%c0` -> `key`), and an immediate-only
+                                // constraint has no other way to print it:
+                                // nothing reads the value.  Left as the
+                                // operand, it kept the address computation
+                                // alive, and every static key the kernel
+                                // tests loaded `&key` into a register ahead
+                                // of its `nop`.
+                                *operand = Operand::Const(IrConst::I64(0));
                             }
                             // Also try to resolve to a constant and convert the operand
                             else if let Some(const_val) = trace_to_const(&Operand::Value(*v)) {

@@ -2327,7 +2327,11 @@ pub(crate) fn run_passes(
             fma_neg_peel::run(module);
             verify::verify_after_pass(module, "fmanegpeel");
         }
-        resolve_asm::resolve_inline_asm_symbols(module);
+        // An operand that got its symbol here no longer reads its value: the
+        // address computation is dead, and this is the last chance to say so.
+        if resolve_asm::resolve_inline_asm_symbols(module) > 0 {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
         // Unreachable internal-linkage functions go, as at -O0 and -O2+.
         dead_statics::eliminate_dead_static_functions(module);
         restore_entry_param_prefix(module);
