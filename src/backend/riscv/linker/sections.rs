@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(addends(1), [6, 3, 12, 16, 1]);
         assert_eq!(objs[1].1.symbols[1].value, 3);
 
-        let (merged, map, refs) = merge_sections(&objs, &aliases);
+        let (merged, map, refs) = merge_sections(&objs, &aliases).unwrap();
         let rodata = &merged[map[".rodata"]];
         assert_eq!(rodata.data, pool);
         let at = |o: usize| {
@@ -509,7 +509,7 @@ mod tests {
         let aliases = merge_alloc_sections(&mut objs);
         assert!(aliases.is_empty());
         assert_eq!(objs[0].1.relocations[1][0].addend, 1);
-        let (merged, map, _) = merge_sections(&objs, &aliases);
+        let (merged, map, _) = merge_sections(&objs, &aliases).unwrap();
         assert_eq!(merged[map[".rodata"]].data, b"x\0x\0");
     }
 
@@ -528,7 +528,7 @@ mod tests {
         );
         a.section_data[2] = SectionData::owned(vec![1; 8]);
         let objs = vec![("a.o".to_string(), a)];
-        let (merged, map, _) = merge_sections(&objs, &MergeAliases::default());
+        let (merged, map, _) = merge_sections(&objs, &MergeAliases::default()).unwrap();
         let sdata = &merged[map[".sdata"]];
         assert!(sdata.script_write);
         assert_ne!(sdata.sh_flags & SHF_WRITE, 0);
