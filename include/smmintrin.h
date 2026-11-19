@@ -300,6 +300,94 @@ _mm_testnzc_si128(__m128i __a, __m128i __b)
         _mm_testc_si128(__tao_v, _mm_cmpeq_epi32(__tao_v, __tao_v));           \
     })
 
+/* === SSE4.1 extends to 64-bit lanes (PMOVSX/PMOVZX). Only the low source
+ * elements are read; each is widened into one 64-bit lane. The bytes are read
+ * with memcpy, not through a scalar pointer into the vector. === */
+
+typedef unsigned short __lccc_sse_v8hu __attribute__((__vector_size__(16)));
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_cvtepi8_epi64(__m128i __a)
+{
+    signed char __b[16];
+    __builtin_memcpy(__b, &__a, 16);
+    __v2di __r = { (long long)__b[0], (long long)__b[1] };
+    return (__m128i)__r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_cvtepu8_epi64(__m128i __a)
+{
+    unsigned char __b[16];
+    __builtin_memcpy(__b, &__a, 16);
+    __v2di __r = { (long long)__b[0], (long long)__b[1] };
+    return (__m128i)__r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_cvtepi16_epi64(__m128i __a)
+{
+    short __h[8];
+    __builtin_memcpy(__h, &__a, 16);
+    __v2di __r = { (long long)__h[0], (long long)__h[1] };
+    return (__m128i)__r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_cvtepu16_epi64(__m128i __a)
+{
+    unsigned short __h[8];
+    __builtin_memcpy(__h, &__a, 16);
+    __v2di __r = { (long long)__h[0], (long long)__h[1] };
+    return (__m128i)__r;
+}
+
+/* === SSE4.1 minimum with index (PHMINPOSUW). Result lane 0 is the minimum
+ * unsigned 16-bit element, lane 1 is its index (the first occurrence), and
+ * lanes 2..7 are zero. === */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_minpos_epu16(__m128i __a)
+{
+    unsigned short __w[8];
+    __builtin_memcpy(__w, &__a, 16);
+    unsigned short __min = __w[0];
+    unsigned short __idx = 0;
+    for (unsigned short __i = 1; __i < 8; __i++) {
+        if (__w[__i] < __min) {
+            __min = __w[__i];
+            __idx = __i;
+        }
+    }
+    __lccc_sse_v8hu __r = { __min, __idx, 0, 0, 0, 0, 0, 0 };
+    return (__m128i)__r;
+}
+
+/* === SSE4.1 multiple sums of absolute differences (MPSADBW). Bit 2 of the
+ * immediate selects a 4-byte offset into __a (0 or 4). Bits 1:0 select a
+ * 4-byte block of __b at offset 0, 4, 8 or 12. Each of the eight results is
+ * the sum of |a[aoff+i+j] - b[boff+j]| over j = 0..3. The largest sum is
+ * 4 * 255, so 16-bit results do not overflow. === */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_mpsadbw_epu8(__m128i __a, __m128i __b, const int __imm)
+{
+    unsigned char __ab[16];
+    unsigned char __bb[16];
+    __builtin_memcpy(__ab, &__a, 16);
+    __builtin_memcpy(__bb, &__b, 16);
+    int __aoff = (__imm & 4) ? 4 : 0;
+    int __boff = (__imm & 3) * 4;
+    __lccc_sse_v8hu __r = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (int __i = 0; __i < 8; __i++) {
+        int __s = 0;
+        for (int __j = 0; __j < 4; __j++) {
+            int __d = (int)__ab[__aoff + __i + __j] - (int)__bb[__boff + __j];
+            __s += __d < 0 ? -__d : __d;
+        }
+        __r[__i] = (unsigned short)__s;
+    }
+    return (__m128i)__r;
+}
+
 /* === SSE4.1 round (ROUNDPS/ROUNDPD and the scalar forms) ===
  * The scalar forms round only the low element of the second operand, and
  * take the upper elements from the first. Rounding the packed value and

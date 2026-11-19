@@ -937,6 +937,74 @@ _mm_loadl_pd(__m128d __a, double const *__p)
     return __a;
 }
 
+/* --- Shifts by a scalar count taken from the low 64 bits of an XMM register
+ * (GCC 16.2 _mm_sll/srl/sra forms). A count above the element width gives zero
+ * for the logical shifts and the sign fill for the arithmetic shift, per the
+ * Intel definition. The 16-bit logical forms and _mm_sll_epi16 are compiler
+ * builtins; these are their 32- and 64-bit companions and _mm_sra_epi16. The
+ * shape matches the 256-bit forms in avx2intrin.h. --- */
+
+typedef unsigned int __lccc_sse_v4su __attribute__((__vector_size__(16)));
+typedef unsigned long long __lccc_sse_v2du __attribute__((__vector_size__(16)));
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_sll_epi32(__m128i __a, __m128i __count)
+{
+    unsigned long long __c = (unsigned long long)((__v2di)__count)[0];
+    if (__c > 31)
+        return _mm_setzero_si128();
+    return (__m128i)((__lccc_sse_v4su)__a << (int)__c);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_sll_epi64(__m128i __a, __m128i __count)
+{
+    unsigned long long __c = (unsigned long long)((__v2di)__count)[0];
+    if (__c > 63)
+        return _mm_setzero_si128();
+    return (__m128i)((__lccc_sse_v2du)__a << (int)__c);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_srl_epi32(__m128i __a, __m128i __count)
+{
+    unsigned long long __c = (unsigned long long)((__v2di)__count)[0];
+    if (__c > 31)
+        return _mm_setzero_si128();
+    return (__m128i)((__lccc_sse_v4su)__a >> (int)__c);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_srl_epi64(__m128i __a, __m128i __count)
+{
+    unsigned long long __c = (unsigned long long)((__v2di)__count)[0];
+    if (__c > 63)
+        return _mm_setzero_si128();
+    return (__m128i)((__lccc_sse_v2du)__a >> (int)__c);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_sra_epi16(__m128i __a, __m128i __count)
+{
+    unsigned long long __c = (unsigned long long)((__v2di)__count)[0];
+    if (__c > 15)
+        __c = 15;
+    return (__m128i)((__v8hi)__a >> (int)__c);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_sra_epi32(__m128i __a, __m128i __count)
+{
+    unsigned long long __c = (unsigned long long)((__v2di)__count)[0];
+    if (__c > 31)
+        __c = 31;
+    return (__m128i)((__v4si)__a >> (int)__c);
+}
+
+/* Byte-granular shifts. GCC 16.2 names these as aliases of PSLLDQ / PSRLDQ. */
+#define _mm_bslli_si128(__a, __imm) _mm_slli_si128((__a), (__imm))
+#define _mm_bsrli_si128(__a, __imm) _mm_srli_si128((__a), (__imm))
+
 /* Partial-width unaligned loads and stores (GCC 16.2 names). A 16-, 32- or
  * 64-bit load fills the low bytes and zeroes the rest. A store writes only the
  * low bytes. memcpy with a constant size is the portable, alias-safe form. */

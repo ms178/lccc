@@ -1744,6 +1744,40 @@
     },
     {
       "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "emmintrin.h",
+      "name": "_mm_bslli_si128",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_slli_si128"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "macro"
+      ],
+      "generic_helpers": [],
+      "header": "emmintrin.h",
+      "name": "_mm_bsrli_si128",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_srli_si128"
+      ]
+    },
+    {
+      "arities": [
         1
       ],
       "canonical_override": true,
@@ -3381,6 +3415,40 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "emmintrin.h",
+      "name": "_mm_sll_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_setzero_si128"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "emmintrin.h",
+      "name": "_mm_sll_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_setzero_si128"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -3449,6 +3517,36 @@
       "arities": [
         2
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "emmintrin.h",
+      "name": "_mm_sra_epi16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "emmintrin.h",
+      "name": "_mm_sra_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -3478,6 +3576,40 @@
         "__builtin_ia32_psradi128"
       ],
       "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "emmintrin.h",
+      "name": "_mm_srl_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_setzero_si128"
+      ]
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "emmintrin.h",
+      "name": "_mm_srl_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": [
+        "_mm_setzero_si128"
+      ]
     },
     {
       "arities": [
@@ -4828,6 +4960,21 @@
       ],
       "generic_helpers": [],
       "header": "smmintrin.h",
+      "name": "_mm_cvtepi16_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "smmintrin.h",
       "name": "_mm_cvtepi32_epi64",
       "raw_builtins": [],
       "wrapper_dependencies": []
@@ -4866,6 +5013,21 @@
       "arities": [
         1
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "smmintrin.h",
+      "name": "_mm_cvtepi8_epi64",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -4874,6 +5036,21 @@
       "generic_helpers": [],
       "header": "smmintrin.h",
       "name": "_mm_cvtepu16_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "smmintrin.h",
+      "name": "_mm_cvtepu16_epi64",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -4919,6 +5096,21 @@
       "generic_helpers": [],
       "header": "smmintrin.h",
       "name": "_mm_cvtepu8_epi32",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "smmintrin.h",
+      "name": "_mm_cvtepu8_epi64",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -5226,6 +5418,36 @@
       "raw_builtins": [
         "__builtin_ia32_pminud128"
       ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "smmintrin.h",
+      "name": "_mm_minpos_epu16",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "smmintrin.h",
+      "name": "_mm_mpsadbw_epu8",
+      "raw_builtins": [],
       "wrapper_dependencies": []
     },
     {
@@ -17642,7 +17864,7 @@
     "_mm_move_epi32",
     "_mm_mwait"
   ],
-  "declarations": 1068,
+  "declarations": 1082,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -20930,8 +21152,6 @@
     "_mm_broadcastmw_epi32",
     "_mm_broadcastq_epi64",
     "_mm_broadcastw_epi16",
-    "_mm_bslli_si128",
-    "_mm_bsrli_si128",
     "_mm_castpd_ph",
     "_mm_castph_pd",
     "_mm_castph_ps",
@@ -21059,7 +21279,6 @@
     "_mm_cvt_roundu64_sd",
     "_mm_cvt_roundu64_sh",
     "_mm_cvt_roundu64_ss",
-    "_mm_cvtepi16_epi64",
     "_mm_cvtepi16_epi8",
     "_mm_cvtepi16_ph",
     "_mm_cvtepi32_epi16",
@@ -21071,8 +21290,6 @@
     "_mm_cvtepi64_pd",
     "_mm_cvtepi64_ph",
     "_mm_cvtepi64_ps",
-    "_mm_cvtepi8_epi64",
-    "_mm_cvtepu16_epi64",
     "_mm_cvtepu16_ph",
     "_mm_cvtepu32_pd",
     "_mm_cvtepu32_ph",
@@ -21080,7 +21297,6 @@
     "_mm_cvtepu64_pd",
     "_mm_cvtepu64_ph",
     "_mm_cvtepu64_ps",
-    "_mm_cvtepu8_epi64",
     "_mm_cvti32_sd",
     "_mm_cvti32_sh",
     "_mm_cvti32_ss",
@@ -22567,7 +22783,6 @@
     "_mm_min_round_sh",
     "_mm_min_round_ss",
     "_mm_min_sh",
-    "_mm_minpos_epu16",
     "_mm_mmask_i32gather_epi32",
     "_mm_mmask_i32gather_epi64",
     "_mm_mmask_i32gather_pd",
@@ -22587,7 +22802,6 @@
     "_mm_movm_epi64",
     "_mm_movm_epi8",
     "_mm_movpi64_epi64",
-    "_mm_mpsadbw_epu8",
     "_mm_msub_pd",
     "_mm_msub_ps",
     "_mm_msub_sd",
@@ -22730,23 +22944,17 @@
     "_mm_sign_pi32",
     "_mm_sign_pi8",
     "_mm_sll_epi16",
-    "_mm_sll_epi32",
-    "_mm_sll_epi64",
     "_mm_sllv_epi16",
     "_mm_sqrt_ph",
     "_mm_sqrt_round_sd",
     "_mm_sqrt_round_sh",
     "_mm_sqrt_round_ss",
     "_mm_sqrt_sh",
-    "_mm_sra_epi16",
-    "_mm_sra_epi32",
     "_mm_sra_epi64",
     "_mm_srai_epi64",
     "_mm_srav_epi16",
     "_mm_srav_epi64",
     "_mm_srl_epi16",
-    "_mm_srl_epi32",
-    "_mm_srl_epi64",
     "_mm_srlv_epi16",
     "_mm_store_epi32",
     "_mm_store_epi64",
@@ -22798,5 +23006,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 1068
+  "unique_names": 1082
 }
