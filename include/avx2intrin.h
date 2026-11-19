@@ -304,9 +304,12 @@ _mm256_inserti128_si256(__m256i __a, __m128i __b, int __imm)
  * A macro, not an inline function: the immediate must stay a constant
  * expression at the call site, and a function parameter is not one.
  *
- * AVX2 only (VPBLENDD, VPSHUFD-256).  Outside `__AVX2__` the names are
- * undeclared, matching GCC 16.2, which rejects them under -mavx. */
-#if defined(__AVX2__)
+ * AVX2 only (VPBLENDD, VPSHUFD-256).  Declared unconditionally, as GCC 16.2
+ * does: both are ISA-gated at codegen (lcccsimd / builtin requirement), so a
+ * plain -mavx caller is rejected while a target("avx2") caller is accepted.
+ * Pure-C AVX2 wrappers below stay behind __AVX2__: they have no codegen gate,
+ * so declaring them under -mavx would emit AVX2 instructions into an AVX-only
+ * translation unit (probe fail-open, measured). */
 #define _mm256_blend_epi32(__a, __b, __imm) \
     (__CCC_M256I_FROM_BUILTIN( \
         __lccc_simd256_i_vpblendd256((__imm), (__m256i)(__a), (__m256i)(__b))))
@@ -320,7 +323,6 @@ _mm256_inserti128_si256(__m256i __a, __m128i __b, int __imm)
 /* _mm256_shuffle_epi32: VPSHUFD - shuffle 32-bit ints within 128-bit lanes */
 #define _mm256_shuffle_epi32(__a, __imm) \
     ((__m256i)__builtin_ia32_pshufd256((__v8si)(__a), (int)(__imm)))
-#endif /* __AVX2__ */
 
 /* === Shift (16-bit) === */
 
