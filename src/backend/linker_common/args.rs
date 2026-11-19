@@ -164,8 +164,9 @@ pub struct LinkerArgs {
     /// `z_ignored_keywords` so it cannot disappear silently.
     pub z_other_keywords: Vec<String>,
     /// Positional file operands that do not exist.  GNU ld reports
-    /// `cannot find FILE: No such file or directory`; callers that resolve
-    /// the ordered input list themselves turn these into that error.
+    /// `cannot find FILE: No such file or directory`; [`Self::require_inputs`]
+    /// is that error, and every link that takes its inputs from this parse
+    /// asks for it.
     pub missing_inputs: Vec<String>,
     /// The `--build-id=STYLE` style when one was given (`sha1`, `md5`,
     /// `uuid`, `0xHEX`, `tree`, `none`), for backends implementing only some.
@@ -221,6 +222,23 @@ impl LinkerArgs {
     /// don't implement it still diagnose it under their warning policy.
     pub fn allow_multiple_definition(&self) -> bool {
         self.z_other_keywords.iter().any(|kw| kw == "muldefs")
+    }
+
+    /// GNU ld's answer to a file operand that is not there:
+    /// `cannot find FILE: No such file or directory`.
+    ///
+    /// The parser keeps such an operand out of the input list -- it cannot be
+    /// read -- so whoever links what the list holds has to ask here.  Unasked,
+    /// the link goes on without the file, and it succeeds whenever nothing
+    /// else needs a symbol of it: an object of constructors, the strong
+    /// definition that was to replace a weak one, a table a linker script
+    /// collects.  The program is built, the exit status is zero, and the
+    /// object is not in it.
+    pub fn require_inputs(&self) -> Result<(), String> {
+        match self.missing_inputs.first() {
+            Some(missing) => Err(format!("cannot find {missing}: No such file or directory")),
+            None => Ok(()),
+        }
     }
 
     /// Validate common option values (`--build-id`, `--image-base`, `-z max-page-size`
@@ -2325,6 +2343,17 @@ mod z_isa_level_tests {
         assert!(parsed.inputs.iter().any(|i| i.name == obj));
         let missing = parse_linker_args(&args(&["-Wl,/nonexistent/lccc/x.o"]));
         assert_eq!(missing.missing_inputs, ["/nonexistent/lccc/x.o"]);
+        // The same operand outside `-Wl,`, the way the driver hands on
+        // `cc main.o x.o`; either way the link is refused in GNU ld's words.
+        let operand = parse_linker_args(&args(&[&obj, "/nonexistent/lccc/x.o", "-lm"]));
+        assert_eq!(operand.missing_inputs, ["/nonexistent/lccc/x.o"]);
+        for parsed in [&missing, &operand] {
+            assert_eq!(
+                parsed.require_inputs().unwrap_err(),
+                "cannot find /nonexistent/lccc/x.o: No such file or directory"
+            );
+        }
+        assert_eq!(parsed.require_inputs(), Ok(()));
         let mut wrong = Vec::new();
         for opt in VALUE_TAKING
             .iter()
