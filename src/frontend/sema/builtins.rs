@@ -1875,6 +1875,30 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "_mm_srl_epi16",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlw128),
     );
+    m.insert(
+        "_mm_sll_epi32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pslld128),
+    );
+    m.insert(
+        "_mm_sll_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllq128),
+    );
+    m.insert(
+        "_mm_srl_epi32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrld128),
+    );
+    m.insert(
+        "_mm_srl_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlq128),
+    );
+    m.insert(
+        "_mm_sra_epi16",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psraw128),
+    );
+    m.insert(
+        "_mm_sra_epi32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrad128),
+    );
     // __builtin_ia32_* names for new ops
     // GCC vector-extension FP min/max: used by kernel code that cannot
     // include userspace intrin headers (the NAP cpuidle governor's
@@ -3644,6 +3668,30 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllw128),
     );
     m.insert(
+        "__builtin_ia32_pslld128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pslld128),
+    );
+    m.insert(
+        "__builtin_ia32_psllq128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllq128),
+    );
+    m.insert(
+        "__builtin_ia32_psrld128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrld128),
+    );
+    m.insert(
+        "__builtin_ia32_psrlq128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlq128),
+    );
+    m.insert(
+        "__builtin_ia32_psraw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psraw128),
+    );
+    m.insert(
+        "__builtin_ia32_psrad128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrad128),
+    );
+    m.insert(
         "__builtin_ia32_psradi256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psradi256),
     );
@@ -4151,6 +4199,12 @@ pub enum BuiltinIntrinsic {
     X86Pmovzxwd128,   // _mm_cvtepu16_epi32 (PMOVZXWD, SSE4.1)
     X86Psllw128,      // _mm_sll_epi16 (PSLLW variable)
     X86Psrlw128,      // _mm_srl_epi16 (PSRLW variable)
+    X86Pslld128,      // _mm_sll_epi32 (count in XMM)
+    X86Psllq128,      // _mm_sll_epi64 (count in XMM)
+    X86Psrld128,      // _mm_srl_epi32 (count in XMM)
+    X86Psrlq128,      // _mm_srl_epi64 (count in XMM)
+    X86Psraw128,      // _mm_sra_epi16 (count in XMM)
+    X86Psrad128,      // _mm_sra_epi32 (count in XMM)
     // AVX2 256-bit
     X86Loadu256,
     X86Storeu256,

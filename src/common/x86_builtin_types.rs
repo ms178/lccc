@@ -133,8 +133,11 @@ fn result_type_0(name: &str) -> Option<CType> {
         | "__builtin_ia32_pmulld128"
         | "__builtin_ia32_pshufd"
         | "__builtin_ia32_psignd128"
+        | "__builtin_ia32_pslld128"
         | "__builtin_ia32_pslldi128"
+        | "__builtin_ia32_psrad128"
         | "__builtin_ia32_psradi128"
+        | "__builtin_ia32_psrld128"
         | "__builtin_ia32_psrldi128"
         | "__builtin_ia32_psubd128"
         | "__builtin_ia32_punpckhdq128"
@@ -208,8 +211,10 @@ fn result_type_1(name: &str) -> Option<CType> {
         | "__builtin_ia32_por128"
         | "__builtin_ia32_psadbw128"
         | "__builtin_ia32_pslldqi128"
+        | "__builtin_ia32_psllq128"
         | "__builtin_ia32_psllqi128"
         | "__builtin_ia32_psrldqi128"
+        | "__builtin_ia32_psrlq128"
         | "__builtin_ia32_psrlqi128"
         | "__builtin_ia32_psubq128"
         | "__builtin_ia32_punpckhqdq128"
@@ -260,6 +265,7 @@ fn result_type_1(name: &str) -> Option<CType> {
         | "__builtin_ia32_psignw128"
         | "__builtin_ia32_psllw128"
         | "__builtin_ia32_psllwi128"
+        | "__builtin_ia32_psraw128"
         | "__builtin_ia32_psrawi128"
         | "__builtin_ia32_psrlw128"
         | "__builtin_ia32_psrlwi128"
@@ -499,7 +505,13 @@ fn argument_vector_widths_0(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_psignb128"
         | "__builtin_ia32_psignd128"
         | "__builtin_ia32_psignw128"
+        | "__builtin_ia32_pslld128"
+        | "__builtin_ia32_psllq128"
         | "__builtin_ia32_psllw128"
+        | "__builtin_ia32_psrad128"
+        | "__builtin_ia32_psraw128"
+        | "__builtin_ia32_psrld128"
+        | "__builtin_ia32_psrlq128"
         | "__builtin_ia32_psrlw128"
         | "__builtin_ia32_psubb128"
         | "__builtin_ia32_psubd128"
@@ -528,6 +540,13 @@ fn argument_vector_widths_0(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_pblendw128"
         | "__builtin_ia32_pclmulqdq128"
         | "__builtin_ia32_shufps" => &[16, 16, 0],
+        _ => return None,
+    })
+}
+
+#[rustfmt::skip]
+fn argument_vector_widths_1(name: &str) -> Option<&'static [usize]> {
+    Some(match name {
         "__builtin_ia32_pblendvb128"
         | "__builtin_ia32_vpdpbssd128"
         | "__builtin_ia32_vpdpbssds128"
@@ -539,13 +558,6 @@ fn argument_vector_widths_0(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_vpdpwusds128"
         | "__builtin_ia32_vpdpwuud128"
         | "__builtin_ia32_vpdpwuuds128" => &[16, 16, 16],
-        _ => return None,
-    })
-}
-
-#[rustfmt::skip]
-fn argument_vector_widths_1(name: &str) -> Option<&'static [usize]> {
-    Some(match name {
         "__builtin_ia32_pabsb256"
         | "__builtin_ia32_pabsd256"
         | "__builtin_ia32_pabsw256"
@@ -855,7 +867,13 @@ fn argument_scalar_types_1(name: &str) -> Option<&'static [Option<IrType>]> {
         | "__builtin_ia32_psignb128"
         | "__builtin_ia32_psignd128"
         | "__builtin_ia32_psignw128"
+        | "__builtin_ia32_pslld128"
+        | "__builtin_ia32_psllq128"
         | "__builtin_ia32_psllw128"
+        | "__builtin_ia32_psrad128"
+        | "__builtin_ia32_psraw128"
+        | "__builtin_ia32_psrld128"
+        | "__builtin_ia32_psrlq128"
         | "__builtin_ia32_psrlw128"
         | "__builtin_ia32_psubb128"
         | "__builtin_ia32_psubb256"
@@ -902,6 +920,13 @@ fn argument_scalar_types_1(name: &str) -> Option<&'static [Option<IrType>]> {
         | "__builtin_ia32_xorpd256"
         | "__builtin_ia32_xorps"
         | "__builtin_ia32_xorps256" => &[None, None],
+        _ => return None,
+    })
+}
+
+#[rustfmt::skip]
+fn argument_scalar_types_2(name: &str) -> Option<&'static [Option<IrType>]> {
+    Some(match name {
         "__builtin_ia32_cmpps256"
         | "__builtin_ia32_palignr128"
         | "__builtin_ia32_pblendw128"
@@ -910,13 +935,6 @@ fn argument_scalar_types_1(name: &str) -> Option<&'static [Option<IrType>]> {
         | "__builtin_ia32_vinsertf128_pd256"
         | "__builtin_ia32_vinsertf128_ps256"
         | "__builtin_ia32_vinsertf128_si256" => &[None, None, Some(IrType::I32)],
-        _ => return None,
-    })
-}
-
-#[rustfmt::skip]
-fn argument_scalar_types_2(name: &str) -> Option<&'static [Option<IrType>]> {
-    Some(match name {
         "__builtin_ia32_maskstored"
         | "__builtin_ia32_maskstored256"
         | "__builtin_ia32_maskstorepd"

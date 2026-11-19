@@ -8813,6 +8813,12 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
         | O::Palignr128
         | O::Psllw128
         | O::Psrlw128
+        | O::Pslld128
+        | O::Psllq128
+        | O::Psrld128
+        | O::Psrlq128
+        | O::Psraw128
+        | O::Psrad128
         | O::Pblendw128
         | O::Aesenc128
         | O::Aesenclast128

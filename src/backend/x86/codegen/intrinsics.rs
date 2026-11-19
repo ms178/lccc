@@ -15,7 +15,7 @@ use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_256};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{StackSlot, vector_reg_bank};
 use crate::common::types::IrType;
-use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
+use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value, packed_var_shift_mnemonic};
 
 /// Decode bounded internal vector controls without truncating wide constants.
 /// A malformed producer must fail closed, not silently change a shuffle/store.
@@ -4172,19 +4172,25 @@ impl X86Codegen {
                     self.sse_store_dest(dptr, "xmm0");
                 }
             }
-            // SSE2 variable-shift (count in xmm register)
-            IntrinsicOp::Psllw128 | IntrinsicOp::Psrlw128 => {
-                if let Some(dptr) = result_dest(dest, dest_ptr) {
-                    let inst = if matches!(op, IntrinsicOp::Psllw128) {
-                        "psllw"
-                    } else {
-                        "psrlw"
-                    };
-                    self.sse_load_arg(&args[0], "xmm0");
-                    self.sse_load_arg(&args[1], "xmm1");
+            // SSE2 variable-shift (count in the low 64 bits of an xmm register).
+            // Destructive, so it stages in %xmm2 (withheld from the allocator
+            // pool by clobbers_xmm2); %xmm0 can hold a live parameter.
+            IntrinsicOp::Psllw128
+            | IntrinsicOp::Psrlw128
+            | IntrinsicOp::Pslld128
+            | IntrinsicOp::Psllq128
+            | IntrinsicOp::Psrld128
+            | IntrinsicOp::Psrlq128
+            | IntrinsicOp::Psraw128
+            | IntrinsicOp::Psrad128 => {
+                if let (Some(dptr), Some(inst)) =
+                    (result_dest(dest, dest_ptr), packed_var_shift_mnemonic(op))
+                {
+                    let count = self.staged_xmm2_rhs(&args[1]);
+                    self.sse_load_arg(&args[0], "xmm2");
                     self.state
-                        .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
-                    self.sse_store_dest(dptr, "xmm0");
+                        .emit_fmt(format_args!("    {} {}, %xmm2", inst, count));
+                    self.sse_store_dest(dptr, "xmm2");
                 }
             }
 
@@ -11578,7 +11584,7 @@ impl X86Codegen {
             // computes lhs PRED rhs, overwriting the staged lhs. %xmm2 is
             // the destructive scratch; it is withheld from the allocator
             // pool (clobbers_xmm2), so no live value can be homed in it.
-            let rhs = self.staged_cmp_rhs(&args[1]);
+            let rhs = self.staged_xmm2_rhs(&args[1]);
             self.sse_load_arg(&args[0], "xmm2");
             self.state.emit_fmt(format_args!(
                 "    v{} ${}, {}, %xmm2, %xmm2",
@@ -11587,17 +11593,18 @@ impl X86Codegen {
             self.sse_store_dest(dest, "xmm2");
             return;
         }
-        let rhs = self.staged_cmp_rhs(&args[1]);
+        let rhs = self.staged_xmm2_rhs(&args[1]);
         self.sse_load_arg(&args[0], "xmm2");
         self.state
             .emit_fmt(format_args!("    {} ${}, {}, %xmm2", inst, imm, rhs));
         self.sse_store_dest(dest, "xmm2");
     }
 
-    /// Resolve the right-hand operand of a destructive `cmp`/`shuf`/`round`
-    /// staged in %xmm2: a register home is used in place, a value with no
-    /// register is loaded into the reserved %xmm1. Returns the AT&T operand.
-    pub(super) fn staged_cmp_rhs(&mut self, rhs: &Operand) -> String {
+    /// Resolve the right-hand operand of a destructive op staged in %xmm2
+    /// (compare, shuffle, round, variable shift): a register home is used in
+    /// place, a value with no register is loaded into the reserved %xmm1.
+    /// Returns the AT&T operand text.
+    pub(super) fn staged_xmm2_rhs(&mut self, rhs: &Operand) -> String {
         match self.vec_home_128(rhs) {
             Some(reg) => reg,
             None => {

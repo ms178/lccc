@@ -1673,6 +1673,12 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pmovzxwd128
             | BuiltinIntrinsic::X86Psllw128
             | BuiltinIntrinsic::X86Psrlw128
+            | BuiltinIntrinsic::X86Pslld128
+            | BuiltinIntrinsic::X86Psllq128
+            | BuiltinIntrinsic::X86Psrld128
+            | BuiltinIntrinsic::X86Psrlq128
+            | BuiltinIntrinsic::X86Psraw128
+            | BuiltinIntrinsic::X86Psrad128
             | BuiltinIntrinsic::X86Loadu256
             | BuiltinIntrinsic::X86Storeu256
             | BuiltinIntrinsic::X86Load256
@@ -4336,6 +4342,12 @@ fn legacy_xmm_intrinsic_required_feature(
         | B::X86CvtPd2PsValue
         | B::X86Psllw128
         | B::X86Psrlw128
+        | B::X86Pslld128
+        | B::X86Psllq128
+        | B::X86Psrld128
+        | B::X86Psrlq128
+        | B::X86Psraw128
+        | B::X86Psrad128
         | B::X86XorPd
         | B::X86AndPd
         | B::X86OrPd
@@ -4962,6 +4974,12 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pmovzxwd128 => IntrinsicOp::Pmovzxwd128,
         BuiltinIntrinsic::X86Psllw128 => IntrinsicOp::Psllw128,
         BuiltinIntrinsic::X86Psrlw128 => IntrinsicOp::Psrlw128,
+        BuiltinIntrinsic::X86Pslld128 => IntrinsicOp::Pslld128,
+        BuiltinIntrinsic::X86Psllq128 => IntrinsicOp::Psllq128,
+        BuiltinIntrinsic::X86Psrld128 => IntrinsicOp::Psrld128,
+        BuiltinIntrinsic::X86Psrlq128 => IntrinsicOp::Psrlq128,
+        BuiltinIntrinsic::X86Psraw128 => IntrinsicOp::Psraw128,
+        BuiltinIntrinsic::X86Psrad128 => IntrinsicOp::Psrad128,
         BuiltinIntrinsic::X86Loadu256 => IntrinsicOp::Loadu256,
         BuiltinIntrinsic::X86Storeu256 => IntrinsicOp::Storeu256,
         BuiltinIntrinsic::X86Load256 => IntrinsicOp::Load256,

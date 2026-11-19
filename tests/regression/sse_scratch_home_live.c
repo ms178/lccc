@@ -65,6 +65,18 @@ __attribute__((noinline)) __m128 h1_cmp_ps(__m128 a, __m128 b)
 }
 
 
+/* The count-in-XMM shifts stage their destructive result in %xmm2 too. A value
+ * read after the shift must survive it: a double homed in %xmm2 and vector
+ * operands that the shifts read. */
+__attribute__((noinline)) double x2_shift(double p, double q, __m128i a, __m128i c)
+{
+    double s0 = p * q - 0.75;
+    __m128i sh = _mm_sll_epi32(a, c);
+    __m128i sr = _mm_sra_epi16(a, c);
+    return s0 + p * 2.0 + q + (double)_mm_extract_epi32(sh, 1)
+        + (double)_mm_extract_epi32(sr, 2) * 16.0 + (double)_mm_extract_epi32(sh, 3) * 0.0;
+}
+
 static void pd(const char *t, __m128d v)
 {
     unsigned long long r[2];
@@ -79,6 +91,7 @@ int main(void)
     printf("x2_cmp %.17g\n", x2_cmp(1.5, -2.25, 3.0, a, b));
     printf("x2_cmp2 %.17g\n", x2_cmp(-0.75, 4.0, 0.125, b, a));
     printf("x2_round %.17g\n", x2_round(2.0, 3.0, a));
+    printf("x2_shift %.17g\n", x2_shift(1.5, -2.25, _mm_setr_epi32(1, -40, 3, 4), _mm_set_epi64x(0, 2)));
     pd("h1_cmp_second", h1_cmp_second(a, b));
     pd("h1_shuf_second", h1_shuf_second(a, b));
     pd("h1_round_second", h1_round_second(a, b));

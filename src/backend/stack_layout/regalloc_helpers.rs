@@ -462,6 +462,16 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
                             | O::VpermilPs128
                             | O::VecCmpF32x4
                             | O::VecCmpF64x2
+                            // Count-in-XMM packed shifts stage the destructive
+                            // result in %xmm2 (see the x86 emitter).
+                            | O::Psllw128
+                            | O::Psrlw128
+                            | O::Pslld128
+                            | O::Psllq128
+                            | O::Psrld128
+                            | O::Psrlq128
+                            | O::Psraw128
+                            | O::Psrad128
                     ) || (sse2_i32_mul_lowering && matches!(op, O::VecMulI32x4))
                 } else {
                     false

@@ -14,7 +14,7 @@ use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;
 use crate::backend::x86_common::{FmaRoleOrder, fma_role_order};
 use crate::emit;
-use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
+use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value, packed_var_shift_mnemonic};
 
 impl I686Codegen {
     /// `_mm_cvt{,t}s{s,d}_si32`: convert the low lane of the 128-bit vector
@@ -1203,14 +1203,18 @@ impl I686Codegen {
                 }
             }
 
-            // Variable-count word shifts (count in the second xmm): (v, count).
-            IntrinsicOp::Psllw128 | IntrinsicOp::Psrlw128 => {
-                if let Some(dptr) = dest_ptr {
-                    let inst = if matches!(op, IntrinsicOp::Psllw128) {
-                        "psllw"
-                    } else {
-                        "psrlw"
-                    };
+            // Variable-count shifts (count in the second xmm): (v, count).
+            // i686 keeps vector values in memory, so there is no XMM home to
+            // protect; the operands are staged through %xmm0/%xmm1.
+            IntrinsicOp::Psllw128
+            | IntrinsicOp::Psrlw128
+            | IntrinsicOp::Pslld128
+            | IntrinsicOp::Psllq128
+            | IntrinsicOp::Psrld128
+            | IntrinsicOp::Psrlq128
+            | IntrinsicOp::Psraw128
+            | IntrinsicOp::Psrad128 => {
+                if let (Some(dptr), Some(inst)) = (dest_ptr, packed_var_shift_mnemonic(op)) {
                     self.operand_to_eax(&args[0]);
                     self.state.emit("    movdqu (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);

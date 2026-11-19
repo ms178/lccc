@@ -1391,6 +1391,18 @@ pub enum IntrinsicOp {
     Psllw128,
     /// Packed 16-bit variable shift right (PSRLW)
     Psrlw128,
+    /// Packed 32-bit variable shift left (PSLLD), count in the low 64 bits of XMM
+    Pslld128,
+    /// Packed 64-bit variable shift left (PSLLQ), count in the low 64 bits of XMM
+    Psllq128,
+    /// Packed 32-bit variable logical shift right (PSRLD)
+    Psrld128,
+    /// Packed 64-bit variable logical shift right (PSRLQ)
+    Psrlq128,
+    /// Packed 16-bit variable arithmetic shift right (PSRAW)
+    Psraw128,
+    /// Packed 32-bit variable arithmetic shift right (PSRAD)
+    Psrad128,
     /// Packed 16-bit multiply high (PMULHW)
     Pmulhw128,
     /// Packed 16-bit multiply-add to 32-bit (PMADDWD)
@@ -2550,6 +2562,7 @@ impl IntrinsicOp {
             | Phaddd128 | Phsubw128 | Phsubd128 | Phaddsw128 | Phsubsw128 | Psignb128 | Psignw128 | Psignd128 | Pmulhrsw128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
             | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pblendw128 | Pmovzxbw128
             | Pmovzxwd128 | Psllw128 | Psrlw128 | Pmulhw128 | Pmaddwd128
+            | Pslld128 | Psllq128 | Psrld128 | Psrlq128 | Psraw128 | Psrad128
             | Pcmpgtw128 | Pcmpgtb128 | Psllwi128 | Psrlwi128 | Psrawi128
             | Psradi128 | Pslldi128 | Psrldi128 | Paddd128 | Psubd128
             | Packssdw128 | Packsswb128 | Packuswb128 | Punpcklbw128
@@ -4676,4 +4689,20 @@ mod mask_compare_width_parity_tests {
             assert_eq!(op.mask_compare_vector_width(), None, "{op:?}");
         }
     }
+}
+
+/// Mnemonic of an SSE2 packed shift whose count is taken from the low 64 bits
+/// of an XMM register (`psllw` ... `psrad`). `None` for every other op.
+pub fn packed_var_shift_mnemonic(op: &IntrinsicOp) -> Option<&'static str> {
+    Some(match op {
+        IntrinsicOp::Psllw128 => "psllw",
+        IntrinsicOp::Psrlw128 => "psrlw",
+        IntrinsicOp::Pslld128 => "pslld",
+        IntrinsicOp::Psllq128 => "psllq",
+        IntrinsicOp::Psrld128 => "psrld",
+        IntrinsicOp::Psrlq128 => "psrlq",
+        IntrinsicOp::Psraw128 => "psraw",
+        IntrinsicOp::Psrad128 => "psrad",
+        _ => return None,
+    })
 }
