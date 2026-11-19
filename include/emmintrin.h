@@ -752,6 +752,13 @@ _mm_loadl_epi64(__m128i const *__p)
     return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_loadldi128(__p));
 }
 
+/* Keep the low 64 bits of __a, zero the high 64 bits (MOVQ xmm, xmm) */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_move_epi64(__m128i __a)
+{
+    return (__m128i)__builtin_shufflevector((__v2di)(__a), (__v2di)(_mm_setzero_si128()), 0, 2);
+}
+
 /* === Float/Int Conversion (SSE2) === */
 
 /* Convert packed 32-bit integers to packed single-precision floats */
