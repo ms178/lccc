@@ -11574,34 +11574,37 @@ impl X86Codegen {
                 }
             }
             // Staged VEX: rhs (src2) in the reserved second scratch,
-            // lhs (src1) through %xmm0 — `vcmpps $imm, %xmm1, %xmm0,
-            // %xmm0` computes lhs PRED rhs, overwriting the staged lhs.
-            let rhs = match self.vec_home_128(&args[1]) {
-                Some(reg) => reg,
-                None => {
-                    self.sse_load_arg(&args[1], "xmm1");
-                    "%xmm1".to_string()
-                }
-            };
-            self.sse_load_arg(&args[0], "xmm0");
+            // lhs (src1) through %xmm2 — `vcmpps $imm, rhs, %xmm2, %xmm2`
+            // computes lhs PRED rhs, overwriting the staged lhs. %xmm2 is
+            // the destructive scratch; it is withheld from the allocator
+            // pool (clobbers_xmm2), so no live value can be homed in it.
+            let rhs = self.staged_cmp_rhs(&args[1]);
+            self.sse_load_arg(&args[0], "xmm2");
             self.state.emit_fmt(format_args!(
-                "    v{} ${}, {}, %xmm0, %xmm0",
+                "    v{} ${}, {}, %xmm2, %xmm2",
                 inst, imm, rhs
             ));
-            self.sse_store_dest(dest, "xmm0");
+            self.sse_store_dest(dest, "xmm2");
             return;
         }
-        let rhs = match self.vec_home_128(&args[1]) {
+        let rhs = self.staged_cmp_rhs(&args[1]);
+        self.sse_load_arg(&args[0], "xmm2");
+        self.state
+            .emit_fmt(format_args!("    {} ${}, {}, %xmm2", inst, imm, rhs));
+        self.sse_store_dest(dest, "xmm2");
+    }
+
+    /// Resolve the right-hand operand of a destructive `cmp`/`shuf`/`round`
+    /// staged in %xmm2: a register home is used in place, a value with no
+    /// register is loaded into the reserved %xmm1. Returns the AT&T operand.
+    pub(super) fn staged_cmp_rhs(&mut self, rhs: &Operand) -> String {
+        match self.vec_home_128(rhs) {
             Some(reg) => reg,
             None => {
-                self.sse_load_arg(&args[1], "xmm1");
+                self.sse_load_arg(rhs, "xmm1");
                 "%xmm1".to_string()
             }
-        };
-        self.sse_load_arg(&args[0], "xmm0");
-        self.state
-            .emit_fmt(format_args!("    {} ${}, {}, %xmm0", inst, imm, rhs));
-        self.sse_store_dest(dest, "xmm0");
+        }
     }
 
     /// Packed INTEGER compare on dword lanes (the map vectorizer's

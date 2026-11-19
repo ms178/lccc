@@ -449,6 +449,19 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
                             // SSE2 masked equal-width step: %xmm2 stages a
                             // slot-homed guard splat beside the lane copy.
                             | O::VecMaskedAddValueI32x4
+                            // Destructive compare/shuffle/round emitters stage
+                            // their result in %xmm2 (never %xmm0: a parameter
+                            // can be parked in %xmm0 for the whole body). The
+                            // packed compares include the generic VecCmpF* path.
+                            | O::CmpPs128
+                            | O::CmpPd128
+                            | O::ShufPs128
+                            | O::ShufPd128
+                            | O::RoundPs128
+                            | O::RoundPd128
+                            | O::VpermilPs128
+                            | O::VecCmpF32x4
+                            | O::VecCmpF64x2
                     ) || (sse2_i32_mul_lowering && matches!(op, O::VecMulI32x4))
                 } else {
                     false
