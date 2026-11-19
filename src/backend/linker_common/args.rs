@@ -1268,6 +1268,15 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             pos.apply(arg, &mut pos_stack);
         } else if pos.apply(arg, &mut pos_stack) {
             // positional toggle consumed
+        } else if arg == "-z" {
+            // Direct backend callers can pass raw ld arguments as well as
+            // the normalized `-Wl,-z,KEYWORD` emitted by lccc-ld.
+            if let Some(kw) = args.get(i + 1) {
+                i += 1;
+                apply_z_keyword(&mut result, kw);
+            }
+        } else if let Some(kw) = arg.strip_prefix("-z") {
+            apply_z_keyword(&mut result, kw);
         } else if let Some(sym) = arg.strip_prefix("--entry=") {
             result.entry_symbol = Some(sym.to_string());
         } else if (arg == "--entry" || arg == "-e") && i + 1 < args.len() {
@@ -1620,10 +1629,26 @@ mod map_arg_tests {
             let parsed = parse_linker_args(&args(flags));
             assert!(parsed.allow_multiple_definition(), "{flags:?}");
             assert_eq!(parsed.z_other_keyword_warnings(), ["-z muldefs ignored"]);
+            assert!(parsed.inputs.is_empty() && parsed.missing_inputs.is_empty());
         }
-        for flags in [&[][..], &["-zmuldefs=1"], &["-Wl,-z,nomuldefs"]] {
+        for flags in [&[][..], &["-z"], &["-zmuldefs=1"], &["-Wl,-z,nomuldefs"]] {
             assert!(!parse_linker_args(&args(flags)).allow_multiple_definition());
         }
+    }
+
+    #[test]
+    fn direct_z_keywords_and_driver_forwarded_keywords_share_order() {
+        let args = args(&[
+            "-z",
+            "defs",
+            "-Wl,-z,undefs",
+            "-zexecstack",
+            "-Wl,-znoexecstack",
+        ]);
+        let parsed = parse_linker_args(&args);
+        assert!(!parsed.no_undefined);
+        assert_eq!(parsed.z_execstack, Some(false));
+        assert!(parsed.inputs.is_empty() && parsed.missing_inputs.is_empty());
     }
 
     /// `-Map` reaches the linker in four spellings depending on whether the
