@@ -3619,6 +3619,22 @@ impl Lowerer {
         name: &str,
         args: &[Expr],
     ) -> Option<Operand> {
+        // Fixed argument counts that the front end cannot check by name (see
+        // `x86_var_shift_arity`). Checked before any operand is lowered.
+        if let Some(expected) = x86_var_shift_arity(intrinsic) {
+            if args.len() != expected {
+                let which = if args.len() < expected {
+                    "too few"
+                } else {
+                    "too many"
+                };
+                let message = format!(
+                    "{which} arguments to function '{name}' (expected {expected}, have {})",
+                    args.len()
+                );
+                return self.reject_builtin_call(message, args, 16);
+            }
+        }
         // One-bit lane immediates must be a constant 0 or 1 (see
         // `x86_lane_immediate_bits`). The check runs before any operand is
         // lowered, so a rejected call leaves no half-built expressions.
@@ -4001,6 +4017,25 @@ impl Lowerer {
 /// argument must be an 1-bit immediate"). The operand lowering masks the
 /// immediate (`& 1`), so without this check an out-of-range constant compiled
 /// to the wrong lane and a runtime value compiled to lane 0, with no diagnostic.
+/// Argument count of the count-in-XMM packed shifts (`_mm_sll_epi16`,
+/// `_mm_sra_epi32`, ...): `(value, count)`. Their public names are not in the
+/// front end's arity table, so nothing else rejects a malformed call. A call
+/// with one argument then indexes past the operands in codegen (ICE), and an
+/// extra argument is silently accepted.
+fn x86_var_shift_arity(intrinsic: &BuiltinIntrinsic) -> Option<usize> {
+    match intrinsic {
+        BuiltinIntrinsic::X86Psllw128
+        | BuiltinIntrinsic::X86Psrlw128
+        | BuiltinIntrinsic::X86Pslld128
+        | BuiltinIntrinsic::X86Psllq128
+        | BuiltinIntrinsic::X86Psrld128
+        | BuiltinIntrinsic::X86Psrlq128
+        | BuiltinIntrinsic::X86Psraw128
+        | BuiltinIntrinsic::X86Psrad128 => Some(2),
+        _ => None,
+    }
+}
+
 fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
     match intrinsic {
         BuiltinIntrinsic::X86Extracti128
@@ -5162,6 +5197,31 @@ fn nan_library_function(name: &str) -> Option<&'static str> {
         "__builtin_nanf128" | "__builtin_nanq" => "nanf128",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod x86_var_shift_arity_tests {
+    use super::{BuiltinIntrinsic as B, x86_var_shift_arity};
+
+    /// Every count-in-XMM shift has exactly two operands `(value, count)`
+    /// (GCC 16.2 `*_FTYPE_*_*_COUNT`). Any other intrinsic is unconstrained
+    /// here, so the check cannot reject a call it does not own.
+    #[test]
+    fn count_in_xmm_shifts_take_two_operands() {
+        for intrinsic in [
+            B::X86Psllw128,
+            B::X86Psrlw128,
+            B::X86Pslld128,
+            B::X86Psllq128,
+            B::X86Psrld128,
+            B::X86Psrlq128,
+            B::X86Psraw128,
+            B::X86Psrad128,
+        ] {
+            assert_eq!(x86_var_shift_arity(&intrinsic), Some(2), "{intrinsic:?}");
+        }
+        assert_eq!(x86_var_shift_arity(&B::X86Pmulhw128), None);
+    }
 }
 
 #[cfg(test)]
