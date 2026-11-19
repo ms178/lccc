@@ -193,11 +193,12 @@ driver/linker side and [MB-20, MB-21, MB-05] on the backend side. The lazy
 reference work has landed; the original ~30% hotspot is not a current estimate.
 
 **2026-11-18 performance worklist:** see the [evidence-ranked ten-item queue](engineering/BACKLOG-ROI-2026-11-18.md).
-Current VM screens favor bounded match extension and Huffman heap codegen over
-reusing the historical nbody/LZ4 order. For compiler throughput, start with a
-fresh-solver/invalidation contract for MB-20 step 5, scope-review metric-pair
-sharing, and only screen global allocators on byte-identity and paired wall time.
-These are separate workstreams; passing a compile-cost gate is not a runtime win.
+The Nov 18 VM screens favor bounded match extension and Huffman heap codegen over
+reusing the historical nbody/LZ4 order. For compiler throughput, re-profile after
+MB-20 step 5 before choosing between decode-once work and a fresh-solver contract
+for liveness memoization. Scope-review metric-pair sharing and screen global
+allocators on byte identity and paired wall time. Passing a compile-cost gate is
+not a runtime win.
 
 ---
 

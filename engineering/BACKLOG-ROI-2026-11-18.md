@@ -9,10 +9,17 @@ new ranking. No production optimizer change or compiler speedup is claimed.
 
 **Decision.** Start with bounded match extension and the heap comparator:
 we have current, output-checked runtime gaps and concrete compiler witnesses for
-both. Start MB-20 step 5 first on the **compiler-throughput** track. Review
-metric-pair sharing before changing either scoped leg. Screen allocators
+both. On the **compiler-throughput** track, re-profile after MB-20 step 5 and
+review metric-pair sharing before changing either scoped leg. Screen allocators
 without a dependency change. Do not use a faster compiler as compensation for
 slower generated code.
+
+**Rebase note.** PR #1199 landed pass-level dirty ticks and the vector-presence
+gate on `d2425d0`. The profile shares below describe the pre-#1199 baseline;
+re-measure before using them to choose between liveness memo work and decode-once
+work. Pass scheduling and liveness invalidation are different contracts. The
+upstream result meets its label-reference target, not the overall ≤35% peephole
+target.
 
 **How to reorder.** Start with a named backlog item and a current output-checked
 witness. Prefer repeatable generated-code gaps over tool latency, and bounded,
@@ -131,7 +138,7 @@ cheap decode-only proposal, not copying mutable prefix state.
 |---:|---|---|---|
 | 1 | **MB-44 / §8 PF-LZ4-1 / RH-10: bounded match extension.** In compare256 trace C `memcpy` load → IR loads/first mismatch → x86 compare/branch and bit scan → disassembly. Price same-source candidate with a bounded unroll or chunk compare plus first-difference refinement. | 1.479× Clang on amplified input means ~32% headroom to parity on that input, not gzip/deflate savings. Compare early/late/all-equal and realistic compression mix; retain LZ4/gzip as independent shapes. | M. Check every offset and alignment, guard pages/tails, overlapping read-only ranges, exact first differing byte and zero-bit-scan legality. No load past the proved readable bound or hoisting volatile/conditionally valid loads. Demand a real paired win, generated code evidence and no regression on gzip/golden controls. Reject unrolling everything or simply cloning Clang. |
 | 2 | **MB-44 / §8 PERF-5 and RA pressure: hot inner comparator/caller.** Use inline trace and RA explanation on the remaining `smaller` calls; test bounded loop-weighted benefit vs call/pressure/growth. Price a post-inline cleanup separately (nonnegative IVs, avoid gratuitous extends). | 1.207× Clang at ordinary size; source-only inlining shows ~7.8% lower median on amplified input, with code growth. Could generalize to small static predicates in codecs and scanners; no projection to whole gzip. | M. Use structural/cost/tie oracles, held-out loop/non-loop, aliased, cold, interposable and recursive cases, debug inline ranges, and actual zlib-ng compress/decompress corpus. Run inflated and ordinary sizes; reject a global growth-cap bump or name-based rule. |
-| 3 | **MB-20 step 5a: incremental per-function liveness invalidation.** Add a mutation/fresh-solve oracle before moving cache ownership; see design below. | Direct hash self cost 1.62–2.63% on these TUs before edit bookkeeping, with potential additional wins only if measured. Broad compiler coverage, **no codegen improvement expected**. | M/high correctness risk. `-O0/-O1/-O2/-Os`, debug/CFI/asm/switch and neutralization negative tests; exact assembly and layout winner; two-input Ir/3% ratchet plus replicated native paired compile wall. Fallback on untracked dependencies. No general dirty-pass skipping in this change. |
+| 3 | **MB-20 follow-up: incremental per-function liveness invalidation.** Re-profile after the landed pass-scheduling change. If the cost remains material, add a mutation/fresh-solve oracle before moving cache ownership; see design below. | Direct hash self cost was 1.62–2.63% on these pre-rebase TUs before edit bookkeeping. Broad compiler coverage, **no codegen improvement expected**. | M/high correctness risk. `-O0/-O1/-O2/-Os`, debug/CFI/asm/switch and neutralization negative tests; exact assembly and layout winner; two-input Ir/3% ratchet plus replicated native paired compile wall. Fallback on untracked dependencies; do not change the pass scheduler as part of this work. |
 | 4 | **MB-20 remaining pair work: exact common-prefix decode feasibility.** Count all distinct pairs and classify shareable prepass time; prototype read-only local classification only after review. | Inclusive pair 34–42% is not removable. Existing full-string exact dedup already handles identical inputs. Shared work bounded by actual decode cost of a safely identical prefix, and often short. | S census / M implementation. Require both optimized legs and chosen winner byte-identical, unchanged diagnostic artifacts and schedule/panic semantics; use four-backend pair tests, single/multi-CPU wall and serial Ir. Stop if copy/clone/worker overhead eats the small eligible gain. |
 | 5 | **MB-20/22: system vs mimalloc vs jemalloc compiler allocator screen.** Use the same frozen executable (preloaded DSOs first), resolve `malloc`/`free`/alignment bindings for every arm once off-timer; no target-program preload. | No measured allocator headroom here. Small experiment prices broad compiler workloads and pair contention; allocation counts are not latency and neither arm is pre-selected. | S screen / M if adopted. Same loader/env, separate RSS/page-fault and runtime measurements, pin DSO versions/digests; see protocol. Require byte identity and material paired wall gain that survives an integrated `fastbuild` A/B; separate dependency commit only after evidence. |
 | 6 | **MB-44 / §8 WR-COND-RETEST: scalar parser/dispatch diagnostics.** Amplify SQLite serial decode without changing data distribution, then compare IR bounds, width/sign extensions, branch fanout and layout with Expat UTF-8 as an independent control. | SQLite 1.088× GCC at 15 ms; Expat 1.029× at 50 ms. Confirm one profitable generic shape; a good case can reach parsers beyond SQLite/Expat, but no VDBE claim. | S probe / M candidate. Oracle every serial type, sign boundary, legal and malformed UTF-8/token boundary; preserve short reads and alias rules. Do not equate a lookup of constant values with dispatch executing arbitrary case bodies; no broad jump-threading rewrite on static differences. |
@@ -430,7 +437,9 @@ substitute.
   shim shadowed the explicitly selected executable on `PATH`. Source builds
   now use the home shim only as a fallback, and verified cache reuse needs
   neither Cargo on `PATH` nor a home shim. This audit does not certify a
-  native mold build or alter the known i686 symbol policy.
+  native mold build. The [ELF32 follow-up](../src/backend/i686/linker/README.md)
+  changes the built-in executable, PIE and DSO symbol policy, not the separate
+  `-T` linker path.
 - **Hosted benchmark provenance.** The timed shards install and verify the
   cached GCC 16.2 oracle before compiling. The base apt bundle remains for
   system dependencies, not as the measurement compiler. The clock, shard
