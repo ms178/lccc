@@ -1077,8 +1077,22 @@ callgrind_annotate --inclusive=yes cg.out | grep -E 'LabelRefs::build|combined_l
    56 need the owned text unconditionally and were left alone.
 4. **Decode once (M).** Extend `LineInfo` with an interned opcode id and operand
    kinds computed on creation/edit so the `starts_with` ladders become table lookups.
-5. **Per-function dirty bits (M).** Re-run only functions changed in the previous
-   iteration of the fixpoint loop; skip a pass when its trigger opcode never occurs.
+5. **Per-function dirty bits (M) — DONE as pass-level dirty ticks + a
+   vector-presence gate (PR #1199).** The fixpoint already runs per function,
+   so the wasted work was at pass granularity: a sub-pass now re-runs only when
+   a change was reported since it last started (`PassTicks`, phase 1 / 2b / 4b,
+   `CCC_PEEPHOLE_NO_DIRTY_SKIP=1` reverts, `CCC_PEEPHOLE_VERIFY_DIRTY=1`
+   digest-checks honesty), which deleted the pure re-verification iteration
+   (108.7 of 404.6 ms on the 40-function TU; 1,659 clean re-runs skipped).
+   The trigger-presence rule gates the audited 28-name FP/vector family on one
+   `%xmm`/`%ymm`/`%zmm`/`vzeroupper` probe (13.35 % of compile instructions on
+   the all-integer TU; `CCC_PEEPHOLE_NO_VEC_GATE=1` reverts). Together:
+   6,754,090,592 → 5,991,160,276 Ir (−11.3 %), paired wall −8.87 % (big40) /
+   −6.02 % (big100), byte-identical over tests/simd, the kernel corpus,
+   tests/regression (1541) and both mixed TUs. `LabelRefs::build` ≤ 2 % held
+   (0.00 %); peephole inclusive share is now 58.01 % — the ≤ 35 % acceptance
+   criterion REMAINS OPEN (next: decode-once table lookups inside
+   `combined_local_pass`, the largest remaining flat profile block).
 
 **Gates.** Byte-identical `.s` over the benchmark programs, the kernel corpus and the
 asm-diff corpus before/after each step (existing identity scripts); a compile-cost

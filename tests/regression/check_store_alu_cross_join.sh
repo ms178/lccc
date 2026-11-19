@@ -209,7 +209,11 @@ if [[ ! -f $modrs ]] && [[ -f $here/../../../src/backend/x86/codegen/peephole/pa
 fi
 if [[ -f $modrs ]]; then
   # (b1) the fold is CALLED from the phase-2 pipeline — at BOTH scan sites.
-  wired=$(grep -c "fold_store_alu_memop" "$modrs" || true)
+  # Count CALL EXPRESSIONS (qualified path + open paren), not bare name
+  # occurrences: the dirty-tick protocol's run_tracked!/fix1! macros take
+  # the pass name as a string literal next to the call, so a plain name
+  # count would see two tokens per tracked site and demand phantom gates.
+  wired=$(grep -c 'memory_fold::fold_store_alu_memop(' "$modrs" || true)
   if [[ "$wired" -lt 2 ]]; then
     echo "FAIL: store_alu_fold is no longer fully wired into the peephole" >&2
     echo "  pipeline ($modrs has $wired fold_store_alu_memop call(s); the" >&2
