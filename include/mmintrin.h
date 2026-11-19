@@ -16,6 +16,12 @@
  * register. */
 typedef int __m64 __attribute__((__vector_size__(8), __may_alias__));
 
+/* Unaligned 64-bit MMX memory operand (GCC 16.2 `__m64_u`). The
+ * _mm_loadl_pi / _mm_loadh_pi / _mm_storel_pi / _mm_storeh_pi forms take this
+ * type so that an 8-byte load from any address, not only an 8-byte-aligned
+ * one, is a valid call. */
+typedef int __m64_u __attribute__((__vector_size__(8), __may_alias__, __aligned__(1)));
+
 /* Packed working images for the MMX entry points: every _mm_*_pi* op below
  * runs as its SSE2 counterpart on the low 64 bits of a 128-bit register
  * image (zero-extended into the working vector, low 8 bytes extracted), so

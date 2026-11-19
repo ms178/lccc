@@ -268,6 +268,61 @@ _mm_testz_si128(__m128i __a, __m128i __b)
     return (__a[0] & __b[0]) == 0 && (__a[1] & __b[1]) == 0;
 }
 
+/* _mm_cmpgt_epi64: signed 64-bit greater-than (PCMPGTQ, SSE4.2). A vector
+ * comparison yields -1 or 0 per lane, which is the mask form the intrinsic
+ * returns. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.2")))
+_mm_cmpgt_epi64(__m128i __a, __m128i __b)
+{
+    return (__m128i)((__v2di)__a > (__v2di)__b);
+}
+
+/* _mm_testc_si128: CF of PTEST, 1 iff (~a & b) == 0 */
+static __inline__ int __attribute__((__always_inline__, target("sse4.1")))
+_mm_testc_si128(__m128i __a, __m128i __b)
+{
+    return (~__a[0] & __b[0]) == 0 && (~__a[1] & __b[1]) == 0;
+}
+
+/* _mm_testnzc_si128: 1 iff ZF == 0 and CF == 0 */
+static __inline__ int __attribute__((__always_inline__, target("sse4.1")))
+_mm_testnzc_si128(__m128i __a, __m128i __b)
+{
+    return !_mm_testz_si128(__a, __b) && !_mm_testc_si128(__a, __b);
+}
+
+/* Macro forms, as in GCC 16.2. Each operand is evaluated once. */
+#define _mm_test_all_zeros(__m, __v) _mm_testz_si128((__m), (__v))
+#define _mm_test_mix_ones_zeros(__m, __v) _mm_testnzc_si128((__m), (__v))
+#define _mm_test_all_ones(__v)                                                 \
+    __extension__ ({                                                           \
+        __m128i __tao_v = (__v);                                               \
+        _mm_testc_si128(__tao_v, _mm_cmpeq_epi32(__tao_v, __tao_v));           \
+    })
+
+/* === SSE4.1 round (ROUNDPS/ROUNDPD and the scalar forms) ===
+ * The scalar forms round only the low element of the second operand, and
+ * take the upper elements from the first. Rounding the packed value and
+ * merging the low lane gives exactly that, with the same rounding mode. */
+#define _mm_round_ss(__d, __v, __m)                                            \
+    __extension__ ({                                                           \
+        __m128 __rss_d = (__d);                                                \
+        _mm_move_ss(__rss_d, _mm_round_ps((__v), (__m)));                      \
+    })
+#define _mm_round_sd(__d, __v, __m)                                            \
+    __extension__ ({                                                           \
+        __m128d __rsd_d = (__d);                                               \
+        _mm_move_sd(__rsd_d, _mm_round_pd((__v), (__m)));                      \
+    })
+#define _mm_ceil_ps(__v) _mm_round_ps((__v), _MM_FROUND_CEIL)
+#define _mm_floor_ps(__v) _mm_round_ps((__v), _MM_FROUND_FLOOR)
+#define _mm_ceil_pd(__v) _mm_round_pd((__v), _MM_FROUND_CEIL)
+#define _mm_floor_pd(__v) _mm_round_pd((__v), _MM_FROUND_FLOOR)
+#define _mm_ceil_ss(__d, __v) _mm_round_ss((__d), (__v), _MM_FROUND_CEIL)
+#define _mm_floor_ss(__d, __v) _mm_round_ss((__d), (__v), _MM_FROUND_FLOOR)
+#define _mm_ceil_sd(__d, __v) _mm_round_sd((__d), (__v), _MM_FROUND_CEIL)
+#define _mm_floor_sd(__d, __v) _mm_round_sd((__d), (__v), _MM_FROUND_FLOOR)
+
 /* === SSE4.1 multiply === */
 
 /* _mm_mullo_epi32: packed 32-bit multiply low (PMULLD) */

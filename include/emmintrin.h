@@ -937,6 +937,91 @@ _mm_loadl_pd(__m128d __a, double const *__p)
     return __a;
 }
 
+/* Partial-width unaligned loads and stores (GCC 16.2 names). A 16-, 32- or
+ * 64-bit load fills the low bytes and zeroes the rest. A store writes only the
+ * low bytes. memcpy with a constant size is the portable, alias-safe form. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_loadu_si16(void const *__p)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, __p, 2);
+    return __r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_loadu_si32(void const *__p)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, __p, 4);
+    return __r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_loadu_si64(void const *__p)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, __p, 8);
+    return __r;
+}
+
+static __inline__ void __attribute__((__always_inline__, target("sse2")))
+_mm_storeu_si16(void *__p, __m128i __b)
+{
+    __builtin_memcpy(__p, &__b, 2);
+}
+
+static __inline__ void __attribute__((__always_inline__, target("sse2")))
+_mm_storeu_si32(void *__p, __m128i __b)
+{
+    __builtin_memcpy(__p, &__b, 4);
+}
+
+static __inline__ void __attribute__((__always_inline__, target("sse2")))
+_mm_storeu_si64(void *__p, __m128i __b)
+{
+    __builtin_memcpy(__p, &__b, 8);
+}
+
+/* _mm_move_epi16 / _mm_move_epi32: keep the low element, zero the rest. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_move_epi16(__m128i __a)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, &__a, 2);
+    return __r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_move_epi32(__m128i __a)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, &__a, 4);
+    return __r;
+}
+
+/* _mm_undefined_si128: the value is unspecified. Zero is a valid choice and
+ * keeps the result deterministic. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_undefined_si128(void)
+{
+    return _mm_setzero_si128();
+}
+
+/* _mm_maskmoveu_si128 (MASKMOVDQU): store byte i of __d to __p[i] only where
+ * the sign bit of byte i of __n is set. Masked-off bytes are not written. */
+static __inline__ void __attribute__((__always_inline__, target("sse2")))
+_mm_maskmoveu_si128(__m128i __d, __m128i __n, char *__p)
+{
+    unsigned char __db[16];
+    unsigned char __nb[16];
+    __builtin_memcpy(__db, &__d, 16);
+    __builtin_memcpy(__nb, &__n, 16);
+    for (int __i = 0; __i < 16; __i++) {
+        if (__nb[__i] & 0x80)
+            __p[__i] = (char)__db[__i];
+    }
+}
+
 /* _mm_loadh_pd: load high double, keep low from __a */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_loadh_pd(__m128d __a, double const *__p)

@@ -122,14 +122,14 @@ _mm_stream_ps(float *__p, __m128 __a)
 
 /* Store the lower 2 floats of __m128 to __m64* memory location. */
 static __inline__ void __attribute__((__always_inline__))
-_mm_storel_pi(__m64 *__p, __m128 __a)
+_mm_storel_pi(__m64_u *__p, __m128 __a)
 {
     __builtin_memcpy(__p, &__a, 8);
 }
 
 /* Store the upper 2 floats of __m128 to __m64* memory location. */
 static __inline__ void __attribute__((__always_inline__))
-_mm_storeh_pi(__m64 *__p, __m128 __a)
+_mm_storeh_pi(__m64_u *__p, __m128 __a)
 {
     __builtin_memcpy(__p, (const char *)&__a + 8, 8);
 }
@@ -624,14 +624,14 @@ _mm_cvttss_si64(__m128 __a)
 /* === Load (additional) === */
 
 static __inline__ __m128 __attribute__((__always_inline__))
-_mm_loadh_pi(__m128 __a, const __m64 *__p)
+_mm_loadh_pi(__m128 __a, const __m64_u *__p)
 {
     __builtin_memcpy((char *)&__a + 8, __p, 8);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
-_mm_loadl_pi(__m128 __a, const __m64 *__p)
+_mm_loadl_pi(__m128 __a, const __m64_u *__p)
 {
     __builtin_memcpy(&__a, __p, 8);
     return __a;

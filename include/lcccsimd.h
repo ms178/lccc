@@ -1170,8 +1170,23 @@ __m128d __lccc_simd128_ps_cmppd128(long, __m128d __a, __m128d __b);
 __m128 __lccc_simd128_ps_cmpps128(long, __m128 __a, __m128 __b);
 __m128d __lccc_simd128_ps_cmppd128(long, __m128d __a, __m128d __b);
 #define _mm_cmp_ps(__a, __b, __imm) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_cmpps128(__imm, __a, __b))
+/* Scalar single-precision compare: low lane from the predicate, upper three
+ * lanes from the first operand (CMPSS). See _mm_cmp_sd below. */
+#define _mm_cmp_ss(__a, __b, __imm)                                             \
+    __extension__ ({                                                           \
+        __m128 __cmp_ss_a = (__a);                                             \
+        _mm_move_ss(__cmp_ss_a, _mm_cmp_ps(__cmp_ss_a, (__b), (__imm)));       \
+    })
 
 #define _mm_cmp_pd(__a, __b, __imm) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_cmppd128(__imm, __a, __b))
+/* Scalar compares: the low lane is the predicate on the low lanes, the upper lane
+ * comes from the first operand (CMPSD / CMPSS). A packed compare then a lane
+ * merge gives exactly that, under the same predicate. */
+#define _mm_cmp_sd(__a, __b, __imm)                                             \
+    __extension__ ({                                                           \
+        __m128d __cmp_sd_a = (__a);                                            \
+        _mm_move_sd(__cmp_sd_a, _mm_cmp_pd(__cmp_sd_a, (__b), (__imm)));       \
+    })
 
 __m128 __lccc_simd128_ps_vpermilvarps128(long, __m128 __a, __m128i __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m128 _mm_permutevar_ps(__m128 __a, __m128i __b)
