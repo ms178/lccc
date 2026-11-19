@@ -419,6 +419,17 @@ gate "static-key-layout" fast \
 # on i686 -- register liveness gave up every function that returned.)
 gate "return-thunk-parity" fast \
     python3 tests/regression/check_return_thunk_parity.py --lccc "$LCCC" --self-test
+# An extended asm statement changes its operands and nothing else: 96
+# generated functions exist once with their updates, loads and exchanges as
+# asm and once in C, both keep eight locals alive around the statements, and
+# the two checksums agree at -O0..-Os on both x86 targets and under the return
+# thunk.  On x86-64 a statement staged in at most two registers is no call
+# point, its inputs keep their registers and the peephole reads its text; the
+# shapes that stay call points are generated too.  Five kernel-style
+# statements are held to instruction budgets (no saved register, no stack).
+gate "asm-operand-equivalence" fast \
+    python3 tests/regression/check_asm_operand_equivalence.py --lccc "$LCCC" \
+    --gcc "${GCC:-gcc-16}" --self-test
 gate "call-arg-staging-homes" fast \
     python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
     --seed-list 1,2,3,4,5,6,11,14,16,26,30
