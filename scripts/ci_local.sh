@@ -395,6 +395,14 @@ gate "licm-global-speculation" fast \
 # above the test that guards its loop.
 gate "call-return-facts" fast \
     python3 tests/regression/check_call_return_facts.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
+# An asm goto behaves like the `if (c) goto label;` it stands for: 352 shapes
+# (what is ahead of the jump, behind it, around it; twelve kinds of storage)
+# are compiled both ways and compared, at -O0..-Os for x86-64 and i686, with
+# the jump spelled as `jnz` and as bytes.  Callee-saved registers are checked
+# around every call.  The committed fixture is what the generator writes.
+gate "asm-goto-equivalence" fast \
+    python3 tests/regression/check_asm_goto_equivalence.py --lccc "$LCCC" \
+    --check-committed --self-test
 gate "call-arg-staging-homes" fast \
     python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
     --seed-list 1,2,3,4,5,6,11,14,16,26,30
