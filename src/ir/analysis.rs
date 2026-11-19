@@ -12,7 +12,7 @@
 //! if_convert, and mem2reg.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{BlockId, Instruction, IrFunction, Terminator};
+use crate::ir::reexports::{BasicBlock, BlockId, Instruction, IrFunction, Terminator};
 
 // ── Flat adjacency list (CSR format) ──────────────────────────────────────────
 
@@ -102,6 +102,20 @@ pub fn build_label_map(func: &IrFunction) -> FxHashMap<BlockId, usize> {
 
 // ── CFG construction ──────────────────────────────────────────────────────────
 
+/// Edges that can bypass the block's terminator, including edges to a label
+/// also named by that terminator. Removing the explicit arm does not remove
+/// the asm-goto edge, and facts specific to the arm do not hold on that edge.
+pub(crate) fn asm_goto_successors(block: &BasicBlock) -> impl Iterator<Item = BlockId> + '_ {
+    block
+        .instructions
+        .iter()
+        .flat_map(|inst| match inst {
+            Instruction::InlineAsm { goto_labels, .. } => goto_labels.as_slice(),
+            _ => &[],
+        })
+        .map(|(_, label)| *label)
+}
+
 /// Build predecessor and successor lists from the function's CFG.
 /// Returns (preds, succs) as flat adjacency lists (CSR format).
 ///
@@ -174,17 +188,13 @@ pub fn build_cfg(
             Terminator::Return(_) | Terminator::Unreachable => {}
         }
         // InlineAsm goto_labels are implicit control flow edges.
-        for inst in &block.instructions {
-            if let Instruction::InlineAsm { goto_labels, .. } = inst {
-                for (_, label) in goto_labels {
-                    if let Some(&t) = label_to_idx.get(label) {
-                        let t32 = t as u32;
-                        if !succs[i].contains(&t32) {
-                            succs[i].push(t32);
-                        }
-                        preds[t].push(i32);
-                    }
+        for label in asm_goto_successors(block) {
+            if let Some(&t) = label_to_idx.get(&label) {
+                let t32 = t as u32;
+                if !succs[i].contains(&t32) {
+                    succs[i].push(t32);
                 }
+                preds[t].push(i32);
             }
         }
     }

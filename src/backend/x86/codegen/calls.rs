@@ -1826,16 +1826,35 @@ impl X86Codegen {
         self.state.invalidate_vec_peephole();
     }
 
-    /// Publish one call-site marker line. At a sibling call (the call text
-    /// suppressed, `pending_sibcall` `Ready`) the line is also kept for
-    /// `emit_return_impl`, which repeats the marker block after the tail
-    /// `jmp` (see `BackendState::sibcall_marker_lines`).
+    /// Publish one call-site marker line.
+    ///
+    /// A sibling call suppresses its `call` text — every other phase of the
+    /// call does the same on `pending_sibcall` (`emit_pre_call_save_caller_regs`,
+    /// `emit_call_store_result_impl`, ...) — so its marker block is suppressed
+    /// with it and only *recorded* here, for `emit_return_impl` to publish
+    /// after the tail `jmp` behind `# LCCC_TAIL_CALL` (see
+    /// `BackendState::sibcall_marker_lines`).
+    ///
+    /// Publishing the block at the suppressed site as well left an ORPHAN: a
+    /// marker block attaches to the instruction directly above it, so a block
+    /// with no call text above it is read as belonging to whatever *does* sit
+    /// above it. When the preceding statement was itself a call, the two blocks
+    /// became contiguous comment runs and `call_markers` — last legible
+    /// `# LCCC_CALL_ARGS` wins — reported the preceding call as reading the
+    /// sibling callee's argument count. `eliminate_dead_pure_writes` then
+    /// deleted that call's argument staging as dead. In Linux 6.18.63 that is
+    /// `addrconf_verify_work` handing `&rtnl_mutex` to `addrconf_verify_rtnl`,
+    /// panicking the guest at t=0.87 s. One marker block per call text is the
+    /// invariant the whole protocol rests on; `call_markers` now also latches
+    /// the first legible value so a future producer bug cannot downgrade a
+    /// read set silently.
     fn emit_call_marker(&mut self, line: String) {
         if matches!(
             self.state.pending_sibcall,
             Some(SibcallPending::Ready { .. })
         ) {
-            self.state.sibcall_marker_lines.push(line.clone());
+            self.state.sibcall_marker_lines.push(line);
+            return;
         }
         self.state.emit(&line);
     }

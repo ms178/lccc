@@ -39,17 +39,34 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair, built by whichever lane
+    # misses the cache first.  Run 39686387347 paid 80-205 s of apt in six
+    # lanes and 125 s in a seventh for the identical package set; restoring the
+    # bundle is a few seconds, and `ci_toolchain_bundle.sh verify` probes
+    # gcc-16 -m32, mold, ld.lld and qemu-i386 before a lane may use it.
+    #
+    # The key is `ci_toolchain_key.sh`: a digest of the image's package
+    # baseline and of the installer.  It has to be the image, because a bundle
+    # is a package delta unpacked over `/`; when the key said only `runner.os`,
+    # image 20261116 was handed a bundle built on 2026-11-06 as an exact hit,
+    # rejected it in every lane it reached, and could never save a replacement
+    # (run 44345167051: 1733 s of provisioning in a 30-minute lane).
+    #
+    # `restore-keys` hands a new image the newest bundle of any other one.  It
+    # is not unpacked -- its stamp is not this runner's -- but the package
+    # archive it carries lets apt rebuild from local files, and the rebuilt
+    # bundle is saved under this runner's key.  The weekly archive above is an
+    # independent seed for a lane that starts with no bundle at all.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -171,11 +188,16 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -251,17 +273,18 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair; the key and the seeding
+    # rule are explained once, on the `build` job.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -362,17 +385,18 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair; the key and the seeding
+    # rule are explained once, on the `build` job.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -530,17 +554,18 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair; the key and the seeding
+    # rule are explained once, on the `build` job.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -819,17 +844,18 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair; the key and the seeding
+    # rule are explained once, on the `build` job.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -1110,6 +1136,10 @@ jobs:
         --lccc target/fastbuild/lccc --seed-list 1,2,3,4,5,6,11,14,16,26,30
         run_gate licm_global_speculation python3 tests/regression/check_licm_global_speculation.py \
         --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate call_return_facts python3 tests/regression/check_call_return_facts.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate asm_goto_equivalence python3 tests/regression/check_asm_goto_equivalence.py \
+        --lccc target/fastbuild/lccc --check-committed --self-test
         run_gate return_local_addr python3 tests/regression/check_return_local_addr.py \
         --lccc target/fastbuild/lccc --gcc gcc-16 --m32
         run_gate qualifier_composition python3 tests/regression/check_qualifier_composition.py \
@@ -1133,6 +1163,17 @@ jobs:
         set -euo pipefail
         python3 scripts/check_intrinsic_arity.py --self-test
         python3 scripts/check_intrinsic_arity.py --check
+    # Same shape as the step above, different provenance: that table is derived
+    # from include/*.h, this one is measured from GCC itself, because GCC's
+    # coverage is not uniform (it arity-checks `memcpy` and stays silent for
+    # `puts`, but checks `__builtin_puts`). Keep both driver paths in lockstep
+    # with the table, including the legacy dialect and withdrawal cases.
+    - name: Libc builtin arity table matches GCC 16.2
+      run: |
+        set -euo pipefail
+        python3 scripts/check_libc_builtin_arity.py --self-test
+        python3 scripts/check_libc_builtin_arity.py --gcc gcc-16 --check
+        python3 tests/regression/check_libc_builtin_calls.py --gcc gcc-16 --lccc target/fastbuild/lccc
     - name: Intrinsic lowering tables are complete (outer pattern vs mnemonic)
       run: |
         set -euo pipefail
@@ -1184,17 +1225,18 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair; the key and the seeding
+    # rule are explained once, on the `build` job.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -1494,17 +1536,18 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair; the key and the seeding
+    # rule are explained once, on the `build` job.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -1732,17 +1775,18 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair; the key and the seeding
+    # rule are explained once, on the `build` job.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -1966,17 +2010,18 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    # One content-addressed bundle per (runner image, installer) pair, built by
-    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
-    # apt in six lanes and 125 s in a seventh for the identical package set;
-    # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # One bundle per (runner image, installer) pair; the key and the seeding
+    # rule are explained once, on the `build` job.
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -2516,11 +2561,16 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -2975,11 +3025,16 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -3695,11 +3750,16 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Cache the GCC 16.2 oracle
@@ -3777,11 +3837,16 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Identify the toolchain bundle for this runner image
+      id: toolchain-key
+      run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+        restore-keys: |
+          lccc-toolchain-v2-
     - name: Provision oracle toolchain (cached bundle, else apt)
       run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Cache the GCC 16.2 oracle

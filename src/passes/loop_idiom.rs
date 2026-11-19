@@ -1596,6 +1596,7 @@ fn make_copy_call(
             regparm: None,
             is_pure: false,
             is_const: false,
+            memory: Default::default(),
             // Created only under `BuiltinPolicy::may_synthesize`.
             assume_library: true,
             ret_eightbyte_classes: Vec::new(),
@@ -4489,6 +4490,7 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // Created only under `BuiltinPolicy::may_synthesize`.
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),

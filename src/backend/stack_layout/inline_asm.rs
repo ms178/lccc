@@ -236,6 +236,211 @@ fn is_generic_gp_constraint(constraint: &str) -> bool {
     false
 }
 
+/// The registers the i686 scratch allocator hands an inline asm, in its order
+/// of preference (`assign_scratch_reg` in `i686/codegen/asm_emitter.rs`).
+///
+/// One definition for the allocator and for the two functions below that
+/// predict it: which callee-saved register the prologue has to save depends
+/// on how far down this list a block can reach.
+pub const I686_ASM_SCRATCH_POOL: &[&str] = &["ecx", "edx", "esi", "edi", "eax", "ebx"];
+
+/// The same for an operand printed through a byte view: IA-32 has no byte
+/// name for `esi`, `edi` or `ebp`.
+pub const I686_ASM_BYTE_SCRATCH_POOL: &[&str] = &["ecx", "edx", "eax", "ebx"];
+
+/// What one operand of an i686 inline asm asks of the scratch pool.
+enum I686ScratchDraw {
+    /// Nothing: a tied operand, an immediate, a flag written straight to its
+    /// byte home.
+    Nothing,
+    /// A register of its own, named by a single-register constraint letter.
+    /// The scratch allocator passes over it for the other operands.
+    Named(&'static str),
+    /// This many registers of the pool, at most.
+    Registers(i32),
+}
+
+fn i686_operand_scratch_draw(
+    constraint: &str,
+    op_idx: usize,
+    outputs: &[(String, crate::ir::reexports::Value, Option<String>)],
+    operand_types: &[crate::common::types::IrType],
+    alloca_ids: &FxHashSet<u32>,
+) -> I686ScratchDraw {
+    use crate::common::types::IrType;
+    let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+    if c.starts_with("@cc") {
+        let direct_byte_store = matches!(operand_types.get(op_idx), Some(IrType::I8 | IrType::U8))
+            && outputs
+                .get(op_idx)
+                .is_some_and(|(_, ptr, _)| alloca_ids.contains(&ptr.0));
+        return if direct_byte_store {
+            I686ScratchDraw::Nothing
+        } else {
+            I686ScratchDraw::Registers(1)
+        };
+    }
+    // Tied to another operand.
+    if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
+        return I686ScratchDraw::Nothing;
+    }
+    // Immediate-only: no register alternative.
+    let imm_only = !c.is_empty()
+        && c.chars().all(|ch| {
+            matches!(
+                ch,
+                'i' | 'n' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'e' | 'Z' | 's'
+            )
+        });
+    if imm_only {
+        return I686ScratchDraw::Nothing;
+    }
+    let named = match c {
+        "a" => Some("eax"),
+        "b" => Some("ebx"),
+        "c" => Some("ecx"),
+        "d" => Some("edx"),
+        "S" => Some("esi"),
+        "D" => Some("edi"),
+        _ => None,
+    };
+    if let Some(reg) = named {
+        return I686ScratchDraw::Named(reg);
+    }
+    // i686 holds a 64-bit operand in a register pair.
+    let wide = matches!(
+        operand_types.get(op_idx),
+        Some(IrType::I64) | Some(IrType::U64) | Some(IrType::F64)
+    );
+    I686ScratchDraw::Registers(if wide { 2 } else { 1 })
+}
+
+/// The pool register a clobber names, through any of its views.
+fn i686_clobbered_pool_reg(clobber: &str) -> Option<&'static str> {
+    match crate::backend::inline_asm::normalize_inline_asm_reg_name(clobber) {
+        "eax" | "ax" | "al" | "ah" => Some("eax"),
+        "ebx" | "bx" | "bl" | "bh" => Some("ebx"),
+        "ecx" | "cx" | "cl" | "ch" => Some("ecx"),
+        "edx" | "dx" | "dl" | "dh" => Some("edx"),
+        "esi" | "si" => Some("esi"),
+        "edi" | "di" => Some("edi"),
+        _ => None,
+    }
+}
+
+/// The callee-saved registers the i686 scratch allocator can hand to an
+/// inline asm, now that the register allocator has chosen its homes.
+///
+/// [`collect_inline_asm_callee_saved_i686`] runs ahead of the allocator and
+/// proves that a block is served from the head of the pool, `%ecx` and
+/// `%edx`.  The scratch allocator, though, passes over a register that is
+/// some value's home -- taking it would destroy the value -- and the
+/// allocator is free to make homes of `%ecx` and `%edx`.  With both taken
+/// the pool begins further down, at a callee-saved register nothing saved:
+///
+/// ```text
+/// f:  pushl %ebx
+///     pushl %esi                  ; the homes the allocator used
+///     ...
+///     movl 32(%esp), %edi         ; "r" operand: ecx, edx, esi are homes
+///     #APP  testl %edi, %edi  #NO_APP
+///     ...
+///     popl %esi
+///     popl %ebx
+///     ret                         ; the caller's %edi is gone
+/// ```
+///
+/// So the walk is repeated here with the homes known: for every block, the
+/// registers it can draw are the first `demand` entries of the pool that are
+/// neither a home nor named by the block itself, and the callee-saved ones
+/// among them are returned for the prologue to save.  A block that may print
+/// an operand through a byte view is walked through the byte pool as well.
+/// The answer is a superset of what the allocator hands out (the demand is
+/// the same over-approximation the early proof uses), and it is empty
+/// whenever a caller-saved register is left at the head of the pool, which
+/// is what the early proof assumed.
+pub fn i686_asm_scratch_callee_saved(
+    func: &IrFunction,
+    is_home: impl Fn(&str) -> bool,
+    ebx_reserved: bool,
+) -> Vec<&'static str> {
+    use crate::common::types::IrType;
+    let mut alloca_ids: Option<FxHashSet<u32>> = None;
+    let mut saved: Vec<&'static str> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::InlineAsm {
+                template,
+                outputs,
+                inputs,
+                clobbers,
+                operand_types,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let allocas = alloca_ids.get_or_insert_with(|| {
+                func.blocks
+                    .iter()
+                    .flat_map(|block| block.instructions.iter())
+                    .filter_map(|inst| match inst {
+                        Instruction::Alloca { dest, .. } => Some(dest.0),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            let mut demand = 0usize;
+            let mut named: Vec<&'static str> = Vec::new();
+            let constraints = outputs
+                .iter()
+                .map(|(c, _, _)| c)
+                .chain(inputs.iter().map(|(c, _, _)| c));
+            for (op_idx, constraint) in constraints.enumerate() {
+                match i686_operand_scratch_draw(constraint, op_idx, outputs, operand_types, allocas)
+                {
+                    I686ScratchDraw::Nothing => {}
+                    I686ScratchDraw::Named(reg) => named.push(reg),
+                    I686ScratchDraw::Registers(n) => demand += n as usize,
+                }
+            }
+            if demand == 0 {
+                continue;
+            }
+            named.extend(clobbers.iter().filter_map(|c| i686_clobbered_pool_reg(c)));
+            let byte_view = template.contains("%b")
+                || template.contains("%h")
+                || operand_types
+                    .iter()
+                    .any(|ty| matches!(ty, IrType::I8 | IrType::U8))
+                || outputs.iter().any(|(c, _, _)| {
+                    c.trim_start_matches(['=', '+', '&', '%'])
+                        .starts_with("@cc")
+                });
+            let pools: &[&[&'static str]] = if byte_view {
+                &[I686_ASM_SCRATCH_POOL, I686_ASM_BYTE_SCRATCH_POOL]
+            } else {
+                &[I686_ASM_SCRATCH_POOL]
+            };
+            for pool in pools {
+                let drawn = pool
+                    .iter()
+                    .copied()
+                    .filter(|&reg| {
+                        !(ebx_reserved && reg == "ebx") && !named.contains(&reg) && !is_home(reg)
+                    })
+                    .take(demand);
+                for reg in drawn {
+                    if matches!(reg, "ebx" | "esi" | "edi") && !saved.contains(&reg) {
+                        saved.push(reg);
+                    }
+                }
+            }
+        }
+    }
+    saved
+}
+
 /// i686-precision variant: skip the blanket callee-saved marking when every
 /// inline-asm block's worst-case scratch demand fits in the caller-saved
 /// prefix of the i686 scratch pool.
@@ -263,29 +468,6 @@ pub fn collect_inline_asm_callee_saved_i686(
     all_callee_saved: &[PhysReg],
 ) {
     use crate::common::types::IrType;
-
-    // Specific single-register constraint letters on i686.
-    fn specific_reg_letter(c: &str) -> Option<&'static str> {
-        match c {
-            "a" => Some("eax"),
-            "b" => Some("ebx"),
-            "c" => Some("ecx"),
-            "d" => Some("edx"),
-            "S" => Some("esi"),
-            "D" => Some("edi"),
-            _ => None,
-        }
-    }
-    // Immediate-only constraint (no register alternative)?
-    fn imm_only(c: &str) -> bool {
-        !c.is_empty()
-            && c.chars().all(|ch| {
-                matches!(
-                    ch,
-                    'i' | 'n' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'e' | 'Z' | 's'
-                )
-            })
-    }
 
     let alloca_ids: FxHashSet<u32> = func
         .blocks
@@ -316,77 +498,40 @@ pub fn collect_inline_asm_callee_saved_i686(
             let mut demand: i32 = 0;
             let mut op_idx = 0usize;
 
-            let account = |c: &str,
-                           op_idx: usize,
-                           ecx_gone: &mut bool,
-                           edx_gone: &mut bool,
-                           avail: &mut i32,
-                           demand: &mut i32| {
-                let c = c.trim_start_matches(['=', '+', '&', '%']);
-                if c.starts_with("@cc") {
-                    let direct_byte_store =
-                        matches!(operand_types.get(op_idx), Some(IrType::I8 | IrType::U8))
-                            && outputs
-                                .get(op_idx)
-                                .is_some_and(|(_, ptr, _)| alloca_ids.contains(&ptr.0));
-                    if !direct_byte_store {
-                        *demand += 1;
-                    }
-                    return;
-                }
-                if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
-                    return;
-                } // tied
-                if imm_only(c) {
-                    return;
-                }
-                if let Some(reg) = specific_reg_letter(c) {
-                    if reg == "ecx" && !*ecx_gone {
-                        *ecx_gone = true;
-                        *avail -= 1;
-                    }
-                    if reg == "edx" && !*edx_gone {
-                        *edx_gone = true;
-                        *avail -= 1;
-                    }
-                    return; // no scratch draw
-                }
-                let wide = matches!(
-                    operand_types.get(op_idx),
-                    Some(IrType::I64) | Some(IrType::U64) | Some(IrType::F64)
-                );
-                *demand += if wide { 2 } else { 1 };
-            };
-
-            for (c, _, _) in outputs {
-                account(
-                    c,
+            let constraints = outputs
+                .iter()
+                .map(|(c, _, _)| c)
+                .chain(inputs.iter().map(|(c, _, _)| c));
+            for constraint in constraints {
+                match i686_operand_scratch_draw(
+                    constraint,
                     op_idx,
-                    &mut ecx_gone,
-                    &mut edx_gone,
-                    &mut avail,
-                    &mut demand,
-                );
-                op_idx += 1;
-            }
-            for (c, _, _) in inputs {
-                account(
-                    c,
-                    op_idx,
-                    &mut ecx_gone,
-                    &mut edx_gone,
-                    &mut avail,
-                    &mut demand,
-                );
+                    outputs,
+                    operand_types,
+                    &alloca_ids,
+                ) {
+                    I686ScratchDraw::Nothing => {}
+                    I686ScratchDraw::Named(reg) => {
+                        if reg == "ecx" && !ecx_gone {
+                            ecx_gone = true;
+                            avail -= 1;
+                        }
+                        if reg == "edx" && !edx_gone {
+                            edx_gone = true;
+                            avail -= 1;
+                        }
+                    }
+                    I686ScratchDraw::Registers(n) => demand += n,
+                }
                 op_idx += 1;
             }
             for cl in clobbers {
-                let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(cl);
-                if matches!(name, "ecx" | "cx" | "cl" | "ch") && !ecx_gone {
+                let name = i686_clobbered_pool_reg(cl);
+                if name == Some("ecx") && !ecx_gone {
                     ecx_gone = true;
                     avail -= 1;
                 }
-                if matches!(name, "edx" | "dx" | "dl" | "dh") && !edx_gone {
+                if name == Some("edx") && !edx_gone {
                     edx_gone = true;
                     avail -= 1;
                 }
@@ -626,5 +771,130 @@ mod tests {
         let mut used = Vec::new();
         collect_inline_asm_callee_saved_i686(&mem_overflow, &mut used, |_| None, |_| None, &all_cs);
         assert_eq!(used, all_cs);
+    }
+
+    /// An asm with `inputs` as its register operands, typed as given.
+    fn asm_with_inputs(template: &str, inputs: &[(&str, IrType)], clobbers: &[&str]) -> IrFunction {
+        make_func_with_asm(Instruction::InlineAsm {
+            template: template.to_string(),
+            outputs: vec![],
+            inputs: inputs
+                .iter()
+                .enumerate()
+                .map(|(i, (c, _))| (c.to_string(), Operand::Value(Value(i as u32)), None))
+                .collect(),
+            clobbers: clobbers.iter().map(|c| c.to_string()).collect(),
+            operand_types: inputs.iter().map(|(_, ty)| *ty).collect(),
+            goto_labels: vec![],
+            input_symbols: vec![None; inputs.len()],
+            seg_overrides: vec![AddressSpace::Default; inputs.len()],
+        })
+    }
+
+    fn scratch_saved(func: &IrFunction, homes: &[&str], ebx_reserved: bool) -> Vec<&'static str> {
+        i686_asm_scratch_callee_saved(func, |reg| homes.contains(&reg), ebx_reserved)
+    }
+
+    #[test]
+    fn i686_scratch_stays_caller_saved_while_ecx_or_edx_is_no_home() {
+        let one = asm_with_inputs("testl %0, %0", &[("r", IrType::I32)], &[]);
+        assert!(scratch_saved(&one, &[], false).is_empty());
+        assert!(scratch_saved(&one, &["ecx"], false).is_empty());
+        assert!(scratch_saved(&one, &["edx", "esi", "edi", "ebx"], false).is_empty());
+    }
+
+    #[test]
+    fn i686_scratch_reaches_a_callee_saved_register_past_two_caller_saved_homes() {
+        // The shape that lost the caller's %edi: %ecx, %edx and %esi are homes,
+        // so the first register of the pool that is free is %edi.
+        let one = asm_with_inputs("testl %0, %0", &[("r", IrType::I32)], &[]);
+        assert_eq!(scratch_saved(&one, &["ecx", "edx"], false), ["esi"]);
+        assert_eq!(scratch_saved(&one, &["ecx", "edx", "esi"], false), ["edi"]);
+        // %eax stands ahead of %ebx in the pool and is caller-saved.
+        assert!(scratch_saved(&one, &["ecx", "edx", "esi", "edi"], false).is_empty());
+        assert_eq!(
+            scratch_saved(&one, &["ecx", "edx", "esi", "edi", "eax"], false),
+            ["ebx"]
+        );
+        // The GOT register is never handed out, so there is nothing to save.
+        assert!(scratch_saved(&one, &["ecx", "edx", "esi", "edi", "eax"], true).is_empty());
+    }
+
+    #[test]
+    fn i686_scratch_counts_every_register_a_block_can_draw() {
+        let two = asm_with_inputs(
+            "addl %0, %1",
+            &[("r", IrType::I32), ("r", IrType::I32)],
+            &[],
+        );
+        assert!(scratch_saved(&two, &[], false).is_empty());
+        assert_eq!(scratch_saved(&two, &["ecx"], false), ["esi"]);
+        assert_eq!(scratch_saved(&two, &["ecx", "edx"], false), ["esi", "edi"]);
+        // A 64-bit operand is a register pair.
+        let wide = asm_with_inputs("nop", &[("r", IrType::I64)], &[]);
+        assert!(scratch_saved(&wide, &[], false).is_empty());
+        assert_eq!(scratch_saved(&wide, &["edx"], false), ["esi"]);
+    }
+
+    #[test]
+    fn i686_scratch_passes_over_registers_the_block_names() {
+        // "c" takes %ecx for itself and a clobber takes %edx: the one generic
+        // operand starts at %esi without any home at all.
+        let named = asm_with_inputs(
+            "shll %b0, %1",
+            &[("c", IrType::I32), ("r", IrType::I32)],
+            &["edx"],
+        );
+        assert_eq!(scratch_saved(&named, &[], false), ["esi"]);
+        // Views of a register name it too.
+        let sub = asm_with_inputs("nop", &[("r", IrType::I32)], &["cl", "dx"]);
+        assert_eq!(scratch_saved(&sub, &[], false), ["esi"]);
+    }
+
+    #[test]
+    fn i686_byte_operands_are_walked_through_the_byte_pool() {
+        // A byte operand cannot live in %esi or %edi: with %ecx, %edx and %eax
+        // homes its register is %ebx.
+        let byte = asm_with_inputs("testb %0, %0", &[("q", IrType::I8)], &[]);
+        assert_eq!(
+            scratch_saved(&byte, &["ecx", "edx", "eax"], false),
+            ["esi", "ebx"]
+        );
+        // The same for a `%b` view of a wider operand.
+        let view = asm_with_inputs("testb %b0, %b0", &[("r", IrType::I32)], &[]);
+        assert_eq!(
+            scratch_saved(&view, &["ecx", "edx", "eax"], false),
+            ["esi", "ebx"]
+        );
+        // Without a byte view only the general pool is walked.
+        let full = asm_with_inputs("testl %0, %0", &[("r", IrType::I32)], &[]);
+        assert_eq!(scratch_saved(&full, &["ecx", "edx", "eax"], false), ["esi"]);
+    }
+
+    #[test]
+    fn i686_scratch_needs_nothing_for_an_asm_that_draws_no_register() {
+        let homes = ["ecx", "edx", "esi", "edi", "eax"];
+        let bare = asm_with_inputs("cli", &[], &[]);
+        assert!(scratch_saved(&bare, &homes, false).is_empty());
+        let fixed = asm_with_inputs(
+            "outb %b0, %w1",
+            &[("a", IrType::I8), ("d", IrType::I16), ("i", IrType::I32)],
+            &[],
+        );
+        assert!(scratch_saved(&fixed, &homes, false).is_empty());
+    }
+
+    #[test]
+    fn i686_early_proof_and_late_walk_share_one_pool() {
+        // The early proof reads the head of the pool as the two caller-saved
+        // registers; the late walk reads the rest.  Both hold only as long as
+        // the allocator's list is this one.
+        assert_eq!(&I686_ASM_SCRATCH_POOL[..2], ["ecx", "edx"]);
+        assert_eq!(&I686_ASM_BYTE_SCRATCH_POOL[..2], ["ecx", "edx"]);
+        assert!(
+            I686_ASM_BYTE_SCRATCH_POOL
+                .iter()
+                .all(|reg| I686_ASM_SCRATCH_POOL.contains(reg))
+        );
     }
 }

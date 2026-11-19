@@ -23,7 +23,7 @@ use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
 use crate::ir::reexports::{
     CallInfo, ConstHashKey, Instruction, IrBinOp, IrCmpOp, IrFunction, IrModule, IrUnaryOp,
-    Operand, Value,
+    MemoryEffect, Operand, Value,
 };
 
 /// A value number expression key. Two instructions with the same ExprKey
@@ -878,13 +878,18 @@ impl GvnState {
                     *dest,
                 ))
             }
-            // Pure/const direct scalar calls: read-none (`is_const` with no
-            // pointer arguments) depends only on its argument VNs; read-only
-            // (`is_pure`, or `is_const` with pointer arguments) additionally
-            // keys on `(load_generation, unknown_ptr_epoch)` so any memory
-            // write, impure call, or CFG merge invalidates it in O(1).
+            // Direct scalar calls that write nothing: read-none (no pointer
+            // arguments either) depends only on its argument VNs; read-only
+            // (or read-none with pointer arguments) additionally keys on
+            // `(load_generation, unknown_ptr_epoch)` so any memory write,
+            // impure call, or CFG merge invalidates it in O(1).
+            //
+            // The memory effect is enough; the call need not be known to
+            // return.  The earlier call dominates this one and did return,
+            // and a callee that depends on nothing else does the same again:
+            // the second `check(i, n)` cannot trap where the first did not.
             Instruction::Call { func, info }
-                if (info.is_pure || info.is_const)
+                if info.memory_effect() != MemoryEffect::ReadWrite
                     && !info.is_sret
                     && !info.is_variadic
                     && info.dest.is_some()
@@ -897,7 +902,7 @@ impl GvnState {
                 let args: Vec<VNOperand> =
                     info.args.iter().map(|a| self.operand_to_vn(a)).collect();
                 let has_ptr_arg = info.arg_types.contains(&IrType::Ptr);
-                let mem_epoch = if info.is_const && !has_ptr_arg {
+                let mem_epoch = if info.memory_effect() == MemoryEffect::ReadNone && !has_ptr_arg {
                     None
                 } else {
                     Some(self.pure_call_epoch)
@@ -1220,7 +1225,7 @@ fn cross_block_renamable(inst: &Instruction) -> bool {
             ..
         } => !ty.is_float() && !ty.is_128bit(),
         Instruction::Call { info, .. } => {
-            (info.is_pure || info.is_const)
+            info.memory_effect() != MemoryEffect::ReadWrite
                 && !info.is_sret
                 && !info.is_variadic
                 && info.dest.is_some()
@@ -1902,8 +1907,10 @@ fn gvn_dfs(
 /// model ([`Instruction::may_write_memory`], no catch-all arm, so a new
 /// instruction kind cannot silently fail open here) plus GVN's own layer:
 ///
-/// * a pure/const call writes nothing the caller can load, EXCEPT through a
-///   hidden sret pointer (i686: every struct/_Complex return; 20070614-1);
+/// * a call whose callee writes nothing leaves what the caller can load as
+///   it was, whether or not the callee is known to return (the loads this
+///   keeps are reached only if it did), EXCEPT through a hidden sret pointer
+///   (i686: every struct/_Complex return; 20070614-1);
 /// * an atomic load stronger than relaxed synchronises with another thread's
 ///   release, after which that thread's writes must be visible
 ///   (`while (!load_acquire(&ready)); use(data);`), and a fence orders the
@@ -1913,7 +1920,7 @@ fn gvn_dfs(
 fn clobbers_memory(inst: &Instruction) -> bool {
     match inst {
         Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-            !(info.is_pure || info.is_const) || info.is_sret
+            info.memory_effect() == MemoryEffect::ReadWrite || info.is_sret
         }
         Instruction::AtomicLoad { ordering, .. } => {
             !matches!(ordering, crate::ir::reexports::AtomicOrdering::Relaxed)
@@ -4318,6 +4325,7 @@ mod tests {
                             regparm: None,
                             is_pure: false,
                             is_const: false,
+                            memory: Default::default(),
                             assume_library: false,
                             ret_eightbyte_classes: Vec::new(),
                             ret_is_f128_sse: false,
@@ -4595,6 +4603,7 @@ mod tests {
                             regparm: None,
                             is_pure: false,
                             is_const: false,
+                            memory: Default::default(),
                             assume_library: false,
                             ret_eightbyte_classes: Vec::new(),
                             ret_is_f128_sse: false,
@@ -4801,6 +4810,7 @@ mod tests {
                             regparm: None,
                             is_pure: false,
                             is_const: false,
+                            memory: Default::default(),
                             assume_library: false,
                             ret_eightbyte_classes: vec![],
                             ret_is_f128_sse: false,
@@ -5131,5 +5141,217 @@ mod tests {
         );
         let mut clob_mod = module_of(clobbered);
         assert_eq!(clob_mod.for_each_function(run_gvn_function), 0);
+    }
+
+    /// `check(i, n)`-shaped: a callee that writes nothing but is not known
+    /// to return, so it is neither pure nor const.
+    fn quiet_call(dest: u32, memory: MemoryEffect, arg: u32) -> Instruction {
+        Instruction::Call {
+            func: "check".into(),
+            info: CallInfo {
+                dest: Some(Value(dest)),
+                args: vec![Operand::Value(Value(arg))],
+                arg_types: vec![IrType::I32],
+                return_type: IrType::I32,
+                memory,
+                ..CallInfo::default()
+            },
+        }
+    }
+
+    fn param(dest: u32, index: usize, ty: IrType) -> Instruction {
+        Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx: index,
+            ty,
+        }
+    }
+
+    fn calls_in(func: &IrFunction) -> usize {
+        func.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i, Instruction::Call { .. }))
+            .count()
+    }
+
+    /// The second `check(i)` can reuse the first: the first returned, and a
+    /// callee that depends on its argument alone does the same again.  That
+    /// needs no promise that the callee returns in general.
+    #[test]
+    fn a_call_that_may_not_return_is_reused_but_never_deleted() {
+        for (memory, merged) in [
+            (MemoryEffect::ReadNone, true),
+            (MemoryEffect::ReadOnly, true),
+            (MemoryEffect::ReadWrite, false),
+        ] {
+            let func = fn_of(
+                "twice",
+                vec![blk(
+                    0,
+                    vec![
+                        param(0, 0, IrType::I32),
+                        quiet_call(1, memory, 0),
+                        quiet_call(2, memory, 0),
+                        Instruction::BinOp {
+                            dest: Value(3),
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(Value(1)),
+                            rhs: Operand::Value(Value(2)),
+                            ty: IrType::I32,
+                        },
+                    ],
+                    Terminator::Return(Some(Operand::Value(Value(3)))),
+                    vec![],
+                )],
+                4,
+            );
+            let mut module = module_of(func);
+            module.for_each_function(run_gvn_function);
+            let func = &module.functions[0];
+            assert_eq!(calls_in(func), if merged { 1 } else { 2 }, "{memory:?}");
+            // GVN reuses; it is DCE that deletes, and DCE must not: with the
+            // results unused, every call left is still a check.
+            let mut unused = func.clone();
+            unused.blocks[0].terminator = Terminator::Return(None);
+            crate::passes::dce::eliminate_dead_code(&mut unused);
+            assert_eq!(
+                calls_in(&unused),
+                calls_in(func),
+                "{memory:?}: DCE deleted a call that may not return"
+            );
+        }
+    }
+
+    /// A different argument is a different check.
+    #[test]
+    fn calls_that_may_not_return_are_not_merged_across_arguments() {
+        let func = fn_of(
+            "two_checks",
+            vec![blk(
+                0,
+                vec![
+                    param(0, 0, IrType::I32),
+                    param(1, 1, IrType::I32),
+                    quiet_call(2, MemoryEffect::ReadNone, 0),
+                    quiet_call(3, MemoryEffect::ReadNone, 1),
+                ],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+                vec![],
+            )],
+            4,
+        );
+        let mut module = module_of(func);
+        module.for_each_function(run_gvn_function);
+        assert_eq!(calls_in(&module.functions[0]), 2);
+    }
+
+    /// A read-only callee sees what a store between the two calls wrote: the
+    /// second result is not the first.  A read-none one does not care.
+    #[test]
+    fn a_store_separates_read_only_calls_that_may_not_return() {
+        for (memory, merged) in [
+            (MemoryEffect::ReadNone, true),
+            (MemoryEffect::ReadOnly, false),
+        ] {
+            let func = fn_of(
+                "store_between",
+                vec![blk(
+                    0,
+                    vec![
+                        param(0, 0, IrType::I32),
+                        param(4, 1, IrType::Ptr),
+                        quiet_call(1, memory, 0),
+                        Instruction::Store {
+                            val: Operand::Const(IrConst::I32(7)),
+                            ptr: Value(4),
+                            ty: IrType::I32,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        },
+                        quiet_call(2, memory, 0),
+                        Instruction::BinOp {
+                            dest: Value(3),
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(Value(1)),
+                            rhs: Operand::Value(Value(2)),
+                            ty: IrType::I32,
+                        },
+                    ],
+                    Terminator::Return(Some(Operand::Value(Value(3)))),
+                    vec![],
+                )],
+                5,
+            );
+            let mut module = module_of(func);
+            module.for_each_function(run_gvn_function);
+            assert_eq!(
+                calls_in(&module.functions[0]),
+                if merged { 1 } else { 2 },
+                "{memory:?}"
+            );
+        }
+    }
+
+    /// What was loaded before a call that writes nothing is still current
+    /// after it -- if control gets there at all, the call returned.
+    #[test]
+    fn a_load_survives_a_call_that_writes_nothing() {
+        let loads_in = |func: &IrFunction| {
+            func.blocks[0]
+                .instructions
+                .iter()
+                .filter(|i| matches!(i, Instruction::Load { .. }))
+                .count()
+        };
+        for (memory, sret, kept) in [
+            (MemoryEffect::ReadNone, false, 1),
+            (MemoryEffect::ReadOnly, false, 1),
+            (MemoryEffect::ReadWrite, false, 2),
+            // The hidden result pointer is a write whatever the callee is.
+            (MemoryEffect::ReadNone, true, 2),
+        ] {
+            let load = |dest: u32| Instruction::Load {
+                dest: Value(dest),
+                ptr: Value(4),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            };
+            let mut call = quiet_call(1, memory, 0);
+            if let Instruction::Call { info, .. } = &mut call {
+                info.is_sret = sret;
+            }
+            let func = fn_of(
+                "load_call_load",
+                vec![blk(
+                    0,
+                    vec![
+                        param(0, 0, IrType::I32),
+                        param(4, 1, IrType::Ptr),
+                        load(5),
+                        call,
+                        load(6),
+                        Instruction::BinOp {
+                            dest: Value(3),
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(Value(5)),
+                            rhs: Operand::Value(Value(6)),
+                            ty: IrType::I32,
+                        },
+                    ],
+                    Terminator::Return(Some(Operand::Value(Value(3)))),
+                    vec![],
+                )],
+                7,
+            );
+            let mut module = module_of(func);
+            module.for_each_function(run_gvn_function);
+            assert_eq!(
+                loads_in(&module.functions[0]),
+                kept,
+                "{memory:?} sret={sret}"
+            );
+        }
     }
 }

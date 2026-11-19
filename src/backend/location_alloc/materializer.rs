@@ -229,6 +229,18 @@ pub(super) fn materialize(
     for bi in 0..nblocks {
         for &s_raw in succs.row(bi) {
             let s = s_raw as usize;
+            // An asm goto leaves its block from where it stands.  A reload
+            // placed at the end of the block has not run on that edge, and
+            // rerouting the terminator does not reroute the asm: a trampoline
+            // planned here was never entered, and the whole plan was thrown
+            // away by `verify_rewrite` with a message on stderr.  Leave the
+            // φ incoming of such an edge on its original value, which stays
+            // resident along it exactly as without GLA.  The φ has one entry
+            // for the block, so this also covers a terminator edge to the
+            // same successor.
+            if asm_goto_edge(func, bi, s) {
+                continue;
+            }
             let mut renames: Vec<(u32, u32)> = Vec::new();
             let mut deferred: Vec<u32> = Vec::new();
             for &vid in &split_vids {
@@ -652,6 +664,12 @@ pub(super) fn rewrite_phi_edge(
             }
         }
     }
+}
+
+/// Whether an asm goto in block `bi` may jump to block `s`.
+fn asm_goto_edge(func: &IrFunction, bi: usize, s: usize) -> bool {
+    let target = func.blocks[s].label;
+    crate::ir::analysis::asm_goto_successors(&func.blocks[bi]).any(|label| label == target)
 }
 
 /// Reroute every static occurrence of terminator edge target `old` to

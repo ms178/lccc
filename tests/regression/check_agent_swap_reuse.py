@@ -2,7 +2,7 @@
 """The verification environment must reuse an active exactly-4-GiB swap file.
 
 A comment-only promise previously exported a second fixed path unconditionally.
-On a 21-GiB sandbox that consumed another 4 GiB and could exhaust the disk.
+On a 21-GiB sandbox that consumed another 8 GiB and could exhaust the disk.
 This gate executes the real environment script with a sandbox-local /proc/swaps
 fixture and a fake `stat`, then checks both the active-file and fallback paths.
 It also pins the private mktemp diagnostic used by ensure_swap.sh: a fixed
@@ -51,14 +51,18 @@ def main() -> None:
         d = Path(td)
         active = d / "active.swap"
         active.write_bytes(b"")
-        assert run_case(d, active, 4 * GIB) == str(active)
-        assert run_case(d, active, 8 * GIB) == str(d / ".cache/lccc-swap.img")
-        assert run_case(d, None, 4 * GIB) == str(d / ".cache/lccc-swap.img")
+        # The reuse band follows scripts/ensure_swap.sh: exactly 8 GiB is
+        # reused, anything else (including the superseded 4 GiB policy) gets a
+        # private image so the build always runs at the budget it was measured
+        # against.
+        assert run_case(d, active, 8 * GIB) == str(active)
+        assert run_case(d, active, 4 * GIB) == str(d / ".cache/lccc-swap.img")
+        assert run_case(d, None, 8 * GIB) == str(d / ".cache/lccc-swap.img")
     swap = (ROOT / "scripts/ensure_swap.sh").read_text()
     assert 'mktemp "${TMPDIR:-/tmp}/lccc-swapon.XXXXXX"' in swap
     assert '2>"$swapon_err"' in swap
     assert "2>/tmp/lccc-swapon.err" not in swap
-    print("agent swap reuse: PASS (active 4 GiB reused; wrong-size/no-swap fallback; private diagnostic)")
+    print("agent swap reuse: PASS (active 8 GiB reused; wrong-size/no-swap fallback; private diagnostic)")
 
 
 if __name__ == "__main__":

@@ -216,6 +216,7 @@ fn rejects_calls_including_pure_calls_volatile_memory_and_intrinsics() {
             info: CallInfo {
                 is_pure: true,
                 is_const: true,
+                memory: Default::default(),
                 ..CallInfo::default()
             },
         },

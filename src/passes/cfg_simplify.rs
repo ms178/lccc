@@ -18,6 +18,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::IrType;
+use crate::ir::analysis::asm_goto_successors;
 use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator,
     Value,
@@ -315,8 +316,10 @@ fn fold_constant_cond_branches(
     // Apply the folds and clean up phi nodes.
     for &(idx, taken, not_taken, block_label) in &folds {
         func.blocks[idx].terminator = Terminator::Branch(taken);
-        // Remove phi entries in the not-taken target (if it differs from taken).
-        if taken != not_taken {
+        // The dropped branch arm might share its target with an asm-goto edge.
+        if taken != not_taken
+            && !asm_goto_successors(&func.blocks[idx]).any(|label| label == not_taken)
+        {
             if let Some(&block_idx) = label_to_idx.get(&not_taken) {
                 remove_phi_entries_from(&mut func.blocks[block_idx], block_label);
             }
@@ -423,7 +426,9 @@ fn fold_constant_switches(
     for (idx, taken, not_taken, block_label) in &folds {
         func.blocks[*idx].terminator = Terminator::Branch(*taken);
         for nt_target in not_taken {
-            if let Some(&block_idx) = label_to_idx.get(nt_target) {
+            if !asm_goto_successors(&func.blocks[*idx]).any(|label| label == *nt_target)
+                && let Some(&block_idx) = label_to_idx.get(nt_target)
+            {
                 remove_phi_entries_from(&mut func.blocks[block_idx], *block_label);
             }
         }
@@ -681,37 +686,55 @@ fn bool_return_disabled() -> bool {
     *DISABLED
 }
 
-/// Whether `block` ends in the shape the backend fuses with an asm-goto's own
-/// flags (`collect_asm_goto_cc_branch_values`): `asm goto(... : "=@cc<cc>"(obj)
-/// ...)`, then `cond = load obj`, then the branch on `cond`. The branch costs
-/// no `setcc` and no memory round trip there; turning it into a returned value
-/// would force the flag through the output object (`sete` to the stack, a
-/// reload, a compare and a second `setcc`), so the boolean-return fold leaves
-/// it alone.
-fn branches_on_asm_goto_flag_output(block: &BasicBlock, cond: Value) -> bool {
-    let n = block.instructions.len();
-    let (
-        Some(Instruction::InlineAsm {
-            outputs,
-            goto_labels,
-            ..
-        }),
-        Some(Instruction::Load { dest, ptr, .. }),
-    ) = (
-        n.checked_sub(2).and_then(|i| block.instructions.get(i)),
-        block.instructions.last(),
-    )
-    else {
+/// The blocks whose branch the backend fuses with an asm goto's own flags
+/// (`collect_asm_goto_cc_branch_values`), each with the flag object it reads:
+/// `asm goto(... : "=@cc<cc>"(obj) ...)` ends its block, and the block it
+/// falls through into holds `cond = load obj` and the branch on `cond`. The
+/// branch costs no `setcc` and no memory round trip there; turning it into a
+/// returned value would force the flag through the output object (`sete` to
+/// the stack, a reload, a compare and a second `setcc`), so the
+/// boolean-return fold leaves it alone.
+fn asm_goto_flag_fallthroughs(func: &IrFunction) -> FxHashMap<BlockId, Value> {
+    let mut out = FxHashMap::default();
+    for block in &func.blocks {
+        let (
+            Some(Instruction::InlineAsm {
+                outputs,
+                goto_labels,
+                ..
+            }),
+            Terminator::Branch(fallthrough),
+        ) = (block.instructions.last(), &block.terminator)
+        else {
+            continue;
+        };
+        if !goto_labels.is_empty()
+            && outputs.len() == 1
+            && outputs[0]
+                .0
+                .trim_start_matches(['=', '+', '&', '%'])
+                .starts_with("@cc")
+        {
+            out.insert(*fallthrough, outputs[0].1);
+        }
+    }
+    out
+}
+
+/// Whether `block` is such a block: nothing but the load of the flag object
+/// its asm goto wrote, feeding `cond`.
+fn branches_on_asm_goto_flag_output(
+    block: &BasicBlock,
+    cond: Value,
+    flag_fallthroughs: &FxHashMap<BlockId, Value>,
+) -> bool {
+    let Some(flag_object) = flag_fallthroughs.get(&block.label) else {
         return false;
     };
-    *dest == cond
-        && !goto_labels.is_empty()
-        && outputs.len() == 1
-        && outputs[0].1 == *ptr
-        && outputs[0]
-            .0
-            .trim_start_matches(['=', '+', '&', '%'])
-            .starts_with("@cc")
+    matches!(
+        block.instructions.as_slice(),
+        [Instruction::Load { dest, ptr, .. }] if *dest == cond && ptr == flag_object
+    )
 }
 
 /// `CondBranch(c, T, F)` where `T` and `F` are distinct, instruction-free
@@ -769,6 +792,8 @@ fn fold_boolean_return_branches(
             _ => None,
         }
     };
+    // Built on the first candidate: most functions have none.
+    let mut flag_fallthroughs: Option<FxHashMap<BlockId, Value>> = None;
     // (branching block, condition, whether the branch returns the condition
     // itself rather than its complement)
     let mut plans: Vec<(usize, Value, bool)> = Vec::new();
@@ -790,7 +815,11 @@ fn fold_boolean_return_branches(
         };
         if let (Some(on_true), Some(on_false)) = (returned_bit(t), returned_bit(f))
             && on_true != on_false
-            && !branches_on_asm_goto_flag_output(block, *cond)
+            && !branches_on_asm_goto_flag_output(
+                block,
+                *cond,
+                flag_fallthroughs.get_or_insert_with(|| asm_goto_flag_fallthroughs(func)),
+            )
         {
             plans.push((bi, *cond, on_true));
         }
@@ -1693,6 +1722,69 @@ mod tests {
             resolve_value_globally(&f, Value(0), &build_global_value_map(&f), 0)
         } else {
             resolve_value_to_const_in_block(&f.blocks[0], Value(0))
+        }
+    }
+
+    #[test]
+    fn folding_a_terminator_preserves_an_asm_goto_phi_arm() {
+        for term in [
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            Terminator::Switch {
+                val: Operand::Const(IrConst::I32(0)),
+                cases: vec![(1, BlockId(1))],
+                default: BlockId(2),
+                ty: IrType::I32,
+            },
+        ] {
+            let mut f = IrFunction::new("asm_edge".into(), IrType::I32, vec![], false);
+            let from = (Operand::Const(IrConst::I32(11)), BlockId(0));
+            f.blocks = vec![
+                make_block(
+                    BlockId(0),
+                    vec![Instruction::InlineAsm {
+                        template: "jmp %l[case]".into(),
+                        outputs: vec![],
+                        inputs: vec![],
+                        clobbers: vec![],
+                        operand_types: vec![],
+                        goto_labels: vec![("case".into(), BlockId(1))],
+                        input_symbols: vec![],
+                        seg_overrides: vec![],
+                    }],
+                    term,
+                ),
+                make_block(
+                    BlockId(1),
+                    vec![Instruction::Phi {
+                        dest: Value(0),
+                        ty: IrType::I32,
+                        incoming: vec![from],
+                    }],
+                    Terminator::Return(Some(Operand::Value(Value(0)))),
+                ),
+                make_block(
+                    BlockId(2),
+                    vec![],
+                    Terminator::Return(Some(Operand::Const(IrConst::I32(22)))),
+                ),
+            ];
+            let labels = crate::ir::analysis::build_label_map(&f);
+            assert_eq!(
+                fold_constant_cond_branches(&mut f, &labels)
+                    + fold_constant_switches(&mut f, &labels),
+                1
+            );
+            assert!(matches!(
+                f.blocks[0].terminator,
+                Terminator::Branch(BlockId(2))
+            ));
+            assert!(
+                matches!(&f.blocks[1].instructions[0], Instruction::Phi { incoming, .. } if incoming.as_slice() == [from])
+            );
         }
     }
 

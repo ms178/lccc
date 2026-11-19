@@ -195,6 +195,42 @@ impl I686Codegen {
         }
     }
 
+    /// Save the callee-saved registers an inline asm can be handed as
+    /// scratch, once the homes are known.
+    ///
+    /// The scratch register of an inline asm is the first of its pool that is
+    /// not a home, and the proof that keeps the callee-saved registers out of
+    /// the prologue (`collect_inline_asm_callee_saved_i686`) is made ahead of
+    /// the allocator: it takes the head of the pool, `%ecx` and `%edx`, to be
+    /// free.  Where the allocator made homes of both, the pool begins at a
+    /// callee-saved register, and a function that handed it out without
+    /// saving it returned with its caller's `%edi` or `%esi` overwritten.
+    fn save_asm_scratch_registers(&mut self, func: &IrFunction) {
+        let reachable = crate::backend::stack_layout::i686_asm_scratch_callee_saved(
+            func,
+            |name| {
+                self.reg_assignments
+                    .values()
+                    .any(|&reg| super::emit::phys_reg_name(reg) == name)
+            },
+            self.pic_got_live,
+        );
+        if reachable.is_empty() {
+            return;
+        }
+        for name in reachable {
+            let reg = match name {
+                "ebx" => PhysReg(0),
+                "esi" => PhysReg(1),
+                _ => PhysReg(2),
+            };
+            if !self.used_callee_saved.contains(&reg) {
+                self.used_callee_saved.push(reg);
+            }
+        }
+        self.used_callee_saved.sort_by_key(|reg| reg.0);
+    }
+
     // ---- calculate_stack_space ----
 
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
@@ -581,6 +617,8 @@ impl I686Codegen {
         if needs_got && !self.used_callee_saved.contains(&PhysReg(0)) {
             self.used_callee_saved.insert(0, PhysReg(0));
         }
+
+        self.save_asm_scratch_registers(func);
 
         // Large by-value call arguments use REP MOVSB. Preserve ESI/EDI
         // from function entry, not just around the copy: CFI must describe

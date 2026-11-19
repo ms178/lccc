@@ -4805,6 +4805,7 @@ mod typed_indirect_calls {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 assume_library: false,
                 ret_eightbyte_classes: vec![],
                 cold: false,

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class KernelWorkflowPaths(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        workflow = yaml.safe_load((ROOT / ".github/workflows/kernel-61858.yml").read_text())
+        workflow = yaml.safe_load((ROOT / ".github/workflows/kernel-61863.yml").read_text())
         # PyYAML's YAML1.1 resolver reads the unquoted Actions `on` key as True.
         events = workflow.get("on", workflow.get(True))
         cls.patterns = events["pull_request"]["paths"]
@@ -34,7 +34,7 @@ class KernelWorkflowPaths(unittest.TestCase):
     def test_compiler_build_inputs_select_kernel_validation(self):
         for path in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml",
                      "scripts/build_lccc_fast.sh", "scripts/rust_toolchain.sh",
-                     "scripts/ensure_swap.sh", "scripts/ci_provision_toolchain.sh",
+                     "scripts/ensure_swap.sh", "scripts/ci_enable_swap.sh",
                      "engineering/toolchains/agent-cache-lock.json"]:
             with self.subTest(path=path):
                 self.assertTrue(self.selected(path), path)
@@ -44,7 +44,9 @@ class KernelWorkflowPaths(unittest.TestCase):
                      "scripts/kernel_version.sh", "scripts/kernel_tool_identity.sh",
                      "scripts/kconfig_query.sh", "scripts/build_kernel_full.sh",
                      "scripts/build_kernel_boot.sh", "scripts/prepare_kernel_tree.sh",
-                     "scripts/qemu_defconfig_smoke.sh", "scripts/qemu_firmware.sh"]:
+                     "scripts/qemu_defconfig_smoke.sh", "scripts/qemu_firmware.sh",
+                     "scripts/ensure_qemu_system.sh", "scripts/kernel_objtool_census.sh",
+                     "tests/corpus/test_kernel_observability.py"]:
             with self.subTest(path=path):
                 self.assertTrue(self.selected(path), path)
 
@@ -73,9 +75,10 @@ class KernelJobIsOnDemandOrWeekly(unittest.TestCase):
     def setUpClass(cls):
         import yaml
         workflow = yaml.safe_load(
-            (ROOT / ".github/workflows/kernel-61858.yml").read_text())
+            (ROOT / ".github/workflows/kernel-61863.yml").read_text())
         cls.events = workflow.get("on", workflow.get(True))
-        cls.job_if = workflow["jobs"]["kernel"]["if"]
+        cls.kernel_job = workflow["jobs"]["kernel"]
+        cls.job_if = cls.kernel_job["if"]
 
     def test_weekly_schedule_exists(self):
         crons = self.events["schedule"]
@@ -104,6 +107,15 @@ class KernelJobIsOnDemandOrWeekly(unittest.TestCase):
         # must still trigger the workflow, otherwise the skip would be silent.
         self.assertTrue(self.events["pull_request"]["paths"])
 
+    def test_host_tools_need_no_gcc_oracle_install(self):
+        # Only host tools use GCC. A cold oracle cache or unavailable GCC 16
+        # multilib packages must not block the LCCC kernel build.
+        self.assertEqual(self.kernel_job.get("env", {}).get("HOSTCC"), "gcc")
+        commands = "\n".join(step.get("run", "") for step in self.kernel_job["steps"])
+        self.assertNotRegex(
+            commands, r"ci_(?:provision_toolchain|install_gcc16|install_gcc_oracle)\.sh"
+                      r"|(?:gcc|g\+\+)-16|multilib")
+
 
 class KernelVersionPinsAgree(unittest.TestCase):
     """The three places the pinned kernel release is spelled must agree.
@@ -122,7 +134,7 @@ class KernelVersionPinsAgree(unittest.TestCase):
         cls.sh = (ROOT / "scripts/kernel_version.sh").read_text()
         cls.py = (ROOT / "scripts/lccc_paths.py").read_text()
         cls.workflow = (
-            ROOT / ".github/workflows/kernel-61858.yml"
+            ROOT / ".github/workflows/kernel-61863.yml"
         ).read_text()
 
     def _sh_fallback(self):

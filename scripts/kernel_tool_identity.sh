@@ -51,12 +51,28 @@ elif [[ -f $compiler_stamp && $(cat "$compiler_stamp") != "$compiler_hash" ]]; t
 fi
 
 if [[ $compiler_changed == 0 && -f $linker_stamp && $(cat "$linker_stamp") != "$linker_hash" ]]; then
-  echo "kernel_tool_identity: lccc-ld changed; purging link-only products"
-  rm -f arch/x86/entry/vdso/vdso*.so* \
-        arch/x86/entry/vdso/vdso-image-*.c \
-        arch/x86/boot/setup.elf arch/x86/boot/setup.bin \
-        arch/x86/boot/compressed/vmlinux* \
-        arch/x86/boot/bzImage vmlinux .tmp_vmlinux* vmlinux.symvers vmlinux.map
+    echo "kernel_tool_identity: lccc-ld changed; purging link-only products"
+    rm -f arch/x86/entry/vdso/vdso*.so* \
+          arch/x86/entry/vdso/vdso-image-*.c \
+          arch/x86/boot/setup.elf arch/x86/boot/setup.bin \
+          arch/x86/boot/bzImage vmlinux .tmp_vmlinux* vmlinux.symvers vmlinux.map
+    # `arch/x86/boot/compressed/vmlinux*` must never be a bare glob. In the
+    # pristine tree the only match besides link products is the CHECKED-IN
+    # linker-script source `vmlinux.lds.S`, and deleting it does not fail here:
+    # it fails the next build with
+    #   No rule to make target 'arch/x86/boot/compressed/vmlinux.lds',
+    #   needed by 'arch/x86/boot/compressed/vmlinux'
+    # after every translation unit has already been rebuilt -- a source file
+    # lost to a product purge, discovered at the worst possible moment. Sweep
+    # the directory but skip any source spelling; products there are `vmlinux`,
+    # `vmlinux.bin[.*]` and the generated `vmlinux.lds`.
+    for product in arch/x86/boot/compressed/vmlinux*; do
+        [[ -e $product ]] || continue
+        case $product in
+            *.S | *.s | *.c | *.h | *.sh | *.py) continue ;;
+        esac
+        rm -f -- "$product"
+    done
 fi
 
 # Atomic publication is fail-safe: an interruption retains an older complete

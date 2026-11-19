@@ -3622,6 +3622,20 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     self.no_unwind_tables = true
                 }
                 "-fasynchronous-unwind-tables" | "-funwind-tables" => self.no_unwind_tables = false,
+                // ── Sibling-call conversion ────────────────────────────────
+                // GCC converts a call whose result is returned verbatim into
+                // a tail jump at -O2 and above, and this pair is the only
+                // spelling that controls it. These arms MUST stay above the
+                // permissive `-f` fall-through: the conversion is not inert,
+                // so tolerating the request there would emit the tail `jmp`
+                // anyway -- the option-effect ledger's failure state, and a
+                // real defect for the Linux kernel, which passes
+                // -fno-optimize-sibling-calls in every translation unit
+                // because a tail jump destroys the caller's frame and with it
+                // frame-pointer unwinding, ftrace function-graph and objtool's
+                // ORC/CFI checks.
+                "-fno-optimize-sibling-calls" => self.no_sibling_calls = true,
+                "-foptimize-sibling-calls" => self.no_sibling_calls = false,
                 "-fno-jump-tables" => self.no_jump_tables = true,
                 // (-ffreestanding/-fhosted/-fbuiltin/-fno-builtin are
                 // handled by the A13 arms above; per-name `-fno-builtin-<fn>`
@@ -6502,6 +6516,65 @@ mod cli_tests {
             !parse(&["-fomit-frame-pointer", "-O0", "-fno-omit-frame-pointer"]).omit_frame_pointer
         );
         assert!(!parse(&["-Ofast", "-O2", "-fno-omit-frame-pointer"]).omit_frame_pointer);
+    }
+
+    #[test]
+    fn sibling_call_option_is_parsed_and_last_spelling_wins() {
+        // `-fno-optimize-sibling-calls` is a real codegen request, not a
+        // tolerated spelling: it must reach the driver state, must survive an
+        // -O level that would otherwise enable the conversion, and must obey
+        // GCC's last-spelling-wins ordering in both directions. The emitted
+        // shapes are pinned by tests/regression/check_sibcall_shapes.sh and by
+        // the option-effect ledger's `probe-no-sibling-calls`, on all four
+        // arch drivers; this test pins the parse contract underneath them.
+        let parse = |flags: &[&str]| {
+            let mut driver = Driver::new();
+            let mut argv = vec!["lccc".to_string()];
+            argv.extend(flags.iter().map(|s| s.to_string()));
+            argv.push("x.c".to_string());
+            // A recognised option must parse cleanly: `unwrap` here is also
+            // the assertion that neither spelling is refused or routed through
+            // the permissive unknown-option path.
+            driver.parse_cli_args(&argv).map(|_| driver).unwrap()
+        };
+        // GCC's default is the conversion at -O2 and above, so the driver
+        // default is "not withdrawn" at every level, and the withdrawal must
+        // not be undone by a level that appears after it.
+        for level in [
+            "-O0", "-O1", "-O2", "-O3", "-O4", "-Os", "-Oz", "-Og", "-Ofast",
+        ] {
+            assert!(
+                !parse(&[level]).no_sibling_calls,
+                "{level} must not withdraw the conversion by default"
+            );
+            assert!(
+                parse(&[level, "-fno-optimize-sibling-calls"]).no_sibling_calls,
+                "{level} -fno-optimize-sibling-calls"
+            );
+            assert!(
+                parse(&["-fno-optimize-sibling-calls", level]).no_sibling_calls,
+                "-fno-optimize-sibling-calls {level}"
+            );
+        }
+        // The positive spelling asks for the default, and the last one wins.
+        assert!(!parse(&["-foptimize-sibling-calls"]).no_sibling_calls);
+        assert!(
+            !parse(&["-fno-optimize-sibling-calls", "-foptimize-sibling-calls"]).no_sibling_calls,
+            "the last spelling must win"
+        );
+        assert!(
+            parse(&["-foptimize-sibling-calls", "-fno-optimize-sibling-calls"]).no_sibling_calls,
+            "the last spelling must win"
+        );
+        assert!(
+            !parse(&[
+                "-O2",
+                "-fno-optimize-sibling-calls",
+                "-foptimize-sibling-calls"
+            ])
+            .no_sibling_calls,
+            "a trailing positive spelling must restore the default"
+        );
     }
 
     #[test]

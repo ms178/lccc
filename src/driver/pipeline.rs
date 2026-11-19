@@ -599,6 +599,18 @@ pub struct Driver {
     /// The Linux kernel uses this with -mindirect-branch=thunk-extern (retpoline) to
     /// prevent indirect jumps that objtool would reject.
     pub(super) no_jump_tables: bool,
+    /// `-fno-optimize-sibling-calls`: withdraw the sibling-call conversion so
+    /// a call whose result is returned verbatim keeps its `call` + `ret`
+    /// instead of collapsing into a tail `jmp`. GCC's default is the
+    /// conversion at `-O2` and above, and this is the spelling that turns it
+    /// off. The Linux kernel passes it in *every* translation unit: a tail
+    /// `jmp` reuses the caller's frame, which breaks frame-pointer unwinding
+    /// (`UNWINDER_FRAME_POINTER=y`), ftrace function-graph and objtool's
+    /// ORC/CFI expectations. `-foptimize-sibling-calls` restores the default.
+    /// Applied through `backend::generation::set_sibling_calls_requested`,
+    /// the single answer both the `ret_dup` IR rewrite and every backend's
+    /// emitter consult, so the two halves cannot disagree.
+    pub(super) no_sibling_calls: bool,
     /// RISC-V ABI override from -mabi= flag (e.g., "lp64", "lp64d", "lp64f").
     /// When set, overrides the default "lp64d" passed to the assembler.
     /// The Linux kernel uses -mabi=lp64 (soft-float) for kernel code.
@@ -994,6 +1006,7 @@ impl Driver {
             general_regs_only: false,
             code_model_kernel: false,
             no_jump_tables: false,
+            no_sibling_calls: false,
             riscv_abi: None,
             riscv_march: None,
             riscv_no_relax: false,
@@ -1175,6 +1188,13 @@ impl Driver {
             self.target,
             Target::X86_64 | Target::I686
         ));
+        // `-f[no-]optimize-sibling-calls`: recorded with the other
+        // per-invocation process globals, before any lowering runs, so the
+        // `ret_dup` IR rewrite and the backend emitters all see the same
+        // answer. Re-recorded on every compilation: a translation unit that
+        // asked for the conversion off must not leak that (or its absence)
+        // into the next one.
+        crate::backend::generation::set_sibling_calls_requested(!self.no_sibling_calls);
 
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),
@@ -3884,13 +3904,17 @@ impl Driver {
         // `Return`, so the backend's per-block sibling-call shape matches
         // (see backend::ret_dup). Last CFG change before the splitters;
         // after the PGO post-pass fingerprint, so generate and use builds
-        // hash the same CFG. `CCC_NO_SIBCALL` turns the conversion off, and
-        // with it this rewrite (a duplicated epilogue would be its only
-        // effect); `CCC_DISABLE_PASSES=ret_dup` turns off only the rewrite.
+        // hash the same CFG. Turning the conversion off -- `-fno-optimize-
+        // sibling-calls` or `CCC_NO_SIBCALL` -- turns off this rewrite with
+        // it (a duplicated epilogue would be its only effect);
+        // `CCC_DISABLE_PASSES=ret_dup` turns off only the rewrite. Both
+        // consult `generation::sibcall_conversion_enabled`, the single answer
+        // the emitters use, so the IR rewrite can never enable a shape the
+        // backend then refuses to emit (or vice versa).
         let sibling_abi = crate::backend::ret_dup::SiblingAbi::for_target(self.target);
         if let Some(abi) = sibling_abi.filter(|_| {
             self.opt_level >= 1
-                && std::env::var_os("CCC_NO_SIBCALL").is_none()
+                && crate::backend::generation::sibcall_conversion_enabled()
                 && !crate::passes::pass_disabled(
                     std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
                     "ret_dup",

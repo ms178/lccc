@@ -252,6 +252,13 @@ impl BuiltinFlags {
         self.policy
     }
 
+    /// Frontend recognition of a bare libc name, including reserved spellings
+    /// such as `__clear_cache`. The IR's reserved-name exceptions do not
+    /// override GCC's `-fno-builtin` diagnostic behavior.
+    pub(crate) fn recognizes_unprefixed_builtin(&self, name: &str) -> bool {
+        !self.policy.blanket_withdrawn && self.may_assume(name)
+    }
+
     /// The command line's answer for a call spelled `name`.
     pub fn may_assume(&self, name: &str) -> bool {
         self.policy.may_assume(name) && !self.withdrawn_other.iter().any(|n| n == name)

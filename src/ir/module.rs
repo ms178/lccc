@@ -412,7 +412,7 @@ impl TerminatorSpans {
             let swap = |t: BlockId| if t == old_target { new_target } else { t };
             *shape = match *shape {
                 TerminatorShape::Branch(t) => TerminatorShape::Branch(swap(t)),
-                // `retarget_block_edge_once` moves one edge: the true one first.
+                // `retarget_terminator_once` moves one edge: the true one first.
                 TerminatorShape::CondBranch(t, f) if t == old_target => {
                     TerminatorShape::CondBranch(new_target, f)
                 }

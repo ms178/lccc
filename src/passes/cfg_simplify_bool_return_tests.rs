@@ -518,8 +518,10 @@ fn a_return_block_other_edges_reach_survives() {
 /// `asm goto(... : "=@ccz"(err) ...); if (err) return 1; return 0;` keeps its
 /// branch: the backend fuses it with the asm's own flags
 /// (tests/regression/check_asm_goto_outputs.sh), while a returned value would
-/// force the flag through `err`'s stack slot. The same shape with an ordinary
-/// register output, or with a gap between the asm and the load, still folds.
+/// force the flag through `err`'s stack slot. The asm goto ends its block, so
+/// the load and the branch are the block it falls through into. The same
+/// shape with an ordinary register output, with anything else in that block,
+/// or with the load in a block the asm goto does not fall into, still folds.
 #[test]
 fn an_asm_goto_flag_output_branch_keeps_its_branch() {
     use crate::common::types::AddressSpace;
@@ -540,47 +542,59 @@ fn an_asm_goto_flag_output_branch_keeps_its_branch() {
         seg_override: AddressSpace::Default,
         volatile: false,
     };
-    let function = |entry: Vec<Instruction>| {
+    // entry: [param, asm goto] -> `falls_into`; block 3: `tail`, the branch.
+    let function = |asm: Instruction, falls_into: u32, tail: Vec<Instruction>| {
         let mut f = IrFunction::new(
             "asm_cc_output_branch".into(),
             IrType::I32,
             vec![param(IrType::Ptr)],
             false,
         );
-        let mut insts = vec![Instruction::ParamRef {
-            dest: Value(0),
-            param_idx: 0,
-            ty: IrType::Ptr,
-        }];
-        insts.extend(entry);
         f.blocks.push(block(
             0,
-            insts,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                asm,
+            ],
+            Terminator::Branch(BlockId(falls_into)),
+        ));
+        f.blocks.push(block(1, vec![], ret(IrType::I32, 1)));
+        f.blocks.push(block(2, vec![], ret(IrType::I32, 0)));
+        f.blocks.push(block(
+            3,
+            tail,
             Terminator::CondBranch {
                 cond: Operand::Value(Value(2)),
                 true_label: BlockId(1),
                 false_label: BlockId(2),
             },
         ));
-        f.blocks.push(block(1, vec![], ret(IrType::I32, 1)));
-        f.blocks.push(block(2, vec![], ret(IrType::I32, 0)));
+        f.blocks
+            .push(block(4, vec![], Terminator::Branch(BlockId(3))));
         f.next_value_id = 4;
-        f.next_label = 3;
+        f.next_label = 5;
         f
     };
     let folds = |mut f: IrFunction| {
         let map = build_label_to_idx(&f);
         fold_boolean_return_branches(&mut f, &map)
     };
-    assert_eq!(folds(function(vec![asm("=@ccz"), load.clone()])), 0);
-    assert_eq!(folds(function(vec![asm("+@ccnz"), load.clone()])), 0);
+    assert_eq!(folds(function(asm("=@ccz"), 3, vec![load.clone()])), 0);
+    assert_eq!(folds(function(asm("+@ccnz"), 3, vec![load.clone()])), 0);
     // An ordinary output is not a flag the backend can reuse.
-    assert_eq!(folds(function(vec![asm("=r"), load.clone()])), 1);
-    // Anything between the asm and the load ends the fusion shape.
+    assert_eq!(folds(function(asm("=r"), 3, vec![load.clone()])), 1);
+    // Anything else in the block ends the fusion shape.
     let gap = Instruction::ParamRef {
         dest: Value(3),
         param_idx: 0,
         ty: IrType::Ptr,
     };
-    assert_eq!(folds(function(vec![asm("=@ccz"), gap, load])), 1);
+    assert_eq!(folds(function(asm("=@ccz"), 3, vec![gap, load.clone()])), 1);
+    // So does a block in between: the flags are the asm goto's own only in
+    // the block it falls through into.
+    assert_eq!(folds(function(asm("=@ccz"), 4, vec![load])), 1);
 }

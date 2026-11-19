@@ -204,6 +204,7 @@ GATE_CALL = re.compile(r"\b(?:bash|sh|python3?)\s+(\S+\.(?:sh|py))")
 INFRASTRUCTURE = frozenset({
     "scripts/ci_provision_toolchain.sh",
     "scripts/ci_toolchain_bundle.sh",
+    "scripts/ci_toolchain_key.sh",
     "scripts/ci_verify_oracles.sh",
     "scripts/ci_install_clang_oracle.sh",
     "tests/regression/check_ci_lane_plan.py",

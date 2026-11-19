@@ -25,7 +25,7 @@ export CPLUS_INCLUDE_PATH="$C_INCLUDE_PATH${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_
 export RUNNER_TEMP="${RUNNER_TEMP:-/tmp/lccc-runner-temp}"
 mkdir -p "$RUNNER_TEMP"
 export CARGO_BUILD_JOBS=1
-# Reuse an already-active EXACTLY 4 GiB file instead of allocating a second
+# Reuse an already-active EXACTLY 8 GiB file instead of allocating a second
 # swap image and exhausting this 21 GiB sandbox. /proc/swaps reports usable
 # pages (slightly below stat's byte count), so verify the file size itself.
 # With no qualifying active file, keep the sandbox-local fallback path.
@@ -33,7 +33,7 @@ LCCC_SWAPFILE="$HOME/.cache/lccc-swap.img"
 if [[ -r /proc/swaps ]]; then
     while read -r active_path active_type _; do
         [[ $active_type == file && -f $active_path ]] || continue
-        if [[ $(stat -c %s "$active_path" 2>/dev/null || echo 0) -eq $((4 * 1024 * 1024 * 1024)) ]]; then
+        if [[ $(stat -c %s "$active_path" 2>/dev/null || echo 0) -eq $((8 * 1024 * 1024 * 1024)) ]]; then
             LCCC_SWAPFILE=$active_path
             break
         fi

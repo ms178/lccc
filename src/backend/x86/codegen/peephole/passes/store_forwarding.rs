@@ -211,6 +211,33 @@ fn invalidate_reg_flat(slot_entries: &mut [SlotEntry], reg_offsets: &mut RegHome
 
 // ── Jump target collection ───────────────────────────────────────────────────
 
+/// Every `.LBB<n>` the text names, as a whole token: `.LBB12` is not a use of
+/// `.LBB1`, and `x.LBB3` is not a label.  Anything that only looks like one
+/// is counted too, which can only keep a label a merge point.
+fn for_each_block_label(text: &str, mut visit: impl FnMut(u32)) {
+    let bytes = text.as_bytes();
+    let symbol = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'$');
+    let mut from = 0;
+    while let Some(found) = text[from..].find(".LBB") {
+        let start = from + found;
+        let mut end = start + 4;
+        let mut number: u32 = 0;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            number = number
+                .wrapping_mul(10)
+                .wrapping_add(u32::from(bytes[end] - b'0'));
+            end += 1;
+        }
+        let bounded = (start == 0 || !symbol(bytes[start - 1]))
+            && end > start + 4
+            && (end == bytes.len() || !symbol(bytes[end]));
+        if bounded {
+            visit(number);
+        }
+        from = end;
+    }
+}
+
 fn collect_jump_targets(store: &LineStore, infos: &[LineInfo], len: usize) -> JumpTargets {
     let mut max_label_num: u32 = 0;
     for i in 0..len {
@@ -242,6 +269,31 @@ fn collect_jump_targets(store: &LineStore, infos: &[LineInfo], len: usize) -> Ju
             }
             LineKind::JmpIndirect => {
                 has_indirect_jump = true;
+            }
+            // An asm goto reaches its labels from inside the region: by a
+            // line of the user's template (`testl %ecx, %ecx; jnz .LBB6`), or
+            // by no instruction at all -- a static key is a nop plus
+            // `.long 1b - ., .LBB6 - .` in `__jump_table`, an exception fixup
+            // is an `__ex_table` entry.  Reading only the compiler's own
+            // `jmp`/`jcc` took such a label for one reached by falling
+            // through and carried slot values across it:
+            //
+            //     movl $1, 8(%rsp)
+            //     #APP  testl %ecx, %ecx; jnz .LBB6  #NO_APP
+            //     movl $2, 8(%rsp)
+            //   .LBB6:
+            //     movl 8(%rsp), %eax      ->  movl $2, %eax
+            //
+            // Every block label a region names is a place control can arrive
+            // at from there.  (A label the template defines for itself is a
+            // line of the region, where every mapping is dropped anyway.)
+            LineKind::InlineAsm => {
+                let text = infos[i].trimmed(store.get(i));
+                for_each_block_label(text, |n| {
+                    if (n as usize) < is_jump_target.len() {
+                        is_jump_target[n as usize] = true;
+                    }
+                });
             }
             _ => {}
         }
@@ -1891,6 +1943,72 @@ mod tests {
             !infos[reload_idx].is_nop(),
             "the slot reload must not be rewritten to the asm output register"
         );
+    }
+
+    /// `store; asm goto(out); store; out: load`, with the asm goto's jump
+    /// spelled by `region`.
+    fn store_behind_asm_goto(region: &str, label: &str) -> String {
+        format!(
+            "f:\n.cfi_startproc\n    movl $1, 8(%rsp)\n#APP\n{region}#NO_APP\n    \
+             movl $2, 8(%rsp)\n{label}:\n    movl 8(%rsp), %eax\n    ret\n.cfi_endproc\n"
+        )
+    }
+
+    fn reload_survives(asm: &str) -> bool {
+        let (mut store, mut infos) = build_pinned(asm);
+        let _ = global_store_forwarding(&mut store, &mut infos);
+        (0..store.len()).any(|i| !infos[i].is_nop() && store.get(i).contains("movl 8(%rsp), %eax"))
+    }
+
+    #[test]
+    fn a_label_an_asm_goto_reaches_is_a_merge_point() {
+        // The slot holds 1 on the asm goto's way to `.LBB6` and 2 when the
+        // block falls through; the reload is the only correct reading.
+        // Taking `.LBB6` for a label nobody jumps to forwarded the `$2`.
+        assert!(reload_survives(&store_behind_asm_goto(
+            "    testl %ecx, %ecx; jnz .LBB6\n",
+            ".LBB6"
+        )));
+        // The jump of a patched static key is bytes, and the label stands in
+        // a table: no line of the region is a `jcc`.
+        assert!(reload_survives(&store_behind_asm_goto(
+            "    testl %ecx, %ecx\n    .byte 0x0f, 0x85\n    .long .LBB6 - . - 4\n",
+            ".LBB6"
+        )));
+        assert!(reload_survives(&store_behind_asm_goto(
+            "1:  .byte 0x0f, 0x1f, 0x44, 0x00, 0x00\n    .pushsection __jump_table, \"aw\"\n    \
+             .long 1b - ., .LBB6 - .\n    .popsection\n",
+            ".LBB6"
+        )));
+    }
+
+    #[test]
+    fn a_label_no_asm_region_names_is_still_fallthrough_only() {
+        // The region names `.LBB60` and `.LBB7`, not `.LBB6`: a label is a
+        // whole token, and the forward across an unnamed label still fires.
+        let asm =
+            store_behind_asm_goto("    testl %ecx, %ecx; jnz .LBB60\n    jz x.LBB6\n", ".LBB6")
+                + ".LBB60:\n    ret\n";
+        assert!(
+            !reload_survives(&asm),
+            "an unrelated label must not block the forward"
+        );
+    }
+
+    #[test]
+    fn block_labels_are_read_as_whole_tokens() {
+        let seen = |text: &str| {
+            let mut out = Vec::new();
+            for_each_block_label(text, |n| out.push(n));
+            out
+        };
+        assert_eq!(seen("testl %ecx, %ecx; jnz .LBB6"), [6]);
+        assert_eq!(seen(".long 1b - ., .LBB12 - ., .LBB7-."), [12, 7]);
+        assert_eq!(seen("jmp .LBB6(%rip)"), [6]);
+        assert!(seen("jmp x.LBB6").is_empty());
+        assert!(seen("jmp .LBB6_cold").is_empty());
+        assert!(seen("jmp .LBB").is_empty());
+        assert!(seen("jmp .LBBx").is_empty());
     }
 
     #[test]

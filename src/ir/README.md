@@ -333,7 +333,7 @@ These instructions support `_Complex` return values that use two registers.
 
 | Variant | Key Fields | Description |
 |---------|------------|-------------|
-| `InlineAsm` | `template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols, seg_overrides` | Inline assembly statement. `outputs` is `Vec<(constraint, Value, Option<name>)>`. `inputs` is `Vec<(constraint, Operand, Option<name>)>`. `goto_labels` contains `(C_label, BlockId)` pairs for `asm goto`. `input_symbols` provides symbol names for `"i"` constraints (used by `%P`/`%a` modifiers). `seg_overrides` carries per-operand `AddressSpace` overrides. Goto labels also generate implicit CFG edges in `build_cfg`. |
+| `InlineAsm` | `template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols, seg_overrides` | Inline assembly statement. `outputs` is `Vec<(constraint, Value, Option<name>)>`. `inputs` is `Vec<(constraint, Operand, Option<name>)>`. `goto_labels` contains `(C_label, BlockId)` pairs for `asm goto`. `input_symbols` provides symbol names for `"i"` constraints (used by `%P`/`%a` modifiers). `seg_overrides` carries per-operand `AddressSpace` overrides. Goto labels also generate implicit CFG edges in `build_cfg`. An `InlineAsm` with goto labels is the last instruction of its block: the block is left through it, so nothing in the block may stand behind it (lowering ends the block there; `passes::verify` check 3a). |
 | `Intrinsic` | `op, dest, dest_ptr, args` | Target-independent intrinsic operation (see [IntrinsicOp](#intrinsics)). `dest` is `Option<Value>` for the result. `dest_ptr` is `Option<Value>` for store-type intrinsics. |
 | `LabelAddr` | `dest, label` | Get the address of a label (GCC computed goto extension: `&&label`). |
 

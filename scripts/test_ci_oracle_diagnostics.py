@@ -93,6 +93,10 @@ class OracleDiagnostics(unittest.TestCase):
             (repo / "scripts/ci_provision_toolchain.sh").write_bytes(script.read_bytes())
             (repo / "scripts/ci_install_gcc16.sh").write_text("exit 9\n")
             (repo / "scripts/ci_toolchain_bundle.sh").write_text("exit 0\n")
+            # The provisioner asks which runner image it is on before it looks
+            # at a bundle.  Any answer serves: the bundle directory is empty,
+            # so the installer runs, and its status is what is under test.
+            (repo / "scripts/ci_toolchain_key.sh").write_text("echo fake-image-0\n")
             sudo = repo / "bin/sudo"
             sudo.write_text("#!/bin/sh\ntouch used-sudo\nexit 0\n")
             sudo.chmod(0o755)

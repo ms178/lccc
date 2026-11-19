@@ -30,7 +30,7 @@ def _resolver() -> Path:
 
 
 def kernel_version() -> str:
-    """Return the kernel version the harness should agree on (e.g. ``6.18.58``).
+    """Return the kernel version the harness should agree on (e.g. ``6.18.63``).
 
     ``KVER`` wins when set.  Otherwise the shell resolver's answer is used.
     The literal fallback exists only for the pathological case of a tree that
@@ -54,7 +54,7 @@ def kernel_version() -> str:
             out = ""
         if out:
             return out
-    return "6.18.58"
+    return "6.18.63"
 
 
 def kernel_default_dir() -> str:

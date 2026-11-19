@@ -800,12 +800,18 @@ impl Lowerer {
             }
             let alias = format!(".LNLG.{}.{}", parent_name, resolved);
             alias_for.insert(resolved.clone(), alias.clone());
-            // Queue the alias at the PARENT's label statement.
-            self.func_mut()
+            // Queue the alias at the PARENT's label statement -- once.  Every
+            // nested function that jumps to this label arrives here with the
+            // same name; a second one used to define the symbol twice
+            // ("symbol `.LNLG.parent.out' is already defined").
+            let queued = self
+                .func_mut()
                 .pending_label_aliases
                 .entry(resolved)
-                .or_default()
-                .push(alias.clone());
+                .or_default();
+            if !queued.contains(&alias) {
+                queued.push(alias.clone());
+            }
             // KEEP THE LABEL BLOCK ALIVE: the only in-function reference may
             // be none at all (the goto comes from a nested function), so
             // dead-block elimination would remove the block — and with it

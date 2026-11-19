@@ -707,6 +707,11 @@ output equivalence, and reports paired bootstrap-CI speedups.
   Only inert debug attribution crosses directive boundaries. Disabled for
   size-oriented codegen until layout-aware growth control is available.
   Disable: `CCC_PEEPHOLE_SKIP=jump_thread`.
+- **`late_branch`**: final x86-64 text sweep; remove a direct local branch
+  when both outcomes reach the same instruction without crossing a section,
+  inline asm, an encoding directive, or a compiler marker. Disable just this
+  sweep with `CCC_PEEPHOLE_SKIP=late_branch`; the other phase-9 cleanups remain
+  active.
 
 The floating transforms are not fast-math identities. Architecture expansion
 requires equivalent rounding/environment proofs and target-specific measurement.

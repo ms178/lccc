@@ -91,7 +91,8 @@
 //! would claim code belonging to the next unit -- a scan is better than a lie.
 //!
 use super::dwarf_spec::{
-    BaseKind, DwarfMember, DwarfType, DwarfUnitSpec, DwarfVariable, RecordKind, TypeQual,
+    ArrayBound, BaseKind, DwarfMember, DwarfType, DwarfUnitSpec, DwarfVariable, RecordKind,
+    TypeQual,
 };
 use super::{ObjReloc, ObjSection, SHF_MERGE, SHF_STRINGS, SHT_PROGBITS, parse_string_literal};
 use crate::common::fx_hash::FxHashMap;
@@ -3359,11 +3360,19 @@ fn emit_type(
                         value: AttrValue::TypeRef(index_type),
                     });
                 }
-                if let Some(upper) = bound {
-                    subrange.push(Attr {
+                // gcc-16 16.2 states a zero-element dimension as
+                // `DW_AT_count: 0` and every other complete dimension as its
+                // upper bound; an incomplete dimension states neither.
+                match *bound {
+                    ArrayBound::Count(count) => subrange.push(Attr {
+                        at: DW_AT_COUNT,
+                        value: AttrValue::Udata(count),
+                    }),
+                    ArrayBound::UpperBound(upper) => subrange.push(Attr {
                         at: DW_AT_UPPER_BOUND,
-                        value: AttrValue::Udata(*upper),
-                    });
+                        value: AttrValue::Udata(upper),
+                    }),
+                    ArrayBound::Incomplete => {}
                 }
                 ctx.write(DW_TAG_SUBRANGE_TYPE, false, &subrange)?;
             }
@@ -3374,6 +3383,7 @@ fn emit_type(
             name,
             kind,
             size,
+            alignment,
             complete,
             members,
         } => emit_record(
@@ -3382,6 +3392,7 @@ fn emit_type(
             name.as_deref(),
             *kind,
             *size,
+            *alignment,
             *complete,
             members,
             five,
@@ -3526,6 +3537,7 @@ fn emit_record(
     name: Option<&str>,
     kind: RecordKind,
     size: u64,
+    alignment: Option<u64>,
     complete: bool,
     members: &[DwarfMember],
     five: bool,
@@ -3545,6 +3557,14 @@ fn emit_record(
         at: DW_AT_BYTE_SIZE,
         value: AttrValue::Udata(size),
     });
+    // gcc-16 puts `DW_AT_alignment` right after the record's size, and only
+    // for an alignment an explicit request raised.
+    if let Some(alignment) = alignment {
+        attrs.push(Attr {
+            at: DW_AT_ALIGNMENT,
+            value: AttrValue::Udata(alignment),
+        });
+    }
     if !complete {
         // A declaration is not an empty struct: without this flag a consumer
         // would report every member as missing instead of "incomplete type".
@@ -3634,6 +3654,12 @@ fn emit_member(
                 });
             }
         }
+    }
+    if let Some(align) = member.align {
+        attrs.push(Attr {
+            at: DW_AT_ALIGNMENT,
+            value: AttrValue::Udata(align),
+        });
     }
     ctx.write(DW_TAG_MEMBER, false, &attrs)?;
     Ok(())
@@ -3750,11 +3776,13 @@ fn spec_type_size(spec: &DwarfUnitSpec, index: u32) -> Option<u64> {
             element, bounds, ..
         } => {
             let element_size = spec_type_size(spec, *element)?;
-            // The product of the dimensions, each of which is an *upper* bound.
-            // An incomplete array has no size to report.
+            // The product of the dimensions' element counts. An incomplete
+            // dimension states no count, so the array has no size to report,
+            // and a zero-length dimension makes the product 0 rather than one
+            // element's worth.
             let mut total = element_size;
             for bound in bounds {
-                total = total.checked_mul((*bound)?.checked_add(1)?)?;
+                total = total.checked_mul(bound.elements()?)?;
             }
             Some(total)
         }
@@ -4056,6 +4084,21 @@ const DW_AT_BIT_SIZE: u64 = 0x0d;
 /// bit of the object instead, which is the layout's own numbering.
 const DW_AT_BIT_OFFSET: u64 = 0x0c;
 const DW_AT_DATA_BIT_OFFSET: u64 = 0x6b;
+/// DWARF 5 `DW_AT_alignment`, new in DWARF 5 but emitted by GCC even under
+/// `-gdwarf-4` (measured: gcc-16 encodes it on both `DW_TAG_structure_type` and
+/// `DW_TAG_member`, and pahole needs it to report a record's forced alignments
+/// and forced holes).
+///
+/// The value is 0x88, NOT 0x21: 0x21 is `DW_AT_is_optional`. Writing 0x21 here
+/// produces a valid-looking abbreviation table whose third record attribute
+/// readelf decodes as `DW_AT_is_optional : 64`, so the alignment value is
+/// emitted but attributed to the wrong name and pahole reports no forced
+/// alignments at all. Verified against gcc-16 by parsing its decompressed
+/// `.debug_abbrev` (its debug sections are zlib-compressed, so `readelf -x`
+/// shows compressed bytes and cannot be used for this):
+///   abbrev DW_TAG_structure_type: 0x03(name), 0x0b(byte_size), 0x88(alignment), …
+///   abbrev DW_TAG_member:         0x03(name), …, 0x49(type), 0x88(alignment), 0x38(…)
+const DW_AT_ALIGNMENT: u64 = 0x88;
 const DW_AT_UPPER_BOUND: u64 = 0x2f;
 const DW_AT_COUNT: u64 = 0x37;
 const DW_AT_PROTOTYPED: u64 = 0x27;

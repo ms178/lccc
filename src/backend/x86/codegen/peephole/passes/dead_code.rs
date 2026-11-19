@@ -4,7 +4,7 @@
 //! - `eliminate_dead_reg_moves`: removes reg-to-reg moves where the destination
 //!   is overwritten before being read (local, forward scan within a window).
 //! - `eliminate_dead_stores`: removes stores to stack slots that are overwritten
-//!   before being read (local, 16-instruction window).
+//!   before being read (local, bounded window).
 //! - `eliminate_never_read_stores`: removes stores to stack slots that are never
 //!   read anywhere in the function (global, whole-function analysis).
 
@@ -321,248 +321,118 @@ pub(super) fn eliminate_dead_fp_moves(store: &LineStore, infos: &mut [LineInfo])
     changed
 }
 
+/// Typed byte range of a direct stack move, shared by the scalar and vector
+/// cases. The caller must still prove that the base names a frame slot.
+fn windowed_slot_move(kind: LineKind) -> Option<(bool, i64, i64)> {
+    let (is_store, offset, size) = match kind {
+        LineKind::StoreRbp { offset, size, .. } | LineKind::StoreXmmRbp { offset, size } => {
+            (true, offset, size)
+        }
+        LineKind::LoadRbp { offset, size, .. } | LineKind::LoadXmmRbp { offset, size } => {
+            (false, offset, size)
+        }
+        _ => return None,
+    };
+    let start = i64::from(offset);
+    Some((is_store, start, start + i64::from(size.byte_size())))
+}
+
+fn is_frame_boundary(text: &str) -> bool {
+    matches!(
+        text.split_ascii_whitespace().next(),
+        Some(".cfi_startproc" | ".cfi_endproc")
+    )
+}
+
 // ── Dead store elimination (local, windowed) ─────────────────────────────────
 
 pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
-    let mut changed = false;
-    let len = store.len();
     const WINDOW: usize = 64;
-
-    let mut pattern_bytes = [0u8; 24];
-
-    // Frame-pointer status: reset at each .cfi_startproc, set true when a
-    // function establishes a frame pointer (`movq %rsp, %rbp`). When %rbp is NOT
-    // the frame pointer, `offset(%rbp)` accesses are pointer dereferences and
-    // must never be treated as stack slots.
+    const STACK_REFS: u16 = (1 << REG_RBP) | (1 << REG_RSP);
+    let mut changed = false;
     let mut rbp_is_frame = false;
-
-    for i in 0..len {
-        match infos[i].kind {
-            LineKind::Directive => {
-                let d = infos[i].trimmed(store.get(i));
-                if d == ".cfi_startproc" {
-                    rbp_is_frame = false;
-                }
+    for i in 0..infos.len() {
+        let info = infos[i];
+        if info.is_nop() {
+            continue;
+        }
+        let text = info.trimmed(store.get(i));
+        match info.kind {
+            LineKind::InlineAsm => rbp_is_frame = false,
+            LineKind::Directive if info.is_barrier() || is_frame_boundary(text) => {
+                rbp_is_frame = false;
             }
-            LineKind::Other { .. } => {
-                let o = infos[i].trimmed(store.get(i));
-                if o == "movq %rsp, %rbp" || o == "movl %esp, %ebp" {
-                    rbp_is_frame = true;
-                }
+            LineKind::Other { dest_reg: REG_RBP } if text == "movq %rsp, %rbp" => {
+                rbp_is_frame = true;
+            }
+            _ if info.reg_refs & (1 << REG_RBP) != 0
+                && line_writes_gp_family(&info, text, REG_RBP) =>
+            {
+                rbp_is_frame = false;
             }
             _ => {}
         }
-
-        let (store_offset, store_size) = match infos[i].kind {
-            // mark_nop refuses pinned lines (notably address-taken slots).
-            // Skip them before the scan so an unchanged line cannot falsely
-            // keep the post-global fixpoint alive.
-            LineKind::StoreRbp { offset, size, .. } if !infos[i].pinned => (offset, size),
-            _ => continue,
+        let Some((true, start, end)) = windowed_slot_move(info.kind) else {
+            continue;
         };
-
-        // SOUNDNESS: if %rbp is not the frame pointer and this store uses an
-        // `(%rbp)` memory operand, it writes ARBITRARY memory (pointer deref), not
-        // a stack slot. Never delete it as a dead stack store.
-        if !rbp_is_frame && uses_rbp_mem_operand(infos[i].trimmed(store.get(i))) {
+        if info.pinned {
             continue;
         }
-
-        let store_bytes = store_size.byte_size();
-
-        let mut slot_read = false;
-        let mut slot_overwritten = false;
-        let mut pattern_len: usize = 0;
-        // The window is WINDOW *live* lines. Counted in raw indices it
-        // shrank with every line an earlier pass deleted and with every
-        // hidden `-g` row, so `-g` kept dead stores the plain build removed
-        // (simd_defer_chain.c at -O0) and deletions upstream decided what
-        // this pass could still see.
-        let mut live = 0usize;
-
-        for j in (i + 1)..len {
-            // A NOP'd line has no effect: it neither reads our slot nor
-            // overwrites it. (No pass revives a NOP slot with its preserved
-            // text; the one NOP-slot reuse -- the FP constant hoist -- writes
-            // new text and re-classifies the line, so it is seen here as a
-            // live line.) Counting a NOP'd load as a read kept the store that
-            // fed a forwarded reload alive forever; counting a NOP'd store as
-            // an overwrite was unsound for any store deleted because the slot
-            // already held its value (the earlier store is then the writer).
-            if infos[j].is_nop() {
+        let base = frame_base(text, 0);
+        if base == 0 || (base == b'b' && !rbp_is_frame) {
+            continue;
+        }
+        let mut live = 0;
+        for j in (i + 1)..infos.len() {
+            let next = infos[j];
+            let text = next.trimmed(store.get(j));
+            // DIRECTIVE-LAW: bails -- function boundaries reset frame identity.
+            if next.kind == LineKind::Directive && is_frame_boundary(text) {
+                break;
+            }
+            if next.is_steppable() {
                 continue;
             }
+            if live == WINDOW || next.is_barrier() || next.has_indirect_mem {
+                break;
+            }
             live += 1;
-            if live > WINDOW {
-                break;
-            }
-
-            if infos[j].is_barrier() {
-                slot_read = true;
-                break;
-            }
-
-            // SOUNDNESS: user inline asm may read this slot through an "m"
-            // operand (`movq -16(%rbp), %rax` inside the template) that the
-            // line parsers never see — InlineAsm lines carry no parsed
-            // offset. Skipping the line would let the store be deleted as
-            // "overwritten, never read" while the asm still reads it (and
-            // vice versa: a later asm read keeps an earlier store alive).
-            // Treat any inline-asm line in the window as a potential reader
-            // of every slot.
-            if infos[j].kind == LineKind::InlineAsm {
-                slot_read = true;
-                break;
-            }
-
-            // SOUNDNESS: an RSP-shifting line between the store and this
-            // point makes the store's %rsp-relative address ambiguous (the
-            // offsets inside the shifted window refer to different physical
-            // slots). Treat as a read so the store is never deleted.
-            if is_rsp_shift_line(infos[j].trimmed(store.get(j))) {
-                slot_read = true;
-                break;
-            }
-
-            // SOUNDNESS: a `(%rbp)` access when %rbp is not the frame pointer
-            // is an opaque pointer dereference that may READ or WRITE the slot.
-            // Conservatively treat it as a read.
-            if !rbp_is_frame && uses_rbp_mem_operand(infos[j].trimmed(store.get(j))) {
-                slot_read = true;
-                break;
-            }
-
-            if let LineKind::LoadRbp {
-                offset: load_off,
-                size: load_sz,
-                ..
-            } = infos[j].kind
+            if (next.reg_refs & STACK_REFS != 0
+                && (line_writes_gp_family(&next, text, REG_RSP)
+                    || (base == b'b' && line_writes_gp_family(&next, text, REG_RBP))))
+                || text == "leave"
+                || text == "leaveq"
+                || text.starts_with("enter ")
             {
-                if ranges_overlap(store_offset, store_bytes, load_off, load_sz.byte_size()) {
-                    slot_read = true;
-                    break;
-                }
+                break;
             }
-
-            if let LineKind::StoreRbp {
-                offset: new_off,
-                size: new_sz,
-                ..
-            } = infos[j].kind
-            {
-                let new_bytes = new_sz.byte_size();
-                if new_off <= store_offset && new_off + new_bytes >= store_offset + store_bytes {
-                    slot_overwritten = true;
+            if let Some((is_store, other_start, other_end)) = windowed_slot_move(next.kind) {
+                // Equal displacements are not equal addresses across the two
+                // frame bases. Without a relation between the bases, even an
+                // access at a different displacement may read this slot.
+                if frame_base(text, 0) != base {
                     break;
                 }
-                if ranges_overlap(store_offset, store_bytes, new_off, new_bytes) {
-                    slot_read = true;
-                    break;
-                }
-            }
-
-            // Scalar-FP / SSE slot traffic participates in the same byte-range
-            // model. A GP store that is reloaded into an XMM register through
-            // the slot (`movq %rax, -72(%rbp)` / `movss -72(%rbp), %xmm0` —
-            // the -O0 int<->float bit-transfer idiom) is a live store; an XMM
-            // store that fully covers our bytes kills it exactly like a GP one.
-            if let LineKind::LoadXmmRbp {
-                offset: load_off,
-                size: load_sz,
-            } = infos[j].kind
-            {
-                if ranges_overlap(store_offset, store_bytes, load_off, load_sz.byte_size()) {
-                    slot_read = true;
-                    break;
-                }
-            }
-            if let LineKind::StoreXmmRbp {
-                offset: new_off,
-                size: new_sz,
-            } = infos[j].kind
-            {
-                let new_bytes = new_sz.byte_size();
-                if new_off <= store_offset && new_off + new_bytes >= store_offset + store_bytes {
-                    slot_overwritten = true;
-                    break;
-                }
-                if ranges_overlap(store_offset, store_bytes, new_off, new_bytes) {
-                    slot_read = true;
-                    break;
-                }
-            }
-
-            // Check Other and Cmp lines for rbp references. Cmp lines can
-            // have memory operands after memory fold (e.g., cmpq -N(%rbp), %rax).
-            if matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp) {
-                if infos[j].has_indirect_mem {
-                    slot_read = true;
-                    break;
-                }
-                let rbp_off = infos[j].rbp_offset;
-                if rbp_off != RBP_OFFSET_NONE {
-                    // PACKED vector moves are RANGE accesses: movdqu et al.
-                    // read/write [rbp_offset, rbp_offset + 16) (32 for %ymm),
-                    // but the cached offset alone credits only the low 8
-                    // bytes. A scalar store fully inside the upper half of a
-                    // `movdqu` copy's read range was elided because the point
-                    // model missed the read (the i128 parameter's high-half
-                    // home store; the wide condition test then read stale
-                    // frame bytes). Overlap of the vector extent with the
-                    // store's range is a read. Same range-vs-point model
-                    // store_forwarding applies (16-byte invalidate).
-                    if let Some(ext) = vector_frame_move_extent(infos[j].trimmed(store.get(j))) {
-                        if ranges_overlap(store_offset, store_bytes, rbp_off, ext) {
-                            slot_read = true;
-                            break;
-                        }
-                    }
-                    if rbp_off >= store_offset && rbp_off < store_offset + store_bytes {
-                        slot_read = true;
-                        break;
-                    }
-                    if rbp_off < store_offset && rbp_off + 8 > store_offset {
-                        slot_read = true;
-                        break;
-                    }
+                if other_start >= end || other_end <= start {
                     continue;
                 }
-                if pattern_len == 0 {
-                    pattern_len = write_rbp_pattern(&mut pattern_bytes, store_offset);
+                if is_store && other_start <= start && end <= other_end {
+                    mark_nop(&mut infos[i]);
+                    changed = true;
                 }
-                let pattern = std::str::from_utf8(&pattern_bytes[..pattern_len])
-                    .expect("rbp pattern produced non-UTF8");
-                let line = infos[j].trimmed(store.get(j));
-                if line.contains(pattern) {
-                    slot_read = true;
-                    break;
-                }
-                if store_bytes > 1 {
-                    let mut sub_pattern_bytes = [0u8; 24];
-                    for byte_off in 1..store_bytes {
-                        let check_off = store_offset + byte_off;
-                        let check_len = write_rbp_pattern(&mut sub_pattern_bytes, check_off);
-                        let check_pattern = std::str::from_utf8(&sub_pattern_bytes[..check_len])
-                            .expect("rbp pattern produced non-UTF8");
-                        let line = infos[j].trimmed(store.get(j));
-                        if line.contains(check_pattern) {
-                            slot_read = true;
-                            break;
-                        }
-                    }
-                    if slot_read {
-                        break;
-                    }
-                }
+                break;
+            }
+            // Untyped memory accesses have unknown width (a vector ALU input
+            // isn't necessarily a MOV). Segment/index/indirect accesses were
+            // rejected above; do not infer disjointness from a register name.
+            if next.rbp_offset != RBP_OFFSET_NONE
+                || (next.reg_refs & STACK_REFS != 0
+                    && (text.contains("(%rsp") || text.contains("(%rbp")))
+            {
+                break;
             }
         }
-
-        if slot_overwritten && !slot_read {
-            mark_nop(&mut infos[i]);
-            changed = true;
-        }
     }
-
     changed
 }
 
@@ -595,11 +465,15 @@ fn rsp_delta_step(t: &str) -> Option<i64> {
         return Some(-8);
     }
     if let Some(rest) = t.strip_prefix("subq $") {
-        return rest.strip_suffix(", %rsp")?.parse::<i64>().ok();
+        return rest
+            .strip_suffix(", %rsp")?
+            .parse::<i32>()
+            .ok()
+            .map(i64::from);
     }
     if let Some(rest) = t.strip_prefix("addq $") {
-        let n = rest.strip_suffix(", %rsp")?.parse::<i64>().ok()?;
-        return Some(-n);
+        let n = rest.strip_suffix(", %rsp")?.parse::<i32>().ok()?;
+        return Some(-i64::from(n));
     }
     None
 }
@@ -610,12 +484,8 @@ fn rsp_delta_step(t: &str) -> Option<i64> {
 /// textual `disp(%rsp)` addresses canonical byte `disp - D` (e.g. after two
 /// pushes, `24(%rsp)` reads canonical slot 8). `%rbp`-relative operands are
 /// unaffected because the frame pointer never moves inside a function.
-fn canonical_frame_off(base: u8, off: i32, rsp_delta: i64) -> i32 {
-    if base == b's' && rsp_delta != 0 {
-        off - rsp_delta as i32
-    } else {
-        off
-    }
+fn canonical_frame_off(base: u8, off: i64, rsp_delta: i64) -> i64 {
+    if base == b's' { off - rsp_delta } else { off }
 }
 
 /// Effective byte range read by an SIB frame operand
@@ -644,7 +514,7 @@ fn sib_frame_read_range(
     use_idx: usize,
     line: &str,
     fm: FrameMem,
-) -> Option<(i32, i32)> {
+) -> Option<(i64, i64)> {
     // Parse "disp(%base,%idx,scale)".
     let lp = line.find('(')?;
     let rp = line[lp..].find(')')? + lp;
@@ -656,6 +526,9 @@ fn sib_frame_read_range(
         None | Some("") => 1,
         Some(s) => s.parse().ok()?,
     };
+    if !matches!(scale, 1 | 2 | 4 | 8) {
+        return None;
+    }
     let family = register_family_fast(idx);
     if family as usize > 15 {
         return None;
@@ -892,8 +765,9 @@ fn sib_frame_read_range(
     }
     let a = lower?;
 
-    let lo = fm.disp + a * scale;
-    let hi = fm.disp + b * scale + width;
+    let scaled = |index| i64::from(fm.disp) + i64::from(index) * i64::from(scale);
+    let lo = scaled(a);
+    let hi = scaled(b) + i64::from(width);
     if hi <= lo {
         return None;
     }
@@ -910,7 +784,7 @@ fn sib_frame_observation(
     infos: &[LineInfo],
     use_idx: usize,
     line: &str,
-) -> Option<(u8, i32, i32, bool)> {
+) -> Option<(u8, i64, i64, bool)> {
     let fm = parse_frame_mem(line)?;
     if !fm.sib {
         return None;
@@ -919,7 +793,7 @@ fn sib_frame_observation(
         return Some((fm.base, off, len, false));
     }
     if fm.disp >= 0 {
-        Some((fm.base, fm.disp, 0, true))
+        Some((fm.base, i64::from(fm.disp), 0, true))
     } else {
         None
     }
@@ -931,15 +805,17 @@ fn slot_is_ever_read(
     base: u8,
     offset: i32,
     store_bytes: i32,
-    read_ranges: &[(u8, i32, i32)],
-    read_floors: &[(u8, i32)],
+    read_ranges: &[(u8, i64, i64)],
+    read_floors: &[(u8, i64)],
 ) -> bool {
+    let lo = i64::from(offset);
+    let hi = lo + i64::from(store_bytes);
+    // The analysis does not establish a fixed relationship between frame
+    // bases. An observation on the other one cannot prove disjointness.
     read_ranges
         .iter()
-        .any(|&(rb, ro, rs)| rb == base && ranges_overlap(offset, store_bytes, ro, rs))
-        || read_floors
-            .iter()
-            .any(|&(rb, d)| rb == base && i64::from(offset) + i64::from(store_bytes) > i64::from(d))
+        .any(|&(rb, ro, rs)| rb != base || (lo < ro + rs && ro < hi))
+        || read_floors.iter().any(|&(rb, d)| rb != base || hi > d)
 }
 
 // Share the architectural read contract with FP slot liveness. A suffix or
@@ -1155,7 +1031,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             frame_base_escapes(store, infos, body_start, func_end, rbp_is_frame);
         // Base-tagged frame reads and unbounded-upward "floors" (escaped
         // addresses and SIB array accesses). Base: b'b' = %rbp, b's' = %rsp.
-        let mut read_ranges: Vec<(u8, i32, i32)> = Vec::new();
+        let mut read_ranges: Vec<(u8, i64, i64)> = Vec::new();
         // A floor at displacement D conservatively observes every frame
         // byte from D upward: an escaped `leaq D(%base)` pointer or an SIB
         // operand `D(%base,%idx,scale)` names an array whose element
@@ -1164,7 +1040,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // never relies on downward reach). Stores ending at or below D stay
         // deletable; this is what distinguishes the home-slot spills at
         // 16/32(%rsp) from a frame buffer based at 40(%rsp).
-        let mut read_floors: Vec<(u8, i32)> = Vec::new();
+        let mut read_floors: Vec<(u8, i64)> = Vec::new();
         // Stores proven to be the ONLY writers a plain slot load observes
         // (see `locally_covering_stores`): such a load is attributed to them
         // instead of being published as a function-wide read range.
@@ -1252,10 +1128,10 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     };
                     // Map a shifted-depth operand back to its canonical slot so
                     // it is compared against the canonical store offsets.
-                    let coff = canonical_frame_off(base, offset, rsp_delta);
+                    let coff = canonical_frame_off(base, i64::from(offset), rsp_delta);
                     match locally_covering_stores(store, infos, k, body_start, base, coff, width) {
                         Some(writers) => locally_read.extend(writers),
-                        None => read_ranges.push((base, coff, width)),
+                        None => read_ranges.push((base, coff, i64::from(width))),
                     }
                 }
                 LineKind::Other { .. } => {
@@ -1277,11 +1153,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                                 has_unparseable_indirect = true;
                                 break;
                             }
-                            let off = canonical_frame_off(fm.base, fm.disp, rsp_delta);
+                            let off = canonical_frame_off(fm.base, i64::from(fm.disp), rsp_delta);
                             read_floors.push((fm.base, off));
                         } else if rbp_off != RBP_OFFSET_NONE {
                             let base = frame_base(line, b's');
-                            let off = canonical_frame_off(base, rbp_off, rsp_delta);
+                            let off = canonical_frame_off(base, i64::from(rbp_off), rsp_delta);
                             read_floors.push((base, off));
                         }
                     } else if rbp_off != RBP_OFFSET_NONE {
@@ -1290,8 +1166,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        let off = canonical_frame_off(base, rbp_off, rsp_delta);
-                        read_ranges.push((base, off, width));
+                        let off = canonical_frame_off(base, i64::from(rbp_off), rsp_delta);
+                        read_ranges.push((base, off, i64::from(width)));
                     } else if let Some(fm) = parse_frame_mem(line) {
                         // Frame operand that was neither a leaq, a cached
                         // plain access, nor a provably bounded SIB: fail
@@ -1341,8 +1217,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        let off = canonical_frame_off(fm.base, fm.disp, rsp_delta);
-                        read_ranges.push((fm.base, off, width));
+                        let off = canonical_frame_off(fm.base, i64::from(fm.disp), rsp_delta);
+                        read_ranges.push((fm.base, off, i64::from(width)));
                     }
                 }
                 _ => {
@@ -1357,8 +1233,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        let off = canonical_frame_off(base, rbp_off, rsp_delta);
-                        read_ranges.push((base, off, width));
+                        let off = canonical_frame_off(base, i64::from(rbp_off), rsp_delta);
+                        read_ranges.push((base, off, i64::from(width)));
                     } else if let Some(fm) = parse_frame_mem(line) {
                         if fm.sib && rsp_delta != 0 {
                             has_unparseable_indirect = true;
@@ -1486,13 +1362,12 @@ fn locally_covering_stores(
     load: usize,
     body_start: usize,
     base: u8,
-    offset: i32,
+    lo: i64,
     bytes: i32,
 ) -> Option<Vec<usize>> {
     if !(1..=64).contains(&bytes) {
         return None;
     }
-    let lo = i64::from(offset);
     let hi = lo + i64::from(bytes);
     let mut uncovered: u64 = if bytes == 64 {
         u64::MAX
@@ -1699,7 +1574,17 @@ fn step_rsp_depth(
             return false;
         }
         match rsp_delta_step(t) {
-            Some(step) => *rsp_delta += step,
+            Some(step) => {
+                // The frame model uses disp32 operands. An unrepresentable
+                // sequence must not wrap back onto an unrelated slot.
+                let Some(delta) = rsp_delta
+                    .checked_add(step)
+                    .and_then(|n| i32::try_from(n).ok())
+                else {
+                    return false;
+                };
+                *rsp_delta = i64::from(delta);
+            }
             None if is_epilogue_rsp_shift(store, infos, k, func_end) => {}
             None => return false,
         }
@@ -1820,6 +1705,237 @@ mod tests {
         assert!(!infos[stores[0]].is_nop() && !infos[stores[1]].is_nop());
         assert!(infos[stores[2]].is_nop() && !infos[stores[3]].is_nop());
         assert!(!eliminate_dead_stores(&store, &mut infos));
+    }
+
+    /// A vector spill overwritten by a later spill of the same bytes, with no
+    /// load in between, is dead -- the case the candidate arm used to miss
+    /// because it matched `StoreRbp` only while the scan below was already
+    /// XMM-aware.
+    #[test]
+    fn windowed_dse_eliminates_dead_vector_slot_store() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    movdqu %xmm1, 16(%rsp)\n    movdqu 16(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spills: Vec<usize> = (0..store.len())
+            .filter(|&i| {
+                matches!(
+                    infos[i].kind,
+                    LineKind::StoreXmmRbp {
+                        offset: 16,
+                        size: MoveSize::DQ
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            spills.len(),
+            2,
+            "both spills classify as vector slot stores"
+        );
+        assert!(spills.iter().all(|&i| !infos[i].pinned));
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(infos[spills[0]].is_nop(), "the overwritten spill is dead");
+        assert!(!infos[spills[1]].is_nop(), "the reloaded spill survives");
+        assert!(!eliminate_dead_stores(&store, &mut infos), "fixpoint");
+    }
+
+    /// A general-purpose load of the same bytes keeps a vector store alive: the
+    /// scan's reader arm is byte-range based, not family based, so `movq` out of
+    /// a slot written by `movdqu` counts as a read of those bytes.
+    #[test]
+    fn windowed_dse_keeps_vector_store_a_gp_load_reads() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    movq 16(%rsp), %rax\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spill = (0..store.len())
+            .find(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .expect("the vector spill is in the fixture");
+        assert!(matches!(
+            infos[spill + 1].kind,
+            LineKind::LoadRbp { offset: 16, .. }
+        ));
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(!infos[spill].is_nop(), "a GP load reads those bytes");
+    }
+
+    /// A call inside the window is a barrier, so a vector store before it is
+    /// never retired: the callee may read the slot through a pointer.
+    #[test]
+    fn windowed_dse_keeps_vector_store_across_a_call() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    call g\n    movdqu 16(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spill = (0..store.len())
+            .find(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .expect("the vector spill is in the fixture");
+        assert!(infos[spill + 1].is_barrier(), "call is a barrier");
+        assert!(matches!(infos[spill + 1].kind, LineKind::Call));
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(!infos[spill].is_nop());
+    }
+
+    /// `%ymm` spills are modelled as QQ (32 bytes), so a 16-byte load of the
+    /// same slot reads only the low half and must not retire the wide store.
+    #[test]
+    fn windowed_dse_models_a_ymm_slot_as_thirty_two_bytes() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    vmovdqu %ymm0, 16(%rsp)\n    movdqu 16(%rsp), %xmm1\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let spill = (0..store.len())
+            .find(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .expect("the wide spill is in the fixture");
+        assert_eq!(
+            match infos[spill].kind {
+                LineKind::StoreXmmRbp { size, .. } => size.byte_size(),
+                _ => 0,
+            },
+            32,
+            "a %ymm slot move is QQ, 32 bytes"
+        );
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(!infos[spill].is_nop(), "the low-half load reads it");
+    }
+
+    /// Width is what makes the kill exact: a narrow store inside a wide one is
+    /// dead only because the wide store covers all of its bytes. The trailing
+    /// reload is a `LoadXmmRbp`, so it is not in the store list.
+    #[test]
+    fn windowed_dse_kills_a_vector_store_a_wider_one_covers() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movsd %xmm0, 16(%rsp)\n    movdqu %xmm1, 16(%rsp)\n    movdqu 16(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let narrow: Vec<usize> = (0..store.len())
+            .filter(|&i| {
+                matches!(
+                    infos[i].kind,
+                    LineKind::StoreXmmRbp {
+                        offset: 16,
+                        size: MoveSize::SD
+                    }
+                )
+            })
+            .collect();
+        let wide: Vec<usize> = (0..store.len())
+            .filter(|&i| {
+                matches!(
+                    infos[i].kind,
+                    LineKind::StoreXmmRbp {
+                        offset: 16,
+                        size: MoveSize::DQ
+                    }
+                )
+            })
+            .collect();
+        assert_eq!((narrow.len(), wide.len()), (1, 1));
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(infos[narrow[0]].is_nop(), "the 8-byte store is covered");
+        assert!(!infos[wide[0]].is_nop(), "the covering store is reloaded");
+    }
+
+    /// An address-taken vector slot is pinned by the real pipeline and must not
+    /// be reported as deletable, exactly as the GP case above pins.
+    /// `pin_address_taken_stack_slots` is textual and kind-agnostic, and
+    /// `direct_stack_slot` checks `(%rsp)` before `(%rbp)`, so a `leaq` of an
+    /// rsp-relative vector slot pins it.
+    #[test]
+    fn windowed_dse_does_not_report_pinned_vector_stores_as_deleted() {
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, 16(%rsp)\n    movdqu %xmm1, 16(%rsp)\n    leaq 16(%rsp), %rcx\n    movdqu 16(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        super::super::pin_address_taken_stack_slots(&store, &mut infos);
+        let spills: Vec<usize> = (0..store.len())
+            .filter(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 16, .. }))
+            .collect();
+        assert_eq!(spills.len(), 2);
+        assert!(
+            spills.iter().all(|&i| infos[i].pinned),
+            "an address-taken vector slot is pinned"
+        );
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(spills.iter().all(|&i| !infos[i].is_nop()));
+    }
+
+    fn keep_first_store_before(middle: &str) {
+        let asm = format!(
+            "f:\n.cfi_startproc\n    pushq %rbp\n    movq %rsp, %rbp\n    subq $64, %rsp\n    movdqu %xmm0, 16(%rsp)\n{middle}\n    movdqu %xmm1, 16(%rsp)\n    ret\n.cfi_endproc\n"
+        );
+        let (store, mut infos) = build(&asm);
+        let first = (0..store.len())
+            .find(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { .. }))
+            .unwrap();
+        eliminate_dead_stores(&store, &mut infos);
+        assert!(!infos[first].is_nop(), "must keep store across {middle}");
+    }
+
+    #[test]
+    fn windowed_dse_does_not_confuse_frame_bases() {
+        keep_first_store_before("    movdqu %xmm1, 16(%rbp)\n    movdqu 16(%rsp), %xmm2");
+        // Here `%rbp - 48` *is* `%rsp + 16`. Equal offsets are not required for aliasing.
+        keep_first_store_before("    movdqu -48(%rbp), %xmm2");
+    }
+
+    #[test]
+    fn windowed_dse_needs_a_stable_base_and_a_known_read_width() {
+        keep_first_store_before("    leaq -16(%rsp), %rsp");
+        keep_first_store_before("    xchgq %rsp, %rax");
+        keep_first_store_before("    .cfi_endproc");
+        keep_first_store_before("    vpaddd (%rsp), %ymm0, %ymm2");
+        keep_first_store_before("    movdqu %gs:0x10(%rbp), %xmm2");
+    }
+
+    #[test]
+    fn windowed_dse_does_not_infer_segment_provenance_from_lea() {
+        let asm = "f:\n.cfi_startproc\n    leaq base(%rip), %rbp\n    movdqu %xmm0, 16(%rsp)\n    movdqu %gs:16(%rbp), %xmm2\n    movdqu %xmm1, 16(%rsp)\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(matches!(infos[3].kind, LineKind::StoreXmmRbp { .. }));
+    }
+
+    #[test]
+    fn windowed_dse_widens_displacement_endpoint_arithmetic() {
+        let asm =
+            "f:\n    movdqu %xmm0, 2147483647(%rsp)\n    movdqu %xmm1, 2147483647(%rsp)\n    ret\n";
+        let (store, mut infos) = build(asm);
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(infos[1].is_nop());
+    }
+
+    /// A segment-qualified store is not a frame-slot store, so it is never a
+    /// dead-store candidate. Operand shape taken verbatim from
+    /// tests/bench/k_seg_gs_copy.c at -O2 (`movdqu %xmm0, %gs:(%rbp)`, which
+    /// writes through the pointer in %rbp via the %gs base).  Before
+    /// `is_direct_frame_slot` guarded the slot parsers this line classified as
+    /// `StoreXmmRbp { offset: 0, size: DQ }` -- `fast_parse_i32("%gs:")` answers
+    /// 0 because its first byte is not a digit -- so a real slot store at 0
+    /// "covered" it and this pass deleted a `__seg_gs` write.  The window
+    /// compares offsets without bases, which is what made the two lines look
+    /// like the same slot.
+    #[test]
+    fn windowed_dse_never_deletes_a_segment_qualified_store() {
+        // Two vector spills at 32(%rsp), the first genuinely dead, so the pass
+        // has real work to do: the assertion that matters is that it does that
+        // work WITHOUT touching the segment store.
+        let asm = "f:\n.cfi_startproc\n    subq $56, %rsp\n    movdqu %xmm0, %gs:(%rbp)\n    movdqu %xmm3, 32(%rsp)\n    movdqu %xmm4, 32(%rsp)\n    movdqu 32(%rsp), %xmm2\n    addq $56, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let seg = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).contains("%gs:"))
+            .expect("the segment store is in the fixture");
+        assert!(
+            !matches!(
+                infos[seg].kind,
+                LineKind::StoreXmmRbp { .. } | LineKind::StoreRbp { .. }
+            ),
+            "a segment-qualified operand must not classify as a slot store"
+        );
+        assert!(
+            infos[seg].has_indirect_mem,
+            "it must be marked opaque so every offset-tracking pass bails"
+        );
+        let spills: Vec<usize> = (0..store.len())
+            .filter(|&i| matches!(infos[i].kind, LineKind::StoreXmmRbp { offset: 32, .. }))
+            .collect();
+        assert_eq!(spills.len(), 2, "only the plain spills are slot stores");
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(
+            !infos[seg].is_nop(),
+            "the __seg_gs write must survive: it is not a stack slot"
+        );
+        assert!(infos[spills[0]].is_nop(), "the first spill is dead");
+        assert!(!infos[spills[1]].is_nop(), "the reloaded spill survives");
     }
 
     /// The windowed DSE models NOP'd lines as absent: a forwarded (NOP'd)
@@ -1946,21 +2062,41 @@ mod tests {
     }
 
     #[test]
-    fn slot_read_floor_endpoint_does_not_wrap() {
+    fn canonical_frame_offsets_and_endpoints_do_not_wrap() {
+        assert_eq!(
+            canonical_frame_off(b's', i64::from(i32::MIN), 16),
+            -2147483664
+        );
+        assert_eq!(rsp_delta_step("addq $-2147483648, %rsp"), Some(2147483648));
+        assert_eq!(rsp_delta_step("addq $-9223372036854775808, %rsp"), None);
         assert!(slot_is_ever_read(
             b's',
             i32::MAX - 3,
             8,
             &[],
-            &[(b's', i32::MAX)]
+            &[(b's', i64::from(i32::MAX))]
         ));
         assert!(!slot_is_ever_read(
-            b'b',
+            b's',
             i32::MAX - 3,
             8,
             &[],
-            &[(b's', i32::MAX)]
+            &[(b's', i64::from(i32::MAX) + 5)]
         ));
+    }
+
+    #[test]
+    fn global_dse_does_not_infer_disjointness_from_different_bases() {
+        let asm = "f:\n.cfi_startproc\n pushq %rbp\n movq %rsp, %rbp\n subq $32, %rsp\n movq %rdi, -16(%rbp)\n movq 16(%rsp), %rax\n addq $32, %rsp\n popq %rbp\n ret\n.cfi_endproc\n.size f, .-f\n";
+        let (store, mut infos) = build(asm);
+        let i = (0..store.len())
+            .find(|&i| store.get(i).contains("movq %rdi"))
+            .unwrap();
+        eliminate_never_read_stores(&store, &mut infos);
+        assert!(
+            !infos[i].is_nop(),
+            "the load on rsp can read the store on rbp"
+        );
     }
 
     #[test]

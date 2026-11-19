@@ -7222,6 +7222,7 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         regparm: info.regparm,
         is_pure: info.is_pure,
         is_const: info.is_const,
+        memory: info.memory,
         // A remapped call is the same call: it still reaches (or not) the
         // library function.
         assume_library: info.assume_library,

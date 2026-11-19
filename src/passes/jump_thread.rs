@@ -247,6 +247,25 @@ fn implied_cmp(
     }
 }
 
+/// A test outcome applies only on an explicit, unambiguous branch edge.
+fn tested_edge(block: &BasicBlock, to: BlockId) -> Option<(Value, bool)> {
+    let Terminator::CondBranch {
+        cond: Operand::Value(c),
+        true_label,
+        false_label,
+    } = block.terminator
+    else {
+        return None;
+    };
+    if true_label == false_label
+        || (to != true_label && to != false_label)
+        || analysis::asm_goto_successors(block).any(|label| label == to)
+    {
+        return None;
+    }
+    Some((c, to == true_label))
+}
+
 /// Is `v` known non-zero (`Some(true)`) or zero (`Some(false)`) at the end
 /// of block `at`?  Facts come from the edge into a single-predecessor block
 /// dominating `at` whose predecessor branches on `v` (or on `v ==/!= 0`, or
@@ -262,15 +281,9 @@ fn known_truth(
     let mut x = at;
     loop {
         if let [d] = cfg.preds[x][..]
-            && let Terminator::CondBranch {
-                cond: Operand::Value(c),
-                true_label,
-                false_label,
-            } = &func.blocks[d].terminator
-            && true_label != false_label
+            && let Some((c, on_true)) = tested_edge(&func.blocks[d], func.blocks[x].label)
         {
-            let on_true = *true_label == func.blocks[x].label;
-            if *c == v {
+            if c == v {
                 return Some(on_true);
             }
             if let Some(&(t, nonzero_on_true)) = tests.get(&c.0)
@@ -457,7 +470,15 @@ impl Search<'_> {
         {
             return None;
         }
-        if let Some(incoming) = phi_def(head_block, val) {
+        // Inlining can test a narrow boolean cast of a merge phi while a
+        // live loop setup instruction keeps that merge from being phi-only.
+        // Look through the cast for the edge decision, but keep it in the
+        // clone so other users still see the original integer conversion.
+        let incoming = phi_def(head_block, val).or_else(|| {
+            let (_, source) = super::bool_thread::boolean_phi_cast_source(head_block, val)?;
+            phi_def(head_block, source)
+        });
+        if let Some(incoming) = incoming {
             for &p in &self.cfg.preds[head] {
                 if path.contains(&p) || !self.cfg.reachable(p) {
                     continue;
@@ -519,19 +540,8 @@ impl Search<'_> {
     /// The truth of comparison `c` on the edge `p -> to` implied by `p`'s own
     /// branch (the loop-exit edge of `while (j >= 0 ...)` knows `j < 0`).
     fn edge_truth(&self, p: usize, to: BlockId, c: Value) -> Option<bool> {
-        let Terminator::CondBranch {
-            cond: Operand::Value(pc),
-            true_label,
-            false_label,
-        } = &self.func.blocks[p].terminator
-        else {
-            return None;
-        };
-        if true_label == false_label {
-            return None;
-        }
-        let on_true = *true_label == to;
-        if *pc == c {
+        let (pc, on_true) = tested_edge(&self.func.blocks[p], to)?;
+        if pc == c {
             return Some(on_true);
         }
         implied_cmp(*self.cmps.get(&pc.0)?, on_true, *self.cmps.get(&c.0)?)
@@ -604,6 +614,13 @@ fn successors(term: &Terminator) -> Vec<BlockId> {
 fn apply(func: &mut IrFunction, t: &Thread) -> Option<()> {
     let pred_label = func.blocks[t.pred].label;
     let orig_labels: Vec<BlockId> = t.path.iter().map(|&b| func.blocks[b].label).collect();
+    // Redirecting the explicit branch must remove the old edge entirely.
+    // An asm-goto edge with the same source and target still needs the
+    // original phi arm, and can observe state from earlier in the block.
+    let head = *orig_labels.first()?;
+    if analysis::asm_goto_successors(&func.blocks[t.pred]).any(|label| label == head) {
+        return None;
+    }
     let clone_labels: Vec<BlockId> = t.path.iter().map(|_| fresh_label(func)).collect();
     let mut map: FxHashMap<u32, u32> = FxHashMap::default();
     let mut types: FxHashMap<u32, IrType> = FxHashMap::default();
@@ -1307,6 +1324,141 @@ mod tests {
             true_label: BlockId(t),
             false_label: BlockId(f),
         }
+    }
+
+    fn bool_cast_merge(second_arm: i32) -> IrFunction {
+        use crate::ir::module::IrParam;
+        use crate::ir::reexports::IrConst;
+        let param = IrParam {
+            ty: IrType::U32,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: vec![],
+            is_f128_sse: false,
+            fp_agg_class: None,
+        };
+        let mut f = IrFunction::new("cast_merge".into(), IrType::U64, vec![param], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::U32,
+                }],
+                cbr(0, 1, 2),
+            ),
+            block(1, vec![], Terminator::Branch(BlockId(3))),
+            block(2, vec![], Terminator::Branch(BlockId(3))),
+            block(
+                3,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::I32,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I32(0)), BlockId(1)),
+                            (Operand::Const(IrConst::I32(second_arm)), BlockId(2)),
+                        ],
+                    },
+                    Instruction::Cast {
+                        dest: Value(2),
+                        src: v(1),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::U8,
+                    },
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: v(0),
+                        from_ty: IrType::U32,
+                        to_ty: IrType::U64,
+                    },
+                ],
+                cbr(2, 4, 5),
+            ),
+            block(4, vec![], Terminator::Return(Some(v(3)))),
+            block(
+                5,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(-1)))),
+            ),
+        ];
+        f
+    }
+
+    #[test]
+    fn threads_through_boolean_cast_in_a_nonempty_merge() {
+        let mut f = bool_cast_merge(1);
+        assert_eq!(thread_decided_branches(&mut f), 2);
+        assert_eq!(
+            f.blocks
+                .iter()
+                .filter(|b| matches!(b.terminator, Terminator::CondBranch { .. }))
+                .count(),
+            1,
+            "only the entry branch should survive"
+        );
+        let mut f = bool_cast_merge(256);
+        assert_eq!(
+            thread_decided_branches(&mut f),
+            0,
+            "a narrowing cast can erase nonzero bits"
+        );
+    }
+
+    #[test]
+    fn cannot_redirect_an_explicit_edge_shared_with_asm_goto() {
+        let mut f = bool_cast_merge(1);
+        f.blocks[2].instructions.push(Instruction::InlineAsm {
+            template: "jmp %l[merge]".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("merge".into(), BlockId(3))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        });
+        let thread = Thread {
+            pred: 2,
+            path: vec![3],
+            target: Some(BlockId(4)),
+        };
+        assert!(apply(&mut f, &thread).is_none());
+        assert!(unique_arm(phi_def(&f.blocks[3], Value(1)).unwrap(), BlockId(2)).is_some());
+    }
+
+    #[test]
+    fn only_the_actual_branch_edge_has_a_truth_value() {
+        let mut f = bool_cast_merge(1);
+        f.blocks[0].instructions.push(Instruction::InlineAsm {
+            template: "j %l[next]".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("next".into(), BlockId(5)), ("shared".into(), BlockId(1))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        });
+        let b = &f.blocks[0];
+        assert_eq!(tested_edge(b, BlockId(5)), None);
+        assert_eq!(tested_edge(b, BlockId(1)), None);
+        assert_eq!(tested_edge(b, BlockId(2)), Some((Value(0), false)));
+        let cfg = Cfg::build(&f);
+        assert_eq!(
+            known_truth(
+                &f,
+                &cfg,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                Value(0),
+                5
+            ),
+            None
+        );
     }
 
     /// The list merge loop of the module docs.

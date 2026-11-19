@@ -2483,6 +2483,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // Created only under `BuiltinPolicy::may_synthesize`.
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
@@ -2595,6 +2596,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // Created only under `BuiltinPolicy::may_synthesize`.
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),

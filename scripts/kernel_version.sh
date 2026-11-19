@@ -14,7 +14,7 @@
 #
 #   1. VERSION ROT.  prepare_kernel_tree.sh derives KVER from the PKGBUILD
 #      (by design: "a PKGBUILD bump is picked up without touching this
-#      script"), so it now materialises `linux-6.18.58`, while
+#      script"), so it now materialises `linux-6.18.63`, while
 #      build_kernel_boot.sh / build_kernel_full.sh / qemu_boot_test.sh still
 #      looked for `linux-6.18.55`.  A freshly prepared workspace therefore
 #      failed its first gate with "kernel tree missing" — a false negative
@@ -50,8 +50,8 @@
 #     K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
 #
 # Usage (CLI, for scripts written in other languages):
-#     kernel_version.sh --default-dir     # e.g. /home/user/.cache/lccc/kernel-work/linux-6.18.58
-#     kernel_version.sh --kver            # e.g. 6.18.58
+#     kernel_version.sh --default-dir     # e.g. /home/user/.cache/lccc/kernel-work/linux-6.18.63
+#     kernel_version.sh --kver            # e.g. 6.18.63
 #     kernel_version.sh --workdir         # directory that holds the trees
 #     kernel_version.sh --pkgdir          # archpkgbuilds package dir, if found
 #
@@ -66,7 +66,16 @@
 # Keep the pinned fallback next to its explanation: it is only reached on a
 # virgin machine with no prepared tree and no PKGBUILD checkout, where its sole
 # job is to give prepare_kernel_tree.sh a directory name to create.
-LCCC_KERNEL_FALLBACK_KVER=6.18.58
+#
+# 2026-11-17, archpkgbuilds 6.18.58 -> 6.18.63 (package commit 736b1572905f,
+# "Update Kernel to 6.18.63"; the AutoFDO patch is retired there because
+# CONFIG_AUTOFDO_CLANG is native upstream).  This bump is the resolver's proof
+# of purpose: every script that asks `lccc_kernel_default_dir` followed the
+# PKGBUILD with no edit at all.  Only three places spell the release literally
+# and must move together -- this fallback, scripts/lccc_paths.py's, and the
+# hosted kernel lane's `KVER:` -- and tests/corpus/test_kernel_workflow_paths.py
+# (KernelVersionPinsAgree) fails the build if they ever disagree again.
+LCCC_KERNEL_FALLBACK_KVER=6.18.63
 # The package directory name inside archpkgbuilds.  The major.minor in it is a
 # *package series* name (the PKGBUILD deliberately keeps it stable across
 # stable-point releases), so it must NOT be parsed as the kernel version.
