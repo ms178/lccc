@@ -6150,6 +6150,42 @@ fn bind_paramref_uses(
     }
 }
 
+/// Whether nothing in `caller` names `label`, so that the block may give the
+/// label to its second half when a call splits it.
+///
+/// A jump to the label has to arrive ahead of the call: at the instructions
+/// in front of it and the callee's body.  If the label moved to the block
+/// behind the call, such a jump would skip both.  Every way of naming a block
+/// counts -- an edge of any terminator, the targets of an indirect branch
+/// included; a label of an asm goto; a static initializer that holds
+/// `&&label` -- and one `&&label` anywhere pins every block, because what is
+/// computed from an address is not followed.
+///
+/// The asm goto was missing here.  `Efault: pagefault_enable(); return
+/// -EFAULT;` in the kernel's `copy_from_kernel_nofault()` is named by nothing
+/// but the exception table entries of its `__get_kernel_nofault()` asm gotos
+/// once the unreachable jump ahead of it is gone, so the label went to the
+/// code behind the inlined call, and a fault left `pagefault_disabled`
+/// incremented, with `current` read out of whatever the faulting load's
+/// register held.
+fn label_is_private(caller: &IrFunction, label: BlockId) -> bool {
+    !caller.global_init_label_blocks.contains(&label)
+        && caller.blocks.iter().all(|block| {
+            let mut named = false;
+            block
+                .terminator
+                .for_each_target(|target| named |= target == label);
+            !named
+                && block.instructions.iter().all(|inst| match inst {
+                    Instruction::LabelAddr { .. } => false,
+                    Instruction::InlineAsm { goto_labels, .. } => {
+                        goto_labels.iter().all(|(_, target)| *target != label)
+                    }
+                    _ => true,
+                })
+        })
+}
+
 fn inline_call_site(
     caller: &mut IrFunction,
     site: &InlineCallSite,
@@ -6914,7 +6950,7 @@ fn inline_call_site(
     // Block after call (merge block) -> instructions after the call + original terminator
     //
     // LABEL PRESERVATION (Phase-0 fairness): when the split block's label is
-    // PRIVATE — no other block branches to it and no LabelAddr exists — the
+    // PRIVATE — nothing names it, see `label_is_private` — the
     // MERGE block keeps the original label and the pre-call remainder takes
     // the fresh one.  Every pre-existing call after the call site therefore
     // stays in an entry-labeled block, which is what makes the Phase-0
@@ -6937,22 +6973,7 @@ fn inline_call_site(
     // edge to the merge itself, skipping the pre-call work and the whole
     // inlined body (sha256_transform segfault: its schedule loop is one
     // self-latching block around inlined helpers).
-    let label_is_private = caller.blocks.iter().all(|b| match &b.terminator {
-        Terminator::Branch(t) => *t != split_label,
-        Terminator::CondBranch {
-            true_label,
-            false_label,
-            ..
-        } => *true_label != split_label && *false_label != split_label,
-        Terminator::Switch { cases, default, .. } => {
-            *default != split_label && !cases.iter().any(|(_, t)| *t == split_label)
-        }
-        _ => true,
-    }) && !caller.blocks.iter().any(|b| {
-        b.instructions
-            .iter()
-            .any(|inst| matches!(inst, Instruction::LabelAddr { .. }))
-    });
+    let label_is_private = label_is_private(caller, split_label);
 
     // Save instructions after the call and the terminator
     let after_call_instructions: Vec<Instruction> = caller.blocks[call_block_idx]
@@ -8811,6 +8832,149 @@ mod phase0_drain_tests {
             fresh_inbound, 0,
             "nothing may branch to the pre-call block's fresh label"
         );
+    }
+
+    /// The block a call splits is named by something other than a jump of a
+    /// plain terminator: an asm goto, an indirect branch, a static
+    /// initializer.  Whatever arrives there has to run the instructions ahead
+    /// of the call and the callee: the label stays on the first half.
+    #[test]
+    fn a_split_block_something_names_keeps_its_label_on_the_first_half() {
+        #[derive(Clone, Copy, Debug)]
+        enum Named {
+            AsmGoto,
+            IndirectBranch,
+            StaticInitializer,
+        }
+        for how in [
+            Named::AsmGoto,
+            Named::IndirectBranch,
+            Named::StaticInitializer,
+        ] {
+            let mut callee = IrFunction::new("helper".to_string(), IrType::I32, vec![], false);
+            callee.is_static = true;
+            callee.is_always_inline = true;
+            callee.next_value_id = 10;
+            callee.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![Instruction::Copy {
+                    dest: Value(8),
+                    src: Operand::Const(IrConst::I32(7)),
+                }],
+                terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            });
+
+            let mut caller = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+            caller.next_value_id = 20;
+            let entry_instructions = match how {
+                Named::AsmGoto => vec![Instruction::InlineAsm {
+                    template: "jmp %l0".to_string(),
+                    outputs: vec![],
+                    inputs: vec![],
+                    clobbers: vec![],
+                    operand_types: vec![],
+                    goto_labels: vec![("fault".to_string(), BlockId(5))],
+                    input_symbols: vec![],
+                    seg_overrides: vec![],
+                }],
+                _ => vec![],
+            };
+            let entry_terminator = match how {
+                Named::IndirectBranch => Terminator::IndirectBranch {
+                    target: Operand::Const(IrConst::I64(0)),
+                    possible_targets: vec![BlockId(5), BlockId(4)],
+                },
+                _ => Terminator::Branch(BlockId(4)),
+            };
+            if matches!(how, Named::StaticInitializer) {
+                caller.global_init_label_blocks.push(BlockId(5));
+            }
+            caller.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: entry_instructions,
+                terminator: entry_terminator,
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            });
+            caller.blocks.push(BasicBlock {
+                label: BlockId(4),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            });
+            // The named block: work ahead of the call, the call, work behind.
+            caller.blocks.push(BasicBlock {
+                label: BlockId(5),
+                instructions: vec![
+                    Instruction::Copy {
+                        dest: Value(0),
+                        src: Operand::Const(IrConst::I32(41)),
+                    },
+                    Instruction::Call {
+                        func: "helper".to_string(),
+                        info: CallInfo {
+                            dest: Some(Value(9)),
+                            args: vec![param0()],
+                            arg_types: vec![IrType::I32],
+                            return_type: IrType::I32,
+                            num_fixed_args: 1,
+                            ..crate::ir::reexports::CallInfo::default()
+                        },
+                    },
+                    Instruction::BinOp {
+                        dest: Value(10),
+                        op: crate::ir::reexports::IrBinOp::Add,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(9)),
+                        ty: IrType::I32,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(10)))),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            });
+            assert!(!super::label_is_private(&caller, BlockId(5)), "{how:?}");
+            assert!(super::label_is_private(&caller, BlockId(0)), "{how:?}");
+
+            let mut module = IrModule::new();
+            module.functions = vec![caller, callee];
+            super::inline_run(&mut module, false);
+
+            let caller = &module.functions[0];
+            assert!(
+                !caller.blocks.iter().any(|b| b
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(i, Instruction::Call { .. }))),
+                "{how:?}: the helper was inlined"
+            );
+            let named = caller
+                .blocks
+                .iter()
+                .find(|b| b.label == BlockId(5))
+                .unwrap_or_else(|| panic!("{how:?}: the named label is gone"));
+            assert!(
+                matches!(
+                    named.instructions.first(),
+                    Some(Instruction::Copy { dest: Value(0), .. })
+                ),
+                "{how:?}: what arrives at the label runs the work ahead of the call, got {:?}",
+                named.instructions
+            );
+            assert!(
+                !named.instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::BinOp {
+                        dest: Value(10),
+                        ..
+                    }
+                )),
+                "{how:?}: the label did not move behind the call"
+            );
+        }
     }
 }
 
