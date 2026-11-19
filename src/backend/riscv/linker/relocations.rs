@@ -499,7 +499,12 @@ pub fn output_section_name(name: &str, sh_type: u32, sh_flags: u64) -> Option<St
 
     // Array sections: fold numbered variants (.init_array.65535 -> .init_array)
     for arr in &[".init_array", ".fini_array", ".preinit_array"] {
-        if name == *arr || name.starts_with(&format!("{}.", arr)) {
+        // `.init_array` or `.init_array.<anything>` — the numbered-variant
+        // check is a prefix + one-byte test, not an owned `format!` pattern.
+        let matches = name
+            .strip_prefix(*arr)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'));
+        if matches {
             return Some(arr.to_string());
         }
     }
@@ -777,5 +782,46 @@ mod auipc_encoding_tests {
                 assert_eq!(decoded_high + decoded_low, expected);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod section_fold_tests {
+    //! Oracles for `output_section_name`'s array-section folding after the
+    //! numbered-variant probe became `strip_prefix` + one-byte test instead
+    //! of a `format!`-built pattern.  The acceptance set is pinned exactly:
+    //! the bare name, any `.`-separated variant, and nothing else.
+    use super::output_section_name;
+
+    // `.init_array`/`.fini_array`/`.preinit_array` carry SHT_INIT_ARRAY /
+    // SHT_FINI_ARRAY / SHT_PREINIT_ARRAY, but the fold is name-driven;
+    // PROGBITS+ALLOC reaches it for all of them.
+    const SHT_PROGBITS: u32 = 1;
+    const ALLOC: u64 = 2;
+
+    fn fold(name: &str) -> Option<String> {
+        output_section_name(name, SHT_PROGBITS, ALLOC)
+    }
+
+    #[test]
+    fn bare_and_numbered_array_sections_fold() {
+        for arr in [".init_array", ".fini_array", ".preinit_array"] {
+            assert_eq!(fold(arr).as_deref(), Some(arr), "bare {arr}");
+            let numbered = format!("{arr}.65535");
+            assert_eq!(fold(&numbered).as_deref(), Some(arr), "{numbered}");
+            let dot_only = format!("{arr}.");
+            assert_eq!(fold(&dot_only).as_deref(), Some(arr), "{dot_only}");
+        }
+    }
+
+    #[test]
+    fn lookalike_names_do_not_fold() {
+        // A name that merely extends the array name without the separating
+        // dot must not fold into it (the old `== || starts_with("{arr}.")`
+        // rejected these too; the strip_prefix form must as well).
+        assert_eq!(fold(".init_arrayX").as_deref(), Some(".init_arrayX"));
+        assert_eq!(fold(".init_arrays.0").as_deref(), Some(".init_arrays.0"));
+        // `.preinit_array` must not be captured by the `.init_array` arm.
+        assert_eq!(fold(".preinit_array.1").as_deref(), Some(".preinit_array"));
     }
 }

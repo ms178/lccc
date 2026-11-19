@@ -2914,7 +2914,14 @@ pub(super) fn fold_zero_addend_fma213_to_132(
             continue;
         }
         let lk = infos[k].trimmed(store.get(k));
-        let Some(body) = lk.strip_prefix(&format!("vfmadd213{} ", width)) else {
+        // `width` is pinned to {sd, ss} where it is derived, so the probe
+        // is a static spelling, not a per-candidate `format!` allocation.
+        let fma_probe = if width == "sd" {
+            "vfmadd213sd "
+        } else {
+            "vfmadd213ss "
+        };
+        let Some(body) = lk.strip_prefix(fma_probe) else {
             i += 1;
             continue;
         };
@@ -3784,6 +3791,20 @@ mod fma132_zero_tests {
         assert_eq!(out.len(), 2, "b load must be gone: {out:?}");
         assert_eq!(out[0], "xorpd %xmm0, %xmm0");
         assert_eq!(out[1], "vfmadd132sd (%rsi), %xmm0, %xmm2");
+    }
+
+    /// The single-precision spelling must fold through the second branch
+    /// of the static probe (`width == "ss"`), pinned since the probe
+    /// stopped being a `format!`-assembled pattern.
+    #[test]
+    fn folds_zero_addend_triple_to_132_single_precision() {
+        let (changed, out) = run("    movss (%rsi), %xmm3\n\
+             \x20   xorps %xmm0, %xmm0\n\
+             \x20   vfmadd213ss %xmm0, %xmm3, %xmm2\n");
+        assert!(changed, "ss triple must fold");
+        assert_eq!(out.len(), 2, "b load must be gone: {out:?}");
+        assert_eq!(out[0], "xorps %xmm0, %xmm0");
+        assert_eq!(out[1], "vfmadd132ss (%rsi), %xmm0, %xmm2");
     }
 
     /// A later use of the loaded register vetoes the fold.

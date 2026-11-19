@@ -1,0 +1,22 @@
+{
+  "src/backend/cfi_synth.rs": 10,
+  "src/backend/i686/codegen/emit.rs": 1,
+  "src/backend/i686/codegen/peephole.rs": 12,
+  "src/backend/x86/codegen/intrinsics.rs": 1,
+  "src/backend/x86/codegen/machinst_alloc.rs": 2,
+  "src/backend/x86/codegen/machinst_tests.rs": 5,
+  "src/backend/x86/codegen/peephole/passes/abs_cmov.rs": 6,
+  "src/backend/x86/codegen/peephole/passes/bmi2_mask.rs": 7,
+  "src/backend/x86/codegen/peephole/passes/frame_compact.rs": 1,
+  "src/backend/x86/codegen/peephole/passes/lea_add_fuse.rs": 1,
+  "src/backend/x86/codegen/peephole/passes/local_patterns.rs": 18,
+  "src/backend/x86/codegen/peephole/passes/logical_narrow_test.rs": 1,
+  "src/backend/x86/codegen/peephole/passes/mask_test.rs": 4,
+  "src/backend/x86/codegen/peephole/passes/memory_fold.rs": 8,
+  "src/backend/x86/codegen/peephole/passes/narrow_copy_fold.rs": 3,
+  "src/backend/x86/codegen/peephole/passes/pow2_cmov.rs": 4,
+  "src/backend/x86/codegen/peephole/passes/relay_and_lea.rs": 2,
+  "src/backend/x86/codegen/peephole/passes/return_bool.rs": 2,
+  "src/backend/x86/codegen/peephole/passes/scalar_transfer_tests.rs": 2,
+  "src/backend/x86/codegen/peephole/passes/sext_test.rs": 1
+}
