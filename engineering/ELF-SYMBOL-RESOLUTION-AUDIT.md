@@ -46,6 +46,12 @@ unless they maintain separate algorithms and output contracts.
 | 28 | x86-64 executable COMMON symbols report the real `.bss` index. | `exe-common-max-*` asserts `st_size`, aligned final address, NOBITS section index and exact allocation size. |
 | 29 | AArch64 `ADR`/`ADRP` accepts a COMMON target only after the allocator proves a mapped `.bss` slot. | `exe-adrp-allocated-common`; same-object loads under QEMU and the existing non-allocated/reserved-index refusal tests. |
 | 30 | AArch64 shared `ABS64` slots referring to an import carry a symbolic dynamic relocation instead of a fabricated local address. | `aarch64/so-ordinary-undefined-demand` (BFD parity), live retired global control and the existing shared-binding suites. |
+| 31 | The x86 script resolver gives surviving tentative definitions their own storage. COMMON beats weak, strong beats COMMON, and size and alignment are independent. | `script-common-{size,align,weak,regular}-*`; ELF section and live first/last byte checks in both ABIs. |
+| 32 | `-T` places `COMMON` through ordinary script selection, GC, and `/DISCARD/`, including fallback to `.bss`. | `script-common-{gc,keep,default-place,default-discard,discard,glob}`; GC retains a live object's sibling but not another object's unreferenced COMMON. |
+| 33 | Script `BYTE`/`SHORT`/`LONG`/`QUAD` prevent a pure NOBITS output designation. | `script-common-data-directive` checks an initialized byte after zero storage, not just a section type. |
+| 34 | Declared LOADs use one VMA-to-file translation over their entire span. | `script-load-{leading-nobits,trailing-nobits,nobits-only,nobits-and-orphan-note,file-gap,distinct-lma}` checks congruence and actual native execution. |
+| 35 | The implicit LMA-mapped image also uses the same origin for payload layout and the PHDR when NOBITS leads. | `script-load-implicit-nobits-first`, plus the kernel-style and implicit overlay controls. |
+| 36 | A placed input symbol names its actual output section, not just the first range matching its address. | `script-symbol-overlay-index`: two symbols with the same VMA in different output sections have different indices. |
 
 Two link-work reductions accompany the correctness changes: ELF64 registration
 no longer reserves hash entries for every local symbol, and a COMDAT object's
@@ -56,6 +62,22 @@ linker-time changes, not claims about generated application cycles.
 
 ## Design and safety review
 
+- **Script COMMON:** use the same input-section placement path used by real
+  NOBITS, not an address-only symbol table or a separately allocated late BSS
+  tail. This makes placement and GC agree before relocations are examined.
+  GNU retains siblings in the same winning COMMON input section under GC;
+  grouping all objects together would keep too much, and making one section
+  per symbol would keep too little. The section index and the two address
+  additions (alignment, size) are checked before a file is written. The
+  synthetic input owns metadata only; its data/relocation slots are empty.
+- **Script LOADs:** independent page-congruent section offsets are not
+  sufficient. A single file/virtual translation per LOAD is required for
+  Linux to map both sections across a VMA gap. Start at the actual memory
+  origin, including leading NOBITS, construct the file-backed span separately,
+  and include real ELF headers when explicitly requested. A shared file-backed
+  section unifies its LOADs' translations. Trailing NOBITS changes memory
+  length, not file length. The implicit kernel/overlay LOAD retains the
+  existing LMA mapping convention. No new mutable global state is involved.
 - **`ObjectSet`, `discarded_members`, `plan_comdat_iter`:** the claim owner is
   the input list in link order. Group signatures and member indices are read
   at the object boundary. Retain first occurrence; tolerate out-of-range group

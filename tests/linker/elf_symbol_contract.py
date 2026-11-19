@@ -286,6 +286,7 @@ def cases(f):
             assert f.sym(out, 'retained').index not in ('UND', 'ABS')
         f.check('script-gc-retained-edge', ['-T', 'drop.ld', '--gc-sections'],
                 base + ['dead-root', 'keep-target'], retained)
+        script_storage_cases(f)
 
     if f.target.name == 'x86_64':
         f.assemble('unique', '.data\n.globl pick\n.type pick,@gnu_unique_object\npick: .quad 3')
@@ -329,6 +330,195 @@ def cases(f):
         f.check('script-dso-discard-export', opts, ['orphan-weak', 'start-data'],
                 absent('pick', True), bfd=False)
         f.check('script-dso-hidden-reference', opts, ['strong', 'hiddenref'], absent('pick', True))
+
+
+def script_storage_cases(f):
+    """Verify Linux maps the script's bytes, not just that the link succeeds."""
+    bits64 = f.target.name == 'x86_64'
+
+    def start(stem, reads, *, writes=()):
+        def address(symbol):
+            return f'{symbol}(%rip)' if bits64 else symbol
+        exit_asm = 'mov $60,%eax; syscall' if bits64 else 'mov $1,%eax; int $0x80'
+        status = '%edi' if bits64 else '%ebx'
+        asm = ['.text', '.globl _start', '_start:']
+        for symbol, value in reads:
+            asm.extend((f'cmpb ${value},{address(symbol)}', 'jne .Lbad'))
+        for symbol in writes:
+            asm.extend((f'movb $91,{address(symbol)}', f'cmpb $91,{address(symbol)}', 'jne .Lbad'))
+        asm.extend((f'xor {status},{status}; {exit_asm}', '.Lbad:', f'mov $7,{status}; {exit_asm}'))
+        f.assemble(stem, '\n'.join(asm))
+
+    def script(name, body, *, note_discard=True, phdrs='code PT_LOAD FLAGS(5); data PT_LOAD FLAGS(6);'):
+        decl = f'PHDRS {{ {phdrs} }}' if phdrs else ''
+        tag = ':code' if phdrs else ''
+        (f.root / f'{name}.ld').write_text(f'''ENTRY(_start)
+{decl}
+SECTIONS {{
+  . = 0x400240;
+  .text : {{ *(.text) }} {tag}
+  . = 0x405037;
+  {body}
+  /DISCARD/ : {{ *({'.note*' if note_discard else '.note.GNU-stack'}) }}
+}}
+''')
+        return ['-T', f'{name}.ld', '--no-warn-rwx-segments']
+
+    def load_rows(out):
+        rows = []
+        for line in f.checked('readelf', '-lW', out).splitlines():
+            fields = line.split()
+            if fields and fields[0] == 'LOAD':
+                o, v, p, filesz, memsz = (int(word, 16) for word in fields[1:6])
+                align = int(fields[-1], 16)
+                assert filesz <= memsz and o % align == v % align, (out, line)
+                rows.append((o, v, p, filesz, memsz))
+        assert rows, f'{out}: no LOAD segments'
+        return rows
+
+    def executable(out):
+        rows = load_rows(out)
+        proc = f.run(f'./{out}')
+        assert proc.returncode == 0, f'{out}: runtime {proc.returncode}, {proc.stderr}; LOADs={rows}'
+
+    def common(home='.tentative', *, kind='NOBITS', siblings=False):
+        def check(out):
+            s = f.sym(out)
+            assert (s.size, s.binding, s.value % 128) == (64, 'GLOBAL', 0), s
+            row = re.search(r'\[\s*(\d+)\]\s+' + re.escape(home) + r'\s+' + kind
+                            + r'\s+(\w+)\s+\w+\s+(\w+).*\s(\d+)\s*$',
+                            f.checked('readelf', '-SW', out), re.MULTILINE)
+            assert row and s.index == row[1] and int(row[4]) >= 128, (out, s, row)
+            begin, size = int(row[2], 16), int(row[3], 16)
+            assert begin <= s.value and s.value + s.size <= begin + size, (begin, size, s)
+            if siblings:
+                other = f.sym(out, 'same_common')
+                assert other.index == s.index and other.size == 16, other
+                assert not f.symbols(out, 'dead_common'), 'GC retained unreferenced COMMON object'
+            elif home != '.bss' and kind == 'NOBITS':
+                assert size == 64, f'{out}: allocated more than one tentative definition'
+            executable(out)
+        return check
+
+    bss = '.data : { *(.data) } :data .bss : { *(.bss) } :data'
+    placed = script('common', bss + ' .tentative : { *(COMMON) } :data')
+    start('common-start', [('pick', 0), ('pick+63', 0)], writes=('pick', 'pick+63'))
+    for label, definitions in (
+        ('size-first', ['c64', 'c8']),
+        ('align-first', ['c8', 'c64']),
+        ('weak-first', ['weak', 'c8', 'c64']),
+        ('weak-last', ['c64', 'c8', 'weak']),
+    ):
+        f.check('script-common-' + label, placed, ['common-start', *definitions], common())
+    # In BFD, GC keeps a winning object's COMMON section as a unit, not
+    # one section per symbol. The unrelated object's common must disappear.
+    f.assemble('common-sibling', '.comm pick,64,8\n.comm same_common,16,8')
+    f.assemble('other-common', '.comm dead_common,4096,256')
+    f.check('script-common-gc', placed + ['--gc-sections'],
+            ['common-start', 'c8', 'common-sibling', 'other-common'], common(siblings=True))
+    kept = script('kept', bss + ' .tentative : { KEEP(*(COMMON)) } :data')
+    f.check('script-common-keep', kept + ['--gc-sections'], ['start', 'c8', 'c64'], common())
+    orphan = script('orphan-common', bss)
+    for policy in ('place', 'discard'):
+        f.check('script-common-default-' + policy, orphan + ['--orphan-handling=' + policy],
+                ['common-start', 'c8', 'c64'], common('.bss'))
+    dropped = script('discard-common', bss + ' /DISCARD/ : { *(COMMON) }')
+    f.check('script-common-discard', dropped, ['common-start', 'c8', 'c64', 'weak'],
+            diagnostic='discarded section')
+    wild = script('wild-common', bss + ' .tentative : { *(COM*) } :data')
+    f.check('script-common-glob', wild, ['common-start', 'c8', 'c64'], common())
+
+    start('data-start', [('pick', 3), ('pick+63', 0)])
+    f.assemble('strong-align', '.data\n.balign 128\n.globl pick\n.type pick,@object\n'
+               'pick: .byte 3\n.zero 63\n.size pick,.-pick')
+    def not_common(out):
+        assert '.tentative' not in f.checked('readelf', '-SW', out), out
+        executable(out)
+    for label, definitions in (('regular-first', ['strong-align', 'c64', 'c8']),
+                               ('regular-last', ['c8', 'c64', 'strong-align'])):
+        f.check('script-common-' + label, placed, ['data-start', *definitions], not_common)
+
+    directive = script('common-directive', bss + ' .tentative : { *(COMMON) marker = .; BYTE(42); } :data')
+    start('common-directive', [('pick', 0), ('pick+63', 0), ('marker', 42)])
+    f.check('script-common-data-directive', directive, ['common-directive', 'c8', 'c64'],
+            common(kind='PROGBITS'))
+
+    f.assemble('zero', '.bss\n.globl pick\n.type pick,@object\npick: .zero 64\n.size pick,.-pick')
+    f.assemble('late', '.section .late,"aw"\n.globl late\nlate: .byte 57')
+    f.assemble('early', '.section .early,"aw"\n.globl early\nearly: .byte 11')
+    # A legitimate allocated note reaches the data LOAD as an orphan in
+    # LCCC. BFD associates it with the code LOAD. Both must map correctly.
+    f.assemble('note', '.section .note.probe,"a",@note\n.balign 4\n'
+               '.long 4,4,1\n.asciz "abc"\n.long 23')
+    bare = script('bss', '.bss : { *(.bss) } :data')
+
+    def pure_zero(out):
+        rows = load_rows(out)
+        assert len(rows) == 2 and rows[1][1] % 4096 and rows[1][3:] == (0, 64), rows
+        executable(out)
+    f.check('script-load-nobits-only', bare, ['common-start', 'zero'], pure_zero)
+    noted = script('noted', '.bss : { *(.bss) } :data', note_discard=False)
+    f.check('script-load-nobits-and-orphan-note', noted, ['common-start', 'zero', 'note'], executable)
+    start('bss-and-late', [('pick', 0), ('pick+63', 0), ('late', 57)], writes=('pick+63',))
+    for label, body in (
+        ('leading-nobits', '.bss : { *(.bss) } :data . += 0x2333; .late : { *(.late) } :data'),
+        ('trailing-nobits', '.late : { *(.late) } :data . += 0x2333; .bss : { *(.bss) } :data'),
+        ('automatic', '.bss : { *(.bss) } . += 0x2333; .late : { *(.late) }'),
+    ):
+        opts = script(label, body, phdrs='' if label == 'automatic' else
+                      'code PT_LOAD FLAGS(5); data PT_LOAD FLAGS(6);')
+        f.check('script-load-' + label, opts, ['bss-and-late', 'zero', 'late'], executable)
+    start('file-gap', [('early', 11), ('late', 57)])
+    gap = script('file-gap', '.early : { *(.early) } :data . += 0x2333; .late : { *(.late) } :data')
+    f.check('script-load-file-gap', gap, ['file-gap', 'early', 'late'], executable)
+    lma = script('different-lma', '.early : AT(0x503000) { *(.early) } :data '
+                 '. += 0x2333; .late : AT(0x505334) { *(.late) } :data')
+
+    def vma_not_lma(out):
+        rows = load_rows(out)
+        assert rows[1][1:3] == (0x405037, 0x503000), rows
+        executable(out)
+    f.check('script-load-distinct-lma', lma, ['file-gap', 'early', 'late'], vma_not_lma)
+
+    # The implicit LOAD's file origin must cover the lowest alloc address,
+    # even when the first file-backed section comes later.
+    (f.root / 'implicit-first.ld').write_text('''ENTRY(_start)
+SECTIONS {
+  . = 0x400140; .bss : { *(.bss) }
+  . = 0x400240; .text : { *(.text) }
+  /DISCARD/ : { *(.note*) }
+}
+''')
+    f.check('script-load-implicit-nobits-first', ['-T', 'implicit-first.ld', '--no-warn-rwx-segments'],
+            ['common-start', 'zero'], executable)
+    (f.root / 'overlay-index.ld').write_text('''ENTRY(_start)
+SECTIONS {
+  . = 0x400240; .text : { *(.text) }
+  OVERLAY 0x500000 : AT(0x480000) {
+    .overlay1 { *(.early) }
+    .overlay2 { *(.late) }
+  }
+  /DISCARD/ : { *(.note*) }
+}
+''')
+
+    def overlay_index(out):
+        a, b = f.sym(out, 'early'), f.sym(out, 'late')
+        assert a.value == b.value == 0x500000 and a.index != b.index, (out, a, b)
+        assert a.index.isdecimal() and b.index.isdecimal(), (out, a, b)
+        executable(out)
+    f.check('script-symbol-overlay-index', ['-T', 'overlay-index.ld', '--no-warn-rwx-segments'],
+            ['start', 'early', 'late'], overlay_index)
+
+    if bits64:
+        (f.root / 'overflow-common.ld').write_text('''ENTRY(_start)
+SECTIONS {
+  . = 0x400240; .text : { *(.text) }
+  . = 0xfffffffffffffff0; .tentative : { *(COMMON) }
+}
+''')
+        f.check('script-common-address-overflow', ['-T', 'overflow-common.ld'],
+                ['start', 'c8', 'c64'], diagnostic='overflows address space', bfd=False)
 
 
 def suite(linker, names, require_oracles=True):
