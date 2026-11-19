@@ -209,6 +209,11 @@ def cases(f):
             check('weak-after-common', ['c64', 'weak'], contract(size=64, binding='GLOBAL'))
             check('strong-over-common', ['c64', 'strong64'], no_bss)
             check('no-dead-common-allocation', ['strong64', 'c64'], no_bss)
+        if f.target.name == 'aarch64':
+            f.assemble('read-common', '.text\n.globl _start\n_start:\n'
+                       '  adrp x9, pick\n  add x9, x9, :lo12:pick\n'
+                       '  ldrb w0, [x9]\n  mov x8, #93\n  svc #0')
+            f.check('exe-adrp-allocated-common', ['-static'], ['read-common', 'c8', 'c64'], placed_common)
 
     if f.target.name in ('x86_64', 'i386', 'riscv64', 'aarch64'):
         first = '.section .text.group,"axG",@progbits,sig,comdat\n'

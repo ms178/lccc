@@ -26,6 +26,8 @@ pub struct GlobalSymbol {
     pub info: u8,
     pub defined_in: Option<usize>,
     pub section_idx: u16,
+    /// Set only by the COMMON allocator. Raw ELF section indices cannot assert this.
+    pub allocated_common: bool,
     /// SONAME of the shared library this symbol was resolved from
     pub from_lib: Option<String>,
     /// PLT entry index (for dynamic function symbols)
@@ -95,6 +97,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             plt_idx: None,
             got_idx: None,
             section_idx: sym.shndx,
+            allocated_common: false,
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
@@ -112,6 +115,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             plt_idx: None,
             got_idx: None,
             section_idx: SHN_COMMON,
+            allocated_common: false,
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
@@ -129,6 +133,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             plt_idx: None,
             got_idx: None,
             section_idx: SHN_UNDEF,
+            allocated_common: false,
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
@@ -139,6 +144,7 @@ impl GlobalSymbolOps for GlobalSymbol {
     fn set_common_bss(&mut self, bss_offset: u64) {
         self.value = bss_offset;
         self.section_idx = 0xffff;
+        self.allocated_common = true;
     }
     fn new_dynamic(dsym: &linker_common::DynSymbol, soname: &str) -> Self {
         GlobalSymbol {
@@ -150,6 +156,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             plt_idx: None,
             got_idx: None,
             section_idx: SHN_UNDEF,
+            allocated_common: false,
             is_dynamic: true,
             copy_reloc: false,
             lib_sym_value: dsym.value,

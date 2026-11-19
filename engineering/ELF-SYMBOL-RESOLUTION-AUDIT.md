@@ -44,6 +44,8 @@ unless they maintain separate algorithms and output contracts.
 | 26 | Model a live global reference to a retired copy as demand, so an executable cannot silently resolve it to zero or the start of an unrelated section. | `*-live-global-in-loser`; shared links retain an undefined import + relocation rather than a `RELATIVE+0` placeholder, a documented LCCC policy where BFD differs. |
 | 27 | AArch64 executables omit COMDAT losers in layout and GC, not just in registration. | `aarch64/exe-comdat-size` and the same-name survivor and local-reference controls. |
 | 28 | x86-64 executable COMMON symbols report the real `.bss` index. | `exe-common-max-*` asserts `st_size`, aligned final address, NOBITS section index and exact allocation size. |
+| 29 | AArch64 `ADR`/`ADRP` accepts a COMMON target only after the allocator proves a mapped `.bss` slot. | `exe-adrp-allocated-common`; same-object loads under QEMU and the existing non-allocated/reserved-index refusal tests. |
+| 30 | AArch64 shared `ABS64` slots referring to an import carry a symbolic dynamic relocation instead of a fabricated local address. | `aarch64/so-ordinary-undefined-demand` (BFD parity), live retired global control and the existing shared-binding suites. |
 
 Two link-work reductions accompany the correctness changes: ELF64 registration
 no longer reserves hash entries for every local symbol, and a COMDAT object's

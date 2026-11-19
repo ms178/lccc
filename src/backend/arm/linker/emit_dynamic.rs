@@ -477,7 +477,7 @@ pub(super) fn emit_dynamic_executable(
             if obj_idx == usize::MAX {
                 continue;
             } // linker-defined or copy-reloc
-            if gsym.section_idx == SHN_COMMON || gsym.section_idx == 0xffff {
+            if gsym.allocated_common {
                 if let Some(bss_sec) = output_sections.iter().find(|s| s.name == ".bss") {
                     gsym.value += bss_sec.addr;
                 }
@@ -519,6 +519,7 @@ pub(super) fn emit_dynamic_executable(
             plt_idx: None,
             got_idx: None,
             section_idx: SHN_ABS,
+            allocated_common: false,
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,

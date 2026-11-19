@@ -712,6 +712,7 @@ fn apply_defsyms(
                 info: (STB_GLOBAL << 4) | STT_NOTYPE,
                 defined_in: Some(usize::MAX),
                 section_idx: SHN_ABS,
+                allocated_common: false,
                 from_lib: None,
                 plt_idx: None,
                 got_idx: None,

@@ -364,7 +364,7 @@ pub(super) fn emit_executable(
             if obj_idx == usize::MAX {
                 continue;
             } // linker-defined
-            if gsym.section_idx == SHN_COMMON || gsym.section_idx == 0xffff {
+            if gsym.allocated_common {
                 if let Some(bss_sec) = output_sections.iter().find(|s| s.name == ".bss") {
                     gsym.value += bss_sec.addr;
                 }
@@ -492,6 +492,7 @@ pub(super) fn emit_executable(
                     info: (sym.binding << 4) | STT_OBJECT,
                     defined_in: Some(usize::MAX),
                     section_idx: SHN_ABS,
+                    allocated_common: false,
                     from_lib: None,
                     plt_idx: None,
                     got_idx: None,
@@ -524,6 +525,7 @@ pub(super) fn emit_executable(
                     info: (STB_GLOBAL << 4),
                     defined_in: Some(usize::MAX),
                     section_idx: SHN_ABS,
+                    allocated_common: false,
                     from_lib: None,
                     plt_idx: None,
                     got_idx: None,
@@ -556,6 +558,7 @@ pub(super) fn emit_executable(
                     info: (STB_GLOBAL << 4) | STT_OBJECT,
                     defined_in: Some(usize::MAX),
                     section_idx: SHN_ABS,
+                    allocated_common: false,
                     from_lib: None,
                     plt_idx: None,
                     got_idx: None,

@@ -165,6 +165,18 @@ pub(super) fn adr_target_is_addressable(
         (obj_idx, sym.shndx)
     } else {
         match globals.get(sym.name.as_str()) {
+            Some(g) if g.allocated_common => {
+                // The COMMON allocator has constructed a real BSS slot. Do
+                // not interpret its internal section marker as SHN_XINDEX.
+                return output_sections.iter().any(|section| {
+                    section.name == ".bss"
+                        && section.sh_type == SHT_NOBITS
+                        && section.flags & SHF_ALLOC != 0
+                        && g.value.checked_sub(section.addr).is_some_and(|offset| {
+                            offset <= section.mem_size && g.size <= section.mem_size - offset
+                        })
+                });
+            }
             Some(g) => match g.defined_in {
                 // Linker-defined symbols are allocated by construction.
                 Some(usize::MAX) => return true,
@@ -1183,6 +1195,7 @@ mod adr_checked_tests {
                 info: (STB_GLOBAL << 4) | STT_OBJECT,
                 defined_in: Some(1),
                 section_idx: 1,
+                allocated_common: false,
                 from_lib: None,
                 plt_idx: None,
                 got_idx: None,
