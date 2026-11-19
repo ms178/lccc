@@ -404,6 +404,12 @@ gate "asm-goto-equivalence" fast \
     python3 tests/regression/check_asm_goto_equivalence.py --lccc "$LCCC" \
     --check-committed --self-test
 gate "call-arg-staging-homes" fast \
+# A static key costs its nop: no address load ahead of it, no jump behind it,
+# the guarded call out of line, no register saved for it; and the program
+# computes the same with the keys off (nop) and on (jmp), -O0..-Os, both
+# x86 targets.
+gate "static-key-layout" fast \
+    python3 tests/regression/check_static_key_layout.py --lccc "$LCCC" --self-test
     python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
     --seed-list 1,2,3,4,5,6,11,14,16,26,30
 gate "fno-builtin-fold-contract" fast \
