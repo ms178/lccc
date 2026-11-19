@@ -175,322 +175,383 @@ __attribute__((noinline)) static tV8SF probe37(const float * a0)
 {
     return __builtin_ia32_loadups256(a0);
 }
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskloadd((const tV4SI *)0, (tV4SI){0})), tV4SI), "__builtin_ia32_maskloadd result type");
+__attribute__((noinline)) static tV4SI probe38(const tV4SI * a0, tV4SI a1)
+{
+    return __builtin_ia32_maskloadd(a0, a1);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskloadd256((const tV8SI *)0, (tV8SI){0})), tV8SI), "__builtin_ia32_maskloadd256 result type");
+__attribute__((noinline)) static tV8SI probe39(const tV8SI * a0, tV8SI a1)
+{
+    return __builtin_ia32_maskloadd256(a0, a1);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskloadpd((const tV2DF *)0, (tV2DI){0})), tV2DF), "__builtin_ia32_maskloadpd result type");
+__attribute__((noinline)) static tV2DF probe40(const tV2DF * a0, tV2DI a1)
+{
+    return __builtin_ia32_maskloadpd(a0, a1);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskloadpd256((const tV4DF *)0, (tV4DI){0})), tV4DF), "__builtin_ia32_maskloadpd256 result type");
+__attribute__((noinline)) static tV4DF probe41(const tV4DF * a0, tV4DI a1)
+{
+    return __builtin_ia32_maskloadpd256(a0, a1);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskloadps((const tV4SF *)0, (tV4SI){0})), tV4SF), "__builtin_ia32_maskloadps result type");
+__attribute__((noinline)) static tV4SF probe42(const tV4SF * a0, tV4SI a1)
+{
+    return __builtin_ia32_maskloadps(a0, a1);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskloadps256((const tV8SF *)0, (tV8SI){0})), tV8SF), "__builtin_ia32_maskloadps256 result type");
+__attribute__((noinline)) static tV8SF probe43(const tV8SF * a0, tV8SI a1)
+{
+    return __builtin_ia32_maskloadps256(a0, a1);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskloadq((const tV2DI *)0, (tV2DI){0})), tV2DI), "__builtin_ia32_maskloadq result type");
+__attribute__((noinline)) static tV2DI probe44(const tV2DI * a0, tV2DI a1)
+{
+    return __builtin_ia32_maskloadq(a0, a1);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskloadq256((const tV4DI *)0, (tV4DI){0})), tV4DI), "__builtin_ia32_maskloadq256 result type");
+__attribute__((noinline)) static tV4DI probe45(const tV4DI * a0, tV4DI a1)
+{
+    return __builtin_ia32_maskloadq256(a0, a1);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskstored((tV4SI *)0, (tV4SI){0}, (tV4SI){0})), void), "__builtin_ia32_maskstored result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskstored256((tV8SI *)0, (tV8SI){0}, (tV8SI){0})), void), "__builtin_ia32_maskstored256 result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskstorepd((tV2DF *)0, (tV2DI){0}, (tV2DF){0})), void), "__builtin_ia32_maskstorepd result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskstorepd256((tV4DF *)0, (tV4DI){0}, (tV4DF){0})), void), "__builtin_ia32_maskstorepd256 result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskstoreps((tV4SF *)0, (tV4SI){0}, (tV4SF){0})), void), "__builtin_ia32_maskstoreps result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskstoreps256((tV8SF *)0, (tV8SI){0}, (tV8SF){0})), void), "__builtin_ia32_maskstoreps256 result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskstoreq((tV2DI *)0, (tV2DI){0}, (tV2DI){0})), void), "__builtin_ia32_maskstoreq result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maskstoreq256((tV4DI *)0, (tV4DI){0}, (tV4DI){0})), void), "__builtin_ia32_maskstoreq256 result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maxps((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_maxps result type");
-__attribute__((noinline)) static tV4SF probe38(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe54(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_maxps(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maxps256((tV8SF){0}, (tV8SF){0})), tV8SF), "__builtin_ia32_maxps256 result type");
-__attribute__((noinline)) static tV8SF probe39(tV8SF a0, tV8SF a1)
+__attribute__((noinline)) static tV8SF probe55(tV8SF a0, tV8SF a1)
 {
     return __builtin_ia32_maxps256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maxsd((tV2DF){0}, (tV2DF){0})), tV2DF), "__builtin_ia32_maxsd result type");
-__attribute__((noinline)) static tV2DF probe40(tV2DF a0, tV2DF a1)
+__attribute__((noinline)) static tV2DF probe56(tV2DF a0, tV2DF a1)
 {
     return __builtin_ia32_maxsd(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_maxss((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_maxss result type");
-__attribute__((noinline)) static tV4SF probe41(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe57(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_maxss(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_minps((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_minps result type");
-__attribute__((noinline)) static tV4SF probe42(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe58(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_minps(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_minps256((tV8SF){0}, (tV8SF){0})), tV8SF), "__builtin_ia32_minps256 result type");
-__attribute__((noinline)) static tV8SF probe43(tV8SF a0, tV8SF a1)
+__attribute__((noinline)) static tV8SF probe59(tV8SF a0, tV8SF a1)
 {
     return __builtin_ia32_minps256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_minsd((tV2DF){0}, (tV2DF){0})), tV2DF), "__builtin_ia32_minsd result type");
-__attribute__((noinline)) static tV2DF probe44(tV2DF a0, tV2DF a1)
+__attribute__((noinline)) static tV2DF probe60(tV2DF a0, tV2DF a1)
 {
     return __builtin_ia32_minsd(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_minss((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_minss result type");
-__attribute__((noinline)) static tV4SF probe45(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe61(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_minss(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntdq((tV2DI *)0, (tV2DI){0})), void), "__builtin_ia32_movntdq result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntdq256((tV4DI *)0, (tV4DI){0})), void), "__builtin_ia32_movntdq256 result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntdqa((tV2DI *)0)), tV2DI), "__builtin_ia32_movntdqa result type");
+__attribute__((noinline)) static tV2DI probe64(tV2DI * a0)
+{
+    return __builtin_ia32_movntdqa(a0);
+}
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntdqa256((tV4DI *)0)), tV4DI), "__builtin_ia32_movntdqa256 result type");
+__attribute__((noinline)) static tV4DI probe65(tV4DI * a0)
+{
+    return __builtin_ia32_movntdqa256(a0);
+}
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movnti((int *)0, (int)0)), void), "__builtin_ia32_movnti result type");
 #ifdef __x86_64__
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movnti64((long long *)0, (long long)0)), void), "__builtin_ia32_movnti64 result type");
 #endif
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntpd((double *)0, (tV2DF){0})), void), "__builtin_ia32_movntpd result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntpd256((double *)0, (tV4DF){0})), void), "__builtin_ia32_movntpd256 result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntps((float *)0, (tV4SF){0})), void), "__builtin_ia32_movntps result type");
+_Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntps256((float *)0, (tV8SF){0})), void), "__builtin_ia32_movntps256 result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_movntq((unsigned long long *)0, (unsigned long long)0)), void), "__builtin_ia32_movntq result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_mulpd((tV2DF){0}, (tV2DF){0})), tV2DF), "__builtin_ia32_mulpd result type");
-__attribute__((noinline)) static tV2DF probe52(tV2DF a0, tV2DF a1)
+__attribute__((noinline)) static tV2DF probe73(tV2DF a0, tV2DF a1)
 {
     return __builtin_ia32_mulpd(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_mulpd256((tV4DF){0}, (tV4DF){0})), tV4DF), "__builtin_ia32_mulpd256 result type");
-__attribute__((noinline)) static tV4DF probe53(tV4DF a0, tV4DF a1)
+__attribute__((noinline)) static tV4DF probe74(tV4DF a0, tV4DF a1)
 {
     return __builtin_ia32_mulpd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_mulps((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_mulps result type");
-__attribute__((noinline)) static tV4SF probe54(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe75(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_mulps(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_mulps256((tV8SF){0}, (tV8SF){0})), tV8SF), "__builtin_ia32_mulps256 result type");
-__attribute__((noinline)) static tV8SF probe55(tV8SF a0, tV8SF a1)
+__attribute__((noinline)) static tV8SF probe76(tV8SF a0, tV8SF a1)
 {
     return __builtin_ia32_mulps256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_mulsd((tV2DF){0}, (tV2DF){0})), tV2DF), "__builtin_ia32_mulsd result type");
-__attribute__((noinline)) static tV2DF probe56(tV2DF a0, tV2DF a1)
+__attribute__((noinline)) static tV2DF probe77(tV2DF a0, tV2DF a1)
 {
     return __builtin_ia32_mulsd(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_mulss((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_mulss result type");
-__attribute__((noinline)) static tV4SF probe57(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe78(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_mulss(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_orpd((tV2DF){0}, (tV2DF){0})), tV2DF), "__builtin_ia32_orpd result type");
-__attribute__((noinline)) static tV2DF probe58(tV2DF a0, tV2DF a1)
+__attribute__((noinline)) static tV2DF probe79(tV2DF a0, tV2DF a1)
 {
     return __builtin_ia32_orpd(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_orpd256((tV4DF){0}, (tV4DF){0})), tV4DF), "__builtin_ia32_orpd256 result type");
-__attribute__((noinline)) static tV4DF probe59(tV4DF a0, tV4DF a1)
+__attribute__((noinline)) static tV4DF probe80(tV4DF a0, tV4DF a1)
 {
     return __builtin_ia32_orpd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_orps((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_orps result type");
-__attribute__((noinline)) static tV4SF probe60(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe81(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_orps(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_orps256((tV8SF){0}, (tV8SF){0})), tV8SF), "__builtin_ia32_orps256 result type");
-__attribute__((noinline)) static tV8SF probe61(tV8SF a0, tV8SF a1)
+__attribute__((noinline)) static tV8SF probe82(tV8SF a0, tV8SF a1)
 {
     return __builtin_ia32_orps256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pabsb128((tV16QI){0})), tV16QI), "__builtin_ia32_pabsb128 result type");
-__attribute__((noinline)) static tV16QI probe62(tV16QI a0)
+__attribute__((noinline)) static tV16QI probe83(tV16QI a0)
 {
     return __builtin_ia32_pabsb128(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pabsb256((tV32QI){0})), tV32QI), "__builtin_ia32_pabsb256 result type");
-__attribute__((noinline)) static tV32QI probe63(tV32QI a0)
+__attribute__((noinline)) static tV32QI probe84(tV32QI a0)
 {
     return __builtin_ia32_pabsb256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pabsd128((tV4SI){0})), tV4SI), "__builtin_ia32_pabsd128 result type");
-__attribute__((noinline)) static tV4SI probe64(tV4SI a0)
+__attribute__((noinline)) static tV4SI probe85(tV4SI a0)
 {
     return __builtin_ia32_pabsd128(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pabsd256((tV8SI){0})), tV8SI), "__builtin_ia32_pabsd256 result type");
-__attribute__((noinline)) static tV8SI probe65(tV8SI a0)
+__attribute__((noinline)) static tV8SI probe86(tV8SI a0)
 {
     return __builtin_ia32_pabsd256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pabsw128((tV8HI){0})), tV8HI), "__builtin_ia32_pabsw128 result type");
-__attribute__((noinline)) static tV8HI probe66(tV8HI a0)
+__attribute__((noinline)) static tV8HI probe87(tV8HI a0)
 {
     return __builtin_ia32_pabsw128(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pabsw256((tV16HI){0})), tV16HI), "__builtin_ia32_pabsw256 result type");
-__attribute__((noinline)) static tV16HI probe67(tV16HI a0)
+__attribute__((noinline)) static tV16HI probe88(tV16HI a0)
 {
     return __builtin_ia32_pabsw256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_packssdw128((tV4SI){0}, (tV4SI){0})), tV8HI), "__builtin_ia32_packssdw128 result type");
-__attribute__((noinline)) static tV8HI probe68(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV8HI probe89(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_packssdw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_packssdw256((tV8SI){0}, (tV8SI){0})), tV16HI), "__builtin_ia32_packssdw256 result type");
-__attribute__((noinline)) static tV16HI probe69(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV16HI probe90(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_packssdw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_packsswb128((tV8HI){0}, (tV8HI){0})), tV16QI), "__builtin_ia32_packsswb128 result type");
-__attribute__((noinline)) static tV16QI probe70(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV16QI probe91(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_packsswb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_packsswb256((tV16HI){0}, (tV16HI){0})), tV32QI), "__builtin_ia32_packsswb256 result type");
-__attribute__((noinline)) static tV32QI probe71(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV32QI probe92(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_packsswb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_packuswb128((tV8HI){0}, (tV8HI){0})), tV16QI), "__builtin_ia32_packuswb128 result type");
-__attribute__((noinline)) static tV16QI probe72(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV16QI probe93(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_packuswb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_packuswb256((tV16HI){0}, (tV16HI){0})), tV32QI), "__builtin_ia32_packuswb256 result type");
-__attribute__((noinline)) static tV32QI probe73(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV32QI probe94(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_packuswb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_paddb128 result type");
-__attribute__((noinline)) static tV16QI probe74(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe95(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_paddb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddb256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_paddb256 result type");
-__attribute__((noinline)) static tV32QI probe75(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe96(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_paddb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_paddd128 result type");
-__attribute__((noinline)) static tV4SI probe76(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe97(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_paddd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddd256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_paddd256 result type");
-__attribute__((noinline)) static tV8SI probe77(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe98(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_paddd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddq128((tV2DI){0}, (tV2DI){0})), tV2DI), "__builtin_ia32_paddq128 result type");
-__attribute__((noinline)) static tV2DI probe78(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe99(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_paddq128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddq256((tV4DI){0}, (tV4DI){0})), tV4DI), "__builtin_ia32_paddq256 result type");
-__attribute__((noinline)) static tV4DI probe79(tV4DI a0, tV4DI a1)
+__attribute__((noinline)) static tV4DI probe100(tV4DI a0, tV4DI a1)
 {
     return __builtin_ia32_paddq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddsb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_paddsb128 result type");
-__attribute__((noinline)) static tV16QI probe80(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe101(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_paddsb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddsw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_paddsw128 result type");
-__attribute__((noinline)) static tV8HI probe81(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe102(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_paddsw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddusb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_paddusb128 result type");
-__attribute__((noinline)) static tV16QI probe82(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe103(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_paddusb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddusw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_paddusw128 result type");
-__attribute__((noinline)) static tV8HI probe83(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe104(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_paddusw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_paddw128 result type");
-__attribute__((noinline)) static tV8HI probe84(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe105(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_paddw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_paddw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_paddw256 result type");
-__attribute__((noinline)) static tV16HI probe85(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe106(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_paddw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_palignr128((tV2DI){0}, (tV2DI){0}, (int)0)), tV2DI), "__builtin_ia32_palignr128 result type");
-__attribute__((noinline)) static tV2DI probe86(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe107(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_palignr128(a0, a1, 24);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pand128((tV2DI){0}, (tV2DI){0})), tV2DI), "__builtin_ia32_pand128 result type");
-__attribute__((noinline)) static tV2DI probe87(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe108(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_pand128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pandn128((tV2DI){0}, (tV2DI){0})), tV2DI), "__builtin_ia32_pandn128 result type");
-__attribute__((noinline)) static tV2DI probe88(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe109(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_pandn128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pause()), void), "__builtin_ia32_pause result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pavgb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pavgb128 result type");
-__attribute__((noinline)) static tV16QI probe90(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe111(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pavgb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pavgw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pavgw128 result type");
-__attribute__((noinline)) static tV8HI probe91(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe112(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pavgw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pblendvb128((tV16QI){0}, (tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pblendvb128 result type");
-__attribute__((noinline)) static tV16QI probe92(tV16QI a0, tV16QI a1, tV16QI a2)
+__attribute__((noinline)) static tV16QI probe113(tV16QI a0, tV16QI a1, tV16QI a2)
 {
     return __builtin_ia32_pblendvb128(a0, a1, a2);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pblendw128((tV8HI){0}, (tV8HI){0}, (int)0)), tV8HI), "__builtin_ia32_pblendw128 result type");
-__attribute__((noinline)) static tV8HI probe93(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe114(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pblendw128(a0, a1, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pclmulqdq128((tV2DI){0}, (tV2DI){0}, (int)0)), tV2DI), "__builtin_ia32_pclmulqdq128 result type");
-__attribute__((noinline)) static tV2DI probe94(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe115(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_pclmulqdq128(a0, a1, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpeqb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pcmpeqb128 result type");
-__attribute__((noinline)) static tV16QI probe95(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe116(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pcmpeqb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpeqb256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_pcmpeqb256 result type");
-__attribute__((noinline)) static tV32QI probe96(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe117(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_pcmpeqb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpeqd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_pcmpeqd128 result type");
-__attribute__((noinline)) static tV4SI probe97(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe118(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_pcmpeqd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpeqd256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_pcmpeqd256 result type");
-__attribute__((noinline)) static tV8SI probe98(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe119(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_pcmpeqd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpeqq256((tV4DI){0}, (tV4DI){0})), tV4DI), "__builtin_ia32_pcmpeqq256 result type");
-__attribute__((noinline)) static tV4DI probe99(tV4DI a0, tV4DI a1)
+__attribute__((noinline)) static tV4DI probe120(tV4DI a0, tV4DI a1)
 {
     return __builtin_ia32_pcmpeqq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpeqw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pcmpeqw128 result type");
-__attribute__((noinline)) static tV8HI probe100(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe121(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pcmpeqw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpgtb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pcmpgtb128 result type");
-__attribute__((noinline)) static tV16QI probe101(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe122(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pcmpgtb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpgtb256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_pcmpgtb256 result type");
-__attribute__((noinline)) static tV32QI probe102(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe123(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_pcmpgtb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpgtd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_pcmpgtd128 result type");
-__attribute__((noinline)) static tV4SI probe103(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe124(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_pcmpgtd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpgtd256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_pcmpgtd256 result type");
-__attribute__((noinline)) static tV8SI probe104(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe125(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_pcmpgtd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpgtq256((tV4DI){0}, (tV4DI){0})), tV4DI), "__builtin_ia32_pcmpgtq256 result type");
-__attribute__((noinline)) static tV4DI probe105(tV4DI a0, tV4DI a1)
+__attribute__((noinline)) static tV4DI probe126(tV4DI a0, tV4DI a1)
 {
     return __builtin_ia32_pcmpgtq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pcmpgtw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pcmpgtw128 result type");
-__attribute__((noinline)) static tV8HI probe106(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe127(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pcmpgtw128(a0, a1);
 }
@@ -499,7 +560,7 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pdep_di((u
 #endif
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pdep_si((unsigned int)0, (unsigned int)0)), unsigned int), "__builtin_ia32_pdep_si result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_permvarsi256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_permvarsi256 result type");
-__attribute__((noinline)) static tV8SI probe109(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe130(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_permvarsi256(a0, a1);
 }
@@ -508,599 +569,599 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pext_di((u
 #endif
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pext_si((unsigned int)0, (unsigned int)0)), unsigned int), "__builtin_ia32_pext_si result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_phaddd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_phaddd128 result type");
-__attribute__((noinline)) static tV4SI probe112(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe133(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_phaddd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_phaddd256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_phaddd256 result type");
-__attribute__((noinline)) static tV8SI probe113(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe134(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_phaddd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_phaddsw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_phaddsw128 result type");
-__attribute__((noinline)) static tV8HI probe114(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe135(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_phaddsw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_phaddw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_phaddw128 result type");
-__attribute__((noinline)) static tV8HI probe115(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe136(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_phaddw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_phaddw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_phaddw256 result type");
-__attribute__((noinline)) static tV16HI probe116(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe137(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_phaddw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_phsubd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_phsubd128 result type");
-__attribute__((noinline)) static tV4SI probe117(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe138(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_phsubd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_phsubsw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_phsubsw128 result type");
-__attribute__((noinline)) static tV8HI probe118(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe139(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_phsubsw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_phsubw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_phsubw128 result type");
-__attribute__((noinline)) static tV8HI probe119(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe140(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_phsubw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaddubsw128((tV16QI){0}, (tV16QI){0})), tV8HI), "__builtin_ia32_pmaddubsw128 result type");
-__attribute__((noinline)) static tV8HI probe120(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV8HI probe141(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pmaddubsw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaddubsw256((tV32QI){0}, (tV32QI){0})), tV16HI), "__builtin_ia32_pmaddubsw256 result type");
-__attribute__((noinline)) static tV16HI probe121(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV16HI probe142(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_pmaddubsw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaddwd128((tV8HI){0}, (tV8HI){0})), tV4SI), "__builtin_ia32_pmaddwd128 result type");
-__attribute__((noinline)) static tV4SI probe122(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV4SI probe143(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pmaddwd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaddwd256((tV16HI){0}, (tV16HI){0})), tV8SI), "__builtin_ia32_pmaddwd256 result type");
-__attribute__((noinline)) static tV8SI probe123(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV8SI probe144(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_pmaddwd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxsb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pmaxsb128 result type");
-__attribute__((noinline)) static tV16QI probe124(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe145(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pmaxsb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxsb256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_pmaxsb256 result type");
-__attribute__((noinline)) static tV32QI probe125(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe146(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_pmaxsb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxsd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_pmaxsd128 result type");
-__attribute__((noinline)) static tV4SI probe126(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe147(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_pmaxsd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxsd256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_pmaxsd256 result type");
-__attribute__((noinline)) static tV8SI probe127(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe148(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_pmaxsd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxsw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pmaxsw128 result type");
-__attribute__((noinline)) static tV8HI probe128(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe149(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pmaxsw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxsw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_pmaxsw256 result type");
-__attribute__((noinline)) static tV16HI probe129(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe150(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_pmaxsw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxub128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pmaxub128 result type");
-__attribute__((noinline)) static tV16QI probe130(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe151(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pmaxub128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxub256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_pmaxub256 result type");
-__attribute__((noinline)) static tV32QI probe131(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe152(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_pmaxub256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxud128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_pmaxud128 result type");
-__attribute__((noinline)) static tV4SI probe132(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe153(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_pmaxud128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxud256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_pmaxud256 result type");
-__attribute__((noinline)) static tV8SI probe133(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe154(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_pmaxud256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxuw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pmaxuw128 result type");
-__attribute__((noinline)) static tV8HI probe134(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe155(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pmaxuw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmaxuw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_pmaxuw256 result type");
-__attribute__((noinline)) static tV16HI probe135(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe156(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_pmaxuw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminsb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pminsb128 result type");
-__attribute__((noinline)) static tV16QI probe136(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe157(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pminsb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminsb256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_pminsb256 result type");
-__attribute__((noinline)) static tV32QI probe137(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe158(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_pminsb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminsd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_pminsd128 result type");
-__attribute__((noinline)) static tV4SI probe138(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe159(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_pminsd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminsd256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_pminsd256 result type");
-__attribute__((noinline)) static tV8SI probe139(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe160(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_pminsd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminsw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pminsw128 result type");
-__attribute__((noinline)) static tV8HI probe140(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe161(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pminsw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminsw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_pminsw256 result type");
-__attribute__((noinline)) static tV16HI probe141(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe162(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_pminsw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminub128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pminub128 result type");
-__attribute__((noinline)) static tV16QI probe142(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe163(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pminub128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminub256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_pminub256 result type");
-__attribute__((noinline)) static tV32QI probe143(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe164(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_pminub256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminud128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_pminud128 result type");
-__attribute__((noinline)) static tV4SI probe144(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe165(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_pminud128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminud256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_pminud256 result type");
-__attribute__((noinline)) static tV8SI probe145(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe166(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_pminud256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminuw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pminuw128 result type");
-__attribute__((noinline)) static tV8HI probe146(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe167(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pminuw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pminuw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_pminuw256 result type");
-__attribute__((noinline)) static tV16HI probe147(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe168(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_pminuw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovmskb128((tV16QI){0})), int), "__builtin_ia32_pmovmskb128 result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovmskb256((tV32QI){0})), int), "__builtin_ia32_pmovmskb256 result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovsxbd256((tV16QI){0})), tV8SI), "__builtin_ia32_pmovsxbd256 result type");
-__attribute__((noinline)) static tV8SI probe150(tV16QI a0)
+__attribute__((noinline)) static tV8SI probe171(tV16QI a0)
 {
     return __builtin_ia32_pmovsxbd256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovsxbw256((tV16QI){0})), tV16HI), "__builtin_ia32_pmovsxbw256 result type");
-__attribute__((noinline)) static tV16HI probe151(tV16QI a0)
+__attribute__((noinline)) static tV16HI probe172(tV16QI a0)
 {
     return __builtin_ia32_pmovsxbw256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovsxwd256((tV8HI){0})), tV8SI), "__builtin_ia32_pmovsxwd256 result type");
-__attribute__((noinline)) static tV8SI probe152(tV8HI a0)
+__attribute__((noinline)) static tV8SI probe173(tV8HI a0)
 {
     return __builtin_ia32_pmovsxwd256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovzxbd256((tV16QI){0})), tV8SI), "__builtin_ia32_pmovzxbd256 result type");
-__attribute__((noinline)) static tV8SI probe153(tV16QI a0)
+__attribute__((noinline)) static tV8SI probe174(tV16QI a0)
 {
     return __builtin_ia32_pmovzxbd256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovzxbw128((tV16QI){0})), tV8HI), "__builtin_ia32_pmovzxbw128 result type");
-__attribute__((noinline)) static tV8HI probe154(tV16QI a0)
+__attribute__((noinline)) static tV8HI probe175(tV16QI a0)
 {
     return __builtin_ia32_pmovzxbw128(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovzxbw256((tV16QI){0})), tV16HI), "__builtin_ia32_pmovzxbw256 result type");
-__attribute__((noinline)) static tV16HI probe155(tV16QI a0)
+__attribute__((noinline)) static tV16HI probe176(tV16QI a0)
 {
     return __builtin_ia32_pmovzxbw256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovzxwd128((tV8HI){0})), tV4SI), "__builtin_ia32_pmovzxwd128 result type");
-__attribute__((noinline)) static tV4SI probe156(tV8HI a0)
+__attribute__((noinline)) static tV4SI probe177(tV8HI a0)
 {
     return __builtin_ia32_pmovzxwd128(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmovzxwd256((tV8HI){0})), tV8SI), "__builtin_ia32_pmovzxwd256 result type");
-__attribute__((noinline)) static tV8SI probe157(tV8HI a0)
+__attribute__((noinline)) static tV8SI probe178(tV8HI a0)
 {
     return __builtin_ia32_pmovzxwd256(a0);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmulhrsw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pmulhrsw128 result type");
-__attribute__((noinline)) static tV8HI probe158(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe179(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pmulhrsw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmulhuw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pmulhuw128 result type");
-__attribute__((noinline)) static tV8HI probe159(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe180(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pmulhuw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmulhw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pmulhw128 result type");
-__attribute__((noinline)) static tV8HI probe160(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe181(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pmulhw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmulhw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_pmulhw256 result type");
-__attribute__((noinline)) static tV16HI probe161(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe182(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_pmulhw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmulld128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_pmulld128 result type");
-__attribute__((noinline)) static tV4SI probe162(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe183(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_pmulld128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmulld256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_pmulld256 result type");
-__attribute__((noinline)) static tV8SI probe163(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe184(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_pmulld256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmullw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_pmullw128 result type");
-__attribute__((noinline)) static tV8HI probe164(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe185(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_pmullw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmullw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_pmullw256 result type");
-__attribute__((noinline)) static tV16HI probe165(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe186(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_pmullw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pmuludq256((tV8SI){0}, (tV8SI){0})), tV4DI), "__builtin_ia32_pmuludq256 result type");
-__attribute__((noinline)) static tV4DI probe166(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV4DI probe187(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_pmuludq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_por128((tV2DI){0}, (tV2DI){0})), tV2DI), "__builtin_ia32_por128 result type");
-__attribute__((noinline)) static tV2DI probe167(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe188(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_por128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_por256((tV4DI){0}, (tV4DI){0})), tV4DI), "__builtin_ia32_por256 result type");
-__attribute__((noinline)) static tV4DI probe168(tV4DI a0, tV4DI a1)
+__attribute__((noinline)) static tV4DI probe189(tV4DI a0, tV4DI a1)
 {
     return __builtin_ia32_por256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psadbw128((tV16QI){0}, (tV16QI){0})), tV2DI), "__builtin_ia32_psadbw128 result type");
-__attribute__((noinline)) static tV2DI probe169(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV2DI probe190(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_psadbw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psadbw256((tV32QI){0}, (tV32QI){0})), tV4DI), "__builtin_ia32_psadbw256 result type");
-__attribute__((noinline)) static tV4DI probe170(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV4DI probe191(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_psadbw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pshufb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_pshufb128 result type");
-__attribute__((noinline)) static tV16QI probe171(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe192(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_pshufb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pshufb256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_pshufb256 result type");
-__attribute__((noinline)) static tV32QI probe172(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe193(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_pshufb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pshufd((tV4SI){0}, (int)0)), tV4SI), "__builtin_ia32_pshufd result type");
-__attribute__((noinline)) static tV4SI probe173(tV4SI a0)
+__attribute__((noinline)) static tV4SI probe194(tV4SI a0)
 {
     return __builtin_ia32_pshufd(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pshufd256((tV8SI){0}, (int)0)), tV8SI), "__builtin_ia32_pshufd256 result type");
-__attribute__((noinline)) static tV8SI probe174(tV8SI a0)
+__attribute__((noinline)) static tV8SI probe195(tV8SI a0)
 {
     return __builtin_ia32_pshufd256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pshufhw((tV8HI){0}, (int)0)), tV8HI), "__builtin_ia32_pshufhw result type");
-__attribute__((noinline)) static tV8HI probe175(tV8HI a0)
+__attribute__((noinline)) static tV8HI probe196(tV8HI a0)
 {
     return __builtin_ia32_pshufhw(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pshuflw((tV8HI){0}, (int)0)), tV8HI), "__builtin_ia32_pshuflw result type");
-__attribute__((noinline)) static tV8HI probe176(tV8HI a0)
+__attribute__((noinline)) static tV8HI probe197(tV8HI a0)
 {
     return __builtin_ia32_pshuflw(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psignb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_psignb128 result type");
-__attribute__((noinline)) static tV16QI probe177(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe198(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_psignb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psignd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_psignd128 result type");
-__attribute__((noinline)) static tV4SI probe178(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe199(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_psignd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psignw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_psignw128 result type");
-__attribute__((noinline)) static tV8HI probe179(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe200(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_psignw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pslldi128((tV4SI){0}, (int)0)), tV4SI), "__builtin_ia32_pslldi128 result type");
-__attribute__((noinline)) static tV4SI probe180(tV4SI a0)
+__attribute__((noinline)) static tV4SI probe201(tV4SI a0)
 {
     return __builtin_ia32_pslldi128(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pslldi256((tV8SI){0}, (int)0)), tV8SI), "__builtin_ia32_pslldi256 result type");
-__attribute__((noinline)) static tV8SI probe181(tV8SI a0)
+__attribute__((noinline)) static tV8SI probe202(tV8SI a0)
 {
     return __builtin_ia32_pslldi256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pslldqi128((tV2DI){0}, (int)0)), tV2DI), "__builtin_ia32_pslldqi128 result type");
-__attribute__((noinline)) static tV2DI probe182(tV2DI a0)
+__attribute__((noinline)) static tV2DI probe203(tV2DI a0)
 {
     return __builtin_ia32_pslldqi128(a0, 24);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pslldqi256((tV4DI){0}, (int)0)), tV4DI), "__builtin_ia32_pslldqi256 result type");
-__attribute__((noinline)) static tV4DI probe183(tV4DI a0)
+__attribute__((noinline)) static tV4DI probe204(tV4DI a0)
 {
     return __builtin_ia32_pslldqi256(a0, 24);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psllqi128((tV2DI){0}, (int)0)), tV2DI), "__builtin_ia32_psllqi128 result type");
-__attribute__((noinline)) static tV2DI probe184(tV2DI a0)
+__attribute__((noinline)) static tV2DI probe205(tV2DI a0)
 {
     return __builtin_ia32_psllqi128(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psllqi256((tV4DI){0}, (int)0)), tV4DI), "__builtin_ia32_psllqi256 result type");
-__attribute__((noinline)) static tV4DI probe185(tV4DI a0)
+__attribute__((noinline)) static tV4DI probe206(tV4DI a0)
 {
     return __builtin_ia32_psllqi256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psllw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_psllw128 result type");
-__attribute__((noinline)) static tV8HI probe186(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe207(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_psllw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psllwi128((tV8HI){0}, (int)0)), tV8HI), "__builtin_ia32_psllwi128 result type");
-__attribute__((noinline)) static tV8HI probe187(tV8HI a0)
+__attribute__((noinline)) static tV8HI probe208(tV8HI a0)
 {
     return __builtin_ia32_psllwi128(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psllwi256((tV16HI){0}, (int)0)), tV16HI), "__builtin_ia32_psllwi256 result type");
-__attribute__((noinline)) static tV16HI probe188(tV16HI a0)
+__attribute__((noinline)) static tV16HI probe209(tV16HI a0)
 {
     return __builtin_ia32_psllwi256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psradi128((tV4SI){0}, (int)0)), tV4SI), "__builtin_ia32_psradi128 result type");
-__attribute__((noinline)) static tV4SI probe189(tV4SI a0)
+__attribute__((noinline)) static tV4SI probe210(tV4SI a0)
 {
     return __builtin_ia32_psradi128(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psradi256((tV8SI){0}, (int)0)), tV8SI), "__builtin_ia32_psradi256 result type");
-__attribute__((noinline)) static tV8SI probe190(tV8SI a0)
+__attribute__((noinline)) static tV8SI probe211(tV8SI a0)
 {
     return __builtin_ia32_psradi256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrawi128((tV8HI){0}, (int)0)), tV8HI), "__builtin_ia32_psrawi128 result type");
-__attribute__((noinline)) static tV8HI probe191(tV8HI a0)
+__attribute__((noinline)) static tV8HI probe212(tV8HI a0)
 {
     return __builtin_ia32_psrawi128(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrawi256((tV16HI){0}, (int)0)), tV16HI), "__builtin_ia32_psrawi256 result type");
-__attribute__((noinline)) static tV16HI probe192(tV16HI a0)
+__attribute__((noinline)) static tV16HI probe213(tV16HI a0)
 {
     return __builtin_ia32_psrawi256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrldi128((tV4SI){0}, (int)0)), tV4SI), "__builtin_ia32_psrldi128 result type");
-__attribute__((noinline)) static tV4SI probe193(tV4SI a0)
+__attribute__((noinline)) static tV4SI probe214(tV4SI a0)
 {
     return __builtin_ia32_psrldi128(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrldi256((tV8SI){0}, (int)0)), tV8SI), "__builtin_ia32_psrldi256 result type");
-__attribute__((noinline)) static tV8SI probe194(tV8SI a0)
+__attribute__((noinline)) static tV8SI probe215(tV8SI a0)
 {
     return __builtin_ia32_psrldi256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrldqi128((tV2DI){0}, (int)0)), tV2DI), "__builtin_ia32_psrldqi128 result type");
-__attribute__((noinline)) static tV2DI probe195(tV2DI a0)
+__attribute__((noinline)) static tV2DI probe216(tV2DI a0)
 {
     return __builtin_ia32_psrldqi128(a0, 24);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrldqi256((tV4DI){0}, (int)0)), tV4DI), "__builtin_ia32_psrldqi256 result type");
-__attribute__((noinline)) static tV4DI probe196(tV4DI a0)
+__attribute__((noinline)) static tV4DI probe217(tV4DI a0)
 {
     return __builtin_ia32_psrldqi256(a0, 24);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrlqi128((tV2DI){0}, (int)0)), tV2DI), "__builtin_ia32_psrlqi128 result type");
-__attribute__((noinline)) static tV2DI probe197(tV2DI a0)
+__attribute__((noinline)) static tV2DI probe218(tV2DI a0)
 {
     return __builtin_ia32_psrlqi128(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrlqi256((tV4DI){0}, (int)0)), tV4DI), "__builtin_ia32_psrlqi256 result type");
-__attribute__((noinline)) static tV4DI probe198(tV4DI a0)
+__attribute__((noinline)) static tV4DI probe219(tV4DI a0)
 {
     return __builtin_ia32_psrlqi256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrlw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_psrlw128 result type");
-__attribute__((noinline)) static tV8HI probe199(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe220(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_psrlw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrlwi128((tV8HI){0}, (int)0)), tV8HI), "__builtin_ia32_psrlwi128 result type");
-__attribute__((noinline)) static tV8HI probe200(tV8HI a0)
+__attribute__((noinline)) static tV8HI probe221(tV8HI a0)
 {
     return __builtin_ia32_psrlwi128(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psrlwi256((tV16HI){0}, (int)0)), tV16HI), "__builtin_ia32_psrlwi256 result type");
-__attribute__((noinline)) static tV16HI probe201(tV16HI a0)
+__attribute__((noinline)) static tV16HI probe222(tV16HI a0)
 {
     return __builtin_ia32_psrlwi256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_psubb128 result type");
-__attribute__((noinline)) static tV16QI probe202(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe223(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_psubb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubb256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_psubb256 result type");
-__attribute__((noinline)) static tV32QI probe203(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe224(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_psubb256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubd128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_psubd128 result type");
-__attribute__((noinline)) static tV4SI probe204(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe225(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_psubd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubd256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_psubd256 result type");
-__attribute__((noinline)) static tV8SI probe205(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe226(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_psubd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubq128((tV2DI){0}, (tV2DI){0})), tV2DI), "__builtin_ia32_psubq128 result type");
-__attribute__((noinline)) static tV2DI probe206(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe227(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_psubq128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubq256((tV4DI){0}, (tV4DI){0})), tV4DI), "__builtin_ia32_psubq256 result type");
-__attribute__((noinline)) static tV4DI probe207(tV4DI a0, tV4DI a1)
+__attribute__((noinline)) static tV4DI probe228(tV4DI a0, tV4DI a1)
 {
     return __builtin_ia32_psubq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubsb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_psubsb128 result type");
-__attribute__((noinline)) static tV16QI probe208(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe229(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_psubsb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubsw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_psubsw128 result type");
-__attribute__((noinline)) static tV8HI probe209(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe230(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_psubsw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubusb128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_psubusb128 result type");
-__attribute__((noinline)) static tV16QI probe210(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe231(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_psubusb128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubusw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_psubusw128 result type");
-__attribute__((noinline)) static tV8HI probe211(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe232(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_psubusw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubusw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_psubusw256 result type");
-__attribute__((noinline)) static tV16HI probe212(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe233(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_psubusw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubw128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_psubw128 result type");
-__attribute__((noinline)) static tV8HI probe213(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe234(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_psubw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_psubw256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_psubw256 result type");
-__attribute__((noinline)) static tV16HI probe214(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe235(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_psubw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckhbw128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_punpckhbw128 result type");
-__attribute__((noinline)) static tV16QI probe215(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe236(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_punpckhbw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckhbw256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_punpckhbw256 result type");
-__attribute__((noinline)) static tV32QI probe216(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe237(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_punpckhbw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckhdq128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_punpckhdq128 result type");
-__attribute__((noinline)) static tV4SI probe217(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe238(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_punpckhdq128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckhdq256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_punpckhdq256 result type");
-__attribute__((noinline)) static tV8SI probe218(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe239(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_punpckhdq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckhqdq128((tV2DI){0}, (tV2DI){0})), tV2DI), "__builtin_ia32_punpckhqdq128 result type");
-__attribute__((noinline)) static tV2DI probe219(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe240(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_punpckhqdq128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckhqdq256((tV4DI){0}, (tV4DI){0})), tV4DI), "__builtin_ia32_punpckhqdq256 result type");
-__attribute__((noinline)) static tV4DI probe220(tV4DI a0, tV4DI a1)
+__attribute__((noinline)) static tV4DI probe241(tV4DI a0, tV4DI a1)
 {
     return __builtin_ia32_punpckhqdq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckhwd128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_punpckhwd128 result type");
-__attribute__((noinline)) static tV8HI probe221(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe242(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_punpckhwd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckhwd256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_punpckhwd256 result type");
-__attribute__((noinline)) static tV16HI probe222(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe243(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_punpckhwd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpcklbw128((tV16QI){0}, (tV16QI){0})), tV16QI), "__builtin_ia32_punpcklbw128 result type");
-__attribute__((noinline)) static tV16QI probe223(tV16QI a0, tV16QI a1)
+__attribute__((noinline)) static tV16QI probe244(tV16QI a0, tV16QI a1)
 {
     return __builtin_ia32_punpcklbw128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpcklbw256((tV32QI){0}, (tV32QI){0})), tV32QI), "__builtin_ia32_punpcklbw256 result type");
-__attribute__((noinline)) static tV32QI probe224(tV32QI a0, tV32QI a1)
+__attribute__((noinline)) static tV32QI probe245(tV32QI a0, tV32QI a1)
 {
     return __builtin_ia32_punpcklbw256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckldq128((tV4SI){0}, (tV4SI){0})), tV4SI), "__builtin_ia32_punpckldq128 result type");
-__attribute__((noinline)) static tV4SI probe225(tV4SI a0, tV4SI a1)
+__attribute__((noinline)) static tV4SI probe246(tV4SI a0, tV4SI a1)
 {
     return __builtin_ia32_punpckldq128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpckldq256((tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_punpckldq256 result type");
-__attribute__((noinline)) static tV8SI probe226(tV8SI a0, tV8SI a1)
+__attribute__((noinline)) static tV8SI probe247(tV8SI a0, tV8SI a1)
 {
     return __builtin_ia32_punpckldq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpcklqdq128((tV2DI){0}, (tV2DI){0})), tV2DI), "__builtin_ia32_punpcklqdq128 result type");
-__attribute__((noinline)) static tV2DI probe227(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe248(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_punpcklqdq128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpcklqdq256((tV4DI){0}, (tV4DI){0})), tV4DI), "__builtin_ia32_punpcklqdq256 result type");
-__attribute__((noinline)) static tV4DI probe228(tV4DI a0, tV4DI a1)
+__attribute__((noinline)) static tV4DI probe249(tV4DI a0, tV4DI a1)
 {
     return __builtin_ia32_punpcklqdq256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpcklwd128((tV8HI){0}, (tV8HI){0})), tV8HI), "__builtin_ia32_punpcklwd128 result type");
-__attribute__((noinline)) static tV8HI probe229(tV8HI a0, tV8HI a1)
+__attribute__((noinline)) static tV8HI probe250(tV8HI a0, tV8HI a1)
 {
     return __builtin_ia32_punpcklwd128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_punpcklwd256((tV16HI){0}, (tV16HI){0})), tV16HI), "__builtin_ia32_punpcklwd256 result type");
-__attribute__((noinline)) static tV16HI probe230(tV16HI a0, tV16HI a1)
+__attribute__((noinline)) static tV16HI probe251(tV16HI a0, tV16HI a1)
 {
     return __builtin_ia32_punpcklwd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pxor128((tV2DI){0}, (tV2DI){0})), tV2DI), "__builtin_ia32_pxor128 result type");
-__attribute__((noinline)) static tV2DI probe231(tV2DI a0, tV2DI a1)
+__attribute__((noinline)) static tV2DI probe252(tV2DI a0, tV2DI a1)
 {
     return __builtin_ia32_pxor128(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_pxor256((tV4DI){0}, (tV4DI){0})), tV4DI), "__builtin_ia32_pxor256 result type");
-__attribute__((noinline)) static tV4DI probe232(tV4DI a0, tV4DI a1)
+__attribute__((noinline)) static tV4DI probe253(tV4DI a0, tV4DI a1)
 {
     return __builtin_ia32_pxor256(a0, a1);
 }
@@ -1108,7 +1169,7 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_rdtsc()), 
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_rdtscp((unsigned int *)0)), unsigned long long), "__builtin_ia32_rdtscp result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_sfence()), void), "__builtin_ia32_sfence result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_shufps((tV4SF){0}, (tV4SF){0}, (int)0)), tV4SF), "__builtin_ia32_shufps result type");
-__attribute__((noinline)) static tV4SF probe236(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe257(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_shufps(a0, a1, 1);
 }
@@ -1117,62 +1178,62 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_storedqu25
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_storeupd256((double *)0, (tV4DF){0})), void), "__builtin_ia32_storeupd256 result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_storeups256((float *)0, (tV8SF){0})), void), "__builtin_ia32_storeups256 result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_subpd((tV2DF){0}, (tV2DF){0})), tV2DF), "__builtin_ia32_subpd result type");
-__attribute__((noinline)) static tV2DF probe241(tV2DF a0, tV2DF a1)
+__attribute__((noinline)) static tV2DF probe262(tV2DF a0, tV2DF a1)
 {
     return __builtin_ia32_subpd(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_subpd256((tV4DF){0}, (tV4DF){0})), tV4DF), "__builtin_ia32_subpd256 result type");
-__attribute__((noinline)) static tV4DF probe242(tV4DF a0, tV4DF a1)
+__attribute__((noinline)) static tV4DF probe263(tV4DF a0, tV4DF a1)
 {
     return __builtin_ia32_subpd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_subps((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_subps result type");
-__attribute__((noinline)) static tV4SF probe243(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe264(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_subps(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_subps256((tV8SF){0}, (tV8SF){0})), tV8SF), "__builtin_ia32_subps256 result type");
-__attribute__((noinline)) static tV8SF probe244(tV8SF a0, tV8SF a1)
+__attribute__((noinline)) static tV8SF probe265(tV8SF a0, tV8SF a1)
 {
     return __builtin_ia32_subps256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_subsd((tV2DF){0}, (tV2DF){0})), tV2DF), "__builtin_ia32_subsd result type");
-__attribute__((noinline)) static tV2DF probe245(tV2DF a0, tV2DF a1)
+__attribute__((noinline)) static tV2DF probe266(tV2DF a0, tV2DF a1)
 {
     return __builtin_ia32_subsd(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_subss((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_subss result type");
-__attribute__((noinline)) static tV4SF probe246(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe267(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_subss(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vextractf128_pd256((tV4DF){0}, (int)0)), tV2DF), "__builtin_ia32_vextractf128_pd256 result type");
-__attribute__((noinline)) static tV2DF probe247(tV4DF a0)
+__attribute__((noinline)) static tV2DF probe268(tV4DF a0)
 {
     return __builtin_ia32_vextractf128_pd256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vextractf128_ps256((tV8SF){0}, (int)0)), tV4SF), "__builtin_ia32_vextractf128_ps256 result type");
-__attribute__((noinline)) static tV4SF probe248(tV8SF a0)
+__attribute__((noinline)) static tV4SF probe269(tV8SF a0)
 {
     return __builtin_ia32_vextractf128_ps256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vextractf128_si256((tV8SI){0}, (int)0)), tV4SI), "__builtin_ia32_vextractf128_si256 result type");
-__attribute__((noinline)) static tV4SI probe249(tV8SI a0)
+__attribute__((noinline)) static tV4SI probe270(tV8SI a0)
 {
     return __builtin_ia32_vextractf128_si256(a0, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vinsertf128_pd256((tV4DF){0}, (tV2DF){0}, (int)0)), tV4DF), "__builtin_ia32_vinsertf128_pd256 result type");
-__attribute__((noinline)) static tV4DF probe250(tV4DF a0, tV2DF a1)
+__attribute__((noinline)) static tV4DF probe271(tV4DF a0, tV2DF a1)
 {
     return __builtin_ia32_vinsertf128_pd256(a0, a1, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vinsertf128_ps256((tV8SF){0}, (tV4SF){0}, (int)0)), tV8SF), "__builtin_ia32_vinsertf128_ps256 result type");
-__attribute__((noinline)) static tV8SF probe251(tV8SF a0, tV4SF a1)
+__attribute__((noinline)) static tV8SF probe272(tV8SF a0, tV4SF a1)
 {
     return __builtin_ia32_vinsertf128_ps256(a0, a1, 1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vinsertf128_si256((tV8SI){0}, (tV4SI){0}, (int)0)), tV8SI), "__builtin_ia32_vinsertf128_si256 result type");
-__attribute__((noinline)) static tV8SI probe252(tV8SI a0, tV4SI a1)
+__attribute__((noinline)) static tV8SI probe273(tV8SI a0, tV4SI a1)
 {
     return __builtin_ia32_vinsertf128_si256(a0, a1, 1);
 }
@@ -1198,22 +1259,22 @@ _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vpdpwuuds1
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vpdpwuuds256((tV8SI){0}, (tV8SI){0}, (tV8SI){0})), tV8SI), "__builtin_ia32_vpdpwuuds256 result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_vzeroupper()), void), "__builtin_ia32_vzeroupper result type");
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_xorpd((tV2DF){0}, (tV2DF){0})), tV2DF), "__builtin_ia32_xorpd result type");
-__attribute__((noinline)) static tV2DF probe274(tV2DF a0, tV2DF a1)
+__attribute__((noinline)) static tV2DF probe295(tV2DF a0, tV2DF a1)
 {
     return __builtin_ia32_xorpd(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_xorpd256((tV4DF){0}, (tV4DF){0})), tV4DF), "__builtin_ia32_xorpd256 result type");
-__attribute__((noinline)) static tV4DF probe275(tV4DF a0, tV4DF a1)
+__attribute__((noinline)) static tV4DF probe296(tV4DF a0, tV4DF a1)
 {
     return __builtin_ia32_xorpd256(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_xorps((tV4SF){0}, (tV4SF){0})), tV4SF), "__builtin_ia32_xorps result type");
-__attribute__((noinline)) static tV4SF probe276(tV4SF a0, tV4SF a1)
+__attribute__((noinline)) static tV4SF probe297(tV4SF a0, tV4SF a1)
 {
     return __builtin_ia32_xorps(a0, a1);
 }
 _Static_assert(__builtin_types_compatible_p(__typeof__(__builtin_ia32_xorps256((tV8SF){0}, (tV8SF){0})), tV8SF), "__builtin_ia32_xorps256 result type");
-__attribute__((noinline)) static tV8SF probe277(tV8SF a0, tV8SF a1)
+__attribute__((noinline)) static tV8SF probe298(tV8SF a0, tV8SF a1)
 {
     return __builtin_ia32_xorps256(a0, a1);
 }
@@ -1548,11 +1609,9 @@ int main(void)
         puts("");
     }
     {
-        tV4SF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SF a1;
+        tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe38(a0, a1);
+        tV4SI result = probe38((const tV4SI *)storage, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("38:");
@@ -1560,11 +1619,9 @@ int main(void)
         puts("");
     }
     {
-        tV8SF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SF a1;
+        tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SF result = probe39(a0, a1);
+        tV8SI result = probe39((const tV8SI *)storage, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("39:");
@@ -1572,11 +1629,9 @@ int main(void)
         puts("");
     }
     {
-        tV2DF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DF a1;
+        tV2DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DF result = probe40(a0, a1);
+        tV2DF result = probe40((const tV2DF *)storage, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("40:");
@@ -1584,11 +1639,9 @@ int main(void)
         puts("");
     }
     {
-        tV4SF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SF a1;
+        tV4DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe41(a0, a1);
+        tV4DF result = probe41((const tV4DF *)storage, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("41:");
@@ -1596,11 +1649,9 @@ int main(void)
         puts("");
     }
     {
-        tV4SF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SF a1;
+        tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe42(a0, a1);
+        tV4SF result = probe42((const tV4SF *)storage, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("42:");
@@ -1608,11 +1659,9 @@ int main(void)
         puts("");
     }
     {
-        tV8SF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SF a1;
+        tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SF result = probe43(a0, a1);
+        tV8SF result = probe43((const tV8SF *)storage, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("43:");
@@ -1620,11 +1669,9 @@ int main(void)
         puts("");
     }
     {
-        tV2DF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DF a1;
+        tV2DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DF result = probe44(a0, a1);
+        tV2DI result = probe44((const tV2DI *)storage, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("44:");
@@ -1632,38 +1679,12 @@ int main(void)
         puts("");
     }
     {
-        tV4SF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SF a1;
+        tV4DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe45(a0, a1);
+        tV4DI result = probe45((const tV4DI *)storage, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("45:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV2DF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DF a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DF result = probe52(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("52:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4DF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DF a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DF result = probe53(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("53:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -1716,38 +1737,14 @@ int main(void)
         puts("");
     }
     {
-        tV2DF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DF a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DF result = probe58(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("58:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4DF a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DF a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DF result = probe59(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("59:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
         tV4SF a0;
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe60(a0, a1);
+        tV4SF result = probe58(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("60:");
+        printf("58:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -1756,7 +1753,31 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SF result = probe61(a0, a1);
+        tV8SF result = probe59(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("59:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DF result = probe60(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("60:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SF result = probe61(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("61:");
@@ -1764,29 +1785,7 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI result = probe62(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("62:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV32QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI result = probe63(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("63:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI result = probe64(a0);
+        tV2DI result = probe64((tV2DI *)storage);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("64:");
@@ -1794,9 +1793,7 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI result = probe65(a0);
+        tV4DI result = probe65((tV4DI *)storage);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("65:");
@@ -1804,91 +1801,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV2DF a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI result = probe66(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("66:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI result = probe67(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("67:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
+        tV2DF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe68(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("68:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe69(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("69:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe70(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("70:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe71(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("71:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe72(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("72:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe73(a0, a1);
+        tV2DF result = probe73(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("73:");
@@ -1896,11 +1813,11 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV4DF a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
+        tV4DF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe74(a0, a1);
+        tV4DF result = probe74(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("74:");
@@ -1908,14 +1825,158 @@ int main(void)
         puts("");
     }
     {
-        tV32QI a0;
+        tV4SF a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
+        tV4SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe75(a0, a1);
+        tV4SF result = probe75(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("75:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8SF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8SF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8SF result = probe76(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("76:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DF result = probe77(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("77:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SF result = probe78(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("78:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DF result = probe79(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("79:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4DF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4DF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4DF result = probe80(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("80:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SF result = probe81(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("81:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8SF a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8SF a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8SF result = probe82(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("82:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16QI result = probe83(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("83:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV32QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV32QI result = probe84(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("84:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SI result = probe85(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("85:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8SI result = probe86(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("86:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI result = probe87(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("87:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16HI result = probe88(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("88:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -1924,10 +1985,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe76(a0, a1);
+        tV8HI result = probe89(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("76:");
+        printf("89:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -1936,151 +1997,7 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe77(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("77:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV2DI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe78(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("78:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4DI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe79(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("79:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe80(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("80:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe81(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("81:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe82(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("82:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe83(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("83:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe84(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("84:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe85(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("85:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV2DI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe86(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("86:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV2DI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe87(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("87:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV2DI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe88(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("88:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe90(a0, a1);
+        tV16HI result = probe90(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("90:");
@@ -2092,7 +2009,7 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe91(a0, a1);
+        tV16QI result = probe91(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("91:");
@@ -2100,13 +2017,11 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV16HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
+        tV16HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI a2;
-        memcpy(&a2, storage + 14, sizeof(a2));
-        tV16QI result = probe92(a0, a1, a2);
+        tV32QI result = probe92(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("92:");
@@ -2118,7 +2033,7 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe93(a0, a1);
+        tV16QI result = probe93(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("93:");
@@ -2126,11 +2041,11 @@ int main(void)
         puts("");
     }
     {
-        tV2DI a0;
+        tV16HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI a1;
+        tV16HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe94(a0, a1);
+        tV32QI result = probe94(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("94:");
@@ -2186,11 +2101,11 @@ int main(void)
         puts("");
     }
     {
-        tV4DI a0;
+        tV2DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI a1;
+        tV2DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe99(a0, a1);
+        tV2DI result = probe99(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("99:");
@@ -2198,11 +2113,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV4DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
+        tV4DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe100(a0, a1);
+        tV4DI result = probe100(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("100:");
@@ -2222,11 +2137,11 @@ int main(void)
         puts("");
     }
     {
-        tV32QI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
+        tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe102(a0, a1);
+        tV8HI result = probe102(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("102:");
@@ -2234,38 +2149,14 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
+        tV16QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe103(a0, a1);
+        tV16QI result = probe103(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("103:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe104(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("104:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4DI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe105(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("105:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2274,7 +2165,31 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe106(a0, a1);
+        tV8HI result = probe104(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("104:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe105(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("105:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16HI result = probe106(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("106:");
@@ -2282,11 +2197,35 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV2DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
+        tV2DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe109(a0, a1);
+        tV2DI result = probe107(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("107:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DI result = probe108(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("108:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DI result = probe109(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("109:");
@@ -2294,11 +2233,23 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
+        tV16QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe112(a0, a1);
+        tV16QI result = probe111(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("111:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe112(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("112:");
@@ -2306,11 +2257,13 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
+        tV16QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe113(a0, a1);
+        tV16QI a2;
+        memcpy(&a2, storage + 14, sizeof(a2));
+        tV16QI result = probe113(a0, a1, a2);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("113:");
@@ -2330,11 +2283,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV2DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
+        tV2DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe115(a0, a1);
+        tV2DI result = probe115(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("115:");
@@ -2342,11 +2295,11 @@ int main(void)
         puts("");
     }
     {
-        tV16HI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
+        tV16QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe116(a0, a1);
+        tV16QI result = probe116(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("116:");
@@ -2354,11 +2307,11 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV32QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
+        tV32QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe117(a0, a1);
+        tV32QI result = probe117(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("117:");
@@ -2366,11 +2319,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV4SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
+        tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe118(a0, a1);
+        tV4SI result = probe118(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("118:");
@@ -2378,11 +2331,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
+        tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe119(a0, a1);
+        tV8SI result = probe119(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("119:");
@@ -2390,11 +2343,11 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV4DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
+        tV4DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe120(a0, a1);
+        tV4DI result = probe120(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("120:");
@@ -2402,11 +2355,11 @@ int main(void)
         puts("");
     }
     {
-        tV32QI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
+        tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe121(a0, a1);
+        tV8HI result = probe121(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("121:");
@@ -2414,11 +2367,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
+        tV16QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe122(a0, a1);
+        tV16QI result = probe122(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("122:");
@@ -2426,11 +2379,11 @@ int main(void)
         puts("");
     }
     {
-        tV16HI a0;
+        tV32QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
+        tV32QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe123(a0, a1);
+        tV32QI result = probe123(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("123:");
@@ -2438,11 +2391,11 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV4SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
+        tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe124(a0, a1);
+        tV4SI result = probe124(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("124:");
@@ -2450,11 +2403,11 @@ int main(void)
         puts("");
     }
     {
-        tV32QI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
+        tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe125(a0, a1);
+        tV8SI result = probe125(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("125:");
@@ -2462,11 +2415,11 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV4DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
+        tV4DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe126(a0, a1);
+        tV4DI result = probe126(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("126:");
@@ -2474,11 +2427,11 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
+        tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe127(a0, a1);
+        tV8HI result = probe127(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("127:");
@@ -2486,50 +2439,14 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
+        tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe128(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("128:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe129(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("129:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe130(a0, a1);
+        tV8SI result = probe130(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("130:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV32QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe131(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("131:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2538,10 +2455,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe132(a0, a1);
+        tV4SI result = probe133(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("132:");
+        printf("133:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2550,10 +2467,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe133(a0, a1);
+        tV8SI result = probe134(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("133:");
+        printf("134:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2562,10 +2479,22 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe134(a0, a1);
+        tV8HI result = probe135(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("134:");
+        printf("135:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe136(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("136:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2574,31 +2503,7 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV16HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe135(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("135:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe136(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("136:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV32QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe137(a0, a1);
+        tV16HI result = probe137(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("137:");
@@ -2618,11 +2523,11 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
+        tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe139(a0, a1);
+        tV8HI result = probe139(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("139:");
@@ -2642,26 +2547,14 @@ int main(void)
         puts("");
     }
     {
-        tV16HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe141(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("141:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
         tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
         tV16QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe142(a0, a1);
+        tV8HI result = probe141(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("142:");
+        printf("141:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2670,34 +2563,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV32QI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe143(a0, a1);
+        tV16HI result = probe142(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("143:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe144(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("144:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe145(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("145:");
+        printf("142:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2706,10 +2575,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe146(a0, a1);
+        tV4SI result = probe143(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("146:");
+        printf("143:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2718,7 +2587,43 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV16HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe147(a0, a1);
+        tV8SI result = probe144(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("144:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe145(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("145:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV32QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV32QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV32QI result = probe146(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("146:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SI result = probe147(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("147:");
@@ -2726,9 +2631,35 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI result = probe150(a0);
+        tV8SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8SI result = probe148(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("148:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe149(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("149:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16HI result = probe150(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("150:");
@@ -2738,7 +2669,9 @@ int main(void)
     {
         tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI result = probe151(a0);
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe151(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("151:");
@@ -2746,110 +2679,14 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV32QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI result = probe152(a0);
+        tV32QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV32QI result = probe152(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("152:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI result = probe153(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("153:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI result = probe154(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("154:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI result = probe155(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("155:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI result = probe156(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("156:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI result = probe157(a0);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("157:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe158(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("158:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe159(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("159:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe160(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("160:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe161(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("161:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2858,10 +2695,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe162(a0, a1);
+        tV4SI result = probe153(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("162:");
+        printf("153:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2870,10 +2707,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe163(a0, a1);
+        tV8SI result = probe154(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("163:");
+        printf("154:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2882,10 +2719,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe164(a0, a1);
+        tV8HI result = probe155(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("164:");
+        printf("155:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -2894,7 +2731,115 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV16HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe165(a0, a1);
+        tV16HI result = probe156(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("156:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe157(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("157:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV32QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV32QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV32QI result = probe158(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("158:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SI result = probe159(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("159:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8SI result = probe160(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("160:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe161(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("161:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16HI result = probe162(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("162:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe163(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("163:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV32QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV32QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV32QI result = probe164(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("164:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SI result = probe165(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("165:");
@@ -2906,7 +2851,7 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe166(a0, a1);
+        tV8SI result = probe166(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("166:");
@@ -2914,11 +2859,11 @@ int main(void)
         puts("");
     }
     {
-        tV2DI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI a1;
+        tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe167(a0, a1);
+        tV8HI result = probe167(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("167:");
@@ -2926,11 +2871,11 @@ int main(void)
         puts("");
     }
     {
-        tV4DI a0;
+        tV16HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI a1;
+        tV16HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe168(a0, a1);
+        tV16HI result = probe168(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("168:");
@@ -2940,33 +2885,7 @@ int main(void)
     {
         tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe169(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("169:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV32QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe170(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("170:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe171(a0, a1);
+        tV8SI result = probe171(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("171:");
@@ -2974,11 +2893,9 @@ int main(void)
         puts("");
     }
     {
-        tV32QI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe172(a0, a1);
+        tV16HI result = probe172(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("172:");
@@ -2986,9 +2903,9 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI result = probe173(a0);
+        tV8SI result = probe173(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("173:");
@@ -2996,7 +2913,7 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8SI result = probe174(a0);
         unsigned char bytes[sizeof(result)];
@@ -3006,7 +2923,7 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI result = probe175(a0);
         unsigned char bytes[sizeof(result)];
@@ -3016,9 +2933,9 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI result = probe176(a0);
+        tV16HI result = probe176(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("176:");
@@ -3026,11 +2943,9 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe177(a0, a1);
+        tV4SI result = probe177(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("177:");
@@ -3038,11 +2953,9 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe178(a0, a1);
+        tV8SI result = probe178(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("178:");
@@ -3062,9 +2975,11 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI result = probe180(a0);
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe180(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("180:");
@@ -3072,9 +2987,11 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI result = probe181(a0);
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe181(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("181:");
@@ -3082,9 +2999,11 @@ int main(void)
         puts("");
     }
     {
-        tV2DI a0;
+        tV16HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI result = probe182(a0);
+        tV16HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16HI result = probe182(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("182:");
@@ -3092,9 +3011,11 @@ int main(void)
         puts("");
     }
     {
-        tV4DI a0;
+        tV4SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI result = probe183(a0);
+        tV4SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SI result = probe183(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("183:");
@@ -3102,9 +3023,11 @@ int main(void)
         puts("");
     }
     {
-        tV2DI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI result = probe184(a0);
+        tV8SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8SI result = probe184(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("184:");
@@ -3112,9 +3035,11 @@ int main(void)
         puts("");
     }
     {
-        tV4DI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI result = probe185(a0);
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe185(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("185:");
@@ -3122,11 +3047,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV16HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
+        tV16HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe186(a0, a1);
+        tV16HI result = probe186(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("186:");
@@ -3134,9 +3059,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI result = probe187(a0);
+        tV8SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4DI result = probe187(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("187:");
@@ -3144,9 +3071,11 @@ int main(void)
         puts("");
     }
     {
-        tV16HI a0;
+        tV2DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI result = probe188(a0);
+        tV2DI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DI result = probe188(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("188:");
@@ -3154,9 +3083,11 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV4DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI result = probe189(a0);
+        tV4DI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4DI result = probe189(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("189:");
@@ -3164,9 +3095,11 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI result = probe190(a0);
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DI result = probe190(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("190:");
@@ -3174,9 +3107,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV32QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI result = probe191(a0);
+        tV32QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4DI result = probe191(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("191:");
@@ -3184,9 +3119,11 @@ int main(void)
         puts("");
     }
     {
-        tV16HI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI result = probe192(a0);
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe192(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("192:");
@@ -3194,9 +3131,11 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV32QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI result = probe193(a0);
+        tV32QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV32QI result = probe193(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("193:");
@@ -3204,9 +3143,9 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV4SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI result = probe194(a0);
+        tV4SI result = probe194(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("194:");
@@ -3214,9 +3153,9 @@ int main(void)
         puts("");
     }
     {
-        tV2DI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI result = probe195(a0);
+        tV8SI result = probe195(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("195:");
@@ -3224,9 +3163,9 @@ int main(void)
         puts("");
     }
     {
-        tV4DI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI result = probe196(a0);
+        tV8HI result = probe196(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("196:");
@@ -3234,9 +3173,9 @@ int main(void)
         puts("");
     }
     {
-        tV2DI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI result = probe197(a0);
+        tV8HI result = probe197(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("197:");
@@ -3244,9 +3183,11 @@ int main(void)
         puts("");
     }
     {
-        tV4DI a0;
+        tV16QI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI result = probe198(a0);
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe198(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("198:");
@@ -3254,11 +3195,11 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV4SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
+        tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe199(a0, a1);
+        tV4SI result = probe199(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("199:");
@@ -3268,7 +3209,9 @@ int main(void)
     {
         tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI result = probe200(a0);
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe200(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("200:");
@@ -3276,9 +3219,9 @@ int main(void)
         puts("");
     }
     {
-        tV16HI a0;
+        tV4SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI result = probe201(a0);
+        tV4SI result = probe201(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("201:");
@@ -3286,11 +3229,9 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe202(a0, a1);
+        tV8SI result = probe202(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("202:");
@@ -3298,11 +3239,9 @@ int main(void)
         puts("");
     }
     {
-        tV32QI a0;
+        tV2DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe203(a0, a1);
+        tV2DI result = probe203(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("203:");
@@ -3310,11 +3249,9 @@ int main(void)
         puts("");
     }
     {
-        tV4SI a0;
+        tV4DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe204(a0, a1);
+        tV4DI result = probe204(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("204:");
@@ -3322,11 +3259,9 @@ int main(void)
         puts("");
     }
     {
-        tV8SI a0;
+        tV2DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe205(a0, a1);
+        tV2DI result = probe205(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("205:");
@@ -3334,11 +3269,9 @@ int main(void)
         puts("");
     }
     {
-        tV2DI a0;
+        tV4DI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe206(a0, a1);
+        tV4DI result = probe206(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("206:");
@@ -3346,11 +3279,11 @@ int main(void)
         puts("");
     }
     {
-        tV4DI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI a1;
+        tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe207(a0, a1);
+        tV8HI result = probe207(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("207:");
@@ -3358,11 +3291,9 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe208(a0, a1);
+        tV8HI result = probe208(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("208:");
@@ -3370,11 +3301,9 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV16HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe209(a0, a1);
+        tV16HI result = probe209(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("209:");
@@ -3382,11 +3311,9 @@ int main(void)
         puts("");
     }
     {
-        tV16QI a0;
+        tV4SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe210(a0, a1);
+        tV4SI result = probe210(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("210:");
@@ -3394,11 +3321,9 @@ int main(void)
         puts("");
     }
     {
-        tV8HI a0;
+        tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe211(a0, a1);
+        tV8SI result = probe211(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("211:");
@@ -3406,14 +3331,82 @@ int main(void)
         puts("");
     }
     {
-        tV16HI a0;
+        tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe212(a0, a1);
+        tV8HI result = probe212(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("212:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16HI result = probe213(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("213:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SI result = probe214(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("214:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8SI result = probe215(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("215:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DI result = probe216(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("216:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4DI result = probe217(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("217:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DI result = probe218(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("218:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4DI result = probe219(a0);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("219:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3422,91 +3415,7 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe213(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("213:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16HI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe214(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("214:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV16QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV16QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16QI result = probe215(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("215:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV32QI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV32QI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV32QI result = probe216(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("216:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SI result = probe217(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("217:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV8SI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV8SI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe218(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("218:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV2DI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe219(a0, a1);
-        unsigned char bytes[sizeof(result)];
-        memcpy(bytes, &result, sizeof(result));
-        printf("219:");
-        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
-        puts("");
-    }
-    {
-        tV4DI a0;
-        memcpy(&a0, storage + 0, sizeof(a0));
-        tV4DI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe220(a0, a1);
+        tV8HI result = probe220(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("220:");
@@ -3516,9 +3425,7 @@ int main(void)
     {
         tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV8HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe221(a0, a1);
+        tV8HI result = probe221(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("221:");
@@ -3528,9 +3435,7 @@ int main(void)
     {
         tV16HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV16HI a1;
-        memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe222(a0, a1);
+        tV16HI result = probe222(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
         printf("222:");
@@ -3610,14 +3515,50 @@ int main(void)
         puts("");
     }
     {
+        tV16QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe229(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("229:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
         tV8HI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8HI result = probe229(a0, a1);
+        tV8HI result = probe230(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("229:");
+        printf("230:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe231(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("231:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe232(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("232:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3626,10 +3567,82 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV16HI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV16HI result = probe230(a0, a1);
+        tV16HI result = probe233(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("230:");
+        printf("233:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe234(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("234:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16HI result = probe235(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("235:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe236(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("236:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV32QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV32QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV32QI result = probe237(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("237:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SI result = probe238(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("238:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8SI result = probe239(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("239:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3638,10 +3651,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV2DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DI result = probe231(a0, a1);
+        tV2DI result = probe240(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("231:");
+        printf("240:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3650,10 +3663,154 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4DI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DI result = probe232(a0, a1);
+        tV4DI result = probe241(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("232:");
+        printf("241:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe242(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("242:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16HI result = probe243(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("243:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16QI result = probe244(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("244:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV32QI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV32QI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV32QI result = probe245(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("245:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4SI result = probe246(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("246:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8SI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8SI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8SI result = probe247(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("247:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DI result = probe248(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("248:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4DI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4DI result = probe249(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("249:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV8HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV8HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV8HI result = probe250(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("250:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV16HI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV16HI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV16HI result = probe251(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("251:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV2DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV2DI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV2DI result = probe252(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("252:");
+        for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
+        puts("");
+    }
+    {
+        tV4DI a0;
+        memcpy(&a0, storage + 0, sizeof(a0));
+        tV4DI a1;
+        memcpy(&a1, storage + 7, sizeof(a1));
+        tV4DI result = probe253(a0, a1);
+        unsigned char bytes[sizeof(result)];
+        memcpy(bytes, &result, sizeof(result));
+        printf("253:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3662,10 +3819,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe236(a0, a1);
+        tV4SF result = probe257(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("236:");
+        printf("257:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3674,10 +3831,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV2DF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DF result = probe241(a0, a1);
+        tV2DF result = probe262(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("241:");
+        printf("262:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3686,10 +3843,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4DF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DF result = probe242(a0, a1);
+        tV4DF result = probe263(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("242:");
+        printf("263:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3698,10 +3855,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe243(a0, a1);
+        tV4SF result = probe264(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("243:");
+        printf("264:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3710,10 +3867,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SF result = probe244(a0, a1);
+        tV8SF result = probe265(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("244:");
+        printf("265:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3722,10 +3879,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV2DF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DF result = probe245(a0, a1);
+        tV2DF result = probe266(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("245:");
+        printf("266:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3734,40 +3891,40 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe246(a0, a1);
+        tV4SF result = probe267(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("246:");
+        printf("267:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
     {
         tV4DF a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV2DF result = probe247(a0);
+        tV2DF result = probe268(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("247:");
+        printf("268:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
     {
         tV8SF a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SF result = probe248(a0);
+        tV4SF result = probe269(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("248:");
+        printf("269:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
     {
         tV8SI a0;
         memcpy(&a0, storage + 0, sizeof(a0));
-        tV4SI result = probe249(a0);
+        tV4SI result = probe270(a0);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("249:");
+        printf("270:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3776,10 +3933,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV2DF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DF result = probe250(a0, a1);
+        tV4DF result = probe271(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("250:");
+        printf("271:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3788,10 +3945,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SF result = probe251(a0, a1);
+        tV8SF result = probe272(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("251:");
+        printf("272:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3800,10 +3957,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SI a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SI result = probe252(a0, a1);
+        tV8SI result = probe273(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("252:");
+        printf("273:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3812,10 +3969,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV2DF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV2DF result = probe274(a0, a1);
+        tV2DF result = probe295(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("274:");
+        printf("295:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3824,10 +3981,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4DF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4DF result = probe275(a0, a1);
+        tV4DF result = probe296(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("275:");
+        printf("296:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3836,10 +3993,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV4SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV4SF result = probe276(a0, a1);
+        tV4SF result = probe297(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("276:");
+        printf("297:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }
@@ -3848,10 +4005,10 @@ int main(void)
         memcpy(&a0, storage + 0, sizeof(a0));
         tV8SF a1;
         memcpy(&a1, storage + 7, sizeof(a1));
-        tV8SF result = probe277(a0, a1);
+        tV8SF result = probe298(a0, a1);
         unsigned char bytes[sizeof(result)];
         memcpy(bytes, &result, sizeof(result));
-        printf("277:");
+        printf("298:");
         for (unsigned i = 0; i < sizeof(result); ++i) printf("%02x", bytes[i]);
         puts("");
     }

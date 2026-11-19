@@ -2258,6 +2258,17 @@ fn is_user_store_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::Movntdq
             | O::Movntpd
             | O::Movntps
+            | O::Movntdq256
+            | O::Movntpd256
+            | O::Movntps256
+            | O::MaskStorePs128
+            | O::MaskStorePd128
+            | O::MaskStoreD128
+            | O::MaskStoreQ128
+            | O::MaskStorePs256
+            | O::MaskStorePd256
+            | O::MaskStoreD256
+            | O::MaskStoreQ256
     )
 }
 

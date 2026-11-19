@@ -343,4 +343,12 @@ _mm_blend_epi16(__m128i __a, __m128i __b, const int __imm)
     return __r;
 }
 
+/* --- Streaming load (SSE4.1, MOVNTDQA). The source must be 16-byte aligned. --- */
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_stream_load_si128(__m128i *__p)
+{
+    return (__m128i)__builtin_ia32_movntdqa((__v2di *)__p);
+}
+
 #endif /* _SMMINTRIN_H_INCLUDED */

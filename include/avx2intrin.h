@@ -1236,6 +1236,64 @@ _mm_broadcastss_ps(__m128 __a)
     return _mm_shuffle_ps(__a, __a, 0x00);
 }
 
+/* --- Streaming load and integer sign-bit-masked moves (AVX2). ---
+ * VMOVNTDQA is the non-temporal load (SSE4.1 for 128 bits, AVX2 for 256).
+ * VPMASKMOV{D,Q} keep the element-size contract of the float forms above. */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_stream_load_si256(__m256i const *__p)
+{
+    return (__m256i)__builtin_ia32_movntdqa256((__v4di *)__p);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_maskload_epi32(int const *__p, __m256i __m)
+{
+    return (__m256i)__builtin_ia32_maskloadd256((const __v8si *)__p, (__v8si)__m);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_maskload_epi64(long long const *__p, __m256i __m)
+{
+    return (__m256i)__builtin_ia32_maskloadq256((const __v4di *)__p, (__v4di)__m);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_maskstore_epi32(int *__p, __m256i __m, __m256i __a)
+{
+    __builtin_ia32_maskstored256((__v8si *)__p, (__v8si)__m, (__v8si)__a);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_maskstore_epi64(long long *__p, __m256i __m, __m256i __a)
+{
+    __builtin_ia32_maskstoreq256((__v4di *)__p, (__v4di)__m, (__v4di)__a);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_maskload_epi32(int const *__p, __m128i __m)
+{
+    return (__m128i)__builtin_ia32_maskloadd((const __v4si *)__p, (__v4si)__m);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_maskload_epi64(long long const *__p, __m128i __m)
+{
+    return (__m128i)__builtin_ia32_maskloadq((const __v2di *)__p, (__v2di)__m);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm_maskstore_epi32(int *__p, __m128i __m, __m128i __a)
+{
+    __builtin_ia32_maskstored((__v4si *)__p, (__v4si)__m, (__v4si)__a);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm_maskstore_epi64(long long *__p, __m128i __m, __m128i __a)
+{
+    __builtin_ia32_maskstoreq((__v2di *)__p, (__v2di)__m, (__v2di)__a);
+}
+
 #endif /* __AVX2__ */
 
 #endif /* _AVX2INTRIN_H_INCLUDED */

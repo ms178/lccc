@@ -67,6 +67,36 @@ pub enum IntrinsicOp {
     Movntdq,
     Movntpd,
     Movntps,
+    /// 256-bit non-temporal stores (`vmovntdq`/`vmovntpd`/`vmovntps`). The
+    /// destination must be 32-byte aligned: the VEX.256 form faults otherwise.
+    Movntdq256,
+    Movntpd256,
+    Movntps256,
+    /// Non-temporal loads (`movntdqa`): SSE4.1 128-bit and AVX2 256-bit. The
+    /// source must be 16-byte (128-bit) or 32-byte (256-bit) aligned.
+    Movntdqa128,
+    Movntdqa256,
+    /// AVX/AVX2 sign-bit-masked memory access (`vmaskmov*` / `vpmaskmov*`).
+    /// `MaskLoad*` takes args `[ptr, mask]` and does NOT fault on a masked-off
+    /// lane. `MaskStore*` takes `dest_ptr` with args `[mask, value]` and writes
+    /// only the lanes whose mask sign bit is set. `Ps`/`Pd` are float lanes
+    /// (32/64-bit); `D`/`Q` are integer lanes (32/64-bit).
+    MaskLoadPs128,
+    MaskLoadPd128,
+    MaskLoadD128,
+    MaskLoadQ128,
+    MaskLoadPs256,
+    MaskLoadPd256,
+    MaskLoadD256,
+    MaskLoadQ256,
+    MaskStorePs128,
+    MaskStorePd128,
+    MaskStoreD128,
+    MaskStoreQ128,
+    MaskStorePs256,
+    MaskStorePd256,
+    MaskStoreD256,
+    MaskStoreQ256,
     /// Load/store 128-bit unaligned
     Loaddqu,
     Storedqu,
@@ -2161,6 +2191,46 @@ pub(crate) const VECTOR_STORES: [IntrinsicOp; 14] = [
 ];
 
 impl IntrinsicOp {
+    /// `(mnemonic, vector bytes, is_store)` for the AVX/AVX2 sign-bit-masked
+    /// memory ops. The mnemonic is the VEX form both emitters must agree on:
+    /// `vmaskmovps`/`vmaskmovpd` for float lanes, `vpmaskmovd`/`vpmaskmovq`
+    /// for integer lanes. Operand order is the same for the load and store
+    /// forms in Intel syntax: `dst, mask, mem` / `mem, mask, src`.
+    pub(crate) fn vmaskmov_form(self) -> Option<(&'static str, u32, bool)> {
+        use IntrinsicOp as O;
+        Some(match self {
+            O::MaskLoadPs128 => ("vmaskmovps", 16, false),
+            O::MaskLoadPd128 => ("vmaskmovpd", 16, false),
+            O::MaskLoadD128 => ("vpmaskmovd", 16, false),
+            O::MaskLoadQ128 => ("vpmaskmovq", 16, false),
+            O::MaskLoadPs256 => ("vmaskmovps", 32, false),
+            O::MaskLoadPd256 => ("vmaskmovpd", 32, false),
+            O::MaskLoadD256 => ("vpmaskmovd", 32, false),
+            O::MaskLoadQ256 => ("vpmaskmovq", 32, false),
+            O::MaskStorePs128 => ("vmaskmovps", 16, true),
+            O::MaskStorePd128 => ("vmaskmovpd", 16, true),
+            O::MaskStoreD128 => ("vpmaskmovd", 16, true),
+            O::MaskStoreQ128 => ("vpmaskmovq", 16, true),
+            O::MaskStorePs256 => ("vmaskmovps", 32, true),
+            O::MaskStorePd256 => ("vmaskmovpd", 32, true),
+            O::MaskStoreD256 => ("vpmaskmovd", 32, true),
+            O::MaskStoreQ256 => ("vpmaskmovq", 32, true),
+            _ => return None,
+        })
+    }
+
+    /// `(vector bytes, required address alignment in bytes)` for the
+    /// non-temporal ops: the stores `Movnt*` and the streaming load
+    /// `Movntdqa*`. `None` for every other op.
+    pub(crate) fn movnt_shape(self) -> Option<(u32, u32)> {
+        use IntrinsicOp as O;
+        Some(match self {
+            O::Movntdq | O::Movntpd | O::Movntps | O::Movntdqa128 => (16, 16),
+            O::Movntdq256 | O::Movntpd256 | O::Movntps256 | O::Movntdqa256 => (32, 32),
+            _ => return None,
+        })
+    }
+
     /// Native legacy/VEX SSSE3 binary mnemonic shared by both x86 emitters.
     pub(crate) fn ssse3_binary_mnemonic(self) -> Option<&'static str> {
         Some(match self {
@@ -2340,6 +2410,7 @@ impl IntrinsicOp {
             // the destination slot exactly like `Loadu256`. Without this,
             // a 32-byte `vmovdqu` store could target an 8-byte slot.
             Loadu256Raw | Loadu256 | Load256
+            | MaskLoadPs256 | MaskLoadPd256 | MaskLoadD256 | MaskLoadQ256 | Movntdqa256
             | Paddb256 | Paddw256 | Paddd256 | Psubb256 | Psubw256 | Psubusw256
             | Psadbw256 | Pmaddubsw256 | Pmaddwd256 | Pcmpeqb256 | Pcmpgtb256
             | Pshufb256 | Pabsb256 | Pabsw256 | Pmaxub256
@@ -2453,7 +2524,8 @@ impl IntrinsicOp {
             | VecSubI64x4 | VecAndI64x4 | VecOrI64x4 | VecXorI64x4
             | VecBroadcastI64x4 => Some(32),
             // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
-            Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
+            Loaddqu | Loadldi128 | MaskLoadPs128 | MaskLoadPd128 | MaskLoadD128 | MaskLoadQ128
+            | Movntdqa128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
             | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
             | MulPs128 | AddPd128 | SubPd128 | MulPd128
             | DivPs128 | MinPs128 | MaxPs128 | SqrtPs128 | RcpPs128 | RsqrtPs128
@@ -2838,6 +2910,16 @@ impl IntrinsicOp {
                 | IntrinsicOp::LoadF64x2
                 | IntrinsicOp::LoadI32x8
                 | IntrinsicOp::LoadI32x4
+                | IntrinsicOp::MaskLoadPs128
+                | IntrinsicOp::MaskLoadPd128
+                | IntrinsicOp::MaskLoadD128
+                | IntrinsicOp::MaskLoadQ128
+                | IntrinsicOp::MaskLoadPs256
+                | IntrinsicOp::MaskLoadPd256
+                | IntrinsicOp::MaskLoadD256
+                | IntrinsicOp::MaskLoadQ256
+                | IntrinsicOp::Movntdqa128
+                | IntrinsicOp::Movntdqa256
                 | IntrinsicOp::VecLoadF64x4
                 | IntrinsicOp::VecLoadF64x2
                 | IntrinsicOp::VecLoadI32x8
@@ -2969,6 +3051,16 @@ impl IntrinsicOp {
         matches!(
             self,
             IntrinsicOp::VecZeroF64x4
+                | IntrinsicOp::MaskLoadPs128
+                | IntrinsicOp::MaskLoadPd128
+                | IntrinsicOp::MaskLoadD128
+                | IntrinsicOp::MaskLoadQ128
+                | IntrinsicOp::MaskLoadPs256
+                | IntrinsicOp::MaskLoadPd256
+                | IntrinsicOp::MaskLoadD256
+                | IntrinsicOp::MaskLoadQ256
+                | IntrinsicOp::Movntdqa128
+                | IntrinsicOp::Movntdqa256
                 | IntrinsicOp::VecZeroF64x2
                 | IntrinsicOp::VecZeroI32x8
                 | IntrinsicOp::VecZeroI32x4
@@ -4116,6 +4208,14 @@ mod memory_classification_tests {
             O::MaskLoaduEpi8_128,
             O::MaskLoaduEpi8_256,
             O::MaskLoaduEpi8_512,
+            O::MaskLoadPs128,
+            O::MaskLoadPd128,
+            O::MaskLoadD128,
+            O::MaskLoadQ128,
+            O::MaskLoadPs256,
+            O::MaskLoadPd256,
+            O::MaskLoadD256,
+            O::MaskLoadQ256,
         ];
         // COMPLETENESS: every load-named variant in the enum is enumerated.
         for name in &load_named_from_source {

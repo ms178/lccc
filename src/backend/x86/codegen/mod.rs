@@ -12,6 +12,7 @@ mod globals;
 mod i128_ops;
 mod inline_asm;
 mod intrinsics;
+mod intrinsics_avx_mem;
 mod intrinsics_simd;
 pub(crate) mod ipa_ra;
 pub(crate) mod isel;

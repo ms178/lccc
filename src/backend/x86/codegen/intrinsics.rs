@@ -1477,7 +1477,13 @@ impl X86Codegen {
                     | O::Movntdq
                     | O::Movntpd
                     | O::Movntps
+                    | O::Movntdq256
+                    | O::Movntpd256
+                    | O::Movntps256
+                    | O::Movntdqa128
+                    | O::Movntdqa256
             )
+            && op.vmaskmov_form().is_none()
     }
 
     /// Lazy-flush entry check for an intrinsic about to be emitted: if a
@@ -3298,6 +3304,15 @@ impl X86Codegen {
             | IntrinsicOp::Movntpd
             | IntrinsicOp::Movntps => {
                 self.emit_nontemporal_store(op, dest_ptr, args);
+            }
+            IntrinsicOp::Movntdq256 | IntrinsicOp::Movntpd256 | IntrinsicOp::Movntps256 => {
+                self.emit_avx_movnt_256(op, dest_ptr, args);
+            }
+            IntrinsicOp::Movntdqa128 | IntrinsicOp::Movntdqa256 => {
+                self.emit_movntdqa(op, dest, dest_ptr, args);
+            }
+            _ if op.vmaskmov_form().is_some() => {
+                self.emit_avx_maskmov(op, dest, dest_ptr, args);
             }
             IntrinsicOp::Loaddqu => {
                 if let Some(dptr) = dest_ptr {
@@ -10890,7 +10905,7 @@ impl X86Codegen {
     /// VEX forms are NON-destructive, so a homed source is read in place
     /// with zero staging copies — the entire point of the VEX.128 path.
     /// Returns the AT&T register operand ("%xmm5").
-    fn vex128_source(&mut self, arg: &Operand, scratch: &'static str) -> String {
+    pub(super) fn vex128_source(&mut self, arg: &Operand, scratch: &'static str) -> String {
         if let Operand::Value(v) = arg {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
                 if is_xmm_reg(reg) {
@@ -11178,7 +11193,7 @@ impl X86Codegen {
     /// Commit a VEX.128 result written straight into `dst_home` (or into
     /// `%xmm0` when the destination has no register home): bookkeeping,
     /// then the slot store / deferral an unhomed destination needs.
-    fn vex128_commit_dest(&mut self, dest_ptr: &Value, dst_home: Option<&'static str>) {
+    pub(super) fn vex128_commit_dest(&mut self, dest_ptr: &Value, dst_home: Option<&'static str>) {
         let dst_static: &'static str = dst_home.unwrap_or("xmm0");
         self.sse_commit_dest_direct(dest_ptr, dst_static);
         if dst_home.is_none() {

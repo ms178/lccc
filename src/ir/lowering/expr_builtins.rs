@@ -1857,6 +1857,27 @@ impl Lowerer {
             | BuiltinIntrinsic::X86MulEpi32
             | BuiltinIntrinsic::X86MulloEpi32
             | BuiltinIntrinsic::X86Pcmpgtb256
+            | BuiltinIntrinsic::X86Movntdq256
+            | BuiltinIntrinsic::X86Movntpd256
+            | BuiltinIntrinsic::X86Movntps256
+            | BuiltinIntrinsic::X86MaskStorePs128
+            | BuiltinIntrinsic::X86MaskStorePd128
+            | BuiltinIntrinsic::X86MaskStoreD128
+            | BuiltinIntrinsic::X86MaskStoreQ128
+            | BuiltinIntrinsic::X86MaskStorePs256
+            | BuiltinIntrinsic::X86MaskStorePd256
+            | BuiltinIntrinsic::X86MaskStoreD256
+            | BuiltinIntrinsic::X86MaskStoreQ256
+            | BuiltinIntrinsic::X86MaskLoadPs128
+            | BuiltinIntrinsic::X86MaskLoadPd128
+            | BuiltinIntrinsic::X86MaskLoadD128
+            | BuiltinIntrinsic::X86MaskLoadQ128
+            | BuiltinIntrinsic::X86Movntdqa128
+            | BuiltinIntrinsic::X86MaskLoadPs256
+            | BuiltinIntrinsic::X86MaskLoadPd256
+            | BuiltinIntrinsic::X86MaskLoadD256
+            | BuiltinIntrinsic::X86MaskLoadQ256
+            | BuiltinIntrinsic::X86Movntdqa256
             | BuiltinIntrinsic::X86CastReinterpret => {
                 self.check_x86_intrinsic_feature(intrinsic, name, args);
                 self.lower_x86_intrinsic(intrinsic, name, args)
@@ -3722,7 +3743,7 @@ impl Lowerer {
                     dest: None,
                     op,
                     dest_ptr: Some(ptr_val),
-                    args: vec![arg_ops[1].clone()],
+                    args: arg_ops[1..].to_vec(),
                 });
                 Some(Operand::Const(IrConst::I64(0)))
             }
@@ -4005,7 +4026,18 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Storeu256
         | BuiltinIntrinsic::X86Store256
         | BuiltinIntrinsic::X86StoreuPs256
-        | BuiltinIntrinsic::X86StoreuPd256 => X86IntrinsicKind::PtrStore,
+        | BuiltinIntrinsic::X86StoreuPd256
+        | BuiltinIntrinsic::X86Movntdq256
+        | BuiltinIntrinsic::X86Movntpd256
+        | BuiltinIntrinsic::X86Movntps256
+        | BuiltinIntrinsic::X86MaskStorePs128
+        | BuiltinIntrinsic::X86MaskStorePd128
+        | BuiltinIntrinsic::X86MaskStoreD128
+        | BuiltinIntrinsic::X86MaskStoreQ128
+        | BuiltinIntrinsic::X86MaskStorePs256
+        | BuiltinIntrinsic::X86MaskStorePd256
+        | BuiltinIntrinsic::X86MaskStoreD256
+        | BuiltinIntrinsic::X86MaskStoreQ256 => X86IntrinsicKind::PtrStore,
 
         BuiltinIntrinsic::X86Pmovmskb128
         | BuiltinIntrinsic::X86Pextrw128
@@ -4155,6 +4187,17 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128,
         BuiltinIntrinsic::X86CvtPd2PsValue => X86IntrinsicKind::Vec128,
         BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadPs128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadPd128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadD128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadQ128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86Movntdqa128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadPs256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86MaskLoadPd256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86MaskLoadD256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86MaskLoadQ256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86Movntdqa256 => X86IntrinsicKind::Vec256,
+
         BuiltinIntrinsic::X86MaxPs256V
         | BuiltinIntrinsic::X86MinPs256V
         | BuiltinIntrinsic::X86AndPs256V
@@ -4489,6 +4532,30 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             flag: "-mavx",
             also: None,
         },
+        // Non-temporal stores and sign-masked float moves are AVX (VEX-only);
+        // the masked integer forms and the 256-bit streaming load need AVX2.
+        B::X86Movntdq256
+        | B::X86Movntpd256
+        | B::X86Movntps256
+        | B::X86MaskLoadPs128 | B::X86MaskLoadPd128 | B::X86MaskLoadPs256 | B::X86MaskLoadPd256
+        | B::X86MaskStorePs128 | B::X86MaskStorePd128 | B::X86MaskStorePs256 | B::X86MaskStorePd256 => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
+        B::X86MaskLoadD128 | B::X86MaskLoadQ128 | B::X86MaskLoadD256 | B::X86MaskLoadQ256
+        | B::X86MaskStoreD128 | B::X86MaskStoreQ128 | B::X86MaskStoreD256 | B::X86MaskStoreQ256
+        | B::X86Movntdqa256 => IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        },
+        // SSE4.1 streaming load: the 128-bit form needs no AVX.
+        B::X86Movntdqa128 => IntrinsicRequirement {
+            feature: F::Sse41,
+            flag: "-msse4.1",
+            also: None,
+        },
         // Public headers must not silently introduce SSSE3 above a declared
         // SSE2 ceiling. Include the raw builtin aliases in this same gate.
         B::X86Pmaddubsw128
@@ -4709,6 +4776,27 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Movntdq => IntrinsicOp::Movntdq,
         BuiltinIntrinsic::X86Movntpd => IntrinsicOp::Movntpd,
         BuiltinIntrinsic::X86Movntps => IntrinsicOp::Movntps,
+        BuiltinIntrinsic::X86Movntdq256 => IntrinsicOp::Movntdq256,
+        BuiltinIntrinsic::X86Movntpd256 => IntrinsicOp::Movntpd256,
+        BuiltinIntrinsic::X86Movntps256 => IntrinsicOp::Movntps256,
+        BuiltinIntrinsic::X86Movntdqa128 => IntrinsicOp::Movntdqa128,
+        BuiltinIntrinsic::X86Movntdqa256 => IntrinsicOp::Movntdqa256,
+        BuiltinIntrinsic::X86MaskLoadPs128 => IntrinsicOp::MaskLoadPs128,
+        BuiltinIntrinsic::X86MaskStorePs128 => IntrinsicOp::MaskStorePs128,
+        BuiltinIntrinsic::X86MaskLoadPs256 => IntrinsicOp::MaskLoadPs256,
+        BuiltinIntrinsic::X86MaskStorePs256 => IntrinsicOp::MaskStorePs256,
+        BuiltinIntrinsic::X86MaskLoadPd128 => IntrinsicOp::MaskLoadPd128,
+        BuiltinIntrinsic::X86MaskStorePd128 => IntrinsicOp::MaskStorePd128,
+        BuiltinIntrinsic::X86MaskLoadPd256 => IntrinsicOp::MaskLoadPd256,
+        BuiltinIntrinsic::X86MaskStorePd256 => IntrinsicOp::MaskStorePd256,
+        BuiltinIntrinsic::X86MaskLoadD128 => IntrinsicOp::MaskLoadD128,
+        BuiltinIntrinsic::X86MaskStoreD128 => IntrinsicOp::MaskStoreD128,
+        BuiltinIntrinsic::X86MaskLoadD256 => IntrinsicOp::MaskLoadD256,
+        BuiltinIntrinsic::X86MaskStoreD256 => IntrinsicOp::MaskStoreD256,
+        BuiltinIntrinsic::X86MaskLoadQ128 => IntrinsicOp::MaskLoadQ128,
+        BuiltinIntrinsic::X86MaskStoreQ128 => IntrinsicOp::MaskStoreQ128,
+        BuiltinIntrinsic::X86MaskLoadQ256 => IntrinsicOp::MaskLoadQ256,
+        BuiltinIntrinsic::X86MaskStoreQ256 => IntrinsicOp::MaskStoreQ256,
         BuiltinIntrinsic::X86Loaddqu | BuiltinIntrinsic::X86LoadPs => IntrinsicOp::Loaddqu,
         BuiltinIntrinsic::X86Pcmpeqb128 => IntrinsicOp::Pcmpeqb128,
         BuiltinIntrinsic::X86Pcmpeqd128 => IntrinsicOp::Pcmpeqd128,

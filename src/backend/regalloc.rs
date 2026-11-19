@@ -8361,6 +8361,17 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | IntrinsicOp::Movntdq
                 | IntrinsicOp::Movntpd
                 | IntrinsicOp::Movntps
+                | IntrinsicOp::Movntdq256
+                | IntrinsicOp::Movntpd256
+                | IntrinsicOp::Movntps256
+                | IntrinsicOp::MaskStorePs128
+                | IntrinsicOp::MaskStorePd128
+                | IntrinsicOp::MaskStoreD128
+                | IntrinsicOp::MaskStoreQ128
+                | IntrinsicOp::MaskStorePs256
+                | IntrinsicOp::MaskStorePd256
+                | IntrinsicOp::MaskStoreD256
+                | IntrinsicOp::MaskStoreQ256
         )
     };
     let is_raw_reader = |op: &IntrinsicOp| -> bool {

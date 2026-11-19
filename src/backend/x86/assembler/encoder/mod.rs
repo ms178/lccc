@@ -5195,6 +5195,9 @@ impl InstructionEncoder {
             // Conditional vector load/store.
             "vmaskmovps" => self.encode_avx_maskmov(ops, 0x2C, 0x2E, 0),
             "vmaskmovpd" => self.encode_avx_maskmov(ops, 0x2D, 0x2F, 0),
+            // Integer forms share the opcode pair; W selects the element width.
+            "vpmaskmovd" => self.encode_avx_maskmov(ops, 0x8C, 0x8E, 0),
+            "vpmaskmovq" => self.encode_avx_maskmov(ops, 0x8C, 0x8E, 1),
             // AVX2 gathers (VSIB).  W selects the element width, the opcode the
             // index width: 0x92/0x90 = dword index, 0x93/0x91 = qword index.
             "vgatherdps" => self.encode_avx_gather(ops, 0x92, 0),

@@ -960,6 +960,90 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntps),
     );
     m.insert(
+        "__builtin_ia32_movntdq256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntdq256),
+    );
+    m.insert(
+        "__builtin_ia32_movntpd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntpd256),
+    );
+    m.insert(
+        "__builtin_ia32_movntps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntps256),
+    );
+    m.insert(
+        "__builtin_ia32_movntdqa",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntdqa128),
+    );
+    m.insert(
+        "__builtin_ia32_movntdqa256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntdqa256),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadPs128),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadpd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadPd128),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadD128),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadq",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadQ128),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadPs256),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadpd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadPd256),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadD256),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadq256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadQ256),
+    );
+    m.insert(
+        "__builtin_ia32_maskstoreps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStorePs128),
+    );
+    m.insert(
+        "__builtin_ia32_maskstorepd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStorePd128),
+    );
+    m.insert(
+        "__builtin_ia32_maskstored",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStoreD128),
+    );
+    m.insert(
+        "__builtin_ia32_maskstoreq",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStoreQ128),
+    );
+    m.insert(
+        "__builtin_ia32_maskstoreps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStorePs256),
+    );
+    m.insert(
+        "__builtin_ia32_maskstorepd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStorePd256),
+    );
+    m.insert(
+        "__builtin_ia32_maskstored256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStoreD256),
+    );
+    m.insert(
+        "__builtin_ia32_maskstoreq256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStoreQ256),
+    );
+    m.insert(
         "__builtin_ia32_loaddqu",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loaddqu),
     );
@@ -3911,6 +3995,27 @@ pub enum BuiltinIntrinsic {
     X86Movntdq,
     X86Movntpd,
     X86Movntps,
+    X86Movntdq256,
+    X86Movntpd256,
+    X86Movntps256,
+    X86Movntdqa128,
+    X86Movntdqa256,
+    X86MaskLoadPs128,
+    X86MaskLoadPd128,
+    X86MaskLoadD128,
+    X86MaskLoadQ128,
+    X86MaskLoadPs256,
+    X86MaskLoadPd256,
+    X86MaskLoadD256,
+    X86MaskLoadQ256,
+    X86MaskStorePs128,
+    X86MaskStorePd128,
+    X86MaskStoreD128,
+    X86MaskStoreQ128,
+    X86MaskStorePs256,
+    X86MaskStorePd256,
+    X86MaskStoreD256,
+    X86MaskStoreQ256,
     X86Loaddqu,
     X86Storedqu,
     /// `_mm_load{,u}_ps` / `_mm_store{,u}_ps`: the same 16-byte copy as

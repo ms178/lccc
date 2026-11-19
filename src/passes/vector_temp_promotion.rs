@@ -697,6 +697,15 @@ fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usi
     if op == O::Load256 && index == 0 {
         return Some(32);
     }
+    // `movntdqa` faults unless its SOURCE meets the vector width, the same
+    // contract as the non-temporal store destinations below.
+    if index == 0 {
+        match op {
+            O::Movntdqa128 => return Some(16),
+            O::Movntdqa256 => return Some(32),
+            _ => {}
+        }
+    }
     // `VecLoad*`: args[0] is the base address, args[1] the constant offset.
     if whole_vector_load(op) {
         return (index == 0).then_some(0);
@@ -775,6 +784,9 @@ fn intrinsic_dest_required_alignment(
         // 16-byte aligned.  Alignment 16 is still a direct stack slot and
         // therefore avoids the expensive runtime alignment sequence.
         O::Movntdq | O::Movntpd | O::Movntps => Some(16),
+        // VEX.256 non-temporal stores fault unless the destination is 32-byte
+        // aligned (`vmovntdq ymm` requires it architecturally).
+        O::Movntdq256 | O::Movntpd256 | O::Movntps256 => Some(32),
         _ => None,
     }
 }
@@ -845,6 +857,17 @@ fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
             | IntrinsicOp::Movntdq
             | IntrinsicOp::Movntpd
             | IntrinsicOp::Movntps
+            | IntrinsicOp::Movntdq256
+            | IntrinsicOp::Movntpd256
+            | IntrinsicOp::Movntps256
+            | IntrinsicOp::MaskStorePs128
+            | IntrinsicOp::MaskStorePd128
+            | IntrinsicOp::MaskStoreD128
+            | IntrinsicOp::MaskStoreQ128
+            | IntrinsicOp::MaskStorePs256
+            | IntrinsicOp::MaskStorePd256
+            | IntrinsicOp::MaskStoreD256
+            | IntrinsicOp::MaskStoreQ256
             | IntrinsicOp::VecStoreI64x2
     )
 }
@@ -7243,6 +7266,58 @@ mod mask_compare_forwarding_tests {
             IntrinsicOp::VecLoadI64x2,
         ] {
             assert_eq!(op.mask_compare_vector_width(), None, "{op:?}");
+        }
+    }
+}
+
+/// Alignment and partial-write contract of the AVX non-temporal and
+/// sign-bit-masked memory ops.  A wrong row here is silent: a 256-bit stream
+/// store with a 16-byte requirement would be promoted to a stack slot that the
+/// hardware then faults on, and a masked store classified as a full overwrite
+/// would let promotion drop the unselected lanes.
+#[cfg(test)]
+mod masked_nontemporal_contract_tests {
+    use super::*;
+
+    #[test]
+    fn non_temporal_store_destinations_are_aligned_to_their_width() {
+        for (op, align) in [
+            (IntrinsicOp::Movntdq, 16),
+            (IntrinsicOp::Movntpd, 16),
+            (IntrinsicOp::Movntps, 16),
+            (IntrinsicOp::Movntdq256, 32),
+            (IntrinsicOp::Movntpd256, 32),
+            (IntrinsicOp::Movntps256, 32),
+        ] {
+            assert_eq!(
+                intrinsic_dest_required_alignment(op, false, 64),
+                Some(align),
+                "{op:?} destination alignment"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_load_source_is_aligned_to_its_width() {
+        assert_eq!(intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa128, 0), Some(16));
+        assert_eq!(intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa256, 0), Some(32));
+        // Only the source (arg 0) carries the alignment contract.
+        assert_eq!(intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa256, 1), None);
+    }
+
+    #[test]
+    fn masked_stores_are_partial_writes_and_never_full_overwrites() {
+        for op in [
+            IntrinsicOp::MaskStorePs128,
+            IntrinsicOp::MaskStorePd128,
+            IntrinsicOp::MaskStoreD128,
+            IntrinsicOp::MaskStoreQ128,
+            IntrinsicOp::MaskStorePs256,
+            IntrinsicOp::MaskStorePd256,
+            IntrinsicOp::MaskStoreD256,
+            IntrinsicOp::MaskStoreQ256,
+        ] {
+            assert!(!intrinsic_overwrites_full_result(op), "{op:?} is a partial write");
         }
     }
 }

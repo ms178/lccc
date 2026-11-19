@@ -135,6 +135,15 @@ impl I686Codegen {
             | IntrinsicOp::Movntps => {
                 self.emit_nontemporal_store(op, dest_ptr, args);
             }
+            IntrinsicOp::Movntdq256 | IntrinsicOp::Movntpd256 | IntrinsicOp::Movntps256 => {
+                self.emit_avx_movnt_256_i686(op, dest_ptr, args);
+            }
+            IntrinsicOp::Movntdqa128 | IntrinsicOp::Movntdqa256 => {
+                self.emit_movntdqa_i686(op, dest, dest_ptr, args);
+            }
+            _ if op.vmaskmov_form().is_some() => {
+                self.emit_avx_maskmov_i686(op, dest, dest_ptr, args);
+            }
 
             // --- SSE 128-bit load/store ---
             IntrinsicOp::Loaddqu | IntrinsicOp::Storedqu => {
@@ -2779,6 +2788,106 @@ impl I686Codegen {
         panic!(
             "i686 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
         )
+    }
+
+    /// `vmovnt{dq,pd,ps}` of a 256-bit value to `(ptr)`; 32-byte aligned
+    /// destination, as on x86-64. The data is staged before the pointer is
+    /// loaded into %eax, since `emit_avx_load` itself uses %eax.
+    fn emit_avx_movnt_256_i686(
+        &mut self,
+        op: &IntrinsicOp,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
+        let Some(ptr) = dest_ptr else { return };
+        let inst = match op {
+            IntrinsicOp::Movntdq256 => "vmovntdq",
+            IntrinsicOp::Movntpd256 => "vmovntpd",
+            IntrinsicOp::Movntps256 => "vmovntps",
+            _ => return,
+        };
+        self.emit_avx_load(&args[0], "ymm0");
+        self.operand_to_eax(&Operand::Value(*ptr));
+        self.state.emit_fmt(format_args!("    {} %ymm0, (%eax)", inst));
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// `movntdqa` (SSE4.1) and `vmovntdqa` (AVX2): non-temporal load of the
+    /// source pointer into the result slot.
+    fn emit_movntdqa_i686(
+        &mut self,
+        op: &IntrinsicOp,
+        dest: &Option<Value>,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
+        let Some(dst) = dest_ptr.as_ref().or(dest.as_ref()) else {
+            return;
+        };
+        match op {
+            IntrinsicOp::Movntdqa128 => {
+                self.operand_to_eax(&args[0]);
+                self.state.emit("    movntdqa (%eax), %xmm0");
+                self.emit_sse_store_dest_from(dst, "xmm0");
+            }
+            IntrinsicOp::Movntdqa256 => {
+                self.operand_to_eax(&args[0]);
+                self.state.emit("    vmovntdqa (%eax), %ymm0");
+                self.emit_avx_store_dest(dst);
+            }
+            _ => {}
+        }
+    }
+
+    /// Sign-bit-masked load and store, the i686 twin of
+    /// `emit_avx_maskmov` on x86-64. The mask and value are staged in
+    /// `%ymm0`/`%ymm1` or `%xmm0`/`%xmm1` before the pointer is loaded
+    /// into %eax; the 128-bit staging reads exactly 16 bytes.
+    fn emit_avx_maskmov_i686(
+        &mut self,
+        op: &IntrinsicOp,
+        dest: &Option<Value>,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
+        let Some((mnemonic, width, is_store)) = op.vmaskmov_form() else {
+            return;
+        };
+        let wide = width == 32;
+        if is_store {
+            let Some(ptr) = dest_ptr else { return };
+            let (mask, value) = if wide { ("ymm1", "ymm0") } else { ("xmm1", "xmm0") };
+            if wide {
+                self.emit_avx_load(&args[0], mask);
+                self.emit_avx_load(&args[1], value);
+            } else {
+                self.emit_avx_load128(&args[0], mask);
+                self.emit_avx_load128(&args[1], value);
+            }
+            self.operand_to_eax(&Operand::Value(*ptr));
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}, (%eax)",
+                mnemonic, value, mask
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let Some(dst) = dest_ptr.as_ref().or(dest.as_ref()) else {
+            return;
+        };
+        if wide {
+            self.emit_avx_load(&args[1], "ymm1");
+            self.operand_to_eax(&args[0]);
+            self.state
+                .emit_fmt(format_args!("    {} (%eax), %ymm1, %ymm0", mnemonic));
+            self.emit_avx_store_dest(dst);
+        } else {
+            self.emit_avx_load128(&args[1], "xmm1");
+            self.operand_to_eax(&args[0]);
+            self.state
+                .emit_fmt(format_args!("    {} (%eax), %xmm1, %xmm0", mnemonic));
+            self.emit_sse_store_dest_from(dst, "xmm0");
+        }
     }
 
     fn emit_nontemporal_store(
