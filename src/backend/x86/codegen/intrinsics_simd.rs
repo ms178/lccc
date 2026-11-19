@@ -2114,12 +2114,18 @@ impl X86Codegen {
                     ShufPd128 => "shufpd",
                     _ => unreachable!(),
                 };
+                // Compute in %xmm2, not %xmm0. %xmm0 can hold a live operand
+                // (an argument still in its ABI register, or a deferred value);
+                // a destructive op on it clobbers that operand before a later
+                // use reads it. The pool never allocates %xmm0..%xmm2, so
+                // %xmm2 is a safe scratch. Both sources are read before any
+                // write, so args[1] or args[0] in %xmm0 is copied out first.
                 let imm = self.simd_imm(&args[2]);
                 self.sse_load_arg(&args[1], "xmm1");
-                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[0], "xmm2");
                 self.state
-                    .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0", inst, imm));
-                self.sse_store_dest(dest_ptr, "xmm0");
+                    .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm2", inst, imm));
+                self.sse_store_dest(dest_ptr, "xmm2");
             }
             // 1-op with imm: roundps/roundpd/vpermilps (a, imm)
             RoundPs128 | RoundPd128 | VpermilPs128 => {
@@ -2129,11 +2135,12 @@ impl X86Codegen {
                     VpermilPs128 => "vpermilps",
                     _ => unreachable!(),
                 };
+                // Computed in %xmm2 for the same reason as the compare above.
                 let imm = self.simd_imm(&args[1]);
-                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[0], "xmm2");
                 self.state
-                    .emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0", inst, imm));
-                self.sse_store_dest(dest_ptr, "xmm0");
+                    .emit_fmt(format_args!("    {} ${}, %xmm2, %xmm2", inst, imm));
+                self.sse_store_dest(dest_ptr, "xmm2");
             }
             // blend with imm: blendps/blendpd/dpps/dppd (a, b, imm)
             BlendPs128 | BlendPd128 | DpPs128 | DpPd128 => {

@@ -427,6 +427,16 @@ _mm_cmplt_epi32(__m128i __a, __m128i __b)
     return __r;
 }
 
+/* _mm_mul_su32: PMULUDQ on the 64-bit MMX register (GCC 16.2 places it
+ * here, not in mmintrin.h). Multiplies the low 32-bit unsigned dwords. */
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_mul_su32(__m64 __a, __m64 __b)
+{
+    unsigned long long __x = (unsigned int)(unsigned long long)(long long)__a;
+    unsigned long long __y = (unsigned int)(unsigned long long)(long long)__b;
+    return (__m64)(long long)(__x * __y);
+}
+
 /* _mm_mul_epu32: unsigned 32x32->64 multiply (PMULUDQ)
  * Multiplies the low 32-bit unsigned integers from each 64-bit lane:
  * result[0] = (u32)a[0] * (u32)b[0], result[1] = (u32)a[2] * (u32)b[2] */
@@ -1004,6 +1014,87 @@ _mm_sra_epi32(__m128i __a, __m128i __count)
 /* Byte-granular shifts. GCC 16.2 names these as aliases of PSLLDQ / PSRLDQ. */
 #define _mm_bslli_si128(__a, __imm) _mm_slli_si128((__a), (__imm))
 #define _mm_bsrli_si128(__a, __imm) _mm_srli_si128((__a), (__imm))
+
+/* Scalar double compares named by their negated predicates (GCC 16.2 names).
+ * The low lane is the predicate; the high lane comes from the first operand.
+ * The "not greater" and "not greater-or-equal" forms are the swapped
+ * "not less" and "not less-or-equal" compares, as in GCC's definitions. Only
+ * the SSE2 predicates 3..7 are used, so these stay legal under -msse2. */
+#define __CCC_SD_MERGE(__a, __cmp) _mm_move_sd((__a), (__cmp))
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpneq_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpneq_pd(__a, __b));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpnlt_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpnlt_pd(__a, __b));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpnle_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpnle_pd(__a, __b));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpngt_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpnlt_pd(__b, __a));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpnge_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpnle_pd(__b, __a));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpord_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpord_pd(__a, __b));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpunord_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpunord_pd(__a, __b));
+}
+
+/* MMX pair <-> XMM low quadword moves and 64-bit constructors. __m64 is an
+ * 8-byte value, so the casts below are same-size bitcasts. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_set_epi64(__m64 __q1, __m64 __q0)
+{
+    return _mm_set_epi64x((long long)__q1, (long long)__q0);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_set1_epi64(__m64 __q)
+{
+    return _mm_set_epi64x((long long)__q, (long long)__q);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_setr_epi64(__m64 __q0, __m64 __q1)
+{
+    return _mm_set_epi64x((long long)__q1, (long long)__q0);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("sse2")))
+_mm_movepi64_pi64(__m128i __a)
+{
+    return (__m64)((__v2di)__a)[0];
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_movpi64_epi64(__m64 __a)
+{
+    return _mm_set_epi64x(0LL, (long long)__a);
+}
 
 /* Partial-width unaligned loads and stores (GCC 16.2 names). A 16-, 32- or
  * 64-bit load fills the low bytes and zeroes the rest. A store writes only the
