@@ -197,7 +197,10 @@ def run(args, oracles, sh, Result):
                 expect(f'{mode}-common-strong-{pos}', inputs if mode == 'so' else ['got.o', *inputs],
                        flags, exit_code=7, dso_caller='got.o')
         for pos, inputs in [('first', ['c8.o', 'c64.o']), ('last', ['c64.o', 'c8.o'])]:
-            expect(f'common-max-{pos}', ['got.o', *inputs], exit_code=0,
+            # GNU ld combines the two maxima independently. Older distro
+            # mold in CI keeps the first COMMON's size and alignment, so it
+            # is not an oracle for this GNU-specific layout contract.
+            expect(f'common-max-{pos}', ['got.o', *inputs], exit_code=0, refs=('bfd',),
                    symbol=('pick', lambda rows: len(rows) == 1 and int(rows[0][2]) == 64
                            and int(rows[0][1], 16) % 128 == 0 and rows[0][6].isdigit()))
         for pos, inputs in [('first', ['c4.o', 'dw.o']), ('last', ['dw.o', 'c4.o'])]:
