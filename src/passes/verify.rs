@@ -453,16 +453,24 @@ fn verify_dominance(
     // the result back). Model: in program order, an asm output slot whose
     // value is already defined is a MEMORY HOME (a pointer use, checked as
     // a use below); a slot with no prior definition is the SSA definition.
+    //
+    // Which of the two an output is belongs to the output, not to the value:
+    // one asm can define a value that a later asm writes through.  The
+    // kernel's `absolute_pointer()` hides a pointer with
+    // `asm("" : "=r"(p) : "0"(p))` and hands it on as the `"=m"` operand of
+    // the next statement; keyed by value, the first asm was then checked as
+    // a use of what it defines, at the instruction that defines it.
     let mut defs: FxHashMap<u32, (usize, usize)> =
         FxHashMap::with_capacity_and_hasher(func.blocks.len() * 4, Default::default());
-    let mut asm_home_slots: FxHashSet<u32> = FxHashSet::default();
+    // (block, instruction, output) of every output that is a memory home.
+    let mut asm_home_outputs: FxHashSet<(usize, usize, usize)> = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Instruction::InlineAsm { outputs, .. } = inst {
-                for (_, dest, _) in outputs {
+                for (oi, (_, dest, _)) in outputs.iter().enumerate() {
                     if defs.contains_key(&dest.0) {
                         // Memory home: the asm writes through this pointer.
-                        asm_home_slots.insert(dest.0);
+                        asm_home_outputs.insert((bi, ii, oi));
                     } else {
                         record_def(&mut defs, out, func, stage, *dest, (bi, ii));
                     }
@@ -508,9 +516,9 @@ fn verify_dominance(
                 outputs, inputs, ..
             } = inst
             {
-                // Inputs are always uses. An output slot that is a memory
-                // home (recorded in `asm_home_slots`) is a pointer USE --
-                // the asm writes through it; a fresh output slot is the
+                // Inputs are always uses. An output that is a memory home
+                // (recorded in `asm_home_outputs`) is a pointer USE -- the
+                // asm writes through it; a fresh output slot is the
                 // definition itself and no use at all.
                 let check_op = |out: &mut Vec<Violation>, op: &Operand, what: &str| {
                     let Operand::Value(v) = op else { return };
@@ -534,8 +542,8 @@ fn verify_dominance(
                 for (_, op, _) in inputs {
                     check_op(out, op, "asm input");
                 }
-                for (_, slot, _) in outputs {
-                    if asm_home_slots.contains(&slot.0) {
+                for (oi, (_, slot, _)) in outputs.iter().enumerate() {
+                    if asm_home_outputs.contains(&(bi, ii, oi)) {
                         check_op(out, &Operand::Value(*slot), "asm output home");
                     }
                 }
