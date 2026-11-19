@@ -144,10 +144,13 @@ dominator-tree children that are goto targets.
 *behind* the asm goto in the same block: phi placement works on whole blocks, takes the store
 to reach the label too, and one predecessor label cannot name two values for a label that the
 block reaches by its asm goto and by its terminator (`err = -EFAULT; asm goto(out); err = 0;
-out: return err;` returned `-EFAULT` after falling through). Before placing phis the pass ends
-such a block at the asm goto (`isolate_asm_goto_edges`): the tail becomes its own block, the
-label is reached from the head with the old value and from the tail with the new one, and the
-ordinary dominance frontier puts the phi there. Blocks that do not need it keep their shape.
+out: return err;` returned `-EFAULT` after falling through). The IR does not have that shape:
+lowering ends a block at its asm goto (`lower_inline_asm_stmt`), so the tail is its own block,
+the label is reached from the head with the old value and from the tail with the new one, and
+the ordinary dominance frontier puts the phi there. The verifier holds every pass to it
+(`passes::verify`, check 3a). `isolate_asm_goto_edges` is what is left of the time when
+promotion had to see to this itself: it splits a block that still has a promoted definition
+behind an asm goto, and on IR that keeps the rule it finds none.
 
 **Cleanup.** After renaming completes, the pass removes all promoted `Alloca`, `Store`, and
 `Load` instructions from the IR. Parameter allocas in the entry block are retained even if

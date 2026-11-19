@@ -241,6 +241,74 @@ fn an_asm_goto_edge_counts_as_a_real_predecessor() {
     assert_clean(&f);
 }
 
+fn asm_goto(label: u32) -> Instruction {
+    Instruction::InlineAsm {
+        template: "jmp %l0".to_string(),
+        outputs: vec![],
+        inputs: vec![],
+        clobbers: vec![],
+        operand_types: vec![],
+        goto_labels: vec![("lbl".to_string(), BlockId(label))],
+        input_symbols: vec![],
+        seg_overrides: vec![],
+    }
+}
+
+#[test]
+fn an_asm_goto_with_an_instruction_behind_it_is_reported() {
+    // The block is left through the asm goto ahead of `v5`; a pass that
+    // reasons about block #0 as a whole takes `v5` for defined at `.LBB2`.
+    let f = func_of(vec![
+        blk(0, vec![def(4), asm_goto(2), def(5)], br(1)),
+        blk(1, vec![], ret()),
+        blk(2, vec![], ret()),
+    ]);
+    assert_reports(
+        &f,
+        "asm goto at instruction 1 is not the last instruction of its block (1 behind it)",
+    );
+}
+
+#[test]
+fn an_asm_goto_that_ends_its_block_is_clean() {
+    // What lowering emits: the asm goto last, the rest of the statement
+    // list in the fallthrough block.
+    let f = func_of(vec![
+        blk(0, vec![def(4), asm_goto(2)], br(1)),
+        blk(1, vec![def(5)], ret()),
+        blk(2, vec![], ret()),
+    ]);
+    assert_clean(&f);
+}
+
+#[test]
+fn a_second_asm_goto_behind_the_first_is_reported_too() {
+    // Two asm gotos in one block: the first is not the last instruction.
+    let f = func_of(vec![
+        blk(0, vec![asm_goto(2), asm_goto(2)], br(1)),
+        blk(1, vec![], ret()),
+        blk(2, vec![], ret()),
+    ]);
+    assert_reports(&f, "asm goto at instruction 0 is not the last instruction");
+}
+
+#[test]
+fn a_plain_inline_asm_may_stand_anywhere() {
+    // Without labels the asm falls through like any instruction.
+    let plain = Instruction::InlineAsm {
+        template: "nop".to_string(),
+        outputs: vec![],
+        inputs: vec![],
+        clobbers: vec![],
+        operand_types: vec![],
+        goto_labels: vec![],
+        input_symbols: vec![],
+        seg_overrides: vec![],
+    };
+    let f = func_of(vec![blk(0, vec![plain, def(5)], ret())]);
+    assert_clean(&f);
+}
+
 #[test]
 fn a_missing_incoming_for_an_unreachable_predecessor_is_tolerated() {
     // Block 2 branches to 3 but nothing branches to 2, so the edge 2 -> 3 can

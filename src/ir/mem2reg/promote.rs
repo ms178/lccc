@@ -123,6 +123,8 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
     }
 
     // Step 1b: give every asm-goto edge that matters a block to leave from.
+    // Lowering ends a block at its asm goto, so this finds nothing to do on
+    // IR that keeps the rule; see `isolate_asm_goto_edges`.
     let promoted: FxHashSet<u32> = alloca_infos
         .iter()
         .map(|info| info.alloca_value.0)
@@ -669,10 +671,15 @@ fn rename_variables(
 /// Ending the block at the asm goto makes each of those an ordinary edge: the
 /// label is reached from the head with the old value and from the tail with
 /// the new one, the tail does not dominate it, and the dominance frontier
-/// puts the phi there.  Only a block that needs it is split.  One whose asm
-/// goto is followed by nothing a promotion defines keeps its shape -- every
-/// edge out of it carries the same values -- and `cfg_simplify` does not merge
-/// across an asm goto, so a tail stays a block of its own.
+/// puts the phi there.  `cfg_simplify` does not merge across an asm goto, so
+/// a tail stays a block of its own.
+///
+/// Lowering now ends every block at its asm goto (`lower_inline_asm_stmt`)
+/// -- promotion was one of several passes that read a block as a whole, and
+/// the others had no such step -- and the verifier reports a pass that puts
+/// an instruction behind one.  On IR that keeps the rule nothing is split
+/// here.  The step stays for the one consumer that turns the shape into a
+/// wrong value at every optimization level, should a pass ever rebuild it.
 fn isolate_asm_goto_edges(func: &mut IrFunction, promoted: &FxHashSet<u32>) -> bool {
     let defines_promoted = |inst: &Instruction| match inst {
         Instruction::Store { ptr, .. } => promoted.contains(&ptr.0),

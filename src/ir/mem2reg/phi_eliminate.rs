@@ -628,6 +628,8 @@ struct PhiElimCtx<'a> {
     is_indirect_branch: Vec<bool>,
     /// The `(block, label)` pairs joined by an asm-goto edge.
     asm_goto_edges: FxHashSet<(usize, BlockId)>,
+    /// The blocks an asm goto can be left through.
+    has_asm_goto: Vec<bool>,
     pred_copies: FxHashMap<usize, Vec<Instruction>>,
     /// Backedge copies for blocks that are their own phi target, buffered so
     /// they can be validated as a whole before deciding between absorbing them
@@ -681,6 +683,15 @@ fn eliminate_phis_with_policy(
             .enumerate()
             .flat_map(|(idx, block)| {
                 crate::ir::analysis::asm_goto_successors(block).map(move |label| (idx, label))
+            })
+            .collect(),
+        has_asm_goto: func
+            .blocks
+            .iter()
+            .map(|block| {
+                crate::ir::analysis::asm_goto_successors(block)
+                    .next()
+                    .is_some()
             })
             .collect(),
         pred_copies: FxHashMap::default(),
@@ -1064,13 +1075,20 @@ fn classify_placement(
     pred_idx: usize,
     target_block_id: BlockId,
 ) -> CopyPlacement {
-    if ctx.asm_goto_edges.contains(&(pred_idx, target_block_id)) {
-        // An asm goto leaves the predecessor ahead of anything put at its
-        // end.  Copies placed there ran only when the block fell through:
-        // `asm goto(... : out); f(); out:` reached `out` by the asm goto
-        // with whatever the phi homes held.  The same goes for a block that
-        // is its own target.  The edge gets a block of its own, shared with
-        // the terminator if that goes to the target too.
+    if ctx.asm_goto_edges.contains(&(pred_idx, target_block_id))
+        || (ctx.has_asm_goto[pred_idx] && !ctx.is_indirect_branch[pred_idx])
+    {
+        // Nothing goes behind an asm goto.  It ends its block
+        // (`lower_inline_asm_stmt`), and the block is left through it ahead
+        // of anything put at the block's end: copies placed there ran only
+        // when the block fell through, so `asm goto(... : out); f(); out:`
+        // reached `out` by the asm goto with whatever the phi homes held.
+        // Every edge out of such a block gets a block of its own: the label
+        // edges, the terminator's (shared with a label edge to the same
+        // target -- the phi has one entry for the block), and the edge of a
+        // block that is its own target, whose copies would otherwise be
+        // absorbed into it.  (The targets of an indirect branch cannot be
+        // rerouted; its edges keep their copies in the block as before.)
         return CopyPlacement::Trampoline;
     }
     if !ctx.multi_succ[pred_idx] || ctx.is_indirect_branch[pred_idx] {
@@ -3043,6 +3061,112 @@ mod tests {
                 false_label: BlockId(3),
                 ..
             }
+        ));
+    }
+
+    /// A loop of one block: `v30 = phi(v5, v31); v31 = v30 + 1;`, left by
+    /// `exit` and repeated by its terminator.  Nothing outside reads `v30`,
+    /// so the copy `v30 = v31` of the back edge may be absorbed into the
+    /// block's end instead of costing a latch block.
+    fn one_block_loop(exit: Option<Instruction>) -> IrFunction {
+        use crate::common::types::IrType;
+        let carried = Instruction::Phi {
+            dest: Value(30),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Value(Value(5)), BlockId(0)),
+                (Operand::Value(Value(31)), BlockId(1)),
+            ],
+        };
+        let step = Instruction::BinOp {
+            dest: Value(31),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs: Operand::Value(Value(30)),
+            rhs: Operand::Const(crate::ir::reexports::IrConst::I64(1)),
+            ty: IrType::I64,
+        };
+        let mut body = vec![carried, step];
+        let leaves_by_asm_goto = exit.is_some();
+        body.extend(exit);
+        let mut func = IrFunction::new("l".to_string(), IrType::I64, Vec::new(), false);
+        func.blocks = vec![
+            blk(0, vec![cp(5, 4), cp(8, 4)], Terminator::Branch(BlockId(1))),
+            blk(
+                1,
+                body,
+                if leaves_by_asm_goto {
+                    Terminator::Branch(BlockId(1))
+                } else {
+                    cond(8, 1, 2)
+                },
+            ),
+            blk(
+                2,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(8)))),
+            ),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 3;
+        func
+    }
+
+    #[test]
+    fn nothing_is_put_behind_an_asm_goto_not_even_a_self_loop_copy() {
+        // Left by a branch, the block absorbs the copy: three blocks stay
+        // three, and the copy is the block's last instruction.
+        let plain = lower(one_block_loop(None));
+        assert_eq!(plain.blocks.len(), 3);
+        assert!(matches!(
+            plain.blocks[1].instructions.last(),
+            Some(Instruction::Copy {
+                dest: Value(30),
+                ..
+            })
+        ));
+
+        // Left by an asm goto, the block ends at the asm goto.  The copy
+        // gets a latch block of its own; at the block's end it would stand
+        // behind the asm goto, where liveness and every later reader of the
+        // block take it to have run on the way to the label too.
+        let asm_goto = Instruction::InlineAsm {
+            template: "jmp %l0".to_string(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("out".to_string(), BlockId(2))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        };
+        let func = lower(one_block_loop(Some(asm_goto)));
+        assert!(matches!(
+            func.blocks[1].instructions.last(),
+            Some(Instruction::InlineAsm { .. })
+        ));
+        let Terminator::Branch(latch) = func.blocks[1].terminator else {
+            panic!("the loop block still ends in a plain branch");
+        };
+        assert_ne!(
+            latch,
+            BlockId(1),
+            "the back edge goes through a latch block"
+        );
+        let latch_block = func
+            .blocks
+            .iter()
+            .find(|block| block.label == latch)
+            .expect("the latch block exists");
+        assert!(matches!(
+            latch_block.instructions.as_slice(),
+            [Instruction::Copy {
+                dest: Value(30),
+                src: Operand::Value(Value(31)),
+            }]
+        ));
+        assert!(matches!(
+            latch_block.terminator,
+            Terminator::Branch(BlockId(1))
         ));
     }
 

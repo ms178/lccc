@@ -195,21 +195,45 @@ fn collect_asm_goto_cc_branch_values(
                 target_edges.push((source_idx, *target, output_ptr.0, jcc));
             }
 
-            // Fall-through edge: the output's first load is the sole input to
-            // this block's CondBranch, with no intervening IR instruction.
+            // Fall-through edge.  The asm goto ends its block, so the branch
+            // is the block it falls through into: nothing but the load of the
+            // output, feeding that block's CondBranch, and no other way in --
+            // neither another predecessor nor an asm-goto label, which would
+            // arrive with flags of its own.  Between the template and the
+            // fused test then stand the store of the output (a `setcc`), a
+            // jump at most, and a label: none of them writes a flag.
+            if inst_idx + 1 != block.instructions.len() {
+                continue;
+            }
+            let Terminator::Branch(fallthrough) = &block.terminator else {
+                continue;
+            };
+            let Some(&fall_idx) = label_to_idx.get(fallthrough) else {
+                continue;
+            };
+            let predecessors = preds.row(fall_idx);
+            if asm_edge_counts.contains_key(fallthrough)
+                || predecessors.len() != 1
+                || predecessors[0] as usize != source_idx
+            {
+                continue;
+            }
+            let fall_block = &func.blocks[fall_idx];
             if let (
-                Some(Instruction::Load {
-                    dest,
-                    ptr,
-                    ty,
-                    volatile: false,
-                    ..
-                }),
+                [
+                    Instruction::Load {
+                        dest,
+                        ptr,
+                        ty,
+                        volatile: false,
+                        ..
+                    },
+                ],
                 Terminator::CondBranch {
                     cond: Operand::Value(branch_value),
                     ..
                 },
-            ) = (block.instructions.get(inst_idx + 1), &block.terminator)
+            ) = (fall_block.instructions.as_slice(), &fall_block.terminator)
             {
                 if *ptr == *output_ptr
                     && matches!(*ty, IrType::I8 | IrType::U8)
@@ -331,9 +355,10 @@ fn collect_asm_goto_cc_branch_values(
         }
     }
 
-    // Keep every fall-through fusion: its load is the *next* instruction and the
-    // branch is that block's terminator, so no instruction at all can sit
-    // between the template's flags and the fused test. Keep a label-edge fusion
+    // Keep every fall-through fusion: its load is the only instruction of the
+    // block the asm goto falls through into and the branch is that block's
+    // terminator, so no instruction at all can sit between the template's
+    // flags and the fused test. Keep a label-edge fusion
     // only when the output object carries no store anywhere; otherwise the
     // synthetic edge block materialises outputs and transfers control, and the
     // fused branch would consume flags produced by that path rather than by the

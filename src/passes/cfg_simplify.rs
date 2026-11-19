@@ -686,37 +686,55 @@ fn bool_return_disabled() -> bool {
     *DISABLED
 }
 
-/// Whether `block` ends in the shape the backend fuses with an asm-goto's own
-/// flags (`collect_asm_goto_cc_branch_values`): `asm goto(... : "=@cc<cc>"(obj)
-/// ...)`, then `cond = load obj`, then the branch on `cond`. The branch costs
-/// no `setcc` and no memory round trip there; turning it into a returned value
-/// would force the flag through the output object (`sete` to the stack, a
-/// reload, a compare and a second `setcc`), so the boolean-return fold leaves
-/// it alone.
-fn branches_on_asm_goto_flag_output(block: &BasicBlock, cond: Value) -> bool {
-    let n = block.instructions.len();
-    let (
-        Some(Instruction::InlineAsm {
-            outputs,
-            goto_labels,
-            ..
-        }),
-        Some(Instruction::Load { dest, ptr, .. }),
-    ) = (
-        n.checked_sub(2).and_then(|i| block.instructions.get(i)),
-        block.instructions.last(),
-    )
-    else {
+/// The blocks whose branch the backend fuses with an asm goto's own flags
+/// (`collect_asm_goto_cc_branch_values`), each with the flag object it reads:
+/// `asm goto(... : "=@cc<cc>"(obj) ...)` ends its block, and the block it
+/// falls through into holds `cond = load obj` and the branch on `cond`. The
+/// branch costs no `setcc` and no memory round trip there; turning it into a
+/// returned value would force the flag through the output object (`sete` to
+/// the stack, a reload, a compare and a second `setcc`), so the
+/// boolean-return fold leaves it alone.
+fn asm_goto_flag_fallthroughs(func: &IrFunction) -> FxHashMap<BlockId, Value> {
+    let mut out = FxHashMap::default();
+    for block in &func.blocks {
+        let (
+            Some(Instruction::InlineAsm {
+                outputs,
+                goto_labels,
+                ..
+            }),
+            Terminator::Branch(fallthrough),
+        ) = (block.instructions.last(), &block.terminator)
+        else {
+            continue;
+        };
+        if !goto_labels.is_empty()
+            && outputs.len() == 1
+            && outputs[0]
+                .0
+                .trim_start_matches(['=', '+', '&', '%'])
+                .starts_with("@cc")
+        {
+            out.insert(*fallthrough, outputs[0].1);
+        }
+    }
+    out
+}
+
+/// Whether `block` is such a block: nothing but the load of the flag object
+/// its asm goto wrote, feeding `cond`.
+fn branches_on_asm_goto_flag_output(
+    block: &BasicBlock,
+    cond: Value,
+    flag_fallthroughs: &FxHashMap<BlockId, Value>,
+) -> bool {
+    let Some(flag_object) = flag_fallthroughs.get(&block.label) else {
         return false;
     };
-    *dest == cond
-        && !goto_labels.is_empty()
-        && outputs.len() == 1
-        && outputs[0].1 == *ptr
-        && outputs[0]
-            .0
-            .trim_start_matches(['=', '+', '&', '%'])
-            .starts_with("@cc")
+    matches!(
+        block.instructions.as_slice(),
+        [Instruction::Load { dest, ptr, .. }] if *dest == cond && ptr == flag_object
+    )
 }
 
 /// `CondBranch(c, T, F)` where `T` and `F` are distinct, instruction-free
@@ -774,6 +792,8 @@ fn fold_boolean_return_branches(
             _ => None,
         }
     };
+    // Built on the first candidate: most functions have none.
+    let mut flag_fallthroughs: Option<FxHashMap<BlockId, Value>> = None;
     // (branching block, condition, whether the branch returns the condition
     // itself rather than its complement)
     let mut plans: Vec<(usize, Value, bool)> = Vec::new();
@@ -795,7 +815,11 @@ fn fold_boolean_return_branches(
         };
         if let (Some(on_true), Some(on_false)) = (returned_bit(t), returned_bit(f))
             && on_true != on_false
-            && !branches_on_asm_goto_flag_output(block, *cond)
+            && !branches_on_asm_goto_flag_output(
+                block,
+                *cond,
+                flag_fallthroughs.get_or_insert_with(|| asm_goto_flag_fallthroughs(func)),
+            )
         {
             plans.push((bi, *cond, on_true));
         }
