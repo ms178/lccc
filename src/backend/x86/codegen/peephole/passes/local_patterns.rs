@@ -1519,13 +1519,27 @@ pub(super) fn retarget_preloaded_scan_copies(
 /// that its semantic preload lives inside the RMW model), so a
 /// `tzcnt`-spelled triple does not occur and adding it here would create
 /// an untestable arm.
+/// The four plain scan spellings, pre-joined so the probe is a static
+/// 5-byte compare.  These used to be `format!`-assembled per probe, which
+/// put up to four 8-byte heap allocations on EVERY window the two scan
+/// matchers walked — DHAT measured 159,052 blocks per 40-function TU from
+/// exactly these two call sites, all freed within the probe.
+const SCAN_SPELLINGS: [(&str, &str, bool); 4] = [
+    ("bsfl ", "bsf", false),
+    ("bsfq ", "bsf", true),
+    ("bsrl ", "bsr", false),
+    ("bsrq ", "bsr", true),
+];
+
 fn match_preloaded_scan_copy(t: &[&str; 3]) -> Option<GuardedScanRewrite> {
-    let (mn, q, scan_ops) = [("bsf", false), ("bsf", true), ("bsr", false), ("bsr", true)]
+    // Necessary condition first: every spelling starts with 'b'.  One byte
+    // rejects ~every line before the four 5-byte compares.
+    if t[1].as_bytes().first() != Some(&b'b') {
+        return None;
+    }
+    let (mn, q, scan_ops) = SCAN_SPELLINGS
         .into_iter()
-        .find_map(|(mn, q)| {
-            let prefix = format!("{mn}{} ", if q { 'q' } else { 'l' });
-            t[1].strip_prefix(prefix.as_str()).map(|o| (mn, q, o))
-        })?;
+        .find_map(|(prefix, mn, q)| t[1].strip_prefix(prefix).map(|o| (mn, q, o)))?;
     let size = usize::from(!q);
     let (s, d) = scan_ops.split_once(", ")?;
     let s_fam = register_family(s)?;
@@ -1624,12 +1638,14 @@ fn is_imm_move_to(t: &str, fam: RegId) -> bool {
 /// `x ? ctz(x) : width` there. A guarded select around a `tzcnt` scan is
 /// therefore left exactly as written.
 fn match_guarded_scan_select(t: &[&str; 4]) -> Option<GuardedScanRewrite> {
-    let (mn, q, scan_ops) = [("bsf", false), ("bsf", true), ("bsr", false), ("bsr", true)]
+    // Same one-byte necessary condition as `match_preloaded_scan_copy`:
+    // every scan spelling starts with 'b'.
+    if t[0].as_bytes().first() != Some(&b'b') {
+        return None;
+    }
+    let (mn, q, scan_ops) = SCAN_SPELLINGS
         .into_iter()
-        .find_map(|(mn, q)| {
-            let prefix = format!("{mn}{} ", if q { 'q' } else { 'l' });
-            t[0].strip_prefix(prefix.as_str()).map(|o| (mn, q, o))
-        })?;
+        .find_map(|(prefix, mn, q)| t[0].strip_prefix(prefix).map(|o| (mn, q, o)))?;
     let size = usize::from(!q); // REG_NAMES row: 0 = 64-bit, 1 = 32-bit.
     let w = if q { 'q' } else { 'l' };
     let (s, d) = scan_ops.split_once(", ")?;
@@ -1643,17 +1659,32 @@ fn match_guarded_scan_select(t: &[&str; 4]) -> Option<GuardedScanRewrite> {
     {
         return None;
     }
-    let test = format!("test{w} {s}, {s}");
-    let mov = if t[1] == test {
+    // Exact `test{w} S, S` without building the owned pattern: prefix,
+    // one ", " split, both operands equal S — accepts precisely the
+    // strings the old `format!` equality accepted.
+    let test_pfx = if q { "testq " } else { "testl " };
+    let is_test = |l: &str| {
+        l.strip_prefix(test_pfx)
+            .and_then(|o| o.split_once(", "))
+            .is_some_and(|(a, b)| a == s && b == s)
+    };
+    let mov = if is_test(t[1]) {
         &t[2]
-    } else if t[2] == test {
+    } else if is_test(t[2]) {
         &t[1]
     } else {
         return None;
     };
+    // Post-gate (a scan already matched t[0]), so this is cold; the probes
+    // are still static spellings because `w` only ranges over {l, q}.
+    let (cmovne, cmovnz) = if q {
+        ("cmovneq ", "cmovnzq ")
+    } else {
+        ("cmovnel ", "cmovnzl ")
+    };
     let cmov_ops = t[3]
-        .strip_prefix(&format!("cmovne{w} "))
-        .or_else(|| t[3].strip_prefix(&format!("cmovnz{w} ")))?;
+        .strip_prefix(cmovne)
+        .or_else(|| t[3].strip_prefix(cmovnz))?;
     let (cm_src, r) = cmov_ops.split_once(", ")?;
     let r_fam = register_family(r)?;
     if cm_src != d
@@ -17075,6 +17106,207 @@ mod return_thunk_branch_tests {
             let out = store.build_result(|i| infos[i].is_nop());
             assert!(out.contains(&format!("jmp {target}")), "{out}");
             assert!(!out.contains(&format!("jne {target}")), "{out}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_matcher_probe_tests {
+    //! Acceptance oracles for `match_guarded_scan_select` and
+    //! `match_preloaded_scan_copy` after their probes became static
+    //! spellings behind a one-byte pre-filter (the `format!`-per-window
+    //! form was the top DHAT allocation site).  Every behavioural branch
+    //! the rewrite touched is pinned: all four scan spellings, the
+    //! pre-filter's 'b'-prefix edge cases, the zero-allocation
+    //! `test S, S` equality, and both cmov spellings.
+    use super::*;
+
+    fn run_pass(asm: &str, pass: fn(&mut LineStore, &mut [LineInfo]) -> bool) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        pass(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim_ascii().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn guarded_select_folds_all_four_spellings() {
+        for (scan, test, k, cmov, want_scan) in [
+            (
+                "bsfl %edi, %eax",
+                "testl %edi, %edi",
+                "movl $32, %ecx",
+                "cmovnel %eax, %ecx",
+                "bsfl %edi, %ecx",
+            ),
+            (
+                "bsrl %edi, %eax",
+                "testl %edi, %edi",
+                "movl $31, %ecx",
+                "cmovnel %eax, %ecx",
+                "bsrl %edi, %ecx",
+            ),
+            (
+                "bsfq %rdi, %rax",
+                "testq %rdi, %rdi",
+                "movq $64, %rcx",
+                "cmovneq %rax, %rcx",
+                "bsfq %rdi, %rcx",
+            ),
+            (
+                "bsrq %rdi, %rax",
+                "testq %rdi, %rdi",
+                "movq $63, %rcx",
+                "cmovneq %rax, %rcx",
+                "bsrq %rdi, %rcx",
+            ),
+        ] {
+            // The pass requires D dead after the cmov and dead flags:
+            // the result copy redefines D (%eax/%rax) and `ret` ends both
+            // live ranges, exactly like the real `x ? ctz(x) : K` tail.
+            let res = if scan.contains('q') {
+                "movq %rcx, %rax"
+            } else {
+                "movl %ecx, %eax"
+            };
+            let asm = format!("    {scan}\n    {test}\n    {k}\n    {cmov}\n    {res}\n    ret\n");
+            let out = run_pass(&asm, fold_guarded_scan_selects);
+            assert!(
+                out.iter().any(|l| l == want_scan),
+                "scan not retargeted for {scan}: {out:?}"
+            );
+            assert!(
+                !out.iter().any(|l| l.starts_with("cmov")),
+                "select must be folded away for {scan}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_select_accepts_cmovnz_and_swapped_mov_test() {
+        // cmovnz spelling, and the `mov $K` / `test` pair in either order.
+        for asm in [
+            "    bsfl %edi, %eax\n    testl %edi, %edi\n    movl $32, %ecx\n    cmovnzl %eax, %ecx\n    movl %ecx, %eax\n    ret\n",
+            "    bsfl %edi, %eax\n    movl $32, %ecx\n    testl %edi, %edi\n    cmovnel %eax, %ecx\n    movl %ecx, %eax\n    ret\n",
+        ] {
+            let out = run_pass(asm, fold_guarded_scan_selects);
+            assert!(
+                out.iter().any(|l| l == "bsfl %edi, %ecx"),
+                "fold must fire: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefilter_b_prefix_rejects_without_losing_scans() {
+        // Lines that start with 'b' but are not plain scans must not match
+        // (the one-byte pre-filter is a NECESSARY condition only), and
+        // non-'b' lines must be rejected outright.
+        for first in [
+            "btsl $3, %eax",     // 'b' prefix, not a scan
+            "bswapl %eax",       // 'b' prefix, not a scan
+            "tzcntl %edi, %eax", // doc'd law: tzcnt NEVER folds (BMI1 semantics)
+            "lzcntl %edi, %eax",
+            "", // empty line: the pre-filter must not panic
+        ] {
+            let asm = format!(
+                "    {first}\n    testl %edi, %edi\n    movl $32, %ecx\n    cmovnel %eax, %ecx\n"
+            );
+            let out = run_pass(&asm, fold_guarded_scan_selects);
+            assert!(
+                out.iter().any(|l| l.starts_with("cmov")),
+                "no fold may fire for `{first}`: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_equality_is_exact_not_fuzzy() {
+        // The zero-allocation `test S, S` check must accept exactly the
+        // canonical spelling: a test of a DIFFERENT register, or operands
+        // that merely contain S, must not satisfy the guard.
+        for test in [
+            "testl %esi, %esi", // wrong register
+            "testl %edi, %esi", // mixed
+            "testq %rdi, %rdi", // wrong width for an l-scan
+        ] {
+            let asm = format!(
+                "    bsfl %edi, %eax\n    {test}\n    movl $32, %ecx\n    cmovnel %eax, %ecx\n"
+            );
+            let out = run_pass(&asm, fold_guarded_scan_selects);
+            assert!(
+                out.iter().any(|l| l.starts_with("cmov")),
+                "guard `{test}` must not satisfy `testl %edi, %edi`: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preloaded_copy_retargets_all_four_spellings() {
+        for (pre, scan, copy, want_pre, want_scan) in [
+            (
+                "movl $32, %eax",
+                "bsfl %edi, %eax",
+                "movl %eax, %ecx",
+                "movl $32, %ecx",
+                "bsfl %edi, %ecx",
+            ),
+            (
+                "movl $31, %eax",
+                "bsrl %edi, %eax",
+                "movl %eax, %ecx",
+                "movl $31, %ecx",
+                "bsrl %edi, %ecx",
+            ),
+            (
+                "movq $64, %rax",
+                "bsfq %rdi, %rax",
+                "movq %rax, %rcx",
+                "movq $64, %rcx",
+                "bsfq %rdi, %rcx",
+            ),
+            (
+                "movq $63, %rax",
+                "bsrq %rdi, %rax",
+                "movq %rax, %rcx",
+                "movq $63, %rcx",
+                "bsrq %rdi, %rcx",
+            ),
+        ] {
+            let res = if scan.contains('q') {
+                "movq %rcx, %rax"
+            } else {
+                "movl %ecx, %eax"
+            };
+            let asm = format!("    {pre}\n    {scan}\n    {copy}\n    {res}\n    ret\n");
+            let out = run_pass(&asm, retarget_preloaded_scan_copies);
+            assert_eq!(
+                out,
+                vec![
+                    want_pre.to_string(),
+                    want_scan.to_string(),
+                    res.to_string(),
+                    "ret".to_string()
+                ],
+                "retarget shape for {scan}"
+            );
+        }
+    }
+
+    #[test]
+    fn preloaded_copy_prefilter_edges() {
+        // 'b'-prefixed non-scans and an empty middle line must not fire.
+        for mid in ["btcl $2, %eax", "bswapl %eax", "tzcntl %edi, %eax", ""] {
+            let asm = format!("    movl $32, %eax\n    {mid}\n    movl %eax, %ecx\n");
+            let out = run_pass(&asm, retarget_preloaded_scan_copies);
+            assert!(
+                out.iter().any(|l| l == "movl %eax, %ecx"),
+                "copy must survive for `{mid}`: {out:?}"
+            );
         }
     }
 }

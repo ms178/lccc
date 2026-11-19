@@ -700,6 +700,9 @@ gate "benchmark-hybrid-perf-contracts" fast \
     python3 scripts/test_benchmark_hybrid_perf.py
 gate "zlib-compare256-correctness" fast \
     python3 tests/regression/check_zlib_compare256.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
+gate "zlib-huffman-heap-correctness" fast \
+    python3 tests/regression/check_zlib_huffman_heap.py --lccc "$LCCC" \
+        --gcc "${GCC16:-gcc-16}" --clang "${CLANG:-clang-23}"
 
 gate "label-reference-cost-contracts" fast \
     python3 scripts/test_measure_label_ref_cost.py
@@ -712,6 +715,12 @@ gate "peephole-alloc-before-filter" fast \
 
 gate "peephole-alloc-before-filter-contracts" fast \
     python3 tests/regression/test_check_peephole_alloc_before_filter.py
+
+gate "format-probe-census" fast \
+    python3 tests/regression/check_format_probe_census.py
+
+gate "format-probe-census-contracts" fast \
+    python3 tests/regression/test_check_format_probe_census.py
 
 gate "simd-commutativity-agreement" fast \
     python3 tests/regression/check_simd_commutativity_agreement.py
@@ -3657,6 +3666,9 @@ if [ -x target/fastbuild/lccc-ld ]; then
     # check_nocfi_peephole_parity.sh), not to this one.
     gate "kernel-relocs-tool" fast \
         bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
+    gate "linker-elf-native-vendor" fast \
+        python3 tests/linker/elf_symbol_contract.py --ld target/fastbuild/lccc-ld \
+            --vendor-cc "gcc=${GCC16:-gcc-16}" --vendor-cc "clang=${CLANG:-clang-23}"
     gate "linker-harness-selftest" fast \
         python3 tests/linker/test_run_linker_helpers.py
     # GCC -fuse-ld=bfd does not discover the triplet-prefixed BFD 2.47 in the

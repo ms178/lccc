@@ -121,6 +121,14 @@ pub(super) struct LineInfo {
 
 /// What kind of assembly line this is, with pre-extracted fields for the
 /// patterns we care about.
+///
+/// `PartialEq`/`Hash` stay DERIVED on purpose: an attempt to route `eq`
+/// through [`LineKind::pack`] (one integer compare, injectivity-proven)
+/// measured 16x WORSE under the fastbuild profile — opt-level 1 does not
+/// inline the packing match, while the derived `eq`'s discriminant
+/// short-circuit is nearly free (Callgrind big40 -O1: 30M → 498M Ir on
+/// `eq` alone).  `pack` exists for [`LineInfo::digest_words`], where the
+/// whole word is wanted anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum LineKind {
     Nop,   // Deleted line (marked via LineInfo only)
@@ -187,6 +195,49 @@ pub(super) enum LineKind {
     /// pinned with all reg_refs set and has_indirect_mem=true so every
     /// conservative fallback path treats it as clobbering everything.
     InlineAsm,
+}
+
+impl LineKind {
+    /// Injective 64-bit packing: discriminant in bits 56..64, variant
+    /// payload (register family, move size, frame offset) below.  Every
+    /// payload fits 48 bits (`reg: u8`, `size: u8`, `offset: i32`), so
+    /// distinct values pack to distinct words and equal values pack
+    /// equally — the lossless-key property the liveness memo digest
+    /// ([`LineInfo::digest_words`]) relies on, oracle-tested in
+    /// `pack_is_injective_and_eq`.
+    ///
+    /// The match is exhaustive WITHOUT a wildcard on purpose: adding a
+    /// variant (or a payload field — the braces destructure fully) fails
+    /// compilation here instead of silently packing lossily.
+    #[inline]
+    pub(super) fn pack(self) -> u64 {
+        #[inline]
+        fn rbp(d: u64, reg: RegId, offset: i32, size: MoveSize) -> u64 {
+            (d << 56) | (reg as u64) | ((size as u64) << 8) | ((offset as u32 as u64) << 16)
+        }
+        match self {
+            LineKind::Nop => 0 << 56,
+            LineKind::Empty => 1 << 56,
+            LineKind::StoreRbp { reg, offset, size } => rbp(2, reg, offset, size),
+            LineKind::LoadRbp { reg, offset, size } => rbp(3, reg, offset, size),
+            LineKind::StoreXmmRbp { offset, size } => rbp(4, 0, offset, size),
+            LineKind::LoadXmmRbp { offset, size } => rbp(5, 0, offset, size),
+            LineKind::SelfMove => 6 << 56,
+            LineKind::Label => 7 << 56,
+            LineKind::Jmp => 8 << 56,
+            LineKind::JmpIndirect => 9 << 56,
+            LineKind::CondJmp => 10 << 56,
+            LineKind::Call => 11 << 56,
+            LineKind::Ret => 12 << 56,
+            LineKind::Push { reg } => (13 << 56) | reg as u64,
+            LineKind::Pop { reg } => (14 << 56) | reg as u64,
+            LineKind::SetCC { reg } => (15 << 56) | reg as u64,
+            LineKind::Cmp => 16 << 56,
+            LineKind::Directive => 17 << 56,
+            LineKind::Other { dest_reg } => (18 << 56) | dest_reg as u64,
+            LineKind::InlineAsm => 19 << 56,
+        }
+    }
 }
 
 /// Pre-parsed classification of what kind of extension/operation an instruction performs.
@@ -435,6 +486,49 @@ impl LineInfo {
         } else {
             &line[start..]
         }
+    }
+}
+
+impl LineInfo {
+    /// The complete semantic state of this line as three words, for the
+    /// liveness memo key (`passes::liveness::hash_function`).  The
+    /// previous key hashed the struct field-by-field through `FxHasher`
+    /// (a non-inlined derive walk: 1.57% of all compile instructions on
+    /// the 40-function mixed TU); these words are a LOSSLESS packing —
+    /// strictly more separating than any hash of the same fields — at the
+    /// cost of three inlined shifts-and-ors.
+    ///
+    /// The destructuring is exhaustive on purpose: a new `LineInfo` field
+    /// fails compilation here instead of silently escaping the memo key
+    /// (a field the key misses would let two semantically different
+    /// functions share one cached liveness answer — a miscompile, not a
+    /// slowdown).
+    #[inline]
+    pub(super) fn digest_words(&self) -> [u64; 3] {
+        let LineInfo {
+            kind,
+            ext_kind,
+            trim_start,
+            has_indirect_mem,
+            rbp_offset,
+            reg_refs,
+            pinned,
+            inert_dir,
+            volatile_access,
+            cfi,
+        } = *self;
+        [
+            kind.pack(),
+            (ext_kind as u64)
+                | ((cfi as u64) << 8)
+                | ((trim_start as u64) << 16)
+                | ((reg_refs as u64) << 32)
+                | ((has_indirect_mem as u64) << 48)
+                | ((pinned as u64) << 49)
+                | ((inert_dir as u64) << 50)
+                | ((volatile_access as u64) << 51),
+            rbp_offset as u32 as u64,
+        ]
     }
 }
 
@@ -4296,5 +4390,160 @@ mod segment_override_slot_tests {
         let info = classify_line("    movdqu %xmm0, %gs:(%rbp)");
         assert!(info.has_indirect_mem);
         assert_eq!(info.rbp_offset, RBP_OFFSET_NONE);
+    }
+}
+
+#[cfg(test)]
+mod pack_digest_tests {
+    use super::*;
+
+    /// Every variant shape at payload extremes.  Kept exhaustive by hand;
+    /// the `match` in `pack` itself is the compile-time exhaustiveness
+    /// guard for NEW variants, this list is the behavioural oracle for
+    /// the EXISTING ones.
+    fn kind_samples() -> Vec<LineKind> {
+        let mut v = vec![
+            LineKind::Nop,
+            LineKind::Empty,
+            LineKind::SelfMove,
+            LineKind::Label,
+            LineKind::Jmp,
+            LineKind::JmpIndirect,
+            LineKind::CondJmp,
+            LineKind::Call,
+            LineKind::Ret,
+            LineKind::Cmp,
+            LineKind::Directive,
+            LineKind::InlineAsm,
+        ];
+        let sizes = [
+            MoveSize::Q,
+            MoveSize::L,
+            MoveSize::W,
+            MoveSize::B,
+            MoveSize::SLQ,
+            MoveSize::SD,
+            MoveSize::SS,
+            MoveSize::DQ,
+            MoveSize::QQ,
+        ];
+        let offsets = [i32::MIN, -24, -1, 0, 1, 8, i32::MAX];
+        let regs = [0u8, 1, 15, 31, REG_NONE];
+        for &offset in &offsets {
+            for &size in &sizes {
+                for &reg in &regs {
+                    v.push(LineKind::StoreRbp { reg, offset, size });
+                    v.push(LineKind::LoadRbp { reg, offset, size });
+                }
+                v.push(LineKind::StoreXmmRbp { offset, size });
+                v.push(LineKind::LoadXmmRbp { offset, size });
+            }
+        }
+        for &reg in &regs {
+            v.push(LineKind::Push { reg });
+            v.push(LineKind::Pop { reg });
+            v.push(LineKind::SetCC { reg });
+            v.push(LineKind::Other { dest_reg: reg });
+        }
+        v
+    }
+
+    /// `pack` must be injective and `eq` must be exactly structural
+    /// equality: for every pair in the sample cross product, packed-word
+    /// equality, `PartialEq`, and field-wise structural identity (via the
+    /// derived `Hash`-feeding `Debug` representation) must agree.
+    #[test]
+    fn pack_is_injective_and_eq() {
+        let samples = kind_samples();
+        for (i, a) in samples.iter().enumerate() {
+            for (j, b) in samples.iter().enumerate() {
+                let structurally_equal = format!("{a:?}") == format!("{b:?}");
+                assert_eq!(
+                    a.pack() == b.pack(),
+                    structurally_equal,
+                    "pack() equality must match structural equality: {a:?} vs {b:?} (i={i}, j={j})"
+                );
+                assert_eq!(
+                    a == b,
+                    structurally_equal,
+                    "PartialEq must be structural equality: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Negative frame offsets (the common case: locals live below %rbp)
+    /// must not smear sign bits across the discriminant or register
+    /// fields of the packed word.
+    #[test]
+    fn pack_isolates_negative_offsets() {
+        let a = LineKind::StoreRbp {
+            reg: 0,
+            offset: -8,
+            size: MoveSize::Q,
+        };
+        let b = LineKind::LoadRbp {
+            reg: 0,
+            offset: -8,
+            size: MoveSize::Q,
+        };
+        assert_ne!(a.pack(), b.pack(), "discriminant survives offset sign bits");
+        assert_eq!(a.pack() >> 56, 2, "StoreRbp discriminant intact");
+        assert_eq!(b.pack() >> 56, 3, "LoadRbp discriminant intact");
+        assert_eq!(a.pack() & 0xff, 0, "reg field intact under negative offset");
+    }
+
+    /// `digest_words` must separate every single-field change: two
+    /// `LineInfo`s that differ in exactly one field must produce different
+    /// word triples (this is the lossless-key property the liveness memo
+    /// relies on -- a collision here would be a cache-correctness bug, not
+    /// a performance bug).
+    #[test]
+    fn digest_words_separate_every_field() {
+        let base = classify_line("    movq %rax, -8(%rbp)");
+        let mut variants: Vec<(&str, LineInfo)> = Vec::new();
+        let mut v = base;
+        v.kind = LineKind::Cmp;
+        variants.push(("kind", v));
+        let mut v = base;
+        v.ext_kind = ExtKind::Cltq;
+        variants.push(("ext_kind", v));
+        let mut v = base;
+        v.trim_start = base.trim_start + 1;
+        variants.push(("trim_start", v));
+        let mut v = base;
+        v.has_indirect_mem = !base.has_indirect_mem;
+        variants.push(("has_indirect_mem", v));
+        let mut v = base;
+        v.rbp_offset = base.rbp_offset.wrapping_add(8);
+        variants.push(("rbp_offset", v));
+        let mut v = base;
+        v.reg_refs = base.reg_refs ^ 0x8000;
+        variants.push(("reg_refs", v));
+        let mut v = base;
+        v.pinned = !base.pinned;
+        variants.push(("pinned", v));
+        let mut v = base;
+        v.inert_dir = !base.inert_dir;
+        variants.push(("inert_dir", v));
+        let mut v = base;
+        v.volatile_access = !base.volatile_access;
+        variants.push(("volatile_access", v));
+        let mut v = base;
+        v.cfi = CfiMark::Start;
+        variants.push(("cfi", v));
+        let bw = base.digest_words();
+        for (field, variant) in &variants {
+            assert_ne!(
+                variant.digest_words(),
+                bw,
+                "digest_words must separate a change in `{field}`"
+            );
+        }
+        // And identical state must digest identically (determinism).
+        assert_eq!(
+            base.digest_words(),
+            classify_line("    movq %rax, -8(%rbp)").digest_words()
+        );
     }
 }

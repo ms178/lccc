@@ -433,6 +433,9 @@ pub struct MergedSection {
     pub sh_type: u32,
     pub sh_flags: u64,
     pub data: Vec<u8>,
+    /// Virtual extent when `sh_type == SHT_NOBITS`. Such sections have no
+    /// payload, including during each relaxation layout probe.
+    pub nobits_size: u64,
     pub vaddr: u64,
     pub align: u64,
     /// `sh_entsize` while the output keeps `SHF_MERGE` (GNU ld's rule,
@@ -442,6 +445,51 @@ pub struct MergedSection {
     /// only `.srodata` inputs fill sits in the RW segment): layout honours
     /// it, the section header keeps the inputs' flags as GNU ld's does.
     pub script_write: bool,
+}
+
+impl MergedSection {
+    pub fn size(&self) -> u64 {
+        if self.sh_type == SHT_NOBITS {
+            self.nobits_size
+        } else {
+            self.data.len() as u64
+        }
+    }
+
+    /// Grow the extent of a NOBITS section, or materialize a zero gap in a
+    /// file-backed section. The latter is needed for legitimately mixed
+    /// outputs, never for an ordinary COMMON, BSS, or TBSS allocation.
+    pub fn zero_extend_to(&mut self, end: u64) -> Result<(), String> {
+        if self.sh_type == SHT_NOBITS {
+            debug_assert!(self.data.is_empty());
+            self.nobits_size = end;
+        } else {
+            let end = usize::try_from(end)
+                .map_err(|_| format!("RISC-V section {} exceeds host size", self.name))?;
+            self.data
+                .try_reserve(end.saturating_sub(self.data.len()))
+                .map_err(|_| {
+                    format!("cannot allocate RISC-V section {} ({end} bytes)", self.name)
+                })?;
+            self.data.resize(end, 0);
+        }
+        Ok(())
+    }
+}
+
+/// The virtual extent of NOBITS isn't bounded by the host allocator. Keep
+/// address math checked even for a section with no file bytes at all.
+pub(super) fn checked_layout_add(addr: u64, size: u64) -> Result<u64, String> {
+    addr.checked_add(size)
+        .ok_or_else(|| "RISC-V section layout exceeds address space".into())
+}
+
+pub(super) fn checked_layout_align(addr: u64, align: u64) -> Result<u64, String> {
+    if !align.is_power_of_two() {
+        return Err(format!("invalid RISC-V section alignment {align}"));
+    }
+    addr.checked_next_multiple_of(align)
+        .ok_or_else(|| "RISC-V section alignment exceeds address space".into())
 }
 
 /// Tracks where each input section maps to in the merged output.
@@ -499,7 +547,12 @@ pub fn output_section_name(name: &str, sh_type: u32, sh_flags: u64) -> Option<St
 
     // Array sections: fold numbered variants (.init_array.65535 -> .init_array)
     for arr in &[".init_array", ".fini_array", ".preinit_array"] {
-        if name == *arr || name.starts_with(&format!("{}.", arr)) {
+        // `.init_array` or `.init_array.<anything>` — the numbered-variant
+        // check is a prefix + one-byte test, not an owned `format!` pattern.
+        let matches = name
+            .strip_prefix(*arr)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'));
+        if matches {
             return Some(arr.to_string());
         }
     }
@@ -777,5 +830,46 @@ mod auipc_encoding_tests {
                 assert_eq!(decoded_high + decoded_low, expected);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod section_fold_tests {
+    //! Oracles for `output_section_name`'s array-section folding after the
+    //! numbered-variant probe became `strip_prefix` + one-byte test instead
+    //! of a `format!`-built pattern.  The acceptance set is pinned exactly:
+    //! the bare name, any `.`-separated variant, and nothing else.
+    use super::output_section_name;
+
+    // `.init_array`/`.fini_array`/`.preinit_array` carry SHT_INIT_ARRAY /
+    // SHT_FINI_ARRAY / SHT_PREINIT_ARRAY, but the fold is name-driven;
+    // PROGBITS+ALLOC reaches it for all of them.
+    const SHT_PROGBITS: u32 = 1;
+    const ALLOC: u64 = 2;
+
+    fn fold(name: &str) -> Option<String> {
+        output_section_name(name, SHT_PROGBITS, ALLOC)
+    }
+
+    #[test]
+    fn bare_and_numbered_array_sections_fold() {
+        for arr in [".init_array", ".fini_array", ".preinit_array"] {
+            assert_eq!(fold(arr).as_deref(), Some(arr), "bare {arr}");
+            let numbered = format!("{arr}.65535");
+            assert_eq!(fold(&numbered).as_deref(), Some(arr), "{numbered}");
+            let dot_only = format!("{arr}.");
+            assert_eq!(fold(&dot_only).as_deref(), Some(arr), "{dot_only}");
+        }
+    }
+
+    #[test]
+    fn lookalike_names_do_not_fold() {
+        // A name that merely extends the array name without the separating
+        // dot must not fold into it (the old `== || starts_with("{arr}.")`
+        // rejected these too; the strip_prefix form must as well).
+        assert_eq!(fold(".init_arrayX").as_deref(), Some(".init_arrayX"));
+        assert_eq!(fold(".init_arrays.0").as_deref(), Some(".init_arrays.0"));
+        // `.preinit_array` must not be captured by the `.init_array` arm.
+        assert_eq!(fold(".preinit_array.1").as_deref(), Some(".preinit_array"));
     }
 }

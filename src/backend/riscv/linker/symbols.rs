@@ -7,7 +7,7 @@
 use super::elf_read::*;
 use super::got::GotKind;
 use super::relocations::{GlobalSym, MergedSection, got_sym_key};
-use crate::backend::elf::{STT_TLS, STV_DEFAULT};
+use crate::backend::elf::{STT_FILE, STT_TLS, STV_DEFAULT};
 use crate::backend::linker_common;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -64,185 +64,180 @@ pub fn import_shared_commons(
     }
 }
 
-/// Build the global symbol table from all input objects.
-///
-/// For each non-local symbol, creates or updates a `GlobalSym` entry.
-/// Handles SHN_UNDEF (undefined), SHN_ABS (absolute), SHN_COMMON (common/BSS),
-/// and defined symbols. Weak-to-strong overrides are applied.
+/// Build the global symbol table and allocate only the surviving commons.
+/// During selection, COMMON's `value` is its maximum alignment, and
+/// `section_idx == Some(PENDING_COMMON)` identifies the pending slot.
 pub fn build_global_symbols(
     input_objs: &[(String, ElfObject)],
     sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     merged_sections: &mut Vec<MergedSection>,
     merged_map: &mut FxHashMap<String, usize>,
-) -> FxHashMap<String, GlobalSym> {
-    let mut global_syms: FxHashMap<String, GlobalSym> = FxHashMap::default();
+    allow_multiple_definition: bool,
+) -> Result<FxHashMap<String, GlobalSym>, String> {
+    const PENDING_COMMON: usize = usize::MAX;
+    let mut globals: FxHashMap<String, GlobalSym> = FxHashMap::default();
+    let mut commons = Vec::new();
+    let mut unplaced_visibility: FxHashMap<&str, u8> = FxHashMap::default();
 
-    for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
+    for (obj_idx, (source, obj)) in input_objs.iter().enumerate() {
         for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.binding() == STB_LOCAL {
+            let name = sym.name.as_str();
+            if name.is_empty() || sym.is_local() || matches!(sym.sym_type(), STT_SECTION | STT_FILE)
+            {
                 continue;
             }
-
-            if sym.shndx == SHN_UNDEF {
-                let entry = global_syms
-                    .entry(sym.name.to_string())
-                    .or_insert_with(|| GlobalSym {
-                        value: 0,
-                        size: 0,
-                        binding: sym.binding(),
-                        sym_type: sym.sym_type(),
-                        visibility: sym.visibility(),
-                        defined: false,
-                        needs_plt: false,
-                        plt_idx: 0,
-                        section_idx: None,
-                        placeholder: false,
-                    });
-                // A weak reference seen first must not make a later strong
-                // unresolved reference optional (including hidden symbols).
-                if !entry.defined && sym.binding() == STB_GLOBAL {
-                    entry.binding = STB_GLOBAL;
-                }
-                continue;
-            }
-
-            if sym.shndx == SHN_ABS {
-                let entry = global_syms
-                    .entry(sym.name.to_string())
-                    .or_insert_with(|| GlobalSym {
-                        value: sym.value,
-                        size: sym.size,
-                        binding: sym.binding(),
-                        sym_type: sym.sym_type(),
-                        visibility: sym.visibility(),
-                        defined: true,
-                        needs_plt: false,
-                        plt_idx: 0,
-                        section_idx: None,
-                        placeholder: false,
-                    });
-                if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-                    entry.value = sym.value;
-                    entry.size = sym.size;
-                    entry.binding = sym.binding();
-                    entry.sym_type = sym.sym_type();
-                    entry.defined = true;
-                    // An absolute definition replacing a weak section symbol
-                    // no longer receives the old section's load address.
-                    entry.section_idx = None;
-                }
-                continue;
-            }
-
-            if sym.shndx == SHN_COMMON {
-                allocate_common_symbol(sym, &mut global_syms, merged_sections, merged_map);
-                continue;
-            }
-
-            let sec_idx = sym.shndx as usize;
-            let (merged_idx, offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
-                Some(&v) => v,
-                None => continue,
+            let (section, base) = match sym.shndx {
+                SHN_UNDEF | SHN_ABS => (None, 0),
+                SHN_COMMON => (Some(PENDING_COMMON), 0),
+                shndx => match sec_mapping.get(&(obj_idx, shndx as usize)) {
+                    Some(&(section, base)) => (Some(section), base),
+                    None => {
+                        // A COMDAT loser is not a definition, but it can still
+                        // restrict a same-name symbol that does survive layout.
+                        let vis = sym.visibility();
+                        if vis != STV_DEFAULT {
+                            let entry = unplaced_visibility.entry(name).or_default();
+                            *entry = linker_common::most_constraining_visibility(*entry, vis);
+                        }
+                        continue;
+                    }
+                },
             };
-
-            let entry = global_syms
-                .entry(sym.name.to_string())
-                .or_insert_with(|| GlobalSym {
-                    value: 0,
-                    size: sym.size,
-                    binding: sym.binding(),
-                    sym_type: sym.sym_type(),
-                    visibility: sym.visibility(),
-                    defined: false,
-                    needs_plt: false,
-                    plt_idx: 0,
-                    section_idx: None,
-                    placeholder: false,
-                });
-
-            if entry.defined && !(entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-                continue;
+            let defined = !sym.is_undefined();
+            let common = section == Some(PENDING_COMMON);
+            let binding = sym.binding();
+            let rank = |defined, common, binding| match (defined, common, binding == STB_WEAK) {
+                (false, _, true) => 0,
+                (false, _, false) => 1,
+                (true, true, _) => 3,
+                (true, false, true) => 2,
+                (true, false, false) => 4,
+            };
+            let mut vis = sym.visibility();
+            let mut old = globals.get_mut(name);
+            if let Some(e) = old.as_deref() {
+                vis = linker_common::most_constraining_visibility(vis, e.visibility);
             }
-
-            entry.value = offset + sym.value;
-            entry.size = sym.size;
-            entry.binding = sym.binding();
-            entry.sym_type = sym.sym_type();
-            entry.visibility = sym.visibility();
-            entry.defined = true;
-            entry.section_idx = Some(merged_idx);
-        }
-    }
-
-    // The gABI combines visibility from ALL definitions and references, not
-    // just the winning definition. A hidden reference in a second TU must
-    // constrain a default-visible definition in either input order.
-    for (_, obj) in input_objs {
-        for sym in &obj.symbols {
-            if sym.binding() != STB_LOCAL && sym.visibility() != STV_DEFAULT {
-                if let Some(global) = global_syms.get_mut(sym.name.as_str()) {
-                    global.visibility = crate::backend::linker_common::most_constraining_visibility(
-                        global.visibility,
-                        sym.visibility(),
-                    );
+            if let Some(e) = old.as_deref_mut() {
+                let old_common = e.section_idx == Some(PENDING_COMMON);
+                let old_rank = rank(e.defined, old_common, e.binding);
+                let new_rank = rank(defined, common, binding);
+                if common && old_common {
+                    e.value = e.value.max(sym.value);
+                    e.size = e.size.max(sym.size);
+                    e.visibility = vis;
+                    if e.binding == STB_WEAK {
+                        e.binding = binding;
+                    }
+                    continue;
+                }
+                if new_rank <= old_rank {
+                    if new_rank == 4
+                        && old_rank == 4
+                        && !allow_multiple_definition
+                        && !(sym.shndx == SHN_ABS
+                            && e.section_idx.is_none()
+                            && e.value == sym.value)
+                    {
+                        // Keep provenance off the hot table. Only the failing
+                        // path needs to identify the first placed definition.
+                        let first =
+                            input_objs[..=obj_idx]
+                                .iter()
+                                .enumerate()
+                                .find(|(i, (_, o))| {
+                                    o.symbols.iter().any(|s| {
+                                        s.name.as_str() == name
+                                            && s.is_strong()
+                                            && (s.shndx == SHN_ABS
+                                                || sec_mapping
+                                                    .contains_key(&(*i, s.shndx as usize)))
+                                    })
+                                });
+                        let origin = first.map_or(source.as_str(), |(_, (file, _))| file.as_str());
+                        return Err(format!(
+                            "multiple definition of '{name}' in {source}; first defined in {origin}",
+                        ));
+                    }
+                    e.visibility = vis;
+                    continue;
                 }
             }
+            if common {
+                commons.push(name);
+            }
+            let value = if defined {
+                base.checked_add(sym.value).ok_or_else(|| {
+                    format!("{source}: section offset for '{name}' exceeds 64-bit address space",)
+                })?
+            } else {
+                0
+            };
+            let winner = GlobalSym {
+                value,
+                size: if defined { sym.size } else { 0 },
+                binding,
+                sym_type: if common { STT_OBJECT } else { sym.sym_type() },
+                visibility: vis,
+                defined,
+                needs_plt: false,
+                plt_idx: 0,
+                section_idx: section,
+                placeholder: false,
+            };
+            if let Some(e) = old {
+                *e = winner;
+            } else {
+                globals.insert(name.to_owned(), winner);
+            }
         }
     }
-    global_syms
-}
 
-/// Allocate a COMMON symbol in .bss.
-fn allocate_common_symbol(
-    sym: &Symbol,
-    global_syms: &mut FxHashMap<String, GlobalSym>,
-    merged_sections: &mut Vec<MergedSection>,
-    merged_map: &mut FxHashMap<String, usize>,
-) {
-    let bss_idx = *merged_map.entry(".bss".into()).or_insert_with(|| {
-        let idx = merged_sections.len();
-        merged_sections.push(MergedSection {
-            name: ".bss".into(),
-            sh_type: SHT_NOBITS,
-            sh_flags: SHF_ALLOC | SHF_WRITE,
-            data: Vec::new(),
-            vaddr: 0,
-            entsize: 0,
-            script_write: false,
-            align: 8,
-        });
-        idx
-    });
-    let ms = &mut merged_sections[bss_idx];
-    let align = sym.value.max(1) as usize; // st_value is alignment for COMMON
-    let cur = ms.data.len();
-    let aligned = (cur + align - 1) & !(align - 1);
-    ms.data.resize(aligned, 0);
-    let off = ms.data.len() as u64;
-    ms.data.resize(ms.data.len() + sym.size as usize, 0);
-    ms.align = ms.align.max(align as u64);
-
-    let entry = global_syms
-        .entry(sym.name.to_string())
-        .or_insert_with(|| GlobalSym {
-            value: off,
-            size: sym.size,
-            binding: sym.binding(),
-            sym_type: STT_OBJECT,
-            visibility: sym.visibility(),
-            defined: true,
-            needs_plt: false,
-            plt_idx: 0,
-            section_idx: Some(bss_idx),
-            placeholder: false,
-        });
-    if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
-        entry.value = off;
-        entry.size = sym.size.max(entry.size);
-        entry.binding = sym.binding();
-        entry.defined = true;
-        entry.section_idx = Some(bss_idx);
+    for (name, vis) in unplaced_visibility {
+        if let Some(sym) = globals.get_mut(name) {
+            sym.visibility = linker_common::most_constraining_visibility(sym.visibility, vis);
+        }
     }
+    for name in commons {
+        let Some(sym) = globals.get_mut(name) else {
+            continue;
+        };
+        if sym.section_idx != Some(PENDING_COMMON) {
+            continue; // A strong definition superseded this tentative one.
+        }
+        let bss_idx = *merged_map.entry(".bss".into()).or_insert_with(|| {
+            let idx = merged_sections.len();
+            merged_sections.push(MergedSection {
+                name: ".bss".into(),
+                sh_type: SHT_NOBITS,
+                sh_flags: SHF_ALLOC | SHF_WRITE,
+                data: Vec::new(),
+                nobits_size: 0,
+                vaddr: 0,
+                entsize: 0,
+                script_write: false,
+                align: 8,
+            });
+            idx
+        });
+        let bss = &mut merged_sections[bss_idx];
+        let align = sym.value.max(1);
+        let cur = bss.size();
+        let Some(off) = cur
+            .checked_next_multiple_of(align)
+            .filter(|_| align.is_power_of_two())
+        else {
+            return Err(format!("invalid COMMON alignment {align} for '{name}'"));
+        };
+        let end = off
+            .checked_add(sym.size)
+            .ok_or_else(|| format!("COMMON symbol '{name}' exceeds address space"))?;
+        bss.zero_extend_to(end)?;
+        bss.align = bss.align.max(align);
+        sym.value = off;
+        sym.section_idx = Some(bss_idx);
+    }
+    Ok(globals)
 }
 
 /// Mark symbols that need PLT entries (undefined functions found in shared libs)

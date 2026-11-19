@@ -12,8 +12,8 @@ use super::got::{
 use super::relax::{LayoutProbe, RelaxProbeLayout, fill_relax_probe};
 use super::relocations::{
     GlobalSym, MergedSection, R_RISCV_ALIGN, R_RISCV_CALL, R_RISCV_CALL_PLT, R_RISCV_GOT_HI20,
-    R_RISCV_JAL, R_RISCV_NONE, R_RISCV_RELAX, R_RISCV_RVC_JUMP, align_up, build_gnu_hash, pad_to,
-    write_phdr,
+    R_RISCV_JAL, R_RISCV_NONE, R_RISCV_RELAX, R_RISCV_RVC_JUMP, align_up, build_gnu_hash,
+    checked_layout_add, checked_layout_align, pad_to, write_phdr,
 };
 use super::{debug, reloc, symbols};
 use crate::backend::linker_common;
@@ -148,6 +148,7 @@ pub fn emit_executable(
             sh_type: SHT_PROGBITS,
             sh_flags: SHF_ALLOC,
             data: vec![0u8; hdr_size],
+            nobits_size: 0,
             vaddr: 0,
             entsize: 0,
             script_write: false,
@@ -196,7 +197,7 @@ pub fn emit_executable(
         got_plt_size: if is_static { 0 } else { got_plt_size },
         ifunc_count,
         copy_symbols,
-    });
+    })?;
     let has_rw_segment = rw_probe.end != 0;
     let relro_phdr = relro && rw_probe.relro_end_raw != 0;
 
@@ -206,7 +207,7 @@ pub fn emit_executable(
     let mut prev_note = false;
     for &si in sec_indices {
         let ms = &merged_sections[si];
-        if ms.sh_flags & SHF_ALLOC == 0 || ms.data.is_empty() || ms.name == ".riscv.attributes" {
+        if ms.sh_flags & SHF_ALLOC == 0 || ms.size() == 0 || ms.name == ".riscv.attributes" {
             continue;
         }
         let is_note = ms.sh_type == SHT_NOTE;
@@ -518,9 +519,9 @@ pub fn emit_executable(
         file_offset = align_up(file_offset, align);
         section_vaddrs[si] = vaddr;
         section_offsets[si] = file_offset;
-        let size = ms.data.len() as u64;
-        file_offset += size;
-        vaddr += size;
+        let size = ms.size();
+        file_offset = checked_layout_add(file_offset, size)?;
+        vaddr = checked_layout_add(vaddr, size)?;
     }
 
     let rx_segment_end_vaddr = vaddr;
@@ -553,21 +554,22 @@ pub fn emit_executable(
                 copy_symbols,
             })
         };
-        let first_base = align_up(rx_end, PAGE_SIZE) + if relro { 0 } else { rx_end % PAGE_SIZE };
-        let first = lay(first_base, false);
+        let rounded = checked_layout_align(rx_end, PAGE_SIZE)?;
+        let first_base = checked_layout_add(rounded, if relro { 0 } else { rx_end % PAGE_SIZE })?;
+        let first = lay(first_base, false)?;
         if relro {
             // lang_size_relro_segment_1: from the last relro section back,
             // move each up so it ends where the next one starts.
-            let relro_end = align_up(first.relro_end_raw, PAGE_SIZE);
+            let relro_end = checked_layout_align(first.relro_end_raw, PAGE_SIZE)?;
             let mut desired = relro_end - relro_offset;
             for &(start, size, align) in first.relro_sections.iter().rev() {
                 let bumped = start + (desired - (start + size));
                 desired = bumped & !(align.max(1) - 1);
             }
-            let adjusted = lay(desired.max(first_base), true);
+            let adjusted = lay(desired.max(first_base), true)?;
             // Alignment can defeat the move; ld then reverts to the first base.
-            if align_up(adjusted.relro_end_raw, PAGE_SIZE) > relro_end {
-                lay(first_base, true)
+            if checked_layout_align(adjusted.relro_end_raw, PAGE_SIZE)? > relro_end {
+                lay(first_base, true)?
             } else {
                 adjusted
             }
@@ -579,7 +581,7 @@ pub fn emit_executable(
                 && first_base / PAGE_SIZE != first.end / PAGE_SIZE
                 && first_part + last_part <= PAGE_SIZE;
             if saves_page {
-                lay(align_up(rx_end, PAGE_SIZE), false)
+                lay(rounded, false)?
             } else {
                 first
             }
@@ -649,8 +651,8 @@ pub fn emit_executable(
     if let (true, Some(&bss_idx), Some(bss_end)) =
         (has_rw_segment, merged_map.get(".bss"), rw.bss_end)
     {
-        let size = (bss_end - section_vaddrs[bss_idx]) as usize;
-        merged_sections[bss_idx].data.resize(size, 0);
+        let size = bss_end - section_vaddrs[bss_idx];
+        merged_sections[bss_idx].zero_extend_to(size)?;
     }
     let vaddr = rw.end;
     let file_offset = offset_of(rw.file_end);
@@ -1404,7 +1406,7 @@ pub fn emit_executable(
         if ms.name == ".riscv.attributes" || Some(si) == build_id_idx {
             continue;
         }
-        if ms.data.is_empty() {
+        if ms.size() == 0 {
             continue;
         }
         pad_to(&mut elf, section_offsets[si] as usize);
@@ -1422,8 +1424,6 @@ pub fn emit_executable(
         if ms.sh_flags & SHF_ALLOC == 0
             || (ms.sh_flags & SHF_WRITE == 0 && ms.sh_flags & SHF_TLS == 0)
             || ms.sh_type == SHT_NOBITS
-            || ms.name == ".bss"
-            || ms.name == ".sbss"
             || ms.data.is_empty()
         {
             continue;
@@ -1873,7 +1873,7 @@ struct RwLayout {
 }
 
 /// Lay the RW segment out from `inp.base` in GNU ld's script order.
-fn lay_rw(inp: &RwInputs) -> RwLayout {
+fn lay_rw(inp: &RwInputs) -> Result<RwLayout, String> {
     let ms = inp.merged_sections;
     let by_name = |name: &str| {
         inp.sec_indices
@@ -1881,7 +1881,7 @@ fn lay_rw(inp: &RwInputs) -> RwLayout {
             .copied()
             .find(|&i| ms[i].name == name)
     };
-    let size = |i: usize| ms[i].data.len() as u64;
+    let size = |i: usize| ms[i].size();
     let align = |i: usize| ms[i].align.max(1);
     let mut dot = inp.base;
     let mut sections = Vec::new();
@@ -1905,19 +1905,20 @@ fn lay_rw(inp: &RwInputs) -> RwLayout {
     };
     for &i in inp.sec_indices {
         if ms[i].sh_flags & SHF_TLS != 0 && ms[i].sh_type != SHT_NOBITS {
-            dot = align_up(dot, align(i));
+            dot = checked_layout_align(dot, align(i))?;
             sections.push((i, dot));
             relro_sections.push((dot, size(i), align(i)));
-            grow_tls(dot, Some(dot + size(i)), dot + size(i), align(i));
-            dot += size(i);
+            let end = checked_layout_add(dot, size(i))?;
+            grow_tls(dot, Some(end), end, align(i));
+            dot = end;
         }
     }
     for &i in inp.sec_indices {
         if ms[i].sh_flags & SHF_TLS != 0 && ms[i].sh_type == SHT_NOBITS {
-            dot = align_up(dot, align(i));
+            dot = checked_layout_align(dot, align(i))?;
             sections.push((i, dot));
             relro_sections.push((dot, 0, align(i)));
-            grow_tls(dot, None, dot + size(i), align(i));
+            grow_tls(dot, None, checked_layout_add(dot, size(i))?, align(i));
         }
     }
     let mut init_arrays = FxHashMap::default();
@@ -1928,31 +1929,31 @@ fn lay_rw(inp: &RwInputs) -> RwLayout {
         ".data.rel.ro",
     ] {
         if let Some(i) = by_name(name) {
-            dot = align_up(dot, align(i));
+            dot = checked_layout_align(dot, align(i))?;
             sections.push((i, dot));
             if size(i) != 0 {
                 relro_sections.push((dot, size(i), align(i)));
             }
             init_arrays.insert(name.to_string(), (dot, size(i)));
-            dot += size(i);
+            dot = checked_layout_add(dot, size(i))?;
         }
     }
     if inp.dynamic_size != 0 {
-        dot = align_up(dot, 8);
+        dot = checked_layout_align(dot, 8)?;
         relro_sections.push((dot, inp.dynamic_size, 8));
     }
     let dynamic = dot;
-    dot += inp.dynamic_size;
+    dot = checked_layout_add(dot, inp.dynamic_size)?;
     if inp.got_size != 0 {
-        dot = align_up(dot, 8);
+        dot = checked_layout_align(dot, 8)?;
         relro_sections.push((dot, inp.got_size, 8));
     }
     let got = dot;
-    dot += inp.got_size;
+    dot = checked_layout_add(dot, inp.got_size)?;
     // DATA_SEGMENT_RELRO_END (offset, .)
-    let relro_end_raw = dot + inp.relro_offset;
+    let relro_end_raw = checked_layout_add(dot, inp.relro_offset)?;
     let relro_seg_end = if inp.relro_adjust {
-        align_up(relro_end_raw, PAGE_SIZE)
+        checked_layout_align(relro_end_raw, PAGE_SIZE)?
     } else {
         relro_end_raw
     };
@@ -1960,17 +1961,17 @@ fn lay_rw(inp: &RwInputs) -> RwLayout {
     // .got.plt : { *(.got.plt) *(.igot.plt) }, then this linker's
     // `.rela.iplt` table.
     if inp.got_plt_size != 0 || inp.ifunc_count != 0 {
-        dot = align_up(dot, 8);
+        dot = checked_layout_align(dot, 8)?;
     }
     let got_plt = dot;
-    dot += inp.got_plt_size;
+    dot = checked_layout_add(dot, inp.got_plt_size)?;
     let irel_slots = dot;
-    dot += inp.ifunc_count * 8;
+    dot = checked_layout_add(dot, inp.ifunc_count * 8)?;
     if inp.ifunc_count != 0 {
-        dot = align_up(dot, 8);
+        dot = checked_layout_align(dot, 8)?;
     }
     let irela = dot;
-    dot += inp.ifunc_count * 24;
+    dot = checked_layout_add(dot, inp.ifunc_count * 24)?;
 
     // .data (+ orphans), .sdata: `__DATA_BEGIN__`/`__SDATA_BEGIN__` sit at
     // their statements, sections present or not.
@@ -1993,40 +1994,48 @@ fn lay_rw(inp: &RwInputs) -> RwLayout {
         {
             continue;
         }
-        dot = align_up(dot, align(i));
+        dot = checked_layout_align(dot, align(i))?;
         data_begin.get_or_insert(dot);
         if m.name == ".sdata" {
             sdata_begin = Some(dot);
         }
         sections.push((i, dot));
-        dot += size(i);
+        dot = checked_layout_add(dot, size(i))?;
     }
     let data_begin = data_begin.unwrap_or(dot);
     let sdata_begin = sdata_begin.unwrap_or(dot);
     let edata = dot;
-    let file_end = dot;
+    let mut file_end = dot;
 
     // .sbss, .bss; this linker's COPY slots close .bss; then
     // `. = ALIGN(. != 0 ? 8 : 1)` inside .bss and `. = ALIGN(8)` after.
     for name in [".sbss", ".bss"] {
         if let Some(i) = by_name(name) {
             if ms[i].sh_flags & SHF_TLS == 0 {
-                dot = align_up(dot, align(i));
+                dot = checked_layout_align(dot, align(i))?;
                 sections.push((i, dot));
-                dot += size(i);
+                dot = checked_layout_add(dot, size(i))?;
+                if ms[i].sh_type != SHT_NOBITS {
+                    file_end = dot;
+                }
             }
         }
     }
     let mut copies = Vec::new();
     for (name, sz) in inp.copy_symbols {
         let sz = if *sz > 0 { *sz } else { 8 };
-        dot = align_up(dot, sz.min(8));
+        dot = checked_layout_align(dot, sz.min(8))?;
         copies.push((name.clone(), dot, sz));
-        dot += sz;
+        dot = checked_layout_add(dot, sz)?;
     }
-    let bss_end = by_name(".bss").map(|_| align_up(dot, 8));
-    let end = align_up(dot, 8);
-    RwLayout {
+    let end = checked_layout_align(dot, 8)?;
+    let bss_end = by_name(".bss").map(|i| {
+        if ms[i].sh_type != SHT_NOBITS {
+            file_end = end;
+        }
+        end
+    });
+    Ok(RwLayout {
         base: inp.base,
         sections,
         relro_sections,
@@ -2046,7 +2055,7 @@ fn lay_rw(inp: &RwInputs) -> RwLayout {
         bss_end,
         end,
         file_end,
-    }
+    })
 }
 
 #[cfg(test)]

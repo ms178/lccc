@@ -39,6 +39,8 @@ pub trait GlobalSymbolOps: Clone {
     fn section_idx(&self) -> u16;
     fn value(&self) -> u64;
     fn size(&self) -> u64;
+    fn defined_in(&self) -> Option<usize>;
+    fn merge_common(&mut self, sym: &Elf64Symbol);
     fn new_defined(obj_idx: usize, sym: &Elf64Symbol) -> Self;
     fn new_common(obj_idx: usize, sym: &Elf64Symbol) -> Self;
     fn new_undefined(sym: &Elf64Symbol) -> Self;

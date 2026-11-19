@@ -312,6 +312,7 @@ pub fn link_builtin(
     // is read; parsing later left early inputs (CRT objects, user objects and
     // scripts) searching only the driver's default directories.
     let parsed_args = linker_common::parse_linker_args(user_args);
+    objects.set_allow_multiple_definition(parsed_args.allow_multiple_definition());
     // Reject malformed options and parse-only target settings before opening
     // any CRT or user input, so a missing file cannot hide an option error.
     parsed_args.validate_common_options()?;
@@ -322,7 +323,7 @@ pub fn link_builtin(
         .iter()
         .map(|kw| format!("-z {kw} ignored"))
         .collect();
-    option_warnings.extend(parsed_args.z_other_keyword_warnings_except(&["global"]));
+    option_warnings.extend(parsed_args.z_other_keyword_warnings_except(&["global", "muldefs"]));
     if parsed_args.emit_relocs {
         option_warnings.push(
             "--emit-relocs ignored: relocation retention is only implemented for -T script links"
@@ -797,6 +798,7 @@ pub fn link_builtin(
     // and retire the input sections. Disabled with LCCC_NO_STRING_MERGE=1.
     let mut dead_sections = dead_sections;
     dead_sections.extend(comdat_plan.dead.iter().copied());
+    linker_common::comdat::check_local_references(&objects, &comdat_plan.dead, &dead_sections)?;
     if std::env::var("LCCC_NO_STRING_MERGE").is_err() {
         if let Some(plan) = linker_common::strmerge::plan_string_merge(
             &objects,
@@ -944,7 +946,7 @@ pub fn link_builtin(
 
     phase!("merge-sections");
     // Allocate COMMON symbols
-    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common);
+    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common)?;
 
     phase!("common");
     // Create PLT/GOT
@@ -1083,6 +1085,7 @@ pub fn link_shared(
     // lccc did not). `LinkerArgs::inputs` now models the ordered, positional
     // input list -- the one thing that previously blocked the merge.
     let parsed = linker_common::parse_linker_args(user_args);
+    objects.set_allow_multiple_definition(parsed.allow_multiple_definition());
     parsed.validate_common_page_size()?;
     if parsed.warn_common {
         objects.enable_warn_common();
@@ -1096,7 +1099,7 @@ pub fn link_shared(
         .iter()
         .map(|kw| format!("-z {kw} ignored"))
         .collect();
-    option_warnings.extend(parsed.z_other_keyword_warnings_except(&["global"]));
+    option_warnings.extend(parsed.z_other_keyword_warnings_except(&["global", "muldefs"]));
     if parsed.emit_relocs {
         option_warnings.push(
             "--emit-relocs ignored: relocation retention is only implemented for -T script links"
@@ -1370,7 +1373,11 @@ pub fn link_shared(
         .icf
         .clone()
         .or_else(|| icf::icf_mode_from_env().map(str::to_string));
-    let mut dead_sections: FxHashSet<(usize, usize)> = FxHashSet::default();
+    let mut dead_sections = linker_common::comdat::plan_comdat(&objects).dead;
+    linker_common::comdat::check_local_references(&objects, &dead_sections, &dead_sections)?;
+    if !dead_sections.is_empty() {
+        linker_common::prune_dead_fdes(&mut objects, &dead_sections);
+    }
     let icf_plan = match icf_mode.as_deref() {
         Some(mode) => icf::plan(&objects, mode == "safe", &dead_sections),
         None => icf::IcfPlan::default(),
@@ -1415,7 +1422,7 @@ pub fn link_shared(
     }
 
     // Allocate COMMON symbols
-    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common);
+    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common)?;
 
     report_exec_stack_inputs(
         &objects,

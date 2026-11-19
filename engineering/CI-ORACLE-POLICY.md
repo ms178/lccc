@@ -11,10 +11,11 @@ GCC/Clang/ICX execution coverage.
   `tests/correctness/run_correctness.py` check local outputs and correctness.
 - `scripts/codegen_oracle.py` remains an explicitly invoked research tool.
 
-The mandatory benchmark lane remains unchanged. Its strict mode catches
-compile/run/output failures, selected failure warnings and unavailable requested
-compilers; it does **not** fail on a measured speed-ratio threshold. Mandatory
-execution still adds latency and infrastructure/timeout risk.
+The mandatory benchmark lane uses the verified GCC 16.2 release-cache oracle
+on every shard, not the rolling GCC 16 package used for base provisioning. Its
+strict mode catches compile/run/output failures, selected failure warnings and
+unavailable requested compilers; it does **not** fail on a measured speed-ratio
+threshold. Mandatory execution still adds latency and infrastructure/timeout risk.
 
 ## Observe before changing the gate
 

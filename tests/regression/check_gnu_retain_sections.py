@@ -503,11 +503,16 @@ def main() -> None:
         group_a_obj, group_b_obj = work / 'group-a.o', work / 'group-b.o'
         run([args.gas, '--64', '-o', group_a_obj, group_a])
         run([args.gas, '--64', '-o', group_b_obj, group_b])
-        for linker, reason in ((args.ld, 'discarded section'), (directory / 'lccc-ld', 'dropped symbol')):
-            result = run([linker, '-m', 'elf_x86_64', '-r', '-o', work / 'bad-group.o',
+        for linker in (args.ld, directory / 'lccc-ld'):
+            output = work / 'bad-group.o'
+            result = run([linker, '-m', 'elf_x86_64', '-r', '-o', output,
                           group_a_obj, group_b_obj], check=False)
-            if result.returncode == 0 or reason not in result.stderr:
-                raise RuntimeError(f'{linker} -r: expected {reason}: {result.stderr}')
+            # Demand is now diagnosed before emission, not by the fallback
+            # "dropped symbol" error from remapping the relocation table.
+            expected = ('discarded section', '.member', '.refs', group_b_obj.name)
+            if result.returncode == 0 or output.exists() or not all(
+                    token in result.stderr for token in expected):
+                raise RuntimeError(f'{linker} -r: expected discarded-section rejection: {result.stderr}')
         mutant = work / 'mutant.s'
         mutant.write_text(ASM.replace('awTR', 'awT').replace('awR', 'aw').replace('aR', 'a').replace('axR', 'ax'))
         mutant_obj = work / 'mutant.o'

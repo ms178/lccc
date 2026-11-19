@@ -6969,6 +6969,29 @@ fn compute_gpr_live_out_hypothetical(
     live_out
 }
 
+/// Classify a `Cmp`-kind line as a compare of register `rn` that can be
+/// re-pointed at the register's stack slot, returning the immediate to use.
+///
+/// Zero-allocation forms of the old `format!`-built patterns:
+/// `testl RN, RN` is prefix + one split + two operand compares,
+/// `..., RN` is two chained suffix strips (`RN` then `", "`, both
+/// mandatory) — each accepts exactly the strings the owned concatenation
+/// accepted, without the two per-Cmp-line heap allocations the caller's
+/// scan loop used to make.
+fn slot_compare_immediate<'a>(s: &'a str, rn: &str) -> Option<&'a str> {
+    let is_test = s
+        .strip_prefix("testl ")
+        .and_then(|o| o.split_once(", "))
+        .is_some_and(|(a, b)| a == rn && b == rn);
+    if is_test {
+        return Some("$0");
+    }
+    s.strip_prefix("cmpl ")
+        .and_then(|rest| rest.strip_suffix(rn))
+        .and_then(|rest| rest.strip_suffix(", "))
+        .filter(|lhs| lhs.starts_with('$') && !lhs.contains(rn))
+}
+
 /// Use whole-function GPR liveness to remove dead moves and retarget safe
 /// accumulator update/copy-back chains.  The earlier bounded scans intentionally
 /// stop at branches, so they cannot reason about loop backedges or both sides of
@@ -7213,15 +7236,7 @@ fn optimize_cfg_register_liveness(
                 continue;
             }
             let s = trimmed(store, &infos[j], j);
-            let rn = reg32_name(reg);
-            let imm: Option<&str> = if s == format!("testl {rn}, {rn}") {
-                Some("$0")
-            } else {
-                s.strip_prefix("cmpl ")
-                    .and_then(|rest| rest.strip_suffix(&format!(", {rn}")))
-                    .filter(|lhs| lhs.starts_with('$') && !lhs.contains(rn))
-            };
-            let Some(imm) = imm else {
+            let Some(imm) = slot_compare_immediate(s, reg32_name(reg)) else {
                 local += 1;
                 continue;
             };
@@ -27682,5 +27697,76 @@ mod slot_rmw_cfg_tests {
                    jmp g\n.cfi_endproc\n";
         let out = collapse(asm);
         assert!(out.iter().any(|l| l == "incl %eax"), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod slot_compare_probe_tests {
+    //! Acceptance oracles for the `movl SLOT,%R; {testl %R,%R | cmpl $imm,%R}`
+    //! → `cmpl $imm, SLOT` fold after its probes became zero-allocation
+    //! (prefix + split + operand compares instead of two `format!`-built
+    //! patterns per scanned `Cmp` line).  Each case pins one acceptance or
+    //! rejection branch of the rewritten test.
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<LineInfo> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        optimize_cfg_register_liveness(&mut store, &mut infos, false);
+        (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    fn fixture(cmp: &str) -> String {
+        // %ecx is dead on both sides of the branch; flags feed the jcc.
+        format!(
+            "f:\n    movl 8(%ebp), %ecx\n    {cmp}\n    je .L1\n    movl $1, %eax\n    ret\n\
+             .L1:\n    movl $2, %eax\n    ret\n.cfi_endproc\n"
+        )
+    }
+
+    #[test]
+    fn test_spelling_folds_to_zero_compare() {
+        let out = run(&fixture("testl %ecx, %ecx"));
+        assert!(out.iter().any(|l| l == "cmpl $0, 8(%ebp)"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("testl")), "{out:?}");
+    }
+
+    #[test]
+    fn immediate_compare_folds_with_its_immediate() {
+        let out = run(&fixture("cmpl $7, %ecx"));
+        assert!(out.iter().any(|l| l == "cmpl $7, 8(%ebp)"), "{out:?}");
+    }
+
+    #[test]
+    fn wrong_register_test_does_not_fold() {
+        // `testl %edx, %edx` reads another family: the load's register is
+        // not the compared one, so the pair must survive.
+        let out = run(
+            "f:\n    movl 8(%ebp), %ecx\n    movl 12(%ebp), %edx\n    testl %edx, %edx\n    \
+             je .L1\n    movl $1, %eax\n    ret\n.L1:\n    movl $2, %eax\n    ret\n.cfi_endproc\n",
+        );
+        assert!(out.iter().any(|l| l == "movl 8(%ebp), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn mixed_operand_test_does_not_fold() {
+        // `testl %ecx, %edx` is not `test R, R`; the exact-equality probe
+        // must reject it (the old `format!` equality did).
+        let out = run(&fixture("testl %ecx, %edx"));
+        assert!(out.iter().any(|l| l == "movl 8(%ebp), %ecx"), "{out:?}");
+        assert!(out.iter().any(|l| l == "testl %ecx, %edx"), "{out:?}");
+    }
+
+    #[test]
+    fn register_compare_does_not_fold() {
+        // `cmpl %eax, %ecx` has no `$` immediate: the chained-strip path
+        // must reject it exactly like the old `", RN"` suffix pattern
+        // followed by the `$` filter.
+        let out = run(&fixture("cmpl %eax, %ecx"));
+        assert!(out.iter().any(|l| l == "movl 8(%ebp), %ecx"), "{out:?}");
     }
 }

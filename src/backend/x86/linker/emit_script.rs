@@ -10,7 +10,9 @@
 //! static ET_EXEC image with no dynamic sections; relocation types are the
 //! static x86-64 set (PC32/PLT32/32/32S/64 and TLS LE forms).
 
-use crate::backend::elf::{STT_NOTYPE, elf64_sym_entry, push_strtab_name};
+use crate::backend::elf::{
+    SHF_EXCLUDE, SHN_LORESERVE, STT_NOTYPE, elf64_sym_entry, push_strtab_name,
+};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::elf::*;
@@ -23,6 +25,8 @@ use crate::backend::linker_common::{
         SecItem, SectionsItem, SortKind, eval_expr, glob_match,
     },
 };
+
+mod loads;
 
 type Object = linker_common::Elf64Object;
 
@@ -785,6 +789,120 @@ struct OutSec {
 /// A script-path definition row: `(object index, shndx, value, size, info)`.
 type DefRow = (usize, u16, u64, u64, u8);
 
+/// A tentative definition has separate size/alignment maxima. Keep the
+/// owner of the largest declaration (first on ties), not of its alignment.
+struct ScriptCommon {
+    object: usize,
+    symbol: usize,
+    size: u64,
+    align: u64,
+}
+
+/// Give each winning object's tentative definitions one size-only input
+/// section. BFD's GC marks that whole input section when any member is used;
+/// one synthetic section for the whole link would retain unrelated objects,
+/// while one per symbol would incorrectly drop siblings in a live object.
+fn materialize_commons(
+    objects: &mut [Object],
+    defs: &mut FxHashMap<String, DefRow>,
+    commons: FxHashMap<String, ScriptCommon>,
+) -> Result<bool, String> {
+    let mut commons: Vec<_> = commons
+        .into_iter()
+        .filter(|(name, _)| defs.get(name).is_none_or(|row| row.4 >> 4 == STB_WEAK))
+        .collect();
+    // BFD's hash-table iteration isn't an order contract. Sort by decreasing
+    // alignment within each input object to avoid avoidable padding.
+    commons.sort_unstable_by(|(an, a), (bn, b)| {
+        a.object
+            .cmp(&b.object)
+            .then(b.align.cmp(&a.align))
+            .then_with(|| an.cmp(bn))
+    });
+    for group in commons.chunk_by(|a, b| a.1.object == b.1.object) {
+        let oi = group[0].1.object;
+        let obj = &mut objects[oi];
+        let si = obj.sections.len();
+        if si >= usize::from(SHN_LORESERVE) {
+            return Err(format!(
+                "{}: no section index available for COMMON",
+                obj.source_name
+            ));
+        }
+        let mut end = 0u64;
+        let mut align = 1;
+        for (name, common) in group {
+            if !common.align.is_power_of_two() {
+                return Err(format!(
+                    "invalid COMMON alignment {} for '{name}'",
+                    common.align
+                ));
+            }
+            align = align.max(common.align);
+            let value = end
+                .checked_next_multiple_of(common.align)
+                .ok_or_else(|| format!("COMMON alignment overflows for '{name}'"))?;
+            end = value
+                .checked_add(common.size)
+                .ok_or_else(|| format!("COMMON size overflows for '{name}'"))?;
+            let sym = &mut obj.symbols[common.symbol];
+            sym.shndx = si as u16;
+            sym.value = value;
+            sym.size = common.size;
+            defs.insert(name.clone(), (oi, sym.shndx, value, common.size, sym.info));
+        }
+        obj.sections.push(linker_common::Elf64Section {
+            name_idx: 0,
+            name: "COMMON".into(),
+            sh_type: SHT_NOBITS_,
+            flags: SHF_ALLOC_ | SHF_WRITE_,
+            addr: 0,
+            offset: 0,
+            size: end,
+            link: 0,
+            info: 0,
+            addralign: align,
+            entsize: 0,
+        });
+        obj.section_data.push(linker_common::SectionData::empty());
+        obj.relocations.push(Vec::new());
+    }
+    Ok(!commons.is_empty())
+}
+
+/// COMMON without an explicit input matcher is appended to `.bss`, even
+/// under `--orphan-handling=discard`. An actual matcher (including a glob or
+/// `/DISCARD/`) takes priority over this default allocation rule.
+fn add_default_common_rule(script: &mut LinkerScript) {
+    if script_destination(script, "COMMON").is_some() {
+        return;
+    }
+    let common = SecItem::Input(InputSpec {
+        patterns: vec!["COMMON".into()],
+        keep: false,
+        sort: SortKind::None,
+    });
+    if let Some(bss) = script.sections.iter_mut().find_map(|item| match item {
+        SectionsItem::Output(def) if def.name == ".bss" && !def.info => Some(def),
+        _ => None,
+    }) {
+        bss.items.push(common);
+    } else {
+        script.sections.push(SectionsItem::Output(OutputSecDef {
+            name: ".bss".into(),
+            address: None,
+            info: false,
+            at_lma: None,
+            items: vec![common],
+            phdrs: Vec::new(),
+            fill: None,
+            align: None,
+            region: None,
+            lma_region: None,
+        }));
+    }
+}
+
 /// `--defsym`s whose values need final addresses, left for after layout.
 #[derive(Debug)]
 struct ScriptDefsyms {
@@ -954,23 +1072,33 @@ impl ScriptDefsyms {
 
 /// Ordinary ELF tables are bookkeeping, not user script inputs.
 fn is_script_input(section: &linker_common::Elf64Section) -> bool {
-    !matches!(
-        section.sh_type,
-        SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_
-    ) && !(section.sh_type == SHT_STRTAB_ && section.flags & SHF_ALLOC_ == 0)
+    section.flags & SHF_EXCLUDE == 0
+        && !matches!(
+            section.sh_type,
+            SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_
+        )
+        && !(section.sh_type == SHT_STRTAB_ && section.flags & SHF_ALLOC_ == 0)
         && !(section.size == 0 && section.name.is_empty())
 }
 
-fn is_script_orphan(script: &LinkerScript, section: &linker_common::Elf64Section) -> bool {
-    is_script_input(section)
-        && section.flags & 0x8000_0000 == 0 // SHF_EXCLUDE
-        && !script.sections.iter().any(|item| {
-            let SectionsItem::Output(def) = item else { return false; };
-            def.items.iter().any(|body| {
+/// Placement is first-match-wins, including an explicit /DISCARD/ rule.
+fn script_destination<'a>(script: &'a LinkerScript, name: &str) -> Option<&'a str> {
+    script.sections.iter().find_map(|item| {
+        let SectionsItem::Output(def) = item else {
+            return None;
+        };
+        def.items
+            .iter()
+            .any(|body| {
                 matches!(body, SecItem::Input(spec)
-                    if spec.patterns.iter().any(|pattern| glob_match(pattern, &section.name)))
+                if spec.patterns.iter().any(|pattern| glob_match(pattern, name)))
             })
-        })
+            .then_some(def.name.as_str())
+    })
+}
+
+fn is_script_orphan(script: &LinkerScript, section: &linker_common::Elf64Section) -> bool {
+    is_script_input(section) && script_destination(script, &section.name).is_none()
 }
 
 /// Treatment of live input sections unmatched by the caller's script.
@@ -1003,6 +1131,7 @@ pub struct ScriptLinkExtras {
     pub print_memory_usage: bool,
     pub orphan_handling: OrphanHandling,
     pub fatal_warnings: bool,
+    pub allow_multiple_definition: bool,
 }
 
 pub fn link_with_script(
@@ -1144,7 +1273,6 @@ fn non_alloc_orphan_names(
     objects: &[Object],
     candidates: &[(usize, usize)],
 ) -> Vec<String> {
-    const SHF_EXCLUDE: u64 = 0x8000_0000;
     let matched = |name: &str| {
         sections.iter().any(|item| {
             let SectionsItem::Output(def) = item else {
@@ -1204,9 +1332,15 @@ fn group_by_name(sections: &[(usize, usize)], objects: &[Object]) -> Vec<Vec<(us
     groups
 }
 
-fn align_up_pow2(value: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two());
-    (value + align - 1) & !(align - 1)
+fn align_script_addr(value: u64, align: u64, name: &str) -> Result<u64, String> {
+    if !align.is_power_of_two() {
+        return Err(format!(
+            "linker script: invalid alignment {align} for {name}"
+        ));
+    }
+    value
+        .checked_next_multiple_of(align)
+        .ok_or_else(|| format!("linker script: alignment overflows address space for {name}"))
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1229,13 +1363,74 @@ fn link_with_script_machine(
 ) -> Result<(), String> {
     let mut script: LinkerScript = linker_script::parse_linker_script(script_src)?;
 
+    let mut dead_sections = linker_common::comdat::plan_comdat(objects).dead;
+
+    // ── Global symbol table from objects (defined globals + weak) ──
+    // name -> (obj_idx, sec_idx(SHN), value, size, info)
+    let mut def_syms: FxHashMap<String, DefRow> = FxHashMap::default();
+    let mut commons: FxHashMap<String, ScriptCommon> = FxHashMap::default();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sym) in obj.symbols.iter().enumerate() {
+            if sym.name.is_empty() || sym.is_local() || sym.is_undefined() {
+                continue;
+            }
+            if dead_sections.contains(&(oi, sym.shndx as usize)) {
+                continue;
+            }
+            if sym.shndx == SHN_COMMON {
+                // Do not allocate storage or turn the alignment into a value
+                // until all regular definitions have been considered.
+                let record = commons.entry(sym.name.to_string()).or_insert(ScriptCommon {
+                    object: oi,
+                    symbol: si,
+                    size: sym.size,
+                    align: 1,
+                });
+                record.align = record.align.max(sym.value);
+                if sym.size > record.size {
+                    record.object = oi;
+                    record.symbol = si;
+                    record.size = sym.size;
+                }
+                continue;
+            }
+            let replace = match def_syms.get(sym.name.as_str()) {
+                None => true,
+                Some(&(old, shndx, value, _, info)) => {
+                    let weak = (info >> 4) == STB_WEAK;
+                    if sym.is_strong()
+                        && !weak
+                        && !extras.allow_multiple_definition
+                        && !(shndx == SHN_ABS && sym.shndx == SHN_ABS && value == sym.value)
+                    {
+                        return Err(format!(
+                            "multiple definition of '{}' in {}; first defined in {}",
+                            sym.name, obj.source_name, objects[old].source_name,
+                        ));
+                    }
+                    weak && sym.is_strong()
+                }
+            };
+            if replace {
+                def_syms.insert(
+                    sym.name.to_string(),
+                    (oi, sym.shndx, sym.value, sym.size, sym.info),
+                );
+            }
+        }
+    }
+
+    if materialize_commons(objects, &mut def_syms, commons)? {
+        add_default_common_rule(&mut script);
+    }
+
     // `--gc-sections` for script links uses the same relocation-reachability
     // engine as ordinary links, with two script-specific root classes:
     // ENTRY(symbol) and every input section matched by KEEP(...).  Merely
     // assigning `start = .; *(registry); stop = .` does not root a registry in
     // GNU ld; the script author must say KEEP, which is why the distinction is
     // retained in the parsed AST.
-    let mut dead_sections: FxHashSet<(usize, usize)> = if gc_sections {
+    if gc_sections {
         let mut kept: FxHashSet<(usize, usize)> = FxHashSet::default();
         for item in &script.sections {
             let SectionsItem::Output(def) = item else {
@@ -1263,42 +1458,25 @@ fn link_with_script_machine(
         }
         let roots: Vec<String> = script.entry.iter().cloned().collect();
         let dead =
-            linker_common::gc_collect_sections_elf64_roots_and_sections(objects, &roots, &kept);
-        // Drop the FDEs describing collected functions (see
-        // `eh_frame::prune_dead_fdes`).  Kernel links with
-        // CONFIG_LD_DEAD_CODE_DATA_ELIMINATION pass --gc-sections and would
-        // otherwise ship an .eh_frame_hdr table full of stale entries.
-        if !dead.is_empty() {
-            linker_common::prune_dead_fdes(objects, &dead);
-        }
-        dead
-    } else {
-        FxHashSet::default()
-    };
+            linker_common::gc_collect_sections_elf64_full(objects, &roots, &kept, &dead_sections);
+        dead_sections.extend(dead);
+    }
 
-    // ── Global symbol table from objects (defined globals + weak) ──
-    // name -> (obj_idx, sec_idx(SHN), value, size, info)
-    let mut def_syms: FxHashMap<String, (usize, u16, u64, u64, u8)> = FxHashMap::default();
-    for (oi, obj) in objects.iter().enumerate() {
-        for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.is_local() {
-                continue;
-            }
-            if dead_sections.contains(&(oi, sym.shndx as usize)) {
-                continue;
-            }
-            if sym.is_undefined() || sym.shndx == SHN_COMMON {
-                continue;
-            }
-            let replace = match def_syms.get(sym.name.as_str()) {
-                None => true,
-                Some(&(_, _, _, _, info)) => (info >> 4) == STB_WEAK && sym.is_global(),
-            };
-            if replace {
-                def_syms.insert(
-                    sym.name.to_string(),
-                    (oi, sym.shndx, sym.value, sym.size, sym.info),
-                );
+    let explicit_discard = script
+        .sections
+        .iter()
+        .any(|item| matches!(item, SectionsItem::Output(def) if def.name == "/DISCARD/"));
+    if explicit_discard {
+        // GNU applies /DISCARD/ at placement, after the GC sweep. A retained
+        // input can still keep its referents even when the script omits it.
+        // Keep the omission visible to FDE and dynamic-export planning.
+        for (oi, obj) in objects.iter().enumerate() {
+            for (si, sec) in obj.sections.iter().enumerate() {
+                if is_script_input(sec)
+                    && script_destination(&script, &sec.name) == Some("/DISCARD/")
+                {
+                    dead_sections.insert((oi, si));
+                }
             }
         }
     }
@@ -1315,6 +1493,8 @@ fn link_with_script_machine(
                 }
             }
         }
+    }
+    if !dead_sections.is_empty() {
         linker_common::prune_dead_fdes(objects, &dead_sections);
     }
 
@@ -1322,10 +1502,10 @@ fn link_with_script_machine(
     // (its section address is zero). Expose that temporary absolute view to
     // the expression planner, not to ordinary relocations or output symbols.
     let mut discarded_values = Vec::new();
-    if extras.orphan_handling == OrphanHandling::Discard {
+    if extras.orphan_handling == OrphanHandling::Discard && !defsym_defs.is_empty() {
         for (name, row) in &mut def_syms {
-            if dead_sections.contains(&(row.0, row.1 as usize)) {
-                discarded_values.push((name.clone(), row.2));
+            if row.1 != SHN_ABS && dead_sections.contains(&(row.0, row.1 as usize)) {
+                discarded_values.push((name.clone(), *row));
                 *row = defsym_row(row.2);
             }
         }
@@ -1364,14 +1544,14 @@ fn link_with_script_machine(
     if !discarded_values.is_empty() {
         let overrides: FxHashSet<&str> =
             defsym_defs.iter().map(|(name, _)| name.as_str()).collect();
-        for (name, value) in discarded_values {
+        for (name, row) in discarded_values {
             // Deferred expressions can mix this absolute with a live address.
             script_defsyms
                 .shadow
                 .entry(name.clone())
-                .or_insert_with(|| defsym_row(value));
+                .or_insert_with(|| defsym_row(row.2));
             if !overrides.contains(name.as_str()) {
-                def_syms.remove(&name);
+                def_syms.insert(name, row);
             }
         }
     }
@@ -1382,7 +1562,7 @@ fn link_with_script_machine(
     let mut hidden_object_syms: FxHashSet<String> = FxHashSet::default();
     for obj in objects.iter() {
         for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.is_undefined() {
+            if sym.name.is_empty() || sym.is_local() {
                 continue;
             }
             // STV_HIDDEN = 2, STV_INTERNAL = 1, STV_PROTECTED = 3 (still exported).
@@ -1415,6 +1595,9 @@ fn link_with_script_machine(
             // a script-linked shared object.
             let mut exports: Vec<String> = def_syms
                 .iter()
+                .filter(|&(_, &(oi, shndx, _, _, _))| {
+                    shndx == SHN_ABS || !dead_sections.contains(&(oi, shndx as usize))
+                })
                 .filter(|(name, _)| version.matches_global(name))
                 .filter(|(name, _)| !hidden_object_syms.contains(name.as_str()))
                 .map(|(name, _)| name.clone())
@@ -1499,8 +1682,6 @@ fn link_with_script_machine(
         if extras.orphan_handling == OrphanHandling::Discard && !orphans.is_empty() {
             dead_sections.extend(orphans);
             unassigned.retain(|input| !dead_sections.contains(input));
-            def_syms
-                .retain(|_, location| !dead_sections.contains(&(location.0, location.1 as usize)));
             linker_common::prune_dead_fdes(objects, &dead_sections);
         }
     }
@@ -1887,7 +2068,7 @@ fn link_with_script_machine(
                     )
                     .unwrap_or(1)
                     .max(1);
-                    sec_start = (sec_start + a - 1) & !(a - 1);
+                    sec_start = align_script_addr(sec_start, a, &def.name)?;
                 } else if def.address.is_none() {
                     // GNU ld aligns the OUTPUT section start to the largest
                     // alignment among its (first-item) input sections, not
@@ -1902,7 +2083,7 @@ fn link_with_script_machine(
                         .max()
                         .unwrap_or(1);
                     if max_in_align > 1 {
-                        sec_start = (sec_start + max_in_align - 1) & !(max_in_align - 1);
+                        sec_start = align_script_addr(sec_start, max_in_align, &def.name)?;
                     }
                 }
 
@@ -2061,7 +2242,7 @@ fn link_with_script_machine(
                             for (oi, si) in ins {
                                 let sec = &objects[oi].sections[si];
                                 let a = sec.addralign.max(1);
-                                cur = (cur + a - 1) & !(a - 1);
+                                cur = align_script_addr(cur, a, &def.name)?;
                                 placed_map.insert((oi, si), cur);
                                 placed_owner.insert((oi, si), out_secs.len());
                                 placed.push(Placed {
@@ -2070,7 +2251,12 @@ fn link_with_script_machine(
                                     vaddr: cur,
                                     size: sec.size,
                                 });
-                                cur += sec.size;
+                                cur = cur.checked_add(sec.size).ok_or_else(|| {
+                                    format!(
+                                        "linker script: section {} exceeds address space",
+                                        def.name
+                                    )
+                                })?;
                                 if a > max_align {
                                     max_align = a;
                                 }
@@ -2105,24 +2291,20 @@ fn link_with_script_machine(
                 }
 
                 let size = cur.saturating_sub(sec_start);
-                // NOBITS only if ALL inputs are NOBITS and there was no ". += N" gap
-                // requiring file content. Kernel .bss/.brk are file-backed zeros in
-                // GNU ld only when fill is demanded; standard behavior: keep NOBITS.
-                let nobits = placed
-                    .iter()
-                    .all(|p| objects[p.obj_idx].sections[p.sec_idx].sh_type == SHT_NOBITS_)
+                // Data commands contribute real bytes even when every
+                // matched input (including a synthetic COMMON) is NOBITS.
+                let nobits = data_commands.is_empty()
                     && def.fill.is_none()
-                    && (def.name.starts_with(".bss")
-                        || def.name.starts_with(".brk")
-                        || placed.iter().len() > 0
-                            && placed.iter().all(|p| {
-                                objects[p.obj_idx].sections[p.sec_idx].sh_type == SHT_NOBITS_
-                            })
-                            && !placed.is_empty());
-                let nobits = nobits && !placed.is_empty()
-                    || (placed.is_empty()
-                        && (def.name.starts_with(".bss") || def.name.starts_with(".brk"))
-                        && size > 0);
+                    && if placed.is_empty() {
+                        size > 0 && (def.name.starts_with(".bss") || def.name.starts_with(".brk"))
+                    } else {
+                        placed
+                            .iter()
+                            .all(|p| objects[p.obj_idx].sections[p.sec_idx].sh_type == SHT_NOBITS_)
+                    };
+                if !data_commands.is_empty() {
+                    sh_type = SHT_PROGBITS_;
+                }
 
                 // GNU ld's default text_read_only policy clears WRITE on
                 // the canonical .text output after combining input flags
@@ -2230,14 +2412,14 @@ fn link_with_script_machine(
             .map(|&(oi, si)| objects[oi].sections[si].addralign.max(1))
             .max()
             .unwrap_or(1);
-        dot = align_up_pow2(dot, align);
+        dot = align_script_addr(dot, align, &name)?;
         let start = dot;
         let owner = out_secs.len();
         let mut placed = Vec::with_capacity(group.len());
         let (mut flags, mut nobits) = (0u64, true);
         for &(oi, si) in &group {
             let sec = &objects[oi].sections[si];
-            dot = align_up_pow2(dot, sec.addralign.max(1));
+            dot = align_script_addr(dot, sec.addralign.max(1), &name)?;
             placed_map.insert((oi, si), dot);
             placed_owner.insert((oi, si), owner);
             placed.push(Placed {
@@ -2246,7 +2428,9 @@ fn link_with_script_machine(
                 vaddr: dot,
                 size: sec.size,
             });
-            dot += sec.size;
+            dot = dot
+                .checked_add(sec.size)
+                .ok_or_else(|| format!("linker script: section {name} exceeds address space"))?;
             flags |= sec.flags & !SHF_GROUP_;
             nobits &= sec.sh_type == SHT_NOBITS_;
         }
@@ -2506,7 +2690,7 @@ fn link_with_script_machine(
                 }
                 return placed_map.get(&(doi, shndx as usize)).map(|b| b + value);
             }
-            if sym.is_weak() {
+            if sym.is_undefined() && sym.is_weak() {
                 return Some(0);
             }
             return None;
@@ -2536,7 +2720,7 @@ fn link_with_script_machine(
     }
 
     // ELF header + phdrs at file start.
-    let declared_phdrs: Vec<&linker_script::PhdrDecl> = script.phdrs.iter().collect();
+    let declared_phdrs = &script.phdrs;
     // A script that places SHF_TLS sections but declares no PT_TLS gets one
     // synthesised -- but only on the auto-segment path (no PHDRS clause).
     // Without the header the loader never allocates the thread block, so every
@@ -2615,48 +2799,35 @@ fn link_with_script_machine(
     let mut order: Vec<usize> = (0..out_secs.len()).collect();
     order.sort_by_key(|&i| (!out_secs[i].is_alloc, out_secs[i].lma));
 
-    if declared_phdrs.is_empty() {
-        // The implicit single PT_LOAD requires one constant p_vaddr-p_offset
-        // delta across every file-backed section.  Merely packing sections at
-        // congruent page offsets is insufficient: a VMA gap larger than one
-        // page then maps later bytes at the wrong address (and objcopy loses
-        // the gap).  Preserve the complete LMA delta for the synthetic LOAD.
-        let min_lma = out_secs
-            .iter()
-            .filter(|os| os.is_alloc && os.size > 0)
-            .map(|os| os.lma)
-            .min()
-            .unwrap_or(0);
-        let want = min_lma % page;
-        let have = file_off % page;
-        if want != have {
-            file_off += (want + page - have) % page;
-        }
-        let load_file_base = file_off;
-        for &i in &order {
-            let os = &mut out_secs[i];
-            if !os.is_alloc || os.nobits || os.size == 0 {
-                continue;
-            }
-            os.file_offset = load_file_base + os.lma.saturating_sub(min_lma);
-            file_off = file_off.max(os.file_offset + os.size);
-        }
+    let (implicit_load, declared_loads) = if declared_phdrs.is_empty() {
+        (
+            Some(loads::implicit(&mut out_secs, &mut file_off, page)?),
+            Vec::new(),
+        )
     } else {
+        let loads = loads::declared(
+            &mut out_secs,
+            declared_phdrs,
+            &sec_phdrs,
+            &mut file_off,
+            page,
+            machine.ehdr_size(),
+        )?;
+        // File-backed sections not assigned to any LOAD (for example a
+        // :NONE section) still have contents, but no mapping constrains them.
         for &i in &order {
             let os = &mut out_secs[i];
-            if !os.is_alloc || os.nobits || os.size == 0 {
+            if !os.is_alloc || os.nobits || os.size == 0 || os.file_offset != 0 {
                 continue;
             }
-            // congruence: file_off ≡ lma (mod page)
-            let want = os.lma % page;
-            let have = file_off % page;
-            if want != have {
-                file_off += (want + page - have) % page;
-            }
-            os.file_offset = file_off;
-            file_off += os.size;
+            os.file_offset = loads::congruent(file_off, os.vaddr, os.align)?;
+            file_off = os
+                .file_offset
+                .checked_add(os.size)
+                .ok_or("linker script: section size overflows file")?;
         }
-    }
+        (None, loads)
+    };
     // Non-allocated PROGBITS still occupy the file. DWARF sections are often
     // hundreds of MiB in a kernel build; assigning all of them the same final
     // alloc offset while writing none of their bytes produced section headers
@@ -2678,13 +2849,22 @@ fn link_with_script_machine(
     }
     // NOBITS and empty sections point at the current file offset (no data).
     for os in out_secs.iter_mut() {
-        if os.nobits || os.size == 0 {
+        if (os.nobits && os.file_offset == 0) || os.size == 0 {
             os.file_offset = file_off;
         }
     }
 
     // ── Build output image ──
-    let mut out = vec![0u8; file_off as usize];
+    let image_size =
+        usize::try_from(file_off).map_err(|_| "linker script: image too large for host")?;
+    if machine == ScriptMachine::I386 && file_off > u64::from(u32::MAX) {
+        return Err("linker script: file image does not fit in ELF32".into());
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(image_size).map_err(|e| {
+        format!("linker script: cannot allocate file image of {file_off:#x} bytes: {e}")
+    })?;
+    out.resize(image_size, 0u8);
 
     // Fill patterns + section data
     for os in &out_secs {
@@ -2941,6 +3121,21 @@ fn link_with_script_machine(
                         0
                     }
                     None => {
+                        if os.is_alloc && !sym.is_local() {
+                            if let Some(&(doi, shndx, _, _, _)) = def_syms.get(sym.name.as_str()) {
+                                if dead_sections.contains(&(doi, shndx as usize))
+                                    && objects[doi]
+                                        .sections
+                                        .get(shndx as usize)
+                                        .is_some_and(|sec| sec.name == "COMMON")
+                                {
+                                    return Err(format!(
+                                        "'{}' referenced in section '{}' of {}: defined in discarded section 'COMMON' of {}",
+                                        sym.name, sec_name, obj_name, objects[doi].source_name,
+                                    ));
+                                }
+                            }
+                        }
                         let unresolved = if sym.name.is_empty() {
                             let section = obj
                                 .sections
@@ -3529,9 +3724,13 @@ fn link_with_script_machine(
 
     // Program headers: for each declared phdr, span the sections assigned to it.
     let mut ph_off = machine.ehdr_size() as usize;
-    for decl in &declared_phdrs {
+    for (di, decl) in declared_phdrs.iter().enumerate() {
+        if let Some(load) = declared_loads[di] {
+            write_script_load(machine, &mut out, ph_off, load)?;
+            ph_off += machine.phdr_size() as usize;
+            continue;
+        }
         let mut min_v = u64::MAX;
-        let mut max_v = 0u64;
         let mut min_f = u64::MAX;
         let mut max_f = 0u64;
         let mut max_mem = 0u64;
@@ -3553,7 +3752,6 @@ fn link_with_script_machine(
             if !os.nobits {
                 min_f = min_f.min(os.file_offset);
                 max_f = max_f.max(os.file_offset + os.size);
-                max_v = max_v.max(os.vaddr + os.size);
             }
         }
         if min_v == u64::MAX {
@@ -3577,7 +3775,6 @@ fn link_with_script_machine(
         if min_f == u64::MAX {
             min_f = 0;
             max_f = 0;
-            max_v = min_v;
         }
         // FILEHDR/PHDRS make the ELF/program headers part of this segment.
         // Linux's vDSO verifier requires its sole PT_LOAD to begin exactly at
@@ -3597,68 +3794,25 @@ fn link_with_script_machine(
         let filesz = max_f.saturating_sub(min_f);
         let memsz = max_mem - min_v;
         let flags = decl.flags.map_or(inferred_flags, |flags| flags as u32);
-        let align = if decl.ptype == PT_LOAD_ {
-            page
-        } else {
-            segment_align
-        };
         // p_paddr = LMA
-        write_script_phdr(
-            machine, &mut out, ph_off, decl.ptype, flags, min_f, min_v, min_lma, filesz, memsz,
-            align,
-        )?;
-        ph_off += machine.phdr_size() as usize;
-        let _ = max_v;
-    }
-    if declared_phdrs.is_empty() {
-        // Single LOAD spanning everything.
-        //
-        // The span is taken over LOAD addresses, not virtual ones. With
-        // overlays (or any AT()) several sections share a VMA while occupying
-        // distinct LMAs, so a VMA-derived memsz can come out smaller than the
-        // file image and produce `filesz > memsz`, which readelf rejects and
-        // loaders treat as corrupt.
-        // Compute bounds and permissions together. Empty outputs occupy no
-        // memory and cannot add write/execute permission to this segment.
-        let mut min_v = u64::MAX;
-        let mut max_m = 0;
-        let mut min_f = u64::MAX;
-        let mut max_f = 0;
-        let mut flags = 4;
-        for section in &out_secs {
-            if !section.is_alloc || section.size == 0 {
-                continue;
-            }
-            min_v = min_v.min(section.lma);
-            max_m = max_m.max(section.lma + section.size);
-            flags |= section_segment_permissions(section.flags);
-            if !section.nobits {
-                min_f = min_f.min(section.file_offset);
-                max_f = max_f.max(section.file_offset + section.size);
-            }
-        }
-        if min_v == u64::MAX {
-            min_v = 0;
-        }
-        if min_f == u64::MAX {
-            min_f = 0;
-        }
-        let filesz = max_f.saturating_sub(min_f);
-        let memsz = (max_m.saturating_sub(min_v)).max(filesz);
         write_script_phdr(
             machine,
             &mut out,
-            machine.ehdr_size() as usize,
-            PT_LOAD_,
+            ph_off,
+            decl.ptype,
             flags,
             min_f,
             min_v,
-            min_v,
+            min_lma,
             filesz,
             memsz,
-            page,
+            segment_align,
         )?;
-        ph_off = (machine.ehdr_size() + machine.phdr_size()) as usize;
+        ph_off += machine.phdr_size() as usize;
+    }
+    if let Some(load) = implicit_load {
+        write_script_load(machine, &mut out, ph_off, load)?;
+        ph_off += machine.phdr_size() as usize;
     }
     if needs_tls_phdr {
         // p_filesz covers .tdata only (.tbss is NOBITS); p_memsz covers both.
@@ -3802,6 +3956,18 @@ fn link_with_script_machine(
         SHN_ABS
     };
 
+    let mut header_indices = vec![0u16; out_secs.len()];
+    for (h, &i) in hdr_secs.iter().enumerate() {
+        header_indices[i] = (h + 1) as u16;
+    }
+    let input_shndx = |oi: usize, si: u16, value: u64| -> u16 {
+        placed_owner
+            .get(&(oi, si as usize))
+            .map(|&i| header_indices[i])
+            .filter(|&n| n != SHN_UNDEF)
+            .unwrap_or_else(|| find_shndx(value))
+    };
+
     // Finish linker-created ET_DYN metadata now that every exported symbol and
     // synthetic section has a final address.
     if let Some(plan) = script_dynamic.as_ref() {
@@ -3822,7 +3988,7 @@ fn link_with_script_machine(
                         } else {
                             placed_map.get(&(oi, shndx as usize)).copied().unwrap_or(0) + value
                         };
-                        (value, size, info, find_shndx(value))
+                        (value, size, info, input_shndx(oi, shndx, value))
                     } else if plan.version_symbols.contains(name) {
                         (0, 0, (STB_GLOBAL << 4) | STT_OBJECT, SHN_ABS)
                     } else {
@@ -4003,7 +4169,7 @@ fn link_with_script_machine(
                     v,
                     sym.size,
                     sym.info,
-                    find_shndx(v),
+                    input_shndx(oi, sym.shndx, v),
                     &mut symtab,
                     &mut strtab,
                 )?;
@@ -4026,7 +4192,7 @@ fn link_with_script_machine(
             let sx = if shndx == SHN_ABS {
                 SHN_ABS
             } else {
-                find_shndx(v)
+                input_shndx(oi, shndx, v)
             };
             global_sym_index.insert(name.clone(), symtab.len() as u32);
             add_sym(name, v, size, info, sx, &mut symtab, &mut strtab)?;
@@ -4517,6 +4683,27 @@ fn link_with_script_machine(
         let _ = std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o755));
     }
     Ok(())
+}
+
+fn write_script_load(
+    machine: ScriptMachine,
+    out: &mut [u8],
+    off: usize,
+    load: loads::Load,
+) -> Result<(), String> {
+    write_script_phdr(
+        machine,
+        out,
+        off,
+        PT_LOAD_,
+        load.flags,
+        load.offset,
+        load.vaddr,
+        load.paddr,
+        load.filesz,
+        load.memsz,
+        load.align,
+    )
 }
 
 #[expect(clippy::too_many_arguments)]

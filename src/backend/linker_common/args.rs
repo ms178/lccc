@@ -216,6 +216,13 @@ pub struct LinkerArgs {
 }
 
 impl LinkerArgs {
+    /// GNU `--allow-multiple-definition` and `-z muldefs` are synonyms.
+    /// Keep the canonical keyword in `z_other_keywords` so link modes that
+    /// don't implement it still diagnose it under their warning policy.
+    pub fn allow_multiple_definition(&self) -> bool {
+        self.z_other_keywords.iter().any(|kw| kw == "muldefs")
+    }
+
     /// Validate common option values (`--build-id`, `--image-base`, `-z max-page-size`
     /// / `common-page-size`, and `--pack-dyn-relocs`).
     pub fn validate_common_options(&self) -> Result<(), String> {
@@ -248,12 +255,6 @@ impl LinkerArgs {
     /// `-z KEYWORD[=VALUE]` spellings kept in `z_other_keywords` that are
     /// neither implemented nor equivalent to the linker's default.  These
     /// spellings must remain visible to each target's warning policy.
-    pub fn z_other_keyword_warnings(&self) -> Vec<String> {
-        self.z_other_keyword_warnings_except(&[])
-    }
-
-    /// As above, for a link path that implements additional keywords beyond
-    /// the shared default-equivalent options.
     pub fn z_other_keyword_warnings_except(&self, implemented: &[&str]) -> Vec<String> {
         self.z_other_keywords
             .iter()
@@ -276,7 +277,7 @@ impl LinkerArgs {
             .iter()
             .map(|kw| format!("-z {kw} ignored"))
             .collect();
-        warnings.extend(self.z_other_keyword_warnings());
+        warnings.extend(self.z_other_keyword_warnings_except(&["muldefs"]));
         // AArch64 and RISC-V call this shared policy but do not emit the
         // requested DT_FLAGS/DT_FLAGS_1 bits. Keep these options visible
         // instead of accepting nodelete/origin/initfirst and their peers
@@ -544,6 +545,7 @@ pub fn parse_hash_style(v: &str) -> Option<HashStyle> {
 /// below.  Accepting lookalike spellings would bless a non-GNU interface.
 fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
     match tok {
+        "--allow-multiple-definition" => apply_z_keyword(result, "muldefs"),
         "--emit-relocs" | "-q" => {
             result.emit_relocs = true;
         }
@@ -1260,6 +1262,15 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             pos.apply(arg, &mut pos_stack);
         } else if pos.apply(arg, &mut pos_stack) {
             // positional toggle consumed
+        } else if arg == "-z" {
+            // Direct backend callers can pass raw ld arguments as well as
+            // the normalized `-Wl,-z,KEYWORD` emitted by lccc-ld.
+            if let Some(kw) = args.get(i + 1) {
+                i += 1;
+                apply_z_keyword(&mut result, kw);
+            }
+        } else if let Some(kw) = arg.strip_prefix("-z") {
+            apply_z_keyword(&mut result, kw);
         } else if let Some(sym) = arg.strip_prefix("--entry=") {
             result.entry_symbol = Some(sym.to_string());
         } else if (arg == "--entry" || arg == "-e") && i + 1 < args.len() {
@@ -1597,6 +1608,44 @@ mod map_arg_tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn allow_multiple_definition_uses_only_exact_gnu_spellings() {
+        for flags in [
+            &["--allow-multiple-definition"][..],
+            &["-z", "muldefs"],
+            &["-zmuldefs"],
+            &["-Wl,--allow-multiple-definition"],
+            &["-Wl,-z,muldefs"],
+            &["-Wl,-zmuldefs"],
+        ] {
+            let parsed = parse_linker_args(&args(flags));
+            assert!(parsed.allow_multiple_definition(), "{flags:?}");
+            assert_eq!(
+                parsed.z_other_keyword_warnings_except(&[]),
+                ["-z muldefs ignored"]
+            );
+            assert!(parsed.inputs.is_empty() && parsed.missing_inputs.is_empty());
+        }
+        for flags in [&[][..], &["-z"], &["-zmuldefs=1"], &["-Wl,-z,nomuldefs"]] {
+            assert!(!parse_linker_args(&args(flags)).allow_multiple_definition());
+        }
+    }
+
+    #[test]
+    fn direct_z_keywords_and_driver_forwarded_keywords_share_order() {
+        let args = args(&[
+            "-z",
+            "defs",
+            "-Wl,-z,undefs",
+            "-zexecstack",
+            "-Wl,-znoexecstack",
+        ]);
+        let parsed = parse_linker_args(&args);
+        assert!(!parsed.no_undefined);
+        assert_eq!(parsed.z_execstack, Some(false));
+        assert!(parsed.inputs.is_empty() && parsed.missing_inputs.is_empty());
     }
 
     /// `-Map` reaches the linker in four spellings depending on whether the
@@ -2205,7 +2254,7 @@ mod z_isa_level_tests {
             "-Wl,-z,not-a-real-keyword",
         ]));
         assert_eq!(
-            parsed.z_other_keyword_warnings(),
+            parsed.z_other_keyword_warnings_except(&[]),
             vec!["-z global ignored", "-z not-a-real-keyword ignored"]
         );
         assert_eq!(

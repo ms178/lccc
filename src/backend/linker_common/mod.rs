@@ -140,8 +140,8 @@ pub use symbols::{
 // merge.rs
 pub use merge::{
     allocate_common_symbols_elf64, is_debug_section_name, merge_comment_sections,
-    merge_debug_sections_elf64, merge_nonalloc_sections_elf64, merge_sections_elf64,
-    merge_sections_elf64_gc, place_debug_sections,
+    merge_debug_sections_elf64, merge_nonalloc_sections_elf64, merge_sections_elf64_gc,
+    place_debug_sections,
 };
 
 // dynamic.rs

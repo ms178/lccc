@@ -8,13 +8,10 @@
 #
 #   * mold is pinned to the v3.0.0 release tag by default (research owner's
 #     standing preference, refreshed 2026-10-27: latest public release)
-#     and wild tracks git HEAD.  Both are
-#     built from SOURCE at the chosen ref, never from a prebuilt tarball:
-#     stale oracles have already produced two *false* lccc failures
-#     (wild 0.7.0 got constructor priority order and RELRO enforcement wrong;
-#     lccc was right in both cases and wild-git agrees), and a prebuilt
-#     binary's exact provenance is unauditable.  Override with MOLD_REF=HEAD.
-#     See docs/linker/FOLLOWUP_2026-08-17_SESSION2.md §0.
+#     and wild tracks git HEAD. Mold prefers the digest-pinned release cache
+#     for functional tests; MOLD_PREFER=source selects a separate native
+#     x86-only build for timings. Other MOLD_REF values require source.
+#     MOLD_REF=HEAD --force refreshes an existing HEAD build.
 #
 #   * lld is pinned to the release/23.x branch (matching the Clang 23.1
 #     codegen oracle channel) and built with LLVM_TARGETS_TO_BUILD=X86 only —
@@ -38,8 +35,7 @@
 #     allocator against itself), and only the `wild` binary from wild's
 #     workspace (not linker-diff, benchmarks, integration tests).
 #
-# The script is idempotent and skips any oracle whose binary is already
-# present and executable, so it is cheap to run at the start of a session.
+# Existing builds are reused within a variant, not across cache/source modes.
 #
 # Usage:
 #   tests/linker/setup_oracles.sh [--force] [--prefix DIR]
@@ -48,6 +44,8 @@
 # ============================================================================
 set -euo pipefail
 REPO=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck source=../../tools/linker/oracle_versions.sh
+source "$REPO/tools/linker/oracle_versions.sh"
 
 PREFIX=${LCCC_ORACLE_PREFIX:-/home/user/tools}
 FORCE=0
@@ -72,6 +70,8 @@ ONLY=${ONLY:-mold,wild,bfd,lld}
 want() { [[ ",$ONLY," == *",$1,"* ]]; }
 
 MOLD_REF=${MOLD_REF:-v3.0.0}
+MOLD_PREFER=${MOLD_PREFER:-cache}
+MOLD_FEATURES=x86_64,i386,system-allocator
 WILD_REF=${WILD_REF:-HEAD}
 ref_suffix() { [[ $1 == HEAD ]] && echo "" || echo "-$(echo "$1" | tr '/.' '__')"; }
 # Check out a tag/branch/SHA, tolerating the `v` prefix that upstream uses on
@@ -95,6 +95,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case $MOLD_PREFER in
+  cache|source) ;;
+  *) printf 'invalid MOLD_PREFER: %s (expected cache or source)\n' "$MOLD_PREFER" >&2; exit 2 ;;
+esac
+
+mkdir -p "$PREFIX"
+PREFIX=$(CDPATH= cd -- "$PREFIX" && pwd)
 BIN="$PREFIX/bin"
 SRC="$PREFIX"
 mkdir -p "$BIN"
@@ -114,50 +121,58 @@ fi
 # ---------------------------------------------------------------------------
 # mold
 # ---------------------------------------------------------------------------
-MOLD_NAME="mold$(ref_suffix "$MOLD_REF")"
-if ! want mold; then
-  :
-elif have "$MOLD_NAME"; then
-  log "mold already present: $("$BIN/$MOLD_NAME" --version | head -1)"
-elif [[ ${MOLD_PREFER:-cache} == cache && ($MOLD_REF == v3.0.0 || $MOLD_REF == 3.0.0) ]] && \
-     bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$SRC/mold-cache-v3.0.0"; then
-  # Hash-verified upstream release bytes (the same digest ci_install_mold_oracle.sh
-  # pins), with a functional elf_i386 + elf_x86_64 link probe.  For LINK TIMING
-  # research use MOLD_PREFER=source: the release binary is not built
-  # -C target-cpu=native and uses mimalloc, while the research preset is
-  # x86_64,i386,system-allocator + target-cpu=native.
-  install -m755 "$SRC/mold-cache-v3.0.0/bin/mold" "$BIN/$MOLD_NAME"
-  ln -sf "$MOLD_NAME" "$BIN/ld$(ref_suffix "$MOLD_REF").mold"
-  ln -sf "$MOLD_NAME" "$BIN/mold"
-  ln -sf mold "$BIN/ld.mold"
-  log "mold: $("$BIN/$MOLD_NAME" --version | head -1) (verified cache binary)"
-else
-  log "building mold ${MOLD_REF} (cargo features: x86_64,i386,system-allocator)"
-  command -v cargo >/dev/null || { echo "cargo is required (mold 3.x is built with Cargo, not CMake)" >&2; exit 1; }
-  command -v cc >/dev/null || { echo "cc is required (mold-wrapper.so is a small C file)" >&2; exit 1; }
-  MOLD_DIR="$SRC/mold-src$(ref_suffix "$MOLD_REF")"
-  if [[ ! -d "$MOLD_DIR/.git" ]]; then
-    rm -rf "$MOLD_DIR"
-    git clone --filter=blob:none https://github.com/rui314/mold.git "$MOLD_DIR"
+verify_mold_version() {
+  if [[ $MOLD_REF =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    oracle_require_version "$1" "${BASH_REMATCH[1]}"
   fi
-  git -C "$MOLD_DIR" fetch --filter=blob:none origin --tags >/dev/null 2>&1 || true
-  checkout_ref "$MOLD_DIR" "$MOLD_REF"
-  log "mold source: $(git -C "$MOLD_DIR" describe --tags --always) $(git -C "$MOLD_DIR" rev-parse --short HEAD)"
-  # mimalloc off, as before (we are not benchmarking mold's allocator
-  # against itself): the mold 3.x spelling is the `system-allocator`
-  # Cargo feature.  `-C target-cpu=native` is the Rust spelling of the
-  # oracles' -march=native policy.
-  ( cd "$MOLD_DIR" && \
-    RUSTFLAGS="-C target-cpu=native" \
-    cargo build --release --locked -j "$JOBS" -p mold-cli \
-          --no-default-features --features x86_64,i386,system-allocator && \
-    PREFIX="$MOLD_DIR/inst" ./install-mold.sh )
-  install -m755 "$MOLD_DIR/inst/bin/mold" "$BIN/$MOLD_NAME"
-  ln -sf "$MOLD_NAME" "$BIN/ld$(ref_suffix "$MOLD_REF").mold"
-  # Canonical alias: the test suites discover the mold oracle via `which mold`.
-  ln -sf "$MOLD_NAME" "$BIN/mold"
-  ln -sf mold "$BIN/ld.mold"
-  log "mold: $("$BIN/$MOLD_NAME" --version | head -1)"
+}
+
+mold_provenance=''
+if want mold; then
+  MOLD_NAME="mold$(ref_suffix "$MOLD_REF")"
+  release="$MOLD_NAME-release"
+  if [[ $MOLD_PREFER == cache && ($MOLD_REF == v3.0.0 || $MOLD_REF == 3.0.0) ]] &&
+     { { have "$release" && oracle_mold_release_matches "$BIN/$release"; } ||
+       { bash "$REPO/scripts/ensure_mold_300_binary.sh" --prefix "$SRC/mold-cache-v3.0.0" &&
+         install -m755 "$SRC/mold-cache-v3.0.0/bin/mold" "$BIN/$release" &&
+         oracle_mold_release_matches "$BIN/$release"; }; }; then
+    mold_selected=$release
+    mold_provenance="digest-pinned release cache v3.0.0 (x86 ELF targets probed on install)"
+  else
+    mold_selected="$MOLD_NAME-x86-native"
+    mold_receipt="$BIN/$mold_selected.revision"
+    if ! have "$mold_selected" || [ ! -s "$mold_receipt" ]; then
+      log "building mold $MOLD_REF (cargo features: $MOLD_FEATURES)"
+      command -v cargo >/dev/null || { echo "cargo is required for mold 3.x" >&2; exit 1; }
+      command -v cc >/dev/null || { echo "cc is required to build mold-wrapper.so" >&2; exit 1; }
+      MOLD_DIR="$SRC/mold-src$(ref_suffix "$MOLD_REF")"
+      if [[ ! -d "$MOLD_DIR/.git" ]]; then
+        rm -rf "$MOLD_DIR"
+        git clone --filter=blob:none https://github.com/rui314/mold.git "$MOLD_DIR"
+      fi
+      git -C "$MOLD_DIR" fetch --filter=blob:none origin --tags >/dev/null
+      checkout_ref "$MOLD_DIR" "$MOLD_REF"
+      mold_revision=$(git -C "$MOLD_DIR" rev-parse HEAD)
+      ( cd "$MOLD_DIR" && \
+        RUSTFLAGS="-C target-cpu=native" \
+        cargo build --release --locked -j "$JOBS" -p mold-cli \
+              --no-default-features --features "$MOLD_FEATURES" && \
+        PREFIX="$MOLD_DIR/inst" ./install-mold.sh )
+      verify_mold_version "$MOLD_DIR/inst/bin/mold"
+      install -m755 "$MOLD_DIR/inst/bin/mold" "$BIN/$mold_selected"
+      printf '%s\n' "$mold_revision" > "$mold_receipt"
+    fi
+    mold_provenance="source $(cat "$mold_receipt"); features=$MOLD_FEATURES; target-cpu=native"
+  fi
+  verify_mold_version "$BIN/$mold_selected"
+  mold_banner=$("$BIN/$mold_selected" --version)
+  mold_banner=${mold_banner%%$'\n'*}
+  # A warm cache/source switch must repoint the public aliases, too.
+  ln -sfn "$mold_selected" "$BIN/$MOLD_NAME"
+  ln -sfn "$mold_selected" "$BIN/ld$(ref_suffix "$MOLD_REF").mold"
+  ln -sfn "$mold_selected" "$BIN/mold"
+  ln -sfn mold "$BIN/ld.mold"
+  log "mold: $mold_banner ($mold_provenance)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -290,10 +305,9 @@ fi
 # git HEAD by policy, but WHICH head must be auditable after the fact.
 {
   echo "# LCCC linker oracle revisions (recorded $(date -u +%Y-%m-%dT%H:%M:%SZ))"
-  # Every mold-src* checkout (HEAD builds and pinned-ref builds coexist).
-  for d in "$SRC"/mold-src*; do
-    [[ -d "$d/.git" ]] && echo "mold:  $(basename "$d"): $(git -C "$d" describe --tags --always 2>/dev/null) $(git -C "$d" rev-parse --short HEAD 2>/dev/null)"
-  done
+  if [ -n "$mold_provenance" ]; then
+    printf 'mold:  %s (%s)\n' "$mold_banner" "$mold_provenance"
+  fi
   for d in "$SRC"/wild-src*; do
     [[ -d "$d/.git" ]] && echo "wild:  $(basename "$d"): $(git -C "$d" describe --tags --always 2>/dev/null) $(git -C "$d" rev-parse --short HEAD 2>/dev/null)"
   done
@@ -301,7 +315,6 @@ fi
     echo "lld:   $(git -C "$SRC/llvm-src" rev-parse HEAD 2>/dev/null || echo unknown) (release/${LLD_MAJOR}.x, X86 backend only)"
   fi
   echo "binutils (bfd/as reference): $BINUTILS_VERSION"
-  echo "mold build features: x86_64,i386,system-allocator (mold-cli Cargo preset)"
 } > "$BIN/ORACLE_REVISIONS.txt"
 
 cat <<EOF

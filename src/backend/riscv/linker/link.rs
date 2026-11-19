@@ -44,6 +44,7 @@ pub fn link_builtin(
     let parsed_args = linker_common::parse_linker_args(user_args);
     parsed_args.validate_common_options()?;
     parsed_args.warn_unimplemented_keyword_options(0x1000)?;
+    let allow_multiple_definition = parsed_args.allow_multiple_definition();
     let trace = parsed_args.trace_files;
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
     let is_static = parsed_args.is_static;
@@ -186,6 +187,7 @@ pub fn link_builtin(
         &input_objs,
     )?;
     push_build_id_note(&mut input_objs, &build_id);
+    discard_comdat(&mut input_objs)?;
     let eh_frame = edit_eh_frame(&mut input_objs, false)?;
     let merge_aliases = sections::merge_alloc_sections(&mut input_objs);
 
@@ -195,6 +197,7 @@ pub fn link_builtin(
     // the final link runs (`link_objects` in probe mode), so every decision
     // is taken against the layout this link will actually produce.
     let link = ExecLink {
+        allow_multiple_definition,
         defsym_defs: &defsym_defs,
         shared_lib_syms: &shared_lib_syms,
         is_static,
@@ -217,6 +220,55 @@ pub fn link_builtin(
         &mut |objs, probe| link_objects(&link, objs, Some(probe)),
     )?;
     link_objects(&link, &input_objs, None)
+}
+
+/// Retain object/section indices for relocation provenance while suppressing
+/// losing input sections in all later layout and relaxation passes.
+fn discard_comdat(input_objs: &mut [(String, ElfObject)]) -> Result<(), String> {
+    let plan = linker_common::comdat::plan_comdat_iter(input_objs.iter().map(|(_, obj)| obj));
+    if plan.dead.is_empty() {
+        return Ok(());
+    }
+    // Check surviving allocated sites before mutating indices or FDEs.
+    for (oi, (_, obj)) in input_objs.iter().enumerate() {
+        let uses = linker_common::comdat::discarded_symbol_uses(
+            obj,
+            |si| plan.dead.contains(&(oi, si)),
+            |si| plan.dead.contains(&(oi, si)),
+        );
+        linker_common::comdat::check_local_uses(obj, uses)?;
+    }
+    let mut by_object: FxHashMap<usize, FxHashSet<(usize, usize)>> = FxHashMap::default();
+    for &(oi, si) in &plan.dead {
+        by_object.entry(oi).or_default().insert((0, si));
+    }
+    for (oi, dead) in by_object {
+        let obj = &mut input_objs[oi].1;
+        linker_common::prune_dead_fdes(std::slice::from_mut(obj), &dead);
+        let needed: FxHashSet<usize> = linker_common::comdat::discarded_symbol_uses(
+            obj,
+            |si| dead.contains(&(0, si)),
+            |si| dead.contains(&(0, si)),
+        )
+        .map(|(_, index, _)| index)
+        .collect();
+        for index in needed {
+            let sym = &mut obj.symbols[index];
+            sym.shndx = SHN_UNDEF;
+            sym.value = 0;
+            sym.size = 0;
+        }
+        for (_, si) in dead {
+            let section = &mut obj.sections[si];
+            section.name.clear();
+            section.flags = 0;
+            section.size = 0;
+            if let Some(relocs) = obj.relocations.get_mut(si) {
+                relocs.clear();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// GNU ld's editing of the `.eh_frame` inputs (`eh_frame_gnu`), in the order
@@ -334,6 +386,7 @@ fn push_build_id_note(
 /// What Phases 2-4 of an executable link read besides the objects: fixed for
 /// the whole link, so every relaxation trip and the final link agree.
 struct ExecLink<'a> {
+    allow_multiple_definition: bool,
     defsym_defs: &'a [(String, String)],
     shared_lib_syms: &'a input::SharedLibSyms,
     is_static: bool,
@@ -360,6 +413,7 @@ fn link_objects(
     mut probe: Option<&mut super::relax::LayoutProbe>,
 ) -> Result<(), String> {
     let ExecLink {
+        allow_multiple_definition,
         defsym_defs,
         shared_lib_syms,
         is_static,
@@ -378,7 +432,7 @@ fn link_objects(
     // ── Phase 2: Merge sections ─────────────────────────────────────────
 
     let (mut merged_sections, mut merged_map, input_sec_refs) =
-        sections::merge_sections(input_objs, merge_aliases);
+        sections::merge_sections(input_objs, merge_aliases)?;
     let attr_warnings =
         super::attributes::merge_into_output(input_objs, &mut merged_sections, &merged_map)?;
     if probe.is_none() {
@@ -413,7 +467,8 @@ fn link_objects(
         &sec_mapping,
         &mut merged_sections,
         &mut merged_map,
-    );
+        allow_multiple_definition,
+    )?;
 
     // `--defsym ALIAS=TARGET` with an object-defined TARGET makes ALIAS a
     // local definition BEFORE dynamic classification, as GNU ld resolves it:
@@ -538,6 +593,7 @@ pub fn link_shared(
     let parsed_args = linker_common::parse_linker_args(user_args);
     parsed_args.validate_common_options()?;
     parsed_args.warn_unimplemented_keyword_options(0x1000)?;
+    let allow_multiple_definition = parsed_args.allow_multiple_definition();
     let build_id = parsed_args.resolved_build_id_style()?;
     let (strip_all, strip_debug) = (parsed_args.strip_all, parsed_args.strip_debug);
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
@@ -644,10 +700,12 @@ pub fn link_shared(
         &input_objs,
     )?;
     push_build_id_note(&mut input_objs, &build_id);
+    discard_comdat(&mut input_objs)?;
     let eh_frame = edit_eh_frame(&mut input_objs, true)?;
     let merge_aliases = sections::merge_alloc_sections(&mut input_objs);
 
     let link = SharedLink {
+        allow_multiple_definition,
         needed_sonames: &needed_sonames,
         shared_lib_syms: &shared_lib_syms,
         soname: soname.as_deref(),
@@ -676,6 +734,7 @@ pub fn link_shared(
 
 /// What Phases 2-4 of a shared-library link read besides the objects.
 struct SharedLink<'a> {
+    allow_multiple_definition: bool,
     needed_sonames: &'a [String],
     shared_lib_syms: &'a input::SharedLibSyms,
     soname: Option<&'a str>,
@@ -706,7 +765,7 @@ fn link_shared_objects(
     // ── Phase 2: Merge sections ─────────────────────────────────────
 
     let (mut merged_sections, mut merged_map, input_sec_refs) =
-        sections::merge_sections(input_objs, link.merge_aliases);
+        sections::merge_sections(input_objs, link.merge_aliases)?;
     let attr_warnings =
         super::attributes::merge_into_output(input_objs, &mut merged_sections, &merged_map)?;
     if probe.is_none() {
@@ -740,7 +799,8 @@ fn link_shared_objects(
         &sec_mapping,
         &mut merged_sections,
         &mut merged_map,
-    );
+        link.allow_multiple_definition,
+    )?;
 
     // Identify GOT entries needed
     let (wanted_got, local_got_sym_info) = symbols::collect_got_entries(input_objs);

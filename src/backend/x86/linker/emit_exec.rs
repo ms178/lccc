@@ -1917,6 +1917,11 @@ pub(super) fn emit_executable(
     });
     let sym_names: Vec<(&String, &GlobalSymbol)> =
         keyed.into_iter().map(|(_, n, g)| (n, g)).collect();
+    let bss_header = output_sections
+        .iter()
+        .position(|s| s.name == ".bss")
+        .and_then(|i| out_sec_to_hdr.get(&i))
+        .copied();
     for (name, gsym) in &sym_names {
         let off = push_strtab_name(&mut symtab_names, name.as_bytes());
         let shndx: u16 = if gsym.absolute {
@@ -1927,6 +1932,10 @@ pub(super) fn emit_executable(
             containing_section_hdr(output_sections, &out_sec_to_hdr, gsym.value).unwrap_or(SHN_ABS)
         } else if gsym.section_idx == SHN_COMMON {
             SHN_COMMON
+        } else if gsym.section_idx == 0xffff {
+            // A tentative symbol allocated by the linker belongs to the
+            // actual BSS output section, not an input or SHN_ABS.
+            bss_header.unwrap_or(SHN_ABS)
         } else if let Some(obj_idx) = gsym.defined_in {
             match section_map.get(&(obj_idx, gsym.section_idx as usize)) {
                 Some(&(oi, _)) => out_sec_to_hdr.get(&oi).copied().unwrap_or(SHN_ABS),
@@ -1936,8 +1945,12 @@ pub(super) fn emit_executable(
             SHN_ABS
         };
         symtab_entries.push(elf64_sym_entry(
-            off, gsym.info, 0, /* st_other */
-            shndx, gsym.value, gsym.size,
+            off,
+            gsym.info,
+            gsym.visibility,
+            shndx,
+            gsym.value,
+            gsym.size,
         ));
     }
     // ELF mandates every STB_LOCAL entry before the first global, and

@@ -14,20 +14,6 @@ use crate::backend::elf::{
     SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
 };
 
-/// Merge input sections from all objects into output sections.
-///
-/// Groups input sections by mapped name (e.g., `.text.foo` -> `.text`),
-/// computes output offsets with proper alignment, and sorts output sections
-/// by permission profile: RO -> Exec -> RW(progbits) -> RW(nobits).
-pub fn merge_sections_elf64(
-    objects: &[Elf64Object],
-    output_sections: &mut Vec<OutputSection>,
-    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
-) {
-    let no_dead = FxHashSet::default();
-    merge_sections_elf64_gc(objects, output_sections, section_map, &no_dead);
-}
-
 /// Merge input sections into output sections, optionally skipping dead sections.
 ///
 /// When `dead_sections` is non-empty (from --gc-sections), sections in the set
@@ -313,14 +299,14 @@ pub fn allocate_common_symbols_elf64<G: GlobalSymbolOps>(
     globals: &mut FxHashMap<String, G>,
     output_sections: &mut Vec<OutputSection>,
     sort_common: bool,
-) {
+) -> Result<(), String> {
     let mut common_syms: Vec<(String, u64, u64)> = globals
         .iter()
         .filter(|(_, sym)| sym.section_idx() == SHN_COMMON && sym.is_defined())
         .map(|(name, sym)| (name.clone(), sym.value().max(1), sym.size()))
         .collect();
     if common_syms.is_empty() {
-        return;
+        return Ok(());
     }
     // `--sort-common`: largest first, so big alignments pack without holes
     // (bfd orders by size too).  bfd's order within one size is hash noise;
@@ -350,17 +336,24 @@ pub fn allocate_common_symbols_elf64<G: GlobalSymbolOps>(
 
     let mut bss_off = output_sections[bss_idx].mem_size;
     for (name, alignment, size) in &common_syms {
-        let a = (*alignment).max(1);
-        bss_off = (bss_off + a - 1) & !(a - 1);
+        if !alignment.is_power_of_two() {
+            return Err(format!("invalid COMMON alignment {alignment} for '{name}'"));
+        }
+        bss_off = bss_off
+            .checked_next_multiple_of(*alignment)
+            .ok_or_else(|| format!("COMMON alignment overflows .bss for '{name}'"))?;
         if let Some(sym) = globals.get_mut(name) {
             sym.set_common_bss(bss_off);
         }
         if *alignment > output_sections[bss_idx].alignment {
             output_sections[bss_idx].alignment = *alignment;
         }
-        bss_off += size;
+        bss_off = bss_off
+            .checked_add(*size)
+            .ok_or_else(|| format!("COMMON size overflows .bss for '{name}'"))?;
     }
     output_sections[bss_idx].mem_size = bss_off;
+    Ok(())
 }
 
 /// Merge `.comment` input sections (compiler version strings) into one blob,
@@ -487,5 +480,50 @@ mod tests {
         o.sections[0].name = ".text".to_string();
         assert!(merge_comment_sections(&[o]).is_empty());
         assert!(merge_comment_sections(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod common_allocation_tests {
+    use super::*;
+    use crate::backend::elf::{STB_GLOBAL, STT_OBJECT};
+    use crate::backend::linker_common::Elf64Symbol;
+    use crate::backend::x86::linker::types::GlobalSymbol;
+
+    fn common(align: u64, size: u64) -> FxHashMap<String, GlobalSymbol> {
+        let input = Elf64Symbol {
+            name_idx: 0,
+            name: "tentative".to_string().into(),
+            info: (STB_GLOBAL << 4) | STT_OBJECT,
+            other: 0,
+            shndx: SHN_COMMON,
+            value: align,
+            size,
+        };
+        [("tentative".into(), GlobalSymbol::new_common(0, &input))]
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn common_layout_rejects_non_power_of_two_alignment() {
+        let err =
+            allocate_common_symbols_elf64(&mut common(3, 8), &mut Vec::new(), false).unwrap_err();
+        assert!(err.contains("invalid COMMON alignment 3 for 'tentative'"));
+    }
+
+    #[test]
+    fn common_layout_checks_aligned_offset_and_final_size() {
+        let mut sections = Vec::new();
+        allocate_common_symbols_elf64(&mut common(64, 8), &mut sections, false).unwrap();
+        assert_eq!((sections[0].alignment, sections[0].mem_size), (64, 8));
+
+        sections[0].mem_size = u64::MAX - 2;
+        let align_err =
+            allocate_common_symbols_elf64(&mut common(64, 8), &mut sections, false).unwrap_err();
+        assert!(align_err.contains("COMMON alignment overflows .bss"));
+        let size_err =
+            allocate_common_symbols_elf64(&mut common(1, 8), &mut sections, false).unwrap_err();
+        assert!(size_err.contains("COMMON size overflows .bss"));
     }
 }

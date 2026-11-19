@@ -187,9 +187,18 @@ GP-22 (option-effect ledger, 4.5), GP-01 (`-Wattributes` truth, 4.6 — but GP-2
 first because it makes every later item a ratchet), GP-05 (macro hygiene, 4.4),
 GP-23 (macro-diff gate, 4.0), GP-09 (warning registry, 4.0).
 
-Suggested start for a single agent with one session: MB-20 (hoist `LabelRefs`:
-a one-function change worth ~30 % of compile instructions) → MB-01 → MB-05; for two agents in parallel: [MB-01, MB-04, MB-13] on the driver/linker
-side and [MB-20, MB-21, MB-05] on the backend side (disjoint files).
+Suggested start at the original baseline: MB-20 (hoist `LabelRefs`) →
+MB-01 → MB-05; for two agents in parallel, [MB-01, MB-04, MB-13] on the
+driver/linker side and [MB-20, MB-21, MB-05] on the backend side. The lazy
+reference work has landed; the original ~30% hotspot is not a current estimate.
+
+**2026-11-18 performance worklist:** see the [evidence-ranked ten-item queue](engineering/BACKLOG-ROI-2026-11-18.md).
+The Nov 18 VM screens favor bounded match extension and Huffman heap codegen over
+reusing the historical nbody/LZ4 order. For compiler throughput, re-profile after
+MB-20 step 5 before choosing between decode-once work and a fresh-solver contract
+for liveness memoization. Scope-review metric-pair sharing and screen global
+allocators on byte identity and paired wall time. Passing a compile-cost gate is
+not a runtime win.
 
 ---
 
@@ -1093,6 +1102,26 @@ callgrind_annotate --inclusive=yes cg.out | grep -E 'LabelRefs::build|combined_l
    (0.00 %); peephole inclusive share is now 58.01 % — the ≤ 35 % acceptance
    criterion REMAINS OPEN (next: decode-once table lookups inside
    `combined_local_pass`, the largest remaining flat profile block).
+   **Step 4 progress — the two measurable decode-once levers landed.**
+   (a) `is_inline_range_marker` now runs a 14-byte necessary-condition
+   prefix probe before its quote-aware statement scan: 59.0 M → 4.9 M Ir
+   on the predicate across its 21 call sites, and the scan's downstream
+   memcmp/malloc/trim cascade collapses with it. (b) The liveness memo
+   key folds `LineInfo::digest_words()` — an injectivity-tested lossless
+   three-word packing (`LineKind::pack`) — instead of a non-inlined
+   `FxHasher` derive walk (157.3 M → 146.3 M Ir). Together:
+   5,990,941,043 → 5,604,432,386 Ir on big40 `-O1` (−6.45 %), paired wall
+   big100 −2.30 % / big40 ±0 % (the saved work is low-CPI predicted
+   scans; big40 wall is allocator-bound), byte-identical on big40/big100
+   × `-O0/-O1/-O2`. A third lever was tried and REJECTED by measurement:
+   routing `LineKind::eq` through the packed word is 16× worse at
+   fastbuild opt-level 1 (the pack match does not inline; the derived
+   discriminant short-circuit is nearly free) — pinned in the enum's doc
+   comment so it is not re-attempted. The remaining `starts_with`/
+   `contains` traffic is diffuse generic-shim cost across hundreds of
+   sites (no single ≥ 2 % block left), so the interned-opcode-id design
+   stays open as the structural cure; peephole share is still far from
+   ≤ 35 %, criterion REMAINS OPEN.
 
 **Gates.** Byte-identical `.s` over the benchmark programs, the kernel corpus and the
 asm-diff corpus before/after each step (existing identity scripts); a compile-cost

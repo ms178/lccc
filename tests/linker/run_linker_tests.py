@@ -13052,6 +13052,8 @@ class _Entry:
 
 def _registry(args, oracles):
     """Every test, in execution order."""
+    import elf_symbol_contract  # noqa: PLC0415 - sibling test module
+    import i386_symbol_resolution  # noqa: PLC0415 - sibling module (same ELF32 objects)
     import i386_userspace  # noqa: PLC0415 - sibling module (ELF32 userspace via gcc -m32)
 
     def one(name, fn, *tags, aux=()):
@@ -13100,6 +13102,12 @@ def _registry(args, oracles):
             "script"),
         _Entry(tuple(n for n, _ in i386_userspace.CASES),
                lambda: i386_userspace.run_all(args, CC, Result), ("shared",)),
+        one("i386_symbol_resolution",
+            lambda args, oracles: i386_symbol_resolution.run(args, oracles, sh, Result),
+            "symbols", "shared"),
+        one("elf_symbol_contract",
+            lambda args, oracles: elf_symbol_contract.run(args, oracles, Result),
+            "symbols", "script", "rel"),
         one("script_vdso_dynamic", _vdso_script_test, "script"),
         one("script_vdso_declared_note_phdrs", _vdso_note_phdr_test, "script"),
         one("script_elf32_i386_relocations", _elf32_script_test, "script", "kernel"),
