@@ -154,6 +154,12 @@ impl Parser {
                         prev_rparen = false;
                     }
                     TokenKind::Semicolon => return seen_params,
+                    // A bare `}` at depth 0 closes the ENCLOSING scope: no
+                    // declaration head contains one, so stop here rather
+                    // than scanning into the rest of the token stream
+                    // (keeps the filter O(item), not O(file), on malformed
+                    // input with a missing `;`).
+                    TokenKind::RBrace => return false,
                     TokenKind::LBrace => {
                         if prev_rparen {
                             return true;

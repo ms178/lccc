@@ -434,14 +434,16 @@ struct SolveScratch {
 
 thread_local! {
     static SOLVE_SCRATCH: std::cell::RefCell<SolveScratch> =
-        std::cell::RefCell::new(SolveScratch {
-            effects: Vec::new(),
-            succ_range: Vec::new(),
-            lines: Vec::new(),
-            succ_flat: Vec::new(),
-            live_in: Vec::new(),
-            live_out: Vec::new(),
-        });
+        const {
+            std::cell::RefCell::new(SolveScratch {
+                effects: Vec::new(),
+                succ_range: Vec::new(),
+                lines: Vec::new(),
+                succ_flat: Vec::new(),
+                live_in: Vec::new(),
+                live_out: Vec::new(),
+            })
+        };
 }
 
 // Counts memo hits, so the tests can prove a hit happened rather than
@@ -1327,7 +1329,6 @@ impl FileLiveness {
     /// liveness questions for the program that would exist if those
     /// definitions had been deleted.  Everything else is unchanged; the
     /// store/load, call and `ret` modelling never consults the mask.
-    #[expect(clippy::needless_range_loop)]
     fn analyse_function(
         &mut self,
         store: &LineStore,
