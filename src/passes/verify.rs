@@ -47,7 +47,7 @@
 //! the pass that broke the invariant, not the one that tripped over it later.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::instruction::{BlockId, Operand, Terminator};
+use crate::ir::instruction::{BlockId, Operand};
 use crate::ir::reexports::{Instruction, IrFunction, IrModule, Value};
 
 /// A single structural violation, with enough context to identify the culprit.
@@ -94,38 +94,6 @@ fn mode() -> Mode {
             },
         });
     *MODE
-}
-
-/// Visit every CFG successor label of a terminator.
-///
-/// Kept private and exhaustive (no wildcard arm) so that adding a terminator
-/// variant is a compile error here rather than a silently unchecked edge.
-fn for_each_target(term: &Terminator, mut f: impl FnMut(BlockId)) {
-    match term {
-        Terminator::Branch(t) => f(*t),
-        Terminator::CondBranch {
-            true_label,
-            false_label,
-            ..
-        } => {
-            f(*true_label);
-            f(*false_label);
-        }
-        Terminator::Switch { cases, default, .. } => {
-            for (_, label) in cases {
-                f(*label);
-            }
-            f(*default);
-        }
-        Terminator::IndirectBranch {
-            possible_targets, ..
-        } => {
-            for t in possible_targets {
-                f(*t);
-            }
-        }
-        Terminator::Return(_) | Terminator::Unreachable => {}
-    }
 }
 
 /// Verify one function, appending any violations to `out`.
@@ -329,7 +297,9 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                     format!("{} in {:?} targets unknown block {:?}", kind, from, label),
                 ),
             };
-        for_each_target(&block.terminator, |l| edge(l, "terminator", out));
+        block
+            .terminator
+            .for_each_target(|l| edge(l, "terminator", out));
         for inst in &block.instructions {
             if let Instruction::InlineAsm { goto_labels, .. } = inst {
                 for (name, label) in goto_labels {
@@ -712,7 +682,7 @@ fn reachable_blocks(func: &IrFunction, label_to_idx: &FxHashMap<BlockId, usize>)
                 }
             }
         };
-        for_each_target(&block.terminator, |l| go(l, &mut stack));
+        block.terminator.for_each_target(|l| go(l, &mut stack));
         for inst in &block.instructions {
             if let Instruction::InlineAsm { goto_labels, .. } = inst {
                 for (_, label) in goto_labels {
@@ -786,7 +756,7 @@ impl Dominance {
                 if !reachable[bi] {
                     return list;
                 }
-                for_each_target(&block.terminator, |l| add(l, &mut list));
+                block.terminator.for_each_target(|l| add(l, &mut list));
                 for inst in &block.instructions {
                     if let Instruction::InlineAsm { goto_labels, .. } = inst {
                         for (_, label) in goto_labels {

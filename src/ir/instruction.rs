@@ -1826,6 +1826,36 @@ pub fn replace_values_in_terminator_map(term: &mut Terminator, map: &FxHashMap<u
 }
 
 impl Terminator {
+    /// Visit the block of every edge this terminator names, once per edge: a
+    /// block named twice (both arms of a `CondBranch`, two cases of a
+    /// `Switch`) is visited twice.  The labels of an asm goto are edges of
+    /// the instruction, not of the terminator, and are not visited.
+    ///
+    /// Exhaustive on purpose (no wildcard arm): a new terminator variant is a
+    /// compile error here, not an edge the verifier and SCCP silently miss.
+    #[inline]
+    pub fn for_each_target(&self, mut f: impl FnMut(BlockId)) {
+        match self {
+            Terminator::Branch(target) => f(*target),
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                f(*true_label);
+                f(*false_label);
+            }
+            Terminator::Switch { cases, default, .. } => {
+                cases.iter().for_each(|&(_, label)| f(label));
+                f(*default);
+            }
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => possible_targets.iter().copied().for_each(f),
+            Terminator::Return(_) | Terminator::Unreachable => {}
+        }
+    }
+
     /// Mutably visit every Operand stored in this terminator.
     #[inline]
     pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut Operand)) {

@@ -1038,7 +1038,7 @@ fn rewrite(func: &mut IrFunction, state: &SccpState) -> SccpStats {
             }
         }
 
-        for_each_target(&block.terminator, |label| {
+        block.terminator.for_each_target(|label| {
             if let Some(&to) = state.label_to_idx.get(&label) {
                 real_edges.insert(edge_key(bi32, to));
             }
@@ -1053,7 +1053,7 @@ fn rewrite(func: &mut IrFunction, state: &SccpState) -> SccpStats {
             fold_terminator(&block.terminator, state)
         };
         let effective = new_term.as_ref().unwrap_or(&block.terminator);
-        for_each_target(effective, |label| {
+        effective.for_each_target(|label| {
             if let Some(&to) = state.label_to_idx.get(&label) {
                 live_edges.insert(edge_key(bi32, to));
             }
@@ -1307,35 +1307,6 @@ fn const_of_operand(op: &Operand, state: &SccpState) -> Option<IrConst> {
     match op {
         Operand::Const(c) => Some(*c),
         Operand::Value(v) => lattice_const(state, *v),
-    }
-}
-
-/// Every block label a terminator can transfer control to.
-fn for_each_target(term: &Terminator, mut f: impl FnMut(BlockId)) {
-    match term {
-        Terminator::Branch(t) => f(*t),
-        Terminator::CondBranch {
-            true_label,
-            false_label,
-            ..
-        } => {
-            f(*true_label);
-            f(*false_label);
-        }
-        Terminator::Switch { cases, default, .. } => {
-            for (_, label) in cases {
-                f(*label);
-            }
-            f(*default);
-        }
-        Terminator::IndirectBranch {
-            possible_targets, ..
-        } => {
-            for t in possible_targets {
-                f(*t);
-            }
-        }
-        Terminator::Return(_) | Terminator::Unreachable => {}
     }
 }
 
