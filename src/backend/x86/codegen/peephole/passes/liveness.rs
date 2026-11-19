@@ -415,6 +415,35 @@ pub(super) struct FileLiveness {
     textual_ret: FxHashSet<usize>,
 }
 
+/// Reusable per-thread scratch for one function solve.  Every buffer here
+/// used to be a fresh heap allocation per `analyse_function` call — and the
+/// solver runs once per function per refresh, so DHAT attributed 1.46M
+/// blocks / 907 MB of churn to it on the profiling TU.  Pooled, each vector
+/// re-allocates only at a new high-water mark (`clear` + `resize` keep
+/// capacity), the same amortisation `succ_flat` already documented.
+/// Thread-local like `FN_CACHE` below, and for the same reason: the solver
+/// is not re-entrant, so one scratch per thread is exactly enough.
+struct SolveScratch {
+    effects: Vec<Option<Effect>>,
+    succ_range: Vec<(usize, usize)>,
+    lines: Vec<usize>,
+    succ_flat: Vec<usize>,
+    live_in: Vec<u16>,
+    live_out: Vec<u16>,
+}
+
+thread_local! {
+    static SOLVE_SCRATCH: std::cell::RefCell<SolveScratch> =
+        std::cell::RefCell::new(SolveScratch {
+            effects: Vec::new(),
+            succ_range: Vec::new(),
+            lines: Vec::new(),
+            succ_flat: Vec::new(),
+            live_in: Vec::new(),
+            live_out: Vec::new(),
+        });
+}
+
 // Counts memo hits, so the tests can prove a hit happened rather than
 // inferring it from matching answers. Compiled out of release builds.
 #[cfg(test)]
@@ -1363,6 +1392,54 @@ impl FileLiveness {
             None
         };
 
+        let solved = SOLVE_SCRATCH.with(|c| {
+            self.solve_function(store, infos, start, end, neutralise, &mut c.borrow_mut())
+        });
+        if !solved {
+            return;
+        }
+        if let Some(key) = cache_key {
+            FN_CACHE.with(|c| {
+                let mut banks = c.borrow_mut();
+                // Two-generation bounded cache (`curr`, `prev`): when `curr`
+                // fills, rotate `curr` into `prev` so hot entries from the
+                // immediately preceding pass are promoted on hit while new
+                // functions continue to be cached (neither a clear-the-world
+                // cliff nor a permanent freeze after FN_CACHE_CAP functions).
+                if banks.0.len() >= FN_CACHE_CAP {
+                    banks.1 = std::mem::take(&mut banks.0);
+                }
+                banks.0.insert(
+                    key,
+                    (
+                        self.live_out[start..end].to_vec(),
+                        self.live_in[start..end].to_vec(),
+                        self.known[start..end].to_vec(),
+                        self.structural[start..end].to_vec(),
+                        self.effect[start..end].to_vec(),
+                        self.textual_ret.contains(&start),
+                    ),
+                );
+            });
+        }
+    }
+
+    /// The uncached solve of one function: build effects and successor
+    /// edges, run the backward dataflow and, on convergence, publish the
+    /// per-line answers into `self`.  Returns `false` when the control
+    /// flow is unanalysable or the solve did not converge (the lines stay
+    /// `known == false` and the caller must not cache).  All working
+    /// memory comes from `scratch` — see `SolveScratch`.
+    fn solve_function(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        start: usize,
+        end: usize,
+        neutralise: Option<(usize, usize, u16)>,
+        scratch: &mut SolveScratch,
+    ) -> bool {
+        let fn_len = end.saturating_sub(start);
         let rdx_marker = Self::ret_rdx_marker(store, infos, start, end);
         if rdx_marker.is_none() {
             self.textual_ret.insert(start);
@@ -1402,7 +1479,11 @@ impl FileLiveness {
         // pairs (gcc.c-torture/compile 20001226-1) spent minutes in string
         // compares, once per `refresh_at`.  The FIRST definition wins, as
         // with the scan it replaces.
-        let mut label_index: FxHashMap<&str, usize> = FxHashMap::default();
+        let nlabels = (start..end)
+            .filter(|&n| !infos[n].is_nop() && infos[n].kind == LineKind::Label)
+            .count();
+        let mut label_index: FxHashMap<&str, usize> =
+            FxHashMap::with_capacity_and_hasher(nlabels, Default::default());
         for n in start..end {
             if infos[n].is_nop() || infos[n].kind != LineKind::Label {
                 continue;
@@ -1419,9 +1500,19 @@ impl FileLiveness {
         // cost a heap allocation and free for nearly every line of every
         // solve (almost all have one or two successors); the flat buffer
         // grows to its high-water mark once per solve.
-        let mut effects: Vec<Option<Effect>> = vec![None; fn_len];
-        let mut succ_range: Vec<(usize, usize)> = vec![(0, 0); fn_len];
-        let mut lines: Vec<usize> = Vec::with_capacity(fn_len);
+        let SolveScratch {
+            effects,
+            succ_range,
+            lines,
+            succ_flat,
+            live_in,
+            live_out,
+        } = scratch;
+        effects.clear();
+        effects.resize(fn_len, None);
+        succ_range.clear();
+        succ_range.resize(fn_len, (0, 0));
+        lines.clear();
         for n in start..end {
             if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
                 continue;
@@ -1448,8 +1539,8 @@ impl FileLiveness {
         // jump (computed goto, tail call through a register) still
         // refuses analysis.
         let jump_table_succs: Vec<Option<Vec<usize>>> =
-            Self::resolve_jump_tables(store, infos, &lines, &label_index, start, end);
-        let mut succ_flat: Vec<usize> = Vec::with_capacity(lines.len() + lines.len() / 4);
+            Self::resolve_jump_tables(store, infos, lines, &label_index, start, end);
+        succ_flat.clear();
         for (pos, &n) in lines.iter().enumerate() {
             let t = infos[n].trimmed(store.get(n));
             let next = lines.get(pos + 1).copied();
@@ -1465,10 +1556,10 @@ impl FileLiveness {
                 ret_live,
                 &jump_table_succs,
                 start,
-                &mut succ_flat,
+                succ_flat,
             ) {
                 Some(v) => v,
-                None => return, // unanalysable control flow: leave `known` false
+                None => return false, // unanalysable control flow: leave `known` false
             };
             let eff = match neutralise {
                 // Deleted-definition semantics: the span is no longer an
@@ -1491,8 +1582,10 @@ impl FileLiveness {
         }
 
         // ── backward dataflow ────────────────────────────────────────────────
-        let mut live_in: Vec<u16> = vec![0; fn_len];
-        let mut live_out: Vec<u16> = vec![0; fn_len];
+        live_in.clear();
+        live_in.resize(fn_len, 0);
+        live_out.clear();
+        live_out.resize(fn_len, 0);
         let mut changed = true;
         let mut rounds = 0;
         while changed && rounds < 64 {
@@ -1525,10 +1618,10 @@ impl FileLiveness {
             }
         }
         if changed {
-            return; // did not converge (pathological CFG): stay unknown
+            return false; // did not converge (pathological CFG): stay unknown
         }
 
-        for &n in &lines {
+        for &n in lines.iter() {
             self.live_out[n] = live_out[n - start];
             self.live_in[n] = live_in[n - start];
             self.known[n] = true;
@@ -1539,30 +1632,7 @@ impl FileLiveness {
         for n in start..end {
             self.structural[n] = is_structural(store, infos, n);
         }
-        if let Some(key) = cache_key {
-            FN_CACHE.with(|c| {
-                let mut banks = c.borrow_mut();
-                // Two-generation bounded cache (`curr`, `prev`): when `curr`
-                // fills, rotate `curr` into `prev` so hot entries from the
-                // immediately preceding pass are promoted on hit while new
-                // functions continue to be cached (neither a clear-the-world
-                // cliff nor a permanent freeze after FN_CACHE_CAP functions).
-                if banks.0.len() >= FN_CACHE_CAP {
-                    banks.1 = std::mem::take(&mut banks.0);
-                }
-                banks.0.insert(
-                    key,
-                    (
-                        self.live_out[start..end].to_vec(),
-                        self.live_in[start..end].to_vec(),
-                        self.known[start..end].to_vec(),
-                        self.structural[start..end].to_vec(),
-                        self.effect[start..end].to_vec(),
-                        self.textual_ret.contains(&start),
-                    ),
-                );
-            });
-        }
+        true
     }
 
     /// Whether GP family `fam` provably holds a zero upper half (bits 32..63)
@@ -1847,6 +1917,20 @@ impl FileLiveness {
         start: usize,
         end: usize,
     ) -> Vec<Option<Vec<usize>>> {
+        // The overwhelmingly common function has NO indirect jump, and
+        // `classify` only consults this table for `JmpIndirect` lines (via
+        // `.get()`, which answers `None` on the empty slice exactly as the
+        // dense all-`None` table did).  Skipping the dense per-line vector
+        // for those functions removes what DHAT measured as the largest
+        // allocation site of the whole backend on the profiling TU:
+        // 183k blocks / 372 MB of zero-initialised `Option<Vec>` entries
+        // that no lookup ever touched.
+        if !lines
+            .iter()
+            .any(|&n| infos[n].kind == LineKind::JmpIndirect)
+        {
+            return Vec::new();
+        }
         let mut out: Vec<Option<Vec<usize>>> = vec![None; end.saturating_sub(start)];
         let resolve = |name: &str| -> Option<usize> { label_index.get(name).copied() };
         for (pos, &n) in lines.iter().enumerate() {

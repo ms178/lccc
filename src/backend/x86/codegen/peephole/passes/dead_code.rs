@@ -589,7 +589,13 @@ fn sib_frame_read_range(
 
     // Label line indices for deciding whether a conditional jump is a
     // back-edge (continue predicate) or a forward exit guard.
-    let mut label_pos: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    // FxHashMap, not the std SipHash default: this map is built by a
+    // whole-file scan on every probe and served 19.7M hashed lookups on the
+    // profiling TU — Callgrind priced the RandomState hashing alone at ~3%
+    // of total compile Ir.  Only `.entry()`/`.get()` touch it, so the hash
+    // function cannot change any pass decision.
+    let mut label_pos: crate::common::fx_hash::FxHashMap<&str, usize> =
+        crate::common::fx_hash::FxHashMap::default();
     for (li, info) in infos.iter().enumerate() {
         if matches!(info.kind, LineKind::Label) {
             let t = info.trimmed(store.get(li));

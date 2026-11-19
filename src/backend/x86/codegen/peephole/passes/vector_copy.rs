@@ -153,8 +153,8 @@ fn split_mn(t: &str) -> (&str, &str) {
 /// braces (EVEX writemasks, broadcasting, embedded rounding) nest, and a comma
 /// inside either is not an operand separator: `vmovupd (%rdi,%rsi,4), %xmm1` is
 /// two operands, not four.
-fn operand_list(operands: &str) -> Vec<&str> {
-    let mut out = Vec::with_capacity(3);
+fn operand_list(operands: &str) -> super::helpers::OperandList<'_> {
+    let mut out = super::helpers::OperandList::new();
     let mut depth = 0u32;
     let mut start = 0usize;
     for (i, c) in operands.char_indices() {
@@ -1064,7 +1064,7 @@ fn copy_spelled_xmm(t: &str) -> bool {
 fn copy_spelled_width(t: &str) -> Option<u16> {
     let (_, ops) = split_mn(t);
     let mut width = None;
-    for op in operand_list(ops) {
+    for &op in operand_list(ops).iter() {
         let (_, w) = vec_operand(op.trim_ascii())?;
         match width {
             None => width = Some(w),

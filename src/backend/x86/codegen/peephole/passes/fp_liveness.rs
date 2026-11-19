@@ -973,8 +973,8 @@ fn dest_operand(operands: &str) -> Option<&str> {
 }
 
 /// Every top-level operand of `operands`.
-fn operand_list(operands: &str) -> Vec<&str> {
-    let mut out = Vec::with_capacity(3);
+fn operand_list(operands: &str) -> super::helpers::OperandList<'_> {
+    let mut out = super::helpers::OperandList::new();
     let mut depth = 0u32;
     let mut start = 0usize;
     for (i, b) in operands.bytes().enumerate() {
@@ -1625,15 +1625,24 @@ pub(super) fn upper_vector_access_line(t: &str) -> (u32, u32) {
 /// The effect and successors of a control transfer (`ret`, `call`, `jmp`,
 /// `jcc`) for [`analyse`]; `None` when the target is unknowable (an indirect
 /// or unmarked foreign jump), which makes the whole function unanalysable.
+/// Successor-edge list for one line: a fall-through plus at most one branch
+/// target, so two inline slots never spill in practice.  The old
+/// `Vec<usize>` per line was the single largest allocation site in this
+/// pass (DHAT: 938k blocks / 106 MB per profiling TU).
+type EdgeList = crate::common::inline_vec::InlineVec<usize, 2>;
+/// Frame-slot operands touched by one line; x86 AT&T syntax has at most
+/// one memory operand per instruction in this corpus, 4 slots fail safe.
+type SlotOps = crate::common::inline_vec::InlineVec<(usize, bool), 4>;
+
 fn transfer_effect(
     store: &LineStore,
     infos: &[LineInfo],
     start: usize,
     n: usize,
     ret_reads: u128,
-    fall: Vec<usize>,
+    fall: EdgeList,
     resolve: &dyn Fn(&str) -> Option<usize>,
-) -> Option<(Effect, Vec<usize>)> {
+) -> Option<(Effect, EdgeList)> {
     let t = infos[n].trimmed(store.get(n));
     Some(match infos[n].kind {
         LineKind::Ret => (
@@ -1641,7 +1650,7 @@ fn transfer_effect(
                 reads: ret_reads | upper_regions(ret_reads),
                 writes: 0,
             },
-            Vec::new(),
+            EdgeList::new(),
         ),
         LineKind::Call => (
             Effect {
@@ -1672,7 +1681,7 @@ fn transfer_effect(
                         | upper_mentions(t),
                     writes: 0,
                 },
-                Vec::new(),
+                EdgeList::new(),
             )
         }
         LineKind::JmpIndirect => {
@@ -1691,7 +1700,11 @@ fn transfer_effect(
                     reads: 0,
                     writes: 0,
                 },
-                vec![idx],
+                {
+                    let mut e = EdgeList::new();
+                    e.push(idx);
+                    e
+                },
             )
         }
         LineKind::CondJmp => {
@@ -1871,9 +1884,9 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
         lines.push(n);
     }
     let mut effects: Vec<Effect> = Vec::with_capacity(lines.len());
-    let mut succs: Vec<Vec<usize>> = Vec::with_capacity(lines.len());
+    let mut succs: Vec<EdgeList> = Vec::with_capacity(lines.len());
     // Deferred slot reads/writes per line: (slot index, is_write).
-    let mut slot_ops: Vec<Vec<(usize, bool)>> = Vec::with_capacity(lines.len());
+    let mut slot_ops: Vec<SlotOps> = Vec::with_capacity(lines.len());
 
     let intern =
         |slots: &mut Vec<(u8, i32, i32)>, base: u8, off: i32, size: i32| -> Option<usize> {
@@ -1892,9 +1905,11 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
 
     for (pos, &n) in lines.iter().enumerate() {
         let t = infos[n].trimmed(store.get(n));
-        let next = lines.get(pos + 1).copied();
-        let fall: Vec<usize> = next.into_iter().collect();
-        let mut ops: Vec<(usize, bool)> = Vec::new();
+        let mut fall = EdgeList::new();
+        if let Some(&next) = lines.get(pos + 1) {
+            fall.push(next);
+        }
+        let mut ops = SlotOps::new();
 
         let (eff, edges) = match infos[n].kind {
             // Inert metadata was removed above. Remaining directives can
@@ -2061,7 +2076,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
             if infos[lines[pos]].kind == LineKind::Call {
                 r |= rsp_slot_mask;
             }
-            for &(si, is_write) in ops {
+            for &(si, is_write) in ops.iter() {
                 let (b, o, s) = slots[si];
                 for (k, &(b2, o2, s2)) in slots.iter().enumerate() {
                     if b2 != b || !ranges_overlap(o, s, o2, s2) {
@@ -2098,7 +2113,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
         rounds += 1;
         for pos in (0..lines.len()).rev() {
             let mut out = 0u128;
-            for &s in &succs[pos] {
+            for &s in succs[pos].iter() {
                 // A successor line index may be a label (in `lines`) — map it.
                 let sp = line_pos[idx_of(s)];
                 if sp == usize::MAX {

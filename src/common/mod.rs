@@ -20,6 +20,7 @@ pub(crate) mod fx_hash;
 pub(crate) mod half_float;
 pub(crate) mod hex_float;
 pub(crate) mod host_time;
+pub(crate) mod inline_vec;
 pub(crate) mod long_double;
 pub(crate) mod qualifiers;
 pub(crate) mod source;

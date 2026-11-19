@@ -126,18 +126,46 @@ pub fn build_cfg(
     label_to_idx: &FxHashMap<BlockId, usize>,
 ) -> (FlatAdj, FlatAdj) {
     let n = func.blocks.len();
-    // Build using temporary Vec<Vec<u32>> then flatten to CSR.
-    // The inner Vecs are tiny (usually 1-4 entries) so this is fast.
-    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut succs: Vec<Vec<u32>> = vec![Vec::new(); n];
+    // Direct CSR construction.  The old `Vec<Vec<u32>>` staging allocated
+    // two inner vectors per block (DHAT: 254k blocks / 10 MB per profiling
+    // TU); blocks are visited in row order, so the successor matrix can be
+    // appended straight into flat storage, and the predecessor matrix is a
+    // counting-sort over the recorded edges.
+    //
+    // Semantics preserved exactly:
+    // * successor rows are duplicate-free in source-arm order (the old code
+    //   deduplicated every arm that could collide; scanning the open row is
+    //   the same test),
+    // * predecessor rows KEEP duplicates (a `CondBranch` with both arms on
+    //   one label contributes that predecessor twice, exactly as before),
+    //   in the same block-visit order.
+    let mut succ_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+    succ_offsets.push(0);
+    // Most blocks end in a plain or conditional branch: ~1.5 edges each.
+    // Seeding the flat stores avoids most of the doubling reallocs.
+    let mut succ_data: Vec<u32> = Vec::with_capacity(n * 2);
+    let mut pred_counts: Vec<u32> = vec![0; n];
+    // (source, target) of every resolved edge, in visit order.
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(n * 2);
 
     for (i, block) in func.blocks.iter().enumerate() {
-        let i32 = i as u32;
+        let i32v = i as u32;
+        let row_start = succ_data.len();
+        let push_edge = |succ_data: &mut Vec<u32>,
+                         edges: &mut Vec<(u32, u32)>,
+                         pred_counts: &mut Vec<u32>,
+                         t: usize| {
+            let t32 = t as u32;
+            if !succ_data[row_start..].contains(&t32) {
+                succ_data.push(t32);
+            }
+            edges.push((i32v, t32));
+            pred_counts[t] += 1;
+        };
         match &block.terminator {
             Terminator::Branch(label) => {
-                if let Some(&target) = label_to_idx.get(label) {
-                    succs[i].push(target as u32);
-                    preds[target].push(i32);
+                if let Some(&t) = label_to_idx.get(label) {
+                    push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
                 }
             }
             Terminator::CondBranch {
@@ -146,15 +174,10 @@ pub fn build_cfg(
                 ..
             } => {
                 if let Some(&t) = label_to_idx.get(true_label) {
-                    succs[i].push(t as u32);
-                    preds[t].push(i32);
+                    push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
                 }
                 if let Some(&f) = label_to_idx.get(false_label) {
-                    let f32v = f as u32;
-                    if !succs[i].contains(&f32v) {
-                        succs[i].push(f32v);
-                    }
-                    preds[f].push(i32);
+                    push_edge(&mut succ_data, &mut edges, &mut pred_counts, f);
                 }
             }
             Terminator::IndirectBranch {
@@ -162,26 +185,17 @@ pub fn build_cfg(
             } => {
                 for label in possible_targets {
                     if let Some(&t) = label_to_idx.get(label) {
-                        let t32 = t as u32;
-                        if !succs[i].contains(&t32) {
-                            succs[i].push(t32);
-                        }
-                        preds[t].push(i32);
+                        push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
                     }
                 }
             }
             Terminator::Switch { cases, default, .. } => {
                 if let Some(&d) = label_to_idx.get(default) {
-                    succs[i].push(d as u32);
-                    preds[d].push(i32);
+                    push_edge(&mut succ_data, &mut edges, &mut pred_counts, d);
                 }
                 for (_, label) in cases {
                     if let Some(&t) = label_to_idx.get(label) {
-                        let t32 = t as u32;
-                        if !succs[i].contains(&t32) {
-                            succs[i].push(t32);
-                        }
-                        preds[t].push(i32);
+                        push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
                     }
                 }
             }
@@ -190,16 +204,38 @@ pub fn build_cfg(
         // InlineAsm goto_labels are implicit control flow edges.
         for label in asm_goto_successors(block) {
             if let Some(&t) = label_to_idx.get(&label) {
-                let t32 = t as u32;
-                if !succs[i].contains(&t32) {
-                    succs[i].push(t32);
-                }
-                preds[t].push(i32);
+                push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
             }
         }
+        succ_offsets.push(succ_data.len() as u32);
     }
 
-    (FlatAdj::from_vecs(preds), FlatAdj::from_vecs(succs))
+    // Predecessors: prefix-sum the counts, then scatter the edges in their
+    // recorded order (stable, so each row keeps the old push order).
+    let mut pred_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+    pred_offsets.push(0);
+    for t in 0..n {
+        let prev = pred_offsets[t];
+        pred_offsets.push(prev + pred_counts[t]);
+    }
+    let mut pred_data: Vec<u32> = vec![0; *pred_offsets.last().unwrap_or(&0) as usize];
+    let mut cursor: Vec<u32> = pred_offsets[..n].to_vec();
+    for &(src, t) in &edges {
+        let c = &mut cursor[t as usize];
+        pred_data[*c as usize] = src;
+        *c += 1;
+    }
+
+    (
+        FlatAdj {
+            offsets: pred_offsets,
+            data: pred_data,
+        },
+        FlatAdj {
+            offsets: succ_offsets,
+            data: succ_data,
+        },
+    )
 }
 
 // ── Reverse postorder ─────────────────────────────────────────────────────────
@@ -924,5 +960,108 @@ mod dominates_idom_tests {
         // A self-referential idom entry is malformed; the walk must terminate
         // and answer false rather than spin.
         assert!(!dominates_idom(&[0, 0, 2], 1, 2));
+    }
+}
+
+#[cfg(test)]
+mod build_cfg_tests {
+    use super::{build_cfg, build_label_map};
+    use crate::common::types::IrType;
+    use crate::ir::reexports::*;
+
+    fn blk(label: u32, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: Vec::new(),
+            terminator: term,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }
+    }
+
+    fn func(blocks: Vec<BasicBlock>) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, Vec::new(), false);
+        f.blocks = blocks;
+        f
+    }
+
+    fn cond(t: u32, f: u32) -> Terminator {
+        Terminator::CondBranch {
+            cond: Operand::Const(IrConst::I32(0)),
+            true_label: BlockId(t),
+            false_label: BlockId(f),
+        }
+    }
+
+    /// The direct CSR construction must preserve the historical contract the
+    /// location-alloc verifier depends on: successor rows are deduplicated,
+    /// predecessor rows are NOT (a `CondBranch` with both arms on one label
+    /// records that predecessor twice), and rows keep source-arm order.
+    #[test]
+    fn dup_arm_cond_branch_dedups_succ_but_not_pred() {
+        let f = func(vec![blk(0, cond(1, 1)), blk(1, Terminator::Return(None))]);
+        let lm = build_label_map(&f);
+        let (preds, succs) = build_cfg(&f, &lm);
+        assert_eq!(succs.row(0), &[1], "successor row is duplicate-free");
+        assert_eq!(succs.row(1), &[] as &[u32]);
+        assert_eq!(preds.row(1), &[0, 0], "both arms recorded as preds");
+        assert_eq!(preds.row(0), &[] as &[u32]);
+    }
+
+    /// Diamond + back edge: row contents and order match the arm order of
+    /// each terminator, and predecessor rows list sources in block order.
+    #[test]
+    fn diamond_rows_keep_arm_and_visit_order() {
+        let f = func(vec![
+            blk(0, cond(2, 1)), // succ row must be [2, 1]: true arm first
+            blk(1, Terminator::Branch(BlockId(3))),
+            blk(2, Terminator::Branch(BlockId(3))),
+            blk(3, cond(0, 3)), // back edge + self loop
+        ]);
+        let lm = build_label_map(&f);
+        let (preds, succs) = build_cfg(&f, &lm);
+        assert_eq!(succs.row(0), &[2, 1]);
+        assert_eq!(succs.row(1), &[3]);
+        assert_eq!(succs.row(2), &[3]);
+        assert_eq!(succs.row(3), &[0, 3]);
+        assert_eq!(preds.row(0), &[3]);
+        assert_eq!(preds.row(1), &[0]);
+        assert_eq!(preds.row(2), &[0]);
+        assert_eq!(preds.row(3), &[1, 2, 3], "sources in block-visit order");
+    }
+
+    /// Switch: the default is pushed first, duplicate case targets collapse
+    /// in the successor row but each resolved arm still counts as a pred.
+    #[test]
+    fn switch_default_first_cases_deduped() {
+        let f = func(vec![
+            blk(
+                0,
+                Terminator::Switch {
+                    val: Operand::Const(IrConst::I32(0)),
+                    cases: vec![(1, BlockId(2)), (2, BlockId(1)), (3, BlockId(2))],
+                    default: BlockId(1),
+                    ty: IrType::I32,
+                },
+            ),
+            blk(1, Terminator::Return(None)),
+            blk(2, Terminator::Unreachable),
+        ]);
+        let lm = build_label_map(&f);
+        let (preds, succs) = build_cfg(&f, &lm);
+        assert_eq!(succs.row(0), &[1, 2], "default first, then first new case");
+        assert_eq!(preds.row(1), &[0, 0], "default + case 2 both recorded");
+        assert_eq!(preds.row(2), &[0, 0], "cases 1 and 3 both recorded");
+    }
+
+    /// A branch to a label missing from the map (e.g. a pruned block) is
+    /// silently skipped, leaving an empty successor row — never a panic.
+    #[test]
+    fn unresolved_label_is_skipped() {
+        let f = func(vec![blk(0, Terminator::Branch(BlockId(99)))]);
+        let lm = build_label_map(&f);
+        let (preds, succs) = build_cfg(&f, &lm);
+        assert_eq!(succs.row(0), &[] as &[u32]);
+        assert_eq!(preds.row(0), &[] as &[u32]);
     }
 }

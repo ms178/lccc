@@ -201,11 +201,13 @@ pub(super) fn parse_scalar_fma(t: &str) -> Option<ScalarFma<'_>> {
     if operands.contains('{') {
         return None;
     }
-    let ops: Vec<&str> = operand_list(operands)
-        .into_iter()
-        .map(str::trim_ascii)
-        .collect();
-    let [op0, op1, dst] = <[&str; 3]>::try_from(ops).ok()?;
+    // Exactly three operands, each compared trimmed.  (Trim-then-count and
+    // count-then-trim agree: trimming never changes arity.)
+    let ops = operand_list(operands);
+    let &[op0, op1, dst] = ops.as_slice() else {
+        return None;
+    };
+    let (op0, op1, dst) = (op0.trim_ascii(), op1.trim_ascii(), dst.trim_ascii());
     if xmm_reg(dst).is_none() || xmm_reg(op1).is_none() {
         return None;
     }
@@ -375,8 +377,8 @@ fn split_mnemonic(t: &str) -> (&str, &str) {
 }
 
 /// Top-level comma split: commas inside `(...)` belong to the address.
-fn operand_list(operands: &str) -> Vec<&str> {
-    let mut out = Vec::with_capacity(3);
+fn operand_list(operands: &str) -> super::helpers::OperandList<'_> {
+    let mut out = super::helpers::OperandList::new();
     let mut depth = 0i32;
     let mut start = 0usize;
     for (i, b) in operands.bytes().enumerate() {

@@ -396,7 +396,7 @@ fn is_far_jump(mn: &str) -> bool {
 /// conservatively reaches every line (fail closed).
 fn successor_lines(
     body: &[&str],
-    labels: &std::collections::HashMap<&str, usize>,
+    labels: &crate::common::fx_hash::FxHashMap<&str, usize>,
     i: usize,
 ) -> Vec<usize> {
     let n = body.len();
@@ -453,7 +453,9 @@ fn successor_lines(
 /// conservative, no precision loss in practice).
 fn allowed_masks(body: &[&str]) -> Vec<u32> {
     let n = body.len();
-    let mut labels = std::collections::HashMap::new();
+    // FxHashMap for the same reason as `dead_code::label_pos`: pure
+    // lookup map on the per-line hot path, hash choice is unobservable.
+    let mut labels = crate::common::fx_hash::FxHashMap::default();
     for (i, l) in body.iter().enumerate() {
         if let Some(name) = label_name(l) {
             labels.entry(name).or_insert(i);
