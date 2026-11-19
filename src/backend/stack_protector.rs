@@ -504,7 +504,9 @@ fn instrument_function(
     // 2. Rewrite every Return block to check the canary before returning.
     let orig_len = func.blocks.len();
     let mut fail_block_id: Option<BlockId> = None;
-    let mut new_blocks: Vec<BasicBlock> = Vec::new();
+    // The return each check falls into, with the index of the block it
+    // follows; ascending, one per original Return.
+    let mut ret_blocks: Vec<(usize, BasicBlock)> = Vec::new();
 
     for bi in 0..orig_len {
         let ret_operand = match &func.blocks[bi].terminator {
@@ -610,14 +612,35 @@ fn instrument_function(
             false_label: ret_lbl,
         };
 
-        new_blocks.push(BasicBlock {
-            label: ret_lbl,
-            instructions: moved_insts,
-            terminator: Terminator::Return(ret_operand),
-            source_spans: moved_spans,
-            source_inline_ids: moved_ids,
-        });
+        ret_blocks.push((
+            bi,
+            BasicBlock {
+                label: ret_lbl,
+                instructions: moved_insts,
+                terminator: Terminator::Return(ret_operand),
+                source_spans: moved_spans,
+                source_inline_ids: moved_ids,
+            },
+        ));
     }
+
+    // Block order is emission order by now (layout has run), so where the new
+    // blocks go decides which arm of the check falls through.  The return is
+    // the arm taken every time and goes directly behind its check; appended
+    // to the function it would sit behind whatever layout moved out of line
+    // after the returning block -- the cold side of an `unlikely()` branch,
+    // the code a disabled static key skips -- and every return would pay a
+    // taken jump over it.  The failure block is never executed in a correct
+    // program and stays last.
+    let mut pending = ret_blocks.into_iter().peekable();
+    let mut blocks = Vec::with_capacity(orig_len + pending.len() + 1);
+    for (bi, block) in std::mem::take(&mut func.blocks).into_iter().enumerate() {
+        blocks.push(block);
+        if let Some((_, ret_block)) = pending.next_if(|(after, _)| *after == bi) {
+            blocks.push(ret_block);
+        }
+    }
+    func.blocks = blocks;
 
     if let Some(fail_lbl) = fail_block_id {
         let info = CallInfo {
@@ -645,7 +668,7 @@ fn instrument_function(
             ret_is_vector128: false,
             cold: true,
         };
-        new_blocks.push(BasicBlock {
+        func.blocks.push(BasicBlock {
             label: fail_lbl,
             instructions: vec![Instruction::Call {
                 func: "__stack_chk_fail".to_string(),
@@ -657,7 +680,6 @@ fn instrument_function(
         });
     }
 
-    func.blocks.extend(new_blocks);
     func.next_value_id = next_val;
     func.next_label = *next_blk;
 }
@@ -791,6 +813,93 @@ mod tests {
                 "the check must not run after a return register is loaded"
             );
         }
+    }
+
+    /// Layout has run when the canary goes in, so the place of the new blocks
+    /// is the place of their code.  Each return follows its own check -- the
+    /// arm taken on every return falls through -- whatever layout put behind
+    /// the returning block, and the failure call goes last.
+    #[test]
+    fn each_return_falls_out_of_its_check_and_the_failure_goes_last() {
+        fn block(label: u32, terminator: Terminator) -> BasicBlock {
+            BasicBlock {
+                label: BlockId(label),
+                instructions: Vec::new(),
+                terminator,
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            }
+        }
+        let ret = || Terminator::Return(Some(Operand::Const(IrConst::I32(0))));
+        // 0 branches to the returning block 1 or to 2, which layout moved
+        // behind it; 2 returns on its own, and 3 comes back to 1.
+        let mut f = IrFunction::new("f".to_string(), IrType::I32, Vec::new(), false);
+        f.blocks = vec![
+            block(
+                0,
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(1, ret()),
+            block(2, ret()),
+            block(3, Terminator::Branch(BlockId(1))),
+        ];
+        f.next_label = 4;
+        f.next_value_id = 1;
+        let mut next_blk = 10;
+        instrument_function(
+            &mut f,
+            &EffectiveStackGuard::Global {
+                symbol: "__stack_chk_guard".to_string(),
+            },
+            8,
+            IrType::U64,
+            &mut next_blk,
+        );
+
+        let order: Vec<u32> = f.blocks.iter().map(|b| b.label.0).collect();
+        assert_eq!(order.len(), 7, "{order:?}");
+        assert_eq!(&order[..2], &[0, 1], "{order:?}");
+        assert_eq!(order[3], 2, "{order:?}");
+        assert_eq!(order[5], 3, "{order:?}");
+        let fail = order[6];
+        assert!(
+            matches!(f.blocks[6].terminator, Terminator::Unreachable)
+                && matches!(
+                    f.blocks[6].instructions.as_slice(),
+                    [Instruction::Call { func, info }] if func == "__stack_chk_fail" && info.cold
+                ),
+            "{order:?}"
+        );
+        for check in [1usize, 3] {
+            let Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } = f.blocks[check].terminator
+            else {
+                panic!("block {check} does not end in the canary check: {order:?}");
+            };
+            assert_eq!(
+                true_label.0, fail,
+                "a mismatch leaves for the failure block"
+            );
+            assert_eq!(
+                false_label,
+                f.blocks[check + 1].label,
+                "the return is the block behind its check: {order:?}"
+            );
+            assert!(matches!(
+                f.blocks[check + 1].terminator,
+                Terminator::Return(Some(_))
+            ));
+        }
+        assert_eq!(f.next_label, next_blk);
+        let mut seen = FxHashSet::default();
+        assert!(order.iter().all(|label| seen.insert(*label)), "{order:?}");
     }
 
     #[test]
