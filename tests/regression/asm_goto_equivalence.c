@@ -14,9 +14,11 @@
  *
  * Found with it on main (GCC 16.2 and Clang 23.1.5 are right): a store to a
  * global or an escaped local ahead of the asm goto deleted as dead (-O2), a
- * stack slot forwarded across the label of an asm goto (x86-64, -O1), and a
+ * stack slot forwarded across the label of an asm goto (x86-64, -O1), a
  * register holding a loop-carried value given up as dead when only the asm
- * goto leaves the loop (-m32, -O1).
+ * goto leaves the loop (-m32, -O1), and a label moved behind the call inlined
+ * into its block, so that the asm goto skipped the call (-O2; the fault paths
+ * of the kernel's copy_from_kernel_nofault()).
  *
  * Header-free: it is built for -m32 and for the cross targets as well.
  */
@@ -108,6 +110,36 @@ NOINLINE static void sink(void *p)
 NOINLINE static int g(int i)
 {
     return 100 + i + zero;
+}
+
+/* `*p`, written the way the kernel's get_current() and this_cpu_read() are: a
+ * switch over a constant size.  It is two dozen blocks and a handful of
+ * instructions until the first cleanup folds the switch, which is too many
+ * blocks for the inliner's first run; the second run takes it, after the
+ * unreachable code ahead of a label has been swept. */
+NOINLINE static int pick_bad_size(void)
+{
+    return -1 + zero;
+}
+
+static inline __attribute__((always_inline)) int pick(const int *p)
+{
+    int value;
+    switch (sizeof(*p)) {
+    case 1: value = *(const signed char *)p; break;
+    case 2: value = *(const short *)p; break;
+    case 4: value = *p; break;
+    case 8: value = (int)*(const long long *)p; break;
+    default: value = pick_bad_size(); break;
+    }
+    switch (sizeof(value)) {
+    case 1: value += 1; break;
+    case 2: value += 2; break;
+    case 4: value += zero; break;
+    case 8: value += 8; break;
+    default: value = pick_bad_size(); break;
+    }
+    return value;
 }
 
 /* A static key: the asm goto lives in a function that is always inlined. */
@@ -230,6 +262,339 @@ __asm__(".text\n"
         "    popq %r12\n"
         "    popq %rbx\n"
         "    popq %rbp\n"
+        "    ret\n"
+        ".size guarded_call, .-guarded_call\n");
+#elif defined(__aarch64__)
+int guarded_call(shape_fn *fn, int x, int y, int n, struct cell *c, int *result)
+    __attribute__((visibility("hidden")));
+__asm__(".text\n"
+        ".globl guarded_call\n"
+        ".hidden guarded_call\n"
+        ".type guarded_call, %function\n"
+        "guarded_call:\n"
+        "    stp x29, x30, [sp, #-176]!\n"
+        "    stp x19, x20, [sp, #16]\n"
+        "    stp x21, x22, [sp, #32]\n"
+        "    stp x23, x24, [sp, #48]\n"
+        "    stp x25, x26, [sp, #64]\n"
+        "    stp x27, x28, [sp, #80]\n"
+        "    stp d8, d9, [sp, #96]\n"
+        "    stp d10, d11, [sp, #112]\n"
+        "    stp d12, d13, [sp, #128]\n"
+        "    stp d14, d15, [sp, #144]\n"
+        "    str x5, [sp, #160]\n"
+        "    mov x9, x0\n"
+        "    mov w0, w1\n"
+        "    mov w1, w2\n"
+        "    mov w2, w3\n"
+        "    mov x3, x4\n"
+        "    mov x19, #0x1b1\n"
+        "    mov x20, #0x2c2\n"
+        "    mov x21, #0x3d3\n"
+        "    mov x22, #0x4e4\n"
+        "    mov x23, #0x5f5\n"
+        "    mov x24, #0x706\n"
+        "    mov x25, #0x817\n"
+        "    mov x26, #0x928\n"
+        "    mov x27, #0xa39\n"
+        "    mov x28, #0xb4a\n"
+        "    mov x10, #0x111\n"
+        "    fmov d8, x10\n"
+        "    mov x10, #0x222\n"
+        "    fmov d9, x10\n"
+        "    mov x10, #0x333\n"
+        "    fmov d10, x10\n"
+        "    mov x10, #0x444\n"
+        "    fmov d11, x10\n"
+        "    mov x10, #0x555\n"
+        "    fmov d12, x10\n"
+        "    mov x10, #0x666\n"
+        "    fmov d13, x10\n"
+        "    mov x10, #0x777\n"
+        "    fmov d14, x10\n"
+        "    mov x10, #0x888\n"
+        "    fmov d15, x10\n"
+        "    blr x9\n"
+        "    ldr x5, [sp, #160]\n"
+        "    str w0, [x5]\n"
+        "    mov w0, #0\n"
+        "    cmp x19, #0x1b1\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x1\n"
+        "1:  cmp x20, #0x2c2\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x2\n"
+        "1:  cmp x21, #0x3d3\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x4\n"
+        "1:  cmp x22, #0x4e4\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x8\n"
+        "1:  cmp x23, #0x5f5\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x10\n"
+        "1:  cmp x24, #0x706\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x20\n"
+        "1:  cmp x25, #0x817\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x40\n"
+        "1:  cmp x26, #0x928\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x80\n"
+        "1:  cmp x27, #0xa39\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x100\n"
+        "1:  cmp x28, #0xb4a\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x200\n"
+        "1:  fmov x10, d8\n"
+        "    cmp x10, #0x111\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x400\n"
+        "1:  fmov x10, d9\n"
+        "    cmp x10, #0x222\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x800\n"
+        "1:  fmov x10, d10\n"
+        "    cmp x10, #0x333\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x1000\n"
+        "1:  fmov x10, d11\n"
+        "    cmp x10, #0x444\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x2000\n"
+        "1:  fmov x10, d12\n"
+        "    cmp x10, #0x555\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x4000\n"
+        "1:  fmov x10, d13\n"
+        "    cmp x10, #0x666\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x8000\n"
+        "1:  fmov x10, d14\n"
+        "    cmp x10, #0x777\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x10000\n"
+        "1:  fmov x10, d15\n"
+        "    cmp x10, #0x888\n"
+        "    b.eq 1f\n"
+        "    orr w0, w0, #0x20000\n"
+        "1:  ldp d14, d15, [sp, #144]\n"
+        "    ldp d12, d13, [sp, #128]\n"
+        "    ldp d10, d11, [sp, #112]\n"
+        "    ldp d8, d9, [sp, #96]\n"
+        "    ldp x27, x28, [sp, #80]\n"
+        "    ldp x25, x26, [sp, #64]\n"
+        "    ldp x23, x24, [sp, #48]\n"
+        "    ldp x21, x22, [sp, #32]\n"
+        "    ldp x19, x20, [sp, #16]\n"
+        "    ldp x29, x30, [sp], #176\n"
+        "    ret\n"
+        ".size guarded_call, .-guarded_call\n");
+#elif defined(__riscv) && __riscv_xlen == 64 && defined(__riscv_float_abi_double)
+int guarded_call(shape_fn *fn, int x, int y, int n, struct cell *c, int *result)
+    __attribute__((visibility("hidden")));
+__asm__(".text\n"
+        ".globl guarded_call\n"
+        ".hidden guarded_call\n"
+        ".type guarded_call, @function\n"
+        "guarded_call:\n"
+        "    addi sp, sp, -208\n"
+        "    sd ra, 0(sp)\n"
+        "    sd s0, 8(sp)\n"
+        "    sd s1, 16(sp)\n"
+        "    sd s2, 24(sp)\n"
+        "    sd s3, 32(sp)\n"
+        "    sd s4, 40(sp)\n"
+        "    sd s5, 48(sp)\n"
+        "    sd s6, 56(sp)\n"
+        "    sd s7, 64(sp)\n"
+        "    sd s8, 72(sp)\n"
+        "    sd s9, 80(sp)\n"
+        "    sd s10, 88(sp)\n"
+        "    sd s11, 96(sp)\n"
+        "    fsd fs0, 104(sp)\n"
+        "    fsd fs1, 112(sp)\n"
+        "    fsd fs2, 120(sp)\n"
+        "    fsd fs3, 128(sp)\n"
+        "    fsd fs4, 136(sp)\n"
+        "    fsd fs5, 144(sp)\n"
+        "    fsd fs6, 152(sp)\n"
+        "    fsd fs7, 160(sp)\n"
+        "    fsd fs8, 168(sp)\n"
+        "    fsd fs9, 176(sp)\n"
+        "    fsd fs10, 184(sp)\n"
+        "    fsd fs11, 192(sp)\n"
+        "    sd a5, 200(sp)\n"
+        "    mv t0, a0\n"
+        "    mv a0, a1\n"
+        "    mv a1, a2\n"
+        "    mv a2, a3\n"
+        "    mv a3, a4\n"
+        "    li s0, 0x1b1\n"
+        "    li s1, 0x2c2\n"
+        "    li s2, 0x3d3\n"
+        "    li s3, 0x4e4\n"
+        "    li s4, 0x5f5\n"
+        "    li s5, 0x706\n"
+        "    li s6, 0x817\n"
+        "    li s7, 0x928\n"
+        "    li s8, 0xa39\n"
+        "    li s9, 0xb4a\n"
+        "    li s10, 0xc5b\n"
+        "    li s11, 0xd6c\n"
+        "    li t1, 0x111\n"
+        "    fmv.d.x fs0, t1\n"
+        "    li t1, 0x222\n"
+        "    fmv.d.x fs1, t1\n"
+        "    li t1, 0x333\n"
+        "    fmv.d.x fs2, t1\n"
+        "    li t1, 0x444\n"
+        "    fmv.d.x fs3, t1\n"
+        "    li t1, 0x555\n"
+        "    fmv.d.x fs4, t1\n"
+        "    li t1, 0x666\n"
+        "    fmv.d.x fs5, t1\n"
+        "    li t1, 0x777\n"
+        "    fmv.d.x fs6, t1\n"
+        "    li t1, 0x888\n"
+        "    fmv.d.x fs7, t1\n"
+        "    li t1, 0x999\n"
+        "    fmv.d.x fs8, t1\n"
+        "    li t1, 0xaaa\n"
+        "    fmv.d.x fs9, t1\n"
+        "    li t1, 0xbbb\n"
+        "    fmv.d.x fs10, t1\n"
+        "    li t1, 0xccc\n"
+        "    fmv.d.x fs11, t1\n"
+        "    jalr t0\n"
+        "    ld a5, 200(sp)\n"
+        "    sw a0, 0(a5)\n"
+        "    li a0, 0\n"
+        "    li t1, 0x1b1\n"
+        "    beq s0, t1, 1f\n"
+        "    ori a0, a0, 1\n"
+        "1:  li t1, 0x2c2\n"
+        "    beq s1, t1, 1f\n"
+        "    ori a0, a0, 2\n"
+        "1:  li t1, 0x3d3\n"
+        "    beq s2, t1, 1f\n"
+        "    ori a0, a0, 4\n"
+        "1:  li t1, 0x4e4\n"
+        "    beq s3, t1, 1f\n"
+        "    ori a0, a0, 8\n"
+        "1:  li t1, 0x5f5\n"
+        "    beq s4, t1, 1f\n"
+        "    ori a0, a0, 16\n"
+        "1:  li t1, 0x706\n"
+        "    beq s5, t1, 1f\n"
+        "    ori a0, a0, 32\n"
+        "1:  li t1, 0x817\n"
+        "    beq s6, t1, 1f\n"
+        "    ori a0, a0, 64\n"
+        "1:  li t1, 0x928\n"
+        "    beq s7, t1, 1f\n"
+        "    ori a0, a0, 128\n"
+        "1:  li t1, 0xa39\n"
+        "    beq s8, t1, 1f\n"
+        "    ori a0, a0, 256\n"
+        "1:  li t1, 0xb4a\n"
+        "    beq s9, t1, 1f\n"
+        "    ori a0, a0, 512\n"
+        "1:  li t1, 0xc5b\n"
+        "    beq s10, t1, 1f\n"
+        "    ori a0, a0, 1024\n"
+        "1:  li t1, 0xd6c\n"
+        "    beq s11, t1, 1f\n"
+        "    li t2, 0x800\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs0\n"
+        "    li t1, 0x111\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x1000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs1\n"
+        "    li t1, 0x222\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x2000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs2\n"
+        "    li t1, 0x333\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x4000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs3\n"
+        "    li t1, 0x444\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x8000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs4\n"
+        "    li t1, 0x555\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x10000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs5\n"
+        "    li t1, 0x666\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x20000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs6\n"
+        "    li t1, 0x777\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x40000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs7\n"
+        "    li t1, 0x888\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x80000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs8\n"
+        "    li t1, 0x999\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x100000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs9\n"
+        "    li t1, 0xaaa\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x200000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs10\n"
+        "    li t1, 0xbbb\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x400000\n"
+        "    or a0, a0, t2\n"
+        "1:  fmv.x.d t2, fs11\n"
+        "    li t1, 0xccc\n"
+        "    beq t2, t1, 1f\n"
+        "    li t2, 0x800000\n"
+        "    or a0, a0, t2\n"
+        "1:  ld ra, 0(sp)\n"
+        "    ld s0, 8(sp)\n"
+        "    ld s1, 16(sp)\n"
+        "    ld s2, 24(sp)\n"
+        "    ld s3, 32(sp)\n"
+        "    ld s4, 40(sp)\n"
+        "    ld s5, 48(sp)\n"
+        "    ld s6, 56(sp)\n"
+        "    ld s7, 64(sp)\n"
+        "    ld s8, 72(sp)\n"
+        "    ld s9, 80(sp)\n"
+        "    ld s10, 88(sp)\n"
+        "    ld s11, 96(sp)\n"
+        "    fld fs0, 104(sp)\n"
+        "    fld fs1, 112(sp)\n"
+        "    fld fs2, 120(sp)\n"
+        "    fld fs3, 128(sp)\n"
+        "    fld fs4, 136(sp)\n"
+        "    fld fs5, 144(sp)\n"
+        "    fld fs6, 152(sp)\n"
+        "    fld fs7, 160(sp)\n"
+        "    fld fs8, 168(sp)\n"
+        "    fld fs9, 176(sp)\n"
+        "    fld fs10, 184(sp)\n"
+        "    fld fs11, 192(sp)\n"
+        "    addi sp, sp, 208\n"
         "    ret\n"
         ".size guarded_call, .-guarded_call\n");
 #else
@@ -2609,6 +2974,690 @@ NOINLINE static int label_writes_arr_ref(int x, int y, int n, struct cell *c)
         v[n & 3] = (9);
         return r;
     }
+}
+
+NOINLINE static int label_inlines_reg_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v = c->a;
+    v = (1);
+    ASM_BR(x, out);
+    v = (2);
+    return (v);
+    out: v = (v + 10);
+    v = (v + pick(&c->a));
+    return (v);
+}
+
+NOINLINE static int label_inlines_reg_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v = c->a;
+    v = (1);
+    REF_BR(x, out);
+    v = (2);
+    return (v);
+    out: v = (v + 10);
+    v = (v + pick(&c->a));
+    return (v);
+}
+
+NOINLINE static int label_inlines_esc_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v = c->a; sink(&v);
+    v = (1);
+    ASM_BR(x, out);
+    v = (2);
+    return (v);
+    out: v = (v + 10);
+    v = (v + pick(&c->a));
+    return (v);
+}
+
+NOINLINE static int label_inlines_esc_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v = c->a; sink(&v);
+    v = (1);
+    REF_BR(x, out);
+    v = (2);
+    return (v);
+    out: v = (v + 10);
+    v = (v + pick(&c->a));
+    return (v);
+}
+
+NOINLINE static int label_inlines_glob_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    G = (1);
+    ASM_BR(x, out);
+    G = (2);
+    return (G);
+    out: G = (G + 10);
+    G = (G + pick(&c->a));
+    return (G);
+}
+
+NOINLINE static int label_inlines_glob_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    G = (1);
+    REF_BR(x, out);
+    G = (2);
+    return (G);
+    out: G = (G + 10);
+    G = (G + pick(&c->a));
+    return (G);
+}
+
+NOINLINE static int label_inlines_ptr_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    c->v = (1);
+    ASM_BR(x, out);
+    c->v = (2);
+    return (c->v);
+    out: c->v = (c->v + 10);
+    c->v = (c->v + pick(&c->a));
+    return (c->v);
+}
+
+NOINLINE static int label_inlines_ptr_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    c->v = (1);
+    REF_BR(x, out);
+    c->v = (2);
+    return (c->v);
+    out: c->v = (c->v + 10);
+    c->v = (c->v + pick(&c->a));
+    return (c->v);
+}
+
+NOINLINE static int label_inlines_elem_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    c->arr[n & 3] = (1);
+    ASM_BR(x, out);
+    c->arr[n & 3] = (2);
+    return (c->arr[n & 3]);
+    out: c->arr[n & 3] = (c->arr[n & 3] + 10);
+    c->arr[n & 3] = (c->arr[n & 3] + pick(&c->a));
+    return (c->arr[n & 3]);
+}
+
+NOINLINE static int label_inlines_elem_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    c->arr[n & 3] = (1);
+    REF_BR(x, out);
+    c->arr[n & 3] = (2);
+    return (c->arr[n & 3]);
+    out: c->arr[n & 3] = (c->arr[n & 3] + 10);
+    c->arr[n & 3] = (c->arr[n & 3] + pick(&c->a));
+    return (c->arr[n & 3]);
+}
+
+NOINLINE static int label_inlines_wide_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    long long v = c->w;
+    v = (long long)(1) * 0x100000003LL;
+    ASM_BR(x, out);
+    v = (long long)(2) * 0x100000003LL;
+    return ((int)(v >> 32) + (int)(v & 0xffff));
+    out: v = (long long)((int)(v >> 32) + 10) * 0x100000003LL;
+    v = (long long)((int)(v >> 32) + pick(&c->a)) * 0x100000003LL;
+    return ((int)(v >> 32) + (int)(v & 0xffff));
+}
+
+NOINLINE static int label_inlines_wide_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    long long v = c->w;
+    v = (long long)(1) * 0x100000003LL;
+    REF_BR(x, out);
+    v = (long long)(2) * 0x100000003LL;
+    return ((int)(v >> 32) + (int)(v & 0xffff));
+    out: v = (long long)((int)(v >> 32) + 10) * 0x100000003LL;
+    v = (long long)((int)(v >> 32) + pick(&c->a)) * 0x100000003LL;
+    return ((int)(v >> 32) + (int)(v & 0xffff));
+}
+
+NOINLINE static int label_inlines_fp_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    double v = c->d;
+    v = (1) + 0.25;
+    ASM_BR(x, out);
+    v = (2) + 0.25;
+    return ((int)(v * 4));
+    out: v = ((int)v + 10) + 0.25;
+    v = ((int)v + pick(&c->a)) + 0.25;
+    return ((int)(v * 4));
+}
+
+NOINLINE static int label_inlines_fp_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    double v = c->d;
+    v = (1) + 0.25;
+    REF_BR(x, out);
+    v = (2) + 0.25;
+    return ((int)(v * 4));
+    out: v = ((int)v + 10) + 0.25;
+    v = ((int)v + pick(&c->a)) + 0.25;
+    return ((int)(v * 4));
+}
+
+NOINLINE static int label_inlines_byte_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    unsigned char v = (unsigned char)c->a;
+    v = (unsigned char)(1);
+    ASM_BR(x, out);
+    v = (unsigned char)(2);
+    return (v);
+    out: v = (unsigned char)(v + 10);
+    v = (unsigned char)(v + pick(&c->a));
+    return (v);
+}
+
+NOINLINE static int label_inlines_byte_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    unsigned char v = (unsigned char)c->a;
+    v = (unsigned char)(1);
+    REF_BR(x, out);
+    v = (unsigned char)(2);
+    return (v);
+    out: v = (unsigned char)(v + 10);
+    v = (unsigned char)(v + pick(&c->a));
+    return (v);
+}
+
+NOINLINE static int label_inlines_vol_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    volatile int v = c->a;
+    v = (1);
+    ASM_BR(x, out);
+    v = (2);
+    return (v);
+    out: v = (v + 10);
+    v = (v + pick(&c->a));
+    return (v);
+}
+
+NOINLINE static int label_inlines_vol_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    volatile int v = c->a;
+    v = (1);
+    REF_BR(x, out);
+    v = (2);
+    return (v);
+    out: v = (v + 10);
+    v = (v + pick(&c->a));
+    return (v);
+}
+
+NOINLINE static int label_inlines_agg_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    struct pair v = { c->a, c->v };
+    v = mk_pair(1);
+    ASM_BR(x, out);
+    v = mk_pair(2);
+    return (v.lo * 3 + v.hi);
+    out: v = mk_pair((v.lo + v.hi) + 10);
+    v = mk_pair((v.lo + v.hi) + pick(&c->a));
+    return (v.lo * 3 + v.hi);
+}
+
+NOINLINE static int label_inlines_agg_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    struct pair v = { c->a, c->v };
+    v = mk_pair(1);
+    REF_BR(x, out);
+    v = mk_pair(2);
+    return (v.lo * 3 + v.hi);
+    out: v = mk_pair((v.lo + v.hi) + 10);
+    v = mk_pair((v.lo + v.hi) + pick(&c->a));
+    return (v.lo * 3 + v.hi);
+}
+
+NOINLINE static int label_inlines_bits_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    struct bits v = { 3, (unsigned)c->a };
+    v.s = (unsigned)(1);
+    ASM_BR(x, out);
+    v.s = (unsigned)(2);
+    return ((int)(v.f + v.s));
+    out: v.s = (unsigned)((int)v.s + 10);
+    v.s = (unsigned)((int)v.s + pick(&c->a));
+    return ((int)(v.f + v.s));
+}
+
+NOINLINE static int label_inlines_bits_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    struct bits v = { 3, (unsigned)c->a };
+    v.s = (unsigned)(1);
+    REF_BR(x, out);
+    v.s = (unsigned)(2);
+    return ((int)(v.f + v.s));
+    out: v.s = (unsigned)((int)v.s + 10);
+    v.s = (unsigned)((int)v.s + pick(&c->a));
+    return ((int)(v.f + v.s));
+}
+
+NOINLINE static int label_inlines_arr_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v[4] = { c->a, 1, 2, 3 };
+    v[n & 3] = (1);
+    ASM_BR(x, out);
+    v[n & 3] = (2);
+    return (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]);
+    out: v[n & 3] = (v[n & 3] + 10);
+    v[n & 3] = (v[n & 3] + pick(&c->a));
+    return (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]);
+}
+
+NOINLINE static int label_inlines_arr_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v[4] = { c->a, 1, 2, 3 };
+    v[n & 3] = (1);
+    REF_BR(x, out);
+    v[n & 3] = (2);
+    return (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]);
+    out: v[n & 3] = (v[n & 3] + 10);
+    v[n & 3] = (v[n & 3] + pick(&c->a));
+    return (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]);
+}
+
+NOINLINE static int loop_label_inlines_reg_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v = c->a;
+    int i;
+    v = (0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v = (v + 10 + i);
+    }
+    return (v);
+    out: v = (v + 3);
+    v = (v + pick(&c->a) + i);
+    return (v);
+}
+
+NOINLINE static int loop_label_inlines_reg_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v = c->a;
+    int i;
+    v = (0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v = (v + 10 + i);
+    }
+    return (v);
+    out: v = (v + 3);
+    v = (v + pick(&c->a) + i);
+    return (v);
+}
+
+NOINLINE static int loop_label_inlines_esc_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v = c->a; sink(&v);
+    int i;
+    v = (0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v = (v + 10 + i);
+    }
+    return (v);
+    out: v = (v + 3);
+    v = (v + pick(&c->a) + i);
+    return (v);
+}
+
+NOINLINE static int loop_label_inlines_esc_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v = c->a; sink(&v);
+    int i;
+    v = (0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v = (v + 10 + i);
+    }
+    return (v);
+    out: v = (v + 3);
+    v = (v + pick(&c->a) + i);
+    return (v);
+}
+
+NOINLINE static int loop_label_inlines_glob_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int i;
+    G = (0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        G = (G + 10 + i);
+    }
+    return (G);
+    out: G = (G + 3);
+    G = (G + pick(&c->a) + i);
+    return (G);
+}
+
+NOINLINE static int loop_label_inlines_glob_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int i;
+    G = (0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        G = (G + 10 + i);
+    }
+    return (G);
+    out: G = (G + 3);
+    G = (G + pick(&c->a) + i);
+    return (G);
+}
+
+NOINLINE static int loop_label_inlines_ptr_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int i;
+    c->v = (0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        c->v = (c->v + 10 + i);
+    }
+    return (c->v);
+    out: c->v = (c->v + 3);
+    c->v = (c->v + pick(&c->a) + i);
+    return (c->v);
+}
+
+NOINLINE static int loop_label_inlines_ptr_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int i;
+    c->v = (0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        c->v = (c->v + 10 + i);
+    }
+    return (c->v);
+    out: c->v = (c->v + 3);
+    c->v = (c->v + pick(&c->a) + i);
+    return (c->v);
+}
+
+NOINLINE static int loop_label_inlines_elem_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int i;
+    c->arr[n & 3] = (0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        c->arr[n & 3] = (c->arr[n & 3] + 10 + i);
+    }
+    return (c->arr[n & 3]);
+    out: c->arr[n & 3] = (c->arr[n & 3] + 3);
+    c->arr[n & 3] = (c->arr[n & 3] + pick(&c->a) + i);
+    return (c->arr[n & 3]);
+}
+
+NOINLINE static int loop_label_inlines_elem_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int i;
+    c->arr[n & 3] = (0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        c->arr[n & 3] = (c->arr[n & 3] + 10 + i);
+    }
+    return (c->arr[n & 3]);
+    out: c->arr[n & 3] = (c->arr[n & 3] + 3);
+    c->arr[n & 3] = (c->arr[n & 3] + pick(&c->a) + i);
+    return (c->arr[n & 3]);
+}
+
+NOINLINE static int loop_label_inlines_wide_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    long long v = c->w;
+    int i;
+    v = (long long)(0) * 0x100000003LL;
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v = (long long)((int)(v >> 32) + 10 + i) * 0x100000003LL;
+    }
+    return ((int)(v >> 32) + (int)(v & 0xffff));
+    out: v = (long long)((int)(v >> 32) + 3) * 0x100000003LL;
+    v = (long long)((int)(v >> 32) + pick(&c->a) + i) * 0x100000003LL;
+    return ((int)(v >> 32) + (int)(v & 0xffff));
+}
+
+NOINLINE static int loop_label_inlines_wide_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    long long v = c->w;
+    int i;
+    v = (long long)(0) * 0x100000003LL;
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v = (long long)((int)(v >> 32) + 10 + i) * 0x100000003LL;
+    }
+    return ((int)(v >> 32) + (int)(v & 0xffff));
+    out: v = (long long)((int)(v >> 32) + 3) * 0x100000003LL;
+    v = (long long)((int)(v >> 32) + pick(&c->a) + i) * 0x100000003LL;
+    return ((int)(v >> 32) + (int)(v & 0xffff));
+}
+
+NOINLINE static int loop_label_inlines_fp_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    double v = c->d;
+    int i;
+    v = (0) + 0.25;
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v = ((int)v + 10 + i) + 0.25;
+    }
+    return ((int)(v * 4));
+    out: v = ((int)v + 3) + 0.25;
+    v = ((int)v + pick(&c->a) + i) + 0.25;
+    return ((int)(v * 4));
+}
+
+NOINLINE static int loop_label_inlines_fp_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    double v = c->d;
+    int i;
+    v = (0) + 0.25;
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v = ((int)v + 10 + i) + 0.25;
+    }
+    return ((int)(v * 4));
+    out: v = ((int)v + 3) + 0.25;
+    v = ((int)v + pick(&c->a) + i) + 0.25;
+    return ((int)(v * 4));
+}
+
+NOINLINE static int loop_label_inlines_byte_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    unsigned char v = (unsigned char)c->a;
+    int i;
+    v = (unsigned char)(0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v = (unsigned char)(v + 10 + i);
+    }
+    return (v);
+    out: v = (unsigned char)(v + 3);
+    v = (unsigned char)(v + pick(&c->a) + i);
+    return (v);
+}
+
+NOINLINE static int loop_label_inlines_byte_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    unsigned char v = (unsigned char)c->a;
+    int i;
+    v = (unsigned char)(0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v = (unsigned char)(v + 10 + i);
+    }
+    return (v);
+    out: v = (unsigned char)(v + 3);
+    v = (unsigned char)(v + pick(&c->a) + i);
+    return (v);
+}
+
+NOINLINE static int loop_label_inlines_vol_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    volatile int v = c->a;
+    int i;
+    v = (0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v = (v + 10 + i);
+    }
+    return (v);
+    out: v = (v + 3);
+    v = (v + pick(&c->a) + i);
+    return (v);
+}
+
+NOINLINE static int loop_label_inlines_vol_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    volatile int v = c->a;
+    int i;
+    v = (0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v = (v + 10 + i);
+    }
+    return (v);
+    out: v = (v + 3);
+    v = (v + pick(&c->a) + i);
+    return (v);
+}
+
+NOINLINE static int loop_label_inlines_agg_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    struct pair v = { c->a, c->v };
+    int i;
+    v = mk_pair(0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v = mk_pair((v.lo + v.hi) + 10 + i);
+    }
+    return (v.lo * 3 + v.hi);
+    out: v = mk_pair((v.lo + v.hi) + 3);
+    v = mk_pair((v.lo + v.hi) + pick(&c->a) + i);
+    return (v.lo * 3 + v.hi);
+}
+
+NOINLINE static int loop_label_inlines_agg_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    struct pair v = { c->a, c->v };
+    int i;
+    v = mk_pair(0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v = mk_pair((v.lo + v.hi) + 10 + i);
+    }
+    return (v.lo * 3 + v.hi);
+    out: v = mk_pair((v.lo + v.hi) + 3);
+    v = mk_pair((v.lo + v.hi) + pick(&c->a) + i);
+    return (v.lo * 3 + v.hi);
+}
+
+NOINLINE static int loop_label_inlines_bits_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    struct bits v = { 3, (unsigned)c->a };
+    int i;
+    v.s = (unsigned)(0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v.s = (unsigned)((int)v.s + 10 + i);
+    }
+    return ((int)(v.f + v.s));
+    out: v.s = (unsigned)((int)v.s + 3);
+    v.s = (unsigned)((int)v.s + pick(&c->a) + i);
+    return ((int)(v.f + v.s));
+}
+
+NOINLINE static int loop_label_inlines_bits_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    struct bits v = { 3, (unsigned)c->a };
+    int i;
+    v.s = (unsigned)(0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v.s = (unsigned)((int)v.s + 10 + i);
+    }
+    return ((int)(v.f + v.s));
+    out: v.s = (unsigned)((int)v.s + 3);
+    v.s = (unsigned)((int)v.s + pick(&c->a) + i);
+    return ((int)(v.f + v.s));
+}
+
+NOINLINE static int loop_label_inlines_arr_asm(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v[4] = { c->a, 1, 2, 3 };
+    int i;
+    v[n & 3] = (0);
+    for (i = 0; i < n; i++) {
+        ASM_BR(i == x, out);
+        v[n & 3] = (v[n & 3] + 10 + i);
+    }
+    return (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]);
+    out: v[n & 3] = (v[n & 3] + 3);
+    v[n & 3] = (v[n & 3] + pick(&c->a) + i);
+    return (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]);
+}
+
+NOINLINE static int loop_label_inlines_arr_ref(int x, int y, int n, struct cell *c)
+{
+    (void)x; (void)y; (void)n; (void)c;
+    int v[4] = { c->a, 1, 2, 3 };
+    int i;
+    v[n & 3] = (0);
+    for (i = 0; i < n; i++) {
+        REF_BR(i == x, out);
+        v[n & 3] = (v[n & 3] + 10 + i);
+    }
+    return (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]);
+    out: v[n & 3] = (v[n & 3] + 3);
+    v[n & 3] = (v[n & 3] + pick(&c->a) + i);
+    return (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]);
 }
 
 NOINLINE static int two_same_reg_asm(int x, int y, int n, struct cell *c)
@@ -9764,6 +10813,30 @@ static const struct {
     { "label_writes_agg", label_writes_agg_asm, label_writes_agg_ref },
     { "label_writes_bits", label_writes_bits_asm, label_writes_bits_ref },
     { "label_writes_arr", label_writes_arr_asm, label_writes_arr_ref },
+    { "label_inlines_reg", label_inlines_reg_asm, label_inlines_reg_ref },
+    { "label_inlines_esc", label_inlines_esc_asm, label_inlines_esc_ref },
+    { "label_inlines_glob", label_inlines_glob_asm, label_inlines_glob_ref },
+    { "label_inlines_ptr", label_inlines_ptr_asm, label_inlines_ptr_ref },
+    { "label_inlines_elem", label_inlines_elem_asm, label_inlines_elem_ref },
+    { "label_inlines_wide", label_inlines_wide_asm, label_inlines_wide_ref },
+    { "label_inlines_fp", label_inlines_fp_asm, label_inlines_fp_ref },
+    { "label_inlines_byte", label_inlines_byte_asm, label_inlines_byte_ref },
+    { "label_inlines_vol", label_inlines_vol_asm, label_inlines_vol_ref },
+    { "label_inlines_agg", label_inlines_agg_asm, label_inlines_agg_ref },
+    { "label_inlines_bits", label_inlines_bits_asm, label_inlines_bits_ref },
+    { "label_inlines_arr", label_inlines_arr_asm, label_inlines_arr_ref },
+    { "loop_label_inlines_reg", loop_label_inlines_reg_asm, loop_label_inlines_reg_ref },
+    { "loop_label_inlines_esc", loop_label_inlines_esc_asm, loop_label_inlines_esc_ref },
+    { "loop_label_inlines_glob", loop_label_inlines_glob_asm, loop_label_inlines_glob_ref },
+    { "loop_label_inlines_ptr", loop_label_inlines_ptr_asm, loop_label_inlines_ptr_ref },
+    { "loop_label_inlines_elem", loop_label_inlines_elem_asm, loop_label_inlines_elem_ref },
+    { "loop_label_inlines_wide", loop_label_inlines_wide_asm, loop_label_inlines_wide_ref },
+    { "loop_label_inlines_fp", loop_label_inlines_fp_asm, loop_label_inlines_fp_ref },
+    { "loop_label_inlines_byte", loop_label_inlines_byte_asm, loop_label_inlines_byte_ref },
+    { "loop_label_inlines_vol", loop_label_inlines_vol_asm, loop_label_inlines_vol_ref },
+    { "loop_label_inlines_agg", loop_label_inlines_agg_asm, loop_label_inlines_agg_ref },
+    { "loop_label_inlines_bits", loop_label_inlines_bits_asm, loop_label_inlines_bits_ref },
+    { "loop_label_inlines_arr", loop_label_inlines_arr_asm, loop_label_inlines_arr_ref },
     { "two_same_reg", two_same_reg_asm, two_same_reg_ref },
     { "two_same_esc", two_same_esc_asm, two_same_esc_ref },
     { "two_same_glob", two_same_glob_asm, two_same_glob_ref },

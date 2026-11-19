@@ -26,10 +26,24 @@ wrong answer, and none of the expected values is written down by hand.
     check_asm_goto_equivalence.py --check-committed  the fixture is what --emit prints
     check_asm_goto_equivalence.py --self-test        the gate sees a planted fault
     check_asm_goto_equivalence.py --reference CC     run the matrix on another compiler
+    check_asm_goto_equivalence.py --lccc PATH --cross
+                                                     and on AArch64 and RISC-V (qemu-user)
+    check_asm_goto_equivalence.py --lccc PATH --cross-only
+                                                     those two alone
+    check_asm_goto_equivalence.py --lccc PATH --cross-only --self-test-only
+                                                     their planted faults, no rows
 
 The committed copy, `asm_goto_equivalence.c`, runs with the regression corpus
-at -O2 and with the cross runner on the other targets; this gate adds the
-other optimization levels and -m32 on the host.
+at -O2; this gate adds the other optimization levels, -m32 on the host, and
+with --cross the two other targets at every level.  Each program also checks
+that the registers a function has to preserve came back unchanged.
+
+check_switch_cross_execute.py runs the committed copy on the two other
+targets at every level as well, with `printf` a no-op: it knows that a pair
+differs and not which.  The --cross rows are the same programs with the
+answer printed, and --cross-only --self-test-only is the part nothing else
+has: a register lost on purpose on each target, to see that the check which
+travels in the fixture reports it there.
 """
 
 from __future__ import annotations
@@ -103,6 +117,16 @@ SHAPES = {
     # the label has a tail of its own
     "overwritten": "WR(1); BR(x, out); WR(2); return RET + 100; out: return RET;",
     "label_writes": "WR(1); BR(x, out); WR(2); return RET; out: { int r = RET; WR(9); return r; }",
+    # the label's block holds a call the inliner expands in its second run,
+    # when nothing but the asm goto names the label any more
+    "label_inlines": (
+        "WR(1); BR(x, out); WR(2); return RET;"
+        " out: WR(RD + 10); WR(RD + pick(&c->a)); return RET;"
+    ),
+    "loop_label_inlines": (
+        "int i; WR(0); for (i = 0; i < n; i++) { BR(i == x, out); WR(RD + 10 + i); }"
+        " return RET; out: WR(RD + 3); WR(RD + pick(&c->a) + i); return RET;"
+    ),
     # more than one way out
     "two_same": "WR(1); BR(x, out); WR(2); BR(y, out); WR(3); out: return RET;",
     "two_labels": (
@@ -218,9 +242,11 @@ HEADER = """\
  *
  * Found with it on main (GCC 16.2 and Clang 23.1.5 are right): a store to a
  * global or an escaped local ahead of the asm goto deleted as dead (-O2), a
- * stack slot forwarded across the label of an asm goto (x86-64, -O1), and a
+ * stack slot forwarded across the label of an asm goto (x86-64, -O1), a
  * register holding a loop-carried value given up as dead when only the asm
- * goto leaves the loop (-m32, -O1).
+ * goto leaves the loop (-m32, -O1), and a label moved behind the call inlined
+ * into its block, so that the asm goto skipped the call (-O2; the fault paths
+ * of the kernel's copy_from_kernel_nofault()).
  *
  * Header-free: it is built for -m32 and for the cross targets as well.
  */
@@ -312,6 +338,36 @@ NOINLINE static void sink(void *p)
 NOINLINE static int g(int i)
 {
     return 100 + i + zero;
+}
+
+/* `*p`, written the way the kernel's get_current() and this_cpu_read() are: a
+ * switch over a constant size.  It is two dozen blocks and a handful of
+ * instructions until the first cleanup folds the switch, which is too many
+ * blocks for the inliner's first run; the second run takes it, after the
+ * unreachable code ahead of a label has been swept. */
+NOINLINE static int pick_bad_size(void)
+{
+    return -1 + zero;
+}
+
+static inline __attribute__((always_inline)) int pick(const int *p)
+{
+    int value;
+    switch (sizeof(*p)) {
+    case 1: value = *(const signed char *)p; break;
+    case 2: value = *(const short *)p; break;
+    case 4: value = *p; break;
+    case 8: value = (int)*(const long long *)p; break;
+    default: value = pick_bad_size(); break;
+    }
+    switch (sizeof(value)) {
+    case 1: value += 1; break;
+    case 2: value += 2; break;
+    case 4: value += zero; break;
+    case 8: value += 8; break;
+    default: value = pick_bad_size(); break;
+    }
+    return value;
 }
 
 /* A static key: the asm goto lives in a function that is always inlined. */
@@ -436,6 +492,144 @@ __asm__(".text\\n"
         "    popq %rbp\\n"
         "    ret\\n"
         ".size guarded_call, .-guarded_call\\n");
+"""
+
+# The same guard for the targets whose callee-saved set is long enough to be
+# worth a table: (register, the value it holds across the call).  The bit a
+# lost register sets in the answer is its position in GPR followed by FPR.
+A64_GPR = [(f"x{19 + i}", 0x1B1 + 0x111 * i) for i in range(10)]
+A64_FPR = [(f"d{8 + i}", 0x111 * (i + 1)) for i in range(8)]
+RV64_GPR = [(f"s{i}", 0x1B1 + 0x111 * i) for i in range(12)]
+RV64_FPR = [(f"fs{i}", 0x111 * (i + 1)) for i in range(12)]
+
+
+def _file_scope_asm(lines: list[str]) -> str:
+    """`__asm__("...\\n" ...);` at file scope, one C string per line."""
+    quoted = "\n".join(f'        "{line}\\n"' for line in lines)
+    return '__asm__(".text\\n"\n' + quoted + ");\n"
+
+
+def guard_aarch64() -> str:
+    """AAPCS64: x19-x28 and the low halves of v8-v15 belong to the caller."""
+    frame = 16 + 8 * (len(A64_GPR) + len(A64_FPR)) + 16
+    result_at = frame - 16
+    pairs_of = lambda regs: [(regs[i][0], regs[i + 1][0]) for i in range(0, len(regs), 2)]
+    saved = pairs_of(A64_GPR) + pairs_of(A64_FPR)
+    lines = [
+        ".globl guarded_call",
+        ".hidden guarded_call",
+        ".type guarded_call, %function",
+        "guarded_call:",
+        f"    stp x29, x30, [sp, #-{frame}]!",
+    ]
+    lines += [f"    stp {a}, {b}, [sp, #{16 + 16 * i}]" for i, (a, b) in enumerate(saved)]
+    lines += [
+        f"    str x5, [sp, #{result_at}]",  # result
+        "    mov x9, x0",
+        "    mov w0, w1",
+        "    mov w1, w2",
+        "    mov w2, w3",
+        "    mov x3, x4",
+    ]
+    lines += [f"    mov {reg}, #{value:#x}" for reg, value in A64_GPR]
+    for reg, value in A64_FPR:
+        lines += [f"    mov x10, #{value:#x}", f"    fmov {reg}, x10"]
+    lines += [
+        "    blr x9",
+        f"    ldr x5, [sp, #{result_at}]",
+        "    str w0, [x5]",
+        "    mov w0, #0",
+    ]
+    label = "    "
+    for bit, (reg, value) in enumerate(A64_GPR + A64_FPR):
+        if reg.startswith("d"):
+            lines.append(f"{label}fmov x10, {reg}")
+            label, reg = "    ", "x10"
+        lines += [
+            f"{label}cmp {reg}, #{value:#x}",
+            "    b.eq 1f",
+            f"    orr w0, w0, #{1 << bit:#x}",
+        ]
+        label = "1:  "
+    lines += [
+        f"{label}ldp {a}, {b}, [sp, #{16 + 16 * i}]"
+        if i == len(saved) - 1
+        else f"    ldp {a}, {b}, [sp, #{16 + 16 * i}]"
+        for i, (a, b) in reversed(list(enumerate(saved)))
+    ]
+    lines += [
+        f"    ldp x29, x30, [sp], #{frame}",
+        "    ret",
+        ".size guarded_call, .-guarded_call",
+    ]
+    return _file_scope_asm(lines)
+
+
+def guard_riscv64() -> str:
+    """LP64D: s0-s11 and fs0-fs11 belong to the caller."""
+    slots = ["ra"] + [reg for reg, _ in RV64_GPR + RV64_FPR]
+    frame = (8 * (len(slots) + 1) + 15) // 16 * 16
+    result_at = 8 * len(slots)
+    store = lambda reg: "fsd" if reg.startswith("f") else "sd"
+    load = lambda reg: "fld" if reg.startswith("f") else "ld"
+    lines = [
+        ".globl guarded_call",
+        ".hidden guarded_call",
+        ".type guarded_call, @function",
+        "guarded_call:",
+        f"    addi sp, sp, -{frame}",
+    ]
+    lines += [f"    {store(reg)} {reg}, {8 * i}(sp)" for i, reg in enumerate(slots)]
+    lines += [
+        f"    sd a5, {result_at}(sp)",  # result
+        "    mv t0, a0",
+        "    mv a0, a1",
+        "    mv a1, a2",
+        "    mv a2, a3",
+        "    mv a3, a4",
+    ]
+    lines += [f"    li {reg}, {value:#x}" for reg, value in RV64_GPR]
+    for reg, value in RV64_FPR:
+        lines += [f"    li t1, {value:#x}", f"    fmv.d.x {reg}, t1"]
+    lines += [
+        "    jalr t0",
+        f"    ld a5, {result_at}(sp)",
+        "    sw a0, 0(a5)",
+        "    li a0, 0",
+    ]
+    label = "    "
+    for bit, (reg, value) in enumerate(RV64_GPR + RV64_FPR):
+        if reg.startswith("f"):
+            lines.append(f"{label}fmv.x.d t2, {reg}")
+            label, reg = "    ", "t2"
+        lines += [f"{label}li t1, {value:#x}", f"    beq {reg}, t1, 1f"]
+        if 1 << bit < 2048:
+            lines.append(f"    ori a0, a0, {1 << bit}")
+        else:
+            lines += [f"    li t2, {1 << bit:#x}", "    or a0, a0, t2"]
+        label = "1:  "
+    lines.append(f"{label}{load(slots[0])} {slots[0]}, 0(sp)")
+    lines += [f"    {load(reg)} {reg}, {8 * i}(sp)" for i, reg in enumerate(slots) if i]
+    lines += [
+        f"    addi sp, sp, {frame}",
+        "    ret",
+        ".size guarded_call, .-guarded_call",
+    ]
+    return _file_scope_asm(lines)
+
+
+GUARD_PROTOTYPE = (
+    "int guarded_call(shape_fn *fn, int x, int y, int n, struct cell *c, int *result)\n"
+    '    __attribute__((visibility("hidden")));\n'
+)
+HEADER += (
+    "#elif defined(__aarch64__)\n"
+    + GUARD_PROTOTYPE
+    + guard_aarch64()
+    + "#elif defined(__riscv) && __riscv_xlen == 64 && defined(__riscv_float_abi_double)\n"
+    + GUARD_PROTOTYPE
+    + guard_riscv64()
+    + """\
 #else
 static int guarded_call(shape_fn *fn, int x, int y, int n, struct cell *c, int *result)
 {
@@ -444,6 +638,7 @@ static int guarded_call(shape_fn *fn, int x, int y, int n, struct cell *c, int *
 }
 #endif
 """
+)
 
 FOOTER = """\
 
@@ -569,9 +764,9 @@ def function(name: str, decl: str, body: str, sabotage: str | None = None) -> st
         # the asm goto copy writes another value behind the jump
         assert "(2)" in body, name
         body = body.replace("(2)", "(2 + 1)", 1)
-    elif sabotage == "register":
-        # the asm goto copy loses a register its caller owns (x86-64)
-        body = '__asm__("xorl %r15d, %r15d"); ' + body
+    elif sabotage in LOSES_A_REGISTER:
+        # the asm goto copy loses a register its caller owns
+        body = f'__asm__("{LOSES_A_REGISTER[sabotage][0]}"); ' + body
     lines = [f"NOINLINE static int {name}(int x, int y, int n, struct cell *c)", "{"]
     lines.append("    (void)x; (void)y; (void)n; (void)c;")
     if decl:
@@ -613,7 +808,7 @@ def pairs() -> list[tuple[str, str, str]]:
 
 
 def emit(sabotage: tuple[str, str] | None = None) -> str:
-    """The fixture; `sabotage` is (pair name, "value" or "register")."""
+    """The fixture; `sabotage` is (pair name, "value" or a key of LOSES_A_REGISTER)."""
     parts = [HEADER]
     names = []
     for name, kind, body in pairs():
@@ -647,18 +842,250 @@ def emit(sabotage: tuple[str, str] | None = None) -> str:
 # ── running ─────────────────────────────────────────────────────────────────
 RAW = "-DASM_GOTO_RAW_JUMP"
 RUN_TIMEOUT_S = 20
+LEVELS = ("-O0", "-O1", "-O2", "-O3", "-Os")
 HOST_MATRIX = [
     (bits, level) + extra
     for extra in ((), (RAW,))
     for bits in ("-m64", "-m32")
-    for level in ("-O0", "-O1", "-O2", "-O3", "-Os")
+    for level in LEVELS
 ]
 
+# The planted fault "a register the caller owns is lost": the statement that
+# loses it, and the mask `guarded_call` answers with (the last register of
+# each target's table).
+LOSES_A_REGISTER = {
+    "register": ("xorl %r15d, %r15d", 0x20),
+    "register-aarch64": ("mov x28, #0", 1 << (len(A64_GPR) - 1)),
+    "register-riscv64": ("li s11, 0", 1 << (len(RV64_GPR) - 1)),
+}
 
-def build_and_run(compiler: list[str], flags: list[str], source: Path, workdir: Path, linker=None):
-    """(status, detail): status is 'ok', 'mismatch', 'compile', 'crash' or 'skip'."""
+# ── the other targets ───────────────────────────────────────────────────────
+# AArch64 and RISC-V run the same fixture under qemu-user.  Nothing but LCCC
+# is needed to build it: the target's driver assembles and links a static
+# program without a C library, around an entry stub and a `printf` for the
+# conversions the fixture uses.  (A cross C library is a few hundred megabytes
+# a lane has to install; a wrong edge of an asm goto is found without one.)
+CROSS_ENTRY = {
+    "aarch64": r"""
+    .text
+    .globl _start
+_start:
+    bl main
+    mov w8, #93
+    svc #0
+    .globl sys_write
+sys_write:
+    mov w8, #64
+    svc #0
+    ret
+    .globl memcpy
+memcpy:
+    mov x3, x0
+1:  cbz x2, 2f
+    ldrb w4, [x1], #1
+    strb w4, [x3], #1
+    sub x2, x2, #1
+    b 1b
+2:  ret
+    .globl memset
+memset:
+    mov x3, x0
+1:  cbz x2, 2f
+    strb w1, [x3], #1
+    sub x2, x2, #1
+    b 1b
+2:  ret
+""",
+    "riscv64": r"""
+    .text
+    .globl _start
+_start:
+    .option push
+    .option norelax
+    lla gp, __global_pointer$
+    .option pop
+    call main
+    li a7, 93
+    ecall
+    .globl sys_write
+sys_write:
+    li a7, 64
+    ecall
+    ret
+    .globl memcpy
+memcpy:
+    mv t0, a0
+1:  beqz a2, 2f
+    lbu t1, 0(a1)
+    sb t1, 0(t0)
+    addi a1, a1, 1
+    addi t0, t0, 1
+    addi a2, a2, -1
+    j 1b
+2:  ret
+    .globl memset
+memset:
+    mv t0, a0
+1:  beqz a2, 2f
+    sb a1, 0(t0)
+    addi t0, t0, 1
+    addi a2, a2, -1
+    j 1b
+2:  ret
+""",
+}
+
+CROSS_SUPPORT = r"""
+/* printf for a program without a C library: %s %d %u %x %#x, a line at a time
+ * through the write system call of the entry stub. */
+long sys_write(long fd, const void *buffer, unsigned long count);
+
+static char line[256];
+static unsigned used;
+
+static void put(char ch)
+{
+    if (used == sizeof line) {
+        sys_write(1, line, used);
+        used = 0;
+    }
+    line[used++] = ch;
+}
+
+static void put_number(unsigned long value, unsigned base)
+{
+    char digits[24];
+    int count = 0;
+    do {
+        digits[count++] = "0123456789abcdef"[value % base];
+        value /= base;
+    } while (value);
+    while (count)
+        put(digits[--count]);
+}
+
+int printf(const char *format, ...)
+{
+    __builtin_va_list arguments;
+    __builtin_va_start(arguments, format);
+    for (; *format; format++) {
+        int alternate = 0;
+        if (*format != '%') {
+            put(*format);
+            continue;
+        }
+        if (*++format == '#') {
+            alternate = 1;
+            format++;
+        }
+        if (*format == 's') {
+            const char *text = __builtin_va_arg(arguments, const char *);
+            while (*text)
+                put(*text++);
+        } else if (*format == 'd') {
+            long value = __builtin_va_arg(arguments, int);
+            if (value < 0) {
+                put('-');
+                value = -value;
+            }
+            put_number((unsigned long)value, 10);
+        } else if (*format == 'u') {
+            put_number(__builtin_va_arg(arguments, unsigned), 10);
+        } else if (*format == 'x') {
+            unsigned value = __builtin_va_arg(arguments, unsigned);
+            if (alternate && value) {
+                put('0');
+                put('x');
+            }
+            put_number(value, 16);
+        } else {
+            put('%');
+            put(*format);
+        }
+    }
+    __builtin_va_end(arguments);
+    sys_write(1, line, used);
+    used = 0;
+    return 0;
+}
+"""
+
+
+class CrossTarget:
+    """One of the other targets: its LCCC driver and, where the host has one,
+    the qemu-user that runs its programs."""
+
+    DRIVERS = {"aarch64": "lccc-arm", "riscv64": "lccc-riscv"}
+
+    def __init__(self, name: str, lccc: Path):
+        import shutil
+
+        self.name = name
+        self.driver = lccc.resolve().parent / self.DRIVERS[name]
+        self.emulator = shutil.which(f"qemu-{name}")
+        self.support: list[str] | None = None
+
+    def prepare(self, workdir: Path) -> str | None:
+        """Build the entry stub and `printf` once per work directory; an error
+        text if that fails."""
+        if self.support is not None and all(Path(obj).is_file() for obj in self.support):
+            return None
+        self.support = None
+        if not self.driver.is_file():
+            return f"{self.driver} is not there (the target's driver sits beside --lccc)"
+        entry = workdir / f"entry-{self.name}.s"
+        entry.write_text(CROSS_ENTRY[self.name])
+        support = workdir / f"support-{self.name}.c"
+        support.write_text(CROSS_SUPPORT)
+        objects = []
+        for source in (entry, support):
+            obj = source.with_suffix(".o")
+            step = subprocess.run(
+                [str(self.driver), "-O1", "-ffreestanding", "-w", "-c", str(source), "-o", str(obj)],
+                capture_output=True, text=True, errors="replace",
+            )
+            if step.returncode != 0:
+                return f"{source.name}: {(step.stderr or step.stdout).strip()[-600:]}"
+            objects.append(str(obj))
+        self.support = objects
+        return None
+
+    def build(self, flags: list[str], source: Path, exe: Path, workdir: Path):
+        """The completed link step, or (None, error text)."""
+        error = self.prepare(workdir)
+        if error:
+            return None, error
+        step = subprocess.run(
+            [str(self.driver), *flags, "-w", "-ffreestanding", "-nostdlib", "-static",
+             str(source), *self.support, "-o", str(exe)],
+            capture_output=True, text=True, errors="replace",
+        )
+        return step, None
+
+
+def cross_matrix() -> list[tuple[str, str]]:
+    return [(target, level) for target in CrossTarget.DRIVERS for level in LEVELS]
+
+
+def build_and_run(
+    compiler: list[str], flags: list[str], source: Path, workdir: Path, linker=None, cross=None
+):
+    """(status, detail): status is 'ok', 'mismatch', 'compile', 'crash' or 'skip'.
+
+    With `cross` (a CrossTarget) the program is built by that target's driver
+    and run under its emulator; 'skip' then means it was built and linked and
+    the host has no emulator to run it.
+    """
     exe = workdir / "eq"
-    if linker:
+    launcher: list[str] = []
+    if cross:
+        step, error = cross.build(flags, source, exe, workdir)
+        if step is None:
+            return "compile", error
+        if step.returncode == 0 and not cross.emulator:
+            return "skip", f"built and linked, not run: no qemu-{cross.name} on PATH"
+        launcher = [cross.emulator]
+    elif linker:
         obj = workdir / "eq.o"
         step = subprocess.run(
             compiler + flags + ["-w", "-c", str(source), "-o", str(obj)],
@@ -677,10 +1104,11 @@ def build_and_run(compiler: list[str], flags: list[str], source: Path, workdir: 
     if step.returncode != 0:
         return "compile", (step.stderr or step.stdout).strip()[-600:]
     try:
-        # A run is 352 pairs times 32 inputs of straight-line code and short
+        # A run is 400 pairs times 32 inputs of straight-line code and short
         # loops: milliseconds.  Anything slower is a loop that lost its exit.
         run = subprocess.run(
-            [str(exe)], capture_output=True, text=True, errors="replace", timeout=RUN_TIMEOUT_S
+            launcher + [str(exe)],
+            capture_output=True, text=True, errors="replace", timeout=RUN_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
         return "crash", f"still running after {RUN_TIMEOUT_S} s (a loop did not end)"
@@ -694,17 +1122,30 @@ def build_and_run(compiler: list[str], flags: list[str], source: Path, workdir: 
     return "crash", f"exit {run.returncode}: {(run.stdout + run.stderr).strip()[-600:]}"
 
 
-def run_matrix(compiler: list[str], label: str, source_text: str, matrix, verbose: bool, linker=None):
+def run_matrix(
+    compiler: list[str], label: str, source_text: str, matrix, verbose: bool, linker=None,
+    cross: dict | None = None,
+):
+    """(rows run, rows failed, rows that could not run on this host).
+
+    A row whose first element names a cross target (`cross`: name ->
+    CrossTarget) is built by that target's driver from the rest of the row.
+    """
     failures = 0
     ran = 0
+    unrun = 0
     with tempfile.TemporaryDirectory(prefix="asm-goto-eq-") as tmp:
         work = Path(tmp)
         source = work / "asm_goto_equivalence.c"
         source.write_text(source_text)
         for row in matrix:
             flags = " ".join(row)
-            status, detail = build_and_run(compiler, list(row), source, work, linker)
+            target = (cross or {}).get(row[0])
+            status, detail = build_and_run(
+                compiler, list(row[1:] if target else row), source, work, linker, target
+            )
             if status == "skip":
+                unrun += 1
                 print(f"SKIP {label} {flags}: {detail}")
                 continue
             ran += 1
@@ -716,32 +1157,56 @@ def run_matrix(compiler: list[str], label: str, source_text: str, matrix, verbos
             print(f"FAIL {label} {flags} [{status}]")
             for line in detail.splitlines()[:40]:
                 print("     " + line)
-    return ran, failures
+    return ran, failures, unrun
 
 
-def self_test(compiler: list[str]) -> int:
+def self_test(
+    compiler: list[str], cross: dict | None = None, host: bool = True, require_run: bool = False
+) -> int:
     """The gate must see a fault, and name the pair that has it.
 
     Two are planted, one at a time, in the asm goto copy of one pair: it
     writes another value behind the jump, and it loses a register its caller
-    owns.  The second is only planted where the host is x86-64.
+    owns.  The second is only planted where the host is x86-64, and once more
+    for each cross target whose programs this host can run.  Without `host`
+    (--cross-only) the cross targets get theirs and the host gets none.
+
+    A planted fault has to be the one pair that differs, so each plant also
+    says that the other pairs agree on its target at -O0.
     """
     import platform
 
-    # x = -1 jumps in both copies: the planted value is never written, so the
-    # first input that differs is x = 0, where the asm copy returns 3 for 2.
-    plants = [("join_reg", "value", "x=0 y=0 n=0: asm goto 3 (G 70), branch 2 (G 70)")]
-    if platform.machine() in ("x86_64", "AMD64"):
-        plants.append(
-            ("overwritten_glob", "register",
-             "callee-saved registers lost, mask 0x20 with the asm goto, 0 with the branch")
-        )
+    plants = []
+    lost = "callee-saved registers lost, mask {:#x} with the asm goto, 0 with the branch"
+    if host:
+        # x = -1 jumps in both copies: the planted value is never written, so
+        # the first input that differs is x = 0, where the asm copy returns 3
+        # for 2.
+        plants.append((None, "join_reg", "value", "x=0 y=0 n=0: asm goto 3 (G 70), branch 2 (G 70)"))
+        if platform.machine() in ("x86_64", "AMD64"):
+            plants.append(
+                (None, "overwritten_glob", "register", lost.format(LOSES_A_REGISTER["register"][1]))
+            )
+    unrun = 0
+    for name, target in (cross or {}).items():
+        if target.emulator:
+            kind = f"register-{name}"
+            plants.append((target, "overwritten_glob", kind, lost.format(LOSES_A_REGISTER[kind][1])))
+        else:
+            # Building the plant would say nothing: it is the run that has to
+            # report it.
+            unrun += 1
+            print(f"SKIP self-test {name}: no qemu-{name} on PATH to run its planted fault")
+    if unrun and require_run:
+        print(f"{unrun} planted faults were not run, and --require-cross-run says each has to be")
+        return 1
     with tempfile.TemporaryDirectory(prefix="asm-goto-eq-self-") as tmp:
         work = Path(tmp)
-        for victim, kind, expected in plants:
+        for target, victim, kind, expected in plants:
             source = work / f"planted-{kind}.c"
             source.write_text(emit(sabotage=(victim, kind)))
-            status, detail = build_and_run(compiler, ["-m64", "-O0"], source, work)
+            flags = ["-O0"] if target else ["-m64", "-O0"]
+            status, detail = build_and_run(compiler, flags, source, work, cross=target)
             reported = [line for line in detail.splitlines() if line.startswith("MISMATCH")]
             if (
                 status != "mismatch"
@@ -762,6 +1227,9 @@ def self_test(compiler: list[str]) -> int:
     if count != expected_count or len({name for name, _, _ in pairs()}) != count:
         print(f"self-test FAILED: {count} pairs, expected {expected_count} distinct ones")
         return 1
+    if not plants:
+        print(f"self-test: no fault could be planted on this host; {count} pairs")
+        return 0
     print(f"self-test ok: {len(plants)} planted faults found where they were planted; {count} pairs")
     return 0
 
@@ -775,9 +1243,32 @@ def main() -> int:
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--check-committed", action="store_true")
     ap.add_argument("--self-test", action="store_true")
-    ap.add_argument("--only", help="comma separated flag sets, e.g. -m64:-O2,-m32:-O1:" + RAW)
+    ap.add_argument(
+        "--self-test-only", action="store_true",
+        help="--self-test and none of the rows: the planted faults alone",
+    )
+    ap.add_argument(
+        "--only",
+        help="comma separated rows, e.g. --only=-m64:-O2,-m32:-O1:" + RAW + ",aarch64:-O2",
+    )
+    ap.add_argument(
+        "--cross", action="store_true",
+        help="also build the fixture for AArch64 and RISC-V with the drivers beside --lccc "
+        "and run it under qemu-user (built and linked only where there is no emulator)",
+    )
+    ap.add_argument("--cross-only", action="store_true", help="--cross without the host rows")
+    ap.add_argument(
+        "--require-cross-run", action="store_true",
+        help="with --cross: a target this host cannot run is a failure, not a SKIP line",
+    )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    args.cross |= args.cross_only
+    args.self_test |= args.self_test_only
+    if args.require_cross_run and not args.cross:
+        ap.error("--require-cross-run needs --cross")
+    if args.cross and not args.lccc:
+        ap.error("--cross needs --lccc: the cross drivers are found beside it")
 
     text = emit()
     if args.emit:
@@ -798,38 +1289,55 @@ def main() -> int:
         else:
             print(f"{FIXTURE.name} matches the generator ({len(pairs())} pairs)")
 
-    matrix = HOST_MATRIX
+    cross = {name: CrossTarget(name, args.lccc) for name in CrossTarget.DRIVERS} if args.cross else {}
+    matrix = ([] if args.cross_only else HOST_MATRIX) + (cross_matrix() if args.cross else [])
     if args.only:
         matrix = [tuple(item.split(":")) for item in args.only.split(",")]
+        for row in matrix:
+            if row[0] in CrossTarget.DRIVERS and not args.cross:
+                ap.error(f"--only names the cross target {row[0]}: give --cross")
+    host_rows = [row for row in matrix if row[0] not in CrossTarget.DRIVERS]
 
     if args.self_test:
         did = True
         compiler = [str(args.lccc)] if args.lccc else [args.reference or os.environ.get("CC", "cc")]
-        rc |= self_test(compiler)
+        rc |= self_test(
+            compiler, cross, host=not args.cross_only, require_run=args.require_cross_run
+        )
 
-    if args.reference:
+    if args.reference and not args.self_test_only:
         did = True
-        ran, failures = run_matrix(
+        ran, failures, _ = run_matrix(
             [args.reference], args.reference, text,
-            [row for row in matrix if row[0] == "-m64" or not args.reference_m32_linker],
+            [row for row in host_rows if row[0] == "-m64" or not args.reference_m32_linker],
             args.verbose,
         )
         if args.reference_m32_linker:
-            ran32, failures32 = run_matrix(
+            ran32, failures32, _ = run_matrix(
                 [args.reference], args.reference, text,
-                [row for row in matrix if row[0] == "-m32"], args.verbose,
+                [row for row in host_rows if row[0] == "-m32"], args.verbose,
                 linker=[args.reference_m32_linker],
             )
             ran, failures = ran + ran32, failures + failures32
         print(f"{args.reference}: {ran} rows, {failures} failed")
         rc |= int(failures != 0)
 
-    if args.lccc:
+    if args.lccc and not args.self_test_only:
         did = True
-        ran, failures = run_matrix([str(args.lccc)], "lccc", text, matrix, args.verbose)
-        print(f"asm goto equivalence: {len(pairs())} pairs, {ran} rows, {failures} failed")
-        if ran == 0:
+        ran, failures, unrun = run_matrix(
+            [str(args.lccc)], "lccc", text, matrix, args.verbose, cross=cross
+        )
+        print(
+            f"asm goto equivalence: {len(pairs())} pairs, {ran} rows, {failures} failed"
+            + (f", {unrun} not run" if unrun else "")
+        )
+        # A cross row without its emulator was still built and linked; a host
+        # row that cannot start says nothing at all.
+        if ran == 0 and host_rows:
             print("no row could run on this host")
+            rc = 1
+        if unrun and args.require_cross_run:
+            print(f"{unrun} rows were not run, and --require-cross-run says each has to be")
             rc = 1
         rc |= int(failures != 0)
 

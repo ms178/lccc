@@ -395,21 +395,23 @@ gate "licm-global-speculation" fast \
 # above the test that guards its loop.
 gate "call-return-facts" fast \
     python3 tests/regression/check_call_return_facts.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
-# An asm goto behaves like the `if (c) goto label;` it stands for: 352 shapes
+# An asm goto behaves like the `if (c) goto label;` it stands for: 400 pairs
 # (what is ahead of the jump, behind it, around it; twelve kinds of storage)
 # are compiled both ways and compared, at -O0..-Os for x86-64 and i686, with
 # the jump spelled as `jnz` and as bytes.  Callee-saved registers are checked
 # around every call.  The committed fixture is what the generator writes.
+# (check_switch_cross_execute.py runs the fixture on the other two targets;
+# `asm-goto-equivalence-cross` below proves the register check there.)
 gate "asm-goto-equivalence" fast \
     python3 tests/regression/check_asm_goto_equivalence.py --lccc "$LCCC" \
     --check-committed --self-test
-gate "call-arg-staging-homes" fast \
 # A static key costs its nop: no address load ahead of it, no jump behind it,
 # the guarded call out of line, no register saved for it; and the program
 # computes the same with the keys off (nop) and on (jmp), -O0..-Os, both
 # x86 targets.
 gate "static-key-layout" fast \
     python3 tests/regression/check_static_key_layout.py --lccc "$LCCC" --self-test
+gate "call-arg-staging-homes" fast \
     python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
     --seed-list 1,2,3,4,5,6,11,14,16,26,30
 gate "fno-builtin-fold-contract" fast \
@@ -3029,6 +3031,15 @@ gate "cond-load-sink-best-tools-contracts" fast \
     python3 scripts/check_cond_load_sink_best_tools.py --self-test
 gate "asm-goto-outputs" fast \
     bash tests/regression/check_asm_goto_outputs.sh
+# The register check of the asm-goto equivalence fixture, proven on AArch64
+# and RISC-V: a register lost on purpose in one pair has to be reported for
+# that pair alone under qemu-user (SKIP where the emulators are missing -- the
+# hosted shard requires the run).  The pairs themselves run on both targets
+# in check_switch_cross_execute.py; `--cross` runs them here and names the
+# pair that differs.
+gate "asm-goto-equivalence-cross" fast \
+    python3 tests/regression/check_asm_goto_equivalence.py --lccc "$LCCC" \
+    --cross-only --self-test-only
 gate "i686-label-ref-safety" fast \
     bash tests/regression/check_i686_label_ref_safety.sh
 

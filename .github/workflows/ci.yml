@@ -2726,6 +2726,21 @@ jobs:
         # objects. Mirrors the ci_local.sh gate of the same name;
         # check_ci_gate_parity.py fails if the two lists drift.
         bash tests/regression/check_tls_cross_models.sh
+        # The asm-goto equivalence fixture checks around every call that the
+        # callee-saved registers came back (x19-x28 and d8-d15, s0-s11 and
+        # fs0-fs11).  This proves that check on AArch64 and RISC-V: one pair
+        # loses a register on purpose (x28, s11), the program is built by the
+        # target's own driver with no C library and run under qemu-user, and
+        # that pair alone has to be reported -- so the other 399 agree there
+        # at -O0 as well.  The pairs themselves run at -O0..-Os on both
+        # targets in the backend lane (check_switch_cross_execute.py, where a
+        # difference is an exit status; `--cross` names the pair) and on x86
+        # in shard b of the frontend contracts.  Mirrored in
+        # scripts/ci_local.sh as `asm-goto-equivalence-cross`
+        # (parity-checked); a host without the emulators prints SKIP there,
+        # here it fails.
+        python3 tests/regression/check_asm_goto_equivalence.py --lccc target/fastbuild/lccc \
+          --cross-only --require-cross-run --self-test-only
         python3 scripts/glibc_check_triage.py --self-test
         bash tests/regression/check_loop_store_motion.sh
         python3 tests/regression/check_dot_assignment.py
