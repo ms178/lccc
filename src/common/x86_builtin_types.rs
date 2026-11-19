@@ -5,7 +5,7 @@
 use super::types::{CType, IrType};
 
 #[rustfmt::skip]
-pub(crate) fn result_type(name: &str) -> Option<CType> {
+fn result_type_0(name: &str) -> Option<CType> {
     Some(match name {
         "__builtin_ia32_pmovmskb128"
         | "__builtin_ia32_pmovmskb256" => CType::Int,
@@ -185,6 +185,13 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_vpdpwusds256"
         | "__builtin_ia32_vpdpwuud256"
         | "__builtin_ia32_vpdpwuuds256" => CType::Vector(Box::new(CType::Int), 32),
+        _ => return None,
+    })
+}
+
+#[rustfmt::skip]
+fn result_type_1(name: &str) -> Option<CType> {
+    Some(match name {
         "__builtin_ia32_aesdec128"
         | "__builtin_ia32_aesdeclast128"
         | "__builtin_ia32_aesenc128"
@@ -311,6 +318,12 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
 }
 
 #[rustfmt::skip]
+pub(crate) fn result_type(name: &str) -> Option<CType> {
+    result_type_0(name)
+        .or_else(|| result_type_1(name))
+}
+
+#[rustfmt::skip]
 pub(crate) fn requires_64_bit(name: &str) -> bool {
     matches!(name,
         "__builtin_ia32_bzhi_di"
@@ -325,7 +338,7 @@ pub(crate) fn requires_64_bit(name: &str) -> bool {
 
 /// Canonical vector argument byte widths; zero marks scalar/address operands.
 #[rustfmt::skip]
-pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
+fn argument_vector_widths_0(name: &str) -> Option<&'static [usize]> {
     Some(match name {
         "__builtin_ia32_lfence"
         | "__builtin_ia32_pause"
@@ -526,6 +539,13 @@ pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_vpdpwusds128"
         | "__builtin_ia32_vpdpwuud128"
         | "__builtin_ia32_vpdpwuuds128" => &[16, 16, 16],
+        _ => return None,
+    })
+}
+
+#[rustfmt::skip]
+fn argument_vector_widths_1(name: &str) -> Option<&'static [usize]> {
+    Some(match name {
         "__builtin_ia32_pabsb256"
         | "__builtin_ia32_pabsd256"
         | "__builtin_ia32_pabsw256"
@@ -630,9 +650,15 @@ pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
     })
 }
 
+#[rustfmt::skip]
+pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
+    argument_vector_widths_0(name)
+        .or_else(|| argument_vector_widths_1(name))
+}
+
 /// C scalar parameter conversions; vectors and addresses remain object operands.
 #[rustfmt::skip]
-pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrType>]> {
+fn argument_scalar_types_0(name: &str) -> Option<&'static [Option<IrType>]> {
     Some(match name {
         "__builtin_ia32_crc32hi" => &[Some(IrType::U32), Some(IrType::U16)],
         "__builtin_ia32_bzhi_si"
@@ -680,6 +706,13 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_vextractf128_si256" => &[None, Some(IrType::I32)],
         "__builtin_ia32_movnti64" => &[None, Some(IrType::I64)],
         "__builtin_ia32_movntq" => &[None, Some(IrType::U64)],
+        _ => return None,
+    })
+}
+
+#[rustfmt::skip]
+fn argument_scalar_types_1(name: &str) -> Option<&'static [Option<IrType>]> {
+    Some(match name {
         "__builtin_ia32_addpd"
         | "__builtin_ia32_addpd256"
         | "__builtin_ia32_addps"
@@ -877,6 +910,13 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_vinsertf128_pd256"
         | "__builtin_ia32_vinsertf128_ps256"
         | "__builtin_ia32_vinsertf128_si256" => &[None, None, Some(IrType::I32)],
+        _ => return None,
+    })
+}
+
+#[rustfmt::skip]
+fn argument_scalar_types_2(name: &str) -> Option<&'static [Option<IrType>]> {
+    Some(match name {
         "__builtin_ia32_maskstored"
         | "__builtin_ia32_maskstored256"
         | "__builtin_ia32_maskstorepd"
@@ -935,4 +975,11 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_rdtscp" => &[None],
         _ => return None,
     })
+}
+
+#[rustfmt::skip]
+pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrType>]> {
+    argument_scalar_types_0(name)
+        .or_else(|| argument_scalar_types_1(name))
+        .or_else(|| argument_scalar_types_2(name))
 }

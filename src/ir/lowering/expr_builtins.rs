@@ -4388,6 +4388,57 @@ fn legacy_xmm_intrinsic_required_feature(
     })
 }
 
+/// Memory intrinsics with their own ISA rules: the non-temporal stores and
+/// loads and the sign-bit-masked moves. Kept apart from
+/// `x86_intrinsic_required_feature` to stay inside the census's
+/// function-size budget; the dispatch order is unchanged (legacy XMM, then
+/// this group, then the general table).
+fn x86_memory_intrinsic_required_feature(
+    intrinsic: &BuiltinIntrinsic,
+) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    Some(match intrinsic {
+        // Non-temporal stores and sign-masked float moves are AVX (VEX-only);
+        // the masked integer forms and the 256-bit streaming load need AVX2.
+        B::X86Movntdq256
+        | B::X86Movntpd256
+        | B::X86Movntps256
+        | B::X86MaskLoadPs128
+        | B::X86MaskLoadPd128
+        | B::X86MaskLoadPs256
+        | B::X86MaskLoadPd256
+        | B::X86MaskStorePs128
+        | B::X86MaskStorePd128
+        | B::X86MaskStorePs256
+        | B::X86MaskStorePd256 => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
+        B::X86MaskLoadD128
+        | B::X86MaskLoadQ128
+        | B::X86MaskLoadD256
+        | B::X86MaskLoadQ256
+        | B::X86MaskStoreD128
+        | B::X86MaskStoreQ128
+        | B::X86MaskStoreD256
+        | B::X86MaskStoreQ256
+        | B::X86Movntdqa256 => IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        },
+        // SSE4.1 streaming load: the 128-bit form needs no AVX.
+        B::X86Movntdqa128 => IntrinsicRequirement {
+            feature: F::Sse41,
+            flag: "-msse4.1",
+            also: None,
+        },
+        _ => return None,
+    })
+}
+
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
 /// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
 /// belongs to, for the families whose permission bit exists in
@@ -4403,6 +4454,9 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     if let Some(requirement) = legacy_xmm_intrinsic_required_feature(intrinsic) {
+        return Some(requirement);
+    }
+    if let Some(requirement) = x86_memory_intrinsic_required_feature(intrinsic) {
         return Some(requirement);
     }
     Some(match intrinsic {
@@ -4530,30 +4584,6 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         B::X86Vextractf128V | B::X86Vinsertf128 => IntrinsicRequirement {
             feature: F::Avx,
             flag: "-mavx",
-            also: None,
-        },
-        // Non-temporal stores and sign-masked float moves are AVX (VEX-only);
-        // the masked integer forms and the 256-bit streaming load need AVX2.
-        B::X86Movntdq256
-        | B::X86Movntpd256
-        | B::X86Movntps256
-        | B::X86MaskLoadPs128 | B::X86MaskLoadPd128 | B::X86MaskLoadPs256 | B::X86MaskLoadPd256
-        | B::X86MaskStorePs128 | B::X86MaskStorePd128 | B::X86MaskStorePs256 | B::X86MaskStorePd256 => IntrinsicRequirement {
-            feature: F::Avx,
-            flag: "-mavx",
-            also: None,
-        },
-        B::X86MaskLoadD128 | B::X86MaskLoadQ128 | B::X86MaskLoadD256 | B::X86MaskLoadQ256
-        | B::X86MaskStoreD128 | B::X86MaskStoreQ128 | B::X86MaskStoreD256 | B::X86MaskStoreQ256
-        | B::X86Movntdqa256 => IntrinsicRequirement {
-            feature: F::Avx2,
-            flag: "-mavx2",
-            also: None,
-        },
-        // SSE4.1 streaming load: the 128-bit form needs no AVX.
-        B::X86Movntdqa128 => IntrinsicRequirement {
-            feature: F::Sse41,
-            flag: "-msse4.1",
             also: None,
         },
         // Public headers must not silently introduce SSSE3 above a declared
