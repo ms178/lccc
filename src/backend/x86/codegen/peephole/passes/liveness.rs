@@ -667,21 +667,21 @@ impl FileLiveness {
     /// `rbp_offset` and `kind` on lines whose text they did not touch.  The
     /// solver's store/load modelling reads exactly those fields, so a key
     /// built from text + `pinned` + `reg_refs` alone is sound only for as
-    /// long as every such mutation also happens to set `pinned`.  Deriving
-    /// `Hash` on the struct makes that coincidence unnecessary, and keeps the
-    /// key complete when a field is added (the derive fails to compile
-    /// otherwise).
+    /// long as every such mutation also happens to set `pinned`.  Folding
+    /// [`LineInfo::digest_words`] — an exhaustively-destructured lossless
+    /// packing — makes that coincidence unnecessary, and keeps the key
+    /// complete when a field is added (the destructure fails to compile
+    /// otherwise, exactly like the old `Hash` derive did).
     ///
     /// Two independent accumulators: an accidental hit then needs a collision
-    /// in both 64-bit halves.  Text is hashed through `FxHasher` (word-wise)
-    /// rather than a byte-at-a-time loop.
+    /// in both 64-bit halves.  The text half rides on the store's cached
+    /// per-line digest rather than a per-call re-hash.
     fn hash_function(
         store: &LineStore,
         infos: &[LineInfo],
         start: usize,
         end: usize,
     ) -> (u64, u64) {
-        use std::hash::{Hash, Hasher};
         // splitmix64 finalizer: full 64-bit avalanche for the returned key.
         #[inline]
         fn mix(mut z: u64) -> u64 {
@@ -697,19 +697,28 @@ impl FileLiveness {
         let len = end.saturating_sub(start);
         let mut h1 = 0x243f_6a88_85a3_08d3u64 ^ len as u64;
         let mut h2 = 0x1319_8a2e_0370_7344u64 ^ (len as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
-        for n in start..end {
+        // Slice once so the per-line `LineInfo` access is a bounds-check-free
+        // iterator step (the indexed form re-checked `n < infos.len()` every
+        // iteration under the fastbuild profile).
+        for (info, n) in infos[start..end].iter().zip(start..) {
             // The text half of the digest comes from the store's per-line
             // cache: it covers the raw stored text, which `trimmed` is a
-            // pure prefix-slice of (`trim_start` is itself hashed as a
-            // `LineInfo` field), so the pair (raw-text digest, LineInfo
-            // hash) separates at least every pair the old
-            // (trimmed-text, LineInfo) fold separated.  Re-hashing the
-            // string per call was 4% of all instructions on a 40-function
-            // TU; the cache makes it one cached-u64 fold per unchanged line.
-            let mut line = crate::common::fx_hash::FxHasher::default();
-            infos[n].hash(&mut line);
-            line.write_u64(store.line_digest(n));
-            let w = line.finish();
+            // pure prefix-slice of (`trim_start` is folded as part of the
+            // `digest_words` packing), so the pair (raw-text digest,
+            // packed LineInfo words) separates at least every pair the
+            // old (trimmed-text, LineInfo) fold separated.  Re-hashing
+            // the string per call was 4% of all instructions on a
+            // 40-function TU; the `LineInfo` half used to go through a
+            // non-inlined `FxHasher` derive walk that itself cost 1.57%
+            // — `digest_words` is the same information as a LOSSLESS
+            // three-word packing, folded inline.
+            let [w0, w1, w2] = info.digest_words();
+            // One order-sensitive chain over the four words; the
+            // rotate+multiply fold keeps position sensitivity, the two
+            // accumulators plus differing seeds keep 128 bits of state —
+            // the same diffusion structure as the previous
+            // (FxHasher-folded word, word ^ const) pair.
+            let w = fold(fold(fold(w0, w1), w2), store.line_digest(n));
             h1 = fold(h1, w);
             h2 = fold(h2, w ^ 0xa409_3822_299f_31d0);
         }
@@ -2310,10 +2319,11 @@ fn upper32_zero_transfer_cached(info: &LineInfo, t: &str) -> (u16, u16) {
     thread_local! {
         static CACHE: std::cell::RefCell<Cache> = std::cell::RefCell::new(Cache::default());
     }
-    // Keyed on the text alone: the full-key check below keeps it exact, a
-    // same-text line in another state (pinned, nop) merely evicts, and not
-    // hashing `LineInfo` here keeps its `Hash` impl single-caller (inlined)
-    // in `hash_function`'s hot loop.
+    // Keyed on the text alone: the full-key check below keeps it exact, and
+    // a same-text line in another state (pinned, nop) merely evicts.  Not
+    // hashing `LineInfo` here keeps the key one short `FxHasher` pass over
+    // bytes the caller already holds; the `i == info` guard on a hit is a
+    // handful of integer compares.
     let mut h = crate::common::fx_hash::FxHasher::default();
     t.hash(&mut h);
     let key = h.finish();

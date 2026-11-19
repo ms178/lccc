@@ -1093,6 +1093,26 @@ callgrind_annotate --inclusive=yes cg.out | grep -E 'LabelRefs::build|combined_l
    (0.00 %); peephole inclusive share is now 58.01 % — the ≤ 35 % acceptance
    criterion REMAINS OPEN (next: decode-once table lookups inside
    `combined_local_pass`, the largest remaining flat profile block).
+   **Step 4 progress — the two measurable decode-once levers landed.**
+   (a) `is_inline_range_marker` now runs a 14-byte necessary-condition
+   prefix probe before its quote-aware statement scan: 59.0 M → 4.9 M Ir
+   on the predicate across its 21 call sites, and the scan's downstream
+   memcmp/malloc/trim cascade collapses with it. (b) The liveness memo
+   key folds `LineInfo::digest_words()` — an injectivity-tested lossless
+   three-word packing (`LineKind::pack`) — instead of a non-inlined
+   `FxHasher` derive walk (157.3 M → 146.3 M Ir). Together:
+   5,990,941,043 → 5,604,432,386 Ir on big40 `-O1` (−6.45 %), paired wall
+   big100 −2.30 % / big40 ±0 % (the saved work is low-CPI predicted
+   scans; big40 wall is allocator-bound), byte-identical on big40/big100
+   × `-O0/-O1/-O2`. A third lever was tried and REJECTED by measurement:
+   routing `LineKind::eq` through the packed word is 16× worse at
+   fastbuild opt-level 1 (the pack match does not inline; the derived
+   discriminant short-circuit is nearly free) — pinned in the enum's doc
+   comment so it is not re-attempted. The remaining `starts_with`/
+   `contains` traffic is diffuse generic-shim cost across hundreds of
+   sites (no single ≥ 2 % block left), so the interned-opcode-id design
+   stays open as the structural cure; peephole share is still far from
+   ≤ 35 %, criterion REMAINS OPEN.
 
 **Gates.** Byte-identical `.s` over the benchmark programs, the kernel corpus and the
 asm-diff corpus before/after each step (existing identity scripts); a compile-cost
