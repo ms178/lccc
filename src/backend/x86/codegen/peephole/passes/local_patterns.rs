@@ -9004,16 +9004,13 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
 fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
     use crate::common::fx_hash::FxHashMap;
     let n = store.len();
-    let mut labels = FxHashMap::default();
+    // Borrowed keys: the map only lives for this solve, and the label text
+    // outlives it in the store — an owned `String` per label was pure
+    // allocator churn on the hottest whole-file path (DHAT: 93k blocks).
+    let mut labels: FxHashMap<&str, usize> = FxHashMap::default();
     for i in 0..n {
         if infos[i].kind == LineKind::Label {
-            labels.insert(
-                infos[i]
-                    .trimmed(store.get(i))
-                    .trim_end_matches(':')
-                    .to_string(),
-                i,
-            );
+            labels.insert(infos[i].trimmed(store.get(i)).trim_end_matches(':'), i);
         }
     }
     let mut uses = vec![0u16; n];

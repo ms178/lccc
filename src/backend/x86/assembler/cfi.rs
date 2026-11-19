@@ -53,6 +53,72 @@ impl CfiArch {
             CfiArch::I386 => 'l',
         }
     }
+    /// Slot-sized suffixed mnemonics (`pushq`/`pushl`, ...).  The CFI
+    /// synthesiser compares every instruction's mnemonic against these; a
+    /// `format!("push{}", suffix)` per compared line used to heap-allocate
+    /// inside its hottest loop (DHAT: ~950k blocks on the profiling TU).
+    /// `&'static str` answers cost nothing and keep the suffix law in the
+    /// one place that owns it.
+    pub(crate) fn push_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "pushq",
+            CfiArch::I386 => "pushl",
+        }
+    }
+    pub(crate) fn pop_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "popq",
+            CfiArch::I386 => "popl",
+        }
+    }
+    pub(crate) fn pushf_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "pushfq",
+            CfiArch::I386 => "pushfl",
+        }
+    }
+    pub(crate) fn popf_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "popfq",
+            CfiArch::I386 => "popfl",
+        }
+    }
+    pub(crate) fn leave_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "leaveq",
+            CfiArch::I386 => "leavel",
+        }
+    }
+    pub(crate) fn call_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "callq",
+            CfiArch::I386 => "calll",
+        }
+    }
+    pub(crate) fn add_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "addq",
+            CfiArch::I386 => "addl",
+        }
+    }
+    pub(crate) fn sub_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "subq",
+            CfiArch::I386 => "subl",
+        }
+    }
+    pub(crate) fn mov_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "movq",
+            CfiArch::I386 => "movl",
+        }
+    }
+    pub(crate) fn lea_mn(self) -> &'static str {
+        match self {
+            CfiArch::X86_64 => "leaq",
+            CfiArch::I386 => "leal",
+        }
+    }
     /// Callee-saved general registers of the psABI.
     pub(crate) fn is_callee_saved(self, r: &str) -> bool {
         match self {
