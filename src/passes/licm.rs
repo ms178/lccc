@@ -743,6 +743,10 @@ fn analyze_loop_memory(
                 }
                 // Impure function calls can modify any global state; read-only
                 // (`is_pure`) and read-none (`is_const`) non-sret calls do not.
+                // A callee that writes nothing but may trap or park
+                // (`CallInfo::memory` alone) stays a barrier here: every
+                // hoist this flag gates would run above it, in executions
+                // the call would have ended.
                 Instruction::Call { func, info } => {
                     if func == crate::common::cpu_probe::INIT_SYMBOL {
                         has_cpu_init_call = true;
@@ -1142,14 +1146,70 @@ fn is_load_hoistable(
     })
 }
 
-fn block_has_impure_call(block: &crate::ir::reexports::BasicBlock) -> bool {
-    block.instructions.iter().any(|inst| match inst {
+/// Whether a call to `callee` may run in an execution that would not have
+/// reached it: a read-none C library function that is defined for every
+/// argument (`fabs`, `sqrt`, ...) and is passed no pointer.
+///
+/// Neither `const` nor coming from a library says as much.  glibc declares
+/// `div` `const`, and a header may declare any
+/// `extern int quot(int, int) __attribute__((const));` -- both divide, and
+/// both raised SIGFPE once hoisted above the `if (b == 0) return -1;` that
+/// guarded their loop (GCC 16.2 and Clang 23.1.5 return -1: neither runs a
+/// call the program would not have made).  Every other call moves only to a
+/// point that implies its execution.
+pub(super) fn call_may_be_speculated(callee: &str, info: &crate::ir::reexports::CallInfo) -> bool {
+    info.is_const
+        && info.assume_library
+        && !info.arg_types.contains(&crate::common::types::IrType::Ptr)
+        && super::ip_purity::library_function_is_total(callee)
+}
+
+/// Whether control may fail to reach the instruction after `inst`: a call
+/// not known to return (`exit`, `longjmp`, an assertion handler, a check
+/// that traps or parks -- anything not `is_pure`/`is_const`), an asm goto,
+/// or a non-local transfer.
+///
+/// An instruction hoisted above one of these runs in executions that would
+/// never have reached it.  What the instruction does to memory is a separate
+/// question (`LoopMemoryInfo::has_calls`).
+///
+/// Inline assembly without labels is not one of them.  GCC documents that it
+/// "assumes that asm execution falls through to the next statement", and
+/// tells the author of one that does not to say so with
+/// `__builtin_unreachable()`, which ends the block here; GCC 16.2 hoists a
+/// division and a `const` call above `asm volatile("nop")` accordingly
+/// (Clang 23.1.5 hoists neither).  An asm goto sits *inside* its block in
+/// this IR while its label edges leave from it, so what follows it in the
+/// block is skipped whenever a label is taken.
+fn may_not_return(inst: &Instruction) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp;
+    match inst {
         Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-            !((info.is_pure || info.is_const) && !info.is_sret)
+            !(info.is_pure || info.is_const)
         }
-        Instruction::InlineAsm { clobbers, .. } => !clobbers.is_empty(),
+        Instruction::InlineAsm { goto_labels, .. } => !goto_labels.is_empty(),
+        Instruction::NonlocalGoto { .. } => true,
+        Instruction::Intrinsic { op, .. } => matches!(
+            op,
+            IntrinsicOp::BuiltinSetjmp
+                | IntrinsicOp::BuiltinLongjmp
+                | IntrinsicOp::SaveApplyArgs
+                | IntrinsicOp::DoBuiltinApply
+                | IntrinsicOp::RestoreApplyResult
+        ),
         _ => false,
-    })
+    }
+}
+
+/// Whether something ahead of instruction `at` in `block` can keep control
+/// from reaching it.
+fn may_not_reach(block: &crate::ir::reexports::BasicBlock, at: usize) -> bool {
+    block.instructions[..at].iter().any(may_not_return)
+}
+
+/// Whether control entering `block` may not leave it through its terminator.
+fn block_may_not_return(block: &crate::ir::reexports::BasicBlock) -> bool {
+    block.instructions.iter().any(may_not_return)
 }
 
 fn eval_typed_int_cmp(
@@ -1197,7 +1257,9 @@ fn eval_typed_int_cmp(
 }
 
 /// Prove that entering `header` from `preheader` on iteration 0 unconditionally
-/// reaches `target_block` before any back-edge or impure call.
+/// reaches `target_block` before any back-edge or anything that may not
+/// return ([`may_not_return`]).  What precedes the instruction of interest
+/// inside `target_block` is the caller's to check ([`may_not_reach`]).
 fn loop_first_iter_reaches_block(
     func: &IrFunction,
     preheader: usize,
@@ -1209,7 +1271,7 @@ fn loop_first_iter_reaches_block(
     if target_block == header {
         return true;
     }
-    if block_has_impure_call(&func.blocks[header]) {
+    if block_may_not_return(&func.blocks[header]) {
         return false;
     }
     let preheader_label = func.blocks[preheader].label;
@@ -1309,7 +1371,7 @@ fn loop_first_iter_reaches_block(
         if cur_idx == target_block {
             return true;
         }
-        if cur_idx == header || block_has_impure_call(&func.blocks[cur_idx]) {
+        if cur_idx == header || block_may_not_return(&func.blocks[cur_idx]) {
             return false;
         }
         match &func.blocks[cur_idx].terminator {
@@ -2031,11 +2093,14 @@ fn hoist_loop_invariants_with(
                             preheader_is_dedicated,
                         )
                     }
-                } else if let Instruction::Call { info, .. } = inst {
+                } else if let Instruction::Call { func: callee, info } = inst {
                     // Loop-invariant direct pure/const scalar call hoisting:
                     // -Callee must be `is_pure || is_const`, non-sret, non-variadic,
                     //  with a scalar return (`dest.is_some()`).
                     // -Every argument must be loop-invariant.
+                    // -A call is never speculated: only a read-none C library
+                    //  function may run on a path that skips the loop, and nothing
+                    //  ahead of the call may keep control from it.
                     // -For read-only (`!info.is_const` or pointer-taking) calls:
                     //  the loop must have no stores or impure calls, the call's
                     //  block must dominate all loop blocks (or execute on the first
@@ -2062,9 +2127,11 @@ fn hoist_loop_invariants_with(
                         let has_ptr_arg =
                             info.arg_types.contains(&crate::common::types::IrType::Ptr);
                         if info.is_const && !has_ptr_arg {
-                            // Read-none scalar call without pointers: safe if either
-                            // dominating all loop blocks or guaranteed first-iter entry.
-                            natural_loop
+                            // Read-none scalar call without pointers.  It runs
+                            // whenever the loop is entered if its block
+                            // dominates the loop (it is the header) or the
+                            // first iteration provably reaches it.
+                            let runs_on_entry = natural_loop
                                 .body
                                 .iter()
                                 .all(|&b| dominates_block(idom, block_idx, b))
@@ -2076,11 +2143,31 @@ fn hoist_loop_invariants_with(
                                         block_idx,
                                         &natural_loop.body,
                                         idom,
-                                    ))
+                                    ));
+                            // A C library function that is defined for every
+                            // argument (`fabs`, `sqrt`, ...) needs no more:
+                            // running it early -- even on a path that skips
+                            // the loop -- changes nothing.
+                            //
+                            // Any other callee can fault on an argument the
+                            // surrounding code rules out, and "no pointer" is
+                            // not "no fault": `static int quot(int a, int b)
+                            // { return a / b; }` behind `if (b == 0) return
+                            // -1;` was hoisted above that test and raised
+                            // SIGFPE (GCC 16.2 and Clang 23.1.5 return -1).
+                            // Such a call moves only to a point that implies
+                            // its execution: a preheader that always enters
+                            // the loop, with nothing ahead of the call in its
+                            // own block that can keep control from it.
+                            runs_on_entry
+                                && (call_may_be_speculated(callee, info)
+                                    || (preheader_is_dedicated
+                                        && !may_not_reach(&func.blocks[block_idx], inst_idx)))
                         } else {
                             preheader_is_dedicated
                                 && !loop_mem.has_calls
                                 && !loop_mem.has_any_stores()
+                                && !may_not_reach(&func.blocks[block_idx], inst_idx)
                                 && loop_first_iter_reaches_block(
                                     func,
                                     preheader,
@@ -3482,6 +3569,429 @@ mod tests {
         assert_eq!(
             hoisted, 2,
             "both __lccc_cpu_w0 load and pure_helper call should hoist"
+        );
+    }
+
+    /// Where an impure call sits relative to the read-none one in the loop.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Impure {
+        Absent,
+        Before,
+        After,
+    }
+
+    /// `if (b == 0) return -1; do { s += quot(a, b); } while (++j < 3);`
+    ///
+    /// Block 0 tests `b` and is the loop's only outside predecessor; with
+    /// `guarded` it branches around the loop as well, otherwise it always
+    /// enters.  Block 1 is the whole loop: the read-none call on the two
+    /// parameters, optionally with an impure call beside it.
+    fn bottom_tested_call_loop(guarded: bool, library: bool, impure: Impure) -> IrFunction {
+        use crate::ir::reexports::CallInfo;
+        let mut func = IrFunction::new("sum".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Eq,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: if guarded {
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(1),
+                }
+            } else {
+                Terminator::Branch(BlockId(1))
+            },
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let quot = Instruction::Call {
+            func: if library { "labs" } else { "quot" }.into(),
+            info: CallInfo {
+                dest: Some(Value(5)),
+                args: vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                arg_types: vec![IrType::I32, IrType::I32],
+                return_type: IrType::I32,
+                is_pure: true,
+                is_const: true,
+                assume_library: library,
+                ..CallInfo::default()
+            },
+        };
+        let check = Instruction::Call {
+            func: "require_nonzero".into(),
+            info: CallInfo {
+                args: vec![Operand::Value(Value(1))],
+                arg_types: vec![IrType::I32],
+                return_type: IrType::Void,
+                ..CallInfo::default()
+            },
+        };
+        let mut body = vec![Instruction::Phi {
+            dest: Value(3),
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                (Operand::Value(Value(6)), BlockId(1)),
+            ],
+        }];
+        match impure {
+            Impure::Absent => body.push(quot),
+            Impure::Before => body.extend([check, quot]),
+            Impure::After => body.extend([quot, check]),
+        }
+        body.extend([
+            Instruction::BinOp {
+                dest: Value(6),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+            Instruction::Cmp {
+                dest: Value(7),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(6)),
+                rhs: Operand::Const(IrConst::I32(3)),
+                ty: IrType::I32,
+            },
+        ]);
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: body,
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(7)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(-1)))),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        func.next_value_id = 8;
+        func
+    }
+
+    /// `func` after LICM on its one loop.
+    fn hoisted(mut func: IrFunction) -> IrFunction {
+        let alloca_info = analyze_allocas(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+        let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+        assert_eq!(loops.len(), 1);
+        hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info);
+        func
+    }
+
+    /// The block holding the call to `callee`.
+    fn block_calling(func: &IrFunction, callee: &str) -> usize {
+        func.blocks
+            .iter()
+            .position(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| matches!(inst, Instruction::Call { func, .. } if func == callee))
+            })
+            .unwrap_or_else(|| panic!("the call to {callee} is still somewhere"))
+    }
+
+    /// Block the read-none call of `bottom_tested_call_loop` ends up in.
+    fn block_of_the_call(func: IrFunction) -> usize {
+        let func = hoisted(func);
+        func.blocks
+            .iter()
+            .position(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| matches!(inst, Instruction::Call { info, .. } if info.is_const))
+            })
+            .expect("the call is still somewhere")
+    }
+
+    /// The `require_nonzero` call of `bottom_tested_call_loop`.
+    fn the_check(func: &mut IrFunction) -> &mut crate::ir::reexports::CallInfo {
+        func.blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|inst| match inst {
+                Instruction::Call { func, info } if func == "require_nonzero" => Some(info),
+                _ => None,
+            })
+            .expect("the check")
+    }
+
+    /// The guard is what makes the division legal: above it, `quot(a, 0)`
+    /// runs in the execution that was supposed to return -1.
+    #[test]
+    fn a_read_none_call_is_not_hoisted_above_the_test_that_guards_its_loop() {
+        assert_eq!(
+            block_of_the_call(bottom_tested_call_loop(true, false, Impure::Absent)),
+            1
+        );
+    }
+
+    /// With a preheader that always enters the loop, the call would have run
+    /// anyway: hoisting it is the optimization, not speculation.
+    #[test]
+    fn a_read_none_call_is_hoisted_into_a_preheader_that_always_enters() {
+        assert_eq!(
+            block_of_the_call(bottom_tested_call_loop(false, false, Impure::Absent)),
+            0
+        );
+    }
+
+    /// `require_nonzero(b); s += quot(a, b);` -- the first call may exit.
+    /// One that comes after cannot stop the division from having run.
+    #[test]
+    fn a_read_none_call_stays_behind_a_call_that_may_not_return() {
+        assert_eq!(
+            block_of_the_call(bottom_tested_call_loop(false, false, Impure::Before)),
+            1
+        );
+        assert_eq!(
+            block_of_the_call(bottom_tested_call_loop(false, false, Impure::After)),
+            0
+        );
+    }
+
+    /// A check that writes nothing is no easier to hoist over, and no easier
+    /// to hoist: what it may do instead of returning is why it is there.
+    /// `CallInfo::memory` describes the first half only.
+    #[test]
+    fn a_check_that_writes_nothing_is_still_a_check() {
+        use crate::ir::reexports::MemoryEffect;
+        for memory in [MemoryEffect::ReadNone, MemoryEffect::ReadOnly] {
+            let mut func = bottom_tested_call_loop(false, false, Impure::Before);
+            let check = the_check(&mut func);
+            check.memory = memory;
+            // Give it the scalar result a hoistable call has, so that only
+            // the missing `is_pure`/`is_const` keeps it where it is.
+            check.dest = Some(Value(9));
+            check.return_type = IrType::I32;
+            func.next_value_id = 10;
+            let func = hoisted(func);
+            assert_eq!(block_calling(&func, "require_nonzero"), 1, "{memory:?}");
+            assert_eq!(block_calling(&func, "quot"), 1, "{memory:?}");
+        }
+    }
+
+    /// Once the check is known to return it is an ordinary read-none call:
+    /// both move, which is what telling the two facts apart buys.
+    #[test]
+    fn a_check_known_to_return_moves_with_the_call_behind_it() {
+        let mut func = bottom_tested_call_loop(false, false, Impure::Before);
+        let check = the_check(&mut func);
+        check.is_pure = true;
+        check.dest = Some(Value(9));
+        check.return_type = IrType::I32;
+        func.next_value_id = 10;
+        let func = hoisted(func);
+        assert_eq!(block_calling(&func, "quot"), 0);
+    }
+
+    /// `bottom_tested_call_loop` with inline assembly ahead of its call:
+    /// plain, or an asm goto whose label is the block after the loop.
+    fn call_after_asm(read_only: bool, goto_exit: bool) -> IrFunction {
+        let mut func = bottom_tested_call_loop(false, false, Impure::Absent);
+        the_call(&mut func).is_const = !read_only;
+        let at = func.blocks[1]
+            .instructions
+            .iter()
+            .position(|inst| matches!(inst, Instruction::Call { .. }))
+            .unwrap();
+        let asm = Instruction::InlineAsm {
+            template: if goto_exit { "jmp %l0" } else { "nop" }.into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: if goto_exit {
+                vec![("out".into(), BlockId(2))]
+            } else {
+                vec![]
+            },
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        };
+        func.blocks[1].instructions.insert(at, asm);
+        func
+    }
+
+    /// Inline assembly falls through to the next statement: that is GCC's
+    /// documented assumption, and GCC 16.2 hoists the call above
+    /// `asm volatile("nop")`.  Holding every hoist back behind a `pause` or a
+    /// barrier would cost the loops that have one for nothing.
+    #[test]
+    fn a_call_moves_above_inline_assembly_that_falls_through() {
+        for read_only in [false, true] {
+            assert_eq!(
+                block_calling(&hoisted(call_after_asm(read_only, false)), "quot"),
+                0,
+                "read_only={read_only}"
+            );
+        }
+    }
+
+    /// An asm goto may leave by its label instead, from the middle of the
+    /// block: the call behind it does not run in that iteration, and must not
+    /// be made to run before the loop.
+    #[test]
+    fn a_call_stays_behind_an_asm_goto() {
+        for read_only in [false, true] {
+            assert_eq!(
+                block_calling(&hoisted(call_after_asm(read_only, true)), "quot"),
+                1,
+                "read_only={read_only}"
+            );
+        }
+    }
+
+    /// `const` and from a library is not "defined for every argument": glibc
+    /// declares `div` `const`, and a header can declare any external function
+    /// so.  Such a call has the rule of a callee nobody knows -- it is not
+    /// run above the test that guards its loop, nor above a check.
+    #[test]
+    fn a_library_function_that_can_fault_is_not_speculated() {
+        for name in ["div", "safe_quot"] {
+            let block_of = |guarded: bool, impure: Impure| {
+                let mut func = bottom_tested_call_loop(guarded, true, impure);
+                for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+                    if let Instruction::Call { func: callee, .. } = inst
+                        && callee == "labs"
+                    {
+                        *callee = name.into();
+                    }
+                }
+                block_calling(&hoisted(func), name)
+            };
+            assert_eq!(block_of(true, Impure::Absent), 1, "{name}: above the guard");
+            assert_eq!(block_of(false, Impure::Before), 1, "{name}: above a check");
+            // It is still an invariant call, and moves where it would have run.
+            assert_eq!(block_of(false, Impure::Absent), 0, "{name}");
+            assert_eq!(block_of(false, Impure::After), 0, "{name}");
+        }
+    }
+
+    /// A read-none C library function is defined for every argument, so the
+    /// rule it had is the rule it keeps.
+    #[test]
+    fn a_library_function_keeps_its_hoist() {
+        for impure in [Impure::Absent, Impure::Before, Impure::After] {
+            for guarded in [false, true] {
+                assert_eq!(
+                    block_of_the_call(bottom_tested_call_loop(guarded, true, impure)),
+                    0
+                );
+            }
+        }
+    }
+
+    fn the_call(func: &mut IrFunction) -> &mut crate::ir::reexports::CallInfo {
+        func.blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|inst| match inst {
+                Instruction::Call { info, .. } if info.is_const => Some(info),
+                _ => None,
+            })
+            .expect("the read-none call")
+    }
+
+    /// The soundness rule must not cost the optimization where it is sound:
+    /// the preheader pass gives the guarded loop a block that is entered only
+    /// with the loop, and the call moves there -- below the test, once.
+    #[test]
+    fn the_preheader_pass_gives_a_guarded_call_somewhere_safe_to_go() {
+        let mut func = bottom_tested_call_loop(true, false, Impure::Absent);
+        assert_eq!(crate::passes::loop_preheader::run_function(&mut func), 1);
+        let preheader = preheader_of(&func);
+        assert_eq!(block_of_the_call(func), preheader);
+    }
+
+    /// The block the preheader pass put between the guard of
+    /// `bottom_tested_call_loop` and its loop.
+    fn preheader_of(func: &IrFunction) -> usize {
+        let guard_false_arm = match &func.blocks[0].terminator {
+            Terminator::CondBranch { false_label, .. } => *false_label,
+            other => panic!("the guard still branches: {other:?}"),
+        };
+        let preheader = func
+            .blocks
+            .iter()
+            .position(|block| block.label == guard_false_arm)
+            .expect("the new block");
+        assert!(matches!(
+            func.blocks[preheader].terminator,
+            Terminator::Branch(BlockId(1))
+        ));
+        preheader
+    }
+
+    /// A preheader is spent only where it can unlock a hoist.
+    #[test]
+    fn the_preheader_pass_spends_no_block_on_a_call_it_cannot_help() {
+        // A library function defined for every argument hoists without one.
+        let mut library = bottom_tested_call_loop(true, true, Impure::Absent);
+        assert_eq!(crate::passes::loop_preheader::run_function(&mut library), 0);
+        // One that can fault does not, and gets the block: the call then
+        // moves below the guard instead of staying in the loop.
+        let mut faulting = bottom_tested_call_loop(true, true, Impure::Absent);
+        for inst in faulting.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+            if let Instruction::Call { func: callee, .. } = inst
+                && callee == "labs"
+            {
+                *callee = "div".into();
+            }
+        }
+        assert_eq!(
+            crate::passes::loop_preheader::run_function(&mut faulting),
+            1
+        );
+        let preheader = preheader_of(&faulting);
+        assert_eq!(block_calling(&hoisted(faulting), "div"), preheader);
+        // An argument computed in the loop keeps the call in the loop.
+        let mut variant = bottom_tested_call_loop(true, false, Impure::Absent);
+        the_call(&mut variant).args[0] = Operand::Value(Value(3));
+        assert_eq!(crate::passes::loop_preheader::run_function(&mut variant), 0);
+        // LICM does not hoist a call without a scalar result.
+        let mut no_result = bottom_tested_call_loop(true, false, Impure::Absent);
+        the_call(&mut no_result).dest = None;
+        assert_eq!(
+            crate::passes::loop_preheader::run_function(&mut no_result),
+            0
+        );
+        // A read-only callee dereferences: same rule as the read-none one.
+        let mut read_only = bottom_tested_call_loop(true, false, Impure::Absent);
+        the_call(&mut read_only).is_const = false;
+        assert_eq!(
+            crate::passes::loop_preheader::run_function(&mut read_only),
+            1
         );
     }
 }

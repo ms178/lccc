@@ -22,9 +22,9 @@
 #     compiler-{types,gcc}.h for __GNUC__ with sane function alignment)
 #
 # Usage:
-#   ./boot_kconfigless_stage.sh /path/to/linux-6.18.58.tar.xz /path/to/workdir
+#   ./boot_kconfigless_stage.sh /path/to/linux-6.18.63.tar.xz /path/to/workdir
 #   eval "$(./boot_kconfigless_stage.sh ... | grep ^export)"  # sets LCCC_BOOT_EXTRA
-#   KERNEL_DIR=/path/to/workdir/linux-6.18.58 LCCC=... OUT=... ./build_kernel_boot.sh
+#   KERNEL_DIR=/path/to/workdir/linux-6.18.63 LCCC=... OUT=... ./build_kernel_boot.sh
 # ============================================================================
 set -euo pipefail
 
@@ -43,7 +43,7 @@ SRC=${SRC%.tar.gz}
 KV=${SRC#linux-}
 [[ $KV =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || {
     echo "boot_kconfigless_stage: cannot read a kernel version from '$TARBALL'" >&2
-    echo "  (expected a kernel.org name such as linux-6.18.58.tar.xz)" >&2
+    echo "  (expected a kernel.org name such as linux-6.18.63.tar.xz)" >&2
     exit 1
 }
 mkdir -p "$WORK"

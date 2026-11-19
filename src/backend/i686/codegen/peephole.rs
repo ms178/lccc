@@ -4203,6 +4203,30 @@ fn forward_slot_loads_cfg_range(
                     succ[b].push(b + 1);
                 }
             }
+            LineKind::InlineAsm => {
+                // An asm goto reaches its labels from inside the region: by a
+                // line of the user's template, or by a table entry that is no
+                // instruction at all.  Every label the line names is a
+                // successor, entered with nothing known (the line kills the
+                // whole state), so a slot stored behind the asm goto is not
+                // forwarded to a load at the label the asm goto jumps to:
+                //
+                //     movl $1, 8(%esp)
+                //     #APP  testl %ecx, %ecx; jnz .LBB5  #NO_APP
+                //     movl $2, 8(%esp)
+                //   .LBB5:
+                //     movl 8(%esp), %eax      ->  movl $2, %eax
+                each_local_symbol(syntax_of(store, infos, lj), |symbol| {
+                    if let Some(&target) = labels.get(symbol)
+                        && (fs..fe).contains(&target)
+                    {
+                        succ[b].push(block_of(target));
+                    }
+                });
+                if b + 1 < nb {
+                    succ[b].push(b + 1);
+                }
+            }
             _ => {
                 if b + 1 < nb {
                     succ[b].push(b + 1);
@@ -6724,6 +6748,56 @@ fn functions_with_hidden_code(store: &LineStore, infos: &[LineInfo]) -> Vec<bool
     hidden
 }
 
+/// Per line of `[start, end)`, the index of its inline-asm region (`u32::MAX`
+/// outside one, and for a region that names no label of the range), and per
+/// region the lines of the labels it names.
+///
+/// A region is the run of lines between `#APP` and `#NO_APP`.  Every line of
+/// it gets every label of it: the template is the user's, and which of its
+/// lines transfers control is not ours to parse.  The table stays empty for a
+/// function without inline asm, and the per-line column is only read for the
+/// lines the fixpoint does not already know how to leave.
+fn inline_asm_region_targets(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+    labels: &std::collections::HashMap<&str, usize>,
+) -> (Vec<u32>, Vec<Vec<usize>>) {
+    let mut region_of = Vec::new();
+    let mut regions: Vec<Vec<usize>> = Vec::new();
+    let mut i = start;
+    while i < end {
+        if infos[i].kind != LineKind::InlineAsm || infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        let mut named: Vec<usize> = Vec::new();
+        while i < end && (infos[i].kind == LineKind::InlineAsm || infos[i].is_nop()) {
+            if !infos[i].is_nop() {
+                each_local_symbol(syntax_of(store, infos, i), |symbol| {
+                    if let Some(&line) = labels.get(symbol)
+                        && !named.contains(&line)
+                    {
+                        named.push(line);
+                    }
+                });
+            }
+            i += 1;
+        }
+        if named.is_empty() {
+            continue;
+        }
+        if region_of.is_empty() {
+            region_of = vec![u32::MAX; end - start];
+        }
+        region_of[first - start..i - start].fill(regions.len() as u32);
+        regions.push(named);
+    }
+    (region_of, regions)
+}
+
 /// Backward GPR liveness over `[start, end)`; returns the live-out bitmask
 /// per line, indexed by `line - start`. Direct jumps to unknown labels are
 /// treated as "all registers live" (tail calls — their ABI arguments may
@@ -6812,6 +6886,25 @@ fn compute_gpr_live_out_hypothetical(
         defs_of.push(defs);
         targets.push(target);
     }
+    // The labels an inline-asm region can reach.  An asm goto's jump is a
+    // line of the user's template (`testl %ecx, %ecx; jnz .LBB5`) or no
+    // instruction at all (a static key: a nop here, the label in a
+    // `__jump_table` entry), so the edge belongs to the region, not to the
+    // line that happens to name the label.  Without it a register read only
+    // at such a label is dead everywhere else:
+    //
+    //   .LBB2:  call g
+    //           #APP  testl %ecx, %ecx; jnz .LBB5  #NO_APP
+    //           movl %ebp, %esi         <- deleted: nothing in the loop reads %esi
+    //           jmp .LBB2
+    //   .LBB5:  movl %esi, %eax
+    let asm_regions = inline_asm_region_targets(store, infos, start, end, &labels);
+    let asm_targets = |local: usize| -> &[usize] {
+        match asm_regions.0.get(local) {
+            Some(&region) if region != u32::MAX => &asm_regions.1[region as usize],
+            _ => &[],
+        }
+    };
     let mut live_in = vec![0u16; n];
     let mut live_out = vec![0u16; n];
     let mut progress = true;
@@ -6859,6 +6952,9 @@ fn compute_gpr_live_out_hypothetical(
                 _ => {
                     if let Some(next) = fallthrough {
                         out |= live_in[next];
+                    }
+                    for &label in asm_targets(local) {
+                        out |= live_in[label];
                     }
                 }
             }
@@ -21636,6 +21732,138 @@ mod tests {
             compact.contains(".LBB5:\n.LBB3:") || result.contains("jne .LBB3"),
             "edge must reach .LBB3 with no trampoline jump:\n{result}"
         );
+    }
+
+    #[test]
+    fn a_slot_stored_behind_an_asm_goto_is_reloaded_at_its_label() {
+        // What `v = 1; asm goto(out); v = g(n); out: return v;` looks like
+        // ahead of this pass (-m32 -O0, `v` escaped).  `.LBB1` is reached by
+        // the asm goto with 1 in the slot and by falling through with the
+        // result of `g` in it; the reload is the only correct reading.  The
+        // label was taken for one nobody jumps to, the reload for a copy of
+        // %eax onto itself, and the asm goto's way out returned `x`.
+        let asm = concat!(
+            "join_call_esc:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebp\n",
+            "    movl %esp, %ebp\n",
+            "    subl $24, %esp\n",
+            "    movl 12(%ebp), %eax\n",
+            "    movl %eax, -12(%ebp)\n",
+            "    subl $16, %esp\n",
+            "    leal -12(%ebp), %eax\n",
+            "    movl %eax, 0(%esp)\n",
+            "    call sink\n",
+            "    addl $16, %esp\n",
+            "    movl $1, -12(%ebp)\n",
+            "    movl 8(%ebp), %eax\n",
+            "    movl %eax, -20(%ebp)\n",
+            "    movl -20(%ebp), %ecx\n",
+            "#APP\n",
+            "    testl %ecx, %ecx; jnz .LBB1\n",
+            "#NO_APP\n",
+            "    movl 12(%ebp), %eax\n",
+            "    movl %eax, -20(%ebp)\n",
+            "    subl $16, %esp\n",
+            "    movl -20(%ebp), %eax\n",
+            "    movl %eax, 0(%esp)\n",
+            "    call g\n",
+            "    addl $16, %esp\n",
+            "    movl %eax, -24(%ebp)\n",
+            "    movl -24(%ebp), %eax\n",
+            "    movl %eax, -12(%ebp)\n",
+            ".LBB1:\n",
+            "    movl -12(%ebp), %eax\n",
+            "    movl %ebp, %esp\n",
+            "    popl %ebp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size join_call_esc, .-join_call_esc\n",
+        );
+        for region in [
+            "    testl %ecx, %ecx; jnz .LBB1\n",
+            // the jump of a patched static key: bytes, and a label in a table
+            "    testl %ecx, %ecx\n    .byte 0x0f, 0x85\n    .long .LBB1 - . - 4\n",
+        ] {
+            let text = asm.replace("    testl %ecx, %ecx; jnz .LBB1\n", region);
+            let result = peephole_optimize(text);
+            let label = result.find(".LBB1:").expect("the label is kept");
+            assert!(
+                result[label..].contains("movl -12(%ebp), %eax"),
+                "the slot must be reloaded at the asm goto's label:\n{result}"
+            );
+        }
+        // Without the asm goto the label is reached by falling through only,
+        // and the reload is the copy the pass removes.
+        let plain = asm.replace("#APP\n    testl %ecx, %ecx; jnz .LBB1\n#NO_APP\n", "");
+        let result = peephole_optimize(plain);
+        assert!(
+            !result.contains("movl -12(%ebp), %eax"),
+            "a label nobody jumps to must not block the forward:\n{result}"
+        );
+    }
+
+    #[test]
+    fn a_register_read_only_at_an_asm_goto_label_is_live_in_the_loop() {
+        // `for (;;) { t = g(i); asm goto(out); s = t; i++; } out: return s;`
+        // ahead of this pass (-m32 -O1).  %esi is read at `.LBB5` only, and
+        // the only way there is the asm goto: with that edge unseen, %esi was
+        // dead in the loop and `movl %ebp, %esi` -- with the copy feeding it
+        // -- was deleted, so the function returned the 7 it started with.
+        let asm = concat!(
+            "endless:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    pushl %edi\n",
+            "    pushl %ebp\n",
+            "    subl $12, %esp\n",
+            "    movl 32(%esp), %eax\n",
+            "    movl %eax, %ebx\n",
+            "    movl $7, %esi\n",
+            "    xorl %edi, %edi\n",
+            ".LBB2:\n",
+            ".LBB3:\n",
+            "    subl $16, %esp\n",
+            "    movl %edi, %eax\n",
+            "    movl %eax, 0(%esp)\n",
+            "    call g\n",
+            "    addl $16, %esp\n",
+            "    movl %eax, %ebp\n",
+            "    cmpl %ebx, %edi\n",
+            "    sete %al\n",
+            "    movzbl %al, %eax\n",
+            "    movl %eax, 8(%esp)\n",
+            "    movl 8(%esp), %ecx\n",
+            "#APP\n",
+            "    testl %ecx, %ecx; jnz .LBB5\n",
+            "#NO_APP\n",
+            ".LBB4:\n",
+            "    addl $1, %edi\n",
+            "    movl %ebp, %esi\n",
+            "    jmp .LBB2\n",
+            ".LBB5:\n",
+            "    movl %esi, %eax\n",
+            "    addl $12, %esp\n",
+            "    popl %ebp\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size endless, .-endless\n",
+        );
+        for region in [
+            "    testl %ecx, %ecx; jnz .LBB5\n",
+            "    testl %ecx, %ecx\n    .byte 0x0f, 0x85\n    .long .LBB5 - . - 4\n",
+        ] {
+            let text = asm.replace("    testl %ecx, %ecx; jnz .LBB5\n", region);
+            let result = peephole_optimize(text);
+            assert!(
+                result.contains("movl %ebp, %esi") && result.contains("movl %eax, %ebp"),
+                "the value carried to the asm goto's label must be kept:\n{result}"
+            );
+        }
     }
 
     #[test]

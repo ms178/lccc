@@ -18,6 +18,11 @@
 #     forwarder, the address-taken-local forwarder, and the dynamic-alloca
 #     user — each must keep `call` + `ret`;
 #   * the kill switch (CCC_NO_SIBCALL=1 restores `call` + `ret` everywhere);
+#   * the user-facing option: `-fno-optimize-sibling-calls` must withdraw the
+#     same conversion (and be *recognised*, not tolerated with a warning),
+#     must agree with the kill switch byte for byte, must leave runtime
+#     results unchanged, and `-foptimize-sibling-calls` must restore the
+#     default with GCC's last-spelling-wins ordering;
 #   * runtime parity: every positive shape, run with the conversion on and
 #     off, must produce identical output (the conversion may not change a
 #     single observable result);
@@ -116,6 +121,67 @@ for fn in dmin2 iw vfwd icall; do
     has "$b" '^[[:space:]]*ret$' || { echo "$fn (control): kill switch lost the ret"; exit 1; }
 done
 
+# --- The user-facing option: -fno-optimize-sibling-calls -------------------
+# GCC converts a returned-verbatim call into a tail jump at -O2+ and this is
+# the spelling that withdraws it. The Linux kernel passes it in every
+# translation unit, because a tail jump reuses the caller's frame and thereby
+# breaks frame-pointer unwinding (UNWINDER_FRAME_POINTER=y), ftrace
+# function-graph and objtool's ORC/CFI checks. Accepting the spelling while
+# emitting the tail jump anyway is not a compatibility no-op, it is a defect:
+# so the option must withdraw exactly what the kill switch withdraws, must be
+# recognised (no tolerated-option warning), and its positive spelling must
+# restore the default with GCC's last-one-wins ordering.
+"$CCC" -O2 -fno-optimize-sibling-calls -S "$tmp/shapes.c" -o "$tmp/shapes_opt.s" \
+    2>"$tmp/opt.err" || { echo "-fno-optimize-sibling-calls: compile failed" >&2; cat "$tmp/opt.err" >&2; exit 1; }
+if grep -q 'sibling-calls' "$tmp/opt.err"; then
+    echo "-fno-optimize-sibling-calls is not a recognised option:" >&2
+    cat "$tmp/opt.err" >&2
+    exit 1
+fi
+for fn in dmin2 dmax2 iw vfwd icall; do
+    b=$(body "$tmp/shapes_opt.s" "$fn")
+    has "$b" '^[[:space:]]*call ' || { echo "$fn (option): -fno-optimize-sibling-calls lost the call"; echo "$b" >&2; exit 1; }
+    has "$b" '^[[:space:]]*ret$' || { echo "$fn (option): -fno-optimize-sibling-calls lost the ret"; echo "$b" >&2; exit 1; }
+    lacks "$b" '^[[:space:]]*jmp' || { echo "$fn (option): the tail jump survived -fno-optimize-sibling-calls"; echo "$b" >&2; exit 1; }
+done
+# The option and the kill switch are one withdrawal, not two code paths: they
+# must agree byte for byte, or the driver flag and CCC_NO_SIBCALL have drifted.
+cmp -s "$tmp/shapes_ctl.s" "$tmp/shapes_opt.s" || {
+    echo "-fno-optimize-sibling-calls does not match the CCC_NO_SIBCALL withdrawal" >&2
+    diff -u "$tmp/shapes_ctl.s" "$tmp/shapes_opt.s" >&2
+    exit 1
+}
+# The positive spelling asks for the default lccc already performs, so it must
+# be byte-identical to the baseline; and the last spelling on the command line
+# wins, exactly as in GCC.
+"$CCC" -O2 -foptimize-sibling-calls -S "$tmp/shapes.c" -o "$tmp/shapes_pos.s" 2>/dev/null
+cmp -s "$tmp/shapes.s" "$tmp/shapes_pos.s" || {
+    echo "-foptimize-sibling-calls changed the default conversion" >&2
+    diff -u "$tmp/shapes.s" "$tmp/shapes_pos.s" >&2
+    exit 1
+}
+"$CCC" -O2 -fno-optimize-sibling-calls -foptimize-sibling-calls -S "$tmp/shapes.c" \
+    -o "$tmp/shapes_laston.s" 2>/dev/null
+cmp -s "$tmp/shapes.s" "$tmp/shapes_laston.s" || {
+    echo "-fno-optimize-sibling-calls -foptimize-sibling-calls: the last spelling must win" >&2
+    exit 1
+}
+"$CCC" -O2 -foptimize-sibling-calls -fno-optimize-sibling-calls -S "$tmp/shapes.c" \
+    -o "$tmp/shapes_lastoff.s" 2>/dev/null
+cmp -s "$tmp/shapes_ctl.s" "$tmp/shapes_lastoff.s" || {
+    echo "-foptimize-sibling-calls -fno-optimize-sibling-calls: the last spelling must win" >&2
+    exit 1
+}
+# The kill switch must stay a kill switch: with the option asking for the
+# conversion ON, CCC_NO_SIBCALL=1 still withdraws it.
+CCC_NO_SIBCALL=1 "$CCC" -O2 -foptimize-sibling-calls -S "$tmp/shapes.c" \
+    -o "$tmp/shapes_envwins.s" 2>/dev/null
+cmp -s "$tmp/shapes_ctl.s" "$tmp/shapes_envwins.s" || {
+    echo "CCC_NO_SIBCALL=1 no longer overrides -foptimize-sibling-calls" >&2
+    exit 1
+}
+echo "PASS: -f[no-]optimize-sibling-calls withdraws and restores the conversion"
+
 # --- Runtime parity: conversion on vs off must be byte-identical, and
 # --- the values must be right (tail results are real results).
 cat > "$tmp/rt.c" <<'C'
@@ -143,10 +209,18 @@ int iw_call(void) { return g6(1, 2, 0, 0, 0, 0); }
 C
 "$CCC" -O2 "$tmp/rt.c" -o "$tmp/rt_on"
 CCC_NO_SIBCALL=1 "$CCC" -O2 "$tmp/rt.c" -o "$tmp/rt_off"
+"$CCC" -O2 -fno-optimize-sibling-calls "$tmp/rt.c" -o "$tmp/rt_opt"
 on=$("$tmp/rt_on")
 off=$("$tmp/rt_off")
+opt=$("$tmp/rt_opt")
 if [ "$on" != "$off" ]; then
     echo "runtime parity broken:"; echo "on : $on"; echo "off: $off"; exit 1
+fi
+# Withdrawing the conversion through the user-facing option must be as
+# unobservable at runtime as through the kill switch: same bytes out.
+if [ "$on" != "$opt" ]; then
+    echo "runtime parity broken for -fno-optimize-sibling-calls:"
+    echo "on  : $on"; echo "opt : $opt"; exit 1
 fi
 case "$on" in
     *"hi"*"1.000000"*"3"*"21"*) ;;
@@ -616,6 +690,16 @@ for target_cc in lccc-i686 lccc-arm lccc-riscv; do
     }
     "$bindir/$target_cc" -O2 -S "$tmp/cross.c" -o "$tmp/$target_cc.on.s"
     CCC_NO_SIBCALL=1 "$bindir/$target_cc" -O2 -S "$tmp/cross.c" -o "$tmp/$target_cc.off.s"
+    "$bindir/$target_cc" -O2 -fno-optimize-sibling-calls -S "$tmp/cross.c" \
+        -o "$tmp/$target_cc.opt.s"
+    # One behaviour, two spellings: the user-facing option must withdraw
+    # exactly what the kill switch withdraws on every target -- including
+    # i686, where the honest answer is that neither changes anything.
+    cmp -s "$tmp/$target_cc.off.s" "$tmp/$target_cc.opt.s" || {
+        echo "$target_cc: -fno-optimize-sibling-calls disagrees with CCC_NO_SIBCALL=1" >&2
+        diff -u "$tmp/$target_cc.off.s" "$tmp/$target_cc.opt.s" >&2
+        exit 1
+    }
     case $target_cc in
         lccc-i686)
             cmp -s "$tmp/$target_cc.on.s" "$tmp/$target_cc.off.s" || {

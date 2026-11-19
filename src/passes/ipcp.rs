@@ -622,6 +622,19 @@ fn find_constant_return_functions(module: &IrModule) -> FxHashMap<String, IrCons
             continue;
         }
 
+        // "The same constant on every return" is the value of the call only
+        // if the call returns.  Replacing the call deletes it, and with it the
+        // trap or the wait that was its purpose:
+        //
+        //   static int check(unsigned i, unsigned n)
+        //   { if (i >= n) __builtin_trap(); return 0; }
+        //
+        // was folded to 0 at every call site, bounds check and all (GCC 16.2
+        // and Clang 23.1.5 trap).
+        if !super::ip_purity::body_always_returns(func) {
+            continue;
+        }
+
         // Collect all return values across all blocks
         let mut return_const: Option<IrConst> = None;
         let mut all_same = true;
@@ -756,6 +769,7 @@ fn const_equal(a: &IrConst, b: &IrConst) -> bool {
 /// - It is defined (not a declaration)
 /// - It is not weak (could be overridden)
 /// - It is side-effect-free (no stores, calls, inline asm, etc.)
+/// - It always returns (no trap, no loop)
 /// - It returns void (no return value to propagate)
 ///
 /// Calls to such functions are dead: they do nothing observable and produce
@@ -774,6 +788,13 @@ fn find_dead_call_functions(module: &IrModule) -> FxHashSet<String> {
         }
         // Must be side-effect-free
         if !is_side_effect_free(func) {
+            continue;
+        }
+        // A call that may not come back does something observable without
+        // touching memory: `static void park(int stop) { if (stop) for (;;)
+        // {} }` is not an empty stub.  The terminator test below rejects a
+        // trap; this rejects the loop that does not end as well.
+        if !super::ip_purity::body_always_returns(func) {
             continue;
         }
         // All terminators must be compatible with dead call elimination.
@@ -1263,5 +1284,110 @@ mod caller_exposure_tests {
                 "exposure {index}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod may_not_return_tests {
+    //! A call is folded away only if it comes back: a trap and a loop
+    //! without end are what some functions are *for*.
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrFunction, Value};
+
+    fn block(id: u32, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(id),
+            instructions: vec![],
+            terminator,
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        }
+    }
+
+    fn either(on_true: u32, on_false: u32) -> Terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(Value(0)),
+            true_label: BlockId(on_true),
+            false_label: BlockId(on_false),
+        }
+    }
+
+    /// Whether the call to a `ty` function made of `blocks` survives the pass.
+    fn call_survives(ty: IrType, blocks: Vec<BasicBlock>) -> bool {
+        let mut callee = IrFunction::new("callee".into(), ty, vec![], false);
+        callee.is_static = true;
+        callee.blocks = blocks;
+        let mut caller = IrFunction::new("caller".into(), IrType::I32, vec![], false);
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Call {
+                func: "callee".into(),
+                info: CallInfo {
+                    dest: Some(Value(1)),
+                    return_type: ty,
+                    ..CallInfo::default()
+                },
+            }],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        let mut module = IrModule::new();
+        module.functions = vec![callee, caller];
+        run(&mut module);
+        module.functions[1].blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Call { .. }))
+    }
+
+    fn zero() -> Terminator {
+        Terminator::Return(Some(Operand::Const(IrConst::I32(0))))
+    }
+
+    /// The control: a stub that only returns is what the pass exists to fold.
+    #[test]
+    fn a_stub_that_returns_is_folded() {
+        assert!(!call_survives(
+            IrType::Void,
+            vec![block(0, Terminator::Return(None))]
+        ));
+        assert!(!call_survives(IrType::I32, vec![block(0, zero())]));
+        let either_way = vec![block(0, either(1, 2)), block(1, zero()), block(2, zero())];
+        assert!(!call_survives(IrType::I32, either_way));
+    }
+
+    /// `if (i >= n) __builtin_trap(); return 0;` returns 0 on every return,
+    /// and is not the constant 0.
+    #[test]
+    fn a_constant_return_behind_a_trap_is_not_the_value_of_the_call() {
+        let check = vec![
+            block(0, either(1, 2)),
+            block(1, Terminator::Unreachable),
+            block(2, zero()),
+        ];
+        assert!(call_survives(IrType::I32, check));
+    }
+
+    /// `if (stop) for (;;) {} return 0;` likewise, and its void twin is not
+    /// an empty stub.
+    #[test]
+    fn a_function_that_may_park_keeps_its_call() {
+        let park = |ret: Terminator| {
+            vec![
+                block(0, either(1, 2)),
+                block(1, Terminator::Branch(BlockId(1))),
+                block(2, ret),
+            ]
+        };
+        assert!(call_survives(IrType::I32, park(zero())));
+        assert!(call_survives(IrType::Void, park(Terminator::Return(None))));
+        // A loop with an exit is not provably finite either.
+        let waits = vec![
+            block(0, Terminator::Branch(BlockId(1))),
+            block(1, either(1, 2)),
+            block(2, Terminator::Return(None)),
+        ];
+        assert!(call_survives(IrType::Void, waits));
     }
 }

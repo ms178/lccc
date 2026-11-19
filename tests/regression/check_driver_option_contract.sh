@@ -350,8 +350,11 @@ done
 # Per-name `-fno-builtin-<fn>` IS supported, with GCC's stickiness: the
 # per-name withdrawal survives a later blanket `-fbuiltin`.  Verify the
 # withdrawal is real (ordinary strlen stays a call) and scoped (the explicit
-# __builtin_strlen spelling still folds).
+# __builtin_strlen spelling still folds). GCC 16.2 rejects a withdrawn,
+# undeclared strlen in its default language mode, so supply a prototype:
+# this witness measures the fold, not implicit-declaration diagnostics.
 cat > "$td/pername.c" <<'CEOF'
+extern __SIZE_TYPE__ strlen(const char *);
 unsigned long per_name_withdrawn(void) {
     char buffer[strlen("abcdefghijkl")];
     return sizeof(buffer);

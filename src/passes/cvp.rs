@@ -30,7 +30,8 @@
 //! Edge facts come from `CondBranch` on a `Cmp value-vs-constant` (and from
 //! the boolean condition value itself, so a re-branch on the same `_Bool`
 //! folds) and from `Switch` (`val == case` on a case edge, `val != every
-//! case` on the default edge).
+//! case` on the default edge). An asm-goto edge carries no terminator facts,
+//! even when it reaches the same label as a conditional branch or switch.
 //!
 //! A fact holds in block `S` when **every** predecessor edge of `S` carries
 //! it (single-predecessor blocks are the common special case; the per-edge
@@ -58,6 +59,9 @@
 //!   only enlarge dominance, so facts computed before the edit stay valid
 //!   for the rest of the walk; `cfg_simplify` later deletes unreachable
 //!   blocks.
+//! * `Switch` cases excluded by facts about the selector itself are removed.
+//!   Phi incomings survive as long as another case, the default, or asm goto
+//!   can still reach the same target from the switch's block.
 //!
 //! The pass never invents values, never widens a type, and is idempotent.
 //! Pass name for `CCC_DISABLE_PASSES`: `"cvp"`.
@@ -664,10 +668,14 @@ fn edge_facts(
     func: &IrFunction,
     defs: &FxHashMap<Value, (usize, usize)>,
     copies: &FxHashMap<Value, Operand>,
+    asm_edges: &FxHashSet<(usize, BlockId)>,
     from: usize,
     to_label: BlockId,
 ) -> Vec<Fact> {
     let mut out = Vec::new();
+    if asm_edges.contains(&(from, to_label)) {
+        return out;
+    }
     match &func.blocks[from].terminator {
         Terminator::CondBranch {
             cond: Operand::Value(cv),
@@ -793,6 +801,7 @@ fn block_entry_facts(
     func: &IrFunction,
     defs: &FxHashMap<Value, (usize, usize)>,
     copies: &FxHashMap<Value, Operand>,
+    asm_edges: &FxHashSet<(usize, BlockId)>,
     preds: &[u32],
     blk: usize,
 ) -> Vec<Fact> {
@@ -802,7 +811,7 @@ fn block_entry_facts(
     let label = func.blocks[blk].label;
     let mut acc: Option<Vec<Fact>> = None;
     for &p in preds {
-        let ef = edge_facts(func, defs, copies, p as usize, label);
+        let ef = edge_facts(func, defs, copies, asm_edges, p as usize, label);
         acc = Some(match acc {
             None => ef,
             Some(prev) => {
@@ -1117,6 +1126,49 @@ fn substitute_singletons(
     n
 }
 
+/// Prune excluded case values and report explicit successors that went away.
+/// Only facts of the switch's selector and width are relevant; a separate
+/// reload or a narrowed copy may have a different value.
+fn prune_switch_cases(term: &mut Terminator, stack: &[Fact]) -> Option<FxHashSet<BlockId>> {
+    let Terminator::Switch {
+        val: Operand::Value(selector),
+        cases,
+        default,
+        ty,
+    } = term
+    else {
+        return None;
+    };
+    let bits = bits_of(*ty)?;
+    let known = known_set(stack, *selector, bits)?;
+    if known.is_empty() {
+        return None;
+    }
+    let mut dropped = FxHashSet::default();
+    let before = cases.len();
+    cases.retain(|&(value, target)| {
+        let u = to_unsigned(i128::from(value), bits);
+        let next = known.partition_point(|&(_, hi)| hi < u);
+        if known.get(next).is_some_and(|&(lo, _)| lo <= u) {
+            true
+        } else {
+            dropped.insert(target);
+            false
+        }
+    });
+    if cases.len() == before {
+        return None;
+    }
+    dropped.remove(default);
+    for (_, target) in cases.iter() {
+        dropped.remove(target);
+    }
+    if cases.is_empty() {
+        *term = Terminator::Branch(*default);
+    }
+    Some(dropped)
+}
+
 /// Remove `pred_label` from the phi incomings of block `target`.
 fn remove_phi_incoming(func: &mut IrFunction, target: usize, pred_label: BlockId) {
     for inst in &mut func.blocks[target].instructions {
@@ -1232,6 +1284,61 @@ fn promote_guarded_counts(func: &mut IrFunction) -> usize {
     promoted.len()
 }
 
+/// Fold the terminator of `blk` under the active facts: a decided conditional
+/// branch becomes unconditional, and a switch loses the cases its selector
+/// cannot take. Returns the number of terminators changed (0 or 1).
+///
+/// Both folds delete CFG edges, so both obey one rule for the phi inputs those
+/// edges carried: an input stays when an `asm goto` in the same block still
+/// jumps to that successor. That jump is taken inside the asm, before the
+/// terminator is reached, whatever the terminator has been folded to.
+fn fold_terminator(
+    func: &mut IrFunction,
+    blk: usize,
+    stack: &[Fact],
+    defs: &FxHashMap<Value, (usize, usize)>,
+    defined_syms: &FxHashSet<String>,
+    asm_edges: &FxHashSet<(usize, BlockId)>,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> usize {
+    let this_label = func.blocks[blk].label;
+    let drop_edge = |func: &mut IrFunction, target: BlockId| {
+        if !asm_edges.contains(&(blk, target))
+            && let Some(&di) = label_to_idx.get(&target)
+        {
+            remove_phi_incoming(func, di, this_label);
+        }
+    };
+    let decided = match &func.blocks[blk].terminator {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } if true_label != false_label => {
+            decide_bool(stack, func, defs, defined_syms, cond).map(|t| {
+                if t {
+                    (*true_label, *false_label)
+                } else {
+                    (*false_label, *true_label)
+                }
+            })
+        }
+        _ => None,
+    };
+    if let Some((keep, drop)) = decided {
+        func.blocks[blk].terminator = Terminator::Branch(keep);
+        drop_edge(func, drop);
+        1
+    } else if let Some(dropped) = prune_switch_cases(&mut func.blocks[blk].terminator, stack) {
+        for target in dropped {
+            drop_edge(func, target);
+        }
+        1
+    } else {
+        0
+    }
+}
+
 pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet<String>) -> usize {
     // Straight-line functions have no predicates to propagate, but the
     // definition-based zero-guard proof below needs no CFG at all: run it first
@@ -1254,6 +1361,7 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
     // (correlated-select use rewriting).  Both keyed by SSA dest (unique).
     let mut copies: FxHashMap<Value, Operand> = FxHashMap::default();
     let mut selects: FxHashMap<Value, (Operand, Operand, Operand)> = FxHashMap::default();
+    let mut asm_edges: FxHashSet<(usize, BlockId)> = FxHashSet::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         for (ii, inst) in b.instructions.iter().enumerate() {
             // `defs` covers EVERY value definition, not just compares: the
@@ -1285,6 +1393,9 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
                 } => {
                     casts.insert(*dest, (*src, *from_ty, *to_ty));
                 }
+                Instruction::InlineAsm { goto_labels, .. } => {
+                    asm_edges.extend(goto_labels.iter().map(|(_, label)| (bi, *label)));
+                }
                 _ => {}
             }
         }
@@ -1292,7 +1403,7 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
 
     // Entry facts per block, computed on the pristine CFG.
     let entry_facts: Vec<Vec<Fact>> = (0..n)
-        .map(|b| block_entry_facts(func, &defs, &copies, preds.row(b), b))
+        .map(|b| block_entry_facts(func, &defs, &copies, &asm_edges, preds.row(b), b))
         .collect();
 
     let mut stack: Vec<Fact> = entry_facts[0].clone();
@@ -1470,30 +1581,15 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
                 }
                 i += 1;
             }
-            let decided = match &func.blocks[blk].terminator {
-                Terminator::CondBranch {
-                    cond,
-                    true_label,
-                    false_label,
-                } if true_label != false_label => {
-                    decide_bool(&stack, func, &defs, defined_syms, cond).map(|t| {
-                        if t {
-                            (*true_label, *false_label)
-                        } else {
-                            (*false_label, *true_label)
-                        }
-                    })
-                }
-                _ => None,
-            };
-            if let Some((keep, drop)) = decided {
-                let this_label = func.blocks[blk].label;
-                if let Some(&di) = label_to_idx.get(&drop) {
-                    remove_phi_incoming(func, di, this_label);
-                }
-                func.blocks[blk].terminator = Terminator::Branch(keep);
-                changes += 1;
-            }
+            changes += fold_terminator(
+                func,
+                blk,
+                &stack,
+                &defs,
+                defined_syms,
+                &asm_edges,
+                &label_to_idx,
+            );
             // Singleton substitution (see `substitute_singletons`) runs LAST:
             // the folds above decide compares, selects and branches from
             // `Value` operands, and a compare whose operand had already been
@@ -3158,6 +3254,116 @@ mod tests {
         } else {
             panic!("phi expected");
         }
+    }
+
+    #[test]
+    fn switch_prunes_only_excluded_cases_of_the_same_value_and_width() {
+        let selector = Value(0);
+        let facts = [Fact {
+            value: selector,
+            bits: 32,
+            set: vec![(0x8000_0000, 0xffff_ffff)],
+        }];
+        let switch = |val, ty| Terminator::Switch {
+            val: Operand::Value(val),
+            cases: vec![
+                (-1, BlockId(3)),
+                (0, BlockId(3)),
+                (1, BlockId(4)),
+                (2, BlockId(5)),
+            ],
+            default: BlockId(5),
+            ty,
+        };
+        assert!(prune_switch_cases(&mut switch(Value(1), IrType::I32), &facts).is_none());
+        assert!(prune_switch_cases(&mut switch(selector, IrType::I64), &facts).is_none());
+        let mut term = switch(selector, IrType::I32);
+        assert_eq!(
+            prune_switch_cases(&mut term, &facts),
+            Some([BlockId(4)].into_iter().collect())
+        );
+        assert!(
+            matches!(&term, Terminator::Switch { cases, default: BlockId(5), .. }
+            if cases == &[(-1, BlockId(3))])
+        );
+        assert!(prune_switch_cases(&mut term, &facts).is_none());
+    }
+
+    #[test]
+    fn switch_prunes_case_but_keeps_the_shared_asm_goto_phi_input() {
+        let v = Operand::Value(Value(0));
+        let ret = || Terminator::Return(Some(v));
+        let phi = || Instruction::Phi {
+            dest: Value(2),
+            ty: IrType::I32,
+            incoming: vec![(Operand::Const(IrConst::I32(7)), BlockId(1))],
+        };
+        let switch = Terminator::Switch {
+            val: v,
+            cases: vec![(0, BlockId(3)), (1, BlockId(4))],
+            default: BlockId(2),
+            ty: IrType::I32,
+        };
+        let mut f = IrFunction::new("case_edges".into(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Slt,
+                    lhs: v,
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![Instruction::InlineAsm {
+                    template: "jmp %l[case]".into(),
+                    outputs: vec![],
+                    inputs: vec![],
+                    clobbers: vec![],
+                    operand_types: vec![],
+                    goto_labels: vec![("case".into(), BlockId(3))],
+                    input_symbols: vec![],
+                    seg_overrides: vec![],
+                }],
+                switch,
+            ),
+            mk(2, vec![], ret()),
+            mk(
+                3,
+                vec![phi()],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+            mk(
+                4,
+                vec![Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::I32,
+                    incoming: vec![(Operand::Const(IrConst::I32(8)), BlockId(1))],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        assert!(run_function_with_symbols(&mut f, &bench_syms()) > 0);
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+        assert!(
+            matches!(&f.blocks[3].instructions[0], Instruction::Phi { incoming, .. }
+            if incoming.as_slice() == [(Operand::Const(IrConst::I32(7)), BlockId(1))])
+        );
+        assert!(
+            matches!(&f.blocks[4].instructions[0], Instruction::Phi { incoming, .. }
+            if incoming.is_empty())
+        );
     }
 
     #[test]

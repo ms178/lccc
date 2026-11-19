@@ -29,6 +29,15 @@ seed_products() {
   : > "$K/arch/x86/boot/compressed/vmlinux.bin"
   : > "$K/arch/x86/boot/bzImage"
   : > "$K/vmlinux"
+  # Link products in the compressed directory, plus the CHECKED-IN source that
+  # shares their `vmlinux*` prefix. A bare glob purge deletes the source too,
+  # and the loss does not fail there: it fails the NEXT build with
+  #   No rule to make target 'arch/x86/boot/compressed/vmlinux.lds'
+  # after every translation unit has already been rebuilt.
+  : > "$K/arch/x86/boot/compressed/vmlinux"
+  : > "$K/arch/x86/boot/compressed/vmlinux.lds"
+  printf '/* checked-in linker-script source, not a product */\n' \
+      > "$K/arch/x86/boot/compressed/vmlinux.lds.S"
 }
 
 # First observation establishes identity and must preserve existing products.
@@ -61,6 +70,12 @@ printf linker-v2 > "$T/lccc-ld"
 [[ ! -e $K/vmlinux && ! -e $K/arch/x86/boot/bzImage ]]
 [[ ! -e $K/arch/x86/entry/vdso/vdso64.so.dbg ]]
 [[ ! -e $K/arch/x86/boot/compressed/vmlinux.bin ]]
+[[ ! -e $K/arch/x86/boot/compressed/vmlinux ]]
+[[ ! -e $K/arch/x86/boot/compressed/vmlinux.lds ]]
+# The purge is product-only. The checked-in linker-script source shares the
+# `vmlinux*` prefix and must survive it, or the next build has no rule to
+# regenerate `vmlinux.lds` from.
+[[ -f $K/arch/x86/boot/compressed/vmlinux.lds.S ]]
 [[ ! -e $T/make.log ]]
 
 # Compiler-only change invokes the authoritative clean, not the weaker linker

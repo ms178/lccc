@@ -752,6 +752,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
@@ -1042,6 +1043,33 @@ impl Lowerer {
         }
     }
 
+    fn register_definition_signature(&mut self, func: &FunctionDef) {
+        if func.attrs.is_pure() {
+            self.pure_functions.insert(func.name.clone());
+        }
+        if func.attrs.is_const_attr() {
+            self.const_functions.insert(func.name.clone());
+        }
+        // Keep definition-only noreturn alongside declarations before
+        // lowering any caller, even a caller earlier in the TU.
+        if func.attrs.is_noreturn() {
+            self.noreturn_functions.insert(func.name.clone());
+        }
+        self.register_function_meta(
+            &func.name,
+            &func.return_type,
+            0,
+            &func.params,
+            func.variadic,
+            func.attrs.is_static(),
+            func.is_kr,
+        );
+        // GNU C nested functions: register their signatures under
+        // the parent-mangled name (recursively for deeper nesting)
+        // so call sites find ABI metadata during lowering.
+        self.register_nested_function_metas(&func.name, &func.body);
+    }
+
     pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine, TypeContext) {
         // Sema has already populated TypeContext with typedefs, enum constants,
         // struct/union layouts, function typedefs, and function pointer typedefs.
@@ -1100,25 +1128,7 @@ impl Lowerer {
         // insert proper casts/ABI handling during lowering.
         for decl in &tu.decls {
             if let ExternalDecl::FunctionDef(func) = decl {
-                if func.attrs.is_pure() {
-                    self.pure_functions.insert(func.name.clone());
-                }
-                if func.attrs.is_const_attr() {
-                    self.const_functions.insert(func.name.clone());
-                }
-                self.register_function_meta(
-                    &func.name,
-                    &func.return_type,
-                    0,
-                    &func.params,
-                    func.variadic,
-                    func.attrs.is_static(),
-                    func.is_kr,
-                );
-                // GNU C nested functions: register their signatures under
-                // the parent-mangled name (recursively for deeper nesting)
-                // so call sites find ABI metadata during lowering.
-                self.register_nested_function_metas(&func.name, &func.body);
+                self.register_definition_signature(func);
             }
             if let ExternalDecl::Declaration(decl) = decl {
                 for declarator in &decl.declarators {
@@ -2680,6 +2690,7 @@ impl Lowerer {
                     is_const: false,
                     assume_library: false,
                     is_pure: false,
+                    memory: Default::default(),
                     cold: false,
                 },
             });
@@ -2732,6 +2743,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 assume_library: false,
                 ret_eightbyte_classes: ret_classes,
                 ret_is_f128_sse: ret_is_f128,
@@ -3207,6 +3219,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // Compiler-generated aggregate copy/clear: GCC's freestanding contract requires memcpy/memset to exist with library semantics.
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
@@ -3251,6 +3264,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // Compiler-generated aggregate copy/clear: GCC's freestanding contract requires memcpy/memset to exist with library semantics.
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
@@ -3291,6 +3305,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,

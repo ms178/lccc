@@ -5,10 +5,18 @@
  * The defect this pins: the lowerer's `is_func_ptr_variable` exempted file-scope
  * objects that also appeared in `known_functions`, and sema's constant-expression
  * path had no shadow test at all. `known_functions` holds every function name
- * sema reported -- including the implicit library prototypes that
- * `declare_implicit_functions` pre-declares -- so EVERY file-scope pointer object
+ * sema reported, and at the time it held these five unconditionally: sema
+ * pre-declared a table of common libc names (`strlen`, `memcpy`, `malloc`,
+ * `printf`, ...) in every translation unit, so EVERY file-scope pointer object
  * named after a library function was exempted, i.e. the veto swallowed exactly
- * the case it existed for. Three symptoms, all measured against gcc 14.2:
+ * the case it existed for. That pre-declaration table has since been removed --
+ * it made those 23 names unprototyped declarations, which silently disabled all
+ * argument checking for them (`memcpy(d, s)` compiled and then segfaulted where
+ * gcc-16 and clang 23.1.5 both refuse the TU) -- and `is_func_ptr_variable` no
+ * longer consults `known_functions` at all. This file therefore pins the surviving
+ * invariant directly: a file-scope object of a library name is called indirectly,
+ * whatever else sema knows about that name. Three symptoms, all measured against
+ * gcc 14.2:
  *
  *   - in an array bound `char vla[strlen("abc") == 103 ? 1 : -1]`, sema folded
  *     `strlen("abc")` to 3 and rejected the TU with `size of array is negative`

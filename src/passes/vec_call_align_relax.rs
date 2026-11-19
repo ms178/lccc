@@ -388,6 +388,7 @@ mod tests {
             regparm: None,
             is_pure: false,
             is_const: false,
+            memory: Default::default(),
             ret_eightbyte_classes: Vec::new(),
             assume_library: false,
             cold: false,

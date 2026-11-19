@@ -16,6 +16,43 @@ use crate::frontend::parser::ast::{
 use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
 
 impl Lowerer {
+    /// A bare function typedef declares a function (`fn_t f;`). Any added
+    /// declarator (such as `*p`) or an initializer declares an object instead.
+    fn block_function_typedef(
+        &self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) -> Option<&crate::frontend::sema::type_context::FunctionTypedefInfo> {
+        if !declarator.derived.is_empty() || declarator.init.is_some() {
+            return None;
+        }
+        match &decl.type_spec {
+            TypeSpecifier::TypedefName(name) => self.types.function_typedefs.get(name),
+            _ => None,
+        }
+    }
+
+    /// `typeof` of a function designator redeclaring that function:
+    /// `extern typeof(f) f;`, the shape of the kernel's `symbol_get()`.
+    ///
+    /// The operand's type decides, not the name: `int f = 1; { typeof(f) f; }`
+    /// declares another `int` even when a function `f` exists at file scope,
+    /// so this must be asked while the enclosing local is still visible.
+    fn block_typeof_redeclares_function(
+        &self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) -> bool {
+        declarator.derived.is_empty()
+            && declarator.init.is_none()
+            && matches!(
+                &decl.type_spec,
+                TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(..)
+            )
+            && self.known_functions.contains(&declarator.name)
+            && matches!(self.type_spec_to_ctype(&decl.type_spec), CType::Function(_))
+    }
+
     /// Handle extern declarations inside function bodies.
     /// They reference a global symbol, not a local variable.
     pub(super) fn lower_extern_decl(
@@ -24,6 +61,14 @@ impl Lowerer {
         declarator: &InitDeclarator,
         inherited_volatile: bool,
     ) -> bool {
+        // A function need not be spelled with a function declarator: a bare
+        // function typedef (`extern fn_t f;`) and `typeof` of a function
+        // (`extern typeof(f) f;`) declare one too. Registering either as an
+        // object made a call through it load the first bytes of the function's
+        // machine code and jump to them (SIGSEGV; GCC calls the function).
+        let declares_function = DerivedDeclarator::declares_function(&declarator.derived)
+            || self.block_function_typedef(decl, declarator).is_some()
+            || self.block_typeof_redeclares_function(decl, declarator);
         // Remove from locals, but track in scope frame so pop_scope()
         // restores the local when this block exits.
         self.shadow_local_for_scope(&declarator.name);
@@ -34,8 +79,7 @@ impl Lowerer {
         // Propagate __attribute__((weak)) / visibility from ANY block-scope
         // extern declaration — including `extern typeof(f) f
         // __attribute__((weak, visibility("hidden")))`, where typeof supplies
-        // the function type and `derived` is empty so the function-declaration
-        // handler below never sees it. The kernel's !CONFIG_MODULES
+        // the type and `derived` is empty. The kernel's !CONFIG_MODULES
         // symbol_get() expands to exactly that shape (module.h:835); dropping
         // the attributes left ips_link_to_i915_driver a STB_GLOBAL undef and
         // the vmlinux link failed instead of resolving it to NULL.
@@ -49,9 +93,7 @@ impl Lowerer {
             ));
         }
 
-        // Check if this is a function declaration (extern int f(int))
-        let is_func_decl = DerivedDeclarator::declares_function(&declarator.derived);
-        if is_func_decl {
+        if declares_function {
             return false; // Fall through to the function declaration handler
         }
 
@@ -129,103 +171,71 @@ impl Lowerer {
                 variadic,
             );
             self.shadow_local_for_scope(&declarator.name);
-            // Propagate __attribute__((error("..."))) and __attribute__((noreturn)) / _Noreturn
-            // from block-scope function declarations. Without this, the kernel's BUILD_BUG_ON
-            // macro (which uses block-scope `extern void __compiletime_assert_NNN(void)
-            // __attribute__((error(...)))`) would emit real calls to undefined symbols
-            // instead of replacing them with Unreachable.
-            // Same scoping law as the signature table above: these sets are
-            // keyed by symbol, so an `auto` declaration must not attach its
-            // attributes to the file-scope entity of the same basename -- an
-            // `error` would reject a legal call elsewhere in the TU, and a
-            // `noreturn` would let code after an unrelated call be dropped as
-            // unreachable. When the entity is a nested one (mangled key
-            // available) the fact is recorded there; when it is a nested
-            // prototype with no definition in this TU, nothing can call it, so
-            // the fact has no carrier and is dropped.
-            let attr_key =
-                self.block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
-            let attr_key = attr_key.filter(|_| !declarator.name.is_empty());
-            if declarator.attrs.is_error_attr() {
-                if let Some(k) = &attr_key {
-                    self.error_functions.insert(k.clone());
-                }
-            }
-            if declarator.attrs.is_noreturn() {
-                if let Some(k) = &attr_key {
-                    self.noreturn_functions.insert(k.clone());
-                }
-            }
-            if declarator.attrs.is_pure() {
-                if let Some(k) = &attr_key {
-                    self.pure_functions.insert(k.clone());
-                }
-            }
-            if declarator.attrs.is_const_attr() {
-                if let Some(k) = &attr_key {
-                    self.const_functions.insert(k.clone());
-                }
-            }
-            // Propagate __attribute__((weak)) and __attribute__((visibility(...)))
-            // from block-scope extern function declarations.
-            // `weak`/`visibility` are properties of the *linker symbol*: a
-            // nested function is not the file-scope symbol of that basename, so
-            // an `auto` declaration must not retag it. The nested definition
-            // carries its own attributes for its own symbol.
-            if !declarator.attrs.is_nested_fn()
-                && !declarator.name.is_empty()
-                && (declarator.attrs.is_weak() || declarator.attrs.visibility.is_some())
-            {
-                self.module.symbol_attrs.push((
-                    declarator.name.clone(),
-                    declarator.attrs.is_weak(),
-                    declarator.attrs.visibility.clone(),
-                ));
-            }
+            self.register_block_func_attrs(declarator, entity.as_deref());
             return true;
         }
 
         // Also handle typedef-based function declarations in block scope
         // (e.g., `func_t add;` where func_t is `typedef int func_t(int);`)
-        if declarator.derived.is_empty() && declarator.init.is_none() {
-            if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
-                if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
-                    let entity = self
-                        .block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
-                    self.register_block_func_meta(
-                        entity.as_deref(),
-                        &declarator.name,
-                        &fti.return_type,
-                        0,
-                        &fti.params,
-                        fti.variadic,
-                    );
-                    self.shadow_local_for_scope(&declarator.name);
-                    if declarator.attrs.is_error_attr() && !declarator.name.is_empty() {
-                        self.error_functions.insert(declarator.name.clone());
-                    }
-                    if declarator.attrs.is_noreturn() && !declarator.name.is_empty() {
-                        self.noreturn_functions.insert(declarator.name.clone());
-                    }
-                    if declarator.attrs.is_weak() || declarator.attrs.visibility.is_some() {
-                        self.module.symbol_attrs.push((
-                            declarator.name.clone(),
-                            declarator.attrs.is_weak(),
-                            declarator.attrs.visibility.clone(),
-                        ));
-                    }
-                    return true;
-                }
-            }
+        if let Some(fti) = self.block_function_typedef(decl, declarator).cloned() {
+            let entity =
+                self.block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
+            self.register_block_func_meta(
+                entity.as_deref(),
+                &declarator.name,
+                &fti.return_type,
+                0,
+                &fti.params,
+                fti.variadic,
+            );
+            self.shadow_local_for_scope(&declarator.name);
+            self.register_block_func_attrs(declarator, entity.as_deref());
+            return true;
+        }
+
+        // `typeof(f) f;` names the function already declared: its signature
+        // is the visible one, so only the attributes can be new.
+        if self.block_typeof_redeclares_function(decl, declarator) {
+            let entity =
+                self.block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
+            self.shadow_local_for_scope(&declarator.name);
+            self.register_block_func_attrs(declarator, entity.as_deref());
+            return true;
         }
 
         false
     }
 
-    /// Register function metadata for a block-scope function declaration.
-    /// Must compute the same ABI metadata as `register_function_meta` so that
-    /// member access on struct return values (e.g., `stfunc1().field`) works
-    /// correctly even when the function is only forward-declared at block scope.
+    /// Record declaration attributes under the same key as the signature,
+    /// whether the function type came from a declarator or a typedef.
+    fn register_block_func_attrs(&mut self, declarator: &InitDeclarator, entity: Option<&str>) {
+        let Some(key) = entity.filter(|_| !declarator.name.is_empty()) else {
+            return;
+        };
+        let attrs = &declarator.attrs;
+        if attrs.is_error_attr() {
+            self.error_functions.insert(key.to_string());
+        }
+        if attrs.is_noreturn() {
+            self.noreturn_functions.insert(key.to_string());
+        }
+        if attrs.is_pure() {
+            self.pure_functions.insert(key.to_string());
+        }
+        if attrs.is_const_attr() {
+            self.const_functions.insert(key.to_string());
+        }
+        // An `auto` declaration names a distinct nested function; it must
+        // not retag the file-scope linker symbol that shares its basename.
+        if !attrs.is_nested_fn() && (attrs.is_weak() || attrs.visibility.is_some()) {
+            self.module.symbol_attrs.push((
+                declarator.name.clone(),
+                attrs.is_weak(),
+                attrs.visibility.clone(),
+            ));
+        }
+    }
+
     /// The symbol under which a block-scope function declaration's module-level
     /// facts (signature, `error`/`noreturn`/`pure`/`const`, weak/visibility) are
     /// recorded -- or `None` when there is no module-level fact to record.
@@ -264,6 +274,8 @@ impl Lowerer {
             .map(|e| e.mangled.clone())
     }
 
+    /// Match `register_function_meta` even for functions only declared at block
+    /// scope: callers need the same ABI facts, e.g. for struct-valued returns.
     fn register_block_func_meta(
         &mut self,
         entity_key: Option<&str>,

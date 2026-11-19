@@ -1278,9 +1278,17 @@ mod flags_horizon_tests {
         // this, "refuse at the horizon" silently becomes "refuse at the end of
         // every small function", which is a missed fold rather than a wrong
         // one -- the kind of defect no correctness oracle can see.
-        let out = run(&f(
-            "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n.Lx:\n    ret",
-        ));
+        //
+        // The fold's witness (`jl .Lx`) is a branch whose target is the very
+        // next label, so Phase 9's `late_branch` pass retires it as the no-op it
+        // is and `out` no longer contains it.  One filler slot between the branch
+        // and the label keeps the fold observable here, and changes nothing this
+        // test measures: the horizon still finds no flag reader, because the
+        // section still ends inside the window.
+        let out = run(&f(&format!(
+            "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n{}.Lx:\n    ret",
+            filler(1)
+        )));
         assert!(
             out.contains("jl .Lx"),
             "the fold was refused although nothing follows the section: {out}"
@@ -1304,9 +1312,13 @@ mod flags_horizon_tests {
 
     #[test]
     fn fuses_bt_setc_movzbl_test_branch() {
-        let out = run(&f(
-            "    btq %rdi, %rsi\n    setc %dl\n    movzbl %dl, %edx\n    testq %rdx, %rdx\n    jne .Lx\n.Lx:\n    ret",
-        ));
+        // `filler(1)` for the same reason as above: the fused `jc .Lx` would
+        // otherwise be a branch onto the next label, which `late_branch` retires,
+        // and the witness of the fold would disappear from `out`.
+        let out = run(&f(&format!(
+            "    btq %rdi, %rsi\n    setc %dl\n    movzbl %dl, %edx\n    testq %rdx, %rdx\n    jne .Lx\n{}.Lx:\n    ret",
+            filler(1)
+        )));
         assert!(
             out.contains("jc .Lx"),
             "btq + setc + movzbl + testq + jne did not fuse: {out}"

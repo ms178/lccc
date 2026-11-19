@@ -8,7 +8,10 @@ if [[ $(uname -s) != Linux ]]; then
     exit 2
 fi
 
-SWAP_SIZE=${LCCC_CI_SWAP_SIZE:-4G}
+# 8G matches scripts/ensure_swap.sh, the repository's one swap policy: the
+# fastbuild test profile was OOM-killed at 4G (see that script for the
+# measurement). Override per job with LCCC_CI_SWAP_SIZE.
+SWAP_SIZE=${LCCC_CI_SWAP_SIZE:-8G}
 SWAP_DIR=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
 SWAP_FILE="$SWAP_DIR/lccc-ci.swap"
 

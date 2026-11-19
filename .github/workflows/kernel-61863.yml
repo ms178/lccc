@@ -1,4 +1,4 @@
-name: CachyMod 6.18.58 LCCC kernel
+name: CachyMod 6.18.63 LCCC kernel
 
 on:
   # The 240-minute full kernel build/boot gate is NOT a per-PR gate by default.
@@ -25,19 +25,22 @@ on:
       - 'scripts/build_lccc_fast.sh'
       - 'scripts/rust_toolchain.sh'
       - 'scripts/ensure_swap.sh'
-      - 'scripts/ci_provision_toolchain.sh'
+      - 'scripts/ci_enable_swap.sh'
       - 'scripts/boot_flags.sh'
       - 'scripts/boot_offsets.sh'
       - 'scripts/kernel_version.sh'
       - 'scripts/kernel_tool_identity.sh'
       - 'scripts/kconfig_query.sh'
       - 'tests/corpus/test_kernel_workflow_paths.py'
-      - '.github/workflows/kernel-61858.yml'
+      - '.github/workflows/kernel-61863.yml'
       - 'scripts/build_kernel_boot.sh'
       - 'scripts/build_kernel_full.sh'
       - 'scripts/prepare_kernel_tree.sh'
       - 'scripts/qemu_defconfig_smoke.sh'
       - 'scripts/qemu_firmware.sh'
+      - 'scripts/ensure_qemu_system.sh'
+      - 'scripts/kernel_objtool_census.sh'
+      - 'tests/corpus/test_kernel_observability.py'
       - 'tests/regression/check_qemu_defconfig_smoke.sh'
   workflow_dispatch:
     inputs:
@@ -58,7 +61,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: kernel-61858-${{ github.ref }}
+  group: kernel-61863-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -95,7 +98,7 @@ jobs:
             apt-get update -qq
             # Name the required firmware provider explicitly, even when
             # qemu-system-common already pulls it in transitively.
-            apt-get -y --no-install-recommends --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file
+            apt-get -y --no-install-recommends --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file pahole
             cp /var/cache/apt/archives/*.deb /out/
           '
           cd "$RUNNER_TEMP/kernel-host-debs"
@@ -136,9 +139,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     env:
-      KVER: 6.18.58
+      KVER: 6.18.63
       LCCC_KERNEL_SOURCE_MODE: git
       LCCC_JOBS: '2'
+      LCCC_SWAP_SIZE: 4G
+      HOSTCC: gcc
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_FASTBUILD_DEBUG: '0'
     steps:
@@ -158,11 +163,12 @@ jobs:
           LCCC_CI_SWAP_SIZE: 4G
         run: bash scripts/ci_enable_swap.sh
       - name: Provision host tools
+        # Kconfig, fixdep and objtool are native host programs. This lane builds
+        # the kernel itself with LCCC; it does not need the GCC oracle or i386 libc.
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file
-          bash scripts/ci_provision_toolchain.sh --multilib
-          echo "HOSTCC=$(command -v gcc-16)" >> "$GITHUB_ENV"
+          sudo apt-get install -y gcc flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file
+          "$HOSTCC" --version
       - name: Build LCCC and lccc-ld (fastbuild)
         run: bash scripts/build_lccc_fast.sh
       - name: Apply package patches and prepare with LCCC
@@ -198,13 +204,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kernel-61858-${{ github.sha }}
+          name: kernel-61863-${{ github.sha }}
           compression-level: 0
           path: |
             ${{ runner.temp }}/kernel-*.log
             ${{ runner.temp }}/kernel-*.qemu-err
             ${{ runner.temp }}/kernel-boot/setup.elf
-            ~/.cache/lccc/kernel-work/linux-6.18.58/.config
-            ~/.cache/lccc/kernel-work/linux-6.18.58/.lccc-prepared
-            ~/.cache/lccc/kernel-work/linux-6.18.58/.lccc-full-build-config
+            ~/.cache/lccc/kernel-work/linux-6.18.63/.config
+            ~/.cache/lccc/kernel-work/linux-6.18.63/.lccc-prepared
+            ~/.cache/lccc/kernel-work/linux-6.18.63/.lccc-full-build-config
           if-no-files-found: warn

@@ -136,6 +136,12 @@ fn for_each_target(term: &Terminator, mut f: impl FnMut(BlockId)) {
 /// 2. **Targets exist.** Every terminator and `asm goto` label names a block.
 /// 3. **Phi contiguity.** Phis form an unbroken prefix of their block
 ///    (`loop_rotate` and `mem2reg` both rely on this).
+///    3a. **An asm goto ends its block.** The block is left through it, so an
+///    instruction behind it has not run on the way to its labels -- while
+///    store elimination, phi placement, copy placement and liveness all
+///    read a block as one straight line.  Lowering ends the block there;
+///    a pass that appends to such a block or merges it with its
+///    fallthrough is reported.
 /// 4. **Phi predecessors are real.** Every label in a phi's incoming list is
 ///    an actual CFG predecessor of the phi's block. *This is the check that
 ///    catches the `loop_rotate` stale-guard-label defect.*
@@ -351,6 +357,32 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                 break;
             }
             seen_non_phi |= !is_phi;
+        }
+
+        // 3a. an asm goto ends its block.
+        //
+        // The block is left through it, so what stands behind it has not run
+        // on the way to its labels -- but every pass reasons about a block as
+        // a whole: its last store to a slot, the values it defines, its end
+        // as the place for an edge's code.  Lowering therefore ends the block
+        // at the asm goto, and a pass that puts an instruction behind one (by
+        // appending to the block, or by merging it with its fallthrough)
+        // makes all of that reasoning wrong for the label edges again.
+        let is_asm_goto = |inst: &Instruction| matches!(inst, Instruction::InlineAsm { goto_labels, .. } if !goto_labels.is_empty());
+        if let Some(at) = block.instructions.iter().position(is_asm_goto)
+            && at + 1 != block.instructions.len()
+        {
+            push(
+                out,
+                format!(
+                    "block #{} ({:?}): asm goto at instruction {} is not the last instruction \
+                     of its block ({} behind it)",
+                    bi,
+                    block.label,
+                    at,
+                    block.instructions.len() - at - 1
+                ),
+            );
         }
 
         // Edge-set checks are meaningful only for blocks that can execute.

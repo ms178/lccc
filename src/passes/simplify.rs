@@ -7664,6 +7664,7 @@ mod tests {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // A call to the C library function (what lowering produces for a
                 // hosted TU without -fno-builtin).
                 assume_library: true,

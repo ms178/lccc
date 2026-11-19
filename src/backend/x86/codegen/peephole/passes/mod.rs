@@ -42,6 +42,7 @@ mod frame_compact;
 mod helpers;
 mod identical_blocks;
 mod jump_thread;
+mod late_branch;
 mod lea_add_fuse;
 mod lea_narrow;
 mod liveness;
@@ -121,6 +122,38 @@ fn direct_stack_slot(operand: &str) -> Option<(u8, i32)> {
         }
     }
     None
+}
+
+/// The frame-slot operand of a slot access, for address-taken pinning.
+///
+/// Both pinners used to match `StoreRbp`/`LoadRbp` only, so a *vector* slot whose
+/// address escaped through a `leaq` was never pinned.  That was latent while
+/// dead-store elimination selected candidates on `StoreRbp` alone; once the
+/// windowed pass also retires `StoreXmmRbp`, an unpinned vector slot became
+/// deletable even though a callee may write it through the escaped pointer:
+///
+/// ```text
+///     movaps %xmm0, 16(%rsp)     ; dead by the window: overwritten, unread
+///     leaq   16(%rsp), %rdi      ; the slot escapes
+///     call   callee              ; callee may write through %rdi
+///     movaps %xmm1, 16(%rsp)     ; covers every byte of the first store
+/// ```
+///
+/// The operand position is the same for both families -- a store carries the slot
+/// after the comma, a load before it -- so one helper covers all four kinds.
+#[inline]
+fn slot_operand_of(kind: LineKind, trimmed: &str) -> Option<&str> {
+    let store_side = match kind {
+        LineKind::StoreRbp { .. } | LineKind::StoreXmmRbp { .. } => true,
+        LineKind::LoadRbp { .. } | LineKind::LoadXmmRbp { .. } => false,
+        _ => return None,
+    };
+    let op = if store_side {
+        trimmed.rsplit_once(',').map(|(_, op)| op)
+    } else {
+        trimmed.split_once(',').map(|(op, _)| op)
+    };
+    op.map(str::trim_ascii)
 }
 
 /// Mark stores to stack slots whose address is materialized with `lea` as
@@ -364,20 +397,8 @@ fn pin_address_taken_global(store: &LineStore, infos: &mut [LineInfo]) {
         return;
     }
     for i in 0..store.len() {
-        if !matches!(
-            infos[i].kind,
-            LineKind::StoreRbp { .. } | LineKind::LoadRbp { .. }
-        ) {
-            continue;
-        }
         let trimmed = infos[i].trimmed(store.get(i));
-        let operand = match infos[i].kind {
-            LineKind::StoreRbp { .. } => trimmed.rsplit_once(',').map(|(_, op)| op),
-            LineKind::LoadRbp { .. } => trimmed.split_once(',').map(|(op, _)| op),
-            _ => None,
-        };
-        let is_taken = operand
-            .map(str::trim_ascii)
+        let is_taken = slot_operand_of(infos[i].kind, trimmed)
             .and_then(direct_stack_slot)
             .is_some_and(|slot| address_taken.contains(&slot));
         if is_taken {
@@ -435,24 +456,13 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
             .collect();
         if !taken.is_empty() {
             for i in start..end {
-                // Pin BOTH stores and loads of address-taken slots:
-                // through the escaped pointer another call can write the
-                // slot, so a load must not be folded/forwarded from an
-                // earlier store, and the store must not be dropped as dead.
-                if !matches!(
-                    infos[i].kind,
-                    LineKind::StoreRbp { .. } | LineKind::LoadRbp { .. }
-                ) {
-                    continue;
-                }
+                // Pin BOTH stores and loads of address-taken slots, and both the
+                // GP and the vector family: through the escaped pointer another
+                // call can write the slot, so a load must not be
+                // folded/forwarded from an earlier store, and the store must not
+                // be dropped as dead.
                 let trimmed = infos[i].trimmed(store.get(i));
-                let operand = match infos[i].kind {
-                    LineKind::StoreRbp { .. } => trimmed.rsplit_once(',').map(|(_, op)| op),
-                    LineKind::LoadRbp { .. } => trimmed.split_once(',').map(|(op, _)| op),
-                    _ => None,
-                };
-                let is_taken = operand
-                    .map(str::trim_ascii)
+                let is_taken = slot_operand_of(infos[i].kind, trimmed)
                     .and_then(direct_stack_slot)
                     .is_some_and(|slot| taken.contains(&slot));
                 if is_taken {
@@ -3083,6 +3093,20 @@ fn peephole_optimize_inner(
     let _ = compare_branch::fuse_late_compare_bool_spills(&mut result);
     let _ = pushf_elim::eliminate_redundant_pushfq(&mut result);
     let _ = redundant_ext::eliminate_redundant_zero_extend(&mut result);
+    // And for branches left pointing at the label they already fall through to.
+    // `combined_local_pass` deletes those (its pattern 3), but it last ran in
+    // Phase 4b, and phases 4c–8e — late hoisting, loop rotation, EBB reuse, tail
+    // calls, global DSE, identical-block merging, `jump_thread::run`, terminal
+    // epilogue cross-jumping and 8c–8e — all rewrite control flow after it.
+    // Measured over the 1335 assembly files the regression and bench corpora
+    // produce at -O2 -S, 21 such branches survive to the object file (20 `jmp`,
+    // 1 `jne`; 13 of them separated from the target only by a stacked label,
+    // which pattern 3 cannot see because it compares the first label it finds),
+    // and gcc-16 and clang emit none.  Last of the four so it also retires
+    // anything the three above expose.
+    if !sk("late_branch") {
+        let _ = late_branch::eliminate_branch_to_next_label(&mut result);
+    }
     result
 }
 
@@ -3383,6 +3407,17 @@ mod tests {
         assert_eq!((m.base, m.disp, m.sib), (b'b', 0, true));
         assert!(f("    movl (%rsi, %r11, 4), %eax").is_none());
         assert!(f("    movq %rax, %rbx").is_none());
+        for noncanonical in [
+            "(%rsp",
+            "%gs:8(%rsp)",
+            "010(%rsp)",
+            "2147483648(%rsp, %rax, 4)",
+        ] {
+            assert!(
+                f(&format!("movq {noncanonical}, %rax")).is_none(),
+                "{noncanonical}"
+            );
+        }
     }
 
     /// sha256_transform-shaped frame: a leaq floor for the w[] buffer at

@@ -17,7 +17,7 @@ use crate::backend::inline_asm::{
 use crate::common::types::{AddressSpace, IrType};
 use crate::frontend::parser::ast::TypeSpecifier;
 use crate::frontend::parser::ast::{AsmOperand, Expr};
-use crate::ir::reexports::{BlockId, Instruction, Operand, Value};
+use crate::ir::reexports::{BlockId, Instruction, Operand, Terminator, Value};
 
 impl Lowerer {
     pub(super) fn lower_inline_asm_stmt(
@@ -378,6 +378,31 @@ impl Lowerer {
         //   Store(const, alloca_v)          <-- dead store (to be removed)
         //   InlineAsm { outputs: [("=r", alloca_v)], inputs: [("rK", Const(0))], ... }
         self.eliminate_dead_stores_before_inline_asm(&ir_outputs, &ir_inputs);
+
+        // An asm goto ends its block.
+        //
+        // It is an instruction, but one the function can be left through:
+        // what stands behind it has not run on the way to its labels.  Left
+        // in the middle of a block, it makes every block-wide statement
+        // false for those edges -- "this store is the block's last word on
+        // the slot", "this value is defined in the block, so it is defined
+        // at the block's successors", "the block's end is where an edge's
+        // copies go" -- and each pass would have to remember the exception
+        // on its own.  Several did not: a store ahead of the asm goto was
+        // deleted as dead for one behind it, a load at the label was given
+        // the value stored behind it, a promoted local reached the label
+        // with one value for both ways in.
+        //
+        // With the block ended here those statements hold again, for every
+        // pass at once: the block's successors are its terminator's target
+        // and the labels (`build_cfg` counts both), and nothing in the block
+        // is skipped by either.  The verifier holds every pass to it
+        // (`passes::verify`, "asm goto ... is not the last instruction").
+        if !goto_labels.is_empty() {
+            let behind = self.fresh_label();
+            self.terminate(Terminator::Branch(behind));
+            self.start_block(behind);
+        }
     }
 
     /// Remove stores to write-only inline asm output allocas when the inline asm

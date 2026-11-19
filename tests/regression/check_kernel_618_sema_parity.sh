@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression gate for Linux 6.18.58 semantic-analysis and parser qualifier parity:
+# Regression gate for Linux 6.18.63 semantic-analysis and parser qualifier parity:
 #   1. container_of_const / _Generic(ptr, const typeof(*ptr) *: ..., default: ...)
 #      inside WRITE_ONCE (*(volatile typeof(x) *)&(x) = val):
 #        - non-const pointer selects default:, stays writable, and preserves
@@ -309,4 +309,4 @@ timeout 10 "$CCC" -std=gnu18 -fsyntax-only "$TMP_DIR/lookahead_bracket.c" 2>"$TM
 [ "$brk_rc" -ne 124 ] || fail "cast lookahead hung on mismatched bracket"
 [ "$brk_rc" -ne 0 ] || fail "mismatched bracket was accepted"
 
-echo "PASS: Linux 6.18.58 sema/qualifier/format/cleanup parity"
+echo "PASS: Linux 6.18.63 sema/qualifier/format/cleanup parity"

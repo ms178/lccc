@@ -68,15 +68,29 @@ PRIORITY_SET = (
     "-Og",
     "-static-pie",
     "-pedantic",
+    # Joined the set after it was found accepted-and-ignored while the Linux
+    # kernel passed it in every translation unit: a codegen-withdrawing option
+    # that silently does not withdraw is the exact failure state this ledger
+    # exists to make impossible, so its row must never be droppable again.
+    "-fno-optimize-sibling-calls",
 )
 
 VALID_CLASSES = frozenset({"Implemented", "Inert", "Refused"})
 
 # A fixture whose codegen is sensitive to optimisation mode, ABI, hardening
 # and arithmetic flags, without depending on headers or the host libc.
+#
+# The `tail`/`h` pair is the sibling-call shape `-fno-optimize-sibling-calls`
+# withdraws (see the `sibcall-suppressed` probe kind). It lives in the SHARED
+# fixture deliberately: because every `Inert` row is checked for byte-identical
+# assembly against this baseline, an option that really does change codegen
+# cannot be misdeclared `Inert` and pass -- the withdrawal is observable here
+# for every row, not only for its own.
 ASM_FIXTURE = (
     "extern int g(int);\n"
     "int f(int x){ int a[8]={1,2,3,4,5,6,7,8}; return g(a[x&7]) + x*3; }\n"
+    "extern int h(int, int, int);\n"
+    "int tail(int a, int b, int c){ return h(a + 1, b, c); }\n"
 )
 MACRO_FIXTURE = ""
 
@@ -84,6 +98,9 @@ MACRO_FIXTURE = ""
 # entry here, and every entry here MUST be referenced by exactly one row.
 # `needle` is checked against `-dM -E` stdout (macro-contains) or `-S` output
 # (asm-contains); `no-delta` rows are checked for byte identity instead.
+# `sibcall-suppressed` rows name the tail callee in `needle` and measure a
+# transformation being *withdrawn*, so they are asserted in both directions
+# (see `dynamic_problems`).
 PROBES: dict[str, tuple[str, str]] = {
     "probe-fopenmp-serial": ("macro-contains", "#define _OPENMP 202111"),
     "probe-lto-no-artifact": ("no-delta", ""),
@@ -99,7 +116,35 @@ PROBES: dict[str, tuple[str, str]] = {
     "probe-Og-debug-opt": ("macro-contains", "#define __OPTIMIZE__ 1"),
     "probe-pedantic-inert": ("no-delta", ""),
     "probe-nullptr-checks-inert": ("no-delta", ""),
+    # `needle` is the tail callee's symbol name; how it is spelled in the
+    # assembly and which mnemonics bracket it are per-driver, because the
+    # ledger is executed against all four arch drivers (see SIBCALL_SHAPES).
+    "probe-no-sibling-calls": ("sibcall-suppressed", "h"),
 }
+
+# Tail-call spelling per driver, measured on the fastbuild tree (2026-11-17)
+# and mirroring the per-target leg of tests/regression/check_sibcall_shapes.sh:
+# driver basename -> (tail-jump mnemonic, real-call mnemonic, decoration
+# appended to the probe's callee symbol to spell its assembly reference).
+# `None` marks a driver that leaves sibling-call lowering disabled entirely, so
+# there is no conversion for the option to withdraw; the honest pin there is
+# that the flag changes nothing at all. Measured shapes, for callee `h`:
+#
+#   lccc        x86-64  `jmp h@PLT`  -> `call h@PLT` + `ret`
+#   lccc-i686   i686    no conversion (kill-switch control is byte-identical)
+#   lccc-arm    AArch64 `b h`        -> `bl h` + `ret`
+#   lccc-riscv  RISC-V  `tail h`     -> `call h` + `ret`
+#
+# An unlisted driver is treated as the primary x86-64 shape: the ledger's own
+# gate invocations resolve to a named driver, and the robustness tests that
+# pass a stub never reach this branch (they fail the baseline compile first).
+SIBCALL_SHAPES: dict[str, tuple[str, str, str] | None] = {
+    "lccc": ("jmp", "call", "@PLT"),
+    "lccc-i686": None,
+    "lccc-arm": ("b", "bl", ""),
+    "lccc-riscv": ("tail", "call", ""),
+}
+SIBCALL_SHAPE_DEFAULT: tuple[str, str, str] = ("jmp", "call", "@PLT")
 
 _BLOCK_RE = re.compile(r"Contract\s*\{(.*?)\n\s*\},", re.S)
 _FIELD_RE = {
@@ -250,6 +295,11 @@ def dynamic_problems(rows: list[Row], lccc: str) -> list[str]:
     lccc, problem = resolve_binary(lccc)
     if problem:
         return [problem]
+    # Which target this driver emits decides how a tail call is spelled (see
+    # SIBCALL_SHAPES): the same ledger rows are executed against all four
+    # arch drivers, so a probe that hard-coded one target's mnemonics would
+    # fail three of them.
+    sibcall_shape = SIBCALL_SHAPES.get(Path(lccc).name, SIBCALL_SHAPE_DEFAULT)
     with tempfile.TemporaryDirectory(prefix="lccc-option-ledger-") as td:
         work = Path(td)
         src = work / "fixture.c"
@@ -301,6 +351,42 @@ def dynamic_problems(rows: list[Row], lccc: str) -> list[str]:
                     asm = (work / "opt.s").read_text() if (work / "opt.s").is_file() else ""
                     if needle not in asm:
                         problems.append(f"{row.spelling}: probe {row.probe} expected {needle!r} in -S output")
+                elif kind == "sibcall-suppressed":
+                    # A withdrawal probe, asserted in BOTH directions so it
+                    # cannot pass by accident: the baseline must really contain
+                    # the tail jump (a compiler that never converted anything
+                    # would make the "it is gone now" half vacuous), and the
+                    # variant must have replaced it with a real call, which is
+                    # what keeps the caller's frame alive for unwinders.
+                    asm = (work / "opt.s").read_text() if (work / "opt.s").is_file() else ""
+                    base_asm = (work / "base1.s").read_text() if (work / "base1.s").is_file() else ""
+                    if sibcall_shape is None:
+                        # This driver leaves sibling-call lowering disabled, so
+                        # there is no conversion to withdraw. The pin is that
+                        # the option changes nothing here; if the target ever
+                        # starts converting, this fails and SIBCALL_SHAPES must
+                        # be updated deliberately instead of silently passing
+                        # an unmeasured shape.
+                        if asm_hash != hash1:
+                            problems.append(
+                                f"{row.spelling}: probe {row.probe} expected no effect on a "
+                                f"driver that does not lower sibling calls, but the "
+                                f"assembly changed")
+                    else:
+                        jump, call, decoration = sibcall_shape
+                        ref = f"{needle}{decoration}"
+                        if f"{jump} {ref}" not in base_asm:
+                            problems.append(
+                                f"{row.spelling}: probe {row.probe} baseline emits no "
+                                f"'{jump} {ref}', so the withdrawal is unobservable")
+                        if f"{jump} {ref}" in asm:
+                            problems.append(
+                                f"{row.spelling}: probe {row.probe} still emits the tail jump "
+                                f"'{jump} {ref}': the option was accepted but not honoured")
+                        if f"{call} {ref}" not in asm:
+                            problems.append(
+                                f"{row.spelling}: probe {row.probe} expected a real "
+                                f"'{call} {ref}' in -S output")
                 elif kind == "no-delta":
                     problems.append(f"{row.spelling}: Implemented row uses a no-delta probe")
                 elif asm_hash == hash1 and macro.stdout == base_macros.stdout:

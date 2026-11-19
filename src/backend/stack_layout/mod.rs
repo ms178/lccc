@@ -44,8 +44,9 @@ pub mod slot_census;
 
 // Re-export submodule public APIs at the stack_layout:: level
 pub use inline_asm::{
-    collect_inline_asm_callee_saved, collect_inline_asm_callee_saved_i686,
-    collect_inline_asm_callee_saved_with_generic, collect_inline_asm_callee_saved_with_overflow,
+    I686_ASM_BYTE_SCRATCH_POOL, I686_ASM_SCRATCH_POOL, collect_inline_asm_callee_saved,
+    collect_inline_asm_callee_saved_i686, collect_inline_asm_callee_saved_with_generic,
+    collect_inline_asm_callee_saved_with_overflow, i686_asm_scratch_callee_saved,
 };
 pub use regalloc_helpers::{
     ParamAllocaIndex, filter_available_regs, leaves_through_nonlocal_goto,

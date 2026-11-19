@@ -389,6 +389,20 @@ gate "sibcall-shapes" fast \
 # seeds that caught the staged-register scratch clobber).
 gate "licm-global-speculation" fast \
     python3 tests/regression/check_licm_global_speculation.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
+# Calls that may not return (a trap, `for (;;)`, a loop nobody can count) are
+# kept, calls to counted loops are still deleted and hoisted, identical calls
+# merge either way, and a `const` declaration is not a licence to run a call
+# above the test that guards its loop.
+gate "call-return-facts" fast \
+    python3 tests/regression/check_call_return_facts.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
+# An asm goto behaves like the `if (c) goto label;` it stands for: 352 shapes
+# (what is ahead of the jump, behind it, around it; twelve kinds of storage)
+# are compiled both ways and compared, at -O0..-Os for x86-64 and i686, with
+# the jump spelled as `jnz` and as bytes.  Callee-saved registers are checked
+# around every call.  The committed fixture is what the generator writes.
+gate "asm-goto-equivalence" fast \
+    python3 tests/regression/check_asm_goto_equivalence.py --lccc "$LCCC" \
+    --check-committed --self-test
 gate "call-arg-staging-homes" fast \
     python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
     --seed-list 1,2,3,4,5,6,11,14,16,26,30
@@ -1427,6 +1441,12 @@ gate "intrinsic-arity-selftest" fast \
     python3 scripts/check_intrinsic_arity.py --self-test
 gate "intrinsic-arity" fast \
     python3 scripts/check_intrinsic_arity.py --check
+gate "libc-builtin-arity-selftest" fast \
+    python3 scripts/check_libc_builtin_arity.py --self-test
+gate "libc-builtin-arity" fast \
+    python3 scripts/check_libc_builtin_arity.py --gcc "${GCC16:-gcc-16}" --check
+gate "libc-builtin-calls" fast \
+    python3 tests/regression/check_libc_builtin_calls.py --gcc "${GCC16:-gcc-16}" --lccc "$LCCC"
 
 # Every pointer-form intrinsic must reach a lowering.  The x86/i686 emitters
 # decide WHETHER an op reaches an arm with the outer match pattern and WHICH

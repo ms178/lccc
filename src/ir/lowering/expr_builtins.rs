@@ -687,6 +687,7 @@ impl Lowerer {
                         regparm: None,
                         is_pure: false,
                         is_const: false,
+                        memory: Default::default(),
                         // Spelled `__builtin_<name>`: the library function by definition.
                         assume_library: true,
                         ret_eightbyte_classes: Vec::new(),
@@ -1920,6 +1921,7 @@ impl Lowerer {
                         regparm: None,
                         is_pure: false,
                         is_const: false,
+                        memory: Default::default(),
                         assume_library: false,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,
@@ -2197,6 +2199,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 // Spelled `__builtin___<name>_chk`: the fortified builtin by definition.
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),

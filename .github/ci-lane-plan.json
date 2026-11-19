@@ -1577,7 +1577,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 353.68,
+      "predicted_gate_seconds": 354.53,
       "shards": 3,
       "steps": [
         {
@@ -1811,6 +1811,10 @@
         {
           "measured_s": 0.25,
           "name": "Surface vector-extension codegen failures in annotations"
+        },
+        {
+          "measured_s": 0.85,
+          "name": "Libc builtin arity table matches GCC 16.2"
         }
       ]
     },

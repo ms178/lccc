@@ -19,6 +19,26 @@
 #
 # Usage:
 #   KERNEL_DIR=... QEMU=... qemu_boot_test.sh [bzImage]
+#
+# The emulator version is part of the result, not of the environment: TCG's
+# instruction decoding, its CPU-model defaults and its firmware loading differ
+# between releases. `QEMU` therefore defaults to the host's
+# `qemu-system-x86_64` only for convenience; for a reproducible gate, point it
+# at the content-pinned 11.1.3 that scripts/ensure_qemu_system.sh provisions
+# (the same release the tag hash cache pins for user-mode QEMU, fetched from
+# Debian sid by SHA-256, with its own glibc so it runs on a Debian 13 host):
+#
+#   QEMU=$(scripts/ensure_qemu_system.sh --print-bin) scripts/qemu_boot_test.sh
+#   eval "$(scripts/ensure_qemu_system.sh --print-env)"   # + firmware dirs
+#
+# That prefix presents its firmware as ONE self-contained directory
+# (`$(dirname $QEMU)/../share/qemu`: a symlink union of qemu-system-data,
+# ipxe-qemu and seabios), so the "prefer a single self-contained directory"
+# branch below takes it directly and all four required files — bios-256k.bin,
+# linuxboot_dma.bin, kvmvapic.bin, efi-e1000.rom — are present without
+# exporting QEMU_DATA_DIR/QEMU_ROM_DIR/QEMU_BIOS_DIR. The union matters beyond
+# this script: scripts/kernel_isolate.sh requires one directory holding all four
+# and has no split-layout fallback.
 # ============================================================================
 set -euo pipefail
 
@@ -137,11 +157,12 @@ firmware_dir=""
 qemu_data=${QEMU_DATA_DIR:-}
 if [[ -n "$qemu_data" ]]; then
     if [[ -f "$qemu_data/bios-256k.bin" && -f "$qemu_data/linuxboot_dma.bin" \
-          && -f "$qemu_data/kvmvapic.bin" && -f "$qemu_data/efi-e1000.rom" ]]; then
+          && -f "$qemu_data/kvmvapic.bin" && -f "$qemu_data/efi-e1000.rom" \
+          && -f "$qemu_data/vgabios-stdvga.bin" ]]; then
         firmware_dir=$qemu_data
     else
         echo "qemu_boot_test: QEMU_DATA_DIR is not a complete firmware directory: $qemu_data" >&2
-        echo "  Need bios-256k.bin, linuxboot_dma.bin, kvmvapic.bin and efi-e1000.rom." >&2
+        echo "  Need bios-256k.bin, linuxboot_dma.bin, kvmvapic.bin, efi-e1000.rom and vgabios-stdvga.bin." >&2
         exit 1
     fi
 else
@@ -151,7 +172,8 @@ else
     # Prefer a single self-contained directory (AppImage/tarball layout).
     for d in "$rom_dir" "$bios_dir"; do
         if [[ -f "$d/bios-256k.bin" && -f "$d/linuxboot_dma.bin" \
-              && -f "$d/kvmvapic.bin" && -f "$d/efi-e1000.rom" ]]; then
+              && -f "$d/kvmvapic.bin" && -f "$d/efi-e1000.rom" \
+              && -f "$d/vgabios-stdvga.bin" ]]; then
             firmware_dir=$d
             break
         fi
@@ -165,7 +187,7 @@ else
     # resolving per file also makes a dangling symlink impossible.)  Symlinks
     # are sufficient and avoid copying firmware into the persistent workspace.
     if [[ -z "$firmware_dir" ]]; then
-        firmware_required=(bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom)
+        firmware_required=(bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom vgabios-stdvga.bin)
         firmware_resolved=()
         firmware_complete=1
         for f in "${firmware_required[@]}"; do
@@ -190,7 +212,7 @@ else
     if [[ -z "$firmware_dir" ]]; then
         echo "qemu_boot_test: could not find a complete QEMU firmware set" >&2
         echo "  Looked in: ROMs=$rom_dir BIOS=$bios_dir" >&2
-        echo "  Need bios-256k.bin, linuxboot_dma.bin, kvmvapic.bin and efi-e1000.rom." >&2
+        echo "  Need bios-256k.bin, linuxboot_dma.bin, kvmvapic.bin, efi-e1000.rom and vgabios-stdvga.bin." >&2
         echo "  Override QEMU_DATA_DIR with one directory containing that union." >&2
         exit 1
     fi

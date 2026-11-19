@@ -159,7 +159,10 @@ def main():
     else:
         exe = shutil.which("qemu-system-x86_64") or "qemu-system-x86_64"
         cand = os.path.join(os.path.dirname(os.path.abspath(exe)), "../share/qemu")
-        for need in ("bios-256k.bin", "linuxboot_dma.bin", "kvmvapic.bin", "efi-e1000.rom"):
+        # Same five-name contract as scripts/qemu_firmware.sh: -L replaces the
+        # data dir, so a dir without the default `-vga std` ROM cannot boot.
+        for need in ("bios-256k.bin", "linuxboot_dma.bin", "kvmvapic.bin",
+                     "efi-e1000.rom", "vgabios-stdvga.bin"):
             if not os.path.isfile(os.path.join(cand, need)):
                 sys.exit(
                     "qemu_qmp_probe: %s lacks %s; symlink the qemu-system-data + "

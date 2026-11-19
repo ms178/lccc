@@ -39,6 +39,7 @@ use crate::frontend::parser::ast::{
 };
 use crate::frontend::sema::builtins;
 use crate::frontend::sema::intrinsic_arity;
+use crate::frontend::sema::libc_builtin_arity;
 use crate::frontend::sema::operand_constraints::{self, AssignmentCtx, MemberOperand, Operand};
 use crate::ir::reexports::IrConst;
 
@@ -140,6 +141,8 @@ pub struct FunctionInfo {
     /// definition a prototype (C11 6.7.6.3p14).
     pub prototype: Option<FunctionType>,
     pub is_defined: bool,
+    /// No written declaration has replaced this legacy implicit declaration.
+    is_implicit: bool,
     /// Whether the function is declared with __attribute__((noreturn)) or _Noreturn
     pub is_noreturn: bool,
     /// Whether the function's return type has a `const` base specifier (`const T *f()`).
@@ -418,7 +421,12 @@ fn param_top_const_source(
 
 impl SemanticAnalyzer {
     pub fn new() -> Self {
-        let mut analyzer = Self {
+        // Not `mut`: the constructor used to pre-populate a table of implicit
+        // libc declarations through a `&mut self` helper.  That table is gone --
+        // it made 23 library names unprototyped declarations, which silently
+        // disabled all argument checking for them -- so nothing mutates the
+        // value before it is returned, and `-D warnings` rejects a stale `mut`.
+        let analyzer = Self {
             symbol_table: SymbolTable::new(),
             result: SemaResult::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
@@ -451,8 +459,6 @@ impl SemanticAnalyzer {
             function_scope_floor: usize::MAX,
             weak_symbols: FxHashSet::default(),
         };
-        // Pre-populate with common implicit declarations
-        analyzer.declare_implicit_functions();
         analyzer
     }
 
@@ -694,6 +700,7 @@ impl SemanticAnalyzer {
             variadic: func.variadic,
             prototype,
             is_defined: true,
+            is_implicit: false,
             is_noreturn: func.attrs.is_noreturn(),
             return_base_const: self
                 .resolve_return_base_const(&func.return_type, func.return_base_const),
@@ -980,6 +987,7 @@ impl SemanticAnalyzer {
             variadic: func.variadic,
             prototype,
             is_defined: true,
+            is_implicit: false,
             is_noreturn: func.attrs.is_noreturn() || prior_noreturn,
             return_base_const: self
                 .resolve_return_base_const(&func.return_type, func.return_base_const)
@@ -1830,6 +1838,7 @@ impl SemanticAnalyzer {
                                         variadic: ft.variadic,
                                         prototype,
                                         is_defined: false,
+                                        is_implicit: false,
                                         is_noreturn,
                                         return_base_const: self.resolve_return_base_const(
                                             &decl.type_spec,
@@ -1893,15 +1902,17 @@ impl SemanticAnalyzer {
                     existing.is_noreturn |= is_noreturn;
                     existing.return_base_const |= return_base_const;
                     existing.return_pointer_const_levels |= return_levels;
+                    // Even an old-style declaration replaces an implicit
+                    // signature. Never replace a definition's body types.
+                    if !existing.is_defined && (existing.is_implicit || prototype.is_some()) {
+                        existing.calling_convention = ft.calling_convention;
+                        existing.return_type = ft.return_type.clone();
+                        existing.params = ft.params.clone();
+                        existing.variadic = ft.variadic;
+                    }
+                    existing.is_implicit = false;
                     if prototype.is_some() {
                         existing.prototype = prototype;
-                        // A later prototype refines an implicit declaration;
-                        // it must not overwrite a definition's body types.
-                        if !existing.is_defined {
-                            existing.return_type = ft.return_type.clone();
-                            existing.params = ft.params.clone();
-                            existing.variadic = ft.variadic;
-                        }
                     }
                 } else {
                     self.result.functions.insert(
@@ -1913,6 +1924,7 @@ impl SemanticAnalyzer {
                             variadic: ft.variadic,
                             prototype,
                             is_defined: false,
+                            is_implicit: false,
                             is_noreturn,
                             return_base_const,
                             return_pointer_const_levels: return_levels,
@@ -4160,6 +4172,28 @@ impl SemanticAnalyzer {
                 if self.symbol_table.lookup(name).is_none()
                     && !self.result.functions.contains_key(name)
                 {
+                    // Names reaching this branch are `builtins::is_builtin`:
+                    // compiler builtins, available without a prototype by
+                    // definition, so this branch must NOT emit an
+                    // implicit-declaration diagnostic.  Measured, not assumed:
+                    // adding one here, gated on the `__builtin_` spelling,
+                    // failed 66 of 1378 corpus tests, because that gate misses
+                    // three populations which are equally builtins --
+                    //
+                    //   * this compiler's own bundled headers call AVX2 helpers
+                    //     before their declaration (`include/avxintrin.h:344`
+                    //     uses `_mm256_and_si256`, defined in `avx2intrin.h`,
+                    //     which `immintrin.h` includes later): 55 tests;
+                    //   * `alloca`, which needs no <stdlib.h>;
+                    //   * the `__atomic_*`/`__sync_*` family, dispatched by name
+                    //     pattern (`is_atomic_builtin`) rather than through
+                    //     `BUILTIN_MAP`, so no `__builtin_` prefix to gate on.
+                    //
+                    // The unprefixed *library* names are not `is_builtin` at all
+                    // -- `memcpy` is only the `BuiltinKind::LibcAlias` target of
+                    // `__builtin_memcpy` -- so they fall to the implicit
+                    // declaration branch below, which is where the
+                    // silently-accepted-`memcpy(d, s)` defect was fixed.
                     if let Some(expected) = intrinsic_arity::builtin_intrinsic_arity(name) {
                         if args.len() != expected {
                             self.diagnostics.borrow_mut().error(
@@ -4177,32 +4211,13 @@ impl SemanticAnalyzer {
                                 *callee_span,
                             );
                         }
+                    } else if name.starts_with("__builtin_") {
+                        self.check_libc_builtin_arity(name, args.len(), *callee_span);
                     }
                     self.check_c2y_builtin_call(name, args, *callee_span);
                 }
-            } else if !self.result.functions.contains_key(name)
-                && self.symbol_table.lookup(name).is_none()
-            {
-                // Implicit function declaration (C89 style) - register it
-                self.diagnostics.borrow_mut().warning_with_kind(
-                    format!("implicit declaration of function '{}'", name),
-                    *callee_span,
-                    crate::common::error::WarningKind::ImplicitFunctionDeclaration,
-                );
-                let func_info = FunctionInfo {
-                    calling_convention: Default::default(),
-                    return_type: CType::Int, // implicit return int
-                    params: Vec::new(),
-                    variadic: true, // unknown params
-                    prototype: None,
-                    is_defined: false,
-                    is_noreturn: false,
-                    return_base_const: false,
-                    return_pointer_const_levels: 0,
-                    param_typedefs: Vec::new(),
-                    return_typedef: None,
-                };
-                self.result.functions.insert(name.clone(), func_info);
+            } else if self.symbol_table.lookup(name).is_none() {
+                self.analyze_unbound_function_call(name, args.len(), *callee_span);
             }
         }
         // C11 6.2.1p4 settles a call's binding at the call, so that is
@@ -8126,6 +8141,65 @@ dereference it before applying '->' to it?"
         None
     }
 
+    /// Keep the declaration diagnostic once per name, but check the arity
+    /// of every implicit call: a valid first call proves nothing about later
+    /// arguments. A visible declaration or object uses its own callable type.
+    fn analyze_unbound_function_call(&mut self, name: &str, argc: usize, span: Span) {
+        match self.result.functions.get(name) {
+            Some(info) if !info.is_implicit => return,
+            Some(_) => {}
+            None => {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!("implicit declaration of function '{}'", name),
+                    span,
+                    crate::common::error::WarningKind::ImplicitFunctionDeclaration,
+                );
+                self.result.functions.insert(
+                    name.to_owned(),
+                    FunctionInfo {
+                        calling_convention: Default::default(),
+                        return_type: CType::Int,
+                        params: Vec::new(),
+                        variadic: true,
+                        prototype: None,
+                        is_defined: false,
+                        is_implicit: true,
+                        is_noreturn: false,
+                        return_base_const: false,
+                        return_pointer_const_levels: 0,
+                        param_typedefs: Vec::new(),
+                        return_typedef: None,
+                    },
+                );
+            }
+        }
+        if self.builtin_policy.recognizes_unprefixed_builtin(name) {
+            self.check_libc_builtin_arity(name, argc, span);
+        }
+    }
+
+    fn check_libc_builtin_arity(&self, name: &str, argc: usize, span: Span) {
+        let Some(arity) = libc_builtin_arity::libc_builtin_arity(name) else {
+            return;
+        };
+        let too_few = argc < arity.min_args;
+        if !too_few && (arity.variadic || argc == arity.min_args) {
+            return;
+        }
+        let expected = if arity.variadic { "at least " } else { "" };
+        self.diagnostics.borrow_mut().error(
+            format!(
+                "{} arguments to function '{}'; expected {}{}, have {}",
+                if too_few { "too few" } else { "too many" },
+                name,
+                expected,
+                arity.min_args,
+                argc,
+            ),
+            span,
+        );
+    }
+
     fn check_c2y_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
         // These GCC 17 compatibility intrinsics have no ordinary
         // declaration in the translation unit. Validate their implicit
@@ -10665,84 +10739,6 @@ dereference it before applying '->' to it?"
     fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
         self.eval_const_expr_value(expr)?.to_i64()
     }
-
-    // === Implicit declarations ===
-
-    /// Pre-declare common implicit functions that C programs expect.
-    fn declare_implicit_functions(&mut self) {
-        // Common libc functions that tests may use without headers
-        let implicit_funcs = [
-            ("printf", CType::Int, true),
-            ("fprintf", CType::Int, true),
-            ("sprintf", CType::Int, true),
-            ("snprintf", CType::Int, true),
-            ("puts", CType::Int, false),
-            ("putchar", CType::Int, false),
-            ("getchar", CType::Int, false),
-            (
-                "malloc",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            (
-                "calloc",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            (
-                "realloc",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            ("free", CType::Void, false),
-            ("exit", CType::Void, false),
-            ("abort", CType::Void, false),
-            (
-                "memcpy",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            (
-                "memmove",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            (
-                "memset",
-                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
-                false,
-            ),
-            ("memcmp", CType::Int, false),
-            ("strlen", CType::ULong, false),
-            ("strcmp", CType::Int, false),
-            (
-                "strcpy",
-                CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC),
-                false,
-            ),
-            ("atoi", CType::Int, false),
-            ("atol", CType::Long, false),
-            ("abs", CType::Int, false),
-        ];
-
-        for (name, ret_type, variadic) in &implicit_funcs {
-            let is_noreturn = matches!(*name, "exit" | "abort" | "_Exit" | "quick_exit");
-            let func_info = FunctionInfo {
-                calling_convention: Default::default(),
-                return_type: ret_type.clone(),
-                params: Vec::new(),
-                variadic: *variadic,
-                prototype: None,
-                is_defined: false,
-                is_noreturn,
-                return_base_const: false,
-                return_pointer_const_levels: 0,
-                param_typedefs: Vec::new(),
-                return_typedef: None,
-            };
-            self.result.functions.insert(name.to_string(), func_info);
-        }
-    }
 }
 
 /// Member-type comparison that sees through anonymous record keys.
@@ -11647,6 +11643,7 @@ mod record_layouts_correspond_tests {
             object_const: false,
             counted_by: None,
             pointer_quals: Vec::new(),
+            user_align: None,
         }
     }
 

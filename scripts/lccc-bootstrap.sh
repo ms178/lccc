@@ -6,8 +6,9 @@
 # of /home/user itself).  This script re-establishes the invariants every LCCC
 # session depends on:
 #
-#   1. A configurable (default 4 GiB) swap file on the largest writable filesystem   (hard requirement:
-#      the sandbox has ~1.9 GiB RAM; linking/optimising lccc OOMs without it).
+#   1. A configurable (default 8 GiB) swap file on the largest writable filesystem   (hard requirement:
+#      the sandbox has ~1.9 GiB RAM; linking/optimising lccc OOMs without it, and
+#      the fastbuild test profile OOMs at 4 GiB -- see scripts/ensure_swap.sh).
 #   2. VM tuning appropriate for a swap-backed, memory-starved build box.
 #   3. The current stable Rust toolchain selected by rust-toolchain.toml,
 #      INCLUDING the rustup proxy binaries and rustup's own execute bit -- both
@@ -26,7 +27,7 @@ set -euo pipefail
 WS=${LCCC_WS:-/home/user}
 REPO=${LCCC_REPO:-/opt/lccc-work/lccc}
 ART=${LCCC_ARTIFACTS:-$WS/artifacts}
-SWAP_SIZE=${LCCC_SWAP_SIZE:-4G}
+SWAP_SIZE=${LCCC_SWAP_SIZE:-8G}
 UPSTREAM=${LCCC_UPSTREAM:-https://github.com/ms178/lccc}
 
 log() { printf '\033[1;36m[bootstrap]\033[0m %s\n' "$*"; }

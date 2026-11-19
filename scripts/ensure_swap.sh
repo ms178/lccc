@@ -7,12 +7,19 @@
 set -euo pipefail
 
 swapfile=${LCCC_SWAPFILE:-/swapfile}
-# Hard requirement: EXACTLY 4 GiB of swap. The previous 8G default was a
-# guess at headroom; the build is run with -j2 and measured peak RSS of the
-# fastbuild rustc/lccc link is far below the 4 GiB RAM + 4 GiB swap budget.
+# Hard requirement: EXACTLY 8 GiB of swap. This was 4 GiB until the tree
+# outgrew that budget, and the failure mode was silent work loss rather than a
+# diagnosable error: `cargo test --profile fastbuild --all-targets -j 1` was
+# OOM-killed -- rustc died on SIGKILL with total-vm 7 373 916 kB and
+# anon-rss 1 810 156 kB on a 1 982 MiB host whose 4 GiB of swap was already
+# 2.6 GiB deep (observed 2026-11-17, cargo-test gate, exit 101, 594 s of work
+# discarded). So the peak of the lib-test compile at -C codegen-units=256 is
+# NOT "far below the RAM + 4 GiB swap budget" as the previous comment claimed;
+# that claim was never measured against the test profile, only against the
+# library link. 8 GiB covers the measured peak with the build still at -j2.
 # Enforce the SIZE, not merely the presence of a swap entry: a harness that
-# restores an 8G /swapfile must be corrected, not accepted as "swap exists".
-size=${LCCC_SWAP_SIZE:-4G}
+# restores a 4G /swapfile must be corrected, not accepted as "swap exists".
+size=${LCCC_SWAP_SIZE:-8G}
 if [[ $size =~ ^([0-9]+)G$ ]]; then
     wanted_bytes=$((BASH_REMATCH[1] * 1024 * 1024 * 1024))
 else
@@ -36,7 +43,7 @@ active_swap_kib() {
 # "a file named $swapfile exists": the wrong-size check below still pins our
 # own file to exactly $size.
 # `mkswap` reserves one page for the swap header, so a file of exactly
-# $wanted_bytes reports one page less in /proc/swaps (4 GiB -> 4194300 KiB).
+# $wanted_bytes reports one page less in /proc/swaps (8 GiB -> 8388604 KiB).
 # Allow that single page of slack; anything smaller is a genuinely smaller
 # area and does not satisfy the budget.
 if (( $(active_swap_kib) * 1024 + 4096 >= wanted_bytes )); then

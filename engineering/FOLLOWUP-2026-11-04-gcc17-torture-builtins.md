@@ -90,7 +90,8 @@ toolchain cache, `target/fastbuild`, `/tmp` probes and the snapshot, and reset t
 HEAD to `dfb902b` with the patchset as uncommitted changes). Recovery used `git fetch`,
 `git diff --cached --binary origin/arena/e0bf34d9-lccc` to isolate ONLY the new work,
 `git reset --hard` to the committed branch head and `git apply` — no work was lost and no
-commit was rewritten. `scripts/ensure_swap.sh` enforces EXACTLY 4 GiB (4,294,967,296 bytes,
+commit was rewritten. `scripts/ensure_swap.sh` enforced EXACTLY 4 GiB (4,294,967,296 bytes;
+raised to 8 GiB on 2026-11-17 after the fastbuild test profile was OOM-killed at 4 GiB,
 priority -2), recreating a wrong-sized swap and remaining idempotent on a second run;
 `python3 scripts/arena_provision.py` then restored GCC 16.2.0, Clang 23.1.4, Rust 1.99.1,
 19 pinned bookworm multilib debs and the GCC 17 corpus from the pinned Git Blobs.
@@ -1072,7 +1073,7 @@ Hosted CI runs the remaining full matrix.
 
 ### 9.11 Kernel gate policy and the full five-level/feature campaign
 
-**Kernel gate is no longer a default PR gate.** `.github/workflows/kernel-61858.yml`
+**Kernel gate is no longer a default PR gate.** `.github/workflows/kernel-61863.yml`
 still declares the same `pull_request` path filter (so a compiler-only PR shows
 the skip instead of silently omitting it), but `jobs.kernel.if` now requires one
 of three explicit opt-ins: a weekly `schedule` (`17 3 * * 1`, Monday 03:17 UTC),
@@ -1084,6 +1085,15 @@ input, the label gate, the `labeled` trigger and the intact path filter. The
 240-minute full kernel build is NOT deleted and NOT rerun by default; it is now
 on-demand/weekly, exactly as requested. `check_ci_gate_parity.py` and
 `check_ci_workflow_shell.py` both pass with the new triggers.
+
+The workflow filename carries the kernel version it builds, so it rotates with
+`scripts/kernel_version.sh` and every reference in this document is to the same
+workflow under whatever name it currently has: the file this policy landed in
+was `kernel-61858.yml`, renamed by the 6.18.58 → 6.18.63 kernel bump. When the
+version moves again, update the filename here and in
+`.github/workflows/` together — the doc-link gate reports the stale spelling as
+a broken reference rather than letting it rot silently, which is how this one
+was caught.
 
 **Full campaign.** `scripts/x86_gcc_torture.py` is run over EVERY `compile/`
 source (2016) and EVERY `execute/` source (1700) at EVERY optimization level
@@ -1418,9 +1428,9 @@ corrected feature legs are complete.
   `mergeStateStatus=CLEAN`.
 * Hosted checks: **23 pass / 0 fail / 3 `skipping`**. The three skips are
   not hidden test skips: `kernel` is `schedule`/`workflow_dispatch(run_kernel)`/
-  `kernel-full`-label only (`kernel-61858.yml`), `host-prerequisites` and
+  `kernel-full`-label only (`kernel-61863.yml`), `host-prerequisites` and
   `diagnostic-transport` are `workflow_dispatch`/label-gated
-  (`kernel-61858.yml`, `ci-diagnostics.yml`). The in-tree kernel gate POLICY
+  (`kernel-61863.yml`, `ci-diagnostics.yml`). The in-tree kernel gate POLICY
   test `tests/corpus/test_kernel_workflow_paths.py` runs and passes 11/11 in
   the hosted contracts, so the opt-in default is verified without running a
   240-minute kernel build on every PR.

@@ -1738,6 +1738,7 @@ fn ci(d: Option<Value>, a: Vec<Operand>, t: Vec<IrType>, r: IrType, var: bool) -
         regparm: None,
         is_pure: false,
         is_const: false,
+        memory: Default::default(),
         assume_library: false,
         ret_eightbyte_classes: vec![],
         ret_is_f128_sse: false,

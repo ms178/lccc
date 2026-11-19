@@ -585,11 +585,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Identify the toolchain bundle for this runner image
+        id: toolchain-key
+        run: bash scripts/ci_toolchain_key.sh --github-output >> "$GITHUB_OUTPUT"
       - name: Cache the provisioned oracle toolchain
         uses: actions/cache@v6
         with:
           path: ~/.cache/lccc-toolchain
-          key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+          key: lccc-toolchain-v2-${{ steps.toolchain-key.outputs.key }}
+          restore-keys: |
+            lccc-toolchain-v2-
       - name: Provision oracle toolchain (cached bundle, else apt)
         run: bash scripts/ci_provision_toolchain.sh --multilib
       - name: Verify Ninja build dependency

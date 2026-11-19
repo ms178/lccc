@@ -4521,6 +4521,7 @@ mod value_type_map_tests {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                memory: Default::default(),
                 assume_library: false,
                 ret_eightbyte_classes: vec![],
                 cold: false,

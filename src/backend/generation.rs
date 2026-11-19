@@ -33,8 +33,47 @@ use std::sync::OnceLock;
 /// the environment-hygiene contract (one read per translation unit).
 static SIBCALL_DISABLED: OnceLock<bool> = OnceLock::new();
 
+/// The driver's `-f[no-]optimize-sibling-calls` request.  GCC defaults the
+/// conversion ON at `-O2` and above and lets the option withdraw it, so the
+/// default here is `true` and the driver records every invocation's answer
+/// before lowering runs (the same process-global contract `set_char_unsigned`
+/// uses: one target and one option set per driver process, re-recorded per
+/// compilation so a flag cannot leak into the next one).
+///
+/// This is a *user-facing option*, not a debugging switch: the Linux kernel
+/// passes `-fno-optimize-sibling-calls` in every translation unit, because a
+/// tail `jmp` destroys the caller's frame and with it frame-pointer
+/// unwinding, ftrace function-graph and objtool's ORC/CFI expectations.
+/// Accepting the spelling while performing the conversion anyway is the
+/// option-effect ledger's failure state, not a compatibility no-op.
+static SIBCALL_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Record the invocation's `-f[no-]optimize-sibling-calls` answer.  Called
+/// once by the driver before any lowering, next to the other per-invocation
+/// process globals.
+pub fn set_sibling_calls_requested(enabled: bool) {
+    SIBCALL_REQUESTED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the invocation asked for sibling calls at all.  The IR rewrite
+/// that enables them (`backend::ret_dup`) must consult the same answer as
+/// the backend that emits them, or the two halves disagree about a
+/// conversion that is then only half withdrawn.
+pub(crate) fn sibling_calls_requested() -> bool {
+    SIBCALL_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the sibling-call conversion may run for this invocation: the user
+/// asked for it *and* the `CCC_NO_SIBCALL` kill switch is not set.  Both the
+/// generation driver and the driver-side `ret_dup` rewrite go through this
+/// single answer, so the option and the kill switch cannot disagree.
+pub(crate) fn sibcall_conversion_enabled() -> bool {
+    sibcall_enabled()
+}
+
 fn sibcall_enabled() -> bool {
-    !*SIBCALL_DISABLED.get_or_init(|| std::env::var_os("CCC_NO_SIBCALL").is_some())
+    sibling_calls_requested()
+        && !*SIBCALL_DISABLED.get_or_init(|| std::env::var_os("CCC_NO_SIBCALL").is_some())
 }
 
 /// GCC condition-code suffix of a single-output `=@cc<suffix>` constraint.
@@ -156,21 +195,45 @@ fn collect_asm_goto_cc_branch_values(
                 target_edges.push((source_idx, *target, output_ptr.0, jcc));
             }
 
-            // Fall-through edge: the output's first load is the sole input to
-            // this block's CondBranch, with no intervening IR instruction.
+            // Fall-through edge.  The asm goto ends its block, so the branch
+            // is the block it falls through into: nothing but the load of the
+            // output, feeding that block's CondBranch, and no other way in --
+            // neither another predecessor nor an asm-goto label, which would
+            // arrive with flags of its own.  Between the template and the
+            // fused test then stand the store of the output (a `setcc`), a
+            // jump at most, and a label: none of them writes a flag.
+            if inst_idx + 1 != block.instructions.len() {
+                continue;
+            }
+            let Terminator::Branch(fallthrough) = &block.terminator else {
+                continue;
+            };
+            let Some(&fall_idx) = label_to_idx.get(fallthrough) else {
+                continue;
+            };
+            let predecessors = preds.row(fall_idx);
+            if asm_edge_counts.contains_key(fallthrough)
+                || predecessors.len() != 1
+                || predecessors[0] as usize != source_idx
+            {
+                continue;
+            }
+            let fall_block = &func.blocks[fall_idx];
             if let (
-                Some(Instruction::Load {
-                    dest,
-                    ptr,
-                    ty,
-                    volatile: false,
-                    ..
-                }),
+                [
+                    Instruction::Load {
+                        dest,
+                        ptr,
+                        ty,
+                        volatile: false,
+                        ..
+                    },
+                ],
                 Terminator::CondBranch {
                     cond: Operand::Value(branch_value),
                     ..
                 },
-            ) = (block.instructions.get(inst_idx + 1), &block.terminator)
+            ) = (fall_block.instructions.as_slice(), &fall_block.terminator)
             {
                 if *ptr == *output_ptr
                     && matches!(*ty, IrType::I8 | IrType::U8)
@@ -292,9 +355,10 @@ fn collect_asm_goto_cc_branch_values(
         }
     }
 
-    // Keep every fall-through fusion: its load is the *next* instruction and the
-    // branch is that block's terminator, so no instruction at all can sit
-    // between the template's flags and the fused test. Keep a label-edge fusion
+    // Keep every fall-through fusion: its load is the only instruction of the
+    // block the asm goto falls through into and the branch is that block's
+    // terminator, so no instruction at all can sit between the template's
+    // flags and the fused test. Keep a label-edge fusion
     // only when the output object carries no store anywhere; otherwise the
     // synthetic edge block materialises outputs and transfers control, and the
     // fused branch would consume flags produced by that path rather than by the
