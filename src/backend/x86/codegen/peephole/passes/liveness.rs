@@ -2964,6 +2964,114 @@ mod tests {
         );
     }
 
+    /// `-mfunction-return=thunk-extern`: the function returns by jumping to
+    /// `__x86_return_thunk`.  The thunk is the return, so every line of such
+    /// a function has the liveness of its `ret` twin; read as a jump to an
+    /// unknown symbol it made the whole function unanalysable, and every
+    /// kernel function with it.
+    #[test]
+    fn a_return_through_the_thunk_is_a_return() {
+        let body = |ret: &str| {
+            format!(
+                concat!(
+                    "f:\n",
+                    ".cfi_startproc\n",
+                    "# LCCC_RET_RDX 0\n",
+                    "# LCCC_RET_RAX 1\n",
+                    "    pushq %rbx\n",
+                    "    movq %rdi, %rbx\n",
+                    "    testq %rsi, %rsi\n",
+                    "    je .Lzero\n",
+                    "    movq 48(%rsp), %rax\n",
+                    "    leaq 152(%rax), %rax\n",
+                    "    movq %rax, %rdx\n",
+                    "    movq (%rdx), %r11\n",
+                    "    leaq (%r11, %rbx), %rax\n",
+                    "    popq %rbx\n",
+                    "    {ret}\n",
+                    ".Lzero:\n",
+                    "    xorl %eax, %eax\n",
+                    "    popq %rbx\n",
+                    "    {ret}\n",
+                    ".cfi_endproc\n",
+                ),
+                ret = ret
+            )
+        };
+        let (plain_store, plain_infos, plain) = build(&body("ret"));
+        let (thunk_store, thunk_infos, thunk) = build(&body("jmp __x86_return_thunk"));
+        assert_eq!(plain_store.len(), thunk_store.len());
+        let mut returns = 0;
+        for n in 0..plain_store.len() {
+            assert_eq!(
+                plain_infos[n].kind,
+                thunk_infos[n].kind,
+                "line {n} `{}`",
+                thunk_store.get(n)
+            );
+            returns += usize::from(thunk_infos[n].kind == LineKind::Ret);
+            assert!(
+                thunk.known[n] == plain.known[n],
+                "line {n} `{}`: analysed with ret, {} with the thunk",
+                thunk_store.get(n),
+                if thunk.known[n] { "also" } else { "not" }
+            );
+            for fam in 0..16u8 {
+                assert_eq!(
+                    thunk.live_after(n, fam),
+                    plain.live_after(n, fam),
+                    "family {fam} after line {n} `{}`",
+                    thunk_store.get(n)
+                );
+            }
+        }
+        assert_eq!(returns, 2);
+        // What the answer is good for: behind the load the two temporaries
+        // are provably dead, although a branch and a return follow.
+        let load = line_of(&thunk_store, "movq (%rdx), %r11");
+        assert_eq!(thunk.live_after(load, 2), Some(false), "%rdx");
+        assert_eq!(
+            thunk.live_after(load, 3),
+            Some(true),
+            "%rbx is read by the lea"
+        );
+        let last = line_of(&thunk_store, "xorl %eax, %eax");
+        assert_eq!(thunk.live_after(last, 0), Some(true), "%rax is returned");
+        assert_eq!(thunk.live_after(last, 2), Some(false), "LCCC_RET_RDX 0");
+    }
+
+    /// Only the plain thunk is a return.  The i686 callee-pops thunk reads its
+    /// return address from %ecx, a conditional jump there is no return any
+    /// kernel patches, and another symbol is another function.
+    #[test]
+    fn only_the_plain_thunk_jump_is_classified_as_a_return() {
+        assert_eq!(
+            classify_line("    jmp __x86_return_thunk").kind,
+            LineKind::Ret
+        );
+        assert_eq!(
+            classify_line("\tjmp __x86_return_thunk  # return").kind,
+            LineKind::Ret
+        );
+        for other in [
+            "    jmp __x86_return_thunk_ecx",
+            "    jmp __x86_return_thunk@PLT",
+            "    jmp __x86_return_thunkx",
+            "    jmp x__x86_return_thunk",
+            "    jmp .L__x86_return_thunk",
+        ] {
+            assert_eq!(classify_line(other).kind, LineKind::Jmp, "{other}");
+        }
+        assert_eq!(
+            classify_line("    jne __x86_return_thunk").kind,
+            LineKind::CondJmp
+        );
+        assert_eq!(
+            classify_line("    call __x86_return_thunk").kind,
+            LineKind::Call
+        );
+    }
+
     #[test]
     fn refresh_span_splices_a_straight_line_fold() {
         let asm = concat!(

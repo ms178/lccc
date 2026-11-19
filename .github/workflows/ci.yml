@@ -1145,6 +1145,8 @@ jobs:
         --lccc target/fastbuild/lccc --check-committed --self-test
         run_gate static_key_layout python3 tests/regression/check_static_key_layout.py \
         --lccc target/fastbuild/lccc --self-test
+        run_gate return_thunk_parity python3 tests/regression/check_return_thunk_parity.py \
+        --lccc target/fastbuild/lccc --self-test
         run_gate return_local_addr python3 tests/regression/check_return_local_addr.py \
         --lccc target/fastbuild/lccc --gcc gcc-16 --m32
         run_gate qualifier_composition python3 tests/regression/check_qualifier_composition.py \

@@ -411,6 +411,14 @@ gate "asm-goto-equivalence" fast \
 # x86 targets.
 gate "static-key-layout" fast \
     python3 tests/regression/check_static_key_layout.py --lccc "$LCCC" --self-test
+# `-mfunction-return=thunk-extern` (every x86 kernel build) changes the
+# spelling of the return and nothing in front of it: the 88 benchmark programs
+# compile to the same listing both ways at -O2 and -Os, x86-64 and i686, once
+# `jmp __x86_return_thunk` reads `ret`; six of them are linked against a thunk
+# that is one `ret` and run.  (Before: +11.1 % instructions on x86-64, +2.6 %
+# on i686 -- register liveness gave up every function that returned.)
+gate "return-thunk-parity" fast \
+    python3 tests/regression/check_return_thunk_parity.py --lccc "$LCCC" --self-test
 gate "call-arg-staging-homes" fast \
     python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
     --seed-list 1,2,3,4,5,6,11,14,16,26,30

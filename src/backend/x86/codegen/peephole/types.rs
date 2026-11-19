@@ -735,6 +735,16 @@ pub(super) fn mnemonic_after_prefixes(text: &str) -> (bool, Option<&str>) {
     }
 }
 
+pub(super) use crate::backend::x86_common::RETURN_THUNK_JUMP;
+
+/// Whether the trimmed line `t` returns to the caller and pops nothing but
+/// the return address: `ret`, or the jump to the thunk that does it
+/// ([`RETURN_THUNK_JUMP`], classified [`LineKind::Ret`] like the `ret`).
+#[inline]
+pub(super) fn is_plain_return(t: &str) -> bool {
+    matches!(t, "ret" | "retq") || t == RETURN_THUNK_JUMP
+}
+
 /// True for a mnemonic that transfers control or traps: after it, a linear
 /// scan of the following lines no longer follows execution.
 pub(super) fn is_control_transfer_mnemonic(mnemonic: &str) -> bool {
@@ -980,6 +990,11 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
                 // `jmp *%rcx` / `jmp *%rax` – indirect jump through register
                 if sb.len() > 4 && sb[4] == b'*' {
                     return line_info_with_regs(LineKind::JmpIndirect, ts, scan_register_refs(sb));
+                }
+                // `-mfunction-return=thunk-extern`: this jump is the return
+                // ([`RETURN_THUNK_JUMP`]), not a transfer out of the function.
+                if s == RETURN_THUNK_JUMP {
+                    return line_info(LineKind::Ret, ts);
                 }
                 return line_info(LineKind::Jmp, ts);
             }

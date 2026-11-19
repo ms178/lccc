@@ -4920,7 +4920,12 @@ impl X86Codegen {
         }
         self.emit_epilogue_impl(frame_size);
         if self.state.function_return_thunk {
-            self.state.emit("    jmp __x86_return_thunk");
+            // One spelling, shared with the peephole that has to know this
+            // jump for the return it is.
+            self.state.emit_fmt(format_args!(
+                "    {}",
+                crate::backend::x86_common::RETURN_THUNK_JUMP
+            ));
         } else {
             self.state.emit("    ret");
         }

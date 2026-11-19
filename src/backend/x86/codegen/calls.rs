@@ -2170,13 +2170,16 @@ impl X86Codegen {
             return None;
         }
         // The remaining ABI refusals from the §5b design: variadic callees
-        // read `%al`, sret/fastcall take unaudited argument paths, and the
-        // kernel return-thunk build replaces `ret` with a thunk the
-        // conversion would bypass.
+        // read `%al`, and sret/fastcall take unaudited argument paths.
+        //
+        // `-mfunction-return=thunk-extern` is no refusal.  The option is
+        // about the `ret` instructions this function executes, and a function
+        // that leaves through a sibling call executes none: the callee
+        // returns to our caller through its own return, built under its own
+        // options.  GCC 16.2 and Clang 23.1 both emit `jmp callee` there
+        // (`check_return_thunk_parity.py` holds the two builds to the same
+        // code); refusing cost a kernel build every tail call it has.
         if info.is_variadic || info.is_sret || info.is_fastcall || info.regparm.is_some() {
-            return None;
-        }
-        if self.state.function_return_thunk {
             return None;
         }
         // Zero-stack-argument guard: classify exactly as the emission will
