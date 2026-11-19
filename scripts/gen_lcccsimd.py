@@ -535,12 +535,17 @@ def wrap(decl, body):
     w("")
 
 
-def macro(name, body):
+def macro(name, body, after=()):
     """Emit a #define wrapper. Used for IMMEDIATE-taking intrinsics: macro
     parameters are substituted textually, so the immediate arrives at the
     builtin call as a literal (a function parameter would be a runtime value
-    and the compiler could not fold it into the instruction)."""
+    and the compiler could not fold it into the instruction).
+
+    `after` is a verbatim block emitted between the define and the blank line
+    (comments and sibling #defines that belong to the same API group)."""
     w(f"#define {name} {body}")
+    for line in after:
+        w(line)
     w("")
 
 def r(s):
@@ -793,10 +798,30 @@ for name, mn, rty, m, imm in FP128_CMP:
 # generic _mm_cmp_ps/_mm_cmp_pd(a, b, imm)
 proto("128_ps_cmpps128", "m128", ["long", "__m128 __a", "__m128 __b"])
 proto("128_ps_cmppd128", "m128d", ["long", "__m128d __a", "__m128d __b"])
+# Scalar compares (CMPSS / CMPSD). Each is a packed compare then a lane merge
+# under the same predicate. Emitted verbatim after the packed macro they use.
+_CMP_SS_LINES = r'''/* Scalar single-precision compare: low lane from the predicate, upper three
+ * lanes from the first operand (CMPSS). See _mm_cmp_sd below. */
+#define _mm_cmp_ss(__a, __b, __imm)                                             \
+    __extension__ ({                                                           \
+        __m128 __cmp_ss_a = (__a);                                             \
+        _mm_move_ss(__cmp_ss_a, _mm_cmp_ps(__cmp_ss_a, (__b), (__imm)));       \
+    })'''.split("\n")
+_CMP_SD_LINES = r'''/* Scalar compares: the low lane is the predicate on the low lanes, the upper lane
+ * comes from the first operand (CMPSD / CMPSS). A packed compare then a lane
+ * merge gives exactly that, under the same predicate. */
+#define _mm_cmp_sd(__a, __b, __imm)                                             \
+    __extension__ ({                                                           \
+        __m128d __cmp_sd_a = (__a);                                            \
+        _mm_move_sd(__cmp_sd_a, _mm_cmp_pd(__cmp_sd_a, (__b), (__imm)));       \
+    })'''.split("\n")
+
 macro("_mm_cmp_ps(__a, __b, __imm)",
-      "__CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cmpps128(__imm, __a, __b))")
+      "__CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cmpps128(__imm, __a, __b))",
+      _CMP_SS_LINES)
 macro("_mm_cmp_pd(__a, __b, __imm)",
-      "__CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cmppd128(__imm, __a, __b))")
+      "__CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cmppd128(__imm, __a, __b))",
+      _CMP_SD_LINES)
 
 for name, mn, rty, m in FP128_VAR:
     proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", "__m128i __b"])
