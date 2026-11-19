@@ -1336,14 +1336,19 @@ impl FileLiveness {
         end: usize,
         neutralise: Option<(usize, usize, u16)>,
     ) {
-        type CachedFnLiveness = (
-            Vec<u16>,
-            Vec<u16>,
-            Vec<bool>,
-            Vec<bool>,
-            Vec<(u16, u16)>,
-            bool,
-        );
+        /// One line's cached answers, packed so a whole function caches in
+        /// ONE vector instead of five (the five `.to_vec()` calls were 565k
+        /// heap blocks / 211 MB per profiling TU — the largest allocation
+        /// site in this pass after the solver itself).
+        #[derive(Clone, Copy)]
+        struct CachedLine {
+            live_out: u16,
+            live_in: u16,
+            effect: (u16, u16),
+            known: bool,
+            structural: bool,
+        }
+        type CachedFnLiveness = (Vec<CachedLine>, bool);
         /// Entries kept across passes for one compilation thread.  Measured
         /// against the code this replaces, which held the same 256 and then
         /// threw the whole table away.
@@ -1366,14 +1371,16 @@ impl FileLiveness {
                     }
                     banks.0.insert(key, promoted);
                 }
-                if let Some((lo, li, kn, st, ef, tret)) = banks.0.get(&key)
-                    && lo.len() == fn_len
+                if let Some((cached, tret)) = banks.0.get(&key)
+                    && cached.len() == fn_len
                 {
-                    self.live_out[start..end].copy_from_slice(lo);
-                    self.live_in[start..end].copy_from_slice(li);
-                    self.known[start..end].copy_from_slice(kn);
-                    self.structural[start..end].copy_from_slice(st);
-                    self.effect[start..end].copy_from_slice(ef);
+                    for (i, c) in cached.iter().enumerate() {
+                        self.live_out[start + i] = c.live_out;
+                        self.live_in[start + i] = c.live_in;
+                        self.known[start + i] = c.known;
+                        self.structural[start + i] = c.structural;
+                        self.effect[start + i] = c.effect;
+                    }
                     if *tret {
                         self.textual_ret.insert(start);
                     }
@@ -1409,17 +1416,19 @@ impl FileLiveness {
                 if banks.0.len() >= FN_CACHE_CAP {
                     banks.1 = std::mem::take(&mut banks.0);
                 }
-                banks.0.insert(
-                    key,
-                    (
-                        self.live_out[start..end].to_vec(),
-                        self.live_in[start..end].to_vec(),
-                        self.known[start..end].to_vec(),
-                        self.structural[start..end].to_vec(),
-                        self.effect[start..end].to_vec(),
-                        self.textual_ret.contains(&start),
-                    ),
-                );
+                let mut cached = Vec::with_capacity(fn_len);
+                for i in start..end {
+                    cached.push(CachedLine {
+                        live_out: self.live_out[i],
+                        live_in: self.live_in[i],
+                        effect: self.effect[i],
+                        known: self.known[i],
+                        structural: self.structural[i],
+                    });
+                }
+                banks
+                    .0
+                    .insert(key, (cached, self.textual_ret.contains(&start)));
             });
         }
     }

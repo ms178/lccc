@@ -1817,16 +1817,34 @@ fn owned_live_segments(
     let mut segmented: FxHashSet<u32> = FxHashSet::default();
     for segment in &liveness.segments {
         segmented.insert(segment.value_id);
+    }
+    // Count each owner's pieces first so every per-owner vector is allocated
+    // once at its exact size: the entry().push() growth chains were 215k heap
+    // blocks per profiling TU.  The entry-insertion sequence below is kept
+    // identical to the single-pass version, so the map's layout (and any
+    // caller's iteration order) is unchanged.
+    let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
+    for segment in &liveness.segments {
+        *counts.entry(owner_of(segment.value_id)).or_insert(0) += 1;
+    }
+    for interval in &liveness.intervals {
+        if !segmented.contains(&interval.value_id) {
+            *counts.entry(owner_of(interval.value_id)).or_insert(0) += 1;
+        }
+    }
+    for segment in &liveness.segments {
+        let owner = owner_of(segment.value_id);
         owned
-            .entry(owner_of(segment.value_id))
-            .or_default()
+            .entry(owner)
+            .or_insert_with(|| Vec::with_capacity(counts[&owner] as usize))
             .push((segment.start, segment.end));
     }
     for interval in &liveness.intervals {
         if !segmented.contains(&interval.value_id) {
+            let owner = owner_of(interval.value_id);
             owned
-                .entry(owner_of(interval.value_id))
-                .or_default()
+                .entry(owner)
+                .or_insert_with(|| Vec::with_capacity(counts[&owner] as usize))
                 .push((interval.start, interval.end));
         }
     }
