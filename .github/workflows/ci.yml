@@ -327,6 +327,9 @@ jobs:
         python3 tests/regression/check_isa_fixture_flags.py
         python3 tests/regression/check_avx_intrinsic_isa.py --lccc target/fastbuild/lccc --reference "$(command -v gcc-16)"
         python3 tests/regression/check_avx_lane_builtin_gate.py --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_vex_legal_encoding.py --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_avx_nontemporal_vex.py --self-test
+        python3 tests/regression/check_avx_nontemporal_vex.py --lccc target/fastbuild/lccc
         python3 tests/regression/run_regression.py \
           --lccc target/fastbuild/lccc \
           -j 2 \

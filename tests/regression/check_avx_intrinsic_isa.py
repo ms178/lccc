@@ -38,13 +38,17 @@ DEFAULT_REFERENCE = Path.home() / ".cache/lccc/agent-toolchains/bin/gcc-16"
 HEADERS = ("include/avxintrin.h", "include/avx2intrin.h")
 
 # AVX2-only mnemonics: illegal on an AVX-only CPU in every operand form.
+# `vmaskmovps` and `vmaskmovpd` are NOT in this set: they are the AVX1
+# sign-bit masked float forms (CPUID.AVX). GCC 16.2 emits them under plain
+# `-mavx` and rejects only the integer `_mm256_maskload_epi32`; only the
+# integer `vpmaskmov{d,q}` family is AVX2, and the prefix below covers it.
 AVX2_ANY_FORM = (
     "vinserti128", "vextracti128", "vbroadcasti128", "vperm2i128",
     "vpermd", "vpermq", "vpermpd", "vpermps", "vpblendd",
     "vpsllvd", "vpsllvq", "vpsrlvd", "vpsrlvq", "vpsravd",
-    "vmaskmovps", "vmaskmovpd",
 )
-# Mnemonic prefixes that are AVX2-only in every form (vpbroadcast*, vpgather*).
+# Mnemonic prefixes that are AVX2-only in every form (vpbroadcast*, vpgather*,
+# and the integer masked moves vpmaskmovd/q).
 AVX2_ANY_FORM_PREFIX = ("vpbroadcast", "vpgather", "vgather", "vpmaskmov")
 # Mnemonics that start with `vp` but are AVX-legal (exact names).
 AVX_LEGAL_VP = frozenset({"vpermilps", "vpermilpd", "vptest", "vpclmulqdq"})
