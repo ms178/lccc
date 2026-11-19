@@ -505,6 +505,370 @@ fn is_structural(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
     }
 }
 
+/// One `#APP` .. `#NO_APP` region whose text was read: `first..=last` are its
+/// lines, `reads` the general registers it may read, `targets` the lines of
+/// the function's labels it names (an asm goto target, an exception fixup, a
+/// jump-table entry the kernel patches into a jump).
+struct AsmRegion {
+    first: usize,
+    last: usize,
+    reads: u16,
+    targets: Vec<usize>,
+}
+
+/// The inline-asm regions of `start..end` whose effect on the general
+/// registers can be told from their text.
+///
+/// Inline asm used to read every register.  That is always sound, and it
+/// switched liveness off around the statement: whatever was computed on a
+/// path to it stayed "read", so no temporary before a static key, a per-CPU
+/// update or a `lock` prefix could be folded away -- which is most kernel
+/// functions.  GCC's contract is narrower and is what the statement's author
+/// wrote against: an asm reads its input operands.  Their registers are
+/// printed into the template, so the text names every register the statement
+/// reads, provided each instruction in it reads only what it names or what
+/// its mnemonic implies (`types::classify_implicit_operands`).
+///
+/// A region is read only when every statement in it is one of:
+///
+/// * an instruction of [`asm_mnemonic_is_modelled`] -- the plain integer
+///   instructions, and the ones whose implicit registers are tabulated;
+/// * a jump to a label of this function, or to a numeric label the region
+///   defines itself;
+/// * a label, a section switch that is balanced within the region, alignment,
+///   data in a section that is not executable, or one of the multi-byte NOPs
+///   spelled as `.byte`s.
+///
+/// Anything else keeps the old answer for the whole region: a `call`, `ret`,
+/// `syscall` or trap (a handler with a register contract of its own), an
+/// indirect or foreign jump, an assembler macro, data in the instruction
+/// stream or in an executable section (`.altinstr_replacement` holds code
+/// that is patched in here), a directive not listed (`.intel_syntax` would
+/// hide every register), an unknown mnemonic.
+///
+/// Writes are never claimed: the region kills nothing.  With that, the order
+/// and the control flow of the statements inside cannot matter for what is
+/// live in front of the region, and instructions inside pushed sections are
+/// simply counted as if they ran here.
+fn asm_regions(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+    resolve: &dyn Fn(&str) -> Option<usize>,
+) -> Vec<AsmRegion> {
+    let mut regions = Vec::new();
+    let mut open: Option<usize> = None;
+    for n in start..end {
+        if infos[n].is_nop() {
+            continue;
+        }
+        let text = infos[n].trimmed(store.get(n));
+        if infos[n].kind != LineKind::InlineAsm {
+            match text {
+                "#APP" => open = Some(n + 1),
+                "#NO_APP" => {
+                    if let Some(first) = open.take().filter(|&first| first < n) {
+                        if let Some((reads, targets)) =
+                            read_asm_region(store, infos, first, n, resolve)
+                        {
+                            regions.push(AsmRegion {
+                                first,
+                                last: n - 1,
+                                reads,
+                                targets,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    regions
+}
+
+/// The registers lines `first..past` of one inline-asm region may read and
+/// the function labels they name; `None` when a statement is not understood.
+fn read_asm_region(
+    store: &LineStore,
+    infos: &[LineInfo],
+    first: usize,
+    past: usize,
+    resolve: &dyn Fn(&str) -> Option<usize>,
+) -> Option<(u16, Vec<usize>)> {
+    let mut reads = 0u16;
+    let mut targets: Vec<usize> = Vec::new();
+    // Sections pushed inside the region: whether their bytes may execute.
+    let mut sections: Vec<bool> = Vec::new();
+    let mut numeric_defs: Vec<&str> = Vec::new();
+    let mut numeric_refs: Vec<&str> = Vec::new();
+    for n in first..past {
+        if infos[n].kind != LineKind::InlineAsm {
+            // A marker or a deleted line inside a region: not this shape.
+            return None;
+        }
+        let raw = infos[n].trimmed(store.get(n));
+        let line = &raw
+            [..crate::backend::peephole_common::line_len_without_trailing_comment(raw.as_bytes())];
+        // `;` separates statements, except inside a string.
+        if line.contains('"') && line.contains(';') {
+            return None;
+        }
+        for statement in line.split(';') {
+            let mut s = statement.trim();
+            // Leading labels: `1:`, `671:`, `.Lretry:`.
+            while let Some((head, rest)) = s.split_once(':') {
+                let symbol = !head.is_empty()
+                    && head
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'));
+                if !symbol {
+                    break;
+                }
+                if head.bytes().all(|b| b.is_ascii_digit()) {
+                    numeric_defs.push(head);
+                }
+                s = rest.trim_start();
+            }
+            if s.is_empty() {
+                continue;
+            }
+            // Function labels the statement names, wherever it names them.
+            for token in
+                s.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$')))
+            {
+                if token.starts_with('.') {
+                    if let Some(target) = resolve(token) {
+                        if !targets.contains(&target) {
+                            targets.push(target);
+                        }
+                    }
+                }
+            }
+            let (word, args) = s
+                .split_once(|c: char| c.is_ascii_whitespace())
+                .unwrap_or((s, ""));
+            if word.starts_with('.') {
+                let executes = sections.last().copied().unwrap_or(true);
+                match word {
+                    ".pushsection" | ".section" => sections.push(asm_section_may_execute(args)),
+                    ".popsection" | ".previous" => {
+                        sections.pop()?;
+                    }
+                    ".balign" | ".p2align" | ".align" | ".nops" => {}
+                    ".byte" => {
+                        if executes && !asm_bytes_are_a_nop(args) {
+                            return None;
+                        }
+                    }
+                    ".word" | ".short" | ".value" | ".2byte" | ".4byte" | ".8byte" | ".long"
+                    | ".int" | ".quad" | ".ascii" | ".asciz" | ".string" | ".skip" | ".space"
+                    | ".zero" | ".fill" | ".org" | ".uleb128" | ".sleb128" => {
+                        if executes {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                continue;
+            }
+            let (_, mnemonic) = mnemonic_after_prefixes(s);
+            let Some(mnemonic) = mnemonic else {
+                // Prefix words alone (`rep; nop`, `lock; addl ...`): a
+                // repeat prefix counts in %rcx whatever follows it.
+                if s.split_ascii_whitespace().any(|w| w.starts_with("rep")) {
+                    reads |= RCX;
+                }
+                continue;
+            };
+            if asm_mnemonic_is_jump(mnemonic) {
+                let target = s
+                    .rsplit(|c: char| c.is_ascii_whitespace())
+                    .next()
+                    .unwrap_or("");
+                match target.strip_suffix(['b', 'f']) {
+                    Some(digits)
+                        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
+                    {
+                        numeric_refs.push(digits);
+                    }
+                    _ => {
+                        // A label of this function, whatever its spelling;
+                        // anything else leaves the function.
+                        let line = resolve(target)?;
+                        if !targets.contains(&line) {
+                            targets.push(line);
+                        }
+                    }
+                }
+                continue;
+            }
+            if is_control_transfer_mnemonic(mnemonic) || !asm_mnemonic_is_modelled(mnemonic) {
+                return None;
+            }
+            reads |= scan_register_refs(s.as_bytes());
+        }
+    }
+    let balanced = sections.is_empty();
+    let internal = numeric_refs.iter().all(|r| numeric_defs.contains(r));
+    (balanced && internal).then_some((reads, targets))
+}
+
+/// Whether the bytes of the section a `.pushsection`/`.section` names may be
+/// executed: its flags say so, or it gives none (fail closed).
+fn asm_section_may_execute(args: &str) -> bool {
+    let mut parts = args.splitn(2, ',');
+    let _name = parts.next();
+    let Some(rest) = parts.next() else {
+        return true;
+    };
+    let rest = rest.trim_start();
+    let Some(flags) = rest
+        .strip_prefix('"')
+        .and_then(|r| r.split_once('"'))
+        .map(|(flags, _)| flags)
+    else {
+        return true;
+    };
+    flags.contains('x')
+}
+
+/// Whether a `.byte` list is one of the NOPs the kernel spells as bytes
+/// (`BYTES_NOP1`..`BYTES_NOP8`; a static key's default is the 5-byte one).
+fn asm_bytes_are_a_nop(args: &str) -> bool {
+    const NOPS: [&[u8]; 8] = [
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0f, 0x1f, 0x00],
+        &[0x0f, 0x1f, 0x40, 0x00],
+        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    let mut bytes = [0u8; 8];
+    let mut len = 0usize;
+    for item in args.split(',') {
+        let item = item.trim();
+        let value = match item.strip_prefix("0x").or_else(|| item.strip_prefix("0X")) {
+            Some(hex) => u8::from_str_radix(hex, 16),
+            None => item.parse::<u8>(),
+        };
+        let (Ok(value), Some(slot)) = (value, bytes.get_mut(len)) else {
+            return false;
+        };
+        *slot = value;
+        len += 1;
+    }
+    NOPS.contains(&&bytes[..len])
+}
+
+/// The condition a `j<cc>`, `set<cc>` or `cmov<cc>` tests.
+fn asm_condition(code: &str) -> bool {
+    const CONDITIONS: [&str; 30] = [
+        "o", "no", "b", "c", "nae", "ae", "nb", "nc", "e", "z", "ne", "nz", "be", "na", "a", "nbe",
+        "s", "ns", "p", "pe", "np", "po", "l", "nge", "ge", "nl", "le", "ng", "g", "nle",
+    ];
+    CONDITIONS.contains(&code)
+}
+
+/// `jmp` and the flag-conditional jumps: they read no general register.
+/// (`jrcxz` and `loop` do, and are refused with the other transfers.)
+fn asm_mnemonic_is_jump(mnemonic: &str) -> bool {
+    mnemonic == "jmp" || mnemonic.strip_prefix('j').is_some_and(asm_condition)
+}
+
+/// Instructions an inline-asm region may contain and still be read: each
+/// reads the registers its operands name, plus the implicit ones
+/// `types::classify_implicit_operands` tabulates (the last group below).
+/// The list is closed on purpose -- an instruction that is not here makes
+/// its region read everything, as before.  Left out although common: the
+/// double shifts (GAS reads `shld %a, %b` as a shift by `%cl`), `in`/`out`,
+/// the x87/SSE state instructions, and everything that transfers control.
+fn asm_mnemonic_is_modelled(mnemonic: &str) -> bool {
+    // Integer instructions that take a width suffix and name every register
+    // they read (`shll %cl, %eax` names its count).
+    const SUFFIXED: [&str; 38] = [
+        "mov", "lea", "add", "adc", "sub", "sbb", "and", "or", "xor", "cmp", "test", "inc", "dec",
+        "neg", "not", "bt", "bts", "btr", "btc", "bsf", "bsr", "tzcnt", "lzcnt", "popcnt", "xchg",
+        "xadd", "shl", "shr", "sar", "sal", "rol", "ror", "rcl", "rcr", "bswap", "nop", "push",
+        "pop",
+    ];
+    // Exact spellings: extensions, flag and barrier instructions.
+    const EXACT: [&str; 43] = [
+        "movabs",
+        "movabsq",
+        "movzbw",
+        "movzbl",
+        "movzbq",
+        "movzwl",
+        "movzwq",
+        "movsbw",
+        "movsbl",
+        "movsbq",
+        "movswl",
+        "movswq",
+        "movslq",
+        "pause",
+        "lfence",
+        "mfence",
+        "sfence",
+        "clac",
+        "stac",
+        "cli",
+        "sti",
+        "cld",
+        "std",
+        "clc",
+        "stc",
+        "cmc",
+        "endbr64",
+        "endbr32",
+        "prefetcht0",
+        "prefetcht1",
+        "prefetcht2",
+        "prefetchnta",
+        "prefetchw",
+        "clflush",
+        "clflushopt",
+        "clwb",
+        "movnti",
+        "movntil",
+        "movntiq",
+        "pushf",
+        "pushfq",
+        "popf",
+        "popfq",
+    ];
+    // Implicit registers, tabulated.
+    const IMPLICIT: [&str; 49] = [
+        "cmpxchg", "cmpxchgb", "cmpxchgw", "cmpxchgl", "cmpxchgq", "cbtw", "cwtl", "cltq", "cwtd",
+        "cltd", "cqto", "div", "divb", "divw", "divl", "divq", "idiv", "idivb", "idivw", "idivl",
+        "idivq", "mul", "mulb", "mulw", "mull", "mulq", "imul", "imulb", "imulw", "imull", "imulq",
+        "cpuid", "rdtsc", "rdtscp", "rdmsr", "wrmsr", "rdpmc", "xgetbv", "xsetbv", "movsb",
+        "movsw", "movsl", "movsq", "stosb", "stosw", "stosl", "stosq", "lodsb", "lodsq",
+    ];
+    let suffixed = SUFFIXED.contains(&mnemonic)
+        || mnemonic
+            .strip_suffix(['b', 'w', 'l', 'q'])
+            .is_some_and(|stem| SUFFIXED.contains(&stem));
+    let conditional = |prefix: &str, width: bool| {
+        mnemonic.strip_prefix(prefix).is_some_and(|code| {
+            asm_condition(code)
+                || (width
+                    && code
+                        .strip_suffix(['w', 'l', 'q'])
+                        .is_some_and(asm_condition))
+        })
+    };
+    suffixed
+        || EXACT.contains(&mnemonic)
+        || IMPLICIT.contains(&mnemonic)
+        || conditional("set", false)
+        || conditional("cmov", true)
+}
+
 /// Read/write sets of one instruction.
 #[derive(Clone, Copy)]
 struct Effect {
@@ -1599,6 +1963,9 @@ impl FileLiveness {
             }
             lines.push(n);
         }
+        // Inline asm whose text can be read line by line: what it reads, and
+        // the labels it may leave for.  Any other region reads everything.
+        let asm_regions = asm_regions(store, infos, start, end, &resolve);
 
         // ── jump-table dispatch resolution ─────────────────────────────────
         // The codegen lowers dense integer switches to exactly:
@@ -1626,20 +1993,38 @@ impl FileLiveness {
             let next = lines.get(pos + 1).copied();
             let rel = n - start;
             let first_edge = succ_flat.len();
-            let eff = match Self::classify(
-                store,
-                infos,
-                n,
-                t,
-                &resolve,
-                next,
-                ret_live,
-                &jump_table_succs,
-                start,
-                succ_flat,
-            ) {
-                Some(v) => v,
-                None => return false, // unanalysable control flow: leave `known` false
+            let read_asm = (infos[n].kind == LineKind::InlineAsm)
+                .then(|| asm_regions.iter().find(|r| (r.first..=r.last).contains(&n)))
+                .flatten();
+            let eff = if let Some(region) = read_asm {
+                // Every line of the region carries the region's reads and
+                // writes nothing, so the answer in front of the region does
+                // not depend on the control flow inside it; the labels it
+                // names are successors of its last line.
+                succ_flat.extend(next);
+                if n == region.last {
+                    succ_flat.extend(region.targets.iter().filter(|&&t| Some(t) != next));
+                }
+                Effect {
+                    reads: region.reads,
+                    writes: 0,
+                }
+            } else {
+                match Self::classify(
+                    store,
+                    infos,
+                    n,
+                    t,
+                    &resolve,
+                    next,
+                    ret_live,
+                    &jump_table_succs,
+                    start,
+                    succ_flat,
+                ) {
+                    Some(v) => v,
+                    None => return false, // unanalysable control flow: leave `known` false
+                }
             };
             let eff = match neutralise {
                 // Deleted-definition semantics: the span is no longer an
@@ -3038,6 +3423,242 @@ mod tests {
         let last = line_of(&thunk_store, "xorl %eax, %eax");
         assert_eq!(thunk.live_after(last, 0), Some(true), "%rax is returned");
         assert_eq!(thunk.live_after(last, 2), Some(false), "LCCC_RET_RDX 0");
+    }
+
+    /// A function around one inline-asm region.  `%r8`..`%r11`, `%rcx` and
+    /// `%rdx` are written in front of it and never named behind it, `%rsi` is
+    /// read only in the block `.Lcold` and `%rdi` only behind the region: what
+    /// is live in front of the region is what it reads plus what its
+    /// successors do.
+    fn live_before_asm(region: &str) -> Option<u16> {
+        let asm = format!(
+            concat!(
+                "f:\n",
+                ".cfi_startproc\n",
+                "# LCCC_RET_RDX 0\n",
+                "# LCCC_RET_RAX 1\n",
+                "    movq (%rdi), %r8\n",
+                "    movq 8(%rdi), %r9\n",
+                "    movq 16(%rdi), %r10\n",
+                "    movq 24(%rdi), %r11\n",
+                "    xorl %ecx, %ecx\n",
+                "    xorl %edx, %edx\n",
+                "#APP\n",
+                "{region}",
+                "#NO_APP\n",
+                "    movq %rdi, %rax\n",
+                "    ret\n",
+                ".Lcold:\n",
+                "    movq %rsi, %rax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ),
+            region = region
+        );
+        // As the peephole sees it: the region's lines pinned as inline asm.
+        let store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::super::pin_inline_asm_regions(&store, &mut infos);
+        let lv = FileLiveness::new(&store, &infos);
+        let marker = line_of(&store, "xorl %edx, %edx");
+        let mut live = 0u16;
+        for fam in 0..16u8 {
+            match lv.live_after(marker, fam) {
+                Some(true) => live |= 1 << fam,
+                Some(false) => {}
+                None => return None,
+            }
+        }
+        Some(live)
+    }
+
+    const RSI_BIT: u16 = 1 << 6;
+    const RDI_BIT: u16 = 1 << 7;
+    const R8_BIT: u16 = 1 << 8;
+    const R9_BIT: u16 = 1 << 9;
+    const R10_BIT: u16 = 1 << 10;
+    const R11_BIT: u16 = 1 << 11;
+    /// Live behind the region whatever it does: the argument the fall-through
+    /// returns, and what a `ret` owes the caller.
+    const FALLS_THROUGH: u16 =
+        RDI_BIT | RBX | RBP | RSP | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+
+    /// A static key is a `jmp` objtool turns into a NOP plus a table entry
+    /// (or the NOP as bytes): it reads no register, and it may leave for its
+    /// label.  Before, it read all sixteen and nothing in front of it died.
+    #[test]
+    fn a_static_key_reads_nothing_and_may_take_its_label() {
+        for key in [
+            concat!(
+                "    1: jmp .Lcold # objtool NOPs this\n",
+                "    .pushsection __jump_table,  \"aw\"\n",
+                "    .balign 8\n",
+                "    .long 1b - .\n",
+                "    .long .Lcold - .\n",
+                "    .quad key + 2 - .\n",
+                "    .popsection\n",
+            ),
+            concat!(
+                "    1:.byte 0x0f,0x1f,0x44,0x00,0x00\n",
+                "    .pushsection __jump_table,  \"aw\"\n",
+                "    .balign 8\n",
+                "    .long 1b - .\n",
+                "    .long .Lcold - .\n",
+                "    .quad key + 0 - .\n",
+                "    .popsection\n",
+            ),
+        ] {
+            assert_eq!(live_before_asm(key), Some(FALLS_THROUGH | RSI_BIT), "{key}");
+        }
+        // Without the table entry nothing names the label: no edge, and
+        // %rsi, read only there, is dead.
+        assert_eq!(live_before_asm("    nop\n"), Some(FALLS_THROUGH));
+    }
+
+    /// An asm reads the registers its text names and the ones its mnemonics
+    /// imply; it kills none.
+    #[test]
+    fn an_asm_region_reads_what_it_names() {
+        for (region, reads) in [
+            ("    lock orb $2,(%rcx)\n", RCX),
+            ("    addl $1, %gs:__preempt_count(%rip)\n", 0),
+            ("    btq %rcx,(%rdx)\n", RCX | RDX),
+            ("    movb (%rdx),%cl\n", RCX | RDX),
+            ("    xchgl %ecx, (%rdx)\n", RCX | RDX),
+            ("    lock cmpxchgq %r8, (%r9)\n", RAX | R8_BIT | R9_BIT),
+            ("    1:\tmovq %r10, %r11\n", R10_BIT | R11_BIT),
+            ("    rep; nop\n", RCX),
+            ("    lock; incl (%r8)\n", R8_BIT),
+            (
+                "    sete %cl\n    cmovneq %r9, %r10\n",
+                RCX | R9_BIT | R10_BIT,
+            ),
+            // Code in a pushed executable section is patched in here.
+            (
+                concat!(
+                    "    nop\n",
+                    "    .pushsection .altinstr_replacement, \"ax\"\n",
+                    "    movq %r9, %r11\n",
+                    "    .popsection\n",
+                ),
+                R9_BIT | R11_BIT,
+            ),
+            // A jump to a numeric label the region defines stays inside it.
+            ("    1: decq %r8\n    jne 1b\n", R8_BIT),
+        ] {
+            assert_eq!(
+                live_before_asm(region),
+                Some(FALLS_THROUGH | reads),
+                "{region}"
+            );
+        }
+        // An exception fixup is an edge to its label.
+        assert_eq!(
+            live_before_asm(concat!(
+                "    1:\tmovb (%rdx),%cl\n",
+                "    .pushsection __ex_table,\"a\"\n",
+                "    .long 1b - ., .Lcold - .\n",
+                "    .popsection\n",
+            )),
+            Some(FALLS_THROUGH | RSI_BIT | RCX | RDX)
+        );
+    }
+
+    /// Whatever the scanner does not understand keeps the old answer: the
+    /// region reads every register.
+    #[test]
+    fn an_asm_region_that_is_not_understood_reads_everything() {
+        for region in [
+            "    call helper\n",
+            "    syscall\n",
+            "    1: ud2\n",
+            "    int3\n",
+            "    ret\n",
+            "    jmp elsewhere\n",
+            "    jmp *%r8\n",
+            "    jrcxz .Lcold\n",
+            "    jne 7f\n",
+            "    vmcall\n",
+            "    fxsave (%r8)\n",
+            "    shldq %r8, %r9\n",
+            "    extable_type_reg reg=%r8, type=3\n",
+            "    .intel_syntax noprefix\n    mov rax, rbx\n",
+            "    .byte 0x0f, 0xa2\n",
+            "    .long 0x90909090\n",
+            "    .pushsection .altinstr_replacement, \"ax\"\n    .byte 0x0f,0x01,0xcb\n    .popsection\n",
+            "    .pushsection unknown_flags\n    .long 1\n    .popsection\n",
+            "    .pushsection __ex_table,\"a\"\n    .long 1\n",
+            "    .popsection\n",
+            "    nop; .ascii \"a;b\"\n",
+            "    MOVQ %r8, %r9\n",
+        ] {
+            assert_eq!(live_before_asm(region), Some(u16::MAX), "{region}");
+        }
+    }
+
+    /// The pieces the region scanner is made of.
+    #[test]
+    fn asm_region_scanner_parts() {
+        for nop in [
+            "0x90",
+            "0x66,0x90",
+            "0x0f,0x1f,0x44,0x00,0x00",
+            " 0x0f, 0x1f, 0x44, 0x00, 0x00 ",
+            "15,31,68,0,0",
+            "0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00",
+        ] {
+            assert!(asm_bytes_are_a_nop(nop), "{nop}");
+        }
+        for other in [
+            "",
+            "0x0f,0x0b",
+            "0x0f,0x1f,0x44,0x00",
+            "0x0f,0x1f,0x44,0x00,0x00,0x90",
+            "0x190",
+            "sym",
+            "0x0f,0x1f,0x84,0,0,0,0,0,0",
+        ] {
+            assert!(!asm_bytes_are_a_nop(other), "{other}");
+        }
+        assert!(!asm_section_may_execute("__jump_table,  \"aw\""));
+        assert!(!asm_section_may_execute(
+            ".discard.annotate_insn,\"M\",@progbits,8"
+        ));
+        assert!(asm_section_may_execute(".altinstr_replacement, \"ax\""));
+        assert!(asm_section_may_execute(".text"));
+        assert!(asm_section_may_execute("mystery, @progbits"));
+        for known in [
+            "movq", "movzbl", "leaq", "orb", "btsq", "xaddl", "cmpxchgq", "sete", "setnae",
+            "cmovne", "cmovnel", "cmovl", "cmovll", "nopw", "pushq", "popfq", "cqto", "rdmsr",
+        ] {
+            assert!(asm_mnemonic_is_modelled(known), "{known}");
+        }
+        for unknown in [
+            "call",
+            "jmp",
+            "ret",
+            "shldq",
+            "inb",
+            "outb",
+            "movsd",
+            "addsd",
+            "fxsave",
+            "leave",
+            "cmpxchg16b",
+            "setx",
+            "cmovx",
+            "cmov",
+            "set",
+            "loop",
+            "syscall",
+            "hlt",
+        ] {
+            assert!(!asm_mnemonic_is_modelled(unknown), "{unknown}");
+        }
+        assert!(asm_mnemonic_is_jump("jmp") && asm_mnemonic_is_jump("jnae"));
+        assert!(!asm_mnemonic_is_jump("jrcxz") && !asm_mnemonic_is_jump("j"));
     }
 
     /// Only the plain thunk is a return.  The i686 callee-pops thunk reads its
