@@ -42,8 +42,15 @@ pub fn load_inputs_x86(
     objects: &mut Vec<Elf64Object>,
     undefined: &[String],
     lib_paths: &[String],
+    allow_multiple_definition: bool,
 ) -> Result<(), String> {
-    crate::backend::x86::linker::load_inputs_for_ld(inputs, objects, undefined, lib_paths)
+    crate::backend::x86::linker::load_inputs_for_ld(
+        inputs,
+        objects,
+        undefined,
+        lib_paths,
+        allow_multiple_definition,
+    )
 }
 
 /// Input list of a `-r` or `-T` link with every `-lNAME` expanded in place;
@@ -107,8 +114,16 @@ pub fn strip_debug_sections(objects: &mut [Elf64Object]) {
 }
 
 /// Relocatable link (`ld -r`): merge objects into a single ET_REL (x86-64).
-pub fn link_relocatable_x86(objects: &[Elf64Object], output: &str) -> Result<(), String> {
-    crate::backend::x86::linker::emit_rel::link_relocatable(objects, output)
+pub fn link_relocatable_x86(
+    objects: &[Elf64Object],
+    output: &str,
+    allow_multiple_definition: bool,
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_rel::link_relocatable(
+        objects,
+        output,
+        allow_multiple_definition,
+    )
 }
 
 /// Link pre-loaded objects with a full GNU linker script (x86-64).

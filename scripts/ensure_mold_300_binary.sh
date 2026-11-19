@@ -24,8 +24,9 @@
 #   scripts/ensure_mold_300_binary.sh [--prefix DIR] [--tag TAG] [--print-bin]
 #                                     [--verify-only] [--self-test]
 #
-# Exit status 0 means `$PREFIX/bin/mold --version` reports exactly 3.0.0 AND
-# both x86 targets linked and produced the expected ELF class/machine.
+# Exit status 0 means `$PREFIX/bin/mold` matches the locked release bytes,
+# reports exactly 3.0.0 and produces the expected ELF class/machine for both
+# x86 targets.
 set -Eeuo pipefail
 
 REPO=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -90,6 +91,13 @@ verify() {
     done
 }
 
+require_release_bytes() {
+    if ! oracle_mold_release_matches "$1"; then
+        printf 'ensure_mold_300_binary: missing or wrong release digest: %s\n' "$1" >&2
+        return 1
+    fi
+}
+
 if [ "$self_test" = 1 ]; then
     python3 "$RESTORE" --self-test
     # Offline negative probes: the verifier must reject a wrong version and a
@@ -116,6 +124,7 @@ if [ "$self_test" = 1 ]; then
 fi
 
 if [ "$verify_only" = 1 ]; then
+    require_release_bytes "$prefix/bin/mold"
     verify "$prefix/bin/mold" || exit 1
     echo "mold $VERSION binary oracle OK (elf_i386 + elf_x86_64 probed): $prefix/bin"
     exit 0
@@ -127,9 +136,7 @@ fi
 cache=${LCCC_AGENT_CACHE_PREFIX:-$HOME/.cache/lccc/agent-toolchains}
 python3 "$RESTORE" --tag "$tag" --prefix "$cache" --repo "$REPO" --remote "$remote" --only mold
 root="$cache/mold-$VERSION-x86_64-linux"
-[ -x "$root/bin/mold" ] || {
-    echo "ensure_mold_300_binary: cache extracted no mold executable at $root/bin/mold" >&2
-    exit 1; }
+require_release_bytes "$root/bin/mold"
 # The upstream release binary needs only system libraries (verified: NEEDED
 # lists libgcc_s/librt/libpthread/libdl/libc/ld-linux and it runs with
 # LD_LIBRARY_PATH unset), so publishing the executable alone is safe.  The
@@ -144,6 +151,7 @@ for sib in libexec lib; do
         cp -a "$root/$sib" "$prefix/$sib"
     fi
 done
+require_release_bytes "$prefix/bin/mold"
 verify "$prefix/bin/mold"
 sha256sum "$prefix/bin/mold"
 if [ "$print_bin" = 1 ]; then

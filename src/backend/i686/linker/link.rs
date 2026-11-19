@@ -11,7 +11,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::emit::emit_executable;
 use super::input::*;
 use super::options::{LinkOptions, check_capabilities};
-use super::sections::{merge_gnu_properties, merge_sections};
+use super::sections::{compute_comdat_skip, merge_gnu_properties, merge_sections};
 use super::shared::emit_shared_library_32;
 use super::symbols::*;
 use super::types::*;
@@ -172,6 +172,24 @@ fn apply_visibility_controls_32(
     Ok(())
 }
 
+/// Use the resolved binding, not whichever undefined input was seen first.
+fn unresolved_dynamic_32<'a>(
+    globals: &'a FxHashMap<String, LinkerSymbol>,
+    dynlib_syms: &DynlibSyms,
+    sections: &FxHashMap<String, usize>,
+) -> Vec<&'a str> {
+    globals
+        .iter()
+        .filter_map(|(name, gs)| {
+            (!gs.is_defined
+                && gs.binding != STB_WEAK
+                && !dynlib_syms.contains_key(name.as_str())
+                && !super::shared::is_emitter_defined(name, sections))
+            .then_some(name.as_str())
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_pie_32(
     inputs: &[InputObject],
@@ -186,26 +204,8 @@ fn finish_pie_32(
     pending_defsyms: &PendingDefsyms,
     output_path: &str,
 ) -> Result<(), String> {
-    let mut unresolved: Vec<&str> = Vec::new();
-    let mut seen: FxHashSet<&str> = FxHashSet::default();
-    for sym in inputs.iter().flat_map(|o| o.symbols.iter()) {
-        if sym.section_index != SHN_UNDEF
-            || sym.name.is_empty()
-            || sym.binding == STB_LOCAL
-            || global_symbols
-                .get(sym.name.as_str())
-                .is_some_and(|g| g.is_defined)
-            || !seen.insert(sym.name.as_str())
-        {
-            continue;
-        }
-        if sym.binding != STB_WEAK
-            && !resolved.dynlib_syms.contains_key(sym.name.as_str())
-            && !super::shared::is_emitter_defined(&sym.name, section_name_to_idx)
-        {
-            unresolved.push(&sym.name);
-        }
-    }
+    let mut unresolved =
+        unresolved_dynamic_32(global_symbols, &resolved.dynlib_syms, section_name_to_idx);
     if !unresolved.is_empty() {
         unresolved.sort_unstable();
         return Err(unresolved
@@ -305,8 +305,9 @@ pub fn link_builtin(
     merge_gnu_properties(&mut inputs, &opts.properties);
 
     // Phase 5: Merge sections
+    let discarded = compute_comdat_skip(&inputs);
     let (mut output_sections, mut section_name_to_idx, section_map) =
-        merge_sections(&mut inputs, !opts.strip_debug);
+        merge_sections(&mut inputs, !opts.strip_debug, &discarded);
 
     // Phase 6: Resolve symbols
     import_shared_commons(&mut inputs, &resolved.common_imports);
@@ -316,16 +317,15 @@ pub fn link_builtin(
     } else {
         &resolved.dynlib_syms
     };
-    let (mut global_symbols, sym_resolution) =
-        resolve_symbols(&inputs, &output_sections, &section_map, dynlib_for_resolve);
-
-    // Phase 6b: Allocate COMMON symbols in .bss
-    allocate_common_symbols(
+    let mut global_symbols = resolve_symbols(
         &inputs,
+        &section_map,
+        &discarded,
+        dynlib_for_resolve,
+        args.allow_multiple_definition(),
         &mut output_sections,
         &mut section_name_to_idx,
-        &mut global_symbols,
-    );
+    )?;
 
     // Apply --defsym definitions: alias, constant or arithmetic expression
     // (see `apply_defsyms` below for the rationale; the classification lives
@@ -357,7 +357,7 @@ pub fn link_builtin(
     }
 
     // Phase 7: Mark PLT/GOT needs and check undefined
-    let local_got_slots = mark_plt_got_needs(&inputs, &mut global_symbols);
+    let local_got_slots = mark_plt_got_needs(&inputs, &discarded, &mut global_symbols);
 
     check_undefined_symbols(&global_symbols)?;
 
@@ -401,7 +401,6 @@ pub fn link_builtin(
         &section_name_to_idx,
         &section_map,
         &mut global_symbols,
-        &sym_resolution,
         &plt_symbols,
         &got_dyn_symbols,
         &got_local_symbols,
@@ -600,23 +599,24 @@ pub fn link_shared(
     merge_gnu_properties(&mut inputs, &opts.properties);
 
     // Merge sections
+    let discarded = compute_comdat_skip(&inputs);
     let (mut output_sections, mut section_name_to_idx, section_map) =
-        merge_sections(&mut inputs, !opts.strip_debug);
+        merge_sections(&mut inputs, !opts.strip_debug, &discarded);
 
     // Resolve symbols.  The output's undefined references stay undefined
     // (they are bound at load time); the linked shared objects' dynamic
     // symbols decide DT_NEEDED and `--no-undefined` only.
     import_shared_commons(&mut inputs, &resolved.common_imports);
     let no_dynlib_syms: DynlibSyms = FxHashMap::default();
-    let (mut global_symbols, _sym_resolution) =
-        resolve_symbols(&inputs, &output_sections, &section_map, &no_dynlib_syms);
-    // Tentative definitions (`-fcommon`) get .bss space, as in executables.
-    allocate_common_symbols(
+    let mut global_symbols = resolve_symbols(
         &inputs,
+        &section_map,
+        &discarded,
+        &no_dynlib_syms,
+        args.allow_multiple_definition(),
         &mut output_sections,
         &mut section_name_to_idx,
-        &mut global_symbols,
-    );
+    )?;
 
     // Apply --defsym definitions (same order and rationale as the executable
     // path: aliases/constants take effect here, expressions are evaluated
@@ -625,35 +625,17 @@ pub fn link_shared(
     define_tls_module_base(&mut global_symbols, &output_sections);
     apply_visibility_controls_32(&inputs, &mut global_symbols, &opts)?;
 
-    // Undefined non-local references of the output, and which linked shared
-    // object (first in command-line order) satisfies each.
-    let mut unresolved: Vec<&str> = Vec::new();
-    let mut seen: FxHashSet<&str> = FxHashSet::default();
-    for sym in inputs.iter().flat_map(|o| o.symbols.iter()) {
-        if sym.section_index != SHN_UNDEF
-            || sym.name.is_empty()
-            || sym.binding == STB_LOCAL
-            || global_symbols
-                .get(sym.name.as_str())
-                .is_some_and(|g| g.is_defined)
-            || !seen.insert(sym.name.as_str())
-        {
-            continue;
+    if opts.no_undefined {
+        let mut unresolved =
+            unresolved_dynamic_32(&global_symbols, &resolved.dynlib_syms, &section_name_to_idx);
+        if !unresolved.is_empty() {
+            unresolved.sort_unstable();
+            return Err(unresolved
+                .iter()
+                .map(|n| format!("undefined reference to `{n}' (--no-undefined)"))
+                .collect::<Vec<_>>()
+                .join("\n"));
         }
-        if sym.binding != STB_WEAK
-            && !resolved.dynlib_syms.contains_key(sym.name.as_str())
-            && !super::shared::is_emitter_defined(&sym.name, &section_name_to_idx)
-        {
-            unresolved.push(&sym.name);
-        }
-    }
-    if opts.no_undefined && !unresolved.is_empty() {
-        unresolved.sort_unstable();
-        return Err(unresolved
-            .iter()
-            .map(|n| format!("undefined reference to `{n}' (--no-undefined)"))
-            .collect::<Vec<_>>()
-            .join("\n"));
     }
     let needed_sonames = resolved.needed_sonames();
 

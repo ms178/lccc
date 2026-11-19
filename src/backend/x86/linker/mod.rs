@@ -54,6 +54,7 @@ pub fn load_inputs_for_ld(
     out: &mut Vec<crate::backend::linker_common::Elf64Object>,
     undefined: &[String],
     lib_paths: &[String],
+    allow_multiple_definition: bool,
 ) -> Result<(), String> {
     // COMDAT claims are only consulted while symbols are registered (see
     // `ObjectSet`), so they live for the duration of loading; the callers'
@@ -61,6 +62,7 @@ pub fn load_inputs_for_ld(
     // `out` are registered as claims first, exactly as if pushed.
     let mut objects: crate::backend::linker_common::ObjectSet =
         std::mem::take(out).into_iter().collect();
+    objects.set_allow_multiple_definition(allow_multiple_definition);
     let result = load_inputs_into(inputs, &mut objects, undefined, lib_paths);
     *out = objects.into_vec();
     result
@@ -95,13 +97,15 @@ fn load_inputs_into(
         );
     }
     let mut needed_sonames: Vec<String> = Vec::new();
-    let mut fully_loaded: crate::common::fx_hash::FxHashSet<String> =
-        crate::common::fx_hash::FxHashSet::default();
+    let mut fully_loaded = vec![false; inputs.len()];
     let mut changed = true;
     while changed {
         changed = false;
         let before = objects.len();
-        for (path, wa) in inputs {
+        for ((path, wa), consumed) in inputs.iter().zip(&mut fully_loaded) {
+            if *consumed {
+                continue;
+            }
             // Plain .o files and whole-archives are fully consumed on first
             // load; re-loading them would duplicate every symbol. Only
             // selective archives participate in group re-scanning.
@@ -119,9 +123,6 @@ fn load_inputs_into(
                         })
                         .unwrap_or(false)
                 });
-            if !is_selective_archive && fully_loaded.contains(path) {
-                continue;
-            }
             input::load_file(
                 path,
                 objects,
@@ -130,9 +131,7 @@ fn load_inputs_into(
                 lib_paths,
                 *wa,
             )?;
-            if !is_selective_archive {
-                fully_loaded.insert(path.clone());
-            }
+            *consumed = !is_selective_archive;
         }
         if objects.len() != before {
             changed = true;

@@ -108,6 +108,28 @@ class BenchmarkShardPlan(unittest.TestCase):
         flag = [bool(shard.get("gate_steps")) for shard in self.shards]
         self.assertEqual(sum(flag), 1, f"gate_steps set in {sum(flag)} shards")
 
+    def test_all_shards_use_the_pinned_gcc_for_timing(self) -> None:
+        workflow = ROOT / BENCH
+        steps = yaml.safe_load(workflow.read_text())["jobs"]["benchmark"]["steps"]
+        bodies = [[line.strip() for line in (step.get("run") or "").splitlines()]
+                  for step in steps]
+        order = []
+        for command in (
+            "bash scripts/ci_provision_toolchain.sh",
+            "bash scripts/ci_install_gcc_oracle.sh --version 16.2",
+            "bash scripts/ci_verify_oracles.sh --gcc-version 16.2",
+            "python3 .github/scripts/ci-bench.py",
+        ):
+            matches = [i for i, body in enumerate(bodies)
+                       if any(line == command or line.startswith(command + " ") for line in body)]
+            self.assertEqual(len(matches), 1, f"missing or duplicate step: {command}")
+            i, = matches
+            self.assertNotIn("if", steps[i], f"not all shards run {command}")
+            self.assertFalse(steps[i].get("continue-on-error"), f"failures masked: {command}")
+            order.append(i)
+        self.assertEqual(order, sorted(set(order)), "the oracle must be installed and verified before timing")
+        self.assertIn("--gcc gcc-16 \\", bodies[order[-1]])
+
     def test_the_merge_job_depends_on_every_shard(self) -> None:
         merge = next((job for job in self.document["jobs"].values()
                       if (job.get("name") or "").startswith("Complete benchmark corpus")),

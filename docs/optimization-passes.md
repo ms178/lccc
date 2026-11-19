@@ -229,9 +229,10 @@ passes; the backend peepholes are documented per backend
   header-free fixture that forces ten explorations per compile, so no cross
   sysroot is needed and no backend's verdict rests on one lucky pair; x86-64
   additionally compiles real benchmark TUs and repeats at `-O2`. `scripts/measure_peephole_pair.py`
-  regenerates the timings. `CCC_DUMP_ASM` / `CCC_PEEPHOLE_TRACE` suffix their
-  files `-chain`/`-orig` so an explored function keeps both candidates instead
-  of one overwriting the other.
+  regenerates the timings. `CCC_DUMP_ASM` / `CCC_PEEPHOLE_TRACE` use `-chain`
+  and `-orig` for the last distinct pair and `-dedup` for a pair evaluated
+  only once. This keeps a later deduplication from replacing just one leg of
+  the previous pair.
 
 - **Phase-1 dirty-tick skipping** (x86-64, MB-20 step 5) — the peephole's
   phase-1 fixpoint re-runs a sub-pass only when a change was reported since

@@ -19,23 +19,35 @@ arm that got the wrong number — plus an i686 `R_386_TLS_LE_32` and a name,
 `R_386_32S`, that does not exist in the i386 ABI at all. Run it after touching
 any `R_*` constant.
 
-## `oracle_cmp.py` — differential comparison against another linker
+## Linker differential tests and same-object package replay
 
-Links the same inputs with lccc-ld and with an oracle (GNU ld by default) and
-reports divergences both in the accept/reject verdict and in the bytes written.
+[`run_linker_tests.py`](../../tests/linker/run_linker_tests.py) checks feature
+fixtures against GNU ld and available corroborating oracles.
+[`real_workloads.py`](../../tests/linker/real_workloads.py) captures a GCC driver
+link invocation and replays it with the same objects, CRT, and options for each
+linker. Compare the resulting programs' outputs before interpreting link times.
+The latter reports grouped medians; use interleaved pairs for performance claims.
 
-    python3 tools/linker/oracle_cmp.py --help
+    python3 tests/linker/run_linker_tests.py --help
+    python3 tests/linker/real_workloads.py --help
+
+`tools/linker/oracle_cmp.py` is a legacy static i686 compiler-assembly counter,
+not a linker oracle. Its output cannot substitute for either test.
 
 ## `setup_oracles.sh` — build the corroborating linkers
 
 Pinned oracles (user directive): **GNU ld 2.47** (bfd + ld only), **mold
-3.0.0** built with the mold-cli Cargo preset
-`--no-default-features --features x86_64,i386` (mold 3.x removed the CMake
-build and its `-DMOLD_TARGETS=` cache variable; one Cargo feature per target
-crate under `arch/` replaced it — the x86-only preset drops the other
-eighteen target crates on the 2-vCPU host),
-**LLVM lld 23.1.x** (apt.llvm.org release build; the script asserts the `23.1.`
-banner) and wild at git HEAD. The binutils release download is SHA-256-pinned
+3.0.0**, **LLVM lld 23.1.x**, and wild at git HEAD. For functional
+checks `MOLD_PREFER=cache` (default) prefers the digest-pinned upstream mold
+release, probed for both x86 ELF targets on install. For native link timings,
+use `MOLD_PREFER=source`: the mold-cli build uses `-C target-cpu=native` and
+`--no-default-features --features x86_64,i386,system-allocator`. Mold 3.x
+removed CMake and `-DMOLD_TARGETS=`. The two variants have separate backing
+paths, so a warm release cache cannot satisfy a source request. The wrapper
+and inventory refer to the selected variant. Do not share a `native` prefix
+across dissimilar CPUs. LLD comes from apt.llvm.org unless `LLD_BIN` names an
+existing absolute executable; either way, a complete `23.1.<patch>` token
+is required on the version line. The binutils release download is SHA-256-pinned
 like the GAS oracle. Its actual banner is `2.47.20260726`, which the version
 check accepts explicitly alongside `2.47`; it still rejects `2.470`, `2.47.1`,
 and other dated snapshots. This is not permission to substitute any version

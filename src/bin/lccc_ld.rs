@@ -442,6 +442,7 @@ fn run(args: &[String]) -> Result<(), String> {
             // GNU ld's COMMON-symbol diagnostics, implemented by every
             // backend (`linker_common::warn_common`).
             "--warn-common" => passthrough.push("--warn-common".to_string()),
+            "--allow-multiple-definition" => passthrough.push(a.to_string()),
             "--warn-rwx-segments" | "--no-warn-rwx-segments" => {
                 warn_rwx_segments = a == "--warn-rwx-segments";
                 passthrough.push(a.to_string());
@@ -1034,10 +1035,25 @@ fn run(args: &[String]) -> Result<(), String> {
             ));
         }
         let ordered = ordered_args(&passthrough, &positional_files);
+        let reloc_args = lccc::backend::linker_common::parse_linker_args(&ordered);
+        reloc_args.validate_common_options()?;
+        let allow_multiple = reloc_args.allow_multiple_definition();
+        let warnings = reloc_args.z_other_keyword_warnings_except(&["muldefs"]);
+        if fatal_warnings && let Some(first) = warnings.first() {
+            return Err(format!("warning treated as error: {first}"));
+        }
+        for warning in warnings {
+            lccc::cli::stderr_line(format_args!("lccc-ld: warning: {warning}"));
+        }
         let inputs = lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &[], "-r")?;
-        let lib_dirs = lccc::backend::linker_common::parse_linker_args(&ordered).extra_lib_paths;
         let mut objects = Vec::new();
-        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols, &lib_dirs)?;
+        lccc::linker_entry::load_inputs_x86(
+            &inputs,
+            &mut objects,
+            &undefined_symbols,
+            &reloc_args.extra_lib_paths,
+            allow_multiple,
+        )?;
         if trace {
             for obj in &objects {
                 lccc::cli::stdout_line(format_args!("{}", obj.source_name));
@@ -1046,7 +1062,7 @@ fn run(args: &[String]) -> Result<(), String> {
         if strip_debug || !emit_symtab {
             lccc::linker_entry::strip_debug_sections(&mut objects);
         }
-        lccc::linker_entry::link_relocatable_x86(&objects, &output)?;
+        lccc::linker_entry::link_relocatable_x86(&objects, &output, allow_multiple)?;
         return lccc::linker_entry::check_rwx_segments(&output, warn_rwx_segments, fatal_warnings);
     }
 
@@ -1089,7 +1105,8 @@ fn run(args: &[String]) -> Result<(), String> {
             .iter()
             .map(|kw| format!("-z {kw} ignored"))
             .collect();
-        z_warnings.extend(script_args.z_other_keyword_warnings());
+        z_warnings.extend(script_args.z_other_keyword_warnings_except(&["muldefs"]));
+        let allow_multiple_definition = script_args.allow_multiple_definition();
         let mut script_option_warnings = Vec::new();
         if script_args.image_base.is_some() {
             script_option_warnings.push(
@@ -1141,6 +1158,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 &mut objects,
                 &undefined_symbols,
                 &lib_dirs,
+                allow_multiple_definition,
             )?;
             objects
         };
@@ -1172,6 +1190,7 @@ fn run(args: &[String]) -> Result<(), String> {
             print_memory_usage,
             orphan_handling,
             fatal_warnings,
+            allow_multiple_definition,
         };
         let res = if elf_i386 {
             lccc::linker_entry::link_with_script_i386_extras(

@@ -289,8 +289,20 @@ pub fn link_with_args(
                 // Only `.o`/`.os`/`.oS`/`.a` inputs are collected above, so no
                 // linker script can reach the loader here and its `-l` search
                 // path is provably unused; glibc's rtld link passes no `-L`.
-                crate::backend::x86::linker::load_inputs_for_ld(&inputs, &mut objects, &[], &[])?;
-                crate::backend::x86::linker::emit_rel::link_relocatable(&objects, output_path)?;
+                let allow_multiple = crate::backend::linker_common::parse_linker_args(user_args)
+                    .allow_multiple_definition();
+                crate::backend::x86::linker::load_inputs_for_ld(
+                    &inputs,
+                    &mut objects,
+                    &[],
+                    &[],
+                    allow_multiple,
+                )?;
+                crate::backend::x86::linker::emit_rel::link_relocatable(
+                    &objects,
+                    output_path,
+                    allow_multiple,
+                )?;
                 // `-Map FILE` (any spelling): glibc's elf/Makefile builds
                 // librtld.map with `$(reloc-link) ... -Wl,-Map,$@T` and then
                 // scrapes lines of the form `<path>/libc_pic.a(member.os)` to

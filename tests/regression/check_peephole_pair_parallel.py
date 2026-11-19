@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """Dual-layout metric pairs: scheduling contract and reproducible output.
 
-Three properties are checked for **every backend** (x86-64, i686, AArch64,
-RISC-V), because all four run a text peephole over both exploration
-candidates:
+Scheduling, accounting and reproducibility are checked on **every backend**
+(x86-64, i686, AArch64, RISC-V). The x86-64 debug dumps have a separate check:
 
 1. *Scheduling* — `LCCC_PEEPHOLE_PAIR_PARALLEL=0`, unset (heuristic) and `=1`
    must emit byte-identical assembly. The split is latency-only, so no
    assembly-level difference is permitted; the only observable proof that the
    concurrent branch ran is the `[pair] … mode=…` telemetry, which also pins
    the kill switch and the single-thread fallback.
-2. *Accounting* — the counters on the `[pair]` line must add up to the number
-   of pairs the compilation reported. A split that silently stops counting
-   would pass the identity check while proving nothing about which path ran.
+2. *Accounting* — the serial and parallel counters must match their reported
+   modes. Identical candidates increment the dedupe counter but aren't
+   scheduled, so they don't produce a `[pair]` line.
 3. *Reproducibility* — repeated compilation of one source must produce one
    assembly hash. This is what caught RS-1: the RISC-V identical-block pass
    iterated a `std::collections::HashMap`, so its per-process hash seed decided
    `.Lskip_N` labels and block placement, and five serial compilations produced
    five different objects.
+4. *Debug evidence* — on x86-64, `CCC_DUMP_ASM` preserves separate raw
+   metric-candidate dumps alongside the full TU and leaves final assembly
+   identical to the uninstrumented run.
 
 The cross backends are driven with a header-free fixture that triggers ten
 explorations per compile (`peephole_pair/chain_wide.c`), so the gate needs no
@@ -92,7 +94,7 @@ def effective_threads():
     return max(1, threads)
 
 
-def compile_asm(compiler, source, knob, workdir, tag, opt="-O1"):
+def compile_asm(compiler, source, knob, workdir, tag, opt="-O1", *, dump=None):
     """Compile one source in one scheduling mode.
 
     Returns `(sha256, modes, counters)` where `modes` holds one entry per pair
@@ -101,6 +103,9 @@ def compile_asm(compiler, source, knob, workdir, tag, opt="-O1"):
     out = workdir / f"{source.stem}-{tag}.s"
     env = dict(os.environ)
     env.pop("LCCC_PEEPHOLE_PAIR_PARALLEL", None)
+    env.pop("CCC_DUMP_ASM", None)
+    if dump is not None:
+        env["CCC_DUMP_ASM"] = str(dump)
     if knob is not None:
         env["LCCC_PEEPHOLE_PAIR_PARALLEL"] = knob
     env["CCC_TIME_PEEPHOLE"] = "1"
@@ -119,17 +124,42 @@ def compile_asm(compiler, source, knob, workdir, tag, opt="-O1"):
 
 
 def check_accounting(label, source_name, opt, modes, counters, failures):
-    """`parallel + serial + deduped` must equal the number of reported pairs."""
+    """Only scheduled pairs emit mode lines; deduped is a separate counter."""
     if not modes:
         return
     if counters is None:
         failures.append(f"{label}/{source_name} {opt}: telemetry without counters")
         return
-    if sum(counters) != len(modes):
+    expected = (modes.count("parallel"), modes.count("serial"))
+    if counters[:2] != expected or sum(expected) != len(modes):
         failures.append(
-            f"{label}/{source_name} {opt}: counters {counters} do not account for "
-            f"{len(modes)} pairs"
+            f"{label}/{source_name} {opt}: counters {counters} do not match "
+            f"reported modes {modes}"
         )
+
+
+def check_debug_dump(compiler, workdir, expected_sha, threads, failures):
+    dumps = []
+    for knob, mode in (("0", "serial"), ("1", "parallel" if threads > 1 else "serial")):
+        folder = workdir / f"dump-{knob}"
+        folder.mkdir()
+        dump = folder / "peephole.raw.s"
+        digest, modes, _ = compile_asm(compiler, ROOT / WIDE, knob, folder, "dump", dump=dump)
+        paths = [dump, folder / "peephole.raw-chain.s", folder / "peephole.raw-orig.s"]
+        if mode not in modes:
+            failures.append(f"CCC_DUMP_ASM ({knob}): fixture did not run a {mode} pair")
+        missing = [p.name for p in paths if not p.is_file() or not p.stat().st_size]
+        if missing:
+            failures.append(f"CCC_DUMP_ASM ({knob}): missing or empty dumps: {missing}")
+        else:
+            rows = tuple(p.read_bytes() for p in paths)
+            if len(set(rows)) != len(paths):
+                failures.append(f"CCC_DUMP_ASM ({knob}): expected distinct TU/chain/original dumps")
+            dumps.append(rows)
+        if digest != expected_sha:
+            failures.append(f"CCC_DUMP_ASM ({knob}): instrumentation changed final assembly")
+    if len(dumps) == 2 and dumps[0] != dumps[1]:
+        failures.append("CCC_DUMP_ASM: serial and forced dumps differ at the same candidate path")
 
 
 def main():
@@ -206,6 +236,8 @@ def main():
                         "pairs_forced": modes["forced"],
                         "counters_auto": counters["auto"],
                     }
+            if label == "x86-64" and f"{WIDE} -O1" in rows:
+                check_debug_dump(binary, workdir, rows[f"{WIDE} -O1"]["assembly_sha256"], threads, failures)
             if arch_pairs == 0:
                 failures.append(f"{label}: no dual-layout pair measured; the contract is void")
             total_pairs += arch_pairs
@@ -226,8 +258,8 @@ def main():
     detail = ", ".join(f"{label} {row['pairs']}" for label, row in observed.items())
     print(
         f"PASS {len(observed)} backends ({detail} pairs), threads={threads}: "
-        f"identical assembly across serial/auto/forced and across repeats, "
-        f"counters account for every pair"
+        f"identical assembly across serial/auto/forced and across repeats; "
+        f"scheduled pair counters and x86-64 dump bytes match"
     )
     return 0
 

@@ -537,7 +537,7 @@ pub(super) fn merged_headers(
                 flags,
                 vaddrs[i],
                 offsets[i],
-                ms.data.len() as u64,
+                ms.size(),
             )
         })
         .collect()

@@ -56,6 +56,7 @@ pub(crate) const MIN_PARALLEL_PAIR_BYTES: usize = 1024;
 pub(crate) enum MetricCandidate {
     Chain,
     Original,
+    Deduplicated,
 }
 
 impl MetricCandidate {
@@ -63,6 +64,7 @@ impl MetricCandidate {
         match self {
             Self::Chain => "-chain",
             Self::Original => "-orig",
+            Self::Deduplicated => "-dedup",
         }
     }
 }
@@ -86,7 +88,8 @@ pub(crate) fn tag_metric_candidate<R>(candidate: MetricCandidate, job: impl FnOn
     job()
 }
 
-/// `-chain`/`-orig` suffix for an instrument filename; empty outside a pair.
+/// Instrument suffix: `-chain`/`-orig` for distinct legs, `-dedup` for an
+/// identical pair that runs once, and empty outside metric evaluation.
 pub(crate) fn metric_candidate_suffix() -> &'static str {
     METRIC_CANDIDATE
         .with(std::cell::Cell::get)
@@ -263,7 +266,9 @@ pub(crate) fn run_metric_pair(
     // check cannot cost more than a fraction of the pass mix it can skip.
     if first == second {
         PAIRS_DEDUPED.fetch_add(1, RELAXED);
-        let optimized = tag_metric_candidate(MetricCandidate::Chain, || apply(first));
+        // One diagnostic stream for this pair; neither side of a previous
+        // distinct pair should be overwritten.
+        let optimized = tag_metric_candidate(MetricCandidate::Deduplicated, || apply(first));
         return (optimized.clone(), optimized);
     }
     let sizes = (first.len(), second.len());
@@ -381,11 +386,20 @@ mod tests {
     #[test]
     fn identical_candidates_are_processed_once() {
         let before = pair_counters().2;
-        let apply = |text: String| text.to_uppercase();
+        let calls = AtomicUsize::new(0);
+        let apply = |text: String| {
+            calls.fetch_add(1, RELAXED);
+            // A later dedupe must not replace only the chain dump of a
+            // previously explored, distinct pair.
+            assert_eq!(metric_candidate_suffix(), "-dedup");
+            text.to_uppercase()
+        };
         let (first, second) =
             run_metric_pair("test", "same".to_string(), "same".to_string(), apply);
         assert_eq!(first, "SAME");
         assert_eq!(second, "SAME");
+        assert_eq!(calls.load(RELAXED), 1);
+        assert!(metric_candidate_suffix().is_empty());
         assert!(
             pair_counters().2 > before,
             "the dedupe counter must advance (deltas only: it is process-global)"

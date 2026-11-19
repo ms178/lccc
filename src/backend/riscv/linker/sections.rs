@@ -8,7 +8,9 @@ use std::rc::Rc;
 
 use super::debug::{MERGE_FLAGS, gnu_merge_flags};
 use super::elf_read::*;
-use super::relocations::{InputSecRef, MergedSection, output_section_name};
+use super::relocations::{
+    InputSecRef, MergedSection, checked_layout_add, checked_layout_align, output_section_name,
+};
 use crate::backend::elf::{SHF_MERGE, SHF_STRINGS};
 use crate::backend::linker_common::SectionData;
 use crate::backend::linker_common::strmerge_gnu::{self, MergeInput, OffsetMap, Placement};
@@ -168,6 +170,12 @@ pub fn merge_alloc_sections(input_objs: &mut [(String, ElfObject)]) -> MergeAlia
     aliases
 }
 
+type MergedSections = (
+    Vec<MergedSection>,
+    FxHashMap<String, usize>,
+    Vec<InputSecRef>,
+);
+
 /// Merge sections from all input objects into output sections.
 ///
 /// Groups input sections by their canonical output name (e.g., `.text.foo` → `.text`),
@@ -176,11 +184,7 @@ pub fn merge_alloc_sections(input_objs: &mut [(String, ElfObject)]) -> MergeAlia
 pub fn merge_sections(
     input_objs: &[(String, ElfObject)],
     aliases: &MergeAliases,
-) -> (
-    Vec<MergedSection>,
-    FxHashMap<String, usize>,
-    Vec<InputSecRef>,
-) {
+) -> Result<MergedSections, String> {
     let mut merged_sections: Vec<MergedSection> = Vec::new();
     let mut merged_map: FxHashMap<String, usize> = FxHashMap::default();
     let mut input_sec_refs: Vec<InputSecRef> = Vec::new();
@@ -210,6 +214,7 @@ pub fn merge_sections(
                     sh_type: sec.sh_type,
                     sh_flags: sec.flags,
                     data: sec_data.to_owned_vec(),
+                    nobits_size: 0,
                     vaddr: 0,
                     entsize: 0,
                     script_write: false,
@@ -241,6 +246,7 @@ pub fn merge_sections(
                 // known (`gnu_merge_flags` below).
                 sh_flags: (sec.flags & !MERGE_FLAGS) | forced_write,
                 data: Vec::new(),
+                nobits_size: 0,
                 vaddr: 0,
                 entsize: 0,
                 script_write: false,
@@ -267,20 +273,26 @@ pub fn merge_sections(
             continue;
         }
 
-        // Align within merged section data
-        let align = sec.addralign.max(1) as usize;
-        let cur_len = ms.data.len();
-        let aligned = (cur_len + align - 1) & !(align - 1);
-        if aligned > cur_len {
-            ms.data.resize(aligned, 0);
-        }
-        let offset_in_merged = ms.data.len() as u64;
-
-        // Append section data
+        let offset_in_merged = checked_layout_align(ms.size(), sec.addralign.max(1))?;
         if sec.sh_type == SHT_NOBITS {
-            ms.data.resize(ms.data.len() + sec.size as usize, 0);
-        } else {
+            ms.zero_extend_to(checked_layout_add(offset_in_merged, sec.size)?)?;
+        } else if !sec_data.is_empty() {
+            // GNU ld promotes a NOBITS output that receives real bytes. In
+            // that case the preceding NOBITS contributions become file gaps.
+            if ms.sh_type == SHT_NOBITS {
+                ms.sh_type = sec.sh_type;
+                ms.nobits_size = 0;
+            }
+            let end = checked_layout_add(offset_in_merged, sec_data.len() as u64)?;
+            let end = usize::try_from(end)
+                .map_err(|_| format!("RISC-V section {} exceeds host size", ms.name))?;
+            ms.data
+                .try_reserve(end - ms.data.len())
+                .map_err(|_| format!("cannot allocate RISC-V section {} ({end} bytes)", ms.name))?;
+            ms.data.resize(end - sec_data.len(), 0);
             ms.data.extend_from_slice(sec_data);
+        } else {
+            ms.zero_extend_to(offset_in_merged)?;
         }
 
         placed.insert((obj_idx, sec_idx), (merged_idx, offset_in_merged));
@@ -308,7 +320,7 @@ pub fn merge_sections(
         ms.entsize = entsize;
     }
 
-    (merged_sections, merged_map, input_sec_refs)
+    Ok((merged_sections, merged_map, input_sec_refs))
 }
 
 /// Position of input section `name` within output section `out` under GNU
@@ -465,7 +477,7 @@ mod tests {
         assert_eq!(addends(1), [6, 3, 12, 16, 1]);
         assert_eq!(objs[1].1.symbols[1].value, 3);
 
-        let (merged, map, refs) = merge_sections(&objs, &aliases);
+        let (merged, map, refs) = merge_sections(&objs, &aliases).unwrap();
         let rodata = &merged[map[".rodata"]];
         assert_eq!(rodata.data, pool);
         let at = |o: usize| {
@@ -497,7 +509,7 @@ mod tests {
         let aliases = merge_alloc_sections(&mut objs);
         assert!(aliases.is_empty());
         assert_eq!(objs[0].1.relocations[1][0].addend, 1);
-        let (merged, map, _) = merge_sections(&objs, &aliases);
+        let (merged, map, _) = merge_sections(&objs, &aliases).unwrap();
         assert_eq!(merged[map[".rodata"]].data, b"x\0x\0");
     }
 
@@ -516,7 +528,7 @@ mod tests {
         );
         a.section_data[2] = SectionData::owned(vec![1; 8]);
         let objs = vec![("a.o".to_string(), a)];
-        let (merged, map, _) = merge_sections(&objs, &MergeAliases::default());
+        let (merged, map, _) = merge_sections(&objs, &MergeAliases::default()).unwrap();
         let sdata = &merged[map[".sdata"]];
         assert!(sdata.script_write);
         assert_ne!(sdata.sh_flags & SHF_WRITE, 0);

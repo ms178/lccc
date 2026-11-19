@@ -433,6 +433,9 @@ pub struct MergedSection {
     pub sh_type: u32,
     pub sh_flags: u64,
     pub data: Vec<u8>,
+    /// Virtual extent when `sh_type == SHT_NOBITS`. Such sections have no
+    /// payload, including during each relaxation layout probe.
+    pub nobits_size: u64,
     pub vaddr: u64,
     pub align: u64,
     /// `sh_entsize` while the output keeps `SHF_MERGE` (GNU ld's rule,
@@ -442,6 +445,51 @@ pub struct MergedSection {
     /// only `.srodata` inputs fill sits in the RW segment): layout honours
     /// it, the section header keeps the inputs' flags as GNU ld's does.
     pub script_write: bool,
+}
+
+impl MergedSection {
+    pub fn size(&self) -> u64 {
+        if self.sh_type == SHT_NOBITS {
+            self.nobits_size
+        } else {
+            self.data.len() as u64
+        }
+    }
+
+    /// Grow the extent of a NOBITS section, or materialize a zero gap in a
+    /// file-backed section. The latter is needed for legitimately mixed
+    /// outputs, never for an ordinary COMMON, BSS, or TBSS allocation.
+    pub fn zero_extend_to(&mut self, end: u64) -> Result<(), String> {
+        if self.sh_type == SHT_NOBITS {
+            debug_assert!(self.data.is_empty());
+            self.nobits_size = end;
+        } else {
+            let end = usize::try_from(end)
+                .map_err(|_| format!("RISC-V section {} exceeds host size", self.name))?;
+            self.data
+                .try_reserve(end.saturating_sub(self.data.len()))
+                .map_err(|_| {
+                    format!("cannot allocate RISC-V section {} ({end} bytes)", self.name)
+                })?;
+            self.data.resize(end, 0);
+        }
+        Ok(())
+    }
+}
+
+/// The virtual extent of NOBITS isn't bounded by the host allocator. Keep
+/// address math checked even for a section with no file bytes at all.
+pub(super) fn checked_layout_add(addr: u64, size: u64) -> Result<u64, String> {
+    addr.checked_add(size)
+        .ok_or_else(|| "RISC-V section layout exceeds address space".into())
+}
+
+pub(super) fn checked_layout_align(addr: u64, align: u64) -> Result<u64, String> {
+    if !align.is_power_of_two() {
+        return Err(format!("invalid RISC-V section alignment {align}"));
+    }
+    addr.checked_next_multiple_of(align)
+        .ok_or_else(|| "RISC-V section alignment exceeds address space".into())
 }
 
 /// Tracks where each input section maps to in the merged output.

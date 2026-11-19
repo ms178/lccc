@@ -305,8 +305,7 @@ pub(super) fn check_capabilities(
             // The layout always keeps headers, code and read-only data in
             // separate segments; `noseparate-code` would only save a page.
             ("separate-code" | "noseparate-code" | "combreloc" | "nocombreloc", None) => {}
-            // Duplicate strong definitions resolve to the first one
-            // (never diagnosed by this linker), which is exactly muldefs.
+            // Enforced during symbol resolution (also --allow-multiple-definition).
             ("muldefs", None) => {}
             ("max-page-size", Some(_)) => {}
             ("nocopyreloc", None) => return unsupported("-z nocopyreloc"),

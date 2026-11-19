@@ -134,10 +134,12 @@ pub(super) fn emit_shared_library(
         }
     }
 
-    // Add undefined/dynamic symbols referenced by ADRP/ADD/LDST to dyn_sym_names
-    // so they get GLOB_DAT relocations and the dynamic linker can resolve them.
-    for obj in objects.iter() {
-        for sec_relas in &obj.relocations {
+    // Add undefined/dynamic symbols used by address materialization and by
+    // allocated ABS64 slots. Absolute imports need a symbolic relocation,
+    // not a link-time value or RELATIVE+0.
+    let imported_abs64 = |g: &GlobalSymbol| g.is_dynamic || g.defined_in.is_none();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (input, sec_relas) in obj.relocations.iter().enumerate() {
             for rela in sec_relas {
                 let si = rela.sym_idx as usize;
                 if si >= obj.symbols.len() {
@@ -160,6 +162,20 @@ pub(super) fn emit_shared_library(
                             sym.is_undefined() && !sym.is_local()
                         };
                         if sym_needs_got && !dyn_sym_names.contains(&sym.name.to_string()) {
+                            dyn_sym_names.push(sym.name.to_string());
+                        }
+                    }
+                    R_AARCH64_ABS64 if !sym.is_local() => {
+                        let loaded = section_map.get(&(oi, input)).is_some_and(|&(out, _)| {
+                            output_sections[out].flags & SHF_ALLOC != 0
+                                && output_sections[out].sh_type != SHT_NOBITS
+                        });
+                        if loaded
+                            && globals
+                                .get(sym.name.as_str())
+                                .is_some_and(|g| imported_abs64(g) && g.visibility == STV_DEFAULT)
+                            && !dyn_sym_names.iter().any(|n| n == sym.name.as_str())
+                        {
                             dyn_sym_names.push(sym.name.to_string());
                         }
                     }
@@ -482,7 +498,7 @@ pub(super) fn emit_shared_library(
     let mut max_rela_count: usize = 0;
     let tls_got = TlsGot::collect(objects, globals);
     max_rela_count += tls_got.dynamic_reloc_count();
-    // Count ABS64 relocations (become RELATIVE)
+    // Count ABS64 relocations (RELATIVE or symbolic imports).
     for obj in objects.iter() {
         for sec_relas in &obj.relocations {
             for rela in sec_relas {
@@ -739,7 +755,7 @@ pub(super) fn emit_shared_library(
     // Update globals
     for (_, gsym) in globals.iter_mut() {
         if let Some(obj_idx) = gsym.defined_in {
-            if gsym.section_idx == SHN_COMMON || gsym.section_idx == 0xffff {
+            if gsym.allocated_common {
                 if let Some(bss_sec) = output_sections.iter().find(|s| s.name == ".bss") {
                     gsym.value += bss_sec.addr;
                 }
@@ -780,6 +796,7 @@ pub(super) fn emit_shared_library(
             plt_idx: None,
             got_idx: None,
             section_idx: SHN_ABS,
+            allocated_common: false,
             is_dynamic: false,
             copy_reloc: false,
             lib_sym_value: 0,
@@ -1270,10 +1287,37 @@ pub(super) fn emit_shared_library(
 
                 match rela.rela_type {
                     R_AARCH64_ABS64 => {
-                        let val = (s as i64 + a) as u64;
-                        w64(&mut out, fp, val);
-                        if s != 0 {
-                            rela_dyn_entries.push((p, R_AARCH64_RELATIVE_DYN, val));
+                        let import = globals_snap
+                            .get(sym.name.as_str())
+                            .filter(|g| !sym.is_local() && imported_abs64(g));
+                        if let Some(g) = import {
+                            if g.visibility == STV_DEFAULT {
+                                let idx = dyn_sym_names
+                                    .iter()
+                                    .position(|name| name == sym.name.as_str())
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "missing dynamic symbol for ABS64 import '{}'",
+                                            sym.name
+                                        )
+                                    })?;
+                                let info = (((idx + 1) as u64) << 32) | u64::from(R_AARCH64_ABS64);
+                                w64(&mut out, fp, 0);
+                                rela_dyn_entries.push((p, info, a as u64));
+                            } else if g.info >> 4 == STB_WEAK {
+                                w64(&mut out, fp, a as u64);
+                            } else {
+                                return Err(format!(
+                                    "undefined non-default-visible AArch64 symbol '{}'",
+                                    sym.name
+                                ));
+                            }
+                        } else {
+                            let val = s.wrapping_add_signed(a);
+                            w64(&mut out, fp, val);
+                            if s != 0 {
+                                rela_dyn_entries.push((p, R_AARCH64_RELATIVE_DYN, val));
+                            }
                         }
                     }
                     R_AARCH64_ABS32 => {

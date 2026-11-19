@@ -21,7 +21,6 @@ pub(super) fn emit_executable(
     section_name_to_idx: &FxHashMap<String, usize>,
     section_map: &SectionMap,
     global_symbols: &mut FxHashMap<String, LinkerSymbol>,
-    _sym_resolution: &FxHashMap<(usize, usize), String>,
     plt_symbols: &[String],
     got_dyn_symbols: &[String],
     got_local_symbols: &[String],

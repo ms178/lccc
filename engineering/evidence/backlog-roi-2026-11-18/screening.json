@@ -1,0 +1,4055 @@
+{
+  "compiler_work": {
+    "a_a": {
+      "binaries": {
+        "mine": {
+          "original": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8"
+        },
+        "ref": {
+          "original": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8"
+        }
+      },
+      "complete": true,
+      "error": null,
+      "flags": [
+        "-O1"
+      ],
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_overrides": {},
+      "metric": "simulated compiler work; NOT wall-clock speedup",
+      "results": [
+        {
+          "median_ir_ratio": 1.0000018426280362,
+          "rounds": [
+            {
+              "arms": {
+                "mine": {
+                  "assembly_sha256": "24e73412558abcb2f2b4fb4c9ff8904c0cd018b9ff1c4f6c93c560ac6fd6d9f8",
+                  "command": [
+                    "valgrind",
+                    "--tool=callgrind",
+                    "--cache-sim=yes",
+                    "--branch-sim=yes",
+                    "--quiet",
+                    "--I1=32768,8,64",
+                    "--D1=32768,8,64",
+                    "--LL=33554432,16,64",
+                    "--callgrind-out-file=/home/user/lccc/target/roi-20261118/compiler-aa/aa/case-0-round-0.cg",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/aa/compiler",
+                    "-O1",
+                    "-S",
+                    "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c",
+                    "-o",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/aa/case-0.s"
+                  ],
+                  "events": {
+                    "Bc": 94474586,
+                    "Bcm": 4568949,
+                    "Bi": 11344231,
+                    "Bim": 1063822,
+                    "D1mr": 1663125,
+                    "D1mw": 475414,
+                    "DLmr": 27666,
+                    "DLmw": 59152,
+                    "Dr": 124539569,
+                    "Dw": 62408466,
+                    "I1mr": 1441703,
+                    "ILmr": 57685,
+                    "Ir": 567125978
+                  },
+                  "native_stderr": "",
+                  "profile_sha256": "9dcc4419a692e878287d314ab423cf6d8793489199bacf14574146b34e675ece",
+                  "stderr": "--4488-- warning: L3 cache found, using its data for the LL simulation.\n--4488-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--4488-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n"
+                },
+                "ref": {
+                  "assembly_sha256": "24e73412558abcb2f2b4fb4c9ff8904c0cd018b9ff1c4f6c93c560ac6fd6d9f8",
+                  "command": [
+                    "valgrind",
+                    "--tool=callgrind",
+                    "--cache-sim=yes",
+                    "--branch-sim=yes",
+                    "--quiet",
+                    "--I1=32768,8,64",
+                    "--D1=32768,8,64",
+                    "--LL=33554432,16,64",
+                    "--callgrind-out-file=/home/user/lccc/target/roi-20261118/compiler-aa/bb/case-0-round-0.cg",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/bb/compiler",
+                    "-O1",
+                    "-S",
+                    "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c",
+                    "-o",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/bb/case-0.s"
+                  ],
+                  "events": {
+                    "Bc": 94474422,
+                    "Bcm": 4568857,
+                    "Bi": 11344222,
+                    "Bim": 1063821,
+                    "D1mr": 1663136,
+                    "D1mw": 475427,
+                    "DLmr": 27666,
+                    "DLmw": 59152,
+                    "Dr": 124539386,
+                    "Dw": 62408421,
+                    "I1mr": 1441700,
+                    "ILmr": 57685,
+                    "Ir": 567124652
+                  },
+                  "native_stderr": "",
+                  "profile_sha256": "253dad860dbb69400f066d5760492636b2088fb0616a1e79d2cec89e18969f16",
+                  "stderr": "--4506-- warning: L3 cache found, using its data for the LL simulation.\n--4506-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--4506-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n"
+                }
+              },
+              "ir_ratio": 1.0000023381103171,
+              "order": [
+                "mine",
+                "ref"
+              ]
+            },
+            {
+              "arms": {
+                "mine": {
+                  "assembly_sha256": "24e73412558abcb2f2b4fb4c9ff8904c0cd018b9ff1c4f6c93c560ac6fd6d9f8",
+                  "command": [
+                    "valgrind",
+                    "--tool=callgrind",
+                    "--cache-sim=yes",
+                    "--branch-sim=yes",
+                    "--quiet",
+                    "--I1=32768,8,64",
+                    "--D1=32768,8,64",
+                    "--LL=33554432,16,64",
+                    "--callgrind-out-file=/home/user/lccc/target/roi-20261118/compiler-aa/aa/case-0-round-1.cg",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/aa/compiler",
+                    "-O1",
+                    "-S",
+                    "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c",
+                    "-o",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/aa/case-0.s"
+                  ],
+                  "events": {
+                    "Bc": 94474544,
+                    "Bcm": 4569032,
+                    "Bi": 11344238,
+                    "Bim": 1063821,
+                    "D1mr": 1663155,
+                    "D1mw": 475410,
+                    "DLmr": 27666,
+                    "DLmw": 59128,
+                    "Dr": 124539584,
+                    "Dw": 62408501,
+                    "I1mr": 1441705,
+                    "ILmr": 57686,
+                    "Ir": 567125737
+                  },
+                  "native_stderr": "",
+                  "profile_sha256": "e136117b43d339fb81f8f5ecdcaa503227966949ca42888d74ac61787462ea45",
+                  "stderr": "--4677-- warning: L3 cache found, using its data for the LL simulation.\n--4677-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--4677-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n"
+                },
+                "ref": {
+                  "assembly_sha256": "24e73412558abcb2f2b4fb4c9ff8904c0cd018b9ff1c4f6c93c560ac6fd6d9f8",
+                  "command": [
+                    "valgrind",
+                    "--tool=callgrind",
+                    "--cache-sim=yes",
+                    "--branch-sim=yes",
+                    "--quiet",
+                    "--I1=32768,8,64",
+                    "--D1=32768,8,64",
+                    "--LL=33554432,16,64",
+                    "--callgrind-out-file=/home/user/lccc/target/roi-20261118/compiler-aa/bb/case-0-round-1.cg",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/bb/compiler",
+                    "-O1",
+                    "-S",
+                    "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c",
+                    "-o",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/bb/case-0.s"
+                  ],
+                  "events": {
+                    "Bc": 94474445,
+                    "Bcm": 4568897,
+                    "Bi": 11344234,
+                    "Bim": 1063822,
+                    "D1mr": 1663125,
+                    "D1mw": 475409,
+                    "DLmr": 27666,
+                    "DLmw": 59152,
+                    "Dr": 124539454,
+                    "Dw": 62408455,
+                    "I1mr": 1441705,
+                    "ILmr": 57686,
+                    "Ir": 567124973
+                  },
+                  "native_stderr": "",
+                  "profile_sha256": "9d29a248a4063fb9ed2e8ff47ab8ba2a0d2902caf804c9ed26e1ebff63ac5eb0",
+                  "stderr": "--4510-- warning: L3 cache found, using its data for the LL simulation.\n--4510-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--4510-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n"
+                }
+              },
+              "ir_ratio": 1.0000013471457552,
+              "order": [
+                "ref",
+                "mine"
+              ]
+            }
+          ],
+          "source": "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c",
+          "source_sha256": "be935c02412c54a626eb1ddef26af46f4f61d14adcbc488fd92cb313863e6a2f"
+        },
+        {
+          "median_ir_ratio": 0.9999973467638528,
+          "rounds": [
+            {
+              "arms": {
+                "mine": {
+                  "assembly_sha256": "f5a014c320dd04230f192da494caed737cc7a8651c9b966e3749c232767fbb8e",
+                  "command": [
+                    "valgrind",
+                    "--tool=callgrind",
+                    "--cache-sim=yes",
+                    "--branch-sim=yes",
+                    "--quiet",
+                    "--I1=32768,8,64",
+                    "--D1=32768,8,64",
+                    "--LL=33554432,16,64",
+                    "--callgrind-out-file=/home/user/lccc/target/roi-20261118/compiler-aa/aa/case-1-round-0.cg",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/aa/compiler",
+                    "-O1",
+                    "-S",
+                    "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c",
+                    "-o",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/aa/case-1.s"
+                  ],
+                  "events": {
+                    "Bc": 157009450,
+                    "Bcm": 7136604,
+                    "Bi": 18352072,
+                    "Bim": 1658702,
+                    "D1mr": 4151923,
+                    "D1mw": 943788,
+                    "DLmr": 28523,
+                    "DLmw": 81690,
+                    "Dr": 215087969,
+                    "Dw": 107669753,
+                    "I1mr": 1949433,
+                    "ILmr": 60454,
+                    "Ir": 959015183
+                  },
+                  "native_stderr": "",
+                  "profile_sha256": "dcd68895edbf740ff66019166210f47e03453dec4d7d2a2cfc53e510c4ff6aa6",
+                  "stderr": "--4696-- warning: L3 cache found, using its data for the LL simulation.\n--4696-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--4696-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n"
+                },
+                "ref": {
+                  "assembly_sha256": "f5a014c320dd04230f192da494caed737cc7a8651c9b966e3749c232767fbb8e",
+                  "command": [
+                    "valgrind",
+                    "--tool=callgrind",
+                    "--cache-sim=yes",
+                    "--branch-sim=yes",
+                    "--quiet",
+                    "--I1=32768,8,64",
+                    "--D1=32768,8,64",
+                    "--LL=33554432,16,64",
+                    "--callgrind-out-file=/home/user/lccc/target/roi-20261118/compiler-aa/bb/case-1-round-0.cg",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/bb/compiler",
+                    "-O1",
+                    "-S",
+                    "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c",
+                    "-o",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/bb/case-1.s"
+                  ],
+                  "events": {
+                    "Bc": 157009767,
+                    "Bcm": 7136742,
+                    "Bi": 18352095,
+                    "Bim": 1658702,
+                    "D1mr": 4151890,
+                    "D1mw": 943785,
+                    "DLmr": 28523,
+                    "DLmw": 81690,
+                    "Dr": 215088274,
+                    "Dw": 107669892,
+                    "I1mr": 1949434,
+                    "ILmr": 60454,
+                    "Ir": 959017711
+                  },
+                  "native_stderr": "",
+                  "profile_sha256": "93d87c3f6945338d8417fa7b7afa764f0787ffd60f0c1b2b5f2fc775bbf2be81",
+                  "stderr": "--4700-- warning: L3 cache found, using its data for the LL simulation.\n--4700-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--4700-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n"
+                }
+              },
+              "ir_ratio": 0.9999973639694335,
+              "order": [
+                "mine",
+                "ref"
+              ]
+            },
+            {
+              "arms": {
+                "mine": {
+                  "assembly_sha256": "f5a014c320dd04230f192da494caed737cc7a8651c9b966e3749c232767fbb8e",
+                  "command": [
+                    "valgrind",
+                    "--tool=callgrind",
+                    "--cache-sim=yes",
+                    "--branch-sim=yes",
+                    "--quiet",
+                    "--I1=32768,8,64",
+                    "--D1=32768,8,64",
+                    "--LL=33554432,16,64",
+                    "--callgrind-out-file=/home/user/lccc/target/roi-20261118/compiler-aa/aa/case-1-round-1.cg",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/aa/compiler",
+                    "-O1",
+                    "-S",
+                    "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c",
+                    "-o",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/aa/case-1.s"
+                  ],
+                  "events": {
+                    "Bc": 157009399,
+                    "Bcm": 7136439,
+                    "Bi": 18352070,
+                    "Bim": 1658702,
+                    "D1mr": 4151928,
+                    "D1mw": 943773,
+                    "DLmr": 28523,
+                    "DLmw": 81690,
+                    "Dr": 215087910,
+                    "Dw": 107669723,
+                    "I1mr": 1949439,
+                    "ILmr": 60454,
+                    "Ir": 959014808
+                  },
+                  "native_stderr": "",
+                  "profile_sha256": "a6d69827613f417f54d7dad22d1e2ba23a231494b2d146cb76a6aff062605f83",
+                  "stderr": "--4751-- warning: L3 cache found, using its data for the LL simulation.\n--4751-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--4751-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n"
+                },
+                "ref": {
+                  "assembly_sha256": "f5a014c320dd04230f192da494caed737cc7a8651c9b966e3749c232767fbb8e",
+                  "command": [
+                    "valgrind",
+                    "--tool=callgrind",
+                    "--cache-sim=yes",
+                    "--branch-sim=yes",
+                    "--quiet",
+                    "--I1=32768,8,64",
+                    "--D1=32768,8,64",
+                    "--LL=33554432,16,64",
+                    "--callgrind-out-file=/home/user/lccc/target/roi-20261118/compiler-aa/bb/case-1-round-1.cg",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/bb/compiler",
+                    "-O1",
+                    "-S",
+                    "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c",
+                    "-o",
+                    "/home/user/lccc/target/roi-20261118/compiler-aa/bb/case-1.s"
+                  ],
+                  "events": {
+                    "Bc": 157009692,
+                    "Bcm": 7136643,
+                    "Bi": 18352097,
+                    "Bim": 1658702,
+                    "D1mr": 4151918,
+                    "D1mw": 943773,
+                    "DLmr": 28523,
+                    "DLmw": 81690,
+                    "Dr": 215088277,
+                    "Dw": 107669802,
+                    "I1mr": 1949431,
+                    "ILmr": 60454,
+                    "Ir": 959017369
+                  },
+                  "native_stderr": "",
+                  "profile_sha256": "2d4828fac8c307fb6d6d939b55210d957f8d3f335a608235e45b93be713037a3",
+                  "stderr": "--4738-- warning: L3 cache found, using its data for the LL simulation.\n--4738-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--4738-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n"
+                }
+              },
+              "ir_ratio": 0.999997329558272,
+              "order": [
+                "ref",
+                "mine"
+              ]
+            }
+          ],
+          "source": "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c",
+          "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b"
+        }
+      ],
+      "valgrind": {
+        "command": [
+          "valgrind"
+        ],
+        "executable": "/home/user/.cache/lccc/agent-toolchains/debs-root/usr/bin/valgrind",
+        "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+        "version": "valgrind-3.19.0"
+      }
+    },
+    "affinity": "CPU 0",
+    "frozen_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+    "mixed_source_seed": 20261024,
+    "opt": "-O1 -S",
+    "pair_parallel": "0",
+    "profiles": [
+      {
+        "breakdown": {
+          "hash_function_self": 177711607,
+          "label_refs_inclusive": 161063594,
+          "metric_pair_inclusive": 2847773795,
+          "peephole_inclusive": 4421382460
+        },
+        "command": "/home/user/lccc/target/roi-20261118/lccc-main -O1 -S /home/user/lccc/target/roi-20261118/mixed-40.c -o /home/user/lccc/target/roi-20261118/mixed-40-profile.s",
+        "ir": 6764409752,
+        "profile_sha256": "47501f771eb7c9dffd923bf7293febf9de5c71b1c528a2408c215b87bea3311a",
+        "source_sha256": "d97256427b10c565bffb02d663ed6b63a3f74f8e72238cd9134401fe497d002a",
+        "tu": "mixed-40"
+      },
+      {
+        "breakdown": {
+          "hash_function_self": 20608492,
+          "label_refs_inclusive": 28949886,
+          "metric_pair_inclusive": 434126518,
+          "peephole_inclusive": 670106142
+        },
+        "command": "/home/user/lccc/target/roi-20261118/lccc-main -O1 -S /home/user/lccc/tests/benchmark/programs/zlib_ng_huffman_heap.c -o /home/user/lccc/target/roi-20261118/zlib_ng_huffman_heap-profile.s",
+        "ir": 1274924249,
+        "profile_sha256": "637b63769464ef413298d791ba6181afa7761835d983ebb80a18b7fe110cf8cf",
+        "source_sha256": "1ee248f1113c5e4ff4e12cff33ae7575e6427ae5c80caf093811a7f2f6a0aa00",
+        "tu": "zlib_ng_huffman_heap"
+      }
+    ],
+    "valgrind": "3.19.0"
+  },
+  "generated_runtime": {
+    "aggregate_lccc_vs_best_reference": {
+      "arithmetic_mean_ratio": 1.0802844254685722,
+      "best": {
+        "benchmark": "glibc_dl_hash",
+        "ratio": 0.9519441035137877,
+        "reference": "gcc"
+      },
+      "geometric_mean_ratio": 1.0737210866140894,
+      "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+      "n_correct_benchmarks": 7,
+      "worst": {
+        "benchmark": "zlib_ng_compare256",
+        "ratio": 1.3092115624942957,
+        "reference": "clang"
+      }
+    },
+    "aggregate_lccc_vs_gcc": {
+      "arithmetic_mean_ratio": 1.0147022339757483,
+      "best": {
+        "benchmark": "gzip_longest_match",
+        "ratio": 0.8967235925002619
+      },
+      "geometric_mean_ratio": 1.0113680560558416,
+      "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+      "n_correct_benchmarks": 7,
+      "worst": {
+        "benchmark": "zlib_ng_huffman_heap",
+        "ratio": 1.1671673412259242
+      }
+    },
+    "benchmarks": [
+      {
+        "compile": {
+          "clang": {
+            "binary_sha256": "bad947be6a731bd51ed33f34a9615aff5eda214bc1a4291fd37038081d7dd858",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/zlib_ng_compare256/clang/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c"
+            ],
+            "text_bytes": 3831
+          },
+          "gcc": {
+            "binary_sha256": "963366b9024d0e5477be3291f24d34d47a01479153d52b663330dd49fd9d91b6",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/zlib_ng_compare256/gcc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c"
+            ],
+            "text_bytes": 2996
+          },
+          "lccc": {
+            "binary_sha256": "e4643d776d246c505d08d32c52a24922f7dad2dfa4d2cf6bd60a3eba0320a68b",
+            "command": [
+              "/home/user/lccc/target/fastbuild/lccc",
+              "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/zlib_ng_compare256/lccc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c"
+            ],
+            "text_bytes": 2655
+          }
+        },
+        "exact_stdout": "zlib_ng_compare256 checksum=5588436955107386243\n",
+        "id": "zlib_ng_compare256",
+        "median_wall_s": {
+          "clang": 0.0053881829999999995,
+          "gcc": 0.0072971649999999996,
+          "lccc": 0.007023633
+        },
+        "quality_warnings": {
+          "clang": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+            "wall-clock coefficient of variation is 5.3% (>5%)",
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "gcc": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate"
+          ],
+          "lccc": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+            "wall-clock coefficient of variation is 6.6% (>5%)",
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ]
+        },
+        "ratio_lccc_over": {
+          "clang": {
+            "median": 1.3092115624942957,
+            "median_ci95_bootstrap": [
+              1.283749174171548,
+              1.338692368387364
+            ]
+          },
+          "gcc": {
+            "median": 0.9829080189643422,
+            "median_ci95_bootstrap": [
+              0.9488171661027234,
+              0.9946516734704812
+            ]
+          }
+        },
+        "source": "tests/benchmark/programs/zlib_ng_compare256.c",
+        "source_sha256": "be935c02412c54a626eb1ddef26af46f4f61d14adcbc488fd92cb313863e6a2f",
+        "timed_rounds": [
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.007094015,
+              0.005282766,
+              0.00705261
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.005337582,
+              0.007104818,
+              0.00716497
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.00858562,
+              0.006361063,
+              0.00733159
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.006954523,
+              0.007292847,
+              0.005327542
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.007129252,
+              0.006994656,
+              0.005391623
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.007407034,
+              0.005384743,
+              0.006786001
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.007448788,
+              0.005350248,
+              0.006965797
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.005606379,
+              0.006914498,
+              0.007184074
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.005475673,
+              0.007301483,
+              0.007189737
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.005409555,
+              0.006871104,
+              0.007495499
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.007249936,
+              0.007214701,
+              0.005494294
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.00537405,
+              0.007230312,
+              0.00731225
+            ]
+          }
+        ]
+      },
+      {
+        "compile": {
+          "clang": {
+            "binary_sha256": "578016d9f259b8a6e92d8fbe313e83af8bc13fd63a156f8e052b8c566bec026d",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/zlib_ng_huffman_heap/clang/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/zlib_ng_huffman_heap.c"
+            ],
+            "text_bytes": 5467
+          },
+          "gcc": {
+            "binary_sha256": "94490cee556e3b8c54bb3474fed9a0b998e571f977ce664599688e5d7101f611",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/zlib_ng_huffman_heap/gcc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/zlib_ng_huffman_heap.c"
+            ],
+            "text_bytes": 4845
+          },
+          "lccc": {
+            "binary_sha256": "b42e1e659fc06ac768155ddd560c47c68129dcf58ad53cd95cc6ec593e9b039c",
+            "command": [
+              "/home/user/lccc/target/fastbuild/lccc",
+              "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/zlib_ng_huffman_heap/lccc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/zlib_ng_huffman_heap.c"
+            ],
+            "text_bytes": 4894
+          }
+        },
+        "exact_stdout": "d700f2be5f117725\n",
+        "id": "zlib_ng_huffman_heap",
+        "median_wall_s": {
+          "clang": 0.1302388075,
+          "gcc": 0.1348452175,
+          "lccc": 0.157543088
+        },
+        "quality_warnings": {
+          "clang": [],
+          "gcc": [],
+          "lccc": []
+        },
+        "ratio_lccc_over": {
+          "clang": {
+            "median": 1.2072706194947318,
+            "median_ci95_bootstrap": [
+              1.2002400492357386,
+              1.2166843792088367
+            ]
+          },
+          "gcc": {
+            "median": 1.1671673412259242,
+            "median_ci95_bootstrap": [
+              1.156564269243539,
+              1.181474462942907
+            ]
+          }
+        },
+        "source": "tests/benchmark/programs/zlib_ng_huffman_heap.c",
+        "source_sha256": "1ee248f1113c5e4ff4e12cff33ae7575e6427ae5c80caf093811a7f2f6a0aa00",
+        "timed_rounds": [
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.13561085,
+              0.157751404,
+              0.131379046
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.129644644,
+              0.134500835,
+              0.156666831
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.1321768,
+              0.157334772,
+              0.128906791
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.130988137,
+              0.156244765,
+              0.1351896
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.130988531,
+              0.130470482,
+              0.158239489
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.134328758,
+              0.158851791,
+              0.128710389
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.1358747,
+              0.129399525,
+              0.159219338
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.156031845,
+              0.13341383,
+              0.133892321
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.132645503,
+              0.159140807,
+              0.139425302
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.138176811,
+              0.155922087,
+              0.1293126
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.157950608,
+              0.133812322,
+              0.13029807
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.157010657,
+              0.135660058,
+              0.130179545
+            ]
+          }
+        ]
+      },
+      {
+        "compile": {
+          "clang": {
+            "binary_sha256": "f8596cdc7dad84a6138ef57b461a372cee09bd72b86c4107345d48a29566fe02",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/gzip_longest_match/clang/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c"
+            ],
+            "text_bytes": 4415
+          },
+          "gcc": {
+            "binary_sha256": "5d72d1e5ea4934b29301752793dd5565927fb314717bca40439e09bf772b6172",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/gzip_longest_match/gcc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c"
+            ],
+            "text_bytes": 2492
+          },
+          "lccc": {
+            "binary_sha256": "89549f4361db98a89442f6323309a01ca01a04f31d962da56214ffb8024ff674",
+            "command": [
+              "/home/user/lccc/target/fastbuild/lccc",
+              "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/gzip_longest_match/lccc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c"
+            ],
+            "text_bytes": 2843
+          }
+        },
+        "exact_stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+        "id": "gzip_longest_match",
+        "median_wall_s": {
+          "clang": 0.10748028400000001,
+          "gcc": 0.1181675905,
+          "lccc": 0.105948309
+        },
+        "quality_warnings": {
+          "clang": [],
+          "gcc": [],
+          "lccc": [
+            "2 MAD outlier(s) retained (never silently discarded)"
+          ]
+        },
+        "ratio_lccc_over": {
+          "clang": {
+            "median": 0.9859726423489656,
+            "median_ci95_bootstrap": [
+              0.9735980536976176,
+              0.9949754408033749
+            ]
+          },
+          "gcc": {
+            "median": 0.8967235925002619,
+            "median_ci95_bootstrap": [
+              0.8843572290021149,
+              0.9134043856632551
+            ]
+          }
+        },
+        "source": "tests/benchmark/programs/gzip_longest_match.c",
+        "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+        "timed_rounds": [
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.104089558,
+              0.10143235,
+              0.11469172
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.108162255,
+              0.106368441,
+              0.11924035
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.118328239,
+              0.109757072,
+              0.108866062
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.107665014,
+              0.10583177,
+              0.117408682
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.101373052,
+              0.106994354,
+              0.116676493
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.105035277,
+              0.106200805,
+              0.118774756
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.120809663,
+              0.106064848,
+              0.107295554
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.108112984,
+              0.105164116,
+              0.114835236
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.115610844,
+              0.105812508,
+              0.105945175
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.108409233,
+              0.118697293,
+              0.108199884
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.106451973,
+              0.119388105,
+              0.105139841
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.107142317,
+              0.112848484,
+              0.118006942
+            ]
+          }
+        ]
+      },
+      {
+        "compile": {
+          "clang": {
+            "binary_sha256": "9361f8748cd10660c13d1a3ca0373964fe35b0617c72d3f9635fc7230baccdd5",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/expat_utf8_content/clang/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/expat_utf8_content.c"
+            ],
+            "text_bytes": 3043
+          },
+          "gcc": {
+            "binary_sha256": "0430a6dbeae6f346ecb9fe4ed7e6a81b97c0d645eafce8fe929ad8b7aa9e38c8",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/expat_utf8_content/gcc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/expat_utf8_content.c"
+            ],
+            "text_bytes": 3428
+          },
+          "lccc": {
+            "binary_sha256": "a21bbfe8c7ad26637700a4018a14d8a5a0863f196cb1da2a9708d901ec378a75",
+            "command": [
+              "/home/user/lccc/target/fastbuild/lccc",
+              "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/expat_utf8_content/lccc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/expat_utf8_content.c"
+            ],
+            "text_bytes": 3349
+          }
+        },
+        "exact_stdout": "cb95e9b26b98c700 2044416\n",
+        "id": "expat_utf8_content",
+        "median_wall_s": {
+          "clang": 0.049536236,
+          "gcc": 0.0485569615,
+          "lccc": 0.049810349500000003
+        },
+        "quality_warnings": {
+          "clang": [],
+          "gcc": [],
+          "lccc": []
+        },
+        "ratio_lccc_over": {
+          "clang": {
+            "median": 1.010446050838064,
+            "median_ci95_bootstrap": [
+              1.0001597669145967,
+              1.0133167176545392
+            ]
+          },
+          "gcc": {
+            "median": 1.0286344672382706,
+            "median_ci95_bootstrap": [
+              1.0169144683852744,
+              1.0417063455769227
+            ]
+          }
+        },
+        "source": "tests/benchmark/programs/expat_utf8_content.c",
+        "source_sha256": "ca0354de49e7d89029cb24d442ff1f681fa26f5aa9b9fea48c73966e242d3ec2",
+        "timed_rounds": [
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.052076174,
+              0.050800192,
+              0.049031188
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.049384364,
+              0.049747956,
+              0.048801382
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.049394739,
+              0.049844927,
+              0.049135776
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.048555762,
+              0.049775772,
+              0.050127988
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.04822635,
+              0.049545109,
+              0.048968359
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.048261782,
+              0.047489521,
+              0.048910585
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.048745144,
+              0.049314356,
+              0.048656914
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.048309366,
+              0.049100728,
+              0.048534522
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.04838237,
+              0.049899863,
+              0.05053598
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.049677733,
+              0.050434647,
+              0.048546181
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.050552092,
+              0.050923441,
+              0.048558161
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.049700593,
+              0.048846491,
+              0.050356145
+            ]
+          }
+        ]
+      },
+      {
+        "compile": {
+          "clang": {
+            "binary_sha256": "564bfc35872d8e95c932ca79122617b89fb3e5e0da1b80f63b68e2d9dbeb9327",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/sqlite_vdbe_serial/clang/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c"
+            ],
+            "text_bytes": 3775
+          },
+          "gcc": {
+            "binary_sha256": "1eba7fbaf4e1e34baa7c52a6148e3f277db8924ba3d206f94d8ed2e61105e53c",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/sqlite_vdbe_serial/gcc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c"
+            ],
+            "text_bytes": 2955
+          },
+          "lccc": {
+            "binary_sha256": "111bf26c159ef66a949e2ad611c2bca2dac6bf7bc6f9f8683b3a5cb34a146bfc",
+            "command": [
+              "/home/user/lccc/target/fastbuild/lccc",
+              "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/sqlite_vdbe_serial/lccc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/sqlite_vdbe_serial.c"
+            ],
+            "text_bytes": 2979
+          }
+        },
+        "exact_stdout": "7bdb34249ea0d400\n",
+        "id": "sqlite_vdbe_serial",
+        "median_wall_s": {
+          "clang": 0.014059754,
+          "gcc": 0.013933259,
+          "lccc": 0.015180197999999999
+        },
+        "quality_warnings": {
+          "clang": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "gcc": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate"
+          ],
+          "lccc": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate"
+          ]
+        },
+        "ratio_lccc_over": {
+          "clang": {
+            "median": 1.0781640963288073,
+            "median_ci95_bootstrap": [
+              1.073777908815995,
+              1.0854419398346993
+            ]
+          },
+          "gcc": {
+            "median": 1.0878830605527803,
+            "median_ci95_bootstrap": [
+              1.0591781594827339,
+              1.0949875921532946
+            ]
+          }
+        },
+        "source": "tests/benchmark/programs/sqlite_vdbe_serial.c",
+        "source_sha256": "716c4164550d809dd2ca8af7c37897fe8e66296f28972e890326228931affc17",
+        "timed_rounds": [
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.013899419,
+              0.014999712,
+              0.013839719
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.01408164,
+              0.013931559,
+              0.014942295
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.014104796,
+              0.014686132,
+              0.015139965
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.014229185,
+              0.014106759,
+              0.015220431
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.013910953,
+              0.014440147,
+              0.015246792
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.0138268,
+              0.015384358,
+              0.014926184
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.014109008,
+              0.015277884,
+              0.013870238
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.015321621,
+              0.01399628,
+              0.014081883
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.014219212,
+              0.014490148,
+              0.015319526
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.015078719,
+              0.014037625,
+              0.013766964
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.015094067,
+              0.014022623,
+              0.013810202
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.015021483,
+              0.013756568,
+              0.013728013
+            ]
+          }
+        ]
+      },
+      {
+        "compile": {
+          "clang": {
+            "binary_sha256": "c7abc865d6231de7988a43f1f2fa020ba0714774ee9df8ef988d9975a54dd6a2",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/linux_xxhash64/clang/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/linux_xxhash64.c"
+            ],
+            "text_bytes": 2687
+          },
+          "gcc": {
+            "binary_sha256": "d61f343feef931759ced2b9564145cfb052c7a259caeb821491033ebff28f454",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/linux_xxhash64/gcc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/linux_xxhash64.c"
+            ],
+            "text_bytes": 2189
+          },
+          "lccc": {
+            "binary_sha256": "4981a077c948a1383c136d40612f17e35fc86703ee51d64d01cef251c0e27656",
+            "command": [
+              "/home/user/lccc/target/fastbuild/lccc",
+              "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/linux_xxhash64/lccc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/linux_xxhash64.c"
+            ],
+            "text_bytes": 2224
+          }
+        },
+        "exact_stdout": "0dd8b02b82affc3b\n",
+        "id": "linux_xxhash64",
+        "median_wall_s": {
+          "clang": 0.004384664,
+          "gcc": 0.0044086279999999995,
+          "lccc": 0.0043588459999999996
+        },
+        "quality_warnings": {
+          "clang": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate"
+          ],
+          "gcc": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+            "2 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "lccc": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate"
+          ]
+        },
+        "ratio_lccc_over": {
+          "clang": {
+            "median": 0.9910745226371739,
+            "median_ci95_bootstrap": [
+              0.979830641145782,
+              1.0039673118640025
+            ]
+          },
+          "gcc": {
+            "median": 0.987655053834872,
+            "median_ci95_bootstrap": [
+              0.9699998933966902,
+              0.9940505556936083
+            ]
+          }
+        },
+        "source": "tests/benchmark/programs/linux_xxhash64.c",
+        "source_sha256": "dccb49c28d88f79106a7103f118436a8d2de6713121e52a7e23cc549e1cd28a8",
+        "timed_rounds": [
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.004523528,
+              0.004426265,
+              0.004478251
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.00436162,
+              0.00436175,
+              0.004378433
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.004446831,
+              0.004346451,
+              0.004693956
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.004381936,
+              0.00420568,
+              0.00424673
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.004348728,
+              0.004333769,
+              0.00431647
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.004309077,
+              0.004286828,
+              0.004526157
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.004435621,
+              0.004367759,
+              0.004432836
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.004326585,
+              0.004434358,
+              0.004362289
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.004333776,
+              0.004342851,
+              0.004256785
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.004390895,
+              0.004613573,
+              0.004784356
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.004421335,
+              0.004561964,
+              0.004445356
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.004476581,
+              0.00438442,
+              0.004355942
+            ]
+          }
+        ]
+      },
+      {
+        "compile": {
+          "clang": {
+            "binary_sha256": "26fe5e3ee86ebae1975e188e25155e1a3ffa94d289d08b8c16b2e29eb560c13a",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/glibc_dl_hash/clang/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/glibc_dl_hash.c"
+            ],
+            "text_bytes": 2710
+          },
+          "gcc": {
+            "binary_sha256": "5f3bdbc5f995f268c1eeb95cacd414a403d6c093652d40a4d8d939c4dbe2b0c1",
+            "command": [
+              "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/glibc_dl_hash/gcc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/glibc_dl_hash.c"
+            ],
+            "text_bytes": 2248
+          },
+          "lccc": {
+            "binary_sha256": "5f9a84418decd90d67a7ec1c9732e70ef9966f439f5cfc59aa98782253cf88b5",
+            "command": [
+              "/home/user/lccc/target/fastbuild/lccc",
+              "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-march=x86-64-v3",
+              "-o",
+              "/home/user/lccc/target/roi-20261118/runtime-artifacts/glibc_dl_hash/lccc/benchmark.bin",
+              "/home/user/lccc/tests/benchmark/programs/glibc_dl_hash.c"
+            ],
+            "text_bytes": 1997
+          }
+        },
+        "exact_stdout": "d03a40010bab2600\n",
+        "id": "glibc_dl_hash",
+        "median_wall_s": {
+          "clang": 0.012884778,
+          "gcc": 0.012871618000000001,
+          "lccc": 0.0122233595
+        },
+        "quality_warnings": {
+          "clang": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate"
+          ],
+          "gcc": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate"
+          ],
+          "lccc": [
+            "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ]
+        },
+        "ratio_lccc_over": {
+          "clang": {
+            "median": 0.9557702748193615,
+            "median_ci95_bootstrap": [
+              0.9467838840089572,
+              0.9616586318674021
+            ]
+          },
+          "gcc": {
+            "median": 0.9519441035137877,
+            "median_ci95_bootstrap": [
+              0.9450002258564274,
+              0.961572725746515
+            ]
+          }
+        },
+        "source": "tests/benchmark/programs/glibc_dl_hash.c",
+        "source_sha256": "a42905655da8210823680569d084dc0e14521d8ab8f61e299fea7b0afda0f38c",
+        "timed_rounds": [
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.012887412,
+              0.012743251,
+              0.012208153
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.012051721,
+              0.012619919,
+              0.012875821
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.012210184,
+              0.012906109,
+              0.013264035
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.013068122,
+              0.012951458,
+              0.012448686
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.012867415,
+              0.012731139,
+              0.012178155
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.012790882,
+              0.012195457,
+              0.012683695
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "gcc",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.013094894,
+              0.012882438,
+              0.012236535
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "clang",
+              "lccc"
+            ],
+            "wall_s_in_order": [
+              0.012560353,
+              0.012882144,
+              0.01219005
+            ]
+          },
+          {
+            "order": [
+              "gcc",
+              "lccc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.01280579,
+              0.012318724,
+              0.012799028
+            ]
+          },
+          {
+            "order": [
+              "clang",
+              "lccc",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.01289959,
+              0.012373476,
+              0.013113514
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "gcc",
+              "clang"
+            ],
+            "wall_s_in_order": [
+              0.012588515,
+              0.012857994,
+              0.013088351
+            ]
+          },
+          {
+            "order": [
+              "lccc",
+              "clang",
+              "gcc"
+            ],
+            "wall_s_in_order": [
+              0.012335269,
+              0.012796508,
+              0.012978497
+            ]
+          }
+        ]
+      }
+    ],
+    "compilers": [
+      {
+        "binary_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+        "executable": "/home/user/lccc/target/fastbuild/lccc",
+        "flags": [
+          "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+          "-O2",
+          "-march=x86-64-v3"
+        ],
+        "key": "lccc",
+        "label": "LCCC"
+      },
+      {
+        "binary_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+        "executable": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+        "flags": [
+          "-O2",
+          "-march=x86-64-v3"
+        ],
+        "key": "gcc",
+        "label": "GCC"
+      },
+      {
+        "binary_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+        "executable": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+        "flags": [
+          "-O2",
+          "-march=x86-64-v3"
+        ],
+        "key": "clang",
+        "label": "Clang"
+      }
+    ],
+    "complete": true,
+    "duration_sensitivity_lccc_vs_gcc": {
+      "aggregate": {
+        "arithmetic_mean_ratio": 1.0308418003214854,
+        "best": {
+          "benchmark": "gzip_longest_match",
+          "ratio": 0.8967235925002619
+        },
+        "geometric_mean_ratio": 1.0249065417856276,
+        "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+        "n_correct_benchmarks": 3,
+        "worst": {
+          "benchmark": "zlib_ng_huffman_heap",
+          "ratio": 1.1671673412259242
+        }
+      },
+      "excluded_short_or_unknown": [
+        "zlib_ng_compare256",
+        "sqlite_vdbe_serial",
+        "linux_xxhash64",
+        "glibc_dl_hash"
+      ],
+      "included": [
+        "zlib_ng_huffman_heap",
+        "gzip_longest_match",
+        "expat_utf8_content"
+      ],
+      "interpretation": "diagnostic sensitivity only; nonrepresentative selection, not a replacement score",
+      "minimum_median_seconds_each_compiler": 0.02
+    },
+    "metadata": {
+      "compiler_versions": {
+        "clang": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+        "gcc": "gcc-16 (GCC) 16.2.0",
+        "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+      },
+      "cpu_governors": {},
+      "cpu_models": [
+        "Intel(R) Xeon(R) Processor @ 2.60GHz"
+      ],
+      "git": {
+        "repo": "/home/user/lccc",
+        "revision": "6439940423b43f9d0d392c52201f5f15a1691d78\n",
+        "status": " M LICENSING.md\n M tests/benchmark/WORKLOAD_PROVENANCE.md\n M tests/benchmark/callgrind_sizes.json\n M tests/benchmark/run_benchmarks.py\n M third_party_licenses/README.md\n?? tests/benchmark/programs/zlib_ng_huffman_heap.c\n"
+      },
+      "hypervisor_detected": true,
+      "meminfo": "MemTotal:        4034452 kB\nMemFree:         2756296 kB\nMemAvailable:    3686632 kB\nBuffers:            8496 kB\nCached:          1081964 kB\nSwapCached:          296 kB\nActive:           512392 kB\nInactive:         608740 kB\nActive(anon):       4748 kB\nInactive(anon):    26932 kB\nActive(file):     507644 kB\nInactive(file):   581808 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       4194300 kB\nSwapFree:        4192104 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:            284084 kB\nWriteback:             8 kB\nAnonPages:         30436 kB\nMapped:            23060 kB\nShmem:               904 kB\nKReclaimable:      91008 kB\nSlab:             110500 kB\nSReclaimable:      91008 kB\nSUnreclaim:        19492 kB\nKernelStack:        1332 kB\nPageTables:          960 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     6211524 kB\nCommitted_AS:     148512 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        5444 kB\nVmallocChunk:          0 kB\nPercpu:              592 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     2060288 kB\nDirectMap1G:     4194304 kB",
+      "pinning": {
+        "allowed_cpus": [
+          0,
+          1
+        ],
+        "applied": true,
+        "cpu": 0,
+        "reason": "taskset pinning",
+        "requested": "0"
+      },
+      "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+      "pmu": {
+        "available": false,
+        "perf_event_paranoid": "2",
+        "perf_path": null,
+        "probe_cpu": 0,
+        "probe_pmu": null,
+        "probed": false,
+        "reason": "not probed"
+      },
+      "python": "3.11.2 (main, Apr  8 2026, 01:58:00) [GCC 12.2.0]",
+      "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/var/swap.lccc                          file\t\t4194300\t\t2196\t\t-2",
+      "timestamp_utc": "2026-11-18T19:34:01.127462+00:00",
+      "uname": [
+        "Linux",
+        "e2b.local",
+        "6.1.158+",
+        "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+        "x86_64"
+      ],
+      "work_root": {
+        "free_bytes": 12197433344,
+        "reason": "--work-dir",
+        "selected": "/home/user/lccc/target/roi-20261118/work"
+      }
+    },
+    "runner_warnings": [],
+    "schema": "lccc-bench-v2",
+    "settings": {
+      "common_cflags": [
+        "-march=x86-64-v3"
+      ],
+      "compiler_order_policy": "randomized balanced two-round blocks for two compilers; independent shuffle otherwise",
+      "opt": "-O2",
+      "outlier_policy": "MAD outliers counted and reported; none are removed",
+      "reps": 12,
+      "seed": 20261118,
+      "skip_perf": false,
+      "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+      "warmup": 2
+    },
+    "unavailable_compilers": {}
+  },
+  "pair_prefix_examples": {
+    "mixed-40": {
+      "all_pair_count": 40,
+      "basis": "only last distinct pair, raw pre-peephole text",
+      "first_differing_lines": [
+        "pushq %r14",
+        "pushq %r13"
+      ],
+      "last_pair": "[pair] arch=x86-64 chain=3083B orig=3252B mode=serial parallel=0 serial=40 deduped=0",
+      "prefix_bytes": 108,
+      "prefix_lines": 7,
+      "total_bytes": [
+        3083,
+        3252
+      ],
+      "total_lines": [
+        170,
+        178
+      ]
+    },
+    "zlib_ng_huffman_heap": {
+      "all_pair_count": 3,
+      "basis": "only last distinct pair, raw pre-peephole text",
+      "first_differing_lines": [
+        ".LBB114:",
+        "jmp .LBB114"
+      ],
+      "last_pair": "[pair] arch=x86-64 chain=7620B orig=7625B mode=serial parallel=0 serial=3 deduped=0",
+      "prefix_bytes": 1424,
+      "prefix_lines": 75,
+      "total_bytes": [
+        7620,
+        7625
+      ],
+      "total_lines": [
+        402,
+        402
+      ]
+    }
+  },
+  "runtime_rechecks": {
+    "amplified_compare256": {
+      "aggregate_lccc_vs_best_reference": {
+        "arithmetic_mean_ratio": 1.4790441141166633,
+        "best": {
+          "benchmark": "zlib_ng_compare256",
+          "ratio": 1.4790441141166633,
+          "reference": "clang"
+        },
+        "geometric_mean_ratio": 1.4790441141166633,
+        "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+        "n_correct_benchmarks": 1,
+        "worst": {
+          "benchmark": "zlib_ng_compare256",
+          "ratio": 1.4790441141166633,
+          "reference": "clang"
+        }
+      },
+      "aggregate_lccc_vs_gcc": {
+        "arithmetic_mean_ratio": 0.9205430440309521,
+        "best": {
+          "benchmark": "zlib_ng_compare256",
+          "ratio": 0.9205430440309521
+        },
+        "geometric_mean_ratio": 0.9205430440309521,
+        "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+        "n_correct_benchmarks": 1,
+        "worst": {
+          "benchmark": "zlib_ng_compare256",
+          "ratio": 0.9205430440309521
+        }
+      },
+      "benchmarks": [
+        {
+          "compile": {
+            "clang": {
+              "binary_sha256": "b17b3a98fa8e1f2bb16536e0736be9839aaeca0f068ff7a545b2c3a7c63b2d4a",
+              "command": [
+                "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+                "-O2",
+                "-march=x86-64-v3",
+                "-DPASSES=524288",
+                "-o",
+                "/home/user/lccc/target/roi-20261118/work/lccc_bench_c42pnxfk/zlib_ng_compare256_clang",
+                "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c"
+              ],
+              "text_bytes": 3831
+            },
+            "gcc": {
+              "binary_sha256": "cb5f06ab7b640216d8a07a125da227f9b7c4220cf75f7f77ff764fa67b3bcdbb",
+              "command": [
+                "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+                "-O2",
+                "-march=x86-64-v3",
+                "-DPASSES=524288",
+                "-o",
+                "/home/user/lccc/target/roi-20261118/work/lccc_bench_c42pnxfk/zlib_ng_compare256_gcc",
+                "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c"
+              ],
+              "text_bytes": 2996
+            },
+            "lccc": {
+              "binary_sha256": "9afc7f34a2825ba193ed74df747c7ced44ab44053d5fb6d29a20e777f8093346",
+              "command": [
+                "/home/user/lccc/target/roi-20261118/lccc-main",
+                "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                "-O2",
+                "-march=x86-64-v3",
+                "-DPASSES=524288",
+                "-o",
+                "/home/user/lccc/target/roi-20261118/work/lccc_bench_c42pnxfk/zlib_ng_compare256_lccc",
+                "/home/user/lccc/tests/benchmark/programs/zlib_ng_compare256.c"
+              ],
+              "text_bytes": 2655
+            }
+          },
+          "exact_stdout": "zlib_ng_compare256 checksum=15920696808145486723\n",
+          "id": "zlib_ng_compare256",
+          "median_wall_s": {
+            "clang": 0.165600072,
+            "gcc": 0.2642529815,
+            "lccc": 0.2450127805
+          },
+          "quality_warnings": {
+            "clang": [
+              "6 MAD outlier(s) retained (never silently discarded)"
+            ],
+            "gcc": [
+              "1 MAD outlier(s) retained (never silently discarded)"
+            ],
+            "lccc": [
+              "1 MAD outlier(s) retained (never silently discarded)"
+            ]
+          },
+          "ratio_lccc_over": {
+            "clang": {
+              "median": 1.4790441141166633,
+              "median_ci95_bootstrap": [
+                1.465081428771968,
+                1.4889731052305906
+              ]
+            },
+            "gcc": {
+              "median": 0.9205430440309521,
+              "median_ci95_bootstrap": [
+                0.9115342660925834,
+                0.9326257365870609
+              ]
+            }
+          },
+          "source": "tests/benchmark/programs/zlib_ng_compare256.c",
+          "source_sha256": "be935c02412c54a626eb1ddef26af46f4f61d14adcbc488fd92cb313863e6a2f",
+          "timed_rounds": [
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.277077703,
+                0.165097725,
+                0.248418752
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.178299436,
+                0.263960937,
+                0.241444527
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "clang",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.250274613,
+                0.164282129,
+                0.263649939
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "gcc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.259405182,
+                0.261134069,
+                0.165126858
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "lccc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.278470618,
+                0.24513843,
+                0.165335121
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.259993292,
+                0.161363249,
+                0.238774697
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.261474494,
+                0.168441355,
+                0.244919365
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "lccc",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.185133758,
+                0.273281384,
+                0.269765134
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.16365146,
+                0.282191074,
+                0.245683054
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "lccc",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.165159485,
+                0.236741335,
+                0.260646262
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "lccc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.267638911,
+                0.245106196,
+                0.165930215
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "lccc",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.181891898,
+                0.243057218,
+                0.272167823
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.264545026,
+                0.165854852,
+                0.246953414
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.167123625,
+                0.260492705,
+                0.241509053
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "lccc",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.164684018,
+                0.243461303,
+                0.265067868
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.161578598,
+                0.262238626,
+                0.238468341
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.165957905,
+                0.263603355,
+                0.239449534
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "lccc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.260837152,
+                0.2466417,
+                0.165345292
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "clang",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.253584141,
+                0.165868833,
+                0.265581463
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "gcc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.241763124,
+                0.262045606,
+                0.163214053
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.261101841,
+                0.16597376,
+                0.243281401
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "gcc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.239347134,
+                0.26542896,
+                0.16587436
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "clang",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.24907228,
+                0.165254982,
+                0.267377628
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "lccc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.264953043,
+                0.246135479,
+                0.165987177
+              ]
+            }
+          ]
+        }
+      ],
+      "compilers": [
+        {
+          "binary_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "executable": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "flags": [
+            "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-DPASSES=524288"
+          ],
+          "key": "lccc",
+          "label": "LCCC"
+        },
+        {
+          "binary_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "executable": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "flags": [
+            "-O2",
+            "-march=x86-64-v3",
+            "-DPASSES=524288"
+          ],
+          "key": "gcc",
+          "label": "GCC"
+        },
+        {
+          "binary_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "executable": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "flags": [
+            "-O2",
+            "-march=x86-64-v3",
+            "-DPASSES=524288"
+          ],
+          "key": "clang",
+          "label": "Clang"
+        }
+      ],
+      "complete": true,
+      "duration_sensitivity_lccc_vs_gcc": {
+        "aggregate": {
+          "arithmetic_mean_ratio": 0.9205430440309521,
+          "best": {
+            "benchmark": "zlib_ng_compare256",
+            "ratio": 0.9205430440309521
+          },
+          "geometric_mean_ratio": 0.9205430440309521,
+          "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+          "n_correct_benchmarks": 1,
+          "worst": {
+            "benchmark": "zlib_ng_compare256",
+            "ratio": 0.9205430440309521
+          }
+        },
+        "excluded_short_or_unknown": [],
+        "included": [
+          "zlib_ng_compare256"
+        ],
+        "interpretation": "diagnostic sensitivity only; nonrepresentative selection, not a replacement score",
+        "minimum_median_seconds_each_compiler": 0.02
+      },
+      "metadata": {
+        "compiler_versions": {
+          "clang": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "gcc": "gcc-16 (GCC) 16.2.0",
+          "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        "cpu_governors": {},
+        "cpu_models": [
+          "Intel(R) Xeon(R) Processor @ 2.60GHz"
+        ],
+        "git": {
+          "repo": "/home/user/lccc",
+          "revision": "568abc7916a7a1791802ee81d31916fbef53050f\n",
+          "status": ""
+        },
+        "hypervisor_detected": true,
+        "meminfo": "MemTotal:        4034452 kB\nMemFree:         2150764 kB\nMemAvailable:    3686184 kB\nBuffers:           33500 kB\nCached:          1645648 kB\nSwapCached:          500 kB\nActive:          1004336 kB\nInactive:         705872 kB\nActive(anon):       4812 kB\nInactive(anon):    27160 kB\nActive(file):     999524 kB\nInactive(file):   678712 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       4194300 kB\nSwapFree:        4192396 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              2668 kB\nWriteback:             0 kB\nAnonPages:         30688 kB\nMapped:            23896 kB\nShmem:               892 kB\nKReclaimable:     127704 kB\nSlab:             153352 kB\nSReclaimable:     127704 kB\nSUnreclaim:        25648 kB\nKernelStack:        1392 kB\nPageTables:          988 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     6211524 kB\nCommitted_AS:     148524 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        5492 kB\nVmallocChunk:          0 kB\nPercpu:              592 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     2060288 kB\nDirectMap1G:     4194304 kB",
+        "pinning": {
+          "allowed_cpus": [
+            0,
+            1
+          ],
+          "applied": true,
+          "cpu": 0,
+          "reason": "taskset pinning",
+          "requested": "0"
+        },
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+        "pmu": {
+          "available": false,
+          "perf_event_paranoid": "2",
+          "perf_path": null,
+          "probe_cpu": 0,
+          "probe_pmu": null,
+          "probed": false,
+          "reason": "not probed"
+        },
+        "python": "3.11.2 (main, Apr  8 2026, 01:58:00) [GCC 12.2.0]",
+        "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/var/swap.lccc                          file\t\t4194300\t\t1904\t\t-2",
+        "timestamp_utc": "2026-11-18T19:42:46.829854+00:00",
+        "uname": [
+          "Linux",
+          "e2b.local",
+          "6.1.158+",
+          "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+          "x86_64"
+        ],
+        "work_root": {
+          "free_bytes": 9997737984,
+          "reason": "--work-dir",
+          "selected": "/home/user/lccc/target/roi-20261118/work"
+        }
+      },
+      "runner_warnings": [],
+      "schema": "lccc-bench-v2",
+      "settings": {
+        "common_cflags": [
+          "-march=x86-64-v3",
+          "-DPASSES=524288"
+        ],
+        "compiler_order_policy": "randomized balanced two-round blocks for two compilers; independent shuffle otherwise",
+        "opt": "-O2",
+        "outlier_policy": "MAD outliers counted and reported; none are removed",
+        "reps": 24,
+        "seed": 20261118,
+        "skip_perf": false,
+        "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+        "warmup": 2
+      },
+      "unavailable_compilers": {}
+    },
+    "huffman_source_only": {
+      "arm_a": {
+        "binary": "/home/user/lccc/target/roi-20261118/huffman-original.bin",
+        "env": "",
+        "sha256": "a33fe279410bc2a2f20a1136cd08b353fbda4cadfb3ce26a9910099a323794cf",
+        "warmup": {
+          "rc": 0,
+          "stdout_sha256": "1ccb772e1f0a84fae360bb396e4e30d72edad9e0e0d658a085b746012b4527df"
+        }
+      },
+      "arm_a_timings": {
+        "arm": "original",
+        "mean_ms": 305.423,
+        "median_ms": 304.287,
+        "min_ms": 299.26,
+        "n": 24,
+        "samples_ms": [
+          299.2603259999669,
+          305.3201830000489,
+          299.42763200006084,
+          309.2392790000531,
+          302.5382850000824,
+          308.83566900001824,
+          303.02597999991576,
+          308.65468399997553,
+          303.95074000000477,
+          306.58877199994095,
+          301.27643200000875,
+          309.07606400000986,
+          301.32904699996743,
+          303.6228480000318,
+          302.03782000000956,
+          308.2499370000278,
+          302.5440040000831,
+          308.6741560000519,
+          300.96438400005354,
+          320.8243479999737,
+          306.41719899995223,
+          309.7241609999628,
+          304.4479830000455,
+          304.12648800006536
+        ],
+        "stdev_ms": 4.547
+      },
+      "arm_b": {
+        "binary": "/home/user/lccc/target/roi-20261118/huffman-forced.bin",
+        "env": "",
+        "sha256": "f78a24d9e2e87fd0ee8c44fc7df9d103fe4cece2ff592e4721453c77859c81b3",
+        "warmup": {
+          "rc": 0,
+          "stdout_sha256": "1ccb772e1f0a84fae360bb396e4e30d72edad9e0e0d658a085b746012b4527df"
+        }
+      },
+      "arm_b_timings": {
+        "arm": "forced",
+        "mean_ms": 279.956,
+        "median_ms": 280.401,
+        "min_ms": 266.649,
+        "n": 24,
+        "samples_ms": [
+          285.41511000003084,
+          277.44097499999043,
+          286.32551300006526,
+          273.53058899996086,
+          282.34909299999345,
+          276.41688400001385,
+          283.5845380000137,
+          278.84945799996785,
+          286.70475100000203,
+          277.0488800000521,
+          283.1534130000364,
+          276.58998300000803,
+          285.00119699992865,
+          274.2578099999946,
+          286.9986139999128,
+          279.31180699999913,
+          283.69383999995534,
+          276.3000519998968,
+          281.49049899991496,
+          284.1761890000498,
+          282.4048859999948,
+          276.4131839999209,
+          274.8384790000955,
+          266.6491700000506
+        ],
+        "stdev_ms": 5.014
+      },
+      "cpu": 0,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-DPASSES=1536"
+      ],
+      "identical_binaries": false,
+      "label": "Source-only smaller always_inline control, not a compiler change",
+      "median_and_min_agree": true,
+      "median_ratio_b_over_a": 0.9215,
+      "min_ratio_b_over_a": 0.89103,
+      "paired_diffs_ms": [
+        13.845215999936045,
+        27.879208000058497,
+        13.102118999995582,
+        35.70869000009225,
+        20.18919200008895,
+        32.41878500000439,
+        19.441441999902054,
+        29.80522600000768,
+        17.245989000002737,
+        29.539891999888823,
+        18.123018999972373,
+        32.48608100000183,
+        16.32785000003878,
+        29.365038000037202,
+        15.039206000096783,
+        28.93813000002865,
+        18.850164000127734,
+        32.37410400015506,
+        19.47388500013858,
+        36.64815899992391,
+        24.01231299995743,
+        33.31097700004193,
+        29.609503999949993,
+        37.47731800001475
+      ],
+      "rounds": 24,
+      "sample_columns": [
+        "round",
+        "position",
+        "arm",
+        "milliseconds"
+      ],
+      "samples": {
+        "timed": [
+          [
+            2,
+            0,
+            "a",
+            299.2603259999669
+          ],
+          [
+            2,
+            1,
+            "b",
+            285.41511000003084
+          ],
+          [
+            3,
+            0,
+            "b",
+            277.44097499999043
+          ],
+          [
+            3,
+            1,
+            "a",
+            305.3201830000489
+          ],
+          [
+            4,
+            0,
+            "a",
+            299.42763200006084
+          ],
+          [
+            4,
+            1,
+            "b",
+            286.32551300006526
+          ],
+          [
+            5,
+            0,
+            "b",
+            273.53058899996086
+          ],
+          [
+            5,
+            1,
+            "a",
+            309.2392790000531
+          ],
+          [
+            6,
+            0,
+            "a",
+            302.5382850000824
+          ],
+          [
+            6,
+            1,
+            "b",
+            282.34909299999345
+          ],
+          [
+            7,
+            0,
+            "b",
+            276.41688400001385
+          ],
+          [
+            7,
+            1,
+            "a",
+            308.83566900001824
+          ],
+          [
+            8,
+            0,
+            "a",
+            303.02597999991576
+          ],
+          [
+            8,
+            1,
+            "b",
+            283.5845380000137
+          ],
+          [
+            9,
+            0,
+            "b",
+            278.84945799996785
+          ],
+          [
+            9,
+            1,
+            "a",
+            308.65468399997553
+          ],
+          [
+            10,
+            0,
+            "a",
+            303.95074000000477
+          ],
+          [
+            10,
+            1,
+            "b",
+            286.70475100000203
+          ],
+          [
+            11,
+            0,
+            "b",
+            277.0488800000521
+          ],
+          [
+            11,
+            1,
+            "a",
+            306.58877199994095
+          ],
+          [
+            12,
+            0,
+            "a",
+            301.27643200000875
+          ],
+          [
+            12,
+            1,
+            "b",
+            283.1534130000364
+          ],
+          [
+            13,
+            0,
+            "b",
+            276.58998300000803
+          ],
+          [
+            13,
+            1,
+            "a",
+            309.07606400000986
+          ],
+          [
+            14,
+            0,
+            "a",
+            301.32904699996743
+          ],
+          [
+            14,
+            1,
+            "b",
+            285.00119699992865
+          ],
+          [
+            15,
+            0,
+            "b",
+            274.2578099999946
+          ],
+          [
+            15,
+            1,
+            "a",
+            303.6228480000318
+          ],
+          [
+            16,
+            0,
+            "a",
+            302.03782000000956
+          ],
+          [
+            16,
+            1,
+            "b",
+            286.9986139999128
+          ],
+          [
+            17,
+            0,
+            "b",
+            279.31180699999913
+          ],
+          [
+            17,
+            1,
+            "a",
+            308.2499370000278
+          ],
+          [
+            18,
+            0,
+            "a",
+            302.5440040000831
+          ],
+          [
+            18,
+            1,
+            "b",
+            283.69383999995534
+          ],
+          [
+            19,
+            0,
+            "b",
+            276.3000519998968
+          ],
+          [
+            19,
+            1,
+            "a",
+            308.6741560000519
+          ],
+          [
+            20,
+            0,
+            "a",
+            300.96438400005354
+          ],
+          [
+            20,
+            1,
+            "b",
+            281.49049899991496
+          ],
+          [
+            21,
+            0,
+            "b",
+            284.1761890000498
+          ],
+          [
+            21,
+            1,
+            "a",
+            320.8243479999737
+          ],
+          [
+            22,
+            0,
+            "a",
+            306.41719899995223
+          ],
+          [
+            22,
+            1,
+            "b",
+            282.4048859999948
+          ],
+          [
+            23,
+            0,
+            "b",
+            276.4131839999209
+          ],
+          [
+            23,
+            1,
+            "a",
+            309.7241609999628
+          ],
+          [
+            24,
+            0,
+            "a",
+            304.4479830000455
+          ],
+          [
+            24,
+            1,
+            "b",
+            274.8384790000955
+          ],
+          [
+            25,
+            0,
+            "b",
+            266.6491700000506
+          ],
+          [
+            25,
+            1,
+            "a",
+            304.12648800006536
+          ]
+        ],
+        "warmup": [
+          [
+            0,
+            0,
+            "a",
+            306.2602899999547
+          ],
+          [
+            0,
+            1,
+            "b",
+            283.60270400003174
+          ],
+          [
+            1,
+            0,
+            "b",
+            277.83802099997956
+          ],
+          [
+            1,
+            1,
+            "a",
+            307.1318209999845
+          ]
+        ]
+      },
+      "scope": "source-only change; no production compiler change",
+      "sign_test_p": 1.1920928955078125e-07,
+      "significant": true,
+      "size_text_bytes": {
+        "forced": 5062,
+        "original": 4894
+      },
+      "source_sha256": {
+        "forced": "2d94da56cfd80b029387827aa7b1cdf4e863e24a4d0cb20ff2c78c7f73320e93",
+        "original": "1ee248f1113c5e4ff4e12cff33ae7575e6427ae5c80caf093811a7f2f6a0aa00"
+      },
+      "static_call_smaller": {
+        "forced": 0,
+        "original": 5
+      },
+      "verdict": "original: 8.52% more median elapsed time",
+      "warmup": 2
+    },
+    "nbody": {
+      "aggregate_lccc_vs_best_reference": {
+        "arithmetic_mean_ratio": 1.022680582483379,
+        "best": {
+          "benchmark": "nbody",
+          "ratio": 1.022680582483379,
+          "reference": "clang"
+        },
+        "geometric_mean_ratio": 1.022680582483379,
+        "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+        "n_correct_benchmarks": 1,
+        "worst": {
+          "benchmark": "nbody",
+          "ratio": 1.022680582483379,
+          "reference": "clang"
+        }
+      },
+      "aggregate_lccc_vs_gcc": {
+        "arithmetic_mean_ratio": 0.9273527068974117,
+        "best": {
+          "benchmark": "nbody",
+          "ratio": 0.9273527068974117
+        },
+        "geometric_mean_ratio": 0.9273527068974117,
+        "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+        "n_correct_benchmarks": 1,
+        "worst": {
+          "benchmark": "nbody",
+          "ratio": 0.9273527068974117
+        }
+      },
+      "benchmarks": [
+        {
+          "compile": {
+            "clang": {
+              "binary_sha256": "678cb380a0baa1243f98caefe968aea6df9be9cc2aa1143a35a08479149262f3",
+              "command": [
+                "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+                "-O2",
+                "-march=x86-64-v3",
+                "-o",
+                "/home/user/lccc/target/roi-20261118/work/lccc_bench_py6ceu1k/nbody_clang",
+                "/home/user/lccc/tests/benchmark/programs/nbody.c",
+                "-lm"
+              ],
+              "text_bytes": 2806
+            },
+            "gcc": {
+              "binary_sha256": "a3b87131b700926e207aa8d633782fd5de2079f0920b2fbefb292e0a0a8630c3",
+              "command": [
+                "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+                "-O2",
+                "-march=x86-64-v3",
+                "-o",
+                "/home/user/lccc/target/roi-20261118/work/lccc_bench_py6ceu1k/nbody_gcc",
+                "/home/user/lccc/tests/benchmark/programs/nbody.c",
+                "-lm"
+              ],
+              "text_bytes": 2111
+            },
+            "lccc": {
+              "binary_sha256": "5981523116f313a99261c62ccb33db0e8870525e7ea45867b05c4c9b5c9c6684",
+              "command": [
+                "/home/user/lccc/target/roi-20261118/lccc-main",
+                "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+                "-O2",
+                "-march=x86-64-v3",
+                "-o",
+                "/home/user/lccc/target/roi-20261118/work/lccc_bench_py6ceu1k/nbody_lccc",
+                "/home/user/lccc/tests/benchmark/programs/nbody.c",
+                "-lm"
+              ],
+              "text_bytes": 2353
+            }
+          },
+          "exact_stdout": "-0.169075164\n-0.169083134\n",
+          "id": "nbody",
+          "median_wall_s": {
+            "clang": 0.19579636,
+            "gcc": 0.214457029,
+            "lccc": 0.198745687
+          },
+          "quality_warnings": {
+            "clang": [
+              "1 MAD outlier(s) retained (never silently discarded)"
+            ],
+            "gcc": [
+              "2 MAD outlier(s) retained (never silently discarded)"
+            ],
+            "lccc": [
+              "4 MAD outlier(s) retained (never silently discarded)"
+            ]
+          },
+          "ratio_lccc_over": {
+            "clang": {
+              "median": 1.022680582483379,
+              "median_ci95_bootstrap": [
+                1.0130473456362517,
+                1.0261068993040383
+              ]
+            },
+            "gcc": {
+              "median": 0.9273527068974117,
+              "median_ci95_bootstrap": [
+                0.9241445824111679,
+                0.9319334152565427
+              ]
+            }
+          },
+          "source": "tests/benchmark/programs/nbody.c",
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+          "timed_rounds": [
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.214001823,
+                0.195852809,
+                0.197543857
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.192646172,
+                0.211752772,
+                0.197339484
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "clang",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.197026682,
+                0.195739911,
+                0.214078315
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "gcc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.19821512,
+                0.213873653,
+                0.19312042
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "lccc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.213854398,
+                0.198439635,
+                0.194053652
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.211143601,
+                0.192361522,
+                0.198812872
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.214126597,
+                0.192984295,
+                0.19799072
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "lccc",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.194480216,
+                0.198906441,
+                0.214230764
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.195950055,
+                0.214470742,
+                0.199164128
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "lccc",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.187994788,
+                0.192902749,
+                0.211157011
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "lccc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.208825726,
+                0.197894115,
+                0.194347962
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "lccc",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.192935944,
+                0.198678502,
+                0.214573088
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.243176312,
+                0.203455672,
+                0.227137194
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.199829834,
+                0.2163984,
+                0.201363073
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "lccc",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.204496538,
+                0.2011178,
+                0.215676457
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.196381783,
+                0.228124033,
+                0.204052562
+              ]
+            },
+            {
+              "order": [
+                "clang",
+                "gcc",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.197450845,
+                0.218397115,
+                0.207535778
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "lccc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.212592847,
+                0.199657866,
+                0.196210146
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "clang",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.199084269,
+                0.196520202,
+                0.215425457
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "gcc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.198341784,
+                0.217575342,
+                0.196128218
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "clang",
+                "lccc"
+              ],
+              "wall_s_in_order": [
+                0.215399438,
+                0.1959077,
+                0.196424824
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "gcc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.198371754,
+                0.214443316,
+                0.196343431
+              ]
+            },
+            {
+              "order": [
+                "lccc",
+                "clang",
+                "gcc"
+              ],
+              "wall_s_in_order": [
+                0.200064033,
+                0.195125542,
+                0.21711011
+              ]
+            },
+            {
+              "order": [
+                "gcc",
+                "lccc",
+                "clang"
+              ],
+              "wall_s_in_order": [
+                0.219321561,
+                0.21756955,
+                0.194156077
+              ]
+            }
+          ]
+        }
+      ],
+      "compilers": [
+        {
+          "binary_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "executable": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "flags": [
+            "-I/home/user/.cache/lccc/agent-toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-march=x86-64-v3"
+          ],
+          "key": "lccc",
+          "label": "LCCC"
+        },
+        {
+          "binary_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "executable": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "flags": [
+            "-O2",
+            "-march=x86-64-v3"
+          ],
+          "key": "gcc",
+          "label": "GCC"
+        },
+        {
+          "binary_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "executable": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "flags": [
+            "-O2",
+            "-march=x86-64-v3"
+          ],
+          "key": "clang",
+          "label": "Clang"
+        }
+      ],
+      "complete": true,
+      "duration_sensitivity_lccc_vs_gcc": {
+        "aggregate": {
+          "arithmetic_mean_ratio": 0.9273527068974117,
+          "best": {
+            "benchmark": "nbody",
+            "ratio": 0.9273527068974117
+          },
+          "geometric_mean_ratio": 0.9273527068974117,
+          "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+          "n_correct_benchmarks": 1,
+          "worst": {
+            "benchmark": "nbody",
+            "ratio": 0.9273527068974117
+          }
+        },
+        "excluded_short_or_unknown": [],
+        "included": [
+          "nbody"
+        ],
+        "interpretation": "diagnostic sensitivity only; nonrepresentative selection, not a replacement score",
+        "minimum_median_seconds_each_compiler": 0.02
+      },
+      "metadata": {
+        "compiler_versions": {
+          "clang": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "gcc": "gcc-16 (GCC) 16.2.0",
+          "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        "cpu_governors": {},
+        "cpu_models": [
+          "Intel(R) Xeon(R) Processor @ 2.60GHz"
+        ],
+        "git": {
+          "repo": "/home/user/lccc",
+          "revision": "568abc7916a7a1791802ee81d31916fbef53050f\n",
+          "status": ""
+        },
+        "hypervisor_detected": true,
+        "meminfo": "MemTotal:        4034452 kB\nMemFree:         2046716 kB\nMemAvailable:    3684348 kB\nBuffers:           34060 kB\nCached:          1749200 kB\nSwapCached:          500 kB\nActive:          1081072 kB\nInactive:         733276 kB\nActive(anon):       4828 kB\nInactive(anon):    27156 kB\nActive(file):    1076244 kB\nInactive(file):   706120 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       4194300 kB\nSwapFree:        4192396 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               332 kB\nWriteback:             0 kB\nAnonPages:         30728 kB\nMapped:            24044 kB\nShmem:               892 kB\nKReclaimable:     127968 kB\nSlab:             153580 kB\nSReclaimable:     127968 kB\nSUnreclaim:        25612 kB\nKernelStack:        1360 kB\nPageTables:          992 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     6211524 kB\nCommitted_AS:     148492 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        5508 kB\nVmallocChunk:          0 kB\nPercpu:              592 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     2060288 kB\nDirectMap1G:     4194304 kB",
+        "pinning": {
+          "allowed_cpus": [
+            0,
+            1
+          ],
+          "applied": true,
+          "cpu": 0,
+          "reason": "taskset pinning",
+          "requested": "0"
+        },
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+        "pmu": {
+          "available": false,
+          "perf_event_paranoid": "2",
+          "perf_path": null,
+          "probe_cpu": 0,
+          "probe_pmu": null,
+          "probed": false,
+          "reason": "not probed"
+        },
+        "python": "3.11.2 (main, Apr  8 2026, 01:58:00) [GCC 12.2.0]",
+        "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/var/swap.lccc                          file\t\t4194300\t\t1904\t\t-2",
+        "timestamp_utc": "2026-11-18T19:43:05.050021+00:00",
+        "uname": [
+          "Linux",
+          "e2b.local",
+          "6.1.158+",
+          "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+          "x86_64"
+        ],
+        "work_root": {
+          "free_bytes": 9997598720,
+          "reason": "--work-dir",
+          "selected": "/home/user/lccc/target/roi-20261118/work"
+        }
+      },
+      "runner_warnings": [],
+      "schema": "lccc-bench-v2",
+      "settings": {
+        "common_cflags": [
+          "-march=x86-64-v3"
+        ],
+        "compiler_order_policy": "randomized balanced two-round blocks for two compilers; independent shuffle otherwise",
+        "opt": "-O2",
+        "outlier_policy": "MAD outliers counted and reported; none are removed",
+        "reps": 24,
+        "seed": 20261118,
+        "skip_perf": false,
+        "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+        "warmup": 2
+      },
+      "unavailable_compilers": {}
+    }
+  },
+  "schema": "lccc-roi-screening-v1",
+  "static_assembly_only": {
+    "expat_utf8_content": {
+      "function": "expat_content_tok",
+      "local_flags": "-O2 -march=x86-64-v3",
+      "oracles": [
+        {
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 269,
+          "key": "lccc",
+          "launcher": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "launcher_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "name": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:gcc",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 200,
+          "key": "gcc",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "launcher_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "name": "gcc-16 (GCC) 16.2.0",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:clang",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 168,
+          "key": "clang",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "launcher_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "name": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        }
+      ],
+      "remote_flags": "-O2 -march=x86-64-v3",
+      "remote_source_sha256": "ca0354de49e7d89029cb24d442ff1f681fa26f5aa9b9fea48c73966e242d3ec2",
+      "schema": 1,
+      "scope": "static-assembly-only",
+      "source": "tests/benchmark/programs/expat_utf8_content.c",
+      "source_sha256": "ca0354de49e7d89029cb24d442ff1f681fa26f5aa9b9fea48c73966e242d3ec2"
+    },
+    "glibc_dl_hash": {
+      "function": "glibc_dl_new_hash",
+      "local_flags": "-O2 -march=x86-64-v3",
+      "oracles": [
+        {
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 21,
+          "key": "lccc",
+          "launcher": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "launcher_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "name": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:gcc",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 24,
+          "key": "gcc",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "launcher_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "name": "gcc-16 (GCC) 16.2.0",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:clang",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 28,
+          "key": "clang",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "launcher_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "name": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        }
+      ],
+      "remote_flags": "-O2 -march=x86-64-v3",
+      "remote_source_sha256": "a42905655da8210823680569d084dc0e14521d8ab8f61e299fea7b0afda0f38c",
+      "schema": 1,
+      "scope": "static-assembly-only",
+      "source": "tests/benchmark/programs/glibc_dl_hash.c",
+      "source_sha256": "a42905655da8210823680569d084dc0e14521d8ab8f61e299fea7b0afda0f38c"
+    },
+    "gzip_longest_match": {
+      "function": "main",
+      "local_flags": "-O2 -march=x86-64-v3",
+      "oracles": [
+        {
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 400,
+          "key": "lccc",
+          "launcher": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "launcher_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "name": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:gcc",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 315,
+          "key": "gcc",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "launcher_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "name": "gcc-16 (GCC) 16.2.0",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:clang",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 377,
+          "key": "clang",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "launcher_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "name": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        }
+      ],
+      "remote_flags": "-O2 -march=x86-64-v3",
+      "remote_source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+      "schema": 1,
+      "scope": "static-assembly-only",
+      "source": "tests/benchmark/programs/gzip_longest_match.c",
+      "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b"
+    },
+    "linux_xxhash64": {
+      "function": "kernel_xxh64",
+      "local_flags": "-O2 -march=x86-64-v3",
+      "oracles": [
+        {
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 179,
+          "key": "lccc",
+          "launcher": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "launcher_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "name": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:gcc",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 163,
+          "key": "gcc",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "launcher_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "name": "gcc-16 (GCC) 16.2.0",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:clang",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 202,
+          "key": "clang",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "launcher_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "name": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        }
+      ],
+      "remote_flags": "-O2 -march=x86-64-v3",
+      "remote_source_sha256": "dccb49c28d88f79106a7103f118436a8d2de6713121e52a7e23cc549e1cd28a8",
+      "schema": 1,
+      "scope": "static-assembly-only",
+      "source": "tests/benchmark/programs/linux_xxhash64.c",
+      "source_sha256": "dccb49c28d88f79106a7103f118436a8d2de6713121e52a7e23cc549e1cd28a8"
+    },
+    "sqlite_vdbe_serial": {
+      "function": "vdbe_serial_get",
+      "local_flags": "-O2 -march=x86-64-v3",
+      "oracles": [
+        {
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 77,
+          "key": "lccc",
+          "launcher": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "launcher_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "name": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:gcc",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 80,
+          "key": "gcc",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "launcher_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "name": "gcc-16 (GCC) 16.2.0",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:clang",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 75,
+          "key": "clang",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "launcher_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "name": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        }
+      ],
+      "remote_flags": "-O2 -march=x86-64-v3",
+      "remote_source_sha256": "716c4164550d809dd2ca8af7c37897fe8e66296f28972e890326228931affc17",
+      "schema": 1,
+      "scope": "static-assembly-only",
+      "source": "tests/benchmark/programs/sqlite_vdbe_serial.c",
+      "source_sha256": "716c4164550d809dd2ca8af7c37897fe8e66296f28972e890326228931affc17"
+    },
+    "zlib_ng_compare256": {
+      "function": "zlib_compare256_64",
+      "local_flags": "-O2 -march=x86-64-v3",
+      "oracles": [
+        {
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 15,
+          "key": "lccc",
+          "launcher": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "launcher_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "name": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:gcc",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 16,
+          "key": "gcc",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "launcher_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "name": "gcc-16 (GCC) 16.2.0",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:clang",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 57,
+          "key": "clang",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "launcher_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "name": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        }
+      ],
+      "remote_flags": "-O2 -march=x86-64-v3",
+      "remote_source_sha256": "be935c02412c54a626eb1ddef26af46f4f61d14adcbc488fd92cb313863e6a2f",
+      "schema": 1,
+      "scope": "static-assembly-only",
+      "source": "tests/benchmark/programs/zlib_ng_compare256.c",
+      "source_sha256": "be935c02412c54a626eb1ddef26af46f4f61d14adcbc488fd92cb313863e6a2f"
+    },
+    "zlib_ng_huffman_heap": {
+      "function": "huffman_merge",
+      "local_flags": "-O2 -march=x86-64-v3",
+      "oracles": [
+        {
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 244,
+          "key": "lccc",
+          "launcher": "/home/user/lccc/target/roi-20261118/lccc-main",
+          "launcher_sha256": "f262b2ecf8de71ad6450a85804b5cdd12e3937e2603ce22c43602cf9e2abfaa8",
+          "name": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:gcc",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 264,
+          "key": "gcc",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/gcc-16",
+          "launcher_sha256": "89691354b8082a95cd13f7e9bb5822024bbd841aeef69ad28882105654ad2ffd",
+          "name": "gcc-16 (GCC) 16.2.0",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        },
+        {
+          "compilerType": "explicit-local",
+          "flags": "-O2 -march=x86-64-v3",
+          "id": "local:clang",
+          "identity_scope": "launcher only; wrapper targets are not pinned",
+          "instructions": 204,
+          "key": "clang",
+          "launcher": "/home/user/.cache/lccc/agent-toolchains/bin/clang-23",
+          "launcher_sha256": "2fa6b03312315e4ae49e11fb770c71b5567c1486e2a6019a2fbcebcca25c0f6e",
+          "name": "clang version 23.1.5 (https://github.com/llvm/llvm-project 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+          "pointer_bits": 64,
+          "target": "x86_64"
+        }
+      ],
+      "remote_flags": "-O2 -march=x86-64-v3",
+      "remote_source_sha256": "1ee248f1113c5e4ff4e12cff33ae7575e6427ae5c80caf093811a7f2f6a0aa00",
+      "schema": 1,
+      "scope": "static-assembly-only",
+      "source": "tests/benchmark/programs/zlib_ng_huffman_heap.c",
+      "source_sha256": "1ee248f1113c5e4ff4e12cff33ae7575e6427ae5c80caf093811a7f2f6a0aa00"
+    }
+  },
+  "upstream_main": "4d8fd153fd4d1c7f1ea21182f95a520b6e48b063"
+}

@@ -29,6 +29,16 @@ oracle_require_version() {
     fi
 }
 
+# bin/mold extracted from the locked mold-3.0.0-x86_64-linux.tar.gz in
+# engineering/toolchains/agent-cache-lock.json. Check the warm executable
+# itself, not the tarball, since consumers may restore or copy it separately.
+oracle_mold_release_matches() {
+    local mold=$1 digest expected=ada05c08a5686fdc8cf047f946f6c9b5163b7181ee7c500f7a904bcb750642a3
+    [[ -f $mold && -x $mold ]] || return 1
+    digest=$(sha256sum < "$mold") || return 1
+    [[ ${digest%% *} == "$expected" ]]
+}
+
 # The cached BFD executable has upstream defaults; the native profile is
 # applied by the stable wrapper. This stamp fingerprints that wrapper's
 # dynamic-tag and library-search configuration, so version alone is not enough.

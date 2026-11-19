@@ -86,6 +86,7 @@ pub const SHF_GNU_RETAIN: u64 = 0x20_0000;
 pub const STB_LOCAL: u8 = 0;
 pub const STB_GLOBAL: u8 = 1;
 pub const STB_WEAK: u8 = 2;
+pub const STB_GNU_UNIQUE: u8 = 10;
 
 // ── Symbol types ─────────────────────────────────────────────────────────────
 
