@@ -1416,6 +1416,28 @@ _mm_cvttsd_si64(__m128d __a)
 
 /* _mm_cvtss_sd: convert low float to double, put in low lane of __a */
 
+/* MMX-register forms of the packed-double conversions (GCC 16.2 emmintrin.h).
+ * The 32-bit results fill the MMX register; the rounding mode is the one the
+ * 128-bit form uses (round-to-nearest for _mm_cvtpd_pi32, truncate for the
+ * _mm_cvttpd_pi32 form). */
+static __inline__ __m64 __attribute__((__always_inline__, target("sse2")))
+_mm_cvtpd_pi32(__m128d __a)
+{
+    return _mm_movepi64_pi64(_mm_cvtpd_epi32(__a));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("sse2")))
+_mm_cvttpd_pi32(__m128d __a)
+{
+    return _mm_movepi64_pi64(_mm_cvttpd_epi32(__a));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cvtpi32_pd(__m64 __a)
+{
+    return _mm_cvtepi32_pd(_mm_movpi64_epi64(__a));
+}
+
 /* _mm_cvtpd_epi32: convert 2 doubles to 2 packed 32-bit integers (round to nearest) */
 
 /* _mm_cvttpd_epi32: convert 2 doubles to 2 packed 32-bit integers (truncate) */

@@ -117,4 +117,125 @@ _mm_hsubs_epi16(__m128i __a, __m128i __b)
     return ((__m128i)(__builtin_ia32_phsubsw128(__a, __b)));
 }
 
+/* --- SSSE3 forms on MMX registers (_mm_*_pi8/_pi16/_pi32, _mm_alignr_pi8).
+ * GCC 16.2 declares these in tmmintrin.h. Each one runs the 128-bit form on the
+ * operands' low quadwords, so the bit pattern matches the MMX instruction.
+ * Element-wise forms zero-extend the operands and keep the low 64 bits. The
+ * horizontal and byte-index forms first place the two quadwords side by side
+ * in one XMM register, so that lane order matches the MMX definition:
+ * a in the low 64 bits (lanes of a before b), then b. --- */
+
+static __inline__ __m128i __attribute__((__always_inline__, target("ssse3")))
+__lccc_mm64_pair(__m64 __lo, __m64 __hi)
+{
+    return _mm_unpacklo_epi64(_mm_movpi64_epi64(__lo), _mm_movpi64_epi64(__hi));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_abs_pi8(__m64 __a)
+{
+    return _mm_movepi64_pi64(_mm_abs_epi8(_mm_movpi64_epi64(__a)));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_abs_pi16(__m64 __a)
+{
+    return _mm_movepi64_pi64(_mm_abs_epi16(_mm_movpi64_epi64(__a)));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_abs_pi32(__m64 __a)
+{
+    return _mm_movepi64_pi64(_mm_abs_epi32(_mm_movpi64_epi64(__a)));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_sign_pi8(__m64 __a, __m64 __b)
+{
+    return _mm_movepi64_pi64(_mm_sign_epi8(_mm_movpi64_epi64(__a), _mm_movpi64_epi64(__b)));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_sign_pi16(__m64 __a, __m64 __b)
+{
+    return _mm_movepi64_pi64(_mm_sign_epi16(_mm_movpi64_epi64(__a), _mm_movpi64_epi64(__b)));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_sign_pi32(__m64 __a, __m64 __b)
+{
+    return _mm_movepi64_pi64(_mm_sign_epi32(_mm_movpi64_epi64(__a), _mm_movpi64_epi64(__b)));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_mulhrs_pi16(__m64 __a, __m64 __b)
+{
+    return _mm_movepi64_pi64(_mm_mulhrs_epi16(_mm_movpi64_epi64(__a), _mm_movpi64_epi64(__b)));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_maddubs_pi16(__m64 __a, __m64 __b)
+{
+    return _mm_movepi64_pi64(_mm_maddubs_epi16(_mm_movpi64_epi64(__a), _mm_movpi64_epi64(__b)));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_hadd_pi16(__m64 __a, __m64 __b)
+{
+    __m128i __x = __lccc_mm64_pair(__a, __b);
+    return _mm_movepi64_pi64(_mm_hadd_epi16(__x, __x));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_hadd_pi32(__m64 __a, __m64 __b)
+{
+    __m128i __x = __lccc_mm64_pair(__a, __b);
+    return _mm_movepi64_pi64(_mm_hadd_epi32(__x, __x));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_hadds_pi16(__m64 __a, __m64 __b)
+{
+    __m128i __x = __lccc_mm64_pair(__a, __b);
+    return _mm_movepi64_pi64(_mm_hadds_epi16(__x, __x));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_hsub_pi16(__m64 __a, __m64 __b)
+{
+    __m128i __x = __lccc_mm64_pair(__a, __b);
+    return _mm_movepi64_pi64(_mm_hsub_epi16(__x, __x));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_hsub_pi32(__m64 __a, __m64 __b)
+{
+    __m128i __x = __lccc_mm64_pair(__a, __b);
+    return _mm_movepi64_pi64(_mm_hsub_epi32(__x, __x));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_hsubs_pi16(__m64 __a, __m64 __b)
+{
+    __m128i __x = __lccc_mm64_pair(__a, __b);
+    return _mm_movepi64_pi64(_mm_hsubs_epi16(__x, __x));
+}
+
+/* PSHUFB on MMX: a control byte with bit 7 set yields zero, otherwise bits 2:0
+ * select a byte of __a. Masking with 0x87 keeps exactly those bits, so the
+ * 128-bit form (which reads bits 3:0) selects the same byte. */
+static __inline__ __m64 __attribute__((__always_inline__, target("ssse3")))
+_mm_shuffle_pi8(__m64 __a, __m64 __b)
+{
+    __m128i __ctl = _mm_and_si128(_mm_movpi64_epi64(__b), _mm_set1_epi8((char)0x87));
+    return _mm_movepi64_pi64(_mm_shuffle_epi8(_mm_movpi64_epi64(__a), __ctl));
+}
+
+/* PALIGNR on MMX: bytes [n, n+8) of the 16-byte value (__a:__b), __b low, __a
+ * high; n >= 16 gives zero. The high operand of the 128-bit form is zero, so
+ * bytes past the 16-byte value read zero, as the MMX definition requires. */
+#define _mm_alignr_pi8(__a, __b, __n)                                            \
+    _mm_movepi64_pi64(_mm_alignr_epi8(_mm_setzero_si128(),                       \
+                                      __lccc_mm64_pair((__b), (__a)), (__n)))
+
 #endif /* _TMMINTRIN_H_INCLUDED */
