@@ -97,14 +97,13 @@ pub(super) fn property_note_extent(
 pub(super) fn merge_sections(
     inputs: &mut [InputObject],
     keep_debug: bool,
+    discarded: &FxHashSet<(usize, usize)>,
 ) -> (Vec<OutputSection>, FxHashMap<String, usize>, SectionMap) {
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_name_to_idx: FxHashMap<String, usize> = FxHashMap::default();
     let mut section_map: SectionMap = FxHashMap::default();
 
-    // COMDAT group deduplication, decided once for the whole link.
-    let discarded = discarded_sections(inputs);
-    let dropped_fdes = prune_discarded_fdes(inputs, &discarded);
+    let dropped_fdes = prune_discarded_fdes(inputs, discarded);
     // Same diagnostic channel as the x86-64 linker's GC/ICF FDE pruning.
     if std::env::var_os("LCCC_DEBUG_GCEH").is_some() {
         lccc::cli::stderr_line(format_args!(
@@ -175,7 +174,7 @@ pub(super) fn merge_sections(
     if keep_debug {
         super::debug::merge_debug_sections(
             inputs,
-            &discarded,
+            discarded,
             &mut output_sections,
             &mut section_name_to_idx,
             &mut section_map,
@@ -183,20 +182,6 @@ pub(super) fn merge_sections(
     }
 
     (output_sections, section_name_to_idx, section_map)
-}
-
-/// Input sections that never reach the output: the members of a COMDAT
-/// group whose signature an earlier group already claimed (see
-/// `compute_comdat_skip`).
-///
-/// Identity is the signature alone, as in the gABI, GNU ld and the x86-64
-/// linker (`linker_common::comdat`). The merge used to also drop any group
-/// member whose section NAME an earlier kept member had used, which threw
-/// away the code of distinct groups that merely share a name (`.text` in
-/// two `,comdat` groups with different signatures) and deduplicated plain
-/// (non-COMDAT) groups, which must never be merged.
-fn discarded_sections(inputs: &[InputObject]) -> FxHashSet<(usize, usize)> {
-    compute_comdat_skip(inputs)
 }
 
 /// Remove the FDEs describing discarded sections from every input
@@ -264,9 +249,18 @@ fn prune_discarded_fdes(
     dropped
 }
 
+/// Input sections that never reach the output: the members of a COMDAT
+/// group whose signature an earlier group already claimed.
+///
+/// Identity is the signature alone, as in the gABI, GNU ld and the x86-64
+/// linker (`linker_common::comdat`). The merge used to also drop any group
+/// member whose section NAME an earlier kept member had used, which threw
+/// away the code of distinct groups that merely share a name (`.text` in
+/// two `,comdat` groups with different signatures) and deduplicated plain
+/// (non-COMDAT) groups, which must never be merged.
 pub(super) fn compute_comdat_skip(inputs: &[InputObject]) -> FxHashSet<(usize, usize)> {
     let mut comdat_skip = FxHashSet::default();
-    let mut seen_groups: FxHashSet<String> = FxHashSet::default();
+    let mut seen_groups: FxHashSet<&str> = FxHashSet::default();
 
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in obj.sections.iter() {
@@ -283,15 +277,12 @@ pub(super) fn compute_comdat_skip(inputs: &[InputObject]) -> FxHashSet<(usize, u
             let sig_name = match obj.symbols.get(sec.info as usize) {
                 // An unnamed signature identifies nothing: keep the group,
                 // as `linker_common::plan_comdat` does.
-                Some(sym) if !sym.name.is_empty() => sym.name.clone(),
+                Some(sym) if !sym.name.is_empty() => sym.name.as_str(),
                 _ => continue,
             };
             if !seen_groups.insert(sig_name) {
-                let mut off = 4;
-                while off + 4 <= sec.data.len() {
-                    let member_idx = read_u32(&sec.data, off) as usize;
-                    comdat_skip.insert((obj_idx, member_idx));
-                    off += 4;
+                for member in sec.data[4..].chunks_exact(4) {
+                    comdat_skip.insert((obj_idx, read_u32(member, 0) as usize));
                 }
             }
         }

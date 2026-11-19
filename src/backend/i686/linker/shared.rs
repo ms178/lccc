@@ -591,23 +591,13 @@ pub(super) fn emit_shared_library_32(
         errors.dedup();
         return Err(errors.join("\n"));
     }
-    // Every undefined global the inputs reference is recorded in .dynsym,
-    // even when no dynamic relocation names it: consumers (an executable
-    // deciding which of its definitions to export, `--no-undefined` checks
-    // of a later link) read the object's undefined dynamic symbols.
-    for obj in inputs {
-        for sym in &obj.symbols {
-            if sym.section_index == SHN_UNDEF
-                && !sym.name.is_empty()
-                && sym.binding != STB_LOCAL
-                && !global_symbols
-                    .get(sym.name.as_str())
-                    .is_some_and(|g| g.is_defined)
-                && !is_emitter_defined(&sym.name, sections)
-                && import_set.insert(sym.name.clone())
-            {
-                imports.push(sym.name.clone());
-            }
+    // Publish unresolved references even when no dynamic relocation names
+    // them. Use the resolved table so a symbol referenced only from a
+    // discarded COMDAT member is not promoted back to a dynamic import.
+    for (name, gs) in global_symbols.iter() {
+        if !gs.is_defined && !is_emitter_defined(name, sections) && import_set.insert(name.clone())
+        {
+            imports.push(name.clone());
         }
     }
     imports.sort();

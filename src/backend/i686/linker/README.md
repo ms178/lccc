@@ -222,30 +222,32 @@ input_section_index)` to `(output_section_index, offset_within_output)`.
 
 ### Step 4: Symbol Resolution
 
-**First pass -- collect definitions:**
+**First pass -- select definitions and assign COMMON storage:**
 
-For each defined symbol in each input object (skipping FILE, SECTION, and
-UNDEF symbols), compute its output-section index and offset.  If a name
-collision occurs:
-- Global beats weak.
-- Defined beats undefined.
-- Otherwise, keep the first definition.
+Input-local, FILE, and SECTION symbols do not participate in global name
+resolution. The COMDAT decisions from section merging also exclude the losing
+members' definitions. A strong regular or absolute definition beats COMMON,
+which in turn beats a weak definition. Repeated COMMONs merge the maximum
+size and maximum alignment independently; each surviving name occupies one
+checked `.bss` slot in input order.
 
-**Second pass -- resolve undefined references:**
+Two live strong definitions are an error, with the symbol and both input
+files named. Like GNU ld, the built-in linker accepts identical `SHN_ABS`
+values. `--allow-multiple-definition` (also `-z muldefs`) explicitly requests
+first-wins for otherwise conflicting definitions. This is implemented for
+built-in ELF32 executable, PIE, and shared links, not linker-script links.
 
-For each undefined symbol, check:
-1. Already defined in `global_symbols`?  Skip.
-2. Available in `dynlib_syms` (from shared library scanning)?
-   - Function symbols (including IFUNC): mark `needs_plt = true`, `needs_got = true`.
-   - Data symbols: mark `needs_copy = true` (copy relocation).
-3. Weak undefined?  Insert with address 0 (allowed to remain unresolved).
-4. Truly undefined?  Will produce an error later, unless it is a linker-
-   defined symbol.
+**Second pass -- resolve references:**
 
-**Section symbol resolution:**
+A live reference to a discarded global definition resolves by name, not by
+that definition's old section or offset. A reference used only in a discarded
+member does not require a definition. Otherwise a surviving object definition
+wins, or an import can bind to a shared library. A strong reference makes the
+name required even if an earlier object only referenced it weakly. The most
+restrictive visibility over the surviving definitions and references applies.
 
-Section symbols (STT_SECTION) are mapped to synthetic names
-`__section_{obj}_{idx}` for relocation resolution.
+Local and section-symbol relocations use `(object, input_section)` and the
+`SectionMap` directly; they do not need a separate name table.
 
 **PLT/GOT marking:**
 

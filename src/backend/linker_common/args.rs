@@ -216,6 +216,13 @@ pub struct LinkerArgs {
 }
 
 impl LinkerArgs {
+    /// GNU `--allow-multiple-definition` and `-z muldefs` are synonyms.
+    /// Keep the canonical keyword in `z_other_keywords` so link modes that
+    /// don't implement it still diagnose it under their warning policy.
+    pub fn allow_multiple_definition(&self) -> bool {
+        self.z_other_keywords.iter().any(|kw| kw == "muldefs")
+    }
+
     /// Validate common option values (`--build-id`, `--image-base`, `-z max-page-size`
     /// / `common-page-size`, and `--pack-dyn-relocs`).
     pub fn validate_common_options(&self) -> Result<(), String> {
@@ -544,6 +551,7 @@ pub fn parse_hash_style(v: &str) -> Option<HashStyle> {
 /// below.  Accepting lookalike spellings would bless a non-GNU interface.
 fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
     match tok {
+        "--allow-multiple-definition" => apply_z_keyword(result, "muldefs"),
         "--emit-relocs" | "-q" => {
             result.emit_relocs = true;
         }
@@ -1597,6 +1605,25 @@ mod map_arg_tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn allow_multiple_definition_uses_only_exact_gnu_spellings() {
+        for flags in [
+            &["--allow-multiple-definition"][..],
+            &["-z", "muldefs"],
+            &["-zmuldefs"],
+            &["-Wl,--allow-multiple-definition"],
+            &["-Wl,-z,muldefs"],
+            &["-Wl,-zmuldefs"],
+        ] {
+            let parsed = parse_linker_args(&args(flags));
+            assert!(parsed.allow_multiple_definition(), "{flags:?}");
+            assert_eq!(parsed.z_other_keyword_warnings(), ["-z muldefs ignored"]);
+        }
+        for flags in [&[][..], &["-zmuldefs=1"], &["-Wl,-z,nomuldefs"]] {
+            assert!(!parse_linker_args(&args(flags)).allow_multiple_definition());
+        }
     }
 
     /// `-Map` reaches the linker in four spellings depending on whether the
