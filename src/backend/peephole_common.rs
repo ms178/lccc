@@ -1763,6 +1763,167 @@ pub(crate) fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::o
     Some(ranges)
 }
 
+/// Pass-level dirty ticks for a peephole fixpoint loop (MB-20 step 5).
+///
+/// A fixpoint driver re-runs every sub-pass until an iteration reports no
+/// change, so the final iteration is always a pure re-verification sweep:
+/// each pass re-scans text it has already seen and finds nothing.  Measured
+/// on a 40-function mixed TU at -O1, that sweep was 27% of total peephole
+/// time (`CCC_TIME_PEEPHOLE`: phase-1 iteration 1 cost 108.7 ms of 404.6 ms,
+/// with `CCC_PEEPHOLE_TRACE` confirming zero changes in it across all 81
+/// invocations).
+///
+/// The tracker cuts that waste with one rule: **a pass only needs to run if
+/// the function text changed since that pass last started.**  `tick` counts
+/// reported changes; `should_run(name)` records the tick at the pass's start
+/// and answers `false` when the tick has not advanced since the previous
+/// start.  The driver calls `note_change()` after every sub-pass that
+/// reports a change — including the pass itself, so a self-cascading pass
+/// (one whose rewrite exposes more of its own pattern) re-runs next
+/// iteration.
+///
+/// # Soundness
+///
+/// Skipping is behaviour-preserving iff every tracked pass is a
+/// deterministic pure function of the text state it is handed (the line
+/// store plus the per-line metadata), and reports `true` whenever it mutated
+/// that state.  Under those two invariants, a skipped run is a run on
+/// bit-identical input whose previous execution mutated nothing and returned
+/// `false` — so it would do exactly that again.  Determinism holds for the
+/// x86 phase-1 passes by construction (their only inputs are the store, the
+/// infos and process-constant configuration; the content-keyed liveness
+/// memos are transparent).  The reporting invariant is asserted on demand:
+/// `CCC_PEEPHOLE_VERIFY_DIRTY=1` digests the state around every pass and
+/// panics on a mutation that reported `false`
+/// (`passes::mod::dirty_state_digest`).  `CCC_PEEPHOLE_NO_DIRTY_SKIP=1`
+/// disables skipping entirely, for bisection and for the byte-equality
+/// oracle test, and is the escape hatch for diagnostic modes that make a
+/// pass deliberately non-deterministic across calls (`CCC_LCR_LIMIT`'s
+/// process-global fuse budget).
+///
+/// Names are the driver's existing per-pass trace literals; the linear scan
+/// is over at most ~80 entries of interned `&'static str`, a few hundred
+/// short-string compares per function against multi-millisecond pass costs.
+pub(crate) struct PassTicks {
+    /// Count of reported changes; `u64` cannot wrap (bounded iterations
+    /// times bounded passes per compile).
+    tick: u64,
+    /// `false`: `should_run` always answers `true` (skipping disabled).
+    enabled: bool,
+    /// `(pass name, tick at that pass's most recent start)`.
+    seen: Vec<(&'static str, u64)>,
+    /// Starts answered `false` — lets the oracle test prove skipping
+    /// actually fired (a vacuously-green equality test would pass even if
+    /// `should_run` always said `true`).
+    skipped: u64,
+}
+
+impl PassTicks {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            tick: 0,
+            enabled,
+            seen: Vec::with_capacity(96),
+            skipped: 0,
+        }
+    }
+
+    /// How many starts were skipped as provably-clean re-runs.
+    pub(crate) fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    /// Record that `name` is about to run and answer whether it has to.
+    /// `false` means: no change was reported since this pass last started,
+    /// so its input is bit-identical and the run would be a no-op.
+    ///
+    /// Only call when the pass WILL run if the answer is `true` — the call
+    /// itself records the start.
+    pub(crate) fn should_run(&mut self, name: &'static str) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        for (seen_name, seen_tick) in &mut self.seen {
+            if *seen_name == name {
+                if *seen_tick == self.tick {
+                    self.skipped += 1;
+                    return false;
+                }
+                *seen_tick = self.tick;
+                return true;
+            }
+        }
+        self.seen.push((name, self.tick));
+        true
+    }
+
+    /// Record a reported change: every pass whose last start precedes this
+    /// call becomes due again.
+    pub(crate) fn note_change(&mut self) {
+        self.tick += 1;
+    }
+}
+
+#[cfg(test)]
+mod pass_ticks_tests {
+    use super::PassTicks;
+
+    /// First start always runs; a second start with no change in between is
+    /// the no-op re-verification the tracker exists to skip.
+    #[test]
+    fn skips_only_unchanged_reruns() {
+        let mut t = PassTicks::new(true);
+        assert!(t.should_run("a"));
+        assert!(t.should_run("b"));
+        // No change reported: both are clean.
+        assert!(!t.should_run("a"));
+        assert!(!t.should_run("b"));
+        // A change makes every pass due exactly once more.
+        t.note_change();
+        assert!(t.should_run("a"));
+        assert!(!t.should_run("a"));
+        assert!(t.should_run("b"));
+        assert!(!t.should_run("b"));
+    }
+
+    /// The driver bumps AFTER the changing pass's start, so the changer
+    /// itself re-runs next round — the self-cascade case.
+    #[test]
+    fn changing_pass_stays_due_for_one_more_round() {
+        let mut t = PassTicks::new(true);
+        assert!(t.should_run("changer"));
+        t.note_change(); // the changer reported a rewrite
+        assert!(
+            t.should_run("changer"),
+            "a pass that changed the text must re-run to chase its own cascade"
+        );
+        assert!(!t.should_run("changer"));
+    }
+
+    /// Changes between two passes are directional: the earlier starter is
+    /// due again, the later starter (which already saw the new text) is not.
+    #[test]
+    fn change_is_relative_to_each_pass_start() {
+        let mut t = PassTicks::new(true);
+        assert!(t.should_run("early"));
+        t.note_change();
+        assert!(t.should_run("late")); // first start: always runs
+        assert!(t.should_run("early")); // started before the change
+        assert!(!t.should_run("late")); // started after it
+        assert!(!t.should_run("early"));
+    }
+
+    /// Disabled tracker (CCC_PEEPHOLE_NO_DIRTY_SKIP): every start runs, the
+    /// pre-tracker fixpoint behaviour.
+    #[test]
+    fn disabled_tracker_never_skips() {
+        let mut t = PassTicks::new(false);
+        for _ in 0..3 {
+            assert!(t.should_run("a"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod inert_directive_tests {
     /// The shared leader walk: bounds, all-deleted, none-deleted, and the

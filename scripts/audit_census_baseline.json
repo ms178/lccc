@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 572,
+  "knob_literals": 575,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -408,10 +408,13 @@
     "CCC_NO_ZEXT_NOP",
     "CCC_NO_ZEXT_PAIR_CMP_FOLD",
     "CCC_OUTLINE_SWITCH",
+    "CCC_PEEPHOLE_NO_DIRTY_SKIP",
+    "CCC_PEEPHOLE_NO_VEC_GATE",
     "CCC_PEEPHOLE_PHASE4",
     "CCC_PEEPHOLE_RELAY",
     "CCC_PEEPHOLE_SKIP",
     "CCC_PEEPHOLE_TRACE",
+    "CCC_PEEPHOLE_VERIFY_DIRTY",
     "CCC_PGO_WEIGHT_MAX",
     "CCC_PHICLEANUP_DEADONLY",
     "CCC_PHI_ACYCLIC_ORDER",
@@ -578,7 +581,7 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 251,
+  "knobs_undocumented": 250,
   "panic_sites": 863,
   "panic_sites_hot": 94,
   "unsafe_sites": 27
