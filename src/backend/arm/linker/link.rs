@@ -331,14 +331,17 @@ pub fn link_builtin(
     // the x86-64 linker — classification lives in linker_common::defsym).
     let pending_defsyms = apply_defsyms(&mut globals, &defsym_defs)?;
 
-    // Garbage-collect unreferenced sections when --gc-sections is active.
-    // This removes sections not reachable from entry points, which may also
-    // eliminate undefined symbol references from dead code.
-    let dead_sections: FxHashSet<(usize, usize)> = if gc_sections {
-        linker_common::gc_collect_sections_elf64(&objects)
-    } else {
-        FxHashSet::default()
-    };
+    linker_common::merge_object_visibility(&objects, &mut globals);
+    let comdat_plan = linker_common::comdat::plan_comdat(&objects);
+    let mut dead_sections = comdat_plan.dead.clone();
+    if gc_sections {
+        dead_sections.extend(linker_common::gc_collect_sections_elf64_full(
+            &objects,
+            &[],
+            &FxHashSet::default(),
+            &comdat_plan.dead,
+        ));
+    }
 
     // When gc-sections is active, remove globals that only exist in dead sections
     if gc_sections {
@@ -388,6 +391,8 @@ pub fn link_builtin(
                 .join(", ")
         ));
     }
+
+    linker_common::comdat::check_local_references(&objects, &comdat_plan.dead, &dead_sections)?;
 
     // Prune FDEs whose functions were collected (see `eh_frame::prune_dead_fdes`).
     linker_common::prune_dead_fdes(&mut objects, &dead_sections);
@@ -570,6 +575,7 @@ pub fn link_shared(
 
     // Select COMDAT members even when this link does not run section GC.
     let discarded = linker_common::comdat::plan_comdat(&objects).dead;
+    linker_common::comdat::check_local_references(&objects, &discarded, &discarded)?;
     if !discarded.is_empty() {
         linker_common::prune_dead_fdes(&mut objects, &discarded);
     }

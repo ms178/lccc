@@ -45,10 +45,12 @@
 //! are complementary, and COMDAT runs first because it is cheaper and strictly
 //! more reliable.
 
-use crate::backend::elf::{GRP_COMDAT, SHT_GROUP, read_u32};
+use crate::backend::elf::{
+    GRP_COMDAT, SHF_ALLOC, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_GROUP, read_u32,
+};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
-use super::types::{DynSymbol, Elf64Object};
+use super::types::{DynSymbol, Elf64Object, Elf64Symbol};
 
 /// Result of a COMDAT scan.
 #[derive(Debug, Default)]
@@ -276,6 +278,77 @@ pub(super) fn discarded_members(prior: &ObjectSet, obj: &Elf64Object) -> FxHashS
         .flat_map(|(_, words)| members(words))
         .filter(|&member| member < obj.sections.len())
         .collect()
+}
+
+/// Allocated relocation sites that still need a symbol from a losing copy.
+/// FDEs and debug relocations are edited by their own consumers, not treated
+/// as program demand. The caller supplies any additional omitted input sites.
+pub(crate) fn discarded_symbol_uses<'a>(
+    obj: &'a Elf64Object,
+    omitted: impl Fn(usize) -> bool + 'a,
+    discarded: impl Fn(usize) -> bool + 'a,
+) -> impl Iterator<Item = (usize, usize, &'a Elf64Symbol)> {
+    obj.relocations
+        .iter()
+        .enumerate()
+        .filter(move |(si, rels)| {
+            !rels.is_empty()
+                && !omitted(*si)
+                && obj.sections.get(*si).is_some_and(|sec| {
+                    sec.flags & SHF_ALLOC != 0
+                        && sec.name != ".eh_frame"
+                        && !sec.name.starts_with(".eh_frame.")
+                })
+        })
+        .flat_map(|(si, rels)| rels.iter().map(move |r| (si, r)))
+        .filter_map(move |(si, rel)| {
+            if rel.rela_type == 0 {
+                return None; // R_*_NONE has no symbol operand.
+            }
+            let index = rel.sym_idx as usize;
+            let sym = obj.symbols.get(index)?;
+            (!matches!(sym.shndx, SHN_UNDEF | SHN_ABS | SHN_COMMON)
+                && discarded(sym.shndx as usize))
+            .then_some((si, index, sym))
+        })
+}
+
+/// Unlike global references, local relocations cannot rebind to a definition
+/// in a different object. Never silently encode a zero or unrelated address.
+pub(crate) fn check_local_references(
+    objects: &[Elf64Object],
+    discarded: &FxHashSet<(usize, usize)>,
+    omitted: &FxHashSet<(usize, usize)>,
+) -> Result<(), String> {
+    if discarded.is_empty() {
+        return Ok(());
+    }
+    for (oi, obj) in objects.iter().enumerate() {
+        let uses = discarded_symbol_uses(
+            obj,
+            |si| omitted.contains(&(oi, si)),
+            |si| discarded.contains(&(oi, si)),
+        );
+        check_local_uses(obj, uses)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn check_local_uses<'a>(
+    obj: &Elf64Object,
+    mut uses: impl Iterator<Item = (usize, usize, &'a Elf64Symbol)>,
+) -> Result<(), String> {
+    if let Some((source, _, sym)) = uses.find(|(_, _, sym)| sym.is_local()) {
+        let target = obj
+            .sections
+            .get(sym.shndx as usize)
+            .map_or("<unknown>", |s| s.name.as_str());
+        return Err(format!(
+            "{}: local symbol '{}' referenced in section '{}' is defined in discarded section '{}'",
+            obj.source_name, sym.name, obj.sections[source].name, target
+        ));
+    }
+    Ok(())
 }
 
 /// Decide which COMDAT group members lose.

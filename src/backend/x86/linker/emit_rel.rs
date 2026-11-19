@@ -49,6 +49,7 @@ pub fn link_relocatable(
 ) -> Result<(), String> {
     // ── 1. COMDAT group deduplication ──────────────────────────────────
     let dead = crate::backend::linker_common::comdat::plan_comdat(objects).dead;
+    crate::backend::linker_common::comdat::check_local_references(objects, &dead, &dead)?;
 
     // ── 2. Merge input sections by name and GNU retention ──────────────
     // GNU ld keeps same-named R and non-R sections distinct under -r:
@@ -212,7 +213,9 @@ pub fn link_relocatable(
 
     // Second pass: globals with deduplication. Borrow input names for the
     // index; output rows own their names and can be updated in place.
+    use crate::backend::linker_common::most_constraining_visibility;
     let mut global_idx: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut retired_visibility: FxHashMap<&str, u8> = FxHashMap::default();
     for (oi, obj) in objects.iter().enumerate() {
         let has_discard = !dead.is_empty()
             && obj
@@ -239,6 +242,13 @@ pub fn link_relocatable(
             }
             let in_dead = has_discard && dead.contains(&(oi, sym.shndx as usize));
             if in_dead && !live_refs.contains(&(yi as u32)) {
+                // Discard the definition without losing a visibility constraint
+                // on a winner, which may be registered later in link order.
+                let vis = sym.visibility();
+                if vis != 0 {
+                    let entry = retired_visibility.entry(sym.name.as_str()).or_default();
+                    *entry = most_constraining_visibility(*entry, vis);
+                }
                 continue;
             }
             let (kind, value, size) = if in_dead || sym.is_undefined() {
@@ -274,7 +284,6 @@ pub fn link_relocatable(
                     idx
                 }
                 Some(&idx) => {
-                    use crate::backend::linker_common::most_constraining_visibility;
                     let e = &mut out_syms[idx];
                     let visibility = most_constraining_visibility(e.other, sym.other);
                     let new_rank = rank(kind, sym.info);
@@ -306,6 +315,13 @@ pub fn link_relocatable(
                 }
             };
             remaps[oi].insert(yi as u32, ((idx + 1) as u32, 0));
+        }
+    }
+
+    for (name, vis) in retired_visibility {
+        if let Some(&idx) = global_idx.get(name) {
+            let row = &mut out_syms[idx];
+            row.other = (row.other & !3) | most_constraining_visibility(row.other, vis);
         }
     }
 

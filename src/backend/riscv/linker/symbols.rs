@@ -77,6 +77,7 @@ pub fn build_global_symbols(
     const PENDING_COMMON: usize = usize::MAX;
     let mut globals: FxHashMap<String, GlobalSym> = FxHashMap::default();
     let mut commons = Vec::new();
+    let mut unplaced_visibility: FxHashMap<&str, u8> = FxHashMap::default();
 
     for (obj_idx, (source, obj)) in input_objs.iter().enumerate() {
         for sym in &obj.symbols {
@@ -90,7 +91,16 @@ pub fn build_global_symbols(
                 SHN_COMMON => (Some(PENDING_COMMON), 0),
                 shndx => match sec_mapping.get(&(obj_idx, shndx as usize)) {
                     Some(&(section, base)) => (Some(section), base),
-                    None => continue,
+                    None => {
+                        // A COMDAT loser is not a definition, but it can still
+                        // restrict a same-name symbol that does survive layout.
+                        let vis = sym.visibility();
+                        if vis != STV_DEFAULT {
+                            let entry = unplaced_visibility.entry(name).or_default();
+                            *entry = linker_common::most_constraining_visibility(*entry, vis);
+                        }
+                        continue;
+                    }
                 },
             };
             let defined = !sym.is_undefined();
@@ -183,6 +193,11 @@ pub fn build_global_symbols(
         }
     }
 
+    for (name, vis) in unplaced_visibility {
+        if let Some(sym) = globals.get_mut(name) {
+            sym.visibility = linker_common::most_constraining_visibility(sym.visibility, vis);
+        }
+    }
     for name in commons {
         let Some(sym) = globals.get_mut(name) else {
             continue;

@@ -112,7 +112,7 @@ class Fixture:
                 error = ''
                 try:
                     if diagnostic:
-                        assert proc.returncode != 0 and diagnostic in proc.stderr, (
+                        assert proc.returncode == 1 and diagnostic in proc.stderr, (
                             f'expected {diagnostic!r}: rc={proc.returncode}, {proc.stderr.strip()}')
                         assert not (self.root / path).exists(), 'failed link left an output'
                     else:
@@ -146,8 +146,8 @@ def cases(f):
     f.checked('ar', 'rcs', 'libpick.a', 'strong2.o')
 
     def symbol(out, *, size=None, binding=None, align=None, index=None, value=None,
-               visibility=None):
-        s = f.sym(out)
+               visibility=None, name='pick'):
+        s = f.sym(out, name)
         fields = (('size', size), ('binding', binding), ('index', index),
                   ('value', value), ('visibility', visibility))
         for field, expected in fields:
@@ -174,6 +174,14 @@ def cases(f):
         size = section_size(out, '.bss')
         assert size == 0, f'superseded COMMON left {size} bytes of .bss'
 
+    def placed_common(out):
+        symbol(out, size=64, align=128, binding='GLOBAL')
+        s = f.sym(out)
+        assert s.value and s.index.isdecimal(), f'COMMON was not placed: {s}'
+        header = re.search(r'\[\s*(\d+)\]\s+\.bss\s+NOBITS\b', f.checked('readelf', '-SW', out))
+        assert header and s.index == header[1], f'{s}: expected a .bss definition'
+        assert section_size(out, '.bss') == 64, 'expected exactly one 64-byte allocation'
+
     def text_size(n):
         def check(out):
             txt = f.checked('readelf', '-SW', out)
@@ -195,8 +203,8 @@ def cases(f):
                   flags=('--fatal-warnings', '-z', 'muldefs'))
             check('different-absolute', ['abs3', 'abs7'], err=dup)
             check('equal-absolute', ['abs3', 'abs3'], contract(value=3, index='ABS'))
-            check('common-max-first', ['c64', 'c8'], contract(size=64, align=128))
-            check('common-max-last', ['c8', 'c64'], contract(size=64, align=128))
+            check('common-max-first', ['c64', 'c8'], placed_common)
+            check('common-max-last', ['c8', 'c64'], placed_common)
             check('common-over-weak', ['weak', 'c64'], contract(size=64, binding='GLOBAL'))
             check('weak-after-common', ['c64', 'weak'], contract(size=64, binding='GLOBAL'))
             check('strong-over-common', ['c64', 'strong64'], no_bss)
@@ -207,8 +215,37 @@ def cases(f):
         f.assemble('comdat', first + '.globl selected\nselected: ret\n')
         f.assemble('comdat-also', first + '.globl selected\nselected: nop; ret\n')
         f.assemble('comdat-ghost', first + '.globl ghost\nghost: nop; ret\n')
+        if f.target.name != 'i386':
+            f.assemble('comdat-hidden', first + '.globl selected\n.hidden selected\nselected: ret')
+            f.assemble('comdat-local-ref', first + '.Lretired: ret\n.data\n' + w + ' .Lretired')
+            f.assemble('comdat-global-ref', first + '.globl retired\nretired: ret\n.data\n' + w + ' retired')
+            selected = ['comdat', 'comdat-hidden']
+            f.check('exe-comdat-merged-visibility', ['-static'], ['start', *selected],
+                    lambda out: symbol(out, visibility='HIDDEN', name='selected'))
+            f.check('so-comdat-merged-visibility', ['-shared'], selected, absent('selected', True))
+            for mode, opts, base in [('exe', ['-static'], ['start']), ('so', ['-shared'], [])]:
+                f.check(f'{mode}-live-local-in-loser', opts, [*base, 'comdat', 'comdat-local-ref'],
+                        diagnostic='discarded section')
+            f.check('exe-live-global-in-loser', ['-static'], ['start', 'comdat', 'comdat-global-ref'],
+                    diagnostic='retired')
+            def imported(out):
+                s = f.symbols(out, 'retired', True)
+                assert len(s) == 1 and s[0].binding == 'GLOBAL' and s[0].index == 'UND', s
+                assert re.search(r'\bretired\b', f.checked('readelf', '-rW', out)), 'missing dynamic use'
+            # Without an explicit undefined row in another object, BFD's
+            # shared link can emit RELATIVE+0. LCCC keeps the live demand.
+            f.check('so-live-global-in-loser', ['-shared'], ['comdat', 'comdat-global-ref'],
+                    imported, bfd=False)
+            f.assemble('comdat-other-demand', '.data\n' + w + ' retired')
+            f.check('so-ordinary-undefined-demand', ['-shared'],
+                    ['comdat', 'comdat-other-demand'], imported)
+            if f.target.name in ('x86_64', 'aarch64'):
+                f.check('exe-gc-dead-local-in-loser', ['-static', '--gc-sections'],
+                        ['start', 'comdat', 'comdat-local-ref'])
         if f.target.name in ('aarch64', 'riscv64'):
             f.check('exe-comdat-collision', ['-static'], ['start', 'comdat', 'comdat-also'])
+            if f.target.name == 'aarch64':
+                f.check('exe-comdat-size', ['-static'], ['start', 'comdat', 'comdat-also'], text_size(16))
             f.check('so-comdat-ghost', ['-shared'], ['comdat', 'comdat-ghost'], absent('ghost', True))
 
     if f.target.name in ('x86_64', 'i386'):
@@ -256,6 +293,10 @@ def cases(f):
         f.check('r-upgrade-strong-reference', ['-r'], ['weakref', 'ref'], contract(binding='GLOBAL', index='UND'))
         f.check('r-hidden-reference', ['-r'], ['strong', 'hiddenref'], contract(visibility='HIDDEN'))
         f.check('r-losing-unique-name', ['-r'], ['comdat', 'comdat-ghost'], absent('ghost'))
+        f.check('r-comdat-merged-visibility', ['-r'], ['comdat', 'comdat-hidden'],
+                contract(visibility='HIDDEN', name='selected'))
+        f.check('r-live-local-in-loser', ['-r'], ['comdat', 'comdat-local-ref'],
+                diagnostic='discarded section')
         f.check('r-invalid-muldefs', ['-r', '--fatal-warnings', '-zmuldefs=typo'],
                 ['strong'], diagnostic='-z muldefs=typo ignored', bfd=False)
         f.check('r-muldefs', ['-r', '--fatal-warnings', '-zmuldefs'], ['abs3', 'abs7'],

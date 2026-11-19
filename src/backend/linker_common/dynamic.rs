@@ -390,6 +390,17 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
     // objects the doubling cascade dominated registration time.
     let obj_idx = prior.len();
     let discarded = super::comdat::discarded_members(prior, obj);
+    let discarded_refs: crate::common::fx_hash::FxHashSet<usize> = if discarded.is_empty() {
+        Default::default()
+    } else {
+        super::comdat::discarded_symbol_uses(
+            obj,
+            |si| discarded.contains(&si),
+            |si| discarded.contains(&si),
+        )
+        .filter_map(|(_, index, sym)| (!sym.is_local()).then_some(index))
+        .collect()
+    };
     // ELF places locals before non-locals. This is a capacity hint, not a
     // traversal bound, so even irregular input ordering cannot lose a name.
     let first_global = obj.symbols.partition_point(|sym| sym.is_local());
@@ -401,18 +412,18 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
     // objects (big-text profile: 21.5 ms of a 66 ms link inside this loop).
     // Replacement through `*e = ..` reuses the existing key (no clone, one
     // hash); only genuinely new symbols pay the clone+insert.
-    for sym in &obj.symbols {
-        if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE {
-            continue;
-        }
-        if sym.name.is_empty()
-            || sym.is_local()
-            || (!discarded.is_empty() && discarded.contains(&(sym.shndx as usize)))
+    for (index, sym) in obj.symbols.iter().enumerate() {
+        if matches!(sym.sym_type(), STT_SECTION | STT_FILE) || sym.name.is_empty() || sym.is_local()
         {
             continue;
         }
-
-        let is_defined = !sym.is_undefined() && sym.shndx != SHN_COMMON;
+        let retired = !discarded.is_empty() && discarded.contains(&(sym.shndx as usize));
+        if retired && !discarded_refs.contains(&index) {
+            continue;
+        }
+        // A surviving relocation to a retired global can rebind. Without
+        // another definition, it is an unresolved demand, not an address.
+        let is_defined = !retired && !sym.is_undefined() && sym.shndx != SHN_COMMON;
 
         if is_defined {
             match globals.get_mut(sym.name.as_str()) {

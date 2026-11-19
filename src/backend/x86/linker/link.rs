@@ -798,6 +798,7 @@ pub fn link_builtin(
     // and retire the input sections. Disabled with LCCC_NO_STRING_MERGE=1.
     let mut dead_sections = dead_sections;
     dead_sections.extend(comdat_plan.dead.iter().copied());
+    linker_common::comdat::check_local_references(&objects, &comdat_plan.dead, &dead_sections)?;
     if std::env::var("LCCC_NO_STRING_MERGE").is_err() {
         if let Some(plan) = linker_common::strmerge::plan_string_merge(
             &objects,
@@ -1373,6 +1374,7 @@ pub fn link_shared(
         .clone()
         .or_else(|| icf::icf_mode_from_env().map(str::to_string));
     let mut dead_sections = linker_common::comdat::plan_comdat(&objects).dead;
+    linker_common::comdat::check_local_references(&objects, &dead_sections, &dead_sections)?;
     if !dead_sections.is_empty() {
         linker_common::prune_dead_fdes(&mut objects, &dead_sections);
     }

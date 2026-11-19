@@ -39,6 +39,11 @@ unless they maintain separate algorithms and output contracts.
 | 21 | `-r` validates shared options and does not silently ignore a malformed `muldefs` spelling. | `r-invalid-muldefs` under `--fatal-warnings`. |
 | 22 | RISC-V selects tentative definitions before allocation; a surviving COMMON receives both maxima and a superseded one receives no BSS slot. | `riscv64/*-common-max-*`, `*-strong-over-common`, `*-no-dead-common-allocation`; check `sh_size`, not just the winning name. |
 | 23 | RISC-V layout drops losing COMDAT members before relaxation, while keeping object/section indices stable. | `riscv64/*-comdat-*`; live allocated references to discarded locals cannot obtain a made-up address. |
+| 24 | Preserve visibility from discarded COMDAT entries separately from reachability and winning section identity. | `*-comdat-merged-visibility`: hidden on a kept static or partial definition; absent from shared dynamic exports. |
+| 25 | Reject live local relocations into retired COMDAT members on ELF64 final and partial links. | `*-live-local-in-loser`; dead GC sources and edited unwind/debug metadata are not program demand. |
+| 26 | Model a live global reference to a retired copy as demand, so an executable cannot silently resolve it to zero or the start of an unrelated section. | `*-live-global-in-loser`; shared links retain an undefined import + relocation rather than a `RELATIVE+0` placeholder, a documented LCCC policy where BFD differs. |
+| 27 | AArch64 executables omit COMDAT losers in layout and GC, not just in registration. | `aarch64/exe-comdat-size` and the same-name survivor and local-reference controls. |
+| 28 | x86-64 executable COMMON symbols report the real `.bss` index. | `exe-common-max-*` asserts `st_size`, aligned final address, NOBITS section index and exact allocation size. |
 
 Two link-work reductions accompany the correctness changes: ELF64 registration
 no longer reserves hash entries for every local symbol, and a COMDAT object's

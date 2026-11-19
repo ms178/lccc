@@ -449,5 +449,5 @@ substitute.
 
 The next pass addresses standalone, script-driven, relocatable, and shared
 ELF link paths with independent failure witnesses. See [the ELF mode and
-symbol-provenance audit](ELF-SYMBOL-RESOLUTION-AUDIT.md) for the 23 changes,
+symbol-provenance audit](ELF-SYMBOL-RESOLUTION-AUDIT.md) for the independently scoped changes,
 reference policy, remaining scope, and exact replay commands.

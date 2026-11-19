@@ -229,28 +229,14 @@ fn discard_comdat(input_objs: &mut [(String, ElfObject)]) -> Result<(), String> 
     if plan.dead.is_empty() {
         return Ok(());
     }
-    for (oi, (source, obj)) in input_objs.iter().enumerate() {
-        for (si, relocs) in obj.relocations.iter().enumerate() {
-            if plan.dead.contains(&(oi, si))
-                || obj.sections.get(si).is_none_or(|s| {
-                    s.flags & SHF_ALLOC == 0
-                        || (s.name == ".eh_frame" || s.name.starts_with(".eh_frame."))
-                })
-            {
-                continue;
-            }
-            for reloc in relocs {
-                if let Some(sym) = obj.symbols.get(reloc.sym_idx as usize)
-                    && sym.is_local()
-                    && plan.dead.contains(&(oi, sym.shndx as usize))
-                {
-                    return Err(format!(
-                        "{source}: relocation to local symbol in discarded COMDAT section {}",
-                        sym.shndx,
-                    ));
-                }
-            }
-        }
+    // Check surviving allocated sites before mutating indices or FDEs.
+    for (oi, (_, obj)) in input_objs.iter().enumerate() {
+        let uses = linker_common::comdat::discarded_symbol_uses(
+            obj,
+            |si| plan.dead.contains(&(oi, si)),
+            |si| plan.dead.contains(&(oi, si)),
+        );
+        linker_common::comdat::check_local_uses(obj, uses)?;
     }
     let mut by_object: FxHashMap<usize, FxHashSet<(usize, usize)>> = FxHashMap::default();
     for &(oi, si) in &plan.dead {
@@ -259,6 +245,19 @@ fn discard_comdat(input_objs: &mut [(String, ElfObject)]) -> Result<(), String> 
     for (oi, dead) in by_object {
         let obj = &mut input_objs[oi].1;
         linker_common::prune_dead_fdes(std::slice::from_mut(obj), &dead);
+        let needed: FxHashSet<usize> = linker_common::comdat::discarded_symbol_uses(
+            obj,
+            |si| dead.contains(&(0, si)),
+            |si| dead.contains(&(0, si)),
+        )
+        .map(|(_, index, _)| index)
+        .collect();
+        for index in needed {
+            let sym = &mut obj.symbols[index];
+            sym.shndx = SHN_UNDEF;
+            sym.value = 0;
+            sym.size = 0;
+        }
         for (_, si) in dead {
             let section = &mut obj.sections[si];
             section.name.clear();
