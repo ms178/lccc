@@ -836,7 +836,7 @@ impl FileLiveness {
     /// (`compare_branch` re-verifies mentionedness of its transparent lines
     /// against the final carrier mask; labels are never transparent there).
     pub(super) fn live_after_dropping_region(
-        &self,
+        &mut self,
         store: &LineStore,
         infos: &[LineInfo],
         idx: usize,
@@ -848,20 +848,37 @@ impl FileLiveness {
             return None;
         }
         let (start, end) = self.recorded_function(store, infos, idx)?;
-        // Clone-and-re-derive: the neutralised solution must not leak into
-        // the caller's (unmodified-program) solution, and every other field
-        // keeps the function/structural bookkeeping the caller inherited.
-        let mut probe = FileLiveness {
-            live_out: self.live_out.clone(),
-            live_in: self.live_in.clone(),
-            known: self.known.clone(),
-            structural: self.structural.clone(),
-            effect: self.effect.clone(),
-            func_of: self.func_of.clone(),
-            textual_ret: self.textual_ret.clone(),
-        };
-        probe.reanalyse_with(store, infos, start, end, Some((lo, hi, mask)));
-        probe.known[idx].then(|| probe.live_out[idx])
+        // Probe in place, then restore the saved span exactly.  The probe
+        // used to clone all seven whole-file vectors to protect the
+        // caller's (unmodified-program) solution — ~2.3% of all compile
+        // instructions on a 400-function TU for questions about ONE
+        // function.  `reanalyse_with`'s write-set is exactly: the five
+        // per-line arrays over `start..end` (solve_function publishes into
+        // `lines ⊆ start..end` and `structural[start..end]`) plus
+        // `textual_ret`'s membership of `start`; `func_of` is only written
+        // by `new()`.  Saving and restoring that span reproduces the
+        // caller-visible state bit for bit.
+        let saved_lo = self.live_out[start..end].to_vec();
+        let saved_li = self.live_in[start..end].to_vec();
+        let saved_kn = self.known[start..end].to_vec();
+        let saved_st = self.structural[start..end].to_vec();
+        let saved_ef = self.effect[start..end].to_vec();
+        let saved_tret = self.textual_ret.contains(&start);
+
+        self.reanalyse_with(store, infos, start, end, Some((lo, hi, mask)));
+        let answer = self.known[idx].then(|| self.live_out[idx]);
+
+        self.live_out[start..end].copy_from_slice(&saved_lo);
+        self.live_in[start..end].copy_from_slice(&saved_li);
+        self.known[start..end].copy_from_slice(&saved_kn);
+        self.structural[start..end].copy_from_slice(&saved_st);
+        self.effect[start..end].copy_from_slice(&saved_ef);
+        if saved_tret {
+            self.textual_ret.insert(start);
+        } else {
+            self.textual_ret.remove(&start);
+        }
+        answer
     }
 
     /// `Some(true)` when `fam` may be read after line `idx`, `Some(false)` when
@@ -2546,6 +2563,89 @@ fn upper32_zero_transfer(info: &LineInfo, t: &str) -> (u16, u16) {
 mod tests {
     use super::*;
     use crate::backend::peephole_common::LineStore;
+
+    /// `live_after_dropping_region` probes in place and restores the saved
+    /// span.  Two contracts, both against independent oracles:
+    /// 1. the answer equals the old clone-the-world implementation's
+    ///    (clone + `reanalyse_with` on the clone);
+    /// 2. after the call, EVERY caller-visible field of the probed
+    ///    `FileLiveness` is bit-identical to its pre-call state.
+    #[test]
+    fn dropping_region_probe_restores_state_exactly() {
+        // A loop so the neutralised question is non-trivial (the carriers
+        // look live across the backedge) plus a second function to prove
+        // out-of-span state is untouched.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    # LCCC_RET_RAX 1\n",
+            "    movl $1, %ecx\n",
+            ".L1:\n",
+            "    setne %r8b\n",
+            "    movzbl %r8b, %r8d\n",
+            "    addl %ecx, %eax\n",
+            "    subl $1, %edi\n",
+            "    jne .L1\n",
+            "    ret\n.cfi_endproc\n",
+            "g:\n.cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    # LCCC_RET_RAX 1\n",
+            "    movl $2, %eax\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let line = |text: &str| {
+            (0..store.len())
+                .find(|&i| store.get(i).trim_ascii() == text)
+                .unwrap()
+        };
+        let mut lv = FileLiveness::new(&store, &infos);
+        let setcc = line("setne %r8b");
+        let widen = line("movzbl %r8b, %r8d");
+        let mask = 1u16 << 8; // %r8 family
+
+        // Oracle 1: the old implementation, verbatim.
+        let mut oracle = FileLiveness {
+            live_out: lv.live_out.clone(),
+            live_in: lv.live_in.clone(),
+            known: lv.known.clone(),
+            structural: lv.structural.clone(),
+            effect: lv.effect.clone(),
+            func_of: lv.func_of.clone(),
+            textual_ret: lv.textual_ret.clone(),
+        };
+        let (start, end) = oracle.recorded_function(&store, &infos, widen).unwrap();
+        oracle.reanalyse_with(&store, &infos, start, end, Some((setcc, widen, mask)));
+        let expected = oracle.known[widen].then(|| oracle.live_out[widen]);
+
+        // Snapshot every caller-visible field before the in-place probe.
+        let snap = (
+            lv.live_out.clone(),
+            lv.live_in.clone(),
+            lv.known.clone(),
+            lv.structural.clone(),
+            lv.effect.clone(),
+            lv.func_of.clone(),
+            lv.textual_ret.clone(),
+        );
+        let got = lv.live_after_dropping_region(&store, &infos, widen, setcc, widen, mask);
+        assert_eq!(got, expected, "probe answer matches the clone oracle");
+        assert_eq!(snap.0, lv.live_out, "live_out restored");
+        assert_eq!(snap.1, lv.live_in, "live_in restored");
+        assert_eq!(snap.2, lv.known, "known restored");
+        assert_eq!(snap.3, lv.structural, "structural restored");
+        assert_eq!(snap.4, lv.effect, "effect restored");
+        assert_eq!(snap.5, lv.func_of, "func_of untouched");
+        assert_eq!(snap.6, lv.textual_ret, "textual_ret restored");
+
+        // A second probe on the same span must agree with the first (the
+        // restore left no residue that could steer a later answer).
+        let again = lv.live_after_dropping_region(&store, &infos, widen, setcc, widen, mask);
+        assert_eq!(got, again, "probe is idempotent");
+    }
 
     /// `DeadWriteRefresh` keeps the solution exact without re-solving per
     /// deletion: after each deletion every family outside the pending read
