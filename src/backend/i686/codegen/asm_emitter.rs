@@ -274,7 +274,10 @@ impl InlineAsmEmitter for I686Codegen {
             // only touch RA-assigned callee-saved registers on a second pass if
             // all unallocated candidates are excluded (note that `collect_inline_asm_callee_saved_i686`
             // already withholds `esi/edi/ebx` from RA whenever scratch demand > avail).
-            const ALL_GP: &[&str] = &["ecx", "edx", "esi", "edi", "eax", "ebx"];
+            // The pool is shared with the two functions that predict this
+            // walk for the prologue (`stack_layout::inline_asm`): which
+            // callee-saved register has to be saved depends on its order.
+            const ALL_GP: &[&str] = crate::backend::stack_layout::I686_ASM_SCRATCH_POOL;
             while self.asm_scratch_idx < ALL_GP.len() * 2 {
                 let idx = self.asm_scratch_idx;
                 self.asm_scratch_idx += 1;
@@ -328,7 +331,7 @@ impl InlineAsmEmitter for I686Codegen {
         view: RegView,
         excluded: &[String],
     ) -> String {
-        const BYTE_GP: &[&str] = &["ecx", "edx", "eax", "ebx"];
+        const BYTE_GP: &[&str] = crate::backend::stack_layout::I686_ASM_BYTE_SCRATCH_POOL;
         // FP/SIMD and x87 operands have their own register files: the byte
         // question does not apply to them.
         let uniform_file = matches!(
