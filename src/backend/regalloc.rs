@@ -5451,6 +5451,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // while rotation's false-dependency avoidance is moot under renaming
     // (benchmark programs: 333 -> 320 pushes at -O2, Ir neutral).
     allocator.prefer_touched = true;
+    // A call-spanning value has this pool or a stack slot: none of its
+    // registers stays idle while one of them was demoted for a loop.
+    allocator.rescue_demoted_spans = true;
     allocator.run();
     let mut assignments = allocator.assignments;
     // Wave two: the hot-loop promotion, which is an optimisation and may only
