@@ -1034,6 +1034,7 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
             inputs,
             clobbers,
             goto_labels,
+            input_symbols,
             ..
         } => {
             // `asm volatile("" ::: "memory")` is a compiler barrier, not a
@@ -1067,9 +1068,28 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
                 !goto_labels.is_empty(),
                 !clobbers.is_empty(),
             );
+            // An immediate input is text: the emitter prints the constant or
+            // the symbol into the template and stages no register for it
+            // (`AsmOperandKind::Immediate`), so it destroys none.  It is the
+            // only operand the kernel's static keys have --
+            // `asm goto("1: nop5 ... .quad %c0 + %c1 - ." : : "i"(key),
+            // "i"(branch) : : l_yes)` -- and counted as a register operand it
+            // made every `if (static_branch_unlikely(&key))` a call: whatever
+            // was live across the test moved into a callee-saved register or
+            // onto the stack for five bytes of `nop`.
+            //
+            // "Immediate" is read off the operand as well as the constraint:
+            // a value that has neither folded to a constant nor been given
+            // its symbol is no immediate yet, whatever the constraint says.
+            let stages_a_register =
+                |(i, (constraint, operand, _)): (usize, &(String, Operand, Option<String>))| {
+                    !(crate::backend::inline_asm::constraint_is_immediate_only(constraint)
+                        && (matches!(operand, Operand::Const(_))
+                            || input_symbols.get(i).is_some_and(Option::is_some)))
+                };
             !inert
                 && (!outputs.is_empty()
-                    || !inputs.is_empty()
+                    || inputs.iter().enumerate().any(stages_a_register)
                     || clobbers.iter().any(|c| clobber_is_allocatable_reg(c)))
         }
         Instruction::Memcpy { .. }
@@ -3690,6 +3710,79 @@ mod tests {
             &[],
             false
         )));
+    }
+
+    /// A static key (`asm/jump_label.h`): a `nop`, a table entry, and two
+    /// immediates the entry is built from.  No register is staged and none
+    /// is clobbered, with the goto label or without.
+    #[test]
+    fn test_asm_with_immediate_inputs_only_is_no_call_point() {
+        fn asm(
+            inputs: Vec<(&str, Operand, Option<&str>)>,
+            clobbers: &[&str],
+            goto: bool,
+        ) -> Instruction {
+            Instruction::InlineAsm {
+                template: "1: nop\n.quad %c0 + %c1 - .".to_string(),
+                outputs: vec![],
+                operand_types: vec![IrType::I64; inputs.len()],
+                input_symbols: inputs
+                    .iter()
+                    .map(|(_, _, s)| s.map(str::to_string))
+                    .collect(),
+                inputs: inputs
+                    .into_iter()
+                    .map(|(c, op, _)| (c.to_string(), op, None))
+                    .collect(),
+                clobbers: clobbers.iter().map(|c| c.to_string()).collect(),
+                goto_labels: if goto {
+                    vec![("l_yes".to_string(), BlockId(1))]
+                } else {
+                    vec![]
+                },
+                seg_overrides: vec![],
+            }
+        }
+        let zero = Operand::Const(IrConst::I64(0));
+        let value = Operand::Value(Value(7));
+        for goto in [false, true] {
+            // `"i"(&key)` after its symbol was resolved, and `"i"(branch)`.
+            assert!(!instruction_is_call_point(&asm(
+                vec![("i", zero, Some("key")), ("i", zero, None)],
+                &[],
+                goto
+            )));
+            assert!(!instruction_is_call_point(&asm(
+                vec![("n", zero, None)],
+                &["cc", "memory"],
+                goto
+            )));
+            // An immediate constraint whose operand is still a value: no
+            // immediate yet.
+            assert!(instruction_is_call_point(&asm(
+                vec![("i", value, None)],
+                &[],
+                goto
+            )));
+            // One register operand beside the immediates, or a register in
+            // the clobber list.
+            assert!(instruction_is_call_point(&asm(
+                vec![("i", zero, Some("key")), ("r", value, None)],
+                &[],
+                goto
+            )));
+            assert!(instruction_is_call_point(&asm(
+                vec![("i", zero, Some("key"))],
+                &["rax"],
+                goto
+            )));
+            // A constraint that only admits an immediate among others.
+            assert!(instruction_is_call_point(&asm(
+                vec![("ri", zero, None)],
+                &[],
+                goto
+            )));
+        }
     }
 
     #[test]

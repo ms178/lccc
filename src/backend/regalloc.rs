@@ -1508,7 +1508,8 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
 
 /// The part of [`x86_param_caller_homes_safe_with_config`] that does not
 /// depend on which registers the body's emitters stage through: the entry
-/// prefix is `Alloca`s and `ParamRef`s only, there is no inline assembly,
+/// prefix is `Alloca`s and `ParamRef`s only, no inline assembly names a
+/// register,
 /// an inline-expanded `memcpy`/`memset` is followed by no parameter read,
 /// and a multi-block body takes all its arguments in registers.
 fn x86_param_homes_shape_ok(func: &IrFunction, ra_config: &RaConfig) -> bool {
@@ -1544,12 +1545,18 @@ fn x86_param_homes_shape_ok(func: &IrFunction, ra_config: &RaConfig) -> bool {
     // on. So a parameter read only before the first call stays in its ABI
     // register (`f(p) { x = p->a; g(x); }` paid push/mov/pop of %rbx for it),
     // and one live across a call still takes a callee-saved home. Inline asm
-    // may clobber argument registers without a precise clobber list: it
-    // keeps the conservative path.
+    // that stages an operand in a register, or lists one as clobbered, keeps
+    // the conservative path: the emitter's scratch registers are the
+    // argument registers, and nothing here says which one an operand takes.
+    // An asm that names no register at all (`liveness::instruction_is_call_point`
+    // -- `cpu_relax()`'s `rep; nop`, a static key's `nop`, `barrier()`)
+    // leaves them alone, and a function is not made to save three registers
+    // for its parameters because it spins on one.
     if func.blocks.iter().any(|b| {
-        b.instructions
-            .iter()
-            .any(|inst| matches!(inst, Instruction::InlineAsm { .. }))
+        b.instructions.iter().any(|inst| {
+            matches!(inst, Instruction::InlineAsm { .. })
+                && crate::backend::liveness::instruction_is_call_point(inst)
+        })
     }) {
         return false;
     }
@@ -22176,6 +22183,62 @@ mod wide_hazard_tests {
         narrow.return_type = IrType::U64;
         assert!(x86_param_caller_homes_safe_with_config(&narrow, &config));
         assert!(!x86_wide_body_param_overflow_safe(&narrow, &config));
+    }
+
+    /// `while (!*p) cpu_relax();` and a static key name no register: the
+    /// parameters stay in the ones they arrived in.  An operand that needs a
+    /// register, or a clobbered one, keeps the callee-saved homes.
+    #[test]
+    fn an_asm_that_names_no_register_leaves_the_parameters_in_theirs() {
+        let config = RaConfig::default();
+        let asm = |template: &str,
+                   inputs: Vec<(String, Operand, Option<String>)>,
+                   symbols: Vec<Option<String>>,
+                   clobbers: &[&str]| {
+            let mut f = one_block(
+                vec![
+                    param(0, 0, IrType::U64),
+                    param(1, 1, IrType::U64),
+                    Instruction::InlineAsm {
+                        template: template.into(),
+                        outputs: vec![],
+                        operand_types: vec![IrType::U64; inputs.len()],
+                        inputs,
+                        clobbers: clobbers.iter().map(|c| c.to_string()).collect(),
+                        goto_labels: vec![],
+                        input_symbols: symbols,
+                        seg_overrides: vec![],
+                    },
+                    binop(3, IrBinOp::Add, 0, 1, IrType::U64),
+                ],
+                3,
+            );
+            f.return_type = IrType::U64;
+            x86_param_caller_homes_safe_with_config(&f, &config)
+        };
+        let immediate = |c: i64| ("i".to_string(), Operand::Const(IrConst::I64(c)), None);
+        assert!(asm("rep; nop", vec![], vec![], &["memory"]));
+        assert!(asm(
+            "1: nop\n.quad %c0 + %c1 - .",
+            vec![immediate(0), immediate(1)],
+            vec![Some("key".into()), None],
+            &[],
+        ));
+        // A register operand, a clobbered register, and an immediate that
+        // has not become one.
+        assert!(!asm(
+            "incq %0",
+            vec![("r".to_string(), v(0), None)],
+            vec![None],
+            &[],
+        ));
+        assert!(!asm("cpuid", vec![], vec![], &["rbx"]));
+        assert!(!asm(
+            ".quad %c0",
+            vec![("i".to_string(), v(1), None)],
+            vec![None],
+            &[],
+        ));
     }
 
     #[test]
