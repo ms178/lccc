@@ -38,3 +38,58 @@ Splits canonical 2-block vector reductions into interleaved accumulator chains. 
 - Self-inlining is frame-neutral by construction (no referenced `Alloca`); never relax that -- stack use per recursion level must not grow. Dead parameter-home allocas left by mem2reg do not count.
 - Never narrow a compare through an extension that has other readers (see the compare narrowing rule in `docs/optimization-passes.md`).
 - Never peel a cast into an indexed address when its source is a single-use load (strstr regression: the fused load-cast is cheaper).
+
+## Inliner value model (`inline.rs`)
+
+Two budgets are enforced together per caller, because they price different
+things. `MAX_INLINE_BUDGET_PER_CALLER` (350) counts **pasted instructions** and
+is the growth bound the kernel's stack-frame safety depends on.
+`MAX_INLINE_BODIES_PER_CALLER` (350) counts **distinct bodies**, charged once
+per callee at its first clone, so repeating one body at several sites does not
+spend the allowance twice. Every caller-side cap, the multisite-loop vetoes
+(`multisite_loop_wrapper_should_stay_outlined`,
+`nested_loop_multisite_static_should_stay_outlined`,
+`repeated_small_loop_clone_should_stay_outlined`) and the -Os vetoes are
+unaffected, so repetition is still bounded by code growth, not by the budget.
+
+`fits_normal_inline_limits` gives `static` and `static inline` the SAME medium
+window (160 instructions): `inline` is a request, `static` only removes the
+linkage cost of cloning, so the stronger hint must never be admitted less
+eagerly than the weaker one. Loop-bearing bodies still need the acyclic block
+window (`MAX_INLINE_BLOCKS_NO_LOOPS`) or `fits_static_loop_inline_limits`.
+
+The general inlining tier is cost-ordered (cheapest callee first, stable
+sort, GCC `big_speed` / LLVM bottom-up order) **only when the candidate set
+cannot fit the instruction budget**, so every uncontended decision is
+byte-identical to the historical CFG-order scan. Contended callers then spend
+the allowance on call elimination per instruction instead of per CFG position:
+zlib-ng's heap sift (`zlib_ng_huffman_heap`) had its 70-instruction loop body
+admitted at three sites before the 24-instruction comparator it calls on
+every level, leaving the comparator outlined at 160,797 sites.
+
+## GVN cross-block classes (`gvn.rs`)
+
+`cross_block_renamable` lists what may be DELETED (not merely copied) when a
+dominated duplicate hits a dominator table entry: integer `Mul`, integer
+`Sub` of two values, pure non-`ReadWrite` calls, and — gated by
+`CCC_CAST_RENAME=1`, default OFF — integer `Cast`. Pointer casts, 128-bit
+types and float<->int conversions are excluded by construction. The
+occurrence-relative ordering argument (dominance orders blocks, not
+instructions) is only sound for a pure total function of its operands; loads,
+calls, division, intrinsics and inline asm keep the unconditional `Copy`
+form. Measured effect of the cast class on its target shape
+(`zlib_ng_huffman_heap`, PASSES=20, n=15): 16.89 ms -> 11.09 ms (2.241 ->
+1.472 vs gcc 16.2). It stays opt-in until the paired corpus run shows a net
+win at n>=15 across the zstd/gzip workloads, which currently move 1-3 % in
+both directions.
+
+The knob is resolved **once per translation unit** in `run_passes`
+(`src/passes/mod.rs`) and installed with `gvn::set_cast_rename_enabled`, the
+same install-once shape as `loop_idiom::set_config` and
+`vectorize::set_strided_reduce_enabled`. The pass body reads a bit, not the
+environment: `check_env_test_hygiene.sh` counts every `env::var`/`env::var_os`
+call site under `src/passes/` (budget 150, raised only with a documented
+measurement), a per-function probe would have pushed it to 151, and a
+concurrent unit-test harness must not drive a pass through `env::set_var`.
+`gvn::set_cast_rename_enabled(true/false)` is also the supported way for a test
+to exercise the class.

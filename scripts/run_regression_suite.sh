@@ -6,7 +6,10 @@
 #   1. Compile + run with the current lccc build.
 #   2. Unless the .env sets LCCC_NO_COMPARE=1, also compile + run with GCC
 #      and require identical stdout+exit code.
-#   3. A/B DIFFERENTIAL: unless the .env sets LCCC_NO_AB=1, re-run every test
+#   3. A DIAGNOSTIC fixture (.env sets LCCC_EXPECT_REJECT=<substring>) is
+#      instead REQUIRED to fail the build with that substring in its
+#      diagnostics; stages 1, 2 and the A/B differential do not apply to it.
+#   4. A/B DIFFERENTIAL: unless the .env sets LCCC_NO_AB=1, re-run every test
 #      with CCC_NO_SMALL_SLOTS=1 and require identical output to the default
 #      run.  Width-partitioned 4-byte spill slots must be value-preserving;
 #      any divergence between the two configurations is a miscompile and
@@ -212,11 +215,33 @@ for src in "$REG"/*.c; do
             env_vars+=("$line")
         done < "$REG/$name.env"
     fi
-    no_compare=0; no_ab=0
+    # LCCC_EXPECT_REJECT=<substring>: the translation unit is a DIAGNOSTIC
+    # fixture.  lccc must fail the build AND its diagnostics must contain the
+    # substring, so a regression that silently starts ACCEPTING the construct
+    # (or that rejects it for the wrong reason) turns the suite RED.  These
+    # fixtures have no binary to run and no oracle comparison to make, so the
+    # run/A-B stages are skipped by construction -- and they are the only way
+    # to pin a required rejection inside this runner.
+    no_compare=0; no_ab=0; expect_reject=""
     for e in "${env_vars[@]:-}"; do
         [[ $e == "LCCC_NO_COMPARE=1" ]] && no_compare=1
         [[ $e == "LCCC_NO_AB=1" ]] && no_ab=1
+        [[ $e == LCCC_EXPECT_REJECT=* ]] && expect_reject=${e#LCCC_EXPECT_REJECT=}
     done
+    if [[ -n "$expect_reject" ]]; then
+        out=$("$LCCC_BIN" ${flags[@]+"${flags[@]}"} -c "$src" -o "$WORK/reject.o" 2>&1) && ec=0 || ec=$?
+        if [[ $ec -eq 0 ]]; then
+            echo "FAIL  $name (expected a rejection, compiler accepted the TU)"
+            fail=$((fail+1)); FAILED+=("$name:accepted"); continue
+        fi
+        if ! grep -qF -- "$expect_reject" <<<"$out"; then
+            echo "FAIL  $name (rejected, but the diagnostic does not name '$expect_reject')"
+            echo "$out" | head -3 | sed 's/^/      /'
+            fail=$((fail+1)); FAILED+=("$name:wrong-diagnostic"); continue
+        fi
+        echo "PASS  $name (rejected with the expected diagnostic)"
+        pass=$((pass+1)); continue
+    fi
 
     # 1. lccc run (default configuration)
     res=$(env ${env_vars[@]:-} bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")

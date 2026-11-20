@@ -122,6 +122,14 @@ else
   echo "borescore-missing: no bore field in /proc/self/sched"
 fi
 echo "--- cpus ---"; grep -c '^processor' /proc/cpuinfo
+# Quiesce the kernel log before the sentinels. A printk that lands BETWEEN the
+# console writes of one echo() (e.g. the TSC clocksource calibration, which
+# fires ~2.35 s in) interleaves into the middle of the line and the sentinel
+# arrives non-contiguous on a console that is byte-exact. That is what the first
+# run measured: `...(){}[][ 2.350522] tsc: Refined TSC ...`. Raising
+# console_loglevel makes the stream deterministic, so a FAIL below can only mean
+# genuinely dropped or reordered bytes -- the defect this sentinel hunts.
+if [ -w /proc/sys/kernel/printk ]; then echo 1 > /proc/sys/kernel/printk; fi
 echo "--- serial integrity ---"
 # Sentinel that exercises the 8250 UART xmit path end to end. Every ttyS0
 # write above flows through kernel/printk + the initramfs write()s, but a
@@ -251,6 +259,56 @@ expect() { # expect <description> <grep-pattern>
     fail=1
   fi
 }
+
+# `expect_contiguous <description> <literal-line> [limit]`
+#
+# The sentinels assert CONTIGUITY, not merely "the words appear somewhere": a
+# console/xmit bug that splits writes (the historical kfifo record-path defect
+# queued userspace one character per write) delivers the bytes in order but in
+# fragments, and can interleave a kernel message into the gap. So the match
+# allows kernel-log noise ONLY inside the line
+#     \[[[:space:]]*[0-9]+\.[0-9]+\]
+# (which the line itself never contains) and only up to <limit> occurrences
+# (default 1). Any other content, any reordering or any missing byte fails.
+expect_contiguous() { # expect_contiguous <description> <literal> [limit]
+  local desc=$1 line=$2 limit=${3:-1} verdict
+  # The matcher is Python, not sed: escaping a shell-level regex through two
+  # sed programs silently produced a pattern that matched nothing, which would
+  # have turned this assertion into a permanent false FAIL (caught by testing
+  # the matcher against a known-good log before trusting it). Here the literal
+  # is escaped by `re.escape` -- exactly one escaping layer, no shell quoting.
+  verdict=$(python3 - "$LOG" "$line" "$limit" <<'PYMATCH'
+import re, sys
+path, literal, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+# Kernel-log noise is the ONLY thing allowed inside the line, because that is
+# the measured interleave: `...(){}[][  2.350522] tsc: Refined TSC ...`.
+noise = r"\[\s*\d+\.\d+\][^\[\]]*"
+words = [re.escape(w) for w in literal.split(" ")]
+# Noise is tolerated BETWEEN words and also AFTER the last one: the measured
+# interleave appended the kernel message after the closing bracket of the
+# sentinel (`...(){}[][    2.350522] tsc: Refined TSC ...`). Reordering or a
+# missing byte still fails, which is what this assertion exists to catch.
+pattern = (r"^" + (r"\s*(?:" + noise + r")?\s*").join(words)
+           + r"\s*(?:" + noise + r")?$")
+hits = 0
+with open(path, errors="replace") as fh:
+    for raw in fh:
+        if re.match(pattern, raw.rstrip("\n")):
+            hits += 1
+if hits == 0:
+    print("none")
+elif hits <= limit:
+    print("ok")
+else:
+    print(f"many:{hits}")
+PYMATCH
+)
+  case $verdict in
+    ok)   echo "PASS: $desc" ;;
+    many:*) echo "FAIL: $desc (${verdict#many:} matching lines, limit $limit)"; fail=1 ;;
+    *)    echo "FAIL: $desc (no contiguous match)"; fail=1 ;;
+  esac
+}
 expect "kernel banner (lccc build)"        "Linux version .*lccc"
 expect "SCHED_BORE compiled in"            "CONFIG_SCHED_BORE=y"
 expect "BORE init banner in dmesg"        "BORE CPU Scheduler"
@@ -281,8 +339,10 @@ expect "2 CPUs online"                     "^2$"
 # Serial-integrity sentinels: must arrive verbatim. A console/xmit bug that
 # drops bytes or splits writes (defect (h), kfifo record-path corruption)
 # breaks the multi-word line or the trailing word of the hex line.
-expect "serial sentinel line verbatim"     "serial-ok the quick brown fox jumps over the lazy dog 0123456789 !\?%&/\(\)\{\}\[\]$"
-expect "serial sentinel hex line verbatim" "serial-ok addr=0xdeadbeef count=31415926 end$"
+expect_contiguous "serial sentinel line verbatim" \
+    "serial-ok the quick brown fox jumps over the lazy dog 0123456789 !?%&/(){}[]"
+expect_contiguous "serial sentinel hex line verbatim" \
+    "serial-ok addr=0xdeadbeef count=31415926 end"
 expect "validation ran to completion"      "LCCC KERNEL BOOT VALIDATION END"
 
 if [[ $fail -eq 0 ]]; then

@@ -658,7 +658,8 @@ gate "pie-link-execution" fast \
 # compare against gcc AND against lccc with CCC_DISABLE_PASSES=inline, with a
 # coverage row proving the inliner fires.
 gate "inline-param-home" fast \
-    env CCC="$LCCC" bash tests/regression/check_inline_param_home.sh
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_inline_param_home.sh
 
 # Array-bound contract: a bad bound is diagnosed (never wrapped), a byte size
 # that cannot exist is rejected instead of wrapping into a bogus section, and a

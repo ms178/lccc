@@ -2014,6 +2014,14 @@ pub(crate) fn run_passes(
         enabled: std::env::var("CCC_NO_LOOP_IDIOM").is_err(),
         memchr: std::env::var_os("CCC_NO_MEMCHR_IDIOM").is_none(),
     });
+    // OPT-IN rename class in GVN.  Resolved here like every other knob above
+    // so the pass pays zero environment reads (`check_env_test_hygiene.sh`
+    // counts them) and so a test can drive the class through
+    // `gvn::set_cast_rename_enabled` instead of `env::set_var`.
+    gvn::set_cast_rename_enabled(std::env::var_os("CCC_CAST_RENAME").is_some_and(|v| v == "1"));
+    cfg_simplify::set_switch_relay_thread_enabled(
+        std::env::var_os("CCC_SWITCH_RELAY_THREAD").is_some_and(|v| v != "0"),
+    );
     let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
     vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
     vectorize::set_strided_reduce_trace(std::env::var_os("LCCC_VEC_STRIDED_TRACE").is_some());

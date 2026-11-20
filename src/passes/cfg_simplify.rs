@@ -73,6 +73,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
         changed += simplify_redundant_cond_branches(func);
         changed += fold_boolean_return_branches(func, &label_to_idx);
         changed += thread_jump_chains(func, &label_to_idx);
+        changed += thread_switch_case_relays(func, &label_to_idx);
         changed += eliminate_unreachable_blocks(func);
         changed += simplify_trivial_phis(func);
         changed += merge_single_pred_blocks(func);
@@ -732,6 +733,204 @@ fn for_each_direct_target_mut(term: &mut Terminator, mut f: impl FnMut(&mut Bloc
 }
 
 /// Missing or duplicated required PHI arms are not evidence for a rewrite.
+// ---------------------------------------------------------------------------
+// Sub-pass: switch-case relay threading
+// ---------------------------------------------------------------------------
+
+/// Opt-in switch (`CCC_SWITCH_RELAY_THREAD=1`), the `CCC_LOOP_ROTATE=1`
+/// convention for a transformation that is correct but has no measured
+/// benefit yet on the corpus it was written for.
+///
+/// MEASURED STATUS (2026-11-19, the reason this is not default-on): on the
+/// zlib-ng/gzip/expat/sqlite extract corpus the pass fires zero times.  The
+/// shape it removes -- a `switch` case arm that only copies a value and jumps
+/// to a shared join -- is real and visible in the IR, but those blocks carry a
+/// `Copy`, so the empty-relay half of this pass cannot see them, and the
+/// `switch-case-relay` blocks that reach machine code as `movq %rsi, %rX; jmp`
+/// pairs need PHI-equivalence promotion, which the current non-SSA copy webs
+/// (one `Value` with several `Copy` definitions) do not let this pass prove
+/// safe.  Keep the machinery behind a flag until that promotion exists; see
+/// engineering/FOLLOWUP-2026-11-19-arena-session.md.
+///
+/// Resolved ONCE per translation unit in `run_passes` and installed through
+/// [`set_switch_relay_thread_enabled`], like every other diagnostic gate in
+/// this pass (see `src/passes/mod.rs`, which the env-read ratchet in
+/// `tests/regression/check_env_test_hygiene.sh` deliberately excludes).  A
+/// `LazyLock` in the pass body would cache the same answer but would still be
+/// a counted `env::var_os` site, and the budget there is the measurement.
+pub(crate) fn set_switch_relay_thread_enabled(enabled: bool) {
+    SWITCH_RELAY_THREAD.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+static SWITCH_RELAY_THREAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn switch_relay_thread_enabled() -> bool {
+    SWITCH_RELAY_THREAD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Redirect `Switch` case edges that land on a relay (a block whose only
+/// content is a branch to another block) straight to the relay's destination.
+///
+/// # Why this exists
+///
+/// `thread_jump_chains` runs the identical transformation for `Branch` and
+/// `CondBranch` sources and then refuses relays that feed a PHI arm with a
+/// single predecessor (`unsafe_relay`), because deleting that arm requires
+/// rewriting every consumer in the same transaction.  A `Switch` case edge has
+/// the same shape but no path through that pass at all -- and `merge_single_pred_blocks`
+/// is narrower still, so the relay survives to machine code.
+///
+/// Lowering a `switch` whose cases fall through into shared tail logic produces
+/// exactly one trivial relay per case (every arm copies its label variable and
+/// jumps to the shared join).  Measured on Expat's `sip24_final` (the SipHash
+/// finalizer, eight fall-through cases), LCCC emitted **eight** relay blocks of
+/// the form `movq %rsi, %rREG ; jmp .LBBnn` that GCC does not have: 158 static
+/// instructions against GCC's 81 for the same source and flags.
+///
+/// # Safety conditions (all verified before any mutation)
+///
+/// 1. The relay has NO instructions, so threading cannot drop work.
+/// 2. The relay terminally `Branch`es (a `CondBranch` has two successors and
+///    cannot be threaded by redirection).
+/// 3. The relay's predecessor count, counting terminator edges AND `InlineAsm`
+///    `goto_labels`, is exactly 1, so removing it is a pure edge retarget.  A
+///    multi-predecessor relay is left alone rather than duplicated.
+/// 4. The relay does not feed any PHI arm.  A single-predecessor arm is not
+///    consumed by `_` on the switch arm or by `constant_switch_target`, and
+///    rewriting it is NOT a local edit (the arm's entry names the relay's
+///    label; the destination PHI needs a new arm for every source that is
+///    retargeted).  Rather than duplicate that transaction here, the relay is
+///    kept: this is the conservative half of the pass, and it is the half that
+///    the measured case (`sip24_final`) exercises -- its eight relays feed no
+///    PHI, they only carry a renamed value into the shared join.
+/// 5. The relay's destination is not the relay itself.
+///
+/// Everything else is a straight rewrite of one arm of one `Switch`, which
+/// leaves block order, labels, instruction order and every other edge intact.
+fn thread_switch_case_relays(
+    func: &mut IrFunction,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> usize {
+    if !switch_relay_thread_enabled() {
+        return 0;
+    }
+    thread_switch_case_relays_impl(func, label_to_idx)
+}
+
+/// The transformation itself, independent of the opt-in gate so unit tests
+/// exercise the same code the flag enables rather than a re-implementation.
+fn thread_switch_case_relays_impl(
+    func: &mut IrFunction,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> usize {
+    if label_to_idx.len() != func.blocks.len() {
+        return 0;
+    }
+    // DISTINCT predecessor BLOCKS, not edge occurrences.  `build_pred_info`
+    // counts mentions, so a `switch` whose default arm equals one of its case
+    // arms (the exact shape SipHash's fall-through ladder produces, and the
+    // normal result of `simplify_redundant_cond_branches` folding a redundant
+    // arm onto the default) reports two predecessors for a block that only ONE
+    // block can reach.  Retargeting every one of those arms is a complete edge
+    // rewrite, so the correct predicate here is "exactly one distinct
+    // predecessor block", and it is computed locally so this pass cannot
+    // change the meaning of `build_pred_info` for the sub-passes that share it.
+    let mut pred_blocks: FxHashMap<BlockId, FxHashSet<BlockId>> = FxHashMap::default();
+    {
+        let mut record = |from: BlockId, to: BlockId| {
+            pred_blocks.entry(to).or_default().insert(from);
+        };
+        for block in &func.blocks {
+            let src = block.label;
+            let mut targets: Vec<BlockId> = Vec::new();
+            for_each_terminator_target(&block.terminator, |t| targets.push(t));
+            for inst in &block.instructions {
+                if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                    for (_, label) in goto_labels {
+                        targets.push(*label);
+                    }
+                }
+            }
+            for target in targets {
+                record(src, target);
+            }
+        }
+    }
+    let mut phi_fed: FxHashSet<BlockId> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, from) in incoming {
+                    phi_fed.insert(*from);
+                }
+            }
+        }
+    }
+    // relay label -> destination, for every threadable relay.
+    let mut relay_target: FxHashMap<BlockId, BlockId> = FxHashMap::default();
+    for block in &func.blocks {
+        if !block.instructions.is_empty() {
+            continue;
+        }
+        let Terminator::Branch(target) = block.terminator else {
+            continue;
+        };
+        if target == block.label
+            || pred_blocks
+                .get(&block.label)
+                .is_none_or(|preds| preds.len() != 1)
+            || phi_fed.contains(&block.label)
+        {
+            continue;
+        }
+        relay_target.insert(block.label, target);
+    }
+    if relay_target.is_empty() {
+        return 0;
+    }
+    // Follow chains so one fixpoint iteration reaches the whole relay run
+    // instead of one hop per iteration.
+    //
+    // `resolve` returns `(terminal, last forwarding vertex)` -- NOT
+    // `(terminal, terminal)`. Using the second field here retargeted every case
+    // edge to the relay's own successor-in-the-chain, i.e. a no-op that still
+    // reported "changed": `simplify_cfg`'s fixpoint then never terminated and
+    // the kernel build wedged in `thread_switch_case_relays -> build_pred_info`
+    // for >6 minutes of pure CPU on `mm/vmstat.o` (caught by gdb sampling,
+    // 2026-11-19). The rewrite below is guarded so it can only ever shorten a
+    // chain: a target is replaced solely when the replacement differs, so a
+    // mis-resolved entry costs one wasted comparison instead of a hang.
+    let resolved = crate::common::forwarding::resolve(&relay_target);
+    let mut count = 0;
+    for block in &mut func.blocks {
+        let Terminator::Switch { cases, default, .. } = &mut block.terminator else {
+            continue;
+        };
+        for (_, label) in cases.iter_mut() {
+            if let Some(&(end, _)) = resolved.get(label)
+                && end != *label
+            {
+                *label = end;
+                count += 1;
+            }
+        }
+        // The default is decided from its ORIGINAL target: reading it after the
+        // case loop would compare against already-remapped arms, and a switch
+        // whose default equals one of its cases (the shape this pass exists
+        // for) would then keep a dangling edge into the relay it just removed
+        // from every other arm.
+        let original_default = *default;
+        if let Some(&(end, _)) = resolved.get(&original_default)
+            && end != original_default
+        {
+            *default = end;
+            count += 1;
+        }
+    }
+    count
+}
+
 fn unique_phi_value(incoming: &[(Operand, BlockId)], label: BlockId) -> Option<Operand> {
     let mut arms = incoming.iter().filter(|(_, from)| *from == label);
     let value = arms.next()?.0;
@@ -1874,6 +2073,146 @@ mod tests {
 
     /// Create a basic block for testing. Reduces boilerplate since
     /// `source_spans` is always empty in tests.
+    /// Regression (2026-11-19): `thread_switch_case_relays` must terminate.
+    ///
+    /// The first implementation read `forwarding::resolve`'s SECOND tuple field
+    /// (the last forwarding vertex) as the thread destination, so a case edge
+    /// was retargeted to the relay's successor and the counter still
+    /// incremented -- `simplify_cfg`'s fixpoint then spun forever. It wedged a
+    /// Linux kernel build in `thread_switch_case_relays -> build_pred_info` for
+    /// 6+ minutes of CPU on `mm/vmstat.o`. This test drives the real fixpoint
+    /// on the exact shape (switch -> empty relay -> body) and asserts the
+    /// rewrite lands, which a self-retargeting implementation cannot do.
+    #[test]
+    fn switch_case_relay_threads_to_the_terminal_block() {
+        // The pass is opt-in; drive the un-gated implementation directly so the
+        // test does not depend on the environment variable.
+        let body = BlockId(9);
+        let mut func = IrFunction::new("relay".into(), IrType::Void, vec![], false);
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Value(Value(0)),
+            }],
+            Terminator::Switch {
+                val: Operand::Value(Value(0)),
+                cases: vec![(0, BlockId(2)), (1, BlockId(3))],
+                default: BlockId(2),
+                ty: IrType::I32,
+            },
+        ));
+        func.blocks
+            .push(make_block(BlockId(2), Vec::new(), Terminator::Branch(body)));
+        func.blocks
+            .push(make_block(BlockId(3), Vec::new(), Terminator::Branch(body)));
+        func.blocks.push(make_block(
+            body,
+            vec![Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Value(Value(1)),
+            }],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let label_to_idx = build_label_to_idx(&func);
+        let changed = thread_switch_case_relays_impl(&mut func, &label_to_idx);
+        assert!(changed > 0, "the two relays must be threaded");
+        let Terminator::Switch { cases, default, .. } = &func.blocks[0].terminator else {
+            panic!("the switch terminator must survive threading");
+        };
+        assert_eq!(
+            cases.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            vec![body, body],
+            "case edges must land on the terminal block, not on the relay"
+        );
+        assert_eq!(*default, body);
+        // A second call must be a no-op: the fixpoint relies on that.
+        let map_again = build_label_to_idx(&func);
+        let again = thread_switch_case_relays_impl(&mut func, &map_again);
+        assert_eq!(again, 0, "threading must reach a fixpoint in ONE call");
+    }
+
+    /// A multi-predecessor relay is not threadable by redirection: retargeting
+    /// one edge would delete a block that another edge still needs.
+    #[test]
+    fn switch_case_relay_with_two_predecessors_is_kept() {
+        let relay = BlockId(2);
+        let body = BlockId(3);
+        let mut func = IrFunction::new("relay2".into(), IrType::Void, vec![], false);
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Switch {
+                val: Operand::Value(Value(0)),
+                cases: vec![(0, relay)],
+                default: BlockId(4),
+                ty: IrType::I32,
+            },
+        ));
+        // The second predecessor is NOT an empty relay (it carries a Copy), so
+        // the only block under test is `relay` itself and the expected count is
+        // exactly zero. An empty second predecessor would have been threaded on
+        // its own account and made the assertion meaningless.
+        func.blocks.push(make_block(
+            BlockId(4),
+            vec![Instruction::Copy {
+                dest: Value(7),
+                src: Operand::Value(Value(0)),
+            }],
+            Terminator::Branch(relay),
+        ));
+        func.blocks
+            .push(make_block(relay, vec![], Terminator::Branch(body)));
+        func.blocks.push(make_block(
+            body,
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        ));
+        let map = build_label_to_idx(&func);
+        let changed = thread_switch_case_relays_impl(&mut func, &map);
+        assert_eq!(changed, 0, "a shared relay must not be threaded");
+    }
+
+    /// A relay that feeds a PHI arm is kept: removing it requires rewriting the
+    /// destination PHI in the same transaction.
+    #[test]
+    fn switch_case_relay_feeding_a_phi_is_kept() {
+        let relay = BlockId(2);
+        let mut func = IrFunction::new("relay3".into(), IrType::Void, vec![], false);
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Switch {
+                val: Operand::Value(Value(0)),
+                cases: vec![(0, relay)],
+                default: BlockId(3),
+                ty: IrType::I32,
+            },
+        ));
+        func.blocks
+            .push(make_block(relay, vec![], Terminator::Branch(BlockId(4))));
+        func.blocks.push(make_block(
+            BlockId(3),
+            vec![],
+            Terminator::Branch(BlockId(4)),
+        ));
+        func.blocks.push(make_block(
+            BlockId(4),
+            vec![Instruction::Phi {
+                dest: Value(5),
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(1)), relay),
+                    (Operand::Const(IrConst::I32(2)), BlockId(3)),
+                ],
+                ty: IrType::I32,
+            }],
+            Terminator::Return(Some(Operand::Value(Value(5)))),
+        ));
+        let map = build_label_to_idx(&func);
+        let changed = thread_switch_case_relays_impl(&mut func, &map);
+        assert_eq!(changed, 0, "a PHI-feeding relay must not be threaded");
+    }
+
     fn make_block(
         label: BlockId,
         instructions: Vec<Instruction>,

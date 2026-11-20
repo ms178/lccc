@@ -1197,6 +1197,89 @@ fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
     volatile
 }
 
+/// Should a dominated duplicate be DELETED and its uses renamed onto the
+/// dominating definition, or kept as a `Copy` of it?
+///
+/// Deleting rewrites every dominated use to read the canonical SSA value, so
+/// it is only legal when the canonical is certain to have written its cell
+/// before the first renamed use reads it.  Dominance orders blocks, not
+/// instructions, so the question is whether any rewritten use can run before
+/// the canonical definition on some dynamic path.
+///
+/// Argument that it cannot, for a single-definition pure value:
+///
+/// * every use of the duplicate is dominated by the duplicate's block (SSA),
+///   and the duplicate's block is dominated by the canonical's block (that is
+///   what the dominator-scoped table guarantees);
+/// * therefore every rewritten use lies in a block dominated by the
+///   canonical's block, so on every path reaching that use the canonical's
+///   block has already executed;
+/// * and if the canonical's block lies on a cycle that the use is inside, the
+///   most recent execution of the canonical is still the one on the current
+///   pass through the cycle: a use dominated by both the canonical and the
+///   duplicate cannot be reached from a later turn of the cycle without
+///   passing the canonical again.
+///
+/// That reasoning needs the expression to be a *pure, total function of its
+/// operands*: re-executing it must not trap, must not touch memory, and must
+/// not be observable.  `cross_block_renamable` enumerates exactly those
+/// classes.  Instructions whose re-execution could trap (integer division by
+/// a runtime value), observe memory (loads with runtime addresses), allocate,
+/// or carry ABI/reservation semantics (`Call`, `InlineAsm`, `Intrinsic`) keep
+/// the pre-existing Copy form, which materialises the value at the
+/// duplicate's own position by construction and is unconditionally sound.
+///
+/// The remaining refuses are structural rather than semantic
+/// (`multi_def_values` webs and `phi_incoming_feeds`), and they are handled
+/// by the caller before this predicate is reached.
+/// Gate for the cross-block integer-`Cast` rename class.
+///
+/// OPT-IN (`CCC_CAST_RENAME=1`), following the same rule this repository
+/// applied to `CCC_SWITCH_RELAY_THREAD`: a rename class ships enabled only
+/// once the corpus proves it wins.  Measured with both settings on the
+/// integrated corpus (scripts/run_benchmarks.py, -O2 -march=x86-64-v3,
+/// lccc/gcc paired medians), the class is a clear win on the shapes it was
+/// designed for -- zlib-ng's heap comparator, whose three duplicate
+/// `Cast I32->I64` per operand collapse into one `movslq` -- but it also
+/// changes which value the double-fast match search observes, and the
+/// zstd/gzip workloads that depend on that search measured slower with it.
+/// It therefore stays behind the knob until the per-workload data shows a
+/// net win; the machinery is shared with the `Mul`/`Sub` classes above and
+/// is exercised by `integer_cast_duplicate_in_dominated_block_is_renamed`.
+fn cast_rename_enabled() -> bool {
+    CONFIG.load(std::sync::atomic::Ordering::Relaxed) & CAST_RENAME != 0
+}
+
+/// Install-once configuration for this pass's opt-in classes.
+///
+/// The knob is resolved once per translation unit by `run_passes` (see
+/// `src/passes/mod.rs`, which `check_env_test_hygiene.sh` excludes) and
+/// installed here, exactly as `loop_idiom::set_config` and
+/// `vectorize::set_strided_reduce_enabled` are.  Two reasons, both measured:
+/// a direct `env::var_os` in the pass body costs one probe per *function*
+/// (the ratchet in `check_env_test_hygiene.sh` counted it, 150 -> 151), and a
+/// process-global read inside a concurrent unit-test harness is the race this
+/// repository removes rather than documents -- the knob used to be toggled by
+/// a test through `env::set_var`, which is exactly the pattern
+/// `check_env_test_hygiene.sh` rule 1 confines to `src/test_support.rs`.
+pub(crate) fn set_cast_rename_enabled(enabled: bool) {
+    let mut bits = CONFIG.load(std::sync::atomic::Ordering::Relaxed);
+    if enabled {
+        bits |= CAST_RENAME;
+    } else {
+        bits &= !CAST_RENAME;
+    }
+    CONFIG.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bit 0 of [`CONFIG`]: the cross-block integer-`Cast` rename class.
+const CAST_RENAME: u8 = 0b01;
+static CONFIG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn rename_is_value_preserving(inst: &Instruction) -> bool {
+    cross_block_renamable(inst)
+}
+
 /// Instruction classes whose dominated duplicates are deleted and renamed
 /// onto the dominating value (see the inventory at the use site).
 ///
@@ -1212,6 +1295,48 @@ fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
 ///   are invalidated at the header merge (the dot-product argument).
 fn cross_block_renamable(inst: &Instruction) -> bool {
     match inst {
+        // INTEGER `Cast` between two non-pointer, non-128-bit types.
+        //
+        // Why this class exists: the C frontend spells an array subscript as
+        // `Cast I32->I64(%idx)` followed by `Shl`/`GEP`, and lowering emits
+        // that pair once per *syntactic* mention of the same subscript.  A
+        // two-operand predicate such as zlib-ng's
+        //
+        //     tree[n].freq < tree[m].freq
+        //  || (tree[n].freq == tree[m].freq && depth[n] <= depth[m])
+        //
+        // therefore carries THREE `Cast %n` and THREE `Cast %m` instructions
+        // (measured: `smaller` in tests/benchmark/programs/
+        // zlib_ng_huffman_heap.c).  Those casts are pure functions of an SSA
+        // value; once the dominating one is computed, every dominated
+        // duplicate is dead weight — a `movslq` per duplicate in a predicate
+        // the heap sift calls on every level.
+        //
+        // Shape neutrality (the reason `Mul`/`Sub` needed their own audit and
+        // `Add` is still excluded): a `Cast` is not consumed structurally by
+        // any matcher in the tree.  `bit_idioms`, `iv_strength_reduce` and
+        // `vectorize` match `BinOp`/`Cmp`/`Load`/`GEP` shapes that *contain*
+        // casts; none demands that a cast be re-materialised in the block it
+        // feeds, and the post-inline canonical pass this runs in front of
+        // (`phase-0 GVN`, src/passes/mod.rs) is followed by a full
+        // constant-fold/copy-prop/simplify sweep, so a rename that exposes a
+        // fold is resolved before the loop passes run.
+        //
+        // Excluded on purpose: `from_ty`/`to_ty` being `Ptr` (pointer casts
+        // feed the address materialisation machinery, which is site-local by
+        // design — the same reason GEP/GlobalAddr stay out), any 128-bit
+        // type (complex codegen is not CSE'd at all, see `make_expr_key`),
+        // and float<->int conversions (`SIToFP`/`FPToSI` are handled by the
+        // FP contraction order rules that pin bit-exact op sequences).
+        Instruction::Cast { from_ty, to_ty, .. } => {
+            cast_rename_enabled()
+                && !from_ty.is_128bit()
+                && !to_ty.is_128bit()
+                && *from_ty != IrType::Ptr
+                && *to_ty != IrType::Ptr
+                && !from_ty.is_float()
+                && !to_ty.is_float()
+        }
         Instruction::BinOp {
             op: IrBinOp::Mul,
             ty,
@@ -2276,6 +2401,25 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         // unrollers/vectorizers structurally refuse (see
                         // `phi_incoming_feeds`).  Keep the instruction.
                         None
+                    } else if !rename_is_value_preserving(&inst) {
+                        // Only a pure, total function of its operands may be
+                        // DELETED here (see `rename_is_value_preserving`).
+                        // For it, deleting the dominated twin is an
+                        // occurrence-relative no-op rather than a hoist: the
+                        // canonical is defined in a dominator, every
+                        // rewritten use is dominated by the duplicate (SSA)
+                        // and therefore by the canonical, so each rewritten
+                        // use is preceded on every path by the canonical's
+                        // most recent execution -- and a use on a later turn
+                        // of an enclosing cycle passes the canonical again
+                        // first.
+                        //
+                        // Everything else -- loads from runtime addresses,
+                        // calls, division, intrinsics, inline asm -- keeps
+                        // the Copy form below, which materialises the value
+                        // at the duplicate's OWN position and is sound
+                        // without any ordering argument.
+                        None
                     } else {
                         pure_cross_block_rename = true;
                         Some((ev, None))
@@ -3254,6 +3398,213 @@ mod tests {
             rhs: Operand::Value(Value(rhs)),
             ty,
         }
+    }
+
+    fn cast_inst(dest: u32, src: u32, from: IrType, to: IrType) -> Instruction {
+        Instruction::Cast {
+            dest: Value(dest),
+            src: Operand::Value(Value(src)),
+            from_ty: from,
+            to_ty: to,
+        }
+    }
+
+    /// Recursive acyclic CFG helper: `blocks` bodies chained 0 -> 1 -> ... -> n-1.
+    /// Used by the ordering tests below, which need "b0 defines, b1 duplicates"
+    /// without a cycle so dominance and reachability are unambiguous.
+    fn chain(blocks: Vec<BasicBlock>) -> IrFunction {
+        fn_of("chain", blocks, 64)
+    }
+
+    #[test]
+    fn integer_cast_duplicate_in_dominated_block_is_renamed() {
+        // Installed through the pass's own configuration entry point instead
+        // of mutating the process environment: the harness runs tests
+        // concurrently, and `check_env_test_hygiene.sh` confines `env::set_var`
+        // to `src/test_support.rs`.  Only this test touches the bit, and it
+        // restores it below.
+        set_cast_rename_enabled(true);
+        // The zlib-ng `smaller` shape at IR level: the frontend emits
+        // `Cast I32->I64(%idx)` once per syntactic mention of `tree[idx]`.
+        // The entry block's cast dominates, so the dominated duplicate must be
+        // DELETED (a rename), not turned into a Copy: a Copy would keep a
+        // `movslq` in the predicate.
+        let func = chain(vec![
+            blk(
+                0,
+                vec![cast_inst(2, 0, IrType::I32, IrType::I64)],
+                Terminator::Branch(BlockId(1)),
+                vec![],
+            ),
+            blk(
+                1,
+                vec![
+                    cast_inst(3, 0, IrType::I32, IrType::I64),
+                    mul_inst(4, 3, 3, IrType::I64),
+                ],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+                vec![],
+            ),
+        ]);
+        let mut module = IrModule {
+            functions: vec![func],
+            ..IrModule::default()
+        };
+        module.for_each_function(run_gvn_function);
+        set_cast_rename_enabled(false);
+        let b1 = &module.functions[0].blocks[1];
+        assert_eq!(
+            b1.instructions.len(),
+            1,
+            "duplicate cast must be deleted, got {:?}",
+            b1.instructions
+        );
+        match &b1.instructions[0] {
+            Instruction::BinOp { lhs, .. } => {
+                assert_eq!(
+                    lhs,
+                    &Operand::Value(Value(2)),
+                    "use must read the dominator's cast"
+                );
+            }
+            other => panic!("expected the Mul to survive, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pointer_cast_is_not_renamed() {
+        // Address materialisation is site-local by contract; the GEP/
+        // GlobalAddr machinery depends on seeing the cast where it was
+        // written.  A pointer cast duplicate must therefore stay a Copy.
+        let func = chain(vec![
+            blk(
+                0,
+                vec![cast_inst(2, 0, IrType::I32, IrType::I64)],
+                Terminator::Branch(BlockId(1)),
+                vec![],
+            ),
+            blk(
+                1,
+                vec![
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: Operand::Value(Value(0)),
+                        from_ty: IrType::I64,
+                        to_ty: IrType::Ptr,
+                    },
+                    Instruction::Cast {
+                        dest: Value(4),
+                        src: Operand::Value(Value(0)),
+                        from_ty: IrType::I64,
+                        to_ty: IrType::Ptr,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+                vec![],
+            ),
+        ]);
+        let mut module = IrModule {
+            functions: vec![func],
+            ..IrModule::default()
+        };
+        module.for_each_function(run_gvn_function);
+        // Both casts must still be present (same-block hit keeps the Copy form
+        // is impossible here -- they are distinct instructions in one block,
+        // so the second becomes a Copy of the first).  What must NOT happen is
+        // the deletion-on-rename path firing for the pointer class.
+        let b1 = &module.functions[0].blocks[1];
+        assert_eq!(b1.instructions.len(), 2);
+        assert!(matches!(
+            &b1.instructions[1],
+            Instruction::Copy { dest: Value(4), .. }
+        ));
+    }
+
+    #[test]
+    fn float_cast_is_not_renamed() {
+        // int<->float conversions are pinned by the FP contraction order
+        // rules; they must never be deleted cross-block.
+        let func = chain(vec![
+            blk(
+                0,
+                vec![cast_inst(2, 0, IrType::I32, IrType::F64)],
+                Terminator::Branch(BlockId(1)),
+                vec![],
+            ),
+            blk(
+                1,
+                vec![cast_inst(3, 0, IrType::I32, IrType::F64)],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+                vec![],
+            ),
+        ]);
+        let mut module = IrModule {
+            functions: vec![func],
+            ..IrModule::default()
+        };
+        module.for_each_function(run_gvn_function);
+        let b1 = &module.functions[0].blocks[1];
+        // Kept verbatim: the cross-block class refuses float conversions, so
+        // the pre-existing "no cross-block CSE" behaviour is preserved
+        // exactly (a deletion here would reorder the FP op sequence that the
+        // contraction passes pin).
+        assert_eq!(b1.instructions.len(), 1);
+        assert!(
+            matches!(
+                &b1.instructions[0],
+                Instruction::Cast {
+                    dest: Value(3),
+                    to_ty: IrType::F64,
+                    ..
+                }
+            ),
+            "float cast must stay materialised, got {:?}",
+            b1.instructions
+        );
+    }
+
+    #[test]
+    fn rename_is_refused_for_phi_feeding_duplicate() {
+        // A duplicate cast that feeds a phi keeps its instruction: deleting it
+        // would leave the phi reading a body-defined value, which the
+        // unrollers/vectorizers structurally refuse.
+        let func = fn_of(
+            "phi_feed",
+            vec![
+                blk(
+                    0,
+                    vec![cast_inst(2, 0, IrType::I32, IrType::I64)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![cast_inst(3, 0, IrType::I32, IrType::I64)],
+                    Terminator::Branch(BlockId(2)),
+                    vec![],
+                ),
+                blk(
+                    2,
+                    vec![Instruction::Phi {
+                        dest: Value(5),
+                        ty: IrType::I64,
+                        incoming: vec![
+                            (Operand::Value(Value(3)), BlockId(1)),
+                            (Operand::Value(Value(2)), BlockId(0)),
+                        ],
+                    }],
+                    Terminator::Return(Some(Operand::Value(Value(5)))),
+                    vec![],
+                ),
+            ],
+            64,
+        );
+        let mut module = IrModule {
+            functions: vec![func],
+            ..IrModule::default()
+        };
+        module.for_each_function(run_gvn_function);
+        assert_eq!(module.functions[0].blocks[1].instructions.len(), 1);
     }
 
     fn blk(
