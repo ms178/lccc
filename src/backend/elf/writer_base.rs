@@ -576,6 +576,7 @@ impl ElfWriterBase {
                     // refused), so there is never a byte worth storing.
                     sh_size: (sh_type == SHT_NOBITS).then_some(0),
                     sh_addralign: align,
+                    sh_entsize: 0,
                     relocs: Vec::new(),
                     comdat_group: None,
                 },
@@ -1446,14 +1447,27 @@ impl ElfWriterBase {
     ///
     /// `sec_name`: section name, `flags_str`: flag characters ("awx" etc.),
     /// `flags_explicit`: whether flags were explicitly provided (vs default),
-    /// `sec_type_str`: optional type string ("@nobits", "@note", etc.)
+    /// `sec_type_str`: optional type string ("@nobits", "@note", etc.),
+    /// `entity_size`: the argument after the type, the size of one entry of
+    /// a mergeable section (`.section .rodata.cst16,"aM",@progbits,16`).
     pub fn process_section_directive(
         &mut self,
         sec_name: &str,
         flags_str: &str,
         flags_explicit: bool,
         sec_type_str: Option<&str>,
+        entity_size: Option<&str>,
     ) -> Result<(), String> {
+        // GNU as: a mergeable section that states no usable entity size is
+        // an ordinary section, with a warning (`section_entity_size`).
+        let (entsize, mergeable) =
+            match super::section_entity_size(flags_explicit.then_some(flags_str), entity_size) {
+                Ok(size) => (size, true),
+                Err(warning) => {
+                    lccc::cli::stderr_line(format_args!("warning: {warning}"));
+                    (0, false)
+                }
+            };
         let sh_type = match sec_type_str {
             Some("@nobits" | "%nobits") => SHT_NOBITS,
             Some("@note" | "%note") => SHT_NOTE,
@@ -1479,10 +1493,10 @@ impl ElfWriterBase {
         if flags_str.contains('x') {
             sh_flags |= SHF_EXECINSTR;
         }
-        if flags_str.contains('M') {
+        if mergeable && flags_str.contains('M') {
             sh_flags |= SHF_MERGE;
         }
-        if flags_str.contains('S') {
+        if mergeable && flags_str.contains('S') {
             sh_flags |= SHF_STRINGS;
         }
         if flags_str.contains('T') {
@@ -1521,6 +1535,14 @@ impl ElfWriterBase {
         // Always created at 1: GAS raises AX sections only when an
         // instruction actually lands in them (see `note_instruction`).
         self.ensure_section(sec_name, sh_type, sh_flags, 1);
+        if entsize != 0
+            && let Some(section) = self.sections.get_mut(sec_name)
+        {
+            if section.sh_entsize != 0 && section.sh_entsize != entsize {
+                return Err(format!("changed section entity size for {sec_name}"));
+            }
+            section.sh_entsize = entsize;
+        }
         self.previous_section = std::mem::replace(&mut self.current_section, sec_name.to_string());
         Ok(())
     }
@@ -1570,9 +1592,10 @@ impl ElfWriterBase {
         flags_str: &str,
         flags_explicit: bool,
         sec_type: Option<&str>,
+        entity_size: Option<&str>,
     ) -> Result<(), String> {
         let saved = (self.current_section.clone(), self.previous_section.clone());
-        self.process_section_directive(name, flags_str, flags_explicit, sec_type)?;
+        self.process_section_directive(name, flags_str, flags_explicit, sec_type, entity_size)?;
         self.section_stack.push(saved);
         Ok(())
     }
@@ -1747,9 +1770,29 @@ impl ElfWriterBase {
     }
 
     /// Record symbol visibility (`.hidden`, `.protected`, `.internal`).
+    ///
+    /// A visibility only narrows, as in GAS (`obj_elf_visibility`): the
+    /// directive applies when the symbol has none yet or the new one is at
+    /// least as restrictive -- internal, hidden, protected, their numeric
+    /// order -- and is refused with a warning otherwise. Taking the last
+    /// directive let `.protected f` undo `.hidden f`.
     pub fn set_visibility(&mut self, syms: &str, vis: u8) {
         for sym in symbol_list(syms) {
-            self.symbol_visibility.insert(sym.to_string(), vis);
+            match self.symbol_visibility.get(sym).copied() {
+                Some(current) if current != STV_DEFAULT && vis > current => {
+                    lccc::cli::stderr_line(format_args!(
+                        "warning: visibility of `{sym}' is already `{}'",
+                        if current == STV_HIDDEN {
+                            "hidden"
+                        } else {
+                            "internal"
+                        }
+                    ));
+                }
+                _ => {
+                    self.symbol_visibility.insert(sym.to_string(), vis);
+                }
+            }
         }
     }
 

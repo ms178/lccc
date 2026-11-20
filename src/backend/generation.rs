@@ -5217,7 +5217,12 @@ pub fn generate_module(
 ) -> String {
     // Freeze this module's control once, not once per function, and avoid
     // running the analysis on backends whose switch emitters do not use it.
+    // Not at -O0 (`disable_regalloc`): a jump table without its range check
+    // leaves the default block with no way in, and only the optimizing tiers
+    // retire that default (`switch_cover`). Unoptimized code keeps the check
+    // and a reachable default, as GCC's does.
     cg.state().switch_bounds_enabled = cg.supports_switch_bounds()
+        && !cg.state_ref().disable_regalloc
         && !crate::passes::pass_disabled(
             std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
             "intbounds",
@@ -7161,8 +7166,15 @@ fn generate_function_body(
     let sibcall_fn_ok = sibcall_use_counts.is_some();
     let sibcall_use_counts = sibcall_use_counts.unwrap_or_default();
 
+    let entered_only_by_falling_in =
+        crate::backend::label_identity::blocks_entered_only_by_falling_in(func, &observable_labels);
+
     for (block_idx, block) in func.blocks.iter().enumerate() {
         cg.begin_home_write_block(block.label);
+        // Nothing names this block's label when the one jump that leads here
+        // was left out (`blocks_entered_only_by_falling_in`).
+        let label_is_named = !(std::mem::take(&mut cg.state().branch_elided_into_next_block)
+            && entered_only_by_falling_in.contains(&block.label));
         // What the vector return register held at the end of the block
         // emitted before this one says nothing about the paths that enter
         // this one.
@@ -7198,14 +7210,14 @@ fn generate_function_body(
             // front of the ordinary bounded cascade below. Only present
             // in code destined for the integrated assembler (-S keeps
             // portable directives only).
-            if crate::passes::loop_align::tight_header(block.label.0) {
+            if label_is_named && crate::passes::loop_align::tight_header(block.label.0) {
                 cg.state()
                     .emit_fmt(format_args!(".lccc_tight_loop .LBB{}", block.label.0));
             }
             // Loop-header / hot-join alignment directives decided by
             // passes::loop_align (post-layout, oracle-calibrated policy;
             // empty on -O0/-Os builds).
-            if crate::passes::loop_align::directives_active() {
+            if label_is_named && crate::passes::loop_align::directives_active() {
                 if let Some(directives) = crate::passes::loop_align::directives(block.label.0) {
                     for d in &directives {
                         match d.max_skip {
@@ -7217,7 +7229,9 @@ fn generate_function_body(
                     }
                 }
             }
-            cg.state().out.emit_block_label(block.label.0);
+            if label_is_named {
+                cg.state().out.emit_block_label(block.label.0);
+            }
         }
         let address_kind = observable_labels.get(&block.label).copied();
         cg.state()

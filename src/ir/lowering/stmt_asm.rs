@@ -339,6 +339,18 @@ impl Lowerer {
                     self.lower_expr(&inp.expr)
                 }
             };
+            // An immediate-only operand that names a symbol is printed as the
+            // symbol (`"i"(&key)` -> `key`): nothing reads its value, and the
+            // asm must not keep the address computation above alive.  It
+            // stays lowered, so that whatever else lowering does for a use of
+            // the symbol still happens, and is dead from here on.
+            let val = if sym_name.is_some()
+                && crate::common::asm_constraints::constraint_is_immediate_only(&constraint)
+            {
+                Operand::Const(crate::ir::reexports::IrConst::I64(0))
+            } else {
+                val
+            };
             ir_inputs.push((constraint, val, name));
             operand_types.push(inp_ty);
             input_symbols.push(sym_name);

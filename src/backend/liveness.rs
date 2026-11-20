@@ -1033,9 +1033,27 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
             outputs,
             inputs,
             clobbers,
+            operand_types,
             goto_labels,
+            input_symbols,
             ..
         } => {
+            // x86-64: an asm that stages at most two operands, in registers
+            // of the emitter's own choice, uses %rcx and %rdx for them (and
+            // %rax in between) -- the function's scratch, which holds no
+            // value across any instruction.  See
+            // [`x86_64_asm_stages_in_fixed_scratch`].
+            if x86_64_asm_stages_in_fixed_scratch(
+                outputs,
+                inputs,
+                clobbers,
+                operand_types,
+                input_symbols,
+            )
+            .is_some()
+            {
+                return false;
+            }
             // `asm volatile("" ::: "memory")` is a compiler barrier, not a
             // register clobber. A GP/XMM clobber list without operands
             // (`syscall ::: rcx,r11`) *is* a call point.
@@ -1067,9 +1085,28 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
                 !goto_labels.is_empty(),
                 !clobbers.is_empty(),
             );
+            // An immediate input is text: the emitter prints the constant or
+            // the symbol into the template and stages no register for it
+            // (`AsmOperandKind::Immediate`), so it destroys none.  It is the
+            // only operand the kernel's static keys have --
+            // `asm goto("1: nop5 ... .quad %c0 + %c1 - ." : : "i"(key),
+            // "i"(branch) : : l_yes)` -- and counted as a register operand it
+            // made every `if (static_branch_unlikely(&key))` a call: whatever
+            // was live across the test moved into a callee-saved register or
+            // onto the stack for five bytes of `nop`.
+            //
+            // "Immediate" is read off the operand as well as the constraint:
+            // a value that has neither folded to a constant nor been given
+            // its symbol is no immediate yet, whatever the constraint says.
+            let stages_a_register =
+                |(i, (constraint, operand, _)): (usize, &(String, Operand, Option<String>))| {
+                    !(crate::backend::inline_asm::constraint_is_immediate_only(constraint)
+                        && (matches!(operand, Operand::Const(_))
+                            || input_symbols.get(i).is_some_and(Option::is_some)))
+                };
             !inert
                 && (!outputs.is_empty()
-                    || !inputs.is_empty()
+                    || inputs.iter().enumerate().any(stages_a_register)
                     || clobbers.iter().any(|c| clobber_is_allocatable_reg(c)))
         }
         Instruction::Memcpy { .. }
@@ -1141,6 +1178,179 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
         }
         _ => false,
     }
+}
+
+/// Most scratch registers an inline asm may be given before one of them is a
+/// register the allocator hands out: the x86-64 emitter takes them in the
+/// order `%rcx`, `%rdx`, `%rsi`, ... (`X86_GP_SCRATCH`; `%rax`, `%rcx`, `%rdx`
+/// for an operand printed through `%h`).
+const X86_64_ASM_FIXED_SCRATCH_OPERANDS: usize = 2;
+
+/// x86-64: `Some(n)` when the registers this asm statement is given are the
+/// first `n <= 2` of the emitter's scratch order -- `%rcx`, then `%rdx` -- and
+/// nothing else of the machine state is written that the statement does not
+/// name itself.  `None` when that cannot be told from the statement.
+///
+/// GCC's contract for extended asm is that it changes its outputs and its
+/// clobbers and nothing else.  LCCC adds registers of its own: an operand is
+/// staged in a scratch register (an input is copied there, an output written
+/// back from there, the address of an `m` operand held there), and since the
+/// allocator did not know which, every operand-carrying asm was a call point:
+/// whatever lived across `this_cpu_inc()`, `atomic_inc()` or `test_bit()`
+/// needed a callee-saved register or a stack slot.  Kernel code is made of
+/// those.
+///
+/// The first two scratch registers are no homes, though.  `%rax` and `%rcx`
+/// never hold a value across an instruction, and `%rdx` only across
+/// instructions [`crate::backend::regalloc::x86_inst_fixed_scratch`] clears --
+/// which reports `%rdx` for a statement that takes two.  So an asm that
+/// stages at most two operands destroys nothing the allocator owns.
+///
+/// Everything that could move the emitter off that order answers `None`:
+///
+/// * a clobber that names a register (it is skipped in the scratch order, so
+///   the next choice may be `%rsi`), and an operand bound to a register by a
+///   single-register constraint (`a`, `D`) or a register variable (lowered
+///   to the constraint `{r8}`);
+/// * an operand that is not a general register, memory or immediate one (`x`,
+///   `t`, `k`: other register files, some of them allocatable), or whose type
+///   needs a pair or the SSE file (128-bit integers, floating point);
+/// * three or more operands that may each take a register.  Counted without
+///   knowing where the values live: every output, and every input that is
+///   neither the read half of a `+` output, nor tied to an output, nor
+///   printed (a symbol, or a constant behind an immediate-only constraint).
+///
+/// Other targets answer `None`: their scratch orders begin with registers
+/// their allocators use.
+pub(crate) fn x86_64_asm_stages_in_fixed_scratch(
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+    clobbers: &[String],
+    operand_types: &[IrType],
+    input_symbols: &[Option<String>],
+) -> Option<usize> {
+    if crate::common::types::target_elf_machine() != crate::backend::elf::EM_X86_64 {
+        return None;
+    }
+    if clobbers.iter().any(|c| clobber_is_allocatable_reg(c)) {
+        return None;
+    }
+    let scalar = |ty: &IrType| {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        )
+    };
+    if !operand_types.iter().all(scalar) {
+        return None;
+    }
+    let named = |i: usize| input_symbols.get(i).is_some_and(Option::is_some);
+    let memory_only = |constraint: &str| {
+        let class = constraint.trim_start_matches(['=', '+', '&', '%']);
+        !class.is_empty() && class.chars().all(|c| matches!(c, 'm' | 'o' | 'V'))
+    };
+    let mut staged = 0usize;
+    // The read half of the k-th `+` output is input k (lowering puts them
+    // first, the emitter pairs them by that position) and shares the output's
+    // operand: one register for both, or none when the operand is a symbol
+    // the emitter addresses as `sym(%rip)`.
+    let mut read_halves = 0usize;
+    for (constraint, _, _) in outputs {
+        if !asm_constraint_is_generic(constraint) {
+            return None;
+        }
+        let by_name = if constraint.contains('+') {
+            read_halves += 1;
+            memory_only(constraint) && named(read_halves - 1)
+        } else {
+            false
+        };
+        if !by_name {
+            staged += 1;
+        }
+    }
+    for (i, (constraint, operand, _)) in inputs.iter().enumerate() {
+        if !asm_constraint_is_generic(constraint) {
+            return None;
+        }
+        if i < read_halves {
+            continue;
+        }
+        let tied = constraint
+            .trim_start_matches(['%', '&'])
+            .starts_with(|c: char| c.is_ascii_digit());
+        // A symbol is printed into the template whatever the constraint (as
+        // `sym(%rip)` for a memory operand, as the name otherwise), and so is
+        // a constant behind an immediate-only constraint.
+        let printed = named(i)
+            || (crate::backend::inline_asm::constraint_is_immediate_only(constraint)
+                && matches!(operand, Operand::Const(_)));
+        if !tied && !printed {
+            staged += 1;
+        }
+    }
+    (staged <= X86_64_ASM_FIXED_SCRATCH_OPERANDS).then_some(staged)
+}
+
+/// Whether an asm constraint lets the emitter choose the register: general
+/// registers (`r`, `q`, `Q`, `R`, `l`), memory (`m`, `o`, `V`, `p`), either
+/// (`g`), immediates, ties, a condition-code output, and the modifiers.  A
+/// letter outside that set
+/// names one register, another register file or a class this model has not
+/// been taught -- all of them a reason to keep the statement a call point.
+fn asm_constraint_is_generic(constraint: &str) -> bool {
+    // `=@cc<cond>`: the flags, read into the operand's scratch register by a
+    // `setcc` behind the template (or straight into the value's stack home).
+    let class = constraint.trim_start_matches(['=', '+', '&', '%']);
+    if let Some(cond) = class.strip_prefix("@cc") {
+        return !cond.is_empty() && cond.bytes().all(|b| b.is_ascii_lowercase());
+    }
+    // A `#` starts a comment GCC skips for register preferencing; the
+    // letters behind it still select alternatives, so they count.
+    !constraint.is_empty()
+        && constraint.chars().all(|c| {
+            matches!(
+                c,
+                '=' | '+'
+                    | '&'
+                    | '%'
+                    | ','
+                    | '?'
+                    | '!'
+                    | '*'
+                    | '#'
+                    | 'r'
+                    | 'q'
+                    | 'Q'
+                    | 'R'
+                    | 'l'
+                    | 'm'
+                    | 'o'
+                    | 'V'
+                    | 'p'
+                    | 'g'
+                    | 'i'
+                    | 'n'
+                    | 'e'
+                    | 'Z'
+                    | 'I'
+                    | 'J'
+                    | 'K'
+                    | 'L'
+                    | 'M'
+                    | 'N'
+                    | 'O'
+                    | 's'
+            ) || c.is_ascii_digit()
+        })
 }
 
 /// True if an asm clobber names an allocatable register (GPR / XMM / …),
@@ -2448,15 +2658,25 @@ fn build_intervals(
     intervals
 }
 
+/// Whether `inst` calls a function that can return a second time.
+///
+/// The names are GCC's (`special_function_p` in calls.cc, which sets
+/// `ECF_RETURNS_TWICE` for exactly these): `setjmp` and `sigsetjmp` with
+/// zero, one or two leading underscores, and `savectx`, `vfork` and
+/// `getcontext` as spelled. `getcontext` matters as much as `setjmp`: a
+/// `setcontext` or `swapcontext` back to the saved context resumes behind
+/// the call with the registers of the first return, on a path the
+/// control-flow graph does not have.
 pub(crate) fn is_returns_twice_call(inst: &Instruction) -> bool {
-    if let Instruction::Call { func, .. } = inst {
-        matches!(
-            func.as_str(),
-            "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp" | "vfork"
-        )
-    } else {
-        false
-    }
+    let Instruction::Call { func, .. } = inst else {
+        return false;
+    };
+    let name = func.as_str();
+    let bare = name
+        .strip_prefix("__")
+        .or_else(|| name.strip_prefix('_'))
+        .unwrap_or(name);
+    matches!(bare, "setjmp" | "sigsetjmp") || matches!(name, "savectx" | "vfork" | "getcontext")
 }
 
 // ── Canonical operand visitors (shared with live_range.rs) ───────────────────
@@ -3476,8 +3696,9 @@ mod tests {
         assert!(iv.start <= 1 && iv.end >= 10);
     }
 
-    #[test]
-    fn test_inline_asm_with_operands_is_call_point() {
+    /// One asm statement around which `v0` is live: the call points of the
+    /// function are those of the statement.
+    fn call_points_of_asm(asm: &AsmShape) -> usize {
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -3491,12 +3712,12 @@ mod tests {
                 },
                 Instruction::InlineAsm {
                     template: "nop".to_string(),
-                    outputs: vec![("=r".to_string(), Value(1), Some("out".to_string()))],
-                    inputs: vec![],
-                    clobbers: vec![],
-                    operand_types: vec![IrType::I32],
+                    outputs: asm.outputs.clone(),
+                    inputs: asm.inputs.clone(),
+                    clobbers: asm.clobbers.clone(),
+                    operand_types: asm.types.clone(),
                     goto_labels: vec![],
-                    input_symbols: vec![],
+                    input_symbols: asm.symbols.clone(),
                     seg_overrides: vec![],
                 },
             ],
@@ -3504,13 +3725,164 @@ mod tests {
             source_spans: Vec::new(),
             source_inline_ids: Vec::new(),
         });
-        func.next_value_id = 2;
+        func.next_value_id = 8;
+        compute_live_intervals(&func).call_points.len()
+    }
 
-        let result = compute_live_intervals(&func);
-        assert!(
-            !result.call_points.is_empty(),
-            "InlineAsm with register operands should be a call point"
-        );
+    /// The operand lists of one asm statement, as lowering writes them: the
+    /// read half of every `+` output first among the inputs.
+    struct AsmShape {
+        outputs: Vec<(String, Value, Option<String>)>,
+        inputs: Vec<(String, Operand, Option<String>)>,
+        clobbers: Vec<String>,
+        types: Vec<IrType>,
+        symbols: Vec<Option<String>>,
+    }
+
+    /// `outputs` and `inputs` as `(constraint, value id)`; an input with the
+    /// id 0 is the symbol `sym`.  64-bit operands, `cc` and `memory` clobbered.
+    fn asm_shape(outputs: &[(&str, u32)], inputs: &[(&str, u32)]) -> AsmShape {
+        AsmShape {
+            outputs: outputs
+                .iter()
+                .map(|(c, v)| (c.to_string(), Value(*v), None))
+                .collect(),
+            inputs: inputs
+                .iter()
+                .map(|(c, v)| (c.to_string(), Operand::Value(Value(*v)), None))
+                .collect(),
+            clobbers: vec!["cc".to_string(), "memory".to_string()],
+            types: vec![IrType::I64; outputs.len() + inputs.len()],
+            symbols: inputs
+                .iter()
+                .map(|(_, v)| (*v == 0).then(|| "sym".to_string()))
+                .collect(),
+        }
+    }
+
+    fn staged(asm: &AsmShape) -> Option<usize> {
+        x86_64_asm_stages_in_fixed_scratch(
+            &asm.outputs,
+            &asm.inputs,
+            &asm.clobbers,
+            &asm.types,
+            &asm.symbols,
+        )
+    }
+
+    /// An asm whose registers the allocator cannot name is a call point:
+    /// three operands reach `%rsi` in the scratch order, a register clobber
+    /// shifts the order, and a single-register or SSE operand is outside it.
+    #[test]
+    fn test_inline_asm_with_operands_is_call_point() {
+        let with = |mut asm: AsmShape, change: &dyn Fn(&mut AsmShape)| {
+            change(&mut asm);
+            asm
+        };
+        for (what, asm) in [
+            (
+                "three staged operands",
+                asm_shape(&[("=r", 1)], &[("r", 2), ("r", 3)]),
+            ),
+            (
+                "a register clobber",
+                with(asm_shape(&[("=r", 1)], &[]), &|a| {
+                    a.clobbers.push("rcx".to_string());
+                }),
+            ),
+            (
+                "an operand bound to a register",
+                asm_shape(&[("=a", 1)], &[]),
+            ),
+            ("a register variable", asm_shape(&[], &[("{r10}", 2)])),
+            ("a named tie", asm_shape(&[("=r", 1)], &[("[out]", 2)])),
+            (
+                "an SSE operand",
+                with(asm_shape(&[("=x", 1)], &[]), &|a| {
+                    a.types = vec![IrType::F64]
+                }),
+            ),
+            (
+                "a floating-point value in a general register",
+                with(asm_shape(&[("=r", 1)], &[]), &|a| {
+                    a.types = vec![IrType::F64]
+                }),
+            ),
+            (
+                "a 128-bit operand",
+                with(asm_shape(&[("=r", 1)], &[]), &|a| {
+                    a.types = vec![IrType::I128]
+                }),
+            ),
+        ] {
+            assert_eq!(staged(&asm), None, "{what}");
+            assert_eq!(call_points_of_asm(&asm), 1, "{what}");
+        }
+    }
+
+    /// x86-64: at most two operands staged in registers of the emitter's
+    /// choice take `%rcx` and `%rdx`, which hold no value across an
+    /// instruction.  Such a statement destroys nothing the allocator owns --
+    /// the kernel's per-CPU accessors, atomics and `preempt_count` updates
+    /// are all of this shape.
+    #[test]
+    fn x86_64_asm_staged_in_the_fixed_scratch_is_no_call_point() {
+        for (what, asm, want) in [
+            // movq %gs:var(%rip), %reg
+            ("this_cpu_read", asm_shape(&[("=r", 1)], &[("m", 0)]), 1),
+            // addl %reg, %gs:var(%rip): the variable is addressed by name,
+            // through the output and through its read half.
+            (
+                "this_cpu_add",
+                asm_shape(&[("+m", 1)], &[("m", 0), ("ri", 2)]),
+                1,
+            ),
+            // lock incl (%reg): one register for the output and its read half.
+            ("atomic_inc", asm_shape(&[("+m", 1)], &[("m", 1)]), 1),
+            (
+                "xadd",
+                asm_shape(&[("+r", 1), ("+m", 2)], &[("r", 1), ("m", 2)]),
+                2,
+            ),
+            (
+                "xchg",
+                asm_shape(&[("=r", 1), ("+m", 2)], &[("m", 2), ("0", 3)]),
+                2,
+            ),
+            ("one output", asm_shape(&[("=rm", 1)], &[]), 1),
+            ("one input", asm_shape(&[], &[("q", 2)]), 1),
+            (
+                "a condition code",
+                asm_shape(&[("=@ccc", 1)], &[("m", 2)]),
+                2,
+            ),
+            ("nothing staged", asm_shape(&[], &[("i", 0)]), 0),
+        ] {
+            assert_eq!(staged(&asm), Some(want), "{what}");
+            assert_eq!(call_points_of_asm(&asm), 0, "{what}");
+        }
+        // A constant behind an immediate-only constraint is printed.
+        let mut bit = asm_shape(&[("+m", 1)], &[("m", 1), ("r", 2), ("i", 3)]);
+        bit.inputs[2].1 = Operand::Const(IrConst::I64(7));
+        assert_eq!(staged(&bit), Some(2));
+        // The same constant behind `ri` may still be given a register.
+        bit.inputs[2].0 = "ri".to_string();
+        assert_eq!(staged(&bit), None);
+    }
+
+    /// The scratch orders of the other targets begin with registers their
+    /// allocators hand out: the same statement stays a call point there.
+    #[test]
+    fn asm_staging_is_a_call_point_off_x86_64() {
+        use crate::backend::elf::{EM_386, EM_AARCH64, EM_RISCV};
+        let asm = asm_shape(&[("=r", 1)], &[("m", 2)]);
+        for machine in [EM_386, EM_AARCH64, EM_RISCV] {
+            crate::common::types::set_target_elf_machine(machine);
+            assert_eq!(staged(&asm), None, "e_machine {machine}");
+            assert_eq!(call_points_of_asm(&asm), 1, "e_machine {machine}");
+        }
+        crate::common::types::set_target_elf_machine(crate::backend::elf::EM_X86_64);
+        assert_eq!(staged(&asm), Some(2));
     }
 
     #[test]
@@ -3597,17 +3969,42 @@ mod tests {
             "an empty template cannot clobber a register: {:?}",
             result.call_points
         );
-        // The same operands with a real instruction ARE a call point.
+        // The same operands with a real instruction are staged: in the fixed
+        // scratch on x86-64 (two registers at most, so still no call point),
+        // in registers the allocator owns elsewhere.
         let mut with_body = func.clone();
         for inst in &mut with_body.blocks[0].instructions {
             if let Instruction::InlineAsm { template, .. } = inst {
                 *template = "nop".to_string();
             }
         }
-        let result = compute_live_intervals(&with_body);
+        assert!(compute_live_intervals(&with_body).call_points.is_empty());
+        crate::common::types::set_target_elf_machine(crate::backend::elf::EM_AARCH64);
+        let elsewhere = compute_live_intervals(&with_body);
+        crate::common::types::set_target_elf_machine(crate::backend::elf::EM_X86_64);
         assert!(
-            !result.call_points.is_empty(),
-            "a non-empty template with operands stays a call point"
+            !elsewhere.call_points.is_empty(),
+            "a non-empty template with operands stays a call point off x86-64"
+        );
+        // A third staged operand reaches a register the allocator owns.
+        for inst in &mut with_body.blocks[0].instructions {
+            if let Instruction::InlineAsm {
+                inputs,
+                operand_types,
+                input_symbols,
+                ..
+            } = inst
+            {
+                for id in [5, 6] {
+                    inputs.push(("r".to_string(), Operand::Value(Value(id)), None));
+                    operand_types.push(IrType::I64);
+                    input_symbols.push(None);
+                }
+            }
+        }
+        assert!(
+            !compute_live_intervals(&with_body).call_points.is_empty(),
+            "three staged operands are a call point"
         );
     }
 
@@ -3643,28 +4040,52 @@ mod tests {
                 seg_overrides: vec![],
             }
         }
-        let register_staged: &[(&[&str], &[&str])] = &[
-            (&["+r"], &[]),
+        // An operand bound to a register, or to another register file: a
+        // call point on every target.
+        let register_bound: &[(&[&str], &[&str])] = &[
             (&["+d"], &[]),
             (&["+c"], &[]),
             (&["=a"], &[]),
             (&[], &["S"]),
             (&[], &["D"]),
             (&["={rdx}"], &[]),
-            (&["=r"], &["0"]),
-            (&["+m"], &["0"]),
-            (&["+rm"], &[]),
-            (&["=g"], &[]),
-            (&["+m"], &["r"]),
             (&["=x"], &[]),
             (&["+{mm0}"], &[]),
         ];
-        for (outs, ins) in register_staged {
+        for (outs, ins) in register_bound {
             assert!(
                 instruction_is_call_point(&asm("", outs, ins, false)),
                 "an empty template still stages {outs:?} {ins:?}"
             );
         }
+        // A register of the emitter's choice: staged all the same, on x86-64
+        // in the fixed scratch (`x86_64_asm_stages_in_fixed_scratch`), which
+        // is no call point; a call point where the scratch order starts with
+        // a register the allocator hands out.
+        let emitter_choice: &[(&[&str], &[&str])] = &[
+            (&["+r"], &[]),
+            (&["=r"], &["0"]),
+            (&["+m"], &["0"]),
+            (&["+rm"], &[]),
+            (&["=g"], &[]),
+            (&["+m"], &["r"]),
+        ];
+        for (outs, ins) in emitter_choice {
+            assert!(
+                !instruction_is_call_point(&asm("", outs, ins, false)),
+                "x86-64 stages {outs:?} {ins:?} in the fixed scratch"
+            );
+        }
+        crate::common::types::set_target_elf_machine(crate::backend::elf::EM_RISCV);
+        let elsewhere: Vec<bool> = emitter_choice
+            .iter()
+            .map(|(outs, ins)| instruction_is_call_point(&asm("", outs, ins, false)))
+            .collect();
+        crate::common::types::set_target_elf_machine(crate::backend::elf::EM_X86_64);
+        assert!(
+            elsewhere.iter().all(|&call| call),
+            "an empty template still stages a register off x86-64: {elsewhere:?}"
+        );
         let inert: &[(&[&str], &[&str])] = &[
             (&["+m"], &[]),
             (&["=m"], &["m"]),
@@ -3677,19 +4098,105 @@ mod tests {
                 !instruction_is_call_point(&asm(" ;\n\t", outs, ins, false)),
                 "memory/immediate operands under an empty template: {outs:?} {ins:?}"
             );
-            // Controls: a real instruction, or goto labels, keep the call point.
-            assert!(instruction_is_call_point(&asm("nop", outs, ins, false)));
-            assert!(instruction_is_call_point(&asm("", outs, ins, true)));
+            // Controls: with a real instruction, or with goto labels, the
+            // operands are staged -- a call point wherever the allocator owns
+            // the scratch registers (x86-64 stages these in the fixed scratch).
+            crate::common::types::set_target_elf_machine(crate::backend::elf::EM_AARCH64);
+            let staged = [
+                instruction_is_call_point(&asm("nop", outs, ins, false)),
+                instruction_is_call_point(&asm("", outs, ins, true)),
+                !instruction_is_call_point(&asm(" ;\n\t", outs, ins, false)),
+            ];
+            crate::common::types::set_target_elf_machine(crate::backend::elf::EM_X86_64);
+            assert_eq!(staged, [true; 3], "{outs:?} {ins:?}");
         }
         // Dialect alternatives that are empty in both dialects assemble to
-        // nothing; a non-empty alternative does not.
+        // nothing; a non-empty alternative does not.  (i686 has the dialects
+        // and an allocator that owns the scratch registers.)
+        crate::common::types::set_target_elf_machine(crate::backend::elf::EM_386);
+        let dialects = [
+            !instruction_is_call_point(&asm("{|}", &["+m"], &[], false)),
+            instruction_is_call_point(&asm("{nop|nop}", &["+m"], &[], false)),
+        ];
+        crate::common::types::set_target_elf_machine(crate::backend::elf::EM_X86_64);
+        assert_eq!(dialects, [true; 2]);
         assert!(!instruction_is_call_point(&asm("{|}", &["+m"], &[], false)));
-        assert!(instruction_is_call_point(&asm(
-            "{nop|nop}",
-            &["+m"],
-            &[],
-            false
-        )));
+    }
+
+    /// A static key (`asm/jump_label.h`): a `nop`, a table entry, and two
+    /// immediates the entry is built from.  No register is staged and none
+    /// is clobbered, with the goto label or without.
+    #[test]
+    fn test_asm_with_immediate_inputs_only_is_no_call_point() {
+        fn asm(
+            inputs: Vec<(&str, Operand, Option<&str>)>,
+            clobbers: &[&str],
+            goto: bool,
+        ) -> Instruction {
+            Instruction::InlineAsm {
+                template: "1: nop\n.quad %c0 + %c1 - .".to_string(),
+                outputs: vec![],
+                operand_types: vec![IrType::I64; inputs.len()],
+                input_symbols: inputs
+                    .iter()
+                    .map(|(_, _, s)| s.map(str::to_string))
+                    .collect(),
+                inputs: inputs
+                    .into_iter()
+                    .map(|(c, op, _)| (c.to_string(), op, None))
+                    .collect(),
+                clobbers: clobbers.iter().map(|c| c.to_string()).collect(),
+                goto_labels: if goto {
+                    vec![("l_yes".to_string(), BlockId(1))]
+                } else {
+                    vec![]
+                },
+                seg_overrides: vec![],
+            }
+        }
+        let zero = Operand::Const(IrConst::I64(0));
+        let value = Operand::Value(Value(7));
+        for goto in [false, true] {
+            // `"i"(&key)` after its symbol was resolved, and `"i"(branch)`.
+            assert!(!instruction_is_call_point(&asm(
+                vec![("i", zero, Some("key")), ("i", zero, None)],
+                &[],
+                goto
+            )));
+            assert!(!instruction_is_call_point(&asm(
+                vec![("n", zero, None)],
+                &["cc", "memory"],
+                goto
+            )));
+            // A register in the clobber list is a call point everywhere.
+            assert!(instruction_is_call_point(&asm(
+                vec![("i", zero, Some("key"))],
+                &["rax"],
+                goto
+            )));
+            // What still takes a register: an immediate constraint whose
+            // operand is a value (no immediate yet), one register operand
+            // beside the immediates, a constraint that admits an immediate
+            // among others.  One register is the fixed scratch on x86-64 and
+            // no call point; it is one wherever the allocator owns the first
+            // scratch register.
+            let staged = [
+                asm(vec![("i", value, None)], &[], goto),
+                asm(
+                    vec![("i", zero, Some("key")), ("r", value, None)],
+                    &[],
+                    goto,
+                ),
+                asm(vec![("ri", zero, None)], &[], goto),
+            ];
+            for statement in &staged {
+                assert!(!instruction_is_call_point(statement), "{statement:?}");
+            }
+            crate::common::types::set_target_elf_machine(crate::backend::elf::EM_AARCH64);
+            let elsewhere: Vec<bool> = staged.iter().map(instruction_is_call_point).collect();
+            crate::common::types::set_target_elf_machine(crate::backend::elf::EM_X86_64);
+            assert!(elsewhere.iter().all(|&call| call), "{elsewhere:?}");
+        }
     }
 
     #[test]
@@ -4313,6 +4820,48 @@ mod program_point_capacity_tests {
             None
         );
         assert_eq!(checked_program_point_count([usize::MAX]), None);
+    }
+}
+
+#[cfg(test)]
+mod returns_twice_tests {
+    use super::is_returns_twice_call;
+    use crate::ir::reexports::{CallInfo, Instruction};
+
+    /// The list is GCC's `special_function_p`: the underscore prefixes are
+    /// dropped for `setjmp`/`sigsetjmp` only, the other three match as
+    /// spelled, and nothing else — `longjmp` does not return at all.
+    #[test]
+    fn the_names_are_the_ones_gcc_marks_returns_twice() {
+        let call = |name: &str| Instruction::Call {
+            func: name.into(),
+            info: CallInfo::default(),
+        };
+        for name in [
+            "setjmp",
+            "_setjmp",
+            "__setjmp",
+            "sigsetjmp",
+            "_sigsetjmp",
+            "__sigsetjmp",
+            "savectx",
+            "vfork",
+            "getcontext",
+        ] {
+            assert!(is_returns_twice_call(&call(name)), "{name}");
+        }
+        for name in [
+            "longjmp",
+            "___setjmp",
+            "setjmp_",
+            "_vfork",
+            "__getcontext",
+            "setcontext",
+            "swapcontext",
+            "fork",
+        ] {
+            assert!(!is_returns_twice_call(&call(name)), "{name}");
+        }
     }
 }
 

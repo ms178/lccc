@@ -693,36 +693,17 @@ pub(crate) fn relayout_blocks_static_chain(
         }
     }
 
-    // Successor indices (terminator edges + `asm goto` labels), deduplicated.
-    let pos_of_label: FxHashMap<u32, usize> = func
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.label.0, i))
-        .collect();
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for b in 0..n {
-        let mut labels: Vec<u32> = Vec::new();
-        collect_successor_labels(&func.blocks[b].terminator, &mut labels);
-        for inst in &func.blocks[b].instructions {
-            if let crate::ir::instruction::Instruction::InlineAsm { goto_labels, .. } = inst {
-                labels.extend(goto_labels.iter().map(|(_, l)| l.0));
-            }
-        }
-        for l in labels {
-            if let Some(&t) = pos_of_label.get(&l) {
-                if !succs[b].contains(&t) {
-                    succs[b].push(t);
-                }
-            }
-        }
-    }
+    // Successor indices, deduplicated: the terminator's edges, which a layout
+    // can turn into falling through, then the labels of an asm goto, which it
+    // cannot (`successors_terminator_first`).
+    let (succs, named_by_terminator) = successors_terminator_first(func, &orig_label_pos);
+    let out_of_line = reached_only_through_asm_goto_labels(&succs, &named_by_terminator);
 
     // Edge weight: which successor of `s` deserves the fall-through slot.
     let rare_zero = rare_mask_zero_targets(func);
     let masked_cold = masked_cold_blocks(func, &cfg, &rare_zero, &innermost);
     let weight = |s: usize, t: usize| -> u32 {
-        if masked_cold[s] {
+        if masked_cold[s] || out_of_line[s] {
             return 1;
         }
         if let Some(li) = innermost[s] {
@@ -738,8 +719,8 @@ pub(crate) fn relayout_blocks_static_chain(
             }
         } else if depth[t] > depth[s] {
             8 // entering a loop from outside: leads to the iterations
-        } else if succs[s].len() == 1 {
-            5 // straight-line edge: the only way forward
+        } else if named_by_terminator[s] == 1 {
+            5 // straight-line edge: the only way forward by falling through
         } else {
             4 // plain if/else arm: neutral, tie-break keeps TRUE first
         }
@@ -749,7 +730,7 @@ pub(crate) fn relayout_blocks_static_chain(
         if masked_cold[b] {
             1
         } else {
-            10u64.saturating_pow(depth[b].min(9) as u32)
+            block_frequency(depth[b], out_of_line[b])
         }
     };
 
@@ -819,15 +800,22 @@ pub(crate) fn relayout_blocks_static_chain(
     let reachable_count = reachable.iter().filter(|b| **b < n).count();
     let mut cur = entry;
     while placed.len() < reachable_count {
-        let cands: Vec<usize> = succs[cur]
+        // The hottest unplaced successor; of two equally hot ones the one the
+        // terminator names, because only that edge is saved a jump by lying
+        // next; then the earlier block.
+        let best = succs[cur]
             .iter()
-            .copied()
-            .filter(|&t| !is_placed[t])
-            .collect();
-        let next = if let Some(&best) = cands
-            .iter()
-            .max_by_key(|&&t| (weight(cur, t), std::cmp::Reverse(t)))
-        {
+            .enumerate()
+            .filter(|&(_, &t)| !is_placed[t])
+            .max_by_key(|&(i, &t)| {
+                (
+                    weight(cur, t),
+                    i < named_by_terminator[cur],
+                    std::cmp::Reverse(t),
+                )
+            })
+            .map(|(_, &t)| t);
+        let next = if let Some(best) = best {
             best
         } else {
             // Trace head (see `head_key`): discard placed blocks and keys
@@ -875,10 +863,12 @@ pub(crate) fn relayout_blocks_static_chain(
         }
         pos
     };
+    // Only a terminator's edges are priced: the jump to an asm goto's label
+    // is taken from inside the template in either order.
     let chain_cost = {
         let mut cost: u64 = 0;
         for (i, &s) in placed.iter().enumerate() {
-            for &t in &succs[s] {
+            for &t in &succs[s][..named_by_terminator[s]] {
                 if position_of[t] != i + 1 {
                     cost += weight(s, t) as u64;
                 }
@@ -891,7 +881,7 @@ pub(crate) fn relayout_blocks_static_chain(
         // adjacent to block `i` exactly when `t == i + 1`.
         let mut cost: u64 = 0;
         for s in 0..n {
-            for &t in &succs[s] {
+            for &t in &succs[s][..named_by_terminator[s]] {
                 if t != s + 1 {
                     cost += weight(s, t) as u64;
                 }
@@ -1122,6 +1112,19 @@ fn is_instruction_line(line: &str) -> bool {
         && !t.contains(".cfi_")
 }
 
+/// How often a block at loop nesting `depth` runs, as the layout estimates it:
+/// ten times per level, and a decade less for a block only an asm goto's
+/// label leads to (`reached_only_through_asm_goto_labels`) -- never, in a
+/// function without loops, for what this estimate is used for.
+fn block_frequency(depth: u32, out_of_line: bool) -> u64 {
+    let frequency = 10u64.saturating_pow(depth.min(9));
+    if out_of_line {
+        frequency / 10
+    } else {
+        frequency
+    }
+}
+
 /// Static cost of the block transitions a LAYOUT leaves without a
 /// fall-through.
 ///
@@ -1181,26 +1184,17 @@ pub(crate) fn layout_branch_cost(func: &IrFunction) -> u64 {
         .enumerate()
         .map(|(i, b)| (b.label.0, i))
         .collect();
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (bi, block) in func.blocks.iter().enumerate() {
-        let mut labels: Vec<u32> = Vec::new();
-        collect_successor_labels(&block.terminator, &mut labels);
-        for l in labels {
-            if let Some(&t) = pos_of.get(&l) {
-                if !succs[bi].contains(&t) {
-                    succs[bi].push(t);
-                }
-            }
-        }
-    }
+    let (succs, named_by_terminator) = successors_terminator_first(func, &pos_of);
+    let out_of_line = reached_only_through_asm_goto_labels(&succs, &named_by_terminator);
     // The chain builder's structural edge weights, mirrored: 9 stays inside
     // the loop, 8 enters a deeper nest, 5 the single successor of a
     // straight-line block, 4 a branch in straight-line code, 1 leaves a loop.
-    // Masked-zero arms and their single-entry continuations carry weight 1.
+    // Masked-zero arms and their single-entry continuations carry weight 1,
+    // and so do blocks only an asm goto's label leads to.
     let rare_zero = rare_mask_zero_targets(func);
     let masked_cold = masked_cold_blocks(func, &cfg, &rare_zero, &innermost);
     let weight = |s: usize, t: usize| -> u32 {
-        if masked_cold[s] {
+        if masked_cold[s] || out_of_line[s] {
             return 1;
         }
         if let Some(li) = innermost[s] {
@@ -1216,7 +1210,7 @@ pub(crate) fn layout_branch_cost(func: &IrFunction) -> u64 {
             }
         } else if depth[t] > depth[s] {
             8
-        } else if succs[s].len() == 1 {
+        } else if named_by_terminator[s] == 1 {
             5
         } else {
             4
@@ -1232,7 +1226,7 @@ pub(crate) fn layout_branch_cost(func: &IrFunction) -> u64 {
         ) {
             continue;
         }
-        let best = succs[pos]
+        let best = succs[pos][..named_by_terminator[pos]]
             .iter()
             .map(|&t| (weight(pos, t), t))
             .max_by_key(|&(w, t)| (w, std::cmp::Reverse(t)));
@@ -1243,7 +1237,7 @@ pub(crate) fn layout_branch_cost(func: &IrFunction) -> u64 {
             let frequency = if masked_cold[pos] {
                 1
             } else {
-                10u64.saturating_pow(depth[pos].min(9))
+                block_frequency(depth[pos], out_of_line[pos])
             };
             cost = cost.saturating_add(frequency);
         }
@@ -1267,6 +1261,87 @@ pub(crate) fn count_instruction_lines(region: &str) -> usize {
                 && !t.ends_with(':')
         })
         .count()
+}
+
+/// Every block's successors by position, and how many of them its terminator
+/// names: those come first, the labels of an asm goto that the terminator
+/// does not name as well behind them.
+///
+/// The two kinds differ in the one thing a layout decides.  A terminator's
+/// edge costs no jump when its target is the block laid out next.  The jump
+/// to an asm goto's label is part of the template (`jnz %l[out]`, a static
+/// key's five-byte `nop` that is patched into a `jmp`, an exception table
+/// entry): it is there wherever the label's block lies, and the block ahead
+/// of it can never fall into it from the asm.
+fn successors_terminator_first(
+    func: &IrFunction,
+    pos_of_label: &FxHashMap<u32, usize>,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let n = func.blocks.len();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut named_by_terminator = vec![0usize; n];
+    let mut labels: Vec<u32> = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        labels.clear();
+        collect_successor_labels(&block.terminator, &mut labels);
+        let terminator_labels = labels.len();
+        labels.extend(crate::ir::analysis::asm_goto_successors(block).map(|l| l.0));
+        for (i, l) in labels.iter().enumerate() {
+            if i == terminator_labels {
+                named_by_terminator[b] = succs[b].len();
+            }
+            if let Some(&t) = pos_of_label.get(l) {
+                if !succs[b].contains(&t) {
+                    succs[b].push(t);
+                }
+            }
+        }
+        if labels.len() == terminator_labels {
+            named_by_terminator[b] = succs[b].len();
+        }
+    }
+    (succs, named_by_terminator)
+}
+
+/// The blocks every way into which passes an asm goto's label: reachable from
+/// the entry, but not along terminators alone.
+///
+/// Such a block is out of line by construction -- control gets there by a
+/// jump inside a template and no other way -- and the kernel's two users of
+/// asm goto build on exactly that.  A static key (`asm/jump_label.h`) lays
+/// the likely side out behind the asm, where execution falls through a `nop`,
+/// and names the unlikely side by the label; `unsafe_get_user()` and friends
+/// name the fault path.  GCC 16.2 and Clang 23.1.5 put both behind the
+/// function's return.  The layout estimates them one decade colder than
+/// their loop depth says, and their own jumps as cold as a loop exit.
+fn reached_only_through_asm_goto_labels(
+    succs: &[Vec<usize>],
+    named_by_terminator: &[usize],
+) -> Vec<bool> {
+    let n = succs.len();
+    if n == 0 || (0..n).all(|b| named_by_terminator[b] == succs[b].len()) {
+        return vec![false; n];
+    }
+    let reach = |through_labels: bool| -> Vec<bool> {
+        let mut seen = vec![false; n];
+        let mut stack = vec![0usize];
+        seen[0] = true;
+        while let Some(b) = stack.pop() {
+            let edges = if through_labels {
+                &succs[b][..]
+            } else {
+                &succs[b][..named_by_terminator[b]]
+            };
+            for &t in edges {
+                if !std::mem::replace(&mut seen[t], true) {
+                    stack.push(t);
+                }
+            }
+        }
+        seen
+    };
+    let (reachable, in_line) = (reach(true), reach(false));
+    (0..n).map(|b| reachable[b] && !in_line[b]).collect()
 }
 
 /// Collect the target label IDs of a terminator.
@@ -1924,5 +1999,178 @@ mod chain_tests {
     fn count_instruction_lines_skips_non_instructions() {
         let text = ".text\nmain:\n\t pushq %rbx\n\t movq %rax, %rbx\n.L1:\n\t # comment\n\n\t ret\n.size main, .-main\n";
         assert_eq!(count_instruction_lines(text), 3);
+    }
+}
+
+#[cfg(test)]
+mod asm_goto_layout_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::instruction::BlockId;
+    use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
+
+    fn blk(label: u32, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: Vec::new(),
+            terminator: term,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }
+    }
+    /// A block that ends in `asm goto(... : label)`.
+    fn asm_goto(label: u32, goto_label: u32, term: Terminator) -> BasicBlock {
+        let mut block = blk(label, term);
+        block.instructions.push(Instruction::InlineAsm {
+            template: "jnz %l0".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("out".into(), BlockId(goto_label))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        });
+        block
+    }
+    fn br(t: u32) -> Terminator {
+        Terminator::Branch(BlockId(t))
+    }
+    fn cond(t: u32, f: u32) -> Terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(Value(99)),
+            true_label: BlockId(t),
+            false_label: BlockId(f),
+        }
+    }
+    fn ret() -> Terminator {
+        Terminator::Return(Some(Operand::Const(IrConst::I32(0))))
+    }
+    fn func_of(blocks: Vec<BasicBlock>) -> IrFunction {
+        let mut f = IrFunction::new("t".into(), IrType::I32, Vec::new(), false);
+        f.blocks = blocks;
+        f
+    }
+    fn labels(f: &IrFunction) -> Vec<u32> {
+        f.blocks.iter().map(|b| b.label.0).collect()
+    }
+    fn laid_out(blocks: Vec<BasicBlock>) -> Vec<u32> {
+        let mut f = func_of(blocks);
+        relayout_blocks_static_chain(&mut f, DualLayout::ChainOnly);
+        labels(&f)
+    }
+    fn out_of_line(blocks: Vec<BasicBlock>) -> Vec<u32> {
+        let f = func_of(blocks);
+        let pos: FxHashMap<u32, usize> = f
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.label.0, i))
+            .collect();
+        let (succs, named) = successors_terminator_first(&f, &pos);
+        reached_only_through_asm_goto_labels(&succs, &named)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &cold)| cold.then_some(f.blocks[i].label.0))
+            .collect()
+    }
+
+    /// `if (static_branch_unlikely(&key)) slow();` as the passes leave it: the
+    /// asm goto falls through a `nop` to the code behind the `if`, and its
+    /// label is the call.  Source order put the call in line and a `jmp` over
+    /// it on the path every caller takes while the key is off.
+    fn static_key_off() -> Vec<BasicBlock> {
+        vec![
+            blk(0, br(1)),
+            asm_goto(1, 3, br(2)),
+            blk(2, br(4)),
+            blk(3, br(4)), // slow(): only the label leads here
+            blk(4, ret()),
+        ]
+    }
+
+    #[test]
+    fn what_an_asm_goto_falls_through_into_lies_behind_it() {
+        assert_eq!(laid_out(static_key_off()), [0, 1, 2, 4, 3]);
+        // The label's block was laid out first: the asm goto still falls
+        // into the block its terminator names.
+        assert_eq!(
+            laid_out(vec![
+                asm_goto(0, 1, br(2)),
+                blk(1, br(3)),
+                blk(2, br(3)),
+                blk(3, ret()),
+            ]),
+            [0, 2, 3, 1]
+        );
+    }
+
+    /// The same key inside a loop: the call stays in the loop's span (the
+    /// compaction's rule) but behind the latch, so that an iteration with the
+    /// key off takes the back edge and no other jump.
+    #[test]
+    fn a_static_key_in_a_loop_keeps_the_iteration_path_straight() {
+        let order = laid_out(vec![
+            blk(0, cond(1, 6)),
+            asm_goto(1, 3, br(2)), // header
+            blk(2, br(4)),
+            blk(3, br(4)),      // slow()
+            blk(4, cond(1, 6)), // latch
+            blk(6, ret()),
+        ]);
+        assert_eq!(order, [0, 1, 2, 4, 3, 6]);
+    }
+
+    /// Only blocks that nothing but a label leads to are out of line.  The
+    /// label of `static_branch_likely()` is the code behind the `if`, which
+    /// the likely side runs into as well.
+    #[test]
+    fn a_label_the_fallthrough_reaches_too_is_in_line() {
+        assert_eq!(out_of_line(static_key_off()), [3]);
+        assert_eq!(
+            out_of_line(vec![
+                asm_goto(0, 2, br(1)),
+                blk(1, br(2)), // the likely statements
+                blk(2, ret()),
+            ]),
+            [] as [u32; 0]
+        );
+        // What an out-of-line block leads to and nothing else does is out of
+        // line with it; a block without any asm goto ahead of it is not.
+        assert_eq!(
+            out_of_line(vec![
+                asm_goto(0, 2, br(1)),
+                blk(1, ret()),
+                blk(2, cond(3, 4)),
+                blk(3, ret()),
+                blk(4, br(1)),
+            ]),
+            [2, 3, 4]
+        );
+        assert_eq!(
+            out_of_line(vec![blk(0, cond(1, 2)), blk(1, ret()), blk(2, ret())]),
+            [] as [u32; 0]
+        );
+    }
+
+    /// The jump to a label is inside the template in any order, and costs
+    /// the same in each: the order that lets the terminator fall through is
+    /// the cheaper one, by the metric the backend picks an order with.
+    #[test]
+    fn the_branch_cost_prices_the_terminator_and_not_the_label() {
+        let source_order = func_of(static_key_off());
+        let mut straight = func_of(static_key_off());
+        relayout_blocks_static_chain(&mut straight, DualLayout::ChainOnly);
+        assert!(layout_branch_cost(&straight) < layout_branch_cost(&source_order));
+        assert_eq!(layout_branch_cost(&straight), 0);
+        // With the label's block right behind the asm goto nothing is saved:
+        // the asm goto's own block still has to jump to its fallthrough.
+        let label_first = func_of(vec![
+            asm_goto(0, 1, br(2)),
+            blk(1, br(3)),
+            blk(2, br(3)),
+            blk(3, ret()),
+        ]);
+        assert_eq!(layout_branch_cost(&label_first), 1);
     }
 }

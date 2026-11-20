@@ -1378,6 +1378,27 @@ pub struct LinearScanAllocator {
     /// (linux_find_bit: a 4-point load temp opened %r15 in a 261K-call leaf
     /// while rbx/r12/r13 sat dead). Set by the callee-saved phases.
     pub prefer_touched: bool,
+    /// Give a register the scan left idle to a span it demoted for holding
+    /// one across a loop it is not read in (the first admission rule of
+    /// [`LinearScanAllocator::allocate_range`]).
+    ///
+    /// That rule fires when the spans alone could fill the pool and then
+    /// demotes every such span, not the excess: six call-spanning values
+    /// against the six callee-saved registers lost five homes, and five
+    /// registers stayed unused while each read of those values reloaded a
+    /// stack slot (`pm_qos_update_flags`: a parameter with seventeen uses).
+    /// The rule's purpose is to leave registers to the ranges inside the
+    /// loop; a register no range took over the span's whole life served none
+    /// of them, so the span has it after all, costliest span first.
+    ///
+    /// Set for the call-spanning wave of the callee-saved pool only.  Its
+    /// values have no other home, and an unused callee-saved register is
+    /// scratch for nobody.  A caller-saved register the scan left idle is
+    /// the scratch of the instruction windows inside the loop -- the reason
+    /// the rule exists -- and stays free.
+    pub rescue_demoted_spans: bool,
+    /// The spans [`Self::rescue_demoted_spans`] may bring back.
+    demoted_spans: Vec<LiveRange>,
     /// Loop-spanning ranges in the original worklist (see the admission
     /// cap in [`LinearScanAllocator::allocate_range`]).
     pub total_spans: usize,
@@ -1426,6 +1447,8 @@ impl LinearScanAllocator {
             enable_splitting: false,
             next_reg_idx: 0,
             prefer_touched: false,
+            rescue_demoted_spans: false,
+            demoted_spans: Vec::new(),
             total_spans,
             free_slot_victims: false,
         }
@@ -2220,6 +2243,9 @@ impl LinearScanAllocator {
                 ));
             }
             self.allocate_spill_slot(range.value_id);
+            if self.rescue_demoted_spans {
+                self.demoted_spans.push(range);
+            }
             return;
         }
         // Structural auto-arming: the admission cap runs even with the
@@ -2927,6 +2953,60 @@ impl LinearScanAllocator {
         true
     }
 
+    /// [`Self::rescue_demoted_spans`]: after the scan, hand each demoted span
+    /// a register that is free over its whole coverage, costliest first.
+    ///
+    /// The occupancy record is complete by now, and the test is the strict
+    /// one: no point shared with any span on the register in segment mode,
+    /// nothing on the register from the range's start on otherwise.  (The
+    /// scan also lets a range share the point at which another dies; that
+    /// call is made against the ACTIVE set, which has moved on.)  A rescued
+    /// span enters the record like any other assignment, so the next one
+    /// sees it.  A register some range already uses goes first: a fresh
+    /// callee-saved register is a push and a pop.
+    fn rescue_spans_into_idle_registers(&mut self) {
+        let mut demoted = std::mem::take(&mut self.demoted_spans);
+        if demoted.is_empty() {
+            return;
+        }
+        demoted.sort_by(|a, b| {
+            b.remaining_cost(b.start)
+                .cmp(&a.remaining_cost(a.start))
+                .then_with(|| a.start.cmp(&b.start))
+                .then_with(|| a.value_id.cmp(&b.value_id))
+        });
+        for range in demoted {
+            let free = |reg: &PhysReg| {
+                if self.segment_mode {
+                    self.register_free_for_segments(*reg, &range)
+                } else {
+                    self.reg_free_until.get(reg).copied().unwrap_or(0) <= range.start
+                }
+            };
+            let touched = |reg: &PhysReg| self.reg_free_until.get(reg).is_some_and(|&u| u > 0);
+            let pick = self
+                .available_regs
+                .iter()
+                .copied()
+                .find(|reg| touched(reg) && free(reg))
+                .or_else(|| self.available_regs.iter().copied().find(free));
+            let Some(reg) = pick else {
+                continue;
+            };
+            if self.ra_config.trace_alloc {
+                lccc::cli::stderr_line(format_args!(
+                    "[SPILL-TRACE] rescue v{} @{} remcost={} reg={}",
+                    range.value_id,
+                    range.start,
+                    range.remaining_cost(range.start),
+                    reg.0
+                ));
+            }
+            self.spill_slots.remove(&range.value_id);
+            self.commit_assignment(range, reg);
+        }
+    }
+
     /// Full scan. Idempotent: a second call reallocates from a clean slate.
     /// Sorts here so callers that skip [`build_live_ranges`] cannot feed an
     /// unsorted worklist. Tie-break `value_id` keeps the assignment
@@ -2954,6 +3034,7 @@ impl LinearScanAllocator {
         self.active.clear();
         self.handled.clear();
         self.assignments.clear();
+        self.demoted_spans.clear();
         self.spill_slots.clear();
         self.next_spill_slot = 0;
         self.next_reg_idx = 0;
@@ -2995,6 +3076,7 @@ impl LinearScanAllocator {
         for range in ranges {
             self.allocate_range(range);
         }
+        self.rescue_spans_into_idle_registers();
         if self.ra_config.verify_regalloc {
             self.verify_handled_history();
         }
@@ -4443,6 +4525,71 @@ mod tests {
             ranges[0].span_recurrence,
             "the constant arm must not erase 1 -> 2 -> 3 -> 1"
         );
+    }
+
+    /// The rule that demotes a span for holding a register across a loop it
+    /// is not read in fires once the spans alone could fill the pool, and
+    /// then takes every such span: two spans against two registers lost both
+    /// homes and both registers stayed empty.  With the rescue, a register no
+    /// range claimed over a demoted span's whole life goes back to it, the
+    /// costlier span first; a register something holds is not touched.
+    #[test]
+    fn a_span_demoted_for_a_loop_takes_a_register_the_scan_left_idle() {
+        let useless = |id: u32, start: u32, end: u32, uses: Vec<u32>| {
+            let mut r = spanned(id, start, end, uses, 300);
+            r.span_marked = true;
+            r.span_has_in_loop_use = false;
+            r
+        };
+        let cheap = || useless(1, 0, 900, vec![10, 900]);
+        let costly = || useless(2, 5, 950, vec![20, 930, 940, 950]);
+        let config = std::sync::Arc::new(RaConfig::default());
+        let scan = |ranges: Vec<LiveRange>, regs: Vec<PhysReg>, rescue: bool| {
+            let mut alloc = LinearScanAllocator::new_with_config(ranges, regs, &config);
+            alloc.rescue_demoted_spans = rescue;
+            alloc.run();
+            alloc
+        };
+        let two = || vec![PhysReg(1), PhysReg(2)];
+
+        // The rule as it was: both demoted, both registers idle.
+        let before = scan(vec![cheap(), costly()], two(), false);
+        assert!(before.assignments.is_empty(), "{:?}", before.assignments);
+        assert!(before.spill_slots.contains_key(&1) && before.spill_slots.contains_key(&2));
+
+        // Rescued: each has a register of its own and no slot.
+        let after = scan(vec![cheap(), costly()], two(), true);
+        assert_eq!(after.assignments.len(), 2, "{:?}", after.assignments);
+        assert_ne!(after.assignments[&1], after.assignments[&2]);
+        assert!(after.spill_slots.is_empty(), "{:?}", after.spill_slots);
+
+        // One register left idle: the costlier span gets it.  The other
+        // register belongs to a range that is read inside the loop, which the
+        // rule never demotes.
+        let mut held = spanned(3, 0, 960, vec![100, 400, 700, 960], 900);
+        held.span_marked = true;
+        held.span_has_in_loop_use = true;
+        let contested = scan(vec![cheap(), costly(), held], two(), true);
+        assert!(contested.assignments.contains_key(&3));
+        assert!(contested.assignments.contains_key(&2), "the costlier span");
+        assert!(
+            !contested.assignments.contains_key(&1),
+            "the cheaper one waits"
+        );
+        assert_ne!(contested.assignments[&2], contested.assignments[&3]);
+        assert!(contested.spill_slots.contains_key(&1));
+
+        // No register idle over the span's life: nothing to give back.  A
+        // short range inside the span takes the only register after the span
+        // was demoted, and keeps it.
+        let short = lr(4, 300, 320, vec![310, 320], 10);
+        let full = scan(
+            vec![cheap(), useless(5, 2, 800, vec![9, 800]), short],
+            vec![PhysReg(1)],
+            true,
+        );
+        assert_eq!(full.assignments.get(&4), Some(&PhysReg(1)));
+        assert_eq!(full.assignments.len(), 1, "{:?}", full.assignments);
     }
 
     /// RA-RECURRENCE-FLOOR: a marked recurrence with in-loop uses that

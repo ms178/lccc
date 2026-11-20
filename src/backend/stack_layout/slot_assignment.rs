@@ -14,6 +14,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator, Value};
 
+use super::alloca_sharing::{self, SharedCandidate};
 use super::{BlockLocalValue, DeferredSlot, MultiBlockValue, StackLayoutContext};
 
 /// Place `func.ssp.stack_guard_alloca` at the start of `non_local_space` on
@@ -400,6 +401,19 @@ pub(super) fn classify_instructions(
         modified
     };
 
+    // Objects that are never live together share a slot (`alloca_sharing`).
+    // One variable, one slot at -O0, and in a function reachability cannot
+    // describe.
+    let share_slots = ctx.coalesce
+        && !state.disable_regalloc
+        && alloca_sharing::enabled()
+        && !alloca_sharing::has_irregular_control(func);
+    let param_allocas: FxHashSet<u32> = if share_slots {
+        func.param_alloca_values.iter().map(|v| v.0).collect()
+    } else {
+        FxHashSet::default()
+    };
+
     if func.ssp.stack_guard_alloca.is_some() {
         classify_ssp_allocas(
             state,
@@ -411,9 +425,11 @@ pub(super) fn classify_instructions(
             block_space,
             max_block_local_space,
             defer_giant,
+            share_slots,
         );
     }
 
+    let mut shared: Vec<SharedCandidate> = Vec::new();
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Alloca {
@@ -446,6 +462,7 @@ pub(super) fn classify_instructions(
                     block_space,
                     max_block_local_space,
                     defer_giant,
+                    (share_slots && !param_allocas.contains(&dest.0)).then_some(&mut shared),
                 );
             } else if let Instruction::InlineAsm {
                 outputs,
@@ -600,6 +617,8 @@ pub(super) fn classify_instructions(
         }
     }
 
+    place_shared_allocas(state, func, assign_slot, non_local_space, &shared);
+
     // Debug-only cross-check of the width invariant the whole small-slot
     // scheme rests on: a value in `small_slot_values` (4-byte slot, accessed
     // with ≤4-byte instructions on every path) must never be typed wider than
@@ -644,6 +663,7 @@ fn classify_ssp_allocas(
     block_space: &mut FxHashMap<usize, i64>,
     max_block_local_space: &mut i64,
     defer_giant: &mut Vec<(u32, i64, i64)>,
+    share_slots: bool,
 ) {
     let param_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
     let mut addr_taken: FxHashSet<u32> = FxHashSet::default();
@@ -682,6 +702,9 @@ fn classify_ssp_allocas(
         [false, true]
     };
     for want_buffer in pass_order {
+        // Buffers share with buffers and the rest with the rest, each inside
+        // its own region: the canary stays next to every buffer.
+        let mut shared: Vec<SharedCandidate> = Vec::new();
         for block in &func.blocks {
             for inst in &block.instructions {
                 let Instruction::Alloca {
@@ -723,9 +746,11 @@ fn classify_ssp_allocas(
                     block_space,
                     max_block_local_space,
                     defer_giant,
+                    (share_slots && !param_set.contains(&dest.0)).then_some(&mut shared),
                 );
             }
         }
+        place_shared_allocas(state, func, assign_slot, non_local_space, &shared);
     }
     if !downward {
         *non_local_space = place_stack_guard_late(state, func, assign_slot, *non_local_space);
@@ -749,6 +774,7 @@ fn classify_alloca(
     block_space: &mut FxHashMap<usize, i64>,
     max_block_local_space: &mut i64,
     defer_giant: &mut Vec<(u32, i64, i64)>,
+    shared: Option<&mut Vec<SharedCandidate>>,
 ) {
     // `Alloca.align` is authoritative, for parameter allocas too: the
     // lowering homes a parameter alloca at `max(struct_align, param_align)`
@@ -864,10 +890,57 @@ fn classify_alloca(
         }
     }
 
-    // Non-coalescable allocas get permanent Tier 1 slots.
+    // Non-coalescable allocas get permanent Tier 1 slots: one each, or one
+    // for several that are never live together, decided once all of them are
+    // known (`place_shared_allocas`).
+    if let Some(shared) = shared
+        && effective_align <= 16
+        && !semantic_volatile
+    {
+        shared.push(SharedCandidate {
+            id: dest.0,
+            size: raw_size + extra as i64,
+            align: align as i64,
+        });
+        return;
+    }
     let (slot, new_space) = assign_slot(*non_local_space, raw_size + extra as i64, align as i64);
     state.value_locations.insert(dest.0, StackSlot(slot));
     *non_local_space = new_space;
+}
+
+/// Give the collected Tier 1 objects their slots, in the order they were
+/// declared: one slot per class of objects that are never live together
+/// (`alloca_sharing::share_classes`), as large and as aligned as its largest
+/// member, placed where the class's first object stands.
+fn place_shared_allocas(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    non_local_space: &mut i64,
+    shared: &[SharedCandidate],
+) {
+    if shared.is_empty() {
+        return;
+    }
+    let classes = alloca_sharing::share_classes(func, shared);
+    let class_count = classes.iter().map(|&c| c as usize + 1).max().unwrap_or(0);
+    let mut extent = vec![(0i64, 0i64); class_count];
+    for (candidate, &class) in shared.iter().zip(&classes) {
+        let (size, align) = &mut extent[class as usize];
+        *size = (*size).max(candidate.size);
+        *align = (*align).max(candidate.align);
+    }
+    let mut slots: Vec<Option<StackSlot>> = vec![None; class_count];
+    for (candidate, &class) in shared.iter().zip(&classes) {
+        let slot = *slots[class as usize].get_or_insert_with(|| {
+            let (size, align) = extent[class as usize];
+            let (slot, new_space) = assign_slot(*non_local_space, size, align);
+            *non_local_space = new_space;
+            StackSlot(slot)
+        });
+        state.value_locations.insert(candidate.id, slot);
+    }
 }
 
 /// Classify a non-alloca value into Tier 2 (multi-block) or Tier 3 (block-local).

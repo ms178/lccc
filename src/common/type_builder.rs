@@ -891,8 +891,18 @@ fn param_ctype_unrecorded(
         let mut result = CType::Pointer(Box::new(func_type), PtrQuals::GENERIC);
         // `(**fpp)(int)` is a pointer to a function pointer; CType would
         // otherwise erase the distinction from `void *(*fp)(size_t)`.
-        for _ in 1..param.fptr_inner_ptr_depth.max(1) {
-            result = CType::Pointer(Box::new(result), PtrQuals::GENERIC);
+        //
+        // Each further level points at the pointer the star before it
+        // declared, and records that star's qualifiers as its pointee's:
+        // `int (*const *h)(int)` and `int (*const h[])(int)` both point at a
+        // CONST function pointer, so `h[0] = 0` is a write to a read-only
+        // location and the type is `int (* const*)(int)`. The record is
+        // taken only when every star of the group was seen in order.
+        let stars = param.fptr_inner_ptr_depth.max(1) as usize;
+        let known = param.paren_star_quals.len() == stars;
+        for level in 1..stars {
+            let pointee = known.then(|| param.paren_star_quals[level - 1]);
+            result = CType::Pointer(Box::new(result), PtrQuals::GENERIC.with_cvr(pointee));
         }
         return result;
     }

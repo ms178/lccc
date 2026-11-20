@@ -195,7 +195,7 @@ fn merge_one_function(
     // Collect exit sites.
     let mut exits: Vec<Exit> = Vec::new();
     for k in (fn_start + 1)..fn_end {
-        if infos[k].is_nop() || infos[k].trimmed(store.get(k)) != "ret" {
+        if infos[k].is_nop() || !is_plain_return(infos[k].trimmed(store.get(k))) {
             continue;
         }
         // Walk backwards over the epilogue run, skipping nops.  Stop before
@@ -267,6 +267,12 @@ fn merge_one_function(
                 continue;
             }
             if host_parts[host_parts.len() - guest_parts.len()..] != guest_parts[..] {
+                continue;
+            }
+            // The guest ends up returning the way the host does.
+            if infos[exits[host].ret_idx].trimmed(store.get(exits[host].ret_idx))
+                != infos[exits[guest].ret_idx].trimmed(store.get(exits[guest].ret_idx))
+            {
                 continue;
             }
 

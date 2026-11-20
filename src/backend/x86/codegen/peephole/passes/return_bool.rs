@@ -101,7 +101,7 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         {
             continue;
         }
-        if !matches!(infos[d].trimmed(store.get(d)), "ret" | "retq") {
+        if !is_plain_return(infos[d].trimmed(store.get(d))) {
             continue;
         }
         let cmp = format!("    {cmp}");
@@ -393,7 +393,7 @@ fn fold_return_select(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let suffix = if width == 0 { "q" } else { "l" };
         let copy = format!("mov{suffix} {dst}, {}", REG_NAMES[width][0]);
         if infos[b].trimmed(store.get(b)) != copy
-            || !matches!(infos[c].trimmed(store.get(c)), "ret" | "retq")
+            || !is_plain_return(infos[c].trimmed(store.get(c)))
             || lv.live_after(b, dfam as RegId) != Some(false)
         {
             continue;

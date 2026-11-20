@@ -11,6 +11,21 @@ use crate::ir::reexports::BlockId;
 use std::borrow::Cow;
 use std::fmt::Write;
 
+/// How a `-mfunction-return=thunk-extern` function returns: the `ret` moves
+/// into a thunk the kernel patches for the speculation mitigation in force,
+/// and the function jumps there with its frame torn down, exactly where the
+/// `ret` would stand.
+///
+/// The thunk returns to this function's caller and keeps every register a
+/// return hands over -- GCC puts the jump wherever it would put a `ret`, and
+/// the kernel patches it back into one where no mitigation needs it
+/// (`apply_returns`).  To everything but the encoder the line *is* the
+/// return, and both x86 peepholes classify it as one: it ends the function's
+/// control flow, reads what a return reads and has no successor.  Read as a
+/// jump to a symbol no label of the function defines, it was a transfer to an
+/// unknown place, and register liveness gave up the whole function.
+pub(crate) const RETURN_THUNK_JUMP: &str = "jmp __x86_return_thunk";
+
 /// Packed element shifts saturate by the full count, not its low byte.
 /// Encoding a large/negative C int modulo 256 would incorrectly make 256 an
 /// identity. 255 is an equivalent saturated count for every 16/32/64-bit

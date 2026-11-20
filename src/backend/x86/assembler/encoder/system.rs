@@ -480,6 +480,87 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode VMREAD (`NP 0F 78 /r`) and VMWRITE (`NP 0F 79 /r`).
+    ///
+    /// The VMCS field encoding is always the ModRM `reg` operand: the source
+    /// of `vmread %field, r/m` and the destination of `vmwrite r/m, %field`.
+    /// The operand size is fixed by the mode (64 bits in long mode), so there
+    /// is no REX.W; REX carries only the register extensions. Bytes checked
+    /// against GNU as 2.47 (`vmread %rdx,%rcx` = `0f 78 d1`, `vmwrite
+    /// %r11,%rcx` = `41 0f 79 cb`). KVM's `vmcs_readl`/`vmcs_writel`
+    /// (arch/x86/kvm/vmx/vmx_ops.h) are these two instructions; without them
+    /// no object of arch/x86/kvm/vmx assembled.
+    pub(crate) fn encode_vmread_vmwrite(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
+        let (opcode, field, rm) = match (mnemonic, ops) {
+            ("vmread", [Operand::Register(field), rm]) => (0x78, field, rm),
+            ("vmwrite", [rm, Operand::Register(field)]) => (0x79, field, rm),
+            _ => {
+                return Err(format!(
+                    "{mnemonic} requires a register for the VMCS field and a register or memory operand"
+                ));
+            }
+        };
+        let field_num = reg_num(&field.name).ok_or("bad register")?;
+        match rm {
+            Operand::Register(reg) => {
+                let rm_num = reg_num(&reg.name).ok_or("bad register")?;
+                self.emit_rex_rr(0, &field.name, &reg.name);
+                self.bytes.extend_from_slice(&[0x0F, opcode]);
+                self.bytes.push(self.modrm(3, field_num, rm_num));
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                self.emit_rex_rm(0, &field.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, opcode]);
+                self.encode_modrm_mem(field_num, mem)
+            }
+            _ => Err(format!("{mnemonic} requires a register or memory operand")),
+        }
+    }
+
+    /// Encode the VMX instructions that take one 64-bit memory operand:
+    /// VMPTRLD (`NP 0F C7 /6`), VMPTRST (`NP 0F C7 /7`), VMCLEAR (`66 0F C7
+    /// /6`) and VMXON (`F3 0F C7 /6`). The mandatory prefix precedes REX.
+    pub(crate) fn encode_vmx_pointer(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        prefix: Option<u8>,
+        ext: u8,
+    ) -> Result<(), String> {
+        let [Operand::Memory(mem)] = ops else {
+            return Err(format!("{mnemonic} requires one memory operand"));
+        };
+        if let Some(prefix) = prefix {
+            self.bytes.push(prefix);
+        }
+        self.emit_rex_rm(0, "", mem);
+        self.bytes.extend_from_slice(&[0x0F, 0xC7]);
+        self.encode_modrm_mem(ext, mem)
+    }
+
+    /// Encode INVEPT (`66 0F 38 80 /r`) and INVVPID (`66 0F 38 81 /r`): a
+    /// 128-bit memory descriptor and the invalidation type in a register.
+    pub(crate) fn encode_invept_invvpid(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        opcode: u8,
+    ) -> Result<(), String> {
+        let [Operand::Memory(mem), Operand::Register(reg)] = ops else {
+            return Err(format!("{mnemonic} requires memory and register operands"));
+        };
+        let reg_num = reg_num(&reg.name).ok_or("bad register")?;
+        self.bytes.push(0x66);
+        self.emit_rex_rm(0, &reg.name, mem);
+        self.bytes.extend_from_slice(&[0x0F, 0x38, opcode]);
+        self.encode_modrm_mem(reg_num, mem)
+    }
+
     /// Encode RDFSBASE/RDGSBASE/WRFSBASE/WRGSBASE: F3 0F AE /N
     pub(crate) fn encode_fsgsbase(
         &mut self,

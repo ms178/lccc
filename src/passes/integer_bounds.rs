@@ -8,7 +8,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{
-    Instruction, IrBinOp, IrFunction, IrUnaryOp, Operand, Terminator, Value,
+    BlockId, Instruction, IrBinOp, IrFunction, IrUnaryOp, Operand, Terminator, Value,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -601,6 +601,139 @@ pub(crate) fn nonneg_i32_values(func: &IrFunction) -> FxHashSet<u32> {
     result
 }
 
+/// Retire the default of a `Switch` whose cases name every value the selector
+/// can have, and report how many were retired.
+///
+/// The bound is the one the backends already trust to drop the table's range
+/// check ([`switch_bounds`], [`covers_switch`]). Dropping the check left the
+/// default block without a way in but still in the function: the IR kept its
+/// edge, so the block, and everything only it uses, was compiled and emitted.
+/// Linux's `rcu_preempt_ctxt_queue` switches on a sum of four one-bit flags
+/// with sixteen cases; its `default: WARN_ON_ONCE(1)` stayed in the object as
+/// a `ud2`, a `__bug_table` entry and a `jmp` that objtool reports as
+/// `unreachable instruction`. GCC 16.2 and Clang 23.1.5 delete the block.
+///
+/// A `Switch` has no way to say "no default", so the edge moves to a block a
+/// case already reaches, and the cases that go there are dropped (they now
+/// say what the default says). Which one: the target of the most cases among
+/// those that own neither the lowest nor the highest case value, so the table
+/// keeps its span and stays free of a range check; when the two ends own
+/// every target, the most frequent one, and the dispatch becomes the range
+/// test it then is. The old default's phi arm for this block is removed when
+/// no case still goes there; `cfg_simplify` deletes the block if nothing else
+/// reaches it.
+pub(crate) fn retire_dead_switch_defaults(func: &mut IrFunction) -> usize {
+    let bounds = switch_bounds(func);
+    if bounds.is_empty() {
+        return 0;
+    }
+    let mut retired: Vec<(usize, BlockId)> = Vec::new();
+    for (index, block) in func.blocks.iter_mut().enumerate() {
+        let Terminator::Switch {
+            val: Operand::Value(selector),
+            cases,
+            default,
+            ty,
+        } = &mut block.terminator
+        else {
+            continue;
+        };
+        let Some(&bound) = bounds.get(&selector.0) else {
+            continue;
+        };
+        let Some(replacement) = dead_default_replacement(bound, *ty, cases, *default) else {
+            continue;
+        };
+        let old = std::mem::replace(default, replacement);
+        cases.retain(|&(_, target)| target != replacement);
+        let still_reached = cases.iter().any(|&(_, target)| target == old);
+        if cases.is_empty() {
+            block.terminator = Terminator::Branch(replacement);
+        }
+        let asm_edge = crate::ir::analysis::asm_goto_successors(block).any(|label| label == old);
+        if !still_reached && !asm_edge {
+            retired.push((index, old));
+        }
+    }
+    let count = retired.len();
+    for (index, old) in retired {
+        let source = func.blocks[index].label;
+        if let Some(target) = func.blocks.iter_mut().find(|b| b.label == old) {
+            for inst in &mut target.instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    incoming.retain(|(_, from)| *from != source);
+                }
+            }
+        }
+    }
+    count
+}
+
+/// The block that takes over a default no selector value can reach, or `None`
+/// when the default is live (or already one of the case targets).
+fn dead_default_replacement(
+    bound: (u32, u64),
+    ty: IrType,
+    cases: &[(i64, BlockId)],
+    default: BlockId,
+) -> Option<BlockId> {
+    if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+        return None;
+    }
+    let width = bits(ty)?;
+    if !matches!(bound.0, 8 | 16 | 32 | 64) || bound.0 < width {
+        return None;
+    }
+    let maximum = bound.1.min(mask(width));
+    // A signed selector equals its unsigned bound only below the sign bit.
+    if !ty.is_unsigned() && maximum >= (1u64 << (width - 1)) {
+        return None;
+    }
+    // Every value in `0..=maximum` needs a case; more values than cases
+    // cannot all have one, which also bounds the bitmap below.
+    let needed = usize::try_from(maximum).ok()?.checked_add(1)?;
+    if needed > cases.len() || cases.iter().any(|&(_, target)| target == default) {
+        return None;
+    }
+    let mut seen = vec![false; needed];
+    let mut distinct = 0usize;
+    for &(value, _) in cases {
+        if let Ok(slot) = usize::try_from(value)
+            && slot < needed
+            && !std::mem::replace(&mut seen[slot], true)
+        {
+            distinct += 1;
+        }
+    }
+    if distinct != needed {
+        return None;
+    }
+    // Only the reachable cases decide the table's span.
+    let reachable = |&&(value, _): &&(i64, _)| usize::try_from(value).is_ok_and(|v| v < needed);
+    let lowest = cases.iter().filter(reachable).min_by_key(|c| c.0)?.1;
+    let highest = cases.iter().filter(reachable).max_by_key(|c| c.0)?.1;
+    let mut votes: Vec<(BlockId, usize, i64)> = Vec::new();
+    for &(value, target) in cases.iter().filter(reachable) {
+        match votes.iter_mut().find(|vote| vote.0 == target) {
+            Some(vote) => {
+                vote.1 += 1;
+                vote.2 = vote.2.min(value);
+            }
+            None => votes.push((target, 1, value)),
+        }
+    }
+    // Most cases first; the lowest case value breaks a tie, so the choice
+    // does not depend on the order the cases happen to be stored in.
+    let best = |inner_only: bool| {
+        votes
+            .iter()
+            .filter(|vote| !inner_only || (vote.0 != lowest && vote.0 != highest))
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)))
+            .map(|vote| vote.0)
+    };
+    best(true).or_else(|| best(false))
+}
+
 pub(crate) fn covers_switch(bound: (u32, u64), ty: IrType, minimum: i64, range: usize) -> bool {
     if minimum != 0 || !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
         return false;
@@ -664,6 +797,171 @@ mod tests {
             to_ty,
         }
     }
+    /// `switch (x & mask)` over `cases`, each case and the default in a block
+    /// of its own that returns; block ids are `10 + target`.
+    fn masked_switch(mask: i64, ty: IrType, cases: &[(i64, u32)], default: u32) -> IrFunction {
+        let mut f = fixture(vec![and(1, mask, ty)]);
+        f.blocks[0].terminator = Terminator::Switch {
+            val: Operand::Value(Value(1)),
+            cases: cases.iter().map(|&(v, t)| (v, BlockId(10 + t))).collect(),
+            default: BlockId(10 + default),
+            ty,
+        };
+        let mut targets: Vec<u32> = cases.iter().map(|c| c.1).collect();
+        targets.push(default);
+        targets.sort_unstable();
+        targets.dedup();
+        for target in targets {
+            f.blocks.push(BasicBlock {
+                label: BlockId(10 + target),
+                instructions: vec![],
+                terminator: Terminator::Return(None),
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            });
+        }
+        f
+    }
+    fn switch_shape(f: &IrFunction) -> (Vec<(i64, u32)>, u32) {
+        match &f.blocks[0].terminator {
+            Terminator::Switch { cases, default, .. } => (
+                cases.iter().map(|&(v, t)| (v, t.0 - 10)).collect(),
+                default.0 - 10,
+            ),
+            other => panic!("switch expected, got {other:?}"),
+        }
+    }
+
+    /// Linux's `rcu_preempt_ctxt_queue`: four one-bit flags, sixteen cases,
+    /// and a `default:` nothing can select. The default moves to the target
+    /// most cases share among those that own neither end of the table, so
+    /// the table still spans 0..=15 and needs no range check.
+    #[test]
+    fn a_default_no_value_selects_is_retired() {
+        let cases: Vec<(i64, u32)> = (0..16)
+            .map(|v| {
+                (
+                    v,
+                    [0, 1, 1, 2, 1, 2, 2, 1, 3, 3, 1, 2, 2, 3, 3, 4][v as usize],
+                )
+            })
+            .collect();
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            let mut f = masked_switch(15, ty, &cases, 9);
+            assert_eq!(retire_dead_switch_defaults(&mut f), 1, "{ty:?}");
+            let (kept, default) = switch_shape(&f);
+            assert_eq!(default, 1, "{ty:?}: five cases go to target 1");
+            assert!(kept.iter().all(|c| c.1 != 1), "{ty:?}: {kept:?}");
+            assert_eq!(kept.first(), Some(&(0, 0)), "{ty:?}: lowest case kept");
+            assert_eq!(kept.last(), Some(&(15, 4)), "{ty:?}: highest case kept");
+            assert_eq!(kept.len(), 11, "{ty:?}");
+            // What the backend asks before it drops the range check.
+            let bound = switch_bounds(&f)[&1];
+            assert!(covers_switch(bound, ty, 0, 16), "{ty:?}: {bound:?}");
+            assert_eq!(retire_dead_switch_defaults(&mut f), 0, "{ty:?}: idempotent");
+        }
+    }
+
+    /// One value without a case, or one more value than the cases cover, and
+    /// the default is live: nothing moves.
+    #[test]
+    fn a_default_some_value_selects_stays() {
+        let all: Vec<(i64, u32)> = (0..8).map(|v| (v, v as u32)).collect();
+        let hole: Vec<(i64, u32)> = all.iter().copied().filter(|c| c.0 != 5).collect();
+        for (mask, cases) in [(7, &hole), (15, &all)] {
+            let mut f = masked_switch(mask, IrType::U32, cases, 9);
+            let before = format!("{f:?}");
+            assert_eq!(retire_dead_switch_defaults(&mut f), 0);
+            assert_eq!(format!("{f:?}"), before);
+        }
+        // A selector this analysis knows nothing about.
+        let mut f = masked_switch(-1, IrType::U32, &all, 9);
+        assert_eq!(retire_dead_switch_defaults(&mut f), 0);
+        // A narrow selector type is outside what the backends skip the
+        // range check for, so its default is left alone as well.
+        let mut f = masked_switch(7, IrType::U8, &all, 9);
+        assert_eq!(retire_dead_switch_defaults(&mut f), 0);
+    }
+
+    /// A target that owns neither end of the table is preferred even over an
+    /// equally frequent one that does: the table keeps its span.
+    #[test]
+    fn an_inner_target_takes_the_default_and_the_ends_stay() {
+        let mut f = masked_switch(3, IrType::U32, &[(0, 0), (1, 1), (2, 1), (3, 0)], 9);
+        assert_eq!(retire_dead_switch_defaults(&mut f), 1);
+        assert_eq!(switch_shape(&f), (vec![(0, 0), (3, 0)], 1));
+        let bound = switch_bounds(&f)[&1];
+        assert!(covers_switch(bound, IrType::U32, 0, 4));
+    }
+
+    /// When the lowest and the highest case own every target, any choice
+    /// shortens the table; the most frequent target goes, and the lowest case
+    /// value decides a tie.
+    #[test]
+    fn two_targets_that_own_both_ends_still_lose_the_default() {
+        let mut f = masked_switch(3, IrType::U32, &[(0, 0), (1, 1), (2, 0), (3, 1)], 9);
+        assert_eq!(retire_dead_switch_defaults(&mut f), 1);
+        assert_eq!(switch_shape(&f), (vec![(1, 1), (3, 1)], 0));
+
+        let mut f = masked_switch(
+            7,
+            IrType::U32,
+            &[
+                (0, 0),
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (4, 0),
+                (5, 1),
+                (6, 1),
+                (7, 1),
+            ],
+            9,
+        );
+        assert_eq!(retire_dead_switch_defaults(&mut f), 1);
+        assert_eq!(switch_shape(&f), (vec![(0, 0), (4, 0)], 1));
+
+        let mut f = masked_switch(1, IrType::U32, &[(0, 0), (1, 1)], 9);
+        assert_eq!(retire_dead_switch_defaults(&mut f), 1);
+        assert_eq!(switch_shape(&f), (vec![(1, 1)], 0));
+    }
+
+    /// A covered switch with one target is no switch.
+    #[test]
+    fn a_covered_switch_with_one_target_becomes_a_branch() {
+        let mut f = masked_switch(1, IrType::U32, &[(0, 2), (1, 2)], 9);
+        assert_eq!(retire_dead_switch_defaults(&mut f), 1);
+        assert!(matches!(
+            f.blocks[0].terminator,
+            Terminator::Branch(BlockId(12))
+        ));
+    }
+
+    /// The old default's phi loses the switch block's arm, and only that one.
+    #[test]
+    fn the_retired_default_loses_the_phi_arm_of_the_switch_block() {
+        let mut f = masked_switch(1, IrType::U32, &[(0, 0), (1, 1)], 9);
+        let default = f
+            .blocks
+            .iter()
+            .position(|b| b.label == BlockId(19))
+            .unwrap();
+        f.blocks[default].instructions.push(Instruction::Phi {
+            dest: Value(50),
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Const(IrConst::I32(1)), BlockId(0)),
+                (Operand::Const(IrConst::I32(2)), BlockId(77)),
+            ],
+        });
+        assert_eq!(retire_dead_switch_defaults(&mut f), 1);
+        assert!(matches!(
+            &f.blocks[default].instructions[0],
+            Instruction::Phi { incoming, .. }
+                if incoming.as_slice() == [(Operand::Const(IrConst::I32(2)), BlockId(77))]
+        ));
+    }
+
     #[test]
     fn exhaustive_byte_bounds_and_signed_consumers_match_bit_vectors() {
         // All 256 masks, eight valid shifts, and all 256 byte inputs:

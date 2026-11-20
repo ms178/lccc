@@ -545,8 +545,22 @@ fn fold_round(func: &mut IrFunction) -> usize {
     };
 
     let mut changes = 0usize;
+    // Blocks that already belong to a chain this round walked. A chain that
+    // offers no cluster is not walked again from one of its own members (no
+    // window of a suffix is missing from the whole), and the scan below only
+    // ever moves forward. It used to resume at "the last member's index + 1",
+    // which is BEHIND the head whenever a miss edge leads to an earlier
+    // block: the same head was then found again, forever (Linux
+    // drivers/gpu/drm/amd/display/dc/clk_mgr/dce100/dce_clk_mgr.c never
+    // finished compiling). Members that sit between other blocks no longer
+    // hide those blocks from the scan either.
+    let mut walked = vec![false; func.blocks.len()];
     let mut bi = 0usize;
     while bi < func.blocks.len() {
+        if walked[bi] {
+            bi += 1;
+            continue;
+        }
         let Some((root, root_ty, first)) = parse_member(func, bi, None, None) else {
             bi += 1;
             continue;
@@ -601,6 +615,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
         }
 
         // ── Walk the chain, continuing over Skip members ──
+        walked[first.bi] = true;
         let mut chain: Vec<Member> = vec![first];
         loop {
             let Some(miss) = chain.last().and_then(|last| last.miss) else {
@@ -610,6 +625,11 @@ fn fold_round(func: &mut IrFunction) -> usize {
                 break;
             };
             if pred_count.get(&miss.0).copied().unwrap_or(0) != 1 {
+                break;
+            }
+            // A miss edge back into a chain (its own, in unreachable code)
+            // ends the walk: a block is a member once.
+            if walked[next_idx] {
                 break;
             }
             let Some((_, _, m)) = parse_member(func, next_idx, Some((root, root_ty)), Some(join))
@@ -622,6 +642,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
                         *b == m.label && matches!(op, Operand::Value(v) if v.0 == m.cond_val)
                     });
                 if phi_takes_value && defs_local(func, next_idx, 0, Some((m.cond_val, join_idx))) {
+                    walked[next_idx] = true;
                     chain.push(m);
                 }
                 break;
@@ -629,6 +650,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
             if !const1_from(m.label) || !defs_local(func, next_idx, 0, None) {
                 break;
             }
+            walked[next_idx] = true;
             chain.push(m);
         }
 
@@ -792,7 +814,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
         // the `if_convert` -> `loop_vectorize` SIMD path and preserve the
         // signed-root negative control.
         if matches!(root_ty, IrType::I8 | IrType::I16) && phi_pos.is_some() {
-            bi = chain[chain.len() - 1].bi + 1;
+            bi += 1;
             continue;
         }
         // Collect maskable members and pick the window of width <= max_span
@@ -804,7 +826,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
             .map(|(i, _)| i)
             .collect();
         if maskable.len() < 3 {
-            bi = chain.last().map_or(bi + 1, |m| m.bi + 1);
+            bi += 1;
             continue;
         }
         let bounds = |k: Kind| -> (i64, i64) {
@@ -831,7 +853,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
             }
         }
         if best.len() < 3 {
-            bi = chain.last().map_or(bi + 1, |m| m.bi + 1);
+            bi += 1;
             continue;
         }
         // The cardinality guard guarantees a nonempty cluster. Seed the
@@ -1592,6 +1614,87 @@ mod tests {
         ];
         f.next_value_id = 100;
         assert_eq!(run_function(&mut f), 0);
+    }
+
+    /// The scan terminates when a chain's miss edge leads to an EARLIER block.
+    /// The head is block index 2 and its only other member is index 1; two
+    /// members offer no cluster, and resuming at "last member + 1" found the
+    /// same head again without end. `dce_clk_mgr.c` of amdgpu hung on this.
+    /// A watchdog turns a regression into a failure instead of a stuck suite.
+    #[test]
+    fn a_chain_that_runs_backwards_ends_the_scan() {
+        // The function is built on the watchdog's thread: it is not `Send`.
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let x = Value(1);
+            let phi = Value(50);
+            let mut f = IrFunction::new("f".into(), IrType::I64, vec![], false);
+            f.blocks = vec![
+                BasicBlock {
+                    label: BlockId(0),
+                    instructions: vec![],
+                    terminator: Terminator::Branch(BlockId(2)),
+                    source_spans: vec![],
+                    source_inline_ids: Vec::new(),
+                },
+                tail_block(1, x, 46, 90, Value(71)),
+                eq_block(2, x, 45, 90, 1, Value(70)),
+                join_block(
+                    90,
+                    phi,
+                    vec![
+                        (Operand::Const(IrConst::I64(1)), BlockId(2)),
+                        (Operand::Value(Value(71)), BlockId(1)),
+                    ],
+                ),
+            ];
+            f.next_value_id = 100;
+            let before = format!("{f:?}");
+            let changed = run_function(&mut f);
+            let _ = done.send((changed, before, format!("{f:?}")));
+        });
+        let (changed, before, after) = result
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the scan must terminate");
+        assert_eq!(changed, 0);
+        assert_eq!(after, before);
+    }
+
+    /// Members that sit between other blocks do not hide those blocks: the
+    /// first chain (blocks 0 and 5) offers no cluster, and the three-member
+    /// chain that starts at block 1 is still found and folded.
+    #[test]
+    fn a_failed_chain_hides_no_block_between_its_members() {
+        let x = Value(1);
+        let mut f = IrFunction::new("f".into(), IrType::I64, vec![], false);
+        f.blocks = vec![
+            eq_block(0, x, 45, 90, 5, Value(70)),
+            eq_block(1, x, 10, 91, 2, Value(72)),
+            eq_block(2, x, 12, 91, 3, Value(73)),
+            eq_block(3, x, 14, 91, 4, Value(74)),
+            tail_block(4, x, 16, 91, Value(75)),
+            tail_block(5, x, 46, 90, Value(71)),
+            join_block(
+                90,
+                Value(50),
+                vec![
+                    (Operand::Const(IrConst::I64(1)), BlockId(0)),
+                    (Operand::Value(Value(71)), BlockId(5)),
+                ],
+            ),
+            join_block(
+                91,
+                Value(51),
+                vec![
+                    (Operand::Const(IrConst::I64(1)), BlockId(1)),
+                    (Operand::Const(IrConst::I64(1)), BlockId(2)),
+                    (Operand::Const(IrConst::I64(1)), BlockId(3)),
+                    (Operand::Value(Value(75)), BlockId(4)),
+                ],
+            ),
+        ];
+        f.next_value_id = 100;
+        assert!(run_function(&mut f) >= 1, "the second chain folds");
     }
 
     #[test]

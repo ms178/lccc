@@ -841,6 +841,33 @@ pub(crate) fn normalize_bare_label(op: &mut Operand) {
     }
 }
 
+/// A carry-less multiply alias spelled out: `pclmul{l,h}q{l,h}qdq`, and the
+/// same with a leading `v`, are `[v]pclmulqdq` with the quadword selector as
+/// the immediate, in every form the base instruction has. The first `l`/`h`
+/// picks the quadword of the first source (immediate bit 0), the second the
+/// quadword of the second (bit 4); GNU as 2.47 assembles `lqlq`, `hqlq`,
+/// `lqhq`, `hqhq` with 0x00, 0x01, 0x10, 0x11. The kernel's AES-XTS, AES-GCM
+/// and CRC code spell every multiply this way. `None` for anything else.
+fn carryless_multiply_alias(instr: &Instruction) -> Option<Instruction> {
+    let (base, pair) = match instr.mnemonic.strip_prefix("vpclmul") {
+        Some(pair) => ("vpclmulqdq", pair),
+        None => ("pclmulqdq", instr.mnemonic.strip_prefix("pclmul")?),
+    };
+    let selector = match pair {
+        "lqlqdq" => 0x00,
+        "hqlqdq" => 0x01,
+        "lqhqdq" => 0x10,
+        "hqhqdq" => 0x11,
+        _ => return None,
+    };
+    let mut spelled_out = instr.clone();
+    spelled_out.mnemonic = base.to_string();
+    spelled_out
+        .operands
+        .insert(0, Operand::Immediate(ImmediateValue::Integer(selector)));
+    Some(spelled_out)
+}
+
 impl InstructionEncoder {
     pub fn new() -> Self {
         InstructionEncoder {
@@ -934,6 +961,10 @@ impl InstructionEncoder {
     }
 
     fn encode_checked(&mut self, instr: &Instruction) -> Result<(), String> {
+        // An alias that names its immediate becomes the base instruction
+        // before any encoder looks.
+        let spelled_out = carryless_multiply_alias(instr);
+        let instr = spelled_out.as_ref().unwrap_or(instr);
         // Bare labels in memory position (`vmovaps foo,%xmm0`) and `%eiz`
         // are rewritten centrally so every encoder sees canonical
         // operands. The clone runs only when a rewrite applies (branches
@@ -2274,6 +2305,13 @@ impl InstructionEncoder {
             "vpternlogq" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x25, false)),
             "vpalignr" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x0F, false)),
             "vpclmulqdq" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x44, false)),
+            // GFNI at 512 bits, on the upper registers, masked, or with a
+            // broadcast matrix: EVEX.66.0F3A.W1 CE/CF ib for the affine
+            // transforms (`{1to8}`: the matrix is a qword), EVEX.66.0F38.W0
+            // CF for the byte multiply. The VEX rows below serve the rest.
+            "vgf2p8affineqb" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0xCE, false)),
+            "vgf2p8affineinvqb" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0xCF, false)),
+            "vgf2p8mulb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xCF)),
             // VAES rounds: EVEX.128/256/512.66.0F38.W0 DC..DF. xmm/ymm0-15
             // without masking take the shorter VEX encoding in the table
             // below; zmm, ymm16-31, and masked forms land here. The ISA has
@@ -4051,6 +4089,13 @@ impl InstructionEncoder {
                 self.bytes.extend_from_slice(&[0x0F, 0x01, 0xD4]);
                 Ok(())
             }
+            "vmread" | "vmwrite" => self.encode_vmread_vmwrite(ops, mnemonic),
+            "vmptrld" => self.encode_vmx_pointer(ops, mnemonic, None, 6),
+            "vmptrst" => self.encode_vmx_pointer(ops, mnemonic, None, 7),
+            "vmclear" => self.encode_vmx_pointer(ops, mnemonic, Some(0x66), 6),
+            "vmxon" => self.encode_vmx_pointer(ops, mnemonic, Some(0xF3), 6),
+            "invept" => self.encode_invept_invvpid(ops, mnemonic, 0x80),
+            "invvpid" => self.encode_invept_invvpid(ops, mnemonic, 0x81),
 
             // No-ops and misc
             "nop" if ops.is_empty() => {
@@ -8098,6 +8143,43 @@ mod merged_pr629_followup_tests {
             hex("{vex} vpcmov %xmm1,%xmm2,%xmm3,%xmm4"),
             "8f e8 60 a2 e2 10"
         );
+        // The VMX instructions with operands, against GNU as 2.47 (`as
+        // --64`, objdump): KVM's VMCS accessors and its invalidations.
+        for (line, bytes) in [
+            ("vmread %rdx, %rcx", "0f 78 d1"),
+            ("vmread %rax, (%rdi)", "0f 78 07"),
+            ("vmread %r11, %r9", "45 0f 78 d9"),
+            ("vmread %rdx, 8(%rsp,%r12,2)", "42 0f 78 54 64 08"),
+            ("vmwrite %rsi, %rcx", "0f 79 ce"),
+            ("vmwrite %r11, %rcx", "41 0f 79 cb"),
+            ("vmwrite (%rdi), %rax", "0f 79 07"),
+            ("vmwrite %rsp, %rdi", "0f 79 fc"),
+            ("vmwrite 16(%r13), %r10", "45 0f 79 55 10"),
+            ("vmptrld (%rdi)", "0f c7 37"),
+            ("vmptrld 8(%rsp)", "0f c7 74 24 08"),
+            ("vmptrst (%rdi)", "0f c7 3f"),
+            ("vmclear (%rdi)", "66 0f c7 37"),
+            ("vmclear -8(%rbp,%r9,4)", "66 42 0f c7 74 8d f8"),
+            ("vmxon (%rdi)", "f3 0f c7 37"),
+            ("vmxon 24(%r8)", "f3 41 0f c7 70 18"),
+            ("invept (%rsi), %rdi", "66 0f 38 80 3e"),
+            ("invept 8(%rsp), %r9", "66 44 0f 38 80 4c 24 08"),
+            ("invvpid (%rsi), %rdi", "66 0f 38 81 3e"),
+            ("invvpid (%r10), %r8", "66 45 0f 38 81 02"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+        for line in [
+            "vmread (%rdi), %rax",
+            "vmwrite %rax, (%rdi)",
+            "vmread $1, %rax",
+            "vmptrld %rax",
+            "vmclear",
+            "invept %rax, %rdi",
+            "invvpid (%rsi)",
+        ] {
+            assert!(fails(line), "{line} has no encoding");
+        }
         for name in [
             "vmcall", "vmmcall", "vmlaunch", "vmresume", "vmxoff", "vmfunc",
         ] {
@@ -8123,6 +8205,97 @@ mod merged_pr629_followup_tests {
             "rex2 pseudo prefix cannot be used for `vaddps'"
         );
         assert!(fails("{vex} vpbroadcastb %eax,%xmm1")); // EVEX-only GPR row.
+    }
+
+    /// The carry-less multiply aliases against GNU as 2.47: legacy SSE, VEX
+    /// at 128 and 256 bits, EVEX at 512 bits and for the upper registers,
+    /// register and memory sources. Each is the base instruction's bytes
+    /// with the selector as the trailing immediate.
+    #[test]
+    fn carryless_multiply_aliases_are_the_base_instruction_with_a_selector() {
+        for (line, bytes) in [
+            ("pclmullqlqdq %xmm1, %xmm2", "66 0f 3a 44 d1 00"),
+            ("pclmulhqlqdq %xmm1, %xmm2", "66 0f 3a 44 d1 01"),
+            ("pclmullqhqdq %xmm1, %xmm2", "66 0f 3a 44 d1 10"),
+            ("pclmulhqhqdq (%rax), %xmm2", "66 0f 3a 44 10 11"),
+            ("vpclmullqlqdq %xmm1, %xmm2, %xmm3", "c4 e3 69 44 d9 00"),
+            ("vpclmulhqlqdq %xmm1, %xmm2, %xmm3", "c4 e3 69 44 d9 01"),
+            ("vpclmullqhqdq %xmm1, %xmm2, %xmm3", "c4 e3 69 44 d9 10"),
+            ("vpclmulhqhqdq %xmm1, %xmm2, %xmm3", "c4 e3 69 44 d9 11"),
+            ("vpclmullqlqdq %ymm1, %ymm2, %ymm3", "c4 e3 6d 44 d9 00"),
+            ("vpclmulhqlqdq (%rdi), %ymm2, %ymm3", "c4 e3 6d 44 1f 01"),
+            ("vpclmullqhqdq %zmm1, %zmm2, %zmm3", "62 f3 6d 48 44 d9 10"),
+            (
+                "vpclmulhqhqdq 64(%rdi), %zmm2, %zmm3",
+                "62 f3 6d 48 44 5f 01 11",
+            ),
+            (
+                "vpclmulhqlqdq %xmm17, %xmm18, %xmm19",
+                "62 a3 6d 00 44 d9 01",
+            ),
+            (
+                "vpclmullqlqdq %ymm20, %ymm2, %ymm30",
+                "62 23 6d 28 44 f4 00",
+            ),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+        // The alias and the spelled-out immediate are one encoding.
+        assert_eq!(
+            hex("vpclmulhqhqdq %zmm1, %zmm2, %zmm3"),
+            hex("vpclmulqdq $0x11, %zmm1, %zmm2, %zmm3")
+        );
+        // An alias takes no immediate of its own, and nothing else is one.
+        for line in [
+            "pclmullqlqdq $1, %xmm1, %xmm2",
+            "vpclmulhqlqdq $0, %xmm1, %xmm2, %xmm3",
+            "pclmulxqlqdq %xmm1, %xmm2",
+            "vpclmullqlq %xmm1, %xmm2, %xmm3",
+        ] {
+            assert!(fails(line), "{line}");
+        }
+    }
+
+    /// GFNI in its EVEX forms against GNU as 2.47 (the kernel's
+    /// aria-gfni-avx512-asm_64.S): 512-bit registers, a register above 15,
+    /// a memory matrix and a broadcast one. The 128- and 256-bit forms on
+    /// the low registers keep their VEX bytes.
+    #[test]
+    fn gfni_has_its_evex_forms() {
+        for (line, bytes) in [
+            (
+                "vgf2p8affineinvqb $0, %zmm1, %zmm2, %zmm3",
+                "62 f3 ed 48 cf d9 00",
+            ),
+            (
+                "vgf2p8affineqb $(0xc5), %zmm1, %zmm2, %zmm3",
+                "62 f3 ed 48 ce d9 c5",
+            ),
+            (
+                "vgf2p8affineinvqb $5, (%rax), %zmm2, %zmm3",
+                "62 f3 ed 48 cf 18 05",
+            ),
+            (
+                "vgf2p8affineinvqb $5, (%rax){1to8}, %zmm2, %zmm3",
+                "62 f3 ed 58 cf 18 05",
+            ),
+            (
+                "vgf2p8affineinvqb $5, %zmm17, %zmm2, %zmm30",
+                "62 23 ed 48 cf f1 05",
+            ),
+            ("vgf2p8mulb %zmm1, %zmm2, %zmm3", "62 f2 6d 48 cf d9"),
+            (
+                "vgf2p8affineinvqb $5, %ymm1, %ymm2, %ymm3",
+                "c4 e3 ed cf d9 05",
+            ),
+            (
+                "vgf2p8affineinvqb $5, %xmm1, %xmm2, %xmm3",
+                "c4 e3 e9 cf d9 05",
+            ),
+            ("gf2p8affineinvqb $5, %xmm1, %xmm2", "66 0f 3a cf d1 05"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
     }
 
     #[test]

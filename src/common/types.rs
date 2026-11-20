@@ -2801,12 +2801,16 @@ impl CType {
 }
 
 /// Whether `ty` must be spelled with C's abstract declarator syntax: its
-/// pointer/array chain holds an array that is pointed to or nested in another
-/// array (`int (*)[3]`, `int[3][4]`), and nothing the plain spelling handles
-/// specially (a function, a named address space).
+/// derivation chain holds an array that is pointed to or nested in another
+/// array (`int (*)[3]`, `int[3][4]`), or a function below more than one
+/// derivation (`int (**)(void)`, `int (* (*)(int))(long)`,
+/// `int (* (*)[3])(int)`). The plain spelling writes a function and a pointer
+/// to one around a return type it can put on their left; it has no way to
+/// nest, and printed a pointer to a function pointer as `int (*)(void) *`,
+/// which is no C type. A named address space keeps the plain spelling.
 fn needs_declarator_syntax(ty: &CType) -> bool {
     let mut cur = ty;
-    let mut derived_above = false;
+    let mut derived_above = 0usize;
     let mut found = false;
     loop {
         match cur {
@@ -2817,21 +2821,48 @@ fn needs_declarator_syntax(ty: &CType) -> bool {
                 cur = inner;
             }
             CType::Array(inner, _) => {
-                found |= derived_above;
+                found |= derived_above > 0;
                 cur = inner;
             }
-            CType::Function(_) => return false,
+            CType::Function(ft) => {
+                found |= derived_above > 1;
+                cur = &ft.return_type;
+            }
             _ => return found,
         }
-        derived_above = true;
+        derived_above += 1;
     }
+}
+
+/// The parenthesised parameter list of a function type, as GCC spells it:
+/// `(void)` for an empty prototype, `()` without one, `, ...` when variadic.
+fn write_function_params(out: &mut impl std::fmt::Write, ft: &FunctionType) -> std::fmt::Result {
+    out.write_char('(')?;
+    for (i, (param_ty, _)) in ft.params.iter().enumerate() {
+        if i > 0 {
+            out.write_str(", ")?;
+        }
+        write!(out, "{param_ty}")?;
+    }
+    if ft.params.is_empty() && ft.has_prototype && !ft.variadic {
+        out.write_str("void")?;
+    }
+    if ft.variadic {
+        if !ft.params.is_empty() {
+            out.write_str(", ")?;
+        }
+        out.write_str("...")?;
+    }
+    out.write_char(')')
 }
 
 /// GCC's spelling of a [`needs_declarator_syntax`] type, built inside out
 /// (measured on gcc-16.2): `int (*)[3]`, `int (**)[3]`, `const int (*)[3]`,
 /// `int (* const*)[3]`, `int * (*)[3]`, `char * const (*)[2]`,
-/// `int (*)[3][4]`, `int[3][4]`. A pointer level's recorded qualifiers follow
-/// its `*`; the base's lead; an array is qualified like its elements.
+/// `int (*)[3][4]`, `int[3][4]`, `int (**)(struct S *)`, `int * (**)(int)`,
+/// `int (* (*)(int))(long int)`, `int (* (*)[3])(int)`. A pointer level's
+/// recorded qualifiers follow its `*`; the base's lead; an array is qualified
+/// like its elements; a function's parameters follow what returns it.
 fn write_declarator_type(f: &mut std::fmt::Formatter<'_>, ty: &CType) -> std::fmt::Result {
     use std::fmt::Write as _;
     let mut declarator = String::new();
@@ -2860,6 +2891,15 @@ fn write_declarator_type(f: &mut std::fmt::Formatter<'_>, ty: &CType) -> std::fm
                     None => declarator.push_str("[]"),
                 }
                 cur = inner;
+            }
+            CType::Function(ft) => {
+                if declarator.starts_with('*') {
+                    declarator = format!("({declarator})");
+                }
+                write_function_params(&mut declarator, ft)?;
+                // A returned value has no qualifiers of its own.
+                own = 0;
+                cur = &ft.return_type;
             }
             leaf => {
                 if own != 0 {
@@ -2920,23 +2960,8 @@ impl std::fmt::Display for CType {
                 // Function pointer: void (*)(int) instead of void (*)(int) *
                 if let CType::Function(ft) = inner.as_ref() {
                     write!(f, "{}", ft.return_type)?;
-                    write!(f, " ({}*)(", prefix)?;
-                    for (i, (param_ty, _)) in ft.params.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{}", param_ty)?;
-                    }
-                    if ft.params.is_empty() && ft.has_prototype && !ft.variadic {
-                        write!(f, "void")?;
-                    }
-                    if ft.variadic {
-                        if !ft.params.is_empty() {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "...")?;
-                    }
-                    write!(f, ")")
+                    write!(f, " ({}*)", prefix)?;
+                    write_function_params(f, ft)
                 } else {
                     // GCC's spelling: the base type's qualifiers lead
                     // (`const char *`), a pointer level's precede its own `*`
@@ -2963,23 +2988,8 @@ impl std::fmt::Display for CType {
                 }
             }
             CType::Function(ft) => {
-                write!(f, "{} (", ft.return_type)?;
-                for (i, (param_ty, _)) in ft.params.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", param_ty)?;
-                }
-                if ft.params.is_empty() && ft.has_prototype && !ft.variadic {
-                    write!(f, "void")?;
-                }
-                if ft.variadic {
-                    if !ft.params.is_empty() {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "...")?;
-                }
-                write!(f, ")")
+                write!(f, "{} ", ft.return_type)?;
+                write_function_params(f, ft)
             }
             CType::Struct(name) => {
                 let display_name = CType::record_display_tag(name);
@@ -5132,7 +5142,7 @@ mod cast_nop_tests {
 
 #[cfg(test)]
 mod record_display_tag_tests {
-    use super::{CType, PtrQuals};
+    use super::{CType, CallingConvention, FunctionType, PtrQuals};
 
     #[test]
     fn strips_the_struct_prefix() {
@@ -5215,6 +5225,81 @@ mod record_display_tag_tests {
         assert_eq!(arr(CType::Int, 3).to_string(), "int[3]");
         assert_eq!(arr(ptr(CType::Int, None), 3).to_string(), "int *[3]");
         assert_eq!(ptr(ptr(CType::Char, c), None).to_string(), "const char **");
+    }
+
+    #[test]
+    fn display_spells_function_declarators_like_gcc() {
+        // Each expected string is gcc-16.2's spelling of the same type in an
+        // `incompatible pointer type` diagnostic. The nested ones used to
+        // print as `int (*)(struct S *) *`, which is not a C type at all.
+        let arr = |t: CType, n| CType::Array(Box::new(t), Some(n));
+        let ptr = |t: CType| CType::Pointer(Box::new(t), PtrQuals::GENERIC);
+        let func = |ret: CType, params: Vec<CType>, variadic: bool| {
+            CType::Function(Box::new(FunctionType {
+                calling_convention: CallingConvention::Default,
+                return_type: ret,
+                params: params.into_iter().map(|p| (p, None)).collect(),
+                variadic,
+                has_prototype: true,
+            }))
+        };
+        let s_ptr = || ptr(CType::Struct("struct.S".into()));
+        // The two shapes the plain spelling always handled.
+        assert_eq!(
+            func(CType::Int, vec![CType::Int], false).to_string(),
+            "int (int)"
+        );
+        assert_eq!(
+            ptr(func(CType::Int, vec![s_ptr()], false)).to_string(),
+            "int (*)(struct S *)"
+        );
+        assert_eq!(
+            ptr(func(CType::Void, vec![], false)).to_string(),
+            "void (*)(void)"
+        );
+        assert_eq!(
+            ptr(func(ptr(CType::Int), vec![CType::Int], true)).to_string(),
+            "int * (*)(int, ...)"
+        );
+        // A function below more than one derivation nests.
+        assert_eq!(
+            ptr(ptr(func(CType::Int, vec![s_ptr()], false))).to_string(),
+            "int (**)(struct S *)"
+        );
+        assert_eq!(
+            ptr(ptr(ptr(func(CType::Int, vec![CType::Int], false)))).to_string(),
+            "int (***)(int)"
+        );
+        assert_eq!(
+            ptr(ptr(func(ptr(CType::Int), vec![CType::Int], false))).to_string(),
+            "int * (**)(int)"
+        );
+        assert_eq!(
+            ptr(func(
+                ptr(func(CType::Int, vec![CType::Long], false)),
+                vec![CType::Int],
+                false
+            ))
+            .to_string(),
+            "int (* (*)(int))(long int)"
+        );
+        assert_eq!(
+            ptr(arr(ptr(func(CType::Int, vec![CType::Int], false)), 3)).to_string(),
+            "int (* (*)[3])(int)"
+        );
+        assert_eq!(
+            arr(ptr(func(CType::Int, vec![CType::Int], false)), 3).to_string(),
+            "int (*[3])(int)"
+        );
+        // A function that returns a pointer to an array, and a pointer to it.
+        assert_eq!(
+            func(ptr(arr(CType::Int, 3)), vec![], false).to_string(),
+            "int (* (void))[3]"
+        );
+        assert_eq!(
+            ptr(func(ptr(arr(CType::Int, 3)), vec![], false)).to_string(),
+            "int (* (*)(void))[3]"
+        );
     }
 }
 

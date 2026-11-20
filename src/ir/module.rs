@@ -79,6 +79,12 @@ pub struct IrModule {
         String,
         crate::backend::zero_call_used_regs::ZeroCallUsedRegs,
     >,
+    /// Library names this unit wraps in an inline-only definition
+    /// ([`IrFunction::is_gnu_inline_def`]) and whose plain calls are the
+    /// library's as soon as no wrapper is put in their place.  Written by
+    /// `passes::builtin_policy::apply`, read by the inliner when it is done;
+    /// see [`IrFunction::body_answers_call`].
+    pub wrapped_library_names: crate::common::fx_hash::FxHashSet<String>,
 }
 
 /// The ELF TLS access model (one enum for the whole compiler; the policy that
@@ -412,7 +418,7 @@ impl TerminatorSpans {
             let swap = |t: BlockId| if t == old_target { new_target } else { t };
             *shape = match *shape {
                 TerminatorShape::Branch(t) => TerminatorShape::Branch(swap(t)),
-                // `retarget_terminator_once` moves one edge: the true one first.
+                // `retarget_terminator` moves one edge: the true one first.
                 TerminatorShape::CondBranch(t, f) if t == old_target => {
                     TerminatorShape::CondBranch(new_target, f)
                 }
@@ -777,6 +783,7 @@ impl IrModule {
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
             externally_visible_symbols: crate::common::fx_hash::FxHashSet::default(),
             zero_call_used_regs_attrs: crate::common::fx_hash::FxHashMap::default(),
+            wrapped_library_names: crate::common::fx_hash::FxHashSet::default(),
         }
     }
 
@@ -803,6 +810,31 @@ impl Default for IrModule {
 }
 
 impl IrFunction {
+    /// Does this function's body run when a direct call with `info` names it?
+    ///
+    /// Not when the body is a GNU extern-inline definition
+    /// ([`Self::is_gnu_inline_def`]) and the call is the library function
+    /// ([`CallInfo::assume_library`]).  Such a body exists for inlining only,
+    /// and the fortified headers write it as a wrapper around the builtin of
+    /// its own name: `memcmp` checks its sizes and returns
+    /// `__builtin_memcmp(p, q, n)`.  GCC and Clang bind that inner call, like
+    /// every library call the compiler makes itself, to the symbol.  Reading
+    /// it as a call of the wrapper makes the wrapper contain itself: the
+    /// inliner then expands one `memcmp` hundreds of times, and tail-call
+    /// elimination turns the wrapper into a loop that never ends (Linux
+    /// 6.18.63 `__jump_label_patch` under `CONFIG_FORTIFY_SOURCE`).
+    ///
+    /// A plain call the user wrote to a wrapped name is the wrapper's until
+    /// the inliner has run (`passes::builtin_policy::apply` leaves
+    /// `assume_library` off), which is GCC's `avoid_folding_inline_builtin`:
+    /// the call is not folded as the library function while its checks can
+    /// still be put in front of it.
+    ///
+    /// [`CallInfo::assume_library`]: super::instruction::CallInfo::assume_library
+    pub fn body_answers_call(&self, info: &super::instruction::CallInfo) -> bool {
+        !(self.is_gnu_inline_def && info.assume_library)
+    }
+
     #[cfg(test)]
     pub fn new(name: String, return_type: IrType, params: Vec<IrParam>, is_variadic: bool) -> Self {
         Self {

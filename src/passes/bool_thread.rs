@@ -53,11 +53,24 @@
 //!    consumption per edge (Bt/Bf phi arms) or deletes the consumption
 //!    (the CondBranch)).
 //! 4. A predecessor is threadable only when its terminator is exactly
-//!    `Branch(Bmerge)` (unconditional — no critical-edge splitting) and it
-//!    contains no InlineAsm with goto labels (those carry implicit CFG edges
-//!    that the terminator does not describe). NonlocalGoto is outside CFG
-//!    discipline in this IR — like every other CFG pass (cfg_simplify,
-//!    phi elimination, liveness), this pass does not model it as an edge.
+//!    `Branch(Bmerge)` (unconditional — no critical-edge splitting).
+//!    NonlocalGoto is outside CFG discipline in this IR — like every other
+//!    CFG pass (cfg_simplify, phi elimination, liveness), this pass does not
+//!    model it as an edge.
+//!
+//!    A predecessor that ends in an asm goto has edges the terminator does
+//!    not describe: its labels.  The arm it holds in the merge phis belongs
+//!    to the terminator's edge, and that edge threads like any other -- it
+//!    is how the kernel's static keys reach here, `asm goto(... : l_yes);
+//!    return false; l_yes: return true;` inlined into `if (key)`, where the
+//!    asm goto's own block brings the constant 0 -- under two conditions:
+//!    * no label is Bmerge, Bt or Bf.  The block would then be one
+//!      predecessor of that block along two edges with one arm, and the
+//!      rewrite removes or adds arms per predecessor;
+//!    * the rewrite adds no instruction to it (rule 1's "possibly
+//!      conditional branch" does not; the int shape's re-materialized
+//!      compare of a non-constant arm does).  Nothing may follow an asm
+//!      goto in its block: its labels' edges would skip it.
 //! 5. A predecessor whose incoming arm for ANY merge phi is itself a merge
 //!    phi (self- or mutual reference — the loop-carried shape) is skipped:
 //!    the arm value is not provably available at the predecessor's end.
@@ -115,9 +128,10 @@ use crate::passes::round_cap;
 const MAX_ROUNDS: usize = 512;
 
 /// Thread bool-phi merge diamonds. Returns the number of threaded
-/// predecessor edges plus removed truth-preserving merge casts.
+/// predecessor edges plus removed truth-preserving merge casts and folded
+/// tests of constant phis.
 pub(crate) fn run(func: &mut IrFunction) -> usize {
-    let mut total = remove_boolean_phi_branch_casts(func);
+    let mut total = fold_tests_of_constant_phis(func) + remove_boolean_phi_branch_casts(func);
     let mut converged = false;
     for _ in 0..MAX_ROUNDS {
         let n = thread_round(func);
@@ -131,6 +145,200 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         round_cap::note_cap_hit(round_cap::Site::BoolThread);
     }
     total
+}
+
+/// One link between a phi of constants and the branch that tests it.
+#[derive(Clone, Copy)]
+enum TestLink {
+    Cast(IrType, IrType),
+    /// `phi op constant`; a constant on the left is stored swapped.
+    Cmp(IrCmpOp, IrConst, IrType),
+    Copy,
+}
+
+/// The test of a phi of constants, folded: what replaces the phi and which
+/// instructions go.
+struct FoldedTest {
+    phi_at: usize,
+    /// Positions of the cast/compare/copy instructions between the phi and
+    /// the branch.
+    links_at: Vec<usize>,
+    /// The phi's value and the links' results except the last: each is read
+    /// by the next link and must be read by nothing else.
+    intermediates: Vec<Value>,
+    dest: Value,
+    ty: IrType,
+    incoming: Vec<(Operand, BlockId)>,
+}
+
+/// `p = phi [0, A], [1, B]; c = (u8)p; t = c == 0; branch t` as
+/// `t = phi [1, A], [0, B]; branch t`, when every arm is an integer constant
+/// and the links are integer casts, copies and compares against constants.
+///
+/// What the branch tests is then a phi again, which is the shape this pass
+/// threads; the links stood between the two.  They differ by target and by
+/// source spelling -- a `_Bool` promoted to `int`, `!x`, `x != 0` -- and are
+/// evaluated here with the constant folder's own evaluators, so each arm gets
+/// exactly the value the folder would compute behind it.
+fn folded_test(block: &BasicBlock, cond: Value) -> Option<FoldedTest> {
+    let mut links: Vec<(usize, TestLink)> = Vec::new();
+    let mut value = cond;
+    // A cast, a compare and a cast again is as long as a test gets; the bound
+    // keeps a malformed cycle from spinning.
+    let (phi_at, phi_ty, arms) = loop {
+        if links.len() > 6 {
+            return None;
+        }
+        let (at, def) = block
+            .instructions
+            .iter()
+            .enumerate()
+            .find(|(_, inst)| inst.dest() == Some(value))?;
+        value = match def {
+            Instruction::Phi { ty, incoming, .. } => break (at, *ty, incoming),
+            Instruction::Cast {
+                src: Operand::Value(src),
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer() && to_ty.is_integer() => {
+                links.push((at, TestLink::Cast(*from_ty, *to_ty)));
+                *src
+            }
+            Instruction::Copy {
+                src: Operand::Value(src),
+                ..
+            } => {
+                links.push((at, TestLink::Copy));
+                *src
+            }
+            Instruction::Cmp {
+                op,
+                lhs: Operand::Value(src),
+                rhs: Operand::Const(rhs),
+                ty,
+                ..
+            } if ty.is_integer() => {
+                links.push((at, TestLink::Cmp(*op, *rhs, *ty)));
+                *src
+            }
+            Instruction::Cmp {
+                op,
+                lhs: Operand::Const(lhs),
+                rhs: Operand::Value(src),
+                ty,
+                ..
+            } if ty.is_integer() => {
+                links.push((at, TestLink::Cmp(op.swapped(), *lhs, *ty)));
+                *src
+            }
+            _ => return None,
+        };
+    };
+    if links.is_empty() || arms.len() < 2 || !phi_ty.is_integer() {
+        return None;
+    }
+    // From the phi outwards.
+    links.reverse();
+    let mut ty = phi_ty;
+    for (_, link) in &links {
+        ty = match link {
+            TestLink::Cast(_, to_ty) => *to_ty,
+            TestLink::Cmp(..) => IrType::I32,
+            TestLink::Copy => ty,
+        };
+    }
+    let incoming = arms
+        .iter()
+        .map(|(arm, from)| {
+            let Operand::Const(mut constant) = *arm else {
+                return None;
+            };
+            for (_, link) in &links {
+                constant = match *link {
+                    TestLink::Cast(from_ty, to_ty) => {
+                        crate::passes::constant_fold::eval_cast_const(constant, from_ty, to_ty)?
+                    }
+                    TestLink::Cmp(op, rhs, cmp_ty) => {
+                        crate::passes::constant_fold::eval_cmp_const(op, constant, rhs, cmp_ty)?
+                    }
+                    TestLink::Copy => constant,
+                };
+            }
+            Some((Operand::Const(constant), *from))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let phi_value = block.instructions[phi_at].dest()?;
+    let intermediates = std::iter::once(phi_value)
+        .chain(
+            links[..links.len() - 1]
+                .iter()
+                .filter_map(|(at, _)| block.instructions[*at].dest()),
+        )
+        .collect();
+    Some(FoldedTest {
+        phi_at,
+        links_at: links.iter().map(|(at, _)| *at).collect(),
+        intermediates,
+        dest: cond,
+        ty,
+        incoming,
+    })
+}
+
+/// Fold every such test ([`folded_test`]) whose links nothing else reads.
+/// Returns the number of branches that test a phi now.
+fn fold_tests_of_constant_phis(func: &mut IrFunction) -> usize {
+    let candidates: Vec<(usize, FoldedTest)> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(bi, block)| match &block.terminator {
+            Terminator::CondBranch {
+                cond: Operand::Value(cond),
+                ..
+            } => folded_test(block, *cond).map(|fold| (bi, fold)),
+            _ => None,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+    let mut uses: FxHashMap<u32, u8> = FxHashMap::default();
+    for block in &func.blocks {
+        let mut count = |id| {
+            let n = uses.entry(id).or_default();
+            *n = (*n + 1).min(2);
+        };
+        for inst in &block.instructions {
+            inst.for_each_used_value(&mut count);
+        }
+        block.terminator.for_each_used_value(&mut count);
+    }
+    let mut folded = 0;
+    for (bi, mut fold) in candidates {
+        if fold
+            .intermediates
+            .iter()
+            .any(|value| uses.get(&value.0) != Some(&1))
+        {
+            continue;
+        }
+        let block = &mut func.blocks[bi];
+        block.instructions[fold.phi_at] = Instruction::Phi {
+            dest: fold.dest,
+            ty: fold.ty,
+            incoming: fold.incoming,
+        };
+        // Highest position first: the others, and the phi ahead of them
+        // all, keep theirs.
+        fold.links_at.sort_unstable_by(|a, b| b.cmp(a));
+        for at in fold.links_at {
+            block.remove_inst(at);
+        }
+        folded += 1;
+    }
+    folded
 }
 
 /// A local integer cast of a {0,1} phi preserves the result of testing
@@ -230,6 +438,37 @@ fn succs(t: &Terminator) -> Vec<BlockId> {
     }
 }
 
+/// Visible predecessors per block (deduped; a CondBranch with both arms
+/// into the same target yields one entry — it is never threadable, and
+/// the exact-arm-count check rejects whatever phi shape it implies).
+fn visible_predecessors(func: &IrFunction, idx_of: &FxHashMap<BlockId, usize>) -> Vec<Vec<usize>> {
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
+    for (i, b) in func.blocks.iter().enumerate() {
+        let mut seen = FxHashSet::default();
+        for s in succs(&b.terminator) {
+            if let Some(&j) = idx_of.get(&s) {
+                if seen.insert(j) {
+                    preds[j].push(i);
+                }
+            }
+        }
+    }
+    preds
+}
+
+/// Rule 4 for a predecessor that ends in an asm goto: none of its labels is
+/// one of `in_the_way` (the merge and its two targets), and threading puts no
+/// instruction behind the asm goto.  A predecessor without an asm goto always
+/// passes.
+fn asm_goto_allows_threading(
+    pred: &BasicBlock,
+    in_the_way: [BlockId; 3],
+    adds_no_instruction: bool,
+) -> bool {
+    let mut labels = crate::ir::analysis::asm_goto_successors(pred).peekable();
+    labels.peek().is_none() || (adds_no_instruction && !labels.any(|l| in_the_way.contains(&l)))
+}
+
 /// One analysis + rewrite round: finds the FIRST threadable candidate and
 /// rewrites it. Returns the number of threaded predecessor edges (0 = no
 /// candidate remains).
@@ -245,20 +484,7 @@ fn thread_round(func: &mut IrFunction) -> usize {
         .map(|(i, b)| (b.label, i))
         .collect();
 
-    // Visible predecessors per block (deduped; a CondBranch with both arms
-    // into the same target yields one entry — it is never threadable, and
-    // the exact-arm-count check rejects whatever phi shape it implies).
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
-    for (i, b) in func.blocks.iter().enumerate() {
-        let mut seen = FxHashSet::default();
-        for s in succs(&b.terminator) {
-            if let Some(&j) = idx_of.get(&s) {
-                if seen.insert(j) {
-                    preds[j].push(i);
-                }
-            }
-        }
-    }
+    let preds = visible_predecessors(func, &idx_of);
 
     // Immediate-dominator tree for the value-RHS admissibility check
     // (G6). Computed lazily on the first value-RHS candidate — the CFG is
@@ -493,10 +719,17 @@ fn thread_round(func: &mut IrFunction) -> usize {
         for (pos, &pi) in preds[mi].iter().enumerate() {
             let pred = &func.blocks[pi];
             let clean_term = matches!(pred.terminator, Terminator::Branch(l) if l == ml);
-            let has_asm_goto = pred.instructions.iter().any(|i| {
-                matches!(i, Instruction::InlineAsm { goto_labels, .. } if !goto_labels.is_empty())
-            });
-            if !clean_term || has_asm_goto {
+            if !clean_term {
+                continue;
+            }
+            let adds_no_instruction = match &int_cmp {
+                None => true,
+                Some((_, rhs, _, ipos)) => matches!(
+                    (&arms[*ipos][pos], rhs),
+                    (Some(Operand::Const(_)), Operand::Const(_))
+                ),
+            };
+            if !asm_goto_allows_threading(pred, [ml, bt, bf], adds_no_instruction) {
                 continue;
             }
             let self_ref = arms.iter().any(|phi_arms| {
@@ -1552,5 +1785,348 @@ mod tests {
             .iter()
             .any(|i| matches!(i, Instruction::Cmp { dest, .. } if *dest == Value(7)));
         assert!(has_cmp, "the merge-local Cmp must survive the rejection");
+    }
+
+    // ---- A predecessor that ends in an asm goto (rule 4). ----
+
+    fn block(label: u32, instructions: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator: term,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }
+    }
+    fn asm_goto_to(label: u32) -> Instruction {
+        Instruction::InlineAsm {
+            template: "jmp %l0".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("l_yes".into(), BlockId(label))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        }
+    }
+    fn jump(label: u32) -> Terminator {
+        Terminator::Branch(BlockId(label))
+    }
+    fn branch_on(value: u32, yes: u32, no: u32) -> Terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(Value(value)),
+            true_label: BlockId(yes),
+            false_label: BlockId(no),
+        }
+    }
+    fn phi(dest: u32, arms: Vec<(Operand, u32)>) -> Instruction {
+        Instruction::Phi {
+            dest: Value(dest),
+            ty: IrType::I32,
+            incoming: arms.into_iter().map(|(op, b)| (op, BlockId(b))).collect(),
+        }
+    }
+    fn int(value: i32) -> Operand {
+        Operand::Const(IrConst::I32(value))
+    }
+    fn ret() -> Terminator {
+        Terminator::Return(Some(int(0)))
+    }
+    fn function(blocks: Vec<BasicBlock>) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        f.next_value_id = 100;
+        f.blocks = blocks;
+        f
+    }
+    fn ends_in_its_asm_goto(block: &BasicBlock) -> bool {
+        matches!(
+            block.instructions.last(),
+            Some(Instruction::InlineAsm { .. })
+        ) && block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::InlineAsm { .. }))
+            .count()
+            == 1
+    }
+
+    /// `if (static_branch_unlikely(&key)) slow();` once the helper is
+    /// inlined: the asm goto's own block brings 0 (it fell through the
+    /// `nop`), the block of its label brings 1.
+    ///
+    /// b0: asm goto -> b1; Branch(b2)
+    /// b1: Branch(b2)
+    /// b2: p = phi [0, b0], [1, b1]; CondBranch(p, b3, b4)
+    /// b3 (slow): Branch(b4)        b4: Return
+    fn static_key(label: u32) -> IrFunction {
+        function(vec![
+            block(0, vec![asm_goto_to(label)], jump(2)),
+            block(1, vec![], jump(2)),
+            block(
+                2,
+                vec![phi(10, vec![(int(0), 0), (int(1), 1)])],
+                branch_on(10, 3, 4),
+            ),
+            block(3, vec![], jump(4)),
+            block(4, vec![], ret()),
+        ])
+    }
+
+    #[test]
+    fn an_asm_goto_predecessor_threads_along_its_terminator() {
+        let mut f = static_key(1);
+        assert_eq!(super::run(&mut f), 2);
+        // The asm falls through to the code behind the `if`; its label is
+        // the call.  No value is left to test.
+        assert!(is_branch_to(&f.blocks[0].terminator, 4));
+        assert!(is_branch_to(&f.blocks[1].terminator, 3));
+        assert!(ends_in_its_asm_goto(&f.blocks[0]));
+        assert!(all_uses_resolved(&f));
+        let Instruction::Phi { incoming, .. } = &f.blocks[2].instructions[0] else {
+            panic!("the merge keeps its (dead) phi");
+        };
+        assert!(incoming.is_empty(), "no way into the merge is left");
+    }
+
+    /// The int shape with constant arms folds its compare per predecessor
+    /// and adds nothing behind the asm goto: `if (!static_branch(...))`.
+    #[test]
+    fn an_asm_goto_predecessor_threads_through_a_folded_compare() {
+        let mut f = static_key(1);
+        f.blocks[2].instructions.push(Instruction::Cmp {
+            dest: Value(11),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(10)),
+            rhs: int(0),
+            ty: IrType::I32,
+        });
+        f.blocks[2].terminator = branch_on(11, 3, 4);
+        // One folded test (the compare becomes the phi's arms), then the
+        // two ways in.
+        assert_eq!(super::run(&mut f), 3);
+        assert!(is_branch_to(&f.blocks[0].terminator, 3), "0 == 0");
+        assert!(is_branch_to(&f.blocks[1].terminator, 4), "1 != 0");
+        assert!(ends_in_its_asm_goto(&f.blocks[0]));
+        assert!(all_uses_resolved(&f));
+    }
+
+    /// A label that is the merge or one of its two targets: the asm goto's
+    /// block reaches that block along two edges and has one arm there.
+    #[test]
+    fn an_asm_goto_whose_label_is_in_the_way_keeps_its_predecessor() {
+        for label in [2u32, 3, 4] {
+            let mut f = static_key(label);
+            // Block 1 is no longer the label; keep it reachable.
+            f.blocks.insert(0, block(9, vec![], branch_on(50, 0, 1)));
+            f.blocks[0].instructions.push(Instruction::ParamRef {
+                dest: Value(50),
+                param_idx: 0,
+                ty: IrType::I32,
+            });
+            super::run(&mut f);
+            assert!(
+                is_branch_to(&f.blocks[1].terminator, 2),
+                "label {label}: the asm goto's block still jumps to the merge"
+            );
+            assert!(ends_in_its_asm_goto(&f.blocks[1]), "label {label}");
+            assert!(all_uses_resolved(&f), "label {label}");
+            // The other predecessor threads on its own (bool shape).
+            assert!(is_branch_to(&f.blocks[2].terminator, 3), "label {label}");
+        }
+    }
+
+    /// A value arm: the bool shape branches on it and adds no instruction;
+    /// the int shape would put its compare behind the asm goto and is
+    /// refused, for every predecessor (the merge has to die as a whole).
+    #[test]
+    fn an_asm_goto_predecessor_never_gets_an_instruction_behind_the_asm_goto() {
+        let with_value_arm = |int_shape: bool| {
+            let mut f = static_key(1);
+            f.blocks.insert(
+                0,
+                block(
+                    9,
+                    vec![Instruction::ParamRef {
+                        dest: Value(50),
+                        param_idx: 0,
+                        ty: IrType::I32,
+                    }],
+                    jump(0),
+                ),
+            );
+            f.blocks[3].instructions[0] =
+                phi(10, vec![(Operand::Value(Value(50)), 0), (int(1), 1)]);
+            if int_shape {
+                f.blocks[3].instructions.push(Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: int(5),
+                    ty: IrType::I32,
+                });
+                f.blocks[3].terminator = branch_on(11, 3, 4);
+            }
+            f
+        };
+        let mut f = with_value_arm(false);
+        assert_eq!(super::run(&mut f), 2);
+        assert!(matches!(
+            &f.blocks[1].terminator,
+            Terminator::CondBranch { cond: Operand::Value(Value(50)), true_label, false_label }
+                if *true_label == BlockId(3) && *false_label == BlockId(4)
+        ));
+        assert!(ends_in_its_asm_goto(&f.blocks[1]));
+
+        let mut f = with_value_arm(true);
+        let before = format!("{f:?}");
+        assert_eq!(super::run(&mut f), 0);
+        assert_eq!(format!("{f:?}"), before);
+    }
+
+    // ---- The test of a phi of constants, folded into the phi. ----
+
+    fn cast(dest: u32, src: u32, from_ty: IrType, to_ty: IrType) -> Instruction {
+        Instruction::Cast {
+            dest: Value(dest),
+            src: Operand::Value(Value(src)),
+            from_ty,
+            to_ty,
+        }
+    }
+    fn cmp(dest: u32, op: IrCmpOp, lhs: u32, rhs: Operand, ty: IrType) -> Instruction {
+        Instruction::Cmp {
+            dest: Value(dest),
+            op,
+            lhs: Operand::Value(Value(lhs)),
+            rhs,
+            ty,
+        }
+    }
+
+    /// `if (static_branch(&key))` on i686 at -O1: the `_Bool` the helper
+    /// returns is narrowed, promoted and compared with zero before the
+    /// branch.  Each way in brings a constant; the branch folds per way in.
+    #[test]
+    fn a_test_through_casts_and_a_compare_folds_into_the_phi_and_threads() {
+        for (op, to_b0, to_b1) in [(IrCmpOp::Ne, 4, 3), (IrCmpOp::Eq, 3, 4)] {
+            let mut f = static_key(1);
+            f.blocks[2].instructions.extend([
+                cast(11, 10, IrType::I32, IrType::U8),
+                cast(12, 11, IrType::U8, IrType::I32),
+                cmp(13, op, 12, int(0), IrType::I32),
+            ]);
+            f.blocks[2].terminator = branch_on(13, 3, 4);
+            // One fold, two threaded edges.
+            assert_eq!(super::run(&mut f), 3, "{op:?}");
+            assert!(is_branch_to(&f.blocks[0].terminator, to_b0), "{op:?}");
+            assert!(is_branch_to(&f.blocks[1].terminator, to_b1), "{op:?}");
+            assert!(
+                matches!(
+                    f.blocks[2].instructions.as_slice(),
+                    [Instruction::Phi {
+                        dest: Value(13),
+                        ..
+                    }]
+                ),
+                "{op:?}: the phi is what the branch tests, got {:?}",
+                f.blocks[2].instructions
+            );
+            assert!(all_uses_resolved(&f), "{op:?}");
+        }
+    }
+
+    /// The links are evaluated, not assumed to keep the truth: 256 narrowed
+    /// to a byte is 0, and a constant on the left of the compare is read
+    /// the right way round.
+    #[test]
+    fn folding_a_test_computes_each_arm() {
+        let folded = |arms: Vec<(Operand, u32)>, links: Vec<Instruction>, tested: u32| {
+            let mut instructions = vec![phi(10, arms)];
+            instructions.extend(links);
+            let merge = block(2, instructions, branch_on(tested, 3, 4));
+            super::folded_test(&merge, Value(tested)).map(|fold| {
+                fold.incoming
+                    .iter()
+                    .map(|(op, _)| match op {
+                        Operand::Const(c) => const_to_i64(c).expect("an integer"),
+                        Operand::Value(_) => panic!("a value arm"),
+                    })
+                    .collect::<Vec<i64>>()
+            })
+        };
+        assert_eq!(
+            folded(
+                vec![(int(256), 0), (int(1), 1)],
+                vec![cast(11, 10, IrType::I32, IrType::U8)],
+                11
+            ),
+            Some(vec![0, 1])
+        );
+        // `5 < p`, the constant on the left.
+        let five_less_than = Instruction::Cmp {
+            dest: Value(11),
+            op: IrCmpOp::Slt,
+            lhs: int(5),
+            rhs: Operand::Value(Value(10)),
+            ty: IrType::I32,
+        };
+        assert_eq!(
+            folded(vec![(int(3), 0), (int(9), 1)], vec![five_less_than], 11),
+            Some(vec![0, 1])
+        );
+        // Unsigned: -1 is the largest value.
+        assert_eq!(
+            folded(
+                vec![(int(-1), 0), (int(1), 1)],
+                vec![cmp(11, IrCmpOp::Ugt, 10, int(2), IrType::U32)],
+                11
+            ),
+            Some(vec![1, 0])
+        );
+        // Nothing between the phi and the branch: nothing to fold.
+        assert_eq!(folded(vec![(int(0), 0), (int(1), 1)], vec![], 10), None);
+        // An arm that is a value, and a compare with one.
+        assert_eq!(
+            folded(
+                vec![(int(0), 0), (Operand::Value(Value(5)), 1)],
+                vec![cast(11, 10, IrType::I32, IrType::U8)],
+                11
+            ),
+            None
+        );
+        assert_eq!(
+            folded(
+                vec![(int(0), 0), (int(1), 1)],
+                vec![cmp(
+                    11,
+                    IrCmpOp::Eq,
+                    10,
+                    Operand::Value(Value(5)),
+                    IrType::I32
+                )],
+                11
+            ),
+            None
+        );
+    }
+
+    /// A link something else reads stays, and so does the test.
+    #[test]
+    fn a_test_whose_links_are_read_elsewhere_is_not_folded() {
+        let mut f = static_key(1);
+        f.blocks[2].instructions.extend([
+            cast(11, 10, IrType::I32, IrType::U8),
+            cmp(13, IrCmpOp::Ne, 11, int(0), IrType::U8),
+        ]);
+        f.blocks[2].terminator = branch_on(13, 3, 4);
+        // The slow block reads the narrowed value.
+        f.blocks[3].instructions.push(Instruction::Copy {
+            dest: Value(40),
+            src: Operand::Value(Value(11)),
+        });
+        let before = format!("{f:?}");
+        assert_eq!(super::fold_tests_of_constant_phis(&mut f), 0);
+        assert_eq!(format!("{f:?}"), before);
     }
 }

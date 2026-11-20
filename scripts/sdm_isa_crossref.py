@@ -366,6 +366,10 @@ LEGACY_SPECS = {
                         "pp": ("const", "none"), "opcode": ("arg", 2)},
     "encode_invpcid": {"family": "legacy", "map": ("const", "0f38"),
                        "pp": ("const", "66"), "opcode": 0x82},
+    # VMX: `invept` is 66 0F 38 80 /r, `invvpid` 66 0F 38 81 /r; the row
+    # passes the opcode byte.
+    "encode_invept_invvpid": {"family": "legacy", "map": ("const", "0f38"),
+                              "pp": ("const", "66"), "opcode": ("arg", 2)},
     # SHSTK: `rstorssp` is F3-prefixed 0F 01 /5, `clrssbsy` F3-prefixed 0F AE /6.
     "encode_rstorssp": {"family": "legacy", "map": ("const", "0f"),
                         "pp": ("const", "f3"), "opcode": 0x01,
@@ -1914,6 +1918,38 @@ def _model_vcvt(args, name, b64) -> list[dict] | None:
     return encs
 
 
+def _model_vmread_vmwrite(args, name, b64) -> list[dict] | None:
+    """`encode_vmread_vmwrite(ops, mnemonic)`: `0F 78 /r` and `0F 79 /r`.
+
+    One row serves both names and passes its `mnemonic` binding, so the name
+    being verified is where the opcode comes from.
+    """
+    opcode = {"vmread": 0x78, "vmwrite": 0x79}.get(name or "")
+    if opcode is None:
+        return None
+    return [form(opcode, map_="0f", pp="none")]
+
+
+def _model_vmx_pointer(args, name, b64) -> list[dict] | None:
+    """`encode_vmx_pointer(ops, mnemonic, prefix, reg)`: `0F C7 /reg`.
+
+    `prefix` is the mandatory prefix as an `Option<u8>`: none for `vmptrld`
+    (/6) and `vmptrst` (/7), 66 for `vmclear` (/6), F3 for `vmxon` (/6).
+    """
+    if len(args) < 4:
+        return None
+    spelled = args[2].replace(" ", "")
+    if spelled == "None":
+        pp = "none"
+    else:
+        hit = re.fullmatch(r"Some\((0[xX][0-9A-Fa-f]+)\)", spelled)
+        pp = PP_BY_BYTE.get(int(hit.group(1), 16)) if hit else None
+    reg = arg_int(args, 3)
+    if pp is None or reg is None:
+        return None
+    return [form(0xC7, map_="0f", pp=pp, reg=reg)]
+
+
 def _model_user_msr(args, name, b64) -> list[dict] | None:
     """`encode_user_msr(ops, mnemonic)`.
 
@@ -2015,6 +2051,8 @@ HELPER_MODELS = {
     "encode_wrss": _model_wrss,
     "encode_vcvt": _model_vcvt,
     "encode_user_msr": _model_user_msr,
+    "encode_vmread_vmwrite": _model_vmread_vmwrite,
+    "encode_vmx_pointer": _model_vmx_pointer,
     "encode_suffixless_alu": _model_suffixless_alu,
     "encode_suffixless_shift": _model_suffixless_shift,
     "encode_suffixless_test": _model_suffixless_test,

@@ -101,6 +101,44 @@ pub fn well_known_section_type(name: &str) -> Option<u32> {
     }
 }
 
+/// The entity size a `.section` directive gives its section: the argument
+/// after the type, as in `.section .rodata.cst16,"aM",@progbits,16`.
+///
+/// `Ok(0)` when the directive states none and needs none. `Err` carries the
+/// warning GNU as gives when the flags ask for merging and no usable size
+/// follows; the caller then drops `SHF_MERGE | SHF_STRINGS`, as GNU as does
+/// (`obj_elf_section`), and the section is an ordinary one.
+///
+/// The header of a mergeable section has to say how large its entries are.
+/// Every such section used to be written with 0 (or 1 for strings, whatever
+/// the source said): bfd and lld then leave a constant pool alone, mold
+/// merged it byte by byte, and every linker split a `"aMS",@progbits,4`
+/// pool of wide strings at its first zero *byte*.
+pub fn section_entity_size(flags: Option<&str>, arg: Option<&str>) -> Result<u64, &'static str> {
+    let Some(flags) = flags else {
+        return Ok(0);
+    };
+    let (merge, strings) = (flags.contains('M'), flags.contains('S'));
+    if !merge && !strings {
+        return Ok(0);
+    }
+    match arg.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(text) => {
+            let value = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                Some(hex) => u64::from_str_radix(hex, 16).ok(),
+                None => text.parse::<u64>().ok(),
+            };
+            match value {
+                Some(size) if size > 0 => Ok(size),
+                _ => Err("invalid section entity size"),
+            }
+        }
+        None if merge => Err("entity size for SHF_MERGE not specified"),
+        // `S` alone: one byte per character (GNU as, silently).
+        None => Ok(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +173,30 @@ mod tests {
         // Custom sections are not fixed.
         assert_eq!(well_known_section_type(".lccc_pgo_cnts"), None);
         assert_eq!(well_known_section_type(".my_section"), None);
+    }
+
+    /// GNU as 2.47, `obj_elf_section`.
+    #[test]
+    fn entity_size_is_the_argument_after_the_type() {
+        assert_eq!(section_entity_size(Some("aM"), Some("16")), Ok(16));
+        assert_eq!(section_entity_size(Some("aMS"), Some(" 4 ")), Ok(4));
+        assert_eq!(section_entity_size(Some("aM"), Some("0x10")), Ok(16));
+        // No size: `M` cannot be honoured, `S` alone means bytes.
+        assert_eq!(
+            section_entity_size(Some("aM"), None),
+            Err("entity size for SHF_MERGE not specified")
+        );
+        assert_eq!(section_entity_size(Some("aS"), None), Ok(1));
+        assert_eq!(
+            section_entity_size(Some("aM"), Some("0")),
+            Err("invalid section entity size")
+        );
+        assert_eq!(
+            section_entity_size(Some("aMS"), Some("x")),
+            Err("invalid section entity size")
+        );
+        // Nothing to say about an ordinary section, or a re-entered one.
+        assert_eq!(section_entity_size(Some("aw"), Some("16")), Ok(0));
+        assert_eq!(section_entity_size(None, None), Ok(0));
     }
 }

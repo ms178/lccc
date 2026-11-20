@@ -2630,6 +2630,72 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     rewrites + if_convert_diamonds(func)
 }
 
+/// Whether the conditional branch that ends `block` is decided by the edge
+/// control came in on: its condition is a phi of this block whose arms are
+/// all constants, read directly or through casts and compares against
+/// constants in the block.
+///
+/// Such a branch tests nothing.  Each way in already knows which arm it
+/// takes, and the jump threaders send it there (`jump_thread`, `bool_thread`):
+/// no test, no branch, no value.  A select is the opposite trade -- it
+/// materializes the constant on every way in, tests it, and computes both
+/// arms -- and once the branch is a select there is nothing left to thread.
+/// The kernel's `if (static_branch_likely(&key)) x = f(x);` is this shape: the
+/// helper's `return false` and `return true` meet in a phi of 0 and 1, the way
+/// in is decided by an asm goto, and no condition exists that a select could
+/// test instead.  (A phi two arms of one branch feed is turned into a select
+/// on that branch's condition first, by this pass, and is no phi any more
+/// when its own turn comes.)
+fn branch_is_decided_on_entry(block: &BasicBlock) -> bool {
+    let Terminator::CondBranch {
+        cond: Operand::Value(cond),
+        ..
+    } = &block.terminator
+    else {
+        return false;
+    };
+    let mut value = *cond;
+    // A cast, a compare and a cast again is as long as a test of a `_Bool`
+    // gets; the bound is what keeps a malformed cycle from spinning.
+    for _ in 0..6 {
+        let Some(def) = block
+            .instructions
+            .iter()
+            .find(|inst| inst.dest() == Some(value))
+        else {
+            return false;
+        };
+        value = match def {
+            Instruction::Phi { incoming, .. } => {
+                return incoming.len() >= 2
+                    && incoming
+                        .iter()
+                        .all(|(arm, _)| matches!(arm, Operand::Const(_)));
+            }
+            Instruction::Cast {
+                src: Operand::Value(src),
+                ..
+            }
+            | Instruction::Copy {
+                src: Operand::Value(src),
+                ..
+            }
+            | Instruction::Cmp {
+                lhs: Operand::Value(src),
+                rhs: Operand::Const(_),
+                ..
+            }
+            | Instruction::Cmp {
+                lhs: Operand::Const(_),
+                rhs: Operand::Value(src),
+                ..
+            } => *src,
+            _ => return false,
+        };
+    }
+    false
+}
+
 /// Diamond/triangle conversion proper, split out so the if-combine phase can
 /// rebuild the analysis context before calling it.
 fn if_convert_diamonds(func: &mut IrFunction) -> usize {
@@ -2640,6 +2706,9 @@ fn if_convert_diamonds(func: &mut IrFunction) -> usize {
     let mut diamonds: Vec<DiamondInfo> = Vec::new();
 
     for pred_idx in 0..num_blocks {
+        if branch_is_decided_on_entry(&func.blocks[pred_idx]) {
+            continue;
+        }
         if let Some(diamond) = detect_diamond(&ctx, pred_idx) {
             diamonds.push(diamond);
         } else if let Some(triangle) = detect_triangle(&ctx, pred_idx) {
@@ -7049,5 +7118,202 @@ mod cond_load_sink_tests {
         let _guard = EnvGuard::set("CCC_NO_COND_LOAD_SINK", "1");
         assert_eq!(sink_conditional_loads(&mut f), 0);
         assert_eq!(format!("{f:?}"), before);
+    }
+}
+
+#[cfg(test)]
+mod decided_on_entry_tests {
+    use super::*;
+    use crate::ir::reexports::IrConst;
+
+    fn block(label: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }
+    }
+    fn int(value: i32) -> Operand {
+        Operand::Const(IrConst::I32(value))
+    }
+    fn branch_on(value: u32, yes: u32, no: u32) -> Terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(Value(value)),
+            true_label: BlockId(yes),
+            false_label: BlockId(no),
+        }
+    }
+    fn jump(label: u32) -> Terminator {
+        Terminator::Branch(BlockId(label))
+    }
+    fn phi(dest: u32, arms: Vec<(Operand, u32)>) -> Instruction {
+        Instruction::Phi {
+            dest: Value(dest),
+            ty: IrType::I32,
+            incoming: arms.into_iter().map(|(op, b)| (op, BlockId(b))).collect(),
+        }
+    }
+    fn asm_goto_to(label: u32) -> Instruction {
+        Instruction::InlineAsm {
+            template: "jmp %l0".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("l_yes".into(), BlockId(label))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        }
+    }
+
+    /// `if (!static_branch(&key)) x = x * 3 + 1; return x;`
+    ///
+    /// b0: x = param; asm goto -> b1; Branch(b2)
+    /// b1: Branch(b2)
+    /// b2: p = phi [0, b0], [1, b1]; c = cast p; t = (c == 0); CondBranch(t, b3, b4)
+    /// b3: y = x * 3; z = y + 1; Branch(b4)
+    /// b4: r = phi [x, b2], [z, b3]; Return r
+    ///
+    /// `tested` is what the branch of b2 reads: the phi of the two constants
+    /// through the cast and the compare, or the parameter.
+    fn static_key_guards_arithmetic(tested: u32) -> IrFunction {
+        let mut f = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+        f.next_value_id = 40;
+        f.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 0,
+                        ty: IrType::I32,
+                    },
+                    asm_goto_to(1),
+                ],
+                jump(2),
+            ),
+            block(1, vec![], jump(2)),
+            block(
+                2,
+                vec![
+                    phi(10, vec![(int(0), 0), (int(1), 1)]),
+                    Instruction::Cast {
+                        dest: Value(11),
+                        src: Operand::Value(Value(10)),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::U8,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(12),
+                        op: IrCmpOp::Eq,
+                        lhs: Operand::Value(Value(11)),
+                        rhs: Operand::Const(IrConst::I8(0)),
+                        ty: IrType::U8,
+                    },
+                ],
+                branch_on(tested, 3, 4),
+            ),
+            block(
+                3,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(20),
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: int(3),
+                        ty: IrType::I32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(21),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(20)),
+                        rhs: int(1),
+                        ty: IrType::I32,
+                    },
+                ],
+                jump(4),
+            ),
+            block(
+                4,
+                vec![phi(
+                    30,
+                    vec![
+                        (Operand::Value(Value(1)), 2),
+                        (Operand::Value(Value(21)), 3),
+                    ],
+                )],
+                Terminator::Return(Some(Operand::Value(Value(30)))),
+            ),
+        ];
+        f
+    }
+
+    fn has_select(f: &IrFunction) -> bool {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .any(|inst| matches!(inst, Instruction::Select { .. }))
+    }
+
+    /// Each way into b2 knows the arm: the jump threaders remove the branch,
+    /// and a select would keep the test and compute `x * 3 + 1` on both.
+    #[test]
+    fn a_branch_the_way_in_decides_is_left_to_the_threaders() {
+        let mut f = static_key_guards_arithmetic(12);
+        assert!(branch_is_decided_on_entry(&f.blocks[2]));
+        let before = format!("{f:?}");
+        assert_eq!(if_convert_function(&mut f), 0);
+        assert_eq!(format!("{f:?}"), before);
+    }
+
+    /// The control: the same arms behind a test of a value nothing decides
+    /// become a select.
+    #[test]
+    fn a_branch_on_a_value_is_still_converted() {
+        let mut f = static_key_guards_arithmetic(1);
+        assert!(!branch_is_decided_on_entry(&f.blocks[2]));
+        assert!(if_convert_function(&mut f) > 0);
+        assert!(has_select(&f));
+    }
+
+    #[test]
+    fn only_a_phi_of_constants_decides() {
+        let decided = |insts: Vec<Instruction>, tested: u32| {
+            branch_is_decided_on_entry(&block(2, insts, branch_on(tested, 3, 4)))
+        };
+        // The phi itself.
+        assert!(decided(vec![phi(10, vec![(int(0), 0), (int(1), 1)])], 10));
+        // One arm is a value: that way in still has to test it.
+        assert!(!decided(
+            vec![phi(10, vec![(int(0), 0), (Operand::Value(Value(5)), 1)])],
+            10
+        ));
+        // A compare of the phi with another value is no constant per way in.
+        assert!(!decided(
+            vec![
+                phi(10, vec![(int(0), 0), (int(1), 1)]),
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: IrCmpOp::Eq,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: Operand::Value(Value(5)),
+                    ty: IrType::I32,
+                },
+            ],
+            12
+        ));
+        // A value defined in another block, and a constant condition.
+        assert!(!decided(vec![], 10));
+        assert!(!branch_is_decided_on_entry(&block(
+            2,
+            vec![],
+            Terminator::CondBranch {
+                cond: int(1),
+                true_label: BlockId(3),
+                false_label: BlockId(4),
+            }
+        )));
     }
 }

@@ -79,6 +79,7 @@ impl Parser {
     /// or "unsigned long int"), struct/union/enum definitions, typedef names,
     /// typeof expressions, and _Complex types.
     pub(super) fn parse_type_specifier(&mut self) -> Option<TypeSpecifier> {
+        self.attrs.spec_type_unused = false;
         self.skip_gcc_extensions();
         // Where this specifier list starts, for the implicit-int diagnostic
         // below: the declaration it belongs to is what needs the position.
@@ -952,6 +953,14 @@ impl Parser {
             return TypeSpecifier::Int;
         }
         let tag_span = self.peek_span();
+        // GNU `unused` on the record (`struct S { ... } __maybe_unused;`) is a
+        // property of the TYPE: no variable of exactly that type is reported
+        // as unused (GCC manual, Common Type Attributes). It used to land in
+        // the declaration's own flag, which a definition without declarators
+        // drops, so each such variable was reported: 23 false
+        // `-Wunused-const-variable` in amdgpu's `*_ip_offset.h` alone.
+        let declaration_unused = self.attrs.parsing_maybe_unused();
+        self.attrs.set_maybe_unused(false);
         let (mut is_packed, mut struct_aligned, _, _, mut sso) = self.parse_record_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
@@ -961,6 +970,7 @@ impl Parser {
             None
         };
         let (packed2, aligned2, _, _, sso2) = self.parse_record_attributes();
+        let mut record_unused = self.attrs.parsing_maybe_unused();
         is_packed = is_packed || packed2;
         if aligned2.is_some() {
             struct_aligned = aligned2;
@@ -1000,7 +1010,22 @@ impl Parser {
         // GCC's `struct T { ... } __attribute__((aligned(N)));` semantics).
         self.attrs.parsed_alignas = saved_pending_alignas;
         self.attrs.parsed_alignas_type = saved_pending_alignas_type;
+        // A member's `unused` is the member's, not the record's.
+        self.attrs.set_maybe_unused(false);
         let (packed3, aligned3, _, _, sso3) = self.parse_record_attributes();
+        record_unused |= self.attrs.parsing_maybe_unused();
+        // Without a body the attribute has no type to attach to and stays
+        // with the declaration, as before.
+        self.attrs
+            .set_maybe_unused(declaration_unused || (record_unused && fields.is_none()));
+        record_unused &= fields.is_some();
+        if let Some(tag) = &name {
+            if record_unused {
+                self.unused_record_tags.insert(tag.clone());
+            } else {
+                record_unused = self.unused_record_tags.contains(tag);
+            }
+        }
         is_packed = is_packed || packed3;
         if aligned3.is_some() {
             struct_aligned = aligned3;
@@ -1080,7 +1105,21 @@ impl Parser {
             _ => {}
         }
         self.exit_parser_frame();
+        // Last, so a nested definition's verdict never survives its parent's.
+        self.attrs.spec_type_unused = record_unused;
         ts
+    }
+
+    /// Whether GCC exempts a variable declared with exactly this specifier
+    /// (no pointer, array or function derivation) from the unused warnings:
+    /// its record or typedef carries GNU `unused`. Read right after the
+    /// specifier is parsed.
+    pub(super) fn spec_names_unused_type(&self, spec: &TypeSpecifier) -> bool {
+        match spec {
+            TypeSpecifier::Struct(..) | TypeSpecifier::Union(..) => self.attrs.spec_type_unused,
+            TypeSpecifier::TypedefName(name) => self.typedef_unused.contains(name),
+            _ => false,
+        }
     }
 
     /// Parse an enum definition/reference.

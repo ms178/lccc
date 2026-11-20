@@ -546,6 +546,7 @@ impl ElfWriter {
                 sec.flags.as_deref().unwrap_or(""),
                 sec.flags.is_some(), // flags are explicit when provided
                 sec.section_type.as_deref(),
+                sec.entity_size.as_deref(),
             ),
 
             AsmDirective::PushSection(sec) => self.base.push_section(
@@ -553,6 +554,7 @@ impl ElfWriter {
                 sec.flags.as_deref().unwrap_or(""),
                 sec.flags.is_some(),
                 sec.section_type.as_deref(),
+                sec.entity_size.as_deref(),
             ),
 
             AsmDirective::PopSection => {
@@ -978,8 +980,14 @@ impl ElfWriter {
                 // is only known once every directive has been processed
                 // (`.globl` may follow the branch), so the check happens
                 // here at resolution time rather than at deferral time.
+                //
+                // An ifunc is relocated whatever its binding: its address
+                // is its resolver's, and only the linker's PLT entry calls
+                // the function the resolver picks. `bl` to a local one,
+                // patched here, called the resolver itself.
                 if self.base.global_symbols.contains_key(&reloc.symbol)
                     || self.base.weak_symbols.contains_key(&reloc.symbol)
+                    || self.base.symbol_types.get(&reloc.symbol) == Some(&STT_GNU_IFUNC)
                 {
                     if let Some(section) = self.base.sections.get_mut(&reloc.section) {
                         section.relocs.push(ObjReloc {

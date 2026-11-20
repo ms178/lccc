@@ -2125,7 +2125,11 @@ impl I686Codegen {
         };
         if self.state.function_return_thunk {
             if cleanup == 0 {
-                self.state.emit("    jmp __x86_return_thunk");
+                emit!(
+                    self.state,
+                    "    {}",
+                    crate::backend::x86_common::RETURN_THUNK_JUMP
+                );
             } else if self.current_return_i686_ext_vector_gp3 {
                 // ECX is the third return lane, so it cannot carry the PC.
                 // Relocate the PC over the dead argument area while preserving
@@ -2141,7 +2145,11 @@ impl I686Codegen {
                 if self.state.emit_cfi {
                     emit!(self.state, "    .cfi_def_cfa_offset {}", 4 - cleanup as i64);
                 }
-                self.state.emit("    jmp __x86_return_thunk");
+                emit!(
+                    self.state,
+                    "    {}",
+                    crate::backend::x86_common::RETURN_THUNK_JUMP
+                );
             } else {
                 // GCC's external-thunk ABI for RET imm16: ECX carries the
                 // return PC, with the callee-cleaned arguments already gone.

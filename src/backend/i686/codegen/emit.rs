@@ -914,6 +914,33 @@ impl I686Codegen {
         self.reg_assignments.get(&dest.0).copied()
     }
 
+    /// Bring the register caches up to date after instructions that wrote
+    /// `dest` straight into its register home `home`, without going through
+    /// [`Self::store_eax_to`].
+    ///
+    /// The accumulator cache says which value %eax holds, and %eax is also a
+    /// home the allocator hands out (`PhysReg(6)`). A direct write into an
+    /// %eax home therefore replaces what the cache describes: from here on
+    /// %eax holds `dest`, and saying so is both the correction and the best
+    /// answer for the next read of `dest`. With the old entry left in place,
+    /// a later `operand_to_eax` of the value it names returns without
+    /// loading anything and the consumer reads `dest` instead: `acc = acc *
+    /// K + (v[3] + v[1])` at `-m32 -O2` added the second term to itself,
+    /// because the product was parked in %eax, the first half of the sum was
+    /// then computed into its %eax home, and the final add asked for the
+    /// product "still" in %eax.
+    ///
+    /// %ecx is the secondary staging register, so a write to an %ecx home
+    /// ends the secondary entry. Every other home is outside both caches,
+    /// and a write to one leaves them exactly as true as they were.
+    pub(super) fn note_home_written(&mut self, dest: &Value, home: PhysReg) {
+        match home.0 {
+            6 => self.state.park_acc(dest.0, false),
+            4 => self.state.reg_cache.invalidate_sec(),
+            _ => {}
+        }
+    }
+
     /// Direct REGISTER source reference for a 32-bit ALU/cmp operand. Returns
     /// `Some("%reg")` when the value is register-allocated — authoritative
     /// (the linear scan guarantees the register holds the value throughout its

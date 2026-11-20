@@ -694,11 +694,34 @@ impl I686Codegen {
     /// Compute a 32-bit int binop straight into the destination's register,
     /// bypassing the %eax round-trip (movl src,%eax; op ...; movl %eax,%dst
     /// -> op src,%dst). Returns false when the shape doesn't fit; the caller
-    /// falls back to the accumulator path. %eax/%ecx/%edx are untouched, so
-    /// the accumulator cache stays valid.
+    /// falls back to the accumulator path.
+    ///
+    /// The only register written besides the home is %ecx (a variable shift
+    /// count), so the accumulator cache stays true unless the home IS %eax —
+    /// which [`Self::note_home_written`] accounts for.
     fn try_emit_int_binop_direct(
         &mut self,
         dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> bool {
+        let Some(home) = self.dest_reg(dest) else {
+            return false;
+        };
+        if !self.emit_int_binop_into_home(home, op, lhs, rhs) {
+            return false;
+        }
+        self.note_home_written(dest, home);
+        true
+    }
+
+    /// The body of [`Self::try_emit_int_binop_direct`]: `home = lhs op rhs`,
+    /// or false with nothing emitted. Leaves the register caches alone; the
+    /// caller owns them.
+    fn emit_int_binop_into_home(
+        &mut self,
+        dphys: PhysReg,
         op: IrBinOp,
         lhs: &Operand,
         rhs: &Operand,
@@ -714,9 +737,6 @@ impl I686Codegen {
         if !is_alu && !is_mul && !is_shift {
             return false;
         }
-        let Some(dphys) = self.dest_reg(dest) else {
-            return false;
-        };
         let d = super::emit::phys_reg_name(dphys);
         let Some(l) = self.binop_loc(lhs) else {
             return false;
@@ -844,7 +864,8 @@ impl I686Codegen {
             }
             let mnem = shift_mnemonic(op);
             emit!(self.state, "    {} %cl, %{}", mnem, d);
-            // %ecx clobbered, but %eax untouched — the acc cache stays valid.
+            // The count went through %ecx, the secondary staging register.
+            self.state.reg_cache.invalidate_sec();
             return true;
         }
 
@@ -1828,5 +1849,106 @@ mod bit_test_width_tests {
         );
         let asm = cg.state.out.buf;
         assert!(asm.contains("btl $1, %eax"), "17 mod 16 is 1:\n{asm}");
+    }
+}
+
+#[cfg(test)]
+mod direct_home_cache_tests {
+    use super::*;
+    use crate::ir::reexports::IrConst;
+
+    fn lines(cg: &I686Codegen) -> Vec<String> {
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// v10 in %ebp, v30 in %edx and still named by the accumulator cache
+    /// (as after `store_eax_to(v30)`), v20 homed in `home`.
+    fn codegen(home: u8) -> I686Codegen {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.reg_assignments.insert(10, PhysReg(3));
+        cg.reg_assignments.insert(20, PhysReg(home));
+        cg.reg_assignments.insert(30, PhysReg(5));
+        cg.state.park_acc(30, false);
+        cg
+    }
+
+    fn add_constant(cg: &mut I686Codegen) {
+        cg.emit_int_binop_impl(
+            &Value(20),
+            IrBinOp::Add,
+            &Operand::Value(Value(10)),
+            &Operand::Const(IrConst::I64(42007)),
+            IrType::U32,
+        );
+    }
+
+    /// `acc = acc * K + (v[3] + v[1])`: the product (v30) is parked in %eax,
+    /// then half of the sum (v20) is computed straight into its %eax home.
+    /// From there on %eax is v20, and the add that consumes the product has
+    /// to fetch it from the product's own home. With the entry left on v30
+    /// that add read v20 for both terms.
+    #[test]
+    fn a_binop_computed_into_an_eax_home_replaces_the_accumulator_entry() {
+        let mut cg = codegen(6);
+        add_constant(&mut cg);
+        assert_eq!(lines(&cg), ["movl %ebp, %eax", "addl $42007, %eax"]);
+        assert!(!cg.state.reg_cache.acc_has(30, false));
+        assert!(cg.state.reg_cache.acc_has(20, false));
+        cg.operand_to_eax(&Operand::Value(Value(30)));
+        assert_eq!(
+            lines(&cg).last().map(String::as_str),
+            Some("movl %edx, %eax")
+        );
+    }
+
+    /// Any other home leaves %eax alone, so what the cache says about it is
+    /// still true and the next read of v30 costs nothing.
+    #[test]
+    fn a_binop_computed_into_another_home_keeps_the_accumulator_entry() {
+        for home in [0u8, 1, 2, 4] {
+            let mut cg = codegen(home);
+            add_constant(&mut cg);
+            let before = lines(&cg);
+            assert_eq!(before.len(), 2, "{before:?}");
+            assert!(cg.state.reg_cache.acc_has(30, false), "home {home}");
+            cg.operand_to_eax(&Operand::Value(Value(30)));
+            assert_eq!(lines(&cg), before, "home {home}: no reload");
+        }
+    }
+
+    /// A variable shift count is staged through %ecx, the secondary staging
+    /// register: its cache entry ends there. An %ecx home ends it as well.
+    #[test]
+    fn direct_binops_that_write_ecx_drop_the_secondary_entry() {
+        let mut cg = codegen(0);
+        cg.reg_assignments.insert(11, PhysReg(1));
+        cg.state.park_sec(40, false);
+        cg.emit_int_binop_impl(
+            &Value(20),
+            IrBinOp::Shl,
+            &Operand::Value(Value(10)),
+            &Operand::Value(Value(11)),
+            IrType::U32,
+        );
+        assert_eq!(
+            lines(&cg),
+            ["movl %ebp, %ebx", "movl %esi, %ecx", "shll %cl, %ebx"]
+        );
+        assert!(!cg.state.reg_cache.sec_has(40, false));
+        assert!(cg.state.reg_cache.acc_has(30, false));
+
+        let mut cg = codegen(4);
+        cg.state.park_sec(40, false);
+        add_constant(&mut cg);
+        assert_eq!(lines(&cg), ["movl %ebp, %ecx", "addl $42007, %ecx"]);
+        assert!(!cg.state.reg_cache.sec_has(40, false));
     }
 }

@@ -110,6 +110,37 @@ if grep -Eq '^[[:space:]]*set[abglenopsz][[:space:]]' <<<"$func"; then
 fi
 echo "PASS x86-64 direct condition-code branches (no setcc, no stack bool reload)"
 
+# ── Codegen: an output read behind the asm goto stays in its register ────────
+# `asm goto(... : "=q"(x) ...); *dst = x;` -- __get_user()'s shape -- reads `x`
+# from the register the template wrote.  An asm goto ends its block, and a
+# label printed between the template and the load made the text peepholes keep
+# the output's store to the frame and reload it: a store and a load in every
+# iteration of copy_from_kernel_nofault()'s loops.  The label nothing names is
+# not printed, and the frame is not touched.
+cat >"$tmp/out_reg.c" <<'EOF'
+int copy1(unsigned char *dst, const unsigned char *src)
+{
+    unsigned char x;
+    asm goto("1:\tmovb %[umem],%[output]\n"
+             ".pushsection __ex_table,\"a\"\n.long 1b - ., %l2 - .\n.popsection\n"
+             : [output] "=q"(x) : [umem] "m"(*src) : : Efault);
+    *dst = x;
+    return 0;
+Efault:
+    return -14;
+}
+EOF
+"$CCC" -m64 -O2 -S "$tmp/out_reg.c" -o "$tmp/out_reg.s"
+func=$(sed -n '/^copy1:/,/^\.size copy1/p' "$tmp/out_reg.s")
+[[ -n $func ]] || { echo "FAIL: copy1 missing from -O2 output" >&2; exit 1; }
+grep -q '#NO_APP' <<<"$func" || { echo "FAIL: copy1 lost its inline asm" >&2; exit 1; }
+if grep -Eq '\((%rsp|%rbp)\)' <<<"$func"; then
+    echo "FAIL: the output of an asm goto goes through the frame on the way that falls through" >&2
+    echo "$func" >&2
+    exit 1
+fi
+echo "PASS x86-64 asm-goto output read from its register (no frame traffic)"
+
 # ── Contract: the accepted @cc suffix set ────────────────────────────────────
 # Measured: gcc accepts exactly these 28 suffixes and rejects everything else
 # with `unknown 'asm' flag output`. The table shared by the parser, setcc

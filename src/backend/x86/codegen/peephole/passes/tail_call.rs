@@ -438,6 +438,95 @@ mod tests {
         );
     }
 
+    /// `-mfunction-return=thunk-extern` spells the return
+    /// `jmp __x86_return_thunk`.  The whole peephole has to produce, for such
+    /// a function, the output it produces for the `ret` twin with that one
+    /// line respelled: a tail call where the twin has one, the same
+    /// liveness-gated folds, the same deleted saves.  (The benchmark programs
+    /// are held to this by `check_return_thunk_parity.py`.)
+    #[test]
+    fn the_return_thunk_changes_the_spelling_of_the_return_and_nothing_else() {
+        const THUNK: &str = "jmp __x86_return_thunk";
+        // A call in tail position behind a balanced frame.
+        let tail_call = [
+            "func:",
+            ".cfi_startproc",
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    pushq %rbx",
+            "    movq %rdi, %rax",
+            "    addq $1, %rax",
+            "    subq $16, %rsp",
+            "    call target",
+            "    movq -16(%rbp), %rbx",
+            "    movq %rbp, %rsp",
+            "    popq %rbp",
+            "    {ret}",
+            ".cfi_endproc",
+            ".size func, .-func",
+        ]
+        .join("\n")
+            + "\n";
+        // A field read through a pointer reloaded from its stack slot: four
+        // instructions that fold to two once %rax and %rdx are known dead
+        // behind the load, which takes liveness across the branch and to
+        // both returns.
+        let field_load = [
+            "g:",
+            ".cfi_startproc",
+            "    # LCCC_RET_RDX 0",
+            "    # LCCC_RET_RAX 1",
+            "    subq $56, %rsp",
+            "    movq %rdi, 48(%rsp)",
+            "    call first",
+            "    # LCCC_CALL_ARGS 0",
+            "    # LCCC_CALL_FP 0",
+            "    movq 48(%rsp), %rax",
+            "    leaq 152(%rax), %rax",
+            "    movq %rax, %rdx",
+            "    movq (%rdx), %r11",
+            "    testq %r11, %r11",
+            "    je .Lnone",
+            "    movq 48(%rsp), %rdi",
+            "    call second",
+            "    # LCCC_CALL_ARGS 1",
+            "    # LCCC_CALL_FP 0",
+            "    movl $1, %eax",
+            "    addq $56, %rsp",
+            "    {ret}",
+            ".Lnone:",
+            "    xorl %eax, %eax",
+            "    addq $56, %rsp",
+            "    {ret}",
+            ".cfi_endproc",
+            ".size g, .-g",
+        ]
+        .join("\n")
+            + "\n";
+        for (name, text, proof) in [
+            ("tail call", &tail_call, "jmp target"),
+            ("field load", &field_load, "movq 152(%rax), %r11"),
+        ] {
+            let plain = peephole_optimize(text.replace("{ret}", "ret"));
+            let thunk = peephole_optimize(text.replace("{ret}", THUNK));
+            assert!(
+                plain.contains(proof),
+                "{name}: the ret twin lost `{proof}`:\n{plain}"
+            );
+            assert_eq!(
+                thunk.replace(THUNK, "ret"),
+                plain,
+                "{name}: the thunk build differs from the ret build"
+            );
+            // A return the peephole kept stays a jump to the thunk: no pass
+            // may write a bare `ret` into a function built without them.
+            assert!(
+                !thunk.lines().any(|line| line.trim() == "ret"),
+                "{name}: a bare ret in the thunk build:\n{thunk}"
+            );
+        }
+    }
+
     #[test]
     fn test_no_tail_call_when_store_based_saves_leave_displacement() {
         // STACK-WINDOW SOUNDNESS REGRESSION TEST (renamed from the former

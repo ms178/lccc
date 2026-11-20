@@ -1016,6 +1016,15 @@ pub(crate) fn is_liveness_call_like(inst: &Instruction) -> bool {
 /// Reordering an explicit basic block is semantics-preserving: every block
 /// has an explicit terminator and labels are stable. No loads, stores, or
 /// extra copies.
+///
+/// "Next to" is behind the predecessor for an edge of its terminator: the
+/// predecessor falls into the edge block, or jumps over it to its other arm.
+/// The edge of an asm goto's label is a jump inside the template, which is
+/// there wherever the edge block lies; right behind the asm goto the block
+/// would only stand between the asm and what it falls through into, and put a
+/// `jmp` on that path (`asm goto(... : out); x = f(); out:` jumped over the
+/// label's copies to reach the call).  Such a block goes to the first place
+/// behind its predecessor where no block falls into the next one.
 pub fn place_edge_copy_blocks(func: &mut IrFunction) -> usize {
     let n = func.blocks.len();
     if n < 3 {
@@ -1025,6 +1034,8 @@ pub fn place_edge_copy_blocks(func: &mut IrFunction) -> usize {
     let (preds, _succs) = analysis::build_cfg(func, &label_map);
 
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // The edge blocks only an asm goto's label in the predecessor leads to.
+    let mut jumped_to: Vec<Vec<usize>> = Vec::new();
     let mut is_edge_copy = vec![false; n];
     for (block_idx, edge_flag) in is_edge_copy.iter_mut().enumerate().skip(1) {
         let block = &func.blocks[block_idx];
@@ -1050,7 +1061,14 @@ pub fn place_edge_copy_blocks(func: &mut IrFunction) -> usize {
         if pred_idx == block_idx || pred_idx >= n {
             continue;
         }
-        children[pred_idx].push(block_idx);
+        if terminator_names(&func.blocks[pred_idx].terminator, block.label) {
+            children[pred_idx].push(block_idx);
+        } else {
+            if jumped_to.is_empty() {
+                jumped_to.resize(n, Vec::new());
+            }
+            jumped_to[pred_idx].push(block_idx);
+        }
         *edge_flag = true;
     }
     if !is_edge_copy.iter().any(|&v| v) {
@@ -1079,16 +1097,33 @@ pub fn place_edge_copy_blocks(func: &mut IrFunction) -> usize {
         }
     }
 
+    let labels: Vec<BlockId> = func.blocks.iter().map(|b| b.label).collect();
     let old_blocks = std::mem::take(&mut func.blocks);
     let mut blocks: Vec<Option<BasicBlock>> = old_blocks.into_iter().map(Some).collect();
     let mut emitted = vec![false; n];
-    let mut reordered = Vec::with_capacity(n);
+    let mut reordered: Vec<BasicBlock> = Vec::with_capacity(n);
+    // Blocks an asm goto's label leads to, waiting for a place where the
+    // block placed last does not fall into the one placed next.
+    let mut waiting: Vec<usize> = Vec::new();
     for (idx, &edge_copy) in is_edge_copy.iter().enumerate() {
-        if !edge_copy {
-            emit_block_and_edges(idx, &children, &mut blocks, &mut emitted, &mut reordered);
+        if edge_copy {
+            continue;
+        }
+        if !waiting.is_empty()
+            && !reordered
+                .last()
+                .is_some_and(|last| terminator_names(&last.terminator, labels[idx]))
+        {
+            for jumped in waiting.drain(..) {
+                emit_block_and_edges(jumped, &children, &mut blocks, &mut emitted, &mut reordered);
+            }
+        }
+        emit_block_and_edges(idx, &children, &mut blocks, &mut emitted, &mut reordered);
+        if let Some(list) = jumped_to.get(idx) {
+            waiting.extend_from_slice(list);
         }
     }
-    for idx in 0..n {
+    for idx in waiting.into_iter().chain(0..n) {
         emit_block_and_edges(idx, &children, &mut blocks, &mut emitted, &mut reordered);
     }
     debug_assert_eq!(reordered.len(), n);
@@ -1106,6 +1141,13 @@ pub fn place_edge_copy_blocks(func: &mut IrFunction) -> usize {
     moved
 }
 
+/// Whether `terminator` has an edge to `label`.
+fn terminator_names(terminator: &Terminator, label: BlockId) -> bool {
+    let mut names = false;
+    terminator.for_each_target(|target| names |= target == label);
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1160,101 @@ mod tests {
             source_spans: Vec::new(),
             source_inline_ids: Vec::new(),
         }
+    }
+
+    fn asm_goto_to(label: u32) -> Instruction {
+        Instruction::InlineAsm {
+            template: "jnz %l0".into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![("out".into(), BlockId(label))],
+            input_symbols: vec![],
+            seg_overrides: vec![],
+        }
+    }
+    fn copy(dest: u32, value: i32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(dest),
+            src: Operand::Const(IrConst::I32(value)),
+        }
+    }
+    fn placed(blocks: Vec<BasicBlock>) -> (usize, Vec<u32>) {
+        let mut func = IrFunction::new("edge_layout".to_string(), IrType::I32, vec![], false);
+        func.blocks = blocks;
+        let moved = place_edge_copy_blocks(&mut func);
+        (moved, func.blocks.iter().map(|b| b.label.0).collect())
+    }
+
+    /// `asm goto(... : out); x = f(); out:` after phi elimination: block 9
+    /// carries the copies of the label's edge.  Behind the asm goto it stood
+    /// between the asm and the call, which then took a `jmp` to get to.
+    #[test]
+    fn an_asm_goto_label_edge_block_is_not_placed_ahead_of_the_fallthrough() {
+        let (moved, order) = placed(vec![
+            block(0, vec![asm_goto_to(9)], Terminator::Branch(BlockId(1))),
+            block(1, vec![copy(10, 2)], Terminator::Branch(BlockId(2))),
+            block(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(10)))),
+            ),
+            block(9, vec![copy(10, 1)], Terminator::Branch(BlockId(2))),
+        ]);
+        // 0 falls into 1 and 1 into 2; behind the return nothing falls on.
+        assert_eq!(order, [0, 1, 2, 9]);
+        assert_eq!(moved, 0);
+    }
+
+    /// It is placed at the first break behind its predecessor, not at the
+    /// function's end, where the values its copies read would stay live
+    /// across everything in between.
+    #[test]
+    fn an_asm_goto_label_edge_block_goes_to_the_first_break_behind_it() {
+        let (moved, order) = placed(vec![
+            block(
+                0,
+                vec![],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(1, vec![asm_goto_to(9)], Terminator::Branch(BlockId(2))),
+            block(2, vec![], Terminator::Return(None)),
+            block(3, vec![], Terminator::Branch(BlockId(4))),
+            block(
+                4,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(10)))),
+            ),
+            block(9, vec![copy(10, 1)], Terminator::Branch(BlockId(4))),
+        ]);
+        // 1 falls into 2; 2 returns, so the block fits ahead of 3.
+        assert_eq!(order, [0, 1, 2, 9, 3, 4]);
+        assert_eq!(moved, 1);
+    }
+
+    /// An edge of the terminator is still placed behind its predecessor, in
+    /// a block with an asm goto as in any other: block 8 carries the copies
+    /// of the way the asm falls through, block 4 those of its label.
+    #[test]
+    fn a_terminator_edge_block_stays_behind_its_predecessor() {
+        let (moved, order) = placed(vec![
+            block(0, vec![asm_goto_to(4)], Terminator::Branch(BlockId(8))),
+            block(
+                1,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(10)))),
+            ),
+            block(4, vec![copy(10, 4)], Terminator::Branch(BlockId(1))),
+            block(8, vec![copy(10, 1)], Terminator::Branch(BlockId(1))),
+        ]);
+        // 0 falls into 8 and 8 into 1; 4 follows the return.
+        assert_eq!(order, [0, 8, 1, 4]);
+        assert_eq!(moved, 2);
     }
 
     #[test]

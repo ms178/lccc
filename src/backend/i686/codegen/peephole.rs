@@ -1066,6 +1066,14 @@ fn classify_line(raw: &str) -> LineInfo {
                 if s.contains("indirect_thunk") || s.contains("*%") {
                     return line_info(LineKind::JmpIndirect, ts);
                 }
+                // The return of a `-mfunction-return=thunk-extern` function
+                // that pops nothing but its return address: a `ret` in every
+                // respect (`RETURN_THUNK_JUMP`).  The `_ecx` thunk of a
+                // callee-pops return stays a jump: it reads the return address
+                // from %ecx, which no return does.
+                if s == RETURN_THUNK_JUMP {
+                    return line_info(LineKind::Ret, ts);
+                }
                 return line_info(LineKind::Jmp, ts);
             }
         }
@@ -1263,6 +1271,7 @@ fn parse_jmp_target(s: &str) -> Option<&str> {
 use crate::backend::peephole_common::{
     LineStore, SectionKind, SectionSwitch, SectionTracker, section_switch,
 };
+use crate::backend::x86_common::RETURN_THUNK_JUMP;
 
 // ── Trimmed line helper ──────────────────────────────────────────────────────
 
@@ -1364,7 +1373,7 @@ fn flag_use(insn: &str) -> FlagUse {
             FlagUse::Kills
         };
     }
-    if m == "ret" || m == "retl" {
+    if m == "ret" || m == "retl" || insn == RETURN_THUNK_JUMP {
         return FlagUse::Kills;
     }
     for p in ["j", "set", "cmov", "fcmov"] {
@@ -17223,6 +17232,32 @@ fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-mfunction-return=thunk-extern`: a function that pops nothing but its
+    /// return address returns by `jmp __x86_return_thunk`, and that line is
+    /// its `ret` to every pass (flags are dead behind it, %eax/%edx are read,
+    /// nothing follows).  The callee-pops form jumps to another thunk with the
+    /// return address in %ecx; no return reads %ecx, so it stays a jump.
+    #[test]
+    fn the_plain_return_thunk_jump_is_a_return() {
+        assert_eq!(
+            classify_line("    jmp __x86_return_thunk").kind,
+            LineKind::Ret
+        );
+        assert_eq!(classify_line("    ret").kind, LineKind::Ret);
+        assert_eq!(classify_line("    ret $4").kind, LineKind::RetN);
+        for other in [
+            "    jmp __x86_return_thunk_ecx",
+            "    jmp __x86_return_thunk@PLT",
+            "    jmp .LBB3",
+        ] {
+            assert_eq!(classify_line(other).kind, LineKind::Jmp, "{other}");
+        }
+        assert_eq!(flag_use("jmp __x86_return_thunk"), FlagUse::Kills);
+        assert_eq!(flag_use("ret"), FlagUse::Kills);
+        assert_eq!(flag_use("jmp __x86_return_thunk_ecx"), FlagUse::Unknown);
+        assert_eq!(flag_use("jmp .LBB3"), FlagUse::Unknown);
+    }
 
     /// The staging copy is made only when `s` starts `movl ` or `xorl `, and
     /// `staging_line_text` hands `""` to a reader in every other case. That is
