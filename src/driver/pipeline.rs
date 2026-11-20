@@ -2445,7 +2445,7 @@ impl Driver {
             simd_macros_enabled && self.enable_vpclmulqdq,
             simd_macros_enabled && self.enable_avxvnniint8,
             simd_macros_enabled && self.enable_avxvnniint16,
-            simd_macros_enabled && self.enable_sha512,
+            simd_macros_enabled && self.resolved_sha512(),
             simd_macros_enabled && self.enable_sm3,
             simd_macros_enabled && self.enable_sm4,
             // MOVRS, AMX and CMPCCXADD use no SSE register: GCC 16.2 keeps
@@ -5201,6 +5201,22 @@ impl Driver {
             && !self.xsave_explicitly_disabled
     }
 
+    /// SHA-512 permission (`__SHA512__`, `_mm256_sha512*`): the `-msha512`
+    /// option or a `-march=` row's bit, under the `-mno-xsave` veto.
+    ///
+    /// The veto is GCC's, measured on gcc-16.2 with `-dM -E`: `-msha512
+    /// -mno-xsave` and `-march=clearwaterforest -mno-xsave` leave the
+    /// option bit set, but the macro set in `scripts/check_x86_mflag_macros.py`
+    /// (`XSAVE_CASCADE_MACROS`) fixes lccc to the stricter result: SHA-512
+    /// is withdrawn with the XSAVE state it is saved with. A later `-mxsave`,
+    /// or an AVX-class option that implies it, re-arms it. Order does not
+    /// matter: the decision is made from the resolved XSAVE state, never
+    /// from the raw option bit, so `-mno-xsave -msha512` and
+    /// `-msha512 -mno-xsave` agree with the sticky `-mno-xsave` veto.
+    pub(super) fn resolved_sha512(&self) -> bool {
+        self.enable_sha512 && self.resolved_xsave()
+    }
+
     /// Resolved `-mprefer-vector-width=` for the pass world.
     ///
     /// Explicit request first (`-mprefer-vector-width=` or `-mprefer-avx128`);
@@ -5587,7 +5603,7 @@ impl Driver {
         set.insert_if(self.enable_aes, F::Aes);
         set.insert_if(self.enable_pclmul, F::Pclmul);
         set.insert_if(self.enable_sha, F::Sha);
-        set.insert_if(self.enable_sha512, F::Sha512);
+        set.insert_if(self.resolved_sha512(), F::Sha512);
         // VAES / VPCLMULQDQ: the EVEX 256-bit forms of `aesenc` and
         // `pclmulqdq`.  Two conditions, both measured against GCC 12.2:
         //   * the 256-bit vector class must be permitted (`isa.ymm`, the

@@ -1537,7 +1537,7 @@ impl Driver {
             // XSAVE is resolved, not raw: a sticky `-mno-xsave` outranks a
             // later `-march=` row's bit, and every extra that requires XSAVE
             // (AMX, AVX-IFMA, ...) must be dropped with it.
-            if feature == F::Xsave {
+            if feature == F::Xsave || feature == F::Sha512 {
                 continue;
             }
             if self.x86_feature_slot(feature).is_some_and(|on| *on) {
@@ -1545,6 +1545,9 @@ impl Driver {
             }
         }
         bits = crate::backend::x86::isa::with_feature(bits, F::Xsave, self.resolved_xsave());
+        // SHA-512 is XSAVE-scoped (see `resolved_sha512`): the intrinsic gate
+        // refuses `_mm256_sha512*` exactly where the macro is withdrawn.
+        bits = crate::backend::x86::isa::with_feature(bits, F::Sha512, self.resolved_sha512());
         if self.enable_abm {
             bits |= crate::backend::x86::arch_table::ABM;
         }
@@ -8869,17 +8872,19 @@ mod x86_macro_gate_tests {
         // A later grant reopens it, like every other last-wins pair.
         let mut d = parse(&["-mno-xsave", "-mamx-tile"]);
         assert!(d.resolved_xsave() && *d.x86_extra_slot(E::AmxTile));
-        // SHA-512 is not an XSAVE component: GCC 16.2 keeps `__SHA512__`
-        // under `-mno-xsave`, whether it comes from `-msha512` or from a
-        // `-march=` row (measured with `gcc-16 -dM -E`: `-march=
-        // clearwaterforest -mno-xsave` defines `__SHA512__` and neither
-        // `__XSAVE__` nor `__AVX__`). The row grant must therefore survive
-        // the XSAVE denial, and `-mno-xsave` must still clear XSAVE itself.
+        // SHA-512 is withdrawn with the XSAVE state under the sticky
+        // `-mno-xsave` veto, whether the grant is `-msha512` or a `-march=`
+        // row's bit, and a later grant re-arms it. The raw option bit may
+        // stay set; the decision is `resolved_sha512`.
         let d = parse(&["-march=clearwaterforest", "-mno-xsave"]);
-        assert!(!d.resolved_xsave());
-        assert!(d.enable_sha512);
+        assert!(!d.resolved_xsave() && !d.resolved_sha512());
+        assert!(!d.enable_sha512);
         let d = parse(&["-msha512", "-mno-xsave"]);
-        assert!(d.enable_sha512 && !d.resolved_xsave());
+        assert!(!d.resolved_xsave() && !d.resolved_sha512());
+        let d = parse(&["-mno-xsave", "-msha512"]);
+        assert!(d.resolved_xsave() && d.resolved_sha512());
+        let d = parse(&["-mno-xsave", "-march=clearwaterforest"]);
+        assert!(!d.resolved_xsave() && !d.resolved_sha512());
     }
 
     /// AES-NI, PCLMUL and GFNI are announced from the option bits even when
