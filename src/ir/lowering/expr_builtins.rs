@@ -3652,8 +3652,15 @@ impl Lowerer {
                 .and_then(|value| value.to_i64())
                 .is_some_and(|value| (0..(1i64 << bits)).contains(&value));
             if !in_range {
+                // GCC 16.2 spells the article from the number ("a 1-bit",
+                // "a 2-bit", "an 8-bit"); a fixed "an" was wrong for 1 and 2.
+                let article = if bits == 8 || bits == 11 || bits == 18 {
+                    "an"
+                } else {
+                    "a"
+                };
                 return self.reject_builtin_call(
-                    format!("the last argument to '{name}' must be an {bits}-bit immediate"),
+                    format!("the last argument to '{name}' must be {article} {bits}-bit immediate"),
                     args,
                     16,
                 );

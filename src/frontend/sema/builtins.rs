@@ -1202,6 +1202,13 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_sha1rnds4",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1rnds4128),
     );
+    // The public SHA-1 round name carries the immediate check (see
+    // `x86_lane_immediate_bits`), so a bad immediate is reported against
+    // `_mm_sha1rnds4_epu32`, as GCC 16.2 does, not the internal builtin.
+    m.insert(
+        "_mm_sha1rnds4_epu32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1rnds4128),
+    );
     m.insert(
         "__builtin_ia32_sha1nexte",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1nexte128),

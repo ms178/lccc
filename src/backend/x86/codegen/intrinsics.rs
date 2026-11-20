@@ -3974,7 +3974,7 @@ impl X86Codegen {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     // args[1] is the immediate value
-                    let imm = self.operand_to_imm_i64(&args[1]);
+                    let imm = self.pinned_imm_i64(&args[1], "aeskeygenassist");
                     self.state
                         .emit_fmt(format_args!("    aeskeygenassist ${}, %xmm0, %xmm0", imm));
                     self.sse_store_dest(dptr, "xmm0");
@@ -4019,7 +4019,7 @@ impl X86Codegen {
                     );
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
-                    let imm = self.operand_to_imm_i64(&args[2]);
+                    let imm = self.pinned_imm_i64(&args[2], "sha1rnds4");
                     self.state
                         .emit_fmt(format_args!("    sha1rnds4 ${}, %xmm1, %xmm0", imm));
                     self.sse_store_dest(dptr, "xmm0");
@@ -4043,7 +4043,7 @@ impl X86Codegen {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
-                    let imm = self.operand_to_imm_i64(&args[2]);
+                    let imm = self.pinned_imm_i64(&args[2], "pclmulqdq");
                     self.state
                         .emit_fmt(format_args!("    pclmulqdq ${}, %xmm1, %xmm0", imm));
                     self.sse_store_dest(dptr, "xmm0");
@@ -4124,7 +4124,7 @@ impl X86Codegen {
                     // args = [a, b, imm8]; result = blend words per imm8 bits
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
-                    let imm = self.operand_to_imm_i64(&args[2]);
+                    let imm = self.pinned_imm_i64(&args[2], "pblendw");
                     self.state
                         .emit_fmt(format_args!("    pblendw ${}, %xmm1, %xmm0", imm));
                     self.sse_store_dest(dptr, "xmm0");

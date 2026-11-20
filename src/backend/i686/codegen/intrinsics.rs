@@ -663,7 +663,7 @@ impl I686Codegen {
                 if let Some(dptr) = dest_ptr {
                     self.operand_to_eax(&args[0]);
                     self.state.emit("    movdqu (%eax), %xmm0");
-                    let imm = Self::operand_to_imm_i64(&args[1]);
+                    let imm = Self::pinned_imm_i64(&args[1], "aeskeygenassist");
                     self.state
                         .emit_fmt(format_args!("    aeskeygenassist ${}, %xmm0, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
@@ -678,7 +678,7 @@ impl I686Codegen {
                     self.state.emit("    movdqu (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);
                     self.state.emit("    movdqu (%eax), %xmm1");
-                    let imm = Self::operand_to_imm_i64(&args[2]);
+                    let imm = Self::pinned_imm_i64(&args[2], "pclmulqdq");
                     self.state
                         .emit_fmt(format_args!("    pclmulqdq ${}, %xmm1, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
@@ -1160,7 +1160,7 @@ impl I686Codegen {
             // Pblendw (SSE4.1): _mm_blend_epi16(a, b, imm8) → pblendw $imm8, %xmm1, %xmm0.
             IntrinsicOp::Pblendw128 => {
                 if let Some(dptr) = dest_ptr {
-                    let imm = Self::operand_to_imm_i64(&args[2]);
+                    let imm = Self::pinned_imm_i64(&args[2], "pblendw");
                     self.operand_to_eax(&args[0]);
                     self.state.emit("    movdqu (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);

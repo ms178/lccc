@@ -1708,6 +1708,16 @@ impl I686Codegen {
         }
     }
 
+    /// Pinned-immediate form of `operand_to_imm_i64`: a non-constant is a
+    /// lowering bug, so fail loudly rather than emit immediate 0.
+    pub(super) fn pinned_imm_i64(op: &Operand, what: &str) -> i64 {
+        assert!(
+            matches!(op, Operand::Const(_)),
+            "{what} immediate must be a compile-time constant"
+        );
+        Self::operand_to_imm_i64(op)
+    }
+
     /// Load an F128 (long double) operand onto the x87 FPU stack.
     pub(super) fn emit_f128_load_to_x87(&mut self, op: &Operand) {
         match op {

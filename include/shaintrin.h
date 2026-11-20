@@ -56,9 +56,16 @@ _mm_sha1msg2_epu32(__m128i __A, __m128i __B)
 /* SHA1RNDS4: four SHA-1 rounds.  The immediate selects the round function
  * and constant (0..3) and must be a compile-time constant, so this is a
  * macro, as in GCC's unoptimised header. */
-#define _mm_sha1rnds4_epu32(A, B, I)                                      \
-    ((__m128i)(__builtin_ia32_sha1rnds4((__ccc_sha_v4si)(A),               \
-                                        (__ccc_sha_v4si)(B), (I))))
+static __inline__ __m128i __attribute__((__always_inline__, target("sha")))
+_mm_sha1rnds4_epu32(__m128i __A, __m128i __B, const int __I)
+{
+    switch (__I & 3) {
+    case 0: return (__m128i)__builtin_ia32_sha1rnds4((__ccc_sha_v4si)__A, (__ccc_sha_v4si)__B, 0);
+    case 1: return (__m128i)__builtin_ia32_sha1rnds4((__ccc_sha_v4si)__A, (__ccc_sha_v4si)__B, 1);
+    case 2: return (__m128i)__builtin_ia32_sha1rnds4((__ccc_sha_v4si)__A, (__ccc_sha_v4si)__B, 2);
+    default: return (__m128i)__builtin_ia32_sha1rnds4((__ccc_sha_v4si)__A, (__ccc_sha_v4si)__B, 3);
+    }
+}
 
 /* ========================================================================
  * SHA-256

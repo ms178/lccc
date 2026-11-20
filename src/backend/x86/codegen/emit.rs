@@ -5493,6 +5493,18 @@ impl X86Codegen {
         }
     }
 
+    /// An immediate the frontend pins to a constant (`x86_lane_immediate_bits`
+    /// and the `-O0` pinning in lowering). A non-constant here is a lowering
+    /// bug: `operand_to_imm_i64` would return 0 and the instruction would
+    /// silently take a wrong immediate, so this fails loudly instead.
+    pub(super) fn pinned_imm_i64(&self, op: &Operand, what: &str) -> i64 {
+        assert!(
+            matches!(op, Operand::Const(_)),
+            "{what} immediate must be a compile-time constant"
+        );
+        self.operand_to_imm_i64(op)
+    }
+
     /// Emit comment annotations for callee-saved registers listed in inline asm
     /// clobber lists. The peephole pass's `eliminate_unused_callee_saves` scans
     /// function bodies for textual register references (e.g., "%rbx") to decide

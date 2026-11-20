@@ -304,8 +304,26 @@ cat >"$tmp/lane_idx.c" <<'SRC'
 #include <immintrin.h>
 __m256i ins_var(__m256i a, __m128i b, int k) { return _mm256_inserti128_si256(a, b, k); }
 SRC
-reject lane_imm.c 'must be an 1-bit immediate' -mavx2
-reject lane_idx.c 'must be an 1-bit immediate' -mavx2
+reject lane_imm.c 'must be a 1-bit immediate' -mavx2
+reject lane_idx.c 'must be a 1-bit immediate' -mavx2
+# SHA1RNDS4 takes a 2-bit round selector. The diagnostic must name the public
+# _mm_sha1rnds4_epu32 (GCC 16.2 does), not the internal builtin, and it must
+# say "a 2-bit" (the article follows the number).
+cat >"$tmp/sha_imm_big.c" <<'SRC'
+#include <immintrin.h>
+__m128i sha_big(__m128i a, __m128i b) { return _mm_sha1rnds4_epu32(a, b, 4); }
+SRC
+cat >"$tmp/sha_imm_var.c" <<'SRC'
+#include <immintrin.h>
+__m128i sha_var(__m128i a, __m128i b, int k) { return _mm_sha1rnds4_epu32(a, b, k); }
+SRC
+cat >"$tmp/sha_imm_ok.c" <<'SRC'
+#include <immintrin.h>
+__m128i sha_ok(__m128i a, __m128i b) { return _mm_sha1rnds4_epu32(a, b, 3); }
+SRC
+reject sha_imm_big.c "the last argument to '_mm_sha1rnds4_epu32' must be a 2-bit immediate" -msha -msse4.1
+reject sha_imm_var.c "the last argument to '_mm_sha1rnds4_epu32' must be a 2-bit immediate" -msha -msse4.1
+accept sha_imm_ok.c sha1rnds4 -msha -msse4.1
 # Lane builtins GCC does not define must stay undeclared (no silent alias).
 cat >"$tmp/lane_alias.c" <<'SRC'
 typedef long long v4di __attribute__((vector_size(32)));
