@@ -301,7 +301,11 @@ fn functions_on_call_cycles(module: &IrModule) -> FxHashSet<String> {
                 .iter()
                 .flat_map(|b| b.instructions.iter())
                 .filter_map(|inst| match inst {
-                    Instruction::Call { func: callee, .. } => index.get(callee.as_str()).copied(),
+                    // An edge is a call the callee's body answers.
+                    Instruction::Call { func: callee, info } => index
+                        .get(callee.as_str())
+                        .copied()
+                        .filter(|&i| module.functions[i].body_answers_call(info)),
                     _ => None,
                 })
                 .collect();
@@ -2494,7 +2498,39 @@ fn inline_run_with(
         }
     }
 
+    settle_wrapped_library_calls(module);
+
     total_inlined
+}
+
+/// Give the library the plain calls no wrapper was put in front of.
+///
+/// `passes::builtin_policy::apply` leaves `assume_library` off a plain call
+/// to a name this unit wraps in a GNU extern-inline definition, so that the
+/// wrapper's checks go in before the call is folded as the library function
+/// (GCC: `avoid_folding_inline_builtin`).  The inliner has now placed every
+/// wrapper it will place; what is left calls the symbol, and from here on is
+/// the library function for every pass, this one included
+/// (`IrFunction::body_answers_call`).  GCC's switch for the same moment is
+/// `cfun->always_inline_functions_inlined`.
+pub(crate) fn settle_wrapped_library_calls(module: &mut IrModule) {
+    if module.wrapped_library_names.is_empty() {
+        return;
+    }
+    let names = std::mem::take(&mut module.wrapped_library_names);
+    for func in &mut module.functions {
+        for inst in func
+            .blocks
+            .iter_mut()
+            .flat_map(|b| b.instructions.iter_mut())
+        {
+            if let Instruction::Call { func: callee, info } = inst {
+                if !info.assume_library && names.contains(callee.as_str()) {
+                    info.assume_library = true;
+                }
+            }
+        }
+    }
 }
 
 /// After inlining, resolve input_symbols for InlineAsm instructions by tracing
@@ -5055,6 +5091,12 @@ fn find_inline_call_sites(
                 if let Some(callee_data) = callee_map.get(callee_name) {
                     // Don't inline recursive calls
                     if callee_name != &func.name {
+                        // The library's call is not the wrapper's: a GNU
+                        // extern-inline body is never put where the call
+                        // names the symbol (`IrFunction::body_answers_call`).
+                        if callee_data.is_gnu_inline_def && info.assume_library {
+                            continue;
+                        }
                         // Skip functions listed in CCC_INLINE_SKIP
                         if skip_list.iter().any(|s| s == callee_name) {
                             continue;
@@ -5791,6 +5833,9 @@ fn clone_self_recursion_sites(
         if func.is_declaration
             || func.is_always_inline
             || func.is_noinline
+            // Its own name is the symbol's there, not this body's
+            // (`IrFunction::body_answers_call`).
+            || func.is_gnu_inline_def
             || func.section.is_some()
             || skip_list.iter().any(|s| s == &func.name)
             || was_self_inlined(&func.name)

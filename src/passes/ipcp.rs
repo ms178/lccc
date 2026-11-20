@@ -127,6 +127,19 @@ pub fn run(module: &mut IrModule) -> usize {
     // Phase 1: Constant return propagation.
     // Find side-effect-free functions that always return the same constant,
     // and replace calls to them with the constant value.
+    //
+    // Every phase below puts what a body does in the place of a call that
+    // names it.  A GNU extern-inline body is not what the library's call
+    // runs (`IrFunction::body_answers_call`), so such a pair is left alone.
+    let wrappers: FxHashSet<String> = module
+        .functions
+        .iter()
+        .filter(|f| f.is_gnu_inline_def && !f.is_declaration)
+        .map(|f| f.name.clone())
+        .collect();
+    let answered = |callee: &str, info: &crate::ir::reexports::CallInfo| {
+        !(info.assume_library && wrappers.contains(callee))
+    };
     let const_returns = find_constant_return_functions(module);
     if !const_returns.is_empty() {
         for func in &mut module.functions {
@@ -137,7 +150,7 @@ pub fn run(module: &mut IrModule) -> usize {
                 let mut i = 0;
                 while i < block.instructions.len() {
                     let replace = match &block.instructions[i] {
-                        Instruction::Call { func: callee, info } => {
+                        Instruction::Call { func: callee, info } if answered(callee, info) => {
                             if let Some(dest) = info.dest {
                                 const_returns
                                     .get(callee.as_str())
@@ -179,7 +192,9 @@ pub fn run(module: &mut IrModule) -> usize {
                 let mut new_ids = Vec::with_capacity(16);
                 for (idx, inst) in block.instructions.drain(..).enumerate() {
                     let is_dead = match &inst {
-                        Instruction::Call { func, .. } => dead_calls.contains(func.as_str()),
+                        Instruction::Call { func, info } => {
+                            answered(func, info) && dead_calls.contains(func.as_str())
+                        }
                         _ => false,
                     };
                     if !is_dead {
@@ -249,6 +264,9 @@ fn evaluate_constant_calls(module: &mut IrModule) -> usize {
                 let Some(&callee_idx) = function_indices.get(callee) else {
                     continue;
                 };
+                if !module.functions[callee_idx].body_answers_call(info) {
+                    continue;
+                }
                 if info
                     .args
                     .iter()
@@ -501,6 +519,9 @@ fn eval_const_function_at(
                     }
                     Instruction::Call { func: callee, info } => {
                         let callee_idx = *function_indices.get(callee)?;
+                        if !module.functions.get(callee_idx)?.body_answers_call(info) {
+                            return None;
+                        }
                         let mut call_args = Vec::with_capacity(info.args.len());
                         for arg in &info.args {
                             call_args.push(eval_const_operand(arg, &values)?);
@@ -831,6 +852,12 @@ fn find_dead_call_functions(module: &IrModule) -> FxHashSet<String> {
 /// are too large to inline but always receive a constant argument (e.g.,
 /// `ia32_fxstate = false` when CONFIG_IA32_EMULATION is disabled).
 fn propagate_constant_arguments(module: &mut IrModule) -> usize {
+    let wrappers: FxHashSet<&str> = module
+        .functions
+        .iter()
+        .filter(|f| f.is_gnu_inline_def && !f.is_declaration)
+        .map(|f| f.name.as_str())
+        .collect();
     // Step 1: For each function name, collect the constant passed at each
     // parameter position across all call sites.
     // Maps function_name -> vec of per-param state.
@@ -896,6 +923,10 @@ fn propagate_constant_arguments(module: &mut IrModule) -> usize {
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {
+                    // The library's call passes the body nothing.
+                    if info.assume_library && wrappers.contains(callee.as_str()) {
+                        continue;
+                    }
                     if let Some(param_states) = func_param_consts.get_mut(callee.as_str()) {
                         for (i, arg) in info.args.iter().enumerate() {
                             if i >= param_states.len() {

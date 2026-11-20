@@ -146,7 +146,9 @@ pub(crate) fn inline_self_recursion(module: &mut IrModule) -> usize {
     let mut total = 0;
     for fi in 0..module.functions.len() {
         let f = &module.functions[fi];
-        if f.is_declaration || f.is_variadic || f.blocks.is_empty() {
+        // A GNU extern-inline body does not call itself: see
+        // `IrFunction::body_answers_call`.
+        if f.is_declaration || f.is_variadic || f.blocks.is_empty() || f.is_gnu_inline_def {
             continue;
         }
         let calls = self_call_sites(f).len();
