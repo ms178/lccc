@@ -1322,6 +1322,15 @@ fn select_inline_site(
                 && is_hot_leaf_candidate(callee_data)
                 && (devirtualized_callees.contains(&site.callee_name)
                     || (hot_direct && callee_data.is_static_inline && !caller_at_absolute_cap)))
+                // A declared-`inline` leaf on a conditional path of a loop
+                // (`if (j < n && smaller(a, b))` in a sift loop): GCC inlines
+                // it, and it is what the nested-inline budget otherwise leaves
+                // as a call on every sift step. Still charged to the budget.
+                || (hot_direct
+                    && !caller_at_absolute_cap
+                    && loop_blocks.contains(&site.block_idx)
+                    && is_hot_leaf_candidate(callee_data)
+                    && callee_data.is_static_inline)
                 || (hot_direct
                     && !caller_at_absolute_cap
                     && loop_blocks.contains(&site.block_idx)

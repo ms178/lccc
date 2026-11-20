@@ -26,6 +26,23 @@ def checked(argv):
     return result.stdout
 
 
+def huffman_merge_calls(lccc, flags, work):
+    """Return the call instructions left in huffman_merge by lccc at `flags`.
+
+    The sift step `if (j < n && smaller(...))` is a conditional call inside
+    the heap loop. A declared-inline leaf on that path must be inlined, not
+    kept as a call per step (measured: 3 calls at -O2/-O3 before the
+    conditional-loop tier of the inliner; 0 after)."""
+    asm = Path(work) / "huffman_merge.s"
+    checked([lccc, *flags, "-S", str(SOURCE), "-o", str(asm)])
+    text = asm.read_text()
+    match = re.search(r"^huffman_merge:\n(.*?)^\s*\.size\s+huffman_merge\b", text,
+                      re.S | re.M)
+    if match is None:
+        raise ValueError(f"{lccc} {' '.join(flags)}: huffman_merge body not found")
+    return re.findall(r"^\s*call[lq]?\s", match.group(1), re.M)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lccc", default=str(ROOT / "target/fastbuild/lccc"))
@@ -65,6 +82,14 @@ def main():
                             raise ValueError(f"{compiler} {width} {level}: got {stdout!r}, "
                                              f"expected {EXPECTED!r}")
                         count += 1
+            # Structural contract on lccc's own inliner: the heap helpers are
+            # inlined at every optimizing level the benchmark is measured at.
+            for flags in (["-O2"], ["-O2", "-march=x86-64-v3"], ["-O3"]):
+                calls = huffman_merge_calls(args.lccc, flags, work)
+                if calls:
+                    raise ValueError(f"{args.lccc} {' '.join(flags)}: huffman_merge keeps "
+                                     f"{len(calls)} call(s) to inlinable heap helpers")
+                count += 1
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"Huffman heap contract: FAIL: {error}")
         return 1
