@@ -4004,6 +4004,7 @@ fn debug_section(name: &str, data: Vec<u8>, relocs: Vec<ObjReloc>) -> ObjSection
         sh_size: None,
         data,
         sh_addralign: 1,
+        sh_entsize: 0,
         relocs,
         comdat_group: None,
     }

@@ -174,10 +174,10 @@ pub struct SectionDirective {
     pub name: String,
     pub flags: Option<String>,
     pub section_type: Option<String>,
-    /// For sections with linked-to or group info (4th arg), e.g.
-    /// `__patchable_function_entries,"awo",@progbits,.LPFE0`
-    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
-    // Parsed for completeness; will be used for SHF_LINK_ORDER sections
+    /// The argument after the type: the entity size of a mergeable section
+    /// (`.rodata.cst16,"aM",@progbits,16`), the linked-to symbol
+    /// (`__patchable_function_entries,"awo",@progbits,.LPFE0`), or the
+    /// group signature, whichever the flags ask for first.
     pub extra: Option<String>,
     /// COMDAT group name from `.section name,"axG",@progbits,group_name,comdat`
     /// Set when flags contain 'G' and a 5th argument is "comdat".
@@ -1357,15 +1357,19 @@ fn parse_section_directive(args: &str) -> Result<AsmItem, String> {
     let section_type = parts.get(2).map(|s| s.trim().to_string());
     let extra = parts.get(3).map(|s| s.trim().to_string());
 
-    // If the flags contain 'G' (SHF_GROUP), the 4th arg is the group signature
-    // name and the 5th arg should be "comdat".
+    // The arguments after the type follow the flag letters, in GNU as's
+    // order: `M` takes the entity size, `o` the linked-to symbol, and `G`
+    // the group signature and its linkage after both
+    // (`.section n,"aMG",@progbits,16,sig,comdat`). Taking the 4th argument
+    // for the signature whatever the flags made `16` the group's name.
     let comdat_group = if let Some(ref f) = flags {
         if f.contains('G') {
-            if let Some(ref group_name) = extra {
-                let fifth = parts.get(4).map(|s| s.trim().to_string());
-                if fifth.as_deref() == Some("comdat") || fifth.is_none() {
+            let at = 3 + usize::from(f.contains('M')) + usize::from(f.contains('o'));
+            if let Some(group_name) = parts.get(at).map(|s| s.trim().to_string()) {
+                let linkage = parts.get(at + 1).map(|s| s.trim().to_string());
+                if linkage.as_deref() == Some("comdat") || linkage.is_none() {
                     // Accept both explicit "comdat" and implicit (GNU as default)
-                    Some(group_name.clone())
+                    Some(group_name)
                 } else {
                     None
                 }

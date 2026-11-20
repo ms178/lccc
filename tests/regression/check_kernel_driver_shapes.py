@@ -38,9 +38,12 @@ Each has unit tests next to its code.  This gate holds the compiled result:
           agree on one-register aggregates in every argument position;
   diag    the unused warnings and the spelling of declarator types are GCC's;
   asm     what the kernel's .S files asked of the assembler: every source in
-          the list assembles to the bytes GNU as produces, or is refused by
-          both (macro references, repeat blocks, the carry-less multiply
-          aliases, VMX).  NOP padding is not compared here: its byte pattern
+          the list assembles to the bytes and the relocations GNU as
+          produces, or is refused by both (macro references, repeat blocks,
+          the carry-less multiply aliases, VMX, nested ALTERNATIVEs, who
+          binds a branch, references into mergeable sections); and a weak
+          definition reached by `jmp`, `jcc` and `call` is still replaced
+          at link time.  NOP padding is not compared here: its byte pattern
           depends on the GNU as release, and the unit tests pin it to 2.47's.
 
     check_kernel_driver_shapes.py --lccc PATH [--gcc gcc-16]
@@ -641,6 +644,24 @@ def alternative(old, new_len):
 
 # Each source is assembled by both. They must agree: the same bytes in .text
 # and .data, or a refusal from both. Lines are joined with newlines.
+def BRANCHES_TO(name, before, after=()):
+    """Every kind of direct branch to `name`, a label of their own section,
+    with the directives that say what `name` is before or after them.
+
+    Only what every GNU as since 2.32 answers alike is asked here. How a
+    branch to `sym+N` that stays the linker's is marked (PC32, so that no
+    PLT entry is entered N bytes in) and what a `@PLT` branch to a local
+    label of another section becomes (PC32 against the section) changed
+    between releases; the unit tests pin those to 2.47.
+    """
+    return [
+        ".text", *before,
+        f"jmp {name}", f"jne {name}", f"call {name}", f"jmp {name}@PLT", f"jne {name}@PLT", f"call {name}@PLT",
+        f"loop {name}", f"jrcxz {name}",
+        f"{name}:", "ret", *after,
+    ]
+
+
 ASM_CASES = {
     # -- macro references: one pass, GNU as's idea of a name ---------------
     "adjacent": [".macro m a, b", ".byte \\a\\b", ".endm", ".data", "m 1, 2"],
@@ -755,34 +776,108 @@ ASM_CASES = {
     ],
     "skip-without-fixed-point": [".text", "0:", ".skip 5 - (1f - 0b), 0x90", "1:", "ret"],
     "skip-diverges": [".text", "0:", ".skip (1f - 0b) + 1, 0x90", "1:", "ret"],
+    # Who binds a branch. A label of the branch's own section is not always
+    # the assembler's to resolve: a weak definition can be replaced at link
+    # time, an ifunc is reached through its PLT entry, and `sym@PLT` on a
+    # global asks for the linker. Resolved here, `jmp hook` stayed with the
+    # weak `hook` whatever the link provided.
+    "branch-to-weak": BRANCHES_TO("hook", [".weak hook"]),
+    "branch-to-global": BRANCHES_TO("hook", [".globl hook"]),
+    "branch-to-hidden": BRANCHES_TO("hook", [".globl hook", ".hidden hook"]),
+    "branch-to-protected-weak": BRANCHES_TO("hook", [".weak hook", ".protected hook"]),
+    "branch-to-local": BRANCHES_TO("hook", []),
+    "branch-to-ifunc": BRANCHES_TO("hook", [".type hook, @gnu_indirect_function"]),
+    "branch-to-global-ifunc": BRANCHES_TO("hook", [".globl hook", ".type hook, @gnu_indirect_function"]),
+    # The directive counts wherever it stands: GNU as binds once it has read
+    # the file.
+    "branch-to-weak-declared-last": BRANCHES_TO("hook", [], [".weak hook"]),
+    "branch-to-hidden-declared-last": BRANCHES_TO("hook", [], [".globl hook", ".hidden hook"]),
+    "branch-to-ifunc-declared-last": BRANCHES_TO("hook", [], [".type hook, @gnu_indirect_function"]),
+    # Out of rel8 reach the jump is still the assembler's: no relocation
+    # against a global label of the jump's own section.
+    "far-branch-to-global": [
+        ".text", ".globl far, far_hidden", ".hidden far_hidden", ".weak far_weak",
+        "jmp far", "jne far", "jmp far+1", "jmp far_hidden@PLT", "jmp far@PLT", "jmp far_weak", "jmp far_local@PLT",
+        ".fill 300, 1, 0x90", "far:", "ret", "far_hidden:", "ret", "far_weak:", "ret", "far_local:", "ret",
+    ],
+    # Another section's label: the section symbol for a local one, the
+    # symbol and a PLT32 for one the linker may rebind.
+    "branch-across-sections": [
+        ".section .text.b,\"ax\"", ".globl og", ".weak ow", "ol:", "ret", "og:", "ret", "ow:", "ret",
+        ".text", "jmp ol", "jne ol", "call ol", "jmp ol+3", "loop ol", "jrcxz og",
+        "jmp og", "call og", "jmp ow", "call ow", "jmp later",
+        ".section .text.b", "later:", "ret",
+    ],
+    # A constant in a mergeable section is named by its symbol: the linker
+    # reads `section + addend` there as an entry's address, and the -4 of a
+    # RIP-relative reference is not part of one.
+    "merge-section-references": [
+        ".section .rodata.cst16.k,\"aM\",@progbits,16",
+        ".Lk1:", ".quad 0x1111111111111111, 0x1111111111111111",
+        ".Lk2:", ".quad 0x2222222222222222, 0x2222222222222222",
+        ".section .rodata.str1.1,\"aMS\",@progbits,1", ".Ls0:", ".string \"abc\"", ".Ls1:", ".string \"defg\"",
+        ".text", "movdqa .Lk1(%rip), %xmm0", "movdqa .Lk2(%rip), %xmm1", "lea .Ls1(%rip), %rax",
+        "lea .Ls1+1(%rip), %rax", "movl $.Ls1, %edi", "movl $.Ls1+2, %edi", "movq $.Lk2, %rdi", "ret",
+        ".data", ".quad .Lk2, .Ls1, .Ls1+2", ".long .Ls1 - .",
+    ],
 }
 
 
 def elf_section_bytes(path: Path, wanted=(".text", ".data")) -> dict:
-    """The contents of the named sections of an ELF64 relocatable object."""
+    """What an ELF64 relocatable object says about the named sections.
+
+    Their contents under the section's name, and under `.rela<name>` their
+    relocations as sorted `(offset, type, symbol, addend)` -- a section
+    symbol under its section's name. Two objects can agree in every byte
+    and still ask the linker for different things: a branch it may rebind
+    against one it may not, a constant named by its symbol against "twelve
+    bytes into the entry before it".
+    """
     data = path.read_bytes()
     if data[:4] != b"\x7fELF" or data[4] != 2:
         raise Failure(f"asm: {path.name} is not an ELF64 object")
-    shoff = int.from_bytes(data[40:48], "little")
-    shentsize = int.from_bytes(data[58:60], "little")
-    shnum = int.from_bytes(data[60:62], "little")
-    shstrndx = int.from_bytes(data[62:64], "little")
+
+    def field(at, width):
+        return int.from_bytes(data[at : at + width], "little")
+
+    shoff, shentsize, shnum, shstrndx = field(40, 8), field(58, 2), field(60, 2), field(62, 2)
 
     def header(index):
         base = shoff + index * shentsize
-        name, kind = (int.from_bytes(data[base + k : base + k + 4], "little") for k in (0, 4))
-        offset, size = (int.from_bytes(data[base + k : base + k + 8], "little") for k in (24, 32))
-        return name, kind, offset, size
+        return {
+            "name": field(base, 4), "type": field(base + 4, 4), "offset": field(base + 24, 8),
+            "size": field(base + 32, 8), "link": field(base + 40, 4), "info": field(base + 44, 4),
+        }
 
-    _, _, str_offset, str_size = header(shstrndx)
-    names = data[str_offset : str_offset + str_size]
+    def text(table, at):
+        start = table["offset"] + at
+        return data[start : data.index(b"\0", start)].decode()
+
+    headers = [header(index) for index in range(shnum)]
+    names = [text(headers[shstrndx], h["name"]) for h in headers]
     found = {}
-    for index in range(shnum):
-        name, kind, offset, size = header(index)
-        text = names[name : names.index(b"\0", name)].decode()
-        if text in wanted and kind != 8:  # SHT_NOBITS has no contents
-            found[text] = data[offset : offset + size]
+    for h, name in zip(headers, names):
+        if name in wanted and h["type"] != 8:  # SHT_NOBITS has no contents
+            found[name] = data[h["offset"] : h["offset"] + h["size"]]
+        if h["type"] != 4 or names[h["info"]] not in wanted:  # SHT_RELA
+            continue
+        symtab = headers[h["link"]]
+        strtab = headers[symtab["link"]]
+        entries = []
+        for at in range(h["offset"], h["offset"] + h["size"], 24):
+            info = field(at + 8, 8)
+            sym = symtab["offset"] + (info >> 32) * 24
+            if data[sym + 4] & 0xF == 3:  # STT_SECTION
+                symbol = names[field(sym + 6, 2)]
+            else:
+                symbol = text(strtab, field(sym, 4))
+            addend = int.from_bytes(data[at + 16 : at + 24], "little", signed=True)
+            entries.append((field(at, 8), info & 0xFFFFFFFF, symbol, addend))
+        found[name] = sorted(entries)
     return found
+
+
+RELOC_NAMES = {1: "64", 2: "PC32", 4: "PLT32", 10: "32", 11: "32S", 15: "PC8", 24: "PC64"}
 
 
 def assemble(tool, source: Path, obj: Path):
@@ -815,7 +910,13 @@ def check_asm(lccc: Path, gcc: str, tmp: Path, cases=None):
             def show(result):
                 if result is None:
                     return "refused"
-                return "; ".join(f"{section} {content.hex(' ')}" for section, content in sorted(result.items()))
+                return "; ".join(
+                    f"{section} " + (
+                        content.hex(" ") if isinstance(content, bytes)
+                        else " ".join(f"{off:#x}:{RELOC_NAMES.get(kind, kind)}:{sym}{add:+d}" for off, kind, sym, add in content)
+                    )
+                    for section, content in sorted(result.items())
+                )
             raise Failure(
                 f"asm: {name}: GNU as and LCCC disagree\n    source: " + " | ".join(ours)
                 + f"\n    GNU as: {show(want)}\n    LCCC:   {show(got)}"
@@ -823,6 +924,60 @@ def check_asm(lccc: Path, gcc: str, tmp: Path, cases=None):
         count += 1
     return count
 
+
+WEAK_BRANCHES = """
+	.text
+	.weak hook
+	.globl via_jmp, via_jcc, via_call
+via_jmp:
+	jmp hook
+via_jcc:
+	xorl %eax, %eax
+	testl %eax, %eax
+	je hook
+	ret
+via_call:
+	call hook
+	ret
+hook:
+	movl $1, %eax
+	ret
+	.section .note.GNU-stack,"",@progbits
+"""
+
+WEAK_BRANCHES_MAIN = """
+#include <stdio.h>
+int via_jmp(void), via_jcc(void), via_call(void);
+int hook(void) { return 2; }
+int main(void) { printf("%d %d %d\\n", via_jmp(), via_jcc(), via_call()); return 0; }
+"""
+
+
+def check_asm_link(lccc: Path, gcc: str, tmp: Path):
+    """A weak definition and the branches to it share a section; the program
+    defines the symbol again, strongly. Every branch has to reach that one."""
+    source, main = tmp / "weak-branches.s", tmp / "weak-branches-main.c"
+    source.write_text(WEAK_BRANCHES.lstrip("\n"))
+    main.write_text(WEAK_BRANCHES_MAIN)
+    seen = {}
+    for who, tool in (("GNU as", gnu_as(gcc)), ("LCCC", [lccc, "-c"])):
+        stem = tmp / f"weak-branches-{who.split()[-1].lower()}"
+        obj, exe = stem.with_suffix(".o"), stem.with_suffix(".exe")
+        p = run([*tool, source, "-o", obj])
+        if p.returncode != 0:
+            raise Failure(f"asm: {who} refuses the weak-branch source:\n{p.stderr}")
+        p = run([gcc, "-O1", "-w", main, obj, "-o", exe])
+        if p.returncode != 0:
+            raise Failure(f"asm: the weak-branch program does not link with the {who} object:\n{p.stderr}")
+        seen[who] = run([exe], timeout=30).stdout
+    if seen["GNU as"] != "2 2 2\n":
+        raise Failure(f"asm: the GNU as build of the weak-branch program prints {seen['GNU as']!r}")
+    if seen["LCCC"] != seen["GNU as"]:
+        raise Failure(
+            "asm: a branch to a weak definition was bound at assembly time: via_jmp, via_jcc, via_call "
+            f"return {seen['LCCC'].strip()} where the program's own `hook` returns 2"
+        )
+    return 1
 
 
 # --------------------------------------------------------------------------
@@ -892,6 +1047,8 @@ def self_test(lccc: Path, gcc: str, tmp: Path):
     for name, pair in {
         "planted-byte": ([".data", ".byte 1"], [".data", ".byte 2"]),
         "planted-refusal": ([".data", ".byte 1"], [".data", ".byte \\zz"]),
+        # The same bytes, another request to the linker.
+        "planted-relocation": ([".text", "call ext"], [".text", "call other"]),
     }.items():
         try:
             check_asm(lccc, gcc, tmp, {name: pair})
@@ -936,7 +1093,7 @@ def main() -> int:
             if "diag" in wanted:
                 report.append(f"diag {check_diag(lccc, args.gcc, tmp)}")
             if "asm" in wanted:
-                report.append(f"asm {check_asm(lccc, args.gcc, tmp)}")
+                report.append(f"asm {check_asm(lccc, args.gcc, tmp) + check_asm_link(lccc, args.gcc, tmp)}")
             if args.self_test:
                 report.append(f"self-test {self_test(lccc, args.gcc, tmp)} planted faults seen")
         except Failure as failure:

@@ -18,19 +18,13 @@
 
 use crate::backend::elf::{
     self as elf_mod, ELFCLASS32, ElfConfig, ObjReloc, ObjSection, ObjSymbol, SHF_ALLOC,
-    SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC,
-    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL,
-    STV_PROTECTED, SymbolTableInput, parse_section_flags, resolve_numeric_labels,
+    SHF_EXECINSTR, SHF_MERGE, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL, STB_WEAK,
+    STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN,
+    STV_INTERNAL, STV_PROTECTED, SymbolTableInput, parse_section_flags, resolve_numeric_labels,
 };
 use crate::backend::x86::assembler::parser::*;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
-// ─── Architecture trait ───────────────────────────────────────────────
-
-/// Architecture-specific behavior for x86-family ELF writers.
-///
-/// Implemented by x86-64 and i686 to provide relocation types,
-/// ELF constants, and instruction encoding.
 /// The names of a comma-separated symbol-list directive (`.weak a, b`).
 fn symbol_names(list: &str) -> impl Iterator<Item = String> + '_ {
     list.split(',')
@@ -39,6 +33,12 @@ fn symbol_names(list: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_string)
 }
 
+// ─── Architecture trait ───────────────────────────────────────────────
+
+/// Architecture-specific behavior for x86-family ELF writers.
+///
+/// Implemented by x86-64 and i686 to provide relocation types,
+/// ELF constants, and instruction encoding.
 pub trait X86Arch {
     /// Encode an instruction, returning (bytes, relocations, optional jump info).
     /// The `section_data_len` parameter is the current offset in the section.
@@ -397,6 +397,30 @@ struct JumpInfo {
     /// `66 e9/0f 8x rel32` (6/7 bytes) — one byte and one displacement
     /// position longer than the plain rows.
     prefix66: bool,
+    /// The operand was written `sym@PLT`.
+    via_plt: bool,
+    /// 64-bit code of a 64-bit object, the one place a branch that is left
+    /// to the linker is marked `PLT32` without being asked (GAS
+    /// `need_plt32_p`).
+    plt32_native: bool,
+    /// The target is not the layout's to resolve: it is undefined, in
+    /// another section, or a definition the linker may replace. Set by
+    /// `bind_jumps` once the whole input is read; such a jump keeps its near
+    /// form and its relocation, and a short-only one gets a `PC8`.
+    linker_bound: bool,
+}
+
+impl JumpInfo {
+    /// Offset of the near form's displacement field, where its relocation
+    /// sits: behind the opcode (two bytes for a `jcc`) and a dead 0x66.
+    fn field_offset(&self) -> u64 {
+        (self.offset + if self.is_conditional { 2 } else { 1 } + usize::from(self.prefix66)) as u64
+    }
+
+    /// `loop` / `jrcxz` and their kin: one encoding, a rel8.
+    fn is_short_only(&self) -> bool {
+        self.relaxed && !self.can_grow && self.long_len == self.len
+    }
 }
 
 /// Apply a source-level branch addend. Negative effective targets are
@@ -531,6 +555,9 @@ struct Section {
     jumps: Vec<JumpInfo>,
     align_markers: Vec<AlignMarker>,
     comdat_group: Option<String>,
+    /// Size of one entry, for a section declared with one
+    /// (`"aM",@progbits,16`); 0 when the source stated none.
+    entsize: u64,
     /// Whether the most recent byte-emitting item in THIS section was a
     /// complete instruction (GAS keeps `last_insn` per segment in
     /// `tc_segment_info_data`). Drives the leading plain-NOP rule for
@@ -1361,11 +1388,17 @@ pub struct ElfWriterCore<A: X86Arch> {
     previous_section: Option<usize>,
     label_positions: FxHashMap<String, (usize, u64)>,
     numeric_label_positions: FxHashMap<String, Vec<(usize, u64)>>,
-    pending_globals: Vec<String>,
-    pending_weaks: Vec<String>,
+    /// Names made external by `.globl` (and `.comm`), less the ones a later
+    /// `.local` took back. A set: every definition and every reference asks
+    /// whether a name is in it, and a list made each of those questions a
+    /// scan of all the file's globals.
+    pending_globals: FxHashSet<String>,
+    /// Names made weak by `.weak`; weak wins over `.globl` in either order
+    /// (GAS `S_SET_EXTERNAL` leaves a weak symbol weak).
+    pending_weaks: FxHashSet<String>,
     /// Symbols named by `.local` (GAS's sticky `local` flag): a later
     /// `.comm` allocates them in `.bss` as LOCAL objects.
-    local_flagged: crate::common::fx_hash::FxHashSet<String>,
+    local_flagged: FxHashSet<String>,
     /// `.bss` allocations from `.lcomm` and `.local`+`.comm`, as
     /// (name, size, alignment) in source order.  GAS places them in `.bss`
     /// subsection 1, i.e. after every ordinary `.bss` byte of the file;
@@ -1373,9 +1406,9 @@ pub struct ElfWriterCore<A: X86Arch> {
     local_commons: Vec<(String, u64, u32)>,
     pending_types: FxHashMap<String, SymbolKind>,
     pending_sizes: FxHashMap<String, SizeExpr>,
-    pending_hidden: Vec<String>,
-    pending_protected: Vec<String>,
-    pending_internal: Vec<String>,
+    /// `.hidden` / `.protected` / `.internal`: the ELF visibility of each
+    /// name they mention (`set_visibility`: the most restrictive one given).
+    pending_visibility: FxHashMap<String, u8>,
     aliases: FxHashMap<String, String>,
     /// `.set NAME, expr` where expr evaluates to a CONSTANT (possibly using
     /// `.` and same-section labels, e.g. header.S
@@ -1459,15 +1492,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
             previous_section: None,
             label_positions: FxHashMap::default(),
             numeric_label_positions: FxHashMap::default(),
-            pending_globals: Vec::new(),
-            pending_weaks: Vec::new(),
+            pending_globals: FxHashSet::default(),
+            pending_weaks: FxHashSet::default(),
             local_flagged: Default::default(),
             local_commons: Vec::new(),
             pending_types: FxHashMap::default(),
             pending_sizes: FxHashMap::default(),
-            pending_hidden: Vec::new(),
-            pending_protected: Vec::new(),
-            pending_internal: Vec::new(),
+            pending_visibility: FxHashMap::default(),
             aliases: FxHashMap::default(),
             set_values: FxHashMap::default(),
             pending_set_exprs: Vec::new(),
@@ -1597,6 +1628,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 jumps: Vec::new(),
                 align_markers: Vec::new(),
                 comdat_group: None,
+                entsize: 0,
                 last_item_was_insn: true,
             });
             self.section_map.insert(name.to_string(), idx);
@@ -1667,6 +1699,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             jumps: Vec::new(),
             align_markers: Vec::new(),
             comdat_group,
+            entsize: 0,
             last_item_was_insn: true,
         });
         self.section_map.insert(name.to_string(), idx);
@@ -1714,8 +1747,29 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 section_type = self.sections[idx].section_type;
             }
         }
+        // A mergeable section states the size of its entries; one that
+        // does not is an ordinary section, with GNU as's warning.
+        let entsize = if dir.flags.as_deref().is_some_and(|f| !f.is_empty()) {
+            match elf_mod::section_entity_size(dir.flags.as_deref(), dir.extra.as_deref()) {
+                Ok(size) => size,
+                Err(warning) => {
+                    lccc::cli::stderr_line(format_args!("warning: {warning}"));
+                    flags &= !(SHF_MERGE | elf_mod::SHF_STRINGS);
+                    0
+                }
+            }
+        } else {
+            0
+        };
         let idx =
             self.get_or_create_section(&dir.name, section_type, flags, dir.comdat_group.clone())?;
+        if entsize != 0 {
+            let section = &mut self.sections[idx];
+            if section.entsize != 0 && section.entsize != entsize {
+                return Err(format!("changed section entity size for {}", dir.name));
+            }
+            section.entsize = entsize;
+        }
         self.previous_section = self.current_section;
         self.current_section = Some(idx);
         Ok(())
@@ -1809,22 +1863,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 for part in name.split(',') {
                     let sym = part.trim();
                     if !sym.is_empty() {
-                        self.pending_globals.push(sym.to_string());
+                        self.pending_globals.insert(sym.to_string());
                     }
                 }
             }
             // Like `.globl`, each of these takes a comma-separated list in
             // GAS; `.weak a, b` used to create one symbol named "a, b".
             AsmItem::Weak(name) => self.pending_weaks.extend(symbol_names(name)),
-            AsmItem::Hidden(name) => self.pending_hidden.extend(symbol_names(name)),
-            AsmItem::Protected(name) => self.pending_protected.extend(symbol_names(name)),
-            AsmItem::Internal(name) => self.pending_internal.extend(symbol_names(name)),
+            AsmItem::Hidden(name) => self.set_visibility(name, STV_HIDDEN),
+            AsmItem::Protected(name) => self.set_visibility(name, STV_PROTECTED),
+            AsmItem::Internal(name) => self.set_visibility(name, STV_INTERNAL),
             AsmItem::Local(names) => {
                 // GAS clears external binding; a later `.globl` restores it
                 // for a defined symbol (last one wins), but not for a
                 // `.local`-flagged `.comm` (see the Comm arm).
                 for name in names {
-                    self.pending_globals.retain(|g| g != name);
+                    self.pending_globals.remove(name);
                     self.local_flagged.insert(name.clone());
                 }
             }
@@ -2235,7 +2289,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     if !align.is_power_of_two() {
                         return Err(format!(".comm {name}: alignment {align} not a power of 2"));
                     }
-                    self.pending_globals.retain(|g| g != name);
+                    self.pending_globals.remove(name);
                     self.local_commons.push((name.clone(), *size, align));
                 } else if let Some(&i) = self
                     .symbol_map
@@ -2264,7 +2318,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // A common is an external OBJECT; a definition that
                     // later replaces it stays GLOBAL and, unless `.type`
                     // says otherwise, an OBJECT (GAS).
-                    self.pending_globals.push(name.clone());
+                    self.pending_globals.insert(name.clone());
                     self.pending_types
                         .entry(name.clone())
                         .or_insert(SymbolKind::Object);
@@ -2524,10 +2578,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             sym.section = Some(sec_name);
             sym.value = offset;
         } else {
-            let binding = if self.pending_globals.contains(&name.to_string()) {
-                STB_GLOBAL
-            } else if self.pending_weaks.contains(&name.to_string()) {
+            // Weak wins over global, as in the symbol table (see
+            // `pending_weaks`).
+            let binding = if self.pending_weaks.contains(name) {
                 STB_WEAK
+            } else if self.pending_globals.contains(name) {
+                STB_GLOBAL
             } else {
                 STB_LOCAL
             };
@@ -2540,15 +2596,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 Some(SymbolKind::NoType) | None => STT_NOTYPE,
             };
 
-            let visibility = if self.pending_hidden.contains(&name.to_string()) {
-                STV_HIDDEN
-            } else if self.pending_protected.contains(&name.to_string()) {
-                STV_PROTECTED
-            } else if self.pending_internal.contains(&name.to_string()) {
-                STV_INTERNAL
-            } else {
-                STV_DEFAULT
-            };
+            let visibility = self
+                .pending_visibility
+                .get(name)
+                .copied()
+                .unwrap_or(STV_DEFAULT);
 
             let sym_idx = self.symbols.len();
             self.symbols.push(SymbolInfo {
@@ -2771,6 +2823,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     /// GAS's PC-relative data relocation for a `size`-byte field, if the
     /// target has one (ELF32 has no PC64).
+    /// The relocation computes `S + A - P`.
+    fn is_pc_relative(reloc_type: u32) -> bool {
+        reloc_type == A::reloc_pc32()
+            || reloc_type == A::reloc_plt32()
+            || reloc_type == A::reloc_pc64()
+            || A::reloc_pc16() == Some(reloc_type)
+            || A::reloc_pc8() == Some(reloc_type)
+            || A::reloc_pc8_internal() == Some(reloc_type)
+    }
+
     fn data_pc_reloc(size: usize) -> Option<u32> {
         match size {
             8 => (A::reloc_pc64() != A::reloc_pc32()).then(A::reloc_pc64),
@@ -3061,7 +3123,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
         // Register jump for relaxation if detected
         if let Some(jump_det) = result.jump {
-            if let Some((label, target_addend)) = self.get_jump_target_label(instr) {
+            if let Some((label, target_addend, via_plt)) = self.get_jump_target_label(instr) {
+                let plt32_native = self.code_mode == 64 && A::default_code_mode() == 64;
                 // `.` targets the current instruction: anchor it so the
                 // relaxation engine resolves (and shrinks) the jump.
                 let label = if label == "." {
@@ -3081,6 +3144,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         relaxed: true,
                         can_grow: false,
                         prefix66: jump_det.prefix66,
+                        via_plt,
+                        plt32_native,
+                        linker_bound: false,
                     });
                 } else if instr_len > 2 {
                     // The architecture has already identified this as a near
@@ -3096,6 +3162,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         relaxed: false,
                         can_grow: false,
                         prefix66: jump_det.prefix66,
+                        via_plt,
+                        plt32_native,
+                        linker_bound: false,
                     });
                 }
             }
@@ -3208,7 +3277,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
         name
     }
 
-    fn get_jump_target_label(&self, instr: &Instruction) -> Option<(String, i64)> {
+    /// The symbol a `jmp`/`jcc`/`loop` names, the constant added to it, and
+    /// whether it was written `sym@PLT`.
+    fn get_jump_target_label(&self, instr: &Instruction) -> Option<(String, i64, bool)> {
         // Same normalization as the encoder and the arch jump detectors:
         // GAS is case-insensitive and accepts `.s` on any mnemonic, so
         // `JMP` and `jmp.s` must register for relaxation exactly like `jmp`.
@@ -3231,12 +3302,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // records none), and both consumers need the base symbol and the
         // constant separately.  Applying the addend exactly once avoids
         // looking up a non-existent literal label named `.Ltarget+1`.
+        //
+        // `sym@PLT` names `sym`: the suffix asks for the relocation type and
+        // decides who resolves a global target (`jump_resolves_in_section`).
+        // Kept as the label, it named a symbol that does not exist, so GAS's
+        // two-byte `jmp local@PLT` stayed five bytes long.
+        let bare = crate::backend::x86::assembler::encoder::strip_plt_suffix(label);
+        let via_plt = bare.len() != label.len();
         if let Some((base, addend)) =
-            crate::backend::x86::assembler::parser::split_relocation_symbol_addend(label)
+            crate::backend::x86::assembler::parser::split_relocation_symbol_addend(bare)
         {
-            Some((base.to_string(), addend))
+            Some((base.to_string(), addend, via_plt))
         } else {
-            Some((label.clone(), 0))
+            Some((bare.to_string(), 0, via_plt))
         }
     }
 
@@ -3463,6 +3541,91 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Ok(resized)
     }
 
+    /// Tell the jumps the layout resolves from the ones it leaves to the
+    /// linker, now that every directive has been read.
+    ///
+    /// A jump was registered when its instruction was assembled, and its
+    /// target was then whatever the source had said so far. Relaxation used
+    /// to take every label of the jump's section for its own, so
+    ///
+    /// ```text
+    ///         .weak   hook
+    ///         jmp     hook            # eb 00: bound to this definition
+    /// hook:   ret
+    /// ```
+    ///
+    /// could not be overridden by a strong `hook` at link time, a jump to
+    /// an ifunc went to its resolver, and a `.weak`/`.globl` written after
+    /// the label was not seen at all. GAS decides when it lays the section
+    /// out (`md_estimate_size_before_relax`), from the symbol's final
+    /// attributes; so does this, by the same rules:
+    ///
+    /// * `jmp`/`jcc`: `jump_resolves_in_section`;
+    /// * `loop`/`jrcxz`, which have no near form to fall back on: only a
+    ///   local definition, like any other PC-relative field
+    ///   (`is_local_symbol`); the rest get a `PC8` relocation.
+    ///
+    /// A near jump that is the linker's keeps the relocation it was
+    /// assembled with, under the type GAS gives it: `PLT32` when written
+    /// `sym@PLT`, or in 64-bit code when the target is undefined, weak or
+    /// global and has no offset; else `PC32` (a `PLT32` plus an offset
+    /// would name a place inside a PLT entry).
+    fn bind_jumps(&mut self) {
+        for sec_idx in 0..self.sections.len() {
+            let mut bound = Vec::new();
+            let mut retype: FxHashMap<u64, u32> = FxHashMap::default();
+            for (j, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
+                let defined_here = match self.label_positions.get(&jump.target) {
+                    Some(&(sec, _)) => sec == sec_idx,
+                    None => self
+                        .resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                        .is_some(),
+                };
+                let short_only = jump.is_short_only();
+                let ours = defined_here
+                    && if short_only {
+                        self.is_local_symbol(&jump.target)
+                    } else {
+                        self.jump_resolves_in_section(&jump.target, jump.via_plt)
+                    };
+                if ours {
+                    continue;
+                }
+                bound.push(j);
+                if !short_only {
+                    let plt32 = jump.via_plt
+                        || (jump.plt32_native
+                            && jump.target_addend == 0
+                            && self.branch_wants_plt32(&jump.target));
+                    retype.insert(
+                        jump.field_offset(),
+                        if plt32 {
+                            A::reloc_plt32()
+                        } else {
+                            A::reloc_pc32()
+                        },
+                    );
+                }
+            }
+            let section = &mut self.sections[sec_idx];
+            for j in bound {
+                section.jumps[j].linker_bound = true;
+            }
+            if retype.is_empty() {
+                continue;
+            }
+            // A rel16 field (`.code16`) keeps its `PC16`.
+            let (pc32, plt32) = (A::reloc_pc32(), A::reloc_plt32());
+            for reloc in &mut section.relocations {
+                if reloc.reloc_type == pc32 || reloc.reloc_type == plt32 {
+                    if let Some(&ty) = retype.get(&reloc.offset) {
+                        reloc.reloc_type = ty;
+                    }
+                }
+            }
+        }
+    }
+
     /// Settle the layout: the jumps relaxed, the alignment padding fitted
     /// and every deferred `.skip` sized, each against the others' final
     /// state.
@@ -3508,6 +3671,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// GNU as's rule -- the square of the number of things that can change
     /// size -- instead of being written half-sized.
     fn settle_layout(&mut self) -> Result<(), String> {
+        self.bind_jumps();
         self.relax_jumps(Relax::FromShortest)?;
         self.fit_alignment()?;
         let resizable = self.deferred_skips.len()
@@ -4160,6 +4324,38 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // fold's (section, addend+offset) form makes linker and
                 // dynamic loader compute the wrong slot -- measured as a
                 // miscompile on both targets.
+                //
+                // A reference into a MERGEABLE section is foldable only when
+                // the folded addend is the address of the datum itself: the
+                // linker reads `section + addend` there as "the entry at
+                // this offset", finds where merging put that entry, and
+                // relocates to it. A displacement that is not the entry's
+                // offset names another entry, or none:
+                //
+                //     .section .rodata.cst16.k,"aM",@progbits,16
+                //     .Lk1: .quad 1, 1
+                //     .Lk2: .quad 2, 2
+                //     .text
+                //     movq .Lk2(%rip), %rax    # PC32  section + 0x10 - 4
+                //
+                // is the entry at 0xc, i.e. `.Lk1`, plus 12 -- twelve bytes
+                // into wherever the linker put `.Lk1`, which is `.Lk2` only
+                // while nothing was merged away in between. mold loaded the
+                // wrong constant; lld refuses the entry at -4 of the first
+                // one. So, as GAS does (`tc_i386_fix_adjustable`: no
+                // PC-relative reference to a merge section is adjusted;
+                // `adjust_reloc_syms`: none with an addend or a subtrahend),
+                // such a reference stays on its symbol, and only an absolute
+                // one to the symbol itself moves to the section. The
+                // kernel's crypto code keeps every constant it loads
+                // RIP-relative in sections like these.
+                let pinned_to_entry = (reloc.addend != 0
+                    || reloc.diff_symbol.is_some()
+                    || Self::is_pc_relative(reloc.reloc_type))
+                    && self
+                        .label_positions
+                        .get(&reloc.symbol)
+                        .is_some_and(|&(sec, _)| self.sections[sec].flags & SHF_MERGE != 0);
                 let is_foldable_local = self.label_positions.contains_key(&reloc.symbol)
                     && !self.pending_globals.contains(&reloc.symbol)
                     && !self.pending_weaks.contains(&reloc.symbol)
@@ -4168,7 +4364,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         Some(SymbolKind::GnuIndirectFunction)
                     )
                     && !A::is_tls_reloc(reloc.reloc_type)
-                    && !A::is_got_slot_reloc(reloc.reloc_type);
+                    && !A::is_got_slot_reloc(reloc.reloc_type)
+                    && !pinned_to_entry;
                 let (sym_name, mut addend) = if is_foldable_local {
                     let &(target_sec, target_off) =
                         self.label_positions.get(&reloc.symbol).unwrap();
@@ -4251,6 +4448,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // A held-back NOBITS tail is a size, not bytes.
                     sh_size: (sec.zero_tail != 0).then_some(sec.cursor()),
                     sh_addralign: sec.alignment,
+                    sh_entsize: sec.entsize,
                     relocs,
                     comdat_group: sec.comdat_group.clone(),
                 },
@@ -4443,16 +4641,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             })
             .collect();
 
-        let mut symbol_visibility: FxHashMap<String, u8> = FxHashMap::default();
-        for name in &self.pending_hidden {
-            symbol_visibility.insert(name.clone(), STV_HIDDEN);
-        }
-        for name in &self.pending_protected {
-            symbol_visibility.insert(name.clone(), STV_PROTECTED);
-        }
-        for name in &self.pending_internal {
-            symbol_visibility.insert(name.clone(), STV_INTERNAL);
-        }
+        let mut symbol_visibility: FxHashMap<String, u8> = self.pending_visibility.clone();
 
         // Three-operand `.symver` visibility flags on DEFINED plain symbols
         // (GAS 2.35+ semantics, verified against binutils):
@@ -4462,8 +4651,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         //   remove — plain name is dropped from the symbol table entirely
         //            (its relocations were already rebound to the versioned
         //            alias in build()).
-        let mut symver_removed: crate::common::fx_hash::FxHashSet<String> =
-            crate::common::fx_hash::FxHashSet::default();
+        let mut symver_removed: FxHashSet<String> = FxHashSet::default();
         let mut global_symbols = global_symbols;
         for (name, (ver, flag)) in &self.symver_flags {
             let defined = self.label_positions.contains_key(name)
@@ -4672,7 +4860,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             symbol_visibility: &symbol_visibility,
             aliases: &self.aliases,
             sections: &shared_sections,
-            include_referenced_locals: false,
+            // Every relocation against a local label was folded into its
+            // section above, except the ones that must name the symbol (a
+            // reference into a mergeable section, a TLS or GOT-slot
+            // reference). Those symbols belong in the table, `.L` or not:
+            // left out, the relocation named nothing.
+            include_referenced_locals: true,
         };
 
         let mut shared_symbols = elf_mod::build_elf_symbol_table(&symtab_input);
@@ -4837,13 +5030,21 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let mut actions: Vec<(usize, JumpAction)> = Vec::new();
                 let dbg = std::env::var("CCC_DEBUG_RELAX").is_ok();
                 for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
-                    let target_off_opt = jump_target_with_addend(
-                        local_labels.get(&jump.target).copied().or_else(|| {
-                            self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                    let target_off_opt = if jump.linker_bound {
+                        None
+                    } else {
+                        jump_target_with_addend(
+                            local_labels.get(&jump.target).copied().or_else(|| {
+                                self.resolve_numeric_label(
+                                    &jump.target,
+                                    jump.offset as u64,
+                                    sec_idx,
+                                )
                                 .map(|(_, off)| off as usize)
-                        }),
-                        jump.target_addend,
-                    );
+                            }),
+                            jump.target_addend,
+                        )
+                    };
                     if dbg {
                         lccc::cli::stderr_line(format_args!(
                             "[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?} relaxed={} growable={}",
@@ -4941,13 +5142,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.apply_jump_transitions_sequential(sec_idx, actions);
             return;
         }
-        let reloc_pos = |offset: usize, is_conditional: bool, prefix66: bool| {
-            (if is_conditional {
-                offset + 2
-            } else {
-                offset + 1
-            } + usize::from(prefix66)) as u64
-        };
         let mut edits: Vec<(usize, bool)> = actions
             .iter()
             .map(|(j, a)| (*j, matches!(a, JumpAction::Shrink)))
@@ -4959,10 +5153,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut dropped: Vec<u64> = edits
             .iter()
             .filter(|&&(_, shrink)| shrink)
-            .map(|&(j, _)| {
-                let jump = &self.sections[sec_idx].jumps[j];
-                reloc_pos(jump.offset, jump.is_conditional, jump.prefix66)
-            })
+            .map(|&(j, _)| self.sections[sec_idx].jumps[j].field_offset())
             .collect();
         if !dropped.is_empty() {
             dropped.sort_unstable();
@@ -5045,7 +5236,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             jump.len = jump.long_len;
             let rel16 = jump.long_len == if jump.is_conditional { 4 } else { 3 };
             let reloc = ElfRelocation {
-                offset: reloc_pos(jump.offset, jump.is_conditional, jump.prefix66),
+                offset: jump.field_offset(),
                 symbol: jump.target.clone(),
                 reloc_type: if rel16 {
                     A::reloc_pc16().expect("rel16 branch without architecture relocation")
@@ -5376,13 +5567,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
             if !jump.relaxed {
                 continue;
             }
-            let target = jump_target_with_addend(
-                local_labels.get(&jump.target).copied().or_else(|| {
-                    self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
-                        .map(|(_, off)| off as usize)
-                }),
-                jump.target_addend,
-            );
+            // A target the linker binds (`bind_jumps`) is no target here,
+            // wherever its label stands.
+            let target = if jump.linker_bound {
+                None
+            } else {
+                jump_target_with_addend(
+                    local_labels.get(&jump.target).copied().or_else(|| {
+                        self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                            .map(|(_, off)| off as usize)
+                    }),
+                    jump.target_addend,
+                )
+            };
             // Every relaxed/short-only jump ends with its rel8 field.
             // Use the recorded final instruction length rather than guessing
             // from the first prefix: multiple legacy prefixes are possible.
@@ -5850,25 +6047,111 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.remap_offsets(sec_idx, |off, seq| q.map(off, seq));
     }
 
-    // ─── Symbol locality check ────────────────────────────────────────
+    // ─── What the whole input made of a symbol ────────────────────────
+    //
+    // GAS binds references after it has read the file, so a `.globl`,
+    // `.weak`, `.type` or visibility directive counts wherever it stands:
+    // before the label, after it, or after the last reference. Every
+    // decision that keeps or drops a relocation therefore asks these
+    // predicates, at layout time, and none looks at the binding a symbol
+    // had when its label was defined.
 
-    fn is_local_symbol(&self, name: &str) -> bool {
-        if name.starts_with('.') {
-            return true;
-        }
-        if name.len() >= 2 {
-            let last = name.as_bytes()[name.len() - 1];
-            if (last == b'f' || last == b'b')
-                && name[..name.len() - 1].chars().all(|c| c.is_ascii_digit())
-            {
-                return true;
+    /// `.hidden a, b` and its siblings. A symbol's visibility only ever
+    /// narrows: GAS (`obj_elf_visibility`) applies a directive when the
+    /// symbol has none yet or the new one is at least as restrictive --
+    /// internal, then hidden, then protected, which is their numeric order
+    /// -- and warns otherwise. The directives used to be ranked hidden,
+    /// protected, internal where the binding was decided and the other way
+    /// round where the symbol was written, so `.hidden f` + `.protected f`
+    /// came out protected: visible to other components after all.
+    fn set_visibility(&mut self, names: &str, visibility: u8) {
+        for name in symbol_names(names) {
+            match self.pending_visibility.get(&name).copied() {
+                Some(current) if current != STV_DEFAULT && visibility > current => {
+                    lccc::cli::stderr_line(format_args!(
+                        "warning: visibility of `{name}' is already `{}'",
+                        if current == STV_HIDDEN {
+                            "hidden"
+                        } else {
+                            "internal"
+                        }
+                    ));
+                }
+                _ => {
+                    self.pending_visibility.insert(name, visibility);
+                }
             }
         }
-        if let Some(&sym_idx) = self.symbol_map.get(name) {
-            self.symbols[sym_idx].binding == STB_LOCAL
-        } else {
-            false
+    }
+
+    /// A numeric reference (`1b`, `23f`): always a local label.
+    fn is_numeric_label_ref(name: &str) -> bool {
+        match name.as_bytes() {
+            [digits @ .., b'b' | b'f'] => {
+                !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+            }
+            _ => false,
         }
+    }
+
+    /// The symbol is `STT_GNU_IFUNC`: its address is its resolver's, so no
+    /// reference to it may be resolved here, not even a local one. The
+    /// linker sends each through the PLT entry that calls the resolver.
+    fn is_ifunc(&self, name: &str) -> bool {
+        matches!(
+            self.pending_types.get(name),
+            Some(SymbolKind::GnuIndirectFunction)
+        )
+    }
+
+    /// A definition the linker cannot replace and need not see: neither
+    /// `.globl` nor `.weak`, and not an ifunc. A PC-relative reference to it
+    /// from its own section is a constant (GAS `S_FORCE_RELOC`).
+    fn is_local_symbol(&self, name: &str) -> bool {
+        Self::is_numeric_label_ref(name) || !self.is_nonfoldable_symbol(name)
+    }
+
+    /// Whether a `jmp`/`jcc` to `target`, a label of the jump's own section,
+    /// is the layout's to resolve and to shorten, or the linker's.
+    ///
+    /// GAS `elf_symbol_resolved_in_segment_p` (tc-i386.c), which is asked
+    /// when the section is laid out:
+    ///
+    /// * an ifunc goes through the PLT, always;
+    /// * a weak symbol may be replaced by a strong definition at link time;
+    /// * a global one may be preempted only through the PLT, so a jump
+    ///   written `sym@PLT` is left to the linker unless the symbol's
+    ///   visibility already rules preemption out, and a plain `jmp sym` is
+    ///   resolved here (GAS does so unless it assembles with `-shared`);
+    /// * anything else is local.
+    fn jump_resolves_in_section(&self, target: &str, via_plt: bool) -> bool {
+        if Self::is_numeric_label_ref(target) {
+            return true;
+        }
+        if self.is_ifunc(target) || self.pending_weaks.contains(target) {
+            return false;
+        }
+        if !self.pending_globals.contains(target) {
+            return true;
+        }
+        !via_plt
+            || self
+                .pending_visibility
+                .get(target)
+                .is_some_and(|&v| v != STV_DEFAULT)
+    }
+
+    /// GAS `need_plt32_p`: on x86-64 a branch the linker resolves is marked
+    /// `R_X86_64_PLT32` when its target is weak, undefined or global, and
+    /// `PC32` when it is a local definition (an ifunc, or a label of another
+    /// section).
+    fn branch_wants_plt32(&self, target: &str) -> bool {
+        self.pending_weaks.contains(target)
+            || self.pending_globals.contains(target)
+            || !(self.label_positions.contains_key(target)
+                || self.aliases.contains_key(target)
+                || self.set_values.contains_key(target)
+                || Self::is_numeric_label_ref(target))
     }
 
     // ─── Internal relocation resolution ───────────────────────────────
@@ -5996,8 +6279,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     }
 
     fn is_global_or_weak(&self, name: &str) -> bool {
-        self.pending_globals.iter().any(|g| g == name)
-            || self.pending_weaks.iter().any(|w| w == name)
+        self.pending_globals.contains(name) || self.pending_weaks.contains(name)
     }
 
     fn is_nonfoldable_symbol(&self, name: &str) -> bool {
@@ -6322,6 +6604,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let mut resolved: Vec<(usize, i64, usize)> = Vec::new(); // (offset, value, patch_size)
             let mut pc8_patches: Vec<(usize, u8)> = Vec::new();
             let mut unresolved = Vec::new();
+            // The displacement fields of the near jumps the layout resolved
+            // (`bind_jumps`). Such a jump may name a global label: it is a
+            // constant all the same, where a `call` to that label is not.
+            // A long `jmp` to a global label of its own section used to
+            // leave the object as a `PC32` against it, which a linker
+            // refuses in a shared object and GAS never emits.
+            let jump_fields: FxHashSet<u64> = self.sections[sec_idx]
+                .jumps
+                .iter()
+                .filter(|jump| !jump.relaxed && !jump.linker_bound)
+                .map(JumpInfo::field_offset)
+                .collect();
 
             for reloc in &self.sections[sec_idx].relocations {
                 // Handle SymbolDiff relocations
@@ -6422,7 +6716,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     .or_else(|| self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx));
 
                 if let Some((target_sec, target_off)) = label_pos {
-                    let is_local = self.is_local_symbol(&reloc.symbol);
+                    let is_local =
+                        self.is_local_symbol(&reloc.symbol) || jump_fields.contains(&reloc.offset);
 
                     // Same-section rel16 branches (.code16, and x86-64
                     // `data16 jmp/jcc/call`): patch the 2-byte field
@@ -6447,7 +6742,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // byte`); silently keeping disp 0 jumps into the next
                     // instruction instead.
                     if let Some(pc8_type) = A::reloc_pc8_internal() {
-                        if reloc.reloc_type == pc8_type && target_sec == sec_idx {
+                        if reloc.reloc_type == pc8_type && target_sec == sec_idx && is_local {
                             let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
                             if !(-128..=127).contains(&rel) {
                                 return Err(Self::pc8_range_error(rel, reloc.offset));
@@ -8578,6 +8873,382 @@ ret
         let obj = assemble_object(".data\n.zero 64\n");
         assert_eq!(section_bytes(&obj, ".data").unwrap().len(), 64);
     }
+
+    /// `(name, sh_flags, sh_entsize)` of every section of an ELF64 object,
+    /// in index order.
+    fn section_headers(obj: &[u8]) -> Vec<(String, u64, u64)> {
+        let field = |at: usize, width: usize| {
+            obj[at..at + width]
+                .iter()
+                .rev()
+                .fold(0u64, |v, &b| v << 8 | u64::from(b))
+        };
+        let (shoff, shentsize) = (field(40, 8) as usize, field(58, 2) as usize);
+        let (shnum, shstrndx) = (field(60, 2) as usize, field(62, 2) as usize);
+        let names = field(shoff + shstrndx * shentsize + 24, 8) as usize;
+        (0..shnum)
+            .map(|i| {
+                let header = shoff + i * shentsize;
+                let start = names + field(header, 4) as usize;
+                let len = obj[start..].iter().position(|&b| b == 0).unwrap();
+                let name = String::from_utf8_lossy(&obj[start..start + len]).into_owned();
+                (name, field(header + 8, 8), field(header + 56, 8))
+            })
+            .collect()
+    }
+
+    /// `(name, st_info, st_other, st_shndx)` of every symbol of an ELF64
+    /// object, in index order.
+    fn symbols(obj: &[u8]) -> Vec<(String, u8, u8, u16)> {
+        let symtab = section_bytes(obj, ".symtab").expect("symbol table");
+        let strtab = section_bytes(obj, ".strtab").expect("string table");
+        symtab
+            .chunks_exact(24)
+            .map(|sym| {
+                let start = u32::from_le_bytes(sym[0..4].try_into().unwrap()) as usize;
+                let len = strtab[start..].iter().position(|&b| b == 0).unwrap();
+                let name = String::from_utf8_lossy(&strtab[start..start + len]).into_owned();
+                (name, sym[4], sym[5], u16::from_le_bytes([sym[6], sym[7]]))
+            })
+            .collect()
+    }
+
+    /// `(r_offset, r_type, symbol, r_addend)` of every entry of an ELF64
+    /// RELA section, by offset; a section symbol goes by its section's
+    /// name. Empty when the object has no such section.
+    fn rela_entries(obj: &[u8], name: &str) -> Vec<(u64, u32, String, i64)> {
+        let Some(rela) = section_bytes(obj, name) else {
+            return Vec::new();
+        };
+        let (symbols, sections) = (symbols(obj), section_headers(obj));
+        let mut entries: Vec<_> = rela
+            .chunks_exact(24)
+            .map(|entry| {
+                let info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+                let (name, st_info, _, shndx) = &symbols[(info >> 32) as usize];
+                let symbol = if st_info & 0xf == 3 {
+                    sections[usize::from(*shndx)].0.clone()
+                } else {
+                    name.clone()
+                };
+                (
+                    u64::from_le_bytes(entry[0..8].try_into().unwrap()),
+                    info as u32,
+                    symbol,
+                    i64::from_le_bytes(entry[16..24].try_into().unwrap()),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// The same entries with the symbol borrowed, for comparison with
+    /// literals.
+    fn relocations(entries: &[(u64, u32, String, i64)]) -> Vec<(u64, u32, &str, i64)> {
+        entries
+            .iter()
+            .map(|(offset, kind, symbol, addend)| (*offset, *kind, symbol.as_str(), *addend))
+            .collect()
+    }
+
+    // x86-64 relocation types.
+    const R_64: u32 = 1;
+    const R_PC32: u32 = 2;
+    const R_PLT32: u32 = 4;
+    const R_32: u32 = 10;
+    const R_32S: u32 = 11;
+    const R_PC8: u32 = 15;
+
+    /// A label of the branch's own section is not always the assembler's to
+    /// resolve. A weak definition can be replaced at link time; an ifunc is
+    /// reached through the PLT entry that calls its resolver; `sym@PLT` on a
+    /// global asks for the linker. Every such branch used to be resolved
+    /// here, and shortened: `jmp w` was `eb 1b`, bound to this file's `w`
+    /// whatever the link provided. Bytes and relocations are GNU as 2.47's.
+    #[test]
+    fn a_branch_the_linker_may_rebind_keeps_its_relocation() {
+        let obj = assemble_object(concat!(
+            ".text\n.weak w\n.globl g\n.type res, @gnu_indirect_function\n",
+            "jmp w\njne w\njmp g\njmp g@PLT\njmp res\n",
+            "loop w\nloop g\nloop l\njrcxz res\ncall l\n",
+            "w: ret\ng: ret\nres: ret\nl: ret\n",
+        ));
+        assert_eq!(
+            section_bytes(&obj, ".text").unwrap(),
+            [
+                0xe9, 0, 0, 0, 0, // jmp w: the linker's
+                0x0f, 0x85, 0, 0, 0, 0, // jne w
+                0xeb, 0x18, // jmp g: a plain jump to a global is resolved
+                0xe9, 0, 0, 0, 0, // jmp g@PLT: asked for the linker
+                0xe9, 0, 0, 0, 0, // jmp res: an ifunc, even a local one
+                0xe2, 0x00, // loop w
+                0xe2, 0x00, // loop g: no near form, so only a local resolves
+                0xe2, 0x0a, // loop l
+                0xe3, 0x00, // jrcxz res
+                0xe8, 0x03, 0, 0, 0, // call l
+                0xc3, 0xc3, 0xc3, 0xc3,
+            ]
+        );
+        assert_eq!(
+            relocations(&rela_entries(&obj, ".rela.text")),
+            [
+                (1, R_PLT32, "w", -4),
+                (7, R_PLT32, "w", -4),
+                (14, R_PLT32, "g", -4),
+                (19, R_PC32, "res", -4),
+                (24, R_PC8, "w", -1),
+                (26, R_PC8, "g", -1),
+                (30, R_PC8, "res", -1),
+            ]
+        );
+    }
+
+    /// GNU as binds once it has read the file, so `.weak`, `.globl`,
+    /// `.hidden` and `.type` count wherever they stand. The layout used to
+    /// read the binding a symbol had when its label was defined: with the
+    /// directives last, `jmp w` and `loop w` were resolved and `jmp res`
+    /// went to the resolver.
+    #[test]
+    fn binding_directives_count_wherever_they_stand() {
+        let obj = assemble_object(concat!(
+            ".text\njmp w\njne g\njmp res\nloop w\nw: ret\ng: ret\nres: ret\n",
+            ".weak w\n.globl g\n.hidden g\n.type res, @gnu_indirect_function\n",
+        ));
+        assert_eq!(
+            section_bytes(&obj, ".text").unwrap(),
+            [
+                0xe9, 0, 0, 0, 0, 0x75, 0x08, 0xe9, 0, 0, 0, 0, 0xe2, 0x00, 0xc3, 0xc3, 0xc3
+            ]
+        );
+        assert_eq!(
+            relocations(&rela_entries(&obj, ".rela.text")),
+            [
+                (1, R_PLT32, "w", -4),
+                (8, R_PC32, "res", -4),
+                (13, R_PC8, "w", -1)
+            ]
+        );
+    }
+
+    /// `sym@PLT` names `sym`. When nothing can preempt it -- a local label,
+    /// or a global with a visibility that rules it out -- the jump is
+    /// resolved and takes its short form; it used to stay five bytes long,
+    /// under a label spelled `l@PLT` that relaxation could not find.
+    #[test]
+    fn a_plt_branch_is_resolved_when_nothing_can_preempt_its_target() {
+        let obj = assemble_object(concat!(
+            ".text\n.globl gh, gp, gd\n.hidden gh\n.protected gp\n",
+            "jmp l@PLT\njne l@PLT\njmp gh@PLT\njmp gp@PLT\njmp gd@PLT\n",
+            "l: ret\ngh: ret\ngp: ret\ngd: ret\n",
+        ));
+        assert_eq!(
+            section_bytes(&obj, ".text").unwrap(),
+            [
+                0xeb, 0x0b, 0x75, 0x09, 0xeb, 0x08, 0xeb, 0x07, 0xe9, 0, 0, 0, 0, 0xc3, 0xc3, 0xc3,
+                0xc3
+            ]
+        );
+        assert_eq!(
+            relocations(&rela_entries(&obj, ".rela.text")),
+            [(9, R_PLT32, "gd", -4)]
+        );
+    }
+
+    /// Out of rel8 reach a jump to a global label of its own section is
+    /// still the assembler's: the near form with its displacement, no
+    /// relocation. It used to leave as `R_X86_64_PC32 g-4`, which a linker
+    /// refuses in a shared object and GNU as never writes.
+    #[test]
+    fn a_far_branch_to_a_global_label_is_resolved_in_place() {
+        let obj =
+            assemble_object(".text\n.globl g\njmp g\njne g\njmp g+1\n.fill 300, 1, 0x90\ng: ret\n");
+        assert_eq!(
+            section_bytes(&obj, ".text").unwrap(),
+            run(
+                &[
+                    0xe9, 0x37, 0x01, 0, 0, 0x0f, 0x85, 0x31, 0x01, 0, 0, 0xe9, 0x2d, 0x01, 0, 0
+                ],
+                0x90,
+                300,
+                &[0xc3]
+            )
+        );
+        assert_eq!(rela_entries(&obj, ".rela.text"), []);
+    }
+
+    /// `sym+N` is not `sym`: through a PLT entry the branch would land N
+    /// bytes into the entry. GNU as marks a branch PLT32 only when it names
+    /// the symbol itself.
+    #[test]
+    fn a_branch_to_a_symbol_plus_offset_asks_for_no_plt_entry() {
+        let obj = assemble_object(".text\njmp ext+1\njne ext+1\ncall ext+2\ncall ext\njmp ext\n");
+        assert_eq!(
+            relocations(&rela_entries(&obj, ".rela.text")),
+            [
+                (1, R_PC32, "ext", -3),
+                (7, R_PC32, "ext", -3),
+                (12, R_PC32, "ext", -2),
+                (17, R_PLT32, "ext", -4),
+                (22, R_PLT32, "ext", -4),
+            ]
+        );
+    }
+
+    /// The i686 rules are the same ones (GNU as 2.47 `--32`); with REL
+    /// relocations a branch left to the linker shows as its in-place
+    /// addend, -4 or -1.
+    #[test]
+    fn i686_branches_follow_the_same_binding_rules() {
+        let dir = std::env::temp_dir().join(format!("lccc_bind32_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = ScratchDir(dir.clone());
+        let out = dir.join("m.o");
+        assemble32(
+            concat!(
+                ".text\n.weak w\n.globl g\njmp w\njne w\njmp g\nloop w\njecxz g\ncall l\njmp l\n",
+                "w: ret\ng: ret\nl: ret\n",
+            ),
+            out.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            section_bytes(&std::fs::read(&out).unwrap(), ".text").unwrap(),
+            [
+                0xe9, 0xfc, 0xff, 0xff, 0xff, // jmp w
+                0x0f, 0x85, 0xfc, 0xff, 0xff, 0xff, // jne w
+                0xeb, 0x0c, // jmp g
+                0xe2, 0xff, // loop w
+                0xe3, 0xff, // jecxz g
+                0xe8, 0x04, 0, 0, 0, // call l
+                0xeb, 0x02, // jmp l
+                0xc3, 0xc3, 0xc3,
+            ]
+        );
+    }
+
+    /// A visibility only narrows (GNU as 2.47): `.protected` after
+    /// `.hidden` is refused, `.hidden` after `.protected` applies.
+    #[test]
+    fn a_visibility_only_narrows() {
+        let obj = assemble_object(concat!(
+            ".text\n.globl a, b, c\n.hidden a\n.protected a\n.protected b\n.hidden b\n",
+            ".hidden c\n.internal c\na: ret\nb: ret\nc: ret\n",
+        ));
+        let visibility = |name: &str| {
+            symbols(&obj)
+                .into_iter()
+                .find(|(n, ..)| n == name)
+                .map(|(_, _, other, _)| other & 3)
+        };
+        // STV_INTERNAL = 1, STV_HIDDEN = 2.
+        assert_eq!(visibility("a"), Some(2));
+        assert_eq!(visibility("b"), Some(2));
+        assert_eq!(visibility("c"), Some(1));
+    }
+
+    /// A constant in a mergeable section is named by its symbol. The linker
+    /// reads `section + addend` there as the address of an entry, finds
+    /// where merging put that entry and relocates to it -- and the -4 of a
+    /// RIP-relative reference, or the `+2` of `.Ls1+2`, is not part of an
+    /// entry's address. Folded into the section, `movdqa .Lm1(%rip)` named
+    /// "twelve bytes into `.Lm0`": mold loaded another constant once the
+    /// pool was merged with another object's, and lld refuses the entry at
+    /// -4 of the first one. The kernel's crypto code keeps every constant
+    /// it loads in sections like these. Relocations are GNU as 2.47's
+    /// (`tc_i386_fix_adjustable`, `adjust_reloc_syms`): only an absolute
+    /// reference to the symbol itself moves to the section.
+    #[test]
+    fn references_into_a_mergeable_section_name_the_symbol() {
+        let obj = assemble_object(concat!(
+            ".section .rodata.cst16.m,\"aM\",@progbits,16\n",
+            ".Lm0: .quad 1, 2\n.Lm1: .quad 3, 4\n",
+            ".section .rodata.str1.1,\"aMS\",@progbits,1\n",
+            ".Ls0: .string \"abc\"\n.Ls1: .string \"defg\"\n",
+            ".text\nmovdqa .Lm0(%rip), %xmm0\nmovdqa .Lm1(%rip), %xmm1\n",
+            "lea .Ls1(%rip), %rax\nlea .Ls1+1(%rip), %rax\n",
+            "movl $.Ls1, %edi\nmovl $.Ls1+2, %edi\nmovq $.Lm1, %rdi\nret\n",
+            ".data\n.quad .Lm1, .Ls1, .Ls1+2\n.long .Ls1 - .\n",
+        ));
+        assert_eq!(
+            relocations(&rela_entries(&obj, ".rela.text")),
+            [
+                (0x04, R_PC32, ".Lm0", -4),
+                (0x0c, R_PC32, ".Lm1", -4),
+                (0x13, R_PC32, ".Ls1", -4),
+                (0x1a, R_PC32, ".Ls1", -3),
+                (0x1f, R_32, ".rodata.str1.1", 4),
+                (0x24, R_32, ".Ls1", 2),
+                (0x2b, R_32S, ".rodata.cst16.m", 16),
+            ]
+        );
+        assert_eq!(
+            relocations(&rela_entries(&obj, ".rela.data")),
+            [
+                (0x00, R_64, ".rodata.cst16.m", 16),
+                (0x08, R_64, ".rodata.str1.1", 4),
+                (0x10, R_64, ".Ls1", 2),
+                (0x18, R_PC32, ".Ls1", 0),
+            ]
+        );
+        // The symbols the relocations name are in the table, local and
+        // defined; the one nothing names (`.Ls0`) is not.
+        let table = symbols(&obj);
+        for name in [".Lm0", ".Lm1", ".Ls1"] {
+            let (_, info, _, shndx) = table
+                .iter()
+                .find(|(n, ..)| n == name)
+                .unwrap_or_else(|| panic!("{name} is not in the symbol table"));
+            assert_eq!((info >> 4, *shndx != 0), (0, true), "{name}");
+        }
+        assert!(!table.iter().any(|(n, ..)| n == ".Ls0"));
+    }
+
+    /// The header of a mergeable section states the size of its entries,
+    /// the argument after the type. It used to be 0 for a constant pool and
+    /// 1 for every string pool: bfd and lld leave a pool with entity size 0
+    /// alone, mold merged it byte by byte, and a pool of 4-byte characters
+    /// was split at its first zero byte.
+    #[test]
+    fn a_mergeable_section_states_its_entity_size() {
+        let obj = assemble_object(concat!(
+            ".section .rodata.cst16.k,\"aM\",@progbits,16\n.quad 1, 2\n",
+            ".section .rodata.str4.4,\"aMS\",@progbits,4\n.long 97, 0\n",
+            ".section .rodata.str1.1,\"aMS\",@progbits,1\n.string \"a\"\n",
+            ".section .pool,\"aMG\",@progbits,8,sig,comdat\nsig: .quad 7\n",
+            // No size: not mergeable (GNU as warns and drops the flags).
+            ".section .unsized,\"aM\",@progbits\n.quad 9\n",
+            // Re-entered by name alone: the same section, the same size.
+            ".section .rodata.cst16.k\n.quad 3, 4\n",
+        ));
+        const MERGE: u64 = 0x10;
+        const STRINGS: u64 = 0x20;
+        let headers = section_headers(&obj);
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, ..)| n == name)
+                .map(|&(_, flags, entsize)| (flags & (MERGE | STRINGS), entsize))
+        };
+        assert_eq!(header(".rodata.cst16.k"), Some((MERGE, 16)));
+        assert_eq!(header(".rodata.str4.4"), Some((MERGE | STRINGS, 4)));
+        assert_eq!(header(".rodata.str1.1"), Some((MERGE | STRINGS, 1)));
+        assert_eq!(header(".pool"), Some((MERGE, 8)));
+        assert_eq!(header(".unsized"), Some((0, 0)));
+        assert_eq!(section_bytes(&obj, ".rodata.cst16.k").unwrap().len(), 32);
+        // The group is named by the argument after the entity size, not
+        // by the size: its signature is `sig`.
+        assert!(headers.iter().any(|(n, ..)| n == ".group"));
+        assert!(!symbols(&obj).iter().any(|(n, ..)| n == "8"));
+        assert_eq!(
+            assemble_err(
+                ".section .p,\"aM\",@progbits,8\n.section .p,\"aM\",@progbits,16\n",
+                false
+            ),
+            "changed section entity size for .p"
+        );
+    }
 }
 
 /// Differential tests of the batched section edits (`apply_jump_transitions`,
@@ -8959,6 +9630,7 @@ mod rel_addend_tests {
             data,
             sh_size: None,
             sh_addralign: 1,
+            sh_entsize: 0,
             relocs,
             comdat_group: None,
         }
