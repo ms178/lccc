@@ -324,6 +324,18 @@ SRC
 reject sha_imm_big.c "the last argument to '_mm_sha1rnds4_epu32' must be a 2-bit immediate" -msha -msse4.1
 reject sha_imm_var.c "the last argument to '_mm_sha1rnds4_epu32' must be a 2-bit immediate" -msha -msse4.1
 accept sha_imm_ok.c sha1rnds4 -msha -msse4.1
+# Argument counts of the public SHA names are checked against their arity
+# (the table is generated from the headers; see check_intrinsic_arity.py).
+cat >"$tmp/sha_arity_few.c" <<'SRC'
+#include <immintrin.h>
+__m128i sha_few(__m128i a) { return _mm_sha1nexte_epu32(a); }
+SRC
+cat >"$tmp/sha_arity_many.c" <<'SRC'
+#include <immintrin.h>
+__m128i sha_many(__m128i a, __m128i b) { return _mm_sha256msg1_epu32(a, b, a); }
+SRC
+reject sha_arity_few.c "too few arguments to function '_mm_sha1nexte_epu32'" -msha -msse4.1
+reject sha_arity_many.c "too many arguments to function '_mm_sha256msg1_epu32'" -msha -msse4.1
 # Lane builtins GCC does not define must stay undeclared (no silent alias).
 cat >"$tmp/lane_alias.c" <<'SRC'
 typedef long long v4di __attribute__((vector_size(32)));
