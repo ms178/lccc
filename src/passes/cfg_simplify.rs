@@ -69,6 +69,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
         let label_to_idx = build_label_to_idx(func);
         changed += fold_constant_cond_branches(func, &label_to_idx);
         changed += fold_constant_switches(func, &label_to_idx);
+        changed += fold_known_indirect_branches(func, &label_to_idx);
         changed += simplify_redundant_cond_branches(func);
         changed += fold_boolean_return_branches(func, &label_to_idx);
         changed += thread_jump_chains(func, &label_to_idx);
@@ -231,20 +232,39 @@ fn for_each_terminator_target(term: &Terminator, mut f: impl FnMut(BlockId)) {
 
 /// Convert `CondBranch { cond, true_label: X, false_label: X }` to `Branch(X)`.
 /// The condition is dead and will be cleaned up by DCE.
+///
+/// The `Switch` form of the same redundancy: a case that goes where the
+/// default goes selects nothing, so it is dropped, and a `Switch` left without
+/// a case is `Branch(default)`. The set of successor blocks is unchanged, so
+/// no phi arm moves. `case X: break;` reaches this shape once
+/// [`thread_jump_chains`] has threaded its empty block; without it the
+/// backends pay a table entry (or a compare) for a value the default already
+/// covers, and a dense table can lose its lowest or highest entries.
 fn simplify_redundant_cond_branches(func: &mut IrFunction) -> usize {
     let mut count = 0;
     for block in &mut func.blocks {
-        if let Terminator::CondBranch {
-            true_label,
-            false_label,
-            ..
-        } = &block.terminator
-        {
-            if true_label == false_label {
+        match &mut block.terminator {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } if true_label == false_label => {
                 let target = *true_label;
                 block.terminator = Terminator::Branch(target);
                 count += 1;
             }
+            Terminator::Switch { cases, default, .. } => {
+                let default = *default;
+                let before = cases.len();
+                cases.retain(|&(_, target)| target != default);
+                if cases.len() != before {
+                    count += 1;
+                    if cases.is_empty() {
+                        block.terminator = Terminator::Branch(default);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     count
@@ -438,6 +458,106 @@ fn fold_constant_switches(
 }
 
 // ---------------------------------------------------------------------------
+// Sub-pass: computed goto with one destination
+// ---------------------------------------------------------------------------
+
+/// Fold `goto *p` into `goto L` when `p` can only be `&&L`.
+///
+/// Two proofs, both local to the function because a label is: the operand is
+/// (a copy of) one `LabelAddr`, which in SSA is its value at every use; or the
+/// terminator lists a single possible target, and jumping anywhere else is
+/// undefined. The chosen label must be one the terminator lists, so the phi
+/// arm it already owns there stays the right one; the arms of the targets no
+/// longer reached are removed, as for a folded `Switch`.
+///
+/// This is how the kernel's `drm_exec_until_all_locked()` retries
+/// (include/drm/drm_exec.h): the loop stores `&&retry` in a local and
+/// `drm_exec_retry_on_contention()` jumps through it. GCC 16.2 and Clang
+/// 23.1.5 emit `jmp retry`. LCCC emitted `leaq retry(%rip), %rax; jmpq *%rax`,
+/// an indirect branch the CPU has to predict, which objtool reads as a tail
+/// call out of a live frame (`sibling call from callable instruction with
+/// modified stack frame`, eight times in amdgpu).
+fn fold_known_indirect_branches(
+    func: &mut IrFunction,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> usize {
+    if !func
+        .blocks
+        .iter()
+        .any(|b| matches!(b.terminator, Terminator::IndirectBranch { .. }))
+    {
+        return 0;
+    }
+    // Every label address, and every copy of a value: computed gotos are rare
+    // enough that the two maps are built only for a function that has one.
+    let mut label_of: FxHashMap<Value, BlockId> = FxHashMap::default();
+    let mut copy_of: FxHashMap<Value, Value> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        match inst {
+            Instruction::LabelAddr { dest, label } => {
+                label_of.insert(*dest, *label);
+            }
+            Instruction::Copy {
+                dest,
+                src: Operand::Value(src),
+            } => {
+                copy_of.insert(*dest, *src);
+            }
+            _ => {}
+        }
+    }
+    let label_address = |mut value: Value| {
+        // A copy chain is acyclic in SSA; the bound only guards malformed IR.
+        for _ in 0..=copy_of.len() {
+            if let Some(label) = label_of.get(&value) {
+                return Some(*label);
+            }
+            value = *copy_of.get(&value)?;
+        }
+        None
+    };
+
+    let mut folds: Vec<(usize, BlockId, Vec<BlockId>, BlockId)> = Vec::new();
+    for (idx, block) in func.blocks.iter().enumerate() {
+        let Terminator::IndirectBranch {
+            target,
+            possible_targets,
+        } = &block.terminator
+        else {
+            continue;
+        };
+        let known = match (target, possible_targets.as_slice()) {
+            (_, [only]) => Some(*only),
+            (Operand::Value(value), _) => label_address(*value),
+            _ => None,
+        };
+        let Some(taken) = known.filter(|label| possible_targets.contains(label)) else {
+            continue;
+        };
+        let mut not_taken: Vec<BlockId> = Vec::new();
+        for label in possible_targets {
+            if *label != taken && !not_taken.contains(label) {
+                not_taken.push(*label);
+            }
+        }
+        folds.push((idx, taken, not_taken, block.label));
+    }
+
+    let count = folds.len();
+    for (idx, taken, not_taken, block_label) in folds {
+        func.blocks[idx].terminator = Terminator::Branch(taken);
+        for target in not_taken {
+            if !asm_goto_successors(&func.blocks[idx]).any(|label| label == target)
+                && let Some(&block_idx) = label_to_idx.get(&target)
+            {
+                remove_phi_entries_from(&mut func.blocks[block_idx], block_label);
+            }
+        }
+    }
+    count
+}
+
+// ---------------------------------------------------------------------------
 // Sub-pass: jump chain threading
 // ---------------------------------------------------------------------------
 
@@ -500,56 +620,52 @@ fn thread_jump_chains(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, u
             }
         });
     let mut plans = Vec::new();
+    // Reused per block: `edges[k]` is the `(end, last relay)` of the k-th
+    // target in `for_each_direct_target` order, or `None` to leave it alone.
+    let mut edges: Vec<Option<(BlockId, BlockId)>> = Vec::new();
     for (source, b) in func.blocks.iter().enumerate() {
-        let targets = match b.terminator {
-            Terminator::Branch(to) => [Some(to), None],
-            Terminator::CondBranch {
-                true_label,
-                false_label,
-                ..
-            } => [Some(true_label), Some(false_label)],
-            // Computed branches, switches and asm-goto destinations retain
-            // their identities. An asm-goto *source* may have a normal edge;
-            // its pre-existing successor PHI arm must agree with that edge.
-            _ => continue,
-        };
-        let edges = targets.map(|to| {
-            to.and_then(|to| {
-                if unsafe_relay(to) {
-                    None
-                } else {
-                    resolved.get(&to).copied()
-                }
-            })
-        });
-        if edges.iter().all(Option::is_none) {
+        // Computed branches and asm-goto destinations retain their
+        // identities. An asm-goto *source* may have a normal edge; its
+        // pre-existing successor PHI arm must agree with that edge.
+        //
+        // A `Switch` edge threads like a conditional one. `case X: break;`
+        // lowers to an empty block, and leaving it to the backend cost a
+        // relay per such case: the x86-64 text pass retargets the table entry
+        // but can only delete the orphaned relay when it can prove the text
+        // around the table contiguous, so Linux's `ftrace_bug`,
+        // `rcu_preempt_ctxt_queue`, `compute_live_registers` and
+        // `l1tf_apply_mitigation` each kept a `jmp` nothing reaches, which
+        // objtool reports as `unreachable instruction`.
+        edges.clear();
+        if !for_each_direct_target(&b.terminator, |to| {
+            edges.push(if unsafe_relay(to) {
+                None
+            } else {
+                resolved.get(&to).copied()
+            });
+        }) {
             continue;
         }
-        let Some(additions) = plan_thread_phis(func, b.label, &edges, label_to_idx, phi_budget)
-        else {
+        let wanted = edges.iter().flatten().count();
+        if wanted == 0 {
             continue;
-        };
+        }
+        let additions = plan_thread_phis(func, b.label, &mut edges, label_to_idx, phi_budget);
+        let accepted = edges.iter().flatten().count();
+        // The two arms of a conditional branch thread together or not at all,
+        // as they always have. The cases of a `Switch` are decided one by
+        // one: a conflict on one of them must not pin its other hundred.
+        let all_or_nothing = !matches!(b.terminator, Terminator::Switch { .. });
+        if accepted == 0 || (all_or_nothing && accepted != wanted) {
+            continue;
+        }
         let mut terminator = b.terminator.clone();
-        match &mut terminator {
-            Terminator::Branch(to) => {
-                if let Some((end, _)) = edges[0] {
-                    *to = end;
-                }
+        let mut next = edges.iter();
+        for_each_direct_target_mut(&mut terminator, |to| {
+            if let Some(Some((end, _))) = next.next() {
+                *to = *end;
             }
-            Terminator::CondBranch {
-                true_label,
-                false_label,
-                ..
-            } => {
-                if let Some((end, _)) = edges[0] {
-                    *true_label = end;
-                }
-                if let Some((end, _)) = edges[1] {
-                    *false_label = end;
-                }
-            }
-            _ => unreachable!("only direct branches were selected"),
-        }
+        });
         phi_budget -= additions.len();
         plans.push((source, terminator, additions));
     }
@@ -568,6 +684,53 @@ fn thread_jump_chains(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, u
     changed
 }
 
+/// The targets [`thread_jump_chains`] may redirect, in a fixed order: the one
+/// of a `Branch`, true then false of a `CondBranch`, default then each case of
+/// a `Switch`. Returns false for every other terminator.
+fn for_each_direct_target(term: &Terminator, mut f: impl FnMut(BlockId)) -> bool {
+    match term {
+        Terminator::Branch(to) => f(*to),
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            f(*true_label);
+            f(*false_label);
+        }
+        Terminator::Switch { cases, default, .. } => {
+            f(*default);
+            for (_, to) in cases {
+                f(*to);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// [`for_each_direct_target`] over the same targets in the same order, mutably.
+fn for_each_direct_target_mut(term: &mut Terminator, mut f: impl FnMut(&mut BlockId)) {
+    match term {
+        Terminator::Branch(to) => f(to),
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            f(true_label);
+            f(false_label);
+        }
+        Terminator::Switch { cases, default, .. } => {
+            f(default);
+            for (_, to) in cases {
+                f(to);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Missing or duplicated required PHI arms are not evidence for a rewrite.
 fn unique_phi_value(incoming: &[(Operand, BlockId)], label: BlockId) -> Option<Operand> {
     let mut arms = incoming.iter().filter(|(_, from)| *from == label);
@@ -575,46 +738,63 @@ fn unique_phi_value(incoming: &[(Operand, BlockId)], label: BlockId) -> Option<O
     arms.next().is_none().then_some(value)
 }
 
+/// Decide each edge of `source` on its own and return the PHI arms the
+/// accepted ones add. An edge whose PHI translation is missing, ambiguous or
+/// in conflict with an arm `source` already owns is cleared in `edges` and
+/// keeps its relay; the caller decides whether the rest may still thread.
 fn plan_thread_phis(
     func: &IrFunction,
     source: BlockId,
-    edges: &[Option<(BlockId, BlockId)>; 2],
+    edges: &mut [Option<(BlockId, BlockId)>],
     labels: &FxHashMap<BlockId, usize>,
     budget: usize,
-) -> Option<Vec<(usize, usize, Operand)>> {
+) -> Vec<(usize, usize, Operand)> {
     let mut additions = Vec::new();
-    for (edge_index, edge) in edges.iter().enumerate() {
-        let Some((target, last)) = edge else { continue };
-        let target_index = *labels.get(target)?;
-        for (instruction, inst) in func.blocks[target_index].instructions.iter().enumerate() {
-            let Instruction::Phi { incoming, .. } = inst else {
-                continue;
-            };
-            let value = unique_phi_value(incoming, *last)?;
-            if incoming.iter().any(|(_, from)| *from == source) {
-                // Includes a direct other conditional arm and implicit asm
-                // edges. Presence alone is NOT enough: the values must agree.
-                if !operands_equal(&value, &unique_phi_value(incoming, source)?) {
-                    return None;
+    // The relay through which `source` first reached each end: a second edge
+    // into the same end becomes the same predecessor, so it must carry the
+    // same values.
+    let mut first_relay: FxHashMap<BlockId, BlockId> = FxHashMap::default();
+    for edge in edges.iter_mut() {
+        let Some((target, last)) = *edge else {
+            continue;
+        };
+        let kept = additions.len();
+        let earlier = first_relay.get(&target).copied();
+        let accepted = (|| {
+            let target_index = *labels.get(&target)?;
+            for (instruction, inst) in func.blocks[target_index].instructions.iter().enumerate() {
+                let Instruction::Phi { incoming, .. } = inst else {
+                    continue;
+                };
+                let value = unique_phi_value(incoming, last)?;
+                if incoming.iter().any(|(_, from)| *from == source) {
+                    // Includes a direct other arm and implicit asm edges.
+                    // Presence alone is NOT enough: the values must agree.
+                    if !operands_equal(&value, &unique_phi_value(incoming, source)?) {
+                        return None;
+                    }
+                } else if let Some(previous_last) = earlier {
+                    // Both rewritten arms would become one predecessor in SSA.
+                    if !operands_equal(&value, &unique_phi_value(incoming, previous_last)?) {
+                        return None;
+                    }
+                } else {
+                    if additions.len() == budget {
+                        return None;
+                    }
+                    additions.push((target_index, instruction, value));
                 }
-            } else if let Some((_, previous_last)) = edges[..edge_index]
-                .iter()
-                .flatten()
-                .find(|(end, _)| end == target)
-            {
-                // Both rewritten arms would become one predecessor in SSA.
-                if !operands_equal(&value, &unique_phi_value(incoming, *previous_last)?) {
-                    return None;
-                }
-            } else {
-                if additions.len() == budget {
-                    return None;
-                }
-                additions.push((target_index, instruction, value));
             }
+            Some(())
+        })();
+        if accepted.is_some() {
+            first_relay.entry(target).or_insert(last);
+        } else {
+            additions.truncate(kept);
+            *edge = None;
         }
     }
-    Some(additions)
+    additions
 }
 
 // ---------------------------------------------------------------------------

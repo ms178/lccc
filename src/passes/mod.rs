@@ -2297,6 +2297,16 @@ pub(crate) fn run_passes(
         // resolver ran last and the dead branches survived to codegen.
         constant_fold::resolve_remaining_is_constant(module);
         o1_checkpoint!("is_constant");
+        // A switch that names every value of its selector has no live
+        // default in this tier either. The backend drops the jump table's
+        // range check on that bound at every optimizing level, so a default
+        // left in the IR is emitted with no way in (objtool: `unreachable
+        // instruction`; see `integer_bounds::retire_dead_switch_defaults`).
+        // The prune below deletes the block it retires.
+        if !pass_disabled(&disabled, "switch_cover") {
+            module.for_each_function(integer_bounds::retire_dead_switch_defaults);
+        }
+        o1_checkpoint!("switch_cover");
         // Post-resolution prune: resolving IsConstant turns previously
         // both-arms-alive diamonds into constant branches, so one more
         // cfg_simplify + DCE round folds the taken edge and deletes the
@@ -3849,6 +3859,25 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "set_membership",
                 run_on_visited(module, &dirty, &mut changed, set_membership::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // A `Switch` whose cases name every value its selector can have has
+        // no live default: retire it, so the block behind it and what only
+        // that block uses are deleted instead of compiled. Ahead of
+        // `switch_lut`, which then has no default value to encode either.
+        // Pass name for CCC_DISABLE_PASSES: "switch_cover".
+        if !pass_disabled(&disabled, "switch_cover") {
+            let n = timed_pass!(
+                "switch_cover",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    integer_bounds::retire_dead_switch_defaults
+                )
             );
             total_changes += n;
             total_changes_excl_dce += n;

@@ -5217,7 +5217,12 @@ pub fn generate_module(
 ) -> String {
     // Freeze this module's control once, not once per function, and avoid
     // running the analysis on backends whose switch emitters do not use it.
+    // Not at -O0 (`disable_regalloc`): a jump table without its range check
+    // leaves the default block with no way in, and only the optimizing tiers
+    // retire that default (`switch_cover`). Unoptimized code keeps the check
+    // and a reachable default, as GCC's does.
     cg.state().switch_bounds_enabled = cg.supports_switch_bounds()
+        && !cg.state_ref().disable_regalloc
         && !crate::passes::pass_disabled(
             std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
             "intbounds",
