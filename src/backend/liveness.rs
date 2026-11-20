@@ -2658,15 +2658,25 @@ fn build_intervals(
     intervals
 }
 
+/// Whether `inst` calls a function that can return a second time.
+///
+/// The names are GCC's (`special_function_p` in calls.cc, which sets
+/// `ECF_RETURNS_TWICE` for exactly these): `setjmp` and `sigsetjmp` with
+/// zero, one or two leading underscores, and `savectx`, `vfork` and
+/// `getcontext` as spelled. `getcontext` matters as much as `setjmp`: a
+/// `setcontext` or `swapcontext` back to the saved context resumes behind
+/// the call with the registers of the first return, on a path the
+/// control-flow graph does not have.
 pub(crate) fn is_returns_twice_call(inst: &Instruction) -> bool {
-    if let Instruction::Call { func, .. } = inst {
-        matches!(
-            func.as_str(),
-            "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp" | "vfork"
-        )
-    } else {
-        false
-    }
+    let Instruction::Call { func, .. } = inst else {
+        return false;
+    };
+    let name = func.as_str();
+    let bare = name
+        .strip_prefix("__")
+        .or_else(|| name.strip_prefix('_'))
+        .unwrap_or(name);
+    matches!(bare, "setjmp" | "sigsetjmp") || matches!(name, "savectx" | "vfork" | "getcontext")
 }
 
 // ── Canonical operand visitors (shared with live_range.rs) ───────────────────
@@ -4810,6 +4820,48 @@ mod program_point_capacity_tests {
             None
         );
         assert_eq!(checked_program_point_count([usize::MAX]), None);
+    }
+}
+
+#[cfg(test)]
+mod returns_twice_tests {
+    use super::is_returns_twice_call;
+    use crate::ir::reexports::{CallInfo, Instruction};
+
+    /// The list is GCC's `special_function_p`: the underscore prefixes are
+    /// dropped for `setjmp`/`sigsetjmp` only, the other three match as
+    /// spelled, and nothing else — `longjmp` does not return at all.
+    #[test]
+    fn the_names_are_the_ones_gcc_marks_returns_twice() {
+        let call = |name: &str| Instruction::Call {
+            func: name.into(),
+            info: CallInfo::default(),
+        };
+        for name in [
+            "setjmp",
+            "_setjmp",
+            "__setjmp",
+            "sigsetjmp",
+            "_sigsetjmp",
+            "__sigsetjmp",
+            "savectx",
+            "vfork",
+            "getcontext",
+        ] {
+            assert!(is_returns_twice_call(&call(name)), "{name}");
+        }
+        for name in [
+            "longjmp",
+            "___setjmp",
+            "setjmp_",
+            "_vfork",
+            "__getcontext",
+            "setcontext",
+            "swapcontext",
+            "fork",
+        ] {
+            assert!(!is_returns_twice_call(&call(name)), "{name}");
+        }
     }
 }
 
