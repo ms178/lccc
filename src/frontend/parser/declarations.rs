@@ -42,6 +42,10 @@ struct DeclContext {
     spec_noinit: bool,
     spec_persistent: bool,
     spec_nocommon: bool,
+    /// The specifier names a type that carries GNU `unused` (see
+    /// `Parser::spec_names_unused_type`): each declarator of exactly that
+    /// type is exempt from the unused warnings.
+    spec_type_unused: bool,
 }
 
 /// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
@@ -191,6 +195,8 @@ impl Parser {
         let type_spec = self
             .parse_type_specifier()
             .or_else(|| self.implicit_int_type_specifier(start))?;
+        // Read before a declarator's parameter list parses its own specifiers.
+        let spec_type_unused = self.spec_names_unused_type(&type_spec);
         // Capture the declaration's named address space before any declarator
         // (parameter lists in particular) is parsed; see ParsedDeclAttrs.
         self.attrs.decl_address_space = std::mem::take(&mut self.attrs.parsing_address_space);
@@ -439,6 +445,7 @@ impl Parser {
                 spec_noinit,
                 spec_persistent,
                 spec_nocommon,
+                spec_type_unused,
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
@@ -1117,6 +1124,12 @@ impl Parser {
         // before Declaration::new would read it.
         let decl_addr_space = self.attrs.decl_address_space;
         let spec_maybe_unused = ctx.attrs.is_maybe_unused();
+        // A type's `unused` reaches the declarators OF that type only: a
+        // pointer to it or an array of it is reported as GCC reports it.
+        let spec_type_unused = ctx.spec_type_unused;
+        if spec_type_unused && derived.is_empty() {
+            ctx.attrs.set_maybe_unused(true);
+        }
         // `noplt` written among the declaration specifiers applies to every
         // declarator of the statement (`__attribute__((noplt)) void f(), g();`
         // marks both, measured against gcc-16.2.0).
@@ -1275,6 +1288,7 @@ impl Parser {
             self.attrs.set_noinline(ctx.spec_noinline);
             self.attrs.parsing_calling_convention = ctx.spec_calling_convention;
             let (dname, dderived) = self.parse_declarator();
+            let dderived_is_plain = dderived.is_empty();
             let d_object_space = self.attrs.declarator_object_space;
             let d_object_volatile = self.attrs.declarator_object_volatile;
             let d_pointer_const = self.attrs.parsing_pointer_const();
@@ -1356,7 +1370,11 @@ impl Parser {
                     da.set_pure(d_pure);
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
-                    da.set_maybe_unused(d_maybe_unused || spec_maybe_unused);
+                    da.set_maybe_unused(
+                        d_maybe_unused
+                            || spec_maybe_unused
+                            || (spec_type_unused && dderived_is_plain),
+                    );
                     da.set_retain(d_retain);
                     da.set_noinit(d_noinit);
                     da.set_persistent(d_persistent);
@@ -1677,6 +1695,7 @@ impl Parser {
         self.attrs.set_nocommon(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
+        let spec_type_unused = self.spec_names_unused_type(&type_spec);
         let spec_maybe_unused = self.attrs.parsing_maybe_unused();
         self.attrs.set_maybe_unused(false);
 
@@ -1753,7 +1772,9 @@ impl Parser {
             let l_base_volatile = self.attrs.declarator_base_volatile;
             let l_base_restrict = self.attrs.declarator_base_restrict;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
-            let local_maybe_unused = spec_maybe_unused || self.attrs.parsing_maybe_unused();
+            let local_maybe_unused = spec_maybe_unused
+                || self.attrs.parsing_maybe_unused()
+                || (spec_type_unused && derived.is_empty());
             self.attrs.set_maybe_unused(false);
             let local_uninitialized = spec_uninitialized || self.attrs.parsing_uninitialized();
             self.attrs.set_uninitialized(false);
@@ -2501,6 +2522,13 @@ impl Parser {
                 self.typedef_base_volatile.insert(decl.name.clone());
             } else {
                 self.typedef_base_volatile.remove(&decl.name);
+            }
+            // `unused` written on the typedef, or inherited from the record
+            // or typedef it names without a derivation in between.
+            if decl.attrs.is_maybe_unused() {
+                self.typedef_unused.insert(decl.name.clone());
+            } else {
+                self.typedef_unused.remove(&decl.name);
             }
         }
     }

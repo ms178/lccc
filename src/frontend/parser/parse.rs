@@ -308,6 +308,15 @@ pub(super) struct ParsedDeclAttrs {
     /// a[const 2]`), which qualify the pointer it is adjusted to (C23
     /// 6.7.6.3p7). Set by `parse_param_declarator_full`.
     pub(super) param_adjusted_cvr: u8,
+    /// The dimension written in a parenthesised group whose array was
+    /// adjusted to a pointer (`(*h[n])(void)`), until the parameter that owns
+    /// it is built.  Set by `restore_adjusted_group`.
+    pub(super) param_group_array_dim: Option<Expr>,
+    /// The record the last parsed specifier defines or names carries GNU
+    /// `unused` (`struct IP_BASE { ... } __maybe_unused;`): GCC then warns
+    /// about no variable of exactly that type. Reset by every
+    /// `parse_type_specifier`, set at the end of `parse_struct_or_union`.
+    pub(super) spec_type_unused: bool,
 
     /// Named address space of the declaration being parsed, moved out of
     /// `parsing_address_space` right after its type specifier. Parameter
@@ -944,6 +953,13 @@ pub struct Parser {
     /// (especially important for packed structs where tag-only refs would
     /// otherwise incorrectly default to ptr_size).
     pub(super) struct_tag_alignments: FxHashMap<String, usize>,
+    /// Tags of the records defined with GNU `unused`, for the tag-only
+    /// references that follow. Keyed like `struct_tag_alignments`.
+    pub(super) unused_record_tags: FxHashSet<String>,
+    /// Typedef names whose objects GCC never reports as unused: the typedef
+    /// carries `unused`, or names such a record or typedef directly. Scoped
+    /// with the other typedef state.
+    pub(super) typedef_unused: FxHashSet<String>,
     /// Undo records for block/for-scope typedef declarations. Names and their
     /// parser-side qualifiers are restored in reverse declaration order.
     pub(super) typedef_scope_log: Vec<TypedefScopeUndo>,
@@ -960,6 +976,7 @@ pub(super) struct TypedefScopeUndo {
     object_space: Option<AddressSpace>,
     object_volatile: bool,
     base_volatile: bool,
+    unused: bool,
 }
 
 impl Parser {
@@ -1054,6 +1071,7 @@ impl Parser {
             object_space: self.typedef_object_spaces.remove(name),
             object_volatile: self.typedef_object_volatile.remove(name),
             base_volatile: self.typedef_base_volatile.remove(name),
+            unused: self.typedef_unused.remove(name),
         };
         self.typedef_scope_log.push(undo);
     }
@@ -1070,6 +1088,10 @@ impl Parser {
             self.typedef_object_spaces.remove(&undo.name);
             self.typedef_object_volatile.remove(&undo.name);
             self.typedef_base_volatile.remove(&undo.name);
+            self.typedef_unused.remove(&undo.name);
+            if undo.unused {
+                self.typedef_unused.insert(undo.name.clone());
+            }
             if undo.was_typedef {
                 self.typedefs.insert(undo.name.clone());
             }
@@ -1132,6 +1154,8 @@ impl Parser {
             local_constants: FxHashMap::default(),
             deferred_static_asserts: Vec::new(),
             struct_tag_alignments: FxHashMap::default(),
+            unused_record_tags: FxHashSet::default(),
+            typedef_unused: FxHashSet::default(),
         }
     }
 
