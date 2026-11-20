@@ -109,6 +109,7 @@ SOURCES = [
     ("datafiles/hswavx/hsw-int256-isa.txt", "AVX2 256-bit integer"),
     ("datafiles/hswavx/avx-fma-isa.xed.txt", "FMA (VEX 0F38)"),
     ("datafiles/sha/sha-isa.xed.txt", "SHA1RNDS4/SHA256RNDS2 (SSE, 0F38/0F3A)"),
+    ("datafiles/sha512/sha512-isa.xed.txt", "SHA512MSG1/MSG2/RNDS2 (VEX.256, 0F38 pp=F2 W0)"),
     ("datafiles/gfni-vaes-vpcl/gfni-sse-isa.xed.txt", "GF2P8* SSE forms"),
     ("datafiles/gfni-vaes-vpcl/gfni-vex-isa.xed.txt", "GF2P8* VEX forms"),
     ("datafiles/gfni-vaes-vpcl/vaes-vex-isa.xed.txt", "VAES/VPCLMULQDQ (VEX)"),
@@ -181,6 +182,8 @@ HELPERS = {
     "encode_avx_3op_commutative": ("0f", None, 2, None),
     "encode_avx_3op_38": ("0f38", None, 2, None),
     "encode_avx_3op_38_pp": ("0f38", None, 2, None),
+    # SHA-512 (VEX.256, 0F38, pp=F2 fixed in the body): (ops, opcode, widths, mnemonic).
+    "encode_sha512_vex": ("0f38", "f2", None, None),
     "encode_avx_3op_38_w1": ("0f38", "66", None, 1),
     "encode_avx_3op_3a_imm8": ("0f3a", "66", None, None),
     "encode_avx_3op_3a_pp_imm8": ("0f3a", None, 2, None),
@@ -553,6 +556,13 @@ VEX_SPECS = {
     "encode_avx_insert_gp_0f": {"family": "vex", "map": ("const", "0f"),
                                 "pp": ("boolpp", 2), "w": ("const", 0),
                                 "opcode": ("arg", 1)},
+    # (ops, widths, opcode): the three SHA-512 rows. The pp is the literal 3
+    # (F2) inside `encode_sha512_vex`, so the spec pins it as a constant and
+    # the model checks the body, not the caller. The widths are operand-shape
+    # checks and do not appear in the encoding.
+    "encode_sha512_vex": {"family": "vex", "map": ("const", "0f38"),
+                          "pp": ("const", "f2"), "w": ("const", 0),
+                          "opcode": ("arg", 1)},
     "encode_avx_2op_38_pp": {"family": "vex", "map": ("const", "0f38"),
                              "pp": ("argpp", 2), "w": ("const", 0),
                              "opcode": ("arg", 1)},

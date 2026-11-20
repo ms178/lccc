@@ -3388,25 +3388,25 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// VEX.256 SHA-512: `vsha512msg1 xmm, ymm`, `vsha512msg2 ymm, ymm`,
-    /// `vsha512rnds2 xmm, ymm, ymm` (AT&T order; 0F38, pp=F2, W0).
+    /// VEX.256 SHA-512 (0F38, pp=F2, W0): `vsha512msg1 ymm, xmm`,
+    /// `vsha512msg2 ymm, ymm`, `vsha512rnds2 ymm, ymm, xmm` (AT&T order).
     ///
-    /// The operand widths are part of the instruction, and the shared AVX helpers
-    /// take VEX.L from any ymm operand, so the widths are checked here. The memory
-    /// forms are rejected: GNU as 2.47 rejects them ("operand type mismatch"), and
-    /// lccc matches that reference. The error wording is GAS's.
+    /// `widths` gives each operand, true = ymm and false = xmm. Only register
+    /// operands of exactly those widths are accepted; that is the set GNU as
+    /// 2.47 accepts, and XED's SHA512 datafile describes the same operands.
+    /// Memory, GPR and immediate operands are type errors, a wrong register
+    /// width is a size error, and a wrong count is a count error (GAS wording).
+    ///
+    /// This is the one entry point for all three rows, so the width check cannot
+    /// be bypassed by a caller. Each row passes its own opcode literally, which
+    /// keeps the encoding auditable and visible to the SDM cross-reference model.
     pub(crate) fn encode_sha512_vex(
         &mut self,
-        mnemonic: &str,
         ops: &[Operand],
+        opcode: u8,
+        widths: &[bool],
+        mnemonic: &str,
     ) -> Result<(), String> {
-        // true = ymm, false = xmm, in AT&T operand order.
-        let (opcode, widths): (u8, &[bool]) = match mnemonic {
-            "vsha512msg1" => (0xCC, &[false, true]),
-            "vsha512msg2" => (0xCD, &[true, true]),
-            "vsha512rnds2" => (0xCB, &[false, true, true]),
-            _ => return Err(format!("{mnemonic}: not a SHA-512 mnemonic")),
-        };
         if ops.len() != widths.len() {
             return Err(format!("number of operands mismatch for `{mnemonic}'"));
         }
@@ -3414,22 +3414,19 @@ impl super::InstructionEncoder {
             let Operand::Register(r) = op else {
                 return Err(format!("operand type mismatch for `{mnemonic}'"));
             };
-            if !is_xmm(&r.name) && !is_ymm(&r.name) {
+            let is_x = is_xmm(&r.name);
+            let is_y = is_ymm(&r.name);
+            if !is_x && !is_y {
                 return Err(format!("operand type mismatch for `{mnemonic}'"));
             }
-            let width_ok = if want_ymm {
-                is_ymm(&r.name)
-            } else {
-                is_xmm(&r.name)
-            };
-            if !width_ok {
+            if (want_ymm && !is_y) || (!want_ymm && !is_x) {
                 return Err(format!("operand size mismatch for `{mnemonic}'"));
             }
         }
-        if mnemonic == "vsha512rnds2" {
-            self.encode_avx_3op_38_pp(ops, opcode, 3)
-        } else {
-            self.encode_avx_2op_38_pp(ops, opcode, 3)
+        match ops {
+            [_, _] => self.encode_avx_2op_38_pp(ops, opcode, 3),
+            [_, _, _] => self.encode_avx_3op_38_pp(ops, opcode, 3),
+            _ => Err(format!("number of operands mismatch for `{mnemonic}'")),
         }
     }
 

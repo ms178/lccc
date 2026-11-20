@@ -15,6 +15,9 @@ ELEMENTS = {'QI': ('Char', 1), 'HI': ('Short', 2), 'SI': ('Int', 4),
             'DI': ('LongLong', 8), 'SF': ('Float', 4), 'DF': ('Double', 8)}
 
 
+# Builtin families whose type contracts are checked but never executed.
+RUNTIME_EXEMPT_PREFIXES = ('__builtin_ia32_vpdp', '__builtin_ia32_vsha512')
+
 def result_expression(token):
     if token in SCALARS:
         return f'CType::{SCALARS[token]}'
@@ -190,9 +193,11 @@ def contract_source():
         lines.append(f'_Static_assert(__builtin_types_compatible_p(__typeof__({call}), {c_type(result)}), "{name} result type");')
         if only64:
             lines.append('#endif')
-        # VNNI is beyond SSE4/AVX2: retain its type contracts without executing
-        # instructions the requested AVX2 host need not implement.
-        if result.startswith('V') and result != 'VOID' and not name.startswith('__builtin_ia32_vpdp'):
+        # VNNI (AVX-VNNI/AVX512-VNNI) and SHA-512 are beyond the AVX2 host this
+        # fixture runs on: retain their type contracts without executing
+        # instructions the host need not implement (a SHA-512 probe on a CPU
+        # without `sha512` faults with SIGILL, both here and on GitHub runners).
+        if result.startswith('V') and result != 'VOID' and not name.startswith(RUNTIME_EXEMPT_PREFIXES):
             parameters = ', '.join(f'{c_type(t)} a{i}' for i, t in enumerate(arguments) if t.startswith('V') or '*' in c_type(t))
             immediate = '24' if re.search(r'(palignr128|ps[lr]ldqi(?:128|256))$', name) else '1'
             operands = [f'a{i}' if t.startswith('V') or '*' in c_type(t) else immediate for i, t in enumerate(arguments)]

@@ -5488,7 +5488,10 @@ impl InstructionEncoder {
             "vaeskeygenassist" => self.encode_avx_2op_3a_pp_imm8(ops, 0xDF, 1),
             // VAES 256 + VPCLMULQDQ 256
             "vaesenc" => self.encode_avx_3op_38(ops, 0xDC, true),
-            "vsha512msg1" | "vsha512msg2" | "vsha512rnds2" => self.encode_sha512_vex(mnemonic, ops),
+            // VEX.256 SHA-512 (0F38, pp=F2, W0); see `encode_sha512_vex`.
+            "vsha512msg1" => self.encode_sha512_vex(ops, 0xCC, &[false, true], mnemonic),
+            "vsha512msg2" => self.encode_sha512_vex(ops, 0xCD, &[true, true], mnemonic),
+            "vsha512rnds2" => self.encode_sha512_vex(ops, 0xCB, &[false, true, true], mnemonic),
             "vaesenclast" => self.encode_avx_3op_38(ops, 0xDD, true),
             "vaesdec" => self.encode_avx_3op_38(ops, 0xDE, true),
             "vaesdeclast" => self.encode_avx_3op_38(ops, 0xDF, true),
@@ -7148,7 +7151,8 @@ mod encoding_opt_tests {
     #[test]
     fn vex_sha512_register_forms_match_gas_247() {
         // Bytes from GNU as 2.47 (`as` in ~/.cache/lccc/binutils-2.47).
-        // VEX.256 0F38 pp=F2 W0: msg1 CC, msg2 CD; rnds2 is 0F3A pp=F2 CB.
+        // VEX.256 0F38 pp=F2 W0: msg1 CC, msg2 CD, rnds2 CB (`C4 E2 6F CB`:
+        // mmmmm=00010 is map 0F38 for all three).
         assert_eq!(hex("vsha512msg1 %xmm2, %ymm0"), "c4 e2 7f cc c2");
         assert_eq!(hex("vsha512msg1 %xmm9, %ymm15"), "c4 42 7f cc f9");
         assert_eq!(hex("vsha512msg2 %ymm2, %ymm0"), "c4 e2 7f cd c2");
