@@ -1207,10 +1207,10 @@ fn normalize_vector_image_endpoints(
             alloca: Value,
             src: Operand,
             dest: Option<Value>,
-            bytes: usize,
+            fam: Family,
         },
         /// Read `alloca`'s image through a family load and feed the store.
-        StoreImage { alloca: Value, bytes: usize },
+        StoreImage { alloca: Value, fam: Family },
     }
     let mut plan: Vec<(usize, usize, Edit)> = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -1230,7 +1230,10 @@ fn normalize_vector_image_endpoints(
                     let (Some(a), [src]) = (dest_ptr, args.as_slice()) else {
                         continue;
                     };
-                    if widths.get(&a.0) != Some(&bytes) || image_family(table, bytes).is_none() {
+                    let Some(fam) = image_family(table, bytes) else {
+                        continue;
+                    };
+                    if widths.get(&a.0) != Some(&bytes) {
                         continue;
                     }
                     plan.push((
@@ -1240,7 +1243,7 @@ fn normalize_vector_image_endpoints(
                             alloca: *a,
                             src: src.clone(),
                             dest: *dest,
-                            bytes,
+                            fam,
                         },
                     ));
                 }
@@ -1253,13 +1256,13 @@ fn normalize_vector_image_endpoints(
                     let (Some(q), [Operand::Value(a)]) = (dest_ptr, args.as_slice()) else {
                         continue;
                     };
-                    if widths.get(&a.0) != Some(&bytes)
-                        || q.0 == a.0
-                        || image_family(table, bytes).is_none()
-                    {
+                    let Some(fam) = image_family(table, bytes) else {
+                        continue;
+                    };
+                    if widths.get(&a.0) != Some(&bytes) || q.0 == a.0 {
                         continue;
                     }
-                    plan.push((bi, ii, Edit::StoreImage { alloca: *a, bytes }));
+                    plan.push((bi, ii, Edit::StoreImage { alloca: *a, fam }));
                 }
                 _ => {}
             }
@@ -1276,9 +1279,8 @@ fn normalize_vector_image_endpoints(
                 alloca,
                 src,
                 dest,
-                bytes,
+                fam,
             } => {
-                let fam = image_family(table, bytes).expect("checked when planned");
                 let img = dest.unwrap_or_else(|| alloc_value(func));
                 let block = &mut func.blocks[bi];
                 block.instructions[ii] = Instruction::Intrinsic {
@@ -1302,8 +1304,7 @@ fn normalize_vector_image_endpoints(
                     },
                 );
             }
-            Edit::StoreImage { alloca, bytes } => {
-                let fam = image_family(table, bytes).expect("checked when planned");
+            Edit::StoreImage { alloca, fam } => {
                 let img = alloc_value(func);
                 let block = &mut func.blocks[bi];
                 insert_instruction(
