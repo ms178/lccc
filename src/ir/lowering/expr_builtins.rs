@@ -4539,6 +4539,46 @@ fn x86_memory_intrinsic_required_feature(
     })
 }
 
+/// VAES, VPCLMULQDQ, SHA-512 and GFNI: the VEX/legacy crypto families.  Split
+/// out of [`x86_intrinsic_required_feature`] (which the census caps at 300
+/// lines) along the same seam as the memory and legacy-SSE helpers; each arm
+/// keeps its own feature bit, so no permission is merged.
+fn vex_crypto_intrinsic_required_feature(
+    intrinsic: &BuiltinIntrinsic,
+) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    Some(match intrinsic {
+        // VAES: the EVEX 256-bit AES round instructions.  A v3 target without
+        // `-mvaes` is exactly the SIGILL case `_mm_crc32_u8` under
+        // `-march=x86-64` was: measured emitting `vaesenc %ymm1, %ymm0, %ymm0`
+        // on a target whose own class does not contain it.
+        B::X86Aesenc256 | B::X86Aesenclast256 | B::X86Aesdec256 | B::X86Aesdeclast256 => {
+            IntrinsicRequirement {
+                feature: F::Vaes,
+                flag: "-mvaes",
+                also: Some(" and AVX (VEX.256)"),
+            }
+        }
+        // VPCLMULQDQ: the 256-bit carry-less multiply.  Separate bit from
+        // VAES, so the two must not share a row.  Both 256-bit forms need AVX
+        // only, not AVX2 (measured on gcc 14: `-mvaes -mno-avx2` accepts).
+        // SHA-512 (VEX.256): GCC 16.2 implies AVX from `-msha512`, not AVX2, so
+        // the feature bit alone carries the permission.
+        B::X86Sha512msg1256 | B::X86Sha512msg2256 | B::X86Sha512rnds2256 => IntrinsicRequirement {
+            feature: F::Sha512,
+            flag: "-msha512",
+            also: None,
+        },
+        B::X86Vpclmulqdq256 => IntrinsicRequirement {
+            feature: F::Vpclmulqdq,
+            flag: "-mvpclmulqdq",
+            also: Some(" and AVX (VEX.256)"),
+        },
+        _ => return None,
+    })
+}
+
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
 /// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
 /// belongs to, for the families whose permission bit exists in
@@ -4557,6 +4597,9 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         return Some(requirement);
     }
     if let Some(requirement) = x86_memory_intrinsic_required_feature(intrinsic) {
+        return Some(requirement);
+    }
+    if let Some(requirement) = vex_crypto_intrinsic_required_feature(intrinsic) {
         return Some(requirement);
     }
     Some(match intrinsic {
@@ -4765,32 +4808,6 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             feature: F::Pclmul,
             flag: "-mpclmul",
             also: None,
-        },
-        // VAES: the EVEX 256-bit AES round instructions.  A v3 target without
-        // `-mvaes` is exactly the SIGILL case `_mm_crc32_u8` under
-        // `-march=x86-64` was: measured emitting `vaesenc %ymm1, %ymm0, %ymm0`
-        // on a target whose own class does not contain it.
-        B::X86Aesenc256 | B::X86Aesenclast256 | B::X86Aesdec256 | B::X86Aesdeclast256 => {
-            IntrinsicRequirement {
-                feature: F::Vaes,
-                flag: "-mvaes",
-                also: Some(" and AVX (VEX.256)"),
-            }
-        }
-        // VPCLMULQDQ: the 256-bit carry-less multiply.  Separate bit from
-        // VAES, so the two must not share a row.  Both 256-bit forms need AVX
-        // only, not AVX2 (measured on gcc 14: `-mvaes -mno-avx2` accepts).
-        // SHA-512 (VEX.256): GCC 16.2 implies AVX from `-msha512`, not AVX2, so
-        // the feature bit alone carries the permission.
-        B::X86Sha512msg1256 | B::X86Sha512msg2256 | B::X86Sha512rnds2256 => IntrinsicRequirement {
-            feature: F::Sha512,
-            flag: "-msha512",
-            also: None,
-        },
-        B::X86Vpclmulqdq256 => IntrinsicRequirement {
-            feature: F::Vpclmulqdq,
-            flag: "-mvpclmulqdq",
-            also: Some(" and AVX (VEX.256)"),
         },
         // AVX-VNNI: `vpdpbusd(s)` and `vpdpwssd(s)`, the VEX-encoded
         // signed-byte-times-unsigned-byte and signed-word dot products.  This
