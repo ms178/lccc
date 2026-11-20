@@ -4749,6 +4749,41 @@ impl X86Codegen {
                     self.avx_store_dest(dptr);
                 }
             }
+            IntrinsicOp::Sha512msg1256 => {
+                // VEX.256 `vsha512msg1 %xmm1, %ymm0`: dst ymm0 = W[0..3] in,
+                // xmm1 = the 16-byte operand (only its low qword is used). The
+                // operand is read at 16 bytes, never 32: it is a 128-bit object.
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.avx_load_arg(&args[0]);
+                    let src = self.vex128_source(&args[1], "xmm1");
+                    self.state.emit_fmt(format_args!("    vsha512msg1 {}, %ymm0", src));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Sha512msg2256 => {
+                // VEX.256 `vsha512msg2 %ymm1, %ymm0`: both operands are 256-bit.
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.avx_load_arg(&args[0]);
+                    self.state.dirty_upper_ymm = true;
+                    self.avx_load_arg_to(&args[1], "ymm1");
+                    self.state.emit("    vsha512msg2 %ymm1, %ymm0");
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Sha512rnds2256 => {
+                // VEX.256 `vsha512rnds2 %xmm2, %ymm1, %ymm0`: dst ymm0 = CDGH in,
+                // vvvv ymm1 = ABEF, rm xmm2 = W+K (16 bytes). %xmm2 is the scratch
+                // for the 16-byte operand; `regalloc_helpers` withholds it from the
+                // pool for this op, as it does for SHA256RNDS2.
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.avx_load_arg(&args[0]);
+                    self.state.dirty_upper_ymm = true;
+                    self.avx_load_arg_to(&args[1], "ymm1");
+                    let wk = self.vex128_source(&args[2], "xmm2");
+                    self.state.emit_fmt(format_args!("    vsha512rnds2 {}, %ymm1, %ymm0", wk));
+                    self.avx_store_dest(dptr);
+                }
+            }
             IntrinsicOp::Pmovmskb256 => {
                 self.avx_load_arg(&args[0]);
                 self.state.emit("    vpmovmskb %ymm0, %eax");

@@ -413,6 +413,7 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
                         op,
                         O::Pblendvb128
                             | O::Sha256rnds2128
+                            | O::Sha512rnds2256
                             | O::Dpbusd128
                             | O::Dpbusds128
                             | O::Dpwusd128

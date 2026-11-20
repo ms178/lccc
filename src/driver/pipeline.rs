@@ -5587,6 +5587,7 @@ impl Driver {
         set.insert_if(self.enable_aes, F::Aes);
         set.insert_if(self.enable_pclmul, F::Pclmul);
         set.insert_if(self.enable_sha, F::Sha);
+        set.insert_if(self.enable_sha512, F::Sha512);
         // VAES / VPCLMULQDQ: the EVEX 256-bit forms of `aesenc` and
         // `pclmulqdq`.  Two conditions, both measured against GCC 12.2:
         //   * the 256-bit vector class must be permitted (`isa.ymm`, the

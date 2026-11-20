@@ -1578,6 +1578,15 @@ pub enum IntrinsicOp {
     Aesdec256,
     Aesdeclast256,
     Vpclmulqdq256,
+    /// SHA-512 message schedule step 1 (VEX.256 `vsha512msg1`). args[0] = dst
+    /// ymm (W[0..3]), args[1] = xmm whose low qword is W[4]; dest_ptr = result.
+    Sha512msg1256,
+    /// SHA-512 message schedule step 2 (`vsha512msg2`). args[0] = partial ymm,
+    /// args[1] = ymm whose qwords 2 and 3 are W[14], W[15]; dest_ptr = result.
+    Sha512msg2256,
+    /// SHA-512 two rounds (`vsha512rnds2`). args[0] = CDGH ymm (dst, output is
+    /// the updated ABEF), args[1] = ABEF ymm (vvvv), args[2] = xmm W+K pair.
+    Sha512rnds2256,
 
     // --- SSE2 ops previously left as scalar header loops ---
     Paddusb128,
@@ -2447,6 +2456,7 @@ impl IntrinsicOp {
             | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
             | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256 | SetEpi8_256
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
+            | Sha512msg1256 | Sha512msg2256 | Sha512rnds2256
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB | MulAddF64x4HoistedSIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecLoadStrided2I32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8

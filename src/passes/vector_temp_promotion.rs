@@ -447,6 +447,20 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         O::Pblendvb128 => return (index < 3).then_some(16),
         // SHA-256 rounds: state, state and the implicit WK operand.
         O::Sha256rnds2128 => return (index < 3).then_some(16),
+        // SHA-512 (VEX.256): the ymm operands are 32 bytes; the msg1 and rnds2
+        // xmm operands are 16. A 32-byte width on a 16-byte operand would let
+        // promotion read past the object, so the widths are per operand.
+        O::Sha512msg1256 => return match index {
+            0 => Some(32),
+            1 => Some(16),
+            _ => None,
+        },
+        O::Sha512msg2256 => return (index < 2).then_some(32),
+        O::Sha512rnds2256 => return match index {
+            0 | 1 => Some(32),
+            2 => Some(16),
+            _ => None,
+        },
 
         // 256-bit stores and unary consumers.
         O::Storeu256

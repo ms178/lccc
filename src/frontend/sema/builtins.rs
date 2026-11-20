@@ -2753,6 +2753,18 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_vpclmulqdq256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vpclmulqdq256),
     );
+    m.insert(
+        "__builtin_ia32_vsha512msg1",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512msg1256),
+    );
+    m.insert(
+        "__builtin_ia32_vsha512msg2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512msg2256),
+    );
+    m.insert(
+        "__builtin_ia32_vsha512rnds2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512rnds2256),
+    );
     // GCC-compatible aliases (GCC 16 uses _avx_ infix for the VEX VNNI forms,
     // and an odd dpwsud spelling for INT16 vpdpwusd; accept both spellings).
     m.insert(
@@ -4368,6 +4380,9 @@ pub enum BuiltinIntrinsic {
     X86Aesdec256,
     X86Aesdeclast256,
     X86Vpclmulqdq256,
+    X86Sha512msg1256,
+    X86Sha512msg2256,
+    X86Sha512rnds2256,
     // SSE2/SSE4.1 previously scalar
     X86Paddusb128,
     X86Paddsb128,

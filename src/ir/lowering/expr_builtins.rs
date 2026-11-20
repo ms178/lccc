@@ -1759,6 +1759,9 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Aesdec256
             | BuiltinIntrinsic::X86Aesdeclast256
             | BuiltinIntrinsic::X86Vpclmulqdq256
+            | BuiltinIntrinsic::X86Sha512msg1256
+            | BuiltinIntrinsic::X86Sha512msg2256
+            | BuiltinIntrinsic::X86Sha512rnds2256
             | BuiltinIntrinsic::X86Paddusb128
             | BuiltinIntrinsic::X86Paddsb128
             | BuiltinIntrinsic::X86Paddusw128
@@ -4189,6 +4192,9 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Aesdec256
         | BuiltinIntrinsic::X86Aesdeclast256
         | BuiltinIntrinsic::X86Vpclmulqdq256
+        | BuiltinIntrinsic::X86Sha512msg1256
+        | BuiltinIntrinsic::X86Sha512msg2256
+        | BuiltinIntrinsic::X86Sha512rnds2256
         | BuiltinIntrinsic::X86Pmulld256
         | BuiltinIntrinsic::X86Psubd256
         | BuiltinIntrinsic::X86Paddq256
@@ -4774,6 +4780,13 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         // VPCLMULQDQ: the 256-bit carry-less multiply.  Separate bit from
         // VAES, so the two must not share a row.  Both 256-bit forms need AVX
         // only, not AVX2 (measured on gcc 14: `-mvaes -mno-avx2` accepts).
+        // SHA-512 (VEX.256): GCC 16.2 implies AVX from `-msha512`, not AVX2, so
+        // the feature bit alone carries the permission.
+        B::X86Sha512msg1256 | B::X86Sha512msg2256 | B::X86Sha512rnds2256 => IntrinsicRequirement {
+            feature: F::Sha512,
+            flag: "-msha512",
+            also: None,
+        },
         B::X86Vpclmulqdq256 => IntrinsicRequirement {
             feature: F::Vpclmulqdq,
             flag: "-mvpclmulqdq",
@@ -5139,6 +5152,9 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Aesdec256 => IntrinsicOp::Aesdec256,
         BuiltinIntrinsic::X86Aesdeclast256 => IntrinsicOp::Aesdeclast256,
         BuiltinIntrinsic::X86Vpclmulqdq256 => IntrinsicOp::Vpclmulqdq256,
+        BuiltinIntrinsic::X86Sha512msg1256 => IntrinsicOp::Sha512msg1256,
+        BuiltinIntrinsic::X86Sha512msg2256 => IntrinsicOp::Sha512msg2256,
+        BuiltinIntrinsic::X86Sha512rnds2256 => IntrinsicOp::Sha512rnds2256,
         BuiltinIntrinsic::X86SetEpi32_256 => IntrinsicOp::SetEpi32_256,
         BuiltinIntrinsic::X86SetEpi64x256 => IntrinsicOp::SetEpi64x256,
         BuiltinIntrinsic::X86Paddusb128 => IntrinsicOp::Paddusb128,

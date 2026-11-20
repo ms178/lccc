@@ -3388,6 +3388,43 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// VEX.256 SHA-512: `vsha512msg1 xmm, ymm`, `vsha512msg2 ymm, ymm`,
+    /// `vsha512rnds2 xmm, ymm, ymm` (AT&T order; 0F38, pp=F2, W0).
+    ///
+    /// The operand widths are part of the instruction, and the shared AVX helpers
+    /// take VEX.L from any ymm operand, so the widths are checked here. The memory
+    /// forms are rejected: GNU as 2.47 rejects them ("operand type mismatch"), and
+    /// lccc matches that reference. The error wording is GAS's.
+    pub(crate) fn encode_sha512_vex(&mut self, mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+        // true = ymm, false = xmm, in AT&T operand order.
+        let (opcode, widths): (u8, &[bool]) = match mnemonic {
+            "vsha512msg1" => (0xCC, &[false, true]),
+            "vsha512msg2" => (0xCD, &[true, true]),
+            "vsha512rnds2" => (0xCB, &[false, true, true]),
+            _ => return Err(format!("{mnemonic}: not a SHA-512 mnemonic")),
+        };
+        if ops.len() != widths.len() {
+            return Err(format!("number of operands mismatch for `{mnemonic}'"));
+        }
+        for (op, &want_ymm) in ops.iter().zip(widths) {
+            let Operand::Register(r) = op else {
+                return Err(format!("operand type mismatch for `{mnemonic}'"));
+            };
+            if !is_xmm(&r.name) && !is_ymm(&r.name) {
+                return Err(format!("operand type mismatch for `{mnemonic}'"));
+            }
+            let width_ok = if want_ymm { is_ymm(&r.name) } else { is_xmm(&r.name) };
+            if !width_ok {
+                return Err(format!("operand size mismatch for `{mnemonic}'"));
+            }
+        }
+        if mnemonic == "vsha512rnds2" {
+            self.encode_avx_3op_38_pp(ops, opcode, 3)
+        } else {
+            self.encode_avx_2op_38_pp(ops, opcode, 3)
+        }
+    }
+
     /// Encode AVX 2-operand in 0F38 map (e.g., vpabsb src, dst with vvvv=0)
     pub(crate) fn encode_avx_2op_38(
         &mut self,

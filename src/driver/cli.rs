@@ -1400,6 +1400,7 @@ impl Driver {
         for (feature, slot) in [
             (F::Aes, &mut self.enable_aes),
             (F::Sha, &mut self.enable_sha),
+            (F::Sha512, &mut self.enable_sha512),
             (F::Pclmul, &mut self.enable_pclmul),
             (F::Gfni, &mut self.enable_gfni),
         ] {
@@ -1491,6 +1492,7 @@ impl Driver {
             F::Movbe => &mut self.enable_movbe,
             F::Aes => &mut self.enable_aes,
             F::Sha => &mut self.enable_sha,
+            F::Sha512 => &mut self.enable_sha512,
             F::Pclmul => &mut self.enable_pclmul,
             F::Rdrnd => &mut self.enable_rdrnd,
             F::Vaes => &mut self.enable_vaes,
@@ -1737,7 +1739,6 @@ impl Driver {
             E::AvxIfma => &mut self.enable_avxifma,
             E::AvxNeConvert => &mut self.enable_avxneconvert,
             E::Cmpccxadd => &mut self.enable_cmpccxadd,
-            E::Sha512 => &mut self.enable_sha512,
             E::Sm3 => &mut self.enable_sm3,
             E::Sm4 => &mut self.enable_sm4,
             E::Movrs => &mut self.enable_movrs,
@@ -8725,9 +8726,9 @@ mod prefetch_isa_tests {
         // Extensions leave with the features they require: AVXIFMA with
         // AVX2, SHA512 only with AVX; CMPCCXADD survives `-mno-sse`.
         d = parse(&["ccc", "-march=clearwaterforest", "-mno-avx2"]);
-        assert!(!*d.x86_extra_slot(E::AvxIfma) && *d.x86_extra_slot(E::Sha512));
+        assert!(!*d.x86_extra_slot(E::AvxIfma) && d.enable_sha512);
         d = parse(&["ccc", "-march=clearwaterforest", "-mno-avx"]);
-        assert!(!*d.x86_extra_slot(E::Sha512) && *d.x86_extra_slot(E::Cmpccxadd));
+        assert!(!d.enable_sha512 && *d.x86_extra_slot(E::Cmpccxadd));
         d = parse(&["ccc", "-mno-avx2", "-march=clearwaterforest"]);
         assert!(
             !*d.x86_extra_slot(E::AvxIfma),
@@ -8868,11 +8869,17 @@ mod x86_macro_gate_tests {
         // A later grant reopens it, like every other last-wins pair.
         let mut d = parse(&["-mno-xsave", "-mamx-tile"]);
         assert!(d.resolved_xsave() && *d.x86_extra_slot(E::AmxTile));
-        // An `-march=` row that grants an XSAVE-dependent extension keeps it
-        // only while XSAVE itself is granted.
-        let mut d = parse(&["-march=clearwaterforest", "-mno-xsave"]);
+        // SHA-512 is not an XSAVE component: GCC 16.2 keeps `__SHA512__`
+        // under `-mno-xsave`, whether it comes from `-msha512` or from a
+        // `-march=` row (measured with `gcc-16 -dM -E`: `-march=
+        // clearwaterforest -mno-xsave` defines `__SHA512__` and neither
+        // `__XSAVE__` nor `__AVX__`). The row grant must therefore survive
+        // the XSAVE denial, and `-mno-xsave` must still clear XSAVE itself.
+        let d = parse(&["-march=clearwaterforest", "-mno-xsave"]);
         assert!(!d.resolved_xsave());
-        assert!(!*d.x86_extra_slot(E::Sha512));
+        assert!(d.enable_sha512);
+        let d = parse(&["-msha512", "-mno-xsave"]);
+        assert!(d.enable_sha512 && !d.resolved_xsave());
     }
 
     /// AES-NI, PCLMUL and GFNI are announced from the option bits even when

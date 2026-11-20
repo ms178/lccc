@@ -139,6 +139,11 @@ pub enum X86Feature {
     /// Its own CPUID bit (leaf 7, EBX bit 29) and its own `-msha` flag; SSE-
     /// encoded, so it needs no vector class of its own.
     Sha,
+    /// SHA-512: `vsha512msg1`, `vsha512msg2`, `vsha512rnds2` (VEX.256, 256-bit
+    /// operands). Its own CPUID bit (leaf 7 subleaf 1, EAX bit 0) and its own
+    /// `-msha512` flag. GCC 16.2 makes it imply AVX (VEX.256 needs AVX), not
+    /// AVX2, so `-mno-avx` removes it and `-mno-avx2` does not.
+    Sha512,
     /// AVX-VNNI: the VEX-encoded dot-product family, `vpdpbusd`/`vpdpbusds`/
     /// `vpdpwssd`/`vpdpwssds`.  Its own CPUID bit (leaf 7, EBX bit 4) and its
     /// own `-mavxvnni` flag; VEX-encoded, so it needs a vector class too.
@@ -193,7 +198,7 @@ pub enum X86Feature {
 
 impl X86Feature {
     /// Every tracked feature, for table-driven tests.
-    pub const ALL: [X86Feature; 47] = [
+    pub const ALL: [X86Feature; 48] = [
         X86Feature::Cmov,
         X86Feature::Fxsr,
         X86Feature::Mmx,
@@ -220,6 +225,7 @@ impl X86Feature {
         X86Feature::Vaes,
         X86Feature::Vpclmulqdq,
         X86Feature::Sha,
+        X86Feature::Sha512,
         X86Feature::AvxVnni,
         X86Feature::AvxVnniInt8,
         X86Feature::AvxVnniInt16,
@@ -272,6 +278,7 @@ impl X86Feature {
             X86Feature::Vaes => "vaes",
             X86Feature::Vpclmulqdq => "vpclmulqdq",
             X86Feature::Sha => "sha",
+            X86Feature::Sha512 => "sha512",
             X86Feature::AvxVnni => "avxvnni",
             X86Feature::AvxVnniInt8 => "avxvnniint8",
             X86Feature::AvxVnniInt16 => "avxvnniint16",
@@ -331,6 +338,7 @@ impl X86Feature {
             "vaes" => X86Feature::Vaes,
             "vpclmulqdq" | "vpclmul" => X86Feature::Vpclmulqdq,
             "sha" => X86Feature::Sha,
+            "sha512" => X86Feature::Sha512,
             "avxvnni" => X86Feature::AvxVnni,
             "avxvnniint8" => X86Feature::AvxVnniInt8,
             "avxvnniint16" => X86Feature::AvxVnniInt16,

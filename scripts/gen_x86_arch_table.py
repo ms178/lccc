@@ -68,6 +68,7 @@ FEATURE_MACROS = [
     ('Vaes', '__VAES__'),
     ('Vpclmulqdq', '__VPCLMULQDQ__'),
     ('Sha', '__SHA__'),
+    ('Sha512', '__SHA512__'),
     ('AvxVnni', '__AVXVNNI__'),
     ('AvxVnniInt8', '__AVXVNNIINT8__'),
     ('AvxVnniInt16', '__AVXVNNIINT16__'),
@@ -96,7 +97,7 @@ OPTION_NAMES = {
     'Cx16': 'cx16', 'Avx': 'avx', 'Avx2': 'avx2', 'Fma': 'fma', 'F16c': 'f16c',
     'Bmi': 'bmi', 'Bmi2': 'bmi2', 'Lzcnt': 'lzcnt', 'Movbe': 'movbe', 'Aes': 'aes',
     'Pclmul': 'pclmul', 'Rdrnd': 'rdrnd', 'Vaes': 'vaes', 'Vpclmulqdq': 'vpclmulqdq',
-    'Sha': 'sha',
+    'Sha': 'sha', 'Sha512': 'sha512',
     'AvxVnni': 'avxvnni', 'AvxVnniInt8': 'avxvnniint8', 'AvxVnniInt16': 'avxvnniint16',
     'Gfni': 'gfni', 'Avx512F': 'avx512f', 'Avx512Bw': 'avx512bw', 'Avx512Dq': 'avx512dq',
     'Avx512Vl': 'avx512vl', 'Avx512Vnni': 'avx512vnni', 'Avx512BitAlg': 'avx512bitalg',
@@ -129,7 +130,6 @@ EXTRA_MACROS = [
     ('AvxIfma', '__AVXIFMA__'),
     ('AvxNeConvert', '__AVXNECONVERT__'),
     ('Cmpccxadd', '__CMPCCXADD__'),
-    ('Sha512', '__SHA512__'),
     ('Sm3', '__SM3__'),
     ('Sm4', '__SM4__'),
     ('Movrs', '__MOVRS__'),
@@ -144,7 +144,7 @@ EXTRA_MACROS = [
 # GCC's option for each macro-only extension.
 EXTRA_OPTION_NAMES = {
     'Prfchw': 'prfchw', 'AvxIfma': 'avxifma', 'AvxNeConvert': 'avxneconvert',
-    'Cmpccxadd': 'cmpccxadd', 'Sha512': 'sha512', 'Sm3': 'sm3', 'Sm4': 'sm4',
+    'Cmpccxadd': 'cmpccxadd', 'Sm3': 'sm3', 'Sm4': 'sm4',
     'Movrs': 'movrs', 'UserMsr': 'usermsr', 'AmxTile': 'amx-tile',
     'AmxInt8': 'amx-int8', 'AmxBf16': 'amx-bf16', 'Avx10_1': 'avx10.1',
     'Avx10_2': 'avx10.2', 'ApxF': 'apxf',

@@ -911,6 +911,9 @@ pub(super) fn known_explicit_vector_inputs(mn: &str, operands: &str) -> bool {
                 | "sha1rnds4"
                 | "sha256msg1"
                 | "sha256msg2"
+                | "sha512msg1"
+                | "sha512msg2"
+                | "sha512rnds2"
                 | "zeroupper"
                 | "zeroall"
         )
