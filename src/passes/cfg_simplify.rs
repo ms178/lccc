@@ -732,7 +732,6 @@ fn for_each_direct_target_mut(term: &mut Terminator, mut f: impl FnMut(&mut Bloc
     }
 }
 
-/// Missing or duplicated required PHI arms are not evidence for a rewrite.
 // ---------------------------------------------------------------------------
 // Sub-pass: switch-case relay threading
 // ---------------------------------------------------------------------------
@@ -827,61 +826,52 @@ fn thread_switch_case_relays_impl(
     if label_to_idx.len() != func.blocks.len() {
         return 0;
     }
-    // DISTINCT predecessor BLOCKS, not edge occurrences.  `build_pred_info`
-    // counts mentions, so a `switch` whose default arm equals one of its case
-    // arms (the exact shape SipHash's fall-through ladder produces, and the
-    // normal result of `simplify_redundant_cond_branches` folding a redundant
-    // arm onto the default) reports two predecessors for a block that only ONE
-    // block can reach.  Retargeting every one of those arms is a complete edge
-    // rewrite, so the correct predicate here is "exactly one distinct
-    // predecessor block", and it is computed locally so this pass cannot
-    // change the meaning of `build_pred_info` for the sub-passes that share it.
-    let mut pred_blocks: FxHashMap<BlockId, FxHashSet<BlockId>> = FxHashMap::default();
+    if !func
+        .blocks
+        .iter()
+        .any(|b| matches!(b.terminator, Terminator::Switch { .. }))
     {
-        let mut record = |from: BlockId, to: BlockId| {
-            pred_blocks.entry(to).or_default().insert(from);
+        return 0;
+    }
+    // Edges from one source arrive together. Track just the last source and
+    // a saturating count instead of allocating a predecessor set per block.
+    let mut preds = vec![(None, 0u8); func.blocks.len()];
+    let mut phi_fed = FxHashSet::default();
+    for block in &func.blocks {
+        let mut record = |target: BlockId| {
+            if let Some(&idx) = label_to_idx.get(&target) {
+                let (last, count) = &mut preds[idx];
+                if *last != Some(block.label) {
+                    *last = Some(block.label);
+                    *count = count.saturating_add(1);
+                }
+            }
         };
-        for block in &func.blocks {
-            let src = block.label;
-            let mut targets: Vec<BlockId> = Vec::new();
-            for_each_terminator_target(&block.terminator, |t| targets.push(t));
-            for inst in &block.instructions {
-                if let Instruction::InlineAsm { goto_labels, .. } = inst {
-                    for (_, label) in goto_labels {
-                        targets.push(*label);
+        for_each_terminator_target(&block.terminator, &mut record);
+        for inst in &block.instructions {
+            match inst {
+                Instruction::InlineAsm { goto_labels, .. } => {
+                    for (_, target) in goto_labels {
+                        record(*target);
                     }
                 }
-            }
-            for target in targets {
-                record(src, target);
-            }
-        }
-    }
-    let mut phi_fed: FxHashSet<BlockId> = FxHashSet::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Phi { incoming, .. } = inst {
-                for (_, from) in incoming {
-                    phi_fed.insert(*from);
+                Instruction::Phi { incoming, .. } => {
+                    phi_fed.extend(incoming.iter().map(|(_, from)| *from));
                 }
+                _ => {}
             }
         }
     }
     // relay label -> destination, for every threadable relay.
     let mut relay_target: FxHashMap<BlockId, BlockId> = FxHashMap::default();
-    for block in &func.blocks {
+    for (idx, block) in func.blocks.iter().enumerate() {
         if !block.instructions.is_empty() {
             continue;
         }
         let Terminator::Branch(target) = block.terminator else {
             continue;
         };
-        if target == block.label
-            || pred_blocks
-                .get(&block.label)
-                .is_none_or(|preds| preds.len() != 1)
-            || phi_fed.contains(&block.label)
-        {
+        if target == block.label || preds[idx].1 != 1 || phi_fed.contains(&block.label) {
             continue;
         }
         relay_target.insert(block.label, target);

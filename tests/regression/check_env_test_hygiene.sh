@@ -158,7 +158,7 @@ MARKER='FIX''ME'
 #        `cfg_simplify::set_switch_relay_thread_enabled`, the shape every other
 #        switch above uses, so its `cfg_simplify.rs` read leaves the count and
 #        the GVN cast-rename knob -- which had pushed the measurement to 151 --
-#        is installed the same way (`gvn::set_cast_rename_enabled`).  The net
+#        is carried by the immutable per-module GVN context. The net
 #        change is zero reads against the tree this PR branched from: the two
 #        new opt-in knobs cost nothing here, so the budget stays 150.
 ENV_READ_BUDGET=150
