@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 575,
+  "knob_literals": 577,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -13,6 +13,7 @@
     "CCC_ASM_DEBUG",
     "CCC_BEPRE_FP",
     "CCC_CALLER_SAVE_SPANNING",
+    "CCC_CAST_RENAME",
     "CCC_CUNROLL_FP_BUDGET",
     "CCC_CUNROLL_INT_BUDGET",
     "CCC_DBG_DA",
@@ -452,6 +453,7 @@
     "CCC_SROA_COPYOUT",
     "CCC_SSA_PARAM_LOG",
     "CCC_SSA_PARAM_SKIP",
+    "CCC_SWITCH_RELAY_THREAD",
     "CCC_TEMP_DEBUG",
     "CCC_TEST_SUPPORT_GUARD_ABSENT",
     "CCC_TEST_SUPPORT_GUARD_LOCK",
@@ -582,7 +584,7 @@
     "LCCC_WHY_NOT_VECTORIZE"
   ],
   "knobs_undocumented": 250,
-  "panic_sites": 863,
+  "panic_sites": 861,
   "panic_sites_hot": 94,
   "unsafe_sites": 27
 }

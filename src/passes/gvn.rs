@@ -201,11 +201,12 @@ fn obj_key(base: &PtrBase) -> ObjKey {
 /// Module facts needed to canonicalize GNU symbol aliases during GVN.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GvnContext {
+    cast_rename: bool,
     aliases: FxHashMap<String, String>,
 }
 
 impl GvnContext {
-    pub(crate) fn for_module(module: &IrModule) -> Self {
+    pub(crate) fn for_module(module: &IrModule, cast_rename: bool) -> Self {
         let direct: FxHashMap<String, String> = module
             .aliases
             .iter()
@@ -223,7 +224,10 @@ impl GvnContext {
             }
             aliases.insert(alias.clone(), current.to_string());
         }
-        Self { aliases }
+        Self {
+            aliases,
+            cast_rename,
+        }
     }
 
     fn canonical<'a>(&'a self, name: &'a str) -> &'a str {
@@ -1210,8 +1214,16 @@ fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
 ///   hoist every matcher already accepts; and a loop-variant `a - b` over
 ///   body loads cannot hit a dominator entry, because load value numbers
 ///   are invalidated at the header merge (the dot-product argument).
-fn cross_block_renamable(inst: &Instruction) -> bool {
+fn cross_block_renamable(inst: &Instruction, cast_rename: bool) -> bool {
     match inst {
+        // Pointer materialization and floating-point conversions remain site-local.
+        Instruction::Cast { from_ty, to_ty, .. } => {
+            cast_rename
+                && from_ty.is_integer()
+                && to_ty.is_integer()
+                && !from_ty.is_128bit()
+                && !to_ty.is_128bit()
+        }
         Instruction::BinOp {
             op: IrBinOp::Mul,
             ty,
@@ -2211,7 +2223,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 {
                     if block_defs.contains(&ev.0) {
                         Some((ev, None))
-                    } else if !cross_block_renamable(&inst) {
+                    } else if !cross_block_renamable(&inst, state.context.cast_rename) {
                         // Cross-block RENAMING is scoped to INTEGER `Mul`
                         // — the audited work-order class ("redundant
                         // multiplications of induction variables"):
@@ -3254,6 +3266,182 @@ mod tests {
             rhs: Operand::Value(Value(rhs)),
             ty,
         }
+    }
+
+    fn cast_inst(dest: u32, src: u32, from: IrType, to: IrType) -> Instruction {
+        Instruction::Cast {
+            dest: Value(dest),
+            src: Operand::Value(Value(src)),
+            from_ty: from,
+            to_ty: to,
+        }
+    }
+
+    /// Recursive acyclic CFG helper: `blocks` bodies chained 0 -> 1 -> ... -> n-1.
+    /// Used by the ordering tests below, which need "b0 defines, b1 duplicates"
+    /// without a cycle so dominance and reachability are unambiguous.
+    fn chain(blocks: Vec<BasicBlock>) -> IrFunction {
+        fn_of("chain", blocks, 64)
+    }
+
+    fn context_with_cast_rename() -> GvnContext {
+        GvnContext {
+            cast_rename: true,
+            ..GvnContext::default()
+        }
+    }
+
+    #[test]
+    fn integer_cast_duplicate_in_dominated_block_is_renamed() {
+        // The zlib-ng `smaller` shape at IR level: the frontend emits
+        // `Cast I32->I64(%idx)` once per syntactic mention of `tree[idx]`.
+        // The entry block's cast dominates, so the dominated duplicate must be
+        // DELETED (a rename), not turned into a Copy: a Copy would keep a
+        // `movslq` in the predicate.
+        let func = chain(vec![
+            blk(
+                0,
+                vec![cast_inst(2, 0, IrType::I32, IrType::I64)],
+                Terminator::Branch(BlockId(1)),
+                vec![],
+            ),
+            blk(
+                1,
+                vec![
+                    cast_inst(3, 0, IrType::I32, IrType::I64),
+                    mul_inst(4, 3, 3, IrType::I64),
+                ],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+                vec![],
+            ),
+        ]);
+        let mut module = IrModule {
+            functions: vec![func],
+            ..IrModule::default()
+        };
+        module.for_each_function(|f| run_gvn_function_with_context(f, &context_with_cast_rename()));
+        let b1 = &module.functions[0].blocks[1];
+        assert_eq!(
+            b1.instructions.len(),
+            1,
+            "duplicate cast must be deleted, got {:?}",
+            b1.instructions
+        );
+        match &b1.instructions[0] {
+            Instruction::BinOp { lhs, .. } => {
+                assert_eq!(
+                    lhs,
+                    &Operand::Value(Value(2)),
+                    "use must read the dominator's cast"
+                );
+            }
+            other => panic!("expected the Mul to survive, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pointer_cast_is_not_renamed() {
+        let inst = cast_inst(2, 0, IrType::I64, IrType::Ptr);
+        assert!(!cross_block_renamable(&inst, true));
+        assert!(!cross_block_renamable(
+            &cast_inst(2, 0, IrType::Void, IrType::I64),
+            true
+        ));
+        assert!(!cross_block_renamable(
+            &cast_inst(2, 0, IrType::I32, IrType::I64),
+            false
+        ));
+    }
+
+    #[test]
+    fn float_cast_is_not_renamed() {
+        // int<->float conversions are pinned by the FP contraction order
+        // rules; they must never be deleted cross-block.
+        let func = chain(vec![
+            blk(
+                0,
+                vec![cast_inst(2, 0, IrType::I32, IrType::F64)],
+                Terminator::Branch(BlockId(1)),
+                vec![],
+            ),
+            blk(
+                1,
+                vec![cast_inst(3, 0, IrType::I32, IrType::F64)],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+                vec![],
+            ),
+        ]);
+        let mut module = IrModule {
+            functions: vec![func],
+            ..IrModule::default()
+        };
+        module.for_each_function(|f| run_gvn_function_with_context(f, &context_with_cast_rename()));
+        let b1 = &module.functions[0].blocks[1];
+        // Kept verbatim: the cross-block class refuses float conversions, so
+        // the pre-existing "no cross-block CSE" behaviour is preserved
+        // exactly (a deletion here would reorder the FP op sequence that the
+        // contraction passes pin).
+        assert_eq!(b1.instructions.len(), 1);
+        assert!(
+            matches!(
+                &b1.instructions[0],
+                Instruction::Cast {
+                    dest: Value(3),
+                    to_ty: IrType::F64,
+                    ..
+                }
+            ),
+            "float cast must stay materialised, got {:?}",
+            b1.instructions
+        );
+    }
+
+    #[test]
+    fn rename_is_refused_for_phi_feeding_duplicate() {
+        // A duplicate cast that feeds a phi keeps its instruction: deleting it
+        // would leave the phi reading a body-defined value, which the
+        // unrollers/vectorizers structurally refuse.
+        let func = fn_of(
+            "phi_feed",
+            vec![
+                blk(
+                    0,
+                    vec![cast_inst(2, 0, IrType::I32, IrType::I64)],
+                    Terminator::CondBranch {
+                        cond: Operand::Value(Value(0)),
+                        true_label: BlockId(1),
+                        false_label: BlockId(2),
+                    },
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![cast_inst(3, 0, IrType::I32, IrType::I64)],
+                    Terminator::Branch(BlockId(2)),
+                    vec![],
+                ),
+                blk(
+                    2,
+                    vec![Instruction::Phi {
+                        dest: Value(5),
+                        ty: IrType::I64,
+                        incoming: vec![
+                            (Operand::Value(Value(3)), BlockId(1)),
+                            (Operand::Value(Value(2)), BlockId(0)),
+                        ],
+                    }],
+                    Terminator::Return(Some(Operand::Value(Value(5)))),
+                    vec![],
+                ),
+            ],
+            64,
+        );
+        let mut module = IrModule {
+            functions: vec![func],
+            ..IrModule::default()
+        };
+        module.for_each_function(|f| run_gvn_function_with_context(f, &context_with_cast_rename()));
+        assert_eq!(module.functions[0].blocks[1].instructions.len(), 1);
     }
 
     fn blk(

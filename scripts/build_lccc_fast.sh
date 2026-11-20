@@ -130,6 +130,30 @@ else
     printf '%s\n' "note: no driver can link through mold; linking with gcc + GNU ld (bfd)"
 fi
 
+# ---- disk headroom ----------------------------------------------------------
+# A fastbuild tree is not small and it GROWS: `incremental/` reached 5.7 GiB and
+# `deps/` 1.7 GiB on the 25 GiB research filesystem, at which point rustc fails
+# with "failed to build archive ... No space left on device (os error 28)" --
+# reported as a BUILD failure, which reads like a compiler defect and cost a CI
+# round (2026-11-19). Warn, but never delete an incremental tree outside
+# Cargo's build-directory lock: another build may still be writing it.
+#
+# `df` must be pointed at the nearest EXISTING ancestor: a clean tree has no
+# `target/` yet, and `df -Pk missing/path` exits non-zero with an empty field,
+# which the old `free_kib=0` fallback silently read as "unknown" -- so the
+# very first build after a restore ran the ENOSPC check on nothing and could
+# not reclaim. Walk up to the first real directory instead of assuming.
+_probe_dir=${CARGO_TARGET_DIR:-$repo_root/target}
+while [[ ! -d $_probe_dir && $_probe_dir != / ]]; do
+    _probe_dir=$(dirname -- "$_probe_dir")
+done
+free_kib=$(df -Pk "$_probe_dir" 2>/dev/null | awk 'NR==2 {print $4}') || free_kib=0
+case $free_kib in ''|*[!0-9]*) free_kib=0 ;; esac
+if (( free_kib > 0 && free_kib < 4 * 1024 * 1024 )); then
+    echo "warning: only $((free_kib / 1024)) MiB free on the target filesystem;" >&2
+    echo "         a fastbuild tree needs ~8 GiB; clean idle targets before building" >&2
+fi
+
 printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
 
 # Fail on warnings unless explicitly opted out.

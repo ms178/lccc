@@ -45,6 +45,11 @@ pub(crate) mod fp_const_hoist;
 pub(crate) mod fp_double;
 pub(crate) mod global_addr_cse;
 pub(crate) mod gvn;
+
+fn cast_rename_enabled() -> bool {
+    std::env::var_os("CCC_CAST_RENAME").is_some_and(|v| v == "1")
+}
+
 pub(crate) mod i128_split;
 pub(crate) mod if_convert;
 mod index_hoist;
@@ -645,7 +650,7 @@ fn run_gvn_licm_ivsr_shared(
     let mut gvn_total = 0usize;
     let mut licm_total = 0usize;
     let mut ivsr_total = 0usize;
-    let gvn_context = gvn::GvnContext::for_module(module);
+    let gvn_context = gvn::GvnContext::for_module(module, cast_rename_enabled());
     let licm_safe_globals = if run_licm {
         licm::speculation_safe_globals(module)
     } else {
@@ -1049,7 +1054,7 @@ fn run_inline_phase(
         // facts) exactly like the main pass loop: with the default context,
         // loads across stores to GNU-alias'd globals are CSE'd and produce
         // wrong code (regression gvn_global_symbol_alias).
-        let gvn_ctx = gvn::GvnContext::for_module(module);
+        let gvn_ctx = gvn::GvnContext::for_module(module, cast_rename_enabled());
         module.for_each_function(|f| gvn::run_gvn_function_with_context(f, &gvn_ctx));
         module.for_each_function(dce::eliminate_dead_code);
     }
@@ -2014,6 +2019,9 @@ pub(crate) fn run_passes(
         enabled: std::env::var("CCC_NO_LOOP_IDIOM").is_err(),
         memchr: std::env::var_os("CCC_NO_MEMCHR_IDIOM").is_none(),
     });
+    cfg_simplify::set_switch_relay_thread_enabled(
+        std::env::var_os("CCC_SWITCH_RELAY_THREAD").is_some_and(|v| v == "1"),
+    );
     let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
     vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
     vectorize::set_strided_reduce_trace(std::env::var_os("LCCC_VEC_STRIDED_TRACE").is_some());
