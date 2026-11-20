@@ -494,13 +494,16 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             };
             let values: Vec<&str> = values_str.split(',').map(|s| s.trim()).collect();
             let body = collect_block_body(lines, &mut i)?;
-            for val in &values {
+            for &val in &values {
                 // Substitute \var with val in each body line
                 let subst_body: Vec<String> = body
                     .iter()
                     .map(|line| {
-                        let pattern = format!("\\{}", var);
-                        asm_preprocess::replace_macro_param(line, &pattern, val)
+                        asm_preprocess::expand_macro_refs(
+                            line,
+                            |name| (name == var).then_some(val),
+                            None,
+                        )
                     })
                     .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
@@ -526,11 +529,11 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
                 let subst_body: Vec<String> = body
                     .iter()
                     .map(|line| {
-                        let pattern = format!("\\{}", var);
-                        let substituted =
-                            asm_preprocess::replace_macro_param(line, &pattern, &ch_str);
-                        // Strip GAS macro argument delimiters: \() resolves to empty string
-                        substituted.replace("\\()", "")
+                        asm_preprocess::expand_macro_refs(
+                            line,
+                            |name| (name == var).then_some(ch_str.as_str()),
+                            None,
+                        )
                     })
                     .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();

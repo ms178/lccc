@@ -1701,7 +1701,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
             | AsmItem::Symver(_, _, _)
             | AsmItem::Empty
             | AsmItem::Align { .. }
-            | AsmItem::Org(_, _, _) => {}
+            | AsmItem::Org(_, _, _)
+            // Symbol assignments and common symbols put no byte into this
+            // section either, and a mode switch only re-reads what follows.
+            // GNU as 2.47 pads `ret; .set s, .-f; .p2align 4` with ONE long
+            // NOP; counting `.set` as data put a plain `nop` in front of it.
+            // The kernel's `SYM_FUNC_END` is a `.set`, so every function
+            // entry of every `.S` file was padded with two NOPs for one.
+            | AsmItem::Set(_, _)
+            | AsmItem::Local(_)
+            | AsmItem::Comm(_, _, _)
+            | AsmItem::Lcomm(_, _, _)
+            | AsmItem::CodeMode(_) => {}
             _ => *state = false,
         }
         result
@@ -2945,14 +2956,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Use the appropriate encoder based on current code mode.
         // When the i686 assembler is in .code64 mode, it delegates to
         // the x86-64 encoder for 64-bit instruction encoding.
-        let result = if self.code_mode == 64 && A::default_code_mode() != 64 {
-            A::encode_instruction_code64(instr, base_offset)?
+        let encoded = if self.code_mode == 64 && A::default_code_mode() != 64 {
+            A::encode_instruction_code64(instr, base_offset)
         } else if self.code_mode == 32 && A::default_code_mode() == 64 {
-            A::encode_instruction_code32(instr, base_offset)?
+            A::encode_instruction_code32(instr, base_offset)
         } else if self.code_mode == 17 && A::default_code_mode() != 64 {
             // `.code16gcc`: like .code16, but unsuffixed call/ret take
             // 32-bit operands (GCC's -m16 calling convention).
-            A::encode_instruction_code16_gcc(instr, base_offset)?
+            A::encode_instruction_code16_gcc(instr, base_offset)
         } else if self.code_mode == 16 && A::default_code_mode() != 64 {
             if std::env::var("LCCC_DBG16").is_ok() {
                 lccc::cli::stderr_line(format_args!(
@@ -2960,7 +2971,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     instr.mnemonic
                 ));
             }
-            A::encode_instruction_code16(instr, base_offset)?
+            A::encode_instruction_code16(instr, base_offset)
         } else if (self.code_mode == 16 || self.code_mode == 17) && A::default_code_mode() == 64 {
             // .code16/.code16gcc inside a 64-bit TU: real-mode code must be
             // assembled via the -m16 (i686) path where operand-size
@@ -2972,8 +2983,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 instr.mnemonic
             ));
         } else {
-            A::encode_instruction(instr, base_offset)?
+            A::encode_instruction(instr, base_offset)
         };
+        // An error that names no instruction gets the statement it is about.
+        // Messages that already quote one (GAS's own wordings do) are kept
+        // verbatim.
+        let result = encoded.map_err(|e| {
+            if e.contains('`') || e.contains(instr.mnemonic.as_str()) {
+                e
+            } else {
+                format!("{e}: `{}'", instr.source_text())
+            }
+        })?;
         let instr_len = result.bytes.len();
         self.sections[sec_idx].push_bytes(&result.bytes)?;
 
@@ -6964,6 +6985,39 @@ mod tests {
         ] {
             assert_eq!(assemble_text(&format!(".text\n{src}")), want, "{src}");
         }
+    }
+
+    /// A directive that puts no byte into the section leaves the padding
+    /// state alone (each row measured on GNU as 2.47: `ret`, the directive,
+    /// `.p2align 4` pads 15 bytes as `0f 1f 40 00` + the 11-byte NOP, with no
+    /// plain `nop` in front). `.set` is the kernel's `SYM_FUNC_END`, so every
+    /// function entry of a `.S` file sits behind one.
+    #[test]
+    fn symbol_assignments_do_not_split_the_alignment_padding() {
+        let want = [
+            &[0xc3u8, 0x0f, 0x1f, 0x40, 0x00][..],
+            &[0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0, 0xc3][..],
+        ]
+        .concat();
+        for directive in [
+            ".set size_of_f, .-f",
+            ".set one, 1",
+            "one = 1",
+            ".equ two, 2",
+            ".local hidden_one",
+            ".comm common_one,8,8",
+            ".lcomm local_common,8",
+            ".code64",
+            ".type f, @function",
+            ".size f, .-f",
+            ".globl g",
+        ] {
+            let src = format!(".text\nf:\n ret\n{directive}\n.p2align 4\ng:\n ret\n");
+            assert_eq!(assemble_text(&src), want, "{directive}");
+        }
+        // Data in the section still gets the plain NOP in front.
+        let src = ".text\nf:\n ret\n.byte 1\n.p2align 4\ng:\n ret\n";
+        assert_eq!(&assemble_text(src)[..4], [0xc3, 0x01, 0x90, 0x66]);
     }
 
     /// `sh_addralign` of `name` from an ELF64 object written by this module.

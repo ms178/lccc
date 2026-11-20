@@ -646,15 +646,10 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
             };
             let values: Vec<&str> = values_str.split(',').map(|s| s.trim()).collect();
             let body = collect_block_body(lines, &mut i, comment_style)?;
-            for val in &values {
+            for &val in &values {
                 let subst_body: Vec<String> = body
                     .iter()
-                    .map(|line| {
-                        let pattern = format!("\\{}", var);
-                        let substituted = replace_macro_param(line, &pattern, val);
-                        // Strip GAS macro argument delimiters: \() resolves to empty string
-                        substituted.replace("\\()", "")
-                    })
+                    .map(|line| expand_macro_refs(line, |name| (name == var).then_some(val), None))
                     .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
                 let expanded = expand_rept_blocks_with_insn_size(
@@ -733,7 +728,12 @@ impl MacroDef {
     ///   the AES-CTR rounds);
     /// * an omitted argument takes its default, else is an error for
     ///   `:req`, else the EMPTY string -- the earlier `"0"` turned
-    ///   `.byte \a\b` with `b` omitted into `70`.
+    ///   `.byte \a\b` with `b` omitted into `70`;
+    /// * an EMPTY field (`m 1, , 3`) is an omitted argument in its position:
+    ///   the parameter takes its default, `:req` reports it missing, and the
+    ///   arguments behind it keep their parameters. In a `:vararg` it stays
+    ///   an empty field (`V 1, 2, , 4` gives `2,,4`). Empty fields past the
+    ///   last parameter are not "too many".
     fn bind(&self, fields: &[Vec<String>]) -> Result<Vec<String>, String> {
         bind_macro_args(&self.name, &self.params, fields)
     }
@@ -748,6 +748,11 @@ pub(crate) fn bind_macro_args(
     let mut named: Vec<Option<String>> = vec![None; params.len()];
     let mut positional: Vec<(usize, String)> = Vec::new();
     for (field, args) in fields.iter().enumerate() {
+        // An empty field holds a position; behind a keyword there are no
+        // positions left to hold.
+        if args.is_empty() && named.iter().all(Option::is_none) {
+            positional.push((field, String::new()));
+        }
         for arg in args {
             if let Some(eq) = find_toplevel_eq(arg) {
                 let key = arg[..eq].trim();
@@ -777,6 +782,7 @@ pub(crate) fn bind_macro_args(
             named.or_else(|| {
                 positional
                     .next()
+                    .filter(|(_, arg)| !arg.is_empty())
                     .map(|(_, arg)| strip_arg_quotes(&arg).to_string())
             })
         };
@@ -793,7 +799,7 @@ pub(crate) fn bind_macro_args(
         };
         values.push(value);
     }
-    if positional.next().is_some() {
+    if positional.any(|(_, arg)| !arg.is_empty()) {
         return Err("too many positional arguments".to_string());
     }
     Ok(values)
@@ -1116,7 +1122,8 @@ fn is_macro_word_char(c: char) -> bool {
 }
 
 /// Split macro invocation arguments the way the AArch64/RISC-V GAS does;
-/// see [`split_macro_arg_fields`].
+/// see [`split_macro_arg_fields`]. The flat list has no place for an empty
+/// field, so those are not in it.
 pub fn split_macro_args(s: &str) -> Vec<String> {
     split_macro_arg_fields(s, MacroArgLexing::Generic).concat()
 }
@@ -1126,6 +1133,12 @@ pub fn split_macro_args(s: &str) -> Vec<String> {
 ///
 /// * a top-level comma ends a field (commas inside parentheses, strings and
 ///   character literals do not);
+/// * a field with nothing in it is an argument all the same: `m 1, , 3`
+///   leaves the second parameter to its default and gives the third `3`
+///   (`_vaes_1x \enc, 1, \xmm_suffix, \data, tmp=\tmp` with an empty
+///   `\xmm_suffix` in Linux's aes-xts-avx-x86_64.S). Dropping the field
+///   moved every later argument one parameter to the left. Only the field
+///   after the LAST comma may be empty without counting (`m 1, 2,`);
 /// * whitespace separates two arguments only between a character that can
 ///   end a word and one that can begin a word ([`MacroArgLexing`]); next to
 ///   anything else it disappears: `1 + 2`, `(1) (2)` and `%hi(x) %lo(y)` are
@@ -1210,9 +1223,7 @@ pub(crate) fn split_macro_arg_fields(s: &str, lexing: MacroArgLexing) -> Vec<Vec
             }
             ',' if depth <= 0 => {
                 end_arg(&mut arg, &mut field);
-                if !field.is_empty() {
-                    fields.push(std::mem::take(&mut field));
-                }
+                fields.push(std::mem::take(&mut field));
             }
             c if c.is_whitespace() => {
                 while chars.next_if(|c| c.is_whitespace()).is_some() {}
@@ -1349,22 +1360,16 @@ impl MacroRun<'_> {
     fn instantiate(&self, mac: &MacroDef, args: &str) -> Result<Vec<String>, String> {
         let values = mac.bind(&split_macro_arg_fields(args, MacroArgLexing::Generic))?;
         let counter = self.invocations.to_string();
-        // Longest name first, so `\orig` never matches inside `\orig_len`.
-        let mut order: Vec<usize> = (0..mac.params.len()).collect();
-        order.sort_by_key(|&pi| std::cmp::Reverse(mac.params[pi].name.len()));
+        let value_of = |name: &str| {
+            mac.params
+                .iter()
+                .position(|param| param.name == name)
+                .map(|index| values[index].as_str())
+        };
         Ok(mac
             .body
             .iter()
-            .map(|line| {
-                let mut line = line.clone();
-                for &pi in &order {
-                    let pattern = format!("\\{}", mac.params[pi].name);
-                    line = replace_macro_param(&line, &pattern, &values[pi]);
-                }
-                // `\()` separates a parameter from adjacent text
-                // (`\op\()_safe_regs` -> `rdmsr_safe_regs`) and is empty.
-                line.replace("\\()", "").replace("\\@", &counter)
-            })
+            .map(|line| expand_macro_refs(line, value_of, Some(&counter)))
             .collect())
     }
 }
@@ -1455,43 +1460,95 @@ fn split_leading_labels(stmt: &str) -> (Vec<&str>, &str) {
     }
 }
 
-/// Replace `\param` in a macro body line with the argument value, but only
-/// when `\param` is followed by a non-identifier character (or end of string).
+/// Whether `b` can continue the name behind a `\` in a macro body: the
+/// bytes GNU as accepts inside a symbol (`is_part_of_name`): letters,
+/// digits, `_`, `.`, `$`, and every byte with the high bit set.
+#[inline]
+fn is_macro_ref_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$') || b >= 0x80
+}
+
+/// Expand the `\` references of one macro, `.irp` or `.irpc` body line in a
+/// single pass from left to right, as GNU as does (`macro_expand_body`; each
+/// rule measured on 2.47):
 ///
-/// GAS macro parameter references like `\orig` should NOT match as a prefix
-/// of `\orig_len`. In GAS, `\()` is used to explicitly delimit parameter names
-/// from adjacent identifier characters (e.g., `\op\()_safe_regs`).
-pub fn replace_macro_param(text: &str, pattern: &str, replacement: &str) -> String {
-    let pat_len = pattern.len();
-    if pat_len == 0 || !text.contains(pattern) {
-        // Nothing to substitute: skip the copying pass entirely (this runs for
-        // every `\param` of every line of every macro body).
-        return text.to_string();
-    }
-    let text_bytes = text.as_bytes();
-    let mut result = String::with_capacity(text.len());
-    let mut copied = 0; // text before this offset is already in `result`
-    let mut search = 0;
-    while let Some(rel) = text[search..].find(pattern) {
-        let at = search + rel;
-        // The character after the match must not extend the parameter name;
-        // GAS symbol characters include every byte with the high bit set.
-        let continues = text_bytes
-            .get(at + pat_len)
-            .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80);
-        if continues {
-            // Not a full match -- the parameter name continues. `at + 1` is a
-            // char boundary because the pattern starts with `\\`.
-            search = at + 1;
-            continue;
+/// * `\name` — `name` is the longest run of symbol characters that does not
+///   start with a digit. When `value_of` knows it, its value takes its
+///   place; otherwise the text stays as written. So `\orig` is not found in
+///   `\orig_len`, nor `\i` in `\i.text` or `\i$x` (`.` and `$` are
+///   symbol characters; all three are errors in GNU as), while `\i\suffix`
+///   and `\i-1` are.
+/// * `\()` ends a name where the text behind it would continue it and is
+///   empty; in general `\(text)` is `text`, taken literally.
+/// * `\@` is `invocation`, the number of the macro invocation. `None`
+///   leaves it as written.
+/// * Any other `\` stays, and the character behind it is looked at afresh:
+///   `\\a` is a backslash and the value of `a`.
+///
+/// A substituted value is never looked at again. That is what one pass
+/// means, and it is why this is one function and not a replace per
+/// parameter: replacing `\xmm_suffix` first turned `KEY\i\xmm_suffix` into
+/// `KEY\i_XMM`, where `\i` no longer ends (the kernel's
+/// `aes-xts-avx-x86_64.S` then asked for the register `%rdi\i_xmm`), and
+/// an argument that spelled another parameter's reference was replaced
+/// twice.
+///
+/// An unclosed `\(` stays as written; the statement fails where it is
+/// parsed, with the text in the message.
+pub(crate) fn expand_macro_refs<'v>(
+    line: &str,
+    value_of: impl Fn(&str) -> Option<&'v str>,
+    invocation: Option<&str>,
+) -> String {
+    let Some(first) = line.find('\\') else {
+        return line.to_string();
+    };
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut copied = 0; // `line[..copied]` is in `out`, or was replaced
+    let mut at = first; // a backslash
+    loop {
+        let next = at + 1;
+        // Where the scan resumes; `copied` moves only on a replacement.
+        let resume = match bytes.get(next) {
+            Some(b'@') => {
+                if let Some(number) = invocation {
+                    out.push_str(&line[copied..at]);
+                    out.push_str(number);
+                    copied = next + 1;
+                }
+                next + 1
+            }
+            Some(b'(') => match line[next + 1..].find(')') {
+                Some(length) => {
+                    out.push_str(&line[copied..at]);
+                    out.push_str(&line[next + 1..next + 1 + length]);
+                    copied = next + 1 + length + 1;
+                    copied
+                }
+                None => next + 1,
+            },
+            Some(&b) if is_macro_ref_byte(b) && !b.is_ascii_digit() => {
+                let mut end = next + 1;
+                while bytes.get(end).is_some_and(|&b| is_macro_ref_byte(b)) {
+                    end += 1;
+                }
+                if let Some(value) = value_of(&line[next..end]) {
+                    out.push_str(&line[copied..at]);
+                    out.push_str(value);
+                    copied = end;
+                }
+                end
+            }
+            _ => next,
+        };
+        match line[resume..].find('\\') {
+            Some(offset) => at = resume + offset,
+            None => break,
         }
-        result.push_str(&text[copied..at]);
-        result.push_str(replacement);
-        copied = at + pat_len;
-        search = copied;
     }
-    result.push_str(&text[copied..]);
-    result
+    out.push_str(&line[copied..]);
+    out
 }
 
 // ── .if / .else / .endif conditional assembly ──────────────────────────
@@ -2536,70 +2593,103 @@ mod tests {
         );
     }
 
+    /// `expand_macro_refs` with `params` bound and invocation number 7.
+    fn refs(line: &str, params: &[(&str, &str)]) -> String {
+        expand_macro_refs(
+            line,
+            |name| {
+                params
+                    .iter()
+                    .find(|(param, _)| *param == name)
+                    .map(|&(_, value)| value)
+            },
+            Some("7"),
+        )
+    }
+
+    /// A reference is the longest run of symbol characters behind the
+    /// backslash; it is replaced when that whole run is a parameter.
     #[test]
-    fn test_replace_macro_param_basic() {
-        // Basic replacement
+    fn a_macro_reference_is_the_longest_symbol_behind_the_backslash() {
+        let orig = [("orig", "140b")];
+        assert_eq!(refs(".byte \\orig", &orig), ".byte 140b");
+        assert_eq!(refs("\\orig", &orig), "140b");
+        assert_eq!(refs(".byte 42", &orig), ".byte 42");
+        assert_eq!(refs("\\orig-\\alt", &orig), "140b-\\alt");
         assert_eq!(
-            replace_macro_param(".byte \\orig", "\\orig", "140b"),
-            ".byte 140b"
+            refs(".long \\orig - . ; .byte \\orig", &orig),
+            ".long 140b - . ; .byte 140b"
+        );
+        // Longer names: letters, digits, `_`, and as in GNU as `.` and `$`.
+        for longer in [
+            "\\orig_len",
+            "\\orig2",
+            "\\orig.text",
+            "\\orig$x",
+            "\\orig\u{e9}",
+        ] {
+            assert_eq!(refs(longer, &orig), longer);
+        }
+        // A digit does not start a name; names are case-sensitive.
+        assert_eq!(refs("\\1orig \\Orig", &orig), "\\1orig \\Orig");
+        // Both parameters of a pair where one name starts the other.
+        assert_eq!(
+            refs(".byte \\a_b, \\a", &[("a", "1"), ("a_b", "2")]),
+            ".byte 2, 1"
         );
     }
 
+    /// References that touch: each ends where the next backslash begins,
+    /// whatever the lengths of the names and whatever their values start
+    /// with. `KEY\i\xmm_suffix` is the kernel's `_vaes_1x`
+    /// (aes-xts-avx-x86_64.S); replacing the longer name first left
+    /// `KEY\i_XMM`, and `\i` could no longer be found.
     #[test]
-    fn test_replace_macro_param_boundary_rejection() {
-        // \orig should NOT match as prefix of \orig_len
+    fn adjacent_macro_references_are_each_replaced() {
+        let key = [
+            ("enc", "1"),
+            ("i", "5"),
+            ("xmm_suffix", "_XMM"),
+            ("data", "%xmm0"),
+        ];
         assert_eq!(
-            replace_macro_param(".byte \\orig_len", "\\orig", "140b"),
-            ".byte \\orig_len"
+            refs("_vaes \\enc, KEY\\i\\xmm_suffix, \\data", &key),
+            "_vaes 1, KEY5_XMM, %xmm0"
         );
-    }
-
-    #[test]
-    fn test_replace_macro_param_end_of_string() {
-        // \orig at end of text should be replaced
-        assert_eq!(replace_macro_param("\\orig", "\\orig", "140b"), "140b");
-    }
-
-    #[test]
-    fn test_replace_macro_param_followed_by_operator() {
-        // \orig followed by '-' (not an identifier char) should be replaced
         assert_eq!(
-            replace_macro_param("\\orig-\\alt", "\\orig", "142b"),
-            "142b-\\alt"
+            refs(".byte \\a\\b\\c", &[("a", "1"), ("b", "2"), ("c", "3")]),
+            ".byte 123"
         );
+        // An empty value leaves nothing behind.
+        assert_eq!(refs(".byte 1\\a\\b", &[("a", ""), ("b", "5")]), ".byte 15");
     }
 
+    /// One pass: a value that spells a reference is not expanded again
+    /// (`m \b, 7` with body `.byte \a` is `.byte \b`, an error in GNU as).
     #[test]
-    fn test_replace_macro_param_multiple() {
-        // Multiple occurrences
-        assert_eq!(
-            replace_macro_param(".long \\sym - . ; .byte \\sym", "\\sym", "foo"),
-            ".long foo - . ; .byte foo"
-        );
+    fn a_substituted_value_is_not_scanned_again() {
+        assert_eq!(refs(".byte \\a", &[("a", "\\b"), ("b", "7")]), ".byte \\b");
+        assert_eq!(refs(".byte \\a", &[("a", "\\@")]), ".byte \\@");
     }
 
+    /// `\()` is empty, `\(text)` is the text, `\@` the invocation number,
+    /// and a backslash before anything else stays and hides nothing.
     #[test]
-    fn test_replace_macro_param_no_match() {
-        // Pattern not present
-        assert_eq!(
-            replace_macro_param(".byte 42", "\\orig", "140b"),
-            ".byte 42"
-        );
-    }
-
-    #[test]
-    fn test_replace_macro_param_adjacent_digit() {
-        // \orig followed by digit should NOT be replaced (digit is identifier continuation)
-        assert_eq!(replace_macro_param("\\orig2", "\\orig", "foo"), "\\orig2");
-    }
-
-    #[test]
-    fn test_replace_macro_param_before_delimiter() {
-        // \op followed by \() delimiter — \op IS replaced, \() stripped later
-        assert_eq!(
-            replace_macro_param("\\op\\()_safe_regs", "\\op", "rdmsr"),
-            "rdmsr\\()_safe_regs"
-        );
+    fn the_other_backslash_forms_follow_gnu_as() {
+        let op = [("op", "rdmsr"), ("a", "2"), ("n", "n")];
+        assert_eq!(refs("\\op\\()_safe_regs", &op), "rdmsr_safe_regs");
+        assert_eq!(refs(".byte \\a\\()1, \\(4)\\a", &op), ".byte 21, 42");
+        assert_eq!(refs(".L\\@: .byte \\@", &op), ".L7: .byte 7");
+        assert_eq!(expand_macro_refs(".byte \\@", |_| None, None), ".byte \\@");
+        // `"\\n"`: a backslash, then the reference `\n`.
+        assert_eq!(refs(".ascii \"\\\\n\"", &op), ".ascii \"\\n\"");
+        assert_eq!(refs(".ascii \"q\\\\\\n\"", &op), ".ascii \"q\\\\n\"");
+        // Inside a string as anywhere else.
+        assert_eq!(refs(".ascii \"\\op-\\op\"", &op), ".ascii \"rdmsr-rdmsr\"");
+        // Unclosed, unknown, or at the end of the line: as written.
+        for kept in [".byte \\(7", ".byte \\zz", ".byte 1 \\", "\\"] {
+            assert_eq!(refs(kept, &op), kept);
+        }
     }
 
     fn fields(s: &str, lexing: MacroArgLexing) -> Vec<Vec<String>> {
