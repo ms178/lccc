@@ -3395,7 +3395,11 @@ impl super::InstructionEncoder {
     /// take VEX.L from any ymm operand, so the widths are checked here. The memory
     /// forms are rejected: GNU as 2.47 rejects them ("operand type mismatch"), and
     /// lccc matches that reference. The error wording is GAS's.
-    pub(crate) fn encode_sha512_vex(&mut self, mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    pub(crate) fn encode_sha512_vex(
+        &mut self,
+        mnemonic: &str,
+        ops: &[Operand],
+    ) -> Result<(), String> {
         // true = ymm, false = xmm, in AT&T operand order.
         let (opcode, widths): (u8, &[bool]) = match mnemonic {
             "vsha512msg1" => (0xCC, &[false, true]),
@@ -3413,7 +3417,11 @@ impl super::InstructionEncoder {
             if !is_xmm(&r.name) && !is_ymm(&r.name) {
                 return Err(format!("operand type mismatch for `{mnemonic}'"));
             }
-            let width_ok = if want_ymm { is_ymm(&r.name) } else { is_xmm(&r.name) };
+            let width_ok = if want_ymm {
+                is_ymm(&r.name)
+            } else {
+                is_xmm(&r.name)
+            };
             if !width_ok {
                 return Err(format!("operand size mismatch for `{mnemonic}'"));
             }

@@ -4756,7 +4756,8 @@ impl X86Codegen {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     let src = self.vex128_source(&args[1], "xmm1");
-                    self.state.emit_fmt(format_args!("    vsha512msg1 {}, %ymm0", src));
+                    self.state
+                        .emit_fmt(format_args!("    vsha512msg1 {}, %ymm0", src));
                     self.avx_store_dest(dptr);
                 }
             }
@@ -4780,7 +4781,8 @@ impl X86Codegen {
                     self.state.dirty_upper_ymm = true;
                     self.avx_load_arg_to(&args[1], "ymm1");
                     let wk = self.vex128_source(&args[2], "xmm2");
-                    self.state.emit_fmt(format_args!("    vsha512rnds2 {}, %ymm1, %ymm0", wk));
+                    self.state
+                        .emit_fmt(format_args!("    vsha512rnds2 {}, %ymm1, %ymm0", wk));
                     self.avx_store_dest(dptr);
                 }
             }
