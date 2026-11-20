@@ -23,6 +23,7 @@ operand-side load/store analysis in codegen_oracle.py (compare and --rank).
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 import argparse
 import hashlib
 import json
@@ -131,8 +132,14 @@ class GodboltError(RuntimeError):
     """Compiler Explorer request or compilation failure."""
 
 
+# Per-worker policy: a cache miss must not send source in offline surveys.
+CACHE_ONLY = ContextVar("godbolt_cache_only", default=False)
+
+
 def _request_json(url: str, *, body: dict[str, Any] | None = None,
                   timeout: int = 120, retries: int = 3) -> Any:
+    if CACHE_ONLY.get():
+        raise GodboltError("offline cache miss")
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if body is not None:

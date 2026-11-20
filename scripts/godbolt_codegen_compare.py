@@ -69,9 +69,9 @@ One function with reviewable assembly::
     scripts/godbolt_codegen_compare.py hot.c --function crc32_update \\
         --flags '-O3 -march=raptorlake' --artifact-dir results/crc
 
-Runtime arm, and a gate that fails on any >2% regression::
+Exploratory whole-program timings on remote executors (not a host gate)::
 
-    scripts/godbolt_codegen_compare.py matmul.c --mode runtime --fail-on-behind 2
+    scripts/godbolt_codegen_compare.py matmul.c --mode runtime
 
 Re-run offline against the cache and diff against a saved manifest::
 
@@ -179,6 +179,8 @@ class Row:
 
     @property
     def best_name(self) -> str:
+        if self.runtime:
+            return min(self.runtime, key=self.runtime.get)
         live = {n: self._insns(n) for n in self.stats if self._insns(n)}
         return min(live, key=lambda n: live[n]) if live else ""
 
@@ -237,12 +239,10 @@ def _ce_runtime(compiler: str, source: str, flags: str) -> tuple[float | None, s
         return None, f"{type(exc).__name__}: {exc}"
     if not data:
         return None, "no CE response"
-    if data.get("code", 0) != 0:
-        return None, f"execution failed (code {data.get('code')}): " \
-                     f"{(data.get('stderr') or [{}])[0].get('text', '')[:200]}"
-    # CE returns {"execResult": {"code": .., "stdout": [{"text": ...}]}}
-    stdout = "".join(part.get("text", "")
-                     for part in (data.get("stdout") or []))
+    execution = data.get("execResult", data)
+    if execution.get("code") != 0:
+        return None, f"execution failed (code {execution.get('code')})"
+    stdout = "\n".join(part.get("text", "") for part in execution.get("stdout", []))
     match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(ms|s|us|ns)\b", stdout)
     if not match:
         return None, f"no timing in program output (got {stdout[:120]!r})"
@@ -259,6 +259,15 @@ def compare_file(path: Path, *, local: str, oracles: list[str], plan: FlagPlan,
     errs: dict[str, str] = {}
     runtime: dict[str, float] = {}
 
+    if mode == "runtime":
+        for name in oracles:
+            elapsed, err = _ce_runtime(name, text, plan.for_compiler(name))
+            if elapsed is None:
+                errs[name] = err
+            else:
+                runtime[name] = elapsed
+        return [Row(path.name, "<program>", {}, errs, runtime)]
+
     if local:
         lines, err = _local_lines(local, path, plan.for_compiler("lccc"))
         asm["lccc"], errs["lccc"] = lines, err
@@ -266,13 +275,6 @@ def compare_file(path: Path, *, local: str, oracles: list[str], plan: FlagPlan,
         cid = godbolt.COMPILER_ALIASES.get(name, name)
         lines, err = _remote_lines(cid, text, plan.for_compiler(name))
         asm[name], errs[name] = lines, err
-        if mode == "runtime":
-            elapsed, rt_err = _ce_runtime(cid, text, plan.for_compiler(name))
-            if elapsed is not None:
-                runtime[name] = elapsed
-            elif rt_err:
-                errs[name] = rt_err
-
     if artifact_dir is not None:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         for name, lines in asm.items():
@@ -328,7 +330,7 @@ def _fmt(value: float | None) -> str:
 
 
 def render(rows: list[Row], compilers: list[str], mode: str, out=sys.stdout) -> None:
-    names = (["lccc", *compilers] if "lccc" in rows[0].stats or not rows
+    names = (["lccc", *compilers] if any("lccc" in r.stats or "lccc" in r.errors for r in rows)
              else list(compilers))
     header = f"{'function':<32}{'source':<26}" + "".join(f"{n:>9}" for n in names)
     header += f"{'best':>10}{'L/best':>8}"
@@ -414,14 +416,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
-    if args.offline:
-        # godbolt_cache is consulted first by _compile_remote; there is no
-        # cache-miss switch upstream, so offline mode is enforced by refusing
-        # to run with an empty cache rather than by pretending.
-        pass
+    if args.mode == "runtime" and (args.function or args.fail_on_behind is not None):
+        parser.error("remote program timings cannot rank functions or gate host LCCC performance")
 
     oracles = [o for o in (x.strip() for x in args.oracles.split(",")) if o]
     local = "" if args.local in ("", "none") else args.local
+    if args.mode == "runtime":
+        local = ""
     if local and not Path(local).exists():
         print(f"error: local compiler not found: {local}", file=sys.stderr)
         return 2
@@ -437,6 +438,7 @@ def main(argv: list[str] | None = None) -> int:
     failures: list[str] = []
 
     def work(path: Path) -> list[Row]:
+        godbolt.CACHE_ONLY.set(args.offline)
         return compare_file(path, local=local, oracles=oracles, plan=plan,
                             function=args.function, artifact_dir=args.artifact_dir,
                             mode=args.mode,
@@ -452,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
                 failures.append(f"{path.name}: {type(exc).__name__}: {exc}")
                 continue
             for row in result:
-                if row.errors and not row.stats:
+                if row.errors and (not row.stats or args.function or args.fail_on_behind is not None):
                     failures.append(f"{path.name}::{row.function}: {row.errors}")
             rows.extend(result)
 
@@ -534,6 +536,9 @@ def main(argv: list[str] | None = None) -> int:
         tolerance = 1.0 + args.fail_on_behind / 100.0
         key = (lambda r: r.lccc_runtime_over_best) if args.mode == "runtime" \
             else (lambda r: r.lccc_over_best)
+        if not summary["ranked"]:
+            print("FAIL: no comparable LCCC measurements", file=sys.stderr)
+            return 1
         offenders = [r for r in rows if key(r) and key(r) > tolerance]
         if offenders:
             print(f"\nFAIL: {len(offenders)} function(s) more than "
