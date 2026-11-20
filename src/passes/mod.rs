@@ -27,6 +27,7 @@ pub(crate) mod block_layout;
 pub(crate) mod bool_thread;
 pub(crate) mod builtin_policy;
 pub(crate) mod byte_load;
+pub(crate) mod byval_scalar;
 pub(crate) mod cfg_simplify;
 pub(crate) mod const_array_promote;
 pub(crate) mod constant_fold;
