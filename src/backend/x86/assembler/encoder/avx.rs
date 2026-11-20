@@ -7298,3 +7298,82 @@ mod tests {
         );
     }
 }
+
+/// Golden bytes for the AVX/AVX2 memory forms the backend emits for the
+/// sign-bit-masked and non-temporal intrinsics. Every expected byte sequence
+/// was produced by GNU as 2.x (`as --64`) and disassembled with objdump; the
+/// test assembles the same text and compares the whole `.text` section.
+#[cfg(test)]
+mod masked_memory_golden_tests {
+    use crate::backend::x86::assembler::assemble_bytes;
+
+    /// Walk the ELF64 section headers and return the raw `.text` bytes.
+    fn text_section(bytes: &[u8]) -> Vec<u8> {
+        assert_eq!(&bytes[0..4], b"\x7fELF");
+        assert_eq!(bytes[4], 2, "ELFCLASS64 expected");
+        let rd16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize;
+        let rd32 = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+        let rd64 = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()) as usize;
+        let shoff = rd64(0x28);
+        let shentsize = rd16(0x3a);
+        let shnum = rd16(0x3c);
+        let shstrndx = rd16(0x3e);
+        let sh = |i: usize| shoff + i * shentsize;
+        let strtab = rd64(sh(shstrndx) + 0x18);
+        for i in 0..shnum {
+            let name_at = strtab + rd32(sh(i));
+            let end = name_at + bytes[name_at..].iter().position(|&b| b == 0).unwrap();
+            if &bytes[name_at..end] == b".text" {
+                let off = rd64(sh(i) + 0x18);
+                let size = rd64(sh(i) + 0x20);
+                return bytes[off..off + size].to_vec();
+            }
+        }
+        panic!("no .text section");
+    }
+
+    #[test]
+    fn masked_and_streaming_forms_match_gas_golden_bytes() {
+        let asm = concat!(
+            ".text\n",
+            "vmaskmovps (%rax), %ymm1, %ymm0\n",
+            "vmaskmovps (%rax), %xmm1, %xmm0\n",
+            "vmaskmovps %ymm0, %ymm1, (%rax)\n",
+            "vmaskmovps %xmm0, %xmm1, (%rax)\n",
+            "vmaskmovpd (%rax), %ymm1, %ymm0\n",
+            "vmaskmovpd %xmm0, %xmm1, (%rax)\n",
+            "vpmaskmovd (%rax), %ymm1, %ymm0\n",
+            "vpmaskmovd (%rax), %xmm1, %xmm0\n",
+            "vpmaskmovd %ymm0, %ymm1, (%rax)\n",
+            "vpmaskmovq (%rax), %ymm1, %ymm0\n",
+            "vpmaskmovq %xmm0, %xmm1, (%rax)\n",
+            "vmovntdqa (%rax), %ymm0\n",
+            "vmovntdqa (%rax), %xmm0\n",
+            "vmovntdq %ymm0, (%rax)\n",
+            "vmovntpd %ymm0, (%rax)\n",
+            "vmovntps %ymm0, (%rax)\n",
+            "vpmaskmovd (%r9), %ymm10, %ymm11\n",
+        );
+        let golden: &[u8] = &[
+            0xc4, 0xe2, 0x75, 0x2c, 0x00, // vmaskmovps (%rax),%ymm1,%ymm0
+            0xc4, 0xe2, 0x71, 0x2c, 0x00, // vmaskmovps (%rax),%xmm1,%xmm0
+            0xc4, 0xe2, 0x75, 0x2e, 0x00, // vmaskmovps %ymm0,%ymm1,(%rax)
+            0xc4, 0xe2, 0x71, 0x2e, 0x00, // vmaskmovps %xmm0,%xmm1,(%rax)
+            0xc4, 0xe2, 0x75, 0x2d, 0x00, // vmaskmovpd (%rax),%ymm1,%ymm0
+            0xc4, 0xe2, 0x71, 0x2f, 0x00, // vmaskmovpd %xmm0,%xmm1,(%rax)
+            0xc4, 0xe2, 0x75, 0x8c, 0x00, // vpmaskmovd (%rax),%ymm1,%ymm0
+            0xc4, 0xe2, 0x71, 0x8c, 0x00, // vpmaskmovd (%rax),%xmm1,%xmm0
+            0xc4, 0xe2, 0x75, 0x8e, 0x00, // vpmaskmovd %ymm0,%ymm1,(%rax)
+            0xc4, 0xe2, 0xf5, 0x8c, 0x00, // vpmaskmovq (%rax),%ymm1,%ymm0
+            0xc4, 0xe2, 0xf1, 0x8e, 0x00, // vpmaskmovq %xmm0,%xmm1,(%rax)
+            0xc4, 0xe2, 0x7d, 0x2a, 0x00, // vmovntdqa (%rax),%ymm0
+            0xc4, 0xe2, 0x79, 0x2a, 0x00, // vmovntdqa (%rax),%xmm0
+            0xc5, 0xfd, 0xe7, 0x00, // vmovntdq %ymm0,(%rax)
+            0xc5, 0xfd, 0x2b, 0x00, // vmovntpd %ymm0,(%rax)
+            0xc5, 0xfc, 0x2b, 0x00, // vmovntps %ymm0,(%rax)
+            0xc4, 0x42, 0x2d, 0x8c, 0x19, // vpmaskmovd (%r9),%ymm10,%ymm11
+        ];
+        let object = assemble_bytes(asm, None).expect("x86-64 assemble failed");
+        assert_eq!(text_section(&object), golden);
+    }
+}

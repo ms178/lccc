@@ -427,6 +427,16 @@ _mm_cmplt_epi32(__m128i __a, __m128i __b)
     return __r;
 }
 
+/* _mm_mul_su32: PMULUDQ on the 64-bit MMX register (GCC 16.2 places it
+ * here, not in mmintrin.h). Multiplies the low 32-bit unsigned dwords. */
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_mul_su32(__m64 __a, __m64 __b)
+{
+    unsigned long long __x = (unsigned int)(unsigned long long)(long long)__a;
+    unsigned long long __y = (unsigned int)(unsigned long long)(long long)__b;
+    return (__m64)(long long)(__x * __y);
+}
+
 /* _mm_mul_epu32: unsigned 32x32->64 multiply (PMULUDQ)
  * Multiplies the low 32-bit unsigned integers from each 64-bit lane:
  * result[0] = (u32)a[0] * (u32)b[0], result[1] = (u32)a[2] * (u32)b[2] */
@@ -752,6 +762,13 @@ _mm_loadl_epi64(__m128i const *__p)
     return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_loadldi128(__p));
 }
 
+/* Keep the low 64 bits of __a, zero the high 64 bits (MOVQ xmm, xmm) */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_move_epi64(__m128i __a)
+{
+    return (__m128i)__builtin_shufflevector((__v2di)(__a), (__v2di)(_mm_setzero_si128()), 0, 2);
+}
+
 /* === Float/Int Conversion (SSE2) === */
 
 /* Convert packed 32-bit integers to packed single-precision floats */
@@ -928,6 +945,182 @@ _mm_loadl_pd(__m128d __a, double const *__p)
 {
     __a[0] = *__p;
     return __a;
+}
+
+/* Shifts by a scalar count in the low 64 bits of an XMM register (_mm_sll_epi32,
+ * _mm_sll_epi64, _mm_srl_epi32, _mm_srl_epi64, _mm_sra_epi16, _mm_sra_epi32, and
+ * the 16-bit logical forms) are compiler builtins that lower to PSLL/PSRL/PSRA
+ * with an XMM count. The former scalar C wrappers are removed: they scalarised
+ * to per-lane shifts with stack spills. */
+
+/* Byte-granular shifts. GCC 16.2 names these as aliases of PSLLDQ / PSRLDQ. */
+#define _mm_bslli_si128(__a, __imm) _mm_slli_si128((__a), (__imm))
+#define _mm_bsrli_si128(__a, __imm) _mm_srli_si128((__a), (__imm))
+
+/* Scalar double compares named by their negated predicates (GCC 16.2 names).
+ * The low lane is the predicate; the high lane comes from the first operand.
+ * The "not greater" and "not greater-or-equal" forms are the swapped
+ * "not less" and "not less-or-equal" compares, as in GCC's definitions. Only
+ * the SSE2 predicates 3..7 are used, so these stay legal under -msse2. */
+#define __CCC_SD_MERGE(__a, __cmp) _mm_move_sd((__a), (__cmp))
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpneq_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpneq_pd(__a, __b));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpnlt_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpnlt_pd(__a, __b));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpnle_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpnle_pd(__a, __b));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpngt_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpnlt_pd(__b, __a));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpnge_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpnle_pd(__b, __a));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpord_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpord_pd(__a, __b));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cmpunord_sd(__m128d __a, __m128d __b)
+{
+    return __CCC_SD_MERGE(__a, _mm_cmpunord_pd(__a, __b));
+}
+
+/* MMX pair <-> XMM low quadword moves and 64-bit constructors. __m64 is an
+ * 8-byte value, so the casts below are same-size bitcasts. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_set_epi64(__m64 __q1, __m64 __q0)
+{
+    return _mm_set_epi64x((long long)__q1, (long long)__q0);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_set1_epi64(__m64 __q)
+{
+    return _mm_set_epi64x((long long)__q, (long long)__q);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_setr_epi64(__m64 __q0, __m64 __q1)
+{
+    return _mm_set_epi64x((long long)__q1, (long long)__q0);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("sse2")))
+_mm_movepi64_pi64(__m128i __a)
+{
+    return (__m64)((__v2di)__a)[0];
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_movpi64_epi64(__m64 __a)
+{
+    return _mm_set_epi64x(0LL, (long long)__a);
+}
+
+/* Partial-width unaligned loads and stores (GCC 16.2 names). A 16-, 32- or
+ * 64-bit load fills the low bytes and zeroes the rest. A store writes only the
+ * low bytes. memcpy with a constant size is the portable, alias-safe form. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_loadu_si16(void const *__p)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, __p, 2);
+    return __r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_loadu_si32(void const *__p)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, __p, 4);
+    return __r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_loadu_si64(void const *__p)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, __p, 8);
+    return __r;
+}
+
+static __inline__ void __attribute__((__always_inline__, target("sse2")))
+_mm_storeu_si16(void *__p, __m128i __b)
+{
+    __builtin_memcpy(__p, &__b, 2);
+}
+
+static __inline__ void __attribute__((__always_inline__, target("sse2")))
+_mm_storeu_si32(void *__p, __m128i __b)
+{
+    __builtin_memcpy(__p, &__b, 4);
+}
+
+static __inline__ void __attribute__((__always_inline__, target("sse2")))
+_mm_storeu_si64(void *__p, __m128i __b)
+{
+    __builtin_memcpy(__p, &__b, 8);
+}
+
+/* _mm_move_epi16 / _mm_move_epi32: keep the low element, zero the rest. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_move_epi16(__m128i __a)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, &__a, 2);
+    return __r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_move_epi32(__m128i __a)
+{
+    __m128i __r = _mm_setzero_si128();
+    __builtin_memcpy(&__r, &__a, 4);
+    return __r;
+}
+
+/* _mm_undefined_si128: the value is unspecified. Zero is a valid choice and
+ * keeps the result deterministic. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse2")))
+_mm_undefined_si128(void)
+{
+    return _mm_setzero_si128();
+}
+
+/* _mm_maskmoveu_si128 (MASKMOVDQU): store byte i of __d to __p[i] only where
+ * the sign bit of byte i of __n is set. Masked-off bytes are not written. */
+static __inline__ void __attribute__((__always_inline__, target("sse2")))
+_mm_maskmoveu_si128(__m128i __d, __m128i __n, char *__p)
+{
+    unsigned char __db[16];
+    unsigned char __nb[16];
+    __builtin_memcpy(__db, &__d, 16);
+    __builtin_memcpy(__nb, &__n, 16);
+    for (int __i = 0; __i < 16; __i++) {
+        if (__nb[__i] & 0x80)
+            __p[__i] = (char)__db[__i];
+    }
 }
 
 /* _mm_loadh_pd: load high double, keep low from __a */
@@ -1222,6 +1415,28 @@ _mm_cvttsd_si64(__m128d __a)
 /* _mm_cvtsd_ss: convert low double to float, put in low lane of __a */
 
 /* _mm_cvtss_sd: convert low float to double, put in low lane of __a */
+
+/* MMX-register forms of the packed-double conversions (GCC 16.2 emmintrin.h).
+ * The 32-bit results fill the MMX register; the rounding mode is the one the
+ * 128-bit form uses (round-to-nearest for _mm_cvtpd_pi32, truncate for the
+ * _mm_cvttpd_pi32 form). */
+static __inline__ __m64 __attribute__((__always_inline__, target("sse2")))
+_mm_cvtpd_pi32(__m128d __a)
+{
+    return _mm_movepi64_pi64(_mm_cvtpd_epi32(__a));
+}
+
+static __inline__ __m64 __attribute__((__always_inline__, target("sse2")))
+_mm_cvttpd_pi32(__m128d __a)
+{
+    return _mm_movepi64_pi64(_mm_cvttpd_epi32(__a));
+}
+
+static __inline__ __m128d __attribute__((__always_inline__, target("sse2")))
+_mm_cvtpi32_pd(__m64 __a)
+{
+    return _mm_cvtepi32_pd(_mm_movpi64_epi64(__a));
+}
 
 /* _mm_cvtpd_epi32: convert 2 doubles to 2 packed 32-bit integers (round to nearest) */
 

@@ -1673,6 +1673,12 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pmovzxwd128
             | BuiltinIntrinsic::X86Psllw128
             | BuiltinIntrinsic::X86Psrlw128
+            | BuiltinIntrinsic::X86Pslld128
+            | BuiltinIntrinsic::X86Psllq128
+            | BuiltinIntrinsic::X86Psrld128
+            | BuiltinIntrinsic::X86Psrlq128
+            | BuiltinIntrinsic::X86Psraw128
+            | BuiltinIntrinsic::X86Psrad128
             | BuiltinIntrinsic::X86Loadu256
             | BuiltinIntrinsic::X86Storeu256
             | BuiltinIntrinsic::X86Load256
@@ -1833,6 +1839,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Psrawi256
             | BuiltinIntrinsic::X86Psradi256
             | BuiltinIntrinsic::X86Packssdw256
+            | BuiltinIntrinsic::X86Packsswb256
             | BuiltinIntrinsic::X86Packuswb256
             | BuiltinIntrinsic::X86Phaddw256
             | BuiltinIntrinsic::X86Phaddd256
@@ -1856,6 +1863,27 @@ impl Lowerer {
             | BuiltinIntrinsic::X86MulEpi32
             | BuiltinIntrinsic::X86MulloEpi32
             | BuiltinIntrinsic::X86Pcmpgtb256
+            | BuiltinIntrinsic::X86Movntdq256
+            | BuiltinIntrinsic::X86Movntpd256
+            | BuiltinIntrinsic::X86Movntps256
+            | BuiltinIntrinsic::X86MaskStorePs128
+            | BuiltinIntrinsic::X86MaskStorePd128
+            | BuiltinIntrinsic::X86MaskStoreD128
+            | BuiltinIntrinsic::X86MaskStoreQ128
+            | BuiltinIntrinsic::X86MaskStorePs256
+            | BuiltinIntrinsic::X86MaskStorePd256
+            | BuiltinIntrinsic::X86MaskStoreD256
+            | BuiltinIntrinsic::X86MaskStoreQ256
+            | BuiltinIntrinsic::X86MaskLoadPs128
+            | BuiltinIntrinsic::X86MaskLoadPd128
+            | BuiltinIntrinsic::X86MaskLoadD128
+            | BuiltinIntrinsic::X86MaskLoadQ128
+            | BuiltinIntrinsic::X86Movntdqa128
+            | BuiltinIntrinsic::X86MaskLoadPs256
+            | BuiltinIntrinsic::X86MaskLoadPd256
+            | BuiltinIntrinsic::X86MaskLoadD256
+            | BuiltinIntrinsic::X86MaskLoadQ256
+            | BuiltinIntrinsic::X86Movntdqa256
             | BuiltinIntrinsic::X86CastReinterpret => {
                 self.check_x86_intrinsic_feature(intrinsic, name, args);
                 self.lower_x86_intrinsic(intrinsic, name, args)
@@ -3591,6 +3619,22 @@ impl Lowerer {
         name: &str,
         args: &[Expr],
     ) -> Option<Operand> {
+        // Fixed argument counts that the front end cannot check by name (see
+        // `x86_var_shift_arity`). Checked before any operand is lowered.
+        if let Some(expected) = x86_var_shift_arity(intrinsic) {
+            if args.len() != expected {
+                let which = if args.len() < expected {
+                    "too few"
+                } else {
+                    "too many"
+                };
+                let message = format!(
+                    "{which} arguments to function '{name}' (expected {expected}, have {})",
+                    args.len()
+                );
+                return self.reject_builtin_call(message, args, 16);
+            }
+        }
         // One-bit lane immediates must be a constant 0 or 1 (see
         // `x86_lane_immediate_bits`). The check runs before any operand is
         // lowered, so a rejected call leaves no half-built expressions.
@@ -3721,7 +3765,7 @@ impl Lowerer {
                     dest: None,
                     op,
                     dest_ptr: Some(ptr_val),
-                    args: vec![arg_ops[1].clone()],
+                    args: arg_ops[1..].to_vec(),
                 });
                 Some(Operand::Const(IrConst::I64(0)))
             }
@@ -3973,6 +4017,25 @@ impl Lowerer {
 /// argument must be an 1-bit immediate"). The operand lowering masks the
 /// immediate (`& 1`), so without this check an out-of-range constant compiled
 /// to the wrong lane and a runtime value compiled to lane 0, with no diagnostic.
+/// Argument count of the count-in-XMM packed shifts (`_mm_sll_epi16`,
+/// `_mm_sra_epi32`, ...): `(value, count)`. Their public names are not in the
+/// front end's arity table, so nothing else rejects a malformed call. A call
+/// with one argument then indexes past the operands in codegen (ICE), and an
+/// extra argument is silently accepted.
+fn x86_var_shift_arity(intrinsic: &BuiltinIntrinsic) -> Option<usize> {
+    match intrinsic {
+        BuiltinIntrinsic::X86Psllw128
+        | BuiltinIntrinsic::X86Psrlw128
+        | BuiltinIntrinsic::X86Pslld128
+        | BuiltinIntrinsic::X86Psllq128
+        | BuiltinIntrinsic::X86Psrld128
+        | BuiltinIntrinsic::X86Psrlq128
+        | BuiltinIntrinsic::X86Psraw128
+        | BuiltinIntrinsic::X86Psrad128 => Some(2),
+        _ => None,
+    }
+}
+
 fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
     match intrinsic {
         BuiltinIntrinsic::X86Extracti128
@@ -4004,7 +4067,18 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Storeu256
         | BuiltinIntrinsic::X86Store256
         | BuiltinIntrinsic::X86StoreuPs256
-        | BuiltinIntrinsic::X86StoreuPd256 => X86IntrinsicKind::PtrStore,
+        | BuiltinIntrinsic::X86StoreuPd256
+        | BuiltinIntrinsic::X86Movntdq256
+        | BuiltinIntrinsic::X86Movntpd256
+        | BuiltinIntrinsic::X86Movntps256
+        | BuiltinIntrinsic::X86MaskStorePs128
+        | BuiltinIntrinsic::X86MaskStorePd128
+        | BuiltinIntrinsic::X86MaskStoreD128
+        | BuiltinIntrinsic::X86MaskStoreQ128
+        | BuiltinIntrinsic::X86MaskStorePs256
+        | BuiltinIntrinsic::X86MaskStorePd256
+        | BuiltinIntrinsic::X86MaskStoreD256
+        | BuiltinIntrinsic::X86MaskStoreQ256 => X86IntrinsicKind::PtrStore,
 
         BuiltinIntrinsic::X86Pmovmskb128
         | BuiltinIntrinsic::X86Pextrw128
@@ -4127,6 +4201,7 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Psrawi256
         | BuiltinIntrinsic::X86Psradi256
         | BuiltinIntrinsic::X86Packssdw256
+        | BuiltinIntrinsic::X86Packsswb256
         | BuiltinIntrinsic::X86Packuswb256
         | BuiltinIntrinsic::X86Phaddw256
         | BuiltinIntrinsic::X86Phaddd256
@@ -4153,6 +4228,17 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128,
         BuiltinIntrinsic::X86CvtPd2PsValue => X86IntrinsicKind::Vec128,
         BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadPs128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadPd128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadD128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadQ128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86Movntdqa128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86MaskLoadPs256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86MaskLoadPd256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86MaskLoadD256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86MaskLoadQ256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86Movntdqa256 => X86IntrinsicKind::Vec256,
+
         BuiltinIntrinsic::X86MaxPs256V
         | BuiltinIntrinsic::X86MinPs256V
         | BuiltinIntrinsic::X86AndPs256V
@@ -4291,6 +4377,12 @@ fn legacy_xmm_intrinsic_required_feature(
         | B::X86CvtPd2PsValue
         | B::X86Psllw128
         | B::X86Psrlw128
+        | B::X86Pslld128
+        | B::X86Psllq128
+        | B::X86Psrld128
+        | B::X86Psrlq128
+        | B::X86Psraw128
+        | B::X86Psrad128
         | B::X86XorPd
         | B::X86AndPd
         | B::X86OrPd
@@ -4343,6 +4435,57 @@ fn legacy_xmm_intrinsic_required_feature(
     })
 }
 
+/// Memory intrinsics with their own ISA rules: the non-temporal stores and
+/// loads and the sign-bit-masked moves. Kept apart from
+/// `x86_intrinsic_required_feature` to stay inside the census's
+/// function-size budget; the dispatch order is unchanged (legacy XMM, then
+/// this group, then the general table).
+fn x86_memory_intrinsic_required_feature(
+    intrinsic: &BuiltinIntrinsic,
+) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    Some(match intrinsic {
+        // Non-temporal stores and sign-masked float moves are AVX (VEX-only);
+        // the masked integer forms and the 256-bit streaming load need AVX2.
+        B::X86Movntdq256
+        | B::X86Movntpd256
+        | B::X86Movntps256
+        | B::X86MaskLoadPs128
+        | B::X86MaskLoadPd128
+        | B::X86MaskLoadPs256
+        | B::X86MaskLoadPd256
+        | B::X86MaskStorePs128
+        | B::X86MaskStorePd128
+        | B::X86MaskStorePs256
+        | B::X86MaskStorePd256 => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
+        B::X86MaskLoadD128
+        | B::X86MaskLoadQ128
+        | B::X86MaskLoadD256
+        | B::X86MaskLoadQ256
+        | B::X86MaskStoreD128
+        | B::X86MaskStoreQ128
+        | B::X86MaskStoreD256
+        | B::X86MaskStoreQ256
+        | B::X86Movntdqa256 => IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        },
+        // SSE4.1 streaming load: the 128-bit form needs no AVX.
+        B::X86Movntdqa128 => IntrinsicRequirement {
+            feature: F::Sse41,
+            flag: "-msse4.1",
+            also: None,
+        },
+        _ => return None,
+    })
+}
+
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
 /// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
 /// belongs to, for the families whose permission bit exists in
@@ -4358,6 +4501,9 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     if let Some(requirement) = legacy_xmm_intrinsic_required_feature(intrinsic) {
+        return Some(requirement);
+    }
+    if let Some(requirement) = x86_memory_intrinsic_required_feature(intrinsic) {
         return Some(requirement);
     }
     Some(match intrinsic {
@@ -4430,6 +4576,7 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pabsd256
         | B::X86Pabsb256
         | B::X86Pand256
+        | B::X86Pandn256
         | B::X86Por256
         | B::X86Pxor256
         | B::X86Pcmpeqd256
@@ -4447,6 +4594,7 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pminub256
         | B::X86Pmovmskb256
         | B::X86Packssdw256
+        | B::X86Packsswb256
         | B::X86Packuswb256
         | B::X86Permutevar8x32
         | B::X86Psadbw256
@@ -4645,8 +4793,31 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             flag: "-mavxvnniint16",
             also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
         },
-        _ => return None,
+        _ => return avx2_shuffle_widen_requirement(intrinsic),
     })
+}
+
+/// AVX2 256-bit lane shuffle and widening-move builtins.  Split out of
+/// `x86_intrinsic_required_feature` so that match stays under the census
+/// function-length ratchet (`fns_over_300`).  Each name is 256-bit AVX2 only:
+/// GCC 16.2 rejects it under `-mavx` ("target specific option mismatch").
+fn avx2_shuffle_widen_requirement(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    match intrinsic {
+        B::X86Pshufd256
+        | B::X86Pmovzxbw256
+        | B::X86Pmovzxbd256
+        | B::X86Pmovzxwd256
+        | B::X86Pmovsxbw256
+        | B::X86Pmovsxbd256
+        | B::X86Pmovsxwd256 => Some(IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        }),
+        _ => None,
+    }
 }
 
 fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
@@ -4682,6 +4853,27 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Movntdq => IntrinsicOp::Movntdq,
         BuiltinIntrinsic::X86Movntpd => IntrinsicOp::Movntpd,
         BuiltinIntrinsic::X86Movntps => IntrinsicOp::Movntps,
+        BuiltinIntrinsic::X86Movntdq256 => IntrinsicOp::Movntdq256,
+        BuiltinIntrinsic::X86Movntpd256 => IntrinsicOp::Movntpd256,
+        BuiltinIntrinsic::X86Movntps256 => IntrinsicOp::Movntps256,
+        BuiltinIntrinsic::X86Movntdqa128 => IntrinsicOp::Movntdqa128,
+        BuiltinIntrinsic::X86Movntdqa256 => IntrinsicOp::Movntdqa256,
+        BuiltinIntrinsic::X86MaskLoadPs128 => IntrinsicOp::MaskLoadPs128,
+        BuiltinIntrinsic::X86MaskStorePs128 => IntrinsicOp::MaskStorePs128,
+        BuiltinIntrinsic::X86MaskLoadPs256 => IntrinsicOp::MaskLoadPs256,
+        BuiltinIntrinsic::X86MaskStorePs256 => IntrinsicOp::MaskStorePs256,
+        BuiltinIntrinsic::X86MaskLoadPd128 => IntrinsicOp::MaskLoadPd128,
+        BuiltinIntrinsic::X86MaskStorePd128 => IntrinsicOp::MaskStorePd128,
+        BuiltinIntrinsic::X86MaskLoadPd256 => IntrinsicOp::MaskLoadPd256,
+        BuiltinIntrinsic::X86MaskStorePd256 => IntrinsicOp::MaskStorePd256,
+        BuiltinIntrinsic::X86MaskLoadD128 => IntrinsicOp::MaskLoadD128,
+        BuiltinIntrinsic::X86MaskStoreD128 => IntrinsicOp::MaskStoreD128,
+        BuiltinIntrinsic::X86MaskLoadD256 => IntrinsicOp::MaskLoadD256,
+        BuiltinIntrinsic::X86MaskStoreD256 => IntrinsicOp::MaskStoreD256,
+        BuiltinIntrinsic::X86MaskLoadQ128 => IntrinsicOp::MaskLoadQ128,
+        BuiltinIntrinsic::X86MaskStoreQ128 => IntrinsicOp::MaskStoreQ128,
+        BuiltinIntrinsic::X86MaskLoadQ256 => IntrinsicOp::MaskLoadQ256,
+        BuiltinIntrinsic::X86MaskStoreQ256 => IntrinsicOp::MaskStoreQ256,
         BuiltinIntrinsic::X86Loaddqu | BuiltinIntrinsic::X86LoadPs => IntrinsicOp::Loaddqu,
         BuiltinIntrinsic::X86Pcmpeqb128 => IntrinsicOp::Pcmpeqb128,
         BuiltinIntrinsic::X86Pcmpeqd128 => IntrinsicOp::Pcmpeqd128,
@@ -4817,6 +5009,12 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pmovzxwd128 => IntrinsicOp::Pmovzxwd128,
         BuiltinIntrinsic::X86Psllw128 => IntrinsicOp::Psllw128,
         BuiltinIntrinsic::X86Psrlw128 => IntrinsicOp::Psrlw128,
+        BuiltinIntrinsic::X86Pslld128 => IntrinsicOp::Pslld128,
+        BuiltinIntrinsic::X86Psllq128 => IntrinsicOp::Psllq128,
+        BuiltinIntrinsic::X86Psrld128 => IntrinsicOp::Psrld128,
+        BuiltinIntrinsic::X86Psrlq128 => IntrinsicOp::Psrlq128,
+        BuiltinIntrinsic::X86Psraw128 => IntrinsicOp::Psraw128,
+        BuiltinIntrinsic::X86Psrad128 => IntrinsicOp::Psrad128,
         BuiltinIntrinsic::X86Loadu256 => IntrinsicOp::Loadu256,
         BuiltinIntrinsic::X86Storeu256 => IntrinsicOp::Storeu256,
         BuiltinIntrinsic::X86Load256 => IntrinsicOp::Load256,
@@ -4977,6 +5175,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Psrawi256 => IntrinsicOp::Psrawi256,
         BuiltinIntrinsic::X86Psradi256 => IntrinsicOp::Psradi256,
         BuiltinIntrinsic::X86Packssdw256 => IntrinsicOp::Packssdw256,
+        BuiltinIntrinsic::X86Packsswb256 => IntrinsicOp::Packsswb256,
         BuiltinIntrinsic::X86Packuswb256 => IntrinsicOp::Packuswb256,
         BuiltinIntrinsic::X86Phaddw256 => IntrinsicOp::Phaddw256,
         BuiltinIntrinsic::X86Phaddd256 => IntrinsicOp::Phaddd256,
@@ -4998,6 +5197,31 @@ fn nan_library_function(name: &str) -> Option<&'static str> {
         "__builtin_nanf128" | "__builtin_nanq" => "nanf128",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod x86_var_shift_arity_tests {
+    use super::{BuiltinIntrinsic as B, x86_var_shift_arity};
+
+    /// Every count-in-XMM shift has exactly two operands `(value, count)`
+    /// (GCC 16.2 `*_FTYPE_*_*_COUNT`). Any other intrinsic is unconstrained
+    /// here, so the check cannot reject a call it does not own.
+    #[test]
+    fn count_in_xmm_shifts_take_two_operands() {
+        for intrinsic in [
+            B::X86Psllw128,
+            B::X86Psrlw128,
+            B::X86Pslld128,
+            B::X86Psllq128,
+            B::X86Psrld128,
+            B::X86Psrlq128,
+            B::X86Psraw128,
+            B::X86Psrad128,
+        ] {
+            assert_eq!(x86_var_shift_arity(&intrinsic), Some(2), "{intrinsic:?}");
+        }
+        assert_eq!(x86_var_shift_arity(&B::X86Pmulhw128), None);
+    }
 }
 
 #[cfg(test)]

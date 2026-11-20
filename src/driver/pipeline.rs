@@ -4953,6 +4953,12 @@ impl Driver {
             avx512vl: self.enable_avx512f && self.enable_avx512vl,
             isa: self.x86_isa(),
             i686_avx2: self.target == Target::I686 && self.enable_avx2,
+            // Mirrors the `i686_avx` term of `vex128` below (SSE2 + AVX).
+            i686_avx: self.target == Target::I686
+                && self.enable_avx
+                && !self.avx_explicitly_disabled
+                && !self.no_sse2
+                && self.resolved_i686_sse2(),
             no_relax: self.riscv_no_relax,
             debug_info: self.debug_info,
             function_sections: self.function_sections,

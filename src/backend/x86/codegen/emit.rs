@@ -1137,8 +1137,8 @@ pub struct X86Codegen {
     ///
     /// Keying the 256-bit FLOAT bitwise forms on AVX2 emitted a legacy 128-bit
     /// `xorps` for a 256-bit operand under `-mavx`, dropping the upper lanes.
-    /// Other 128-bit emitters still key their VEX choice on `avx2_enabled`; that
-    /// is tracked as an open item and is not changed here.
+    /// The 128-bit VEX choices key on this cell through [`X86Codegen::vex128`]
+    /// (AVX1).  The former `avx2_enabled` keying of those forms is gone.
     pub(super) avx_enabled: bool,
     /// Code-generation ISA permission for the current TU (VEX / SSE4.1 /
     /// FMA3 / ymm).  Every text emitter consults this instead of assuming a
@@ -1526,6 +1526,19 @@ fn alias_refuse_dbg() -> bool {
 }
 
 impl X86Codegen {
+    /// VEX.128 encoding permission.  The 128-bit `v<op> xmm` family, the VEX.128
+    /// moves, compares, shifts, shuffles, packs and scalar-GPR moves this backend
+    /// emits are AVX1-legal, so they key on the AVX1 cell (`isa.avx`, which the
+    /// ISA contract says "governs every `v*` mnemonic").  `avx2_enabled`
+    /// (`isa.ymm`) stays for YMM register forms and the genuinely AVX2-only
+    /// mnemonics (`vpbroadcast{b,w}` from xmm, `vpblend*d`, `vpsllv*`, `vpermd`).
+    /// Keying the 128-bit forms on AVX2 emitted legacy SSE under `-mavx`, which
+    /// mixes with the dirty upper state of the surrounding 256-bit code.
+    #[inline]
+    pub(super) fn vex128(&self) -> bool {
+        self.avx_enabled
+    }
+
     /// IPA-RA keep mask for a call at program point `pp`: the families
     /// holding a value that is live across the call. Exact rather than the
     /// function-wide union, so at a call no IPA value survives the peephole
@@ -2666,7 +2679,8 @@ impl X86Codegen {
             // the vector DATA (`movq %xmmN, %rax`) instead of the address.
             if let Some(slot) = self.state.get_slot(v) {
                 if let Some(align) = self.state.alloca_over_align(v) {
-                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, "rax"));
                     self.state
                         .out
                         .emit_instr_imm_reg("    addq", (align - 1) as i64, "rax");
@@ -2674,7 +2688,8 @@ impl X86Codegen {
                         .out
                         .emit_instr_imm_reg("    andq", -(align as i64), "rax");
                 } else {
-                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, "rax"));
                 }
                 // Width-correct store: vec_live_regs can hold xmm (128-bit),
                 // ymm (256-bit) or zmm (512-bit) names; movdqu is the SSE
@@ -3022,11 +3037,9 @@ impl X86Codegen {
                         if *v >= 0 && *v <= i32::MAX as i64 {
                             // PF-16: fits and non-negative — 5-byte movl,
                             // zero-extension equals the sign-extended q-form.
-                            self.state.out.emit_instr_imm_reg(
-                                "    movl",
-                                *v,
-                                phys_reg_name_32(target),
-                            );
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movl", *v, phys_reg_name_32(target))
+                            });
                         } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
                             self.state
                                 .out
@@ -3075,11 +3088,9 @@ impl X86Codegen {
                                 self.emit_scalar_xmm_to_gpr(xmm_name, target_name, None);
                             } else {
                                 let src_name = phys_reg_name(reg);
-                                self.state.out.emit_instr_reg_reg(
-                                    "    movq",
-                                    src_name,
-                                    target_name,
-                                );
+                                self.state.with_out_checked(|o| {
+                                    o.emit_instr_reg_reg("    movq", src_name, target_name)
+                                });
                             }
                         }
                         // If same register, nothing to do
@@ -3219,11 +3230,9 @@ impl X86Codegen {
                                 // movl zero-extends upper 32 bits, losing sign information
                                 // for I32 values that later flow into 64-bit operations.
                                 let src_name = phys_reg_name(reg);
-                                self.state.out.emit_instr_reg_reg(
-                                    "    movq",
-                                    src_name,
-                                    target_name,
-                                );
+                                self.state.with_out_checked(|o| {
+                                    o.emit_instr_reg_reg("    movq", src_name, target_name)
+                                });
                             }
                         }
                         // Same fresh register: already staged.
@@ -3405,11 +3414,9 @@ impl X86Codegen {
                         if bits == 0 {
                             self.state.emit("    xorl %eax, %eax");
                         } else {
-                            self.state.out.emit_instr_imm_reg(
-                                "    movl",
-                                bits as i32 as i64,
-                                "eax",
-                            );
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movl", bits as i32 as i64, "eax")
+                            });
                         }
                     }
                     IrConst::F64(v) => {
@@ -3460,9 +3467,12 @@ impl X86Codegen {
                         if low == 0 {
                             self.state.emit("    xorl %eax, %eax");
                         } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", low, "rax");
+                            self.state
+                                .with_out_checked(|o| o.emit_instr_imm_reg("    movq", low, "rax"));
                         } else {
-                            self.state.out.emit_instr_imm_reg("    movabsq", low, "rax");
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movabsq", low, "rax")
+                            });
                         }
                     }
                     IrConst::Zero => self.state.emit("    xorl %eax, %eax"),
@@ -3485,7 +3495,8 @@ impl X86Codegen {
                     // "copy, then extend the copy", and the plain copy alone is
                     // what made a 32-bit-canonical home reach 64-bit consumers.
                     if !self.extend_narrow_home_to(v.0, R_RCX, "rax", "eax") {
-                        self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rcx", "rax"));
                     }
                     self.state.park_acc(v.0, is_alloca);
                     self.note_narrow_canonical(v.0, true);
@@ -3724,7 +3735,9 @@ impl X86Codegen {
                             .state
                             .out
                             .emit_instr_rbp_reg("    movslq", slot.0, "rax"),
-                        _ => self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax"),
+                        _ => self
+                            .state
+                            .with_out_checked(|o| o.emit_instr_rbp_reg("    movl", slot.0, "eax")),
                     }
                 } else {
                     self.operand_to_rax(op);
@@ -3835,8 +3848,10 @@ impl X86Codegen {
                     } else {
                         ("    movq", "rax", "    movlps")
                     };
-                    self.state.out.emit_instr_reg_rbp(store, source, slot.0);
-                    self.state.out.emit_instr_rbp_reg(load, slot.0, reg_name);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_rbp(store, source, slot.0));
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg(load, slot.0, reg_name));
                 } else {
                     self.emit_scalar_gpr_to_xmm("rax", "eax", reg_name, use_small);
                 }
@@ -3852,9 +3867,11 @@ impl X86Codegen {
             }
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             if use_small {
-                self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg_rbp("    movl", "eax", slot.0));
             } else {
-                self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", slot.0));
             }
         } else if self.state.is_accumulator_location(dest.0) {
             // Value is consumed by the very next instruction — skip the store.
@@ -3913,7 +3930,8 @@ impl X86Codegen {
                 } else {
                     "    movlps"
                 };
-                self.state.out.emit_instr_reg_rbp(instr, src_xmm, slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg_rbp(instr, src_xmm, slot.0));
                 return;
             }
         }
@@ -3984,7 +4002,8 @@ impl X86Codegen {
                 } else if self.state.get_slot(v.0).is_some() {
                     // Load from stack using movl (32-bit)
                     let slot = self.state.get_slot(v.0).unwrap();
-                    self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    movl", slot.0, "eax"));
                     self.state.park_acc(v.0, is_alloca);
                 } else {
                     self.state.emit("    xorl %eax, %eax");
@@ -4585,11 +4604,9 @@ impl X86Codegen {
                         if bits == 0 {
                             self.state.emit("    xorl %ecx, %ecx");
                         } else {
-                            self.state.out.emit_instr_imm_reg(
-                                "    movl",
-                                bits as i32 as i64,
-                                "ecx",
-                            );
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movl", bits as i32 as i64, "ecx")
+                            });
                         }
                     }
                     IrConst::F64(v) => {
@@ -4617,9 +4634,12 @@ impl X86Codegen {
                         if low == 0 {
                             self.state.emit("    xorl %ecx, %ecx");
                         } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", low, "rcx");
+                            self.state
+                                .with_out_checked(|o| o.emit_instr_imm_reg("    movq", low, "rcx"));
                         } else {
-                            self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movabsq", low, "rcx")
+                            });
                         }
                     }
                     // Decimal FP bit containers materialize like integer
@@ -4677,7 +4697,8 @@ impl X86Codegen {
                     // extended directly out of %rax for the same reason as the
                     // secondary-cache path above.
                     if !self.extend_narrow_home_to(v.0, R_RAX, "rcx", "ecx") {
-                        self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rax", "rcx"));
                     }
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rcx");
@@ -4709,7 +4730,8 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    movl ${}, %{}", val, name32));
         } else if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-            self.state.out.emit_instr_imm_reg("    movq", val, name64);
+            self.state
+                .with_out_checked(|o| o.emit_instr_imm_reg("    movq", val, name64));
         } else {
             self.state
                 .out
@@ -4791,7 +4813,8 @@ impl X86Codegen {
             if !self.home_clobbered.contains(&val.0) || self.home_readable_via_alias(val.0) {
                 let reg_name = phys_reg_name(phys_reg);
                 if reg_name != reg {
-                    self.state.out.emit_instr_reg_reg("    movq", reg_name, reg);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_reg("    movq", reg_name, reg));
                 }
                 return;
             }
@@ -4805,7 +4828,8 @@ impl X86Codegen {
                     // Over-aligned alloca: compute aligned address within the
                     // oversized stack slot. The slot has (align - 1) extra bytes
                     // to guarantee we can find an aligned address within it.
-                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, reg));
                     self.state
                         .out
                         .emit_instr_imm_reg("    addq", (align - 1) as i64, reg);
@@ -4813,11 +4837,13 @@ impl X86Codegen {
                         .out
                         .emit_instr_imm_reg("    andq", -(align as i64), reg);
                 } else {
-                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, reg));
                 }
             } else if self.state.vector_values.contains(&val.0) {
                 // Vector value: use leaq to get address (vectors are stored directly at slot)
-                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, reg));
             } else if matches!(
                 self.value_types.get(&val.0),
                 Some(IrType::I8)
@@ -4846,22 +4872,29 @@ impl X86Codegen {
                     && !self.needs_sext_values.is_empty()
                     && self.needs_sext_values.contains(&val.0);
                 match ty {
-                    IrType::I8 => self.state.out.emit_instr_rbp_reg("    movsbq", slot.0, reg),
+                    IrType::I8 => self
+                        .state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    movsbq", slot.0, reg)),
                     IrType::U8 => {
                         self.state
                             .out
                             .emit_instr_rbp_reg("    movzbl", slot.0, reg_name_to_32(reg))
                     }
-                    IrType::I16 => self.state.out.emit_instr_rbp_reg("    movswq", slot.0, reg),
+                    IrType::I16 => self
+                        .state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    movswq", slot.0, reg)),
                     IrType::U16 => {
                         self.state
                             .out
                             .emit_instr_rbp_reg("    movzwl", slot.0, reg_name_to_32(reg))
                     }
-                    _ if needs_sext => self.state.out.emit_instr_rbp_reg("    movslq", slot.0, reg),
+                    _ if needs_sext => self
+                        .state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    movslq", slot.0, reg)),
                     _ => {
                         let reg32 = reg_name_to_32(reg);
-                        self.state.out.emit_instr_rbp_reg("    movl", slot.0, reg32);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_rbp_reg("    movl", slot.0, reg32));
                     }
                 }
             } else if self.state.f128_direct_slots.contains(&val.0)
@@ -4878,7 +4911,8 @@ impl X86Codegen {
                 // negative denormal double: `v5 != ld` misfired and the
                 // (double) print of an intact 41.0L showed -0.0
                 // (va-arg-pack-1, both levels >= O1).
-                self.state.out.emit_instr_rbp("    fldt", slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 if reg == "rax" {
@@ -4898,7 +4932,8 @@ impl X86Codegen {
                     self.state.park_acc(val.0, false);
                 }
             } else {
-                self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, reg));
             }
         } else {
             // Try to resolve through Copy or same-size Cast (U64<->I64 no-op).
@@ -4961,7 +4996,9 @@ impl X86Codegen {
                             {
                                 let rep_name = phys_reg_name(rep_phys);
                                 if rep_name != reg {
-                                    self.state.out.emit_instr_reg_reg("    movq", rep_name, reg);
+                                    self.state.with_out_checked(|o| {
+                                        o.emit_instr_reg_reg("    movq", rep_name, reg)
+                                    });
                                 }
                                 return;
                             }
@@ -4983,7 +5020,8 @@ impl X86Codegen {
                     if self.state.acc_has_verified(val.0, false)
                         || self.state.acc_has_verified(val.0, true)
                     {
-                        self.state.out.emit_instr_reg_reg("    movq", "rax", reg);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rax", reg));
                         return;
                     }
                     panic!(
@@ -5011,14 +5049,19 @@ impl X86Codegen {
                         if low == 0 {
                             self.state.emit("    xorl %eax, %eax");
                         } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", low, "rax");
+                            self.state
+                                .with_out_checked(|o| o.emit_instr_imm_reg("    movq", low, "rax"));
                         } else {
-                            self.state.out.emit_instr_imm_reg("    movabsq", low, "rax");
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movabsq", low, "rax")
+                            });
                         }
                         if high == 0 {
                             self.state.emit("    xorl %edx, %edx");
                         } else if high >= i32::MIN as i64 && high <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", high, "rdx");
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movq", high, "rdx")
+                            });
                         } else {
                             self.state
                                 .out
@@ -5042,17 +5085,19 @@ impl X86Codegen {
                         // Alloca: load the address (not a 128-bit value itself)
                         if let Some(align) = self.state.alloca_over_align(v.0) {
                             // Over-aligned alloca: compute aligned address
-                            self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
-                            self.state.out.emit_instr_imm_reg(
-                                "    addq",
-                                (align - 1) as i64,
-                                "rax",
-                            );
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_rbp_reg("    leaq", slot.0, "rax")
+                            });
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    addq", (align - 1) as i64, "rax")
+                            });
                             self.state
                                 .out
                                 .emit_instr_imm_reg("    andq", -(align as i64), "rax");
                         } else {
-                            self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_rbp_reg("    leaq", slot.0, "rax")
+                            });
                         }
                         self.state.emit("    xorl %edx, %edx");
                     } else if self.state.is_i128_value(v.0) {
@@ -5063,7 +5108,8 @@ impl X86Codegen {
                                 v.0, slot.0, self.state.out.rsp_frame_size
                             ));
                         }
-                        self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rax"));
                         self.state
                             .out
                             .emit_instr_rbp_reg("    movq", slot.0 + 8, "rdx");
@@ -5120,10 +5166,14 @@ impl X86Codegen {
                                         .out
                                         .emit_instr_rbp_reg("    movslq", slot.0, "rax")
                                 }
-                                _ => self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax"),
+                                _ => self.state.with_out_checked(|o| {
+                                    o.emit_instr_rbp_reg("    movl", slot.0, "eax")
+                                }),
                             }
                         } else {
-                            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_rbp_reg("    movq", slot.0, "rax")
+                            });
                         }
                         self.state.emit("    xorl %edx, %edx");
                     }
@@ -5169,7 +5219,8 @@ impl X86Codegen {
                     dest.0, slot.0
                 ));
             }
-            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            self.state
+                .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", slot.0));
             self.state
                 .out
                 .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
@@ -5406,9 +5457,11 @@ impl X86Codegen {
                             .out
                             .emit_instr_imm_reg("    movl", *v, reg_name_to_32(reg));
                     } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-                        self.state.out.emit_instr_imm_reg("    movq", *v, reg);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_imm_reg("    movq", *v, reg));
                     } else {
-                        self.state.out.emit_instr_imm_reg("    movabsq", *v, reg);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_imm_reg("    movabsq", *v, reg));
                     }
                 }
                 _ => self
@@ -6458,9 +6511,11 @@ impl X86Codegen {
                 .emit_instr_reg_reg("    movq", reg_name, "rcx");
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
-                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rcx");
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    leaq", slot.0, "rcx"));
             } else {
-                self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rcx"));
             }
         }
     }
@@ -9450,7 +9505,8 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_acc_to_phys_reg(&mut self, dest: PhysReg) {
         let d_name = phys_reg_name(dest);
-        self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
+        self.state
+            .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rax", d_name));
     }
 
     fn emit_pre_call_save_caller_regs(&mut self) {
@@ -10263,9 +10319,12 @@ impl ArchCodegen for X86Codegen {
                 if let (Some(src_slot), Some(dest_slot)) =
                     (self.state.get_slot(v.0), self.state.get_slot(dest.0))
                 {
-                    self.state.out.emit_instr_rbp("    fldt", src_slot.0);
-                    self.state.out.emit_instr_rbp("    fstpt", dest_slot.0);
-                    self.state.out.emit_instr_rbp("    fldt", dest_slot.0);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp("    fldt", src_slot.0));
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp("    fstpt", dest_slot.0));
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp("    fldt", dest_slot.0));
                     self.state.emit("    subq $8, %rsp");
                     self.state.emit("    fstpl (%rsp)");
                     self.state.emit("    popq %rax");
@@ -10379,7 +10438,8 @@ impl ArchCodegen for X86Codegen {
                 } else {
                     self.operand_to_rax(src);
                     let d_name = phys_reg_name(d);
-                    self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rax", d_name));
                 }
                 self.state.reg_cache.invalidate_acc();
                 // Definition-writes-home accounting: the const store / rax

@@ -960,6 +960,90 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntps),
     );
     m.insert(
+        "__builtin_ia32_movntdq256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntdq256),
+    );
+    m.insert(
+        "__builtin_ia32_movntpd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntpd256),
+    );
+    m.insert(
+        "__builtin_ia32_movntps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntps256),
+    );
+    m.insert(
+        "__builtin_ia32_movntdqa",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntdqa128),
+    );
+    m.insert(
+        "__builtin_ia32_movntdqa256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntdqa256),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadPs128),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadpd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadPd128),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadD128),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadq",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadQ128),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadPs256),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadpd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadPd256),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadD256),
+    );
+    m.insert(
+        "__builtin_ia32_maskloadq256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskLoadQ256),
+    );
+    m.insert(
+        "__builtin_ia32_maskstoreps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStorePs128),
+    );
+    m.insert(
+        "__builtin_ia32_maskstorepd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStorePd128),
+    );
+    m.insert(
+        "__builtin_ia32_maskstored",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStoreD128),
+    );
+    m.insert(
+        "__builtin_ia32_maskstoreq",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStoreQ128),
+    );
+    m.insert(
+        "__builtin_ia32_maskstoreps256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStorePs256),
+    );
+    m.insert(
+        "__builtin_ia32_maskstorepd256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStorePd256),
+    );
+    m.insert(
+        "__builtin_ia32_maskstored256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStoreD256),
+    );
+    m.insert(
+        "__builtin_ia32_maskstoreq256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaskStoreQ256),
+    );
+    m.insert(
         "__builtin_ia32_loaddqu",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loaddqu),
     );
@@ -1790,6 +1874,30 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "_mm_srl_epi16",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlw128),
+    );
+    m.insert(
+        "_mm_sll_epi32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pslld128),
+    );
+    m.insert(
+        "_mm_sll_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllq128),
+    );
+    m.insert(
+        "_mm_srl_epi32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrld128),
+    );
+    m.insert(
+        "_mm_srl_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlq128),
+    );
+    m.insert(
+        "_mm_sra_epi16",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psraw128),
+    );
+    m.insert(
+        "_mm_sra_epi32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrad128),
     );
     // __builtin_ia32_* names for new ops
     // GCC vector-extension FP min/max: used by kernel code that cannot
@@ -2973,18 +3081,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "_mm256_sub_epi64",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubq256),
     );
-    m.insert(
-        "_mm256_andnot_si256",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256),
-    );
-    m.insert(
-        "_mm256_andnot_pd",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256),
-    );
-    m.insert(
-        "_mm256_andnot_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256),
-    );
+    // `_mm256_andnot_{si256,ps,pd}` are header macros (avx2intrin.h /
+    // avxintrin.h) over the correct builtins. A frontend entry here made the
+    // public names visible without <immintrin.h> and bound the float forms to
+    // the integer VPANDN (AVX2) under -mavx, which GCC never does.
     m.insert(
         "_mm256_cmpeq_epi32",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpeqd256),
@@ -3360,6 +3460,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packssdw256),
     );
     m.insert(
+        "__builtin_ia32_packsswb256",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packsswb256),
+    );
+    m.insert(
         "__builtin_ia32_packuswb256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packuswb256),
     );
@@ -3562,6 +3666,30 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "__builtin_ia32_psllw128",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllw128),
+    );
+    m.insert(
+        "__builtin_ia32_pslld128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pslld128),
+    );
+    m.insert(
+        "__builtin_ia32_psllq128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllq128),
+    );
+    m.insert(
+        "__builtin_ia32_psrld128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrld128),
+    );
+    m.insert(
+        "__builtin_ia32_psrlq128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlq128),
+    );
+    m.insert(
+        "__builtin_ia32_psraw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psraw128),
+    );
+    m.insert(
+        "__builtin_ia32_psrad128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrad128),
     );
     m.insert(
         "__builtin_ia32_psradi256",
@@ -3915,6 +4043,27 @@ pub enum BuiltinIntrinsic {
     X86Movntdq,
     X86Movntpd,
     X86Movntps,
+    X86Movntdq256,
+    X86Movntpd256,
+    X86Movntps256,
+    X86Movntdqa128,
+    X86Movntdqa256,
+    X86MaskLoadPs128,
+    X86MaskLoadPd128,
+    X86MaskLoadD128,
+    X86MaskLoadQ128,
+    X86MaskLoadPs256,
+    X86MaskLoadPd256,
+    X86MaskLoadD256,
+    X86MaskLoadQ256,
+    X86MaskStorePs128,
+    X86MaskStorePd128,
+    X86MaskStoreD128,
+    X86MaskStoreQ128,
+    X86MaskStorePs256,
+    X86MaskStorePd256,
+    X86MaskStoreD256,
+    X86MaskStoreQ256,
     X86Loaddqu,
     X86Storedqu,
     /// `_mm_load{,u}_ps` / `_mm_store{,u}_ps`: the same 16-byte copy as
@@ -4050,6 +4199,12 @@ pub enum BuiltinIntrinsic {
     X86Pmovzxwd128,   // _mm_cvtepu16_epi32 (PMOVZXWD, SSE4.1)
     X86Psllw128,      // _mm_sll_epi16 (PSLLW variable)
     X86Psrlw128,      // _mm_srl_epi16 (PSRLW variable)
+    X86Pslld128,      // _mm_sll_epi32 (count in XMM)
+    X86Psllq128,      // _mm_sll_epi64 (count in XMM)
+    X86Psrld128,      // _mm_srl_epi32 (count in XMM)
+    X86Psrlq128,      // _mm_srl_epi64 (count in XMM)
+    X86Psraw128,      // _mm_sra_epi16 (count in XMM)
+    X86Psrad128,      // _mm_sra_epi32 (count in XMM)
     // AVX2 256-bit
     X86Loadu256,
     X86Storeu256,
@@ -4261,6 +4416,7 @@ pub enum BuiltinIntrinsic {
     X86Psrawi256,
     X86Psradi256,
     X86Packssdw256,
+    X86Packsswb256,
     X86Packuswb256,
     X86Phaddw256,
     X86Phaddd256,

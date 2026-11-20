@@ -409,7 +409,8 @@ impl X86Codegen {
                                 sp_adjust += 16;
                                 self.state.out.rsp_frame_size += 16;
                                 if let Some(slot) = self.state.get_slot(v.0) {
-                                    self.state.out.emit_instr_rbp("    fldt", slot.0);
+                                    self.state
+                                        .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                                     self.state.emit("    fstpt (%rsp)");
                                 }
                             } else if let Some(slot) = self.state.get_slot(v.0) {
@@ -417,14 +418,17 @@ impl X86Codegen {
                                     self.state.emit("    subq $16, %rsp");
                                     sp_adjust += 16;
                                     self.state.out.rsp_frame_size += 16;
-                                    self.state.out.emit_instr_rbp("    fldt", slot.0);
+                                    self.state
+                                        .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                                     self.state.emit("    fstpt (%rsp)");
                                 } else {
                                     // The value is represented as a scalar f64
                                     // bit-pattern. Read it before reserving the
                                     // outgoing slot, then widen in that slot;
                                     // this avoids an untracked push/pop window.
-                                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+                                    self.state.with_out_checked(|o| {
+                                        o.emit_instr_rbp_reg("    movq", slot.0, "rax")
+                                    });
                                     self.state.emit("    subq $16, %rsp");
                                     sp_adjust += 16;
                                     self.state.out.rsp_frame_size += 16;
@@ -461,9 +465,12 @@ impl X86Codegen {
                                 // (call-arg staging gate, five seeds of forty).
                                 // Under %rsp addressing the first push moves
                                 // the slot 8 bytes further away.
-                                self.state.out.emit_instr_rbp("    pushq", slot.0 + 8);
+                                self.state.with_out_checked(|o| {
+                                    o.emit_instr_rbp("    pushq", slot.0 + 8)
+                                });
                                 self.state.out.rsp_frame_size += 8;
-                                self.state.out.emit_instr_rbp("    pushq", slot.0);
+                                self.state
+                                    .with_out_checked(|o| o.emit_instr_rbp("    pushq", slot.0));
                                 self.state.out.rsp_frame_size -= 8;
                             } else {
                                 self.state.emit("    pushq $0");
@@ -480,11 +487,9 @@ impl X86Codegen {
                                     if i32::try_from(limb).is_ok() {
                                         self.state.emit_fmt(format_args!("    pushq ${limb}"));
                                     } else {
-                                        self.state.out.emit_instr_imm_reg(
-                                            "    movabsq",
-                                            limb,
-                                            "rax",
-                                        );
+                                        self.state.with_out_checked(|o| {
+                                            o.emit_instr_imm_reg("    movabsq", limb, "rax")
+                                        });
                                         self.state.emit("    pushq %rax");
                                     }
                                 }
@@ -879,7 +884,8 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    {mn} {ferry}, {}(%rsp)", offset as i64));
         }
-        self.state.out.emit_instr_mem_reg(load, 0, "rsp", dest);
+        self.state
+            .with_out_checked(|o| o.emit_instr_mem_reg(load, 0, "rsp", dest));
         self.state.emit("    movq 8(%rsp), %rax");
         // The reload above restores the parked %rax value verbatim, but it is
         // still a %rax write to the epoch analyzer; re-sync the park epoch so
@@ -1210,7 +1216,9 @@ impl X86Codegen {
                                 _ => {
                                     // Smaller constant: load into lo_reg via rax, zero hi_reg
                                     self.operand_to_rax(arg);
-                                    self.state.out.emit_instr_reg_reg("    movq", "rax", lo_reg);
+                                    self.state.with_out_checked(|o| {
+                                        o.emit_instr_reg_reg("    movq", "rax", lo_reg)
+                                    });
                                     self.state.emit_fmt(format_args!(
                                         "    xorq %{}, %{}",
                                         hi_reg, hi_reg
@@ -1964,11 +1972,9 @@ impl X86Codegen {
                     self.state.get_slot(v.0),
                     v.0,
                 );
-                self.state.out.emit_instr_rbp_reg(
-                    &format!("    {}", self.xmm_move(false)),
-                    slot.0,
-                    xmm,
-                );
+                let mnemonic = format!("    {}", self.xmm_move(false));
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg(&mnemonic, slot.0, xmm));
                 return;
             }
             Operand::Const(c) => {
@@ -2329,7 +2335,9 @@ impl X86Codegen {
                 match (c0, c1) {
                     (EightbyteClass::Integer, EightbyteClass::Sse) => {
                         if let Some(slot) = self.state.get_slot(dest.0) {
-                            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_reg_rbp("    movq", "rax", slot.0)
+                            });
                             // SSE eightbyte: store %xmm0 directly (movq
                             // xmm→m64 is baseline SSE2); the old %rdx relay
                             // was an FP-domain round-trip for no reason.
@@ -2345,7 +2353,9 @@ impl X86Codegen {
                         if let Some(slot) = self.state.get_slot(dest.0) {
                             // Direct xmm0→slot store (baseline SSE2 movq);
                             // no GPR relay.
-                            self.state.out.emit_instr_reg_rbp(xmm_store, "xmm0", slot.0);
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_reg_rbp(xmm_store, "xmm0", slot.0)
+                            });
                             self.state
                                 .out
                                 .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
@@ -2359,7 +2369,9 @@ impl X86Codegen {
                             // Both halves are SSE: two direct xmm stores,
                             // replacing the double movq→rax relay (2 extra
                             // insns and two false GPR dependencies).
-                            self.state.out.emit_instr_reg_rbp(xmm_store, "xmm0", slot.0);
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_reg_rbp(xmm_store, "xmm0", slot.0)
+                            });
                             self.state
                                 .out
                                 .emit_instr_reg_rbp(xmm_store, "xmm1", slot.0 + 8);
@@ -2379,8 +2391,10 @@ impl X86Codegen {
             self.store_xmm_to(dest, "xmm0", IrType::F32);
         } else if return_type == IrType::F128 {
             if let Some(slot) = self.state.get_slot(dest.0) {
-                self.state.out.emit_instr_rbp("    fstpt", slot.0);
-                self.state.out.emit_instr_rbp("    fldt", slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fstpt", slot.0));
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fldt", slot.0));
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    popq %rax");

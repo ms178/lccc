@@ -967,8 +967,10 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    {} %st, %st(1)", x87_op));
             if let Some(dest_slot) = self.state.get_slot(dest.0) {
-                self.state.out.emit_instr_rbp("    fstpt", dest_slot.0);
-                self.state.out.emit_instr_rbp("    fldt", dest_slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fstpt", dest_slot.0));
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fldt", dest_slot.0));
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    popq %rax");
@@ -1396,8 +1398,10 @@ impl X86Codegen {
             self.emit_f128_load_to_x87(src);
             self.state.emit("    fchs");
             if let Some(dest_slot) = self.state.get_slot(dest.0) {
-                self.state.out.emit_instr_rbp("    fstpt", dest_slot.0);
-                self.state.out.emit_instr_rbp("    fldt", dest_slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fstpt", dest_slot.0));
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fldt", dest_slot.0));
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    popq %rax");

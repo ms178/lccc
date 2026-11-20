@@ -231,16 +231,12 @@ impl InlineAsmEmitter for X86Codegen {
                             self.state
                                 .out
                                 .emit_instr_rbp_reg("    leaq", slot.0, &tmp_reg);
-                            self.state.out.emit_instr_imm_reg(
-                                "    addq",
-                                (align - 1) as i64,
-                                &tmp_reg,
-                            );
-                            self.state.out.emit_instr_imm_reg(
-                                "    andq",
-                                -(align as i64),
-                                &tmp_reg,
-                            );
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    addq", (align - 1) as i64, &tmp_reg)
+                            });
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    andq", -(align as i64), &tmp_reg)
+                            });
                         } else {
                             self.state
                                 .out
@@ -595,7 +591,8 @@ impl InlineAsmEmitter for X86Codegen {
                 } else if imm >= 0 && imm <= u32::MAX as i64 {
                     // Value fits in unsigned 32-bit: use movl which zero-extends
                     // to 64 bits.
-                    self.state.out.emit_instr_imm_reg("    movl", imm, &reg32);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    movl", imm, &reg32));
                 } else {
                     self.state
                         .out
@@ -618,11 +615,9 @@ impl InlineAsmEmitter for X86Codegen {
                             self.state
                                 .out
                                 .emit_instr_rbp_reg("    leaq", slot.0, lea_reg);
-                            self.state.out.emit_instr_imm_reg(
-                                "    addq",
-                                (align - 1) as i64,
-                                lea_reg,
-                            );
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    addq", (align - 1) as i64, lea_reg)
+                            });
                             self.state
                                 .out
                                 .emit_instr_imm_reg("    andq", -(align as i64), lea_reg);
@@ -682,13 +677,15 @@ impl InlineAsmEmitter for X86Codegen {
                     }
                 } else {
                     let scratch = "rcx";
-                    self.state.out.emit_instr_reg("    pushq", scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    pushq", scratch));
                     self.state
                         .out
                         .emit_instr_rbp_reg("    movq", slot.0, scratch);
                     self.state
                         .emit_fmt(format_args!("    {} (%{})", fld_instr, scratch));
-                    self.state.out.emit_instr_reg("    popq", scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    popq", scratch));
                 }
             }
             return;
@@ -728,15 +725,18 @@ impl InlineAsmEmitter for X86Codegen {
                         _ => "movdqu",
                     };
                     let scratch = "rcx";
-                    self.state.out.emit_instr_reg("    pushq", scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    pushq", scratch));
                     self.state
                         .out
                         .emit_instr_rbp_reg("    movq", slot.0, scratch);
                     self.state
                         .emit_fmt(format_args!("    {} (%{}), %{}", load_instr, scratch, reg));
-                    self.state.out.emit_instr_reg("    popq", scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    popq", scratch));
                 } else {
-                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, reg));
                     let load_instr = Self::mov_load_for_type(ty);
                     let dest_reg = Self::asm_load_dest_reg(load_instr, reg);
                     self.state
@@ -852,7 +852,8 @@ impl InlineAsmEmitter for X86Codegen {
                     let scratch = self.asm_output_scratch(all_output_regs, &op.reg);
                     let preserve = all_output_regs.contains(&scratch.as_str());
                     if preserve {
-                        self.state.out.emit_instr_reg("    pushq", &scratch);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg("    pushq", &scratch));
                     }
                     self.state
                         .out
@@ -860,7 +861,8 @@ impl InlineAsmEmitter for X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} (%{})", fstp_instr, scratch));
                     if preserve {
-                        self.state.out.emit_instr_reg("    popq", &scratch);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg("    popq", &scratch));
                     }
                 }
             } else {
@@ -874,13 +876,15 @@ impl InlineAsmEmitter for X86Codegen {
                 let scratch = self.asm_output_scratch(all_output_regs, &op.reg);
                 let preserve = all_output_regs.contains(&scratch.as_str());
                 if preserve {
-                    self.state.out.emit_instr_reg("    pushq", &scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    pushq", &scratch));
                 }
                 self.value_to_reg(ptr, &scratch);
                 self.state
                     .emit_fmt(format_args!("    {} (%{})", fstp_instr, scratch));
                 if preserve {
-                    self.state.out.emit_instr_reg("    popq", &scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    popq", &scratch));
                 }
             }
             return;
@@ -906,7 +910,8 @@ impl InlineAsmEmitter for X86Codegen {
             let scratch = self.asm_output_scratch(all_output_regs, reg);
             let preserve = all_output_regs.contains(&scratch.as_str());
             if preserve {
-                self.state.out.emit_instr_reg("    pushq", &scratch);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg("    pushq", &scratch));
             }
             if ty.size() <= 4 {
                 self.state.emit_fmt(format_args!(
@@ -925,7 +930,8 @@ impl InlineAsmEmitter for X86Codegen {
             taken.push(scratch.as_str());
             self.store_output_from_reg(&gp, ptr, _constraint, &taken);
             if preserve {
-                self.state.out.emit_instr_reg("    popq", &scratch);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg("    popq", &scratch));
             }
             return;
         }
@@ -956,7 +962,8 @@ impl InlineAsmEmitter for X86Codegen {
                     let scratch = self.asm_output_scratch(all_output_regs, reg);
                     let preserve = all_output_regs.contains(&scratch.as_str());
                     if preserve {
-                        self.state.out.emit_instr_reg("    pushq", &scratch);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg("    pushq", &scratch));
                     }
                     self.state
                         .out
@@ -964,7 +971,8 @@ impl InlineAsmEmitter for X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} %{}, (%{})", store_instr, reg, scratch));
                     if preserve {
-                        self.state.out.emit_instr_reg("    popq", &scratch);
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg("    popq", &scratch));
                     }
                 }
             } else if self.state.is_direct_slot(ptr.0) {
@@ -1029,7 +1037,8 @@ impl InlineAsmEmitter for X86Codegen {
                 let scratch = self.asm_output_scratch(all_output_regs, reg);
                 let preserve = all_output_regs.contains(&scratch.as_str());
                 if preserve {
-                    self.state.out.emit_instr_reg("    pushq", &scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    pushq", &scratch));
                 }
                 self.state
                     .out
@@ -1046,7 +1055,8 @@ impl InlineAsmEmitter for X86Codegen {
                     store_instr, src_reg, scratch
                 ));
                 if preserve {
-                    self.state.out.emit_instr_reg("    popq", &scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    popq", &scratch));
                 }
             }
         } else {
@@ -1238,7 +1248,8 @@ impl X86Codegen {
                 let scratch = self.asm_output_scratch(all_output_regs, reg);
                 let preserve = all_output_regs.contains(&scratch.as_str());
                 if preserve {
-                    self.state.out.emit_instr_reg("    pushq", &scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    pushq", &scratch));
                 }
                 self.state
                     .out
@@ -1257,7 +1268,8 @@ impl X86Codegen {
                     store_instr, src_reg, scratch
                 ));
                 if preserve {
-                    self.state.out.emit_instr_reg("    popq", &scratch);
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg("    popq", &scratch));
                 }
             }
         }
@@ -1307,7 +1319,8 @@ impl X86Codegen {
         let scratch = self.asm_output_scratch(all_output_regs, reg);
         let needs_preserve = all_output_regs.contains(&scratch.as_str());
         if needs_preserve {
-            self.state.out.emit_instr_reg("    pushq", &scratch);
+            self.state
+                .with_out_checked(|o| o.emit_instr_reg("    pushq", &scratch));
         }
         self.value_to_reg(ptr, &scratch);
         if reg.starts_with("xmm") {
@@ -1332,7 +1345,8 @@ impl X86Codegen {
             ));
         }
         if needs_preserve {
-            self.state.out.emit_instr_reg("    popq", &scratch);
+            self.state
+                .with_out_checked(|o| o.emit_instr_reg("    popq", &scratch));
         }
     }
 }

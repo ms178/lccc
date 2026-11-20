@@ -14,7 +14,7 @@ use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;
 use crate::backend::x86_common::{FmaRoleOrder, fma_role_order};
 use crate::emit;
-use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
+use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value, packed_var_shift_mnemonic};
 
 impl I686Codegen {
     /// `_mm_cvt{,t}s{s,d}_si32`: convert the low lane of the 128-bit vector
@@ -30,6 +30,33 @@ impl I686Codegen {
         if let Some(d) = dest {
             self.store_eax_to(d);
         }
+    }
+
+    /// 128-bit variable-index permute (AVX `vpermilps`/`vpermilpd`, memory
+    /// destination form): `mnemonic %xmm1, %xmm0, %xmm0`. The value form is
+    /// rejected because lowering never produces it.
+    fn emit_i686_vpermilvar_128(
+        &mut self,
+        dest: &Option<Value>,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+        mnemonic: &str,
+        op: &IntrinsicOp,
+    ) {
+        let Some(dptr) = dest_ptr else {
+            if dest.is_some() {
+                self.reject_value_form(op);
+            }
+            return;
+        };
+        self.operand_to_eax(&args[0]);
+        self.state.emit("    movups (%eax), %xmm0");
+        self.operand_to_eax(&args[1]);
+        self.state.emit("    movups (%eax), %xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0, %xmm0", mnemonic));
+        self.operand_to_eax(&Operand::Value(*dptr));
+        self.state.emit("    movups %xmm0, (%eax)");
     }
 
     pub(super) fn emit_intrinsic_impl(
@@ -107,6 +134,15 @@ impl I686Codegen {
             | IntrinsicOp::Movntpd
             | IntrinsicOp::Movntps => {
                 self.emit_nontemporal_store(op, dest_ptr, args);
+            }
+            IntrinsicOp::Movntdq256 | IntrinsicOp::Movntpd256 | IntrinsicOp::Movntps256 => {
+                self.emit_avx_movnt_256_i686(op, dest_ptr, args);
+            }
+            IntrinsicOp::Movntdqa128 | IntrinsicOp::Movntdqa256 => {
+                self.emit_movntdqa_i686(op, dest, dest_ptr, args);
+            }
+            _ if op.vmaskmov_form().is_some() => {
+                self.emit_avx_maskmov_i686(op, dest, dest_ptr, args);
             }
 
             // --- SSE 128-bit load/store ---
@@ -983,6 +1019,15 @@ impl I686Codegen {
                 }
             }
 
+            // 128-bit variable-index permutes (AVX): vpermilps/vpermilpd
+            // %idx, %src, %dst. Loads follow the 128-bit operand pattern above.
+            IntrinsicOp::VpermilvarPs128 => {
+                self.emit_i686_vpermilvar_128(dest, dest_ptr, args, "vpermilps", op)
+            }
+            IntrinsicOp::VpermilvarPd128 => {
+                self.emit_i686_vpermilvar_128(dest, dest_ptr, args, "vpermilpd", op)
+            }
+
             // Blend with immediate (SSE4.1): blendps/blendpd/dpps/dppd (a, b, imm).
             IntrinsicOp::BlendPs128
             | IntrinsicOp::BlendPd128
@@ -1158,14 +1203,18 @@ impl I686Codegen {
                 }
             }
 
-            // Variable-count word shifts (count in the second xmm): (v, count).
-            IntrinsicOp::Psllw128 | IntrinsicOp::Psrlw128 => {
-                if let Some(dptr) = dest_ptr {
-                    let inst = if matches!(op, IntrinsicOp::Psllw128) {
-                        "psllw"
-                    } else {
-                        "psrlw"
-                    };
+            // Variable-count shifts (count in the second xmm): (v, count).
+            // i686 keeps vector values in memory, so there is no XMM home to
+            // protect; the operands are staged through %xmm0/%xmm1.
+            IntrinsicOp::Psllw128
+            | IntrinsicOp::Psrlw128
+            | IntrinsicOp::Pslld128
+            | IntrinsicOp::Psllq128
+            | IntrinsicOp::Psrld128
+            | IntrinsicOp::Psrlq128
+            | IntrinsicOp::Psraw128
+            | IntrinsicOp::Psrad128 => {
+                if let (Some(dptr), Some(inst)) = (dest_ptr, packed_var_shift_mnemonic(op)) {
                     self.operand_to_eax(&args[0]);
                     self.state.emit("    movdqu (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);
@@ -1863,6 +1912,7 @@ impl I686Codegen {
             | IntrinsicOp::Psadbw256
             | IntrinsicOp::Pshufb256
             | IntrinsicOp::Packssdw256
+            | IntrinsicOp::Packsswb256
             | IntrinsicOp::Packuswb256
             | IntrinsicOp::Phaddw256
             | IntrinsicOp::Phaddd256
@@ -1918,6 +1968,7 @@ impl I686Codegen {
                         IntrinsicOp::Psadbw256 => "vpsadbw",
                         IntrinsicOp::Pshufb256 => "vpshufb",
                         IntrinsicOp::Packssdw256 => "vpackssdw",
+                        IntrinsicOp::Packsswb256 => "vpacksswb",
                         IntrinsicOp::Packuswb256 => "vpackuswb",
                         IntrinsicOp::Phaddw256 => "vphaddw",
                         IntrinsicOp::Phaddd256 => "vphaddd",
@@ -1955,6 +2006,7 @@ impl I686Codegen {
             | IntrinsicOp::HaddPs256
             | IntrinsicOp::HsubPs256
             | IntrinsicOp::AddsubPs256
+            | IntrinsicOp::AddsubPd256
             | IntrinsicOp::UnpcklPs256
             | IntrinsicOp::UnpckhPs256
             | IntrinsicOp::UnpcklPd256
@@ -1986,6 +2038,7 @@ impl I686Codegen {
                         IntrinsicOp::HaddPs256 => "vhaddps",
                         IntrinsicOp::HsubPs256 => "vhsubps",
                         IntrinsicOp::AddsubPs256 => "vaddsubps",
+                        IntrinsicOp::AddsubPd256 => "vaddsubpd",
                         IntrinsicOp::UnpcklPs256 => "vunpcklps",
                         IntrinsicOp::UnpckhPs256 => "vunpckhps",
                         IntrinsicOp::UnpcklPd256 => "vunpcklpd",
@@ -2011,6 +2064,8 @@ impl I686Codegen {
             // --- AVX packed float unary (256-bit) ---
             IntrinsicOp::SqrtPs256
             | IntrinsicOp::SqrtPd256
+            | IntrinsicOp::RcpPs256
+            | IntrinsicOp::RsqrtPs256
             | IntrinsicOp::CvtPs2Ep32_256
             | IntrinsicOp::CvttPs2Ep32_256
             | IntrinsicOp::CvtEp32ToPs256
@@ -2022,6 +2077,8 @@ impl I686Codegen {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::SqrtPs256 => "vsqrtps",
+                        IntrinsicOp::RcpPs256 => "vrcpps",
+                        IntrinsicOp::RsqrtPs256 => "vrsqrtps",
                         IntrinsicOp::SqrtPd256 => "vsqrtpd",
                         IntrinsicOp::CvtPs2Ep32_256 => "vcvtps2dq",
                         IntrinsicOp::CvttPs2Ep32_256 => "vcvttps2dq",
@@ -2046,6 +2103,7 @@ impl I686Codegen {
             IntrinsicOp::CmpPs256
             | IntrinsicOp::CmpPd256
             | IntrinsicOp::ShufPs256
+            | IntrinsicOp::DpPs256
             | IntrinsicOp::ShufPd256
             | IntrinsicOp::BlendPs256
             | IntrinsicOp::BlendPd256 => {
@@ -2056,6 +2114,7 @@ impl I686Codegen {
                         IntrinsicOp::ShufPs256 => "vshufps",
                         IntrinsicOp::ShufPd256 => "vshufpd",
                         IntrinsicOp::BlendPs256 => "vblendps",
+                        IntrinsicOp::DpPs256 => "vdpps",
                         IntrinsicOp::BlendPd256 => "vblendpd",
                         _ => unreachable!("unexpected AVX fp imm op: {:?}", op),
                     };
@@ -2735,6 +2794,123 @@ impl I686Codegen {
         )
     }
 
+    /// `vmovnt{dq,pd,ps}` of a 256-bit value to `(ptr)`; 32-byte aligned
+    /// destination, as on x86-64. The data is staged before the pointer is
+    /// loaded into %eax, since `emit_avx_load` itself uses %eax.
+    fn emit_avx_movnt_256_i686(
+        &mut self,
+        op: &IntrinsicOp,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
+        let Some(ptr) = dest_ptr else { return };
+        let inst = match op {
+            IntrinsicOp::Movntdq256 => "vmovntdq",
+            IntrinsicOp::Movntpd256 => "vmovntpd",
+            IntrinsicOp::Movntps256 => "vmovntps",
+            _ => return,
+        };
+        self.emit_avx_load(&args[0], "ymm0");
+        self.operand_to_eax(&Operand::Value(*ptr));
+        self.state
+            .emit_fmt(format_args!("    {} %ymm0, (%eax)", inst));
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// `movntdqa` (SSE4.1) and `vmovntdqa` (AVX2): non-temporal load of the
+    /// source pointer into the result slot.
+    fn emit_movntdqa_i686(
+        &mut self,
+        op: &IntrinsicOp,
+        dest: &Option<Value>,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
+        let Some(dst) = dest_ptr.as_ref().or(dest.as_ref()) else {
+            return;
+        };
+        if matches!(op, IntrinsicOp::Movntdqa256) {
+            // Routed here only under AVX2 (lowering gate), so VEX is implied.
+            self.operand_to_eax(&args[0]);
+            self.state.emit("    vmovntdqa (%eax), %ymm0");
+            self.emit_avx_store_dest(dst);
+        } else if self.avx_enabled {
+            // -m32 -mavx: the VEX.128 spellings, so no legacy SSE mixes with
+            // dirty upper YMM state. i686 has no text-level promotion pass.
+            self.operand_to_eax(&args[0]);
+            self.state.emit("    vmovntdqa (%eax), %xmm0");
+            self.emit_vex128_store_dest_from(dst, "xmm0");
+        } else {
+            self.operand_to_eax(&args[0]);
+            self.state.emit("    movntdqa (%eax), %xmm0");
+            self.emit_sse_store_dest_from(dst, "xmm0");
+        }
+    }
+
+    /// `emit_sse_store_dest_from` with the VEX.128 store spelling. The
+    /// register file and store width are identical; only the encoding differs.
+    fn emit_vex128_store_dest_from(&mut self, dptr: &Value, src: &'static str) {
+        self.operand_to_eax(&Operand::Value(*dptr));
+        self.state
+            .emit_fmt(format_args!("    vmovdqu %{}, (%eax)", src));
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Sign-bit-masked load and store, the i686 twin of
+    /// `emit_avx_maskmov` on x86-64. The mask and value are staged in
+    /// `%ymm0`/`%ymm1` or `%xmm0`/`%xmm1` before the pointer is loaded
+    /// into %eax; the 128-bit staging reads exactly 16 bytes.
+    fn emit_avx_maskmov_i686(
+        &mut self,
+        op: &IntrinsicOp,
+        dest: &Option<Value>,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
+        let Some((mnemonic, width, is_store)) = op.vmaskmov_form() else {
+            return;
+        };
+        let wide = width == 32;
+        if is_store {
+            let Some(ptr) = dest_ptr else { return };
+            let (mask, value) = if wide {
+                ("ymm1", "ymm0")
+            } else {
+                ("xmm1", "xmm0")
+            };
+            if wide {
+                self.emit_avx_load(&args[0], mask);
+                self.emit_avx_load(&args[1], value);
+            } else {
+                self.emit_avx_load128(&args[0], mask);
+                self.emit_avx_load128(&args[1], value);
+            }
+            self.operand_to_eax(&Operand::Value(*ptr));
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}, (%eax)",
+                mnemonic, value, mask
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let Some(dst) = dest_ptr.as_ref().or(dest.as_ref()) else {
+            return;
+        };
+        if wide {
+            self.emit_avx_load(&args[1], "ymm1");
+            self.operand_to_eax(&args[0]);
+            self.state
+                .emit_fmt(format_args!("    {} (%eax), %ymm1, %ymm0", mnemonic));
+            self.emit_avx_store_dest(dst);
+        } else {
+            self.emit_avx_load128(&args[1], "xmm1");
+            self.operand_to_eax(&args[0]);
+            self.state
+                .emit_fmt(format_args!("    {} (%eax), %xmm1, %xmm0", mnemonic));
+            self.emit_sse_store_dest_from(dst, "xmm0");
+        }
+    }
+
     fn emit_nontemporal_store(
         &mut self,
         op: &IntrinsicOp,
@@ -2760,25 +2936,36 @@ impl I686Codegen {
                 self.state.emit("    movnti %eax, (%ecx)");
                 self.state.emit("    movnti %edx, 4(%ecx)");
             }
+            // Under -m32 -mavx every instruction takes its VEX.128 spelling, so
+            // no legacy SSE mixes with dirty upper YMM state. Without AVX the
+            // SSE1/SSE2 spellings are kept: an SSE1-only target has MOVUPS and
+            // MOVNTPS but neither MOVDQU nor MOVUPD.
             IntrinsicOp::Movntdq => {
+                let v = if self.avx_enabled { "v" } else { "" };
                 self.operand_to_eax(&args[0]);
-                self.state.emit("    movdqu (%eax), %xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {v}movdqu (%eax), %xmm0"));
                 self.operand_to_eax(&Operand::Value(*ptr));
-                self.state.emit("    movntdq %xmm0, (%eax)");
+                self.state
+                    .emit_fmt(format_args!("    {v}movntdq %xmm0, (%eax)"));
             }
             IntrinsicOp::Movntpd => {
+                let v = if self.avx_enabled { "v" } else { "" };
                 self.operand_to_eax(&args[0]);
-                self.state.emit("    movupd (%eax), %xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {v}movupd (%eax), %xmm0"));
                 self.operand_to_eax(&Operand::Value(*ptr));
-                self.state.emit("    movntpd %xmm0, (%eax)");
+                self.state
+                    .emit_fmt(format_args!("    {v}movntpd %xmm0, (%eax)"));
             }
             IntrinsicOp::Movntps => {
-                // SSE1 throughout: an SSE1-only i686 target has MOVUPS and
-                // MOVNTPS but neither MOVDQU nor MOVUPD.
+                let v = if self.avx_enabled { "v" } else { "" };
                 self.operand_to_eax(&args[0]);
-                self.state.emit("    movups (%eax), %xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {v}movups (%eax), %xmm0"));
                 self.operand_to_eax(&Operand::Value(*ptr));
-                self.state.emit("    movntps %xmm0, (%eax)");
+                self.state
+                    .emit_fmt(format_args!("    {v}movntps %xmm0, (%eax)"));
             }
             _ => {}
         }

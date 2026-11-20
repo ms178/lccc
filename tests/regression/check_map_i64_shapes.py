@@ -47,8 +47,11 @@ def main():
     shape(rolled, 'sub64', 1, 16)
     shape(vector, 'tier2', 2, 32, 2)  # Two sub AND two add instructions.
     body, start, loop = shape(vector, 'invariant64', 4, 64)
-    assert len(re.findall(r'\b(?:unpcklpd|vpbroadcastq)\b', body[:start])) == 1
-    assert not re.search(r'\b(?:unpcklpd|vpbroadcastq)\b', loop)
+    # The lane broadcast is `unpcklpd` under SSE2 and `vunpcklpd` under VEX
+    # (-march=x86-64-v3 promotes it); both spellings are the same hoisted op.
+    lane_broadcast = r'\b(?:v?unpcklpd|vpbroadcastq)\b'
+    assert len(re.findall(lane_broadcast, body[:start])) == 1
+    assert not re.search(lane_broadcast, loop)
     assert not re.search(r'\bv?psubq\b', function(scalar, 'sub64'))
     for count in range(3, 17):
         assert re.search(r'\bv?psubq\b', function(small, f'small{count}')), count

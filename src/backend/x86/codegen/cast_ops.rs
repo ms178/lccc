@@ -298,11 +298,9 @@ impl X86Codegen {
                     self.state.emit("    fildq (%rsp)");
                     self.state.emit("    addq $8, %rsp");
                     self.state.emit("    subq $16, %rsp");
-                    self.state.out.emit_instr_imm_reg(
-                        "    movabsq",
-                        -9223372036854775808i64,
-                        "rax",
-                    );
+                    self.state.with_out_checked(|o| {
+                        o.emit_instr_imm_reg("    movabsq", -9223372036854775808i64, "rax")
+                    });
                     self.state.emit("    movq %rax, (%rsp)");
                     self.state
                         .out
@@ -313,8 +311,10 @@ impl X86Codegen {
                     self.state.emit("    faddp %st, %st(1)");
                     self.state.out.emit_named_label(&done_label);
                 }
-                self.state.out.emit_instr_rbp("    fstpt", dest_slot.0);
-                self.state.out.emit_instr_rbp("    fldt", dest_slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fstpt", dest_slot.0));
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp("    fldt", dest_slot.0));
                 self.state.emit("    subq $8, %rsp");
                 self.state.emit("    fstpl (%rsp)");
                 self.state.emit("    popq %rax");
@@ -1271,7 +1271,8 @@ impl X86Codegen {
         let fused32 = matches!(narrow_to, Some(t) if t.size() <= 4)
             && self.state.alloca_over_align(v).is_none();
         if fused32 {
-            self.state.out.emit_instr_rbp_reg("    leal", slot, dest_32);
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    leal", slot, dest_32));
         } else {
             self.value_to_reg(&Value(v), dest_64);
         }

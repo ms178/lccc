@@ -524,6 +524,30 @@ _mm256_zeroupper(void)
     __builtin_ia32_vzeroupper();
 }
 
+/* _mm_broadcastsd_pd (VMOVDDUP / VPERMILPD $0): duplicate the low double.
+   GCC defines it as _mm_movedup_pd, the same unpacklo of a value with
+   itself.  It is AVX1, so it is not behind __AVX2__. */
+static __inline__ __m128d __attribute__((__always_inline__))
+_mm_broadcastsd_pd(__m128d __a)
+{
+    return _mm_unpacklo_pd(__a, __a);
+}
+
+/* vzeroall writes every YMM register (and zeroes bits 128..255 of each).
+   The asm clobber list names all sixteen registers so that a YMM value
+   live across the call is spilled and reloaded rather than kept in a
+   register that vzeroall destroys. */
+static __inline__ void __attribute__((__always_inline__))
+_mm256_zeroall(void)
+{
+    __asm__ volatile("vzeroall"
+                     :
+                     :
+                     : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6",
+                       "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
+                       "xmm13", "xmm14", "xmm15", "memory");
+}
+
 /* Zero-extend a 128-bit value: lanes 4..7 are the zero vector's lanes. */
 static __inline__ __m256 __attribute__((__always_inline__))
 _mm256_zextps128_ps256(__m128 __a)
@@ -720,5 +744,76 @@ _mm_broadcast_ss(float const *__p)
 
 /* === Movemask === */
 
+
+/* === Non-temporal stores and sign-bit-masked moves (AVX1) ===
+ * The streaming stores (VMOVNT*) require a 32-byte aligned destination. The
+ * masked moves (VMASKMOV*) use only the sign bit of each lane: a masked-off
+ * lane is neither read nor written, so it cannot fault. */
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_stream_ps(float *__p, __m256 __a)
+{
+    __builtin_ia32_movntps256(__p, (__v8sf)__a);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_stream_pd(double *__p, __m256d __a)
+{
+    __builtin_ia32_movntpd256(__p, (__v4df)__a);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_stream_si256(__m256i *__p, __m256i __a)
+{
+    __builtin_ia32_movntdq256((__v4di *)__p, (__v4di)__a);
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_maskload_ps(float const *__p, __m256i __m)
+{
+    return (__m256)__builtin_ia32_maskloadps256((const __v8sf *)__p, (__v8si)__m);
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_maskload_pd(double const *__p, __m256i __m)
+{
+    return (__m256d)__builtin_ia32_maskloadpd256((const __v4df *)__p, (__v4di)__m);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_maskstore_ps(float *__p, __m256i __m, __m256 __a)
+{
+    __builtin_ia32_maskstoreps256((__v8sf *)__p, (__v8si)__m, (__v8sf)__a);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_maskstore_pd(double *__p, __m256i __m, __m256d __a)
+{
+    __builtin_ia32_maskstorepd256((__v4df *)__p, (__v4di)__m, (__v4df)__a);
+}
+
+static __inline__ __m128 __attribute__((__always_inline__))
+_mm_maskload_ps(float const *__p, __m128i __m)
+{
+    return (__m128)__builtin_ia32_maskloadps((const __v4sf *)__p, (__v4si)__m);
+}
+
+static __inline__ __m128d __attribute__((__always_inline__))
+_mm_maskload_pd(double const *__p, __m128i __m)
+{
+    return (__m128d)__builtin_ia32_maskloadpd((const __v2df *)__p, (__v2di)__m);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm_maskstore_ps(float *__p, __m128i __m, __m128 __a)
+{
+    __builtin_ia32_maskstoreps((__v4sf *)__p, (__v4si)__m, (__v4sf)__a);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm_maskstore_pd(double *__p, __m128i __m, __m128d __a)
+{
+    __builtin_ia32_maskstorepd((__v2df *)__p, (__v2di)__m, (__v2df)__a);
+}
 
 #endif /* _AVXINTRIN_H_INCLUDED */

@@ -16,6 +16,12 @@
  * register. */
 typedef int __m64 __attribute__((__vector_size__(8), __may_alias__));
 
+/* Unaligned 64-bit MMX memory operand (GCC 16.2 `__m64_u`). The
+ * _mm_loadl_pi / _mm_loadh_pi / _mm_storel_pi / _mm_storeh_pi forms take this
+ * type so that an 8-byte load from any address, not only an 8-byte-aligned
+ * one, is a valid call. */
+typedef int __m64_u __attribute__((__vector_size__(8), __may_alias__, __aligned__(1)));
+
 /* Packed working images for the MMX entry points: every _mm_*_pi* op below
  * runs as its SSE2 counterpart on the low 64 bits of a 128-bit register
  * image (zero-extended into the working vector, low 8 bytes extracted), so
@@ -716,5 +722,123 @@ _mm_cvtm64_si64(__m64 __a)
 
 #undef __LCCC_MMX_LOW
 #undef __LCCC_MMX_EXTEND
+
+/* === 64-bit scalar moves and integer ops on the MMX register (GCC 16.2
+ * names). The register is 8 bytes; each op reads or writes all 8 bytes. ===
+ * Unsigned arithmetic is used for the wrap-around adds and subtracts, so no
+ * signed overflow occurs. */
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_cvtsi64x_si64(long long __i)
+{
+    return (__m64)(long long)(__i);
+}
+
+static __inline__ long long __attribute__((__always_inline__))
+_mm_cvtsi64_si64x(__m64 __i)
+{
+    return (long long)__i;
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_set_pi64x(long long __i)
+{
+    return (__m64)(long long)(__i);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_add_si64(__m64 __a, __m64 __b)
+{
+    return (__m64)(long long)((unsigned long long)(long long)__a + (unsigned long long)(long long)__b);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_sub_si64(__m64 __a, __m64 __b)
+{
+    return (__m64)(long long)((unsigned long long)(long long)__a - (unsigned long long)(long long)__b);
+}
+
+/* Shifts of the whole 64-bit register by a count taken from the second
+ * operand's 64 bits. A count above 63 gives zero. */
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_sll_si64(__m64 __a, __m64 __count)
+{
+    unsigned long long __c = (unsigned long long)(long long)__count;
+    if (__c > 63)
+        return (__m64)(long long)(0);
+    return (__m64)(long long)((unsigned long long)(long long)__a << (int)__c);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_srl_si64(__m64 __a, __m64 __count)
+{
+    unsigned long long __c = (unsigned long long)(long long)__count;
+    if (__c > 63)
+        return (__m64)(long long)(0);
+    return (__m64)(long long)((unsigned long long)(long long)__a >> (int)__c);
+}
+
+/* === MMX packed shifts by a scalar count (PSLLW/PSRLW/PSRAW, PSLLD/PSRLD/
+ * PSRAD on the 64-bit register). A count above the element width gives zero
+ * for the logical shifts and the sign fill for the arithmetic shifts. === */
+
+typedef unsigned short __lccc_mmx_v4hu __attribute__((__vector_size__(8)));
+typedef short __lccc_mmx_v4hi __attribute__((__vector_size__(8)));
+typedef unsigned int __lccc_mmx_v2su __attribute__((__vector_size__(8)));
+typedef int __lccc_mmx_v2si __attribute__((__vector_size__(8)));
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_sll_pi16(__m64 __a, __m64 __count)
+{
+    unsigned long long __c = (unsigned long long)(long long)__count;
+    if (__c > 15)
+        return (__m64)(long long)(0);
+    return (__m64)((__lccc_mmx_v4hu)__a << (int)__c);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_srl_pi16(__m64 __a, __m64 __count)
+{
+    unsigned long long __c = (unsigned long long)(long long)__count;
+    if (__c > 15)
+        return (__m64)(long long)(0);
+    return (__m64)((__lccc_mmx_v4hu)__a >> (int)__c);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_sra_pi16(__m64 __a, __m64 __count)
+{
+    unsigned long long __c = (unsigned long long)(long long)__count;
+    if (__c > 15)
+        __c = 15;
+    return (__m64)((__lccc_mmx_v4hi)__a >> (int)__c);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_sll_pi32(__m64 __a, __m64 __count)
+{
+    unsigned long long __c = (unsigned long long)(long long)__count;
+    if (__c > 31)
+        return (__m64)(long long)(0);
+    return (__m64)((__lccc_mmx_v2su)__a << (int)__c);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_srl_pi32(__m64 __a, __m64 __count)
+{
+    unsigned long long __c = (unsigned long long)(long long)__count;
+    if (__c > 31)
+        return (__m64)(long long)(0);
+    return (__m64)((__lccc_mmx_v2su)__a >> (int)__c);
+}
+
+static __inline__ __m64 __attribute__((__always_inline__))
+_mm_sra_pi32(__m64 __a, __m64 __count)
+{
+    unsigned long long __c = (unsigned long long)(long long)__count;
+    if (__c > 31)
+        __c = 31;
+    return (__m64)((__lccc_mmx_v2si)__a >> (int)__c);
+}
 
 #endif /* _MMINTRIN_H_INCLUDED */

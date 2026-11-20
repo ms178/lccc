@@ -1591,6 +1591,14 @@ gate "avx-intrinsic-isa" fast python3 tests/regression/check_avx_intrinsic_isa.p
     --lccc target/fastbuild/lccc --reference "$(command -v gcc-16)"
 gate "avx-lane-builtin-gate" fast python3 tests/regression/check_avx_lane_builtin_gate.py \
     --lccc target/fastbuild/lccc --gcc gcc-16
+# VEX encoding parity: 128-bit and scalar SIMD under -mavx (GCC 16.2 is VEX
+# throughout); the streaming/masked fixture pins the non-temporal forms.
+gate "vex-legal-encoding" fast python3 tests/regression/check_vex_legal_encoding.py \
+    --lccc target/fastbuild/lccc --gcc gcc-16
+gate "avx-nontemporal-vex-selftest" fast python3 tests/regression/check_avx_nontemporal_vex.py \
+    --self-test
+gate "avx-nontemporal-vex" fast python3 tests/regression/check_avx_nontemporal_vex.py \
+    --lccc target/fastbuild/lccc
 
 # CCC_VALIDATE_SSA is what CI sets; without it the corpus does not verify SSA
 # form after every pass and a malformed-IR bug can hide behind a correct

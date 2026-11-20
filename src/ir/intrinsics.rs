@@ -67,6 +67,36 @@ pub enum IntrinsicOp {
     Movntdq,
     Movntpd,
     Movntps,
+    /// 256-bit non-temporal stores (`vmovntdq`/`vmovntpd`/`vmovntps`). The
+    /// destination must be 32-byte aligned: the VEX.256 form faults otherwise.
+    Movntdq256,
+    Movntpd256,
+    Movntps256,
+    /// Non-temporal loads (`movntdqa`): SSE4.1 128-bit and AVX2 256-bit. The
+    /// source must be 16-byte (128-bit) or 32-byte (256-bit) aligned.
+    Movntdqa128,
+    Movntdqa256,
+    /// AVX/AVX2 sign-bit-masked memory access (`vmaskmov*` / `vpmaskmov*`).
+    /// `MaskLoad*` takes args `[ptr, mask]` and does NOT fault on a masked-off
+    /// lane. `MaskStore*` takes `dest_ptr` with args `[mask, value]` and writes
+    /// only the lanes whose mask sign bit is set. `Ps`/`Pd` are float lanes
+    /// (32/64-bit); `D`/`Q` are integer lanes (32/64-bit).
+    MaskLoadPs128,
+    MaskLoadPd128,
+    MaskLoadD128,
+    MaskLoadQ128,
+    MaskLoadPs256,
+    MaskLoadPd256,
+    MaskLoadD256,
+    MaskLoadQ256,
+    MaskStorePs128,
+    MaskStorePd128,
+    MaskStoreD128,
+    MaskStoreQ128,
+    MaskStorePs256,
+    MaskStorePd256,
+    MaskStoreD256,
+    MaskStoreQ256,
     /// Load/store 128-bit unaligned
     Loaddqu,
     Storedqu,
@@ -1361,6 +1391,18 @@ pub enum IntrinsicOp {
     Psllw128,
     /// Packed 16-bit variable shift right (PSRLW)
     Psrlw128,
+    /// Packed 32-bit variable shift left (PSLLD), count in the low 64 bits of XMM
+    Pslld128,
+    /// Packed 64-bit variable shift left (PSLLQ), count in the low 64 bits of XMM
+    Psllq128,
+    /// Packed 32-bit variable logical shift right (PSRLD)
+    Psrld128,
+    /// Packed 64-bit variable logical shift right (PSRLQ)
+    Psrlq128,
+    /// Packed 16-bit variable arithmetic shift right (PSRAW)
+    Psraw128,
+    /// Packed 32-bit variable arithmetic shift right (PSRAD)
+    Psrad128,
     /// Packed 16-bit multiply high (PMULHW)
     Pmulhw128,
     /// Packed 16-bit multiply-add to 32-bit (PMADDWD)
@@ -1633,6 +1675,7 @@ pub enum IntrinsicOp {
     Psrawi256,
     Psradi256,
     Packssdw256,
+    Packsswb256,
     Packuswb256,
     Phaddw256,
     Phaddd256,
@@ -1934,6 +1977,10 @@ pub enum IntrinsicOp {
     MinPs256,
     MaxPs256,
     SqrtPs256,
+    /// 256-bit reciprocal approximation: `vrcpps ymm`.
+    RcpPs256,
+    /// 256-bit reciprocal-square-root approximation: `vrsqrtps ymm`.
+    RsqrtPs256,
     CmpPs256,
     ShufPs256,
     UnpcklPs256,
@@ -1963,6 +2010,10 @@ pub enum IntrinsicOp {
     VpermilvarPs256,
     /// 256-bit variable-index permute (double): `vpermilpd %idx, %src, %dst`.
     VpermilvarPd256,
+    /// 128-bit variable-index permute: `vpermilps %idx, %src, %dst` (xmm).
+    VpermilvarPs128,
+    /// 128-bit variable-index permute (double): `vpermilpd %idx, %src, %dst` (xmm).
+    VpermilvarPd128,
     Vperm2f128,
     Vinsertf128,
     Vextractf128,
@@ -1984,6 +2035,8 @@ pub enum IntrinsicOp {
     BlendvPd256,
     DpPs128,
     DpPd128,
+    /// 256-bit dot product, two independent 128-bit lanes: `vdpps ymm`.
+    DpPs256,
     InsertPs128,
     ExtractPs128,
     InsertPd128,
@@ -1997,6 +2050,8 @@ pub enum IntrinsicOp {
     HaddPs256,
     HsubPs256,
     AddsubPs256,
+    /// 256-bit alternating subtract/add, double: `vaddsubpd ymm`.
+    AddsubPd256,
     Movddup128,
     Movsldup128,
     Movshdup128,
@@ -2148,6 +2203,46 @@ pub(crate) const VECTOR_STORES: [IntrinsicOp; 14] = [
 ];
 
 impl IntrinsicOp {
+    /// `(mnemonic, vector bytes, is_store)` for the AVX/AVX2 sign-bit-masked
+    /// memory ops. The mnemonic is the VEX form both emitters must agree on:
+    /// `vmaskmovps`/`vmaskmovpd` for float lanes, `vpmaskmovd`/`vpmaskmovq`
+    /// for integer lanes. Operand order is the same for the load and store
+    /// forms in Intel syntax: `dst, mask, mem` / `mem, mask, src`.
+    pub(crate) fn vmaskmov_form(self) -> Option<(&'static str, u32, bool)> {
+        use IntrinsicOp as O;
+        Some(match self {
+            O::MaskLoadPs128 => ("vmaskmovps", 16, false),
+            O::MaskLoadPd128 => ("vmaskmovpd", 16, false),
+            O::MaskLoadD128 => ("vpmaskmovd", 16, false),
+            O::MaskLoadQ128 => ("vpmaskmovq", 16, false),
+            O::MaskLoadPs256 => ("vmaskmovps", 32, false),
+            O::MaskLoadPd256 => ("vmaskmovpd", 32, false),
+            O::MaskLoadD256 => ("vpmaskmovd", 32, false),
+            O::MaskLoadQ256 => ("vpmaskmovq", 32, false),
+            O::MaskStorePs128 => ("vmaskmovps", 16, true),
+            O::MaskStorePd128 => ("vmaskmovpd", 16, true),
+            O::MaskStoreD128 => ("vpmaskmovd", 16, true),
+            O::MaskStoreQ128 => ("vpmaskmovq", 16, true),
+            O::MaskStorePs256 => ("vmaskmovps", 32, true),
+            O::MaskStorePd256 => ("vmaskmovpd", 32, true),
+            O::MaskStoreD256 => ("vpmaskmovd", 32, true),
+            O::MaskStoreQ256 => ("vpmaskmovq", 32, true),
+            _ => return None,
+        })
+    }
+
+    /// `(vector bytes, required address alignment in bytes)` for the
+    /// non-temporal ops: the stores `Movnt*` and the streaming load
+    /// `Movntdqa*`. `None` for every other op.
+    pub(crate) fn movnt_shape(self) -> Option<(u32, u32)> {
+        use IntrinsicOp as O;
+        Some(match self {
+            O::Movntdq | O::Movntpd | O::Movntps | O::Movntdqa128 => (16, 16),
+            O::Movntdq256 | O::Movntpd256 | O::Movntps256 | O::Movntdqa256 => (32, 32),
+            _ => return None,
+        })
+    }
+
     /// Native legacy/VEX SSSE3 binary mnemonic shared by both x86 emitters.
     pub(crate) fn ssse3_binary_mnemonic(self) -> Option<&'static str> {
         Some(match self {
@@ -2327,6 +2422,7 @@ impl IntrinsicOp {
             // the destination slot exactly like `Loadu256`. Without this,
             // a 32-byte `vmovdqu` store could target an 8-byte slot.
             Loadu256Raw | Loadu256 | Load256
+            | MaskLoadPs256 | MaskLoadPd256 | MaskLoadD256 | MaskLoadQ256 | Movntdqa256
             | Paddb256 | Paddw256 | Paddd256 | Psubb256 | Psubw256 | Psubusw256
             | Psadbw256 | Pmaddubsw256 | Pmaddwd256 | Pcmpeqb256 | Pcmpgtb256
             | Pshufb256 | Pabsb256 | Pabsw256 | Pmaxub256
@@ -2395,7 +2491,8 @@ impl IntrinsicOp {
             | DivPs256 | MinPs256 | MaxPs256 | SqrtPs256 | CmpPs256 | ShufPs256
             | DivPd256 | MinPd256 | MaxPd256 | SqrtPd256 | CmpPd256 | ShufPd256
             | UnpcklPs256 | UnpckhPs256 | UnpcklPd256 | UnpckhPd256
-            | HaddPs256 | HsubPs256 | AddsubPs256
+            | HaddPs256 | HsubPs256 | AddsubPs256 | AddsubPd256
+            | DpPs256 | RcpPs256 | RsqrtPs256
             | RoundPs256 | RoundPd256 | VpermilPs256 | VpermilPd256
             | VpermilvarPs256 | VpermilvarPd256 | BlendPs256 | BlendPd256
             | LoaduPs256 | StoreuPs256 | LoaduPd256
@@ -2409,7 +2506,7 @@ impl IntrinsicOp {
             | Pminsb256 | Pmaxsb256 | Pminud256 | Pmaxud256
             | Pmovzxbw256 | Pmovzxbd256 | Pmovzxwd256
             | Pmovsxbw256 | Pmovsxbd256 | Pmovsxwd256
-            | Psrawi256 | Psradi256 | Packssdw256 | Packuswb256
+            | Psrawi256 | Psradi256 | Packssdw256 | Packsswb256 | Packuswb256
             | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256
             // `VecMaskedAddI32x8` folds eight I32 lanes into an I32x8
             // accumulator: a 256-bit result, emitted with `vpaddd %ymm`.
@@ -2439,7 +2536,8 @@ impl IntrinsicOp {
             | VecSubI64x4 | VecAndI64x4 | VecOrI64x4 | VecXorI64x4
             | VecBroadcastI64x4 => Some(32),
             // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
-            Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
+            Loaddqu | Loadldi128 | MaskLoadPs128 | MaskLoadPd128 | MaskLoadD128 | MaskLoadQ128
+            | Movntdqa128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
             | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
             | MulPs128 | AddPd128 | SubPd128 | MulPd128
             | DivPs128 | MinPs128 | MaxPs128 | SqrtPs128 | RcpPs128 | RsqrtPs128
@@ -2464,6 +2562,7 @@ impl IntrinsicOp {
             | Phaddd128 | Phsubw128 | Phsubd128 | Phaddsw128 | Phsubsw128 | Psignb128 | Psignw128 | Psignd128 | Pmulhrsw128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
             | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pblendw128 | Pmovzxbw128
             | Pmovzxwd128 | Psllw128 | Psrlw128 | Pmulhw128 | Pmaddwd128
+            | Pslld128 | Psllq128 | Psrld128 | Psrlq128 | Psraw128 | Psrad128
             | Pcmpgtw128 | Pcmpgtb128 | Psllwi128 | Psrlwi128 | Psrawi128
             | Psradi128 | Pslldi128 | Psrldi128 | Paddd128 | Psubd128
             | Packssdw128 | Packsswb128 | Packuswb128 | Punpcklbw128
@@ -2542,6 +2641,7 @@ impl IntrinsicOp {
             // ARX lane family: 128-bit XMM results (pslld/pshufd/pshufb/
             // pack are x4-lane).
             | VecRotlI32x4 | VecShufdI32x4 | VecShufbI32x4 | VecPackI32x4
+            | VpermilvarPs128 | VpermilvarPd128
             => Some(16),
             // Everything else produces a scalar GPR/x87 result, no result, or
             // is an F128 helper handled by the dedicated f128 slot path.
@@ -2823,6 +2923,16 @@ impl IntrinsicOp {
                 | IntrinsicOp::LoadF64x2
                 | IntrinsicOp::LoadI32x8
                 | IntrinsicOp::LoadI32x4
+                | IntrinsicOp::MaskLoadPs128
+                | IntrinsicOp::MaskLoadPd128
+                | IntrinsicOp::MaskLoadD128
+                | IntrinsicOp::MaskLoadQ128
+                | IntrinsicOp::MaskLoadPs256
+                | IntrinsicOp::MaskLoadPd256
+                | IntrinsicOp::MaskLoadD256
+                | IntrinsicOp::MaskLoadQ256
+                | IntrinsicOp::Movntdqa128
+                | IntrinsicOp::Movntdqa256
                 | IntrinsicOp::VecLoadF64x4
                 | IntrinsicOp::VecLoadF64x2
                 | IntrinsicOp::VecLoadI32x8
@@ -2954,6 +3064,16 @@ impl IntrinsicOp {
         matches!(
             self,
             IntrinsicOp::VecZeroF64x4
+                | IntrinsicOp::MaskLoadPs128
+                | IntrinsicOp::MaskLoadPd128
+                | IntrinsicOp::MaskLoadD128
+                | IntrinsicOp::MaskLoadQ128
+                | IntrinsicOp::MaskLoadPs256
+                | IntrinsicOp::MaskLoadPd256
+                | IntrinsicOp::MaskLoadD256
+                | IntrinsicOp::MaskLoadQ256
+                | IntrinsicOp::Movntdqa128
+                | IntrinsicOp::Movntdqa256
                 | IntrinsicOp::VecZeroF64x2
                 | IntrinsicOp::VecZeroI32x8
                 | IntrinsicOp::VecZeroI32x4
@@ -3258,6 +3378,26 @@ mod vector_width_tests {
             assert!(op.is_pure());
             assert!(!op.may_read_memory());
             assert!(!op.writes_memory_via_args());
+        }
+    }
+
+    /// AVX1 mirror ops are whole-register values. Pin their home widths so a
+    /// missing row falls through `vector_home_width`'s silent `_ => None` and
+    /// cannot reach the stack layout with an undersized destination slot.
+    #[test]
+    fn avx1_mirror_intrinsics_have_full_register_homes() {
+        for op in [
+            IntrinsicOp::AddsubPd256,
+            IntrinsicOp::DpPs256,
+            IntrinsicOp::RcpPs256,
+            IntrinsicOp::RsqrtPs256,
+        ] {
+            assert_eq!(op.vector_home_width(), Some(32), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(32), "{op:?} result");
+        }
+        for op in [IntrinsicOp::VpermilvarPs128, IntrinsicOp::VpermilvarPd128] {
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?} result");
         }
     }
 
@@ -4081,6 +4221,14 @@ mod memory_classification_tests {
             O::MaskLoaduEpi8_128,
             O::MaskLoaduEpi8_256,
             O::MaskLoaduEpi8_512,
+            O::MaskLoadPs128,
+            O::MaskLoadPd128,
+            O::MaskLoadD128,
+            O::MaskLoadQ128,
+            O::MaskLoadPs256,
+            O::MaskLoadPd256,
+            O::MaskLoadD256,
+            O::MaskLoadQ256,
         ];
         // COMPLETENESS: every load-named variant in the enum is enumerated.
         for name in &load_named_from_source {
@@ -4541,4 +4689,20 @@ mod mask_compare_width_parity_tests {
             assert_eq!(op.mask_compare_vector_width(), None, "{op:?}");
         }
     }
+}
+
+/// Mnemonic of an SSE2 packed shift whose count is taken from the low 64 bits
+/// of an XMM register (`psllw` ... `psrad`). `None` for every other op.
+pub fn packed_var_shift_mnemonic(op: &IntrinsicOp) -> Option<&'static str> {
+    Some(match op {
+        IntrinsicOp::Psllw128 => "psllw",
+        IntrinsicOp::Psrlw128 => "psrlw",
+        IntrinsicOp::Pslld128 => "pslld",
+        IntrinsicOp::Psllq128 => "psllq",
+        IntrinsicOp::Psrld128 => "psrld",
+        IntrinsicOp::Psrlq128 => "psrlq",
+        IntrinsicOp::Psraw128 => "psraw",
+        IntrinsicOp::Psrad128 => "psrad",
+        _ => return None,
+    })
 }

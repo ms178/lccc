@@ -6,6 +6,25 @@
 /* SSE4.2 shipped POPCNT; GCC's smmintrin.h carries its intrinsics too. */
 #include <popcntintrin.h>
 
+/* Rounding-mode macros for _mm_round_* and _mm256_round_* (and therefore the
+ * AVX1 _mm256_ceil/floor_{ps,pd}, which expand to _mm256_round_* with these
+ * constants).  Values and composition match GCC 16.2 smmintrin.h exactly. */
+#define _MM_FROUND_TO_NEAREST_INT 0x00
+#define _MM_FROUND_TO_NEG_INF 0x01
+#define _MM_FROUND_TO_POS_INF 0x02
+#define _MM_FROUND_TO_ZERO 0x03
+#define _MM_FROUND_CUR_DIRECTION 0x04
+
+#define _MM_FROUND_RAISE_EXC 0x00
+#define _MM_FROUND_NO_EXC 0x08
+
+#define _MM_FROUND_NINT (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_FLOOR (_MM_FROUND_TO_NEG_INF | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_CEIL (_MM_FROUND_TO_POS_INF | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_TRUNC (_MM_FROUND_TO_ZERO | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_RINT (_MM_FROUND_CUR_DIRECTION | _MM_FROUND_RAISE_EXC)
+#define _MM_FROUND_NEARBYINT (_MM_FROUND_CUR_DIRECTION | _MM_FROUND_NO_EXC)
+
 /* === SSE4.1 insert/extract intrinsics === */
 
 /* _mm_extract_epi8: extract 8-bit int from lane (PEXTRB) */
@@ -249,6 +268,149 @@ _mm_testz_si128(__m128i __a, __m128i __b)
     return (__a[0] & __b[0]) == 0 && (__a[1] & __b[1]) == 0;
 }
 
+/* _mm_cmpgt_epi64: signed 64-bit greater-than (PCMPGTQ, SSE4.2). A vector
+ * comparison yields -1 or 0 per lane, which is the mask form the intrinsic
+ * returns. */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.2")))
+_mm_cmpgt_epi64(__m128i __a, __m128i __b)
+{
+    return (__m128i)((__v2di)__a > (__v2di)__b);
+}
+
+/* _mm_testc_si128: CF of PTEST, 1 iff (~a & b) == 0 */
+static __inline__ int __attribute__((__always_inline__, target("sse4.1")))
+_mm_testc_si128(__m128i __a, __m128i __b)
+{
+    return (~__a[0] & __b[0]) == 0 && (~__a[1] & __b[1]) == 0;
+}
+
+/* _mm_testnzc_si128: 1 iff ZF == 0 and CF == 0 */
+static __inline__ int __attribute__((__always_inline__, target("sse4.1")))
+_mm_testnzc_si128(__m128i __a, __m128i __b)
+{
+    return !_mm_testz_si128(__a, __b) && !_mm_testc_si128(__a, __b);
+}
+
+/* Macro forms, as in GCC 16.2. Each operand is evaluated once. */
+#define _mm_test_all_zeros(__m, __v) _mm_testz_si128((__m), (__v))
+#define _mm_test_mix_ones_zeros(__m, __v) _mm_testnzc_si128((__m), (__v))
+#define _mm_test_all_ones(__v)                                                 \
+    __extension__ ({                                                           \
+        __m128i __tao_v = (__v);                                               \
+        _mm_testc_si128(__tao_v, _mm_cmpeq_epi32(__tao_v, __tao_v));           \
+    })
+
+/* === SSE4.1 extends to 64-bit lanes (PMOVSX/PMOVZX). Only the low source
+ * elements are read; each is widened into one 64-bit lane. The bytes are read
+ * with memcpy, not through a scalar pointer into the vector. === */
+
+typedef unsigned short __lccc_sse_v8hu __attribute__((__vector_size__(16)));
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_cvtepi8_epi64(__m128i __a)
+{
+    signed char __b[16];
+    __builtin_memcpy(__b, &__a, 16);
+    __v2di __r = { (long long)__b[0], (long long)__b[1] };
+    return (__m128i)__r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_cvtepu8_epi64(__m128i __a)
+{
+    unsigned char __b[16];
+    __builtin_memcpy(__b, &__a, 16);
+    __v2di __r = { (long long)__b[0], (long long)__b[1] };
+    return (__m128i)__r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_cvtepi16_epi64(__m128i __a)
+{
+    short __h[8];
+    __builtin_memcpy(__h, &__a, 16);
+    __v2di __r = { (long long)__h[0], (long long)__h[1] };
+    return (__m128i)__r;
+}
+
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_cvtepu16_epi64(__m128i __a)
+{
+    unsigned short __h[8];
+    __builtin_memcpy(__h, &__a, 16);
+    __v2di __r = { (long long)__h[0], (long long)__h[1] };
+    return (__m128i)__r;
+}
+
+/* === SSE4.1 minimum with index (PHMINPOSUW). Result lane 0 is the minimum
+ * unsigned 16-bit element, lane 1 is its index (the first occurrence), and
+ * lanes 2..7 are zero. === */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_minpos_epu16(__m128i __a)
+{
+    unsigned short __w[8];
+    __builtin_memcpy(__w, &__a, 16);
+    unsigned short __min = __w[0];
+    unsigned short __idx = 0;
+    for (unsigned short __i = 1; __i < 8; __i++) {
+        if (__w[__i] < __min) {
+            __min = __w[__i];
+            __idx = __i;
+        }
+    }
+    __lccc_sse_v8hu __r = { __min, __idx, 0, 0, 0, 0, 0, 0 };
+    return (__m128i)__r;
+}
+
+/* === SSE4.1 multiple sums of absolute differences (MPSADBW). Bit 2 of the
+ * immediate selects a 4-byte offset into __a (0 or 4). Bits 1:0 select a
+ * 4-byte block of __b at offset 0, 4, 8 or 12. Each of the eight results is
+ * the sum of |a[aoff+i+j] - b[boff+j]| over j = 0..3. The largest sum is
+ * 4 * 255, so 16-bit results do not overflow. === */
+static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
+_mm_mpsadbw_epu8(__m128i __a, __m128i __b, const int __imm)
+{
+    unsigned char __ab[16];
+    unsigned char __bb[16];
+    __builtin_memcpy(__ab, &__a, 16);
+    __builtin_memcpy(__bb, &__b, 16);
+    int __aoff = (__imm & 4) ? 4 : 0;
+    int __boff = (__imm & 3) * 4;
+    __lccc_sse_v8hu __r = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (int __i = 0; __i < 8; __i++) {
+        int __s = 0;
+        for (int __j = 0; __j < 4; __j++) {
+            int __d = (int)__ab[__aoff + __i + __j] - (int)__bb[__boff + __j];
+            __s += __d < 0 ? -__d : __d;
+        }
+        __r[__i] = (unsigned short)__s;
+    }
+    return (__m128i)__r;
+}
+
+/* === SSE4.1 round (ROUNDPS/ROUNDPD and the scalar forms) ===
+ * The scalar forms round only the low element of the second operand, and
+ * take the upper elements from the first. Rounding the packed value and
+ * merging the low lane gives exactly that, with the same rounding mode. */
+#define _mm_round_ss(__d, __v, __m)                                            \
+    __extension__ ({                                                           \
+        __m128 __rss_d = (__d);                                                \
+        _mm_move_ss(__rss_d, _mm_round_ps((__v), (__m)));                      \
+    })
+#define _mm_round_sd(__d, __v, __m)                                            \
+    __extension__ ({                                                           \
+        __m128d __rsd_d = (__d);                                               \
+        _mm_move_sd(__rsd_d, _mm_round_pd((__v), (__m)));                      \
+    })
+#define _mm_ceil_ps(__v) _mm_round_ps((__v), _MM_FROUND_CEIL)
+#define _mm_floor_ps(__v) _mm_round_ps((__v), _MM_FROUND_FLOOR)
+#define _mm_ceil_pd(__v) _mm_round_pd((__v), _MM_FROUND_CEIL)
+#define _mm_floor_pd(__v) _mm_round_pd((__v), _MM_FROUND_FLOOR)
+#define _mm_ceil_ss(__d, __v) _mm_round_ss((__d), (__v), _MM_FROUND_CEIL)
+#define _mm_floor_ss(__d, __v) _mm_round_ss((__d), (__v), _MM_FROUND_FLOOR)
+#define _mm_ceil_sd(__d, __v) _mm_round_sd((__d), (__v), _MM_FROUND_CEIL)
+#define _mm_floor_sd(__d, __v) _mm_round_sd((__d), (__v), _MM_FROUND_FLOOR)
+
 /* === SSE4.1 multiply === */
 
 /* _mm_mullo_epi32: packed 32-bit multiply low (PMULLD) */
@@ -322,6 +484,14 @@ _mm_blend_epi16(__m128i __a, __m128i __b, const int __imm)
     for (int __i = 0; __i < 8; __i++)
         __pr[__i] = ((__imm >> __i) & 1) ? __pb[__i] : __pa[__i];
     return __r;
+}
+
+/* --- Streaming load (SSE4.1, MOVNTDQA). The source must be 16-byte aligned. --- */
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_stream_load_si128(__m128i *__p)
+{
+    return (__m128i)__builtin_ia32_movntdqa((__v2di *)__p);
 }
 
 #endif /* _SMMINTRIN_H_INCLUDED */

@@ -112,12 +112,9 @@ impl X86Codegen {
                     .filter(|r| !is_xmm_reg(*r))
                     .map(phys_reg_name)
                     .unwrap_or("rax");
-                self.state.out.emit_instr_sym_base_reg(
-                    "    leaq",
-                    name,
-                    phys_reg_name(off_reg),
-                    target,
-                );
+                self.state.with_out_checked(|o| {
+                    o.emit_instr_sym_base_reg("    leaq", name, phys_reg_name(off_reg), target)
+                });
                 if target == "rax" {
                     self.store_rax_to(dest);
                 } else {
@@ -289,7 +286,8 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", n, reg));
         } else if self.state.absolute_symbols.contains(name) {
-            self.state.out.emit_instr_sym_imm_reg("    movq", name, reg);
+            self.state
+                .with_out_checked(|o| o.emit_instr_sym_imm_reg("    movq", name, reg));
         } else {
             self.state
                 .out

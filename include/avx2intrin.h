@@ -152,11 +152,20 @@ _mm256_add_epi8(__m256i __a, __m256i __b)
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_add_epi16(__m256i a, __m256i b) { __m256i r; unsigned short *x=(unsigned short*)&a,*y=(unsigned short*)&b,*z=(unsigned short*)&r; for(int i=0;i<16;i++)z[i]=x[i]+y[i]; return r; }
+_mm256_add_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_paddw256((__v16hi)(__a), (__v16hi)(__b));
+}
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_sub_epi8(__m256i a, __m256i b) { __m256i r; unsigned char *x=(unsigned char*)&a,*y=(unsigned char*)&b,*z=(unsigned char*)&r; for(int i=0;i<32;i++)z[i]=x[i]-y[i]; return r; }
+_mm256_sub_epi8(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_psubb256((__v32qi)(__a), (__v32qi)(__b));
+}
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_sub_epi16(__m256i a, __m256i b) { __m256i r; unsigned short *x=(unsigned short*)&a,*y=(unsigned short*)&b,*z=(unsigned short*)&r; for(int i=0;i<16;i++)z[i]=x[i]-y[i]; return r; }
+_mm256_sub_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_psubw256((__v16hi)(__a), (__v16hi)(__b));
+}
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_add_epi32(__m256i __a, __m256i __b)
@@ -293,11 +302,21 @@ _mm256_inserti128_si256(__m256i __a, __m128i __b, int __imm)
  * both inputs to the stack and wrote the result lane by lane.
  *
  * A macro, not an inline function: the immediate must stay a constant
- * expression at the call site, and a function parameter is not one. */
+ * expression at the call site, and a function parameter is not one.
+ *
+ * AVX2 only (VPBLENDD, VPSHUFD-256).  Declared unconditionally, as GCC 16.2
+ * does: both are ISA-gated at codegen (lcccsimd / builtin requirement), so a
+ * plain -mavx caller is rejected while a target("avx2") caller is accepted.
+ * Pure-C AVX2 wrappers below stay behind __AVX2__: they have no codegen gate,
+ * so declaring them under -mavx would emit AVX2 instructions into an AVX-only
+ * translation unit (probe fail-open, measured). */
 #define _mm256_blend_epi32(__a, __b, __imm) \
-    _mm256_castps_si256(__CCC_M256_FROM_BUILTIN( \
-        __lccc_simd256_ps_vblendps256(__imm, _mm256_castsi256_ps(__a), \
-                                      _mm256_castsi256_ps(__b))))
+    (__CCC_M256I_FROM_BUILTIN( \
+        __lccc_simd256_i_vpblendd256((__imm), (__m256i)(__a), (__m256i)(__b))))
+
+#define _mm_blend_epi32(__a, __b, __imm) \
+    (__CCC_M128I_FROM_BUILTIN( \
+        __lccc_simd128_i_vpblendd128((__imm), (__m128i)(__a), (__m128i)(__b))))
 
 /* === Shuffle (32-bit) === */
 
@@ -751,6 +770,13 @@ _mm256_packs_epi32(__m256i __a, __m256i __b)
     return (__m256i)__builtin_ia32_packssdw256((__v8si)(__a), (__v8si)(__b));
 }
 
+/* _mm256_packs_epi16: pack 16-bit to 8-bit with signed saturation within lanes (VPACKSSWB) */
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_packs_epi16(__m256i __a, __m256i __b)
+{
+    return (__m256i)__builtin_ia32_packsswb256((__v16hi)(__a), (__v16hi)(__b));
+}
+
 /* _mm256_packus_epi16: pack 16-bit to 8-bit with unsigned saturation within lanes (VPACKUSWB) */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_packus_epi16(__m256i __a, __m256i __b)
@@ -1201,18 +1227,71 @@ _mm_srav_epi32(__m128i __a, __m128i __count)
     return (__m128i)((__lccc_v4si)__a >> (__lccc_v4si)__kk);
 }
 
-/* --- 128-bit broadcasts of the low element (VBROADCASTSD / VBROADCASTSS). --- */
-
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_broadcastsd_pd(__m128d __a)
-{
-    return _mm_unpacklo_pd(__a, __a);
-}
+/* --- 128-bit broadcasts of the low element (VBROADCASTSS). ---
+ * _mm_broadcastsd_pd is AVX1 and lives in avxintrin.h. */
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_broadcastss_ps(__m128 __a)
 {
     return _mm_shuffle_ps(__a, __a, 0x00);
+}
+
+/* --- Streaming load and integer sign-bit-masked moves (AVX2). ---
+ * VMOVNTDQA is the non-temporal load (SSE4.1 for 128 bits, AVX2 for 256).
+ * VPMASKMOV{D,Q} keep the element-size contract of the float forms above. */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_stream_load_si256(__m256i const *__p)
+{
+    return (__m256i)__builtin_ia32_movntdqa256((__v4di *)__p);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_maskload_epi32(int const *__p, __m256i __m)
+{
+    return (__m256i)__builtin_ia32_maskloadd256((const __v8si *)__p, (__v8si)__m);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_maskload_epi64(long long const *__p, __m256i __m)
+{
+    return (__m256i)__builtin_ia32_maskloadq256((const __v4di *)__p, (__v4di)__m);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_maskstore_epi32(int *__p, __m256i __m, __m256i __a)
+{
+    __builtin_ia32_maskstored256((__v8si *)__p, (__v8si)__m, (__v8si)__a);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm256_maskstore_epi64(long long *__p, __m256i __m, __m256i __a)
+{
+    __builtin_ia32_maskstoreq256((__v4di *)__p, (__v4di)__m, (__v4di)__a);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_maskload_epi32(int const *__p, __m128i __m)
+{
+    return (__m128i)__builtin_ia32_maskloadd((const __v4si *)__p, (__v4si)__m);
+}
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_maskload_epi64(long long const *__p, __m128i __m)
+{
+    return (__m128i)__builtin_ia32_maskloadq((const __v2di *)__p, (__v2di)__m);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm_maskstore_epi32(int *__p, __m128i __m, __m128i __a)
+{
+    __builtin_ia32_maskstored((__v4si *)__p, (__v4si)__m, (__v4si)__a);
+}
+
+static __inline__ void __attribute__((__always_inline__))
+_mm_maskstore_epi64(long long *__p, __m128i __m, __m128i __a)
+{
+    __builtin_ia32_maskstoreq((__v2di *)__p, (__v2di)__m, (__v2di)__a);
 }
 
 #endif /* __AVX2__ */

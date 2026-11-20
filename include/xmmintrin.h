@@ -9,6 +9,41 @@
 
 #include <mmintrin.h>
 
+/* Compare predicates for the SSE/AVX compare intrinsics. Encodings and names
+ * match GCC 16.2 xmmintrin.h and avxintrin.h (imm8 0x00..0x1f). */
+#define _CMP_EQ_OQ	0x00
+#define _CMP_LT_OS	0x01
+#define _CMP_LE_OS	0x02
+#define _CMP_UNORD_Q	0x03
+#define _CMP_NEQ_UQ	0x04
+#define _CMP_NLT_US	0x05
+#define _CMP_NLE_US	0x06
+#define _CMP_ORD_Q	0x07
+#define _CMP_EQ_UQ	0x08
+#define _CMP_NGE_US	0x09
+#define _CMP_NGT_US	0x0a
+#define _CMP_FALSE_OQ	0x0b
+#define _CMP_NEQ_OQ	0x0c
+#define _CMP_GE_OS	0x0d
+#define _CMP_GT_OS	0x0e
+#define _CMP_TRUE_UQ	0x0f
+#define _CMP_EQ_OS	0x10
+#define _CMP_LT_OQ	0x11
+#define _CMP_LE_OQ	0x12
+#define _CMP_UNORD_S	0x13
+#define _CMP_NEQ_US	0x14
+#define _CMP_NLT_UQ	0x15
+#define _CMP_NLE_UQ	0x16
+#define _CMP_ORD_S	0x17
+#define _CMP_EQ_US	0x18
+#define _CMP_NGE_UQ	0x19
+#define _CMP_NGT_UQ	0x1a
+#define _CMP_FALSE_OS	0x1b
+#define _CMP_NEQ_OS	0x1c
+#define _CMP_GE_OQ	0x1d
+#define _CMP_GT_OQ	0x1e
+#define _CMP_TRUE_US	0x1f
+
 #include <lcccsimd.h>
 
 /* Internal vector type referenced by GCC system headers.
@@ -122,14 +157,14 @@ _mm_stream_ps(float *__p, __m128 __a)
 
 /* Store the lower 2 floats of __m128 to __m64* memory location. */
 static __inline__ void __attribute__((__always_inline__))
-_mm_storel_pi(__m64 *__p, __m128 __a)
+_mm_storel_pi(__m64_u *__p, __m128 __a)
 {
     __builtin_memcpy(__p, &__a, 8);
 }
 
 /* Store the upper 2 floats of __m128 to __m64* memory location. */
 static __inline__ void __attribute__((__always_inline__))
-_mm_storeh_pi(__m64 *__p, __m128 __a)
+_mm_storeh_pi(__m64_u *__p, __m128 __a)
 {
     __builtin_memcpy(__p, (const char *)&__a + 8, 8);
 }
@@ -624,14 +659,14 @@ _mm_cvttss_si64(__m128 __a)
 /* === Load (additional) === */
 
 static __inline__ __m128 __attribute__((__always_inline__))
-_mm_loadh_pi(__m128 __a, const __m64 *__p)
+_mm_loadh_pi(__m128 __a, const __m64_u *__p)
 {
     __builtin_memcpy((char *)&__a + 8, __p, 8);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
-_mm_loadl_pi(__m128 __a, const __m64 *__p)
+_mm_loadl_pi(__m128 __a, const __m64_u *__p)
 {
     __builtin_memcpy(&__a, __p, 8);
     return __a;

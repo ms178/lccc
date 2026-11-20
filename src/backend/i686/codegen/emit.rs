@@ -275,6 +275,10 @@ pub struct I686Codegen {
     pub(super) prefetch_isa: Option<crate::backend::x86_common::X86PrefetchIsa>,
     /// AVX2 (ymm integer) permission from `CodegenOptions::i686_avx2`.
     pub(super) avx2_enabled: bool,
+    /// AVX (VEX.128) permission from `CodegenOptions::i686_avx`. Keys the
+    /// 128-bit VEX spellings of the i686 backend; there is no text-level
+    /// legacy-to-VEX pass on this target to rescue a legacy SSE spelling.
+    pub(super) avx_enabled: bool,
     /// Final TU permission for SSE1 `movups` copies. This is independent of
     /// SSE2/AVX: no-SSE targets retain the scalar bit-exact copy loops.
     pub(super) sse_enabled: bool,
@@ -743,6 +747,7 @@ impl I686Codegen {
             popcnt_enabled: false,
             prefetch_isa: None,
             avx2_enabled: false,
+            avx_enabled: false,
             sse_enabled: false,
             sse2_scalar_enabled: true,
             fisttp_enabled: true,
@@ -788,6 +793,7 @@ impl I686Codegen {
         // i686 is NOT SSE-baseline: the driver decides (SSE or PRFCHW).
         self.prefetch_isa = (!opts.no_prefetch).then_some(opts.x86_prefetch);
         self.avx2_enabled = opts.i686_avx2;
+        self.avx_enabled = opts.i686_avx;
         self.sse_enabled = !opts.no_sse && !opts.general_regs_only;
         self.sse2_scalar_enabled = !opts.i686_no_sse2 && !opts.general_regs_only;
         self.fisttp_enabled = self.sse2_scalar_enabled && !opts.i686_no_sse3;

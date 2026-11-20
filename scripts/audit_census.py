@@ -87,7 +87,11 @@ IGNORE_PAT = re.compile(r"#\[ignore")
 # A knob name ends in a letter or digit: `CCC_NO_` (a `starts_with` prefix) or
 # `CCC_NO_INLINE_*` (prose for a family) names no variable.
 KNOB_PAT = re.compile(r"\b(?:CCC|LCCC)_[A-Z0-9_]*[A-Z0-9]\b")
-NON_KNOB_SOURCE_MARKERS = frozenset({"LCCC_TAIL_CALL"})
+# Assembly annotation markers that the emitter writes and a peephole pass reads.
+# They are fixed codegen facts, not runtime knobs, so they never count as
+# undocumented knobs: `LCCC_TAIL_CALL` and `LCCC_VEX_LEGAL` (the per-function
+# VEX-legal prologue marker that `vex_promote` keys on).
+NON_KNOB_SOURCE_MARKERS = frozenset({"LCCC_TAIL_CALL", "LCCC_VEX_LEGAL"})
 
 
 def source_knob_literals(text: str) -> list[str]:

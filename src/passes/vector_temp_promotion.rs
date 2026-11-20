@@ -389,6 +389,12 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Aesdeclast128
         | O::Psllw128
         | O::Psrlw128
+        | O::Pslld128
+        | O::Psllq128
+        | O::Psrld128
+        | O::Psrlq128
+        | O::Psraw128
+        | O::Psrad128
         | O::Pmulhw128
         | O::Pmaddwd128
         | O::Pcmpgtw128
@@ -468,7 +474,9 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::RoundPs256
         | O::RoundPd256
         | O::VpermilPs256
-        | O::VpermilPd256 => {
+        | O::VpermilPd256
+        | O::RcpPs256
+        | O::RsqrtPs256 => {
             return (index == 0).then_some(32);
         }
 
@@ -491,10 +499,14 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::HaddPs256
         | O::HsubPs256
         | O::AddsubPs256
+        | O::AddsubPd256
+        | O::DpPs256
         | O::VpermilvarPs256
         | O::VpermilvarPd256
         | O::BlendPs256
         | O::BlendPd256 => 32,
+        // 128-bit variable permutes: 16-byte source and index.
+        O::VpermilvarPs128 | O::VpermilvarPd128 => 16,
 
         // Binary 256-bit vector operations.
         O::Paddb256
@@ -554,6 +566,7 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Pminud256
         | O::Pmaxud256
         | O::Packssdw256
+        | O::Packsswb256
         | O::Packuswb256
         | O::Phaddw256
         | O::Phaddd256
@@ -690,6 +703,15 @@ fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usi
     if op == O::Load256 && index == 0 {
         return Some(32);
     }
+    // `movntdqa` faults unless its SOURCE meets the vector width, the same
+    // contract as the non-temporal store destinations below.
+    if index == 0 {
+        match op {
+            O::Movntdqa128 => return Some(16),
+            O::Movntdqa256 => return Some(32),
+            _ => {}
+        }
+    }
     // `VecLoad*`: args[0] is the base address, args[1] the constant offset.
     if whole_vector_load(op) {
         return (index == 0).then_some(0);
@@ -768,6 +790,9 @@ fn intrinsic_dest_required_alignment(
         // 16-byte aligned.  Alignment 16 is still a direct stack slot and
         // therefore avoids the expensive runtime alignment sequence.
         O::Movntdq | O::Movntpd | O::Movntps => Some(16),
+        // VEX.256 non-temporal stores fault unless the destination is 32-byte
+        // aligned (`vmovntdq ymm` requires it architecturally).
+        O::Movntdq256 | O::Movntpd256 | O::Movntps256 => Some(32),
         _ => None,
     }
 }
@@ -838,6 +863,17 @@ fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
             | IntrinsicOp::Movntdq
             | IntrinsicOp::Movntpd
             | IntrinsicOp::Movntps
+            | IntrinsicOp::Movntdq256
+            | IntrinsicOp::Movntpd256
+            | IntrinsicOp::Movntps256
+            | IntrinsicOp::MaskStorePs128
+            | IntrinsicOp::MaskStorePd128
+            | IntrinsicOp::MaskStoreD128
+            | IntrinsicOp::MaskStoreQ128
+            | IntrinsicOp::MaskStorePs256
+            | IntrinsicOp::MaskStorePd256
+            | IntrinsicOp::MaskStoreD256
+            | IntrinsicOp::MaskStoreQ256
             | IntrinsicOp::VecStoreI64x2
     )
 }
@@ -5038,11 +5074,15 @@ mod tests {
             (HaddPs256, 2),
             (HsubPs256, 2),
             (AddsubPs256, 2),
+            (AddsubPd256, 2),
+            (DpPs256, 2),
             (VpermilvarPs256, 2),
             (VpermilvarPd256, 2),
             (BlendPs256, 2),
             (BlendPd256, 2),
             (SqrtPs256, 1),
+            (RcpPs256, 1),
+            (RsqrtPs256, 1),
             (SqrtPd256, 1),
             (RoundPs256, 1),
             (RoundPd256, 1),
@@ -5056,6 +5096,18 @@ mod tests {
                 assert_eq!(
                     pointer_vector_arg_width(op, index),
                     (index < vectors).then_some(32),
+                    "{op:?} arg {index}"
+                );
+            }
+        }
+        // 128-bit variable permutes are 16-byte values, not 32-byte ones.
+        for (op, vectors) in [(VpermilvarPs128, 2), (VpermilvarPd128, 2)] {
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?}");
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?}");
+            for index in 0..4 {
+                assert_eq!(
+                    pointer_vector_arg_width(op, index),
+                    (index < vectors).then_some(16),
                     "{op:?} arg {index}"
                 );
             }
@@ -7220,6 +7272,70 @@ mod mask_compare_forwarding_tests {
             IntrinsicOp::VecLoadI64x2,
         ] {
             assert_eq!(op.mask_compare_vector_width(), None, "{op:?}");
+        }
+    }
+}
+
+/// Alignment and partial-write contract of the AVX non-temporal and
+/// sign-bit-masked memory ops.  A wrong row here is silent: a 256-bit stream
+/// store with a 16-byte requirement would be promoted to a stack slot that the
+/// hardware then faults on, and a masked store classified as a full overwrite
+/// would let promotion drop the unselected lanes.
+#[cfg(test)]
+mod masked_nontemporal_contract_tests {
+    use super::*;
+
+    #[test]
+    fn non_temporal_store_destinations_are_aligned_to_their_width() {
+        for (op, align) in [
+            (IntrinsicOp::Movntdq, 16),
+            (IntrinsicOp::Movntpd, 16),
+            (IntrinsicOp::Movntps, 16),
+            (IntrinsicOp::Movntdq256, 32),
+            (IntrinsicOp::Movntpd256, 32),
+            (IntrinsicOp::Movntps256, 32),
+        ] {
+            assert_eq!(
+                intrinsic_dest_required_alignment(op, false, 64),
+                Some(align),
+                "{op:?} destination alignment"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_load_source_is_aligned_to_its_width() {
+        assert_eq!(
+            intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa128, 0),
+            Some(16)
+        );
+        assert_eq!(
+            intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa256, 0),
+            Some(32)
+        );
+        // Only the source (arg 0) carries the alignment contract.
+        assert_eq!(
+            intrinsic_arg_required_alignment(IntrinsicOp::Movntdqa256, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn masked_stores_are_partial_writes_and_never_full_overwrites() {
+        for op in [
+            IntrinsicOp::MaskStorePs128,
+            IntrinsicOp::MaskStorePd128,
+            IntrinsicOp::MaskStoreD128,
+            IntrinsicOp::MaskStoreQ128,
+            IntrinsicOp::MaskStorePs256,
+            IntrinsicOp::MaskStorePd256,
+            IntrinsicOp::MaskStoreD256,
+            IntrinsicOp::MaskStoreQ256,
+        ] {
+            assert!(
+                !intrinsic_overwrites_full_result(op),
+                "{op:?} is a partial write"
+            );
         }
     }
 }

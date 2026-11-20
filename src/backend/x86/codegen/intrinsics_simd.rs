@@ -1434,6 +1434,7 @@ impl X86Codegen {
             | UnpckhPs256 | UnpcklPd256 | UnpckhPd256 | HaddPs256 | HsubPs256 | AddsubPs256
             | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256 | BlendvPs256 | BlendvPd256
             | VpermilPs256 | VpermilPd256 | Vperm2f128 | Vinsertf128 | Vextractf128
+            | AddsubPd256 | DpPs256 | RcpPs256 | RsqrtPs256 | VpermilvarPs128 | VpermilvarPd128
             | Vbroadcastss | Vbroadcastsd | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256
             | CvtPs2Pd256 | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256
             | VpermilvarPs256 | VpermilvarPd256 | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
@@ -2113,12 +2114,18 @@ impl X86Codegen {
                     ShufPd128 => "shufpd",
                     _ => unreachable!(),
                 };
+                // Compute in %xmm2, not %xmm0. %xmm0 can hold a live operand
+                // (an argument still in its ABI register, or a deferred value);
+                // a destructive op on it clobbers that operand before a later
+                // use reads it. The pool never allocates %xmm0..%xmm2, so
+                // %xmm2 is a safe scratch. Both sources are read before any
+                // write, so args[1] or args[0] in %xmm0 is copied out first.
                 let imm = self.simd_imm(&args[2]);
                 self.sse_load_arg(&args[1], "xmm1");
-                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[0], "xmm2");
                 self.state
-                    .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0", inst, imm));
-                self.sse_store_dest(dest_ptr, "xmm0");
+                    .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm2", inst, imm));
+                self.sse_store_dest(dest_ptr, "xmm2");
             }
             // 1-op with imm: roundps/roundpd/vpermilps (a, imm)
             RoundPs128 | RoundPd128 | VpermilPs128 => {
@@ -2128,11 +2135,12 @@ impl X86Codegen {
                     VpermilPs128 => "vpermilps",
                     _ => unreachable!(),
                 };
+                // Computed in %xmm2 for the same reason as the compare above.
                 let imm = self.simd_imm(&args[1]);
-                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[0], "xmm2");
                 self.state
-                    .emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0", inst, imm));
-                self.sse_store_dest(dest_ptr, "xmm0");
+                    .emit_fmt(format_args!("    {} ${}, %xmm2, %xmm2", inst, imm));
+                self.sse_store_dest(dest_ptr, "xmm2");
             }
             // blend with imm: blendps/blendpd/dpps/dppd (a, b, imm)
             BlendPs128 | BlendPd128 | DpPs128 | DpPd128 => {
@@ -2281,6 +2289,25 @@ impl X86Codegen {
         }
     }
 
+    /// `vdpps $imm, %ymm1, %ymm0, %ymm0`: two independent 128-bit dot products.
+    fn emit_avx_dpps_256(&mut self, dest_ptr: &Value, args: &[Operand]) {
+        let imm = self.simd_imm(&args[2]);
+        self.avx_load_arg(&args[0]);
+        self.avx_load_arg_to(&args[1], "ymm1");
+        self.state
+            .emit_fmt(format_args!("    vdpps ${}, %ymm1, %ymm0, %ymm0", imm));
+        self.avx_store_dest(dest_ptr);
+    }
+
+    /// `vpermilps`/`vpermilpd` (xmm, variable index): `mnemonic %xmm1, %xmm0, %xmm0`.
+    fn emit_avx_vpermilvar_128(&mut self, dest_ptr: &Value, args: &[Operand], mnemonic: &str) {
+        self.sse_load_arg(&args[0], "xmm0");
+        self.sse_load_arg(&args[1], "xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0, %xmm0", mnemonic));
+        self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
     /// 256-bit AVX FP op dispatch (all shapes).
     fn emit_avx_fp_256_op(&mut self, dest_ptr: &Value, op: &IntrinsicOp, args: &[Operand]) {
         use IntrinsicOp::*;
@@ -2381,6 +2408,9 @@ impl X86Codegen {
             HaddPs256 => binary(self, "vhaddps", false),
             HsubPs256 => binary(self, "vhsubps", false),
             AddsubPs256 => binary(self, "vaddsubps", false),
+            AddsubPd256 => binary(self, "vaddsubpd", false),
+            RcpPs256 => unary(self, "vrcpps"),
+            RsqrtPs256 => unary(self, "vrsqrtps"),
             // The 256-bit unpack family previously had NO arm here: the ops
             // were routed to this dispatcher but silently emitted nothing,
             // leaving the result alloca uninitialized (garbage output for
@@ -2400,6 +2430,11 @@ impl X86Codegen {
             CvtPd2Ps256 => narrow(self, "vcvtpd2ps"),
             CvtPd2Ep32_256 => narrow(self, "vcvtpd2dq"),
             CvttPd2Ep32_256 => narrow(self, "vcvttpd2dq"),
+            // vdpps: two independent 128-bit dot products selected by imm.
+            DpPs256 => self.emit_avx_dpps_256(dest_ptr, args),
+            // 128-bit variable-index permutes (xmm): idx in arg 1.
+            VpermilvarPs128 => self.emit_avx_vpermilvar_128(dest_ptr, args, "vpermilps"),
+            VpermilvarPd128 => self.emit_avx_vpermilvar_128(dest_ptr, args, "vpermilpd"),
             // 3-op with imm: vcmpps/vcmppd/vshufps/vshufpd/vblendps/vblendpd (a, b, imm)
             CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | BlendPs256 | BlendPd256 => {
                 let inst = match op {

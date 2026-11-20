@@ -1371,9 +1371,11 @@ impl X86Codegen {
             self.note_inplace_compute(reg, dest.0);
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             if use_small {
-                self.state.out.emit_instr_reg_rbp("    movl", "edx", slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg_rbp("    movl", "edx", slot.0));
             } else {
-                self.state.out.emit_instr_reg_rbp("    movq", "rdx", slot.0);
+                self.state
+                    .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rdx", slot.0));
             }
         } else if self.state.is_accumulator_location(dest.0) {
             // Accumulator location means %rax residency — a remainder can

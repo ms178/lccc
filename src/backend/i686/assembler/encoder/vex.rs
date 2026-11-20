@@ -673,6 +673,45 @@ impl super::InstructionEncoder {
     }
 
     /// 0F38-map VEX 2-operand (vpabs*, vpmovzx*, vptest): (src, dst), vvvv=0.
+    /// Encode `vmaskmov{ps,pd}` / `vpmaskmov{d,q}` in both directions.
+    ///
+    /// Load:  `op (mem), %mask, %dst`  -> map 0F38, pp=66, opcode `load_op`.
+    /// Store: `op %src, %mask, (mem)`  -> map 0F38, pp=66, opcode `store_op`.
+    /// The mask is VEX.vvvv in both spellings. i686 has no extended registers,
+    /// so VEX.R/X/B are always clear, as in the other helpers of this file.
+    pub(crate) fn encode_avx_maskmov(
+        &mut self,
+        ops: &[Operand],
+        load_op: u8,
+        store_op: u8,
+        w: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("vmaskmov requires 3 operands".to_string());
+        }
+        let mask = match &ops[1] {
+            Operand::Register(r) => r,
+            _ => return Err("vmaskmov: mask must be a register".to_string()),
+        };
+        let vvvv = reg_num(&mask.name).ok_or("bad mask register")?;
+        let l = u8::from(is_ymm(&mask.name));
+        match (&ops[0], &ops[2]) {
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.emit_vex(false, false, false, 2, w, vvvv, l, 1);
+                self.bytes.push(load_op);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                self.emit_vex(false, false, false, 2, w, vvvv, l, 1);
+                self.bytes.push(store_op);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("unsupported vmaskmov operands".to_string()),
+        }
+    }
+
     pub(crate) fn encode_avx_2op_38(
         &mut self,
         ops: &[Operand],
@@ -1707,5 +1746,38 @@ mod tests {
         // ICC win: `0(,%eax,1)` -> `(%eax)` (2-byte addressing, not SIB+disp32).
         let bytes = assemble_text(".text\nmov 0(,%eax,1), %ecx\n");
         assert_eq!(bytes, vec![0x8b, 0x08]);
+    }
+
+    #[test]
+    fn masked_and_streaming_forms_match_gas_golden_bytes() {
+        // GNU as --32 golden bytes (see lccc-artifacts/v32/enc32.s).
+        let asm = concat!(
+            ".text\n",
+            "vmaskmovps (%eax), %ymm1, %ymm0\n",
+            "vmaskmovps (%eax), %xmm1, %xmm0\n",
+            "vmaskmovps %ymm0, %ymm1, (%eax)\n",
+            "vmaskmovps %xmm0, %xmm1, (%eax)\n",
+            "vmaskmovpd (%eax), %ymm1, %ymm0\n",
+            "vmaskmovpd %xmm0, %xmm1, (%eax)\n",
+            "vpmaskmovd (%eax), %ymm1, %ymm0\n",
+            "vpmaskmovd (%eax), %xmm1, %xmm0\n",
+            "vpmaskmovd %ymm0, %ymm1, (%eax)\n",
+            "vpmaskmovq (%eax), %ymm1, %ymm0\n",
+            "vpmaskmovq %xmm0, %xmm1, (%eax)\n",
+            "vmovntdqa (%eax), %ymm0\n",
+            "vmovntdqa (%eax), %xmm0\n",
+            "vmovntdq %ymm0, (%eax)\n",
+            "vmovntpd %ymm0, (%eax)\n",
+            "vmovntps %ymm0, (%eax)\n",
+        );
+        let golden: &[u8] = &[
+            0xc4, 0xe2, 0x75, 0x2c, 0x00, 0xc4, 0xe2, 0x71, 0x2c, 0x00, 0xc4, 0xe2, 0x75, 0x2e,
+            0x00, 0xc4, 0xe2, 0x71, 0x2e, 0x00, 0xc4, 0xe2, 0x75, 0x2d, 0x00, 0xc4, 0xe2, 0x71,
+            0x2f, 0x00, 0xc4, 0xe2, 0x75, 0x8c, 0x00, 0xc4, 0xe2, 0x71, 0x8c, 0x00, 0xc4, 0xe2,
+            0x75, 0x8e, 0x00, 0xc4, 0xe2, 0xf5, 0x8c, 0x00, 0xc4, 0xe2, 0xf1, 0x8e, 0x00, 0xc4,
+            0xe2, 0x7d, 0x2a, 0x00, 0xc4, 0xe2, 0x79, 0x2a, 0x00, 0xc5, 0xfd, 0xe7, 0x00, 0xc5,
+            0xfd, 0x2b, 0x00, 0xc5, 0xfc, 0x2b, 0x00,
+        ];
+        assert_eq!(assemble_text(asm), golden);
     }
 }

@@ -260,14 +260,19 @@ impl X86Codegen {
                         if low == 0 {
                             self.state.emit("    xorl %ecx, %ecx");
                         } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", low, "rcx");
+                            self.state
+                                .with_out_checked(|o| o.emit_instr_imm_reg("    movq", low, "rcx"));
                         } else {
-                            self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movabsq", low, "rcx")
+                            });
                         }
                         if high == 0 {
                             self.state.emit("    xorl %esi, %esi");
                         } else if high >= i32::MIN as i64 && high <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", high, "rsi");
+                            self.state.with_out_checked(|o| {
+                                o.emit_instr_imm_reg("    movq", high, "rsi")
+                            });
                         } else {
                             self.state
                                 .out
@@ -284,14 +289,17 @@ impl X86Codegen {
                         // zero-extend the pair into rcx:rsi.
                         self.operand_to_rax(op);
                         self.state.emit("    xorl %edx, %edx");
-                        self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
-                        self.state.out.emit_instr_reg_reg("    movq", "rdx", "rsi");
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rax", "rcx"));
+                        self.state
+                            .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rdx", "rsi"));
                     }
                 }
             }
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rcx"));
                     self.state
                         .out
                         .emit_instr_rbp_reg("    movq", slot.0 + 8, "rsi");
@@ -299,8 +307,10 @@ impl X86Codegen {
                     // No slot (should not happen for i128 values): fall back
                     // to the accumulator pair, then copy into rcx:rsi.
                     self.operand_to_rax_rdx(op);
-                    self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
-                    self.state.out.emit_instr_reg_reg("    movq", "rdx", "rsi");
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rax", "rcx"));
+                    self.state
+                        .with_out_checked(|o| o.emit_instr_reg_reg("    movq", "rdx", "rsi"));
                 }
             }
         }
@@ -428,7 +438,8 @@ impl X86Codegen {
                 self.state
                     .out
                     .emit_instr_rbp_reg("    movq", right.0, "rcx");
-                self.state.out.emit_instr_rbp_reg("    movq", left.0, "rax");
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", left.0, "rax"));
             }
             I128MulPlan::RightHighZero => {
                 let Some(right) = right_low else {
@@ -446,7 +457,8 @@ impl X86Codegen {
                 };
                 self.begin_raw_i128_sequence();
                 self.load_i128_to_rcx_rsi(rhs);
-                self.state.out.emit_instr_rbp_reg("    movq", left.0, "rax");
+                self.state
+                    .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", left.0, "rax"));
             }
         }
         for line in plan.body() {
@@ -528,7 +540,8 @@ impl X86Codegen {
         // that the cross terms still need first.  lhs.hi is only needed when
         // it can be non-zero, lhs.lo only when the multiplier has a high half.
         if let Some(slot) = left_zero_high {
-            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rax"));
         } else {
             // LHS into %rax:%rdx (low:high); %rcx/%r8/%rsi are scratch.  The
             // one permitted cache-consulting load, before any clobber.
@@ -887,14 +900,16 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_store_pair_to_slot_impl(&mut self, slot: StackSlot) {
-        self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+        self.state
+            .with_out_checked(|o| o.emit_instr_reg_rbp("    movq", "rax", slot.0));
         self.state
             .out
             .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
     }
 
     pub(super) fn emit_load_pair_from_slot_impl(&mut self, slot: StackSlot) {
-        self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+        self.state
+            .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rax"));
         self.state
             .out
             .emit_instr_rbp_reg("    movq", slot.0 + 8, "rdx");

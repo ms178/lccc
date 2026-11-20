@@ -1647,7 +1647,8 @@ impl X86Codegen {
         if let Some(slot) = self.state.get_slot(val_id) {
             // lo at slot+0, hi at slot+8 (the i128 slot layout used by
             // emit_store_pair_to_slot / the Mov128 path).
-            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rcx"));
             self.state
                 .out
                 .emit_instr_rbp_reg("    orq", slot.0 + 8, "rcx");
@@ -1699,7 +1700,8 @@ impl X86Codegen {
         if let Some(slot) = slot {
             // lo at slot+0, hi at slot+8 (the i128 slot layout used by
             // emit_store_pair_to_slot / the Mov128 path).
-            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+            self.state
+                .with_out_checked(|o| o.emit_instr_rbp_reg("    movq", slot.0, "rax"));
             self.state
                 .out
                 .emit_instr_rbp_reg("    orq", slot.0 + 8, "rax");
@@ -1777,11 +1779,14 @@ impl X86Codegen {
             }
             let emit_int_imm = |this: &mut Self, v: i64| {
                 if v >= 0 && v <= i32::MAX as i64 {
-                    this.state.out.emit_instr_imm_reg("    movl", v, reg32);
+                    this.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    movl", v, reg32));
                 } else if v >= i32::MIN as i64 && v < 0 {
-                    this.state.out.emit_instr_imm_reg("    movq", v, reg64);
+                    this.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    movq", v, reg64));
                 } else {
-                    this.state.out.emit_instr_imm_reg("    movabsq", v, reg64);
+                    this.state
+                        .with_out_checked(|o| o.emit_instr_imm_reg("    movabsq", v, reg64));
                 }
             };
             match c {

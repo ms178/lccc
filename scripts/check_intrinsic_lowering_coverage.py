@@ -117,11 +117,23 @@ def _arm_head_indices(code: list[str]) -> list[int]:
 
 
 def _body_end(code: list[str], head: int) -> int:
-    """Last line index of the arm body opened on `head`."""
+    """Last line index of the body opened on `head`.
+
+    The span closes only once a brace has opened and closed again. A
+    signature may wrap (`fn f(` on one line, parameters and `) {` below), so
+    the brace-free lines before the first `{` belong to the head, not to a
+    body that ends early. A bodiless declaration (`fn f(...);`) ends at its
+    semicolon instead of swallowing the next function.
+    """
     depth = 0
+    opened = False
     for index in range(head, len(code)):
-        depth += code[index].count("{") - code[index].count("}")
-        if depth <= 0 and index > head:
+        line = code[index]
+        depth += line.count("{") - line.count("}")
+        opened = opened or "{" in line
+        if opened and depth <= 0:
+            return index
+        if not opened and index > head and line.rstrip().endswith(";"):
             return index
     return len(code) - 1
 
@@ -374,8 +386,49 @@ SELF_TEST_CASES = {
 }
 
 
+# Helper functions whose mnemonic tables are out of scope by design. Each must
+# be recognised as a function (not an unparsed anchor), so that its inner table
+# is counted as out of scope rather than as an arm this check cannot read.
+HELPER_CASES = {
+    "wrapped_signature_helper": (
+        """    fn emit_helper(
+        &mut self,
+        op: &IntrinsicOp,
+    ) {
+        let inst = match op {
+            IntrinsicOp::Movntdq256 => "vmovntdq",
+            _ => return,
+        };
+    }
+""",
+        (0, 1),
+    ),
+    "bodiless_declaration_then_helper": (
+        """    fn declared(&self, op: &IntrinsicOp);
+    fn helper(&self, op: &IntrinsicOp) {
+        let inst = match op {
+            IntrinsicOp::Movntdq256 => "vmovntdq",
+            _ => return,
+        };
+    }
+""",
+        (0, 1),
+    ),
+}
+
+
 def self_test() -> int:
     failures = 0
+    for name, (snippet, expected) in HELPER_CASES.items():
+        arms, in_scope, out_of_scope = parse_tables(snippet, Path(f"<self-test:{name}>"))
+        if (len(arms), out_of_scope) != (expected[0], expected[1]) or in_scope != 0:
+            print(
+                f"SELFTEST FAIL {name}: arms={len(arms)} in_scope={in_scope} "
+                f"out_of_scope={out_of_scope}, expected arms={expected[0]} out_of_scope={expected[1]}"
+            )
+            failures += 1
+        else:
+            print(f"SELFTEST ok {name}")
     for name, (snippet, expect_problems) in SELF_TEST_CASES.items():
         path = Path(f"<self-test:{name}>")
         arms, _anchors, _helpers = parse_tables(snippet, path)
