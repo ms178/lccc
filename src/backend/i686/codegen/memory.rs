@@ -138,6 +138,7 @@ impl I686Codegen {
                 d
             ),
         }
+        self.note_home_written(dest, phys);
         true
     }
 
@@ -916,6 +917,7 @@ impl I686Codegen {
                     if let Some(dphys) = self.dest_reg(dest) {
                         let d = phys_reg_name(dphys);
                         emit!(self.state, "    {} {}, %{}", load_instr, mem, d);
+                        self.note_home_written(dest, dphys);
                         return;
                     }
                 }
@@ -934,9 +936,10 @@ impl I686Codegen {
             let direct_dest = if is_i128_type(ty) {
                 None
             } else {
-                self.dest_reg(dest).map(phys_reg_name)
+                self.dest_reg(dest)
             };
-            if let Some(d) = direct_dest {
+            if let Some(home) = direct_dest {
+                let d = phys_reg_name(home);
                 match addr {
                     SlotAddr::OverAligned(slot, id) => {
                         self.emit_alloca_aligned_addr(slot, id);
@@ -966,6 +969,7 @@ impl I686Codegen {
                         }
                     }
                 }
+                self.note_home_written(dest, home);
                 return;
             }
             match addr {
@@ -1729,6 +1733,91 @@ mod frame_operand_tests {
                 .unwrap();
             let plain = cg.slot_ref_offset(StackSlot(-8), k);
             assert_eq!(sib.split('(').next(), plain.split('(').next(), "byte {k}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_home_cache_tests {
+    use super::*;
+
+    fn lines(cg: &I686Codegen) -> Vec<String> {
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// v20 homed in `home`; v30 homed in %edx and still named by the
+    /// accumulator cache; v31 an 8-byte local at -8(%ebp); v32 a pointer
+    /// in %esi.
+    fn codegen(home: u8) -> I686Codegen {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.omit_frame_pointer = false;
+        cg.reg_assignments.insert(20, PhysReg(home));
+        cg.reg_assignments.insert(30, PhysReg(5));
+        cg.state.value_locations.insert(31, StackSlot(-8));
+        cg.state.alloca_values.insert(31);
+        cg.reg_assignments.insert(32, PhysReg(1));
+        cg.state.park_acc(30, false);
+        cg
+    }
+
+    /// Each load that lands straight in its home, by the name of the path
+    /// and the one line it emits for an %eax home.
+    fn direct_loads() -> [(&'static str, fn(&mut I686Codegen), &'static str); 3] {
+        [
+            (
+                "plain load of a local",
+                |cg| cg.emit_load_impl(&Value(20), &Value(31), IrType::I32),
+                "movl -8(%ebp), %eax",
+            ),
+            (
+                "folded offset off a register base",
+                |cg| cg.emit_load_with_const_offset_impl(&Value(20), &Value(32), 12, IrType::I32),
+                "movl 12(%esi), %eax",
+            ),
+            (
+                "folded offset into a local",
+                |cg| cg.emit_load_with_const_offset_impl(&Value(20), &Value(31), 4, IrType::I32),
+                "movl -4(%ebp), %eax",
+            ),
+        ]
+    }
+
+    /// A load into an %eax home overwrites the register the accumulator
+    /// cache describes: the entry moves to the loaded value, and the value
+    /// it named is fetched from its own home when next read.
+    #[test]
+    fn a_load_into_an_eax_home_replaces_the_accumulator_entry() {
+        for (name, load, line) in direct_loads() {
+            let mut cg = codegen(6);
+            load(&mut cg);
+            assert_eq!(lines(&cg), [line], "{name}");
+            assert!(!cg.state.reg_cache.acc_has(30, false), "{name}");
+            assert!(cg.state.reg_cache.acc_has(20, false), "{name}");
+            cg.operand_to_eax(&Operand::Value(Value(30)));
+            assert_eq!(
+                lines(&cg).last().map(String::as_str),
+                Some("movl %edx, %eax"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A load into any other home leaves %eax and its cache entry alone.
+    #[test]
+    fn a_load_into_another_home_keeps_the_accumulator_entry() {
+        for (name, load, line) in direct_loads() {
+            let mut cg = codegen(0);
+            load(&mut cg);
+            assert_eq!(lines(&cg), [line.replace("%eax", "%ebx")], "{name}");
+            assert!(cg.state.reg_cache.acc_has(30, false), "{name}");
         }
     }
 }
