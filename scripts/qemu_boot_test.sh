@@ -260,54 +260,16 @@ expect() { # expect <description> <grep-pattern>
   fi
 }
 
-# `expect_contiguous <description> <literal-line> [limit]`
-#
-# The sentinels assert CONTIGUITY, not merely "the words appear somewhere": a
-# console/xmit bug that splits writes (the historical kfifo record-path defect
-# queued userspace one character per write) delivers the bytes in order but in
-# fragments, and can interleave a kernel message into the gap. So the match
-# allows kernel-log noise ONLY inside the line
-#     \[[[:space:]]*[0-9]+\.[0-9]+\]
-# (which the line itself never contains) and only up to <limit> occurrences
-# (default 1). Any other content, any reordering or any missing byte fails.
-expect_contiguous() { # expect_contiguous <description> <literal> [limit]
-  local desc=$1 line=$2 limit=${3:-1} verdict
-  # The matcher is Python, not sed: escaping a shell-level regex through two
-  # sed programs silently produced a pattern that matched nothing, which would
-  # have turned this assertion into a permanent false FAIL (caught by testing
-  # the matcher against a known-good log before trusting it). Here the literal
-  # is escaped by `re.escape` -- exactly one escaping layer, no shell quoting.
-  verdict=$(python3 - "$LOG" "$line" "$limit" <<'PYMATCH'
-import re, sys
-path, literal, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
-# Kernel-log noise is the ONLY thing allowed inside the line, because that is
-# the measured interleave: `...(){}[][  2.350522] tsc: Refined TSC ...`.
-noise = r"\[\s*\d+\.\d+\][^\[\]]*"
-words = [re.escape(w) for w in literal.split(" ")]
-# Noise is tolerated BETWEEN words and also AFTER the last one: the measured
-# interleave appended the kernel message after the closing bracket of the
-# sentinel (`...(){}[][    2.350522] tsc: Refined TSC ...`). Reordering or a
-# missing byte still fails, which is what this assertion exists to catch.
-pattern = (r"^" + (r"\s*(?:" + noise + r")?\s*").join(words)
-           + r"\s*(?:" + noise + r")?$")
-hits = 0
-with open(path, errors="replace") as fh:
-    for raw in fh:
-        if re.match(pattern, raw.rstrip("\n")):
-            hits += 1
-if hits == 0:
-    print("none")
-elif hits <= limit:
-    print("ok")
-else:
-    print(f"many:{hits}")
-PYMATCH
-)
-  case $verdict in
-    ok)   echo "PASS: $desc" ;;
-    many:*) echo "FAIL: $desc (${verdict#many:} matching lines, limit $limit)"; fail=1 ;;
-    *)    echo "FAIL: $desc (no contiguous match)"; fail=1 ;;
-  esac
+# CRLF was normalized above. Accept exactly one complete literal record;
+# optional whitespace would also accept the lost spaces this gate detects.
+expect_contiguous() {
+  local desc=$1 line=$2 count
+  if count=$(LC_ALL=C grep -aFxc -- "$line" "$LOG") && [[ $count == 1 ]]; then
+    echo "PASS: $desc"
+  else
+    echo "FAIL: $desc (expected exactly one intact line, found ${count:-0})"
+    fail=1
+  fi
 }
 expect "kernel banner (lccc build)"        "Linux version .*lccc"
 expect "SCHED_BORE compiled in"            "CONFIG_SCHED_BORE=y"
