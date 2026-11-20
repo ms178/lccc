@@ -1319,6 +1319,23 @@ pub enum IntrinsicOp {
     /// CLMUL: pclmulqdq with immediate
     /// args[0] = src1 ptr, args[1] = src2 ptr, args[2] = imm8; dest_ptr = result ptr
     Pclmulqdq128,
+    /// SHA-NI: sha1rnds4 (four SHA-1 rounds), args[0] = state (dst), args[1] = msg
+    /// (src), args[2] = imm8 round-function selector; dest_ptr = result ptr.
+    Sha1rnds4128,
+    /// SHA-NI: sha1nexte (next-E of the SHA-1 state), two vector operands.
+    Sha1nexte128,
+    /// SHA-NI: sha1msg1 (first SHA-1 message-schedule step), two vector operands.
+    Sha1msg1128,
+    /// SHA-NI: sha1msg2 (second SHA-1 message-schedule step), two vector operands.
+    Sha1msg2128,
+    /// SHA-NI: sha256rnds2 (two SHA-256 rounds). args[0] = CDGH state (dst),
+    /// args[1] = ABEF state (src2), args[2] = WK words, which the instruction
+    /// reads from the implicit operand %xmm0; dest_ptr = result ptr.
+    Sha256rnds2128,
+    /// SHA-NI: sha256msg1 (first SHA-256 message-schedule step), two vector operands.
+    Sha256msg1128,
+    /// SHA-NI: sha256msg2 (second SHA-256 message-schedule step), two vector operands.
+    Sha256msg2128,
     /// SSE2 byte shift left (PSLLDQ): shift by imm8 bytes
     /// args[0] = src ptr, args[1] = imm8; dest_ptr = result ptr
     Pslldqi128,
@@ -2571,6 +2588,8 @@ impl IntrinsicOp {
             | Pinsrq128 | Cast256to128 | Dpbusd128 | Dpbssd128 | Dpwuud128
             | Gf2p8mulb128 | Aesenc128 | Aesenclast128 | Aesdec128
             | Aesdeclast128 | Aesimc128 | Aeskeygenassist128 | Pclmulqdq128
+            | Sha1rnds4128 | Sha1nexte128 | Sha1msg1128 | Sha1msg2128
+            | Sha256rnds2128 | Sha256msg1128 | Sha256msg2128
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecLoadStrided2I32x4 | VecLoadStrided2CompactI32x4 | VecAddF64x2
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
@@ -2720,6 +2739,10 @@ impl IntrinsicOp {
             IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
             IntrinsicOp::Aesimc128 | IntrinsicOp::Aeskeygenassist128 |
             IntrinsicOp::Pclmulqdq128 |
+            IntrinsicOp::Sha1rnds4128 | IntrinsicOp::Sha1nexte128 |
+            IntrinsicOp::Sha1msg1128 | IntrinsicOp::Sha1msg2128 |
+            IntrinsicOp::Sha256rnds2128 | IntrinsicOp::Sha256msg1128 |
+            IntrinsicOp::Sha256msg2128 |
             IntrinsicOp::Pslldqi128 | IntrinsicOp::Psrldqi128 |
             IntrinsicOp::Psllqi128 | IntrinsicOp::Psrlqi128 |
             IntrinsicOp::Pshufd128 |

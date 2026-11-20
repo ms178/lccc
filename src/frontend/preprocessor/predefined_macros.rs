@@ -1100,6 +1100,7 @@ impl Preprocessor {
         avx2: bool,
         aes: bool,
         pclmul: bool,
+        sha: bool,
         f16c: bool,
         fma: bool,
         bmi: bool,
@@ -1181,6 +1182,9 @@ impl Preprocessor {
         }
         if pclmul {
             self.define_simple_macro("__PCLMUL__", "1");
+        }
+        if sha {
+            self.define_simple_macro("__SHA__", "1");
         }
         if f16c {
             self.define_simple_macro("__F16C__", "1");

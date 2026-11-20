@@ -874,7 +874,9 @@ mod function_feature_tests {
         // Duplicates and repeats are harmless; order still decides.
         assert!(permitted("no-avx2,avx2,avx2", F::Avx2, v1));
         // `tune=` and unmodelled names change nothing.
-        assert_eq!(features("tune=znver5,sha,rtm", v1, 0).raw(), v1);
+        assert_eq!(features("tune=znver5,xop,rtm", v1, 0).raw(), v1);
+        // SHA-NI is modelled: `sha` grants exactly its own bit.
+        assert_eq!(features("sha", v1, 0).raw(), v1 | bit(F::Sha));
     }
 
     /// GCC's override implications and what blocks them (`gcc-16 -E`).

@@ -506,6 +506,7 @@ pub struct Driver {
     pub(super) enable_avx: bool,
     pub(super) enable_avx2: bool,
     pub(super) enable_aes: bool,
+    pub(super) enable_sha: bool,
     pub(super) enable_pclmul: bool,
     pub(super) enable_f16c: bool,
     pub(super) enable_fma: bool,
@@ -949,6 +950,7 @@ impl Driver {
             enable_avx: false,
             enable_avx2: false,
             enable_aes: false,
+            enable_sha: false,
             enable_pclmul: false,
             enable_f16c: false,
             enable_fma: false,
@@ -2397,6 +2399,7 @@ impl Driver {
             simd_macros_enabled && self.enable_avx2,
             self.enable_aes,
             self.enable_pclmul,
+            self.enable_sha,
             simd_macros_enabled && self.enable_f16c,
             simd_macros_enabled && self.enable_fma,
             // INTEGER-ISA macros follow the RESOLVED codegen permission
@@ -5583,6 +5586,7 @@ impl Driver {
         // the announcement follows the option alone, never `simd`.
         set.insert_if(self.enable_aes, F::Aes);
         set.insert_if(self.enable_pclmul, F::Pclmul);
+        set.insert_if(self.enable_sha, F::Sha);
         // VAES / VPCLMULQDQ: the EVEX 256-bit forms of `aesenc` and
         // `pclmulqdq`.  Two conditions, both measured against GCC 12.2:
         //   * the 256-bit vector class must be permitted (`isa.ymm`, the

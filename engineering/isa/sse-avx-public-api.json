@@ -10431,7 +10431,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha1msg1_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha1msg1"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -10446,7 +10448,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha1msg2_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha1msg2"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -10461,7 +10465,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha1nexte_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha1nexte"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -10476,7 +10482,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha1rnds4_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha1rnds4"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -10491,7 +10499,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha256msg1_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha256msg1"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -10506,7 +10516,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha256msg2_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha256msg2"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -10521,7 +10533,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha256rnds2_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha256rnds2"
+      ],
       "wrapper_dependencies": []
     },
     {

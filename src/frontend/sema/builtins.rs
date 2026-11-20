@@ -1197,6 +1197,35 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_aeskeygenassist128",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Aeskeygenassist128),
     );
+    // x86 SHA-NI (GCC 16.2 spellings, from i386-builtin.def)
+    m.insert(
+        "__builtin_ia32_sha1rnds4",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1rnds4128),
+    );
+    m.insert(
+        "__builtin_ia32_sha1nexte",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1nexte128),
+    );
+    m.insert(
+        "__builtin_ia32_sha1msg1",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1msg1128),
+    );
+    m.insert(
+        "__builtin_ia32_sha1msg2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1msg2128),
+    );
+    m.insert(
+        "__builtin_ia32_sha256rnds2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256rnds2128),
+    );
+    m.insert(
+        "__builtin_ia32_sha256msg1",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg1128),
+    );
+    m.insert(
+        "__builtin_ia32_sha256msg2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg2128),
+    );
     // x86 CLMUL
     m.insert(
         "__builtin_ia32_pclmulqdq128",
@@ -4100,6 +4129,14 @@ pub enum BuiltinIntrinsic {
     X86Aesdeclast128,
     X86Aesimc128,
     X86Aeskeygenassist128,
+    // SHA-NI
+    X86Sha1rnds4128,
+    X86Sha1nexte128,
+    X86Sha1msg1128,
+    X86Sha1msg2128,
+    X86Sha256rnds2128,
+    X86Sha256msg1128,
+    X86Sha256msg2128,
     // CLMUL
     X86Pclmulqdq128,
     // SSE2 shift/shuffle

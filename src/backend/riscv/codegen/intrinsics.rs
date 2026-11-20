@@ -455,6 +455,13 @@ impl RiscvCodegen {
             | IntrinsicOp::Aesimc128
             | IntrinsicOp::Aeskeygenassist128
             | IntrinsicOp::Pclmulqdq128
+            | IntrinsicOp::Sha1rnds4128
+            | IntrinsicOp::Sha1nexte128
+            | IntrinsicOp::Sha1msg1128
+            | IntrinsicOp::Sha1msg2128
+            | IntrinsicOp::Sha256rnds2128
+            | IntrinsicOp::Sha256msg1128
+            | IntrinsicOp::Sha256msg2128
             | IntrinsicOp::Pslldqi128
             | IntrinsicOp::Psrldqi128
             | IntrinsicOp::Psllqi128

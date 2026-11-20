@@ -1081,6 +1081,66 @@ impl I686Codegen {
             }
 
             // Pblendvb (SSE4.1): args = (a, b, mask); mask implicit in %xmm0.
+            // SHA-NI (pointer form). Legacy-encoded; no VEX form exists.
+            IntrinsicOp::Sha1nexte128
+            | IntrinsicOp::Sha1msg1128
+            | IntrinsicOp::Sha1msg2128
+            | IntrinsicOp::Sha256msg1128
+            | IntrinsicOp::Sha256msg2128 => {
+                if let Some(dptr) = dest_ptr {
+                    let inst = match op {
+                        IntrinsicOp::Sha1nexte128 => "sha1nexte",
+                        IntrinsicOp::Sha1msg1128 => "sha1msg1",
+                        IntrinsicOp::Sha1msg2128 => "sha1msg2",
+                        IntrinsicOp::Sha256msg1128 => "sha256msg1",
+                        _ => "sha256msg2",
+                    };
+                    self.operand_to_eax(&args[0]);
+                    self.state.emit("    movdqu (%eax), %xmm0");
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    movdqu (%eax), %xmm1");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+            IntrinsicOp::Sha1rnds4128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.operand_to_eax(&args[0]);
+                    self.state.emit("    movdqu (%eax), %xmm0");
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    movdqu (%eax), %xmm1");
+                    assert!(
+                        matches!(args[2], Operand::Const(_)),
+                        "sha1rnds4 immediate must be a compile-time constant"
+                    );
+                    let imm = Self::operand_to_imm_i64(&args[2]);
+                    self.state
+                        .emit_fmt(format_args!("    sha1rnds4 ${}, %xmm1, %xmm0", imm));
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+            IntrinsicOp::Sha256rnds2128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.operand_to_eax(&args[2]);
+                    self.state.emit("    movdqu (%eax), %xmm0"); // WK (implicit)
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    movdqu (%eax), %xmm2"); // ABEF (src2)
+                    self.operand_to_eax(&args[0]);
+                    self.state.emit("    movdqu (%eax), %xmm1"); // CDGH (dst)
+                    self.state.emit("    sha256rnds2 %xmm0, %xmm2, %xmm1");
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movdqu %xmm1, (%eax)");
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
             IntrinsicOp::Pblendvb128 => {
                 if let Some(dptr) = dest_ptr {
                     self.operand_to_eax(&args[2]);

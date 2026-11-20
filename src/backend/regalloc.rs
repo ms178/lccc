@@ -8715,6 +8715,7 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
 
         // Three genuine vector inputs (no scalar operand in the prefix).
         O::Pblendvb128
+        | O::Sha256rnds2128
         | O::Dpbusd128
         | O::Dpbusds128
         | O::Dpwusd128
@@ -8856,6 +8857,12 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
         | O::Psraw128
         | O::Psrad128
         | O::Pblendw128
+        | O::Sha1rnds4128
+        | O::Sha1nexte128
+        | O::Sha1msg1128
+        | O::Sha1msg2128
+        | O::Sha256msg1128
+        | O::Sha256msg2128
         | O::Aesenc128
         | O::Aesenclast128
         | O::Aesdec128

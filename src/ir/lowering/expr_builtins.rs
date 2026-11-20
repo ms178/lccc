@@ -1556,6 +1556,13 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pxor128
             | BuiltinIntrinsic::X86Set1Epi8
             | BuiltinIntrinsic::X86Set1Epi32
+            | BuiltinIntrinsic::X86Sha1rnds4128
+            | BuiltinIntrinsic::X86Sha1nexte128
+            | BuiltinIntrinsic::X86Sha1msg1128
+            | BuiltinIntrinsic::X86Sha1msg2128
+            | BuiltinIntrinsic::X86Sha256rnds2128
+            | BuiltinIntrinsic::X86Sha256msg1128
+            | BuiltinIntrinsic::X86Sha256msg2128
             | BuiltinIntrinsic::X86Aesenc128
             | BuiltinIntrinsic::X86Aesenclast128
             | BuiltinIntrinsic::X86Aesdec128
@@ -3819,6 +3826,20 @@ impl Lowerer {
                 if let (Some(count), Some(last)) = (normalized_count, arg_ops.last_mut()) {
                     *last = Operand::Const(IrConst::I64(count));
                 }
+                // Immediates range-checked above (`x86_lane_immediate_bits`) are
+                // pinned as literals at every optimisation level: at -O0 a C
+                // conversion leaves the immediate as an SSA value, which the
+                // emitter cannot encode (it silently read 0 for blend, clmul,
+                // aeskeygenassist and sha1rnds4).
+                if x86_lane_immediate_bits(intrinsic).is_some() {
+                    let imm = args
+                        .last()
+                        .and_then(|arg| self.eval_const_expr(arg))
+                        .and_then(|value| value.to_i64());
+                    if let (Some(imm), Some(last)) = (imm, arg_ops.last_mut()) {
+                        *last = Operand::Const(IrConst::I32(imm as i32));
+                    }
+                }
                 let result_size = match x86_intrinsic_kind(intrinsic) {
                     X86IntrinsicKind::Vec128 => 16,
                     X86IntrinsicKind::Vec256 => 32,
@@ -4042,6 +4063,12 @@ fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
         | BuiltinIntrinsic::X86Vextractf128V
         | BuiltinIntrinsic::X86Insert128to256
         | BuiltinIntrinsic::X86Vinsertf128 => Some(1),
+        // SHA1RNDS4 selects one of four round functions with a 2-bit immediate.
+        BuiltinIntrinsic::X86Sha1rnds4128 => Some(2),
+        // PBLENDW, PCLMULQDQ and AESKEYGENASSIST take a full 8-bit immediate.
+        BuiltinIntrinsic::X86Pblendw128
+        | BuiltinIntrinsic::X86Pclmulqdq128
+        | BuiltinIntrinsic::X86Aeskeygenassist128 => Some(8),
         _ => None,
     }
 }
@@ -4284,6 +4311,19 @@ fn legacy_xmm_intrinsic_required_feature(
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
+        // SHA-NI (GCC's `__builtin_ia32_sha*`, `target("sha")` on the wrappers).
+        B::X86Sha1rnds4128
+        | B::X86Sha1nexte128
+        | B::X86Sha1msg1128
+        | B::X86Sha1msg2128
+        | B::X86Sha256rnds2128
+        | B::X86Sha256msg1128
+        | B::X86Sha256msg2128
+        => IntrinsicRequirement {
+            feature: F::Sha,
+            flag: "-msha",
+            also: None,
+        },
         // Public and raw spellings share an intrinsic identity. SSE1 floating
         // arithmetic must not bypass permission checks, nor imply SSE2 integer
         // or double arithmetic merely because the register class is the same.
@@ -4917,6 +4957,13 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86CastReinterpret => IntrinsicOp::CastReinterpret128,
         BuiltinIntrinsic::X86Set1Epi8 => IntrinsicOp::SetEpi8,
         BuiltinIntrinsic::X86Set1Epi32 => IntrinsicOp::SetEpi32,
+        BuiltinIntrinsic::X86Sha1rnds4128 => IntrinsicOp::Sha1rnds4128,
+        BuiltinIntrinsic::X86Sha1nexte128 => IntrinsicOp::Sha1nexte128,
+        BuiltinIntrinsic::X86Sha1msg1128 => IntrinsicOp::Sha1msg1128,
+        BuiltinIntrinsic::X86Sha1msg2128 => IntrinsicOp::Sha1msg2128,
+        BuiltinIntrinsic::X86Sha256rnds2128 => IntrinsicOp::Sha256rnds2128,
+        BuiltinIntrinsic::X86Sha256msg1128 => IntrinsicOp::Sha256msg1128,
+        BuiltinIntrinsic::X86Sha256msg2128 => IntrinsicOp::Sha256msg2128,
         BuiltinIntrinsic::X86Aesenc128 => IntrinsicOp::Aesenc128,
         BuiltinIntrinsic::X86Aesenclast128 => IntrinsicOp::Aesenclast128,
         BuiltinIntrinsic::X86Aesdec128 => IntrinsicOp::Aesdec128,

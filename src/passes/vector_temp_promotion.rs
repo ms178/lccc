@@ -383,6 +383,12 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Pminub128
         | O::Pblendw128
         | O::Pclmulqdq128
+        | O::Sha1rnds4128
+        | O::Sha1nexte128
+        | O::Sha1msg1128
+        | O::Sha1msg2128
+        | O::Sha256msg1128
+        | O::Sha256msg2128
         | O::Aesenc128
         | O::Aesenclast128
         | O::Aesdec128
@@ -439,6 +445,8 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
 
         // PBLENDVB consumes state, true value and mask as vectors.
         O::Pblendvb128 => return (index < 3).then_some(16),
+        // SHA-256 rounds: state, state and the implicit WK operand.
+        O::Sha256rnds2128 => return (index < 3).then_some(16),
 
         // 256-bit stores and unary consumers.
         O::Storeu256

@@ -1,0 +1,1 @@
+-m32 -O0 -msha -maes -mpclmul -mssse3 -msse4.1

@@ -1478,6 +1478,7 @@ impl X86Codegen {
             && !matches!(
                 op,
                 O::Pblendvb128
+                    | O::Sha256rnds2128
                     | O::Storedqu
                     | O::Storeu256
                     | O::Store256
@@ -1510,6 +1511,23 @@ impl X86Codegen {
     }
 
     #[inline]
+    /// Legacy-encoded SHA-NI binary op `inst %xmm1, %xmm0` (dst = args[0],
+    /// src = args[1]), stored to `dest_ptr`.  SHA-NI has no VEX encoding, so
+    /// this never takes the `v`-prefixed route of `emit_sse_binary_128`.
+    pub(super) fn emit_sha_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str) {
+        assert!(
+            args.len() >= 2,
+            "emit_sha_binary_128: malformed intrinsic {} ({} args)",
+            inst,
+            args.len()
+        );
+        self.sse_load_arg(&args[0], "xmm0");
+        self.sse_load_arg(&args[1], "xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+        self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
     pub(super) fn emit_sse_binary_128(
         &mut self,
         dest_ptr: &Value,
@@ -3960,6 +3978,64 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    aeskeygenassist ${}, %xmm0, %xmm0", imm));
                     self.sse_store_dest(dptr, "xmm0");
+                }
+            }
+            // SHA-NI, two vector operands: sha1nexte, sha1msg1/2, sha256msg1/2.
+            // The instructions have no VEX form, so they are emitted legacy
+            // (`emit_sha_binary_128`), never through the `v`-prefixed path.
+            IntrinsicOp::Sha1nexte128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha1nexte");
+                }
+            }
+            IntrinsicOp::Sha1msg1128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha1msg1");
+                }
+            }
+            IntrinsicOp::Sha1msg2128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha1msg2");
+                }
+            }
+            IntrinsicOp::Sha256msg1128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha256msg1");
+                }
+            }
+            IntrinsicOp::Sha256msg2128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha256msg2");
+                }
+            }
+            // SHA-NI sha1rnds4: args = [state, msg, imm8]. Destination and first
+            // source are xmm0/xmm1; the immediate selects the round function.
+            IntrinsicOp::Sha1rnds4128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    assert_eq!(args.len(), 3, "Sha1rnds4128 requires state, msg, imm8");
+                    assert!(
+                        matches!(args[2], Operand::Const(_)),
+                        "sha1rnds4 immediate must be a compile-time constant"
+                    );
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.sse_load_arg(&args[1], "xmm1");
+                    let imm = self.operand_to_imm_i64(&args[2]);
+                    self.state
+                        .emit_fmt(format_args!("    sha1rnds4 ${}, %xmm1, %xmm0", imm));
+                    self.sse_store_dest(dptr, "xmm0");
+                }
+            }
+            // SHA-NI sha256rnds2: args = [cdgh (dst), abef (src2), wk]. WK is
+            // read from the implicit operand %xmm0, so it is loaded first and
+            // the other operands are loaded into %xmm2 and %xmm1 (the result).
+            IntrinsicOp::Sha256rnds2128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    assert_eq!(args.len(), 3, "Sha256rnds2128 requires cdgh, abef, wk");
+                    self.sse_load_arg(&args[2], "xmm0");
+                    self.sse_load_arg(&args[1], "xmm2");
+                    self.sse_load_arg(&args[0], "xmm1");
+                    self.state.emit("    sha256rnds2 %xmm0, %xmm2, %xmm1");
+                    self.sse_store_dest(dptr, "xmm1");
                 }
             }
             // CLMUL: pclmulqdq with immediate

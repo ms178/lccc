@@ -464,6 +464,7 @@ impl Driver {
         self.enable_avx = false;
         self.enable_avx2 = false;
         self.enable_aes = false;
+        self.enable_sha = false;
         self.enable_pclmul = false;
         self.enable_f16c = false;
         self.enable_fma = false;
@@ -569,6 +570,14 @@ impl Driver {
                 x86_target_option(&name).map(|handler| handler.touched(negated))
             })
             .fold(0, |mask, touched| mask | touched)
+    }
+
+    /// SHA-NI (`-msha`): legacy-encoded SSE2-class instructions, so it grants
+    /// the SSE2 class and nothing above it (GCC's `-msha` implies `-msse2`).
+    fn grant_sha_class(&mut self) {
+        self.enable_sha = true;
+        self.grant_sse2_class();
+        self.enable_sse = true;
     }
 
     /// The AVX-512 subsets and AVX-VNNI (AVX-512 / AVX10 feature flags;
@@ -819,6 +828,7 @@ impl Driver {
             "-mno-amx-bf16" => self.enable_amx_bf16 = false,
             "-mno-cmpccxadd" => self.enable_cmpccxadd = false,
             "-mno-aes" => self.enable_aes = false,
+            "-mno-sha" => self.enable_sha = false,
             "-mno-pclmul" => self.enable_pclmul = false,
             "-mno-f16c" => self.enable_f16c = false,
             _ => return false,
@@ -897,6 +907,7 @@ impl Driver {
             // Positive SIMD feature flags: define corresponding macros.
             // -mavx2 implies -mavx implies -msse4.2 implies -msse4.1 implies
             // -mssse3 implies -msse3 (matching GCC's implication chain).
+            "-msha" => self.grant_sha_class(),
             "-maes" => {
                 self.enable_aes = true;
                 self.grant_sse2_class();
@@ -1388,6 +1399,7 @@ impl Driver {
         // the denial below cannot drop a row-granted extension.
         for (feature, slot) in [
             (F::Aes, &mut self.enable_aes),
+            (F::Sha, &mut self.enable_sha),
             (F::Pclmul, &mut self.enable_pclmul),
             (F::Gfni, &mut self.enable_gfni),
         ] {
@@ -1478,6 +1490,7 @@ impl Driver {
             F::Lzcnt => &mut self.enable_lzcnt,
             F::Movbe => &mut self.enable_movbe,
             F::Aes => &mut self.enable_aes,
+            F::Sha => &mut self.enable_sha,
             F::Pclmul => &mut self.enable_pclmul,
             F::Rdrnd => &mut self.enable_rdrnd,
             F::Vaes => &mut self.enable_vaes,
@@ -3179,6 +3192,9 @@ impl Driver {
                                         if !self.sse_explicitly_disabled {
                                             if std::arch::is_x86_feature_detected!("aes") {
                                                 self.enable_aes = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("sha") {
+                                                self.enable_sha = true;
                                             }
                                             if std::arch::is_x86_feature_detected!("pclmulqdq") {
                                                 self.enable_pclmul = true;
