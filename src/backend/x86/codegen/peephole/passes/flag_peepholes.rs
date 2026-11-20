@@ -1800,7 +1800,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             widened_mask,
             bool_retired,
         };
-        if !carriers.all_dead_after_cmov(store, infos, &lv, &owned) {
+        if !carriers.all_dead_after_cmov(store, infos, &mut lv, &owned) {
             i += 1;
             continue;
         }
@@ -1844,7 +1844,7 @@ impl IdiomCarriers {
         &self,
         store: &LineStore,
         infos: &[LineInfo],
-        lv: &FileLiveness,
+        lv: &mut FileLiveness,
         owned: &[usize],
     ) -> bool {
         let Self {

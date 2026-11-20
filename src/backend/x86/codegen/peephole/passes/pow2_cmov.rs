@@ -124,7 +124,7 @@ impl Block {
 
         // mov: `mov{l,q} %X, %S`
         let (mov_mnem, mov_rest) = split_head(mov)?;
-        if mov_mnem != format!("mov{width}") {
+        if !is_mn(mov_mnem, "mov", width) {
             return None;
         }
         let (x_spelling, scratch) = split_two_operands(mov_rest)?;
@@ -136,7 +136,7 @@ impl Block {
 
         // sign: `sar{l,q} $(31|63), %S`
         let (sign_mnem, sign_rest) = split_head(sign)?;
-        if sign_mnem != format!("sar{width}") {
+        if !is_mn(sign_mnem, "sar", width) {
             return None;
         }
         let (sign_src, sign_dst) = split_two_operands(sign_rest)?;
@@ -150,7 +150,7 @@ impl Block {
 
         // bias: `shr{l,q} $(width_bits-k), %S`
         let (bias_mnem, bias_rest) = split_head(bias)?;
-        if bias_mnem != format!("shr{width}") {
+        if !is_mn(bias_mnem, "shr", width) {
             return None;
         }
         let (bias_src, bias_dst) = split_two_operands(bias_rest)?;
@@ -166,7 +166,7 @@ impl Block {
 
         // lea: `lea{l,q} (%X, %S), %T` — two-register SIB, zero displacement.
         let (lea_mnem, lea_rest) = split_head(lea)?;
-        if lea_mnem != format!("lea{width}") {
+        if !is_mn(lea_mnem, "lea", width) {
             return None;
         }
         let (mem, t_spelling) = split_two_operands(lea_rest)?;
@@ -335,9 +335,17 @@ pub(super) fn plain_text<'a>(
     Some(infos[i].trimmed(raw))
 }
 
-pub(super) fn split_head(text: &str) -> Option<(String, &str)> {
+pub(super) fn split_head(text: &str) -> Option<(&str, &str)> {
+    // Borrowed mnemonic: the old owned `String` cost one heap block per
+    // probed line across this pass and `abs_cmov` (DHAT: 111k blocks).
     text.split_once(char::is_whitespace)
-        .map(|(m, r)| (m.to_string(), r))
+}
+
+/// `mnem == format!("{base}{width}")` without building the owned pattern
+/// (`width` is an ASCII size suffix: 'l' or 'q').
+pub(super) fn is_mn(mnem: &str, base: &str, width: char) -> bool {
+    mnem.strip_prefix(base)
+        .is_some_and(|r| r.len() == 1 && r.as_bytes()[0] == width as u8)
 }
 
 pub(super) fn imm_value(src: &str) -> Option<u32> {
@@ -489,7 +497,7 @@ fn full_register_overwrite(text: &str, fam: RegId) -> bool {
         return false;
     };
     if !matches!(
-        mnem.as_str(),
+        mnem,
         "movl"
             | "movq"
             | "movabsq"

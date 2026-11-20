@@ -70,8 +70,8 @@ use super::super::types::*;
 use super::identical_blocks::reads_flags;
 use super::liveness::FileLiveness;
 use super::pow2_cmov::{
-    definitely_kills_any_flags_text, imm_value, plain_text, prev_non_silence, scratch_live_after,
-    split_head, width_letter,
+    definitely_kills_any_flags_text, imm_value, is_mn, plain_text, prev_non_silence,
+    scratch_live_after, split_head, width_letter,
 };
 use super::relay_and_lea::{plain_gp_operand, split_two_operands};
 
@@ -117,7 +117,7 @@ impl Block {
         let sub = plain_text(store, infos, end)?;
         let width = width_letter(store, infos, end)?;
         let (sub_mnem, sub_rest) = split_head(sub)?;
-        if sub_mnem != format!("sub{width}") {
+        if !is_mn(sub_mnem, "sub", width) {
             return None;
         }
         let (s_spelling, d_spelling) = split_two_operands(sub_rest)?;
@@ -130,7 +130,7 @@ impl Block {
         // xor: `xor{w} %S, %D`
         let xor_i = prev_non_silence(store, infos, end)?;
         let (xor_mnem, xor_rest) = split_head(plain_text(store, infos, xor_i)?)?;
-        if xor_mnem != format!("xor{width}") {
+        if !is_mn(xor_mnem, "xor", width) {
             return None;
         }
         let (xs, xd) = split_two_operands(xor_rest)?;
@@ -143,7 +143,7 @@ impl Block {
         let mut i = prev_non_silence(store, infos, xor_i)?;
         let mut out_of_place: Option<(usize, String)> = None;
         if let Some((mnem, rest)) = plain_text(store, infos, i).and_then(split_head)
-            && mnem == format!("mov{width}")
+            && is_mn(&mnem, "mov", width)
             && let Some((src, dst)) = split_two_operands(rest)
             && dst == d_spelling
         {
@@ -154,7 +154,7 @@ impl Block {
         // sar: `sar{w} $(31|63), %S`
         let sar_i = i;
         let (sar_mnem, sar_rest) = split_head(plain_text(store, infos, sar_i)?)?;
-        if sar_mnem != format!("sar{width}") {
+        if !is_mn(sar_mnem, "sar", width) {
             return None;
         }
         let (count, sar_dst) = split_two_operands(sar_rest)?;
@@ -166,7 +166,7 @@ impl Block {
         // mov: `mov{w} %X, %S`
         let mov_i = prev_non_silence(store, infos, sar_i)?;
         let (mov_mnem, mov_rest) = split_head(plain_text(store, infos, mov_i)?)?;
-        if mov_mnem != format!("mov{width}") {
+        if !is_mn(mov_mnem, "mov", width) {
             return None;
         }
         let (x_spelling, mov_dst) = split_two_operands(mov_rest)?;
@@ -215,7 +215,7 @@ impl Block {
         let copy_out = if out_of_place.is_none() {
             next_non_silence(store, infos, end).and_then(|c| {
                 let (mnem, rest) = split_head(plain_text(store, infos, c)?)?;
-                if mnem != format!("mov{width}") || infos[c].pinned {
+                if !is_mn(&mnem, "mov", width) || infos[c].pinned {
                     return None;
                 }
                 let (src, dst) = split_two_operands(rest)?;

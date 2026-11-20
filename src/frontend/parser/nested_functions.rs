@@ -95,10 +95,110 @@ impl Parser {
         matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::LBrace))
     }
 
+    /// Pure token-level pre-filter for `try_parse_nested_function_def`:
+    /// `false` only when the item at `self.pos` CANNOT be a nested function
+    /// definition, so the caller skips the speculative parse and its eleven
+    /// state snapshots (those clones were 264k heap blocks per profiling TU
+    /// -- one set per ordinary typed local declaration).
+    ///
+    /// Soundness contract: any true nested definition must get `true`.
+    /// A function definition's declarator carries a parameter list, and its
+    /// body `{` follows the parameter list (possibly via attribute groups)
+    /// or, for K&R heads, after parameter declarations.  Therefore at
+    /// top level (outside every bracket/paren/brace group):
+    /// * `=` proves an ordinary declaration — reject (neither parameter
+    ///   declarations nor a definition head can carry an initialiser);
+    /// * `,` rejects only before any parameter list (`int x, y;`); after one
+    ///   it may sit in K&R parameter declarations (`int f(a, b) int a, b;`)
+    ///   and the scan continues;
+    /// * `;` rejects unless a parameter list was already seen (a K&R head
+    ///   `int f(a) int a; { ... }` passes, `int x;` fails);
+    /// * `{` directly after a `)` is a function body — accept;
+    /// * any other `{` (struct/union/enum body, braced initialiser reached
+    ///   only through `=` and so unreachable here) is skipped as a balanced
+    ///   group and the scan continues.
+    /// False positives (e.g. `int (*fp)(int);`) merely fall through to the
+    /// speculative parse, which rolls back exactly as before.
+    fn could_be_nested_function_def(&self) -> bool {
+        let mut i = self.pos;
+        let mut paren = 0usize;
+        let mut bracket = 0usize;
+        let mut seen_params = false;
+        let mut prev_rparen = false;
+        while i < self.tokens.len() {
+            match &self.tokens[i].kind {
+                TokenKind::LParen => {
+                    paren += 1;
+                    seen_params = true;
+                    prev_rparen = false;
+                }
+                TokenKind::RParen => {
+                    paren = paren.saturating_sub(1);
+                    prev_rparen = paren == 0;
+                }
+                TokenKind::LBracket => {
+                    bracket += 1;
+                    prev_rparen = false;
+                }
+                TokenKind::RBracket => {
+                    bracket = bracket.saturating_sub(1);
+                    prev_rparen = false;
+                }
+                TokenKind::Eof => return false,
+                k if paren == 0 && bracket == 0 => match k {
+                    TokenKind::Assign => return false,
+                    TokenKind::Comma => {
+                        if !seen_params {
+                            return false;
+                        }
+                        prev_rparen = false;
+                    }
+                    TokenKind::Semicolon => return seen_params,
+                    // A bare `}` at depth 0 closes the ENCLOSING scope: no
+                    // declaration head contains one, so stop here rather
+                    // than scanning into the rest of the token stream
+                    // (keeps the filter O(item), not O(file), on malformed
+                    // input with a missing `;`).
+                    TokenKind::RBrace => return false,
+                    TokenKind::LBrace => {
+                        if prev_rparen {
+                            return true;
+                        }
+                        // Tag body (`struct S { ... }`): skip the balanced
+                        // group, the declarator follows it.
+                        let mut depth = 1usize;
+                        i += 1;
+                        while i < self.tokens.len() {
+                            match self.tokens[i].kind {
+                                TokenKind::LBrace => depth += 1,
+                                TokenKind::RBrace => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                TokenKind::Eof => return false,
+                                _ => {}
+                            }
+                            i += 1;
+                        }
+                    }
+                    _ => prev_rparen = false,
+                },
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Speculatively parse a nested function definition at block scope.
     /// Returns `None` (with the parser state fully restored) when the item
     /// turns out to be an ordinary declaration.
     pub(super) fn try_parse_nested_function_def(&mut self) -> Option<FunctionDef> {
+        if !self.could_be_nested_function_def() {
+            return None;
+        }
         // Snapshot all state the speculative parse may mutate.
         let saved_pos = self.pos;
         let saved_attrs = self.attrs.clone();

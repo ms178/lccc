@@ -1762,3 +1762,76 @@ mod implicit_veto_tests {
         }
     }
 }
+
+/// Fixed-capacity operand container for the passes' comma splitters.
+///
+/// Three passes (`fp_liveness`, `fma_forms`, `vector_copy`) split an AT&T
+/// operand string per instruction line inside their hottest loops, and each
+/// split used to heap-allocate a `Vec<&str>` — DHAT measured ~500k such
+/// blocks per profiling TU.  Real x86 lines top out at 4 top-level operands
+/// (an immediate selector plus three registers); 6 inline slots cover every
+/// machine form with margin, and a pathological hand-written line spills to
+/// the heap transparently instead of truncating (truncation would change
+/// `.all()`/`.iter()` answers and thus pass behaviour).
+///
+/// `Deref<Target = [&str]>` keeps every call site's indexing, slicing and
+/// iteration untouched.  Each pass keeps its OWN split loop: their comma
+/// grammars differ deliberately (`vector_copy` counts `{`/`}` for EVEX
+/// decorations, `fp_liveness` trims and drops an empty tail, `fma_forms`
+/// does neither), and unifying them would silently change accepted spellings.
+/// Fixed-capacity operand container for the passes' comma splitters —
+/// see `crate::common::inline_vec::InlineVec` for the mechanism and the
+/// allocation-storm rationale.  Six inline slots cover every real AT&T
+/// machine form (at most an immediate selector plus three registers, plus
+/// margin); a pathological hand-written line spills to the heap
+/// transparently instead of truncating.
+///
+/// Each pass keeps its OWN split loop: their comma grammars differ
+/// deliberately (`vector_copy` counts `{`/`}` for EVEX decorations,
+/// `fp_liveness` trims and drops an empty tail, `fma_forms` does neither),
+/// and unifying them would silently change accepted spellings.
+pub(super) type OperandList<'a> = crate::common::inline_vec::InlineVec<&'a str, 6>;
+
+#[cfg(test)]
+mod operand_list_container_tests {
+    use super::OperandList;
+
+    #[test]
+    fn inline_up_to_capacity_no_spill() {
+        let mut l = OperandList::new();
+        for s in ["a", "b", "c", "d", "e", "f"] {
+            l.push(s);
+        }
+        assert_eq!(&*l, &["a", "b", "c", "d", "e", "f"]);
+        assert!(!l.spilled(), "no heap for the machine-form maximum");
+    }
+
+    #[test]
+    fn overflow_preserves_order_and_content() {
+        let mut l = OperandList::new();
+        let all = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for s in all {
+            l.push(s);
+        }
+        assert_eq!(&*l, &all);
+    }
+
+    #[test]
+    fn empty_list_is_an_empty_slice() {
+        let l = OperandList::new();
+        assert!(l.is_empty());
+        assert_eq!(l.len(), 0);
+        assert_eq!(l.first(), None);
+    }
+
+    #[test]
+    fn slice_ops_work_through_deref() {
+        let mut l = OperandList::new();
+        for s in ["$1", "%xmm0", "%xmm1"] {
+            l.push(s);
+        }
+        assert_eq!(l[0], "$1");
+        assert_eq!(&l[..l.len() - 1], &["$1", "%xmm0"]);
+        assert!(l.iter().any(|s| s.starts_with("%xmm")));
+    }
+}

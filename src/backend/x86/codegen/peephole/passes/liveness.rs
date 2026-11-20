@@ -387,6 +387,19 @@ impl DeadWriteRefresh {
     }
 }
 
+/// Saved span of one function inside a [`FileLiveness`]; see
+/// [`FileLiveness::snapshot_function`].
+pub(super) struct FnSpanSnapshot {
+    start: usize,
+    end: usize,
+    live_out: Vec<u16>,
+    live_in: Vec<u16>,
+    known: Vec<bool>,
+    structural: Vec<bool>,
+    effect: Vec<(u16, u16)>,
+    textual_ret: bool,
+}
+
 #[derive(Clone)]
 pub(super) struct FileLiveness {
     /// Registers live immediately AFTER each line, when its function could be
@@ -413,6 +426,37 @@ pub(super) struct FileLiveness {
     /// Functions whose `ret` read set was inferred from their text (no
     /// legible `# LCCC_RET_RDX` marker): any edit can change it.
     textual_ret: FxHashSet<usize>,
+}
+
+/// Reusable per-thread scratch for one function solve.  Every buffer here
+/// used to be a fresh heap allocation per `analyse_function` call — and the
+/// solver runs once per function per refresh, so DHAT attributed 1.46M
+/// blocks / 907 MB of churn to it on the profiling TU.  Pooled, each vector
+/// re-allocates only at a new high-water mark (`clear` + `resize` keep
+/// capacity), the same amortisation `succ_flat` already documented.
+/// Thread-local like `FN_CACHE` below, and for the same reason: the solver
+/// is not re-entrant, so one scratch per thread is exactly enough.
+struct SolveScratch {
+    effects: Vec<Option<Effect>>,
+    succ_range: Vec<(usize, usize)>,
+    lines: Vec<usize>,
+    succ_flat: Vec<usize>,
+    live_in: Vec<u16>,
+    live_out: Vec<u16>,
+}
+
+thread_local! {
+    static SOLVE_SCRATCH: std::cell::RefCell<SolveScratch> =
+        const {
+            std::cell::RefCell::new(SolveScratch {
+                effects: Vec::new(),
+                succ_range: Vec::new(),
+                lines: Vec::new(),
+                succ_flat: Vec::new(),
+                live_in: Vec::new(),
+                live_out: Vec::new(),
+            })
+        };
 }
 
 // Counts memo hits, so the tests can prove a hit happened rather than
@@ -804,8 +848,48 @@ impl FileLiveness {
     /// contains every mention of the mask families that it deletes
     /// (`compare_branch` re-verifies mentionedness of its transparent lines
     /// against the final carrier mask; labels are never transparent there).
-    pub(super) fn live_after_dropping_region(
+    /// Exact saved state of one function's span: everything a span-bounded
+    /// re-derivation (`reanalyse_with`, `refresh_span`, `refresh_at`) can
+    /// write.  Restoring it reproduces the pre-probe `FileLiveness` bit for
+    /// bit: the five per-line arrays are only ever published into
+    /// `start..end` by those paths, `textual_ret` only gains or loses
+    /// `start`, and `func_of` is written exclusively by `new()`.
+    pub(super) fn snapshot_function(
         &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+    ) -> Option<FnSpanSnapshot> {
+        let (start, end) = self.recorded_function(store, infos, idx)?;
+        Some(FnSpanSnapshot {
+            start,
+            end,
+            live_out: self.live_out[start..end].to_vec(),
+            live_in: self.live_in[start..end].to_vec(),
+            known: self.known[start..end].to_vec(),
+            structural: self.structural[start..end].to_vec(),
+            effect: self.effect[start..end].to_vec(),
+            textual_ret: self.textual_ret.contains(&start),
+        })
+    }
+
+    /// Restore a span saved by [`FileLiveness::snapshot_function`].
+    pub(super) fn restore_function(&mut self, snap: &FnSpanSnapshot) {
+        let (start, end) = (snap.start, snap.end);
+        self.live_out[start..end].copy_from_slice(&snap.live_out);
+        self.live_in[start..end].copy_from_slice(&snap.live_in);
+        self.known[start..end].copy_from_slice(&snap.known);
+        self.structural[start..end].copy_from_slice(&snap.structural);
+        self.effect[start..end].copy_from_slice(&snap.effect);
+        if snap.textual_ret {
+            self.textual_ret.insert(start);
+        } else {
+            self.textual_ret.remove(&start);
+        }
+    }
+
+    pub(super) fn live_after_dropping_region(
+        &mut self,
         store: &LineStore,
         infos: &[LineInfo],
         idx: usize,
@@ -816,21 +900,16 @@ impl FileLiveness {
         if idx >= self.known.len() || lo > hi || hi >= self.known.len() {
             return None;
         }
-        let (start, end) = self.recorded_function(store, infos, idx)?;
-        // Clone-and-re-derive: the neutralised solution must not leak into
-        // the caller's (unmodified-program) solution, and every other field
-        // keeps the function/structural bookkeeping the caller inherited.
-        let mut probe = FileLiveness {
-            live_out: self.live_out.clone(),
-            live_in: self.live_in.clone(),
-            known: self.known.clone(),
-            structural: self.structural.clone(),
-            effect: self.effect.clone(),
-            func_of: self.func_of.clone(),
-            textual_ret: self.textual_ret.clone(),
-        };
-        probe.reanalyse_with(store, infos, start, end, Some((lo, hi, mask)));
-        probe.known[idx].then(|| probe.live_out[idx])
+        // Probe in place, then restore the saved span exactly.  The probe
+        // used to clone all seven whole-file vectors to protect the
+        // caller's (unmodified-program) solution — O(file) copies for a
+        // question about ONE function.  See `snapshot_function` for the
+        // write-set argument.
+        let snap = self.snapshot_function(store, infos, idx)?;
+        self.reanalyse_with(store, infos, snap.start, snap.end, Some((lo, hi, mask)));
+        let answer = self.known[idx].then(|| self.live_out[idx]);
+        self.restore_function(&snap);
+        answer
     }
 
     /// `Some(true)` when `fam` may be read after line `idx`, `Some(false)` when
@@ -1298,7 +1377,6 @@ impl FileLiveness {
     /// liveness questions for the program that would exist if those
     /// definitions had been deleted.  Everything else is unchanged; the
     /// store/load, call and `ret` modelling never consults the mask.
-    #[expect(clippy::needless_range_loop)]
     fn analyse_function(
         &mut self,
         store: &LineStore,
@@ -1307,14 +1385,19 @@ impl FileLiveness {
         end: usize,
         neutralise: Option<(usize, usize, u16)>,
     ) {
-        type CachedFnLiveness = (
-            Vec<u16>,
-            Vec<u16>,
-            Vec<bool>,
-            Vec<bool>,
-            Vec<(u16, u16)>,
-            bool,
-        );
+        /// One line's cached answers, packed so a whole function caches in
+        /// ONE vector instead of five (the five `.to_vec()` calls were 565k
+        /// heap blocks / 211 MB per profiling TU — the largest allocation
+        /// site in this pass after the solver itself).
+        #[derive(Clone, Copy)]
+        struct CachedLine {
+            live_out: u16,
+            live_in: u16,
+            effect: (u16, u16),
+            known: bool,
+            structural: bool,
+        }
+        type CachedFnLiveness = (Vec<CachedLine>, bool);
         /// Entries kept across passes for one compilation thread.  Measured
         /// against the code this replaces, which held the same 256 and then
         /// threw the whole table away.
@@ -1337,14 +1420,30 @@ impl FileLiveness {
                     }
                     banks.0.insert(key, promoted);
                 }
-                if let Some((lo, li, kn, st, ef, tret)) = banks.0.get(&key)
-                    && lo.len() == fn_len
+                if let Some((cached, tret)) = banks.0.get(&key)
+                    && cached.len() == fn_len
                 {
-                    self.live_out[start..end].copy_from_slice(lo);
-                    self.live_in[start..end].copy_from_slice(li);
-                    self.known[start..end].copy_from_slice(kn);
-                    self.structural[start..end].copy_from_slice(st);
-                    self.effect[start..end].copy_from_slice(ef);
+                    // Five zipped streams: equal-length slices let the
+                    // compiler drop every per-element bounds check (the
+                    // indexed spelling cost ~0.5B instructions per TU).
+                    let lo = &mut self.live_out[start..end];
+                    let li = &mut self.live_in[start..end];
+                    let kn = &mut self.known[start..end];
+                    let st = &mut self.structural[start..end];
+                    let ef = &mut self.effect[start..end];
+                    for (c, ((((lo, li), kn), st), ef)) in cached.iter().zip(
+                        lo.iter_mut()
+                            .zip(li.iter_mut())
+                            .zip(kn.iter_mut())
+                            .zip(st.iter_mut())
+                            .zip(ef.iter_mut()),
+                    ) {
+                        *lo = c.live_out;
+                        *li = c.live_in;
+                        *kn = c.known;
+                        *st = c.structural;
+                        *ef = c.effect;
+                    }
                     if *tret {
                         self.textual_ret.insert(start);
                     }
@@ -1363,6 +1462,64 @@ impl FileLiveness {
             None
         };
 
+        let solved = SOLVE_SCRATCH.with(|c| {
+            self.solve_function(store, infos, start, end, neutralise, &mut c.borrow_mut())
+        });
+        if !solved {
+            return;
+        }
+        if let Some(key) = cache_key {
+            FN_CACHE.with(|c| {
+                let mut banks = c.borrow_mut();
+                // Two-generation bounded cache (`curr`, `prev`): when `curr`
+                // fills, rotate `curr` into `prev` so hot entries from the
+                // immediately preceding pass are promoted on hit while new
+                // functions continue to be cached (neither a clear-the-world
+                // cliff nor a permanent freeze after FN_CACHE_CAP functions).
+                if banks.0.len() >= FN_CACHE_CAP {
+                    banks.1 = std::mem::take(&mut banks.0);
+                }
+                let mut cached = Vec::with_capacity(fn_len);
+                // Zipped gather for the same reason as the hit path: the
+                // indexed loop re-checked five slice bounds per line.
+                cached.extend(
+                    self.live_out[start..end]
+                        .iter()
+                        .zip(self.live_in[start..end].iter())
+                        .zip(self.known[start..end].iter())
+                        .zip(self.structural[start..end].iter())
+                        .zip(self.effect[start..end].iter())
+                        .map(|((((&lo, &li), &kn), &st), &ef)| CachedLine {
+                            live_out: lo,
+                            live_in: li,
+                            effect: ef,
+                            known: kn,
+                            structural: st,
+                        }),
+                );
+                banks
+                    .0
+                    .insert(key, (cached, self.textual_ret.contains(&start)));
+            });
+        }
+    }
+
+    /// The uncached solve of one function: build effects and successor
+    /// edges, run the backward dataflow and, on convergence, publish the
+    /// per-line answers into `self`.  Returns `false` when the control
+    /// flow is unanalysable or the solve did not converge (the lines stay
+    /// `known == false` and the caller must not cache).  All working
+    /// memory comes from `scratch` — see `SolveScratch`.
+    fn solve_function(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        start: usize,
+        end: usize,
+        neutralise: Option<(usize, usize, u16)>,
+        scratch: &mut SolveScratch,
+    ) -> bool {
+        let fn_len = end.saturating_sub(start);
         let rdx_marker = Self::ret_rdx_marker(store, infos, start, end);
         if rdx_marker.is_none() {
             self.textual_ret.insert(start);
@@ -1402,7 +1559,11 @@ impl FileLiveness {
         // pairs (gcc.c-torture/compile 20001226-1) spent minutes in string
         // compares, once per `refresh_at`.  The FIRST definition wins, as
         // with the scan it replaces.
-        let mut label_index: FxHashMap<&str, usize> = FxHashMap::default();
+        let nlabels = (start..end)
+            .filter(|&n| !infos[n].is_nop() && infos[n].kind == LineKind::Label)
+            .count();
+        let mut label_index: FxHashMap<&str, usize> =
+            FxHashMap::with_capacity_and_hasher(nlabels, Default::default());
         for n in start..end {
             if infos[n].is_nop() || infos[n].kind != LineKind::Label {
                 continue;
@@ -1419,9 +1580,19 @@ impl FileLiveness {
         // cost a heap allocation and free for nearly every line of every
         // solve (almost all have one or two successors); the flat buffer
         // grows to its high-water mark once per solve.
-        let mut effects: Vec<Option<Effect>> = vec![None; fn_len];
-        let mut succ_range: Vec<(usize, usize)> = vec![(0, 0); fn_len];
-        let mut lines: Vec<usize> = Vec::with_capacity(fn_len);
+        let SolveScratch {
+            effects,
+            succ_range,
+            lines,
+            succ_flat,
+            live_in,
+            live_out,
+        } = scratch;
+        effects.clear();
+        effects.resize(fn_len, None);
+        succ_range.clear();
+        succ_range.resize(fn_len, (0, 0));
+        lines.clear();
         for n in start..end {
             if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
                 continue;
@@ -1448,8 +1619,8 @@ impl FileLiveness {
         // jump (computed goto, tail call through a register) still
         // refuses analysis.
         let jump_table_succs: Vec<Option<Vec<usize>>> =
-            Self::resolve_jump_tables(store, infos, &lines, &label_index, start, end);
-        let mut succ_flat: Vec<usize> = Vec::with_capacity(lines.len() + lines.len() / 4);
+            Self::resolve_jump_tables(store, infos, lines, &label_index, start, end);
+        succ_flat.clear();
         for (pos, &n) in lines.iter().enumerate() {
             let t = infos[n].trimmed(store.get(n));
             let next = lines.get(pos + 1).copied();
@@ -1465,10 +1636,10 @@ impl FileLiveness {
                 ret_live,
                 &jump_table_succs,
                 start,
-                &mut succ_flat,
+                succ_flat,
             ) {
                 Some(v) => v,
-                None => return, // unanalysable control flow: leave `known` false
+                None => return false, // unanalysable control flow: leave `known` false
             };
             let eff = match neutralise {
                 // Deleted-definition semantics: the span is no longer an
@@ -1491,8 +1662,10 @@ impl FileLiveness {
         }
 
         // ── backward dataflow ────────────────────────────────────────────────
-        let mut live_in: Vec<u16> = vec![0; fn_len];
-        let mut live_out: Vec<u16> = vec![0; fn_len];
+        live_in.clear();
+        live_in.resize(fn_len, 0);
+        live_out.clear();
+        live_out.resize(fn_len, 0);
         let mut changed = true;
         let mut rounds = 0;
         while changed && rounds < 64 {
@@ -1525,10 +1698,10 @@ impl FileLiveness {
             }
         }
         if changed {
-            return; // did not converge (pathological CFG): stay unknown
+            return false; // did not converge (pathological CFG): stay unknown
         }
 
-        for &n in &lines {
+        for &n in lines.iter() {
             self.live_out[n] = live_out[n - start];
             self.live_in[n] = live_in[n - start];
             self.known[n] = true;
@@ -1539,30 +1712,7 @@ impl FileLiveness {
         for n in start..end {
             self.structural[n] = is_structural(store, infos, n);
         }
-        if let Some(key) = cache_key {
-            FN_CACHE.with(|c| {
-                let mut banks = c.borrow_mut();
-                // Two-generation bounded cache (`curr`, `prev`): when `curr`
-                // fills, rotate `curr` into `prev` so hot entries from the
-                // immediately preceding pass are promoted on hit while new
-                // functions continue to be cached (neither a clear-the-world
-                // cliff nor a permanent freeze after FN_CACHE_CAP functions).
-                if banks.0.len() >= FN_CACHE_CAP {
-                    banks.1 = std::mem::take(&mut banks.0);
-                }
-                banks.0.insert(
-                    key,
-                    (
-                        self.live_out[start..end].to_vec(),
-                        self.live_in[start..end].to_vec(),
-                        self.known[start..end].to_vec(),
-                        self.structural[start..end].to_vec(),
-                        self.effect[start..end].to_vec(),
-                        self.textual_ret.contains(&start),
-                    ),
-                );
-            });
-        }
+        true
     }
 
     /// Whether GP family `fam` provably holds a zero upper half (bits 32..63)
@@ -1847,6 +1997,20 @@ impl FileLiveness {
         start: usize,
         end: usize,
     ) -> Vec<Option<Vec<usize>>> {
+        // The overwhelmingly common function has NO indirect jump, and
+        // `classify` only consults this table for `JmpIndirect` lines (via
+        // `.get()`, which answers `None` on the empty slice exactly as the
+        // dense all-`None` table did).  Skipping the dense per-line vector
+        // for those functions removes what DHAT measured as the largest
+        // allocation site of the whole backend on the profiling TU:
+        // 183k blocks / 372 MB of zero-initialised `Option<Vec>` entries
+        // that no lookup ever touched.
+        if !lines
+            .iter()
+            .any(|&n| infos[n].kind == LineKind::JmpIndirect)
+        {
+            return Vec::new();
+        }
         let mut out: Vec<Option<Vec<usize>>> = vec![None; end.saturating_sub(start)];
         let resolve = |name: &str| -> Option<usize> { label_index.get(name).copied() };
         for (pos, &n) in lines.iter().enumerate() {
@@ -2430,6 +2594,89 @@ fn upper32_zero_transfer(info: &LineInfo, t: &str) -> (u16, u16) {
 mod tests {
     use super::*;
     use crate::backend::peephole_common::LineStore;
+
+    /// `live_after_dropping_region` probes in place and restores the saved
+    /// span.  Two contracts, both against independent oracles:
+    /// 1. the answer equals the old clone-the-world implementation's
+    ///    (clone + `reanalyse_with` on the clone);
+    /// 2. after the call, EVERY caller-visible field of the probed
+    ///    `FileLiveness` is bit-identical to its pre-call state.
+    #[test]
+    fn dropping_region_probe_restores_state_exactly() {
+        // A loop so the neutralised question is non-trivial (the carriers
+        // look live across the backedge) plus a second function to prove
+        // out-of-span state is untouched.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    # LCCC_RET_RAX 1\n",
+            "    movl $1, %ecx\n",
+            ".L1:\n",
+            "    setne %r8b\n",
+            "    movzbl %r8b, %r8d\n",
+            "    addl %ecx, %eax\n",
+            "    subl $1, %edi\n",
+            "    jne .L1\n",
+            "    ret\n.cfi_endproc\n",
+            "g:\n.cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    # LCCC_RET_RAX 1\n",
+            "    movl $2, %eax\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let line = |text: &str| {
+            (0..store.len())
+                .find(|&i| store.get(i).trim_ascii() == text)
+                .unwrap()
+        };
+        let mut lv = FileLiveness::new(&store, &infos);
+        let setcc = line("setne %r8b");
+        let widen = line("movzbl %r8b, %r8d");
+        let mask = 1u16 << 8; // %r8 family
+
+        // Oracle 1: the old implementation, verbatim.
+        let mut oracle = FileLiveness {
+            live_out: lv.live_out.clone(),
+            live_in: lv.live_in.clone(),
+            known: lv.known.clone(),
+            structural: lv.structural.clone(),
+            effect: lv.effect.clone(),
+            func_of: lv.func_of.clone(),
+            textual_ret: lv.textual_ret.clone(),
+        };
+        let (start, end) = oracle.recorded_function(&store, &infos, widen).unwrap();
+        oracle.reanalyse_with(&store, &infos, start, end, Some((setcc, widen, mask)));
+        let expected = oracle.known[widen].then(|| oracle.live_out[widen]);
+
+        // Snapshot every caller-visible field before the in-place probe.
+        let snap = (
+            lv.live_out.clone(),
+            lv.live_in.clone(),
+            lv.known.clone(),
+            lv.structural.clone(),
+            lv.effect.clone(),
+            lv.func_of.clone(),
+            lv.textual_ret.clone(),
+        );
+        let got = lv.live_after_dropping_region(&store, &infos, widen, setcc, widen, mask);
+        assert_eq!(got, expected, "probe answer matches the clone oracle");
+        assert_eq!(snap.0, lv.live_out, "live_out restored");
+        assert_eq!(snap.1, lv.live_in, "live_in restored");
+        assert_eq!(snap.2, lv.known, "known restored");
+        assert_eq!(snap.3, lv.structural, "structural restored");
+        assert_eq!(snap.4, lv.effect, "effect restored");
+        assert_eq!(snap.5, lv.func_of, "func_of untouched");
+        assert_eq!(snap.6, lv.textual_ret, "textual_ret restored");
+
+        // A second probe on the same span must agree with the first (the
+        // restore left no residue that could steer a later answer).
+        let again = lv.live_after_dropping_region(&store, &infos, widen, setcc, widen, mask);
+        assert_eq!(got, again, "probe is idempotent");
+    }
 
     /// `DeadWriteRefresh` keeps the solution exact without re-solving per
     /// deletion: after each deletion every family outside the pending read

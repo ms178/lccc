@@ -122,9 +122,11 @@ fn parse_disp_reg(s: &str) -> Option<(i64, &str)> {
     Some((disp, reg))
 }
 
-fn split_operands(ops: &str) -> Vec<&str> {
-    // AT&T operands: split on commas outside parentheses.
-    let mut out = Vec::new();
+fn split_operands(ops: &str) -> crate::common::inline_vec::InlineVec<&str, 6> {
+    // AT&T operands: split on commas outside parentheses.  The inline
+    // container keeps this zero-allocation per parsed line (DHAT: 190k
+    // heap blocks before).
+    let mut out = crate::common::inline_vec::InlineVec::new();
     let mut depth = 0i32;
     let mut start = 0;
     for (i, c) in ops.char_indices() {
@@ -159,8 +161,15 @@ fn writes_reg_family(dst: &str, arch: CfiArch, full: &str) -> bool {
     };
     match arch {
         CfiArch::X86_64 => {
+            // `r == full.replacen('r', "e", 1)` without the per-call String:
+            // every 64-bit family name starts with 'r', so the 32-bit alias
+            // is exactly 'e' + the same tail ("rsp" -> "esp", "rbp" -> "ebp").
+            let is_e_alias = match (full.strip_prefix('r'), r.strip_prefix('e')) {
+                (Some(ft), Some(rt)) => ft == rt,
+                _ => false,
+            };
             r == full
-                || r == &full.replacen('r', "e", 1)
+                || is_e_alias
                 || (full == "rsp" && (r == "sp" || r == "spl"))
                 || (full == "rbp" && (r == "bp" || r == "bpl"))
         }
@@ -176,7 +185,7 @@ enum Flow {
 
 struct Insn<'a> {
     mnem: &'a str,
-    ops: Vec<&'a str>,
+    ops: crate::common::inline_vec::InlineVec<&'a str, 6>,
 }
 
 fn parse_insn(t: &str) -> Option<Insn<'_>> {
@@ -339,9 +348,8 @@ fn materialized_stack_adjustments(
     arch: CfiArch,
 ) -> Vec<Option<i64>> {
     let sp = arch.sp();
-    let sfx = arch.suffix();
-    let add = format!("add{}", sfx);
-    let sub = format!("sub{}", sfx);
+    let add = arch.add_mn();
+    let sub = arch.sub_mn();
     let mut out = vec![None; body.len()];
     // Register and constant written by the previous instruction, if any.
     let mut prev: Option<(&'static str, i64)> = None;
@@ -446,7 +454,6 @@ fn step<'a>(
     unknown: &mut bool,
 ) -> (Flow, Option<&'a str>) {
     let slot = arch.slot();
-    let sfx = arch.suffix();
     let m = insn.mnem;
     let ops = &insn.ops;
     let sp = arch.sp();
@@ -468,9 +475,9 @@ fn step<'a>(
         return (Flow::Next, Some(ops[0]));
     }
 
-    let push_like = m == format!("push{}", sfx) || m == "push";
-    let pop_like = m == format!("pop{}", sfx) || m == "pop";
-    if push_like || m == format!("pushf{}", sfx) || m == "pushf" {
+    let push_like = m == arch.push_mn() || m == "push";
+    let pop_like = m == arch.pop_mn() || m == "pop";
+    if push_like || m == arch.pushf_mn() || m == "pushf" {
         bump(f, slot);
         return (Flow::Next, None);
     }
@@ -488,7 +495,7 @@ fn step<'a>(
         }
         return (Flow::Next, None);
     }
-    if m == format!("popf{}", sfx) || m == "popf" {
+    if m == arch.popf_mn() || m == "popf" {
         bump(f, -slot);
         return (Flow::Next, None);
     }
@@ -500,14 +507,14 @@ fn step<'a>(
         bump(f, -32);
         return (Flow::Next, None);
     }
-    if m == "leave" || m == format!("leave{}", sfx) {
+    if m == "leave" || m == arch.leave_mn() {
         // %sp = %fp; pop %fp.
         f.sp_off = f.fp_off.map(|o| o - slot);
         f.fp_off = None;
         f.cfa = CfaReg::Sp;
         return (Flow::Next, None);
     }
-    if m == "call" || m == format!("call{}", sfx) {
+    if m == "call" || m == arch.call_mn() {
         // The callee pops its return address, plus whatever its convention
         // makes it pop (`ret $N`); `None` when that is not known.
         match call_pop {
@@ -525,10 +532,10 @@ fn step<'a>(
     let Some(&dst) = ops.last() else {
         return (Flow::Next, None);
     };
-    let add = format!("add{}", sfx);
-    let sub = format!("sub{}", sfx);
-    let mov = format!("mov{}", sfx);
-    let lea = format!("lea{}", sfx);
+    let add = arch.add_mn();
+    let sub = arch.sub_mn();
+    let mov = arch.mov_mn();
+    let lea = arch.lea_mn();
     if is_reg(dst, sp) && ops.len() == 2 {
         let src = ops[0];
         if m == add || m == sub {
@@ -642,19 +649,17 @@ fn pic_setup_reg(insn: &Insn<'_>, arch: CfiArch, thunked: &[&str]) -> Option<&'s
 /// Prologue-region instructions: frame setup that cannot write a
 /// callee-saved register other than establishing %fp from %sp.
 fn is_prologue_insn(insn: &Insn<'_>, arch: CfiArch) -> bool {
-    let sfx = arch.suffix();
     let m = insn.mnem;
     if m == "endbr64" || m == "endbr32" || m == "nop" || m.starts_with("nop") {
         return true;
     }
-    if m == format!("push{}", sfx) {
+    if m == arch.push_mn() {
         return insn.ops.len() == 1 && insn.ops[0].starts_with('%');
     }
     if insn.ops.len() == 2 && is_reg(insn.ops[1], arch.sp()) {
-        let sub = format!("sub{}", sfx);
-        return m == sub && parse_imm(insn.ops[0]).is_some();
+        return m == arch.sub_mn() && parse_imm(insn.ops[0]).is_some();
     }
-    if m == format!("mov{}", sfx) && insn.ops.len() == 2 {
+    if m == arch.mov_mn() && insn.ops.len() == 2 {
         // %sp -> %fp, or a callee-saved register stored to a frame slot.
         if is_reg(insn.ops[0], arch.sp()) && is_reg(insn.ops[1], arch.fp()) {
             return true;
@@ -1077,7 +1082,14 @@ pub(crate) fn synthesize(
         }
         if !app && t == ".cfi_startproc" {
             if let Some(name) = prev_label.filter(|n| marked.contains(*n)) {
-                let want = format!(".size {}, .-{}", name, name);
+                // Matches exactly `.size NAME, .-NAME` without building the
+                // owned pattern: symbol names cannot contain `, ` or spaces,
+                // so splitting at the first `, .-` is unambiguous.
+                let is_size_line = |s: &str| {
+                    s.strip_prefix(".size ")
+                        .and_then(|r| r.split_once(", .-"))
+                        .is_some_and(|(a, b)| a == name && b == name)
+                };
                 let mut end = None;
                 for k in i + 1..lines.len() {
                     if lines[k].trim() != ".cfi_endproc" {
@@ -1087,7 +1099,7 @@ pub(crate) fn synthesize(
                         .iter()
                         .map(|s| s.trim())
                         .find(|s| !s.is_empty());
-                    if next == Some(want.as_str()) {
+                    if next.is_some_and(is_size_line) {
                         end = Some(k);
                         break;
                     }
@@ -1155,7 +1167,6 @@ fn call_pops(
     pops: CalleePops<'_>,
     debug: bool,
 ) -> Vec<Option<i64>> {
-    let sfx = arch.suffix();
     let mut out = vec![Some(0); body.len()];
     let mut indirect_lines = Vec::new();
     for (k, l) in body.iter().enumerate() {
@@ -1165,7 +1176,7 @@ fn call_pops(
         let Some(insn) = parse_insn(l.trim()) else {
             continue;
         };
-        if insn.mnem != "call" && insn.mnem != format!("call{}", sfx) {
+        if insn.mnem != "call" && insn.mnem != arch.call_mn() {
             continue;
         }
         let Some(&target) = insn.ops.first() else {
@@ -1237,9 +1248,8 @@ fn synthesize_function<'b>(
     // three passes below must agree on it or they would derive different CFA
     // rules for the same program point.
     let materialized = materialized_stack_adjustments(body, &ctx, arch);
-    let sfx = arch.suffix();
-    let push_m = format!("push{}", sfx);
-    let mov_m = format!("mov{}", sfx);
+    let push_m = arch.push_mn();
+    let mov_m = arch.mov_mn();
 
     // Pass 0: prologue region -> saved registers and the body state.
     let mut saves: Vec<(&str, i64)> = Vec::new();
@@ -1404,7 +1414,7 @@ fn synthesize_function<'b>(
                 );
                 // `call .Llocal` (the inline retpoline) is a push and a
                 // jump: the target runs with one more slot on the stack.
-                let local_call = (insn.mnem == "call" || insn.mnem == format!("call{}", sfx))
+                let local_call = (insn.mnem == "call" || insn.mnem == arch.call_mn())
                     .then(|| insn.ops.first().copied())
                     .flatten()
                     .filter(|tg| label_set.contains(tg))

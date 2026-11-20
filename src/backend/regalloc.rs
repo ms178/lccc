@@ -1817,23 +1817,40 @@ fn owned_live_segments(
     let mut segmented: FxHashSet<u32> = FxHashSet::default();
     for segment in &liveness.segments {
         segmented.insert(segment.value_id);
+    }
+    // Count each owner's pieces first so every per-owner vector is allocated
+    // once at its exact size: the entry().push() growth chains were 215k heap
+    // blocks per profiling TU.  The entry-insertion sequence below is kept
+    // identical to the single-pass version, so the map's layout (and any
+    // caller's iteration order) is unchanged.
+    let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
+    for segment in &liveness.segments {
+        *counts.entry(owner_of(segment.value_id)).or_insert(0) += 1;
+    }
+    for interval in &liveness.intervals {
+        if !segmented.contains(&interval.value_id) {
+            *counts.entry(owner_of(interval.value_id)).or_insert(0) += 1;
+        }
+    }
+    for segment in &liveness.segments {
+        let owner = owner_of(segment.value_id);
         owned
-            .entry(owner_of(segment.value_id))
-            .or_default()
+            .entry(owner)
+            .or_insert_with(|| Vec::with_capacity(counts[&owner] as usize))
             .push((segment.start, segment.end));
     }
     for interval in &liveness.intervals {
         if !segmented.contains(&interval.value_id) {
+            let owner = owner_of(interval.value_id);
             owned
-                .entry(owner_of(interval.value_id))
-                .or_default()
+                .entry(owner)
+                .or_insert_with(|| Vec::with_capacity(counts[&owner] as usize))
                 .push((interval.start, interval.end));
         }
     }
     for pieces in owned.values_mut() {
         pieces.sort_unstable();
-        let source = std::mem::take(pieces);
-        insert_segment_union(pieces, &source);
+        coalesce_sorted_segments(pieces);
     }
     owned
 }
@@ -1934,6 +1951,27 @@ fn fill_saved_callee_stretches(
 
 /// Merge two sorted segment sets into a normalized union. Adjacent pieces are
 /// combined: no candidate can use the zero-width boundary between them.
+/// Coalesce a SORTED segment vector in place: the exact recurrence of
+/// `insert_segment_union(empty, sorted)` (next.0 <= last.1 merges, with the
+/// same half-open boundary convention) without the fresh output vector the
+/// take-then-union idiom paid per value — DHAT priced that idiom at ~500k
+/// blocks across the allocator on the profiling TU.
+fn coalesce_sorted_segments(v: &mut Vec<(u32, u32)>) {
+    let mut w = 0usize;
+    for r in 0..v.len() {
+        let cur = v[r];
+        if w > 0 && cur.0 <= v[w - 1].1 {
+            if cur.1 > v[w - 1].1 {
+                v[w - 1].1 = cur.1;
+            }
+        } else {
+            v[w] = cur;
+            w += 1;
+        }
+    }
+    v.truncate(w);
+}
+
 fn insert_segment_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
     let mut all: Vec<(u32, u32)> = Vec::with_capacity(into.len() + added.len());
     let (mut i, mut j) = (0usize, 0usize);
@@ -4006,8 +4044,7 @@ fn build_coalesce_groups(
     }
     for pieces in segments_of.values_mut() {
         pieces.sort_unstable();
-        let source = std::mem::take(pieces);
-        insert_segment_union(pieces, &source);
+        coalesce_sorted_segments(pieces);
     }
     let load_def_types = unique_load_def_types(func);
     // (cast dest, cast src) edges where the cast is a bit-preserving no-op on
@@ -6364,8 +6401,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
                 for spans in occupied.values_mut() {
                     spans.sort_unstable();
-                    let source = std::mem::take(spans);
-                    insert_segment_union(spans, &source);
+                    coalesce_sorted_segments(spans);
                 }
                 // Phase 2f's ranking: the whole web's loop-weighted uses,
                 // then the shorter envelope (fewer holes consumed, more
@@ -15954,6 +15990,59 @@ mod phi_coalesce_tests {
         let mut occupied = vec![(1, 3), (8, 10)];
         insert_segment_union(&mut occupied, &[(3, 5), (6, 8), (12, 14)]);
         assert_eq!(occupied, vec![(1, 5), (6, 10), (12, 14)]);
+    }
+
+    /// `coalesce_sorted_segments` must agree with
+    /// `insert_segment_union(empty, sorted)` — the idiom it replaced — on
+    /// every shape: disjoint, touching (half-open hand-off), nested,
+    /// duplicated, and a deterministic pseudo-random sweep.
+    #[test]
+    fn in_place_coalesce_matches_union_from_empty() {
+        let oracle = |sorted: &[(u32, u32)]| -> Vec<(u32, u32)> {
+            let mut out = Vec::new();
+            insert_segment_union(&mut out, sorted);
+            out
+        };
+        let cases: Vec<Vec<(u32, u32)>> = vec![
+            vec![],
+            vec![(5, 9)],
+            vec![(1, 3), (3, 7)],          // touching: merges (<=)
+            vec![(1, 3), (4, 7)],          // gap of one: stays split
+            vec![(1, 10), (2, 5), (6, 9)], // nested
+            vec![(1, 4), (1, 4), (1, 4)],  // duplicates
+            vec![(0, 0), (0, 0), (1, 1)],  // empty segments
+        ];
+        for mut c in cases {
+            c.sort_unstable();
+            let want = oracle(&c);
+            let mut got = c.clone();
+            coalesce_sorted_segments(&mut got);
+            assert_eq!(got, want, "case {c:?}");
+        }
+        // Deterministic sweep: xorshift over dense coordinates to force
+        // every overlap relation, 200 vectors of up to 12 segments.
+        let mut st = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for _ in 0..200 {
+            let n = (next() % 12) as usize;
+            let mut v: Vec<(u32, u32)> = (0..n)
+                .map(|_| {
+                    let a = (next() % 24) as u32;
+                    let b = a + (next() % 6) as u32;
+                    (a, b)
+                })
+                .collect();
+            v.sort_unstable();
+            let want = oracle(&v);
+            let mut got = v.clone();
+            coalesce_sorted_segments(&mut got);
+            assert_eq!(got, want, "random case {v:?}");
+        }
     }
 
     #[test]
