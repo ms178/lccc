@@ -1149,6 +1149,8 @@ jobs:
         --lccc target/fastbuild/lccc --self-test
         run_gate asm_operand_equivalence python3 tests/regression/check_asm_operand_equivalence.py \
         --lccc target/fastbuild/lccc --gcc gcc-16 --self-test
+        run_gate kernel_driver_shapes python3 tests/regression/check_kernel_driver_shapes.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16 --self-test
         run_gate return_local_addr python3 tests/regression/check_return_local_addr.py \
         --lccc target/fastbuild/lccc --gcc gcc-16 --m32
         run_gate qualifier_composition python3 tests/regression/check_qualifier_composition.py \
