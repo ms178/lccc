@@ -318,11 +318,23 @@ fi
 # verdict <cc> <std> <extra-flags...> : 0 = accepted, 1 = rejected.
 # A non-zero exit AND an `error:` diagnostic both count as rejection; an
 # `error:` with rc=0 (recovered parse) must not be mistaken for success.
+# A refusal is only a verdict when the compiler UNDERSTOOD the request.  An
+# oracle that cannot honour the flags (ICX ships no 32-bit target at all: it
+# answers every `-m32` with "error: unsupported option") or that cannot write
+# its output (`cannot open output file`) has not judged the declaration, and
+# counting that as "rejects the shape" compares lccc against a refusal to
+# compile -- which is how an option-support difference would masquerade as a
+# front-end disagreement.  Such a result is UNUSABLE and is reported, never
+# scored.
 verdict() {
     local cc=$1 std=$2; shift 2
     local out rc
     out=$("$cc" "-std=$std" -O2 "$@" -c "$tmp/kr.c" -o "$tmp/kr.o" 2>&1) && rc=0 || rc=$?
-    if [ "$rc" -eq 0 ] && ! grep -q 'error:' <<<"$out"; then printf '0'; else printf '1'; fi
+    if grep -qiE "unsupported option|cannot open output file|no such file or directory" <<<"$out"; then
+        printf 'u'
+    elif [ "$rc" -eq 0 ] && ! grep -q 'error:' <<<"$out"; then printf '0'
+    else printf '1'
+    fi
 }
 
 kr_accept=(
@@ -422,6 +434,7 @@ for src in "${kr_semantic[@]}"; do kr_sources+=("$src"); done
 
 kr_bad=0
 kr_checks=0
+kr_unusable=()
 for abi in x86_64 i686; do
     if [ "$abi" = i686 ]; then lcc=$CCC_I686; lf=(-m32); gf=(-m32); else lcc=$CCC; lf=(); gf=(); fi
     if [ ! -x "$lcc" ]; then
@@ -435,6 +448,10 @@ for abi in x86_64 i686; do
             lv=$(verdict "$lcc" "$std_group" "${lf[@]}")
             for i in "${!kr_oracles[@]}"; do
                 ov=$(verdict "${kr_oracles[$i]}" "$std_group" "${gf[@]}")
+                if [ "$ov" = "u" ]; then
+                    kr_unusable+=("${kr_names[$i]} / $abi / $std_group")
+                    continue
+                fi
                 kr_checks=$((kr_checks + 1))
                 if [ "$lv" != "$ov" ]; then
                     printf 'FAIL: K&R %s %s %s %q lccc=%s oracle=%s\n' \
@@ -445,6 +462,14 @@ for abi in x86_64 i686; do
         done
     done
 done
+if [ "${#kr_unusable[@]}" -gt 0 ]; then
+    # Report each distinct (oracle / ABI / dialect) once: a whole block of
+    # shapes shares one cause, and no claim is made for an oracle that could
+    # not build them.
+    printf '%s\n' "${kr_unusable[@]}" | sort -u | while read -r line; do
+        printf 'K&R oracle note: %s could not build the fixture; no verdict claimed.\n' "$line"
+    done
+fi
 check "K&R 3-oracle verdict parity: $(( ${#kr_sources[@]} + ${#kr_gnu11[@]} )) shapes x 2 ABIs ($kr_checks comparisons)" "$kr_bad"
 
 # Layer 3: host-CPU execution. lccc owns the object; gcc 16.2 links it.
@@ -645,6 +670,7 @@ d_runtime=(
 
 d_bad=0
 d_checks=0
+d_unusable=()
 for abi in x86_64 i686; do
     if [ "$abi" = i686 ]; then lcc=$CCC_I686; lf=(-m32); gf=(-m32); else lcc=$CCC; lf=(); gf=(); fi
     if [ ! -x "$lcc" ]; then
@@ -656,6 +682,10 @@ for abi in x86_64 i686; do
         lv=$(verdict "$lcc" gnu11 "${lf[@]}")
         for i in "${!d_oracles[@]}"; do
             ov=$(verdict "${d_oracles[$i]}" gnu11 "${gf[@]}")
+            if [ "$ov" = "u" ]; then
+                d_unusable+=("${d_names[$i]} / $abi")
+                continue
+            fi
             d_checks=$((d_checks + 1))
             if [ "$lv" != "$ov" ]; then
                 printf 'FAIL: D %s %s %q lccc=%s oracle=%s\n' \
@@ -665,6 +695,11 @@ for abi in x86_64 i686; do
         done
     done
 done
+if [ "${#d_unusable[@]}" -gt 0 ]; then
+    printf '%s\n' "${d_unusable[@]}" | sort -u | while read -r line; do
+        printf 'D oracle note: %s could not build the fixtures; no verdict claimed.\n' "$line"
+    done
+fi
 printf 'D layer 1: %d declarator shapes x 2 ABIs x %d oracles = %d verdict comparisons\n' \
     "${#d_shapes[@]}" "${#d_oracles[@]}" "$d_checks"
 check "D array-derivation verdict parity: ${#d_shapes[@]} shapes x 2 ABIs ($d_checks comparisons)" "$d_bad"

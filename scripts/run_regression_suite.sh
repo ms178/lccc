@@ -6,7 +6,10 @@
 #   1. Compile + run with the current lccc build.
 #   2. Unless the .env sets LCCC_NO_COMPARE=1, also compile + run with GCC
 #      and require identical stdout+exit code.
-#   3. A/B DIFFERENTIAL: unless the .env sets LCCC_NO_AB=1, re-run every test
+#   3. A DIAGNOSTIC fixture (.env sets LCCC_EXPECT_REJECT=<substring>) is
+#      instead REQUIRED to fail the build with that substring in its
+#      diagnostics; stages 1, 2 and the A/B differential do not apply to it.
+#   4. A/B DIFFERENTIAL: unless the .env sets LCCC_NO_AB=1, re-run every test
 #      with CCC_NO_SMALL_SLOTS=1 and require identical output to the default
 #      run.  Width-partitioned 4-byte spill slots must be value-preserving;
 #      any divergence between the two configurations is a miscompile and
@@ -44,7 +47,7 @@ REPO=${LCCC_REPO:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 REG="$REPO/tests/regression"
 LCCC_BIN=${LCCC_BIN:-$REPO/target/fastbuild/lccc}
 GCC_BIN=${GCC_BIN:-gcc}
-GCC_INC="-I$(gcc -print-file-name=include)"
+GCC_INC="-I$("$GCC_BIN" -print-file-name=include)"
 I686_SYSROOT=${LCCC_I686_SYSROOT:-}
 FILTER=${1:-}
 WORK=$(mktemp -d /tmp/lccc-reg.XXXXXX)
@@ -178,7 +181,7 @@ run_one() {  # run_one <src> ; env may override CCC_NO_SMALL_SLOTS etc.
     # every one found so far was invisible to the output comparison below.
     # Opt out with LCCC_IR_VERIFY=0.
     if ! CCC_VERIFY_IR="${LCCC_IR_VERIFY:-1}" \
-         "$LCCC_BIN" $GCC_INC -O2 "${flags[@]}" "$src" -o "$obj" 2>"$WORK/cc.err"; then
+         "$LCCC_BIN" "$GCC_INC" -O2 "${flags[@]}" "$src" -o "$obj" 2>"$WORK/cc.err"; then
         echo "BUILDFAIL"; return
     fi
     if [[ "${LCCC_IR_VERIFY:-1}" != "0" ]] && grep -q '\[ir-verify\]' "$WORK/cc.err"; then
@@ -199,27 +202,52 @@ run_one() {  # run_one <src> ; env may override CCC_NO_SMALL_SLOTS etc.
     echo "$out|$ec"
 }
 
-for src in "$REG"/*.c; do
+for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
+    [[ -f $src ]] || continue
     name=$(basename "$src" .c)
     [[ -n $FILTER && $name != *$FILTER* ]] && continue
 
     # per-test env (LCCC_NO_COMPARE=1: lccc-only semantics; LCCC_NO_AB=1:
     # exempt from the small-slot A/B differential, see header)
     env_vars=()
-    if [[ -f "$REG/$name.env" ]]; then
+    if [[ -f "${src%.c}.env" ]]; then
         while IFS= read -r line; do
             [[ -z $line || $line == \#* ]] && continue
             env_vars+=("$line")
-        done < "$REG/$name.env"
+        done < "${src%.c}.env"
     fi
-    no_compare=0; no_ab=0
+    # LCCC_EXPECT_REJECT=<substring>: the translation unit is a DIAGNOSTIC
+    # fixture.  lccc must fail the build AND its diagnostics must contain the
+    # substring, so a regression that silently starts ACCEPTING the construct
+    # (or that rejects it for the wrong reason) turns the suite RED.  These
+    # fixtures have no binary to run and no oracle comparison to make, so the
+    # run/A-B stages are skipped by construction -- and they are the only way
+    # to pin a required rejection inside this runner.
+    no_compare=0; no_ab=0; expect_reject=""
     for e in "${env_vars[@]:-}"; do
         [[ $e == "LCCC_NO_COMPARE=1" ]] && no_compare=1
         [[ $e == "LCCC_NO_AB=1" ]] && no_ab=1
+        [[ $e == LCCC_EXPECT_REJECT=* ]] && expect_reject=${e#LCCC_EXPECT_REJECT=}
     done
+    if [[ -n "$expect_reject" ]]; then
+        flags=()
+        [[ -f "${src%.c}.flags" ]] && read -r -a flags < "${src%.c}.flags"
+        out=$(env "${env_vars[@]}" "$LCCC_BIN" "$GCC_INC" -O2 "${flags[@]}" -c "$src" -o "$WORK/reject.o" 2>&1) && ec=0 || ec=$?
+        if [[ $ec -eq 0 ]]; then
+            echo "FAIL  $name (expected a rejection, compiler accepted the TU)"
+            fail=$((fail+1)); FAILED+=("$name:accepted"); continue
+        fi
+        if (( ec >= 126 )) || ! grep -qF -- "$expect_reject" <<<"$out"; then
+            echo "FAIL  $name (rejected, but the diagnostic does not name '$expect_reject')"
+            echo "$out" | head -3 | sed 's/^/      /'
+            fail=$((fail+1)); FAILED+=("$name:wrong-diagnostic"); continue
+        fi
+        echo "PASS  $name (rejected with the expected diagnostic)"
+        pass=$((pass+1)); continue
+    fi
 
     # 1. lccc run (default configuration)
-    res=$(env ${env_vars[@]:-} bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+    res=$(env "${env_vars[@]}" bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
 
     if [[ $res == "BUILDFAIL" ]]; then
         echo "FAIL  $name (lccc build failed: $(head -3 "$WORK/cc.err" | tr '\n' ' '))"
@@ -246,7 +274,7 @@ for src in "$REG"/*.c; do
     # 2. GCC oracle comparison
     if [[ $no_compare -eq 0 ]]; then
         gflags=()
-        [[ -f "$REG/$name.flags" ]] && read -r -a gflags < "$REG/$name.flags"
+        [[ -f "${src%.c}.flags" ]] && read -r -a gflags < "${src%.c}.flags"
         # Rootless multilib sysroot for the oracle side: -m32 only.  The
         # sysroot's include dir answers <bits/*.h> ahead of the host's
         # (empty) i386 multiarch dir, and the -B prefixes make cc1/collect2
@@ -292,7 +320,7 @@ for src in "$REG"/*.c; do
 
     # 3. A/B differential: small slots on (default) vs off
     if [[ $no_ab -eq 0 ]]; then
-        res_ab=$(env ${env_vars[@]:-} CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_ab=$(env "${env_vars[@]}" CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_ab != "$res" ]]; then
             echo "FAIL  $name (A/B small-slot differential)"
             echo "      default : $(echo "$res" | head -2)"
@@ -305,7 +333,7 @@ for src in "$REG"/*.c; do
         # to reuse must never hold a live value at the moment of reuse, so the
         # two layouts must produce byte-identical program output. Divergence
         # here is a coloring soundness bug (2026-09-02 preboot-ZSTD class).
-        res_t2=$(env ${env_vars[@]:-} CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_t2=$(env "${env_vars[@]}" CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_t2 != "$res" ]]; then
             echo "FAIL  $name (A/B Tier-2 sharing differential)"
             echo "      default  : $(echo "$res" | head -2)"
@@ -318,7 +346,7 @@ for src in "$REG"/*.c; do
         # source-less values must produce identical program output. The full
         # opt/target matrix is covered by scripts/gla_equiv_check.sh; this arm
         # guards the default-on policy at the suite's -O2.
-        res_gla=$(env ${env_vars[@]:-} CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_gla=$(env "${env_vars[@]}" CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_gla != "$res" ]]; then
             echo "FAIL  $name (A/B GLA gate differential)"
             echo "      default(on) : $(echo "$res" | head -2)"

@@ -152,6 +152,15 @@ MARKER='FIX''ME'
 #        src/passes/bit_idioms_facts.rs next to the other bit_idioms gates,
 #        so the rewrite pays one read per process.  Raised to the
 #        measurement, exactly.
+#   150  2026-11-20: the switch-case relay threading gate
+#        (CCC_SWITCH_RELAY_THREAD, added with the relay-threading machinery) is
+#        resolved once per translation unit in `run_passes` and installed via
+#        `cfg_simplify::set_switch_relay_thread_enabled`, the shape every other
+#        switch above uses, so its `cfg_simplify.rs` read leaves the count and
+#        the GVN cast-rename knob -- which had pushed the measurement to 151 --
+#        is carried by the immutable per-module GVN context. The net
+#        change is zero reads against the tree this PR branched from: the two
+#        new opt-in knobs cost nothing here, so the budget stays 150.
 ENV_READ_BUDGET=150
 
 fail=0

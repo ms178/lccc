@@ -122,6 +122,14 @@ else
   echo "borescore-missing: no bore field in /proc/self/sched"
 fi
 echo "--- cpus ---"; grep -c '^processor' /proc/cpuinfo
+# Quiesce the kernel log before the sentinels. A printk that lands BETWEEN the
+# console writes of one echo() (e.g. the TSC clocksource calibration, which
+# fires ~2.35 s in) interleaves into the middle of the line and the sentinel
+# arrives non-contiguous on a console that is byte-exact. That is what the first
+# run measured: `...(){}[][ 2.350522] tsc: Refined TSC ...`. Raising
+# console_loglevel makes the stream deterministic, so a FAIL below can only mean
+# genuinely dropped or reordered bytes -- the defect this sentinel hunts.
+if [ -w /proc/sys/kernel/printk ]; then echo 1 > /proc/sys/kernel/printk; fi
 echo "--- serial integrity ---"
 # Sentinel that exercises the 8250 UART xmit path end to end. Every ttyS0
 # write above flows through kernel/printk + the initramfs write()s, but a
@@ -251,6 +259,18 @@ expect() { # expect <description> <grep-pattern>
     fail=1
   fi
 }
+
+# CRLF was normalized above. Accept exactly one complete literal record;
+# optional whitespace would also accept the lost spaces this gate detects.
+expect_contiguous() {
+  local desc=$1 line=$2 count
+  if count=$(LC_ALL=C grep -aFxc -- "$line" "$LOG") && [[ $count == 1 ]]; then
+    echo "PASS: $desc"
+  else
+    echo "FAIL: $desc (expected exactly one intact line, found ${count:-0})"
+    fail=1
+  fi
+}
 expect "kernel banner (lccc build)"        "Linux version .*lccc"
 expect "SCHED_BORE compiled in"            "CONFIG_SCHED_BORE=y"
 expect "BORE init banner in dmesg"        "BORE CPU Scheduler"
@@ -281,8 +301,10 @@ expect "2 CPUs online"                     "^2$"
 # Serial-integrity sentinels: must arrive verbatim. A console/xmit bug that
 # drops bytes or splits writes (defect (h), kfifo record-path corruption)
 # breaks the multi-word line or the trailing word of the hex line.
-expect "serial sentinel line verbatim"     "serial-ok the quick brown fox jumps over the lazy dog 0123456789 !\?%&/\(\)\{\}\[\]$"
-expect "serial sentinel hex line verbatim" "serial-ok addr=0xdeadbeef count=31415926 end$"
+expect_contiguous "serial sentinel line verbatim" \
+    "serial-ok the quick brown fox jumps over the lazy dog 0123456789 !?%&/(){}[]"
+expect_contiguous "serial sentinel hex line verbatim" \
+    "serial-ok addr=0xdeadbeef count=31415926 end"
 expect "validation ran to completion"      "LCCC KERNEL BOOT VALIDATION END"
 
 if [[ $fail -eq 0 ]]; then
