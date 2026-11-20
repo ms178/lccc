@@ -69,13 +69,14 @@ Defined in `mod.rs`.  Called when the built-in assembler is selected
           |    encoder/        |   | ElfWriterCore (cont.)  |
           | - Suffix inference |   |  (Second Pass)         |
           | - REX/VEX/EVEX    |   |  1. relax_jumps()      |
-          | - ModR/M + SIB    |   |  2. resolve_deferred   |
-          | - Displacement     |   |     _skips()           |
-          | - Immediate        |   |  3. resolve_deferred   |
-          | - Relocation       |   |     _byte_diffs()      |
-          |   generation       |   |  4. Update symbol vals |
-          |                    |   |  5. Resolve .size dirs  |
-          +--------------------+   |  6. resolve_internal   |
+          | - ModR/M + SIB    |   |  2. size_deferred      |
+          | - Displacement     |   |     _skips(); 1 and 2  |
+          | - Immediate        |   |     until both settle  |
+          | - Relocation       |   |  3. resolve_deferred   |
+          |   generation       |   |     _byte_diffs()      |
+          |                    |   |  4. Update symbol vals |
+          +--------------------+   |  5. Resolve .size dirs  |
+                                   |  6. resolve_internal   |
                                    |     _relocations()     |
                                    |  7. emit_elf() ->      |
                                    |     write_relocatable  |
@@ -439,16 +440,23 @@ jump's target into short range:
 
 Two categories of deferred work are resolved after jump relaxation:
 
-**Deferred `.skip` expressions** -- `resolve_deferred_skips()` evaluates
+**Deferred `.skip` expressions** -- `size_deferred_skips()` evaluates
 complex `.skip` expressions that reference labels.  The expression evaluator
 (from `backend::asm_expr`) supports arithmetic, comparison, bitwise, and
 unary operators with proper operator precedence.  Symbol references are
 resolved from `label_positions`.
 
-Skips are processed in reverse order within each section so that earlier
-insertions do not invalidate the offsets of later ones.  After each insertion,
-all subsequent label positions, numeric label positions, relocation offsets,
-jump offsets, and deferred byte diffs in the same section are adjusted.
+A gap starts empty and is resized to the value of its expression, in source
+order and on the spot, so that an expression measuring an earlier gap (the
+outer padding of a nested `ALTERNATIVE_2`) reads its size.  Every resize
+moves the label positions, numeric label positions, relocation offsets, jump
+offsets and deferred records behind the gap.  `settle_layout()` repeats the
+sizing, the alignment fix-up and `relax_jumps()` (from the short forms once
+more the first time, growing only afterwards) until a sizing pass changes
+nothing: the size of a gap, the branches that cross it and the padding
+behind it all depend on one another, and GNU as relaxes them in one loop as
+well.  A layout that never settles is refused with GNU as's "Infinite loop
+encountered whilst attempting to compute the addresses of symbols" message.
 
 **Deferred byte-sized symbol diffs** -- `resolve_deferred_byte_diffs()`
 resolves 1-byte and 2-byte `symbol_a - symbol_b` expressions.  Both symbols

@@ -352,6 +352,15 @@ enum SetBase {
     Sym(String),
 }
 
+/// Where `relax_jumps` starts from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Relax {
+    /// Every relaxable jump short; the ones that do not reach grow back.
+    FromShortest,
+    /// The sizes reached so far; the short jumps that no longer reach grow.
+    GrowOnly,
+}
+
 /// One relaxation-pass transition of a jump (see `relax_jumps`).
 enum JumpAction {
     /// Long form -> 2-byte short form (first, optimistic pass only).
@@ -577,6 +586,54 @@ impl Section {
             .zero_tail
             .checked_add(n)
             .ok_or_else(|| format!("section '{}' exceeds the addressable size", self.name))?;
+        Ok(())
+    }
+
+    /// Resize the run of `fill` bytes at `start..start + old` to `new` bytes.
+    ///
+    /// The run is a deferred `.skip`'s gap: every byte of it is the same, so
+    /// the edit happens at its end. In a NOBITS section the gap is zeros
+    /// wherever it lies, and the part past `data` is held-back tail -- a
+    /// size, with no ceiling.
+    fn resize_fill_run(
+        &mut self,
+        start: usize,
+        old: usize,
+        new: usize,
+        fill: u8,
+    ) -> Result<(), String> {
+        let end = start + old;
+        debug_assert!(end <= self.cursor_usize(), "the gap lies in the section");
+        if new < old {
+            let keep = start + new;
+            let stored = end.min(self.data.len());
+            if keep < stored {
+                self.data.drain(keep..stored);
+            }
+            self.zero_tail = self
+                .zero_tail
+                .saturating_sub((end - keep.max(stored)) as u64);
+            return Ok(());
+        }
+        let grow = new - old;
+        let nobits = self.section_type == SHT_NOBITS;
+        if nobits && end >= self.data.len() {
+            return self.hold_zeros(grow as u64);
+        }
+        // The size is computed from the layout and can be anything (`.skip
+        // (b - a) << 30`); refuse before the allocation, as GAS dies on a
+        // runaway pad as well.
+        if new > crate::backend::elf::MAX_DIRECTIVE_FILL {
+            return Err(format!(
+                ".skip: {new} bytes exceed the {}-byte directive limit",
+                crate::backend::elf::MAX_DIRECTIVE_FILL
+            ));
+        }
+        check_fill_fits(grow, &self.name)?;
+        // A NOBITS gap between instruction bytes stores nothing, so its fill
+        // byte is unobservable; zeros keep `data` honest.
+        let fill = if nobits { 0 } else { fill };
+        self.data.splice(end..end, std::iter::repeat_n(fill, grow));
         Ok(())
     }
 
@@ -1225,14 +1282,17 @@ fn tokenize_expr(expr: &str) -> Result<Vec<ExprToken>, String> {
 /// from parsed assembly items. Architecture-specific behavior is
 /// provided through the `X86Arch` trait parameter.
 /// A `.skip` whose size is not a compile-time constant at emission time
-/// (it references labels that are not yet resolved), so its fill bytes are
-/// spliced in later by `resolve_deferred_skips`.
+/// (it references labels that are not yet resolved). Its gap starts empty
+/// and is resized by `size_deferred_skips` until its length is the value
+/// of its expression in the final layout.
 #[derive(Clone, Debug)]
 pub struct DeferredSkip {
     /// Section the `.skip` was emitted into.
     pub sec_idx: usize,
     /// Section offset the gap starts at (== section length at emission time).
     pub offset: usize,
+    /// Fill bytes the gap holds so far, at `offset..offset + size`.
+    pub size: usize,
     /// Unresolved size expression.
     pub expr: String,
     /// Fill byte (the `.skip size, fill` second operand; 0 when omitted).
@@ -2128,6 +2188,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         self.deferred_skips.push(DeferredSkip {
                             sec_idx,
                             offset,
+                            size: 0,
                             expr: expr.clone(),
                             fill: *fill,
                             seq: self.seq,
@@ -3350,76 +3411,159 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     // ─── Deferred skip resolution (x86-64 and i686) ──────────────────
 
-    fn resolve_deferred_skips(&mut self) -> Result<(), String> {
-        let mut skips = std::mem::take(&mut self.deferred_skips);
-        // Ties (two deferred skips at the SAME offset) must be spliced in
-        // REVERSE source order. Each splice inserts at `offset`, pushing
-        // already-inserted bytes to the right, so processing them in source
-        // order would put the second gap's fill BEFORE the first gap's fill
-        // and silently permute the section contents (observed as
-        // `cc 90 90 90` where GNU as emits `90 90 90 cc`). `sort_by` is
-        // stable, so reversing the VECTOR (rather than negating the
-        // comparator, which leaves ties in source order) is what yields
-        // descending offsets with reversed ties.
-        skips.sort_by(|a, b| a.sec_idx.cmp(&b.sec_idx).then(a.offset.cmp(&b.offset)));
-        skips.reverse();
-
-        for skip in &skips {
-            // Destructure by reference: `skips` is detached from `self`, so
-            // the mutable borrows of `self` below are sound.
-            let DeferredSkip {
-                sec_idx,
-                offset,
-                expr,
-                fill,
-                seq,
-            } = skip;
-            // Temporarily insert "." (current position) into label_positions so
-            // expressions like "0b + 16 - ." can reference the directive's offset.
+    /// Give every deferred `.skip` the size its expression has in the
+    /// current layout. Returns the section of the last gap that changed,
+    /// `None` when every gap already had its size.
+    ///
+    /// One sweep in source order, each resize applied on the spot, so a
+    /// later expression is read against the gaps before it: the padding of
+    /// a nested ALTERNATIVE measures the code *and the padding* of the one
+    /// inside it (`741b-740b` spans the inner `.skip`). Sizing every
+    /// expression against the layout the sweep started from padded the
+    /// kernel's ALTERNATIVE_2 twice -- `__switch_to_asm` came out 13 bytes
+    /// of NOPs longer than GNU as's, and `.skip (b - a) * 2` behind another
+    /// deferred `.skip` took the gap between `a` and `b` for empty.
+    ///
+    /// A gap is resized at its END, under `shift_after`'s tie rule: an
+    /// empty gap shares its offset with the labels on both sides of the
+    /// directive and with any other empty gap there, and source order says
+    /// which of them the fill bytes precede. Two gaps at one offset
+    /// therefore fill in source order whichever grows first.
+    ///
+    /// A negative size is no gap, as in GNU as (which says so in a
+    /// warning).
+    fn size_deferred_skips(&mut self) -> Result<Option<usize>, String> {
+        let mut resized = None;
+        for i in 0..self.deferred_skips.len() {
+            let (sec_idx, offset, old, fill, seq) = {
+                let skip = &self.deferred_skips[i];
+                (skip.sec_idx, skip.offset, skip.size, skip.fill, skip.seq)
+            };
+            // "." is the directive's own position (`0b + 16 - .`), and
+            // numeric references the renaming pass left alone (`0b`, `1f`)
+            // resolve from there.
             self.label_positions
-                .insert(".".to_string(), (*sec_idx, *offset as u64));
-            // Pre-resolve numeric label references (e.g. "0b", "1f") in the expression
-            let resolved_expr = self.resolve_numeric_labels_in_expr(expr, *offset as u64, *sec_idx);
-            let val = self.evaluate_expr(&resolved_expr);
+                .insert(".".to_string(), (sec_idx, offset as u64));
+            let expr = self.resolve_numeric_labels_in_expr(
+                &self.deferred_skips[i].expr,
+                offset as u64,
+                sec_idx,
+            );
+            let value = self.evaluate_expr(&expr);
             self.label_positions.remove(".");
-            let val = val?;
-            let count = if val < 0 { 0usize } else { val as usize };
-            if count == 0 {
+            let new = usize::try_from(value?).unwrap_or(0);
+            if new == old {
                 continue;
             }
-            let section = &mut self.sections[*sec_idx];
-            if section.section_type == SHT_NOBITS && *offset >= section.data.len() {
-                // The gap opens inside the held zero tail (everything past
-                // `data` is tail), so it is more tail: a size, with no
-                // ceiling. Splicing into `data` here indexed past its end --
-                // `.bss; .zero 16; .skip 2f-1f` was an internal error.
-                section.hold_zeros(count as u64)?;
+            self.sections[sec_idx].resize_fill_run(offset, old, new, fill)?;
+            self.shift_after(sec_idx, offset + old, new as i64 - old as i64, Some(seq));
+            self.deferred_skips[i].size = new;
+            resized = Some(sec_idx);
+        }
+        Ok(resized)
+    }
+
+    /// Settle the layout: the jumps relaxed, the alignment padding fitted
+    /// and every deferred `.skip` sized, each against the others' final
+    /// state.
+    ///
+    /// The three depend on one another. A `.skip` measures code that
+    /// relaxation resizes; its fill moves alignment boundaries and pushes
+    /// branch targets out of reach; and another `.skip` may measure it.
+    /// GNU as relaxes all of them in one loop (`relax_segment`: `rs_space`
+    /// beside the branch and alignment frags) from the smallest state --
+    /// branches short, gaps empty -- until a pass changes nothing. Here:
+    ///
+    ///  1. every relaxable branch takes the shortest encoding that reaches
+    ///     while no gap exists yet (retpoline.S FILL_RETURN_BUFFER: the
+    ///     padded region holds a `jmp`, and sizing against its long form
+    ///     over-pads; objtool: "weirdly overlapping alternative!
+    ///     33 != 35");
+    ///  2. the gaps are sized against that layout;
+    ///  3. alignment is re-fitted and the branches are relaxed again, the
+    ///     first time from their short forms once more: the fill pushed
+    ///     some targets out of reach (sev.o: a `jmp` across two paddings
+    ///     whose displacement was patched before they existed landed
+    ///     inside an instruction; objtool: "can't find jump dest
+    ///     instruction"), and it can bring one back into reach by taking
+    ///     the place of alignment padding. From then on branches only
+    ///     grow, as in GNU as: a size that depends on a branch which
+    ///     depends on that size (a 130-byte replacement for a `jmp` over
+    ///     its own padding) would otherwise alternate for ever;
+    ///  4. back to 2 until no gap changes. The pass that changes none has
+    ///     read every expression against the layout the object is written
+    ///     from.
+    ///
+    /// Steps 1 to 3 once were the whole procedure, which is right when no
+    /// gap depends on another gap or on a branch that step 3 resizes. When
+    /// one does, its size described a layout that no longer existed: the
+    /// outer padding of the kernel's ALTERNATIVE_2 measured the inner one
+    /// as empty and padded a second time.
+    ///
+    /// Each further round is caused by a gap that changed. A layout that
+    /// only grows settles within one round per gap for each branch that
+    /// grows, and one whose gaps measure alignment padding can overshoot a
+    /// few times before it does. One that never settles
+    /// (`0: .skip 5 - (1f - 0b); 1:`) is refused, in GNU as's words and by
+    /// GNU as's rule -- the square of the number of things that can change
+    /// size -- instead of being written half-sized.
+    fn settle_layout(&mut self) -> Result<(), String> {
+        self.relax_jumps(Relax::FromShortest)?;
+        self.fit_alignment()?;
+        let resizable = self.deferred_skips.len()
+            + self
+                .sections
+                .iter()
+                .map(|s| s.jumps.len() + s.align_markers.len())
+                .sum::<usize>()
+            + 2;
+        let mut rounds_left = resizable.saturating_mul(resizable);
+        let mut relax = Relax::FromShortest;
+        loop {
+            let resized = if A::supports_deferred_skips() {
+                self.size_deferred_skips()?
             } else {
-                // Deferred skips resolve after labels are known — the
-                // expression can compute a huge runtime size (`.skip
-                // 1<<40`); refuse before the allocation (GAS dies on runaway
-                // pads as well).
-                if count > crate::backend::elf::MAX_DIRECTIVE_FILL {
+                None
+            };
+            match resized {
+                None if relax == Relax::GrowOnly => return Ok(()),
+                Some(sec_idx) if rounds_left == 0 => {
                     return Err(format!(
-                        ".skip: {count} bytes exceed the {}-byte directive limit",
-                        crate::backend::elf::MAX_DIRECTIVE_FILL
+                        "Infinite loop encountered whilst attempting to compute the \
+                         addresses of symbols in section {}",
+                        self.sections[sec_idx].name
                     ));
                 }
-                // A NOBITS gap between instruction bytes stores nothing, so
-                // its fill byte is unobservable; zeros keep `data` honest.
-                let fill = if section.section_type == SHT_NOBITS {
-                    0
-                } else {
-                    *fill
-                };
-                section
-                    .data
-                    .splice(*offset..*offset, std::iter::repeat_n(fill, count));
+                Some(_) => rounds_left -= 1,
+                // No gap, or none that needs a byte: the second relaxation
+                // still runs.
+                None => {}
             }
+            // Relaxation is the last to touch a section. Its final pass
+            // reads the layout it then patches the short displacements
+            // from, and a padding sweep after it can move a label without
+            // moving the branch that names it: a tight-loop marker decides
+            // from a span that holds the padding of the markers behind it,
+            // which the same sweep re-pads only afterwards, so one more
+            // sweep is not always the identity. With a `.p2align 4` in a
+            // tight loop of 50 bytes the marker was accepted and rejected
+            // in turn, and the sweep that used to follow this call took
+            // the header's padding away after `jmp` and `je` had been
+            // patched across it.
+            self.fit_alignment()?;
+            self.relax_jumps(relax)?;
+            relax = Relax::GrowOnly;
+        }
+    }
 
-            // Everything after the gap moves; a label at the gap start
-            // moves only if it was defined after the `.skip`.
-            self.shift_after(*sec_idx, *offset, count as i64, Some(*seq));
+    /// Re-pad the alignment markers of every section against the current
+    /// layout -- every section, not only the ones relaxation visits: it
+    /// keeps the markers of a section current only while it resizes that
+    /// section's branches (`.eh_frame` has none), and a gap moves markers
+    /// wherever it is.
+    fn fit_alignment(&mut self) -> Result<(), String> {
+        for sec_idx in 0..self.sections.len() {
+            self.fixup_alignment_markers(sec_idx)?;
         }
         Ok(())
     }
@@ -3901,75 +4045,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
         // GAS always carries the .text/.data/.bss trio, even for empty input.
         self.ensure_default_sections();
-        // `.skip` sizing and jump relaxation are MUTUALLY dependent, and the
-        // fixed-point they reach depends on the order. Two real kernel shapes
-        // pull in opposite directions:
-        //
-        //  (a) sev.o: a `jmp` walks OVER two ALTERNATIVE paddings. If jumps
-        //      are relaxed against the placeholder layout and the skips are
-        //      sized afterwards, the already-patched displacement is stale
-        //      and the branch lands mid-instruction (objtool: "can't find
-        //      jump dest instruction").
-        //  (b) retpoline.S FILL_RETURN_BUFFER: the padded region ITSELF
-        //      contains a relaxable `jmp`. Sizing the skip first measures the
-        //      long form, over-pads by a byte, and the recorded
-        //      `origlen = 742b-740b` describes code that no longer exists
-        //      (objtool: "weirdly overlapping alternative! 33 != 35").
-        //
-        // GNU as reaches the SMALLEST fixed point: relax first — while no
-        // padding exists, every branch picks its shortest encoding — then
-        // size the skips against that layout, re-fix alignment, and relax
-        // again so any branch crossing the new padding is re-patched. Both
-        // shapes are byte-identical to GAS under this order (regression:
-        // alt_skip_relax_order.s covers (b), the sev shape is covered by the
-        // second relax pass below).
-        //
-        // This first relax/fixup pass runs unconditionally, not gated on
-        // `A::supports_deferred_skips()`: it is answering a question
-        // ("what is the smallest fixed point for jump encodings before any
-        // `.skip` padding exists?") that has nothing to do with whether this
-        // architecture defers `.skip` sizing. The *second* relax_jumps()
-        // call below (needed regardless, to re-patch displacements after
-        // skips/alignment change layout) has always run unconditionally;
-        // gating only the first call on the trait method was an
-        // inconsistency, not a deliberate distinction — both concrete
-        // X86Arch impls (i686, x86-64) return `true` here today, so the two
-        // placements produce identical output for every currently-existing
-        // backend, but the unconditional form is the one that stays correct
-        // if a future arch ever overrides the default `false`.
-        self.relax_jumps()?;
-        for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx)?;
-        }
-        if A::supports_deferred_skips() {
-            self.resolve_deferred_skips()?;
-        }
-
-        // Apply `.p2align` / `.org` padding BEFORE relaxing jumps.
-        //
-        // `relax_jumps` re-runs `fixup_alignment_markers` after each size
-        // change, but only for sections that contain jumps, and only once it
-        // has already started moving things. Resolving the deferred `.skip`s
-        // above changed section sizes, so any alignment marker after a skip is
-        // stale at this point. Leaving it stale placed a function symbol at an
-        // unaligned address (`vc_do_mmio` at 0x2043 where GAS puts 0x2050) and
-        // objtool rejected the object with "can't find starting instruction".
-        //
-        // Running the fixup for every section first makes the pre-relaxation
-        // layout correct; `relax_jumps` then keeps it correct as it shrinks.
-        for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx)?;
-        }
-
-        // Relax long jumps to short form where possible.
-        self.relax_jumps()?;
-
-        // Fix alignment/org markers for EVERY section again: relaxation only
-        // maintains them for sections that actually contain jumps
-        // (.eh_frame never had its `.align` padding fixed up otherwise).
-        for sec_idx in 0..self.sections.len() {
-            self.fixup_alignment_markers(sec_idx)?;
-        }
+        // Branch relaxation, alignment padding and deferred `.skip` sizing
+        // decide one another's inputs; `settle_layout` runs them to their
+        // common fixed point.
+        self.settle_layout()?;
 
         // Enforce GAS's no-backwards rule on the *final* layout. Checking
         // during initial emission rejects valid fixed-size vector entries
@@ -4715,7 +4794,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     // ─── Jump relaxation ──────────────────────────────────────────────
 
-    fn relax_jumps(&mut self) -> Result<(), String> {
+    fn relax_jumps(&mut self, from: Relax) -> Result<(), String> {
         for sec_idx in 0..self.sections.len() {
             if self.sections[sec_idx].jumps.is_empty() {
                 continue;
@@ -4739,8 +4818,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // agreement comes for free.
             //
             // The first iteration therefore shrinks unconditionally; afterwards
-            // only growth is considered.
-            let mut first_pass = true;
+            // only growth is considered. A `GrowOnly` call has no shrinking
+            // iteration at all: it continues a relaxation whose deferred
+            // `.skip` gaps have since been resized, and a jump that grew
+            // stays long, as it does in GAS, whose relaxation loop never
+            // shortens a branch (see `settle_layout`).
+            let mut first_pass = from == Relax::FromShortest;
             loop {
                 let any_change;
                 let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
@@ -4804,12 +4887,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
                 // Growth passes decide in one sequential sweep, as GAS does
                 // (see `plan_jump_growth`), not against the pass's snapshot.
-                // A first pass that shrinks nothing is a growth pass too: the
-                // second `relax_jumps` call (after deferred `.skip`s resolve)
-                // starts with every jump already short, and a `.skip` that
-                // grew inside a loop must still grow its back-edge. A pass
-                // that does shrink leaves growth to the next pass, which it
-                // always forces.
+                // A first pass that shrinks nothing is a growth pass too
+                // (every jump may be short already). A pass that does shrink
+                // leaves growth to the next pass, which it always forces.
                 if !first_pass || actions.is_empty() {
                     for j_idx in self.plan_jump_growth(sec_idx, &local_labels) {
                         actions.push((j_idx, JumpAction::Grow));
@@ -6778,31 +6858,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The file bytes of section `name` in an ELF32 or ELF64 object.
     fn section_bytes(obj: &[u8], name: &str) -> Option<Vec<u8>> {
-        let e_shoff = u64::from_le_bytes(obj[40..48].try_into().unwrap()) as usize;
-        let e_shentsize = u16::from_le_bytes(obj[58..60].try_into().unwrap()) as usize;
-        let e_shnum = u16::from_le_bytes(obj[60..62].try_into().unwrap()) as usize;
-        let shstr = {
-            let shstr_idx = u16::from_le_bytes(obj[62..64].try_into().unwrap()) as usize;
-            let off = e_shoff + shstr_idx * e_shentsize;
-            let sh_offset =
-                u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
-            let sh_size = u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
-            &obj[sh_offset..sh_offset + sh_size]
-        };
-        for i in 0..e_shnum {
-            let off = e_shoff + i * e_shentsize;
-            let name_off = u32::from_le_bytes(obj[off..off + 4].try_into().unwrap()) as usize;
-            let mut end = name_off;
-            while shstr[end] != 0 {
-                end += 1;
+        let wide = obj[4] == 2;
+        let half = |at: usize| u16::from_le_bytes(obj[at..at + 2].try_into().unwrap()) as usize;
+        let word = |at: usize| u32::from_le_bytes(obj[at..at + 4].try_into().unwrap()) as usize;
+        // An address-sized field: 8 bytes in ELF64, 4 in ELF32.
+        let addr = |at: usize| {
+            if wide {
+                u64::from_le_bytes(obj[at..at + 8].try_into().unwrap()) as usize
+            } else {
+                word(at)
             }
-            if &shstr[name_off..end] == name.as_bytes() {
-                let sh_offset =
-                    u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
-                let sh_size =
-                    u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
-                return Some(obj[sh_offset..sh_offset + sh_size].to_vec());
+        };
+        // e_shoff, e_shentsize, e_shnum, e_shstrndx; then sh_offset and
+        // sh_size within a section header.
+        let (shoff, entsize, shnum, shstrndx, sh_offset, sh_size) = if wide {
+            (addr(40), half(58), half(60), half(62), 24, 32)
+        } else {
+            (addr(32), half(46), half(48), half(50), 16, 20)
+        };
+        let header = |i: usize| shoff + i * entsize;
+        let names = addr(header(shstrndx) + sh_offset);
+        for i in 0..shnum {
+            let start = names + word(header(i));
+            let len = obj[start..].iter().position(|&b| b == 0)?;
+            if &obj[start..start + len] == name.as_bytes() {
+                let offset = addr(header(i) + sh_offset);
+                let size = addr(header(i) + sh_size);
+                return Some(obj[offset..offset + size].to_vec());
             }
         }
         None
@@ -7352,6 +7436,242 @@ mod tests {
             "outer backedge at {outer_jmp} must be near jmp rel32 after padding, got {:02x}",
             text[outer_jmp]
         );
+    }
+
+    /// The kernel's ALTERNATIVE padding around `old`, measured against a
+    /// replacement of `new_len` bytes in `.altinstr_replacement`.
+    fn alternative(old: &str, new_len: usize) -> String {
+        format!(
+            "740:\n{old}741:\n\
+             \t.skip -(((744f-743f)-(741b-740b)) > 0) * ((744f-743f)-(741b-740b)),0x90\n\
+             742:\n\
+             \t.pushsection .altinstr_replacement,\"ax\"\n\
+             743:\n\t.fill {new_len},1,0xcc\n744:\n\
+             \t.popsection\n"
+        )
+    }
+
+    /// `n` copies of `byte` between a head and a tail.
+    fn run(head: &[u8], byte: u8, n: usize, tail: &[u8]) -> Vec<u8> {
+        [head, &vec![byte; n][..], tail].concat()
+    }
+
+    /// A nested ALTERNATIVE pads once. The outer `.skip` measures the inner
+    /// one (`741b-740b` spans it), so it is sized against the inner gap, not
+    /// beside it: `__switch_to_asm` (FILL_RETURN_BUFFER is an ALTERNATIVE_2)
+    /// carried 13 more bytes of NOPs than GNU as 2.47 gives it. Every image
+    /// here is GNU as's.
+    #[test]
+    fn a_nested_alternative_pads_once() {
+        // ALTERNATIVE_2: a 2-byte `jmp` against 31 and 13 bytes.
+        let inner = alternative("\tjmp .Lskip\n", 31);
+        let two = format!(".text\n{}.Lskip:\n\tret\n", alternative(&inner, 13));
+        assert_eq!(assemble_text(&two), run(&[0xeb, 0x1d], 0x90, 29, &[0xc3]));
+        // ALTERNATIVE_3: 7, then 13, then 9 bytes; the length the entry
+        // records (`742b-740b`) is the padded one.
+        let inner = alternative("\tjmp .Lskip\n", 7);
+        let middle = alternative(&inner, 13);
+        let three = format!(
+            ".text\n{}\t.byte 742b-740b\n.Lskip:\n\tret\n",
+            alternative(&middle, 9)
+        );
+        assert_eq!(
+            assemble_text(&three),
+            run(&[0xeb, 0x0c], 0x90, 11, &[13, 0xc3])
+        );
+        // The same on i686.
+        let dir = std::env::temp_dir().join(format!("lccc_alt32_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = ScratchDir(dir.clone());
+        let out = dir.join("m.o");
+        assemble32(&two, out.to_str().unwrap(), None).unwrap();
+        assert_eq!(
+            section_bytes(&std::fs::read(&out).unwrap(), ".text").unwrap(),
+            run(&[0xeb, 0x1d], 0x90, 29, &[0xc3])
+        );
+    }
+
+    /// A deferred `.skip` is the value of its expression in the layout the
+    /// object is written from -- whatever else that layout made it wait
+    /// for. Every image is GNU as 2.47's.
+    #[test]
+    fn deferred_skips_settle_with_the_layout_they_measure() {
+        // A gap behind another gap measures it.
+        assert_eq!(
+            assemble_text(
+                ".text\n0:\n\tnop\n1:\n\t.skip (1b-0b)*5, 0x90\n2:\n\
+                 \t.skip (2b-0b)*2, 0xcc\n3:\n\t.byte 3b-0b\n\tret\n"
+            ),
+            [&[0x90; 6][..], &[0xcc; 12][..], &[18, 0xc3][..]].concat()
+        );
+        // So does a gap in front of the one it measures.
+        assert_eq!(
+            assemble_text(
+                ".text\n0:\n\tnop\n1:\n\t.skip (3f-2f), 0x90\n2:\n\
+                 \t.skip (4f-3f)*3, 0xcc\n3:\n\tnop\n\tnop\n4:\n\
+                 \t.byte 4b-0b\n\tret\n"
+            ),
+            [&[0x90; 7][..], &[0xcc; 6][..], &[0x90, 0x90, 15, 0xc3][..]].concat()
+        );
+        // Two gaps at one offset fill in source order.
+        assert_eq!(
+            assemble_text(
+                ".text\n0:\n\tnop\n1:\n\t.skip (1b-0b)*3, 0xaa\n\
+                 \t.skip (1b-0b)*2, 0xbb\n2:\n\t.byte 2b-1b\n\tret\n"
+            ),
+            [0x90, 0xaa, 0xaa, 0xaa, 0xbb, 0xbb, 5, 0xc3]
+        );
+        // The padded region holds a `jmp` that its own padding pushes out
+        // of reach: the branch grows, and the gap gives the three bytes
+        // back (`742b-740b` is 200, the replacement's length).
+        let far = format!(
+            ".text\n{}\t.byte 742b-740b\n.Lskip:\n\tret\n",
+            alternative("\tjmp .Lskip\n", 200)
+        );
+        assert_eq!(
+            assemble_text(&far),
+            run(&[0xe9, 0xc4, 0, 0, 0], 0x90, 195, &[200, 0xc3])
+        );
+        // A gap grows a branch, and the branch grows a second gap.
+        let chain = |fill: usize| {
+            format!(
+                ".text\n0:\n\tjmp 2f\n1:\n\t.skip (4f-3f), 0x90\n2:\n\tret\n\
+                 5:\n\t.skip (1b-0b)*4, 0xcc\n6:\n\t.byte 6b-5b\n\
+                 \t.section .rodata\n3:\n\t.fill {fill}\n4:\n"
+            )
+        };
+        assert_eq!(
+            assemble_text(&chain(126)),
+            [
+                run(&[0xeb, 0x7e], 0x90, 126, &[0xc3]),
+                run(&[], 0xcc, 8, &[8])
+            ]
+            .concat()
+        );
+        assert_eq!(
+            assemble_text(&chain(130)),
+            [
+                run(&[0xe9, 0x82, 0, 0, 0], 0x90, 130, &[0xc3]),
+                run(&[], 0xcc, 20, &[20])
+            ]
+            .concat()
+        );
+        // A gap that measures alignment padding it moves: 2 * (1 + pad)
+        // bytes in front of a `.p2align 4` settles at ten.
+        assert_eq!(
+            assemble_text(
+                ".text\n0:\n\tnop\n1:\n\t.skip (3f-2f)*2, 0xcc\n2:\n\tnop\n\
+                 \t.p2align 4\n3:\n\t.byte 3b-0b\n\tret\n"
+            ),
+            [
+                run(&[0x90], 0xcc, 10, &[0x90]),
+                vec![0x0f, 0x1f, 0x40, 0x00, 16, 0xc3]
+            ]
+            .concat()
+        );
+    }
+
+    /// The short displacements are patched from the layout the object is
+    /// written from. A tight-loop marker whose span holds a `.p2align` is
+    /// accepted with the padding that the previous sweep left there and
+    /// rejected with the padding its own acceptance causes, so every sweep
+    /// moves the header and the join; the sweep that ran after the last
+    /// relaxation left `je` 15 bytes past its label and `jmp` 15 bytes
+    /// short of the header.
+    #[test]
+    fn no_padding_sweep_follows_the_last_displacement_patch() {
+        let text = assemble_text(
+            ".text\n.globl f\nf:\n\t.fill 15, 1, 0x90\n\
+             \t.lccc_tight_loop .L1\n.L1:\n\thlt\n\t.fill 14, 1, 0x90\n\
+             \tje .Lj\n\t.p2align 4\n.Lj:\n\tint3\n\t.fill 30, 1, 0x90\n\
+             \tjmp .L1\n\tret\n",
+        );
+        // No NOP of any length holds an opcode byte of the two branches.
+        let target = |opcode: u8| {
+            let at = text.iter().position(|&b| b == opcode).expect("branch");
+            (at as i64 + 2 + i64::from(text[at + 1] as i8)) as usize
+        };
+        assert_eq!(text[target(0x74)], 0xcc, "je reaches the join: {text:02x?}");
+        assert_eq!(
+            text[target(0xeb)],
+            0xf4,
+            "jmp reaches the header: {text:02x?}"
+        );
+    }
+
+    /// The second relaxation starts from the short forms again: fill in
+    /// front of a branch can take the place of alignment padding behind it
+    /// and bring the target into reach. 60 bytes of gap put this `jmp` 120
+    /// bytes from the boundary it was 180 bytes from (GNU as 2.47: `eb 78`,
+    /// 193 bytes).
+    #[test]
+    fn a_gap_can_bring_a_branch_target_back_into_reach() {
+        let text = assemble_text(
+            ".text\n0:\n\t.fill 10, 1, 0x90\n1:\n\t.skip (1b-0b)*6, 0xcc\n\
+             \tjmp 9f\n\t.fill 120, 1, 0x90\n\t.p2align 6, 0x11\n9:\n\tret\n",
+        );
+        assert_eq!(
+            text,
+            [
+                run(&[], 0x90, 10, &[]),
+                run(&[], 0xcc, 60, &[0xeb, 0x78]),
+                run(&[], 0x90, 120, &[0xc3])
+            ]
+            .concat()
+        );
+    }
+
+    /// The gaps of a NOBITS section are sizes: they grow, and shrink again,
+    /// without a byte being stored, also around an instruction.
+    #[test]
+    fn deferred_skips_in_nobits_grow_and_shrink() {
+        let data = |asm: &str| section_bytes(&assemble_object(asm), ".data").unwrap();
+        let words = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        // The second gap measures the first.
+        assert_eq!(
+            data(
+                ".text\n0:\n\tnop\n\tnop\n1:\n\t.bss\nb0:\n\t.skip (1b-0b)*8\nb1:\n\
+                 \t.skip (b1-b0)*2\nb2:\n\t.zero 4\n\t.data\n\t.long b2-b0\n"
+            ),
+            words(&[48])
+        );
+        // 100 bytes less a `jmp` that a later gap makes long: 98, then 95.
+        let shrinking = |tail: &str| {
+            format!(
+                ".text\n0:\n\tjmp 2f\n1:\n\t.skip (4f-3f), 0x90\n2:\n\tret\n\
+                 \t.section .rodata\n3:\n\t.fill 200\n4:\n\
+                 \t.bss\nb0:\n\t.skip 100 - (1b-0b)\nb1:\n{tail}"
+            )
+        };
+        assert_eq!(
+            data(&shrinking("\t.zero 1\n\t.data\n\t.long b1-b0\n")),
+            words(&[95])
+        );
+        assert_eq!(
+            data(&shrinking("\tnop\nb2:\n\t.data\n\t.long b1-b0, b2-b0\n")),
+            words(&[95, 96])
+        );
+    }
+
+    /// A size with no fixed point is refused, in GNU as's words, where it
+    /// used to be written as whatever the one evaluation gave.
+    #[test]
+    fn a_skip_that_never_settles_is_refused() {
+        for asm in [
+            // 5 and 0 in turn.
+            ".text\n0:\n\t.skip 5 - (1f - 0b), 0x90\n1:\n\tret\n",
+            // One more byte every time.
+            ".text\n0:\n\t.skip (1f - 0b) + 1, 0x90\n1:\n\tret\n",
+        ] {
+            for arch32 in [false, true] {
+                assert_eq!(
+                    assemble_err(asm, arch32),
+                    "Infinite loop encountered whilst attempting to compute the \
+                     addresses of symbols in section .text",
+                    "{asm}"
+                );
+            }
+        }
     }
 
     /// Assemble x86-64 `asm` and return the contents of section `name`.

@@ -630,6 +630,15 @@ def check_diag(lccc: Path, gcc: str, tmp: Path):
 # asm: the assembler against GNU as
 # --------------------------------------------------------------------------
 
+def alternative(old, new_len):
+    """The kernel's ALTERNATIVE around `old`, for a replacement of `new_len` bytes."""
+    return [
+        "740:", *old, "741:",
+        ".skip -(((744f-743f)-(741b-740b)) > 0) * ((744f-743f)-(741b-740b)),0x90",
+        "742:", '.pushsection .altinstr_replacement,"ax"', "743:", f".fill {new_len},1,0xcc", "744:", ".popsection",
+    ]
+
+
 # Each source is assembled by both. They must agree: the same bytes in .text
 # and .data, or a refusal from both. Lines are joined with newlines.
 ASM_CASES = {
@@ -703,6 +712,49 @@ ASM_CASES = {
         "invept (%rsi), %rdi", "invvpid (%r10), %r8",
     ],
     "vmx-wrong-direction": [".text", "vmread (%rdi), %rax"],
+    # -- GFNI in its EVEX forms (aria-gfni-avx512-asm_64.S) ------------------
+    "gfni-evex": [
+        ".text", "vgf2p8affineinvqb $0, %zmm1, %zmm2, %zmm3", "vgf2p8affineqb $0xc5, %zmm1, %zmm2, %zmm3",
+        "vgf2p8affineinvqb $5, (%rax), %zmm2, %zmm3", "vgf2p8affineinvqb $5, (%rax){1to8}, %zmm2, %zmm3",
+        "vgf2p8affineinvqb $5, %zmm17, %zmm2, %zmm30", "vgf2p8affineqb $1, 0x40(%rax), %zmm2, %zmm3{%k1}{z}",
+        "vgf2p8affineqb $1, %xmm17, %xmm2, %xmm3", "vgf2p8affineqb $1, (%rax){1to4}, %ymm2, %ymm3",
+        "vgf2p8mulb %zmm1, %zmm2, %zmm3", "vgf2p8mulb 0x40(%rax), %zmm2, %zmm3{%k2}", "vgf2p8mulb %ymm17, %ymm2, %ymm3",
+        "vgf2p8affineinvqb $5, %ymm1, %ymm2, %ymm3", "vgf2p8mulb %xmm1, %xmm2, %xmm3", "gf2p8mulb %xmm1, %xmm2",
+    ],
+    # -- deferred .skip: the size is the expression's value in the final layout
+    "alternative-2": [".text", *alternative(alternative(["jmp .Lskip"], 31), 13), ".Lskip:", "ret"],
+    "alternative-3": [
+        ".text", *alternative(alternative(alternative(["jmp .Lskip"], 7), 13), 9), ".byte 742b-740b", ".Lskip:", "ret",
+    ],
+    "alternative-far": [".text", *alternative(["jmp .Lskip"], 200), ".byte 742b-740b", ".Lskip:", "ret"],
+    "skip-measures-skip": [
+        ".text", "0:", "nop", "1:", ".skip (1b-0b)*5, 0x90", "2:", ".skip (2b-0b)*2, 0xcc", "3:", ".byte 3b-0b", "ret",
+    ],
+    "skip-measures-later-skip": [
+        ".text", "0:", "nop", "1:", ".skip (3f-2f), 0x90", "2:", ".skip (4f-3f)*3, 0xcc", "3:", "nop", "nop", "4:",
+        ".byte 4b-0b", "ret",
+    ],
+    "skips-at-one-offset": [
+        ".text", "0:", "nop", "1:", ".skip (1b-0b)*3, 0xaa", ".skip (1b-0b)*2, 0xbb", "2:", ".byte 2b-1b", "ret",
+    ],
+    "skip-grows-jump-grows-skip": [
+        ".text", "0:", "jmp 2f", "1:", ".skip (4f-3f), 0x90", "2:", "ret", "5:", ".skip (1b-0b)*4, 0xcc", "6:",
+        ".byte 6b-5b", ".section .rodata", "3:", ".fill 130", "4:",
+    ],
+    "skip-measures-padding": [
+        ".text", "0:", "nop", "1:", ".skip (3f-2f)*2, 0xcc", "2:", "nop", ".p2align 4, 0x11", "3:", ".byte 3b-0b", "ret",
+    ],
+    "skip-nobits": [
+        ".text", "0:", "jmp 2f", "1:", ".skip (4f-3f), 0x90", "2:", "ret", ".section .rodata", "3:", ".fill 200", "4:",
+        ".bss", "b0:", ".skip 100 - (1b-0b)", "b1:", ".skip (b1-b0)*2", "b2:", "nop", "b3:",
+        ".data", ".long b1-b0, b2-b0, b3-b0",
+    ],
+    "skip-takes-the-place-of-padding": [
+        ".text", "0:", ".fill 10, 1, 0x90", "1:", ".skip (1b-0b)*6, 0xcc", "jmp 9f", ".fill 120, 1, 0x90",
+        ".p2align 6, 0x11", "9:", "ret",
+    ],
+    "skip-without-fixed-point": [".text", "0:", ".skip 5 - (1f - 0b), 0x90", "1:", "ret"],
+    "skip-diverges": [".text", "0:", ".skip (1f - 0b) + 1, 0x90", "1:", "ret"],
 }
 
 
