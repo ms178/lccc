@@ -1763,6 +1763,8 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
 
     let operands = if operand_str.is_empty() {
         Vec::new()
+    } else if let Some(target) = grouped_branch_target(mnemonic, operand_str) {
+        vec![Operand::Label(target)]
     } else {
         parse_operands(operand_str)?
     };
@@ -1853,6 +1855,29 @@ fn parse_dfv_hint(s: &str) -> Result<(u8, &str), String> {
         return Err(format!("bad dfv hint: {{{inner}}}"));
     }
     Ok((dfv, s[close + 1..].trim_start()))
+}
+
+/// The target of a direct branch written with grouping: `jmp (sym)`,
+/// `call (sym)+0`, `jne ((sym)+2)`, as a `sym+N` label.
+///
+/// The operand of a `jmp`, `call`, `jcc` or `loop` that is not `*indirect`
+/// and names no register is an expression, parenthesised or not (GAS: a
+/// macro that expands to `(name)` is a fine branch target). The operand
+/// parser reads a leading `(` as the start of a base/index form, so these
+/// were refused: "unsupported jmp operand", "junk `+0` after expression in
+/// memory operand".
+fn grouped_branch_target(mnemonic: &str, operand: &str) -> Option<String> {
+    let mnemonic = mnemonic.to_ascii_lowercase();
+    let is_direct_branch =
+        mnemonic.starts_with('j') || mnemonic.starts_with("call") || mnemonic.starts_with("loop");
+    if !is_direct_branch || operand.starts_with('*') || operand.contains(['%', ',', '$']) {
+        return None;
+    }
+    match grouped_symbol_plus_offset(operand)? {
+        Displacement::SymbolPlusOffset(symbol, 0) => Some(symbol),
+        Displacement::SymbolPlusOffset(symbol, offset) => Some(format!("{symbol}{offset:+}")),
+        _ => None,
+    }
 }
 
 /// Split a line into mnemonic and operand string.
@@ -2877,7 +2902,42 @@ fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
             }
         }
     }
-    None
+    grouped_symbol_plus_offset(s)
+}
+
+/// One symbol plus a constant, written with grouping the scan in
+/// `try_parse_symbol_plus_offset` cannot see through: parentheses around the
+/// symbol, around a sum, or both.
+///
+/// des3_ede-asm_64.S addresses its S-boxes as `#define s2 ((s1) + (64*8))`,
+/// `#define s3 ((s2) + (64*8))` and so on, and loads `s8(%rip)`. No split at
+/// a `+` leaves a bare name on one side of `(.L_s1) + (64*8)`, so the whole
+/// text became the relocation's symbol: an undefined symbol by that name,
+/// seven of them in that file, and an object that cannot be linked.
+///
+/// The expression evaluator knows the grammar; the answer is taken when it
+/// is exactly one symbol with coefficient one. Anything else (two symbols,
+/// a scaled one, `.`) is not this pattern.
+fn grouped_symbol_plus_offset(s: &str) -> Option<Displacement> {
+    use asm_expr::{SectionExpr, eval_section_expr};
+    if !s.contains('(') {
+        return None;
+    }
+    let value = eval_section_expr::<String>(s, |name| {
+        if name == "." {
+            Err("the location counter is not a symbol".to_string())
+        } else {
+            Ok(SectionExpr::term(name.to_string(), 1))
+        }
+    })
+    .ok()?;
+    match value.terms() {
+        [(symbol, 1)] => Some(Displacement::SymbolPlusOffset(
+            symbol.clone(),
+            value.constant,
+        )),
+        _ => None,
+    }
 }
 
 /// Try to parse a `symbol+offset` or `symbol-offset` expression as an immediate value.

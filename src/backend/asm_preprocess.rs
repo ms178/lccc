@@ -24,9 +24,10 @@ pub enum CommentStyle {
     /// `#` and `//` (RISC-V GAS)
     HashAndSlashSlash,
     /// `//` and `@` (the ARM assembler's macro expansion) -- but `@` is not a
-    /// comment before type specifiers like `@function`, `@object`,
-    /// `@progbits`, `@nobits`, `@tls_object`, `@note`, nor in the macro
-    /// counter `\@`.
+    /// comment in the macro counter `\@`, nor where GNU as reads a type
+    /// after it: anywhere in a `.type`, `.section` or `.pushsection`
+    /// statement (`@gnu_indirect_function`, `@init_array`, ...), and before
+    /// the type words in any other.
     SlashSlashAndAt,
 }
 
@@ -124,6 +125,8 @@ fn utf8_char_len(lead: u8) -> usize {
 pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
     let bytes = line.as_bytes();
     let mut in_string = false;
+    // Start of the statement being scanned (`;` separates statements).
+    let mut statement = 0;
     let mut i = 0;
     while i < bytes.len() {
         if in_string {
@@ -149,6 +152,9 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
         if bytes[i] == b'\'' {
             i = crate::backend::asm_expr::skip_gas_char_literal(bytes, i);
             continue;
+        }
+        if bytes[i] == b';' {
+            statement = i + 1;
         }
         match style {
             CommentStyle::Hash => {
@@ -178,6 +184,7 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
                         && !after.starts_with("nobits")
                         && !after.starts_with("tls_object")
                         && !after.starts_with("note")
+                        && !takes_at_type(&line[statement..i])
                     {
                         return &line[..i];
                     }
@@ -187,6 +194,24 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
         i += 1;
     }
     line
+}
+
+/// `statement`, the text of a statement up to an `@`, is a directive whose
+/// operands name a type as `@word`: `.type sym, @gnu_indirect_function`,
+/// `.section name,"aw",@init_array`. GNU as for AArch64 has no `@` comment
+/// at all; the list of words that used to be spared one here missed
+/// `@gnu_indirect_function`, so the type was cut off, the symbol became an
+/// ordinary function, and every call went to the resolver instead of the
+/// function it picks.
+fn takes_at_type(statement: &str) -> bool {
+    let statement = statement.trim_start();
+    [".type", ".section", ".pushsection"]
+        .iter()
+        .any(|directive| {
+            statement
+                .strip_prefix(directive)
+                .is_some_and(|rest| rest.starts_with([' ', '\t']))
+        })
 }
 
 /// Split a line on `;` characters, respecting string literals, GAS character
@@ -2238,6 +2263,23 @@ mod tests {
             strip_comment(".type foo, @function", &style),
             ".type foo, @function"
         );
+        // Every type GNU as accepts after `@`, not a list of some of them.
+        for line in [
+            ".type foo, @gnu_indirect_function",
+            "\t.type\tfoo, @gnu_unique_object",
+            ".section .init_array,\"aw\",@init_array",
+            ".globl foo; .type foo, @gnu_indirect_function",
+            ".pushsection .text.x,\"ax\",@progbits",
+        ] {
+            assert_eq!(strip_comment(line, &style), line);
+        }
+        // A comment behind such a statement is still one, and so is `@`
+        // in any other statement.
+        assert_eq!(
+            strip_comment(".type foo, @function; ret @ done", &style),
+            ".type foo, @function; ret "
+        );
+        assert_eq!(strip_comment(".typeof x @ no", &style), ".typeof x ");
     }
 
     #[test]

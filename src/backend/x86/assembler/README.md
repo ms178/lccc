@@ -409,8 +409,34 @@ Relocations are generated for:
 
 ### Step 4: Jump Relaxation (elf_writer_common.rs)
 
-After the first pass, `relax_jumps()` attempts to shrink long-form jumps to
-short form:
+Before any jump is resized, `bind_jumps()` decides for each one whether its
+target is the layout's to resolve or the linker's. The whole input has been
+read by then, so a `.weak`, `.globl`, `.type` or visibility directive counts
+wherever it stands. The rules are GNU as's (`elf_symbol_resolved_in_segment_p`,
+`need_plt32_p`):
+
+| target, a label of the jump's own section | `jmp` / `jcc` | `loop` / `jrcxz` | `call` |
+|---|---|---|---|
+| local, or a local `.set` alias of one | resolved, shortest form | resolved | resolved |
+| global, default visibility | resolved; `sym@PLT`: `PLT32` | `PC8` | `PLT32` |
+| global, hidden / protected / internal | resolved, `sym@PLT` too | `PC8` | `PLT32` |
+| weak | `PLT32` | `PC8` | `PLT32` |
+| ifunc, whatever its binding | `PLT32`; local: `PC32` | `PC8` | relocated |
+
+A jump left to the linker keeps its near form and its relocation: `PLT32`
+when written `sym@PLT`, or in 64-bit code when it names a weak, global or
+undefined symbol itself; `PC32` otherwise (`sym+N` is not `sym`, and under
+`.code32` or on i686 only `@PLT` asks for a PLT entry). A weak definition
+resolved here could not be replaced at link time, and a jump to an ifunc went
+to its resolver.
+
+One deliberate difference from GNU as: `call sym` is marked `PLT32` whenever
+`sym` ends up global or weak. GNU as decides at the instruction and writes
+`PC32` when the label was already defined and `.globl` came later -- a
+relocation the linker refuses in a shared object.
+
+`relax_jumps()` then attempts to shrink the long-form jumps that are the
+layout's to short form:
 
 ```
 Long JMP:  E9 rel32   (5 bytes) --> Short JMP:  EB rel8  (2 bytes)  saves 3
@@ -458,6 +484,32 @@ behind it all depend on one another, and GNU as relaxes them in one loop as
 well.  A layout that never settles is refused with GNU as's "Infinite loop
 encountered whilst attempting to compute the addresses of symbols" message.
 
+The result is a layout in which every gap has the value of its expression
+and every branch reaches. GNU as's is one too, and almost always the same
+one; where several exist the two can differ, because GNU as relaxes a
+section before the sections after it have addresses. A `.skip` in `.text`
+that measures two labels of a *later* section separated by something of
+variable size (a `.fill`, a relaxable jump) is empty during that first
+relaxation, and a branch that was out of reach then stays long although the
+gap, once sized, brings its target back into reach:
+
+```
+0:      .fill 10, 1, 0x90
+        .skip (4f-3f), 0xcc     # 60 bytes of .rodata, known only later
+        jmp 9f                  # GNU as: e9 (257 bytes); here: eb (193)
+        .fill 120, 1, 0x90
+        .p2align 6
+9:      ret
+        .section .rodata
+3:      .fill 60
+4:
+```
+
+Following it would mean reproducing where GNU as happens to start a new
+fragment. The same source with the measured labels in the section itself,
+in an earlier section, or with nothing variable between them assembles to
+GNU as's bytes (the gate's `skip-takes-the-place-of-padding`).
+
 **Deferred byte-sized symbol diffs** -- `resolve_deferred_byte_diffs()`
 resolves 1-byte and 2-byte `symbol_a - symbol_b` expressions.  Both symbols
 must be in the same section; cross-section diffs are an error.
@@ -484,6 +536,11 @@ without the linker:
 
 - **`R_X86_64_PC32`** -- Same-section, local-symbol targets: the ELF formula
   `S + A - P` is applied and the result is patched into the section data.
+  Local means neither `.globl` nor `.weak` nor an ifunc, by the directives of
+  the whole file; a local `.set` alias of a label is at that label's place
+  (`SYM_FUNC_START_LOCAL_ALIAS`). The displacement of a near jump that
+  `bind_jumps()` kept for the layout is resolved whatever its target's
+  binding.
 
 - **`R_X86_64_PLT32`** -- Same-section, local-symbol targets: resolved
   identically to PC32.  A PLT32 against a local symbol in another section is
@@ -773,18 +830,33 @@ they reference labels that may not yet be defined, and whose positions may
 shift during jump relaxation.  These are deferred and evaluated after both
 relaxation and skip insertion are complete.
 
-### 6. Lazy Symbol Attribute Application
+### 6. Symbol Attributes Belong to the Whole File
 
-`.globl`, `.type`, `.hidden`, etc. are collected as "pending" attributes and
-only applied when a label definition (`name:`) is encountered.  This handles
-the common GAS pattern where attributes appear before the label.
+`.globl`, `.weak`, `.type`, `.hidden`, etc. are collected by name and read
+when the layout is settled and the object is written, never at the label:
+GNU as binds references after it has read the file, so the directive may
+stand before the label, after it, or after the last reference. A visibility
+only narrows (internal, hidden, protected), as in `obj_elf_visibility`.
 
 ### 7. Internal Labels via Section Symbols
 
-Labels starting with `.L` are treated as section-local.  In the ELF output,
-they are not emitted as named symbols.  Instead, relocations referencing them
-use the parent section's section symbol, with the addend adjusted to include
-the label's offset.  This matches GAS behavior.
+A relocation against a local label -- `.L` or not -- uses the section symbol
+of the label's section, with the label's offset in the addend, and `.L`
+labels are not written to the symbol table.  This matches GAS behavior, and
+so do the exceptions, where the relocation keeps the symbol and the symbol is
+written:
+
+- a TLS or GOT-slot relocation, which the linker resolves through the symbol;
+- a reference into a **mergeable** section (`"aM"`, `"aMS"`) that is
+  PC-relative or carries an addend. The linker reads `section + addend`
+  there as the address of an entry and relocates to wherever merging put
+  that entry; the `-4` of a RIP-relative reference is not part of an entry's
+  address. Only an absolute reference to the symbol itself is folded
+  (`tc_i386_fix_adjustable`, `adjust_reloc_syms`).
+
+The header of a mergeable section states its entity size, the argument after
+the type (`.section .rodata.cst16,"aM",@progbits,16`); a section that asks
+for merging without one is an ordinary section, with GNU as's warning.
 
 ### 8. CFI Directives Parsed but Not Emitted
 

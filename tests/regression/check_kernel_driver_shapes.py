@@ -808,6 +808,23 @@ ASM_CASES = {
         "jmp og", "call og", "jmp ow", "call ow", "jmp later",
         ".section .text.b", "later:", "ret",
     ],
+    # A `.set` alias is bound by its own attributes, at its label's place
+    # (aesni-intel_asm.S: `SYM_FUNC_START_LOCAL_ALIAS(_key_expansion_128)`).
+    "branch-to-alias": [
+        ".text", "f1:", "ret", ".set al, f1", ".set al2, al", ".globl gal", ".set gal, f1",
+        ".weak w", "w:", "ret", ".set alw, w",
+        "call al", "jmp al", "jne al2", "call gal", "jmp gal", "jmp alw", "loop al", "call alw",
+    ],
+    # One symbol plus a constant, however it is grouped (des3_ede-asm_64.S:
+    # `#define s2 ((s1) + (64*8))`, loaded as `s8(%rip)`), and a branch
+    # target written `(name)`.
+    "grouped-symbol-expression": [
+        ".section .rodata", ".Ls:", ".fill 64", ".text", "f:", "ret",
+        "leaq ((.Ls) + (4*8))(%rip), %rax", "leaq (((.Ls) + (4*8)) + (4*8))(%rip), %rbx",
+        "movq ((.Ls) + 8)(%rip), %rsi", "leaq ((.Ls)+(4*8))(,%rax,8), %rdi", "movq $((.Ls)+8), %rax",
+        "jmp (f)", "call (f)", "call (f)+0", "jne (f)", "jmp ((f)+1)", "loop (f)",
+        ".data", ".quad ((.Ls) + 8)", ".long (.Ls)+4 - .",
+    ],
     # A constant in a mergeable section is named by its symbol: the linker
     # reads `section + addend` there as an entry's address, and the -4 of a
     # RIP-relative reference is not part of one.
