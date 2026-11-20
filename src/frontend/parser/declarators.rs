@@ -1154,6 +1154,12 @@ impl Parser {
                 // (Inner dimensions are preserved in type_spec and evaluated by
                 // compute_vla_param_strides).
                 let mut vla_size_exprs = Vec::with_capacity(2);
+                // The dimension of an adjusted array of pointers to function
+                // or array (`(*h[n++])(void)`): evaluated at entry like any
+                // other, its type lives in the group's stars.
+                if let Some(expr) = self.attrs.param_group_array_dim.take() {
+                    vla_size_exprs.push(expr);
+                }
                 if !array_dims.is_empty() {
                     if let Some(Some(expr)) = array_dims.first() {
                         vla_size_exprs.push((**expr).clone());
@@ -1386,6 +1392,7 @@ impl Parser {
         // INSIDE a parenthesised group (`int (a[const 4])`), so resetting
         // after it would silently discard the adjusted pointer's const.
         self.attrs.param_adjusted_cvr = 0;
+        self.attrs.param_group_array_dim = None;
         let mut pointer_depth: u32 = 0;
         let mut is_restrict = false;
         // Space written after each leading `*`, in written order (see
@@ -1553,6 +1560,63 @@ impl Parser {
             paren_star_quals,
             outer_fn_returns,
         )
+    }
+
+    /// `(*h[N])(params)` and `(*h[N])[M]` declare an ARRAY of pointers to
+    /// function, or to array.  The array is the parameter's outermost
+    /// derivation and is adjusted to a pointer to its element (C11
+    /// 6.7.6.3p7), so the parameter is `(**h)(params)`, `(**h)[M]`: one more
+    /// star in the group, binding from the outside like the written ones.
+    /// Dropping the dimension instead typed `int (*h[])(struct S *)` as ONE
+    /// function pointer: every caller's table was a constraint violation, and
+    /// `h[i]` in the body was arithmetic on a function (Linux
+    /// `nested_vmx_hardware_setup(kvm_vmx_exit_handlers)`).
+    ///
+    /// Called behind the group's `)`.  When the group is such an array, its
+    /// dimensions are taken out of `dims`, the adjusted pointer's qualifiers
+    /// (the ones written in the brackets) join `star_quals`, and they are
+    /// returned with the first dimension for `restore_adjusted_group`: the
+    /// parameter list parsed next resets both attributes.  The caller counts
+    /// the adjusted array as one more star, outermost in the group.
+    fn adjust_array_group(
+        &mut self,
+        is_func_ptr: bool,
+        dims: &mut Vec<Option<Box<Expr>>>,
+        star_quals: &mut Vec<u8>,
+    ) -> Option<(u8, Option<Box<Expr>>)> {
+        let derives_more = (!is_func_ptr && matches!(self.peek(), TokenKind::LParen))
+            || (matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start());
+        if !derives_more || dims.is_empty() {
+            return None;
+        }
+        if dims.len() > 1 {
+            // A pointer to an array of such pointers has no encoding in
+            // `ParamDecl`; say so instead of mistyping it.
+            self.emit_error(
+                "sorry, unimplemented: parameter declared as a multidimensional array \
+                 of pointers to function or array"
+                    .to_owned(),
+                self.peek_span(),
+            );
+        }
+        let cvr = self.attrs.param_adjusted_cvr;
+        star_quals.push(cvr);
+        let first = dims.swap_remove(0);
+        dims.clear();
+        Some((cvr, first))
+    }
+
+    /// The outermost array of a parenthesised group was adjusted to a pointer
+    /// (`(*h[const n])(void)`): hand its qualifiers and its dimension to the
+    /// parameter under construction.  Called after the group's own parameter
+    /// list or pointee dimensions were parsed, because parsing those resets
+    /// the per-parameter attributes.  `None`: the group was no such array.
+    fn restore_adjusted_group(&mut self, group: Option<(u8, Option<Box<Expr>>)>) {
+        if let Some((cvr, dim)) = group {
+            self.attrs.param_adjusted_cvr = cvr;
+            self.attrs.set_pointer_const(cvr & CVR_CONST != 0);
+            self.attrs.param_group_array_dim = dim.map(|expr| *expr);
+        }
     }
 
     /// True when a nested parenthesised group contributes ONLY plain pointer
@@ -1853,10 +1917,15 @@ impl Parser {
             // These represent "array of pointers" and need to be propagated
             // to the caller so array-to-pointer decay is properly applied.
             // E.g. int (*a[]) = array of ptr-to-int = int **a (after decay)
-            let inner_array_dims =
+            let mut inner_array_dims =
                 self.parse_array_suffixes(ArrayDerivation::Outermost { prior: 0 });
             self.expect(&TokenKind::RParen);
-            if !inner_array_dims.is_empty() && !matches!(self.peek(), TokenKind::LParen) {
+            let adjusted =
+                self.adjust_array_group(*is_func_ptr, &mut inner_array_dims, paren_star_quals);
+            let extra_star = u32::from(adjusted.is_some());
+            inner_ptr_depth += extra_star;
+            *pointer_depth += extra_star;
+            if !inner_array_dims.is_empty() {
                 // Array of pointers: (*a[]) or (*a[N])
                 // The * gives one level of pointer, and the array dims are
                 // propagated for the caller to apply array-to-pointer decay.
@@ -1864,9 +1933,10 @@ impl Parser {
                 *pointer_depth += 1;
                 *array_dims = inner_array_dims;
             } else if !*is_func_ptr && matches!(self.peek(), TokenKind::LParen) {
-                // Function pointer: (*fp)(params) or (*fp[])(params)
+                // Function pointer: (*fp)(params) or (*fp[N])(params)
                 *fptr_inner_ptr_depth = inner_ptr_depth;
                 self.take_param_list(is_func_ptr, fptr_params, fptr_variadic, fptr_has_prototype);
+                self.restore_adjusted_group(adjusted);
             } else if matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
                 // Pointer-to-array: (*p)[N], (**p)[N]
                 //
@@ -1882,6 +1952,7 @@ impl Parser {
                 // parameter's outermost array derivation: `int (*a)[static 4]`
                 // is a constraint violation. `[*]` is still legal here.
                 ptr_to_array_dims.extend(self.parse_array_suffixes(ArrayDerivation::Nested));
+                self.restore_adjusted_group(adjusted);
             } else if !*is_func_ptr {
                 *pointer_depth += 1;
             }

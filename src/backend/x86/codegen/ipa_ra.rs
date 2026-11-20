@@ -814,6 +814,12 @@ fn insn_writes(t: &str, lookup: &dyn Fn(&str) -> Option<u16>) -> Option<u16> {
             }
             target_clobbers(ops, lookup)
         }
+        // The return, in its `-mfunction-return=thunk-extern` spelling.  The
+        // thunk hands the caller every register a `ret` would: it is patched
+        // over, or jumped to, at any return of any function, so it cannot own
+        // a scratch register.  GCC's `-fipa-ra` summarises such a callee the
+        // same way (`check_return_thunk_parity.py`).
+        "jmp" if s == crate::backend::x86_common::RETURN_THUNK_JUMP => Some(0),
         "jmp" | "jmpq" => {
             if ops.starts_with('*') {
                 return None; // jump table or indirect tail call
@@ -1117,6 +1123,33 @@ mod tests {
             "    movq %r99, %rax\n",
         ] {
             assert_eq!(text_clobbers(text, &none), None, "{text}");
+        }
+    }
+
+    /// A callee that returns through `__x86_return_thunk` is summarised like
+    /// its `ret` twin: the thunk is the return and owns no register.  Any
+    /// other symbol the text jumps to still has to have a summary.
+    #[test]
+    fn a_return_through_the_thunk_clobbers_what_a_ret_does() {
+        let body = "    leal 1(%rdi, %rdi, 2), %eax\n";
+        let plain = text_clobbers(&format!("{body}    ret\n"), &none);
+        assert_eq!(plain, Some(RAX | RDI));
+        assert_eq!(
+            text_clobbers(&format!("{body}    jmp __x86_return_thunk\n"), &none),
+            plain
+        );
+        for unknown in [
+            "    jmp __x86_return_thunk_ecx\n",
+            "    jmp __x86_return_thunk@PLT\n",
+            "    jne __x86_return_thunk\n",
+            "    call __x86_return_thunk\n",
+            "    jmp elsewhere\n",
+        ] {
+            assert_eq!(
+                text_clobbers(&format!("{body}{unknown}"), &none),
+                None,
+                "{unknown}"
+            );
         }
     }
 

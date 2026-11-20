@@ -3654,6 +3654,26 @@ impl Driver {
         Ok((asm, inline_instances))
     }
 
+    /// A by-value aggregate of one INTEGER eightbyte whose image exists only
+    /// to be read by its call is passed as the value itself (x86-64 psABI:
+    /// the same register, the same stack slot). After this step a call may
+    /// pass a scalar where the callee declares an aggregate, which only code
+    /// generation reads correctly, so nothing that pairs arguments with
+    /// parameters may follow it (see `passes::byval_scalar`).
+    /// Kill switch: CCC_DISABLE_PASSES=byvalscalar.
+    fn pass_one_register_aggregates_by_value(&self, module: &mut crate::ir::module::IrModule) {
+        if self.target == Target::X86_64
+            && self.opt_level >= 1
+            && !crate::passes::pass_disabled(
+                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                "byvalscalar",
+            )
+            && crate::passes::byval_scalar::run(module) != 0
+        {
+            crate::passes::verify::verify_after_pass(module, "byvalscalar");
+        }
+    }
+
     fn optimize_ir_module(
         &self,
         mut module: crate::ir::module::IrModule,
@@ -3886,6 +3906,10 @@ impl Driver {
                 crate::passes::verify::verify_after_pass(&module, "ipa_pta");
             }
         }
+
+        // After the last pass that pairs arguments with parameters (the
+        // inliner above, IPA-PTA); see `pass_one_register_aggregates_by_value`.
+        self.pass_one_register_aggregates_by_value(&mut module);
 
         // x86-64 hardware shifts mask their counts; drop the C-level masks
         // that only feed such counts. This must follow every semantic IR

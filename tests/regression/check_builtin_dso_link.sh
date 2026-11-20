@@ -11,7 +11,10 @@
 #   - the driver's implicit libm is not NEEDED by a program using no libm;
 #   - atexit (libc_nonshared.a, via the libc.so linker script) resolves in
 #     the executable as in the DSO;
-#   - a missing user -l library fails the link with GNU ld's diagnostic.
+#   - a missing user -l library fails the link with GNU ld's diagnostic;
+#   - so does an object or archive operand that is not there, in a program,
+#     a shared object and a `-r` link alike (three of the four targets linked
+#     the rest and exited zero).
 #   - DT_INIT/DT_FINI exist iff _init/_fini are defined: legacy .init/.fini
 #     fragments run in the program and its DSO (none on RISC-V, whose glibc
 #     has no crti frame -- as with GNU ld), and a `-shared -nostartfiles`
@@ -39,6 +42,20 @@ fail=0
 expect=$'dso ctor\nmain interposed 42\nmain atexit\ndso atexit'
 missing='cannot find -lno_such_lib_dsolink: No such file or directory'
 
+# absent FILE KIND COMMAND...: COMMAND names FILE, which does not exist, and
+# has to fail with GNU ld's diagnostic for it.  Adds to the caller's $why.
+absent() {
+    local file=$1 kind=$2 err
+    shift 2
+    if err=$("$@" 2>&1); then
+        why+=" linked-without-${file##*/}($kind)"
+    elif [ "$kind" = -r ] && grep -q 'requires the gcc_linker feature' <<<"$err"; then
+        : # no `-r` of its own on this target: refused for that, ahead of the operand
+    elif ! grep -qF "cannot find $file: No such file or directory" <<<"$err"; then
+        why+=" missing-${file##*/}($kind)-diagnostic=[${err//$'\n'/|}]"
+    fi
+}
+
 # leg LABEL CC READELF [RUNNER...]
 leg() {
     local label=$1 cc=$2 re=$3; shift 3
@@ -56,6 +73,15 @@ leg() {
     err=$("$cc" "$d/main.o" -L"$d" -lno_such_lib_dsolink -o "$d/bad" 2>&1) &&
         why+=" missing-lib-linked"
     grep -qF "$missing" <<<"$err" || why+=" missing-lib-diagnostic=[${err//$'\n'/|}]"
+    # A file operand that is not there: nothing is linked without it.  Each
+    # of these links succeeds with the operand left out, which is what three
+    # of the four targets did.
+    local gone
+    for gone in "$d/no_such_object.o" "$d/no_such_archive.a"; do
+        absent "$gone" program "$cc" "$d/main.o" "$gone" -L"$d" -ldso -o "$d/bad"
+        absent "$gone" -shared "$cc" -shared "$d/lib.o" "$gone" -o "$d/bad.so"
+        absent "$gone" -r "$cc" -r "$d/lib.o" "$gone" -o "$d/bad.o"
+    done
     dyn_exe=$("$re" -dW "$d/main")
     dyn_so=$("$re" -dW "$d/libdso.so")
     grep -q 'RUNPATH.*\[\$ORIGIN\]' <<<"$dyn_exe" || why+=" no-RUNPATH"

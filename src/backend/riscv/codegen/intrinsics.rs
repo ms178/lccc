@@ -22,8 +22,13 @@ impl RiscvCodegen {
                 self.state.emit("    fence ow, ow");
             }
             IntrinsicOp::Pause => {
-                // RISC-V pause hint (encoded as fence with specific args)
-                self.state.emit("    fence.tso");
+                // Zihintpause's `pause`, spelled as GCC spells it for a
+                // `-march` without the extension: the mnemonic needs it at
+                // assembly time, the encoding does not at run time (it is a
+                // `fence` HINT every core executes as a no-op).  `fence.tso`,
+                // emitted here before, is no hint: it is a real ordering
+                // barrier and cost a spin-wait loop one per turn.
+                self.state.emit("    .insn 0x0100000f");
             }
             IntrinsicOp::Clflush => {
                 // No RISC-V equivalent; emit fence as best approximation

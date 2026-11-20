@@ -48,13 +48,18 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, IrModule, Operand, Value};
 
 /// Resolve InlineAsm input symbols across all functions in the module.
-pub(crate) fn resolve_inline_asm_symbols(module: &mut IrModule) {
+///
+/// Returns how many operands were given a symbol.  Each of them stopped
+/// reading its value, so the instructions that computed it may be dead now.
+pub(crate) fn resolve_inline_asm_symbols(module: &mut IrModule) -> usize {
+    let mut named = 0;
     for func in &mut module.functions {
         if func.is_declaration || func.blocks.is_empty() {
             continue;
         }
-        resolve_in_function(func);
+        named += resolve_in_function(func);
     }
+    named
 }
 
 /// Lightweight, copyable reference to a value's defining instruction.
@@ -73,7 +78,7 @@ enum DefRef<'a> {
     Const(i64),
 }
 
-fn resolve_in_function(func: &mut IrFunction) {
+fn resolve_in_function(func: &mut IrFunction) -> usize {
     // ─── Fast-path Early Exit ──────────────────────────────────────────
     // 99.9% of functions in typical C code have zero inline assembly instructions,
     // or their inline asm operands already have resolved symbols.
@@ -109,7 +114,7 @@ fn resolve_in_function(func: &mut IrFunction) {
     }
 
     if !has_unresolved_asm {
-        return;
+        return 0;
     }
 
     // ─── Flat O(1) Definition Indexing ─────────────────────────────────
@@ -221,14 +226,28 @@ fn resolve_in_function(func: &mut IrFunction) {
         }
     }
     drop(defs);
+    let named = resolutions.len();
     for (bi, ii, i, sym) in resolutions {
-        if let Some(Instruction::InlineAsm { input_symbols, .. }) = func
+        if let Some(Instruction::InlineAsm {
+            inputs,
+            input_symbols,
+            ..
+        }) = func
             .blocks
             .get_mut(bi)
             .and_then(|b| b.instructions.get_mut(ii))
         {
             if i < input_symbols.len() {
                 input_symbols[i] = Some(sym);
+                // The operand is printed as that symbol from here on, and an
+                // immediate-only constraint has no other spelling: nothing
+                // reads the value.  Left as the operand it kept the address
+                // computation alive -- `leaq boot_cpu_data+74(%rip), %rax`
+                // ahead of every `static_cpu_has()`, for a register no
+                // instruction looks at.
+                if let Some(slot) = inputs.get_mut(i) {
+                    slot.1 = Operand::Const(IrConst::I64(0));
+                }
             }
         }
     }
@@ -243,6 +262,7 @@ fn resolve_in_function(func: &mut IrFunction) {
             }
         }
     }
+    named
 }
 
 /// Try to evaluate an Operand to a constant integer `i64`.

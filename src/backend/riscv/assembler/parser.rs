@@ -97,6 +97,8 @@ pub struct SectionInfo {
     pub sec_type: Option<String>,
     /// True when the directive explicitly included a flags field (even if empty).
     pub flags_explicit: bool,
+    /// The argument after the type: the entity size of a mergeable section.
+    pub entity_size: Option<String>,
 }
 
 /// A typed assembly directive. All argument parsing happens in the parser,
@@ -729,11 +731,13 @@ fn parse_section_args(args: &str) -> SectionInfo {
         String::new()
     };
     let sec_type = parts.get(2).map(|part| part.trim().to_string());
+    let entity_size = parts.get(3).map(|part| part.trim().to_string());
     SectionInfo {
         name,
         flags,
         sec_type,
         flags_explicit,
+        entity_size,
     }
 }
 

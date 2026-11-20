@@ -29,6 +29,11 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     if func.is_variadic || func.is_declaration || func.uses_sret {
         return 0;
     }
+    // The calls a GNU extern-inline body makes to its own name reach the
+    // symbol, not this body (`IrFunction::body_answers_call`).
+    if func.is_gnu_inline_def {
+        return 0;
+    }
     if func.blocks.is_empty() || func.params.len() != 1 {
         return 0; // Only handle single-parameter functions for now
     }

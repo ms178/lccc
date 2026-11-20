@@ -304,7 +304,7 @@ fn is_return_insn(trimmed: &str, target: Target) -> bool {
                 || trimmed == "retq"
                 || trimmed == "retl"
                 || trimmed.starts_with("ret $")
-                || trimmed == "jmp __x86_return_thunk"
+                || trimmed == crate::backend::x86_common::RETURN_THUNK_JUMP
         }
         Target::Aarch64 | Target::Riscv64 => trimmed == "ret",
     }

@@ -34,6 +34,7 @@
 //! - `ParamAllocaIndex`: O(1) per-function parameter-home index
 
 mod alloca_coalescing;
+mod alloca_sharing;
 mod analysis;
 pub(crate) mod copy_coalescing;
 mod graph_coloring;

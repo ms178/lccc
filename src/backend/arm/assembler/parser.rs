@@ -86,6 +86,8 @@ pub struct SectionDirective {
     pub name: String,
     pub flags: Option<String>,
     pub section_type: Option<String>,
+    /// The argument after the type: the entity size of a mergeable section.
+    pub entity_size: Option<String>,
 }
 
 /// Symbol kind from `.type` directive.
@@ -494,13 +496,16 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             };
             let values: Vec<&str> = values_str.split(',').map(|s| s.trim()).collect();
             let body = collect_block_body(lines, &mut i)?;
-            for val in &values {
+            for &val in &values {
                 // Substitute \var with val in each body line
                 let subst_body: Vec<String> = body
                     .iter()
                     .map(|line| {
-                        let pattern = format!("\\{}", var);
-                        asm_preprocess::replace_macro_param(line, &pattern, val)
+                        asm_preprocess::expand_macro_refs(
+                            line,
+                            |name| (name == var).then_some(val),
+                            None,
+                        )
                     })
                     .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
@@ -526,11 +531,11 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
                 let subst_body: Vec<String> = body
                     .iter()
                     .map(|line| {
-                        let pattern = format!("\\{}", var);
-                        let substituted =
-                            asm_preprocess::replace_macro_param(line, &pattern, &ch_str);
-                        // Strip GAS macro argument delimiters: \() resolves to empty string
-                        substituted.replace("\\()", "")
+                        asm_preprocess::expand_macro_refs(
+                            line,
+                            |name| (name == var).then_some(ch_str.as_str()),
+                            None,
+                        )
                     })
                     .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
@@ -1240,21 +1245,25 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             name: ".text".to_string(),
             flags: None,
             section_type: None,
+            entity_size: None,
         }),
         ".data" => AsmDirective::Section(SectionDirective {
             name: ".data".to_string(),
             flags: None,
             section_type: None,
+            entity_size: None,
         }),
         ".bss" => AsmDirective::Section(SectionDirective {
             name: ".bss".to_string(),
             flags: None,
             section_type: None,
+            entity_size: None,
         }),
         ".rodata" => AsmDirective::Section(SectionDirective {
             name: ".rodata".to_string(),
             flags: None,
             section_type: None,
+            entity_size: None,
         }),
         ".globl" | ".global" => AsmDirective::Global(args.trim().to_string()),
         ".weak" => AsmDirective::Weak(args.trim().to_string()),
@@ -2353,10 +2362,12 @@ fn parse_section_directive(args: &str) -> Result<AsmDirective, String> {
         .unwrap_or_else(|| ".text".to_string());
     let flags = parts.get(1).map(|s| s.trim().trim_matches('"').to_string());
     let section_type = parts.get(2).map(|s| s.trim().to_string());
+    let entity_size = parts.get(3).map(|s| s.trim().to_string());
     Ok(AsmDirective::Section(SectionDirective {
         name,
         flags,
         section_type,
+        entity_size,
     }))
 }
 

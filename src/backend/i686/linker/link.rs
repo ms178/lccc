@@ -101,12 +101,7 @@ fn search_dirs(args: &LinkerArgs, lib_paths: &[&str]) -> Vec<String> {
 fn prepare(user_args: &[String], is_shared: bool) -> Result<(LinkerArgs, LinkOptions), String> {
     let args = linker_common::parse_linker_args(user_args);
     let mut opts = check_capabilities(&args, user_args, is_shared)?;
-    if let Some(missing) = args.missing_inputs.first() {
-        return Err(format!(
-            "cannot find {}: No such file or directory",
-            missing
-        ));
-    }
+    args.require_inputs()?;
     if !opts.dynamic_list_paths.is_empty() {
         opts.dynamic_list =
             linker_common::DynamicList::parse_files(&opts.dynamic_list_paths)?.unwrap_or_default();

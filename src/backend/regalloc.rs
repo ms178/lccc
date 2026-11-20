@@ -981,6 +981,31 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
             | IntrinsicOp::VecZeroI32x4 => RDX,
             _ => NONE,
         },
+        // An asm statement whose two operands are staged in the emitter's
+        // first two scratch registers: `%rcx` and `%rdx`.  It is no call point
+        // (`liveness::x86_64_asm_stages_in_fixed_scratch`), so this is what
+        // keeps a value out of `%rdx` across it.  One staged operand takes
+        // `%rcx` alone; any other asm is a call point, which no caller-saved
+        // home lives across in the first place.
+        Instruction::InlineAsm {
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            input_symbols,
+            ..
+        } => {
+            match crate::backend::liveness::x86_64_asm_stages_in_fixed_scratch(
+                outputs,
+                inputs,
+                clobbers,
+                operand_types,
+                input_symbols,
+            ) {
+                Some(staged) if staged >= 2 => RDX,
+                _ => NONE,
+            }
+        }
         _ => NONE,
     }
 }
@@ -1388,6 +1413,14 @@ fn x86_rdx_clobbers_allow_param_homes(func: &IrFunction, ra_config: &RaConfig) -
     all_admitted && !x86_body_has_wide_ops(func)
 }
 
+/// Whether an asm output constraint admits memory and nothing else (`=m`,
+/// `+m`, `=o`): the operand's value is then the ADDRESS the statement writes
+/// through, which the emitter only reads.
+fn asm_output_is_memory_only(constraint: &str) -> bool {
+    let class = constraint.trim_start_matches(['=', '+', '&', '%']);
+    !class.is_empty() && class.chars().all(|c| matches!(c, 'm' | 'o' | 'V'))
+}
+
 /// The `%rdx`-clobber classes whose only `%rdx` write is the instruction
 /// itself, at its own program point (see
 /// [`x86_rdx_clobbers_allow_param_homes`]).
@@ -1418,7 +1451,13 @@ fn x86_narrow_rdx_clobber(inst: &Instruction) -> bool {
             | Instruction::AtomicStore { ty, .. }
             if !matches!(ty, IrType::I128 | IrType::U128)
     ) && !x86_inst_fixed_scratch(inst).rdi;
-    narrow_divlike || narrow_atomic
+    // An asm statement staged in the fixed scratch writes %rdx while it loads
+    // its second operand and inside its template, nowhere else; the operands
+    // are loaded in the order their registers are taken, %rcx first, and the
+    // wave keeps every value live into the point out of %rdx.
+    let staged_asm =
+        matches!(inst, Instruction::InlineAsm { .. }) && x86_inst_fixed_scratch(inst).rdx;
+    narrow_divlike || narrow_atomic || staged_asm
 }
 
 /// Whether the parameters of an x86-64 body may fill the free stretches of
@@ -1508,7 +1547,8 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
 
 /// The part of [`x86_param_caller_homes_safe_with_config`] that does not
 /// depend on which registers the body's emitters stage through: the entry
-/// prefix is `Alloca`s and `ParamRef`s only, there is no inline assembly,
+/// prefix is `Alloca`s and `ParamRef`s only, no inline assembly names a
+/// register,
 /// an inline-expanded `memcpy`/`memset` is followed by no parameter read,
 /// and a multi-block body takes all its arguments in registers.
 fn x86_param_homes_shape_ok(func: &IrFunction, ra_config: &RaConfig) -> bool {
@@ -1544,12 +1584,18 @@ fn x86_param_homes_shape_ok(func: &IrFunction, ra_config: &RaConfig) -> bool {
     // on. So a parameter read only before the first call stays in its ABI
     // register (`f(p) { x = p->a; g(x); }` paid push/mov/pop of %rbx for it),
     // and one live across a call still takes a callee-saved home. Inline asm
-    // may clobber argument registers without a precise clobber list: it
-    // keeps the conservative path.
+    // that stages an operand in a register, or lists one as clobbered, keeps
+    // the conservative path: the emitter's scratch registers are the
+    // argument registers, and nothing here says which one an operand takes.
+    // An asm that names no register at all (`liveness::instruction_is_call_point`
+    // -- `cpu_relax()`'s `rep; nop`, a static key's `nop`, `barrier()`)
+    // leaves them alone, and a function is not made to save three registers
+    // for its parameters because it spins on one.
     if func.blocks.iter().any(|b| {
-        b.instructions
-            .iter()
-            .any(|inst| matches!(inst, Instruction::InlineAsm { .. }))
+        b.instructions.iter().any(|inst| {
+            matches!(inst, Instruction::InlineAsm { .. })
+                && crate::backend::liveness::instruction_is_call_point(inst)
+        })
     }) {
         return false;
     }
@@ -5405,6 +5451,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // while rotation's false-dependency avoidance is moot under renaming
     // (benchmark programs: 333 -> 320 pushes at -O2, Ir neutral).
     allocator.prefer_touched = true;
+    // A call-spanning value has this pool or a stack slot: none of its
+    // registers stays idle while one of them was demoted for a loop.
+    allocator.rescue_demoted_spans = true;
     allocator.run();
     let mut assignments = allocator.assignments;
     // Wave two: the hot-loop promotion, which is an optimisation and may only
@@ -12760,15 +12809,44 @@ fn remove_ineligible_operands(
                     eligible.remove(&ptr.0);
                 }
                 Instruction::InlineAsm {
-                    outputs, inputs, ..
+                    outputs,
+                    inputs,
+                    clobbers,
+                    operand_types,
+                    input_symbols,
+                    ..
                 } => {
                     if !config.allow_inline_asm_regalloc {
-                        for (_, val, _) in outputs {
-                            eligible.remove(&val.0);
+                        // x86-64, a statement staged in the fixed scratch
+                        // (`liveness::x86_64_asm_stages_in_fixed_scratch`):
+                        // whatever the emitter READS keeps its register.  An
+                        // input is copied out of its home, or addressed
+                        // through it, by the loads every other instruction
+                        // uses, and neither %rcx nor a %rdx this statement
+                        // takes is the home of a value live into it.  So does
+                        // the address of a memory output, which is read, not
+                        // written.  A register output stays in its slot: the
+                        // write-back tells a value the statement defines from
+                        // a pointer it stores through by that slot.
+                        let reads_keep_homes =
+                            crate::backend::liveness::x86_64_asm_stages_in_fixed_scratch(
+                                outputs,
+                                inputs,
+                                clobbers,
+                                operand_types,
+                                input_symbols,
+                            )
+                            .is_some();
+                        for (constraint, val, _) in outputs {
+                            if !(reads_keep_homes && asm_output_is_memory_only(constraint)) {
+                                eligible.remove(&val.0);
+                            }
                         }
-                        for (_, op, _) in inputs {
-                            if let Operand::Value(v) = op {
-                                eligible.remove(&v.0);
+                        if !reads_keep_homes {
+                            for (_, op, _) in inputs {
+                                if let Operand::Value(v) = op {
+                                    eligible.remove(&v.0);
+                                }
                             }
                         }
                     }
@@ -22176,6 +22254,72 @@ mod wide_hazard_tests {
         narrow.return_type = IrType::U64;
         assert!(x86_param_caller_homes_safe_with_config(&narrow, &config));
         assert!(!x86_wide_body_param_overflow_safe(&narrow, &config));
+    }
+
+    /// `while (!*p) cpu_relax();` and a static key name no register, and an
+    /// operand staged in the fixed scratch takes none the allocator owns: the
+    /// parameters stay in the registers they arrived in.  A clobbered
+    /// register, or more operands than the fixed scratch holds, keeps the
+    /// callee-saved homes.
+    #[test]
+    fn an_asm_that_names_no_register_leaves_the_parameters_in_theirs() {
+        let config = RaConfig::default();
+        let asm = |template: &str,
+                   inputs: Vec<(String, Operand, Option<String>)>,
+                   symbols: Vec<Option<String>>,
+                   clobbers: &[&str]| {
+            let mut f = one_block(
+                vec![
+                    param(0, 0, IrType::U64),
+                    param(1, 1, IrType::U64),
+                    Instruction::InlineAsm {
+                        template: template.into(),
+                        outputs: vec![],
+                        operand_types: vec![IrType::U64; inputs.len()],
+                        inputs,
+                        clobbers: clobbers.iter().map(|c| c.to_string()).collect(),
+                        goto_labels: vec![],
+                        input_symbols: symbols,
+                        seg_overrides: vec![],
+                    },
+                    binop(3, IrBinOp::Add, 0, 1, IrType::U64),
+                ],
+                3,
+            );
+            f.return_type = IrType::U64;
+            x86_param_caller_homes_safe_with_config(&f, &config)
+        };
+        let immediate = |c: i64| ("i".to_string(), Operand::Const(IrConst::I64(c)), None);
+        assert!(asm("rep; nop", vec![], vec![], &["memory"]));
+        assert!(asm(
+            "1: nop\n.quad %c0 + %c1 - .",
+            vec![immediate(0), immediate(1)],
+            vec![Some("key".into()), None],
+            &[],
+        ));
+        // One register operand, and an immediate that has not become one:
+        // %rcx, which is no parameter's home.
+        assert!(asm(
+            "incq %0",
+            vec![("r".to_string(), v(0), None)],
+            vec![None],
+            &[],
+        ));
+        assert!(asm(
+            ".quad %c0",
+            vec![("i".to_string(), v(1), None)],
+            vec![None],
+            &[],
+        ));
+        // Two take %rdx as well: the statement is a %rdx clobber at its own
+        // point, which the position-aware model admits.
+        let two = vec![("r".to_string(), v(0), None), ("r".to_string(), v(1), None)];
+        assert!(asm("addq %1, %0", two.clone(), vec![None, None], &[]));
+        // A clobbered register, and a third operand.
+        assert!(!asm("cpuid", vec![], vec![], &["rbx"]));
+        let mut three = two;
+        three.push(("r".to_string(), v(0), None));
+        assert!(!asm("leaq (%1,%2), %0", three, vec![None; 3], &[]));
     }
 
     #[test]

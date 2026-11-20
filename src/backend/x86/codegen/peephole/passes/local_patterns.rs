@@ -754,7 +754,7 @@ pub(super) fn delete_dead_vector_epilogue_stores(
                 continue 'cand;
             }
             let t = infos[j].trimmed(store.get(j));
-            if t == "ret" || t == "retq" {
+            if is_plain_return(t) {
                 // The return-address read is implicit: at `ret` the slot
                 // sits at `frame_size(%rsp)` of the body (0 with no
                 // `addq`), and everything at or above it is the caller's

@@ -46,6 +46,9 @@ pub struct ObjSection {
     /// uses, so behaviour there is byte-for-byte unchanged.
     pub sh_size: Option<u64>,
     pub sh_addralign: u64,
+    /// Size of one entry, for a section the source declared with one
+    /// (`.section name,"aM",@progbits,16`); 0 when it stated none.
+    pub sh_entsize: u64,
     /// Relocations targeting this section.
     pub relocs: Vec<ObjReloc>,
     /// If this section is part of a COMDAT group, the group signature symbol name.
@@ -855,16 +858,18 @@ pub fn write_relocatable_object(
 /// state: every referenced name is defined, folded, or an undefined global.
 /// `sh_entsize` of an emitted section.
 ///
-/// A `SHF_MERGE|SHF_STRINGS` section is a list of equal-sized entries whose size
-/// the header must state -- `0` there is malformed and every linker rejects the
-/// object (bfd: "section `.debug_str` has invalid sh_entsize").  lccc emits such
-/// a section for exactly one shape, the byte-wide string pools (`entsize` 1, one
-/// NUL-terminated string per entry -- see `dwarf::debug_section_flags`), and
-/// every other content section it writes is a plain byte stream, which is what
-/// `sh_entsize == 0` means.  Symbol and relocation tables fill their own headers
-/// in and never reach this path.
+/// A mergeable section is a list of equal-sized entries whose size the header
+/// must state -- `0` there is malformed (bfd: "section `.debug_str` has
+/// invalid sh_entsize"; mold merges the section byte by byte). The size is
+/// the one the source gave (`ObjSection::sh_entsize`). The string pools lccc
+/// builds itself (`dwarf::debug_section_flags`) state none and are byte-wide:
+/// one NUL-terminated string per entry. Every other content section is a
+/// plain byte stream, which is what `sh_entsize == 0` means. Symbol and
+/// relocation tables fill their own headers in and never reach this path.
 fn section_entsize(section: &ObjSection) -> u64 {
-    if section.sh_type == SHT_PROGBITS
+    if section.sh_entsize != 0 {
+        section.sh_entsize
+    } else if section.sh_type == SHT_PROGBITS
         && section.sh_flags & SHF_MERGE != 0
         && section.sh_flags & SHF_STRINGS != 0
     {

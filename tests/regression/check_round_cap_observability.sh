@@ -14,9 +14,13 @@
 #      The only exempt exit is `pass_disabled("all")`, where no pass runs
 #      and every counter is provably zero.
 #   2. Behavioral witnesses: `cross_pr_redteam.c` exhausts backedge_pre's
-#      3-round budget and `fortify_open_va_pack.c` exhausts the ordinary
+#      3-round budget and `cpu_model_mul_const_plan.c` exhausts the ordinary
 #      inline budget, both at -O2 (2 654-file corpus sweep, see the
-#      follow-up). Under CCC_TIME_PASSES=1 the compiler must print the
+#      follow-up; the inline witness re-measured on 1 860 files when
+#      `fortify_open_va_pack.c` stopped being one: it reached the budget only
+#      by inlining a GNU extern-inline wrapper into itself round after round,
+#      which `IrFunction::body_answers_call` ended). Under CCC_TIME_PASSES=1
+#      the compiler must print the
 #      matching `round_cap <site>` line; with the variable unset it must
 #      print nothing. A cap-hit edit that drops the report, or a cap change
 #      that removes the witness, fails here and must be re-measured rather
@@ -205,7 +209,7 @@ witness() {
     echo "witness: $want on $src"
 }
 witness tests/regression/cross_pr_redteam.c backedge_pre
-witness tests/regression/fortify_open_va_pack.c inline_ordinary_rounds
+witness tests/regression/cpu_model_mul_const_plan.c inline_ordinary_rounds
 
 if [ "$fail" -ne 0 ]; then
     exit 1

@@ -724,6 +724,7 @@ impl ElfWriter {
                 &info.flags,
                 info.flags_explicit,
                 info.sec_type.as_deref(),
+                info.entity_size.as_deref(),
             ),
             Directive::PopSection => {
                 self.base.pop_section();
@@ -738,6 +739,7 @@ impl ElfWriter {
                 &info.flags,
                 info.flags_explicit,
                 info.sec_type.as_deref(),
+                info.entity_size.as_deref(),
             ),
 
             Directive::Text => self.base.switch_to_standard_section(

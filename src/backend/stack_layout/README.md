@@ -20,8 +20,10 @@ stack usage by 40-60% compared to naive allocation.
 
 ## Three-tier allocation
 
-- **Tier 1 (Permanent)**: Allocas get dedicated, non-shared slots. They're
-  addressable memory -- the program may take their address.
+- **Tier 1 (Permanent)**: Allocas get slots that last for the whole function.
+  They're addressable memory -- the program may take their address. Objects
+  that are never live together -- the per-arm structs of an ioctl switch --
+  share one slot (`alloca_sharing.rs`); every other object has its own.
 
 - **Tier 2 (Liveness-packed)**: Multi-block SSA temporaries share slots based
   on live interval overlap. Uses greedy interval coloring with a min-heap.
@@ -36,6 +38,7 @@ stack usage by 40-60% compared to naive allocation.
 |------|---------|
 | `analysis.rs` | Value use-block maps, used-value collection, dead param alloca detection |
 | `alloca_coalescing.rs` | Escape analysis: determines which allocas can share slots |
+| `alloca_sharing.rs` | One Tier 1 slot for objects no execution has alive at once (CFG reachability, no lifetime markers needed) |
 | `copy_coalescing.rs` | Copy alias map and immediately-consumed value optimization |
 | `slot_assignment.rs` | The core phases: instruction classification, tier assignment, slot packing |
 | `inline_asm.rs` | Inline assembly clobber register scanning |

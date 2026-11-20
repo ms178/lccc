@@ -2837,6 +2837,19 @@ impl super::InstructionEncoder {
                     // (see encode_jmp for the full rationale).
                     return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
                 }
+                // `call sym+8` is not a call of `sym`: sent through a PLT
+                // entry it would land eight bytes into the entry. GAS marks
+                // a branch PLT32 only when it names the symbol itself
+                // (`output_jump`: `X_add_number == 0`) or says `@PLT`.
+                let via_plt = sym.len() != label.len();
+                let offset =
+                    crate::backend::x86::assembler::parser::split_relocation_symbol_addend(sym)
+                        .is_some_and(|(_, addend)| addend != 0);
+                let reloc = if offset && !via_plt {
+                    R_X86_64_PC32
+                } else {
+                    R_X86_64_PLT32
+                };
                 self.bytes.push(0xE8);
                 // `data16 call` keeps the full rel32 field: the 66 prefix
                 // is dead on 64-bit near branches (see encode_jmp). A
@@ -2845,7 +2858,7 @@ impl super::InstructionEncoder {
                 // both desynchronises the stream and computes a wild
                 // target. `66 e8 rel32` (spliced dead prefix) is the
                 // shortest VALID form; there is no short call row.
-                self.add_relocation(sym, R_X86_64_PLT32, -4);
+                self.add_relocation(sym, reloc, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }

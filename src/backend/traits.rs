@@ -2636,6 +2636,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         if self.state().next_block_label == Some(block)
             && !self.state().fallthrough_would_alias_observable_label()
         {
+            self.state().branch_elided_into_next_block = true;
             return;
         }
         // Cache the mnemonic first to avoid borrow conflict with state()

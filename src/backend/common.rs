@@ -250,6 +250,10 @@ pub fn link_with_args(
             // Native `ld -r`: merge ET_REL inputs into one ET_REL output.
             // Only x86-64 has the emitter today; other arches keep the old error.
             if config.expected_elf_machine == EM_X86_64 {
+                // An operand that is not there is an error here as in a
+                // final link; the loop below only takes files that exist.
+                let link_args = crate::backend::linker_common::parse_linker_args(user_args);
+                link_args.require_inputs()?;
                 let mut inputs: Vec<(String, bool)> = Vec::new();
                 for f in object_files {
                     inputs.push((f.to_string(), false));
@@ -289,8 +293,7 @@ pub fn link_with_args(
                 // Only `.o`/`.os`/`.oS`/`.a` inputs are collected above, so no
                 // linker script can reach the loader here and its `-l` search
                 // path is provably unused; glibc's rtld link passes no `-L`.
-                let allow_multiple = crate::backend::linker_common::parse_linker_args(user_args)
-                    .allow_multiple_definition();
+                let allow_multiple = link_args.allow_multiple_definition();
                 crate::backend::x86::linker::load_inputs_for_ld(
                     &inputs,
                     &mut objects,
@@ -1260,6 +1263,11 @@ fn link_builtin_native(
     // name -- a zero exit status with the wrong artifact, which is worse than
     // a refusal because the build never notices.
     let link_args = crate::backend::linker_common::parse_linker_args(user_args);
+    // `cc main.o helper.o` with no `helper.o`: the parse leaves a file that
+    // is not there out of the inputs, and three of the four backends linked
+    // the rest (only i686 asked).  With nothing undefined left the program
+    // was written and the driver exited zero.
+    link_args.require_inputs()?;
     let oformat = link_args.oformat.clone();
     let native = match arch.elf_machine {
         EM_X86_64 => "elf64-x86-64",

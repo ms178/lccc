@@ -174,10 +174,10 @@ pub struct SectionDirective {
     pub name: String,
     pub flags: Option<String>,
     pub section_type: Option<String>,
-    /// For sections with linked-to or group info (4th arg), e.g.
-    /// `__patchable_function_entries,"awo",@progbits,.LPFE0`
-    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
-    // Parsed for completeness; will be used for SHF_LINK_ORDER sections
+    /// The argument after the type: the entity size of a mergeable section
+    /// (`.rodata.cst16,"aM",@progbits,16`), the linked-to symbol
+    /// (`__patchable_function_entries,"awo",@progbits,.LPFE0`), or the
+    /// group signature, whichever the flags ask for first.
     pub extra: Option<String>,
     /// COMDAT group name from `.section name,"axG",@progbits,group_name,comdat`
     /// Set when flags contain 'G' and a 5th argument is "comdat".
@@ -279,6 +279,82 @@ pub struct Instruction {
     /// GNU as `{dfv=cf,zf,sf,of}`: APX default-flags value for CCMP/CTEST.
     /// Encoded raw in EVEX P1.vvvv (not inverted). Bits: CF=1 ZF=2 SF=4 OF=8.
     pub dfv: u8,
+}
+
+impl Instruction {
+    /// The statement as a reader would write it, for a diagnostic: prefixes,
+    /// mnemonic and operands in AT&T order. An encoder error that names no
+    /// instruction ("bad register") is useless in a file of ten thousand
+    /// macro-expanded statements; this is what gets appended to it. Shapes
+    /// with no short spelling are named by kind — the text is for a person,
+    /// not for the assembler.
+    pub(crate) fn source_text(&self) -> String {
+        fn register(out: &mut String, reg: &Register) {
+            out.push('%');
+            out.push_str(&reg.name);
+            if let Some(mask) = &reg.mask {
+                out.push_str("{%");
+                out.push_str(mask);
+                out.push('}');
+            }
+        }
+        fn operand(out: &mut String, op: &Operand) {
+            match op {
+                Operand::Register(reg) => register(out, reg),
+                Operand::Immediate(ImmediateValue::Integer(value)) => {
+                    out.push_str(&format!("${value}"));
+                }
+                Operand::Immediate(ImmediateValue::Symbol(name)) => {
+                    out.push('$');
+                    out.push_str(name);
+                }
+                Operand::Immediate(_) => out.push_str("$<expression>"),
+                Operand::Memory(mem) => {
+                    if let Some(segment) = &mem.segment {
+                        out.push('%');
+                        out.push_str(segment);
+                        out.push(':');
+                    }
+                    match &mem.displacement {
+                        Displacement::None => {}
+                        Displacement::Integer(value) => out.push_str(&value.to_string()),
+                        Displacement::Symbol(name) => out.push_str(name),
+                        _ => out.push_str("<expression>"),
+                    }
+                    if mem.base.is_some() || mem.index.is_some() {
+                        out.push('(');
+                        if let Some(base) = &mem.base {
+                            register(out, base);
+                        }
+                        if let Some(index) = &mem.index {
+                            out.push(',');
+                            register(out, index);
+                            if let Some(scale) = mem.scale {
+                                out.push_str(&format!(",{scale}"));
+                            }
+                        }
+                        out.push(')');
+                    }
+                }
+                Operand::Label(name) => out.push_str(name),
+                Operand::Indirect(inner) => {
+                    out.push('*');
+                    operand(out, inner);
+                }
+            }
+        }
+        let mut out = String::new();
+        for prefix in &self.prefixes {
+            out.push_str(prefix);
+            out.push(' ');
+        }
+        out.push_str(&self.mnemonic);
+        for (index, op) in self.operands.iter().enumerate() {
+            out.push_str(if index == 0 { " " } else { ", " });
+            operand(&mut out, op);
+        }
+        out
+    }
 }
 
 /// An instruction operand.
@@ -424,18 +500,52 @@ const COMMENT_STYLE: CommentStyle = CommentStyle::Hash;
 /// Expand .rept/.endr blocks by repeating contained lines.
 /// Note: .irp/.endr blocks are handled separately by expand_gas_macros, so we must
 /// track .irp depth to avoid swallowing .endr lines that belong to .irp blocks.
+///
+/// This pre-pass sees the text before any macro is expanded or any symbol is
+/// assigned, so it expands only what it can read: a `.rept` outside every
+/// `.macro` body whose count is a literal expression. A `.macro` body passes
+/// through untouched — its `.rept (\count)` has no count until the macro is
+/// invoked (Linux arch/x86/crypto/polyval-clmulni_asm.S: `.macro schoolbook1
+/// count` ... `.rept (\count)`, which failed here with "bad count") — and so
+/// does a block whose count names a symbol. `expand_gas_macros_with_state`
+/// expands both in order, where the arguments and the symbols exist.
 fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
     let mut irp_depth = 0; // Track .irp nesting to avoid consuming their .endr
+    let mut macro_depth = 0usize;
+    // `.rept` blocks left for the in-order pass, so their `.endr` stays too.
+    let mut deferred_depth = 0usize;
     // Repetition-only growth totals (see asm_preprocess::check_expansion_growth).
     let mut grown_lines: u64 = 0;
     let mut grown_bytes: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i]).trim().to_string();
+        if directive_arg(&trimmed, ".macro").is_some() {
+            macro_depth += 1;
+        } else if trimmed == ".endm" {
+            macro_depth = macro_depth.saturating_sub(1);
+            result.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
+        if macro_depth > 0 {
+            result.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
         if let Some(count_str) = directive_arg(&trimmed, ".rept") {
-            if irp_depth > 0 {
-                // Inside .irp block - pass through as-is
+            if irp_depth > 0 || deferred_depth > 0 {
+                // Inside a block the in-order pass expands, this one is
+                // that pass's as well: it passes through, and so must its
+                // `.endr`, which the depth it adds here accounts for.
+                // (Uncounted, that `.endr` closed the `.irp` around it and
+                // the `.irp`'s own was dropped as a stray.)
+                if deferred_depth > 0 {
+                    deferred_depth += 1;
+                } else {
+                    irp_depth += 1;
+                }
                 result.push(lines[i].to_string());
                 i += 1;
                 continue;
@@ -445,28 +555,18 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             // wording (measured `.rept -1` -> "excessive count
             // 18446744073709551615 for REPT - ignored"); `as usize` on the
             // i64 expression performs the same wrap on this target.
-            let count = parse_integer_expr(count_str)
-                .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?
-                as u64;
-            let mut depth = 1;
-            let mut body = Vec::new();
-            i += 1;
-            while i < lines.len() {
-                let inner = strip_comment(lines[i]).trim().to_string();
-                if directive_arg(&inner, ".rept").is_some() {
-                    depth += 1;
-                } else if inner == ".endr" {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                body.push(lines[i]);
+            let Ok(count) = parse_integer_expr(count_str) else {
+                // Not a literal: a symbol assigned above, perhaps. The
+                // in-order pass evaluates it, or reports it.
+                deferred_depth = 1;
+                result.push(lines[i].to_string());
                 i += 1;
-            }
-            if depth != 0 {
-                return Err(".rept without matching .endr".to_string());
-            }
+                continue;
+            };
+            let count = count as u64;
+            // Blocks of every kind nest: an `.irp` in the body owns the
+            // next `.endr`, not this `.rept`.
+            let body = collect_repeat_body(lines, &mut i, ".rept")?;
             // Bound the raw block before recursing — same position in the
             // flow as GAS's `do_repeat` check (pre-expansion, raw body).
             asm_preprocess::check_rept_budget(count, &body)?;
@@ -486,10 +586,17 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             // DELETED it, so the later .irpc expansion ran off the end of
             // the block (efi-mixed.S page-table unroll emitted a stray
             // `ret` per iteration).
-            irp_depth += 1;
+            if deferred_depth > 0 {
+                deferred_depth += 1;
+            } else {
+                irp_depth += 1;
+            }
             result.push(lines[i].to_string());
         } else if trimmed == ".endr" {
-            if irp_depth > 0 {
+            if deferred_depth > 0 {
+                deferred_depth -= 1;
+                result.push(lines[i].to_string());
+            } else if irp_depth > 0 {
                 irp_depth -= 1;
                 result.push(lines[i].to_string());
             }
@@ -656,9 +763,14 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
             return Ok(items);
         }
         // Ordinary GAS symbol assignment is equivalent to `.set`.
+        // A backslash is no symbol character: what is left of a macro
+        // reference that named no parameter (`x\a.y = 7`, where the
+        // reference is `a.y`) is not a name. The statement goes on to the
+        // instruction parser and fails there, as it does in GNU as.
         if !before.is_empty()
             && !before.contains(' ')
             && !before.contains('\t')
+            && !before.contains('\\')
             && !before.starts_with('$')
             && !before.starts_with('%')
             && (before.as_bytes()[0].is_ascii_alphabetic() || before.starts_with('_'))
@@ -1245,15 +1357,19 @@ fn parse_section_directive(args: &str) -> Result<AsmItem, String> {
     let section_type = parts.get(2).map(|s| s.trim().to_string());
     let extra = parts.get(3).map(|s| s.trim().to_string());
 
-    // If the flags contain 'G' (SHF_GROUP), the 4th arg is the group signature
-    // name and the 5th arg should be "comdat".
+    // The arguments after the type follow the flag letters, in GNU as's
+    // order: `M` takes the entity size, `o` the linked-to symbol, and `G`
+    // the group signature and its linkage after both
+    // (`.section n,"aMG",@progbits,16,sig,comdat`). Taking the 4th argument
+    // for the signature whatever the flags made `16` the group's name.
     let comdat_group = if let Some(ref f) = flags {
         if f.contains('G') {
-            if let Some(ref group_name) = extra {
-                let fifth = parts.get(4).map(|s| s.trim().to_string());
-                if fifth.as_deref() == Some("comdat") || fifth.is_none() {
+            let at = 3 + usize::from(f.contains('M')) + usize::from(f.contains('o'));
+            if let Some(group_name) = parts.get(at).map(|s| s.trim().to_string()) {
+                let linkage = parts.get(at + 1).map(|s| s.trim().to_string());
+                if linkage.as_deref() == Some("comdat") || linkage.is_none() {
                     // Accept both explicit "comdat" and implicit (GNU as default)
-                    Some(group_name.clone())
+                    Some(group_name)
                 } else {
                     None
                 }
@@ -1533,7 +1649,9 @@ fn parse_org_target(expr: &str, directive: &str) -> Result<(String, i64), String
 /// Parse `.set alias, target`.
 fn parse_set_directive(args: &str) -> Result<AsmItem, String> {
     let parts: Vec<&str> = args.splitn(2, ',').collect();
-    if parts.len() != 2 {
+    // A name with a backslash in it is what an unexpanded macro reference
+    // leaves behind (`.set s\a$t, 9`: the reference is `a$t`), not a symbol.
+    if parts.len() != 2 || parts[0].contains('\\') {
         return Err(format!("bad .set directive: {}", args));
     }
     Ok(AsmItem::Set(
@@ -1645,6 +1763,8 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
 
     let operands = if operand_str.is_empty() {
         Vec::new()
+    } else if let Some(target) = grouped_branch_target(mnemonic, operand_str) {
+        vec![Operand::Label(target)]
     } else {
         parse_operands(operand_str)?
     };
@@ -1735,6 +1855,29 @@ fn parse_dfv_hint(s: &str) -> Result<(u8, &str), String> {
         return Err(format!("bad dfv hint: {{{inner}}}"));
     }
     Ok((dfv, s[close + 1..].trim_start()))
+}
+
+/// The target of a direct branch written with grouping: `jmp (sym)`,
+/// `call (sym)+0`, `jne ((sym)+2)`, as a `sym+N` label.
+///
+/// The operand of a `jmp`, `call`, `jcc` or `loop` that is not `*indirect`
+/// and names no register is an expression, parenthesised or not (GAS: a
+/// macro that expands to `(name)` is a fine branch target). The operand
+/// parser reads a leading `(` as the start of a base/index form, so these
+/// were refused: "unsupported jmp operand", "junk `+0` after expression in
+/// memory operand".
+fn grouped_branch_target(mnemonic: &str, operand: &str) -> Option<String> {
+    let mnemonic = mnemonic.to_ascii_lowercase();
+    let is_direct_branch =
+        mnemonic.starts_with('j') || mnemonic.starts_with("call") || mnemonic.starts_with("loop");
+    if !is_direct_branch || operand.starts_with('*') || operand.contains(['%', ',', '$']) {
+        return None;
+    }
+    match grouped_symbol_plus_offset(operand)? {
+        Displacement::SymbolPlusOffset(symbol, 0) => Some(symbol),
+        Displacement::SymbolPlusOffset(symbol, offset) => Some(format!("{symbol}{offset:+}")),
+        _ => None,
+    }
 }
 
 /// Split a line into mnemonic and operand string.
@@ -2759,7 +2902,42 @@ fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
             }
         }
     }
-    None
+    grouped_symbol_plus_offset(s)
+}
+
+/// One symbol plus a constant, written with grouping the scan in
+/// `try_parse_symbol_plus_offset` cannot see through: parentheses around the
+/// symbol, around a sum, or both.
+///
+/// des3_ede-asm_64.S addresses its S-boxes as `#define s2 ((s1) + (64*8))`,
+/// `#define s3 ((s2) + (64*8))` and so on, and loads `s8(%rip)`. No split at
+/// a `+` leaves a bare name on one side of `(.L_s1) + (64*8)`, so the whole
+/// text became the relocation's symbol: an undefined symbol by that name,
+/// seven of them in that file, and an object that cannot be linked.
+///
+/// The expression evaluator knows the grammar; the answer is taken when it
+/// is exactly one symbol with coefficient one. Anything else (two symbols,
+/// a scaled one, `.`) is not this pattern.
+fn grouped_symbol_plus_offset(s: &str) -> Option<Displacement> {
+    use asm_expr::{SectionExpr, eval_section_expr};
+    if !s.contains('(') {
+        return None;
+    }
+    let value = eval_section_expr::<String>(s, |name| {
+        if name == "." {
+            Err("the location counter is not a symbol".to_string())
+        } else {
+            Ok(SectionExpr::term(name.to_string(), 1))
+        }
+    })
+    .ok()?;
+    match value.terms() {
+        [(symbol, 1)] => Some(Displacement::SymbolPlusOffset(
+            symbol.clone(),
+            value.constant,
+        )),
+        _ => None,
+    }
 }
 
 /// Try to parse a `symbol+offset` or `symbol-offset` expression as an immediate value.
@@ -3512,6 +3690,16 @@ struct GasMacro {
 static MACRO_INVOCATION_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// `\@` outside a macro body, in an `.irp` or `.irpc` block: the number the
+/// next invocation will get, which the block does not take (GNU as 2.47:
+/// after one invocation, both rounds of `.irp i, 1, 2` / `.byte \@` give 1,
+/// and so does the next invocation).
+fn invocations_so_far() -> String {
+    MACRO_INVOCATION_COUNTER
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .to_string()
+}
+
 /// GAS 2.47's macro-nesting wall, re-measured on the pinned oracle: a
 /// 101-frame chain of distinct macros (`m0 -> m1 -> ... -> m100`)
 /// assembles, the 102nd frame fatals with `macros nested too deeply`,
@@ -3696,6 +3884,67 @@ fn substitute_register_aliases(lines: Vec<String>) -> Vec<String> {
     out
 }
 
+/// The body of the `.rept`, `.irp` or `.irpc` block whose head is
+/// `lines[*i]`: every line up to its `.endr`, blocks of all three kinds
+/// nested in it kept whole. `*i` is left on that `.endr`. A block that never
+/// ends is an error, named after `head`, as it is for GNU as.
+fn collect_repeat_body<'l, S: AsRef<str>>(
+    lines: &'l [S],
+    i: &mut usize,
+    head: &str,
+) -> Result<Vec<&'l str>, String> {
+    let mut body = Vec::new();
+    let mut depth = 1u32;
+    *i += 1;
+    while let Some(line) = lines.get(*i) {
+        let line = line.as_ref();
+        let inner = strip_comment(line).trim();
+        if [".rept", ".irp", ".irpc"]
+            .iter()
+            .any(|kind| directive_arg(inner, kind).is_some())
+        {
+            depth += 1;
+        } else if inner == ".endr" {
+            depth -= 1;
+            if depth == 0 {
+                return Ok(body);
+            }
+        }
+        body.push(line);
+        *i += 1;
+    }
+    Err(format!("{head} without matching .endr"))
+}
+
+/// The text of an `.irp` or `.irpc` block (`kind`): `body` once per value
+/// `next_round` yields, with `\var` replaced by that value. Every round is
+/// charged to `budget` as it is materialized, because `rounds x body` is
+/// quadratic in a linear input and the ceiling has to fire before the next
+/// round allocates. The result still has to be expanded.
+fn expand_iterated_block(
+    body: &[&str],
+    var: &str,
+    mut next_round: impl FnMut() -> Option<String>,
+    kind: &str,
+    budget: &mut ExpansionBudget,
+) -> Result<Vec<String>, String> {
+    let invocation = invocations_so_far();
+    let mut expanded = Vec::new();
+    let mut round: Vec<String> = Vec::with_capacity(body.len());
+    while let Some(value) = next_round() {
+        round.extend(body.iter().map(|line| {
+            asm_preprocess::expand_macro_refs(
+                line,
+                |name| (name == var).then_some(value.as_str()),
+                Some(&invocation),
+            )
+        }));
+        budget.charge(&round, kind)?;
+        expanded.append(&mut round);
+    }
+    Ok(expanded)
+}
+
 fn expand_gas_macros_with_state(
     lines: &[String],
     macros: &mut crate::common::fx_hash::FxHashMap<String, GasMacro>,
@@ -3840,6 +4089,35 @@ fn expand_gas_macros_with_state(
             }
         }
 
+        // .rept count / .endr, in order. The pre-pass (`expand_rept_blocks`)
+        // has expanded the blocks it could read; what arrives here is a block
+        // from a macro body, now that the arguments are substituted, or one
+        // whose count names a symbol assigned above. The body is repeated
+        // first and expanded after, so a `.set i, (i + 1)` inside it counts
+        // per repetition, as it does for GAS.
+        if let Some(count_str) = directive_arg(&trimmed, ".rept") {
+            let resolved = resolve_set_expr(count_str, symbols);
+            let count = parse_integer_expr(&resolved)
+                .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?
+                as u64;
+            let body = collect_repeat_body(lines, &mut i, ".rept")?;
+            // The same bound, at the same point, as the pre-pass: GAS's
+            // `do_repeat` check on the raw block.
+            asm_preprocess::check_rept_budget(count, &body)?;
+            let mut all_expanded: Vec<String> = Vec::new();
+            let mut block: Vec<String> = Vec::with_capacity(body.len());
+            for _ in 0..count {
+                block.extend(body.iter().map(|line| (*line).to_string()));
+                budget.charge(&block, ".rept")?;
+                all_expanded.append(&mut block);
+            }
+            let processed =
+                expand_gas_macros_with_state(&all_expanded, macros, symbols, labels, budget)?;
+            result.extend(processed);
+            i += 1;
+            continue;
+        }
+
         // .irpc var, string  /  .endr -- GAS character iteration: the body
         // expands once per CHARACTER of the string. efi-mixed.S uses
         // `.irpc l, 0123` to unroll four page-table-entry stores with
@@ -3856,44 +4134,24 @@ fn expand_gas_macros_with_state(
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or(chars_str);
-            let mut body = Vec::new();
-            let mut depth = 1;
-            i += 1;
-            while i < lines.len() {
-                let inner = strip_comment(&lines[i]).trim().to_string();
-                if directive_arg(&inner, ".irp").is_some()
-                    || directive_arg(&inner, ".irpc").is_some()
-                    || directive_arg(&inner, ".rept").is_some()
-                {
-                    depth += 1;
-                } else if inner == ".endr" {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                body.push(lines[i].clone());
-                i += 1;
-            }
-            let mut all_expanded = Vec::new();
-            let mut block: Vec<String> = Vec::with_capacity(body.len());
-            for ch in chars_str.chars() {
-                let item = ch.to_string();
-                for bline in &body {
-                    let mut expanded =
-                        asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), &item);
-                    expanded = expanded.replace("\\()", "");
-                    block.push(expanded);
-                }
-                // Charge every character-block as it is materialized: an
-                // `.irpc` amplifies `len(string) x body` from linear input,
-                // and the ceiling must fire before the next block allocates.
-                budget.charge(&block, ".irpc")?;
-                all_expanded.append(&mut block);
-            }
-            let processed =
-                expand_gas_macros_with_state(&all_expanded, macros, symbols, labels, budget)?;
-            result.extend(processed);
+            let body = collect_repeat_body(lines, &mut i, ".irpc")?;
+            // One round per CHARACTER of the string.
+            let mut utf8 = [0u8; 4];
+            let mut rounds = chars_str.chars();
+            let expanded = expand_iterated_block(
+                &body,
+                &var,
+                || {
+                    rounds
+                        .next()
+                        .map(|ch| ch.encode_utf8(&mut utf8).to_string())
+                },
+                ".irpc",
+                budget,
+            )?;
+            result.extend(expand_gas_macros_with_state(
+                &expanded, macros, symbols, labels, budget,
+            )?);
             i += 1;
             continue;
         }
@@ -3901,45 +4159,12 @@ fn expand_gas_macros_with_state(
         // .irp var, item1, item2, ...  /  .endr
         if let Some(rest) = directive_arg(&trimmed, ".irp") {
             let (var, items) = parse_irp_header(rest)?;
-            let mut body = Vec::new();
-            let mut depth = 1;
-            i += 1;
-            while i < lines.len() {
-                let inner = strip_comment(&lines[i]).trim().to_string();
-                if directive_arg(&inner, ".irp").is_some()
-                    || directive_arg(&inner, ".rept").is_some()
-                {
-                    depth += 1;
-                } else if inner == ".endr" {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                body.push(lines[i].clone());
-                i += 1;
-            }
-            // Expand: for each item, substitute \var with the item, then recursively process
-            let mut all_expanded = Vec::new();
-            let mut block: Vec<String> = Vec::with_capacity(body.len());
-            for item in &items {
-                for bline in &body {
-                    let mut expanded =
-                        asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), item);
-                    // Strip GAS macro argument delimiters: \() resolves to empty string
-                    expanded = expanded.replace("\\()", "");
-                    block.push(expanded);
-                }
-                // Same incremental charge as `.irpc`: the `items x body`
-                // product is quadratic in a linear input, so the shared
-                // ceilings must be tested between blocks, not after the
-                // whole (potentially unbounded) materialization.
-                budget.charge(&block, ".irp")?;
-                all_expanded.append(&mut block);
-            }
-            let processed =
-                expand_gas_macros_with_state(&all_expanded, macros, symbols, labels, budget)?;
-            result.extend(processed);
+            let body = collect_repeat_body(lines, &mut i, ".irp")?;
+            let mut rounds = items.into_iter();
+            let expanded = expand_iterated_block(&body, &var, || rounds.next(), ".irp", budget)?;
+            result.extend(expand_gas_macros_with_state(
+                &expanded, macros, symbols, labels, budget,
+            )?);
             i += 1;
             continue;
         }
@@ -4088,39 +4313,23 @@ fn expand_gas_macros_with_state(
                 asm_preprocess::MacroArgLexing::X86,
             );
             let values = asm_preprocess::bind_macro_args(&mac.name, &mac.params, &fields)?;
-            let args: Vec<(String, String)> = mac
-                .params
-                .iter()
-                .map(|p| p.name.clone())
-                .zip(values)
-                .collect();
-            // Sort parameters by name length (longest first) to avoid partial
-            // substitution: e.g., \orig must not match before \orig_len.
-            let mut sorted_args: Vec<(String, String)> = args.clone();
-            sorted_args.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-            // Substitute parameters in body
             // One `\@` value per invocation, fetched before body substitution
             // so every line of this expansion sees the same number.
             let invocation = MACRO_INVOCATION_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 .to_string();
+            // Every reference of a body line is resolved in one pass
+            // (`expand_macro_refs`): parameters, `\@`, `\()`.
+            let value_of = |name: &str| {
+                mac.params
+                    .iter()
+                    .position(|param| param.name == name)
+                    .map(|index| values[index].as_str())
+            };
             let mut expanded_body: Vec<String> = mac
                 .body
                 .iter()
-                .map(|line| {
-                    let mut l = line.clone();
-                    for (pname, pval) in &sorted_args {
-                        l = asm_preprocess::replace_macro_param(&l, &format!("\\{}", pname), pval);
-                    }
-                    if l.contains("\\@") {
-                        l = l.replace("\\@", &invocation);
-                    }
-                    // Strip GAS macro argument delimiters: \() resolves to empty string.
-                    // Used to separate parameter names from adjacent text,
-                    // e.g., \op\()_safe_regs -> rdmsr_safe_regs
-                    l = l.replace("\\()", "");
-                    l
-                })
+                .map(|line| asm_preprocess::expand_macro_refs(line, value_of, Some(&invocation)))
                 .collect();
             // Substituting a parameter can splice several statements into ONE
             // body line (a quoted ALTERNATIVE argument such as
@@ -4841,6 +5050,168 @@ mod tests {
         assert!(err.contains("line limit"), "got: {err}");
     }
 
+    /// `.rept` whose count exists only where the block is used: a macro
+    /// argument (`schoolbook1 count` / `.rept (\count)` in Linux's
+    /// polyval-clmulni_asm.S, which failed as "bad count '(\count)'"), a
+    /// symbol assigned above it, or an `.irp` variable. The body is repeated
+    /// and then expanded, so its `.set` counts per repetition.
+    #[test]
+    fn rept_counts_from_macro_arguments_symbols_and_irp_variables() {
+        let both = |src: &str| -> Result<Vec<String>, String> {
+            let lines: Vec<&str> = src.lines().collect();
+            let pre = expand_rept_blocks(&lines)?;
+            expand_gas_macros(&pre)
+        };
+        let bytes = |out: &[String]| -> Vec<String> {
+            out.iter()
+                .map(|l| l.trim().to_string())
+                .filter(|l| l.starts_with(".byte"))
+                .collect()
+        };
+        // The macro is defined before the macro it calls, as in the kernel.
+        let out = both(concat!(
+            ".macro schoolbook count\n",
+            "    .set i, 0\n",
+            "    .rept (\\count)\n",
+            "        iteration i\n",
+            "        .set i, (i + 1)\n",
+            "    .endr\n",
+            ".endm\n",
+            ".macro iteration n\n",
+            "    .byte \\n\n",
+            ".endm\n",
+            "schoolbook 3\n",
+            "schoolbook 1\n",
+        ))
+        .unwrap();
+        // Each repetition read the `i` the one before it left behind.
+        assert_eq!(
+            bytes(&out),
+            [".byte 0", ".byte 1", ".byte 2", ".byte 0"],
+            "{out:?}"
+        );
+        // The counter's assignments stay between the bytes, in order.
+        let order: String = out
+            .iter()
+            .filter_map(|l| {
+                let l = l.trim();
+                if l.starts_with(".byte") {
+                    Some('b')
+                } else if l.starts_with(".set i") {
+                    Some('s')
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(order, "sbsbsbssbs", "{out:?}");
+
+        // A symbol count is read where the block stands.
+        let out = both(".set n, 2\n.rept n + 1\n.byte 7\n.endr\n.byte 9\n").unwrap();
+        assert_eq!(bytes(&out), [".byte 7", ".byte 7", ".byte 7", ".byte 9"]);
+
+        // Nested in a deferred block, and under an `.irp`.
+        let out = both(".set n, 2\n.rept n\n.rept 2\n.byte 1\n.endr\n.endr\n").unwrap();
+        assert_eq!(bytes(&out).len(), 4, "{out:?}");
+        let out = both(".irp k, 1, 3\n.rept \\k\n.byte \\k\n.endr\n.endr\n").unwrap();
+        assert_eq!(
+            bytes(&out),
+            [".byte 1", ".byte 3", ".byte 3", ".byte 3"],
+            "{out:?}"
+        );
+
+        // A literal count inside a macro body is expanded at the call too.
+        let out = both(".macro twice\n.rept 2\n.byte 5\n.endr\n.endm\ntwice\ntwice\n").unwrap();
+        assert_eq!(bytes(&out).len(), 4, "{out:?}");
+
+        // What cannot be evaluated is still reported, with the same words.
+        let err = both(".rept nowhere\n.byte 0\n.endr\n").unwrap_err();
+        assert!(err.contains(".rept: bad count 'nowhere'"), "{err}");
+        let err = both(".macro m c\n.rept \\c\n.byte 0\n.endr\n.endm\nm -1\n").unwrap_err();
+        assert!(err.contains("excessive count"), "{err}");
+        let err = both(".set n, 2\n.rept n\n.byte 0\n").unwrap_err();
+        assert!(err.contains(".rept without matching .endr"), "{err}");
+    }
+
+    /// An empty macro argument is an argument (GNU as 2.47, each row measured
+    /// with `as --64` and `objdump -s`): the parameter takes its default, the
+    /// arguments behind it keep their parameters. The field used to be
+    /// dropped, which shifted every later argument one parameter to the left:
+    /// `_vaes_1x \enc, 1, \xmm_suffix, \data, tmp=\tmp` with an empty
+    /// `\xmm_suffix` (Linux aes-xts-avx-x86_64.S) assembled `vaesenc` with two
+    /// operands, and the same call without the keyword assembled the WRONG
+    /// instruction without a word.
+    #[test]
+    fn an_empty_macro_argument_keeps_its_position() {
+        let expand = |call: &str| -> Result<Vec<String>, String> {
+            let src = format!(
+                ".macro m a=5, b=6, c=7\n.byte \\a, \\b, \\c\n.endm\n\
+                 .macro r a:req, b\n.byte \\a\n.endm\n\
+                 .macro v a, rest:vararg\n.long \\rest\n.endm\n{call}\n"
+            );
+            let lines: Vec<String> = src.lines().map(str::to_string).collect();
+            expand_gas_macros(&lines)
+        };
+        let line = |call: &str| -> String {
+            let out = expand(call).unwrap_or_else(|e| panic!("{call}: {e}"));
+            out.iter()
+                .map(|l| l.trim())
+                .find(|l| l.starts_with(".byte") || l.starts_with(".long"))
+                .unwrap_or_else(|| panic!("{call}: {out:?}"))
+                .to_string()
+        };
+        for (call, want) in [
+            ("m 1, , 3", ".byte 1, 6, 3"),
+            ("m , 2", ".byte 5, 2, 7"),
+            ("m 1,", ".byte 1, 6, 7"),
+            ("m 1, 2, 3,", ".byte 1, 2, 3"),
+            ("m 1, 2, 3, ", ".byte 1, 2, 3"),
+            ("m , , ", ".byte 5, 6, 7"),
+            ("m 1, , c=9", ".byte 1, 6, 9"),
+            ("m 1 , , 3", ".byte 1, 6, 3"),
+            ("r 1, ", ".byte 1"),
+            ("v 1, 2, , 4", ".long 2,,4"),
+        ] {
+            assert_eq!(line(call), want, "{call}");
+        }
+        assert_eq!(
+            expand("m 1, 2, 3, 4").unwrap_err(),
+            "too many positional arguments"
+        );
+        assert_eq!(
+            expand("r , 2").unwrap_err(),
+            "Missing value for required parameter `a' of macro `r'"
+        );
+
+        // The kernel's shape, both ways it is written.
+        let kernel = |call: &str| -> Vec<String> {
+            let src = format!(
+                ".macro _vaes enc, key, data\nvaesenc \\key, \\data, \\data\n.endm\n\
+                 .macro _vb src, dst\nvmovdqu \\src, \\dst\n.endm\n\
+                 .macro _vaes_1x enc, i, xmm_suffix, data, tmp\n\
+                 .ifnb \\xmm_suffix\n_vaes \\enc, (\\i-7)*16(%rdi), \\data\n.else\n\
+                 _vb (\\i-7)*16(%rdi), \\tmp\n_vaes \\enc, \\tmp, \\data\n.endif\n.endm\n{call}\n"
+            );
+            let lines: Vec<String> = src.lines().map(str::to_string).collect();
+            expand_gas_macros(&lines)
+                .unwrap_or_else(|e| panic!("{call}: {e}"))
+                .iter()
+                .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|l| l.starts_with('v'))
+                .collect()
+        };
+        let broadcast = [
+            "vmovdqu (1-7)*16(%rdi), %xmm4",
+            "vaesenc %xmm4, %xmm0, %xmm0",
+        ];
+        assert_eq!(kernel("_vaes_1x 1, 1, , %xmm0, tmp=%xmm4"), broadcast);
+        assert_eq!(kernel("_vaes_1x 1, 1, , %xmm0, %xmm4"), broadcast);
+        assert_eq!(
+            kernel("_vaes_1x 1, 1, _XMM, %xmm0, tmp=%xmm4"),
+            ["vaesenc (1-7)*16(%rdi), %xmm0, %xmm0"]
+        );
+    }
+
     /// GAS 2.47's macro-nesting wall on the pinned oracle: a 101-frame
     /// chain of distinct macros assembles, the 102nd frame fatals with
     /// `macros nested too deeply`, and direct/mutual recursion land on
@@ -4879,6 +5250,130 @@ mod tests {
             seq.push_str("n\n");
         }
         run(&seq).expect("sequential invocations never nest");
+    }
+
+    /// A macro body's references are resolved in one pass, so references
+    /// that touch are each found whatever their names' lengths. The first
+    /// shape is `_vaes_1x` of the kernel's aes-xts-avx-x86_64.S; replacing
+    /// `\xmm_suffix` before `\i` left `KEY\i_XMM` and no `\i` to find. The
+    /// expected lines are what GNU as 2.47 assembles from each source.
+    #[test]
+    fn touching_macro_references_expand_as_in_gas() {
+        let run = |src: &str| {
+            let lines: Vec<String> = src.lines().map(str::to_string).collect();
+            expand_gas_macros(&lines).unwrap()
+        };
+        let lines = |text: &[&str]| text.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            run(".macro one enc, i, xmm_suffix, data\n\
+                 vaesenc KEY\\i\\xmm_suffix, \\data, \\data\n\
+                 .endm\n\
+                 one 1, 5, _XMM, %xmm0\n\
+                 .irp i, 6, 7\n\
+                 one 1, \\i, _XMM, %xmm0\n\
+                 .endr\n"),
+            lines(&[
+                "vaesenc KEY5_XMM, %xmm0, %xmm0",
+                "vaesenc KEY6_XMM, %xmm0, %xmm0",
+                "vaesenc KEY7_XMM, %xmm0, %xmm0",
+            ])
+        );
+        // An argument that spells another parameter's reference is text.
+        assert_eq!(
+            run(".macro two a, b\n.byte \\a\n.endm\ntwo \\b, 7\n"),
+            lines(&[".byte \\b"])
+        );
+        // `\(text)` is the text; `\()` is the empty case of it.
+        assert_eq!(
+            run(".macro three a\n.byte \\a\\()1, \\(4)\\a\n.endm\nthree 2\n"),
+            lines(&[".byte 21, 42"])
+        );
+        // `.` and `$` continue a name, so these references name no
+        // parameter. What is left is no symbol to define: GNU as rejects
+        // both statements, and neither becomes a symbol with a backslash
+        // in its name here (the first is refused by the parser, the second
+        // by the encoder, which finds no such instruction).
+        assert!(parse_asm(".macro four a\n.set s\\a$t, 9\n.endm\nfour 5\n").is_err());
+        let items = parse_asm(".macro five a\nx\\a.y = 7\n.endm\nfive 5\n").unwrap_or_default();
+        assert!(
+            !items.iter().any(|item| matches!(item, AsmItem::Set(..))),
+            "{items:?}"
+        );
+    }
+
+    /// Repeat blocks of the three kinds nest in any order: each `.endr`
+    /// ends the innermost open block. The literal-count `.rept` pre-pass
+    /// counted only `.rept` inside a `.rept` body and none inside an `.irp`,
+    /// so a mixed pair lost the outer block's `.endr`. Expected lines: what
+    /// GNU as 2.47 assembles.
+    #[test]
+    fn repeat_blocks_of_every_kind_nest() {
+        let run = |src: &str| {
+            let lines: Vec<&str> = src.lines().collect();
+            expand_gas_macros(&expand_rept_blocks(&lines).unwrap()).unwrap()
+        };
+        let bytes = |values: &[u32]| {
+            values
+                .iter()
+                .map(|v| format!(".byte {v}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run(".irp i, 1, 2\n.rept 2\n.byte \\i\n.endr\n.endr\n"),
+            bytes(&[1, 1, 2, 2])
+        );
+        assert_eq!(
+            run(".rept 2\n.irp i, 1, 2\n.byte \\i\n.endr\n.endr\n"),
+            bytes(&[1, 2, 1, 2])
+        );
+        assert_eq!(
+            run(".irp i, 1, 2\n.irpc c, 34\n.byte \\i\\c\n.endr\n.endr\n"),
+            bytes(&[13, 14, 23, 24])
+        );
+        assert_eq!(
+            run(".rept 2\n.irpc c, 56\n.rept 2\n.byte \\c\n.endr\n.endr\n.endr\n"),
+            bytes(&[5, 5, 6, 6, 5, 5, 6, 6])
+        );
+        // A block that never ends is refused, whichever kind it is.
+        for open in [
+            ".rept 2\n.byte 1\n",
+            ".irp i, 1\n.byte 1\n",
+            ".irpc c, 1\n.byte 1\n",
+        ] {
+            let lines: Vec<&str> = open.lines().collect();
+            let pre = expand_rept_blocks(&lines);
+            assert!(
+                pre.is_err() || expand_gas_macros(&pre.unwrap()).is_err(),
+                "{open}"
+            );
+        }
+    }
+
+    /// `\@` in an `.irp` or `.irpc` block outside a macro is the number
+    /// the next invocation will get; the block does not take it.
+    #[test]
+    fn the_invocation_number_in_a_repeat_block_is_the_next_one() {
+        let lines: Vec<String> = ".macro m\n.byte \\@\n.endm\n\
+                                  m\n\
+                                  .irp i, 1, 2\n.byte \\@\n.endr\n\
+                                  .irpc c, ab\n.byte \\@\n.endr\n\
+                                  m\n"
+        .lines()
+        .map(str::to_string)
+        .collect();
+        let out = expand_gas_macros(&lines).unwrap();
+        let number = |line: &String| line.trim_start_matches(".byte ").parse::<u64>().unwrap();
+        let n: Vec<u64> = out.iter().map(number).collect();
+        // m, two `.irp` rounds, two `.irpc` rounds, m. Alone in the process
+        // the numbers are k, k+1 four times, k+1 (GNU as: 0 1 1 1 1 1). The
+        // counter is shared with every test running beside this one, so
+        // what is asserted is what no interleaving can change: a block reads
+        // one number for all its rounds, it is past the first invocation's,
+        // and the next invocation's is not before it.
+        assert_eq!(n.len(), 6, "{out:?}");
+        assert_eq!(n[1], n[2], "{out:?}");
+        assert_eq!(n[3], n[4], "{out:?}");
+        assert!(n[0] < n[1] && n[1] <= n[3] && n[3] <= n[5], "{out:?}");
     }
 
     /// `.irp`/`.irpc` amplify `items x body` out of a linear input, and

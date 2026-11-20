@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 541.23,
+      "predicted_gate_seconds": 550.1,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -394,6 +394,10 @@
         {
           "measured_s": 0.04,
           "name": "python3 scripts/check_cond_load_sink_cross_arch.py --self-test"
+        },
+        {
+          "measured_s": 8.87,
+          "name": "python3 tests/regression/check_asm_goto_equivalence.py --lccc target/fastbuild/lccc \\ --cross-only --require-cross-run --self-test-only"
         }
       ]
     },
@@ -2058,8 +2062,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/gates.tsv",
-      "measured_seconds_total": 1096.21,
-      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s); vec-store-contracts and its self-test measured locally as worst-of-5 (1.36 s each; static scan, no compiler); SV-03 four-ISA cross, same-width cast-range, best-tool and matrix gates remeasured locally with the pinned cache toolchain (cross full 0.41 s / self-test 0.04 s, cast full 1.44 s / self-test 0.06 s (32-bit induction proof, worst-of-3), best-tools full 2.13 s / self-test 0.04 s, matrix full 16.63 s / self-test 0.04 s; bit-select fold remeasured worst-of-3 at 3.59 s after the induction runtime oracle); hosted Clang path is pinned on the command line; guarded folds remeasured worst-of-3 at 2.80 s with 21 verdict mutations, Clang 23.1.5 and a strict hosted ICX 2026.2 contract"
+      "measured_seconds_total": 1108.24,
+      "source": "measured by scripts/ci_gate_costs.py; rootfs-write-policy gates measured locally (max of 3 runs); debug-acceptance-parity and asm-dialect-alternatives (4 commands) measured locally as max of 3 runs, floored at 0.25 s, +2.92 s; SV-03 cond-load-sink gate measured locally as max of 3 runs (0.30 s); vec-store-contracts and its self-test measured locally as worst-of-5 (1.36 s each; static scan, no compiler); SV-03 four-ISA cross, same-width cast-range, best-tool and matrix gates remeasured locally with the pinned cache toolchain (cross full 0.41 s / self-test 0.04 s, cast full 1.44 s / self-test 0.06 s (32-bit induction proof, worst-of-3), best-tools full 2.13 s / self-test 0.04 s, matrix full 16.63 s / self-test 0.04 s; bit-select fold remeasured worst-of-3 at 3.59 s after the induction runtime oracle); hosted Clang path is pinned on the command line; guarded folds remeasured worst-of-3 at 2.80 s with 21 verdict mutations, Clang 23.1.5 and a strict hosted ICX 2026.2 contract; asm-goto equivalence register check on AArch64 and RISC-V (one planted fault per target, built at -O0 by the target driver and run under qemu-user) added to shard a, measured locally as max of 3 runs (8.87 s; fastbuild binaries)"
     },
     "codegen": {
       "costs": "/home/user/lccc-bench/split/costs.tsv",

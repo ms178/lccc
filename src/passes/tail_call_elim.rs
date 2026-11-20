@@ -422,7 +422,10 @@ fn accumulator_identity(op: IrBinOp, ty: IrType) -> IrConst {
 }
 
 fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
-    if func.is_variadic || func.is_declaration || func.uses_sret {
+    // `is_gnu_inline_def`: a GNU extern-inline body is never the function a
+    // call reaches. The call it makes to its own name leaves for the symbol
+    // (`IrFunction::body_answers_call`), so it is no back edge.
+    if func.is_variadic || func.is_declaration || func.uses_sret || func.is_gnu_inline_def {
         return 0;
     }
     if func.blocks.is_empty() || func.params.is_empty() {

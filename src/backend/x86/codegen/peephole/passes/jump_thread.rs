@@ -451,14 +451,141 @@ impl SectionIdentity {
         self.current()
     }
 
-    /// Opaque text — an `#APP` region, a pinned line, conditional assembly —
-    /// forgets everything: a wrong name restores a verdict into a section that
-    /// never earned it, which is a miscompile, while an unknown name only costs
-    /// the deletion.
+    /// Opaque text — an `#APP` region that does not visibly leave the section
+    /// it found ([`AsmRegionSections`]), a pinned directive, conditional
+    /// assembly — forgets everything: a wrong name restores a verdict into a
+    /// section that never earned it, which is a miscompile, while an unknown
+    /// name only costs the deletion.
     fn forget(&mut self) {
         self.current = None;
         self.pushed.clear();
     }
+}
+
+/// What one `#APP` region does to the current section, read from its text.
+///
+/// The emitter resumes the function after a region without naming a section:
+/// it relies on the region leaving the section it found, the contract GCC and
+/// Clang rely on as well (both print a switch table as `.section .rodata` …
+/// `.text` on the same belief). Forgetting the section at EVERY region, as
+/// this sweep used to, made it inert in exactly the code that needs it: a
+/// kernel translation unit has an `ALTERNATIVE`, a `__bug_table` or a
+/// `__jump_table` entry in nearly every function, so no function after the
+/// first one could prove its text contiguous around a switch table, and each
+/// relay behind a table stayed in the object (objtool: `unreachable
+/// instruction` in `ftrace_bug`, `rcu_preempt_ctxt_queue`,
+/// `compute_live_registers`, `l1tf_apply_mitigation`).
+///
+/// So the region is READ instead. Its statements are split the way GAS splits
+/// them, and the section is kept only when every switch in it is undone:
+/// `.pushsection` by `.popsection`, a single `.section`/`.text`/`.data`/`.bss`
+/// by `.previous`. Anything that could hide or duplicate a switch
+/// ([`section_proof_ends`]), a quote that does not close, an unmatched pop
+/// or a region that ends displaced still forgets, as before. A macro
+/// call is not visible as one; for it the emitter's own contract stands, the
+/// one that already decides where the rest of the function is assembled.
+#[derive(Default)]
+struct AsmRegionSections {
+    /// `displaced` as saved by each open `.pushsection`.
+    pushed: Vec<bool>,
+    /// One `.section`-style switch is waiting for its `.previous`.
+    displaced: bool,
+    broken: bool,
+}
+
+impl AsmRegionSections {
+    fn feed(&mut self, line: &str) {
+        let mut rest = line;
+        while !self.broken && !rest.is_empty() {
+            let (statement, tail) = match first_asm_statement(rest) {
+                Some(split) => split,
+                None => {
+                    self.broken = true;
+                    return;
+                }
+            };
+            self.statement(statement);
+            rest = tail;
+        }
+    }
+
+    fn statement(&mut self, statement: &str) {
+        // `1: .pushsection x` — labels come first and switch nothing.
+        let mut stmt = statement.trim_ascii();
+        while let Some(colon) = stmt.find(':') {
+            let label = &stmt[..colon];
+            let is_label = !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'));
+            if !is_label {
+                break;
+            }
+            stmt = stmt[colon + 1..].trim_ascii_start();
+        }
+        let Some(directive) = stmt.strip_prefix('.') else {
+            return;
+        };
+        let end = directive
+            .find(|c: char| c.is_whitespace() || c == ',')
+            .unwrap_or(directive.len());
+        // GAS folds the case of a pseudo-op before it looks it up.
+        let name = directive[..end].to_ascii_lowercase();
+        match name.as_str() {
+            "pushsection" => self.pushed.push(std::mem::take(&mut self.displaced)),
+            "popsection" => match self.pushed.pop() {
+                Some(displaced) => self.displaced = displaced,
+                None => self.broken = true,
+            },
+            // Inside an open `.pushsection` the matching pop restores the
+            // section, the previous section and the subsection alike.
+            "section" | "text" | "data" | "bss" | "previous" | "subsection"
+                if !self.pushed.is_empty() => {}
+            "section" | "text" | "data" | "bss" => {
+                // A second switch makes `.previous` return to the first.
+                self.broken |= std::mem::replace(&mut self.displaced, true);
+            }
+            "previous" => self.broken |= !std::mem::take(&mut self.displaced),
+            _ => self.broken |= section_proof_ends(&format!(".{name}")),
+        }
+    }
+
+    /// The region left the section, the previous section and the
+    /// `.pushsection` stack as it found them.
+    fn neutral(&self) -> bool {
+        !self.broken && !self.displaced && self.pushed.is_empty()
+    }
+}
+
+/// Split the first statement off `text` the way GAS does for x86: `;` and a
+/// newline separate statements, `#` starts a comment that runs to the end of
+/// the line, and none of them counts inside a quoted string. `None` when a
+/// quote does not close — the statement boundaries are then unknowable.
+fn first_asm_statement(text: &str) -> Option<(&str, &str)> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, b) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if let Some(q) = quote {
+            if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+        } else {
+            match b {
+                b'"' => quote = Some(b),
+                b';' | b'\n' | b'\r' => return Some((&text[..i], &text[i + 1..])),
+                b'#' => {
+                    let tail = text[i..].find('\n').map_or("", |n| &text[i + n + 1..]);
+                    return Some((&text[..i], tail));
+                }
+                _ => {}
+            }
+        }
+    }
+    (quote.is_none() && !escaped).then_some((text, ""))
 }
 
 /// Cheap gate in front of [`section_switch`], which scans the whole statement
@@ -600,10 +727,16 @@ fn remove_dead_relays(
         let mut tracker = SectionTracker::default();
         let mut identity = SectionIdentity::at(entry_section);
         let mut excursion: Option<(String, bool)> = None;
+        let mut region: Option<AsmRegionSections> = None;
         let mut k = lo;
         while k < hi && found.is_none() {
             let info = infos[k];
             let s = info.trimmed(store.get(k));
+            if info.kind == LineKind::InlineAsm {
+                region.get_or_insert_with(Default::default).feed(s);
+            } else if region.take().is_some_and(|r| !r.neutral()) {
+                identity.forget();
+            }
             if info.is_nop() || info.kind == LineKind::Empty || inert_comment(s) {
                 k += 1;
                 continue;
@@ -668,18 +801,20 @@ fn remove_dead_relays(
                 continue;
             }
             // Everything that can move the next bytes somewhere this scan
-            // cannot follow ends the same-section proof: `pin_inline_asm_regions`
-            // reclassifies and pins each line between `#APP` and `#NO_APP`, so a
-            // `.pushsection` with label arithmetic inside one is invisible here;
-            // a prefixed control transfer is pinned for the same reason; and
-            // `section_proof_ends` names the directives that reshape assembly
-            // without naming a section.
-            if info.pinned
-                || info.kind == LineKind::InlineAsm
+            // cannot follow ends the same-section proof. An `#APP` region puts
+            // bytes of its own into the section, so no excursion verdict
+            // crosses it; whether it also loses the section NAME is decided by
+            // reading it ([`AsmRegionSections`], above). `section_proof_ends`
+            // names the directives that reshape assembly without naming a
+            // section. A pinned INSTRUCTION — a volatile access, a prefixed
+            // transfer — is the compiler's own and switches nothing.
+            let opaque_directive = (info.pinned || section_proof_ends(s))
                 // DIRECTIVE-LAW: bails -- an opaque directive kills the proof.
-                || (info.kind == LineKind::Directive && section_proof_ends(s))
-            {
+                && info.kind == LineKind::Directive;
+            if opaque_directive {
                 identity.forget();
+            }
+            if opaque_directive || info.kind == LineKind::InlineAsm {
                 excursion = None;
             }
             let mnemonic = s.split_whitespace().next().unwrap_or("");
@@ -717,15 +852,31 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     // identity. `None` means unknown, and unknown restores nothing.
     let mut section = SectionIdentity::default();
     let mut start_section: Option<String> = None;
+    let mut region: Option<AsmRegionSections> = None;
     for i in 0..store.len() {
         let info = infos[i];
         let mut endproc = None;
-        if info.pinned || info.kind == LineKind::InlineAsm {
-            // Opaque text — `pin_inline_asm_regions` pins every line of an
-            // `#APP` region, and a prefixed control transfer is pinned too. A
-            // wrong name would restore a fallthrough verdict into a section
+        if info.kind == LineKind::InlineAsm {
+            // An `#APP` region: read it, and decide at its end whether it
+            // left the section it found (see [`AsmRegionSections`]).
+            region
+                .get_or_insert_with(Default::default)
+                .feed(info.trimmed(store.get(i)));
+            continue;
+        }
+        if region.take().is_some_and(|r| !r.neutral()) {
+            // A wrong name would restore a fallthrough verdict into a section
             // that never earned it, so forget the identity instead.
             section.forget();
+        }
+        if info.pinned {
+            // A pinned instruction is the compiler's own (a volatile access,
+            // a prefixed transfer) and names no section; a pinned directive
+            // is not something this scan can vouch for.
+            // DIRECTIVE-LAW: bails -- an opaque directive kills the proof.
+            if info.kind == LineKind::Directive {
+                section.forget();
+            }
         } else if info.kind == LineKind::Directive {
             let s = info.trimmed(store.get(i));
             if s == ".cfi_startproc" {
@@ -1835,6 +1986,171 @@ mod tests {
             out.contains(".LBB1:"),
             "opaque text must end the proof:\n{out}"
         );
+    }
+
+    /// The kernel shape this sweep was inert on: a `WARN` (`ud2` and its
+    /// `__bug_table` entry) ahead of the dispatch, in the same function. The
+    /// region pushes and pops, so the section after it is the section before
+    /// it, and the relay behind the table goes (objtool: `unreachable
+    /// instruction` in `ftrace_bug` and three more of a 6.18.63 build).
+    const BALANCED_REGION: &str = concat!(
+        "#APP\n",
+        "    1:\t ud2\n",
+        "    .pushsection __bug_table,\"aw\"\n",
+        "    2:\t.long 1b - .\t# bug_entry::bug_addr\n",
+        "    .word 2307\t# bug_entry::flags\n",
+        "    .org 2b + 8\n",
+        "    .popsection\n",
+        "    .pushsection .discard.annotate_insn,\"M\",@progbits,8 ; .long 1b - . ; .popsection\n",
+        "#NO_APP\n",
+    );
+    const DISPATCH_AND_RELAY: &str = concat!(
+        "jne .LBB1\n",
+        "jmpq *.Ljt_0(,%rax,8)\n",
+        ".section .rodata\n",
+        ".Ljt_0:\n",
+        ".quad .LBB1\n",
+        ".quad .LBB2\n",
+        ".section .text,\"ax\",@progbits\n",
+        ".LBB1:\n",
+        "jmp .LBB2\n",
+        ".LBB2:\n",
+        "ret\n",
+    );
+
+    #[test]
+    fn a_balanced_asm_region_keeps_the_section() {
+        let (changed, out) = apply(&format!("{BALANCED_REGION}{DISPATCH_AND_RELAY}"), None);
+        assert!(changed, "{out}");
+        assert!(!out.contains(".LBB1:"), "relay swept:\n{out}");
+        assert!(out.contains("jne .LBB2"), "{out}");
+        assert_eq!(out.matches(".quad .LBB2").count(), 2, "{out}");
+        // The region itself reaches the assembler byte for byte.
+        for line in BALANCED_REGION.lines() {
+            assert!(out.contains(line.trim_ascii()), "{line:?} kept:\n{out}");
+        }
+    }
+
+    /// The same across functions: the region is in the function before, and
+    /// nothing names a section in between (`.text` functions follow each other
+    /// without a directive).
+    #[test]
+    fn a_balanced_asm_region_in_an_earlier_function_keeps_the_section() {
+        let text = format!(
+            ".text\ng:\n.cfi_startproc\n{BALANCED_REGION}ret\n.cfi_endproc\n\
+             f:\n.cfi_startproc\n{DISPATCH_AND_RELAY}.cfi_endproc\n"
+        );
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::super::pin_inline_asm_regions(&store, &mut infos);
+        assert!(run(&mut store, &mut infos));
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim_ascii())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!out.contains(".LBB1:"), "relay swept:\n{out}");
+    }
+
+    /// A pinned instruction (a volatile access, a prefixed transfer) is the
+    /// compiler's own text and names no section. It used to end the proof, in
+    /// every function that reads or writes a `volatile`.
+    #[test]
+    fn a_pinned_instruction_keeps_the_section() {
+        let body = format!("movl (%rdi), %eax\n{DISPATCH_AND_RELAY}");
+        let (_, out) = apply(&body, Some("movl (%rdi), %eax"));
+        assert!(!out.contains(".LBB1:"), "relay swept:\n{out}");
+    }
+
+    /// Each way a region can leave another section current, or hide what it
+    /// does, still ends the proof: the relay stays.
+    #[test]
+    fn an_asm_region_that_may_leave_another_section_ends_the_proof() {
+        for region in [
+            // Pushed and never popped.
+            "    .pushsection .text.other,\"ax\"\n",
+            // Popped without a push: whatever was pushed before the function.
+            "    .popsection\n",
+            // Switched and never switched back.
+            "    .section .text.other,\"ax\"\n",
+            "    .text 1\n",
+            // Two switches: `.previous` returns to the first, not to `.text`.
+            "    .section .a ; .section .b ; .previous\n",
+            // `.previous` with nothing to undo swaps to an unknown section.
+            "    .previous\n",
+            // Another chunk of the same section.
+            "    .subsection 1\n",
+            // Conditional assembly and macros can hide or repeat a switch.
+            "    .if 1\n    .pushsection .a\n    .endif\n    .popsection\n",
+            "    .macro m\n    .endm\n",
+            // A quote that does not close: the statements are unknowable.
+            "    .pushsection \"unterminated\n    .popsection\n",
+            // Case does not hide a pseudo-op from GAS, so not from this either.
+            "    .PUSHSECTION .a\n",
+        ] {
+            let body = format!("#APP\n{region}#NO_APP\n{DISPATCH_AND_RELAY}");
+            let (_, out) = apply(&body, None);
+            assert!(
+                out.contains(".LBB1:"),
+                "{region:?} must end the proof:\n{out}"
+            );
+            assert!(
+                out.contains("jne .LBB2"),
+                "the branch still threads:\n{out}"
+            );
+        }
+    }
+
+    /// The statement reader on its own: separators, labels, comments, quotes
+    /// and nesting, each decided the way GAS decides it.
+    #[test]
+    fn asm_region_sections_reads_statements_like_gas() {
+        let neutral = |text: &str| {
+            let mut region = AsmRegionSections::default();
+            for line in text.lines() {
+                region.feed(line);
+            }
+            region.neutral()
+        };
+        for text in [
+            "",
+            "nop",
+            "1: .pushsection .a ; .long 1b - . ; .popsection",
+            ".pushsection .a\n.section .b\n.previous\n.subsection 2\n.popsection",
+            ".pushsection .a\n.pushsection .b\n.popsection\n.popsection",
+            ".section .a ; .previous",
+            ".section \".export_symbol\", \"a\" ; sym: ; .asciz \"GPL\" ; .previous",
+            ".text ; .previous",
+            // `;` and `#` inside a string separate nothing; a comment hides
+            // the rest of its line only.
+            ".pushsection .a ; .asciz \"x ; .section y # z\" ; .popsection",
+            "nop # .section .hidden",
+            ".pushsection .a # .popsection\n.popsection",
+            // A label is not a directive, and a macro call is not visible.
+            ".Lsection: nop",
+            "extable_type_reg type=1, reg=%rax",
+        ] {
+            assert!(neutral(text), "{text:?} leaves the section it found");
+        }
+        for text in [
+            ".pushsection .a",
+            ".popsection",
+            ".section .a",
+            ".section .a ; .section .b ; .previous",
+            ".section .a ; .previous ; .previous",
+            ".data",
+            ".bss",
+            ".subsection 1",
+            ".pushsection .a ; .popsection ; .popsection",
+            "1: 2: .section .a",
+            ".ifdef X\n.endif",
+            ".rept 2\n.endr",
+            ".asciz \"open",
+        ] {
+            assert!(!neutral(text), "{text:?} may leave another section");
+        }
     }
 
     /// `.subsection` moves to another chunk of the SAME section: the chunk the

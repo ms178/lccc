@@ -395,14 +395,54 @@ gate "licm-global-speculation" fast \
 # above the test that guards its loop.
 gate "call-return-facts" fast \
     python3 tests/regression/check_call_return_facts.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
-# An asm goto behaves like the `if (c) goto label;` it stands for: 352 shapes
+# An asm goto behaves like the `if (c) goto label;` it stands for: 400 pairs
 # (what is ahead of the jump, behind it, around it; twelve kinds of storage)
 # are compiled both ways and compared, at -O0..-Os for x86-64 and i686, with
 # the jump spelled as `jnz` and as bytes.  Callee-saved registers are checked
 # around every call.  The committed fixture is what the generator writes.
+# (check_switch_cross_execute.py runs the fixture on the other two targets;
+# `asm-goto-equivalence-cross` below proves the register check there.)
 gate "asm-goto-equivalence" fast \
     python3 tests/regression/check_asm_goto_equivalence.py --lccc "$LCCC" \
     --check-committed --self-test
+# A static key costs its nop: no address load ahead of it, no jump behind it,
+# the guarded call out of line, no register saved for it; and the program
+# computes the same with the keys off (nop) and on (jmp), -O0..-Os, both
+# x86 targets.
+gate "static-key-layout" fast \
+    python3 tests/regression/check_static_key_layout.py --lccc "$LCCC" --self-test
+# `-mfunction-return=thunk-extern` (every x86 kernel build) changes the
+# spelling of the return and nothing in front of it: the 88 benchmark programs
+# compile to the same listing both ways at -O2 and -Os, x86-64 and i686, once
+# `jmp __x86_return_thunk` reads `ret`; six of them are linked against a thunk
+# that is one `ret` and run.  (Before: +11.1 % instructions on x86-64, +2.6 %
+# on i686 -- register liveness gave up every function that returned.)
+gate "return-thunk-parity" fast \
+    python3 tests/regression/check_return_thunk_parity.py --lccc "$LCCC" --self-test
+# An extended asm statement changes its operands and nothing else: 96
+# generated functions exist once with their updates, loads and exchanges as
+# asm and once in C, both keep eight locals alive around the statements, and
+# the two checksums agree at -O0..-Os on both x86 targets and under the return
+# thunk.  On x86-64 a statement staged in at most two registers is no call
+# point, its inputs keep their registers and the peephole reads its text; the
+# shapes that stay call points are generated too.  Five kernel-style
+# statements are held to instruction budgets (no saved register, no stack).
+gate "asm-operand-equivalence" fast \
+    python3 tests/regression/check_asm_operand_equivalence.py --lccc "$LCCC" \
+    --gcc "${GCC:-gcc-16}" --self-test
+# What building amdgpu, ixgbe and KVM asked for (Linux 6.18.63, CachyMod
+# configuration): the fortified `memcmp` wrapper reaches the library once, a
+# parameter array of function pointers keeps its array, no instruction is left
+# behind a jump table or in a default nothing selects (objtool's `unreachable
+# instruction`), a one-label computed goto is a direct jump, the frame of a
+# chain of by-value one-register aggregates does not grow with the chain
+# (`calculate_bandwidth`: 7832 bytes -> 1656; GCC 240), LCCC and GCC agree on
+# that ABI in both directions, and the unused warnings and declarator
+# spellings are GCC's.  The self-test turns two of the fixes off and expects
+# the gate to fail for that reason.
+gate "kernel-driver-shapes" fast \
+    python3 tests/regression/check_kernel_driver_shapes.py --lccc "$LCCC" \
+    --gcc "${GCC:-gcc-16}" --self-test
 gate "call-arg-staging-homes" fast \
     python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
     --seed-list 1,2,3,4,5,6,11,14,16,26,30
@@ -3023,6 +3063,15 @@ gate "cond-load-sink-best-tools-contracts" fast \
     python3 scripts/check_cond_load_sink_best_tools.py --self-test
 gate "asm-goto-outputs" fast \
     bash tests/regression/check_asm_goto_outputs.sh
+# The register check of the asm-goto equivalence fixture, proven on AArch64
+# and RISC-V: a register lost on purpose in one pair has to be reported for
+# that pair alone under qemu-user (SKIP where the emulators are missing -- the
+# hosted shard requires the run).  The pairs themselves run on both targets
+# in check_switch_cross_execute.py; `--cross` runs them here and names the
+# pair that differs.
+gate "asm-goto-equivalence-cross" fast \
+    python3 tests/regression/check_asm_goto_equivalence.py --lccc "$LCCC" \
+    --cross-only --self-test-only
 gate "i686-label-ref-safety" fast \
     bash tests/regression/check_i686_label_ref_safety.sh
 

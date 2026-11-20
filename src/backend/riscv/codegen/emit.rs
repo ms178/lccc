@@ -1002,6 +1002,7 @@ impl ArchCodegen for RiscvCodegen {
         if self.state.next_block_label == Some(block)
             && !self.state.fallthrough_would_alias_observable_label()
         {
+            self.state.branch_elided_into_next_block = true;
             return;
         }
         let out = &mut self.state.out;

@@ -925,6 +925,12 @@ pub struct CodegenState {
     /// Label emitted immediately after the current block, if any. Used to
     /// elide unconditional jumps on the hot fall-through path.
     pub next_block_label: Option<BlockId>,
+    /// The jump that ended the block emitted last was left out, because its
+    /// target is the block emitted next (`ArchCodegen::emit_branch_to_block`).
+    /// The block driver reads and clears this at the next block, whose label
+    /// it leaves out when nothing else leads there
+    /// (`label_identity::blocks_entered_only_by_falling_in`).
+    pub branch_elided_into_next_block: bool,
     /// Next globally unused block-label number reserved for backend-generated
     /// asm-goto output trampolines.
     next_synthetic_block_id: u32,
@@ -1134,6 +1140,7 @@ impl CodegenState {
             fp_const_pool: FxHashMap::default(),
             vec_const_pool: FxHashMap::default(),
             next_block_label: None,
+            branch_elided_into_next_block: false,
             next_synthetic_block_id: 0,
             pending_asm_goto_trampolines: Vec::new(),
             asm_cc_branch_values: FxHashMap::default(),
@@ -1540,6 +1547,7 @@ impl CodegenState {
         self.dirty_upper_ymm = false;
         self.uses_sret = false;
         self.next_block_label = None;
+        self.branch_elided_into_next_block = false;
         // Drop any trampolines a previous function failed to emit instead of
         // asserting on them: a caller that returns before the drain (the
         // `is_naked` path does) would otherwise panic every assertion-enabled

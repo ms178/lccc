@@ -184,6 +184,15 @@ pub(crate) fn apply(module: &mut IrModule, cli: &BuiltinFlags) {
     }
     let asm_labels = &module.asm_labels;
     let mut blocked: FxHashMap<String, bool> = FxHashMap::default();
+    // The names this unit wraps in an inline-only definition, and those of
+    // them whose plain calls wait for the inliner (see below).
+    let wrapped: FxHashSet<String> = module
+        .functions
+        .iter()
+        .filter(|f| f.is_gnu_inline_def && !f.is_declaration)
+        .map(|f| f.name.clone())
+        .collect();
+    let mut waiting: FxHashSet<String> = FxHashSet::default();
     for func in &mut module.functions {
         let mut function_policy = policy;
         // A GNU extern-inline body is not an out-of-line TU definition, so it
@@ -227,9 +236,23 @@ pub(crate) fn apply(module: &mut IrModule, cli: &BuiltinFlags) {
             // this exception to an ordinary library name.
             let defined_fortified_stdio =
                 blocks && inventory.permits_fortified_definition(callee, asm);
-            info.assume_library = cli.may_assume(callee) && (!blocks || defined_fortified_stdio);
+            let library = cli.may_assume(callee) && (!blocks || defined_fortified_stdio);
+            // A plain call to a name the unit wraps is the wrapper's call
+            // until the inliner has run: folded as the library function now,
+            // it would lose the checks the wrapper puts in front of it
+            // (`memcpy(buf4, s, 8)` copied eight bytes into four with no
+            // `fortify_panic`; GCC 16.2 and Clang 23.1.5 keep the check --
+            // GCC through `avoid_folding_inline_builtin`).  The inliner
+            // settles what it leaves (`settle_wrapped_library_calls`).
+            // Inside the wrapper its own name is the symbol's, at once.
+            if library && wrapped.contains(callee.as_str()) && *callee != func.name {
+                waiting.insert(callee.clone());
+                continue;
+            }
+            info.assume_library = library;
         }
     }
+    module.wrapped_library_names = waiting;
 }
 
 /// The x86-64 and AArch64 [`library_memcpy_inline_max`].  64 bytes is the x86-64 emitter's
@@ -476,7 +499,16 @@ mod tests {
         );
     }
 
-    /// From #844: a declaration says the symbol is referenced, not provided.
+    /// From #844: a declaration says the symbol is referenced, not provided,
+    /// and neither does a GNU extern-inline body: the library still exists
+    /// behind it and may be synthesized.
+    ///
+    /// A PLAIN call to the wrapped name is another matter until the inliner
+    /// has run: it is the wrapper's call, and the wrapper's checks belong in
+    /// front of it. Read as the library function at once, `memcpy(buf4, s,
+    /// 8)` was expanded inline past the kernel's `fortify_panic` (GCC 16.2
+    /// and Clang 23.1.5 keep the check). So the call waits, the name is
+    /// handed to the inliner, and the inliner settles what it leaves.
     #[test]
     fn declarations_and_gnu_inline_bodies_are_not_definitions() {
         let mut wrapper = func("memcpy", true, &["__memcpy_chk"]);
@@ -487,8 +519,64 @@ mod tests {
             func("main", true, &["memcpy", "printf"]),
         ]);
         apply(&mut m, &BuiltinFlags::default());
-        assert!(assumed(&m, "main").iter().all(|(_, a)| *a));
+        assert_eq!(
+            assumed(&m, "main"),
+            pairs(&[("memcpy", false), ("printf", true)])
+        );
+        assert!(m.wrapped_library_names.contains("memcpy"));
+        assert_eq!(m.wrapped_library_names.len(), 1);
         assert!(may_synthesize(&m, "main", Libcall::Memcpy));
+
+        crate::passes::inline::settle_wrapped_library_calls(&mut m);
+        assert!(assumed(&m, "main").iter().all(|(_, a)| *a));
+        assert!(m.wrapped_library_names.is_empty());
+    }
+
+    /// Inside the wrapper its own name is the library's at once: the kernel's
+    /// fortified `memcmp` returns `__builtin_memcmp(...)`, which lowering
+    /// spells `Call "memcmp"` with the assumption already set, and a plain
+    /// self-named call there can only mean the symbol too. Read as a call of
+    /// the wrapper it made the wrapper contain itself: inlined into itself
+    /// 468 times in an 18-line file, then turned into a loop
+    /// (`__jump_label_patch` ended in a jump to itself).
+    #[test]
+    fn a_wrapper_calling_its_own_name_calls_the_library() {
+        let mut wrapper = func("memcmp", true, &["fortify_panic", "memcmp"]);
+        wrapper.is_gnu_inline_def = true;
+        if let Instruction::Call { info, .. } = &mut wrapper.blocks[0].instructions[1] {
+            // What lowering leaves for `__builtin_memcmp`.
+            info.assume_library = true;
+        }
+        let mut plain = func("strlen", true, &["strlen"]);
+        plain.is_gnu_inline_def = true;
+        let mut m = module(vec![wrapper, plain, func("user", true, &["memcmp"])]);
+        apply(&mut m, &BuiltinFlags::default());
+
+        let wrapper = &m.functions[0];
+        let Instruction::Call { info, .. } = &wrapper.blocks[0].instructions[1] else {
+            panic!("the library call");
+        };
+        assert!(info.assume_library);
+        assert!(
+            !wrapper.body_answers_call(info),
+            "the body of the wrapper is not what its library call reaches"
+        );
+        // A plain self-named call inside a wrapper is the symbol as well.
+        assert_eq!(assumed(&m, "strlen"), pairs(&[("strlen", true)]));
+        // The user's plain call is the wrapper's, and the wrapper answers it.
+        let user = m.functions.iter().find(|f| f.name == "user").unwrap();
+        let Instruction::Call { info, .. } = &user.blocks[0].instructions[0] else {
+            panic!("the user's call");
+        };
+        assert!(!info.assume_library);
+        assert!(m.functions[0].body_answers_call(info));
+        // An ordinary definition answers every call of its name.
+        let ordinary = func("helper", true, &[]);
+        let library_call = CallInfo {
+            assume_library: true,
+            ..CallInfo::default()
+        };
+        assert!(ordinary.body_answers_call(&library_call));
     }
 
     /// The loop inside `memset` must not become `call memset` (GCC 16.2

@@ -722,6 +722,48 @@ fn a_use_of_an_asm_output_before_the_asm_is_reported() {
     assert_reports(&f, "does not dominate its use");
 }
 
+/// `absolute_pointer(x)`: one asm hides a pointer (`"=r"(p) : "0"(p)`, an
+/// SSA definition) and a later asm writes through it (`"=m"(*p)`, a memory
+/// home).  The first is a definition and nothing else; it was reported as a
+/// use of the value at the instruction that defines it.
+#[test]
+fn a_value_one_asm_defines_and_a_later_asm_writes_through_is_clean() {
+    let asm = |outputs: Vec<(&str, u32)>, inputs: Vec<(&str, Operand)>| Instruction::InlineAsm {
+        template: String::new(),
+        outputs: outputs
+            .into_iter()
+            .map(|(c, id)| (c.to_string(), Value(id), None))
+            .collect(),
+        inputs: inputs
+            .into_iter()
+            .map(|(c, op)| (c.to_string(), op, None))
+            .collect(),
+        clobbers: vec![],
+        operand_types: vec![],
+        goto_labels: vec![],
+        input_symbols: vec![],
+        seg_overrides: vec![],
+    };
+    let hide = || asm(vec![("=r", 11)], vec![("0", c0())]);
+    let write_through = || asm(vec![("=m", 11)], vec![]);
+    assert_clean(&func_of(vec![blk(0, vec![hide(), write_through()], ret())]));
+    // In another block the first still dominates the second.
+    assert_clean(&func_of(vec![
+        blk(0, vec![hide()], br(1)),
+        blk(1, vec![write_through()], ret()),
+    ]));
+    // The control: a home that is defined on one way in only is still a use
+    // nothing guarantees.
+    assert_reports(
+        &func_of(vec![
+            blk(0, vec![def(1)], condbr(1, 1, 2)),
+            blk(1, vec![hide()], br(2)),
+            blk(2, vec![write_through()], ret()),
+        ]),
+        "does not dominate its use",
+    );
+}
+
 #[test]
 fn a_read_write_asm_output_naming_an_alloca_is_a_memory_home_not_a_redefinition() {
     // `asm("..." : "+a"(x))` names x's stack home: the Alloca stays the

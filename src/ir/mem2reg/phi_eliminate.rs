@@ -235,14 +235,14 @@ fn successor_count(block: &BasicBlock) -> usize {
     seen.len()
 }
 
-/// Send the edges from `block` to `old_target` to `new_target` instead: one
-/// occurrence in the terminator, and every asm goto label.
+/// Send the edges from `block` to `old_target` to `new_target` instead: the
+/// terminator's (see [`retarget_terminator`]), and every asm goto label.
 ///
 /// The asm gotos are not an alternative to the terminator.  A block may reach
 /// the target both ways, the phi has one entry for the block either way, and
 /// the copies of that entry have to run on each of the edges.
 fn retarget_block_edges(block: &mut BasicBlock, old_target: BlockId, new_target: BlockId) {
-    retarget_terminator_once(&mut block.terminator, old_target, new_target);
+    retarget_terminator(&mut block.terminator, old_target, new_target);
     for inst in &mut block.instructions {
         if let Instruction::InlineAsm { goto_labels, .. } = inst {
             for (_, label) in goto_labels.iter_mut() {
@@ -254,8 +254,15 @@ fn retarget_block_edges(block: &mut BasicBlock, old_target: BlockId, new_target:
     }
 }
 
-/// Replace one occurrence of `old_target` with `new_target` in a terminator.
-fn retarget_terminator_once(terminator: &mut Terminator, old_target: BlockId, new_target: BlockId) {
+/// Replace `old_target` with `new_target` in a terminator: one arm of a
+/// conditional branch, and EVERY case of a switch that names it.
+///
+/// A phi has one entry per predecessor block, so the copies of that entry
+/// belong on each edge the block has into the target. A `Switch` can have
+/// several (`case 4: case 6: v = 30; break;` once the empty case blocks are
+/// threaded): moving only the first left the other cases jumping straight to
+/// the target, past the copies, with whatever the phi's home held.
+fn retarget_terminator(terminator: &mut Terminator, old_target: BlockId, new_target: BlockId) {
     match terminator {
         Terminator::Branch(t) => {
             if *t == old_target {
@@ -284,8 +291,11 @@ fn retarget_terminator_once(terminator: &mut Terminator, old_target: BlockId, ne
         Terminator::Switch { cases, default, .. } => {
             if *default == old_target {
                 *default = new_target;
-            } else if let Some((_, t)) = cases.iter_mut().find(|(_, t)| *t == old_target) {
-                *t = new_target;
+            }
+            for (_, target) in cases.iter_mut() {
+                if *target == old_target {
+                    *target = new_target;
+                }
             }
         }
         _ => {}
@@ -2032,6 +2042,87 @@ mod tests {
     fn hoists(blocks: &[BasicBlock], block_idx: usize, copies: &[Instruction]) -> bool {
         let uses = BlockUses::from_blocks(blocks);
         self_loop_copies_can_hoist(&blocks[block_idx], copies, &uses, block_idx)
+    }
+
+    /// `case 4: case 6: v = 30; break;` with the empty case blocks threaded:
+    /// the switch block reaches the join twice (and once more by default) and
+    /// owns ONE phi entry there. Each of those edges has to pass the copy.
+    /// Only the first used to be sent through the trampoline; the others
+    /// reached the join with whatever the phi's home held (`queue()` in
+    /// tests/regression/switch_break_cases_covered_default.c returned 6 for
+    /// 36).
+    #[test]
+    fn every_switch_edge_into_a_phi_target_passes_the_copies() {
+        for policy in [CopyOrderPolicy::Acyclic, CopyOrderPolicy::Legacy] {
+            let mut func = IrFunction::new(
+                "multi_edge".to_string(),
+                crate::common::types::IrType::I32,
+                Vec::new(),
+                false,
+            );
+            let konst = |v: i32| Operand::Const(crate::ir::reexports::IrConst::I32(v));
+            func.blocks = vec![
+                blk(
+                    0,
+                    vec![cmp9(1)],
+                    Terminator::Switch {
+                        val: Operand::Value(Value(9)),
+                        cases: vec![
+                            (4, BlockId(2)),
+                            (5, BlockId(1)),
+                            (6, BlockId(2)),
+                            (7, BlockId(2)),
+                        ],
+                        default: BlockId(2),
+                        ty: crate::common::types::IrType::I32,
+                    },
+                ),
+                blk(1, Vec::new(), Terminator::Branch(BlockId(2))),
+                blk(
+                    2,
+                    vec![Instruction::Phi {
+                        dest: Value(20),
+                        ty: crate::common::types::IrType::I32,
+                        incoming: vec![(konst(30), BlockId(0)), (konst(40), BlockId(1))],
+                    }],
+                    Terminator::Return(Some(Operand::Value(Value(20)))),
+                ),
+            ];
+            func.next_value_id = 64;
+            func.next_label = 3;
+            let mut next_block_id = 3;
+            eliminate_phis_with_policy(&mut func, &mut next_block_id, policy);
+
+            let Terminator::Switch { cases, default, .. } = &func.blocks[0].terminator else {
+                panic!("{policy:?}: the switch stays a switch");
+            };
+            let edge = *default;
+            assert_ne!(edge, BlockId(2), "{policy:?}: the default passes the copy");
+            for &(value, target) in cases {
+                if value == 5 {
+                    assert_eq!(target, BlockId(1), "{policy:?}: case 5 keeps its block");
+                } else {
+                    assert_eq!(target, edge, "{policy:?}: case {value} passes the copy");
+                }
+            }
+            let trampoline = func
+                .blocks
+                .iter()
+                .find(|b| b.label == edge)
+                .unwrap_or_else(|| panic!("{policy:?}: the edge block exists"));
+            assert!(
+                matches!(trampoline.terminator, Terminator::Branch(BlockId(2))),
+                "{policy:?}"
+            );
+            assert!(
+                trampoline.instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::Copy { src, .. } if *src == konst(30)
+                )),
+                "{policy:?}: {:?}",
+                trampoline.instructions
+            );
+        }
     }
 
     #[test]
