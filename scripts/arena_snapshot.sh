@@ -66,7 +66,7 @@ KEEP=${MS178_KEEP:-12}
 [[ $KEEP =~ ^[1-9][0-9]*$ ]] || { echo "error: MS178_KEEP must be a positive integer" >&2; exit 2; }
 
 cd "$REPO"
-if [[ ! -d .git ]]; then
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
   echo "error: $REPO is not a git repository; nothing to snapshot" >&2
   echo "       restore it with scripts/arena_session_restore.sh --source-only" >&2
   exit 1
@@ -93,19 +93,10 @@ if [[ -z $base ]]; then
 fi
 
 # ---- scratch guard ---------------------------------------------------------
-# `git add -N` is deliberately broad (it is what makes a brand-new test appear
-# without a manifest) and that breadth has shipped generated scratch before:
-# 61 benchmark `.s` dumps reached the user-facing patch once, 83.7% of the diff.
-# Only ADDITIONS are inspected; upstream legitimately tracks work/ scratch.
-git add -A -N
-mapfile -t staged < <(git diff --cached --name-only --diff-filter=A)
-git reset -q
-# `git reset` above clears the intent-to-add marks, so untracked files would
-# disappear from the `git diff <base>` below and the publisher would report an
-# empty delta while a brand-new script sits right there. Re-arm them and leave
-# them armed for the diff; the trailing reset at the end restores the caller's
-# index state (some workflows assert on a clean `git status`).
-git add -A -N
+# Freeze one tree in a disposable index. Use that same immutable object for
+# the scratch guard, stamp, payload and statistics; never reset the caller.
+tree=$(bash scripts/worktree_tree.sh)
+mapfile -d '' -t staged < <(git diff --name-only -z --diff-filter=A "$base" "$tree" --)
 scratch=()
 for f in "${staged[@]:-}"; do
   [[ -z $f ]] && continue
@@ -137,7 +128,6 @@ fi
 # A stamp for a DIFFERENT tree is not a pass.  That is the whole point of
 # keying on the tree, and it is why the check below compares the stamp's own
 # `tree=` field instead of trusting the file's presence.
-tree=$(bash scripts/worktree_tree.sh 2>/dev/null || git write-tree 2>/dev/null || true)
 stamp=${LCCC_CI_STAMP:-$REPO/target/ci_local.pass}
 gate="UNGATED"
 if [[ -n $tree && -r $stamp ]]; then
@@ -156,21 +146,23 @@ if [[ $gate == UNGATED && ${MS178_UNGATED:-0} != 1 ]]; then
 fi
 
 # ---- build the patch -------------------------------------------------------
+if [[ ${MS178_DRY_RUN:-0} == 1 ]]; then
+  git diff --stat "$base" "$tree" --
+  printf 'gate       %s\n' "$gate"
+  exit 0
+fi
 ts=$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$OUTDIR"
 name="ms178-1.$ts.$slug.patch"
 tmp="$OUTDIR/.$name.tmp"
-git diff "$base" -- > "$tmp"
+git diff --binary --full-index --no-ext-diff --no-textconv "$base" "$tree" -- > "$tmp"
 if [[ ! -s $tmp ]]; then
   rm -f "$tmp"
   echo "error: empty diff against $base; nothing to publish" >&2
   exit 1
 fi
-# Statistics are captured while the intent-to-add marks are still armed: after
-# the trailing `git reset` below, untracked files vanish from the diff and the
-# summary would report a zero-file snapshot of a non-empty patch (observed).
-files_changed=$(git diff --name-only "$base" -- | wc -l)
-numstat=$(git diff --numstat "$base" -- | awk '{a+=$1; d+=$2} END {print a+0" additions, "d+0" deletions"}')
+files_changed=$(git diff --name-only -z "$base" "$tree" -- | tr -cd '\0' | wc -c)
+numstat=$(git diff --numstat "$base" "$tree" -- | awk '{a+=$1; d+=$2} END {print a+0" additions, "d+0" deletions"}')
 # fsync before rename: rename is atomic for readers, but the CONTENT must be on
 # stable storage first or a host-level crash exposes a zero-length file.
 sync "$tmp" 2>/dev/null || true
@@ -195,10 +187,9 @@ for target in "$publish_dir/ms178-1.patch" "$publish_dir/ms178-1.$ts.$slug.patch
   mv -f "$target.tmp" "$target"
 done
 ln -sfn "$name" "$OUTDIR/ms178-1.patch"
-git reset -q
 
 # ---- lineage ledger --------------------------------------------------------
-files=$(git diff --stat "$base" -- | tail -1)
+files=$(git diff --stat "$base" "$tree" -- | tail -1)
 {
   printf 'timestamp  %s\n' "$ts"
   printf 'slug       %s\n' "$slug"

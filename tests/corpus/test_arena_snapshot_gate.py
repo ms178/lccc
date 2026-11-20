@@ -53,6 +53,38 @@ class ArenaSnapshotGateTests(unittest.TestCase):
                                'gate-test', 'gate contract'],
                               env=env, capture_output=True, text=True, timeout=120)
 
+    def test_publish_preserves_index_and_round_trips_binary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self.make_repo(root)
+            (repo / 'a.txt').write_text('staged')
+            subprocess.run(['git', 'add', 'a.txt'], cwd=repo, check=True)
+            (repo / 'a.txt').write_text('worktree')
+            (repo / 'binary').write_bytes(bytes(range(256)))
+            index = repo / '.git' / 'index'
+            before = index.read_bytes()
+            result = self.run_publisher(repo, root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(index.read_bytes(), before)
+            subprocess.run(['git', 'apply', '--reverse', '--check',
+                            str(root / 'publish' / 'ms178-1.patch')], cwd=repo, check=True)
+
+    def test_untracked_scratch_refused_and_dry_run_does_not_publish(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self.make_repo(root)
+            scratch = repo / 'scratch file.tmp'
+            scratch.touch()
+            result = self.run_publisher(repo, root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(scratch.name, result.stderr)
+            scratch.unlink()
+            (repo / 'a.txt').write_text('modified')
+            result = self.run_publisher(repo, root, ('MS178_DRY_RUN', '1'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((root / 'publish').exists())
+            self.assertFalse((root / 'snapshots').exists())
+
     def test_matching_stamp_is_a_pass(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
