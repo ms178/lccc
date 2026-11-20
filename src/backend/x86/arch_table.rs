@@ -78,7 +78,7 @@ impl X86ExtraFeature {
                 bits(&[Sse, Sse2, Sse3, Ssse3, Sse41, Sse42, Xsave, Avx, Avx2])
             }
             X86ExtraFeature::Sm3 | X86ExtraFeature::Sm4 => {
-                bits(&[Sse, Sse2, Sse3, Ssse3, Sse41, Sse42, Avx])
+                bits(&[Sse, Sse2, Sse3, Ssse3, Sse41, Sse42])
             }
             X86ExtraFeature::AmxTile | X86ExtraFeature::AmxInt8 | X86ExtraFeature::AmxBf16 => {
                 bits(&[Xsave])
@@ -153,8 +153,8 @@ pub(crate) struct X86ArchRow {
     pub name: &'static str,
     /// GCC accepts the name for x86-64 code (`-m64`).
     pub x86_64: bool,
-    features: u64,
-    extras: u32,
+    pub(crate) features: u64,
+    pub(crate) extras: u32,
     /// GCC's `-march=` CPU macros (`__haswell`, `__core_avx2__`, ...).
     pub arch_macros: &'static [&'static str],
     /// GCC's `-mtune=` macros (`__tune_haswell__`, ...); `-march=` alone

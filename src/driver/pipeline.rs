@@ -452,6 +452,25 @@ pub struct Driver {
     /// keeps `__POPCNT__`, `-mavx -mno-sse4.2` drops it (measured,
     /// gcc-16.2). See `Driver::apply_x86_feature_dependencies`.
     pub(super) arch_grants_popcnt: bool,
+    /// Set by `-mgeneral-regs-only` when POPCNT was live at that point. GCC
+    /// 16.2 does not cascade the general-register denial into POPCNT, and it
+    /// stays from then on: a later `-mno-sse4.2`, `-mno-sse2` or `-march=`
+    /// does not withdraw it (measured: `-mavx -mgeneral-regs-only -mno-sse4.2`,
+    /// `-mavx -mgeneral-regs-only -march=x86-64` both define `__POPCNT__`).
+    /// Only an explicit `-mno-popcnt` removes it. Applied by
+    /// `Driver::apply_x86_feature_dependencies`.
+    pub(super) popcnt_held_by_general: bool,
+    /// CRC32 counterpart of [`Self::popcnt_held_by_general`]: GCC's
+    /// `-mgeneral-regs-only` adds CRC32 under the same SSE4.2-live condition,
+    /// and it stays until the next SSE4.2 cycle (measured: `-mavx
+    /// -mgeneral-regs-only` defines `__CRC32__` without `__SSE4_2__`).
+    pub(super) crc32_held_by_general: bool,
+    /// SSE4.2 granted by an explicit option (`-msse4.2`, `-mfma`, the AVX and
+    /// AVX2 classes) and not withdrawn since. `-march=` rows never set it:
+    /// GCC applies them after option parsing, so `-march=haswell
+    /// -mgeneral-regs-only` does NOT define `__CRC32__` or keep POPCNT through
+    /// the denial, while `-mavx -mgeneral-regs-only` does (measured).
+    pub(super) sse42_explicit: bool,
     /// Set by `-mno-movbe`: MOVBE forbidden.
     pub(super) movbe_explicitly_disabled: bool,
     /// Set by `-mno-cx16`: CMPXCHG16B forbidden.
@@ -931,6 +950,9 @@ impl Driver {
             march_pre_sse: false,
             march_pre_sse_mmx: false,
             arch_grants_popcnt: false,
+            popcnt_held_by_general: false,
+            crc32_held_by_general: false,
+            sse42_explicit: false,
             march_fxsr: true,
             fxsr_override: None,
             movbe_explicitly_disabled: false,
@@ -2341,13 +2363,12 @@ impl Driver {
             // SSE level: its handler clears `no_sse2` only when no EXPLICIT
             // SSE2 denial is pending, so `-mno-sse -msse` restores baseline
             // SSE2 while `-mno-sse2 -msse` must not. `-mgeneral-regs-only`
-            // drops all three, including `__MMX__`.
+            // drops all three, including `__MMX__`, until an explicit `-mmmx`
+            // re-arms it (measured: `-mgeneral-regs-only -mmmx` defines it).
             (
                 self.target == Target::X86_64 && !self.no_sse,
                 self.target == Target::X86_64 && !self.no_sse2,
-                self.target == Target::X86_64
-                    && !self.general_regs_only
-                    && !self.mmx_explicitly_disabled,
+                self.target == Target::X86_64 && !self.mmx_explicitly_disabled,
             )
         };
         preprocessor.set_sse_macros(sse_on, sse2_on, mmx_on);
@@ -2395,6 +2416,7 @@ impl Driver {
             simd_macros_enabled && self.enable_ssse3,
             simd_macros_enabled && self.enable_sse4_1,
             simd_macros_enabled && self.enable_sse4_2,
+            (simd_macros_enabled && self.enable_sse4_2) || self.crc32_held_by_general,
             simd_macros_enabled && self.enable_avx,
             simd_macros_enabled && self.enable_avx2,
             self.enable_aes,
@@ -2445,7 +2467,7 @@ impl Driver {
             simd_macros_enabled && self.enable_vpclmulqdq,
             simd_macros_enabled && self.enable_avxvnniint8,
             simd_macros_enabled && self.enable_avxvnniint16,
-            simd_macros_enabled && self.resolved_sha512(),
+            simd_macros_enabled && self.announced_sha512(),
             simd_macros_enabled && self.enable_sm3,
             simd_macros_enabled && self.enable_sm4,
             // MOVRS, AMX and CMPCCXADD use no SSE register: GCC 16.2 keeps
@@ -2457,6 +2479,7 @@ impl Driver {
             self.enable_amx_bf16,
             self.enable_cmpccxadd,
             self.enable_apxf,
+            self.enable_user_msr,
         );
         for macro_name in self.x86_cpu_name_macros() {
             preprocessor.define_macro(macro_name, "1");
@@ -5201,18 +5224,29 @@ impl Driver {
             && !self.xsave_explicitly_disabled
     }
 
-    /// SHA-512 permission (`__SHA512__`, `_mm256_sha512*`): the `-msha512`
-    /// option or a `-march=` row's bit, under the `-mno-xsave` veto.
+    /// SHA-512 announcement: whether `__SHA512__` is defined.
     ///
-    /// The veto is GCC's, measured on gcc-16.2 with `-dM -E`: `-msha512
-    /// -mno-xsave` and `-march=clearwaterforest -mno-xsave` leave the
-    /// option bit set, but the macro set in `scripts/check_x86_mflag_macros.py`
-    /// (`XSAVE_CASCADE_MACROS`) fixes lccc to the stricter result: SHA-512
-    /// is withdrawn with the XSAVE state it is saved with. A later `-mxsave`,
-    /// or an AVX-class option that implies it, re-arms it. Order does not
-    /// matter: the decision is made from the resolved XSAVE state, never
-    /// from the raw option bit, so `-mno-xsave -msha512` and
-    /// `-msha512 -mno-xsave` agree with the sticky `-mno-xsave` veto.
+    /// This follows the option alone. GCC 16.2 defines `__SHA512__` for
+    /// `-msha512` under `-mno-xsave` in every flag order (measured with
+    /// `-dM -E`: `-msha512 -mno-xsave` defines `__SHA512__` and nothing else
+    /// of AVX/XSAVE), and Clang 23.1.5 does too. The withdrawal this function
+    /// used to apply matched neither compiler, and it did not protect any
+    /// program: a `#ifdef __SHA512__` probe that takes its `#else` branch
+    /// reaches AVX2 code that `-mno-xsave` also rejects.
+    pub(super) fn announced_sha512(&self) -> bool {
+        self.enable_sha512
+    }
+
+    /// SHA-512 intrinsic permission (`_mm256_sha512*`): the option, under the
+    /// `-mno-xsave` veto.
+    ///
+    /// The 256-bit forms are AVX state, so `-mno-xsave` withdraws them. GCC 16.2
+    /// rejects `_mm256_sha512msg2_epi64` under `-msha512 -mno-xsave` (an ICE
+    /// in expand, i.e. not accepted), and lccc refuses the call with a
+    /// diagnostic. A later `-mxsave`, or an AVX-class option that implies it,
+    /// re-arms it. The decision is made from the resolved XSAVE state, so
+    /// `-mno-xsave -msha512` and `-msha512 -mno-xsave` are ordered by the
+    /// last flag, as in GCC.
     pub(super) fn resolved_sha512(&self) -> bool {
         self.enable_sha512 && self.resolved_xsave()
     }
@@ -5338,7 +5372,6 @@ impl Driver {
     /// (measured on 16.2).
     pub(crate) fn resolved_i686_mmx(&self) -> bool {
         (!self.march_pre_sse || self.march_pre_sse_mmx || self.resolved_i686_sse())
-            && !self.general_regs_only
             && !self.mmx_explicitly_disabled
     }
 
@@ -5603,7 +5636,7 @@ impl Driver {
         set.insert_if(self.enable_aes, F::Aes);
         set.insert_if(self.enable_pclmul, F::Pclmul);
         set.insert_if(self.enable_sha, F::Sha);
-        set.insert_if(self.resolved_sha512(), F::Sha512);
+        set.insert_if(self.announced_sha512(), F::Sha512);
         // VAES / VPCLMULQDQ: the EVEX 256-bit forms of `aesenc` and
         // `pclmulqdq`.  Two conditions, both measured against GCC 12.2:
         //   * the 256-bit vector class must be permitted (`isa.ymm`, the

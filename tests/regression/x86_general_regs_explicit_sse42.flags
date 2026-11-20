@@ -1,0 +1,1 @@
+-mavx -mgeneral-regs-only -mmmx -mno-sse4.2

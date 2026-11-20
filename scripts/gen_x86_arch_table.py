@@ -386,6 +386,17 @@ def measure_implied(options):
     return sorted(rules, key=lambda r: (r[1] in PSEUDO_CONST, ORDER.index(r[1]) if r[1] in ORDER else 0, r[0]))
 
 
+# A feature the measurement finds removing an extension that GCC does NOT
+# withdraw it for. `-mno-xsave` clears the ISA AVX bit (GCC's XSAVE_UNSET
+# includes AVX_UNSET) but SM3 and SM4 are ISA2 extensions whose withdrawal
+# chain is ISA2_AVX_UNSET, which only `-mno-avx` reaches. A removal probe sees
+# only the one AVX bit, so `Avx` is dropped from their requirement here; the
+# driver withdraws them on `-mno-avx` explicitly (`withdraw_x86_extra`).
+# Measured with gcc-16.2: `-msm3 -mno-xsave` defines `__SM3__`,
+# `-msm3 -mno-avx` does not, and the same holds for `-msm4`.
+XSAVE_CASCADE_EXEMPT = {'Sm3': {'Avx'}, 'Sm4': {'Avx'}}
+
+
 def measure_extra_requires():
     """{extension: (features, extensions) whose `-mno-` removes it}, each
     measured on `-march=x86-64 -mEXTENSION`: AVXIFMA leaves with AVX2,
@@ -403,7 +414,9 @@ def measure_extra_requires():
         def removed_by(options):
             return [v for option, v in options if v != variant
                     and not re.search(rf'^#define {macro} ', run(base + [f'-mno-{option}']).stdout, re.M)]
-        return variant, (removed_by(feature_options), removed_by(extra_options))
+        features = [f for f in removed_by(feature_options)
+                    if f not in XSAVE_CASCADE_EXEMPT.get(variant, ())]
+        return variant, (features, removed_by(extra_options))
 
     with ThreadPoolExecutor(os.cpu_count() or 1) as pool:
         return dict(pool.map(requires, EXTRA_MACROS))
@@ -593,8 +606,8 @@ def render(rows, options, implied, requires, derived, tunes):
         '    pub name: &\'static str,',
         '    /// GCC accepts the name for x86-64 code (`-m64`).',
         '    pub x86_64: bool,',
-        '    features: u64,',
-        '    extras: u32,',
+        '    pub(crate) features: u64,',
+        '    pub(crate) extras: u32,',
         '    /// GCC\'s `-march=` CPU macros (`__haswell`, `__core_avx2__`, ...).',
         '    pub arch_macros: &\'static [&\'static str],',
         '    /// GCC\'s `-mtune=` macros (`__tune_haswell__`, ...); `-march=` alone',
