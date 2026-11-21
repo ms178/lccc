@@ -10431,7 +10431,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha1msg1_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha1msg1"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -10446,7 +10448,9 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha1msg2_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha1msg2"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -10461,29 +10465,33 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha1nexte_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha1nexte"
+      ],
       "wrapper_dependencies": []
     },
     {
       "arities": [
         3
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
-        "macro"
+        "function"
       ],
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha1rnds4_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha1rnds4"
+      ],
       "wrapper_dependencies": []
     },
     {
       "arities": [
         2
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -10491,14 +10499,16 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha256msg1_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha256msg1"
+      ],
       "wrapper_dependencies": []
     },
     {
       "arities": [
         2
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -10506,14 +10516,16 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha256msg2_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha256msg2"
+      ],
       "wrapper_dependencies": []
     },
     {
       "arities": [
         3
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -10521,7 +10533,60 @@
       "generic_helpers": [],
       "header": "shaintrin.h",
       "name": "_mm_sha256rnds2_epu32",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_sha256rnds2"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": true,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "sha512intrin.h",
+      "name": "_mm256_sha512msg1_epi64",
+      "raw_builtins": [
+        "__builtin_ia32_vsha512msg1"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": true,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "sha512intrin.h",
+      "name": "_mm256_sha512msg2_epi64",
+      "raw_builtins": [
+        "__builtin_ia32_vsha512msg2"
+      ],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        3
+      ],
+      "canonical_override": true,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "sha512intrin.h",
+      "name": "_mm256_sha512rnds2_epi64",
+      "raw_builtins": [
+        "__builtin_ia32_vsha512rnds2"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -18318,6 +18383,9 @@
     "_mm256_cmpord_ps",
     "_mm256_cmpunord_pd",
     "_mm256_cmpunord_ps",
+    "_mm256_sha512msg1_epi64",
+    "_mm256_sha512msg2_epi64",
+    "_mm256_sha512rnds2_epi64",
     "_mm512_broadcastsi128_si512",
     "_mm512_cmpeq_epi16",
     "_mm512_cmpeq_epi32",
@@ -18337,7 +18405,7 @@
     "_mm_move_epi32",
     "_mm_mwait"
   ],
-  "declarations": 1108,
+  "declarations": 1111,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -23448,10 +23516,11 @@
     "avx2intrin.h",
     "wmmintrin.h",
     "shaintrin.h",
+    "sha512intrin.h",
     "fmaintrin.h",
     "avx512fintrin.h",
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 1108
+  "unique_names": 1111
 }

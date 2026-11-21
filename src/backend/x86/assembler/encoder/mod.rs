@@ -5533,6 +5533,10 @@ impl InstructionEncoder {
             "vaeskeygenassist" => self.encode_avx_2op_3a_pp_imm8(ops, 0xDF, 1),
             // VAES 256 + VPCLMULQDQ 256
             "vaesenc" => self.encode_avx_3op_38(ops, 0xDC, true),
+            // VEX.256 SHA-512 (0F38, pp=F2, W0); see `encode_sha512_vex`.
+            "vsha512msg1" => self.encode_sha512_vex(ops, 0xCC, &[false, true], mnemonic),
+            "vsha512msg2" => self.encode_sha512_vex(ops, 0xCD, &[true, true], mnemonic),
+            "vsha512rnds2" => self.encode_sha512_vex(ops, 0xCB, &[false, true, true], mnemonic),
             "vaesenclast" => self.encode_avx_3op_38(ops, 0xDD, true),
             "vaesdec" => self.encode_avx_3op_38(ops, 0xDE, true),
             "vaesdeclast" => self.encode_avx_3op_38(ops, 0xDF, true),
@@ -7186,6 +7190,73 @@ mod encoding_opt_tests {
         assert_eq!(
             hex("vpclmulqdq $16, 32(%rdi), %xmm3, %xmm4"),
             "c4 e3 61 44 67 20 10"
+        );
+    }
+
+    #[test]
+    fn vex_sha512_register_forms_match_gas_247() {
+        // Bytes from GNU as 2.47 (`as` in ~/.cache/lccc/binutils-2.47).
+        // VEX.256 0F38 pp=F2 W0: msg1 CC, msg2 CD, rnds2 CB (`C4 E2 6F CB`:
+        // mmmmm=00010 is map 0F38 for all three).
+        assert_eq!(hex("vsha512msg1 %xmm2, %ymm0"), "c4 e2 7f cc c2");
+        assert_eq!(hex("vsha512msg1 %xmm9, %ymm15"), "c4 42 7f cc f9");
+        assert_eq!(hex("vsha512msg2 %ymm2, %ymm0"), "c4 e2 7f cd c2");
+        assert_eq!(hex("vsha512msg2 %ymm10, %ymm7"), "c4 c2 7f cd fa");
+        assert_eq!(hex("vsha512rnds2 %xmm3, %ymm2, %ymm1"), "c4 e2 6f cb cb");
+        assert_eq!(hex("vsha512rnds2 %xmm12, %ymm13, %ymm8"), "c4 42 17 cb c4");
+    }
+
+    #[test]
+    fn vex_sha512_rejects_what_gas_247_rejects() {
+        // GAS 2.47 rejects every memory form and every width/count/type
+        // mismatch. Each rejection must come with GAS's wording.
+        assert_eq!(
+            fail_msg("vsha512msg1 (%rax), %ymm0"),
+            "operand type mismatch for `vsha512msg1'"
+        );
+        assert_eq!(
+            fail_msg("vsha512msg2 (%rax), %ymm0"),
+            "operand type mismatch for `vsha512msg2'"
+        );
+        assert_eq!(
+            fail_msg("vsha512rnds2 (%rax), %ymm1, %ymm0"),
+            "operand type mismatch for `vsha512rnds2'"
+        );
+        assert_eq!(
+            fail_msg("vsha512msg1 %ymm1, %ymm0"),
+            "operand size mismatch for `vsha512msg1'"
+        );
+        assert_eq!(
+            fail_msg("vsha512msg2 %xmm1, %ymm0"),
+            "operand size mismatch for `vsha512msg2'"
+        );
+        assert_eq!(
+            fail_msg("vsha512rnds2 %ymm3, %ymm1, %ymm0"),
+            "operand size mismatch for `vsha512rnds2'"
+        );
+        assert_eq!(
+            fail_msg("vsha512msg1 %xmm1, %xmm0"),
+            "operand size mismatch for `vsha512msg1'"
+        );
+        assert_eq!(
+            fail_msg("vsha512msg1 %xmm1"),
+            "number of operands mismatch for `vsha512msg1'"
+        );
+        assert_eq!(
+            fail_msg("vsha512msg2 %ymm1, %ymm0, %ymm2"),
+            "number of operands mismatch for `vsha512msg2'"
+        );
+        assert_eq!(
+            fail_msg("vsha512rnds2 %xmm3, %ymm1"),
+            "number of operands mismatch for `vsha512rnds2'"
+        );
+        assert_eq!(
+            fail_msg("vsha512msg1 %rax, %ymm0"),
+            "operand type mismatch for `vsha512msg1'"
+        );
+        assert_eq!(
+            fail_msg("vsha512msg2 $1, %ymm0"),
+            "operand type mismatch for `vsha512msg2'"
         );
     }
 

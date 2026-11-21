@@ -623,31 +623,17 @@ impl X86Cpu {
 
     /// Read CPUID leaf `leaf` into `eax/ebx/ecx/edx` (subleaf 0).
     ///
-    /// The call is unprivileged and available on every x86-64 CPU.  It is
-    /// wrapped in `unsafe` with an `unused_unsafe` allowance because the
-    /// intrinsic's safety changed across Rust releases (AUD-TOOLCHAIN-1): the
-    /// declared `rust-version`/stable channel for this tree treats it as
-    /// `unsafe`, while older compilers accepted it as safe.  One wrapper keeps
-    /// the file building warning-free on every toolchain.
+    /// The call is unprivileged and available on every x86-64 CPU.
     #[cfg(target_arch = "x86_64")]
-    #[allow(unused_unsafe)]
     fn cpuid(leaf: u32) -> std::arch::x86_64::CpuidResult {
-        unsafe { std::arch::x86_64::__cpuid(leaf) }
+        crate::common::cpu_probe::cpuid_count(leaf, 0)
     }
 
-    /// `CPUID(leaf, subleaf)` variant, same safety contract as [`Self::cpuid`].
+    /// `CPUID(leaf, subleaf)`; the one `unsafe` wrapper lives in
+    /// [`crate::common::cpu_probe`], shared with the host probe.
     #[cfg(target_arch = "x86_64")]
-    #[allow(unused_unsafe)]
     fn cpuid_count(leaf: u32, subleaf: u32) -> std::arch::x86_64::CpuidResult {
-        unsafe { std::arch::x86_64::__cpuid_count(leaf, subleaf) }
-    }
-
-    /// Whether the host implements PREFETCHW (CPUID 0x8000_0001 ECX bit 8,
-    /// "PRFCHW"/"3DNowPrefetch" — the same bit `common::cpu_probe` answers
-    /// `__builtin_cpu_supports("prfchw")` with). Used by `-march=native`.
-    #[cfg(target_arch = "x86_64")]
-    pub fn host_has_prfchw() -> bool {
-        Self::cpuid(0x8000_0000).eax >= 0x8000_0001 && Self::cpuid(0x8000_0001).ecx & (1 << 8) != 0
+        crate::common::cpu_probe::cpuid_count(leaf, subleaf)
     }
 
     /// Identify the host core from CPUID family/model (leaf 1) for

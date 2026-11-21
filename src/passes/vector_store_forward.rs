@@ -73,6 +73,7 @@
 //!   against the pre-fix instruction counts instead of against a hand-edited
 //!   budget.
 
+use crate::common::fx_hash::FxHashSet;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{Instruction, IrConst, IrFunction, IrModule, Operand};
 use crate::passes::use_def::UseDefInfo;
@@ -112,6 +113,8 @@ fn canonical_store_op(width: usize) -> Option<IntrinsicOp> {
 struct ForwardPlan {
     store_block: usize,
     store_idx: usize,
+    /// The temporary the writing `VecStore` fills (its `dest_ptr`).
+    temp: u32,
     value: u32,
     /// `(block, index)` of each reader, in program order.
     readers: Vec<(usize, usize)>,
@@ -224,6 +227,7 @@ fn plan_function(func: &IrFunction) -> Vec<ForwardPlan> {
             plans.push(ForwardPlan {
                 store_block: bi,
                 store_idx: ii,
+                temp: temp.0,
                 value: value.0,
                 readers,
                 width,
@@ -295,6 +299,14 @@ fn forward_in_function(func: &mut IrFunction) -> usize {
         }
     }
     rewrites
+}
+
+/// The temporaries `forward_vector_temp_stores` would delete in `func`, read-only.
+///
+/// This is the pass's own admission routine, not a second copy of its rules, so
+/// a pass that runs earlier can leave exactly these temporaries to it.
+pub(crate) fn forwardable_temporaries(func: &IrFunction) -> FxHashSet<u32> {
+    plan_function(func).into_iter().map(|p| p.temp).collect()
 }
 
 /// Forward whole-vector temporary stores whose only reader is the store that
@@ -386,6 +398,29 @@ mod tests {
 
     fn last_store(func: &IrFunction) -> Option<(IntrinsicOp, u32, u32)> {
         stores_value_at(func.blocks[0].instructions.last()?)
+    }
+
+    /// `forwardable_temporaries` is the forwarder's own admission: it names
+    /// exactly the temporaries `forward_in_function` deletes, and nothing else.
+    #[test]
+    fn forwardable_temporaries_names_exactly_the_deleted_temporary() {
+        let admitted = function(vec![
+            alloca(20, 32),
+            vec_store(IntrinsicOp::VecStoreF32x8, 11, 20),
+            point_store(IntrinsicOp::StoreuPs256, 20, 3),
+        ]);
+        assert_eq!(
+            forwardable_temporaries(&admitted),
+            FxHashSet::from_iter([20])
+        );
+        // A second whole-vector writer breaks the single-writer shape: refused.
+        let refused = function(vec![
+            alloca(20, 32),
+            vec_store(IntrinsicOp::VecStoreF32x8, 11, 20),
+            vec_store(IntrinsicOp::VecStoreF32x8, 12, 20),
+            point_store(IntrinsicOp::StoreuPs256, 20, 3),
+        ]);
+        assert!(forwardable_temporaries(&refused).is_empty());
     }
 
     /// The single-reader shape is forwarded: the value goes to the final

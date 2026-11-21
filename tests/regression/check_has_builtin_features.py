@@ -2,8 +2,9 @@
 """GP-18: `__has_builtin` differential over the GNU x86 builtin namespace.
 
 GCC 16.2 conditions 110 of the 246 registered `__builtin_ia32_*` names on
-a target flag (measured sweep, 2026-10-28). This gate re-runs that sweep
-against both compilers — default plus twelve feature flags — and fails on
+a target flag (measured sweep, 2026-10-28), and the SHA-NI names on `-msha`
+since. This gate re-runs that sweep against both compilers — default plus
+fourteen feature flags — and fails on
 any answer divergence. The namespace is compiled in chunks because LCCC's
 `#warning` diagnostics are capped per translation unit.
 
@@ -38,6 +39,7 @@ FLAGS = (
     ("-maes",),
     ("-mpclmul",),
     ("-mavx512f",),
+    ("-msha",),
 )
 GATING_MACROS = (
     "__SSE3__",
@@ -53,6 +55,7 @@ GATING_MACROS = (
     "__AES__",
     "__PCLMUL__",
     "__AVX512F__",
+    "__SHA__",
 )
 ANSWER = re.compile(r"\b(YES|NO)\s+(\d+)\s+__builtin")
 CHUNK = 60

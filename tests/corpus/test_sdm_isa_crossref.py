@@ -37,6 +37,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 SDM_PY = ROOT / "scripts" / "sdm_isa_crossref.py"
 CATALOGUE = ROOT / "scripts" / "isa" / "catalogue.json"
+# Block-bodied (`"name" => { ... }`) encoder arms that call an encoder. These
+# are not verified by the SDM gate; this is the measured ceiling (see
+# test_block_bodied_encoder_arms_do_not_grow). Only lower it.
+BLOCK_ARM_CEILING = 161
 MANIFEST = ROOT / "scripts" / "isa" / "MANIFEST.json"
 
 
@@ -285,6 +289,59 @@ class SdmCrossrefTests(unittest.TestCase):
             _row('self.encode_string_op(ops, 0xA4, string_op_size(mnemonic)?, '
                  'Some(0), Some(1), "movs")', ["movsq"]), True, "movsq")
         self.assertEqual([e["opcode"] for e in movsq], [0xA5])
+
+    def test_sha512_rows_are_catalogued_and_modelled(self):
+        # XED's SHA512 datafile (v2026.08.23, pinned in MANIFEST.json): the
+        # three classes carry VEX.0F38 with pp=F2 and W0, and their opcodes are
+        # CC/CD/CB. The model must read those bytes out of the encoder row.
+        for name, opcode in (("VSHA512MSG1", 0xCC), ("VSHA512MSG2", 0xCD),
+                             ("VSHA512RNDS2", 0xCB)):
+            encs = self.catalogue[name]
+            self.assertEqual(len(encs), 1, name)
+            self.assertEqual(encs[0]["family"], "vex", name)
+            self.assertEqual(encs[0]["map"], "0f38", name)
+            self.assertEqual(encs[0]["pp"], "f2", name)
+            self.assertEqual(encs[0]["w"], 0, name)
+            self.assertEqual(encs[0]["opcode"], opcode, name)
+        msg1 = self.sdm.model_row(
+            _row('self.encode_sha512_vex(ops, 0xCC, &[false, true], mnemonic)',
+                 ["vsha512msg1"]), True, "vsha512msg1")
+        self.assertEqual([e["opcode"] for e in msg1], [0xCC])
+        self.assertEqual([e["pp"] for e in msg1], ["f2"])
+        rnds2 = self.sdm.model_row(
+            _row('self.encode_sha512_vex(ops, 0xCB, &[false, true, true], mnemonic)',
+                 ["vsha512rnds2"]), True, "vsha512rnds2")
+        self.assertEqual([e["opcode"] for e in rnds2], [0xCB])
+
+    def test_block_bodied_encoder_arms_do_not_grow(self):
+        # `extract_rows` only reads one-line arms (`\"name\" => self.encode_..`).
+        # A block arm (`\"name\" => { ... }`) is NOT verified: the gate skips it
+        # without a finding. That gap is real and pre-existing. This ceiling
+        # stops it widening: a new block arm that calls an encoder must either
+        # be flattened into a verified row or the ceiling must be raised in
+        # review. The count only ever goes down as arms are flattened.
+        import re
+        arm = re.compile(r'^\s*((?:"[a-z0-9._]+"\s*(?:\|\s*)?)+)\s*=>\s*\{\s*$')
+        count = 0
+        for rel in self.sdm.encoder_files("all"):
+            lines = (ROOT / rel).read_text(encoding="utf-8").splitlines()
+            for i, line in enumerate(lines):
+                if not arm.match(line):
+                    continue
+                depth, body = 0, []
+                for j in range(i, min(i + 400, len(lines))):
+                    seg = lines[j][lines[j].index("{"):] if j == i else lines[j]
+                    body.append(seg)
+                    depth += seg.count("{") - seg.count("}")
+                    if depth <= 0:
+                        break
+                text = " ".join(body)
+                if re.search(r"(self|Self)(\.|::)encode_", text):
+                    count += 1
+        self.assertLessEqual(
+            count, BLOCK_ARM_CEILING,
+            f"block-bodied encoder arms calling an encoder grew to {count} "
+            f"(ceiling {BLOCK_ARM_CEILING}): flatten the new arm into a verified row")
 
     def test_relocation_rows_are_not_mnemonics(self):
         for name in ("gotpcrel", "gottpoff", "tlsdesc", "es", "fs"):

@@ -961,9 +961,179 @@ fn state_gate_asm(state: Xstate, ctx: &Ctx) -> String {
     out
 }
 
+/// Number of cached words the probe keeps, one per [`CpuWord`].
+const WORD_COUNT: usize = CpuWord::ALL.len();
+
+/// CPUID `(leaf, subleaf)`, the one x86 CPUID wrapper of the probe.
+///
+/// CPUID exists on every x86-64 CPU and has no operand preconditions, so the
+/// call is sound everywhere; callers guard each leaf by the maximum leaf the
+/// CPU reports (leaf 0, or 0x8000_0000 for the extended leaves). This is the
+/// `__cpuid_count` contract, which `__cpuid(leaf)` also follows with subleaf 0.
+/// The `unused_unsafe` allowance keeps the file warning-free on toolchains
+/// that accepted the intrinsic as safe (AUD-TOOLCHAIN-1).
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+pub(crate) fn cpuid_count(leaf: u32, subleaf: u32) -> std::arch::x86_64::CpuidResult {
+    // SAFETY: see the function documentation: no operand precondition.
+    unsafe { std::arch::x86_64::__cpuid_count(leaf, subleaf) }
+}
+
+/// `XCR0` through `XGETBV(0)`.
+///
+/// The caller must have checked `CPUID.1:ECX.OSXSAVE` (bit 27); without it
+/// `XGETBV` raises `#UD`. [`host_words`] does so before reading it.
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+fn xgetbv0() -> u64 {
+    // SAFETY: the caller checked OSXSAVE, the architectural precondition.
+    unsafe { std::arch::x86_64::_xgetbv(0) }
+}
+
+/// The cached words of the executing CPU, read with the generated probe's
+/// rules: every leaf is issued only when the CPU advertises a maximum at least
+/// that large; Key Locker reads as clear unless the OS enabled it (AESKLE);
+/// the AVX10 word holds one bit per level (bit N = AVX10.N, gated on
+/// `CPUID.(7,1):EDX[19]`); and XCR0 is read only when OSXSAVE gates `XGETBV`.
+#[cfg(target_arch = "x86_64")]
+fn host_words() -> [u32; WORD_COUNT] {
+    let mut w = [0u32; WORD_COUNT];
+    let max = cpuid_count(0, 0).eax;
+    if max >= 1 {
+        let l1 = cpuid_count(1, 0);
+        w[CpuWord::Leaf1Edx as usize] = l1.edx;
+        w[CpuWord::Leaf1Ecx as usize] = l1.ecx;
+    }
+    if max >= 7 {
+        let l7 = cpuid_count(7, 0);
+        w[CpuWord::Leaf7Ebx as usize] = l7.ebx;
+        w[CpuWord::Leaf7Ecx as usize] = l7.ecx;
+        w[CpuWord::Leaf7Edx as usize] = l7.edx;
+        if l7.eax >= 1 {
+            let l71 = cpuid_count(7, 1);
+            w[CpuWord::Leaf71Eax as usize] = l71.eax;
+            w[CpuWord::Leaf71Edx as usize] = l71.edx;
+        }
+    }
+    if max >= 0xd {
+        w[CpuWord::LeafD1Eax as usize] = cpuid_count(0xd, 1).eax;
+    }
+    if max >= 0x14 {
+        w[CpuWord::Leaf14Ebx as usize] = cpuid_count(0x14, 0).ebx;
+    }
+    if max >= 0x19 {
+        w[CpuWord::Leaf19Ebx as usize] = cpuid_count(0x19, 0).ebx;
+    }
+    if w[CpuWord::Leaf19Ebx as usize] & 1 == 0 {
+        // AESKLE clear: the OS has not enabled Key Locker.
+        w[CpuWord::Leaf19Ebx as usize] &= !(1 << 2);
+        w[CpuWord::Leaf7Ecx as usize] &= !(1 << 23);
+    }
+    if max >= 0x1e {
+        w[CpuWord::Leaf1E1Eax as usize] = cpuid_count(0x1e, 1).eax;
+    }
+    if max >= 0x24 && w[CpuWord::Leaf71Edx as usize] & (1 << 19) != 0 {
+        let version = cpuid_count(0x24, 0).ebx & 0xff;
+        for level in 1..=2u32 {
+            if version >= level {
+                w[CpuWord::Avx10Levels as usize] |= 1 << level;
+            }
+        }
+    }
+    let ext_max = cpuid_count(0x8000_0000, 0).eax;
+    if ext_max >= 0x8000_0001 {
+        let e1 = cpuid_count(0x8000_0001, 0);
+        w[CpuWord::Ext1Ecx as usize] = e1.ecx;
+        w[CpuWord::Ext1Edx as usize] = e1.edx;
+    }
+    if ext_max >= 0x8000_0008 {
+        w[CpuWord::Ext8Ebx as usize] = cpuid_count(0x8000_0008, 0).ebx;
+    }
+    if ext_max >= 0x8000_0021 {
+        w[CpuWord::Ext21Eax as usize] = cpuid_count(0x8000_0021, 0).eax;
+    }
+    if w[CpuWord::Leaf1Ecx as usize] & (1 << 27) != 0 {
+        w[CpuWord::Xcr0 as usize] = xgetbv0() as u32;
+    }
+    w
+}
+
+/// The canonical names of the [`PROBE_TABLE`] features the executing CPU
+/// supports: exactly the answers the generated `__builtin_cpu_supports` probe
+/// returns at run time. `-march=native` grants this set.
+///
+/// A feature whose xstate the OS did not enable is absent (the probe's
+/// `Xstate` gate), so this is never a CPU the OS cannot run.
+#[cfg(target_arch = "x86_64")]
+pub fn host_supported_names() -> Vec<&'static str> {
+    let words = host_words();
+    let xcr0 = words[CpuWord::Xcr0 as usize];
+    PROBE_TABLE
+        .iter()
+        .filter(|(_, probe)| {
+            let gate_open =
+                probe.state == Xstate::None || (xcr0 & probe.state.mask()) == probe.state.mask();
+            gate_open && words[probe.word as usize] & probe.bit_mask() != 0
+        })
+        .map(|(name, _)| *name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host evaluation behind `-march=native` must agree with the Rust
+    /// standard library's independent CPUID/XGETBV detection for every name
+    /// both know. A wrong bit, leaf, or xstate gate fails here on any host
+    /// that implements the feature.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn host_supported_names_agree_with_std_detection() {
+        use std::arch::is_x86_feature_detected as std_has;
+        let names = host_supported_names();
+        let has = |name: &str| names.contains(&name);
+        assert_eq!(has("sse3"), std_has!("sse3"));
+        assert_eq!(has("ssse3"), std_has!("ssse3"));
+        assert_eq!(has("sse4.1"), std_has!("sse4.1"));
+        assert_eq!(has("sse4.2"), std_has!("sse4.2"));
+        assert_eq!(has("avx"), std_has!("avx"));
+        assert_eq!(has("avx2"), std_has!("avx2"));
+        assert_eq!(has("fma"), std_has!("fma"));
+        assert_eq!(has("f16c"), std_has!("f16c"));
+        // Canonical GCC names: `bmi` is std's `bmi1`, `pclmul` its
+        // `pclmulqdq`, `rdrnd` its `rdrand` (see `NAME_ALIASES`).
+        assert_eq!(has("bmi"), std_has!("bmi1"));
+        assert_eq!(has("bmi2"), std_has!("bmi2"));
+        assert_eq!(has("lzcnt"), std_has!("lzcnt"));
+        assert_eq!(has("popcnt"), std_has!("popcnt"));
+        assert_eq!(has("movbe"), std_has!("movbe"));
+        assert_eq!(has("aes"), std_has!("aes"));
+        assert_eq!(has("pclmul"), std_has!("pclmulqdq"));
+        assert_eq!(has("rdrnd"), std_has!("rdrand"));
+        assert_eq!(has("sha"), std_has!("sha"));
+        assert_eq!(has("gfni"), std_has!("gfni"));
+        assert_eq!(has("vaes"), std_has!("vaes"));
+        assert_eq!(has("vpclmulqdq"), std_has!("vpclmulqdq"));
+        assert_eq!(has("xsave"), std_has!("xsave"));
+        assert_eq!(has("avx512f"), std_has!("avx512f"));
+        assert_eq!(has("avx512cd"), std_has!("avx512cd"));
+        assert_eq!(has("avx512dq"), std_has!("avx512dq"));
+        assert_eq!(has("avx512bw"), std_has!("avx512bw"));
+        assert_eq!(has("avx512vl"), std_has!("avx512vl"));
+        assert_eq!(has("avx512vnni"), std_has!("avx512vnni"));
+        assert_eq!(has("avx512vbmi"), std_has!("avx512vbmi"));
+        assert_eq!(has("avx512vbmi2"), std_has!("avx512vbmi2"));
+        assert_eq!(has("avx512ifma"), std_has!("avx512ifma"));
+        assert_eq!(has("avx512bitalg"), std_has!("avx512bitalg"));
+        assert_eq!(has("avx512vpopcntdq"), std_has!("avx512vpopcntdq"));
+        assert_eq!(has("avx512bf16"), std_has!("avx512bf16"));
+        assert_eq!(has("avx512fp16"), std_has!("avx512fp16"));
+        assert_eq!(has("avxvnni"), std_has!("avxvnni"));
+        assert_eq!(has("sha512"), std_has!("sha512"));
+        assert_eq!(has("sm3"), std_has!("sm3"));
+        assert_eq!(has("sm4"), std_has!("sm4"));
+    }
 
     /// Every extension the driver can grant is a name dispatch code can
     /// probe: the model's own enums are the list, so nothing drifts.

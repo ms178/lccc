@@ -1096,10 +1096,12 @@ impl Preprocessor {
         ssse3: bool,
         sse4_1: bool,
         sse4_2: bool,
+        crc32: bool,
         avx: bool,
         avx2: bool,
         aes: bool,
         pclmul: bool,
+        sha: bool,
         f16c: bool,
         fma: bool,
         bmi: bool,
@@ -1144,6 +1146,7 @@ impl Preprocessor {
         amx_bf16: bool,
         cmpccxadd: bool,
         apxf: bool,
+        user_msr: bool,
     ) {
         // Only define SSE/AVX macros for x86 targets.
         let is_x86 = self.macros.is_defined("__x86_64__") || self.macros.is_defined("__i386__");
@@ -1161,13 +1164,14 @@ impl Preprocessor {
         }
         if sse4_2 {
             self.define_simple_macro("__SSE4_2__", "1");
-            // `__CRC32__` announces the CRC32 instruction, which IS the SSE4.2
-            // string/dword extension: GCC defines the two together in every
-            // row where `__SSE4_2__` is defined and neither otherwise
-            // (measured across all 102 `-march=` names, -m64 and -m32).
-            // Defining `__SSE4_2__` without it made a `#ifdef __CRC32__`
-            // probe conclude the compiler has no CRC32 path and take the
-            // scalar fallback.
+        }
+        // `__CRC32__` is announced by the SSE4.2 grant, but NOT only by it:
+        // GCC 16.2's `-mgeneral-regs-only` keeps it when SSE4.2 was live
+        // (the GPR-only instructions survive the SSE denial), and then the
+        // SSE4.2 macro is gone while this one stays. Measured across all
+        // `-march=` names and a 3-option grid, -m64 and -m32; the caller
+        // supplies the resolved value.
+        if crc32 {
             self.define_simple_macro("__CRC32__", "1");
         }
         if avx {
@@ -1181,6 +1185,9 @@ impl Preprocessor {
         }
         if pclmul {
             self.define_simple_macro("__PCLMUL__", "1");
+        }
+        if sha {
+            self.define_simple_macro("__SHA__", "1");
         }
         if f16c {
             self.define_simple_macro("__F16C__", "1");
@@ -1323,6 +1330,11 @@ impl Preprocessor {
         }
         if apxf {
             self.define_simple_macro("__APX_F__", "1");
+        }
+        // USERMSR (URDMSR/UWRMSR) uses no SSE state: GCC keeps `__USER_MSR__`
+        // under `-mno-sse`, `-mno-sse2` and `-mgeneral-regs-only` (measured).
+        if user_msr {
+            self.define_simple_macro("__USER_MSR__", "1");
         }
     }
 

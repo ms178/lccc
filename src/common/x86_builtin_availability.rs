@@ -6,6 +6,8 @@
 //! -mf16c -mavx512f` (2026-10-28). 136 names are baseline-known without
 //! any flag; the remaining 110 flip on exactly the feature macro listed
 //! here (16 SSSE3, 5 SSE4.1, 4 SSE4.2, 16 AVX, 6 BMI2, 63 AVX2).
+//! The seven SHA-NI names (`-msha`, `__SHA__`) were added afterwards and are
+//! covered by the same differential gate.
 //! `tests/regression/check_has_builtin_features.py` re-runs the sweep
 //! against GCC and fails on any answer divergence, so this table cannot
 //! drift from the oracle.
@@ -156,6 +158,16 @@ pub fn x86_builtin_feature_macro(name: &str) -> Option<&'static str> {
         "__builtin_ia32_storeups256" | "__builtin_ia32_storeupd256" => Some("__AVX__"),
         "__builtin_ia32_subpd256" => Some("__AVX__"),
         "__builtin_ia32_subps256" => Some("__AVX__"),
+        "__builtin_ia32_vsha512msg1"
+        | "__builtin_ia32_vsha512msg2"
+        | "__builtin_ia32_vsha512rnds2" => Some("__SHA512__"),
+        "__builtin_ia32_sha1msg1"
+        | "__builtin_ia32_sha1msg2"
+        | "__builtin_ia32_sha1nexte"
+        | "__builtin_ia32_sha1rnds4"
+        | "__builtin_ia32_sha256msg1"
+        | "__builtin_ia32_sha256msg2"
+        | "__builtin_ia32_sha256rnds2" => Some("__SHA__"),
         "__builtin_ia32_vextractf128_pd256"
         | "__builtin_ia32_vextractf128_ps256"
         | "__builtin_ia32_vextractf128_si256"

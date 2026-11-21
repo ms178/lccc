@@ -1134,8 +1134,153 @@ fn fold_select_idioms(func: &mut IrFunction) -> usize {
 
 /// The per-function half of [`promote_vector_allocas`].  `table` must have
 /// been built under the ISA this function is allowed to use.
-fn promote_one_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family>) -> usize {
-    let mut n = promote_function(func, table);
+/// Full-width register-family load for a 16- or 32-byte image, from the
+/// table. `None` when the table lacks it (AVX-less 256-bit code).
+fn image_family(table: &FxHashMap<IntrinsicOp, Family>, bytes: usize) -> Option<Family> {
+    let loads: &[IntrinsicOp] = match bytes {
+        32 => &[IntrinsicOp::VecLoadF32x8, IntrinsicOp::VecLoadI64x4],
+        16 => &[IntrinsicOp::VecLoadF32x4, IntrinsicOp::VecLoadI64x2],
+        _ => return None,
+    };
+    loads
+        .iter()
+        .find_map(|op| table.get(op).copied())
+        .filter(|fam| fam.bytes == bytes)
+}
+
+/// Canonicalise the image read of a 16- or 32-byte alloca by a pointer-form
+/// store into a full-width family load, so the local can promote.
+///
+/// `_mm256_storeu_si256(q, v)` where `v` is a reassigned `__m256i` local lowers
+/// to `Storeu256 {dest_ptr: q, args: [alloca]}`: the source is read as an image
+/// through the local's stack slot, and the alloca is not a family endpoint, so
+/// the local stays in memory even on plain AVX2 code. The rewrite reads the
+/// same bytes through the family load:
+///
+/// ```text
+///   Storeu256 {dest_ptr: q, args: [a]}  ==>  %t = VecLoad(a, 0); Storeu256 {dest_ptr: q, args: [%t]}
+/// ```
+///
+/// Only allocas of exactly that width, defined in block 0 and not volatile,
+/// are touched. A temporary that `vector_store_forward` admits (one whole-vector
+/// `VecStore*` writer, only same-width readers) is skipped: that pass deletes it
+/// outright, and rewriting it here first would leave the forwarder nothing to
+/// measure (`check_vector_store_forward.sh` pins that it does). The admission
+/// test is the forwarder's own, so the two passes cannot disagree.
+///
+/// The unaligned load side (`Loadu256`/`Loaddqu` into an alloca) is not
+/// rewritten. Measured on the AVX-512VL mask-compare matrix, rewriting it grew
+/// the runtime code from 5136 to 8080 bytes (GCC 16.2: 5308).
+///
+/// Returns the number of rewritten stores. The caller runs this on x86-64 only
+/// (see `promote_vector_allocas`).
+fn normalize_vector_image_endpoints(
+    func: &mut IrFunction,
+    table: &FxHashMap<IntrinsicOp, Family>,
+) -> usize {
+    // Same admission guards as `promote_function`, checked first: the pre-pass
+    // must not touch a function the promotion itself would leave alone.
+    if func.is_declaration
+        || func.blocks.is_empty()
+        || func.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::NonlocalGotoSave { .. }))
+        })
+    {
+        return 0;
+    }
+    let mut widths: FxHashMap<u32, usize> = FxHashMap::default();
+    for inst in &func.blocks[0].instructions {
+        if let Instruction::Alloca {
+            dest,
+            size,
+            volatile: false,
+            semantic_volatile: false,
+            ..
+        } = inst
+        {
+            if matches!(*size, 16 | 32) {
+                widths.insert(dest.0, *size);
+            }
+        }
+    }
+    if widths.is_empty() {
+        return 0;
+    }
+    let forwarded = crate::passes::vector_store_forward::forwardable_temporaries(func);
+    let mut plan: Vec<(usize, usize, Value, usize, Family)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Intrinsic {
+                op,
+                dest_ptr: Some(q),
+                args,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let bytes = match op {
+                IntrinsicOp::Storeu256 => 32,
+                IntrinsicOp::Storedqu => 16,
+                _ => continue,
+            };
+            let [Operand::Value(a)] = args.as_slice() else {
+                continue;
+            };
+            if widths.get(&a.0) != Some(&bytes) || q.0 == a.0 || forwarded.contains(&a.0) {
+                continue;
+            }
+            let Some(fam) = image_family(table, bytes) else {
+                continue;
+            };
+            plan.push((bi, ii, *a, bytes, fam));
+        }
+    }
+    if plan.is_empty() {
+        return 0;
+    }
+    let count = plan.len();
+    // Apply from the back, so the indices of earlier sites stay valid.
+    for (bi, ii, alloca, _bytes, fam) in plan.into_iter().rev() {
+        let img = alloc_value(func);
+        let block = &mut func.blocks[bi];
+        insert_instruction(
+            block,
+            ii,
+            Instruction::Intrinsic {
+                dest: Some(img),
+                op: fam.load,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(alloca),
+                    Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                ],
+            },
+        );
+        if let Instruction::Intrinsic { args, .. } = &mut block.instructions[ii + 1] {
+            args[0] = Operand::Value(img);
+        }
+    }
+    count
+}
+
+fn promote_one_function(
+    func: &mut IrFunction,
+    table: &FxHashMap<IntrinsicOp, Family>,
+    canonicalise_endpoints: bool,
+) -> usize {
+    // The endpoint rewrites introduce register-valued vector operands. The
+    // x86-64 backend accepts them; the i686 backend's legacy SSE/AVX emitters
+    // still read a vector operand as an address (a `movdqu` through the
+    // value's home), so 32-bit code keeps the original shape.
+    let mut n = if canonicalise_endpoints {
+        normalize_vector_image_endpoints(func, table)
+    } else {
+        0
+    };
+    n += promote_function(func, table);
     n += hoist_param_loads(func, table);
     n += fold_zero_identities(func);
     n += fold_select_idioms(func);
@@ -1152,6 +1297,7 @@ pub(crate) fn promote_vector_allocas(
     if base_table.is_empty() {
         return 0;
     }
+    let canonicalise = target == crate::backend::Target::X86_64;
     let mut total = 0;
     for func in &mut module.functions {
         // `family_for` gates its 256-bit arms on AVX2, so the table is
@@ -1168,10 +1314,10 @@ pub(crate) fn promote_vector_allocas(
                 base_isa,
                 base_avx512vl,
                 &feats,
-                |_| promote_one_function(func, &family_table()),
+                |_| promote_one_function(func, &family_table(), canonicalise),
             );
         } else {
-            total += promote_one_function(func, &base_table);
+            total += promote_one_function(func, &base_table, canonicalise);
         }
     }
     total
@@ -1200,6 +1346,135 @@ mod tests {
             source_spans: Vec::new(),
             source_inline_ids: Vec::new(),
         }
+    }
+
+    /// A pointer-form store that reads a 16-byte local's image through its
+    /// alloca address is rewritten into a family load feeding the store.
+    #[test]
+    fn unaligned_16_byte_store_image_is_canonicalised() {
+        crate::passes::vectorize::set_x86_simd_isa(true, false, false, true, false);
+        let table = family_table();
+        let a = Value(0);
+        let blocks = vec![block(
+            0,
+            vec![
+                Instruction::Alloca {
+                    dest: a,
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 16,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::Storedqu,
+                    dest_ptr: Some(Value(2)),
+                    args: vec![Operand::Value(a)],
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        let mut f = func_with_blocks(blocks);
+        f.next_value_id = 10;
+        assert_eq!(normalize_vector_image_endpoints(&mut f, &table), 1);
+        // The store reads a fresh register image, not the alloca address.
+        let reads_alloca = f.blocks[0].instructions.iter().any(|inst| {
+            matches!(inst, Instruction::Intrinsic { op: IntrinsicOp::Storedqu, args, .. }
+                if matches!(args.first(), Some(Operand::Value(v)) if *v == a))
+        });
+        assert!(!reads_alloca);
+    }
+
+    /// A temporary that `vector_store_forward` admits (one whole-register
+    /// `VecStore*` writer, one same-width reader) is left to that pass.
+    #[test]
+    fn forwarder_admitted_temporary_is_left_to_forwarding() {
+        crate::passes::vectorize::set_x86_simd_isa(true, false, false, true, false);
+        let table = family_table();
+        let a = Value(0);
+        let blocks = vec![block(
+            0,
+            vec![
+                Instruction::Alloca {
+                    dest: a,
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 16,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::VecStoreI64x2,
+                    dest_ptr: Some(a),
+                    args: vec![
+                        val(1),
+                        val(0),
+                        Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                    ],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::Storedqu,
+                    dest_ptr: Some(Value(2)),
+                    args: vec![Operand::Value(a)],
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        let mut f = func_with_blocks(blocks);
+        f.next_value_id = 10;
+        assert_eq!(normalize_vector_image_endpoints(&mut f, &table), 0);
+    }
+
+    /// The reassigned-local shape (`a = f(a, t); store(q, a)`): the alloca has a
+    /// non-`VecStore` writer as well, so the forwarder refuses it and the
+    /// store-side rewrite must still canonicalise the read.
+    #[test]
+    fn reassigned_local_read_is_canonicalised_when_forwarder_refuses() {
+        crate::passes::vectorize::set_x86_simd_isa(true, true, true, true, false);
+        let table = family_table();
+        let a = Value(0);
+        let blocks = vec![block(
+            0,
+            vec![
+                Instruction::Alloca {
+                    dest: a,
+                    ty: IrType::Ptr,
+                    size: 32,
+                    align: 32,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::Loadu256,
+                    dest_ptr: Some(a),
+                    args: vec![val(1)],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::VecStoreI64x4,
+                    dest_ptr: Some(a),
+                    args: vec![
+                        val(3),
+                        val(0),
+                        Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                    ],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::Storeu256,
+                    dest_ptr: Some(Value(2)),
+                    args: vec![Operand::Value(a)],
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        let mut f = func_with_blocks(blocks);
+        f.next_value_id = 10;
+        assert_eq!(normalize_vector_image_endpoints(&mut f, &table), 1);
     }
 
     #[test]

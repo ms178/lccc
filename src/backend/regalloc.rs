@@ -8764,6 +8764,8 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
 
         // Three genuine vector inputs (no scalar operand in the prefix).
         O::Pblendvb128
+        | O::Sha256rnds2128
+        | O::Sha512rnds2256
         | O::Dpbusd128
         | O::Dpbusds128
         | O::Dpwusd128
@@ -8905,6 +8907,14 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
         | O::Psraw128
         | O::Psrad128
         | O::Pblendw128
+        | O::Sha1rnds4128
+        | O::Sha1nexte128
+        | O::Sha1msg1128
+        | O::Sha1msg2128
+        | O::Sha256msg1128
+        | O::Sha256msg2128
+        | O::Sha512msg1256
+        | O::Sha512msg2256
         | O::Aesenc128
         | O::Aesenclast128
         | O::Aesdec128
@@ -9170,6 +9180,20 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecSubI64x2
             | O::VecAddI8x16
             | O::VecSubI8x16
+            // VEX.256 SHA-512 chains (destructive: the first operand is the
+            // destination's tie, `vsha512msg1/msg2 ymm1` and `rnds2`'s CDGH).
+            // Each emitter copies its operands into ymm0/ymm1/xmm1/xmm2 and
+            // writes the result through `avx_store_dest`, so a pre-allocated
+            // home is exact for any operand placement.
+            | O::Sha512msg1256
+            | O::Sha512msg2256
+            | O::Sha512rnds2256
+            // SHA-NI 128-bit chains: same copy-in discipline as the SHA-512
+            // forms above (`sha256rnds2`'s CDGH is the first operand and the
+            // destination tie).
+            | O::Sha256msg1128
+            | O::Sha256msg2128
+            | O::Sha256rnds2128
             | O::VecMinU8x16
             | O::VecAndNotI32x4
             | O::VecAvgU8x16
@@ -10611,6 +10635,30 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // I64x4 physical family) so the Copy-web can home them.  The
             // maddwd result feeds the class-5 dword accumulator add.
             O::VecMaddubsU8x32 | O::VecConstI8x32 => Some(8),
+            // VEX.256 SHA-512 (`vsha512msg1`/`msg2`/`rnds2`): their emitters
+            // read every operand through `avx_load_arg` and write the result
+            // through `avx_store_dest`, so a YMM home survives them (scratch
+            // is ymm0/ymm1 plus xmm1; rnds2's xmm2 is pool-withheld by
+            // `clobbers_xmm2`). Unclassified, every W/state word was homed on
+            // the stack.
+            O::Sha512msg1256 | O::Sha512msg2256 | O::Sha512rnds2256 => Some(8),
+            // SHA-512 full-block schedule producers (sha512 rounds need the message
+            // words and state in YMM homes across all 80 rounds). Each emitter ends in
+            // avx_store_dest, which copies into a register-homed destination, so a
+            // classed producer is sound; the copy is the only extra cost.
+            O::Loadu256
+            | O::Load256
+            | O::Permute2x128
+            | O::Permute4x64
+            | O::Pshufd256
+            | O::Pshufb256
+            | O::BlendPs256 => Some(8),
+            // SHA-NI (`sha256msg1`/`msg2`/`rnds2`): four 32-bit lanes, so the
+            // I32x4 family. Their emitters copy each operand into the scratch
+            // pair (xmm0/xmm1, plus xmm2 for rnds2, withheld by
+            // `clobbers_xmm2`) and store the result through `sse_store_dest`,
+            // so a register home survives them, exactly as for SHA-512.
+            O::Sha256msg1128 | O::Sha256msg2128 | O::Sha256rnds2128 => Some(6),
             O::VecMaddwdI16x16 => Some(5),
             // BB-SLP I64x4 copy/ALU chains: loads, sub/bitwise, splat.
             O::VecLoadI64x4
@@ -10754,6 +10802,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::StrictRecipMulAddPackedF64x4
                     | O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
+                    // SHA-NI chain: operands are read through `sse_load_arg`
+                    // / `emit_sha_binary_128` (scratch xmm0/xmm1/xmm2) and the
+                    // result is written through `sse_store_dest`.
+                    | O::Sha256msg1128
+                    | O::Sha256msg2128
+                    | O::Sha256rnds2128
                     // SSE2 masked equal-width step: reads the I32x4
                     // accumulator home and writes its own destination
                     // through the shared 128-bit fold (scratch xmm0/xmm1).
@@ -10801,6 +10855,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecAddI64x2
                     | O::VecSadbwU8x16
+                    // SHA-512 16-byte operands (`msg1`'s second operand and
+                    // `rnds2`'s W+K): read through `vex128_source`, which uses
+                    // the xmm home directly, scratch xmm1/xmm2 only.
+                    | O::Sha512msg1256
+                    | O::Sha512rnds2256
                     | O::VecMulI64x2
                     | O::VecHorizontalAddI64x2
                     // v12 Fix C: the SSE2 value-shaped widening steps
@@ -10839,6 +10898,20 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             8 => matches!(
                 op,
                 O::VecAddI64x4 | O::VecHorizontalAddI64x4 | O::VecSadbwU8x32
+                    | O::Sha512msg1256
+                    | O::Sha512msg2256
+                    | O::Sha512rnds2256
+                    // SHA-512 schedule shuffles read YMM homes through avx_load_arg
+                    // (the blend/shuffle emitters end in avx_store_dest).
+                    | O::Permute2x128
+                    | O::Permute4x64
+                    | O::Pshufd256
+                    | O::Pshufb256
+                    | O::BlendPs256
+                    // The 256-bit pointer stores consume a YMM home through
+                    // `avx_load_arg` (copy from the home into ymm0).
+                    | O::Storeu256
+                    | O::Store256
                     // AVX2 widening steps read+write the I64x4 accumulator;
                     // scratch is confined to ymm0/ymm1, so a YMM home
                     // (ymm2..ymm15) survives them.
@@ -10935,6 +11008,42 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // round-tripped 32 bytes through the
                                 // stack every iteration).
                                 | O::VecHorizontalAddI64x4
+                                // 256-bit pointer stores (`_mm256_storeu_si256`
+                                // and the aligned twin): the emitter reads its
+                                // value through `avx_load_arg`, which copies from
+                                // a YMM home, and writes only ymm0 scratch. With
+                                // them unlisted, one store poisoned every vector
+                                // web of the function (SHA-512 kernels, measured:
+                                // `sha512_chain` had no homes at all).
+                                | O::Storeu256
+                                | O::Store256
+                                // 256-bit loads and the 128->256 zero-extension
+                                // are scratch-free in the only sense the poison
+                                // rule protects: their emitters touch only
+                                // ymm0/xmm0 (`avx_load_arg_to("ymm0")` plus the
+                                // result store, `sse_load_arg("xmm0")` plus
+                                // `vmovdqa %xmm0,%xmm0`). Homes are xmm2..xmm15
+                                // (`phys_reg_name` 20..33), so no home is
+                                // clobbered. Unlisted, one such op in a kernel
+                                // withdrew every vector home of the function.
+                                | O::Loadu256
+                                | O::Load256
+                                | O::Zext128to256
+                                // 256-bit in-lane shuffles and lane moves (the
+                                // full-block SHA-512 message schedule). Their
+                                // emitters read homes through `avx_load_arg*`
+                                // and use only ymm0/ymm1 (plus xmm0 for the
+                                // extract) as scratch, writing the result to
+                                // its own home. Unlisted, each one withdrew
+                                // every vector home of the kernel: nanazip's
+                                // `Sha512_UpdateBlocks_HW` was poisoned by
+                                // `Pshufd256`, libtomcrypt's by `Permute4x64`.
+                                | O::Pshufd256
+                                | O::Permute4x64
+                                | O::Permute2x128
+                                | O::Extracti128
+                                | O::Pshufb256
+                                | O::BlendPs256
                                 // v12 Fix C: widening reductions consume an
                                 // I64x4 accumulator (whitelisted above). Their
                                 // lowerings confine scratch to ymm0/ymm1 so a
@@ -11482,6 +11591,9 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecSadbwU8x32
                     | O::VecMaddubsU8x32
+                    | O::Sha512msg1256
+                    | O::Sha512msg2256
+                    | O::Sha512rnds2256
                     | O::VecMaddwdI16x16
                     | O::VecAddI64x4
                     | O::VecSubI64x4

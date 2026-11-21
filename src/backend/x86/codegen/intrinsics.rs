@@ -1478,6 +1478,7 @@ impl X86Codegen {
             && !matches!(
                 op,
                 O::Pblendvb128
+                    | O::Sha256rnds2128
                     | O::Storedqu
                     | O::Storeu256
                     | O::Store256
@@ -1510,6 +1511,112 @@ impl X86Codegen {
     }
 
     #[inline]
+    /// The destination's register home when it coincides with `a0`'s, and
+    /// `a0` is an ordinary register-resident operand: the RA's destructive
+    /// coalescing (the first source dies at this instruction). Returns the
+    /// home's name, or `None` when the staged path must run.
+    fn sha_destructive_home(&self, dest: &Value, a0: &Value, a1: &Value) -> Option<&'static str> {
+        if a0.0 == a1.0 {
+            return None;
+        }
+        let dest_reg = *self.reg_assignments.get(&dest.0)?;
+        if !is_xmm_reg(dest_reg) || self.reg_assignments.get(&a0.0) != Some(&dest_reg) {
+            return None;
+        }
+        if self
+            .state
+            .pending_vec_memfold
+            .as_ref()
+            .is_some_and(|pf| pf.val == a0.0)
+        {
+            return None;
+        }
+        Some(phys_reg_name(dest_reg))
+    }
+
+    /// In-place SHA-NI two-operand form (`sha1msg1/msg2/nexte`,
+    /// `sha256msg1/msg2`). Every one of them is destructive in its first
+    /// source and reads its second source (`xmm2/m128`) without writing it,
+    /// so when the destination shares the first source's home the whole
+    /// instruction is one `op %src, %home`: no staging through `%xmm0` and
+    /// no write-back. Returns `false` (emitting nothing) when the shape does
+    /// not hold.
+    fn try_emit_sha_binary_in_place(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        inst: &str,
+    ) -> bool {
+        let (Operand::Value(a0), Operand::Value(a1)) = (&args[0], &args[1]) else {
+            return false;
+        };
+        let Some(target) = self.sha_destructive_home(dest_ptr, a0, a1) else {
+            return false;
+        };
+        let Some(src) = self.vec_operand_reg(a1) else {
+            return false;
+        };
+        if src == target {
+            return false;
+        }
+        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(a1.0) {
+            self.state.pending_vec_store = None;
+        }
+        self.state
+            .emit_fmt(format_args!("    {} %{}, %{}", inst, src, target));
+        self.sse_mark_in_place(dest_ptr, target);
+        true
+    }
+
+    /// In-place `sha256rnds2` (see the arm in `emit_intrinsic`). Operands:
+    /// `args = [cdgh, abef, wk]`. Returns `false`, emitting nothing, when the
+    /// destination does not share CDGH's home or ABEF has no register home.
+    fn try_emit_sha256rnds2_in_place(&mut self, dptr: &Value, args: &[Operand]) -> bool {
+        let (Operand::Value(cdgh), Operand::Value(abef)) = (&args[0], &args[1]) else {
+            return false;
+        };
+        let Some(target) = self.sha_destructive_home(dptr, cdgh, abef) else {
+            return false;
+        };
+        let Some(src) = self.vec_operand_reg(abef) else {
+            return false;
+        };
+        if src == target {
+            return false;
+        }
+        // WK is the implicit %xmm0 operand; no register home is %xmm0, so
+        // it is always staged there.
+        self.sse_load_arg(&args[2], "xmm0");
+        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(abef.0) {
+            self.state.pending_vec_store = None;
+        }
+        self.state
+            .emit_fmt(format_args!("    sha256rnds2 %xmm0, %{}, %{}", src, target));
+        self.sse_mark_in_place(dptr, target);
+        true
+    }
+
+    /// Legacy-encoded SHA-NI binary op `inst %xmm1, %xmm0` (dst = args[0],
+    /// src = args[1]), stored to `dest_ptr`.  SHA-NI has no VEX encoding, so
+    /// this never takes the `v`-prefixed route of `emit_sse_binary_128`.
+    /// In place when the destination shares the first source's home.
+    pub(super) fn emit_sha_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str) {
+        assert!(
+            args.len() >= 2,
+            "emit_sha_binary_128: malformed intrinsic {} ({} args)",
+            inst,
+            args.len()
+        );
+        if self.try_emit_sha_binary_in_place(dest_ptr, args, inst) {
+            return;
+        }
+        self.sse_load_arg(&args[0], "xmm0");
+        self.sse_load_arg(&args[1], "xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+        self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
     pub(super) fn emit_sse_binary_128(
         &mut self,
         dest_ptr: &Value,
@@ -3956,10 +4063,76 @@ impl X86Codegen {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     // args[1] is the immediate value
-                    let imm = self.operand_to_imm_i64(&args[1]);
+                    let imm = self.pinned_imm_i64(&args[1], "aeskeygenassist");
                     self.state
                         .emit_fmt(format_args!("    aeskeygenassist ${}, %xmm0, %xmm0", imm));
                     self.sse_store_dest(dptr, "xmm0");
+                }
+            }
+            // SHA-NI, two vector operands: sha1nexte, sha1msg1/2, sha256msg1/2.
+            // The instructions have no VEX form, so they are emitted legacy
+            // (`emit_sha_binary_128`), never through the `v`-prefixed path.
+            IntrinsicOp::Sha1nexte128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha1nexte");
+                }
+            }
+            IntrinsicOp::Sha1msg1128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha1msg1");
+                }
+            }
+            IntrinsicOp::Sha1msg2128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha1msg2");
+                }
+            }
+            IntrinsicOp::Sha256msg1128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha256msg1");
+                }
+            }
+            IntrinsicOp::Sha256msg2128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_sha_binary_128(dptr, args, "sha256msg2");
+                }
+            }
+            // SHA-NI sha1rnds4: args = [state, msg, imm8]. Destination and first
+            // source are xmm0/xmm1; the immediate selects the round function.
+            IntrinsicOp::Sha1rnds4128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    assert_eq!(args.len(), 3, "Sha1rnds4128 requires state, msg, imm8");
+                    assert!(
+                        matches!(args[2], Operand::Const(_)),
+                        "sha1rnds4 immediate must be a compile-time constant"
+                    );
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.sse_load_arg(&args[1], "xmm1");
+                    let imm = self.pinned_imm_i64(&args[2], "sha1rnds4");
+                    self.state
+                        .emit_fmt(format_args!("    sha1rnds4 ${}, %xmm1, %xmm0", imm));
+                    self.sse_store_dest(dptr, "xmm0");
+                }
+            }
+            // SHA-NI sha256rnds2: args = [cdgh (dst), abef (src2), wk]. WK is
+            // read from the implicit operand %xmm0, so it is loaded first and
+            // the other operands are loaded into %xmm2 and %xmm1 (the result).
+            IntrinsicOp::Sha256rnds2128 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    assert_eq!(args.len(), 3, "Sha256rnds2128 requires cdgh, abef, wk");
+                    // In place when CDGH's home is the destination's (the
+                    // RA's destructive coalescing). The architecture pins
+                    // only two things: the implicit WK operand is %xmm0, and
+                    // the destination holds CDGH on entry. ABEF is read
+                    // straight from its home (xmm2/m128 is read-only), so no
+                    // operand is staged through %xmm1 or %xmm2.
+                    if !self.try_emit_sha256rnds2_in_place(dptr, args) {
+                        self.sse_load_arg(&args[2], "xmm0");
+                        self.sse_load_arg(&args[1], "xmm2");
+                        self.sse_load_arg(&args[0], "xmm1");
+                        self.state.emit("    sha256rnds2 %xmm0, %xmm2, %xmm1");
+                        self.sse_store_dest(dptr, "xmm1");
+                    }
                 }
             }
             // CLMUL: pclmulqdq with immediate
@@ -3967,7 +4140,7 @@ impl X86Codegen {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
-                    let imm = self.operand_to_imm_i64(&args[2]);
+                    let imm = self.pinned_imm_i64(&args[2], "pclmulqdq");
                     self.state
                         .emit_fmt(format_args!("    pclmulqdq ${}, %xmm1, %xmm0", imm));
                     self.sse_store_dest(dptr, "xmm0");
@@ -4048,7 +4221,7 @@ impl X86Codegen {
                     // args = [a, b, imm8]; result = blend words per imm8 bits
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
-                    let imm = self.operand_to_imm_i64(&args[2]);
+                    let imm = self.pinned_imm_i64(&args[2], "pblendw");
                     self.state
                         .emit_fmt(format_args!("    pblendw ${}, %xmm1, %xmm0", imm));
                     self.sse_store_dest(dptr, "xmm0");
@@ -4673,6 +4846,43 @@ impl X86Codegen {
                     self.avx_store_dest(dptr);
                 }
             }
+            IntrinsicOp::Sha512msg1256 => {
+                // VEX.256 `vsha512msg1 %xmm1, %ymm0`: dst ymm0 = W[0..3] in,
+                // xmm1 = the 16-byte operand (only its low qword is used). The
+                // operand is read at 16 bytes, never 32: it is a 128-bit object.
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.avx_load_arg(&args[0]);
+                    let src = self.vex128_source(&args[1], "xmm1");
+                    self.state
+                        .emit_fmt(format_args!("    vsha512msg1 {}, %ymm0", src));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Sha512msg2256 => {
+                // VEX.256 `vsha512msg2 %ymm1, %ymm0`: both operands are 256-bit.
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.avx_load_arg(&args[0]);
+                    self.state.dirty_upper_ymm = true;
+                    self.avx_load_arg_to(&args[1], "ymm1");
+                    self.state.emit("    vsha512msg2 %ymm1, %ymm0");
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Sha512rnds2256 => {
+                // VEX.256 `vsha512rnds2 %xmm2, %ymm1, %ymm0`: dst ymm0 = CDGH in,
+                // vvvv ymm1 = ABEF, rm xmm2 = W+K (16 bytes). %xmm2 is the scratch
+                // for the 16-byte operand; `regalloc_helpers` withholds it from the
+                // pool for this op, as it does for SHA256RNDS2.
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.avx_load_arg(&args[0]);
+                    self.state.dirty_upper_ymm = true;
+                    self.avx_load_arg_to(&args[1], "ymm1");
+                    let wk = self.vex128_source(&args[2], "xmm2");
+                    self.state
+                        .emit_fmt(format_args!("    vsha512rnds2 {}, %ymm1, %ymm0", wk));
+                    self.avx_store_dest(dptr);
+                }
+            }
             IntrinsicOp::Pmovmskb256 => {
                 self.avx_load_arg(&args[0]);
                 self.state.emit("    vpmovmskb %ymm0, %eax");
@@ -4868,7 +5078,10 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Extracti128 => {
-                if let Some(dptr) = dest_ptr {
+                // Width-changing 256 -> 128 producer. `result_dest` accepts both
+                // spellings; `sse_store_dest` writes the register-homed result
+                // (`reg_assignments`) or its slot.
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     let lane = self.operand_to_imm_i64(&args[1]) & 1;
                     self.state.emit_fmt(format_args!(
@@ -4881,10 +5094,6 @@ impl X86Codegen {
                         lane
                     ));
                     self.sse_store_dest(dptr, "xmm0");
-                } else if dest.is_some() {
-                    panic!(
-                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
-                    );
                 }
             }
             IntrinsicOp::LoaduPs256 | IntrinsicOp::LoaduPd256 => {
@@ -7483,8 +7692,16 @@ impl X86Codegen {
                 // home/memfold/all-homed paths apply unchanged.  Used by the
                 // byte-predicate counting reduction to accumulate the four
                 // `vpsadbw` partial sums.
-                if let Some(d) = dest {
+                if let Some(d) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(d, args, "vpaddq", true);
+                }
+            }
+            // BlendPs256: the register-form result (`dest`) reaches the shared
+            // 3-operand FP emitter with the resolved result value; the
+            // `dest_ptr` form is routed there by `emit_simd_op` as before.
+            IntrinsicOp::BlendPs256 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_avx_fp_256_op(dptr, op, args);
                 }
             }
             IntrinsicOp::VecSadbwU8x32 => {
@@ -15220,12 +15437,34 @@ mod intrinsic_destination_contract_tests {
         );
     }
 
+    /// `Extracti128` is width-changing (256 -> 128) and takes both the
+    /// memory form and the SSA form: the SSA result must be emitted, not
+    /// refused (the register-result forwarding depends on it).
+    #[test]
+    fn extracti128_emits_the_ssa_form() {
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 0);
+        xmm_homed(&mut cg, 2);
+        cg.emit_intrinsic_impl(
+            &Some(Value(2)),
+            &IntrinsicOp::Extracti128,
+            &None,
+            &[Operand::Value(Value(0)), Operand::Const(IrConst::I32(1))],
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("vextracti128 $1, %ymm0, %xmm0")
+                || out.contains("vextractf128 $1, %ymm0, %xmm0"),
+            "SSA-form Extracti128 emitted no lane extract: {out}"
+        );
+    }
+
     /// Groups whose destination plumbing is memory-form only (scalar
     /// extracts, pointer-staged loads) refuse the SSA form loudly instead of
     /// silently emitting nothing.
     #[test]
     fn memory_form_only_groups_refuse_the_ssa_form_loudly() {
-        for op in [IntrinsicOp::Extracti128, IntrinsicOp::LoadF64x2] {
+        for op in [IntrinsicOp::LoadF64x2] {
             let mut cg = X86Codegen::new();
             for id in [0u32, 1] {
                 slot_homed(&mut cg, id);

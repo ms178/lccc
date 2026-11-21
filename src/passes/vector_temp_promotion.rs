@@ -383,6 +383,12 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Pminub128
         | O::Pblendw128
         | O::Pclmulqdq128
+        | O::Sha1rnds4128
+        | O::Sha1nexte128
+        | O::Sha1msg1128
+        | O::Sha1msg2128
+        | O::Sha256msg1128
+        | O::Sha256msg2128
         | O::Aesenc128
         | O::Aesenclast128
         | O::Aesdec128
@@ -439,6 +445,26 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
 
         // PBLENDVB consumes state, true value and mask as vectors.
         O::Pblendvb128 => return (index < 3).then_some(16),
+        // SHA-256 rounds: state, state and the implicit WK operand.
+        O::Sha256rnds2128 => return (index < 3).then_some(16),
+        // SHA-512 (VEX.256): the ymm operands are 32 bytes; the msg1 and rnds2
+        // xmm operands are 16. A 32-byte width on a 16-byte operand would let
+        // promotion read past the object, so the widths are per operand.
+        O::Sha512msg1256 => {
+            return match index {
+                0 => Some(32),
+                1 => Some(16),
+                _ => None,
+            };
+        }
+        O::Sha512msg2256 => return (index < 2).then_some(32),
+        O::Sha512rnds2256 => {
+            return match index {
+                0 | 1 => Some(32),
+                2 => Some(16),
+                _ => None,
+            };
+        }
 
         // 256-bit stores and unary consumers.
         O::Storeu256
@@ -801,6 +827,39 @@ fn intrinsic_dest_required_alignment(
 /// write-only full result.  These intrinsics read the old destination (or do
 /// not materialize the advertised result there), so redirecting them to the
 /// memcpy destination changes the value being computed.
+/// Width of a vector REGISTER operand (not an address) at an intrinsic
+/// argument position, for the consumers that read a register-result home
+/// through the register-aware operand helpers. Each arm names an emitter that
+/// takes the operand as a vector value (`avx_load_arg*`/`vex128_source`), so a
+/// `Value` that is a forwarded register and a `Value` that is its slot are
+/// interchangeable there. Anything not listed keeps its memory image.
+fn value_consumer_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
+    use IntrinsicOp as O;
+    if intrinsic_arg_required_alignment(op, index).is_some() {
+        return None;
+    }
+    match op {
+        O::Permute2x128 | O::Pshufb256 | O::BlendPs256 | O::Sha512msg2256 | O::VecAddI64x4 => {
+            (index < 2).then_some(32)
+        }
+        // Storeu256/Store256: arg 0 is the stored VALUE; the address is
+        // `dest_ptr`, which the caller rejects when it names the home.
+        O::Permute4x64 | O::Pshufd256 | O::Storeu256 | O::Store256 => (index == 0).then_some(32),
+        O::Extracti128 => (index == 0).then_some(32),
+        O::Sha512msg1256 => match index {
+            0 => Some(32),
+            1 => Some(16),
+            _ => None,
+        },
+        O::Sha512rnds2256 => match index {
+            0 | 1 => Some(32),
+            2 => Some(16),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Ops whose x86 register-result form is SELF-CONTAINED: the emitter writes
 /// the result into `dest`'s register when `dest_ptr` is absent.
 ///
@@ -813,12 +872,31 @@ fn intrinsic_dest_required_alignment(
 /// development of this pass, which is why removing a home write is gated on
 /// proof that the register form exists rather than on the mere presence of a
 /// `dest` field.  An op not named here keeps its home: fail closed.
+/// `BlendPs256` is listed because its dispatch arm passes the RESOLVED result
+/// (`result_dest`) to `emit_avx_fp_256_op`, which stores through `avx_store_dest`
+/// and so accepts a register-homed result. The other 256-bit FP spellings
+/// keep their memory form.
 fn register_result_form_is_self_contained(op: IntrinsicOp) -> bool {
     use IntrinsicOp::*;
     matches!(
         op,
-        // Constant splats (1-bit through 64-bit lanes, 128/256/512-bit).
-        SetEpi8
+        // 256-bit in-lane shuffles and the SHA-512 schedule producers. Each
+        // emitter writes its result through `result_dest` (the register value
+        // when the memory image is retired) and reads its operands through
+        // `avx_load_arg*`/`vex128_source`, so the register result carries the
+        // bytes. Extracti128 is the width-changing 256->128 producer.
+        Permute2x128
+            | Permute4x64
+            | Pshufd256
+            | Pshufb256
+            | BlendPs256
+            | Extracti128
+            | Sha512msg1256
+            | Sha512msg2256
+            | Sha512rnds2256
+            | VecAddI64x4
+            // Constant splats (1-bit through 64-bit lanes, 128/256/512-bit).
+            | SetEpi8
             | SetEpi16
             | SetEpi32
             | SetEpi8_256
@@ -2092,6 +2170,7 @@ fn plan_result_forward(
     let builder = cfg.get_or_insert_with(|| crate::ir::analysis::CfgAnalysis::build(func));
     let dominators = crate::ir::analysis::DominanceChecker::new(builder.num_blocks, &builder.idom);
     let mut load_rewrites: Vec<(usize, usize)> = Vec::new();
+    let mut arg_reads: Vec<(usize, usize)> = Vec::new();
     for (&(bi, ii), &mentions) in home_uses {
         if bi == block_idx && ii == producer {
             // Exactly the `dest_ptr` write; the address operands of a
@@ -2105,6 +2184,34 @@ fn plan_result_forward(
             return None;
         }
         let r_inst = func.blocks.get(bi)?.instructions.get(ii)?;
+        // A direct register READ of the home: the home is a vector-register
+        // operand of a consumer that takes register values (see
+        // `value_consumer_arg_width`). Same block and after the producer only,
+        // because the rewrite list addresses the producer's block.
+        if let Instruction::Intrinsic {
+            op: r_op,
+            args: r_args,
+            dest_ptr: r_dp,
+            ..
+        } = r_inst
+        {
+            if !whole_vector_load(*r_op) && bi == block_idx && ii > producer {
+                let slots: Vec<usize> = r_args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, a)| {
+                        matches!(a, Operand::Value(v) if v.0 == home).then_some(idx)
+                    })
+                    .collect();
+                if slots.len() == 1
+                    && value_consumer_arg_width(*r_op, slots[0]) == Some(width)
+                    && r_dp.is_none_or(|p| p.0 != home)
+                {
+                    arg_reads.push((ii, slots[0]));
+                    continue;
+                }
+            }
+        }
         let Instruction::Intrinsic {
             dest: Some(ld),
             op: r_op,
@@ -2154,17 +2261,18 @@ fn plan_result_forward(
         }
         load_rewrites.push((bi, ii));
     }
-    if load_rewrites.is_empty() {
+    if load_rewrites.is_empty() && arg_reads.is_empty() {
         return None;
     }
     load_rewrites.sort_unstable();
+    arg_reads.sort_unstable();
     Some(HomeForward {
         block: block_idx,
         producer,
         home,
         kind: HomeBypass::Result,
         value: Some(register),
-        arg_rewrites: Vec::new(),
+        arg_rewrites: arg_reads,
         load_rewrites,
         dead: Vec::new(),
     })

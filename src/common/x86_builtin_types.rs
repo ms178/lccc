@@ -142,6 +142,13 @@ fn result_type_0(name: &str) -> Option<CType> {
         | "__builtin_ia32_psubd128"
         | "__builtin_ia32_punpckhdq128"
         | "__builtin_ia32_punpckldq128"
+        | "__builtin_ia32_sha1msg1"
+        | "__builtin_ia32_sha1msg2"
+        | "__builtin_ia32_sha1nexte"
+        | "__builtin_ia32_sha1rnds4"
+        | "__builtin_ia32_sha256msg1"
+        | "__builtin_ia32_sha256msg2"
+        | "__builtin_ia32_sha256rnds2"
         | "__builtin_ia32_vextractf128_si256"
         | "__builtin_ia32_vpdpbssd128"
         | "__builtin_ia32_vpdpbssds128"
@@ -236,7 +243,10 @@ fn result_type_1(name: &str) -> Option<CType> {
         | "__builtin_ia32_psubq256"
         | "__builtin_ia32_punpckhqdq256"
         | "__builtin_ia32_punpcklqdq256"
-        | "__builtin_ia32_pxor256" => CType::Vector(Box::new(CType::LongLong), 32),
+        | "__builtin_ia32_pxor256"
+        | "__builtin_ia32_vsha512msg1"
+        | "__builtin_ia32_vsha512msg2"
+        | "__builtin_ia32_vsha512rnds2" => CType::Vector(Box::new(CType::LongLong), 32),
         "__builtin_ia32_pabsw128"
         | "__builtin_ia32_packssdw128"
         | "__builtin_ia32_paddsw128"
@@ -530,6 +540,11 @@ fn argument_vector_widths_0(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_punpcklqdq128"
         | "__builtin_ia32_punpcklwd128"
         | "__builtin_ia32_pxor128"
+        | "__builtin_ia32_sha1msg1"
+        | "__builtin_ia32_sha1msg2"
+        | "__builtin_ia32_sha1nexte"
+        | "__builtin_ia32_sha256msg1"
+        | "__builtin_ia32_sha256msg2"
         | "__builtin_ia32_subpd"
         | "__builtin_ia32_subps"
         | "__builtin_ia32_subsd"
@@ -539,6 +554,7 @@ fn argument_vector_widths_0(name: &str) -> Option<&'static [usize]> {
         "__builtin_ia32_palignr128"
         | "__builtin_ia32_pblendw128"
         | "__builtin_ia32_pclmulqdq128"
+        | "__builtin_ia32_sha1rnds4"
         | "__builtin_ia32_shufps" => &[16, 16, 0],
         _ => return None,
     })
@@ -548,6 +564,7 @@ fn argument_vector_widths_0(name: &str) -> Option<&'static [usize]> {
 fn argument_vector_widths_1(name: &str) -> Option<&'static [usize]> {
     Some(match name {
         "__builtin_ia32_pblendvb128"
+        | "__builtin_ia32_sha256rnds2"
         | "__builtin_ia32_vpdpbssd128"
         | "__builtin_ia32_vpdpbssds128"
         | "__builtin_ia32_vpdpbsud128"
@@ -576,6 +593,7 @@ fn argument_vector_widths_1(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_vextractf128_pd256"
         | "__builtin_ia32_vextractf128_ps256"
         | "__builtin_ia32_vextractf128_si256" => &[32, 0],
+        "__builtin_ia32_vsha512msg1" => &[32, 16],
         "__builtin_ia32_vinsertf128_pd256"
         | "__builtin_ia32_vinsertf128_ps256"
         | "__builtin_ia32_vinsertf128_si256" => &[32, 16, 0],
@@ -645,9 +663,11 @@ fn argument_vector_widths_1(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_pxor256"
         | "__builtin_ia32_subpd256"
         | "__builtin_ia32_subps256"
+        | "__builtin_ia32_vsha512msg2"
         | "__builtin_ia32_xorpd256"
         | "__builtin_ia32_xorps256" => &[32, 32],
         "__builtin_ia32_cmpps256" => &[32, 32, 0],
+        "__builtin_ia32_vsha512rnds2" => &[32, 32, 16],
         "__builtin_ia32_vpdpbssd256"
         | "__builtin_ia32_vpdpbssds256"
         | "__builtin_ia32_vpdpbsud256"
@@ -906,6 +926,11 @@ fn argument_scalar_types_1(name: &str) -> Option<&'static [Option<IrType>]> {
         | "__builtin_ia32_punpcklwd256"
         | "__builtin_ia32_pxor128"
         | "__builtin_ia32_pxor256"
+        | "__builtin_ia32_sha1msg1"
+        | "__builtin_ia32_sha1msg2"
+        | "__builtin_ia32_sha1nexte"
+        | "__builtin_ia32_sha256msg1"
+        | "__builtin_ia32_sha256msg2"
         | "__builtin_ia32_storedqu"
         | "__builtin_ia32_storedqu256"
         | "__builtin_ia32_storeupd256"
@@ -916,6 +941,8 @@ fn argument_scalar_types_1(name: &str) -> Option<&'static [Option<IrType>]> {
         | "__builtin_ia32_subps256"
         | "__builtin_ia32_subsd"
         | "__builtin_ia32_subss"
+        | "__builtin_ia32_vsha512msg1"
+        | "__builtin_ia32_vsha512msg2"
         | "__builtin_ia32_xorpd"
         | "__builtin_ia32_xorpd256"
         | "__builtin_ia32_xorps"
@@ -931,6 +958,7 @@ fn argument_scalar_types_2(name: &str) -> Option<&'static [Option<IrType>]> {
         | "__builtin_ia32_palignr128"
         | "__builtin_ia32_pblendw128"
         | "__builtin_ia32_pclmulqdq128"
+        | "__builtin_ia32_sha1rnds4"
         | "__builtin_ia32_shufps"
         | "__builtin_ia32_vinsertf128_pd256"
         | "__builtin_ia32_vinsertf128_ps256"
@@ -944,6 +972,7 @@ fn argument_scalar_types_2(name: &str) -> Option<&'static [Option<IrType>]> {
         | "__builtin_ia32_maskstoreq"
         | "__builtin_ia32_maskstoreq256"
         | "__builtin_ia32_pblendvb128"
+        | "__builtin_ia32_sha256rnds2"
         | "__builtin_ia32_vpdpbssd128"
         | "__builtin_ia32_vpdpbssd256"
         | "__builtin_ia32_vpdpbssds128"
@@ -963,7 +992,8 @@ fn argument_scalar_types_2(name: &str) -> Option<&'static [Option<IrType>]> {
         | "__builtin_ia32_vpdpwuud128"
         | "__builtin_ia32_vpdpwuud256"
         | "__builtin_ia32_vpdpwuuds128"
-        | "__builtin_ia32_vpdpwuuds256" => &[None, None, None],
+        | "__builtin_ia32_vpdpwuuds256"
+        | "__builtin_ia32_vsha512rnds2" => &[None, None, None],
         "__builtin_ia32_aesimc128"
         | "__builtin_ia32_cvtpd2ps"
         | "__builtin_ia32_cvtsd2si64"

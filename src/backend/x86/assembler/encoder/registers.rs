@@ -703,6 +703,9 @@ fn is_mixed_width_mnemonic(m: &str) -> bool {
         // it from every GAS-oracle build.
         "shld",
         "shrd",
+        // SHA-512 (VEX.256): the xmm source of msg1/rnds2 is deliberately narrower
+        // than the ymm destination. check_sha512_operands checks each operand width.
+        "vsha512",
         "vperm",
         "vpsll",
         "vpsrl",

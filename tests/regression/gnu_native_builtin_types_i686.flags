@@ -1,1 +1,1 @@
--m32 -mavx2 -maes -mpclmul -msse4.2 -mbmi2
+-m32 -mavx2 -maes -mpclmul -msse4.2 -mbmi2 -msha -msha512

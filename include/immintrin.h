@@ -11,6 +11,7 @@
 #include <wmmintrin.h>
 #include <smmintrin.h>
 #include <shaintrin.h>
+#include <sha512intrin.h>
 #include <bmiintrin.h>
 #include <bmi2intrin.h>
 #include <lzcntintrin.h>

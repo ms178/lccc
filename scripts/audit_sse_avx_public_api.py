@@ -20,12 +20,12 @@ REFERENCE = ROOT / 'engineering/isa/gcc16-sse-avx-reference.json'
 BUNDLE_HEADERS = (
     'xmmintrin.h', 'emmintrin.h', 'pmmintrin.h', 'tmmintrin.h',
     'smmintrin.h', 'nmmintrin.h', 'avxintrin.h', 'avx2intrin.h',
-    'wmmintrin.h', 'shaintrin.h', 'fmaintrin.h', 'avx512fintrin.h',
+    'wmmintrin.h', 'shaintrin.h', 'sha512intrin.h', 'fmaintrin.h', 'avx512fintrin.h',
 )
 REFERENCE_HEADERS = (
     'xmmintrin.h', 'emmintrin.h', 'pmmintrin.h', 'tmmintrin.h',
     'smmintrin.h', 'nmmintrin.h', 'avxintrin.h', 'avx2intrin.h',
-    'wmmintrin.h', 'shaintrin.h', 'fmaintrin.h', 'fma4intrin.h',
+    'wmmintrin.h', 'shaintrin.h', 'sha512intrin.h', 'fmaintrin.h', 'fma4intrin.h',
     'avx5124fmapsintrin.h', 'avx5124vnniwintrin.h', 'avx512bf16intrin.h',
     'avx512bf16vlintrin.h', 'avx512bitalgintrin.h', 'avx512bitalgvlintrin.h',
     'avx512bmmintrin.h', 'avx512bmmvlintrin.h', 'avx512bwintrin.h',

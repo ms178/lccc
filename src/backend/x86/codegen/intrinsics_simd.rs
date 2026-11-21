@@ -2309,7 +2309,12 @@ impl X86Codegen {
     }
 
     /// 256-bit AVX FP op dispatch (all shapes).
-    fn emit_avx_fp_256_op(&mut self, dest_ptr: &Value, op: &IntrinsicOp, args: &[Operand]) {
+    pub(super) fn emit_avx_fp_256_op(
+        &mut self,
+        dest_ptr: &Value,
+        op: &IntrinsicOp,
+        args: &[Operand],
+    ) {
         use IntrinsicOp::*;
         // Preserve a deferred vector result — and the register peephole that
         // lets the operand load be elided — when THIS op is the pending
