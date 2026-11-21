@@ -609,42 +609,46 @@ fn reaching_value(
     }
 }
 
-fn promote_function(
+/// Follows the rename chain of a promoted load to the value that replaces it.
+fn resolve(rename: &FxHashMap<u32, u32>, mut v: Value) -> Value {
+    while let Some(&n) = rename.get(&v.0) {
+        v = Value(n);
+    }
+    v
+}
+
+/// Results of the dominator-tree rename walk that the apply phase consumes.
+struct RenameWalk {
+    /// `rename[v]` is the value that replaces the promoted load destination `v`.
+    rename: FxHashMap<u32, u32>,
+    /// Zero seeds created lazily for candidates read before any store.
+    zero_insts: Vec<Instruction>,
+    /// `phi_incoming[phi]` lists the `(incoming value, predecessor label)` pairs.
+    phi_incoming: FxHashMap<u32, Vec<(Value, crate::ir::reexports::BlockId)>>,
+    /// Per block: the load/store instruction indices promoted away.
+    delete: Vec<FxHashSet<usize>>,
+    /// Register-operand reads: (block, instruction, alloca, reaching value).
+    arg_edits: Vec<(usize, usize, u32, Value)>,
+    /// Register-operand definitions: (block, instruction, rewrite).
+    def_edits: Vec<(usize, usize, Option<IntrinsicOp>)>,
+}
+
+/// Walks the dominator tree, renaming every promoted load and store of `cands`
+/// to the SSA value that reaches it, and records the phi operands and the
+/// register-operand rewrites for `promote_function`'s apply phase.
+#[allow(clippy::too_many_arguments)]
+fn rename_walk(
     func: &mut IrFunction,
     table: &FxHashMap<IntrinsicOp, Family>,
     register_operands: bool,
-) -> usize {
-    if func.is_declaration || func.blocks.is_empty() {
-        return 0;
-    }
-    if func.blocks.iter().any(|b| {
-        b.instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::NonlocalGotoSave { .. }))
-    }) {
-        return 0;
-    }
-    let cands = find_candidates(func, table, register_operands);
-    if cands.is_empty() {
-        return 0;
-    }
+    cands: &[Candidate],
+    cand_index: &FxHashMap<u32, usize>,
+    phi_sites: &[Vec<(usize, Value)>],
+    succs: &analysis::FlatAdj,
+    children: &[Vec<usize>],
+    reachable: &FxHashSet<usize>,
+) -> RenameWalk {
     let num_blocks = func.blocks.len();
-    let label_to_idx = analysis::build_label_map(func);
-    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
-    let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
-    let df = analysis::compute_dominance_frontiers(num_blocks, &preds, &idom);
-    let children = analysis::build_dom_tree_children(num_blocks, &idom);
-    let (reachable, cands) = drop_unreachable_candidates(func, &succs, cands);
-    if cands.is_empty() {
-        return 0;
-    }
-    let cand_index: FxHashMap<u32, usize> = cands
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.alloca, i))
-        .collect();
-    let phi_sites = place_phis(func, &cands, &df, &reachable);
-
     // ── Rename ─────────────────────────────────────────────────────────
     // rename[v] = value that replaces load dest `v`.
     let mut rename: FxHashMap<u32, u32> = FxHashMap::default();
@@ -661,13 +665,6 @@ fn promote_function(
     // definitions. Applied before any deletion so the indices stay valid.
     let mut arg_edits: Vec<(usize, usize, u32, Value)> = Vec::new();
     let mut def_edits: Vec<(usize, usize, Option<IntrinsicOp>)> = Vec::new();
-
-    fn resolve(rename: &FxHashMap<u32, u32>, mut v: Value) -> Value {
-        while let Some(&n) = rename.get(&v.0) {
-            v = Value(n);
-        }
-        v
-    }
 
     // Explicit DFS over the dominator tree (no recursion: deep CFGs).
     enum Step {
@@ -777,6 +774,71 @@ fn promote_function(
             }
         }
     }
+
+    RenameWalk {
+        rename,
+        zero_insts,
+        phi_incoming,
+        delete,
+        arg_edits,
+        def_edits,
+    }
+}
+
+fn promote_function(
+    func: &mut IrFunction,
+    table: &FxHashMap<IntrinsicOp, Family>,
+    register_operands: bool,
+) -> usize {
+    if func.is_declaration || func.blocks.is_empty() {
+        return 0;
+    }
+    if func.blocks.iter().any(|b| {
+        b.instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::NonlocalGotoSave { .. }))
+    }) {
+        return 0;
+    }
+    let cands = find_candidates(func, table, register_operands);
+    if cands.is_empty() {
+        return 0;
+    }
+    let num_blocks = func.blocks.len();
+    let label_to_idx = analysis::build_label_map(func);
+    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
+    let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
+    let df = analysis::compute_dominance_frontiers(num_blocks, &preds, &idom);
+    let children = analysis::build_dom_tree_children(num_blocks, &idom);
+    let (reachable, cands) = drop_unreachable_candidates(func, &succs, cands);
+    if cands.is_empty() {
+        return 0;
+    }
+    let cand_index: FxHashMap<u32, usize> = cands
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.alloca, i))
+        .collect();
+    let phi_sites = place_phis(func, &cands, &df, &reachable);
+
+    let RenameWalk {
+        rename,
+        zero_insts,
+        mut phi_incoming,
+        mut delete,
+        arg_edits,
+        def_edits,
+    } = rename_walk(
+        func,
+        table,
+        register_operands,
+        &cands,
+        &cand_index,
+        &phi_sites,
+        &succs,
+        &children,
+        &reachable,
+    );
 
     // ── Apply ──────────────────────────────────────────────────────────
     // 0. Register-operand edits, applied first so the instruction indices the
