@@ -311,6 +311,8 @@ const ARITY_TABLE: &[(&str, u8)] = &[
     ("__builtin_ia32_pxor256", 2),
     ("__builtin_ia32_rdtsc", 0),
     ("__builtin_ia32_rdtscp", 1),
+    ("__builtin_ia32_set1_epi32", 1),
+    ("__builtin_ia32_set1_epi8", 1),
     ("__builtin_ia32_sfence", 0),
     ("__builtin_ia32_sha1msg1", 2),
     ("__builtin_ia32_sha1msg2", 2),

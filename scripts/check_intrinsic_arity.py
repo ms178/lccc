@@ -119,11 +119,21 @@ def intrinsic_names(repo: Path) -> set[str]:
 # no `__builtin_ia32_loaddqu(...)` call site exists anywhere to derive
 # from.  An entry that contradicts a header-derived count is a hard error
 # in derive(): the supplement may only fill a genuine gap.
+#
+# `__builtin_ia32_set1_epi8` / `__builtin_ia32_set1_epi32` are lccc-private
+# aliases: GCC 16.2 does not define them at all (implicit declaration), so the
+# count is not a GCC signature.  It is the operand count the backend consumes
+# (`IntrinsicOp::SetEpi8` / `SetEpi32` read exactly `args[0]`), and it is the
+# count the public `_mm_set1_epi8` / `_mm_set1_epi32` wrappers derive from the
+# headers.  Without an entry an argument-less call reached `args[0]` in the
+# backend: a panic at -O0 and a silently dropped call at -O2 (AUD-ICE-1).
 SUPPLEMENT = {
     "__builtin_ia32_loaddqu": 1,
     "__builtin_ia32_loaddqu256": 1,
     "__builtin_ia32_storedqu": 2,
     "__builtin_ia32_storedqu256": 2,
+    "__builtin_ia32_set1_epi8": 1,
+    "__builtin_ia32_set1_epi32": 1,
 }
 
 
