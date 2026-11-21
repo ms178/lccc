@@ -168,19 +168,26 @@ corpus).  The layout of `struct pad` is also checked against GCC's
 
 The generators above produce valid programs.  `mutate_frontend.py` goes the other
 way: it damages the repository's own C files and reports any internal error,
-signal or hang (`timeout`) — an ordinary diagnostic is a pass.  Every distinct
-failure keeps one reproducer under `--out`, and the exit status is 1 when something
-failed.
+signal or hang (`timeout`) — an ordinary diagnostic is a pass.  Each failure
+bucket keeps up to three distinct inputs under `--out`.
+Timeouts share a bucket and signals are grouped by number, not root cause. A
+known-good input checks the compiler and flags first. The exit status is 0 for
+a clean run, 1 for findings, and 2 for an invalid invocation or harness error.
 
 ```bash
 python3 tests/fuzz/mutate_frontend.py --lccc target/fastbuild/lccc \
   --seeds 'tests/**/*.c' --iterations 900 --out /tmp/lccc-mutfuzz -- -O1
 # re-check a saved reproducer:
 python3 tests/fuzz/mutate_frontend.py --lccc target/fastbuild/lccc \
-  --replay /tmp/lccc-mutfuzz/timeout-<hash>.c -- -O0
+  --replay /tmp/lccc-mutfuzz/timeout-<sha256>.c -- -O0
 ```
 
-Flags after `--` go to the compiler (default `-O1`).  Runs with the same `--seed`
-share one mutant sequence regardless of the compiler flags, so vary `--seed` when
-you want new inputs rather than new configurations.  Open work around this tool:
-`backlog.md` AU-01 (a preprocessor hang it found) and AU-02.
+Flags after `--` go to the compiler (default `-O1`).  Runs with the same `--seed`,
+Python RNG behavior, and unchanged seed paths and contents share one mutant sequence regardless of the compiler flags. `--json`
+includes the original working directory, flags, timeout, seed, and replay arguments
+for each sample. Replay preserves the input bytes, not the original input path or
+include context: use the original working directory and compiler/environment, and
+expect path-sensitive inputs (for example, quoted includes) to behave differently.
+Use a trusted compiler and flags, and keep the output directory outside the seed
+glob. The timeout is per invocation, not a wall-clock budget for the whole run.
+Open work is tracked in `backlog.md` under AU-01 and AU-02.

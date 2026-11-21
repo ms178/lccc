@@ -1487,6 +1487,8 @@ SA-33 and SA-36 are fixed. Edit the audit document, not a copy of the register h
 
 ## 10. Open performance and verification items (carried from the 2026-10-24 queue)
 
+Historical source: [October 24 live queue](https://github.com/ms178/lccc/blob/4d28473646f9a549ad6c2e74852ee2f07b3d9f1a/engineering/archive/BACKLOG-2026-10-24-live-queue.md).
+
 Each row keeps the measurement it was filed with; re-verify the reproducer before
 starting, and delete the row when it stops reproducing.
 

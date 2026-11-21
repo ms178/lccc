@@ -12,8 +12,8 @@ as fine:
 * ``signal``   -- the compiler was killed by a signal (abort, stack overflow);
 * ``timeout``  -- no result within ``--timeout`` seconds (a hang).
 
-Every distinct failure signature keeps one reproducer in ``--out``.  The
-exit status is 1 when any failure was found, so the script can gate a job.
+Each failure bucket retains up to three distinct inputs in ``--out``.
+Exit status: 0 for a clean run, 1 for findings, 2 for a harness error.
 
 Examples::
 
@@ -22,7 +22,7 @@ Examples::
 
     # Re-check a saved reproducer (or any file) without mutating it:
     python3 tests/fuzz/mutate_frontend.py --lccc target/fastbuild/lccc \
-        --replay /tmp/lccc-mutfuzz/timeout-8a41ade96f.c -- -O0
+        --replay /tmp/lccc-mutfuzz/timeout-<sha256>.c -- -O0
 
 Everything after ``--`` is passed to the compiler.  The default is ``-O1``.
 The run is deterministic for a given ``--seed``; change it to explore new
@@ -35,15 +35,21 @@ import argparse
 import glob
 import hashlib
 import json
+import math
 import os
 import random
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 MAX_SEED_BYTES = 6000
+MAX_SAMPLES = 3
+ICE_HEADER = re.compile(
+    r"^(?:ccc: internal error: (?P<ice>.*)|"
+    r"thread '[^\n]*' panicked at (?P<panic>.*))$", re.MULTILINE)
 
 TOKENS = [
     b"{", b"}", b"(", b")", b"[", b"]", b";", b",", b"*", b"&", b"#define ",
@@ -90,17 +96,25 @@ def run_one(lccc: str, path: Path, flags: list[str], timeout: float):
     try:
         proc = subprocess.run(
             [lccc, "-S", "-o", os.devnull, str(path), *flags],
-            capture_output=True, timeout=timeout)
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired:
         return "timeout", "TIMEOUT"
-    err = proc.stderr.decode("latin-1")
     if proc.returncode < 0:
         return "signal", f"SIG{-proc.returncode}"
-    if "internal error" in err or "panicked at" in err:
-        m = (re.search(r"panicked at ([^\n:]+:\d+)", err)
-             or re.search(r"internal error: ([^\n]{0,90})", err))
-        return "ice", m.group(1) if m else err[:80]
+    match = ICE_HEADER.search(proc.stderr.decode("utf-8", errors="replace"))
+    if match:
+        return "ice", (match.group("ice") or match.group("panic") or "unknown")[:256]
     return ("ok" if proc.returncode == 0 else "diagnostic"), ""
+
+
+def publish(out: Path, kind: str, src: bytes, digest: str) -> Path:
+    """Publish complete, content-addressed inputs even with concurrent runs."""
+    dest = out / f"{kind}-{digest}.c"
+    with tempfile.TemporaryDirectory(dir=out) as staging:
+        pending = Path(staging) / "input.c"
+        pending.write_bytes(src)
+        pending.replace(dest)
+    return dest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -124,57 +138,82 @@ def main(argv: list[str] | None = None) -> int:
                     help="compile these files as they are, without mutating")
     ap.add_argument("--json", action="store_true", help="machine-readable summary")
     args = ap.parse_args(argv)
+    if args.iterations <= 0:
+        ap.error("--iterations must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be finite and positive")
     flags = flags or ["-O1"]
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    try:
+        return run(args, flags)
+    except (OSError, OverflowError, ValueError) as exc:
+        print(f"mutation harness: {exc}", file=sys.stderr)
+        return 2
 
-    found: dict[str, list[str]] = {}
-    stats = {"total": 0, "ok": 0, "diagnostic": 0, "ice": 0, "signal": 0, "timeout": 0}
-    t0 = time.time()
 
-    def record(kind: str, sig: str, src: bytes, origin: str) -> None:
+def run(args: argparse.Namespace, flags: list[str]) -> int:
+    out = Path(args.out).resolve()
+    seeds = [] if args.replay else sorted(
+        p for p in map(Path, glob.iglob(args.seeds, recursive=True))
+        if p.is_file() and 0 < p.stat().st_size < MAX_SEED_BYTES
+    )
+    if not args.replay and not seeds:
+        raise ValueError(f"no usable seed files match {args.seeds!r}")
+    buckets: dict[tuple[str, str], dict] = {}
+    stats = dict.fromkeys(("total", "ok", "diagnostic", "ice", "signal", "timeout"), 0)
+    started = time.monotonic()
+
+    def record(src: bytes, origin: Path, path: Path) -> None:
+        kind, signature = run_one(args.lccc, path, flags, args.timeout)
+        stats["total"] += 1
         stats[kind] += 1
         if kind in ("ok", "diagnostic"):
             return
-        digest = hashlib.sha1(src).hexdigest()[:10]
-        key = f"{kind}: {sig}"
-        if key not in found:
-            (out / f"{kind}-{digest}.c").write_bytes(src)
-        found.setdefault(key, []).append(f"{digest} ({origin})")
+        key = (kind, signature)
+        if key not in buckets:
+            buckets[key] = {"kind": kind, "signature": signature, "count": 0,
+                            "coarse": kind != "ice", "samples": []}
+        bucket = buckets[key]
+        bucket["count"] += 1
+        samples = bucket["samples"]
+        if len(samples) < MAX_SAMPLES:
+            digest = hashlib.sha256(src).hexdigest()
+            if not any(sample["sha256"] == digest for sample in samples):
+                saved = publish(out, kind, src, digest)
+                samples.append({"path": str(saved), "origin": str(origin), "sha256": digest,
+                                "replay_argv": [sys.executable, str(Path(__file__).resolve()),
+                                                "--lccc", args.lccc, "--timeout", str(args.timeout),
+                                                "--out", str(out), "--replay", str(saved), "--", *flags]})
 
-    if args.replay:
-        for name in args.replay:
-            stats["total"] += 1
-            kind, sig = run_one(args.lccc, Path(name), flags, args.timeout)
-            record(kind, sig, Path(name).read_bytes(), name)
-    else:
-        seeds = [p for p in glob.glob(args.seeds, recursive=True)
-                 if os.path.getsize(p) < MAX_SEED_BYTES]
-        if not seeds:
-            print(f"no seed files match {args.seeds!r}", file=sys.stderr)
-            return 2
-        seeds.sort()
-        rng = random.Random(args.seed)
-        scratch = out / "current.c"
-        for _ in range(args.iterations):
-            seed_path = rng.choice(seeds)
-            src = mutate(Path(seed_path).read_bytes(), rng)
-            scratch.write_bytes(src)
-            stats["total"] += 1
-            kind, sig = run_one(args.lccc, scratch, flags, args.timeout)
-            record(kind, sig, src, seed_path)
-        scratch.unlink(missing_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="run-", dir=out) as work:
+        scratch = Path(work) / "current.c"
+        scratch.write_bytes(b"int lccc_mutation_probe(void) { return 0; }\n")
+        kind, signature = run_one(args.lccc, scratch, flags, args.timeout)
+        if kind != "ok":
+            raise ValueError(f"known-good input rejected ({kind}{': ' + signature if signature else ''}); "
+                             "check the compiler, flags and timeout")
+        if args.replay:
+            for name in args.replay:
+                path = Path(name).absolute()
+                record(path.read_bytes(), path, path)
+        else:
+            rng = random.Random(args.seed)
+            for _ in range(args.iterations):
+                origin = rng.choice(seeds)
+                src = mutate(origin.read_bytes(), rng)
+                scratch.write_bytes(src)
+                record(src, origin, scratch)
 
-    failures = stats["ice"] + stats["signal"] + stats["timeout"]
+    report = {"stats": stats, "flags": flags, "seed": args.seed, "timeout": args.timeout,
+              "cwd": str(Path.cwd()), "buckets": list(buckets.values())}
     if args.json:
-        print(json.dumps({"stats": stats, "flags": flags, "seed": args.seed,
-                          "signatures": {k: len(v) for k, v in found.items()}},
-                         indent=2, sort_keys=True))
+        print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        print(f"{json.dumps(stats)} in {time.time() - t0:.0f}s, flags {' '.join(flags)}")
-        for key, hits in sorted(found.items(), key=lambda kv: -len(kv[1])):
-            print(f"{len(hits):5d}  {key}   e.g. {hits[0]}")
-    return 1 if failures else 0
+        print(f"{json.dumps(stats)} in {time.monotonic() - started:.0f}s, flags {' '.join(flags)}")
+        for bucket in sorted(buckets.values(), key=lambda item: -item["count"]):
+            print(f"{bucket['count']:5d}  {bucket['kind']}: {bucket['signature']}"
+                  f"   e.g. {bucket['samples'][0]['path']}")
+    return int(bool(buckets))
 
 
 if __name__ == "__main__":

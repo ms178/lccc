@@ -64,7 +64,7 @@ Findings, in attack order (now BACKLOG MS-20):
 ## 3. Backlog rewrite (user-ordered)
 
 `engineering/agent/BACKLOG.md` rewritten from the ground up; the previous
-catalog is archived verbatim at the retired 2026-10-16 backlog archive (git history).
+catalog is archived verbatim at the [October 16 backlog snapshot](https://github.com/ms178/lccc/blob/4d28473646f9a549ad6c2e74852ee2f07b3d9f1a/engineering/archive/BACKLOG-2026-10-16.md).
 Every claim of the external "MB" audit was re-probed before admission;
 the new §3 of the backlog records rejected/stale claims so they are not
 re-imported. Highlights:

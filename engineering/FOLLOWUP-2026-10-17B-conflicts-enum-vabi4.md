@@ -21,10 +21,10 @@ Seven conflicted files, resolved by three-way semantics, never wholesale:
 | `backlog.md` | **main** | Their lean reconciled backlog; my completed items re-recorded below. |
 
 Hygiene from the #854 red-team report:
-- the retired 2026-10-16 backlog archive (git history) in #852 contained literal
+- the [October 16 backlog snapshot](https://github.com/ms178/lccc/blob/4d28473646f9a549ad6c2e74852ee2f07b3d9f1a/engineering/archive/BACKLOG-2026-10-16.md) in #852 contained literal
   `<<<<<<<` blocks (1 block, lines 1/398/3700) — **restored main's clean
-  archive** and deleted my duplicate the monolith duplicate
-  (byte-identical to main's the retired root-backlog snapshot). The conflict-
+  archive** and deleted my duplicate of the monolith
+  (byte-identical to the [October 17 root backlog snapshot](https://github.com/ms178/lccc/blob/4d28473646f9a549ad6c2e74852ee2f07b3d9f1a/engineering/archive/ROOT-BACKLOG-2026-10-17.md)). The conflict-
   marker gate would have rejected the branch; that catch was correct.
 - Conflict-marker scan over the merged tree: clean.
 
