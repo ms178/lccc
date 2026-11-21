@@ -2844,9 +2844,11 @@ fn peephole_optimize_inner(
         tail_call::optimize_tail_calls(&mut store, &mut infos);
     }
 
-    // Phase 5b: Global dead store elimination for never-read stack slots.
+    // Phase 5b: Global dead store elimination for never-read stack slots, then
+    // the per-path form for vector spills whose slot is read for another value.
     if !skip_phase5 {
         dead_code::eliminate_never_read_stores(&store, &mut infos);
+        dead_code::eliminate_flow_dead_vector_stores(&store, &mut infos);
     }
 
     // Select a native mask only from an already-BMI2, low-byte-saturating
