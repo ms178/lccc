@@ -5,18 +5,21 @@
 
 use super::*;
 
-fn infer_movext_dst_size(ops: &[Operand]) -> Result<u8, String> {
+/// The width an extending move extends to: its destination register's,
+/// which is wider than the `src_size` bytes it extends from (`movsw %cx,
+/// %cx` was assembled, to an extension of a word into itself).
+fn infer_movext_dst_size(ops: &[Operand], src_size: u8) -> Result<u8, String> {
     if ops.len() != 2 {
         return Err("mov extension requires 2 operands".to_string());
     }
     match &ops[1] {
         Operand::Register(dst) => {
             let size = reg_size(&dst.name);
-            if size == 2 || size == 4 {
+            if (size == 2 || size == 4) && size > src_size {
                 Ok(size)
             } else {
                 Err(format!(
-                    "mov extension destination must be 16/32-bit GP register: {}",
+                    "mov extension destination must be a wider 16/32-bit GP register: {}",
                     dst.name
                 ))
             }
@@ -625,7 +628,7 @@ impl super::InstructionEncoder {
         ops: &[Operand],
         src_size: u8,
     ) -> Result<(), String> {
-        let dst_size = infer_movext_dst_size(ops)?;
+        let dst_size = infer_movext_dst_size(ops, src_size)?;
         self.encode_movsx(ops, src_size, dst_size)
     }
 
@@ -634,7 +637,7 @@ impl super::InstructionEncoder {
         ops: &[Operand],
         src_size: u8,
     ) -> Result<(), String> {
-        let dst_size = infer_movext_dst_size(ops)?;
+        let dst_size = infer_movext_dst_size(ops, src_size)?;
         self.encode_movzx(ops, src_size, dst_size)
     }
 
@@ -646,19 +649,21 @@ impl super::InstructionEncoder {
             (Operand::Label(label), Operand::Register(dst)) => {
                 // Bare absolute: `lea sym,%eax` = 8D /5 disp32 (no SIB)
                 // with R_386_32; under addr16 the 16-bit rm=110 form is
-                // 8D /6 disp16 (GAS 2.47: 67 8d 06 0000 + R_386_16).
+                // 8D /6 disp16 (GAS 2.47: 67 8d 06 0000 + R_386_16). So it
+                // is in 16-bit code, where the 32-bit form was written
+                // without an address-size prefix: `8d 0d` and four bytes,
+                // which a real-mode processor reads as `lea (%di), %cx`
+                // and two more instructions.
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 self.bytes.push(0x8D);
                 if self.explicit_addr16 {
                     self.bytes.push(self.modrm(0, dst_num, 6));
                     self.add_relocation(label.as_str(), R_386_16, 0);
                     self.bytes.extend_from_slice(&[0, 0]);
+                    Ok(())
                 } else {
-                    self.bytes.push(self.modrm(0, dst_num, 5));
-                    self.add_relocation(label.as_str(), R_386_32, 0);
-                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    self.encode_abs_addr_modrm(dst_num, label)
                 }
-                Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
@@ -828,8 +833,8 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             // `pushw $sym` (header.S: `pushw $6f` lretw trampoline):
-            // 68 imm16 + R_386_16 in .code16. No valid GAS form outside
-            // 16-bit mode, so reject loudly there.
+            // 68 imm16 + R_386_16 in .code16, `66 68` and the same in
+            // 32-bit code (GAS 2.47; it used to be refused there).
             Operand::Immediate(ImmediateValue::Symbol(sym))
             | Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)) => {
                 let addend =
@@ -838,13 +843,19 @@ impl super::InstructionEncoder {
                     } else {
                         0
                     };
-                if !self.code16 {
-                    return Err("pushw $symbol is only supported in .code16 mode".to_string());
-                }
+                self.sized_op = true;
+                self.bytes.push(0x66);
                 self.bytes.push(0x68);
                 self.add_relocation(sym, R_386_16, addend);
                 self.bytes.extend_from_slice(&[0, 0]);
                 Ok(())
+            }
+            // `pushw sym`: an absolute memory operand, `66 FF /6`.
+            Operand::Label(label) => {
+                self.sized_op = true;
+                self.bytes.push(0x66);
+                self.bytes.push(0xFF);
+                self.encode_abs_addr_modrm(6, label)
             }
             _ => Err("unsupported pushw operand".to_string()),
         }
@@ -1851,6 +1862,13 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// `bt`, `bts`, `btr`, `btc`: a bit of a register or of memory.
+    ///
+    /// The operand size is the suffix's, else a register's, else the code
+    /// segment's default. (An immediate and memory used to be 32 bits
+    /// wide everywhere -- in 16-bit code `bt $5, (%bx)` came out with an
+    /// operand-size prefix GNU as does not write -- and the `w` spellings
+    /// were refused.)
     pub(super) fn encode_bt(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
         // Operand-width instruction: mark sized_op so the .code16 prefix
         // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
@@ -1859,30 +1877,34 @@ impl super::InstructionEncoder {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
 
-        let (opcode_rr, ext) = match mnemonic {
-            "btl" | "bt" => (0xA3u8, 4u8),
-            "btsl" | "bts" => (0xAB, 5),
-            "btrl" | "btr" => (0xB3, 6),
-            "btcl" | "btc" => (0xBB, 7),
+        let (stem, suffix) = match mnemonic.strip_suffix(['w', 'l']) {
+            Some(stem) if stem.len() >= 2 => (stem, mnemonic.as_bytes()[stem.len()]),
+            _ => (mnemonic, b' '),
+        };
+        let (opcode_rr, ext) = match stem {
+            "bt" => (0xA3u8, 4u8),
+            "bts" => (0xAB, 5),
+            "btr" => (0xB3, 6),
+            "btc" => (0xBB, 7),
             _ => return Err(format!("unknown bt instruction: {}", mnemonic)),
         };
 
-        // Width from the destination/base operand (GAS 2.47: `bt $15,%ax`
-        // = 66 0f ba e0 0f, `bt $3,%ecx` = 0f ba e1 03 — the unsuffixed
-        // spelling follows the register width; the imm8 is the unsigned
-        // truncation, so $16 -> 0x10).
-        let dst_size = match ops.get(1) {
-            Some(Operand::Register(r)) => Some(reg_size(&r.name)),
-            Some(Operand::Memory(_)) | Some(Operand::Label(_)) => None,
+        // Width from the suffix, then the destination/base operand (GAS
+        // 2.47: `bt $15,%ax` = 66 0f ba e0 0f, `bt $3,%ecx` = 0f ba e1 03
+        // -- the unsuffixed spelling follows the register width; the imm8
+        // is the unsigned truncation, so $16 -> 0x10).
+        let register = ops.iter().rev().find_map(|op| match op {
+            Operand::Register(r) => Some(reg_size(&r.name)),
             _ => None,
+        });
+        let size = match (suffix, register) {
+            (b'w', None | Some(2)) => 2,
+            (b'l', None | Some(4)) => 4,
+            (b' ', Some(size @ (2 | 4))) => size,
+            (b' ', None) => self.default_operand_size(),
+            _ => return Err(format!("operand type mismatch for `{stem}'")),
         };
-        let reg_size_is16 = dst_size == Some(2);
-        let src_reg_is16 = matches!(
-            ops.first(),
-            Some(Operand::Register(r)) if reg_size(&r.name) == 2
-        );
-        if reg_size_is16 || (!dst_size.is_some() && src_reg_is16) {
-            self.sized_op = true;
+        if size == 2 {
             self.bytes.push(0x66);
         }
 
@@ -2045,10 +2067,17 @@ impl super::InstructionEncoder {
                     // `e9 00 00` + PC16 for forward targets; short local
                     // targets get relaxed to EB rel8 by GAS — lccc's fixed
                     // rel16 form is semantically identical and local
-                    // targets fold to constants in the writer).
+                    // targets fold to constants in the writer). `jmpl` is
+                    // the 32-bit spelling: `66 e9` and a 32-bit
+                    // displacement, the prefix added by the inversion.
                     self.bytes.push(0xE9);
-                    self.add_relocation(sym, R_386_PC16, -2);
-                    self.bytes.extend_from_slice(&[0, 0]);
+                    if self.sized_op {
+                        self.add_relocation(sym, R_386_PC32, -4);
+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    } else {
+                        self.add_relocation(sym, R_386_PC16, -2);
+                        self.bytes.extend_from_slice(&[0, 0]);
+                    }
                     return Ok(());
                 }
                 if self.explicit_data16 {
@@ -2103,8 +2132,16 @@ impl super::InstructionEncoder {
                     }
                 }
                 match inner.as_ref() {
+                    // Through a 32-bit register: a width 16-bit code has
+                    // to be told (`jmp *%eax` is `66 ff e0` there; it came
+                    // out as `ff e0`, a jump to `%ax`). An 8-bit register
+                    // is no target.
                     Operand::Register(reg) => {
+                        if reg_size(&reg.name) != 4 {
+                            return Err("operand type mismatch for `jmp'".to_string());
+                        }
                         let num = reg_num(&reg.name).ok_or("bad register")?;
+                        self.sized_op = true;
                         self.bytes.push(0xFF);
                         self.bytes.push(self.modrm(3, 4, num));
                         Ok(())
@@ -2368,12 +2405,18 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 match inner.as_ref() {
+                    // The register says how wide the call is, in every
+                    // mode (`call *%eax` in 16-bit code is `66 ff d0`; it
+                    // came out as `ff d0`, a call to `%ax`). An 8-bit
+                    // register is no target.
                     Operand::Register(reg) => {
                         let num = reg_num(&reg.name).ok_or("bad register")?;
-                        if reg_size(&reg.name) == 2 && !self.bytes.ends_with(&[0x66]) {
-                            self.sized_op = true;
-                            self.bytes.push(0x66);
+                        match reg_size(&reg.name) {
+                            2 if !self.bytes.ends_with(&[0x66]) => self.bytes.push(0x66),
+                            2 | 4 => {}
+                            _ => return Err("operand type mismatch for `call'".to_string()),
                         }
+                        self.sized_op = true;
                         self.bytes.push(0xFF);
                         self.bytes.push(self.modrm(3, 2, num));
                         Ok(())

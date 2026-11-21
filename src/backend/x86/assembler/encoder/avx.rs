@@ -4495,6 +4495,12 @@ impl super::InstructionEncoder {
             "sd" => (false, Some(3u8)), // F2
             _ => return Ok(None),
         };
+        // A scalar compare is on `%xmm` registers, under a predicate's name
+        // as under `vcmpss` (`vcmpeqsd %xmm1, %xmm1, %ymm2` was assembled,
+        // with the vector length of the `%ymm`).
+        if pp_scalar.is_some() {
+            Self::check_avx_scalar_xmm(mnemonic, ops)?;
+        }
 
         let l = self.vex_l_from_ops(ops);
         let pp = match pp_scalar {

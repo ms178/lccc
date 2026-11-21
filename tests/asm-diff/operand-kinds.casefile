@@ -1,0 +1,410 @@
+# What an encoding takes: a register of a kind, a width or a number the
+# instruction has no field for is refused, and the statement beside it that
+# GNU as assembles is assembled to the same bytes.
+#
+# The encoders take a register's number and ask no more, and `%xmm3`, `%mm3`,
+# `%st(3)`, `%k3`, `%bl`, `%ebx`, `%ds` and `%cr3` are all number three: `rdrand
+# %xmm0` was `rdrand %eax`, `movhps %xmm1, %xmm2` was `movlhps`, `vpermd %xmm1,
+# %xmm2, %xmm3` an instruction that does not exist at that width. Each `reject`
+# group below was assembled; `operand_class::check` and the encoders refuse
+# them now. `scripts/gas_table_sweep.py` asks the same of every mnemonic of GNU
+# as's table.
+
+;;; operand_kinds_taken
+	.text
+	seta %cl
+	seta %ecx
+	seta %rcx
+	setzua %cl
+	lar %cx, %edx
+	lsl %ax, %rcx
+	movnti %ecx, (%rdx)
+	nop %ax
+	nop %ecx
+	rdpid %rcx
+	pushp %rcx
+	popp %r16
+	lwpins $0x12345678, %ecx, %rcx
+	incsspd %ecx
+	rdsspq %rcx
+	shl %cl, %eax
+	shld %cl, %eax, %edx
+	movzbl %cl, %edx
+	movswq %cx, %rdx
+	crc32b %cl, %eax
+	in %dx, %al
+	out %eax, %dx
+	bswap %ecx
+	lea (%rdx), %cx
+	movd %eax, %xmm1
+	movq %xmm1, %rax
+	movq %xmm1, %xmm2
+	cvtsd2si %xmm1, %eax
+	cvttsd2si (%rdx), %rcx
+	vcvtsi2sd %eax, %xmm1, %xmm0
+	pextrw $1, %xmm1, %eax
+	vpcmpeqd %xmm1, %xmm2, %xmm3
+	vpcmpeqd %zmm1, %zmm2, %k3
+	vptestmd %zmm1, %zmm2, %k3
+	kmovw %eax, %k1
+	kmovw %k1, %k2
+	movhps (%rdx), %xmm2
+	movlps %xmm1, (%rdx)
+	movhlps %xmm1, %xmm2
+	movlhps %xmm1, %xmm2
+	movntdqa (%rdx), %xmm2
+	movntq %mm3, (%rdx)
+	movntdq %xmm3, (%rdx)
+	lddqu (%rdx), %xmm2
+	fcomi %st(2), %st
+	fcomip %st(2)
+	fucomip %st(3), %st
+	fcom %st(1)
+	vpshufb %ymm1, %ymm2, %ymm3
+	vpsllw %xmm1, %ymm2, %ymm3
+	vpsllw %xmm1, %zmm2, %zmm3
+	vpermd %ymm1, %ymm2, %ymm3
+	vpermq $5, %zmm1, %zmm2
+	vdppd $5, %xmm1, %xmm2, %xmm3
+	vpmovsxbw %xmm1, %ymm2
+	vpmovsxbw %ymm1, %zmm2
+	vpmovsxbq %xmm1, %zmm2
+	vpmovwb %ymm1, %xmm2
+	vpmovwb %zmm1, %ymm2
+	vcvtps2ph $5, %ymm1, %xmm2
+	vcvtps2ph $5, %zmm1, %ymm2
+	vcvtps2pd %xmm1, %ymm2
+	vcvtpd2ps %ymm1, %xmm2
+	vbroadcastss %xmm1, %zmm2
+	vinsertf128 $1, %xmm1, %ymm2, %ymm3
+	vextractf128 $1, %ymm1, %xmm2
+	vinserti32x8 $1, %ymm1, %zmm2, %zmm3
+	vextracti32x8 $1, %zmm1, %ymm2
+	vmovaps %ymm1, (%rdx)
+	vmovaps %xmm17, %xmm18
+	vmovaps.s %xmm1, %xmm2
+	vgatherdps %ymm1, (%rdx,%ymm7,2), %ymm2
+	vcmpeqps %ymm1, %ymm2, %ymm3
+	vcmpeqps %zmm1, %zmm2, %k3
+	vaddps %zmm1, %zmm2, %zmm3{%k1}{z}
+	vaddpd {rn-sae}, %zmm1, %zmm2, %zmm3
+	vcvtps2pd {sae}, %ymm1, %zmm2
+	vpternlogd $1, (%rdx){1to16}, %zmm1, %zmm2
+	vfmaddcph %xmm1, %xmm2, %xmm3
+	vmpsadbw $5, %xmm17, %xmm2, %xmm3
+	vpcmov %xmm1, %xmm2, %xmm3, %xmm4
+	vblendvps %ymm1, %ymm2, %ymm3, %ymm4
+	tpause %ecx, %edx, %eax
+	umwait %ebx
+
+;;; reject_rdrand_xmm0 reject
+	.text
+	rdrand %xmm0
+
+;;; reject_adc_cl_mm3 reject
+	.text
+	adc %cl, %mm3
+
+;;; reject_addps_ecx_xmm1 reject
+	.text
+	addps %ecx, %xmm1
+
+;;; reject_seta_fs reject
+	.text
+	seta %fs
+
+;;; reject_paddb_xmm1_mm2 reject
+	.text
+	paddb %xmm1, %mm2
+
+;;; reject_fadd_xmm1 reject
+	.text
+	fadd %xmm1
+
+;;; reject_kmovw_xmm1_k1 reject
+	.text
+	kmovw %xmm1, %k1
+
+;;; reject_vaddps_k1_xmm2_xmm3 reject
+	.text
+	vaddps %k1, %xmm2, %xmm3
+
+;;; reject_push_xmm1 reject
+	.text
+	push %xmm1
+
+;;; reject_mov_st_1_eax reject
+	.text
+	mov %st(1), %eax
+
+;;; reject_movaps_eax_xmm1 reject
+	.text
+	movaps %eax, %xmm1
+
+;;; reject_cvtsi2sd_xmm1_xmm2 reject
+	.text
+	cvtsi2sd %xmm1, %xmm2
+
+;;; reject_crc32_xmm1_eax reject
+	.text
+	crc32 %xmm1, %eax
+
+;;; reject_andn_cx_dx_ax reject
+	.text
+	andn %cx, %dx, %ax
+
+;;; reject_setzua_ecx reject
+	.text
+	setzua %ecx
+
+;;; reject_seta_cx reject
+	.text
+	seta %cx
+
+;;; reject_lar_cl_cx reject
+	.text
+	lar %cl, %cx
+
+;;; reject_lsl_cx_cl reject
+	.text
+	lsl %cx, %cl
+
+;;; reject_movnti_cx_rdx reject
+	.text
+	movnti %cx, (%rdx)
+
+;;; reject_nop_cl reject
+	.text
+	nop %cl
+
+;;; reject_rdpid_ecx reject
+	.text
+	rdpid %ecx
+
+;;; reject_pushp_cx reject
+	.text
+	pushp %cx
+
+;;; reject_popp_ecx reject
+	.text
+	popp %ecx
+
+;;; reject_lwpins_0x12345678_rcx_ecx reject
+	.text
+	lwpins $0x12345678, %rcx, %ecx
+
+;;; reject_incsspd_rcx reject
+	.text
+	incsspd %rcx
+
+;;; reject_rdsspq_ecx reject
+	.text
+	rdsspq %ecx
+
+;;; reject_add_eax_cx reject
+	.text
+	add %eax, %cx
+
+;;; reject_shld_1_ax_ecx reject
+	.text
+	shld $1, %ax, %ecx
+
+;;; reject_bswap_cx reject
+	.text
+	bswap %cx
+
+;;; reject_lea_rdx_cl reject
+	.text
+	lea (%rdx), %cl
+
+;;; reject_cvtsd2si_xmm1_xmm1 reject
+	.text
+	cvtsd2si %xmm1, %xmm1
+
+;;; reject_movd_xmm1_xmm2 reject
+	.text
+	movd %xmm1, %xmm2
+
+;;; reject_movd_eax_ecx reject
+	.text
+	movd %eax, %ecx
+
+;;; reject_vcvtsi2sd_eax_ecx_xmm0 reject
+	.text
+	vcvtsi2sd %eax, %ecx, %xmm0
+
+;;; reject_pextrw_1_xmm1_xmm2 reject
+	.text
+	pextrw $1, %xmm1, %xmm2
+
+;;; reject_vpcmpd_1_zmm1_zmm2_zmm3 reject
+	.text
+	vpcmpd $1, %zmm1, %zmm2, %zmm3
+
+;;; reject_vptestmd_zmm1_zmm2_zmm3 reject
+	.text
+	vptestmd %zmm1, %zmm2, %zmm3
+
+;;; reject_vpmovm2d_zmm1_zmm2 reject
+	.text
+	vpmovm2d %zmm1, %zmm2
+
+;;; reject_movhps_xmm1_xmm2 reject
+	.text
+	movhps %xmm1, %xmm2
+
+;;; reject_movlps_xmm1_xmm2 reject
+	.text
+	movlps %xmm1, %xmm2
+
+;;; reject_movhpd_xmm1_xmm2 reject
+	.text
+	movhpd %xmm1, %xmm2
+
+;;; reject_movlpd_xmm1_xmm2 reject
+	.text
+	movlpd %xmm1, %xmm2
+
+;;; reject_movntdqa_xmm1_xmm2 reject
+	.text
+	movntdqa %xmm1, %xmm2
+
+;;; reject_movntps_xmm1_xmm2 reject
+	.text
+	movntps %xmm1, %xmm2
+
+;;; reject_movnti_eax_ecx reject
+	.text
+	movnti %eax, %ecx
+
+;;; reject_lddqu_xmm1_xmm2 reject
+	.text
+	lddqu %xmm1, %xmm2
+
+;;; reject_vlddqu_xmm1_xmm2 reject
+	.text
+	vlddqu %xmm1, %xmm2
+
+;;; reject_vmovntdqa_xmm1_xmm2 reject
+	.text
+	vmovntdqa %xmm1, %xmm2
+
+;;; reject_movntdq_mm3_rdx reject
+	.text
+	movntdq %mm3, (%rdx)
+
+;;; reject_fcomi_st_2_st_2 reject
+	.text
+	fcomi %st(2), %st(2)
+
+;;; reject_fcomip_st_2_cx reject
+	.text
+	fcomip %st(2), %cx
+
+;;; reject_fucomip_st_st_3 reject
+	.text
+	fucomip %st, %st(3)
+
+;;; reject_fcom_st_1_st_2 reject
+	.text
+	fcom %st(1), %st(2)
+
+;;; reject_vaddps_ymm1_xmm2_xmm3 reject
+	.text
+	vaddps %ymm1, %xmm2, %xmm3
+
+;;; reject_vpshufb_xmm1_ymm2_ymm3 reject
+	.text
+	vpshufb %xmm1, %ymm2, %ymm3
+
+;;; reject_vblendvps_ymm1_ymm2_xmm3_ymm4 reject
+	.text
+	vblendvps %ymm1, %ymm2, %xmm3, %ymm4
+
+;;; reject_vpclmulqdq_1_xmm1_ymm2_ymm3 reject
+	.text
+	vpclmulqdq $1, %xmm1, %ymm2, %ymm3
+
+;;; reject_vpermd_xmm1_xmm2_xmm3 reject
+	.text
+	vpermd %xmm1, %xmm2, %xmm3
+
+;;; reject_vpermq_5_xmm1_xmm2 reject
+	.text
+	vpermq $5, %xmm1, %xmm2
+
+;;; reject_vdppd_5_ymm1_ymm2_ymm3 reject
+	.text
+	vdppd $5, %ymm1, %ymm2, %ymm3
+
+;;; reject_vinsertps_5_ymm1_ymm2_ymm3 reject
+	.text
+	vinsertps $5, %ymm1, %ymm2, %ymm3
+
+;;; reject_vmovhlps_ymm1_ymm2_ymm3 reject
+	.text
+	vmovhlps %ymm1, %ymm2, %ymm3
+
+;;; reject_vpmovsxbw_ymm1_ymm2 reject
+	.text
+	vpmovsxbw %ymm1, %ymm2
+
+;;; reject_vpmovsxbq_ymm2_xmm1 reject
+	.text
+	vpmovsxbq %ymm2, %xmm1
+
+;;; reject_vcvtps2ph_5_xmm1_zmm3 reject
+	.text
+	vcvtps2ph $5, %xmm1, %zmm3
+
+;;; reject_vcmpeqps_xmm1_ymm2_ymm3 reject
+	.text
+	vcmpeqps %xmm1, %ymm2, %ymm3
+
+;;; reject_vptest_xmm1_ymm2 reject
+	.text
+	vptest %xmm1, %ymm2
+
+;;; reject_vroundps_1_ymm1_xmm2 reject
+	.text
+	vroundps $1, %ymm1, %xmm2
+
+;;; reject_vpsllw_ymm1_ymm2_ymm3 reject
+	.text
+	vpsllw %ymm1, %ymm2, %ymm3
+
+;;; reject_vextractf128_1_ymm1_ymm2 reject
+	.text
+	vextractf128 $1, %ymm1, %ymm2
+
+;;; reject_vpmovwb_xmm1_ymm2 reject
+	.text
+	vpmovwb %xmm1, %ymm2
+
+;;; reject_vbroadcastss_ymm1_ymm2 reject
+	.text
+	vbroadcastss %ymm1, %ymm2
+
+;;; reject_vpcmov_xmm1_xmm2_ymm3_ymm4 reject
+	.text
+	vpcmov %xmm1, %xmm2, %ymm3, %ymm4
+
+;;; reject_tpause_eax_edx_ecx reject
+	.text
+	tpause %eax, %edx, %ecx
+
+;;; reject_tpause_ecx_ecx_eax reject
+	.text
+	tpause %ecx, %ecx, %eax
+
+;;; reject_vfmaddcph_xmm1_xmm2_xmm1 reject
+	.text
+	vfmaddcph %xmm1, %xmm2, %xmm1
+
+;;; reject_vfcmulcsh_xmm1_xmm2_xmm2 reject
+	.text
+	vfcmulcsh %xmm1, %xmm2, %xmm2
+
+;;; reject_vfmulcph_rdx_zmm3_zmm3 reject
+	.text
+	vfmulcph (%rdx), %zmm3, %zmm3

@@ -163,6 +163,12 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let use_mmx = is_mmx(&src.name);
                 let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                // A store under a mandatory prefix is of an `%xmm` register:
+                // without the prefix `movntdq %mm3, (%rdx)` is `movntq`,
+                // which is what it was assembled to.
+                if use_mmx && prefix_len != 0 {
+                    return Err("unsupported SSE store operands".to_string());
+                }
                 if !use_mmx {
                     for &b in &opcode[..prefix_len] {
                         self.bytes.push(b);

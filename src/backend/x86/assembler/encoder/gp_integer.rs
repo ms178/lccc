@@ -2550,13 +2550,17 @@ impl super::InstructionEncoder {
                     .and_then(cc_from_mnemonic)
             })?;
             return match &ops[0] {
-                Operand::Register(reg) => {
+                Operand::Register(reg) if is_reg8(&reg.name) => {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
                     self.emit_apx_evex_rr_nd1_pp(false, "", &reg.name, false, 3)?;
                     self.bytes.push(0x40 + cc);
                     self.bytes.push(self.modrm(3, 0, num));
                     Ok(())
                 }
+                // The spelling with `zu` names the byte register (`setzua
+                // %ecx` was assembled as `setzua %cl`; the wide spelling
+                // is `seta %ecx`).
+                Operand::Register(_) => Err(format!("operand size mismatch for `{mnemonic}'")),
                 // ZU zeros the unused upper bits of a GPR. Memory has no
                 // upper bits to clear, and GAS 2.47 rejects `setzu* (%reg)`.
                 _ => Err("setzu requires a register operand".to_string()),

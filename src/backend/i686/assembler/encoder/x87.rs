@@ -77,26 +77,11 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// `fxch`, `fxch %st(i)`, and the two-operand spelling `fxch %st(i),
+    /// %st`, whose second operand is the top of the stack and nothing else
+    /// (`fxch %st(2), %st(3)` was `fxch %st(2)`).
     pub(super) fn encode_fxch(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.is_empty() {
-            // fxch with no operand defaults to st(1)
-            self.bytes.extend_from_slice(&[0xD9, 0xC9]);
-            return Ok(());
-        }
-        if ops.len() == 1 || ops.len() == 2 {
-            // With 1 operand: fxch %st(i)
-            // With 2 operands: fxch %st(i), %st (AT&T syntax)
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xD9, 0xC8 + n]);
-                    Ok(())
-                }
-                _ => Err("fxch requires st register".to_string()),
-            }
-        } else {
-            Err("fxch requires 0, 1 or 2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xD9, 0xC8, Some(1), "fxch")
     }
 
     /// Encode fnstsw (store FPU status word).
@@ -187,101 +172,26 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
+    // The compares with the top of the stack: bare (with `%st(1)`), `%st(i)`,
+    // or `%st(i), %st` -- the second operand was not looked at, and `fcom
+    // %st(1), %st(2)` was `fcom %st(1)`.
+
     pub(super) fn encode_fcom(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 1 || ops.len() == 2 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xD8, 0xD0 + n]);
-                    Ok(())
-                }
-                _ => Err("fcom requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xD8, 0xD1]);
-            Ok(())
-        } else {
-            Err("fcom requires 0, 1 or 2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xD8, 0xD0, Some(1), "fcom")
     }
 
     pub(super) fn encode_fcomp(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 1 || ops.len() == 2 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xD8, 0xD8 + n]);
-                    Ok(())
-                }
-                _ => Err("fcomp requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xD8, 0xD9]);
-            Ok(())
-        } else {
-            Err("fcomp requires 0, 1 or 2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xD8, 0xD8, Some(1), "fcomp")
     }
 
-    /// Encode fucomi (unordered compare and set EFLAGS).
     /// Encode fucomp (unordered compare and pop, sets FPU status word).
     pub(super) fn encode_fucomp(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 1 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDD, 0xE8 + n]);
-                    Ok(())
-                }
-                _ => Err("fucomp requires st register".to_string()),
-            }
-        } else if ops.len() == 2 {
-            // AT&T syntax: fucomp %st(1), %st  — first operand is the source
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDD, 0xE8 + n]);
-                    Ok(())
-                }
-                _ => Err("fucomp requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            // Default: fucomp %st(1)
-            self.bytes.extend_from_slice(&[0xDD, 0xE9]);
-            Ok(())
-        } else {
-            Err("fucomp requires 0, 1 or 2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xDD, 0xE8, Some(1), "fucomp")
     }
 
     /// Encode fucom (unordered compare, sets FPU status word, no pop).
     pub(super) fn encode_fucom(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 1 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDD, 0xE0 + n]);
-                    Ok(())
-                }
-                _ => Err("fucom requires st register".to_string()),
-            }
-        } else if ops.len() == 2 {
-            // AT&T syntax: fucom %st(1), %st — first operand is the source
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDD, 0xE0 + n]);
-                    Ok(())
-                }
-                _ => Err("fucom requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            // Default: fucom %st(1)
-            self.bytes.extend_from_slice(&[0xDD, 0xE1]);
-            Ok(())
-        } else {
-            Err("fucom requires 0, 1 or 2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xDD, 0xE0, Some(1), "fucom")
     }
 
     /// Map a `sym@MOD` modifier to its relocation type (`i686_modifier_reloc`);

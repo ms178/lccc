@@ -415,6 +415,14 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let use_mmx = is_mm(&src.name);
                 let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                // A store under a mandatory prefix is of an `%xmm` register:
+                // without the prefix `movntdq %mm3, (%edx)` is `movntq`,
+                // which is what it was assembled to.
+                if use_mmx && prefix_len != 0 {
+                    return Err(
+                        "SSE store requires xmm/mm source and memory destination".to_string()
+                    );
+                }
                 if !use_mmx {
                     self.bytes.extend_from_slice(&opcode[..prefix_len]);
                 }

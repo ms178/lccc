@@ -583,6 +583,15 @@ pub(crate) fn infer_suffix(mnemonic: &str, ops: &[Operand]) -> String {
 
 /// Get operand size from mnemonic suffix.
 pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
+    // The last letter first: it is asked of every instruction, and most
+    // names that are no suffixed spelling do not end in a suffix's letter.
+    let size = match mnemonic.as_bytes().last()? {
+        b'b' => 1,
+        b'w' => 2,
+        b'l' | b'd' => 4,
+        b'q' => 8,
+        _ => return None,
+    };
     // Handle mnemonics that don't follow the simple suffix pattern
     match mnemonic {
         "cltq" | "cqto" | "cltd" | "cdq" | "cqo" | "cbtw" | "cbw" | "cwtl"
@@ -611,17 +620,8 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         | "movsq" | "stosq" | "movsw" | "stosw" | "lodsb" | "lodsw" | "lodsd" | "lodsq"
         | "scasb" | "scasw" | "scasd" | "scasq" | "cmpsb" | "cmpsw" | "cmpsd" | "cmpsq"
         | "insb" | "insw" | "insd" | "insl" | "outsb" | "outsw" | "outsd" | "outsl"
-        | "inb" | "inw" | "inl" | "outb" | "outw" | "outl" => return None,
-        _ => {}
-    }
-
-    let last = mnemonic.as_bytes().last()?;
-    match last {
-        b'b' => Some(1),
-        b'w' => Some(2),
-        b'l' | b'd' => Some(4),
-        b'q' => Some(8),
-        _ => None,
+        | "inb" | "inw" | "inl" | "outb" | "outw" | "outl" => None,
+        _ => Some(size),
     }
 }
 
@@ -674,144 +674,115 @@ pub(crate) fn reg_class(name: &str) -> RegClass {
 }
 
 /// Mnemonics whose register operands are INTENTIONALLY of different widths or
-/// classes, and therefore exempt from the uniform-width check.
+/// classes, and therefore exempt from the uniform-width check: every mnemonic
+/// that starts with one of these.
+///
+/// By first letter, because the list is long and this used to be asked of
+/// every instruction -- 120 comparisons each, a sixth of the time it took to
+/// assemble a compiler's output.
+///
+/// `bt`/`bts`/`btr`/`btc` are NOT mixed-width: the bit-index register and the
+/// bit-base register share one operand size (GAS: "register type mismatch for
+/// `bt'" on `btl %rcx, %r8d`, "incorrect register `%r8' used with `l' suffix"
+/// on `btl $31, %r8`). The former exemption let the BitTest emitter's `btl
+/// $31, %r8` through and hid it from every GAS-oracle build.
+///
+/// XOP/LWP and the FMA4-era 5-op family are here because the specific
+/// encoders carry the byte-probed GAS 2.47 diagnostics (register type mismatch
+/// for the ymm-capable vpcmov/vfrcz*/vpermil2*; operand size mismatch for the
+/// xmm-only vpperm/vprot*/vpmac*/vph*/vpsha*/vpshl*), which the generic rules
+/// would pre-empt with non-GAS wording.
 fn is_mixed_width_mnemonic(m: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "movs",
-        "movz",
-        "movbe",
-        "cvt",
-        "vcvt",
-        "pmov",
-        "vpmov",
-        "pinsr",
-        "pextr",
-        "vpinsr",
-        "vpextr",
-        "extractps",
-        "vextractps",
-        "insertps",
-        "vinsertps",
-        "vextract",
-        "vinsert",
-        "vbroadcast",
-        "vpbroadcast",
-        "broadcast",
-        "kmov",
-        "movmsk",
-        "vmovmsk",
-        "crc32",
-        // `bt`/`bts`/`btr`/`btc` are NOT mixed-width: the bit-index register
-        // and the bit-base register share one operand size (GAS: "register
-        // type mismatch for `bt'" on `btl %rcx, %r8d`, "incorrect register
-        // `%r8' used with `l' suffix" on `btl $31, %r8`).  The former
-        // exemption let the BitTest emitter's `btl $31, %r8` through and hid
-        // it from every GAS-oracle build.
-        "shld",
-        "shrd",
-        "vperm",
-        "vpsll",
-        "vpsrl",
-        "vpsra",
-        "psll",
-        "psrl",
-        "psra",
-        "vgather",
-        "vpgather",
-        "vscatter",
-        "vpscatter",
-        "in",
-        "out",
-        "vzero",
-        "enter",
-        "lar",
-        "lsl",
-        "lgdt",
-        "lidt",
-        "sgdt",
-        "sidt",
-        "lldt",
-        "sldt",
-        "ltr",
-        "str",
-        "lmsw",
-        "smsw",
-        "verr",
-        "verw",
-        "vmread",
-        "vmwrite",
-        "vcmp",
-        "cmpp",
-        "cmps",
-        "vdpp",
-        "dpp",
-        "vround",
-        "round",
-        "vblend",
-        "blend",
-        "vpblend",
-        "pblend",
-        "vpalignr",
-        "palignr",
-        "vshuf",
-        "shuf",
-        "pshuf",
-        "vpshuf",
-        "vptest",
-        "ptest",
-        "vtest",
-        "aeskeygenassist",
-        "pclmul",
-        "vpclmul",
-        "vpdp",
-        "vpmadd",
-        // XOP/LWP and the FMA4-era 5-op family: the specific encoders
-        // carry the byte-probed GAS 2.47 diagnostics (register type
-        // mismatch for the ymm-capable vpcmov/vfrcz*/vpermil2*; operand
-        // size mismatch for the xmm-only vpperm/vprot*/vpmac*/vph*/
-        // vpsha*/vpshl*), which the generic rules below would pre-empt
-        // with non-GAS wording.
-        "vpcmov",
-        "vpperm",
-        "vprot",
-        "vpmac",
-        "vph",
-        "vfrcz",
-        "vpsha",
-        "vpshl",
-        "vpermil2",
-        "pmadd",
-        "psadbw",
-        "vpsadbw",
-        "mpsadbw",
-        "vmpsadbw",
-        "vfixup",
-        "vrange",
-        "vreduce",
-        "vgetmant",
-        "vrndscale",
-        "vscalef",
-        "vfpclass",
-        "vpternlog",
-        "vpcmp",
-        "vpshld",
-        "vpshrd",
-        "vpconflict",
-        "vplzcnt",
-        "vpopcnt",
-        "vpcompress",
-        "vpexpand",
-        "vcompress",
-        "vexpand",
-        "sh",
-        "sal",
-        "sar",
-        "rol",
-        "ror",
-        "rcl",
-        "rcr",
-    ];
-    PREFIXES.iter().any(|p| m.starts_with(p))
+    let prefixes: &[&str] = match m.as_bytes().first() {
+        Some(b'a') => &["aeskeygenassist"],
+        Some(b'b') => &["broadcast", "blend"],
+        Some(b'c') => &["cvt", "crc32", "cmpp", "cmps"],
+        Some(b'd') => &["dpp"],
+        Some(b'e') => &["extractps", "enter"],
+        Some(b'i') => &["insertps", "in"],
+        Some(b'k') => &["kmov"],
+        Some(b'l') => &["lar", "lsl", "lgdt", "lidt", "lldt", "ltr", "lmsw"],
+        Some(b'm') => &["movs", "movz", "movbe", "movmsk", "mpsadbw"],
+        Some(b'o') => &["out"],
+        Some(b'p') => &[
+            "pmov", "pinsr", "pextr", "psll", "psrl", "psra", "pblend", "palignr", "pshuf",
+            "ptest", "pclmul", "pmadd", "psadbw",
+        ],
+        Some(b'r') => &["round", "rol", "ror", "rcl", "rcr"],
+        Some(b's') => &[
+            "shld", "shrd", "sgdt", "sidt", "sldt", "str", "smsw", "shuf", "sh", "sal", "sar",
+        ],
+        Some(b'v') => &[
+            "vcvt",
+            "vpmov",
+            "vpinsr",
+            "vpextr",
+            "vextractps",
+            "vinsertps",
+            "vextract",
+            "vinsert",
+            "vbroadcast",
+            "vpbroadcast",
+            "vmovmsk",
+            "vperm",
+            "vpsll",
+            "vpsrl",
+            "vpsra",
+            "vgather",
+            "vpgather",
+            "vscatter",
+            "vpscatter",
+            "vzero",
+            "verr",
+            "verw",
+            "vmread",
+            "vmwrite",
+            "vcmp",
+            "vdpp",
+            "vround",
+            "vblend",
+            "vpblend",
+            "vpalignr",
+            "vshuf",
+            "vpshuf",
+            "vptest",
+            "vtest",
+            "vpclmul",
+            "vpdp",
+            "vpmadd",
+            "vpcmov",
+            "vpperm",
+            "vprot",
+            "vpmac",
+            "vph",
+            "vfrcz",
+            "vpsha",
+            "vpshl",
+            "vpermil2",
+            "vpsadbw",
+            "vmpsadbw",
+            "vfixup",
+            "vrange",
+            "vreduce",
+            "vgetmant",
+            "vrndscale",
+            "vscalef",
+            "vfpclass",
+            "vpternlog",
+            "vpcmp",
+            "vpshld",
+            "vpshrd",
+            "vpconflict",
+            "vplzcnt",
+            "vpopcnt",
+            "vpcompress",
+            "vpexpand",
+            "vcompress",
+            "vexpand",
+        ],
+        _ => return false,
+    };
+    prefixes.iter().any(|p| m.starts_with(p))
 }
 
 /// `movd`/`movq`/`vmovd`/`vmovq` shape validation (GAS 2.47 texts).
@@ -1127,43 +1098,36 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
     }
 
     // 3. Uniform-width rule for plain two-register data/ALU forms.
-    if ops.len() == 2 && !is_mixed_width_mnemonic(mnemonic) {
-        if let (Operand::Register(a), Operand::Register(b)) = (&ops[0], &ops[1]) {
-            let (ca, cb) = (reg_class(&a.name), reg_class(&b.name));
-            let comparable = matches!(
-                (ca, cb),
-                (RegClass::Gp(_), RegClass::Gp(_))
-                    | (RegClass::Xmm, RegClass::Xmm)
-                    | (RegClass::Ymm, RegClass::Ymm)
-                    | (RegClass::Xmm, RegClass::Ymm)
-                    | (RegClass::Ymm, RegClass::Xmm)
-            );
-            if comparable && ca != cb {
-                return Err(format!(
-                    "operand size mismatch for `{}`: %{} and %{}",
-                    mnemonic, a.name, b.name
-                ));
-            }
+    //    (The registers first: what the mnemonic exempts is asked only of
+    //    a statement that has two of different widths.)
+    if let [Operand::Register(a), Operand::Register(b)] = ops {
+        let (ca, cb) = (reg_class(&a.name), reg_class(&b.name));
+        let comparable = matches!(
+            (ca, cb),
+            (RegClass::Gp(_), RegClass::Gp(_))
+                | (RegClass::Xmm, RegClass::Xmm)
+                | (RegClass::Ymm, RegClass::Ymm)
+                | (RegClass::Xmm, RegClass::Ymm)
+                | (RegClass::Ymm, RegClass::Xmm)
+        );
+        if comparable && ca != cb && !is_mixed_width_mnemonic(mnemonic) {
+            return Err(format!(
+                "operand size mismatch for `{}`: %{} and %{}",
+                mnemonic, a.name, b.name
+            ));
         }
     }
 
     // 4. A vector mnemonic's register operands must all be the same width.
-    if mnemonic.starts_with('v') && !is_mixed_width_mnemonic(mnemonic) {
-        let mut seen: Option<RegClass> = None;
-        for op in ops {
-            if let Operand::Register(r) = op {
-                let c = reg_class(&r.name);
-                if !matches!(c, RegClass::Xmm | RegClass::Ymm | RegClass::Zmm) {
-                    continue;
-                }
-                match seen {
-                    None => seen = Some(c),
-                    Some(prev) if prev != c => {
-                        return Err(format!("mixed vector register widths in `{}`", mnemonic));
-                    }
-                    _ => {}
-                }
-            }
+    if mnemonic.starts_with('v') {
+        let mut widths = ops.iter().filter_map(|op| match op {
+            Operand::Register(r) => Some(reg_class(&r.name))
+                .filter(|c| matches!(c, RegClass::Xmm | RegClass::Ymm | RegClass::Zmm)),
+            _ => None,
+        });
+        let first = widths.next();
+        if widths.any(|width| Some(width) != first) && !is_mixed_width_mnemonic(mnemonic) {
+            return Err(format!("mixed vector register widths in `{}`", mnemonic));
         }
     }
 
@@ -1198,39 +1162,39 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
     // 5. A suffixed mnemonic must agree with its register operands' width.
     //    `setCC`/`cmovCC`/`jCC` end in a CONDITION CODE, not a size suffix
     //    (`setl` is set-if-less, not "set long"), so they must be excluded.
-    let is_cc_mnemonic = mnemonic.starts_with("set")
-        || mnemonic.starts_with("cmov")
-        || mnemonic.starts_with("cfcmov")
-        || (mnemonic.starts_with('j') && mnemonic != "jmp" && mnemonic != "jmpq");
-    if let Some(sz) = mnemonic_size_suffix(mnemonic) {
-        // LWP spellings end in letters that LOOK like size suffixes
-        // (`lwpval` → 'l') but are full mnemonic names: the destination
-        // register independently chooses r32/r64 (GAS 2.47 accepts
-        // `lwpval $imm, %ebx, %r15`). The 0x8F family has no suffixed
-        // spellings at all.
-        let is_lwp = mnemonic == "lwpins" || mnemonic == "lwpval";
-        if !is_cc_mnemonic
-            && !is_lwp
-            && !is_mixed_width_mnemonic(mnemonic)
-            && matches!(sz, 1 | 2 | 4 | 8)
-        {
-            for op in ops {
-                if let Operand::Register(r) = op {
-                    if let RegClass::Gp(w) = reg_class(&r.name) {
-                        if w != sz {
-                            // A name of the table has its own size rules:
-                            // the `s` of `lkgs` and the `d` of `vmload` are
-                            // no suffixes.
-                            if super::table::names(mnemonic) {
-                                break;
-                            }
-                            return Err(format!(
-                                "`{}` operand size does not match register %{}",
-                                mnemonic, r.name
-                            ));
-                        }
-                    }
-                }
+    //    (The registers first again: nearly every statement has a suffix
+    //    and registers that agree with it, and what the mnemonic is need
+    //    not be asked.)
+    if let Some(sz @ (1 | 2 | 4 | 8)) = mnemonic_size_suffix(mnemonic) {
+        let disagrees = ops.iter().find_map(|op| match op {
+            Operand::Register(r) => match reg_class(&r.name) {
+                RegClass::Gp(w) if w != sz => Some(r),
+                _ => None,
+            },
+            _ => None,
+        });
+        if let Some(r) = disagrees {
+            let is_cc_mnemonic = mnemonic.starts_with("set")
+                || mnemonic.starts_with("cmov")
+                || mnemonic.starts_with("cfcmov")
+                || (mnemonic.starts_with('j') && mnemonic != "jmp" && mnemonic != "jmpq");
+            // LWP spellings end in letters that LOOK like size suffixes
+            // (`lwpval` → 'l') but are full mnemonic names: the destination
+            // register independently chooses r32/r64 (GAS 2.47 accepts
+            // `lwpval $imm, %ebx, %r15`). The 0x8F family has no suffixed
+            // spellings at all.
+            let is_lwp = mnemonic == "lwpins" || mnemonic == "lwpval";
+            // A name of the table has its own size rules: the `s` of
+            // `lkgs` and the `d` of `vmload` are no suffixes.
+            if !is_cc_mnemonic
+                && !is_lwp
+                && !is_mixed_width_mnemonic(mnemonic)
+                && !super::table::names(mnemonic)
+            {
+                return Err(format!(
+                    "`{}` operand size does not match register %{}",
+                    mnemonic, r.name
+                ));
             }
         }
     }
@@ -1239,26 +1203,24 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
     //    WITHOUT REX, while %spl/%bpl/%sil/%dil and %r8b-%r15b REQUIRE it.
     //    An instruction naming both is unencodable: the REX byte one operand
     //    demands silently reinterprets the other, touching the WRONG REGISTER.
+    //    (Asked only of a statement that names one of the four.)
+    let is_high8 = |name: &str| matches!(name.trim_start_matches('%'), "ah" | "ch" | "dh" | "bh");
+    if ops
+        .iter()
+        .any(|op| matches!(op, Operand::Register(r) if is_high8(&r.name)))
     {
-        let mut has_high8 = false;
-        let mut needs_rex = false;
-        for op in ops {
-            if let Operand::Register(r) = op {
+        let needs_rex = ops.iter().any(|op| match op {
+            Operand::Register(r) => {
                 let n = r.name.trim_start_matches('%');
-                if matches!(n, "ah" | "ch" | "dh" | "bh") {
-                    has_high8 = true;
-                } else if is_rex_required_8bit(n) || needs_rex_ext(n) {
-                    needs_rex = true;
-                }
-            } else if let Operand::Memory(m) = op {
-                if m.base.as_ref().is_some_and(|b| needs_rex_ext(&b.name))
-                    || m.index.as_ref().is_some_and(|i| needs_rex_ext(&i.name))
-                {
-                    needs_rex = true;
-                }
+                !is_high8(n) && (is_rex_required_8bit(n) || needs_rex_ext(n))
             }
-        }
-        if has_high8 && needs_rex {
+            Operand::Memory(m) => {
+                m.base.as_ref().is_some_and(|b| needs_rex_ext(&b.name))
+                    || m.index.as_ref().is_some_and(|i| needs_rex_ext(&i.name))
+            }
+            _ => false,
+        });
+        if needs_rex {
             return Err(
                 "cannot encode %ah/%ch/%dh/%bh together with a REX-requiring register".to_string(),
             );
@@ -1291,7 +1253,7 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
     }
 
     // 8. Zero-operand instructions must not be given operands.
-    if crate::common::asm_scan::is_x86_zero_operand_mnemonic(mnemonic) && !ops.is_empty() {
+    if !ops.is_empty() && crate::common::asm_scan::is_x86_zero_operand_mnemonic(mnemonic) {
         return Err(format!("`{}` takes no operands", mnemonic));
     }
 
@@ -1467,4 +1429,122 @@ pub(crate) fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
     };
 
     Some((base + 0x10 * order_step + u8::from(scalar), w))
+}
+
+#[cfg(test)]
+mod mixed_width_tests {
+    use super::is_mixed_width_mnemonic;
+
+    /// The exemptions as one list, as they were before they were sorted by
+    /// first letter.
+    #[rustfmt::skip]
+    const PREFIXES: &[&str] = &[
+        "movs", "movz", "movbe", "cvt", "vcvt", "pmov", "vpmov", "pinsr", "pextr", "vpinsr",
+        "vpextr", "extractps", "vextractps", "insertps", "vinsertps", "vextract", "vinsert",
+        "vbroadcast", "vpbroadcast", "broadcast", "kmov", "movmsk", "vmovmsk", "crc32", "shld",
+        "shrd", "vperm", "vpsll", "vpsrl", "vpsra", "psll", "psrl", "psra", "vgather",
+        "vpgather", "vscatter", "vpscatter", "in", "out", "vzero", "enter", "lar", "lsl",
+        "lgdt", "lidt", "sgdt", "sidt", "lldt", "sldt", "ltr", "str", "lmsw", "smsw", "verr",
+        "verw", "vmread", "vmwrite", "vcmp", "cmpp", "cmps", "vdpp", "dpp", "vround", "round",
+        "vblend", "blend", "vpblend", "pblend", "vpalignr", "palignr", "vshuf", "shuf",
+        "pshuf", "vpshuf", "vptest", "ptest", "vtest", "aeskeygenassist", "pclmul", "vpclmul",
+        "vpdp", "vpmadd", "vpcmov", "vpperm", "vprot", "vpmac", "vph", "vfrcz", "vpsha",
+        "vpshl", "vpermil2", "pmadd", "psadbw", "vpsadbw", "mpsadbw", "vmpsadbw", "vfixup",
+        "vrange", "vreduce", "vgetmant", "vrndscale", "vscalef", "vfpclass", "vpternlog",
+        "vpcmp", "vpshld", "vpshrd", "vpconflict", "vplzcnt", "vpopcnt", "vpcompress",
+        "vpexpand", "vcompress", "vexpand", "sh", "sal", "sar", "rol", "ror", "rcl", "rcr",
+    ];
+
+    #[test]
+    fn the_exemptions_by_first_letter_are_the_list() {
+        let listed = |m: &str| PREFIXES.iter().any(|p| m.starts_with(p));
+        let mut asked = 0;
+        let mut ask = |m: &str| {
+            assert_eq!(is_mixed_width_mnemonic(m), listed(m), "{m}");
+            asked += 1;
+        };
+        for prefix in PREFIXES {
+            // The prefix, a mnemonic of it, and everything shorter.
+            ask(prefix);
+            for tail in ["b", "l", "q", "ps", "x"] {
+                ask(&format!("{prefix}{tail}"));
+            }
+            for end in 0..prefix.len() {
+                ask(&prefix[..end]);
+            }
+            // The same behind every other first letter.
+            for first in b'a'..=b'z' {
+                ask(&format!("{}{}", first as char, &prefix[1..]));
+            }
+        }
+        for mnemonic in [
+            "mov",
+            "movq",
+            "movl",
+            "movabs",
+            "movaps",
+            "movd",
+            "add",
+            "addq",
+            "sub",
+            "lea",
+            "leaq",
+            "cmp",
+            "cmpl",
+            "cmpxchg",
+            "test",
+            "xor",
+            "and",
+            "or",
+            "not",
+            "neg",
+            "inc",
+            "incl",
+            "dec",
+            "imul",
+            "idiv",
+            "push",
+            "pop",
+            "call",
+            "ret",
+            "jmp",
+            "je",
+            "jne",
+            "seta",
+            "cmovne",
+            "bt",
+            "bts",
+            "btl",
+            "bsf",
+            "bswap",
+            "xchg",
+            "xadd",
+            "nop",
+            "int",
+            "invlpg",
+            "str",
+            "strq",
+            "enterq",
+            "vaddps",
+            "vmovaps",
+            "vmovd",
+            "vpaddd",
+            "vfmadd231ps",
+            "vzeroupper",
+            "kandw",
+            "paddd",
+            "pxor",
+            "sqrtsd",
+            "cvtsi2sd",
+            "fld",
+            "fstp",
+            "",
+        ] {
+            ask(mnemonic);
+        }
+        assert!(asked > 4_000, "{asked}");
+        // What the list is for.
+        assert!(is_mixed_width_mnemonic("movzbl") && is_mixed_width_mnemonic("shlq"));
+        assert!(!is_mixed_width_mnemonic("movq") && !is_mixed_width_mnemonic("btl"));
+    }
 }

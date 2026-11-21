@@ -192,79 +192,27 @@ impl super::InstructionEncoder {
         self.encode_x87_mem(ops, opcode, ext)
     }
 
+    // The compares that set the flags: `fcomi %st(2)`, `fcomi %st(2), %st`.
+    // The second operand names the top of the stack and nothing else
+    // (`fcomi %st(2), %st(2)` and `fcomip %st(2), %cx` were assembled as
+    // if it were not there).
+
     pub(crate) fn encode_fcomip(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 || ops.len() == 1 {
-            // fcomip %st(N), %st
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDF, 0xF0 + n]);
-                    Ok(())
-                }
-                _ => Err("fcomip requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDF, 0xF1]);
-            Ok(())
-        } else {
-            Err("fcomip requires 0-2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xDF, 0xF0, Some(1), "fcomip")
     }
 
     pub(crate) fn encode_fucomi(&mut self, ops: &[Operand]) -> Result<(), String> {
-        // fucomi %st(i), %st -> DB E8+i (0 or 2 operands; 1-operand also accepted)
-        if ops.len() == 2 || ops.len() == 1 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDB, 0xE8 + n]);
-                    Ok(())
-                }
-                _ => Err("fucomi requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDB, 0xE9]); // default st(1)
-            Ok(())
-        } else {
-            Err("fucomi requires 0-2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xDB, 0xE8, Some(1), "fucomi")
     }
 
     /// Encode fcomi/fucomi (compare, no pop): fcomi = DB F0+i, fucomi = DB E8+i.
     pub(crate) fn encode_fcomi(&mut self, ops: &[Operand], base: u8) -> Result<(), String> {
-        if ops.len() == 2 || ops.len() == 1 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDB, base + n]);
-                    Ok(())
-                }
-                _ => Err("fcomi requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDB, base + 1]);
-            Ok(())
-        } else {
-            Err("fcomi requires 0-2 operands".to_string())
-        }
+        let name = if base == 0xF0 { "fcomi" } else { "fucomi" };
+        self.encode_x87_st0_sti(ops, 0xDB, base, Some(1), name)
     }
 
     pub(crate) fn encode_fucomip(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 || ops.len() == 1 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDF, 0xE8 + n]);
-                    Ok(())
-                }
-                _ => Err("fucomip requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDF, 0xE9]);
-            Ok(())
-        } else {
-            Err("fucomip requires 0-2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xDF, 0xE8, Some(1), "fucomip")
     }
 
     pub(crate) fn encode_fld_st(&mut self, ops: &[Operand]) -> Result<(), String> {
@@ -358,6 +306,21 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// The second operand of a two-operand x87 compare is `%st`, the top of
+    /// the stack it compares with (`fcom %st(1), %st(2)` and `fcom (%rax),
+    /// %st(2)` were assembled as if it were not there).
+    fn second_is_st(ops: &[Operand], name: &str) -> Result<(), String> {
+        match ops {
+            [Operand::Register(_), Operand::Register(second)]
+                if parse_st_num(&second.name) == Ok(0) =>
+            {
+                Ok(())
+            }
+            [_, _] => Err(format!("`{name}' requires %st as its second operand")),
+            _ => Ok(()),
+        }
+    }
+
     /// Encode fcom (compare real, no pop).  Handles the register forms emitted
     /// by GCC/clang-style inline assembly: no operand defaults to ST(1), one
     /// operand is ST(i), and two-operand AT&T syntax uses the first operand as
@@ -368,6 +331,7 @@ impl super::InstructionEncoder {
             return Ok(());
         }
         if ops.len() == 1 || ops.len() == 2 {
+            Self::second_is_st(ops, "fcom")?;
             match &ops[0] {
                 Operand::Register(reg) => {
                     let n = parse_st_num(&reg.name)?;
@@ -415,6 +379,7 @@ impl super::InstructionEncoder {
             return Ok(());
         }
         if ops.len() == 1 || ops.len() == 2 {
+            Self::second_is_st(ops, "fcomp")?;
             match &ops[0] {
                 Operand::Register(reg) => {
                     let n = parse_st_num(&reg.name)?;

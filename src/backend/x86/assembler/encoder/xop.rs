@@ -168,6 +168,11 @@ impl InstructionEncoder {
         };
         let imm_le = (imm as u32).to_le_bytes();
         match &ops[1] {
+            // The value is 32 bits wide whatever the destination is
+            // (`lwpins $1, %rcx, %ecx` was `lwpins $1, %ecx, %ecx`).
+            Operand::Register(src) if !is_reg32(&src.name) => {
+                Err(format!("operand type mismatch for `{mnemonic}'"))
+            }
             Operand::Register(src) => {
                 let src_num =
                     reg_num(&src.name).ok_or_else(|| format!("bad register: {}", src.name))?;

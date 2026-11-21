@@ -315,7 +315,15 @@ impl InstructionEncoder {
         let vex_hint = self.vex_hint;
         let s_flip = self.s_flip;
         let sized_op_callw = self.sized_op_callw;
-        let result = self.encode_checked(instr);
+        // The encoders go by a register's number; what kind of register
+        // the statement named is held against the encoding afterwards.
+        let result = self.encode_checked(instr).and_then(|()| {
+            crate::backend::x86::assembler::encoder::operand_class::check(
+                instr,
+                self.bytes.get(bytes..).unwrap_or(&[]),
+                false,
+            )
+        });
         if result.is_ok() {
             self.relax_got32(bytes, relocations);
         }
@@ -490,7 +498,7 @@ impl InstructionEncoder {
                 .to_string();
             if matches!(
                 stem.as_str(),
-                "movs" | "cmps" | "lods" | "scas" | "stos" | "ins" | "outs"
+                "movs" | "cmps" | "lods" | "scas" | "stos" | "ins" | "outs" | "xlat"
             ) {
                 for op in &instr.operands {
                     if let Operand::Memory(mem) = op {
@@ -513,9 +521,10 @@ impl InstructionEncoder {
         let mut result = self.encode_mnemonic(instr);
         // What the arms refuse may be a plain instruction of the shared
         // table: a spelling or a form no arm was written for.
-        if result.is_err() {
+        if let Err(refusal) = &result {
             let body = start_len + body_prefix_count;
-            if let Some(from_table) = self.encode_from_table(instr, body, reloc_base) {
+            let unhandled = refusal.starts_with("unhandled i686 instruction");
+            if let Some(from_table) = self.encode_from_table(instr, body, reloc_base, unhandled) {
                 result = from_table;
             }
         }
@@ -1684,20 +1693,28 @@ impl InstructionEncoder {
             // (The double-precision shifts are rows of the shared table,
             // with their 16-bit and memory forms.)
 
-            // Sign extension
+            // Sign extension. Each name is one width, whatever the code
+            // segment's: in 16-bit code `cbw` is `98` and `cwde` is `66
+            // 98`. (They were written as 32-bit code has them and left at
+            // that, so real-mode `cbw` extended `%ax` into `%eax` and
+            // `cwd` did what `cdq` does.)
             "cltd" | "cdq" => {
+                self.sized_op = true;
                 self.bytes.push(0x99);
                 Ok(())
             }
             "cwtl" | "cwde" => {
+                self.sized_op = true;
                 self.bytes.push(0x98);
                 Ok(())
             }
             "cbtw" | "cbw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0x98]);
                 Ok(())
             }
             "cwtd" | "cwd" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0x99]);
                 Ok(())
             }
@@ -1713,9 +1730,8 @@ impl InstructionEncoder {
             }
             "bsrl" | "bsfl" | "bsr" | "bsf" => self.encode_bsr_bsf(ops, mnemonic),
             "bsrw" | "bsfw" => self.encode_bsr_bsf_16(ops, mnemonic),
-            "btl" | "btsl" | "btrl" | "btcl" | "bt" | "bts" | "btr" | "btc" => {
-                self.encode_bt(ops, mnemonic)
-            }
+            "bt" | "bts" | "btr" | "btc" | "btw" | "btsw" | "btrw" | "btcw" | "btl" | "btsl"
+            | "btrl" | "btcl" => self.encode_bt(ops, mnemonic),
 
             // Conditional set
             "sete" | "setz" | "setne" | "setnz" | "setl" | "setle" | "setg" | "setge" | "setb"
@@ -1760,7 +1776,15 @@ impl InstructionEncoder {
             {
                 self.encode_far_branch(ops, mnemonic, "call")
             }
-            "jmp" | "jmpl" => self.encode_jmp(ops),
+            // `jmpl` says 32 bits, which 16-bit code has to be told: `jmpl
+            // *(%bx)` is `66 ff 27` there, and `jmpl label` `66 e9` and a
+            // 32-bit displacement. (Both came out as plain `jmp`.)
+            "jmp" | "jmpl" => {
+                if mnemonic == "jmpl" {
+                    self.sized_op = true;
+                }
+                self.encode_jmp(ops)
+            }
             // `jmpw` with an indirect target: `66 FF /4`. (With a label it
             // would be a 16-bit direct jump, which nothing here relaxes.)
             "jmpw" if !matches!(ops.as_slice(), [Operand::Label(_)]) => {
@@ -1937,7 +1961,8 @@ impl InstructionEncoder {
             "lret" | "lretl" => {
                 // `lret` follows the current mode's default width, `lretl`
                 // forces 32-bit; both are the no-prefix form in 32-bit terms.
-                if mnemonic == "lretl" {
+                // Under `.code16gcc` the bare one is 32 bits wide too.
+                if mnemonic == "lretl" || self.code16gcc {
                     self.sized_op = true;
                 }
                 if ops.is_empty() {
@@ -1968,12 +1993,13 @@ impl InstructionEncoder {
                     Operand::Register(reg) => {
                         let num = reg_num(&reg.name).ok_or("bad register")?;
                         // Width from the register itself (GAS 2.47:
-                        // `nop %ax` = 66 0f 1f c0, `nop %eax` = 0f 1f c0).
+                        // `nop %ax` = 66 0f 1f c0, `nop %eax` = 0f 1f c0;
+                        // in 16-bit code the other way round).
+                        self.sized_op = true;
                         if matches!(
                             reg.name.as_str(),
                             "ax" | "bx" | "cx" | "dx" | "sp" | "bp" | "si" | "di"
                         ) {
-                            self.sized_op = true;
                             self.bytes.push(0x66);
                         }
                         self.bytes.extend_from_slice(&[0x0F, 0x1F]);
@@ -2269,26 +2295,10 @@ impl InstructionEncoder {
                 self.bytes.push(self.modrm(3, 6, num));
                 Ok(())
             }
-            "tpause" | "umwait" => {
-                let pp = if mnemonic == "tpause" { 0x66 } else { 0xF2 };
-                match ops.first() {
-                    Some(Operand::Register(r)) => {
-                        let n = r.name.to_ascii_lowercase();
-                        let num = reg_num(&n).ok_or("bad register")?;
-                        if !matches!(
-                            n.as_str(),
-                            "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
-                        ) {
-                            return Err(format!("operand type mismatch for `{mnemonic}'"));
-                        }
-                        self.bytes.push(pp);
-                        self.bytes.extend_from_slice(&[0x0F, 0xAE]);
-                        self.bytes.push(self.modrm(3, 6, num));
-                        Ok(())
-                    }
-                    _ => Err(format!("{mnemonic} requires a register operand")),
-                }
-            }
+            // (`tpause` and `umwait` are rows of the shared table, with the
+            // form that names the deadline's registers: `tpause %ecx, %edx,
+            // %eax`. An arm here took the first operand of any three, and
+            // `tpause %ecx, %ecx, %eax` with it.)
             // RDRAND/RDSEED (0F C7 /6, /7): the SEV boot path draws
             // randomness in .code32.  Register form only (the only form
             // the ISA defines); %ax sizes take the 66 prefix, 32-bit
@@ -2345,6 +2355,14 @@ impl InstructionEncoder {
             // the register in ModRM.reg and the memory operand in ModRM.r/m.
             // Routing them through the single-opcode `encode_sse_op` left
             // `movlps %xmm0, (%eax)` (valid GAS) unassemblable.
+            // Between two registers the opcodes of `movlps` and `movhps` are
+            // `movhlps` and `movlhps` (which `movhps %xmm1, %xmm2` was
+            // assembled to); the half moves are to or from memory.
+            "movlps" | "movhps" | "movlpd" | "movhpd"
+                if matches!(&ops[..], [Operand::Register(_), Operand::Register(_)]) =>
+            {
+                Err(format!("operand type mismatch for `{mnemonic}'"))
+            }
             "movlps" => self.encode_sse_rr_rm(ops, &[0x0F, 0x12], &[0x0F, 0x13]),
             "movhps" => self.encode_sse_rr_rm(ops, &[0x0F, 0x16], &[0x0F, 0x17]),
             "movlpd" => self.encode_sse_rr_rm(ops, &[0x66, 0x0F, 0x12], &[0x66, 0x0F, 0x13]),
@@ -2414,9 +2432,19 @@ impl InstructionEncoder {
             // SSE convention used here: ops = [src, dst]. Byte form F0 takes
             // r/m8; word form prefixes 66+F2; the 64-bit form (crc32q) needs
             // REX.W and is unavailable on i686.
-            "crc32b" => self.encode_via_x64(instr),
-            "crc32w" => self.encode_via_x64(instr),
-            "crc32l" => self.encode_via_x64(instr),
+            // The source says how wide the operation is, and a word or a
+            // doubleword is a choice 16-bit code inverts: `crc32w (%bx),
+            // %ebp` has no prefix there and `crc32l` has one (they had it
+            // the other way round). Where nothing says it -- no suffix, a
+            // source in memory -- it is the mode's own width, as in GNU as:
+            // `crc32 (%bx), %ebp` has no prefix in either mode.
+            "crc32b" | "crc32w" | "crc32l" | "crc32" => {
+                self.sized_op = match ops.first() {
+                    Some(Operand::Register(r)) => reg_size(&r.name) != 1,
+                    _ => matches!(mnemonic, "crc32w" | "crc32l"),
+                };
+                self.encode_via_x64(instr)
+            }
             "aesimc" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDB]),
             "aeskeygenassist" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xDF]),
 
@@ -2846,17 +2874,15 @@ impl InstructionEncoder {
             "pushf" | "pushfl" => {
                 // The 'l' spelling selects the 32-bit form — a real size
                 // choice, so it participates in the .code16 inversion
-                // (wakeup_asm.S pushfl = 66 9c in real mode).
-                if mnemonic == "pushfl" {
-                    self.sized_op = true;
-                }
+                // (wakeup_asm.S pushfl = 66 9c in real mode). So does the
+                // bare one under `.code16gcc`, where a stack operation is
+                // 32 bits wide unless it says otherwise.
+                self.sized_op = mnemonic == "pushfl" || self.code16gcc;
                 self.bytes.push(0x9C);
                 Ok(())
             }
             "popf" | "popfl" => {
-                if mnemonic == "popfl" {
-                    self.sized_op = true;
-                }
+                self.sized_op = mnemonic == "popfl" || self.code16gcc;
                 self.bytes.push(0x9D);
                 Ok(())
             }
@@ -2864,32 +2890,34 @@ impl InstructionEncoder {
             // only (invalid in 64-bit mode — correctly absent from the x86-64
             // encoder). Kernel realmode BIOS trampolines save the full
             // register file around INT calls (arch/x86/boot/bioscall.S).
-            // `pushaw`/`popaw` are the 16-bit-operand forms (0x66 prefix).
+            // `pushaw`/`popaw` are the 16-bit-operand forms: `66 60` in
+            // 32-bit code, `60` in 16-bit code (where they came out as
+            // `66 60`, which is `pushal` there).
             "pusha" | "pushal" => {
-                if mnemonic == "pushal" {
-                    self.sized_op = true;
-                }
+                self.sized_op = mnemonic == "pushal" || self.code16gcc;
                 self.bytes.push(0x60);
                 Ok(())
             }
             "popa" | "popal" => {
-                if mnemonic == "popal" {
-                    self.sized_op = true;
-                }
+                self.sized_op = mnemonic == "popal" || self.code16gcc;
                 self.bytes.push(0x61);
                 Ok(())
             }
             "pushaw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0x60]);
                 Ok(())
             }
             "popaw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0x61]);
                 Ok(())
             }
 
-            // Leave (stack frame teardown)
+            // Leave (stack frame teardown): a stack operation, 32 bits
+            // wide under `.code16gcc`.
             "leave" => {
+                self.sized_op = self.code16gcc;
                 self.bytes.push(0xC9);
                 Ok(())
             }
@@ -2924,7 +2952,7 @@ impl InstructionEncoder {
             "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
             "lddqu" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xF0]),
             "movntdqa" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2A]),
-            "extrq" | "insertq" | "crc32" => self.encode_via_x64(instr),
+            "extrq" | "insertq" => self.encode_via_x64(instr),
             "movntsd" => self.encode_sse_store_only(ops, &[0xF2, 0x0F, 0x2B]),
             "movntss" => self.encode_sse_store_only(ops, &[0xF3, 0x0F, 0x2B]),
 

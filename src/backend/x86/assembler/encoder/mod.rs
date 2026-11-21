@@ -10,6 +10,7 @@ mod core;
 
 pub(crate) use self::core::{fold_index_into_base, folded_base, mem_vex_xb_bits};
 mod gp_integer;
+pub(crate) mod operand_class;
 mod promoted;
 mod registers;
 mod sse;
@@ -17,6 +18,7 @@ mod sse34;
 pub(crate) use sse34::check_sse34_operands;
 mod system;
 pub(crate) mod table;
+mod vector_widths;
 mod x87_misc;
 mod xop;
 
@@ -969,7 +971,11 @@ impl InstructionEncoder {
             self.s_flip,
         );
         let trace = (self.track_memory_emission, self.memory_emission);
-        let result = self.encode_checked(instr);
+        // The encoders go by a register's number; what kind of register
+        // the statement named is held against the encoding afterwards.
+        let result = self.encode_checked(instr).and_then(|()| {
+            operand_class::check(instr, self.bytes.get(bytes..).unwrap_or(&[]), true)
+        });
         if result.is_err() {
             self.bytes.truncate(bytes);
             self.relocations.truncate(relocations);
@@ -4198,7 +4204,9 @@ impl InstructionEncoder {
             }
             // CET shadow stack: rdsspq %r64, rdsspd %r32
             "rdsspq" => {
-                if let Some(Operand::Register(reg)) = ops.first() {
+                if let [Operand::Register(reg)] = ops.as_slice()
+                    && is_reg64(&reg.name)
+                {
                     let rm = reg_num(&reg.name)
                         .ok_or_else(|| format!("unknown register: {}", reg.name))?;
                     self.bytes.push(0xF3);
@@ -4213,7 +4221,9 @@ impl InstructionEncoder {
                 }
             }
             "rdsspd" => {
-                if let Some(Operand::Register(reg)) = ops.first() {
+                if let [Operand::Register(reg)] = ops.as_slice()
+                    && is_reg32(&reg.name)
+                {
                     let rm = reg_num(&reg.name)
                         .ok_or_else(|| format!("unknown register: {}", reg.name))?;
                     self.bytes.push(0xF3);
@@ -4230,7 +4240,9 @@ impl InstructionEncoder {
             // CET shadow stack increment: incsspq %r64 / incsspd %r32
             // (F3 [REX.W] 0F AE /6 — same family as rdssp with reg field 6).
             "incsspq" => {
-                if let Some(Operand::Register(reg)) = ops.first() {
+                if let [Operand::Register(reg)] = ops.as_slice()
+                    && is_reg64(&reg.name)
+                {
                     let rm = reg_num(&reg.name)
                         .ok_or_else(|| format!("unknown register: {}", reg.name))?;
                     self.bytes.push(0xF3);
@@ -4244,7 +4256,9 @@ impl InstructionEncoder {
                 }
             }
             "incsspd" => {
-                if let Some(Operand::Register(reg)) = ops.first() {
+                if let [Operand::Register(reg)] = ops.as_slice()
+                    && is_reg32(&reg.name)
+                {
                     let rm = reg_num(&reg.name)
                         .ok_or_else(|| format!("unknown register: {}", reg.name))?;
                     self.bytes.push(0xF3);
@@ -4566,6 +4580,15 @@ impl InstructionEncoder {
             // Additional SSE data movement
             "movaps" => self.encode_sse_rr_rm(ops, &[0x0F, 0x28], &[0x0F, 0x29]),
             "movdqa" => self.encode_sse_rr_rm(ops, &[0x66, 0x0F, 0x6F], &[0x66, 0x0F, 0x7F]),
+            // The half moves are to or from memory. Between two registers
+            // the opcodes of `movlps` and `movhps` are `movhlps` and
+            // `movlhps`, which is what `movhps %xmm1, %xmm2` was assembled
+            // to.
+            "movlps" | "movhps" | "movlpd" | "movhpd"
+                if matches!(&ops[..], [Operand::Register(_), Operand::Register(_)]) =>
+            {
+                Err(format!("operand type mismatch for `{mnemonic}'"))
+            }
             "movlpd" => self.encode_sse_rr_rm(ops, &[0x66, 0x0F, 0x12], &[0x66, 0x0F, 0x13]),
             "movhpd" => self.encode_sse_rr_rm(ops, &[0x66, 0x0F, 0x16], &[0x66, 0x0F, 0x17]),
             "movlps" => self.encode_sse_rr_rm(ops, &[0x0F, 0x12], &[0x0F, 0x13]),

@@ -21,9 +21,11 @@ impl super::InstructionEncoder {
         if ops.len() != 1 {
             return Err("pushp/popp requires 1 operand".to_string());
         }
+        // The pair hint is of the 64-bit push and pop (`pushp %cx` was
+        // `pushp %rcx`).
         let r = match &ops[0] {
-            Operand::Register(r) => r,
-            _ => return Err("pushp/popp requires a register".to_string()),
+            Operand::Register(r) if is_reg64(&r.name) => r,
+            _ => return Err("pushp/popp requires a 64-bit register".to_string()),
         };
         let num = reg_num(&r.name).ok_or("bad register")?;
         let (b, b4) = gp_ext_bits(&r.name);

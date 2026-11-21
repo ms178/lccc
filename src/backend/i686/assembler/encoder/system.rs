@@ -353,6 +353,13 @@ impl super::InstructionEncoder {
                 self.bytes.push(0x8F);
                 self.encode_modrm_mem(0, mem)
             }
+            // `popw sym`: the same, into an absolute address.
+            Operand::Label(label) => {
+                self.sized_op = true;
+                self.bytes.push(0x66);
+                self.bytes.push(0x8F);
+                self.encode_abs_addr_modrm(0, label)
+            }
             _ => Err("unsupported popw operand".to_string()),
         }
     }
@@ -393,12 +400,15 @@ impl super::InstructionEncoder {
     /// Encode `instr` from the table of plain instructions the 64-bit
     /// encoder shares (`x86::assembler::encoder::table`), in place of what
     /// an arm that refused it left from `body` on. `None` when the table
-    /// has no row for it, and the arm's own diagnostic stands.
+    /// has no row for it, and the arm's own diagnostic stands -- unless no
+    /// arm knew the name (`unhandled`) and the table does: then what the
+    /// table has against the operands is the diagnostic.
     pub(super) fn encode_from_table(
         &mut self,
         instr: &Instruction,
         body: usize,
         relocations: usize,
+        unhandled: bool,
     ) -> Option<Result<(), String>> {
         use crate::backend::x86::assembler::encoder::table::{self, RegField, RmField};
         let mnemonic = instr.mnemonic.to_ascii_lowercase();
@@ -421,7 +431,10 @@ impl super::InstructionEncoder {
                 .collect();
             &addresses
         };
-        let plan = table::plan(&mnemonic, operands, false)?.ok()?;
+        let plan = match table::plan(&mnemonic, operands, false)? {
+            Ok(plan) => plan,
+            Err(mismatch) => return unhandled.then_some(Err(mismatch)),
+        };
         self.bytes.truncate(body);
         self.relocations.truncate(relocations);
         // 16-bit code spells an address register differently, and nothing
@@ -469,9 +482,16 @@ impl super::InstructionEncoder {
                 self.bytes
                     .extend_from_slice(&value.to_le_bytes()[..usize::from(bytes)]);
             }
+            // A displacement is as wide as the operand: 16 bits in 16-bit
+            // code (`xbegin` had 32 there, two bytes too many).
             if let Some(target) = plan.target {
-                self.add_relocation(target, R_386_PC32, -4);
-                self.bytes.extend_from_slice(&[0; 4]);
+                if self.code16 {
+                    self.add_relocation(target, R_386_PC16, -2);
+                    self.bytes.extend_from_slice(&[0; 2]);
+                } else {
+                    self.add_relocation(target, R_386_PC32, -4);
+                    self.bytes.extend_from_slice(&[0; 4]);
+                }
             }
             Ok(())
         })();
