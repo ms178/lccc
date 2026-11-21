@@ -163,3 +163,24 @@ reference before trusting any verdict: `--ccc gcc`, `--ccc clang`, or `--ccc icx
 (the model agreed with all three, 240 of 240 each, for the bit-field and padding
 corpus).  The layout of `struct pad` is also checked against GCC's
 `sizeof`/`offsetof` in `test_punning_fuzz.py`.
+
+## Front-end robustness: `mutate_frontend.py`
+
+The generators above produce valid programs.  `mutate_frontend.py` goes the other
+way: it damages the repository's own C files and reports any internal error,
+signal or hang (`timeout`) — an ordinary diagnostic is a pass.  Every distinct
+failure keeps one reproducer under `--out`, and the exit status is 1 when something
+failed.
+
+```bash
+python3 tests/fuzz/mutate_frontend.py --lccc target/fastbuild/lccc \
+  --seeds 'tests/**/*.c' --iterations 900 --out /tmp/lccc-mutfuzz -- -O1
+# re-check a saved reproducer:
+python3 tests/fuzz/mutate_frontend.py --lccc target/fastbuild/lccc \
+  --replay /tmp/lccc-mutfuzz/timeout-<hash>.c -- -O0
+```
+
+Flags after `--` go to the compiler (default `-O1`).  Runs with the same `--seed`
+share one mutant sequence regardless of the compiler flags, so vary `--seed` when
+you want new inputs rather than new configurations.  Open work around this tool:
+`backlog.md` AU-01 (a preprocessor hang it found) and AU-02.
