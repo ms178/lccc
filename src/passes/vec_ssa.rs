@@ -123,14 +123,9 @@ enum Access {
     ArgRead { positions: Vec<(usize, usize)> },
     /// `dest_ptr = a` on a producer whose register result is `value`: the
     /// instruction now defines the object instead of storing into it. The
-    /// `dest_ptr` is dropped. `rewrite` is set for the `Loadu256`/`Load256`
-    /// memory loads, which have no register-result form: they become the
-    /// family whole-register load of the same address (`args = [p, 0]`).
-    Def {
-        value: Value,
-        rewrite: Option<IntrinsicOp>,
-        width: usize,
-    },
+    /// `dest_ptr` is dropped. Memory loads (`Loadu256`/`Load256`) are not
+    /// definitions: see `classify_register_operand`.
+    Def { value: Value, width: usize },
 }
 
 /// Family-form access: `VecLoad(a, 0)` or `VecStore(a) <- val` of `fam`.
@@ -180,7 +175,6 @@ fn classify_register_operand(
     dest_ptr: &Option<Value>,
     args: &[Operand],
     a: u32,
-    table: &FxHashMap<IntrinsicOp, Family>,
 ) -> Option<Access> {
     if *dest_ptr == Some(Value(a)) {
         // A definition of the whole object. The producer must not also read
@@ -191,32 +185,22 @@ fn classify_register_operand(
         {
             return None;
         }
-        let value = (*dest)?;
+        // A memory load into the object (`Loadu256`/`Load256`) is not a
+        // definition the pass may take over. Its result has no register-home
+        // form here, and rewriting it into the family load leaves the
+        // following copy into a local unmatched by `veccopychain` (which
+        // needs the load to write its home directly), so the compare reads
+        // the local from memory. The 485-case AVX-512VL matrix grew from 5136
+        // to 7440 runtime bytes; the object stays in memory instead.
         if matches!(op, IntrinsicOp::Loadu256 | IntrinsicOp::Load256) {
-            let [Operand::Value(p)] = args else {
-                return None;
-            };
-            if p.0 == a {
-                return None;
-            }
-            // The 32-byte whole-register load, unaligned-safe like the
-            // `Loadu256` it replaces.
-            let rewrite = image_family(table, 32)?.load;
-            return Some(Access::Def {
-                value,
-                rewrite: Some(rewrite),
-                width: 32,
-            });
+            return None;
         }
+        let value = (*dest)?;
         if !register_result_form_is_self_contained(op) {
             return None;
         }
         let width = op.vector_result_width()? as usize;
-        return Some(Access::Def {
-            value,
-            rewrite: None,
-            width,
-        });
+        return Some(Access::Def { value, width });
     }
     // A register-operand read. `dest_ptr` may name a different memory
     // destination; that write is independent of the operand read.
@@ -253,7 +237,7 @@ fn classify(
     if !register_operands {
         return None;
     }
-    classify_register_operand(dest, *op, dest_ptr, args, a, table)
+    classify_register_operand(dest, *op, dest_ptr, args, a)
 }
 
 struct Candidate {
@@ -629,8 +613,8 @@ struct RenameWalk {
     delete: Vec<FxHashSet<usize>>,
     /// Register-operand reads: (block, instruction, alloca, reaching value).
     arg_edits: Vec<(usize, usize, u32, Value)>,
-    /// Register-operand definitions: (block, instruction, rewrite).
-    def_edits: Vec<(usize, usize, Option<IntrinsicOp>)>,
+    /// Register-operand definitions: (block, instruction).
+    def_edits: Vec<(usize, usize)>,
 }
 
 /// Walks the dominator tree, renaming every promoted load and store of `cands`
@@ -661,10 +645,10 @@ fn rename_walk(
     let mut delete: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); num_blocks];
     let mut stacks: Vec<Vec<Value>> = vec![Vec::new(); cands.len()];
     // Register-operand rewrites recorded by the walk: (block, instruction,
-    // alloca, reaching value) for reads, (block, instruction, load kind) for
-    // definitions. Applied before any deletion so the indices stay valid.
+    // alloca, reaching value) for reads, (block, instruction) for definitions.
+    // Applied before any deletion so the indices stay valid.
     let mut arg_edits: Vec<(usize, usize, u32, Value)> = Vec::new();
-    let mut def_edits: Vec<(usize, usize, Option<IntrinsicOp>)> = Vec::new();
+    let mut def_edits: Vec<(usize, usize)> = Vec::new();
 
     // Explicit DFS over the dominator tree (no recursion: deep CFGs).
     enum Step {
@@ -740,10 +724,10 @@ fn rename_walk(
                         }
                     }
                     for (ci, acc) in &events {
-                        if let Access::Def { value, rewrite, .. } = acc {
+                        if let Access::Def { value, .. } = acc {
                             stacks[*ci].push(*value);
                             pushed.push(*ci);
-                            def_edits.push((b, ii, *rewrite));
+                            def_edits.push((b, ii));
                         }
                     }
                 }
@@ -843,8 +827,7 @@ fn promote_function(
     // ── Apply ──────────────────────────────────────────────────────────
     // 0. Register-operand edits, applied first so the instruction indices the
     //    walk recorded are still valid. A read operand takes the reaching SSA
-    //    value; a definition drops its memory destination, and the memory
-    //    `Loadu256`/`Load256` forms become the family whole-register load.
+    //    value; a definition drops its memory destination.
     for (b, ii, alloca, cur) in arg_edits {
         let cur = resolve(&rename, cur);
         if let Instruction::Intrinsic { args, .. } = &mut func.blocks[b].instructions[ii] {
@@ -855,25 +838,9 @@ fn promote_function(
             }
         }
     }
-    for (b, ii, rewrite) in def_edits {
-        if let Instruction::Intrinsic {
-            op, dest_ptr, args, ..
-        } = &mut func.blocks[b].instructions[ii]
-        {
+    for (b, ii) in def_edits {
+        if let Instruction::Intrinsic { dest_ptr, .. } = &mut func.blocks[b].instructions[ii] {
             *dest_ptr = None;
-            if let Some(load) = rewrite {
-                let pointer = match args.as_slice() {
-                    [Operand::Value(p)] => Some(*p),
-                    _ => None,
-                };
-                if let Some(p) = pointer {
-                    *op = load;
-                    *args = vec![
-                        Operand::Value(p),
-                        Operand::Const(crate::ir::reexports::IrConst::I64(0)),
-                    ];
-                }
-            }
         }
     }
     // 1. Delete promoted loads/stores and the allocas themselves (parameter
