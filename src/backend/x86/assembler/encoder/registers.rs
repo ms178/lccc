@@ -521,8 +521,8 @@ pub(crate) fn check_movext_register_sizes(
 /// Only these mnemonics will have suffixes inferred from operand types.
 pub(crate) const SUFFIXABLE_MNEMONICS: &[&str] = &[
     "mov", "add", "sub", "and", "or", "xor", "cmp", "test", "push", "pop", "lea", "shl", "shr",
-    "sar", "rol", "ror", "inc", "dec", "neg", "not", "imul", "mul", "div", "idiv", "adc", "sbb",
-    "xchg", "cmpxchg", "xadd", "bswap", "bsf", "bsr",
+    "sar", "sal", "rol", "ror", "rcl", "rcr", "inc", "dec", "neg", "not", "imul", "mul", "div",
+    "idiv", "adc", "sbb", "xchg", "cmpxchg", "xadd", "bswap", "bsf", "bsr",
 ];
 
 /// Infer the AT&T size suffix for an unsuffixed mnemonic from its operands.
@@ -552,7 +552,13 @@ pub(crate) fn infer_suffix(mnemonic: &str, ops: &[Operand]) -> String {
     // leaves the mnemonic unsuffixed for the encoder's GAS 32-bit
     // default (`shl (%rax)` = d1 20, `sal %cl,(%rax)` = d3 20 — the %cl
     // COUNT never decides the size, only a register DESTINATION does).
-    let is_shift = matches!(mnemonic, "shl" | "shr" | "sar" | "rol" | "ror");
+    // (`sal`, `rcl` and `rcr` were missing here, and a byte register took
+    // the 32-bit form: `rcl $1, %cl` came out as `d1 d1`, which rotates
+    // `%ecx`, where GAS writes `d0 d1`.)
+    let is_shift = matches!(
+        mnemonic,
+        "shl" | "shr" | "sar" | "sal" | "rol" | "ror" | "rcl" | "rcr"
+    );
     if is_shift {
         if let Some(Operand::Register(r)) = ops.last() {
             if let Some(suffix) = register_size_suffix(&r.name) {
@@ -1212,6 +1218,12 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
                 if let Operand::Register(r) = op {
                     if let RegClass::Gp(w) = reg_class(&r.name) {
                         if w != sz {
+                            // A name of the table has its own size rules:
+                            // the `s` of `lkgs` and the `d` of `vmload` are
+                            // no suffixes.
+                            if super::table::names(mnemonic) {
+                                break;
+                            }
                             return Err(format!(
                                 "`{}` operand size does not match register %{}",
                                 mnemonic, r.name
@@ -1349,8 +1361,11 @@ pub(crate) fn infer_operand_size_from_pair(op1: &Operand, op2: &Operand) -> u8 {
             }
         }
     }
-    // Default to 64-bit
-    8
+    // No register says: 32 bits, GAS's default for an operation it warns
+    // about ("no instruction mnemonic suffix given and no register
+    // operands"). `add $7, (%rbp)` is `83 45 00 07`; the 64-bit form this
+    // used to pick wrote eight bytes where GAS writes four.
+    4
 }
 
 /// Parse x87 register number: "st(0)" -> 0, "st" -> 0, "st(1)" -> 1, etc.

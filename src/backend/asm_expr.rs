@@ -96,6 +96,15 @@ pub fn trim_asm_line(s: &str) -> &str {
         return s;
     }
     let bytes = s.as_bytes();
+    // Without a quote there is no literal whose payload could be trailing
+    // whitespace: the line ends at its last byte that is none.
+    if !bytes.contains(&b'"') && !bytes.contains(&b'\'') {
+        let end = bytes
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map_or(0, |last| last + 1);
+        return &s[..end];
+    }
     let mut in_string = false;
     let mut i = 0usize;
     let mut keep_end = 0usize;

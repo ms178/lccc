@@ -499,54 +499,6 @@ impl super::InstructionEncoder {
         }
     }
 
-    pub(crate) fn encode_sldt(&mut self, ops: &[Operand]) -> Result<(), String> {
-        // sldt %reg: 0F 00 /0
-        if ops.len() != 1 {
-            return Err("sldt requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let num = reg_num(&reg.name).ok_or("bad register")?;
-                let size = infer_reg_size(&reg.name);
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                // SLDT never sets REX.W, even for a 64-bit dest (upper bits zero).
-                self.emit_rex_unary(4, &reg.name);
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.bytes.push(self.modrm(3, 0, num));
-                Ok(())
-            }
-            Operand::Memory(mem) => {
-                self.emit_rex_rm(0, "", mem);
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.encode_modrm_mem(0, mem)
-            }
-            _ => Err("unsupported sldt operand".to_string()),
-        }
-    }
-
-    pub(crate) fn encode_str_insn(&mut self, ops: &[Operand]) -> Result<(), String> {
-        // str %reg: 0F 00 /1
-        if ops.len() != 1 {
-            return Err("str requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let num = reg_num(&reg.name).ok_or("bad register")?;
-                let size = infer_reg_size(&reg.name);
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.emit_rex_unary(4, &reg.name);
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.bytes.push(self.modrm(3, 1, num));
-                Ok(())
-            }
-            _ => Err("unsupported str operand".to_string()),
-        }
-    }
-
     pub(crate) fn encode_sse_cvt_gp_to_xmm(
         &mut self,
         ops: &[Operand],
