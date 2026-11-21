@@ -409,7 +409,10 @@ mod tests {
             vec_store(IntrinsicOp::VecStoreF32x8, 11, 20),
             point_store(IntrinsicOp::StoreuPs256, 20, 3),
         ]);
-        assert_eq!(forwardable_temporaries(&admitted), FxHashSet::from_iter([20]));
+        assert_eq!(
+            forwardable_temporaries(&admitted),
+            FxHashSet::from_iter([20])
+        );
         // A second whole-vector writer breaks the single-writer shape: refused.
         let refused = function(vec![
             alloca(20, 32),
