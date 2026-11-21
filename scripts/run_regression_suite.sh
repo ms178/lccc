@@ -154,6 +154,17 @@ else
 fi
 rm -f "$probe_src" "$probe_bin"
 
+# hdr32_build_failure: 0 when a -m32 build failed ONLY because the i386 libc
+# headers or libgcc are absent on this host (the HDR32 probe failed, and every
+# diagnostic is a missing-tree consequence). Any other error is a real FAIL.
+hdr32_build_failure() {  # hdr32_build_failure <err-file> <flags...>
+    local err=$1; shift
+    [[ " $* " == *" -m32 "* ]] || return 1
+    [[ "${HDR32_OK:-1}" == "0" ]] || return 1
+    grep -q 'bits/[^ ]*: No such file or directory\|cannot find -l[a-z]*' "$err" || return 1
+    ! grep -v 'No such file or directory\|cannot find -l\|missing binary operator before token\|preprocessor error(s)\|^In file included\|fatal error\|compilation terminated' "$err" | grep -q 'error:'
+}
+
 # ── 32-bit libc/libgcc capability probe ─────────────────────────────────
 # A `-m32` fixture needs the 32-bit glibc header tree (bits/libc-header-start.h
 # and friends) to compile, and the i386 libgcc to link. Hosts without the i386
@@ -193,6 +204,37 @@ run_one() {  # run_one <src> ; env may override CCC_NO_SMALL_SLOTS etc.
     else
         unset LCCC_SYSROOT
     fi
+    # OBJECT-ONLY fixture (`LCCC_OBJECT_ONLY=<entry symbol>` in .env): the
+    # translation unit is a component consumed by another harness, not a
+    # program. It must compile to an object of the requested class that DEFINES
+    # the entry symbol; it is never linked, so a missing `main` is not a defect.
+    if [[ -n ${LCCC_OBJECT_ONLY:-} ]]; then
+        local objf="$WORK/$(basename "$base").o"
+        if ! CCC_VERIFY_IR="${LCCC_IR_VERIFY:-1}" \
+             "$LCCC_BIN" "$GCC_INC" -O2 "${flags[@]}" -c "$src" -o "$objf" 2>"$WORK/cc.err"; then
+            if hdr32_build_failure "$WORK/cc.err" "${flags[@]}"; then echo "NOHDR32"; return; fi
+            echo "BUILDFAIL"; return
+        fi
+        if [[ "${LCCC_IR_VERIFY:-1}" != "0" ]] && grep -q '\[ir-verify\]' "$WORK/cc.err"; then
+            echo "IRVERIFY"; return
+        fi
+        if [[ " ${flags[*]} " == *" -m32 "* ]] && ! is_elf32 "$objf"; then
+            echo "OBJFAIL:object is not ELF32 (-m32)"; return
+        fi
+        if ! nm -g --defined-only "$objf" 2>/dev/null | awk '{print $NF}' | grep -qxF "$LCCC_OBJECT_ONLY"; then
+            echo "OBJFAIL:entry symbol $LCCC_OBJECT_ONLY is not defined"; return
+        fi
+        echo "OBJOK"; return
+    fi
+    # COMPANION fixture (`LCCC_COMPANION=<file>` in .env): a sibling translation
+    # unit, resolved beside the fixture, linked into the same program.
+    local companions=()
+    if [[ -n ${LCCC_COMPANION:-} ]]; then
+        companions=("$(dirname "$src")/$LCCC_COMPANION")
+        if [[ ! -f ${companions[0]} ]]; then
+            echo "HARNESS:companion $LCCC_COMPANION does not exist"; return
+        fi
+    fi
     # IR STRUCTURAL GATE: compile with the inter-pass verifier armed. A pass
     # that emits malformed IR (a phi naming a block that is not a predecessor,
     # a phi stranded after a non-phi, a branch to a nonexistent block) is a
@@ -200,14 +242,12 @@ run_one() {  # run_one <src> ; env may override CCC_NO_SMALL_SLOTS etc.
     # every one found so far was invisible to the output comparison below.
     # Opt out with LCCC_IR_VERIFY=0.
     if ! CCC_VERIFY_IR="${LCCC_IR_VERIFY:-1}" \
-         "$LCCC_BIN" "$GCC_INC" -O2 "${flags[@]}" "$src" -o "$obj" 2>"$WORK/cc.err"; then
+         "$LCCC_BIN" "$GCC_INC" -O2 "${flags[@]}" "$src" "${companions[@]+"${companions[@]}"}" -o "$obj" 2>"$WORK/cc.err"; then
         # -m32 build that fails ONLY because the i386 libc headers or libgcc
         # are not installed (probe failed, and the diagnostic names a missing
         # bits/ header or `cannot find -lgcc`): environmental SKIP. Any other
         # failure stays a FAIL.
-        if [[ " ${flags[*]} " == *" -m32 "* ]] && [[ "${HDR32_OK:-1}" == "0" ]] \
-           && grep -q 'bits/[^ ]*: No such file or directory\|cannot find -l[a-z]*' "$WORK/cc.err" \
-           && ! grep -v 'No such file or directory\|cannot find -l\|missing binary operator before token\|preprocessor error(s)\|^In file included\|fatal error\|compilation terminated' "$WORK/cc.err" | grep -q 'error:'; then
+        if hdr32_build_failure "$WORK/cc.err" "${flags[@]}"; then
             echo "NOHDR32"; return
         fi
         echo "BUILDFAIL"; return
@@ -257,6 +297,12 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
         [[ $e == "LCCC_NO_AB=1" ]] && no_ab=1
         [[ $e == LCCC_EXPECT_REJECT=* ]] && expect_reject=${e#LCCC_EXPECT_REJECT=}
     done
+    companion_name=""
+    oracle_skip=""
+    for e in "${env_vars[@]:-}"; do
+        [[ $e == LCCC_ORACLE_SELFCHECK=* ]] && oracle_skip=${e#LCCC_ORACLE_SELFCHECK=}
+        [[ $e == LCCC_COMPANION=* ]] && companion_name=${e#LCCC_COMPANION=}
+    done
     if [[ -n "$expect_reject" ]]; then
         flags=()
         [[ -f "${src%.c}.flags" ]] && read -r -a flags < "${src%.c}.flags"
@@ -275,8 +321,20 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
     fi
 
     # 1. lccc run (default configuration)
-    res=$(env "${env_vars[@]}" bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+    res=$(env "${env_vars[@]}" bash -c "$(declare -f run_one is_elf32 hdr32_build_failure); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
 
+    if [[ $res == OBJOK ]]; then
+        echo "PASS  $name (object-only: entry symbol defined, class verified)"
+        pass=$((pass+1)); continue
+    fi
+    if [[ $res == OBJFAIL:* ]]; then
+        echo "FAIL  $name (${res#OBJFAIL:})"
+        fail=$((fail+1)); FAILED+=("$name:object"); continue
+    fi
+    if [[ $res == HARNESS:* ]]; then
+        echo "FAIL  $name (harness: ${res#HARNESS:})"
+        fail=$((fail+1)); FAILED+=("$name:harness"); continue
+    fi
     if [[ $res == "BUILDFAIL" ]]; then
         echo "FAIL  $name (lccc build failed: $(head -3 "$WORK/cc.err" | tr '\n' ' '))"
         fail=$((fail+1)); FAILED+=("$name:build"); continue
@@ -301,6 +359,22 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
     if [[ $res == "TIMEOUT" ]]; then
         echo "FAIL  $name (timeout)"
         fail=$((fail+1)); FAILED+=("$name:timeout"); continue
+    fi
+
+    # 1b. EXIT CONTRACT. A regression fixture is a self-checking program: lccc's
+    # run must exit with the code the fixture declares, 0 unless its .env sets
+    # LCCC_EXPECT_EXIT=<n>. Without this, a wrong answer that exits nonzero
+    # passes whenever GCC returns the same wrong answer (measured: a fixture
+    # that prints "wrong answer" and returns 1 reported PASS). The GCC oracle
+    # comparison below still requires identical stdout and exit code.
+    expect_exit=0
+    for e in "${env_vars[@]:-}"; do
+        [[ $e == LCCC_EXPECT_EXIT=* ]] && expect_exit=${e#LCCC_EXPECT_EXIT=}
+    done
+    got_exit=${res##*|}
+    if [[ $got_exit != "$expect_exit" ]]; then
+        echo "FAIL  $name (lccc exit $got_exit, expected $expect_exit)"
+        fail=$((fail+1)); FAILED+=("$name:exit"); continue
     fi
 
     # 2. GCC oracle comparison
@@ -329,8 +403,13 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
             fi
         fi
         gbin="$WORK/$(basename "$name").gcc.bin"
-        if ! "$GCC_BIN" -O2 "${gflags[@]}" "$src" -o "$gbin" -lm 2>/dev/null; then
-            skip=$((skip+1))   # GCC can't build it (lccc-specific asm) — lccc-only test
+        gcompanions=()
+        [[ -n $companion_name ]] && gcompanions=("$(dirname "$src")/$companion_name")
+        if ! "$GCC_BIN" -O2 "${gflags[@]}" "$src" "${gcompanions[@]+"${gcompanions[@]}"}" -o "$gbin" -lm 2>"$WORK/gcc.err"; then
+            # Reported, not silent: the oracle cannot build this fixture (for
+            # example a lccc-specific construct), so it is an lccc-only check.
+            echo "SKIP  $name (GCC oracle cannot build it: $(head -1 "$WORK/gcc.err"))"
+            skip=$((skip+1))
         else
             gpfx=""
             if [[ "$ELF32_MODE" == "runner" ]] && is_elf32 "$gbin"; then
@@ -342,6 +421,15 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
                 gout=$(timeout 20 "$gbin" 2>&1); gec=$?
             fi
             if [[ "$gout|$gec" != "$res" ]]; then
+                # Same waiver as tests/regression/run_regression.py: a .env
+                # sidecar that declares LCCC_ORACLE_SELFCHECK=skip (the
+                # reference toolchain is known not to implement the asserted
+                # semantics) downgrades a failed oracle comparison to a
+                # reported SKIP, with the sidecar's reason visible in review.
+                if [[ $oracle_skip == skip ]]; then
+                    echo "SKIP  $name (declared oracle gap: LCCC_ORACLE_SELFCHECK=skip; gcc rc=$gec)"
+                    skip=$((skip+1)); continue
+                fi
                 echo "FAIL  $name (GCC mismatch)"
                 echo "      gcc : $(echo "$gout|$gec" | head -2)"
                 echo "      lccc: $(echo "$res" | head -2)"
@@ -352,7 +440,7 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
 
     # 3. A/B differential: small slots on (default) vs off
     if [[ $no_ab -eq 0 ]]; then
-        res_ab=$(env "${env_vars[@]}" CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_ab=$(env "${env_vars[@]}" CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32 hdr32_build_failure); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_ab != "$res" ]]; then
             echo "FAIL  $name (A/B small-slot differential)"
             echo "      default : $(echo "$res" | head -2)"
@@ -365,7 +453,7 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
         # to reuse must never hold a live value at the moment of reuse, so the
         # two layouts must produce byte-identical program output. Divergence
         # here is a coloring soundness bug (2026-09-02 preboot-ZSTD class).
-        res_t2=$(env "${env_vars[@]}" CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_t2=$(env "${env_vars[@]}" CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32 hdr32_build_failure); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_t2 != "$res" ]]; then
             echo "FAIL  $name (A/B Tier-2 sharing differential)"
             echo "      default  : $(echo "$res" | head -2)"
@@ -378,7 +466,7 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
         # source-less values must produce identical program output. The full
         # opt/target matrix is covered by scripts/gla_equiv_check.sh; this arm
         # guards the default-on policy at the suite's -O2.
-        res_gla=$(env "${env_vars[@]}" CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_gla=$(env "${env_vars[@]}" CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32 hdr32_build_failure); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_gla != "$res" ]]; then
             echo "FAIL  $name (A/B GLA gate differential)"
             echo "      default(on) : $(echo "$res" | head -2)"
