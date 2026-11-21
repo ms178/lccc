@@ -836,9 +836,51 @@ impl Driver {
         true
     }
 
+    /// `-mavx10.1` and `-mavx10.2` (GCC 16.2; the `-256`/`-512` spellings do
+    /// not exist there). Measured with `-dM -E` on gcc-16.2:
+    ///   * `-mavx10.1` defines `__AVX10_1__` and the AVX-512 set (F, CD, VL,
+    ///     BW, DQ, VBMI, IFMA, VNNI, BITALG, VPOPCNTDQ, VBMI2, BF16, FP16),
+    ///     AVX2 and AVX. It does NOT imply FMA, GFNI, VAES or VPCLMULQDQ.
+    ///   * `-mavx10.2` additionally defines `__AVX10_2__` and requires
+    ///     AVX10.1 (the same macro set otherwise).
+    /// The grant reaches the AVX-512 set explicitly, because the generic
+    /// extension path only grants an extension's own macro and prerequisites
+    /// are dropped if missing ([`Self::drop_x86_extras_without_requirements`]).
+    fn grant_avx10_family(&mut self, flag: &str) -> bool {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let level = match flag {
+            "-mavx10.1" => E::Avx10_1,
+            "-mavx10.2" => E::Avx10_2,
+            _ => return false,
+        };
+        for avx512 in [
+            "-mavx512f",
+            "-mavx512cd",
+            "-mavx512dq",
+            "-mavx512bw",
+            "-mavx512vl",
+            "-mavx512ifma",
+            "-mavx512vbmi",
+            "-mavx512vbmi2",
+            "-mavx512vnni",
+            "-mavx512bitalg",
+            "-mavx512vpopcntdq",
+            "-mavx512bf16",
+            "-mavx512fp16",
+        ] {
+            let granted = self.grant_avx512_family(avx512);
+            debug_assert!(granted, "AVX10 base flag {avx512} must be an AVX-512 grant");
+        }
+        if level == E::Avx10_2 {
+            self.grant_x86_extra_explicitly(E::Avx10_1);
+        }
+        true
+    }
+
     fn apply_x86_isa_mflag_arm(&mut self, arg: &str) -> bool {
         if self.apply_x86_mmx_mflag(arg)
             || self.grant_avx512_family(arg)
+            || self.grant_avx10_family(arg)
             || self.apply_x86_sse_level_mflag(arg)
             || self.apply_x86_avx512_mno_mflag(arg)
             || self.apply_x86_isa_toggle(arg)
@@ -3114,12 +3156,10 @@ impl Driver {
                     );
                 }
                 "-mharden-sls=none" => {}
-                // AVX10 is a hard error (not silently ignored): requesting
-                // code generation the backend cannot produce must fail.
-                "-mavx10.1" | "-mavx10.1-256" | "-mavx10.1-512" | "-mavx10.2" | "-mavx10.2-256"
-                | "-mavx10.2-512" => {
-                    return Err("AVX10 code generation is not implemented".to_string());
-                }
+                // -mavx10.1 / -mavx10.2 are handled by the ISA-flag path
+                // (`grant_avx10_family`). The `-256`/`-512` spellings are not
+                // GCC 16.2 options and fall through to the unsupported-option
+                // error below, exactly as GCC rejects them.
                 "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt"
                 | "-mno-xsavec" => {}
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
@@ -8841,6 +8881,47 @@ mod x86_macro_gate_tests {
 
     fn features(flags: &[&str]) -> crate::common::x86_features::EffectiveFeatures {
         parse(flags).effective_x86_features()
+    }
+
+    /// `-mavx10.1` / `-mavx10.2` (measured against gcc-16.2 with `-dM -E`):
+    /// the AVX-512 base set, AVX2 and AVX, and the AVX10 level; `.2` requires
+    /// `.1`. FMA is NOT implied. The `-256`/`-512` spellings do not exist in
+    /// GCC 16.2 and must be rejected.
+    #[test]
+    fn avx10_option_grants_the_avx512_base_set() {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let mut d = parse(&["-mavx10.1"]);
+        assert!(*d.x86_extra_slot(E::Avx10_1));
+        assert!(!*d.x86_extra_slot(E::Avx10_2));
+        let f = d.effective_x86_features();
+        for feat in [
+            F::Avx,
+            F::Avx2,
+            F::Avx512F,
+            F::Avx512Cd,
+            F::Avx512Dq,
+            F::Avx512Bw,
+            F::Avx512Vl,
+            F::Avx512Ifma,
+            F::Avx512Vbmi,
+            F::Avx512Vbmi2,
+            F::Avx512Vnni,
+            F::Avx512BitAlg,
+            F::Avx512Vpopcntdq,
+            F::Avx512Bf16,
+            F::Avx512Fp16,
+        ] {
+            assert!(f.contains(feat), "-mavx10.1 must imply {feat:?}");
+        }
+        assert!(!f.contains(F::Fma), "-mavx10.1 does not imply FMA");
+
+        let mut d2 = parse(&["-mavx10.2"]);
+        assert!(*d2.x86_extra_slot(E::Avx10_1) && *d2.x86_extra_slot(E::Avx10_2));
+
+        for flag in ["-mavx10.1-256", "-mavx10.1-512", "-mavx10.2-512"] {
+            let args = ["ccc", flag, "x.c"].map(str::to_string);
+            assert!(Driver::new().parse_cli_args(&args).is_err(), "{flag}");
+        }
     }
 
     /// `__XSAVE__` is CPUID leaf 1 ECX bit 26 with its own `-mxsave`, not an

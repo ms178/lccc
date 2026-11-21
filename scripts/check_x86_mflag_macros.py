@@ -53,8 +53,11 @@ OPTIONS = sorted({GEN.OPTION_NAMES[v] for v, _ in GEN.FEATURE_MACROS}
 # flag order), and lccc matches. Only the SHA-512 intrinsic is withdrawn under
 # `-mno-xsave`, because GCC rejects it and lccc refuses it with a diagnostic.
 #
-# Refused with a diagnostic, as documented: lccc has no AVX10 code generation.
-REFUSED = {'avx10.1', 'avx10.2'}
+# Options lccc refuses with a diagnostic. Empty: `-mavx10.1`/`-mavx10.2` are
+# compared like every other option (they define __AVX10_1__/__AVX10_2__ and
+# the AVX-512 set, measured against gcc-16.2). `-mavx10.N-256/-512` are not GCC
+# options and are rejected by both compilers.
+REFUSED = set()
 # Ordered pairs that pin the one cascade the single-option matrix cannot see:
 # XSAVE is an *option-layer* bit, so `-mno-xsave` has to withdraw the
 # extensions whose state it saves while `-mxsave`/an implying option re-arms

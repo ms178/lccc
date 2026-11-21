@@ -153,6 +153,25 @@ else
     ELF32_MODE="native-no-oracle"
 fi
 rm -f "$probe_src" "$probe_bin"
+
+# ── 32-bit libc/libgcc capability probe ─────────────────────────────────
+# A `-m32` fixture needs the 32-bit glibc header tree (bits/libc-header-start.h
+# and friends) to compile, and the i386 libgcc to link. Hosts without the i386
+# multilib cannot build such a fixture with ANY compiler (GCC 16.2 fails the
+# same way here), so the failure is environmental. The probe COMPILES AND LINKS
+# a program that uses the system headers. When it fails, a -m32 build that
+# fails only with those missing-tree diagnostics is reported as SKIP with that
+# reason. When the probe passes, the same fixture runs and a failure is a FAIL.
+HDR32_OK=0
+hdr32_src="$WORK/hdr32probe.c"
+hdr32_obj="$WORK/hdr32probe.o"
+printf '#include <stdio.h>\n#include <stdint.h>\n#include <string.h>\nint main(void){return puts(\"\")!=0;}\n' > "$hdr32_src"
+probe_env=()
+[[ -n "${I686_SYSROOT:-}" ]] && probe_env=(LCCC_SYSROOT="$I686_SYSROOT")
+if env "${probe_env[@]}" "$LCCC_BIN" -m32 "$hdr32_src" -o "$hdr32_obj" 2>/dev/null; then
+    HDR32_OK=1
+fi
+rm -f "$hdr32_src" "$hdr32_obj"
 el_f32_warned=0
 
 pass=0; fail=0; skip=0; ab_fail=0
@@ -182,6 +201,15 @@ run_one() {  # run_one <src> ; env may override CCC_NO_SMALL_SLOTS etc.
     # Opt out with LCCC_IR_VERIFY=0.
     if ! CCC_VERIFY_IR="${LCCC_IR_VERIFY:-1}" \
          "$LCCC_BIN" "$GCC_INC" -O2 "${flags[@]}" "$src" -o "$obj" 2>"$WORK/cc.err"; then
+        # -m32 build that fails ONLY because the i386 libc headers or libgcc
+        # are not installed (probe failed, and the diagnostic names a missing
+        # bits/ header or `cannot find -lgcc`): environmental SKIP. Any other
+        # failure stays a FAIL.
+        if [[ " ${flags[*]} " == *" -m32 "* ]] && [[ "${HDR32_OK:-1}" == "0" ]] \
+           && grep -q 'bits/[^ ]*: No such file or directory\|cannot find -l[a-z]*' "$WORK/cc.err" \
+           && ! grep -v 'No such file or directory\|cannot find -l\|missing binary operator before token\|preprocessor error(s)\|^In file included\|fatal error\|compilation terminated' "$WORK/cc.err" | grep -q 'error:'; then
+            echo "NOHDR32"; return
+        fi
         echo "BUILDFAIL"; return
     fi
     if [[ "${LCCC_IR_VERIFY:-1}" != "0" ]] && grep -q '\[ir-verify\]' "$WORK/cc.err"; then
@@ -247,7 +275,7 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
     fi
 
     # 1. lccc run (default configuration)
-    res=$(env "${env_vars[@]}" bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+    res=$(env "${env_vars[@]}" bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
 
     if [[ $res == "BUILDFAIL" ]]; then
         echo "FAIL  $name (lccc build failed: $(head -3 "$WORK/cc.err" | tr '\n' ' '))"
@@ -257,6 +285,10 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
         echo "FAIL  $name (IR verifier: malformed IR between passes)"
         grep '\[ir-verify\]' "$WORK/cc.err" | head -3 | sed 's/^/      /'
         fail=$((fail+1)); FAILED+=("$name:ir-verify"); continue
+    fi
+    if [[ $res == "NOHDR32" ]]; then
+        echo "SKIP  $name (-m32 build needs the i386 libc headers / libgcc, absent on this host)"
+        skip=$((skip+1)); continue
     fi
     if [[ $res == "NOELF32" ]]; then
         if [[ $el_f32_warned -eq 0 ]]; then
@@ -320,7 +352,7 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
 
     # 3. A/B differential: small slots on (default) vs off
     if [[ $no_ab -eq 0 ]]; then
-        res_ab=$(env "${env_vars[@]}" CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_ab=$(env "${env_vars[@]}" CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_ab != "$res" ]]; then
             echo "FAIL  $name (A/B small-slot differential)"
             echo "      default : $(echo "$res" | head -2)"
@@ -333,7 +365,7 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
         # to reuse must never hold a live value at the moment of reuse, so the
         # two layouts must produce byte-identical program output. Divergence
         # here is a coloring soundness bug (2026-09-02 preboot-ZSTD class).
-        res_t2=$(env "${env_vars[@]}" CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_t2=$(env "${env_vars[@]}" CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_t2 != "$res" ]]; then
             echo "FAIL  $name (A/B Tier-2 sharing differential)"
             echo "      default  : $(echo "$res" | head -2)"
@@ -346,7 +378,7 @@ for src in "$REG"/*.c "$REG"/diagnostics/*.c; do
         # source-less values must produce identical program output. The full
         # opt/target matrix is covered by scripts/gla_equiv_check.sh; this arm
         # guards the default-on policy at the suite's -O2.
-        res_gla=$(env "${env_vars[@]}" CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
+        res_gla=$(env "${env_vars[@]}" CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' HDR32_OK='$HDR32_OK' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_gla != "$res" ]]; then
             echo "FAIL  $name (A/B GLA gate differential)"
             echo "      default(on) : $(echo "$res" | head -2)"
