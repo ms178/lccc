@@ -9188,6 +9188,12 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::Sha512msg1256
             | O::Sha512msg2256
             | O::Sha512rnds2256
+            // SHA-NI 128-bit chains: same copy-in discipline as the SHA-512
+            // forms above (`sha256rnds2`'s CDGH is the first operand and the
+            // destination tie).
+            | O::Sha256msg1128
+            | O::Sha256msg2128
+            | O::Sha256rnds2128
             | O::VecMinU8x16
             | O::VecAndNotI32x4
             | O::VecAvgU8x16
@@ -10636,6 +10642,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // `clobbers_xmm2`). Unclassified, every W/state word was homed on
             // the stack.
             O::Sha512msg1256 | O::Sha512msg2256 | O::Sha512rnds2256 => Some(8),
+            // SHA-NI (`sha256msg1`/`msg2`/`rnds2`): four 32-bit lanes, so the
+            // I32x4 family. Their emitters copy each operand into the scratch
+            // pair (xmm0/xmm1, plus xmm2 for rnds2, withheld by
+            // `clobbers_xmm2`) and store the result through `sse_store_dest`,
+            // so a register home survives them, exactly as for SHA-512.
+            O::Sha256msg1128 | O::Sha256msg2128 | O::Sha256rnds2128 => Some(6),
             O::VecMaddwdI16x16 => Some(5),
             // BB-SLP I64x4 copy/ALU chains: loads, sub/bitwise, splat.
             O::VecLoadI64x4
@@ -10779,6 +10791,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::StrictRecipMulAddPackedF64x4
                     | O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
+                    // SHA-NI chain: operands are read through `sse_load_arg`
+                    // / `emit_sha_binary_128` (scratch xmm0/xmm1/xmm2) and the
+                    // result is written through `sse_store_dest`.
+                    | O::Sha256msg1128
+                    | O::Sha256msg2128
+                    | O::Sha256rnds2128
                     // SSE2 masked equal-width step: reads the I32x4
                     // accumulator home and writes its own destination
                     // through the shared 128-bit fold (scratch xmm0/xmm1).
@@ -10981,6 +10999,33 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // `sha512_chain` had no homes at all).
                                 | O::Storeu256
                                 | O::Store256
+                                // 256-bit loads and the 128->256 zero-extension
+                                // are scratch-free in the only sense the poison
+                                // rule protects: their emitters touch only
+                                // ymm0/xmm0 (`avx_load_arg_to("ymm0")` plus the
+                                // result store, `sse_load_arg("xmm0")` plus
+                                // `vmovdqa %xmm0,%xmm0`). Homes are xmm2..xmm15
+                                // (`phys_reg_name` 20..33), so no home is
+                                // clobbered. Unlisted, one such op in a kernel
+                                // withdrew every vector home of the function.
+                                | O::Loadu256
+                                | O::Load256
+                                | O::Zext128to256
+                                // 256-bit in-lane shuffles and lane moves (the
+                                // full-block SHA-512 message schedule). Their
+                                // emitters read homes through `avx_load_arg*`
+                                // and use only ymm0/ymm1 (plus xmm0 for the
+                                // extract) as scratch, writing the result to
+                                // its own home. Unlisted, each one withdrew
+                                // every vector home of the kernel: nanazip's
+                                // `Sha512_UpdateBlocks_HW` was poisoned by
+                                // `Pshufd256`, libtomcrypt's by `Permute4x64`.
+                                | O::Pshufd256
+                                | O::Permute4x64
+                                | O::Permute2x128
+                                | O::Extracti128
+                                | O::Pshufb256
+                                | O::BlendPs256
                                 // v12 Fix C: widening reductions consume an
                                 // I64x4 accumulator (whitelisted above). Their
                                 // lowerings confine scratch to ymm0/ymm1 so a

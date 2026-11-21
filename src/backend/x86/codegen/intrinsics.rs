@@ -1511,9 +1511,95 @@ impl X86Codegen {
     }
 
     #[inline]
+    /// The destination's register home when it coincides with `a0`'s, and
+    /// `a0` is an ordinary register-resident operand: the RA's destructive
+    /// coalescing (the first source dies at this instruction). Returns the
+    /// home's name, or `None` when the staged path must run.
+    fn sha_destructive_home(&self, dest: &Value, a0: &Value, a1: &Value) -> Option<&'static str> {
+        if a0.0 == a1.0 {
+            return None;
+        }
+        let dest_reg = *self.reg_assignments.get(&dest.0)?;
+        if !is_xmm_reg(dest_reg) || self.reg_assignments.get(&a0.0) != Some(&dest_reg) {
+            return None;
+        }
+        if self
+            .state
+            .pending_vec_memfold
+            .as_ref()
+            .is_some_and(|pf| pf.val == a0.0)
+        {
+            return None;
+        }
+        Some(phys_reg_name(dest_reg))
+    }
+
+    /// In-place SHA-NI two-operand form (`sha1msg1/msg2/nexte`,
+    /// `sha256msg1/msg2`). Every one of them is destructive in its first
+    /// source and reads its second source (`xmm2/m128`) without writing it,
+    /// so when the destination shares the first source's home the whole
+    /// instruction is one `op %src, %home`: no staging through `%xmm0` and
+    /// no write-back. Returns `false` (emitting nothing) when the shape does
+    /// not hold.
+    fn try_emit_sha_binary_in_place(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        inst: &str,
+    ) -> bool {
+        let (Operand::Value(a0), Operand::Value(a1)) = (&args[0], &args[1]) else {
+            return false;
+        };
+        let Some(target) = self.sha_destructive_home(dest_ptr, a0, a1) else {
+            return false;
+        };
+        let Some(src) = self.vec_operand_reg(a1) else {
+            return false;
+        };
+        if src == target {
+            return false;
+        }
+        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(a1.0) {
+            self.state.pending_vec_store = None;
+        }
+        self.state
+            .emit_fmt(format_args!("    {} %{}, %{}", inst, src, target));
+        self.sse_mark_in_place(dest_ptr, target);
+        true
+    }
+
+    /// In-place `sha256rnds2` (see the arm in `emit_intrinsic`). Operands:
+    /// `args = [cdgh, abef, wk]`. Returns `false`, emitting nothing, when the
+    /// destination does not share CDGH's home or ABEF has no register home.
+    fn try_emit_sha256rnds2_in_place(&mut self, dptr: &Value, args: &[Operand]) -> bool {
+        let (Operand::Value(cdgh), Operand::Value(abef)) = (&args[0], &args[1]) else {
+            return false;
+        };
+        let Some(target) = self.sha_destructive_home(dptr, cdgh, abef) else {
+            return false;
+        };
+        let Some(src) = self.vec_operand_reg(abef) else {
+            return false;
+        };
+        if src == target {
+            return false;
+        }
+        // WK is the implicit %xmm0 operand; no register home is %xmm0, so
+        // it is always staged there.
+        self.sse_load_arg(&args[2], "xmm0");
+        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(abef.0) {
+            self.state.pending_vec_store = None;
+        }
+        self.state
+            .emit_fmt(format_args!("    sha256rnds2 %xmm0, %{}, %{}", src, target));
+        self.sse_mark_in_place(dptr, target);
+        true
+    }
+
     /// Legacy-encoded SHA-NI binary op `inst %xmm1, %xmm0` (dst = args[0],
     /// src = args[1]), stored to `dest_ptr`.  SHA-NI has no VEX encoding, so
     /// this never takes the `v`-prefixed route of `emit_sse_binary_128`.
+    /// In place when the destination shares the first source's home.
     pub(super) fn emit_sha_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str) {
         assert!(
             args.len() >= 2,
@@ -1521,6 +1607,9 @@ impl X86Codegen {
             inst,
             args.len()
         );
+        if self.try_emit_sha_binary_in_place(dest_ptr, args, inst) {
+            return;
+        }
         self.sse_load_arg(&args[0], "xmm0");
         self.sse_load_arg(&args[1], "xmm1");
         self.state
@@ -4031,11 +4120,19 @@ impl X86Codegen {
             IntrinsicOp::Sha256rnds2128 => {
                 if let Some(dptr) = result_dest(dest, dest_ptr) {
                     assert_eq!(args.len(), 3, "Sha256rnds2128 requires cdgh, abef, wk");
-                    self.sse_load_arg(&args[2], "xmm0");
-                    self.sse_load_arg(&args[1], "xmm2");
-                    self.sse_load_arg(&args[0], "xmm1");
-                    self.state.emit("    sha256rnds2 %xmm0, %xmm2, %xmm1");
-                    self.sse_store_dest(dptr, "xmm1");
+                    // In place when CDGH's home is the destination's (the
+                    // RA's destructive coalescing). The architecture pins
+                    // only two things: the implicit WK operand is %xmm0, and
+                    // the destination holds CDGH on entry. ABEF is read
+                    // straight from its home (xmm2/m128 is read-only), so no
+                    // operand is staged through %xmm1 or %xmm2.
+                    if !self.try_emit_sha256rnds2_in_place(dptr, args) {
+                        self.sse_load_arg(&args[2], "xmm0");
+                        self.sse_load_arg(&args[1], "xmm2");
+                        self.sse_load_arg(&args[0], "xmm1");
+                        self.state.emit("    sha256rnds2 %xmm0, %xmm2, %xmm1");
+                        self.sse_store_dest(dptr, "xmm1");
+                    }
                 }
             }
             // CLMUL: pclmulqdq with immediate

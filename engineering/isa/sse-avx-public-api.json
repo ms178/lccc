@@ -10491,7 +10491,7 @@
       "arities": [
         2
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -10508,7 +10508,7 @@
       "arities": [
         2
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -10525,7 +10525,7 @@
       "arities": [
         3
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -10542,7 +10542,7 @@
       "arities": [
         2
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -10559,7 +10559,7 @@
       "arities": [
         2
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -10576,7 +10576,7 @@
       "arities": [
         3
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"

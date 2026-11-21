@@ -1233,6 +1233,21 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_sha256msg2",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg2128),
     );
+    // The public `_mm_sha256*_epu32` names are compiler-known, as the SHA-1
+    // round name and the SHA-512 names are, so the value reaches the SHA op
+    // without the header wrapper in between.
+    m.insert(
+        "_mm_sha256msg1_epu32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg1128),
+    );
+    m.insert(
+        "_mm_sha256msg2_epu32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg2128),
+    );
+    m.insert(
+        "_mm_sha256rnds2_epu32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256rnds2128),
+    );
     // x86 CLMUL
     m.insert(
         "__builtin_ia32_pclmulqdq128",

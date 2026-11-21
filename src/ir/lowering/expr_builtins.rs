@@ -3740,9 +3740,9 @@ impl Lowerer {
         if let Some(result) = self.try_native_packed_map(op, args) {
             return Some(result);
         }
-        // SHA-512 (VEX.256): register-valued operands and result, so no
+        // SHA-NI and SHA-512: register-valued operands and result, so no
         // 256-bit state or schedule word is forced through a stack slot.
-        if let Some(result) = self.try_native_sha512(op, args) {
+        if let Some(result) = self.try_native_sha(op, args) {
             return Some(result);
         }
         match x86_intrinsic_kind(intrinsic) {

@@ -1082,6 +1082,52 @@ fn native_packed_cmp(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, i64
     })
 }
 
+/// Operand shape of a SHA instruction's register-valued form.
+struct NativeShaForm {
+    /// Byte width of each operand, in argument order.
+    widths: &'static [usize],
+    /// Lane element type of the instruction: qword for SHA-512, dword for SHA-256.
+    elem: IrType,
+    /// Byte width of the register result.
+    result_bytes: usize,
+}
+
+/// The register-valued form of each SHA instruction the lowering routes.
+///
+/// SHA-512 (VEX.256): `msg1`'s second operand and `rnds2`'s W+K are 16-byte
+/// operands read at 16 bytes, never 32. SHA-256 (128-bit): every operand and
+/// the result are 16 bytes of dword lanes.
+fn native_sha_form(op: IntrinsicOp) -> Option<NativeShaForm> {
+    Some(match op {
+        IntrinsicOp::Sha512msg1256 => NativeShaForm {
+            widths: &[32, 16],
+            elem: IrType::I64,
+            result_bytes: 32,
+        },
+        IntrinsicOp::Sha512msg2256 => NativeShaForm {
+            widths: &[32, 32],
+            elem: IrType::I64,
+            result_bytes: 32,
+        },
+        IntrinsicOp::Sha512rnds2256 => NativeShaForm {
+            widths: &[32, 32, 16],
+            elem: IrType::I64,
+            result_bytes: 32,
+        },
+        IntrinsicOp::Sha256msg1128 | IntrinsicOp::Sha256msg2128 => NativeShaForm {
+            widths: &[16, 16],
+            elem: IrType::I32,
+            result_bytes: 16,
+        },
+        IntrinsicOp::Sha256rnds2128 => NativeShaForm {
+            widths: &[16, 16, 16],
+            elem: IrType::I32,
+            result_bytes: 16,
+        },
+        _ => return None,
+    })
+}
+
 impl Lowerer {
     /// Keep packed FP helpers in the same register-valued IR as native vector
     /// arithmetic. The legacy address result remains an addressable object;
@@ -1364,17 +1410,16 @@ impl Lowerer {
         Some(Operand::Value(result))
     }
 
-    /// Route a SHA-512 (VEX.256) pointer form through a register-valued form.
+    /// Route a SHA-NI or SHA-512 pointer form through a register-valued form.
     ///
-    /// `vsha512msg1`/`vsha512msg2`/`vsha512rnds2` have no packed-map twin in
-    /// the RH-03 table: their operands are mixed-width (a 16-byte operand in
-    /// `msg1` and in the third slot of `rnds2`) and `rnds2` takes three
-    /// arguments. They were therefore lowered by the generic `Vec256` pointer
-    /// emitter, which passes every operand by address and writes the result
-    /// through `dest_ptr`. The `vec_ssa` promotion rule admits only whole-width
-    /// family loads and stores, so every 256-bit SHA-512 state and schedule
-    /// value stayed in a stack slot (`rsp` references: `k.c` 9, `chain.c` 16,
-    /// GCC 16.2 0).
+    /// The SHA instructions have no packed-map twin in the RH-03 table: their
+    /// operands are mixed-width (`sha512msg1`'s second operand and `rnds2`'s
+    /// W+K are 16 bytes; `sha256rnds2` takes three 16-byte operands) and the
+    /// `rnds2` forms take three arguments. They were therefore lowered by the
+    /// generic pointer emitter, which passes every operand by address and
+    /// writes the result through `dest_ptr`. The `vec_ssa` promotion rule
+    /// admits only whole-width family loads and stores, so every SHA state and
+    /// schedule value stayed in a stack slot.
     ///
     /// This is the RH-03 shape: each operand is a family `VecLoad` (promotable),
     /// the instruction computes a register `value` with no `dest_ptr`, and the
@@ -1382,47 +1427,45 @@ impl Lowerer {
     /// already emits the value form (`result_dest` prefers `dest_ptr` and falls
     /// back to `dest`). Shapes are resolved before any operand is lowered, so
     /// refusal leaves no partial IR. i686 keeps the pointer form.
-    pub(super) fn try_native_sha512(&mut self, op: IntrinsicOp, args: &[Expr]) -> Option<Operand> {
-        // Operand byte widths per position. msg1 reads a 16-byte operand (only
-        // its low qword is used); rnds2 reads the 16-byte W+K operand third.
-        let widths: &[usize] = match op {
-            IntrinsicOp::Sha512msg1256 => &[32, 16],
-            IntrinsicOp::Sha512msg2256 => &[32, 32],
-            IntrinsicOp::Sha512rnds2256 => &[32, 32, 16],
-            _ => return None,
-        };
+    pub(super) fn try_native_sha(&mut self, op: IntrinsicOp, args: &[Expr]) -> Option<Operand> {
+        let form = native_sha_form(op)?;
         if packed_map_disabled() || self.target != crate::backend::Target::X86_64 {
             return None;
         }
-        if args.len() != widths.len() {
+        if args.len() != form.widths.len() {
             return None;
         }
         if !args
             .iter()
-            .zip(widths)
+            .zip(form.widths)
             .all(|(arg, &bytes)| self.packed_map_operand_ok(arg, bytes))
         {
             return None;
         }
         // Resolve every shape BEFORE lowering anything: lowering is not
         // idempotent (see `try_native_packed_map`).
+        let elem_bytes = form.elem.size();
         let shape_for = |bytes: usize| -> Option<super::vector_simd::SimdShape> {
-            let lanes = bytes / 8;
-            let fam = crate::passes::slp_vectorizer::family_for(IrType::I64, lanes)?;
+            if bytes % elem_bytes != 0 {
+                return None;
+            }
+            let lanes = bytes / elem_bytes;
+            let fam = crate::passes::slp_vectorizer::family_for(form.elem, lanes)?;
             Some(super::vector_simd::SimdShape {
                 fam,
-                elem_ir: IrType::I64,
+                elem_ir: form.elem,
                 lanes,
                 bytes,
             })
         };
-        let shapes: Vec<_> = widths
+        let shapes: Vec<_> = form
+            .widths
             .iter()
             .map(|&bytes| shape_for(bytes))
             .collect::<Option<_>>()?;
-        let result_shape = shape_for(32)?;
+        let result_shape = shape_for(form.result_bytes)?;
 
-        let mut operands = Vec::with_capacity(widths.len());
+        let mut operands = Vec::with_capacity(form.widths.len());
         for (arg, shape) in args.iter().zip(&shapes) {
             let ty = self.expr_ctype(arg);
             match self.direct_vector_load_ptr(arg, shape.bytes) {
@@ -1442,7 +1485,8 @@ impl Lowerer {
             dest_ptr: None,
             args: operands,
         });
-        let result = self.emit_entry_alloca(IrType::Ptr, 32, 32, false);
+        let result =
+            self.emit_entry_alloca(IrType::Ptr, form.result_bytes, form.result_bytes, false);
         self.emit_vec_store(&result_shape, value, result);
         Some(Operand::Value(result))
     }
