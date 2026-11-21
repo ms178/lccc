@@ -2410,11 +2410,19 @@ jobs:
     - name: Verify i686 assembly differential vs GNU as 2.47
       run: python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
         --lccc target/fastbuild/lccc-i686
+    - name: Verify the vector-width table is what GNU as 2.47 says
+      run: python3 scripts/x86_vector_widths.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
     - name: Verify x86-64 instruction-table sweep vs GNU as 2.47
       run: python3 scripts/gas_table_sweep.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
         --lccc target/fastbuild/lccc-x86
     - name: Verify i686 instruction-table sweep vs GNU as 2.47
       run: python3 scripts/gas_table_sweep.py --check --32 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+        --lccc target/fastbuild/lccc-i686
+    - name: Verify .code16 instruction-table sweep vs GNU as 2.47
+      run: python3 scripts/gas_table_sweep.py --check --16 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+        --lccc target/fastbuild/lccc-i686
+    - name: Verify .code16gcc instruction-table sweep vs GNU as 2.47
+      run: python3 scripts/gas_table_sweep.py --check --16gcc --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
         --lccc target/fastbuild/lccc-i686
     - name: Verify complete SSE3 SSSE3 SSE4 encodings vs Clang 23.1.5
       run: python3 tests/regression/check_sse34_clang.py

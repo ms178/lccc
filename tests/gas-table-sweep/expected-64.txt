@@ -1,772 +1,793 @@
-# What scripts/gas_table_sweep.py may find beside SAME. Written by --update;
-# --check fails on anything this file does not allow.
+# What scripts/gas_table_sweep.py finds. Written by --update; --check fails
+# on any difference from this file, in either direction.
 #
+# rows, statements, assembled, same: how much was swept -- table rows,
+# statements made from them, the ones GNU as assembles, and of those the
+# ones lccc assembles to the same bytes and relocations.
+# foreign, refused: the other direction -- statements with a register of a
+# kind or a width the mnemonic does not take, and the ones GNU as refuses.
 # shorter <statement>: lccc's encoding is shorter than GNU as's, and audited.
-# reject <mnemonic> <count>: lccc refuses that many swept statements of the
-# mnemonic. The count may only go down.
+# accept <statement>: GNU as refuses the statement and lccc assembles it.
+# reject <mnemonic> <count> <digest>: lccc refuses that many swept statements
+# of the mnemonic that GNU as assembles; the digest names which.
+rows 4848
+statements 31065
+assembled 18492
+same 15462
+foreign 41044
+refused 38848
 shorter vcmpfalse_oqps %ymm10, %ymm2, %ymm10
 shorter vcmpneq_ospd %xmm9, %xmm1, %xmm1
 shorter vpaddb %ymm10, %ymm2, %ymm10
 shorter vpaddusb %xmm9, %xmm1, %xmm9
 shorter vpmuludq %xmm9, %xmm1, %xmm9
 shorter vpsadbw %xmm9, %xmm1, %xmm1
-reject aadd 9
-reject aand 10
-reject adcx 2
-reject addr32 1
-reject adox 2
-reject adoxq 1
-reject adword 1
-reject aesdec128kl 5
-reject aesdec256kl 4
-reject aesdecwide128kl 6
-reject aesdecwide256kl 6
-reject aesenc128kl 4
-reject aesenc256kl 5
-reject aesencwide128kl 6
-reject aesencwide256kl 6
-reject and 2
-reject andq 1
-reject aor 11
-reject axor 11
-reject bextr 5
-reject bextrl 1
-reject bextrq 2
-reject blcfill 5
-reject blcfilll 2
-reject blcfillq 1
-reject blci 6
-reject blcic 4
-reject blcicq 2
-reject blcil 3
-reject blciq 2
-reject blcmsk 4
-reject blcmskl 1
-reject blcmskq 2
-reject blcs 6
-reject blcsl 2
-reject blcsq 2
-reject blsfill 5
-reject blsfillq 2
-reject blsic 5
-reject blsicq 2
-reject call 4
-reject callw 2
-reject ccmpa 1
-reject ccmpae 2
-reject ccmpaeb 1
-reject ccmpael 1
-reject ccmpaeq 1
-reject ccmpaew 1
-reject ccmpb 6
-reject ccmpbe 2
-reject ccmpc 2
-reject ccmpcb 2
-reject ccmpcl 2
-reject ccmpcq 2
-reject ccmpcw 2
-reject ccmpe 1
-reject ccmpeb 1
-reject ccmpel 1
-reject ccmpeq 1
-reject ccmpew 1
-reject ccmpf 16
-reject ccmpfb 3
-reject ccmpfl 6
-reject ccmpfq 6
-reject ccmpfw 6
-reject ccmpg 1
-reject ccmpl 10
-reject ccmple 1
-reject ccmpleb 1
-reject ccmplel 1
-reject ccmpleq 1
-reject ccmplew 1
-reject ccmpna 1
-reject ccmpnae 1
-reject ccmpnb 9
-reject ccmpnbe 2
-reject ccmpnbeb 2
-reject ccmpnbel 2
-reject ccmpnbeq 2
-reject ccmpnbew 2
-reject ccmpnbw 1
-reject ccmpnc 1
-reject ccmpncb 1
-reject ccmpncl 1
-reject ccmpncq 1
-reject ccmpncw 1
-reject ccmpne 1
-reject ccmpnge 1
-reject ccmpngeb 1
-reject ccmpngel 1
-reject ccmpngeq 1
-reject ccmpngew 1
-reject ccmpnl 10
-reject ccmpno 1
-reject ccmpnob 1
-reject ccmpnol 1
-reject ccmpnoq 1
-reject ccmpnow 1
-reject ccmpns 2
-reject ccmpnsb 1
-reject ccmpnsl 1
-reject ccmpnsq 1
-reject ccmpnsw 1
-reject ccmpnz 1
-reject ccmpnzb 1
-reject ccmpnzl 1
-reject ccmpnzq 1
-reject ccmpnzw 1
-reject ccmpo 2
-reject ccmps 1
-reject ccmpt 17
-reject ccmptb 3
-reject ccmptl 6
-reject ccmptq 7
-reject ccmptw 5
-reject ccmpz 1
-reject cfcmovnp 7
-reject cfcmovnpl 1
-reject cfcmovnpq 3
-reject cfcmovp 7
-reject cfcmovpq 2
-reject cfcmovpw 2
-reject clr 6
-reject cmpaexadd 3
-reject cmpaxadd 3
-reject cmpbexadd 4
-reject cmpbxadd 3
-reject cmpcxadd 4
-reject cmpexadd 3
-reject cmpgexadd 2
-reject cmpgxadd 2
-reject cmplexadd 3
-reject cmplxadd 4
-reject cmpnaexadd 3
-reject cmpnaxadd 4
-reject cmpnbexadd 4
-reject cmpnbxadd 4
-reject cmpncxadd 3
-reject cmpnexadd 2
-reject cmpngexadd 5
-reject cmpngxadd 5
-reject cmpnlexadd 5
-reject cmpnlxadd 3
-reject cmpnoxadd 3
-reject cmpnpxadd 5
-reject cmpnsxadd 2
-reject cmpnzxadd 5
-reject cmpoxadd 3
-reject cmppexadd 5
-reject cmppoxadd 4
-reject cmppxadd 2
-reject cmps 7
-reject cmpsxadd 5
-reject cmpzxadd 2
-reject cs 1
-reject ctesta 2
-reject ctestab 1
-reject ctestae 1
-reject ctestaeb 1
-reject ctestael 1
-reject ctestaeq 1
-reject ctestaew 1
-reject ctestal 1
-reject ctestaq 1
-reject ctestaw 1
-reject ctestb 4
-reject ctestbe 1
-reject ctestc 1
-reject ctestcw 1
-reject cteste 1
-reject ctestf 10
-reject ctestfb 3
-reject ctestfl 2
-reject ctestfq 3
-reject ctestfw 2
-reject ctestg 1
-reject ctestgb 1
-reject ctestge 1
-reject ctestgeb 1
-reject ctestgl 1
-reject ctestgq 1
-reject ctestgw 1
-reject ctestl 9
-reject ctestnae 2
-reject ctestnaeb 2
-reject ctestnael 2
-reject ctestnaeq 2
-reject ctestnaew 2
-reject ctestnb 6
-reject ctestnbe 2
-reject ctestnc 1
-reject ctestne 1
-reject ctestng 1
-reject ctestnl 7
-reject ctesto 2
-reject ctestob 1
-reject ctestol 1
-reject ctestoq 1
-reject ctestow 1
-reject ctestt 9
-reject ctesttb 2
-reject ctesttl 3
-reject ctesttq 3
-reject ctesttw 3
-reject cvtpd2pi 6
-reject cvtpi2pd 8
-reject cvtpi2ps 3
-reject cvtps2pi 6
-reject cvttpd2pi 5
-reject cvttps2pi 5
-reject data16 1
-reject ds 1
-reject encodekey128 6
-reject encodekey256 6
-reject enter 2
-reject enterq 2
-reject enterw 2
-reject fcoml 2
-reject fcompl 2
-reject fldcww 6
-reject fldl 2
-reject fnstcww 6
-reject fnstsww 6
-reject fs 1
-reject fsavel 6
-reject fsaves 6
-reject fstcww 6
-reject fstenvl 6
-reject fstenvs 6
-reject fstl 2
-reject fstpl 2
-reject fstsww 6
-reject gs 1
-reject hnt 1
-reject ht 1
-reject imul 1
-reject imulzu 3
-reject imulzul 11
-reject imulzuq 12
-reject imulzuw 1
-reject ins 7
-reject jmp 1
-reject ldtilecfg 6
-reject llwpcb 6
-reject loadiwkey 3
-reject lods 13
-reject lret 1
-reject lretl 1
-reject lretq 1
-reject lretw 1
-reject maskmovdqu 2
-reject maskmovq 4
-reject movabsw 1
-reject movdq2q 4
-reject movq2dq 4
-reject movrs 6
-reject movrsb 3
-reject movrsl 3
-reject movs 7
-reject movsx 1
-reject movsxb 5
-reject movsxd 13
-reject movsxl 6
-reject movsxw 4
-reject movzxb 1
-reject movzxw 1
-reject notrack 1
-reject outs 6
-reject pavgusb 6
-reject pcmpestril 3
-reject pcmpestriq 3
-reject pcmpestrml 2
-reject pcmpestrmq 2
-reject pextrw 6
-reject pextrwl 1
-reject pextrwq 2
-reject pf2id 6
-reject pf2iw 6
-reject pfacc 6
-reject pfadd 6
-reject pfcmpeq 6
-reject pfcmpge 6
-reject pfcmpgt 6
-reject pfmax 6
-reject pfmin 6
-reject pfmul 6
-reject pfnacc 6
-reject pfpnacc 6
-reject pfrcp 6
-reject pfrcpit1 6
-reject pfrcpit2 6
-reject pfrsqit1 6
-reject pfrsqrt 6
-reject pfsub 6
-reject pfsubr 6
-reject pi2fd 6
-reject pi2fw 6
-reject pinsrw 12
-reject pinsrwl 2
-reject pmovmskb 6
-reject pmovmskbl 1
-reject pmovmskbq 1
-reject pmulhrw 6
-reject prefetch 6
-reject prefetchit0 6
-reject prefetchit1 6
-reject prefetchrst2 6
-reject prefetchwt1 6
-reject pswapd 6
-reject push2pq 1
-reject pushw 1
-reject rcl 9
-reject rclb 4
-reject rcll 2
-reject rclq 2
-reject rclw 1
-reject rcr 4
-reject rcrb 1
-reject rcrq 1
-reject rcrw 2
-reject rdmsr 3
-reject ret 1
-reject retf 1
-reject retfl 1
-reject retfq 1
-reject retfw 1
-reject retq 1
-reject retw 1
-reject rex 1
-reject rex.b 1
-reject rex.r 1
-reject rex.rb 1
-reject rex.rx 1
-reject rex.rxb 1
-reject rex.w 1
-reject rex.wb 1
-reject rex.wr 1
-reject rex.wrb 1
-reject rex.wrx 1
-reject rex.wrxb 1
-reject rex.wx 1
-reject rex.wxb 1
-reject rex.x 1
-reject rex.xb 1
-reject rex64 1
-reject rex64x 1
-reject rex64xy 1
-reject rex64xyz 1
-reject rex64xz 1
-reject rex64y 1
-reject rex64yz 1
-reject rex64z 1
-reject rexx 1
-reject rexxy 1
-reject rexxyz 1
-reject rexxz 1
-reject rexy 1
-reject rexyz 1
-reject rexz 1
-reject rol 3
-reject roll 2
-reject rolq 1
-reject ror 3
-reject rorb 1
-reject rorq 2
-reject sal 5
-reject salb 1
-reject salw 4
-reject sar 5
-reject sarl 3
-reject sarq 1
-reject sarw 1
-reject scas 13
-reject scasb 2
-reject scasq 2
-reject scasw 2
-reject scmp 7
-reject scmpb 7
-reject scmpl 7
-reject scmpq 7
-reject scmpw 7
-reject setaeq 1
-reject setal 2
-reject setcq 1
-reject setgel 1
-reject setleq 1
-reject setlq 1
-reject setnael 1
-reject setnaq 1
-reject setneq 1
-reject setngl 1
-reject setnlel 1
-reject setnpl 1
-reject setnsl 1
-reject setol 1
-reject setpoq 1
-reject setpq 1
-reject setsq 2
-reject setzl 1
-reject shl 4
-reject shlb 2
-reject shlw 2
-reject shr 5
-reject shrb 1
-reject shrl 2
-reject shrq 1
-reject shrw 1
-reject slod 12
-reject slodb 8
-reject slodl 8
-reject slodq 7
-reject slodw 7
-reject slwpcb 6
-reject smov 7
-reject smovb 7
-reject smovl 7
-reject smovq 7
-reject smovw 7
-reject ssca 13
-reject sscab 8
-reject sscal 11
-reject sscaq 7
-reject sscaw 8
-reject ssto 13
-reject sstob 8
-reject sstol 10
-reject sstoq 8
-reject sstow 8
-reject stos 13
-reject sttilecfg 6
-reject sysexitl 1
-reject t1mskc 5
-reject t1mskcl 2
-reject t1mskcq 2
-reject tcvtrowd2ps 10
-reject tcvtrowps2bf16h 10
-reject tcvtrowps2bf16l 10
-reject tcvtrowps2phh 10
-reject tcvtrowps2phl 10
-reject test 2
-reject tileloadd 5
-reject tileloaddrs 5
-reject tileloaddrst1 5
-reject tileloaddt1 6
-reject tilemovrow 10
-reject tilerelease 1
-reject tilestored 5
-reject tilezero 1
-reject tzmsk 3
-reject tzmskl 2
-reject urdmsr 3
-reject v4fmaddps 6
-reject v4fmaddss 6
-reject v4fnmaddps 6
-reject v4fnmaddss 6
-reject vaddbf16 3
-reject vbcstnebf162ps 3
-reject vbcstnesh2ps 4
-reject vbitrevb 3
-reject vbmacor16x16x16 4
-reject vbmacxor16x16x16 4
-reject vcmpnge_uspd 4
-reject vcmpnge_usph 3
-reject vcmpnge_usps 6
-reject vcmpnge_ussd 9
-reject vcmpnge_ussh 6
-reject vcmpnge_usss 9
-reject vcmpngt_uspd 6
-reject vcmpngt_usph 4
-reject vcmpngt_usps 9
-reject vcmpngt_ussd 9
-reject vcmpngt_ussh 6
-reject vcmpngt_usss 10
-reject vcomisbf16 6
-reject vcomxsd 6
-reject vcomxsh 6
-reject vcomxss 6
-reject vcvt2ph2bf8 2
-reject vcvt2ph2bf8s 3
-reject vcvt2ph2hf8 2
-reject vcvt2ph2hf8s 1
-reject vcvt2ps2phx 2
-reject vcvtbf162ibs 6
-reject vcvtbf162iubs 5
-reject vcvtbiasph2bf8 10
-reject vcvtbiasph2bf8s 9
-reject vcvtbiasph2hf8 11
-reject vcvtbiasph2hf8s 11
-reject vcvthf82ph 18
-reject vcvtneebf162ps 4
-reject vcvtneeph2ps 3
-reject vcvtneobf162ps 5
-reject vcvtneoph2ps 4
-reject vcvtph2bf8 12
-reject vcvtph2bf8s 9
-reject vcvtph2bf8sx 6
-reject vcvtph2bf8sy 6
-reject vcvtph2bf8x 6
-reject vcvtph2bf8y 6
-reject vcvtph2hf8 8
-reject vcvtph2hf8s 10
-reject vcvtph2hf8sx 6
-reject vcvtph2hf8sy 6
-reject vcvtph2hf8x 6
-reject vcvtph2hf8y 6
-reject vcvtph2ibs 4
-reject vcvtph2iubs 4
-reject vcvtps2ibs 4
-reject vcvtps2iubs 3
-reject vcvtsd2sh 6
-reject vcvtsd2sil 3
-reject vcvtsd2siq 1
-reject vcvtsh2sd 6
-reject vcvtsh2si 6
-reject vcvtsh2ss 6
-reject vcvtsh2usi 6
-reject vcvtsi2sh 6
-reject vcvtsi2shl 3
-reject vcvtsi2shq 3
-reject vcvtss2sh 6
-reject vcvtss2sil 2
-reject vcvtss2siq 2
-reject vcvttbf162ibs 5
-reject vcvttbf162iubs 3
-reject vcvttpd2dqs 10
-reject vcvttpd2dqsx 6
-reject vcvttpd2dqsy 6
-reject vcvttpd2qqs 6
-reject vcvttpd2udqs 10
-reject vcvttpd2udqsx 6
-reject vcvttpd2udqsy 6
-reject vcvttpd2uqqs 4
-reject vcvttph2ibs 3
-reject vcvttph2iubs 5
-reject vcvttps2dqs 5
-reject vcvttps2ibs 3
-reject vcvttps2iubs 3
-reject vcvttps2qqs 18
-reject vcvttps2udqs 4
-reject vcvttps2uqqs 18
-reject vcvttsd2sil 2
-reject vcvttsd2siq 1
-reject vcvttsd2sis 6
-reject vcvttsd2usis 6
-reject vcvttsh2si 6
-reject vcvttsh2usi 6
-reject vcvttss2sil 3
-reject vcvttss2siq 2
-reject vcvttss2sis 6
-reject vcvttss2usis 6
-reject vcvtusi2sh 6
-reject vcvtusi2shl 2
-reject vcvtusi2shq 2
-reject vdivbf16 4
-reject vdpphps 3
-reject vfmadd132bf16 1
-reject vfmadd213bf16 3
-reject vfmadd231bf16 2
-reject vfmaddpd 1
-reject vfmaddps 2
-reject vfmaddsd 1
-reject vfmaddss 3
-reject vfmaddsubpd 1
-reject vfmaddsubps 1
-reject vfmsub132bf16 2
-reject vfmsub213bf16 2
-reject vfmsub231bf16 3
-reject vfmsubaddpd 1
-reject vfmsubaddps 1
-reject vfmsubpd 1
-reject vfmsubps 1
-reject vfmsubsd 1
-reject vfmsubss 1
-reject vfnmadd132bf16 1
-reject vfnmadd213bf16 2
-reject vfnmadd231bf16 1
-reject vfnmaddpd 2
-reject vfnmaddps 1
-reject vfnmaddsd 3
-reject vfnmaddss 1
-reject vfnmsub132bf16 1
-reject vfnmsub213bf16 1
-reject vfnmsub231bf16 2
-reject vfnmsubpd 1
-reject vfnmsubps 1
-reject vfnmsubsd 2
-reject vfnmsubss 2
-reject vgetexpbf16 5
-reject vgetmantbf16 4
-reject vgetmantsh 6
-reject vmaskmovdqu 3
-reject vmaxbf16 1
-reject vminbf16 2
-reject vminmaxsd 6
-reject vminmaxsh 6
-reject vminmaxss 6
-reject vmovhlps 4
-reject vmovhpd 12
-reject vmovhps 12
-reject vmovlhps 5
-reject vmovlpd 12
-reject vmovlps 12
-reject vmovmskpdl 1
-reject vmovmskpdq 1
-reject vmovntdq 5
-reject vmovntdqa 3
-reject vmovntpd 6
-reject vmovntps 7
-reject vmovrsb 6
-reject vmovrsd 6
-reject vmovrsq 6
-reject vmovrsw 6
-reject vmovw 17
-reject vmreadq 4
-reject vmulbf16 1
-reject vmwriteq 4
-reject vp2intersectd 2
-reject vp2intersectq 4
-reject vp4dpwssd 6
-reject vp4dpwssds 6
-reject vpbroadcastmb2q 6
-reject vpbroadcastmw2d 6
-reject vpcmpequb 4
-reject vpcmpequd 3
-reject vpcmpequq 5
-reject vpcmpequw 4
-reject vpcmpestri 4
-reject vpcmpestril 2
-reject vpcmpestriq 3
-reject vpcmpestrm 4
-reject vpcmpestrml 2
-reject vpcmpestrmq 2
-reject vpcmpistri 7
-reject vpcmpistrm 6
-reject vpcmpleb 3
-reject vpcmpled 6
-reject vpcmpleq 3
-reject vpcmpleub 3
-reject vpcmpleud 4
-reject vpcmpleuq 6
-reject vpcmpleuw 5
-reject vpcmplew 5
-reject vpcmpltb 5
-reject vpcmpltd 4
-reject vpcmpltq 3
-reject vpcmpltub 5
-reject vpcmpltud 5
-reject vpcmpltuq 5
-reject vpcmpltuw 3
-reject vpcmpltw 5
-reject vpcmpneqb 2
-reject vpcmpneqd 4
-reject vpcmpneqq 4
-reject vpcmpnequb 4
-reject vpcmpnequd 4
-reject vpcmpnequq 5
-reject vpcmpnequw 3
-reject vpcmpneqw 5
-reject vpcmpnleb 5
-reject vpcmpnled 6
-reject vpcmpnleq 4
-reject vpcmpnleub 4
-reject vpcmpnleud 4
-reject vpcmpnleuq 3
-reject vpcmpnleuw 6
-reject vpcmpnlew 4
-reject vpcmpnltb 2
-reject vpcmpnltd 5
-reject vpcmpnltq 5
-reject vpcmpnltub 5
-reject vpcmpnltud 3
-reject vpcmpnltuq 4
-reject vpcmpnltuw 4
-reject vpcmpnltw 4
-reject vpcomb 3
-reject vpcomd 3
-reject vpcomeqb 3
-reject vpcomeqd 2
-reject vpcomeqq 3
-reject vpcomequb 3
-reject vpcomequd 4
-reject vpcomequq 3
-reject vpcomequw 2
-reject vpcomeqw 3
-reject vpcomleb 4
-reject vpcomled 3
-reject vpcomleq 3
-reject vpcomleub 3
-reject vpcomleud 3
-reject vpcomleuq 3
-reject vpcomleuw 2
-reject vpcomlew 3
-reject vpcomltb 3
-reject vpcomltd 2
-reject vpcomltq 2
-reject vpcomltub 4
-reject vpcomltud 2
-reject vpcomltuq 4
-reject vpcomltuw 2
-reject vpcomltw 1
-reject vpcomneqb 2
-reject vpcomneqd 4
-reject vpcomneqq 4
-reject vpcomnequb 4
-reject vpcomnequd 3
-reject vpcomnequq 4
-reject vpcomnequw 2
-reject vpcomneqw 1
-reject vpcomq 3
-reject vpcomub 2
-reject vpcomud 4
-reject vpcomuq 3
-reject vpcomuw 2
-reject vpcomw 3
-reject vperm2f128 1
-reject vpmadcsswd 4
-reject vpmadcswd 3
-reject vpmovb2m 6
-reject vpmovd2m 6
-reject vpmovm2b 6
-reject vpmovm2d 6
-reject vpmovm2q 6
-reject vpmovm2w 6
-reject vpmovq2m 6
-reject vpmovw2m 6
-reject vprotb 3
-reject vprotd 5
-reject vprotq 7
-reject vprotw 3
-reject vrcp14sd 6
-reject vrcp14ss 6
-reject vrcp28sd 6
-reject vrcp28ss 6
-reject vrcpbf16 3
-reject vrcpss 2
-reject vreducebf16 3
-reject vreducesh 6
-reject vrndscalebf16 4
-reject vrndscalesh 6
-reject vrsqrt14sd 6
-reject vrsqrt14ss 6
-reject vrsqrt28sd 6
-reject vrsqrt28ss 6
-reject vrsqrtbf16 5
-reject vrsqrtss 3
-reject vscalefbf16 2
-reject vsha512msg1 3
-reject vsha512msg2 3
-reject vsha512rnds2 1
-reject vsm3msg1 3
-reject vsm3msg2 2
-reject vsm3rnds2 4
-reject vsqrtbf16 3
-reject vsubbf16 2
-reject vucomxsd 6
-reject vucomxsh 6
-reject vucomxss 6
-reject word 1
-reject xacquire 1
-reject xrelease 1
+reject aadd 9 7b151874
+reject aand 10 4b0fb113
+reject adcx 2 9031886b
+reject addr32 1 a5411652
+reject adox 2 ad2fb285
+reject adoxq 1 bdd3dc04
+reject adword 1 0045b0be
+reject aesdec128kl 5 f087c671
+reject aesdec256kl 4 d0e83aed
+reject aesdecwide128kl 6 1b1123b9
+reject aesdecwide256kl 6 5910f828
+reject aesenc128kl 4 36e8d387
+reject aesenc256kl 5 cea72813
+reject aesencwide128kl 6 ad9a1306
+reject aesencwide256kl 6 1501733e
+reject and 2 313e811d
+reject andq 1 fcf764ac
+reject aor 11 6616c35a
+reject axor 11 07764803
+reject bextr 5 79fddd6b
+reject bextrl 1 5c241007
+reject bextrq 2 d97f5a2a
+reject blcfill 5 27cd43f5
+reject blcfilll 2 60074b8f
+reject blcfillq 1 fc6bbabc
+reject blci 6 17d058fc
+reject blcic 4 fbe30d2c
+reject blcicq 2 29cda25a
+reject blcil 3 6483092b
+reject blciq 2 ca2801e0
+reject blcmsk 4 11f86a6e
+reject blcmskl 1 99f01457
+reject blcmskq 2 6d37fd1e
+reject blcs 6 6574a027
+reject blcsl 2 af6715b8
+reject blcsq 2 313f3945
+reject blsfill 5 9e928fe2
+reject blsfillq 2 264f4b67
+reject blsic 5 dfdcf184
+reject blsicq 2 2f52135d
+reject call 4 0f6b34fa
+reject callw 2 4dd9acf1
+reject ccmpa 1 4676bc1f
+reject ccmpae 2 e31f3645
+reject ccmpaeb 1 5e683181
+reject ccmpael 1 7b54f4b6
+reject ccmpaeq 1 d2ee0ef9
+reject ccmpaew 1 31bcc782
+reject ccmpb 8 40c46af0
+reject ccmpbe 2 2b88fe3e
+reject ccmpc 2 41977efc
+reject ccmpcb 2 0b469624
+reject ccmpcl 2 f99c7306
+reject ccmpcq 2 607b76d7
+reject ccmpcw 2 f736f295
+reject ccmpe 1 d1655c8a
+reject ccmpeb 1 199eeb8a
+reject ccmpel 1 2111f357
+reject ccmpeq 1 3e2241b7
+reject ccmpew 1 c244ef11
+reject ccmpf 18 beb8b41d
+reject ccmpfb 3 061e7d74
+reject ccmpfl 7 23d68eac
+reject ccmpfq 7 78820539
+reject ccmpfw 6 b76b62c4
+reject ccmpg 1 3a122521
+reject ccmpl 14 ebcf4774
+reject ccmple 1 5fbf56b4
+reject ccmpleb 1 9cd74b05
+reject ccmplel 1 33e5f249
+reject ccmpleq 1 0e36c545
+reject ccmplew 1 835fda29
+reject ccmpna 1 2874c680
+reject ccmpnae 1 bf8c410e
+reject ccmpnb 10 3e420ea0
+reject ccmpnbe 2 cdc38379
+reject ccmpnbeb 2 e3bf9ced
+reject ccmpnbel 2 9c13271e
+reject ccmpnbeq 2 9d986315
+reject ccmpnbew 2 bd412bdd
+reject ccmpnbw 1 b9f016bb
+reject ccmpnc 1 1891393c
+reject ccmpncb 1 510acd86
+reject ccmpncl 1 c7c88c25
+reject ccmpncq 1 ec724a6e
+reject ccmpncw 1 2778a580
+reject ccmpne 1 a560b014
+reject ccmpnge 1 6c07197a
+reject ccmpngeb 1 36c28b50
+reject ccmpngel 1 9cefeac4
+reject ccmpngeq 1 d2a5a73b
+reject ccmpngew 1 684c0877
+reject ccmpnl 11 ba0aa397
+reject ccmpno 1 e043af9b
+reject ccmpnob 1 999b5b65
+reject ccmpnol 1 6465f63f
+reject ccmpnoq 1 380abb1a
+reject ccmpnow 1 cbe220c6
+reject ccmpns 2 7ddee680
+reject ccmpnsb 1 c0544e30
+reject ccmpnsl 1 edb4d32c
+reject ccmpnsq 1 f23e57b3
+reject ccmpnsw 1 2db26a88
+reject ccmpnz 1 64b42e5e
+reject ccmpnzb 1 2d3bb634
+reject ccmpnzl 1 de86f11b
+reject ccmpnzq 1 5250e1cb
+reject ccmpnzw 1 b8c179f7
+reject ccmpo 2 a1f93beb
+reject ccmps 1 9875ccaa
+reject ccmpt 21 7000d7cf
+reject ccmptb 4 4a905bcd
+reject ccmptl 6 9822afe6
+reject ccmptq 9 62706f7d
+reject ccmptw 6 5c0cb418
+reject ccmpz 1 ab486e9a
+reject cfcmovnp 10 0b29e9d0
+reject cfcmovnpl 1 5f10cdf2
+reject cfcmovnpq 4 f5d260af
+reject cfcmovnpw 2 f3e0ad64
+reject cfcmovp 9 08d7cd14
+reject cfcmovpl 1 fc7d13c1
+reject cfcmovpq 3 48414387
+reject cfcmovpw 2 367820ce
+reject clr 6 5f634c70
+reject cmpaexadd 3 c7b14014
+reject cmpaxadd 3 4a427f82
+reject cmpbexadd 4 7757492b
+reject cmpbxadd 3 19950ea4
+reject cmpcxadd 4 c89dacf5
+reject cmpexadd 3 0e92fdae
+reject cmpgexadd 2 99de2292
+reject cmpgxadd 2 72725af4
+reject cmplexadd 3 834c564c
+reject cmplxadd 4 e3a24eb8
+reject cmpnaexadd 3 9f24a21a
+reject cmpnaxadd 4 4aaebb97
+reject cmpnbexadd 4 3ed598f0
+reject cmpnbxadd 4 ae704aa1
+reject cmpncxadd 3 943736a2
+reject cmpnexadd 2 4101beaa
+reject cmpngexadd 5 7c5d62f7
+reject cmpngxadd 5 6f8437e1
+reject cmpnlexadd 5 96de6115
+reject cmpnlxadd 3 14aa8a4d
+reject cmpnoxadd 3 6697fad2
+reject cmpnpxadd 5 f859afce
+reject cmpnsxadd 2 d0f629a2
+reject cmpnzxadd 5 b48132c4
+reject cmpoxadd 3 7db59a87
+reject cmppexadd 5 505e17d7
+reject cmppoxadd 4 ec3e8992
+reject cmppxadd 2 7cbefaae
+reject cmps 7 050d65b5
+reject cmpsxadd 5 350402f4
+reject cmpzxadd 2 36c661cc
+reject cs 1 3b8b91c7
+reject ctesta 2 63ac33fd
+reject ctestab 1 1d49672c
+reject ctestae 1 021c15b0
+reject ctestaeb 1 6d79ac3b
+reject ctestael 1 39b7ea23
+reject ctestaeq 1 dbff0df7
+reject ctestaew 1 5e962249
+reject ctestal 1 53384d89
+reject ctestaq 1 08e1442e
+reject ctestaw 1 17ba4df5
+reject ctestb 7 d863d05e
+reject ctestbe 1 1d859188
+reject ctestc 1 330ba99b
+reject ctestcw 1 6d4c0827
+reject cteste 1 4af5832d
+reject ctestf 12 c121e7c2
+reject ctestfb 3 f2fe206f
+reject ctestfl 3 da7d6f01
+reject ctestfq 3 9f73b8a7
+reject ctestfw 3 2064286e
+reject ctestg 1 29bb0361
+reject ctestgb 1 ab252218
+reject ctestge 1 7a9ffd2f
+reject ctestgeb 1 a9dbed44
+reject ctestgl 1 6093dfb6
+reject ctestgq 1 73b68712
+reject ctestgw 1 17eee1fd
+reject ctestl 11 ab18c156
+reject ctestnae 2 2f5f861c
+reject ctestnaeb 2 f8131120
+reject ctestnael 2 4fd4f595
+reject ctestnaeq 2 34704ac0
+reject ctestnaew 2 e3395f54
+reject ctestnb 8 31acc80b
+reject ctestnbe 2 de329f82
+reject ctestnc 1 849568c2
+reject ctestne 1 1c066d57
+reject ctestng 1 bfefbeba
+reject ctestnl 9 845fa1f5
+reject ctesto 2 f592e08c
+reject ctestob 1 de2fc00b
+reject ctestol 1 6f797f19
+reject ctestoq 1 5350ce50
+reject ctestow 1 df874685
+reject ctestt 10 3d916812
+reject ctesttb 2 586119b8
+reject ctesttl 3 c3de734d
+reject ctesttq 3 7cb7e6e4
+reject ctesttw 3 d1e5f81c
+reject cvtpd2pi 6 d781876a
+reject cvtpi2pd 8 6155ee4d
+reject cvtpi2ps 3 2ebc20f0
+reject cvtps2pi 6 21b25b0e
+reject cvttpd2pi 5 17fd9f02
+reject cvttps2pi 5 bcd71036
+reject data16 1 86f4eb3a
+reject ds 1 f9c7af7e
+reject encodekey128 6 0cf019b5
+reject encodekey256 6 db5f0bc8
+reject enter 2 af3ec3a8
+reject enterq 2 867dc8f8
+reject enterw 2 65cab687
+reject fcoml 2 0d351992
+reject fcompl 2 63a1ef89
+reject fldcww 6 abdbb632
+reject fldl 2 be35029c
+reject fnstcww 6 3f8c1308
+reject fnstsww 6 531e4838
+reject fs 1 dce7cce0
+reject fsavel 6 d50de19c
+reject fsaves 6 c8d18b50
+reject fstcww 6 301af78a
+reject fstenvl 6 0d74ff74
+reject fstenvs 6 be008662
+reject fstl 2 3a91e34c
+reject fstpl 2 8ae0557c
+reject fstsww 6 57a23c50
+reject gs 1 7a5443b6
+reject hnt 1 a382592b
+reject ht 1 712dd58e
+reject imul 1 8b27c07e
+reject imulzu 3 fbc03bb6
+reject imulzul 11 7fe5c82f
+reject imulzuq 12 7cf4e5a1
+reject imulzuw 1 9f25d228
+reject ins 7 72392ad3
+reject jmp 1 253fbff0
+reject ldtilecfg 6 a94bde37
+reject llwpcb 6 28170c7d
+reject loadiwkey 3 d5bc694d
+reject lods 13 aeca457b
+reject lret 1 be918eed
+reject lretl 1 87755892
+reject lretq 1 6b0f04e5
+reject lretw 1 7e2d77b8
+reject maskmovdqu 2 9a9088bf
+reject maskmovq 4 2e9fe882
+reject movabsb 1 0f47bef0
+reject movabsw 1 2c47230b
+reject movdq2q 4 5b219602
+reject movq2dq 4 5a8dbc82
+reject movrs 12 e5cbf786
+reject movrsb 5 cc4992c7
+reject movrsl 6 40010fcf
+reject movrsq 1 3d4fff95
+reject movs 7 83aeb28b
+reject movsx 1 3ac00cf9
+reject movsxb 5 9dbd638d
+reject movsxd 13 5a582d1a
+reject movsxl 6 2e491247
+reject movsxw 4 43888b2c
+reject movzxb 1 dd714bd1
+reject movzxw 1 69877950
+reject notrack 1 6baffd7c
+reject outs 6 15c5c981
+reject pavgusb 6 5f549e91
+reject pcmpestril 3 cc2dee84
+reject pcmpestriq 3 fb15a69b
+reject pcmpestrml 2 6d2ce452
+reject pcmpestrmq 2 248fe6e4
+reject pextrw 6 35ea39ff
+reject pextrwl 1 b54ea0ed
+reject pextrwq 2 b5d3c49c
+reject pf2id 6 bbde5542
+reject pf2iw 6 2bea74f4
+reject pfacc 6 f6eeba7f
+reject pfadd 6 c0672451
+reject pfcmpeq 6 b2a4c1d6
+reject pfcmpge 6 00367cd5
+reject pfcmpgt 6 c2708f27
+reject pfmax 6 f1e5d9dc
+reject pfmin 6 03394521
+reject pfmul 6 a43a7e2a
+reject pfnacc 6 d433f797
+reject pfpnacc 6 1091a544
+reject pfrcp 6 407ea7be
+reject pfrcpit1 6 6938fefe
+reject pfrcpit2 6 3594b2a6
+reject pfrsqit1 6 44966f22
+reject pfrsqrt 6 d3ccde9e
+reject pfsub 6 dd0b13fa
+reject pfsubr 6 90f2b883
+reject pi2fd 6 d0d53407
+reject pi2fw 6 30caa8e7
+reject pinsrw 12 80f67963
+reject pinsrwl 2 503a7249
+reject pmovmskb 6 22088626
+reject pmovmskbl 1 99eb1c20
+reject pmovmskbq 1 93612bd4
+reject pmulhrw 6 1f1b31d7
+reject prefetch 6 8d0bf4a3
+reject prefetchit0 6 96873814
+reject prefetchit1 6 583b39b3
+reject prefetchrst2 6 2e38222d
+reject prefetchwt1 6 82822d3f
+reject pswapd 6 63881fba
+reject push2pq 1 da5cb336
+reject pushw 1 a617f67f
+reject rcl 9 d5398702
+reject rclb 4 017ba264
+reject rcll 2 16084430
+reject rclq 2 f85ab182
+reject rclw 1 85390670
+reject rcr 4 a64183bd
+reject rcrb 1 089defe5
+reject rcrq 1 4a30a87a
+reject rcrw 2 da207ced
+reject rdmsr 3 e85a3cf2
+reject ret 1 17957cee
+reject retf 1 e50ce2b9
+reject retfl 1 61bbd049
+reject retfq 1 7f0c012a
+reject retfw 1 e155161b
+reject retq 1 85f3adda
+reject retw 1 d3e8aa9c
+reject rex 1 3227fe6b
+reject rex.b 1 adcd15e4
+reject rex.r 1 d6838b26
+reject rex.rb 1 605ec901
+reject rex.rx 1 df5b6c57
+reject rex.rxb 1 d1f8cdd2
+reject rex.w 1 fcac92dd
+reject rex.wb 1 9e71e19d
+reject rex.wr 1 cd629657
+reject rex.wrb 1 65befeee
+reject rex.wrx 1 6b007c29
+reject rex.wrxb 1 48515d67
+reject rex.wx 1 0ad395b1
+reject rex.wxb 1 b4a326a9
+reject rex.x 1 79ae809e
+reject rex.xb 1 a2393b47
+reject rex64 1 00b9ef08
+reject rex64x 1 d24d5cd8
+reject rex64xy 1 eb65a9a2
+reject rex64xyz 1 ea97aabf
+reject rex64xz 1 a038ece5
+reject rex64y 1 6516db9a
+reject rex64yz 1 4fcc24d7
+reject rex64z 1 12690471
+reject rexx 1 55808dda
+reject rexxy 1 ffad466b
+reject rexxyz 1 445f5540
+reject rexxz 1 7563df8e
+reject rexy 1 e56ffb09
+reject rexyz 1 a8c7dd6d
+reject rexz 1 6e6de02f
+reject rol 3 cc807dc4
+reject roll 2 62b2c6ea
+reject rolq 1 4a558c32
+reject ror 3 ee172917
+reject rorb 1 3852483d
+reject rorq 2 516bdb92
+reject sal 5 10948b4f
+reject salb 1 f9dc64f7
+reject salw 4 489e74d6
+reject sar 5 e1dd9365
+reject sarl 3 6e8df7e7
+reject sarq 1 167b47f0
+reject sarw 1 7028ea33
+reject scas 13 d0a7fa52
+reject scasb 2 e6c6474d
+reject scasq 2 7baf7582
+reject scasw 2 5d4aa2ab
+reject scmp 7 edb11a84
+reject scmpb 7 cd5f975d
+reject scmpl 7 d0c3a324
+reject scmpq 7 c5175909
+reject scmpw 7 08c9ec88
+reject setaeq 1 6ecdc7ff
+reject setal 2 047da988
+reject setcq 1 2820cca5
+reject setgel 1 24ff7952
+reject setleq 1 fc2e7582
+reject setlq 1 7ea192ea
+reject setnael 1 e307040a
+reject setnaq 1 4d3bec95
+reject setneq 1 1f812578
+reject setngl 1 33d99fd8
+reject setnlel 1 9d653095
+reject setnpl 1 40ec2594
+reject setnsl 1 980d6b3f
+reject setol 1 26916378
+reject setpoq 1 99b7e944
+reject setpq 1 884c735e
+reject setsq 2 62513ba3
+reject setzl 1 7d0431b2
+reject shl 4 12926dd0
+reject shlb 2 76e2aa4e
+reject shlw 2 45e428b5
+reject shr 5 0402639d
+reject shrb 1 413664a0
+reject shrl 2 4744d8f3
+reject shrq 1 05086812
+reject shrw 1 3bb0cb34
+reject slod 12 a7d82a96
+reject slodb 8 5c3173ca
+reject slodl 8 f1282ddd
+reject slodq 7 eaad83cb
+reject slodw 7 0f84856f
+reject slwpcb 6 f75dbb37
+reject smov 7 94bde92e
+reject smovb 7 1e94151a
+reject smovl 7 e433488d
+reject smovq 7 10ee6028
+reject smovw 7 12a790b5
+reject ssca 13 6b1a62e5
+reject sscab 8 61d33e6f
+reject sscal 11 1c536e8c
+reject sscaq 7 9b80d434
+reject sscaw 8 49d745f9
+reject ssto 13 ff20cd5e
+reject sstob 8 80b4f2c7
+reject sstol 10 eac6c5cc
+reject sstoq 8 ad9d7c11
+reject sstow 8 6c8f8784
+reject stos 13 432ec55f
+reject sttilecfg 6 62c2811f
+reject sysexitl 1 514f09c2
+reject t1mskc 5 ec31110e
+reject t1mskcl 2 17e39537
+reject t1mskcq 2 471f401f
+reject tcvtrowd2ps 10 07759473
+reject tcvtrowps2bf16h 10 96d58bab
+reject tcvtrowps2bf16l 10 346fc85b
+reject tcvtrowps2phh 10 bf53df07
+reject tcvtrowps2phl 10 3d65694d
+reject test 2 9708490f
+reject tileloadd 5 04d17351
+reject tileloaddrs 5 875552ec
+reject tileloaddrst1 5 24d77723
+reject tileloaddt1 6 0f06429a
+reject tilemovrow 10 9213c7fa
+reject tilerelease 1 cdedb598
+reject tilestored 5 39f1148e
+reject tilezero 1 77617e6f
+reject tzmsk 3 6134de2e
+reject tzmskl 2 41481ae3
+reject urdmsr 3 544912fa
+reject v4fmaddps 6 7c3bec99
+reject v4fmaddss 6 e4822c68
+reject v4fnmaddps 6 80792cc1
+reject v4fnmaddss 6 3226d3c4
+reject vaddbf16 3 e183cf9b
+reject vbcstnebf162ps 3 b5574c51
+reject vbcstnesh2ps 4 4e6d7b57
+reject vbitrevb 3 d7b45946
+reject vbmacor16x16x16 4 e7dc808e
+reject vbmacxor16x16x16 4 c7fe475c
+reject vcmpnge_uspd 4 559a736c
+reject vcmpnge_usph 3 2c8c5b6e
+reject vcmpnge_usps 6 05414bac
+reject vcmpnge_ussd 9 30e269f8
+reject vcmpnge_ussh 6 416b3d0c
+reject vcmpnge_usss 9 bb6f5004
+reject vcmpngt_uspd 6 28670565
+reject vcmpngt_usph 4 82026d0f
+reject vcmpngt_usps 9 411ea7f5
+reject vcmpngt_ussd 9 b9dab35f
+reject vcmpngt_ussh 6 a356c32f
+reject vcmpngt_usss 10 b41035c4
+reject vcomisbf16 6 792765e0
+reject vcomxsd 6 45bfcb79
+reject vcomxsh 6 b315046e
+reject vcomxss 6 e4bc1dfc
+reject vcvt2ph2bf8 2 f3f88605
+reject vcvt2ph2bf8s 3 c37f495d
+reject vcvt2ph2hf8 2 5ac937b0
+reject vcvt2ph2hf8s 1 80eaea19
+reject vcvt2ps2phx 2 d7dd4db8
+reject vcvtbf162ibs 6 9df6e992
+reject vcvtbf162iubs 5 7cdd282d
+reject vcvtbiasph2bf8 10 3d4a4a37
+reject vcvtbiasph2bf8s 9 71071339
+reject vcvtbiasph2hf8 11 d844525b
+reject vcvtbiasph2hf8s 11 e1a722b3
+reject vcvthf82ph 18 4b9df7ef
+reject vcvtneebf162ps 4 53669121
+reject vcvtneeph2ps 3 01458ffc
+reject vcvtneobf162ps 5 78ab84ea
+reject vcvtneoph2ps 4 f6442540
+reject vcvtph2bf8 12 c6e00bed
+reject vcvtph2bf8s 9 c3aa8888
+reject vcvtph2bf8sx 6 a60a0080
+reject vcvtph2bf8sy 6 a4e01100
+reject vcvtph2bf8x 6 447474e1
+reject vcvtph2bf8y 6 3f431162
+reject vcvtph2hf8 8 083deefc
+reject vcvtph2hf8s 10 aa14c3e1
+reject vcvtph2hf8sx 6 b442a183
+reject vcvtph2hf8sy 6 2134c444
+reject vcvtph2hf8x 6 00b601d3
+reject vcvtph2hf8y 6 6432cc3e
+reject vcvtph2ibs 4 9a72c60d
+reject vcvtph2iubs 4 428fdcea
+reject vcvtps2ibs 4 ee5a58c9
+reject vcvtps2iubs 3 a1205f22
+reject vcvtsd2sh 6 0ff32214
+reject vcvtsd2sil 3 27317475
+reject vcvtsd2siq 1 be0d6a0a
+reject vcvtsh2sd 6 6cde7d50
+reject vcvtsh2si 6 130d037f
+reject vcvtsh2ss 6 e6913bc5
+reject vcvtsh2usi 6 e36f42e7
+reject vcvtsi2sh 6 a7e80803
+reject vcvtsi2shl 3 7262d03f
+reject vcvtsi2shq 3 eebb43f6
+reject vcvtss2sh 6 b1f3dc87
+reject vcvtss2sil 2 e0e300fc
+reject vcvtss2siq 2 fcf43060
+reject vcvttbf162ibs 5 ac2a7a56
+reject vcvttbf162iubs 3 ed8ed410
+reject vcvttpd2dqs 10 b637aea6
+reject vcvttpd2dqsx 6 b5757a9f
+reject vcvttpd2dqsy 6 9ed81b12
+reject vcvttpd2qqs 6 336fe891
+reject vcvttpd2udqs 10 3daa41dc
+reject vcvttpd2udqsx 6 6aac10f9
+reject vcvttpd2udqsy 6 7cdbdbb9
+reject vcvttpd2uqqs 4 95ca2654
+reject vcvttph2ibs 3 d72db7d0
+reject vcvttph2iubs 5 57469982
+reject vcvttps2dqs 5 727e8bef
+reject vcvttps2ibs 3 018c9b42
+reject vcvttps2iubs 3 4923a64e
+reject vcvttps2qqs 18 e6d6b340
+reject vcvttps2udqs 4 e70651e9
+reject vcvttps2uqqs 18 e683c3d4
+reject vcvttsd2sil 2 7dfdfa02
+reject vcvttsd2siq 1 3944688e
+reject vcvttsd2sis 6 a36eb26a
+reject vcvttsd2usis 6 c8ecc1c2
+reject vcvttsh2si 6 5dad7879
+reject vcvttsh2usi 6 f6bab95a
+reject vcvttss2sil 3 db240592
+reject vcvttss2siq 2 f46150d5
+reject vcvttss2sis 6 b69c7c61
+reject vcvttss2usis 6 d9624f8b
+reject vcvtusi2sh 6 363e31ac
+reject vcvtusi2shl 2 d2416ec0
+reject vcvtusi2shq 2 04b0df5c
+reject vdivbf16 4 47f3ab6c
+reject vdpphps 3 2a44bcd2
+reject vfmadd132bf16 1 87ec8f12
+reject vfmadd213bf16 3 03be83e0
+reject vfmadd231bf16 2 61f19145
+reject vfmaddpd 1 ae8edec9
+reject vfmaddps 2 0fdc416f
+reject vfmaddsd 2 006626ac
+reject vfmaddss 4 1dda7c9a
+reject vfmaddsubpd 1 06d8ac73
+reject vfmaddsubps 1 0f8c3393
+reject vfmsub132bf16 2 4561548b
+reject vfmsub213bf16 2 064cd2b0
+reject vfmsub231bf16 3 fe7b6328
+reject vfmsubaddpd 2 d98ded72
+reject vfmsubaddps 1 3b4c9890
+reject vfmsubpd 1 f0a5b9db
+reject vfmsubps 1 4629540b
+reject vfmsubsd 4 e1bc8e77
+reject vfmsubss 3 141d546e
+reject vfnmadd132bf16 1 a92b9331
+reject vfnmadd213bf16 2 7e64e1e0
+reject vfnmadd231bf16 1 fa7989a6
+reject vfnmaddpd 2 f32280c3
+reject vfnmaddps 1 a8dd050c
+reject vfnmaddsd 5 f9cf9e3e
+reject vfnmaddss 3 405c9ce0
+reject vfnmsub132bf16 1 faebb625
+reject vfnmsub213bf16 1 0fcd754c
+reject vfnmsub231bf16 2 2c570429
+reject vfnmsubpd 1 beb68522
+reject vfnmsubps 1 886c2a89
+reject vfnmsubsd 2 15c5ed3b
+reject vfnmsubss 2 b811f991
+reject vgetexpbf16 5 b7445534
+reject vgetmantbf16 4 279cc6eb
+reject vgetmantsh 6 239f6d51
+reject vmaskmovdqu 3 7a92fa91
+reject vmaxbf16 1 0ad9ecf4
+reject vminbf16 2 8f711d2d
+reject vminmaxsd 6 dc4360cc
+reject vminmaxsh 6 ab136a26
+reject vminmaxss 6 81150d3c
+reject vmovhlps 4 fe0af6be
+reject vmovhpd 12 5de67beb
+reject vmovhps 12 c86909a6
+reject vmovlhps 5 a7081f45
+reject vmovlpd 12 415de2c2
+reject vmovlps 12 db728842
+reject vmovmskpdl 1 0f831e8b
+reject vmovmskpdq 1 d4c4b8ff
+reject vmovntdq 5 0cb81eaf
+reject vmovntdqa 3 dfa57ca4
+reject vmovntpd 6 53d398b4
+reject vmovntps 7 46660884
+reject vmovrsb 6 f59e0994
+reject vmovrsd 6 ca86efc3
+reject vmovrsq 6 d7b19ca1
+reject vmovrsw 6 ddd65264
+reject vmovw 32 0639b499
+reject vmreadq 4 a106d555
+reject vmulbf16 1 65aa12ea
+reject vmwriteq 4 601fe5ac
+reject vp2intersectd 2 597a16bc
+reject vp2intersectq 4 0d820899
+reject vp4dpwssd 6 3327157c
+reject vp4dpwssds 6 7964bd1b
+reject vpbroadcastmb2q 6 997f82c3
+reject vpbroadcastmw2d 6 92a1840f
+reject vpcmpequb 4 a7f93c5d
+reject vpcmpequd 3 0b6249d8
+reject vpcmpequq 5 bf60c513
+reject vpcmpequw 4 0581998c
+reject vpcmpestri 4 f0fc0561
+reject vpcmpestril 2 5caa0c3f
+reject vpcmpestriq 3 52c5284b
+reject vpcmpestrm 4 8de3b092
+reject vpcmpestrml 2 b1af8910
+reject vpcmpestrmq 2 ca1ab1be
+reject vpcmpistri 7 712ff9f5
+reject vpcmpistrm 6 588abaec
+reject vpcmpleb 3 cf14388b
+reject vpcmpled 6 8d3d0823
+reject vpcmpleq 3 48cdb72f
+reject vpcmpleub 3 4be05363
+reject vpcmpleud 4 7adf2010
+reject vpcmpleuq 6 707d637b
+reject vpcmpleuw 5 d492e47e
+reject vpcmplew 5 6447f14c
+reject vpcmpltb 5 7d502a73
+reject vpcmpltd 4 c2944ff3
+reject vpcmpltq 3 025ec9a7
+reject vpcmpltub 5 afc365f6
+reject vpcmpltud 5 43b3f74a
+reject vpcmpltuq 5 1f2e000d
+reject vpcmpltuw 3 8d04cff5
+reject vpcmpltw 5 1d16b57c
+reject vpcmpneqb 2 80bbe092
+reject vpcmpneqd 4 56f33c30
+reject vpcmpneqq 4 8b2ee335
+reject vpcmpnequb 4 b5830681
+reject vpcmpnequd 4 196f87e6
+reject vpcmpnequq 5 30a7fa97
+reject vpcmpnequw 3 106b3528
+reject vpcmpneqw 5 4ca0d096
+reject vpcmpnleb 5 932bfc53
+reject vpcmpnled 6 05741b35
+reject vpcmpnleq 4 0fa29f71
+reject vpcmpnleub 4 8224c30c
+reject vpcmpnleud 4 eeb14432
+reject vpcmpnleuq 3 b76c1d41
+reject vpcmpnleuw 6 fb98f7f3
+reject vpcmpnlew 4 c55bb868
+reject vpcmpnltb 2 2da3fed6
+reject vpcmpnltd 5 a37b0910
+reject vpcmpnltq 5 edde08ad
+reject vpcmpnltub 5 fc853e72
+reject vpcmpnltud 3 8647d96d
+reject vpcmpnltuq 4 4b63090f
+reject vpcmpnltuw 4 9360fe8c
+reject vpcmpnltw 4 ef2c70cd
+reject vpcomb 3 154965ae
+reject vpcomd 3 51e70577
+reject vpcomeqb 3 cf5ef056
+reject vpcomeqd 2 50856ffc
+reject vpcomeqq 3 dfbd0631
+reject vpcomequb 3 1008bfe6
+reject vpcomequd 4 0484487c
+reject vpcomequq 3 333d8243
+reject vpcomequw 2 aecb36e1
+reject vpcomeqw 3 45eb06fa
+reject vpcomleb 4 8937e796
+reject vpcomled 3 8b15c9dd
+reject vpcomleq 3 74bd65f6
+reject vpcomleub 3 991afd2e
+reject vpcomleud 3 cbdc1c09
+reject vpcomleuq 3 cd2f1539
+reject vpcomleuw 2 f18bf67b
+reject vpcomlew 3 86e1c69f
+reject vpcomltb 3 e715dfe5
+reject vpcomltd 2 fb780ab3
+reject vpcomltq 2 75c686bd
+reject vpcomltub 4 81fe64a5
+reject vpcomltud 2 7637e7f4
+reject vpcomltuq 4 32b0360e
+reject vpcomltuw 2 750e1fdb
+reject vpcomltw 1 4bf65467
+reject vpcomneqb 2 3279564c
+reject vpcomneqd 4 ba56e859
+reject vpcomneqq 4 09c71fd4
+reject vpcomnequb 4 1fcac351
+reject vpcomnequd 3 8a1f274d
+reject vpcomnequq 4 d608217b
+reject vpcomnequw 2 d863a8c7
+reject vpcomneqw 1 f1b9cc91
+reject vpcomq 3 610bf49b
+reject vpcomub 2 48829576
+reject vpcomud 4 a14e2e4e
+reject vpcomuq 3 0fc5432b
+reject vpcomuw 2 eeb99e6e
+reject vpcomw 3 f33a4e26
+reject vperm2f128 1 c698952a
+reject vpmadcsswd 4 a7c12a9c
+reject vpmadcswd 3 d23c4d73
+reject vpmovb2m 6 f9b0f658
+reject vpmovd2m 6 3dcb7743
+reject vpmovm2b 6 0d813835
+reject vpmovm2d 6 a938ce51
+reject vpmovm2q 6 91857500
+reject vpmovm2w 6 b4d766b2
+reject vpmovq2m 6 1d25ca4d
+reject vpmovw2m 6 0a3d631f
+reject vprotb 3 2bc259ba
+reject vprotd 5 3c9ac7dc
+reject vprotq 7 cbf2c2c5
+reject vprotw 3 c9070a04
+reject vpshab 2 45dfe904
+reject vpshad 1 d07e7de6
+reject vpshaq 2 4c75bd40
+reject vpshlb 2 5340cae2
+reject vpshlw 2 895b3625
+reject vrcp14sd 6 b1bb2b06
+reject vrcp14ss 6 c37c650c
+reject vrcp28sd 6 779c23b9
+reject vrcp28ss 6 89eff92a
+reject vrcpbf16 3 60d55d56
+reject vrcpss 2 2376922f
+reject vreducebf16 3 37a16394
+reject vreducesh 6 fde4087b
+reject vrndscalebf16 4 f9e19781
+reject vrndscalesh 6 fe41826c
+reject vrsqrt14sd 6 e5167857
+reject vrsqrt14ss 6 8495d378
+reject vrsqrt28sd 6 def70c72
+reject vrsqrt28ss 6 26140717
+reject vrsqrtbf16 5 88a1033f
+reject vrsqrtss 3 b44d775c
+reject vscalefbf16 2 daeb4732
+reject vsha512msg1 3 668c799f
+reject vsha512msg2 3 a9a45ec4
+reject vsha512rnds2 1 0d21524b
+reject vsm3msg1 3 b70a1ee7
+reject vsm3msg2 2 adf9238e
+reject vsm3rnds2 4 b773a8cb
+reject vsqrtbf16 3 b40b549d
+reject vsubbf16 2 b6cd3654
+reject vucomxsd 6 5000c4c6
+reject vucomxsh 6 c127374d
+reject vucomxss 6 1a6fac53
+reject word 1 98c1eb4e
+reject xacquire 1 77685d3b
+reject xrelease 1 93a242a3
