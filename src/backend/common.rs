@@ -3041,12 +3041,16 @@ impl PtrDirective {
 /// write those relocations at load time; keeping them in `.rodata` makes GNU ld
 /// create DT_TEXTREL and can fail hardened builds.  `.data.rel.ro` is writable
 /// during relocation and becomes read-only under RELRO.
+///
+/// `referenced` holds the symbols the module's code and initializers name
+/// (`generation::collect_referenced_symbols`); see `emit_globals`.
 pub fn emit_data_sections(
     out: &mut AsmOutput,
     module: &IrModule,
     ptr_dir: PtrDirective,
     pic_mode: bool,
     optimize_size: bool,
+    referenced: &crate::common::fx_hash::FxHashSet<String>,
 ) {
     // String literals in .rodata
     if !module.string_literals.is_empty()
@@ -3079,7 +3083,14 @@ pub fn emit_data_sections(
 
     // Global variables
     let alignment = DataAlignment::new(module, ptr_dir, optimize_size);
-    emit_globals(out, &module.globals, ptr_dir, pic_mode, &alignment);
+    emit_globals(
+        out,
+        &module.globals,
+        ptr_dir,
+        pic_mode,
+        &alignment,
+        referenced,
+    );
 }
 
 /// Emit a zero-initialized global variable (used in .bss, .tbss, and custom section zero-init).
@@ -3225,6 +3236,7 @@ fn emit_globals(
     ptr_dir: PtrDirective,
     pic_mode: bool,
     alignment: &DataAlignment,
+    referenced: &crate::common::fx_hash::FxHashSet<String>,
 ) {
     // Phase 1: classify every global into its target section.
     let classified: Vec<GlobalSection> = globals
@@ -3236,8 +3248,17 @@ fn emit_globals(
 
     // Extern visibility directives (needed for PIC code so the assembler/linker knows
     // these symbols are resolved within the link unit).
+    //
+    // Only for a declaration this object refers to. A directive makes the
+    // symbol: GNU as writes every symbol a directive names into the symbol
+    // table, so `.hidden tv` and `.type tv, @tls_object` for a declaration
+    // whose every use was optimised away left an undefined hidden symbol in
+    // the object, and the link failed on it ("hidden symbol `tv' isn't
+    // defined"). GCC and Clang write nothing for such a declaration. (The
+    // integrated assembler drops a symbol that is only mentioned, which is
+    // why the stray directives went unnoticed.)
     for (g, sect) in globals.iter().zip(&classified) {
-        if matches!(sect, GlobalSection::Extern) {
+        if matches!(sect, GlobalSection::Extern) && referenced.contains(&g.name) {
             emit_visibility_directive(out, &g.name, &g.visibility);
             // For extern TLS variables, emit .type @tls_object so the assembler
             // creates a TLS-typed undefined symbol. Without this, the linker
@@ -5352,6 +5373,84 @@ mod slot_operand_split_tests {
         let mut o = out(false, 0, None);
         o.emit_instr_rbp_reg("    leaq", -24, "rax");
         assert_eq!(o.buf.trim_end(), "    leaq -24(%rbp), %rax");
+    }
+}
+
+#[cfg(test)]
+mod extern_directive_tests {
+    use super::{AsmOutput, PtrDirective, emit_data_sections};
+    use crate::common::fx_hash::FxHashSet;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{GlobalInit, IrGlobal, IrModule};
+
+    fn declaration(name: &str, visibility: Option<&str>, thread_local: bool) -> IrGlobal {
+        IrGlobal {
+            name: name.into(),
+            ty: IrType::I32,
+            size: 4,
+            align: 4,
+            init: GlobalInit::Zero,
+            is_static: false,
+            is_extern: true,
+            is_common: false,
+            section: None,
+            is_weak: false,
+            visibility: visibility.map(str::to_string),
+            has_explicit_align: false,
+            is_const: false,
+            is_used: false,
+            is_retain: false,
+            is_nocommon: false,
+            is_thread_local: thread_local,
+        }
+    }
+
+    fn data_sections(module: &IrModule, referenced: &[&str]) -> String {
+        let referenced: FxHashSet<String> = referenced.iter().map(|s| s.to_string()).collect();
+        let mut out = AsmOutput::new();
+        emit_data_sections(
+            &mut out,
+            module,
+            PtrDirective::Quad,
+            true,
+            false,
+            &referenced,
+        );
+        out.buf
+    }
+
+    /// `extern __thread int tv __attribute__((visibility("hidden")));` with
+    /// every use optimised away: GCC 16 and Clang 23 write nothing for it.
+    /// `.hidden tv` and `.type tv, @tls_object` make GNU as write an
+    /// undefined hidden TLS symbol, and GNU ld refuse the link ("hidden
+    /// symbol `tv' isn't defined").
+    #[test]
+    fn a_declaration_nothing_refers_to_gets_no_directive() {
+        let mut module = IrModule::new();
+        module.globals.push(declaration("tv", Some("hidden"), true));
+        module
+            .globals
+            .push(declaration("pv", Some("protected"), false));
+        let asm = data_sections(&module, &[]);
+        assert!(!asm.contains("tv") && !asm.contains("pv"), "{asm}");
+    }
+
+    /// The one that is referred to keeps both: the visibility the access
+    /// was compiled for, and the type without which the linker reports
+    /// "TLS definition mismatches non-TLS reference".
+    #[test]
+    fn a_referenced_declaration_keeps_its_directives() {
+        let mut module = IrModule::new();
+        module.globals.push(declaration("tv", Some("hidden"), true));
+        module
+            .globals
+            .push(declaration("pv", Some("protected"), false));
+        module.globals.push(declaration("dv", None, true));
+        let asm = data_sections(&module, &["tv", "dv"]);
+        assert!(asm.contains(".hidden tv"), "{asm}");
+        assert!(asm.contains(".type tv, @tls_object"), "{asm}");
+        assert!(asm.contains(".type dv, @tls_object"), "{asm}");
+        assert!(!asm.contains("pv"), "{asm}");
     }
 }
 

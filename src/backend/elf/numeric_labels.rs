@@ -49,7 +49,13 @@ pub fn parse_numeric_ref(name: &str) -> Option<(&str, bool)> {
 ///
 /// This function renames each definition to a unique `.Lnum_N_K` name and
 /// updates all references accordingly. Used by both x86 and i686 ELF writers.
-pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
+///
+/// A source without numeric labels -- everything a compiler writes -- is
+/// handed back as it came, not copied. The definitions of one number are
+/// kept in source order and searched by bisection: a kernel file defines
+/// `1:` or `771:` thousands of times, and a scan per reference made the
+/// pass quadratic (8000 ALTERNATIVEs: 60 % of the whole assembly).
+pub fn resolve_numeric_labels(items: &[AsmItem]) -> std::borrow::Cow<'_, [AsmItem]> {
     // First pass: find all numeric label definitions and assign unique names.
     let mut defs: FxHashMap<String, Vec<(usize, String)>> = FxHashMap::default();
     let mut unique_counter: FxHashMap<String, usize> = FxHashMap::default();
@@ -66,20 +72,21 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
     }
 
     if defs.is_empty() {
-        return items.to_vec();
+        return std::borrow::Cow::Borrowed(items);
     }
 
     let mut result = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
         match item {
             AsmItem::Label(name) if is_numeric_label(name) => {
-                if let Some(def_list) = defs.get(name) {
-                    if let Some((_, unique_name)) = def_list.iter().find(|(idx, _)| *idx == i) {
-                        result.push(AsmItem::Label(unique_name.clone()));
-                        continue;
-                    }
+                let unique_name = defs.get(name).and_then(|def_list| {
+                    let k = def_list.binary_search_by_key(&i, |(idx, _)| *idx).ok()?;
+                    Some(&def_list[k].1)
+                });
+                match unique_name {
+                    Some(unique_name) => result.push(AsmItem::Label(unique_name.clone())),
+                    None => result.push(item.clone()),
                 }
-                result.push(item.clone());
             }
             AsmItem::Instruction(instr) => {
                 let new_ops: Vec<Operand> = instr
@@ -142,7 +149,7 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
         }
     }
 
-    result
+    std::borrow::Cow::Owned(result)
 }
 
 /// Resolve numeric label references in a single operand.
@@ -301,18 +308,17 @@ pub fn resolve_numeric_name(
     let (num, is_forward) = parse_numeric_ref(name)?;
     let def_list = defs.get(num)?;
 
-    if is_forward {
-        def_list
-            .iter()
-            .find(|(idx, _)| *idx > current_idx)
-            .map(|(_, name)| name.clone())
+    // The definitions are in source order: the next one behind the
+    // reference, or the last one in front of it.
+    let found = if is_forward {
+        def_list.get(def_list.partition_point(|(idx, _)| *idx <= current_idx))
     } else {
         def_list
-            .iter()
-            .rev()
-            .find(|(idx, _)| *idx < current_idx)
-            .map(|(_, name)| name.clone())
-    }
+            .partition_point(|(idx, _)| *idx < current_idx)
+            .checked_sub(1)
+            .and_then(|k| def_list.get(k))
+    };
+    found.map(|(_, name)| name.clone())
 }
 
 /// Resolve numeric label references in a displacement.

@@ -192,79 +192,27 @@ impl super::InstructionEncoder {
         self.encode_x87_mem(ops, opcode, ext)
     }
 
+    // The compares that set the flags: `fcomi %st(2)`, `fcomi %st(2), %st`.
+    // The second operand names the top of the stack and nothing else
+    // (`fcomi %st(2), %st(2)` and `fcomip %st(2), %cx` were assembled as
+    // if it were not there).
+
     pub(crate) fn encode_fcomip(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 || ops.len() == 1 {
-            // fcomip %st(N), %st
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDF, 0xF0 + n]);
-                    Ok(())
-                }
-                _ => Err("fcomip requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDF, 0xF1]);
-            Ok(())
-        } else {
-            Err("fcomip requires 0-2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xDF, 0xF0, Some(1), "fcomip")
     }
 
     pub(crate) fn encode_fucomi(&mut self, ops: &[Operand]) -> Result<(), String> {
-        // fucomi %st(i), %st -> DB E8+i (0 or 2 operands; 1-operand also accepted)
-        if ops.len() == 2 || ops.len() == 1 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDB, 0xE8 + n]);
-                    Ok(())
-                }
-                _ => Err("fucomi requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDB, 0xE9]); // default st(1)
-            Ok(())
-        } else {
-            Err("fucomi requires 0-2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xDB, 0xE8, Some(1), "fucomi")
     }
 
     /// Encode fcomi/fucomi (compare, no pop): fcomi = DB F0+i, fucomi = DB E8+i.
     pub(crate) fn encode_fcomi(&mut self, ops: &[Operand], base: u8) -> Result<(), String> {
-        if ops.len() == 2 || ops.len() == 1 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDB, base + n]);
-                    Ok(())
-                }
-                _ => Err("fcomi requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDB, base + 1]);
-            Ok(())
-        } else {
-            Err("fcomi requires 0-2 operands".to_string())
-        }
+        let name = if base == 0xF0 { "fcomi" } else { "fucomi" };
+        self.encode_x87_st0_sti(ops, 0xDB, base, Some(1), name)
     }
 
     pub(crate) fn encode_fucomip(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 || ops.len() == 1 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDF, 0xE8 + n]);
-                    Ok(())
-                }
-                _ => Err("fucomip requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDF, 0xE9]);
-            Ok(())
-        } else {
-            Err("fucomip requires 0-2 operands".to_string())
-        }
+        self.encode_x87_st0_sti(ops, 0xDF, 0xE8, Some(1), "fucomip")
     }
 
     pub(crate) fn encode_fld_st(&mut self, ops: &[Operand]) -> Result<(), String> {
@@ -358,6 +306,21 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// The second operand of a two-operand x87 compare is `%st`, the top of
+    /// the stack it compares with (`fcom %st(1), %st(2)` and `fcom (%rax),
+    /// %st(2)` were assembled as if it were not there).
+    fn second_is_st(ops: &[Operand], name: &str) -> Result<(), String> {
+        match ops {
+            [Operand::Register(_), Operand::Register(second)]
+                if parse_st_num(&second.name) == Ok(0) =>
+            {
+                Ok(())
+            }
+            [_, _] => Err(format!("`{name}' requires %st as its second operand")),
+            _ => Ok(()),
+        }
+    }
+
     /// Encode fcom (compare real, no pop).  Handles the register forms emitted
     /// by GCC/clang-style inline assembly: no operand defaults to ST(1), one
     /// operand is ST(i), and two-operand AT&T syntax uses the first operand as
@@ -368,6 +331,7 @@ impl super::InstructionEncoder {
             return Ok(());
         }
         if ops.len() == 1 || ops.len() == 2 {
+            Self::second_is_st(ops, "fcom")?;
             match &ops[0] {
                 Operand::Register(reg) => {
                     let n = parse_st_num(&reg.name)?;
@@ -415,6 +379,7 @@ impl super::InstructionEncoder {
             return Ok(());
         }
         if ops.len() == 1 || ops.len() == 2 {
+            Self::second_is_st(ops, "fcomp")?;
             match &ops[0] {
                 Operand::Register(reg) => {
                     let n = parse_st_num(&reg.name)?;
@@ -539,36 +504,52 @@ impl super::InstructionEncoder {
 
     // ---- Segment register moves ----
 
+    /// `mov` between a segment register and a general register or memory.
+    ///
+    /// `size` is the mnemonic's suffix in bytes, if it has one. GNU as 2.47,
+    /// byte-probed: `mov %ds,%ax` = `66 8c d8`, `mov %ds,%eax` = `8c d8`,
+    /// `mov %ds,%rax` = `8c d8` (the store zero-extends: never `REX.W`),
+    /// `mov %ax,%ds` = `mov %eax,%ds` = `8e d8` (the load reads 16 bits
+    /// whatever the register is called: never `66`), `movw %ss,(%rax)` =
+    /// `8c 10` (memory is 16 bits: no prefix, and no suffix but `w`).
+    ///
+    /// The other operand has to be what the instruction takes -- a general
+    /// register of 16, 32 or 64 bits, of the suffix's width if there is
+    /// one -- or memory. Anything else used to be encoded by its register
+    /// number: `mov %ds,%xmm0` as `mov %ds,%eax`, `mov %ds,%es` likewise,
+    /// and `mov %ds,%al`, taken for a byte move, as `mov %bl,%al`.
     pub(crate) fn encode_mov_seg(
         &mut self,
         ops: &[Operand],
         size: Option<u8>,
     ) -> Result<(), String> {
-        if ops.len() != 2 {
+        let [first, second] = ops else {
             return Err("mov seg requires 2 operands".to_string());
-        }
-        // Operand size for the GP side: the mnemonic suffix when present,
-        // otherwise the register's own width (GAS 2.47 byte-probed:
-        // `mov %ds,%ax` = 66 8c d8, `mov %ds,%eax` = 8c d8, `movw %ds,%di`
-        // = 66 8c df). A 16-bit operation needs the 0x66 prefix in 64-bit
-        // mode. REX.W is NEVER set: Sreg→GP is architecturally a 16-bit
-        // move that zero-extends (`mov %ds,%rax` = 8c d8, no W — probed),
-        // and the memory forms never take 0x66 either (`movw %ss,(%rax)`
-        // = 8c 10; an `l' suffix is rejected outright).
-        let infer = |gp: &str| -> u8 {
-            match size {
-                Some(s) => s,
-                None => infer_reg_size(gp),
+        };
+        let mismatch = || "operand type mismatch for `mov'".to_string();
+        // The width of the general register beside the segment register.
+        let general = |reg: &Register| -> Result<u8, String> {
+            match reg_class(&reg.name) {
+                RegClass::Gp(width @ (2 | 4 | 8)) if size.is_none_or(|s| s == width) => Ok(width),
+                RegClass::Gp(2 | 4 | 8) => Err(format!(
+                    "incorrect register `%{}' used with `{}' suffix",
+                    reg.name,
+                    match size {
+                        Some(2) => 'w',
+                        Some(4) => 'l',
+                        _ => 'q',
+                    }
+                )),
+                _ => Err(mismatch()),
             }
         };
-        match (&ops[0], &ops[1]) {
-            // mov %seg, %reg
+        let segment = |reg: &Register| reg_num(&reg.name).ok_or("bad seg register");
+        match (first, second) {
+            // 8C /r: MOV r/m16, Sreg.
             (Operand::Register(src), Operand::Register(dst)) if is_segment_reg(&src.name) => {
-                let src_num = reg_num(&src.name).ok_or("bad seg register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                // 8C /r - MOV r/m16, Sreg
-                let sz = infer(&dst.name);
-                if sz == 2 {
+                let width = general(dst)?;
+                let (src_num, dst_num) = (segment(src)?, reg_num(&dst.name).ok_or("bad register")?);
+                if width == 2 {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_unary(4, &dst.name);
@@ -576,39 +557,35 @@ impl super::InstructionEncoder {
                 self.bytes.push(self.modrm(3, src_num, dst_num));
                 Ok(())
             }
-            // mov %reg, %seg
+            // 8E /r: MOV Sreg, r/m16. `REX` still names the register
+            // (`mov %r8d,%ds` = `41 8e d8`).
             (Operand::Register(src), Operand::Register(dst)) if is_segment_reg(&dst.name) => {
-                let src_num = reg_num(&src.name).ok_or("bad register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad seg register")?;
-                // 8E /r - MOV Sreg, r/m16.  The SOURCE operand size is
-                // architecturally fixed at 16 bits: GAS 2.47 never emits
-                // 0x66 here (`mov %ax,%ds' = 8e d8, `movw %ax,%ds' =
-                // 8e d8, `mov %eax,%ds' = 8e d8) — a 0x66 would be a
-                // redundant lengthening.  REX still tracks the r/m-side
-                // GP register (`mov %r8d,%ds' = 41 8e d8), never REX.W.
-                let _ = infer(&src.name);
+                general(src)?;
+                let (src_num, dst_num) = (reg_num(&src.name).ok_or("bad register")?, segment(dst)?);
                 self.emit_rex_unary(4, &src.name);
                 self.bytes.push(0x8E);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
             }
-            // mov %seg, mem
             (Operand::Register(src), Operand::Memory(mem)) if is_segment_reg(&src.name) => {
-                let src_num = reg_num(&src.name).ok_or("bad seg register")?;
-                // 8C /r - MOV r/m16, Sreg (store segment to memory)
+                if size.is_some_and(|s| s != 2) {
+                    return Err(mismatch());
+                }
+                let src_num = segment(src)?;
                 self.emit_rex_rm(0, "", mem);
                 self.bytes.push(0x8C);
                 self.encode_modrm_mem(src_num, mem)
             }
-            // mov mem, %seg
             (Operand::Memory(mem), Operand::Register(dst)) if is_segment_reg(&dst.name) => {
-                let dst_num = reg_num(&dst.name).ok_or("bad seg register")?;
-                // 8E /r - MOV Sreg, r/m16 (load segment from memory)
+                if size.is_some_and(|s| s != 2) {
+                    return Err(mismatch());
+                }
+                let dst_num = segment(dst)?;
                 self.emit_rex_rm(0, "", mem);
                 self.bytes.push(0x8E);
                 self.encode_modrm_mem(dst_num, mem)
             }
-            _ => Err("unsupported mov seg operands".to_string()),
+            _ => Err(mismatch()),
         }
     }
 

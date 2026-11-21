@@ -23,6 +23,18 @@ fn infer_movext_dst_size(ops: &[Operand]) -> Result<u8, String> {
     }
 }
 
+/// Whether `target`, the operand of a near branch written without `*`, is
+/// an indirect target all the same: a register, or memory addressed through
+/// one (`jmp %rax`, `call 8(%rdx)`, `jmp sym(%rip)`). An address without a
+/// register is where a direct branch goes.
+pub(crate) fn is_star_less_target(target: &Operand) -> bool {
+    match target {
+        Operand::Register(_) => true,
+        Operand::Memory(mem) => mem.base.is_some() || mem.index.is_some(),
+        _ => false,
+    }
+}
+
 impl super::InstructionEncoder {
     // ---- Instruction-specific encoders ----
 
@@ -378,17 +390,20 @@ impl super::InstructionEncoder {
                 } else {
                     0
                 };
-                if size >= 4 {
-                    // movq uses R_X86_64_32S because the 32-bit immediate is sign-extended
-                    // to 64 bits; movl uses R_X86_64_32 (unsigned, no sign extension).
-                    let reloc_type = if size == 8 { R_X86_64_32S } else { R_X86_64_32 };
-                    self.add_relocation(sym, reloc_type, addend);
-                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-                } else {
-                    return Err(
-                        "symbol immediate only supported for 32/64-bit mov to memory".to_string(),
-                    );
-                }
+                // The field is as wide as the operation, and so is its
+                // relocation: movq uses R_X86_64_32S because the 32-bit
+                // immediate is sign-extended to 64 bits, movl R_X86_64_32
+                // (unsigned), and `movw $sym, (%rdi)` / `movb $sym, (%rdi)`
+                // are `66 c7 07 iw` + R_X86_64_16 and `c6 07 ib` +
+                // R_X86_64_8 (GAS 2.47; they used to be refused).
+                let (class, width) = match size {
+                    8 => (R_X86_64_32S, 4),
+                    4 => (R_X86_64_32, 4),
+                    2 => (R_X86_64_16, 2),
+                    _ => (R_X86_64_8, 1),
+                };
+                self.add_relocation(sym, class, addend);
+                self.bytes.extend_from_slice(&[0u8; 4][..width]);
             }
             _ => return Err("unsupported immediate for mov to memory".to_string()),
         }
@@ -1216,7 +1231,14 @@ impl super::InstructionEncoder {
                     _ => {
                         self.bytes.push(0x81);
                         self.bytes.push(self.modrm(3, alu_op, dst_num));
-                        self.add_relocation(sym, R_X86_64_32S, addend);
+                        // The zero-extending class for a 32-bit operation,
+                        // the sign-extending one for a 64-bit one, as in
+                        // the accumulator and memory forms above (`and
+                        // $sym, %r9d` is `R_X86_64_32`: with `32S` a symbol
+                        // in the upper half of the 32-bit range, which the
+                        // instruction takes, fails to link).
+                        let class = if size == 4 { R_X86_64_32 } else { R_X86_64_32S };
+                        self.add_relocation(sym, class, addend);
                         self.bytes.extend_from_slice(&[0; 4]);
                     }
                 }
@@ -2528,13 +2550,17 @@ impl super::InstructionEncoder {
                     .and_then(cc_from_mnemonic)
             })?;
             return match &ops[0] {
-                Operand::Register(reg) => {
+                Operand::Register(reg) if is_reg8(&reg.name) => {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
                     self.emit_apx_evex_rr_nd1_pp(false, "", &reg.name, false, 3)?;
                     self.bytes.push(0x40 + cc);
                     self.bytes.push(self.modrm(3, 0, num));
                     Ok(())
                 }
+                // The spelling with `zu` names the byte register (`setzua
+                // %ecx` was assembled as `setzua %cl`; the wide spelling
+                // is `seta %ecx`).
+                Operand::Register(_) => Err(format!("operand size mismatch for `{mnemonic}'")),
                 // ZU zeros the unused upper bits of a GPR. Memory has no
                 // upper bits to clear, and GAS 2.47 rejects `setzu* (%reg)`.
                 _ => Err("setzu requires a register operand".to_string()),
@@ -2567,9 +2593,11 @@ impl super::InstructionEncoder {
                     4 | 8 => {
                         let w = infer_reg_size(&reg.name) == 8;
                         let num = reg_num(&reg.name).ok_or("bad register")?;
-                        // NDD form: P2.ND=1, vvvv=dest, ModRM.reg=0
-                        // (`setae %eax` = 62 f4 7f 18 43 c0, GAS-probed).
-                        self.emit_apx_evex_rr_pp(w, "", &reg.name, Some(&reg.name), false, 3)?;
+                        // ND=1 with `vvvv` unused, so all ones: `setae
+                        // %eax` = 62 f4 7f 18 43 c0, `seta %ecx` = 62 f4
+                        // 7f 18 47 c1. (Naming the destination there too
+                        // gave `77` for `%ecx`: right only for register 0.)
+                        self.emit_apx_evex_rr_nd1_pp(w, "", &reg.name, false, 3)?;
                         self.bytes.push(0x40 + cc);
                         self.bytes.push(self.modrm(3, 0, num));
                         return Ok(());
@@ -2724,13 +2752,85 @@ impl super::InstructionEncoder {
         }
     }
 
-    pub(crate) fn encode_jmp(&mut self, ops: &[Operand]) -> Result<(), String> {
+    /// The target of an indirect near branch, `FF /digit`: `jmp *T` and
+    /// `call *T`, `name` without the size suffix `mnemonic` may have.
+    ///
+    /// `T` is a 64-bit register, a 16-bit one under the operand-size prefix
+    /// (`jmp *%ax` = `66 ff e0`; without the prefix the same bytes are `jmp
+    /// *%rax`), or memory, which `w` makes a 16-bit target. A bare symbol
+    /// is the memory at that address (`jmp *table` = `ff 24 25` and
+    /// `R_X86_64_32S`), which used to be refused.
+    ///
+    /// Nothing else is a target. `jmp *%eax` used to be written as `jmp
+    /// *%rax` -- 32-bit operand size does not exist for a near branch in
+    /// long mode, and GNU as refuses the statement.
+    fn encode_indirect_branch(
+        &mut self,
+        target: &Operand,
+        digit: u8,
+        mnemonic: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let suffix = mnemonic.strip_prefix(name).unwrap_or_default();
+        let mismatch = || format!("operand type mismatch for `{name}'");
+        match target {
+            Operand::Register(reg) => {
+                let width = match reg_class(&reg.name) {
+                    RegClass::Gp(width @ (2 | 8)) => width,
+                    _ => return Err(mismatch()),
+                };
+                if (suffix == "q" && width != 8) || (suffix == "w" && width != 2) {
+                    return Err(format!(
+                        "incorrect register `%{}' used with `{suffix}' suffix",
+                        reg.name
+                    ));
+                }
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                if width == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_unary(4, &reg.name);
+                self.bytes.push(0xFF);
+                self.bytes.push(self.modrm(3, digit, num));
+                Ok(())
+            }
+            Operand::Memory(_) | Operand::Label(_) => {
+                let mut pointer = target.clone();
+                normalize_bare_label(&mut pointer);
+                let Operand::Memory(mem) = &pointer else {
+                    return Err(mismatch());
+                };
+                if suffix == "w" {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_rm(0, "", mem);
+                self.bytes.push(0xFF);
+                self.encode_modrm_mem(digit, mem)
+            }
+            _ => Err(mismatch()),
+        }
+    }
+
+    /// A direct near branch has no 16-bit form in long mode that a
+    /// processor reads the way it is written (see `encode_jmp`), so the
+    /// `w` spelling is for indirect targets only.
+    fn refuse_word_branch(mnemonic: &str, name: &str) -> Result<(), String> {
+        if mnemonic.strip_prefix(name) == Some("w") {
+            return Err(format!(
+                "`{mnemonic}' with a direct target is not supported in 64-bit mode"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn encode_jmp(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("jmp requires 1 operand".to_string());
         }
 
         match &ops[0] {
             Operand::Label(label) => {
+                Self::refuse_word_branch(mnemonic, "jmp")?;
                 // Near jump with 32-bit displacement (will be resolved by linker/relocator)
                 // Always use R_X86_64_PLT32 for branch targets, matching modern GCC/binutils.
                 // R_X86_64_PC32 is rejected by ld for PIE executables calling shared lib functions.
@@ -2763,27 +2863,13 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())
             }
-            Operand::Indirect(inner) => match inner.as_ref() {
-                Operand::Register(reg) => {
-                    let num = reg_num(&reg.name).ok_or("bad register")?;
-                    // 16-bit targets take the operand-size prefix (`call
-                    // *%ax` = 66 ff d0; without it the same bytes decode as
-                    // the 64-bit `call *%rax` — GAS 2.47 byte-verified).
-                    if is_reg16(&reg.name) {
-                        self.bytes.push(0x66);
-                    }
-                    self.emit_rex_unary(4, &reg.name);
-                    self.bytes.push(0xFF);
-                    self.bytes.push(self.modrm(3, 4, num));
-                    Ok(())
-                }
-                Operand::Memory(mem) => {
-                    self.emit_rex_rm(0, "", mem);
-                    self.bytes.push(0xFF);
-                    self.encode_modrm_mem(4, mem)
-                }
-                _ => Err("unsupported indirect jmp target".to_string()),
-            },
+            Operand::Indirect(inner) => self.encode_indirect_branch(inner, 4, mnemonic, "jmp"),
+            // An indirect target without its `*`: GNU as takes it (and
+            // warns). A bare symbol is the direct target above, and so
+            // would a bare number be.
+            target if is_star_less_target(target) => {
+                self.encode_indirect_branch(target, 4, mnemonic, "jmp")
+            }
             _ => Err("unsupported jmp operand".to_string()),
         }
     }
@@ -2822,13 +2908,14 @@ impl super::InstructionEncoder {
         }
     }
 
-    pub(crate) fn encode_call(&mut self, ops: &[Operand]) -> Result<(), String> {
+    pub(crate) fn encode_call(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("call requires 1 operand".to_string());
         }
 
         match &ops[0] {
             Operand::Label(label) => {
+                Self::refuse_word_branch(mnemonic, "call")?;
                 // Use PLT32 for external function calls (linker will resolve)
                 let sym = strip_plt_suffix(label);
                 if self.explicit_data16 && sym.len() != label.len() {
@@ -2864,20 +2951,6 @@ impl super::InstructionEncoder {
             }
             Operand::Indirect(inner) => {
                 match inner.as_ref() {
-                    Operand::Register(reg) => {
-                        let num = reg_num(&reg.name).ok_or("bad register")?;
-                        // 16-bit targets take the operand-size prefix
-                        // (`jmp *%ax` = 66 ff e0; without it the same
-                        // bytes decode as the 64-bit `jmp *%rax` —
-                        // GAS 2.47 byte-verified).
-                        if is_reg16(&reg.name) {
-                            self.bytes.push(0x66);
-                        }
-                        self.emit_rex_unary(4, &reg.name);
-                        self.bytes.push(0xFF);
-                        self.bytes.push(self.modrm(3, 2, num));
-                        Ok(())
-                    }
                     Operand::Memory(mem) => {
                         // `call *sym@tlscall(%reg)`: the @tlscall marker is
                         // NOT a displacement — GAS emits the plain
@@ -2915,13 +2988,14 @@ impl super::InstructionEncoder {
                             self.bytes.push(0xFF);
                             return self.encode_modrm_mem(2, &zero_mem);
                         }
-                        // call *disp(%base) - FF /2 with memory operand
-                        self.emit_rex_rm(0, "", mem);
-                        self.bytes.push(0xFF);
-                        self.encode_modrm_mem(2, mem)
+                        self.encode_indirect_branch(inner, 2, mnemonic, "call")
                     }
-                    _ => Err("unsupported indirect call target".to_string()),
+                    target => self.encode_indirect_branch(target, 2, mnemonic, "call"),
                 }
+            }
+            // An indirect target without its `*` (see `encode_jmp`).
+            target if is_star_less_target(target) => {
+                self.encode_indirect_branch(target, 2, mnemonic, "call")
             }
             _ => Err("unsupported call operand".to_string()),
         }

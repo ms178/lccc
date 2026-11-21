@@ -392,8 +392,13 @@ pub(super) fn sink_copies_into_fallthrough(store: &mut LineStore, infos: &mut [L
         }
         replace_line(store, &mut infos[j], j, copy);
         changed = true;
-        // Liveness is stale after the rotation; rebuild on the next query.
-        liveness = None;
+        // Liveness is stale after the rotation, in this function only (the
+        // span lies in one: `same_function` above): re-solve it alone.
+        // Dropping the whole solution made the next query rebuild every
+        // function of the file -- once per rotation.
+        if let Some(lv) = liveness.as_mut() {
+            lv.refresh_at(store, infos, j);
+        }
         j += 1;
     }
     changed

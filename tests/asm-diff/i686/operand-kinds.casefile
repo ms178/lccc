@@ -1,0 +1,315 @@
+# What an encoding takes, in 32-bit and 16-bit code: a register of a kind, a
+# width or a number the instruction has no field for is refused (each `reject`
+# group below was assembled), and the statement beside it that GNU as
+# assembles is assembled to the same bytes.
+#
+# The two 16-bit groups are the statements whose width 16-bit code has the
+# other way round, or `.code16gcc` keeps at 32 bits: `cbw` was `cwde` there,
+# `pushaw` was `pushal`, `nop %ax` had the prefix of `nop %eax`, `jmpl
+# *(%bx)` was `jmp *(%bx)`, `lea sym, %ax` had a four-byte address and no
+# prefix for it, and under `.code16gcc` a bare `leave`, `lret`, `pushf` or
+# `pusha` was 16 bits wide.
+
+;;; operand_kinds_taken
+	.text
+	seta %cl
+	movsb %cl, %cx
+	movzw %cx, %ecx
+	movsw %cx, %ecx
+	movzb %cl, %ecx
+	tpause %ecx
+	umwait %ebx
+	bswap %ecx
+	lea (%edx), %cx
+	nop %ax
+	nop %ecx
+	rdpid %ecx
+	movnti %ecx, (%edx)
+	movntq %mm3, (%edx)
+	movntdq %xmm3, (%edx)
+	movhps (%edx), %xmm2
+	movlps %xmm1, (%edx)
+	movhlps %xmm1, %xmm2
+	fxch %st(2)
+	fxch
+	fcom %st(1)
+	fcomp %st(2)
+	fucom %st(2)
+	fucomp
+	fcomi %st(2), %st
+	vpshufb %ymm1, %ymm2, %ymm3
+	vpermd %ymm1, %ymm2, %ymm3
+	vpmovsxbw %xmm1, %ymm2
+	vcvtps2ph $5, %ymm1, %xmm2
+	vpsllw %xmm1, %ymm2, %ymm3
+	vmovaps %ymm1, (%edx)
+	tpause %ecx, %edx, %eax
+	umwait %ebx, %edx, %eax
+
+;;; widths_in_code16
+	.text
+	.code16
+	cbw
+	cwde
+	cwd
+	cdq
+	cbtw
+	cwtl
+	cwtd
+	cltd
+	pushaw
+	pushal
+	pusha
+	popaw
+	popal
+	popa
+	nop %ax
+	nop %eax
+	jmpl *(%bx)
+	jmp *(%bx)
+	jmpw *(%bx)
+	jmp *%eax
+	jmp *%ax
+	call *%eax
+	call *%ax
+	crc32 (%bx), %ebp
+	crc32w (%bx), %ebp
+	crc32l (%bx), %ebp
+	crc32b (%bx), %ebp
+	crc32 %cx, %ebp
+	crc32 %ecx, %ebp
+	crc32 %cl, %ebp
+	xlat
+	xlat %es:(%ebx)
+	xlat %es:(%bx)
+	bt %ax, %cx
+	bt %eax, %ecx
+	btw $1, (%bx)
+	btsw $1, (%bx)
+	btrw %ax, (%bx)
+	btcw $1, %cx
+	btl $1, (%bx)
+	lea ext, %ax
+	lea ext, %eax
+	pushw ext
+	popw ext
+	pushw $ext
+	pushl $ext
+	leave
+	leavew
+	leavel
+	lret
+	lretw
+	lretl
+	lret $4
+	pushf
+	pushfw
+	pushfl
+	popf
+	ret
+	retw
+	retl
+	ret $4
+	enter $8, $0
+	call ext
+	calll ext
+	callw ext
+	xbegin ext
+	push %eax
+	push %ax
+	push $5
+	push $0x12345678
+	push (%bx)
+	pop (%bx)
+	push %ds
+	.code32
+
+;;; widths_in_code16gcc
+	.text
+	.code16gcc
+	cbw
+	cwde
+	cwd
+	cdq
+	cbtw
+	cwtl
+	cwtd
+	cltd
+	pushaw
+	pushal
+	pusha
+	popaw
+	popal
+	popa
+	nop %ax
+	nop %eax
+	jmpl *(%bx)
+	jmp *(%bx)
+	jmpw *(%bx)
+	jmp *%eax
+	jmp *%ax
+	call *%eax
+	call *%ax
+	crc32 (%bx), %ebp
+	crc32w (%bx), %ebp
+	crc32l (%bx), %ebp
+	crc32b (%bx), %ebp
+	crc32 %cx, %ebp
+	crc32 %ecx, %ebp
+	crc32 %cl, %ebp
+	xlat
+	xlat %es:(%ebx)
+	xlat %es:(%bx)
+	bt %ax, %cx
+	bt %eax, %ecx
+	btw $1, (%bx)
+	btsw $1, (%bx)
+	btrw %ax, (%bx)
+	btcw $1, %cx
+	btl $1, (%bx)
+	lea ext, %ax
+	lea ext, %eax
+	pushw ext
+	popw ext
+	pushw $ext
+	pushl $ext
+	leave
+	leavew
+	leavel
+	lret
+	lretw
+	lretl
+	lret $4
+	pushf
+	pushfw
+	pushfl
+	popf
+	ret
+	retw
+	retl
+	ret $4
+	enter $8, $0
+	call ext
+	calll ext
+	callw ext
+	xbegin ext
+	push %eax
+	push %ax
+	push $5
+	push $0x12345678
+	push (%bx)
+	pop (%bx)
+	push %ds
+	.code32
+
+;;; reject_rdrand_xmm0 reject
+	.text
+	rdrand %xmm0
+
+;;; reject_adc_cl_mm3 reject
+	.text
+	adc %cl, %mm3
+
+;;; reject_addps_ecx_xmm1 reject
+	.text
+	addps %ecx, %xmm1
+
+;;; reject_seta_fs reject
+	.text
+	seta %fs
+
+;;; reject_seta_cx reject
+	.text
+	seta %cx
+
+;;; reject_bswap_cx reject
+	.text
+	bswap %cx
+
+;;; reject_bswap_cl reject
+	.text
+	bswap %cl
+
+;;; reject_lea_edx_cl reject
+	.text
+	lea (%edx), %cl
+
+;;; reject_movsw_cx_cx reject
+	.text
+	movsw %cx, %cx
+
+;;; reject_movzw_cx_cx reject
+	.text
+	movzw %cx, %cx
+
+;;; reject_nop_cl reject
+	.text
+	nop %cl
+
+;;; reject_rdpid_cx reject
+	.text
+	rdpid %cx
+
+;;; reject_tpause_ecx_ecx_eax reject
+	.text
+	tpause %ecx, %ecx, %eax
+
+;;; reject_tpause_ecx_edx_ecx reject
+	.text
+	tpause %ecx, %edx, %ecx
+
+;;; reject_umwait_ecx_ecx_eax reject
+	.text
+	umwait %ecx, %ecx, %eax
+
+;;; reject_movnti_cx_edx reject
+	.text
+	movnti %cx, (%edx)
+
+;;; reject_movntdq_mm3_edx reject
+	.text
+	movntdq %mm3, (%edx)
+
+;;; reject_movhps_xmm1_xmm2 reject
+	.text
+	movhps %xmm1, %xmm2
+
+;;; reject_movlpd_xmm1_xmm2 reject
+	.text
+	movlpd %xmm1, %xmm2
+
+;;; reject_fcom_st_1_st_2 reject
+	.text
+	fcom %st(1), %st(2)
+
+;;; reject_fucom_st_1_st_1 reject
+	.text
+	fucom %st(1), %st(1)
+
+;;; reject_fxch_st_2_st_3 reject
+	.text
+	fxch %st(2), %st(3)
+
+;;; reject_vpshufb_xmm1_ymm2_ymm3 reject
+	.text
+	vpshufb %xmm1, %ymm2, %ymm3
+
+;;; reject_vpermd_xmm1_xmm2_xmm3 reject
+	.text
+	vpermd %xmm1, %xmm2, %xmm3
+
+;;; reject_vpmovsxbw_ymm1_ymm2 reject
+	.text
+	vpmovsxbw %ymm1, %ymm2
+
+;;; reject_vdppd_5_ymm1_ymm2_ymm3 reject
+	.text
+	vdppd $5, %ymm1, %ymm2, %ymm3
+
+;;; reject_vcvtps2ph_5_xmm1_zmm3 reject
+	.text
+	vcvtps2ph $5, %xmm1, %zmm3
+
+;;; reject_tpause_eax_edx_ecx reject
+	.text
+	tpause %eax, %edx, %ecx

@@ -1,0 +1,161 @@
+;;; indirect_branch_segment_overrides
+	.text
+	jmp *%fs:(%rax)
+	jmp *%gs:(%rax)
+	jmp *%es:(%rax)
+	jmp *%cs:(%rax)
+	jmp *%ss:(%rax)
+	jmp *%ds:(%rax)
+	jmp *%ss:(%rbp)
+	jmp *%ds:(%rsp)
+	jmp *%gs:16
+	jmp *%fs:8(%rbx,%rcx,4)
+	jmp *%fs:(%eax)
+	jmp *%gs:(%r12,%r13,2)
+	jmp *%fs:sym(%rip)
+	jmpq *%gs:(%rax)
+	call *%fs:(%rax)
+	call *%gs:0x10
+	call *%gs:(%rax)
+	call *%fs:8(%rbx,%rcx,4)
+	call *%fs:(%eax)
+	call *%gs:sym(%rip)
+	callq *%gs:16
+	ljmp *%fs:(%rax)
+	lcall *%gs:4(%rbx)
+	lcallw *%fs:(%eax)
+	notrack jmp *%ds:(%rax)
+	notrack jmp *%ss:(%rbp)
+	fs jmp *%fs:(%rax)
+;;; indirect_branch_targets
+	.text
+	jmp *%rax
+	jmp *%r8
+	jmp *%ax
+	jmp *%r9w
+	jmpq *%rax
+	jmpw *%ax
+	jmp *(%rax)
+	jmp *(%eax)
+	jmpq *(%rax)
+	jmpw *(%rax)
+	jmpw *(%eax)
+	jmp *sym
+	jmp *sym+8
+	jmp *sym(%rip)
+	jmp *sym(,%rax,8)
+	jmp *0x1000
+	call *%rax
+	call *%r8
+	call *%ax
+	callq *%rax
+	callw *%ax
+	call *(%rax)
+	call *(%eax)
+	callq *(%rax)
+	callw *(%rax)
+	call *sym
+	call *sym+8
+	call *sym(%rip)
+	call *0x1000
+	notrack jmp *%rax
+	notrack call *(%rax)
+	notrack jmp *sym
+	notrack jmpw *%ax
+;;; reject_jmp_through_a_32_bit_register reject
+	.text
+	jmp *%eax
+;;; reject_jmp_through_a_byte_register reject
+	.text
+	jmp *%al
+;;; reject_call_through_a_32_bit_register reject
+	.text
+	call *%eax
+;;; reject_call_through_a_byte_register reject
+	.text
+	call *%al
+;;; reject_jmpq_through_a_word_register reject
+	.text
+	jmpq *%ax
+;;; reject_callq_through_a_word_register reject
+	.text
+	callq *%ax
+;;; reject_jmpq_through_a_32_bit_register reject
+	.text
+	jmpq *%eax
+;;; reject_jmp_through_a_vector_register reject
+	.text
+	jmp *%xmm0
+;;; reject_jmp_through_a_segment_register reject
+	.text
+	jmp *%fs
+;;; reject_notrack_with_a_segment_override reject
+	.text
+	notrack jmp *%fs:(%rax)
+;;; reject_notrack_call_with_a_segment_override reject
+	.text
+	notrack call *%gs:(%rax)
+;;; reject_notrack_on_a_direct_branch reject
+	.text
+	notrack jmp 1f
+1:
+;;; reject_notrack_on_a_direct_call reject
+	.text
+	notrack call sym
+;;; reject_notrack_on_a_far_jump reject
+	.text
+	notrack ljmp *(%rax)
+;;; reject_notrack_on_mov reject
+	.text
+	notrack mov (%rax), %eax
+;;; reject_notrack_on_ret reject
+	.text
+	notrack ret
+;;; reject_notrack_on_nop reject
+	.text
+	notrack nop
+;;; reject_notrack_twice reject
+	.text
+	notrack notrack jmp *%rax
+;;; reject_two_segment_prefix_words reject
+	.text
+	cs ds nop
+;;; reject_the_same_segment_prefix_word_twice reject
+	.text
+	fs fs nop
+;;; reject_notrack_and_a_segment_prefix_word reject
+	.text
+	gs notrack jmp *%rax
+;;; reject_es_prefix_word reject
+	.text
+	es nop
+;;; reject_ss_prefix_word reject
+	.text
+	ss mov (%rax), %eax
+;;; reject_ds_prefix_word_with_an_override reject
+	.text
+	ds mov %fs:(%rax), %eax
+;;; reject_gs_prefix_word_with_another_override reject
+	.text
+	gs jmp *%fs:(%rax)
+;;; reject_cs_prefix_word_with_an_override reject
+	.text
+	cs jmp *%fs:(%rax)
+;;; reject_ds_prefix_word_with_a_needed_ss_override reject
+	.text
+	ds mov %ss:(%rax), %eax
+;;; segment_prefix_words
+	.text
+	cs nop
+	ds nop
+	fs nop
+	gs nop
+	ds wrmsr
+	cs mov (%rax), %eax
+	fs mov (%rax), %eax
+	gs mov %gs:(%rax), %eax
+	cs mov %ds:(%rax), %eax
+	ds mov %ds:(%rbp), %eax
+	ds jmp *(%rax)
+	cs jmp *%rax
+	fs jmp *%fs:(%rax)

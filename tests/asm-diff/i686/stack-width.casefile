@@ -1,0 +1,112 @@
+;;; stack_width_code16
+	.text
+	.code16
+	push %ecx
+	push %cx
+	pop %ecx
+	pop %cx
+	pushl %ecx
+	pushw %cx
+	popl %ecx
+	popw %cx
+	push %ds
+	pop %ds
+	push %fs
+	pushw %fs
+	pushl %fs
+	pop %gs
+	popw %gs
+	popl %gs
+	push $1
+	push $0x1234
+	push $0x12345678
+	pushw $1
+	pushl $1
+	push $sym
+	pushw $sym
+	pushl $sym
+	push (%bx)
+	pushw (%bx)
+	pushl (%bx)
+	pop (%bx)
+	popw (%bx)
+	popl (%bx)
+	push (%eax)
+	pop (%eax)
+	.code32
+
+;;; stack_width_code16gcc
+	.text
+	.code16gcc
+	push %ecx
+	push %cx
+	pop %ecx
+	pop %cx
+	pushl %ecx
+	pushw %cx
+	popl %ecx
+	popw %cx
+	push %ds
+	pop %ds
+	push %fs
+	pushw %fs
+	pushl %fs
+	pop %gs
+	popw %gs
+	popl %gs
+	push $1
+	push $0x1234
+	push $0x12345678
+	pushw $1
+	pushl $1
+	pushw $sym
+	pushl $sym
+	push (%bx)
+	pushw (%bx)
+	pushl (%bx)
+	pop (%bx)
+	popw (%bx)
+	popl (%bx)
+	push (%eax)
+	pop (%eax)
+	push sym
+	pop sym
+	.code32
+
+;;; stack_width_code32
+	.text
+	.code32
+	push %ecx
+	push %cx
+	pop %ecx
+	pop %cx
+	pushl %ecx
+	pushw %cx
+	popl %ecx
+	popw %cx
+	push %ds
+	pop %ds
+	push %fs
+	pushw %fs
+	pushl %fs
+	pop %gs
+	popw %gs
+	popl %gs
+	push $1
+	push $0x1234
+	push $0x12345678
+	pushw $1
+	pushl $1
+	push $sym
+	pushl $sym
+	push (%bx)
+	pushw (%bx)
+	pushl (%bx)
+	pop (%bx)
+	popw (%bx)
+	popl (%bx)
+	push (%eax)
+	pop (%eax)
+	push sym
+	pop sym
+	.code32

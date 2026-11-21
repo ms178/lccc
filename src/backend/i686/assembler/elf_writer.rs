@@ -16,19 +16,6 @@ use crate::backend::x86::assembler::encoder::{
 };
 use crate::backend::x86::assembler::parser::*;
 
-/// A short-only branch ends in opcode and rel8, after any legacy prefixes.
-fn is_short_only_encoding(bytes: &[u8]) -> bool {
-    if bytes.len() < 2 || !matches!(bytes[bytes.len() - 2], 0xe2 | 0xe3) {
-        return false;
-    }
-    bytes[..bytes.len() - 2].iter().all(|b| {
-        matches!(
-            b,
-            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
-        )
-    })
-}
-
 /// i686 architecture implementation for the shared ELF writer.
 pub struct I686Arch;
 
@@ -49,11 +36,12 @@ impl X86Arch for I686Arch {
             // relaxes exactly like `jmp`.
             let mnem_lower = instr.mnemonic.to_ascii_lowercase();
             let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-            let is_jump =
-                mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
+            let is_jump = mnem == "jmp"
+                || mnem.starts_with("loop")
+                || (mnem.starts_with('j') && mnem.len() >= 2);
             if is_jump && instr.operands.len() == 1 {
                 if let Operand::Label(_) = &instr.operands[0] {
-                    let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
+                    let is_short_only = is_short_only_branch(mnem);
                     let is_conditional = mnem != "jmp";
                     if is_short_only && is_short_only_encoding(&encoder.bytes) {
                         // Short-only jumps have no long form; register as already relaxed
@@ -327,7 +315,10 @@ impl X86Arch for I686Arch {
 /// Builds a 32-bit ELF relocatable object file from parsed assembly items.
 pub type ElfWriter = ElfWriterCore<I686Arch>;
 
-fn code16_encode_inner(
+/// Encode one instruction of a `.code16` (or, with `gcc_mode`,
+/// `.code16gcc`) region, with `R_386_*` relocations: for this writer, and
+/// for the 64-bit one, which translates them.
+pub(crate) fn code16_encode_inner(
     instr: &Instruction,
     section_data_len: u64,
     gcc_mode: bool,
@@ -342,11 +333,11 @@ fn code16_encode_inner(
     let jump = {
         let mnem_lower = instr.mnemonic.to_ascii_lowercase();
         let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-        let is_jump = mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
+        let is_jump = mnem.starts_with("loop") || (mnem.starts_with('j') && mnem.len() >= 2);
         if is_jump && instr.operands.len() == 1 {
             if let Operand::Label(_) = &instr.operands[0] {
                 let is_conditional = mnem != "jmp";
-                let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
+                let is_short_only = is_short_only_branch(mnem);
                 // In 16-bit mode a near jump carries a 16-bit
                 // displacement, so the long forms are one byte shorter
                 // than in 32-bit mode.

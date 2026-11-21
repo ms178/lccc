@@ -1,0 +1,29 @@
+;;; indirect_branch_segment_overrides
+	.text
+	jmp *%fs:(%eax)
+	jmp *%gs:16
+	jmp *%es:(%ebp)
+	jmp *%ss:(%ebp)
+	jmp *%ds:(%eax)
+	jmp *%cs:(%eax)
+	jmpl *%fs:(%eax)
+	call *%gs:0x10
+	call *%gs:(%eax)
+	call *%fs:8(%ebx,%ecx,4)
+	call *%ss:(%ebp)
+	call *%ds:(%eax)
+	calll *%gs:16
+	callw *%gs:16
+	ljmp *%fs:(%eax)
+	ljmpw *%fs:(%eax)
+	lcall *%gs:4(%ebx)
+	lcallw *%fs:(%eax)
+;;; indirect_branch_segment_overrides_code16
+	.text
+	.code16
+	jmp *%fs:(%bx)
+	call *%gs:(%bx)
+	call *%es:16
+	ljmp *%fs:(%bx)
+	lcall *%fs:(%bx)
+	lcalll *%gs:(%bx)
