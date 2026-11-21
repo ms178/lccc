@@ -9180,6 +9180,14 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecSubI64x2
             | O::VecAddI8x16
             | O::VecSubI8x16
+            // VEX.256 SHA-512 chains (destructive: the first operand is the
+            // destination's tie, `vsha512msg1/msg2 ymm1` and `rnds2`'s CDGH).
+            // Each emitter copies its operands into ymm0/ymm1/xmm1/xmm2 and
+            // writes the result through `avx_store_dest`, so a pre-allocated
+            // home is exact for any operand placement.
+            | O::Sha512msg1256
+            | O::Sha512msg2256
+            | O::Sha512rnds2256
             | O::VecMinU8x16
             | O::VecAndNotI32x4
             | O::VecAvgU8x16
@@ -10621,6 +10629,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // I64x4 physical family) so the Copy-web can home them.  The
             // maddwd result feeds the class-5 dword accumulator add.
             O::VecMaddubsU8x32 | O::VecConstI8x32 => Some(8),
+            // VEX.256 SHA-512 (`vsha512msg1`/`msg2`/`rnds2`): their emitters
+            // read every operand through `avx_load_arg` and write the result
+            // through `avx_store_dest`, so a YMM home survives them (scratch
+            // is ymm0/ymm1 plus xmm1; rnds2's xmm2 is pool-withheld by
+            // `clobbers_xmm2`). Unclassified, every W/state word was homed on
+            // the stack.
+            O::Sha512msg1256 | O::Sha512msg2256 | O::Sha512rnds2256 => Some(8),
             O::VecMaddwdI16x16 => Some(5),
             // BB-SLP I64x4 copy/ALU chains: loads, sub/bitwise, splat.
             O::VecLoadI64x4
@@ -10811,6 +10826,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecAddI64x2
                     | O::VecSadbwU8x16
+                    // SHA-512 16-byte operands (`msg1`'s second operand and
+                    // `rnds2`'s W+K): read through `vex128_source`, which uses
+                    // the xmm home directly, scratch xmm1/xmm2 only.
+                    | O::Sha512msg1256
+                    | O::Sha512rnds2256
                     | O::VecMulI64x2
                     | O::VecHorizontalAddI64x2
                     // v12 Fix C: the SSE2 value-shaped widening steps
@@ -10849,6 +10869,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             8 => matches!(
                 op,
                 O::VecAddI64x4 | O::VecHorizontalAddI64x4 | O::VecSadbwU8x32
+                    | O::Sha512msg1256
+                    | O::Sha512msg2256
+                    | O::Sha512rnds2256
+                    // The 256-bit pointer stores consume a YMM home through
+                    // `avx_load_arg` (copy from the home into ymm0).
+                    | O::Storeu256
+                    | O::Store256
                     // AVX2 widening steps read+write the I64x4 accumulator;
                     // scratch is confined to ymm0/ymm1, so a YMM home
                     // (ymm2..ymm15) survives them.
@@ -10945,6 +10972,15 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // round-tripped 32 bytes through the
                                 // stack every iteration).
                                 | O::VecHorizontalAddI64x4
+                                // 256-bit pointer stores (`_mm256_storeu_si256`
+                                // and the aligned twin): the emitter reads its
+                                // value through `avx_load_arg`, which copies from
+                                // a YMM home, and writes only ymm0 scratch. With
+                                // them unlisted, one store poisoned every vector
+                                // web of the function (SHA-512 kernels, measured:
+                                // `sha512_chain` had no homes at all).
+                                | O::Storeu256
+                                | O::Store256
                                 // v12 Fix C: widening reductions consume an
                                 // I64x4 accumulator (whitelisted above). Their
                                 // lowerings confine scratch to ymm0/ymm1 so a
@@ -11492,6 +11528,9 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecSadbwU8x32
                     | O::VecMaddubsU8x32
+                    | O::Sha512msg1256
+                    | O::Sha512msg2256
+                    | O::Sha512rnds2256
                     | O::VecMaddwdI16x16
                     | O::VecAddI64x4
                     | O::VecSubI64x4

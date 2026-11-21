@@ -2765,6 +2765,23 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_vsha512rnds2",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512rnds2256),
     );
+    // The `<immintrin.h>` SHA-512 names are compiler-known like
+    // `_mm256_add_epi64` (see above). Measured on `k.c` (rsp references):
+    // header wrappers with the lowering and regalloc changes leave 6; these
+    // builtin names with both changes reach 0, matching GCC 16.2. Neither
+    // change alone reaches 0 (see the PR attribution matrix).
+    m.insert(
+        "_mm256_sha512msg1_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512msg1256),
+    );
+    m.insert(
+        "_mm256_sha512msg2_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512msg2256),
+    );
+    m.insert(
+        "_mm256_sha512rnds2_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512rnds2256),
+    );
     // GCC-compatible aliases (GCC 16 uses _avx_ infix for the VEX VNNI forms,
     // and an odd dpwsud spelling for INT16 vpdpwusd; accept both spellings).
     m.insert(

@@ -1364,6 +1364,89 @@ impl Lowerer {
         Some(Operand::Value(result))
     }
 
+    /// Route a SHA-512 (VEX.256) pointer form through a register-valued form.
+    ///
+    /// `vsha512msg1`/`vsha512msg2`/`vsha512rnds2` have no packed-map twin in
+    /// the RH-03 table: their operands are mixed-width (a 16-byte operand in
+    /// `msg1` and in the third slot of `rnds2`) and `rnds2` takes three
+    /// arguments. They were therefore lowered by the generic `Vec256` pointer
+    /// emitter, which passes every operand by address and writes the result
+    /// through `dest_ptr`. The `vec_ssa` promotion rule admits only whole-width
+    /// family loads and stores, so every 256-bit SHA-512 state and schedule
+    /// value stayed in a stack slot (`rsp` references: `k.c` 9, `chain.c` 16,
+    /// GCC 16.2 0).
+    ///
+    /// This is the RH-03 shape: each operand is a family `VecLoad` (promotable),
+    /// the instruction computes a register `value` with no `dest_ptr`, and the
+    /// result is stored to an entry alloca that `vec_ssa` promotes. The backend
+    /// already emits the value form (`result_dest` prefers `dest_ptr` and falls
+    /// back to `dest`). Shapes are resolved before any operand is lowered, so
+    /// refusal leaves no partial IR. i686 keeps the pointer form.
+    pub(super) fn try_native_sha512(&mut self, op: IntrinsicOp, args: &[Expr]) -> Option<Operand> {
+        // Operand byte widths per position. msg1 reads a 16-byte operand (only
+        // its low qword is used); rnds2 reads the 16-byte W+K operand third.
+        let widths: &[usize] = match op {
+            IntrinsicOp::Sha512msg1256 => &[32, 16],
+            IntrinsicOp::Sha512msg2256 => &[32, 32],
+            IntrinsicOp::Sha512rnds2256 => &[32, 32, 16],
+            _ => return None,
+        };
+        if packed_map_disabled() || self.target != crate::backend::Target::X86_64 {
+            return None;
+        }
+        if args.len() != widths.len() {
+            return None;
+        }
+        if !args
+            .iter()
+            .zip(widths)
+            .all(|(arg, &bytes)| self.packed_map_operand_ok(arg, bytes))
+        {
+            return None;
+        }
+        // Resolve every shape BEFORE lowering anything: lowering is not
+        // idempotent (see `try_native_packed_map`).
+        let shape_for = |bytes: usize| -> Option<super::vector_simd::SimdShape> {
+            let lanes = bytes / 8;
+            let fam = crate::passes::slp_vectorizer::family_for(IrType::I64, lanes)?;
+            Some(super::vector_simd::SimdShape {
+                fam,
+                elem_ir: IrType::I64,
+                lanes,
+                bytes,
+            })
+        };
+        let shapes: Vec<_> = widths
+            .iter()
+            .map(|&bytes| shape_for(bytes))
+            .collect::<Option<_>>()?;
+        let result_shape = shape_for(32)?;
+
+        let mut operands = Vec::with_capacity(widths.len());
+        for (arg, shape) in args.iter().zip(&shapes) {
+            let ty = self.expr_ctype(arg);
+            match self.direct_vector_load_ptr(arg, shape.bytes) {
+                Some((ptr, disp)) => {
+                    operands.push(Operand::Value(self.emit_vec_load_at(shape, ptr, disp)));
+                }
+                None => {
+                    let ptr = self.vector_operand_ptr(arg, &ty);
+                    operands.push(Operand::Value(self.emit_vec_load(shape, ptr)));
+                }
+            }
+        }
+        let value = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(value),
+            op,
+            dest_ptr: None,
+            args: operands,
+        });
+        let result = self.emit_entry_alloca(IrType::Ptr, 32, 32, false);
+        self.emit_vec_store(&result_shape, value, result);
+        Some(Operand::Value(result))
+    }
+
     /// Bytes of the whole-register vector load builtin `name`, if it is one.
     ///
     /// Only the PLAIN loaders belong here: `_mm_loadl_epi64` reads 8 bytes
