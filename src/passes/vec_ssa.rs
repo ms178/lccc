@@ -306,6 +306,10 @@ fn find_candidates(
         return Vec::new();
     }
     let mut rejected: FxHashSet<u32> = FxHashSet::default();
+    // Allocas that some instruction reads, and allocas that receive a register
+    // result (`dest_ptr` of an intrinsic whose value is the register product).
+    let mut read_allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut result_home_allocas: FxHashSet<u32> = FxHashSet::default();
     let mut sizes: FxHashMap<u32, usize> = FxHashMap::default();
     for inst in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
         if let Instruction::Alloca { dest, size, .. } = inst {
@@ -326,6 +330,15 @@ fn find_candidates(
                 }
                 let size_a = sizes.get(&a).copied().unwrap_or(0);
                 let access = classify(inst, a, table, register_operands);
+                match &access {
+                    Some(Access::Load { .. }) | Some(Access::ArgRead { .. }) => {
+                        read_allocas.insert(a);
+                    }
+                    Some(Access::Def { .. }) => {
+                        result_home_allocas.insert(a);
+                    }
+                    _ => {}
+                }
                 let ok = match access {
                     Some(Access::Load { op, .. }) | Some(Access::Store { op, .. }) => {
                         let fam = table[&op];
@@ -392,6 +405,12 @@ fn find_candidates(
     order
         .into_iter()
         .filter(|a| !rejected.contains(a))
+        // A register result written to an alloca that nothing reads is a dead
+        // value. Promoting it leaves a value with no use and no home, which
+        // the codegen cannot store (`value N has no register, stack slot`,
+        // e.g. `_mm256_castpd256_pd128((__m256d){0})`). The alloca stays in
+        // memory, as it does without promotion.
+        .filter(|a| !(result_home_allocas.contains(a) && !read_allocas.contains(a)))
         .filter_map(|a| cands.remove(&a))
         .filter_map(|mut c| {
             // A candidate with no endpoint family of its own (only register
