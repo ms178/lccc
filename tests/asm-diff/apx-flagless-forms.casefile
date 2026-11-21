@@ -1,0 +1,150 @@
+;;; nf_shift_memory
+.text
+{nf} rol %cl, (%rsp)
+{nf} rol $1, (%rsp)
+{nf} roll $5, (%rsp)
+{nf} rorb $7, 0x12(%rbx,%rsi,4)
+{nf} rorw %cl, (%rbp)
+{nf} rorq $63, (%rdx)
+{nf} shlb $5, (%rsp)
+{nf} shlw %cl, 0x1234(%r9,%r10,2)
+{nf} shll $1, 0x1000
+{nf} shlq $0x90, sym(%rip)
+{nf} salq %cl, (%r16)
+{nf} shrb %cl, (%rbp)
+{nf} shrl $3, 8(%rsp)
+{nf} sarw $9, sym(%rip)
+{nf} sarq %cl, 0x12(%rbx,%rsi,4)
+
+;;; nf_shift_memory_new_destination
+.text
+{nf} rolw $5, (%rsp), %cx
+{nf} rol $1, 0x12(%rbx,%rsi,4), %ecx
+{nf} ror $0x90, 0x12(%rbx,%rsi,4), %rcx
+{nf} ror %cl, sym(%rip), %r13
+{nf} shl $5, 0x1000, %sil
+{nf} shl $0x90, (%rbp), %cx
+{nf} shr $1, sym(%rip), %r13
+{nf} sar %cl, 0x12(%rbx,%rsi,4), %ecx
+{nf} sar $1, (%rsp), %r9
+shl $5, (%rdx), %ecx
+shr %cl, (%rdx), %r16
+rcl $5, (%rdx), %ecx
+rcr %cl, 8(%rsp), %r9w
+{evex} rcl $5, (%rdx)
+{evex} shrq %cl, (%rdx)
+
+;;; nf_double_shift_memory
+.text
+{nf} shld $5, %ecx, (%rdx)
+{nf} shld %cl, %r9, 8(%rsp)
+{nf} shrd $7, %cx, sym(%rip)
+{nf} shrd %cl, %r16d, (%rbp)
+{evex} shld $5, %ecx, (%rdx)
+{evex} shrd %cl, %rcx, (%rdx)
+{nf} shld $5, %ecx, (%rdx), %r9d
+{nf} shrd %cl, %r9, sym(%rip), %rcx
+
+;;; nf_arithmetic_and_unary
+.text
+{nf} add $1, %ecx
+{nf} sub $1, (%rbp)
+{nf} addq $-1, 8(%rsp)
+{nf} imul $0x80, (%rbp), %rcx
+{nf} imulzu $0x80, (%rsp), %r9w
+{nf} xor %ecx, %ecx, %ecx
+{nf} sub %r9, %r9, %r9
+{nf} inc %cl, %dl
+{nf} incw (%rbp), %r9w
+{nf} neg %ecx
+{nf} idiv %ecx, %eax
+
+;;; evex_setcc_wide
+.text
+{evex} setz %al
+{evex} setzb %r16b
+{evex} setnc %ecx
+{evex} setl %r9
+{evex} seta %r31d
+setzuz %cl
+setzunb %r9b
+
+;;; x87_wait_then_segment
+.text
+fsave %fs:(%rdx)
+fstcw %fs:8(%rsp)
+fstenv %gs:(%rcx)
+fstsw %fs:(%rdx)
+fnsave %fs:(%rdx)
+fnstcw %fs:8(%rsp)
+
+;;; unsigned_displacement_relocations
+.text
+lea sym(%rcx), %eax
+lea sym(,%rcx,2), %cx
+lea sym, %eax
+lea sym(%rip), %eax
+lea 0xfffffff0(%rcx), %eax
+mov sym(%ecx), %eax
+addl %edx, sym(%ecx,%edx,2)
+movdir64b sym, %ecx
+movdir64b sym, %rcx
+movdir64b (%ecx), %ecx
+enqcmd sym, %ecx
+enqcmds 16(%r9), %r10
+
+;;; nf_on_what_writes_no_flags reject
+.text
+{nf} mov %eax, %ecx
+
+;;; nf_on_add_with_carry reject
+.text
+{nf} adc %eax, %ecx
+
+;;; nf_on_rotate_through_carry reject
+.text
+{nf} rcl $1, (%rsp)
+
+;;; nf_on_a_vector_instruction reject
+.text
+{nf} vaddps %xmm1, %xmm2, %xmm3
+
+;;; high_byte_register_behind_evex reject
+.text
+add %dh, %cl, %al
+
+;;; shift_of_another_size_than_its_suffix reject
+.text
+sarl $1, %r9b
+
+;;; rotate_of_another_size_than_its_suffix reject
+.text
+rolb $7, %cx
+
+;;; shift_into_a_register_of_another_size reject
+.text
+shl %cl, %ecx, %sil
+
+;;; double_shift_of_two_sizes reject
+.text
+shrd %cl, %ebp, %r13
+
+;;; double_shift_of_another_size_than_its_suffix reject
+.text
+shrdl $0x90, %r9, (%rbp)
+
+;;; increment_of_another_size_than_its_suffix reject
+.text
+incw %cl
+
+;;; increment_into_a_register_of_another_size reject
+.text
+incb (%rbp), %r9d
+
+;;; address_register_narrower_than_the_address reject
+.text
+movdir64b (%rdx), %ecx
+
+;;; address_register_wider_than_the_address reject
+.text
+movdir64b (%edx), %rcx

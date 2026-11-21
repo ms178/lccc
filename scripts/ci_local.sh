@@ -3192,6 +3192,33 @@ gate "code16-gas-table-sweep" fast \
 gate "code16gcc-gas-table-sweep" fast \
     python3 scripts/gas_table_sweep.py --check --16gcc --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         --lccc target/fastbuild/lccc-i686
+
+# What the assemblers replace. Both encoders write the cheaper instruction
+# for the same effect -- `movl $1, %eax` for `movq $1, %rax`, `movlps` for a
+# `movsd` store -- in everything the compiler emits, and under -Wa,-O2 or
+# -Wa,-Os in a person's text (encoder/optimize.rs). The statements of GNU as
+# 2.47's table again, with what an optimizer looks at on top (immediates at
+# the edges of every width, one register in every position, every form of
+# address, {nf}); two questions of each. --check: is lccc's encoding as
+# short as GNU as's under -O2 and -Os? Fails on a longer one that
+# tests/asm-optimize/expected-<mode>.txt does not name (each of those is a
+# replacement of GNU as's that is not the same instruction; README.md there
+# says why), on a statement the optimizer no longer assembles, and on any
+# other difference from the inventory. --execute: is the replacement the same
+# instruction? Every rewritten statement is run on this processor as written
+# and as replaced, from the same registers, flags, vector registers and
+# memory, and all of it has to be the same afterwards. The self-test plants
+# replacements that are wrong in every way the run can see.
+gate "asm-optimize-sweep-selftest" fast \
+    python3 scripts/asm_optimize_sweep.py --self-test
+
+gate "x86-asm-optimize-sweep" fast \
+    python3 scripts/asm_optimize_sweep.py --check --execute --minimum 1500 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        --lccc target/fastbuild/lccc-x86
+
+gate "i686-asm-optimize-sweep" fast \
+    python3 scripts/asm_optimize_sweep.py --32 --check --execute --minimum 800 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        --lccc target/fastbuild/lccc-i686
 gate "sse34-clang-encoding" fast \
     python3 tests/regression/check_sse34_clang.py
 

@@ -13,7 +13,7 @@
 rows 4848
 statements 31065
 assembled 18492
-same 15469
+same 15515
 foreign 41044
 refused 38848
 shorter vcmpfalse_oqps %ymm10, %ymm2, %ymm10
@@ -64,7 +64,7 @@ reject blsic 5 dfdcf184
 reject blsicq 2 2f52135d
 reject call 4 0f6b34fa
 reject callw 2 4dd9acf1
-reject ccmpa 1 4676bc1f
+reject ccmpa 2 dba0e92a
 reject ccmpae 2 e31f3645
 reject ccmpaeb 1 5e683181
 reject ccmpael 1 7b54f4b6
@@ -77,7 +77,7 @@ reject ccmpcb 2 0b469624
 reject ccmpcl 2 f99c7306
 reject ccmpcq 2 607b76d7
 reject ccmpcw 2 f736f295
-reject ccmpe 1 d1655c8a
+reject ccmpe 2 f13900f2
 reject ccmpeb 1 199eeb8a
 reject ccmpel 1 2111f357
 reject ccmpeq 1 3e2241b7
@@ -88,6 +88,8 @@ reject ccmpfl 7 23d68eac
 reject ccmpfq 7 78820539
 reject ccmpfw 6 b76b62c4
 reject ccmpg 1 3a122521
+reject ccmpge 1 003ce05d
+reject ccmpgeb 1 5ff13d1d
 reject ccmpl 14 ebcf4774
 reject ccmple 1 5fbf56b4
 reject ccmpleb 1 9cd74b05
@@ -181,8 +183,8 @@ reject cmpzxadd 2 36c661cc
 reject cs 1 3b8b91c7
 reject ctesta 2 63ac33fd
 reject ctestab 1 1d49672c
-reject ctestae 1 021c15b0
-reject ctestaeb 1 6d79ac3b
+reject ctestae 2 b0afb4f0
+reject ctestaeb 2 6ca6e7b4
 reject ctestael 1 39b7ea23
 reject ctestaeq 1 dbff0df7
 reject ctestaew 1 5e962249
@@ -191,9 +193,9 @@ reject ctestaq 1 08e1442e
 reject ctestaw 1 17ba4df5
 reject ctestb 7 d863d05e
 reject ctestbe 1 1d859188
-reject ctestc 1 330ba99b
+reject ctestc 2 ec4148ee
 reject ctestcw 1 6d4c0827
-reject cteste 1 4af5832d
+reject cteste 2 589d64ef
 reject ctestf 12 c121e7c2
 reject ctestfb 3 f2fe206f
 reject ctestfl 3 da7d6f01
@@ -207,17 +209,22 @@ reject ctestgl 1 6093dfb6
 reject ctestgq 1 73b68712
 reject ctestgw 1 17eee1fd
 reject ctestl 11 ab18c156
+reject ctestle 1 7414869b
+reject ctestna 2 e5dada06
+reject ctestnab 1 cebc507c
 reject ctestnae 2 2f5f861c
 reject ctestnaeb 2 f8131120
 reject ctestnael 2 4fd4f595
 reject ctestnaeq 2 34704ac0
 reject ctestnaew 2 e3395f54
 reject ctestnb 8 31acc80b
-reject ctestnbe 2 de329f82
-reject ctestnc 1 849568c2
+reject ctestnbe 3 41f850c8
+reject ctestnc 2 4b416197
 reject ctestne 1 1c066d57
 reject ctestng 1 bfefbeba
 reject ctestnl 9 845fa1f5
+reject ctestns 1 07e38af3
+reject ctestnsb 1 0b1c39ab
 reject ctesto 2 f592e08c
 reject ctestob 1 de2fc00b
 reject ctestol 1 6f797f19
@@ -337,15 +344,6 @@ reject prefetchwt1 6 82822d3f
 reject pswapd 6 63881fba
 reject push2pq 1 da5cb336
 reject pushw 1 a617f67f
-reject rcl 9 d5398702
-reject rclb 4 017ba264
-reject rcll 2 16084430
-reject rclq 2 f85ab182
-reject rclw 1 85390670
-reject rcr 4 a64183bd
-reject rcrb 1 089defe5
-reject rcrq 1 4a30a87a
-reject rcrw 2 da207ced
 reject rdmsr 3 e85a3cf2
 reject ret 1 17957cee
 reject retf 1 e50ce2b9
@@ -385,19 +383,8 @@ reject rexxz 1 7563df8e
 reject rexy 1 e56ffb09
 reject rexyz 1 a8c7dd6d
 reject rexz 1 6e6de02f
-reject rol 3 cc807dc4
-reject roll 2 62b2c6ea
-reject rolq 1 4a558c32
-reject ror 3 ee172917
+reject ror 1 4c2d541f
 reject rorb 1 3852483d
-reject rorq 2 516bdb92
-reject sal 5 10948b4f
-reject salb 1 f9dc64f7
-reject salw 4 489e74d6
-reject sar 5 e1dd9365
-reject sarl 3 6e8df7e7
-reject sarq 1 167b47f0
-reject sarw 1 7028ea33
 reject scas 13 d0a7fa52
 reject scasb 2 e6c6474d
 reject scasq 2 7baf7582
@@ -425,14 +412,10 @@ reject setpoq 1 99b7e944
 reject setpq 1 884c735e
 reject setsq 2 62513ba3
 reject setzl 1 7d0431b2
-reject shl 4 12926dd0
-reject shlb 2 76e2aa4e
-reject shlw 2 45e428b5
-reject shr 5 0402639d
+reject shl 1 91911053
+reject shlb 1 02be8d80
+reject shr 1 9a48ba74
 reject shrb 1 413664a0
-reject shrl 2 4744d8f3
-reject shrq 1 05086812
-reject shrw 1 3bb0cb34
 reject slod 12 a7d82a96
 reject slodb 8 5c3173ca
 reject slodl 8 f1282ddd
@@ -777,6 +760,9 @@ reject vrsqrt28ss 6 26140717
 reject vrsqrtbf16 5 88a1033f
 reject vrsqrtss 3 b44d775c
 reject vscalefbf16 2 daeb4732
+reject vsha512msg1 3 668c799f
+reject vsha512msg2 3 a9a45ec4
+reject vsha512rnds2 1 0d21524b
 reject vsm3msg1 3 b70a1ee7
 reject vsm3msg2 2 adf9238e
 reject vsm3rnds2 4 b773a8cb
@@ -787,4 +773,5 @@ reject vucomxsh 6 c127374d
 reject vucomxss 6 1a6fac53
 reject word 1 98c1eb4e
 reject xacquire 1 77685d3b
+reject xor 1 fb9ab201
 reject xrelease 1 93a242a3

@@ -314,6 +314,7 @@ mod x87_pop_tests {
             vex_hint: None,
             force_rex2: false,
             dfv: 0,
+            optimize: Default::default(),
         }
     }
 

@@ -2435,6 +2435,14 @@ jobs:
     - name: Verify .code16gcc instruction-table sweep vs GNU as 2.47
       run: python3 scripts/gas_table_sweep.py --check --16gcc --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
         --lccc target/fastbuild/lccc-i686
+    - name: Self-test the replacement sweep's execution harness
+      run: python3 scripts/asm_optimize_sweep.py --self-test
+    - name: Verify x86-64 assembler replacements vs GNU as 2.47 -O2 and -Os, and execute them
+      run: python3 scripts/asm_optimize_sweep.py --check --execute --minimum 1500 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
+        --lccc target/fastbuild/lccc-x86
+    - name: Verify i686 assembler replacements vs GNU as 2.47 -O2 and -Os, and execute them
+      run: python3 scripts/asm_optimize_sweep.py --32 --check --execute --minimum 800 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
+        --lccc target/fastbuild/lccc-i686
     - name: Verify complete SSE3 SSSE3 SSE4 encodings vs Clang 23.1.5
       run: python3 tests/regression/check_sse34_clang.py
     - name: Verify encdiff corpus vs GNU as 2.47 (offline)

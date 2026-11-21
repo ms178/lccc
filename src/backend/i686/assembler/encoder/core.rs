@@ -1575,6 +1575,7 @@ mod i686_encoding_helper_tests {
             vex_hint: None,
             force_rex2: false,
             dfv: 0,
+            optimize: Default::default(),
         };
         let mut encoder = InstructionEncoder::new();
         encoder.encode(&instr).expect("encoding must succeed");

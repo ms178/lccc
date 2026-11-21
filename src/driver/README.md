@@ -503,6 +503,18 @@ The builtin assembler path also handles the `-Wa,--version` probe: when
 detected, it prints `GNU assembler (Claude's C Compiler built-in) 2.42` to satisfy the Linux
 kernel's as-version.sh probe script (out of tree).
 
+The x86-64 and i686 builtin assemblers assemble a text as it is written. With
+`-Wa,-O` (or `-Wa,-O1`, `-Wa,-O2`) they write the cheaper instruction that has
+the same effect instead -- `movl $1, %eax` for `movq $1, %rax` -- and with
+`-Wa,-Os` also the shorter one where it costs time; `-Wa,-O0` is the default,
+the last of them wins, and `{nooptimize}` in front of a statement exempts it,
+as in GNU as. What the compiler itself emits is replaced the same way before
+it is assembled or printed (`-S` shows it), whatever these options say; the
+bodies of inline assembly are not. See
+`src/backend/x86/assembler/encoder/optimize.rs` for what is replaced and why
+each replacement is the same instruction, and `tests/asm-optimize/` for how
+that is held.
+
 ### Linker Selection
 
 Linker selection is also a **compile-time** decision (handled in

@@ -285,6 +285,22 @@ pub struct InstructionEncoder {
     pub(super) explicit_data16: bool,
 }
 
+impl crate::backend::x86::assembler::encoder::optimize::Atomic for InstructionEncoder {
+    fn mark(&self) -> (usize, usize, u64) {
+        (self.bytes.len(), self.relocations.len(), self.offset)
+    }
+
+    fn rewind(&mut self, (bytes, relocations, offset): (usize, usize, u64)) {
+        self.bytes.truncate(bytes);
+        self.relocations.truncate(relocations);
+        self.offset = offset;
+    }
+
+    fn written(&mut self, instr: &Instruction) -> Result<(), String> {
+        self.encode_as_written(instr)
+    }
+}
+
 impl InstructionEncoder {
     pub fn new() -> Self {
         InstructionEncoder {
@@ -303,10 +319,31 @@ impl InstructionEncoder {
         }
     }
 
+    /// Encode one instruction atomically: as written, or as the cheaper
+    /// instruction that has the same effect, for a statement that may be
+    /// replaced (`Instruction::optimize`; see the 64-bit encoder's
+    /// `optimize`). Not in 16-bit code, where every size prefix is the
+    /// other way round and nothing the compiler writes is at stake.
+    pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+        self.encode_choosing(instr).map(|_| ())
+    }
+
+    /// [`Self::encode`], returning the instruction that replaced `instr`
+    /// if one did.
+    pub(crate) fn encode_choosing(
+        &mut self,
+        instr: &Instruction,
+    ) -> Result<Option<Instruction>, String> {
+        if self.code16 {
+            return self.encode_as_written(instr).map(|()| None);
+        }
+        crate::backend::x86::assembler::encoder::optimize::encode(self, instr, false)
+    }
+
     /// Encode one instruction atomically: callers may reuse this encoder
     /// after an error without exposing an emitted prefix, a stale relocation
     /// or a shifted location counter to the next instruction.
-    pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+    fn encode_as_written(&mut self, instr: &Instruction) -> Result<(), String> {
         let bytes = self.bytes.len();
         let relocations = self.relocations.len();
         let offset = self.offset;
@@ -3858,6 +3895,7 @@ mod stack_width_tests {
             vex_hint: None,
             force_rex2: false,
             dfv: 0,
+            optimize: Default::default(),
         }
     }
 

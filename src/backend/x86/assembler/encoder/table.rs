@@ -15,7 +15,7 @@
 //! against GNU as 2.47 statement by statement, in 64-bit and in 32-bit mode
 //! (`scripts/gas_table_sweep.py`; the unit tests below pin a sample).
 
-use crate::backend::x86::assembler::parser::{ImmediateValue, MemoryOperand, Operand};
+use crate::backend::x86::assembler::parser::{ImmediateValue, MemoryOperand, Operand, Register};
 
 /// One operand a row takes, in AT&T order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -883,7 +883,24 @@ impl Row {
                 }
                 RegAddr => {
                     let name = register(op)?;
-                    if !address(&mut plan, register_letter(name)?) {
+                    let letter = register_letter(name)?;
+                    if !address(&mut plan, letter) {
+                        return None;
+                    }
+                    // The registers of the memory operand say how wide an
+                    // address is too, and have to say the same (`movdir64b
+                    // (%rdx), %ecx` was `movdir64b (%rdx), %rcx`).
+                    let another_width = |part: &Register| match part.name.as_str() {
+                        "rip" => letter != b'q',
+                        "eip" => letter != b'l',
+                        part => register_letter(part).is_some_and(|wide| wide != letter),
+                    };
+                    if ops.iter().filter_map(memory).any(|mem| {
+                        [&mem.base, &mem.index]
+                            .into_iter()
+                            .flatten()
+                            .any(another_width)
+                    }) {
                         return None;
                     }
                     // The prefix comes with the memory operand, whose
@@ -1032,6 +1049,9 @@ impl super::InstructionEncoder {
         // folds the `0F` escape into, or refuses for a longer escape.)
         if plan.addr_prefix {
             self.bytes.push(0x67);
+            // Under it an address is 32 bits wide and has no sign: a
+            // symbol in one takes `R_X86_64_32` (`movdir64b sym, %ecx`).
+            self.disp32_unsigned = true;
         }
         if plan.data16 {
             self.bytes.push(0x66);

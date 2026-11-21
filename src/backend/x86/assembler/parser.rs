@@ -279,6 +279,32 @@ pub struct Instruction {
     /// GNU as `{dfv=cf,zf,sf,of}`: APX default-flags value for CCMP/CTEST.
     /// Encoded raw in EVEX P1.vvvv (not inverted). Bits: CF=1 ZF=2 SF=4 OF=8.
     pub dfv: u8,
+    /// Whether the encoder may write a cheaper instruction that has the
+    /// same effect (`encoder::optimize`), and which kind. `Never` for a
+    /// statement behind `{nooptimize}`; otherwise what the text was parsed
+    /// under.
+    pub optimize: Optimize,
+}
+
+/// Whether the encoders may replace a statement by a cheaper instruction
+/// with the same effect (`movq $1, %rax` by `movl $1, %eax`), and what
+/// cheaper means.
+///
+/// A person who writes `movq $15, %rax` may have counted its seven bytes --
+/// glibc's `__restore_rt` is recognized by its bytes -- so a text is
+/// assembled as written unless the command line asks otherwise (`-Wa,-O`,
+/// as GNU as has it). What the compiler writes is replaced in the text
+/// itself, before it is assembled or shown (`assembler::generated`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Optimize {
+    /// As written.
+    #[default]
+    Never,
+    /// The instruction that is shorter, or faster at the same length, and
+    /// slower on no processor: `-Wa,-O`, `-Wa,-O1` and above.
+    Faster,
+    /// That, and the shorter instruction where it costs time: `-Wa,-Os`.
+    Smaller,
 }
 
 impl Instruction {
@@ -632,9 +658,20 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
-/// Parse assembly text into a list of AsmItems.
+/// Parse assembly text into a list of AsmItems, every statement to be
+/// assembled as written.
 pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
+    parse_asm_with(text, Optimize::Never)
+}
+
+/// Parse assembly text into a list of AsmItems; `optimize` says whether
+/// the encoders may replace its statements by cheaper equivalents.
+pub fn parse_asm_with(text: &str, optimize: Optimize) -> Result<Vec<AsmItem>, String> {
     let mut items = Vec::new();
+    // Behind data, or behind a prefix written as a statement of its own:
+    // the next statement may be the rest of an instruction somebody put
+    // together by hand, and is assembled as written (GNU as's rule).
+    let mut bare = false;
 
     // Strip C-style /* */ comments (used in hand-written assembly like musl)
     let text = asm_preprocess::strip_c_comments(text);
@@ -698,8 +735,38 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
             if part.is_empty() {
                 continue;
             }
-            match parse_line_items(part) {
-                Ok(line_items) => items.extend(line_items),
+            match parse_line_items(part, optimize) {
+                Ok(mut line_items) => {
+                    if optimize != Optimize::Never {
+                        for item in &mut line_items {
+                            match item {
+                                AsmItem::Instruction(instruction) => {
+                                    if bare {
+                                        instruction.optimize = Optimize::Never;
+                                    }
+                                    bare = instruction.operands.is_empty()
+                                        && INSN_PREFIXES.contains(&instruction.mnemonic.as_str());
+                                }
+                                AsmItem::Byte(_)
+                                | AsmItem::Short(_)
+                                | AsmItem::Long(_)
+                                | AsmItem::Quad(_)
+                                | AsmItem::Uleb128(_)
+                                | AsmItem::Sleb128(_)
+                                | AsmItem::Addr(_)
+                                | AsmItem::Fill { .. }
+                                | AsmItem::Zero(_)
+                                | AsmItem::SkipExpr(..)
+                                | AsmItem::Asciz(_)
+                                | AsmItem::Ascii(_)
+                                | AsmItem::Org(..)
+                                | AsmItem::Incbin { .. } => bare = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    items.extend(line_items);
+                }
                 Err(e) => {
                     // Decorator diagnostics (`\0raw:`) are GAS-bare: GNU as
                     // reports them without location or source echo.
@@ -713,6 +780,16 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
     }
 
     Ok(items)
+}
+
+/// The one instruction a line is, if it is one and nothing else: no label
+/// in front of it, no directive, no second statement.
+pub(crate) fn parse_statement(line: &str, optimize: Optimize) -> Option<Instruction> {
+    let mut items = parse_line_items(line, optimize).ok()?;
+    match (items.pop(), items.is_empty()) {
+        (Some(AsmItem::Instruction(instruction)), true) => Some(instruction),
+        _ => None,
+    }
 }
 
 /// Whether `text` names a directive `expand_rept_blocks` acts on, anywhere
@@ -774,7 +851,7 @@ fn directive_arg<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
 ///
 /// A line may contain a label followed by an instruction on the same line
 /// (e.g., `1: stmxcsr -8(%rsp)`), which produces two items.
-fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
+fn parse_line_items(line: &str, optimize: Optimize) -> Result<Vec<AsmItem>, String> {
     let mut items = Vec::new();
 
     // Check for label (may be followed by instruction on same line)
@@ -842,9 +919,9 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
     if rest.starts_with('.') {
         items.push(parse_directive(rest)?);
     } else if is_prefixed_instruction(rest) {
-        items.push(parse_prefixed_instruction(rest)?);
+        items.push(parse_prefixed_instruction(rest, optimize)?);
     } else {
-        items.push(parse_instruction(rest, Vec::new())?);
+        items.push(parse_instruction(rest, Vec::new(), optimize)?);
     }
 
     Ok(items)
@@ -1762,7 +1839,7 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
 /// `addr16`/`addr32`/`data16`/`data32` are the GAS spellings of the
 /// address-/operand-size overrides as standalone words. `rex`/`rex.x`
 /// force explicit legacy REX bits; `rex64` also sets W (64-bit mode only).
-const INSN_PREFIXES: [&str; 22] = [
+pub(crate) const INSN_PREFIXES: [&str; 22] = [
     "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs", "gs",
     "xacquire", "xrelease", "addr16", "addr32", "data16", "data32", "rex", "rex.x", "rex64",
 ];
@@ -1787,7 +1864,7 @@ fn is_prefixed_instruction(rest: &str) -> bool {
 /// yields ["lock", "xacquire"]) so the encoder can emit the full prefix run.
 /// Duplicate detection lives in the encoder (it compares prefix BYTES:
 // `rep repe movsb` is two spellings of one byte).
-fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
+fn parse_prefixed_instruction(line: &str, optimize: Optimize) -> Result<AsmItem, String> {
     let mut rest = line.trim();
     let mut prefixes: Vec<String> = Vec::new();
     while let Some((head, tail)) = rest.split_once(|c: char| c.is_whitespace()) {
@@ -1800,18 +1877,22 @@ fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
             break;
         }
     }
-    parse_instruction(rest, prefixes)
+    parse_instruction(rest, prefixes, optimize)
 }
 
 /// Parse an instruction line.
-fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, String> {
+fn parse_instruction(
+    line: &str,
+    prefixes: Vec<String>,
+    optimize: Optimize,
+) -> Result<AsmItem, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(AsmItem::Empty);
     }
 
     // Split mnemonic from operands
-    let (nf, force_evex, vex_hint, force_rex2, rest) = parse_encoding_hints(trimmed);
+    let (nf, force_evex, vex_hint, force_rex2, nooptimize, rest) = parse_encoding_hints(trimmed);
     let (mnemonic, operand_str) = split_mnemonic_operands(rest);
     let (dfv, operand_str) = parse_dfv_hint(operand_str)?;
 
@@ -1836,6 +1917,11 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
         vex_hint,
         force_rex2,
         dfv,
+        optimize: if nooptimize {
+            Optimize::Never
+        } else {
+            optimize
+        },
     }))
 }
 
@@ -1844,11 +1930,14 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
 /// `{vex3}` also controls the prefix length when C5 would be legal.
 /// Selectors are last-wins, while incompatible APX modifiers are validated
 /// by the encoder (GAS accepts them syntactically, but rejects the instruction).
-fn parse_encoding_hints(line: &str) -> (bool, bool, Option<VexHint>, bool, &str) {
+fn parse_encoding_hints(line: &str) -> (bool, bool, Option<VexHint>, bool, bool, &str) {
     let mut nf = false;
     let mut force_evex = false;
     let mut vex_hint = None;
     let mut force_rex2 = false;
+    // GNU as `{nooptimize}`: this statement as written, whatever the
+    // command line says.
+    let mut nooptimize = false;
     let mut s = line.trim_start();
     loop {
         if !s.starts_with('{') {
@@ -1866,6 +1955,7 @@ fn parse_encoding_hints(line: &str) -> (bool, bool, Option<VexHint>, bool, &str)
                 vex_hint = None;
             }
             "rex2" => force_rex2 = true,
+            "nooptimize" => nooptimize = true,
             "vex" | "vex2" | "vex3" => {
                 vex_hint = Some(match &s[1..close] {
                     "vex2" => VexHint::Vex2,
@@ -1878,7 +1968,7 @@ fn parse_encoding_hints(line: &str) -> (bool, bool, Option<VexHint>, bool, &str)
         }
         s = s[close + 1..].trim_start();
     }
-    (nf, force_evex, vex_hint, force_rex2, s)
+    (nf, force_evex, vex_hint, force_rex2, nooptimize, s)
 }
 
 /// GNU as `{dfv=cf,zf,sf,of}` sits *after* the mnemonic (never as a leading
@@ -6354,7 +6444,7 @@ main:
 
     #[test]
     fn dot_assignment_lowers_to_org_with_zero_fill() {
-        let items = parse_line_items(". = base + (2 * 6)").unwrap();
+        let items = parse_line_items(". = base + (2 * 6)", Optimize::Never).unwrap();
         assert_eq!(items.len(), 1);
         match &items[0] {
             AsmItem::Org(sym, off, fill) => {
@@ -6364,7 +6454,7 @@ main:
             }
             other => panic!("expected Org, got {other:?}"),
         }
-        let items = parse_line_items("label: . = 8").unwrap();
+        let items = parse_line_items("label: . = 8", Optimize::Never).unwrap();
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0], AsmItem::Label(_)));
         assert!(matches!(items[1], AsmItem::Org(_, 8, 0)));
@@ -6380,7 +6470,10 @@ main:
             ". >= 8",
             ". = (1 + 2",
         ] {
-            assert!(parse_line_items(src).is_err(), "accepted {src:?}");
+            assert!(
+                parse_line_items(src, Optimize::Never).is_err(),
+                "accepted {src:?}"
+            );
         }
     }
 

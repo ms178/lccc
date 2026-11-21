@@ -11,6 +11,7 @@ mod core;
 pub(crate) use self::core::{fold_index_into_base, folded_base, mem_vex_xb_bits};
 mod gp_integer;
 pub(crate) mod operand_class;
+pub(crate) mod optimize;
 mod promoted;
 mod registers;
 mod sse;
@@ -203,6 +204,10 @@ pub struct InstructionEncoder {
     /// The RIP-relative displacement of the instruction under way, if its
     /// field carries a relocation (`settle_rip_field`).
     rip_field: Option<RipField>,
+    /// The displacements of the instruction under way are 32-bit numbers
+    /// without a sign (`unsigned_displacement`): a symbol in one takes
+    /// `R_X86_64_32`, not the sign-extended relocation.
+    pub(crate) disp32_unsigned: bool,
 }
 
 /// A RIP-relative displacement field with a relocation.
@@ -686,6 +691,54 @@ fn evex_only_mnemonic(mnemonic: &str) -> bool {
     )
 }
 
+/// Whether the displacements of `instr` are 32-bit numbers without a sign
+/// (GNU as's `want_disp32`): under an address-size prefix, where the
+/// address is 32 bits wide, and in a `lea` into a register narrower than
+/// 64 bits, which keeps no more of it. A symbol there takes `R_X86_64_32`
+/// (`lea sym(%rcx), %eax`, `mov sym(%ecx), %eax`): the sign-extended
+/// relocation refuses an address in the upper half of the 32 bits.
+fn unsigned_displacement(instr: &Instruction) -> bool {
+    let mut memory = instr.operands.iter().filter_map(Operand::memory);
+    if memory.clone().any(core::mem_needs_addr32) || instr.prefixes.iter().any(|p| p == "addr32") {
+        return memory.next().is_some();
+    }
+    let lea = matches!(
+        instr.mnemonic.to_ascii_lowercase().as_str(),
+        "lea" | "leaw" | "leal"
+    );
+    lea && matches!(instr.operands.last(), Some(Operand::Register(to)) if !is_reg64(&to.name))
+}
+
+/// The operand size of a `shld` or `shrd` without a suffix: its last
+/// register's, the destination's or (shifting into memory) the source's.
+fn double_shift_size(ops: &[Operand]) -> u8 {
+    ops.iter()
+        .rev()
+        .find_map(|op| match op {
+            Operand::Register(r) if r.name != "cl" => Some(infer_reg_size(&r.name)),
+            _ => None,
+        })
+        .unwrap_or(8)
+}
+
+/// Whether `mnemonic` (lower case) has an APX form that writes no flags:
+/// the instructions GNU as 2.47's table marks `NF`, with or without a
+/// size suffix. `adc`, `sbb`, `rcl` and `rcr` are not among them (they
+/// read the carry they would not write), nor is anything that writes no
+/// flags to begin with.
+fn takes_nf(mnemonic: &str) -> bool {
+    const NF: [&str; 31] = [
+        "add", "and", "andn", "bextr", "blsi", "blsmsk", "blsr", "bzhi", "clr", "dec", "div",
+        "idiv", "imul", "imulzu", "inc", "lzcnt", "mul", "neg", "or", "popcnt", "rol", "ror",
+        "sal", "sar", "shl", "shld", "shr", "shrd", "sub", "tzcnt", "xor",
+    ];
+    NF.iter().any(|name| {
+        mnemonic
+            .strip_prefix(name)
+            .is_some_and(|suffix| matches!(suffix, "" | "b" | "w" | "l" | "q"))
+    })
+}
+
 /// Mnemonic as GAS names it in decorator diagnostics: one size suffix
 /// stripped (`addl` -> `add`, `movl` -> `mov`, `leal` -> `lea`).
 /// EVEX mnemonics are never suffixed, so this is the identity there.
@@ -912,6 +965,22 @@ fn sha256rnds2_operands(ops: &[Operand]) -> Result<&[Operand], String> {
     }
 }
 
+impl optimize::Atomic for InstructionEncoder {
+    fn mark(&self) -> (usize, usize, u64) {
+        (self.bytes.len(), self.relocations.len(), self.offset)
+    }
+
+    fn rewind(&mut self, (bytes, relocations, offset): (usize, usize, u64)) {
+        self.bytes.truncate(bytes);
+        self.relocations.truncate(relocations);
+        self.offset = offset;
+    }
+
+    fn written(&mut self, instr: &Instruction) -> Result<(), String> {
+        self.encode_as_written(instr)
+    }
+}
+
 impl InstructionEncoder {
     pub fn new() -> Self {
         InstructionEncoder {
@@ -928,6 +997,7 @@ impl InstructionEncoder {
             apx_rex2: false,
             apx_dfv: 0,
             rip_field: None,
+            disp32_unsigned: false,
         }
     }
 
@@ -971,10 +1041,26 @@ impl InstructionEncoder {
         Ok(())
     }
 
+    /// Encode one instruction atomically: as written, or as the cheaper
+    /// instruction that has the same effect, for a statement that may be
+    /// replaced (`Instruction::optimize`; see [`optimize`]).
+    pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+        self.encode_choosing(instr).map(|_| ())
+    }
+
+    /// [`Self::encode`], returning the instruction that replaced `instr`
+    /// if one did.
+    pub(crate) fn encode_choosing(
+        &mut self,
+        instr: &Instruction,
+    ) -> Result<Option<Instruction>, String> {
+        optimize::encode(self, instr, true)
+    }
+
     /// Encode one instruction atomically. Post-encode decorator validation
     /// may fail *after* emitting bytes, relocations and advancing `offset`;
     /// callers that reuse an encoder must never retain that partial state.
-    pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+    fn encode_as_written(&mut self, instr: &Instruction) -> Result<(), String> {
         let bytes = self.bytes.len();
         let relocations = self.relocations.len();
         let offset = self.offset;
@@ -1031,6 +1117,43 @@ impl InstructionEncoder {
             }
             owned = o;
             &owned
+        } else {
+            instr
+        };
+        // Where an address is 32 bits wide, its displacement is a number
+        // modulo 2^32: `lea 0xfffffff0(%rcx), %eax` is `lea -16(%rcx),
+        // %eax`, and was refused as out of range.
+        self.disp32_unsigned = unsigned_displacement(instr);
+        let wraps = |op: &Operand| {
+            op.memory().is_some_and(|mem| {
+                matches!(mem.displacement, Displacement::Integer(v)
+                    if (0x8000_0000..=0xFFFF_FFFF_i64).contains(&v))
+                    && (mem.base.is_some() || mem.index.is_some())
+            })
+        };
+        let wrapped;
+        let instr = if self.disp32_unsigned && instr.operands.iter().any(wraps) {
+            let mut o = instr.clone();
+            for op in &mut o.operands {
+                if !wraps(op) {
+                    continue;
+                }
+                let mem = match op {
+                    Operand::Memory(mem) => Some(mem),
+                    Operand::Indirect(inner) => match inner.as_mut() {
+                        Operand::Memory(mem) => Some(mem),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(mem) = mem {
+                    if let Displacement::Integer(v) = mem.displacement {
+                        mem.displacement = Displacement::Integer(i64::from(v as u32 as i32));
+                    }
+                }
+            }
+            wrapped = o;
+            &wrapped
         } else {
             instr
         };
@@ -1495,6 +1618,59 @@ impl InstructionEncoder {
                 ));
             }
         }
+        // `{nf}` post-check: what was asked for is an instruction that
+        // writes no flags, which is EVEX with its NF bit set and exists
+        // for the instructions of `takes_nf` alone. An arm that knows no
+        // such form, and the table, which knows none, write the plain
+        // instruction, flags and all (`{nf} shld $5, %ecx, (%rdx)` was
+        // `0f a4 0a 05`; `{nf} bsf`, `{nf} xadd`, `{nf} mov` and twelve
+        // thousand more of the statements GNU as refuses were assembled
+        // as if nothing had been asked); `{nf} adc` was written with the
+        // bit set, which no processor decodes.
+        if result.is_ok() && self.apx_nf {
+            let body = &self.bytes[start_len..];
+            let is_prefix = |b: u8| matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67);
+            let at = body
+                .iter()
+                .position(|&b| !is_prefix(b))
+                .unwrap_or(body.len());
+            let no_flags =
+                body.get(at) == Some(&0x62) && body.get(at + 3).is_some_and(|p2| p2 & 0x04 != 0);
+            let lower = instr.mnemonic.to_ascii_lowercase();
+            if !no_flags || !takes_nf(&lower) {
+                self.bytes.truncate(start_len);
+                self.relocations.truncate(reloc_base);
+                result = Err(format!("{{nf}} unsupported for `{}'", decor_stem(&lower)));
+            }
+        }
+        // Behind an EVEX prefix, as behind REX, the byte registers 4 to 7
+        // are `%spl` to `%dil`: `add %dh, %cl, %al` was assembled as `add
+        // %sil, %cl, %al`.
+        if result.is_ok() {
+            let body = &self.bytes[start_len..];
+            let is_prefix = |b: u8| matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67);
+            let at = body
+                .iter()
+                .position(|&b| !is_prefix(b))
+                .unwrap_or(body.len());
+            if body.get(at) == Some(&0x62) {
+                let high = instr.operands.iter().find_map(|op| match op {
+                    Operand::Register(r)
+                        if matches!(r.name.as_str(), "ah" | "ch" | "dh" | "bh") =>
+                    {
+                        Some(r.name.as_str())
+                    }
+                    _ => None,
+                });
+                if let Some(name) = high {
+                    self.bytes.truncate(start_len);
+                    self.relocations.truncate(reloc_base);
+                    result = Err(format!(
+                        "can't encode register '%{name}' in an instruction requiring EVEX prefix"
+                    ));
+                }
+            }
+        }
         // Reject any path that silently ignored a VEX selector, including
         // early APX CCMP/CTEST/CFCMOV/IMULZU and legacy VMX `v*` mnemonics.
         // XOP/LWP (8F map >= 8) is legal under `{vex}`. This postcondition
@@ -1538,18 +1714,26 @@ impl InstructionEncoder {
         // family) also precedes 0x67: GAS 2.47 emits `9b 67 d9 ...' for
         // `fstenv (%ebp)' — the WAIT prefix is a separate instruction, so
         // the address-size prefix lands on the x87 body, not on it.
-        if result.is_ok() && need67 {
-            // Normalize a [segment][9b] head to [9b][segment]: the
-            // operand-segment chokepoint above runs before the encoder
-            // body pushed the WAIT byte, but GAS orders the WAIT first
-            // (`fstenv %fs:(%ebp)' = 9b 64 67 d9 75 00).
-            if self.bytes.len() >= start_len + 2 {
-                let a = self.bytes[start_len];
-                let b = self.bytes[start_len + 1];
-                if matches!(a, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) && b == 0x9B {
+        //
+        // Normalize a [segment][9b] head to [9b][segment] first: the
+        // operand-segment chokepoint above runs before the encoder body
+        // pushed the WAIT byte, and a prefix in front of WAIT is WAIT's,
+        // so the x87 instruction behind it addressed the default segment
+        // (`fsave %fs:(%rdx)' was `64 9b dd 32'; GAS: `9b 64 dd 32', and
+        // `fstenv %fs:(%ebp)' = 9b 64 67 d9 75 00). Only where an x87
+        // instruction follows: `fs wait' is a prefix on WAIT itself.
+        if result.is_ok() {
+            if let [a, 0x9B, rest @ ..] = &self.bytes[start_len..] {
+                let x87 = rest
+                    .iter()
+                    .find(|b| !matches!(b, 0x40..=0x4F | 0x66))
+                    .is_some_and(|b| matches!(b, 0xD8..=0xDF));
+                if matches!(a, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) && x87 {
                     self.bytes.swap(start_len, start_len + 1);
                 }
             }
+        }
+        if result.is_ok() && need67 {
             let mut at = start_len;
             while at < self.bytes.len() {
                 if matches!(
@@ -6180,22 +6364,14 @@ impl InstructionEncoder {
             // ---- Suffix-less shrd/shld ----
             "shrd" => {
                 if ops.len() == 3 || ops.len() == 4 {
-                    let size = match ops.last() {
-                        Some(Operand::Register(r)) => infer_reg_size(&r.name),
-                        _ => 8,
-                    };
-                    self.encode_double_shift(ops, 0xAC, size)
+                    self.encode_double_shift(ops, 0xAC, double_shift_size(ops))
                 } else {
                     Err("shrd requires 3 or 4 operands".to_string())
                 }
             }
             "shld" => {
                 if ops.len() == 3 || ops.len() == 4 {
-                    let size = match ops.last() {
-                        Some(Operand::Register(r)) => infer_reg_size(&r.name),
-                        _ => 8,
-                    };
-                    self.encode_double_shift(ops, 0xA4, size)
+                    self.encode_double_shift(ops, 0xA4, double_shift_size(ops))
                 } else {
                     Err("shld requires 3 or 4 operands".to_string())
                 }
@@ -6944,6 +7120,88 @@ mod apx_tests {
         assert!(fails("{nf} cmovzq %rax, %rbx, %r16"));
         assert!(fails("{evex} cmovzq %rax, %rbx"));
         assert!(fails("{evex} pushq %rax"));
+    }
+
+    /// Bytes and relocations of GNU as 2.47.
+    #[test]
+    fn apx_shifts_and_rotates_take_memory() {
+        assert_eq!(hex("{nf} rol %cl, (%rsp)"), "62 f4 7c 0c d3 04 24");
+        assert_eq!(hex("{nf} rol $1, (%rsp)"), "62 f4 7c 0c d1 04 24");
+        assert_eq!(hex("{nf} rolw $5, (%rsp), %cx"), "62 f4 75 1c c1 04 24 05");
+        assert_eq!(
+            hex("{nf} sar %cl, 0x12(%rbx,%rsi,4), %ecx"),
+            "62 f4 74 1c d3 7c b3 12"
+        );
+        assert_eq!(
+            hex("{nf} shl $5, 0x1000, %sil"),
+            "62 f4 4c 1c c0 24 25 00 10 00 00 05"
+        );
+        assert_eq!(hex("shl $5, (%rdx), %ecx"), "62 f4 74 18 c1 22 05");
+        assert_eq!(hex("rcl $5, (%rdx), %ecx"), "62 f4 74 18 c1 12 05");
+        assert_eq!(hex("{evex} rcl $5, (%rdx)"), "62 f4 7c 08 c1 12 05");
+        // The immediate behind a RIP-relative address: its byte is between
+        // the displacement and the end of the instruction.
+        let (bytes, relocations) = hex_relocs("{nf} shlq $0x90, sym(%rip)");
+        assert_eq!(bytes, "62 f4 fc 0c c1 25 00 00 00 00 90");
+        assert_eq!(relocations, [2]);
+        // No flags to leave alone for the rotations through carry.
+        assert!(fails("{nf} rcl $1, (%rsp)"));
+    }
+
+    /// A shift, a double shift and `inc` take the operand size from the
+    /// mnemonic and a register by its number: each of these was assembled
+    /// into the instruction on a register of the mnemonic's size.
+    #[test]
+    fn a_register_of_another_size_than_the_mnemonics_is_refused() {
+        for statement in [
+            "sarl $1, %r9b",
+            "rolb $7, %cx",
+            "shl %cl, %ecx, %sil",
+            "sal %cl, %r9w, %r13",
+            "shrd %cl, %ebp, %r13",
+            "shrdl $0x90, %r9, (%rbp)",
+            "{nf} shldl $5, %cx, %cx, %cx",
+            "incw %cl",
+            "incb %cx",
+            "incl %r9w",
+            "incb (%rbp), %r9d",
+            "incw %cl, %cl",
+            "{nf} incq (%rbp), %r9d",
+            "{nf} rol %cl, %cx, %rcx",
+        ] {
+            assert!(fails(statement), "`{statement}` was assembled");
+        }
+        // The count is `%cl` whatever is shifted.
+        assert_eq!(hex("sall %cl, %ecx"), "d3 e1");
+        assert_eq!(hex("shld %cl, %ebx, %ecx"), "0f a5 d9");
+        assert_eq!(hex("shlb %cl"), "d0 e1");
+        assert_eq!(hex("incw %cx"), "66 ff c1");
+        assert_eq!(hex("in %dx, %al"), "ec");
+    }
+
+    /// `movdir64b` and `enqcmd` name their destination by a register that
+    /// holds its address: as wide as the address of the source is, which
+    /// decides the address-size prefix for both.
+    #[test]
+    fn a_register_that_names_an_address_is_as_wide_as_the_other_address() {
+        for statement in [
+            "movdir64b (%rdx), %ecx",
+            "movdir64b (%edx), %rcx",
+            "movdir64b sym(%rip), %ecx",
+            "movdir64b (,%rdx,2), %ecx",
+            "enqcmd 8(%rsp), %ecx",
+        ] {
+            assert!(fails(statement), "`{statement}` was assembled");
+        }
+        assert_eq!(hex("movdir64b (%ecx), %ecx"), "67 66 0f 38 f8 09");
+        assert_eq!(hex("movdir64b (%rdx,%rcx), %rax"), "66 0f 38 f8 04 0a");
+        // Under the prefix an address has 32 bits and no sign.
+        let (bytes, relocations) = hex_relocs("movdir64b sym, %ecx");
+        assert_eq!(bytes, "67 66 0f 38 f8 0c 25 00 00 00 00");
+        assert_eq!(relocations, [R_X86_64_32]);
+        let (bytes, relocations) = hex_relocs("movdir64b sym, %rcx");
+        assert_eq!(bytes, "66 0f 38 f8 0c 25 00 00 00 00");
+        assert_eq!(relocations, [R_X86_64_32S]);
     }
 
     #[test]
