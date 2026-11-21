@@ -1,0 +1,389 @@
+;;; table_segment_words
+	.text
+	sldt %ax
+	sldt %eax
+	sldt (%edx)
+	sldtw (%edx)
+	str %ax
+	str %eax
+	str (%edx)
+	smsw %ax
+	smsw %eax
+	smsw (%edx)
+	lldt %ax
+	lldt %eax
+	lldt (%edx)
+	lldtw (%edx)
+	ltr %ax
+	ltr (%edx)
+	verr %ax
+	verr %ecx
+	verr (%edx)
+	verrw (%edx)
+	verw %ax
+	verw (%edx)
+	lmsw %ax
+	lmsw (%edx)
+	lar %cx, %ax
+	lar %ecx, %eax
+	lar %cx, %eax
+	lar (%edx), %eax
+	larw (%edx), %ax
+	lsl %cx, %ax
+	lsl (%edx), %eax
+	invlpgb
+	invlpgb %eax, %ecx, %edx
+	arpl %ax, %cx
+	arpl %ax, (%edx)
+	arpl %eax, %ecx
+	lgdt (%edx)
+	lgdtw (%edx)
+	lgdtl (%edx)
+	lidt (%edx)
+	sgdt (%edx)
+	sidt (%edx)
+	sgdtw (%edx)
+	clts
+	invlpg (%edx)
+;;; table_port_io
+	.text
+	in $5, %al
+	in $5, %ax
+	in $5, %eax
+	in %dx, %al
+	in %dx, %eax
+	in (%dx), %ax
+	in $5
+	inb $5
+	inw %dx
+	out %al, $5
+	out %eax, $5
+	out %al, %dx
+	out %ax, (%dx)
+	out $5
+	outb %dx
+	outl $5
+;;; table_frames_flags_returns
+	.text
+	enter $0x1234, $5
+	enterl $0x1234, $5
+	enterw $0x1234, $5
+	leave
+	leavel
+	leavew
+	pushf
+	pushfl
+	pushfw
+	popf
+	popfl
+	popfw
+	iret
+	iretw
+	iretl
+	lret
+	lretw
+	lretl
+	lret $8
+	retf
+	retfw
+	retf $8
+	ret
+	retw
+	retl
+	ret $8
+	retw $8
+	bound %eax, (%edx)
+	boundw %ax, (%edx)
+	boundl %eax, (%edx)
+	pusha
+	pushal
+	pushaw
+	popa
+	popal
+	popaw
+;;; table_translation_traps_decimal
+	.text
+	xlat
+	xlatb
+	xlat (%ebx)
+	xlat %es:(%ebx)
+	int1
+	into
+	ud0
+	ud1
+	ud2
+	ud2a
+	ud2b
+	ud0 %ecx, %eax
+	ud0 (%edx), %eax
+	ud0 %cx, %ax
+	ud1 %ecx, %eax
+	ud1w (%edx), %ax
+	ud2b (%edx), %eax
+	aaa
+	aas
+	aad
+	aam
+	aad $7
+	aam $7
+	daa
+	das
+;;; table_far_pointers
+	.text
+	lfs (%edx), %cx
+	lfs (%edx), %ecx
+	lfsw (%edx), %cx
+	lgs (%edx), %ecx
+	lss (%edx), %ecx
+	lds (%edx), %ecx
+	les (%edx), %ecx
+	lds (%edx), %cx
+	ljmp $0x10, $0x1234
+	lcall $0x10, $0x1234
+	ljmp *(%edx)
+	lcall *(%edx)
+	ljmpw *(%edx)
+	ljmpl *(%edx)
+;;; table_waiting_tracing_direct_stores
+	.text
+	tpause %ecx
+	tpause %ecx, %edx, %eax
+	umwait %ecx
+	umonitor %ecx
+	umonitor %cx
+	ptwrite %ecx
+	ptwrite (%edx)
+	ptwritel (%edx)
+	cldemote (%edx)
+	movdiri %ecx, (%edx)
+	movdir64b (%edx), %ecx
+	movdir64b (%bx), %cx
+	enqcmd (%edx), %ecx
+	enqcmds (%edx), %ecx
+;;; table_virtualisation
+	.text
+	clgi
+	stgi
+	vmrun
+	vmrun %eax
+	vmrun %ax
+	vmload %eax
+	vmsave %eax
+	skinit %eax
+	invlpga
+	invlpga %eax, %ecx
+	invlpga %ax, %ecx
+	vmgexit
+	clzero
+	clzero %eax
+	clzero %ax
+	pvalidate
+	pvalidate %eax, %ecx, %edx
+	tlbsync
+;;; table_transactions_and_state
+	.text
+	xbegin 1f
+	xbegin ext
+	xend
+	xabort $5
+	xtest
+	cmpxchg8b (%edx)
+	xsave (%edx)
+	fxsave (%edx)
+	xsusldtrk
+1:	nop
+;;; table_privilege_and_keys
+	.text
+	hreset $5
+	wrmsrns
+	pconfig
+	tdcall
+	getsec
+	rsm
+	femms
+	xstore
+	xcryptecb
+	xsha1
+	montmul
+	rdpru
+	mcommit
+;;; table_count_branches
+	.text
+	loop 1f
+	loopw 1f
+	loopl 1f
+	loope 1f
+	loopew 1f
+	loopnz 1f
+	loopnzl 1f
+	jecxz 1f
+	jcxz 1f
+1:	nop
+;;; a_16_bit_register_or_segment_on_the_stack
+	.text
+	push %cx
+	pop %cx
+	push %bp
+	pop %di
+	pushw %cx
+	popw %dx
+	pushw %es
+	popw %es
+	pushw %fs
+	popw %gs
+	pushw %ds
+	popw %ss
+	push %es
+	pop %ds
+	pushl %es
+	popl %ds
+	push %ecx
+	pop %ecx
+;;; shift_of_memory_by_the_count_register
+	.text
+	shl %cl, (%ebp)
+	shl %cl, (%esp)
+	shr %cl, 0x1000
+	sar %cl, (%edx)
+	rol %cl, 0x12(%ebx,%esi,4)
+	ror %cl, 0x1234(,%edi,2)
+	rcr %cl, (%edx)
+	rcl %cl, (%edx)
+	sal %cl, (%edx)
+	rcl $1, %cl
+	rcl $5, %cl
+	rcl %cl
+	rcl %cl, %cl
+	rcl %cl, %dh
+	rcl $0x90, %dh
+	rcl $1, %cx
+	rcl %cl, %cx
+	rcl %cx
+	rcr $1, %cx
+	shl %cl, %cx
+	shl %cl
+	shlb %cl, (%edx)
+	shlw %cl, (%edx)
+;;; double_shifts_in_32_bit_code
+	.text
+	shld $5, %cx, %cx
+	shld %cl, %cx, %cx
+	shrd $5, %cx, %cx
+	shrd %cl, %cx, %cx
+	shld $5, %ecx, %edx
+	shld $0x90, %cx, 0x12(%ebx,%esi,4)
+	shrd $5, %ecx, (%esp)
+	shld %cx, %cx
+	shrd %ebp, (%ebp)
+	shldl %cl, %eax, (%edx)
+	shrdw $5, %cx, (%eax)
+;;; far_jumps_and_calls_by_size
+	.text
+	ljmpl $0x1234, $0x1234
+	ljmpl $0x1234, $0x12345678
+	ljmp $0x10, $0x1234
+	ljmpw $0x1234, $0x5678
+	ljmpw $0x1234, $ext
+	ljmp $0x1234, $ext
+	ljmpl $0x1234, $ext
+	lcallw $0x1234, $ext
+	lcallw $0x1234, $0x5678
+	lcall $0x1234, $ext
+	ljmp *(%edx)
+	ljmpw *(%edx)
+	ljmpl *(%edx)
+	ljmpw *0x12(%ebx,%esi,4)
+	lcall *(%edx)
+	lcallw *(%edx)
+;;; symbolic_immediate_as_wide_as_the_operation
+	.text
+	adc $ext, %dh
+	adcb $ext, %dh
+	add $ext, %dh
+	cmp $ext, %cl
+	or $ext, %dh
+	sub $ext, %dh
+	addb $ext, (%ebp)
+	andb $ext, (%esp)
+	orb $ext, 0x12(%ebx,%esi,4)
+	cmpb $ext, (%ebp)
+	addw $ext, (%ebp)
+	andw $ext, (%esp)
+	orw $ext, 0x1000
+	xorw $ext, 0x12(%ebx,%esi,4)
+	cmpw $ext, 0x1234(,%edi,2)
+	addl $ext, (%ebp)
+	add $ext, %cx
+	add $ext, %ecx
+	add $ext, %al
+	add $ext, %ax
+;;; x87_operands_without_a_size
+	.text
+	fisttp (%ebp)
+	fisttp 8(%esp)
+	fild (%esp)
+	fist (%esp)
+	fistp (%esp)
+	fld (%esp)
+	fst (%esp)
+	fstp (%esp)
+	fadd (%esp)
+	fmul (%esp)
+	fsub (%esp)
+	fsubr (%esp)
+	fdiv (%esp)
+	fdivr (%esp)
+	fcom (%esp)
+	fcomp (%esp)
+	fcoms (%esp)
+	fcoml (%esp)
+	fiadd (%esp)
+	ficom (%esp)
+	fisub (%esp)
+	fbld (%esp)
+	fbstp (%esp)
+	fldenvs (%esp)
+	fldenvl (%esp)
+	fnsaves (%esp)
+	fst %st(2)
+	fcompi %st(1)
+	fucompi
+	fdisi
+	fneni
+	fadds sym
+	faddl sym
+	fild sym
+;;; vector_forms_shared_with_64_bit_code
+	.text
+	addsubps sym, %xmm6
+	cmpeqps (%edx), %xmm1
+	cmpeqps sym, %xmm1
+	cmpltsd 0x12(%ebx,%esi,4), %xmm6
+	cmpneqpd %xmm1, %xmm6
+	cmpordss sym, %xmm1
+	pmaddubsw sym, %mm3
+	pmaddubsw (%edx), %xmm1
+	phsubd %mm3, %mm7
+	pabsw sym, %xmm6
+	sha1msg1 (%edx), %xmm1
+	sha256rnds2 %xmm6, %xmm1
+	paddusw %mm3, %mm7
+	packuswb sym, %mm3
+	movntdq %xmm1, sym
+	movntpd %xmm6, sym
+	pclmullqlqdq %xmm1, %xmm6
+	pclmulhqhqdq (%edx), %xmm1
+	pcmpeqq sym, %xmm1
+	pmovsxbq (%edx), %xmm1
+	blendvps %xmm0, sym, %xmm1
+	kandw %k2, %k5, %k2
+	kandnd %k2, %k5, %k2
+	korq %k2, %k5, %k2
+	kshiftlw $5, %k2, %k5
+	kunpckbw %k2, %k5, %k2
+	kxnorw %k2, %k5, %k2
+	knotb %k2, %k5
+	kaddb %k2, %k5, %k2
+;;; operands_the_64_bit_encoder_must_not_lend reject
+	.text
+	cvtsi2sdq (%eax), %xmm0

@@ -1,0 +1,449 @@
+;;; table_segment_words
+	.text
+	lkgs %cx
+	lkgs %ecx
+	lkgs %rcx
+	lkgs %r9w
+	lkgs (%rdx)
+	lkgsw (%rdx)
+;;; table_port_io
+	.text
+	in $5, %al
+	in $5, %ax
+	in $5, %eax
+	in %dx, %al
+	in %dx, %ax
+	in %dx, %eax
+	in (%dx), %al
+	in (%dx), %eax
+	in $5
+	in %dx
+	in (%dx)
+	inb $5
+	inw $5
+	inl $5
+	inb %dx
+	inw %dx
+	inl %dx
+	inb (%dx)
+	inb $5, %al
+	inw $5, %ax
+	inl $5, %eax
+	inb %dx, %al
+	inw (%dx), %ax
+	out %al, $5
+	out %ax, $5
+	out %eax, $5
+	out %al, %dx
+	out %ax, %dx
+	out %eax, %dx
+	out %al, (%dx)
+	out %eax, (%dx)
+	out $5
+	out %dx
+	out (%dx)
+	outb $5
+	outw $5
+	outl $5
+	outb %dx
+	outw %dx
+	outl %dx
+	outb (%dx)
+	outb %al, $5
+	outw %ax, $5
+	outl %eax, $5
+	outb %al, %dx
+	outl %eax, (%dx)
+;;; table_frames_flags_returns
+	.text
+	enter $0x1234, $5
+	enterq $0x1234, $5
+	enterw $0x1234, $5
+	leave
+	leaveq
+	leavew
+	pushf
+	pushfq
+	pushfw
+	popf
+	popfq
+	popfw
+	iret
+	iretw
+	iretl
+	iretq
+	lret
+	lretw
+	lretl
+	lretq
+	lret $8
+	lretw $8
+	lretq $8
+	retf
+	retfw
+	retfl
+	retfq
+	retf $8
+	retfq $8
+	ret
+	retw
+	retq
+	ret $8
+	retw $8
+	retq $8
+;;; table_translation_and_traps
+	.text
+	xlat
+	xlatb
+	xlat (%rbx)
+	xlatb (%rbx)
+	xlat %fs:(%rbx)
+	int1
+	int3
+	int $3
+	ud0
+	ud1
+	ud2
+	ud2a
+	ud2b
+	udb
+	ud0 %ecx, %eax
+	ud0 (%rdx), %eax
+	ud0 %rcx, %rax
+	ud0 %cx, %ax
+	ud0l %ecx, %eax
+	ud0q (%rdx), %rax
+	ud0w (%rdx), %ax
+	ud1 %ecx, %eax
+	ud1 (%rdx), %r9
+	ud1q (%rdx), %rax
+	ud1w %cx, %ax
+	ud2b %ecx, %eax
+	ud2b (%rdx), %eax
+	ud2bl (%rdx), %eax
+	int1
+;;; table_far_pointers
+	.text
+	lfs (%rdx), %cx
+	lfs (%rdx), %ecx
+	lfsw (%rdx), %cx
+	lfsl (%rdx), %ecx
+	lgs (%rdx), %ecx
+	lss (%rdx), %ecx
+	lss (%rdx), %r9w
+;;; table_waiting_tracing_direct_stores
+	.text
+	tpause %ecx
+	tpause %ecx, %edx, %eax
+	tpause %r9d
+	umwait %ecx
+	umwait %ecx, %edx, %eax
+	umonitor %rcx
+	umonitor %ecx
+	umonitor %r9
+	ptwrite %ecx
+	ptwrite %rcx
+	ptwrite (%rdx)
+	ptwritel (%rdx)
+	ptwriteq (%rdx)
+	ptwrite %r9
+	cldemote (%rdx)
+	cldemote 8(%r9,%r10,2)
+	movdiri %ecx, (%rdx)
+	movdiri %rcx, (%rdx)
+	movdiril %ecx, (%rdx)
+	movdiriq %r9, (%rdx)
+	movdir64b (%rdx), %rcx
+	movdir64b (%edx), %ecx
+	movdir64b (%rdx), %r9
+	enqcmd (%rdx), %rcx
+	enqcmd (%edx), %ecx
+	enqcmds (%rdx), %rcx
+	enqcmds (%rdx), %r9
+;;; table_virtualisation
+	.text
+	clgi
+	stgi
+	vmrun
+	vmrun %rax
+	vmrun %eax
+	vmload
+	vmload %rax
+	vmload %eax
+	vmsave
+	vmsave %rax
+	skinit
+	skinit %eax
+	invlpga
+	invlpga %rax, %ecx
+	invlpga %eax, %ecx
+	vmgexit
+	clzero
+	clzero %rax
+	clzero %eax
+	psmash
+	psmash %rax
+	psmash %eax
+	pvalidate
+	pvalidate %rax, %ecx, %edx
+	rmpadjust
+	rmpadjust %rax, %rcx, %rdx
+	rmpupdate
+	rmpupdate %rax, %rcx
+	rmpquery
+	rmpread %rax, (%rdx)
+	tlbsync
+	invlpgb
+	invlpgb %rax, %ecx, %edx
+;;; table_transactions_and_state
+	.text
+	xbegin 1f
+	xbegin ext
+	xend
+	xabort $5
+	xtest
+	cmpxchg8b (%rdx)
+	cmpxchg8bq (%rdx)
+	cmpxchg16b (%rdx)
+	xsave (%rdx)
+	xsaveq (%rdx)
+	xsave64 (%rdx)
+	xrstor (%rdx)
+	xrstorq (%rdx)
+	xsaveopt (%rdx)
+	xsaveoptq (%rdx)
+	xsavec (%rdx)
+	xsaves (%rdx)
+	xrstors (%rdx)
+	fxsave (%rdx)
+	fxsaveq (%rdx)
+	fxsave64 (%rdx)
+	fxrstor (%rdx)
+	fxrstorq (%rdx)
+	xsusldtrk
+	xresldtrk
+1:	nop
+;;; table_privilege_and_keys
+	.text
+	hreset $5
+	senduipi %rcx
+	senduipi %r9
+	testui
+	clui
+	stui
+	uiret
+	erets
+	eretu
+	rdmsrlist
+	wrmsrlist
+	wrmsrns
+	pconfig
+	pbndkb
+	seamcall
+	seamops
+	seamret
+	tdcall
+	getsec
+	rsm
+	rdpru
+	mcommit
+	wrussq %rcx, (%rdx)
+;;; table_padlock
+	.text
+	femms
+	xstore
+	xstorerng
+	xcryptecb
+	xcryptcbc
+	xcryptctr
+	xcryptcfb
+	xcryptofb
+	xsha1
+	xsha256
+	montmul
+	montmul2
+	xmodexp
+	xrng2
+	xsha384
+	xsha512
+	sm2
+	sm3
+	sm4
+;;; table_count_branches
+	.text
+	loop 1f
+	loopl 1f
+	loopq 1f
+	loope 1f
+	loopel 1f
+	loopeq 1f
+	loopz 1f
+	loopzl 1f
+	loopne 1f
+	loopnel 1f
+	loopnz 1f
+	loopnzq 1f
+	jrcxz 1f
+	jecxz 1f
+1:	nop
+;;; unsuffixed_memory_operation_is_32_bit
+	.text
+	add $7, (%rbp)
+	add $0x90, (%rdx)
+	add $0x12345678, sym(%rip)
+	adc $-3, (%rsp)
+	adc $7, 0x12(%rbx,%rsi,4)
+	and $0x12345678, 0x1234(%r9,%r10,2)
+	and $-3, 0x1000
+	cmp $7, sym(%rip)
+	cmp $0x1234, (%rbp)
+	or $-3, (%rsp)
+	or $0x90, sym(%rip)
+	sbb $7, (%rdx)
+	sub $-3, 8(%rsp)
+	xor $0x12345678, 0x1234(%r9,%r10,2)
+	test $5, (%rdx)
+	test $0x1234, sym(%rip)
+	mov $1, (%rax)
+	ccmpb $7, (%rdx)
+	ccmpae $-3, (%rbp)
+	ctestbe $5, (%rdx)
+;;; rotate_and_shift_of_a_byte_register
+	.text
+	rcl $1, %cl
+	rcl $5, %cl
+	rcl %cl
+	rcl %cl, %cl
+	rcl $1, %dh
+	rcr $1, %cl
+	rcr $5, %cl
+	rcr %cl
+	rcr %cl, %cl
+	sal $1, %cl
+	sal $5, %cl
+	sal $0x90, %cl
+	sal %cl
+	sal %cl, %cl
+	sal $1, %sil
+	rcl $1, %cx
+	rcl %cl, %r9w
+	rcr $3, %rdx
+	sal %cl, %eax
+	rcl $1, %cl, %cl
+	sal %cl, %cl, %cl
+;;; rip_relative_address_in_front_of_an_immediate
+	.text
+	vpinsrw $0x90, sym(%rip), %xmm17, %xmm9
+	vpinsrw $0x90, sym(%rip), %xmm9, %xmm17
+	vpinsrb $0x90, sym(%rip), %xmm1, %xmm17
+	vinsertps $5, sym(%rip), %xmm17, %xmm9
+	vpextrb $5, %xmm17, sym(%rip)
+	vpextrw $5, %xmm17, sym+8(%rip)
+	adc $-3, sym(%rip), %r9d
+	sub $-3, sym(%rip), %r9d
+	xor $-3, sym(%rip), %rcx
+	xor $0x1234, sym(%rip), %ecx
+	xorl $0x90, sym(%rip), %ebp
+	ccmpab $0x90, sym(%rip)
+	ccmpal $0x90, sym(%rip)
+	ccmpaq $0x90, sym(%rip)
+	ccmpaw $0x90, sym(%rip)
+	ccmpll $-3, sym(%rip)
+	ctestb $5, sym(%rip)
+	ctestbl $5, sym(%rip)
+	ctestbw $5, sym(%rip)
+	vpmacsdd %xmm9, sym(%rip), %xmm9, %xmm9
+	vpmacsww %xmm9, sym(%rip), %xmm1, %xmm1
+	lwpval $0x12345678, sym(%rip), %rcx
+	lwpins $0x12345678, sym(%rip), %eax
+	vpinsrw $1, sym(%rip), %xmm1, %xmm2
+	pinsrw $1, sym(%rip), %xmm2
+	cmpl $0x12345678, sym(%rip)
+	imul $0x1234, sym(%rip), %eax
+	shld $5, %eax, sym(%rip)
+	vpshufd $5, sym(%rip), %zmm2
+	vpternlogd $5, sym(%rip), %zmm1, %zmm2
+;;; setcc_into_a_wide_register
+	.text
+	seta %ecx
+	seta %ebp
+	seta %r9d
+	seta %rcx
+	seta %r13
+	setz %ecx
+	setz %r9
+	setae %eax
+	setne %edi
+;;; symbolic_immediate_relocation_class
+	.text
+	and $ext, %r9d
+	adc $ext, %ebp
+	add $ext, %ecx
+	cmp $ext, %ecx
+	or $ext, %ebp
+	sub $ext, %r9d
+	sub $ext, %rbx
+	add $ext, %eax
+	movw $ext, (%rdi)
+	movb $ext, (%rdi)
+	movl $ext, (%rdi)
+	movq $ext, (%rdi)
+	movw $ext+2, 8(%rsp)
+;;; double_shift_into_memory
+	.text
+	shld $0x90, %cx, 0x1234(%r9,%r10,2)
+	shld $0x90, %ebp, 0x1000
+	shld $0x90, %r13, sym(%rip)
+	shld $5, %r9, 0x12(%rbx,%rsi,4)
+	shrd $0x90, %cx, sym(%rip)
+	shrd $5, %ecx, 0x1000
+	shrd $0x90, %r9w, (%rbp)
+	shld %cl, %r13, (%rsp)
+	shrd %cl, %eax, 8(%rdx)
+	shld %ebp, (%rdx)
+	shld %cx, %cx
+	shrd %r9, (%rdx)
+	shldq %cl, %r13, (%rsp)
+	shldl %ebp, (%rdx)
+	shrdw $5, %cx, (%rax)
+;;; x87_operands_without_a_size
+	.text
+	fadd (%rbp)
+	fmul (%rdx)
+	fsub (%rsp)
+	fsubr 8(%rax)
+	fdiv (%rdx)
+	fdivr (%rdx)
+	fcom (%rdx)
+	fcomp (%rdx)
+	fld (%rbp)
+	fst (%rdx)
+	fstp (%rdx)
+	fiadd (%rdx)
+	fimul (%rdx)
+	ficom (%rdx)
+	ficomp (%rdx)
+	fisub (%rdx)
+	fisubr (%rdx)
+	fidiv (%rdx)
+	fidivr (%rdx)
+	fild (%rdx)
+	fist (%rdx)
+	fistp (%rdx)
+	fisttp (%rsp)
+	fbld (%rdx)
+	fbstp (%rdx)
+	fst %st(2)
+	fcompi
+	fcompi %st(1)
+	fucompi
+	fucompi %st(1)
+	fneni
+	fndisi
+	fnsetpm
+	frstpm
+	feni
+	fdisi
+	fsetpm
+	fcoms (%rdx)
+	fcoml (%rdx)

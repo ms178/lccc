@@ -1,0 +1,749 @@
+;;; segment_moves
+	.text
+	mov %ds, %ax
+	mov %ax, %es
+	mov %ds, %r9w
+	mov %r9w, %es
+	mov %ds, %eax
+	mov %eax, %es
+	mov %ds, %r10d
+	mov %r10d, %es
+	mov %ds, %rax
+	mov %rax, %es
+	mov %ds, %r11
+	mov %r11, %es
+	movw %ds, %ax
+	movw %ax, %es
+	movw %ds, %r9w
+	movw %r9w, %es
+	movl %ds, %eax
+	movl %eax, %es
+	movl %ds, %r10d
+	movl %r10d, %es
+	movq %ds, %rax
+	movq %rax, %es
+	movq %ds, %r11
+	movq %r11, %es
+	mov %fs, (%rax)
+	mov (%rax), %gs
+	mov %fs, sym(%rip)
+	movw %fs, (%rax)
+	movw (%rax), %gs
+	movw %fs, sym(%rip)
+	mov %cs, %eax
+	mov %eax, %cs
+	mov (%rax), %cs
+	movw %ax, %cs
+	mov sym, %ds
+	mov %ds, sym
+;;; reject_mov_ds_al reject
+	.text
+	mov %ds, %al
+;;; reject_mov_al_es reject
+	.text
+	mov %al, %es
+;;; reject_mov_ds_ah reject
+	.text
+	mov %ds, %ah
+;;; reject_mov_ah_es reject
+	.text
+	mov %ah, %es
+;;; reject_mov_ds_sil reject
+	.text
+	mov %ds, %sil
+;;; reject_mov_sil_es reject
+	.text
+	mov %sil, %es
+;;; reject_mov_ds_r8b reject
+	.text
+	mov %ds, %r8b
+;;; reject_mov_r8b_es reject
+	.text
+	mov %r8b, %es
+;;; reject_mov_ds_xmm0 reject
+	.text
+	mov %ds, %xmm0
+;;; reject_mov_xmm0_es reject
+	.text
+	mov %xmm0, %es
+;;; reject_mov_ds_mm0 reject
+	.text
+	mov %ds, %mm0
+;;; reject_mov_mm0_es reject
+	.text
+	mov %mm0, %es
+;;; reject_mov_ds_st reject
+	.text
+	mov %ds, %st
+;;; reject_mov_st_es reject
+	.text
+	mov %st, %es
+;;; reject_mov_ds_ymm1 reject
+	.text
+	mov %ds, %ymm1
+;;; reject_mov_ymm1_es reject
+	.text
+	mov %ymm1, %es
+;;; reject_mov_ds_zmm2 reject
+	.text
+	mov %ds, %zmm2
+;;; reject_mov_zmm2_es reject
+	.text
+	mov %zmm2, %es
+;;; reject_mov_ds_k1 reject
+	.text
+	mov %ds, %k1
+;;; reject_mov_k1_es reject
+	.text
+	mov %k1, %es
+;;; reject_mov_ds_cr0 reject
+	.text
+	mov %ds, %cr0
+;;; reject_mov_cr0_es reject
+	.text
+	mov %cr0, %es
+;;; reject_mov_ds_dr0 reject
+	.text
+	mov %ds, %dr0
+;;; reject_mov_dr0_es reject
+	.text
+	mov %dr0, %es
+;;; reject_mov_ds_es reject
+	.text
+	mov %ds, %es
+;;; reject_mov_es_es reject
+	.text
+	mov %es, %es
+;;; reject_mov_ds_fs reject
+	.text
+	mov %ds, %fs
+;;; reject_mov_fs_es reject
+	.text
+	mov %fs, %es
+;;; reject_mov_ds_bnd0 reject
+	.text
+	mov %ds, %bnd0
+;;; reject_mov_bnd0_es reject
+	.text
+	mov %bnd0, %es
+;;; reject_mov_ds_rip reject
+	.text
+	mov %ds, %rip
+;;; reject_mov_rip_es reject
+	.text
+	mov %rip, %es
+;;; reject_mov_ds_eip reject
+	.text
+	mov %ds, %eip
+;;; reject_mov_eip_es reject
+	.text
+	mov %eip, %es
+;;; reject_mov_ds_tmm0 reject
+	.text
+	mov %ds, %tmm0
+;;; reject_mov_tmm0_es reject
+	.text
+	mov %tmm0, %es
+;;; reject_mov_ds_st_1 reject
+	.text
+	mov %ds, %st(1)
+;;; reject_mov_st_1_es reject
+	.text
+	mov %st(1), %es
+;;; reject_movw_ds_al reject
+	.text
+	movw %ds, %al
+;;; reject_movw_al_es reject
+	.text
+	movw %al, %es
+;;; reject_movw_ds_ah reject
+	.text
+	movw %ds, %ah
+;;; reject_movw_ah_es reject
+	.text
+	movw %ah, %es
+;;; reject_movw_ds_sil reject
+	.text
+	movw %ds, %sil
+;;; reject_movw_sil_es reject
+	.text
+	movw %sil, %es
+;;; reject_movw_ds_r8b reject
+	.text
+	movw %ds, %r8b
+;;; reject_movw_r8b_es reject
+	.text
+	movw %r8b, %es
+;;; reject_movw_ds_eax reject
+	.text
+	movw %ds, %eax
+;;; reject_movw_eax_es reject
+	.text
+	movw %eax, %es
+;;; reject_movw_ds_r10d reject
+	.text
+	movw %ds, %r10d
+;;; reject_movw_r10d_es reject
+	.text
+	movw %r10d, %es
+;;; reject_movw_ds_rax reject
+	.text
+	movw %ds, %rax
+;;; reject_movw_rax_es reject
+	.text
+	movw %rax, %es
+;;; reject_movw_ds_r11 reject
+	.text
+	movw %ds, %r11
+;;; reject_movw_r11_es reject
+	.text
+	movw %r11, %es
+;;; reject_movw_ds_xmm0 reject
+	.text
+	movw %ds, %xmm0
+;;; reject_movw_xmm0_es reject
+	.text
+	movw %xmm0, %es
+;;; reject_movw_ds_mm0 reject
+	.text
+	movw %ds, %mm0
+;;; reject_movw_mm0_es reject
+	.text
+	movw %mm0, %es
+;;; reject_movw_ds_st reject
+	.text
+	movw %ds, %st
+;;; reject_movw_st_es reject
+	.text
+	movw %st, %es
+;;; reject_movw_ds_ymm1 reject
+	.text
+	movw %ds, %ymm1
+;;; reject_movw_ymm1_es reject
+	.text
+	movw %ymm1, %es
+;;; reject_movw_ds_zmm2 reject
+	.text
+	movw %ds, %zmm2
+;;; reject_movw_zmm2_es reject
+	.text
+	movw %zmm2, %es
+;;; reject_movw_ds_k1 reject
+	.text
+	movw %ds, %k1
+;;; reject_movw_k1_es reject
+	.text
+	movw %k1, %es
+;;; reject_movw_ds_cr0 reject
+	.text
+	movw %ds, %cr0
+;;; reject_movw_cr0_es reject
+	.text
+	movw %cr0, %es
+;;; reject_movw_ds_dr0 reject
+	.text
+	movw %ds, %dr0
+;;; reject_movw_dr0_es reject
+	.text
+	movw %dr0, %es
+;;; reject_movw_ds_es reject
+	.text
+	movw %ds, %es
+;;; reject_movw_es_es reject
+	.text
+	movw %es, %es
+;;; reject_movw_ds_fs reject
+	.text
+	movw %ds, %fs
+;;; reject_movw_fs_es reject
+	.text
+	movw %fs, %es
+;;; reject_movw_ds_bnd0 reject
+	.text
+	movw %ds, %bnd0
+;;; reject_movw_bnd0_es reject
+	.text
+	movw %bnd0, %es
+;;; reject_movw_ds_rip reject
+	.text
+	movw %ds, %rip
+;;; reject_movw_rip_es reject
+	.text
+	movw %rip, %es
+;;; reject_movw_ds_eip reject
+	.text
+	movw %ds, %eip
+;;; reject_movw_eip_es reject
+	.text
+	movw %eip, %es
+;;; reject_movw_ds_tmm0 reject
+	.text
+	movw %ds, %tmm0
+;;; reject_movw_tmm0_es reject
+	.text
+	movw %tmm0, %es
+;;; reject_movw_ds_st_1 reject
+	.text
+	movw %ds, %st(1)
+;;; reject_movw_st_1_es reject
+	.text
+	movw %st(1), %es
+;;; reject_movl_ds_al reject
+	.text
+	movl %ds, %al
+;;; reject_movl_al_es reject
+	.text
+	movl %al, %es
+;;; reject_movl_ds_ah reject
+	.text
+	movl %ds, %ah
+;;; reject_movl_ah_es reject
+	.text
+	movl %ah, %es
+;;; reject_movl_ds_sil reject
+	.text
+	movl %ds, %sil
+;;; reject_movl_sil_es reject
+	.text
+	movl %sil, %es
+;;; reject_movl_ds_r8b reject
+	.text
+	movl %ds, %r8b
+;;; reject_movl_r8b_es reject
+	.text
+	movl %r8b, %es
+;;; reject_movl_ds_ax reject
+	.text
+	movl %ds, %ax
+;;; reject_movl_ax_es reject
+	.text
+	movl %ax, %es
+;;; reject_movl_ds_r9w reject
+	.text
+	movl %ds, %r9w
+;;; reject_movl_r9w_es reject
+	.text
+	movl %r9w, %es
+;;; reject_movl_ds_rax reject
+	.text
+	movl %ds, %rax
+;;; reject_movl_rax_es reject
+	.text
+	movl %rax, %es
+;;; reject_movl_ds_r11 reject
+	.text
+	movl %ds, %r11
+;;; reject_movl_r11_es reject
+	.text
+	movl %r11, %es
+;;; reject_movl_ds_xmm0 reject
+	.text
+	movl %ds, %xmm0
+;;; reject_movl_xmm0_es reject
+	.text
+	movl %xmm0, %es
+;;; reject_movl_ds_mm0 reject
+	.text
+	movl %ds, %mm0
+;;; reject_movl_mm0_es reject
+	.text
+	movl %mm0, %es
+;;; reject_movl_ds_st reject
+	.text
+	movl %ds, %st
+;;; reject_movl_st_es reject
+	.text
+	movl %st, %es
+;;; reject_movl_ds_ymm1 reject
+	.text
+	movl %ds, %ymm1
+;;; reject_movl_ymm1_es reject
+	.text
+	movl %ymm1, %es
+;;; reject_movl_ds_zmm2 reject
+	.text
+	movl %ds, %zmm2
+;;; reject_movl_zmm2_es reject
+	.text
+	movl %zmm2, %es
+;;; reject_movl_ds_k1 reject
+	.text
+	movl %ds, %k1
+;;; reject_movl_k1_es reject
+	.text
+	movl %k1, %es
+;;; reject_movl_ds_cr0 reject
+	.text
+	movl %ds, %cr0
+;;; reject_movl_cr0_es reject
+	.text
+	movl %cr0, %es
+;;; reject_movl_ds_dr0 reject
+	.text
+	movl %ds, %dr0
+;;; reject_movl_dr0_es reject
+	.text
+	movl %dr0, %es
+;;; reject_movl_ds_es reject
+	.text
+	movl %ds, %es
+;;; reject_movl_es_es reject
+	.text
+	movl %es, %es
+;;; reject_movl_ds_fs reject
+	.text
+	movl %ds, %fs
+;;; reject_movl_fs_es reject
+	.text
+	movl %fs, %es
+;;; reject_movl_ds_bnd0 reject
+	.text
+	movl %ds, %bnd0
+;;; reject_movl_bnd0_es reject
+	.text
+	movl %bnd0, %es
+;;; reject_movl_ds_rip reject
+	.text
+	movl %ds, %rip
+;;; reject_movl_rip_es reject
+	.text
+	movl %rip, %es
+;;; reject_movl_ds_eip reject
+	.text
+	movl %ds, %eip
+;;; reject_movl_eip_es reject
+	.text
+	movl %eip, %es
+;;; reject_movl_ds_tmm0 reject
+	.text
+	movl %ds, %tmm0
+;;; reject_movl_tmm0_es reject
+	.text
+	movl %tmm0, %es
+;;; reject_movl_ds_st_1 reject
+	.text
+	movl %ds, %st(1)
+;;; reject_movl_st_1_es reject
+	.text
+	movl %st(1), %es
+;;; reject_movq_ds_al reject
+	.text
+	movq %ds, %al
+;;; reject_movq_al_es reject
+	.text
+	movq %al, %es
+;;; reject_movq_ds_ah reject
+	.text
+	movq %ds, %ah
+;;; reject_movq_ah_es reject
+	.text
+	movq %ah, %es
+;;; reject_movq_ds_sil reject
+	.text
+	movq %ds, %sil
+;;; reject_movq_sil_es reject
+	.text
+	movq %sil, %es
+;;; reject_movq_ds_r8b reject
+	.text
+	movq %ds, %r8b
+;;; reject_movq_r8b_es reject
+	.text
+	movq %r8b, %es
+;;; reject_movq_ds_ax reject
+	.text
+	movq %ds, %ax
+;;; reject_movq_ax_es reject
+	.text
+	movq %ax, %es
+;;; reject_movq_ds_r9w reject
+	.text
+	movq %ds, %r9w
+;;; reject_movq_r9w_es reject
+	.text
+	movq %r9w, %es
+;;; reject_movq_ds_eax reject
+	.text
+	movq %ds, %eax
+;;; reject_movq_eax_es reject
+	.text
+	movq %eax, %es
+;;; reject_movq_ds_r10d reject
+	.text
+	movq %ds, %r10d
+;;; reject_movq_r10d_es reject
+	.text
+	movq %r10d, %es
+;;; reject_movq_ds_xmm0 reject
+	.text
+	movq %ds, %xmm0
+;;; reject_movq_xmm0_es reject
+	.text
+	movq %xmm0, %es
+;;; reject_movq_ds_mm0 reject
+	.text
+	movq %ds, %mm0
+;;; reject_movq_mm0_es reject
+	.text
+	movq %mm0, %es
+;;; reject_movq_ds_st reject
+	.text
+	movq %ds, %st
+;;; reject_movq_st_es reject
+	.text
+	movq %st, %es
+;;; reject_movq_ds_ymm1 reject
+	.text
+	movq %ds, %ymm1
+;;; reject_movq_ymm1_es reject
+	.text
+	movq %ymm1, %es
+;;; reject_movq_ds_zmm2 reject
+	.text
+	movq %ds, %zmm2
+;;; reject_movq_zmm2_es reject
+	.text
+	movq %zmm2, %es
+;;; reject_movq_ds_k1 reject
+	.text
+	movq %ds, %k1
+;;; reject_movq_k1_es reject
+	.text
+	movq %k1, %es
+;;; reject_movq_ds_cr0 reject
+	.text
+	movq %ds, %cr0
+;;; reject_movq_cr0_es reject
+	.text
+	movq %cr0, %es
+;;; reject_movq_ds_dr0 reject
+	.text
+	movq %ds, %dr0
+;;; reject_movq_dr0_es reject
+	.text
+	movq %dr0, %es
+;;; reject_movq_ds_es reject
+	.text
+	movq %ds, %es
+;;; reject_movq_es_es reject
+	.text
+	movq %es, %es
+;;; reject_movq_ds_fs reject
+	.text
+	movq %ds, %fs
+;;; reject_movq_fs_es reject
+	.text
+	movq %fs, %es
+;;; reject_movq_ds_bnd0 reject
+	.text
+	movq %ds, %bnd0
+;;; reject_movq_bnd0_es reject
+	.text
+	movq %bnd0, %es
+;;; reject_movq_ds_rip reject
+	.text
+	movq %ds, %rip
+;;; reject_movq_rip_es reject
+	.text
+	movq %rip, %es
+;;; reject_movq_ds_eip reject
+	.text
+	movq %ds, %eip
+;;; reject_movq_eip_es reject
+	.text
+	movq %eip, %es
+;;; reject_movq_ds_tmm0 reject
+	.text
+	movq %ds, %tmm0
+;;; reject_movq_tmm0_es reject
+	.text
+	movq %tmm0, %es
+;;; reject_movq_ds_st_1 reject
+	.text
+	movq %ds, %st(1)
+;;; reject_movq_st_1_es reject
+	.text
+	movq %st(1), %es
+;;; reject_movb_ds_al reject
+	.text
+	movb %ds, %al
+;;; reject_movb_al_es reject
+	.text
+	movb %al, %es
+;;; reject_movb_ds_ah reject
+	.text
+	movb %ds, %ah
+;;; reject_movb_ah_es reject
+	.text
+	movb %ah, %es
+;;; reject_movb_ds_sil reject
+	.text
+	movb %ds, %sil
+;;; reject_movb_sil_es reject
+	.text
+	movb %sil, %es
+;;; reject_movb_ds_r8b reject
+	.text
+	movb %ds, %r8b
+;;; reject_movb_r8b_es reject
+	.text
+	movb %r8b, %es
+;;; reject_movb_ds_ax reject
+	.text
+	movb %ds, %ax
+;;; reject_movb_ax_es reject
+	.text
+	movb %ax, %es
+;;; reject_movb_ds_r9w reject
+	.text
+	movb %ds, %r9w
+;;; reject_movb_r9w_es reject
+	.text
+	movb %r9w, %es
+;;; reject_movb_ds_eax reject
+	.text
+	movb %ds, %eax
+;;; reject_movb_eax_es reject
+	.text
+	movb %eax, %es
+;;; reject_movb_ds_r10d reject
+	.text
+	movb %ds, %r10d
+;;; reject_movb_r10d_es reject
+	.text
+	movb %r10d, %es
+;;; reject_movb_ds_rax reject
+	.text
+	movb %ds, %rax
+;;; reject_movb_rax_es reject
+	.text
+	movb %rax, %es
+;;; reject_movb_ds_r11 reject
+	.text
+	movb %ds, %r11
+;;; reject_movb_r11_es reject
+	.text
+	movb %r11, %es
+;;; reject_movb_ds_xmm0 reject
+	.text
+	movb %ds, %xmm0
+;;; reject_movb_xmm0_es reject
+	.text
+	movb %xmm0, %es
+;;; reject_movb_ds_mm0 reject
+	.text
+	movb %ds, %mm0
+;;; reject_movb_mm0_es reject
+	.text
+	movb %mm0, %es
+;;; reject_movb_ds_st reject
+	.text
+	movb %ds, %st
+;;; reject_movb_st_es reject
+	.text
+	movb %st, %es
+;;; reject_movb_ds_ymm1 reject
+	.text
+	movb %ds, %ymm1
+;;; reject_movb_ymm1_es reject
+	.text
+	movb %ymm1, %es
+;;; reject_movb_ds_zmm2 reject
+	.text
+	movb %ds, %zmm2
+;;; reject_movb_zmm2_es reject
+	.text
+	movb %zmm2, %es
+;;; reject_movb_ds_k1 reject
+	.text
+	movb %ds, %k1
+;;; reject_movb_k1_es reject
+	.text
+	movb %k1, %es
+;;; reject_movb_ds_cr0 reject
+	.text
+	movb %ds, %cr0
+;;; reject_movb_cr0_es reject
+	.text
+	movb %cr0, %es
+;;; reject_movb_ds_dr0 reject
+	.text
+	movb %ds, %dr0
+;;; reject_movb_dr0_es reject
+	.text
+	movb %dr0, %es
+;;; reject_movb_ds_es reject
+	.text
+	movb %ds, %es
+;;; reject_movb_es_es reject
+	.text
+	movb %es, %es
+;;; reject_movb_ds_fs reject
+	.text
+	movb %ds, %fs
+;;; reject_movb_fs_es reject
+	.text
+	movb %fs, %es
+;;; reject_movb_ds_bnd0 reject
+	.text
+	movb %ds, %bnd0
+;;; reject_movb_bnd0_es reject
+	.text
+	movb %bnd0, %es
+;;; reject_movb_ds_rip reject
+	.text
+	movb %ds, %rip
+;;; reject_movb_rip_es reject
+	.text
+	movb %rip, %es
+;;; reject_movb_ds_eip reject
+	.text
+	movb %ds, %eip
+;;; reject_movb_eip_es reject
+	.text
+	movb %eip, %es
+;;; reject_movb_ds_tmm0 reject
+	.text
+	movb %ds, %tmm0
+;;; reject_movb_tmm0_es reject
+	.text
+	movb %tmm0, %es
+;;; reject_movb_ds_st_1 reject
+	.text
+	movb %ds, %st(1)
+;;; reject_movb_st_1_es reject
+	.text
+	movb %st(1), %es
+;;; reject_movl_fs_rax reject
+	.text
+	movl %fs, (%rax)
+;;; reject_movl_rax_gs reject
+	.text
+	movl (%rax), %gs
+;;; reject_movl_fs_sym_rip reject
+	.text
+	movl %fs, sym(%rip)
+;;; reject_movq_fs_rax reject
+	.text
+	movq %fs, (%rax)
+;;; reject_movq_rax_gs reject
+	.text
+	movq (%rax), %gs
+;;; reject_movq_fs_sym_rip reject
+	.text
+	movq %fs, sym(%rip)
+;;; reject_movb_fs_rax reject
+	.text
+	movb %fs, (%rax)
+;;; reject_movb_rax_gs reject
+	.text
+	movb (%rax), %gs
+;;; reject_movb_fs_sym_rip reject
+	.text
+	movb %fs, sym(%rip)
+;;; reject_mov_1_ds reject
+	.text
+	mov $1, %ds
+;;; reject_mov_ds_1 reject
+	.text
+	mov %ds, $1

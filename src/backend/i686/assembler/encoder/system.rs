@@ -7,6 +7,27 @@
 use super::*;
 
 impl super::InstructionEncoder {
+    /// The size of an operation that neither a suffix nor a register says
+    /// anything about: the code segment's default, 16 bits in `.code16` and
+    /// `.code16gcc` and 32 bits otherwise. GNU as assumes it, with a
+    /// warning. (It used to be 32 bits everywhere: `add $1, (%bx)` in
+    /// real-mode code came out as `66 83 07 01`, an `addl`, and `mov $1,
+    /// (%bx)` with a four-byte immediate.)
+    pub(super) fn default_operand_size(&self) -> u8 {
+        if self.code16 { 2 } else { 4 }
+    }
+
+    /// The operand size of `mnemonic ops`: its suffix, else its registers,
+    /// else [`Self::default_operand_size`].
+    pub(super) fn operand_size(&self, mnemonic: &str, ops: &[Operand]) -> Result<u8, String> {
+        infer_op_size(
+            mnemonic,
+            ops,
+            mnemonic_size_suffix(mnemonic),
+            self.default_operand_size(),
+        )
+    }
+
     /// Encode prefetch instructions (0F 18 /hint)
     pub(super) fn encode_prefetch(&mut self, ops: &[Operand], hint: u8) -> Result<(), String> {
         if ops.len() != 1 {
@@ -35,107 +56,6 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Encode OUT instruction: outb/outw/outl
-    pub(super) fn encode_out(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-        let size: u8 = match mnemonic {
-            "outb" => 1,
-            "outw" => 2,
-            "outl" => 4,
-            _ => return Err(format!("unknown out mnemonic: {}", mnemonic)),
-        };
-
-        // Handle zero-operand form (implicit operands)
-        if ops.is_empty() {
-            if size == 2 || size == 4 {
-                self.sized_op = true;
-            }
-            if size == 2 {
-                self.bytes.push(0x66);
-            }
-            self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
-            return Ok(());
-        }
-
-        if ops.len() != 2 {
-            return Err(format!("{} requires 0 or 2 operands", mnemonic));
-        }
-
-        match (&ops[0], &ops[1]) {
-            (Operand::Register(_src), Operand::Register(_dst)) => {
-                if size == 2 || size == 4 {
-                    self.sized_op = true;
-                }
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
-                Ok(())
-            }
-            (Operand::Register(_src), Operand::Immediate(ImmediateValue::Integer(val))) => {
-                if size == 2 || size == 4 {
-                    self.sized_op = true;
-                }
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xE6 } else { 0xE7 });
-                self.bytes.push(*val as u8);
-                Ok(())
-            }
-            _ => Err(format!("unsupported {} operands", mnemonic)),
-        }
-    }
-
-    /// Encode IN instruction: inb/inw/inl
-    pub(super) fn encode_in(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-        let size: u8 = match mnemonic {
-            "inb" => 1,
-            "inw" => 2,
-            "inl" => 4,
-            _ => return Err(format!("unknown in mnemonic: {}", mnemonic)),
-        };
-
-        if ops.is_empty() {
-            if size == 2 || size == 4 {
-                self.sized_op = true;
-            }
-            if size == 2 {
-                self.bytes.push(0x66);
-            }
-            self.bytes.push(if size == 1 { 0xEC } else { 0xED });
-            return Ok(());
-        }
-
-        if ops.len() != 2 {
-            return Err(format!("{} requires 0 or 2 operands", mnemonic));
-        }
-
-        match (&ops[0], &ops[1]) {
-            (Operand::Register(_src), Operand::Register(_dst)) => {
-                if size == 2 || size == 4 {
-                    self.sized_op = true;
-                }
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xEC } else { 0xED });
-                Ok(())
-            }
-            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(_dst)) => {
-                if size == 2 || size == 4 {
-                    self.sized_op = true;
-                }
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xE4 } else { 0xE5 });
-                self.bytes.push(*val as u8);
-                Ok(())
-            }
-            _ => Err(format!("unsupported {} operands", mnemonic)),
-        }
-    }
-
     /// Encode INVLPG: 0F 01 /7 (memory operand)
     pub(super) fn encode_invlpg(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 1 {
@@ -147,61 +67,6 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(7, mem)
             }
             _ => Err("invlpg requires memory operand".to_string()),
-        }
-    }
-
-    /// Encode VERW: 0F 00 /5
-    pub(super) fn encode_verw(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("verw requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Memory(mem) => {
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.encode_modrm_mem(5, mem)
-            }
-            Operand::Register(reg) => {
-                let rm = reg_num(&reg.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.bytes.push(self.modrm(3, 5, rm));
-                Ok(())
-            }
-            _ => Err("verw requires memory or register operand".to_string()),
-        }
-    }
-
-    /// Encode LSL (Load Segment Limit): 0F 03 /r
-    pub(super) fn encode_lsl(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() != 2 {
-            return Err("lsl requires 2 operands".to_string());
-        }
-        match (&ops[0], &ops[1]) {
-            (Operand::Register(src), Operand::Register(dst)) => {
-                let src_num = reg_num(&src.name).ok_or("bad register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                // The operand size follows the DESTINATION (GAS 2.47:
-                // `lsl (%edx),%dx` = 66 0f 03 12 but `lsl %dx,%edx` =
-                // 0f 03 d2 — a 16-bit SOURCE with a 32-bit destination
-                // takes NO 66).  The old source-driven check lengthened
-                // the 32-bit-destination form.
-                let is_16 = matches!(
-                    dst.name.as_str(),
-                    "ax" | "bx" | "cx" | "dx" | "si" | "di" | "sp" | "bp"
-                );
-                if is_16 {
-                    self.sized_op = true;
-                    self.bytes.push(0x66);
-                }
-                self.bytes.extend_from_slice(&[0x0F, 0x03]);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
-                Ok(())
-            }
-            (Operand::Memory(mem), Operand::Register(dst)) => {
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x0F, 0x03]);
-                self.encode_modrm_mem(dst_num, mem)
-            }
-            _ => Err("unsupported lsl operands".to_string()),
         }
     }
 
@@ -256,37 +121,6 @@ impl super::InstructionEncoder {
         }
     }
 
-    pub(super) fn encode_system_reg16(
-        &mut self,
-        ops: &[Operand],
-        reg_ext: u8,
-    ) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("system segment instruction requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let rm = reg_num(&reg.name).ok_or_else(|| {
-                    format!("bad register for system segment instruction: {}", reg.name)
-                })?;
-                // GAS 2.47 emits 0x66 for the 16-bit register spellings
-                // (`str %ax` = 66 0f 00 c8, `sldt %ax` = 66 0f 00 c0) and
-                // none for the 32-bit ones (`str %eax` = 0f 00 c8).
-                if matches!(
-                    reg.name.as_str(),
-                    "ax" | "cx" | "dx" | "bx" | "sp" | "bp" | "si" | "di"
-                ) {
-                    self.sized_op = true;
-                    self.bytes.push(0x66);
-                }
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.bytes.push(self.modrm(3, reg_ext, rm));
-                Ok(())
-            }
-            _ => Err("system segment instruction requires a register operand".to_string()),
-        }
-    }
-
     pub(super) fn encode_system_table(
         &mut self,
         ops: &[Operand],
@@ -323,58 +157,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             _ => Err(format!("{} requires memory operand", mnemonic)),
-        }
-    }
-
-    /// Encode LMSW (Load Machine Status Word): 0F 01 /6
-    /// Accepts a 16-bit register or memory operand.
-    pub(super) fn encode_lmsw(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("lmsw requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let rm = reg_num(&reg.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x0F, 0x01]);
-                self.bytes.push(self.modrm(3, 6, rm));
-                Ok(())
-            }
-            Operand::Memory(mem) => {
-                self.bytes.extend_from_slice(&[0x0F, 0x01]);
-                self.encode_modrm_mem(6, mem)
-            }
-            _ => Err("lmsw requires register or memory operand".to_string()),
-        }
-    }
-
-    /// Encode SMSW (Store Machine Status Word): 0F 01 /4
-    /// Accepts a 16-bit register or memory operand.
-    /// Register form gets a 66h prefix for 16-bit operand size.
-    pub(super) fn encode_smsw(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("smsw requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let rm = reg_num(&reg.name).ok_or("bad register")?;
-                // 16-bit register form needs operand size prefix
-                let is_16 = matches!(
-                    reg.name.as_str(),
-                    "ax" | "bx" | "cx" | "dx" | "si" | "di" | "sp" | "bp"
-                );
-                if is_16 {
-                    self.sized_op = true;
-                    self.bytes.push(0x66);
-                }
-                self.bytes.extend_from_slice(&[0x0F, 0x01]);
-                self.bytes.push(self.modrm(3, 4, rm));
-                Ok(())
-            }
-            Operand::Memory(mem) => {
-                self.bytes.extend_from_slice(&[0x0F, 0x01]);
-                self.encode_modrm_mem(4, mem)
-            }
-            _ => Err("smsw requires register or memory operand".to_string()),
         }
     }
 
@@ -540,30 +322,22 @@ impl super::InstructionEncoder {
         match &ops[0] {
             Operand::Register(reg) => {
                 if is_segment_reg(&reg.name) {
-                    // Segment register pops don't use 0x66 prefix
-                    match reg.name.as_str() {
-                        "es" => {
-                            self.bytes.push(0x07);
-                            Ok(())
-                        }
-                        "ss" => {
-                            self.bytes.push(0x17);
-                            Ok(())
-                        }
-                        "ds" => {
-                            self.bytes.push(0x1F);
-                            Ok(())
-                        }
-                        "fs" => {
-                            self.bytes.extend_from_slice(&[0x0F, 0xA1]);
-                            Ok(())
-                        }
-                        "gs" => {
-                            self.bytes.extend_from_slice(&[0x0F, 0xA9]);
-                            Ok(())
-                        }
-                        _ => Err(format!("cannot pop to {}", reg.name)),
-                    }
+                    // A 16-bit pop like any other: `popw %es` is `66 07` in
+                    // 32-bit code (four bytes come off the stack without
+                    // the prefix), and `07` in 16-bit code, where `encode`
+                    // takes the prefix off again.
+                    let opcode: &[u8] = match reg.name.as_str() {
+                        "es" => &[0x07],
+                        "ss" => &[0x17],
+                        "ds" => &[0x1F],
+                        "fs" => &[0x0F, 0xA1],
+                        "gs" => &[0x0F, 0xA9],
+                        _ => return Err(format!("cannot pop to {}", reg.name)),
+                    };
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
+                    self.bytes.extend_from_slice(opcode);
+                    Ok(())
                 } else {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
                     self.sized_op = true;
@@ -614,5 +388,93 @@ impl super::InstructionEncoder {
             }
             _ => Err(format!("unsupported {} operands", mnemonic)),
         }
+    }
+
+    /// Encode `instr` from the table of plain instructions the 64-bit
+    /// encoder shares (`x86::assembler::encoder::table`), in place of what
+    /// an arm that refused it left from `body` on. `None` when the table
+    /// has no row for it, and the arm's own diagnostic stands.
+    pub(super) fn encode_from_table(
+        &mut self,
+        instr: &Instruction,
+        body: usize,
+        relocations: usize,
+    ) -> Option<Result<(), String>> {
+        use crate::backend::x86::assembler::encoder::table::{self, RegField, RmField};
+        let mnemonic = instr.mnemonic.to_ascii_lowercase();
+        // A bare symbol is an address here (`fadds sym`): the table takes
+        // it as the memory operand it is, unless a row wants the label
+        // itself (`xbegin`).
+        let as_written = matches!(table::plan(&mnemonic, &instr.operands, false), Some(Ok(_)));
+        let addresses: Vec<Operand>;
+        let operands: &[Operand] = if as_written {
+            &instr.operands
+        } else {
+            addresses = instr
+                .operands
+                .iter()
+                .cloned()
+                .map(|mut operand| {
+                    crate::backend::x86::assembler::encoder::normalize_bare_label(&mut operand);
+                    operand
+                })
+                .collect();
+            &addresses
+        };
+        let plan = table::plan(&mnemonic, operands, false)?.ok()?;
+        self.bytes.truncate(body);
+        self.relocations.truncate(relocations);
+        // 16-bit code spells an address register differently, and nothing
+        // that takes one is 16-bit code's to run.
+        if self.code16 && plan.names_address {
+            return Some(Err(format!(
+                "`{mnemonic}' with an address register is not supported in 16-bit mode"
+            )));
+        }
+        // Written as 32-bit code; `encode` inverts the operand-size prefix
+        // for 16-bit code where a width was chosen -- by the statement, or
+        // by `.code16gcc`, under which a stack operation is 32 bits wide.
+        self.sized_op = plan.sized || (plan.stack_default && self.code16gcc);
+        if plan.addr_prefix {
+            self.bytes.push(0x67);
+        }
+        if plan.data16 {
+            self.bytes.push(0x66);
+        }
+        if plan.prefix != 0 {
+            self.bytes.push(plan.prefix);
+        }
+        let Some((last, head)) = plan.opcode.split_last() else {
+            return Some(Err("internal: a table row without an opcode".to_string()));
+        };
+        self.bytes.extend_from_slice(head);
+        self.bytes.push(last | plan.opcode_low);
+        let number =
+            |name: &str| reg_num(name).ok_or_else(|| format!("bad register name `%{name}'"));
+        let emitted = (|| -> Result<(), String> {
+            let field = match plan.reg {
+                RegField::None => 0,
+                RegField::Digit(digit) => digit,
+                RegField::Register(name) => number(name)?,
+            };
+            match plan.rm {
+                Some(RmField::Register(rm)) => {
+                    let rm = number(rm)?;
+                    self.bytes.push(self.modrm(3, field, rm));
+                }
+                Some(RmField::Memory(mem)) => self.encode_modrm_mem(field, mem)?,
+                None => {}
+            }
+            for &(bytes, value) in plan.imm.iter().flatten() {
+                self.bytes
+                    .extend_from_slice(&value.to_le_bytes()[..usize::from(bytes)]);
+            }
+            if let Some(target) = plan.target {
+                self.add_relocation(target, R_386_PC32, -4);
+                self.bytes.extend_from_slice(&[0; 4]);
+            }
+            Ok(())
+        })();
+        Some(emitted)
     }
 }

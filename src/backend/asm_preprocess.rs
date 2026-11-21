@@ -124,6 +124,16 @@ fn utf8_char_len(lead: u8) -> usize {
 /// quotes (`\"`) correctly.
 pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
     let bytes = line.as_bytes();
+    // A line without the byte a comment starts with has none; most lines
+    // are like that, and this function is called on each several times.
+    let may_have_comment = match style {
+        CommentStyle::Hash => bytes.contains(&b'#'),
+        CommentStyle::HashAndSlashSlash => bytes.contains(&b'#') || bytes.contains(&b'/'),
+        CommentStyle::SlashSlashAndAt => bytes.contains(&b'/') || bytes.contains(&b'@'),
+    };
+    if !may_have_comment {
+        return line;
+    }
     let mut in_string = false;
     // Start of the statement being scanned (`;` separates statements).
     let mut statement = 0;
@@ -220,6 +230,9 @@ fn takes_at_type(statement: &str) -> bool {
 /// Stops splitting once a line comment (`#` or `//`) is encountered outside strings,
 /// so semicolons inside comments are not treated as statement separators.
 pub fn split_on_semicolons(line: &str) -> Vec<&str> {
+    if !line.as_bytes().contains(&b';') {
+        return vec![line];
+    }
     let mut parts = Vec::new();
     let mut in_string = false;
     let mut start = 0usize;

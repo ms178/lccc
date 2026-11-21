@@ -1,0 +1,282 @@
+;;; operand_fixed_difference
+	.text
+a:	nop
+	nop
+	nop
+b:
+	sub $(b - a), %ebp
+	add $(b - a), %rax
+	mov $(b - a), %eax
+	push $(b - a)
+	imul $(b - a), %eax, %ecx
+	mov (b - a)(%rax), %ecx
+	lea (b - a)(%rax,%rcx,2), %edx
+	cmpl $(b - a), (%rax)
+	test $(b - a), %al
+	shl $(b - a), %eax
+	mov $(a - b), %rax
+	movq $(b - a), %rax
+	add $(a - b), %eax
+	and $(b - a + 125), %ecx
+	and $(b - a + 126), %ecx
+	movb $(b - a), (%rdi)
+	movw $(b - a), (%rdi)
+	movl $(b - a), (%rdi)
+	movq $(b - a), (%rdi)
+	or $(b - a), %ax
+	xor $(b - a), %eax
+	cmp $(b - a), %rax
+	sub $(b - a + 200), %eax
+	sub $(b - a + 200), %ecx
+	bt $(b - a), %eax
+	ret $(b - a)
+	int $(b - a)
+	rol $(b - a - 2), %eax
+	mov %eax, (a - b)(%rsp)
+	mov %eax, (b - a + 125)(%rbp)
+	mov %eax, (b - a + 126)(%rbp)
+	jmp *(b - a)(%rax)
+	call *(b - a)(,%rax,8)
+;;; operand_difference_fixed_stretches
+	.text
+c:	jmp far
+d:
+	sub $(d - c), %ebp
+e:	.p2align 4
+f:
+	sub $(f - e), %ebp
+g:	call ext
+h:
+	sub $(h - g), %ebp
+i:	loop i
+j:
+	sub $(j - i), %ebp
+k:	jrcxz k
+l:
+	sub $(l - k), %ebp
+m:	.skip 3
+n:
+	sub $(n - m), %ebp
+o:	.skip n - m
+p:
+	sub $(p - o), %ebp
+q:	.org q + 4
+r:
+	sub $(r - q), %ebp
+s:	.uleb128 r - q
+t:
+	sub $(t - s), %ebp
+u:	.uleb128 5
+v:
+	sub $(v - u), %ebp
+w:	jmp *%rax
+x:
+	sub $(x - w), %ebp
+y:	jne ext
+z:
+	sub $(z - y), %ebp
+aa:	jmp ext2
+bb:
+	sub $(bb - aa), %ebp
+cc:	.fill 3, 1, 0x90
+dd:
+	sub $(dd - cc), %ebp
+ee:	.byte 1, 2
+	.long 5
+ff:
+	sub $(ff - ee), %ebp
+gg:	.balign 1
+hh:
+	sub $(hh - gg), %ebp
+	.fill 200, 1, 0x90
+far:	ret
+	sub $(far - hh), %ebp
+	sub $(far - c), %ebp
+;;; operand_difference_symbol_kinds
+	.text
+	.weak wa
+	.globl ga
+	.type ia, @gnu_indirect_function
+wa:	nop
+wb:
+	sub $(wb - wa), %ebp
+ga:	nop
+gb:
+	sub $(gb - ga), %ebp
+	sub $(ga - wa), %ebp
+la:	nop
+lb:
+	sub $(lb - la), %ebp
+	.weak lb
+	.set al, la
+	sub $(lb - al), %ebp
+	sub $(1f - lb), %ebp
+1:
+2:	nop
+	sub $(. - 2b), %ebp
+	sub $(2b - 1b), %ebp
+	sub $(. - lb), %ebp
+	.data
+da:	.long 0
+db:
+	.text
+	sub $(db - da), %ebp
+	mov $(db - da), %eax
+;;; operand_difference_ifunc_declared_later
+	.text
+ja:	nop
+jb:
+	sub $(jb - ja), %ebp
+	.type ja, @gnu_indirect_function
+;;; operand_difference_ifunc_declared_first reject
+	.text
+	.type ia, @gnu_indirect_function
+ia:	nop
+ib:
+	sub $(ib - ia), %ebp
+;;; operand_expressions_resolved_late
+	.text
+	.set X, 3
+a:	jmp far
+b:
+	mov X(%rip), %eax
+	mov (b - a) * 2(%rax), %eax
+	sub $(b - a) * 2, %ebp
+	sub $(b - a + 1), %ebp
+	mov $(b - a) / 2, %al
+	movw $(b - a + 1), (%rdi)
+	push $(b - a + 1)
+	and $X, %ecx
+	and $X + 1, %ecx
+	mov $(ext + 4 * 2), %eax
+	mov $(4 + ext), %eax
+	mov $(ext - a), %eax
+	mov $(ext - b + 2), %eax
+	mov (ext + 4 * 2)(%rax), %eax
+	lea (ext - b)(%rax), %eax
+	.fill 200, 1, 0x90
+far:	ret
+;;; operand_expression_forms
+	.text
+a:	nop
+	nop
+	nop
+b:
+	sub $(b-a)+4, %ebp
+	sub $4+(b-a), %ebp
+	sub $(b - a) * 2, %ebp
+	sub $(b - a) / 3, %ebp
+	sub $-(b - a), %ebp
+	mov $(b - a + 1), %eax
+	movw $(b - a + 1), (%rdi)
+	movl $(b - a + 1), (%rdi)
+	movq $(b - a + 1), (%rdi)
+	push $(b - a + 1)
+	imul $(b - a + 1), %eax, %ecx
+	mov (b - a + 1)(%rax), %ecx
+	mov (b - a) * 2(%rax), %ecx
+	lea (b - a)(,%rax,8), %ecx
+	mov %eax, (b - a)
+	mov (b - a)(%rip), %eax
+	test $(b - a), %eax
+	cmpb $(b - a), (%rax)
+	shld $(b - a), %eax, %ecx
+	bt $(b - a), %eax
+	ret $(b - a)
+	adc $(b - a + 130), %eax
+	movabs $(b - a), %rax
+	pinsrw $(b - a), %eax, %xmm0
+	pshufd $(b - a), %xmm1, %xmm0
+	vpshufd $(b - a), %xmm1, %xmm0
+	rorx $(b - a), %eax, %ecx
+	sub $(. - a), %ebp
+	sub $(b - .), %ebp
+;;; skip_of_a_fixed_expression
+	.text
+a:	nop
+	nop
+	nop
+b:
+	.skip b - a
+c:
+	sub $(c - b), %ebp
+	.skip (c - a) / 2 + 1, 0x90
+d:
+	sub $(d - a), %ebp
+	.skip 32 - (. - a), 0xcc
+e:
+	sub $(e - a), %ebp
+	.equ GAP, 5
+	.skip GAP
+f:
+	sub $(f - e), %ebp
+	.set span, f - a
+	.skip span - 30
+g:
+	sub $(g - f), %ebp
+	ret
+;;; data_difference_of_an_indirect_function
+	.text
+	.type ia, @gnu_indirect_function
+ia:	nop
+ib:
+	.long ia - ib
+	.long ia - .
+	.long ia - ia + 2
+	.long ia
+	sub $(ia - ib), %ebp
+	nop
+ic:
+	.long ia - ic
+;;; difference_from_an_indirect_function_data_long reject
+	.text
+	.type ia, @gnu_indirect_function
+	.type ja, @gnu_indirect_function
+ia:	nop
+ja:	nop
+ib:
+	.long ib - ia
+;;; difference_from_an_indirect_function_data_byte reject
+	.text
+	.type ia, @gnu_indirect_function
+	.type ja, @gnu_indirect_function
+ia:	nop
+ja:	nop
+ib:
+	.byte ib - ia
+;;; difference_from_an_indirect_function_data_word reject
+	.text
+	.type ia, @gnu_indirect_function
+	.type ja, @gnu_indirect_function
+ia:	nop
+ja:	nop
+ib:
+	.word ib - ia
+;;; difference_from_an_indirect_function_operand reject
+	.text
+	.type ia, @gnu_indirect_function
+	.type ja, @gnu_indirect_function
+ia:	nop
+ja:	nop
+ib:
+	sub $(ib - ia), %ebp
+;;; difference_from_an_indirect_function_two_ifuncs reject
+	.text
+	.type ia, @gnu_indirect_function
+	.type ja, @gnu_indirect_function
+ia:	nop
+ja:	nop
+ib:
+	.long ja - ia
+;;; dangling_numeric_label_forward reject
+	.text
+	jmp 1f
+	nop
+;;; dangling_numeric_label_backward reject
+	.text
+	jmp 2b
+2:	nop
+;;; dangling_numeric_label_call reject
+	.text
+1:	nop
+	call 1f

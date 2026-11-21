@@ -16,12 +16,13 @@ mod sse;
 mod sse34;
 pub(crate) use sse34::check_sse34_operands;
 mod system;
+pub(crate) mod table;
 mod x87_misc;
 mod xop;
 
 pub(crate) use gp_integer::{
     addr_hint_is32, check_monitor_family, has_reg_operand, is_explicit_string_op,
-    is_size_matched_accumulator, string_op_size,
+    is_size_matched_accumulator, is_star_less_target, string_op_size,
 };
 pub(crate) use registers::*;
 
@@ -197,6 +198,31 @@ pub struct InstructionEncoder {
     apx_rex2: bool,
     /// APX `{dfv=}` bitmap for CCMP/CTEST (P1.vvvv, not inverted).
     apx_dfv: u8,
+    /// The RIP-relative displacement of the instruction under way, if its
+    /// field carries a relocation (`settle_rip_field`).
+    rip_field: Option<RipField>,
+}
+
+/// A RIP-relative displacement field with a relocation.
+///
+/// `%rip` is the address of the *next* instruction, so the relocation's
+/// addend has to take off every byte from the field to the end of the
+/// instruction: the four of the field itself and whatever follows it (an
+/// immediate, a VEX `is4` byte). How many follow is known only when the
+/// instruction is complete, so it is settled there, in one place; an encoder
+/// that forgets to count them cannot get the address wrong. (`vpinsrw $1,
+/// sym(%rip), %xmm17, %xmm9`, `adc $-3, sym(%rip), %r9d`, `ccmpb $7,
+/// sym(%rip)`, `lwpval $1, sym(%rip), %rcx` and `vpmacsdd` did: each left an
+/// address off by the bytes of its immediate.)
+#[derive(Clone, Copy)]
+struct RipField {
+    /// Index of the relocation in `InstructionEncoder::relocations`.
+    reloc: usize,
+    /// `bytes.len()` right behind the field.
+    end: usize,
+    /// Bytes behind the field the addend has been lowered by so far
+    /// (`adjust_rip_reloc_addend`).
+    counted: i64,
 }
 
 /// Mnemonic stems that accept `lock` (with a memory operand): the classic
@@ -848,7 +874,7 @@ pub(crate) fn normalize_bare_label(op: &mut Operand) {
 /// quadword of the second (bit 4); GNU as 2.47 assembles `lqlq`, `hqlq`,
 /// `lqhq`, `hqhq` with 0x00, 0x01, 0x10, 0x11. The kernel's AES-XTS, AES-GCM
 /// and CRC code spell every multiply this way. `None` for anything else.
-fn carryless_multiply_alias(instr: &Instruction) -> Option<Instruction> {
+pub(crate) fn carryless_multiply_alias(instr: &Instruction) -> Option<Instruction> {
     let (base, pair) = match instr.mnemonic.strip_prefix("vpclmul") {
         Some(pair) => ("vpclmulqdq", pair),
         None => ("pclmulqdq", instr.mnemonic.strip_prefix("pclmul")?),
@@ -883,6 +909,7 @@ impl InstructionEncoder {
             vex_hint: None,
             apx_rex2: false,
             apx_dfv: 0,
+            rip_field: None,
         }
     }
 
@@ -990,21 +1017,14 @@ impl InstructionEncoder {
         // dispatch: GAS reports operand-shape errors before prefix /
         // template errors, and every mnemonic shares the verdict.
         // Indirect branch targets (`call *(%eax)`, `jmp *table(,%rax)`)
-        // wrap the memory operand in `Operand::Indirect`, so they must be
-        // unwrapped here — they used to skip BOTH the structural
-        // validation and the 0x67 address-size splice, silently encoding
-        // `call *(%eax)` with 64-bit addressing (GAS: `67 ff 10`).
+        // wrap the memory operand in `Operand::Indirect`
+        // (`Operand::memory` looks through it) — they used to skip BOTH
+        // the structural validation and the 0x67 address-size splice,
+        // silently encoding `call *(%eax)` with 64-bit addressing (GAS:
+        // `67 ff 10`).
         let mut need67 = false;
         for op in &instr.operands {
-            let mem = match op {
-                Operand::Memory(mem) => Some(mem),
-                Operand::Indirect(inner) => match inner.as_ref() {
-                    Operand::Memory(mem) => Some(mem),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(mem) = mem {
+            if let Some(mem) = op.memory() {
                 core::validate_mem_operand(&instr.mnemonic, mem)?;
                 need67 |= core::mem_needs_addr32(mem);
             }
@@ -1159,7 +1179,21 @@ impl InstructionEncoder {
                 }
                 "rep" | "repz" | "repe" => group1.push(0xF3),
                 "repnz" | "repne" => group1.push(0xF2),
-                "notrack" => seg_pre.push(0x3E),
+                // `notrack` is `ds`'s byte in front of an indirect near
+                // branch, and nothing in front of anything else.
+                "notrack" => {
+                    let indirect = matches!(instr.operands.as_slice(), [Operand::Indirect(_)])
+                        && matches!(
+                            instr.mnemonic.to_ascii_lowercase().as_str(),
+                            "jmp" | "jmpq" | "jmpw" | "call" | "callq" | "callw"
+                        );
+                    if !indirect {
+                        return Err(
+                            "expecting indirect branch instruction after `notrack'".to_string()
+                        );
+                    }
+                    seg_pre.push(0x3E);
+                }
                 // The override words classified in the pre-scan; the
                 // addr32 0x67 byte is appended to seg_pre AFTER the loop
                 // so segment overrides always precede it (GAS:
@@ -1169,13 +1203,22 @@ impl InstructionEncoder {
                 // `ds wrmsr` relies on the byte being emitted so an
                 // ALTERNATIVE can patch the instruction in place.
                 "cs" => seg_pre.push(0x2E),
-                "ss" => seg_pre.push(0x36),
                 "ds" => seg_pre.push(0x3E),
-                "es" => seg_pre.push(0x26),
                 "fs" => seg_pre.push(0x64),
                 "gs" => seg_pre.push(0x65),
+                // GNU as has no such prefix word in 64-bit code, where the
+                // two segments do nothing (`%es:` in an operand is still an
+                // override byte).
+                word @ ("es" | "ss") => {
+                    return Err(format!("`{word}' is not supported in 64-bit mode"));
+                }
                 other => return Err(format!("unknown prefix: {}", other)),
             }
+        }
+        // One segment prefix to an instruction, whatever it is called
+        // (GNU as: `cs ds nop`, `notrack gs jmp *%rax`, `fs fs nop`).
+        if seg_pre.len() > 1 {
+            return Err("same type of prefix used twice".to_string());
         }
         // F0 sinks past any F2/F3 byte (stable: singletons keep position).
         group1.sort_by_key(|&b| b == 0xF0);
@@ -1248,6 +1291,10 @@ impl InstructionEncoder {
         // the parser only, no encoder synthesizes a segmented memory
         // operand, and the byte is pushed before the body starts, so no
         // body emission can precede it and no relocation fixup is needed.
+        // (Total with `Operand::memory`: the target of an indirect branch
+        // is a memory operand too, and the scan that did not look through
+        // `Operand::Indirect` dropped its override -- `call *%gs:16` and
+        // `jmp *%fs:(%rax)` went through the address without the segment.)
         // A standalone segment prefix (`gs movl ...`) deduplicates against
         // the same override byte on the operand below.
         //
@@ -1263,7 +1310,7 @@ impl InstructionEncoder {
         let mut operand_seg: Option<u8> = None;
         if !is_explicit_string_op(&instr.mnemonic, &instr.operands) {
             for op in &instr.operands {
-                if let Operand::Memory(mem) = op {
+                if let Some(mem) = op.memory() {
                     if let Some(seg) = &mem.segment {
                         // GAS 2.47 drops an override equal to the DEFAULT
                         // segment of the addressing form: %ss is the default
@@ -1311,24 +1358,20 @@ impl InstructionEncoder {
             // Deduplicate the standalone form: an operand-less
             // `gs movl (%eax),%eax` and an operand-carrying
             // `movl %gs:(%eax),%eax` must both encode exactly one 0x65.
-            // A CONFLICTING standalone override (prefix "gs" on an
-            // instruction whose memory operand says %fs) is rejected —
-            // emitting only one of the two would silently drop the other
-            // (0x3E is exempt either way: neither `ds` (shadowed — %ds is
-            // dropped as the default segment) nor `notrack` (a hint, and
-            // GAS orders it after the segment) can collide with a real
-            // operand override).
+            // Any other standalone segment prefix beside an override the
+            // operand needs is one prefix too many, `ds` and `notrack`
+            // (the byte 3E) included: GNU as refuses `ds mov %fs:(%rax),
+            // %eax` and `notrack jmp *%fs:(%rax)` as it refuses `gs mov
+            // %fs:(%rax), %eax`. (An override that is the addressing form's
+            // default is dropped above and collides with nothing.)
             if let Some(pos) = seg_pre.iter().position(|&g| g == b) {
                 seg_pre.remove(pos);
             }
-            if let Some(&g) = seg_pre
+            if seg_pre
                 .iter()
-                .find(|&&g| matches!(g, 0x26 | 0x2E | 0x36 | 0x64 | 0x65))
+                .any(|&g| matches!(g, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65))
             {
-                return Err(format!(
-                    "conflicting segment overrides: prefix byte {:#x} vs operand byte {:#x}",
-                    g, b
-                ));
+                return Err("same type of prefix used twice".to_string());
             }
             self.bytes.push(b);
         }
@@ -1348,15 +1391,7 @@ impl InstructionEncoder {
         // base/index expression"). Vector (VSIB) indexes stay legal.
         if explicit_addr32 {
             for op in &instr.operands {
-                let mem = match op {
-                    Operand::Memory(mem) => Some(mem),
-                    Operand::Indirect(inner) => match inner.as_ref() {
-                        Operand::Memory(mem) => Some(mem),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                if let Some(mem) = mem {
+                if let Some(mem) = op.memory() {
                     for slot in [&mem.base, &mem.index].into_iter().flatten() {
                         let n = slot.name.to_ascii_lowercase();
                         if !matches!(
@@ -1376,6 +1411,8 @@ impl InstructionEncoder {
             }
         }
 
+        self.rip_field = None;
+        let (body, body_relocations) = (self.bytes.len(), self.relocations.len());
         let mut result = if moffs_redirect {
             if explicit_addr32 {
                 self.encode_addr32_moffs(&instr.operands)
@@ -1385,6 +1422,28 @@ impl InstructionEncoder {
         } else {
             self.encode_mnemonic(instr)
         };
+        // What the arms refuse may be a plain instruction of the table
+        // (`table`): a form or a spelling no arm was written for.
+        if let (Err(refusal), false) = (&result, moffs_redirect) {
+            let name = instr.mnemonic.to_ascii_lowercase();
+            match table::plan(&name, &instr.operands, true) {
+                Some(Ok(plan)) => {
+                    self.bytes.truncate(body);
+                    self.relocations.truncate(body_relocations);
+                    self.rip_field = None;
+                    result = self.emit_plan(&plan);
+                }
+                // The table knows the name and has a better word for what
+                // is wrong than "unhandled".
+                Some(Err(mismatch)) if refusal.starts_with("unhandled instruction") => {
+                    result = Err(mismatch);
+                }
+                _ => {}
+            }
+        }
+        if result.is_ok() {
+            self.settle_rip_field();
+        }
         // `{evex}` post-check: the instruction must have taken an EVEX
         // (0x62) arm. Per the SDM the only legacy prefixes that may
         // precede EVEX are segment overrides and the 0x67 address-size
@@ -3727,9 +3786,7 @@ impl InstructionEncoder {
                 } else if has_mmx {
                     self.encode_mmx_movq(ops)
                 } else if has_seg {
-                    // Suffix-less: size from the GP register (GAS 2.47:
-                    // `mov %ds,%ax` = 66 8c d8, `mov %ds,%eax` = 8c d8).
-                    self.encode_mov_seg(ops, None)
+                    self.encode_mov_seg(ops, Some(8))
                 } else if has_cr {
                     self.encode_mov_cr(ops)
                 } else if has_dr {
@@ -3767,6 +3824,16 @@ impl InstructionEncoder {
                 } else {
                     self.encode_mov(ops, 2)
                 }
+            }
+            // A segment register is no byte: without this, its number was
+            // taken for a byte register's (`movb %fs,(%rax)` came out as
+            // `mov %ah,(%rax)`).
+            "movb"
+                if ops
+                    .iter()
+                    .any(|op| matches!(op, Operand::Register(r) if is_segment_reg(&r.name))) =>
+            {
+                Err("operand type mismatch for `mov'".to_string())
             }
             "movb" => self.encode_mov(ops, 1),
             "movabsq" | "movabs" => self.encode_movabs(ops),
@@ -3939,7 +4006,7 @@ impl InstructionEncoder {
             | "cmovaw" | "cmovaew" => self.encode_cmovcc(ops, mnemonic),
 
             // Jumps (jmpq is a common AT&T alias for jmp on x86-64)
-            "jmp" | "jmpq" => self.encode_jmp(ops),
+            "jmp" | "jmpq" | "jmpw" => self.encode_jmp(ops, mnemonic),
             "ljmpl" | "ljmpq" | "ljmp" | "ljmpw" => self.encode_ljmp(ops, mnemonic),
             "lcalll" | "lcallq" | "lcall" | "lcallw" => self.encode_lcall(ops, mnemonic),
             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge" | "jb" | "jbe" | "ja"
@@ -3958,7 +4025,7 @@ impl InstructionEncoder {
             }
 
             // Call/return (callq/retq are common AT&T aliases on x86-64)
-            "call" | "callq" => self.encode_call(ops),
+            "call" | "callq" | "callw" => self.encode_call(ops, mnemonic),
             "ret" | "retq" => {
                 if ops.is_empty() {
                     self.bytes.push(0xC3);
@@ -4235,18 +4302,6 @@ impl InstructionEncoder {
             // AMD Zen / cache-line / processor-register helpers omitted by
             // PR #462. Encodings match GAS 2.47: clzero 0F 01 FC, rdpru
             // 0F 01 FD, mcommit F3 0F 01 FA.
-            "clzero" => {
-                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFC]);
-                Ok(())
-            }
-            "rdpru" => {
-                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFD]);
-                Ok(())
-            }
-            "mcommit" => {
-                self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xFA]);
-                Ok(())
-            }
             "clflush" => self.encode_clflush(ops),
             // clflushopt is clflush with a 66 prefix; clwb reuses the opcode
             // with ModRM.reg = 6.
@@ -4351,8 +4406,6 @@ impl InstructionEncoder {
             }
 
             // Port I/O instructions
-            "outb" | "outw" | "outl" => self.encode_out(ops, mnemonic),
-            "inb" | "inw" | "inl" => self.encode_in(ops, mnemonic),
 
             // Atomic exchange
             "xchgb" | "xchgw" | "xchgl" | "xchgq" => self.encode_xchg(ops, mnemonic),
@@ -4891,8 +4944,6 @@ impl InstructionEncoder {
                     Err("int requires immediate operand".to_string())
                 }
             }
-            "sldt" => self.encode_sldt(ops),
-            "str" if ops.len() == 1 => self.encode_str_insn(ops),
             "fninit" => {
                 self.bytes.extend_from_slice(&[0xDB, 0xE3]);
                 Ok(())
@@ -4958,19 +5009,12 @@ impl InstructionEncoder {
                     _ => Err("jrcxz requires label".to_string()),
                 }
             }
-            "loop" => {
-                if ops.len() != 1 {
-                    return Err("loop requires 1 operand".to_string());
-                }
-                match &ops[0] {
-                    Operand::Label(label) => {
-                        self.bytes.push(0xE2);
-                        self.add_relocation(label, R_X86_64_PC8_INTERNAL, -1);
-                        self.bytes.push(0); // placeholder for rel8
-                        Ok(())
-                    }
-                    _ => Err("loop requires label".to_string()),
-                }
+            // `loop` and its conditional forms count in `%rcx`; the `l`
+            // spellings count in `%ecx`, which is the address-size prefix
+            // (GAS 2.47: `loopl 1f` = 67 e2, `loopq 1f` = e2).
+            m if loop_opcode(m).is_some_and(|(_, size)| size != Some(b'w')) => {
+                let (opcode, size) = loop_opcode(m).unwrap_or((0xE2, None));
+                self.encode_counter_branch(ops, opcode, size == Some(b'l'), m)
             }
             // Short-only counter branches (no long form; GAS 2.47 oracle:
             // `jecxz there` = `67 e3 fd`, `loope` = `e1`, `loopne` = `e0`).
@@ -4988,34 +5032,6 @@ impl InstructionEncoder {
                         Ok(())
                     }
                     _ => Err("jecxz requires label".to_string()),
-                }
-            }
-            "loope" | "loopz" => {
-                if ops.len() != 1 {
-                    return Err("loope requires 1 operand".to_string());
-                }
-                match &ops[0] {
-                    Operand::Label(label) => {
-                        self.bytes.push(0xE1);
-                        self.add_relocation(label, R_X86_64_PC8_INTERNAL, -1);
-                        self.bytes.push(0); // placeholder for rel8
-                        Ok(())
-                    }
-                    _ => Err("loope requires label".to_string()),
-                }
-            }
-            "loopne" | "loopnz" => {
-                if ops.len() != 1 {
-                    return Err("loopne requires 1 operand".to_string());
-                }
-                match &ops[0] {
-                    Operand::Label(label) => {
-                        self.bytes.push(0xE0);
-                        self.add_relocation(label, R_X86_64_PC8_INTERNAL, -1);
-                        self.bytes.push(0); // placeholder for rel8
-                        Ok(())
-                    }
-                    _ => Err("loopne requires label".to_string()),
                 }
             }
 
@@ -6511,7 +6527,8 @@ impl InstructionEncoder {
                 Ok(())
             }
             // wrmsrns: write-MSR-no-side-effects, always the immediate form.
-            "wrmsrns" => self.encode_user_msr(ops, "wrmsrns"),
+            // (Without operands it is the plain instruction of the table.)
+            "wrmsrns" if !ops.is_empty() => self.encode_user_msr(ops, "wrmsrns"),
             // USER_MSR: urdmsr/uwrmsr 2-register + immediate spellings.
             "urdmsr" | "uwrmsr" => self.encode_user_msr(ops, mnemonic),
             "wrmsr" => {
@@ -6538,12 +6555,8 @@ impl InstructionEncoder {
                 self.bytes.extend_from_slice(&[0x0F, 0x06]);
                 Ok(())
             }
-            "verw" => self.encode_verw(ops),
             "lsl" => self.encode_lsl(ops),
             "lar" => self.encode_lar(ops),
-            "lldt" => self.encode_system_reg(ops, &[0x0F, 0x00], 2), // 0F 00 /2
-            "ltr" => self.encode_system_reg(ops, &[0x0F, 0x00], 3),  // 0F 00 /3
-            "str" => self.encode_system_reg(ops, &[0x0F, 0x00], 1),  // 0F 00 /1
             "invlpg" => self.encode_mem_only(ops, &[0x0F, 0x01], 7), // 0F 01 /7
             "invpcid" => self.encode_invpcid(ops),
             "rdgsbase" | "wrgsbase" | "rdfsbase" | "wrfsbase" => {
@@ -6573,8 +6586,6 @@ impl InstructionEncoder {
             // System table instructions
             "sgdt" | "sidt" | "lgdt" | "lidt" | "sgdtl" | "sidtl" | "lgdtl" | "lidtl" | "sgdtq"
             | "sidtq" | "lgdtq" | "lidtq" => self.encode_system_table(ops, mnemonic),
-            "lmsw" => self.encode_lmsw(ops),
-            "smsw" => self.encode_smsw(ops),
 
             _ if mnemonic.starts_with("set") => {
                 // Handle setXXb forms (e.g., setcb = setc with byte suffix)
@@ -6587,10 +6598,7 @@ impl InstructionEncoder {
             // AVX comparison pseudo-ops: vcmpXXps/pd/ss/sd -> vcmpps/pd/ss/sd $imm
             _ if self.try_encode_avx_cmp_pseudo(ops, mnemonic)?.is_some() => Ok(()),
 
-            _ => {
-                // TODO: many more instructions to handle
-                Err(format!("unhandled instruction: {} {:?}", mnemonic, ops))
-            }
+            _ => Err(format!("unhandled instruction: {} {:?}", mnemonic, ops)),
         }
     }
 }
@@ -7460,7 +7468,11 @@ mod encoding_opt_tests {
         assert_eq!(hex("clzero"), "0f 01 fc");
         assert_eq!(hex("rdpru"), "0f 01 fd");
         assert_eq!(hex("mcommit"), "f3 0f 01 fa");
-        assert!(fails("clzero %rax"));
+        // The address may be spelled out; `%eax` is the address-size prefix
+        // (GAS 2.47: 0f 01 fc and 67 0f 01 fc).
+        assert_eq!(hex("clzero %rax"), "0f 01 fc");
+        assert_eq!(hex("clzero %eax"), "67 0f 01 fc");
+        assert!(fails("clzero %rcx"));
     }
 
     #[test]

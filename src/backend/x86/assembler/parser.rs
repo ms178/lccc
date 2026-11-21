@@ -372,6 +372,29 @@ pub enum Operand {
     Indirect(Box<Operand>),
 }
 
+impl Operand {
+    /// The memory this operand addresses: a memory operand, or the target
+    /// of an indirect branch through memory (`call *%gs:16(%rax)`).
+    ///
+    /// Everything the encoders decide from "the instruction's memory
+    /// operand" before or after the opcode -- the segment override, the
+    /// address-size prefix, the legality of its registers -- has to read
+    /// it through this: a scan for `Operand::Memory` alone does not see
+    /// the branch target, and each one that did lost that prefix (the
+    /// address-size prefix first, then the segment override: `call
+    /// *%gs:16` called through `*16`).
+    pub fn memory(&self) -> Option<&MemoryOperand> {
+        match self {
+            Operand::Memory(mem) => Some(mem),
+            Operand::Indirect(inner) => match inner.as_ref() {
+                Operand::Memory(mem) => Some(mem),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 /// Register reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Register {
@@ -621,6 +644,10 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
     let raw_lines: Vec<&str> = text.lines().collect();
     let mut lines: Vec<String> = Vec::new();
     for line in &raw_lines {
+        if !line.as_bytes().contains(&b';') {
+            lines.push(line.to_string());
+            continue;
+        }
         let parts = asm_preprocess::split_on_semicolons(line);
         if parts.len() > 1 {
             for part in parts {
@@ -633,8 +660,15 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
             lines.push(line.to_string());
         }
     }
-    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-    let expanded = expand_rept_blocks(&line_refs)?;
+    // The block pre-pass acts on `.rept`, `.irp`/`.irpc`, `.macro`, `.endm`
+    // and `.endr` lines; a text that names none of them -- anything a
+    // compiler writes -- would come out of it as it went in.
+    let expanded = if has_block_directives(&text) {
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        expand_rept_blocks(&line_refs)?
+    } else {
+        lines
+    };
     let expanded = expand_gas_macros(&expanded)?;
 
     for (line_num, line) in expanded.iter().enumerate() {
@@ -651,8 +685,15 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
 
         // Handle ';' as instruction separator (GAS syntax)
         // Split the line on ';' and parse each part independently.
-        let parts: Vec<&str> = asm_preprocess::split_on_semicolons(trimmed);
-        for part in parts {
+        let (single, split);
+        let parts: &[&str] = if trimmed.as_bytes().contains(&b';') {
+            split = asm_preprocess::split_on_semicolons(trimmed);
+            &split
+        } else {
+            single = [trimmed];
+            &single
+        };
+        for &part in parts {
             let part = crate::backend::asm_expr::trim_asm_line(part);
             if part.is_empty() {
                 continue;
@@ -672,6 +713,23 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
     }
 
     Ok(items)
+}
+
+/// Whether `text` names a directive `expand_rept_blocks` acts on, anywhere
+/// (in a comment or a string too: the answer only decides whether that pass
+/// is run).
+fn has_block_directives(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(dot) = rest.find('.') {
+        rest = &rest[dot + 1..];
+        if ["rept", "irp", "macro", "endm", "endr"]
+            .iter()
+            .any(|word| rest.starts_with(word))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Strip trailing comment from a line using x86 comment style (`#`).
@@ -2843,6 +2901,44 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
 /// relocation choke point uses this helper to recover the addend.  Keeping the
 /// grammar here prevents the label and memory-displacement paths from drifting
 /// (the latter already calls `try_parse_symbol_plus_offset` directly).
+/// The opcode of a `loop` instruction and the letter its count register is
+/// spelled with (`loopl` counts in `%ecx`), if it has one. The family is
+/// `loop`, `loope`/`loopz` and `loopne`/`loopnz`.
+pub(crate) fn loop_opcode(mnemonic: &str) -> Option<(u8, Option<u8>)> {
+    let rest = mnemonic.strip_prefix("loop")?;
+    let (condition, size) = match rest.as_bytes().split_last() {
+        Some((&letter @ (b'w' | b'l' | b'q'), _)) => (&rest[..rest.len() - 1], Some(letter)),
+        _ => (rest, None),
+    };
+    let opcode = match condition {
+        "" => 0xE2,
+        "e" | "z" => 0xE1,
+        "ne" | "nz" => 0xE0,
+        _ => return None,
+    };
+    Some((opcode, size))
+}
+
+/// A branch that has an 8-bit displacement and no longer form: the tests of
+/// the count register and the `loop` family.
+pub(crate) fn is_short_only_branch(mnemonic: &str) -> bool {
+    matches!(mnemonic, "jcxz" | "jecxz" | "jrcxz") || loop_opcode(mnemonic).is_some()
+}
+
+/// The encoding of such a branch: opcode `E0`..`E3` and a rel8, behind any
+/// legacy prefixes (the address-size prefix selects the count register).
+pub(crate) fn is_short_only_encoding(bytes: &[u8]) -> bool {
+    let [prefixes @ .., 0xE0..=0xE3, _] = bytes else {
+        return false;
+    };
+    prefixes.iter().all(|b| {
+        matches!(
+            b,
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+        )
+    })
+}
+
 pub(crate) fn split_relocation_symbol_addend(s: &str) -> Option<(&str, i64)> {
     match try_parse_symbol_plus_offset(s)? {
         Displacement::SymbolPlusOffset(ref symbol, addend) => {
@@ -3956,7 +4052,7 @@ fn expand_gas_macros_with_state(
     let mut i = 0;
 
     while i < lines.len() {
-        let trimmed = strip_comment(&lines[i]).trim().to_string();
+        let trimmed = strip_comment(&lines[i]).trim();
 
         // Label definitions are recorded SEQUENTIALLY (GAS semantics: a
         // label only counts as "defined" for a later .ifdef — forward
@@ -3978,8 +4074,20 @@ fn expand_gas_macros_with_state(
             }
         }
 
+        // Every directive this pass acts on, by its second byte. A line
+        // that begins with none of them -- an instruction, a label, `.loc`,
+        // `.cfi_*`, `.byte`, which is all a compiler writes -- is compared
+        // with none of them: the two dozen prefix tests below were a
+        // quarter of this pass on a large file.
+        let directive = match trimmed.as_bytes() {
+            [b'.', second, ..] => *second,
+            _ => 0,
+        };
+
         // .macro name param1:req param2:req ...
-        if let Some(rest) = directive_arg(&trimmed, ".macro") {
+        if directive == b'm'
+            && let Some(rest) = directive_arg(trimmed, ".macro")
+        {
             let (name, params) = asm_preprocess::parse_macro_header(rest);
             if name.is_empty() {
                 return Err(".macro: missing name".to_string());
@@ -4010,14 +4118,18 @@ fn expand_gas_macros_with_state(
         }
 
         // .purgem name
-        if let Some(name) = directive_arg(&trimmed, ".purgem") {
+        if directive == b'p'
+            && let Some(name) = directive_arg(trimmed, ".purgem")
+        {
             macros.remove(name);
             i += 1;
             continue;
         }
 
         // .set symbol, expr (with symbol resolution)
-        if let Some(rest) = set_directive_arg(&trimmed) {
+        if matches!(directive, b's' | b'e')
+            && let Some(rest) = set_directive_arg(trimmed)
+        {
             if let Some(comma_pos) = rest.find(',') {
                 let sym_name = rest[..comma_pos].trim().to_string();
                 let expr_str = rest[comma_pos + 1..].trim();
@@ -4095,7 +4207,9 @@ fn expand_gas_macros_with_state(
         // whose count names a symbol assigned above. The body is repeated
         // first and expanded after, so a `.set i, (i + 1)` inside it counts
         // per repetition, as it does for GAS.
-        if let Some(count_str) = directive_arg(&trimmed, ".rept") {
+        if directive == b'r'
+            && let Some(count_str) = directive_arg(trimmed, ".rept")
+        {
             let resolved = resolve_set_expr(count_str, symbols);
             let count = parse_integer_expr(&resolved)
                 .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?
@@ -4123,7 +4237,9 @@ fn expand_gas_macros_with_state(
         // `.irpc l, 0123` to unroll four page-table-entry stores with
         // `\l * 8(%eax)` displacements; without this the raw `\l` leaked
         // into the object as a relocation symbol named "\l * 8".
-        if let Some(rest) = directive_arg(&trimmed, ".irpc") {
+        if directive == b'i'
+            && let Some(rest) = directive_arg(trimmed, ".irpc")
+        {
             let comma = rest
                 .find(',')
                 .ok_or(".irpc: missing comma after variable")?;
@@ -4157,7 +4273,9 @@ fn expand_gas_macros_with_state(
         }
 
         // .irp var, item1, item2, ...  /  .endr
-        if let Some(rest) = directive_arg(&trimmed, ".irp") {
+        if directive == b'i'
+            && let Some(rest) = directive_arg(trimmed, ".irp")
+        {
             let (var, items) = parse_irp_header(rest)?;
             let body = collect_repeat_body(lines, &mut i, ".irp")?;
             let mut rounds = items.into_iter();
@@ -4179,7 +4297,11 @@ fn expand_gas_macros_with_state(
         // `.elseif`/`.else`/`.endif` collection below is shared, so a new
         // family member cannot drift from the nesting rules — the three
         // pre-family copy-pasted collectors had exactly that drift risk.
-        let head = eval_conditional_head(&trimmed, symbols, labels);
+        let head = if directive == b'i' {
+            eval_conditional_head(trimmed, symbols, labels)
+        } else {
+            None
+        };
         match head {
             Some(Ok(cond)) => {
                 let branches = collect_conditional_branches(lines, &mut i, cond, symbols)?;
@@ -4200,7 +4322,9 @@ fn expand_gas_macros_with_state(
         }
 
         // .error "message" - assembler error directive
-        if let Some(rest) = directive_arg(&trimmed, ".error") {
+        if directive == b'e'
+            && let Some(rest) = directive_arg(trimmed, ".error")
+        {
             return Err(format!("assembler error: {}", rest));
         }
 
@@ -4217,15 +4341,26 @@ fn expand_gas_macros_with_state(
         if trimmed == ".endif" {
             return Err("\".endif\" without \".if\"".to_string());
         }
-        if directive_arg(&trimmed, ".elseif").is_some() {
+        if directive == b'e' && directive_arg(trimmed, ".elseif").is_some() {
             return Err("\".elseif\" without matching \".if\"".to_string());
+        }
+
+        // No macro is defined (yet): the line invokes none.
+        if macros.is_empty() {
+            if symbols.is_empty() {
+                result.push(lines[i].clone());
+            } else {
+                result.push(resolve_set_expr(&lines[i], symbols));
+            }
+            i += 1;
+            continue;
         }
 
         // Check if line is a macro invocation.
         // First, split on semicolons to handle "macrocall args; other_stuff" patterns.
         // GAS treats ';' as a statement separator, so a macro invocation may be
         // followed by other statements on the same line.
-        let semi_parts = crate::backend::asm_preprocess::split_on_semicolons(&trimmed);
+        let semi_parts = crate::backend::asm_preprocess::split_on_semicolons(trimmed);
         let first_part = semi_parts[0].trim();
         let first_word = first_part.split_whitespace().next().unwrap_or("");
         // Strip label prefixes if present (e.g., "label: macroname args").
