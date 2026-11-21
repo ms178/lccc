@@ -6,7 +6,7 @@ WHY THIS EXISTS
 A whole-file `count_ins()` total cannot answer "is the runtime-compare
 roundtrip gone?" -- `main`'s 485 `printf` calls dominate it, and GCC/Clang
 emit `.set alias,target` (ICF) or inline whole functions, so a naive label
-walk silently compares different case sets.  `backlog.md` section 14 records
+walk silently compares different case sets.  the closed 2026-11-08 investigation (PR #1145, see git history) recorded
 the gap as a PER-FUNCTION average (19.0 instructions per runtime compare vs
 3.19 / 3.25 for GCC 16.2 / Clang 23.1.5).  This script is that measurement,
 made reproducible and self-testing:
@@ -19,7 +19,7 @@ made reproducible and self-testing:
   predicate-3/7 folds therefore leave the set automatically;
 * instructions are counted between the function label and its `.size`
   directive, including `ret`.  A second figure EXCLUDES `ret` so the result
-  is comparable with the historical 3.19 / 3.25 numbers in section 14;
+  is comparable with the historical 3.19 / 3.25 numbers of that investigation;
 * `--require-runtime-avg N` turns the acceptance criterion into a hard gate,
   and `--self-test` feeds synthetic assembly through the SAME parser to
   detect a vacuous or drifted census;
@@ -112,7 +112,7 @@ def census(asm_dir: Path, labels: list[str], fixture: Path):
         resolved[label] = resolver(bodies, aliases)
 
     # The audited set: exactly those runtime cases whose LCCC ON body still
-    # emits a vpcmp*.  This is the set section 14's 19.0 was measured on.
+    # emits a vpcmp*.  This is the set the investigation's 19.0 was measured on.
     on = resolved[labels[0]]
     vp = [
         n

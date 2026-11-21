@@ -21,9 +21,11 @@ impl super::InstructionEncoder {
         if ops.len() != 1 {
             return Err("pushp/popp requires 1 operand".to_string());
         }
+        // The pair hint is of the 64-bit push and pop (`pushp %cx` was
+        // `pushp %rcx`).
         let r = match &ops[0] {
-            Operand::Register(r) => r,
-            _ => return Err("pushp/popp requires a register".to_string()),
+            Operand::Register(r) if is_reg64(&r.name) => r,
+            _ => return Err("pushp/popp requires a 64-bit register".to_string()),
         };
         let num = reg_num(&r.name).ok_or("bad register")?;
         let (b, b4) = gp_ext_bits(&r.name);
@@ -432,7 +434,9 @@ pub(crate) fn infer_ccmp_size(ops: &[Operand]) -> u8 {
             return infer_reg_size(&r.name);
         }
     }
-    8
+    // No register says: 32 bits, as for every operation GAS has to guess
+    // the size of (`ccmpb $7, (%rdx)` is `62 f4 04 02 83 3a 07`).
+    4
 }
 
 fn push_imm_sized(bytes: &mut Vec<u8>, val: i64, size: u8) {

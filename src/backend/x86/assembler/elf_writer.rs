@@ -121,13 +121,14 @@ impl X86Arch for X86_64Arch {
             // Same normalization as the 64-bit path above (`.s` + case).
             let mnem_lower = instr.mnemonic.to_ascii_lowercase();
             let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-            let is_jump =
-                mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
+            let is_jump = mnem == "jmp"
+                || mnem.starts_with("loop")
+                || (mnem.starts_with('j') && mnem.len() >= 2);
             if is_jump && instr.operands.len() == 1 {
                 if let Operand::Label(_) = &instr.operands[0] {
-                    let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
+                    let is_short_only = is_short_only_branch(mnem);
                     let is_conditional = mnem != "jmp";
-                    if is_short_only && instr_len == 2 {
+                    if is_short_only && is_short_only_encoding(&encoder.bytes) {
                         Some(JumpDetection {
                             is_conditional: true,
                             already_short: true,
@@ -153,53 +154,38 @@ impl X86Arch for X86_64Arch {
             }
         };
 
-        // The i686 encoder emits R_386_* relocation numbers, but the
-        // containing object is ELF64 and the linker interprets reloc types
-        // by machine. Passing them through raw is a type-pun across tables:
-        // R_386_32(=1) would be read as R_X86_64_64(=1) — an 8-byte patch
-        // that overwrites 4 bytes of the NEXT instruction — and
-        // R_386_GOTOFF(=9) as R_X86_64_GOTPCREL(=9), a different computation
-        // entirely. Translate the types with identical width and semantics
-        // (R_386_32 = S+A word32 = R_X86_64_32; R_386_PC32 = S+A-P word32 =
-        // R_X86_64_PC32) and reject anything else loudly rather than emit a
-        // silently corrupt object.
-        let mut relocations = Vec::with_capacity(encoder.relocations.len());
-        for r in encoder.relocations {
-            let reloc_type = match r.reloc_type {
-                R_386_32 => R_X86_64_32,
-                R_386_PC32 => R_X86_64_PC32,
-                R_386_PLT32 => R_X86_64_PLT32,
-                // Width-and-semantics-matched 16/8-bit pairs: the linker
-                // computes S+A, S+A-P identically, only the field width
-                // differs. `data16 jmp ext` inside a .code32 section of a
-                // 64-bit object emits R_386_PC16 (GAS: R_X86_64_PC16),
-                // `movw $ext,%ax` the R_386_16 pair.
-                R_386_16 => R_X86_64_16,
-                R_386_PC16 => R_X86_64_PC16,
-                R_386_8 => R_X86_64_8,
-                R_386_PC8 => R_X86_64_PC8,
-                other => {
-                    return Err(format!(
-                        ".code32 in 64-bit object: relocation type {} for '{}' has no \
-                     R_X86_64_* equivalent with matching semantics",
-                        other, r.symbol
-                    ));
-                }
-            };
-            relocations.push(EncoderReloc {
-                offset: r.offset,
-                symbol: r.symbol,
-                reloc_type,
-                addend: r.addend,
-                diff_symbol: r.diff_symbol,
-            });
-        }
-
         Ok(EncodeResult {
             bytes: encoder.bytes,
-            relocations,
+            relocations: translate_i386_relocations(
+                encoder.relocations.into_iter().map(|r| EncoderReloc {
+                    offset: r.offset,
+                    symbol: r.symbol,
+                    reloc_type: r.reloc_type,
+                    addend: r.addend,
+                    diff_symbol: r.diff_symbol,
+                }),
+                ".code32",
+            )?,
             jump,
         })
+    }
+
+    /// Encode a `.code16` instruction with the 32-bit encoder in its 16-bit
+    /// mode: real-mode code inside a 64-bit object, which GNU as assembles
+    /// like any other (the kernel's boot and real-mode sources, when they
+    /// are built without `-m16`). It used to be refused.
+    fn encode_instruction_code16(
+        instr: &Instruction,
+        _section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        real_mode_instruction(instr, false)
+    }
+
+    fn encode_instruction_code16_gcc(
+        instr: &Instruction,
+        _section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        real_mode_instruction(instr, true)
     }
 
     fn elf_machine() -> u16 {
@@ -359,6 +345,66 @@ impl X86Arch for X86_64Arch {
     fn supports_deferred_skips() -> bool {
         true
     }
+}
+
+/// The relocations of an instruction the 32-bit encoder wrote, for a
+/// 64-bit object.
+///
+/// The i686 encoder emits `R_386_*` numbers, but the containing object is
+/// ELF64 and the linker reads relocation types by machine. Passing them
+/// through raw is a pun across tables: `R_386_32` (1) would be read as
+/// `R_X86_64_64` (1) -- an 8-byte patch that overwrites 4 bytes of the next
+/// instruction -- and `R_386_GOTOFF` (9) as `R_X86_64_GOTPCREL` (9), another
+/// computation altogether. The types with the same width and the same
+/// meaning are translated (`R_386_32` = S+A word32 = `R_X86_64_32`;
+/// `R_386_PC32` = S+A-P word32 = `R_X86_64_PC32`; the 16- and 8-bit pairs,
+/// which real-mode code and `data16` branches use), and anything else is
+/// refused rather than written wrong.
+fn translate_i386_relocations(
+    relocations: impl Iterator<Item = EncoderReloc>,
+    mode: &str,
+) -> Result<Vec<EncoderReloc>, String> {
+    use crate::backend::i686::assembler::encoder::{
+        R_386_8, R_386_16, R_386_32, R_386_PC8, R_386_PC16, R_386_PC32, R_386_PLT32,
+    };
+    relocations
+        .map(|reloc| {
+            let reloc_type = match reloc.reloc_type {
+                R_386_32 => R_X86_64_32,
+                R_386_PC32 => R_X86_64_PC32,
+                R_386_PLT32 => R_X86_64_PLT32,
+                R_386_16 => R_X86_64_16,
+                R_386_PC16 => R_X86_64_PC16,
+                R_386_8 => R_X86_64_8,
+                R_386_PC8 => R_X86_64_PC8,
+                other => {
+                    return Err(format!(
+                        "{mode} in 64-bit object: relocation type {other} for '{}' has no \
+                         R_X86_64_* equivalent with matching semantics",
+                        reloc.symbol
+                    ));
+                }
+            };
+            Ok(EncoderReloc {
+                reloc_type,
+                ..reloc
+            })
+        })
+        .collect()
+}
+
+/// One instruction of a `.code16` or `.code16gcc` region of a 64-bit
+/// object: the 32-bit writer's encoding, relocations translated.
+fn real_mode_instruction(instr: &Instruction, gcc_mode: bool) -> Result<EncodeResult, String> {
+    let encoded =
+        crate::backend::i686::assembler::elf_writer::code16_encode_inner(instr, 0, gcc_mode)?;
+    Ok(EncodeResult {
+        relocations: translate_i386_relocations(
+            encoded.relocations.into_iter(),
+            if gcc_mode { ".code16gcc" } else { ".code16" },
+        )?,
+        ..encoded
+    })
 }
 
 /// Builds an ELF relocatable object file from parsed assembly items.

@@ -76,6 +76,27 @@ pub(crate) fn reg_size(name: &str) -> u8 {
     }
 }
 
+/// The one operand is a 32-bit general register.
+pub(crate) fn is_reg32_operand(ops: &[Operand]) -> bool {
+    matches!(
+        ops,
+        [Operand::Register(reg)]
+            if matches!(
+                reg.name.as_str(),
+                "eax" | "ebx" | "ecx" | "edx" | "esp" | "ebp" | "esi" | "edi"
+            )
+    )
+}
+
+/// The one operand is a 16-bit general register.
+pub(crate) fn is_reg16_operand(ops: &[Operand]) -> bool {
+    matches!(
+        ops,
+        [Operand::Register(reg)]
+            if matches!(reg.name.as_str(), "ax" | "bx" | "cx" | "dx" | "sp" | "bp" | "si" | "di")
+    )
+}
+
 /// i686 accumulator: %al/%ax/%eax only (ModRM 000 short forms
 /// 04+op*8 / 05+op*8 / A8 / A9 / 90+r). AH/BH/CH/DH never qualify.
 pub(crate) fn is_accum(name: &str) -> bool {
@@ -106,11 +127,14 @@ pub(crate) fn fits_imm8(val: i64, size: u8) -> bool {
 /// `add %dl,(%eax)` = 00 10 — one register is enough), and mixed-width
 /// register operands are a hard error (`add %dl,%ecx` -> "register type
 /// mismatch").  Memory-only operands default to the 32-bit operand size.
-/// An explicit mnemonic suffix (`forced`) always wins.
+/// An explicit mnemonic suffix (`forced`) always wins; `default` is the
+/// size of an operation neither a suffix nor a register says anything
+/// about.
 pub(crate) fn infer_op_size(
     mnemonic: &str,
     ops: &[Operand],
     forced: Option<u8>,
+    default: u8,
 ) -> Result<u8, String> {
     if let Some(s) = forced {
         return Ok(s);
@@ -135,7 +159,7 @@ pub(crate) fn infer_op_size(
             }
         }
     }
-    Ok(seen.unwrap_or(4))
+    Ok(seen.unwrap_or(default))
 }
 
 /// Get operand size from mnemonic suffix.
@@ -149,7 +173,7 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         // `imul`/`mul`/`sal` end in `l` yet are unsuffixed spellings —
         // treating them as l-suffixed forces the 32-bit width and breaks
         // the register-driven inference (`imul $0x9090,(%eax),%dx`).
-        | "sub" | "sbb" | "add" | "and" | "shl" | "rol" | "xadd"
+        | "sub" | "sbb" | "add" | "and" | "shl" | "rol" | "rcl" | "xadd"
         | "imul" | "mul" | "sal"
         | "insb" | "insw" | "insl" | "outsb" | "outsw" | "outsl"
         | "outb" | "outw" | "outl" | "inb" | "inw" | "inl"

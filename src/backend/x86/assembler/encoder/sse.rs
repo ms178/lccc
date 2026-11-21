@@ -163,6 +163,12 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let use_mmx = is_mmx(&src.name);
                 let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                // A store under a mandatory prefix is of an `%xmm` register:
+                // without the prefix `movntdq %mm3, (%rdx)` is `movntq`,
+                // which is what it was assembled to.
+                if use_mmx && prefix_len != 0 {
+                    return Err("unsupported SSE store operands".to_string());
+                }
                 if !use_mmx {
                     for &b in &opcode[..prefix_len] {
                         self.bytes.push(b);
@@ -496,54 +502,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             _ => Err("rdrand requires register operand".to_string()),
-        }
-    }
-
-    pub(crate) fn encode_sldt(&mut self, ops: &[Operand]) -> Result<(), String> {
-        // sldt %reg: 0F 00 /0
-        if ops.len() != 1 {
-            return Err("sldt requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let num = reg_num(&reg.name).ok_or("bad register")?;
-                let size = infer_reg_size(&reg.name);
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                // SLDT never sets REX.W, even for a 64-bit dest (upper bits zero).
-                self.emit_rex_unary(4, &reg.name);
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.bytes.push(self.modrm(3, 0, num));
-                Ok(())
-            }
-            Operand::Memory(mem) => {
-                self.emit_rex_rm(0, "", mem);
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.encode_modrm_mem(0, mem)
-            }
-            _ => Err("unsupported sldt operand".to_string()),
-        }
-    }
-
-    pub(crate) fn encode_str_insn(&mut self, ops: &[Operand]) -> Result<(), String> {
-        // str %reg: 0F 00 /1
-        if ops.len() != 1 {
-            return Err("str requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let num = reg_num(&reg.name).ok_or("bad register")?;
-                let size = infer_reg_size(&reg.name);
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.emit_rex_unary(4, &reg.name);
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.bytes.push(self.modrm(3, 1, num));
-                Ok(())
-            }
-            _ => Err("unsupported str operand".to_string()),
         }
     }
 

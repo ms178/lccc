@@ -241,26 +241,56 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
         }
     }
 
-    // Undefined .globl/.weak declarations with no relocation reference are
-    // still emitted by GAS as UNDEF symbols (measured on GAS 2.47: a bare
-    // `.globl foo` with no definition produces `*UND* foo`).  The same path
-    // carries the `_GLOBAL_OFFSET_TABLE_` global the writer synthesises for
-    // GOT-base-relative relocations — neither is referenced by any
-    // relocation, so the loop above would silently drop both.
+    // Undefined symbols that no relocation names. GNU as (2.47, measured
+    // per directive; `write_object_file` and `elf_frob_file_before_adjust`
+    // are where it is decided):
+    //
+    //  * a directive that names a symbol makes it. `.globl f`, `.type f,
+    //    @function`, `.size f, 4`, `.hidden f` (`.protected`, `.internal`)
+    //    each leave an undefined global `f` in the object, with the type,
+    //    size and visibility the directives gave it. Such a symbol is a
+    //    request to the linker like any other undefined symbol: it pulls
+    //    the defining member out of an archive, and a hidden one has to be
+    //    defined in the link. (Only `.globl` used to do this here.)
+    //  * except a `.weak` one: neither defined nor used, it is no symbol
+    //    of the object, whatever else was said of it. "Used" is named by a
+    //    relocation (above) or by what another symbol is equated to. (It
+    //    used to be written as an undefined weak symbol.)
+    //  * and except an assembler-local name (`.type .Lf, @function`).
+    //
+    // The same path carries the `_GLOBAL_OFFSET_TABLE_` global the writer
+    // synthesises for GOT-base-relative relocations, which no relocation
+    // names either.
     let emitted: FxHashSet<String> = symbols.iter().map(|s| s.name.clone()).collect();
-    for name in input.global_symbols.keys().chain(input.weak_symbols.keys()) {
-        if emitted.contains(name) || input.sections.contains_key(name) {
+    let equated_to: FxHashSet<&str> = input.aliases.values().map(String::as_str).collect();
+    let mut mentioned: Vec<&String> = input
+        .global_symbols
+        .keys()
+        .chain(input.weak_symbols.keys())
+        .chain(input.symbol_types.keys())
+        .chain(input.symbol_sizes.keys())
+        .chain(input.symbol_visibility.keys())
+        .collect();
+    // (In name order: the maps iterate in an order of their own.)
+    mentioned.sort_unstable();
+    mentioned.dedup();
+    for name in mentioned {
+        if emitted.contains(name)
+            || input.sections.contains_key(name)
+            || name.starts_with(".L")
+            || name.starts_with(".l")
+        {
+            continue;
+        }
+        let weak = input.weak_symbols.contains_key(name);
+        if weak && !equated_to.contains(name.as_str()) {
             continue;
         }
         symbols.push(ObjSymbol {
             name: name.clone(),
             value: 0,
-            size: 0,
-            binding: if input.weak_symbols.contains_key(name) {
-                STB_WEAK
-            } else {
-                STB_GLOBAL
-            },
+            size: input.symbol_sizes.get(name).copied().unwrap_or(0),
+            binding: if weak { STB_WEAK } else { STB_GLOBAL },
             sym_type: input.symbol_types.get(name).copied().unwrap_or(STT_NOTYPE),
             visibility: input
                 .symbol_visibility
@@ -336,6 +366,114 @@ fn is_tls_reloc(rtype: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The symbols a table gets for `globals`, `weaks` and the per-symbol
+    /// attributes, with nothing defined and no relocation.
+    fn undefined(
+        globals: &[&str],
+        weaks: &[&str],
+        types: &[(&str, u8)],
+        sizes: &[(&str, u64)],
+        visibility: &[(&str, u8)],
+        aliases: &[(&str, &str)],
+    ) -> Vec<(String, u8, u8, u8, u64)> {
+        let set = |names: &[&str]| -> FxHashMap<String, bool> {
+            names.iter().map(|n| (n.to_string(), true)).collect()
+        };
+        let input = SymbolTableInput {
+            labels: &FxHashMap::default(),
+            global_symbols: &set(globals),
+            weak_symbols: &set(weaks),
+            symbol_types: &types.iter().map(|&(n, t)| (n.to_string(), t)).collect(),
+            symbol_sizes: &sizes.iter().map(|&(n, s)| (n.to_string(), s)).collect(),
+            symbol_visibility: &visibility
+                .iter()
+                .map(|&(n, v)| (n.to_string(), v))
+                .collect(),
+            aliases: &aliases
+                .iter()
+                .map(|&(a, t)| (a.to_string(), t.to_string()))
+                .collect(),
+            sections: &FxHashMap::default(),
+            include_referenced_locals: false,
+        };
+        let mut out: Vec<_> = build_elf_symbol_table(&input)
+            .into_iter()
+            .filter(|s| s.section_name == "*UND*")
+            .map(|s| (s.name, s.binding, s.sym_type, s.visibility, s.size))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// GNU as 2.47, one directive at a time (`readelf -s` of `.text; <the
+    /// directive>; nop`): each leaves `f` undefined and global.
+    #[test]
+    fn a_directive_that_names_a_symbol_makes_it() {
+        let f = |binding, sym_type, visibility, size| {
+            vec![("f".to_string(), binding, sym_type, visibility, size)]
+        };
+        assert_eq!(
+            undefined(&["f"], &[], &[], &[], &[], &[]),
+            f(STB_GLOBAL, STT_NOTYPE, STV_DEFAULT, 0),
+            ".globl f"
+        );
+        assert_eq!(
+            undefined(&[], &[], &[("f", STT_FUNC)], &[], &[], &[]),
+            f(STB_GLOBAL, STT_FUNC, STV_DEFAULT, 0),
+            ".type f, @function"
+        );
+        assert_eq!(
+            undefined(&[], &[], &[], &[("f", 4)], &[], &[]),
+            f(STB_GLOBAL, STT_NOTYPE, STV_DEFAULT, 4),
+            ".size f, 4"
+        );
+        assert_eq!(
+            undefined(&[], &[], &[], &[], &[("f", STV_HIDDEN)], &[]),
+            f(STB_GLOBAL, STT_NOTYPE, STV_HIDDEN, 0),
+            ".hidden f"
+        );
+        assert_eq!(
+            undefined(
+                &["f"],
+                &[],
+                &[("f", STT_OBJECT)],
+                &[("f", 8)],
+                &[("f", STV_PROTECTED)],
+                &[]
+            ),
+            f(STB_GLOBAL, STT_OBJECT, STV_PROTECTED, 8),
+            "all of them, once"
+        );
+    }
+
+    /// `.weak f` and nothing else of `f`: GNU as writes no symbol, whatever
+    /// other directives name it -- unless something is equated to it.
+    #[test]
+    fn a_weak_symbol_neither_defined_nor_used_is_no_symbol() {
+        assert!(undefined(&[], &["f"], &[], &[], &[], &[]).is_empty());
+        assert!(
+            undefined(
+                &[],
+                &["f"],
+                &[("f", STT_FUNC)],
+                &[("f", 4)],
+                &[("f", STV_HIDDEN)],
+                &[]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            undefined(&[], &["f"], &[], &[], &[], &[("g", "f")]),
+            vec![("f".to_string(), STB_WEAK, STT_NOTYPE, STV_DEFAULT, 0)],
+            ".weak f; .set g, f"
+        );
+    }
+
+    #[test]
+    fn an_assembler_local_name_is_no_symbol() {
+        assert!(undefined(&[], &[], &[(".Lf", STT_FUNC)], &[], &[], &[]).is_empty());
+    }
 
     /// Regression: is_tls_reloc must key off the ELF machine, not the pointer
     /// size. The old target_is_32bit() split classified RISC-V objects with the

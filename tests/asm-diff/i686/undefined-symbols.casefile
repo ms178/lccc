@@ -1,0 +1,107 @@
+;;; type_names_an_undefined_symbol
+	.text
+	.type f, @function
+	nop
+;;; type_object_names_an_undefined_symbol
+	.text
+	.type f, @object
+	nop
+;;; type_ifunc_names_an_undefined_symbol
+	.text
+	.type f, @gnu_indirect_function
+	nop
+;;; type_tls_names_an_undefined_symbol
+	.text
+	.type f, @tls_object
+	nop
+;;; type_notype_names_an_undefined_symbol
+	.text
+	.type f, @notype
+	nop
+;;; size_names_an_undefined_symbol
+	.text
+	.size f, 4
+	nop
+;;; hidden_names_an_undefined_symbol
+	.text
+	.hidden f
+	nop
+;;; protected_names_an_undefined_symbol
+	.text
+	.protected f
+	nop
+;;; internal_names_an_undefined_symbol
+	.text
+	.internal f
+	nop
+;;; globl_names_an_undefined_symbol
+	.text
+	.globl f
+	nop
+;;; several_directives_name_one_undefined_symbol
+	.text
+	.globl f
+	.type f, @object
+	.size f, 8
+	.hidden f
+	nop
+;;; the_last_type_stands
+	.text
+	.type f, @function
+	.type f, @notype
+	nop
+;;; weak_alone_names_nothing
+	.text
+	.weak f
+	nop
+;;; weak_and_type_name_nothing
+	.text
+	.weak f
+	.type f, @function
+	nop
+;;; weak_and_hidden_name_nothing
+	.text
+	.weak f
+	.hidden f
+	nop
+;;; weak_and_size_name_nothing
+	.text
+	.weak f
+	.size f, 4
+	nop
+;;; weak_that_is_referenced_is_a_symbol
+	.text
+	.weak f
+	.long f
+	call f
+;;; a_local_name_is_no_symbol
+	.text
+	.type .Lf, @function
+	.hidden .Lg
+	nop
+;;; hidden_and_referenced
+	.text
+	.hidden f
+	call f
+;;; type_and_a_common
+	.text
+	.comm f,4,4
+	.type f, @object
+	nop
+;;; type_of_a_symbol_defined_later
+	.text
+	.type f, @function
+	.hidden f
+	nop
+f:	ret
+	.size f, . - f
+;;; undefined_and_defined_side_by_side
+	.text
+	.globl a
+	.type a, @function
+	.type b, @function
+	.hidden c
+	.weak d
+	.weak e
+a:	call e
+	ret

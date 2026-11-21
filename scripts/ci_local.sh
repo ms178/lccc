@@ -3154,6 +3154,41 @@ gate "i686-asm-diff" fast \
     python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         --lccc target/fastbuild/lccc-i686
+
+# The ISA-wide differential: every row of GNU as 2.47's own instruction table
+# (opcodes/i386-opc.tbl, fetched at a pinned commit and SHA-256) turned into
+# statements, assembled by both. The case files above hold what somebody
+# thought of writing down; this holds the assembler to the reference's own
+# list, in 64-bit and 32-bit code and in 16-bit code under .code16 and
+# .code16gcc. Fails on any statement whose bytes or relocations differ, on a
+# longer encoding, on a crash, and on any other difference from the inventory
+# in tests/gas-table-sweep/expected-<mode>.txt: how much was swept, the
+# audited shorter encodings, and per mnemonic the statements lccc refuses.
+# The 64- and 32-bit sweeps go the other way too: a register of every kind in
+# every operand position, and the statements GNU as refuses and lccc
+# assembles, per mnemonic.
+# The widths of vector register each VEX, EVEX and XOP opcode takes together
+# are a table in the encoder (vector_widths.rs), written from GNU as's own
+# answers to every combination. Fails if the table in the tree is not what
+# the pinned GNU as says.
+gate "x86-vector-width-table" fast \
+    python3 scripts/x86_vector_widths.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+
+gate "x86-gas-table-sweep" fast \
+    python3 scripts/gas_table_sweep.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-x86
+
+gate "i686-gas-table-sweep" fast \
+    python3 scripts/gas_table_sweep.py --check --32 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-i686
+
+gate "code16-gas-table-sweep" fast \
+    python3 scripts/gas_table_sweep.py --check --16 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-i686
+
+gate "code16gcc-gas-table-sweep" fast \
+    python3 scripts/gas_table_sweep.py --check --16gcc --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-i686
 gate "sse34-clang-encoding" fast \
     python3 tests/regression/check_sse34_clang.py
 

@@ -1,0 +1,326 @@
+;;; far_branches_code32
+	.text
+a0:
+	ljmp $8, $sym
+	ljmp $8, $0x1000
+	ljmp $8, $sym+4
+	ljmp *(%eax)
+	ljmp *sym
+	ljmp sym
+	ljmp (%eax)
+	ljmp *%fs:(%eax)
+	ljmp *4(%esi,%edi,2)
+	ljmp *sym+4
+	ljmpw $8, $sym
+	ljmpw $8, $0x1000
+	ljmpw $8, $sym+4
+	ljmpw *(%eax)
+	ljmpw *sym
+	ljmpw sym
+	ljmpw (%eax)
+	ljmpw *%fs:(%eax)
+	ljmpw *4(%esi,%edi,2)
+	ljmpw *sym+4
+	ljmpl $8, $sym
+	ljmpl $8, $0x1000
+	ljmpl $8, $sym+4
+	ljmpl *(%eax)
+	ljmpl *sym
+	ljmpl sym
+	ljmpl (%eax)
+	ljmpl *%fs:(%eax)
+	ljmpl *4(%esi,%edi,2)
+	ljmpl *sym+4
+	lcall $8, $sym
+	lcall $8, $0x1000
+	lcall $8, $sym+4
+	lcall *(%eax)
+	lcall *sym
+	lcall sym
+	lcall (%eax)
+	lcall *%fs:(%eax)
+	lcall *4(%esi,%edi,2)
+	lcall *sym+4
+	lcallw $8, $sym
+	lcallw $8, $0x1000
+	lcallw $8, $sym+4
+	lcallw *(%eax)
+	lcallw *sym
+	lcallw sym
+	lcallw (%eax)
+	lcallw *%fs:(%eax)
+	lcallw *4(%esi,%edi,2)
+	lcallw *sym+4
+	lcalll $8, $sym
+	lcalll $8, $0x1000
+	lcalll $8, $sym+4
+	lcalll *(%eax)
+	lcalll *sym
+	lcalll sym
+	lcalll (%eax)
+	lcalll *%fs:(%eax)
+	lcalll *4(%esi,%edi,2)
+	lcalll *sym+4
+	jmp $8, $sym
+	jmp $8, $0x1000
+	jmp $8, $sym+4
+	call $8, $sym
+	call $8, $0x1000
+	call $8, $sym+4
+	jmpw $8, $sym
+	jmpw $8, $0x1000
+	jmpw $8, $sym+4
+	jmpl $8, $sym
+	jmpl $8, $0x1000
+	jmpl $8, $sym+4
+	callw $8, $sym
+	callw $8, $0x1000
+	callw $8, $sym+4
+	calll $8, $sym
+	calll $8, $0x1000
+	calll $8, $sym+4
+	ljmp $8, $(e0 - a0)
+	lcall $8, $(e0 - a0)
+	ljmpl $8, $(a0 - e0)
+	lcallw $8, $(e0 - a0 + 2)
+e0:
+;;; far_branches_code16
+	.text
+	.code16
+a0:
+	ljmp $8, $sym
+	ljmp $8, $0x1000
+	ljmp $8, $sym+4
+	ljmp *(%bx)
+	ljmp *sym
+	ljmp sym
+	ljmp (%bx)
+	ljmp *%fs:(%bx)
+	ljmp *4(%esi,%edi,2)
+	ljmp *sym+4
+	ljmpw $8, $sym
+	ljmpw $8, $0x1000
+	ljmpw $8, $sym+4
+	ljmpw *(%bx)
+	ljmpw *sym
+	ljmpw sym
+	ljmpw (%bx)
+	ljmpw *%fs:(%bx)
+	ljmpw *4(%esi,%edi,2)
+	ljmpw *sym+4
+	ljmpl $8, $sym
+	ljmpl $8, $0x1000
+	ljmpl $8, $sym+4
+	ljmpl *(%bx)
+	ljmpl *sym
+	ljmpl sym
+	ljmpl (%bx)
+	ljmpl *%fs:(%bx)
+	ljmpl *4(%esi,%edi,2)
+	ljmpl *sym+4
+	lcall $8, $sym
+	lcall $8, $0x1000
+	lcall $8, $sym+4
+	lcall *(%bx)
+	lcall *sym
+	lcall sym
+	lcall (%bx)
+	lcall *%fs:(%bx)
+	lcall *4(%esi,%edi,2)
+	lcall *sym+4
+	lcallw $8, $sym
+	lcallw $8, $0x1000
+	lcallw $8, $sym+4
+	lcallw *(%bx)
+	lcallw *sym
+	lcallw sym
+	lcallw (%bx)
+	lcallw *%fs:(%bx)
+	lcallw *4(%esi,%edi,2)
+	lcallw *sym+4
+	lcalll $8, $sym
+	lcalll $8, $0x1000
+	lcalll $8, $sym+4
+	lcalll *(%bx)
+	lcalll *sym
+	lcalll sym
+	lcalll (%bx)
+	lcalll *%fs:(%bx)
+	lcalll *4(%esi,%edi,2)
+	lcalll *sym+4
+	jmp $8, $sym
+	jmp $8, $0x1000
+	jmp $8, $sym+4
+	call $8, $sym
+	call $8, $0x1000
+	call $8, $sym+4
+	jmpw $8, $sym
+	jmpw $8, $0x1000
+	jmpw $8, $sym+4
+	jmpl $8, $sym
+	jmpl $8, $0x1000
+	jmpl $8, $sym+4
+	callw $8, $sym
+	callw $8, $0x1000
+	callw $8, $sym+4
+	calll $8, $sym
+	calll $8, $0x1000
+	calll $8, $sym+4
+	ljmp $8, $(e0 - a0)
+	lcall $8, $(e0 - a0)
+	ljmpl $8, $(a0 - e0)
+	lcallw $8, $(e0 - a0 + 2)
+e0:
+;;; far_branches_code16gcc
+	.text
+	.code16gcc
+a0:
+	ljmp $8, $sym
+	ljmp $8, $0x1000
+	ljmp $8, $sym+4
+	ljmp *(%bx)
+	ljmp *sym
+	ljmp sym
+	ljmp (%bx)
+	ljmp *%fs:(%bx)
+	ljmp *4(%esi,%edi,2)
+	ljmp *sym+4
+	ljmpw $8, $sym
+	ljmpw $8, $0x1000
+	ljmpw $8, $sym+4
+	ljmpw *(%bx)
+	ljmpw *sym
+	ljmpw sym
+	ljmpw (%bx)
+	ljmpw *%fs:(%bx)
+	ljmpw *4(%esi,%edi,2)
+	ljmpw *sym+4
+	ljmpl $8, $sym
+	ljmpl $8, $0x1000
+	ljmpl $8, $sym+4
+	ljmpl *(%bx)
+	ljmpl *sym
+	ljmpl sym
+	ljmpl (%bx)
+	ljmpl *%fs:(%bx)
+	ljmpl *4(%esi,%edi,2)
+	ljmpl *sym+4
+	lcall $8, $sym
+	lcall $8, $0x1000
+	lcall $8, $sym+4
+	lcall *(%bx)
+	lcall *sym
+	lcall sym
+	lcall (%bx)
+	lcall *%fs:(%bx)
+	lcall *4(%esi,%edi,2)
+	lcall *sym+4
+	lcallw $8, $sym
+	lcallw $8, $0x1000
+	lcallw $8, $sym+4
+	lcallw *(%bx)
+	lcallw *sym
+	lcallw sym
+	lcallw (%bx)
+	lcallw *%fs:(%bx)
+	lcallw *4(%esi,%edi,2)
+	lcallw *sym+4
+	lcalll $8, $sym
+	lcalll $8, $0x1000
+	lcalll $8, $sym+4
+	lcalll *(%bx)
+	lcalll *sym
+	lcalll sym
+	lcalll (%bx)
+	lcalll *%fs:(%bx)
+	lcalll *4(%esi,%edi,2)
+	lcalll *sym+4
+	jmp $8, $sym
+	jmp $8, $0x1000
+	jmp $8, $sym+4
+	call $8, $sym
+	call $8, $0x1000
+	call $8, $sym+4
+	jmpw $8, $sym
+	jmpw $8, $0x1000
+	jmpw $8, $sym+4
+	jmpl $8, $sym
+	jmpl $8, $0x1000
+	jmpl $8, $sym+4
+	callw $8, $sym
+	callw $8, $0x1000
+	callw $8, $sym+4
+	calll $8, $sym
+	calll $8, $0x1000
+	calll $8, $sym+4
+	ljmp $8, $(e0 - a0)
+	lcall $8, $(e0 - a0)
+	ljmpl $8, $(a0 - e0)
+	lcallw $8, $(e0 - a0 + 2)
+e0:
+;;; reject_code32_ljmp_eax reject
+	.text
+	ljmp *%eax
+;;; reject_code32_ljmpw_eax reject
+	.text
+	ljmpw *%eax
+;;; reject_code32_ljmpl_eax reject
+	.text
+	ljmpl *%eax
+;;; reject_code32_lcall_eax reject
+	.text
+	lcall *%eax
+;;; reject_code32_lcallw_eax reject
+	.text
+	lcallw *%eax
+;;; reject_code32_lcalll_eax reject
+	.text
+	lcalll *%eax
+;;; reject_code16_ljmp_ax reject
+	.text
+	.code16
+	ljmp *%ax
+;;; reject_code16_ljmpw_ax reject
+	.text
+	.code16
+	ljmpw *%ax
+;;; reject_code16_ljmpl_ax reject
+	.text
+	.code16
+	ljmpl *%ax
+;;; reject_code16_lcall_ax reject
+	.text
+	.code16
+	lcall *%ax
+;;; reject_code16_lcallw_ax reject
+	.text
+	.code16
+	lcallw *%ax
+;;; reject_code16_lcalll_ax reject
+	.text
+	.code16
+	lcalll *%ax
+;;; reject_code16gcc_ljmp_ax reject
+	.text
+	.code16gcc
+	ljmp *%ax
+;;; reject_code16gcc_ljmpw_ax reject
+	.text
+	.code16gcc
+	ljmpw *%ax
+;;; reject_code16gcc_ljmpl_ax reject
+	.text
+	.code16gcc
+	ljmpl *%ax
+;;; reject_code16gcc_lcall_ax reject
+	.text
+	.code16gcc
+	lcall *%ax
+;;; reject_code16gcc_lcallw_ax reject
+	.text
+	.code16gcc
+	lcallw *%ax
+;;; reject_code16gcc_lcalll_ax reject
+	.text
+	.code16gcc
+	lcalll *%ax
