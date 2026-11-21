@@ -2630,6 +2630,11 @@ impl X86Codegen {
     /// register-name-generic, so the deferral and register-cache
     /// behaviour is identical to the %ymm0 spelling.
     pub(super) fn avx_store_dest_from(&mut self, dest_ptr: &Value, src: &'static str) {
+        // A result nothing reads (see `unused_protected_values`) has no slot
+        // and no consumer: homing it would be a store to nowhere.
+        if self.state.unused_protected_values.contains(&dest_ptr.0) {
+            return;
+        }
         // 256-bit store paths read the full YMM register; the earlier load
         // already dirtied it, but mark defensively (a broadcast-only body
         // could reach here through a register-copy path).

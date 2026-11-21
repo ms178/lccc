@@ -823,17 +823,13 @@ fn intrinsic_dest_required_alignment(
     }
 }
 
-/// A vector result width is not by itself a proof that `dest_ptr` is a
-/// write-only full result.  These intrinsics read the old destination (or do
-/// not materialize the advertised result there), so redirecting them to the
-/// memcpy destination changes the value being computed.
 /// Width of a vector REGISTER operand (not an address) at an intrinsic
 /// argument position, for the consumers that read a register-result home
 /// through the register-aware operand helpers. Each arm names an emitter that
 /// takes the operand as a vector value (`avx_load_arg*`/`vex128_source`), so a
 /// `Value` that is a forwarded register and a `Value` that is its slot are
 /// interchangeable there. Anything not listed keeps its memory image.
-fn value_consumer_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
+pub(crate) fn value_consumer_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
     use IntrinsicOp as O;
     if intrinsic_arg_required_alignment(op, index).is_some() {
         return None;
@@ -845,7 +841,7 @@ fn value_consumer_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
         // Storeu256/Store256: arg 0 is the stored VALUE; the address is
         // `dest_ptr`, which the caller rejects when it names the home.
         O::Permute4x64 | O::Pshufd256 | O::Storeu256 | O::Store256 => (index == 0).then_some(32),
-        O::Extracti128 => (index == 0).then_some(32),
+        O::Extracti128 | O::Cast256to128 => (index == 0).then_some(32),
         O::Sha512msg1256 => match index {
             0 => Some(32),
             1 => Some(16),
@@ -876,7 +872,7 @@ fn value_consumer_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
 /// (`result_dest`) to `emit_avx_fp_256_op`, which stores through `avx_store_dest`
 /// and so accepts a register-homed result. The other 256-bit FP spellings
 /// keep their memory form.
-fn register_result_form_is_self_contained(op: IntrinsicOp) -> bool {
+pub(crate) fn register_result_form_is_self_contained(op: IntrinsicOp) -> bool {
     use IntrinsicOp::*;
     matches!(
         op,
@@ -891,6 +887,9 @@ fn register_result_form_is_self_contained(op: IntrinsicOp) -> bool {
             | Pshufb256
             | BlendPs256
             | Extracti128
+            // 256->128 low-half cast: writes its XMM result through `result_dest`
+            // (register home or the memory image), like `Extracti128`.
+            | Cast256to128
             | Sha512msg1256
             | Sha512msg2256
             | Sha512rnds2256
@@ -920,6 +919,10 @@ fn register_result_form_is_self_contained(op: IntrinsicOp) -> bool {
     )
 }
 
+/// A vector result width is not by itself a proof that `dest_ptr` is a
+/// write-only full result.  These intrinsics read the old destination (or do
+/// not materialize the advertised result there), so redirecting them to the
+/// memcpy destination changes the value being computed.
 fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
     !matches!(
         op,

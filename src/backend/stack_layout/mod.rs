@@ -42,6 +42,7 @@ mod inline_asm;
 mod regalloc_helpers;
 mod slot_assignment;
 pub mod slot_census;
+mod vector_pool;
 
 // Re-export submodule public APIs at the stack_layout:: level
 pub use inline_asm::{
@@ -384,6 +385,64 @@ pub fn calculate_stack_space_common(
     // by the adjacent F64 binop (the x87 twin of the vector deferral above;
     // backends that never set x87_pending ignore it).
 
+    // Block-local vector temporaries. Pass 1 protects every vector intrinsic
+    // result, which gives each one a unique slot. A result whose only uses are
+    // in its defining block, which is not a phi incoming, multi-def, or part of
+    // a copy alias, has an exact live range the allocator already computes for
+    // scalars (see `coalescable_group`). It can share a slot, so it is released
+    // from protection here (x86-64 only). Every other value keeps its protection.
+    // Single-block functions have no coalescing (`coalesce` is false), so the
+    // block-local test below can never hold for them. Their vector temporaries
+    // instead get exact instruction-index intervals and share slots through
+    // the Tier-2 fallback (see `vector_pool.rs`).
+    state.vector_pool = if state.vector_temp_sharing && !coalesce {
+        vector_pool::single_block_pool_intervals(
+            func,
+            &vector_pool::PoolExclusions {
+                defer: &state.vector_defer_values,
+                memfold: &state.vector_memfold_values,
+                asm_output: &state.asm_output_values,
+            },
+        )
+    } else {
+        FxHashMap::default()
+    };
+    if state.vector_temp_sharing {
+        let alias_roots: FxHashSet<u32> = ctx.copy_alias.values().copied().collect();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                let crate::ir::instruction::Instruction::Intrinsic {
+                    dest: Some(d), op, ..
+                } = inst
+                else {
+                    continue;
+                };
+                if !matches!(op.vector_home_width(), Some(16) | Some(32)) {
+                    continue;
+                }
+                let id = d.0;
+                let single_block = ctx.def_block.get(&id) == Some(&bi)
+                    && ctx
+                        .use_blocks_map
+                        .get(&id)
+                        .is_none_or(|blks| blks.iter().all(|&b| b == bi));
+                let eligible = if coalesce {
+                    single_block
+                        && !ctx.multi_def_values.contains(&id)
+                        && !ctx.phi_incoming_values.contains(&id)
+                        && !ctx.copy_alias.contains_key(&id)
+                        && !alias_roots.contains(&id)
+                } else {
+                    state.vector_pool.contains_key(&id)
+                };
+                if eligible {
+                    state.protected_slot_values.remove(&id);
+                    state.vector_temp_released.insert(id);
+                }
+            }
+        }
+    }
+
     // Phase 2: Classify all instructions into the three tiers.
     let mut non_local_space = initial_offset;
     slot_assignment::place_stack_guard_early(state, func, &assign_slot, &mut non_local_space);
@@ -426,8 +485,9 @@ pub fn calculate_stack_space_common(
 
     // Raptor Lake Optimization: Protect cross-block vector slots
     for mbv in &multi_block_values {
-        if state.vector_values.contains(&mbv.dest_id)
-            || state.vector128_values.contains(&mbv.dest_id)
+        if (state.vector_values.contains(&mbv.dest_id)
+            || state.vector128_values.contains(&mbv.dest_id))
+            && !state.vector_temp_released.contains(&mbv.dest_id)
         {
             state.protected_slot_values.insert(mbv.dest_id);
         }

@@ -1643,6 +1643,9 @@ impl X86Codegen {
         // passes: arm the sink's shadow-epoch validator for this target.
         state.enable_rax_epoch_discipline();
         state.frame_gep_direct = std::env::var_os("CCC_NO_FRAME_GEP_DIRECT").is_none();
+        // Block-local vector temporaries may share slots (x86-64 only; see
+        // `calculate_stack_space_common`).
+        state.vector_temp_sharing = true;
         Self {
             state,
             current_return_type: IrType::I64,

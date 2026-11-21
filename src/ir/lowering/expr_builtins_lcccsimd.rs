@@ -1006,7 +1006,10 @@ fn native_packed_map(op: IntrinsicOp) -> Option<(IntrinsicOp, IrType, usize, Nat
         Psubq256 => (VecSubI64x4, IrType::I64, 32, Binary),
         Pand256 => (VecAndI32x8, IrType::I32, 32, Binary),
         Por256 => (VecOrI32x8, IrType::I32, 32, Binary),
-        Pxor256 => (VecXorI32x8, IrType::I32, 32, Binary),
+        // XOR is lane-agnostic: the 256-bit qword family (I64x4) is the web the
+        // loop-carried accumulators and shuffles live in. The I32x8 spelling put
+        // this XOR in a different web from its operands, so it was homed in memory.
+        Pxor256 => (VecXorI64x4, IrType::I64, 32, Binary),
         Pmullw256 => (VecMulI16x16, IrType::I16, 32, Binary),
         Pmulld256 => (VecMulI32x8, IrType::I32, 32, Binary),
         Pmaxub256 => (VecMaxU8x32, IrType::U8, 32, Binary),

@@ -10593,7 +10593,15 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // Per-lane variable dword shifts (VEX.128 three-operand form,
             // `emit_vex_binary_128`): class 6 (I32x4 family).
             O::VecShlvI32x4 | O::VecLShrvI32x4 | O::VecAShrvI32x4 => Some(6),
-            O::VecZeroI64x2
+            // `_mm_setzero_si128()` is the I64x2 family zero: its emitter
+            // writes the result through `result_dest`/`sse_store_dest`, so a
+            // register home takes it directly. Unclassed, it poisoned every
+            // vector web of the function (`run_chain`: the accumulator seed).
+            O::Setzero128
+            // 256->128 low-half cast: the XMM result of a 256-bit value is an
+            // I64x2 home (its emitter writes through `result_dest`).
+            | O::Cast256to128
+            | O::VecZeroI64x2
             | O::VecLoadI64x2
             | O::VecAddI64x2
             | O::VecMulI64x2
@@ -10710,6 +10718,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // through its XMM alias / vextractf128; scratch is
                     // xmm1 only.
                     | O::VecExtractLaneF32x8
+                    // 256-bit stores and the low-half cast of an F32x8 home: all read
+                    // the YMM home raw through home-aware paths (`vec_store_source_256`,
+                    // `avx_load_arg`, `xmm_home_of`), so the element type is irrelevant.
+                    | O::VecStoreI64x4
+                    | O::Storeu256
+                    | O::Store256
+                    | O::Cast256to128
             ),
             2 => matches!(
                 op,
@@ -10855,6 +10870,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecAddI64x2
                     | O::VecSadbwU8x16
+                    // Scalar readers of an I64x2 home (`_mm_cvtsi128_si64`,
+                    // `_mm_extract_epi64`): both read the home through
+                    // `sse_load_arg` into xmm0 and write only a GPR, so the
+                    // accumulator keeps its register home across them.
+                    | O::Cvtsi128Si64
+                    | O::Pextrq128
                     // SHA-512 16-byte operands (`msg1`'s second operand and
                     // `rnds2`'s W+K): read through `vex128_source`, which uses
                     // the xmm home directly, scratch xmm1/xmm2 only.
@@ -10912,6 +10933,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // `avx_load_arg` (copy from the home into ymm0).
                     | O::Storeu256
                     | O::Store256
+                    // 256->128 low-half cast of an I64x4 home (XMM alias).
+                    | O::Cast256to128
                     // AVX2 widening steps read+write the I64x4 accumulator;
                     // scratch is confined to ymm0/ymm1, so a YMM home
                     // (ymm2..ymm15) survives them.
@@ -11017,6 +11040,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // `sha512_chain` had no homes at all).
                                 | O::Storeu256
                                 | O::Store256
+                                // 256->128 low-half cast: reads a YMM home as its XMM alias,
+                                // else loads through ymm0/xmm0 scratch.
+                                | O::Cast256to128
+                                // Scalar readers of an I64x2 home (see the class-7
+                                // consumer list): read-only through xmm0.
+                                | O::Cvtsi128Si64
+                                | O::Pextrq128
                                 // 256-bit loads and the 128->256 zero-extension
                                 // are scratch-free in the only sense the poison
                                 // rule protects: their emitters touch only
@@ -11602,6 +11632,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecXorI64x4
                     | O::VecShlvI64x4
                     | O::VecLShrvI64x4
+                    | O::Cast256to128
             ),
             _ => false,
         }

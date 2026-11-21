@@ -807,6 +807,24 @@ pub struct CodegenState {
     /// The backend's slot allocation must preserve these values' slots for
     /// their entire live range to prevent corruption.
     pub protected_slot_values: FxHashSet<u32>,
+    /// Vector intrinsic results that pass 1 protected but that are proven to be
+    /// single-block temporaries (see `calculate_stack_space_common`). They may
+    /// share a block-local or liveness-packed slot, so the classifier must not
+    /// re-protect them.
+    pub vector_temp_released: FxHashSet<u32>,
+    /// Protected vector results with no uses anywhere in the function. The
+    /// classifier gives them no slot (nothing reads them), so the emitter must
+    /// not try to home them: a dead `Permute4x64` left behind by vector
+    /// promotion otherwise panicked in `value_to_reg` (no register, no slot).
+    pub unused_protected_values: FxHashSet<u32>,
+    /// Shared-slot intervals of single-block vector temporaries (id ->
+    /// (def index, last use index, size)), filled per function by the stack
+    /// layout. Members are released from protection and coloured into shared
+    /// slots (see `stack_layout/vector_pool.rs`).
+    pub vector_pool: FxHashMap<u32, (usize, usize, i64)>,
+    /// Enabled by the x86-64 emitter only: lets pass-1 vector temporaries be
+    /// released from protection (see `vector_temp_released`).
+    pub vector_temp_sharing: bool,
     /// Whether to emit .file/.loc debug directives for source-level debugging.
     pub debug_info: bool,
     /// `-g`: the closing brace's `.loc`, set while a `return` is emitted and
@@ -1111,6 +1129,10 @@ impl CodegenState {
             ra_accumulator_values: FxHashSet::default(),
             asm_output_values: FxHashSet::default(),
             protected_slot_values: FxHashSet::default(),
+            vector_temp_released: FxHashSet::default(),
+            unused_protected_values: FxHashSet::default(),
+            vector_pool: FxHashMap::default(),
+            vector_temp_sharing: false,
             debug_info: false,
             pending_epilogue_loc: None,
             param_classes: Vec::new(),
@@ -1507,6 +1529,9 @@ impl CodegenState {
         self.small_slot_values.clear();
         self.vector_values.clear();
         self.protected_slot_values.clear();
+        self.vector_temp_released.clear();
+        self.unused_protected_values.clear();
+        self.vector_pool.clear();
         self.explicit_locations.clear();
         self.ra_accumulator_values.clear();
         self.asm_output_values.clear();
@@ -1531,6 +1556,9 @@ impl CodegenState {
         self.vector128_values.clear();
         self.call_ret_vector_in_xmm0.clear();
         self.protected_slot_values.clear();
+        self.vector_temp_released.clear();
+        self.unused_protected_values.clear();
+        self.vector_pool.clear();
         self.vector_defer_values.clear();
         self.vector_memfold_values.clear();
         self.pending_vec_memfold = None;

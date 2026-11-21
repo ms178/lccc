@@ -4084,6 +4084,16 @@ fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
         BuiltinIntrinsic::X86Pblendw128
         | BuiltinIntrinsic::X86Pclmulqdq128
         | BuiltinIntrinsic::X86Aeskeygenassist128 => Some(8),
+        // The 256-bit lane shuffles also take 8-bit immediates. Their
+        // emitters read the immediate with `operand_to_imm_i64`, which
+        // returns 0 for an SSA value, so at -O0 (where the call stays a
+        // plain SSA value) VPERMQ was emitted as `vpermq $0` for any control
+        // word. The byte shifts are excluded: their builtins take bit counts
+        // that are normalised to byte counts above, so they must not be
+        // re-pinned to the raw value.
+        BuiltinIntrinsic::X86Permute4x64
+        | BuiltinIntrinsic::X86Permute2x128
+        | BuiltinIntrinsic::X86Pshufd256 => Some(8),
         _ => None,
     }
 }

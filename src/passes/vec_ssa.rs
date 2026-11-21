@@ -49,6 +49,9 @@ use crate::ir::instruction::{replace_values_in_inst_map, replace_values_in_termi
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{BasicBlock, Instruction, IrFunction, IrModule, Operand, Value};
 use crate::passes::slp_vectorizer::family_for;
+use crate::passes::vector_temp_promotion::{
+    register_result_form_is_self_contained, value_consumer_arg_width,
+};
 
 /// One register family admitted by the pass: the load/store endpoints, the
 /// zero producer and the byte width of the register image.
@@ -113,32 +116,42 @@ enum Access {
     Load { dest: Value, op: IntrinsicOp },
     /// `VecStore(a) <- val`.
     Store { val: Value, op: IntrinsicOp },
+    /// `a` is read as a REGISTER operand of `op` at each listed position
+    /// (`value_consumer_arg_width`, paired with that position's byte width).
+    /// The operand carries the object's value at this point of the program,
+    /// so the rewrite substitutes the reaching SSA value; nothing is deleted.
+    ArgRead { positions: Vec<(usize, usize)> },
+    /// `dest_ptr = a` on a producer whose register result is `value`: the
+    /// instruction now defines the object instead of storing into it. The
+    /// `dest_ptr` is dropped. `rewrite` is set for the `Loadu256`/`Load256`
+    /// memory loads, which have no register-result form: they become the
+    /// family whole-register load of the same address (`args = [p, 0]`).
+    Def {
+        value: Value,
+        rewrite: Option<IntrinsicOp>,
+        width: usize,
+    },
 }
 
-fn classify(inst: &Instruction, a: u32, table: &FxHashMap<IntrinsicOp, Family>) -> Option<Access> {
-    let Instruction::Intrinsic {
-        dest,
-        op,
-        dest_ptr,
-        args,
-    } = inst
-    else {
-        return None;
-    };
-    let fam = table.get(op)?;
-    if *op == fam.load {
+/// Family-form access: `VecLoad(a, 0)` or `VecStore(a) <- val` of `fam`.
+fn classify_family(
+    dest: &Option<Value>,
+    op: IntrinsicOp,
+    dest_ptr: &Option<Value>,
+    args: &[Operand],
+    a: u32,
+    fam: &Family,
+) -> Option<Access> {
+    if op == fam.load {
         if dest_ptr.is_some() || args.len() != 2 {
             return None;
         }
         if !matches!(args[0], Operand::Value(p) if p.0 == a) || !const_is_zero(&args[1]) {
             return None;
         }
-        return Some(Access::Load {
-            dest: (*dest)?,
-            op: *op,
-        });
+        return Some(Access::Load { dest: (*dest)?, op });
     }
-    if *op == fam.store {
+    if op == fam.store {
         if dest.is_some() || args.len() != 3 || *dest_ptr != Some(Value(a)) {
             return None;
         }
@@ -151,9 +164,96 @@ fn classify(inst: &Instruction, a: u32, table: &FxHashMap<IntrinsicOp, Family>) 
         {
             return None;
         }
-        return Some(Access::Store { val, op: *op });
+        return Some(Access::Store { val, op });
     }
     None
+}
+
+/// Register-operand access of `a` by an intrinsic that is not a family
+/// endpoint: a `dest_ptr = a` definition, or a register-operand read.
+///
+/// Only called on x86-64 (the caller gates it): the register forms are the
+/// ones the x86-64 emitters take, and i686 keeps address-form operands.
+fn classify_register_operand(
+    dest: &Option<Value>,
+    op: IntrinsicOp,
+    dest_ptr: &Option<Value>,
+    args: &[Operand],
+    a: u32,
+    table: &FxHashMap<IntrinsicOp, Family>,
+) -> Option<Access> {
+    if *dest_ptr == Some(Value(a)) {
+        // A definition of the whole object. The producer must not also read
+        // the object it writes.
+        if args
+            .iter()
+            .any(|x| matches!(x, Operand::Value(v) if v.0 == a))
+        {
+            return None;
+        }
+        let value = (*dest)?;
+        if matches!(op, IntrinsicOp::Loadu256 | IntrinsicOp::Load256) {
+            let [Operand::Value(p)] = args else {
+                return None;
+            };
+            if p.0 == a {
+                return None;
+            }
+            // The 32-byte whole-register load, unaligned-safe like the
+            // `Loadu256` it replaces.
+            let rewrite = image_family(table, 32)?.load;
+            return Some(Access::Def {
+                value,
+                rewrite: Some(rewrite),
+                width: 32,
+            });
+        }
+        if !register_result_form_is_self_contained(op) {
+            return None;
+        }
+        let width = op.vector_result_width()? as usize;
+        return Some(Access::Def {
+            value,
+            rewrite: None,
+            width,
+        });
+    }
+    // A register-operand read. `dest_ptr` may name a different memory
+    // destination; that write is independent of the operand read.
+    let mut positions: Vec<(usize, usize)> = Vec::new();
+    for (idx, arg) in args.iter().enumerate() {
+        if matches!(arg, Operand::Value(v) if v.0 == a) {
+            positions.push((idx, value_consumer_arg_width(op, idx)?));
+        }
+    }
+    if positions.is_empty() {
+        return None;
+    }
+    Some(Access::ArgRead { positions })
+}
+
+fn classify(
+    inst: &Instruction,
+    a: u32,
+    table: &FxHashMap<IntrinsicOp, Family>,
+    register_operands: bool,
+) -> Option<Access> {
+    let Instruction::Intrinsic {
+        dest,
+        op,
+        dest_ptr,
+        args,
+    } = inst
+    else {
+        return None;
+    };
+    if let Some(fam) = table.get(op) {
+        return classify_family(dest, *op, dest_ptr, args, a, fam);
+    }
+    if !register_operands {
+        return None;
+    }
+    classify_register_operand(dest, *op, dest_ptr, args, a, table)
 }
 
 struct Candidate {
@@ -177,11 +277,19 @@ fn uses_of(inst: &Instruction, a: u32) -> usize {
     n
 }
 
-fn find_candidates(func: &IrFunction, table: &FxHashMap<IntrinsicOp, Family>) -> Vec<Candidate> {
+fn find_candidates(
+    func: &IrFunction,
+    table: &FxHashMap<IntrinsicOp, Family>,
+    register_operands: bool,
+) -> Vec<Candidate> {
     let params: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
     let mut cands: FxHashMap<u32, Candidate> = FxHashMap::default();
     let mut order: Vec<u32> = Vec::new();
-    for inst in &func.blocks[0].instructions {
+    // Every block, not only the entry: a per-iteration temporary (a register
+    // result stored into a loop-body alloca) is the commonest vector object
+    // of a vector loop, and its alloca dominates all of its own uses. The
+    // rename walk and the phi placement are already CFG-general.
+    for inst in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
         if let Instruction::Alloca {
             dest,
             size,
@@ -215,7 +323,7 @@ fn find_candidates(func: &IrFunction, table: &FxHashMap<IntrinsicOp, Family>) ->
     }
     let mut rejected: FxHashSet<u32> = FxHashSet::default();
     let mut sizes: FxHashMap<u32, usize> = FxHashMap::default();
-    for inst in &func.blocks[0].instructions {
+    for inst in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
         if let Instruction::Alloca { dest, size, .. } = inst {
             sizes.insert(dest.0, *size);
         }
@@ -232,7 +340,8 @@ fn find_candidates(func: &IrFunction, table: &FxHashMap<IntrinsicOp, Family>) ->
                 if rejected.contains(&a) {
                     continue;
                 }
-                let access = classify(inst, a, table);
+                let size_a = sizes.get(&a).copied().unwrap_or(0);
+                let access = classify(inst, a, table, register_operands);
                 let ok = match access {
                     Some(Access::Load { op, .. }) | Some(Access::Store { op, .. }) => {
                         let fam = table[&op];
@@ -253,7 +362,7 @@ fn find_candidates(func: &IrFunction, table: &FxHashMap<IntrinsicOp, Family>) ->
                             1
                         };
                         let shape_ok = uses_of(inst, a) == expected
-                            && fam.bytes == sizes.get(&a).copied().unwrap_or(0)
+                            && fam.bytes == size_a
                             && (cand.family.bytes == 0 || cand.family.bytes == fam.bytes);
                         if shape_ok {
                             // Every admitted endpoint copies ALL bytes, without
@@ -262,6 +371,22 @@ fn find_candidates(func: &IrFunction, table: &FxHashMap<IntrinsicOp, Family>) ->
                             // retain a concrete family only for seeds/phis.
                             cand.family = fam;
                             if matches!(access, Some(Access::Store { .. })) {
+                                cand.def_blocks.insert(bi);
+                            }
+                        }
+                        shape_ok
+                    }
+                    Some(Access::ArgRead { ref positions }) => {
+                        // Every mention of `a` in this instruction is one of
+                        // the register-operand positions, each reading the
+                        // full image.
+                        uses_of(inst, a) == positions.len()
+                            && positions.iter().all(|&(_, w)| w == size_a)
+                    }
+                    Some(Access::Def { width, .. }) => {
+                        let shape_ok = uses_of(inst, a) == 1 && width == size_a;
+                        if shape_ok {
+                            if let Some(cand) = cands.get_mut(&a) {
                                 cand.def_blocks.insert(bi);
                             }
                         }
@@ -284,6 +409,20 @@ fn find_candidates(func: &IrFunction, table: &FxHashMap<IntrinsicOp, Family>) ->
         .into_iter()
         .filter(|a| !rejected.contains(a))
         .filter_map(|a| cands.remove(&a))
+        .filter_map(|mut c| {
+            // A candidate with no endpoint family of its own (only register
+            // reads and definitions) takes the family of its own width: its
+            // phi/seed lane type is a placeholder, and the seed needs a zero
+            // and a load of that width. A definition or a parameter seed is
+            // needed; a candidate with neither is never written.
+            if c.family.bytes == 0 {
+                if !(c.is_param || !c.def_blocks.is_empty()) {
+                    return None;
+                }
+                c.family = image_family(table, *sizes.get(&c.alloca)?)?;
+            }
+            Some(c)
+        })
         .filter(|c| c.family.bytes != 0)
         .collect()
 }
@@ -454,7 +593,27 @@ fn seed_value(
     z
 }
 
-fn promote_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family>) -> usize {
+/// The SSA value a register-operand read or a load of candidate `ci` sees:
+/// the top of its store stack, or the seed when no store dominates the read.
+fn reaching_value(
+    func: &mut IrFunction,
+    cands: &[Candidate],
+    stacks: &[Vec<Value>],
+    zero_of: &mut [Option<Value>],
+    zero_insts: &mut Vec<Instruction>,
+    ci: usize,
+) -> Value {
+    match stacks[ci].last() {
+        Some(&v) => v,
+        None => seed_value(func, &cands[ci], &mut zero_of[ci], zero_insts),
+    }
+}
+
+fn promote_function(
+    func: &mut IrFunction,
+    table: &FxHashMap<IntrinsicOp, Family>,
+    register_operands: bool,
+) -> usize {
     if func.is_declaration || func.blocks.is_empty() {
         return 0;
     }
@@ -465,7 +624,7 @@ fn promote_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family
     }) {
         return 0;
     }
-    let cands = find_candidates(func, table);
+    let cands = find_candidates(func, table, register_operands);
     if cands.is_empty() {
         return 0;
     }
@@ -497,6 +656,11 @@ fn promote_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family
         FxHashMap::default();
     let mut delete: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); num_blocks];
     let mut stacks: Vec<Vec<Value>> = vec![Vec::new(); cands.len()];
+    // Register-operand rewrites recorded by the walk: (block, instruction,
+    // alloca, reaching value) for reads, (block, instruction, load kind) for
+    // definitions. Applied before any deletion so the indices stay valid.
+    let mut arg_edits: Vec<(usize, usize, u32, Value)> = Vec::new();
+    let mut def_edits: Vec<(usize, usize, Option<IntrinsicOp>)> = Vec::new();
 
     fn resolve(rename: &FxHashMap<u32, u32>, mut v: Value) -> Value {
         while let Some(&n) = rename.get(&v.0) {
@@ -523,34 +687,66 @@ fn promote_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family
                 let n_inst = func.blocks[b].instructions.len();
                 for ii in 0..n_inst {
                     let inst = &func.blocks[b].instructions[ii];
-                    let mut hit: Option<(usize, Access)> = None;
+                    // Every candidate this instruction mentions, in operand
+                    // order. One instruction may read one object and define
+                    // another (`BlendPs256 dest_ptr=b, args=[a, c]`), so the
+                    // walk cannot stop at the first mention.
+                    let mut mentioned: Vec<u32> = Vec::new();
                     inst.for_each_used_value(|v| {
-                        if hit.is_none() {
-                            if let Some(&ci) = cand_index.get(&v) {
-                                if let Some(acc) = classify(inst, v, table) {
-                                    hit = Some((ci, acc));
-                                }
-                            }
+                        if cand_index.contains_key(&v) && !mentioned.contains(&v) {
+                            mentioned.push(v);
                         }
                     });
-                    let Some((ci, acc)) = hit else {
+                    if mentioned.is_empty() {
                         continue;
-                    };
-                    match acc {
-                        Access::Load { dest, .. } => {
-                            let cur = match stacks[ci].last() {
-                                Some(&v) => v,
-                                None => {
-                                    seed_value(func, &cands[ci], &mut zero_of[ci], &mut zero_insts)
-                                }
-                            };
-                            rename.insert(dest.0, resolve(&rename, cur).0);
-                            delete[b].insert(ii);
+                    }
+                    let events: Vec<(usize, Access)> = mentioned
+                        .into_iter()
+                        .filter_map(|v| {
+                            let ci = cand_index[&v];
+                            classify(inst, v, table, register_operands).map(|acc| (ci, acc))
+                        })
+                        .collect();
+                    // Register-operand reads see the value that reaches this
+                    // instruction, i.e. BEFORE its own definition takes effect.
+                    for (ci, acc) in &events {
+                        match acc {
+                            Access::ArgRead { .. } => {
+                                let cur = reaching_value(
+                                    func,
+                                    &cands,
+                                    &stacks,
+                                    &mut zero_of,
+                                    &mut zero_insts,
+                                    *ci,
+                                );
+                                arg_edits.push((b, ii, cands[*ci].alloca, cur));
+                            }
+                            Access::Load { dest, .. } => {
+                                let cur = reaching_value(
+                                    func,
+                                    &cands,
+                                    &stacks,
+                                    &mut zero_of,
+                                    &mut zero_insts,
+                                    *ci,
+                                );
+                                rename.insert(dest.0, resolve(&rename, cur).0);
+                                delete[b].insert(ii);
+                            }
+                            Access::Store { val, .. } => {
+                                stacks[*ci].push(resolve(&rename, *val));
+                                pushed.push(*ci);
+                                delete[b].insert(ii);
+                            }
+                            Access::Def { .. } => {}
                         }
-                        Access::Store { val, .. } => {
-                            stacks[ci].push(resolve(&rename, val));
-                            pushed.push(ci);
-                            delete[b].insert(ii);
+                    }
+                    for (ci, acc) in &events {
+                        if let Access::Def { value, rewrite, .. } = acc {
+                            stacks[*ci].push(*value);
+                            pushed.push(*ci);
+                            def_edits.push((b, ii, *rewrite));
                         }
                     }
                 }
@@ -583,6 +779,41 @@ fn promote_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family
     }
 
     // ── Apply ──────────────────────────────────────────────────────────
+    // 0. Register-operand edits, applied first so the instruction indices the
+    //    walk recorded are still valid. A read operand takes the reaching SSA
+    //    value; a definition drops its memory destination, and the memory
+    //    `Loadu256`/`Load256` forms become the family whole-register load.
+    for (b, ii, alloca, cur) in arg_edits {
+        let cur = resolve(&rename, cur);
+        if let Instruction::Intrinsic { args, .. } = &mut func.blocks[b].instructions[ii] {
+            for arg in args.iter_mut() {
+                if matches!(arg, Operand::Value(v) if v.0 == alloca) {
+                    *arg = Operand::Value(cur);
+                }
+            }
+        }
+    }
+    for (b, ii, rewrite) in def_edits {
+        if let Instruction::Intrinsic {
+            op, dest_ptr, args, ..
+        } = &mut func.blocks[b].instructions[ii]
+        {
+            *dest_ptr = None;
+            if let Some(load) = rewrite {
+                let pointer = match args.as_slice() {
+                    [Operand::Value(p)] => Some(*p),
+                    _ => None,
+                };
+                if let Some(p) = pointer {
+                    *op = load;
+                    *args = vec![
+                        Operand::Value(p),
+                        Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                    ];
+                }
+            }
+        }
+    }
     // 1. Delete promoted loads/stores and the allocas themselves (parameter
     //    allocas stay: the prologue capture writes them and the entry seed
     //    load reads them).
@@ -591,10 +822,14 @@ fn promote_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family
         .filter(|c| !c.is_param)
         .map(|c| c.alloca)
         .collect();
-    for inst_idx in 0..func.blocks[0].instructions.len() {
-        if let Instruction::Alloca { dest, .. } = &func.blocks[0].instructions[inst_idx] {
-            if alloca_ids.contains(&dest.0) {
-                delete[0].insert(inst_idx);
+    // Each candidate's alloca leaves the block that defines it: block 0 for
+    // the object's own home, a loop body for a per-iteration temporary.
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Alloca { dest, .. } = inst {
+                if alloca_ids.contains(&dest.0) {
+                    delete[bi].insert(inst_idx);
+                }
             }
         }
     }
@@ -746,7 +981,7 @@ fn hoist_param_loads(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Famil
                 }
             });
             for a in touched {
-                let ok = match classify(inst, a, table) {
+                let ok = match classify(inst, a, table, false) {
                     Some(Access::Load { dest, op }) => {
                         let fam = table[&op];
                         let entry = loads.entry(a).or_insert((fam, Vec::new()));
@@ -1280,7 +1515,7 @@ fn promote_one_function(
     } else {
         0
     };
-    n += promote_function(func, table);
+    n += promote_function(func, table, canonicalise_endpoints);
     n += hoist_param_loads(func, table);
     n += fold_zero_identities(func);
     n += fold_select_idioms(func);
@@ -1536,7 +1771,7 @@ mod tests {
         )];
         let mut f = func_with_blocks(blocks);
         f.next_value_id = 10;
-        assert_eq!(promote_function(&mut f, &table), 1);
+        assert_eq!(promote_function(&mut f, &table, false), 1);
         let insts = &f.blocks[0].instructions;
         assert_eq!(insts.len(), 2, "{insts:?}");
         assert!(matches!(
@@ -1610,7 +1845,7 @@ mod tests {
                     )]);
                     f.next_value_id = 10;
                     assert_eq!(
-                        promote_function(&mut f, &table),
+                        promote_function(&mut f, &table, false),
                         1,
                         "{bytes}/{source_ty:?}/{result_ty:?}"
                     );
@@ -1676,7 +1911,7 @@ mod tests {
                 Terminator::Return(Some(val(2))),
             )]);
             f.next_value_id = 10;
-            assert_eq!(promote_function(&mut f, &table), 0);
+            assert_eq!(promote_function(&mut f, &table, false), 0);
             assert_eq!(f.blocks[0].instructions.len(), 4);
         }
     }
@@ -1718,7 +1953,7 @@ mod tests {
         )];
         let mut f = func_with_blocks(blocks);
         f.next_value_id = 10;
-        assert_eq!(promote_function(&mut f, &table), 0);
+        assert_eq!(promote_function(&mut f, &table, false), 0);
         assert_eq!(f.blocks[0].instructions.len(), 3);
     }
 
