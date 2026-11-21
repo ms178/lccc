@@ -3154,6 +3154,23 @@ gate "i686-asm-diff" fast \
     python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         --lccc target/fastbuild/lccc-i686
+
+# The ISA-wide differential: every row of GNU as 2.47's own instruction table
+# (opcodes/i386-opc.tbl, fetched at a pinned commit and SHA-256) turned into
+# statements, assembled by both. The case files above hold what somebody
+# thought of writing down; this holds the assembler to the reference's own
+# list. Fails on any statement whose bytes or relocations differ, on a longer
+# encoding, on a shorter one that is not in the audited list, and on a
+# mnemonic of which more statements are refused than
+# tests/gas-table-sweep/expected-{64,32}.txt records (a ratchet: the counts
+# only go down).
+gate "x86-gas-table-sweep" fast \
+    python3 scripts/gas_table_sweep.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-x86
+
+gate "i686-gas-table-sweep" fast \
+    python3 scripts/gas_table_sweep.py --check --32 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-i686
 gate "sse34-clang-encoding" fast \
     python3 tests/regression/check_sse34_clang.py
 
