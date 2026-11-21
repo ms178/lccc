@@ -896,6 +896,22 @@ pub(crate) fn carryless_multiply_alias(instr: &Instruction) -> Option<Instructio
     Some(spelled_out)
 }
 
+/// Operands of `sha256rnds2`, with the implicit round-key register dropped.
+///
+/// GNU as accepts the three-operand spelling `sha256rnds2 %xmm0, src, dst`,
+/// where the first operand is the implicit `%xmm0` the instruction reads. The
+/// two-operand form is the encoding itself. Any other first operand is an
+/// error, so the explicit form cannot silently encode a different instruction.
+fn sha256rnds2_operands(ops: &[Operand]) -> Result<&[Operand], String> {
+    if ops.len() != 3 {
+        return Ok(ops);
+    }
+    match &ops[0] {
+        Operand::Register(r) if r.name == "xmm0" => Ok(&ops[1..]),
+        _ => Err("sha256rnds2: explicit first operand must be %xmm0".to_string()),
+    }
+}
+
 impl InstructionEncoder {
     pub fn new() -> Self {
         InstructionEncoder {
@@ -4635,21 +4651,7 @@ impl InstructionEncoder {
             "sha1msg2" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCA]),
             // sha256rnds2 has an IMPLICIT third operand (%xmm0); GAS accepts
             // both the 2-op spelling and an explicit leading %xmm0.
-            "sha256rnds2" => {
-                let ops_norm: &[Operand] = if ops.len() == 3 {
-                    match &ops[0] {
-                        Operand::Register(r) if r.name == "xmm0" => &ops[1..],
-                        _ => {
-                            return Err(
-                                "sha256rnds2: explicit first operand must be %xmm0".to_string()
-                            );
-                        }
-                    }
-                } else {
-                    ops
-                };
-                self.encode_sse_op(ops_norm, &[0x0F, 0x38, 0xCB])
-            }
+            "sha256rnds2" => self.encode_sse_op(sha256rnds2_operands(ops)?, &[0x0F, 0x38, 0xCB]),
             "sha256msg1" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCC]),
             "sha256msg2" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCD]),
             "aesenc" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDC]),
