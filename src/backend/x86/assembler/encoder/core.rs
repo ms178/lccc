@@ -879,6 +879,7 @@ impl super::InstructionEncoder {
         // RIP-relative addressing
         if let Some(base_reg) = base {
             if base_reg.name == "rip" {
+                let relocations = self.relocations.len();
                 // ModR/M: mod=00, rm=101 (RIP-relative)
                 self.bytes.push(self.modrm(0, reg_field, 5));
                 // 32-bit displacement (will be filled by relocation)
@@ -953,6 +954,13 @@ impl super::InstructionEncoder {
                     Displacement::None => {
                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                     }
+                }
+                if self.relocations.len() > relocations {
+                    self.rip_field = Some(super::RipField {
+                        reloc: relocations,
+                        end: self.bytes.len(),
+                        counted: 0,
+                    });
                 }
                 return Ok(());
             }
@@ -1157,8 +1165,22 @@ impl super::InstructionEncoder {
         // Only adjust if encode_modrm_mem added a relocation
         if self.relocations.len() > reloc_count_before {
             let reloc = &mut self.relocations[reloc_count_before];
-            match reloc.reloc_type {
-                R_X86_64_PC32
+            if Self::is_rip_relative(reloc.reloc_type) {
+                reloc.addend -= trailing_bytes;
+                if let Some(field) = &mut self.rip_field {
+                    if field.reloc == reloc_count_before {
+                        field.counted += trailing_bytes;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The relocation types whose value is relative to `%rip`.
+    fn is_rip_relative(reloc_type: u32) -> bool {
+        matches!(
+            reloc_type,
+            R_X86_64_PC32
                 | R_X86_64_PLT32
                 | R_X86_64_GOTPCREL
                 | R_X86_64_GOTPCRELX
@@ -1170,11 +1192,28 @@ impl super::InstructionEncoder {
                 | R_X86_64_CODE_6_GOTTPOFF
                 | R_X86_64_GOTPC32_TLSDESC
                 | R_X86_64_CODE_4_GOTPC32_TLSDESC
-                | R_X86_64_CODE_6_GOTPC32_TLSDESC => {
-                    reloc.addend -= trailing_bytes;
-                }
-                _ => {}
-            }
+                | R_X86_64_CODE_6_GOTPC32_TLSDESC
+        )
+    }
+
+    /// The instruction is complete: lower the addend of its RIP-relative
+    /// displacement by the bytes behind the field that no encoder has
+    /// counted yet (see [`super::RipField`]).
+    pub(crate) fn settle_rip_field(&mut self) {
+        let Some(field) = self.rip_field.take() else {
+            return;
+        };
+        // The field is this instruction's only if the bytes and the
+        // relocation it names are still there (an encoder may have dropped
+        // a first attempt).
+        let (Some(trailing), Some(reloc)) = (
+            self.bytes.len().checked_sub(field.end),
+            self.relocations.get_mut(field.reloc),
+        ) else {
+            return;
+        };
+        if reloc.offset + 4 == field.end as u64 && Self::is_rip_relative(reloc.reloc_type) {
+            reloc.addend -= trailing as i64 - field.counted;
         }
     }
 }

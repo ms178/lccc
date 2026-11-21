@@ -25,6 +25,8 @@ use crate::backend::elf::{
 use crate::backend::x86::assembler::parser::*;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
+mod relax_layout;
+
 /// The names of a comma-separated symbol-list directive (`.weak a, b`).
 fn symbol_names(list: &str) -> impl Iterator<Item = String> + '_ {
     list.split(',')
@@ -603,6 +605,16 @@ struct Section {
     /// executable alignment padding. Starts `true`: GNU as 2.47 pads a fresh
     /// `.text` after `.org 3` with `0f 1f 44 00 00`, no leading `0x90`.
     last_item_was_insn: bool,
+    /// Where the section holds something whose size is not final yet --
+    /// a relaxable branch, alignment or `.org` padding, a deferred `.skip`,
+    /// a LEB128 or CFA advance of a label difference -- as (offset, source
+    /// position), in the order they were emitted, which is ascending.
+    ///
+    /// Read while the section is still being written, to tell whether the
+    /// distance between two labels can still change
+    /// (`ElfWriterCore::fixed_difference`). It is not kept up to date once
+    /// the layout starts moving things.
+    resizable: Vec<(u64, u64)>,
 }
 
 impl Section {
@@ -1459,6 +1471,12 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// (alias, expr with `.` already substituted, sec_idx). Re-evaluated
     /// after all labels are placed.
     pending_set_exprs: Vec<(String, String, usize)>,
+    /// The names in `pending_set_exprs`: a `.set` that redefines none of
+    /// them has nothing to look for there.
+    pending_set_names: FxHashSet<String>,
+    /// The operand expressions given a symbol so far (`expression_symbol`):
+    /// number `i` is `.Lccc_expr_i`.
+    expression_symbols: Vec<String>,
     /// `.set NAME, expr` with a symbolic linear value, captured where the
     /// directive stands: `.` is a relaxation-tracked `.Ldotpos_` label,
     /// constant and symbolic `.set` operands are substituted by the value
@@ -1495,6 +1513,10 @@ pub struct ElfWriterCore<A: X86Arch> {
     fill_budget_used: usize,
     /// Deferred `.skip` expressions with symbolic sizes (see `DeferredSkip`).
     deferred_skips: Vec<DeferredSkip>,
+    /// The gaps a `.skip` sizing sweep has resized and not yet written, by
+    /// section. Empty outside `size_deferred_skips`, where every label is
+    /// read through it (`label_in_sweep`).
+    skip_edits: FxHashMap<usize, PadQueue>,
     /// Deferred byte-sized symbol diffs: (section_index, offset, sym_a, sym_b, size, addend).
     deferred_byte_diffs: Vec<(usize, usize, String, String, usize, i64)>,
     /// Deferred ULEB/SLEB128 symbol diffs: (section, offset, sym_a, sym_b, addend, signed).
@@ -1541,6 +1563,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
             aliases: FxHashMap::default(),
             set_values: FxHashMap::default(),
             pending_set_exprs: Vec::new(),
+            pending_set_names: FxHashSet::default(),
+            expression_symbols: Vec::new(),
             set_exprs: FxHashMap::default(),
             symver_refs: FxHashMap::default(),
             symver_flags: FxHashMap::default(),
@@ -1552,6 +1576,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             section_stack: Vec::new(),
             fill_budget_used: 0,
             deferred_skips: Vec::new(),
+            skip_edits: FxHashMap::default(),
             deferred_byte_diffs: Vec::new(),
             deferred_leb_diffs: Vec::new(),
             code_mode: A::default_code_mode(),
@@ -1586,7 +1611,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// Build the ELF object file from parsed assembly items.
     pub fn build(mut self, items: &[AsmItem]) -> Result<Vec<u8>, String> {
         let items = resolve_numeric_labels(items);
-        for item in &items {
+        for item in items.iter() {
             self.seq += 1;
             self.process_item(item)?;
         }
@@ -1670,6 +1695,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 entsize: 0,
                 jumps_by_target: None,
                 last_item_was_insn: true,
+                resizable: Vec::new(),
             });
             self.section_map.insert(name.to_string(), idx);
         }
@@ -1742,6 +1768,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             entsize: 0,
             jumps_by_target: None,
             last_item_was_insn: true,
+            resizable: Vec::new(),
         });
         self.section_map.insert(name.to_string(), idx);
         Ok(idx)
@@ -1980,6 +2007,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
                     if is_exec {
                         let current = self.sections[sec_idx].cursor_usize();
+                        self.sections[sec_idx].resizable.push((current as u64, seq));
                         self.sections[sec_idx].align_markers.push(AlignMarker {
                             offset: current,
                             padding: 0,
@@ -2105,6 +2133,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // site). The fixup re-evaluates the max-skip decision
                     // against the relaxed offset.
                     if align > 1 {
+                        section.resizable.push((current, seq));
                         section.align_markers.push(AlignMarker {
                             offset: current as usize,
                             padding,
@@ -2169,6 +2198,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.ensure_section()?;
                 let sec_idx = self.current_section.unwrap();
                 let offset = self.sections[sec_idx].cursor_usize();
+                let seq = self.seq;
+                self.sections[sec_idx].resizable.push((offset as u64, seq));
                 self.deferred_cfa_advances.push(CfaAdvance {
                     sec_idx,
                     offset,
@@ -2256,7 +2287,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // instead of five bytes). Only genuinely symbolic sizes —
                     // the kernel-alternatives case deferral exists for — still
                     // need to wait for label resolution.
-                    if let Some(n) = parse_const_skip(expr) {
+                    // So must one whose size is a label difference that
+                    // can no longer change: GNU as takes it for a number
+                    // (a negative one is no gap).
+                    let fixed = || {
+                        let size = self.fixed_expression(expr)?;
+                        Some(usize::try_from(size).unwrap_or(0))
+                    };
+                    if let Some(n) = parse_const_skip(expr).or_else(fixed) {
                         let fill_byte = *fill;
                         // A NOBITS run is a size whatever its fill byte
                         // (`pad_fill`), so it bypasses the cap and budget;
@@ -2280,6 +2318,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         self.process_org(&sym, addend, *fill)?;
                     } else {
                         let offset = self.sections[sec_idx].cursor_usize();
+                        let seq = self.seq;
+                        self.sections[sec_idx].resizable.push((offset as u64, seq));
                         self.deferred_skips.push(DeferredSkip {
                             sec_idx,
                             offset,
@@ -2572,6 +2612,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // dot-relative target instead moves with its own position and its
         // padding is already final.
         if sym != "." {
+            let seq = self.seq;
+            self.sections[sec_idx].resizable.push((current, seq));
             self.sections[sec_idx].align_markers.push(AlignMarker {
                 offset: current as usize,
                 padding,
@@ -2925,6 +2967,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 "`{a} - {b}`: a PC-relative value without a symbol is not supported"
             ));
         }
+        // A difference that can no longer change is a number, here as in
+        // an instruction operand (`fixed_difference`): written now, it
+        // needs no record to be resolved later, and it is what GNU as
+        // writes for a symbol that is declared an indirect function only
+        // further down (see `resolve_internal_relocations`). The field
+        // takes the low bytes, as the later resolution would give it.
+        if let Some(value) = self.fixed_difference(&a_resolved, &b_resolved) {
+            let bytes = value.wrapping_add(addend).to_le_bytes();
+            let field = bytes
+                .get(..size)
+                .ok_or("internal: data field wider than 8 bytes")?;
+            return self.sections[sec_idx].push_bytes(field);
+        }
         // `.` as the minuend is THIS directive's position: a synthetic label
         // here, which relaxation keeps current (`. - .data` is the offset).
         let a_resolved = if a_resolved == "." {
@@ -3085,6 +3140,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Forward references are fine: resolution happens after all items
         // are processed and every label position is known. Reserve the
         // maximum LEB128 width (10 bytes for u64); resolve shrinks to fit.
+        let seq = self.seq;
+        self.sections[sec_idx].resizable.push((offset as u64, seq));
         self.deferred_leb_diffs
             .push((sec_idx, offset, a_resolved, b_resolved, addend, signed));
         self.sections[sec_idx]
@@ -3116,6 +3173,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
         } else {
             instr
         };
+        // An expression that is a number already is encoded as one, and
+        // any other is put in terms the encoders know
+        // (`lower_operand_expressions`).
+        let lowered;
+        let instr = match self.lower_operand_expressions(instr)? {
+            Some(with_values) => {
+                lowered = with_values;
+                &lowered
+            }
+            None => instr,
+        };
 
         // Use the appropriate encoder based on current code mode.
         // When the i686 assembler is in .code64 mode, it delegates to
@@ -3124,28 +3192,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
             A::encode_instruction_code64(instr, base_offset)
         } else if self.code_mode == 32 && A::default_code_mode() == 64 {
             A::encode_instruction_code32(instr, base_offset)
-        } else if self.code_mode == 17 && A::default_code_mode() != 64 {
+        } else if self.code_mode == 17 {
             // `.code16gcc`: like .code16, but unsuffixed call/ret take
-            // 32-bit operands (GCC's -m16 calling convention).
+            // 32-bit operands (GCC's -m16 calling convention). In a 64-bit
+            // object as in a 32-bit one: the architecture hands real-mode
+            // code to the encoder that models its operand sizes.
             A::encode_instruction_code16_gcc(instr, base_offset)
-        } else if self.code_mode == 16 && A::default_code_mode() != 64 {
-            if std::env::var("LCCC_DBG16").is_ok() {
-                lccc::cli::stderr_line(format_args!(
-                    "[C16] dispatch code16 for {}",
-                    instr.mnemonic
-                ));
-            }
+        } else if self.code_mode == 16 {
             A::encode_instruction_code16(instr, base_offset)
-        } else if (self.code_mode == 16 || self.code_mode == 17) && A::default_code_mode() == 64 {
-            // .code16/.code16gcc inside a 64-bit TU: real-mode code must be
-            // assembled via the -m16 (i686) path where operand-size
-            // semantics are modeled. Encoding it with the 64-bit encoder
-            // would silently produce wrong machine code, so reject loudly.
-            return Err(format!(
-                ".code16 in 64-bit assembly is not supported; compile real-mode \
-                 code with -m16 (instruction: {})",
-                instr.mnemonic
-            ));
         } else {
             A::encode_instruction(instr, base_offset)
         };
@@ -3195,6 +3249,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // The architecture has already identified this as a near
                     // branch. Do not re-impose x86 rel32 lengths here:
                     // `.code16` jcc/jmp are 4/3-byte rel16 instructions.
+                    let seq = self.seq;
+                    self.sections[sec_idx].resizable.push((base_offset, seq));
                     self.sections[sec_idx].jumps.push(JumpInfo {
                         offset: base_offset as usize,
                         len: instr_len,
@@ -3239,6 +3295,284 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
 
         Ok(())
+    }
+
+    /// The stretch of bytes `name` stands in whose sizes are final -- its
+    /// section and the number of `Section::resizable` records in front of
+    /// it -- and its offset. Two labels of one stretch are at a distance
+    /// that can no longer change.
+    ///
+    /// `name` is a label or what a `.set` equates to one, and it has to be
+    /// defined already. A record at the label's own offset is in front of
+    /// it if it was written first (the label behind an empty padding run or
+    /// an empty gap moves with it) and behind it otherwise (a label in
+    /// front of the directive, or at the first byte of a branch, stays):
+    /// the order is by offset, then by source position.
+    ///
+    /// An indirect function has no such place: what the symbol stands for
+    /// is decided when the program is loaded. What has been said of the
+    /// symbol so far decides, as in GNU as: a `.type ...,
+    /// @gnu_indirect_function` further down comes too late to take a
+    /// constant back.
+    fn fixed_stretch(&self, name: &str) -> Option<((usize, usize), u64)> {
+        let label = match self.label_positions.contains_key(name) {
+            true => name,
+            false => self.alias_label(name)?,
+        };
+        let &(section, offset) = self.label_positions.get(label)?;
+        let seq = self.label_seq.get(label).copied()?;
+        if self.is_ifunc(name) {
+            return None;
+        }
+        Some((self.stretch_at(section, offset, seq), offset))
+    }
+
+    /// The stretch (`fixed_stretch`) a record written at `offset` of
+    /// `section`, at source position `seq`, stands in.
+    fn stretch_at(&self, section: usize, offset: u64, seq: u64) -> (usize, usize) {
+        let in_front = self.sections[section]
+            .resizable
+            .partition_point(|&record| record < (offset, seq));
+        (section, in_front)
+    }
+
+    /// The value of `a - b`, when it can no longer change: both labels are
+    /// already defined, in one section, and nothing between them is still
+    /// to be sized.
+    ///
+    /// This is when GNU as takes the difference for a constant on reading
+    /// it (`expr.c`: both symbols defined in the same section, neither one
+    /// an ifunc -- `S_FORCE_RELOC` in its lenient reading, which lets a
+    /// weak or global definition through -- and `frag_offset_fixed_p`,
+    /// i.e. only fixed frags between them; or one symbol minus itself). A
+    /// relaxable branch, alignment or `.org` padding, a `.skip` of an
+    /// expression that is no constant yet, a LEB128 or CFA advance of a
+    /// label difference all end a fixed frag, and all are in
+    /// `Section::resizable`. A `loop`/`jrcxz` and a `call` are fixed there
+    /// and here.
+    fn fixed_difference(&self, a: &str, b: &str) -> Option<i64> {
+        if a == b {
+            return Some(0);
+        }
+        let (stretch_a, offset_a) = self.fixed_stretch(a)?;
+        let (stretch_b, offset_b) = self.fixed_stretch(b)?;
+        // Section offsets: far below 2^63, each.
+        (stretch_a == stretch_b).then(|| offset_a as i64 - offset_b as i64)
+    }
+
+    /// The value of `expr`, when it is a number already: an expression over
+    /// constants and label differences that can no longer change
+    /// (`fixed_difference`), the location counter among the labels.
+    /// `.skip b - a`, `.skip (b - a) / 2 + 1`, `.skip SIZE - (. - start)`:
+    /// GNU as reads each as a number and fills on the spot, which also
+    /// keeps the labels on either side of the gap at a fixed distance.
+    ///
+    /// Every label is its offset in its stretch (`fixed_stretch`), so that
+    /// two of one stretch cancel and nothing else does; a `.set` symbol is
+    /// the value it has now.
+    fn fixed_expression(&self, expr: &str) -> Option<i64> {
+        use crate::backend::asm_expr::{SectionExpr, eval_section_expr};
+        type Form = SectionExpr<(usize, usize)>;
+        let here = self.current_section.map(|section| {
+            let offset = self.sections[section].cursor();
+            (self.stretch_at(section, offset, self.seq), offset)
+        });
+        // A name without a place is a term of its own, which only itself
+        // cancels.
+        let mut unplaced: Vec<String> = Vec::new();
+        let mut label = |name: &str| -> Form {
+            let place = match name {
+                "." => here,
+                _ => self.fixed_stretch(name),
+            };
+            match place {
+                Some((stretch, offset)) => Form::at(stretch, offset as i64),
+                None => {
+                    let known = unplaced.iter().position(|other| other == name);
+                    let index = known.unwrap_or_else(|| {
+                        unplaced.push(name.to_string());
+                        unplaced.len() - 1
+                    });
+                    Form::term((usize::MAX, index), 1)
+                }
+            }
+        };
+        let form = eval_section_expr(expr, |name| {
+            if let Some(&value) = self.set_values.get(name) {
+                return Ok(Form::absolute(value));
+            }
+            // `.set len, end - start`: captured as a sum of labels.
+            match self.set_exprs.get(name) {
+                Some(sum) if !self.is_nonfoldable_symbol(name) => Ok(sum
+                    .terms()
+                    .iter()
+                    .fold(Form::absolute(sum.constant), |form, (term, scale)| {
+                        form.add_scaled(label(term), *scale)
+                    })),
+                _ => Ok(label(name)),
+            }
+        })
+        .ok()?;
+        form.is_absolute().then_some(form.constant)
+    }
+
+    /// `instr` with every operand expression in the form the encoders take:
+    /// a number where it is one already, else a symbol and a constant, a
+    /// difference of two symbols, or a symbol that stands for the
+    /// expression. `None` when the operands are in that form as written.
+    ///
+    /// The encoders reserve a 32-bit field for whatever is not a number,
+    /// which the layout fills in at the end. GNU as does the same for an
+    /// expression it cannot evaluate yet, but folds the one it can and then
+    /// picks the encoding of the constant: `subl $(1b - pvh_start_xen),
+    /// %ebp` is `83 ed 0b` in `arch/x86/platform/pvh/head.S`, not `81 ed 0b
+    /// 00 00 00`. With the number in the operand every form gets it: the
+    /// imm8 of an ALU instruction, `push` and `imul`, the disp8 of a memory
+    /// operand, the accumulator and shift-by-one forms, and the operands
+    /// that can only be numbers (`shl`, `bt`, `ret`, `pshufd`, ...).
+    fn lower_operand_expressions(
+        &mut self,
+        instr: &Instruction,
+    ) -> Result<Option<Instruction>, String> {
+        let mut out: Option<Instruction> = None;
+        for (i, operand) in instr.operands.iter().enumerate() {
+            let lowered = match operand {
+                Operand::Immediate(imm) => self.lower_immediate(imm)?.map(Operand::Immediate),
+                Operand::Memory(mem) => self.lower_displacement(mem)?.map(Operand::Memory),
+                Operand::Indirect(inner) => match inner.as_ref() {
+                    Operand::Memory(mem) => self
+                        .lower_displacement(mem)?
+                        .map(|mem| Operand::Indirect(Box::new(Operand::Memory(mem)))),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(operand) = lowered {
+                out.get_or_insert_with(|| instr.clone()).operands[i] = operand;
+            }
+        }
+        Ok(out)
+    }
+
+    /// An immediate that is no number yet is one symbol and a constant,
+    /// which the encoders relocate, or a symbol that stands for the whole
+    /// expression (`expression_symbol`): a difference too, whatever the
+    /// parser made of it. The encoders take a symbol in every immediate
+    /// they can relocate, where they knew a difference in four places
+    /// (`movl $(b - a), (%rdi)`, `push $(b - a)`, `cmpl $(ext - b), (%rdi)`
+    /// were refused, and `add $(b - a), %al` got a four-byte field).
+    fn lower_immediate(&mut self, imm: &ImmediateValue) -> Result<Option<ImmediateValue>, String> {
+        Ok(match imm {
+            // (The encoders read `_GLOBAL_OFFSET_TABLE_` off the operand:
+            // it stands for a relocation type, not for a place.)
+            ImmediateValue::SymbolDiff(a, b)
+                if a != "_GLOBAL_OFFSET_TABLE_" && b != "_GLOBAL_OFFSET_TABLE_" =>
+            {
+                Some(match self.fixed_difference(a, b) {
+                    Some(value) => ImmediateValue::Integer(value),
+                    None => ImmediateValue::Symbol(self.expression_symbol(&format!("{a} - {b}"))?),
+                })
+            }
+            ImmediateValue::Symbol(text) if is_operand_expression(text) => {
+                Some(match self.operand_expression(text) {
+                    OperandValue::Number(value) => ImmediateValue::Integer(value),
+                    OperandValue::Symbol(name, 0) => ImmediateValue::Symbol(name),
+                    OperandValue::Symbol(name, addend) => {
+                        ImmediateValue::SymbolPlusOffset(name, addend)
+                    }
+                    OperandValue::Difference(..) | OperandValue::Other => {
+                        ImmediateValue::Symbol(self.expression_symbol(text)?)
+                    }
+                })
+            }
+            _ => None,
+        })
+    }
+
+    fn lower_displacement(&mut self, mem: &MemoryOperand) -> Result<Option<MemoryOperand>, String> {
+        let displacement = match &mem.displacement {
+            Displacement::SymbolDiff(a, b) => {
+                self.fixed_difference(a, b).map(Displacement::Integer)
+            }
+            Displacement::SymbolDiffAddend(a, b, addend) => self
+                .fixed_difference(a, b)
+                .map(|value| Displacement::Integer(value.wrapping_add(*addend))),
+            Displacement::Symbol(text) if is_operand_expression(text) => {
+                Some(match self.operand_expression(text) {
+                    OperandValue::Number(value) => Displacement::Integer(value),
+                    OperandValue::Symbol(name, 0) => Displacement::Symbol(name),
+                    OperandValue::Symbol(name, addend) => {
+                        Displacement::SymbolPlusOffset(name, addend)
+                    }
+                    OperandValue::Difference(a, b, 0) => Displacement::SymbolDiff(a, b),
+                    OperandValue::Difference(a, b, addend) => {
+                        Displacement::SymbolDiffAddend(a, b, addend)
+                    }
+                    OperandValue::Other => {
+                        // The value is a number only once the layout is
+                        // final, and a number is no place `%rip` can be
+                        // relative to (GNU as leaves a `PC32` against no
+                        // symbol, which no linker takes in a PIE).
+                        let pc_relative = mem
+                            .base
+                            .as_ref()
+                            .is_some_and(|base| matches!(base.name.as_str(), "rip" | "eip"));
+                        if pc_relative {
+                            return Err(format!(
+                                "displacement `{text}` is not valid with RIP-relative addressing"
+                            ));
+                        }
+                        Displacement::Symbol(self.expression_symbol(text)?)
+                    }
+                })
+            }
+            _ => None,
+        };
+        Ok(displacement.map(|displacement| MemoryOperand {
+            displacement,
+            ..mem.clone()
+        }))
+    }
+
+    /// What the operand expression `text` comes to as the instruction is
+    /// read.
+    fn operand_expression(&self, text: &str) -> OperandValue {
+        if let Some(value) = self.fixed_expression(text) {
+            return OperandValue::Number(value);
+        }
+        let captured = crate::backend::asm_expr::eval_section_expr(text, |name| {
+            Ok(self.capture_set_operand(name, 0))
+        });
+        match captured.as_ref().map(|sum| (sum.constant, sum.terms())) {
+            Ok((constant, [])) => OperandValue::Number(constant),
+            Ok((constant, [(name, 1)])) => OperandValue::Symbol(name.clone(), constant),
+            Ok((constant, [(a, 1), (b, -1)] | [(b, -1), (a, 1)])) => {
+                OperandValue::Difference(a.clone(), b.clone(), constant)
+            }
+            // More symbols than a relocation holds, or an operator that
+            // needs their values.
+            _ => OperandValue::Other,
+        }
+    }
+
+    /// A symbol that stands for the operand expression `text`, as `.set`
+    /// would define it here: resolved when the layout is final
+    /// (`publish_final_set`), and never written to the symbol table.
+    fn expression_symbol(&mut self, text: &str) -> Result<String, String> {
+        let name = format!("{EXPRESSION_SYMBOL}{}", self.expression_symbols.len());
+        self.expression_symbols.push(text.to_string());
+        self.define_set_value(&name, text)?;
+        Ok(name)
+    }
+
+    /// What to call the `.set` symbol `alias` in a diagnostic: the operand
+    /// expression it stands for, if it is one of `expression_symbol`'s.
+    fn set_symbol_spelling<'a>(&'a self, alias: &'a str) -> &'a str {
+        alias
+            .strip_prefix(EXPRESSION_SYMBOL)
+            .and_then(|number| number.parse::<usize>().ok())
+            .and_then(|number| self.expression_symbols.get(number))
+            .map_or(alias, String::as_str)
     }
 
     /// Rewrite every standalone `.` in an instruction's operand expressions
@@ -3329,7 +3663,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // `JMP` and `jmp.s` must register for relaxation exactly like `jmp`.
         let mnem_lower = instr.mnemonic.to_ascii_lowercase();
         let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-        let is_jump = mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
+        let is_jump =
+            mnem == "jmp" || mnem.starts_with("loop") || (mnem.starts_with('j') && mnem.len() >= 2);
         if !is_jump || instr.operands.len() != 1 {
             return None;
         }
@@ -3559,14 +3894,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// current layout. Returns the section of the last gap that changed,
     /// `None` when every gap already had its size.
     ///
-    /// One sweep in source order, each resize applied on the spot, so a
-    /// later expression is read against the gaps before it: the padding of
-    /// a nested ALTERNATIVE measures the code *and the padding* of the one
-    /// inside it (`741b-740b` spans the inner `.skip`). Sizing every
-    /// expression against the layout the sweep started from padded the
-    /// kernel's ALTERNATIVE_2 twice -- `__switch_to_asm` came out 13 bytes
-    /// of NOPs longer than GNU as's, and `.skip (b - a) * 2` behind another
-    /// deferred `.skip` took the gap between `a` and `b` for empty.
+    /// One sweep in source order, each resize in force for the expressions
+    /// behind it: the padding of a nested ALTERNATIVE measures the code
+    /// *and the padding* of the one inside it (`741b-740b` spans the inner
+    /// `.skip`). Sizing every expression against the layout the sweep
+    /// started from padded the kernel's ALTERNATIVE_2 twice --
+    /// `__switch_to_asm` came out 13 bytes of NOPs longer than GNU as's,
+    /// and `.skip (b - a) * 2` behind another deferred `.skip` took the gap
+    /// between `a` and `b` for empty.
     ///
     /// A gap is resized at its END, under `shift_after`'s tie rule: an
     /// empty gap shares its offset with the labels on both sides of the
@@ -3574,37 +3909,129 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// which of them the fill bytes precede. Two gaps at one offset
     /// therefore fill in source order whichever grows first.
     ///
+    /// The resizes are not written one by one. Each used to be a rebuild
+    /// of the section's tail and a move of every record of the section
+    /// (`shift_after`), which made a sweep gaps x records: 16,000 gaps
+    /// (8000 nested ALTERNATIVEs) took 9.6 s where GNU as takes 0.44 s.
+    /// They are queued per section instead (`skip_edits`), every label an
+    /// expression names is read through the queue (`label_in_sweep`), which
+    /// gives the offset it has once the queued gaps are written, and one
+    /// rebuild and one move per section apply them at the end of the
+    /// sweep -- the batching `fixup_alignment_markers_behind` uses for
+    /// padding, under the same tie rule.
+    ///
     /// A negative size is no gap, as in GNU as (which says so in a
     /// warning).
     fn size_deferred_skips(&mut self) -> Result<Option<usize>, String> {
+        let swept = self.sweep_deferred_skips();
+        // Written whatever the sweep's outcome, so that no label is read
+        // through a stale queue afterwards.
+        for (sec_idx, mut queue) in std::mem::take(&mut self.skip_edits) {
+            self.flush_padding_edits(sec_idx, &mut queue);
+        }
+        self.label_positions.remove(".");
+        swept
+    }
+
+    /// `size_deferred_skips`' sweep; leaves the resizes in `skip_edits`.
+    fn sweep_deferred_skips(&mut self) -> Result<Option<usize>, String> {
         let mut resized = None;
         for i in 0..self.deferred_skips.len() {
-            let (sec_idx, offset, old, fill, seq) = {
+            let (sec_idx, offset, old, seq) = {
                 let skip = &self.deferred_skips[i];
-                (skip.sec_idx, skip.offset, skip.size, skip.fill, skip.seq)
+                (skip.sec_idx, skip.offset, skip.size, skip.seq)
             };
-            // "." is the directive's own position (`0b + 16 - .`), and
-            // numeric references the renaming pass left alone (`0b`, `1f`)
-            // resolve from there.
+            // "." is the directive's own position (`0b + 16 - .`), behind
+            // the gaps resized so far, and numeric references the renaming
+            // pass left alone (`0b`, `1f`) resolve from there.
+            let here = match self.skip_edits.get(&sec_idx) {
+                Some(queue) => queue.map(offset as u64, Some(seq)),
+                None => offset as u64,
+            };
             self.label_positions
-                .insert(".".to_string(), (sec_idx, offset as u64));
-            let expr = self.resolve_numeric_labels_in_expr(
-                &self.deferred_skips[i].expr,
-                offset as u64,
-                sec_idx,
-            );
-            let value = self.evaluate_expr(&expr);
-            self.label_positions.remove(".");
-            let new = usize::try_from(value?).unwrap_or(0);
+                .insert(".".to_string(), (sec_idx, here));
+            let expr =
+                self.resolve_numeric_labels_in_expr(&self.deferred_skips[i].expr, here, sec_idx);
+            let value = self.evaluate_expr(&expr)?;
+            let new = usize::try_from(value).unwrap_or(0);
             if new == old {
                 continue;
             }
-            self.sections[sec_idx].resize_fill_run(offset, old, new, fill)?;
-            self.shift_after(sec_idx, offset + old, new as i64 - old as i64, Some(seq));
+            self.resize_deferred_skip(i, new)?;
             self.deferred_skips[i].size = new;
             resized = Some(sec_idx);
         }
         Ok(resized)
+    }
+
+    /// Give the gap of deferred skip `i` the size `new`: queued for the
+    /// end of the sweep, or on the spot where the bytes are a size only
+    /// (NOBITS) and in the tests' sequential reference.
+    fn resize_deferred_skip(&mut self, i: usize, new: usize) -> Result<(), String> {
+        let (sec_idx, offset, old, fill, seq) = {
+            let skip = &self.deferred_skips[i];
+            (skip.sec_idx, skip.offset, skip.size, skip.fill, skip.seq)
+        };
+        #[cfg(test)]
+        let on_the_spot = SEQUENTIAL_EDITS.get();
+        #[cfg(not(test))]
+        let on_the_spot = false;
+        if on_the_spot || self.sections[sec_idx].section_type == SHT_NOBITS {
+            self.sections[sec_idx].resize_fill_run(offset, old, new, fill)?;
+            self.shift_after(sec_idx, offset + old, new as i64 - old as i64, Some(seq));
+            return Ok(());
+        }
+        // `Section::resize_fill_run`'s refusals: the size is computed from
+        // the layout and can be anything (`.skip (b - a) << 30`).
+        if new > old && new > crate::backend::elf::MAX_DIRECTIVE_FILL {
+            return Err(format!(
+                ".skip: {new} bytes exceed the {}-byte directive limit",
+                crate::backend::elf::MAX_DIRECTIVE_FILL
+            ));
+        }
+        let bytes = fill_run(new, fill, &self.sections[sec_idx].name)?;
+        let mut edit = PadEdit {
+            start: offset,
+            old_len: old,
+            bytes,
+            at: (offset + old) as u64,
+            seq,
+        };
+        // Gaps come in source order, which is the order of their offsets
+        // unless the section was written out of order; the queue's map
+        // needs the latter. Write what is queued first, then: this gap's
+        // offset is current after that.
+        if self
+            .skip_edits
+            .get(&sec_idx)
+            .is_some_and(|queue| !queue.accepts(&edit))
+        {
+            let mut queue = self.skip_edits.remove(&sec_idx).unwrap_or_default();
+            self.flush_padding_edits(sec_idx, &mut queue);
+            let offset = self.deferred_skips[i].offset;
+            (edit.start, edit.at) = (offset, (offset + old) as u64);
+        }
+        self.skip_edits.entry(sec_idx).or_default().push(edit);
+        Ok(())
+    }
+
+    /// Where `name` stands once the gaps a `.skip` sizing sweep has resized
+    /// so far are written: the offset an expression of the sweep is to
+    /// read. Outside a sweep, simply where it stands.
+    fn label_in_sweep(&self, name: &str) -> Option<(usize, u64)> {
+        let &(sec, off) = self.label_positions.get(name)?;
+        match self.skip_edits.get(&sec) {
+            // "." was put in at its position in the sweep.
+            Some(queue) if name != "." => {
+                let seq = if queue.ties_at(off) {
+                    self.label_seq.get(name).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                Some((sec, queue.map(off, Some(seq))))
+            }
+            _ => Some((sec, off)),
+        }
     }
 
     /// Tell the jumps the layout resolves from the ones it leaves to the
@@ -4001,7 +4428,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .ok_or_else(|| format!("undefined label in .byte diff: {}", sym_b))?;
             let (pos_a, pos_b) = (&pos_a, &pos_b);
 
-            if pos_a.0 != pos_b.0 {
+            // An indirect function is no place to take a difference from
+            // (see `resolve_internal_relocations`): as the subtrahend it
+            // cannot be resolved, as the minuend it is a symbol defined
+            // elsewhere.
+            if self.is_ifunc(sym_b) {
+                return Err(self.unresolved_difference(sym_a, sym_b));
+            }
+            if pos_a.0 != pos_b.0 || self.is_ifunc(sym_a) {
                 // Cross-section byte diff (header.S: `.byte start_of_setup-1f`,
                 // start_of_setup in .entrytext, 1f in .header). GAS emits a
                 // PC8 relocation: S + A - P with P = the byte's own offset,
@@ -4078,8 +4512,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // This is a numeric label reference like "0b" or "1f"
                     let label_ref = &expr[start..=i];
                     i += 1;
-                    if let Some((_, label_off)) =
-                        self.resolve_numeric_label(label_ref, offset, sec_idx)
+                    if let Some(label_off) = self.numeric_label_in_sweep(label_ref, offset, sec_idx)
                     {
                         result.push_str(&label_off.to_string());
                     } else {
@@ -4095,6 +4528,37 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
         }
         result
+    }
+
+    /// `resolve_numeric_label` for an expression of a `.skip` sizing
+    /// sweep: `here` and the label offsets compared with it are the ones
+    /// the gaps resized so far lead to (`label_in_sweep`).
+    fn numeric_label_in_sweep(&self, symbol: &str, here: u64, sec_idx: usize) -> Option<u64> {
+        let Some(queue) = self.skip_edits.get(&sec_idx) else {
+            return self
+                .resolve_numeric_label(symbol, here, sec_idx)
+                .map(|(_, off)| off);
+        };
+        let (num, direction) = symbol.split_at(symbol.len().checked_sub(1)?);
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let seqs = self.numeric_label_seq.get(num);
+        let offsets = self
+            .numeric_label_positions
+            .get(num)?
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(sec, _))| sec == sec_idx)
+            .map(|(i, &(_, off))| {
+                let seq = seqs.and_then(|v| v.get(i)).copied().unwrap_or(0);
+                queue.map(off, Some(seq))
+            });
+        match direction {
+            "b" => offsets.filter(|&off| off <= here).max(),
+            "f" => offsets.filter(|&off| off > here).min(),
+            _ => None,
+        }
     }
 
     // ─── Expression evaluator ─────────────────────────────────────────
@@ -4243,7 +4707,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
             ExprToken::Symbol(name) => {
                 *pos += 1;
-                if let Some(&(_, offset)) = self.label_positions.get(name.as_str()) {
+                if let Some((_, offset)) = self.label_in_sweep(name.as_str()) {
                     Ok(offset as i64)
                 } else {
                     Err(format!("undefined symbol in expression: {}", name))
@@ -5077,119 +5541,420 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     // ─── Jump relaxation ──────────────────────────────────────────────
 
+    /// Relax the branches of every section.
+    ///
+    /// The passes are computed on the section's resizable items alone
+    /// (`relax_layout`) and the section is edited once, when their sizes
+    /// have settled; a section whose records that layout does not model is
+    /// relaxed in place, pass by pass, as every section used to be.
     fn relax_jumps(&mut self, from: Relax) -> Result<(), String> {
         for sec_idx in 0..self.sections.len() {
             if self.sections[sec_idx].jumps.is_empty() {
                 continue;
             }
+            if !self.relax_section_in_layout(sec_idx, from)? {
+                self.relax_section_in_place(sec_idx, from)?;
+            }
+            self.patch_short_jumps(sec_idx)?;
+        }
+        Ok(())
+    }
 
-            // Branch relaxation is a fixed-point problem with MORE THAN ONE
-            // solution, and the two obvious search directions do not find the
-            // same one.
-            //
-            // Starting pessimistic (every jump long) and only shrinking gets
-            // stuck: with a long jump in front of it, `.p2align 16` has to
-            // insert more padding, which pushes the target out of disp8 range,
-            // which "justifies" keeping the jump long.  That is self-consistent
-            // but 16 bytes worse than necessary.  A 124-nop test case came out
-            // 145 bytes against GAS's 129.
-            //
-            // Starting optimistic (every relaxable jump short) and only growing
-            // converges on the SMALLEST fixed point instead, and terminates for
-            // the same reason: every step strictly increases the section size,
-            // which is bounded.  That is also what GAS does, so byte-for-byte
-            // agreement comes for free.
-            //
-            // The first iteration therefore shrinks unconditionally; afterwards
-            // only growth is considered. A `GrowOnly` call has no shrinking
-            // iteration at all: it continues a relaxation whose deferred
-            // `.skip` gaps have since been resized, and a jump that grew
-            // stays long, as it does in GAS, whose relaxation loop never
-            // shortens a branch (see `settle_layout`).
-            let mut first_pass = from == Relax::FromShortest;
-            // Nothing in front of this offset has changed since a growth
-            // sweep last passed it (see `plan_jump_growth`).
-            let mut settled_before = 0usize;
-            loop {
-                let any_change;
+    /// Relax the branches of `sec_idx` on a layout of its resizable items
+    /// and apply the result in one edit. `false` when the section has to
+    /// be relaxed in place instead:
+    ///
+    /// * it holds an `.org`, whose padding follows a label that can be
+    ///   anywhere and is resolved against the offsets of the moment;
+    /// * it is NOBITS (its padding is a size, and nothing in it moves);
+    /// * its records do not have the shape `Layout::build` relies on;
+    /// * `CCC_DEBUG_RELAX` asks for the pass-by-pass trace.
+    fn relax_section_in_layout(&mut self, sec_idx: usize, from: Relax) -> Result<bool, String> {
+        use relax_layout::{JumpSpec, Latch, LatchLen, Layout, MarkerSpec, MarkerSpecAt, Point};
 
-                // The first pass shortens every relaxable jump the layout
-                // resolves, even one that does not currently fit: the
-                // growth passes restore exactly those that still do not fit
-                // once the layout has settled.
-                let mut actions: Vec<(usize, JumpAction)> = Vec::new();
-                let dbg = std::env::var("CCC_DEBUG_RELAX").is_ok();
-                if first_pass || dbg {
-                    for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
-                        let target_off_opt = jump.target_offset();
-                        if dbg {
-                            lccc::cli::stderr_line(format_args!(
-                                "[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?} relaxed={} growable={}",
-                                sec_idx,
-                                j_idx,
-                                jump.offset,
-                                jump.len,
-                                jump.is_conditional,
-                                jump.target,
-                                target_off_opt,
-                                jump.relaxed,
-                                jump.can_grow
-                            ));
-                        }
-                        if first_pass && target_off_opt.is_some() && !jump.relaxed {
-                            actions.push((j_idx, JumpAction::Shrink));
-                        }
+        #[cfg(test)]
+        if SEQUENTIAL_EDITS.get() {
+            return Ok(false);
+        }
+        if self.sections[sec_idx].section_type == SHT_NOBITS
+            || self.sections[sec_idx]
+                .align_markers
+                .iter()
+                .any(|m| matches!(m.kind, AlignMarkerKind::Org { .. }))
+            || std::env::var_os("CCC_DEBUG_RELAX").is_some()
+        {
+            return Ok(false);
+        }
+        // Front to back, as every padding sweep takes them.
+        self.sections[sec_idx]
+            .align_markers
+            .sort_by_key(|m| m.offset);
+
+        // The branches a pass may resize: the ones the layout resolves that
+        // can be shortened (first pass only) or have been.
+        let from_shortest = from == Relax::FromShortest;
+        let mut specs: Vec<JumpSpec> = Vec::new();
+        let mut spec_jump: Vec<usize> = Vec::new();
+        let mut spec_of_jump: FxHashMap<usize, usize> = FxHashMap::default();
+        for (j, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
+            let Some((target_off, target_seq)) = jump.target_at else {
+                continue;
+            };
+            let shortened = jump.relaxed && jump.can_grow;
+            let shortens = from_shortest && !jump.relaxed && jump.target_offset().is_some();
+            if !shortened && !shortens {
+                continue;
+            }
+            spec_of_jump.insert(j, specs.len());
+            spec_jump.push(j);
+            specs.push(JumpSpec {
+                off: jump.offset as u64,
+                short_len: 2 + u64::from(jump.prefix66),
+                long_len: jump.long_len as u64,
+                short: shortened,
+                target: Point {
+                    off: target_off,
+                    seq: Some(target_seq),
+                },
+                addend: jump.target_addend,
+            });
+        }
+
+        // Back-edge candidates per tight-loop header (see
+        // `fixup_alignment_markers_behind`, which keeps the same index).
+        let has_tight = self.sections[sec_idx]
+            .align_markers
+            .iter()
+            .any(|m| matches!(m.kind, AlignMarkerKind::TightLoop { .. }));
+        let mut jumps_by_target = self.sections[sec_idx]
+            .jumps_by_target
+            .take()
+            .unwrap_or_default();
+        if jumps_by_target.is_empty() && has_tight {
+            for (j, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
+                jumps_by_target
+                    .entry(jump.target.clone())
+                    .or_default()
+                    .push(j);
+            }
+        }
+        let section = &self.sections[sec_idx];
+        let markers: Vec<MarkerSpecAt> = section
+            .align_markers
+            .iter()
+            .map(|m| {
+                let spec = match &m.kind {
+                    AlignMarkerKind::Align {
+                        align, max_skip, ..
+                    } => MarkerSpec::Align {
+                        align: *align,
+                        max_skip: *max_skip,
+                    },
+                    AlignMarkerKind::TightLoop { header } => {
+                        let at = match self.label_positions.get(header.as_str()) {
+                            None => Err("unresolved-header"),
+                            Some(&(h_sec, _)) if h_sec != sec_idx => Err("cross-section"),
+                            Some(&(_, h_off)) => Ok(Point {
+                                off: h_off,
+                                seq: Some(
+                                    self.label_seq.get(header.as_str()).copied().unwrap_or(0),
+                                ),
+                            }),
+                        };
+                        // The latch: the first branch at or behind the
+                        // header that goes back to it. Edits never reorder
+                        // records, so the choice holds for every pass.
+                        let latch = at.ok().and_then(|h| {
+                            jumps_by_target
+                                .get(header.as_str())
+                                .into_iter()
+                                .flatten()
+                                .map(|&j| (section.jumps[j].offset as u64, j))
+                                .filter(|&(off, _)| off >= h.off)
+                                .min()
+                                .map(|(off, j)| Latch {
+                                    at: off,
+                                    len: match spec_of_jump.get(&j) {
+                                        Some(&spec) => LatchLen::Jump(spec),
+                                        None => LatchLen::Fixed(section.jumps[j].len as u64),
+                                    },
+                                })
+                        });
+                        MarkerSpec::Tight { header: at, latch }
                     }
-                }
-                // Growth passes decide in one sequential sweep, as GAS does
-                // (see `plan_jump_growth`), not against the pass's snapshot.
-                // A first pass that shrinks nothing is a growth pass too
-                // (every jump may be short already). A pass that does shrink
-                // leaves growth to the next pass, which it always forces.
-                let growing = !first_pass || actions.is_empty();
-                if growing {
-                    for j_idx in self.plan_jump_growth(sec_idx, settled_before) {
-                        actions.push((j_idx, JumpAction::Grow));
-                    }
-                }
-
-                if actions.is_empty() {
-                    break;
-                }
-
-                // Where this pass first touches the section: in front of it
-                // every record keeps its offset. A pass that shortens jumps
-                // touches all of it. (The tests' reference run takes every
-                // sweep over the whole section, so that the differential
-                // tests hold the shortened sweeps to the full ones.)
-                #[cfg(test)]
-                let whole_sweeps = SEQUENTIAL_EDITS.get();
-                #[cfg(not(test))]
-                let whole_sweeps = false;
-                let first_edit = if growing && !whole_sweeps {
-                    let jumps = &self.sections[sec_idx].jumps;
-                    actions
-                        .iter()
-                        .map(|&(j, _)| jumps[j].offset)
-                        .min()
-                        .unwrap_or(0)
-                } else {
-                    0
+                    // Excluded above.
+                    AlignMarkerKind::Org { .. } => MarkerSpec::Align {
+                        align: 1,
+                        max_skip: None,
+                    },
                 };
-                self.apply_jump_transitions(sec_idx, &actions);
-                any_change = true;
+                MarkerSpecAt {
+                    off: m.offset as u64,
+                    padding: m.padding as u64,
+                    seq: m.seq,
+                    spec,
+                }
+            })
+            .collect();
+        let layout = Layout::build(&specs, &markers);
+        self.sections[sec_idx].jumps_by_target = Some(jumps_by_target);
+        let Some(mut layout) = layout else {
+            return Ok(false);
+        };
 
-                // Recompute alignment padding after the size changes.
-                let first_repad = self.fixup_alignment_markers_behind(sec_idx, first_edit)?;
-                settled_before = first_repad.map_or(first_edit, |at| at.min(first_edit));
-                first_pass = false;
+        let debug_tight = std::env::var_os("CCC_DEBUG_TIGHT").is_some();
+        let headers: Vec<String> = if debug_tight {
+            self.sections[sec_idx]
+                .align_markers
+                .iter()
+                .map(|m| match &m.kind {
+                    AlignMarkerKind::TightLoop { header } => header.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut budget = self.fill_budget_used;
+        let settled = layout.settle(
+            from_shortest,
+            &mut |grow| {
+                let total = usize::try_from(grow)
+                    .ok()
+                    .and_then(|grow| budget.checked_add(grow).map(|total| (total, grow)));
+                match total {
+                    Some((total, _)) if total <= crate::backend::elf::MAX_TOTAL_DIRECTIVE_FILL => {
+                        budget = total;
+                        Ok(())
+                    }
+                    Some((total, grow)) => Err(format!(
+                        "directive fill budget of {} bytes exceeded ({total} total, {grow} more requested)",
+                        crate::backend::elf::MAX_TOTAL_DIRECTIVE_FILL
+                    )),
+                    None => Err(format!(
+                        "directive fill budget of {} bytes exceeded ({grow} more requested)",
+                        crate::backend::elf::MAX_TOTAL_DIRECTIVE_FILL
+                    )),
+                }
+            },
+            &mut |m, verdict| {
+                if debug_tight {
+                    let header = &headers[m];
+                    match verdict {
+                        Ok((size, log2, align)) => lccc::cli::stderr_line(format_args!(
+                            "[TIGHT] sec{sec_idx} header={header} span={size} log2={log2} align={align}"
+                        )),
+                        Err(why) => lccc::cli::stderr_line(format_args!(
+                            "[TIGHT] sec{sec_idx} header={header} reject={why}"
+                        )),
+                    }
+                }
+            },
+        );
+        self.fill_budget_used = budget;
+        settled?;
 
-                if !any_change {
-                    break;
+        // One edit of the section for all the passes. Every jump first
+        // takes the short form the first pass gave it, then the ones that
+        // grew take their near form: the bytes and relocations of a jump
+        // that went both ways are the ones the two transitions leave.
+        let shrink: Vec<(usize, JumpAction)> = (0..specs.len())
+            .filter(|&spec| layout.jump_outcome(spec).shrunk)
+            .map(|spec| (spec_jump[spec], JumpAction::Shrink))
+            .collect();
+        if !shrink.is_empty() {
+            self.apply_jump_transitions(sec_idx, &shrink);
+        }
+        let grown: Vec<(usize, u32)> = (0..specs.len())
+            .filter_map(|spec| Some((spec_jump[spec], layout.jump_outcome(spec).grown?)))
+            .collect();
+        if !grown.is_empty() {
+            let grow: Vec<(usize, JumpAction)> =
+                grown.iter().map(|&(j, _)| (j, JumpAction::Grow)).collect();
+            let kept = self.sections[sec_idx].relocations.len();
+            self.apply_jump_transitions(sec_idx, &grow);
+            // The relocations of the near forms, in the order the passes
+            // append them: pass by pass, each from the back of the section.
+            let section = &mut self.sections[sec_idx];
+            let pass_of: FxHashMap<u64, u32> = grown
+                .iter()
+                .map(|&(j, pass)| (section.jumps[j].field_offset(), pass))
+                .collect();
+            section.relocations[kept..].sort_by_key(|reloc| {
+                (
+                    pass_of.get(&reloc.offset).copied().unwrap_or(u32::MAX),
+                    std::cmp::Reverse(reloc.offset),
+                )
+            });
+        }
+
+        // The padding, each run written for its final size.
+        let mut queue = PadQueue::default();
+        for m in 0..markers.len() {
+            let outcome = layout.marker_outcome(m);
+            let existing = self.sections[sec_idx].align_markers[m].padding;
+            if outcome.repadded {
+                let new_bytes = self.padding_run(sec_idx, m, outcome.padding as usize)?;
+                let marker = &self.sections[sec_idx].align_markers[m];
+                let edit = PadEdit {
+                    start: marker.offset,
+                    old_len: existing,
+                    bytes: new_bytes,
+                    at: (marker.offset + existing) as u64,
+                    seq: marker.seq,
+                };
+                self.enqueue_padding_edit(sec_idx, m, existing, &mut queue, edit);
+            }
+            let marker = &mut self.sections[sec_idx].align_markers[m];
+            marker.padding = outcome.padding as usize;
+            if let Some(bucket) = outcome.tight {
+                marker.tight_resolved_align = bucket;
+            }
+        }
+        self.flush_padding_edits(sec_idx, &mut queue);
+        Ok(true)
+    }
+
+    /// The bytes of marker `marker_idx`'s padding run at `len` bytes.
+    ///
+    /// The ENTIRE run is generated rather than spliced: executable padding
+    /// is a sequence of multi-byte NOP *instructions*, so inserting or
+    /// deleting bytes in the middle of it would corrupt an instruction.
+    fn padding_run(
+        &self,
+        sec_idx: usize,
+        marker_idx: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, String> {
+        let section = &self.sections[sec_idx];
+        let marker = &section.align_markers[marker_idx];
+        let is_exec = section.flags & SHF_EXECINSTR != 0;
+        match &marker.kind {
+            // `.org` / org-style `.fill LABEL+N-.` pad with the fill byte,
+            // not multi-byte NOPs, even in an executable section.
+            AlignMarkerKind::Org { fill, .. } => fill_run(len, *fill, &section.name),
+            // An `.align` with an explicit non-`0x90` fill byte pads
+            // verbatim (GAS tc-i386 keeps multi-byte NOPs only for the
+            // default/0x90 fill in executable sections).
+            AlignMarkerKind::Align {
+                fill: Some(fill), ..
+            } if !is_exec || *fill != 0x90 => fill_run(len, *fill, &section.name),
+            // Tight-loop padding is unconditional max-skip-0 style
+            // alignment and always uses optimal multi-byte NOPs.
+            AlignMarkerKind::Align { .. } | AlignMarkerKind::TightLoop { .. } => {
+                section_padding(len, is_exec, marker.after_insn, marker.nops, &section.name)
+            }
+        }
+    }
+
+    /// Relax the branches of `sec_idx` pass by pass, editing the section
+    /// after each: the algorithm `relax_layout` transcribes, and the one
+    /// its results are held to (`batched_edit_differential_tests`).
+    fn relax_section_in_place(&mut self, sec_idx: usize, from: Relax) -> Result<(), String> {
+        // Branch relaxation is a fixed-point problem with MORE THAN ONE
+        // solution, and the two obvious search directions do not find the
+        // same one.
+        //
+        // Starting pessimistic (every jump long) and only shrinking gets
+        // stuck: with a long jump in front of it, `.p2align 16` has to
+        // insert more padding, which pushes the target out of disp8 range,
+        // which "justifies" keeping the jump long.  That is self-consistent
+        // but 16 bytes worse than necessary.  A 124-nop test case came out
+        // 145 bytes against GAS's 129.
+        //
+        // Starting optimistic (every relaxable jump short) and only growing
+        // converges on the SMALLEST fixed point instead, and terminates for
+        // the same reason: every step strictly increases the section size,
+        // which is bounded.  That is also what GAS does, so byte-for-byte
+        // agreement comes for free.
+        //
+        // The first iteration therefore shrinks unconditionally; afterwards
+        // only growth is considered. A `GrowOnly` call has no shrinking
+        // iteration at all: it continues a relaxation whose deferred
+        // `.skip` gaps have since been resized, and a jump that grew
+        // stays long, as it does in GAS, whose relaxation loop never
+        // shortens a branch (see `settle_layout`).
+        let mut first_pass = from == Relax::FromShortest;
+        // Nothing in front of this offset has changed since a growth
+        // sweep last passed it (see `plan_jump_growth`).
+        let mut settled_before = 0usize;
+        loop {
+            let any_change;
+
+            // The first pass shortens every relaxable jump the layout
+            // resolves, even one that does not currently fit: the
+            // growth passes restore exactly those that still do not fit
+            // once the layout has settled.
+            let mut actions: Vec<(usize, JumpAction)> = Vec::new();
+            let dbg = std::env::var("CCC_DEBUG_RELAX").is_ok();
+            if first_pass || dbg {
+                for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
+                    let target_off_opt = jump.target_offset();
+                    if dbg {
+                        lccc::cli::stderr_line(format_args!(
+                            "[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?} relaxed={} growable={}",
+                            sec_idx,
+                            j_idx,
+                            jump.offset,
+                            jump.len,
+                            jump.is_conditional,
+                            jump.target,
+                            target_off_opt,
+                            jump.relaxed,
+                            jump.can_grow
+                        ));
+                    }
+                    if first_pass && target_off_opt.is_some() && !jump.relaxed {
+                        actions.push((j_idx, JumpAction::Shrink));
+                    }
+                }
+            }
+            // Growth passes decide in one sequential sweep, as GAS does
+            // (see `plan_jump_growth`), not against the pass's snapshot.
+            // A first pass that shrinks nothing is a growth pass too
+            // (every jump may be short already). A pass that does shrink
+            // leaves growth to the next pass, which it always forces.
+            let growing = !first_pass || actions.is_empty();
+            if growing {
+                for j_idx in self.plan_jump_growth(sec_idx, settled_before) {
+                    actions.push((j_idx, JumpAction::Grow));
                 }
             }
 
-            self.patch_short_jumps(sec_idx)?;
+            if actions.is_empty() {
+                break;
+            }
+
+            // Where this pass first touches the section: in front of it
+            // every record keeps its offset. A pass that shortens jumps
+            // touches all of it. (The tests' reference run takes every
+            // sweep over the whole section, so that the differential
+            // tests hold the shortened sweeps to the full ones.)
+            #[cfg(test)]
+            let whole_sweeps = SEQUENTIAL_EDITS.get();
+            #[cfg(not(test))]
+            let whole_sweeps = false;
+            let first_edit = if growing && !whole_sweeps {
+                let jumps = &self.sections[sec_idx].jumps;
+                actions
+                    .iter()
+                    .map(|&(j, _)| jumps[j].offset)
+                    .min()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            self.apply_jump_transitions(sec_idx, &actions);
+            any_change = true;
+
+            // Recompute alignment padding after the size changes.
+            let first_repad = self.fixup_alignment_markers_behind(sec_idx, first_edit)?;
+            settled_before = first_repad.map_or(first_edit, |at| at.min(first_edit));
+            first_pass = false;
+
+            if !any_change {
+                break;
+            }
         }
         Ok(())
     }
@@ -5875,8 +6640,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
             .align_markers
             .sort_by_key(|m| m.offset);
 
-        let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
-
         // Back-edge candidates per tight-loop header (jump indices).  Jumps
         // are only moved by this sweep, never added or resized, so the
         // index is built once and kept on the section; building it for
@@ -6034,37 +6797,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
             if needed_padding != existing_padding {
                 first_repad.get_or_insert(current_offset);
-                // Regenerate the ENTIRE padding run rather than splicing the
-                // delta. Executable padding is a sequence of multi-byte NOP
-                // *instructions*, so inserting or deleting bytes in the middle
-                // of it would corrupt an instruction; only a full rebuild
-                // yields a valid, optimally-sized NOP sequence for the new
-                // length.
-                let after_insn = self.sections[sec_idx].align_markers[marker_idx].after_insn;
-                let nops = self.sections[sec_idx].align_markers[marker_idx].nops;
-                // `.org` / org-style `.fill LABEL+N-.` pad with the fill
-                // byte, not multi-byte NOPs, even in an executable section.
-                // An `.align` with an explicit non-`0x90` fill byte pads
-                // verbatim (GAS tc-i386 keeps multi-byte NOPs only for the
-                // default/0x90 fill in executable sections).
-                let sec_name = self.sections[sec_idx].name.clone();
-                let new_bytes = match &kind {
-                    AlignMarkerKind::Org { fill, .. } => {
-                        fill_run(needed_padding, *fill, &sec_name)?
-                    }
-                    AlignMarkerKind::Align { fill, .. } => match fill {
-                        Some(f) if is_exec && *f != 0x90 => {
-                            fill_run(needed_padding, *f, &sec_name)?
-                        }
-                        Some(f) if !is_exec => fill_run(needed_padding, *f, &sec_name)?,
-                        _ => section_padding(needed_padding, is_exec, after_insn, nops, &sec_name)?,
-                    },
-                    // Tight-loop padding is unconditional max-skip-0 style
-                    // alignment and always uses optimal multi-byte NOPs.
-                    AlignMarkerKind::TightLoop { .. } => {
-                        section_padding(needed_padding, is_exec, after_insn, nops, &sec_name)?
-                    }
-                };
+                // The whole run is written again (`padding_run`).
+                let new_bytes = self.padding_run(sec_idx, marker_idx, needed_padding)?;
                 debug_assert_eq!(new_bytes.len(), needed_padding);
                 let current_len = queue.len_after(self.sections[sec_idx].cursor_usize());
                 if current_offset + existing_padding <= current_len {
@@ -6434,12 +7168,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// still unknown (`(e - s) >> 1` with forward labels) is evaluated after
     /// layout in GAS's section algebra (`pending_set_exprs`).
     fn define_set(&mut self, alias: &str, target: &str) -> Result<(), String> {
-        use crate::backend::asm_expr::{SectionExpr, eval_section_expr, is_bare_symbol};
-        let target = target.trim();
         self.set_values.remove(alias);
         self.set_exprs.remove(alias);
-        self.pending_set_exprs.retain(|(a, _, _)| a != alias);
+        if self.pending_set_names.remove(alias) {
+            self.pending_set_exprs.retain(|(a, _, _)| a != alias);
+        }
         self.aliases.remove(alias);
+        self.define_set_value(alias, target)
+    }
+
+    /// `define_set` for a name that has no value yet.
+    fn define_set_value(&mut self, alias: &str, target: &str) -> Result<(), String> {
+        use crate::backend::asm_expr::{SectionExpr, eval_section_expr, is_bare_symbol};
+        let target = target.trim();
         if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(target) {
             // A constant, with or without operators (`.set salign, 0x1000`,
             // `.equ N, 3*4+1`): an absolute symbol, whether or not a section
@@ -6467,6 +7208,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // are unknown yet, so evaluate after layout.
                 eval_section_expr::<()>(&substituted, |_| Ok(SectionExpr::absolute(0)))
                     .map_err(|_| format!(".set {alias}, {target}: {e}"))?;
+                self.pending_set_names.insert(alias.to_string());
                 self.pending_set_exprs
                     .push((alias.to_string(), substituted, sec_idx));
             }
@@ -6595,6 +7337,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// The writer consumes abs_symbols in build_symbol_table.
     fn resolve_set_constants(&mut self) -> Result<(), String> {
         let pending = std::mem::take(&mut self.pending_set_exprs);
+        self.pending_set_names.clear();
         for (alias, expr, _sec_idx) in pending {
             let v =
                 crate::backend::asm_expr::eval_section_expr(&expr, |n| self.final_set_name(n, 0))
@@ -6653,8 +7396,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // scraped from nm output by the boot Makefile's ZOFFSET rule, and
         // swallowing it produced "undefined reference to ZO_z_input_len"
         // in header.S.
-        for (name, val) in self.set_values.clone() {
-            self.aliases.entry(name).or_insert_with(|| val.to_string());
+        // (An assembler-local name is no symbol of the object, constant
+        // or not: `.set .Llen, end - start` used to leave an ABS `.Llen`.)
+        for (name, val) in &self.set_values {
+            if !name.starts_with(".L") && !self.aliases.contains_key(name) {
+                self.aliases.insert(name.clone(), val.to_string());
+            }
         }
         Ok(())
     }
@@ -6662,6 +7409,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// `v` with every defined label among its symbol terms (the global and
     /// weak ones [`Self::final_set_name`] keeps by name) replaced by its
     /// section plus offset: the value's position, independent of binding.
+    /// An indirect function stays a symbol: what it stands for is decided
+    /// when the program is loaded, so it is no place in its section
+    /// (`ifunc - label` is relative to the symbol, `label - ifunc` cannot
+    /// be resolved; see `resolve_internal_relocations`).
     fn fold_label_terms(
         &self,
         v: crate::backend::asm_expr::SectionExpr<SetBase>,
@@ -6671,8 +7422,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         for (base, coeff) in v.terms() {
             let t = match base {
                 SetBase::Sym(n) => match self.label_positions.get(n) {
-                    Some(&(sec, off)) => SectionExpr::at(SetBase::Sec(sec), off as i64),
-                    None => SectionExpr::term(base.clone(), 1),
+                    Some(&(sec, off)) if !self.is_ifunc(n) => {
+                        SectionExpr::at(SetBase::Sec(sec), off as i64)
+                    }
+                    _ => SectionExpr::term(base.clone(), 1),
                 },
                 SetBase::Sec(_) => SectionExpr::term(base.clone(), 1),
             };
@@ -6713,6 +7466,32 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
                 }
             }
+            // `X - (a place in section s)`, X an external symbol or a place
+            // in another section: a field of `s` that holds it is relative
+            // to its own place (GNU as `fixup_segment`: a subtrahend defined
+            // in the fixup's section makes the fixup PC-relative --
+            // `mov $(ext - here + 2), %eax` is `R_X86_64_PC32 ext+N`), and a
+            // field anywhere else cannot hold it. Both are what
+            // `resolve_internal_relocations` does with a difference, so the
+            // relocations become differences: X minus the start of `s`.
+            [(minuend, 1), (SetBase::Sec(sub), -1)] | [(SetBase::Sec(sub), -1), (minuend, 1)]
+                if !self.is_global_or_weak(alias) =>
+            {
+                let minuend = match minuend {
+                    SetBase::Sym(name) => name.clone(),
+                    SetBase::Sec(sec) => self.sections[*sec].name.clone(),
+                };
+                let subtrahend = self.sections[*sub].name.clone();
+                for sec in &mut self.sections {
+                    for r in &mut sec.relocations {
+                        if r.symbol == alias && r.diff_symbol.is_none() {
+                            r.symbol = minuend.clone();
+                            r.diff_symbol = Some(subtrahend.clone());
+                            r.addend = r.addend.wrapping_add(c);
+                        }
+                    }
+                }
+            }
             _ => {
                 let used = self.sections.iter().any(|s| {
                     s.relocations
@@ -6720,9 +7499,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         .any(|r| r.symbol == alias || r.diff_symbol.as_deref() == Some(alias))
                 });
                 if used {
-                    return Err(format!(
-                        "can't resolve `{alias}': its value is not a link-time address"
-                    ));
+                    // GNU as's wording for a difference: a place by its
+                    // section, a symbol by its name (`can't resolve .text -
+                    // xtrn`).
+                    let name = |base: &SetBase| match base {
+                        SetBase::Sym(symbol) => symbol.clone(),
+                        SetBase::Sec(section) => self.sections[*section].name.clone(),
+                    };
+                    return Err(match folded.terms() {
+                        [(a, 1), (b, -1)] | [(b, -1), (a, 1)] => {
+                            format!("can't resolve {} - {}", name(a), name(b))
+                        }
+                        _ => format!(
+                            "can't resolve `{}': its value is not a link-time address",
+                            self.set_symbol_spelling(alias)
+                        ),
+                    });
                 }
             }
         }
@@ -6822,6 +7614,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
         out
     }
 
+    /// GNU as's wording for a difference that is no link-time constant:
+    /// the minuend by its section if it is a label the assembler resolves
+    /// (`can't resolve .text - xtrn`), by name otherwise.
+    fn unresolved_difference(&self, a: &str, b: &str) -> String {
+        let a_name = match self.label_positions.get(a) {
+            Some(&(section, _)) if !self.is_ifunc(a) => self.sections[section].name.as_str(),
+            _ => a,
+        };
+        format!("can't resolve {a_name} - {b}")
+    }
+
     fn resolve_internal_relocations(&mut self) -> Result<(), String> {
         for sec_idx in 0..self.sections.len() {
             let mut resolved: Vec<(usize, i64, usize)> = Vec::new(); // (offset, value, patch_size)
@@ -6847,16 +7650,42 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         // Either side may be a NUMERIC local label (`0b` in
                         // relocate_kernel_64.S `$identity_mapped - 0b`);
                         // label_positions only holds named labels.
-                        let a_pos =
+                        // And either side may be a `.set` alias of a
+                        // label, which stands where the label stands
+                        // (`lb - al` after `.set al, la` used to end in
+                        // "can't resolve .text - al").
+                        // A symbol minus itself is 0 whatever it is.
+                        if reloc.symbol == *diff_sym {
+                            resolved.push((
+                                reloc.offset as usize,
+                                reloc.addend,
+                                reloc.patch_size as usize,
+                            ));
+                            continue;
+                        }
+                        // An indirect function has no place to take a
+                        // difference from: what the symbol stands for is
+                        // decided when the program is loaded. GNU as treats
+                        // it like a symbol defined elsewhere -- `ifunc -
+                        // label` is PC-relative to it, `label - ifunc` is
+                        // "can't resolve .text - ifunc" -- unless the
+                        // difference was a number when it was read, and
+                        // then it was written as one (`fixed_difference`).
+                        let position = |name: &str| {
+                            if self.is_ifunc(name) {
+                                return None;
+                            }
                             self.label_positions
-                                .get(&reloc.symbol)
+                                .get(name)
                                 .copied()
+                                .or_else(|| self.resolve_numeric_label(name, reloc.offset, sec_idx))
                                 .or_else(|| {
-                                    self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx)
-                                });
-                        let b_pos = self.label_positions.get(diff_sym).copied().or_else(|| {
-                            self.resolve_numeric_label(diff_sym, reloc.offset, sec_idx)
-                        });
+                                    self.alias_label(name)
+                                        .and_then(|label| self.label_positions.get(label).copied())
+                                })
+                        };
+                        let a_pos = position(&reloc.symbol);
+                        let b_pos = position(diff_sym);
                         // A SECTION symbol in a difference: in GAS a section
                         // name used as a symbol is offset 0 of THAT section,
                         // wherever the expression is placed.  So `X - S`
@@ -6922,14 +7751,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // `can't resolve A - B`, folding a local A to its section
                     // (`.text - xtrn`); silently emitting a one-sided reloc
                     // miscomputes the field.
-                    let section_names: Vec<String> =
-                        self.sections.iter().map(|s| s.name.clone()).collect();
-                    let a_name = match self.label_positions.get(&reloc.symbol) {
-                        Some((sec, _)) => section_names[*sec].clone(),
-                        None => reloc.symbol.clone(),
-                    };
-                    let b_name = reloc.diff_symbol.clone().unwrap_or_default();
-                    return Err(format!("can't resolve {a_name} - {b_name}"));
+                    let b_name = reloc.diff_symbol.as_deref().unwrap_or_default();
+                    return Err(self.unresolved_difference(&reloc.symbol, b_name));
                 }
 
                 let label_pos = self
@@ -7044,10 +7867,53 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.sections[sec_idx].write_bytes_at(offset, &[value])?;
             }
 
+            // A numeric label reference that found no label (`jmp 1f` with
+            // no `1:` behind it) is no symbol a linker could ever define.
+            // GNU as: "local label `"1" (instance number 1 of a fb label)'
+            // is not defined"; it used to leave the object as a relocation
+            // against a symbol named `1f`.
+            if let Some(dangling) = unresolved
+                .iter()
+                .find(|reloc| Self::is_numeric_label_ref(&reloc.symbol))
+            {
+                return Err(format!("local label `{}' is not defined", dangling.symbol));
+            }
             self.sections[sec_idx].relocations = unresolved;
         }
         Ok(())
     }
+}
+
+/// The names of the symbols that stand for operand expressions
+/// (`ElfWriterCore::expression_symbol`), in front of their number.
+const EXPRESSION_SYMBOL: &str = ".Lccc_expr_";
+
+/// What an operand expression comes to as its instruction is read
+/// (`ElfWriterCore::operand_expression`).
+enum OperandValue {
+    Number(i64),
+    /// One symbol and a constant.
+    Symbol(String, i64),
+    /// `a - b` and a constant, with the distance still open.
+    Difference(String, String, i64),
+    /// Anything else: resolved when the layout is final.
+    Other,
+}
+
+/// Whether the symbolic operand `text` is an expression rather than one
+/// name: it has operators, and it is well formed once every name in it is a
+/// number. (Anything else is left to be what it was: a name the tokenizer
+/// has no word for.)
+///
+/// An expression on `_GLOBAL_OFFSET_TABLE_` is not one to evaluate: the
+/// name stands for a relocation type (`addl $_GLOBAL_OFFSET_TABLE_+(.-1b),
+/// %ebx` is `R_386_GOTPC`), which the encoders read off the operand as it
+/// was written.
+fn is_operand_expression(text: &str) -> bool {
+    use crate::backend::asm_expr::{SectionExpr, eval_section_expr, is_bare_symbol};
+    !is_bare_symbol(text)
+        && !text.contains("_GLOBAL_OFFSET_TABLE_")
+        && eval_section_expr::<()>(text, |_| Ok(SectionExpr::absolute(0))).is_ok()
 }
 
 /// ULEB128 encode (used by .uleb128 data emission).
@@ -9825,7 +10691,9 @@ mod batched_edit_differential_tests {
         const JCC: &[&str] = &["jmp", "jne", "je", "jl", "jg", "jb", "jae"];
         let labels = 4 + rng.below(12);
         let mut defined = vec![false; labels as usize];
-        let mut asm = String::from(".text\nf:\n");
+        // (Every numeric label is defined in front too: a backward
+        // reference that finds none is an error.)
+        let mut asm = String::from(".text\nf:\n1:\n2:\n3:\n");
         let mut aux = 0u32;
         for _ in 0..10 + rng.below(50) {
             match rng.below(16) {
@@ -10030,6 +10898,84 @@ mod batched_edit_differential_tests {
             fallbacks >= total,
             "only {fallbacks} queue fallbacks over {total} programs"
         );
+    }
+
+    /// The kernel's ALTERNATIVE and ALTERNATIVE_2: padding sized from label
+    /// differences that span other such padding and relaxable branches, in
+    /// two sections written in turns, on numeric labels defined over and
+    /// over. Between them the things a sizing sweep has to keep apart:
+    /// several gaps at one offset, a gap that shrinks again, alignment.
+    fn alternatives(rng: &mut Rng) -> String {
+        const OLD: &[&str] = &["nop", "call ext", "jmp .Lout", "jne .Lout", "ret", ""];
+        const NEW: &[&str] = &[
+            "lfence\ncall ext",
+            "jmp .Lout",
+            "nop\nnop\nnop\nnop\nnop\nnop\nnop",
+            "jne .Lout\njmp .Lout",
+            "",
+            "ud2",
+        ];
+        const PAD: &str = ".skip -(((144f-143f)-(141b-140b)) > 0) * ((144f-143f)-(141b-140b)),0x90";
+        let mut s = String::from(".text\nf:\n");
+        for _ in 0..4 + rng.below(40) {
+            match rng.below(8) {
+                0 => s.push_str(&nops(rng.below(70) as usize)),
+                1 => {
+                    let _ = writeln!(s, ".p2align {}", 1 + rng.below(4));
+                }
+                2 => {
+                    // Two gaps at one offset, the second sized from the
+                    // first; and one that follows a branch's size.
+                    let _ = writeln!(
+                        s,
+                        "1:\n{} .Lout\n2:\n.skip 2b - 1b\n3:\n.skip (3b - 2b) * 2, 0xcc\n.skip 3b - 2b",
+                        rng.pick(&["jmp", "jne"])
+                    );
+                }
+                3..=5 => {
+                    // ALTERNATIVE old, new.
+                    let _ = writeln!(
+                        s,
+                        "140:\n{}\n141:\n{PAD}\n142:\n.pushsection .altinstr_replacement,\"ax\"\n143:\n{}\n144:\n.popsection",
+                        rng.pick(OLD),
+                        rng.pick(NEW)
+                    );
+                }
+                _ => {
+                    // ALTERNATIVE_2 old, new1, new2: the outer padding
+                    // measures the inner one.
+                    let _ = writeln!(
+                        s,
+                        "140:\n740:\n{}\n741:\n.skip -(((744f-743f)-(741b-740b)) > 0) * ((744f-743f)-(741b-740b)),0x90\n742:\n\
+                         .pushsection .altinstr_replacement,\"ax\"\n743:\n{}\n744:\n.popsection\n141:\n{PAD}\n142:\n\
+                         .pushsection .altinstr_replacement,\"ax\"\n143:\n{}\n144:\n.popsection",
+                        rng.pick(OLD),
+                        rng.pick(NEW),
+                        rng.pick(NEW)
+                    );
+                }
+            }
+        }
+        s.push_str(&nops(rng.below(200) as usize));
+        s.push_str(".Lout:\nret\n");
+        s
+    }
+
+    /// One sizing sweep that queues its resizes against one that writes
+    /// each on the spot.
+    #[test]
+    fn deferred_skips_sized_in_one_sweep_match_sequential_edits() {
+        let mut ok = 0usize;
+        for seed in 1..=200u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xa076_1d64_78bd_642f) | 1);
+            let asm = alternatives(&mut rng);
+            for arch32 in [false, true] {
+                if same(&asm, arch32, &format!("alternatives seed {seed}")).is_ok() {
+                    ok += 1;
+                }
+            }
+        }
+        assert!(ok >= 360, "only {ok}/400 alternative programs assembled");
     }
 }
 

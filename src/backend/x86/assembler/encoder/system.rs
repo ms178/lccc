@@ -1,148 +1,25 @@
 use super::*;
 
-/// True when the memory operand is EXACTLY the port-I/O DX-indirect form
-/// GAS accepts for IN/INS/OUT/OUTS: base `%dx`, no index, no scale, no
-/// displacement.  The encoding carries no ModRM (DX is implicit in the
-/// opcode), so any other spelling must not silently encode as DX I/O.
-fn is_dx_indirect(mem: &MemoryOperand) -> bool {
-    mem.base.as_ref().is_some_and(|b| b.name == "dx")
-        && mem.index.is_none()
-        && mem.scale.is_none()
-        && matches!(
-            mem.displacement,
-            Displacement::None | Displacement::Integer(0)
-        )
-}
-
 impl super::InstructionEncoder {
-    /// Encode OUT instruction: outb/outw/outl
-    /// AT&T syntax: outb %al, %dx  OR  outb %al, $imm8
-    pub(crate) fn encode_out(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-        let size: u8 = match mnemonic {
-            "outb" => 1,
-            "outw" => 2,
-            "outl" => 4,
-            _ => return Err(format!("unknown out mnemonic: {}", mnemonic)),
+    /// `loop`, `loope`, `loopne`: a branch on the count register with an
+    /// 8-bit displacement and no longer form. `narrow` counts in `%ecx`.
+    pub(crate) fn encode_counter_branch(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        narrow: bool,
+        name: &str,
+    ) -> Result<(), String> {
+        let [Operand::Label(label)] = ops else {
+            return Err(format!("{name} requires a label"));
         };
-
-        // Handle zero-operand form (implicit operands)
-        if ops.is_empty() {
-            if size == 2 {
-                self.bytes.push(0x66);
-            }
-            self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
-            return Ok(());
+        if narrow {
+            self.bytes.push(0x67);
         }
-
-        if ops.len() != 2 {
-            return Err(format!("{} requires 0 or 2 operands", mnemonic));
-        }
-
-        // AT&T: outb %al, %dx  (src=al, dst=dx)
-        // AT&T: outb %al, $imm8  (src=al, dst=imm)
-        // Also handle parenthesized form: outl %eax, (%dx)
-        match (&ops[0], &ops[1]) {
-            (Operand::Register(_), Operand::Register(_)) => {
-                // outb %al, %dx  =>  0xEE (byte) or 0xEF (word/dword)
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
-                Ok(())
-            }
-            (Operand::Register(_), Operand::Memory(mem)) => {
-                // outl %eax, (%dx): the memory form shares the implicit-DX
-                // opcode with the register form, but ONLY when the operand
-                // really is DX-indirect — anything else here used to encode
-                // silently as DX I/O (a wrong-port corruption), and the
-                // central validator only admits exact DX-indirect operands.
-                if !is_dx_indirect(mem) {
-                    return Err(format!(
-                        "`{}' is not a valid base/index expression",
-                        "(%dx)"
-                    ));
-                }
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
-                Ok(())
-            }
-            (Operand::Register(_), Operand::Immediate(ImmediateValue::Integer(val))) => {
-                // outb %al, $imm8  =>  0xE6 ib (byte) or 0xE7 ib (word/dword)
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xE6 } else { 0xE7 });
-                self.bytes.push(*val as u8);
-                Ok(())
-            }
-            _ => Err(format!("unsupported {} operands", mnemonic)),
-        }
-    }
-
-    /// Encode IN instruction: inb/inw/inl
-    /// AT&T syntax: inb %dx, %al  OR  inb $imm8, %al
-    pub(crate) fn encode_in(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-        let size: u8 = match mnemonic {
-            "inb" => 1,
-            "inw" => 2,
-            "inl" => 4,
-            _ => return Err(format!("unknown in mnemonic: {}", mnemonic)),
-        };
-
-        // Handle zero-operand form (implicit operands)
-        if ops.is_empty() {
-            if size == 2 {
-                self.bytes.push(0x66);
-            }
-            self.bytes.push(if size == 1 { 0xEC } else { 0xED });
-            return Ok(());
-        }
-
-        if ops.len() != 2 {
-            return Err(format!("{} requires 0 or 2 operands", mnemonic));
-        }
-
-        // AT&T: inb %dx, %al  (src=dx, dst=al)
-        // AT&T: inb $imm8, %al  (src=imm, dst=al)
-        // Also handle parenthesized form: inl (%dx), %eax
-        match (&ops[0], &ops[1]) {
-            (Operand::Register(_), Operand::Register(_)) => {
-                // inb %dx, %al  =>  0xEC (byte) or 0xED (word/dword)
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xEC } else { 0xED });
-                Ok(())
-            }
-            (Operand::Memory(mem), Operand::Register(_)) => {
-                // inl (%dx), %eax: shares the implicit-DX opcode with the
-                // register form; only exact DX-indirect operands may take
-                // this path (see the OUT arm).
-                if !is_dx_indirect(mem) {
-                    return Err(format!(
-                        "`{}' is not a valid base/index expression",
-                        "(%dx)"
-                    ));
-                }
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xEC } else { 0xED });
-                Ok(())
-            }
-            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(_)) => {
-                // inb $imm8, %al  =>  0xE4 ib (byte) or 0xE5 ib (word/dword)
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                self.bytes.push(if size == 1 { 0xE4 } else { 0xE5 });
-                self.bytes.push(*val as u8);
-                Ok(())
-            }
-            _ => Err(format!("unsupported {} operands", mnemonic)),
-        }
+        self.bytes.push(opcode);
+        self.add_relocation(label, R_X86_64_PC8_INTERNAL, -1);
+        self.bytes.push(0);
+        Ok(())
     }
 
     pub(crate) fn encode_clflush(&mut self, ops: &[Operand]) -> Result<(), String> {
@@ -156,27 +33,6 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(7, mem)
             }
             _ => Err("clflush requires memory operand".to_string()),
-        }
-    }
-
-    /// Encode VERW instruction: 0F 00 /5
-    pub(crate) fn encode_verw(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("verw requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Memory(mem) => {
-                self.emit_rex_rm(0, "", mem);
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.encode_modrm_mem(5, mem)
-            }
-            Operand::Register(reg) => {
-                let rm = reg_num(&reg.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x0F, 0x00]);
-                self.bytes.push(self.modrm(3, 5, rm));
-                Ok(())
-            }
-            _ => Err("verw requires memory or register operand".to_string()),
         }
     }
 
@@ -291,87 +147,6 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(reg_ext, &mem)
             }
             _ => Err(format!("{} requires memory operand", mnemonic)),
-        }
-    }
-
-    /// Encode LMSW (Load Machine Status Word): 0F 01 /6
-    /// Accepts a 16-bit register or memory operand.
-    pub(crate) fn encode_lmsw(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("lmsw requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let rm = reg_num(&reg.name).ok_or("bad register")?;
-                self.emit_rex_unary(2, &reg.name);
-                self.bytes.extend_from_slice(&[0x0F, 0x01]);
-                self.bytes.push(self.modrm(3, 6, rm));
-                Ok(())
-            }
-            Operand::Memory(mem) => {
-                self.emit_rex_rm(0, "", mem);
-                self.bytes.extend_from_slice(&[0x0F, 0x01]);
-                self.encode_modrm_mem(6, mem)
-            }
-            _ => Err("lmsw requires register or memory operand".to_string()),
-        }
-    }
-
-    /// Encode SMSW (Store Machine Status Word): 0F 01 /4
-    /// Accepts a register or memory operand.
-    /// 16-bit register form gets a 66h prefix.
-    pub(crate) fn encode_smsw(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("smsw requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let rm = reg_num(&reg.name).ok_or("bad register")?;
-                let size = infer_reg_size(&reg.name);
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                // SMSW to a 64-bit dest uses REX.W (zero-extends); 32-bit does not.
-                self.emit_rex_unary(if size == 8 { 8 } else { 4 }, &reg.name);
-                self.bytes.extend_from_slice(&[0x0F, 0x01]);
-                self.bytes.push(self.modrm(3, 4, rm));
-                Ok(())
-            }
-            Operand::Memory(mem) => {
-                self.emit_rex_rm(0, "", mem);
-                self.bytes.extend_from_slice(&[0x0F, 0x01]);
-                self.encode_modrm_mem(4, mem)
-            }
-            _ => Err("smsw requires register or memory operand".to_string()),
-        }
-    }
-
-    /// Encode system register instructions (LLDT, LTR, STR, SLDT): opcode /ext
-    /// These take a 16-bit register or memory operand.
-    pub(crate) fn encode_system_reg(
-        &mut self,
-        ops: &[Operand],
-        opcode: &[u8],
-        ext: u8,
-    ) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("system register instruction requires 1 operand".to_string());
-        }
-        match &ops[0] {
-            Operand::Register(reg) => {
-                let reg_num = reg_num(&reg.name).ok_or("bad register")?;
-                // No REX.W for 16-bit system register instructions
-                self.emit_rex_unary(2, &reg.name);
-                self.bytes.extend_from_slice(opcode);
-                self.bytes.push(self.modrm(3, ext, reg_num));
-                Ok(())
-            }
-            Operand::Memory(mem) => {
-                self.emit_rex_rm(0, "", mem);
-                self.bytes.extend_from_slice(opcode);
-                self.encode_modrm_mem(ext, mem)
-            }
-            _ => Err("system register instruction requires register or memory operand".to_string()),
         }
     }
 
@@ -591,166 +366,61 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Encode LCALL (far call): 9A cp (direct) or FF /3 (indirect memory).
-    ///
-    /// Same shapes as LJMP but ModRM extension /3 and direct opcode 0x9A. The
-    /// kernel's EFI mixed-mode thunk uses `lcalll *efi32_call(%rip)` to drop
-    /// from 64-bit into a 32-bit EFI service and return.
+    /// `lcall`: see [`Self::encode_far_branch`].
     pub(crate) fn encode_lcall(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-        match ops.len() {
-            1 => {
-                let mem = match &ops[0] {
-                    Operand::Indirect(inner) => match inner.as_ref() {
-                        Operand::Memory(mem) => mem,
-                        _ => return Err("lcall indirect requires memory operand".to_string()),
-                    },
-                    Operand::Memory(mem) => mem,
-                    _ => {
-                        return Err(
-                            "lcall requires indirect memory or segment:offset operands".to_string()
-                        );
-                    }
-                };
-                // `lcalll *mem` keeps the default 32-bit operand size
-                // (m16:32 far pointer) — the form the kernel's EFI mixed-mode
-                // thunk uses to drop from long mode into protected mode.
-                // `lcallq *mem` is the m16:64 form and needs REX.W.
-                // `lcallw *mem` is the m16:16 form: 0x66 + FF /3
-                // (`lcallw *xxx(,%edi,4)` = 67 66 ff 1c bd, GAS-probed; the
-                // 0x67 is spliced centrally before the 0x66).
-                if mnemonic == "lcallw" {
-                    self.bytes.push(0x66);
-                }
-                if mnemonic == "lcallq" {
-                    self.emit_rex_rm(8, "", mem);
-                } else {
-                    self.emit_rex_rm(0, "", mem);
-                }
-                self.bytes.push(0xFF);
-                self.encode_modrm_mem(3, mem)
-            }
-            2 => match (&ops[0], &ops[1]) {
-                (
-                    Operand::Immediate(ImmediateValue::Integer(seg)),
-                    Operand::Immediate(ImmediateValue::Integer(off)),
-                ) => {
-                    self.bytes.push(0x9A);
-                    self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
-                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                    Ok(())
-                }
-                (
-                    Operand::Immediate(ImmediateValue::Integer(seg)),
-                    Operand::Immediate(ImmediateValue::Symbol(sym)),
-                )
-                | (
-                    Operand::Immediate(ImmediateValue::Integer(seg)),
-                    Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)),
-                ) => {
-                    let addend = match &ops[1] {
-                        Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a,
-                        _ => 0,
-                    };
-                    self.bytes.push(0x9A);
-                    self.add_relocation(sym, R_X86_64_32, addend);
-                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                    Ok(())
-                }
-                _ => Err("lcall requires $segment, $offset operands".to_string()),
-            },
-            _ => Err("lcall requires 1 or 2 operands".to_string()),
-        }
+        self.encode_far_branch(ops, mnemonic, "lcall", 3)
     }
 
-    /// Encode LJMP (far jump): EA cp (direct) or FF /5 (indirect memory).
-    /// The `w` suffix selects a 16-bit offset in the far pointer: the
-    /// indirect form takes 0x66 (`ljmpw *xxx(,%edi,4)` = 67 66 ff 2c bd,
-    /// GAS 2.47 byte-probed; the 0x67 comes from the central splice) and
-    /// the direct EA form narrows the offset to iw.
+    /// `ljmp`: see [`Self::encode_far_branch`].
     pub(crate) fn encode_ljmp(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-        let w = mnemonic.starts_with("ljmpw");
-        match ops.len() {
-            // ljmpl *mem - indirect far jump through memory
-            1 => {
-                match &ops[0] {
-                    Operand::Indirect(inner) => match inner.as_ref() {
-                        Operand::Memory(mem) => {
-                            if w {
-                                self.bytes.push(0x66);
-                            }
-                            self.emit_rex_rm(0, "", mem);
-                            self.bytes.push(0xFF);
-                            self.encode_modrm_mem(5, mem)
-                        }
-                        _ => Err("ljmp indirect requires memory operand".to_string()),
-                    },
-                    Operand::Memory(mem) => {
-                        // ljmp *mem (without explicit indirect prefix)
-                        if w {
-                            self.bytes.push(0x66);
-                        }
-                        self.emit_rex_rm(0, "", mem);
-                        self.bytes.push(0xFF);
-                        self.encode_modrm_mem(5, mem)
-                    }
-                    _ => {
-                        Err("ljmp requires indirect memory or segment:offset operands".to_string())
-                    }
-                }
-            }
-            // ljmpl $segment, $offset - direct far jump (opcode 0xEA, valid in 32-bit/16-bit mode only;
-            // used by kernel realmode trampoline code compiled with gcc_m16)
-            2 => {
-                match (&ops[0], &ops[1]) {
-                    (
-                        Operand::Immediate(ImmediateValue::Integer(seg)),
-                        Operand::Immediate(ImmediateValue::Integer(off)),
-                    ) => {
-                        self.bytes.push(0xEA);
-                        self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
-                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                        Ok(())
-                    }
-                    (
-                        Operand::Immediate(ImmediateValue::Integer(seg)),
-                        Operand::Immediate(ImmediateValue::Symbol(sym)),
-                    )
-                    | (
-                        Operand::Immediate(ImmediateValue::Integer(seg)),
-                        Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)),
-                    ) => {
-                        let addend = match &ops[1] {
-                            Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a,
-                            _ => 0,
-                        };
-                        self.bytes.push(0xEA);
-                        self.add_relocation(sym, R_X86_64_32, addend);
-                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                        Ok(())
-                    }
-                    (
-                        Operand::Immediate(ImmediateValue::Integer(seg)),
-                        Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff)),
-                    ) => {
-                        // la57toggle.S: `ljmpl $__KERNEL_CS, $(.Lret -
-                        // trampoline_32bit_src)` — the offset is a
-                        // same-section label difference that resolves to a
-                        // constant after layout (GAS: `ea 08000000 1000`).
-                        // Record a diff relocation on the imm32; the writer
-                        // patches the folded value in place.
-                        self.bytes.push(0xEA);
-                        self.add_diff_relocation(sym, diff, R_X86_64_32, 0);
-                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                        Ok(())
-                    }
-                    _ => Err("ljmp requires $segment, $offset operands".to_string()),
-                }
-            }
-            _ => Err("ljmp requires 1 or 2 operands".to_string()),
+        self.encode_far_branch(ops, mnemonic, "ljmp", 5)
+    }
+
+    /// A far jump or call in 64-bit code: through a far pointer in memory,
+    /// `FF /5` and `FF /3`.
+    ///
+    /// The pointer is `m16:32`, or `m16:16` under the `w` suffix, which
+    /// takes the operand-size prefix (`ljmpw *xxx(,%edi,4)` = `67 66 ff 2c
+    /// bd`; the `67` is spliced in front centrally). The kernel's EFI
+    /// mixed-mode thunk drops into a 32-bit service with `lcalll
+    /// *efi32_call(%rip)`. A bare symbol is the pointer's address, as it is
+    /// for GNU as (which warns that the `*` is missing).
+    ///
+    /// What GNU as 2.47 refuses is refused here:
+    ///
+    /// * the direct forms `ljmp $segment, $offset` (`EA`, `9A`): the
+    ///   opcodes do not exist in long mode. They used to be written all the
+    ///   same -- an invalid-opcode fault where the statement stood;
+    /// * the `q` suffix (`lcallq *(%rax)` used to come out with `REX.W`);
+    /// * a register (`ljmp *%rax`): a far pointer does not fit in one.
+    fn encode_far_branch(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        name: &str,
+        digit: u8,
+    ) -> Result<(), String> {
+        let suffix = mnemonic.strip_prefix(name).unwrap_or_default();
+        if !matches!(suffix, "" | "w" | "l") {
+            return Err(format!("invalid instruction suffix for `{name}'"));
         }
+        let [target] = ops else {
+            return Err(format!("unsupported instruction `{name}'"));
+        };
+        let mut pointer = match target {
+            Operand::Indirect(inner) => inner.as_ref().clone(),
+            other => other.clone(),
+        };
+        normalize_bare_label(&mut pointer);
+        let Operand::Memory(mem) = &pointer else {
+            return Err(format!("operand type mismatch for `{name}'"));
+        };
+        if suffix == "w" {
+            self.bytes.push(0x66);
+        }
+        self.emit_rex_rm(0, "", mem);
+        self.bytes.push(0xFF);
+        self.encode_modrm_mem(digit, mem)
     }
 
     /// Encode LAR (Load Access Rights): 66 r/w 0F 02 /r — the operand size

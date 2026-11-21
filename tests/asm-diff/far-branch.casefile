@@ -1,0 +1,62 @@
+;;; far_branches_through_memory
+	.text
+	ljmp *(%rax)
+	ljmpl *(%rax)
+	ljmpw *(%rax)
+	lcall *(%rax)
+	lcalll *(%rax)
+	lcallw *(%rax)
+	ljmp *sym(%rip)
+	lcalll *sym(%rip)
+	ljmpw *8(%rbx,%rcx,4)
+	ljmp *%fs:(%rax)
+	ljmp (%rax)
+	lcall (%rax)
+	ljmp sym
+	lcall sym
+	ljmpw sym
+;;; reject_ljmp_direct reject
+	.text
+	ljmp $8, $sym
+;;; reject_ljmpl_direct reject
+	.text
+	ljmpl $8, $sym
+;;; reject_ljmpw_direct reject
+	.text
+	ljmpw $8, $sym
+;;; reject_ljmpq_direct reject
+	.text
+	ljmpq $8, $sym
+;;; reject_ljmp_direct_number reject
+	.text
+	ljmp $8, $0x1000
+;;; reject_lcall_direct reject
+	.text
+	lcall $8, $sym
+;;; reject_lcalll_direct reject
+	.text
+	lcalll $8, $sym
+;;; reject_lcallw_direct reject
+	.text
+	lcallw $8, $sym
+;;; reject_lcall_direct_number reject
+	.text
+	lcall $8, $0x1000
+;;; reject_jmp_direct reject
+	.text
+	jmp $8, $sym
+;;; reject_call_direct reject
+	.text
+	call $8, $sym
+;;; reject_ljmpq_memory reject
+	.text
+	ljmpq *(%rax)
+;;; reject_lcallq_memory reject
+	.text
+	lcallq *(%rax)
+;;; reject_ljmp_register reject
+	.text
+	ljmp *%rax
+;;; reject_lcall_register reject
+	.text
+	lcall *%rax
