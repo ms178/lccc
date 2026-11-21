@@ -10642,6 +10642,17 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // `clobbers_xmm2`). Unclassified, every W/state word was homed on
             // the stack.
             O::Sha512msg1256 | O::Sha512msg2256 | O::Sha512rnds2256 => Some(8),
+            // SHA-512 full-block schedule producers (sha512 rounds need the message
+            // words and state in YMM homes across all 80 rounds). Each emitter ends in
+            // avx_store_dest, which copies into a register-homed destination, so a
+            // classed producer is sound; the copy is the only extra cost.
+            O::Loadu256
+            | O::Load256
+            | O::Permute2x128
+            | O::Permute4x64
+            | O::Pshufd256
+            | O::Pshufb256
+            | O::BlendPs256 => Some(8),
             // SHA-NI (`sha256msg1`/`msg2`/`rnds2`): four 32-bit lanes, so the
             // I32x4 family. Their emitters copy each operand into the scratch
             // pair (xmm0/xmm1, plus xmm2 for rnds2, withheld by
@@ -10890,6 +10901,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::Sha512msg1256
                     | O::Sha512msg2256
                     | O::Sha512rnds2256
+                    // SHA-512 schedule shuffles read YMM homes through avx_load_arg
+                    // (the blend/shuffle emitters end in avx_store_dest).
+                    | O::Permute2x128
+                    | O::Permute4x64
+                    | O::Pshufd256
+                    | O::Pshufb256
+                    | O::BlendPs256
                     // The 256-bit pointer stores consume a YMM home through
                     // `avx_load_arg` (copy from the home into ymm0).
                     | O::Storeu256

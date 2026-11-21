@@ -5078,7 +5078,10 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Extracti128 => {
-                if let Some(dptr) = dest_ptr {
+                // Width-changing 256 -> 128 producer. `result_dest` accepts both
+                // spellings; `sse_store_dest` writes the register-homed result
+                // (`reg_assignments`) or its slot.
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     let lane = self.operand_to_imm_i64(&args[1]) & 1;
                     self.state.emit_fmt(format_args!(
@@ -5091,10 +5094,6 @@ impl X86Codegen {
                         lane
                     ));
                     self.sse_store_dest(dptr, "xmm0");
-                } else if dest.is_some() {
-                    panic!(
-                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
-                    );
                 }
             }
             IntrinsicOp::LoaduPs256 | IntrinsicOp::LoaduPd256 => {
@@ -7693,8 +7692,16 @@ impl X86Codegen {
                 // home/memfold/all-homed paths apply unchanged.  Used by the
                 // byte-predicate counting reduction to accumulate the four
                 // `vpsadbw` partial sums.
-                if let Some(d) = dest {
+                if let Some(d) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(d, args, "vpaddq", true);
+                }
+            }
+            // BlendPs256: the register-form result (`dest`) reaches the shared
+            // 3-operand FP emitter with the resolved result value; the
+            // `dest_ptr` form is routed there by `emit_simd_op` as before.
+            IntrinsicOp::BlendPs256 => {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
+                    self.emit_avx_fp_256_op(dptr, op, args);
                 }
             }
             IntrinsicOp::VecSadbwU8x32 => {
@@ -15430,12 +15437,34 @@ mod intrinsic_destination_contract_tests {
         );
     }
 
+    /// `Extracti128` is width-changing (256 -> 128) and takes both the
+    /// memory form and the SSA form: the SSA result must be emitted, not
+    /// refused (the register-result forwarding depends on it).
+    #[test]
+    fn extracti128_emits_the_ssa_form() {
+        let mut cg = X86Codegen::new();
+        slot_homed(&mut cg, 0);
+        xmm_homed(&mut cg, 2);
+        cg.emit_intrinsic_impl(
+            &Some(Value(2)),
+            &IntrinsicOp::Extracti128,
+            &None,
+            &[Operand::Value(Value(0)), Operand::Const(IrConst::I32(1))],
+        );
+        let out = cg.state.out.buf.clone();
+        assert!(
+            out.contains("vextracti128 $1, %ymm0, %xmm0")
+                || out.contains("vextractf128 $1, %ymm0, %xmm0"),
+            "SSA-form Extracti128 emitted no lane extract: {out}"
+        );
+    }
+
     /// Groups whose destination plumbing is memory-form only (scalar
     /// extracts, pointer-staged loads) refuse the SSA form loudly instead of
     /// silently emitting nothing.
     #[test]
     fn memory_form_only_groups_refuse_the_ssa_form_loudly() {
-        for op in [IntrinsicOp::Extracti128, IntrinsicOp::LoadF64x2] {
+        for op in [IntrinsicOp::LoadF64x2] {
             let mut cg = X86Codegen::new();
             for id in [0u32, 1] {
                 slot_homed(&mut cg, id);
