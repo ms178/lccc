@@ -5245,12 +5245,14 @@ pub fn generate_module(
     // optimize_size); the padding would be real flat-image bytes in
     // size-gated segments such as the Linux boot setup.
     let optimize_size = cg.optimize_for_size();
+    let referenced_symbols = collect_referenced_symbols(module);
     common::emit_data_sections(
         &mut cg.state().out,
         module,
         ptr_dir,
         pic_mode,
         optimize_size,
+        &referenced_symbols,
     );
 
     // Top-level asm("...") (e.g. musl `_start`). Switch to .text first so
@@ -5301,7 +5303,6 @@ pub fn generate_module(
         }
     }
 
-    let referenced_symbols = collect_referenced_symbols(module);
     emit_extern_visibility_directives(cg, module, &referenced_symbols);
     let ipa_reorder = cg.ipa_reorder_functions();
     emit_functions_and_sections(cg, module, source_mgr, &file_table, ipa_reorder);
@@ -6021,7 +6022,16 @@ fn emit_symbol_attrs(
     module: &IrModule,
     referenced_symbols: &FxHashSet<String>,
 ) {
-    let defined_labels: FxHashSet<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+    // The objects defined here. (A declaration is no definition: counted
+    // as one, an `extern` nothing refers to still got its `.weak` or
+    // `.hidden`, and with it an undefined symbol in the object -- see
+    // `common::emit_globals`.)
+    let defined_labels: FxHashSet<&str> = module
+        .globals
+        .iter()
+        .filter(|g| !g.is_extern)
+        .map(|g| g.name.as_str())
+        .collect();
     for (name, is_weak, visibility) in &module.symbol_attrs {
         let resolved = module
             .asm_labels
