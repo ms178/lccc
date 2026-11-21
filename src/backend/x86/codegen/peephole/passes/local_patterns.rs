@@ -10300,6 +10300,11 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
+    // One liveness solution for the pass, re-solved per rewritten function
+    // (see `LazyDeadness`). A fresh `FileLiveness::new` per candidate walked
+    // every function of the file each time: quadratic in the file, and 80 %
+    // of the compile of a 600-function unit (35.5 s; 300 functions: 6.7 s).
+    let mut dead = LazyDeadness::new();
     while i < len {
         if debug_transparent(store, infos[i], i) || infos[i].pinned {
             i += 1;
@@ -10560,12 +10565,12 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
                     // the movl-relay-under-addq cell was refused above.
                     REG_NAMES[1][y as usize].to_string()
                 };
-                let lv = FileLiveness::new(store, infos);
-                if provably_dead_lv(&lv, store, infos, k, x_fam, &[i, j, k]) {
+                if dead.dead_after(store, infos, k, x_fam, &[i, j, k]) {
                     let new_text = format!("    {lea_op} {mem_operand}, {y_text}");
                     mark_nop(&mut infos[i]);
                     mark_nop(&mut infos[j]);
                     replace_line(store, &mut infos[k], k, new_text);
+                    dead.invalidate(store, infos, k);
                     changed = true;
                     i = k + 1;
                     continue;
@@ -10582,6 +10587,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
         let new_text = format!("    {lea_op} {mem_operand}, {x_text}");
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, new_text);
+        dead.invalidate(store, infos, j);
         changed = true;
         i = j + 1;
     }
@@ -10640,6 +10646,9 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
+    // Shared, per-function-refreshed liveness (as in
+    // `fuse_staged_add_and_relay`), not one whole-file solve per candidate.
+    let mut dead = LazyDeadness::new();
     while i < len {
         if infos[i].is_nop() || infos[i].pinned {
             i += 1;
@@ -10881,8 +10890,7 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
             continue;
         }
         // X must die at the LEA.
-        let lv = FileLiveness::new(store, infos);
-        if !provably_dead_lv(&lv, store, infos, j, x_fam, &[i, j]) {
+        if !dead.dead_after(store, infos, j, x_fam, &[i, j]) {
             i += 1;
             continue;
         }
@@ -10968,6 +10976,7 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, lea_new);
         replace_line(store, &mut infos[k], k, add_new);
+        dead.invalidate(store, infos, k);
         changed = true;
         i = k + 1;
     }
