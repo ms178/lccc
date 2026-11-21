@@ -4,7 +4,7 @@ Ranked work for **generated-code performance** vs GCC 16.2 / Clang 23.1 /
 ICC 2021.10 / ICX 2026.2. This file carries **only open items**: every
 landed/closed/superseded row, the architectural-flaw essay, the historical
 scoreboard and the landed register live verbatim in
-[`../archive/BACKLOG-2026-10-16.md`](../archive/BACKLOG-2026-10-16.md);
+the [October 16 backlog snapshot](https://github.com/ms178/lccc/blob/4d28473646f9a549ad6c2e74852ee2f07b3d9f1a/engineering/archive/BACKLOG-2026-10-16.md);
 measured negatives and session history live in [`../DECISIONS.md`](../DECISIONS.md).
 
 This rewrite also absorbs the 2026-10-16 external backlog audit
