@@ -830,10 +830,27 @@ fn intrinsic_dest_required_alignment(
 /// `Value` that is a forwarded register and a `Value` that is its slot are
 /// interchangeable there. Anything not listed keeps its memory image.
 pub(crate) fn value_consumer_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
-    use IntrinsicOp as O;
     if intrinsic_arg_required_alignment(op, index).is_some() {
         return None;
     }
+    register_operand_arg_width(op, index)
+}
+
+/// The vector REGISTER width at an argument position of a consumer that reads
+/// its operand as a vector VALUE through the register-aware helpers, without
+/// the address veto of [`value_consumer_arg_width`].
+///
+/// The veto exists for positions that can also carry an ADDRESS. The consumers
+/// listed here take a register-substituted operand with no address to fold, so
+/// the veto made every arm below unreachable. Two callers use this table:
+/// `vec_ssa`'s register-read classification (a promoted alloca read at these
+/// positions is a register read), and the allocator's
+/// `collect_avx256_home_values` (a register-homed SSA value). Moving the veto
+/// is measured safe: the AVX-512VL mask-compare matrix, census and memory-safety
+/// gates hold at their baseline, and the libtomcrypt `(%rsp)` count falls from
+/// 586 to 10.
+pub(crate) fn register_operand_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
+    use IntrinsicOp as O;
     match op {
         O::Permute2x128 | O::Pshufb256 | O::BlendPs256 | O::Sha512msg2256 | O::VecAddI64x4 => {
             (index < 2).then_some(32)

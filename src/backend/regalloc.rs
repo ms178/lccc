@@ -7344,7 +7344,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let mut sse_chain_regs: FxHashSet<u8> = FxHashSet::default();
         let mut sse_chain_alloc: FxHashSet<u32> = FxHashSet::default();
         if x86_fp_pool {
-            let sse_chain_values = collect_sse128_chain_values(func);
+            let mut sse_chain_values = collect_sse128_chain_values(func);
+            sse_chain_values.extend(collect_avx256_home_values(func));
             if !sse_chain_values.is_empty() {
                 let mut sse_chain_pool: Vec<PhysReg> = config
                     .xmm_regs
@@ -9299,6 +9300,119 @@ fn is_vector_broadcast_op(op: &IntrinsicOp) -> bool {
             | O::VecBroadcastI16x8
             | O::VecBroadcastI8x16
     )
+}
+
+/// 256-bit (and 256->128) SSA results of the in-lane shuffle and SHA-512
+/// producers, eligible for a YMM/XMM register home.
+///
+/// A register-result producer whose value has no home is written to its stack
+/// slot and reloaded at every use. The chain allocator below already colours
+/// arbitrary SSA intervals, so these values join it. A register home for a
+/// 256-bit value is the YMM bank index (`phys_reg_name_256`); the emitters
+/// name it through `vec_store_source_256` / `avx_load_arg`.
+///
+/// Admission is fail-closed and needs both sides of the contract:
+///   * the producer writes its result through `result_dest` when it has no
+///     `dest_ptr`: the arms listed in `register_result_form_is_self_contained`,
+///     and the 256-bit loads and zero-extension, whose emitters also store
+///     through `result_dest` / `avx_store_dest`;
+///   * every use is an intrinsic ARGUMENT whose register width is exactly the
+///     value's width (`register_operand_arg_width`), or the stored value of a
+///     `VecStoreI64x4`. Any other use (copy, phi, terminator, folded pointer,
+///     `dest_ptr`, comparison) vetoes the value.
+fn collect_avx256_home_values(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    use crate::passes::vector_temp_promotion::register_operand_arg_width;
+
+    let producer_ok = |op: &O| {
+        matches!(
+            op,
+            O::Permute2x128
+                | O::Permute4x64
+                | O::Pshufd256
+                | O::Pshufb256
+                | O::BlendPs256
+                | O::Extracti128
+                | O::Cast256to128
+                | O::Sha512msg1256
+                | O::Sha512msg2256
+                | O::Sha512rnds2256
+                | O::VecAddI64x4
+                | O::Loadu256
+                | O::Load256
+                | O::Zext128to256
+        )
+    };
+    let mut width_of: FxHashMap<u32, usize> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                dest_ptr: None,
+                op,
+                ..
+            } = inst
+            {
+                if producer_ok(op) {
+                    if let Some(w) = op.vector_result_width() {
+                        width_of.insert(d.0, w as usize);
+                    }
+                }
+            }
+        }
+    }
+    if width_of.is_empty() {
+        return FxHashSet::default();
+    }
+    let mut bad: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Intrinsic {
+                    op, args, dest_ptr, ..
+                } => {
+                    if let Some(p) = dest_ptr {
+                        if width_of.contains_key(&p.0) {
+                            bad.insert(p.0);
+                        }
+                    }
+                    for (idx, arg) in args.iter().enumerate() {
+                        let Operand::Value(v) = arg else { continue };
+                        let Some(&w) = width_of.get(&v.0) else {
+                            continue;
+                        };
+                        let legal = register_operand_arg_width(*op, idx) == Some(w)
+                            || (matches!(op, O::VecStoreI64x4) && idx == 0 && w == 32);
+                        if !legal {
+                            bad.insert(v.0);
+                        }
+                    }
+                }
+                _ => {
+                    for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            if width_of.contains_key(&v.0) {
+                                bad.insert(v.0);
+                            }
+                        }
+                    });
+                    for_each_value_use_in_instruction(inst, |v| {
+                        if width_of.contains_key(&v.0) {
+                            bad.insert(v.0);
+                        }
+                    });
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if width_of.contains_key(&v.0) {
+                    bad.insert(v.0);
+                }
+            }
+        });
+    }
+    width_of.into_keys().filter(|v| !bad.contains(v)).collect()
 }
 
 fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
@@ -11381,6 +11495,15 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
         let mut v: Vec<u32> = classes.keys().copied().collect();
         v.sort_unstable();
         lccc::cli::stderr_line(format_args!("[VECWEB] fn={} web={:?}", func.name, v));
+        // The reduction web above is loop-carried COPY values only, so it is
+        // empty for straight-line code by design. The straight-line 256-bit
+        // values that the chain allocator homes are reported separately.
+        let mut homes: Vec<u32> = collect_avx256_home_values(func).into_iter().collect();
+        homes.sort_unstable();
+        lccc::cli::stderr_line(format_args!(
+            "[VECWEB-256] fn={} straight_line_homes={:?}",
+            func.name, homes
+        ));
     }
     classes.into_keys().collect()
 }
@@ -22863,5 +22986,98 @@ mod ipa_fill_tests {
         );
         assert_eq!(c.assignments.len(), 1);
         assert_eq!(c.assignments.get(&10), Some(&RBX));
+    }
+}
+
+#[cfg(test)]
+mod avx256_home_tests {
+    use super::*;
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    use crate::ir::reexports::{BasicBlock, BlockId, Value};
+
+    fn v(id: u32) -> Operand {
+        Operand::Value(Value(id))
+    }
+
+    /// `dest = op(args)` with no dest pointer: a register-result producer.
+    fn reg_op(dest: u32, op: O, args: Vec<Operand>) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op,
+            dest_ptr: None,
+            args,
+        }
+    }
+
+    /// Whole-vector 256-bit store of `val` (a real register consumer).
+    fn store256(val: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op: O::VecStoreI64x4,
+            dest_ptr: Some(Value(90)),
+            args: vec![v(val), v(90), Operand::Const(IrConst::I64(0))],
+        }
+    }
+
+    fn func_of(instructions: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("avx256_home".to_string(), IrType::Void, vec![], false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }];
+        f.next_value_id = 100;
+        f
+    }
+
+    fn permute(dest: u32, src: u32) -> Instruction {
+        reg_op(
+            dest,
+            O::Permute4x64,
+            vec![v(src), Operand::Const(IrConst::I64(0xB1))],
+        )
+    }
+
+    #[test]
+    fn permute_result_consumed_by_store_is_admitted() {
+        let f = func_of(vec![permute(10, 1), store256(10)]);
+        assert!(collect_avx256_home_values(&f).contains(&10));
+    }
+
+    #[test]
+    fn copy_use_vetoes_the_home() {
+        let f = func_of(vec![
+            permute(10, 1),
+            Instruction::Copy {
+                dest: Value(11),
+                src: v(10),
+            },
+            store256(11),
+        ]);
+        assert!(!collect_avx256_home_values(&f).contains(&10));
+    }
+
+    #[test]
+    fn width_mismatched_consumer_vetoes_the_home() {
+        // Sha512msg1256 reads its second operand at 16 bytes; a 256-bit
+        // value there is not a register-width read.
+        let f = func_of(vec![
+            permute(10, 1),
+            reg_op(11, O::Sha512msg1256, vec![v(1), v(10)]),
+            store256(11),
+        ]);
+        assert!(!collect_avx256_home_values(&f).contains(&10));
+    }
+
+    #[test]
+    fn unlisted_consumer_vetoes_the_home() {
+        let f = func_of(vec![
+            permute(10, 1),
+            reg_op(11, O::VecAddI32x4, vec![v(10), v(10)]),
+            store256(11),
+        ]);
+        assert!(!collect_avx256_home_values(&f).contains(&10));
     }
 }

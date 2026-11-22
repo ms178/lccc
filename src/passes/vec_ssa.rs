@@ -50,7 +50,7 @@ use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{BasicBlock, Instruction, IrFunction, IrModule, Operand, Value};
 use crate::passes::slp_vectorizer::family_for;
 use crate::passes::vector_temp_promotion::{
-    register_result_form_is_self_contained, value_consumer_arg_width,
+    register_operand_arg_width, register_result_form_is_self_contained,
 };
 
 /// One register family admitted by the pass: the load/store endpoints, the
@@ -207,7 +207,7 @@ fn classify_register_operand(
     let mut positions: Vec<(usize, usize)> = Vec::new();
     for (idx, arg) in args.iter().enumerate() {
         if matches!(arg, Operand::Value(v) if v.0 == a) {
-            positions.push((idx, value_consumer_arg_width(op, idx)?));
+            positions.push((idx, register_operand_arg_width(op, idx)?));
         }
     }
     if positions.is_empty() {
