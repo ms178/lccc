@@ -2756,6 +2756,18 @@ impl IntrinsicOp {
             IntrinsicOp::Pslldqi128 | IntrinsicOp::Psrldqi128 |
             IntrinsicOp::Psllqi128 | IntrinsicOp::Psrlqi128 |
             IntrinsicOp::Pshufd128 |
+            // 256-bit register-only shuffles, zero-extension, the 256-bit
+            // SHA-512 producers and the 256-bit add: one VEX instruction on
+            // register operands, no memory operand and no side effect. Left
+            // impure, a dead result stayed rooted in DCE and still wrote its
+            // home (a dead `vpshufb` clobbered a live YMM value).
+            IntrinsicOp::Pshufb256 | IntrinsicOp::Permute4x64 |
+            IntrinsicOp::Permute2x128 | IntrinsicOp::Pshufd256 |
+            IntrinsicOp::BlendPs256 | IntrinsicOp::Extracti128 |
+            IntrinsicOp::Cast256to128 | IntrinsicOp::Zext128to256 |
+            IntrinsicOp::VecAddI64x4 |
+            IntrinsicOp::Sha512msg1256 | IntrinsicOp::Sha512msg2256 |
+            IntrinsicOp::Sha512rnds2256 |
             // SSE2 packed operations are all pure
             IntrinsicOp::Psubsb128 |
             IntrinsicOp::Paddw128 | IntrinsicOp::Psubw128 |
@@ -3536,6 +3548,32 @@ mod vector_width_tests {
         ] {
             assert!(op.is_pure(), "{op:?} has no observable side effect");
             assert_eq!(op.vector_result_width(), None, "{op:?} is scalar");
+        }
+    }
+
+    /// The 256-bit register-only producers are DCE-eligible, so a dead result
+    /// is removed rather than emitted into its home. The loads stay impure:
+    /// they read memory, and this predicate is what keeps them rooted.
+    #[test]
+    fn register_only_256_bit_producers_are_pure() {
+        for op in [
+            IntrinsicOp::Pshufb256,
+            IntrinsicOp::Permute4x64,
+            IntrinsicOp::Permute2x128,
+            IntrinsicOp::Pshufd256,
+            IntrinsicOp::BlendPs256,
+            IntrinsicOp::Extracti128,
+            IntrinsicOp::Cast256to128,
+            IntrinsicOp::Zext128to256,
+            IntrinsicOp::VecAddI64x4,
+            IntrinsicOp::Sha512msg1256,
+            IntrinsicOp::Sha512msg2256,
+            IntrinsicOp::Sha512rnds2256,
+        ] {
+            assert!(op.is_pure(), "{op:?} is register-only");
+        }
+        for op in [IntrinsicOp::Loadu256, IntrinsicOp::Load256] {
+            assert!(!op.is_pure(), "{op:?} reads memory");
         }
     }
 

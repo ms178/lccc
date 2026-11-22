@@ -7344,8 +7344,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let mut sse_chain_regs: FxHashSet<u8> = FxHashSet::default();
         let mut sse_chain_alloc: FxHashSet<u32> = FxHashSet::default();
         if x86_fp_pool {
+            let avx256_admitted: Vec<u32> = collect_avx256_home_values(func).into_iter().collect();
             let mut sse_chain_values = collect_sse128_chain_values(func);
-            sse_chain_values.extend(collect_avx256_home_values(func));
+            sse_chain_values.extend(avx256_admitted.iter().copied());
+            // `(value, physical register)` pairs the allocator returned for
+            // the admitted 256-bit values: the basis of `[VECWEB-256]`.
+            let mut avx256_homed: Vec<(u32, u8)> = Vec::new();
             if !sse_chain_values.is_empty() {
                 let mut sse_chain_pool: Vec<PhysReg> = config
                     .xmm_regs
@@ -7363,11 +7367,22 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         &liveness,
                     );
                     sse_chain_alloc = coalesced.iter().map(|&(v, _)| v).collect();
+                    avx256_homed = coalesced
+                        .iter()
+                        .filter(|(v, _)| avx256_admitted.contains(v))
+                        .map(|&(v, reg)| (v, reg.0))
+                        .collect();
                     for (vid, reg) in coalesced {
                         sse_chain_regs.insert(reg.0);
                         assignments.insert(vid, reg);
                     }
                 }
+            }
+            if !avx256_admitted.is_empty() && std::env::var("CCC_DEBUG_VECWEB").is_ok() {
+                lccc::cli::stderr_line(format_args!(
+                    "{}",
+                    vecweb_256_report(&func.name, &avx256_admitted, &avx256_homed)
+                ));
             }
         }
         // COLD-CALL XMM SPLIT: SysV x86-64 has no callee-saved XMM, so a
@@ -9822,7 +9837,20 @@ fn allocate_vector_registers_destructive(
             !liveness.folded_read_points.contains_key(&v),
             "sse128 chain value {v} has hidden folded reads"
         );
-        coverage.insert(v, pieces.clone());
+        // A piece is half-open and `intervals_overlap` treats an empty piece
+        // as overlapping nothing. A dead definition (no reads) yields exactly
+        // such a piece `(p, p)`, yet its instruction still writes its home at
+        // `p`, so it could share the register of a value live over `p`. The
+        // write occupies its point: widen every empty piece to `(p, p + 1)`.
+        // A value dying at `p` keeps its `(s, p)` piece, so the in-place
+        // handoff `d <- a0` at `p` still shares cleanly.
+        coverage.insert(
+            v,
+            pieces
+                .iter()
+                .map(|&(s, e)| (s, e.max(s.saturating_add(1))))
+                .collect(),
+        );
     }
     if coverage.is_empty() {
         return Vec::new();
@@ -11494,18 +11522,34 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
         let mut v: Vec<u32> = classes.keys().copied().collect();
         v.sort_unstable();
+        // The reduction web is loop-carried COPY values only, so it is empty
+        // for straight-line code by design. The 256-bit homes are reported
+        // from the allocation result (`vecweb_256_report`), not from here.
         lccc::cli::stderr_line(format_args!("[VECWEB] fn={} web={:?}", func.name, v));
-        // The reduction web above is loop-carried COPY values only, so it is
-        // empty for straight-line code by design. The straight-line 256-bit
-        // values that the chain allocator homes are reported separately.
-        let mut homes: Vec<u32> = collect_avx256_home_values(func).into_iter().collect();
-        homes.sort_unstable();
-        lccc::cli::stderr_line(format_args!(
-            "[VECWEB-256] fn={} straight_line_homes={:?}",
-            func.name, homes
-        ));
     }
     classes.into_keys().collect()
+}
+
+/// One-line `[VECWEB-256]` report for `func`, built from the allocator's
+/// actual output: `admitted` are the 256-bit values the collector let the
+/// chain allocator consider, `homed` are the `(value, physical register)`
+/// pairs it returned for them, and `unhomed` is the admitted remainder.
+/// The previous report printed the admitted set before allocation, so it
+/// could list a value the allocator then gave no register.
+fn vecweb_256_report(func: &str, admitted: &[u32], homed: &[(u32, u8)]) -> String {
+    let mut admitted: Vec<u32> = admitted.to_vec();
+    admitted.sort_unstable();
+    let mut homed: Vec<(u32, u8)> = homed.to_vec();
+    homed.sort_unstable();
+    let unhomed: Vec<u32> = admitted
+        .iter()
+        .copied()
+        .filter(|v| !homed.iter().any(|&(h, _)| h == *v))
+        .collect();
+    format!(
+        "[VECWEB-256] fn={func} admitted={} homed={homed:?} unhomed={unhomed:?}",
+        admitted.len()
+    )
 }
 
 /// Loop-invariant map broadcasts whose only uses are same-width packed
@@ -23079,5 +23123,135 @@ mod avx256_home_tests {
             store256(11),
         ]);
         assert!(!collect_avx256_home_values(&f).contains(&10));
+    }
+
+    /// Homes of `candidates` under the real allocator on `f`.
+    fn homes_of(f: &IrFunction, candidates: &[u32]) -> Vec<(u32, u8)> {
+        let candidates: FxHashSet<u32> = candidates.iter().copied().collect();
+        let liveness = compute_live_intervals(f);
+        let pool = [PhysReg(21), PhysReg(22)];
+        let mut out: Vec<(u32, u8)> =
+            allocate_vector_registers_destructive(f, &candidates, &pool, &|_| false, &liveness)
+                .into_iter()
+                .map(|(vid, reg)| (vid, reg.0))
+                .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn home(homes: &[(u32, u8)], vid: u32) -> Option<u8> {
+        homes.iter().find(|(v, _)| *v == vid).map(|&(_, r)| r)
+    }
+
+    /// Two blocks: `first` falls through to `second`. A value defined in
+    /// `first` and read in `second` is live-in there, so its segment starts
+    /// at the entry point of `second`.
+    fn func_two_blocks(first: Vec<Instruction>, second: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("avx256_home".to_string(), IrType::Void, vec![], false);
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: first,
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: second,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+        ];
+        f.next_value_id = 100;
+        f
+    }
+
+    /// A diamond in layout order: block 0 defines the value and branches to
+    /// the then arm (block 1, which never reads it) or the else arm (block 2).
+    /// The value is live in block 0 and again in block 2, so its live range
+    /// has a hole over block 1 and restarts at block 2's entry point.
+    fn func_diamond(entry: Vec<Instruction>, else_arm: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("avx256_home".to_string(), IrType::Void, vec![], false);
+        let block =
+            |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+                label: BlockId(label),
+                instructions,
+                terminator,
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            };
+        f.blocks = vec![
+            block(
+                0,
+                entry,
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(1, Vec::new(), Terminator::Return(None)),
+            block(2, else_arm, Terminator::Return(None)),
+        ];
+        f.next_value_id = 100;
+        f
+    }
+
+    #[test]
+    fn dead_definition_does_not_share_a_live_home() {
+        // v10 is live over block 0 and again from block 2's entry, which is
+        // also where the dead definition of v11 writes. Its piece at that
+        // point is the only one: a zero-length piece for v11 overlapped
+        // nothing, so the allocator shared the register and the dead
+        // `vpshufb` clobbered v10 before its read.
+        let f = func_diamond(
+            vec![permute(10, 1)],
+            vec![reg_op(11, O::Pshufb256, vec![v(2), v(3)]), store256(10)],
+        );
+        let homes = homes_of(&f, &[10, 11]);
+        let (a, b) = (home(&homes, 10), home(&homes, 11));
+        assert!(
+            a.is_some() && b.is_some(),
+            "both values must be homed: {homes:?}"
+        );
+        assert_ne!(a, b, "dead definition shares the live home: {homes:?}");
+    }
+
+    #[test]
+    fn dying_operand_handoff_still_shares_the_home() {
+        // v10 dies at the instruction that defines v11, so the in-place
+        // handoff must still give v11 v10's register: the fix must not
+        // turn a proven handoff into a second register.
+        let f = func_two_blocks(
+            vec![permute(10, 1)],
+            vec![reg_op(11, O::Pshufb256, vec![v(10), v(3)]), store256(11)],
+        );
+        let homes = homes_of(&f, &[10, 11]);
+        assert_eq!(
+            home(&homes, 10),
+            home(&homes, 11),
+            "handoff lost: {homes:?}"
+        );
+        assert!(home(&homes, 11).is_some(), "v11 must be homed: {homes:?}");
+    }
+
+    #[test]
+    fn vecweb_report_separates_homed_from_unhomed_admitted_values() {
+        // Admitted values are listed sorted; only the allocator's pairs count
+        // as homed, and the admitted remainder is reported as unhomed.
+        assert_eq!(
+            vecweb_256_report("kern", &[11, 10], &[(10, 21)]),
+            "[VECWEB-256] fn=kern admitted=2 homed=[(10, 21)] unhomed=[11]"
+        );
+    }
+
+    #[test]
+    fn vecweb_report_with_no_homes_lists_every_admitted_value_as_unhomed() {
+        assert_eq!(
+            vecweb_256_report("f", &[7], &[]),
+            "[VECWEB-256] fn=f admitted=1 homed=[] unhomed=[7]"
+        );
     }
 }
