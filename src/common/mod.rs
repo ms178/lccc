@@ -25,6 +25,7 @@ pub(crate) mod long_double;
 pub(crate) mod qualifiers;
 pub(crate) mod source;
 pub(crate) mod symbol_table;
+pub(crate) mod succ_set;
 pub(crate) mod sysv_classify;
 pub(crate) mod temp_files;
 pub(crate) mod tls;

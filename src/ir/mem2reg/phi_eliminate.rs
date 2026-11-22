@@ -191,48 +191,102 @@ pub fn eliminate_phis(module: &mut IrModule, narrow_gprs: bool) {
 
 /// Returns the number of distinct successor block IDs for a block.
 /// Accounts for both terminator targets and InlineAsm goto_labels.
+/// Number of DISTINCT blocks `block` can transfer control to, counting the
+/// terminator's edges and every asm-goto label.
+///
+/// The four terminator kinds name at most an `IndirectBranch`'s target list or
+/// a `Switch`'s case list, and those lists are not deduplicated: C lowers
+/// `switch (x) { case 0: case 1: ... }` to a case list that repeats targets,
+/// which on machine-generated input is tens of thousands of repeats.  The
+/// previous implementation deduplicated with `seen.contains()`, so one such
+/// block cost O(labels^2) -- 8.2% of a whole compile on a 25,000-arm switch
+/// (callgrind), on top of the three sibling CFG builders that had the same
+/// loop.  `SuccSet` deduplicates in O(1) per label and stops counting as soon
+/// as the block is known to have more than one successor, which is all the
+/// caller asks.
 fn successor_count(block: &BasicBlock) -> usize {
-    let mut seen: Vec<BlockId> = Vec::new();
+    let mut set = crate::common::succ_set::SuccSet::new();
+    // `BlockId` values are sparse (they name IR labels, not positions), so
+    // size the stamp from the widest id this terminator can name instead of
+    // from a block count this function has no access to.  `insert` grows the
+    // stamp if a target still exceeds it, so this is an allocation hint, not
+    // a precondition.
+    set.begin(widest_target_id(block).saturating_add(1));
     match &block.terminator {
         Terminator::Return(_) | Terminator::Unreachable => {}
         Terminator::Branch(label) => {
-            seen.push(*label);
+            set.insert(label.0 as usize);
         }
         Terminator::CondBranch {
             true_label,
             false_label,
             ..
         } => {
-            seen.push(*true_label);
-            if true_label != false_label {
-                seen.push(*false_label);
-            }
+            set.insert(true_label.0 as usize);
+            set.insert(false_label.0 as usize);
         }
         Terminator::IndirectBranch {
             possible_targets, ..
         } => {
-            seen.extend_from_slice(possible_targets);
+            for label in possible_targets {
+                set.insert(label.0 as usize);
+            }
         }
         Terminator::Switch { cases, default, .. } => {
-            seen.push(*default);
+            set.insert(default.0 as usize);
             for &(_, label) in cases {
-                if !seen.contains(&label) {
-                    seen.push(label);
-                }
+                set.insert(label.0 as usize);
             }
         }
     }
-    // InlineAsm goto_labels are implicit control flow edges.
     for inst in &block.instructions {
         if let Instruction::InlineAsm { goto_labels, .. } = inst {
             for (_, label) in goto_labels {
-                if !seen.contains(label) {
-                    seen.push(*label);
-                }
+                set.insert(label.0 as usize);
             }
         }
     }
-    seen.len()
+    set.len()
+}
+
+/// One past the widest `BlockId` the block's terminator or asm-goto labels can
+/// name; 0 when the block names nothing.
+fn widest_target_id(block: &BasicBlock) -> usize {
+    let mut widest = 0u32;
+    let mut bump = |id: u32| widest = widest.max(id);
+    match &block.terminator {
+        Terminator::Return(_) | Terminator::Unreachable => {}
+        Terminator::Branch(label) => bump(label.0),
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            bump(true_label.0);
+            bump(false_label.0);
+        }
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => {
+            for label in possible_targets {
+                bump(label.0);
+            }
+        }
+        Terminator::Switch { cases, default, .. } => {
+            bump(default.0);
+            for &(_, label) in cases {
+                bump(label.0);
+            }
+        }
+    }
+    for inst in &block.instructions {
+        if let Instruction::InlineAsm { goto_labels, .. } = inst {
+            for (_, label) in goto_labels {
+                bump(label.0);
+            }
+        }
+    }
+    widest as usize + 1
 }
 
 /// Send the edges from `block` to `old_target` to `new_target` instead: the
