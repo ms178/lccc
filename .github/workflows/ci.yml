@@ -1648,6 +1648,15 @@ jobs:
         LCCC_BIN: target/fastbuild/lccc
         GCC_BIN: gcc-16
       run: python3 tests/correctness/run_correctness.py
+    # Severity and exact wording of the read-only-lvalue diagnostics, which
+    # codegen tests cannot see: a const object's bit-field must be an ERROR
+    # worded `member 'a' in read-only object`, while a const bit-field's own
+    # type is only a WARNING worded `read-only location`.  Pinned per case
+    # against GCC 16.2 so the two contracts cannot collapse into one.
+    - name: Read-only lvalue diagnostic contract (GCC 16 wording)
+      env:
+        LCCC_BIN: target/fastbuild/lccc
+      run: python3 tests/correctness/run_correctness.py --only-diagnostics
     - name: Volatile destructuring ratchet
       run: |
         python3 scripts/check_volatile_destructuring.py --self-test

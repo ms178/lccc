@@ -743,6 +743,11 @@ fn peephole_optimize_inner(
     // all late passes are skip-switchable under exactly the name they are
     // reported under, and hand-writing 21 gates invited the one that went
     // missing.  `$call` is not evaluated when skipped.
+    //
+    // Timing note: the clock is read and reset AFTER the guarded call, so a
+    // skipped pass is reported as taking the time of whatever ran before it
+    // and then resets the clock for the next one -- the per-pass numbers of
+    // the passes that DID run stay exact, which is what the trace is for.
     macro_rules! late {
         ($sk:ident, $clock:ident, $name:literal, $call:expr) => {{
             if !$sk($name) {

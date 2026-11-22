@@ -1087,8 +1087,6 @@ fn hoist_common_arm_heads_cached(
     if windows.is_empty() {
         return false;
     }
-    { let dbg=std::env::var_os("CCC_TIME_PEEPHOLE").is_some();
-      if dbg { lccc::cli::stderr_line(format_args!("[PEEPHOLE-TIME]     hoist: {} windows, first={:?} last={:?}", windows.len(), windows.first(), windows.last())); } }
     // `label_mention_counts` scans the WHOLE translation unit, so it is asked
     // once per text state, never per attempt.  A window keeps its own resume
     // cursor: every line before the cursor was examined against the counts in
