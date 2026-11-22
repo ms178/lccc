@@ -7344,7 +7344,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let mut sse_chain_regs: FxHashSet<u8> = FxHashSet::default();
         let mut sse_chain_alloc: FxHashSet<u32> = FxHashSet::default();
         if x86_fp_pool {
-            let sse_chain_values = collect_sse128_chain_values(func);
+            let avx256_admitted: Vec<u32> = collect_avx256_home_values(func).into_iter().collect();
+            let mut sse_chain_values = collect_sse128_chain_values(func);
+            sse_chain_values.extend(avx256_admitted.iter().copied());
+            // `(value, physical register)` pairs the allocator returned for
+            // the admitted 256-bit values: the basis of `[VECWEB-256]`.
+            let mut avx256_homed: Vec<(u32, u8)> = Vec::new();
             if !sse_chain_values.is_empty() {
                 let mut sse_chain_pool: Vec<PhysReg> = config
                     .xmm_regs
@@ -7362,11 +7367,22 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         &liveness,
                     );
                     sse_chain_alloc = coalesced.iter().map(|&(v, _)| v).collect();
+                    avx256_homed = coalesced
+                        .iter()
+                        .filter(|(v, _)| avx256_admitted.contains(v))
+                        .map(|&(v, reg)| (v, reg.0))
+                        .collect();
                     for (vid, reg) in coalesced {
                         sse_chain_regs.insert(reg.0);
                         assignments.insert(vid, reg);
                     }
                 }
+            }
+            if !avx256_admitted.is_empty() && std::env::var("CCC_DEBUG_VECWEB").is_ok() {
+                lccc::cli::stderr_line(format_args!(
+                    "{}",
+                    vecweb_256_report(&func.name, &avx256_admitted, &avx256_homed)
+                ));
             }
         }
         // COLD-CALL XMM SPLIT: SysV x86-64 has no callee-saved XMM, so a
@@ -8764,6 +8780,8 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
 
         // Three genuine vector inputs (no scalar operand in the prefix).
         O::Pblendvb128
+        | O::Sha256rnds2128
+        | O::Sha512rnds2256
         | O::Dpbusd128
         | O::Dpbusds128
         | O::Dpwusd128
@@ -8905,6 +8923,14 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
         | O::Psraw128
         | O::Psrad128
         | O::Pblendw128
+        | O::Sha1rnds4128
+        | O::Sha1nexte128
+        | O::Sha1msg1128
+        | O::Sha1msg2128
+        | O::Sha256msg1128
+        | O::Sha256msg2128
+        | O::Sha512msg1256
+        | O::Sha512msg2256
         | O::Aesenc128
         | O::Aesenclast128
         | O::Aesdec128
@@ -9170,6 +9196,20 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecSubI64x2
             | O::VecAddI8x16
             | O::VecSubI8x16
+            // VEX.256 SHA-512 chains (destructive: the first operand is the
+            // destination's tie, `vsha512msg1/msg2 ymm1` and `rnds2`'s CDGH).
+            // Each emitter copies its operands into ymm0/ymm1/xmm1/xmm2 and
+            // writes the result through `avx_store_dest`, so a pre-allocated
+            // home is exact for any operand placement.
+            | O::Sha512msg1256
+            | O::Sha512msg2256
+            | O::Sha512rnds2256
+            // SHA-NI 128-bit chains: same copy-in discipline as the SHA-512
+            // forms above (`sha256rnds2`'s CDGH is the first operand and the
+            // destination tie).
+            | O::Sha256msg1128
+            | O::Sha256msg2128
+            | O::Sha256rnds2128
             | O::VecMinU8x16
             | O::VecAndNotI32x4
             | O::VecAvgU8x16
@@ -9275,6 +9315,119 @@ fn is_vector_broadcast_op(op: &IntrinsicOp) -> bool {
             | O::VecBroadcastI16x8
             | O::VecBroadcastI8x16
     )
+}
+
+/// 256-bit (and 256->128) SSA results of the in-lane shuffle and SHA-512
+/// producers, eligible for a YMM/XMM register home.
+///
+/// A register-result producer whose value has no home is written to its stack
+/// slot and reloaded at every use. The chain allocator below already colours
+/// arbitrary SSA intervals, so these values join it. A register home for a
+/// 256-bit value is the YMM bank index (`phys_reg_name_256`); the emitters
+/// name it through `vec_store_source_256` / `avx_load_arg`.
+///
+/// Admission is fail-closed and needs both sides of the contract:
+///   * the producer writes its result through `result_dest` when it has no
+///     `dest_ptr`: the arms listed in `register_result_form_is_self_contained`,
+///     and the 256-bit loads and zero-extension, whose emitters also store
+///     through `result_dest` / `avx_store_dest`;
+///   * every use is an intrinsic ARGUMENT whose register width is exactly the
+///     value's width (`register_operand_arg_width`), or the stored value of a
+///     `VecStoreI64x4`. Any other use (copy, phi, terminator, folded pointer,
+///     `dest_ptr`, comparison) vetoes the value.
+fn collect_avx256_home_values(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    use crate::passes::vector_temp_promotion::register_operand_arg_width;
+
+    let producer_ok = |op: &O| {
+        matches!(
+            op,
+            O::Permute2x128
+                | O::Permute4x64
+                | O::Pshufd256
+                | O::Pshufb256
+                | O::BlendPs256
+                | O::Extracti128
+                | O::Cast256to128
+                | O::Sha512msg1256
+                | O::Sha512msg2256
+                | O::Sha512rnds2256
+                | O::VecAddI64x4
+                | O::Loadu256
+                | O::Load256
+                | O::Zext128to256
+        )
+    };
+    let mut width_of: FxHashMap<u32, usize> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                dest_ptr: None,
+                op,
+                ..
+            } = inst
+            {
+                if producer_ok(op) {
+                    if let Some(w) = op.vector_result_width() {
+                        width_of.insert(d.0, w as usize);
+                    }
+                }
+            }
+        }
+    }
+    if width_of.is_empty() {
+        return FxHashSet::default();
+    }
+    let mut bad: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Intrinsic {
+                    op, args, dest_ptr, ..
+                } => {
+                    if let Some(p) = dest_ptr {
+                        if width_of.contains_key(&p.0) {
+                            bad.insert(p.0);
+                        }
+                    }
+                    for (idx, arg) in args.iter().enumerate() {
+                        let Operand::Value(v) = arg else { continue };
+                        let Some(&w) = width_of.get(&v.0) else {
+                            continue;
+                        };
+                        let legal = register_operand_arg_width(*op, idx) == Some(w)
+                            || (matches!(op, O::VecStoreI64x4) && idx == 0 && w == 32);
+                        if !legal {
+                            bad.insert(v.0);
+                        }
+                    }
+                }
+                _ => {
+                    for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            if width_of.contains_key(&v.0) {
+                                bad.insert(v.0);
+                            }
+                        }
+                    });
+                    for_each_value_use_in_instruction(inst, |v| {
+                        if width_of.contains_key(&v.0) {
+                            bad.insert(v.0);
+                        }
+                    });
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if width_of.contains_key(&v.0) {
+                    bad.insert(v.0);
+                }
+            }
+        });
+    }
+    width_of.into_keys().filter(|v| !bad.contains(v)).collect()
 }
 
 fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
@@ -9585,6 +9738,23 @@ fn returned_vector_values(func: &IrFunction) -> FxHashSet<u32> {
         .collect()
 }
 
+/// The register-occupancy extent of a value's live pieces, for the interval
+/// tests in the SSE/AVX chain allocator.
+///
+/// A piece is half-open, and `intervals_overlap` treats an empty piece as
+/// overlapping nothing. A dead definition (no reads) yields exactly such a
+/// piece `(p, p)`, yet its instruction still writes its home at `p`, so it
+/// could share the register of a value live over `p`. The write occupies its
+/// point, so every empty piece widens to `(p, p + 1)`. A value that dies at
+/// `p` keeps its non-empty `(s, p)` piece, so the in-place handoff `d <- a0`
+/// at `p` still shares its register.
+fn occupied_pieces(pieces: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    pieces
+        .iter()
+        .map(|&(s, e)| (s, e.max(s.saturating_add(1))))
+        .collect()
+}
+
 fn allocate_vector_registers_destructive(
     func: &IrFunction,
     candidates: &FxHashSet<u32>,
@@ -9684,7 +9854,7 @@ fn allocate_vector_registers_destructive(
             !liveness.folded_read_points.contains_key(&v),
             "sse128 chain value {v} has hidden folded reads"
         );
-        coverage.insert(v, pieces.clone());
+        coverage.insert(v, occupied_pieces(&pieces));
     }
     if coverage.is_empty() {
         return Vec::new();
@@ -10569,7 +10739,15 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // Per-lane variable dword shifts (VEX.128 three-operand form,
             // `emit_vex_binary_128`): class 6 (I32x4 family).
             O::VecShlvI32x4 | O::VecLShrvI32x4 | O::VecAShrvI32x4 => Some(6),
-            O::VecZeroI64x2
+            // `_mm_setzero_si128()` is the I64x2 family zero: its emitter
+            // writes the result through `result_dest`/`sse_store_dest`, so a
+            // register home takes it directly. Unclassed, it poisoned every
+            // vector web of the function (`run_chain`: the accumulator seed).
+            O::Setzero128
+            // 256->128 low-half cast: the XMM result of a 256-bit value is an
+            // I64x2 home (its emitter writes through `result_dest`).
+            | O::Cast256to128
+            | O::VecZeroI64x2
             | O::VecLoadI64x2
             | O::VecAddI64x2
             | O::VecMulI64x2
@@ -10611,6 +10789,30 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // I64x4 physical family) so the Copy-web can home them.  The
             // maddwd result feeds the class-5 dword accumulator add.
             O::VecMaddubsU8x32 | O::VecConstI8x32 => Some(8),
+            // VEX.256 SHA-512 (`vsha512msg1`/`msg2`/`rnds2`): their emitters
+            // read every operand through `avx_load_arg` and write the result
+            // through `avx_store_dest`, so a YMM home survives them (scratch
+            // is ymm0/ymm1 plus xmm1; rnds2's xmm2 is pool-withheld by
+            // `clobbers_xmm2`). Unclassified, every W/state word was homed on
+            // the stack.
+            O::Sha512msg1256 | O::Sha512msg2256 | O::Sha512rnds2256 => Some(8),
+            // SHA-512 full-block schedule producers (sha512 rounds need the message
+            // words and state in YMM homes across all 80 rounds). Each emitter ends in
+            // avx_store_dest, which copies into a register-homed destination, so a
+            // classed producer is sound; the copy is the only extra cost.
+            O::Loadu256
+            | O::Load256
+            | O::Permute2x128
+            | O::Permute4x64
+            | O::Pshufd256
+            | O::Pshufb256
+            | O::BlendPs256 => Some(8),
+            // SHA-NI (`sha256msg1`/`msg2`/`rnds2`): four 32-bit lanes, so the
+            // I32x4 family. Their emitters copy each operand into the scratch
+            // pair (xmm0/xmm1, plus xmm2 for rnds2, withheld by
+            // `clobbers_xmm2`) and store the result through `sse_store_dest`,
+            // so a register home survives them, exactly as for SHA-512.
+            O::Sha256msg1128 | O::Sha256msg2128 | O::Sha256rnds2128 => Some(6),
             O::VecMaddwdI16x16 => Some(5),
             // BB-SLP I64x4 copy/ALU chains: loads, sub/bitwise, splat.
             O::VecLoadI64x4
@@ -10662,6 +10864,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // through its XMM alias / vextractf128; scratch is
                     // xmm1 only.
                     | O::VecExtractLaneF32x8
+                    // 256-bit stores and the low-half cast of an F32x8 home: all read
+                    // the YMM home raw through home-aware paths (`vec_store_source_256`,
+                    // `avx_load_arg`, `xmm_home_of`), so the element type is irrelevant.
+                    | O::VecStoreI64x4
+                    | O::Storeu256
+                    | O::Store256
+                    | O::Cast256to128
             ),
             2 => matches!(
                 op,
@@ -10754,6 +10963,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::StrictRecipMulAddPackedF64x4
                     | O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
+                    // SHA-NI chain: operands are read through `sse_load_arg`
+                    // / `emit_sha_binary_128` (scratch xmm0/xmm1/xmm2) and the
+                    // result is written through `sse_store_dest`.
+                    | O::Sha256msg1128
+                    | O::Sha256msg2128
+                    | O::Sha256rnds2128
                     // SSE2 masked equal-width step: reads the I32x4
                     // accumulator home and writes its own destination
                     // through the shared 128-bit fold (scratch xmm0/xmm1).
@@ -10801,6 +11016,17 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecAddI64x2
                     | O::VecSadbwU8x16
+                    // Scalar readers of an I64x2 home (`_mm_cvtsi128_si64`,
+                    // `_mm_extract_epi64`): both read the home through
+                    // `sse_load_arg` into xmm0 and write only a GPR, so the
+                    // accumulator keeps its register home across them.
+                    | O::Cvtsi128Si64
+                    | O::Pextrq128
+                    // SHA-512 16-byte operands (`msg1`'s second operand and
+                    // `rnds2`'s W+K): read through `vex128_source`, which uses
+                    // the xmm home directly, scratch xmm1/xmm2 only.
+                    | O::Sha512msg1256
+                    | O::Sha512rnds2256
                     | O::VecMulI64x2
                     | O::VecHorizontalAddI64x2
                     // v12 Fix C: the SSE2 value-shaped widening steps
@@ -10839,6 +11065,22 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             8 => matches!(
                 op,
                 O::VecAddI64x4 | O::VecHorizontalAddI64x4 | O::VecSadbwU8x32
+                    | O::Sha512msg1256
+                    | O::Sha512msg2256
+                    | O::Sha512rnds2256
+                    // SHA-512 schedule shuffles read YMM homes through avx_load_arg
+                    // (the blend/shuffle emitters end in avx_store_dest).
+                    | O::Permute2x128
+                    | O::Permute4x64
+                    | O::Pshufd256
+                    | O::Pshufb256
+                    | O::BlendPs256
+                    // The 256-bit pointer stores consume a YMM home through
+                    // `avx_load_arg` (copy from the home into ymm0).
+                    | O::Storeu256
+                    | O::Store256
+                    // 256->128 low-half cast of an I64x4 home (XMM alias).
+                    | O::Cast256to128
                     // AVX2 widening steps read+write the I64x4 accumulator;
                     // scratch is confined to ymm0/ymm1, so a YMM home
                     // (ymm2..ymm15) survives them.
@@ -10935,6 +11177,49 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // round-tripped 32 bytes through the
                                 // stack every iteration).
                                 | O::VecHorizontalAddI64x4
+                                // 256-bit pointer stores (`_mm256_storeu_si256`
+                                // and the aligned twin): the emitter reads its
+                                // value through `avx_load_arg`, which copies from
+                                // a YMM home, and writes only ymm0 scratch. With
+                                // them unlisted, one store poisoned every vector
+                                // web of the function (SHA-512 kernels, measured:
+                                // `sha512_chain` had no homes at all).
+                                | O::Storeu256
+                                | O::Store256
+                                // 256->128 low-half cast: reads a YMM home as its XMM alias,
+                                // else loads through ymm0/xmm0 scratch.
+                                | O::Cast256to128
+                                // Scalar readers of an I64x2 home (see the class-7
+                                // consumer list): read-only through xmm0.
+                                | O::Cvtsi128Si64
+                                | O::Pextrq128
+                                // 256-bit loads and the 128->256 zero-extension
+                                // are scratch-free in the only sense the poison
+                                // rule protects: their emitters touch only
+                                // ymm0/xmm0 (`avx_load_arg_to("ymm0")` plus the
+                                // result store, `sse_load_arg("xmm0")` plus
+                                // `vmovdqa %xmm0,%xmm0`). Homes are xmm2..xmm15
+                                // (`phys_reg_name` 20..33), so no home is
+                                // clobbered. Unlisted, one such op in a kernel
+                                // withdrew every vector home of the function.
+                                | O::Loadu256
+                                | O::Load256
+                                | O::Zext128to256
+                                // 256-bit in-lane shuffles and lane moves (the
+                                // full-block SHA-512 message schedule). Their
+                                // emitters read homes through `avx_load_arg*`
+                                // and use only ymm0/ymm1 (plus xmm0 for the
+                                // extract) as scratch, writing the result to
+                                // its own home. Unlisted, each one withdrew
+                                // every vector home of the kernel: nanazip's
+                                // `Sha512_UpdateBlocks_HW` was poisoned by
+                                // `Pshufd256`, libtomcrypt's by `Permute4x64`.
+                                | O::Pshufd256
+                                | O::Permute4x64
+                                | O::Permute2x128
+                                | O::Extracti128
+                                | O::Pshufb256
+                                | O::BlendPs256
                                 // v12 Fix C: widening reductions consume an
                                 // I64x4 accumulator (whitelisted above). Their
                                 // lowerings confine scratch to ymm0/ymm1 so a
@@ -11241,9 +11526,34 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
         let mut v: Vec<u32> = classes.keys().copied().collect();
         v.sort_unstable();
+        // The reduction web is loop-carried COPY values only, so it is empty
+        // for straight-line code by design. The 256-bit homes are reported
+        // from the allocation result (`vecweb_256_report`), not from here.
         lccc::cli::stderr_line(format_args!("[VECWEB] fn={} web={:?}", func.name, v));
     }
     classes.into_keys().collect()
+}
+
+/// One-line `[VECWEB-256]` report for `func`, built from the allocator's
+/// actual output: `admitted` are the 256-bit values the collector let the
+/// chain allocator consider, `homed` are the `(value, physical register)`
+/// pairs it returned for them, and `unhomed` is the admitted remainder.
+/// The previous report printed the admitted set before allocation, so it
+/// could list a value the allocator then gave no register.
+fn vecweb_256_report(func: &str, admitted: &[u32], homed: &[(u32, u8)]) -> String {
+    let mut admitted: Vec<u32> = admitted.to_vec();
+    admitted.sort_unstable();
+    let mut homed: Vec<(u32, u8)> = homed.to_vec();
+    homed.sort_unstable();
+    let unhomed: Vec<u32> = admitted
+        .iter()
+        .copied()
+        .filter(|v| !homed.iter().any(|&(h, _)| h == *v))
+        .collect();
+    format!(
+        "[VECWEB-256] fn={func} admitted={} homed={homed:?} unhomed={unhomed:?}",
+        admitted.len()
+    )
 }
 
 /// Loop-invariant map broadcasts whose only uses are same-width packed
@@ -11482,6 +11792,9 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecSadbwU8x32
                     | O::VecMaddubsU8x32
+                    | O::Sha512msg1256
+                    | O::Sha512msg2256
+                    | O::Sha512rnds2256
                     | O::VecMaddwdI16x16
                     | O::VecAddI64x4
                     | O::VecSubI64x4
@@ -11490,6 +11803,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecXorI64x4
                     | O::VecShlvI64x4
                     | O::VecLShrvI64x4
+                    | O::Cast256to128
             ),
             _ => false,
         }
@@ -22720,5 +23034,287 @@ mod ipa_fill_tests {
         );
         assert_eq!(c.assignments.len(), 1);
         assert_eq!(c.assignments.get(&10), Some(&RBX));
+    }
+}
+
+#[cfg(test)]
+mod avx256_home_tests {
+    use super::*;
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    use crate::ir::reexports::{BasicBlock, BlockId, Value};
+
+    fn v(id: u32) -> Operand {
+        Operand::Value(Value(id))
+    }
+
+    /// `dest = op(args)` with no dest pointer: a register-result producer.
+    fn reg_op(dest: u32, op: O, args: Vec<Operand>) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op,
+            dest_ptr: None,
+            args,
+        }
+    }
+
+    /// Whole-vector 256-bit store of `val` (a real register consumer).
+    fn store256(val: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op: O::VecStoreI64x4,
+            dest_ptr: Some(Value(90)),
+            args: vec![v(val), v(90), Operand::Const(IrConst::I64(0))],
+        }
+    }
+
+    fn func_of(instructions: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("avx256_home".to_string(), IrType::Void, vec![], false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }];
+        f.next_value_id = 100;
+        f
+    }
+
+    fn permute(dest: u32, src: u32) -> Instruction {
+        reg_op(
+            dest,
+            O::Permute4x64,
+            vec![v(src), Operand::Const(IrConst::I64(0xB1))],
+        )
+    }
+
+    #[test]
+    fn permute_result_consumed_by_store_is_admitted() {
+        let f = func_of(vec![permute(10, 1), store256(10)]);
+        assert!(collect_avx256_home_values(&f).contains(&10));
+    }
+
+    #[test]
+    fn copy_use_vetoes_the_home() {
+        let f = func_of(vec![
+            permute(10, 1),
+            Instruction::Copy {
+                dest: Value(11),
+                src: v(10),
+            },
+            store256(11),
+        ]);
+        assert!(!collect_avx256_home_values(&f).contains(&10));
+    }
+
+    #[test]
+    fn width_mismatched_consumer_vetoes_the_home() {
+        // Sha512msg1256 reads its second operand at 16 bytes; a 256-bit
+        // value there is not a register-width read.
+        let f = func_of(vec![
+            permute(10, 1),
+            reg_op(11, O::Sha512msg1256, vec![v(1), v(10)]),
+            store256(11),
+        ]);
+        assert!(!collect_avx256_home_values(&f).contains(&10));
+    }
+
+    #[test]
+    fn unlisted_consumer_vetoes_the_home() {
+        let f = func_of(vec![
+            permute(10, 1),
+            reg_op(11, O::VecAddI32x4, vec![v(10), v(10)]),
+            store256(11),
+        ]);
+        assert!(!collect_avx256_home_values(&f).contains(&10));
+    }
+
+    /// Homes of `candidates` under the real allocator on `f`.
+    fn homes_of(f: &IrFunction, candidates: &[u32]) -> Vec<(u32, u8)> {
+        let candidates: FxHashSet<u32> = candidates.iter().copied().collect();
+        let liveness = compute_live_intervals(f);
+        let pool = [PhysReg(21), PhysReg(22)];
+        let mut out: Vec<(u32, u8)> =
+            allocate_vector_registers_destructive(f, &candidates, &pool, &|_| false, &liveness)
+                .into_iter()
+                .map(|(vid, reg)| (vid, reg.0))
+                .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn home(homes: &[(u32, u8)], vid: u32) -> Option<u8> {
+        homes.iter().find(|(v, _)| *v == vid).map(|&(_, r)| r)
+    }
+
+    /// Two blocks: `first` falls through to `second`. A value defined in
+    /// `first` and read in `second` is live-in there, so its segment starts
+    /// at the entry point of `second`.
+    fn func_two_blocks(first: Vec<Instruction>, second: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("avx256_home".to_string(), IrType::Void, vec![], false);
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: first,
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: second,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+        ];
+        f.next_value_id = 100;
+        f
+    }
+
+    /// A diamond in layout order: block 0 defines the value and branches to
+    /// the then arm (block 1, which never reads it) or the else arm (block 2).
+    /// The value is live in block 0 and again in block 2, so its live range
+    /// has a hole over block 1 and restarts at block 2's entry point.
+    fn func_diamond(entry: Vec<Instruction>, else_arm: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("avx256_home".to_string(), IrType::Void, vec![], false);
+        let block =
+            |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+                label: BlockId(label),
+                instructions,
+                terminator,
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            };
+        f.blocks = vec![
+            block(
+                0,
+                entry,
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(1, Vec::new(), Terminator::Return(None)),
+            block(2, else_arm, Terminator::Return(None)),
+        ];
+        f.next_value_id = 100;
+        f
+    }
+
+    #[test]
+    fn dead_definition_does_not_share_a_live_home() {
+        // v10 is live over block 0 and again from block 2's entry, which is
+        // also where the dead definition of v11 writes. Its piece at that
+        // point is the only one: a zero-length piece for v11 overlapped
+        // nothing, so the allocator shared the register and the dead
+        // `vpshufb` clobbered v10 before its read.
+        let f = func_diamond(
+            vec![permute(10, 1)],
+            vec![reg_op(11, O::Pshufb256, vec![v(2), v(3)]), store256(10)],
+        );
+        let homes = homes_of(&f, &[10, 11]);
+        let (a, b) = (home(&homes, 10), home(&homes, 11));
+        assert!(
+            a.is_some() && b.is_some(),
+            "both values must be homed: {homes:?}"
+        );
+        assert_ne!(a, b, "dead definition shares the live home: {homes:?}");
+    }
+
+    #[test]
+    fn dying_operand_handoff_still_shares_the_home() {
+        // v10 dies at the instruction that defines v11, so the in-place
+        // handoff must still give v11 v10's register: the fix must not
+        // turn a proven handoff into a second register.
+        let f = func_two_blocks(
+            vec![permute(10, 1)],
+            vec![reg_op(11, O::Pshufb256, vec![v(10), v(3)]), store256(11)],
+        );
+        let homes = homes_of(&f, &[10, 11]);
+        assert_eq!(
+            home(&homes, 10),
+            home(&homes, 11),
+            "handoff lost: {homes:?}"
+        );
+        assert!(home(&homes, 11).is_some(), "v11 must be homed: {homes:?}");
+    }
+
+    #[test]
+    fn vecweb_report_separates_homed_from_unhomed_admitted_values() {
+        // Admitted values are listed sorted; only the allocator's pairs count
+        // as homed, and the admitted remainder is reported as unhomed.
+        assert_eq!(
+            vecweb_256_report("kern", &[11, 10], &[(10, 21)]),
+            "[VECWEB-256] fn=kern admitted=2 homed=[(10, 21)] unhomed=[11]"
+        );
+    }
+
+    #[test]
+    fn vecweb_report_with_no_homes_lists_every_admitted_value_as_unhomed() {
+        assert_eq!(
+            vecweb_256_report("f", &[7], &[]),
+            "[VECWEB-256] fn=f admitted=1 homed=[] unhomed=[7]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod occupied_piece_tests {
+    use super::*;
+
+    /// A dead definition at point `p` writes its home at `p`. Its widened
+    /// piece must conflict with a value that is live across `p`.
+    #[test]
+    fn a_dead_definition_occupies_its_point() {
+        let dead = occupied_pieces(&[(3, 3)]);
+        assert_eq!(dead, vec![(3, 4)]);
+        assert!(
+            intervals_overlap(dead[0], (2, 5)),
+            "live across p must conflict"
+        );
+        assert!(
+            !intervals_overlap(dead[0], (4, 9)),
+            "live only after p may share"
+        );
+    }
+
+    /// Non-empty pieces are untouched, so the in-place handoff of a dying
+    /// operand (`(s, p)` followed by a definition starting at `p`) still
+    /// shares a register.
+    #[test]
+    fn a_dying_operand_still_hands_off_at_its_last_read() {
+        let pieces = occupied_pieces(&[(2, 5)]);
+        assert_eq!(pieces, vec![(2, 5)]);
+        assert!(!intervals_overlap(pieces[0], (5, 8)));
+    }
+
+    #[test]
+    fn an_empty_piece_at_point_zero_widens_to_one_point() {
+        assert_eq!(occupied_pieces(&[(0, 0)]), vec![(0, 1)]);
+    }
+
+    /// Every piece of a multi-piece value widens independently, and the order
+    /// and count are preserved.
+    #[test]
+    fn each_piece_widens_independently_in_order() {
+        assert_eq!(
+            occupied_pieces(&[(1, 1), (4, 6), (9, 9)]),
+            vec![(1, 2), (4, 6), (9, 10)]
+        );
+    }
+
+    /// A piece can never be inverted by widening: the result is always at
+    /// least one point long, and `end >= start` holds for every input the
+    /// allocator can produce (program points are far below `u32::MAX`).
+    #[test]
+    fn widening_never_inverts_a_piece() {
+        for s in [0u32, 1, 7, 1 << 20] {
+            for e in [s, s + 1, s + 5] {
+                let w = occupied_pieces(&[(s, e)])[0];
+                assert!(w.0 <= w.1 && w.1 > w.0, "({s},{e}) -> {w:?}");
+            }
+        }
     }
 }

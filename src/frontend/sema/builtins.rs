@@ -1197,6 +1197,57 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_aeskeygenassist128",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Aeskeygenassist128),
     );
+    // x86 SHA-NI (GCC 16.2 spellings, from i386-builtin.def)
+    m.insert(
+        "__builtin_ia32_sha1rnds4",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1rnds4128),
+    );
+    // The public SHA-1 round name carries the immediate check (see
+    // `x86_lane_immediate_bits`), so a bad immediate is reported against
+    // `_mm_sha1rnds4_epu32`, as GCC 16.2 does, not the internal builtin.
+    m.insert(
+        "_mm_sha1rnds4_epu32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1rnds4128),
+    );
+    m.insert(
+        "__builtin_ia32_sha1nexte",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1nexte128),
+    );
+    m.insert(
+        "__builtin_ia32_sha1msg1",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1msg1128),
+    );
+    m.insert(
+        "__builtin_ia32_sha1msg2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1msg2128),
+    );
+    m.insert(
+        "__builtin_ia32_sha256rnds2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256rnds2128),
+    );
+    m.insert(
+        "__builtin_ia32_sha256msg1",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg1128),
+    );
+    m.insert(
+        "__builtin_ia32_sha256msg2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg2128),
+    );
+    // The public `_mm_sha256*_epu32` names are compiler-known, as the SHA-1
+    // round name and the SHA-512 names are, so the value reaches the SHA op
+    // without the header wrapper in between.
+    m.insert(
+        "_mm_sha256msg1_epu32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg1128),
+    );
+    m.insert(
+        "_mm_sha256msg2_epu32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256msg2128),
+    );
+    m.insert(
+        "_mm_sha256rnds2_epu32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha256rnds2128),
+    );
     // x86 CLMUL
     m.insert(
         "__builtin_ia32_pclmulqdq128",
@@ -2717,6 +2768,35 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_vpclmulqdq256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vpclmulqdq256),
     );
+    m.insert(
+        "__builtin_ia32_vsha512msg1",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512msg1256),
+    );
+    m.insert(
+        "__builtin_ia32_vsha512msg2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512msg2256),
+    );
+    m.insert(
+        "__builtin_ia32_vsha512rnds2",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512rnds2256),
+    );
+    // The `<immintrin.h>` SHA-512 names are compiler-known like
+    // `_mm256_add_epi64` (see above). Measured on `k.c` (rsp references):
+    // header wrappers with the lowering and regalloc changes leave 6; these
+    // builtin names with both changes reach 0, matching GCC 16.2. Neither
+    // change alone reaches 0 (see the PR attribution matrix).
+    m.insert(
+        "_mm256_sha512msg1_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512msg1256),
+    );
+    m.insert(
+        "_mm256_sha512msg2_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512msg2256),
+    );
+    m.insert(
+        "_mm256_sha512rnds2_epi64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha512rnds2256),
+    );
     // GCC-compatible aliases (GCC 16 uses _avx_ infix for the VEX VNNI forms,
     // and an odd dpwsud spelling for INT16 vpdpwusd; accept both spellings).
     m.insert(
@@ -4100,6 +4180,14 @@ pub enum BuiltinIntrinsic {
     X86Aesdeclast128,
     X86Aesimc128,
     X86Aeskeygenassist128,
+    // SHA-NI
+    X86Sha1rnds4128,
+    X86Sha1nexte128,
+    X86Sha1msg1128,
+    X86Sha1msg2128,
+    X86Sha256rnds2128,
+    X86Sha256msg1128,
+    X86Sha256msg2128,
     // CLMUL
     X86Pclmulqdq128,
     // SSE2 shift/shuffle
@@ -4324,6 +4412,9 @@ pub enum BuiltinIntrinsic {
     X86Aesdec256,
     X86Aesdeclast256,
     X86Vpclmulqdq256,
+    X86Sha512msg1256,
+    X86Sha512msg2256,
+    X86Sha512rnds2256,
     // SSE2/SSE4.1 previously scalar
     X86Paddusb128,
     X86Paddsb128,

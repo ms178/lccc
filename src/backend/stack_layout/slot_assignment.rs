@@ -1077,7 +1077,7 @@ fn classify_value(
     // These homes need protected slots to prevent reuse from corrupting data.
     // vector_result_width describes actual results instead; a store's source
     // home metadata is neither a produced value nor a memory-effect proof.
-    if is_vector || is_vector128 {
+    if (is_vector || is_vector128) && !state.vector_temp_released.contains(&dest.0) {
         state.protected_slot_values.insert(dest.0);
     }
 
@@ -1100,6 +1100,9 @@ fn classify_value(
 
     // Skip dead values (defined but never used).
     if !ctx.used_values.contains(&dest.0) {
+        if state.protected_slot_values.contains(&dest.0) {
+            state.unused_protected_values.insert(dest.0);
+        }
         if debug_protect && state.protected_slot_values.contains(&dest.0) {
             lccc::cli::stderr_line(format_args!(
                 "[CLASSIFY] SSA {} is protected but not in used_values, skipping slot",
@@ -1606,7 +1609,30 @@ pub(super) fn assign_tier2_liveness_packed_slots(
     // risky model (requires the liveness to record every hole exactly) and is
     // therefore never the default.
     if !coalesce || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some() || has_builtin_setjmp(func) {
+        // Single-block vector temporaries share slots by live interval. A
+        // returns-twice function keeps every value in a unique slot (the
+        // setjmp resume edge is not in the interval model).
+        let pool = std::mem::take(&mut state.vector_pool);
+        let placed: FxHashSet<u32> = if pool.is_empty() || has_builtin_setjmp(func) {
+            FxHashSet::default()
+        } else {
+            let members: Vec<(u32, i64)> = multi_block_values
+                .iter()
+                .map(|m| (m.dest_id, m.slot_size))
+                .collect();
+            super::vector_pool::assign_pool_slots(
+                &mut state.value_locations,
+                &pool,
+                &members,
+                non_local_space,
+                assign_slot,
+            )
+        };
+        state.vector_pool = pool;
         for mbv in multi_block_values {
+            if placed.contains(&mbv.dest_id) {
+                continue;
+            }
             // Vector slots (16/32 bytes) are 16-aligned — see the Tier-3
             // note; the same legacy-SSE memory-form consumers apply.
             let align = if mbv.slot_size >= 16 { 16 } else { 0 };

@@ -1319,6 +1319,23 @@ pub enum IntrinsicOp {
     /// CLMUL: pclmulqdq with immediate
     /// args[0] = src1 ptr, args[1] = src2 ptr, args[2] = imm8; dest_ptr = result ptr
     Pclmulqdq128,
+    /// SHA-NI: sha1rnds4 (four SHA-1 rounds), args[0] = state (dst), args[1] = msg
+    /// (src), args[2] = imm8 round-function selector; dest_ptr = result ptr.
+    Sha1rnds4128,
+    /// SHA-NI: sha1nexte (next-E of the SHA-1 state), two vector operands.
+    Sha1nexte128,
+    /// SHA-NI: sha1msg1 (first SHA-1 message-schedule step), two vector operands.
+    Sha1msg1128,
+    /// SHA-NI: sha1msg2 (second SHA-1 message-schedule step), two vector operands.
+    Sha1msg2128,
+    /// SHA-NI: sha256rnds2 (two SHA-256 rounds). args[0] = CDGH state (dst),
+    /// args[1] = ABEF state (src2), args[2] = WK words, which the instruction
+    /// reads from the implicit operand %xmm0; dest_ptr = result ptr.
+    Sha256rnds2128,
+    /// SHA-NI: sha256msg1 (first SHA-256 message-schedule step), two vector operands.
+    Sha256msg1128,
+    /// SHA-NI: sha256msg2 (second SHA-256 message-schedule step), two vector operands.
+    Sha256msg2128,
     /// SSE2 byte shift left (PSLLDQ): shift by imm8 bytes
     /// args[0] = src ptr, args[1] = imm8; dest_ptr = result ptr
     Pslldqi128,
@@ -1561,6 +1578,15 @@ pub enum IntrinsicOp {
     Aesdec256,
     Aesdeclast256,
     Vpclmulqdq256,
+    /// SHA-512 message schedule step 1 (VEX.256 `vsha512msg1`). args[0] = dst
+    /// ymm (W[0..3]), args[1] = xmm whose low qword is W[4]; dest_ptr = result.
+    Sha512msg1256,
+    /// SHA-512 message schedule step 2 (`vsha512msg2`). args[0] = partial ymm,
+    /// args[1] = ymm whose qwords 2 and 3 are W[14], W[15]; dest_ptr = result.
+    Sha512msg2256,
+    /// SHA-512 two rounds (`vsha512rnds2`). args[0] = CDGH ymm (dst, output is
+    /// the updated ABEF), args[1] = ABEF ymm (vvvv), args[2] = xmm W+K pair.
+    Sha512rnds2256,
 
     // --- SSE2 ops previously left as scalar header loops ---
     Paddusb128,
@@ -2430,6 +2456,7 @@ impl IntrinsicOp {
             | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
             | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256 | SetEpi8_256
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
+            | Sha512msg1256 | Sha512msg2256 | Sha512rnds2256
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB | MulAddF64x4HoistedSIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecLoadStrided2I32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
@@ -2571,6 +2598,8 @@ impl IntrinsicOp {
             | Pinsrq128 | Cast256to128 | Dpbusd128 | Dpbssd128 | Dpwuud128
             | Gf2p8mulb128 | Aesenc128 | Aesenclast128 | Aesdec128
             | Aesdeclast128 | Aesimc128 | Aeskeygenassist128 | Pclmulqdq128
+            | Sha1rnds4128 | Sha1nexte128 | Sha1msg1128 | Sha1msg2128
+            | Sha256rnds2128 | Sha256msg1128 | Sha256msg2128
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecLoadStrided2I32x4 | VecLoadStrided2CompactI32x4 | VecAddF64x2
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
@@ -2720,9 +2749,25 @@ impl IntrinsicOp {
             IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
             IntrinsicOp::Aesimc128 | IntrinsicOp::Aeskeygenassist128 |
             IntrinsicOp::Pclmulqdq128 |
+            IntrinsicOp::Sha1rnds4128 | IntrinsicOp::Sha1nexte128 |
+            IntrinsicOp::Sha1msg1128 | IntrinsicOp::Sha1msg2128 |
+            IntrinsicOp::Sha256rnds2128 | IntrinsicOp::Sha256msg1128 |
+            IntrinsicOp::Sha256msg2128 |
             IntrinsicOp::Pslldqi128 | IntrinsicOp::Psrldqi128 |
             IntrinsicOp::Psllqi128 | IntrinsicOp::Psrlqi128 |
             IntrinsicOp::Pshufd128 |
+            // 256-bit register-only shuffles, zero-extension, the 256-bit
+            // SHA-512 producers and the 256-bit add: one VEX instruction on
+            // register operands, no memory operand and no side effect. Left
+            // impure, a dead result stayed rooted in DCE and still wrote its
+            // home (a dead `vpshufb` clobbered a live YMM value).
+            IntrinsicOp::Pshufb256 | IntrinsicOp::Permute4x64 |
+            IntrinsicOp::Permute2x128 | IntrinsicOp::Pshufd256 |
+            IntrinsicOp::BlendPs256 | IntrinsicOp::Extracti128 |
+            IntrinsicOp::Cast256to128 | IntrinsicOp::Zext128to256 |
+            IntrinsicOp::VecAddI64x4 |
+            IntrinsicOp::Sha512msg1256 | IntrinsicOp::Sha512msg2256 |
+            IntrinsicOp::Sha512rnds2256 |
             // SSE2 packed operations are all pure
             IntrinsicOp::Psubsb128 |
             IntrinsicOp::Paddw128 | IntrinsicOp::Psubw128 |
@@ -3503,6 +3548,32 @@ mod vector_width_tests {
         ] {
             assert!(op.is_pure(), "{op:?} has no observable side effect");
             assert_eq!(op.vector_result_width(), None, "{op:?} is scalar");
+        }
+    }
+
+    /// The 256-bit register-only producers are DCE-eligible, so a dead result
+    /// is removed rather than emitted into its home. The loads stay impure:
+    /// they read memory, and this predicate is what keeps them rooted.
+    #[test]
+    fn register_only_256_bit_producers_are_pure() {
+        for op in [
+            IntrinsicOp::Pshufb256,
+            IntrinsicOp::Permute4x64,
+            IntrinsicOp::Permute2x128,
+            IntrinsicOp::Pshufd256,
+            IntrinsicOp::BlendPs256,
+            IntrinsicOp::Extracti128,
+            IntrinsicOp::Cast256to128,
+            IntrinsicOp::Zext128to256,
+            IntrinsicOp::VecAddI64x4,
+            IntrinsicOp::Sha512msg1256,
+            IntrinsicOp::Sha512msg2256,
+            IntrinsicOp::Sha512rnds2256,
+        ] {
+            assert!(op.is_pure(), "{op:?} is register-only");
+        }
+        for op in [IntrinsicOp::Loadu256, IntrinsicOp::Load256] {
+            assert!(!op.is_pure(), "{op:?} reads memory");
         }
     }
 

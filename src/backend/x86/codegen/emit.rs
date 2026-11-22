@@ -1643,6 +1643,9 @@ impl X86Codegen {
         // passes: arm the sink's shadow-epoch validator for this target.
         state.enable_rax_epoch_discipline();
         state.frame_gep_direct = std::env::var_os("CCC_NO_FRAME_GEP_DIRECT").is_none();
+        // Block-local vector temporaries may share slots (x86-64 only; see
+        // `calculate_stack_space_common`).
+        state.vector_temp_sharing = true;
         Self {
             state,
             current_return_type: IrType::I64,
@@ -5491,6 +5494,18 @@ impl X86Codegen {
                 0
             }
         }
+    }
+
+    /// An immediate the frontend pins to a constant (`x86_lane_immediate_bits`
+    /// and the `-O0` pinning in lowering). A non-constant here is a lowering
+    /// bug: `operand_to_imm_i64` would return 0 and the instruction would
+    /// silently take a wrong immediate, so this fails loudly instead.
+    pub(super) fn pinned_imm_i64(&self, op: &Operand, what: &str) -> i64 {
+        assert!(
+            matches!(op, Operand::Const(_)),
+            "{what} immediate must be a compile-time constant"
+        );
+        self.operand_to_imm_i64(op)
     }
 
     /// Emit comment annotations for callee-saved registers listed in inline asm

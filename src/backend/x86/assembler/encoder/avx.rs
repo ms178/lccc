@@ -3388,6 +3388,48 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// VEX.256 SHA-512 (0F38, pp=F2, W0): `vsha512msg1 ymm, xmm`,
+    /// `vsha512msg2 ymm, ymm`, `vsha512rnds2 ymm, ymm, xmm` (AT&T order).
+    ///
+    /// `widths` gives each operand, true = ymm and false = xmm. Only register
+    /// operands of exactly those widths are accepted; that is the set GNU as
+    /// 2.47 accepts, and XED's SHA512 datafile describes the same operands.
+    /// Memory, GPR and immediate operands are type errors, a wrong register
+    /// width is a size error, and a wrong count is a count error (GAS wording).
+    ///
+    /// This is the one entry point for all three rows, so the width check cannot
+    /// be bypassed by a caller. Each row passes its own opcode literally, which
+    /// keeps the encoding auditable and visible to the SDM cross-reference model.
+    pub(crate) fn encode_sha512_vex(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        widths: &[bool],
+        mnemonic: &str,
+    ) -> Result<(), String> {
+        if ops.len() != widths.len() {
+            return Err(format!("number of operands mismatch for `{mnemonic}'"));
+        }
+        for (op, &want_ymm) in ops.iter().zip(widths) {
+            let Operand::Register(r) = op else {
+                return Err(format!("operand type mismatch for `{mnemonic}'"));
+            };
+            let is_x = is_xmm(&r.name);
+            let is_y = is_ymm(&r.name);
+            if !is_x && !is_y {
+                return Err(format!("operand type mismatch for `{mnemonic}'"));
+            }
+            if (want_ymm && !is_y) || (!want_ymm && !is_x) {
+                return Err(format!("operand size mismatch for `{mnemonic}'"));
+            }
+        }
+        match ops {
+            [_, _] => self.encode_avx_2op_38_pp(ops, opcode, 3),
+            [_, _, _] => self.encode_avx_3op_38_pp(ops, opcode, 3),
+            _ => Err(format!("number of operands mismatch for `{mnemonic}'")),
+        }
+    }
+
     /// Encode AVX 2-operand in 0F38 map (e.g., vpabsb src, dst with vvvv=0)
     pub(crate) fn encode_avx_2op_38(
         &mut self,

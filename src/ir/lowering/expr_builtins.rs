@@ -1556,6 +1556,13 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pxor128
             | BuiltinIntrinsic::X86Set1Epi8
             | BuiltinIntrinsic::X86Set1Epi32
+            | BuiltinIntrinsic::X86Sha1rnds4128
+            | BuiltinIntrinsic::X86Sha1nexte128
+            | BuiltinIntrinsic::X86Sha1msg1128
+            | BuiltinIntrinsic::X86Sha1msg2128
+            | BuiltinIntrinsic::X86Sha256rnds2128
+            | BuiltinIntrinsic::X86Sha256msg1128
+            | BuiltinIntrinsic::X86Sha256msg2128
             | BuiltinIntrinsic::X86Aesenc128
             | BuiltinIntrinsic::X86Aesenclast128
             | BuiltinIntrinsic::X86Aesdec128
@@ -1752,6 +1759,9 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Aesdec256
             | BuiltinIntrinsic::X86Aesdeclast256
             | BuiltinIntrinsic::X86Vpclmulqdq256
+            | BuiltinIntrinsic::X86Sha512msg1256
+            | BuiltinIntrinsic::X86Sha512msg2256
+            | BuiltinIntrinsic::X86Sha512rnds2256
             | BuiltinIntrinsic::X86Paddusb128
             | BuiltinIntrinsic::X86Paddsb128
             | BuiltinIntrinsic::X86Paddusw128
@@ -3645,8 +3655,15 @@ impl Lowerer {
                 .and_then(|value| value.to_i64())
                 .is_some_and(|value| (0..(1i64 << bits)).contains(&value));
             if !in_range {
+                // GCC 16.2 spells the article from the number ("a 1-bit",
+                // "a 2-bit", "an 8-bit"); a fixed "an" was wrong for 1 and 2.
+                let article = if bits == 8 || bits == 11 || bits == 18 {
+                    "an"
+                } else {
+                    "a"
+                };
                 return self.reject_builtin_call(
-                    format!("the last argument to '{name}' must be an {bits}-bit immediate"),
+                    format!("the last argument to '{name}' must be {article} {bits}-bit immediate"),
                     args,
                     16,
                 );
@@ -3721,6 +3738,11 @@ impl Lowerer {
         // refusal-first rewrite: every shape the twin table does not own keeps
         // the established pointer emitter below.
         if let Some(result) = self.try_native_packed_map(op, args) {
+            return Some(result);
+        }
+        // SHA-NI and SHA-512: register-valued operands and result, so no
+        // 256-bit state or schedule word is forced through a stack slot.
+        if let Some(result) = self.try_native_sha(op, args) {
             return Some(result);
         }
         match x86_intrinsic_kind(intrinsic) {
@@ -3818,6 +3840,20 @@ impl Lowerer {
                     .collect();
                 if let (Some(count), Some(last)) = (normalized_count, arg_ops.last_mut()) {
                     *last = Operand::Const(IrConst::I64(count));
+                }
+                // Immediates range-checked above (`x86_lane_immediate_bits`) are
+                // pinned as literals at every optimisation level: at -O0 a C
+                // conversion leaves the immediate as an SSA value, which the
+                // emitter cannot encode (it silently read 0 for blend, clmul,
+                // aeskeygenassist and sha1rnds4).
+                if x86_lane_immediate_bits(intrinsic).is_some() {
+                    let imm = args
+                        .last()
+                        .and_then(|arg| self.eval_const_expr(arg))
+                        .and_then(|value| value.to_i64());
+                    if let (Some(imm), Some(last)) = (imm, arg_ops.last_mut()) {
+                        *last = Operand::Const(IrConst::I32(imm as i32));
+                    }
                 }
                 let result_size = match x86_intrinsic_kind(intrinsic) {
                     X86IntrinsicKind::Vec128 => 16,
@@ -4042,6 +4078,22 @@ fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
         | BuiltinIntrinsic::X86Vextractf128V
         | BuiltinIntrinsic::X86Insert128to256
         | BuiltinIntrinsic::X86Vinsertf128 => Some(1),
+        // SHA1RNDS4 selects one of four round functions with a 2-bit immediate.
+        BuiltinIntrinsic::X86Sha1rnds4128 => Some(2),
+        // PBLENDW, PCLMULQDQ and AESKEYGENASSIST take a full 8-bit immediate.
+        BuiltinIntrinsic::X86Pblendw128
+        | BuiltinIntrinsic::X86Pclmulqdq128
+        | BuiltinIntrinsic::X86Aeskeygenassist128 => Some(8),
+        // The 256-bit lane shuffles also take 8-bit immediates. Their
+        // emitters read the immediate with `operand_to_imm_i64`, which
+        // returns 0 for an SSA value, so at -O0 (where the call stays a
+        // plain SSA value) VPERMQ was emitted as `vpermq $0` for any control
+        // word. The byte shifts are excluded: their builtins take bit counts
+        // that are normalised to byte counts above, so they must not be
+        // re-pinned to the raw value.
+        BuiltinIntrinsic::X86Permute4x64
+        | BuiltinIntrinsic::X86Permute2x128
+        | BuiltinIntrinsic::X86Pshufd256 => Some(8),
         _ => None,
     }
 }
@@ -4155,6 +4207,9 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Aesdec256
         | BuiltinIntrinsic::X86Aesdeclast256
         | BuiltinIntrinsic::X86Vpclmulqdq256
+        | BuiltinIntrinsic::X86Sha512msg1256
+        | BuiltinIntrinsic::X86Sha512msg2256
+        | BuiltinIntrinsic::X86Sha512rnds2256
         | BuiltinIntrinsic::X86Pmulld256
         | BuiltinIntrinsic::X86Psubd256
         | BuiltinIntrinsic::X86Paddq256
@@ -4284,6 +4339,19 @@ fn legacy_xmm_intrinsic_required_feature(
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
+        // SHA-NI (GCC's `__builtin_ia32_sha*`, `target("sha")` on the wrappers).
+        B::X86Sha1rnds4128
+        | B::X86Sha1nexte128
+        | B::X86Sha1msg1128
+        | B::X86Sha1msg2128
+        | B::X86Sha256rnds2128
+        | B::X86Sha256msg1128
+        | B::X86Sha256msg2128
+        => IntrinsicRequirement {
+            feature: F::Sha,
+            flag: "-msha",
+            also: None,
+        },
         // Public and raw spellings share an intrinsic identity. SSE1 floating
         // arithmetic must not bypass permission checks, nor imply SSE2 integer
         // or double arithmetic merely because the register class is the same.
@@ -4486,6 +4554,46 @@ fn x86_memory_intrinsic_required_feature(
     })
 }
 
+/// VAES, VPCLMULQDQ, SHA-512 and GFNI: the VEX/legacy crypto families.  Split
+/// out of [`x86_intrinsic_required_feature`] (which the census caps at 300
+/// lines) along the same seam as the memory and legacy-SSE helpers; each arm
+/// keeps its own feature bit, so no permission is merged.
+fn vex_crypto_intrinsic_required_feature(
+    intrinsic: &BuiltinIntrinsic,
+) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    Some(match intrinsic {
+        // VAES: the EVEX 256-bit AES round instructions.  A v3 target without
+        // `-mvaes` is exactly the SIGILL case `_mm_crc32_u8` under
+        // `-march=x86-64` was: measured emitting `vaesenc %ymm1, %ymm0, %ymm0`
+        // on a target whose own class does not contain it.
+        B::X86Aesenc256 | B::X86Aesenclast256 | B::X86Aesdec256 | B::X86Aesdeclast256 => {
+            IntrinsicRequirement {
+                feature: F::Vaes,
+                flag: "-mvaes",
+                also: Some(" and AVX (VEX.256)"),
+            }
+        }
+        // VPCLMULQDQ: the 256-bit carry-less multiply.  Separate bit from
+        // VAES, so the two must not share a row.  Both 256-bit forms need AVX
+        // only, not AVX2 (measured on gcc 14: `-mvaes -mno-avx2` accepts).
+        // SHA-512 (VEX.256): GCC 16.2 implies AVX from `-msha512`, not AVX2, so
+        // the feature bit alone carries the permission.
+        B::X86Sha512msg1256 | B::X86Sha512msg2256 | B::X86Sha512rnds2256 => IntrinsicRequirement {
+            feature: F::Sha512,
+            flag: "-msha512",
+            also: None,
+        },
+        B::X86Vpclmulqdq256 => IntrinsicRequirement {
+            feature: F::Vpclmulqdq,
+            flag: "-mvpclmulqdq",
+            also: Some(" and AVX (VEX.256)"),
+        },
+        _ => return None,
+    })
+}
+
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
 /// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
 /// belongs to, for the families whose permission bit exists in
@@ -4504,6 +4612,9 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         return Some(requirement);
     }
     if let Some(requirement) = x86_memory_intrinsic_required_feature(intrinsic) {
+        return Some(requirement);
+    }
+    if let Some(requirement) = vex_crypto_intrinsic_required_feature(intrinsic) {
         return Some(requirement);
     }
     Some(match intrinsic {
@@ -4713,25 +4824,6 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             flag: "-mpclmul",
             also: None,
         },
-        // VAES: the EVEX 256-bit AES round instructions.  A v3 target without
-        // `-mvaes` is exactly the SIGILL case `_mm_crc32_u8` under
-        // `-march=x86-64` was: measured emitting `vaesenc %ymm1, %ymm0, %ymm0`
-        // on a target whose own class does not contain it.
-        B::X86Aesenc256 | B::X86Aesenclast256 | B::X86Aesdec256 | B::X86Aesdeclast256 => {
-            IntrinsicRequirement {
-                feature: F::Vaes,
-                flag: "-mvaes",
-                also: Some(" and AVX (VEX.256)"),
-            }
-        }
-        // VPCLMULQDQ: the 256-bit carry-less multiply.  Separate bit from
-        // VAES, so the two must not share a row.  Both 256-bit forms need AVX
-        // only, not AVX2 (measured on gcc 14: `-mvaes -mno-avx2` accepts).
-        B::X86Vpclmulqdq256 => IntrinsicRequirement {
-            feature: F::Vpclmulqdq,
-            flag: "-mvpclmulqdq",
-            also: Some(" and AVX (VEX.256)"),
-        },
         // AVX-VNNI: `vpdpbusd(s)` and `vpdpwssd(s)`, the VEX-encoded
         // signed-byte-times-unsigned-byte and signed-word dot products.  This
         // is the family the audit's live SIGILL case belongs to: measured
@@ -4917,6 +5009,13 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86CastReinterpret => IntrinsicOp::CastReinterpret128,
         BuiltinIntrinsic::X86Set1Epi8 => IntrinsicOp::SetEpi8,
         BuiltinIntrinsic::X86Set1Epi32 => IntrinsicOp::SetEpi32,
+        BuiltinIntrinsic::X86Sha1rnds4128 => IntrinsicOp::Sha1rnds4128,
+        BuiltinIntrinsic::X86Sha1nexte128 => IntrinsicOp::Sha1nexte128,
+        BuiltinIntrinsic::X86Sha1msg1128 => IntrinsicOp::Sha1msg1128,
+        BuiltinIntrinsic::X86Sha1msg2128 => IntrinsicOp::Sha1msg2128,
+        BuiltinIntrinsic::X86Sha256rnds2128 => IntrinsicOp::Sha256rnds2128,
+        BuiltinIntrinsic::X86Sha256msg1128 => IntrinsicOp::Sha256msg1128,
+        BuiltinIntrinsic::X86Sha256msg2128 => IntrinsicOp::Sha256msg2128,
         BuiltinIntrinsic::X86Aesenc128 => IntrinsicOp::Aesenc128,
         BuiltinIntrinsic::X86Aesenclast128 => IntrinsicOp::Aesenclast128,
         BuiltinIntrinsic::X86Aesdec128 => IntrinsicOp::Aesdec128,
@@ -5085,6 +5184,9 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Aesdec256 => IntrinsicOp::Aesdec256,
         BuiltinIntrinsic::X86Aesdeclast256 => IntrinsicOp::Aesdeclast256,
         BuiltinIntrinsic::X86Vpclmulqdq256 => IntrinsicOp::Vpclmulqdq256,
+        BuiltinIntrinsic::X86Sha512msg1256 => IntrinsicOp::Sha512msg1256,
+        BuiltinIntrinsic::X86Sha512msg2256 => IntrinsicOp::Sha512msg2256,
+        BuiltinIntrinsic::X86Sha512rnds2256 => IntrinsicOp::Sha512rnds2256,
         BuiltinIntrinsic::X86SetEpi32_256 => IntrinsicOp::SetEpi32_256,
         BuiltinIntrinsic::X86SetEpi64x256 => IntrinsicOp::SetEpi64x256,
         BuiltinIntrinsic::X86Paddusb128 => IntrinsicOp::Paddusb128,

@@ -833,6 +833,77 @@ fn frame_read_extent(line: &str) -> Option<i32> {
     super::fp_liveness::read_extent(mnemonic, operands.trim_ascii())
 }
 
+/// Removes a full-width vector store to an `%rsp` frame slot when no path from
+/// the store reads its bytes before they are overwritten or the function exits.
+/// The store must lie inside the function's own frame (see below).
+///
+/// `eliminate_never_read_stores` is address-global: a store survives while any
+/// read anywhere in the function covers its bytes. That is too coarse once
+/// block-local vector temporaries share a slot (`vector_pool.rs`). The stores of
+/// values that are consumed in their register are then kept alive by a reload of
+/// a different value in the same slot. The exact per-slot liveness oracle sees
+/// the control flow: a loop body that rewrites the slot before it reads it, and
+/// a function exit, kill the store. Only `%rsp`-relative stores are considered,
+/// which is the form the vector spill path emits; every other store keeps the
+/// established rules.
+///
+/// Soundness: a store is removed only when `slot_dead_after` proves that no
+/// read of its bytes is reachable. Removing such a store adds no read and
+/// removes only a kill whose effect is already dead, so the facts computed
+/// before the removal stay valid for later stores in this pass (the same
+/// argument `eliminate_dead_fp_moves` relies on).
+pub(super) fn eliminate_flow_dead_vector_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    const RSP_FAMILY: u8 = 4;
+    let mut changed = false;
+    let mut fp: Option<FpLiveness> = None;
+    // Bytes of this function's own frame, from the first `subq $N, %rsp` after
+    // its `.cfi_startproc`. Offsets in `[0, N)` name the frame; anything else
+    // (a caller's stack argument, a function with no frame) is not dead when
+    // the function returns, so those stores keep their established treatment.
+    let mut frame_bytes: Option<i64> = None;
+    for i in 0..infos.len() {
+        let info = infos[i];
+        if info.is_nop() {
+            continue;
+        }
+        let text = info.trimmed(store.get(i));
+        if info.kind == LineKind::Directive && is_frame_boundary(text) {
+            frame_bytes = None;
+            continue;
+        }
+        if frame_bytes.is_none() {
+            if let Some(rest) = text.strip_prefix("subq $") {
+                frame_bytes = rest
+                    .strip_suffix(", %rsp")
+                    .and_then(|v| v.parse::<i64>().ok());
+            }
+            continue;
+        }
+        if info.pinned {
+            continue;
+        }
+        let LineKind::StoreXmmRbp { offset, size } = info.kind else {
+            continue;
+        };
+        // An indexed frame operand names no fixed slot; keep it.
+        if frame_base(text, 0) != b's' || text.contains("(%rsp,") {
+            continue;
+        }
+        let end = i64::from(offset) + i64::from(size.byte_size());
+        if i64::from(offset) < 0 || Some(end) > frame_bytes {
+            continue;
+        }
+        if fp
+            .get_or_insert_with(|| FpLiveness::new(store, infos))
+            .slot_dead_after(i, RSP_FAMILY, offset, size.byte_size())
+        {
+            mark_nop(&mut infos[i]);
+            changed = true;
+        }
+    }
+    changed
+}
+
 pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
     let len = store.len();
     if len == 0 {
@@ -2649,5 +2720,80 @@ mod tests {
         // deleted — proving the guard is what keeps it.
         let mutated = asm.replace("jmp .L2\n", "");
         assert!(dse_removed(&mutated, "movl %eax, 16(%rsp)"));
+    }
+
+    /// A vector spill whose slot is rewritten at the loop head before it is
+    /// read is dead on the back-edge. The store at the bottom of the loop
+    /// survives the windowed pass (a `jl` ends the window) and the address-global
+    /// pass (the slot is read at the head), so only the per-path oracle removes
+    /// it. This is the shape `vector_pool.rs` sharing produces for
+    /// classify-style loops (`test_classify_predicate_codegen`: 13 spills
+    /// against a ceiling of 12).
+    #[test]
+    fn vector_store_overwritten_on_the_back_edge_is_removed() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $40, %rsp\n",
+            ".cfi_def_cfa_offset 48\n",
+            "    xorl %ecx, %ecx\n",
+            ".LB:\n",
+            "    movdqu %xmm0, 16(%rsp)\n",
+            "    movdqu 16(%rsp), %xmm1\n",
+            "    paddb %xmm1, %xmm2\n",
+            "    movdqu %xmm2, 16(%rsp)\n",
+            "    addl $1, %ecx\n",
+            "    cmpl $4, %ecx\n",
+            "    jl .LB\n",
+            "    addq $40, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, mut infos) = build(asm);
+        assert!(eliminate_flow_dead_vector_stores(&store, &mut infos));
+        let kept: Vec<&str> = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim_ascii())
+            .filter(|t| t.starts_with("movdqu") && t.contains("(%rsp)"))
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["movdqu %xmm0, 16(%rsp)", "movdqu 16(%rsp), %xmm1"],
+            "only the store that the back-edge overwrites may be removed"
+        );
+    }
+
+    /// The control: the same store is live when the slot is read at the loop
+    /// head, because the value written at the bottom flows around the back-edge
+    /// into that read. The pass must keep it.
+    #[test]
+    fn vector_store_read_after_the_back_edge_is_kept() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $40, %rsp\n",
+            ".cfi_def_cfa_offset 48\n",
+            "    xorl %ecx, %ecx\n",
+            ".LB:\n",
+            "    movdqu 16(%rsp), %xmm1\n",
+            "    paddb %xmm1, %xmm2\n",
+            "    movdqu %xmm2, 16(%rsp)\n",
+            "    addl $1, %ecx\n",
+            "    cmpl $4, %ecx\n",
+            "    jl .LB\n",
+            "    addq $40, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, mut infos) = build(asm);
+        assert!(!eliminate_flow_dead_vector_stores(&store, &mut infos));
+        assert!(
+            (0..store.len()).any(
+                |i| !infos[i].is_nop() && store.get(i).trim_ascii() == "movdqu %xmm2, 16(%rsp)"
+            ),
+            "a store that reaches a read through the back-edge is live"
+        );
     }
 }

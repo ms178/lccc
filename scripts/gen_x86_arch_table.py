@@ -67,6 +67,8 @@ FEATURE_MACROS = [
     ('Rdrnd', '__RDRND__'),
     ('Vaes', '__VAES__'),
     ('Vpclmulqdq', '__VPCLMULQDQ__'),
+    ('Sha', '__SHA__'),
+    ('Sha512', '__SHA512__'),
     ('AvxVnni', '__AVXVNNI__'),
     ('AvxVnniInt8', '__AVXVNNIINT8__'),
     ('AvxVnniInt16', '__AVXVNNIINT16__'),
@@ -95,6 +97,7 @@ OPTION_NAMES = {
     'Cx16': 'cx16', 'Avx': 'avx', 'Avx2': 'avx2', 'Fma': 'fma', 'F16c': 'f16c',
     'Bmi': 'bmi', 'Bmi2': 'bmi2', 'Lzcnt': 'lzcnt', 'Movbe': 'movbe', 'Aes': 'aes',
     'Pclmul': 'pclmul', 'Rdrnd': 'rdrnd', 'Vaes': 'vaes', 'Vpclmulqdq': 'vpclmulqdq',
+    'Sha': 'sha', 'Sha512': 'sha512',
     'AvxVnni': 'avxvnni', 'AvxVnniInt8': 'avxvnniint8', 'AvxVnniInt16': 'avxvnniint16',
     'Gfni': 'gfni', 'Avx512F': 'avx512f', 'Avx512Bw': 'avx512bw', 'Avx512Dq': 'avx512dq',
     'Avx512Vl': 'avx512vl', 'Avx512Vnni': 'avx512vnni', 'Avx512BitAlg': 'avx512bitalg',
@@ -127,7 +130,6 @@ EXTRA_MACROS = [
     ('AvxIfma', '__AVXIFMA__'),
     ('AvxNeConvert', '__AVXNECONVERT__'),
     ('Cmpccxadd', '__CMPCCXADD__'),
-    ('Sha512', '__SHA512__'),
     ('Sm3', '__SM3__'),
     ('Sm4', '__SM4__'),
     ('Movrs', '__MOVRS__'),
@@ -142,7 +144,7 @@ EXTRA_MACROS = [
 # GCC's option for each macro-only extension.
 EXTRA_OPTION_NAMES = {
     'Prfchw': 'prfchw', 'AvxIfma': 'avxifma', 'AvxNeConvert': 'avxneconvert',
-    'Cmpccxadd': 'cmpccxadd', 'Sha512': 'sha512', 'Sm3': 'sm3', 'Sm4': 'sm4',
+    'Cmpccxadd': 'cmpccxadd', 'Sm3': 'sm3', 'Sm4': 'sm4',
     'Movrs': 'movrs', 'UserMsr': 'usermsr', 'AmxTile': 'amx-tile',
     'AmxInt8': 'amx-int8', 'AmxBf16': 'amx-bf16', 'Avx10_1': 'avx10.1',
     'Avx10_2': 'avx10.2', 'ApxF': 'apxf',
@@ -384,6 +386,17 @@ def measure_implied(options):
     return sorted(rules, key=lambda r: (r[1] in PSEUDO_CONST, ORDER.index(r[1]) if r[1] in ORDER else 0, r[0]))
 
 
+# A feature the measurement finds removing an extension that GCC does NOT
+# withdraw it for. `-mno-xsave` clears the ISA AVX bit (GCC's XSAVE_UNSET
+# includes AVX_UNSET) but SM3 and SM4 are ISA2 extensions whose withdrawal
+# chain is ISA2_AVX_UNSET, which only `-mno-avx` reaches. A removal probe sees
+# only the one AVX bit, so `Avx` is dropped from their requirement here; the
+# driver withdraws them on `-mno-avx` explicitly (`withdraw_x86_extra`).
+# Measured with gcc-16.2: `-msm3 -mno-xsave` defines `__SM3__`,
+# `-msm3 -mno-avx` does not, and the same holds for `-msm4`.
+XSAVE_CASCADE_EXEMPT = {'Sm3': {'Avx'}, 'Sm4': {'Avx'}}
+
+
 def measure_extra_requires():
     """{extension: (features, extensions) whose `-mno-` removes it}, each
     measured on `-march=x86-64 -mEXTENSION`: AVXIFMA leaves with AVX2,
@@ -401,7 +414,9 @@ def measure_extra_requires():
         def removed_by(options):
             return [v for option, v in options if v != variant
                     and not re.search(rf'^#define {macro} ', run(base + [f'-mno-{option}']).stdout, re.M)]
-        return variant, (removed_by(feature_options), removed_by(extra_options))
+        features = [f for f in removed_by(feature_options)
+                    if f not in XSAVE_CASCADE_EXEMPT.get(variant, ())]
+        return variant, (features, removed_by(extra_options))
 
     with ThreadPoolExecutor(os.cpu_count() or 1) as pool:
         return dict(pool.map(requires, EXTRA_MACROS))
@@ -591,8 +606,8 @@ def render(rows, options, implied, requires, derived, tunes):
         '    pub name: &\'static str,',
         '    /// GCC accepts the name for x86-64 code (`-m64`).',
         '    pub x86_64: bool,',
-        '    features: u64,',
-        '    extras: u32,',
+        '    pub(crate) features: u64,',
+        '    pub(crate) extras: u32,',
         '    /// GCC\'s `-march=` CPU macros (`__haswell`, `__core_avx2__`, ...).',
         '    pub arch_macros: &\'static [&\'static str],',
         '    /// GCC\'s `-mtune=` macros (`__tune_haswell__`, ...); `-march=` alone',

@@ -50961,6 +50961,42 @@
 "w": 0
 }
 ],
+"VSHA512MSG1": [
+{
+"family": "vex",
+"map": "0f38",
+"modrm": true,
+"modrm_mode": "register",
+"opcode": 204,
+"pp": "f2",
+"reg": null,
+"w": 0
+}
+],
+"VSHA512MSG2": [
+{
+"family": "vex",
+"map": "0f38",
+"modrm": true,
+"modrm_mode": "register",
+"opcode": 205,
+"pp": "f2",
+"reg": null,
+"w": 0
+}
+],
+"VSHA512RNDS2": [
+{
+"family": "vex",
+"map": "0f38",
+"modrm": true,
+"modrm_mode": "register",
+"opcode": 203,
+"pp": "f2",
+"reg": null,
+"w": 0
+}
+],
 "VSHUFF32X4": [
 {
 "family": "evex",

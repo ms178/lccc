@@ -3,10 +3,6 @@
   "ice": [
     "__builtin_ia32_extracti128 -O0",
     "__builtin_ia32_extracti128 -O2",
-    "__builtin_ia32_set1_epi32 -O0",
-    "__builtin_ia32_set1_epi32 -O2",
-    "__builtin_ia32_set1_epi8 -O0",
-    "__builtin_ia32_set1_epi8 -O2",
     "__builtin_ia32_vpbroadcastb256 -O0",
     "__builtin_ia32_vpbroadcastb256 -O2",
     "__builtin_ia32_vpbroadcastd256 -O0",

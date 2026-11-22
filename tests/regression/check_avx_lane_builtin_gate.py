@@ -17,7 +17,7 @@ Cases cover:
   * the ISA gate: without -mavx every lane builtin is rejected (GCC: "target
     specific option mismatch" / undeclared). LCCC previously accepted them;
   * the immediate: selectors 0 and 1 are accepted, 2, -1 and a runtime value
-    are rejected ("the last argument must be an 1-bit immediate"). The same
+    are rejected ("the last argument must be a 1-bit immediate"). The same
     rule applies to the public _mm256_*f128_* macros, which reach the generic
     __lccc_simd helper path rather than the raw builtin; MACRO_CASES pins them;
   * AVX2 implies AVX, so -mavx2 accepts the AVX1 forms.

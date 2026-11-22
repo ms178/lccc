@@ -134,6 +134,16 @@ pub enum X86Feature {
     Rdrnd,
     Vaes,
     Vpclmulqdq,
+    /// SHA-NI: the SHA-1 and SHA-256 round and message-schedule instructions
+    /// (`sha1rnds4`, `sha1nexte`, `sha1msg1/2`, `sha256rnds2`, `sha256msg1/2`).
+    /// Its own CPUID bit (leaf 7, EBX bit 29) and its own `-msha` flag; SSE-
+    /// encoded, so it needs no vector class of its own.
+    Sha,
+    /// SHA-512: `vsha512msg1`, `vsha512msg2`, `vsha512rnds2` (VEX.256, 256-bit
+    /// operands). Its own CPUID bit (leaf 7 subleaf 1, EAX bit 0) and its own
+    /// `-msha512` flag. GCC 16.2 makes it imply AVX (VEX.256 needs AVX), not
+    /// AVX2, so `-mno-avx` removes it and `-mno-avx2` does not.
+    Sha512,
     /// AVX-VNNI: the VEX-encoded dot-product family, `vpdpbusd`/`vpdpbusds`/
     /// `vpdpwssd`/`vpdpwssds`.  Its own CPUID bit (leaf 7, EBX bit 4) and its
     /// own `-mavxvnni` flag; VEX-encoded, so it needs a vector class too.
@@ -188,7 +198,7 @@ pub enum X86Feature {
 
 impl X86Feature {
     /// Every tracked feature, for table-driven tests.
-    pub const ALL: [X86Feature; 46] = [
+    pub const ALL: [X86Feature; 48] = [
         X86Feature::Cmov,
         X86Feature::Fxsr,
         X86Feature::Mmx,
@@ -214,6 +224,8 @@ impl X86Feature {
         X86Feature::Rdrnd,
         X86Feature::Vaes,
         X86Feature::Vpclmulqdq,
+        X86Feature::Sha,
+        X86Feature::Sha512,
         X86Feature::AvxVnni,
         X86Feature::AvxVnniInt8,
         X86Feature::AvxVnniInt16,
@@ -265,6 +277,8 @@ impl X86Feature {
             X86Feature::Rdrnd => "rdrnd",
             X86Feature::Vaes => "vaes",
             X86Feature::Vpclmulqdq => "vpclmulqdq",
+            X86Feature::Sha => "sha",
+            X86Feature::Sha512 => "sha512",
             X86Feature::AvxVnni => "avxvnni",
             X86Feature::AvxVnniInt8 => "avxvnniint8",
             X86Feature::AvxVnniInt16 => "avxvnniint16",
@@ -323,6 +337,8 @@ impl X86Feature {
             "rdrnd" | "rdrand" => X86Feature::Rdrnd,
             "vaes" => X86Feature::Vaes,
             "vpclmulqdq" | "vpclmul" => X86Feature::Vpclmulqdq,
+            "sha" => X86Feature::Sha,
+            "sha512" => X86Feature::Sha512,
             "avxvnni" => X86Feature::AvxVnni,
             "avxvnniint8" => X86Feature::AvxVnniInt8,
             "avxvnniint16" => X86Feature::AvxVnniInt16,
@@ -473,7 +489,6 @@ mod tests {
     #[test]
     fn untracked_features_are_unknown() {
         for name in [
-            "sha",
             "sha_ni",
             "adx",
             "rdseed",
@@ -489,6 +504,13 @@ mod tests {
         ] {
             assert_eq!(X86Feature::parse(name), None, "{name} must not be tracked");
         }
+    }
+
+    /// `-msha` is a real target bit (SHA-NI); it must parse to the tracked
+    /// feature, not fall through to the untracked list.
+    #[test]
+    fn sha_is_a_tracked_feature() {
+        assert_eq!(X86Feature::parse("sha"), Some(X86Feature::Sha));
     }
 
     /// AVX-512 features are separate bits, so granting one subset cannot

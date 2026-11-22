@@ -663,7 +663,7 @@ impl I686Codegen {
                 if let Some(dptr) = dest_ptr {
                     self.operand_to_eax(&args[0]);
                     self.state.emit("    movdqu (%eax), %xmm0");
-                    let imm = Self::operand_to_imm_i64(&args[1]);
+                    let imm = Self::pinned_imm_i64(&args[1], "aeskeygenassist");
                     self.state
                         .emit_fmt(format_args!("    aeskeygenassist ${}, %xmm0, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
@@ -678,7 +678,7 @@ impl I686Codegen {
                     self.state.emit("    movdqu (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);
                     self.state.emit("    movdqu (%eax), %xmm1");
-                    let imm = Self::operand_to_imm_i64(&args[2]);
+                    let imm = Self::pinned_imm_i64(&args[2], "pclmulqdq");
                     self.state
                         .emit_fmt(format_args!("    pclmulqdq ${}, %xmm1, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
@@ -1081,6 +1081,66 @@ impl I686Codegen {
             }
 
             // Pblendvb (SSE4.1): args = (a, b, mask); mask implicit in %xmm0.
+            // SHA-NI (pointer form). Legacy-encoded; no VEX form exists.
+            IntrinsicOp::Sha1nexte128
+            | IntrinsicOp::Sha1msg1128
+            | IntrinsicOp::Sha1msg2128
+            | IntrinsicOp::Sha256msg1128
+            | IntrinsicOp::Sha256msg2128 => {
+                if let Some(dptr) = dest_ptr {
+                    let inst = match op {
+                        IntrinsicOp::Sha1nexte128 => "sha1nexte",
+                        IntrinsicOp::Sha1msg1128 => "sha1msg1",
+                        IntrinsicOp::Sha1msg2128 => "sha1msg2",
+                        IntrinsicOp::Sha256msg1128 => "sha256msg1",
+                        _ => "sha256msg2",
+                    };
+                    self.operand_to_eax(&args[0]);
+                    self.state.emit("    movdqu (%eax), %xmm0");
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    movdqu (%eax), %xmm1");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+            IntrinsicOp::Sha1rnds4128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.operand_to_eax(&args[0]);
+                    self.state.emit("    movdqu (%eax), %xmm0");
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    movdqu (%eax), %xmm1");
+                    assert!(
+                        matches!(args[2], Operand::Const(_)),
+                        "sha1rnds4 immediate must be a compile-time constant"
+                    );
+                    let imm = Self::operand_to_imm_i64(&args[2]);
+                    self.state
+                        .emit_fmt(format_args!("    sha1rnds4 ${}, %xmm1, %xmm0", imm));
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+            IntrinsicOp::Sha256rnds2128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.operand_to_eax(&args[2]);
+                    self.state.emit("    movdqu (%eax), %xmm0"); // WK (implicit)
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    movdqu (%eax), %xmm2"); // ABEF (src2)
+                    self.operand_to_eax(&args[0]);
+                    self.state.emit("    movdqu (%eax), %xmm1"); // CDGH (dst)
+                    self.state.emit("    sha256rnds2 %xmm0, %xmm2, %xmm1");
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movdqu %xmm1, (%eax)");
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
             IntrinsicOp::Pblendvb128 => {
                 if let Some(dptr) = dest_ptr {
                     self.operand_to_eax(&args[2]);
@@ -1100,7 +1160,7 @@ impl I686Codegen {
             // Pblendw (SSE4.1): _mm_blend_epi16(a, b, imm8) → pblendw $imm8, %xmm1, %xmm0.
             IntrinsicOp::Pblendw128 => {
                 if let Some(dptr) = dest_ptr {
-                    let imm = Self::operand_to_imm_i64(&args[2]);
+                    let imm = Self::pinned_imm_i64(&args[2], "pblendw");
                     self.operand_to_eax(&args[0]);
                     self.state.emit("    movdqu (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);
@@ -2679,6 +2739,44 @@ impl I686Codegen {
                 }
             }
 
+            // SHA-512 (VEX.256), pointer-result form. Operand roles match the
+            // x86-64 emitter exactly: msg1 reads its 16-byte operand at 16
+            // bytes (never 32); msg2 is 256 x 256; rnds2 takes CDGH in ymm0,
+            // ABEF in ymm1 and the 16-byte W+K in xmm2. The i686 lowering
+            // always supplies `dest_ptr` for a 256-bit result, so without these
+            // arms `-m32 -msha512` reached `reject_value_form` and ICE'd.
+            IntrinsicOp::Sha512msg1256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_avx_load(&args[0], "ymm0");
+                    self.emit_avx_load128(&args[1], "xmm1");
+                    self.state.emit("    vsha512msg1 %xmm1, %ymm0");
+                    self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+            IntrinsicOp::Sha512msg2256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_avx_load(&args[0], "ymm0");
+                    self.emit_avx_load(&args[1], "ymm1");
+                    self.state.emit("    vsha512msg2 %ymm1, %ymm0");
+                    self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+            IntrinsicOp::Sha512rnds2256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_avx_load(&args[0], "ymm0");
+                    self.emit_avx_load(&args[1], "ymm1");
+                    self.emit_avx_load128(&args[2], "xmm2");
+                    self.state.emit("    vsha512rnds2 %xmm2, %ymm1, %ymm0");
+                    self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
+
             // AVX-VNNI dot products (a, b, c) — 66/F2/F3/NP 0F38 pp forms.
             IntrinsicOp::Dpbusd128
             | IntrinsicOp::Dpbusds128
@@ -4248,5 +4346,55 @@ impl I686Codegen {
         for line in crate::backend::x86_common::avx1_splat_xmm_lines(lane, "xmm0", "ymm0") {
             self.state.emit(&line);
         }
+    }
+}
+
+#[cfg(test)]
+mod sha512_pointer_form_tests {
+    use super::*;
+
+    /// `-m32 -msha512` used to reach `reject_value_form` for every SHA-512
+    /// op: the lowering supplies `dest_ptr` for a 256-bit result, and the i686
+    /// emitter had no arm for these three ops. Each must emit its pointer form
+    /// with the x86-64 operand roles.
+    #[test]
+    fn sha512_ops_emit_pointer_form_on_i686() {
+        let cases: [(IntrinsicOp, usize, &str); 3] = [
+            (IntrinsicOp::Sha512msg1256, 2, "vsha512msg1 %xmm1, %ymm0"),
+            (IntrinsicOp::Sha512msg2256, 2, "vsha512msg2 %ymm1, %ymm0"),
+            (
+                IntrinsicOp::Sha512rnds2256,
+                3,
+                "vsha512rnds2 %xmm2, %ymm1, %ymm0",
+            ),
+        ];
+        for (op, arity, want) in cases {
+            let args: Vec<Operand> = (0..arity as u32)
+                .map(|i| Operand::Value(Value(i)))
+                .collect();
+            let mut cg = I686Codegen::new();
+            cg.emit_intrinsic_impl(&None, &op, &Some(Value(9)), &args);
+            assert!(
+                cg.state.out.buf.contains(want),
+                "{op:?} did not emit `{want}`: {}",
+                cg.state.out.buf
+            );
+        }
+    }
+
+    /// The value (SSA) form of a 256-bit SHA-512 result is still refused, not
+    /// silently dropped.
+    #[test]
+    fn sha512_value_form_is_refused_on_i686() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cg = I686Codegen::new();
+            cg.emit_intrinsic_impl(
+                &Some(Value(2)),
+                &IntrinsicOp::Sha512msg2256,
+                &None,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+            );
+        }));
+        assert!(result.is_err(), "i686 accepted the SHA-512 value form");
     }
 }

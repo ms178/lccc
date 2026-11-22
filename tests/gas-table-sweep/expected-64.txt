@@ -13,7 +13,7 @@
 rows 4848
 statements 31065
 assembled 18492
-same 15462
+same 15469
 foreign 41044
 refused 38848
 shorter vcmpfalse_oqps %ymm10, %ymm2, %ymm10
@@ -777,9 +777,6 @@ reject vrsqrt28ss 6 26140717
 reject vrsqrtbf16 5 88a1033f
 reject vrsqrtss 3 b44d775c
 reject vscalefbf16 2 daeb4732
-reject vsha512msg1 3 668c799f
-reject vsha512msg2 3 a9a45ec4
-reject vsha512rnds2 1 0d21524b
 reject vsm3msg1 3 b70a1ee7
 reject vsm3msg2 2 adf9238e
 reject vsm3rnds2 4 b773a8cb

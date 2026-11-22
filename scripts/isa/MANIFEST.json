@@ -44,6 +44,14 @@
     },
     {
       "repo": "intelxed/xed",
+      "path": "datafiles/sha512/sha512-isa.xed.txt",
+      "role": "SHA512MSG1/MSG2/RNDS2 (VEX.256, 0F38 pp=F2 W0)",
+      "sha256": "99968e58d50e74e5d5e84b862a7e06bfcd320466e4c11bbac86c5d840fc365e7",
+      "bytes": 1922,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
       "path": "datafiles/gfni-vaes-vpcl/gfni-sse-isa.xed.txt",
       "role": "GF2P8* SSE forms",
       "sha256": "e8b9a861e7e7bf58f421528b5324a2c577edc93de22836eed5e6554883266511",
@@ -339,6 +347,6 @@
       "license": "Apache-2.0"
     }
   ],
-  "classes": 1439,
-  "encodings": 4998
+  "classes": 1442,
+  "encodings": 5001
 }

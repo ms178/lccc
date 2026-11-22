@@ -2471,7 +2471,31 @@ impl InstructionEncoder {
             "cvtpd2dq" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xE6]),
 
             // SSE packed integer
+            // SHA-NI (same encodings as the x86-64 table; all NP, no 0x66).
+            // sha256rnds2 has an implicit third operand, %xmm0: accept the
+            // 2-operand spelling and the explicit leading %xmm0 form that the
+            // i686 codegen emits, exactly as the x86-64 encoder does.
             "sha1rnds4" => self.encode_sse_op_imm8(ops, &[0x0F, 0x3A, 0xCC]),
+            "sha1nexte" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xC8]),
+            "sha1msg1" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xC9]),
+            "sha1msg2" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCA]),
+            "sha256rnds2" => {
+                let ops_norm: &[Operand] = if ops.len() == 3 {
+                    match &ops[0] {
+                        Operand::Register(r) if r.name == "xmm0" => &ops[1..],
+                        _ => {
+                            return Err(
+                                "sha256rnds2: explicit first operand must be %xmm0".to_string()
+                            );
+                        }
+                    }
+                } else {
+                    ops
+                };
+                self.encode_sse_op(ops_norm, &[0x0F, 0x38, 0xCB])
+            }
+            "sha256msg1" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCC]),
+            "sha256msg2" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCD]),
             "mpsadbw" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x42]),
             "gf2p8affineqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCE]),
             "gf2p8affineinvqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCF]),

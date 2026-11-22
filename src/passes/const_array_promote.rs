@@ -106,6 +106,7 @@ use crate::common::types::IrType;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::module::{GlobalInit, IrGlobal, IrModule};
 use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator, Value};
+use crate::passes::vector_temp_promotion::{whole_vector_load, whole_vector_load_width};
 
 /// A store into a candidate array: `(byte_offset, width, constant)`.
 struct ByteStore {
@@ -188,6 +189,35 @@ fn addr_of(v: u32, alloca: u32, geps: &FxHashMap<u32, (u32, i64)>) -> Option<i64
     }
     match geps.get(&v) {
         Some(&(b, off)) if b == alloca => Some(off),
+        _ => None,
+    }
+}
+
+/// A full-width, unaligned-safe READ of memory through `args[0]`: the
+/// pointer value and the byte count read. Admitted forms are exactly the
+/// ones the vector passes already share as a width contract:
+/// `VecLoad*(p, 0)` (`whole_vector_load` / `whole_vector_load_width`) and
+/// `Loadu256(p)`. Any other intrinsic that mentions an address stays a
+/// rejection (its memory effect is not proven here).
+fn whole_read(inst: &Instruction) -> Option<(u32, usize)> {
+    let Instruction::Intrinsic {
+        op,
+        dest_ptr: None,
+        args,
+        ..
+    } = inst
+    else {
+        return None;
+    };
+    match args.as_slice() {
+        [Operand::Value(p), Operand::Const(off)]
+            if whole_vector_load(*op) && off.to_i64() == Some(0) =>
+        {
+            Some((p.0, whole_vector_load_width(*op)?))
+        }
+        [Operand::Value(p)] if *op == crate::ir::intrinsics::IntrinsicOp::Loadu256 => {
+            Some((p.0, 32))
+        }
         _ => None,
     }
 }
@@ -682,6 +712,30 @@ fn audit_candidates(
                         }
                     }
                 }
+                // A full-width whole-register read of the object's image is
+                // a read like any load, provided its byte range lies inside
+                // the object. The stored bytes tile the whole object, so
+                // the read sees exactly the folded image.
+                _ if whole_read(inst).is_some() => {
+                    let (p, width) = whole_read(inst).unwrap_or((0, 0));
+                    if let Some(ts) = touches.get(&p) {
+                        for &a in ts {
+                            let size = allocas[&a].0;
+                            match addr_of(p, a, &geps) {
+                                Some(off)
+                                    if off >= 0 && (off as usize).saturating_add(width) <= size =>
+                                {
+                                    use_blocks.entry(a).or_default().push(bi);
+                                    read_sites.entry(a).or_default().push((bi, ii));
+                                    read_uses.insert(a);
+                                }
+                                _ => {
+                                    bad.insert(a);
+                                }
+                            }
+                        }
+                    }
+                }
                 Instruction::Call { func: callee, info } => {
                     for (pos, arg) in info.args.iter().enumerate() {
                         if let Operand::Value(v) = arg {
@@ -744,6 +798,11 @@ fn audit_candidates(
                             ok.insert(v.0);
                         }
                     }
+                }
+                // The whole-register read's pointer: audited by the arm above
+                // (its byte range is checked there), not by the catch-all.
+                _ if whole_read(inst).is_some() => {
+                    ok.insert(whole_read(inst).map_or(0, |(p, _)| p));
                 }
                 Instruction::Select {
                     true_val,
@@ -920,6 +979,17 @@ fn apply_one(func: &mut IrFunction, a: u32, global_name: &str) {
     // the entry-block insertion dominates every use.
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
+            // Whole-register reads admitted by `whole_read`: the pointer is
+            // `args[0]`; the displacement operand is a constant. Checked
+            // before the match because the predicate needs a shared borrow.
+            if whole_read(inst).is_some_and(|(p, _)| p == a) {
+                if let Instruction::Intrinsic { args, .. } = inst {
+                    if let Some(Operand::Value(v)) = args.first_mut() {
+                        *v = addr;
+                    }
+                }
+                continue;
+            }
             match inst {
                 Instruction::Load { ptr, .. } => {
                     if ptr.0 == a {

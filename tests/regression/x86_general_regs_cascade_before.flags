@@ -1,0 +1,1 @@
+-mavx -mno-sse2 -mgeneral-regs-only

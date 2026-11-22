@@ -1632,6 +1632,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
     matches!(
         op,
         O::Pblendvb128
+            | O::Sha256rnds2128
             | O::Pblendw128
             | O::Loadldi128
             | O::Storeldi128

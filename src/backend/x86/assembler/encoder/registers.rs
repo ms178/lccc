@@ -724,6 +724,9 @@ fn is_mixed_width_mnemonic(m: &str) -> bool {
             "vbroadcast",
             "vpbroadcast",
             "vmovmsk",
+            // SHA-512 (VEX.256): the xmm source of msg1/rnds2 is deliberately narrower
+            // than the ymm destination. check_sha512_operands checks each operand width.
+            "vsha512",
             "vperm",
             "vpsll",
             "vpsrl",
@@ -1442,7 +1445,7 @@ mod mixed_width_tests {
         "movs", "movz", "movbe", "cvt", "vcvt", "pmov", "vpmov", "pinsr", "pextr", "vpinsr",
         "vpextr", "extractps", "vextractps", "insertps", "vinsertps", "vextract", "vinsert",
         "vbroadcast", "vpbroadcast", "broadcast", "kmov", "movmsk", "vmovmsk", "crc32", "shld",
-        "shrd", "vperm", "vpsll", "vpsrl", "vpsra", "psll", "psrl", "psra", "vgather",
+        "shrd", "vsha512", "vperm", "vpsll", "vpsrl", "vpsra", "psll", "psrl", "psra", "vgather",
         "vpgather", "vscatter", "vpscatter", "in", "out", "vzero", "enter", "lar", "lsl",
         "lgdt", "lidt", "sgdt", "sidt", "lldt", "sldt", "ltr", "str", "lmsw", "smsw", "verr",
         "verw", "vmread", "vmwrite", "vcmp", "cmpp", "cmps", "vdpp", "dpp", "vround", "round",
