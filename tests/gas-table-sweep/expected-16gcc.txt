@@ -13,7 +13,7 @@
 rows 4848
 statements 29672
 assembled 16771
-same 13456
+same 13470
 reject aadd 6 d4837a9f
 reject aand 6 8b99008a
 reject adcx 6 80c9a4f1
@@ -696,9 +696,6 @@ reject vrsqrt28ss 6 7cd8fb45
 reject vrsqrtbf16 5 da77094d
 reject vrsqrtss 6 c0e8b29b
 reject vscalefbf16 4 1cbe78a1
-reject vsha512msg1 4 d6af1e88
-reject vsha512msg2 4 6cdf0ee3
-reject vsha512rnds2 6 620a9db7
 reject vsm3msg1 6 8b35ad6f
 reject vsm3msg2 6 c0cce859
 reject vsm3rnds2 6 4232e2f0
