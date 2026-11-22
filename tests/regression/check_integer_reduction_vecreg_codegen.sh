@@ -74,7 +74,8 @@ if new_round_trips + 8 > old_round_trips:
         f"AVX2: expected at least eight fewer vector stack round-trips "
         f"({new_round_trips} vs {old_round_trips})"
     )
-if not re.search(r"vpxor %ymm([2-9]|1[0-5]), %ymm\1, %ymm\1", avx):
+# (Written on the %xmm register of the home: that clears all of the %ymm one.)
+if not re.search(r"vpxor %([xy])mm([2-9]|1[0-5]), %\1mm\2, %\1mm\2", avx):
     raise SystemExit("AVX2: zero producer did not initialize an assigned YMM home directly")
 
 # Forced SSE2 exercises the 128-bit class and register-aware horizontal load.

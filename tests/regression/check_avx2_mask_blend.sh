@@ -54,7 +54,10 @@ for level in -O1 -O2; do
     # No per-byte/per-lane work beside them.
     for fn in mask_of blend_a5 blend_00 blend_ff blend_55; do
         body_of "$ASM" "$fn" > "$WORK/body.s"
-        n=$(grep -cE '^[[:space:]]+(vmov(ss|sd|q|d)|movzbl|movsbl)[[:space:]]' "$WORK/body.s")
+        # (`vmovd %xmm0, %eax` is the fixture's own read of element 0 of the
+        # result -- `vextractps $0, %xmm0, %eax`, written the short way.)
+        n=$(grep -E '^[[:space:]]+(vmov(ss|sd|q|d)|movzbl|movsbl)[[:space:]]' "$WORK/body.s" \
+            | grep -cvE '^[[:space:]]+vmovd[[:space:]]+%xmm[0-9]+, %(e[a-z]+|r[0-9]+d)[[:space:]]*$' || true)
         if [ "$n" -ne 0 ]; then
             bad "$level: $fn still moves $n byte/lane(s) individually"
         fi

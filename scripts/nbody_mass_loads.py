@@ -30,8 +30,10 @@ GP_OPS = {prefix + suffix for prefix in ('mov','lea','add','sub','cmp','test','x
 SIMD = {prefix + suffix for prefix in ('add','sub','mul','div','sqrt','min','max','xor','and','or','ucomi','comi','cvt','round') for suffix in ('ss','sd','ps','pd')}
 SIMD |= {prefix + suffix for prefix in ('fmadd132','fmadd213','fmadd231','fmsub132','fmsub213','fmsub231','fnmadd132','fnmadd213','fnmadd231','fnmsub132','fnmsub213','fnmsub231') for suffix in ('ss','sd','ps','pd')}
 SIMD |= {'pshufd','pshufhw','pshuflw','shufpd','shufps','unpcklpd','unpckhpd','punpcklqdq','punpckhqdq','pxor','pand','por','paddq','psubq','paddd','psubd'}
+# Between registers `unpcklpd` is written `movlhps`: the same halves, no prefix byte.
+SIMD |= {'movlhps', 'movhlps'}
 MEM = re.compile(r"^([^()]*)\(%(\w+)(?:,\s*%(\w+)(?:,\s*([1248]))?)?\)$")
-MOV = re.compile(r"^v?mov(?:sd|ss|upd|aps|apd|ups|dqu|dqa|q|l|w|b|d|ddup|dqu[0-9]+|dqa[0-9]+)$")
+MOV = re.compile(r"^v?mov(?:sd|ss|upd|aps|apd|ups|lps|hps|lpd|hpd|dqu|dqa|q|l|w|b|d|ddup|dqu[0-9]+|dqa[0-9]+)$")
 CC = r'(?:a|ae|b|be|c|e|z|g|ge|l|le|na|nae|nb|nbe|nc|ne|nz|ng|nge|nl|nle|no|np|ns|o|p|pe|po|s)'
 PURE_FLOW = re.compile(rf'^(?:j{CC}|j(?:mp|cxz|ecxz|rcxz)|cmov{CC}[wlq]?|set{CC}|nop[lwq]?)$')
 CALLER_SAVED = {'rax', 'rcx', 'rdx', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11'}
@@ -195,7 +197,8 @@ def width(mn, ops):
             return 64
         if any('%ymm' in op for op in ops):
             return 32
-    if mn.endswith('sd') or mn in ('movlpd', 'movhpd', 'vmovlpd', 'vmovhpd', 'movq', 'vmovq', 'movddup', 'vmovddup', 'vbroadcastsd', 'vpbroadcastq'):
+    if mn.endswith('sd') or mn in ('movlpd', 'movhpd', 'vmovlpd', 'vmovhpd', 'movlps', 'movhps', 'vmovlps', 'vmovhps',
+                                   'movq', 'vmovq', 'movddup', 'vmovddup', 'vbroadcastsd', 'vpbroadcastq'):
         return 8
     if mn.endswith('ss') or mn in ('movl', 'movd', 'vmovd'):
         return 4
