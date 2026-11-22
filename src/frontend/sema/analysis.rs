@@ -10112,13 +10112,73 @@ dereference it before applying '->' to it?"
         is_array
     }
 
+    /// Is `target` the selection of a BIT-FIELD member (through `.`, `->`, or
+    /// a statement-expression/parenthesized wrapper around either)?
+    ///
+    /// GCC 16.2 demotes the const-bitfield violation to a WARNING ("assignment
+    /// of read-only location 'v.f'", measured: `-Werror` is what makes it an
+    /// error, so it carries a `[-Werror]` tag rather than a warning option,
+    /// and plain `-std=c11 -pedantic-errors` still only warns) while a
+    /// const-qualified OBJECT of the same record is a hard constraint
+    /// violation.  This predicate is what splits those two contracts.
+    fn is_bitfield_member_target(&self, target: &Expr) -> bool {
+        let (base, field, indirect) = match target {
+            Expr::MemberAccess(base, field, _) => (Some(base), field.as_str(), false),
+            Expr::PointerMemberAccess(base, field, _) => (Some(base), field.as_str(), true),
+            _ => (None, "", false),
+        };
+        let Some(base) = base else {
+            return false;
+        };
+        let Some(CType::Struct(key) | CType::Union(key)) =
+            self.member_base_ctype(base, indirect)
+        else {
+            return false;
+        };
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        layouts
+            .get(key.as_ref())
+            .and_then(|layout| layout.field_offset_with_bitfield(field, &*layouts))
+            .is_some_and(|(_, _, _, bit_width)| bit_width.is_some())
+    }
+
     /// Emit GCC 16.2's read-only diagnostic for a mutation whose operand
     /// fails [`Self::lvalue_readonly`]. `verb` is the measured GCC word:
     /// `assignment` for `=`/`op=`, `increment` for pre/postfix `++`, and
     /// `decrement` for `--`, each pairing with one of the three operand
     /// classes (variable / location / member in read-only object).
+    ///
+    /// Constness is a property of an LVALUE, so the not-an-lvalue verdict
+    /// that [`Self::check_lvalue_operand`] already emitted (`f() = x`,
+    /// `(a, b) = x`, `(c ? v : w) = x`) suppresses this second, nonsensical
+    /// diagnostic: `assignment of read-only location 'f()'` named a value
+    /// that can never be assigned at all, and GCC reports only the first.
+    ///
+    /// Severity is part of the contract, not an afterthought: a general
+    /// const-lvalue violation is a constraint violation (error), but GCC only
+    /// WARNS for a const bit-field, and the operand-class wordings differ
+    /// too (`read-only location 'v.f'`, never `read-only member 'f'`).
     fn check_readonly_mutation(&self, target: &Expr, op_span: Span, verb: &str) {
-        if !self.lvalue_readonly(target) {
+        if self.is_known_rvalue(target, false) || !self.lvalue_readonly(target) {
+            return;
+        }
+        if self.is_bitfield_member_target(target) {
+            // Measured on GCC 16.2.0: `warning: assignment of read-only
+            // location 'v.f'` at default, `-Wall`, `-Wextra -pedantic` and
+            // `-std=c11 -pedantic-errors`; only `-Werror` promotes it.  The
+            // location text is the source spelling, so it uses the same
+            // renderer as every other location-class message.
+            //
+            // The message is rendered BEFORE the engine is borrowed mutably:
+            // `readonly_location_text` re-enters `self.diagnostics.borrow()`
+            // for the source manager, and evaluating it inside the `warning`
+            // argument list would panic on an already-mutably-borrowed
+            // RefCell (the same invariant every other site follows).
+            let message = format!(
+                "{verb} of read-only location '{}'",
+                self.readonly_location_text(target)
+            );
+            self.diagnostics.borrow_mut().warning(message, op_span);
             return;
         }
         let message = match target {

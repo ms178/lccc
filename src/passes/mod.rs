@@ -2162,8 +2162,21 @@ pub(crate) fn run_passes(
         // cannot be attributed to a pass (the verifier only ever saw the
         // module after the final FMA peel). Both are no-ops unless the
         // corresponding environment variable is set.
+        // The checkpoint also carries the -O1 tier's per-pass timing, so
+        // `CCC_TIME_PASSES=1` attributes a slow compile to a pass instead of
+        // leaving one opaque "o1 mem2reg" line (the -O2+ tiers time every pass
+        // through the iter= log).  The timer is only armed under the env var.
+        let mut o1_pass_start = time_passes.then(std::time::Instant::now);
         macro_rules! o1_checkpoint {
             ($name:expr_2021) => {
+                if let Some(start) = o1_pass_start.as_mut() {
+                    lccc::cli::stderr_line(format_args!(
+                        "[PASS] o1 {}: {:.4}s",
+                        $name,
+                        start.elapsed().as_secs_f64()
+                    ));
+                    *start = std::time::Instant::now();
+                }
                 if dump_each_pass {
                     dump_ir_filtered(module, &format!("O1 {}", $name));
                 }

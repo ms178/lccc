@@ -285,6 +285,17 @@ pub(super) fn reuse_ebb_copies_and_flags(store: &mut LineStore, infos: &mut [Lin
 /// editable (`all_editable`, no volatile protection).
 pub(super) fn sink_copies_into_fallthrough(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let (mentions, duplicate) = label_mention_counts(store, infos);
+    // `local_label -> first defining line`, built once (see the target-line
+    // lookup inside the loop).
+    let mut first_def: FxHashMap<u32, usize> = FxHashMap::default();
+    for (i, info) in infos.iter().enumerate() {
+        if info.kind == LineKind::Label
+            && !info.is_nop()
+            && let Some(l) = local_label(label_text(info.trimmed(store.get(i))))
+        {
+            first_def.entry(l).or_insert(i);
+        }
+    }
     let mut liveness: Option<FileLiveness> = None;
     let mut changed = false;
     let len = store.len();
@@ -320,10 +331,26 @@ pub(super) fn sink_copies_into_fallthrough(store: &mut LineStore, infos: &mut [L
             break;
         }
         // The target label's line, for the liveness query.
-        let target_line = (j + 1..len).find(|&n| {
-            infos[n].kind == LineKind::Label
-                && local_label(label_text(infos[n].trimmed(store.get(n)))) == Some(target)
-        });
+        //
+        // O(1) through `first_def`, which is built once for the whole file.
+        // The previous formulation scanned `j+1..len` for EVERY conditional
+        // branch: on a wide `switch` the arms sit in one run, so arm `i`
+        // walked O(arms) lines to reach its own label -- quadratic, and the
+        // single largest cost of the whole backend on a 16k-arm switch
+        // (5.0 s of a 6 s compile, measured with `CCC_TIME_PEEPHOLE=1`).
+        // `first_def` maps a label to its FIRST definition; that is exactly
+        // the answer whenever the first definition follows the branch, which
+        // is the only case the old search could return for a well-formed
+        // file.  A label already defined at or before the branch keeps the
+        // original scan, so the results are identical even for the
+        // (invalid, but tolerated) duplicated-label input.
+        let target_line = match first_def.get(&target).copied() {
+            Some(first) if first > j => Some(first),
+            _ => (j + 1..len).find(|&n| {
+                infos[n].kind == LineKind::Label
+                    && local_label(label_text(infos[n].trimmed(store.get(n)))) == Some(target)
+            }),
+        };
         let (true, Some(target_line)) = (clean_fallthrough, target_line) else {
             j += 1;
             continue;

@@ -351,16 +351,25 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     // entries are all rewritable jumps (P can jump to the canonical and
     // fall through into the duplicate, making both pred sets {P}).
     let mut fallthrough_entries: FxHashSet<String> = FxHashSet::default();
+    // `start -> block index` index: the previous formulation rescanned every
+    // block for every block (`O(B^2)`, and on a wide `switch` B is the number
+    // of arm blocks).  Blocks are disjoint and in source order, so at most
+    // ONE block can end at a given start; the index makes the predecessor
+    // lookup a single hash hit with identical results.  `entry().or_insert`
+    // keeps the FIRST claimant if a degenerate input ever produced two, which
+    // is exactly what the old first-match `if blocks[xi].1 == b_start` did.
+    let mut block_starting_at: FxHashMap<usize, usize> = FxHashMap::default();
+    for (xi, b) in blocks.iter().enumerate() {
+        block_starting_at.entry(b.0).or_insert(xi);
+    }
     for bi in 0..blocks.len() {
         let b_start = blocks[bi].0;
         let b_label = blocks[bi].2.clone();
-        // Only one block can end at b_start (the immediately preceding one), but
-        // check all blocks for safety.
-        for xi in 0..blocks.len() {
+        if let Some(&xi) = block_starting_at.get(&b_start) {
             if xi == bi {
                 continue;
             }
-            if blocks[xi].1 == b_start {
+            {
                 // X immediately precedes B.
                 match block_terminator[xi] {
                     LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret => {
@@ -384,13 +393,17 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     // predecessor AND a fall-through entry (the edge cannot be rewritten).
     {
         let mut seen_func: FxHashSet<u32> = FxHashSet::default();
+        // `O(1)` membership for "some block ends exactly here".  The old
+        // `blocks.iter().any(|..| pe == start)` rescanned every block once per
+        // function — quadratic in the block count on a wide `switch`.
+        let block_ends: FxHashSet<usize> = blocks.iter().map(|b| b.1).collect();
         for &(start, _, ref bl, fid) in &blocks {
             if !seen_func.insert(fid) {
                 continue;
             }
             // Only when no real block immediately precedes it (a same-function
             // predecessor is handled by the loop above).
-            let preceded_by_block = blocks.iter().any(|&(_ps, pe, _, _)| pe == start);
+            let preceded_by_block = block_ends.contains(&start);
             if preceded_by_block {
                 continue;
             }
@@ -529,13 +542,14 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         let has_explicit_exit =
             matches!(term, LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret);
         if !has_explicit_exit {
-            // Find the block that starts exactly where this block ends.
+            // Find the block that starts exactly where this block ends, in
+            // O(1) through the same start index built above (the old inner
+            // scan made this quadratic in the block count).
             let end_pos = blocks[bi].1;
-            for x in 0..blocks.len() {
-                if x != bi && blocks[x].0 == end_pos {
-                    fallthrough[bi] = Some(blocks[x].2.clone());
-                    break;
-                }
+            if let Some(&x) = block_starting_at.get(&end_pos)
+                && x != bi
+            {
+                fallthrough[bi] = Some(blocks[x].2.clone());
             }
         }
     }
@@ -548,6 +562,13 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     let mut flag_dep = vec![false; nblocks];
     let mut clean = vec![false; nblocks];
     let mut preds_clean = vec![false; nblocks];
+    // `clean` is a property of ONE block, but it was recomputed for every
+    // PREDECESSOR edge: with E predecessor edges the old code re-walked a
+    // block's lines up to E times — the last quadratic path in this pass on a
+    // wide `switch` (every arm shares the enclosing blocks as predecessors).
+    // Memoise the per-block verdict; the walk itself is unchanged, so the
+    // pass makes exactly the same decisions in O(lines + edges).
+    let mut block_clean_memo: Vec<Option<bool>> = vec![None; nblocks];
     for bi in 0..nblocks {
         let (bs, be, ref bl, _) = blocks[bi];
         flag_dep[bi] = block_is_flag_dependent(store, infos, bs, be);
@@ -560,12 +581,21 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
         ) || fallthrough[bi].is_some();
         clean[bi] = exit_known && block_is_clean(store, infos, bs, be);
+        block_clean_memo[bi] = Some(clean[bi]);
         let mut all_clean = true;
         if let Some(pset) = preds.get(bl) {
             for pl in pset {
                 if let Some(&pidx) = label_to_bidx.get(pl) {
-                    let (ps, pe, _, _) = blocks[pidx];
-                    if !block_is_clean(store, infos, ps, pe) {
+                    let is_clean = match block_clean_memo[pidx] {
+                        Some(v) => v,
+                        None => {
+                            let (ps, pe, _, _) = blocks[pidx];
+                            let v = block_is_clean(store, infos, ps, pe);
+                            block_clean_memo[pidx] = Some(v);
+                            v
+                        }
+                    };
+                    if !is_clean {
                         all_clean = false;
                         break;
                     }
