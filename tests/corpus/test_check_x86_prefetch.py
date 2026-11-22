@@ -170,6 +170,16 @@ class TheFixture(unittest.TestCase):
         self.assertNotIn("_m_prefetchw", self.text)
 
 
+class NoCLibrary(unittest.TestCase):
+    def test_the_gates_own_stdlib_stands_in_front_of_the_systems(self):
+        source = Path("/somewhere/prefetch.c")
+        self.assertEqual(gate.hermetic(source), ["-isystem", "/somewhere/include"])
+
+    def test_it_declares_what_mm_malloc_uses(self):
+        for name in ("size_t", "NULL", "malloc", "free"):
+            self.assertIn(name, gate.STDLIB)
+
+
 class TheFirstError(unittest.TestCase):
     def test_the_line_with_the_error_is_the_message(self):
         said = "In file included from a.c:1:\nx.h:3:1: error: unknown type name 'foo'\n  3 | foo\n"

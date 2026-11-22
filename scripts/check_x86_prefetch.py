@@ -37,6 +37,11 @@ The selectors GCC refuses are compared too: a prefetch of code with a
 locality it has no instruction for (`_mm_prefetch(p, 16)`) is an error in
 both, and a hint that is no constant is one in both.
 
+The fixtures need no C library, and the gate does not ask for one: GCC's
+`<xmmintrin.h>` reads `<stdlib.h>` for `_mm_malloc`, which for a 32-bit
+target is a header only a multilib installation has. Both compilers are
+given a `<stdlib.h>` of four lines in front of the system's.
+
 Usage: check_x86_prefetch.py LCCC [--gcc GCC] [--lccc-i686 LCCC_I686] [-v]
 Exit status is the number of failing rows (0 = clean).
 """
@@ -199,6 +204,10 @@ VISIBLE = ("#include <xmmintrin.h>\n"
              "&& _MM_HINT_NTA == 0 && _MM_HINT_ET0 == 7 && _MM_HINT_RST2 == 9 "
              "&& _MM_HINT_IT0 == 19 && _MM_HINT_IT1 == 18, \"GCC 16.2's values\");\n")
 
+# What GCC's <mm_malloc.h> needs of <stdlib.h>.
+STDLIB = ("typedef __SIZE_TYPE__ size_t;\n#define NULL ((void *)0)\n"
+          "void *malloc(size_t);\nvoid free(void *);\n")
+
 PREFETCH = re.compile(r"^\s+(prefetch[a-z0-9]*)\b", re.M)
 LABEL = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):", re.M)
 
@@ -220,9 +229,14 @@ def prefetches_of(assembly: str, names: list[str]) -> dict[str, list[str]]:
     return found
 
 
+def hermetic(source: Path) -> list[str]:
+    """The options that put the gate's own <stdlib.h> in front of the system's."""
+    return ["-isystem", str(source.parent / "include")]
+
+
 def assembly_of(compiler: list[str], flags: list[str], source: Path) -> tuple[str | None, str]:
-    result = subprocess.run([*compiler, "-O2", "-w", *flags, "-S", str(source), "-o", "-"],
-                            capture_output=True, text=True, env=ENV)
+    result = subprocess.run([*compiler, "-O2", "-w", *flags, *hermetic(source), "-S", str(source),
+                             "-o", "-"], capture_output=True, text=True, env=ENV)
     return (result.stdout if result.returncode == 0 else None), result.stderr
 
 
@@ -245,8 +259,8 @@ def differences(reference: dict[str, list[str]], ours: dict[str, list[str]]) -> 
 
 
 def diagnostics_of(compiler: list[str], source: Path) -> tuple[int, str]:
-    result = subprocess.run([*compiler, "-O2", "-c", str(source), "-o", os.devnull],
-                            capture_output=True, text=True, env=ENV)
+    result = subprocess.run([*compiler, "-O2", *hermetic(source), "-c", str(source), "-o",
+                             os.devnull], capture_output=True, text=True, env=ENV)
     return result.returncode, result.stderr
 
 
@@ -287,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
         source.write_text(text)
         write_source = Path(directory) / "prefetchw.c"
         write_source.write_text(WRITE_FIXTURE)
+        (Path(directory) / "include").mkdir()
+        (Path(directory) / "include" / "stdlib.h").write_text(STDLIB)
 
         def examine(row, fixture_source: Path, functions: list[str]):
             """(error or None, what GCC selects, whether 3DNow! would change it,
