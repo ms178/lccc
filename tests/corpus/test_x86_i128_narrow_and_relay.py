@@ -422,7 +422,9 @@ class PairRelayShape(Base):
         moves = [line for line in body.splitlines() if "%xmm" in line]
         self.assertEqual(len(moves), 2, body)
         self.assertRegex(moves[0], r"^movdqu \(%r\w+\), %xmm0$")
-        self.assertRegex(moves[1], r"^movdqu %xmm0, \(%r\w+\)$")
+        # (The store is written `movups`, as GCC writes it: the same
+        # sixteen bytes stored, one prefix byte less.)
+        self.assertRegex(moves[1], r"^movups %xmm0, \(%r\w+\)$")
 
     def test_no_function_reads_16_bytes_across_two_8_byte_stores(self) -> None:
         for opt in ("-O1", "-O2", "-O3"):
