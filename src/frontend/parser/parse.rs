@@ -956,6 +956,13 @@ pub struct Parser {
     /// Tags of the records defined with GNU `unused`, for the tag-only
     /// references that follow. Keyed like `struct_tag_alignments`.
     pub(super) unused_record_tags: FxHashSet<String>,
+    /// Memo for [`Self::type_spec_has_enum_tag`], keyed by a record
+    /// definition's `(file_id, start)` span.  The old un-memoised walker
+    /// re-traversed the full nested-record subtree at every level of
+    /// `struct { struct { ... } }` depth -- quadratic in the nesting depth
+    /// (limits-structnest.c: 10k levels).  Each record definition computes
+    /// its enum-containment exactly once.
+    pub(super) record_has_enum_cache: FxHashMap<(u32, u32), bool>,
     /// Typedef names whose objects GCC never reports as unused: the typedef
     /// carries `unused`, or names such a record or typedef directly. Scoped
     /// with the other typedef state.
@@ -1155,6 +1162,7 @@ impl Parser {
             deferred_static_asserts: Vec::new(),
             struct_tag_alignments: FxHashMap::default(),
             unused_record_tags: FxHashSet::default(),
+            record_has_enum_cache: FxHashMap::default(),
             typedef_unused: FxHashSet::default(),
         }
     }

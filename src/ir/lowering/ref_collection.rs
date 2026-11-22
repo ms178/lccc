@@ -11,7 +11,7 @@ use super::lower::Lowerer;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Declaration, Expr, ExternalDecl, ForInit, FunctionDef, Initializer,
-    Stmt, TranslationUnit,
+    Label, Stmt, TranslationUnit,
 };
 use std::collections::VecDeque;
 
@@ -206,13 +206,22 @@ impl Lowerer {
                 }
                 self.collect_refs_from_stmt(body, refs);
             }
-            Stmt::While(_, body, _)
-            | Stmt::DoWhile(body, ..)
-            | Stmt::Switch(_, body, _)
-            | Stmt::Case(_, body, _)
-            | Stmt::CaseRange(_, _, body, _)
-            | Stmt::Default(body, _)
-            | Stmt::Label(_, body, _) => self.collect_refs_from_stmt(body, refs),
+            Stmt::While(_, body, _) | Stmt::DoWhile(body, ..) | Stmt::Switch(_, body, _) => {
+                self.collect_refs_from_stmt(body, refs)
+            }
+            Stmt::Labeled(run, _) => {
+                for label in &run.labels {
+                    match label {
+                        Label::Case(expr, _) => self.collect_refs_from_expr(expr, refs),
+                        Label::CaseRange(low, high, _) => {
+                            self.collect_refs_from_expr(low, refs);
+                            self.collect_refs_from_expr(high, refs);
+                        }
+                        Label::Default(_) | Label::Name(..) => {}
+                    }
+                }
+                self.collect_refs_from_stmt(&run.body, refs);
+            }
             Stmt::Declaration(decl) => self.collect_refs_from_declaration(decl, refs),
             Stmt::Expr(_)
             | Stmt::Return(..)

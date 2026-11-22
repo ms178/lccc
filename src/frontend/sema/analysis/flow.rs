@@ -6,7 +6,7 @@
 //! before the first matching label. This is diagnostic analysis, not an IR
 //! optimization or a replacement for expression evaluation/type checking.
 use super::{BinOp, BlockItem, CompoundStmt, Expr, FxHashMap, SemanticAnalyzer, Stmt};
-use crate::frontend::parser::ast::ForInit;
+use crate::frontend::parser::ast::{ForInit, Label};
 
 type NodeId = usize;
 const END: NodeId = 0;
@@ -206,24 +206,25 @@ impl<'a, 's> Graph<'a, 's> {
                 let dispatch = self.node(Node::Dispatch(cases));
                 self.expr(selector, dispatch)
             }
-            Stmt::Case(_, body, _) | Stmt::CaseRange(_, _, body, _) | Stmt::Default(body, _) => {
-                let entry = self.stmt(body, next, &[]);
-                if let Some(dispatch) = self.switches.last_mut() {
-                    dispatch.cases.push(entry);
-                    dispatch.has_default |= matches!(stmt, Stmt::Default(..));
-                }
-                entry
-            }
-            Stmt::Label(..) => {
-                let mut labels = Vec::new();
-                let mut inner = stmt;
-                while let Stmt::Label(name, body, _) = inner {
-                    labels.push(name.as_str());
-                    inner = body;
-                }
-                let entry = self.stmt(inner, next, &labels);
-                for label in labels {
-                    self.labels.insert(label, entry);
+            Stmt::Labeled(run, _) => {
+                // Only the trailing `name:` labels (after the last
+                // `case`/`default`) wrap the body directly and can name it
+                // as a `break`/`continue` target — the exact reachability
+                // the nested-label chain had.
+                let names: Vec<&str> = run.trailing_names().map(|(n, _)| n).collect();
+                let entry = self.stmt(&run.body, next, &names);
+                for label in &run.labels {
+                    match label {
+                        Label::Case(..) | Label::CaseRange(..) | Label::Default(..) => {
+                            if let Some(dispatch) = self.switches.last_mut() {
+                                dispatch.cases.push(entry);
+                                dispatch.has_default |= matches!(label, Label::Default(..));
+                            }
+                        }
+                        Label::Name(name, _) => {
+                            self.labels.insert(name.as_str(), entry);
+                        }
+                    }
                 }
                 entry
             }

@@ -147,16 +147,27 @@ pub fn build_cfg(
     let mut pred_counts: Vec<u32> = vec![0; n];
     // (source, target) of every resolved edge, in visit order.
     let mut edges: Vec<(u32, u32)> = Vec::with_capacity(n * 2);
+    // Successor deduplication by EPOCH STAMP instead of a scan of the open
+    // row.  `stamp[t] == i` means "block i already has target t in its
+    // successor row"; block indices are visited in increasing order, so the
+    // stamp is unambiguous and needs no clearing.  The previous
+    // `succ_data[row_start..].contains(&t)` was O(row) per edge — quadratic
+    // on a `Switch` with many distinct case blocks (gcc.c-torture's
+    // limits-caselabels.c: 100k case labels → 100k-edge successor row →
+    // measured n^1.86 compile scaling).  This is O(1) per edge with the
+    // exact same successor-row semantics: duplicate-free, source-arm order.
+    let mut succ_seen_stamp: Vec<u32> = vec![u32::MAX; n];
 
     for (i, block) in func.blocks.iter().enumerate() {
         let i32v = i as u32;
-        let row_start = succ_data.len();
         let push_edge = |succ_data: &mut Vec<u32>,
                          edges: &mut Vec<(u32, u32)>,
                          pred_counts: &mut Vec<u32>,
+                         succ_seen_stamp: &mut Vec<u32>,
                          t: usize| {
             let t32 = t as u32;
-            if !succ_data[row_start..].contains(&t32) {
+            if succ_seen_stamp[t] != i32v {
+                succ_seen_stamp[t] = i32v;
                 succ_data.push(t32);
             }
             edges.push((i32v, t32));
@@ -165,7 +176,13 @@ pub fn build_cfg(
         match &block.terminator {
             Terminator::Branch(label) => {
                 if let Some(&t) = label_to_idx.get(label) {
-                    push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
+                    push_edge(
+                        &mut succ_data,
+                        &mut edges,
+                        &mut pred_counts,
+                        &mut succ_seen_stamp,
+                        t,
+                    );
                 }
             }
             Terminator::CondBranch {
@@ -174,10 +191,22 @@ pub fn build_cfg(
                 ..
             } => {
                 if let Some(&t) = label_to_idx.get(true_label) {
-                    push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
+                    push_edge(
+                        &mut succ_data,
+                        &mut edges,
+                        &mut pred_counts,
+                        &mut succ_seen_stamp,
+                        t,
+                    );
                 }
                 if let Some(&f) = label_to_idx.get(false_label) {
-                    push_edge(&mut succ_data, &mut edges, &mut pred_counts, f);
+                    push_edge(
+                        &mut succ_data,
+                        &mut edges,
+                        &mut pred_counts,
+                        &mut succ_seen_stamp,
+                        f,
+                    );
                 }
             }
             Terminator::IndirectBranch {
@@ -185,17 +214,35 @@ pub fn build_cfg(
             } => {
                 for label in possible_targets {
                     if let Some(&t) = label_to_idx.get(label) {
-                        push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
+                        push_edge(
+                            &mut succ_data,
+                            &mut edges,
+                            &mut pred_counts,
+                            &mut succ_seen_stamp,
+                            t,
+                        );
                     }
                 }
             }
             Terminator::Switch { cases, default, .. } => {
                 if let Some(&d) = label_to_idx.get(default) {
-                    push_edge(&mut succ_data, &mut edges, &mut pred_counts, d);
+                    push_edge(
+                        &mut succ_data,
+                        &mut edges,
+                        &mut pred_counts,
+                        &mut succ_seen_stamp,
+                        d,
+                    );
                 }
                 for (_, label) in cases {
                     if let Some(&t) = label_to_idx.get(label) {
-                        push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
+                        push_edge(
+                            &mut succ_data,
+                            &mut edges,
+                            &mut pred_counts,
+                            &mut succ_seen_stamp,
+                            t,
+                        );
                     }
                 }
             }
@@ -204,7 +251,13 @@ pub fn build_cfg(
         // InlineAsm goto_labels are implicit control flow edges.
         for label in asm_goto_successors(block) {
             if let Some(&t) = label_to_idx.get(&label) {
-                push_edge(&mut succ_data, &mut edges, &mut pred_counts, t);
+                push_edge(
+                    &mut succ_data,
+                    &mut edges,
+                    &mut pred_counts,
+                    &mut succ_seen_stamp,
+                    t,
+                );
             }
         }
         succ_offsets.push(succ_data.len() as u32);

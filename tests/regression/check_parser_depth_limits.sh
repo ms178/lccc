@@ -62,12 +62,18 @@ fi
 # ---------------------------------------------------------------------------
 # The other three resource budgets (block / expression / type nesting).
 #
-# gcc.c-torture/compile/limits-caselabels.c, limits-exprparen.c and
-# limits-structnest.c deliberately exceed them.  A clean, bounded rejection
-# is the contract: rc=1, ONE diagnostic naming the budget, no signal, no
-# panic, no stack overflow.  The legal-depth legs prove the budgets are not
-# accidentally too small for real code.  Both sides are measured here so a
-# future "fix" that simply raises a bound into a stack overflow is caught.
+# gcc.c-torture/compile/limits-caselabels.c, limits-exprparen.c (10,000-deep
+# pure parens) and limits-structnest.c (10,000-deep struct chains) all
+# deliberately exceed the naive recursive costs, and all three must COMPILE:
+# that is what GCC does and what the torture suite requires.  lccc reaches
+# that with the flat label-run lowering, the `paren_chain_run` iterative
+# peel and the record-level trampoline respectively.  The budgets still
+# bound every frame-consuming recursive shape (block nesting, mixed nested
+# binary expressions, non-trampoline type chains); those rejection ends are
+# pinned here so a future change that turns a clean budget error into a
+# stack overflow or a hang is caught.  The legal-depth legs prove the
+# budgets are not accidentally too small for real code.  Both sides are
+# measured here.
 # ---------------------------------------------------------------------------
 budget_case() {
     label=$1
@@ -111,8 +117,19 @@ d = pathlib.Path(sys.argv[1])
 for n in (2000, 4000, 4200, 5000):
     (d / f"block{n}.c").write_text(
         "int f(void) {" + "{" * (n - 1) + " return 0; " + "}" * n + "\n")
+# Pure paren chains `(`^n 1 `)`^n are peeled iteratively by
+# `paren_chain_run` (see src/frontend/parser/expressions.rs): the group is
+# scanned in O(n) and the content is parsed exactly once, so no parse frames
+# accumulate and the shape is legal at any depth (gcc.c-torture/compile
+# limits-exprparen.c is 10,000-deep and must compile).  A nested binary
+# chain `(0+(0+...))` cannot be peeled (the parens interleave with `+`) and
+# still consumes parse frames per level, so it exercises the expression
+# frame budget's clean-rejection contract.
 for n in (1000, 2000, 34000):
     (d / f"expr{n}.c").write_text("int x = " + "(" * n + "1" + ")" * n + ";\n")
+for n in (5000,):
+    (d / f"exprmix{n}.c").write_text(
+        "int x = " + "(0+" * n + "1" + ")" * n + ";\n")
 for n in (1000, 2100):
     src = "".join(f"struct A{i} {{ " for i in range(n)) + "int v; " \
           + "".join(f"}} a{i}; " for i in range(n))
@@ -123,10 +140,11 @@ budget_case 'block nesting 4000'   0 '' "$tmp/block4000.c"
 budget_case 'block nesting 4200'   1 'block nesting too deep' "$tmp/block4200.c"
 budget_case 'block nesting 5000'   1 'block nesting too deep' "$tmp/block5000.c"
 budget_case 'expression nesting 1000' 0 '' "$tmp/expr1000.c"
-budget_case 'expression nesting 2000' 1 'expression nesting too deep' "$tmp/expr2000.c"
-budget_case 'expression nesting 34000' 1 'expression nesting too deep' "$tmp/expr34000.c"
+budget_case 'expression nesting 2000' 0 '' "$tmp/expr2000.c"
+budget_case 'expression nesting 34000' 0 '' "$tmp/expr34000.c"
+budget_case 'expression nesting 5000 mixed' 1 'expression nesting too deep' "$tmp/exprmix5000.c"
 budget_case 'type nesting 1000'   0 '' "$tmp/type1000.c"
-budget_case 'type nesting 2100'   1 'type nesting too deep' "$tmp/type2100.c"
+budget_case 'type nesting 2100'   0 '' "$tmp/type2100.c"
 
 # ---------------------------------------------------------------------------
 # Unsupported-input refusal contracts (self-contained; no corpus dependency).

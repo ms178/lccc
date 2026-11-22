@@ -18,10 +18,14 @@ spin forever.
 
 This gate pins the whole contract:
 
-  1. crash-class inputs (5000 paren levels) exit with EXACTLY the budget
-     diagnostic and rc=1 -- never an abort/segv/signal (checked
+  1. crash-class inputs (5000 nested paren-add levels) exit with EXACTLY
+     the budget diagnostic and rc=1 -- never an abort/segv/signal (checked
      explicitly), never a hang (hard timeout), never a diagnostic flood
-     (>256 KB), never zero or duplicate budget diagnostics;
+     (>256 KB), never zero or duplicate budget diagnostics.  Pure paren
+     chains `(`^n 1 `)`^n are NOT a crash class since `paren_chain_run`
+     peels them iteratively (O(n), no parse frames); they belong to class 2
+     and must keep compiling (gcc.c-torture limits-exprparen.c depends on
+     it) -- the paren_add leg keeps the rejection end pinned;
   2. deep-but-legal shapes that have always compiled keep compiling
      (right-nested ternary, unary-negation chains) -- the budget must not
      reject inputs that were safe before;
@@ -435,8 +439,10 @@ def main() -> int:
         # 1. crash class -> clean bounded error, never an abort/hang
         ok &= check_clean_budget_error("paren_add_5000", lccc, gen_paren_add(5000),
                                        tmp, args.timeout)
-        ok &= check_clean_budget_error("paren_pure_5000", lccc, gen_paren_pure(5000),
-                                       tmp, args.timeout)
+        # Pure paren chains peel iteratively (paren_chain_run): legal at any
+        # depth, must compile quickly like unary/ternary below.
+        ok &= check_compiles("paren_pure_5000", lccc, gen_paren_pure(5000),
+                             tmp, args.timeout)
         # 1b. statement-expression crash class -> termination guarantee.
         # Statement expressions ARE compound statements, so the block-class
         # budget (not the expression budget) catches them.
@@ -455,11 +461,11 @@ def main() -> int:
         ok &= check_clean_budget_error("record_named_50k", lccc,
                                        gen_record_nesting(50_000, True), tmp,
                                        args.timeout,
-                                       "type nesting too deep (exceeds 2048 parser frames)")
+                                       "type nesting too deep (exceeds 16384 levels)")
         ok &= check_clean_budget_error("record_anon_50k", lccc,
                                        gen_record_nesting(50_000, False), tmp,
                                        args.timeout,
-                                       "type nesting too deep (exceeds 2048 parser frames)")
+                                       "type nesting too deep (exceeds 16384 levels)")
         # 1d. #embed I/O crash class -> size clamp neutralizes hostile limits
         ok &= check_embed_adversarial("embed_limit_u64max", lccc,
                                       gen_embed_limit(18446744073709551615),

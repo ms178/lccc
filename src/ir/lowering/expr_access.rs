@@ -1528,18 +1528,40 @@ impl Lowerer {
         for item in &compound.items {
             match item {
                 BlockItem::Statement(stmt) => {
-                    // Peel through Label wrappers to find the innermost statement.
-                    // A label like `out: sz;` parses as Label("out", Expr(Some(sz))).
+                    // Peel through label wrappers to find the innermost statement.
+                    // A label like `out: sz;` parses as Labeled([out], Expr(sz)).
                     // We need to lower the labels (creating branch targets) and then
                     // capture the final expression value, rather than discarding it
                     // via lower_stmt.  This is critical for goto inside statement
                     // expressions: the goto jumps to the label, and the expression
                     // after the label is the statement expression's value.
-                    let mut inner = stmt;
+                    //
+                    // Only leading `name:` labels see this treatment (the
+                    // historical `while let Stmt::Label` peel stopped at the
+                    // first non-label); a `case`/`default` in the run takes
+                    // the lower_stmt path and the value is discarded, exactly
+                    // like the nested-label chain did.
                     let mut labels = Vec::new();
-                    while let Stmt::Label(name, sub_stmt, _span) = inner {
-                        labels.push(name.as_str());
-                        inner = sub_stmt;
+                    let mut inner = stmt;
+                    let mut rest: Option<(&[crate::frontend::parser::ast::Label], &Stmt)> = None;
+                    if let Stmt::Labeled(run, _) = stmt {
+                        let pos = run
+                            .labels
+                            .iter()
+                            .take_while(|l| {
+                                matches!(l, crate::frontend::parser::ast::Label::Name(..))
+                            })
+                            .count();
+                        for l in &run.labels[..pos] {
+                            if let crate::frontend::parser::ast::Label::Name(name, _) = l {
+                                labels.push(name.as_str());
+                            }
+                        }
+                        if pos == run.labels.len() {
+                            inner = &run.body;
+                        } else if pos > 0 {
+                            rest = Some((&run.labels[pos..], &run.body));
+                        }
                     }
                     if !labels.is_empty() {
                         // Lower each label: terminate current block, start label block
@@ -1549,7 +1571,11 @@ impl Lowerer {
                             self.start_block(label);
                         }
                         // Now lower the innermost statement
-                        if let Stmt::Expr(Some(expr)) = inner {
+                        if let Some((rest_labels, rest_body)) = rest {
+                            // Mixed run: the tail expression's value is
+                            // discarded, matching the old chain behaviour.
+                            self.lower_labeled_stmt(rest_labels, rest_body);
+                        } else if let Stmt::Expr(Some(expr)) = inner {
                             last_val = self.lower_expr(expr);
                         } else {
                             self.lower_stmt(inner);

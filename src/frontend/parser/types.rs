@@ -7,6 +7,7 @@
 
 use super::ast::*;
 use super::parse::{ModeKind, Parser, parsed_attr_flag};
+use crate::common::fx_hash::FxHashMap;
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
@@ -70,6 +71,52 @@ struct TypeSpecFlags {
     /// qualifier/storage-class loop so qualifiers and `__seg_gs` survive.
     wide_kind: WideBaseKind,
     typedef_name: Option<String>,
+}
+
+/// Pre-body state of one record definition, captured by
+/// [`Parser::record_header`] and consumed by [`Parser::record_finish`].
+/// The member-body trampoline in [`Parser::parse_struct_fields`] stacks these
+/// so `struct { struct { ... } x; }` chains parse iteratively: one Rust stack
+/// frame per top-level definition instead of one per nesting level
+/// (gcc.c-torture/compile limits-structnest.c nests 10,000 deep).
+struct RecordHeader {
+    is_struct: bool,
+    name: Option<String>,
+    tag_span: Span,
+    declaration_unused: bool,
+    is_packed: bool,
+    struct_aligned: Option<usize>,
+    sso: Option<bool>,
+    record_unused: bool,
+    designated_init: bool,
+    saved_pending_alignas: Option<usize>,
+    saved_pending_alignas_type: Option<TypeSpecifier>,
+}
+
+/// One suspended level of the record-body trampoline.  Pushed when a member's
+/// type is a nested record DEFINITION, popped when that definition's body
+/// closes.  Holds the nested definition's [`RecordHeader`] (finished at pop)
+/// plus the paused parent body-loop state, so the parent member's declarators
+/// (`} y;`) parse exactly as in the recursive formulation.
+struct RecordLevel {
+    /// The nested definition whose body the trampoline is now parsing.
+    nested_header: RecordHeader,
+    /// Body-boundary parser state of the nested definition's body (the
+    /// `parse_struct_fields` entry/exit contract, saved at push and restored
+    /// at pop, plus `parse_struct_or_union`'s `parsing_const` wrap).
+    nested_body_saved_const: bool,
+    nested_body_outer_volatile: bool,
+    nested_body_outer_const: bool,
+    nested_body_outer_pointer_const: bool,
+    nested_body_outer_counted_by: Option<String>,
+    nested_body_outer_vector_size: Option<usize>,
+    nested_body_outer_vector_size_expr: Option<Box<Expr>>,
+    nested_body_outer_ext_vector_nelem: Option<usize>,
+    /// Paused parent body-loop state.
+    parent_fields: Vec<StructFieldDecl>,
+    parent_open: Span,
+    parent_pos_before: usize,
+    parent_pre_spec_packed: bool,
 }
 
 impl Parser {
@@ -927,31 +974,84 @@ impl Parser {
     /// parser-level evaluator has no enum tag registry, so any enum-shaped
     /// alignof must be answered by sema (which resolves the compatible type
     /// from the completed definition).
-    pub(super) fn type_spec_has_enum_tag(ts: &TypeSpecifier) -> bool {
+    ///
+    /// Memoised on each record DEFINITION's `(file_id, start)` span: the old
+    /// un-memoised walker re-traversed the full nested-record subtree at every
+    /// level of `struct { struct { ... } }` depth, which was quadratic in the
+    /// nesting depth (limits-structnest.c: 10k levels).  Each definition now
+    /// computes its enum-containment exactly once.
+    pub(super) fn type_spec_has_enum_tag(&mut self, ts: &TypeSpecifier) -> bool {
+        Self::type_spec_has_enum_tag_cached(ts, &mut self.record_has_enum_cache)
+    }
+
+    fn type_spec_has_enum_tag_cached(
+        ts: &TypeSpecifier,
+        cache: &mut FxHashMap<(u32, u32), bool>,
+    ) -> bool {
         match ts {
             TypeSpecifier::Enum(.., _) => true,
-            TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_enum_tag(inner),
-            TypeSpecifier::Array(inner, _) => Self::type_spec_has_enum_tag(inner),
-            TypeSpecifier::TypeofType(inner, _) => Self::type_spec_has_enum_tag(inner),
+            TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_enum_tag_cached(inner, cache),
+            TypeSpecifier::Array(inner, _) => Self::type_spec_has_enum_tag_cached(inner, cache),
+            TypeSpecifier::TypeofType(inner, _) => {
+                Self::type_spec_has_enum_tag_cached(inner, cache)
+            }
             // A record with an enum field inherits the range-dependence: the
             // field's alignment is the completed enum's alignment.
-            TypeSpecifier::Struct(_, Some(fields), ..)
-            | TypeSpecifier::Union(_, Some(fields), .., _) => fields
-                .iter()
-                .any(|f| Self::type_spec_has_enum_tag(&f.type_spec)),
+            TypeSpecifier::Struct(_, Some(fields), .., tag_span)
+            | TypeSpecifier::Union(_, Some(fields), .., tag_span) => {
+                let key = (tag_span.file_id, tag_span.start);
+                if let Some(&v) = cache.get(&key) {
+                    return v;
+                }
+                let v = fields
+                    .iter()
+                    .any(|f| Self::type_spec_has_enum_tag_cached(&f.type_spec, cache));
+                cache.insert(key, v);
+                v
+            }
             _ => false,
         }
     }
 
+    /// Parse a struct or union definition/reference.
     fn parse_struct_or_union(&mut self, is_struct: bool) -> TypeSpecifier {
-        // Type-budget frame: nested struct/union DEFINITIONS recurse one
-        // frame per level (`struct { struct { ... int x; } s; }`); on
+        // Type-budget frame: nested struct/union DEFINITIONS used to recurse
+        // one frame per level (`struct { struct { ... int x; } s; }`); on
         // exhaustion return a placeholder WITHOUT consuming tokens -- the
         // budget diagnostic is already the TU verdict and the callers'
-        // progress guarantees unwind the rest.
+        // progress guarantees unwind the rest.  Bodies reached through a
+        // member's type are parsed ITERATIVELY now (see parse_struct_fields'
+        // level stack), so this frame is charged only for definitions in
+        // non-member positions (function parameters, initializers, ...).
         if !self.enter_record_frame(self.peek_span()) {
             return TypeSpecifier::Int;
         }
+        let header = self.record_header(is_struct);
+        let fields = if matches!(self.peek(), TokenKind::LBrace) {
+            // Save and restore parsing_const across struct field parsing.
+            // Field types may contain `const` (e.g., `const int *p`), and without
+            // this save/restore the const from field types leaks into the outer
+            // declaration, incorrectly marking non-const variables as const.
+            let saved_const = self.attrs.parsing_const();
+            let f = self.parse_struct_fields();
+            self.attrs.set_const(saved_const);
+            Some(f)
+        } else {
+            None
+        };
+        let ts = self.record_finish(header, fields);
+        self.exit_parser_frame();
+        ts
+    }
+
+    /// Pre-body half of a record definition: attributes, tag, and the parser
+    /// state that must be handed back after the body.  Split out of
+    /// parse_struct_or_union so the member-body trampoline in
+    /// parse_struct_fields can stack these and parse nested definitions
+    /// iteratively (one Rust stack frame per top-level definition instead of
+    /// one per nesting level -- gcc.c-torture limits-structnest.c nests
+    /// 10,000 deep).
+    fn record_header(&mut self, is_struct: bool) -> RecordHeader {
         let tag_span = self.peek_span();
         // GNU `unused` on the record (`struct S { ... } __maybe_unused;`) is a
         // property of the TYPE: no variable of exactly that type is reported
@@ -970,7 +1070,7 @@ impl Parser {
             None
         };
         let (packed2, aligned2, _, _, sso2) = self.parse_record_attributes();
-        let mut record_unused = self.attrs.parsing_maybe_unused();
+        let record_unused = self.attrs.parsing_maybe_unused();
         is_packed = is_packed || packed2;
         if aligned2.is_some() {
             struct_aligned = aligned2;
@@ -988,22 +1088,48 @@ impl Parser {
         // (gcc.c-torture/execute pr82210.c: `aligned(16) struct T { short
         // c; } a[size];` made sizeof(struct T) = 16 instead of 2, so the
         // VLA member spanned 8x the bytes and every later offset was wrong).
-        let mut designated_init = self.attrs.parsing_designated_init();
+        let designated_init = self.attrs.parsing_designated_init();
         self.attrs.set_designated_init(false);
         let saved_pending_alignas = self.attrs.parsed_alignas.take();
         let saved_pending_alignas_type = self.attrs.parsed_alignas_type.take();
-        let fields = if matches!(self.peek(), TokenKind::LBrace) {
-            // Save and restore parsing_const across struct field parsing.
-            // Field types may contain `const` (e.g., `const int *p`), and without
-            // this save/restore the const from field types leaks into the outer
-            // declaration, incorrectly marking non-const variables as const.
-            let saved_const = self.attrs.parsing_const();
-            let f = self.parse_struct_fields();
-            self.attrs.set_const(saved_const);
-            Some(f)
-        } else {
-            None
-        };
+        RecordHeader {
+            is_struct,
+            name,
+            tag_span,
+            declaration_unused,
+            is_packed,
+            struct_aligned,
+            sso,
+            record_unused,
+            designated_init,
+            saved_pending_alignas,
+            saved_pending_alignas_type,
+        }
+    }
+
+    /// Post-body half of a record definition: trailing attributes, the
+    /// TypeSpecifier, tag-alignment caching, and the unused verdict.  The
+    /// caller owns the type-budget frame (enter/exit around the whole
+    /// definition); the body trampoline calls this WITHOUT a frame per
+    /// nested level.
+    fn record_finish(
+        &mut self,
+        header: RecordHeader,
+        fields: Option<Vec<StructFieldDecl>>,
+    ) -> TypeSpecifier {
+        let RecordHeader {
+            is_struct,
+            name,
+            tag_span,
+            declaration_unused,
+            mut is_packed,
+            mut struct_aligned,
+            mut sso,
+            mut record_unused,
+            mut designated_init,
+            saved_pending_alignas,
+            saved_pending_alignas_type,
+        } = header;
         // Body parsed: hand the pending alignment back to the declarator
         // parsing that follows (post-body `__attribute__((aligned(N)))`
         // attributes read below apply to the struct type itself, matching
@@ -1085,7 +1211,7 @@ impl Parser {
         match &ts {
             TypeSpecifier::Struct(Some(tag), Some(_), ..)
             | TypeSpecifier::Union(Some(tag), Some(_), ..)
-                if !Self::type_spec_has_enum_tag(&ts) =>
+                if !self.type_spec_has_enum_tag(&ts) =>
             {
                 // Pass the tag-alignment map so nested NAMED records already
                 // defined (parsed inside-out) resolve in O(1) instead of
@@ -1104,8 +1230,8 @@ impl Parser {
             }
             _ => {}
         }
-        self.exit_parser_frame();
-        // Last, so a nested definition's verdict never survives its parent's.
+        // Last, so a nested definition's unused verdict never survives its
+        // parent's: the parent's record_finish overwrites this assignment.
         self.attrs.spec_type_unused = record_unused;
         ts
     }
@@ -1338,7 +1464,7 @@ impl Parser {
     /// Parse struct or union field declarations inside braces.
     pub(super) fn parse_struct_fields(&mut self) -> Vec<StructFieldDecl> {
         let mut fields = Vec::with_capacity(8);
-        let open = self.peek_span();
+        let mut open = self.peek_span();
         // The members' `volatile` qualifiers must not outlive the body:
         // `struct S { volatile int a; } s;` leaves `s` non-volatile.
         let outer_volatile = self.attrs.parsing_volatile();
@@ -1348,20 +1474,62 @@ impl Parser {
         // A record body is a declaration-specifier scope of its own. A
         // `__attribute__((vector_size(N)))` pending for the ENCLOSING
         // declaration must not be consumed by the first member, and one
-        // parsed on a member must not leak to the next member or out of the
-        // body. `save_flags()` packs booleans only, so the three Options are
+        // parsed on a member must not leak to the next member or out of
+        // the body. `save_flags()` packs booleans only, so the three Options are
         // taken and restored explicitly (the same invariant as a compound
         // statement, proven by vector_attr_scope_tests).
         let outer_vector_size = self.attrs.parsing_vector_size.take();
         let outer_vector_size_expr = self.attrs.parsing_vector_size_expr.take();
         let outer_ext_vector_nelem = self.attrs.parsing_ext_vector_nelem.take();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
-        while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+        // Trampoline levels for member types that are nested record
+        // DEFINITIONS (`struct A { struct B { ... } y; }`): the nested body is
+        // parsed by THIS loop against an explicit stack instead of the
+        // parse_struct_fields -> parse_type_specifier -> parse_struct_or_union
+        // recursion, so nesting depth is bounded by heap, not the Rust stack
+        // or TYPE_FRAME_BUDGET (limits-structnest.c nests 10,000 deep).
+        let mut levels: Vec<RecordLevel> = Vec::new();
+        loop {
             // Budget termination guarantee: once the nesting budget is
             // exhausted, every level unwinds immediately instead of
             // grinding through the remaining tokens (the budget
-            // diagnostic is the TU verdict).
-            if self.nesting_budget_diagnosed {
+            // diagnostic is the TU verdict).  Merged with the body-end
+            // condition: each unwinding level closes its body exactly as
+            // the recursive formulation did (one expect_closing per level).
+            if self.nesting_budget_diagnosed
+                || matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof)
+            {
+                self.expect_closing(&TokenKind::RBrace, open);
+                if let Some(level) = levels.pop() {
+                    // The nested definition's body is complete.  Restore the
+                    // body-boundary state FIRST (parse_struct_fields' exit
+                    // contract), then the parse_struct_or_union const wrap,
+                    // then finish the TypeSpecifier (parse_type_specifier's
+                    // trailing-qualifier wrap and the declarator resume come
+                    // after) -- the exact recursive unwind order, so a
+                    // post-body `__attribute__` side effect on any of these
+                    // flags survives the hand-back.
+                    self.attrs.set_volatile(level.nested_body_outer_volatile);
+                    self.attrs.set_const(level.nested_body_outer_const);
+                    self.attrs
+                        .set_pointer_const(level.nested_body_outer_pointer_const);
+                    self.attrs.parsing_counted_by = level.nested_body_outer_counted_by;
+                    self.attrs.parsing_vector_size = level.nested_body_outer_vector_size;
+                    self.attrs.parsing_vector_size_expr = level.nested_body_outer_vector_size_expr;
+                    self.attrs.parsing_ext_vector_nelem = level.nested_body_outer_ext_vector_nelem;
+                    self.attrs.set_const(level.nested_body_saved_const);
+                    let ts = self.record_finish(level.nested_header, Some(fields));
+                    let ts = self.consume_trailing_qualifiers(ts);
+                    fields = level.parent_fields;
+                    open = level.parent_open;
+                    self.finish_field_after_type(
+                        ts,
+                        &mut fields,
+                        level.parent_pre_spec_packed,
+                        level.parent_pos_before,
+                    );
+                    continue;
+                }
                 break;
             }
             let pos_before = self.pos;
@@ -1407,75 +1575,34 @@ impl Parser {
                 }
                 continue;
             }
+            if self.at_struct_or_union_def() {
+                // The member's type is a nested record DEFINITION: parse its
+                // header here and push this body level, then let the loop
+                // parse the nested body -- no Rust recursion.
+                let nested_header = self.record_field_type_header();
+                let level = RecordLevel {
+                    nested_header,
+                    nested_body_saved_const: self.attrs.parsing_const(),
+                    nested_body_outer_volatile: self.attrs.parsing_volatile(),
+                    nested_body_outer_const: self.attrs.parsing_const(),
+                    nested_body_outer_pointer_const: self.attrs.parsing_pointer_const(),
+                    nested_body_outer_counted_by: self.attrs.parsing_counted_by.take(),
+                    nested_body_outer_vector_size: self.attrs.parsing_vector_size.take(),
+                    nested_body_outer_vector_size_expr: self.attrs.parsing_vector_size_expr.take(),
+                    nested_body_outer_ext_vector_nelem: self.attrs.parsing_ext_vector_nelem.take(),
+                    parent_fields: std::mem::take(&mut fields),
+                    parent_open: open,
+                    parent_pos_before: pos_before,
+                    parent_pre_spec_packed: pre_spec_packed,
+                };
+                levels.push(level);
+                fields = Vec::with_capacity(8);
+                open = self.peek_span();
+                self.expect_context(&TokenKind::LBrace, "for struct/union body");
+                continue;
+            }
             if let Some(type_spec) = self.parse_type_specifier() {
-                // `vector_size(N)` / `ext_vector_type(N)` is a SPECIFIER
-                // attribute. Unlike a variable Declaration, StructFieldDecl
-                // has no size slot, so wrap the member's BASE spec here,
-                // before `fold_simple_derived` adds pointer/array layers.
-                // A deferred vector_size(EXPR) is carried on the field for
-                // sema (it needs the layout engine for `sizeof(struct T)`).
-                let field_vector_size_expr = self.attrs.parsing_vector_size_expr.take();
-                let type_spec = self.apply_pending_vector_attr(type_spec);
-                if matches!(self.peek(), TokenKind::Semicolon) {
-                    // A tag reference without a declarator is not an anonymous
-                    // member (C11 6.7.2.1p13). Treating `struct S;` inside S
-                    // as a member constructs a cyclic layout and makes member
-                    // lookup recurse forever. The tag reference has no body
-                    // to register; retain the warning, not a synthetic field.
-                    if matches!(
-                        &type_spec,
-                        TypeSpecifier::Struct(Some(_), None, ..)
-                            | TypeSpecifier::Union(Some(_), None, ..)
-                    ) {
-                        self.diagnostics
-                            .warning("declaration does not declare anything", self.peek_span());
-                        continue;
-                    }
-                    // Anonymous field (e.g., anonymous struct/union)
-                    self.check_field_designated_attribute(&type_spec, self.peek_span());
-                    let alignment = self.attrs.parsed_alignas.take();
-                    let alignas_type = self.attrs.parsed_alignas_type.take();
-                    fields.push(StructFieldDecl {
-                        span: self.peek_span(),
-                        type_spec,
-                        name: None,
-                        bit_width: None,
-                        derived: Vec::new(),
-                        alignment,
-                        alignas_type,
-                        is_packed: pre_spec_packed,
-                        base_volatile: false,
-                        base_restrict: false,
-                        base_const: self.attrs.parsing_const(),
-                        object_volatile: false,
-                        object_const: self.attrs.parsing_const(),
-                        counted_by: None,
-                        vector_size_expr: field_vector_size_expr.clone(),
-                    });
-                } else {
-                    self.parse_struct_field_declarators(
-                        &type_spec,
-                        &mut fields,
-                        pre_spec_packed,
-                        &field_vector_size_expr,
-                    );
-                }
-                self.skip_gcc_extensions();
-                if matches!(self.peek(), TokenKind::Semicolon) {
-                    self.advance();
-                } else if matches!(self.peek(), TokenKind::RBrace) {
-                    // gcc 16.2 (default gnu23, no -fpermissive needed):
-                    // `struct S { int x };` is a PEDWARN, not a hard error --
-                    // "no semicolon at end of struct or union".  This is the
-                    // last field of `struct S0` in gcc.c-torture/compile/
-                    // pr72802.c (`signed f5` followed directly by `};`).
-                    self.diagnostics.warning(
-                        "no semicolon at end of struct or union".to_owned(),
-                        self.peek_span(),
-                    );
-                } else {
-                    self.expect_after(&TokenKind::Semicolon, "after struct field declaration");
-                }
+                self.finish_field_after_type(type_spec, &mut fields, pre_spec_packed, pos_before);
             } else {
                 self.advance(); // skip unknown
             }
@@ -1486,7 +1613,6 @@ impl Parser {
                 self.advance();
             }
         }
-        self.expect_closing(&TokenKind::RBrace, open);
         self.attrs.set_volatile(outer_volatile);
         self.attrs.set_const(outer_const);
         self.attrs.set_pointer_const(outer_pointer_const);
@@ -1495,6 +1621,175 @@ impl Parser {
         self.attrs.parsing_vector_size_expr = outer_vector_size_expr;
         self.attrs.parsing_ext_vector_nelem = outer_ext_vector_nelem;
         fields
+    }
+
+    /// True when the tokens at the member type position form a bare
+    /// `struct`/`union` DEFINITION (optionally preceded by type qualifiers):
+    /// `struct [attrs] [tag] [attrs] { ... }`.  Only these take the iterative
+    /// record trampoline; tag references (`struct S *p;`) and anything else
+    /// parse through `parse_type_specifier` as before.
+    fn at_struct_or_union_def(&self) -> bool {
+        let mut i = self.pos;
+        // Leading type qualifiers (`const struct { ... }`) are consumed by
+        // record_field_type_header with the parse_type_specifier arm's exact
+        // attribute effects.
+        while let Some(t) = self.tokens.get(i).map(|t| &t.kind) {
+            match t {
+                TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => i += 1,
+                _ => break,
+            }
+        }
+        match self.tokens.get(i).map(|t| &t.kind) {
+            Some(TokenKind::Struct) | Some(TokenKind::Union) => i += 1,
+            _ => return false,
+        }
+        // `struct [attrs] [tag] [attrs] {`: scan (bounded) for the body
+        // brace; any declarator-side token means a tag reference.  Tokens
+        // INSIDE attribute parentheses/brackets are skipped wholesale (an
+        // attribute argument may be any token: `aligned(8)`, `mode(SI)`,
+        // string arguments), and the scan aborts on an unbalanced close so a
+        // malformed group can never mis-route the trampoline.
+        let mut depth = 0i32;
+        for _ in 0..64 {
+            match self.tokens.get(i).map(|t| &t.kind) {
+                Some(TokenKind::LBrace) if depth == 0 => return true,
+                Some(TokenKind::LParen) | Some(TokenKind::LBracket) => {
+                    depth += 1;
+                    i += 1;
+                }
+                Some(TokenKind::RParen) | Some(TokenKind::RBracket) => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return false;
+                    }
+                    i += 1;
+                }
+                Some(_) if depth > 0 => i += 1,
+                Some(TokenKind::Attribute) | Some(TokenKind::Identifier(_)) => i += 1,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// The nested-definition path of a member type: the exact
+    /// `parse_type_specifier` flow for a type starting with a bare (or
+    /// qualifier-led) `struct`/`union` DEFINITION, through the record header
+    /// and up to the body.  Used by the parse_struct_fields trampoline
+    /// instead of the recursive parse_type_specifier -> parse_struct_or_union
+    /// chain; the resume path completes parse_type_specifier's tail
+    /// (`consume_trailing_qualifiers`).
+    fn record_field_type_header(&mut self) -> RecordHeader {
+        self.attrs.spec_type_unused = false;
+        self.skip_gcc_extensions();
+        loop {
+            match self.peek() {
+                TokenKind::Const => {
+                    self.advance();
+                    self.attrs.set_const(true);
+                }
+                TokenKind::Volatile => {
+                    self.advance();
+                    self.attrs.set_volatile(true);
+                    self.attrs.volatile_from_stars = false;
+                }
+                TokenKind::Restrict => {
+                    self.advance();
+                    self.attrs.set_restrict(true);
+                }
+                _ => break,
+            }
+        }
+        let is_struct = matches!(self.peek(), TokenKind::Struct);
+        self.advance(); // the `struct` / `union` keyword (collecting-loop arm)
+        self.record_header(is_struct)
+    }
+
+    /// The remainder of one member's parse after its type specifier is
+    /// complete: the vector-size wrap, anonymous-member handling, declarators
+    /// (which own the type), and the trailing semicolon contract.  Shared by
+    /// the ordinary type path and the record trampoline's resume (a nested
+    /// definition's `} y;` field).
+    fn finish_field_after_type(
+        &mut self,
+        type_spec: TypeSpecifier,
+        fields: &mut Vec<StructFieldDecl>,
+        pre_spec_packed: bool,
+        pos_before: usize,
+    ) {
+        // `vector_size(N)` / `ext_vector_type(N)` is a SPECIFIER
+        // attribute. Unlike a variable Declaration, StructFieldDecl
+        // has no size slot, so wrap the member's BASE spec here,
+        // before `fold_simple_derived` adds pointer/array layers.
+        // A deferred vector_size(EXPR) is carried on the field for
+        // sema (it needs the layout engine for `sizeof(struct T)`).
+        let field_vector_size_expr = self.attrs.parsing_vector_size_expr.take();
+        let type_spec = self.apply_pending_vector_attr(type_spec);
+        if matches!(self.peek(), TokenKind::Semicolon) {
+            // A tag reference without a declarator is not an anonymous
+            // member (C11 6.7.2.1p13). Treating `struct S;` inside S
+            // as a member constructs a cyclic layout and makes member
+            // lookup recurse forever. The tag reference has no body
+            // to register; retain the warning, not a synthetic field.
+            if matches!(
+                &type_spec,
+                TypeSpecifier::Struct(Some(_), None, ..) | TypeSpecifier::Union(Some(_), None, ..)
+            ) {
+                self.diagnostics
+                    .warning("declaration does not declare anything", self.peek_span());
+                return;
+            }
+            // Anonymous field (e.g., anonymous struct/union)
+            self.check_field_designated_attribute(&type_spec, self.peek_span());
+            let alignment = self.attrs.parsed_alignas.take();
+            let alignas_type = self.attrs.parsed_alignas_type.take();
+            fields.push(StructFieldDecl {
+                span: self.peek_span(),
+                type_spec,
+                name: None,
+                bit_width: None,
+                derived: Vec::new(),
+                alignment,
+                alignas_type,
+                is_packed: pre_spec_packed,
+                base_volatile: false,
+                base_restrict: false,
+                base_const: self.attrs.parsing_const(),
+                object_volatile: false,
+                object_const: self.attrs.parsing_const(),
+                counted_by: None,
+                vector_size_expr: field_vector_size_expr.clone(),
+            });
+        } else {
+            self.parse_struct_field_declarators(
+                type_spec,
+                fields,
+                pre_spec_packed,
+                &field_vector_size_expr,
+            );
+        }
+        self.skip_gcc_extensions();
+        if matches!(self.peek(), TokenKind::Semicolon) {
+            self.advance();
+        } else if matches!(self.peek(), TokenKind::RBrace) {
+            // gcc 16.2 (default gnu23, no -fpermissive needed):
+            // `struct S { int x };` is a PEDWARN, not a hard error --
+            // "no semicolon at end of struct or union".  This is the
+            // last field of `struct S0` in gcc.c-torture/compile/
+            // pr72802.c (`signed f5` followed directly by `};`).
+            self.diagnostics.warning(
+                "no semicolon at end of struct or union".to_owned(),
+                self.peek_span(),
+            );
+        } else {
+            self.expect_after(&TokenKind::Semicolon, "after struct field declaration");
+        }
+        // Universal progress guarantee: a field parse that consumed
+        // nothing (e.g. a budget-exhausted placeholder type) must not
+        // be retried on the same token.
+        if self.pos == pos_before {
+            self.advance();
+        }
     }
 
     /// Reject a named address space on a struct or union field object, as GCC
@@ -1580,11 +1875,19 @@ impl Parser {
     /// `void (*(*xDlSym)(sqlite3_vfs*, void*, const char *))(void)`).
     fn parse_struct_field_declarators(
         &mut self,
-        type_spec: &TypeSpecifier,
+        type_spec: TypeSpecifier,
         fields: &mut Vec<StructFieldDecl>,
         pre_spec_packed: bool,
         vector_size_expr: &Option<Box<Expr>>,
     ) {
+        // Owned base type: moved into the first field that consumes it and
+        // cloned ONLY when a comma actually introduces a second declarator
+        // (`struct { T x, y; }`).  With the previous always-clone contract a
+        // deep nested-record base made every level of
+        // `struct { struct { ... } x; }` cost O(depth) to copy -- quadratic in
+        // the nesting depth (limits-structnest.c).
+        let mut type_spec = Some(type_spec);
+        let mut type_spec_clone_source: Option<TypeSpecifier> = None;
         let field_spec_const = self.attrs.parsing_const();
         // Capture _Alignas value that was parsed during type specifier parsing
         let mut alignas_from_type = self.attrs.parsed_alignas.take();
@@ -1634,9 +1937,24 @@ impl Parser {
                     &TypeSpecifier::Void,
                     colon_span,
                 );
+                if matches!(self.peek(), TokenKind::Comma) && type_spec_clone_source.is_none() {
+                    type_spec_clone_source = type_spec.clone();
+                }
+                let base = type_spec.take().unwrap_or_else(|| {
+                    type_spec_clone_source.as_ref().cloned().unwrap_or_else(|| {
+                        // Invariant: every repeated bitfield declarator
+                        // follows a comma that saved the base type.  If that
+                        // ever regresses, fail soft with a diagnostic and a
+                        // placeholder base instead of an ICE: a parser bug
+                        // must not crash the compiler on hostile input.
+                        self.diagnostics
+                            .error("missing type specifier for bitfield declarator", colon_span);
+                        TypeSpecifier::Void
+                    })
+                });
                 fields.push(StructFieldDecl {
                     span: colon_span,
-                    type_spec: type_spec.clone(),
+                    type_spec: base,
                     name: None,
                     bit_width,
                     derived: Vec::new(),
@@ -1723,7 +2041,20 @@ impl Parser {
             // directly, fold simple derived declarators (pointers, arrays) into
             // type_spec. Only use the derived field for complex cases with function
             // pointers that require build_full_ctype().
-            let (mut field_type, field_derived) = Self::fold_simple_derived(type_spec, &derived);
+            if matches!(self.peek(), TokenKind::Comma) && type_spec_clone_source.is_none() {
+                type_spec_clone_source = type_spec.clone();
+            }
+            let base = type_spec.take().unwrap_or_else(|| {
+                type_spec_clone_source.as_ref().cloned().unwrap_or_else(|| {
+                    // Same soft-fail contract as the bitfield arm above: a
+                    // repeated declarator without a saved base is a parser
+                    // invariant break, not an ICE.
+                    self.diagnostics
+                        .error("missing type specifier for declarator", declarator_span);
+                    TypeSpecifier::Void
+                })
+            });
+            let (mut field_type, field_derived) = Self::fold_simple_derived(base, &derived);
             self.check_field_designated_attribute(&field_type, declarator_span);
             self.check_struct_field_space(
                 field_addr_space,
@@ -1842,7 +2173,7 @@ impl Parser {
     }
 
     fn fold_simple_derived(
-        base: &TypeSpecifier,
+        base: TypeSpecifier,
         derived: &[DerivedDeclarator],
     ) -> (TypeSpecifier, Vec<DerivedDeclarator>) {
         // If derived contains any function-related declarators, pass it through
@@ -1862,11 +2193,11 @@ impl Parser {
             .any(|d| matches!(d, DerivedDeclarator::Pointer(_, cvr) if *cvr != 0));
 
         if has_function || has_star_qualifiers {
-            return (base.clone(), derived.to_vec());
+            return (base, derived.to_vec());
         }
 
         if derived.is_empty() {
-            return (base.clone(), Vec::new());
+            return (base, Vec::new());
         }
 
         // Simple case: only Pointer and Array declarators. Fold into type_spec.
@@ -1878,7 +2209,13 @@ impl Parser {
         // `struct sched_domain * __percpu *`: the first dereference reads %gs).
         // The old code dropped every space, so field types lost %gs and
         // `free_percpu(sdd->sd)` failed that GCC accepts.
-        let mut result = base.clone();
+        //
+        // The base is MOVED into the wrapper chain, not cloned: a deep
+        // nested-record type (gcc.c-torture limits-structnest.c's 10k
+        // `struct { struct { ... } }` levels) is O(depth) to clone, and one
+        // clone per member made parsing quadratic (measured n^1.8+). The
+        // caller clones only when a comma actually forces a second declarator.
+        let mut result = base;
         let mut pending_space = AddressSpace::Default;
         let mut i = 0;
         while i < derived.len() {

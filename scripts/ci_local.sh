@@ -317,6 +317,9 @@ gate "gnu-declaration-corners" fast \
 gate "parser-depth-limits" fast \
     env CCC="$LCCC" \
     bash tests/regression/check_parser_depth_limits.sh
+gate "sema-lvalue-readonly-gates" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_sema_lvalue_gates.sh
 gate "frontend-ternary-common-type" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
 gate "frontend-preprocessor-rules" fast \

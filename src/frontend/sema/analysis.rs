@@ -34,7 +34,7 @@ use crate::common::types::{
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, EnumVariant, Expr,
     ExprId, ExternalDecl, ForInit, FunctionDef, GenericAssociation, InitDeclarator, Initializer,
-    InitializerItem, ParamDecl, PostfixOp, SizeofArg, StaticAssert, Stmt, StructFieldDecl,
+    InitializerItem, Label, ParamDecl, PostfixOp, SizeofArg, StaticAssert, Stmt, StructFieldDecl,
     TranslationUnit, TypeSpecifier, UnaryOp,
 };
 use crate::frontend::sema::builtins;
@@ -370,6 +370,36 @@ pub struct SemanticAnalyzer {
     /// Names declared `weak` (attribute or `#pragma weak`): their address may
     /// be null, so the front end cannot fold it to true.
     weak_symbols: FxHashSet<String>,
+    /// Live depth of the `resolve_struct_or_union` -> `convert_struct_fields`
+    /// -> `field_ctype` -> `build_qualified_ctype` recursion (nested
+    /// struct/union member definitions).  The parser's record trampoline
+    /// makes arbitrary nesting PARSE in constant stack, but this resolution
+    /// cycle still recurses one Rust frame chain per level and overflows the
+    /// 64 MB worker stack at ~25k levels (measured: 20k compiles, 25k
+    /// overflows).  The guard degrades deeper record chains to ONE clean
+    /// `type nesting too deep` diagnostic: gcc.c-torture limits-structnest.c
+    /// needs 10,000 levels to compile, and 16,384 leaves >1.5x headroom
+    /// under the measured cliff, so neither the torture floor nor the crash
+    /// ceiling is touched.  Depth is counted per live nesting level and
+    /// unwound on every return path.
+    record_resolve_depth: Cell<u32>,
+    /// One-shot marker so the depth diagnostic is emitted exactly once.
+    record_depth_diagnosed: Cell<bool>,
+}
+
+/// Maximum nested record-definition resolution depth; see
+/// `SemanticAnalyzer::record_resolve_depth` for the calibration.
+const MAX_RECORD_RESOLVE_DEPTH: u32 = 16_384;
+
+/// RAII unwinder for `SemanticAnalyzer::record_resolve_depth`: the counter
+/// must decrement on every return path of `resolve_struct_or_union`, and
+/// this makes that structural instead of per-return bookkeeping.
+struct RecordDepthGuard<'a>(&'a Cell<u32>);
+
+impl Drop for RecordDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 /// Where an implicit conversion occurs, for GCC 16.2's verbatim
@@ -458,6 +488,8 @@ impl SemanticAnalyzer {
             address_of_operand: Cell::new(false),
             function_scope_floor: usize::MAX,
             weak_symbols: FxHashSet::default(),
+            record_resolve_depth: Cell::new(0),
+            record_depth_diagnosed: Cell::new(false),
         };
         analyzer
     }
@@ -3398,25 +3430,29 @@ impl SemanticAnalyzer {
                 self.analyze_substatement(body);
                 self.active_break_targets.pop();
             }
-            Stmt::Case(expr, body, _) => {
-                self.analyze_expr(expr);
-                self.analyze_stmt(body);
-            }
-            Stmt::CaseRange(low, high, body, _) => {
-                self.analyze_expr(low);
-                self.analyze_expr(high);
-                self.analyze_stmt(body);
-            }
-            Stmt::Default(body, _) => {
-                self.analyze_stmt(body);
-            }
-            Stmt::Label(name, body, _) => {
-                if body.labels_loop_or_switch() {
-                    self.pending_loop_labels.push(name.clone());
+            Stmt::Labeled(run, _) => {
+                // Binding rule for C2y named loops mirrors the previous
+                // nested-label semantics exactly: only `name:` labels that
+                // wrap the loop directly (the run's trailing names, after
+                // the last `case`/`default`) bind `break name`.
+                if run.body.labels_loop_or_switch() {
+                    for (name, _) in run.trailing_names() {
+                        self.pending_loop_labels.push(name.to_string());
+                    }
                 } else {
                     self.pending_loop_labels.clear();
                 }
-                self.analyze_stmt(body);
+                for label in &run.labels {
+                    match label {
+                        Label::Case(expr, _) => self.analyze_expr(expr),
+                        Label::CaseRange(low, high, _) => {
+                            self.analyze_expr(low);
+                            self.analyze_expr(high);
+                        }
+                        Label::Default(_) | Label::Name(..) => {}
+                    }
+                }
+                self.analyze_stmt(&run.body);
                 self.pending_loop_labels.clear();
             }
             Stmt::Declaration(decl) => {
@@ -9973,6 +10009,59 @@ dereference it before applying '->' to it?"
     /// read-only elements); a dot access recurses into the object; an
     /// arrow access consults the pointee.
     fn lvalue_readonly(&self, target: &Expr) -> bool {
+        self.lvalue_readonly_qualpath(target)
+            || self
+                .expr_type_checker()
+                .infer_expr_ctype(target)
+                .is_some_and(|ty| self.type_structural_readonly(&ty))
+    }
+
+    /// C11 6.3.2.1p3 structural modifiability rule: an lvalue of struct or
+    /// union type is NOT modifiable when any member is const-qualified,
+    /// recursively through contained aggregates and unions (GCC 16.2
+    /// wording: `assignment of read-only member 'n'`).  Array members
+    /// unwrap to their element type (measured: `struct { const int a[2]; }`
+    /// is non-modifiable as an assignment target); pointers stop the walk
+    /// (`const int *p` as a member is a writable pointer object).  The walk
+    /// is ITERATIVE with a visited set: record chains reach 10k levels and
+    /// shared layouts must not re-trigger exponential walks.
+    fn type_structural_readonly(&self, ty: &crate::common::types::CType) -> bool {
+        use crate::common::types::CType as T;
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let mut work: Vec<&crate::common::types::CType> = vec![ty];
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        while let Some(cur) = work.pop() {
+            match cur {
+                T::Array(inner, _) => work.push(inner),
+                T::Struct(key) | T::Union(key) => {
+                    if !seen.insert(key.as_ref()) {
+                        continue;
+                    }
+                    let Some(layout) = layouts.get(key.as_ref()) else {
+                        continue;
+                    };
+                    for f in &layout.fields {
+                        if f.object_const {
+                            return true;
+                        }
+                        if matches!(f.ty, T::Array(..) | T::Struct(..) | T::Union(..)) {
+                            work.push(&f.ty);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Qualification-path readonly (the pre-existing rule): const flowing
+    /// along the access path from the declared object or pointee.  This is
+    /// what distinguishes GCC 16.2's wordings -- `wu.n = w` where the const
+    /// sits INSIDE `n`'s own type says `assignment of read-only member 'n'`
+    /// (base `wu` is not qualification-readonly), while `const struct s5 *p;
+    /// p->n = w` says `assignment of member 'n' in read-only object`.
+    fn lvalue_readonly_qualpath(&self, target: &Expr) -> bool {
         let tc = self.expr_type_checker();
         match target {
             Expr::Identifier(name, _) => self.symbol_table.is_top_const(name),
@@ -9984,20 +10073,20 @@ dereference it before applying '->' to it?"
                     base
                 };
                 if matches!(tc.infer_expr_ctype(base), Some(CType::Array(..))) {
-                    self.lvalue_readonly(base)
+                    self.lvalue_readonly_qualpath(base)
                 } else {
                     self.pointee_readonly(base)
                 }
             }
             Expr::MemberAccess(base, field, _) => {
-                self.lvalue_readonly(base) || self.member_constness(base, field, false).1
+                self.lvalue_readonly_qualpath(base) || self.member_constness(base, field, false).1
             }
             Expr::PointerMemberAccess(base, field, _) => {
                 self.pointee_readonly(base) || self.member_constness(base, field, true).1
             }
             Expr::GenericSelection(controlling, associations, _) => tc
                 .generic_selection_index(controlling, associations)
-                .is_some_and(|i| self.lvalue_readonly(&associations[i].expr)),
+                .is_some_and(|i| self.lvalue_readonly_qualpath(&associations[i].expr)),
             _ => false,
         }
     }
@@ -10040,7 +10129,7 @@ dereference it before applying '->' to it?"
             }
             Expr::Identifier(name, _) => format!("{verb} of read-only variable '{name}'"),
             Expr::MemberAccess(base, field, _) => {
-                if self.lvalue_readonly(base) {
+                if self.lvalue_readonly_qualpath(base) {
                     format!("{verb} of member '{field}' in read-only object")
                 } else {
                     format!("{verb} of read-only member '{field}'")
@@ -10994,6 +11083,27 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         struct_aligned: Option<usize>,
         reverse_sso: bool,
     ) -> CType {
+        // Depth-guarded: nested member definitions recurse through
+        // `convert_struct_fields` -> `field_ctype` -> back here, so a record
+        // chain deeper than `MAX_RECORD_RESOLVE_DEPTH` degrades to a single
+        // clean diagnostic (and a `Void` placeholder field type) instead of
+        // overflowing the worker stack.
+        let depth = self.record_resolve_depth.get();
+        if depth >= MAX_RECORD_RESOLVE_DEPTH {
+            if !self.record_depth_diagnosed.get() {
+                self.record_depth_diagnosed.set(true);
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "type nesting too deep (exceeds {} levels)",
+                        MAX_RECORD_RESOLVE_DEPTH
+                    ),
+                    span,
+                );
+            }
+            return CType::Void;
+        }
+        self.record_resolve_depth.set(depth + 1);
+        let _depth_guard = RecordDepthGuard(&self.record_resolve_depth);
         let prefix = if is_union { "union" } else { "struct" };
         let struct_fields = fields
             .as_ref()

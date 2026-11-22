@@ -871,6 +871,81 @@ impl Parser {
         expr
     }
 
+    /// Recognize a pure parenthesized chain `(`^k X `)`^k whose content X is
+    /// bracket-balanced over `()`/`[]`/`{}` and non-empty.  Called from the
+    /// `(` primary arm after the first `(` of the run has been consumed
+    /// (`self.pos` points at the second token of the group).  Returns the run
+    /// length `k` (including the consumed paren) when the group is exactly a
+    /// run of k opens, a balanced content X, then exactly k closing parens;
+    /// the caller peels the run and parses X once.  Groups whose content is
+    /// not balanced (`((a)+(b))`, `((int)3)`, `(f(x))` with mismatched
+    /// shapes) return None and take the ordinary recursive path.
+    fn paren_chain_run(&self) -> Option<usize> {
+        let n = self.tokens.len();
+        let open0 = self.pos - 1;
+        // Leading `(` run (including the already-consumed one).
+        let mut k = 1usize;
+        while open0 + k < n && self.tokens[open0 + k].kind == TokenKind::LParen {
+            k += 1;
+        }
+        // Matching close of the first `(`.
+        let mut depth = 0i64;
+        let mut match_paren = None;
+        let mut i = open0;
+        while i < n {
+            match self.tokens[i].kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return None;
+                    }
+                    if depth == 0 {
+                        match_paren = Some(i);
+                        break;
+                    }
+                }
+                TokenKind::Eof => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        let m = match_paren?;
+        // The k closing parens must be exactly the trailing `)` run at m.
+        if m + 1 < k {
+            return None;
+        }
+        let x_start = open0 + k;
+        let x_end = m + 1 - k;
+        if x_end <= x_start {
+            return None; // empty content: keep the old error path
+        }
+        if (x_end..=m).any(|j| self.tokens[j].kind != TokenKind::RParen) {
+            return None;
+        }
+        // X must itself be bracket-balanced so one `parse_expr` stops exactly
+        // at `x_end`; an unbalanced X (e.g. `a)+(b`) means the group is not a
+        // plain chain and must nest through the recursive parser as before.
+        let mut d = 0i64;
+        for j in x_start..x_end {
+            match self.tokens[j].kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => d += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    d -= 1;
+                    if d < 0 {
+                        return None;
+                    }
+                }
+                TokenKind::Eof => return None,
+                _ => {}
+            }
+        }
+        if d != 0 {
+            return None;
+        }
+        Some(k)
+    }
+
     fn parse_primary_expr(&mut self) -> Expr {
         let span = self.peek_span();
         if !self.enter_expr_frame(span) {
@@ -882,6 +957,74 @@ impl Parser {
     }
 
     #[inline(always)]
+    /// Parse a parenthesized group at `(` in primary position: a GCC
+    /// statement expression `({ ... })`, a pure paren chain
+    /// `(`^k X `)`^k (peeled iteratively, see `paren_chain_run`), or an
+    /// ordinary parenthesized expression.  Extracted from
+    /// `parse_primary_expr_inner` so that function stays within the audit
+    /// census size budget and each arm names one concern.
+    fn parse_paren_group(&mut self) -> Expr {
+        let open = self.peek_span();
+        self.advance();
+        // Check for GCC statement expression: ({ stmt; stmt; expr; })
+        if matches!(self.peek(), TokenKind::LBrace) {
+            let span = self.peek_span();
+            let compound = self.parse_compound_stmt();
+            self.expect_closing(&TokenKind::RParen, open);
+            // Measured on GCC 16.2: `-pedantic`/`-Wpedantic` warn
+            // "ISO C forbids braced-groups within expressions
+            // [-Wpedantic]" (and `-pedantic-errors` errors) in every
+            // dialect; silent by default and under -Wall/-Wextra.
+            self.diagnostics.warning_with_kind(
+                "ISO C forbids braced-groups within expressions",
+                span,
+                crate::common::error::WarningKind::Pedantic,
+            );
+            Expr::StmtExpr(compound, span)
+        } else if let Some(k) = self.paren_chain_run() {
+            // Pure paren chain `(`^k X `)`^k with bracket-balanced X
+            // (e.g. gcc.c-torture limits-exprparen.c's
+            // `LBR4 0 RBR4` = 10,000 parens around one token): peel
+            // the run iteratively and parse the content once, instead
+            // of recursing through the full cast/unary/postfix/
+            // binary chain per paren level (which exhausted
+            // PARSER_FRAME_BUDGET at ~2.7k parens). Parens are
+            // transparent in the AST, so the flattened result is
+            // byte-identical to the recursive one. A run whose
+            // content X is not balanced (`((a)+(b))`, `((int)3)`)
+            // returns None and takes the exact old path.
+            for _ in 1..k {
+                self.advance();
+            }
+            if self.peek() == &TokenKind::LBrace {
+                // `((({ ... })))`: the run wraps a statement
+                // expression; same StmtExpr node and pedantic warning
+                // as the single-paren arm above.
+                let span = self.peek_span();
+                let compound = self.parse_compound_stmt();
+                for _ in 0..k {
+                    self.expect_closing(&TokenKind::RParen, open);
+                }
+                self.diagnostics.warning_with_kind(
+                    "ISO C forbids braced-groups within expressions",
+                    span,
+                    crate::common::error::WarningKind::Pedantic,
+                );
+                Expr::StmtExpr(compound, span)
+            } else {
+                let expr = self.parse_expr();
+                for _ in 0..k {
+                    self.expect_closing(&TokenKind::RParen, open);
+                }
+                expr
+            }
+        } else {
+            let expr = self.parse_expr();
+            self.expect_closing(&TokenKind::RParen, open);
+            expr
+        }
+    }
+
     fn parse_primary_expr_inner(&mut self) -> Expr {
         match self.peek() {
             TokenKind::IntLiteral(val) => {
@@ -1111,30 +1254,7 @@ impl Parser {
                 }
                 Expr::Identifier(name, span)
             }
-            TokenKind::LParen => {
-                let open = self.peek_span();
-                self.advance();
-                // Check for GCC statement expression: ({ stmt; stmt; expr; })
-                if matches!(self.peek(), TokenKind::LBrace) {
-                    let span = self.peek_span();
-                    let compound = self.parse_compound_stmt();
-                    self.expect_closing(&TokenKind::RParen, open);
-                    // Measured on GCC 16.2: `-pedantic`/`-Wpedantic` warn
-                    // "ISO C forbids braced-groups within expressions
-                    // [-Wpedantic]" (and `-pedantic-errors` errors) in every
-                    // dialect; silent by default and under -Wall/-Wextra.
-                    self.diagnostics.warning_with_kind(
-                        "ISO C forbids braced-groups within expressions",
-                        span,
-                        crate::common::error::WarningKind::Pedantic,
-                    );
-                    Expr::StmtExpr(compound, span)
-                } else {
-                    let expr = self.parse_expr();
-                    self.expect_closing(&TokenKind::RParen, open);
-                    expr
-                }
-            }
+            TokenKind::LParen => self.parse_paren_group(),
             TokenKind::Generic => self.parse_generic_selection(),
             TokenKind::Asm => {
                 // GCC asm expression

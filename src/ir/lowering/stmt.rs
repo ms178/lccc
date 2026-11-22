@@ -1759,14 +1759,9 @@ impl Lowerer {
             Stmt::Break(target, _span) => self.lower_break_stmt(target.as_deref()),
             Stmt::Continue(target, _span) => self.lower_continue_stmt(target.as_deref()),
             Stmt::Switch(expr, body, _span) => self.lower_switch_stmt(expr, body),
-            Stmt::Case(expr, stmt, span) => self.lower_case_stmt(expr, stmt, *span),
-            Stmt::CaseRange(low_expr, high_expr, stmt, span) => {
-                self.lower_case_range_stmt(low_expr, high_expr, stmt, *span)
-            }
-            Stmt::Default(stmt, span) => self.lower_default_stmt(stmt, *span),
+            Stmt::Labeled(run, _span) => self.lower_labeled_stmt(&run.labels, &run.body),
             Stmt::Goto(label, _span) => self.lower_goto_stmt(label),
             Stmt::GotoIndirect(expr, _span) => self.lower_goto_indirect_stmt(expr),
-            Stmt::Label(name, stmt, _span) => self.lower_label_stmt(name, stmt),
             Stmt::Declaration(decl) => {
                 self.func_mut().current_span = decl.span;
                 self.declare_local_decl_tags(decl);
