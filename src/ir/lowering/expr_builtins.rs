@@ -3598,17 +3598,30 @@ impl Lowerer {
         }
     }
 
-    /// The value of `arg` when it is an integer constant expression of
-    /// integer type (C11 6.6): what an immediate has to be. A constant has
+    /// The value of `arg` as the integer an immediate's parameter takes,
+    /// when it is a constant: what an immediate has to be. A constant has
     /// no side effect, so its value stands for its evaluation in any
     /// argument position. Pointers and vectors are not asked: a null pointer
     /// constant stays the expression it is.
+    ///
+    /// An integer constant expression (C11 6.6) is its value. A floating
+    /// constant is the value the call converts it to, as an assignment to
+    /// the `int` parameter would (6.3.1.4: toward zero), which is how GCC
+    /// 16.2 reads `_mm_shuffle_epi32(v, 27.9)` (selector 27) and
+    /// `_mm_extract_epi16(v, 2.5)` (element 2); 1e30, which `int` does not
+    /// hold, it refuses. Read as "no integer", such a constant was the
+    /// selector 0 without a word, and then a refusal of a call GCC
+    /// compiles.
     pub(super) fn integer_constant_argument(&self, arg: &Expr) -> Option<IrConst> {
-        if !self.expr_ctype(arg).is_integer() {
+        let ty = self.expr_ctype(arg);
+        let value = self.eval_const_expr(arg)?;
+        if ty.is_integer() {
+            return value.to_i128().is_some().then_some(value);
+        }
+        if !ty.is_floating() {
             return None;
         }
-        self.eval_const_expr(arg)
-            .filter(|value| value.to_i128().is_some())
+        converted_to_int(value.to_f64()?).map(IrConst::I64)
     }
 
     fn lower_x86_intrinsic(
@@ -4209,6 +4222,16 @@ impl Lowerer {
             None => PrefetchArg::NotConstant,
         }
     }
+}
+
+/// A floating value converted to `int` as C converts it (toward zero), where
+/// `int` holds the result; `None` for a value it does not hold, a NaN among
+/// them, which C leaves undefined and no immediate can be.
+fn converted_to_int(value: f64) -> Option<i64> {
+    let truncated = value.trunc();
+    // False for a NaN, which compares with nothing.
+    (truncated >= f64::from(i32::MIN) && truncated <= f64::from(i32::MAX))
+        .then_some(truncated as i64)
 }
 
 /// Width in bits of the lane-select immediate of a builtin whose instruction
@@ -5642,6 +5665,47 @@ mod x86_var_shift_arity_tests {
             assert_eq!(x86_var_shift_arity(&intrinsic), Some(2), "{intrinsic:?}");
         }
         assert_eq!(x86_var_shift_arity(&B::X86Pmulhw128), None);
+    }
+}
+
+#[cfg(test)]
+mod converted_to_int_tests {
+    use super::converted_to_int;
+
+    /// C11 6.3.1.4: the fractional part is discarded, toward zero, and the
+    /// conversion is defined only where `int` holds the result. GCC 16.2
+    /// reads 27.9 as 27, -0.5 as 0 and 256.5 as 256, and refuses 1e30.
+    #[test]
+    fn a_floating_constant_converts_toward_zero_within_int() {
+        for (value, converted) in [
+            (0.0, 0),
+            (-0.0, 0),
+            (0.999, 0),
+            (-0.5, 0),
+            (-0.999, 0),
+            (3.75, 3),
+            (27.9, 27),
+            (-1.5, -1),
+            (256.5, 256),
+            (2147483647.0, 2147483647),
+            (2147483647.9, 2147483647),
+            (-2147483648.0, -2147483648),
+            (-2147483648.9, -2147483648),
+        ] {
+            assert_eq!(converted_to_int(value), Some(converted), "{value}");
+        }
+        for value in [
+            2147483648.0,
+            -2147483649.0,
+            1e30,
+            -1e30,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::MAX,
+        ] {
+            assert_eq!(converted_to_int(value), None, "{value}");
+        }
     }
 }
 

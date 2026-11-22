@@ -104,5 +104,34 @@ int main(void)
     row("shuffle_ps 0x11b", _mm_castps_si128(_mm_shuffle_ps(f, g, 0x11b)));
     row("shuffle_ps 256", _mm_castps_si128(_mm_shuffle_ps(f, g, 256)));
     row("shuffle_pd 256+1", _mm_castpd_si128(_mm_shuffle_pd(_mm_castsi128_pd(v), _mm_castsi128_pd(w), 257)));
+
+    /* A floating constant: the parameter is an `int`, so the call converts
+     * it, toward zero, as an assignment would. GCC reads 27.9 as 27. It was
+     * the selector 0 here (the constant was "no integer"), without a word. */
+    row("shuffle 27.9", _mm_shuffle_epi32(v, 27.9));
+    row("shuffle 27", _mm_shuffle_epi32(v, 27));
+    row("shufflelo 27.5f", _mm_shufflelo_epi16(v, 27.5f));
+    row("shufflehi 0x1b.8p0", _mm_shufflehi_epi16(v, 0x1b.8p0));
+    row("shuffle -0.5", _mm_shuffle_epi32(v, -0.5));
+    row("shuffle 256.5", _mm_shuffle_epi32(v, 256.5));
+    row("slli_si128 1.99", _mm_slli_si128(v, 1.99));
+    row("srli_si128 3.01L", _mm_srli_si128(v, 3.01L));
+    row("alignr 5.5", _mm_alignr_epi8(v, w, 5.5));
+    row("blend16 90.9", _mm_blend_epi16(v, w, 90.9));
+    row("insert16 3.2", _mm_insert_epi16(v, 0x7777, 3.2));
+    row("insert32 2.999", _mm_insert_epi32(v, 0x55667788, 2.999));
+    printf("extract16 2.5 %d\n", _mm_extract_epi16(v, 2.5));
+    printf("extract32 1.5 %d\n", _mm_extract_epi32(v, 1.5));
+    printf("extract8 15.9 %d\n", _mm_extract_epi8(v, 15.9));
+    row("shuffle_ps 27.5f", _mm_castps_si128(_mm_shuffle_ps(f, g, 27.5f)));
+    row("blend_ps 5.9", _mm_castps_si128(_mm_blend_ps(f, g, 5.9)));
+    row("round_ps 1.5", _mm_castps_si128(_mm_round_ps(f, 1.5)));
+    row256("permute4x64 27.75", _mm256_permute4x64_epi64(y, 27.75));
+    row256("shuffle256 27.25", _mm256_shuffle_epi32(y, 27.25));
+    row256("blend32 90.5", _mm256_blend_epi32(y, _mm256_set1_epi32(-1), 90.5));
+    row("extracti128 1.9", _mm256_extracti128_si256(y, 1.9));
+    /* The spelling of the builtin itself, which Clang refuses with a
+     * floating constant ("must be a constant integer"); GCC converts. */
+    row("pshufd 3.75", (__m128i)__builtin_ia32_pshufd((__v4si)v, 3.75));
     return 0;
 }
