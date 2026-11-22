@@ -2364,6 +2364,14 @@ jobs:
       run: >-
         python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # A macro lccc defines is a promise that the intrinsics behind it exist
+    # (`__AVX512F__`, `__F16C__`). The census calls every intrinsic of GCC
+    # 16.2's headers under lccc and holds the count that does not compile to
+    # the record, in both directions.
+    - name: Verify the x86 intrinsic census against GCC 16.2's headers
+      run: >-
+        python3 scripts/x86_intrinsic_census.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     - name: Verify range-fold branch contracts
       env:
         CCC: target/fastbuild/lccc

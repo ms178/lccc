@@ -1365,6 +1365,12 @@ gate "x86-mflag-macro-parity" fast \
 # and pins GCC's rejection wording.
 gate "x86-prefer-vector-width" fast \
     python3 scripts/check_x86_prefer_vector_width.py "$LCCC" --gcc "${GCC16:-gcc-16}"
+# A macro lccc defines is a promise that the intrinsics behind it exist. The
+# census calls every intrinsic of GCC 16.2's headers under lccc and holds the
+# count that does not compile to tests/x86-intrinsics/expected.txt, in both
+# directions.
+gate "x86-intrinsic-census" fast \
+    python3 scripts/x86_intrinsic_census.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 

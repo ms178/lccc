@@ -1942,9 +1942,17 @@ impl Driver {
         if self.target == Target::I686 && self.no_sse2 {
             self.no_sse = self.sse_explicitly_disabled || self.general_regs_only;
         }
-        // APX's extended GPRs exist only in 64-bit mode (GCC 16.2's wording).
+        // APX's extended GPRs exist only in 64-bit mode: asked for by name
+        // it is an error (GCC 16.2's wording), and the APX of a CPU row is
+        // left out of 32-bit code, as GCC leaves it out of `-m32
+        // -march=novalake` (no `__APX_F__` there, and no error).
         if self.target == Target::I686 && self.enable_apxf {
-            return Err("'-mapxf' is not supported for 32-bit code".to_string());
+            if self.x86_isa_flag_was_enabled("-mapxf", "-mno-apxf")
+                || self.x86_isa_flag_was_enabled("-mapx", "-mno-apx")
+            {
+                return Err("'-mapxf' is not supported for 32-bit code".to_string());
+            }
+            self.enable_apxf = false;
         }
         // GCC 16.2 rejects a `-mtune=` name outside its vocabulary ("bad
         // value for '-mtune=' switch"); configure and Kbuild `cc-option`
@@ -3239,12 +3247,6 @@ impl Driver {
                                     // Every name in this legacy pre-SSE list
                                     // is FXSR-less on GCC 16.2 (measured).
                                     self.march_fxsr = false;
-                                }
-                                "novalake" | "diamondrapids" => {
-                                    return Err(format!(
-                                        "-march={} requires unimplemented AVX10/APX lowering",
-                                        march
-                                    ));
                                 }
                                 "native" => {
                                     // The HOST CPU's features, from the CPUID table
@@ -5491,6 +5493,45 @@ mod cli_tests {
         assert!(err.contains("only valid with -m32"), "{err}");
         let err = parse(&["ccc", "-m32", "-mapxf", "x.c"]).expect_err("-m32 -mapxf");
         assert!(err.contains("not supported for 32-bit code"), "{err}");
+    }
+
+    /// Every CPU name of GCC 16.2's table is a `-march=`. `novalake` and
+    /// `diamondrapids` were refused ("requires unimplemented AVX10/APX
+    /// lowering") although each of their features was accepted as an
+    /// option of its own: their rows grant what every other row grants,
+    /// the extensions lccc announces without generating code for them
+    /// included. In 32-bit code the row's APX is left out, as GCC leaves it
+    /// out (`-m32 -march=novalake` defines no `__APX_F__` and is no error);
+    /// APX asked for by name stays an error there.
+    #[test]
+    fn the_cpus_with_avx10_2_and_apx_are_accepted() {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let parsed = |args: &[&str]| {
+            let mut d = Driver::new();
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            d.parse_cli_args(&owned).map(|_| d)
+        };
+        for cpu in ["novalake", "diamondrapids"] {
+            let march = format!("-march={cpu}");
+            let mut d = parsed(&["ccc", &march, "x.c"]).unwrap_or_else(|e| panic!("{cpu}: {e}"));
+            assert!(d.enable_avx512f && d.enable_avx2, "{cpu}");
+            for extra in [E::ApxF, E::Avx10_1, E::Avx10_2, E::Movrs, E::Sm3, E::Sm4] {
+                assert!(*d.x86_extra_slot(extra), "{cpu}: {extra:?}");
+            }
+            let mut d = parsed(&["ccc", "-m32", &march, "x.c"])
+                .unwrap_or_else(|e| panic!("-m32 {cpu}: {e}"));
+            assert!(!*d.x86_extra_slot(E::ApxF), "-m32 {cpu}");
+            assert!(*d.x86_extra_slot(E::Avx10_2), "-m32 {cpu}");
+            for spelling in ["-mapxf", "-mapx"] {
+                let err = parsed(&["ccc", "-m32", &march, spelling, "x.c"])
+                    .err()
+                    .unwrap_or_else(|| panic!("-m32 {cpu} {spelling} was accepted"));
+                assert!(err.contains("not supported for 32-bit code"), "{err}");
+            }
+            // Withdrawn by name, the row's APX is no error either.
+            parsed(&["ccc", "-m32", &march, "-mapxf", "-mno-apxf", "x.c"])
+                .unwrap_or_else(|e| panic!("-m32 {cpu} -mapxf -mno-apxf: {e}"));
+        }
     }
 
     /// `-mcpu=` on x86 is GCC's deprecated `-mtune=` alias: it fills the
