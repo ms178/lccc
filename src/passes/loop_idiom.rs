@@ -4434,6 +4434,18 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
     if m.bound_ty.size() != size_ty.size() {
         return false;
     }
+    // The call stands where the loop stood: it takes the place in the source
+    // of the loop's first instruction, so a line table says the loop's line
+    // for it.  Every instruction goes in through the block's own interface,
+    // which keeps the table of places as long as the list of instructions:
+    // pushed onto the list directly, four instructions had no place and the
+    // found arm kept the places of instructions it no longer had
+    // (`CCC_VERIFY_IR=1`: "block #0 has 6 source spans for 10 instructions").
+    let span = func.blocks[m.header]
+        .source_spans
+        .first()
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy);
     // `(int)(unsigned char)c`: for a value, the U8 zero-extension is exactly
     // what `memchr` compares each byte against; a constant image is already
     // in 0..=255 (the matcher reduced it).
@@ -4447,7 +4459,7 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
                 from_ty: IrType::U8,
                 to_ty: IrType::I32,
             };
-            func.blocks[m.preheader].instructions.push(cast);
+            func.blocks[m.preheader].push_inst(cast, span);
             Operand::Value(widened)
         }
     };
@@ -4457,20 +4469,20 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
         m.bound.clone()
     } else {
         let widened = alloc_value(func);
-        func.blocks[m.preheader]
-            .instructions
-            .push(Instruction::Cast {
+        func.blocks[m.preheader].push_inst(
+            Instruction::Cast {
                 dest: widened,
                 src: m.bound.clone(),
                 from_ty: m.bound_ty,
                 to_ty: size_ty,
-            });
+            },
+            span,
+        );
         Operand::Value(widened)
     };
     let result = alloc_value(func);
-    func.blocks[m.preheader]
-        .instructions
-        .push(Instruction::Call {
+    func.blocks[m.preheader].push_inst(
+        Instruction::Call {
             func: "memchr".to_string(),
             info: crate::ir::reexports::CallInfo {
                 dest: Some(result),
@@ -4498,7 +4510,9 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
                 ret_is_vector128: false,
                 cold: false,
             },
-        });
+        },
+        span,
+    );
     // `result != 0` is "a byte matched".  The IR compares pointers at the
     // target's *integer* width with an `I64` null image -- that is the exact
     // shape the frontend emits for `p != 0` on every target
@@ -4507,15 +4521,16 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
     // compare's lane width depend on a pointer type the backends do not
     // classify.
     let hit = alloc_value(func);
-    func.blocks[m.preheader]
-        .instructions
-        .push(Instruction::Cmp {
+    func.blocks[m.preheader].push_inst(
+        Instruction::Cmp {
             dest: hit,
             op: IrCmpOp::Ne,
             lhs: Operand::Value(result),
             rhs: Operand::Const(IrConst::I64(0)),
             ty: size_ty,
-        });
+        },
+        span,
+    );
     let preheader_label = func.blocks[m.preheader].label;
     func.blocks[m.preheader].terminator = Terminator::CondBranch {
         cond: Operand::Value(hit),
@@ -4578,9 +4593,7 @@ fn rewrite_search_loop(func: &mut IrFunction, m: &SearchLoop) -> bool {
     // deleted instructions are exactly `base + i` (the IV is about to vanish)
     // plus values the matcher proved dead outside the arm.
     let keep: FxHashSet<u32> = m.found_keep.iter().map(|v| v.0).collect();
-    func.blocks[m.found]
-        .instructions
-        .retain(|inst| inst.dest().is_some_and(|d| keep.contains(&d.0)));
+    func.blocks[m.found].retain_insts(|inst| inst.dest().is_some_and(|d| keep.contains(&d.0)));
     // Delete the loop itself.
     let dead: FxHashSet<BlockId> = [m.header, m.body, m.latch]
         .iter()
