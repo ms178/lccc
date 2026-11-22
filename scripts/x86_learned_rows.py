@@ -904,9 +904,10 @@ def solve_numbers(rows, gas: str) -> tuple[list[Number], dict[str, dict]]:
 
 # The legacy prefixes in front of an opcode.
 LEGACY_PREFIXES = re.compile(rb"^[\x26\x2e\x36\x3e\x64\x65\x66\x67\xf0\xf2\xf3]*")
-# Of the statements GNU as refuses, one in this many is given to lccc: each
-# takes a run of its own.
-REFUSED_SHARE = 8
+# Of the statements GNU as refuses, one in this many is given to lccc: all
+# of them. (It was one in eight while each took a run of lccc of its own;
+# `gas_table_sweep.assemble_each`.)
+REFUSED_SHARE = 1
 # How many statements of each kind a report names.
 LISTED = int(os.environ.get("LEARNED_LISTED", "40"))
 HIGH_BYTES = ("%ah", "%ch", "%dh", "%bh")

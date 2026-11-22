@@ -14,8 +14,13 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import platform
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -173,6 +178,99 @@ class Batches(unittest.TestCase):
         self.assertEqual(sweep.verdict_of((b"", ()), same)[0], "SHORTER")
         self.assertEqual(sweep.verdict_of((b"\xf8", ()), same)[0], "DIFF")
         self.assertEqual(sweep.verdict_of((b"\x90", ((0, 2, "ext", None),)), same)[0], "RELOC")
+
+
+def system_as() -> str | None:
+    """An assembler of this machine that assembles 64-bit x86 code, if any."""
+    found = shutil.which("as")
+    if not found or platform.machine() not in ("x86_64", "AMD64"):
+        return None
+    probe = subprocess.run([found, "--64", "-o", os.devnull, "-"], input="\tnop\n",
+                           text=True, capture_output=True)
+    return found if probe.returncode == 0 else None
+
+
+@unittest.skipUnless(system_as(), "an x86-64 `as` to stand behind the planted drivers")
+class EachStatement(unittest.TestCase):
+    """`assemble_each`: the statements GNU as refuses, each a file of its own.
+
+    A driver that goes on behind a file it refuses is handed many files in
+    one run, any other one file at a time, and what is found is the same.
+    The drivers are the self-test's: an assembler behind lccc's command
+    line, with a defect planted in one statement each.
+    """
+    STATEMENTS = ["nop", "nosuchinsn", "clc", "sti", "bswap %xmm0", "nop %xmm0", "cmc", "stc"]
+    # Planted: `clc` is assembled as `stc`, `stc` as nothing, a statement
+    # with a register that the assembler refuses as `nop`; `sti` and
+    # `nop %xmm0` end the run with status 3; `cmc` and what the assembler
+    # refuses are refused.
+    ACCEPTED = {0: "lccc 90", 2: "lccc f9", 4: "lccc 90", 7: "lccc "}
+    CRASHED = {3: "exit status 3", 5: "exit status 3"}
+
+    def driver(self, directory: Path, plant: bool, stops: bool) -> tuple[str, Path]:
+        """A planted driver that counts its runs, and the file it counts in."""
+        planted = directory / f"planted-{plant}-{stops}"
+        planted.write_text(sweep.PLANTED.format(python=sys.executable, plant=plant,
+                                                stops=stops, gas=system_as()))
+        planted.chmod(0o755)
+        runs = directory / f"runs-{plant}-{stops}"
+        counting = directory / f"driver-{plant}-{stops}"
+        counting.write_text(f"#!/bin/sh\necho run >> '{runs}'\nexec '{planted}' \"$@\"\n")
+        counting.chmod(0o755)
+        return str(counting), runs
+
+    def each(self, plant: bool, stops: bool, statements: list[str]):
+        mode = sweep.MODES["64"]
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            driver, runs = self.driver(tmp, plant, stops)
+            work = tmp / "work"
+            work.mkdir()
+            found = sweep.assemble_each(statements, list(range(len(statements))), driver,
+                                        mode, work)
+            return found, len(runs.read_text().splitlines())
+
+    def test_a_driver_that_goes_on_is_told_apart_from_one_that_stops(self):
+        mode = sweep.MODES["64"]
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            for stops in (False, True):
+                driver, _ = self.driver(tmp, False, stops)
+                self.assertEqual(sweep.goes_on(driver, mode, tmp), not stops)
+            # No driver at all, and one that assembles nothing.
+            self.assertFalse(sweep.goes_on(str(tmp / "missing"), mode, tmp))
+            self.assertFalse(sweep.goes_on("/bin/false", mode, tmp))
+
+    def test_many_files_in_one_run_find_what_one_file_a_run_finds(self):
+        for stops in (False, True):
+            (accepted, crashed), _ = self.each(True, stops, self.STATEMENTS)
+            self.assertEqual(accepted, self.ACCEPTED, f"stops={stops}")
+            self.assertEqual(crashed, self.CRASHED, f"stops={stops}")
+
+    def test_a_driver_that_goes_on_takes_all_of_them_in_one_run(self):
+        statements = ["nop", "nosuchinsn", "clc", "cmc %eax", "stc", "cld"] * 20
+        expected = {index: {"nop": "lccc 90", "clc": "lccc f8", "stc": "lccc f9",
+                            "cld": "lccc fc"}[statement]
+                    for index, statement in enumerate(statements)
+                    if statement in ("nop", "clc", "stc", "cld")}
+        (accepted, crashed), runs = self.each(False, False, statements)
+        self.assertEqual((accepted, crashed), (expected, {}))
+        # The question whether it goes on, and the statements.
+        self.assertEqual(runs, 2)
+        (accepted, crashed), runs = self.each(False, True, statements)
+        self.assertEqual((accepted, crashed), (expected, {}))
+        self.assertEqual(runs, 1 + len(statements))
+
+    def test_a_run_that_dies_says_nothing_about_the_files_behind_it(self):
+        # `sti` ends the run: the statements behind it get a run each, and
+        # the ones in front of it are not asked again.
+        statements = ["nop", "clc", "sti", "stc", "nosuchinsn", "cld"]
+        (accepted, crashed), runs = self.each(True, False, statements)
+        self.assertEqual(accepted, {0: "lccc 90", 1: "lccc f9", 3: "lccc ", 5: "lccc fc90"})
+        self.assertEqual(crashed, {2: "exit status 3"})
+        # One question, one run of all, and one each for `sti` and the
+        # three behind it.
+        self.assertEqual(runs, 2 + 4)
 
 
 class Expectation(unittest.TestCase):

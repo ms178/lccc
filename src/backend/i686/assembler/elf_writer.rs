@@ -388,6 +388,27 @@ pub(crate) fn code16_encode_inner(
 mod tests {
     use super::super::assemble;
 
+    /// As the 64-bit assembler: GNU as's words and the statement, in 32-bit
+    /// code and behind `.code16`, where the message was `unhandled i686
+    /// instruction:` and the operands as Rust prints them.
+    #[test]
+    fn unknown_mnemonic_is_refused_with_the_statement() {
+        use super::super::assemble_bytes;
+        let refusal = |text: &str| assemble_bytes(text, None).unwrap_err();
+        assert_eq!(
+            refusal("\tnosuchinsn %eax\n"),
+            "no such instruction: `nosuchinsn %eax'"
+        );
+        assert_eq!(
+            refusal("\t.code16\n\tnosuchinsn $5, 8(%bx,%si)\n"),
+            "no such instruction: `nosuchinsn $5, 8(%bx,%si)'"
+        );
+        assert_eq!(
+            refusal("\tbt $256, %ecx\n"),
+            "operand type mismatch for `bt'"
+        );
+    }
+
     /// R_386_PC8 owns a 1-byte field: the REL-format addend patch must write
     /// exactly one byte, or the bytes after the field get clobbered. Linux
     /// arch/x86/boot/header.S puts `.byte start_of_setup-1f` immediately

@@ -1221,18 +1221,67 @@ impl Driver {
         crate::backend::generation::set_sibling_calls_requested(!self.no_sibling_calls);
 
         match self.mode {
-            CompileMode::PreprocessOnly => self.run_preprocess_only(),
-            CompileMode::AssemblyOnly => self.run_assembly_only(),
-            CompileMode::ObjectOnly => self.run_object_only(),
+            CompileMode::PreprocessOnly => {
+                self.every_input(|input| self.run_preprocess_only(input))
+            }
+            CompileMode::AssemblyOnly => self.every_input(|input| self.run_assembly_only(input)),
+            CompileMode::ObjectOnly => self.every_input(|input| self.run_object_only(input)),
             CompileMode::Full => self.run_full(),
-            CompileMode::SyntaxOnly => self.run_syntax_only(),
+            CompileMode::SyntaxOnly => self.every_input(|input| self.run_syntax_only(input)),
         }
     }
 
     // ---- Run modes ----
 
-    fn run_preprocess_only(&self) -> Result<(), String> {
-        for input_file in &self.input_files {
+    /// What `run` fails with when everything that went wrong has been said:
+    /// the caller has only the exit status left to set.
+    pub const REPORTED: &'static str = "";
+
+    /// Run `mode` on each input file in turn, and on every one of them.
+    ///
+    /// GCC and Clang go on with the inputs behind one that fails: `gcc -c
+    /// a.c b.c` writes `b.o` whatever is wrong with `a.c`, reports both and
+    /// fails at the end, and so with `-S`, `-E` and `-fsyntax-only`. A build
+    /// that hands the driver several inputs gets every diagnostic and every
+    /// output that can be made from one run. The first failure used to end
+    /// the run: `b.o` was not written, and what was wrong with `b.c` not said.
+    ///
+    /// A failure is reported here, when it happens, so that it stands under
+    /// the diagnostics of its own input; the run then fails with
+    /// [`Self::REPORTED`]. One input alone says what it always said.
+    fn every_input(&self, mode: impl Fn(&[String]) -> Result<(), String>) -> Result<(), String> {
+        let mut failed = false;
+        for input in self.input_files.chunks(1) {
+            if let Err(error) = mode(input) {
+                self.report_failure(&input[0], &error);
+                failed = true;
+            }
+        }
+        if failed {
+            Err(Self::REPORTED.to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Say that `input` failed with `error`.
+    ///
+    /// Among several inputs the reader has to be told which one it was, and
+    /// not every stage names its file: the assembler's `operand type
+    /// mismatch for `bt'` could be any of them.
+    fn report_failure(&self, input: &str, error: &str) {
+        if error == Self::REPORTED {
+            return;
+        }
+        if self.input_files.len() > 1 && !error.contains(input) {
+            lccc::cli::stderr_line(format_args!("ccc: error: {}: {}", input, error));
+        } else {
+            lccc::cli::stderr_line(format_args!("ccc: error: {}", error));
+        }
+    }
+
+    fn run_preprocess_only(&self, inputs: &[String]) -> Result<(), String> {
+        for input_file in inputs {
             if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
                 // For .S files, delegate preprocessing to gcc which understands
                 // assembly-specific preprocessor behavior
@@ -1561,8 +1610,8 @@ impl Driver {
         }
     }
 
-    fn run_syntax_only(&self) -> Result<(), String> {
-        for input_file in &self.input_files {
+    fn run_syntax_only(&self, inputs: &[String]) -> Result<(), String> {
+        for input_file in inputs {
             if Self::is_object_or_archive(input_file) {
                 continue;
             }
@@ -1889,8 +1938,8 @@ impl Driver {
         Ok(())
     }
 
-    fn run_assembly_only(&self) -> Result<(), String> {
-        for input_file in &self.input_files {
+    fn run_assembly_only(&self, inputs: &[String]) -> Result<(), String> {
+        for input_file in inputs {
             let out_path = self.output_for_input(input_file);
             // When gcc_m16 feature is enabled, delegate -m16 C compilation to GCC
             #[cfg(feature = "gcc_m16")]
@@ -1982,8 +2031,8 @@ impl Driver {
         Some(request)
     }
 
-    fn run_object_only(&self) -> Result<(), String> {
-        for input_file in &self.input_files {
+    fn run_object_only(&self, inputs: &[String]) -> Result<(), String> {
+        for input_file in inputs {
             let out_path = self.output_for_input(input_file);
             if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
                 // .s/.S files (or -x assembler): pass directly to the assembler
@@ -2021,6 +2070,84 @@ impl Driver {
         Ok(())
     }
 
+    /// One input of a link: its object joins `temp_guards`, or its name the
+    /// list of what is passed on as it is or of what is compiled as one program.
+    fn compile_for_link<'a>(
+        &'a self,
+        input_file: &'a str,
+        can_merge_whole_program: bool,
+        temp_guards: &mut Vec<crate::common::temp_files::TempFile>,
+        extra_passthrough: &mut Vec<String>,
+        whole_program_c_files: &mut Vec<&'a str>,
+    ) -> Result<(), String> {
+        use crate::common::temp_files::TempFile;
+
+        if Self::is_object_or_archive(input_file) {
+            // Object/archive files are passed to the linker via linker_ordered_items
+            // (populated during argument parsing) to preserve their position relative
+            // to -Wl, and -l flags. This is critical for --whole-archive support.
+        } else if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
+            // .s/.S files (or -x assembler): pass to assembler, then link
+            let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
+                .map_err(|error| error.to_string())?;
+            self.assemble_source_file(
+                input_file,
+                tmp.to_str().map_err(|error| error.to_string())?,
+            )?;
+            temp_guards.push(tmp);
+        } else if !Self::is_c_source(input_file) && Self::looks_like_binary_object(input_file) {
+            // Unrecognized extension but file has ELF/archive magic bytes -
+            // treat as object file. These weren't caught by is_object_or_archive
+            // at parse time, so add them to the extra passthrough list.
+            extra_passthrough.push(input_file.to_string());
+        } else {
+            // When gcc_m16 feature is enabled, delegate -m16 C compilation to GCC
+            #[cfg(feature = "gcc_m16")]
+            if self.code16gcc {
+                use super::external_tools::GccM16Mode;
+                let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
+                    .map_err(|error| error.to_string())?;
+                self.compile_with_gcc_m16(
+                    input_file,
+                    tmp.to_str().map_err(|error| error.to_string())?,
+                    GccM16Mode::Object,
+                )?;
+                if self.verbose {
+                    crate::common::cli_output::stderr_line(format_args!(
+                        "Compiled (GCC -m16): {}",
+                        input_file
+                    ));
+                }
+                self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
+                temp_guards.push(tmp);
+                return Ok(());
+            }
+            if can_merge_whole_program {
+                whole_program_c_files.push(input_file);
+                return Ok(());
+            }
+            // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
+            let compiled = self.compile_to_assembly(input_file)?;
+
+            let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
+                .map_err(|error| error.to_string())?;
+            let extra = self.build_asm_extra_args();
+            self.target.assemble_with_extra(
+                &compiled.asm,
+                tmp.to_str().map_err(|error| error.to_string())?,
+                &extra,
+                self.debug_request(compiled.debug_unit),
+            )?;
+            // Write dependency file for this source file. When compiling and
+            // linking in one step, GCC's -Wp,-MMD uses the .o name as the
+            // dependency target. We use the output executable path as target,
+            // which is sufficient for kernel build's fixdep processing.
+            self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
+            temp_guards.push(tmp);
+        }
+        Ok(())
+    }
+
     fn run_full(&self) -> Result<(), String> {
         use crate::common::temp_files::TempFile;
 
@@ -2032,69 +2159,19 @@ impl Driver {
         let can_merge_whole_program =
             self.whole_program && !self.relocatable && !self.debug_info && !self.code16gcc;
 
+        // Every input is compiled, whatever is wrong with the one before it (see
+        // `every_input`); behind a failure nothing is linked.
+        let mut failed = false;
         for input_file in &self.input_files {
-            if Self::is_object_or_archive(input_file) {
-                // Object/archive files are passed to the linker via linker_ordered_items
-                // (populated during argument parsing) to preserve their position relative
-                // to -Wl, and -l flags. This is critical for --whole-archive support.
-            } else if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
-                // .s/.S files (or -x assembler): pass to assembler, then link
-                let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
-                    .map_err(|error| error.to_string())?;
-                self.assemble_source_file(
-                    input_file,
-                    tmp.to_str().map_err(|error| error.to_string())?,
-                )?;
-                temp_guards.push(tmp);
-            } else if !Self::is_c_source(input_file) && Self::looks_like_binary_object(input_file) {
-                // Unrecognized extension but file has ELF/archive magic bytes -
-                // treat as object file. These weren't caught by is_object_or_archive
-                // at parse time, so add them to the extra passthrough list.
-                extra_passthrough.push(input_file.clone());
-            } else {
-                // When gcc_m16 feature is enabled, delegate -m16 C compilation to GCC
-                #[cfg(feature = "gcc_m16")]
-                if self.code16gcc {
-                    use super::external_tools::GccM16Mode;
-                    let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
-                        .map_err(|error| error.to_string())?;
-                    self.compile_with_gcc_m16(
-                        input_file,
-                        tmp.to_str().map_err(|error| error.to_string())?,
-                        GccM16Mode::Object,
-                    )?;
-                    if self.verbose {
-                        crate::common::cli_output::stderr_line(format_args!(
-                            "Compiled (GCC -m16): {}",
-                            input_file
-                        ));
-                    }
-                    self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
-                    temp_guards.push(tmp);
-                    continue;
-                }
-                if can_merge_whole_program {
-                    whole_program_c_files.push(input_file.as_str());
-                    continue;
-                }
-                // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
-                let compiled = self.compile_to_assembly(input_file)?;
-
-                let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
-                    .map_err(|error| error.to_string())?;
-                let extra = self.build_asm_extra_args();
-                self.target.assemble_with_extra(
-                    &compiled.asm,
-                    tmp.to_str().map_err(|error| error.to_string())?,
-                    &extra,
-                    self.debug_request(compiled.debug_unit),
-                )?;
-                // Write dependency file for this source file. When compiling and
-                // linking in one step, GCC's -Wp,-MMD uses the .o name as the
-                // dependency target. We use the output executable path as target,
-                // which is sufficient for kernel build's fixdep processing.
-                self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
-                temp_guards.push(tmp);
+            if let Err(error) = self.compile_for_link(
+                input_file,
+                can_merge_whole_program,
+                &mut temp_guards,
+                &mut extra_passthrough,
+                &mut whole_program_c_files,
+            ) {
+                self.report_failure(input_file, &error);
+                failed = true;
             }
         }
 
@@ -2123,6 +2200,9 @@ impl Driver {
                 self.debug_request(compiled.debug_unit),
             )?;
             temp_guards.push(tmp);
+        }
+        if failed {
+            return Err(Self::REPORTED.to_string());
         }
 
         // Compiled temp objects go first (order relative to linker flags doesn't matter

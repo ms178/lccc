@@ -170,7 +170,11 @@ pub fn compiler_main() {
     match handler.join() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            lccc::cli::stderr_line(format_args!("ccc: error: {}", e));
+            // With several inputs each failure has been reported under the
+            // diagnostics of its own file.
+            if e != driver::Driver::REPORTED {
+                lccc::cli::stderr_line(format_args!("ccc: error: {}", e));
+            }
             std::process::exit(1);
         }
         Err(e) => {

@@ -415,6 +415,34 @@ mod tests {
     use super::X86_64Arch;
     use crate::backend::elf_writer_common::X86Arch;
 
+    /// A mnemonic no encoder has is refused in GNU as's words, with the
+    /// statement as it was written. The message used to be the encoders'
+    /// own -- `unhandled instruction: nosuchinsn [Register(Register { name:
+    /// "eax", mask: None, zeroing: false, broadcast: None })]` -- which is
+    /// how their fallbacks tell an unknown mnemonic from a known one.
+    #[test]
+    fn unknown_mnemonic_is_refused_with_the_statement() {
+        use crate::backend::x86::assembler::assemble_bytes;
+        let refusal = |text: &str| assemble_bytes(text, None).unwrap_err();
+        assert_eq!(
+            refusal("\tnosuchinsn %eax\n"),
+            "no such instruction: `nosuchinsn %eax'"
+        );
+        assert_eq!(
+            refusal("\tnosuchinsn $5, 8(%rbx,%rcx,4)\n"),
+            "no such instruction: `nosuchinsn $5, 8(%rbx,%rcx,4)'"
+        );
+        assert_eq!(
+            refusal("\tnosuchinsn\n"),
+            "no such instruction: `nosuchinsn'"
+        );
+        // The refusal of a known mnemonic is the one that says what is wrong.
+        assert_eq!(
+            refusal("\tbt $256, %ecx\n"),
+            "operand type mismatch for `bt'"
+        );
+    }
+
     /// Every known x86-64 TLS relocation (binutils 2.47
     /// `include/elf/x86-64.h`) must classify as TLS: local-label folding
     /// rewrites a reloc's symbol to the section symbol, which is only

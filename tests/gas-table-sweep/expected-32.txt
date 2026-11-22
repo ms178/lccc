@@ -14,8 +14,8 @@ rows 4848
 statements 29469
 assembled 16625
 same 16146
-foreign 50791
-refused 48609
+foreign 126359
+refused 119750
 reject addr16 1 45ab3611
 reject addr32 1 a5411652
 reject adword 1 0045b0be

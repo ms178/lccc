@@ -14,8 +14,8 @@ rows 4848
 statements 29673
 assembled 16768
 same 16241
-foreign 50858
-refused 48691
+foreign 126420
+refused 119811
 accept vgatherdps %xmm6, 0x1000(,%xmm7,8), %xmm1
 accept vgatherdps %xmm6, 0x1000(,%xmm7,8), %xmm6
 accept vgatherdps %ymm2, 0x1000(,%ymm7,8), %ymm2

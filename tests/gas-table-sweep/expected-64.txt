@@ -14,8 +14,8 @@ rows 4848
 statements 31065
 assembled 18492
 same 17693
-foreign 53444
-refused 51248
+foreign 135032
+refused 128371
 shorter vcmpfalse_oqps %ymm10, %ymm2, %ymm10
 shorter vcmpneq_ospd %xmm9, %xmm1, %xmm1
 shorter vpaddb %ymm10, %ymm2, %ymm10

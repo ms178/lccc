@@ -1085,6 +1085,13 @@ gate "temp-symlink-hardening" fast \
 gate "o-stdout" fast \
     env CCC="$LCCC" bash tests/regression/check_o_stdout.sh
 
+# GCC and Clang go on with the inputs behind one that fails (`gcc -c a.c bad.c
+# c.c` writes a.o and c.o and reports bad.c); the driver ended the run at the
+# first failure. -c, -S, -E and -fsyntax-only, C and assembly inputs, and the
+# objects GCC leaves as the oracle.
+gate "every-input-compiled" fast \
+    env CCC="$LCCC" GCC=gcc-16 bash tests/regression/check_every_input_compiled.sh
+
 # AUD-HYGIENE-1: the loose `tests/*.c`/`*.sh` scratch (compat_test.sh and the
 # IVSR/univsr probes) are gates now instead of unreferenced files.  The compat
 # suite is a run-and-compare differential against GCC; the probe
@@ -3176,6 +3183,21 @@ gate "i686-asm-diff" fast \
 # the pinned GNU as says.
 gate "x86-vector-width-table" fast \
     python3 scripts/x86_vector_widths.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+
+# The instructions no encoder arm was written for (3DNow!, FMA4, XOP, TBM,
+# LWP, Key Locker, AMX, AVX10.2, SM3, SHA512, the MMX/SSE conversions, odd
+# forms of known ones) are a table that scripts/x86_learned_rows.py solves
+# from GNU as's bytes (encoder/learned_rows.rs; encoder/learned.rs reads it).
+# --verify: is the table in the tree what GNU as answers today, and does lccc
+# make of every row what GNU as makes of it? The second question is asked
+# with what the solving held still -- every register of a kind, the
+# addresses, masks, broadcasts, rounding modes, numbers and encoding hints:
+# 370,000 statements in 64-bit, 32-bit and 16-bit code. The ones GNU as
+# assembles have to come out as the same bytes and relocations, and of the
+# 200,000 it refuses lccc has to refuse every one.
+gate "x86-learned-rows" fast \
+    python3 scripts/x86_learned_rows.py --verify --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-x86 --lccc32 target/fastbuild/lccc-i686
 
 gate "x86-gas-table-sweep" fast \
     python3 scripts/gas_table_sweep.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \

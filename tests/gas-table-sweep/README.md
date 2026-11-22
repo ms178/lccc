@@ -61,10 +61,19 @@ instruction's vector length from one operand and never looks at the others,
 or takes the operand size from a suffix and never looks at the register,
 assembles such a statement into an instruction on other registers: before
 these sweeps existed 17,000 of the first kind and 1,200 of the second were
-assembled, and of the third 670 in 64-bit code and 270 in 32-bit code. Each
-of these statements takes a run of lccc of its own (lccc stops at the first
-statement it refuses), so of the first two kinds one in three is swept; of
-the third, every one.
+assembled, and of the third 670 in 64-bit code and 270 in 32-bit code.
+
+Each of these statements is a file of its own, because lccc stops a file at
+the first statement it refuses and says nothing about the ones behind it.
+lccc is handed four hundred of the files in one run: like GCC it goes on with
+the inputs behind one it refuses, so an object is there for a statement it
+assembles and not for one it refuses. With a run for each statement the
+64-bit sweep took 115 seconds for one statement in three; it takes 36 for
+every one of them -- 135,000 statements in 64-bit code, 126,000 in each of
+the other two. A run that ends in anything but a refusal says nothing about
+the files it left without an object, and those get a run each (the self-test
+plants a driver that stops at the first file it refuses beside one that goes
+on, and the findings have to be the same).
 
 What an encoding takes is checked in one place for every instruction
 (`src/backend/x86/assembler/encoder/operand_class.rs`): the kinds of register
@@ -81,6 +90,62 @@ address names no general register (`vgatherdps %xmm6, 0x1000(,%xmm7,8),
 %xmm1`). Such an address is 16 bits wide for GNU as, which has no 16-bit form
 of it and wants `addr32` written in front; lccc writes the prefix, and the
 bytes are the ones GNU as makes of the statement with `addr32`.
+
+## The instructions learned from GNU as
+
+An instruction is encoded by the arm that was written for it, and one nobody
+wrote an arm for was refused however regular its encoding: before the table
+below 2,968 of the 18,492 swept statements in 64-bit code, 3,237 in 32-bit
+code and 3,308 in 16-bit code -- 3DNow!, FMA4, XOP, TBM, LWP, Key Locker, AMX,
+AVX10.2, SM3, SHA512, the MMX and SSE conversions, and odd forms of
+instructions the arms know.
+
+`scripts/x86_learned_rows.py` closes that list with a table instead of an arm
+per instruction. Of every spelling of a mnemonic on its list it asks GNU as
+what it assembles -- each operand a general, MMX, vector, mask or tile
+register of one width, memory, or a number -- and from the bytes of two
+statements that differ in their registers it works out where each operand
+goes: the prefix, the map and the opcode, the `ModRM` fields, `vvvv`, the
+upper half of a trailing byte. Further statements say what else the form
+takes: a mask and zeroing, a broadcast and its width, a rounding mode, a
+register of APX, how a one-byte displacement is scaled. Nothing is copied
+from the table's columns; its rows only say which statements are worth
+asking. What comes out is `src/backend/x86/assembler/encoder/learned_rows.rs`
+(2,453 rows of 734 mnemonics), which `encoder/learned.rs` reads for both
+assemblers. A row is tried only where the arms and the plain table refuse a
+statement, or wrote it in an encoding that cannot say it (`{evex}`, `{vex}`,
+a register beyond `%r15`), so what the compiler emits is encoded as before.
+
+The same script asks GNU as how large the one-byte number of every
+instruction may be (`$256` is refused in `pshufd`, cut with a warning in
+`add`, and `$-128` is taken by some forms and not by others): 342 ranges of
+263 mnemonics, which every statement is held to before it is encoded.
+
+```
+scripts/x86_learned_rows.py --as AS --verify --lccc LCCC --lccc32 LCCC32   # the gate
+scripts/x86_learned_rows.py --as AS --check                 # is the file GNU as's answers?
+scripts/x86_learned_rows.py --as AS --write [--add M]       # solve again
+scripts/x86_learned_rows.py --as AS --show --add M          # the rows of one mnemonic
+```
+
+`--verify` holds the file in the tree to GNU as (it has to be what solving
+gives today), and then lccc to GNU as on what the solving held still: every
+register of a kind, the addresses, the masks, the broadcasts, the rounding
+modes, the numbers and the encoding hints of every row -- 174,000 statements
+in 64-bit code and 100,000 in each of 32-bit and 16-bit code. The 169,000
+that GNU as assembles have to come out as the same bytes and relocations, and
+of the 204,000 it refuses lccc has to refuse every one. Twenty-seven
+statements are left out, and lccc refuses them: GNU as assembles them into
+another instruction than the one written (`data16` in front of an EVEX
+instruction of map 4 becomes a bit of the prefix; `data16 vmread` is
+`extrq`).
+
+With the rows, 793 statements are refused in 64-bit code, 479 in 32-bit code
+and 527 in 16-bit code. What is left is no instruction a table of register
+positions can say: `ccmp` and `ctest` with their flag values, the string
+instructions written with operands, `imulzu`, far and sized branches and
+returns, the x87 environment forms with a size suffix, and prefixes written
+as statements of their own.
 
 ## The expectation files
 

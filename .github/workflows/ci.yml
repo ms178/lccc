@@ -1047,6 +1047,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_static_local_init.sh
     - name: Standard-output contract for -o -
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
+    - name: Every input file is compiled, as GCC 16.2 does
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_every_input_compiled.sh
     - name: Inline-asm operand and template diagnostics match GCC 16.2
       run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
     - name: Ring identities against GCC 16 and Clang 23.1.5
@@ -2423,6 +2425,9 @@ jobs:
         --lccc target/fastbuild/lccc-i686
     - name: Verify the vector-width table is what GNU as 2.47 says
       run: python3 scripts/x86_vector_widths.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+    - name: Verify the instructions learned from GNU as 2.47 are what it assembles
+      run: python3 scripts/x86_learned_rows.py --verify --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+        --lccc target/fastbuild/lccc-x86 --lccc32 target/fastbuild/lccc-i686
     - name: Verify x86-64 instruction-table sweep vs GNU as 2.47
       run: python3 scripts/gas_table_sweep.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
         --lccc target/fastbuild/lccc-x86

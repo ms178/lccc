@@ -3205,9 +3205,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
         };
         // An error that names no instruction gets the statement it is about.
         // Messages that already quote one (GAS's own wordings do) are kept
-        // verbatim.
+        // verbatim. A mnemonic no encoder has is refused in GNU as's words
+        // and with the statement: what the encoders say of it among
+        // themselves ("unhandled", and the operands as Rust prints them) is
+        // how their fallbacks tell it from a known one, not a diagnostic.
         let result = encoded.map_err(|e| {
-            if e.contains('`') || e.contains(instr.mnemonic.as_str()) {
+            if e.starts_with("unhandled ") {
+                format!("no such instruction: `{}'", instr.source_text())
+            } else if e.contains('`') || e.contains(instr.mnemonic.as_str()) {
                 e
             } else {
                 format!("{e}: `{}'", instr.source_text())
