@@ -5840,14 +5840,37 @@ impl SemanticAnalyzer {
     }
 
     fn member_base_ctype(&self, base_expr: &Expr, is_pointer: bool) -> Option<CType> {
-        let base_ctype = self.expr_checker().infer_expr_ctype(base_expr)?;
-        if !is_pointer {
-            return Some(base_ctype);
+        let mut base_ctype = self.expr_checker().infer_expr_ctype(base_expr)?;
+        if is_pointer {
+            match base_ctype {
+                CType::Pointer(inner, _) | CType::Array(inner, _) => base_ctype = *inner,
+                _ => return None,
+            }
         }
-        match base_ctype {
-            CType::Pointer(inner, _) | CType::Array(inner, _) => Some(*inner),
+        // `->` and `[]` DEREFERENCE their operand (C11 6.5.2.3p4, 6.5.2.1p2),
+        // so the struct/union behind `(*pp)->a`, `pp[0]->a` or `(*pa)[0].a`
+        // sits behind those dereferences.  `infer_expr_ctype` answers with the
+        // pointer type itself for them, which used to lose the record --
+        // `(*pp)->a` was consequently not recognised as a bit-field (its
+        // read-only diagnostic then had the wrong severity) and every
+        // `member_constness` query through such a base answered "not const"
+        // (a missing diagnostic).  Walk through explicit dereferences and
+        // subscripts to the pointee; anything else is left to the caller.
+        let mut guard = 0u32;
+        while let Some(pointee) = match &base_ctype {
+            CType::Pointer(inner, _) => Some((**inner).clone()),
+            CType::Array(inner, _) => Some((**inner).clone()),
             _ => None,
+        } {
+            // Bound the walk: this is a diagnostic helper, and a deeply
+            // nested pointer chain is free to stay a pointer for our purposes.
+            guard += 1;
+            if guard > 8 {
+                break;
+            }
+            base_ctype = pointee;
         }
+        Some(base_ctype)
     }
 
     /// The ext vector and selector of `expr` when it is an ext-vector
@@ -9030,6 +9053,22 @@ dereference it before applying '->' to it?"
             && content.is_char_boundary(start)
             && content.is_char_boundary(end)
         {
+            // The span of `(*pp)->a` starts at the `*`: the opening paren of
+            // an EXPLICIT dereference is not part of any token the walk
+            // covered, so the fragment would read `*pp)->a`.  Check the
+            // character before the fragment (only whitespace is ever between
+            // a delimiter and the operand) and pull the paren in when the
+            // token it belongs to is inside the fragment.
+            let mut start = start;
+            if content.as_bytes().get(start) == Some(&b'*') {
+                let mut back = start;
+                while back > 0 && content.as_bytes()[back - 1].is_ascii_whitespace() {
+                    back -= 1;
+                }
+                if back > 0 && content.as_bytes()[back - 1] == b'(' {
+                    start = back - 1;
+                }
+            }
             let text = &content[start..end];
             if !text.is_empty() && !text.contains('\n') {
                 return text.to_string();
@@ -9622,6 +9661,18 @@ dereference it before applying '->' to it?"
     /// field name. A non-literal offset falls back to source (GCC prints
     /// an internal scaled form there — a documented divergence).
     fn readonly_location_text(&self, target: &Expr) -> String {
+        let text = self.readonly_location_text_inner(target);
+        // A location MUST read as a well-formed expression: the message is
+        // pinned by tests and consumed by humans, and an unbalanced fragment
+        // (`(*pp)->a` losing its opening paren because the member-access span
+        // starts at the `*`) is a defect however GCC happens to spell the
+        // same case.  Every branch of the renderer returns either source text
+        // or a constructed spelling; balance the parens as the last step so
+        // no individual branch can regress this.
+        Self::balance_delimiters(text)
+    }
+
+    fn readonly_location_text_inner(&self, target: &Expr) -> String {
         let tc = self.expr_type_checker();
         let mut stars = 0usize;
         let mut offset_bytes: i128 = 0;
@@ -9794,6 +9845,70 @@ dereference it before applying '->' to it?"
             return format!("{}({} + {})", "*".repeat(stars), source(cur), offset_bytes);
         }
         self.expr_source_text(target)
+    }
+
+    /// Close any `(`/`[` a source fragment left open, in reverse order of
+    /// appearance, so a location renders as a complete expression.
+    ///
+    /// `expr_source_text` reconstructs a fragment from token spans, and the
+    /// span of `(*pp)->a` starts at `*` -- the opening paren of an explicit
+    /// dereference is not part of any token span.  The fragment then reads
+    /// `*pp)->a`, which no compiler would print.  Balancing is mechanical and
+    /// total: it counts delimiters outside character literals and closes what
+    /// is outstanding.  Fragments that are already balanced (the overwhelming
+    /// majority) are returned unchanged, so no measured spelling moves.
+    fn balance_delimiters(text: String) -> String {
+        let mut depth: Vec<u8> = Vec::new();
+        let mut in_char_literal = false;
+        let mut escaped = false;
+        for b in text.bytes() {
+            if in_char_literal {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'\'' {
+                    in_char_literal = false;
+                }
+                continue;
+            }
+            match b {
+                b'\'' => in_char_literal = true,
+                b'(' => depth.push(b')'),
+                b'[' => depth.push(b']'),
+                b')' | b']' => {
+                    if depth.last() == Some(&b) {
+                        depth.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth.is_empty() {
+            return text;
+        }
+        let mut out = text;
+        for close in depth.iter().rev() {
+            out.push(*close as char);
+        }
+        out
+    }
+
+    /// For a member selection (`x.f`, `p->f`), whether the read-only-ness
+    /// comes from the OBJECT the selection is made through (true) or from the
+    /// member's own qualifiers (false).  `None` for anything that is not a
+    /// member selection.
+    ///
+    /// This is the single discriminator GCC's wording and severity both turn
+    /// on: `assignment of member 'f' in read-only object` (error) versus
+    /// `assignment of read-only member 'f'` (error, except a bit-field, which
+    /// only warns -- see `is_bitfield_member_target`).
+    fn selection_is_in_readonly_object(&self, target: &Expr) -> Option<bool> {
+        match target {
+            Expr::MemberAccess(base, _, _) => Some(self.lvalue_readonly_qualpath(base)),
+            Expr::PointerMemberAccess(base, _, _) => Some(self.pointee_readonly(base)),
+            _ => None,
+        }
     }
 
     fn member_constness(&self, base: &Expr, field: &str, indirect: bool) -> (bool, bool) {
@@ -10162,18 +10277,27 @@ dereference it before applying '->' to it?"
         if self.is_known_rvalue(target, false) || !self.lvalue_readonly(target) {
             return;
         }
-        if self.is_bitfield_member_target(target) {
-            // Measured on GCC 16.2.0: `warning: assignment of read-only
-            // location 'v.f'` at default, `-Wall`, `-Wextra -pedantic` and
-            // `-std=c11 -pedantic-errors`; only `-Werror` promotes it.  The
-            // location text is the source spelling, so it uses the same
-            // renderer as every other location-class message.
-            //
-            // The message is rendered BEFORE the engine is borrowed mutably:
-            // `readonly_location_text` re-enters `self.diagnostics.borrow()`
-            // for the source manager, and evaluating it inside the `warning`
-            // argument list would panic on an already-mutably-borrowed
-            // RefCell (the same invariant every other site follows).
+        // A read-only BIT-FIELD is the one case GCC only WARNS about, and the
+        // discriminator is WHOSE const makes the lvalue read-only -- exactly
+        // the one the wording below already uses.  Measured on GCC 16.2.0
+        // over a 14-case matrix (field-level const, object-level const,
+        // arrays of const, anonymous/nested aggregates, unions, `->` and `.`,
+        // local objects, pointer members):
+        //
+        // * the const is on the bit-field's own type (`struct S { const int
+        //   a : 3; }; s->a = 1`) -- C11 6.3.2.1p3, and GCC warns at default,
+        //   `-Wall`, `-Wextra -pedantic` and `-std=c11 -pedantic-errors`;
+        //   only `-Werror` promotes it.  Wording is the location class:
+        //   `read-only location 's->a'`, never `read-only member 'a'`.
+        // * the OBJECT is const-qualified (`const struct S *s; s->a = 1`) --
+        //   a constraint violation, and GCC errors with `assignment of member
+        //   'a' in read-only object`, bit-field or not.
+        //
+        // `selection_is_in_readonly_object` is the shared discriminator, so
+        // severity and wording cannot drift apart.
+        if self.is_bitfield_member_target(target)
+            && self.selection_is_in_readonly_object(target) == Some(false)
+        {
             let message = format!(
                 "{verb} of read-only location '{}'",
                 self.readonly_location_text(target)
@@ -10181,6 +10305,11 @@ dereference it before applying '->' to it?"
             self.diagnostics.borrow_mut().warning(message, op_span);
             return;
         }
+        // The message is rendered BEFORE the engine is borrowed mutably:
+        // `readonly_location_text` re-enters `self.diagnostics.borrow()` for
+        // the source manager, and evaluating it inside the `error` argument
+        // list would panic on an already-mutably-borrowed RefCell (the
+        // invariant every other diagnostic site follows).
         let message = match target {
             // GCC 16.2 says `parameter` for a function parameter and
             // `variable` for everything else (measured).
@@ -10188,15 +10317,8 @@ dereference it before applying '->' to it?"
                 format!("{verb} of read-only parameter '{name}'")
             }
             Expr::Identifier(name, _) => format!("{verb} of read-only variable '{name}'"),
-            Expr::MemberAccess(base, field, _) => {
-                if self.lvalue_readonly_qualpath(base) {
-                    format!("{verb} of member '{field}' in read-only object")
-                } else {
-                    format!("{verb} of read-only member '{field}'")
-                }
-            }
-            Expr::PointerMemberAccess(base, field, _) => {
-                if self.pointee_readonly(base) {
+            Expr::MemberAccess(_, field, _) | Expr::PointerMemberAccess(_, field, _) => {
+                if self.selection_is_in_readonly_object(target) == Some(true) {
                     format!("{verb} of member '{field}' in read-only object")
                 } else {
                     format!("{verb} of read-only member '{field}'")

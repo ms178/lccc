@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1521,10 +1522,120 @@ def run_multi_file_test(verbose, tmpdir):
         return "PASS", ""
     return "MISMATCH", f"GCC: {gcc_r.stdout.strip()}\nLCCC: {lccc_r.stdout.strip()}"
 
+def _diag_lines(binary, path, flags):
+    """The (severity, text) pairs a compiler reports for one source file."""
+    proc = subprocess.run(
+        [binary, *flags, "-c", path, "-o", os.devnull],
+        capture_output=True, text=True,
+    )
+    out = []
+    for line in proc.stderr.splitlines():
+        m = re.match(r"^[^:]+:\d+:\d+: (warning|error|note): (.*)$", line.strip())
+        if m:
+            out.append((m.group(1), m.group(2)))
+    return proc.returncode, out
+
+
+def _lccc_diag_lines(path, flags):
+    """LCCC's diagnostics, minus the batch summary line it appends on failure."""
+    code, lines = _diag_lines(str(LCCC), path, flags)
+    return code, [l for l in lines if not l[1].startswith("error(s) during semantic")]
+
+
+# C11 6.3.2.1p3 modifiability, pinned against GCC 16.2.0 case by case.
+#
+# The distinction the compiler must get right is not "is this a bit-field" but
+# "whose const makes it read-only": a const-qualified FIELD of a non-const
+# record is a warning for a bit-field and an error otherwise, while a const
+# OBJECT is always a constraint violation and always worded `member 'f' in
+# read-only object`.  Severity alone is not enough to pin that, so each case
+# asserts both the severity and the exact wording.
+#
+# (name, declaration, statement, gcc severity, gcc text)
+_READONLY_MATRIX = [
+    ("objconst_ptr_member", "struct S{int *const p;};", "void f(struct S*s,int*q){ s->p=q; }",
+     "error", "assignment of read-only member 'p'"),
+    ("constfield_plain", "struct S{const int a;};", "void f(struct S*s){ s->a=1; }",
+     "error", "assignment of read-only member 'a'"),
+    ("constfield_bitfield", "struct S{const int a:3;};", "void f(struct S*s){ s->a=1; }",
+     "warning", "assignment of read-only location 's->a'"),
+    ("constfield_bitfield_incr", "struct S{const unsigned a:3;};", "void f(struct S*s){ s->a++; }",
+     "warning", "increment of read-only location 's->a'"),
+    ("constfield_array", "struct S{const int a[3];};", "void f(struct S*s){ s->a[0]=1; }",
+     "error", "assignment of read-only location 's->a[0]'"),
+    ("obj_const_member", "struct S{int n;};", "void f(const struct S*s){ s->n=1; }",
+     "error", "assignment of member 'n' in read-only object"),
+    ("obj_const_bitfield", "struct S{int a:3;};", "void f(const struct S*s){ s->a=1; }",
+     "error", "assignment of member 'a' in read-only object"),
+    ("obj_const_bitfield_incr", "struct S{int a:3;};", "void f(const struct S*s){ s->a++; }",
+     "error", "increment of member 'a' in read-only object"),
+    ("local_const_bitfield", "struct S{const int a:3;};", "void f(void){ struct S s; s.a=1; }",
+     "warning", "assignment of read-only location 's.a'"),
+    ("nested_obj_const", "struct I{int n;};struct O{struct I i;};",
+     "void f(const struct O*o){ o->i.n=1; }",
+     "error", "assignment of member 'n' in read-only object"),
+    ("nested_bitfield", "struct I{const int a:2;};struct O{struct I i;};",
+     "void f(struct O*o){ o->i.a=1; }",
+     "warning", "assignment of read-only location 'o->i.a'"),
+    ("union_bitfield", "union U{const int a:4;long b;};", "void f(union U*u){ u->a=1; }",
+     "warning", "assignment of read-only location 'u->a'"),
+    # A pointer member that is itself const is an error even though the
+    # pointee is writable -- and the reverse case must stay silent.
+    ("pointer_member_deref", "struct S{const int *p;};", "void f(struct S*s,int v){ *s->p=v; }",
+     "error", "assignment of read-only location '*s->p'"),
+]
+
+# Non-lvalues: exactly ONE diagnostic each, from the lvalue check, and never a
+# second "read-only location" line naming something that cannot be assigned.
+_NONLVALUE_MATRIX = [
+    ("nonlvalue_arithmetic", "int f(int a,int b){ (a+b)=1; return a; }"),
+    ("nonlvalue_ternary", "int f(int c,int a,int b){ (c?a:b)=1; return c; }"),
+    ("nonlvalue_comma", "int f(int a,int b){ (a,b)=1; return a; }"),
+    ("nonlvalue_call_result", "struct S{int a;};struct S g(void);\nvoid f(void){ g().a=1; }"),
+]
+
+
+def run_diagnostic_contract_suite(verbose, tmpdir):
+    """Diagnostics, not just codegen: severity and wording pinned per case."""
+    failures = []
+    for name, decl, stmt, sev, text in _READONLY_MATRIX:
+        src = os.path.join(tmpdir, f"ro_{name}.c")
+        with open(src, "w") as fh:
+            fh.write(f"{decl}\n{stmt}\n")
+        code, got = _lccc_diag_lines(src, ["-std=c11"])
+        want = [(sev, text)]
+        if got != want:
+            failures.append((f"readonly_{name}", f"want {want} got {got} (rc={code})"))
+        elif code != (0 if sev == "warning" else 1):
+            failures.append((f"readonly_{name}", f"exit code {code} for {sev}"))
+    for name, src_text in _NONLVALUE_MATRIX:
+        src = os.path.join(tmpdir, f"{name}.c")
+        with open(src, "w") as fh:
+            fh.write(src_text + "\n")
+        code, got = _lccc_diag_lines(src, ["-std=c11"])
+        if len(got) != 1 or got[0][0] != "error":
+            failures.append((name, f"want exactly one error, got {got}"))
+        elif "read-only" in got[0][1]:
+            failures.append((name, f"spurious read-only diagnostic: {got[0][1]}"))
+        elif code != 1:
+            failures.append((name, f"exit code {code}"))
+    return failures
+
+
+    fail_count = 0
+    skip_count = 0
+    compile_fail_count = 0
+    failures = []
+
 def main():
     p = argparse.ArgumentParser(description="LCCC correctness test suite")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--filter", help="only run tests matching this substring")
+    p.add_argument(
+        "--only-diagnostics",
+        action="store_true",
+        help="run only the diagnostic-contract suite (severity and wording)",
+    )
     args = p.parse_args()
 
     if not LCCC.exists():
@@ -1536,12 +1647,17 @@ def main():
     print(f"  GCC include: {GCC_INC}")
     print()
 
-    pass_count = 0
-    fail_count = 0
-    skip_count = 0
-    compile_fail_count = 0
-    failures = []
+    if args.only_diagnostics:
+        with tempfile.TemporaryDirectory(prefix="lccc_diag_") as tmpdir:
+            failures = run_diagnostic_contract_suite(args.verbose, tmpdir)
+        total = len(_READONLY_MATRIX) + len(_NONLVALUE_MATRIX)
+        for name, detail in failures:
+            print(f"  {c(RED, 'FAIL')}  {name} ({detail})")
+        print(f"\n  {total - len(failures)}/{total} diagnostic cases match GCC 16.2")
+        sys.exit(1 if failures else 0)
 
+    pass_count = 0
+    skip_count = 0
     with tempfile.TemporaryDirectory(prefix="lccc_test_") as tmpdir:
         for name, src, extra_flags, expected_exit in TESTS:
             if args.filter and args.filter not in name:
@@ -1591,6 +1707,18 @@ def main():
                     print(f"         {detail}")
                 fail_count += 1
                 failures.append((name, status, detail))
+
+        # Diagnostics contract (severity + wording), independent of codegen.
+        if not args.filter or "readonly" in (args.filter or ""):
+            diag_failures = run_diagnostic_contract_suite(args.verbose, tmpdir)
+            for name, detail in diag_failures:
+                print(f"  {c(RED, 'FAIL')}  {name} ({detail})")
+                failures.append((name, "DIAG", detail))
+                fail_count += 1
+            if not diag_failures:
+                print(f"  {c(GRN, 'PASS')}  readonly_diagnostic_contract "
+                      f"({len(_READONLY_MATRIX) + len(_NONLVALUE_MATRIX)} cases)")
+                pass_count += 1
 
     total = pass_count + fail_count + compile_fail_count + skip_count
     print(f"\n{'='*60}")
