@@ -6,8 +6,14 @@ bundled headers. The runner compiles it with lccc and GCC, runs both, and
 compares stdout + exit code. lccc must be given the GCC include path for
 <stdint.h> etc., with lccc's own include/ FIRST so its intrinsic headers win.
 
+Every case runs at each level of `--levels` (default `-O2,-O0`). Without
+optimization an intrinsic is another program: nothing folds the immediate a
+wrapper passes on, nothing forwards the temporaries, and the defects that
+hide there do not show at `-O2` (`_mm256_clmulepi64_epi128` was assembled
+with `$0` for every selector at `-O0` only).
+
 Usage:
-    python3 tests/intrinsics/run_intrin_tests.py [filter]
+    python3 tests/intrinsics/run_intrin_tests.py [filter] [--levels=-O2,-O0]
 """
 import argparse
 import difflib
@@ -39,6 +45,9 @@ ISA_REQUIREMENTS = {
     "-mavx": "avx",
     "-mavx2": "avx2",
     "-mfma": "fma",
+    "-mxsave": "xsave",
+    "-maes": "aes",
+    "-mpclmul": "pclmulqdq",
     "-mgfni": "gfni",
     "-mvaes": "vaes",
     "-mvpclmulqdq": "vpclmulqdq",
@@ -84,17 +93,21 @@ def run(cmd, timeout=COMPILE_TIMEOUT):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("filter", nargs="?", default="")
-    ap.add_argument("--lccc-flags", default="-O2", help="optimization flags for lccc")
+    ap.add_argument("--levels", default="-O2,-O0",
+                    help="optimization levels, each a run of every case (default -O2,-O0)")
     # Identical optimization flags for both compilers, on purpose: the case's
     # own `// FLAGS:` line supplies the ISA features it needs. Blanket AVX-512
     # flags for the GCC leg made the comparison depend on the host (a runner
     # without AVX-512 executes GCC's auto-vectorised prologue and faults while
     # this compiler's narrower code does not) and changed GCC's codegen for
     # cases that never asked for it.
-    ap.add_argument("--gcc-flags", default="-O2",
-                    help="optimization flags for GCC")
+    ap.add_argument("--lccc-flags", default="", help="further flags for lccc")
+    ap.add_argument("--gcc-flags", default="", help="further flags for GCC")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    args.levels = [level for level in args.levels.split(",") if level]
+    if not args.levels:
+        ap.error("--levels names no level")
 
     files = sorted(CASES.glob("*.c"))
     if args.filter:
@@ -114,8 +127,8 @@ def main():
 def run_cases(args, files, workdir):
     npass = nfail = nskip = 0
     failures = []
-    for src in files:
-        name = src.stem
+    for level, src in ((level, src) for level in args.levels for src in files):
+        name = f"{src.stem} {level}"
         # Per-test flags: lines starting with "// FLAGS: " in the header.
         extra = []
         for line in src.read_text(errors="replace").splitlines()[:10]:
@@ -125,11 +138,11 @@ def run_cases(args, files, workdir):
                 break
         lacking = missing_isa(extra)
 
-        lccc_flags = (args.lccc_flags + " " + " ".join(extra)).split()
-        gcc_flags = (args.gcc_flags + " " + " ".join(extra)).split()
+        lccc_flags = [level, *args.lccc_flags.split(), *extra]
+        gcc_flags = [level, *args.gcc_flags.split(), *extra]
 
-        lbin = workdir / f"it_{name}_lccc"
-        gbin = workdir / f"it_{name}_gcc"
+        lbin = workdir / f"it_{src.stem}{level}_lccc"
+        gbin = workdir / f"it_{src.stem}{level}_gcc"
 
         # GCC must also find lccc's headers for _mm* availability tests? No:
         # GCC uses its own headers; lccc uses lccc's. lccc needs gcc's std headers.

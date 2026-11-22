@@ -8,6 +8,8 @@
 #endif
 
 #include <ia32intrin.h>
+#include <xsaveintrin.h>
+#include <prfchwintrin.h>
 #include <wmmintrin.h>
 #include <smmintrin.h>
 #include <shaintrin.h>

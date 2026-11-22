@@ -5078,6 +5078,7 @@ impl Driver {
             x86_prefetch: crate::backend::x86_common::X86PrefetchIsa {
                 sse: self.resolved_prefetch_sse(),
                 prfchw: self.resolved_prfchw(),
+                movrs: self.resolved_movrs(),
             },
             avx512: self.enable_avx512f,
             avx512vl: self.enable_avx512f && self.enable_avx512vl,
@@ -5388,6 +5389,14 @@ impl Driver {
             && !self.prfchw_explicitly_disabled
     }
 
+    /// PREFETCHRST2 (`0F 18 /4`) permission: `-mmovrs`, or a `-march=` that
+    /// has MOVRS (`diamondrapids`, `novalake`), unless `-mno-movrs` came
+    /// later. GCC 16.2 selects the instruction for a shared read of
+    /// locality 1 on both x86 targets.
+    pub(crate) fn resolved_movrs(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686) && self.enable_movrs
+    }
+
     /// `CodegenOptions::no_sse`: the backend may not use SSE moves. Legacy
     /// bulk-memory/vararg helpers use SSE2 integer moves, so an SSE2 denial
     /// turns them off too, independently of the SSE1 scalar operations the
@@ -5524,16 +5533,43 @@ impl Driver {
     /// * x86-64: always. The forms are part of the x86-64 baseline and touch
     ///   no vector state, so GCC 16 emits them even under `-mno-sse` and
     ///   `-mgeneral-regs-only` (measured).
-    /// * i686: SSE enabled, or PRFCHW enabled (GCC: `TARGET_SSE ||
+    /// * i686: the CPU has them, or SSE is enabled, or PRFCHW is (GCC: the
+    ///   `-march=` row's `PTA_SSE | PTA_PREFETCH_SSE`, or `TARGET_SSE ||
     ///   (TARGET_PRFCHW && !TARGET_3DNOW)`; `-m3dnow` is rejected here, so
-    ///   the 3DNow! clause is vacuous). The i686 default is pre-SSE silicon,
-    ///   where these opcodes are #UD, and GCC emits nothing for
-    ///   `-m32`/`-march=i686`/`-mno-sse` (measured).
+    ///   the 3DNow! clause is vacuous). A pre-SSE CPU is silicon where
+    ///   these opcodes are #UD, and GCC emits nothing for `-march=i686`.
+    ///
+    /// The CPU's instructions are not taken away by `-mno-sse`, which is
+    /// about the registers: `-m32 -mno-sse` (the default CPU is `x86-64`)
+    /// and `-march=pentium3 -mno-sse` prefetch in GCC 16.2. They did not
+    /// here, where the answer was "is SSE enabled": a 32-bit kernel-style
+    /// build lost every hint it wrote.
     pub(crate) fn resolved_prefetch_sse(&self) -> bool {
         match self.target {
             Target::X86_64 => true,
-            Target::I686 => self.resolved_i686_sse() || self.resolved_prfchw(),
+            Target::I686 => {
+                self.march_has_sse_prefetch() || self.resolved_i686_sse() || self.resolved_prfchw()
+            }
             _ => false,
+        }
+    }
+
+    /// Does the CPU of the final `-march=` have `prefetchnta/t0/t1/t2`?
+    ///
+    /// Every CPU with SSE has, and three without it: the Athlon, the
+    /// Athlon Thunderbird and the Geode implement the SSE prefetch opcodes
+    /// beside their 3DNow! ones (GCC's `PTA_PREFETCH_SSE`; measured with
+    /// `-mno-3dnow`, where the SSE forms are what GCC writes for them).
+    /// Without `-march=` the CPU is `x86-64`; `native` and `generic` are
+    /// 64-bit hosts.
+    fn march_has_sse_prefetch(&self) -> bool {
+        use crate::common::x86_features::X86Feature as F;
+        match self.x86_march.as_deref() {
+            None => true,
+            Some("athlon" | "athlon-tbird" | "geode") => true,
+            Some(march) => {
+                crate::backend::x86::isa::X86Isa::arch_row(march).is_none_or(|row| row.has(F::Sse))
+            }
         }
     }
 

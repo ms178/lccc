@@ -1365,12 +1365,31 @@ gate "x86-mflag-macro-parity" fast \
 # and pins GCC's rejection wording.
 gate "x86-prefer-vector-width" fast \
     python3 scripts/check_x86_prefer_vector_width.py "$LCCC" --gcc "${GCC16:-gcc-16}"
+# A prefetch computes nothing, so its gate compares the instruction: every
+# form of `__builtin_prefetch`, `_mm_prefetch` and `_m_prefetchw` under every
+# CPU of the table, as a 64-bit and as a 32-bit target, against GCC 16.2.
+gate "x86-prefetch-instructions" fast \
+    python3 scripts/check_x86_prefetch.py "$LCCC" --gcc "${GCC16:-gcc-16}"
 # A macro lccc defines is a promise that the intrinsics behind it exist. The
 # census calls every intrinsic of GCC 16.2's headers under lccc and holds the
 # count that does not compile to tests/x86-intrinsics/expected.txt, in both
 # directions.
 gate "x86-intrinsic-census" fast \
     python3 scripts/x86_intrinsic_census.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# Which extension each SIMD helper needs, against the table generated from
+# GCC 16.2's headers (tests/simd/isa_permissions_gcc16.json). No compiler.
+gate "simd-isa-permissions" fast \
+    python3 tests/simd/check_isa_permissions.py
+# A call that compiles may still compute something else. Every intrinsic lccc
+# has that this processor executes is called with generated arguments and
+# held to GCC 16.2's result at -O2 and -O0; a value where GCC wants a
+# constant has to be refused or be right; GNU as 2.47 has to take the
+# assembly lccc writes.
+gate "x86-intrinsic-values-self-test" fast \
+    python3 -m unittest tests.corpus.test_x86_intrinsic_values
+gate "x86-intrinsic-values" slow \
+    python3 scripts/x86_intrinsic_values.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 

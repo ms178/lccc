@@ -34,31 +34,33 @@ pub enum IntrinsicOp {
     /// survive DCE (it is deliberately NOT in `is_pure`).
     ///
     /// The payload is a [`PrefetchHint`] encoding of GCC's hint pair, chosen
-    /// once in the frontend lowering: bits 0-1 hold `locality` (0..=3) and
-    /// bit 2 holds write intent (`rw == 1`). Both facts are kept because
+    /// once in the frontend lowering: bits 0-1 hold `locality` (0..=3),
+    /// bit 2 holds write intent (`rw == 1`) and bit 3 the shared read
+    /// (`rw == 2`, GCC 15+: the line is expected to be read by another
+    /// processor before it is written). All three facts are kept because
     /// every target that distinguishes write intent ALSO keeps the locality
     /// (AArch64 `pst*` has the same four levels as `pld*`), and every target
-    /// that cannot express write intent falls back to the locality table —
-    /// collapsing the pair loses information some backend needs. GCC 15+'s
-    /// `rw == 2` (instruction-fetch intent) is encoded as a read: GCC 16
-    /// lowers it with the read table on both x86 and AArch64
-    /// (`pftype[rw & 1][locality]`).
+    /// that cannot express an intent falls back to the locality table —
+    /// collapsing them loses information some backend needs. A shared read
+    /// is a read everywhere but on x86 with MOVRS, where locality 1 has an
+    /// instruction of its own.
     ///
     /// Backend mapping (GCC 16.2 parity, measured per form):
     ///
-    /// | locality | x86 read / write without PRFCHW | x86 write with PRFCHW | arm64 read | arm64 write |
-    /// |----------|---------------------------------|-----------------------|------------|-------------|
-    /// | 0        | `prefetchnta`                   | `prefetchw`           | `pldl1strm`| `pstl1strm` |
-    /// | 1        | `prefetcht2`                    | `prefetchw`           | `pldl3keep`| `pstl3keep` |
-    /// | 2        | `prefetcht1`                    | `prefetchw`           | `pldl2keep`| `pstl2keep` |
-    /// | 3        | `prefetcht0`                    | `prefetchw`           | `pldl1keep`| `pstl1keep` |
+    /// | locality | x86 read / write without PRFCHW | x86 write with PRFCHW | x86 shared read with MOVRS | arm64 read | arm64 write |
+    /// |----------|---------------------------------|-----------------------|----------------------------|------------|-------------|
+    /// | 0        | `prefetchnta`                   | `prefetchw`           | `prefetchnta`              | `pldl1strm`| `pstl1strm` |
+    /// | 1        | `prefetcht2`                    | `prefetchw`           | `prefetchrst2`             | `pldl3keep`| `pstl3keep` |
+    /// | 2        | `prefetcht1`                    | `prefetchw`           | `prefetcht1`               | `pldl2keep`| `pstl2keep` |
+    /// | 3        | `prefetcht0`                    | `prefetchw`           | `prefetcht0`               | `pldl1keep`| `pstl1keep` |
     ///
     /// x86-64 always has the SSE prefetch forms (GCC emits them even under
     /// `-mno-sse`/`-mgeneral-regs-only`: `0F 18` touches no vector state).
-    /// i686 has them only when SSE or PRFCHW is enabled (GCC's
-    /// `ix86_prefetch_sse`); otherwise the hint is dropped, because the
-    /// i686 baseline is pre-SSE silicon where `0F 18 /0-3` is #UD. RISC-V
-    /// emits nothing without Zicbop (GCC parity for `rv64gc`).
+    /// i686 has them where the CPU of `-march=` has them, or SSE or PRFCHW
+    /// is enabled (GCC's `ix86_prefetch_sse`), `-mno-sse` or not, for the
+    /// same reason; otherwise the hint is dropped, because a pre-SSE CPU is
+    /// silicon where `0F 18 /0-3` is #UD. RISC-V emits nothing without
+    /// Zicbop (GCC parity for `rv64gc`).
     Prefetch(u8),
     /// Non-temporal stores: movnti (32-bit), movnti64 (64-bit), movntdq (128-bit), movntpd (128-bit double),
     /// movntps (128-bit float; SSE1, so it is legal on an SSE1-only target)
@@ -1906,6 +1908,8 @@ pub enum IntrinsicOp {
     MaskzShuffleEpi8_128,
     MaskShuffleEpi8_128,
     ReduceAddEpu32_512,
+    /// The sum of the eight 64-bit lanes (`_mm512_reduce_add_epi64`).
+    ReduceAddEpu64_512,
     Vpdpbusd512,
     Vpdpbusds512,
     Vpclmulqdq512,
@@ -2186,6 +2190,9 @@ pub struct PrefetchHint {
     pub locality: u8,
     /// GCC `rw == 1`: the line is about to be written.
     pub write: bool,
+    /// GCC `rw == 2`: the line is about to be read, and by another processor
+    /// too before anybody writes it. Never set together with `write`.
+    pub shared: bool,
 }
 
 impl PrefetchHint {
@@ -2195,17 +2202,42 @@ impl PrefetchHint {
         PrefetchHint {
             locality: locality & 3,
             write,
+            shared: false,
+        }
+    }
+
+    /// The payload of a shared read (`rw == 2`).
+    pub const fn shared_read(locality: u8) -> Self {
+        PrefetchHint {
+            locality: locality & 3,
+            write: false,
+            shared: true,
+        }
+    }
+
+    /// The hint of GCC's `rw` argument, already validated to 0..=2.
+    pub const fn of_rw(rw: u8, locality: u8) -> Self {
+        match rw {
+            1 => Self::new(true, locality),
+            2 => Self::shared_read(locality),
+            _ => Self::new(false, locality),
         }
     }
 
     pub const fn encode(self) -> u8 {
-        (self.locality & 3) | ((self.write as u8) << 2)
+        (self.locality & 3)
+            | ((self.write as u8) << 2)
+            | (((self.shared && !self.write) as u8) << 3)
     }
 
     pub const fn decode(payload: u8) -> Self {
+        let write = payload & 4 != 0;
         PrefetchHint {
             locality: payload & 3,
-            write: payload & 4 != 0,
+            write,
+            // Write intent wins where a payload names both: there is one
+            // access, and a written line is not shared.
+            shared: !write && payload & 8 != 0,
         }
     }
 }

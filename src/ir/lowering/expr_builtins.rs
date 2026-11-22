@@ -454,48 +454,12 @@ impl Lowerer {
             return Some(result);
         }
 
-        // __builtin_prefetch(addr, [rw], [locality]) - architectural
-        // prefetch hint.
-        //
-        // GCC 16 semantics (`expand_builtin_prefetch`): `rw` and `locality`
-        // must be integer constant expressions (an error otherwise), `rw` in
-        // 0..=2 (read, write, instruction fetch) and `locality` in 0..=3; an
-        // out-of-range value is a warning and is replaced by ZERO. They
-        // default to 0 and 3. This lowering is the only place that sees the
-        // builtin's arguments (sema registers it as a plain intrinsic), so
-        // it owns those diagnostics — see `prefetch_hint`.
-        //
-        // The hint is only a hint: dropping it (non-constant arguments, or a
-        // backend without prefetch support) can never change program
-        // semantics, and the instruction can never fault — every address is
-        // architecturally legal for a prefetch.
-        if name == "__builtin_prefetch" {
-            let addr = args.first().map(|arg| self.lower_expr(arg));
-            let rw = args.get(1).map(|e| self.prefetch_hint_arg(e));
-            let locality = args.get(2).map(|e| self.prefetch_hint_arg(e));
-            let (hint, diags) = prefetch_hint(rw, locality);
-            for (diag, idx) in diags {
-                let span = args[idx].span();
-                match diag {
-                    PrefetchDiag::NotConstant(msg) => self.emit_error(msg, span),
-                    PrefetchDiag::OutOfRange(msg) => self.emit_warning(msg, span),
-                }
-            }
-            let hint = hint.encode();
-            // Evaluate any arguments beyond the first for their side effects
-            // (GCC's frontend rejects >3 arguments, but lowering must stay
-            // total).
-            let extra: Vec<Operand> = args.iter().skip(1).map(|a| self.lower_expr(a)).collect();
-            let _ = extra;
-            if let Some(addr) = addr {
-                self.emit(Instruction::Intrinsic {
-                    dest: None,
-                    op: IntrinsicOp::Prefetch(hint),
-                    dest_ptr: None,
-                    args: vec![addr],
-                });
-            }
-            return Some(Operand::Const(IrConst::I64(0)));
+        // The prefetch builtins: hints, lowered beside the rules of their
+        // arguments (`prefetch_hint`, `ia32_prefetch_hint`).
+        match name {
+            "__builtin_prefetch" => return Some(self.lower_builtin_prefetch(args)),
+            "__builtin_ia32_prefetch" => return Some(self.lower_ia32_prefetch(args)),
+            _ => {}
         }
 
         // __builtin_unreachable() - marks code path as unreachable. Emit a trap instruction
@@ -3594,10 +3558,21 @@ impl Lowerer {
                 .filter(|ty| ty.is_integer() || ty.is_floating())
                 .map(IrType::from_ctype),
         };
+        // An integer constant expression is its value, however it is spelled
+        // and at every optimization level. `lower_expr` folds a literal and
+        // a binary operation of literals; `-(-1)`, `~0` and `!0` it lowers
+        // to instructions that only the optimizer folds. So at -O0 the lane
+        // of `_mm_extract_epi8(v, -(-1))` reached the emitter as a value,
+        // and the emitter wrote `pextrb $0`.
+        let constant = self.integer_constant_argument(arg);
+        let lowered = |this: &mut Self| match constant {
+            Some(value) => Operand::Const(value),
+            None => this.lower_expr(arg),
+        };
         match target {
             Some(target) => {
                 let source = self.get_expr_type(arg);
-                let value = self.lower_expr(arg);
+                let value = lowered(self);
                 // Preserve constant immediates even at O0: a numeric C
                 // conversion must not turn a valid immediate into an SSA value.
                 let folded = match &value {
@@ -3619,8 +3594,21 @@ impl Lowerer {
             }
             // No redundant type inference or signature-map probe for native
             // vector/address operands already described by canonical metadata.
-            None => self.lower_expr(arg),
+            None => lowered(self),
         }
+    }
+
+    /// The value of `arg` when it is an integer constant expression of
+    /// integer type (C11 6.6): what an immediate has to be. A constant has
+    /// no side effect, so its value stands for its evaluation in any
+    /// argument position. Pointers and vectors are not asked: a null pointer
+    /// constant stays the expression it is.
+    pub(super) fn integer_constant_argument(&self, arg: &Expr) -> Option<IrConst> {
+        if !self.expr_ctype(arg).is_integer() {
+            return None;
+        }
+        self.eval_const_expr(arg)
+            .filter(|value| value.to_i128().is_some())
     }
 
     fn lower_x86_intrinsic(
@@ -3645,16 +3633,19 @@ impl Lowerer {
                 return self.reject_builtin_call(message, args, 16);
             }
         }
-        // One-bit lane immediates must be a constant 0 or 1 (see
-        // `x86_lane_immediate_bits`). The check runs before any operand is
-        // lowered, so a rejected call leaves no half-built expressions.
-        if let Some(bits) = x86_lane_immediate_bits(intrinsic) {
-            let in_range = args
-                .last()
-                .and_then(|arg| self.eval_const_expr(arg))
+        // An immediate is a constant the encoding holds (`x86_immediate`).
+        // The check runs before any operand is lowered, so a rejected call
+        // leaves no half-built expressions.
+        let immediate = x86_immediate(intrinsic, name);
+        let immediate_value = immediate.and_then(|immediate| {
+            args.last()
+                .and_then(|arg| self.integer_constant_argument(arg))
                 .and_then(|value| value.to_i64())
-                .is_some_and(|value| (0..(1i64 << bits)).contains(&value));
-            if !in_range {
+                .and_then(|value| immediate.encoded(value))
+        });
+        if let Some(immediate) = immediate {
+            let bits = immediate.bits();
+            if immediate_value.is_none() {
                 // GCC 16.2 spells the article from the number ("a 1-bit",
                 // "a 2-bit", "an 8-bit"); a fixed "an" was wrong for 1 and 2.
                 let article = if bits == 8 || bits == 11 || bits == 18 {
@@ -3841,19 +3832,14 @@ impl Lowerer {
                 if let (Some(count), Some(last)) = (normalized_count, arg_ops.last_mut()) {
                     *last = Operand::Const(IrConst::I64(count));
                 }
-                // Immediates range-checked above (`x86_lane_immediate_bits`) are
-                // pinned as literals at every optimisation level: at -O0 a C
-                // conversion leaves the immediate as an SSA value, which the
-                // emitter cannot encode (it silently read 0 for blend, clmul,
-                // aeskeygenassist and sha1rnds4).
-                if x86_lane_immediate_bits(intrinsic).is_some() {
-                    let imm = args
-                        .last()
-                        .and_then(|arg| self.eval_const_expr(arg))
-                        .and_then(|value| value.to_i64());
-                    if let (Some(imm), Some(last)) = (imm, arg_ops.last_mut()) {
-                        *last = Operand::Const(IrConst::I32(imm as i32));
-                    }
+                // The immediate checked above is the operand the emitter is
+                // given, as its encoding holds it: a literal at every
+                // optimisation level (at -O0 a C conversion left it an SSA
+                // value, read as 0 for blend, clmul, aeskeygenassist and
+                // sha1rnds4), and the low byte where the instruction takes
+                // no more (`_mm_shuffle_epi32(v, 256)` is `pshufd $0`).
+                if let (Some(value), Some(last)) = (immediate_value, arg_ops.last_mut()) {
+                    *last = Operand::Const(IrConst::I32(value as i32));
                 }
                 let result_size = match x86_intrinsic_kind(intrinsic) {
                     X86IntrinsicKind::Vec128 => 16,
@@ -3968,8 +3954,13 @@ enum PrefetchArg {
 /// like GCC 16 so build logs and `-Werror` behave identically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PrefetchDiag {
+    /// An error: the argument is no integer constant expression.
     NotConstant(&'static str),
+    /// A warning: the constant is outside the argument's domain and zero is
+    /// used in its place.
     OutOfRange(&'static str),
+    /// An error: the constant names a prefetch there is no instruction for.
+    Invalid(&'static str),
 }
 
 /// GCC 16 `expand_builtin_prefetch`: map the optional `rw` and `locality`
@@ -3980,7 +3971,8 @@ enum PrefetchDiag {
 /// * not an integer constant: an error, and the argument is treated as 0;
 /// * `rw` outside 0..=2 or `locality` outside 0..=3: a warning, and the
 ///   argument is treated as 0 (GCC's "using zero" — NOT the default 3);
-/// * `rw == 2` (instruction-fetch intent, GCC 15+) is a read hint.
+/// * `rw == 2` (GCC 15+) is a shared read: a read on every target but x86
+///   with MOVRS, where locality 1 is `prefetchrst2`.
 fn prefetch_hint(
     rw: Option<PrefetchArg>,
     locality: Option<PrefetchArg>,
@@ -4030,10 +4022,181 @@ fn prefetch_hint(
             0
         }
     };
-    (PrefetchHint::new(rw == 1, locality), diags)
+    (PrefetchHint::of_rw(rw as u8, locality), diags)
+}
+
+/// GCC 16 `ix86_expand_builtin` for `__builtin_ia32_prefetch(addr, rw,
+/// locality, instruction)`: the hint to emit, if any, plus the diagnostics
+/// (paired with the index of the call argument they are about).
+///
+/// Measured against GCC 16.2 for `rw` -1..=4, `locality` 0..=4 and
+/// `instruction` 0..=2, and held to it by `scripts/check_x86_prefetch.py`:
+///
+/// * an argument that is no integer constant: one error for the call, and
+///   nothing is emitted;
+/// * `rw` outside 0..=2, `instruction` outside 0..=1, and (for a prefetch
+///   of data) `locality` outside 0..=3: a warning each, in this order, and
+///   zero is used;
+/// * `instruction == 1` is a prefetch of code (`prefetchit0`/`prefetchit1`,
+///   `_MM_HINT_IT0`/`_MM_HINT_IT1`). Its locality has to be 2 or 3, an
+///   error otherwise. GCC emits the instruction for a RIP-relative address
+///   under `-mprefetchi`, an option this compiler does not take, and warns
+///   everywhere else that the hint stays a NOP: so does this.
+fn ia32_prefetch_hint(
+    rw: PrefetchArg,
+    locality: PrefetchArg,
+    instruction: PrefetchArg,
+) -> (Option<PrefetchHint>, Vec<(PrefetchDiag, usize)>) {
+    let (PrefetchArg::Value(rw), PrefetchArg::Value(locality), PrefetchArg::Value(instruction)) =
+        (rw, locality, instruction)
+    else {
+        let first = [rw, locality, instruction]
+            .iter()
+            .position(|arg| *arg == PrefetchArg::NotConstant)
+            .map_or(1, |at| at + 1);
+        return (
+            None,
+            vec![(
+                PrefetchDiag::NotConstant("second, third and fourth argument must be a const"),
+                first,
+            )],
+        );
+    };
+    let mut diags = Vec::new();
+    let rw = if (0..=2).contains(&rw) {
+        rw as u8
+    } else {
+        diags.push((
+            PrefetchDiag::OutOfRange(
+                "invalid second argument to '__builtin_ia32_prefetch'; using zero",
+            ),
+            1,
+        ));
+        0
+    };
+    let instruction = if (0..=1).contains(&instruction) {
+        instruction
+    } else {
+        diags.push((
+            PrefetchDiag::OutOfRange(
+                "invalid fourth argument to '__builtin_ia32_prefetch'; using zero",
+            ),
+            3,
+        ));
+        0
+    };
+    if instruction == 1 {
+        if (2..=3).contains(&locality) {
+            diags.push((
+                PrefetchDiag::OutOfRange(
+                    "instruction prefetch applies when in 64-bit mode with RIP-relative \
+                     addressing and option '-mprefetchi'; they stay NOPs otherwise",
+                ),
+                0,
+            ));
+        } else {
+            diags.push((PrefetchDiag::Invalid("invalid third argument"), 2));
+        }
+        return (None, diags);
+    }
+    let locality = if (0..=3).contains(&locality) {
+        locality as u8
+    } else {
+        diags.push((
+            PrefetchDiag::OutOfRange(
+                "invalid third argument to '__builtin_ia32_prefetch'; using zero",
+            ),
+            2,
+        ));
+        0
+    };
+    (Some(PrefetchHint::of_rw(rw, locality)), diags)
 }
 
 impl Lowerer {
+    /// `__builtin_prefetch(addr, [rw], [locality])`: an architectural
+    /// prefetch hint.
+    ///
+    /// GCC 16 semantics (`expand_builtin_prefetch`): `rw` and `locality`
+    /// must be integer constant expressions (an error otherwise), `rw` in
+    /// 0..=2 (read, write, shared read) and `locality` in 0..=3; an
+    /// out-of-range value is a warning and is replaced by ZERO. They
+    /// default to 0 and 3. This lowering is the only place that sees the
+    /// builtin's arguments (sema registers it as a plain intrinsic), so it
+    /// owns those diagnostics — see `prefetch_hint`.
+    ///
+    /// The hint is only a hint: dropping it (non-constant arguments, or a
+    /// backend without prefetch support) can never change program
+    /// semantics, and the instruction can never fault — every address is
+    /// architecturally legal for a prefetch.
+    fn lower_builtin_prefetch(&mut self, args: &[Expr]) -> Operand {
+        let addr = args.first().map(|arg| self.lower_expr(arg));
+        let rw = args.get(1).map(|e| self.prefetch_hint_arg(e));
+        let locality = args.get(2).map(|e| self.prefetch_hint_arg(e));
+        let (hint, diags) = prefetch_hint(rw, locality);
+        self.report_prefetch_diagnostics(diags, args);
+        // Evaluate any arguments beyond the first for their side effects
+        // (GCC's frontend rejects >3 arguments, but lowering must stay
+        // total).
+        for arg in args.iter().skip(1) {
+            self.lower_expr(arg);
+        }
+        self.emit_prefetch(addr, Some(hint))
+    }
+
+    /// `__builtin_ia32_prefetch(addr, rw, locality, instruction)`: what
+    /// `_mm_prefetch(P, I)` is in GCC's <xmmintrin.h>, the selector `I`
+    /// taken apart by the header. The x86 builtin differs from the generic
+    /// one in its fourth argument (a prefetch of code) and in what it says;
+    /// see `ia32_prefetch_hint`.
+    ///
+    /// `_mm_prefetch` was a macro that evaluated its arguments and did
+    /// nothing, from the time before this compiler had a prefetch
+    /// instruction: every program that prefetches through the Intel name
+    /// (DPDK's `rte_prefetch0`, Abseil's `PrefetchToLocalCache`, RocksDB)
+    /// ran its loads cold.
+    fn lower_ia32_prefetch(&mut self, args: &[Expr]) -> Operand {
+        let addr = args.first().map(|arg| self.lower_expr(arg));
+        let hints: Vec<PrefetchArg> = args
+            .iter()
+            .skip(1)
+            .map(|e| self.prefetch_hint_arg(e))
+            .collect();
+        let (hint, diags) = match hints[..] {
+            [rw, locality, instruction] => ia32_prefetch_hint(rw, locality, instruction),
+            // The arity table refuses any other count in front of here.
+            _ => (None, Vec::new()),
+        };
+        self.report_prefetch_diagnostics(diags, args);
+        self.emit_prefetch(addr, hint)
+    }
+
+    /// Say each diagnostic at the call argument it is about.
+    fn report_prefetch_diagnostics(&self, diags: Vec<(PrefetchDiag, usize)>, args: &[Expr]) {
+        for (diag, index) in diags {
+            let span = args[index].span();
+            match diag {
+                PrefetchDiag::NotConstant(msg) | PrefetchDiag::Invalid(msg) => {
+                    self.emit_error(msg, span);
+                }
+                PrefetchDiag::OutOfRange(msg) => self.emit_warning(msg, span),
+            }
+        }
+    }
+
+    /// The hint for `addr`, where there is one of each; the call's value.
+    fn emit_prefetch(&mut self, addr: Option<Operand>, hint: Option<PrefetchHint>) -> Operand {
+        if let (Some(addr), Some(hint)) = (addr, hint) {
+            self.emit(Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::Prefetch(hint.encode()),
+                dest_ptr: None,
+                args: vec![addr],
+            });
+        }
+        Operand::Const(IrConst::I64(0))
+    }
+
     /// Constant-evaluate one hint argument. Any integer constant expression
     /// counts (`enum` constants, `sizeof`, parenthesised arithmetic), exactly
     /// like GCC; a float or a runtime value is `NotConstant`.
@@ -4072,29 +4235,185 @@ fn x86_var_shift_arity(intrinsic: &BuiltinIntrinsic) -> Option<usize> {
     }
 }
 
-fn x86_lane_immediate_bits(intrinsic: &BuiltinIntrinsic) -> Option<u32> {
-    match intrinsic {
+/// What the instruction behind a builtin takes as its last operand.
+///
+/// An immediate is encoded in the instruction: it has to be an integer
+/// constant expression, and of the values the encoding holds. The emitters
+/// read it with `immediate_operand`, which stops the compiler on anything
+/// else (it used to read a value as 0: `_mm_shuffle_epi32(v, n)` was
+/// `pshufd $0` for every `n`), so every builtin whose emitter reads one has a
+/// row here, and the row makes the refusal a diagnostic of the call.
+/// `scripts/x86_intrinsic_values.py` holds the set to GCC 16.2: it asks for
+/// every intrinsic with a value where GCC wants a constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum X86Immediate {
+    /// A constant of `0..2^bits`. GCC 16.2: "the last argument must be an
+    /// N-bit immediate", or for an element selector "selector must be an
+    /// integer constant in the range [0, N]".
+    Bits(u32),
+    /// A constant of which the instruction takes the low eight bits. GCC
+    /// 16.2 takes any `int` for the 128-bit integer shuffles
+    /// (`_mm_shuffle_epi32(v, -1)` is `pshufd $0xff`, and 256 is 0).
+    LowByte,
+}
+
+impl X86Immediate {
+    /// Bits of the immediate, for the diagnostic.
+    const fn bits(self) -> u32 {
+        match self {
+            X86Immediate::Bits(bits) => bits,
+            X86Immediate::LowByte => 8,
+        }
+    }
+
+    /// The operand an emitter is given for the constant `value`, or `None`
+    /// when `value` is not one the encoding holds.
+    fn encoded(self, value: i64) -> Option<i64> {
+        match self {
+            X86Immediate::Bits(bits) => (0..(1i64 << bits)).contains(&value).then_some(value),
+            X86Immediate::LowByte => Some(value & 0xff),
+        }
+    }
+}
+
+/// The immediate of `intrinsic` when it is called as `name`.
+///
+/// `name` matters for the byte shifts alone: GNU's `__builtin_ia32_pslldqi*`
+/// take a count of bits, which the lowering checks and turns into bytes
+/// itself, while the public names (`_mm256_bslli_epi128`) take the bytes.
+fn x86_immediate(intrinsic: &BuiltinIntrinsic, name: &str) -> Option<X86Immediate> {
+    use X86Immediate::{Bits, LowByte};
+    Some(match intrinsic {
+        // One of two 128-bit lanes.
         BuiltinIntrinsic::X86Extracti128
         | BuiltinIntrinsic::X86Vextractf128V
         | BuiltinIntrinsic::X86Insert128to256
-        | BuiltinIntrinsic::X86Vinsertf128 => Some(1),
-        // SHA1RNDS4 selects one of four round functions with a 2-bit immediate.
-        BuiltinIntrinsic::X86Sha1rnds4128 => Some(2),
-        // PBLENDW, PCLMULQDQ and AESKEYGENASSIST take a full 8-bit immediate.
+        | BuiltinIntrinsic::X86Vinsertf128 => Bits(1),
+        // SHA1RNDS4 selects one of four round functions.
+        BuiltinIntrinsic::X86Sha1rnds4128 => Bits(2),
+        // An element of the vector: 16 bytes, 8 words, 4 doublewords, 2
+        // quadwords. An index past the vector was masked into it.
+        BuiltinIntrinsic::X86Pextrb128 | BuiltinIntrinsic::X86Pinsrb128 => Bits(4),
+        BuiltinIntrinsic::X86Pextrw128 | BuiltinIntrinsic::X86Pinsrw128 => Bits(3),
+        BuiltinIntrinsic::X86Pextrd128 | BuiltinIntrinsic::X86Pinsrd128 => Bits(2),
+        BuiltinIntrinsic::X86Pextrq128 | BuiltinIntrinsic::X86Pinsrq128 => Bits(1),
+        // PBLENDW, PCLMULQDQ (at both widths), AESKEYGENASSIST and the
+        // GF(2^8) affine transforms take a full 8-bit immediate, and so do
+        // the 256-bit lane shuffles.
         BuiltinIntrinsic::X86Pblendw128
         | BuiltinIntrinsic::X86Pclmulqdq128
-        | BuiltinIntrinsic::X86Aeskeygenassist128 => Some(8),
-        // The 256-bit lane shuffles also take 8-bit immediates. Their
-        // emitters read the immediate with `operand_to_imm_i64`, which
-        // returns 0 for an SSA value, so at -O0 (where the call stays a
-        // plain SSA value) VPERMQ was emitted as `vpermq $0` for any control
-        // word. The byte shifts are excluded: their builtins take bit counts
-        // that are normalised to byte counts above, so they must not be
-        // re-pinned to the raw value.
-        BuiltinIntrinsic::X86Permute4x64
+        | BuiltinIntrinsic::X86Vpclmulqdq256
+        | BuiltinIntrinsic::X86Aeskeygenassist128
+        | BuiltinIntrinsic::X86Gf2p8affineqb128
+        | BuiltinIntrinsic::X86Gf2p8affineinvqb128
+        | BuiltinIntrinsic::X86Permute4x64
         | BuiltinIntrinsic::X86Permute2x128
-        | BuiltinIntrinsic::X86Pshufd256 => Some(8),
-        _ => None,
+        | BuiltinIntrinsic::X86Pshufd256 => Bits(8),
+        BuiltinIntrinsic::X86Pshufd128
+        | BuiltinIntrinsic::X86Pshuflw128
+        | BuiltinIntrinsic::X86Pshufhw128 => LowByte,
+        // A count of bytes, under the public names.
+        BuiltinIntrinsic::X86Pslldqi128
+        | BuiltinIntrinsic::X86Psrldqi128
+        | BuiltinIntrinsic::X86Pslldqi256
+        | BuiltinIntrinsic::X86Psrldqi256
+            if !name.starts_with("__builtin_ia32_") =>
+        {
+            Bits(8)
+        }
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod x86_immediate_tests {
+    use super::{BuiltinIntrinsic as B, X86Immediate, x86_immediate};
+
+    /// GCC 16.2's ranges: "selector must be an integer constant in the
+    /// range [0, 15]" for a byte, [0, 7] for a word, [0, 3], [0, 1].
+    #[test]
+    fn an_element_selector_is_an_index_into_the_vector() {
+        for (extract, insert, elements) in [
+            (B::X86Pextrb128, B::X86Pinsrb128, 16i64),
+            (B::X86Pextrw128, B::X86Pinsrw128, 8),
+            (B::X86Pextrd128, B::X86Pinsrd128, 4),
+            (B::X86Pextrq128, B::X86Pinsrq128, 2),
+        ] {
+            for intrinsic in [extract, insert] {
+                let immediate = x86_immediate(&intrinsic, "x").expect("has an immediate");
+                for index in 0..elements {
+                    assert_eq!(
+                        immediate.encoded(index),
+                        Some(index),
+                        "{intrinsic:?} {index}"
+                    );
+                }
+                for index in [-1, elements, elements + 1, 255, 256] {
+                    assert_eq!(immediate.encoded(index), None, "{intrinsic:?} {index}");
+                }
+            }
+        }
+    }
+
+    /// GCC takes any `int` for the 128-bit integer shuffles and encodes its
+    /// low byte; at 256 bits it says "must be an 8-bit immediate".
+    #[test]
+    fn the_128_bit_shuffles_take_the_low_byte() {
+        for intrinsic in [B::X86Pshufd128, B::X86Pshuflw128, B::X86Pshufhw128] {
+            let immediate = x86_immediate(&intrinsic, "x").expect("has an immediate");
+            assert_eq!(immediate, X86Immediate::LowByte);
+            assert_eq!(immediate.bits(), 8);
+            for (value, encoded) in [(0, 0), (0x1b, 0x1b), (255, 255), (256, 0), (-1, 255)] {
+                assert_eq!(
+                    immediate.encoded(value),
+                    Some(encoded),
+                    "{intrinsic:?} {value}"
+                );
+            }
+        }
+        let wide = x86_immediate(&B::X86Pshufd256, "x").expect("has an immediate");
+        assert_eq!(wide, X86Immediate::Bits(8));
+        assert_eq!(wide.encoded(255), Some(255));
+        assert_eq!(wide.encoded(256), None);
+        assert_eq!(wide.encoded(-1), None);
+    }
+
+    /// The byte shifts take bytes under the public names; GNU's builtins
+    /// take bits and are checked where they are converted.
+    #[test]
+    fn a_byte_shift_is_an_immediate_under_its_public_name() {
+        for intrinsic in [
+            B::X86Pslldqi128,
+            B::X86Psrldqi128,
+            B::X86Pslldqi256,
+            B::X86Psrldqi256,
+        ] {
+            assert_eq!(
+                x86_immediate(&intrinsic, "_mm256_bslli_epi128"),
+                Some(X86Immediate::Bits(8)),
+                "{intrinsic:?}"
+            );
+            assert_eq!(
+                x86_immediate(&intrinsic, "__builtin_ia32_pslldqi256"),
+                None,
+                "{intrinsic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_carry_less_multiply_has_a_selector_at_both_widths() {
+        for intrinsic in [B::X86Pclmulqdq128, B::X86Vpclmulqdq256] {
+            assert_eq!(x86_immediate(&intrinsic, "x"), Some(X86Immediate::Bits(8)));
+        }
+    }
+
+    /// What has no immediate has no row: a count in a register is a value.
+    #[test]
+    fn a_shift_by_a_register_count_has_no_immediate() {
+        for intrinsic in [B::X86Psllw128, B::X86Psrad128, B::X86Pshufb128] {
+            assert_eq!(x86_immediate(&intrinsic, "x"), None, "{intrinsic:?}");
+        }
     }
 }
 
@@ -5333,7 +5652,7 @@ mod prefetch_hint_tests {
     //! table is indexed by. Every expectation below is GCC 16.2's measured
     //! behaviour (`gcc-16 -O2 -S`, x86-64 and `-m32 -msse`; AArch64 via the
     //! `pftype[rw & 1][locality]` table), including the diagnostics' text.
-    use super::{PrefetchArg, PrefetchDiag, prefetch_hint};
+    use super::{PrefetchArg, PrefetchDiag, ia32_prefetch_hint, prefetch_hint};
     use crate::ir::reexports::PrefetchHint;
 
     fn v(x: i128) -> Option<PrefetchArg> {
@@ -5368,15 +5687,158 @@ mod prefetch_hint_tests {
     }
 
     #[test]
-    fn instruction_fetch_intent_is_a_read_hint() {
-        // GCC 15+ accepts `rw = 2` without a diagnostic and lowers it with the
-        // read table on every target.
+    fn rw_two_is_a_shared_read() {
+        // GCC 15+ accepts `rw = 2` without a diagnostic: a read the line of
+        // which another processor reads too. It is the read table on every
+        // target but x86 with MOVRS (`prefetchrst2` for locality 1), so the
+        // intent has to reach the backend; as a plain read it never did.
         for loc in 0..=3i128 {
+            let (hint, diags) = prefetch_hint(v(2), v(loc));
+            assert!(diags.is_empty());
+            assert_eq!(hint, PrefetchHint::shared_read(loc as u8));
+            assert!(hint.shared && !hint.write);
+            assert_ne!(hint.encode(), PrefetchHint::new(false, loc as u8).encode());
+        }
+    }
+
+    /// `_mm_prefetch(P, I)` is `__builtin_ia32_prefetch(P, (I & 0xC) >> 2,
+    /// I & 3, (I & 0x10) >> 4)`: every selector GCC's `enum _mm_hint`
+    /// names, as the header takes it apart.
+    #[test]
+    fn every_named_hint_of_mm_prefetch_is_the_hint_gcc_selects() {
+        let of = |selector: i128| {
+            ia32_prefetch_hint(
+                PrefetchArg::Value((selector & 0xC) >> 2),
+                PrefetchArg::Value(selector & 3),
+                PrefetchArg::Value((selector & 0x10) >> 4),
+            )
+        };
+        // _MM_HINT_NTA, _MM_HINT_T2, _MM_HINT_T1, _MM_HINT_T0
+        for loc in 0..=3u8 {
             assert_eq!(
-                prefetch_hint(v(2), v(loc)),
-                (PrefetchHint::new(false, loc as u8), vec![])
+                of(i128::from(loc)),
+                (Some(PrefetchHint::new(false, loc)), vec![])
             );
         }
+        // _MM_HINT_ET0 = 7: a write of locality 3.
+        assert_eq!(of(7), (Some(PrefetchHint::new(true, 3)), vec![]));
+        // _MM_HINT_RST2 = 9: a shared read of locality 1.
+        assert_eq!(of(9), (Some(PrefetchHint::shared_read(1)), vec![]));
+        // _MM_HINT_IT1 = 18, _MM_HINT_IT0 = 19: code, a NOP with a warning.
+        for selector in [18, 19] {
+            let (hint, diags) = of(selector);
+            assert_eq!(hint, None);
+            assert_eq!(diags.len(), 1);
+            assert!(matches!(&diags[0], (PrefetchDiag::OutOfRange(text), 0)
+                if text.starts_with("instruction prefetch applies")));
+        }
+        // 16, 17: code with a locality it has no instruction for.
+        for selector in [16, 17] {
+            assert_eq!(
+                of(selector),
+                (
+                    None,
+                    vec![(PrefetchDiag::Invalid("invalid third argument"), 2)]
+                )
+            );
+        }
+        // 12..=15: `rw` 3 is no access; GCC warns and reads.
+        for loc in 0..=3u8 {
+            assert_eq!(
+                of(12 + i128::from(loc)),
+                (
+                    Some(PrefetchHint::new(false, loc)),
+                    vec![(
+                        PrefetchDiag::OutOfRange(
+                            "invalid second argument to '__builtin_ia32_prefetch'; using zero"
+                        ),
+                        1
+                    )]
+                )
+            );
+        }
+    }
+
+    /// GCC 16.2, measured for `rw` -1..=4, `locality` 0..=4, `instruction`
+    /// 0..=2: which diagnostics, in which order, and whether a hint is left.
+    #[test]
+    fn ia32_prefetch_diagnostics_are_gccs_in_gccs_order() {
+        let v = PrefetchArg::Value;
+        let second = (
+            PrefetchDiag::OutOfRange(
+                "invalid second argument to '__builtin_ia32_prefetch'; using zero",
+            ),
+            1,
+        );
+        let third = (
+            PrefetchDiag::OutOfRange(
+                "invalid third argument to '__builtin_ia32_prefetch'; using zero",
+            ),
+            2,
+        );
+        let fourth = (
+            PrefetchDiag::OutOfRange(
+                "invalid fourth argument to '__builtin_ia32_prefetch'; using zero",
+            ),
+            3,
+        );
+        // (3, 4, 2): all three, second, fourth, third; a read of locality 0.
+        assert_eq!(
+            ia32_prefetch_hint(v(3), v(4), v(2)),
+            (
+                Some(PrefetchHint::new(false, 0)),
+                vec![second.clone(), fourth.clone(), third.clone()]
+            )
+        );
+        // (1, 4, 0): the write survives a bad locality.
+        assert_eq!(
+            ia32_prefetch_hint(v(1), v(4), v(0)),
+            (Some(PrefetchHint::new(true, 0)), vec![third])
+        );
+        // (2, 1, 2): a fourth argument that is neither is data.
+        assert_eq!(
+            ia32_prefetch_hint(v(2), v(1), v(2)),
+            (Some(PrefetchHint::shared_read(1)), vec![fourth])
+        );
+        // (-1, 1, 1): the warning about `rw`, then the error about code.
+        assert_eq!(
+            ia32_prefetch_hint(v(-1), v(1), v(1)),
+            (
+                None,
+                vec![second, (PrefetchDiag::Invalid("invalid third argument"), 2)]
+            )
+        );
+        // Every valid triple of data has its hint and says nothing.
+        for rw in 0..=2u8 {
+            for loc in 0..=3u8 {
+                assert_eq!(
+                    ia32_prefetch_hint(v(i128::from(rw)), v(i128::from(loc)), v(0)),
+                    (Some(PrefetchHint::of_rw(rw, loc)), vec![])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_ia32_prefetch_argument_that_is_no_constant_is_one_error() {
+        let message =
+            PrefetchDiag::NotConstant("second, third and fourth argument must be a const");
+        let v = PrefetchArg::Value;
+        let n = PrefetchArg::NotConstant;
+        assert_eq!(
+            ia32_prefetch_hint(n, v(3), v(0)),
+            (None, vec![(message.clone(), 1)])
+        );
+        assert_eq!(
+            ia32_prefetch_hint(v(0), n, v(0)),
+            (None, vec![(message.clone(), 2)])
+        );
+        assert_eq!(
+            ia32_prefetch_hint(v(0), v(3), n),
+            (None, vec![(message.clone(), 3)])
+        );
+        // One error, at the first of them.
+        assert_eq!(ia32_prefetch_hint(n, n, n), (None, vec![(message, 1)]));
     }
 
     #[test]
@@ -5433,7 +5895,10 @@ mod prefetch_hint_tests {
         for p in 0u8..=255 {
             let h = PrefetchHint::decode(p);
             assert!(h.locality <= 3);
-            assert_eq!(h.encode(), p & 7);
+            assert!(!(h.write && h.shared));
+            // Four bits are the hint, and write intent wins over shared.
+            let canonical = if p & 4 != 0 { p & 7 } else { p & 15 };
+            assert_eq!(h.encode(), canonical);
         }
     }
 }

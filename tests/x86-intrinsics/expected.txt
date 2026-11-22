@@ -3,37 +3,37 @@
 # many of them it cannot call under lccc: header, callable, missing, digest
 # of the missing names (--list HEADER prints them).
 gcc 16.2.0
-callable 7021
-missing 5736
+callable 7502
+missing 6183
 header adxintrin.h 6 6 b363f9a3
-header ammintrin.h 5 5 f8288ddb
+header ammintrin.h 6 6 920b74f4
 header amxtileintrin.h 3 3 2f72485e
-header avx10_2bf16intrin.h 18 18 e8158db2
-header avx10_2convertintrin.h 21 21 cf29880d
+header avx10_2bf16intrin.h 192 192 5f112a95
+header avx10_2convertintrin.h 138 138 6a075f2d
 header avx10_2copyintrin.h 2 0 e3b0c442
 header avx10_2mediaintrin.h 100 100 2cb5fd8b
 header avx10_2minmaxintrin.h 63 63 290b518f
 header avx10_2satcvtintrin.h 268 268 a5d58750
 header avx2intrin.h 221 88 35821cde
 header avx512bf16intrin.h 13 13 ceb03da9
-header avx512bf16vlintrin.h 28 28 94878ab7
+header avx512bf16vlintrin.h 29 29 ffdb9237
 header avx512bitalgintrin.h 8 6 a33ef0fd
 header avx512bitalgvlintrin.h 16 16 5682a9c7
 header avx512bmmintrin.h 5 5 cafd0857
 header avx512bmmvlintrin.h 8 8 3dd19717
-header avx512bwintrin.h 319 257 de8ec548
+header avx512bwintrin.h 323 261 5ec478fe
 header avx512cdintrin.h 14 14 1048c45c
-header avx512dqintrin.h 221 215 438f590e
-header avx512fintrin.h 1394 1282 135c9099
-header avx512fp16intrin.h 560 560 067e082d
-header avx512fp16vlintrin.h 339 339 71758897
+header avx512dqintrin.h 224 218 d225e85d
+header avx512fintrin.h 1395 1283 d26e8804
+header avx512fp16intrin.h 563 563 32014ae6
+header avx512fp16vlintrin.h 341 341 10ad3daa
 header avx512ifmaintrin.h 6 6 da7b478c
 header avx512ifmavlintrin.h 8 8 3910b0b9
 header avx512vbmi2intrin.h 50 50 eeb6b66d
 header avx512vbmi2vlintrin.h 100 100 6d269f1d
 header avx512vbmiintrin.h 10 10 7efd977f
 header avx512vbmivlintrin.h 20 20 3ef14597
-header avx512vlbwintrin.h 500 476 4eb2dd8c
+header avx512vlbwintrin.h 501 477 6297b5fd
 header avx512vldqintrin.h 177 177 741bfb61
 header avx512vlintrin.h 1253 1233 f9e097f7
 header avx512vnniintrin.h 12 10 c608cf9b
@@ -43,10 +43,11 @@ header avx512vp2intersectvlintrin.h 4 4 0321bf81
 header avx512vpopcntdqintrin.h 6 4 2d9560c0
 header avx512vpopcntdqvlintrin.h 12 12 a289018c
 header avxifmaintrin.h 4 4 52265d8b
-header avxintrin.h 180 0 e3b0c442
+header avxintrin.h 183 0 e3b0c442
 header avxneconvertintrin.h 14 14 463bbb9c
 header avxvnniint16intrin.h 12 0 e3b0c442
 header avxvnniint8intrin.h 12 0 e3b0c442
+header avxvnniintrin.h 8 0 e3b0c442
 header bmi2intrin.h 7 0 e3b0c442
 header bmiintrin.h 26 3 4f20abc4
 header cetintrin.h 10 10 98cd7b1c
@@ -55,7 +56,7 @@ header clflushoptintrin.h 1 1 26397c6b
 header clwbintrin.h 1 1 08d9fe95
 header clzerointrin.h 1 1 73498522
 header cmpccxaddintrin.h 2 2 a6a8f132
-header emmintrin.h 230 0 e3b0c442
+header emmintrin.h 237 0 e3b0c442
 header enqcmdintrin.h 2 2 cbe80e86
 header f16cintrin.h 6 6 97ca73f6
 header fma4intrin.h 32 32 8275c6b7
@@ -64,32 +65,34 @@ header fxsrintrin.h 4 4 54c6b71a
 header gfniintrin.h 27 24 048021d6
 header hresetintrin.h 1 1 24208eb7
 header ia32intrin.h 26 7 f3c0e797
-header keylockerintrin.h 7 7 1393fc2e
+header keylockerintrin.h 11 11 f116332d
 header lwpintrin.h 6 6 2a8f1e79
 header lzcntintrin.h 5 0 e3b0c442
+header mm3dnow.h 28 28 18987669
+header mm_malloc.h 2 0 e3b0c442
 header mmintrin.h 129 9 27ae131e
 header movdirintrin.h 3 3 7929fc67
 header movrsintrin.h 41 41 a80d6caf
 header mwaitintrin.h 2 0 e3b0c442
 header mwaitxintrin.h 2 2 f70825bd
-header pconfigintrin.h 0 0 e3b0c442
+header pconfigintrin.h 1 1 e5a26264
 header pkuintrin.h 2 2 526384f4
 header pmmintrin.h 11 0 e3b0c442
 header popcntintrin.h 2 0 e3b0c442
 header prfchiintrin.h 2 2 096cca5a
-header prfchwintrin.h 1 1 080b6a28
+header prfchwintrin.h 1 0 e3b0c442
 header raointintrin.h 8 8 52087b05
 header rdseedintrin.h 3 0 e3b0c442
 header rtmintrin.h 3 3 63360246
 header serializeintrin.h 1 1 a8145fea
-header sgxintrin.h 0 0 e3b0c442
+header sgxintrin.h 3 3 3392fc78
 header sha512intrin.h 3 0 e3b0c442
 header shaintrin.h 7 0 e3b0c442
 header sm3intrin.h 3 3 2f89628d
 header sm4intrin.h 6 6 55023338
-header smmintrin.h 68 14 9f5f17f0
+header smmintrin.h 69 14 9f5f17f0
 header tbmintrin.h 20 20 26cb9ad0
-header tmmintrin.h 30 0 e3b0c442
+header tmmintrin.h 32 0 e3b0c442
 header tsxldtrkintrin.h 2 2 e4bca07f
 header uintrintrin.h 4 4 7051d835
 header usermsrintrin.h 2 2 ec5bd869
@@ -99,10 +102,10 @@ header waitpkgintrin.h 3 3 be09a3e1
 header wbnoinvdintrin.h 1 1 836fb05a
 header wmmintrin.h 3 0 e3b0c442
 header x86gprintrin.h 15 12 edf3e7cd
-header xmmintrin.h 152 0 e3b0c442
-header xopintrin.h 10 10 39b9e2e6
+header xmmintrin.h 157 0 e3b0c442
+header xopintrin.h 120 120 1b2c826e
 header xsavecintrin.h 2 2 abf6872c
-header xsaveintrin.h 6 5 f39f764b
+header xsaveintrin.h 6 0 e3b0c442
 header xsaveoptintrin.h 2 2 67b62c4e
 header xsavesintrin.h 4 4 3b2c3eb5
 header xtestintrin.h 1 1 73c9922e

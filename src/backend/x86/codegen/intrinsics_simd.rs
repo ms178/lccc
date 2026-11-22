@@ -368,6 +368,74 @@ impl X86Codegen {
         self.evex_store_dest(dest_ptr);
     }
 
+    /// 512-bit sign or zero extension: `inst %src, %zmm0`, where `src` is
+    /// the register of the source's own width -- the half of the destination
+    /// for a doubling (`vpmovsxbw %ymm0, %zmm0`), an XMM register for a
+    /// quadrupling or more (`vpmovsxbq %xmm0, %zmm0`).
+    ///
+    /// The source is loaded at that width. It went through
+    /// `emit_evex_unary_512`, which loaded 64 bytes from the slot of a 32-
+    /// or 16-byte value (a read of up to 48 bytes past the object) and wrote
+    /// `vpmovsxbw %zmm0, %zmm0`: no instruction, GNU as refuses it ("operand
+    /// size mismatch"), and so does this crate's assembler since it checks
+    /// operand widths.
+    fn emit_evex_widen_512(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        inst: &str,
+        src: &'static str,
+    ) {
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        if let Some(m) = self.evex_arg_mem(&args[0]) {
+            self.state
+                .emit_fmt(format_args!("    {} {}, %zmm0", inst, m));
+        } else {
+            self.simd_load_arg_to(&args[0], src);
+            self.state
+                .emit_fmt(format_args!("    {} %{}, %zmm0", inst, src));
+        }
+        self.evex_store_dest(dest_ptr);
+    }
+
+    /// 512-bit element shift by a count: `inst $count, src, %zmm0` for a
+    /// constant, `inst %xmm1, %zmm0, %zmm0` for a count of the running
+    /// program.
+    ///
+    /// The instruction saturates: a count past the lane clears the lane, or
+    /// fills it with the sign. The immediate is one byte, so a constant past
+    /// 255 is written as 255 (`packed_shift_immediate`): it went out as
+    /// `vpsrad $256, %zmm0, %zmm0`, which no assembler takes. A runtime count
+    /// is the 32-bit value GCC's `unsigned int` parameter is; `vmovd` clears
+    /// the rest of the 64 bits the instruction reads.
+    fn emit_evex_shift_512(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str) {
+        if matches!(args[1], Operand::Const(_)) {
+            self.flush_pending_vec_store_impl();
+            self.state.invalidate_vec_peephole();
+            let count = crate::backend::x86_common::packed_shift_immediate(self.simd_imm(&args[1]));
+            if let Some(m) = self.evex_arg_mem(&args[0]) {
+                self.state
+                    .emit_fmt(format_args!("    {} ${}, {}, %zmm0", inst, count, m));
+            } else {
+                self.evex_load_arg(&args[0]);
+                self.state
+                    .emit_fmt(format_args!("    {} ${}, %zmm0, %zmm0", inst, count));
+            }
+            self.evex_store_dest(dest_ptr);
+            return;
+        }
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        self.evex_load_arg(&args[0]);
+        self.operand_to_reg(&args[1], "rax");
+        self.state.vec_evict_bank_except("xmm1", u32::MAX);
+        self.state.emit("    vmovd %eax, %xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %zmm0, %zmm0", inst));
+        self.evex_store_dest(dest_ptr);
+    }
+
     /// 512-bit op with immediate: `inst $imm, src, dst` (shifts/shuffles).
     fn emit_evex_imm_512(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str) {
         self.flush_pending_vec_store_impl();
@@ -874,39 +942,39 @@ impl X86Codegen {
             }
             // ---- shifts / shuffles with immediate ----
             Psllwi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpsllw");
+                self.emit_evex_shift_512(dptr, args, "vpsllw");
                 true
             }
             Psrlwi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpsrlw");
+                self.emit_evex_shift_512(dptr, args, "vpsrlw");
                 true
             }
             Psrawi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpsraw");
+                self.emit_evex_shift_512(dptr, args, "vpsraw");
                 true
             }
             Psllidi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpslld");
+                self.emit_evex_shift_512(dptr, args, "vpslld");
                 true
             }
             Psrlidi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpsrld");
+                self.emit_evex_shift_512(dptr, args, "vpsrld");
                 true
             }
             Psradi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpsrad");
+                self.emit_evex_shift_512(dptr, args, "vpsrad");
                 true
             }
             Psllqi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpsllq");
+                self.emit_evex_shift_512(dptr, args, "vpsllq");
                 true
             }
             Psrlqi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpsrlq");
+                self.emit_evex_shift_512(dptr, args, "vpsrlq");
                 true
             }
             Psraqi512 => {
-                self.emit_evex_imm_512(dptr, args, "vpsraq");
+                self.emit_evex_shift_512(dptr, args, "vpsraq");
                 true
             }
             Pshufd512 => {
@@ -944,51 +1012,51 @@ impl X86Codegen {
             }
             // ---- sign/zero extension (unary, src narrower than dst) ----
             Pmovzxbw512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovzxbw");
+                self.emit_evex_widen_512(dptr, args, "vpmovzxbw", "ymm0");
                 true
             }
             Pmovzxbd512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovzxbd");
+                self.emit_evex_widen_512(dptr, args, "vpmovzxbd", "xmm0");
                 true
             }
             Pmovzxbq512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovzxbq");
+                self.emit_evex_widen_512(dptr, args, "vpmovzxbq", "xmm0");
                 true
             }
             Pmovzxwd512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovzxwd");
+                self.emit_evex_widen_512(dptr, args, "vpmovzxwd", "ymm0");
                 true
             }
             Pmovzxwq512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovzxwq");
+                self.emit_evex_widen_512(dptr, args, "vpmovzxwq", "xmm0");
                 true
             }
             Pmovzxdq512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovzxdq");
+                self.emit_evex_widen_512(dptr, args, "vpmovzxdq", "ymm0");
                 true
             }
             Pmovsxbw512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovsxbw");
+                self.emit_evex_widen_512(dptr, args, "vpmovsxbw", "ymm0");
                 true
             }
             Pmovsxbd512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovsxbd");
+                self.emit_evex_widen_512(dptr, args, "vpmovsxbd", "xmm0");
                 true
             }
             Pmovsxbq512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovsxbq");
+                self.emit_evex_widen_512(dptr, args, "vpmovsxbq", "xmm0");
                 true
             }
             Pmovsxwd512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovsxwd");
+                self.emit_evex_widen_512(dptr, args, "vpmovsxwd", "ymm0");
                 true
             }
             Pmovsxwq512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovsxwq");
+                self.emit_evex_widen_512(dptr, args, "vpmovsxwq", "xmm0");
                 true
             }
             Pmovsxdq512 => {
-                self.emit_evex_unary_512(dptr, args, "vpmovsxdq");
+                self.emit_evex_widen_512(dptr, args, "vpmovsxdq", "ymm0");
                 true
             }
             // ---- insert/extract ----
@@ -1895,6 +1963,7 @@ impl X86Codegen {
             TestzPs128 => ("vtestps", 0, true),
             TestzPs256 => ("vtestps", 0, true),
             ReduceAddEpu32_512 => ("__reduce_add_epu32", 0, false),
+            ReduceAddEpu64_512 => ("__reduce_add_epu64", 0, false),
             _ => return false,
         };
         let _ = (w, opcode_ok);
@@ -2031,6 +2100,24 @@ impl X86Codegen {
                 }
                 true
             }
+            ReduceAddEpu64_512 => {
+                // args: (a) -- the sum of the eight 64-bit lanes, halved as
+                // GCC 16.2 halves it: 512 -> 256 -> 128 -> 64. (The wrapper
+                // used the 32-bit reduction above and returned the sum of
+                // the sixteen halves.)
+                self.evex_load_arg(&args[0]);
+                self.state.emit("    vextracti64x4 $1, %zmm0, %ymm1");
+                self.state.emit("    vpaddq %ymm1, %ymm0, %ymm0");
+                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vpsrldq $8, %xmm0, %xmm1");
+                self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vmovq %xmm0, %rax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -2123,8 +2210,15 @@ impl X86Codegen {
                 let imm = self.simd_imm(&args[2]);
                 self.sse_load_arg(&args[1], "xmm1");
                 self.sse_load_arg(&args[0], "xmm2");
-                self.state
-                    .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm2", inst, imm));
+                if crate::backend::x86_common::compare_predicate_is_vex_only(op, imm) {
+                    // No legacy spelling for the late VEX promotion to
+                    // rewrite, or to leave: `cmppd $13` is `cmppd $5`.
+                    self.state
+                        .emit_fmt(format_args!("    v{} ${}, %xmm1, %xmm2, %xmm2", inst, imm));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm2", inst, imm));
+                }
                 self.sse_store_dest(dest_ptr, "xmm2");
             }
             // 1-op with imm: roundps/roundpd/vpermilps (a, imm)

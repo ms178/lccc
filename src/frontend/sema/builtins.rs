@@ -863,6 +863,11 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_prefetch",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::Nop),
     );
+    // What `_mm_prefetch` is in <xmmintrin.h>; lowered beside the generic one.
+    m.insert(
+        "__builtin_ia32_prefetch",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::Nop),
+    );
 
     // CPU feature detection builtins
     // __builtin_cpu_init() initializes CPU feature detection; on glibc systems
@@ -1203,7 +1208,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sha1rnds4128),
     );
     // The public SHA-1 round name carries the immediate check (see
-    // `x86_lane_immediate_bits`), so a bad immediate is reported against
+    // `x86_immediate`), so a bad immediate is reported against
     // `_mm_sha1rnds4_epu32`, as GCC 16.2 does, not the internal builtin.
     m.insert(
         "_mm_sha1rnds4_epu32",

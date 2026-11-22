@@ -7,6 +7,20 @@
 #error "MMX intrinsics (mmintrin.h) require an x86 target"
 #endif
 
+/* An immediate of an intrinsic this header family writes in C: an integer
+ * constant expression in [0, MAX], or the translation unit is refused where
+ * the call stands, with TEXT. An expression of type void, for the left side
+ * of a comma.
+ *
+ * GCC 16.2 and Clang 23.1.5 refuse `_mm_extract_pi16(v, 4)` ("selector must
+ * be an integer constant in the range [0, 3]"). A header that masks the
+ * selector instead (`(N) & 3`) compiles it to element 0: a program no other
+ * compiler takes runs here, on a selector nobody wrote. */
+#ifndef __LCCC_IMMEDIATE
+#define __LCCC_IMMEDIATE(N, MAX, TEXT) \
+    ((void)sizeof(struct { _Static_assert((N) >= 0 && (N) <= (MAX), TEXT); char __c; }))
+#endif
+
 /* __m64: 64-bit MMX vector type, GCC's exact definition. Being a GNU
  * vector (not a struct) gives it the psABI class GCC uses: SSE on x86-64,
  * so __m64 arguments and returns travel in %xmm registers and interoperate
@@ -439,8 +453,9 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_srai_pi16(__m64 __a, int __count)
 {
     __m64 __r;
-    if (__count > 15) __count = 15;
-    if (__count < 0) __count = 0;
+    /* PSRAW reads the count as unsigned: one past the lane, which a negative
+     * `int` is, fills the lane with the sign. (It was taken for a count of 0.) */
+    if ((unsigned int)__count > 15) __count = 15;
     __v8hh __x = {0}, __v;
     __builtin_memcpy(&__x, &__a, 8);
     __v = __builtin_ia32_psrawi128(__x, __count);
@@ -453,8 +468,8 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_srai_pi32(__m64 __a, int __count)
 {
     __m64 __r;
-    if (__count > 31) __count = 31;
-    if (__count < 0) __count = 0;
+    /* As _mm_srai_pi16: a negative count fills the lane with the sign. */
+    if ((unsigned int)__count > 31) __count = 31;
     __v4ss __x = {0}, __v;
     __builtin_memcpy(&__x, &__a, 8);
     __v = __builtin_ia32_psradi128(__x, __count);

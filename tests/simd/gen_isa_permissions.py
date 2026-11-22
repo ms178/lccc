@@ -112,7 +112,9 @@ def build(header: Path, gcc_include: Path) -> dict:
     return {
         'schema': 1,
         'source': 'GCC 16.2.0 intrinsic headers (harness-cache-8 tag cache)',
-        'gcc_include': str(gcc_include),
+        # The part of the path that names the compiler, not the machine
+        # the table was generated on.
+        'gcc_include': '/'.join(gcc_include.resolve().parts[-3:]),
         'generated_from': 'include/lcccsimd.h',
         'intrinsic_headers_indexed': len(set(owner.values())),
         'wrapper_pairs': len(pairs),

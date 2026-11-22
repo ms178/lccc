@@ -767,8 +767,10 @@ jobs:
         # with GCC, then compares stdout and exit code. Catches emitted-but-
         # unassemblable vector forms (a 256-bit width-changing convert used to
         # be spelled `vcvtps2pd %ymm0, %ymm0`) that a compile-only gate cannot.
+        # At -O2 here; the backend job runs the cases without optimization
+        # against GCC 16.2.
         env LCCC_BIN=target/fastbuild/lccc CC=gcc \
-          python3 tests/intrinsics/run_intrin_tests.py
+          python3 tests/intrinsics/run_intrin_tests.py --levels=-O2
     - name: Check FP-contraction parity with GCC
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
     - name: IV-widen exposed-latch trajectory gates
@@ -2364,6 +2366,14 @@ jobs:
       run: >-
         python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # A prefetch computes nothing, so no test that compares values sees one:
+    # `_mm_prefetch` emitted nothing for years and every suite passed. The
+    # instruction is the behaviour, so it is compared with GCC 16.2's for
+    # every statement form, under every CPU of the table in both modes.
+    - name: Verify the x86 prefetch instructions against GCC 16.2
+      run: >-
+        python3 scripts/check_x86_prefetch.py target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     # A macro lccc defines is a promise that the intrinsics behind it exist
     # (`__AVX512F__`, `__F16C__`). The census calls every intrinsic of GCC
     # 16.2's headers under lccc and holds the count that does not compile to
@@ -2372,6 +2382,12 @@ jobs:
       run: >-
         python3 scripts/x86_intrinsic_census.py --check --lccc target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # Which extension each SIMD helper of include/lcccsimd.h needs is held to
+    # a table generated from GCC 16.2's headers. Nothing ran the comparison
+    # (only its self-test), and it had come apart: 29 helpers, the FMA 132
+    # forms and vdpps256, had no row. A ratchet is a gate or it is a file.
+    - name: Verify SIMD helper feature permissions against the GCC 16.2 table
+      run: python3 tests/simd/check_isa_permissions.py
     - name: Verify range-fold branch contracts
       env:
         CCC: target/fastbuild/lccc
@@ -2456,6 +2472,28 @@ jobs:
     - name: Verify i686 assembler replacements vs GNU as 2.47 -O2 and -Os, and execute them
       run: python3 scripts/asm_optimize_sweep.py --32 --check --execute --minimum 800 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
         --lccc target/fastbuild/lccc-i686
+    # An intrinsic that compiles may still compute something else, and that
+    # is the defect nothing reports: `_xgetbv` returned 0, a 128-bit compare
+    # with a VEX-only predicate ran another predicate, and a selector that is
+    # no literal was assembled as `$0`. Every intrinsic lccc has that this
+    # runner's processor executes is called with generated arguments and held
+    # to GCC 16.2's result, with and without optimization; where GCC wants a
+    # constant, lccc is given a value and has to say so or be right; and GNU
+    # as has to take the assembly lccc writes for the tests.
+    - name: Self-test the intrinsic value differential
+      run: python3 -m unittest tests.corpus.test_x86_intrinsic_values
+    - name: Verify the values of the x86 intrinsics against GCC 16.2
+      run: >-
+        python3 scripts/x86_intrinsic_values.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+        --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+    # The hand-written cases once more, without optimization: there nothing
+    # folds an immediate or forwards a temporary, and what goes wrong there
+    # does not show at -O2 (`_mm256_clmulepi64_epi128`).
+    - name: Intrinsic differential corpus without optimization (lccc vs GCC 16.2)
+      run: >-
+        env LCCC_BIN=target/fastbuild/lccc CC="${{ steps.gcc162.outputs.bin }}"
+        python3 tests/intrinsics/run_intrin_tests.py --levels=-O0
     - name: Verify complete SSE3 SSSE3 SSE4 encodings vs Clang 23.1.5
       run: python3 tests/regression/check_sse34_clang.py
     - name: Verify encdiff corpus vs GNU as 2.47 (offline)

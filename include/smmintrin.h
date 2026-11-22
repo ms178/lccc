@@ -368,7 +368,7 @@ _mm_minpos_epu16(__m128i __a)
  * the sum of |a[aoff+i+j] - b[boff+j]| over j = 0..3. The largest sum is
  * 4 * 255, so 16-bit results do not overflow. === */
 static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
-_mm_mpsadbw_epu8(__m128i __a, __m128i __b, const int __imm)
+__lccc_mm_mpsadbw_epu8(__m128i __a, __m128i __b, const int __imm)
 {
     unsigned char __ab[16];
     unsigned char __bb[16];
@@ -387,6 +387,11 @@ _mm_mpsadbw_epu8(__m128i __a, __m128i __b, const int __imm)
     }
     return (__m128i)__r;
 }
+/* The selector is the byte MPSADBW encodes: a constant in [0, 255], as in
+ * GCC 16.2 ("the last argument must be an 8-bit immediate"). */
+#define _mm_mpsadbw_epu8(__a, __b, __imm)                                       \
+    (__LCCC_IMMEDIATE(__imm, 255, "the last argument must be an 8-bit immediate"), \
+     __lccc_mm_mpsadbw_epu8((__a), (__b), (__imm)))
 
 /* === SSE4.1 round (ROUNDPS/ROUNDPD and the scalar forms) ===
  * The scalar forms round only the low element of the second operand, and

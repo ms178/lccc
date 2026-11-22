@@ -8184,25 +8184,37 @@ mod prefetch_isa_tests {
     }
 
     #[test]
-    fn i686_sse_prefetch_needs_sse_or_prfchw() {
-        // The i386 default baseline is the x86-64 ISA level, so the
-        // prefetcht*/nta family is baseline for plain `-m32` (GCC 16.2 and
-        // Clang 23.1.3 both emit it there, measured). An explicit pre-SSE
-        // `-march=` still suppresses it (both oracles: 0 instructions for
-        // `-m32 -march=i686`), as does `-mno-sse`.
+    fn i686_sse_prefetch_follows_the_cpu_not_the_sse_registers() {
+        // The prefetcht*/nta family exists where the CPU of `-march=` has
+        // it (every CPU with SSE; the Athlon, Athlon Thunderbird and Geode
+        // without), where SSE is enabled, and where PRFCHW is. The default
+        // CPU of `-m32` is `x86-64`. A pre-SSE `-march=` has none: both
+        // oracles write 0 instructions for `-m32 -march=i686`.
         //
-        // The `-mno-sse` corner is a measured oracle fork: GCC 16.2 EMITS
-        // `prefetcht0` under `-m32 -mno-sse` (0F 18, an SSE encoding), while
-        // Clang 23.1.3 suppresses it. lccc follows Clang: the `-mno-sse`
-        // contract is that NO SSE instruction of any encoding is emitted
-        // (the kernel's -mno-sse use is precisely to avoid FPU/SSE state),
-        // and a lone prefetch hint does not justify breaking that invariant.
+        // `-mno-sse` is a measured oracle fork, and the same fork at both
+        // widths: GCC 16.2 writes `prefetcht0` under `-mno-sse` and
+        // `-mgeneral-regs-only` for `-m64` and for `-m32`, Clang 23.1.5
+        // writes nothing for either. This target followed Clang while the
+        // x86-64 one followed GCC (`x86_64_sse_prefetch_is_baseline`): two
+        // rules for one instruction. It follows GCC now, because the reason
+        // given for the other choice does not hold. `-mno-sse` keeps the
+        // compiler out of the XMM registers, whose state a kernel does not
+        // save; PREFETCHh has no register operand and no state, and is one
+        // of the instructions the SDM (vol. 3A, 2.5, CR4.OSFXSR) excepts
+        // from needing operating-system SSE support. The kernel, built with
+        // `-mno-sse`, writes the instruction itself (`prefetch()`). What the
+        // option does not say is that the CPU lacks the opcode: that is
+        // `-march=`'s to say, and is honoured.
+        // `scripts/check_x86_prefetch.py` holds every row of the CPU table
+        // to GCC, with and without the option.
         for flags in [
             &["-m32", "-march=i686"][..],
             &["-m32", "-march=pentiumpro"],
-            &["-m32", "-msse", "-mno-sse"],
-            &["-m32", "-mno-sse"],
-            &["-m32", "-march=raptorlake", "-mno-sse", "-mno-prfchw"],
+            &["-m32", "-march=i686", "-mno-sse"],
+            &["-m32", "-march=i686", "-msse", "-mno-sse"],
+            &["-m32", "-march=pentium2", "-mgeneral-regs-only"],
+            &["-m32", "-march=k6-2"],
+            &["-m32", "-march=haswell", "-march=i586"],
         ] {
             assert!(!parse(flags).resolved_prefetch_sse(), "{flags:?}");
         }
@@ -8213,13 +8225,51 @@ mod prefetch_isa_tests {
             &["-m32", "-msse2"],
             &["-m32", "-msse", "-march=i686"],
             &["-m32", "-march=i686", "-msse"],
+            &["-m32", "-march=i686", "-mno-sse", "-msse"],
             &["-m32", "-msse4.1"],
             &["-m32", "-march=nehalem"],
             &["-m32", "-march=raptorlake"],
             &["-m32", "-mprfchw"],
             &["-m32", "-mno-sse", "-mprfchw"],
+            &["-m32", "-march=i686", "-mprfchw"],
+            // The CPU has the opcode; the option is about the registers.
+            &["-m32", "-mno-sse"],
+            &["-m32", "-msse", "-mno-sse"],
+            &["-m32", "-mgeneral-regs-only"],
+            &["-m32", "-march=pentium3", "-mno-sse"],
+            &["-m32", "-march=raptorlake", "-mno-sse", "-mno-prfchw"],
+            &["-m32", "-march=i586", "-march=haswell", "-mno-sse"],
+            // GCC's PTA_PREFETCH_SSE: the opcode without SSE.
+            &["-m32", "-march=athlon"],
+            &["-m32", "-march=athlon-tbird", "-mno-sse"],
+            &["-m32", "-march=geode"],
         ] {
             assert!(parse(flags).resolved_prefetch_sse(), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn prefetchrst2_needs_movrs_on_both_x86_targets() {
+        // GCC 16.2: `-mmovrs`, and the two CPUs that have it; a later
+        // `-mno-movrs` or `-march=` takes it back.
+        for mode in ["-m32", "-m64"] {
+            for (flags, granted) in [
+                (&[][..], false),
+                (&["-mmovrs"][..], true),
+                (&["-mmovrs", "-mno-movrs"][..], false),
+                (&["-mno-movrs", "-mmovrs"][..], true),
+                (&["-march=diamondrapids"][..], true),
+                (&["-march=novalake"][..], true),
+                (&["-march=diamondrapids", "-mno-movrs"][..], false),
+                (&["-march=diamondrapids", "-march=haswell"][..], false),
+                (&["-march=haswell", "-march=diamondrapids"][..], true),
+                (&["-march=sapphirerapids"][..], false),
+                (&["-mno-sse", "-mmovrs"][..], true),
+            ] {
+                let mut all = vec![mode];
+                all.extend_from_slice(flags);
+                assert_eq!(parse(&all).resolved_movrs(), granted, "{all:?}");
+            }
         }
     }
 
@@ -8449,7 +8499,9 @@ mod prefetch_isa_tests {
 
         // `-mgeneral-regs-only` is a full SSE denial (it sets `no_sse`, so
         // the resolved levels drop too): no XMM state of any kind, which
-        // also vetoes the published features and the prefetch grant.
+        // also vetoes the published features. It does not take the
+        // prefetch opcodes away from a CPU that has them: they have no
+        // register (GCC 16.2 writes `prefetcht0` under it, at both widths).
         let driver = parse(&["-m32", "-mgeneral-regs-only"]);
         assert!(!driver.resolved_i686_sse());
         assert!(!driver.resolved_i686_sse2());
@@ -8463,7 +8515,8 @@ mod prefetch_isa_tests {
                 .effective_x86_features()
                 .contains(crate::common::x86_features::X86Feature::Sse2)
         );
-        assert!(!driver.resolved_prefetch_sse());
+        assert!(driver.resolved_prefetch_sse());
+        assert!(!parse(&["-m32", "-march=i686", "-mgeneral-regs-only"]).resolved_prefetch_sse());
     }
 
     #[test]

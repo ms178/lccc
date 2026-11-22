@@ -43,25 +43,85 @@ fn exact_immediate_operand(op: &Operand) -> bool {
     }
 }
 
-/// Width in bits of the lane selector of a generic helper whose instruction
-/// encodes only one bit of its immediate. `vinsertf128` and `vextractf128`
-/// select lane 0 or 1; GCC 16.2 rejects any other value with "the last argument
-/// must be a 1-bit immediate". The `_mm256_*f128_*` macros reach this generic
-/// path, which only checked that the value was an exact integer, so an
-/// out-of-range selector compiled silently to the masked lane.
-fn lane_selector_bits(mnemonic: &str) -> Option<u32> {
+/// Width in bits of the immediate of a generic helper: the constant has to
+/// be in `0..1 << bits`, as GCC 16.2 and Clang 23.1.5 require of it.
+///
+/// Every row is measured: the public intrinsic over the helper was given
+/// 0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256 and -1
+/// under GCC 16.2, and the width is the one of the largest constant it
+/// took. (Its message is no guide: `_mm512_extracti32x8_epi32(v, 2)` is
+/// refused with "must be an 8-bit immediate", and `_mm256_permute_pd`,
+/// whose message says "4-bit", takes 255.) `scripts/x86_intrinsic_values.py`
+/// asks the same question of every intrinsic on every run.
+///
+/// The generic path only checked that the value was an exact integer.
+/// Where the instruction ignores the bits it has no use for, a constant
+/// out of range compiled to the masked one (`_mm_blend_ps(a, b, 16)` was
+/// `blendps $0`, `_mm512_cmp_epi32_mask(a, b, 8)` the predicate 0): a
+/// program GCC and Clang refuse ran here, on a selector nobody wrote.
+/// Where it does not, the constant went to the assembler, which stopped
+/// with "operand type mismatch for `vblendps'" and no line of the program.
+///
+/// `None`: the helper takes any `int`; see `immediate_is_low_byte` and
+/// `count_may_be_runtime`, which between them are the rest of the helpers
+/// with an immediate.
+fn immediate_bits(mnemonic: &str) -> Option<u32> {
     match mnemonic {
-        "vinsertf128" | "vinsertf128ps" | "vinsertf128pd" | "vextractf128" | "vextractf128ps"
-        | "vextractf128pd" => Some(1),
+        // One half of two.
+        "vinsertf128"
+        | "vinsertf128ps"
+        | "vinsertf128pd"
+        | "vextractf128"
+        | "vextractf128ps"
+        | "vextractf128pd"
+        | "vextracti32x8_512"
+        | "vextracti64x4_512"
+        | "vextracti64x4_maskz512"
+        | "vinserti32x8_512"
+        | "vinserti64x4_512" => Some(1),
+        // One lane of four, one float of four, a blend of two doubles.
+        "blendpd128"
+        | "extractps128"
+        | "vextracti32x4_512"
+        | "vextracti32x4_maskz512"
+        | "vextracti64x2_512"
+        | "vextracti64x2_maskz512"
+        | "vinserti32x4_512"
+        | "vinserti32x4_maskz512"
+        | "vinserti64x2_512"
+        | "vinserti64x2_maskz512" => Some(2),
+        // One of the eight integer predicates.
+        _ if is_integer_compare(mnemonic) => Some(3),
+        // A blend of four lanes; a rounding mode with its exception bit.
+        "blendps128" | "roundpd128" | "roundps128" | "vblendpd256" | "vroundpd256"
+        | "vroundps256" => Some(4),
+        // One of the 32 floating-point predicates.
+        "cmpps128" | "cmppd128" | "vcmpps256" | "vcmppd256" | "vcmpps512" | "vcmppd512" => Some(5),
+        // The byte the instruction encodes.
+        "dppd128" | "dpps128" | "insertps128" | "vblendps256" | "vdpps256" | "vpalignr512"
+        | "vpblendd128" | "vpblendd256" | "vpclmulqdq512" | "vperm2f128" | "vperm2f128ps"
+        | "vperm2f128pd" | "vpermilpd256" | "vpermilps128" | "vpermilps256" | "vpshufd512"
+        | "vpshufhw512" | "vpshuflw512" => Some(8),
         _ => None,
     }
 }
 
-/// `true` when `op` is a constant that fits the `bits`-wide selector `mnemonic`
+/// `vpcmp{b,w,d,q}` and `vpcmpu{b,w,d,q}` at the three vector widths: the
+/// compares into a mask register, whose predicate is three bits.
+fn is_integer_compare(mnemonic: &str) -> bool {
+    mnemonic.strip_prefix("vpcmp").is_some_and(|rest| {
+        let rest = rest.strip_prefix('u').unwrap_or(rest);
+        let mut chars = rest.chars();
+        matches!(chars.next(), Some('b' | 'w' | 'd' | 'q'))
+            && matches!(chars.as_str(), "128" | "256" | "512")
+    })
+}
+
+/// `true` when `op` is a constant that fits the `bits`-wide immediate `mnemonic`
 /// requires, or when that mnemonic has no width contract. A runtime value is
 /// refused earlier by `exact_immediate_operand`, so only constants reach here.
-fn lane_selector_in_range(mnemonic: &str, op: &Operand) -> bool {
-    let Some(bits) = lane_selector_bits(mnemonic) else {
+fn immediate_in_range(mnemonic: &str, op: &Operand) -> bool {
+    let Some(bits) = immediate_bits(mnemonic) else {
         return true;
     };
     match op {
@@ -70,6 +130,70 @@ fn lane_selector_in_range(mnemonic: &str, op: &Operand) -> bool {
             .is_some_and(|v| (0..(1i128 << bits)).contains(&v)),
         Operand::Value(_) => false,
     }
+}
+
+/// May the "immediate" of this helper be a value of the running program?
+///
+/// The 512-bit element shifts by a count: GCC 16.2 declares the count
+/// `unsigned int` and, for one that is no constant, puts it in an XMM
+/// register (`vmovd %edi, %xmm1; vpslld %xmm1, %zmm0, %zmm0`). The
+/// instruction saturates either way: a count past the lane clears the lane
+/// (or fills it with the sign).
+fn count_may_be_runtime(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "vpsllw512"
+            | "vpslld512"
+            | "vpsllq512"
+            | "vpsrlw512"
+            | "vpsrld512"
+            | "vpsrlq512"
+            | "vpsraw512"
+            | "vpsrad512"
+            | "vpsraq512"
+    )
+}
+
+/// Does the instruction take the low eight bits of whatever constant the
+/// call names?
+///
+/// GCC 16.2 refuses a constant past the byte for most immediates ("the last
+/// argument must be an 8-bit immediate") and takes any `int` for these:
+/// `_mm_shuffle_ps(a, b, 256)` is `shufps $0`, `_mm512_ternarylogic_epi32`
+/// with 0x1e4 is the function 0xe4. The constant went to the assembler as
+/// it stood, which refused it ("operand type mismatch for `vshufps'").
+fn immediate_is_low_byte(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "shufps128" | "shufpd128" | "vshufps256" | "vshufpd256"
+    ) || mnemonic.starts_with("vpternlog")
+}
+
+/// `op` as the instruction encodes it: the low byte of a constant where
+/// `immediate_is_low_byte`, `op` itself otherwise.
+fn low_byte_immediate(mnemonic: &str, op: Operand) -> Operand {
+    match &op {
+        Operand::Const(constant) if immediate_is_low_byte(mnemonic) => match constant.to_i64() {
+            Some(value) => Operand::Const(IrConst::I64(value & 0xff)),
+            None => op,
+        },
+        _ => op,
+    }
+}
+
+/// Does this compare ask for a predicate only the VEX encoding has?
+///
+/// `cmpps`/`cmppd` encode the predicate in three bits: EQ, LT, LE, UNORD,
+/// NEQ, NLT, NLE, ORD. The other 24 (`_CMP_EQ_UQ` = 8 to `_CMP_TRUE_US` =
+/// 31) exist in `vcmpps`/`vcmppd` only, so `_mm_cmp_pd(a, b, 13)` needs AVX
+/// although its operands are 128 bits wide. GCC 16.2: "'__builtin_ia32_cmppd'
+/// needs isa option -mavx"; Clang 23.1.5: "needs target feature avx". The
+/// legacy encoding ignores the upper bits, so without this rule predicate
+/// 13 (GE, ordered) compiled to 5 (NLT, unordered): the opposite answer for
+/// a NaN.
+fn compare_predicate_needs_avx(mnemonic: &str, op: &Operand) -> bool {
+    matches!(mnemonic, "cmpps128" | "cmppd128")
+        && matches!(op, Operand::Const(c) if c.to_i128().is_some_and(|v| v > 7))
 }
 
 pub(crate) fn lccc_simd_lookup(
@@ -303,6 +427,7 @@ pub(crate) fn lccc_simd_lookup(
         "vpshufb_maskz128" => m3(Vec128, MaskzShuffleEpi8_128),
         "vpshufb_mask128" => m4(Vec128, MaskShuffleEpi8_128),
         "vreduce_add_epu32_512" => s1(Scalar, ReduceAddEpu32_512),
+        "vreduce_add_epu64_512" => s1(Scalar, ReduceAddEpu64_512),
         // ---- AVX-VNNI 512 ----
         "vpdpbusd512" => m3(Vec512, Vpdpbusd512),
         "vpdpbusds512" => m3(Vec512, Vpdpbusds512),
@@ -1772,27 +1897,44 @@ impl Lowerer {
         // expressions and enum constants already lower to `Operand::Const`,
         // so only genuinely runtime values are refused.
         let imm_op = if has_imm {
-            let op = self.lower_expr(&args[0]);
+            // An immediate is any integer constant expression. `lower_expr`
+            // folds a binary one (`0 - 1`, `1 << 2`) but lowers a unary one
+            // to an instruction, so `_mm512_srai_epi32(a, -1)` and a control
+            // word written `~0x1b` were refused as "not a constant".
+            let op = match self.integer_constant_argument(&args[0]) {
+                Some(constant) => Operand::Const(constant),
+                None => self.lower_expr(&args[0]),
+            };
             // `Operand::Const` alone is not enough: a float, a decimal
             // container or an out-of-i64-range I128 also reaches
             // `operand_to_imm_i64`, whose catch-all arm would silently emit
             // `$0`.  Require an EXACT integer immediate in the i64 domain.
-            if !exact_immediate_operand(&op) {
+            let runtime_count = count_may_be_runtime(canonical) && matches!(op, Operand::Value(_));
+            if !runtime_count && !exact_immediate_operand(&op) {
                 return self.reject_builtin_call(
                     format!("the last argument to '{name}' must be a constant integer immediate"),
                     args,
                     width.max(16),
                 );
             }
-            if !lane_selector_in_range(canonical, &op) {
-                let bits = lane_selector_bits(canonical).unwrap_or(1);
+            if !immediate_in_range(canonical, &op) {
+                let bits = immediate_bits(canonical).unwrap_or(1);
+                let article = if bits == 8 { "an" } else { "a" };
                 return self.reject_builtin_call(
-                    format!("the last argument to '{name}' must be an {bits}-bit immediate"),
+                    format!("the last argument to '{name}' must be {article} {bits}-bit immediate"),
                     args,
                     width.max(16),
                 );
             }
-            Some(op)
+            if x86_target && compare_predicate_needs_avx(canonical, &op) {
+                self.check_x86_simd_feature(
+                    crate::common::x86_features::X86Feature::Avx,
+                    "-mavx",
+                    name,
+                    args,
+                );
+            }
+            Some(low_byte_immediate(canonical, op))
         } else {
             None
         };
@@ -2064,7 +2206,10 @@ mod portable_subset_tests {
 
 #[cfg(test)]
 mod immediate_diagnostic_tests {
-    use super::{exact_immediate_operand, lane_selector_bits, lane_selector_in_range};
+    use super::{
+        compare_predicate_needs_avx, count_may_be_runtime, exact_immediate_operand, immediate_bits,
+        immediate_in_range, immediate_is_low_byte, lccc_simd_lookup, low_byte_immediate,
+    };
     use crate::ir::reexports::{IrConst as C, Operand, Value};
 
     /// GCC 16.2 / Clang 23.1.5 hard-error on a runtime `vpcmp` predicate;
@@ -2124,13 +2269,13 @@ mod immediate_diagnostic_tests {
         ] {
             for v in [0i64, 1] {
                 assert!(
-                    lane_selector_in_range(mn, &Operand::Const(C::I64(v))),
+                    immediate_in_range(mn, &Operand::Const(C::I64(v))),
                     "{mn} selector {v} is a valid lane"
                 );
             }
             for v in [-1i64, 2, 3, 4, i64::MAX, i64::MIN] {
                 assert!(
-                    !lane_selector_in_range(mn, &Operand::Const(C::I64(v))),
+                    !immediate_in_range(mn, &Operand::Const(C::I64(v))),
                     "{mn} selector {v} must be rejected"
                 );
             }
@@ -2141,11 +2286,319 @@ mod immediate_diagnostic_tests {
     /// cannot leak onto unrelated immediates.
     #[test]
     fn lane_selector_leaves_other_immediates_alone() {
-        for mn in ["vpermilps256", "vcmpps256", "vshufps256", "vinserti128"] {
-            assert_eq!(lane_selector_bits(mn), None, "{mn} has no 1-bit contract");
+        for mn in ["vshufps256", "vinserti128", "shufps128", "vpsllvd512"] {
+            assert_eq!(immediate_bits(mn), None, "{mn} has no width contract");
             assert!(
-                lane_selector_in_range(mn, &Operand::Const(C::I64(7))),
-                "{mn} is not governed by the lane-selector width"
+                immediate_in_range(mn, &Operand::Const(C::I64(255))),
+                "{mn} is not governed by a narrower width"
+            );
+        }
+    }
+
+    /// GCC 16.2's range for every helper with one, by the largest constant
+    /// the public intrinsic takes (the comment over `immediate_bits` says
+    /// how it was measured): the largest is accepted, the next is not, and
+    /// neither is -1 nor a constant past the byte.
+    #[test]
+    fn every_ranged_immediate_has_the_width_gcc_enforces() {
+        let widths: [(u32, &[&str]); 6] = [
+            (
+                1,
+                &[
+                    "vinsertf128",
+                    "vextractf128",
+                    "vextracti32x8_512",
+                    "vextracti64x4_512",
+                    "vextracti64x4_maskz512",
+                    "vinserti32x8_512",
+                    "vinserti64x4_512",
+                ],
+            ),
+            (
+                2,
+                &[
+                    "blendpd128",
+                    "extractps128",
+                    "vextracti32x4_512",
+                    "vextracti32x4_maskz512",
+                    "vextracti64x2_512",
+                    "vextracti64x2_maskz512",
+                    "vinserti32x4_512",
+                    "vinserti32x4_maskz512",
+                    "vinserti64x2_512",
+                    "vinserti64x2_maskz512",
+                ],
+            ),
+            (
+                3,
+                &[
+                    "vpcmpb128",
+                    "vpcmpw256",
+                    "vpcmpd512",
+                    "vpcmpq128",
+                    "vpcmpub256",
+                    "vpcmpuw512",
+                    "vpcmpud128",
+                    "vpcmpuq512",
+                ],
+            ),
+            (
+                4,
+                &[
+                    "blendps128",
+                    "roundpd128",
+                    "roundps128",
+                    "vblendpd256",
+                    "vroundpd256",
+                    "vroundps256",
+                ],
+            ),
+            (5, &["cmpps128", "cmppd128", "vcmpps256", "vcmppd256"]),
+            (
+                8,
+                &[
+                    "dppd128",
+                    "dpps128",
+                    "insertps128",
+                    "vblendps256",
+                    "vdpps256",
+                    "vpalignr512",
+                    "vpblendd128",
+                    "vpblendd256",
+                    "vpclmulqdq512",
+                    "vperm2f128",
+                    "vpermilpd256",
+                    "vpermilps256",
+                    "vpshufd512",
+                    "vpshufhw512",
+                    "vpshuflw512",
+                ],
+            ),
+        ];
+        for (bits, mnemonics) in widths {
+            for mn in mnemonics {
+                assert_eq!(immediate_bits(mn), Some(bits), "{mn}");
+                let (_, _, has_imm, _) = lccc_simd_lookup(mn).expect(mn);
+                assert!(has_imm, "{mn} has an immediate");
+                let top = (1i64 << bits) - 1;
+                for value in [0, top] {
+                    assert!(
+                        immediate_in_range(mn, &Operand::Const(C::I64(value))),
+                        "{mn} takes {value}"
+                    );
+                }
+                for value in [top + 1, 256, 0x1e4, -1, i64::MIN, i64::MAX] {
+                    assert!(
+                        !immediate_in_range(mn, &Operand::Const(C::I64(value))),
+                        "{mn} refuses {value}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every helper with an immediate has a contract, and one only: a
+    /// width, the low byte of any `int`, or a count that may be a value of
+    /// the running program. A helper added without one would take whatever
+    /// constant the call names and leave it to the instruction, which is
+    /// how sixty of them were found.
+    #[test]
+    fn every_helper_with_an_immediate_has_exactly_one_contract() {
+        let header = include_str!("../../../include/lcccsimd.h");
+        let mut with_immediate = std::collections::BTreeSet::new();
+        for word in header.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let Some(rest) = word.strip_prefix("__lccc_simd") else {
+                continue;
+            };
+            // `128_ps_blendps128`: the mnemonic is the longest tail the
+            // table knows.
+            let found = rest
+                .match_indices('_')
+                .map(|(at, _)| &rest[at + 1..])
+                .find(|tail| lccc_simd_lookup(tail).is_some());
+            if let Some(mnemonic) = found
+                && lccc_simd_lookup(mnemonic).is_some_and(|(_, _, has_imm, _)| has_imm)
+            {
+                with_immediate.insert(mnemonic);
+            }
+        }
+        // The spellings of the table the generated header does not use:
+        // aliases, and the two helpers `avx2intrin.h` spells itself.
+        for mnemonic in [
+            "vcmpps512",
+            "vcmppd512",
+            "vextractf128ps",
+            "vextractf128pd",
+            "vinsertf128ps",
+            "vinsertf128pd",
+            "vperm2f128ps",
+            "vperm2f128pd",
+            "vpermilps128",
+            "vpternlogq128",
+            "vpternlogq256",
+            "vpblendd128",
+            "vpblendd256",
+        ] {
+            assert!(
+                lccc_simd_lookup(mnemonic).is_some_and(|(_, _, has_imm, _)| has_imm),
+                "{mnemonic}"
+            );
+            with_immediate.insert(mnemonic);
+        }
+        // 94 as this is written; fewer means the header was not read.
+        assert!(
+            with_immediate.len() >= 94,
+            "the header was read: {} helpers",
+            with_immediate.len()
+        );
+        for mnemonic in with_immediate {
+            let contracts = [
+                immediate_bits(mnemonic).is_some(),
+                immediate_is_low_byte(mnemonic),
+                count_may_be_runtime(mnemonic),
+            ];
+            assert_eq!(
+                contracts.iter().filter(|held| **held).count(),
+                1,
+                "{mnemonic}: width, low byte, runtime count = {contracts:?}"
+            );
+        }
+    }
+
+    /// Only an element shift's count may be a value of the running program,
+    /// and every such helper is one the table declares with an immediate.
+    #[test]
+    fn only_the_512_bit_element_shifts_take_a_runtime_count() {
+        for direction in ["sll", "srl", "sra"] {
+            for lane in ["w", "d", "q"] {
+                let mnemonic = format!("vp{direction}{lane}512");
+                assert!(count_may_be_runtime(&mnemonic), "{mnemonic}");
+                let (_, _, has_imm, operands) = lccc_simd_lookup(&mnemonic).expect(&mnemonic);
+                assert!(has_imm && operands == 1, "{mnemonic}");
+            }
+        }
+        for mnemonic in [
+            "vpshufd512",
+            "vpshuflw512",
+            "vpternlogd512",
+            "vpalignr512",
+            "vcmpps512",
+            "cmpps128",
+            "vpsllvd512",
+        ] {
+            assert!(!count_may_be_runtime(mnemonic), "{mnemonic}");
+        }
+    }
+
+    /// GCC takes any `int` for the floating-point shuffles and the ternary
+    /// logic and encodes its low byte; every other immediate goes through
+    /// as it stands (and is refused where it does not fit).
+    #[test]
+    fn a_shuffle_and_a_ternary_function_take_the_low_byte_of_their_constant() {
+        for mnemonic in [
+            "shufps128",
+            "shufpd128",
+            "vshufps256",
+            "vshufpd256",
+            "vpternlogd128",
+            "vpternlogq256",
+            "vpternlogd512",
+            "vpternlogq512",
+        ] {
+            assert!(immediate_is_low_byte(mnemonic), "{mnemonic}");
+            let (_, _, has_imm, _) = lccc_simd_lookup(mnemonic).expect(mnemonic);
+            assert!(has_imm, "{mnemonic}");
+            for (value, encoded) in [
+                (0i64, 0i64),
+                (0xe4, 0xe4),
+                (255, 255),
+                (256, 0),
+                (0x1e4, 0xe4),
+            ] {
+                assert_eq!(
+                    low_byte_immediate(mnemonic, Operand::Const(C::I32(value as i32))),
+                    Operand::Const(C::I64(encoded)),
+                    "{mnemonic} {value}"
+                );
+            }
+            assert_eq!(
+                low_byte_immediate(mnemonic, Operand::Const(C::I64(-1))),
+                Operand::Const(C::I64(255))
+            );
+        }
+        for mnemonic in [
+            "vpshufd512",
+            "vpblendd256",
+            "cmpps128",
+            "vpalignr512",
+            "vpslld512",
+        ] {
+            assert!(!immediate_is_low_byte(mnemonic), "{mnemonic}");
+            assert_eq!(
+                low_byte_immediate(mnemonic, Operand::Const(C::I32(256))),
+                Operand::Const(C::I32(256)),
+                "{mnemonic}"
+            );
+        }
+        // A count of the running program is no constant to cut.
+        assert_eq!(
+            low_byte_immediate("shufps128", Operand::Value(Value(3))),
+            Operand::Value(Value(3))
+        );
+    }
+
+    /// The packed floating-point compares have 32 predicates at every width
+    /// (GCC 16.2: "the last argument must be a 5-bit immediate").
+    #[test]
+    fn compare_predicates_are_five_bits() {
+        for mn in [
+            "cmpps128",
+            "cmppd128",
+            "vcmpps256",
+            "vcmppd256",
+            "vcmpps512",
+            "vcmppd512",
+        ] {
+            assert_eq!(immediate_bits(mn), Some(5), "{mn}");
+            for v in [0i64, 7, 8, 31] {
+                assert!(
+                    immediate_in_range(mn, &Operand::Const(C::I64(v))),
+                    "{mn} {v}"
+                );
+            }
+            for v in [-1i64, 32, 255, i64::MAX] {
+                assert!(
+                    !immediate_in_range(mn, &Operand::Const(C::I64(v))),
+                    "{mn} {v}"
+                );
+            }
+        }
+    }
+
+    /// Predicates 8 to 31 have no legacy SSE encoding: the 128-bit compare
+    /// needs AVX for them, and for nothing else. The 256- and 512-bit
+    /// compares need their vector class whatever the predicate.
+    #[test]
+    fn only_the_vex_predicates_of_a_128_bit_compare_need_avx() {
+        for mn in ["cmpps128", "cmppd128"] {
+            for v in 0i64..8 {
+                assert!(
+                    !compare_predicate_needs_avx(mn, &Operand::Const(C::I64(v))),
+                    "{mn} {v}"
+                );
+            }
+            for v in 8i64..32 {
+                assert!(
+                    compare_predicate_needs_avx(mn, &Operand::Const(C::I64(v))),
+                    "{mn} {v}"
+                );
+            }
+            assert!(!compare_predicate_needs_avx(mn, &Operand::Value(Value(0))));
+        }
+        for mn in ["vcmpps256", "vcmppd256", "shufps128", "shufpd128"] {
+            assert!(
+                !compare_predicate_needs_avx(mn, &Operand::Const(C::I64(13))),
+                "{mn}"
             );
         }
     }

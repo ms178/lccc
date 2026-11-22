@@ -480,23 +480,23 @@ void * __lccc_simd512_i_vpsrad512(long, __m512i __a);
 void * __lccc_simd512_i_vpsllq512(long, __m512i __a);
 void * __lccc_simd512_i_vpsrlq512(long, __m512i __a);
 void * __lccc_simd512_i_vpsraq512(long, __m512i __a);
-#define _mm512_slli_epi16(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsllw512(__imm, __a))
+#define _mm512_slli_epi16(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsllw512((unsigned int)(__imm), (__a)))
 
-#define _mm512_srli_epi16(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsrlw512(__imm, __a))
+#define _mm512_srli_epi16(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsrlw512((unsigned int)(__imm), (__a)))
 
-#define _mm512_srai_epi16(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsraw512(__imm, __a))
+#define _mm512_srai_epi16(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsraw512((unsigned int)(__imm), (__a)))
 
-#define _mm512_slli_epi32(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpslld512(__imm, __a))
+#define _mm512_slli_epi32(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpslld512((unsigned int)(__imm), (__a)))
 
-#define _mm512_srli_epi32(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsrld512(__imm, __a))
+#define _mm512_srli_epi32(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsrld512((unsigned int)(__imm), (__a)))
 
-#define _mm512_srai_epi32(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsrad512(__imm, __a))
+#define _mm512_srai_epi32(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsrad512((unsigned int)(__imm), (__a)))
 
-#define _mm512_slli_epi64(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsllq512(__imm, __a))
+#define _mm512_slli_epi64(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsllq512((unsigned int)(__imm), (__a)))
 
-#define _mm512_srli_epi64(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsrlq512(__imm, __a))
+#define _mm512_srli_epi64(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsrlq512((unsigned int)(__imm), (__a)))
 
-#define _mm512_srai_epi64(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsraq512(__imm, __a))
+#define _mm512_srai_epi64(__a, __imm) __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpsraq512((unsigned int)(__imm), (__a)))
 
 void * __lccc_simd512_i_vpshufd512(long, __m512i __a);
 void * __lccc_simd512_i_vpshuflw512(long, __m512i __a);
@@ -773,8 +773,8 @@ static __inline__ __attribute__((__always_inline__, __artificial__)) __m512i _mm
 
 void * __lccc_simd512_i_vreduce_add_epu32_512(long, __m512i __a);
 void * __lccc_simd512_i_vreduce_add_epu32_512(long, __m512i __a);
-void * __lccc_simd512_i_vreduce_add_epu32_512(long, __m512i __a);
-void * __lccc_simd512_i_vreduce_add_epu32_512(long, __m512i __a);
+void * __lccc_simd512_i_vreduce_add_epu64_512(long, __m512i __a);
+void * __lccc_simd512_i_vreduce_add_epu64_512(long, __m512i __a);
 static __inline__ __attribute__((__always_inline__, __artificial__)) unsigned int _mm512_reduce_add_epu32(__m512i __a)
 { return (unsigned int)__lccc_simd512_i_vreduce_add_epu32_512(0, __a); }
 
@@ -782,10 +782,10 @@ static __inline__ __attribute__((__always_inline__, __artificial__)) int _mm512_
 { return (int)__lccc_simd512_i_vreduce_add_epu32_512(0, __a); }
 
 static __inline__ __attribute__((__always_inline__, __artificial__)) unsigned long long _mm512_reduce_add_epu64(__m512i __a)
-{ return (unsigned long long)__lccc_simd512_i_vreduce_add_epu32_512(0, __a); }
+{ return (unsigned long long)__lccc_simd512_i_vreduce_add_epu64_512(0, __a); }
 
 static __inline__ __attribute__((__always_inline__, __artificial__)) long long _mm512_reduce_add_epi64(__m512i __a)
-{ return (long long)__lccc_simd512_i_vreduce_add_epu32_512(0, __a); }
+{ return (long long)__lccc_simd512_i_vreduce_add_epu64_512(0, __a); }
 
 __m128 __lccc_simd128_ps_andps128(long, __m128 __a, __m128 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m128 _mm_and_ps(__m128 __a, __m128 __b)

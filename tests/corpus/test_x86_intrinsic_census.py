@@ -9,6 +9,7 @@ as much as a lost one.
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -81,6 +82,90 @@ static void helper (int x)
 {
 }
 #define _MM_SHUFFLE(z, y, x, w) (((z) << 6) | ((y) << 4) | ((x) << 2) | (w))
+
+extern __inline __m128d __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+_mm_shuffle_pd(__m128d __A, __m128d __B, const int __mask)
+{
+  return (__m128d)__builtin_ia32_shufpd ((__v2df)__A, (__v2df)__B, __mask);
+}
+#define _mm_shuffle_pd(A, B, N) ((__m128d)__builtin_ia32_shufpd ((A), (B), (int)(N)))
+
+extern __inline __m256i __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+_mm256_set_epi8  (char __q31, char __q30,
+		  char __q01, char __q00)
+{
+  return __extension__ (__m256i)(__v32qi){ __q00, __q01, __q30, __q31 };
+}
+
+extern __inline
+unsigned char __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+_mm_aesdecwide128kl_u8(__m128i __A[8], const __m128i __B[8], const void * __P)
+{
+  return __builtin_ia32_aesdecwide128kl_u8 ((__v2di *) __A, (__v2di *) __B, __P);
+}
+
+extern __inline __m128i __attribute__ ((__gnu_inline__, __always_inline__, __artificial__, __target__ ("xop")))
+_mm_comeq_epi16(__m128i __A, __m128i __B)
+{
+  return (__m128i) __builtin_ia32_vpcomeqw ((__v8hi)__A, (__v8hi)__B);
+}
+
+extern __inline __m128 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+_mm_msub_ps (__m128 __A, __m128 __B, __m128 __C)
+
+{
+  return (__m128) __builtin_ia32_vfmaddps ((__v4sf)__A, (__v4sf)__B, -(__v4sf)__C);
+}
+
+extern __inline__ __m256bh
+__attribute__ ((__gnu_inline__, __always_inline__, __artificial__))
+_mm256_add_pbh (__m256bh __A, __m256bh __B)
+{
+  return (__m256bh) __builtin_ia32_addbf16256 (__A, __B);
+}
+
+  extern __inline __m512h
+  __attribute__ ((__gnu_inline__, __always_inline__, __artificial__))
+  _mm512_cvtepu16_ph (__m512i __A)
+  {
+    return __builtin_ia32_vcvtuw2ph512_mask_round ((__v32hi) __A,
+						   _mm512_setzero_ph (),
+						   (__mmask32) -1, 4);
+  }
+
+extern __inline __m512h
+__attribute__ ((__gnu_inline__, __always_inline__, __artificial__))
+  _mm512_fmadd_ph (__m512h __A, __m512h __B, __m512h __C)
+{
+  return (__m512h) __builtin_ia32_vfmaddph512_mask ((__v32hf) __A, (__v32hf) __B, (__v32hf) __C,
+						    (__mmask32) -1, 4);
+}
+
+static __inline__ void *
+_mm_malloc (__SIZE_TYPE__ __size, __SIZE_TYPE__ __align)
+{
+  return 0;
+}
+
+extern int _mm_only_declared (int __A);
+int
+_not_inline (int __A)
+{
+  return __A;
+}
+"""
+
+# What `gcc -aux-info` writes: the place, `N` for a prototype, `F` for a
+# definition or `C` for a declaration, the declaration, the old-style form.
+AUX_INFO = """/* compiled from: . */
+/* /opt/gcc/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include/ia32intrin.h:31:NF */ extern int __bsfd (int __X); /* (__X) int __X; */
+/* /opt/gcc/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include/xmmintrin.h:206:NF */ extern __m128 _mm_add_ps (__m128 __A, __m128 __B); /* (__A, __B) __m128 __A; __m128 __B; */
+/* /opt/gcc/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include/xmmintrin.h:1300:NF */ extern void _mm_pause (void); /* () */
+/* /opt/gcc/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include/mm_malloc.h:30:NF */ static void *_mm_malloc (size_t __size, size_t __align); /* (__size, __align) size_t __size; size_t __align; */
+/* /usr/include/stdlib.h:672:NC */ extern void *malloc (size_t); /* (size_t) */
+/* /opt/gcc/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include/xmmintrin.h:99:NC */ extern __m128 _mm_declared (__m128); /* (__m128) */
+/* /opt/gcc/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include/ssp/string.h:10:NF */ extern int _in_a_subdirectory (int __X); /* (__X) int __X; */
+/* c.c:3:NF */ extern int _the_program (int a); /* (a) int a; */
 """
 
 
@@ -90,8 +175,87 @@ class Reading(unittest.TestCase):
 
     def test_every_definition_is_found_once(self):
         self.assertEqual(sorted(self.functions), [
-            "_addcarry_u64", "_mm512_add_round_pd", "_mm512_mask_add_epi32",
-            "_mm_clflushopt", "_mm_set1_epi32", "_mm_shuffle_epi32", "_rdpid_u32"])
+            "_addcarry_u64", "_mm256_add_pbh", "_mm256_set_epi8", "_mm512_add_round_pd",
+            "_mm512_cvtepu16_ph", "_mm512_fmadd_ph", "_mm512_mask_add_epi32",
+            "_mm_aesdecwide128kl_u8", "_mm_clflushopt", "_mm_comeq_epi16", "_mm_malloc",
+            "_mm_msub_ps", "_mm_set1_epi32", "_mm_shuffle_epi32", "_mm_shuffle_pd",
+            "_rdpid_u32"])
+
+    def test_a_blank_line_may_stand_in_front_of_the_body(self):
+        returns, parameters, _ = self.functions["_mm_msub_ps"]
+        self.assertEqual(returns, "__m128")
+        self.assertEqual(parameters, ["__m128 __A", "__m128 __B", "__m128 __C"])
+
+    def test_inline_has_two_spellings(self):
+        # 292 of GCC 16.2's definitions say `__inline__`: all of AVX10.2.
+        self.assertEqual(self.functions["_mm256_add_pbh"][0], "__m256bh")
+        self.assertEqual(self.functions["_mm_malloc"][:2],
+                         ("void *", ["__SIZE_TYPE__ __size", "__SIZE_TYPE__ __align"]))
+
+    def test_a_definition_may_be_indented_whole_or_at_its_name(self):
+        self.assertEqual(self.functions["_mm512_cvtepu16_ph"][:2], ("__m512h", ["__m512i __A"]))
+        self.assertEqual(self.functions["_mm512_fmadd_ph"][:2],
+                         ("__m512h", ["__m512h __A", "__m512h __B", "__m512h __C"]))
+
+    def test_the_spacing_in_front_of_the_parameters_does_not_matter(self):
+        # `_mm_shuffle_pd(`, `_mm256_set_epi8  (`: read as `_mm_add_ps (` is.
+        # A pattern that wanted one space left out 148 of GCC 16.2's 7,174
+        # definitions, every XOP intrinsic among them.
+        returns, parameters, twin = self.functions["_mm_shuffle_pd"]
+        self.assertEqual((returns, twin), ("__m128d", True))
+        self.assertEqual(parameters, ["__m128d __A", "__m128d __B", "const int __mask"])
+        returns, parameters, _ = self.functions["_mm256_set_epi8"]
+        self.assertEqual(returns, "__m256i")
+        self.assertEqual(parameters, ["char __q31", "char __q30", "char __q01", "char __q00"])
+
+    def test_the_return_type_may_stand_on_a_line_of_its_own(self):
+        returns, parameters, _ = self.functions["_mm_aesdecwide128kl_u8"]
+        self.assertEqual(returns, "unsigned char")
+        self.assertEqual(parameters, ["__m128i __A[8]", "const __m128i __B[8]",
+                                      "const void * __P"])
+
+    def test_an_attribute_with_parentheses_of_its_own_is_no_part_of_the_type(self):
+        self.assertEqual(self.functions["_mm_comeq_epi16"][0], "__m128i")
+        self.assertEqual(
+            census.without_attributes(' __m128i __attribute__ ((__a__, __target__ ("xop"))) x'),
+            " __m128i  x")
+        self.assertEqual(census.without_attributes("__attribute__((a)) int __attribute__((b))"),
+                         " int ")
+
+    def test_a_declaration_and_a_function_that_is_not_inline_are_no_definitions(self):
+        self.assertNotIn("_mm_only_declared", self.functions)
+        self.assertNotIn("_not_inline", self.functions)
+
+    def test_the_definitions_gcc_lists_are_read_from_its_own_account(self):
+        include = Path("/opt/gcc/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include")
+        self.assertEqual(census.aux_definitions_of(AUX_INFO, include), {
+            "ia32intrin.h": {"__bsfd"},
+            "xmmintrin.h": {"_mm_add_ps", "_mm_pause"},
+            "mm_malloc.h": {"_mm_malloc"},
+        })
+        # Another compiler's directory holds none of them.
+        self.assertEqual(census.aux_definitions_of(AUX_INFO, Path("/usr/include")), {})
+
+    def test_the_headers_are_the_intrin_headers_and_the_two_named_otherwise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            include = Path(directory)
+            for name in ("xmmintrin.h", "mm3dnow.h", "mm_malloc.h", "cpuid.h", "float.h",
+                         "avx512fintrin.h"):
+                (include / name).write_text("")
+            self.assertEqual([header.name for header in census.headers_of(include)],
+                             ["avx512fintrin.h", "mm3dnow.h", "mm_malloc.h", "xmmintrin.h"])
+
+    def test_an_array_parameter_is_the_pointer_it_decays_to(self):
+        self.assertEqual(census.parameter_of("__m128i __A[8]"), ("__m128i *", "__A"))
+        self.assertEqual(census.parameter_of("const __m128i __B[8]"), ("const __m128i *", "__B"))
+        self.assertEqual(census.parameter_of("const void * __P"), ("const void *", "__P"))
+        self.assertEqual(census.parameter_of("unsigned long long *__P"),
+                         ("unsigned long long *", "__P"))
+        self.assertEqual(
+            census.caller(3, "_mm_aesdecwide128kl_u8",
+                          *self.functions["_mm_aesdecwide128kl_u8"]),
+            "unsigned char t3(__m128i * a0, const __m128i * a1, const void * a2) "
+            "{ return _mm_aesdecwide128kl_u8(a0, a1, a2); }")
 
     def test_types_are_read(self):
         returns, parameters, twin = self.functions["_mm512_mask_add_epi32"]

@@ -1,5 +1,5 @@
 {
-  "gcc_include": "/home/user/.cache/lccc/agent-tools/gcc-16/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+  "gcc_include": "x86_64-pc-linux-gnu/16.2.0/include",
   "generated_from": "include/lcccsimd.h",
   "intrinsic_headers_indexed": 66,
   "rows": {
@@ -66,6 +66,132 @@
       "note": "",
       "required_features": []
     },
+    "fmadd132sd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmadd_sd",
+      "note": "",
+      "required_features": []
+    },
+    "fmadd132ss128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmadd_ss",
+      "note": "",
+      "required_features": []
+    },
+    "fmaddsub132pd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmaddsub_pd",
+      "note": "",
+      "required_features": []
+    },
+    "fmaddsub132ps128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmaddsub_ps",
+      "note": "",
+      "required_features": []
+    },
+    "fmsub132pd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmsub_pd",
+      "note": "",
+      "required_features": []
+    },
+    "fmsub132ps128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmsub_ps",
+      "note": "",
+      "required_features": []
+    },
+    "fmsub132sd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmsub_sd",
+      "note": "",
+      "required_features": []
+    },
+    "fmsub132ss128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmsub_ss",
+      "note": "",
+      "required_features": []
+    },
+    "fmsubadd132pd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmsubadd_pd",
+      "note": "",
+      "required_features": []
+    },
+    "fmsubadd132ps128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fmsubadd_ps",
+      "note": "",
+      "required_features": []
+    },
+    "fnmadd132pd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fnmadd_pd",
+      "note": "",
+      "required_features": []
+    },
+    "fnmadd132ps128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fnmadd_ps",
+      "note": "",
+      "required_features": []
+    },
+    "fnmadd132sd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fnmadd_sd",
+      "note": "",
+      "required_features": []
+    },
+    "fnmadd132ss128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fnmadd_ss",
+      "note": "",
+      "required_features": []
+    },
+    "fnmsub132pd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fnmsub_pd",
+      "note": "",
+      "required_features": []
+    },
+    "fnmsub132ps128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fnmsub_ps",
+      "note": "",
+      "required_features": []
+    },
+    "fnmsub132sd128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fnmsub_sd",
+      "note": "",
+      "required_features": []
+    },
+    "fnmsub132ss128": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm_fnmsub_ss",
+      "note": "",
+      "required_features": []
+    },
     "insertps128": {
       "enforce": false,
       "gcc_header": "smmintrin.h",
@@ -129,14 +255,19 @@
       "note": "",
       "required_features": []
     },
+    "vdpps256": {
+      "enforce": false,
+      "gcc_header": "avxintrin.h",
+      "intrinsic": "_mm256_dp_ps",
+      "note": "",
+      "required_features": []
+    },
     "vextractf128": {
       "enforce": false,
-      "gcc_header": "avx512fintrin.h",
-      "intrinsic": "_mm256_extractf128_pd",
+      "gcc_header": "avxintrin.h",
+      "intrinsic": "_mm256_extractf128_si256",
       "note": "legacy VEX spelling also declared in an AVX-512 header for a masked variant; header ownership is ambiguous",
-      "required_features": [
-        "Avx512F"
-      ]
+      "required_features": []
     },
     "vextracti32x4_512": {
       "enforce": true,
@@ -218,10 +349,80 @@
       "note": "",
       "required_features": []
     },
+    "vfmaddsub132pd256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fmaddsub_pd",
+      "note": "",
+      "required_features": []
+    },
+    "vfmaddsub132ps256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fmaddsub_ps",
+      "note": "",
+      "required_features": []
+    },
+    "vfmsub132pd256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fmsub_pd",
+      "note": "",
+      "required_features": []
+    },
+    "vfmsub132ps256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fmsub_ps",
+      "note": "",
+      "required_features": []
+    },
+    "vfmsubadd132pd256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fmsubadd_pd",
+      "note": "",
+      "required_features": []
+    },
+    "vfmsubadd132ps256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fmsubadd_ps",
+      "note": "",
+      "required_features": []
+    },
+    "vfnmadd132pd256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fnmadd_pd",
+      "note": "",
+      "required_features": []
+    },
+    "vfnmadd132ps256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fnmadd_ps",
+      "note": "",
+      "required_features": []
+    },
+    "vfnmsub132pd256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fnmsub_pd",
+      "note": "",
+      "required_features": []
+    },
+    "vfnmsub132ps256": {
+      "enforce": false,
+      "gcc_header": "fmaintrin.h",
+      "intrinsic": "_mm256_fnmsub_ps",
+      "note": "",
+      "required_features": []
+    },
     "vinsertf128": {
       "enforce": false,
       "gcc_header": "avxintrin.h",
-      "intrinsic": "_mm256_insertf128_pd",
+      "intrinsic": "_mm256_insertf128_si256",
       "note": "",
       "required_features": []
     },
@@ -875,6 +1076,6 @@
   },
   "schema": 1,
   "source": "GCC 16.2.0 intrinsic headers (harness-cache-8 tag cache)",
-  "unique_mnemonics": 97,
-  "wrapper_pairs": 158
+  "unique_mnemonics": 126,
+  "wrapper_pairs": 189
 }

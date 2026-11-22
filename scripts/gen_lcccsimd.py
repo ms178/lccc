@@ -240,8 +240,8 @@ CASTS = [
 REDUCE = [
     ("reduce_add_epu32", "vreduce_add_epu32_512", "unsigned int"),
     ("reduce_add_epi32", "vreduce_add_epu32_512", "int"),
-    ("reduce_add_epu64", "vreduce_add_epu32_512", "unsigned long long"),
-    ("reduce_add_epi64", "vreduce_add_epu32_512", "long long"),
+    ("reduce_add_epu64", "vreduce_add_epu64_512", "unsigned long long"),
+    ("reduce_add_epi64", "vreduce_add_epu64_512", "long long"),
 ]
 
 # 128-bit FP: (name, mnemonic, kind) — kind b=bin u=unary s=scalar
@@ -573,9 +573,11 @@ for name, mn in UNI512:
 # ---- 512-bit binary+imm ----
 for name, mn in BIN_IMM512:
     proto(f"512_i_{mn}", "m512i", ["long", "__m512i __a"])
+# The count is GCC's `unsigned int`: a negative one is a count past the lane,
+# and it need not be a constant (`vpslld %xmm1, %zmm0, %zmm0`).
 for name, mn in BIN_IMM512:
     macro(f"_mm512_{name}(__a, __imm)",
-          f"__CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_{mn}(__imm, __a))")
+          f"__CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_{mn}((unsigned int)(__imm), (__a)))")
 # ---- 512-bit unary+imm ----
 for name, mn in UNI_IMM512:
     proto(f"512_i_{mn}", "m512i", ["long", "__m512i __a"])

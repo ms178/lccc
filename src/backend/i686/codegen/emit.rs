@@ -1723,20 +1723,12 @@ impl I686Codegen {
     /// Extract an immediate integer value from an operand.
     /// Used for SSE/AES instructions that require compile-time immediate operands.
     pub(super) fn operand_to_imm_i64(op: &Operand) -> i64 {
-        match op {
-            Operand::Const(c) => match c {
-                IrConst::I8(v) => *v as i64,
-                IrConst::I16(v) => *v as i64,
-                IrConst::I32(v) => *v as i64,
-                IrConst::I64(v) => *v,
-                _ => 0,
-            },
-            Operand::Value(_) => 0,
-        }
+        crate::backend::x86_common::immediate_operand(op)
     }
 
-    /// Pinned-immediate form of `operand_to_imm_i64`: a non-constant is a
-    /// lowering bug, so fail loudly rather than emit immediate 0.
+    /// An immediate the lowering has checked: what `operand_to_imm_i64`
+    /// reads, with the instruction named in the internal error a
+    /// non-constant would be.
     pub(super) fn pinned_imm_i64(op: &Operand, what: &str) -> i64 {
         assert!(
             matches!(op, Operand::Const(_)),
