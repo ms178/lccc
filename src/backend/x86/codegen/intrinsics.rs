@@ -2653,7 +2653,12 @@ impl X86Codegen {
                 return;
             }
         }
-        let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
+        // A deferral keeps the only copy of the value in `src` until a flush.
+        // Only the reserved scratch banks are safe for that: an allocator-owned
+        // bank can be re-claimed by another value, which would destroy the
+        // deferred result before the flush. Such a result takes the slot store.
+        let deferred = self.state.vector_defer_values.contains(&dest_ptr.0)
+            && vector_reg_bank(src) < 2;
         if deferred && std::env::var("CCC_DEBUG_VDEFER").is_ok() {
             lccc::cli::stderr_line(format_args!(
                 "[VDEFER-EMIT] deferring result store for dest_ptr={}",

@@ -1724,9 +1724,40 @@ impl CodegenState {
             self.vec_live_regs.remove(&v);
             return;
         }
-        self.vec_live_regs
-            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == v);
+        self.evict_bank_claims(bank, Some(v));
         self.vec_live_regs.insert(v, reg);
+    }
+
+    /// The single eviction point for a physical vector bank. Every write that
+    /// makes `keep` (or nothing, for a raw clobber) the bank's only content
+    /// must come through here, so every record that names the bank dies
+    /// together:
+    ///
+    /// * `vec_live_regs`: the block-local claims.
+    /// * `vec_home_reg`: the whole-register home contents. A 256-bit read of a
+    ///   home is served from this register, so a stale entry is a wrong read.
+    /// * `vec_last_store_*`: the last-stored value's register, for allocator-
+    ///   owned banks. Scratch banks are covered by
+    ///   `invalidate_vec_scratch_peephole`, which runs at each scratch write.
+    ///
+    /// Before this helper, `vec_claim_live_reg` evicted only `vec_live_regs`,
+    /// so a value homed in `%ymm15` by a whole-register store kept that home
+    /// after another value's claim overwrote `%ymm15`. A later read of the
+    /// home then took the wrong register (fuzz seed 1234 case 137).
+    fn evict_bank_claims(&mut self, bank: u32, keep: Option<u32>) {
+        self.vec_live_regs
+            .retain(|&other, &mut r| vector_reg_bank(r) != bank || Some(other) == keep);
+        self.vec_home_reg
+            .retain(|&other, &mut r| vector_reg_bank(r) != bank || Some(other) == keep);
+        if bank >= 2
+            && self.vec_last_store_reg
+            && self.vec_last_store_val != keep
+            && self
+                .vec_last_store_reg_name
+                .is_some_and(|n| vector_reg_bank(n) == bank)
+        {
+            self.vec_last_store_reg = false;
+        }
     }
 
     /// Every value's `vec_live_regs` claim on `reg`'s bank EXCEPT `keep`
@@ -1744,17 +1775,11 @@ impl CodegenState {
     /// the `u32::MAX` "impossible SSA id" sentinel that `vec_evict_bank_except`
     /// would otherwise need here.
     pub fn vec_evict_bank(&mut self, reg: &str) {
-        let bank = vector_reg_bank(reg);
-        self.vec_live_regs.retain(|_, r| vector_reg_bank(r) != bank);
-        self.vec_home_reg.retain(|_, r| vector_reg_bank(r) != bank);
+        self.evict_bank_claims(vector_reg_bank(reg), None);
     }
 
     pub fn vec_evict_bank_except(&mut self, reg: &str, keep: u32) {
-        let bank = vector_reg_bank(reg);
-        self.vec_live_regs
-            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == keep);
-        self.vec_home_reg
-            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == keep);
+        self.evict_bank_claims(vector_reg_bank(reg), Some(keep));
     }
 
     /// The YMM register holding the current contents of home `v`, if a
@@ -3148,5 +3173,92 @@ mod last_store_hazard_tests {
         st.sse_last_store_reg_name = Some("xmm0");
         st.with_out_checked(|o| o.emit_instr_rbp_reg("    movdqu", 48, "xmm0"));
         assert!(!st.sse_last_store_reg);
+    }
+}
+
+#[cfg(test)]
+mod vec_bank_eviction_tests {
+    use super::*;
+
+    /// Bug shape (fuzz seed 1234 case 137): `82` is stored from `%ymm15`, so
+    /// its home is `%ymm15`. Then `85` and `90` are each claimed into
+    /// `%ymm15` in turn. Writing `90` must retract `82`'s home, otherwise a
+    /// 256-bit read of slot `82` takes `%ymm15`, which holds `90`.
+    #[test]
+    fn claim_into_a_bank_retracts_another_values_home() {
+        let mut st = CodegenState::new();
+        st.set_vec_home_reg(82, Some("ymm15"));
+        st.vec_claim_live_reg(85, "ymm15");
+        assert_eq!(st.vec_home_reg_256(82), None, "home dies with the claim");
+        st.set_vec_home_reg(82, Some("ymm15"));
+        st.vec_claim_live_reg(90, "ymm15");
+        assert_eq!(st.vec_home_reg_256(82), None);
+        assert_eq!(st.vec_live_ymm(85), None);
+        assert_eq!(st.vec_live_ymm(90), Some("ymm15"));
+    }
+
+    #[test]
+    fn claim_into_another_bank_keeps_the_home() {
+        let mut st = CodegenState::new();
+        st.set_vec_home_reg(82, Some("ymm15"));
+        st.vec_claim_live_reg(90, "ymm14");
+        assert_eq!(st.vec_home_reg_256(82), Some("ymm15"));
+    }
+
+    /// Re-claiming the owner's own register is not a clobber of its contents.
+    #[test]
+    fn reclaim_by_the_same_value_keeps_its_home() {
+        let mut st = CodegenState::new();
+        st.set_vec_home_reg(82, Some("ymm15"));
+        st.vec_claim_live_reg(82, "ymm15");
+        assert_eq!(st.vec_home_reg_256(82), Some("ymm15"));
+    }
+
+    #[test]
+    fn claim_into_a_bank_clears_allocator_last_store() {
+        let mut st = CodegenState::new();
+        st.vec_last_store_reg = true;
+        st.vec_last_store_val = Some(85);
+        st.vec_last_store_reg_name = Some("ymm15");
+        st.vec_claim_live_reg(90, "ymm15");
+        assert!(!st.vec_last_store_reg, "last store named the clobbered bank");
+    }
+
+    /// Scratch banks keep their own invalidation rule (`invalidate_vec_scratch_
+    /// peephole`); an allocator-bank claim must not change them.
+    #[test]
+    fn claim_into_an_allocator_bank_leaves_a_scratch_last_store_alone() {
+        let mut st = CodegenState::new();
+        st.vec_last_store_reg = true;
+        st.vec_last_store_val = Some(85);
+        st.vec_last_store_reg_name = Some("ymm0");
+        st.vec_claim_live_reg(90, "ymm15");
+        assert!(st.vec_last_store_reg);
+    }
+
+    #[test]
+    fn evict_except_keeps_the_named_value_and_drops_the_rest() {
+        let mut st = CodegenState::new();
+        st.set_vec_home_reg(82, Some("ymm15"));
+        // Seed a claim on the same bank directly: `vec_claim_live_reg` would
+        // itself evict the home, and this test is about the explicit eviction.
+        st.vec_live_regs.insert(90, "ymm15");
+        st.vec_evict_bank_except("ymm15", 82);
+        assert_eq!(st.vec_home_reg_256(82), Some("ymm15"));
+        assert_eq!(st.vec_live_ymm(90), None);
+    }
+
+    #[test]
+    fn raw_bank_eviction_drops_every_record_on_the_bank() {
+        let mut st = CodegenState::new();
+        st.set_vec_home_reg(82, Some("ymm15"));
+        st.vec_claim_live_reg(90, "ymm15");
+        st.vec_last_store_reg = true;
+        st.vec_last_store_val = Some(90);
+        st.vec_last_store_reg_name = Some("ymm15");
+        st.vec_evict_bank("xmm15");
+        assert_eq!(st.vec_home_reg_256(82), None);
+        assert_eq!(st.vec_live_ymm(90), None);
+        assert!(!st.vec_last_store_reg);
     }
 }
