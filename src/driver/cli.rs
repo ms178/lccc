@@ -8616,11 +8616,11 @@ mod prefetch_isa_tests {
             let mut d = Driver::new();
             let march = format!("-march={}", row.name);
             let args: Vec<String> = ["ccc", &march, "x.c"].map(str::to_string).to_vec();
-            if let Err(e) = d.parse_cli_args(&args) {
-                // The only refusals: AVX10/APX CPUs, an explicit error.
-                assert!(e.contains("AVX10/APX"), "{}: {e}", row.name);
-                continue;
-            }
+            // No row is refused: an escape for the two AVX10.2/APX CPUs stood
+            // here while the driver refused them, and a row that is skipped
+            // is a row nothing holds to GCC.
+            d.parse_cli_args(&args)
+                .unwrap_or_else(|e| panic!("{}: {e}", row.name));
             let features = d.effective_x86_features();
             let drift: Vec<_> = X86Feature::ALL
                 .iter()
@@ -8640,11 +8640,7 @@ mod prefetch_isa_tests {
             .iter()
             .filter(|r| r.x86_64)
             .count();
-        assert_eq!(
-            checked,
-            x86_64_rows - 2,
-            "every GCC x86-64 CPU but the AVX10/APX two"
-        );
+        assert_eq!(checked, x86_64_rows, "every x86-64 CPU of GCC 16.2");
     }
 
     /// GCC 16.2's CPU-name macros (`gcc-16 [-m32] ... -dM -E`, measured):
@@ -8725,10 +8721,10 @@ mod prefetch_isa_tests {
             let march = format!("-march={}", row.name);
             let mut d = Driver::new();
             let args: Vec<String> = ["i686-ccc", &march, "x.c"].map(str::to_string).to_vec();
-            if let Err(e) = d.parse_cli_args(&args) {
-                assert!(e.contains("AVX10/APX"), "{}: {e}", row.name);
-                continue;
-            }
+            // Every name is accepted in 32-bit code, the two AVX10.2/APX
+            // CPUs included (GCC 16.2: `-m32 -march=novalake` is no error).
+            d.parse_cli_args(&args)
+                .unwrap_or_else(|e| panic!("{}: {e}", row.name));
             assert_eq!(d.resolved_i686_sse(), row.has(F::Sse), "{} SSE", row.name);
             assert_eq!(
                 d.resolved_i686_sse2(),
