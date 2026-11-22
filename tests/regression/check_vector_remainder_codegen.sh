@@ -250,7 +250,9 @@ if not match:
     raise SystemExit("init_head: missing assembly body")
 body = match.group(1)
 detail = body[:1500].replace("%", "%25").replace("\n", "%0A")
-stores = re.findall(r"\bmovdqu %xmm\d+, (-?\d*)\(%r\w+,%r\w+\)", body)
+# (A vector store is written `movups`: the same sixteen bytes stored, one
+# prefix byte less.)
+stores = re.findall(r"\bmov(?:dqu|ups) %xmm\d+, (-?\d*)\(%r\w+,%r\w+\)", body)
 if sorted(stores, key=lambda d: int(d or 0)) != ["", "16"]:
     print(f"::error title=vector fill shape::no 16-byte store pair --- {detail}", file=sys.stderr)
     raise SystemExit("init_head: fill was not vectorized into a movdqu store pair")
