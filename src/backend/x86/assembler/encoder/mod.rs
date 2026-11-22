@@ -1842,7 +1842,7 @@ impl InstructionEncoder {
         // A number that is one byte of the instruction, in the range GNU
         // as takes it in.
         learned::check_number(
-            &instr.mnemonic.to_ascii_lowercase(),
+            &instr.mnemonic,
             &instr.operands,
             operand_class::Code::Bits64,
         )?;

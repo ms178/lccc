@@ -1154,6 +1154,7 @@ def render(rows: list[Row], names: list[str], numbers: list[Number]) -> str:
     out.append(line)
     out += [
         "",
+        "#[rustfmt::skip]",
         "use super::learned::{",
         "    ADDRESSED, DATA16, EGPR, M16, M32, M64, MASK, MODRM, ND, Number, ROUND, Row, SAE, SIB,",
         "    SIZED, W, WHEN_EVEX, WHEN_VEX, ZERO, number, row,",

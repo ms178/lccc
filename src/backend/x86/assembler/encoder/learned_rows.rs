@@ -102,9 +102,10 @@
 //! vsm3rnds2 vsqrtbf16 vsubbf16 vucomxsd vucomxsh vucomxss wrssd wrussd xadd
 //! xaddb xaddl xaddw xrstors xsavec xsaves xsetbv
 
+#[rustfmt::skip]
 use super::learned::{
-    ADDRESSED, DATA16, EGPR, M16, M32, M64, MASK, MODRM, ND, Number, ROUND, Row, SAE, SIB, SIZED,
-    W, WHEN_EVEX, WHEN_VEX, ZERO, number, row,
+    ADDRESSED, DATA16, EGPR, M16, M32, M64, MASK, MODRM, ND, Number, ROUND, Row, SAE, SIB,
+    SIZED, W, WHEN_EVEX, WHEN_VEX, ZERO, number, row,
 };
 
 /// The mnemonics that have rows, in order.

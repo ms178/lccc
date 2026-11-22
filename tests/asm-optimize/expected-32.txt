@@ -18,15 +18,19 @@
 #   kind <written> <rewritten> <count>: what lccc rewrites to what, as
 #     objdump reads the two encodings.
 statements 83258
-assembled 29504
+assembled 34691
 swept aaa 1 9834876d
 swept aad 8 20e78bbf
+swept aadd 6 2430ff13
 swept aam 8 dd467bf0
+swept aand 6 05141ec6
 swept aas 1 57add6cd
 swept adc 168 89eaf45d
 swept adcb 78 199908f4
 swept adcl 58 247b66db
 swept adcw 39 7a7bccf1
+swept adcx 6 edf51066
+swept adcxl 6 8c03c406
 swept add 221 fea2c5f9
 swept addb 107 8e39f421
 swept addl 108 6c1dba65
@@ -37,10 +41,20 @@ swept addss 33 51d5ff5a
 swept addsubpd 33 bee8aa2d
 swept addsubps 34 eef55350
 swept addw 95 2ddae14f
+swept adox 6 4997fc34
+swept adoxl 6 3c98ccf7
 swept aesdec 6 3add5106
+swept aesdec128kl 33 827d12f8
+swept aesdec256kl 6 998d9192
 swept aesdeclast 34 3ad999aa
+swept aesdecwide128kl 6 b55e919b
+swept aesdecwide256kl 19 893da98a
 swept aesenc 6 b41f7ee8
+swept aesenc128kl 6 7509bf34
+swept aesenc256kl 6 61475c99
 swept aesenclast 6 f71c970c
+swept aesencwide128kl 6 9bea126c
+swept aesencwide256kl 6 7c330859
 swept aesimc 6 5e7d11bf
 swept aeskeygenassist 12 35d6b3f8
 swept and 113 bbe89dac
@@ -51,13 +65,29 @@ swept andnps 6 9ce15d04
 swept andpd 6 c19765af
 swept andps 6 441cc909
 swept andw 37 e0aeb40e
+swept aor 6 edd0eb2e
 swept arpl 37 53129900
 swept arpll 19 1bea1037
 swept arplw 18 9f0d33c4
+swept axor 6 06938a86
+swept blcfill 6 c42fb5d9
+swept blcfilll 6 585409ba
+swept blci 6 ccf1afa4
+swept blcic 6 201bae16
+swept blcicl 6 f0478310
+swept blcil 6 be14bab2
+swept blcmsk 6 47c515fd
+swept blcmskl 6 c291148c
+swept blcs 6 b8c0cf91
+swept blcsl 6 003ad1fd
 swept blendpd 41 4c02364b
 swept blendps 15 a14325fb
 swept blendvpd 6 ea7714c1
 swept blendvps 6 5eb1b8aa
+swept blsfill 6 867dda1c
+swept blsfilll 6 23eed466
+swept blsic 6 f01717a5
+swept blsicl 6 b78952f1
 swept bound 6 00718d77
 swept boundl 3 0ba40655
 swept boundw 3 c676ffd0
@@ -92,10 +122,13 @@ swept clc 1 abd20cfd
 swept cld 1 67265f3d
 swept cldemote 6 1993383b
 swept clflush 5 ada6223a
+swept clflushopt 6 8d1bf240
 swept clgi 1 a013b65f
 swept cli 1 99bb8840
+swept clrssbsy 6 90fae051
 swept cltd 1 4d0178e6
 swept clts 1 c96ef5a1
+swept clwb 6 95bb1571
 swept clzero 3 4c3c32af
 swept cmc 1 81e5538a
 swept cmova 6 ba85875c
@@ -221,6 +254,7 @@ swept cmpordsd 6 82504719
 swept cmpordss 6 49f69706
 swept cmppd 11 b0784415
 swept cmpps 12 df257547
+swept cmps 1 927a126d
 swept cmpsb 5 c77085ed
 swept cmpsd 12 e015f532
 swept cmpsl 5 243cd585
@@ -231,11 +265,11 @@ swept cmpunordps 6 712d2ff6
 swept cmpunordsd 6 73b2cf01
 swept cmpunordss 6 811f6b2a
 swept cmpw 72 a34e7efc
-swept cmpxchg 26 74f5a5eb
+swept cmpxchg 35 020e339d
 swept cmpxchg8b 6 bd4e2607
-swept cmpxchgb 24 608cdba8
-swept cmpxchgl 1 d6569d99
-swept cmpxchgw 1 c11e9c25
+swept cmpxchgb 29 940f18f7
+swept cmpxchgl 3 a891d343
+swept cmpxchgw 3 c5ff2f8f
 swept comisd 6 1b7f9067
 swept comiss 6 c6ca5b6a
 swept cpuid 1 b31d956b
@@ -246,9 +280,13 @@ swept crc32w 4 313aa113
 swept cvtdq2pd 6 c0a67943
 swept cvtdq2ps 6 7eed102c
 swept cvtpd2dq 6 d5be9fe7
+swept cvtpd2pi 6 954b78a4
 swept cvtpd2ps 6 6a2edacb
+swept cvtpi2pd 10 839544bf
+swept cvtpi2ps 6 dab57d9b
 swept cvtps2dq 6 d7779e87
 swept cvtps2pd 33 92c7484f
+swept cvtps2pi 6 bd617071
 swept cvtsd2si 6 80a328ca
 swept cvtsd2sil 6 2bc7e156
 swept cvtsd2ss 6 4c85d730
@@ -260,7 +298,9 @@ swept cvtss2sd 6 aefdb6cd
 swept cvtss2si 6 d51f1be0
 swept cvtss2sil 6 da86de19
 swept cvttpd2dq 6 1dc74b69
+swept cvttpd2pi 33 707ce3d7
 swept cvttps2dq 6 336a5d69
+swept cvttps2pi 6 cfe09127
 swept cvttsd2si 6 d1886ddd
 swept cvttsd2sil 6 c04125c8
 swept cvttss2si 6 a1996e43
@@ -275,21 +315,24 @@ swept dec 8 cfe6abef
 swept decb 5 0d39fdd9
 swept decl 5 eafadbab
 swept decw 4 6c259164
-swept div 6 be175101
-swept divb 4 ca3fb9c7
-swept divl 4 64b72b5e
+swept div 12 b9358b08
+swept divb 8 9554b70e
+swept divl 5 1440c9ec
 swept divpd 6 a3a80eb2
 swept divps 6 90e5de39
 swept divsd 33 9445bad2
 swept divss 6 cf32bff0
-swept divw 4 5775591c
+swept divw 5 8ad751af
 swept dppd 16 a5006a97
 swept dpps 16 2c149410
 swept emms 1 e756c5be
 swept encls 1 6bbb4f47
 swept enclu 1 1e86b054
 swept enclv 1 4ff7d861
+swept encodekey128 4 595584a8
+swept encodekey256 4 e2c1ed8f
 swept endbr32 1 e0354f41
+swept endbr64 1 f425948f
 swept enqcmd 4 f83d766f
 swept enqcmds 3 c29353d5
 swept enter 17 fae847a8
@@ -371,6 +414,7 @@ swept fisubrl 6 0eb229f5
 swept fld 22 1f182851
 swept fld1 1 d518b968
 swept fldcw 6 1a9ee9b9
+swept fldcww 6 c5adeb9e
 swept fldenv 5 1956f423
 swept fldenvl 6 1a819dfc
 swept fldl 6 1c6a3a1a
@@ -393,9 +437,11 @@ swept fnsave 5 018993d1
 swept fnsavel 6 3e93790c
 swept fnsetpm 1 ddefa3b2
 swept fnstcw 5 981b79b8
+swept fnstcww 6 773ffa58
 swept fnstenv 6 0d6b5917
 swept fnstenvl 6 0bc829a8
 swept fnstsw 7 4d5a55a0
+swept fnstsww 6 a9c976d0
 swept fpatan 1 1675cdde
 swept fprem 1 1a69cdf0
 swept fprem1 1 089435b3
@@ -449,11 +495,12 @@ swept hlt 1 de35fa06
 swept hreset 7 83573147
 swept hsubpd 6 a144dfcd
 swept hsubps 6 a827d711
-swept idiv 6 a7a50767
-swept idivb 4 7ff66740
-swept idivl 3 a37a825f
-swept idivw 3 f8a7b186
+swept idiv 12 9c812983
+swept idivb 8 45a6ae4c
+swept idivl 4 565f6d36
+swept idivw 4 512ecde3
 swept imul 80 98eb982e
+swept imulb 5 e26a1f26
 swept imull 41 26c887bc
 swept imulw 40 32fd9170
 swept in 36 785582b2
@@ -461,8 +508,10 @@ swept inb 18 9b1aa3fc
 swept inc 8 92aaf6fd
 swept incb 5 494aa8e4
 swept incl 5 17e98d69
+swept incsspd 2 b5d996ae
 swept incw 4 4cb48159
 swept inl 18 99b8683c
+swept ins 1 e5bf1f03
 swept insb 7 f81335ea
 swept insertps 12 72c05bbe
 swept insertq 22 f3de1a56
@@ -472,9 +521,13 @@ swept int 7 3e52d723
 swept int1 1 6b87e848
 swept int3 1 c57cb8db
 swept into 1 6b847a0e
+swept invd 1 9cba66a6
+swept invept 6 95e405f3
 swept invlpg 6 b7b95db2
 swept invlpga 3 475a97bf
 swept invlpgb 3 290aab1a
+swept invpcid 6 525ed384
+swept invvpid 6 19165e0d
 swept inw 18 3a1002eb
 swept iret 1 96805013
 swept iretl 1 06ad321f
@@ -601,9 +654,12 @@ swept ljmpw 27 f373df51
 swept lldt 9 992e8697
 swept lldtl 2 4374345f
 swept lldtw 7 036465b5
+swept llwpcb 2 50d6c7e9
 swept lmsw 6 66a92940
 swept lmsww 6 340271f2
+swept loadiwkey 4 78586cea
 swept lock 1 0c030586
+swept lods 1 b82963b4
 swept lodsb 9 5036c779
 swept lodsl 8 8fb1da83
 swept lodsw 7 1f3aa3e4
@@ -636,7 +692,11 @@ swept ltrl 2 461df42a
 swept ltrw 7 166c2bab
 swept lwpins 19 88159dab
 swept lwpval 17 61b50385
-swept lzcntl 1 fb2e823f
+swept lzcnt 7 c73e136c
+swept lzcntl 4 ff8d1ca3
+swept lzcntw 3 69e5d87a
+swept maskmovdqu 4 6e253f4e
+swept maskmovq 4 2e9fe882
 swept maxpd 6 5bdf3f54
 swept maxps 34 8f77e524
 swept maxsd 6 8a485dae
@@ -655,11 +715,15 @@ swept mov 226 4c641dcb
 swept movapd 63 999e07e2
 swept movaps 65 c49282a7
 swept movb 98 2e576ed8
+swept movbe 67 d37f0822
+swept movbel 36 292e7d99
+swept movbew 31 d1278079
 swept movd 133 cf909a2d
 swept movddup 32 70be680f
 swept movdir64b 17 3a811c0d
 swept movdiri 33 6d848b14
 swept movdiril 33 ad8224da
+swept movdq2q 4 7dc37c47
 swept movdqa 66 9f80d7c6
 swept movdqu 63 2415cb38
 swept movhlps 4 89d07775
@@ -670,7 +734,9 @@ swept movlhps 4 1031af9c
 swept movlpd 67 3d91694b
 swept movlps 66 b8540b34
 swept movmskpd 4 90acfd0f
+swept movmskpdl 4 3329f62b
 swept movmskps 4 4e6a2025
+swept movmskpsl 4 bfb6e9e0
 swept movntdq 34 b4d897e3
 swept movntdqa 34 7ac64ec9
 swept movnti 29 199eb9ce
@@ -681,6 +747,8 @@ swept movntq 33 3a257bb1
 swept movntsd 34 2ba6d90f
 swept movntss 33 e959922c
 swept movq 132 9bca9b55
+swept movq2dq 4 4e2c69d1
+swept movs 1 28857627
 swept movsb 72 6b673cf0
 swept movsbl 16 e4d2c8b3
 swept movsbw 17 926a21f3
@@ -691,6 +759,9 @@ swept movsldup 33 a63e5f2b
 swept movss 63 b6b2c155
 swept movsw 73 42363410
 swept movswl 34 1f628025
+swept movsx 34 9205a4d5
+swept movsxb 33 39094e7e
+swept movsxw 30 5dbaac8f
 swept movupd 65 032942c2
 swept movups 64 d32949a7
 swept movw 111 1985525a
@@ -699,6 +770,9 @@ swept movzbl 18 b38dbe75
 swept movzbw 15 2f58707d
 swept movzw 34 6a045cde
 swept movzwl 34 0c464af9
+swept movzx 34 224e171e
+swept movzxb 32 d85defa4
+swept movzxw 33 a06dfa84
 swept mpsadbw 43 f855516b
 swept mul 6 79bc3a76
 swept mulb 4 4d022f7a
@@ -715,6 +789,8 @@ swept negb 5 ed6d745e
 swept negl 4 fa1cf071
 swept negw 3 70fac550
 swept nop 6 ba80683b
+swept nopl 5 b013b8f1
+swept nopw 5 1203c729
 swept not 6 6253a753
 swept notb 5 11acdcb1
 swept notl 5 df109281
@@ -728,6 +804,7 @@ swept orw 40 a91039cd
 swept out 15 c903c0b4
 swept outb 11 adebd261
 swept outl 11 1f49109c
+swept outs 1 5094f8ca
 swept outsb 5 6a1f0f27
 swept outsl 5 0c5da079
 swept outsw 5 41b9c3a8
@@ -752,6 +829,7 @@ swept pand 12 4ea9013e
 swept pandn 12 4b1502c7
 swept pause 1 6210c0bf
 swept pavgb 40 4de4f369
+swept pavgusb 6 ae124b71
 swept pavgw 12 d4a31389
 swept pblendvb 34 9b402c90
 swept pblendw 16 bda10698
@@ -776,6 +854,26 @@ swept pconfig 1 40c96672
 swept pextrb 23 c35cdbc7
 swept pextrd 12 7f7517aa
 swept pextrw 36 46931249
+swept pextrwl 23 a19d95c9
+swept pf2id 6 dfa79b91
+swept pf2iw 6 15212d07
+swept pfacc 6 5d9a41f5
+swept pfadd 6 7854ffcc
+swept pfcmpeq 33 70df6fb7
+swept pfcmpge 32 4f933b0c
+swept pfcmpgt 6 20600236
+swept pfmax 6 320b11c0
+swept pfmin 6 db8022c9
+swept pfmul 6 ac0e78c9
+swept pfnacc 6 354b2f50
+swept pfpnacc 6 3c7a57b8
+swept pfrcp 6 ba3bd458
+swept pfrcpit1 6 cb9525a8
+swept pfrcpit2 6 6c15186e
+swept pfrsqit1 6 82cd73c3
+swept pfrsqrt 6 3a1270fd
+swept pfsub 6 49d6154a
+swept pfsubr 6 dcb52b3d
 swept phaddd 12 2ccba097
 swept phaddsw 12 0a0b1651
 swept phaddw 12 3c263224
@@ -783,9 +881,12 @@ swept phminposuw 6 885bbdbc
 swept phsubd 12 410a1c41
 swept phsubsw 12 71ee908c
 swept phsubw 12 3add971f
+swept pi2fd 6 7a5bc55a
+swept pi2fw 6 d44b4ee6
 swept pinsrb 22 28d97b63
 swept pinsrd 12 5f1650c4
-swept pinsrw 42 65ce874b
+swept pinsrw 43 aecaa2c2
+swept pinsrwl 20 7d466448
 swept pmaddubsw 12 76bd67cb
 swept pmaddwd 38 4256cbf1
 swept pmaxsb 6 00bc6f5a
@@ -801,6 +902,7 @@ swept pminub 12 7e1d3a2d
 swept pminud 6 ae5efd62
 swept pminuw 33 f923eaa7
 swept pmovmskb 8 b69dfd5b
+swept pmovmskbl 8 f7296ffb
 swept pmovsxbd 6 52a73c5f
 swept pmovsxbq 33 fda654e6
 swept pmovsxbw 6 8c89c50d
@@ -815,6 +917,7 @@ swept pmovzxwd 34 ec3bf4da
 swept pmovzxwq 6 71da247f
 swept pmuldq 6 830b9472
 swept pmulhrsw 12 c80cc0ea
+swept pmulhrw 6 4db4488a
 swept pmulhuw 12 a576c1e5
 swept pmulhw 12 b4c68392
 swept pmulld 6 6123f965
@@ -833,11 +936,14 @@ swept popfw 1 f7c3367b
 swept popl 9 12ac0a44
 swept popw 8 0029e1a5
 swept por 12 3acb3602
+swept prefetch 6 c8517fad
 swept prefetchnta 6 2ff3edad
+swept prefetchrst2 6 97df5fdd
 swept prefetcht0 5 47802272
 swept prefetcht1 5 2f1943f7
 swept prefetcht2 5 74698759
 swept prefetchw 5 82093fc7
+swept prefetchwt1 6 968ad80a
 swept psadbw 12 44217044
 swept pshufb 12 cc69afb7
 swept pshufd 16 5bb010c0
@@ -865,6 +971,7 @@ swept psubsw 12 086915a0
 swept psubusb 12 1afae5ea
 swept psubusw 39 2181080d
 swept psubw 40 792e47b9
+swept pswapd 6 3849dab4
 swept ptest 6 60906b31
 swept ptwrite 6 47f525e7
 swept ptwritel 6 cb9e7075
@@ -904,6 +1011,7 @@ swept rdpmc 1 381334d0
 swept rdpru 1 73e98271
 swept rdrand 3 d1270578
 swept rdseed 3 efdf36ee
+swept rdsspd 2 d1166d4d
 swept rdtsc 1 eb2de269
 swept rdtscp 1 47835537
 swept rep 1 ca27e538
@@ -932,43 +1040,93 @@ swept roundss 12 6d48e37f
 swept rsm 1 7a7fc2c0
 swept rsqrtps 33 f45e4cd1
 swept rsqrtss 6 70f2c49b
+swept rstorssp 6 f8ae2a45
 swept sahf 1 93a5ad61
 swept sal 62 3109dc13
 swept salb 45 e2f32ad7
+swept salc 1 5f35cda4
+swept salcb 1 c6c3ce3f
 swept sall 44 5a2739ea
 swept salw 43 d03dc55a
 swept sar 39 4ebca7c9
 swept sarb 22 19d415a6
 swept sarl 22 41402d6c
 swept sarw 19 8fb31a84
+swept saveprevssp 1 20ea5e87
 swept sbb 141 6077cdaa
 swept sbbb 26 569a0dbb
 swept sbbl 82 4be95734
 swept sbbw 69 df7494af
+swept scas 1 ddf859ae
 swept scasb 6 c2996fbb
 swept scasl 6 a8c7d3f5
 swept scasw 6 5c56f0b2
+swept scmp 1 e40add4d
+swept scmpb 1 4f4f53cb
+swept scmpl 1 b9897372
+swept scmpw 1 431fc982
 swept serialize 1 010e9826
 swept seta 19 c27ec29b
+swept setab 21 f6700853
 swept setae 8 9f4ec81a
+swept setaeb 9 728e425d
 swept setb 20 89318c62
+swept setbb 22 47cab699
 swept setbe 8 63c79487
+swept setbeb 9 4864acbe
 swept setc 8 6ee3d10d
+swept setcb 9 91840362
 swept sete 7 911bb66f
+swept seteb 8 37981092
 swept setg 18 eafeb743
+swept setgb 20 3aec5771
 swept setge 6 e3172bbf
+swept setgeb 7 b7f59aca
 swept setl 20 870d9a03
+swept setlb 22 41686d34
 swept setle 6 184e6a46
+swept setleb 7 f9741a56
+swept setna 22 030de44f
+swept setnab 22 d61827d9
+swept setnae 9 0f5ddf1e
+swept setnaeb 9 ff4a6700
+swept setnb 8 23a840a2
+swept setnbb 8 1de4ca83
+swept setnbe 21 7245d5b7
+swept setnbeb 21 28f6ed4e
 swept setnc 8 9661eb4c
+swept setncb 9 358aca3d
 swept setne 20 8b14a1b7
+swept setneb 22 dc8c96c0
+swept setng 8 d2a93fd2
+swept setngb 8 9ea70931
+swept setnge 8 05bf0e5b
+swept setngeb 8 c509925d
+swept setnl 8 9072f22a
+swept setnlb 8 9d1e3252
+swept setnle 7 82bec30b
+swept setnleb 7 e959ac67
 swept setno 7 40699563
+swept setnob 8 1ad656bb
 swept setnp 7 62263d29
+swept setnpb 8 b664dc46
 swept setns 7 29beccd2
+swept setnsb 8 fb1e749a
 swept setnz 7 eb52246c
+swept setnzb 8 f621a484
 swept seto 6 2c8e4aa9
+swept setob 7 0ed62deb
 swept setp 20 1520c81e
+swept setpb 22 a5affbc5
+swept setpe 8 fa1191f6
+swept setpeb 8 9ccb2a5d
+swept setpo 20 bedfdda8
+swept setpob 20 fc9ca161
 swept sets 7 c6c43ba5
+swept setsb 8 ae82f403
+swept setssbsy 1 22287f5e
 swept setz 8 13a3a934
+swept setzb 8 9b6d5fe9
 swept sfence 1 b313f796
 swept sgdt 19 f164b61c
 swept sgdtl 19 a9d53263
@@ -1003,9 +1161,18 @@ swept skinit 2 3d365812
 swept sldt 9 14eb8111
 swept sldtl 2 816d93af
 swept sldtw 7 f059d914
+swept slod 1 467a1aed
+swept slodb 1 5666a4fd
+swept slodl 1 0e47ea3a
+swept slodw 1 81230ca8
+swept slwpcb 2 e63eb0f5
 swept sm2 1 22e8f058
 swept sm3 1 151911c2
 swept sm4 1 e6b58d4c
+swept smov 1 6bc3c010
+swept smovb 1 6ddbbfa2
+swept smovl 1 40831bb9
+swept smovw 1 4dee2e04
 swept smsw 9 00d1803e
 swept smswl 2 05d944e3
 swept smsww 7 da506656
@@ -1013,12 +1180,21 @@ swept sqrtpd 33 ca68fff6
 swept sqrtps 6 34f7a3e1
 swept sqrtsd 6 0571eedf
 swept sqrtss 6 bb0483d4
+swept ssca 1 2717ae47
+swept sscab 1 875a0cf7
+swept sscal 1 f6990fe3
+swept sscaw 1 fe15b7bd
+swept ssto 1 48f53967
+swept sstob 1 1d88191d
+swept sstol 1 1794c87a
+swept sstow 1 cf9dd6e9
 swept stac 1 50f3b71f
 swept stc 1 c91cfb23
 swept std 1 a7f53974
 swept stgi 1 80fea958
 swept sti 1 06ba2682
 swept stmxcsr 17 64f2ae38
+swept stos 1 b976943d
 swept stosb 8 00a88185
 swept stosl 7 9c0258b0
 swept stosw 9 cdbabd5c
@@ -1035,6 +1211,11 @@ swept subss 6 52492afb
 swept subw 40 514b6a7f
 swept syscall 1 44b1bb13
 swept sysenter 1 3f878a23
+swept sysexit 1 888fc636
+swept sysret 1 694106be
+swept sysretl 1 9e0ae244
+swept t1mskc 6 e258f7a8
+swept t1mskcl 6 454c6aff
 swept tdcall 1 246ee4af
 swept test 113 c3db7028
 swept testb 27 9a425819
@@ -1042,7 +1223,11 @@ swept testl 55 dea2e308
 swept testw 35 b65cea44
 swept tlbsync 1 95b41938
 swept tpause 4 5368563f
-swept tzcntl 1 702fac13
+swept tzcnt 6 6416578c
+swept tzcntl 4 1feb19f9
+swept tzcntw 2 b6ad95c5
+swept tzmsk 6 2d342e6b
+swept tzmskl 6 76bf731d
 swept ucomisd 34 912426f9
 swept ucomiss 6 d37e7eda
 swept ud0 6 01fc0520
@@ -1062,6 +1247,11 @@ swept unpckhpd 6 e726e1fa
 swept unpckhps 6 b581b4e8
 swept unpcklpd 6 ed2214c5
 swept unpcklps 6 111c00b3
+swept v4fmaddps 6 ed9bbd71
+swept v4fmaddss 6 25dce4c7
+swept v4fnmaddps 6 04e8c375
+swept v4fnmaddss 34 e5dcf0a2
+swept vaddbf16 3 48aac25a
 swept vaddpd 4 05592ca2
 swept vaddph 5 2f99086f
 swept vaddps 34 67bd15a3
@@ -1082,12 +1272,17 @@ swept vandnpd 4 e889ad06
 swept vandnps 6 a60af669
 swept vandpd 6 71e11878
 swept vandps 9 c263fb6f
+swept vbcstnebf162ps 6 bde3d775
+swept vbcstnesh2ps 6 886bd456
+swept vbitrevb 35 32749366
 swept vblendmpd 3 42e84769
 swept vblendmps 4 06d65127
 swept vblendpd 13 4cdab112
 swept vblendps 14 8c63ca06
 swept vblendvpd 2 4434e4d8
 swept vblendvps 4 fb1828dd
+swept vbmacor16x16x16 6 d90a82df
+swept vbmacxor16x16x16 33 2a79d840
 swept vbroadcastf128 6 c5ef384e
 swept vbroadcastf32x2 6 f0885254
 swept vbroadcastf32x4 6 ad33d743
@@ -1259,6 +1454,12 @@ swept vcmpnge_uqps 11 391372d5
 swept vcmpnge_uqsd 40 47e0e108
 swept vcmpnge_uqsh 6 21e8a947
 swept vcmpnge_uqss 40 d7b6c303
+swept vcmpnge_uspd 12 b6762e4d
+swept vcmpnge_usph 33 dbb44869
+swept vcmpnge_usps 10 57f32705
+swept vcmpnge_ussd 12 8f06783a
+swept vcmpnge_ussh 6 196353e1
+swept vcmpnge_usss 12 e9514804
 swept vcmpngepd 12 b1e096b6
 swept vcmpngeph 6 94eb1d4d
 swept vcmpngeps 13 f1b76a00
@@ -1271,6 +1472,12 @@ swept vcmpngt_uqps 38 9e38b4db
 swept vcmpngt_uqsd 39 b42fd80f
 swept vcmpngt_uqsh 6 4556df99
 swept vcmpngt_uqss 12 47945132
+swept vcmpngt_uspd 11 dd12144c
+swept vcmpngt_usph 7 1badb29f
+swept vcmpngt_usps 12 6905f6ea
+swept vcmpngt_ussd 40 0582909a
+swept vcmpngt_ussh 6 311eaef7
+swept vcmpngt_usss 12 1db4ee85
 swept vcmpngtpd 11 5365d99c
 swept vcmpngtph 6 88c59bfa
 swept vcmpngtps 11 018615c7
@@ -1373,17 +1580,37 @@ swept vcmpunordps 8 6967a17a
 swept vcmpunordsd 12 cdae19e1
 swept vcmpunordsh 6 ebf9b298
 swept vcmpunordss 12 a75b0a83
+swept vcomisbf16 6 150674d5
 swept vcomisd 9 a2173c32
 swept vcomish 6 39b2b6f2
 swept vcomiss 10 b2f0d534
 swept vcompresspd 5 7817e184
 swept vcompressps 7 bf20a22b
+swept vcomxsd 6 0ae91fdc
+swept vcomxsh 6 db400e11
+swept vcomxss 6 b682fcc2
+swept vcvt2ph2bf8 6 5b122162
+swept vcvt2ph2bf8s 4 af0b1779
+swept vcvt2ph2hf8 3 d35b7116
+swept vcvt2ph2hf8s 3 fb90925e
+swept vcvt2ps2phx 5 d39e4c39
+swept vcvtbf162ibs 8 ed1b98e3
+swept vcvtbf162iubs 8 eaf8b29d
+swept vcvtbiasph2bf8 13 5604a450
+swept vcvtbiasph2bf8s 12 88416640
+swept vcvtbiasph2hf8 68 fd438e8b
+swept vcvtbiasph2hf8s 12 a4da53c0
 swept vcvtdq2pd 29 898d802c
 swept vcvtdq2ph 11 dfcef61b
 swept vcvtdq2phx 6 73ce6035
 swept vcvtdq2phy 34 230d6284
 swept vcvtdq2ps 12 0e6bf26a
+swept vcvthf82ph 18 f9e1840c
 swept vcvtne2ps2bf16 31 4c30edb8
+swept vcvtneebf162ps 6 74351417
+swept vcvtneeph2ps 33 a083a75b
+swept vcvtneobf162ps 6 e6923c31
+swept vcvtneoph2ps 6 a62f985e
 swept vcvtneps2bf16 12 b7c736c8
 swept vcvtneps2bf16x 6 37d5abe4
 swept vcvtneps2bf16y 6 bc3823bb
@@ -1402,7 +1629,21 @@ swept vcvtpd2udq 9 ebf47b86
 swept vcvtpd2udqx 6 b01279bd
 swept vcvtpd2udqy 6 f9a38f16
 swept vcvtpd2uqq 5 d551a591
+swept vcvtph2bf8 9 e63f169c
+swept vcvtph2bf8s 10 c9807a69
+swept vcvtph2bf8sx 6 2e49df24
+swept vcvtph2bf8sy 6 1f4aeb3d
+swept vcvtph2bf8x 6 2ea98dae
+swept vcvtph2bf8y 6 6ef7f32c
 swept vcvtph2dq 18 856bf6f3
+swept vcvtph2hf8 8 94c329d6
+swept vcvtph2hf8s 10 7a48419e
+swept vcvtph2hf8sx 6 e751f52c
+swept vcvtph2hf8sy 6 3c71f201
+swept vcvtph2hf8x 33 af78db17
+swept vcvtph2hf8y 6 0b27c5c5
+swept vcvtph2ibs 34 95dd3ced
+swept vcvtph2iubs 6 34821d46
 swept vcvtph2pd 99 7fe43b52
 swept vcvtph2ps 18 00f4f7b0
 swept vcvtph2psx 18 17a6d38b
@@ -1412,6 +1653,8 @@ swept vcvtph2uqq 18 c2673529
 swept vcvtph2uw 33 2dd42c71
 swept vcvtph2w 7 5e6d30ba
 swept vcvtps2dq 42 c1b83243
+swept vcvtps2ibs 5 591d12b5
+swept vcvtps2iubs 6 f72b23ad
 swept vcvtps2pd 28 449e4692
 swept vcvtps2ph 43 81fd4a8f
 swept vcvtps2phx 10 1d65e08d
@@ -1428,32 +1671,74 @@ swept vcvtqq2phz 6 2f21c117
 swept vcvtqq2ps 8 ec44c03c
 swept vcvtqq2psx 33 07443a56
 swept vcvtqq2psy 6 7db66e0d
+swept vcvtsd2sh 34 33ccf058
 swept vcvtsd2si 6 4e959e27
+swept vcvtsd2sil 6 c8a6df72
 swept vcvtsd2ss 10 1bcb76c9
+swept vcvtsd2usi 33 aaf00221
+swept vcvtsh2sd 6 2e9d20e1
+swept vcvtsh2si 34 ebe99b3f
+swept vcvtsh2ss 6 1fcb7b90
+swept vcvtsh2usi 33 e436d615
+swept vcvtsi2sd 11 1ad719c0
 swept vcvtsi2sdl 10 2e43e4cd
+swept vcvtsi2sh 6 7e49d42b
+swept vcvtsi2shl 6 72149d46
+swept vcvtsi2ss 38 6d04e326
 swept vcvtsi2ssl 34 086e0fcb
 swept vcvtss2sd 11 bba5fa44
+swept vcvtss2sh 6 628ae74a
 swept vcvtss2si 29 d8e1deed
+swept vcvtss2sil 33 ade4a761
+swept vcvtss2usi 6 d8481d91
+swept vcvttbf162ibs 35 4d12961f
+swept vcvttbf162iubs 6 d49a381d
 swept vcvttpd2dq 12 82a3f4e9
+swept vcvttpd2dqs 8 9446d115
+swept vcvttpd2dqsx 6 cd213391
+swept vcvttpd2dqsy 6 e35b4ef4
 swept vcvttpd2dqx 6 c7b0f945
 swept vcvttpd2dqy 6 ee10a4d7
 swept vcvttpd2qq 6 64b0de3a
+swept vcvttpd2qqs 6 ff53ff91
 swept vcvttpd2udq 37 1cdf0886
+swept vcvttpd2udqs 8 7a76f5cf
+swept vcvttpd2udqsx 6 ea58825b
+swept vcvttpd2udqsy 6 dc09285f
 swept vcvttpd2udqx 6 803f3b4a
 swept vcvttpd2udqy 6 1be87a30
 swept vcvttpd2uqq 33 c61ecf0b
+swept vcvttpd2uqqs 8 24640bee
 swept vcvttph2dq 18 0eabcd1a
+swept vcvttph2ibs 5 63740f3c
+swept vcvttph2iubs 6 3e1b6505
 swept vcvttph2qq 18 a322c83f
 swept vcvttph2udq 18 9535569a
 swept vcvttph2uqq 18 77158d51
 swept vcvttph2uw 6 187cdb07
 swept vcvttph2w 7 eb0e3953
 swept vcvttps2dq 43 208cc82c
+swept vcvttps2dqs 6 9c31f13a
+swept vcvttps2ibs 5 811b417c
+swept vcvttps2iubs 6 2788a5b9
 swept vcvttps2qq 18 6b89ce9c
+swept vcvttps2qqs 99 f6d0cfee
 swept vcvttps2udq 7 e9c8a8b7
+swept vcvttps2udqs 6 7c827a31
 swept vcvttps2uqq 101 b039a8c9
+swept vcvttps2uqqs 18 890103c1
 swept vcvttsd2si 4 1ec37438
+swept vcvttsd2sil 6 9c434bc6
+swept vcvttsd2sis 6 964b33b3
+swept vcvttsd2usi 6 41caf0d7
+swept vcvttsd2usis 6 46ff1103
+swept vcvttsh2si 6 feb150ae
+swept vcvttsh2usi 6 3856b56c
 swept vcvttss2si 5 b806475a
+swept vcvttss2sil 6 de8a9b74
+swept vcvttss2sis 6 1d369c20
+swept vcvttss2usi 6 7c7e4c46
+swept vcvttss2usis 34 d0607d60
 swept vcvtudq2pd 99 25bff5d1
 swept vcvtudq2ph 37 4947dcc3
 swept vcvtudq2phx 6 b505da4a
@@ -1469,11 +1754,14 @@ swept vcvtuqq2psx 6 d36eb294
 swept vcvtuqq2psy 6 3b399df1
 swept vcvtusi2sd 9 bad26c61
 swept vcvtusi2sdl 6 7de61291
+swept vcvtusi2sh 6 6e653a7b
+swept vcvtusi2shl 6 2b1f98f4
 swept vcvtusi2ss 6 1f15a287
 swept vcvtusi2ssl 6 e697c7b2
 swept vcvtuw2ph 5 04ef5402
 swept vcvtw2ph 5 9b94d2d8
 swept vdbpsadbw 13 2b0e0102
+swept vdivbf16 4 2e243ca9
 swept vdivpd 33 a23e4a45
 swept vdivph 5 978af5c8
 swept vdivps 4 f6dde079
@@ -1482,6 +1770,7 @@ swept vdivsh 6 c48781de
 swept vdivss 6 99f0bca3
 swept vdpbf16ps 3 2d26eb01
 swept vdppd 16 b3014a8f
+swept vdpphps 31 99439e28
 swept vdpps 13 a637ab8c
 swept verr 9 8acfad0b
 swept verrl 2 439635a0
@@ -1510,18 +1799,21 @@ swept vfixupimmpd 14 2ecb5a56
 swept vfixupimmps 13 5995d51f
 swept vfixupimmsd 16 e098db00
 swept vfixupimmss 16 95f7fd4f
+swept vfmadd132bf16 3 f88e23ba
 swept vfmadd132pd 32 a50ab93b
 swept vfmadd132ph 5 26eb338a
 swept vfmadd132ps 5 3f46e4c1
 swept vfmadd132sd 6 e3a1ccdf
 swept vfmadd132sh 6 38086d88
 swept vfmadd132ss 6 f12221dd
+swept vfmadd213bf16 5 0d0c970f
 swept vfmadd213pd 5 5c530e03
 swept vfmadd213ph 5 cd48861e
 swept vfmadd213ps 5 3f46ee15
 swept vfmadd213sd 6 92282462
 swept vfmadd213sh 6 2229250a
 swept vfmadd213ss 6 9a70b0bc
+swept vfmadd231bf16 3 735ef3ef
 swept vfmadd231pd 3 ab8696ce
 swept vfmadd231ph 6 2eaac0de
 swept vfmadd231ps 4 0aed5ded
@@ -1529,6 +1821,10 @@ swept vfmadd231sd 6 19bcd3cf
 swept vfmadd231sh 33 aaf6fc04
 swept vfmadd231ss 6 b238069d
 swept vfmaddcsh 4 9a991324
+swept vfmaddpd 6 07f2f905
+swept vfmaddps 58 005a95a6
+swept vfmaddsd 10 0e39c2b6
+swept vfmaddss 10 272e366a
 swept vfmaddsub132pd 6 ba544eb9
 swept vfmaddsub132ph 4 14095d75
 swept vfmaddsub132ps 3 66e2e233
@@ -1538,18 +1834,23 @@ swept vfmaddsub213ps 4 2841fd71
 swept vfmaddsub231pd 32 4f187d78
 swept vfmaddsub231ph 5 2b4eaa9b
 swept vfmaddsub231ps 5 972e8d4f
+swept vfmaddsubpd 3 d4a228e6
+swept vfmaddsubps 5 290213ed
+swept vfmsub132bf16 3 fe74528a
 swept vfmsub132pd 32 76308a29
 swept vfmsub132ph 7 50913571
 swept vfmsub132ps 4 cbbf0a90
 swept vfmsub132sd 6 8ddda591
 swept vfmsub132sh 6 e1c2a791
 swept vfmsub132ss 6 28d23663
+swept vfmsub213bf16 4 f8511ef5
 swept vfmsub213pd 4 7c55d0e2
 swept vfmsub213ph 4 ffc8c24d
 swept vfmsub213ps 4 c9eee4a3
 swept vfmsub213sd 6 f319f25d
 swept vfmsub213sh 6 595e38cf
 swept vfmsub213ss 6 dc0f4194
+swept vfmsub231bf16 4 b684e156
 swept vfmsub231pd 6 6f3ff72e
 swept vfmsub231ph 4 579d085c
 swept vfmsub231ps 32 32a605c3
@@ -1565,44 +1866,64 @@ swept vfmsubadd213ps 32 1a0cdaab
 swept vfmsubadd231pd 4 b91e532c
 swept vfmsubadd231ph 4 8ea8c7b8
 swept vfmsubadd231ps 4 a35f667c
+swept vfmsubaddpd 4 7361aa88
+swept vfmsubaddps 3 14b5e2b4
+swept vfmsubpd 3 595eb807
+swept vfmsubps 2 8f7762db
+swept vfmsubsd 11 7e58c158
+swept vfmsubss 11 4504442c
 swept vfmulcph 1 5201c30e
 swept vfmulcsh 1 708842b0
+swept vfnmadd132bf16 4 1057ff0e
 swept vfnmadd132pd 4 9078f0fa
 swept vfnmadd132ph 3 f0161649
 swept vfnmadd132ps 4 39e678ae
 swept vfnmadd132sd 6 eb37a05d
 swept vfnmadd132sh 6 7fe86cf8
 swept vfnmadd132ss 6 86bcf19c
+swept vfnmadd213bf16 3 01848173
 swept vfnmadd213pd 4 0ab376cb
 swept vfnmadd213ph 3 cb4d8905
 swept vfnmadd213ps 33 921be9b3
 swept vfnmadd213sd 6 6c97ac4b
 swept vfnmadd213sh 34 528179df
 swept vfnmadd213ss 6 7ef727f2
+swept vfnmadd231bf16 4 562a0130
 swept vfnmadd231pd 3 8b67190e
 swept vfnmadd231ph 4 7a03f7ad
 swept vfnmadd231ps 4 f0497d41
 swept vfnmadd231sd 34 1e1b2537
 swept vfnmadd231sh 6 182b1a64
 swept vfnmadd231ss 6 f175da90
+swept vfnmaddpd 3 53c91e93
+swept vfnmaddps 3 87b1fdac
+swept vfnmaddsd 10 d5aa9124
+swept vfnmaddss 11 05477a7f
+swept vfnmsub132bf16 4 0dd82f8a
 swept vfnmsub132pd 33 4776e7b5
 swept vfnmsub132ph 4 ae705708
 swept vfnmsub132ps 4 1dcb0a41
 swept vfnmsub132sd 6 9c05c035
 swept vfnmsub132sh 6 23246ad3
 swept vfnmsub132ss 34 49a6f9c5
+swept vfnmsub213bf16 4 4c5e23cc
 swept vfnmsub213pd 31 75517fc2
 swept vfnmsub213ph 4 88009027
 swept vfnmsub213ps 4 33a212e3
 swept vfnmsub213sd 6 8b75d036
 swept vfnmsub213sh 6 0a4364e6
 swept vfnmsub213ss 6 2be70a25
+swept vfnmsub231bf16 32 a4c37ed2
 swept vfnmsub231pd 3 96b73f9d
 swept vfnmsub231ph 5 50b458f8
 swept vfnmsub231ps 4 3b027d89
 swept vfnmsub231sd 6 bd56708c
 swept vfnmsub231sh 6 620139d7
 swept vfnmsub231ss 6 78f790ff
+swept vfnmsubpd 6 08d01cc9
+swept vfnmsubps 4 c3b0b6fa
+swept vfnmsubsd 10 07d4a46d
+swept vfnmsubss 67 9e2de128
 swept vfpclassbf16 9 8e5c4960
 swept vfpclassbf16x 12 82ed851d
 swept vfpclassbf16y 12 f644941a
@@ -1630,16 +1951,19 @@ swept vgatherdpd 3 7971ff6b
 swept vgatherdps 12 18a9b36b
 swept vgatherqpd 12 b1ebb8b0
 swept vgatherqps 12 473994f2
+swept vgetexpbf16 34 6b7cc84d
 swept vgetexppd 7 b0451727
 swept vgetexpph 8 25d5cb6e
 swept vgetexpps 7 31592a94
 swept vgetexpsd 6 d23f1c76
 swept vgetexpsh 6 09bb7e60
 swept vgetexpss 6 28adef7d
+swept vgetmantbf16 12 b65c1705
 swept vgetmantpd 12 42e885fe
 swept vgetmantph 13 977146e9
 swept vgetmantps 14 b1c7bf9e
 swept vgetmantsd 12 8bf5224c
+swept vgetmantsh 12 0f1e6b44
 swept vgetmantss 40 d121c760
 swept vgf2p8affineinvqb 12 f6970d4a
 swept vgf2p8affineqb 13 db49d88d
@@ -1661,8 +1985,10 @@ swept vinserti64x4 12 7db34f0d
 swept vinsertps 12 1521a5fe
 swept vlddqu 12 d0c8b917
 swept vldmxcsr 6 f2c00054
+swept vmaskmovdqu 4 82c676c0
 swept vmaskmovpd 8 46932c9d
 swept vmaskmovps 7 54fcdd8b
+swept vmaxbf16 4 74e5cbed
 swept vmaxpd 6 9ff81b5f
 swept vmaxph 5 22b13cd6
 swept vmaxps 6 8388a516
@@ -1673,10 +1999,14 @@ swept vmcall 1 b046877d
 swept vmclear 6 2715afb2
 swept vmfunc 1 7e9c4d48
 swept vmgexit 1 2c555420
+swept vminbf16 4 e2681cf7
 swept vminmaxbf16 9 e8dcec8b
 swept vminmaxpd 9 4c15f561
 swept vminmaxph 10 bd950ed0
 swept vminmaxps 11 b9504d2e
+swept vminmaxsd 12 03b7d757
+swept vminmaxsh 12 507c1c4a
+swept vminmaxss 12 2f22b70f
 swept vminpd 6 d6f787b8
 swept vminph 31 ef9f2d5e
 swept vminps 5 517e0526
@@ -1699,13 +2029,19 @@ swept vmovdqu32 61 ba03b332
 swept vmovdqu64 8 6fb7a9d0
 swept vmovdqu8 12 a6987ff6
 swept vmovhlps 6 2d8255f0
+swept vmovhpd 12 80f77841
+swept vmovhps 12 7251f9c7
 swept vmovlhps 6 82a31056
+swept vmovlpd 12 7cf78af8
+swept vmovlps 12 ef520acd
 swept vmovmskpd 7 00cfeb6d
+swept vmovmskpdl 7 2a1469fe
 swept vmovmskps 6 15d090ad
-swept vmovntdq 41 337b0033
-swept vmovntdqa 38 9e000064
-swept vmovntpd 38 ad69810e
-swept vmovntps 11 51822076
+swept vmovmskpsl 6 25b52008
+swept vmovntdq 42 7b1c82b6
+swept vmovntdqa 41 2815ab54
+swept vmovntpd 39 a61d4ef6
+swept vmovntps 14 22a52ea1
 swept vmovq 43 02535abd
 swept vmovsd 18 d42e7a86
 swept vmovsh 18 e515c688
@@ -1714,22 +2050,32 @@ swept vmovsldup 14 b931bc20
 swept vmovss 18 e37d2736
 swept vmovupd 23 2124f354
 swept vmovups 18 31ab70b9
+swept vmovw 27 cd745adf
 swept vmpsadbw 19 5282ed01
 swept vmptrld 6 8542146b
 swept vmptrst 19 6926189a
+swept vmread 6 980add99
+swept vmreadl 6 58c29c8a
 swept vmresume 1 e3318ddb
 swept vmrun 3 d8618841
 swept vmsave 3 9b1f8a50
+swept vmulbf16 4 1a1de4ec
 swept vmulpd 4 a61b70b5
 swept vmulph 4 cab16daf
 swept vmulps 4 d0dcf87f
 swept vmulsd 6 1328e8dc
 swept vmulsh 33 d20a5efe
 swept vmulss 34 cda98587
+swept vmwrite 6 95f0d59c
+swept vmwritel 6 733805d2
 swept vmxoff 1 de6839bc
 swept vmxon 6 407f52bf
 swept vorpd 3 5be256ec
 swept vorps 7 8b66b807
+swept vp2intersectd 6 38e15bb9
+swept vp2intersectq 5 ef75dbb2
+swept vp4dpwssd 6 ef06141a
+swept vp4dpwssds 33 eff5e4ae
 swept vpabsb 12 904a7e30
 swept vpabsd 14 726f89c8
 swept vpabsq 7 5ff49b64
@@ -1764,6 +2110,8 @@ swept vpblendvb 31 4c1a89df
 swept vpblendw 12 dfc92893
 swept vpbroadcastb 13 fba3b5ff
 swept vpbroadcastd 12 eba183fb
+swept vpbroadcastmb2q 6 4a0c4975
+swept vpbroadcastmw2d 6 710d2d82
 swept vpbroadcastq 7 d62969c3
 swept vpbroadcastw 14 88977d73
 swept vpclmulhqhqdq 8 b6aa3416
@@ -1777,21 +2125,109 @@ swept vpcmpd 12 7ab054f0
 swept vpcmpeqb 68 243468e5
 swept vpcmpeqd 44 1f623bca
 swept vpcmpeqq 12 0a834994
+swept vpcmpequb 7 9bd4a769
+swept vpcmpequd 7 df0fc27d
+swept vpcmpequq 7 310b08f9
+swept vpcmpequw 6 51f8043d
 swept vpcmpeqw 39 4a63c2f8
+swept vpcmpestri 16 05b8d9e9
+swept vpcmpestrm 17 c04350b9
 swept vpcmpgtb 8 bbb86a19
 swept vpcmpgtd 8 929b0ef7
 swept vpcmpgtq 10 41144e16
 swept vpcmpgtw 9 bbb5f8dc
+swept vpcmpistri 16 000550b4
+swept vpcmpistrm 17 30bb4053
+swept vpcmpleb 7 ec0d25cc
+swept vpcmpled 5 fc61cd73
+swept vpcmpleq 5 398ce7d2
+swept vpcmpleub 6 81857e84
+swept vpcmpleud 34 fa04485b
+swept vpcmpleuq 6 26758733
+swept vpcmpleuw 8 4261f175
+swept vpcmplew 6 db2b66d8
+swept vpcmpltb 7 b270b5f3
+swept vpcmpltd 35 df4a7f22
+swept vpcmpltq 4 44dce02f
+swept vpcmpltub 6 67706dba
+swept vpcmpltud 5 a7dd149c
+swept vpcmpltuq 5 73d01b21
+swept vpcmpltuw 7 d3b60b1c
+swept vpcmpltw 7 91b1f1d3
+swept vpcmpneqb 5 440a05fb
+swept vpcmpneqd 6 0c5537a5
+swept vpcmpneqq 7 f717dce0
+swept vpcmpnequb 8 2d8a6b95
+swept vpcmpnequd 6 7d72ba29
+swept vpcmpnequq 7 6a2e8f75
+swept vpcmpnequw 6 11dea553
+swept vpcmpneqw 34 1ebb08b7
+swept vpcmpnleb 7 f18c8e98
+swept vpcmpnled 7 af46d0aa
+swept vpcmpnleq 6 223cb2ed
+swept vpcmpnleub 7 fde9a4d4
+swept vpcmpnleud 6 3ff82a18
+swept vpcmpnleuq 7 06347d14
+swept vpcmpnleuw 7 953ec767
+swept vpcmpnlew 8 86931b9c
+swept vpcmpnltb 5 fef28c99
+swept vpcmpnltd 8 94fcc641
+swept vpcmpnltq 6 271361f6
+swept vpcmpnltub 4 9483efdc
+swept vpcmpnltud 7 75e899a0
+swept vpcmpnltuq 6 67082714
+swept vpcmpnltuw 7 7c747267
+swept vpcmpnltw 6 b4da3153
 swept vpcmpq 12 9039fb26
 swept vpcmpub 11 12e569d1
 swept vpcmpud 9 3c5813a9
 swept vpcmpuq 41 35c86d04
 swept vpcmpuw 12 8127af31
 swept vpcmpw 13 f368f413
+swept vpcomb 12 8ef2b917
+swept vpcomd 40 d791df75
+swept vpcomeqb 6 18b26ab0
+swept vpcomeqd 6 025c540a
+swept vpcomeqq 6 9e060b2c
+swept vpcomequb 6 01397b63
+swept vpcomequd 6 b33cac95
+swept vpcomequq 34 1ff1341d
+swept vpcomequw 6 732857c6
+swept vpcomeqw 6 2a5db337
+swept vpcomleb 6 f9fae74d
+swept vpcomled 6 dbcdf56f
+swept vpcomleq 6 0c6dfeb3
+swept vpcomleub 6 84f5b4d8
+swept vpcomleud 6 3bd1fb6c
+swept vpcomleuq 6 49727d3d
+swept vpcomleuw 6 e09f22e5
+swept vpcomlew 34 c5bb61e2
+swept vpcomltb 6 0e2611c2
+swept vpcomltd 6 215b2829
+swept vpcomltq 34 777821f5
+swept vpcomltub 6 99554982
+swept vpcomltud 34 56ea09e9
+swept vpcomltuq 6 7c71d97c
+swept vpcomltuw 6 feb929fa
+swept vpcomltw 6 17831b7d
+swept vpcomneqb 6 14bd96a7
+swept vpcomneqd 6 5d164232
+swept vpcomneqq 6 8f9c92a3
+swept vpcomnequb 6 fd3dd3f7
+swept vpcomnequd 6 bd6d4375
+swept vpcomnequq 6 d2789a22
+swept vpcomnequw 6 36273bdc
+swept vpcomneqw 6 4e506782
 swept vpcompressb 34 e1f31f58
 swept vpcompressd 35 008dd55b
 swept vpcompressq 6 b8facd46
 swept vpcompressw 5 0b1412d9
+swept vpcomq 40 ddfd898e
+swept vpcomub 12 5ccaf110
+swept vpcomud 11 d64ffb01
+swept vpcomuq 12 6716a666
+swept vpcomuw 11 fe67a038
+swept vpcomw 12 e6c12052
 swept vpconflictd 6 08ce30f6
 swept vpconflictq 7 32c39591
 swept vpdpbssd 7 f59804c2
@@ -1838,6 +2274,10 @@ swept vpexpandb 6 fe907b9f
 swept vpexpandd 33 a5af3a87
 swept vpexpandq 7 5b0ae612
 swept vpexpandw 7 771a21a9
+swept vpextrb 31 ea43689b
+swept vpextrd 17 e8f595fc
+swept vpextrw 62 282decb2
+swept vpextrwl 13 bba43cd6
 swept vpgatherdd 12 8b6ac1ce
 swept vpgatherdq 4 9a1f4880
 swept vpgatherqd 12 00a02fae
@@ -1864,6 +2304,10 @@ swept vphsubdq 6 aa2d3cf2
 swept vphsubsw 4 fe3ad387
 swept vphsubw 4 76c1692d
 swept vphsubwd 34 44d24430
+swept vpinsrb 23 38d3b3e7
+swept vpinsrd 11 8f0c787e
+swept vpinsrw 32 c848b7e3
+swept vpinsrwl 11 6ce8d9f8
 swept vplzcntd 33 0d8b80b1
 swept vplzcntq 7 8435c2e8
 swept vpmacsdd 6 8c20bda3
@@ -1876,6 +2320,8 @@ swept vpmacsswd 6 c17ec444
 swept vpmacssww 6 c5030625
 swept vpmacswd 6 35a9eeb3
 swept vpmacsww 6 64acfa5f
+swept vpmadcsswd 6 e7ad3333
+swept vpmadcswd 6 4d515527
 swept vpmadd52huq 5 e82b70e1
 swept vpmadd52luq 5 a7517fc6
 swept vpmaddubsw 7 ebb11c2c
@@ -1898,9 +2344,17 @@ swept vpminub 8 5f9c6cdf
 swept vpminud 7 764c8dcb
 swept vpminuq 4 d88f2be1
 swept vpminuw 6 b8bbaa24
+swept vpmovb2m 6 9e56bc67
+swept vpmovd2m 6 9aa052e0
 swept vpmovdb 18 c6b24a55
 swept vpmovdw 18 2097a7cd
+swept vpmovm2b 6 d9cd4cd8
+swept vpmovm2d 6 a25561b9
+swept vpmovm2q 6 51fc9c41
+swept vpmovm2w 6 0bdd196d
 swept vpmovmskb 7 fa04d09f
+swept vpmovmskbl 7 457da73c
+swept vpmovq2m 6 4a368246
 swept vpmovqb 18 8154bdde
 swept vpmovqd 18 f3a2df1a
 swept vpmovqw 18 46dd771c
@@ -1922,6 +2376,7 @@ swept vpmovusqb 18 ba2c0819
 swept vpmovusqd 18 ad641000
 swept vpmovusqw 18 6db48e9c
 swept vpmovuswb 18 402676e1
+swept vpmovw2m 6 2bbabc20
 swept vpmovwb 18 20f7b6e5
 swept vpmovzxbd 50 65a51d89
 swept vpmovzxbq 21 ff577671
@@ -1954,25 +2409,25 @@ swept vprord 44 282e9710
 swept vprorq 16 2175fffd
 swept vprorvd 4 6d7d0b6f
 swept vprorvq 3 c30df7d6
-swept vprotb 19 04cb98f9
-swept vprotd 18 c33b0bc6
-swept vprotq 18 c07b7fce
-swept vprotw 18 405e0d36
+swept vprotb 24 bcc38846
+swept vprotd 26 89961a82
+swept vprotq 27 f1b98120
+swept vprotw 25 9935f23c
 swept vpsadbw 5 31531470
-swept vpshab 6 6b573774
-swept vpshad 6 c550148f
-swept vpshaq 34 6196b2ee
-swept vpshaw 34 5597b534
-swept vpshlb 6 a1ff24db
-swept vpshld 6 a766c317
+swept vpshab 10 31418c1b
+swept vpshad 8 55700e98
+swept vpshaq 65 4a52db3a
+swept vpshaw 65 a9418776
+swept vpshlb 10 d519f407
+swept vpshld 10 2169cd45
 swept vpshldd 12 f19ed62b
 swept vpshldq 10 1214f7fc
 swept vpshldvd 3 5255af98
 swept vpshldvq 4 68676d99
 swept vpshldvw 4 14edf917
 swept vpshldw 9 d4e7bf1a
-swept vpshlq 6 9fca5d38
-swept vpshlw 6 ea4bccf9
+swept vpshlq 9 49d0c271
+swept vpshlw 11 ace8bd91
 swept vpshrdd 10 4c8add0b
 swept vpshrdq 11 5e4351a0
 swept vpshrdvd 3 86ce9ad2
@@ -2043,20 +2498,30 @@ swept vrangesd 11 4f670d8b
 swept vrangess 12 b7966d56
 swept vrcp14pd 8 fb1b58ac
 swept vrcp14ps 8 856cbdc8
+swept vrcp14sd 6 ecc5cb89
+swept vrcp14ss 6 2ca9167b
 swept vrcp28pd 6 9547e4f8
 swept vrcp28ps 6 56c20f29
+swept vrcp28sd 6 fa4e542e
+swept vrcp28ss 6 44a3d131
+swept vrcpbf16 6 4d093dff
 swept vrcpph 8 358db60d
 swept vrcpps 43 dca7ca02
 swept vrcpsh 6 99ca4803
+swept vrcpss 34 d286d30e
+swept vreducebf16 13 32852d2b
 swept vreducepd 12 7719f53b
 swept vreduceph 14 6f0bbcfd
 swept vreduceps 14 6dbf53e1
 swept vreducesd 12 0437101d
+swept vreducesh 12 41f9e8f4
 swept vreducess 12 335fb9e8
+swept vrndscalebf16 13 935f7699
 swept vrndscalepd 11 e9cfb1a4
 swept vrndscaleph 12 2a148b8a
 swept vrndscaleps 11 15b60cf8
 swept vrndscalesd 12 4f068aef
+swept vrndscalesh 12 d8a48824
 swept vrndscaless 40 84c9a365
 swept vroundpd 45 4e9397aa
 swept vroundps 17 31f4d2fe
@@ -2064,25 +2529,39 @@ swept vroundsd 11 d2c9c28f
 swept vroundss 39 56361822
 swept vrsqrt14pd 6 36efb992
 swept vrsqrt14ps 6 5e65ecf5
+swept vrsqrt14sd 6 ce72ccc0
+swept vrsqrt14ss 6 fede75b6
 swept vrsqrt28pd 33 b38da1d0
 swept vrsqrt28ps 33 5ed382d1
+swept vrsqrt28sd 6 53143d04
+swept vrsqrt28ss 6 9bf05c9b
+swept vrsqrtbf16 7 a36222b0
 swept vrsqrtph 7 40fc17ba
 swept vrsqrtps 13 1647bd6b
 swept vrsqrtsh 6 605730ee
+swept vrsqrtss 6 a43909ea
+swept vscalefbf16 34 d2c5a3f5
 swept vscalefpd 4 71f5d5e0
 swept vscalefph 5 262f429a
 swept vscalefps 5 8e2ab142
 swept vscalefsd 34 3f507081
 swept vscalefsh 6 f02618be
 swept vscalefss 6 f9bd8826
+swept vsha512msg1 4 d6af1e88
+swept vsha512msg2 4 6cdf0ee3
+swept vsha512rnds2 6 620a9db7
 swept vshuff32x4 13 6726d440
 swept vshuff64x2 15 f0c5e40c
 swept vshufi32x4 14 9f522292
 swept vshufi64x2 14 d687d8dd
 swept vshufpd 18 2cea0165
 swept vshufps 17 91d8c713
+swept vsm3msg1 6 66b571d7
+swept vsm3msg2 6 970aef6b
+swept vsm3rnds2 12 a987c158
 swept vsm4key4 7 55cd5e5d
 swept vsm4rnds4 6 65867a10
+swept vsqrtbf16 7 90ff10d0
 swept vsqrtpd 38 d74a24d6
 swept vsqrtph 7 8e2cc71d
 swept vsqrtps 39 30567a0a
@@ -2090,6 +2569,7 @@ swept vsqrtsd 6 5183743f
 swept vsqrtsh 6 5ac8bee1
 swept vsqrtss 6 068614ee
 swept vstmxcsr 7 fe043e2a
+swept vsubbf16 31 37c0d182
 swept vsubpd 4 156ebc77
 swept vsubph 3 4032017d
 swept vsubps 7 e06e92c5
@@ -2101,6 +2581,9 @@ swept vtestps 7 b2f0aaa3
 swept vucomisd 37 7b886688
 swept vucomish 6 44df7c6e
 swept vucomiss 11 0135a005
+swept vucomxsd 6 b3c265ca
+swept vucomxsh 6 3fc5964a
+swept vucomxss 34 f773d67c
 swept vunpckhpd 4 b9b3b29a
 swept vunpckhps 5 3f52868e
 swept vunpcklpd 6 de52d96c
@@ -2115,10 +2598,13 @@ swept wbnoinvd 1 050db334
 swept wrmsr 1 505d2fe9
 swept wrmsrns 1 e76daede
 swept wrpkru 1 1d6790a5
+swept wrssd 6 a1f4c384
+swept wrussd 6 19e144e1
 swept xabort 7 005f7057
-swept xadd 2 21a17b28
-swept xaddb 1 ea487e70
-swept xaddw 1 08382a19
+swept xadd 6 74a49166
+swept xaddb 2 18a4bebf
+swept xaddl 2 c61e7e11
+swept xaddw 2 e554353c
 swept xbegin 2 df30df48
 swept xchg 64 45ef6224
 swept xchgb 52 d2fe1c57
@@ -2143,8 +2629,12 @@ swept xorw 95 a4459c3a
 swept xresldtrk 1 06b0be4e
 swept xrng2 1 42c36f2f
 swept xrstor 6 736cef16
+swept xrstors 6 cdb72f3a
 swept xsave 6 4206ff0b
+swept xsavec 6 a27117e0
 swept xsaveopt 6 1e4079db
+swept xsaves 19 7bd9f853
+swept xsetbv 1 2d5535f4
 swept xsha1 1 0f686527
 swept xsha256 1 72955a2f
 swept xsha384 1 a016e8b4
@@ -2153,8 +2643,8 @@ swept xstore 1 39646ebb
 swept xstorerng 1 193cb9e1
 swept xsusldtrk 1 eb5ee51f
 swept xtest 1 611f2c30
-O2 rewritten 2309 7b3cf231
-O2 equal 26745
+O2 rewritten 2542 2cde53fe
+O2 equal 31575
 O2 shorter adc 12 16092a6a
 O2 shorter adcb 12 8191d4ff
 O2 shorter add 24 863a23b8
@@ -2167,7 +2657,9 @@ O2 shorter addss 6 0dd2a3cf
 O2 shorter addsubpd 6 3f335246
 O2 shorter addsubps 6 e46cbf11
 O2 shorter addw 12 27e58aab
+O2 shorter aesdec128kl 6 4c675f0b
 O2 shorter aesdeclast 6 50a46d92
+O2 shorter aesdecwide256kl 3 6d743494
 O2 shorter andnpd 6 1d8f2223
 O2 shorter andpd 6 c19765af
 O2 shorter arpl 6 6918594f
@@ -2203,6 +2695,7 @@ O2 shorter cmpxchgb 6 5bb16141
 O2 shorter cvtps2pd 6 5c7fc080
 O2 shorter cvtsi2sd 6 9e2d218d
 O2 shorter cvtsi2sdl 6 33115100
+O2 shorter cvttpd2pi 6 415824b5
 O2 shorter divsd 6 c9bf4383
 O2 shorter extractps 1 f8403d61
 O2 shorter fiadd 3 cbec7139
@@ -2228,6 +2721,9 @@ O2 shorter mov 30 fd6a5993
 O2 shorter movapd 63 999e07e2
 O2 shorter movaps 12 66c3fe2c
 O2 shorter movb 18 3489e71d
+O2 shorter movbe 12 44ee41fd
+O2 shorter movbel 6 bd606117
+O2 shorter movbew 6 c7398226
 O2 shorter movd 24 0da848eb
 O2 shorter movddup 8 819a4501
 O2 shorter movdir64b 3 53b98040
@@ -2259,6 +2755,9 @@ O2 shorter movsldup 6 3b60927b
 O2 shorter movss 12 286b74dd
 O2 shorter movsw 6 d0c6a121
 O2 shorter movswl 6 1d676f78
+O2 shorter movsx 6 2fd8f1f7
+O2 shorter movsxb 6 e90c46d4
+O2 shorter movsxw 6 e8c64f2a
 O2 shorter movupd 65 032942c2
 O2 shorter movups 12 dc32ea4c
 O2 shorter movw 18 7871a434
@@ -2267,6 +2766,9 @@ O2 shorter movzbl 3 f4ba0e4e
 O2 shorter movzbw 3 b7608946
 O2 shorter movzw 6 064d733d
 O2 shorter movzwl 6 abc1363e
+O2 shorter movzx 6 6f63bc73
+O2 shorter movzxb 6 d0181045
+O2 shorter movzxw 6 855d8aec
 O2 shorter mpsadbw 6 4b0e0060
 O2 shorter mulsd 6 b1dc6099
 O2 shorter mulss 6 6c645b6c
@@ -2284,6 +2786,8 @@ O2 shorter pcmpeqd 6 2d5d2a3b
 O2 shorter pcmpeqq 2 14bb5559
 O2 shorter pcmpeqw 12 10fd6a9b
 O2 shorter pcmpgtw 6 31949b21
+O2 shorter pfcmpeq 6 466183c5
+O2 shorter pfcmpge 6 73398219
 O2 shorter pmaddwd 6 c059b628
 O2 shorter pminuw 6 01cc7c15
 O2 shorter pmovsxbq 6 f65c0011
@@ -2311,11 +2815,23 @@ O2 shorter sbb 6 ec93df62
 O2 shorter sbbl 6 dac61e7f
 O2 shorter sbbw 6 3171ee1c
 O2 shorter seta 3 e50d5517
+O2 shorter setab 3 6fd6616c
 O2 shorter setb 3 cbe5f842
+O2 shorter setbb 3 0873c6f2
 O2 shorter setg 3 9c3c4811
+O2 shorter setgb 3 b73f9ec7
 O2 shorter setl 3 da72ad00
+O2 shorter setlb 3 8e75cdf8
+O2 shorter setna 3 814e78d8
+O2 shorter setnab 3 9dbe528e
+O2 shorter setnbe 3 1cfd1975
+O2 shorter setnbeb 3 28e6d598
 O2 shorter setne 3 dc6dbf9f
+O2 shorter setneb 3 b3d6e927
 O2 shorter setp 3 e8d7bd7c
+O2 shorter setpb 3 57aded59
+O2 shorter setpo 3 9d3fa45d
+O2 shorter setpob 3 bcfae27f
 O2 shorter sgdt 3 70d00652
 O2 shorter sgdtl 3 ad417cf0
 O2 shorter sgdtw 3 b719b524
@@ -2332,7 +2848,10 @@ O2 shorter testl 8 c8316d5f
 O2 shorter testw 8 31153c51
 O2 shorter ucomisd 6 bfa85b4e
 O2 shorter unpcklpd 3 2a2e2433
+O2 shorter v4fnmaddss 4 e4d1ecac
 O2 shorter vaddps 6 3c1f2ef3
+O2 shorter vbitrevb 4 7907dd3e
+O2 shorter vbmacxor16x16x16 4 c489eb8b
 O2 shorter vbroadcastf32x2 4 ba9b9a0d
 O2 shorter vbroadcastf32x4 3 64268229
 O2 shorter vbroadcastf64x2 3 8a725d40
@@ -2372,9 +2891,11 @@ O2 shorter vcmpneqps 4 457ed248
 O2 shorter vcmpneqss 6 496dcf4b
 O2 shorter vcmpnge_uqsd 6 aa9cfd3f
 O2 shorter vcmpnge_uqss 6 ad3626ad
+O2 shorter vcmpnge_usph 4 723ea0d1
 O2 shorter vcmpngt_uqph 4 18e2148f
 O2 shorter vcmpngt_uqps 4 8a6833f2
 O2 shorter vcmpngt_uqsd 6 19de50f0
+O2 shorter vcmpngt_ussd 6 f0160f94
 O2 shorter vcmpngtsd 6 7353fced
 O2 shorter vcmpngtsh 6 e935b187
 O2 shorter vcmpnle_uqps 6 589c1357
@@ -2395,19 +2916,32 @@ O2 shorter vcmptrueps 6 5d7030fa
 O2 shorter vcmpunord_sps 6 8bb1afde
 O2 shorter vcmpunord_ssd 6 67b5404f
 O2 shorter vcmpunordpd 4 ca45b3b9
+O2 shorter vcvtbiasph2hf8 8 bb68cfe8
 O2 shorter vcvtdq2phy 4 61c2714f
 O2 shorter vcvtne2ps2bf16 4 ca9509d9
+O2 shorter vcvtneeph2ps 6 501838d4
+O2 shorter vcvtph2hf8x 4 ffc70b6f
+O2 shorter vcvtph2ibs 4 1c233859
 O2 shorter vcvtph2pd 16 26b83c70
 O2 shorter vcvtph2uw 4 43b2e5a1
 O2 shorter vcvtps2dq 6 3d7589ae
 O2 shorter vcvtqq2phx 4 bba78051
 O2 shorter vcvtqq2psx 4 317ce68b
+O2 shorter vcvtsd2sh 6 cf7bb7c6
+O2 shorter vcvtsd2usi 6 ccb59886
+O2 shorter vcvtsh2si 6 3afdf67b
+O2 shorter vcvtsh2usi 6 3e070be4
+O2 shorter vcvtsi2ss 6 eb8a1504
 O2 shorter vcvtsi2ssl 6 0a6cfddc
 O2 shorter vcvtss2si 6 358da5a6
+O2 shorter vcvtss2sil 6 df6f1f96
+O2 shorter vcvttbf162ibs 4 474e653e
 O2 shorter vcvttpd2udq 4 8a4d040d
 O2 shorter vcvttpd2uqq 4 d02a0b6a
 O2 shorter vcvttps2dq 6 4274e556
+O2 shorter vcvttps2qqs 14 647d2c78
 O2 shorter vcvttps2uqq 14 74aa9501
+O2 shorter vcvttss2usis 6 df0192d5
 O2 shorter vcvtudq2pd 14 a6da94d1
 O2 shorter vcvtudq2ph 4 062136e4
 O2 shorter vcvtudq2phy 4 756e4e8f
@@ -2415,6 +2949,7 @@ O2 shorter vcvtuqq2phx 4 a2cfcff0
 O2 shorter vcvtuqq2ps 4 1bbdee39
 O2 shorter vdivpd 6 b896d832
 O2 shorter vdivsd 6 43ffe786
+O2 shorter vdpphps 4 55c2432d
 O2 shorter vextractf32x4 9 82d85378
 O2 shorter vextractf32x8 4 16d5a53c
 O2 shorter vextractf64x2 8 74ba7a8d
@@ -2422,6 +2957,7 @@ O2 shorter vextracti32x4 11 e482fd19
 O2 shorter vextracti64x2 8 cc5d8ae5
 O2 shorter vfmadd132pd 6 f11330b9
 O2 shorter vfmadd231sh 6 775c32d8
+O2 shorter vfmaddps 12 f317c60c
 O2 shorter vfmaddsub213pd 6 4a1689d5
 O2 shorter vfmaddsub213ph 4 7b741207
 O2 shorter vfmaddsub231pd 6 f862bd17
@@ -2437,8 +2973,11 @@ O2 shorter vfnmadd231sd 6 14596611
 O2 shorter vfnmsub132pd 6 52a8afa8
 O2 shorter vfnmsub132ss 6 17d38f05
 O2 shorter vfnmsub213pd 6 bcfcff41
+O2 shorter vfnmsub231bf16 4 8ab9f966
+O2 shorter vfnmsubss 12 cde1bf4d
 O2 shorter vfpclassphx 4 c17e05a6
 O2 shorter vfrczps 6 75b977ae
+O2 shorter vgetexpbf16 4 f2d0eee2
 O2 shorter vgetmantss 6 29c30685
 O2 shorter vinsertf32x4 36 014d5262
 O2 shorter vinsertf64x2 8 a27abaa5
@@ -2458,6 +2997,7 @@ O2 shorter vmovshdup 6 8be0ac22
 O2 shorter vmptrst 3 bfd9a072
 O2 shorter vmulsh 6 0d673a91
 O2 shorter vmulss 6 447e4b5b
+O2 shorter vp4dpwssds 4 0cb90590
 O2 shorter vpacksswb 6 a866ca54
 O2 shorter vpandnq 6 04174ac5
 O2 shorter vpavgb 6 a15617da
@@ -2469,15 +3009,25 @@ O2 shorter vpcmpeqb 10 85e81d87
 O2 shorter vpcmpeqd 4 c36fd591
 O2 shorter vpcmpeqq 2 606ef5bc
 O2 shorter vpcmpeqw 4 e6acc9a9
+O2 shorter vpcmpleud 4 a65084a2
+O2 shorter vpcmpltd 4 4d7c7bcf
+O2 shorter vpcmpneqw 4 5b4cf3d1
 O2 shorter vpcmpuq 4 1e6799f4
+O2 shorter vpcomd 6 4ed6640b
+O2 shorter vpcomequq 6 eb8b7eaf
+O2 shorter vpcomlew 6 2b067681
+O2 shorter vpcomltq 6 248cb4aa
+O2 shorter vpcomltud 6 65663064
 O2 shorter vpcompressb 6 d04073d9
 O2 shorter vpcompressd 6 73be2028
+O2 shorter vpcomq 6 526d51cf
 O2 shorter vpdpwusd 6 10f112df
 O2 shorter vpermi2b 4 8bce1538
 O2 shorter vpermil2ps 6 fb443612
 O2 shorter vpermq 4 262d5b71
 O2 shorter vpermt2d 4 482d59c5
 O2 shorter vpexpandd 6 69471ec5
+O2 shorter vpextrw 6 176b698d
 O2 shorter vphminposuw 6 bc86296a
 O2 shorter vphsubwd 6 fd6557ad
 O2 shorter vplzcntd 4 0cae2f3a
@@ -2492,8 +3042,8 @@ O2 shorter vpmovzxdq 16 39b5b22c
 O2 shorter vpmulhuw 6 84f9c427
 O2 shorter vpmullw 6 2be19b1c
 O2 shorter vprord 4 d9003e24
-O2 shorter vpshaq 6 792625b5
-O2 shorter vpshaw 6 f375395c
+O2 shorter vpshaq 12 db403638
+O2 shorter vpshaw 12 fb8e4d39
 O2 shorter vpshufbitqmb 4 0276f9a5
 O2 shorter vpshufhw 6 d4ea0878
 O2 shorter vpsignd 6 8190d2c8
@@ -2504,16 +3054,21 @@ O2 shorter vpunpckhdq 6 0ae9865e
 O2 shorter vpunpckhqdq 6 bce3b2de
 O2 shorter vpxord 6 0804e49c
 O2 shorter vrcpps 6 cf9748b9
+O2 shorter vrcpss 6 b503b847
 O2 shorter vrndscaless 6 a28bc794
 O2 shorter vroundpd 6 d5be49a6
 O2 shorter vroundss 6 b6853316
 O2 shorter vrsqrt28pd 4 a52bb7b8
 O2 shorter vrsqrt28ps 4 ef95d853
+O2 shorter vscalefbf16 4 51dcd15e
 O2 shorter vscalefsd 6 29bf5568
 O2 shorter vsqrtpd 6 c6b97bc1
 O2 shorter vsqrtps 6 f4c47a0f
+O2 shorter vsubbf16 4 9a677f70
 O2 shorter vucomisd 6 c14c8284
+O2 shorter vucomxss 6 f31fd377
 O2 shorter vunpcklps 6 f76e39cd
+O2 shorter xadd 1 488b895a
 O2 shorter xchg 12 2fcb5e7e
 O2 shorter xchgb 12 77f3a9ad
 O2 shorter xor 12 63e3cdcb
@@ -2521,6 +3076,7 @@ O2 shorter xorb 6 53f329fb
 O2 shorter xorl 12 0fd931d2
 O2 shorter xorpd 6 fdf747aa
 O2 shorter xorw 12 45a3145e
+O2 shorter xsaves 3 a537db9b
 O2 other andnps 1 574ff7d9
 O2 other kandnb 4 f5bd5beb
 O2 other kandnd 3 7f43374b
@@ -2564,7 +3120,9 @@ O2 kind addss addss 4
 O2 kind addsubpd addsubpd 4
 O2 kind addsubps addsubps 4
 O2 kind addw addw 8
+O2 kind aesdec128kl aesdec128kl 4
 O2 kind aesdeclast aesdeclast 4
+O2 kind aesdecwide256kl aesdecwide256kl 2
 O2 kind and test 8
 O2 kind andnpd andnps 5
 O2 kind andnpd xorps 1
@@ -2592,6 +3150,7 @@ O2 kind cmpw cmpw 4
 O2 kind cmpxchg cmpxchg 8
 O2 kind cvtps2pd cvtps2pd 4
 O2 kind cvtsi2sd cvtsi2sd 8
+O2 kind cvttpd2pi cvttpd2pi 4
 O2 kind divsd divsd 4
 O2 kind extractps movd 1
 O2 kind fiaddl fiaddl 2
@@ -2623,6 +3182,7 @@ O2 kind mov mov 32
 O2 kind movapd movaps 63
 O2 kind movaps movaps 8
 O2 kind movb movb 4
+O2 kind movbe movbe 16
 O2 kind movd movd 16
 O2 kind movddup movddup 4
 O2 kind movddup movlhps 2
@@ -2647,20 +3207,22 @@ O2 kind movntsd movntsd 4
 O2 kind movntss movntss 4
 O2 kind movq movlps 32
 O2 kind movq movq 12
-O2 kind movsbl movsbl 4
-O2 kind movsbw movsbw 4
+O2 kind movsbl movsbl 8
+O2 kind movsbw movsbw 8
 O2 kind movsd movlps 33
 O2 kind movsd movsd 4
 O2 kind movshdup movshdup 4
 O2 kind movsldup movsldup 4
 O2 kind movss movss 8
-O2 kind movswl movswl 8
+O2 kind movswl movswl 10
+O2 kind movsww movsww 2
 O2 kind movupd movups 65
 O2 kind movups movups 8
 O2 kind movw movw 4
-O2 kind movzbl movzbl 4
-O2 kind movzbw movzbw 4
-O2 kind movzwl movzwl 8
+O2 kind movzbl movzbl 8
+O2 kind movzbw movzbw 8
+O2 kind movzwl movzwl 10
+O2 kind movzww movzww 2
 O2 kind mpsadbw mpsadbw 4
 O2 kind mulsd mulsd 4
 O2 kind mulss mulss 4
@@ -2685,6 +3247,8 @@ O2 kind pcmpgtq pxor 1
 O2 kind pcmpgtw pcmpgtw 4
 O2 kind pcmpgtw pxor 3
 O2 kind pextrd movd 3
+O2 kind pfcmpeq pfcmpeq 4
+O2 kind pfcmpge pfcmpge 4
 O2 kind pmaddwd pmaddwd 4
 O2 kind pminuw pminuw 4
 O2 kind pmovsxbq pmovsxbq 4
@@ -2707,12 +3271,14 @@ O2 kind rcrw rcrw 8
 O2 kind rsqrtps rsqrtps 4
 O2 kind sbbl sbbl 8
 O2 kind sbbw sbbw 4
-O2 kind seta seta 2
-O2 kind setb setb 2
-O2 kind setg setg 2
-O2 kind setl setl 2
-O2 kind setne setne 2
-O2 kind setp setp 2
+O2 kind seta seta 8
+O2 kind setb setb 4
+O2 kind setbe setbe 4
+O2 kind setg setg 4
+O2 kind setl setl 4
+O2 kind setne setne 4
+O2 kind setnp setnp 4
+O2 kind setp setp 4
 O2 kind sgdtl sgdtl 4
 O2 kind sgdtw sgdtw 2
 O2 kind shl add 18
@@ -2726,9 +3292,12 @@ O2 kind stmxcsr stmxcsr 2
 O2 kind test test 32
 O2 kind ucomisd ucomisd 4
 O2 kind unpcklpd movlhps 3
+O2 kind v4fnmaddss v4fnmaddss 2
 O2 kind vaddps vaddps 4
 O2 kind vandnpd vxorpd 3
 O2 kind vandnps vxorps 3
+O2 kind vbitrevb vbitrevb 2
+O2 kind vbmacxor16x16x16 vbmacxor16x16x16 2
 O2 kind vbroadcastf32x2 vbroadcastsd 4
 O2 kind vbroadcastf32x4 vbroadcastf128 3
 O2 kind vbroadcastf64x2 vbroadcastf128 3
@@ -2768,10 +3337,11 @@ O2 kind vcmpneqps vcmpneqps 2
 O2 kind vcmpneqss vcmpneqss 4
 O2 kind vcmpnge_uqsd vcmpnge_uqsd 4
 O2 kind vcmpnge_uqss vcmpnge_uqss 4
+O2 kind vcmpngeph vcmpngeph 2
 O2 kind vcmpngt_uqph vcmpngt_uqph 2
 O2 kind vcmpngt_uqps vcmpngt_uqps 2
 O2 kind vcmpngt_uqsd vcmpngt_uqsd 4
-O2 kind vcmpngtsd vcmpngtsd 4
+O2 kind vcmpngtsd vcmpngtsd 8
 O2 kind vcmpngtsh vcmpngtsh 4
 O2 kind vcmpnle_uqps vcmpnle_uqps 4
 O2 kind vcmpnle_uqsh vcmpnle_uqsh 4
@@ -2791,19 +3361,30 @@ O2 kind vcmptruesd vcmptruesd 4
 O2 kind vcmpunord_sps vcmpunord_sps 4
 O2 kind vcmpunord_ssd vcmpunord_ssd 4
 O2 kind vcmpunordpd vcmpunordpd 2
+O2 kind vcvtbiasph2hf8 vcvtbiasph2hf8 4
 O2 kind vcvtdq2phy vcvtdq2phy 2
 O2 kind vcvtne2ps2bf16 vcvtne2ps2bf16 2
+O2 kind vcvtneeph2ps vcvtneeph2ps 4
+O2 kind vcvtph2hf8x vcvtph2hf8x 2
+O2 kind vcvtph2ibs vcvtph2ibs 2
 O2 kind vcvtph2pd vcvtph2pd 10
 O2 kind vcvtph2uw vcvtph2uw 2
 O2 kind vcvtps2dq vcvtps2dq 4
 O2 kind vcvtqq2phx vcvtqq2phx 2
 O2 kind vcvtqq2psx vcvtqq2psx 2
-O2 kind vcvtsi2ss vcvtsi2ss 4
-O2 kind vcvtss2si vcvtss2si 4
+O2 kind vcvtsd2sh vcvtsd2sh 4
+O2 kind vcvtsd2usi vcvtsd2usi 4
+O2 kind vcvtsh2si vcvtsh2si 4
+O2 kind vcvtsh2usi vcvtsh2usi 4
+O2 kind vcvtsi2ss vcvtsi2ss 8
+O2 kind vcvtss2si vcvtss2si 8
+O2 kind vcvttbf162ibs vcvttbf162ibs 2
 O2 kind vcvttpd2udq vcvttpd2udq 2
 O2 kind vcvttpd2uqq vcvttpd2uqq 2
 O2 kind vcvttps2dq vcvttps2dq 4
+O2 kind vcvttps2qqs vcvttps2qqs 8
 O2 kind vcvttps2uqq vcvttps2uqq 8
+O2 kind vcvttss2usis vcvttss2usis 4
 O2 kind vcvtudq2pd vcvtudq2pd 8
 O2 kind vcvtudq2ph vcvtudq2ph 2
 O2 kind vcvtudq2phy vcvtudq2phy 2
@@ -2811,6 +3392,7 @@ O2 kind vcvtuqq2phx vcvtuqq2phx 2
 O2 kind vcvtuqq2ps vcvtuqq2ps 2
 O2 kind vdivpd vdivpd 4
 O2 kind vdivsd vdivsd 4
+O2 kind vdpphps vdpphps 2
 O2 kind vextractf128 vmovaps 1
 O2 kind vextractf128 vmovups 1
 O2 kind vextractf32x4 vextractf128 9
@@ -2834,6 +3416,7 @@ O2 kind vextractps vmovd 1
 O2 kind vextractps vmovss 1
 O2 kind vfmadd132pd vfmadd132pd 4
 O2 kind vfmadd231sh vfmadd231sh 4
+O2 kind vfmaddps vfmaddps 8
 O2 kind vfmaddsub213pd vfmaddsub213pd 4
 O2 kind vfmaddsub213ph vfmaddsub213ph 2
 O2 kind vfmaddsub231pd vfmaddsub231pd 4
@@ -2849,8 +3432,11 @@ O2 kind vfnmadd231sd vfnmadd231sd 4
 O2 kind vfnmsub132pd vfnmsub132pd 4
 O2 kind vfnmsub132ss vfnmsub132ss 4
 O2 kind vfnmsub213pd vfnmsub213pd 4
+O2 kind vfnmsub231bf16 vfnmsub231bf16 2
+O2 kind vfnmsubss vfnmsubss 8
 O2 kind vfpclassphx vfpclassphx 2
 O2 kind vfrczps vfrczps 4
+O2 kind vgetexpbf16 vgetexpbf16 2
 O2 kind vgetmantss vgetmantss 4
 O2 kind vinsertf32x4 vinsertf128 36
 O2 kind vinsertf64x2 vinsertf128 8
@@ -2877,6 +3463,7 @@ O2 kind vmovshdup vmovshdup 4
 O2 kind vmptrst vmptrst 2
 O2 kind vmulsh vmulsh 4
 O2 kind vmulss vmulss 4
+O2 kind vp4dpwssds vp4dpwssds 2
 O2 kind vpacksswb vpacksswb 4
 O2 kind vpandd vpand 2
 O2 kind vpandn vpxor 2
@@ -2898,17 +3485,30 @@ O2 kind vpcmpgtb vpxor 2
 O2 kind vpcmpgtd vpxor 2
 O2 kind vpcmpgtq vpxor 2
 O2 kind vpcmpgtw vpxor 3
+O2 kind vpcmpleud vpcmpleud 2
+O2 kind vpcmpltd vpcmpltd 2
+O2 kind vpcmpneqw vpcmpneqw 2
 O2 kind vpcmpnltb vpcmpnltb 1
 O2 kind vpcmpnltuq vpcmpnltuq 1
 O2 kind vpcmpuq vpcmpuq 1
+O2 kind vpcomd vpcomd 2
+O2 kind vpcomequq vpcomequq 4
+O2 kind vpcomlew vpcomlew 4
+O2 kind vpcomltq vpcomltq 4
+O2 kind vpcomltud vpcomltud 4
+O2 kind vpcomneqd vpcomneqd 2
+O2 kind vpcomneqq vpcomneqq 2
 O2 kind vpcompressb vpcompressb 4
 O2 kind vpcompressd vpcompressd 4
+O2 kind vpcomq vpcomq 2
 O2 kind vpdpwusd vpdpwusd 4
 O2 kind vpermi2b vpermi2b 2
 O2 kind vpermil2ps vpermil2ps 4
 O2 kind vpermq vpermq 2
 O2 kind vpermt2d vpermt2d 2
 O2 kind vpexpandd vpexpandd 4
+O2 kind vpextrd vmovd 3
+O2 kind vpextrw vpextrw 4
 O2 kind vphminposuw vphminposuw 4
 O2 kind vphsubwd vphsubwd 4
 O2 kind vplzcntd vplzcntd 2
@@ -2925,8 +3525,8 @@ O2 kind vpmullw vpmullw 4
 O2 kind vpord vpor 2
 O2 kind vporq vpor 3
 O2 kind vprord vprord 2
-O2 kind vpshaq vpshaq 4
-O2 kind vpshaw vpshaw 4
+O2 kind vpshaq vpshaq 8
+O2 kind vpshaw vpshaw 8
 O2 kind vpshufbitqmb vpshufbitqmb 2
 O2 kind vpshufhw vpshufhw 4
 O2 kind vpsignd vpsignd 4
@@ -2946,25 +3546,31 @@ O2 kind vpxor vpxor 2
 O2 kind vpxord vpxor 31
 O2 kind vpxorq vpxor 4
 O2 kind vrcpps vrcpps 4
+O2 kind vrcpss vrcpss 4
 O2 kind vrndscaless vrndscaless 4
 O2 kind vroundpd vroundpd 4
 O2 kind vroundss vroundss 4
 O2 kind vrsqrt28pd vrsqrt28pd 2
 O2 kind vrsqrt28ps vrsqrt28ps 2
+O2 kind vscalefbf16 vscalefbf16 2
 O2 kind vscalefsd vscalefsd 4
 O2 kind vsqrtpd vsqrtpd 4
 O2 kind vsqrtps vsqrtps 4
+O2 kind vsubbf16 vsubbf16 2
 O2 kind vucomisd vucomisd 4
+O2 kind vucomxss vucomxss 4
 O2 kind vunpcklps vunpcklps 4
 O2 kind vxorpd vxorpd 2
 O2 kind vxorps vxorps 2
+O2 kind xadd add 6
 O2 kind xchg xchg 16
 O2 kind xorb xorb 4
 O2 kind xorl xorl 16
 O2 kind xorpd xorps 6
 O2 kind xorw xorw 8
-Os rewritten 2394 76aebaf0
-Os equal 26699
+O2 kind xsaves xsaves 2
+Os rewritten 2628 c0aef65b
+Os equal 31529
 Os shorter adc 12 16092a6a
 Os shorter adcb 12 8191d4ff
 Os shorter add 24 863a23b8
@@ -2977,7 +3583,9 @@ Os shorter addss 6 0dd2a3cf
 Os shorter addsubpd 6 3f335246
 Os shorter addsubps 6 e46cbf11
 Os shorter addw 12 27e58aab
+Os shorter aesdec128kl 6 4c675f0b
 Os shorter aesdeclast 6 50a46d92
+Os shorter aesdecwide256kl 3 6d743494
 Os shorter andnpd 6 1d8f2223
 Os shorter andpd 6 c19765af
 Os shorter arpl 6 6918594f
@@ -3013,6 +3621,7 @@ Os shorter cmpxchgb 6 5bb16141
 Os shorter cvtps2pd 6 5c7fc080
 Os shorter cvtsi2sd 6 9e2d218d
 Os shorter cvtsi2sdl 6 33115100
+Os shorter cvttpd2pi 6 415824b5
 Os shorter divsd 6 c9bf4383
 Os shorter extractps 1 f8403d61
 Os shorter fiadd 3 cbec7139
@@ -3038,6 +3647,9 @@ Os shorter mov 30 fd6a5993
 Os shorter movapd 63 999e07e2
 Os shorter movaps 12 66c3fe2c
 Os shorter movb 18 3489e71d
+Os shorter movbe 12 44ee41fd
+Os shorter movbel 6 bd606117
+Os shorter movbew 6 c7398226
 Os shorter movd 24 0da848eb
 Os shorter movddup 8 819a4501
 Os shorter movdir64b 3 53b98040
@@ -3069,6 +3681,9 @@ Os shorter movsldup 6 3b60927b
 Os shorter movss 12 286b74dd
 Os shorter movsw 6 d0c6a121
 Os shorter movswl 6 1d676f78
+Os shorter movsx 6 2fd8f1f7
+Os shorter movsxb 6 e90c46d4
+Os shorter movsxw 6 e8c64f2a
 Os shorter movupd 65 032942c2
 Os shorter movups 12 dc32ea4c
 Os shorter movw 18 7871a434
@@ -3077,6 +3692,9 @@ Os shorter movzbl 3 f4ba0e4e
 Os shorter movzbw 3 b7608946
 Os shorter movzw 6 064d733d
 Os shorter movzwl 6 abc1363e
+Os shorter movzx 6 6f63bc73
+Os shorter movzxb 6 d0181045
+Os shorter movzxw 6 855d8aec
 Os shorter mpsadbw 6 4b0e0060
 Os shorter mulsd 6 b1dc6099
 Os shorter mulss 6 6c645b6c
@@ -3098,6 +3716,8 @@ Os shorter pcmpgtb 1 29cd1c0f
 Os shorter pcmpgtd 1 767eafaa
 Os shorter pcmpgtq 1 207a29b8
 Os shorter pcmpgtw 7 1daa58ab
+Os shorter pfcmpeq 6 466183c5
+Os shorter pfcmpge 6 73398219
 Os shorter pmaddwd 6 c059b628
 Os shorter pminuw 6 01cc7c15
 Os shorter pmovsxbq 6 f65c0011
@@ -3127,11 +3747,23 @@ Os shorter sbb 6 ec93df62
 Os shorter sbbl 6 dac61e7f
 Os shorter sbbw 6 3171ee1c
 Os shorter seta 3 e50d5517
+Os shorter setab 3 6fd6616c
 Os shorter setb 3 cbe5f842
+Os shorter setbb 3 0873c6f2
 Os shorter setg 3 9c3c4811
+Os shorter setgb 3 b73f9ec7
 Os shorter setl 3 da72ad00
+Os shorter setlb 3 8e75cdf8
+Os shorter setna 3 814e78d8
+Os shorter setnab 3 9dbe528e
+Os shorter setnbe 3 1cfd1975
+Os shorter setnbeb 3 28e6d598
 Os shorter setne 3 dc6dbf9f
+Os shorter setneb 3 b3d6e927
 Os shorter setp 3 e8d7bd7c
+Os shorter setpb 3 57aded59
+Os shorter setpo 3 9d3fa45d
+Os shorter setpob 3 bcfae27f
 Os shorter sgdt 3 70d00652
 Os shorter sgdtl 3 ad417cf0
 Os shorter sgdtw 3 b719b524
@@ -3145,7 +3777,10 @@ Os shorter sqrtpd 6 3c24d569
 Os shorter stmxcsr 3 bf0b5386
 Os shorter ucomisd 6 bfa85b4e
 Os shorter unpcklpd 3 2a2e2433
+Os shorter v4fnmaddss 4 e4d1ecac
 Os shorter vaddps 6 3c1f2ef3
+Os shorter vbitrevb 4 7907dd3e
+Os shorter vbmacxor16x16x16 4 c489eb8b
 Os shorter vbroadcastf32x2 4 ba9b9a0d
 Os shorter vbroadcastf32x4 3 64268229
 Os shorter vbroadcastf64x2 3 8a725d40
@@ -3185,9 +3820,11 @@ Os shorter vcmpneqps 4 457ed248
 Os shorter vcmpneqss 6 496dcf4b
 Os shorter vcmpnge_uqsd 6 aa9cfd3f
 Os shorter vcmpnge_uqss 6 ad3626ad
+Os shorter vcmpnge_usph 4 723ea0d1
 Os shorter vcmpngt_uqph 4 18e2148f
 Os shorter vcmpngt_uqps 4 8a6833f2
 Os shorter vcmpngt_uqsd 6 19de50f0
+Os shorter vcmpngt_ussd 6 f0160f94
 Os shorter vcmpngtsd 6 7353fced
 Os shorter vcmpngtsh 6 e935b187
 Os shorter vcmpnle_uqps 6 589c1357
@@ -3208,19 +3845,32 @@ Os shorter vcmptrueps 6 5d7030fa
 Os shorter vcmpunord_sps 6 8bb1afde
 Os shorter vcmpunord_ssd 6 67b5404f
 Os shorter vcmpunordpd 4 ca45b3b9
+Os shorter vcvtbiasph2hf8 8 bb68cfe8
 Os shorter vcvtdq2phy 4 61c2714f
 Os shorter vcvtne2ps2bf16 4 ca9509d9
+Os shorter vcvtneeph2ps 6 501838d4
+Os shorter vcvtph2hf8x 4 ffc70b6f
+Os shorter vcvtph2ibs 4 1c233859
 Os shorter vcvtph2pd 16 26b83c70
 Os shorter vcvtph2uw 4 43b2e5a1
 Os shorter vcvtps2dq 6 3d7589ae
 Os shorter vcvtqq2phx 4 bba78051
 Os shorter vcvtqq2psx 4 317ce68b
+Os shorter vcvtsd2sh 6 cf7bb7c6
+Os shorter vcvtsd2usi 6 ccb59886
+Os shorter vcvtsh2si 6 3afdf67b
+Os shorter vcvtsh2usi 6 3e070be4
+Os shorter vcvtsi2ss 6 eb8a1504
 Os shorter vcvtsi2ssl 6 0a6cfddc
 Os shorter vcvtss2si 6 358da5a6
+Os shorter vcvtss2sil 6 df6f1f96
+Os shorter vcvttbf162ibs 4 474e653e
 Os shorter vcvttpd2udq 4 8a4d040d
 Os shorter vcvttpd2uqq 4 d02a0b6a
 Os shorter vcvttps2dq 6 4274e556
+Os shorter vcvttps2qqs 14 647d2c78
 Os shorter vcvttps2uqq 14 74aa9501
+Os shorter vcvttss2usis 6 df0192d5
 Os shorter vcvtudq2pd 14 a6da94d1
 Os shorter vcvtudq2ph 4 062136e4
 Os shorter vcvtudq2phy 4 756e4e8f
@@ -3228,6 +3878,7 @@ Os shorter vcvtuqq2phx 4 a2cfcff0
 Os shorter vcvtuqq2ps 4 1bbdee39
 Os shorter vdivpd 6 b896d832
 Os shorter vdivsd 6 43ffe786
+Os shorter vdpphps 4 55c2432d
 Os shorter vextractf32x4 9 82d85378
 Os shorter vextractf32x8 4 16d5a53c
 Os shorter vextractf64x2 8 74ba7a8d
@@ -3235,6 +3886,7 @@ Os shorter vextracti32x4 11 e482fd19
 Os shorter vextracti64x2 8 cc5d8ae5
 Os shorter vfmadd132pd 6 f11330b9
 Os shorter vfmadd231sh 6 775c32d8
+Os shorter vfmaddps 12 f317c60c
 Os shorter vfmaddsub213pd 6 4a1689d5
 Os shorter vfmaddsub213ph 4 7b741207
 Os shorter vfmaddsub231pd 6 f862bd17
@@ -3250,8 +3902,11 @@ Os shorter vfnmadd231sd 6 14596611
 Os shorter vfnmsub132pd 6 52a8afa8
 Os shorter vfnmsub132ss 6 17d38f05
 Os shorter vfnmsub213pd 6 bcfcff41
+Os shorter vfnmsub231bf16 4 8ab9f966
+Os shorter vfnmsubss 12 cde1bf4d
 Os shorter vfpclassphx 4 c17e05a6
 Os shorter vfrczps 6 75b977ae
+Os shorter vgetexpbf16 4 f2d0eee2
 Os shorter vgetmantss 6 29c30685
 Os shorter vinsertf32x4 36 014d5262
 Os shorter vinsertf64x2 8 a27abaa5
@@ -3271,6 +3926,7 @@ Os shorter vmovshdup 6 8be0ac22
 Os shorter vmptrst 3 bfd9a072
 Os shorter vmulsh 6 0d673a91
 Os shorter vmulss 6 447e4b5b
+Os shorter vp4dpwssds 4 0cb90590
 Os shorter vpacksswb 6 a866ca54
 Os shorter vpandnq 6 04174ac5
 Os shorter vpavgb 6 a15617da
@@ -3280,15 +3936,25 @@ Os shorter vpcmpb 4 bddf4eb5
 Os shorter vpcmpeqb 10 85e81d87
 Os shorter vpcmpeqd 4 c36fd591
 Os shorter vpcmpeqw 4 e6acc9a9
+Os shorter vpcmpleud 4 a65084a2
+Os shorter vpcmpltd 4 4d7c7bcf
+Os shorter vpcmpneqw 4 5b4cf3d1
 Os shorter vpcmpuq 4 1e6799f4
+Os shorter vpcomd 6 4ed6640b
+Os shorter vpcomequq 6 eb8b7eaf
+Os shorter vpcomlew 6 2b067681
+Os shorter vpcomltq 6 248cb4aa
+Os shorter vpcomltud 6 65663064
 Os shorter vpcompressb 6 d04073d9
 Os shorter vpcompressd 6 73be2028
+Os shorter vpcomq 6 526d51cf
 Os shorter vpdpwusd 6 10f112df
 Os shorter vpermi2b 4 8bce1538
 Os shorter vpermil2ps 6 fb443612
 Os shorter vpermq 4 262d5b71
 Os shorter vpermt2d 4 482d59c5
 Os shorter vpexpandd 6 69471ec5
+Os shorter vpextrw 6 176b698d
 Os shorter vphminposuw 6 bc86296a
 Os shorter vphsubwd 6 fd6557ad
 Os shorter vplzcntd 4 0cae2f3a
@@ -3303,8 +3969,8 @@ Os shorter vpmovzxdq 16 39b5b22c
 Os shorter vpmulhuw 6 84f9c427
 Os shorter vpmullw 6 2be19b1c
 Os shorter vprord 4 d9003e24
-Os shorter vpshaq 6 792625b5
-Os shorter vpshaw 6 f375395c
+Os shorter vpshaq 12 db403638
+Os shorter vpshaw 12 fb8e4d39
 Os shorter vpshufbitqmb 4 0276f9a5
 Os shorter vpshufhw 6 d4ea0878
 Os shorter vpsignd 6 8190d2c8
@@ -3315,16 +3981,21 @@ Os shorter vpunpckhdq 6 0ae9865e
 Os shorter vpunpckhqdq 6 bce3b2de
 Os shorter vpxord 6 0804e49c
 Os shorter vrcpps 6 cf9748b9
+Os shorter vrcpss 6 b503b847
 Os shorter vrndscaless 6 a28bc794
 Os shorter vroundpd 6 d5be49a6
 Os shorter vroundss 6 b6853316
 Os shorter vrsqrt28pd 4 a52bb7b8
 Os shorter vrsqrt28ps 4 ef95d853
+Os shorter vscalefbf16 4 51dcd15e
 Os shorter vscalefsd 6 29bf5568
 Os shorter vsqrtpd 6 c6b97bc1
 Os shorter vsqrtps 6 f4c47a0f
+Os shorter vsubbf16 4 9a677f70
 Os shorter vucomisd 6 c14c8284
+Os shorter vucomxss 6 f31fd377
 Os shorter vunpcklps 6 f76e39cd
+Os shorter xadd 1 488b895a
 Os shorter xchg 12 2fcb5e7e
 Os shorter xchgb 12 77f3a9ad
 Os shorter xor 12 63e3cdcb
@@ -3332,6 +4003,7 @@ Os shorter xorb 6 53f329fb
 Os shorter xorl 12 0fd931d2
 Os shorter xorpd 6 fdf747aa
 Os shorter xorw 12 45a3145e
+Os shorter xsaves 3 a537db9b
 Os other andnps 1 574ff7d9
 Os other kandnb 4 f5bd5beb
 Os other kandnd 3 7f43374b
@@ -3374,7 +4046,9 @@ Os kind addss addss 4
 Os kind addsubpd addsubpd 4
 Os kind addsubps addsubps 4
 Os kind addw addw 8
+Os kind aesdec128kl aesdec128kl 4
 Os kind aesdeclast aesdeclast 4
+Os kind aesdecwide256kl aesdecwide256kl 2
 Os kind and test 8
 Os kind andnpd andnps 5
 Os kind andnpd xorps 1
@@ -3402,6 +4076,7 @@ Os kind cmpw cmpw 4
 Os kind cmpxchg cmpxchg 8
 Os kind cvtps2pd cvtps2pd 4
 Os kind cvtsi2sd cvtsi2sd 8
+Os kind cvttpd2pi cvttpd2pi 4
 Os kind divsd divsd 4
 Os kind extractps movd 1
 Os kind fiaddl fiaddl 2
@@ -3433,6 +4108,7 @@ Os kind mov mov 32
 Os kind movapd movaps 63
 Os kind movaps movaps 8
 Os kind movb movb 4
+Os kind movbe movbe 16
 Os kind movd movd 16
 Os kind movddup movddup 4
 Os kind movddup movlhps 2
@@ -3455,21 +4131,23 @@ Os kind movntsd movntsd 4
 Os kind movntss movntss 4
 Os kind movq movlps 32
 Os kind movq movq 12
-Os kind movsbl movsbl 4
-Os kind movsbw movsbw 4
+Os kind movsbl movsbl 8
+Os kind movsbw movsbw 8
 Os kind movsd movlps 33
 Os kind movsd movsd 4
 Os kind movshdup movshdup 4
 Os kind movsldup movsldup 4
 Os kind movss movss 8
-Os kind movswl movswl 8
+Os kind movswl movswl 10
+Os kind movsww movsww 2
 Os kind movupd movups 65
 Os kind movups movups 8
 Os kind movw movw 4
-Os kind movzbl movzbl 4
-Os kind movzbw mov 2
-Os kind movzbw movzbw 4
-Os kind movzwl movzwl 8
+Os kind movzbl movzbl 8
+Os kind movzbw mov 3
+Os kind movzbw movzbw 8
+Os kind movzwl movzwl 10
+Os kind movzww movzww 2
 Os kind mpsadbw mpsadbw 4
 Os kind mulsd mulsd 4
 Os kind mulss mulss 4
@@ -3499,6 +4177,8 @@ Os kind pcmpgtw pcmpgtw 4
 Os kind pcmpgtw pxor 2
 Os kind pcmpgtw xorps 1
 Os kind pextrd movd 3
+Os kind pfcmpeq pfcmpeq 4
+Os kind pfcmpge pfcmpge 4
 Os kind pmaddwd pmaddwd 4
 Os kind pminuw pminuw 4
 Os kind pmovsxbq pmovsxbq 4
@@ -3523,12 +4203,14 @@ Os kind rcrw rcrw 8
 Os kind rsqrtps rsqrtps 4
 Os kind sbbl sbbl 8
 Os kind sbbw sbbw 4
-Os kind seta seta 2
-Os kind setb setb 2
-Os kind setg setg 2
-Os kind setl setl 2
-Os kind setne setne 2
-Os kind setp setp 2
+Os kind seta seta 8
+Os kind setb setb 4
+Os kind setbe setbe 4
+Os kind setg setg 4
+Os kind setl setl 4
+Os kind setne setne 4
+Os kind setnp setnp 4
+Os kind setp setp 4
 Os kind sgdtl sgdtl 4
 Os kind sgdtw sgdtw 2
 Os kind shl add 18
@@ -3542,9 +4224,12 @@ Os kind stmxcsr stmxcsr 2
 Os kind test test 32
 Os kind ucomisd ucomisd 4
 Os kind unpcklpd movlhps 3
+Os kind v4fnmaddss v4fnmaddss 2
 Os kind vaddps vaddps 4
 Os kind vandnpd vxorpd 3
 Os kind vandnps vxorps 3
+Os kind vbitrevb vbitrevb 2
+Os kind vbmacxor16x16x16 vbmacxor16x16x16 2
 Os kind vbroadcastf32x2 vbroadcastsd 4
 Os kind vbroadcastf32x4 vbroadcastf128 3
 Os kind vbroadcastf64x2 vbroadcastf128 3
@@ -3584,10 +4269,11 @@ Os kind vcmpneqps vcmpneqps 2
 Os kind vcmpneqss vcmpneqss 4
 Os kind vcmpnge_uqsd vcmpnge_uqsd 4
 Os kind vcmpnge_uqss vcmpnge_uqss 4
+Os kind vcmpngeph vcmpngeph 2
 Os kind vcmpngt_uqph vcmpngt_uqph 2
 Os kind vcmpngt_uqps vcmpngt_uqps 2
 Os kind vcmpngt_uqsd vcmpngt_uqsd 4
-Os kind vcmpngtsd vcmpngtsd 4
+Os kind vcmpngtsd vcmpngtsd 8
 Os kind vcmpngtsh vcmpngtsh 4
 Os kind vcmpnle_uqps vcmpnle_uqps 4
 Os kind vcmpnle_uqsh vcmpnle_uqsh 4
@@ -3607,19 +4293,30 @@ Os kind vcmptruesd vcmptruesd 4
 Os kind vcmpunord_sps vcmpunord_sps 4
 Os kind vcmpunord_ssd vcmpunord_ssd 4
 Os kind vcmpunordpd vcmpunordpd 2
+Os kind vcvtbiasph2hf8 vcvtbiasph2hf8 4
 Os kind vcvtdq2phy vcvtdq2phy 2
 Os kind vcvtne2ps2bf16 vcvtne2ps2bf16 2
+Os kind vcvtneeph2ps vcvtneeph2ps 4
+Os kind vcvtph2hf8x vcvtph2hf8x 2
+Os kind vcvtph2ibs vcvtph2ibs 2
 Os kind vcvtph2pd vcvtph2pd 10
 Os kind vcvtph2uw vcvtph2uw 2
 Os kind vcvtps2dq vcvtps2dq 4
 Os kind vcvtqq2phx vcvtqq2phx 2
 Os kind vcvtqq2psx vcvtqq2psx 2
-Os kind vcvtsi2ss vcvtsi2ss 4
-Os kind vcvtss2si vcvtss2si 4
+Os kind vcvtsd2sh vcvtsd2sh 4
+Os kind vcvtsd2usi vcvtsd2usi 4
+Os kind vcvtsh2si vcvtsh2si 4
+Os kind vcvtsh2usi vcvtsh2usi 4
+Os kind vcvtsi2ss vcvtsi2ss 8
+Os kind vcvtss2si vcvtss2si 8
+Os kind vcvttbf162ibs vcvttbf162ibs 2
 Os kind vcvttpd2udq vcvttpd2udq 2
 Os kind vcvttpd2uqq vcvttpd2uqq 2
 Os kind vcvttps2dq vcvttps2dq 4
+Os kind vcvttps2qqs vcvttps2qqs 8
 Os kind vcvttps2uqq vcvttps2uqq 8
+Os kind vcvttss2usis vcvttss2usis 4
 Os kind vcvtudq2pd vcvtudq2pd 8
 Os kind vcvtudq2ph vcvtudq2ph 2
 Os kind vcvtudq2phy vcvtudq2phy 2
@@ -3627,6 +4324,7 @@ Os kind vcvtuqq2phx vcvtuqq2phx 2
 Os kind vcvtuqq2ps vcvtuqq2ps 2
 Os kind vdivpd vdivpd 4
 Os kind vdivsd vdivsd 4
+Os kind vdpphps vdpphps 2
 Os kind vextractf128 vmovaps 1
 Os kind vextractf128 vmovups 1
 Os kind vextractf32x4 vextractf128 9
@@ -3650,6 +4348,7 @@ Os kind vextractps vmovd 1
 Os kind vextractps vmovss 1
 Os kind vfmadd132pd vfmadd132pd 4
 Os kind vfmadd231sh vfmadd231sh 4
+Os kind vfmaddps vfmaddps 8
 Os kind vfmaddsub213pd vfmaddsub213pd 4
 Os kind vfmaddsub213ph vfmaddsub213ph 2
 Os kind vfmaddsub231pd vfmaddsub231pd 4
@@ -3665,8 +4364,11 @@ Os kind vfnmadd231sd vfnmadd231sd 4
 Os kind vfnmsub132pd vfnmsub132pd 4
 Os kind vfnmsub132ss vfnmsub132ss 4
 Os kind vfnmsub213pd vfnmsub213pd 4
+Os kind vfnmsub231bf16 vfnmsub231bf16 2
+Os kind vfnmsubss vfnmsubss 8
 Os kind vfpclassphx vfpclassphx 2
 Os kind vfrczps vfrczps 4
+Os kind vgetexpbf16 vgetexpbf16 2
 Os kind vgetmantss vgetmantss 4
 Os kind vinsertf32x4 vinsertf128 36
 Os kind vinsertf64x2 vinsertf128 8
@@ -3693,6 +4395,7 @@ Os kind vmovshdup vmovshdup 4
 Os kind vmptrst vmptrst 2
 Os kind vmulsh vmulsh 4
 Os kind vmulss vmulss 4
+Os kind vp4dpwssds vp4dpwssds 2
 Os kind vpacksswb vpacksswb 4
 Os kind vpandd vpand 2
 Os kind vpandn vpxor 2
@@ -3714,17 +4417,30 @@ Os kind vpcmpgtb vpxor 2
 Os kind vpcmpgtd vpxor 2
 Os kind vpcmpgtq vpxor 2
 Os kind vpcmpgtw vpxor 3
+Os kind vpcmpleud vpcmpleud 2
+Os kind vpcmpltd vpcmpltd 2
+Os kind vpcmpneqw vpcmpneqw 2
 Os kind vpcmpnltb vpcmpnltb 1
 Os kind vpcmpnltuq vpcmpnltuq 1
 Os kind vpcmpuq vpcmpuq 1
+Os kind vpcomd vpcomd 2
+Os kind vpcomequq vpcomequq 4
+Os kind vpcomlew vpcomlew 4
+Os kind vpcomltq vpcomltq 4
+Os kind vpcomltud vpcomltud 4
+Os kind vpcomneqd vpcomneqd 2
+Os kind vpcomneqq vpcomneqq 2
 Os kind vpcompressb vpcompressb 4
 Os kind vpcompressd vpcompressd 4
+Os kind vpcomq vpcomq 2
 Os kind vpdpwusd vpdpwusd 4
 Os kind vpermi2b vpermi2b 2
 Os kind vpermil2ps vpermil2ps 4
 Os kind vpermq vpermq 2
 Os kind vpermt2d vpermt2d 2
 Os kind vpexpandd vpexpandd 4
+Os kind vpextrd vmovd 3
+Os kind vpextrw vpextrw 4
 Os kind vphminposuw vphminposuw 4
 Os kind vphsubwd vphsubwd 4
 Os kind vplzcntd vplzcntd 2
@@ -3741,8 +4457,8 @@ Os kind vpmullw vpmullw 4
 Os kind vpord vpor 2
 Os kind vporq vpor 3
 Os kind vprord vprord 2
-Os kind vpshaq vpshaq 4
-Os kind vpshaw vpshaw 4
+Os kind vpshaq vpshaq 8
+Os kind vpshaw vpshaw 8
 Os kind vpshufbitqmb vpshufbitqmb 2
 Os kind vpshufhw vpshufhw 4
 Os kind vpsignd vpsignd 4
@@ -3762,20 +4478,26 @@ Os kind vpxor vpxor 2
 Os kind vpxord vpxor 31
 Os kind vpxorq vpxor 4
 Os kind vrcpps vrcpps 4
+Os kind vrcpss vrcpss 4
 Os kind vrndscaless vrndscaless 4
 Os kind vroundpd vroundpd 4
 Os kind vroundss vroundss 4
 Os kind vrsqrt28pd vrsqrt28pd 2
 Os kind vrsqrt28ps vrsqrt28ps 2
+Os kind vscalefbf16 vscalefbf16 2
 Os kind vscalefsd vscalefsd 4
 Os kind vsqrtpd vsqrtpd 4
 Os kind vsqrtps vsqrtps 4
+Os kind vsubbf16 vsubbf16 2
 Os kind vucomisd vucomisd 4
+Os kind vucomxss vucomxss 4
 Os kind vunpcklps vunpcklps 4
 Os kind vxorpd vxorpd 2
 Os kind vxorps vxorps 2
+Os kind xadd add 6
 Os kind xchg xchg 16
 Os kind xorb xorb 4
 Os kind xorl xorl 16
 Os kind xorpd xorps 6
 Os kind xorw xorw 8
+Os kind xsaves xsaves 2

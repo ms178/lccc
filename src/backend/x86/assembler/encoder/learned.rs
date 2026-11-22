@@ -256,7 +256,11 @@ fn of_kinds(kinds: &[u8; 5], ops: &[Operand]) -> bool {
 /// (`pshufd $-1`), and none for a form whose number another row of its
 /// table takes wider (`add`) or that it cuts with a warning (`rolb $256,
 /// %cl`).
-pub(crate) fn check_number(name: &str, ops: &[Operand], code: Code) -> Result<(), String> {
+///
+/// Asked of every statement, so it costs one with no number a look at its
+/// operands and one with a number a search among the names -- no
+/// allocation: `mnemonic` is compared as it is written, in either case.
+pub(crate) fn check_number(mnemonic: &str, ops: &[Operand], code: Code) -> Result<(), String> {
     let mut numbers = ops.iter().filter_map(|op| match op {
         Operand::Immediate(immediate) => Some(immediate),
         _ => None,
@@ -264,7 +268,11 @@ pub(crate) fn check_number(name: &str, ops: &[Operand], code: Code) -> Result<()
     let (Some(ImmediateValue::Integer(value)), None) = (numbers.next(), numbers.next()) else {
         return Ok(());
     };
-    let Ok(at) = NUMBER_NAMES.binary_search(&name) else {
+    let lowercased = |name: &&str| {
+        name.bytes()
+            .cmp(mnemonic.bytes().map(|byte| byte.to_ascii_lowercase()))
+    };
+    let Ok(at) = NUMBER_NAMES.binary_search_by(lowercased) else {
         return Ok(());
     };
     let entries = NUMBER_STARTS
@@ -281,9 +289,10 @@ pub(crate) fn check_number(name: &str, ops: &[Operand], code: Code) -> Result<()
         entry.modes & mode != 0 && (entry.kinds[0] == 0 || of_kinds(&entry.kinds, ops))
     });
     match entry {
-        Some(entry) if !in_range(entry.range, *value) => {
-            Err(format!("operand type mismatch for `{name}'"))
-        }
+        Some(entry) if !in_range(entry.range, *value) => Err(format!(
+            "operand type mismatch for `{}'",
+            mnemonic.to_ascii_lowercase()
+        )),
         _ => Ok(()),
     }
 }

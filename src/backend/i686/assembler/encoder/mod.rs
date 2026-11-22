@@ -610,11 +610,7 @@ impl InstructionEncoder {
 
         // A number that is one byte of the instruction, in the range GNU
         // as takes it in (`pextrw $256, %xmm1, %edx` extracted word 0).
-        learned::check_number(
-            &instr.mnemonic.to_ascii_lowercase(),
-            &instr.operands,
-            self.code(),
-        )?;
+        learned::check_number(&instr.mnemonic, &instr.operands, self.code())?;
         let mut result = self.encode_mnemonic(instr);
         // What the arms refuse may be a plain instruction of the shared
         // table: a spelling or a form no arm was written for.
