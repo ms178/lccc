@@ -175,6 +175,26 @@ fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usiz
 
 /// Merge identical basic blocks.
 /// Returns true if any blocks were merged.
+/// `end line -> indices of the blocks that end there`, in block order.
+///
+/// A block's predecessor set is built from the blocks that END where it
+/// STARTS (`X.end == B.start`), never from the blocks that START there: for a
+/// well-formed block list the only block starting at `B.start` is `B` itself,
+/// so a start-keyed lookup is a silent no-op -- it yields EMPTY predecessor
+/// sets and an empty `fallthrough_entries` set, and the latter is the guard
+/// that keeps a fall-through-entered block from being deleted.
+///
+/// This is a free function so the invariant can be asserted directly rather
+/// than only through whatever merge decisions a hand-built shape happens to
+/// reach.
+fn blocks_ending_at(blocks: &[(usize, usize, String, u32)]) -> FxHashMap<usize, Vec<usize>> {
+    let mut ending: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for (xi, b) in blocks.iter().enumerate() {
+        ending.entry(b.1).or_default().push(xi);
+    }
+    ending
+}
+
 pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     if len < 10 {
@@ -358,6 +378,11 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     // lookup a single hash hit with identical results.  `entry().or_insert`
     // keeps the FIRST claimant if a degenerate input ever produced two, which
     // is exactly what the old first-match `if blocks[xi].1 == b_start` did.
+    // `end -> block indices that end there`.  A list, not a single index: the
+    // old scan visited EVERY block ending at `b_start` (it did not break), and
+    // degenerate input can have more than one; keeping all claimants makes the
+    // predecessor sets identical to the old first-match-free scan.
+    let blocks_ending_at = blocks_ending_at(&blocks);
     let mut block_starting_at: FxHashMap<usize, usize> = FxHashMap::default();
     for (xi, b) in blocks.iter().enumerate() {
         block_starting_at.entry(b.0).or_insert(xi);
@@ -365,11 +390,14 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     for bi in 0..blocks.len() {
         let b_start = blocks[bi].0;
         let b_label = blocks[bi].2.clone();
-        if let Some(&xi) = block_starting_at.get(&b_start) {
-            if xi == bi {
-                continue;
-            }
-            {
+        // Every block that ENDS exactly where B starts immediately precedes B
+        // (`blocks_ending_at`, not `block_starting_at`: the latter would only
+        // ever return B itself).
+        if let Some(xs) = blocks_ending_at.get(&b_start) {
+            for &xi in xs {
+                if xi == bi {
+                    continue;
+                }
                 // X immediately precedes B.
                 match block_terminator[xi] {
                     LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret => {
@@ -793,16 +821,55 @@ mod tests {
         peephole_optimize(asm.to_string())
     }
 
-    /// Alignment directives must not sever fall-through edges in the block
-    /// model. A `.p2align` between a guard's conditional branch and the
-    /// loop-preheader label used to stop the block scan, so the preheader's
-    /// recorded predecessor set came out EMPTY; two such preheaders then
-    /// satisfied "identical predecessors" (empty == empty) and one was
-    /// deleted — while its guard still fell through into it at runtime,
-    /// leaving the surviving loop with uninitialized pointer/counter
-    /// registers. Reproduces tests/regression/vectorize_int_map_lanes.c
-    /// at -O2 -march=x86-64-v3 with hot-loop alignment (SIGSEGV in
-    /// `vmovdqu %ymm0,(%rdi)`, 20/20 runs before the fix).
+    /// Call `merge_identical_blocks` ALONE and report how many copies of
+    /// `needle` survive.
+    fn survivors_after_isolated_merge(asm: &str, needle: &str) -> usize {
+        let mut store = super::LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|index| super::classify_line(store.get(index)))
+            .collect();
+        super::merge_identical_blocks(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop() && store.get(i).trim_ascii() == needle)
+            .count()
+    }
+
+    fn blk(start: usize, end: usize, label: &str) -> (usize, usize, String, u32) {
+        (start, end, label.to_string(), 0)
+    }
+
+    /// The predecessor lookup must be keyed on block ENDS. A start-keyed index
+    /// returns only the block itself for every query, i.e. no predecessor at
+    /// all, and it also empties `fallthrough_entries` -- which is the guard
+    /// that stops the pass from deleting a block whose entry is positional.
+    #[test]
+    fn blocks_ending_at_indexes_ends_not_starts() {
+        // A: [0,3)  B: [3,6)  C: [6,9) -- B and C start where the previous ends.
+        let blocks = vec![blk(0, 3, ".LA"), blk(3, 6, ".LB"), blk(6, 9, ".LC")];
+        let ending = super::blocks_ending_at(&blocks);
+        assert_eq!(ending.get(&3).map(Vec::as_slice), Some(&[0usize][..]));
+        assert_eq!(ending.get(&6).map(Vec::as_slice), Some(&[1][..]));
+        assert_eq!(ending.get(&9).map(Vec::as_slice), Some(&[2][..]));
+        // Nothing ends at a block's own start, which is why keying on starts
+        // can never find a predecessor.
+        for b in &blocks {
+            assert!(
+                ending.get(&b.0).is_none_or(|xs| !xs.contains(&blocks.iter().position(|x| x.0 == b.0).unwrap())),
+                "a block must not be its own predecessor"
+            );
+        }
+    }
+
+    /// Degenerate input can have SEVERAL blocks ending at one line (a block
+    /// with no instructions of its own). Every claimant must be kept: the old
+    /// scan visited all of them, so keeping one would change predecessor sets.
+    #[test]
+    fn blocks_ending_at_keeps_every_claimant() {
+        let blocks = vec![blk(0, 4, ".LA"), blk(4, 4, ".LM"), blk(4, 8, ".LB")];
+        let ending = super::blocks_ending_at(&blocks);
+        assert_eq!(ending.get(&4).map(Vec::as_slice), Some(&[0usize, 1][..]));
+    }
+
     #[test]
     fn alignment_directive_does_not_sever_fallthrough_entry() {
         let out = run(concat!(
