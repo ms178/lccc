@@ -17,8 +17,8 @@
 #   other <mnemonic> <count> <digest>: the same length, other bytes.
 #   kind <written> <rewritten> <count>: what lccc rewrites to what, as
 #     objdump reads the two encodings.
-statements 83258
-assembled 34691
+statements 83187
+assembled 34704
 swept aaa 1 9834876d
 swept aad 8 20e78bbf
 swept aadd 6 2430ff13
@@ -658,7 +658,6 @@ swept llwpcb 2 50d6c7e9
 swept lmsw 6 66a92940
 swept lmsww 6 340271f2
 swept loadiwkey 4 78586cea
-swept lock 1 0c030586
 swept lods 1 b82963b4
 swept lodsb 9 5036c779
 swept lodsl 8 8fb1da83
@@ -801,14 +800,14 @@ swept orl 55 22490c9a
 swept orpd 6 d4e37273
 swept orps 6 6d214153
 swept orw 40 a91039cd
-swept out 15 c903c0b4
-swept outb 11 adebd261
-swept outl 11 1f49109c
+swept out 25 3fa932ac
+swept outb 18 1ac32ae7
+swept outl 13 07c57412
 swept outs 1 5094f8ca
 swept outsb 5 6a1f0f27
 swept outsl 5 0c5da079
 swept outsw 5 41b9c3a8
-swept outw 11 fa01a7c8
+swept outw 12 02688479
 swept pabsb 40 9995529b
 swept pabsd 39 a0ec9088
 swept pabsw 12 17a4e704
@@ -1014,11 +1013,6 @@ swept rdseed 3 efdf36ee
 swept rdsspd 2 d1166d4d
 swept rdtsc 1 eb2de269
 swept rdtscp 1 47835537
-swept rep 1 ca27e538
-swept repe 1 9fad0c9f
-swept repne 1 b7a15529
-swept repnz 1 bafcec20
-swept repz 1 f11cc2c7
 swept ret 9 e85b1d68
 swept retf 9 1c624e69
 swept retfl 9 d42e8998
@@ -2592,7 +2586,6 @@ swept vxorpd 4 ebe33794
 swept vxorps 4 598b1b27
 swept vzeroall 1 24d60ef4
 swept vzeroupper 1 c958fe7f
-swept wait 1 716ecabb
 swept wbinvd 1 50598bc6
 swept wbnoinvd 1 050db334
 swept wrmsr 1 505d2fe9
@@ -2644,7 +2637,7 @@ swept xstorerng 1 193cb9e1
 swept xsusldtrk 1 eb5ee51f
 swept xtest 1 611f2c30
 O2 rewritten 2542 2cde53fe
-O2 equal 31575
+O2 equal 31590
 O2 shorter adc 12 16092a6a
 O2 shorter adcb 12 8191d4ff
 O2 shorter add 24 863a23b8
@@ -2697,7 +2690,6 @@ O2 shorter cvtsi2sd 6 9e2d218d
 O2 shorter cvtsi2sdl 6 33115100
 O2 shorter cvttpd2pi 6 415824b5
 O2 shorter divsd 6 c9bf4383
-O2 shorter extractps 1 f8403d61
 O2 shorter fiadd 3 cbec7139
 O2 shorter fiaddl 3 bf4b43c2
 O2 shorter ficom 3 88756a10
@@ -3068,7 +3060,6 @@ O2 shorter vsubbf16 4 9a677f70
 O2 shorter vucomisd 6 c14c8284
 O2 shorter vucomxss 6 f31fd377
 O2 shorter vunpcklps 6 f76e39cd
-O2 shorter xadd 1 488b895a
 O2 shorter xchg 12 2fcb5e7e
 O2 shorter xchgb 12 77f3a9ad
 O2 shorter xor 12 63e3cdcb
@@ -3570,7 +3561,7 @@ O2 kind xorpd xorps 6
 O2 kind xorw xorw 8
 O2 kind xsaves xsaves 2
 Os rewritten 2628 c0aef65b
-Os equal 31529
+Os equal 31544
 Os shorter adc 12 16092a6a
 Os shorter adcb 12 8191d4ff
 Os shorter add 24 863a23b8
@@ -3623,7 +3614,6 @@ Os shorter cvtsi2sd 6 9e2d218d
 Os shorter cvtsi2sdl 6 33115100
 Os shorter cvttpd2pi 6 415824b5
 Os shorter divsd 6 c9bf4383
-Os shorter extractps 1 f8403d61
 Os shorter fiadd 3 cbec7139
 Os shorter fiaddl 3 bf4b43c2
 Os shorter ficom 3 88756a10
@@ -3995,7 +3985,6 @@ Os shorter vsubbf16 4 9a677f70
 Os shorter vucomisd 6 c14c8284
 Os shorter vucomxss 6 f31fd377
 Os shorter vunpcklps 6 f76e39cd
-Os shorter xadd 1 488b895a
 Os shorter xchg 12 2fcb5e7e
 Os shorter xchgb 12 77f3a9ad
 Os shorter xor 12 63e3cdcb

@@ -31,8 +31,8 @@
 
 use super::encoder::optimize::{self, Atomic};
 use super::parser::{
-    Displacement, INSN_PREFIXES, ImmediateValue, Instruction, MemoryOperand, Operand, Optimize,
-    Register, parse_statement,
+    Displacement, ImmediateValue, Instruction, MemoryOperand, Operand, Optimize, Register,
+    is_prefix_word, parse_statement,
 };
 use std::fmt::Write as _;
 
@@ -168,9 +168,7 @@ impl Reader {
             return false;
         }
         let bare = std::mem::replace(&mut self.bare, false);
-        if word.len() == body.trim_end().len()
-            && (INSN_PREFIXES.contains(&word) || word.starts_with("rex"))
-        {
+        if word.len() == body.trim_end().len() && is_prefix_word(word) {
             // A prefix on a line of its own belongs to the next statement.
             self.bare = true;
             return false;

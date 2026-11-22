@@ -448,6 +448,26 @@ pub(crate) fn check_lock_prefixes(
     Ok(())
 }
 
+/// The byte of a prefix word that is a statement of its own, in 64-bit
+/// code. GNU as has no `es`, `ss`, `addr16` or `data32` word there.
+pub(crate) fn lone_prefix_byte(word: &str) -> Result<u8, String> {
+    Ok(match word {
+        "lock" => 0xF0,
+        "repne" | "repnz" | "xacquire" => 0xF2,
+        "rep" | "repe" | "repz" | "xrelease" => 0xF3,
+        "cs" => 0x2E,
+        "ds" | "notrack" => 0x3E,
+        "fs" => 0x64,
+        "gs" => 0x65,
+        "data16" => 0x66,
+        "addr32" => 0x67,
+        "es" | "ss" | "addr16" | "data32" => {
+            return Err(format!("`{word}' is not supported in 64-bit mode"));
+        }
+        _ => rex_prefix_word(word).ok_or_else(|| format!("no such instruction: `{word}'"))?,
+    })
+}
+
 /// The byte the opcode of `body` begins with, behind the legacy prefixes:
 /// a REX2 (`D5`), VEX (`C4`, `C5`), EVEX (`62`) or XOP (`8F`) prefix, a REX
 /// prefix, or the opcode itself. With the byte behind it.
@@ -1117,7 +1137,7 @@ pub(crate) fn carryless_multiply_alias(instr: &Instruction) -> Option<Instructio
 /// where the first operand is the implicit `%xmm0` the instruction reads. The
 /// two-operand form is the encoding itself. Any other first operand is an
 /// error, so the explicit form cannot silently encode a different instruction.
-fn sha256rnds2_operands(ops: &[Operand]) -> Result<&[Operand], String> {
+pub(crate) fn sha256rnds2_operands(ops: &[Operand]) -> Result<&[Operand], String> {
     if ops.len() != 3 {
         return Ok(ops);
     }
@@ -1250,12 +1270,18 @@ impl InstructionEncoder {
             return Ok(());
         }
         let body = &self.bytes[start..];
-        let Some(at) = body.iter().position(|byte| {
-            !matches!(
-                byte,
-                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0x9B | 0xF0 | 0xF2 | 0xF3
-            )
-        }) else {
+        // The first byte that is no prefix. `9B` is one in front of an x87
+        // instruction and the instruction where nothing follows it
+        // (`{rex2} fwait` is `d5 00 9b`; it was refused).
+        let Some(at) = body
+            .iter()
+            .enumerate()
+            .position(|(index, byte)| match byte {
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => false,
+                0x9B => index + 1 == body.len(),
+                _ => true,
+            })
+        else {
             return Err(cannot());
         };
         // `66`, `F3` or `F2` in front makes another instruction of an
@@ -1507,15 +1533,16 @@ impl InstructionEncoder {
         // rejects `addr16`/`data32` outright in 64-bit mode, accepts a
         // single `addr32`/`data16` word (even when redundant on
         // register-only forms: `addr32 nop` = `67 90`), and provides
-        // `rex`/`rex.x` as the explicit legacy-REX spellings whose bits
-        // OR-merge with the body's REX (`rex.x mov %r8d,%ebx` =
-        // `46 89 c3`); the `.y/.xy/.z` spellings do not exist.
+        // the REX words (`rex_prefix_word`) as the explicit legacy-REX
+        // spellings whose bits OR-merge with the body's REX (`rex.x mov
+        // %r8d,%ebx` = `46 89 c3`). Several of them merge too (`rex.w
+        // rex.b nop` = `49 90`), unless two set the same bit.
         let mut explicit_addr32 = false;
         self.explicit_data16 = false;
         let mut rex_floor: u8 = 0;
         for p in &instr.prefixes {
             match p.as_str() {
-                "addr16" => return Err("addr16 is not supported in 64-bit mode".to_string()),
+                "addr16" => return Err("`addr16' is not supported in 64-bit mode".to_string()),
                 "addr32" => {
                     if explicit_addr32 {
                         return Err("same type of prefix used twice".to_string());
@@ -1529,10 +1556,25 @@ impl InstructionEncoder {
                     self.explicit_data16 = true;
                 }
                 "data32" => return Err("`data32' is not supported in 64-bit mode".to_string()),
-                "rex" => rex_floor |= 0x40,
-                "rex.x" => rex_floor |= 0x42,
-                "rex64" => rex_floor |= 0x48,
-                _ => {}
+                word => {
+                    if let Some(byte) = rex_prefix_word(word) {
+                        if rex_floor & byte & 0x0F != 0 {
+                            return Err("same type of prefix used twice".to_string());
+                        }
+                        rex_floor |= byte;
+                    }
+                }
+            }
+        }
+        // `jmpabs` takes no size and no address override: `66`, `67` and
+        // `W` in front of it are undefined opcodes (they were written;
+        // GNU as refuses them in these words).
+        if instr.mnemonic.eq_ignore_ascii_case("jmpabs") {
+            if self.explicit_data16 || rex_floor & 0x08 != 0 {
+                return Err("size override not allowed with `jmpabs'".to_string());
+            }
+            if explicit_addr32 {
+                return Err("address override not allowed with `jmpabs'".to_string());
             }
         }
         // AH/BH/CH/DH do not exist under any REX prefix. Never silently
@@ -1667,7 +1709,8 @@ impl InstructionEncoder {
                 // addr32 0x67 byte is appended to seg_pre AFTER the loop
                 // so segment overrides always precede it (GAS:
                 // `fs addr32 mov %eax,(%ebx)' = 64 67 89 03).
-                "addr32" | "data16" | "rex" | "rex.x" | "rex64" => {}
+                "addr32" | "data16" => {}
+                word if rex_prefix_word(word).is_some() => {}
                 // Segment overrides used as standalone prefixes. The kernel's
                 // `ds wrmsr` relies on the byte being emitted so an
                 // ALTERNATIVE can patch the instruction in place.
@@ -2056,6 +2099,32 @@ impl InstructionEncoder {
             }
         }
 
+        // A string instruction with operands decides its own segment byte
+        // (the exception at the choke point above), behind the one a
+        // segment word in front of it has already written: the same
+        // segment is one prefix (`fs movsb %fs:(%rsi), %es:(%rdi)` was
+        // `64 64 a4`) and another one is one too many (`cs movsb
+        // %fs:(%rsi), %es:(%rdi)` was `2e 64 a4`; GNU as refuses it).
+        if result.is_ok() && is_explicit_string_op(&instr.mnemonic, &instr.operands) {
+            let is_segment = |byte: u8| matches!(byte, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65);
+            let word = seg_pre.iter().copied().find(|&byte| is_segment(byte));
+            let own = self
+                .bytes
+                .get(body)
+                .copied()
+                .filter(|&byte| is_segment(byte));
+            match (word, own) {
+                (Some(word), Some(own)) if word == own => {
+                    self.bytes.remove(body);
+                    self.shift_relocations(reloc_base, body, -1);
+                }
+                (Some(_), Some(_)) => {
+                    result = Err("same type of prefix used twice".to_string());
+                }
+                _ => {}
+            }
+        }
+
         // Central 0x67 splice: after any segment bytes, before 0x66 /
         // group-1 / REX / VEX / EVEX (`65 67 66 8b`, `64 67 c5 ..`).
         // Runs before the group-1 splice, whose skipper already steps
@@ -2126,11 +2195,14 @@ impl InstructionEncoder {
         }
 
         // `data16` word: splice the forced 0x66 after any segment/0x67 run
-        // and before group-1/REX/opcode (GAS: `data16 mov %eax,(%eax)` =
-        // 66 89 00, `data16 nop` = 66 90). A body that already carries
-        // 0x66, or a VEX/EVEX body (a legacy 0x66 ahead of VEX/EVEX is
-        // ignored or #UD depending on class), is rejected — matching the
-        // GAS duplicate-prefix diagnostic.
+        // and before group-1/REX/REX2/opcode (GAS: `data16 mov %eax,(%eax)`
+        // = 66 89 00, `data16 nop` = 66 90, `data16 addl %r16d, %ebx` =
+        // 66 d5 40 01 c3: a REX2 prefix is a REX prefix here, and the
+        // word in front of one used to be "same type of prefix used
+        // twice"). A body that already carries 0x66, or a VEX/EVEX body
+        // (a legacy 0x66 ahead of VEX/EVEX is ignored or #UD depending on
+        // class), is rejected — matching the GAS duplicate-prefix
+        // diagnostic.
         if result.is_ok() && self.explicit_data16 {
             let mut at = start_len;
             while at < self.bytes.len()
@@ -2149,7 +2221,7 @@ impl InstructionEncoder {
             let vector =
                 has_vector_prefix(&self.bytes[at..], true) || takes_no_data_size_prefix(instr);
             match self.bytes.get(at) {
-                Some(0x66 | 0xD5) => {
+                Some(0x66) => {
                     result = Err("same type of prefix used twice".to_string());
                 }
                 _ if vector => {
@@ -2167,13 +2239,19 @@ impl InstructionEncoder {
             }
         }
 
-        // `rex`/`rex.x` floor: OR-merge into a body-carried REX byte, or
-        // splice a standalone one before the opcode (GAS 2.47:
-        // `rex mov %eax,%ebx` = 40 89 c3, `rex.x mov %r8d,%ebx` =
-        // 46 89 c3, `rex mov %rax,%rbx` = 48 89 c3 — the bare 0x40 is
-        // absorbed by the body's REX.W). The group-1 splice below lands
-        // F0/F2/F3 in front of the merged/inserted REX byte, so the
-        // canonical [seg][67][66][F0/F2/F3][REX] order holds.
+        // The REX words: OR-merge into a body-carried REX byte, or splice
+        // a standalone one before the opcode (GAS 2.47: `rex mov
+        // %eax,%ebx` = 40 89 c3, `rex.x mov %r8d,%ebx` = 46 89 c3, `rex
+        // mov %rax,%rbx` = 48 89 c3 — the bare 0x40 is absorbed by the
+        // body's REX.W). A bit the word sets and the instruction sets
+        // itself is "same type of prefix used twice" (`rex64 mov %rax,
+        // %rbx`, `rex.b mov %eax, %r8d`; they were assembled). A REX2
+        // prefix carries the same four bits in the low half of its
+        // second byte and takes them the same way (`rex64 addl %r16d,
+        // %ebx` = d5 48 01 c3); a VEX or EVEX prefix takes none. The
+        // group-1 splice below lands F0/F2/F3 in front of the
+        // merged/inserted REX byte, so the canonical
+        // [seg][67][66][F0/F2/F3][REX] order holds.
         if result.is_ok() && rex_floor != 0 {
             let mut at = start_len;
             while at < self.bytes.len()
@@ -2194,20 +2272,40 @@ impl InstructionEncoder {
             {
                 at += 1;
             }
-            match self.bytes.get(at) {
-                Some(b) if (0x40..=0x4F).contains(b) => {
-                    self.bytes[at] |= rex_floor & 0x0F;
+            // Where the instruction keeps its W, R, X and B bits.
+            let bits_at = match self.bytes.get(at) {
+                Some(0x40..=0x4F) => Some(at),
+                Some(0xD5) => Some(at + 1),
+                _ => None,
+            };
+            if has_vector_prefix(&self.bytes[at..], true) {
+                result = Err(format!(
+                    "REX prefix invalid with `{}'",
+                    instr.mnemonic.to_ascii_lowercase()
+                ));
+            } else if let Some(bits_at) = bits_at {
+                if self.bytes[bits_at] & rex_floor & 0x0F != 0 {
+                    result = Err("same type of prefix used twice".to_string());
+                } else {
+                    self.bytes[bits_at] |= rex_floor & 0x0F;
                 }
-                Some(0x62) | Some(0xC4) | Some(0xC5) | Some(0xD5) => {
-                    result = Err("REX prefix is not valid before a VEX/EVEX encoding".to_string());
-                }
-                _ => {
-                    self.bytes.insert(at, rex_floor);
-                    for r in &mut self.relocations[reloc_base..] {
-                        r.offset += 1;
-                    }
+            } else {
+                self.bytes.insert(at, rex_floor);
+                for r in &mut self.relocations[reloc_base..] {
+                    r.offset += 1;
                 }
             }
+        }
+
+        // `lock` is a prefix of the legacy encodings: behind it a VEX,
+        // EVEX or XOP prefix is an undefined opcode. The APX forms of the
+        // lockable instructions are such (`lock {nf} addl $1, (%rax)`,
+        // `lock addl %ecx, (%rax), %ebx`, `lock {evex} negl (%rax)` were
+        // written `f0 62 ..`; GNU as refuses them in these words). The
+        // HLE hints stand beside `lock` or in front of `xchg` and `mov`,
+        // which have no such form.
+        if result.is_ok() && has_lock && has_vector_prefix(&self.bytes[start_len..], true) {
+            result = Err("expecting lockable instruction after `lock'".to_string());
         }
 
         if result.is_ok() && !group1.is_empty() {
@@ -4405,17 +4503,8 @@ impl InstructionEncoder {
             }
             "movb" => self.encode_mov(ops, 1),
             "movabs" => self.encode_movabs(ops),
-            // With a suffix: a register of that size, and for all but `q`
-            // the accumulator at an address (only `movabsq` loads a
-            // number).
-            "movabsq" | "movabsl" | "movabsw" | "movabsb" => {
-                let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
-                Self::check_operand_size(mnemonic, ops, size)?;
-                if size != 8 && ops.iter().any(|op| matches!(op, Operand::Immediate(_))) {
-                    return Err(format!("operand type mismatch for `{mnemonic}'"));
-                }
-                self.encode_movabs(ops)
-            }
+            "movabsq" | "movabsl" => self.encode_movabs_sized(ops, mnemonic),
+            "movabsw" | "movabsb" => self.encode_movabs_sized(ops, mnemonic),
             "movslq" => self.encode_movsx(ops, 4, 8),
             "movsbq" => self.encode_movsx(ops, 1, 8),
             "movswq" => self.encode_movsx(ops, 2, 8),
@@ -4627,18 +4716,23 @@ impl InstructionEncoder {
                 Ok(())
             }
 
-            // Standalone prefix bytes (used when prefix and instruction are on separate
-            // lines or separated by ; in inline asm, e.g., "lock ; cmpxchg %r, %m")
-            "lock" if ops.is_empty() => {
-                self.bytes.push(0xF0);
-                Ok(())
-            }
-            "rep" | "repe" | "repz" if ops.is_empty() => {
-                self.bytes.push(0xF3);
-                Ok(())
-            }
-            "repne" | "repnz" if ops.is_empty() => {
-                self.bytes.push(0xF2);
+            // A prefix word that is the whole statement is its byte (used
+            // when prefix and instruction are on separate lines or
+            // separated by ; in inline asm, e.g., "lock ; cmpxchg %r, %m",
+            // "rep; nop"; GCC writes `rex64` on the line in front of the
+            // `call` of its TLS sequence). Every prefix word, as in GNU as:
+            // `lock` and the `rep`s were, and `data16`, `addr32`, the
+            // segments, `notrack`, the HLE hints and the REX words were "no
+            // such instruction".
+            //
+            // `ops.is_empty()` is LOAD-BEARING: without it a line the parser
+            // mis-shaped (`REP MOVSQ` pre-case-fix, or `rep; zzz` typos)
+            // reached this arm and emitted a BARE 0xF3 while silently
+            // dropping the operands. GAS rejects `rep` with operands it
+            // cannot attach ("suffix or operands invalid"), so does this.
+            word if ops.is_empty() && is_prefix_word(word) => {
+                let byte = lone_prefix_byte(word)?;
+                self.bytes.push(byte);
                 Ok(())
             }
 
@@ -6824,23 +6918,6 @@ impl InstructionEncoder {
             "rcr" => self.encode_suffixless_shift(ops, 3),
             "rol" => self.encode_suffixless_shift(ops, 0),
             "ror" => self.encode_suffixless_shift(ops, 1),
-
-            // ---- rep/lock with nothing or partial ----
-            // `ops.is_empty()` is LOAD-BEARING: without it a line the parser
-            // mis-shaped (`REP MOVSQ` pre-case-fix, or `rep; zzz` typos)
-            // reached this arm and emitted a BARE 0xF3 while silently
-            // dropping the operands. GAS rejects `rep` with operands it
-            // cannot attach ("suffix or operands invalid"), so does this.
-            "rep" if ops.is_empty() => {
-                // rep; by itself just emits the prefix (for "rep; nop" = pause)
-                self.bytes.push(0xF3);
-                Ok(())
-            }
-            "lock" if ops.is_empty() => {
-                // lock; by itself just emits the prefix byte
-                self.bytes.push(0xF0);
-                Ok(())
-            }
 
             // 1-operand shift forms are now handled in encode_shift directly
 
@@ -10161,5 +10238,417 @@ mod legacy_simd_immediate_shape_tests {
             }
         }
         assert_eq!(count, 1, "{line}");
+    }
+}
+
+/// Prefix words and encoding requests in front of an instruction. The
+/// bytes are GNU as 2.47's (`as --64`) unless a test says otherwise.
+#[cfg(test)]
+mod prefix_word_tests {
+    use super::apx_tests::{fail_msg, hex};
+
+    /// Every REX word is a REX prefix whose bits merge with the ones the
+    /// instruction needs. Of the thirty-one, `rex`, `rex.x` and `rex64`
+    /// were known.
+    #[test]
+    fn rex_words_merge_with_the_instruction() {
+        for (line, bytes) in [
+            ("rex mov %eax, %ebx", "40 89 c3"),
+            ("rexz mov %eax, %ebx", "41 89 c3"),
+            ("rexy mov %eax, %ebx", "42 89 c3"),
+            ("rexxyz mov %eax, %ebx", "47 89 c3"),
+            ("rex64 mov %eax, %ebx", "48 89 c3"),
+            ("rex64xyz mov %eax, %ebx", "4f 89 c3"),
+            ("rex.b mov %eax, %ebx", "41 89 c3"),
+            ("rex.r mov %eax, %ebx", "44 89 c3"),
+            ("rex.w mov %eax, %ebx", "48 89 c3"),
+            ("rex.wrxb mov (%rax,%rcx), %edx", "4f 8b 14 08"),
+            ("rex.b mov %r8d, %ebx", "45 89 c3"),
+            ("rex.x mov %r8d, %ebx", "46 89 c3"),
+            ("rex mov %rax, %rbx", "48 89 c3"),
+            ("rex.w nop", "48 90"),
+            ("rex.b push %rax", "41 50"),
+            ("rex.w jmp *%rax", "48 ff e0"),
+            ("rex.wb ret", "49 c3"),
+            ("rex.w movaps %xmm0, %xmm1", "48 0f 28 c8"),
+            ("rex.w movd %xmm0, %eax", "66 48 0f 7e c0"),
+            ("rex.w fnop", "48 d9 d0"),
+            ("rex.w cmova %eax, %ebx", "48 0f 47 d8"),
+            ("rex.wb mov $5, %al", "49 b0 05"),
+            (
+                "rex mov $0x1122334455667788, %rax",
+                "48 b8 88 77 66 55 44 33 22 11",
+            ),
+            // Among the other prefixes, in their order.
+            ("rex.w lock addl $1, (%rax)", "f0 48 83 00 01"),
+            ("lock rex.w addl $1, (%rax)", "f0 48 83 00 01"),
+            ("rex.w rep movsb", "f3 48 a4"),
+            ("rex.w data16 nop", "66 48 90"),
+            ("data16 rex.w nop", "66 48 90"),
+            ("rex.w addr32 nop", "67 48 90"),
+            ("rex.w cs nop", "2e 48 90"),
+            // Several words are one prefix.
+            ("rex.w rex.b nop", "49 90"),
+            ("rex rex nop", "40 90"),
+            ("rex rex64 nop", "48 90"),
+            ("rex.b rex.x rex.r rex.w nop", "4f 90"),
+            // A row learned from GNU as takes the word too.
+            ("rex.w pfadd %mm1, %mm2", "48 0f 0f d1 9e"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+    }
+
+    /// A bit that two words set, or a word and the instruction itself, is
+    /// refused: the statement asks for it twice. (`rex64 mov %rax, %rbx`
+    /// and `rex.b mov %eax, %r8d` were assembled.)
+    #[test]
+    fn a_rex_bit_set_twice_is_refused() {
+        for line in [
+            "rex64 mov %rax, %rbx",
+            "rex.w mov %rax, %rbx",
+            "rex64 movq %rax, %rbx",
+            "rex.b mov %eax, %r8d",
+            "rex.r mov %r8d, %eax",
+            "rex.x mov (%rax,%r9), %eax",
+            "rex.b lea (%r8), %ebx",
+            "rex64 mov $0x1122334455667788, %rax",
+            "rex.w rex64 nop",
+            "rex.wb rex.b nop",
+            "rex.w rex.w nop",
+            // The same bits in a REX2 prefix.
+            "rex.x addl %eax, (%rax,%r9)",
+        ] {
+            assert_eq!(fail_msg(line), "same type of prefix used twice", "{line}");
+        }
+    }
+
+    /// A REX2 prefix carries the four bits of a REX prefix and takes a
+    /// REX word's as a REX prefix does; a VEX or EVEX prefix takes none.
+    #[test]
+    fn rex_words_in_front_of_the_other_prefixes() {
+        for (line, bytes) in [
+            ("rex64 {rex2} nop", "d5 08 90"),
+            ("rex {rex2} nop", "d5 00 90"),
+            ("rex.w {rex2} mov %eax, %ebx", "d5 08 89 c3"),
+            ("rex.b {rex2} push %rax", "d5 01 50"),
+            ("rex.b push %r16", "d5 11 50"),
+            ("rex64 addl %r16d, %ebx", "d5 48 01 c3"),
+            ("rex.b addl %r16d, %ebx", "d5 41 01 c3"),
+            ("rex.r addl %r16d, %ebx", "d5 44 01 c3"),
+            ("rex.x addl %eax, (%r16,%rcx)", "d5 12 01 04 08"),
+            ("rex.x addl %eax, (%rax,%r17)", "d5 22 01 04 08"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+        assert_eq!(
+            fail_msg("rex.w vmovaps %xmm0, %xmm1"),
+            "REX prefix invalid with `vmovaps'"
+        );
+        assert_eq!(
+            fail_msg("rex.w kmovw %k1, %k2"),
+            "REX prefix invalid with `kmovw'"
+        );
+        assert_eq!(
+            fail_msg("rex.w andn %eax, %ebx, %ecx"),
+            "REX prefix invalid with `andn'"
+        );
+        // GNU as sets the `W` of the EVEX prefix here, which makes an
+        // `addq` of the `addl` written. Refused, like `data16` in front
+        // of an EVEX prefix.
+        assert_eq!(
+            fail_msg("rex64 {evex} addl %eax, %ebx"),
+            "REX prefix invalid with `addl'"
+        );
+        assert_eq!(
+            fail_msg("rex64 addl %eax, %ebx, %ecx"),
+            "REX prefix invalid with `addl'"
+        );
+    }
+
+    /// The accumulator exchanged with itself is `nop`, behind a prefix
+    /// that makes no other register of it too.
+    #[test]
+    fn nop_spelled_as_an_exchange_behind_a_prefix() {
+        assert_eq!(hex("xchg %rax, %rax"), "90");
+        assert_eq!(hex("rex xchg %rax, %rax"), "40 90");
+        assert_eq!(hex("rex64 xchg %rax, %rax"), "48 90");
+        assert_eq!(hex("{rex2} xchg %rax, %rax"), "d5 00 90");
+        assert_eq!(hex("{rex2} xchgq %rax, %rax"), "d5 00 90");
+        assert_eq!(hex("{rex2} xchg %ax, %ax"), "66 d5 00 90");
+        // Not the 32-bit one, which clears the upper half.
+        assert_eq!(hex("rex xchg %eax, %eax"), "40 87 c0");
+        assert_eq!(hex("{rex2} xchg %eax, %eax"), "d5 00 87 c0");
+        assert_eq!(hex("rex.b xchg %eax, %eax"), "41 87 c0");
+        assert_eq!(hex("{rex2} xchg %r8, %rax"), "d5 09 90");
+    }
+
+    /// A prefix word that is the whole statement is its byte. `lock` and
+    /// the `rep`s were; the others were "no such instruction", `rex64`
+    /// among them, which GCC writes on the line in front of the `call` of
+    /// a TLS sequence.
+    #[test]
+    fn a_prefix_word_alone_is_its_byte() {
+        for (word, byte) in [
+            ("lock", "f0"),
+            ("rep", "f3"),
+            ("repe", "f3"),
+            ("repz", "f3"),
+            ("repne", "f2"),
+            ("repnz", "f2"),
+            ("xacquire", "f2"),
+            ("xrelease", "f3"),
+            ("cs", "2e"),
+            ("ds", "3e"),
+            ("notrack", "3e"),
+            ("fs", "64"),
+            ("gs", "65"),
+            ("data16", "66"),
+            ("addr32", "67"),
+            ("rex", "40"),
+            ("rexx", "44"),
+            ("rex.x", "42"),
+            ("rex64", "48"),
+            ("rex.w", "48"),
+            ("rex.wrxb", "4f"),
+        ] {
+            assert_eq!(hex(word), byte, "{word}");
+            assert_eq!(hex(&word.to_ascii_uppercase()), byte, "{word}");
+        }
+        for word in ["es", "ss", "addr16", "data32"] {
+            assert_eq!(
+                fail_msg(word),
+                format!("`{word}' is not supported in 64-bit mode")
+            );
+        }
+        assert_eq!(hex("rex64\ncall *%rax"), "48 ff d0");
+    }
+
+    /// `lock` is a prefix of the legacy encodings. In front of the EVEX
+    /// forms APX gives the lockable instructions it is an undefined
+    /// opcode; lccc wrote it (`f0 62 f4 7c 08 83 00 01`).
+    #[test]
+    fn lock_stands_in_front_of_no_evex_encoding() {
+        for line in [
+            "lock {evex} addl $1, (%rax)",
+            "{evex} lock addl $1, (%rax)",
+            "lock {nf} addl $1, (%rax)",
+            "{nf} lock addl $1, (%rax)",
+            "lock addl $1, (%rax), %ebx",
+            "lock addl %ecx, (%rax), %ebx",
+            "lock {evex} incl (%rax)",
+            "lock incl (%rax), %ebx",
+            "lock {nf} decl (%rax)",
+            "lock {evex} negl (%rax)",
+            "lock negl (%rax), %ebx",
+            "lock notl (%rax), %ebx",
+            "lock {evex} andl %eax, (%rbx)",
+            "lock {evex} subl $1, (%rax)",
+            "lock {evex} adcl $1, (%rax)",
+            "lock {evex} sbbl $1, (%rax)",
+            "lock {evex} orl $1, (%rax)",
+            "lock {evex} xorl $1, (%rax)",
+            "xacquire lock {nf} addl $1, (%rax)",
+        ] {
+            assert_eq!(
+                fail_msg(line),
+                "expecting lockable instruction after `lock'",
+                "{line}"
+            );
+        }
+        // A REX2 prefix is a legacy encoding's.
+        for (line, bytes) in [
+            ("lock addl $1, (%r16)", "f0 d5 10 83 00 01"),
+            ("lock addl %r16d, (%rax)", "f0 d5 40 01 00"),
+            ("lock {rex2} addl $1, (%rax)", "f0 d5 00 83 00 01"),
+            ("{rex2} lock addl $1, (%rax)", "f0 d5 00 83 00 01"),
+            (
+                "{rex2} xacquire lock addl $1, (%rax)",
+                "f2 f0 d5 00 83 00 01",
+            ),
+            ("lock {rex2} xchg %eax, (%rbx)", "f0 d5 00 87 03"),
+            ("lock {rex2} cmpxchg16b (%rax)", "f0 d5 88 c7 08"),
+            ("lock {rex2} btsl $1, (%rax)", "f0 d5 80 ba 28 01"),
+            ("lock xaddl %r17d, (%rbx)", "f0 d5 c0 c1 0b"),
+            ("lock btsl $1, (%r20)", "f0 d5 90 ba 2c 24 01"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+    }
+
+    /// A REX2 prefix is a REX prefix to `data16` too: the 0x66 goes in
+    /// front of it. (It was "same type of prefix used twice".)
+    #[test]
+    fn data16_in_front_of_a_rex2_prefix() {
+        for (line, bytes) in [
+            ("data16 {rex2} nop", "66 d5 00 90"),
+            ("{rex2} data16 nop", "66 d5 00 90"),
+            ("data16 {rex2} mov %eax, %ebx", "66 d5 00 89 c3"),
+            ("data16 {rex2} addl %eax, %ebx", "66 d5 00 01 c3"),
+            ("data16 {rex2} push %rax", "66 d5 00 50"),
+            ("data16 addl %r16d, %ebx", "66 d5 40 01 c3"),
+            ("data16 addl %eax, (%r16)", "66 d5 10 01 00"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+        assert_eq!(
+            fail_msg("data16 {rex2} addw %ax, %bx"),
+            "same type of prefix used twice"
+        );
+        assert_eq!(
+            fail_msg("data16 {rex2} movaps %xmm0, %xmm1"),
+            "data size prefix invalid with `movaps'"
+        );
+    }
+
+    /// Requests and prefix words in either order in front of the
+    /// instruction. (A prefix word behind a request was "no such
+    /// instruction".)
+    #[test]
+    fn a_prefix_word_behind_a_request() {
+        for (line, bytes) in [
+            ("{rex2} lock addl $1, (%rax)", "f0 d5 00 83 00 01"),
+            ("{nooptimize} lock addl $1, (%rax)", "f0 83 00 01"),
+            ("{nooptimize} rep movsb", "f3 a4"),
+            ("{nooptimize} rep stosq", "f3 48 ab"),
+            ("{nooptimize} cs mov $1, %rax", "2e 48 c7 c0 01 00 00 00"),
+            ("{nooptimize} data16 nop", "66 90"),
+            ("{rex2} data16 nop", "66 d5 00 90"),
+            ("{rex2} addr32 nop", "67 d5 00 90"),
+            ("{rex2} cs nop", "2e d5 00 90"),
+            ("{rex2} notrack jmp *%rax", "3e d5 00 ff e0"),
+            ("{rex2} rex nop", "d5 00 90"),
+            ("{rex2} rex.w nop", "d5 08 90"),
+            ("{vex3} cs vaddps (%rax), %xmm1, %xmm2", "2e c4 e1 70 58 10"),
+            (
+                "{evex} cs vaddps (%rax), %xmm1, %xmm2",
+                "2e 62 f1 74 08 58 10",
+            ),
+            (
+                "{evex} addr32 vaddps (%eax), %xmm1, %xmm2",
+                "67 62 f1 74 08 58 10",
+            ),
+            ("{vex} addr32 vaddps (%eax), %xmm1, %xmm2", "67 c5 f0 58 10"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+    }
+
+    /// `{rex2}` in front of `fwait`, which is the byte 9B: a prefix in
+    /// front of an x87 instruction and the instruction on its own.
+    #[test]
+    fn rex2_in_front_of_fwait() {
+        assert_eq!(hex("{rex2} wait"), "d5 00 9b");
+        assert_eq!(hex("{rex2} fwait"), "d5 00 9b");
+        assert_eq!(hex("{rex2} fsave (%rax)"), "9b d5 00 dd 30");
+        assert_eq!(hex("{rex2} fnop"), "d5 00 d9 d0");
+    }
+
+    /// With one of `%ah`, `%ch`, `%dh`, `%bh`, which no instruction behind
+    /// a REX prefix can name, the request is dropped and the statement is
+    /// assembled as written. That is GNU as's rule, and what it does where
+    /// it sees the register; behind a number it does not look
+    /// (`establish_rex` in tc-i386.c counts its last operand from the
+    /// wrong end) and writes `d5 00 b6 05` for the first of these, which
+    /// is `mov $5, %sil`. Clang 23.1.5 refuses all of them.
+    #[test]
+    fn rex2_request_with_a_high_byte_register() {
+        for (line, bytes) in [
+            ("{rex2} mov $5, %dh", "b6 05"),
+            ("{rex2} test $5, %dh", "f6 c6 05"),
+            ("{rex2} add $5, %dh", "80 c6 05"),
+            ("{rex2} shl $3, %dh", "c0 e6 03"),
+            ("{rex2} cmp $5, %ah", "80 fc 05"),
+            ("{rex2} or $1, %bh", "80 cf 01"),
+            // As GNU as has them.
+            ("{rex2} mov %ah, %al", "88 e0"),
+            ("{rex2} mov %dh, (%rax)", "88 30"),
+            ("{rex2} mov (%rax), %dh", "8a 30"),
+            ("{rex2} inc %dh", "fe c6"),
+            ("{rex2} shl %cl, %dh", "d2 e6"),
+            ("{rex2} movzbl %dh, %eax", "0f b6 c6"),
+            ("{rex2} xchg %dh, %al", "86 f0"),
+            ("{rex2} setc %dh", "0f 92 c6"),
+            ("{rex2} neg %dh", "f6 de"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+        assert_eq!(
+            fail_msg("{rex2} mov %dh, %r16b"),
+            "can't encode register '%dh' in an instruction requiring REX/REX2 prefix"
+        );
+    }
+
+    /// A segment word and the segment of a string instruction's operand
+    /// are one prefix when they agree. (`fs movsb %fs:(%rsi), %es:(%rdi)`
+    /// was `64 64 a4`, and `cs movsb %fs:(%rsi), %es:(%rdi)` `2e 64 a4`.)
+    #[test]
+    fn a_segment_word_and_a_string_operand_s_segment() {
+        assert_eq!(hex("fs movsb %fs:(%rsi), %es:(%rdi)"), "64 a4");
+        assert_eq!(hex("fs movsb %ds:(%rsi), %es:(%rdi)"), "64 a4");
+        assert_eq!(hex("fs movsb"), "64 a4");
+        assert_eq!(hex("cs rep movsb"), "2e f3 a4");
+        assert_eq!(hex("movsb %fs:(%rsi), %es:(%rdi)"), "64 a4");
+        assert_eq!(
+            fail_msg("cs movsb %fs:(%rsi), %es:(%rdi)"),
+            "same type of prefix used twice"
+        );
+    }
+
+    /// `jmpabs` takes no size and no address override: the prefixes are
+    /// undefined opcodes in front of it. They were written.
+    #[test]
+    fn jmpabs_takes_no_override() {
+        assert_eq!(
+            hex("jmpabs $0x1122334455667788"),
+            "d5 00 a1 88 77 66 55 44 33 22 11"
+        );
+        assert_eq!(
+            hex("rex.b jmpabs $0x1122334455667788"),
+            "d5 01 a1 88 77 66 55 44 33 22 11"
+        );
+        assert_eq!(
+            hex("cs jmpabs $0x1122334455667788"),
+            "2e d5 00 a1 88 77 66 55 44 33 22 11"
+        );
+        for line in [
+            "rex.w jmpabs $0x1122334455667788",
+            "rex64 jmpabs $0x1122334455667788",
+            "data16 jmpabs $0x1122334455667788",
+        ] {
+            assert_eq!(
+                fail_msg(line),
+                "size override not allowed with `jmpabs'",
+                "{line}"
+            );
+        }
+        assert_eq!(
+            fail_msg("addr32 jmpabs $0x1122334455667788"),
+            "address override not allowed with `jmpabs'"
+        );
+    }
+
+    /// A prefix word in front of a direct branch is written. GNU as 2.47
+    /// leaves out all of these but the `cs` and `ds` of a jump ("skipping
+    /// prefixes on `call'", a warning); Clang 23.1.5 writes them, and so
+    /// does lccc: what the statement says is what is assembled.
+    #[test]
+    fn prefix_words_on_direct_branches_are_kept() {
+        for (line, bytes) in [
+            ("cs call foo", "2e e8 00 00 00 00"),
+            ("ds call foo", "3e e8 00 00 00 00"),
+            ("fs call foo", "64 e8 00 00 00 00"),
+            ("fs jmp foo", "64 e9 00 00 00 00"),
+            ("fs jne foo", "64 0f 85 00 00 00 00"),
+            ("addr32 jmp foo", "67 e9 00 00 00 00"),
+            ("addr32 call foo", "67 e8 00 00 00 00"),
+            // As GNU as has them.
+            ("cs jmp foo", "2e e9 00 00 00 00"),
+            ("cs jne foo", "2e 0f 85 00 00 00 00"),
+            ("rex64 jmp foo", "48 e9 00 00 00 00"),
+            ("rex64 call foo", "48 e8 00 00 00 00"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
     }
 }

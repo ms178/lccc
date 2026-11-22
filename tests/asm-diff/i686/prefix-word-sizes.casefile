@@ -1,0 +1,452 @@
+# The prefix words in 32-bit code, one statement a group, each held to GNU as
+# 2.47. `data16`/`addr16` are the 0x66/0x67 bytes and `data32`/`addr32` are
+# refused as "redundant". What lccc had wrong: a branch behind `data16` (the
+# displacement is 16 bits when it is not 8: `data16 jmp 1f; 1:` is 66 eb 00,
+# and `data16 jmp foo` is 66 e9 with an R_386_PC16), far branches behind
+# `data16` (66 ea, a 16-bit offset), `fwait` behind a prefix word (the word
+# first: 66 9b; in front of an x87 instruction the 9b goes first), and a bare
+# symbol behind `addr16` (16-bit absolute address, R_386_16) in the arms that
+# wrote the ModRM bytes themselves (`mov $imm, sym`).
+;;; addr16_nop
+.text
+addr16 nop
+;;; data16_nop
+.text
+data16 nop
+;;; addr32_nop reject
+.text
+addr32 nop
+;;; data32_nop reject
+.text
+data32 nop
+;;; data16_addl_eax_ebx
+.text
+data16 addl %eax, %ebx
+;;; data16_addw_ax_bx reject
+.text
+data16 addw %ax, %bx
+;;; addr16_movl_eax_0x1234
+.text
+addr16 movl %eax, 0x1234
+;;; addr16_movl_eax_ebx reject
+.text
+addr16 movl %eax, (%ebx)
+;;; addr16_movl_eax_bx
+.text
+addr16 movl %eax, (%bx)
+;;; data16_ret
+.text
+data16 ret
+;;; data16_lret
+.text
+data16 lret
+;;; data16_push_eax
+.text
+data16 push %eax
+;;; data16_pushl_eax
+.text
+data16 pushl %eax
+;;; data16_pushw_ax reject
+.text
+data16 pushw %ax
+;;; addr16_jecxz_1f_1
+.text
+addr16 jecxz 1f
+1:
+;;; addr16_loop_1f_1
+.text
+addr16 loop 1f
+1:
+;;; addr16_rep_movsb
+.text
+addr16 rep movsb
+;;; addr16_stosl
+.text
+addr16 stosl
+;;; addr16_lodsb
+.text
+addr16 lodsb
+;;; data16_jmp_1f_1
+.text
+data16 jmp 1f
+1:
+;;; data16_call_1f_1
+.text
+data16 call 1f
+1:
+;;; data16_jmp_foo
+.text
+data16 jmp foo
+;;; data16_call_foo
+.text
+data16 call foo
+;;; data16_ljmp_0x10_0x1234
+.text
+data16 ljmp $0x10, $0x1234
+;;; data16_lcall_0x10_0x1234
+.text
+data16 lcall $0x10, $0x1234
+;;; addr16_lgdtw_0x1234
+.text
+addr16 lgdtw 0x1234
+;;; data16_lidt_0x1234
+.text
+data16 lidt 0x1234
+;;; data16_lidtw_0x1234 reject
+.text
+data16 lidtw 0x1234
+;;; addr16_xlat
+.text
+addr16 xlat
+;;; data16_iret
+.text
+data16 iret
+;;; data16_pushf
+.text
+data16 pushf
+;;; data16_popf
+.text
+data16 popf
+;;; data16_pusha
+.text
+data16 pusha
+;;; data16_leave
+.text
+data16 leave
+;;; data16_cwtl
+.text
+data16 cwtl
+;;; data16_cltd
+.text
+data16 cltd
+;;; addr16_mov_0x1234_al
+.text
+addr16 mov 0x1234, %al
+;;; addr16_mov_ax_0x1234
+.text
+addr16 mov %ax, 0x1234
+;;; addr16_jmp_0x1234
+.text
+addr16 jmp *0x1234
+;;; data16_movl_0x12345678_eax
+.text
+data16 movl $0x12345678, %eax
+;;; data16_mov_0x1234_ax reject
+.text
+data16 mov $0x1234, %ax
+;;; data16_lock_addl_eax_ebx
+.text
+data16 lock addl %eax, (%ebx)
+;;; lock_data16_addl_eax_ebx
+.text
+lock data16 addl %eax, (%ebx)
+;;; data16_addr16_addl_eax_bx
+.text
+data16 addr16 addl %eax, (%bx)
+;;; addr16_data16_addl_eax_0x1234
+.text
+addr16 data16 addl %eax, 0x1234
+;;; data16_vaddps_xmm1_xmm2_xmm3 reject
+.text
+data16 vaddps %xmm1, %xmm2, %xmm3
+;;; data16_movd_eax_xmm1 reject
+.text
+data16 movd %eax, %xmm1
+;;; data16_jne_1f_1
+.text
+data16 jne 1f
+1:
+;;; data16_jne_foo
+.text
+data16 jne foo
+;;; data16_lea_ebx_eax
+.text
+data16 lea (%ebx), %eax
+;;; addr16_lea_ebx_eax reject
+.text
+addr16 lea (%ebx), %eax
+;;; addr16_lea_0x1234_eax
+.text
+addr16 lea 0x1234, %eax
+;;; data16_in_5_eax
+.text
+data16 in $5, %eax
+;;; data16_movsl
+.text
+data16 movsl
+;;; data16_rep_movsl
+.text
+data16 rep movsl
+;;; data16_enter_8_0
+.text
+data16 enter $8, $0
+;;; data16_pop_eax
+.text
+data16 pop %eax
+;;; data16_inc_eax
+.text
+data16 inc %eax
+;;; data16_xchg_eax_ebx
+.text
+data16 xchg %eax, %ebx
+;;; data16_fwait
+.text
+data16 fwait
+;;; data16_fnstsw_ax
+.text
+data16 fnstsw %ax
+;;; data16_bswap_eax
+.text
+data16 bswap %eax
+;;; data16_cmpxchg_eax_ebx
+.text
+data16 cmpxchg %eax, (%ebx)
+;;; data16_movzbl_al_eax
+.text
+data16 movzbl %al, %eax
+;;; data16_imul_5_eax_ebx
+.text
+data16 imul $5, %eax, %ebx
+;;; data16_test_0x12345678_eax
+.text
+data16 test $0x12345678, %eax
+;;; data16_mov_eax_cr0
+.text
+data16 mov %eax, %cr0
+;;; data16_mov_ds_eax
+.text
+data16 mov %ds, %eax
+;;; data16_mov_eax_ds
+.text
+data16 mov %eax, %ds
+;;; data16_int_0x80
+.text
+data16 int $0x80
+;;; data16_hlt
+.text
+data16 hlt
+;;; data16_sysenter
+.text
+data16 sysenter
+;;; data16_cpuid
+.text
+data16 cpuid
+;;; addr16_addl_ebx_sym
+.text
+addr16 addl %ebx, sym
+;;; addr16_addl_ebx_0x1234
+.text
+addr16 addl %ebx, 0x1234
+;;; addr16_movl_eax_sym
+.text
+addr16 movl %eax, sym
+;;; addr16_movl_sym_ebx
+.text
+addr16 movl sym, %ebx
+;;; addr16_pushl_sym
+.text
+addr16 pushl sym
+;;; addr16_incl_sym
+.text
+addr16 incl sym
+;;; addr16_call_sym
+.text
+addr16 call *sym
+;;; addr16_jmp_sym
+.text
+addr16 jmp *sym
+;;; addr16_ljmp_sym
+.text
+addr16 ljmp *sym
+;;; addr16_lgdt_sym
+.text
+addr16 lgdt sym
+;;; addr16_cmpl_5_sym
+.text
+addr16 cmpl $5, sym
+;;; addr16_movb_5_sym
+.text
+addr16 movb $5, sym
+;;; addr16_lea_sym_eax
+.text
+addr16 lea sym, %eax
+;;; addr16_lea_1_eax
+.text
+addr16 lea 1, %eax
+;;; addr16_lea_sym_4_eax
+.text
+addr16 lea sym+4, %eax
+;;; addr16_fldl_sym
+.text
+addr16 fldl sym
+;;; addr16_movss_sym_xmm0
+.text
+addr16 movss sym, %xmm0
+;;; addr16_movss_0x1234_xmm0
+.text
+addr16 movss 0x1234, %xmm0
+;;; addr16_vmovss_sym_xmm0
+.text
+addr16 vmovss sym, %xmm0
+;;; addr16_vmovss_0x1234_xmm0
+.text
+addr16 vmovss 0x1234, %xmm0
+;;; data16_ljmpw_0x10_0x1234 reject
+.text
+data16 ljmpw $0x10, $0x1234
+;;; data16_ljmpl_0x10_0x1234
+.text
+data16 ljmpl $0x10, $0x1234
+;;; data16_lcallw_0x10_0x1234 reject
+.text
+data16 lcallw $0x10, $0x1234
+;;; data16_lcalll_0x10_0x1234
+.text
+data16 lcalll $0x10, $0x1234
+;;; data16_calll_foo
+.text
+data16 calll foo
+;;; data16_callw_foo reject
+.text
+data16 callw foo
+;;; data16_jmp_eax
+.text
+data16 jmp *%eax
+;;; data16_jmp_eax_2
+.text
+data16 jmp *(%eax)
+;;; data16_call_eax
+.text
+data16 call *%eax
+;;; data16_retw reject
+.text
+data16 retw
+;;; data16_retl
+.text
+data16 retl
+;;; data16_lretw reject
+.text
+data16 lretw
+;;; data16_iretw reject
+.text
+data16 iretw
+;;; data16_jmp_1f_skip_200_1
+.text
+data16 jmp 1f
+.skip 200
+1:
+;;; data16_jne_1f_skip_200_1
+.text
+data16 jne 1f
+.skip 200
+1:
+;;; jmp_1f_skip_200_1
+.text
+jmp 1f
+.skip 200
+1:
+;;; data16_jmp_1f_skip_100_1
+.text
+data16 jmp 1f
+.skip 100
+1:
+;;; data16_jne_1f_skip_127_1
+.text
+data16 jne 1f
+.skip 127
+1:
+;;; data16_jne_1f_skip_128_1
+.text
+data16 jne 1f
+.skip 128
+1:
+;;; data16_fstcw_eax
+.text
+data16 fstcw (%eax)
+;;; data16_fstsw_ax
+.text
+data16 fstsw %ax
+;;; data16_fsave_eax
+.text
+data16 fsave (%eax)
+;;; data16_fnsave_eax
+.text
+data16 fnsave (%eax)
+;;; data16_finit
+.text
+data16 finit
+;;; data16_fclex
+.text
+data16 fclex
+;;; data16_wait
+.text
+data16 wait
+;;; addr16_fstcw_bx
+.text
+addr16 fstcw (%bx)
+;;; addr16_fwait
+.text
+addr16 fwait
+;;; data16_addr16_fstcw_bx
+.text
+data16 addr16 fstcw (%bx)
+;;; data16_fstenv_eax
+.text
+data16 fstenv (%eax)
+;;; addr16_monitor_ax_ecx_edx reject
+.text
+addr16 monitor %ax, %ecx, %edx
+;;; addr16_monitor_eax_ecx_edx
+.text
+addr16 monitor %eax, %ecx, %edx
+;;; addr16_umonitor_ax reject
+.text
+addr16 umonitor %ax
+;;; addr16_umonitor_eax
+.text
+addr16 umonitor %eax
+;;; addr16_jcxz_1f_1 reject
+.text
+addr16 jcxz 1f
+1:
+;;; addr16_loopw_1f_1 reject
+.text
+addr16 loopw 1f
+1:
+;;; addr16_loopl_1f_1
+.text
+addr16 loopl 1f
+1:
+;;; addr16_movsb_esi_es_edi reject
+.text
+addr16 movsb (%esi), %es:(%edi)
+;;; addr16_movsb_si_es_di
+.text
+addr16 movsb (%si), %es:(%di)
+;;; data16_jmp_foo_plt reject
+.text
+data16 jmp foo@PLT
+;;; data16_call_foo_plt reject
+.text
+data16 call foo@PLT
+;;; data16_jne_foo_plt reject
+.text
+data16 jne foo@PLT
+;;; addr16_movl_eax_sym_4
+.text
+addr16 movl %eax, sym+4
+;;; addr16_movl_eax_fs_sym
+.text
+addr16 movl %eax, %fs:sym
+;;; addr16_movl_eax_es_0x1234
+.text
+addr16 movl %eax, %es:0x1234
+;;; addr16_pushl_0x1234
+.text
+addr16 pushl 0x1234
+;;; addr16_addl_5_bx_si
+.text
+addr16 addl $5, (%bx,%si)
+;;; addr16_addl_5_4_bp
+.text
+addr16 addl $5, 4(%bp)

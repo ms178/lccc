@@ -548,12 +548,9 @@ impl super::InstructionEncoder {
         ops: &[Operand],
         mnemonic: &str,
     ) -> Result<(), String> {
-        let check_imm_u32 = |v: &i64| -> Result<(), String> {
-            if !(0..=0xFFFF_FFFFu64 as i64).contains(v) {
-                return Err(format!("operand type mismatch for `{mnemonic}'"));
-            }
-            Ok(())
-        };
+        // The immediate forms of `urdmsr`/`uwrmsr` come back in here under
+        // an inner name; a message names what was written.
+        let written = mnemonic.strip_suffix("_imm").unwrap_or(mnemonic);
         match mnemonic {
             // ---- 2-register forms ----
             "urdmsr" | "uwrmsr" => {
@@ -651,7 +648,7 @@ impl super::InstructionEncoder {
                     }
                     "wrmsrns" | "uwrmsr_imm" => {
                         let [a, b] = ops else {
-                            return Err(format!("number of operands mismatch for `{mnemonic}'"));
+                            return Err(format!("number of operands mismatch for `{written}'"));
                         };
                         (b, a, 0xF6, 2)
                     }
@@ -665,12 +662,23 @@ impl super::InstructionEncoder {
                     opcode
                 };
                 let reg = Self::msr_gp64(reg_op)
-                    .ok_or_else(|| format!("operand size mismatch for `{mnemonic}'"))?;
-                let imm = match imm_op {
-                    Operand::Immediate(ImmediateValue::Integer(v)) => *v,
-                    _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
+                    .ok_or_else(|| format!("operand size mismatch for `{written}'"))?;
+                // The MSR number is an unsigned 32-bit field: a number in
+                // 0..=0xFFFFFFFF, or a symbol with `R_X86_64_32` (GNU as
+                // 2.47: `urdmsr $msr_index, %rcx` is `c4 e7 7b f8 c1` and
+                // four relocated bytes; it used to be refused).
+                let (imm, symbol) = match imm_op {
+                    Operand::Immediate(ImmediateValue::Integer(v))
+                        if (0..=i64::from(u32::MAX)).contains(v) =>
+                    {
+                        (*v as u32, None)
+                    }
+                    Operand::Immediate(ImmediateValue::Symbol(sym)) => (0, Some((sym, 0))),
+                    Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, addend)) => {
+                        (0, Some((sym, *addend)))
+                    }
+                    _ => return Err(format!("operand type mismatch for `{written}'")),
                 };
-                check_imm_u32(&imm)?;
                 let r = gp_id(reg).unwrap();
                 if Self::msr_is_egpr(reg) {
                     // EVEX m7: reg field 0, rm = destination, B/B4 ext.
@@ -699,10 +707,94 @@ impl super::InstructionEncoder {
                     self.bytes.push(opcode);
                     self.bytes.push(self.modrm(3, 0, (r & 7) as u8));
                 }
-                self.bytes.extend_from_slice(&(imm as u32).to_le_bytes());
+                if let Some((sym, addend)) = symbol {
+                    self.add_relocation(sym, R_X86_64_32, addend);
+                }
+                self.bytes.extend_from_slice(&imm.to_le_bytes());
                 Ok(())
             }
             _ => Err(format!("not a user-msr mnemonic: {mnemonic}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod user_msr_tests {
+    use super::super::apx_tests::{fail_msg, hex, hex_relocs};
+    use super::*;
+
+    /// Bytes of GNU as 2.47 (`as --64`).
+    #[test]
+    fn register_and_number_forms() {
+        assert_eq!(hex("urdmsr %rax, %rcx"), "f2 0f 38 f8 c1");
+        assert_eq!(hex("uwrmsr %rcx, %rax"), "f3 0f 38 f8 c1");
+        assert_eq!(hex("urdmsr $0x1234, %rcx"), "c4 e7 7b f8 c1 34 12 00 00");
+        assert_eq!(hex("uwrmsr %rcx, $0x1234"), "c4 e7 7a f8 c1 34 12 00 00");
+        assert_eq!(hex("wrmsrns %rcx, $0x1234"), "c4 e7 7a f6 c1 34 12 00 00");
+        assert_eq!(hex("rdmsr $0x1234, %rcx"), "c4 e7 7b f6 c1 34 12 00 00");
+        assert_eq!(
+            hex("urdmsr $0xffffffff, %rcx"),
+            "c4 e7 7b f8 c1 ff ff ff ff"
+        );
+    }
+
+    /// The MSR number may be a symbol: an unsigned 32-bit field with
+    /// `R_X86_64_32`, in the VEX and in the EVEX form (`%r16`..`%r31`).
+    /// All of these were "operand type mismatch".
+    #[test]
+    fn msr_number_as_a_symbol() {
+        for (line, bytes) in [
+            ("urdmsr $ext, %rcx", "c4 e7 7b f8 c1 00 00 00 00"),
+            ("uwrmsr %rcx, $ext", "c4 e7 7a f8 c1 00 00 00 00"),
+            ("wrmsrns %rcx, $ext", "c4 e7 7a f6 c1 00 00 00 00"),
+            ("rdmsr $ext, %rcx", "c4 e7 7b f6 c1 00 00 00 00"),
+            ("urdmsr $ext+4, %r9", "c4 c7 7b f8 c1 00 00 00 00"),
+            ("wrmsrns %r17, $ext", "62 ff 7e 08 f6 c1 00 00 00 00"),
+            ("rdmsr $ext, %r31", "62 df 7f 08 f6 c7 00 00 00 00"),
+        ] {
+            assert_eq!(
+                hex_relocs(line),
+                (bytes.to_string(), vec![R_X86_64_32]),
+                "{line}"
+            );
+        }
+    }
+
+    /// The relocation sits on the four bytes of the number and carries the
+    /// addend that was written.
+    #[test]
+    fn msr_symbol_relocation_place_and_addend() {
+        let items = parse_asm("urdmsr $ext+4, %r9").unwrap();
+        let mut encoder = InstructionEncoder::new();
+        for item in items {
+            if let AsmItem::Instruction(instruction) = item {
+                encoder.encode(&instruction).unwrap();
+            }
+        }
+        let [relocation] = encoder.relocations.as_slice() else {
+            panic!("one relocation expected, got {}", encoder.relocations.len());
+        };
+        assert_eq!(relocation.offset, 5);
+        assert_eq!(relocation.addend, 4);
+        assert_eq!(relocation.symbol, "ext");
+    }
+
+    /// A number outside 0..=0xFFFFFFFF is refused, and the message names
+    /// the mnemonic that was written (it said `urdmsr_imm').
+    #[test]
+    fn refused_numbers_name_the_mnemonic_written() {
+        for (line, mnemonic) in [
+            ("urdmsr $-1, %rcx", "urdmsr"),
+            ("urdmsr $0x100000000, %rcx", "urdmsr"),
+            ("uwrmsr %rcx, $-1", "uwrmsr"),
+            ("wrmsrns %rcx, $0x100000000", "wrmsrns"),
+            ("rdmsr $-1, %rcx", "rdmsr"),
+        ] {
+            assert_eq!(
+                fail_msg(line),
+                format!("operand type mismatch for `{mnemonic}'"),
+                "{line}"
+            );
         }
     }
 }

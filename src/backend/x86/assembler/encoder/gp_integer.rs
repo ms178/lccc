@@ -488,6 +488,22 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
+    /// `movabs` with a size suffix: a register of that size, and for all
+    /// but `q` the accumulator at an address (only `movabsq` loads a
+    /// number).
+    pub(crate) fn encode_movabs_sized(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
+        let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        Self::check_operand_size(mnemonic, ops, size)?;
+        if size != 8 && ops.iter().any(|op| matches!(op, Operand::Immediate(_))) {
+            return Err(format!("operand type mismatch for `{mnemonic}'"));
+        }
+        self.encode_movabs(ops)
+    }
+
     pub(crate) fn encode_movabs(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("movabsq requires 2 operands".to_string());

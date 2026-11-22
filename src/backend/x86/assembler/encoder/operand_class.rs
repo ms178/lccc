@@ -45,7 +45,7 @@
 //! the statements GNU as refuses and an encoder here assembles.
 
 use super::vector_widths::{OPCODES, SHAPES};
-use crate::backend::x86::assembler::parser::{Instruction, Operand};
+use crate::backend::x86::assembler::parser::{Instruction, Operand, rex_prefix_word};
 
 const G8: u32 = 1 << 0;
 const G16: u32 = 1 << 1;
@@ -254,6 +254,9 @@ struct Encoded {
     wide: bool,
     /// A REX or a REX2 prefix stands in front of the opcode.
     extended: bool,
+    /// And it extends the register in the opcode byte or the `r/m` field:
+    /// `B`, or one of REX2's two.
+    extends_base: bool,
     /// An operand-size prefix `66` is among the prefixes, whatever else is
     /// (`popcnt %cx, %dx` is `66 F3 0F B8`); of an APX instruction, the
     /// `66` its EVEX prefix stands for.
@@ -296,9 +299,11 @@ fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
     let mut first = *bytes.get(at)?;
     let mut wide = false;
     let mut extended = false;
+    let mut extends_base = false;
     if long && (0x40..=0x4F).contains(&first) {
         wide = first & 0x08 != 0;
         extended = true;
+        extends_base = first & 0x01 != 0;
         at += 1;
         first = *bytes.get(at)?;
     }
@@ -321,6 +326,8 @@ fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
             };
             wide = second? & 0x08 != 0;
             extended = true;
+            // `B3` and `B4`.
+            extends_base = second? & 0x11 != 0;
             (space, at + 2, prefix, false)
         }
         0x62 if vex => {
@@ -364,6 +371,7 @@ fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
                     evex: false,
                     wide,
                     extended,
+                    extends_base,
                     data16,
                     modrm: 0,
                 });
@@ -379,6 +387,7 @@ fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
         evex,
         wide,
         extended,
+        extends_base,
         // A VEX, EVEX or XOP prefix has the `66` in its `pp` field.
         data16: match space {
             Space::Vex(_) | Space::Xop(_) => prefix == PREFIX_66,
@@ -492,9 +501,12 @@ fn general_width(encoded: &Encoded, code: Code) -> Option<u32> {
         (Space::One, 0x50..=0x5F) => by_stack,
         (Space::One, 0x8F) if extension == 0 => by_stack,
         // The accumulator exchanged with itself is `nop`, and `xchg %rax,
-        // %rax` is written as that: `90` and nothing in front. (`41 90` is
-        // `xchg %r8d, %eax`.)
-        (Space::One, 0x90) if code == Code::Bits64 && !wide && !data16 && !encoded.extended => {
+        // %rax` is written as that: `90`, behind no prefix that makes
+        // another register of it (`41 90` is `xchg %r8d, %eax`) -- one
+        // that does not may stand there (`rex xchg %rax, %rax` is `40 90`
+        // and `{rex2} xchg %rax, %rax` is `d5 00 90`; both were refused
+        // for the 32 bits of an `xchg` without `W`).
+        (Space::One, 0x90) if code == Code::Bits64 && !wide && !data16 && !encoded.extends_base => {
             G32 | G64
         }
         // `imul` by a number, `lea`, `xchg` with the accumulator.
@@ -622,13 +634,14 @@ fn without_count(operands: &[Operand]) -> &[Operand] {
 
 /// Whether a prefix written as a word in front of the statement sets its
 /// operand size: `data16 addl %eax, %ebx` is `66 01 C3`, and `rex64 cmova
-/// %eax, %ebx` is `48 0F 47 D8`. The registers of such a statement are as
-/// wide as the statement without the word.
+/// %eax, %ebx` is `48 0F 47 D8` (as is any REX word that sets W: `rex.w`,
+/// `rex64z`). The registers of such a statement are as wide as the
+/// statement without the word.
 fn sized_by_word(instr: &Instruction) -> bool {
-    instr
-        .prefixes
-        .iter()
-        .any(|word| matches!(word.as_str(), "data16" | "data32" | "rex64"))
+    instr.prefixes.iter().any(|word| {
+        matches!(word.as_str(), "data16" | "data32")
+            || rex_prefix_word(word).is_some_and(|byte| byte & 0x08 != 0)
+    })
 }
 
 /// The kinds of register the opcode can address, in 64-bit code (`long`)

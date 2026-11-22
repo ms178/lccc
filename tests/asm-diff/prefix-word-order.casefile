@@ -1,0 +1,704 @@
+# Prefix words and encoding requests in front of an instruction, one statement
+# a group, each held to GNU as 2.47.
+#
+# * In any order: GNU as reads `{rex2}`, `{evex}`, `{nooptimize}` and the
+#   prefix words in one loop. A prefix word behind a request was "no such
+#   instruction" (`{rex2} lock addl $1, (%rax)`, `{nooptimize} rep movsb`).
+# * A prefix word that is the whole statement is its byte: `lock` and the
+#   `rep`s were, the others were refused (`rex64`, which GCC writes on the
+#   line in front of the `call` of a TLS sequence, `data16`, `cs`).
+# * `lock` in front of an EVEX encoding is refused: the APX forms of the
+#   lockable instructions are not lockable (lccc wrote `f0 62 ..`, an
+#   undefined opcode).
+# * `data16` in front of a REX2 prefix is the 0x66 in front of it (it was
+#   "same type of prefix used twice").
+# * `jmpabs` takes no size and no address override (they were written).
+# * A segment word and a string instruction's own segment are one prefix.
+# * A jump to a label behind a `cs`, `ds` or REX word is relaxed with the
+#   word in front (`cs jmp 1f; 1:` is 2e eb 00; it kept its near form).
+#
+# Not here, because lccc does not follow GNU as: a prefix word GNU as leaves
+# out of a direct branch with a warning ("skipping prefixes on `call'": any
+# segment word on `call`, `fs`/`gs`/`addr32` on `jmp` and `jcc`), which lccc
+# writes, as Clang does; `data16` and the REX words in front of an APX EVEX
+# encoding, which GNU as folds into the prefix and lccc refuses. The
+# encoder's unit tests (`prefix_word_tests`) pin those.
+;;; xchg_rax_rax
+.text
+xchg %rax, %rax
+;;; xchg_eax_eax
+.text
+xchg %eax, %eax
+;;; xchg_ax_ax
+.text
+xchg %ax, %ax
+;;; rex2_xchg_rax_rax
+.text
+{rex2} xchg %rax, %rax
+;;; rex2_xchg_ax_ax
+.text
+{rex2} xchg %ax, %ax
+;;; rex2_xchg_rax_rcx
+.text
+{rex2} xchg %rax, %rcx
+;;; rex2_xchg_r8_rax
+.text
+{rex2} xchg %r8, %rax
+;;; rex2_xchg_eax_r8d
+.text
+{rex2} xchg %eax, %r8d
+;;; rex2_xchgq_rax_rax
+.text
+{rex2} xchgq %rax, %rax
+;;; rex2_lock_addl_1_rax
+.text
+{rex2} lock addl $1, (%rax)
+;;; lock_rex2_addl_1_rax
+.text
+lock {rex2} addl $1, (%rax)
+;;; evex_lock_addl_1_rax reject
+.text
+{evex} lock addl $1, (%rax)
+;;; lock_evex_addl_1_rax reject
+.text
+lock {evex} addl $1, (%rax)
+;;; nf_lock_addl_1_rax reject
+.text
+{nf} lock addl $1, (%rax)
+;;; nooptimize_lock_addl_1_rax
+.text
+{nooptimize} lock addl $1, (%rax)
+;;; nooptimize_rep_movsb
+.text
+{nooptimize} rep movsb
+;;; nooptimize_rep_stosq
+.text
+{nooptimize} rep stosq
+;;; rex2_rep_stosb reject
+.text
+{rex2} rep stosb
+;;; rex2_stosb reject
+.text
+{rex2} stosb
+;;; rex2_stosq reject
+.text
+{rex2} stosq
+;;; rex2_lodsb reject
+.text
+{rex2} lodsb
+;;; rex2_scasb reject
+.text
+{rex2} scasb
+;;; rex2_cmpsb reject
+.text
+{rex2} cmpsb
+;;; rex2_movsq reject
+.text
+{rex2} movsq
+;;; rex2_insb
+.text
+{rex2} insb
+;;; rex2_outsb
+.text
+{rex2} outsb
+;;; rex2_repz_cmpsb reject
+.text
+{rex2} repz cmpsb
+;;; rex2_data16_nop
+.text
+{rex2} data16 nop
+;;; rex2_addr32_nop
+.text
+{rex2} addr32 nop
+;;; data16_rex2_nop
+.text
+data16 {rex2} nop
+;;; rex2_cs_nop
+.text
+{rex2} cs nop
+;;; rex2_notrack_jmp_rax
+.text
+{rex2} notrack jmp *%rax
+;;; rex2_bnd_jmp_rax reject
+.text
+{rex2} bnd jmp *%rax
+;;; rex2_xacquire_lock_addl_1_rax
+.text
+{rex2} xacquire lock addl $1, (%rax)
+;;; rex2_rex_nop
+.text
+{rex2} rex nop
+;;; rex2_rex_w_nop
+.text
+{rex2} rex.w nop
+;;; vex_lock_nop reject
+.text
+{vex} lock nop
+;;; evex_rep_movsb reject
+.text
+{evex} rep movsb
+;;; vex3_cs_vaddps_rax_xmm1_xmm2
+.text
+{vex3} cs vaddps (%rax), %xmm1, %xmm2
+;;; evex_cs_vaddps_rax_xmm1_xmm2
+.text
+{evex} cs vaddps (%rax), %xmm1, %xmm2
+;;; evex_addr32_vaddps_eax_xmm1_xmm2
+.text
+{evex} addr32 vaddps (%eax), %xmm1, %xmm2
+;;; vex_addr32_vaddps_eax_xmm1_xmm2
+.text
+{vex} addr32 vaddps (%eax), %xmm1, %xmm2
+;;; rex2_es_movsb reject
+.text
+{rex2} es movsb
+;;; nooptimize_cs_mov_1_rax
+.text
+{nooptimize} cs mov $1, %rax
+;;; nooptimize_data16_nop
+.text
+{nooptimize} data16 nop
+;;; rex2_wait
+.text
+{rex2} wait
+;;; rex2_fwait
+.text
+{rex2} fwait
+;;; rex2_fsave_rax
+.text
+{rex2} fsave (%rax)
+;;; rex2_lcall_rax
+.text
+{rex2} lcall *(%rax)
+;;; rex2_ljmp_rax
+.text
+{rex2} ljmp *(%rax)
+;;; rex2_call_foo reject
+.text
+{rex2} call foo
+;;; rex2_callq_rax
+.text
+{rex2} callq *%rax
+;;; lock_nf_addl_1_rax reject
+.text
+lock {nf} addl $1, (%rax)
+;;; lock_addl_1_rax_ebx reject
+.text
+lock addl $1, (%rax), %ebx
+;;; lock_addl_ecx_rax_ebx reject
+.text
+lock addl %ecx, (%rax), %ebx
+;;; lock_addl_1_r16
+.text
+lock addl $1, (%r16)
+;;; lock_addl_r16d_rax
+.text
+lock addl %r16d, (%rax)
+;;; lock_evex_xchg_eax_rbx reject
+.text
+lock {evex} xchg %eax, (%rbx)
+;;; lock_evex_incl_rax reject
+.text
+lock {evex} incl (%rax)
+;;; lock_incl_rax_ebx reject
+.text
+lock incl (%rax), %ebx
+;;; lock_nf_incl_rax reject
+.text
+lock {nf} incl (%rax)
+;;; lock_evex_cmpxchg_eax_rbx reject
+.text
+lock {evex} cmpxchg %eax, (%rbx)
+;;; lock_evex_btsl_1_rax reject
+.text
+lock {evex} btsl $1, (%rax)
+;;; lock_evex_xaddl_eax_rbx reject
+.text
+lock {evex} xaddl %eax, (%rbx)
+;;; lock_evex_negl_rax reject
+.text
+lock {evex} negl (%rax)
+;;; lock_negl_rax_ebx reject
+.text
+lock negl (%rax), %ebx
+;;; lock_evex_notl_rax reject
+.text
+lock {evex} notl (%rax)
+;;; lock_notl_rax_ebx reject
+.text
+lock notl (%rax), %ebx
+;;; lock_evex_andl_eax_rbx reject
+.text
+lock {evex} andl %eax, (%rbx)
+;;; lock_evex_subl_1_rax reject
+.text
+lock {evex} subl $1, (%rax)
+;;; lock_evex_adcl_1_rax reject
+.text
+lock {evex} adcl $1, (%rax)
+;;; lock_evex_sbbl_1_rax reject
+.text
+lock {evex} sbbl $1, (%rax)
+;;; lock_evex_orl_1_rax reject
+.text
+lock {evex} orl $1, (%rax)
+;;; lock_evex_xorl_1_rax reject
+.text
+lock {evex} xorl $1, (%rax)
+;;; lock_evex_decl_rax reject
+.text
+lock {evex} decl (%rax)
+;;; lock_nf_decl_rax reject
+.text
+lock {nf} decl (%rax)
+;;; xacquire_lock_evex_addl_1_rax reject
+.text
+xacquire lock {evex} addl $1, (%rax)
+;;; xrelease_evex_movl_1_rax reject
+.text
+xrelease {evex} movl $1, (%rax)
+;;; xrelease_movl_1_rax
+.text
+xrelease movl $1, (%rax)
+;;; lock_rex2_xchg_eax_rbx
+.text
+lock {rex2} xchg %eax, (%rbx)
+;;; lock_rex2_cmpxchg_eax_rbx
+.text
+lock {rex2} cmpxchg %eax, (%rbx)
+;;; lock_rex2_cmpxchg16b_rax
+.text
+lock {rex2} cmpxchg16b (%rax)
+;;; lock_rex2_btsl_1_rax
+.text
+lock {rex2} btsl $1, (%rax)
+;;; lock_rex2_xaddl_eax_rbx
+.text
+lock {rex2} xaddl %eax, (%rbx)
+;;; lock_cmpxchg_eax_r16
+.text
+lock cmpxchg %eax, (%r16)
+;;; lock_xaddl_r17d_rbx
+.text
+lock xaddl %r17d, (%rbx)
+;;; lock_btsl_1_r20
+.text
+lock btsl $1, (%r20)
+;;; rep_evex_movsb reject
+.text
+rep {evex} movsb
+;;; rep_nf_addl_1_rax reject
+.text
+rep {nf} addl $1, (%rax)
+;;; repne_evex_addl_1_rax reject
+.text
+repne {evex} addl $1, (%rax)
+;;; data16_rex2_addl_eax_ebx
+.text
+data16 {rex2} addl %eax, %ebx
+;;; data16_rex2_mov_eax_ebx
+.text
+data16 {rex2} mov %eax, %ebx
+;;; data16_rex2_push_rax
+.text
+data16 {rex2} push %rax
+;;; data16_rex2_movaps_xmm0_xmm1 reject
+.text
+data16 {rex2} movaps %xmm0, %xmm1
+;;; data16_rex2_addw_ax_bx reject
+.text
+data16 {rex2} addw %ax, %bx
+;;; data16_addl_r16d_ebx
+.text
+data16 addl %r16d, %ebx
+;;; data16_addl_eax_r16
+.text
+data16 addl %eax, (%r16)
+;;; data16_nop
+.text
+data16 nop
+;;; data16_addl_eax_ebx
+.text
+data16 addl %eax, %ebx
+;;; rex64_rex2_nop
+.text
+rex64 {rex2} nop
+;;; rex_rex2_nop
+.text
+rex {rex2} nop
+;;; rex_w_rex2_mov_eax_ebx
+.text
+rex.w {rex2} mov %eax, %ebx
+;;; rex64_addl_r16d_ebx
+.text
+rex64 addl %r16d, %ebx
+;;; addr32_evex_addl_eax_ebx
+.text
+addr32 {evex} addl %eax, (%ebx)
+;;; addr32_rex2_addl_eax_ebx
+.text
+addr32 {rex2} addl %eax, (%ebx)
+;;; cs_evex_addl_eax_rbx
+.text
+cs {evex} addl %eax, (%rbx)
+;;; notrack_rex2_jmp_rax
+.text
+notrack {rex2} jmp *%rax
+;;; notrack_jmp_r16
+.text
+notrack jmp *%r16
+;;; cs_nop
+.text
+cs nop
+;;; ds_nop
+.text
+ds nop
+;;; fs_nop
+.text
+fs nop
+;;; gs_nop
+.text
+gs nop
+;;; cs_mov_eax_rbx
+.text
+cs mov %eax, (%rbx)
+;;; cs_mov_eax_ds_rbx
+.text
+cs mov %eax, %ds:(%rbx)
+;;; cs_mov_eax_ss_rbp
+.text
+cs mov %eax, %ss:(%rbp)
+;;; ds_mov_eax_rbx
+.text
+ds mov %eax, (%rbx)
+;;; cs_mov_eax_cs_rbx
+.text
+cs mov %eax, %cs:(%rbx)
+;;; cs_mov_eax_fs_rbx reject
+.text
+cs mov %eax, %fs:(%rbx)
+;;; fs_mov_eax_fs_rbx
+.text
+fs mov %eax, %fs:(%rbx)
+;;; cs_cs_nop reject
+.text
+cs cs nop
+;;; cs_ds_nop reject
+.text
+cs ds nop
+;;; cs_rep_movsb
+.text
+cs rep movsb
+;;; rep_cs_movsb
+.text
+rep cs movsb
+;;; fs_movsb_ds_rsi_es_rdi
+.text
+fs movsb %ds:(%rsi), %es:(%rdi)
+;;; fs_movsb_fs_rsi_es_rdi
+.text
+fs movsb %fs:(%rsi), %es:(%rdi)
+;;; cs_movsb_fs_rsi_es_rdi reject
+.text
+cs movsb %fs:(%rsi), %es:(%rdi)
+;;; cs_lodsb
+.text
+cs lodsb
+;;; cs_xlat
+.text
+cs xlat
+;;; lock_cs_addl_1_rax
+.text
+lock cs addl $1, (%rax)
+;;; cs_lock_addl_1_rax
+.text
+cs lock addl $1, (%rax)
+;;; xacquire_lock_cs_addl_1_rax
+.text
+xacquire lock cs addl $1, (%rax)
+;;; cs_data16_nop
+.text
+cs data16 nop
+;;; data16_cs_nop
+.text
+data16 cs nop
+;;; cs_addr32_nop
+.text
+cs addr32 nop
+;;; cs_fwait
+.text
+cs fwait
+;;; cs_fstcw_rax
+.text
+cs fstcw (%rax)
+;;; cs_fnstcw_rax
+.text
+cs fnstcw (%rax)
+;;; cs_fsave_rax
+.text
+cs fsave (%rax)
+;;; cs_vaddps_rax_xmm1_xmm2
+.text
+cs vaddps (%rax), %xmm1, %xmm2
+;;; cs_evex_vaddps_rax_xmm1_xmm2
+.text
+cs {evex} vaddps (%rax), %xmm1, %xmm2
+;;; cs_movaps_rax_xmm1
+.text
+cs movaps (%rax), %xmm1
+;;; cs_jmp_1f_1
+.text
+cs jmp 1f
+1:
+;;; cs_jne_1f_1
+.text
+cs jne 1f
+1:
+;;; ds_jne_1f_1
+.text
+ds jne 1f
+1:
+;;; cs_jmp_foo
+.text
+cs jmp foo
+;;; cs_jne_foo
+.text
+cs jne foo
+;;; lock_jmp_foo reject
+.text
+lock jmp foo
+;;; rep_jmp_foo reject
+.text
+rep jmp foo
+;;; rep_call_foo reject
+.text
+rep call foo
+;;; rex64_jmp_foo
+.text
+rex64 jmp foo
+;;; rex64_call_foo
+.text
+rex64 call foo
+;;; rex_jne_foo
+.text
+rex jne foo
+;;; cs_ret
+.text
+cs ret
+;;; cs_push_rax
+.text
+cs push %rax
+;;; cs_jmp_rax
+.text
+cs jmp *%rax
+;;; cs_call_rax
+.text
+cs call *%rax
+;;; cs_jmp_rax_2
+.text
+cs jmp *(%rax)
+;;; cs_ljmp_rax
+.text
+cs ljmp *(%rax)
+;;; cs_lgdt_rax
+.text
+cs lgdt (%rax)
+;;; notrack_jmp_rax
+.text
+notrack jmp *%rax
+;;; notrack_call_rax
+.text
+notrack call *%rax
+;;; notrack_jmp_rax_2
+.text
+notrack jmp *(%rax)
+;;; notrack_nop reject
+.text
+notrack nop
+;;; notrack_jmp_1f_1 reject
+.text
+notrack jmp 1f
+1:
+;;; notrack_jmp_fs_rax reject
+.text
+notrack jmp *%fs:(%rax)
+;;; notrack_jmp_ds_rax
+.text
+notrack jmp *%ds:(%rax)
+;;; ds_notrack_jmp_rax reject
+.text
+ds notrack jmp *%rax
+;;; notrack_cs_jmp_rax reject
+.text
+notrack cs jmp *%rax
+;;; notrack_jmpq_rax
+.text
+notrack jmpq *%rax
+;;; notrack_callq_rax
+.text
+notrack callq *%rax
+;;; notrack_ret reject
+.text
+notrack ret
+;;; cs_loop_1f_1
+.text
+cs loop 1f
+1:
+;;; cs_jrcxz_1f_1
+.text
+cs jrcxz 1f
+1:
+;;; addr32_loop_1f_1
+.text
+addr32 loop 1f
+1:
+;;; cs_cpuid
+.text
+cs cpuid
+;;; cs_syscall
+.text
+cs syscall
+;;; cs_lea_rax_ebx
+.text
+cs lea (%rax), %ebx
+;;; ds_wrmsr
+.text
+ds wrmsr
+;;; cs_call_x86_indirect_thunk_r11_rip
+.text
+cs call *__x86_indirect_thunk_r11(%rip)
+;;; cs_jmp_x86_indirect_thunk_r11
+.text
+cs jmp __x86_indirect_thunk_r11
+;;; lock
+.text
+lock
+;;; rep
+.text
+rep
+;;; repne
+.text
+repne
+;;; data16
+.text
+data16
+;;; addr32
+.text
+addr32
+;;; cs
+.text
+cs
+;;; ds
+.text
+ds
+;;; fs
+.text
+fs
+;;; notrack
+.text
+notrack
+;;; xacquire
+.text
+xacquire
+;;; xrelease
+.text
+xrelease
+;;; rex
+.text
+rex
+;;; rex64
+.text
+rex64
+;;; rex_x
+.text
+rex.x
+;;; rex_wrxb
+.text
+rex.wrxb
+;;; rexxyz
+.text
+rexxyz
+;;; rex64z
+.text
+rex64z
+;;; es reject
+.text
+es
+;;; ss reject
+.text
+ss
+;;; gs
+.text
+gs
+;;; repz
+.text
+repz
+;;; repe
+.text
+repe
+;;; repnz
+.text
+repnz
+;;; addr16 reject
+.text
+addr16
+;;; data32 reject
+.text
+data32
+;;; jmpabs_0x1122334455667788
+.text
+jmpabs $0x1122334455667788
+;;; rex_w_jmpabs_0x1122334455667788 reject
+.text
+rex.w jmpabs $0x1122334455667788
+;;; rex64_jmpabs_0x1122334455667788 reject
+.text
+rex64 jmpabs $0x1122334455667788
+;;; rex_jmpabs_0x1122334455667788
+.text
+rex jmpabs $0x1122334455667788
+;;; rex_b_jmpabs_0x1122334455667788
+.text
+rex.b jmpabs $0x1122334455667788
+;;; data16_jmpabs_0x1122334455667788 reject
+.text
+data16 jmpabs $0x1122334455667788
+;;; addr32_jmpabs_0x1122334455667788 reject
+.text
+addr32 jmpabs $0x1122334455667788
+;;; cs_jmpabs_0x1122334455667788
+.text
+cs jmpabs $0x1122334455667788
+;;; lock_jmpabs_0x1122334455667788 reject
+.text
+lock jmpabs $0x1122334455667788
+;;; rep_jmpabs_0x1122334455667788 reject
+.text
+rep jmpabs $0x1122334455667788
+;;; notrack_jmpabs_0x1122334455667788 reject
+.text
+notrack jmpabs $0x1122334455667788
+;;; rex2_jmpabs_0x1122334455667788 reject
+.text
+{rex2} jmpabs $0x1122334455667788
+;;; evex_jmpabs_0x1122334455667788 reject
+.text
+{evex} jmpabs $0x1122334455667788
+;;; nf_jmpabs_0x1122334455667788 reject
+.text
+{nf} jmpabs $0x1122334455667788
+;;; jmpabs_foo
+.text
+jmpabs $foo
+;;; jmpabs_rax reject
+.text
+jmpabs %rax
+;;; jmpabs_foo_2 reject
+.text
+jmpabs foo
+;;; jmpabs_1
+.text
+jmpabs $1
+;;; jmpabs_1_2
+.text
+jmpabs $-1

@@ -12,12 +12,10 @@
 # of the mnemonic that GNU as assembles; the digest names which.
 rows 4848
 statements 29469
-assembled 16625
-same 16146
-foreign 126359
-refused 119750
-reject addr16 1 45ab3611
-reject addr32 1 a5411652
+assembled 16633
+same 16167
+foreign 126351
+refused 119742
 reject adword 1 0045b0be
 reject aword 1 eb99325b
 reject bextr 6 80abdcea
@@ -54,16 +52,11 @@ reject cmps 6 fa681336
 reject cmpsb 2 99f9b686
 reject cmpsl 2 7fcee5b5
 reject cmpsw 2 3128c7ec
-reject cs 1 3b8b91c7
-reject data16 1 86f4eb3a
-reject data32 1 11f69338
-reject ds 1 f9c7af7e
 reject dword 1 e94a50a4
 reject enqcmds 2 86942b7d
 reject enter 2 af3ec3a8
 reject enterl 2 027403ae
 reject enterw 2 65cab687
-reject es 1 c0bc1e08
 reject fcoml 2 0d351992
 reject fcompl 2 63a1ef89
 reject fldenv 1 598690b9
@@ -72,7 +65,6 @@ reject fnsave 1 f1e7e58e
 reject fnstcw 1 c59a47a0
 reject fnstsw 1 4c53b332
 reject frstor 1 f93dd8a4
-reject fs 1 dce7cce0
 reject fsave 1 092c4220
 reject fsavel 6 99fff5e2
 reject fsaves 6 81af0887
@@ -84,7 +76,6 @@ reject fstl 2 3a91e34c
 reject fstpl 2 8ae0557c
 reject fstsw 1 b32cb867
 reject fstsww 6 bf377e4d
-reject gs 1 7a5443b6
 reject hnt 1 a382592b
 reject ht 1 712dd58e
 reject imul 2 7a8a8d72
@@ -110,7 +101,6 @@ reject movsl 2 2fa1edd4
 reject movsw 2 b042b354
 reject movw 3 6642c262
 reject nop 1 4b6c631c
-reject notrack 1 6baffd7c
 reject outs 4 bf7e7e46
 reject prefetcht0 1 ae037aed
 reject prefetcht1 1 4444f2de
@@ -185,7 +175,6 @@ reject smov 6 e72a07b9
 reject smovb 6 98e6a814
 reject smovl 6 f2c8f58e
 reject smovw 6 2a70f837
-reject ss 1 a31fe965
 reject ssca 12 a3b13f92
 reject sscab 11 2b48b460
 reject sscal 6 4feb76e4
@@ -206,7 +195,5 @@ reject vcvttsd2si 2 43b0c9c2
 reject vcvttss2si 1 9a319ad2
 reject vextractps 2 c165d6f6
 reject word 1 98c1eb4e
-reject xacquire 1 77685d3b
 reject xchg 1 1d6465a2
 reject xchgl 1 1dfe70cf
-reject xrelease 1 93a242a3

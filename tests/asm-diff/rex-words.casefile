@@ -1,0 +1,386 @@
+# The REX prefix words of 64-bit code, one statement a group, each held to GNU
+# as 2.47. Its table has thirty-one for the sixteen bytes 40..4F: `rex` and
+# `rex64` with the letters x, y, z behind them (R, X, B), and `rex.` with the
+# bits' own letters w, r, x, b. Their bits merge with the ones the instruction
+# needs (`rex.x mov %r8d, %ebx` is 46 89 c3), with one another (`rex.w rex.b
+# nop` is 49 90) and with a REX2 prefix's (`rex64 addl %r16d, %ebx` is d5 48
+# 01 c3); a bit asked for twice is "same type of prefix used twice", and a VEX
+# prefix takes none. lccc knew `rex`, `rex.x` and `rex64`, read the dotted
+# ones as a mnemonic with a size suffix, and assembled `rex64 mov %rax, %rbx`.
+;;; rex_mov_eax_ebx
+.text
+rex mov %eax, %ebx
+;;; rexz_mov_eax_ebx
+.text
+rexz mov %eax, %ebx
+;;; rexy_mov_eax_ebx
+.text
+rexy mov %eax, %ebx
+;;; rexyz_mov_eax_ebx
+.text
+rexyz mov %eax, %ebx
+;;; rexx_mov_eax_ebx
+.text
+rexx mov %eax, %ebx
+;;; rexxz_mov_eax_ebx
+.text
+rexxz mov %eax, %ebx
+;;; rexxy_mov_eax_ebx
+.text
+rexxy mov %eax, %ebx
+;;; rexxyz_mov_eax_ebx
+.text
+rexxyz mov %eax, %ebx
+;;; rex64_mov_eax_ebx
+.text
+rex64 mov %eax, %ebx
+;;; rex64z_mov_eax_ebx
+.text
+rex64z mov %eax, %ebx
+;;; rex64y_mov_eax_ebx
+.text
+rex64y mov %eax, %ebx
+;;; rex64yz_mov_eax_ebx
+.text
+rex64yz mov %eax, %ebx
+;;; rex64x_mov_eax_ebx
+.text
+rex64x mov %eax, %ebx
+;;; rex64xz_mov_eax_ebx
+.text
+rex64xz mov %eax, %ebx
+;;; rex64xy_mov_eax_ebx
+.text
+rex64xy mov %eax, %ebx
+;;; rex64xyz_mov_eax_ebx
+.text
+rex64xyz mov %eax, %ebx
+;;; rex_b_mov_eax_ebx
+.text
+rex.b mov %eax, %ebx
+;;; rex_x_mov_eax_ebx
+.text
+rex.x mov %eax, %ebx
+;;; rex_xb_mov_eax_ebx
+.text
+rex.xb mov %eax, %ebx
+;;; rex_r_mov_eax_ebx
+.text
+rex.r mov %eax, %ebx
+;;; rex_rb_mov_eax_ebx
+.text
+rex.rb mov %eax, %ebx
+;;; rex_rx_mov_eax_ebx
+.text
+rex.rx mov %eax, %ebx
+;;; rex_rxb_mov_eax_ebx
+.text
+rex.rxb mov %eax, %ebx
+;;; rex_w_mov_eax_ebx
+.text
+rex.w mov %eax, %ebx
+;;; rex_wb_mov_eax_ebx
+.text
+rex.wb mov %eax, %ebx
+;;; rex_wx_mov_eax_ebx
+.text
+rex.wx mov %eax, %ebx
+;;; rex_wxb_mov_eax_ebx
+.text
+rex.wxb mov %eax, %ebx
+;;; rex_wr_mov_eax_ebx
+.text
+rex.wr mov %eax, %ebx
+;;; rex_wrb_mov_eax_ebx
+.text
+rex.wrb mov %eax, %ebx
+;;; rex_wrx_mov_eax_ebx
+.text
+rex.wrx mov %eax, %ebx
+;;; rex_wrxb_mov_eax_ebx
+.text
+rex.wrxb mov %eax, %ebx
+;;; rex_w_nop
+.text
+rex.w nop
+;;; rex_b_nop
+.text
+rex.b nop
+;;; rex_r_mov_eax_rbx
+.text
+rex.r mov %eax, (%rbx)
+;;; rex_wrxb_mov_rax_rcx_edx
+.text
+rex.wrxb mov (%rax,%rcx), %edx
+;;; rex_b_mov_r8d_ebx
+.text
+rex.b mov %r8d, %ebx
+;;; rex_w_mov_rax_rbx reject
+.text
+rex.w mov %rax, %rbx
+;;; rex_w_movaps_xmm0_xmm1
+.text
+rex.w movaps %xmm0, %xmm1
+;;; rex_w_vmovaps_xmm0_xmm1 reject
+.text
+rex.w vmovaps %xmm0, %xmm1
+;;; rex_w_mov_ah_al reject
+.text
+rex.w mov %ah, %al
+;;; rex_mov_ah_al reject
+.text
+rex mov %ah, %al
+;;; rex64_mov_ah_al reject
+.text
+rex64 mov %ah, %al
+;;; rex_b_push_rax
+.text
+rex.b push %rax
+;;; rex_w_jmp_rax
+.text
+rex.w jmp *%rax
+;;; rex_wb_ret
+.text
+rex.wb ret
+;;; rex
+.text
+rex
+;;; rex_w
+.text
+rex.w
+;;; rex64
+.text
+rex64
+;;; rexx
+.text
+rexx
+;;; rex_w_lock_addl_1_rax
+.text
+rex.w lock addl $1, (%rax)
+;;; lock_rex_w_addl_1_rax
+.text
+lock rex.w addl $1, (%rax)
+;;; rex_w_rep_movsb
+.text
+rex.w rep movsb
+;;; rex_w_rex_b_nop
+.text
+rex.w rex.b nop
+;;; rex_rex_nop
+.text
+rex rex nop
+;;; rex_w_data16_nop
+.text
+rex.w data16 nop
+;;; data16_rex_w_nop
+.text
+data16 rex.w nop
+;;; rex64_mov_rax_rbx reject
+.text
+rex64 mov %rax, %rbx
+;;; rex64_movq_rax_rbx reject
+.text
+rex64 movq %rax, %rbx
+;;; rex_b_mov_eax_r8d reject
+.text
+rex.b mov %eax, %r8d
+;;; rex_r_mov_r8d_eax reject
+.text
+rex.r mov %r8d, %eax
+;;; rex_x_mov_rax_r9_eax reject
+.text
+rex.x mov (%rax,%r9), %eax
+;;; rex_w_rex64_nop reject
+.text
+rex.w rex64 nop
+;;; rex_wb_rex_b_nop reject
+.text
+rex.wb rex.b nop
+;;; rex_w_rex_w_nop reject
+.text
+rex.w rex.w nop
+;;; rex_rex64_nop
+.text
+rex rex64 nop
+;;; rex_b_rex_x_rex_r_rex_w_nop
+.text
+rex.b rex.x rex.r rex.w nop
+;;; rex_xchg_rax_rax
+.text
+rex xchg %rax, %rax
+;;; rex_xchg_eax_eax
+.text
+rex xchg %eax, %eax
+;;; rex64_xchg_rax_rax
+.text
+rex64 xchg %rax, %rax
+;;; rex64_nop
+.text
+rex64 nop
+;;; rex_b_xchg_eax_eax
+.text
+rex.b xchg %eax, %eax
+;;; rex_mov_rax_rbx
+.text
+rex mov %rax, %rbx
+;;; rex_x_mov_r8d_ebx
+.text
+rex.x mov %r8d, %ebx
+;;; rex64_cmova_eax_ebx
+.text
+rex64 cmova %eax, %ebx
+;;; rex_w_cmova_eax_ebx
+.text
+rex.w cmova %eax, %ebx
+;;; rex_w_push_rax
+.text
+rex.w push %rax
+;;; rex64_push_rax
+.text
+rex64 push %rax
+;;; rex_b_pop_rax
+.text
+rex.b pop %rax
+;;; rex_w_call_rax
+.text
+rex.w call *%rax
+;;; rex64_jmp_1f_1
+.text
+rex64 jmp 1f
+1:
+;;; rex_jne_1f_1
+.text
+rex jne 1f
+1:
+;;; rex_wb_mov_5_al
+.text
+rex.wb mov $5, %al
+;;; rex_mov_5_al
+.text
+rex mov $5, %al
+;;; rex64_mov_0x1122334455667788_rax reject
+.text
+rex64 mov $0x1122334455667788, %rax
+;;; rex_mov_0x1122334455667788_rax
+.text
+rex mov $0x1122334455667788, %rax
+;;; rex_w_lea_rax_ebx
+.text
+rex.w lea (%rax), %ebx
+;;; rex_b_lea_rax_ebx
+.text
+rex.b lea (%rax), %ebx
+;;; rex_b_lea_r8_ebx reject
+.text
+rex.b lea (%r8), %ebx
+;;; rex_movzbl_al_eax
+.text
+rex movzbl %al, %eax
+;;; rex_movzbl_ah_eax reject
+.text
+rex movzbl %ah, %eax
+;;; rex_w_movd_xmm0_eax
+.text
+rex.w movd %xmm0, %eax
+;;; rex_w_cvtsi2sd_eax_xmm0
+.text
+rex.w cvtsi2sd %eax, %xmm0
+;;; rex64_fxsave_rax
+.text
+rex64 fxsave (%rax)
+;;; rex_w_fxsave_rax
+.text
+rex.w fxsave (%rax)
+;;; rex64_xsave_rax
+.text
+rex64 xsave (%rax)
+;;; rex64_sysret
+.text
+rex64 sysret
+;;; rex64_iret
+.text
+rex64 iret
+;;; rex_w_lret
+.text
+rex.w lret
+;;; rex64_ljmp_rax
+.text
+rex64 ljmp *(%rax)
+;;; rex64_lcall_rax
+.text
+rex64 lcall *(%rax)
+;;; rex_w_lgdt_rax
+.text
+rex.w lgdt (%rax)
+;;; rex_w_cmpxchg8b_rax
+.text
+rex.w cmpxchg8b (%rax)
+;;; rex_w_bswap_eax
+.text
+rex.w bswap %eax
+;;; rex_w_movsb
+.text
+rex.w movsb
+;;; rex_w_stosl
+.text
+rex.w stosl
+;;; rex64_rep_stosl
+.text
+rex64 rep stosl
+;;; rex_w_in_5_al
+.text
+rex.w in $5, %al
+;;; rex_w_cpuid
+.text
+rex.w cpuid
+;;; rex_w_kmovw_k1_k2 reject
+.text
+rex.w kmovw %k1, %k2
+;;; rex_w_andn_eax_ebx_ecx reject
+.text
+rex.w andn %eax, %ebx, %ecx
+;;; rex_w_pfadd_mm1_mm2
+.text
+rex.w pfadd %mm1, %mm2
+;;; rex_w_emms
+.text
+rex.w emms
+;;; rex_w_fnop
+.text
+rex.w fnop
+;;; rex_w_addr32_nop
+.text
+rex.w addr32 nop
+;;; rex_w_cs_nop
+.text
+rex.w cs nop
+;;; rex_w_rex2_nop
+.text
+rex.w {rex2} nop
+;;; rex_b_rex2_push_rax
+.text
+rex.b {rex2} push %rax
+;;; rex_b_push_r16
+.text
+rex.b push %r16
+;;; rex_w_addl_r16d_ebx
+.text
+rex.w addl %r16d, %ebx
+;;; rex_b_addl_r16d_ebx
+.text
+rex.b addl %r16d, %ebx
+;;; rex_r_addl_r16d_ebx
+.text
+rex.r addl %r16d, %ebx
+;;; rex_x_addl_eax_r16_rcx
+.text
+rex.x addl %eax, (%r16,%rcx)
+;;; rex_x_addl_eax_rax_r17
+.text
+rex.x addl %eax, (%rax,%r17)
+;;; rex_x_addl_eax_rax_r9 reject
+.text
+rex.x addl %eax, (%rax,%r9)
+;;; rex_w_jmpabs_0x1122334455667788 reject
+.text
+rex.w jmpabs $0x1122334455667788

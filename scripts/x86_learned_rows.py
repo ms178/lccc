@@ -30,6 +30,8 @@ table's own columns: its rows only say which statements are worth asking.
             (the same bytes and relocations, or refused by both)
   --add M   with --write: put the mnemonic M (as spelled, suffix and all) on
             the list
+  --drop M  with --write: take it off again -- the list is for what no arm
+            assembles, and an arm that is written later makes its rows dead
 
 The list is the header of the written file.
 """
@@ -842,8 +844,11 @@ class Number:
 
 
 def number_forms(rows, mode: str) -> list[tuple[str, tuple[str, ...]]]:
-    """The forms of the table, of any mnemonic, with one number of one byte."""
-    names = {row[0] for row in sweep.rows_of(rows, sweep.MODES[mode], set())}
+    """The forms of the table, of any mnemonic under every size suffix it
+    takes, with one number of one byte: `bt` and `btl`, `in` and `inw`. A
+    statement is looked up as it is spelled."""
+    names = {row[0] + suffix for row in sweep.rows_of(rows, sweep.MODES[mode], set())
+             for suffix in ("", "b", "w", "l", "q", "s")}
     return sorted({(name, kinds) for name, kinds, _modrm in spellings(rows, mode, names)
                    if kinds.count("i8") == 1})
 
@@ -1339,6 +1344,9 @@ def main(argv: list[str] | None = None) -> int:
     what.add_argument("--show", action="store_true", help="print the rows of --add")
     parser.add_argument("--add", action="append", default=[], metavar="MNEMONIC")
     parser.add_argument("--add-from", metavar="FILE", help="a file of mnemonics to add")
+    parser.add_argument("--drop", action="append", default=[], metavar="MNEMONIC",
+                        help="with --write: take the mnemonic off the list (an arm of the "
+                             "encoders assembles every form of it now)")
     parser.add_argument("--as", dest="gas", default="as")
     parser.add_argument("--table", help="i386-opc.tbl of binutils 2.47")
     parser.add_argument("--lccc", default=str(REPO / "target" / "fastbuild" / "lccc-x86"))
@@ -1358,7 +1366,13 @@ def main(argv: list[str] | None = None) -> int:
     added = list(args.add)
     if args.add_from:
         added += Path(args.add_from).read_text().split()
-    names = sorted(set(added) if args.show else set(listed_names()) | set(added))
+    if args.drop and not args.write:
+        parser.error("--drop goes with --write")
+    unlisted = set(args.drop) - set(listed_names())
+    if unlisted:
+        parser.error(f"--drop: not on the list: {' '.join(sorted(unlisted))}")
+    names = sorted(set(added) if args.show
+                   else (set(listed_names()) | set(added)) - set(args.drop))
     solved, unsolved, reasons = solve_all(rows, set(names), args.gas)
     merged = merge(solved)
     numbers, took = solve_numbers(rows, args.gas)

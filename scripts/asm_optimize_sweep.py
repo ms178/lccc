@@ -156,6 +156,13 @@ def statements(rows, mode: table.Mode, per_row: int, seed: int, only: set[str]) 
     """statement -> the table row it was made from."""
     out: dict[str, str] = {}
     for mnemonic, opcode, cpu, attributes, row_operands in table.rows_of(rows, mode, only):
+        # A prefix word is no statement to rewrite, and as a statement of its
+        # own it stands in front of the next one, which is then assembled as
+        # written (GNU as's rule and lccc's): swept, `xacquire` took `xadd
+        # %cl, %cl` out of the sweep, and `es` took `extractps $0, %xmm1,
+        # %ecx`. The table sweep holds the words themselves.
+        if "IsPrefix" in attributes:
+            continue
         suffixes = [""]
         if "NoSuf" not in attributes:
             for suffix, flag in (("b", "No_bSuf"), ("w", "No_wSuf"), ("l", "No_lSuf"),

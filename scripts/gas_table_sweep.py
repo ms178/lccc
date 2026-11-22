@@ -297,8 +297,16 @@ def logical_lines(text: str) -> list[str]:
     return out
 
 
+# The mnemonics whose number the table has in front and a statement behind:
+# `out %al, $5` is the row `{ Imm8, Acc }`. GNU as exchanges the two before
+# it looks for the row ("OUT, UWRMSR, and WRMSRNS want their immediate to be
+# in the canonical place", `md_assemble` in gas/config/tc-i386.c).
+NUMBER_LAST = {"out", "uwrmsr", "wrmsrns"}
+
+
 def expand_rows(text: str):
-    """Yield (mnemonic, opcode, cpu, attributes, operand class sets), templates expanded."""
+    """Yield (mnemonic, opcode, cpu, attributes, operand class sets), templates
+    expanded and the operands in the order a statement has them."""
     templates: dict[str, list[dict]] = {}
     rows = []
     for line in logical_lines(text):
@@ -353,6 +361,9 @@ def expand_rows(text: str):
                                 for o in split_top(inner)]
             if "SSE2AVX" in attributes:
                 mnemonic = "v" + mnemonic
+            if (mnemonic in NUMBER_LAST and len(operands) > 1
+                    and any(c.startswith("Imm") for c in operands[0])):
+                operands[0], operands[1] = operands[1], operands[0]
             yield mnemonic, parts[1].strip(), parts[2].strip(), attributes, operands
 
 

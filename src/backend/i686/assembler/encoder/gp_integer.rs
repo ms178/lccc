@@ -221,24 +221,12 @@ impl super::InstructionEncoder {
                 // instruction stream desyncs; reproduced: boot setup's
                 // `movb $1, loaded_flags` ate the following call's stack
                 // slot and get_cpuflags returned into garbage). GAS emits
-                // mod=00 rm=110 + disp16 + R_386_16 there.
-                if self.code16 {
-                    self.bytes.push(self.modrm(0, 0, 6));
-                    if let Ok(addr) = label.parse::<i64>() {
-                        self.bytes.extend_from_slice(&(addr as i16).to_le_bytes());
-                    } else {
-                        self.add_relocation_for_label(label, R_386_16);
-                        self.bytes.extend_from_slice(&[0, 0]);
-                    }
-                } else {
-                    self.bytes.push(self.modrm(0, 0, 5));
-                    if let Ok(addr) = label.parse::<i64>() {
-                        self.bytes.extend_from_slice(&(addr as i32).to_le_bytes());
-                    } else {
-                        self.add_relocation_for_label(label, R_386_32);
-                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-                    }
-                }
+                // mod=00 rm=110 + disp16 + R_386_16 there. The address
+                // planner knows the code, and the address-size word that
+                // turns it round (`addr16 movb $5, sym` in 32-bit code is
+                // `67 c6 06` and a 16-bit field; this arm wrote the form
+                // of the code under either word).
+                self.encode_abs_addr_modrm(0, label)?;
                 match imm {
                     ImmediateValue::Integer(val) => match size {
                         1 => self.bytes.push(*val as u8),
@@ -686,43 +674,14 @@ impl super::InstructionEncoder {
                 // is in 16-bit code, where the 32-bit form was written
                 // without an address-size prefix: `8d 0d` and four bytes,
                 // which a real-mode processor reads as `lea (%di), %cx`
-                // and two more instructions.
+                // and two more instructions. The address planner knows
+                // the code and the address-size word (`bare_address16`).
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 self.bytes.push(0x8D);
-                if self.explicit_addr16 {
-                    self.bytes.push(self.modrm(0, dst_num, 6));
-                    self.add_relocation(label.as_str(), R_386_16, 0);
-                    self.bytes.extend_from_slice(&[0, 0]);
-                    Ok(())
-                } else {
-                    self.encode_abs_addr_modrm(dst_num, label)
-                }
+                self.encode_abs_addr_modrm(dst_num, label)
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                if self.explicit_addr16 && mem.base.is_none() && mem.index.is_none() {
-                    // `addr16 lea 1,%eax`: 16-bit addressing has no SIB, so
-                    // a bare absolute is mod=00 rm=110 + disp16 (GAS 2.47:
-                    // 67 8d 06 0100; `lea sym` takes R_386_16).
-                    self.bytes.push(0x8D);
-                    self.bytes.push(self.modrm(0, dst_num, 6));
-                    match &mem.displacement {
-                        Displacement::Integer(v) => {
-                            self.bytes.extend_from_slice(&(*v as i16).to_le_bytes());
-                        }
-                        Displacement::Symbol(sym) => {
-                            self.add_relocation(sym, R_386_16, 0);
-                            self.bytes.extend_from_slice(&[0, 0]);
-                        }
-                        Displacement::SymbolPlusOffset(sym, a)
-                        | Displacement::SymbolAddend(sym, a) => {
-                            self.add_relocation(sym, R_386_16, *a);
-                            self.bytes.extend_from_slice(&[0, 0]);
-                        }
-                        _ => return Err("unsupported addr16 lea displacement".to_string()),
-                    }
-                    return Ok(());
-                }
                 self.bytes.push(0x8D);
                 self.encode_modrm_mem(dst_num, mem)
             }
@@ -2097,29 +2056,23 @@ impl super::InstructionEncoder {
         match &ops[0] {
             Operand::Label(label) => {
                 let sym = strip_plt_suffix(label);
-                if self.explicit_data16 && sym.len() != label.len() {
+                // The offset is as wide as the operand size: the code's,
+                // and the other one under the data-size word, whose 0x66
+                // the forced-data fixup inserts. `data16 jmp foo` is 66 e9
+                // rel16 + R_386_PC16 in 32-bit code, `data32 jmp foo` 66
+                // e9 rel32 + R_386_PC32 in 16-bit code (GAS 2.47).
+                let narrow = self.code16 != self.explicit_data;
+                if narrow && !self.code16 && sym.len() != label.len() {
                     // GAS 2.47 rejects `data16 jmp foo@PLT` (either case):
                     // a 16-bit displacement field cannot carry a PLT32.
                     // Checked before any byte is pushed so a rejected form
                     // leaves no partial state in `self.bytes`.
                     return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
                 }
-                if self.code16 {
+                if narrow {
                     // .code16 near jmp: E9 rel16 + R_386_PC16 (GAS emits
-                    // `e9 00 00` + PC16 for forward targets; short local
-                    // targets get relaxed to EB rel8 by GAS — lccc's fixed
-                    // rel16 form is semantically identical and local
-                    // targets fold to constants in the writer).
-                    self.bytes.push(0xE9);
-                    self.add_relocation(sym, R_386_PC16, -2);
-                    self.bytes.extend_from_slice(&[0, 0]);
-                    return Ok(());
-                }
-                if self.explicit_data16 {
-                    // `data16 jmp foo` shrinks the displacement to rel16
-                    // (GAS 2.47: 66 e9 feff + R_386_PC16 -2). The 0x66 is
-                    // inserted by the forced-data16 fixup, not here.
-                    self.sized_op = true;
+                    // `e9 00 00` + PC16 for forward targets; a short local
+                    // target is relaxed to EB rel8 by the writer).
                     self.bytes.push(0xE9);
                     self.add_relocation(sym, R_386_PC16, -2);
                     self.bytes.extend_from_slice(&[0, 0]);
@@ -2247,6 +2200,18 @@ impl super::InstructionEncoder {
             _ if call && self.code16gcc => 4,
             _ => self.default_operand_size(),
         };
+        // Under the data-size word the offset in the instruction is as
+        // wide as the word says, whatever the suffix: `data16 ljmp $0x10,
+        // $0x1234` and `data16 ljmpl` are `66 ea 34 12 10 00` in 32-bit
+        // code, `data32 ljmp` is `66 ea` and a 32-bit offset in 16-bit
+        // code (GAS 2.47). The 0x66 is the word's, which the forced-data
+        // fixup inserts -- and refuses in front of the 0x66 `ljmpw` has
+        // for itself. The offset kept the code's width, so the processor
+        // read the selector out of the offset's upper half.
+        let worded = self.explicit_data
+            && matches!(ops, [Operand::Immediate(_), Operand::Immediate(_)])
+            && size == self.default_operand_size();
+        let size = if worded { 6 - size } else { size };
         let mismatch = || format!("operand type mismatch for `{name}'");
         // A 16-bit offset has to be one, and so has the selector beside a
         // 32-bit offset (`ljmpw $0x1234, $0x12345678` jumped to `0x5678`).
@@ -2263,9 +2228,11 @@ impl super::InstructionEncoder {
                 return Err(mismatch());
             }
         }
-        self.sized_op = true;
-        if size == 2 {
-            self.bytes.push(0x66);
+        if !worded {
+            self.sized_op = true;
+            if size == 2 {
+                self.bytes.push(0x66);
+            }
         }
         match ops {
             [Operand::Immediate(segment), Operand::Immediate(offset)] => {
@@ -2332,28 +2299,22 @@ impl super::InstructionEncoder {
         match &ops[0] {
             Operand::Label(label) => {
                 let sym = strip_plt_suffix(label);
-                if self.explicit_data16 && sym.len() != label.len() {
+                // As wide as the operand size, which the data-size word
+                // turns round (see `encode_jmp`): `data16 je foo` is 66 0F
+                // 8x rel16 in 32-bit code, `data32 je foo` 66 0F 8x rel32
+                // in 16-bit code (GAS 2.47). The 0x66 is inserted by the
+                // forced-data fixup, not here.
+                let narrow = self.code16 != self.explicit_data;
+                if narrow && !self.code16 && sym.len() != label.len() {
                     // GAS 2.47 rejects `data16 je foo@PLT` (either case):
                     // a 16-bit displacement field cannot carry a PLT32.
                     // Checked before any byte is pushed so a rejected form
                     // leaves no partial state in `self.bytes`.
                     return Err("4-byte relocation cannot be applied to 2-byte field".to_string());
                 }
-                if self.code16 {
-                    // .code16 Jcc: 0F 8x rel16 + R_386_PC16. GAS relaxes
-                    // same-section short targets to 7x rel8; lccc emits the
-                    // fixed rel16 form (identical semantics, always in
-                    // range for real-mode blobs; local targets resolve to
-                    // constants via the writer's PC16 path).
-                    self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
-                    self.add_relocation(sym, R_386_PC16, -2);
-                    self.bytes.extend_from_slice(&[0, 0]);
-                    return Ok(());
-                }
-                if self.explicit_data16 {
-                    // `data16 je foo`: 66 0F 8x rel16 (GAS 2.47). The 0x66
-                    // is inserted by the forced-data16 fixup, not here.
-                    self.sized_op = true;
+                if narrow {
+                    // .code16 Jcc: 0F 8x rel16 + R_386_PC16; the writer
+                    // relaxes a same-section short target to 7x rel8.
                     self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
                     self.add_relocation(sym, R_386_PC16, -2);
                     self.bytes.extend_from_slice(&[0, 0]);
@@ -2390,7 +2351,7 @@ impl super::InstructionEncoder {
         match &ops[0] {
             Operand::Label(label) => {
                 let sym = strip_plt_suffix(label);
-                if self.explicit_data16 && sym.len() != label.len() {
+                if self.explicit_data && !self.code16 && sym.len() != label.len() {
                     // GAS 2.47 rejects `data16 call foo@PLT` (either case):
                     // a 16-bit displacement field cannot carry a PLT32.
                     // Checked before any byte is pushed so a rejected form
@@ -2402,8 +2363,10 @@ impl super::InstructionEncoder {
                     // `e8 00 00` + PC16 ext_fn-0x2). The explicit 32-bit
                     // spelling `calll` is 66-prefixed rel32 (PC32) — GAS
                     // `66 e8 00 00 00 00` + PC32 ext_fn-0x4 — selected by
-                    // the sized_op the dispatch sets for "calll".
-                    if self.sized_op {
+                    // the sized_op the dispatch sets for "calll". So is
+                    // `data32 call`, whose 0x66 the forced-data fixup
+                    // inserts.
+                    if self.sized_op || self.explicit_data {
                         self.bytes.push(0xE8);
                         self.add_relocation(sym, R_386_PC32, -4);
                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
@@ -2425,11 +2388,10 @@ impl super::InstructionEncoder {
                     self.bytes.extend_from_slice(&[0, 0]);
                     return Ok(());
                 }
-                if self.explicit_data16 {
+                if self.explicit_data {
                     // `data16 call foo` shrinks the displacement to rel16
                     // (GAS 2.47: 66 e8 feff + R_386_PC16 -2). The 0x66 is
                     // inserted by the forced-data16 fixup, not here.
-                    self.sized_op = true;
                     self.bytes.push(0xE8);
                     self.add_relocation(label, R_386_PC16, -2);
                     self.bytes.extend_from_slice(&[0, 0]);

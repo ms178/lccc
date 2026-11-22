@@ -12,10 +12,10 @@
 # of the mnemonic that GNU as assembles; the digest names which.
 rows 4848
 statements 29673
-assembled 16768
-same 16241
-foreign 126420
-refused 119811
+assembled 16776
+same 16262
+foreign 126412
+refused 119803
 accept vgatherdps %xmm6, 0x1000(,%xmm7,8), %xmm1
 accept vgatherdps %xmm6, 0x1000(,%xmm7,8), %xmm6
 accept vgatherdps %ymm2, 0x1000(,%ymm7,8), %ymm2
@@ -39,8 +39,6 @@ accept vpgatherqq %xmm6, 0x1000(,%xmm7,8), %xmm1
 accept vpgatherqq %ymm2, 0x1000(,%ymm7,8), %ymm2
 accept vpgatherqq %ymm2, 0x1000(,%ymm7,8), %ymm6
 accept vpgatherqq %ymm6, 0x1000(,%ymm7,8), %ymm2
-reject addr16 1 45ab3611
-reject addr32 1 a5411652
 reject adword 1 0045b0be
 reject aword 1 eb99325b
 reject bextr 6 32bb22da
@@ -78,17 +76,12 @@ reject cmps 4 b85e0da4
 reject cmpsb 2 16c294c6
 reject cmpsl 2 042f42e8
 reject cmpsw 2 d1dae6c5
-reject cs 1 3b8b91c7
-reject data16 1 86f4eb3a
-reject data32 1 11f69338
-reject ds 1 f9c7af7e
 reject dword 1 e94a50a4
 reject enqcmd 3 afcbb0d3
 reject enqcmds 4 c413220a
 reject enter 2 af3ec3a8
 reject enterl 2 027403ae
 reject enterw 2 65cab687
-reject es 1 c0bc1e08
 reject fcoml 2 0d351992
 reject fcompl 2 63a1ef89
 reject fldl 2 be35029c
@@ -96,7 +89,6 @@ reject fnsave 1 f1e7e58e
 reject fnstcw 1 c59a47a0
 reject fnstsw 1 4c53b332
 reject frstor 1 f93dd8a4
-reject fs 1 dce7cce0
 reject fsave 1 092c4220
 reject fsavel 6 6c8d3c18
 reject fsaves 6 0168d1a9
@@ -108,7 +100,6 @@ reject fstl 2 3a91e34c
 reject fstpl 2 8ae0557c
 reject fstsw 1 b32cb867
 reject fstsww 6 8a3e3a66
-reject gs 1 7a5443b6
 reject hnt 1 a382592b
 reject ht 1 712dd58e
 reject imul 2 7a8a8d72
@@ -142,7 +133,6 @@ reject movsl 3 d2938332
 reject movsw 2 42ec9867
 reject movw 4 2f494310
 reject nop 1 4b6c631c
-reject notrack 1 6baffd7c
 reject outs 5 2e14e4fe
 reject outsb 1 39251ba9
 reject outsl 1 68925aeb
@@ -223,7 +213,6 @@ reject smov 5 4971584a
 reject smovb 5 a15b39cb
 reject smovl 5 2497d95c
 reject smovw 5 f1448511
-reject ss 1 a31fe965
 reject ssca 12 882d0687
 reject sscab 8 37fad671
 reject sscal 8 755a4d4e
@@ -249,7 +238,5 @@ reject vmload 2 f6f520d4
 reject vmrun 2 720c3202
 reject vmsave 2 a22440f4
 reject word 1 98c1eb4e
-reject xacquire 1 77685d3b
 reject xchg 1 1d6465a2
 reject xchgl 1 1dfe70cf
-reject xrelease 1 93a242a3

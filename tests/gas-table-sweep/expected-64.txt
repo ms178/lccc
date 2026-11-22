@@ -12,17 +12,16 @@
 # of the mnemonic that GNU as assembles; the digest names which.
 rows 4848
 statements 31065
-assembled 18492
-same 17693
-foreign 135032
-refused 128371
+assembled 18512
+same 17759
+foreign 135012
+refused 128351
 shorter vcmpfalse_oqps %ymm10, %ymm2, %ymm10
 shorter vcmpneq_ospd %xmm9, %xmm1, %xmm1
 shorter vpaddb %ymm10, %ymm2, %ymm10
 shorter vpaddusb %xmm9, %xmm1, %xmm9
 shorter vpmuludq %xmm9, %xmm1, %xmm9
 shorter vpsadbw %xmm9, %xmm1, %xmm1
-reject addr32 1 a5411652
 reject adword 1 0045b0be
 reject and 2 313e811d
 reject andq 1 fcf764ac
@@ -116,7 +115,6 @@ reject cfcmovpq 1 23677551
 reject cfcmovpw 1 0031b0d0
 reject clr 6 5f634c70
 reject cmps 6 90b2ccf7
-reject cs 1 3b8b91c7
 reject ctesta 2 63ac33fd
 reject ctestab 1 1d49672c
 reject ctestae 2 b0afb4f0
@@ -171,15 +169,12 @@ reject ctesttb 2 586119b8
 reject ctesttl 3 c3de734d
 reject ctesttq 3 7cb7e6e4
 reject ctesttw 3 d1e5f81c
-reject data16 1 86f4eb3a
-reject ds 1 f9c7af7e
 reject enter 2 af3ec3a8
 reject enterq 2 867dc8f8
 reject enterw 2 65cab687
 reject fcoml 2 0d351992
 reject fcompl 2 63a1ef89
 reject fldl 2 be35029c
-reject fs 1 dce7cce0
 reject fsavel 6 d50de19c
 reject fsaves 6 c8d18b50
 reject fstcww 6 301af78a
@@ -188,7 +183,6 @@ reject fstenvs 6 be008662
 reject fstl 2 3a91e34c
 reject fstpl 2 8ae0557c
 reject fstsww 6 57a23c50
-reject gs 1 7a5443b6
 reject hnt 1 a382592b
 reject ht 1 712dd58e
 reject imul 1 8b27c07e
@@ -208,10 +202,8 @@ reject movrsb 2 9d4fd01b
 reject movrsl 3 d058a792
 reject movrsq 1 3d4fff95
 reject movs 6 7c8b0922
-reject notrack 1 6baffd7c
 reject outs 5 b1cfc7af
 reject pushw 1 a617f67f
-reject rdmsr 3 e85a3cf2
 reject ret 1 17957cee
 reject retf 1 e50ce2b9
 reject retfl 1 61bbd049
@@ -219,37 +211,6 @@ reject retfq 1 7f0c012a
 reject retfw 1 e155161b
 reject retq 1 85f3adda
 reject retw 1 d3e8aa9c
-reject rex 1 3227fe6b
-reject rex.b 1 adcd15e4
-reject rex.r 1 d6838b26
-reject rex.rb 1 605ec901
-reject rex.rx 1 df5b6c57
-reject rex.rxb 1 d1f8cdd2
-reject rex.w 1 fcac92dd
-reject rex.wb 1 9e71e19d
-reject rex.wr 1 cd629657
-reject rex.wrb 1 65befeee
-reject rex.wrx 1 6b007c29
-reject rex.wrxb 1 48515d67
-reject rex.wx 1 0ad395b1
-reject rex.wxb 1 b4a326a9
-reject rex.x 1 79ae809e
-reject rex.xb 1 a2393b47
-reject rex64 1 00b9ef08
-reject rex64x 1 d24d5cd8
-reject rex64xy 1 eb65a9a2
-reject rex64xyz 1 ea97aabf
-reject rex64xz 1 a038ece5
-reject rex64y 1 6516db9a
-reject rex64yz 1 4fcc24d7
-reject rex64z 1 12690471
-reject rexx 1 55808dda
-reject rexxy 1 ffad466b
-reject rexxyz 1 445f5540
-reject rexxz 1 7563df8e
-reject rexy 1 e56ffb09
-reject rexyz 1 a8c7dd6d
-reject rexz 1 6e6de02f
 reject ror 1 4c2d541f
 reject rorb 1 3852483d
 reject scas 12 13c59755
@@ -287,8 +248,5 @@ reject sstoq 7 1b510ac6
 reject sstow 7 a5240afb
 reject stos 12 de652b34
 reject test 2 9708490f
-reject urdmsr 3 544912fa
 reject word 1 98c1eb4e
-reject xacquire 1 77685d3b
 reject xor 1 fb9ab201
-reject xrelease 1 93a242a3

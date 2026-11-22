@@ -937,7 +937,7 @@ impl super::InstructionEncoder {
             };
 
         let plan = i686_plan_memory_address(
-            self.code16,
+            self.bare_address16(),
             reg_field.unwrap_or(0),
             None,
             None,
@@ -946,6 +946,20 @@ impl super::InstructionEncoder {
         )?;
 
         self.i686_resolve_and_emit(&plan, relocation, reg_field.is_some())
+    }
+
+    /// Whether an address with no register in it is 16 bits wide: as the
+    /// code is, and the other way round under the address-size word
+    /// (`addr16` in 32-bit code, `addr32` in 16-bit code).
+    ///
+    /// No register says how wide such an address is, so the word has to:
+    /// GAS 2.47 writes `addr16 addl %ebx, sym` as `67 01 1e` and a 16-bit
+    /// field with `R_386_16`, and `addr32 movw %ax, 0x1234` in 16-bit code
+    /// as `67 a3` and four bytes. A bare symbol kept the code's width
+    /// under the word -- `67 01 1d` and a 32-bit field, which a processor
+    /// reads as `addl %ebx, (%di)` and four bytes of something else.
+    pub(super) fn bare_address16(&self) -> bool {
+        self.code16 != self.explicit_addr
     }
 
     /// Emit the address field for the accumulator moffs forms A0/A1/A2/A3.
@@ -1001,10 +1015,14 @@ impl super::InstructionEncoder {
         let mem = folded.as_ref().unwrap_or(mem);
         let (displacement, relocation) = i686_memory_displacement(&mem.displacement);
         // A base-less address has no register spelling to select its size.
-        // In .code32, an explicit addr16 therefore must select the disp16
-        // ModR/M form, not merely prepend 0x67 to a disp32 encoding.
-        let address16_default =
-            self.code16 || (self.explicit_addr16 && mem.base.is_none() && mem.index.is_none());
+        // The address-size word therefore must select the other ModR/M
+        // form (disp16 in .code32, disp32 in .code16), not merely prepend
+        // 0x67 to the encoding of the code's own.
+        let address16_default = if mem.base.is_none() && mem.index.is_none() {
+            self.bare_address16()
+        } else {
+            self.code16
+        };
         let mut plan = i686_plan_memory_address(
             address16_default,
             reg_field,
@@ -1063,16 +1081,11 @@ impl super::InstructionEncoder {
         // 16 bits (GAS 2.47: `addr16 mov %eax,0x0898` = `67 a3 98 08`):
         // planning with the 16-bit code mode yields the disp16 form and
         // the resolve step requests the 0x67 override for the width
-        // mismatch with the 32-bit mode default. .code16 needs no
-        // override either way.
-        let plan = i686_plan_memory_address(
-            self.code16 || self.explicit_addr16,
-            0,
-            None,
-            None,
-            None,
-            displacement,
-        )?;
+        // mismatch with the 32-bit mode default. In .code16 it is
+        // `addr32` that widens the field (`addr32 mov 0x12345678, %al` =
+        // `67 a0 78 56 34 12`).
+        let plan =
+            i686_plan_memory_address(self.bare_address16(), 0, None, None, None, displacement)?;
 
         self.i686_resolve_and_emit(&plan, relocation, false)
     }

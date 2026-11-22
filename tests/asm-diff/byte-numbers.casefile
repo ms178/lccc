@@ -1,0 +1,197 @@
+# Numbers that have to fit a byte, under a size suffix and in the order of
+# the statement, one statement a group, each held to GNU as 2.47.
+# The ranges are those of the unsuffixed mnemonic (`btl $256, %ecx` is
+# refused as `bt $256, %ecx` is; lccc looked the statement up as spelled,
+# found no range for `btl` and cut the number to a byte). `out`, `uwrmsr`
+# and `wrmsrns` list the number last in GNU as's table and first in the
+# statement, so `out %al, $256` was refused for the range of `in`'s number
+# (GNU as cuts it with a warning: e6 00).
+;;; btl_256_ecx reject
+.text
+btl $256, %ecx
+;;; btw_256_cx reject
+.text
+btw $256, %cx
+;;; btq_1_rcx reject
+.text
+btq $-1, %rcx
+;;; btsl_256_rbx reject
+.text
+btsl $256, (%rbx)
+;;; btcq_256_rax reject
+.text
+btcq $256, %rax
+;;; shldl_256_eax_ebx reject
+.text
+shldl $256, %eax, %ebx
+;;; shldw_256_ax_bx reject
+.text
+shldw $256, %ax, %bx
+;;; shrdq_256_rax_rbx reject
+.text
+shrdq $256, %rax, %rbx
+;;; inw_256_ax reject
+.text
+inw $256, %ax
+;;; inl_256_eax reject
+.text
+inl $256, %eax
+;;; inl_1_eax reject
+.text
+inl $-1, %eax
+;;; outw_ax_256 reject
+.text
+outw %ax, $256
+;;; outl_eax_256 reject
+.text
+outl %eax, $256
+;;; outl_eax_1 reject
+.text
+outl %eax, $-1
+;;; out_ax_1 reject
+.text
+out %ax, $-1
+;;; out_eax_255
+.text
+out %eax, $255
+;;; outb_al_255
+.text
+outb %al, $255
+;;; rolw_256_ax reject
+.text
+rolw $256, %ax
+;;; roll_256_eax reject
+.text
+roll $256, %eax
+;;; rorl_129_eax reject
+.text
+rorl $-129, %eax
+;;; rclw_256_ax reject
+.text
+rclw $256, %ax
+;;; sarl_256_eax reject
+.text
+sarl $256, %eax
+;;; shll_256_rbx reject
+.text
+shll $256, (%rbx)
+;;; shrq_256_rax reject
+.text
+shrq $256, %rax
+;;; shlb_256_al
+.text
+shlb $256, %al
+;;; enterq_1_256 reject
+.text
+enterq $1, $256
+;;; enterw_1_256 reject
+.text
+enterw $1, $256
+;;; pushw_256
+.text
+pushw $256
+;;; imulw_256_ax_bx
+.text
+imulw $256, %ax, %bx
+;;; uwrmsr_rax_0x1234
+.text
+uwrmsr %rax, $0x1234
+;;; wrmsrns_rax_0x1234
+.text
+wrmsrns %rax, $0x1234
+;;; uwrmsr_0x1234_rax reject
+.text
+uwrmsr $0x1234, %rax
+;;; extrq_1_2_xmm1
+.text
+extrq $1, $2, %xmm1
+;;; insertq_1_2_xmm1_xmm2
+.text
+insertq $1, $2, %xmm1, %xmm2
+;;; pshufd_255_xmm1_xmm2
+.text
+pshufd $255, %xmm1, %xmm2
+;;; pshufd_128_xmm1_xmm2
+.text
+pshufd $-128, %xmm1, %xmm2
+;;; pshufd_256_xmm1_xmm2 reject
+.text
+pshufd $256, %xmm1, %xmm2
+;;; pshufd_129_xmm1_xmm2 reject
+.text
+pshufd $-129, %xmm1, %xmm2
+;;; rolw_128_ax
+.text
+rolw $-128, %ax
+;;; roll_255_eax
+.text
+roll $255, %eax
+;;; rolq_256_rax reject
+.text
+rolq $256, %rax
+;;; rolb_256_al
+.text
+rolb $256, %al
+;;; bt_255_ecx
+.text
+bt $255, %ecx
+;;; bt_256_ecx reject
+.text
+bt $256, %ecx
+;;; bt_1_ecx reject
+.text
+bt $-1, %ecx
+;;; vpermil2ps_15_xmm1_xmm2_xmm3_xmm4
+.text
+vpermil2ps $15, %xmm1, %xmm2, %xmm3, %xmm4
+;;; vpermil2ps_16_xmm1_xmm2_xmm3_xmm4 reject
+.text
+vpermil2ps $16, %xmm1, %xmm2, %xmm3, %xmm4
+;;; in_255_eax
+.text
+in $255, %eax
+;;; in_256_eax reject
+.text
+in $256, %eax
+;;; in_256_al
+.text
+in $256, %al
+;;; out_al_256
+.text
+out %al, $256
+;;; int_255
+.text
+int $255
+;;; int_256 reject
+.text
+int $256
+;;; enter_65535_255
+.text
+enter $65535, $255
+;;; enter_65535_256 reject
+.text
+enter $65535, $256
+;;; palignr_255_xmm1_xmm2
+.text
+palignr $255, %xmm1, %xmm2
+;;; palignr_1_xmm1_xmm2 reject
+.text
+palignr $-1, %xmm1, %xmm2
+;;; vpshufd_128_ymm1_ymm2
+.text
+vpshufd $-128, %ymm1, %ymm2
+;;; vpshufd_256_ymm1_ymm2 reject
+.text
+vpshufd $256, %ymm1, %ymm2
+;;; kshiftlw_255_k1_k2
+.text
+kshiftlw $255, %k1, %k2
+;;; kshiftlw_256_k1_k2 reject
+.text
+kshiftlw $256, %k1, %k2
+;;; shld_255_eax_ebx
+.text
+shld $255, %eax, %ebx
+;;; shld_256_eax_ebx reject
+.text
+shld $256, %eax, %ebx

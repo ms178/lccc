@@ -31,7 +31,9 @@
 use super::InstructionEncoder;
 use super::learned_rows::{NAMES, NUMBER_NAMES, NUMBER_STARTS, NUMBERS, ROWS, STARTS};
 use super::operand_class::Code;
-use crate::backend::x86::assembler::parser::{ImmediateValue, MemoryOperand, Operand};
+use crate::backend::x86::assembler::parser::{
+    ImmediateValue, MemoryOperand, Operand, rex_prefix_word,
+};
 
 /// One form of one mnemonic: the kind of each operand, and its encoding.
 #[derive(Clone, Copy, Debug)]
@@ -393,8 +395,9 @@ pub(crate) struct Asked {
 /// The encoders hold a repeat prefix, `lock` and the HLE hints against the
 /// mnemonic before any row is looked at (`repeat_prefix`,
 /// `check_lock_prefixes`), and write the bytes of those, of a segment word
-/// and of the size words around whatever encoded the instruction. The
-/// `rex` words, `notrack` and `bnd` are for the arms.
+/// and of the size words around whatever encoded the instruction, and
+/// the bits of a REX word into it or in front of it (`rex.w pfadd %mm1,
+/// %mm2` is `48 0f 0f d1 9e`). `notrack` and `bnd` are for the arms.
 pub(crate) fn stands_behind(prefixes: &[String]) -> bool {
     prefixes.iter().all(|word| {
         matches!(
@@ -417,7 +420,7 @@ pub(crate) fn stands_behind(prefixes: &[String]) -> bool {
                 | "fs"
                 | "gs"
                 | "ss"
-        )
+        ) || rex_prefix_word(word).is_some()
     })
 }
 
@@ -457,12 +460,26 @@ pub(crate) fn plan<'a>(
         Code::Bits32 => M32,
         Code::Bits16 => M16,
     };
-    for row in rows {
-        if row.flags & mode == 0 {
-            continue;
-        }
-        if let Some(learned) = row.take(&operands[..count], rounding, asked) {
-            return Some(Ok(learned));
+    let operands = &operands[..count];
+    let row_for = |asked: Asked| {
+        rows.iter()
+            .filter(|row| row.flags & mode != 0)
+            .find_map(|row| row.take(operands, rounding, asked))
+    };
+    if let Some(learned) = row_for(asked) {
+        return Some(Ok(learned));
+    }
+    // No row. Where one takes the operands in another encoding than the
+    // statement asks for, that is what is wrong with it, and GNU as's word.
+    if asked.evex || asked.vex {
+        let any = Asked {
+            evex: false,
+            vex: false,
+            ..asked
+        };
+        if row_for(any).is_some() {
+            let encoding = if asked.evex { "EVEX" } else { "VEX/XOP" };
+            return Some(Err(format!("no {encoding} encoding for `{name}'")));
         }
     }
     Some(Err(mismatch(name)))

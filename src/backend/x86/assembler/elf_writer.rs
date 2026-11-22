@@ -23,58 +23,24 @@ impl X86Arch for X86_64Arch {
         encoder.offset = section_data_len;
         encoder.encode(instr)?;
 
-        let instr_len = encoder.bytes.len();
-
-        // Detect jump instructions for relaxation
-        let jump = {
-            // A `data16`-prefixed jmp/jcc registers like its plain sibling:
-            // in 64-bit mode the 0x66 the central splice prepends is an
-            // architecturally dead prefix on near branches (Intel SDM; the
-            // decoder consumes the full 4-byte displacement regardless), so
-            // the row underneath is selected exactly as without the prefix
-            // and every length is one byte longer. Near targets relax to
-            // `66 eb/7x rel8` — byte-identical to GAS — and far or external
-            // targets keep `66 e9/0f 8x rel32`, the shortest VALID form
-            // (GAS 2.47 truncates the field to rel16 there, which
-            // mis-executes: the decoder reads two bytes past the
-            // instruction). `call` never registers (it has no short row).
-            let data16 = instr
-                .prefixes
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case("data16"));
-            // Match the encoder's normalization: GAS accepts `.s` on any
-            // mnemonic (`jmp.s` relaxes exactly like `jmp`) and is
-            // case-insensitive. Without this, `jmp.s` misclassifies as
-            // conditional (length 5 != 6) and is never relaxed.
-            let mnem_lower = instr.mnemonic.to_ascii_lowercase();
-            let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
-            if is_jump && instr.operands.len() == 1 {
-                if let Operand::Label(_) = &instr.operands[0] {
-                    let is_conditional = mnem != "jmp";
-                    // Parens, not precedence: `if c {6} else {5} + x` reads
-                    // as though the `+ x` belonged to the else arm. It does
-                    // not (gp_integer.rs ships the same idiom, and the
-                    // data16 casefile pins the behavior) — but this line
-                    // decides which branches the relaxer adopts, so make
-                    // the grouping impossible to misread.
-                    let expected_len = (if is_conditional { 6 } else { 5 }) + usize::from(data16);
-                    if instr_len == expected_len {
-                        Some(JumpDetection {
-                            is_conditional,
-                            already_short: false,
-                            prefix66: data16,
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        // Detect jump instructions for relaxation: a `jmp` or `jcc` to a
+        // label, in the near form the encoder writes, behind whatever
+        // prefix words stand in front of it (`cs jne 1f`, `rex64 jmp 1f`:
+        // the bytes are read, not the length, which used to leave every
+        // prefixed jump but `data16`'s in its near form).
+        //
+        // A `data16`-prefixed jmp/jcc registers like its plain sibling:
+        // in 64-bit mode the 0x66 the central splice prepends is an
+        // architecturally dead prefix on near branches (Intel SDM; the
+        // decoder consumes the full 4-byte displacement regardless), so
+        // the row underneath is selected exactly as without the prefix
+        // and every length is one byte longer. Near targets relax to
+        // `66 eb/7x rel8` — byte-identical to GAS — and far or external
+        // targets keep `66 e9/0f 8x rel32`, the shortest VALID form
+        // (GAS 2.47 truncates the field to rel16 there, which
+        // mis-executes: the decoder reads two bytes past the
+        // instruction). `call` never registers (it has no short row).
+        let jump = JumpDetection::of(instr, &encoder.bytes, true);
 
         let relocations = encoder
             .relocations
@@ -114,45 +80,9 @@ impl X86Arch for X86_64Arch {
         encoder.offset = 0;
         encoder.encode(instr)?;
 
-        let instr_len = encoder.bytes.len();
-        // Jump relaxation detection: same rules as the native i686 writer,
+        // Jump relaxation detection: the rules of the native i686 writer,
         // including the short-only forms (jecxz/jcxz/loop have no long form).
-        let jump = {
-            // Same normalization as the 64-bit path above (`.s` + case).
-            let mnem_lower = instr.mnemonic.to_ascii_lowercase();
-            let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-            let is_jump = mnem == "jmp"
-                || mnem.starts_with("loop")
-                || (mnem.starts_with('j') && mnem.len() >= 2);
-            if is_jump && instr.operands.len() == 1 {
-                if let Operand::Label(_) = &instr.operands[0] {
-                    let is_short_only = is_short_only_branch(mnem);
-                    let is_conditional = mnem != "jmp";
-                    if is_short_only && is_short_only_encoding(&encoder.bytes) {
-                        Some(JumpDetection {
-                            is_conditional: true,
-                            already_short: true,
-                            prefix66: false,
-                        })
-                    } else {
-                        let expected_len = if is_conditional { 6 } else { 5 };
-                        if instr_len == expected_len {
-                            Some(JumpDetection {
-                                is_conditional,
-                                already_short: false,
-                                prefix66: false,
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let jump = JumpDetection::of(instr, &encoder.bytes, false);
 
         Ok(EncodeResult {
             bytes: encoder.bytes,

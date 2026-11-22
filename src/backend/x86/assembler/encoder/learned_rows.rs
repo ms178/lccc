@@ -98,9 +98,9 @@
 //! vpshaq vpshaw vpshlb vpshld vpshlq vpshlw vrcp14sd vrcp14ss vrcp28sd
 //! vrcp28ss vrcpbf16 vrcpss vreducebf16 vreducesh vrndscalebf16 vrndscalesh
 //! vrsqrt14sd vrsqrt14ss vrsqrt28sd vrsqrt28ss vrsqrtbf16 vrsqrtss
-//! vscalefbf16 vsha512msg1 vsha512msg2 vsha512rnds2 vsm3msg1 vsm3msg2
-//! vsm3rnds2 vsqrtbf16 vsubbf16 vucomxsd vucomxsh vucomxss wrssd wrussd xadd
-//! xaddb xaddl xaddw xrstors xsavec xsaves xsetbv
+//! vscalefbf16 vsm3msg1 vsm3msg2 vsm3rnds2 vsqrtbf16 vsubbf16 vucomxsd
+//! vucomxsh vucomxss wrssd wrussd xadd xaddb xaddl xaddw xrstors xsavec
+//! xsaves xsetbv
 
 #[rustfmt::skip]
 use super::learned::{
@@ -110,7 +110,7 @@ use super::learned::{
 
 /// The mnemonics that have rows, in order.
 #[rustfmt::skip]
-pub(super) static NAMES: [&str; 734] = [
+pub(super) static NAMES: [&str; 731] = [
     "aadd", "aand", "adcx", "adcxl", "adcxq", "adox", "adoxl", "adoxq", "aesdec128kl",
     "aesdec256kl", "aesdecwide128kl", "aesdecwide256kl", "aesenc128kl", "aesenc256kl",
     "aesencwide128kl", "aesencwide256kl", "aor", "axor", "blcfill", "blcfilll", "blcfillq", "blci",
@@ -205,15 +205,14 @@ pub(super) static NAMES: [&str; 734] = [
     "vpshab", "vpshad", "vpshaq", "vpshaw", "vpshlb", "vpshld", "vpshlq", "vpshlw", "vrcp14sd",
     "vrcp14ss", "vrcp28sd", "vrcp28ss", "vrcpbf16", "vrcpss", "vreducebf16", "vreducesh",
     "vrndscalebf16", "vrndscalesh", "vrsqrt14sd", "vrsqrt14ss", "vrsqrt28sd", "vrsqrt28ss",
-    "vrsqrtbf16", "vrsqrtss", "vscalefbf16", "vsha512msg1", "vsha512msg2", "vsha512rnds2",
-    "vsm3msg1", "vsm3msg2", "vsm3rnds2", "vsqrtbf16", "vsubbf16", "vucomxsd", "vucomxsh",
-    "vucomxss", "wrssd", "wrussd", "xadd", "xaddb", "xaddl", "xaddw", "xrstors", "xsavec", "xsaves",
-    "xsetbv",
+    "vrsqrtbf16", "vrsqrtss", "vscalefbf16", "vsm3msg1", "vsm3msg2", "vsm3rnds2", "vsqrtbf16",
+    "vsubbf16", "vucomxsd", "vucomxsh", "vucomxss", "wrssd", "wrussd", "xadd", "xaddb", "xaddl",
+    "xaddw", "xrstors", "xsavec", "xsaves", "xsetbv",
 ];
 
 /// Where the rows of each mnemonic of `NAMES` begin in `ROWS`, and the end.
 #[rustfmt::skip]
-pub(super) static STARTS: [u16; 735] = [
+pub(super) static STARTS: [u16; 732] = [
     0, 4, 8, 20, 26, 32, 44, 50, 56, 57, 58, 59, 60, 61, 62, 63, 64, 68, 72, 76, 78, 80, 84, 88, 90,
     92, 94, 96, 100, 102, 104, 108, 110, 112, 116, 118, 120, 124, 126, 128, 134, 136, 138, 140, 146,
     148, 150, 152, 153, 154, 155, 158, 162, 166, 170, 174, 178, 182, 186, 190, 194, 198, 202, 206,
@@ -254,15 +253,14 @@ pub(super) static STARTS: [u16; 735] = [
     2218, 2220, 2222, 2224, 2226, 2228, 2230, 2232, 2234, 2236, 2238, 2244, 2248, 2254, 2255, 2256,
     2262, 2266, 2272, 2273, 2274, 2276, 2278, 2281, 2284, 2287, 2290, 2293, 2296, 2298, 2300, 2303,
     2306, 2311, 2316, 2321, 2326, 2329, 2332, 2335, 2338, 2341, 2344, 2347, 2350, 2352, 2354, 2356,
-    2358, 2364, 2366, 2372, 2374, 2380, 2382, 2384, 2386, 2388, 2390, 2396, 2398, 2404, 2405, 2406,
-    2407, 2409, 2411, 2413, 2419, 2425, 2427, 2429, 2431, 2433, 2435, 2443, 2445, 2447, 2449, 2450,
-    2451, 2452, 2453,
+    2358, 2364, 2366, 2372, 2374, 2380, 2382, 2384, 2386, 2388, 2390, 2396, 2398, 2404, 2406, 2408,
+    2410, 2416, 2422, 2424, 2426, 2428, 2430, 2432, 2440, 2442, 2444, 2446, 2447, 2448, 2449, 2450,
 ];
 
 /// The rows, by mnemonic; of one mnemonic and one form, the encoding GNU as
 /// chooses first.
 #[rustfmt::skip]
-pub(super) static ROWS: [Row; 2453] = [
+pub(super) static ROWS: [Row; 2450] = [
     // aadd
     row(MODRM | M64 | M32 | M16, 0, [3, 11, 0, 0, 0], [1, 2, 0, 0, 0], 0, 2, 0, 0, 0xFC, -1, -1, -1, [0x00, 0x00, 0x00], 0, [0, 0, 0, 0, 0, 0, 0]), // r32 m
     row(MODRM | EGPR | M64 | WHEN_EVEX, 0, [3, 11, 0, 0, 0], [1, 2, 0, 0, 0], 2, 4, 0, 0, 0xFC, -1, -1, -1, [0x00, 0x00, 0x00], 0, [0, 0, 0, 0, 0, 0, 0]), // r32 m
@@ -3380,12 +3378,6 @@ pub(super) static ROWS: [Row; 2453] = [
     row(MODRM | MASK | ZERO | EGPR | M64 | M32 | M16, 0, [11, 6, 6, 0, 0], [2, 3, 1, 0, 0], 2, 6, 0, 0, 0x2C, -1, -1, -1, [0x00, 0x00, 0x00], 0, [4, 8, 1, 0, 0, 0, 0]), // m x x
     row(MODRM | MASK | ZERO | EGPR | M64 | M32 | M16, 0, [11, 7, 7, 0, 0], [2, 3, 1, 0, 0], 2, 6, 0, 1, 0x2C, -1, -1, -1, [0x00, 0x00, 0x00], 0, [5, 16, 1, 0, 0, 0, 0]), // m y y
     row(MODRM | MASK | ZERO | EGPR | M64 | M32 | M16, 0, [11, 8, 8, 0, 0], [2, 3, 1, 0, 0], 2, 6, 0, 2, 0x2C, -1, -1, -1, [0x00, 0x00, 0x00], 0, [6, 32, 1, 0, 0, 0, 0]), // m z z
-    // vsha512msg1
-    row(MODRM | M64 | M32 | M16, 0, [6, 7, 0, 0, 0], [2, 1, 0, 0, 0], 1, 2, 3, 1, 0xCC, -1, -1, -1, [0x00, 0x00, 0x00], 0, [0, 0, 0, 0, 0, 0, 0]), // x y
-    // vsha512msg2
-    row(MODRM | M64 | M32 | M16, 0, [7, 7, 0, 0, 0], [2, 1, 0, 0, 0], 1, 2, 3, 1, 0xCD, -1, -1, -1, [0x00, 0x00, 0x00], 0, [0, 0, 0, 0, 0, 0, 0]), // y y
-    // vsha512rnds2
-    row(MODRM | M64 | M32 | M16, 0, [6, 7, 7, 0, 0], [2, 3, 1, 0, 0], 1, 2, 3, 1, 0xCB, -1, -1, -1, [0x00, 0x00, 0x00], 0, [0, 0, 0, 0, 0, 0, 0]), // x y y
     // vsm3msg1
     row(MODRM | M64 | M32 | M16, 0, [6, 6, 6, 0, 0], [2, 3, 1, 0, 0], 1, 2, 0, 0, 0xDA, -1, -1, -1, [0x00, 0x00, 0x00], 0, [0, 0, 0, 0, 0, 0, 0]), // x x x
     row(MODRM | M64 | M32 | M16, 0, [11, 6, 6, 0, 0], [2, 3, 1, 0, 0], 1, 2, 0, 0, 0xDA, -1, -1, -1, [0x00, 0x00, 0x00], 0, [0, 0, 0, 0, 0, 0, 0]), // m x x
@@ -3455,16 +3447,21 @@ pub(super) static ROWS: [Row; 2453] = [
 /// The mnemonics of GNU as's table whose one-byte number has a range, in order:
 /// of every encoder's instructions, not of the rows above alone.
 #[rustfmt::skip]
-pub(super) static NUMBER_NAMES: [&str; 263] = [
-    "aad", "aam", "aeskeygenassist", "blendpd", "blendps", "bt", "btc", "btr", "bts", "cmppd",
+pub(super) static NUMBER_NAMES: [&str; 327] = [
+    "aad", "aam", "aeskeygenassist", "blendpd", "blendps", "bt", "btc", "btcl", "btcq", "btcw",
+    "btl", "btq", "btr", "btrl", "btrq", "btrw", "bts", "btsl", "btsq", "btsw", "btw", "cmppd",
     "cmpps", "cmpsd", "cmpss", "dppd", "dpps", "extractps", "gf2p8affineinvqb", "gf2p8affineqb",
-    "hreset", "in", "insertps", "int", "kshiftlb", "kshiftld", "kshiftlq", "kshiftlw", "kshiftrb",
-    "kshiftrd", "kshiftrq", "kshiftrw", "mpsadbw", "out", "palignr", "pblendw", "pclmulqdq",
-    "pcmpestri", "pcmpestrm", "pcmpistri", "pcmpistrm", "pextrb", "pextrd", "pextrq", "pextrw",
-    "pinsrb", "pinsrd", "pinsrq", "pinsrw", "pshufd", "pshufhw", "pshuflw", "pshufw", "pslld",
-    "pslldq", "psllq", "psllw", "psrad", "psraw", "psrld", "psrldq", "psrlq", "psrlw", "rcl", "rcr",
-    "rol", "ror", "rorx", "roundpd", "roundps", "roundsd", "roundss", "sal", "sar", "sha1rnds4",
-    "shl", "shld", "shr", "shrd", "shufpd", "shufps", "tcvtrowd2ps", "tcvtrowps2bf16h",
+    "hreset", "in", "inl", "insertps", "int", "inw", "kshiftlb", "kshiftld", "kshiftlq", "kshiftlw",
+    "kshiftrb", "kshiftrd", "kshiftrq", "kshiftrw", "mpsadbw", "out", "outl", "outw", "palignr",
+    "pblendw", "pclmulqdq", "pcmpestri", "pcmpestril", "pcmpestriq", "pcmpestrm", "pcmpestrml",
+    "pcmpestrmq", "pcmpistri", "pcmpistrm", "pextrb", "pextrd", "pextrq", "pextrw", "pextrwl",
+    "pextrwq", "pinsrb", "pinsrd", "pinsrq", "pinsrw", "pinsrwl", "pinsrwq", "pshufd", "pshufhw",
+    "pshuflw", "pshufw", "pslld", "pslldq", "psllq", "psllw", "psrad", "psraw", "psrld", "psrldq",
+    "psrlq", "psrlw", "rcl", "rcll", "rclq", "rclw", "rcr", "rcrl", "rcrq", "rcrw", "rol", "roll",
+    "rolq", "rolw", "ror", "rorl", "rorq", "rorw", "rorx", "rorxl", "rorxq", "roundpd", "roundps",
+    "roundsd", "roundss", "sal", "sall", "salq", "salw", "sar", "sarl", "sarq", "sarw", "sha1rnds4",
+    "shl", "shld", "shldl", "shldq", "shldw", "shll", "shlq", "shlw", "shr", "shrd", "shrdl",
+    "shrdq", "shrdw", "shrl", "shrq", "shrw", "shufpd", "shufps", "tcvtrowd2ps", "tcvtrowps2bf16h",
     "tcvtrowps2bf16l", "tcvtrowps2phh", "tcvtrowps2phl", "tilemovrow", "vaeskeygenassist",
     "valignd", "valignq", "vblendpd", "vblendps", "vcmpbf16", "vcmppd", "vcmpph", "vcmpps",
     "vcmpsd", "vcmpsh", "vcmpss", "vcvtps2ph", "vdbpsadbw", "vdppd", "vdpps", "vextractf128",
@@ -3479,44 +3476,49 @@ pub(super) static NUMBER_NAMES: [&str; 263] = [
     "vinserti128", "vinserti32x4", "vinserti32x8", "vinserti64x2", "vinserti64x4", "vinsertps",
     "vminmaxbf16", "vminmaxpd", "vminmaxph", "vminmaxps", "vminmaxsd", "vminmaxsh", "vminmaxss",
     "vmpsadbw", "vpalignr", "vpblendd", "vpblendw", "vpclmulqdq", "vpcmpb", "vpcmpd", "vpcmpestri",
-    "vpcmpestrm", "vpcmpistri", "vpcmpistrm", "vpcmpq", "vpcmpub", "vpcmpud", "vpcmpuq", "vpcmpuw",
-    "vpcmpw", "vpcomb", "vpcomd", "vpcomq", "vpcomub", "vpcomud", "vpcomuq", "vpcomuw", "vpcomw",
-    "vperm2f128", "vperm2i128", "vpermil2pd", "vpermil2ps", "vpermilpd", "vpermilps", "vpermpd",
-    "vpermq", "vpextrb", "vpextrd", "vpextrq", "vpextrw", "vpinsrb", "vpinsrd", "vpinsrq",
-    "vpinsrw", "vprold", "vprolq", "vprord", "vprorq", "vprotb", "vprotd", "vprotq", "vprotw",
-    "vpshldd", "vpshldq", "vpshldw", "vpshrdd", "vpshrdq", "vpshrdw", "vpshufd", "vpshufhw",
-    "vpshuflw", "vpslld", "vpslldq", "vpsllq", "vpsllw", "vpsrad", "vpsraq", "vpsraw", "vpsrld",
-    "vpsrldq", "vpsrlq", "vpsrlw", "vpternlogd", "vpternlogq", "vrangepd", "vrangeps", "vrangesd",
-    "vrangess", "vreducebf16", "vreducepd", "vreduceph", "vreduceps", "vreducesd", "vreducesh",
-    "vreducess", "vrndscalebf16", "vrndscalepd", "vrndscaleph", "vrndscaleps", "vrndscalesd",
-    "vrndscalesh", "vrndscaless", "vroundpd", "vroundps", "vroundsd", "vroundss", "vshuff32x4",
-    "vshuff64x2", "vshufi32x4", "vshufi64x2", "vshufpd", "vshufps", "vsm3rnds2", "xabort",
+    "vpcmpestril", "vpcmpestriq", "vpcmpestrm", "vpcmpestrml", "vpcmpestrmq", "vpcmpistri",
+    "vpcmpistrm", "vpcmpq", "vpcmpub", "vpcmpud", "vpcmpuq", "vpcmpuw", "vpcmpw", "vpcomb",
+    "vpcomd", "vpcomq", "vpcomub", "vpcomud", "vpcomuq", "vpcomuw", "vpcomw", "vperm2f128",
+    "vperm2i128", "vpermil2pd", "vpermil2ps", "vpermilpd", "vpermilps", "vpermpd", "vpermq",
+    "vpextrb", "vpextrd", "vpextrq", "vpextrw", "vpextrwl", "vpextrwq", "vpinsrb", "vpinsrd",
+    "vpinsrq", "vpinsrw", "vpinsrwl", "vpinsrwq", "vprold", "vprolq", "vprord", "vprorq", "vprotb",
+    "vprotd", "vprotq", "vprotw", "vpshldd", "vpshldq", "vpshldw", "vpshrdd", "vpshrdq", "vpshrdw",
+    "vpshufd", "vpshufhw", "vpshuflw", "vpslld", "vpslldq", "vpsllq", "vpsllw", "vpsrad", "vpsraq",
+    "vpsraw", "vpsrld", "vpsrldq", "vpsrlq", "vpsrlw", "vpternlogd", "vpternlogq", "vrangepd",
+    "vrangeps", "vrangesd", "vrangess", "vreducebf16", "vreducepd", "vreduceph", "vreduceps",
+    "vreducesd", "vreducesh", "vreducess", "vrndscalebf16", "vrndscalepd", "vrndscaleph",
+    "vrndscaleps", "vrndscalesd", "vrndscalesh", "vrndscaless", "vroundpd", "vroundps", "vroundsd",
+    "vroundss", "vshuff32x4", "vshuff64x2", "vshufi32x4", "vshufi64x2", "vshufpd", "vshufps",
+    "vsm3rnds2", "xabort",
 ];
 
 /// Where the ranges of each mnemonic of `NUMBER_NAMES` begin in `NUMBERS`, and the
 /// end.
 #[rustfmt::skip]
-pub(super) static NUMBER_STARTS: [u16; 264] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 23, 24, 25, 26, 27,
-    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 73, 83, 93, 103, 104, 105, 106, 107, 108, 118,
-    128, 129, 139, 140, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164,
-    165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183,
-    184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202,
-    203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221,
-    222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 242, 243, 244, 245,
-    246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264,
-    265, 266, 267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283,
-    284, 285, 286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301, 302,
-    303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317, 318, 319, 320, 321,
-    322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333, 334, 335, 336, 337, 338, 339, 340,
-    341, 342,
+pub(super) static NUMBER_STARTS: [u16; 328] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 50, 51, 52, 53,
+    54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77,
+    78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 99, 100, 101, 102, 112, 113, 114, 115, 125, 126,
+    127, 128, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 158, 159, 160, 161, 171, 172,
+    173, 174, 175, 185, 186, 187, 188, 189, 190, 191, 192, 202, 203, 204, 205, 206, 207, 208, 209,
+    210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228,
+    229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247,
+    248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266,
+    267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285,
+    286, 287, 288, 289, 290, 291, 292, 293, 294, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309,
+    310, 311, 312, 313, 314, 315, 316, 317, 318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328,
+    329, 330, 331, 332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347,
+    348, 349, 350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361, 362, 363, 364, 365, 366,
+    367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381, 382, 383, 384, 385,
+    386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397, 398, 399, 400, 401, 402, 403, 404,
+    405, 406, 407, 408,
 ];
 
 /// The ranges: of one form of a mnemonic (the kinds of its operands), or of every
 /// form it has (no kinds).
 #[rustfmt::skip]
-pub(super) static NUMBERS: [Number; 342] = [
+pub(super) static NUMBERS: [Number; 408] = [
     number(M32 | M16, [0, 0, 0, 0, 0], 2), // aad *: 0..=255
     number(M32 | M16, [0, 0, 0, 0, 0], 2), // aam *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // aeskeygenassist *: 0..=255
@@ -3524,8 +3526,20 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // blendps *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // bt *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btc *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btcl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // btcq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btcw *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // btq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btr *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btrl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // btrq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btrw *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // bts *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btsl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // btsq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btsw *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // btw *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // cmppd *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // cmpps *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // cmpsd *: 0..=255
@@ -3539,8 +3553,10 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64 | M32 | M16, [12, 14, 0, 0, 0], 2), // in i8 ax: 0..=255
     number(M64 | M32 | M16, [12, 15, 0, 0, 0], 2), // in i8 eax: 0..=255
     number(M64 | M32 | M16, [12, 0, 0, 0, 0], 2), // in i8: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // inl *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // insertps *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // int *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // inw *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // kshiftlb *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // kshiftld *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // kshiftlq *: 0..=255
@@ -3550,22 +3566,34 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // kshiftrq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // kshiftrw *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // mpsadbw *: -128..=255
-    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // out *: 0..=255
+    number(M64 | M32 | M16, [14, 12, 0, 0, 0], 2), // out ax i8: 0..=255
+    number(M64 | M32 | M16, [15, 12, 0, 0, 0], 2), // out eax i8: 0..=255
+    number(M64 | M32 | M16, [12, 0, 0, 0, 0], 2), // out i8: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // outl *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // outw *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // palignr *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // pblendw *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // pclmulqdq *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pcmpestri *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // pcmpestril *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // pcmpestriq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pcmpestrm *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // pcmpestrml *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // pcmpestrmq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pcmpistri *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pcmpistrm *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pextrb *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pextrd *: 0..=255
     number(M64, [0, 0, 0, 0, 0], 2), // pextrq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pextrw *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pextrwl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // pextrwq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pinsrb *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pinsrd *: 0..=255
     number(M64, [0, 0, 0, 0, 0], 2), // pinsrq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pinsrw *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // pinsrwl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // pinsrwq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // pshufd *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // pshufhw *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // pshuflw *: -128..=255
@@ -3590,6 +3618,9 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64, [12, 11, 2, 0, 0], 2), // rcl i8 m r16: 0..=255
     number(M64, [12, 11, 3, 0, 0], 2), // rcl i8 m r32: 0..=255
     number(M64, [12, 11, 4, 0, 0], 2), // rcl i8 m r64: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // rcll *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // rclq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // rclw *: 0..=255
     number(M64 | M32 | M16, [12, 2, 0, 0, 0], 2), // rcr i8 r16: 0..=255
     number(M64, [12, 2, 2, 0, 0], 2), // rcr i8 r16 r16: 0..=255
     number(M64 | M32 | M16, [12, 3, 0, 0, 0], 2), // rcr i8 r32: 0..=255
@@ -3600,6 +3631,9 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64, [12, 11, 2, 0, 0], 2), // rcr i8 m r16: 0..=255
     number(M64, [12, 11, 3, 0, 0], 2), // rcr i8 m r32: 0..=255
     number(M64, [12, 11, 4, 0, 0], 2), // rcr i8 m r64: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // rcrl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // rcrq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // rcrw *: 0..=255
     number(M64 | M32 | M16, [12, 2, 0, 0, 0], 1), // rol i8 r16: -128..=255
     number(M64, [12, 2, 2, 0, 0], 1), // rol i8 r16 r16: -128..=255
     number(M64 | M32 | M16, [12, 3, 0, 0, 0], 1), // rol i8 r32: -128..=255
@@ -3610,6 +3644,9 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64, [12, 11, 2, 0, 0], 1), // rol i8 m r16: -128..=255
     number(M64, [12, 11, 3, 0, 0], 1), // rol i8 m r32: -128..=255
     number(M64, [12, 11, 4, 0, 0], 1), // rol i8 m r64: -128..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // roll *: -128..=255
+    number(M64, [0, 0, 0, 0, 0], 1), // rolq *: -128..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // rolw *: -128..=255
     number(M64 | M32 | M16, [12, 2, 0, 0, 0], 1), // ror i8 r16: -128..=255
     number(M64, [12, 2, 2, 0, 0], 1), // ror i8 r16 r16: -128..=255
     number(M64 | M32 | M16, [12, 3, 0, 0, 0], 1), // ror i8 r32: -128..=255
@@ -3620,7 +3657,12 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64, [12, 11, 2, 0, 0], 1), // ror i8 m r16: -128..=255
     number(M64, [12, 11, 3, 0, 0], 1), // ror i8 m r32: -128..=255
     number(M64, [12, 11, 4, 0, 0], 1), // ror i8 m r64: -128..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // rorl *: -128..=255
+    number(M64, [0, 0, 0, 0, 0], 1), // rorq *: -128..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // rorw *: -128..=255
     number(M64, [0, 0, 0, 0, 0], 1), // rorx *: -128..=255
+    number(M64, [0, 0, 0, 0, 0], 1), // rorxl *: -128..=255
+    number(M64, [0, 0, 0, 0, 0], 1), // rorxq *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // roundpd *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // roundps *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // roundsd *: 0..=255
@@ -3635,6 +3677,9 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64, [12, 11, 2, 0, 0], 2), // sal i8 m r16: 0..=255
     number(M64, [12, 11, 3, 0, 0], 2), // sal i8 m r32: 0..=255
     number(M64, [12, 11, 4, 0, 0], 2), // sal i8 m r64: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // sall *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // salq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // salw *: 0..=255
     number(M64 | M32 | M16, [12, 2, 0, 0, 0], 2), // sar i8 r16: 0..=255
     number(M64, [12, 2, 2, 0, 0], 2), // sar i8 r16 r16: 0..=255
     number(M64 | M32 | M16, [12, 3, 0, 0, 0], 2), // sar i8 r32: 0..=255
@@ -3645,6 +3690,9 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64, [12, 11, 2, 0, 0], 2), // sar i8 m r16: 0..=255
     number(M64, [12, 11, 3, 0, 0], 2), // sar i8 m r32: 0..=255
     number(M64, [12, 11, 4, 0, 0], 2), // sar i8 m r64: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // sarl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // sarq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // sarw *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // sha1rnds4 *: -128..=255
     number(M64 | M32 | M16, [12, 2, 0, 0, 0], 2), // shl i8 r16: 0..=255
     number(M64, [12, 2, 2, 0, 0], 2), // shl i8 r16 r16: 0..=255
@@ -3657,6 +3705,12 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64, [12, 11, 3, 0, 0], 2), // shl i8 m r32: 0..=255
     number(M64, [12, 11, 4, 0, 0], 2), // shl i8 m r64: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shld *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shldl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // shldq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shldw *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shll *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // shlq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shlw *: 0..=255
     number(M64 | M32 | M16, [12, 2, 0, 0, 0], 2), // shr i8 r16: 0..=255
     number(M64, [12, 2, 2, 0, 0], 2), // shr i8 r16 r16: 0..=255
     number(M64 | M32 | M16, [12, 3, 0, 0, 0], 2), // shr i8 r32: 0..=255
@@ -3668,6 +3722,12 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64, [12, 11, 3, 0, 0], 2), // shr i8 m r32: 0..=255
     number(M64, [12, 11, 4, 0, 0], 2), // shr i8 m r64: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shrd *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shrdl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // shrdq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shrdw *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shrl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // shrq *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // shrw *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // shufpd *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // shufps *: -128..=255
     number(M64, [0, 0, 0, 0, 0], 2), // tcvtrowd2ps *: 0..=255
@@ -3766,7 +3826,11 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpcmpb *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpcmpd *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpcmpestri *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // vpcmpestril *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // vpcmpestriq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpcmpestrm *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // vpcmpestrml *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // vpcmpestrmq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpcmpistri *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpcmpistrm *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpcmpq *: 0..=255
@@ -3795,10 +3859,14 @@ pub(super) static NUMBERS: [Number; 342] = [
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpextrd *: 0..=255
     number(M64, [0, 0, 0, 0, 0], 2), // vpextrq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpextrw *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpextrwl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // vpextrwq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpinsrb *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpinsrd *: 0..=255
     number(M64, [0, 0, 0, 0, 0], 2), // vpinsrq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpinsrw *: 0..=255
+    number(M64 | M32 | M16, [0, 0, 0, 0, 0], 2), // vpinsrwl *: 0..=255
+    number(M64, [0, 0, 0, 0, 0], 2), // vpinsrwq *: 0..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // vprold *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // vprolq *: -128..=255
     number(M64 | M32 | M16, [0, 0, 0, 0, 0], 1), // vprord *: -128..=255

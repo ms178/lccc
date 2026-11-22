@@ -1,0 +1,67 @@
+# `urdmsr`, `uwrmsr`, `rdmsr` and `wrmsrns` with the MSR number as an operand,
+# one statement a group, each held to GNU as 2.47. The number is an unsigned
+# 32-bit field: 0..0xffffffff, or a symbol with R_X86_64_32, which lccc
+# refused ("operand type mismatch for `urdmsr_imm'").
+;;; urdmsr_ext_rcx
+.text
+urdmsr $ext, %rcx
+;;; uwrmsr_rcx_ext
+.text
+uwrmsr %rcx, $ext
+;;; wrmsrns_rcx_ext
+.text
+wrmsrns %rcx, $ext
+;;; rdmsr_ext_rcx
+.text
+rdmsr $ext, %rcx
+;;; urdmsr_0x1234_rcx
+.text
+urdmsr $0x1234, %rcx
+;;; uwrmsr_rcx_0x1234
+.text
+uwrmsr %rcx, $0x1234
+;;; wrmsrns_rcx_0x1234
+.text
+wrmsrns %rcx, $0x1234
+;;; rdmsr_0x1234_rcx
+.text
+rdmsr $0x1234, %rcx
+;;; urdmsr_ext_4_r9
+.text
+urdmsr $ext+4, %r9
+;;; wrmsrns_r17_ext
+.text
+wrmsrns %r17, $ext
+;;; rdmsr_ext_r31
+.text
+rdmsr $ext, %r31
+;;; urdmsr_rax_rcx
+.text
+urdmsr %rax, %rcx
+;;; uwrmsr_rcx_rax
+.text
+uwrmsr %rcx, %rax
+;;; urdmsr_ext_got_rcx reject
+.text
+urdmsr $ext@GOT, %rcx
+;;; urdmsr_1_rcx reject
+.text
+urdmsr $-1, %rcx
+;;; urdmsr_0x100000000_rcx reject
+.text
+urdmsr $0x100000000, %rcx
+;;; urdmsr_0xffffffff_rcx
+.text
+urdmsr $0xffffffff, %rcx
+;;; uwrmsr_rcx_1 reject
+.text
+uwrmsr %rcx, $-1
+;;; wrmsrns_rcx_0x100000000 reject
+.text
+wrmsrns %rcx, $0x100000000
+;;; urdmsr_0x1234_r16
+.text
+urdmsr $0x1234, %r16
+;;; uwrmsr_r31_0x1234
+.text
+uwrmsr %r31, $0x1234

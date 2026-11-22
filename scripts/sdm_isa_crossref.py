@@ -500,15 +500,21 @@ LEGACY_SPECS = {
                      "reg": ("const", 5)},
                     {"family": "legacy", "map": ("const", "none"),
                      "pp": ("const", "none"), "opcode": 0xEA}],
-    # movabs: REX.W + B8+rd with a 64-bit immediate, i.e. the MOV class.
-    "encode_movabs": {"family": "legacy", "map": ("const", "none"),
-                      "pp": ("const", "none"), "opcode": 0xB8,
-                      "opreg": True},
+    # movabs: REX.W + B8+rd with a 64-bit immediate, and the accumulator at a
+    # 64-bit address (A0..A3), i.e. the MOV class.  `encode_movabs_sized` is
+    # the same encoder behind the check of a size suffix.
+    "encode_movabs": [{"family": "legacy", "map": ("const", "none"),
+                       "pp": ("const", "none"), "opcode": 0xB8,
+                       "opreg": True}]
+                     + [{"family": "legacy", "map": ("const", "none"),
+                         "pp": ("const", "none"), "opcode": opcode}
+                        for opcode in (0xA0, 0xA1, 0xA2, 0xA3)],
     "encode_int": {"family": "legacy", "map": ("const", "none"),
                    "pp": ("const", "none"), "opcode": 0xCD},
     "encode_cvtsi2x": {"family": "legacy", "map": ("const", "0f"),
                        "pp": ("argpp", 2), "opcode": ("arg", 1)},
 }
+LEGACY_SPECS["encode_movabs_sized"] = LEGACY_SPECS["encode_movabs"]
 
 # The VEX helpers take the opcode map and the mandatory prefix as arguments in
 # the 64-bit encoder (`mm` 1..3, `pp` 0..3) and select the map in the body in the
@@ -758,6 +764,7 @@ ALIASES = {
     # `CALL_FAR`, `JMP_FAR`, `RET_FAR`.
     "lcall": "CALL_FAR", "ljmp": "JMP_FAR",
     "movabs": "MOV", "movabsq": "MOV", "movabsl": "MOV",
+    "movabsw": "MOV", "movabsb": "MOV",
     # The 32-bit/64-bit string forms are their own classes in XED, and AT&T
     # spells them with an `l` suffix that the class name does not have.
     "movsl": "MOVSD", "cmpsl": "CMPSD", "stosl": "STOSD",

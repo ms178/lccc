@@ -1,0 +1,320 @@
+# `{rex2}` asks for a REX2 prefix whatever the registers are, one statement a
+# group, each held to GNU as 2.47: on an instruction of the legacy maps 0 and
+# 1 it is written (`{rex2} nop` is d5 00 90, `{rex2} pause` f3 d5 00 90);
+# where no REX2 form exists GNU as refuses the statement (VEX and EVEX
+# instructions, the maps 0F 38 and 0F 3A, `xsave`, `in`, `wrmsr`, the
+# string instructions, direct jumps and calls); with one
+# of %ah %ch %dh %bh, which no instruction behind a REX prefix can name, the
+# request is dropped and the statement assembled as written (`{rex2} mov
+# %ah, %al` is 88 e0).
+#
+# Not here, because GNU as 2.47 is wrong about them: `{rex2} mov $5, %dh`
+# and the other statements of a number and a high-byte register. GNU as
+# writes d5 00 b6 05, which is `mov $5, %sil` (establish_rex in tc-i386.c
+# counts its last operand from the wrong end when there is a number, so the
+# loop that looks for a high-byte register sees none). lccc drops the
+# request there as it does everywhere else; the encoder's unit test
+# `rex2_request_with_a_high_byte_register` pins the bytes.
+;;; rex2_nop
+.text
+{rex2} nop
+;;; rex2_syscall
+.text
+{rex2} syscall
+;;; rex2_pause
+.text
+{rex2} pause
+;;; rex2_pfadd_mm1_mm2
+.text
+{rex2} pfadd %mm1, %mm2
+;;; rex2_test_5_al
+.text
+{rex2} test $5, %al
+;;; rex2_xbegin_1f_1
+.text
+{rex2} xbegin 1f
+1:
+;;; rex2_mov_ah_al
+.text
+{rex2} mov %ah, %al
+;;; rex2_addl_eax_ebx
+.text
+{rex2} addl %eax, %ebx
+;;; rex2_vaddps_xmm1_xmm2_xmm3 reject
+.text
+{rex2} vaddps %xmm1, %xmm2, %xmm3
+;;; rex2_jo_1f_1 reject
+.text
+{rex2} jo 1f
+1:
+;;; rex2_clwb_rbx
+.text
+{rex2} clwb (%rbx)
+;;; rex2_xsave_rbx reject
+.text
+{rex2} xsave (%rbx)
+;;; rex2_movabs_0x1122334455667788_rax
+.text
+{rex2} movabs $0x1122334455667788, %rax
+;;; rex2_in_5_al reject
+.text
+{rex2} in $5, %al
+;;; movb_ah_r8b reject
+.text
+movb %ah, %r8b
+;;; movb_ah_sil reject
+.text
+movb %ah, %sil
+;;; movb_ah_bl
+.text
+movb %ah, %bl
+;;; rex2_movzbl_ah_eax
+.text
+{rex2} movzbl %ah, %eax
+;;; rex2_mov_dh_rax
+.text
+{rex2} mov %dh, (%rax)
+;;; rex2_mov_rax_dh
+.text
+{rex2} mov (%rax), %dh
+;;; rex2_inc_dh
+.text
+{rex2} inc %dh
+;;; rex2_shl_cl_dh
+.text
+{rex2} shl %cl, %dh
+;;; rex2_movzbl_dh_eax
+.text
+{rex2} movzbl %dh, %eax
+;;; rex2_mov_dh_r16b reject
+.text
+{rex2} mov %dh, %r16b
+;;; rex2_mov_5_dl
+.text
+{rex2} mov $5, %dl
+;;; rex2_xchg_dh_al
+.text
+{rex2} xchg %dh, %al
+;;; rex2_setc_dh
+.text
+{rex2} setc %dh
+;;; rex2_neg_dh
+.text
+{rex2} neg %dh
+;;; rex2_movl_1_eax
+.text
+{rex2} movl $1, %eax
+;;; rex2_movaps_xmm0_xmm1
+.text
+{rex2} movaps %xmm0, %xmm1
+;;; rex2_vmovaps_xmm0_xmm1 reject
+.text
+{rex2} vmovaps %xmm0, %xmm1
+;;; rex2_jmp_1f_1 reject
+.text
+{rex2} jmp 1f
+1:
+;;; rex2_call_1f_1 reject
+.text
+{rex2} call 1f
+1:
+;;; rex2_jmp_rax
+.text
+{rex2} jmp *%rax
+;;; rex2_call_rax
+.text
+{rex2} call *(%rax)
+;;; rex2_loop_1f_1 reject
+.text
+{rex2} loop 1f
+1:
+;;; rex2_jrcxz_1f_1 reject
+.text
+{rex2} jrcxz 1f
+1:
+;;; rex2_ret
+.text
+{rex2} ret
+;;; rex2_push_rax
+.text
+{rex2} push %rax
+;;; rex2_pop_r8
+.text
+{rex2} pop %r8
+;;; rex2_push_5
+.text
+{rex2} push $5
+;;; rex2_bswap_eax
+.text
+{rex2} bswap %eax
+;;; rex2_movsb reject
+.text
+{rex2} movsb
+;;; rex2_rep_movsb reject
+.text
+{rex2} rep movsb
+;;; rex2_lock_addl_1_rax
+.text
+{rex2} lock addl $1, (%rax)
+;;; rex2_cpuid
+.text
+{rex2} cpuid
+;;; rex2_fnop
+.text
+{rex2} fnop
+;;; rex2_movd_eax_xmm0
+.text
+{rex2} movd %eax, %xmm0
+;;; rex2_pshufb_xmm0_xmm1 reject
+.text
+{rex2} pshufb %xmm0, %xmm1
+;;; rex2_popcnt_eax_ebx
+.text
+{rex2} popcnt %eax, %ebx
+;;; rex2_crc32b_al_eax reject
+.text
+{rex2} crc32b %al, %eax
+;;; rex2_imul_5_eax_ebx
+.text
+{rex2} imul $5, %eax, %ebx
+;;; rex2_lea_rax_ebx
+.text
+{rex2} lea (%rax), %ebx
+;;; rex2_cltq
+.text
+{rex2} cltq
+;;; rex2_xchg_eax_eax
+.text
+{rex2} xchg %eax, %eax
+;;; rex2_xchg_rax_rax
+.text
+{rex2} xchg %rax, %rax
+;;; rex2_movq_rax_xmm0
+.text
+{rex2} movq %rax, %xmm0
+;;; rex2_mov_cr0_rax
+.text
+{rex2} mov %cr0, %rax
+;;; rex2_mov_fs_eax
+.text
+{rex2} mov %fs, %eax
+;;; rex2_movbe_rax_ebx reject
+.text
+{rex2} movbe (%rax), %ebx
+;;; rex2_adcx_eax_ebx reject
+.text
+{rex2} adcx %eax, %ebx
+;;; rex2_emms
+.text
+{rex2} emms
+;;; rex2_leave
+.text
+{rex2} leave
+;;; rex2_int3
+.text
+{rex2} int3
+;;; rex2_hlt
+.text
+{rex2} hlt
+;;; rex2_xlat
+.text
+{rex2} xlat
+;;; rex2_wrmsr reject
+.text
+{rex2} wrmsr
+;;; rex2_rdtsc reject
+.text
+{rex2} rdtsc
+;;; rex2_ud2
+.text
+{rex2} ud2
+;;; rex2_cmpxchg16b_rax
+.text
+{rex2} cmpxchg16b (%rax)
+;;; rex2_fxsave_rax
+.text
+{rex2} fxsave (%rax)
+;;; rex2_clflush_rax
+.text
+{rex2} clflush (%rax)
+;;; rex2_prefetcht0_rax
+.text
+{rex2} prefetcht0 (%rax)
+;;; rex2_sfence
+.text
+{rex2} sfence
+;;; rex2_movnti_eax_rbx
+.text
+{rex2} movnti %eax, (%rbx)
+;;; rex2_ptest_xmm0_xmm1 reject
+.text
+{rex2} ptest %xmm0, %xmm1
+;;; rex2_aesenc_xmm0_xmm1 reject
+.text
+{rex2} aesenc %xmm0, %xmm1
+;;; rex2_sha1nexte_xmm0_xmm1 reject
+.text
+{rex2} sha1nexte %xmm0, %xmm1
+;;; rex2_kmovw_k1_k2 reject
+.text
+{rex2} kmovw %k1, %k2
+;;; rex2_andn_eax_ebx_ecx reject
+.text
+{rex2} andn %eax, %ebx, %ecx
+;;; rex2_endbr64
+.text
+{rex2} endbr64
+;;; rex2_rdfsbase_rax
+.text
+{rex2} rdfsbase %rax
+;;; rex2_xgetbv
+.text
+{rex2} xgetbv
+;;; rex2_bsf_eax_ebx
+.text
+{rex2} bsf %eax, %ebx
+;;; rex2_tzcnt_eax_ebx
+.text
+{rex2} tzcnt %eax, %ebx
+;;; rex2_cmovne_eax_ebx
+.text
+{rex2} cmovne %eax, %ebx
+;;; rex2_setne_al
+.text
+{rex2} setne %al
+;;; rex2_movzbl_al_eax
+.text
+{rex2} movzbl %al, %eax
+;;; rex2_enter_8_0
+.text
+{rex2} enter $8, $0
+;;; rex2_lret
+.text
+{rex2} lret
+;;; rex2_iretq
+.text
+{rex2} iretq
+;;; rex2_sysretq
+.text
+{rex2} sysretq
+;;; rex2_swapgs
+.text
+{rex2} swapgs
+;;; rex2_invlpg_rax
+.text
+{rex2} invlpg (%rax)
+;;; rex2_lgdt_rax
+.text
+{rex2} lgdt (%rax)
+;;; rex2_monitor
+.text
+{rex2} monitor
+;;; rex2_rdpid_rax
+.text
+{rex2} rdpid %rax
+;;; rex2_wrussq_rax_rbx reject
+.text
+{rex2} wrussq %rax, (%rbx)
+;;; rex2_incsspq_rax
+.text
+{rex2} incsspq %rax

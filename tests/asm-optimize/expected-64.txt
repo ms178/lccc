@@ -17,8 +17,8 @@
 #   other <mnemonic> <count> <digest>: the same length, other bytes.
 #   kind <written> <rewritten> <count>: what lccc rewrites to what, as
 #     objdump reads the two encodings.
-statements 164621
-assembled 73582
+statements 164511
+assembled 73623
 swept aadd 9 7b151874
 swept aand 10 4b0fb113
 swept adc 377 0f1118cb
@@ -1162,7 +1162,6 @@ swept llwpcb 6 28170c7d
 swept lmsw 6 1f185efd
 swept lmsww 6 27a7c982
 swept loadiwkey 3 d5bc694d
-swept lock 1 0c030586
 swept lods 1 b82963b4
 swept lodsb 10 c81be1a1
 swept lodsl 7 48f5e350
@@ -1339,14 +1338,14 @@ swept orpd 5 53f18c6b
 swept orps 2 89c28705
 swept orq 75 f036a560
 swept orw 70 3fbdf08e
-swept out 15 c903c0b4
-swept outb 11 adebd261
-swept outl 11 1f49109c
+swept out 25 3fa932ac
+swept outb 18 1ac32ae7
+swept outl 13 07c57412
 swept outs 1 5094f8ca
 swept outsb 6 f4fd7b8f
 swept outsl 6 5ad54d91
 swept outsw 6 d4d48747
-swept outw 11 fa01a7c8
+swept outw 12 02688479
 swept pabsb 46 0c7de277
 swept pabsd 45 6da5301d
 swept pabsw 10 837f014a
@@ -1583,11 +1582,6 @@ swept rdsspd 3 4def0bad
 swept rdsspq 3 12238bb7
 swept rdtsc 1 eb2de269
 swept rdtscp 1 47835537
-swept rep 1 ca27e538
-swept repe 1 9fad0c9f
-swept repne 1 b7a15529
-swept repnz 1 bafcec20
-swept repz 1 f11cc2c7
 swept ret 9 e85b1d68
 swept retf 9 1c624e69
 swept retfl 9 d42e8998
@@ -2002,8 +1996,8 @@ swept unpckhpd 5 4844ce9c
 swept unpckhps 6 9f34b553
 swept unpcklpd 4 9d038b0b
 swept unpcklps 5 55fb2885
-swept urdmsr 26 22a5cc41
-swept uwrmsr 8 68e0f2d8
+swept urdmsr 28 9abf5d34
+swept uwrmsr 20 1358c3e8
 swept v4fmaddps 6 7c3bec99
 swept v4fmaddss 7 cef0032c
 swept v4fnmaddps 6 80792cc1
@@ -3376,14 +3370,13 @@ swept vxorpd 5 30463ca8
 swept vxorps 6 740b2b99
 swept vzeroall 1 24d60ef4
 swept vzeroupper 1 c958fe7f
-swept wait 1 716ecabb
 swept wbinvd 1 50598bc6
 swept wbnoinvd 1 050db334
 swept wrfsbase 6 807205c4
 swept wrgsbase 6 bbf0964b
 swept wrmsr 1 505d2fe9
 swept wrmsrlist 1 ddfa4c7f
-swept wrmsrns 1 e76daede
+swept wrmsrns 15 9684fafe
 swept wrpkru 1 1d6790a5
 swept wrssd 11 42c1b9ec
 swept wrssq 45 d2d1dc6a
@@ -3575,7 +3568,7 @@ swept {nf}xorl 132 9e8ed3aa
 swept {nf}xorq 126 681a81dc
 swept {nf}xorw 161 7c269713
 O2 rewritten 8066 521ce850
-O2 equal 65713
+O2 equal 65755
 O2 longer vcmpfalse_osss %xmm9, %xmm1, %xmm1
 O2 longer vcmpunord_sss %xmm9, %xmm1, %xmm1
 O2 longer vextractf64x2 $0, %zmm20, (%rsp)
@@ -4196,7 +4189,6 @@ O2 shorter vucomxss 10 35994a78
 O2 shorter vunpcklps 10 211647ee
 O2 shorter wrssq 10 085d8b68
 O2 shorter wrussq 10 7a01596e
-O2 shorter xadd 1 488b895a
 O2 shorter xchg 16 9b2c156b
 O2 shorter xchgb 16 f97895fd
 O2 shorter xor 35 f5a204cb
@@ -4967,7 +4959,7 @@ O2 kind {nf}subw decw 1
 O2 kind {nf}subw incw 1
 O2 kind {nf}xor mov 16
 Os rewritten 8609 83522db4
-Os equal 66899
+Os equal 66941
 Os longer vcmpfalse_osss %xmm9, %xmm1, %xmm1
 Os longer vcmpunord_sss %xmm9, %xmm1, %xmm1
 Os longer vextractf64x2 $0, %zmm20, (%rsp)
@@ -5515,7 +5507,6 @@ Os shorter vucomxss 10 35994a78
 Os shorter vunpcklps 10 211647ee
 Os shorter wrssq 10 085d8b68
 Os shorter wrussq 10 7a01596e
-Os shorter xadd 1 488b895a
 Os shorter xchg 16 9b2c156b
 Os shorter xchgb 16 f97895fd
 Os shorter xor 35 f5a204cb
