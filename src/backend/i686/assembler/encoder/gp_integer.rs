@@ -31,6 +31,39 @@ fn infer_movext_dst_size(ops: &[Operand], src_size: u8) -> Result<u8, String> {
 /// The one operand of a near branch as an indirect target, when it is one
 /// written without its `*` (`jmp %eax`, `call (%edx)`): GNU as takes it,
 /// with a warning. A bare symbol or number is a direct target.
+/// Whether `value` is a 16-bit number as GNU as reads one: signed or
+/// unsigned, or the 32-bit spelling of a negative one (`0xffff8000`).
+fn fits_word(value: i64) -> bool {
+    (-0x8000..=0xFFFF).contains(&value) || (0xFFFF_8000..=0xFFFF_FFFF).contains(&value)
+}
+
+/// `jmpl` and `calll` go through a 32-bit register or a pointer (`calll
+/// *%cx` was `callw *%cx`); and a direct jump has no sized spelling at
+/// all, where a direct call has two (`jmpl label` is "invalid instruction
+/// suffix" for GNU as in every mode, `calll label` is not).
+pub(super) fn check_long_branch(ops: &[Operand], name: &str) -> Result<(), String> {
+    let register = match ops {
+        [Operand::Register(register)] => Some(register),
+        [Operand::Indirect(inner)] => match inner.as_ref() {
+            Operand::Register(register) => Some(register),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(register) = register {
+        if reg_size(&register.name) != 4 {
+            return Err(format!(
+                "incorrect register `%{}' used with `l' suffix",
+                register.name
+            ));
+        }
+    }
+    if name == "jmp" && matches!(ops, [Operand::Label(_)]) {
+        return Err("invalid instruction suffix for `jmp'".to_string());
+    }
+    Ok(())
+}
+
 fn star_less_target(ops: &[Operand]) -> Option<Operand> {
     match ops {
         [target] if crate::backend::x86::assembler::encoder::is_star_less_target(target) => {
@@ -1840,6 +1873,15 @@ impl super::InstructionEncoder {
             Some(Operand::Register(r)) => reg_size(&r.name),
             _ => 4,
         };
+        // The `l` spellings say 32 bits (`bsfl 0x1000, %cx` was `bsfw`).
+        if size != 4 && mnemonic.ends_with('l') {
+            if let Some(Operand::Register(r)) = ops.get(1) {
+                return Err(format!(
+                    "incorrect register `%{}' used with `l' suffix",
+                    r.name
+                ));
+            }
+        }
         if size == 2 {
             self.sized_op = true;
             self.bytes.push(0x66);
@@ -2067,17 +2109,10 @@ impl super::InstructionEncoder {
                     // `e9 00 00` + PC16 for forward targets; short local
                     // targets get relaxed to EB rel8 by GAS — lccc's fixed
                     // rel16 form is semantically identical and local
-                    // targets fold to constants in the writer). `jmpl` is
-                    // the 32-bit spelling: `66 e9` and a 32-bit
-                    // displacement, the prefix added by the inversion.
+                    // targets fold to constants in the writer).
                     self.bytes.push(0xE9);
-                    if self.sized_op {
-                        self.add_relocation(sym, R_386_PC32, -4);
-                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-                    } else {
-                        self.add_relocation(sym, R_386_PC16, -2);
-                        self.bytes.extend_from_slice(&[0, 0]);
-                    }
+                    self.add_relocation(sym, R_386_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
                     return Ok(());
                 }
                 if self.explicit_data16 {
@@ -2213,6 +2248,21 @@ impl super::InstructionEncoder {
             _ => self.default_operand_size(),
         };
         let mismatch = || format!("operand type mismatch for `{name}'");
+        // A 16-bit offset has to be one, and so has the selector beside a
+        // 32-bit offset (`ljmpw $0x1234, $0x12345678` jumped to `0x5678`).
+        // Beside a 16-bit offset GNU as cuts the selector to its 16 bits.
+        if let [Operand::Immediate(segment), Operand::Immediate(offset)] = ops {
+            let word = |value: &ImmediateValue| match value {
+                ImmediateValue::Integer(value) => fits_word(*value),
+                _ => true,
+            };
+            if size == 2 && !word(offset) {
+                return Err("16-bit jump out of range".to_string());
+            }
+            if size == 4 && !word(segment) {
+                return Err(mismatch());
+            }
+        }
         self.sized_op = true;
         if size == 2 {
             self.bytes.push(0x66);

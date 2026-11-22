@@ -13,9 +13,9 @@
 rows 4848
 statements 31065
 assembled 18492
-same 15515
-foreign 41044
-refused 38848
+same 15518
+foreign 53444
+refused 51248
 shorter vcmpfalse_oqps %ymm10, %ymm2, %ymm10
 shorter vcmpneq_ospd %xmm9, %xmm1, %xmm1
 shorter vpaddb %ymm10, %ymm2, %ymm10
@@ -283,8 +283,6 @@ reject lretq 1 6b0f04e5
 reject lretw 1 7e2d77b8
 reject maskmovdqu 2 9a9088bf
 reject maskmovq 4 2e9fe882
-reject movabsb 1 0f47bef0
-reject movabsw 1 2c47230b
 reject movdq2q 4 5b219602
 reject movq2dq 4 5a8dbc82
 reject movrs 12 e5cbf786
@@ -723,7 +721,6 @@ reject vpcomud 4 a14e2e4e
 reject vpcomuq 3 0fc5432b
 reject vpcomuw 2 eeb99e6e
 reject vpcomw 3 f33a4e26
-reject vperm2f128 1 c698952a
 reject vpmadcsswd 4 a7c12a9c
 reject vpmadcswd 3 d23c4d73
 reject vpmovb2m 6 f9b0f658

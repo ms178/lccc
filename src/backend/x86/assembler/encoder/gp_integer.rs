@@ -1505,9 +1505,14 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_unary(size, &dst.name);
+                // The accumulator's own opcodes are in a row REX2 cannot
+                // stand in front of: under `{rex2}` the general form is
+                // written (GNU as: `{rex2} test $5, %al` = `D5 00 F6 C0
+                // 05`).
+                let short = is_accum(&dst.name) && !self.apx_rex2;
 
                 if size == 1 {
-                    if is_accum(&dst.name) {
+                    if short {
                         self.bytes.push(0xA8);
                     } else {
                         self.bytes.push(0xF6);
@@ -1515,7 +1520,7 @@ impl super::InstructionEncoder {
                     }
                     self.bytes.push(val as u8);
                 } else {
-                    if is_accum(&dst.name) {
+                    if short {
                         self.bytes.push(0xA9);
                     } else {
                         self.bytes.push(0xF7);
@@ -2288,7 +2293,11 @@ impl super::InstructionEncoder {
     /// bytes wide. The encoders here take a register's number and the
     /// operand size from the mnemonic: `sarl $1, %r9b` was `sarl $1,
     /// %r9d`, and `shrd %cl, %ebp, %r13` shifted `%rbp` in.
-    fn check_operand_size(mnemonic: &str, operands: &[Operand], size: u8) -> Result<(), String> {
+    pub(crate) fn check_operand_size(
+        mnemonic: &str,
+        operands: &[Operand],
+        size: u8,
+    ) -> Result<(), String> {
         for operand in operands {
             if let Operand::Register(register) = operand {
                 if matches!(reg_class(&register.name), RegClass::Gp(width) if width != size) {
@@ -2589,13 +2598,28 @@ impl super::InstructionEncoder {
 
         let cc_str = &mnemonic[3..];
         // Try the condition code as-is first, then strip trailing 'b' suffix
-        let cc = cc_from_mnemonic(cc_str).or_else(|_| {
+        let as_written = cc_from_mnemonic(cc_str);
+        // The suffix names a byte: `setgeb %ecx` is no statement (it was
+        // assembled as `setge %ecx`, the APX instruction that clears the
+        // rest of the register).
+        let byte_suffix = as_written.is_err();
+        let cc = as_written.or_else(|_| {
             if let Some(stripped) = cc_str.strip_suffix('b') {
                 cc_from_mnemonic(stripped)
             } else {
                 Err(format!("unknown condition code: {}", cc_str))
             }
         })?;
+        if byte_suffix {
+            if let Operand::Register(reg) = &ops[0] {
+                if infer_reg_size(&reg.name) != 1 {
+                    return Err(format!(
+                        "incorrect register `%{}' used with `b' suffix",
+                        reg.name
+                    ));
+                }
+            }
+        }
 
         // APX auto-promotion (GAS 2.47 byte-probed): a 32/64-bit REGISTER
         // destination cannot use the legacy byte form — that would write
@@ -2827,11 +2851,14 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// A direct near branch has no 16-bit form in long mode that a
+    /// A direct near call has no 16-bit form in long mode that a
     /// processor reads the way it is written (see `encode_jmp`), so the
-    /// `w` spelling is for indirect targets only.
-    fn refuse_word_branch(mnemonic: &str, name: &str) -> Result<(), String> {
-        if mnemonic.strip_prefix(name) == Some("w") {
+    /// `w` spelling is for indirect targets only. (GNU as assembles
+    /// `callw label` to `66 e8` and a 16-bit displacement, which one make
+    /// of processor reads as written and the other reads two bytes more
+    /// of.)
+    fn refuse_word_call(mnemonic: &str) -> Result<(), String> {
+        if mnemonic == "callw" {
             return Err(format!(
                 "`{mnemonic}' with a direct target is not supported in 64-bit mode"
             ));
@@ -2846,7 +2873,12 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
-                Self::refuse_word_branch(mnemonic, "jmp")?;
+                // A direct jump has no sized spelling: GNU as refuses
+                // `jmpq label` as it does `jmpw label` (what a jump jumps
+                // over is found when the labels are).
+                if mnemonic != "jmp" {
+                    return Err("invalid instruction suffix for `jmp'".to_string());
+                }
                 // Near jump with 32-bit displacement (will be resolved by linker/relocator)
                 // Always use R_X86_64_PLT32 for branch targets, matching modern GCC/binutils.
                 // R_X86_64_PC32 is rejected by ld for PIE executables calling shared lib functions.
@@ -2931,7 +2963,7 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
-                Self::refuse_word_branch(mnemonic, "call")?;
+                Self::refuse_word_call(mnemonic)?;
                 // Use PLT32 for external function calls (linker will resolve)
                 let sym = strip_plt_suffix(label);
                 if self.explicit_data16 && sym.len() != label.len() {
@@ -3375,22 +3407,16 @@ impl super::InstructionEncoder {
         // 26 6e) — and the order is fixed (`outsb %dx,(%esi)` is
         // "operand type mismatch for `outs'").
         if ops.len() == 2 && matches!(stem, "ins" | "outs") {
-            let port_is_dx = |op: &Operand| match op {
-                Operand::Register(r) => r.name.eq_ignore_ascii_case("dx"),
-                Operand::Memory(m) => {
-                    m.base
-                        .as_ref()
-                        .is_some_and(|b| b.name.eq_ignore_ascii_case("dx"))
-                        && m.index.is_none()
-                }
-                _ => false,
-            };
             let addr_idx = if stem == "ins" { 1 } else { 0 };
-            if !port_is_dx(&ops[1 - addr_idx]) {
+            if !is_string_port(&ops[1 - addr_idx]) {
                 return Err(format!("operand type mismatch for `{stem}'"));
             }
             let mem =
                 mem_of(&ops[addr_idx]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            if stem == "outs" {
+                implied_address(stem, mem)?;
+                port_behind_index(mem, &ops[1])?;
+            }
             match (stem, mem.segment.as_deref()) {
                 ("ins", None | Some("es")) => {}
                 ("ins", Some(_)) => {
@@ -3442,6 +3468,7 @@ impl super::InstructionEncoder {
         }
         if ops.len() == 1 && esi_idx.is_some() && edi_idx.is_none() {
             let mem = mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            implied_address(stem, mem)?;
             let seg_byte = match mem.segment.as_deref() {
                 None | Some("ds") => None,
                 Some("es") => Some(0x26),
@@ -3504,6 +3531,7 @@ impl super::InstructionEncoder {
             if !is_size_matched_accumulator(&ops[1], size) {
                 return Err(format!("operand type mismatch for `{stem}'"));
             }
+            implied_address(stem, mem)?;
             let seg_byte = match mem.segment.as_deref() {
                 None | Some("ds") => None,
                 Some("es") => Some(0x26),
@@ -3587,6 +3615,50 @@ impl super::InstructionEncoder {
         self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
         Ok(())
     }
+}
+
+/// The address `lods`, `outs` and `xlat` read is implied by the
+/// instruction; the one written is for the reader. GNU as takes any that
+/// names a register (and warns unless it is the implied one), and no
+/// displacement alone: `lodsb sym` and `xlat 0x1000` are "operand type
+/// mismatch". (`movs`, `cmps`, `scas`, `stos` and `ins` take that as
+/// well: their rows of GNU as's table carry another mark, and its
+/// generator adds the displacement to those.)
+pub(crate) fn implied_address(stem: &str, mem: &MemoryOperand) -> Result<(), String> {
+    if mem.base.is_some() || mem.index.is_some() {
+        Ok(())
+    } else {
+        Err(format!("operand type mismatch for `{stem}'"))
+    }
+}
+
+/// Whether `op` is the port of `ins` and `outs`: `%dx`, or `(%dx)` with
+/// nothing else in the parentheses or in front of them (`4(%dx)` and
+/// `%es:(%dx)` are addresses, and none a string instruction takes).
+pub(crate) fn is_string_port(op: &Operand) -> bool {
+    match op {
+        Operand::Register(register) => register.name.eq_ignore_ascii_case("dx"),
+        Operand::Memory(mem) => {
+            mem.base
+                .as_ref()
+                .is_some_and(|base| base.name.eq_ignore_ascii_case("dx"))
+                && mem.index.is_none()
+                && mem.segment.is_none()
+                && matches!(mem.displacement, Displacement::None)
+        }
+        _ => false,
+    }
+}
+
+/// GNU as reads `(%dx)` as the port only while the statement has named no
+/// index register: behind `outsb 0x1234(,%edi,2)` it is an address to it,
+/// and no string address. (`%dx` without the parentheses is the port
+/// there too.)
+pub(crate) fn port_behind_index(address: &MemoryOperand, port: &Operand) -> Result<(), String> {
+    if address.index.is_some() && matches!(port, Operand::Memory(_)) {
+        return Err("`(%dx)' is not a valid string address expression".to_string());
+    }
+    Ok(())
 }
 
 /// True when `op` is the size-matched accumulator register operand of a

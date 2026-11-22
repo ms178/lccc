@@ -1022,7 +1022,7 @@ impl super::InstructionEncoder {
     /// fold_moves_the_egpr_index_through_avx512_evex). VSIB operands
     /// never fold (the index is a vector register, so
     /// `fold_index_into_base` declines).
-    fn evex_addr_bits(mem: &MemoryOperand) -> (bool, bool, bool, bool) {
+    pub(crate) fn evex_addr_bits(mem: &MemoryOperand) -> (bool, bool, bool, bool) {
         let folded = fold_index_into_base(mem);
         let mem = folded.as_ref().unwrap_or(mem);
         let b_id = mem.base.as_ref().and_then(|b| gp_id(&b.name));
@@ -4092,7 +4092,8 @@ impl super::InstructionEncoder {
     ///
     ///   Insert  : `$imm, xmm|m128 src, ymm vvvv, ymm dst`
     ///   Extract : `$imm, ymm src, xmm|m128 dst`
-    ///   Perm2   : `$imm, ymm src, ymm vvvv, ymm dst`
+    ///   Perm2   : `$imm, ymm|m256 src, ymm vvvv, ymm dst` (the source in
+    ///             memory was refused: `vperm2f128 $0x20, (%rsi), %ymm0, %ymm1`)
     ///
     /// Arity errors are deliberately delegated to the encoder (which has its
     /// own, byte-probed diagnostics); this check only refuses *wrong-width*
@@ -4134,7 +4135,7 @@ impl super::InstructionEncoder {
             }
             VexHalfKind::Extract => is_reg(&ops[1], true) && mem_or(&ops[2], false),
             VexHalfKind::Perm2 => {
-                is_reg(&ops[1], true) && is_reg(&ops[2], true) && is_reg(&ops[3], true)
+                mem_or(&ops[1], true) && is_reg(&ops[2], true) && is_reg(&ops[3], true)
             }
         };
         if ok {
@@ -4610,15 +4611,33 @@ impl super::InstructionEncoder {
         if ops.len() != 4 {
             return Err("AVX 3-op+imm8 requires 4 operands".to_string());
         }
-        // GAS 2.47 range law for the VEX 0F3A imm8 (vmpsadbw, the only
-        // caller): the full imm8 byte, -128..=255 — `$-2` and `$200`
-        // assemble, `$300` is `operand type mismatch` (byte-probed on
-        // both the xmm and ymm rows). The EVEX rows take the unsigned
-        // 0..255 range instead (see the promoted insert encoder and
-        // encode_evex_vmpsadbw_avx10).
+        // GAS 2.47 range law for the VEX 0F3A imm8: the full imm8 byte,
+        // -128..=255 — `$-2` and `$200` assemble, `$300` is `operand type
+        // mismatch` (byte-probed on both the xmm and ymm rows). The EVEX
+        // rows take the unsigned 0..255 range instead (see the promoted
+        // insert encoder and encode_evex_vmpsadbw_avx10).
         if let Operand::Immediate(ImmediateValue::Integer(v)) = &ops[0] {
             if !(-128..=255).contains(v) {
-                return Err("operand type mismatch for `vmpsadbw'".to_string());
+                // The message names the statement's instruction; it said
+                // `vmpsadbw` for all fifteen that come here.
+                let mnemonic = match opcode {
+                    0x02 => "vpblendd",
+                    0x06 => "vperm2f128",
+                    0x0A => "vroundss",
+                    0x0B => "vroundsd",
+                    0x0C => "vblendps",
+                    0x0D => "vblendpd",
+                    0x0E => "vpblendw",
+                    0x0F => "vpalignr",
+                    0x18 => "vinsertf128",
+                    0x21 => "vinsertps",
+                    0x38 => "vinserti128",
+                    0x40 => "vdpps",
+                    0x41 => "vdppd",
+                    0x46 => "vperm2i128",
+                    _ => "vmpsadbw",
+                };
+                return Err(format!("operand type mismatch for `{mnemonic}'"));
             }
         }
         let l = self.vex_l_from_ops(ops);

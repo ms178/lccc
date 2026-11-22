@@ -13,7 +13,32 @@
 rows 4848
 statements 29673
 assembled 16768
-same 13467
+same 13460
+foreign 50858
+refused 48691
+accept vgatherdps %xmm6, 0x1000(,%xmm7,8), %xmm1
+accept vgatherdps %xmm6, 0x1000(,%xmm7,8), %xmm6
+accept vgatherdps %ymm2, 0x1000(,%ymm7,8), %ymm2
+accept vgatherdps %ymm2, 0x1000(,%ymm7,8), %ymm6
+accept vgatherdps %ymm6, 0x1000(,%ymm7,8), %ymm2
+accept vgatherqpd %xmm1, 0x1000(,%xmm7,8), %xmm1
+accept vgatherqpd %xmm6, 0x1000(,%xmm7,8), %xmm6
+accept vgatherqpd %ymm2, 0x1000(,%ymm7,8), %ymm2
+accept vgatherqpd %ymm6, 0x1000(,%ymm7,8), %ymm6
+accept vgatherqps %xmm1, 0x1000(,%xmm7,8), %xmm1
+accept vgatherqps %xmm1, 0x1000(,%ymm7,8), %xmm6
+accept vpgatherdd %xmm1, 0x1000(,%xmm7,8), %xmm1
+accept vpgatherdd %xmm6, 0x1000(,%xmm7,8), %xmm1
+accept vpgatherdd %xmm6, 0x1000(,%xmm7,8), %xmm6
+accept vpgatherdd %ymm2, 0x1000(,%ymm7,8), %ymm2
+accept vpgatherdd %ymm2, 0x1000(,%ymm7,8), %ymm6
+accept vpgatherdd %ymm6, 0x1000(,%ymm7,8), %ymm2
+accept vpgatherqd %xmm1, 0x1000(,%ymm7,8), %xmm1
+accept vpgatherqd %xmm6, 0x1000(,%xmm7,8), %xmm6
+accept vpgatherqq %xmm6, 0x1000(,%xmm7,8), %xmm1
+accept vpgatherqq %ymm2, 0x1000(,%ymm7,8), %ymm2
+accept vpgatherqq %ymm2, 0x1000(,%ymm7,8), %ymm6
+accept vpgatherqq %ymm6, 0x1000(,%ymm7,8), %ymm2
 reject aadd 6 d4837a9f
 reject aand 6 8b99008a
 reject adcx 6 80c9a4f1
@@ -646,8 +671,6 @@ reject vpcomud 6 e7c20c50
 reject vpcomuq 6 ea286a18
 reject vpcomuw 6 75a6b39b
 reject vpcomw 6 9164ca7d
-reject vperm2f128 3 957ec658
-reject vperm2i128 4 904b52b6
 reject vpextrb 18 e24ee7ef
 reject vpextrd 11 d6c9f2fa
 reject vpextrw 18 5527c2f6
@@ -696,6 +719,9 @@ reject vrsqrt28ss 6 7cd8fb45
 reject vrsqrtbf16 5 da77094d
 reject vrsqrtss 6 c0e8b29b
 reject vscalefbf16 4 1cbe78a1
+reject vsha512msg1 4 d6af1e88
+reject vsha512msg2 4 6cdf0ee3
+reject vsha512rnds2 6 620a9db7
 reject vsm3msg1 6 8b35ad6f
 reject vsm3msg2 6 c0cce859
 reject vsm3rnds2 6 4232e2f0

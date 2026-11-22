@@ -153,6 +153,9 @@ struct Named {
     /// The widths of its vector register operands: a base-4 digit each
     /// (1 `%xmm`, 2 `%ymm`, 3 `%zmm`), the first operand's first.
     vectors: u32,
+    /// One of its vector registers is numbered 16 or more: a register only
+    /// an EVEX prefix has the bits for.
+    high: bool,
 }
 
 /// The operands of a statement: its register operands, the register an
@@ -174,6 +177,11 @@ fn named(operands: &[Operand]) -> Named {
                 if kind & (XMM | YMM | ZMM) != 0 {
                     let width = 1 + u32::from(kind != XMM) + u32::from(kind == ZMM);
                     found.vectors = found.vectors.saturating_mul(4).saturating_add(width);
+                    found.high |= register
+                        .name
+                        .get(3..)
+                        .and_then(|number| number.parse::<u8>().ok())
+                        .is_some_and(|number| number >= 16);
                 }
             }
             // A symbol alone is an address too.
@@ -182,6 +190,26 @@ fn named(operands: &[Operand]) -> Named {
         }
     }
     found
+}
+
+/// Whether a register operand is a `%mm`, vector, mask or bound register:
+/// what GNU as calls a SIMD instruction's operands, in front of which it
+/// takes no operand-size prefix word.
+pub(crate) fn names_simd_register(operands: &[Operand]) -> bool {
+    named(operands).kinds & (MMX | XMM | YMM | ZMM | MASK | BOUND) != 0
+}
+
+/// The code a statement is assembled for: how its bytes are read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Code {
+    /// `.code16` and `.code16gcc`: an operand is 16 bits wide, and 32
+    /// under `66`.
+    Bits16,
+    /// 32-bit code: an operand is 32 bits wide, and 16 under `66`.
+    Bits32,
+    /// 64-bit code: as 32-bit code, and `40`..`4F` are REX prefixes; `C4`,
+    /// `C5`, `62` and `D5` are always prefixes too.
+    Bits64,
 }
 
 /// Where an opcode stands.
@@ -222,6 +250,14 @@ struct Encoded {
     prefix: u8,
     /// EVEX-encoded.
     evex: bool,
+    /// `REX.W`, or the `W` of a VEX, EVEX, XOP or REX2 prefix.
+    wide: bool,
+    /// A REX or a REX2 prefix stands in front of the opcode.
+    extended: bool,
+    /// An operand-size prefix `66` is among the prefixes, whatever else is
+    /// (`popcnt %cx, %dx` is `66 F3 0F B8`); of an APX instruction, the
+    /// `66` its EVEX prefix stands for.
+    data16: bool,
     /// The byte behind the opcode: the ModR/M byte of an opcode that has
     /// one.
     modrm: u8,
@@ -239,10 +275,15 @@ impl Encoded {
 fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
     let mut at = 0;
     let mut prefix = NO_PREFIX;
+    let mut data16 = false;
     loop {
         match *bytes.get(at)? {
-            0x66 if prefix == NO_PREFIX => prefix = PREFIX_66,
-            0x66 => {}
+            0x66 => {
+                data16 = true;
+                if prefix == NO_PREFIX {
+                    prefix = PREFIX_66;
+                }
+            }
             0xF3 => prefix = PREFIX_F3,
             0xF2 => prefix = PREFIX_F2,
             0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67 | 0xF0 => {}
@@ -253,11 +294,18 @@ fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
         at += 1;
     }
     let mut first = *bytes.get(at)?;
+    let mut wide = false;
+    let mut extended = false;
     if long && (0x40..=0x4F).contains(&first) {
+        wide = first & 0x08 != 0;
+        extended = true;
         at += 1;
         first = *bytes.get(at)?;
     }
     let second = bytes.get(at + 1).copied();
+    // `W` is the top bit of the byte behind the map of a three-byte VEX, an
+    // EVEX or an XOP prefix, and bit 3 of the payload of a REX2 one.
+    let third_w = bytes.get(at + 2).is_some_and(|byte| byte & 0x80 != 0);
     // In 32-bit code `C4`, `C5` and `62` with a memory operand are `les`,
     // `lds` and `bound`; a VEX or EVEX prefix reads as a register form.
     let vex = long || second.is_some_and(|byte| byte >= 0xC0);
@@ -271,29 +319,40 @@ fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
             } else {
                 Space::One
             };
+            wide = second? & 0x08 != 0;
+            extended = true;
             (space, at + 2, prefix, false)
         }
-        0x62 if vex => (
-            Space::Vex(second? & 0x07),
-            at + 4,
-            *bytes.get(at + 2)? & 3,
-            true,
-        ),
-        0xC4 if vex => (
-            Space::Vex(second? & 0x1F),
-            at + 3,
-            *bytes.get(at + 2)? & 3,
-            false,
-        ),
+        0x62 if vex => {
+            wide = third_w;
+            (
+                Space::Vex(second? & 0x07),
+                at + 4,
+                *bytes.get(at + 2)? & 3,
+                true,
+            )
+        }
+        0xC4 if vex => {
+            wide = third_w;
+            (
+                Space::Vex(second? & 0x1F),
+                at + 3,
+                *bytes.get(at + 2)? & 3,
+                false,
+            )
+        }
         0xC5 if vex => (Space::Vex(1), at + 2, second? & 3, false),
         // `8F /0` is `pop`; XOP has a map of 8 or more where `pop` has
         // its ModR/M byte.
-        0x8F if second.is_some_and(|byte| byte & 0x1F >= 8) => (
-            Space::Xop(second? & 0x1F),
-            at + 3,
-            *bytes.get(at + 2)? & 3,
-            false,
-        ),
+        0x8F if second.is_some_and(|byte| byte & 0x1F >= 8) => {
+            wide = third_w;
+            (
+                Space::Xop(second? & 0x1F),
+                at + 3,
+                *bytes.get(at + 2)? & 3,
+                false,
+            )
+        }
         0x0F => match second? {
             0x38 => (Space::Three38, at + 2, prefix, false),
             0x3A => (Space::Three3A, at + 2, prefix, false),
@@ -303,6 +362,9 @@ fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
                     opcode: 0,
                     prefix,
                     evex: false,
+                    wide,
+                    extended,
+                    data16,
                     modrm: 0,
                 });
             }
@@ -315,8 +377,258 @@ fn opcode_of(bytes: &[u8], long: bool) -> Option<Encoded> {
         opcode: *bytes.get(opcode_at)?,
         prefix,
         evex,
+        wide,
+        extended,
+        // A VEX, EVEX or XOP prefix has the `66` in its `pp` field.
+        data16: match space {
+            Space::Vex(_) | Space::Xop(_) => prefix == PREFIX_66,
+            _ => data16,
+        },
         modrm: bytes.get(opcode_at + 1).copied().unwrap_or(0),
     })
+}
+
+/// How an encoding stands to EVEX.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Evex {
+    /// No EVEX prefix.
+    None,
+    /// An EVEX prefix of AVX-512 or AVX10, which every code has.
+    Vector,
+    /// An EVEX prefix APX alone has, and 64-bit code alone: its map 4, and
+    /// the instructions on general and mask registers that AVX-512 left
+    /// to VEX (`andn`, `cmpccxadd`, `kmovw`).
+    Apx,
+}
+
+/// How the instruction in `bytes` stands to EVEX.
+pub(crate) fn evex_of(bytes: &[u8], long: bool) -> Evex {
+    match opcode_of(bytes, long) {
+        Some(encoded) if encoded.evex => match (encoded.space, encoded.opcode) {
+            (Space::Vex(4), _)
+            | (Space::Vex(1), 0x90..=0x93)
+            | (Space::Vex(2), 0xF2 | 0xF3 | 0xF5 | 0xF6 | 0xF7 | 0xE0..=0xEF)
+            | (Space::Vex(3), 0xF0) => Evex::Apx,
+            _ => Evex::Vector,
+        },
+        _ => Evex::None,
+    }
+}
+
+/// The width of the general registers an opcode takes, where every one of
+/// them is as wide as the operation: the integer instructions, `cmovcc`
+/// and `cfcmovcc`, the scalar conversions from and to a general register,
+/// `movd` and `movq`, BMI and `cmpccxadd`. The encoders of these take a
+/// register by its number and the width from a suffix or from another
+/// operand: `cmovaq (%rsp), %r9w` was `cmovaq (%rsp), %r9`, `cvttss2siq
+/// %xmm1, %ecx` converted into `%rcx`, `rorxq $3, %ecx, %ecx` rotated
+/// `%rcx`, and in 32-bit code `addw $-3, %ecx` added to `%cx` and `movb
+/// $0x90, %cx` wrote `%cl`.
+///
+/// A shift's count is `%cl` whatever is shifted ([`shifts_by_count`]), and
+/// the width a prefix written as a word gives ([`sized_by_word`]) is not
+/// the registers'.
+fn general_width(encoded: &Encoded, code: Code) -> Option<u32> {
+    let Encoded {
+        space,
+        opcode,
+        prefix,
+        wide,
+        data16,
+        ..
+    } = *encoded;
+    // 32 bits, or 64 under `W`.
+    let by_w = if wide { G64 } else { G32 };
+    // The operand size: 64 bits under `W`; else `66` selects the one of 16
+    // and 32 bits that is not the code's own.
+    let by_size = if wide {
+        G64
+    } else if data16 != (code == Code::Bits16) {
+        G16
+    } else {
+        G32
+    };
+    // What is pushed, popped and branched through is as wide as the stack
+    // in 64-bit code, whatever `W` says.
+    let by_stack = match code {
+        Code::Bits64 if !data16 => G64,
+        _ => by_size,
+    };
+    // The low bit of an opcode of the first instructions selects the
+    // operand size: clear for bytes.
+    let by_low_bit = if opcode & 1 == 0 { G8 } else { by_size };
+    let scalar = prefix >= PREFIX_F3;
+    let extension = encoded.extension();
+    Some(match (space, opcode) {
+        // `add`, `or`, `adc`, `sbb`, `and`, `sub`, `xor`, `cmp`: from and
+        // to a register, and a number to the accumulator.
+        (Space::One, 0x00..=0x3F) if opcode & 7 < 6 => by_low_bit,
+        // The same with a number, `test`, `xchg`, `mov`; `mov` of a
+        // number and of the accumulator from and to an address; `test` of
+        // a number; the shifts; `not`, `neg`, `mul`, `div` and their kin.
+        (
+            Space::One,
+            0x80..=0x8B
+            | 0xA0..=0xA3
+            | 0xA8
+            | 0xA9
+            | 0xC0
+            | 0xC1
+            | 0xC6
+            | 0xC7
+            | 0xD0..=0xD3
+            | 0xF6
+            | 0xF7
+            | 0xFE,
+        ) => by_low_bit,
+        // `inc` and `dec`; `call`, `jmp` and `push` through a register.
+        (Space::One, 0xFF) => match extension {
+            0 | 1 => by_size,
+            2 | 4 | 6 => by_stack,
+            _ => return None,
+        },
+        // `inc` and `dec` of a register, where these are no REX prefixes.
+        (Space::One, 0x40..=0x4F) => by_size,
+        (Space::One, 0x50..=0x5F) => by_stack,
+        (Space::One, 0x8F) if extension == 0 => by_stack,
+        // The accumulator exchanged with itself is `nop`, and `xchg %rax,
+        // %rax` is written as that: `90` and nothing in front. (`41 90` is
+        // `xchg %r8d, %eax`.)
+        (Space::One, 0x90) if code == Code::Bits64 && !wide && !data16 && !encoded.extended => {
+            G32 | G64
+        }
+        // `imul` by a number, `lea`, `xchg` with the accumulator.
+        (Space::One, 0x69 | 0x6B | 0x8D | 0x90..=0x97) => by_size,
+        (Space::One, 0xB0..=0xB7) => G8,
+        // `mov` of a number into a register. Without `W` it clears the
+        // upper half of the 64-bit one, which is how the encoder writes
+        // `movq $0xffffffff, %rax`.
+        (Space::One, 0xB8..=0xBF) if code == Code::Bits64 && !wide && !data16 => G32 | G64,
+        (Space::One, 0xB8..=0xBF) => by_size,
+        (Space::Two, 0x40..=0x4F) => by_size,
+        // The bit tests, the double shifts, `imul`, `popcnt`, the bit
+        // scans and the counts in their place under `F3`.
+        (
+            Space::Two,
+            0xA3 | 0xA4 | 0xA5 | 0xAB | 0xAC | 0xAD | 0xAF | 0xB3 | 0xB8 | 0xBA..=0xBD,
+        ) => by_size,
+        // `cmpxchg` and `xadd`.
+        (Space::Two, 0xB0 | 0xB1 | 0xC0 | 0xC1) => by_low_bit,
+        // `movbe`; under `F2` the opcodes are `crc32`, which takes a
+        // register of each of two widths.
+        (Space::Three38, 0xF0 | 0xF1) if prefix != PREFIX_F2 => by_size,
+        // APX: under `F2` these are `setcc`, which has its own registers.
+        (Space::Vex(4), 0x40..=0x4F) if prefix != PREFIX_F2 => by_size,
+        // The rest of APX's map: the first instructions keep their
+        // opcodes behind the EVEX prefix, and their sizes with them.
+        // (`{evex} cmpb %ebp, (%rdx)` and `{evex} testw $5, %al` were
+        // assembled.)
+        (Space::Vex(4), 0x00..=0x3F) if opcode & 7 < 4 => by_low_bit,
+        (
+            Space::Vex(4),
+            0x80..=0x85 | 0x8A | 0x8B | 0xC0 | 0xC1 | 0xD0..=0xD3 | 0xF6 | 0xF7 | 0xFE,
+        ) => by_low_bit,
+        (Space::Vex(4), 0xFF) if extension < 2 => by_size,
+        // The double shifts, `imul`, `movbe`, `popcnt`, `tzcnt`, `lzcnt`.
+        (
+            Space::Vex(4),
+            0x24 | 0x2C | 0xA5 | 0xAD | 0x69 | 0x6B | 0xAF | 0x60 | 0x61 | 0x88 | 0xF4 | 0xF5,
+        ) => by_size,
+        (Space::Two, 0x2A | 0x2C | 0x2D) if scalar => by_w,
+        (Space::Vex(1 | 5), 0x2A | 0x2C | 0x2D | 0x78 | 0x79 | 0x7B) if scalar => by_w,
+        (Space::Two | Space::Vex(1), 0x6E | 0x7E) if prefix != PREFIX_F3 => by_w,
+        // `pextrd` and `pinsrd`, and `pextrq` and `pinsrq` under `W`.
+        (Space::Three3A | Space::Vex(3), 0x16 | 0x22) => by_w,
+        // APX's `invept`, `invvpid` and `invpcid`; `wrss` and `wruss`.
+        (Space::Vex(4), 0xF0..=0xF2) if prefix == PREFIX_F3 => G64,
+        (Space::Vex(4), 0x66) if prefix == NO_PREFIX => by_w,
+        (Space::Vex(4), 0x65) if prefix == PREFIX_66 => by_w,
+        (Space::Vex(2), 0xF2 | 0xF3 | 0xF5 | 0xF6 | 0xF7 | 0xE0..=0xEF) | (Space::Vex(3), 0xF0) => {
+            by_w
+        }
+        _ => return None,
+    })
+}
+
+/// The kinds of register a memory form of the opcode names, where the
+/// opcode moves between a general register and a vector register and one
+/// of the two can be memory: the other kind alone.
+///
+/// The encoders take a register by its number. `vcvtsi2sd (%rbx), %ecx,
+/// %xmm2` named a general register where the first source stands and was
+/// assembled as `vcvtsi2sdl (%rbx), %xmm1, %xmm2`; `vcvtsd2sil (%rbx),
+/// %xmm1` converted into `%ecx`; in 32-bit code `pextrw $5, %ecx, (%ebx)`
+/// extracted from `%xmm1`.
+fn beside_memory(encoded: &Encoded) -> Option<u32> {
+    let Encoded {
+        space,
+        opcode,
+        prefix,
+        ..
+    } = *encoded;
+    let scalar = prefix >= PREFIX_F3;
+    Some(match (space, opcode) {
+        // A conversion from a general register or memory.
+        (Space::Two | Space::Vex(1 | 5), 0x2A) | (Space::Vex(1 | 5), 0x7B) if scalar => XMM,
+        // A conversion into a general register.
+        (Space::Two | Space::Vex(1 | 5), 0x2C | 0x2D) | (Space::Vex(1 | 5), 0x78 | 0x79)
+            if scalar =>
+        {
+            WIDE
+        }
+        // `movd` and `movq` from and to a general register or memory.
+        (Space::Two | Space::Vex(1), 0x6E | 0x7E) if prefix != PREFIX_F3 => MMX | XMM,
+        // `pinsrw`; `pextrb`, `pextrw`, `pextrd` and `extractps` to
+        // memory; `pinsrb` and `pinsrd`.
+        (Space::Two | Space::Vex(1), 0xC4) => MMX | XMM,
+        (Space::Three3A | Space::Vex(3), 0x14..=0x17 | 0x20 | 0x22) => XMM,
+        _ => return None,
+    })
+}
+
+/// The first of `%ah`, `%ch`, `%dh` and `%bh` among the operands.
+fn high_byte(operands: &[Operand]) -> Option<&str> {
+    operands.iter().find_map(|operand| match operand {
+        Operand::Register(register)
+            if matches!(register.name.as_str(), "ah" | "ch" | "dh" | "bh") =>
+        {
+            Some(register.name.as_str())
+        }
+        _ => None,
+    })
+}
+
+/// Whether the opcode shifts by a count in `%cl`: the shifts and the
+/// double shifts. The count is the statement's first operand, and is not
+/// as wide as what is shifted.
+fn shifts_by_count(encoded: &Encoded) -> bool {
+    matches!(
+        (encoded.space, encoded.opcode),
+        (Space::One, 0xD2 | 0xD3)
+            | (Space::Two, 0xA5 | 0xAD)
+            | (Space::Vex(4), 0xD2 | 0xD3 | 0xA5 | 0xAD)
+    )
+}
+
+/// The operands of a shift without its count.
+fn without_count(operands: &[Operand]) -> &[Operand] {
+    match operands {
+        [Operand::Register(count), shifted @ ..] if !shifted.is_empty() && count.name == "cl" => {
+            shifted
+        }
+        _ => operands,
+    }
+}
+
+/// Whether a prefix written as a word in front of the statement sets its
+/// operand size: `data16 addl %eax, %ebx` is `66 01 C3`, and `rex64 cmova
+/// %eax, %ebx` is `48 0F 47 D8`. The registers of such a statement are as
+/// wide as the statement without the word.
+fn sized_by_word(instr: &Instruction) -> bool {
+    instr
+        .prefixes
+        .iter()
+        .any(|word| matches!(word.as_str(), "data16" | "data32" | "rex64"))
 }
 
 /// The kinds of register the opcode can address, in 64-bit code (`long`)
@@ -589,13 +901,13 @@ fn destination_among_sources(operands: &[Operand]) -> bool {
 }
 
 /// Refuse a statement whose registers its encoding `bytes` cannot
-/// address. `long` is 64-bit code, where `40`..`4F` are REX prefixes and
-/// `C4`, `C5`, `62` and `D5` are always prefixes too.
-pub(crate) fn check(instr: &Instruction, bytes: &[u8], long: bool) -> Result<(), String> {
+/// address, or addresses at another width than they have.
+pub(crate) fn check(instr: &Instruction, bytes: &[u8], code: Code) -> Result<(), String> {
     let found = named(&instr.operands);
     if found.kinds == 0 {
         return Ok(());
     }
+    let long = code == Code::Bits64;
     let Some(encoded) = opcode_of(bytes, long) else {
         return Ok(());
     };
@@ -609,11 +921,49 @@ pub(crate) fn check(instr: &Instruction, bytes: &[u8], long: bool) -> Result<(),
             && counts_fit(&found, takes)
             && !(memory_only(&encoded) && encoded.modrm >= 0xC0)
     };
-    if !fits {
+    // `%xmm16` and up are EVEX's: a VEX or XOP opcode has no bit for them
+    // (`vfrczpd %xmm17, %xmm17` was `vfrczpd %xmm1, %xmm1`).
+    let unreachable = found.high && !encoded.evex;
+    if !fits || unreachable {
         return Err(format!(
             "operand type mismatch for `{}'",
             instr.mnemonic.to_ascii_lowercase()
         ));
+    }
+    // Behind a REX or a REX2 prefix `%ah` to `%bh` are `%spl` to `%dil`:
+    // `movsbq %ah, %rdx` was assembled as `movsbq %spl, %rdx`, and `movzbl
+    // %ch, %r17d` as `movzbl %bpl, %r17d`.
+    if encoded.extended {
+        if let Some(name) = high_byte(&instr.operands) {
+            return Err(format!(
+                "can't encode register '%{name}' in an instruction requiring REX/REX2 prefix"
+            ));
+        }
+    }
+    if found.memory != 0 && encoded.modrm < 0xC0 {
+        if let Some(kinds) = beside_memory(&encoded) {
+            if found.kinds & !kinds != 0 {
+                return Err(format!(
+                    "operand type mismatch for `{}'",
+                    instr.mnemonic.to_ascii_lowercase()
+                ));
+            }
+        }
+    }
+    if found.kinds & GENERAL != 0 && !sized_by_word(instr) {
+        if let Some(width) = general_width(&encoded, code) {
+            let sized = if shifts_by_count(&encoded) {
+                named(without_count(&instr.operands)).kinds
+            } else {
+                found.kinds
+            };
+            if sized & GENERAL & !width != 0 {
+                return Err(format!(
+                    "operand size mismatch for `{}'",
+                    instr.mnemonic.to_ascii_lowercase()
+                ));
+            }
+        }
     }
     if ((found.kinds & GENERAL).count_ones() > 1 && !mixes_widths(&encoded))
         || (found.vectors != 0 && !widths_fit(&encoded, found.vectors))
@@ -1016,6 +1366,259 @@ mod tests {
             })));
     }
 
+    /// `W` is found in every prefix that has one.
+    #[test]
+    fn the_w_bit_is_read_from_every_prefix() {
+        let wide = |bytes: &[u8]| opcode_of(bytes, true).map(|encoded| encoded.wide);
+        for (bytes, expected) in [
+            // `cmova %ecx, %edx`; with REX.W; with REX.R only.
+            (&[0x0F, 0x47, 0xD1][..], false),
+            (&[0x48, 0x0F, 0x47, 0xD1], true),
+            (&[0x44, 0x0F, 0x47, 0xD1], false),
+            // `66` and REX.W together: W wins the size, and is still W.
+            (&[0x66, 0x48, 0x0F, 0x47, 0xD1], true),
+            // Three-byte VEX: `rorx $3, %ecx, %ecx` and its 64-bit form.
+            (&[0xC4, 0xE3, 0x7B, 0xF0, 0xC9, 0x03], false),
+            (&[0xC4, 0xE3, 0xFB, 0xF0, 0xC9, 0x03], true),
+            // Two-byte VEX has no W.
+            (&[0xC5, 0xFA, 0x2C, 0xC9], false),
+            // EVEX: `vmovd %xmm17, %ecx`, `vmovq %xmm17, %rcx`.
+            (&[0x62, 0xE1, 0x7D, 0x08, 0x7E, 0xC9], false),
+            (&[0x62, 0xE1, 0xFD, 0x08, 0x7E, 0xC9], true),
+            // XOP: `vpcmov` with W.
+            (&[0x8F, 0xE8, 0xF0, 0xA2, 0xC1, 0x20], true),
+            (&[0x8F, 0xE8, 0x70, 0xA2, 0xC1, 0x20], false),
+            // REX2: `imulq %r16, %rax` (`d5 98 af c0`), `addl %r16d, %eax`.
+            (&[0xD5, 0x98, 0xAF, 0xC0], true),
+            (&[0xD5, 0x40, 0x01, 0xC0], false),
+        ] {
+            assert_eq!(wide(bytes), Some(expected), "{bytes:02x?}");
+        }
+        // In 32-bit code `48` is `dec %eax`, an opcode of its own.
+        assert_eq!(
+            opcode_of(&[0x48], false).map(|encoded| (encoded.opcode, encoded.wide)),
+            Some((0x48, false))
+        );
+    }
+
+    /// An operand-size prefix is noted beside a mandatory `F3` or `F2`,
+    /// and read out of the `pp` field of a VEX, EVEX or XOP prefix.
+    #[test]
+    fn the_operand_size_prefix_is_found_among_the_others() {
+        let data16 = |bytes: &[u8]| opcode_of(bytes, true).map(|encoded| encoded.data16);
+        for (bytes, expected) in [
+            (&[0x01, 0xC8][..], false),
+            (&[0x66, 0x01, 0xC8], true),
+            // In either order with `F3`, and behind a segment prefix.
+            (&[0x66, 0xF3, 0x0F, 0xB8, 0xD1], true),
+            (&[0xF3, 0x66, 0x0F, 0xB8, 0xD1], true),
+            (&[0xF3, 0x0F, 0xB8, 0xD1], false),
+            (&[0x64, 0x66, 0x01, 0x08], true),
+            // REX2 behind `66`.
+            (&[0x66, 0xD5, 0x40, 0x01, 0xC0], true),
+            // `vmovd` has `66` in its `pp` field, `vcvtsi2ss` has `F3`.
+            (&[0xC5, 0xF9, 0x6E, 0xC1], true),
+            (&[0xC5, 0x72, 0x2A, 0xC9], false),
+            (&[0x62, 0xF4, 0x7D, 0x08, 0x43, 0xD1], true),
+            (&[0x62, 0xF4, 0x7C, 0x08, 0x43, 0xD1], false),
+        ] {
+            assert_eq!(data16(bytes), Some(expected), "{bytes:02x?}");
+        }
+    }
+
+    /// The opcodes whose general registers are all as wide as the
+    /// operation, and the width each encoding takes.
+    #[test]
+    fn the_width_an_opcode_takes_its_general_registers_in() {
+        let width =
+            |bytes: &[u8]| opcode_of(bytes, true).and_then(|e| general_width(&e, Code::Bits64));
+        for (bytes, expected) in [
+            // `cmovcc`: 16 bits under `66`, 64 under REX.W, else 32.
+            (&[0x0F, 0x47, 0xD1][..], Some(G32)),
+            (&[0x66, 0x0F, 0x47, 0xD1], Some(G16)),
+            (&[0x48, 0x0F, 0x47, 0xD1], Some(G64)),
+            // APX `cfcmovcc` / three-operand `cmovcc`; `setcc` under `F2`
+            // has registers of its own.
+            (&[0x62, 0xF4, 0x7C, 0x08, 0x43, 0xD1], Some(G32)),
+            (&[0x62, 0xF4, 0x7D, 0x08, 0x43, 0xD1], Some(G16)),
+            (&[0x62, 0xF4, 0xFC, 0x08, 0x43, 0xD1], Some(G64)),
+            (&[0x62, 0xF4, 0x7F, 0x08, 0x44, 0xC0], None),
+            // `cvttss2si` into 32 and into 64 bits; the packed
+            // `cvttps2pi` is another instruction.
+            (&[0xF3, 0x0F, 0x2C, 0xC9], Some(G32)),
+            (&[0xF3, 0x48, 0x0F, 0x2C, 0xC9], Some(G64)),
+            (&[0x0F, 0x2C, 0xC9], None),
+            // `vcvtsi2ss`; `movd` and `movq`; `movq` between `%xmm`s.
+            (&[0xC5, 0x72, 0x2A, 0xC9], Some(G32)),
+            (&[0x66, 0x0F, 0x6E, 0xC0], Some(G32)),
+            (&[0x66, 0x48, 0x0F, 0x6E, 0xC0], Some(G64)),
+            (&[0xF3, 0x0F, 0x7E, 0xC1], None),
+            // BMI: `andn`, `rorx`.
+            (&[0xC4, 0xE2, 0x70, 0xF2, 0xC2], Some(G32)),
+            (&[0xC4, 0xE3, 0xFB, 0xF0, 0xC9, 0x03], Some(G64)),
+            // The integer instructions: the low bit of the opcode is clear
+            // for bytes.
+            (&[0x01, 0xC8], Some(G32)),
+            (&[0x66, 0x01, 0xC8], Some(G16)),
+            (&[0x48, 0x01, 0xC8], Some(G64)),
+            (&[0x00, 0xC8], Some(G8)),
+            (&[0x04, 0x05], Some(G8)),
+            (&[0x05, 0x34, 0x12, 0x00, 0x00], Some(G32)),
+            (&[0x80, 0xC1, 0x05], Some(G8)),
+            (&[0x66, 0x83, 0xC1, 0xFD], Some(G16)),
+            (&[0x85, 0xC9], Some(G32)),
+            (&[0x86, 0xC8], Some(G8)),
+            (&[0x49, 0x91], Some(G64)),
+            (&[0x66, 0x95], Some(G16)),
+            // `xchg %rax, %rax` is `nop`, written without a `W`; `xchg
+            // %r8, %rax` has one.
+            (&[0x90], Some(G32 | G64)),
+            (&[0x49, 0x90], Some(G64)),
+            (&[0x41, 0x90], Some(G32)),
+            (&[0x66, 0x90], Some(G16)),
+            (&[0xB1, 0x90], Some(G8)),
+            (&[0x48, 0xB8, 1, 2, 3, 4, 5, 6, 7, 8], Some(G64)),
+            // `movq $0xffffffff, %rax` is written as `movl` is.
+            (&[0xB8, 0xFF, 0xFF, 0xFF, 0xFF], Some(G32 | G64)),
+            (&[0x66, 0xB8, 0x34, 0x12], Some(G16)),
+            (&[0xA2, 1, 2, 3, 4, 5, 6, 7, 8], Some(G8)),
+            (&[0x66, 0xA3, 1, 2, 3, 4, 5, 6, 7, 8], Some(G16)),
+            (&[0xD2, 0xEE], Some(G8)),
+            (&[0x48, 0xD3, 0xE2], Some(G64)),
+            (&[0xF6, 0xE1], Some(G8)),
+            (&[0xF7, 0xF1], Some(G32)),
+            (&[0xFE, 0xC1], Some(G8)),
+            (&[0x0F, 0xA5, 0xC3], Some(G32)),
+            (&[0x66, 0x0F, 0xBC, 0xC1], Some(G16)),
+            (&[0x0F, 0xC0, 0x0A], Some(G8)),
+            (&[0x48, 0x0F, 0xB1, 0x0A], Some(G64)),
+            (&[0x0F, 0x38, 0xF0, 0x08], Some(G32)),
+            // `popcnt %cx, %dx`: the `66` beside the mandatory `F3`.
+            (&[0x66, 0xF3, 0x0F, 0xB8, 0xD1], Some(G16)),
+            (&[0xF3, 0x48, 0x0F, 0xB8, 0xD1], Some(G64)),
+            // What is pushed, popped and branched through is 64 bits
+            // wide without a `W`; `inc` beside them in the group is not.
+            (&[0x51], Some(G64)),
+            (&[0x66, 0x51], Some(G16)),
+            (&[0x41, 0x58], Some(G64)),
+            (&[0x8F, 0xC1], Some(G64)),
+            (&[0xFF, 0xD0], Some(G64)),
+            (&[0xFF, 0xE0], Some(G64)),
+            (&[0x66, 0xFF, 0xD0], Some(G16)),
+            (&[0xFF, 0xC0], Some(G32)),
+            (&[0x48, 0xFF, 0xC8], Some(G64)),
+            // What mixes widths, or has registers of another kind beside
+            // the general one: `movzbl`, `movslq`, `crc32`, `mov` from a
+            // segment register, `push %fs`, `lar`, `in`, `stos`.
+            (&[0x0F, 0xB6, 0xC1], None),
+            (&[0x48, 0x63, 0xC8], None),
+            (&[0xF2, 0x0F, 0x38, 0xF1, 0xC9], None),
+            (&[0x8C, 0xD8], None),
+            (&[0x0F, 0xA0], None),
+            (&[0x0F, 0x02, 0xCD], None),
+            (&[0xEC], None),
+            (&[0xAA], None),
+            // A far call through memory has no register.
+            (&[0xFF, 0x18], None),
+        ] {
+            assert_eq!(width(bytes), expected, "{bytes:02x?}");
+        }
+    }
+
+    /// `66` selects the operand size that is not the code's own, and in
+    /// 16- and 32-bit code the stack is as wide as an operand.
+    #[test]
+    fn the_operand_size_prefix_is_read_for_the_code() {
+        let width = |bytes: &[u8], code| {
+            opcode_of(bytes, false).and_then(|encoded| general_width(&encoded, code))
+        };
+        for (bytes, in_32, in_16) in [
+            (&[0x01, 0xC8][..], G32, G16),
+            (&[0x66, 0x01, 0xC8], G16, G32),
+            (&[0x00, 0xC8], G8, G8),
+            (&[0x0F, 0x47, 0xD1], G32, G16),
+            (&[0x66, 0x0F, 0x47, 0xD1], G16, G32),
+            // `inc %ebp` and `dec %bp`: no REX prefixes here.
+            (&[0x45], G32, G16),
+            (&[0x66, 0x4D], G16, G32),
+            (&[0x51], G32, G16),
+            (&[0x66, 0x51], G16, G32),
+            (&[0xB9, 0x78, 0x56, 0x34, 0x12], G32, G16),
+            (&[0x90], G32, G16),
+            (&[0xFF, 0xD1], G32, G16),
+            (&[0x66, 0xFF, 0xE1], G16, G32),
+            (&[0x67, 0x8D, 0x0A], G32, G16),
+            // `popcnt %cx, %dx` in 32-bit code, `popcnt %ecx, %edx` in
+            // 16-bit code.
+            (&[0x66, 0xF3, 0x0F, 0xB8, 0xD1], G16, G32),
+        ] {
+            assert_eq!(width(bytes, Code::Bits32), Some(in_32), "{bytes:02x?}");
+            assert_eq!(width(bytes, Code::Bits16), Some(in_16), "{bytes:02x?}");
+        }
+        // The conversions and BMI go by `W`, which there is none of: 32
+        // bits in every code.
+        for bytes in [
+            &[0xF3, 0x0F, 0x2C, 0xC9][..],
+            &[0x66, 0x0F, 0x6E, 0xC9],
+            &[0xC4, 0xE2, 0x68, 0xF2, 0xD9],
+        ] {
+            assert_eq!(width(bytes, Code::Bits16), Some(G32), "{bytes:02x?}");
+            assert_eq!(width(bytes, Code::Bits32), Some(G32), "{bytes:02x?}");
+        }
+    }
+
+    /// `%cl` in front of what a shift shifts is its count.
+    #[test]
+    fn a_shift_s_count_is_not_what_it_shifts() {
+        let by_count = |bytes: &[u8]| opcode_of(bytes, true).is_some_and(|e| shifts_by_count(&e));
+        for bytes in [
+            &[0xD3, 0xE2][..],
+            &[0xD2, 0xEE],
+            &[0x0F, 0xA5, 0xC3],
+            &[0x48, 0x0F, 0xAD, 0xC3],
+        ] {
+            assert!(by_count(bytes), "{bytes:02x?}");
+        }
+        // By one, by a number; `bt` and `imul` beside the double shifts.
+        for bytes in [
+            &[0xD1, 0xE2][..],
+            &[0xC1, 0xE2, 0x05],
+            &[0x0F, 0xA4, 0xC3, 0x05],
+            &[0x0F, 0xA3, 0xC3],
+            &[0x0F, 0xAF, 0xC3],
+        ] {
+            assert!(!by_count(bytes), "{bytes:02x?}");
+        }
+        let register = |name: &str| Operand::Register(Register::new(name));
+        let kinds = |names: &[&str]| {
+            let operands: Vec<Operand> = names.iter().map(|name| register(name)).collect();
+            named(without_count(&operands)).kinds
+        };
+        assert_eq!(kinds(&["cl", "edx"]), G32);
+        assert_eq!(kinds(&["cl", "ax", "bx"]), G16);
+        // `shl %cl` shifts `%cl` by one, and `shl %cl, %cl` by itself.
+        assert_eq!(kinds(&["cl"]), G8);
+        assert_eq!(kinds(&["cl", "cl"]), G8);
+        // Another register in front is no count.
+        assert_eq!(kinds(&["dl", "edx"]), G8 | G32);
+    }
+
+    #[test]
+    fn a_register_only_evex_reaches_is_noted() {
+        let register = |name: &str| Operand::Register(Register::new(name));
+        for (names, high) in [
+            (&["xmm15", "xmm0"][..], false),
+            (&["xmm16", "xmm0"], true),
+            (&["ymm7", "ymm31"], true),
+            (&["zmm9", "zmm10", "zmm11"], false),
+            (&["rax", "r31"], false),
+            (&["k7", "xmm3"], false),
+        ] {
+            let operands: Vec<Operand> = names.iter().map(|name| register(name)).collect();
+            assert_eq!(named(&operands).high, high, "{names:?}");
+        }
+    }
+
     #[test]
     fn a_move_between_files_names_one_register_of_each() {
         let named = |general, files, memory, masks| Named {
@@ -1025,6 +1628,7 @@ mod tests {
             files,
             memory,
             vectors: 0,
+            high: false,
         };
         let transfer = XMM | WIDE;
         // `movd %eax, %xmm0`, `movd (%rax), %xmm0`, `cvtsd2si (%rax), %eax`.

@@ -43,10 +43,15 @@ def made(mode=MODE):
     return sweep.statements(rows, mode, sweep.PER_ROW, sweep.SEED, set())
 
 
+# Sixty statements both assemble: forty of `add`, twenty flagless `sub`s.
+ASSEMBLED = ([f"add ${n}, %ecx" for n in range(40)]
+             + [f"{{nf}} sub ${n}, %ecx, %edx" for n in range(20)])
+
+
 def report(**levels) -> sweep.Report:
     blank = {"rewritten": [], "equal": 0, "longer": [], "shorter": [], "other": [],
              "kinds": Counter()}
-    return sweep.Report(statements=100, assembled=60,
+    return sweep.Report(statements=100, assembled=ASSEMBLED,
                         levels={level: {**blank, **levels.get(level, {})}
                                 for level in sweep.LEVELS},
                         lost=[], written=[])
@@ -135,6 +140,9 @@ class Record(unittest.TestCase):
         for line in ("statements 100", "assembled 60", "O2 equal 50",
                      "O2 longer vcmpeqss %xmm9, %xmm1, %xmm1", "O2 kind mov mov 1"):
             self.assertIn(line, text.splitlines())
+        # What both assemble, by mnemonic, the pseudo prefix part of the name.
+        swept = [line.split()[:3] for line in text.splitlines() if line.startswith("swept ")]
+        self.assertEqual(swept, [["swept", "add", "40"], ["swept", "{nf}sub", "20"]])
 
     def test_every_difference_fails_in_both_directions(self):
         base = report(O2={"equal": 50, "longer": ["vcmpeqss %xmm9, %xmm1, %xmm1"]})
@@ -160,6 +168,34 @@ class Record(unittest.TestCase):
         rewritten = report(O2={"rewritten": ["movq $1, %rax = b801000000"]})
         again = report(O2={"rewritten": ["movq $1, %rax = 48c7c001000000"]})
         self.assertTrue(sweep.failures_of(again, sweep.expectation_text(rewritten)))
+
+    def test_a_statement_one_of_the_two_stops_assembling_is_named(self):
+        """The counts of the levels can stay as they are when a statement leaves
+        the sweep and another joins; the line of its mnemonic cannot."""
+        base = report()
+        text = sweep.expectation_text(base)
+        fewer = report()
+        fewer.assembled = ASSEMBLED[1:]
+        failures = sweep.failures_of(fewer, text)
+        self.assertTrue(any(line.startswith("expected, not found:  swept add 40 ")
+                            for line in failures), failures)
+        self.assertTrue(any(line.startswith("found, not expected:  swept add 39 ")
+                            for line in failures), failures)
+        self.assertFalse(any("{nf}sub" in line for line in failures), failures)
+        # As many, but another one.
+        other = report()
+        other.assembled = ASSEMBLED[1:] + ["add $99, %ecx"]
+        failures = sweep.failures_of(other, text)
+        self.assertEqual(sorted(line.split()[3:6] for line in failures),
+                         [["swept", "add", "40"], ["swept", "add", "40"]])
+        # A mnemonic that is new to the sweep, and one that left it whole.
+        more = report()
+        more.assembled = ASSEMBLED + ["lea (%rdx), %ecx"]
+        self.assertTrue(any("swept lea 1 " in line for line in sweep.failures_of(more, text)))
+        gone = report()
+        gone.assembled = ASSEMBLED[:40]
+        self.assertTrue(any(line.startswith("expected, not found:  swept {nf}sub 20 ")
+                            for line in sweep.failures_of(gone, text)))
 
     def test_a_lost_statement_fails_whatever_the_record_says(self):
         found = report()

@@ -427,12 +427,25 @@ impl super::InstructionEncoder {
     /// comes from the DESTINATION register (the source selector is r/m16);
     /// `lar %dx,%dx` needs 66, `lar (%edx),%dx` needs 67+66, and a 32/64-bit
     /// destination takes none/REX.W respectively (GAS 2.47 byte-verified).
+    /// `lar` and `lsl` read a selector: a 16-bit register, or one as wide
+    /// as the destination, of which they read 16 bits (`lar %ebp, %r9w`
+    /// names neither).
+    fn selector_width(mnemonic: &str, from: &Register, to: &Register) -> Result<(), String> {
+        let (from, to) = (infer_reg_size(&from.name), infer_reg_size(&to.name));
+        if from == 2 || from == to {
+            Ok(())
+        } else {
+            Err(format!("register type mismatch for `{mnemonic}'"))
+        }
+    }
+
     pub(crate) fn encode_lar(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("lar requires 2 operands".to_string());
         }
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
+                Self::selector_width("lar", src, dst)?;
                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 // Infer size from destination register. LAR never takes
@@ -474,6 +487,7 @@ impl super::InstructionEncoder {
         }
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
+                Self::selector_width("lsl", src, dst)?;
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let size = infer_reg_size(&dst.name).min(4); // no REX.W (GAS: lsl %rdx,%rdx = 0f 03 d2)

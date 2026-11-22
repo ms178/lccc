@@ -42,16 +42,25 @@ The table also says what a mnemonic does *not* take.  For every mnemonic and
 operand position, a register of each kind no row has there is put in --
 `rdrand %xmm0`, `adc %cl, %mm3`, `addps %ecx, %xmm1` -- and in the vector
 positions of every row vector registers of every width, in every combination
--- `vaddps %ymm1, %xmm2, %xmm3`, `vpermd %xmm1, %xmm2, %xmm3`.  Of the
-statements GNU as refuses, lccc has to refuse every one:
+-- `vaddps %ymm1, %xmm2, %xmm3`, `vpermd %xmm1, %xmm2, %xmm3`.  And the
+statements made from the rows themselves that GNU as refuses are asked too: a
+size suffix on a register of another width (`cmovaq (%rsp), %r9w`), general
+registers of two widths where a row takes one of several (`shrd %cl, %ebp,
+%r13`), a vector register only EVEX reaches on an opcode without one
+(`vfrczpd %xmm17, %xmm17`).  Of the statements GNU as refuses, lccc has to
+refuse every one:
 
   ACCEPT   GNU as refuses the statement, lccc assembles it
 
-An encoder that goes by a register's number, or takes an instruction's vector
-length from one operand and never looks at the others, assembles such a
-statement into an instruction on other registers; the first runs found 17,000
-and 1,200 of them assembled.  One that is left is recorded by name.  (64-bit
-and 32-bit mode; the 16-bit modes use the 32-bit encoder.)
+An encoder that goes by a register's number, takes an instruction's vector
+length from one operand and never looks at the others, or takes the operand
+size from a suffix and never looks at the register, assembles such a statement
+into an instruction on other registers; the first runs found 17,000, 1,200
+and 670 of them assembled.  One that is left is recorded by name.  (64-bit,
+32-bit and `.code16` code: an operand-size prefix means the other size in
+16-bit code, so what an encoding is as wide as is asked there too.
+`.code16gcc` differs from it in the size of a few statements without a
+suffix.)
 
 The table is GPL-3.0-or-later and is *read*, never copied: it is fetched at a
 pinned commit, verified against a pinned SHA-256 (the same pin
@@ -119,7 +128,7 @@ class Mode:
 MODES = {
     "64": Mode("64", True, ("--64",), (), "", False, True),
     "32": Mode("32", False, ("--32",), ("-m32",), "", False, True),
-    "16": Mode("16", False, ("--32",), ("-m32",), ".code16", True, False),
+    "16": Mode("16", False, ("--32",), ("-m32",), ".code16", True, True),
     "16gcc": Mode("16gcc", False, ("--32",), ("-m32",), ".code16gcc", True, False),
 }
 
@@ -894,7 +903,12 @@ def sweep_rows(rows, mode: Mode, gas: str, lccc: str, *, per_row: int, seed: int
                     findings[verdict].append((ordered[i], detail))
         report = Report(len(rows), len(ordered), len(indexes), same, findings)
         if mode.foreign and foreign:
-            other = foreign_statements(rows, mode, only, seed, share)
+            # The statements with a register no row takes, and of the
+            # statements made from the rows above the ones GNU as refuses:
+            # a size suffix on a register of another width, registers of
+            # two widths where a row takes one of each of several.
+            other = sorted(set(foreign_statements(rows, mode, only, seed, share))
+                           | {ordered[i] for i in range(len(ordered)) if i not in reference})
             valid = assemble_gas(other, gas, mode, tmp)
             invalid = [i for i in range(len(other)) if i not in valid]
             accepted, crashed = assemble_each(other, invalid, lccc, mode, tmp)

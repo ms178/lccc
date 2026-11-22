@@ -405,7 +405,7 @@ def disassemble(encodings: list[bytes], mode: table.Mode, objdump: str, tmp: Pat
 @dataclasses.dataclass
 class Report:
     statements: int
-    assembled: int
+    assembled: list[str]    # the statements both assemble as written
     levels: dict            # level -> {"rewritten": [(statement, hex)], "equal": int,
     #                                   "longer": [...], "shorter": [...], "other": [...],
     #                                   "kinds": Counter}
@@ -452,7 +452,7 @@ def report_of(sweep: Sweep, mode: table.Mode, objdump: str | None, tmp: Path) ->
     lost = sorted(f"-{level}: {ordered[i]}: {why}"
                   for level in LEVELS for i, why in sweep.lost[level].items())
     lost += sorted(f"crash: {ordered[i]}: {why}" for i, why in sweep.crashed.items())
-    return Report(len(ordered), len(compared), levels, lost, written)
+    return Report(len(ordered), [ordered[i] for i in compared], levels, lost, written)
 
 
 HEADER = """\
@@ -461,6 +461,8 @@ HEADER = """\
 #
 # statements, assembled: how much was swept -- the statements made, and the
 # ones both GNU as and lccc assemble as written.
+#   swept <mnemonic> <count> <digest>: the latter, by mnemonic. A statement
+#     that one of the two starts or stops assembling shows here.
 # For each of -O2 and -Os (lccc under -Wa,-O2 against GNU as -O2; lccc under
 # -Wa,-Os against the shorter of GNU as -O2 and -Os):
 #   rewritten <count> <digest>: the statements lccc encodes otherwise than as
@@ -485,7 +487,9 @@ def per_mnemonic(items: list[str]) -> dict[str, list[str]]:
 
 def expectation_text(report: Report) -> str:
     lines = [HEADER.rstrip("\n"), f"statements {report.statements}",
-             f"assembled {report.assembled}"]
+             f"assembled {len(report.assembled)}"]
+    lines += [f"swept {mnemonic} {len(items)} {digest_of(items)}"
+              for mnemonic, items in sorted(per_mnemonic(report.assembled).items())]
     for level in LEVELS:
         found = report.levels[level]
         lines.append(f"{level} rewritten {len(found['rewritten'])} "
@@ -1163,7 +1167,7 @@ def main(argv: list[str] | None = None) -> int:
         sweep = assemble(ordered, mode, gas, lccc, tmp)
         if compare:
             report = report_of(sweep, mode, objdump, tmp)
-            print(f"{mode.name}: {report.statements} statements, {report.assembled} assembled "
+            print(f"{mode.name}: {report.statements} statements, {len(report.assembled)} assembled "
                   f"by both as written")
             for level in LEVELS:
                 found = report.levels[level]

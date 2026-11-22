@@ -10,6 +10,8 @@ mod core;
 
 pub(crate) use self::core::{fold_index_into_base, folded_base, mem_vex_xb_bits};
 mod gp_integer;
+pub(crate) mod learned;
+mod learned_rows;
 pub(crate) mod operand_class;
 pub(crate) mod optimize;
 mod promoted;
@@ -24,8 +26,9 @@ mod x87_misc;
 mod xop;
 
 pub(crate) use gp_integer::{
-    addr_hint_is32, check_monitor_family, has_reg_operand, is_explicit_string_op,
-    is_size_matched_accumulator, is_star_less_target, string_op_size,
+    addr_hint_is32, check_monitor_family, has_reg_operand, implied_address, is_explicit_string_op,
+    is_size_matched_accumulator, is_star_less_target, is_string_port, port_behind_index,
+    string_op_size,
 };
 pub(crate) use registers::*;
 
@@ -208,6 +211,10 @@ pub struct InstructionEncoder {
     /// without a sign (`unsigned_displacement`): a symbol in one takes
     /// `R_X86_64_32`, not the sign-extended relocation.
     pub(crate) disp32_unsigned: bool,
+    /// The instruction under way was written from a row learned from GNU
+    /// as (`learned`): the row said which registers and which decorations
+    /// it takes, and the checks that go by the opcode have nothing to add.
+    learned_row: bool,
 }
 
 /// A RIP-relative displacement field with a relocation.
@@ -316,6 +323,161 @@ fn prefix_stem(mnemonic: &str) -> String {
         }
     }
     m.to_string()
+}
+
+/// The instructions a repeat prefix stands in front of, without their size
+/// suffix: the string instructions and their `s`-first aliases.
+const REPEATED_STEMS: [&str; 12] = [
+    "cmps", "ins", "lods", "movs", "outs", "scas", "scmp", "slod", "smov", "ssca", "ssto", "stos",
+];
+
+/// The VIA PadLock instructions: `F3` is part of their encoding, and `rep`
+/// in front of one says nothing more.
+const PADLOCK: [&str; 15] = [
+    "montmul",
+    "montmul2",
+    "xcryptcbc",
+    "xcryptcfb",
+    "xcryptctr",
+    "xcryptecb",
+    "xcryptofb",
+    "xmodexp",
+    "xrng2",
+    "xsha1",
+    "xsha256",
+    "xsha384",
+    "xsha512",
+    "xstore",
+    "xstorerng",
+];
+
+/// Whether the repeat prefix `word` (`rep`, `repe`, `repz`, `repne`,
+/// `repnz`) in front of `instr` is a byte of its own.
+///
+/// GNU as takes a repeat prefix in front of a string instruction, of
+/// `bsf`/`bsr` (`rep bsf` is how `tzcnt` is written for an assembler that
+/// does not know it), of `ret` (`rep ret`) and of `nop` (`rep nop` is
+/// `pause`), and refuses it in front of everything else: "invalid
+/// instruction `add' after `rep'". The byte was written in front of any
+/// instruction -- `rep vaddps` was `F3` and a VEX prefix, which no
+/// processor decodes, and `rep xcryptecb` had the `F3` twice.
+pub(crate) fn repeat_prefix(word: &str, instr: &Instruction) -> Result<bool, String> {
+    let lower = instr.mnemonic.to_ascii_lowercase();
+    let name = lower.as_str();
+    if PADLOCK.contains(&name) {
+        return if matches!(word, "repne" | "repnz") {
+            Err(format!("invalid instruction `{name}' after `{word}'"))
+        } else {
+            Ok(false)
+        };
+    }
+    let stem = name.strip_suffix(['b', 'w', 'l', 'q']).unwrap_or(name);
+    let repeated = |name: &str| REPEATED_STEMS.contains(&name);
+    // `movsd` and `cmpsd` are string instructions unless an operand is a
+    // vector register.
+    let vector = instr
+        .operands
+        .iter()
+        .any(|op| matches!(op, Operand::Register(reg) if vec_reg_id(&reg.name).is_some()));
+    let string = repeated(name)
+        || repeated(stem)
+        || (!vector && name.strip_suffix('d').is_some_and(repeated));
+    if string
+        || matches!(stem, "bsf" | "bsr" | "ret")
+        || matches!(name, "bsf" | "bsr" | "ret")
+        || (name == "nop" && instr.operands.is_empty())
+    {
+        Ok(true)
+    } else {
+        Err(format!("invalid instruction `{stem}' after `{word}'"))
+    }
+}
+
+/// Hold `lock` and the HLE hints against the instruction they stand in
+/// front of, as GNU as 2.47 does.
+///
+/// `lock` demands a lockable instruction with a memory operand; the HLE
+/// hints demand `lock` alongside, except `xchg` (implicitly locked) and
+/// `xrelease` on a `mov` store. The `lock` check comes first.
+pub(crate) fn check_lock_prefixes(
+    instr: &Instruction,
+    has_lock: bool,
+    has_xacquire: bool,
+    has_xrelease: bool,
+) -> Result<(), String> {
+    if !(has_lock || has_xacquire || has_xrelease) {
+        return Ok(());
+    }
+    let lower = instr.mnemonic.to_ascii_lowercase();
+    let stem = prefix_stem(&lower);
+    let has_mem = instr
+        .operands
+        .iter()
+        .any(|op| matches!(op, Operand::Memory(_)));
+    let lockable = (stem == "xchg" || LOCKABLE_STEMS.contains(&stem.as_str())) && has_mem;
+    if has_lock && !lockable {
+        return Err("expecting lockable instruction after `lock'".to_string());
+    }
+    if has_xacquire {
+        if stem == "mov" {
+            return Err("instruction `mov' after `xacquire' not allowed".to_string());
+        } else if stem == "xchg" && !has_mem {
+            return Err("invalid instruction `xchg' after `xacquire'".to_string());
+        } else if stem != "xchg" && !lockable {
+            return Err(format!("invalid instruction `{stem}' after `xacquire'"));
+        } else if !has_lock && stem != "xchg" {
+            return Err("missing `lock' with `xacquire'".to_string());
+        }
+    }
+    if has_xrelease {
+        if stem == "mov" {
+            let mem_dst = matches!(instr.operands.last(), Some(Operand::Memory(_)));
+            if !mem_dst {
+                return Err(
+                    "memory destination needed for instruction `mov' after `xrelease'".to_string(),
+                );
+            }
+        } else if stem == "xchg" && !has_mem {
+            return Err("invalid instruction `xchg' after `xrelease'".to_string());
+        } else if stem != "xchg" && !lockable {
+            return Err(format!("invalid instruction `{stem}' after `xrelease'"));
+        } else if !has_lock && stem != "xchg" {
+            return Err("missing `lock' with `xrelease'".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// The byte the opcode of `body` begins with, behind the legacy prefixes:
+/// a REX2 (`D5`), VEX (`C4`, `C5`), EVEX (`62`) or XOP (`8F`) prefix, a REX
+/// prefix, or the opcode itself. With the byte behind it.
+pub(crate) fn opcode_start(body: &[u8]) -> Option<(u8, Option<u8>)> {
+    let at = body.iter().position(|byte| {
+        !matches!(
+            byte,
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0x9B | 0xF0 | 0xF2 | 0xF3
+        )
+    })?;
+    Some((body[at], body.get(at + 1).copied()))
+}
+
+/// Whether GNU as refuses the operand-size prefix word in front of `instr`
+/// whatever its encoding ("data size prefix invalid with"): an instruction
+/// on `%mm`, vector, mask or bound registers, or a PadLock one.
+pub(crate) fn takes_no_data_size_prefix(instr: &Instruction) -> bool {
+    PADLOCK.contains(&instr.mnemonic.to_ascii_lowercase().as_str())
+        || operand_class::names_simd_register(&instr.operands)
+}
+
+/// Whether `body` is an instruction behind a VEX, EVEX or XOP prefix. In
+/// 32-bit code `C4`, `C5` and `62` with a memory operand are `les`, `lds`
+/// and `bound`; `8F` with a map below 8 is `pop`.
+pub(crate) fn has_vector_prefix(body: &[u8], long: bool) -> bool {
+    match opcode_start(body) {
+        Some((0xC4 | 0xC5 | 0x62, next)) => long || next.is_some_and(|byte| byte >= 0xC0),
+        Some((0x8F, Some(next))) => next & 0x1F >= 8,
+        _ => false,
+    }
 }
 
 /// True when the mnemonic takes a bare label as a branch target (`jmp
@@ -806,11 +968,11 @@ fn is_moffs_shape(mnemonic: &str, ops: &[Operand]) -> bool {
         }
         let size = registers::infer_reg_size(reg);
         match mnemonic {
-            "mov" | "movabs" | "movabsq" => matches!(size, 1 | 2 | 4 | 8),
-            "movb" => size == 1,
-            "movw" => size == 2,
-            "movl" => size == 4,
-            "movq" => size == 8,
+            "mov" | "movabs" => matches!(size, 1 | 2 | 4 | 8),
+            "movb" | "movabsb" => size == 1,
+            "movw" | "movabsw" => size == 2,
+            "movl" | "movabsl" => size == 4,
+            "movq" | "movabsq" => size == 8,
             _ => false,
         }
     };
@@ -998,6 +1160,7 @@ impl InstructionEncoder {
             apx_dfv: 0,
             rip_field: None,
             disp32_unsigned: false,
+            learned_row: false,
         }
     }
 
@@ -1057,6 +1220,151 @@ impl InstructionEncoder {
         optimize::encode(self, instr, true)
     }
 
+    /// Hold the instruction written from `start` on to `{rex2}`: give it
+    /// the prefix if it has none, and refuse it where the prefix cannot
+    /// stand.
+    ///
+    /// REX2 stands in front of the one-byte opcodes and of the `0F` map,
+    /// and there not in front of the rows `7x`, `Ax` and `Ex` of the first
+    /// (the short conditional jumps; the accumulator moves and the string
+    /// instructions; `loop`, `in`, `out` and the near jumps and calls) nor
+    /// `3x` and `8x` of the second (`wrmsr` to `getsec` and the escapes to
+    /// the longer maps; the long conditional jumps), nor in front of the
+    /// `xsave` family. GNU as 2.47 refuses the same (`rex2_disallowed` of
+    /// its table generator, and the table's `NoEgpr`).
+    fn apply_rex2_request(
+        &mut self,
+        instr: &Instruction,
+        start: usize,
+        relocations: usize,
+    ) -> Result<(), String> {
+        let name = instr.mnemonic.to_ascii_lowercase();
+        let cannot = || {
+            format!(
+                "rex2 pseudo prefix cannot be used for `{}'",
+                decor_stem(&name)
+            )
+        };
+        // GNU as writes none in front of `xbegin`, and says nothing.
+        if name == "xbegin" {
+            return Ok(());
+        }
+        let body = &self.bytes[start..];
+        let Some(at) = body.iter().position(|byte| {
+            !matches!(
+                byte,
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0x9B | 0xF0 | 0xF2 | 0xF3
+            )
+        }) else {
+            return Err(cannot());
+        };
+        // `66`, `F3` or `F2` in front makes another instruction of an
+        // opcode (`clwb` of `xsaveopt`'s).
+        let plain = !body[..at]
+            .iter()
+            .any(|byte| matches!(byte, 0x66 | 0xF2 | 0xF3));
+        if has_vector_prefix(&body[at..], true) {
+            return Err(format!(
+                "{{rex2}} prefix invalid with `{}'",
+                decor_stem(&name)
+            ));
+        }
+        let at = start + at;
+        // The map and the opcode, with the prefix in place.
+        let (second_map, opcode_at) = match self.bytes[at..] {
+            [0xD5, payload, ..] => (payload & 0x80 != 0, at + 2),
+            // A REX prefix the arm wrote itself: the same bits, in REX2's
+            // payload.
+            [rex @ 0x40..=0x4F, ..] => {
+                self.bytes[at] = 0xD5;
+                self.bytes.insert(at + 1, rex & 0x0F);
+                self.shift_relocations(relocations, at, 1);
+                match self.bytes.get(at + 2) {
+                    Some(0x0F) => {
+                        self.bytes.remove(at + 2);
+                        self.bytes[at + 1] |= 0x80;
+                        self.shift_relocations(relocations, at + 2, -1);
+                        (true, at + 2)
+                    }
+                    _ => (false, at + 2),
+                }
+            }
+            [0x0F, ..] => {
+                self.bytes[at] = 0xD5;
+                self.bytes.insert(at + 1, 0x80);
+                self.shift_relocations(relocations, at, 1);
+                (true, at + 2)
+            }
+            _ => {
+                self.bytes.splice(at..at, [0xD5, 0x00]);
+                self.shift_relocations(relocations, at, 2);
+                (false, at + 2)
+            }
+        };
+        let Some(&opcode) = self.bytes.get(opcode_at) else {
+            return Err(cannot());
+        };
+        let extension = self
+            .bytes
+            .get(opcode_at + 1)
+            .map_or(0, |modrm| (modrm >> 3) & 7);
+        let register_form = self
+            .bytes
+            .get(opcode_at + 1)
+            .is_some_and(|modrm| *modrm >= 0xC0);
+        let refused = if second_map {
+            matches!(opcode, 0x30..=0x3F | 0x80..=0x8F)
+                // `xsave`, `xrstor`, `xsaveopt`; `xrstors`, `xsavec`,
+                // `xsaves`.
+                || (plain && opcode == 0xAE && !register_form && matches!(extension, 4..=6))
+                || (plain && opcode == 0xC7 && !register_form && matches!(extension, 3..=5))
+        } else {
+            matches!(opcode, 0x70..=0x7F | 0xA0..=0xAF | 0xE0..=0xEF)
+        };
+        if refused {
+            return Err(cannot());
+        }
+        Ok(())
+    }
+
+    /// Move the relocations of the instruction under way that stand at
+    /// `from` or behind it by `by` bytes.
+    fn shift_relocations(&mut self, first: usize, from: usize, by: i64) {
+        for relocation in self.relocations.iter_mut().skip(first) {
+            if relocation.offset >= from as u64 {
+                relocation.offset = relocation.offset.wrapping_add_signed(by);
+            }
+        }
+    }
+
+    /// What the encoding written from `body` on lacks of what the statement
+    /// asks for: EVEX under `{evex}`, VEX or XOP under `{vex}`, a prefix
+    /// that names the registers beyond `%r15` the operands have. In GNU
+    /// as's words; `None` when nothing is missing.
+    fn unmet_request(&self, name: &str, has_egpr: bool, body: usize) -> Option<String> {
+        let bytes = self.bytes.get(body..)?;
+        let start = opcode_start(bytes);
+        let evex = matches!(start, Some((0x62, _)));
+        if self.apx_evex && !evex {
+            return Some(format!("no EVEX encoding for `{name}'"));
+        }
+        if self.vex_hint.is_some() && !is_vex_xop_encoding(bytes) {
+            return Some(format!("no VEX/XOP encoding for `{name}'"));
+        }
+        if has_egpr && !evex {
+            // REX2 says them, but not in front of the `0F 38` and `0F 3A`
+            // maps (`fixup_rex2_map1`).
+            let rex2 = bytes.iter().position(|&byte| byte == 0xD5).filter(|&at| {
+                matches!(start, Some((0xD5, _)))
+                    && !matches!(bytes.get(at + 2..at + 4), Some([0x0F, 0x38 | 0x3A]))
+            });
+            if rex2.is_none() {
+                return Some(format!("no EVEX encoding for `{name}'"));
+            }
+        }
+        None
+    }
+
     /// Encode one instruction atomically. Post-encode decorator validation
     /// may fail *after* emitting bytes, relocations and advancing `offset`;
     /// callers that reuse an encoder must never retain that partial state.
@@ -1075,8 +1383,16 @@ impl InstructionEncoder {
         let trace = (self.track_memory_emission, self.memory_emission);
         // The encoders go by a register's number; what kind of register
         // the statement named is held against the encoding afterwards.
+        self.learned_row = false;
         let result = self.encode_checked(instr).and_then(|()| {
-            operand_class::check(instr, self.bytes.get(bytes..).unwrap_or(&[]), true)
+            if self.learned_row {
+                return Ok(());
+            }
+            operand_class::check(
+                instr,
+                self.bytes.get(bytes..).unwrap_or(&[]),
+                operand_class::Code::Bits64,
+            )
         });
         if result.is_err() {
             self.bytes.truncate(bytes);
@@ -1322,8 +1638,16 @@ impl InstructionEncoder {
                     has_xrelease = true;
                     group1.push(0xF3);
                 }
-                "rep" | "repz" | "repe" => group1.push(0xF3),
-                "repnz" | "repne" => group1.push(0xF2),
+                word @ ("rep" | "repz" | "repe") => {
+                    if repeat_prefix(word, instr)? {
+                        group1.push(0xF3);
+                    }
+                }
+                word @ ("repnz" | "repne") => {
+                    if repeat_prefix(word, instr)? {
+                        group1.push(0xF2);
+                    }
+                }
                 // `notrack` is `ds`'s byte in front of an indirect near
                 // branch, and nothing in front of anything else.
                 "notrack" => {
@@ -1372,48 +1696,7 @@ impl InstructionEncoder {
             return Err("same type of prefix used twice".to_string());
         }
         // Prefix/instruction agreement (GNU as diagnostics, verified 2.47).
-        // `lock` demands a lockable mnemonic with a memory operand; the HLE
-        // hints demand `lock` alongside, except `xchg` (implicitly locked)
-        // and `xrelease` on a `mov` store. The `lock` check fires first.
-        if has_lock || has_xacquire || has_xrelease {
-            let stem = prefix_stem(&instr.mnemonic);
-            let has_mem = instr
-                .operands
-                .iter()
-                .any(|op| matches!(op, Operand::Memory(_)));
-            let lockable = (stem == "xchg" || LOCKABLE_STEMS.contains(&stem.as_str())) && has_mem;
-            if has_lock && !lockable {
-                return Err("expecting lockable instruction after `lock'".to_string());
-            }
-            if has_xacquire {
-                if stem == "mov" {
-                    return Err("instruction `mov' after `xacquire' not allowed".to_string());
-                } else if stem == "xchg" && !has_mem {
-                    return Err("invalid instruction `xchg' after `xacquire'".to_string());
-                } else if stem != "xchg" && !lockable {
-                    return Err(format!("invalid instruction `{}' after `xacquire'", stem));
-                } else if !has_lock && stem != "xchg" {
-                    return Err("missing `lock' with `xacquire'".to_string());
-                }
-            }
-            if has_xrelease {
-                if stem == "mov" {
-                    let mem_dst = matches!(instr.operands.last(), Some(Operand::Memory(_)));
-                    if !mem_dst {
-                        return Err(
-                            "memory destination needed for instruction `mov' after `xrelease'"
-                                .to_string(),
-                        );
-                    }
-                } else if stem == "xchg" && !has_mem {
-                    return Err("invalid instruction `xchg' after `xrelease'".to_string());
-                } else if stem != "xchg" && !lockable {
-                    return Err(format!("invalid instruction `{}' after `xrelease'", stem));
-                } else if !has_lock && stem != "xchg" {
-                    return Err("missing `lock' with `xrelease'".to_string());
-                }
-            }
-        }
+        check_lock_prefixes(instr, has_lock, has_xacquire, has_xrelease)?;
 
         let reloc_base = self.relocations.len();
 
@@ -1556,6 +1839,13 @@ impl InstructionEncoder {
             }
         }
 
+        // A number that is one byte of the instruction, in the range GNU
+        // as takes it in.
+        learned::check_number(
+            &instr.mnemonic.to_ascii_lowercase(),
+            &instr.operands,
+            operand_class::Code::Bits64,
+        )?;
         self.rip_field = None;
         let (body, body_relocations) = (self.bytes.len(), self.relocations.len());
         let mut result = if moffs_redirect {
@@ -1571,6 +1861,7 @@ impl InstructionEncoder {
         // (`table`): a form or a spelling no arm was written for.
         if let (Err(refusal), false) = (&result, moffs_redirect) {
             let name = instr.mnemonic.to_ascii_lowercase();
+            let unhandled = refusal.starts_with("unhandled instruction");
             match table::plan(&name, &instr.operands, true) {
                 Some(Ok(plan)) => {
                     self.bytes.truncate(body);
@@ -1580,10 +1871,53 @@ impl InstructionEncoder {
                 }
                 // The table knows the name and has a better word for what
                 // is wrong than "unhandled".
-                Some(Err(mismatch)) if refusal.starts_with("unhandled instruction") => {
-                    result = Err(mismatch);
-                }
+                Some(Err(mismatch)) if unhandled => result = Err(mismatch),
                 _ => {}
+            }
+        }
+        // Or an instruction GNU as was asked about (`learned`): one the
+        // arms and the table refuse, or one they wrote in an encoding that
+        // cannot say the statement -- not EVEX where `{evex}` asks for it
+        // or a register beyond `%r15` needs it, not VEX under `{vex}`.
+        // `{nf}` and `{dfv=}` are for the arms; the rows say nothing about
+        // them.
+        let has_egpr = operands_have_egpr(&instr.operands);
+        let asks = self.apx_evex || self.vex_hint.is_some() || has_egpr;
+        if (result.is_err() || asks) && !moffs_redirect && !(self.apx_nf || self.apx_dfv != 0) {
+            let name = instr.mnemonic.to_ascii_lowercase();
+            if learned::knows(&name) && learned::stands_behind(&instr.prefixes) {
+                if result.is_ok() {
+                    if let Some(unmet) = self.unmet_request(&name, has_egpr, body) {
+                        result = Err(unmet);
+                    }
+                }
+                if let Err(refusal) = &result {
+                    let unhandled = refusal.starts_with("unhandled instruction");
+                    self.bytes.truncate(body);
+                    self.relocations.truncate(body_relocations);
+                    self.rip_field = None;
+                    let asked = learned::Asked {
+                        code: operand_class::Code::Bits64,
+                        evex: self.apx_evex,
+                        vex: self.vex_hint.is_some(),
+                        rex2: self.apx_rex2,
+                    };
+                    match self.encode_learned(&name, &instr.operands, asked) {
+                        Some(Ok(_)) => {
+                            self.learned_row = true;
+                            result = Ok(());
+                        }
+                        Some(Err(mismatch)) => {
+                            self.bytes.truncate(body);
+                            self.relocations.truncate(body_relocations);
+                            self.rip_field = None;
+                            if unhandled {
+                                result = Err(mismatch);
+                            }
+                        }
+                        None => {}
+                    }
+                }
             }
         }
         if result.is_ok() {
@@ -1696,9 +2030,24 @@ impl InstructionEncoder {
         if result.is_ok() {
             result = self.fixup_rex2_map1(start_len);
         }
-        if result.is_ok() && operands_have_egpr(&instr.operands) {
-            let body = &self.bytes[start_len..];
-            let has_apx = body.iter().any(|&b| b == 0xD5 || b == 0x62);
+        // `{rex2}` asks for a REX2 prefix whatever the registers are. The
+        // arms that write a REX prefix write the REX2 one; the others --
+        // an instruction without operands, x87, a table row -- wrote
+        // theirs without (`{rex2} nop` was `90`, GNU as: `D5 00 90`), and
+        // one on an opcode REX2 cannot stand in front of was written all
+        // the same (`{rex2} xsave (%rax)` was `D5 80 AE 20`, which no
+        // processor decodes).
+        if result.is_ok() && self.apx_rex2 {
+            result = self.apply_rex2_request(instr, start_len, reloc_base);
+        }
+        // (The prefix itself: a `D5` or a `62` anywhere in the instruction
+        // passed for one, and `kmovb %r21d, %k2`, whose ModRM byte is
+        // `D5`, was assembled as `kmovb %ebp, %k2`.)
+        if result.is_ok() && has_egpr {
+            let has_apx = matches!(
+                opcode_start(&self.bytes[start_len..]),
+                Some((0xD5 | 0x62, _))
+            );
             if !has_apx {
                 result = Err(format!(
                     "internal: EGPR operand without REX2/EVEX prefix ({})",
@@ -1792,9 +2141,22 @@ impl InstructionEncoder {
             {
                 at += 1;
             }
+            // (An XOP prefix among them: `data16 vprotw` was `66 8F ..`.)
+            // Nor does the word stand in front of an instruction on
+            // vector, `%mm` or mask registers, where `66` selects another
+            // instruction (`data16 addps %xmm1, %xmm2` was `addpd`), or of
+            // a PadLock one.
+            let vector =
+                has_vector_prefix(&self.bytes[at..], true) || takes_no_data_size_prefix(instr);
             match self.bytes.get(at) {
-                Some(0x66) | Some(0x62) | Some(0xC4) | Some(0xC5) | Some(0xD5) => {
+                Some(0x66 | 0xD5) => {
                     result = Err("same type of prefix used twice".to_string());
+                }
+                _ if vector => {
+                    result = Err(format!(
+                        "data size prefix invalid with `{}'",
+                        instr.mnemonic.to_ascii_lowercase()
+                    ));
                 }
                 _ => {
                     self.bytes.insert(at, 0x66);
@@ -1878,7 +2240,7 @@ impl InstructionEncoder {
         // a mask on `addl` is `unsupported masking for `add'' rather
         // than `mask not on destination'. Runs only when the body
         // succeeded; body errors (bad operands) take precedence.
-        if result.is_ok() {
+        if result.is_ok() && !self.learned_row {
             Self::check_decorators(&self.bytes[start_len..], &instr.mnemonic, &instr.operands)?;
         }
 
@@ -4042,7 +4404,18 @@ impl InstructionEncoder {
                 Err("operand type mismatch for `mov'".to_string())
             }
             "movb" => self.encode_mov(ops, 1),
-            "movabsq" | "movabs" => self.encode_movabs(ops),
+            "movabs" => self.encode_movabs(ops),
+            // With a suffix: a register of that size, and for all but `q`
+            // the accumulator at an address (only `movabsq` loads a
+            // number).
+            "movabsq" | "movabsl" | "movabsw" | "movabsb" => {
+                let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+                Self::check_operand_size(mnemonic, ops, size)?;
+                if size != 8 && ops.iter().any(|op| matches!(op, Operand::Immediate(_))) {
+                    return Err(format!("operand type mismatch for `{mnemonic}'"));
+                }
+                self.encode_movabs(ops)
+            }
             "movslq" => self.encode_movsx(ops, 4, 8),
             "movsbq" => self.encode_movsx(ops, 1, 8),
             "movswq" => self.encode_movsx(ops, 2, 8),
@@ -4186,6 +4559,11 @@ impl InstructionEncoder {
                         _ => None,
                     })
                     .unwrap_or(8);
+                // No byte form (`{evex} lzcnt (%rbx), %cl` was assembled
+                // as `lzcnt (%rbx), %rcx`).
+                if size == 1 {
+                    return Err(format!("operand size mismatch for `{mnemonic}'"));
+                }
                 let suffixed = match (mnemonic, size) {
                     (m, 2) => format!("{}w", m),
                     (m, 4) => format!("{}l", m),
@@ -7120,6 +7498,222 @@ mod apx_tests {
         assert!(fails("{nf} cmovzq %rax, %rbx, %r16"));
         assert!(fails("{evex} cmovzq %rax, %rbx"));
         assert!(fails("{evex} pushq %rax"));
+    }
+
+    /// The encoders of these took a general register by its number and the
+    /// operand size from a suffix, or from another operand.
+    #[test]
+    fn a_general_register_is_as_wide_as_the_operation() {
+        for statement in [
+            "cmovaq (%rsp), %r9w",
+            "cmoval (%rdx), %r13",
+            "cmovaw %rcx, %r9, %rcx",
+            "cfcmovaq %cx, %cx",
+            "cvttss2siq %xmm1, %ecx",
+            "cvtss2sil %xmm1, %r13",
+            "vcvtsi2ssl %rcx, %xmm1, %xmm9",
+            "rorxq $3, %ecx, %ecx",
+            "shrxl %r9, (%rsp), %rcx",
+            "sarxq %r9d, (%rsp), %ecx",
+            "vmovd %r13, %xmm17",
+            "movabsq 0x1122334455667788, %eax",
+            "movabsl %rax, 0x1122334455667788",
+            "movabsl $1, %eax",
+            "lar %ebp, %r9w",
+            "lsl %rbp, %r9d",
+        ] {
+            assert!(fails(statement), "`{statement}` was assembled");
+        }
+        assert_eq!(hex("cmovaq (%rsp), %r9"), "4c 0f 47 0c 24");
+        assert_eq!(hex("cmovaw %cx, %dx"), "66 0f 47 d1");
+        assert_eq!(hex("cvttss2siq %xmm1, %rcx"), "f3 48 0f 2c c9");
+        assert_eq!(hex("cvttss2si %xmm1, %ecx"), "f3 0f 2c c9");
+        assert_eq!(hex("rorxq $3, %rcx, %rcx"), "c4 e3 fb f0 c9 03");
+        assert_eq!(hex("vmovd %xmm17, %ecx"), "62 e1 7d 08 7e c9");
+        assert_eq!(
+            hex("movabsl 0x1122334455667788, %eax"),
+            "a1 88 77 66 55 44 33 22 11"
+        );
+        assert_eq!(
+            hex("movabsw %ax, 0x1122334455667788"),
+            "66 a3 88 77 66 55 44 33 22 11"
+        );
+        assert_eq!(hex("lar %bp, %r9d"), "44 0f 02 cd");
+        assert_eq!(hex("lar %ebp, %r9d"), "44 0f 02 cd");
+    }
+
+    /// The width of the integer instructions is read off the encoding
+    /// too; what it has to leave alone, in 64-bit code (bytes of GNU as
+    /// 2.47).
+    #[test]
+    fn the_integer_width_check_takes_what_gnu_as_takes() {
+        // A prefix written as a word sets the size, not the registers.
+        assert_eq!(hex("data16 addl %eax, %ebx"), "66 01 c3");
+        assert_eq!(hex("data16 push %rax"), "66 50");
+        assert_eq!(hex("data16 call *%rax"), "66 ff d0");
+        assert_eq!(hex("rex64 movl %eax, %ebx"), "48 89 c3");
+        assert_eq!(hex("rex64 cmova %eax, %ebx"), "48 0f 47 d8");
+        assert_eq!(hex("rex64 shl %cl, %eax"), "48 d3 e0");
+        // The stack is 64 bits wide without a `W`.
+        assert_eq!(hex("push %rax"), "50");
+        assert_eq!(hex("pop %r9"), "41 59");
+        assert_eq!(hex("pushw %cx"), "66 51");
+        assert_eq!(hex("callq *%rax"), "ff d0");
+        assert_eq!(hex("jmpq *%r9"), "41 ff e1");
+        assert_eq!(hex("callw *%ax"), "66 ff d0");
+        // A count in `%cl` beside what is shifted.
+        assert_eq!(hex("shlq %cl, %rdx"), "48 d3 e2");
+        assert_eq!(hex("shrw %cl, %dx"), "66 d3 ea");
+        assert_eq!(hex("shrb %cl, %cl"), "d2 e9");
+        assert_eq!(hex("shld %cl, %rax, %rbx"), "48 0f a5 c3");
+        // `xchg` with the accumulator, with and without REX.
+        assert_eq!(hex("xchg %r8, %rax"), "49 90");
+        assert_eq!(hex("xchg %ax, %bp"), "66 95");
+        assert_eq!(hex("xchg %rax, %rax"), "90");
+        assert_eq!(hex("xchg %eax, %eax"), "87 c0");
+        // A number that fits 32 bits unsigned goes into the 64-bit
+        // register through its lower half.
+        assert_eq!(hex("movq $0xffffffff, %rax"), "b8 ff ff ff ff");
+        assert_eq!(hex("mov $0x80000000, %r9"), "41 b9 00 00 00 80");
+        for statement in [
+            "pushq %cx",
+            "pushw %rcx",
+            "callq *%ecx",
+            "callw *%rcx",
+            "jmpq *%cx",
+            "shlq %cl, %edx",
+            "shll %cl",
+            "addw $-3, %ecx",
+            "movb $0x90, %cx",
+            "leal (%rdx), %cx",
+            "xchgw %ebp, %eax",
+        ] {
+            assert!(fails(statement), "`{statement}` was assembled");
+        }
+    }
+
+    /// `vperm2f128` and `vperm2i128` take their first source from memory
+    /// (they were refused there, as a wrong width). Bytes of GNU as 2.47.
+    #[test]
+    fn a_two_source_permute_reads_a_source_from_memory() {
+        assert_eq!(
+            hex("vperm2f128 $0x20, (%rdi), %ymm1, %ymm0"),
+            "c4 e3 75 06 07 20"
+        );
+        assert_eq!(
+            hex("vperm2f128 $0x90, 0x12(%rbx,%rsi,4), %ymm2, %ymm2"),
+            "c4 e3 6d 06 54 b3 12 90"
+        );
+        assert_eq!(
+            hex("vperm2i128 $0x20, (%rdi), %ymm1, %ymm0"),
+            "c4 e3 75 46 07 20"
+        );
+        assert_eq!(
+            hex("vperm2i128 $-3, 0x1000, %ymm10, %ymm10"),
+            "c4 63 2d 46 14 25 00 10 00 00 fd"
+        );
+        assert_eq!(
+            hex("vperm2f128 $0x90, %ymm3, %ymm2, %ymm2"),
+            "c4 e3 6d 06 d3 90"
+        );
+        for statement in [
+            "vperm2f128 $1, (%rdi), %xmm1, %xmm0",
+            "vperm2f128 $1, (%rdi), %ymm1, %xmm0",
+            "vperm2i128 $1, %xmm2, %ymm1, %ymm0",
+        ] {
+            assert!(fails(statement), "`{statement}` was assembled");
+        }
+    }
+
+    /// A number that does not fit the byte is refused under the name of the
+    /// statement's instruction (every one said `vmpsadbw`).
+    #[test]
+    fn an_immediate_out_of_range_names_its_instruction() {
+        for (statement, mnemonic) in [
+            ("vperm2f128 $0x1234, (%rdi), %ymm1, %ymm0", "vperm2f128"),
+            ("vperm2i128 $300, %ymm2, %ymm1, %ymm0", "vperm2i128"),
+            ("vpalignr $300, %xmm2, %xmm1, %xmm0", "vpalignr"),
+            ("vblendps $300, %xmm2, %xmm1, %xmm0", "vblendps"),
+            ("vblendpd $300, %xmm2, %xmm1, %xmm0", "vblendpd"),
+            ("vpblendd $300, %xmm2, %xmm1, %xmm0", "vpblendd"),
+            ("vpblendw $300, %xmm2, %xmm1, %xmm0", "vpblendw"),
+            ("vinsertf128 $300, %xmm2, %ymm1, %ymm0", "vinsertf128"),
+            ("vinserti128 $300, %xmm2, %ymm1, %ymm0", "vinserti128"),
+            ("vinsertps $300, %xmm2, %xmm1, %xmm0", "vinsertps"),
+            ("vroundss $300, %xmm2, %xmm1, %xmm0", "vroundss"),
+            ("vroundsd $300, %xmm2, %xmm1, %xmm0", "vroundsd"),
+            ("vdpps $300, %xmm2, %xmm1, %xmm0", "vdpps"),
+            ("vdppd $300, %xmm2, %xmm1, %xmm0", "vdppd"),
+            ("vmpsadbw $300, %xmm2, %xmm1, %xmm0", "vmpsadbw"),
+        ] {
+            assert_eq!(
+                fail_msg(statement),
+                format!("operand type mismatch for `{mnemonic}'"),
+                "{statement}"
+            );
+        }
+    }
+
+    /// GNU as has no sized spelling of a direct jump, in any code.
+    #[test]
+    fn a_direct_jump_has_no_sized_spelling() {
+        for statement in ["jmpq sym", "jmpw sym", "jmpl sym", "jmpq 1f\n1:"] {
+            assert!(fails(statement), "`{statement}` was assembled");
+        }
+        assert_eq!(hex("jmp sym"), "e9 00 00 00 00");
+        assert_eq!(hex("jmpq *sym(%rip)"), "ff 25 00 00 00 00");
+        assert_eq!(hex("callq sym"), "e8 00 00 00 00");
+    }
+
+    /// `%xmm16` and up are EVEX's, and an address an instruction implies
+    /// is written through its register.
+    #[test]
+    fn what_an_encoding_cannot_address_is_refused() {
+        for statement in [
+            "vfrczpd %xmm17, %xmm17",
+            "vphaddbd %xmm18, %xmm1",
+            "xlat 0x1000",
+            "xlat sym",
+            "outsb 0x1000, (%dx)",
+            "outsb sym, %dx",
+            "lodsb 0x1000",
+            "lodsb sym",
+            "lodsl sym, %eax",
+            "rmpupdate 0x1000, %rax",
+        ] {
+            assert!(fails(statement), "`{statement}` was assembled");
+        }
+        assert_eq!(hex("vfrczpd %xmm7, %xmm1"), "8f e9 78 81 cf");
+        assert_eq!(hex("xlat (%rbx)"), "d7");
+        assert_eq!(hex("xlat %es:(%rbx)"), "26 d7");
+        assert_eq!(hex("outsb %fs:(%rsi), (%dx)"), "64 6e");
+        // Any register will do for GNU as, which warns and assembles the
+        // instruction; so will the instruction pointer.
+        assert_eq!(hex("outsb (%rsi,%rcx), %dx"), "6e");
+        assert_eq!(hex("outsb 0x1234(%r9,%r10,2), %dx"), "6e");
+        assert_eq!(hex("outsb (,%rax,4), %dx"), "6e");
+        assert_eq!(hex("outsb 4(%rax), (%dx)"), "6e");
+        // `(%dx)` is the port while no index register has been named,
+        // and with nothing beside the register.
+        for statement in [
+            "outsb (%rsi,%rcx), (%dx)",
+            "outsb (,%rsi), (%dx)",
+            "outsb (%rsi), 4(%dx)",
+            "outsb (%rsi), %es:(%dx)",
+            "insb 4(%dx), (%rdi)",
+        ] {
+            assert!(fails(statement), "`{statement}` was assembled");
+        }
+        assert_eq!(hex("insb (%dx), 4(%rdi,%rax)"), "6c");
+        assert_eq!(hex("xlat (,%rbx)"), "d7");
+        assert_eq!(hex("lodsb (%rax,%rbx)"), "ac");
+        assert_eq!(hex("lodsb sym(%rip)"), "ac");
+        // What the other string instructions address may be a bare
+        // displacement.
+        assert_eq!(hex("scasb sym"), "ae");
+        assert_eq!(hex("stosb %al, sym"), "aa");
+        assert_eq!(hex("movsb sym, (%rdi)"), "a4");
+        assert_eq!(hex("insb %dx, sym"), "6c");
     }
 
     /// Bytes and relocations of GNU as 2.47.

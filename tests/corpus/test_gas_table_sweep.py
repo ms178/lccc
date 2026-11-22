@@ -304,9 +304,10 @@ class CommandLine(unittest.TestCase):
         self.assertIn("--lccc", self.refuses("--check"))
         self.assertEqual({mode.name for mode in sweep.MODES.values()},
                          {"64", "32", "16", "16gcc"})
-        # The other direction is the 64- and 32-bit encoders'.
+        # The other direction: every code in which a size prefix is read
+        # its own way.
         self.assertEqual([name for name, mode in sweep.MODES.items() if mode.foreign],
-                         ["64", "32"])
+                         ["64", "32", "16"])
 
 
 if __name__ == "__main__":

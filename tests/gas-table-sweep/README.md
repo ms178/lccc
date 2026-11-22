@@ -35,8 +35,8 @@ round, and so is every size prefix; `.code16gcc` keeps the stack instructions
 
 ## The other direction
 
-The table also says what a mnemonic does *not* take. The 64- and 32-bit
-sweeps put in
+The table also says what a mnemonic does *not* take. The 64-bit, 32-bit and
+`.code16` sweeps put in
 
 * for every mnemonic and operand position, a register of each kind that no
   row of the mnemonic has there -- `rdrand %xmm0`, `adc %cl, %mm3`, `addps
@@ -44,20 +44,43 @@ sweeps put in
 * in the vector positions of every row, vector registers of every width in
   every combination -- `vaddps %ymm1, %xmm2, %xmm3`, `vpermd %xmm1, %xmm2,
   %xmm3`, `vpmovsxbw %ymm1, %ymm2`;
+* every statement made from the rows themselves that GNU as refuses -- a
+  size suffix on a register of another width (`cmovaq (%rsp), %r9w`,
+  `cvttss2siq %xmm1, %ecx`, `sarl $1, %r9b`, and in 32-bit code `addw $-3,
+  %ecx`, `movb $0x90, %cx`, `sall %cl`), general registers of two widths
+  where a row takes one of several (`shrd %cl, %ebp, %r13`, `lar %ebp,
+  %r9w`), a vector register only EVEX reaches on an opcode that has none
+  (`vfrczpd %xmm17, %xmm17`), an address an instruction implies written
+  without a register (`xlat 0x1000`, `lodsb sym`), a far branch whose offset
+  does not fit its field (`ljmpw $0x1234, $0x12345678`), a mnemonic of
+  another mode (`rmpquery` in 32-bit code);
 
 and of the statements GNU as refuses, lccc has to refuse every one. An
-encoder that goes by a register's number and never asks its kind, or takes
-an instruction's vector length from one operand and never looks at the
-others, assembles such a statement into an instruction on other registers:
-before these sweeps existed 17,000 of the first kind and 1,200 of the second
-were assembled. Each of these statements takes a run of lccc of its own (lccc
-stops at the first statement it refuses), so one in three is swept.
+encoder that goes by a register's number and never asks its kind, takes an
+instruction's vector length from one operand and never looks at the others,
+or takes the operand size from a suffix and never looks at the register,
+assembles such a statement into an instruction on other registers: before
+these sweeps existed 17,000 of the first kind and 1,200 of the second were
+assembled, and of the third 670 in 64-bit code and 270 in 32-bit code. Each
+of these statements takes a run of lccc of its own (lccc stops at the first
+statement it refuses), so of the first two kinds one in three is swept; of
+the third, every one.
 
 What an encoding takes is checked in one place for every instruction
-(`src/backend/x86/assembler/encoder/operand_class.rs`). The widths of vector
-register each VEX, EVEX and XOP opcode takes together are a table there,
-written from GNU as's own answers by `scripts/x86_vector_widths.py`
-(`--check` holds the table in the tree to GNU as, `--write` regenerates it).
+(`src/backend/x86/assembler/encoder/operand_class.rs`): the kinds of register
+an opcode addresses, and for the integer instructions, the conditional moves,
+the scalar conversions and BMI the width its general registers have -- read
+off the encoding, in which `66` means 16 bits in 32- and 64-bit code and 32
+bits in 16-bit code. The widths of vector register each VEX, EVEX and XOP
+opcode takes together are a table there, written from GNU as's own answers by
+`scripts/x86_vector_widths.py` (`--check` holds the table in the tree to GNU
+as, `--write` regenerates it).
+
+One kind of statement is left, in 16-bit code, and recorded: a gather whose
+address names no general register (`vgatherdps %xmm6, 0x1000(,%xmm7,8),
+%xmm1`). Such an address is 16 bits wide for GNU as, which has no 16-bit form
+of it and wants `addr32` written in front; lccc writes the prefix, and the
+bytes are the ones GNU as makes of the statement with `addr32`.
 
 ## The expectation files
 

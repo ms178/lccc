@@ -50,7 +50,7 @@ pub(crate) enum Arg {
     /// The port register: `%dx` or `(%dx)`.
     Port,
     /// A memory operand of which only the segment and the address size are
-    /// encoded (`xlat %es:(%rbx)`).
+    /// encoded (`xlat %es:(%rbx)`): one that names a register.
     Segment,
     /// An 8-bit immediate, signed or unsigned.
     Imm8,
@@ -509,7 +509,7 @@ static ROWS: &[Row] = &[
         None,
         FIXED,
     )),
-    bytes("rmpquery", 0xF3, &[0x0F, 0x01, 0xFD]),
+    long(bytes("rmpquery", 0xF3, &[0x0F, 0x01, 0xFD])),
     long(row(
         "rmpquery",
         &[AccAddr, RCX, RDX],
@@ -524,7 +524,7 @@ static ROWS: &[Row] = &[
     long(bytes("seamret", 0x66, &[0x0F, 0x01, 0xCD])),
     bytes("tdcall", 0x66, &[0x0F, 0x01, 0xCC]),
     bytes("pconfig", 0, &[0x0F, 0x01, 0xC5]),
-    bytes("pbndkb", 0, &[0x0F, 0x01, 0xC7]),
+    long(bytes("pbndkb", 0, &[0x0F, 0x01, 0xC7])),
     bytes("getsec", 0, &[0x0F, 0x37]),
     bytes("rsm", 0, &[0x0F, 0xAA]),
     // --- Interrupts and returns of newer privilege models ---
@@ -978,7 +978,7 @@ impl Row {
                     }
                 }
                 Segment => {
-                    memory(op)?;
+                    super::implied_address(self.name, memory(op)?).ok()?;
                 }
                 Imm8 | Imm8u | Imm8t | Imm16 => {
                     let value = integer(op)?;
