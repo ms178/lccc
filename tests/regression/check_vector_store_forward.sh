@@ -134,6 +134,22 @@ CCC_DISABLE_PASSES=vecstorefwd "$LCCC" -O2 -w -mavx2 -S "$FIXTURE" -o "$WORK/off
     || { echo "FAIL: cannot emit the counterfactual assembly" >&2; exit 1; }
 
 fail=0
+# check_budget <name> <budget>: the body must fit the budget and be non-empty.
+# Used where the disabled pass is no longer a distinct counterfactual.
+check_budget() {
+    local name=$1 budget=$2 on
+    on=$(body "$WORK/on.s" "$name")
+    if [ "$on" -eq 0 ]; then
+        echo "FAIL: no emitted body for '$name'" >&2
+        fail=1; return
+    fi
+    if [ "$on" -gt "$budget" ]; then
+        echo "FAIL: $name costs $on instructions (budget $budget)" >&2
+        fail=1; return
+    fi
+    echo "  ok  $name costs $on instruction(s) (budget $budget; register-homed, pass-off $(body "$WORK/off.s" "$name"))"
+}
+
 # check <name> <budget>: the forwarded body must fit the budget, the disabled
 # pass must be strictly worse, and no staging reload may survive.
 check() {
@@ -169,7 +185,13 @@ check() {
 check float_256 14
 check int_128 3
 check ps_256 4
-check chain_256 22
+# chain_256 is budget-only. Its 256-bit result now has a YMM register home
+# (the straight-line 256-bit allocator in regalloc.rs), so the frame temporary
+# that the pass forwards no longer exists with or without the pass: the
+# counterfactual is 22 as well, below the 24 the pass used to save. The pass
+# still has a measured cost on float_256, int_128, ps_256 and two_stores above.
+# The budget still guards the forwarded body.
+check_budget chain_256 22
 
 # A value read by TWO stores is the multi-reader case: every reader is an
 # address-form store of the same width, so the pass forwards the register
