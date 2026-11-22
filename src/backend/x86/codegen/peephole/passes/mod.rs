@@ -2139,7 +2139,7 @@ fn peephole_optimize_inner(
     }
 
     phase_mark!(peephole_total, "phase2->3");
-// Phase 3: One more local cleanup if global passes made changes.
+    // Phase 3: One more local cleanup if global passes made changes.
     if global_changed && !skip_phase3 {
         let mut changed2 = true;
         let mut pass_count2 = 0;
@@ -2636,7 +2636,7 @@ fn peephole_optimize_inner(
     };
 
     phase_mark!(peephole_total, "phase4a");
-// Phase 4b: If trampoline elimination made changes, do another round of local cleanup.
+    // Phase 4b: If trampoline elimination made changes, do another round of local cleanup.
     if trampoline_changed && !skip_phase4 {
         let mut changed3 = true;
         let mut pass_count3 = 0;
@@ -2890,7 +2890,7 @@ fn peephole_optimize_inner(
     }
     phase_mark!(peephole_total, "phase5");
     phase_mark!(peephole_total, "phase4b");
-// Phase 5: Tail call optimization.
+    // Phase 5: Tail call optimization.
     if !skip_phase5 {
         tail_call::optimize_tail_calls(&mut store, &mut infos);
     }
@@ -2917,7 +2917,7 @@ fn peephole_optimize_inner(
     }
 
     phase_mark!(peephole_total, "phase6");
-// Phase 6: Eliminate unused callee-saved register saves/restores. A
+    // Phase 6: Eliminate unused callee-saved register saves/restores. A
     // call-free function's still-used saved value first moves into a
     // scratch register it never names (`scratch_rename`), making the save
     // unused; renames whose save survives the elimination are reverted.
@@ -2973,7 +2973,12 @@ fn peephole_optimize_inner(
     // Phase 8: Merge identical basic blocks (phi trampoline deduplication).
     // Must run after all other transformations to catch final identical patterns.
     if !sk("identical_blocks") {
-        late!(sk, late_clock, "identical_blocks", identical_blocks::merge_identical_blocks(&mut store, &mut infos));
+        late!(
+            sk,
+            late_clock,
+            "identical_blocks",
+            identical_blocks::merge_identical_blocks(&mut store, &mut infos)
+        );
     }
 
     // Dead copies can leave branch-only blocks after the IR CFG cleanup.
@@ -2983,7 +2988,12 @@ fn peephole_optimize_inner(
     // Retargeting can widen a rel8 branch while retaining its relay. Until
     // exact layout proves non-growth, preserve size mode rather than guess.
     if !optimize_for_size && !sk("jump_thread") {
-        late!(sk, late_clock, "jump_thread", jump_thread::run(&mut store, &mut infos));
+        late!(
+            sk,
+            late_clock,
+            "jump_thread",
+            jump_thread::run(&mut store, &mut infos)
+        );
     }
 
     if let Some(s) = peephole_total {
@@ -2993,35 +3003,52 @@ fn peephole_optimize_inner(
         ));
     }
 
-
-
-
     // Phase 8b: terminal epilogue cross-jumping.  Every frame/callee-save,
     // trampoline, tail-call, and identical-block rewrite has now settled, so
     // the pass sees the largest set of compatible suffixes.  It deliberately
     // runs after all structured LineStore passes: its synthetic `label +\n\
     // instruction` replacement is assembler text, not an input for another
     // line classifier.
-    late!(sk, late_clock, "epilogue_merge", epilogue_merge::merge_epilogue_tails(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "epilogue_merge",
+        epilogue_merge::merge_epilogue_tails(&mut store, &mut infos)
+    );
 
     // Final orphan sweep: phases 4c–8b (hoisting, rotation, tail calls, slot
     // DSE, callee-save elimination, frame compaction, block merging) can each
     // orphan a pure write after the last fixpoint loop above.  This restores
     // the pipeline's terminal invariant: no provably-dead GP pure write
     // leaves the peephole.
-    late!(sk, late_clock, "dead_pure_writes", retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes")));
+    late!(
+        sk,
+        late_clock,
+        "dead_pure_writes",
+        retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"))
+    );
 
     // Phase 8b: index-only lea + add fused into one SIB address, so the
     // terminal window the next phase walks already sees the shorter chain.
     // `CCC_PEEPHOLE_SKIP=lea_add_fuse` disables it for bisection.
-    late!(sk, late_clock, "lea_add_fuse", lea_add_fuse::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "lea_add_fuse",
+        lea_add_fuse::run(&mut store, &mut infos)
+    );
 
     // Phase 8b': a constant pointer adjustment absorbed into its single
     // memory consumer's displacement (`addq $256, %rdi; op (%rdi)` →
     // `op 256(%rdi)`).  Same flags oracle and editing discipline as 8b;
     // placed here so 8c..8e and the final dead sweep see the shorter form.
     // `CCC_PEEPHOLE_SKIP=disp_absorb` disables it for bisection.
-    late!(sk, late_clock, "disp_absorb", disp_absorb::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "disp_absorb",
+        disp_absorb::run(&mut store, &mut infos)
+    );
 
     // Phase 8b'': a narrow reload of a just-homed vector register becomes a
     // register lane extraction (`vmovdqu %ymm0, 8(%rsp); vmovss 20(%rsp),
@@ -3039,28 +3066,48 @@ fn peephole_optimize_inner(
     // sweep) and before `return_bool`, whose cmp/setcc shapes never carry a
     // return copy for it to fold anyway.  `CCC_PEEPHOLE_SKIP=return_home`
     // disables it for bisection.
-    late!(sk, late_clock, "return_home", return_home::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "return_home",
+        return_home::run(&mut store, &mut infos)
+    );
 
     // Phase 8c': the XMM analogue — `movaps %xmmS, %xmm0; ret` retires by
     // renaming the producer chain's `%xmmS` into the return register.  Pure
     // renaming (no instruction changes form, so no flag concerns); every
     // gate fails closed on implicit-xmm0 readers (legacy blendv/sha), wider
     // spellings and unproven roots.  `CCC_PEEPHOLE_SKIP=xmm_return_home`.
-    late!(sk, late_clock, "xmm_return_home", return_home::run_xmm(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "xmm_return_home",
+        return_home::run_xmm(&mut store, &mut infos)
+    );
 
     // Phase 8d: the signed power-of-two division bias-add identity into the
     // conditional-add/cmov machine idiom — four instructions, no sign
     // scratch, and the arms land directly in the return register on terminal
     // paths because `return_home` already ran.  `CCC_PEEPHOLE_SKIP=pow2_cmov`
     // disables it for bisection.
-    late!(sk, late_clock, "pow2_cmov", pow2_cmov::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "pow2_cmov",
+        pow2_cmov::run(&mut store, &mut infos)
+    );
 
     // Phase 8d'': the sign-magnitude identity (`mov; sar $31; xor; sub`, from
     // `abs` and `x < 0 ? -x : x`) into GCC's and Clang's `mov; neg; cmovs` --
     // one instruction (two when the result is then copied out) and one cycle
     // of latency shorter.  After `return_home` for the same reason as
     // `pow2_cmov`.  `CCC_PEEPHOLE_SKIP=abs_cmov` disables it for bisection.
-    late!(sk, late_clock, "abs_cmov", abs_cmov::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "abs_cmov",
+        abs_cmov::run(&mut store, &mut infos)
+    );
 
     // Phase 8d-1: an in-place byte mask whose only consumer is a condition —
     // `andl $255, %r10; testq %r10, %r10; je` becomes `testb %r10b, %r10b; je`,
@@ -3073,17 +3120,47 @@ fn peephole_optimize_inner(
     // the phase-1 fixed point (it is idempotent, so it needs no loop) and
     // before the boolean-shaping passes, so `return_bool`/`sign_test` see the
     // shortened text rather than a mask they would have to look through.
-    late!(sk, late_clock, "mask_test", mask_test::fold_inplace_mask_test(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "mask_test",
+        mask_test::fold_inplace_mask_test(&mut store, &mut infos)
+    );
 
-    late!(sk, late_clock, "div_rem_fusion", div_rem_fusion::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "div_rem_fusion",
+        div_rem_fusion::run(&mut store, &mut infos)
+    );
     // The product twin: one `mul` already holds the low half an `imul` of
     // the same factors recomputes (idempotent, so no loop).
-    late!(sk, late_clock, "multiword", multiword::fold_product_pair(&mut store, &mut infos));
-    late!(sk, late_clock, "logical_narrow_test", logical_narrow_test::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "multiword",
+        multiword::fold_product_pair(&mut store, &mut infos)
+    );
+    late!(
+        sk,
+        late_clock,
+        "logical_narrow_test",
+        logical_narrow_test::run(&mut store, &mut infos)
+    );
 
-    late!(sk, late_clock, "sext_test", sext_test::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "sext_test",
+        sext_test::run(&mut store, &mut infos)
+    );
 
-    late!(sk, late_clock, "return_bool", return_bool::run(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "return_bool",
+        return_bool::run(&mut store, &mut infos)
+    );
 
     // Phase 8d': sign tests as a shift of the sign bit (`xorl; testl; setl`
     // -> `movl; shrl $31`).  Unconditional and this late because its inputs
@@ -3091,7 +3168,12 @@ fn peephole_optimize_inner(
     // folds produce them, and Phase 3 does not run when no global pass
     // changed anything.  Before 8e, whose same-line marker blocks the
     // liveness oracle cannot read.  `CCC_PEEPHOLE_SKIP=sign_test`.
-    late!(sk, late_clock, "sign_test", sign_test::materialize_sign_tests(&mut store, &mut infos));
+    late!(
+        sk,
+        late_clock,
+        "sign_test",
+        sign_test::materialize_sign_tests(&mut store, &mut infos)
+    );
     // Phase 8e: conditional sibling calls (`je .L; ... .L: jmp sym` ->
     // `je sym`).  Terminal: the rewritten `jcc` carries the tail call's
     // marker block on the same store line, which only the Phase 9 re-parse
@@ -3104,7 +3186,10 @@ fn peephole_optimize_inner(
     // hoist finishes with counts for the final text, so the fold reuses them
     // instead of scanning the translation unit a second time. The skip
     // masks keep their exact bisection meaning.
-    late!(sk, late_clock, "phase8e",
+    late!(
+        sk,
+        late_clock,
+        "phase8e",
         jump_thread::run_phase8e(
             &mut store,
             &mut infos,
@@ -3136,7 +3221,12 @@ fn peephole_optimize_inner(
     // which pattern 3 cannot see because it compares the first label it finds),
     // and gcc-16 and clang emit none.  Last of the four so it also retires
     // anything the three above expose.
-    late!(sk, late_clock, "late_branch", late_branch::eliminate_branch_to_next_label(&mut result));
+    late!(
+        sk,
+        late_clock,
+        "late_branch",
+        late_branch::eliminate_branch_to_next_label(&mut result)
+    );
     result
 }
 

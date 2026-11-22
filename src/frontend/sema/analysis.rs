@@ -5847,21 +5847,30 @@ impl SemanticAnalyzer {
                 _ => return None,
             }
         }
-        // `->` and `[]` DEREFERENCE their operand (C11 6.5.2.3p4, 6.5.2.1p2),
-        // so the struct/union behind `(*pp)->a`, `pp[0]->a` or `(*pa)[0].a`
-        // sits behind those dereferences.  `infer_expr_ctype` answers with the
-        // pointer type itself for them, which used to lose the record --
-        // `(*pp)->a` was consequently not recognised as a bit-field (its
-        // read-only diagnostic then had the wrong severity) and every
-        // `member_constness` query through such a base answered "not const"
-        // (a missing diagnostic).  Walk through explicit dereferences and
-        // subscripts to the pointee; anything else is left to the caller.
+        // `->` DEREFERENCES its operand (C11 6.5.2.3p4), so the struct/union
+        // behind `(*pp)->a` or `pp[0]->a` sits one pointer level down and
+        // `infer_expr_ctype` reports the pointer type for those bases.  That
+        // used to lose the record: `(*pp)->a` was not recognised as a
+        // bit-field (its read-only diagnostic then had the wrong severity) and
+        // every `member_constness` query through such a base answered "not
+        // const" (a missing diagnostic).
+        //
+        // The walk is deliberately limited to `is_pointer`, i.e. to the `->`
+        // form.  This helper ALSO answers "what is the base type of `x`?" for
+        // callers that are not member accesses at all -- the ext-vector
+        // element checks pass `is_pointer = false` and expect the operand's
+        // own type.  Walking there would reinterpret an ext-vector object as
+        // its LANE type and turn legal `&v[i]` / `v[i]` on a GNU `vector_size`
+        // vector into "address of vector element requested" errors.  Arrays
+        // are unwrapped because `->` reaches a pointer through array decay.
         let mut guard = 0u32;
-        while let Some(pointee) = match &base_ctype {
-            CType::Pointer(inner, _) => Some((**inner).clone()),
-            CType::Array(inner, _) => Some((**inner).clone()),
-            _ => None,
-        } {
+        while is_pointer
+            && let Some(pointee) = match &base_ctype {
+                CType::Pointer(inner, _) => Some((**inner).clone()),
+                CType::Array(inner, _) => Some((**inner).clone()),
+                _ => None,
+            }
+        {
             // Bound the walk: this is a diagnostic helper, and a deeply
             // nested pointer chain is free to stay a pointer for our purposes.
             guard += 1;
@@ -10245,8 +10254,7 @@ dereference it before applying '->' to it?"
         let Some(base) = base else {
             return false;
         };
-        let Some(CType::Struct(key) | CType::Union(key)) =
-            self.member_base_ctype(base, indirect)
+        let Some(CType::Struct(key) | CType::Union(key)) = self.member_base_ctype(base, indirect)
         else {
             return false;
         };

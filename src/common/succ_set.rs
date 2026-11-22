@@ -220,7 +220,10 @@ mod tests {
         let mut s = SuccSet::new();
         s.begin(2);
         assert!(s.insert(1));
-        assert!(s.insert(9), "an under-declared target must still be recorded");
+        assert!(
+            s.insert(9),
+            "an under-declared target must still be recorded"
+        );
         assert!(!s.insert(9));
         assert!(s.insert(0), "growth must not disturb target 0");
         assert!(s.insert(4), "the grown region is usable too");

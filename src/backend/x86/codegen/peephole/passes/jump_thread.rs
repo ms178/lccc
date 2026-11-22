@@ -1158,10 +1158,8 @@ fn hoist_one_arm_head(
     };
     // Window label index: `local_label -> defining line`.  Built in O(L) once
     // per attempt instead of per candidate (see the target-arm comment below).
-    let mut label_at: FxHashMap<u32, usize> = FxHashMap::with_capacity_and_hasher(
-        (hi - lo) / 2 + 1,
-        Default::default(),
-    );
+    let mut label_at: FxHashMap<u32, usize> =
+        FxHashMap::with_capacity_and_hasher((hi - lo) / 2 + 1, Default::default());
     for k in lo..hi {
         if infos[k].kind == LineKind::Label
             && !infos[k].is_nop()
