@@ -9738,6 +9738,23 @@ fn returned_vector_values(func: &IrFunction) -> FxHashSet<u32> {
         .collect()
 }
 
+/// The register-occupancy extent of a value's live pieces, for the interval
+/// tests in the SSE/AVX chain allocator.
+///
+/// A piece is half-open, and `intervals_overlap` treats an empty piece as
+/// overlapping nothing. A dead definition (no reads) yields exactly such a
+/// piece `(p, p)`, yet its instruction still writes its home at `p`, so it
+/// could share the register of a value live over `p`. The write occupies its
+/// point, so every empty piece widens to `(p, p + 1)`. A value that dies at
+/// `p` keeps its non-empty `(s, p)` piece, so the in-place handoff `d <- a0`
+/// at `p` still shares its register.
+fn occupied_pieces(pieces: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    pieces
+        .iter()
+        .map(|&(s, e)| (s, e.max(s.saturating_add(1))))
+        .collect()
+}
+
 fn allocate_vector_registers_destructive(
     func: &IrFunction,
     candidates: &FxHashSet<u32>,
@@ -9837,20 +9854,7 @@ fn allocate_vector_registers_destructive(
             !liveness.folded_read_points.contains_key(&v),
             "sse128 chain value {v} has hidden folded reads"
         );
-        // A piece is half-open and `intervals_overlap` treats an empty piece
-        // as overlapping nothing. A dead definition (no reads) yields exactly
-        // such a piece `(p, p)`, yet its instruction still writes its home at
-        // `p`, so it could share the register of a value live over `p`. The
-        // write occupies its point: widen every empty piece to `(p, p + 1)`.
-        // A value dying at `p` keeps its `(s, p)` piece, so the in-place
-        // handoff `d <- a0` at `p` still shares cleanly.
-        coverage.insert(
-            v,
-            pieces
-                .iter()
-                .map(|&(s, e)| (s, e.max(s.saturating_add(1))))
-                .collect(),
-        );
+        coverage.insert(v, occupied_pieces(&pieces));
     }
     if coverage.is_empty() {
         return Vec::new();
@@ -23253,5 +23257,64 @@ mod avx256_home_tests {
             vecweb_256_report("f", &[7], &[]),
             "[VECWEB-256] fn=f admitted=1 homed=[] unhomed=[7]"
         );
+    }
+}
+
+#[cfg(test)]
+mod occupied_piece_tests {
+    use super::*;
+
+    /// A dead definition at point `p` writes its home at `p`. Its widened
+    /// piece must conflict with a value that is live across `p`.
+    #[test]
+    fn a_dead_definition_occupies_its_point() {
+        let dead = occupied_pieces(&[(3, 3)]);
+        assert_eq!(dead, vec![(3, 4)]);
+        assert!(
+            intervals_overlap(dead[0], (2, 5)),
+            "live across p must conflict"
+        );
+        assert!(
+            !intervals_overlap(dead[0], (4, 9)),
+            "live only after p may share"
+        );
+    }
+
+    /// Non-empty pieces are untouched, so the in-place handoff of a dying
+    /// operand (`(s, p)` followed by a definition starting at `p`) still
+    /// shares a register.
+    #[test]
+    fn a_dying_operand_still_hands_off_at_its_last_read() {
+        let pieces = occupied_pieces(&[(2, 5)]);
+        assert_eq!(pieces, vec![(2, 5)]);
+        assert!(!intervals_overlap(pieces[0], (5, 8)));
+    }
+
+    #[test]
+    fn an_empty_piece_at_point_zero_widens_to_one_point() {
+        assert_eq!(occupied_pieces(&[(0, 0)]), vec![(0, 1)]);
+    }
+
+    /// Every piece of a multi-piece value widens independently, and the order
+    /// and count are preserved.
+    #[test]
+    fn each_piece_widens_independently_in_order() {
+        assert_eq!(
+            occupied_pieces(&[(1, 1), (4, 6), (9, 9)]),
+            vec![(1, 2), (4, 6), (9, 10)]
+        );
+    }
+
+    /// A piece can never be inverted by widening: the result is always at
+    /// least one point long, and `end >= start` holds for every input the
+    /// allocator can produce (program points are far below `u32::MAX`).
+    #[test]
+    fn widening_never_inverts_a_piece() {
+        for s in [0u32, 1, 7, 1 << 20] {
+            for e in [s, s + 1, s + 5] {
+                let w = occupied_pieces(&[(s, e)])[0];
+                assert!(w.0 <= w.1 && w.1 > w.0, "({s},{e}) -> {w:?}");
+            }
+        }
     }
 }

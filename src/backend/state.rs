@@ -3221,7 +3221,10 @@ mod vec_bank_eviction_tests {
         st.vec_last_store_val = Some(85);
         st.vec_last_store_reg_name = Some("ymm15");
         st.vec_claim_live_reg(90, "ymm15");
-        assert!(!st.vec_last_store_reg, "last store named the clobbered bank");
+        assert!(
+            !st.vec_last_store_reg,
+            "last store named the clobbered bank"
+        );
     }
 
     /// Scratch banks keep their own invalidation rule (`invalidate_vec_scratch_
