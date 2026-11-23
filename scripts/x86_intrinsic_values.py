@@ -85,7 +85,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import itertools
+import math
 import os
 import re
 import subprocess
@@ -123,6 +123,18 @@ EXPRESSION_TWINS = 3
 # Constants far from every range: of the choices GCC refuses, the ones with
 # these are asked of lccc, beside the one next to the range.
 FAR = (256, -1)
+# Constants tried where GCC wants one and its place is being looked for: a
+# value most selectors, shifts and scales take, and the two rounding modes.
+PROBES = (1, 8, 4, 0)
+# What a reference says of an intrinsic it has no code for on this target or
+# in this mode: a statement about the intrinsic, none about the call written.
+ELSEWHERE = re.compile(r"target specific option mismatch|needs isa option"
+                       r"|(needs|requires) target feature"
+                       r"|implicit declaration of function|undeclared")
+# After so many rounds in a row in which the compiler names one line, for the
+# target, and stops (GCC ends at its first `always_inline` mismatch), every
+# line left is asked on its own.
+ONE_AT_A_TIME = 3
 
 # Run, the result not compared: it is the clock, the random number generator,
 # an address, or the state of the registers.
@@ -454,67 +466,180 @@ def candidates_for(name: str, spelled: str) -> list[int]:
     return IMMEDIATES
 
 
-def implicated(command: list[str], lines: list[str], tmp: Path, head: str = HEAD) -> set[int]:
-    """The indexes of `lines` a compiler refuses.
+DIAGNOSTIC = re.compile(r": (fatal error|error|warning|note): (.*)")
+MENTION = re.compile(r"c\.c:(\d+)[:,)]")
+# The lines a compiler writes in front of a diagnostic, to say where it is.
+OPENER = re.compile(r"\s*(In file included from\b|from \S|In function\b|\S+: In function\b"
+                    r"|\S+: At top level)")
 
-    Every mention of a line of ours counts: GCC reports a bad immediate in
-    the header and names the test in a note (`inlined from 'v7' at c.c:12`,
-    `c.c:12: note: called from here`).  Warnings are off, so that a mention
-    is an error's.
+
+def errors_of(stderr: str) -> dict[int, str]:
+    """Line of `c.c` -> the error that is about it, for every error reported.
+
+    A compiler names the line in the error itself, in the lines in front of
+    it (GCC: `inlined from 'v7' at c.c:12:5:`) or in the notes behind it
+    (`c.c:12:44: note: called from here`, for an error it places in its own
+    header).  A note that follows no error is about no error: GCC tells of a
+    changed ABI once per file, with warnings off too, at whichever function
+    comes first.
     """
-    alive, bad = list(range(len(lines))), set()
+    found: dict[int, str] = {}
+    leading: list[int] = []     # named in front of the diagnostic to come
+    error: str | None = None    # the error whose notes these are
+    for line in stderr.splitlines():
+        mentions = [int(number) for number in MENTION.findall(line)]
+        diagnostic = DIAGNOSTIC.search(line)
+        if diagnostic is None:
+            if "inlined from" in line:
+                error = None
+                leading += mentions
+            elif OPENER.match(line):
+                error, leading = None, []
+            continue
+        kind, message = diagnostic.groups()
+        if kind in ("error", "fatal error"):
+            error = message
+            for number in leading + mentions:
+                found.setdefault(number, message)
+        elif kind == "note" and error is not None:
+            for number in mentions:
+                found.setdefault(number, error)
+        else:
+            error = None
+        leading = []
+    return found
+
+
+def first_error(stderr: str) -> str:
+    for line in stderr.splitlines():
+        diagnostic = DIAGNOSTIC.search(line)
+        if diagnostic and diagnostic.group(1) in ("error", "fatal error"):
+            return diagnostic.group(2)
+    return (stderr.strip().splitlines() or ["no message"])[0]
+
+
+def each_alone(command: list[str], lines: list[str], indexes: list[int], tmp: Path,
+               head: str) -> dict[int, str]:
+    """Of `indexes`, the lines the compiler refuses when each is the whole file.
+
+    Side by side: each compilation has its own source, and its own output
+    where `command` names one, so that none writes the file of another.
+    """
+    def ask(index: int) -> tuple[int, str | None]:
+        source, output = tmp / f"alone-{index}.c", tmp / f"alone-{index}.out"
+        source.write_text(head + lines[index] + "\n")
+        own = [str(output) if at and command[at - 1] == "-o" and argument != os.devnull
+               else argument for at, argument in enumerate(command)]
+        result = subprocess.run([*own, "-w", str(source)], capture_output=True, text=True,
+                                cwd=tmp)
+        source.unlink()
+        output.unlink(missing_ok=True)
+        return index, None if result.returncode == 0 else first_error(result.stderr)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+        return {index: message for index, message in pool.map(ask, indexes)
+                if message is not None}
+
+
+def refusals(command: list[str], lines: list[str], tmp: Path, head: str = HEAD) -> dict[int, str]:
+    """The indexes of `lines` a compiler refuses, each with the error that names it.
+
+    The file is compiled, the lines its errors are about are taken out, and
+    it is compiled again until nothing is refused: a compiler reports what it
+    sees, and some stop at the first thing they see.  An error that names no
+    line of ours (an assembler's, a crash) is found by halves.
+    """
+    alive, bad = list(range(len(lines))), {}
     source = tmp / "c.c"
     first = head.count("\n") + 1
+    stopped = 0
     while alive:
         source.write_text(head + "\n".join(lines[i] for i in alive) + "\n")
         result = subprocess.run([*command, "-w", str(source)], capture_output=True, text=True,
                                 cwd=tmp)
         if result.returncode == 0:
             return bad
-        named = {alive[int(m.group(1)) - first]
-                 for m in re.finditer(r"c\.c:(\d+)[:,)]", result.stderr)
-                 if 0 <= int(m.group(1)) - first < len(alive)}
+        named = {alive[number - first]: message
+                 for number, message in errors_of(result.stderr).items()
+                 if 0 <= number - first < len(alive)}
         if not named:
             if len(alive) == 1:
-                return bad | set(alive)
+                bad[alive[0]] = first_error(result.stderr)
+                return bad
             half = len(alive) // 2
-            left = implicated(command, [lines[i] for i in alive[:half]], tmp, head)
-            right = implicated(command, [lines[i] for i in alive[half:]], tmp, head)
-            return (bad | {alive[:half][i] for i in left} | {alive[half:][i] for i in right})
-        bad |= named
+            for part in (alive[:half], alive[half:]):
+                inner = refusals(command, [lines[i] for i in part], tmp, head)
+                bad.update({part[i]: message for i, message in inner.items()})
+            return bad
+        bad.update(named)
         alive = [i for i in alive if i not in named]
+        alone = len(named) == 1 and ELSEWHERE.search(next(iter(named.values())))
+        stopped = stopped + 1 if alone else 0
+        if stopped == ONE_AT_A_TIME:
+            bad.update(each_alone(command, lines, alive, tmp, head))
+            return bad
     return bad
 
 
-def immediates_of(functions: dict, compile_only: list[str], tmp: Path) -> dict[str, list[int] | None]:
-    """name -> the positions GCC wants a constant at, or None when no choice compiles.
+def implicated(command: list[str], lines: list[str], tmp: Path, head: str = HEAD) -> set[int]:
+    """The indexes of `lines` a compiler refuses."""
+    return set(refusals(command, lines, tmp, head))
 
-    Offered to GCC: first every parameter a variable; where that is refused,
-    every set of constant positions, with constants of each kind an
-    immediate comes in.  The smallest set that compiles is the answer.
+
+def immediates_of(functions: dict, compile_only: list[str],
+                  tmp: Path) -> tuple[dict[str, list[int] | None], set[str]]:
+    """(name -> the positions GCC wants a constant at, or None when no choice
+    compiles; the names GCC has no intrinsic of on this target or in this mode).
+
+    Offered to GCC: first every parameter a variable.  What it refuses for
+    the target is set aside by the message, before anything is tried: on a
+    processor without AVX-512 that is every AVX-512 intrinsic, and a search
+    for constants in `_mm512_set_epi8` has 64 parameters to search.
+
+    For the others the constants are found in two steps of one file each.
+    A constant at every position that may hold one, with each value of
+    `PROBES`: the first value GCC takes.  Then each position in turn a
+    variable again, the others constant: GCC refuses exactly where it wants
+    the constant, because a constant is valid wherever a variable is.  That
+    is 4 + k tests for k positions, where every set of positions is 2**k.
     """
     names = sorted(functions)
     shapes = {name: split_parameters(functions[name][1]) for name in names}
-    plain = [Test(name, functions[name][0], shapes[name], {}) for name in names]
-    bad = implicated(compile_only, [t.line(i) for i, t in enumerate(plain)], tmp)
+
+    def test(name: str, constants: dict[int, int]) -> Test:
+        return Test(name, functions[name][0], shapes[name], constants)
+
+    def lines_of(tests: list[Test]) -> list[str]:
+        return [t.line(i) for i, t in enumerate(tests)]
+
+    why = refusals(compile_only, lines_of([test(name, {}) for name in names]), tmp)
+    elsewhere = {names[i] for i, message in why.items() if ELSEWHERE.search(message)}
     answer: dict[str, list[int] | None] = {name: [] for i, name in enumerate(names)
-                                           if i not in bad}
-    attempts = []
-    for i in sorted(bad):
-        name = names[i]
-        positions = [p for p, (kind, _) in enumerate(shapes[name]) if may_be_immediate(kind)]
+                                           if i not in why}
+    wanted = [names[i] for i in sorted(why) if names[i] not in elsewhere]
+    places = {name: [p for p, (kind, _) in enumerate(shapes[name]) if may_be_immediate(kind)]
+              for name in wanted}
+
+    filled = [(name, value) for name in wanted if places[name] for value in PROBES]
+    refused = implicated(compile_only, lines_of(
+        [test(name, dict.fromkeys(places[name], value)) for name, value in filled]), tmp)
+    taken: dict[str, int] = {}
+    for i, (name, value) in enumerate(filled):
+        if i not in refused:
+            taken.setdefault(name, value)
+
+    freed = [(name, position) for name in wanted if name in taken for position in places[name]]
+    refused = implicated(compile_only, lines_of(
+        [test(name, {p: taken[name] for p in places[name] if p != position})
+         for name, position in freed]), tmp)
+    for name in wanted:
+        answer[name] = [] if name in taken else None
+    for i, (name, position) in enumerate(freed):
+        if i in refused:
+            answer[name].append(position)
+    for name in elsewhere:
         answer[name] = None
-        for size in range(1, len(positions) + 1):
-            for chosen in itertools.combinations(positions, size):
-                for value in (1, 8, 4, 0):
-                    attempts.append((name, chosen, value))
-    tests = [Test(name, functions[name][0], shapes[name], {p: value for p in chosen})
-             for name, chosen, value in attempts]
-    refused = implicated(compile_only, [t.line(i) for i, t in enumerate(tests)], tmp)
-    for i, (name, chosen, _) in enumerate(attempts):
-        if i not in refused and (answer[name] is None or len(chosen) < len(answer[name])):
-            answer[name] = list(chosen)
-    return answer
+    return answer, elsewhere
 
 
 def not_for_this_target(names: list[str], functions: dict, compile_only: list[str],
@@ -526,10 +651,19 @@ def not_for_this_target(names: list[str], functions: dict, compile_only: list[st
         source.write_text(HEAD + census.caller(0, name, *functions[name]) + "\n")
         result = subprocess.run([*compile_only, "-w", str(source)], capture_output=True,
                                 text=True, cwd=tmp)
-        if re.search(r"target specific option mismatch|needs isa option|needs target feature"
-                     r"|implicit declaration of function|undeclared", result.stderr):
+        if ELSEWHERE.search(result.stderr):
             found.add(name)
     return found
+
+
+def combination(choices: list[list[int]], index: int) -> tuple[int, ...]:
+    """Element `index` of the product of `choices`, the last choice counting
+    fastest, without the product: 29 values at 6 positions are 594 million."""
+    picked = []
+    for choice in reversed(choices):
+        index, at = divmod(index, len(choice))
+        picked.append(choice[at])
+    return tuple(reversed(picked))
 
 
 def variants_of(name: str, returns: str, shape: list[tuple[str, str]],
@@ -537,12 +671,14 @@ def variants_of(name: str, returns: str, shape: list[tuple[str, str]],
     if not positions:
         return [Test(name, returns, shape, {})]
     choices = [candidates_for(name, shape[p][1]) for p in positions]
-    combos = list(itertools.product(*choices))
-    if len(combos) > MOST_VARIANTS:
+    count = math.prod(len(choice) for choice in choices)
+    picked = range(count)
+    if count > MOST_VARIANTS:
         # A spread of the product, the same on every run.
-        step = len(combos) / MOST_VARIANTS
-        combos = [combos[int(k * step)] for k in range(MOST_VARIANTS)]
-    tests = [Test(name, returns, shape, dict(zip(positions, combo))) for combo in combos]
+        step = count / MOST_VARIANTS
+        picked = [int(k * step) for k in range(MOST_VARIANTS)]
+    tests = [Test(name, returns, shape, dict(zip(positions, combination(choices, index))))
+             for index in picked]
     # One twin per choice: where the literal is not valid for the intrinsic,
     # GCC drops the twin with it.
     return tests + [Test(name, returns, shape, dict(test.constants), "~")
@@ -766,7 +902,10 @@ def examine(header: Path, lccc: str, levels: list[str], refs: list[str], runtime
     if not functions:
         return outcome
 
-    positions = immediates_of(functions, gcc_compile, tmp)
+    # An intrinsic of another processor or mode: lccc declares more than the
+    # target has, and GCC says so by name.
+    positions, elsewhere = immediates_of(functions, gcc_compile, tmp)
+    outcome.not_here |= elsewhere
     tests: list[Test] = []
     for name in sorted(functions):
         if positions[name] is not None:
@@ -775,13 +914,13 @@ def examine(header: Path, lccc: str, levels: list[str], refs: list[str], runtime
     invalid = implicated(gcc_compile, [test.line(i) for i, test in enumerate(tests)], tmp)
     rejected = refused_constants(tests, invalid)
     tests = [test for i, test in enumerate(tests) if i not in invalid]
-    # What GCC compiles no test of: an intrinsic of another processor or mode
-    # (lccc declares more than the target has; GCC says so by name), or one
-    # this tool writes no valid call of.
-    untested = sorted(set(functions) - {test.name for test in tests})
-    elsewhere = not_for_this_target(untested, functions, gcc_compile, tmp)
-    outcome.not_here |= elsewhere
-    outcome.not_modeled |= set(untested) - elsewhere
+    # What GCC compiles no test of beside those: one this tool writes no
+    # valid call of, or one GCC refuses for the target only once the call has
+    # its constants.
+    untested = sorted(set(functions) - elsewhere - {test.name for test in tests})
+    late = not_for_this_target(untested, functions, gcc_compile, tmp)
+    outcome.not_here |= late
+    outcome.not_modeled |= set(untested) - late
     if not tests:
         return outcome
 
