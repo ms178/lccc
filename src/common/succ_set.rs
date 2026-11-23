@@ -266,6 +266,58 @@ mod tests {
         }
     }
 
+    /// Growth must not be able to fake a duplicate.
+    ///
+    /// Newly grown slots are zero-filled, and phase 0 is a legitimate
+    /// generation: a sequence that has already begun uses generations >= 1.
+    /// If the stamp is left at 0 and a later sequence's generation happens to
+    /// be high, an out-of-range insert lands on a zeroed slot that can never
+    /// match -- so a sequence that resets to 0 would instead treat EVERY
+    /// out-of-range target as already present.  This pins the invariant that
+    /// makes later generations safe: the stamp always holds 0 or a live
+    /// generation, and 0 is never handed out after the first begin.
+    #[test]
+    fn a_grown_slot_is_never_mistaken_for_a_present_edge() {
+        let mut s = SuccSet::new();
+        s.begin(2);
+        assert!(s.insert(1000), "growth must record the out-of-range target");
+        assert!(!s.insert(1000), "and then dedup it");
+        assert!(s.insert(5000), "growth twice");
+        assert!(!s.insert(5000));
+        assert_eq!(s.len(), 2);
+        // A new sequence reclaims the grown slots without seeing ghosts.
+        s.begin(2);
+        assert!(s.insert(1000));
+        assert!(s.insert(5000));
+        assert_eq!(s.len(), 2);
+    }
+
+    /// The edge counter must restart with the sequence, or a block that grows
+    /// its stamp would inherit the previous block's tally.
+    #[test]
+    fn begin_resets_the_edge_count_even_after_growth() {
+        let mut s = SuccSet::new();
+        s.begin(1);
+        assert!(s.insert(9));
+        assert_eq!(s.len(), 1);
+        s.begin(1);
+        assert_eq!(s.len(), 0, "a fresh block has no edges yet");
+        assert!(s.insert(9));
+        assert_eq!(s.len(), 1);
+    }
+
+    /// `begin` must never hand out generation 0, which is the value a freshly
+    /// grown (zero-filled) slot holds; otherwise the first out-of-range insert
+    /// after growth would be invisible.
+    #[test]
+    fn generation_zero_is_never_live() {
+        let mut s = SuccSet::new();
+        s.begin(1);
+        assert_ne!(s.generation, 0, "the first sequence must start at 1");
+        s.begin(1);
+        assert_ne!(s.generation, 0);
+    }
+
     #[test]
     fn build_edges_preserves_insertion_order_and_dedups() {
         let mut map = FxHashMap::default();
