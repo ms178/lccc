@@ -44,9 +44,9 @@
 //! reverting loses no perf on the 9 worst while eliminating all 15
 //! remaining v16 miscompiles. The v16/v17 hardening (Guard A exit-block
 //! single-predecessor, Guard B dominance-checked external phi uses,
-//! v17 undo-on-bail for `next_value_id` consistency, v17 cross-phi
-//! self-loop-phi latch-incoming rewrite) is KEPT — it makes the pass
-//! safer when opt-in.
+//! v17 cross-phi self-loop-phi latch-incoming rewrite) is KEPT — it makes
+//! the pass safer when opt-in. (The v17 undo-on-bail is gone with what it
+//! undid: Guards A and B now stand in front of the first change.)
 //!
 //! PF-17 (2026-09-01, PRs #325/#327): those 15 shapes MATCH GCC on the
 //! 19-name A/B. Pred-label uses `(pre_op, header_label)` (never the
@@ -55,6 +55,10 @@
 //! tree. Guard F rejects header work outside the cloned condition closure.
 //! Guard H rejects a loop in which anything but the header reads a value
 //! the header computes: those readers kept the guard's value.
+//!
+//! Every refusal stands in front of the first change to the function
+//! (`try_rotate_loop`, "Nothing below refuses"): a loop that is not rotated
+//! is left as it was, value numbers included.
 //! Rotation STAYS opt-in (`CCC_LOOP_ROTATE=1`) while default-enable needs
 //! broader fuzz/performance evidence; kill-switch `CCC_NO_LOOP_ROTATE=1`
 //! wins.
@@ -123,9 +127,10 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
     // so reverting loses no perf on the 9 worst while eliminating all 15
     // remaining v16 miscompiles. The v16 hardening (Guard A exit-block
     // single-predecessor, Guard B dominance-checked external phi uses,
-    // v17 undo-on-bail for next_value_id consistency, v17 cross-phi
-    // self-loop-phi latch-incoming rewrite) is KEPT — it makes the pass
-    // safer when opt-in. A future session will root-cause the 15 remaining
+    // v17 cross-phi self-loop-phi latch-incoming rewrite) is KEPT — it
+    // makes the pass safer when opt-in (the v17 undo-on-bail went when
+    // Guards A and B moved in front of the first change). A future session
+    // will root-cause the 15 remaining
     // miscompiles (likely the exit-merge-phi off-by-one for cross-phi
     // latch_ops used externally, plus the cloned-closure header-phi
     // reference collapse) before flipping the default again.
@@ -793,6 +798,134 @@ fn try_rotate_loop(
                 && loop_exit_threshold(func, lp, shape, cfg).is_some()
         });
 
+    // 6.7, decided: where the loop's values leave it.
+    //
+    // After rotation the exit block has two predecessors, the guard (no
+    // iteration ran) and the latch (the copied test failed). Whatever
+    // crosses needs the merge of the two: a header phi read behind the loop
+    // gets a phi in the exit block, and a phi the exit block already has
+    // gets a second incoming. Both are built in step 6.7 below.
+    //
+    // Everything that can refuse the rotation is asked here, in front of the
+    // first change to the function, so that a refusal leaves the function as
+    // it was. (Guards A and B used to stand behind step 6.6 and take its
+    // phis out again; the value numbers stayed taken.)
+    let Some(&exit_idx) = label_to_idx.get(&exit_label) else {
+        return false;
+    };
+    // Guard A: the header is the exit block's only predecessor, so that the
+    // exit block has exactly the guard and the latch in front of it once
+    // rotated and two incomings say everything. A third predecessor (a
+    // second exit of the loop, a jump around it) would be an edge on which
+    // the merge has no value.
+    let exit_preds = cfg.preds.row(exit_idx);
+    if exit_preds.len() != 1 || exit_preds[0] as usize != lp.header {
+        if debug {
+            lccc::cli::stderr_line(format_args!(
+                "[ROT] exit block has {} predecessors (expected 1 = header); bailing",
+                exit_preds.len()
+            ));
+        }
+        return false;
+    }
+    // The exit block's own phis. With one predecessor each has one
+    // incoming, from the header; anything else is a phi this function did
+    // not keep up with its edges, and nothing is built on it.
+    let exit_own_phis = func.blocks[exit_idx]
+        .instructions
+        .iter()
+        .take_while(|inst| matches!(inst, Instruction::Phi { .. }))
+        .count();
+    let exit_phis_name_the_header = func.blocks[exit_idx].instructions[..exit_own_phis]
+        .iter()
+        .all(|inst| {
+            matches!(inst, Instruction::Phi { incoming, .. }
+                if incoming.len() == 1 && incoming[0].1 == header_label)
+        });
+    if !exit_phis_name_the_header {
+        if debug {
+            lccc::cli::stderr_line(format_args!(
+                "[ROT] a phi of the exit block does not name the header alone — bail"
+            ));
+        }
+        return false;
+    }
+    // Guard B: the merge of a header phi is defined at the top of the exit
+    // block, so it serves the readers the exit block dominates. A phi reads
+    // its incoming at the end of the predecessor it names, so for a phi it
+    // is that predecessor the exit block has to dominate, not the phi's own
+    // block: `if (c) { loop } else { s = 0; }` merges the loop's sum in a
+    // block the exit does not dominate, from an edge it does. (The guard
+    // used to ask about the phi's block and refused that shape.)
+    //
+    // A block no path reaches is not asked: nothing in it runs, nothing
+    // dominates it, and it is left reading the header's phi, which stays
+    // defined. The unroller leaves the body it replaced behind as such a
+    // block until the next CFG cleanup, and rotation runs before that.
+    //
+    // In valid SSA no reader that can run fails this: it is dominated by
+    // the header, and every path from the header out of the loop starts
+    // with the edge to the exit block (the body is one block that jumps
+    // back). The guard is asked because its answer is what the rewrite
+    // below relies on. Over tests/regression at -O2 it refused 227 times
+    // while it asked about a phi's own block and about dead blocks (18 and
+    // 209 of them) and does not refuse now.
+    let mut external_users: Vec<(u32, IrType, Operand, Operand)> = Vec::new();
+    for &(phi_dest, phi_ty, (_pre_label, pre_op), latch_op) in &phi_info {
+        let mut read_behind = false;
+        for (bi, block) in func.blocks.iter().enumerate() {
+            if bi == lp.header || lp.body.contains(&bi) || is_unreachable(bi, cfg) {
+                continue;
+            }
+            // The exit block's own phis read the header's value on the
+            // guard's edge; they get their own second incoming.
+            let own_phis = if bi == exit_idx { exit_own_phis } else { 0 };
+            let block_is_served = is_dominated_by(bi, exit_idx, cfg);
+            let mut served = true;
+            let mut read_here = false;
+            for inst in &block.instructions[own_phis..] {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (op, pred_label) in incoming {
+                        if !matches!(op, Operand::Value(v) if v.0 == phi_dest) {
+                            continue;
+                        }
+                        read_here = true;
+                        served &= label_to_idx
+                            .get(pred_label)
+                            .is_some_and(|&pred| is_dominated_by(pred, exit_idx, cfg));
+                    }
+                } else {
+                    let mut reads = false;
+                    inst.for_each_used_value(|v| reads |= v == phi_dest);
+                    read_here |= reads;
+                    served &= !reads || block_is_served;
+                }
+            }
+            let mut reads = false;
+            block
+                .terminator
+                .for_each_used_value(|v| reads |= v == phi_dest);
+            read_here |= reads;
+            served &= !reads || block_is_served;
+            if !served {
+                if debug {
+                    lccc::cli::stderr_line(format_args!(
+                        "[ROT] header phi {} has external use in block {} \
+                         not dominated by exit {} — bailing",
+                        phi_dest, bi, exit_idx
+                    ));
+                }
+                return false;
+            }
+            read_behind |= read_here;
+        }
+        if read_behind {
+            external_users.push((phi_dest, phi_ty, pre_op, latch_op));
+        }
+    }
+
+    // ---- Nothing below refuses: from here on the function is changed. ----
+
     // 6.6 Create a fresh self-loop phi in body_latch for each header phi.
     //     The new phi `i_loop = phi[header: v_pre, latch: v_latch]`
     //     becomes the IV for the rotated self-loop. The header's original
@@ -915,255 +1048,95 @@ fn try_rotate_loop(
         }
     }
 
-    // 7. Clone the closure instructions to the latch, allocating fresh dest
-    //    IDs and rewriting: cloned refs → new dests, phi refs → latch values.
+    // 6.7 The merges in the exit block (decided above).
     //
-    //    But FIRST (step 6.7): the header phis are used OUTSIDE the loop
-    //    (e.g. the accumulator `s` is read after the loop to return the
-    //    sum). After rotation, the header phi's latch incoming is gone
-    //    (step 10), so the header phi collapses to the preheader value
-    //    — losing the accumulated result. The real final value lives in
-    //    the new self-loop phi `s_loop` (in body_latch), reached via the
-    //    test-exit edge. So for each header phi with external uses, we
-    //    create a merge phi in the exit block: `s_final = phi[header:
-    //    v_pre, body_latch: s_loop]` and rewrite external uses to it.
-    let exit_idx = label_to_idx.get(&exit_label).copied().unwrap_or(usize::MAX);
-    // v16 Guard A: the exit block must have exactly ONE predecessor (the
-    // header's guard-exit edge). After rotation the latch's test-exit edge
-    // adds a SECOND predecessor, so the exit-merge-phi (which has exactly 2
-    // incomings: (pre_op, header) and (latch_op, latch)) is correct ONLY when
-    // no third block branches to exit. A third predecessor would leave the
-    // merge-phi missing an incoming — the classic
-    // "header-phi-escapes-through-non-Return-terminator" miscompile class,
-    // where the phi's value is read on an edge the phi does not cover.
-    // This also subsumes the "multi-exit" class: any loop whose body or
-    // header has a second edge to exit (or to a block that branches to
-    // exit) is rejected here.
-    if exit_idx != usize::MAX {
-        let exit_preds = cfg.preds.row(exit_idx);
-        if exit_preds.len() != 1 || exit_preds[0] as usize != lp.header {
-            if debug {
-                lccc::cli::stderr_line(format_args!(
-                    "[ROT] exit block has {} predecessors (expected 1 = header); bailing",
-                    exit_preds.len()
-                ));
-            }
-            // v17 fix: undo step 6.6's state changes before bailing. Step
-            // 6.6 added `n_new_phis` new self-loop phis at the top of
-            // body_latch and rewrote body_latch's uses of the header phis
-            // to the new self-loop phis. Without undoing, the new phi IDs
-            // (allocated from `next_val`, which is bumped past
-            // `func.next_value_id`) exceed the cached `next_value_id`
-            // watermark, so the next pass (bit_idioms) sizes its defs vec
-            // from `max_value_id() == next_value_id - 1` and panics with
-            // index-out-of-bounds (sieve/expat at -O2). Undoing restores
-            // the IR to its pre-6.6 state (no orphaned IDs referenced)
-            // and keeps `next_value_id` consistent with the IR's actual
-            // content. The undo is safe here because Guard A is NOT
-            // inside any `func.blocks.iter()` loop (no borrow conflict).
-            let latch_block = &mut func.blocks[latch_idx];
-            latch_block.remove_insts(0..n_new_phis);
-            let latch_block = &mut func.blocks[latch_idx];
-            for inst in latch_block.instructions.iter_mut() {
-                for (&old_phi, &new_phi) in &new_loop_phis {
-                    let repl = Operand::Value(Value(old_phi));
-                    replace_operand_value(inst, Value(new_phi), repl.clone());
-                }
-            }
-            // Defensive: bump the watermark past the now-unused IDs so
-            // any future pass that reads `next_value_id` sees a value
-            // that bounds all live instructions (the undo removed all
-            // references to the new IDs, so the original watermark is
-            // also correct; this just guards against a missed reference).
-            func.next_value_id = next_val;
-            return false;
-        }
-        // Collect (header_phi_dest, new_loop_phi_dest, preheader_operand,
-        // latch_operand) for phis that have at least one use outside the
-        // loop body. `latch_operand` is the value the body computed THIS
-        // iteration (the original header phi's latch incoming — e.g. the
-        // post-add accumulator `s_new = s + a[i]`, or the post-increment
-        // IV `i_next = i + 1`). On the test-exit edge the body has already
-        // computed this value but it has NOT been written back to the new
-        // self-loop phi yet (that only happens on the NEXT iteration's
-        // entry via the backedge), so the exit-merge-phi must read
-        // `latch_operand`, NOT the self-loop phi (which still holds the
-        // start-of-iteration value).
+    // A header phi read behind the loop (the accumulator a function
+    // returns): after step 10 the header's phi is the value from in front of
+    // the loop, and the value the loop computed arrives over the latch's
+    // exit edge. `s_final = phi [(v_pre, guard), (v_latch, latch)]` at the
+    // top of the exit block merges the two, and every reader behind the loop
+    // reads it.
+    //
+    // `v_latch` is the header phi's latch incoming: what the body computed
+    // in the iteration whose test failed (`s_new = s + a[i]`, `i_next = i +
+    // 1`). Not the new self-loop phi, which still holds the value the
+    // iteration began with (the last iteration's contribution would be
+    // lost). When the latch incoming is itself a header phi (a swap,
+    // `a_next = b`), that phi is the guard's after step 10 and its self-loop
+    // phi is the value meant: `rewrite_header_phi_operand`.
+    let mut exit_merge_map: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut exit_phi_insts: Vec<Instruction> = Vec::with_capacity(external_users.len());
+    for &(phi_dest, phi_ty, pre_op, latch_op) in &external_users {
+        let merge = Value(next_val);
+        next_val += 1;
+        exit_merge_map.insert(phi_dest, merge.0);
+        exit_phi_insts.push(Instruction::Phi {
+            dest: merge,
+            ty: phi_ty,
+            incoming: vec![
+                (pre_op, header_label), // the guard's edge: no iteration ran
+                (
+                    rewrite_header_phi_operand(latch_op, &new_loop_phis),
+                    latch_label,
+                ), // the latch's edge: the last iteration's value
+            ],
+        });
+    }
+    let merge_phis = exit_phi_insts.len();
+    {
+        let exit_block = &mut func.blocks[exit_idx];
+        // The exit block's own phis: over the latch's edge each takes what
+        // its incoming from the header would have been at the test that
+        // failed. A header phi's value there is its latch incoming, as
+        // above; anything else the header passed on is defined in front of
+        // the loop (Guard H: the header's other values are read by the
+        // header alone) and is the same on both edges.
         //
-        // v16 Guard B: every external use of a header phi must be in a
-        // block DOMINATED by the exit block. The exit-merge-phi is defined
-        // at the top of the exit block; it dominates only exit and exit's
-        // dominator-tree descendants. A use in a block NOT dominated by
-        // exit (reachable via a path that bypasses exit) would read the
-        // merge-phi before it is defined — use-before-def, the
-        // "missing-downstream-use" miscompile class. Bail conservatively
-        // rather than risk an unverified rewrite.
-        let mut external_users: Vec<(u32, u32, Operand, Operand)> = Vec::new();
-        for &(phi_dest, _ty, (_pre_lbl, pre_op), latch_op) in &phi_info {
-            let new_loop = *new_loop_phis
-                .get(&phi_dest)
-                .expect("new_loop_phis has an entry for every header phi");
-            // Scan all blocks outside the loop for uses of phi_dest.
-            // Includes BOTH instructions and the terminator (the loop
-            // phi is often returned, e.g. `Return(s)` reads the
-            // accumulator phi — missing the terminator use would leave
-            // the return reading the guard's preheader value (0) instead
-            // of the accumulated result).
-            let mut found = false;
-            // v17 fix: Guard B previously did `return false;` directly
-            // from inside the `for (bi, block) in func.blocks.iter()` loop
-            // below, which (a) held an immutable borrow of `func.blocks`
-            // for the loop's duration, blocking the mutable borrow needed
-            // to undo step 6.6, and (b) left step 6.6's new self-loop phis
-            // orphaned in body_latch (their IDs exceeded the cached
-            // `next_value_id` watermark, causing bit_idioms to panic with
-            // index-out-of-bounds). Now we collect the failing block
-            // index into `guard_b_fail` and break the loop, then undo
-            // step 6.6 AFTER the immutable borrow is released.
-            let mut guard_b_fail: Option<usize> = None;
-            'outer: for (bi, block) in func.blocks.iter().enumerate() {
-                if bi == lp.header || lp.body.contains(&bi) {
-                    continue;
-                }
-                let mut used_here = false;
-                for inst in &block.instructions {
-                    inst.for_each_used_value(|v| {
-                        if v == phi_dest {
-                            used_here = true;
-                        }
-                    });
-                    if used_here {
-                        break;
-                    }
-                }
-                if !used_here {
-                    // Check the terminator too (Return, CondBranch, Switch, etc.).
-                    block.terminator.for_each_used_value(|v| {
-                        if v == phi_dest {
-                            used_here = true;
-                        }
-                    });
-                }
-                if used_here {
-                    // v16 Guard B: external use must be dominated by exit.
-                    if exit_idx != usize::MAX && !is_dominated_by(bi, exit_idx, cfg) {
-                        if debug {
-                            lccc::cli::stderr_line(format_args!(
-                                "[ROT] header phi {} has external use in block {} \
-                                 not dominated by exit {} — bailing",
-                                phi_dest, bi, exit_idx
-                            ));
-                        }
-                        guard_b_fail = Some(bi);
-                        break 'outer;
-                    }
-                    found = true;
-                }
-            }
-            if let Some(bi) = guard_b_fail {
-                // v17 fix: undo step 6.6's state changes before bailing.
-                // See the Guard A path above for the full rationale.
-                // The immutable borrow of `func.blocks` from the loop
-                // above has been released (the loop ended via `break`),
-                // so we can mutably borrow `func.blocks[latch_idx]` here.
-                // `bi` is preserved for the debug eprintln above; we keep
-                // it in scope via the `if let Some(bi)` pattern.
-                let latch_block = &mut func.blocks[latch_idx];
-                latch_block.remove_insts(0..n_new_phis);
-                let latch_block = &mut func.blocks[latch_idx];
-                for inst in latch_block.instructions.iter_mut() {
-                    for (&old_phi, &new_phi) in &new_loop_phis {
-                        let repl = Operand::Value(Value(old_phi));
-                        replace_operand_value(inst, Value(new_phi), repl.clone());
-                    }
-                }
-                func.next_value_id = next_val;
-                let _ = bi; // bi was used in the debug eprintln above
-                return false;
-            }
-            if found {
-                external_users.push((phi_dest, new_loop, pre_op, latch_op));
-            }
+        // Without this the phi kept one incoming for two predecessors, and
+        // the rewrite below gave that one incoming the merge defined beside
+        // it: `v46 = phi [(v57, guard)]` with v57 a phi of the same block
+        // (tests/regression/loop_rotate_exit_block_phis.c; seven tests of
+        // the corpus did not compile with rotation on).
+        for inst in exit_block.instructions.iter_mut().take(exit_own_phis) {
+            let Instruction::Phi { incoming, .. } = inst else {
+                continue;
+            };
+            let from_guard = incoming[0].0;
+            let from_latch = match from_guard {
+                Operand::Value(v) => phi_latch_val.get(&v.0).map_or(from_guard, |&latch_op| {
+                    rewrite_header_phi_operand(latch_op, &new_loop_phis)
+                }),
+                Operand::Const(_) => from_guard,
+            };
+            incoming.push((from_latch, latch_label));
         }
-        // Create the merge phis at the top of the exit block.
-        let mut exit_merge_map: FxHashMap<u32, u32> = FxHashMap::default();
-        let mut exit_phi_insts: Vec<Instruction> = Vec::with_capacity(external_users.len());
-        for &(phi_dest, _new_loop, pre_op, latch_op) in &external_users {
-            let nd = Value(next_val);
-            next_val += 1;
-            exit_merge_map.insert(phi_dest, nd.0);
-            let ty = phi_info
-                .iter()
-                .find(|&&(pd, _, _, _)| pd == phi_dest)
-                .map(|&(_, ty, _, _)| ty)
-                .expect("phi_info has an entry for every header phi");
-            // The test-exit incoming is `latch_op` (the value the body
-            // computed this iteration, e.g. `s_new = s + a[i]`), NOT the
-            // new self-loop phi `Value(new_loop)`. The self-loop phi holds
-            // the START-of-iteration value at the CondBranch point (its
-            // backedge writeback only fires on the next iteration's
-            // entry); reading it on the exit edge would lose the final
-            // iteration's contribution (off-by-one accumulator).
-            //
-            // Exception: when latch_op IS another header phi (cross-phi
-            // swap: `a_next = b`), that header phi collapses to its
-            // preheader value after step 10. The value we want on the
-            // test-exit edge is the corresponding new self-loop phi
-            // (start-of-this-iteration of the sibling), which is what
-            // rewrite_header_phi_operand substitutes.
-            let latch_for_exit = rewrite_header_phi_operand(latch_op, &new_loop_phis);
-            exit_phi_insts.push(Instruction::Phi {
-                dest: nd,
-                ty,
-                incoming: vec![
-                    (pre_op, header_label),        // guard-exit path: preheader value (0-trip)
-                    (latch_for_exit, latch_label), // test-exit path: post-iteration value
-                ],
-            });
-        }
-        if !exit_phi_insts.is_empty() {
-            let exit_block = &mut func.blocks[exit_idx];
-            exit_block.insert_insts(0, exit_phi_insts, crate::common::source::Span::dummy());
-            // Rewrite external uses of the header phis to the merge phis.
-            // We must skip the new merge phis themselves (they're at the top
-            // of the exit block and reference v_pre / s_loop, NOT the header
-            // phi dest). We also skip the loop body (uses there were already
-            // rewritten to s_loop in step 6.6) and the header (the header
-            // phi is still live there until step 10 strips its latch edge —
-            // but the header's own cond uses will be cloned, not the original).
-            let n_exit_phis = external_users.len();
-            for (bi, block) in func.blocks.iter_mut().enumerate() {
-                if bi == lp.header || lp.body.contains(&bi) || bi == exit_idx {
-                    if bi == exit_idx {
-                        // Rewrite exit-block instructions (skip the new phis at top).
-                        for inst in block.instructions.iter_mut().skip(n_exit_phis) {
-                            for (&old_phi, &new_phi) in &exit_merge_map {
-                                let repl = Operand::Value(Value(new_phi));
-                                replace_operand_value(inst, Value(old_phi), repl.clone());
-                            }
-                        }
-                        // Also rewrite the exit block's terminator.
-                        for (&old_phi, &new_phi) in &exit_merge_map {
-                            let repl = Operand::Value(Value(new_phi));
-                            replace_terminator_value(
-                                &mut block.terminator,
-                                Value(old_phi),
-                                repl.clone(),
-                            );
-                        }
-                    }
-                    continue;
+        exit_block.insert_insts(0, exit_phi_insts, crate::common::source::Span::dummy());
+    }
+    if !exit_merge_map.is_empty() {
+        // Every reader behind the loop reads the merge. The header and the
+        // body are not behind the loop (the body's readers were given the
+        // self-loop phis in step 6.6), and neither are the phis at the top
+        // of the exit block: the merges themselves and the block's own.
+        for (bi, block) in func.blocks.iter_mut().enumerate() {
+            if bi == lp.header || lp.body.contains(&bi) || is_unreachable(bi, cfg) {
+                continue;
+            }
+            let leading_phis = if bi == exit_idx {
+                merge_phis + exit_own_phis
+            } else {
+                0
+            };
+            for inst in block.instructions.iter_mut().skip(leading_phis) {
+                for (&old_phi, &merge) in &exit_merge_map {
+                    replace_operand_value(inst, Value(old_phi), Operand::Value(Value(merge)));
                 }
-                for inst in &mut block.instructions {
-                    for (&old_phi, &new_phi) in &exit_merge_map {
-                        let repl = Operand::Value(Value(new_phi));
-                        replace_operand_value(inst, Value(old_phi), repl.clone());
-                    }
-                }
-                for (&old_phi, &new_phi) in &exit_merge_map {
-                    let repl = Operand::Value(Value(new_phi));
-                    replace_terminator_value(&mut block.terminator, Value(old_phi), repl.clone());
-                }
+            }
+            for (&old_phi, &merge) in &exit_merge_map {
+                replace_terminator_value(
+                    &mut block.terminator,
+                    Value(old_phi),
+                    Operand::Value(Value(merge)),
+                );
             }
         }
     }
@@ -1300,15 +1273,26 @@ fn is_in_loop(label: BlockId, label_to_idx: &FxHashMap<BlockId, usize>, lp: &Nat
         .unwrap_or(false)
 }
 
+/// A block no path from the entry reaches: `compute_dominators` numbers the
+/// blocks it walks to and leaves the immediate dominator of the others
+/// unset. Nothing in such a block runs, and nothing dominates it.
+fn is_unreachable(block_idx: usize, cfg: &CfgAnalysis) -> bool {
+    cfg.idom
+        .get(block_idx)
+        .is_none_or(|&idom| idom == usize::MAX)
+}
+
 /// Returns true if `block_idx` is dominated by `dom_idx` — i.e. every path
 /// from the function entry to `block_idx` passes through `dom_idx`. Walks the
 /// `idom` chain: `dom_idx` must be an ancestor of `block_idx` in the dominator
 /// tree. `block_idx == dom_idx` returns true (a block dominates itself).
 ///
-/// Used by the v16 Guard B in `try_rotate_loop`: an external use of a header
-/// phi is only safe to rewrite to the exit-merge-phi if the use's block is
-/// dominated by the exit block (where the merge-phi is defined). A use in a
-/// block reachable via a path that bypasses exit would be a use-before-def.
+/// Used by Guard B in `try_rotate_loop`: a reader of a header phi behind
+/// the loop is rewritten to the merge phi of the exit block, which has to
+/// dominate the reader's block, or for a phi reader the predecessor its
+/// incoming names. A block no path reaches has no immediate dominator and
+/// is dominated by nothing here; Guard B does not ask about those
+/// (`is_unreachable`).
 ///
 /// Complexity: O(depth of dom tree) — bounded by `num_blocks`. The walk
 /// terminates because `idom[entry] == entry` (the entry block is its own
@@ -3197,6 +3181,357 @@ mod tests {
         let before = written(&f);
         assert!(rotate_the_only_loop(&mut f));
         assert_ne!(written(&f), before);
+    }
+
+    /// How the code behind `for (i = seed, s = 0; i < bound; i++) s += i;`
+    /// reads the loop.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Behind {
+        /// The exit block has phis of its own for the sum, the counter, a
+        /// constant and a value from in front of the loop (what the header
+        /// of a following loop looks like once that loop is rotated), and
+        /// reads the sum directly as well.
+        ExitPhis,
+        /// `if (seed < 100) { loop } else { s = 77; i = seed; }`: the sum
+        /// and the counter are merged in a block the exit block does not
+        /// dominate, over an edge it does.
+        MergeBehind,
+        /// The entry jumps around the loop to the exit block: two
+        /// predecessors (Guard A).
+        JumpAround,
+        /// An exit phi with an incoming for an edge that does not exist.
+        StaleExitPhi,
+        /// A block nothing branches to reads the sum and the counter (what
+        /// the unroller leaves behind until the next CFG cleanup).
+        DeadReader,
+    }
+
+    /// ```text
+    ///   0 entry:  v1 = seed                              -> 1 (or see below)
+    ///   1 header: v2 = phi i [v1, 0], [v6, 3]
+    ///             v5 = phi s [0, 0],  [v7, 3]
+    ///             v4 = v2 < bound
+    ///             CondBranch(v4, 3, 4)
+    ///   3 body:   v7 = v5 + v2 ; v6 = v2 + 1             -> 1
+    ///   4 exit:   ...
+    /// ```
+    fn loop_read_behind(seed: i64, bound: i64, behind: Behind) -> IrFunction {
+        let ty = Ty::I32;
+        let constant = |value: i64| Operand::Const(IrConst::from_i64(value, ty));
+        let value = |id: u32| Operand::Value(Value(id));
+        let add = |dest: u32, lhs: Operand, rhs: Operand| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty,
+        };
+        let phi = |dest: u32, incoming: Vec<(Operand, u32)>| Instruction::Phi {
+            dest: Value(dest),
+            ty,
+            incoming: incoming
+                .into_iter()
+                .map(|(op, label)| (op, BlockId(label)))
+                .collect(),
+        };
+        let mut f = IrFunction::new("read_behind".into(), ty, vec![], false);
+        let mut entry = vec![Instruction::Copy {
+            dest: Value(1),
+            src: constant(seed),
+        }];
+        let entry_term = match behind {
+            Behind::ExitPhis | Behind::StaleExitPhi | Behind::DeadReader => {
+                Terminator::Branch(BlockId(1))
+            }
+            Behind::MergeBehind | Behind::JumpAround => {
+                entry.push(Instruction::Cmp {
+                    dest: Value(20),
+                    op: IrCmpOp::Slt,
+                    lhs: value(1),
+                    rhs: constant(100),
+                    ty,
+                });
+                Terminator::CondBranch {
+                    cond: value(20),
+                    true_label: BlockId(1),
+                    false_label: BlockId(if behind == Behind::MergeBehind { 5 } else { 4 }),
+                }
+            }
+        };
+        f.blocks.push(blk(0, entry, entry_term));
+        f.blocks.push(blk(
+            1,
+            vec![
+                phi(2, vec![(value(1), 0), (value(6), 3)]),
+                phi(5, vec![(constant(0), 0), (value(7), 3)]),
+                Instruction::Cmp {
+                    dest: Value(4),
+                    op: IrCmpOp::Slt,
+                    lhs: value(2),
+                    rhs: constant(bound),
+                    ty,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: value(4),
+                true_label: BlockId(3),
+                false_label: BlockId(4),
+            },
+        ));
+        f.blocks.push(blk(
+            3,
+            vec![add(7, value(5), value(2)), add(6, value(2), constant(1))],
+            Terminator::Branch(BlockId(1)),
+        ));
+        match behind {
+            Behind::ExitPhis | Behind::StaleExitPhi => {
+                let mut sum = vec![(value(5), 1)];
+                if behind == Behind::StaleExitPhi {
+                    sum.push((constant(9), 0));
+                }
+                f.blocks.push(blk(
+                    4,
+                    vec![
+                        phi(8, sum),
+                        phi(9, vec![(value(2), 1)]),
+                        phi(10, vec![(constant(100), 1)]),
+                        phi(11, vec![(value(1), 1)]),
+                        add(12, value(8), value(9)),
+                        add(13, value(12), value(10)),
+                        add(14, value(13), value(11)),
+                        add(15, value(14), value(5)),
+                    ],
+                    Terminator::Return(Some(value(15))),
+                ));
+            }
+            Behind::MergeBehind => {
+                f.blocks
+                    .push(blk(4, vec![], Terminator::Branch(BlockId(6))));
+                f.blocks.push(blk(
+                    5,
+                    vec![Instruction::Copy {
+                        dest: Value(21),
+                        src: constant(77),
+                    }],
+                    Terminator::Branch(BlockId(6)),
+                ));
+                f.blocks.push(blk(
+                    6,
+                    vec![
+                        phi(8, vec![(value(5), 4), (value(21), 5)]),
+                        phi(9, vec![(value(2), 4), (value(1), 5)]),
+                        add(10, value(8), value(9)),
+                    ],
+                    Terminator::Return(Some(value(10))),
+                ));
+            }
+            Behind::JumpAround => {
+                f.blocks.push(blk(
+                    4,
+                    vec![
+                        phi(8, vec![(value(5), 1), (constant(77), 0)]),
+                        phi(9, vec![(value(2), 1), (value(1), 0)]),
+                        add(10, value(8), value(9)),
+                    ],
+                    Terminator::Return(Some(value(10))),
+                ));
+            }
+            Behind::DeadReader => {
+                f.blocks.push(blk(
+                    4,
+                    vec![add(10, value(5), value(2))],
+                    Terminator::Return(Some(value(10))),
+                ));
+                f.blocks.push(blk(
+                    5,
+                    vec![add(21, value(5), value(2))],
+                    Terminator::Unreachable,
+                ));
+            }
+        }
+        f.next_value_id = 30;
+        f.next_label = 7;
+        f
+    }
+
+    /// What the function above returns, computed from its C form.
+    fn read_behind_result(seed: i64, bound: i64, behind: Behind) -> i64 {
+        let (mut i, mut s) = (seed, 0);
+        let looped = !matches!(behind, Behind::MergeBehind | Behind::JumpAround) || seed < 100;
+        if looped {
+            while i < bound {
+                s += i;
+                i += 1;
+            }
+        }
+        match behind {
+            Behind::ExitPhis | Behind::StaleExitPhi => s + i + 100 + seed + s,
+            Behind::DeadReader => s + i,
+            Behind::MergeBehind | Behind::JumpAround if looped => s + i,
+            Behind::MergeBehind | Behind::JumpAround => 77 + seed,
+        }
+    }
+
+    fn rotated_is_valid_and_computes(f: &mut IrFunction, expected: i64, what: &str) {
+        assert_eq!(
+            interpret_rotation_fixture(f),
+            expected,
+            "{what}: the fixture"
+        );
+        assert!(rotate_the_only_loop(f), "{what}: not rotated");
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(f, "read_behind", &mut violations);
+        assert!(violations.is_empty(), "{what}: {violations:?}");
+        assert_eq!(interpret_rotation_fixture(f), expected, "{what}: rotated");
+    }
+
+    /// The phis the exit block already has get an incoming for the latch's
+    /// edge. Before: one incoming for two predecessors, and for a phi that
+    /// read a header phi that one incoming was rewritten to the merge phi
+    /// defined beside it -- the verifier's "phi arity" and "phi dominance"
+    /// violations with which seven tests of tests/regression failed to
+    /// compile under CCC_LOOP_ROTATE=1.
+    #[test]
+    fn rotation_gives_the_exit_blocks_own_phis_the_latch_edge() {
+        for seed in [-3, 0, 2, 3, 4, 7] {
+            let mut f = loop_read_behind(seed, 4, Behind::ExitPhis);
+            let expected = read_behind_result(seed, 4, Behind::ExitPhis);
+            rotated_is_valid_and_computes(&mut f, expected, &format!("seed {seed}"));
+            let exit = f.blocks.iter().find(|b| b.label == BlockId(4)).unwrap();
+            for inst in &exit.instructions {
+                let Instruction::Phi { dest, incoming, .. } = inst else {
+                    continue;
+                };
+                let mut labels: Vec<u32> = incoming.iter().map(|(_, label)| label.0).collect();
+                labels.sort_unstable();
+                assert_eq!(labels, [1, 3], "v{}: one incoming per predecessor", dest.0);
+            }
+        }
+    }
+
+    /// `x, y = y + j, x` with an exit block whose own phis read both. Over
+    /// the latch's edge `y` is what `x` was during the last iteration, its
+    /// self-loop phi; the header's `x` is the guard's value once rotated.
+    #[test]
+    fn an_exit_phi_of_a_swapped_value_takes_the_last_iterations() {
+        let ty = Ty::I32;
+        let constant = |value: i64| Operand::Const(IrConst::from_i64(value, ty));
+        let value = |id: u32| Operand::Value(Value(id));
+        let add = |dest: u32, lhs: Operand, rhs: Operand| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty,
+        };
+        let phi = |dest: u32, incoming: Vec<(Operand, u32)>| Instruction::Phi {
+            dest: Value(dest),
+            ty,
+            incoming: incoming
+                .into_iter()
+                .map(|(op, label)| (op, BlockId(label)))
+                .collect(),
+        };
+        for bound in 0..6 {
+            let mut f = IrFunction::new("swap".into(), ty, vec![], false);
+            f.blocks
+                .push(blk(0, vec![], Terminator::Branch(BlockId(1))));
+            f.blocks.push(blk(
+                1,
+                vec![
+                    phi(2, vec![(constant(0), 0), (value(6), 3)]),
+                    phi(3, vec![(constant(1), 0), (value(7), 3)]),
+                    phi(5, vec![(constant(2), 0), (value(3), 3)]),
+                    Instruction::Cmp {
+                        dest: Value(4),
+                        op: IrCmpOp::Slt,
+                        lhs: value(2),
+                        rhs: constant(bound),
+                        ty,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: value(4),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+            ));
+            f.blocks.push(blk(
+                3,
+                vec![add(7, value(5), value(2)), add(6, value(2), constant(1))],
+                Terminator::Branch(BlockId(1)),
+            ));
+            f.blocks.push(blk(
+                4,
+                vec![
+                    phi(8, vec![(value(3), 1)]),
+                    phi(9, vec![(value(5), 1)]),
+                    add(10, value(8), value(9)),
+                    add(11, value(10), value(9)),
+                ],
+                Terminator::Return(Some(value(11))),
+            ));
+            f.next_value_id = 20;
+            f.next_label = 5;
+            let (mut x, mut y) = (1, 2);
+            for j in 0..bound {
+                (x, y) = (y + j, x);
+            }
+            rotated_is_valid_and_computes(&mut f, x + 2 * y, &format!("bound {bound}"));
+        }
+    }
+
+    /// `if (c) { loop } else { ... }` merges the loop's values in a block the
+    /// exit block does not dominate, over an edge it does. A phi reads at
+    /// the end of the predecessor it names, so the merge phi in the exit
+    /// block serves it. (Guard B asked about the phi's own block and
+    /// refused this loop.)
+    #[test]
+    fn rotation_serves_a_merge_behind_the_exit_block() {
+        for seed in [-3, 0, 2, 3, 4, 7, 100, 150] {
+            let mut f = loop_read_behind(seed, 4, Behind::MergeBehind);
+            let expected = read_behind_result(seed, 4, Behind::MergeBehind);
+            rotated_is_valid_and_computes(&mut f, expected, &format!("seed {seed}"));
+        }
+    }
+
+    /// A block nothing reaches is no reader: the unroller leaves the body it
+    /// replaced behind until the next CFG cleanup, and rotation runs before
+    /// that. The loop rotates, and the dead block is left as it was (it
+    /// keeps naming the header's phis, which stay defined).
+    #[test]
+    fn rotation_is_not_held_up_by_a_dead_reader() {
+        for seed in [-3, 0, 2, 3, 4, 7] {
+            let mut f = loop_read_behind(seed, 4, Behind::DeadReader);
+            let dead = format!("{:?}", f.blocks[4].instructions);
+            let expected = read_behind_result(seed, 4, Behind::DeadReader);
+            rotated_is_valid_and_computes(&mut f, expected, &format!("seed {seed}"));
+            let block = f.blocks.iter().find(|b| b.label == BlockId(5)).unwrap();
+            assert_eq!(format!("{:?}", block.instructions), dead, "seed {seed}");
+        }
+    }
+
+    /// Guard A and the stale exit phi are refusals, and a refusal leaves the
+    /// function as it was: no phi added to the body and taken out again, no
+    /// value number taken (the two guards used to stand behind step 6.6 and
+    /// left `next_value_id` advanced).
+    #[test]
+    fn a_refusal_behind_the_loop_leaves_the_function_untouched() {
+        for behind in [Behind::JumpAround, Behind::StaleExitPhi] {
+            let mut f = loop_read_behind(0, 4, behind);
+            let before = written(&f);
+            assert!(!rotate_the_only_loop(&mut f), "{behind:?}");
+            assert_eq!(written(&f), before, "{behind:?}");
+            assert_eq!(f.next_value_id, 30, "{behind:?}");
+        }
+        // The jump around the loop is valid IR and still computes its result.
+        for seed in [-3, 0, 5, 100, 150] {
+            let f = loop_read_behind(seed, 4, Behind::JumpAround);
+            assert_eq!(
+                interpret_rotation_fixture(&f),
+                read_behind_result(seed, 4, Behind::JumpAround)
+            );
+        }
     }
 
     /// The same counted loop with EXIT-ON-TRUE polarity: the CondBranch's true
