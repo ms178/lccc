@@ -12,6 +12,12 @@
 #                compare against the constant must survive untouched.
 #   width-shape  `(unsigned long long)(int)x >= 2^64 - 2^31` — the same rule at
 #                a 64-bit compare width, where the halves are 2^31 apart.
+#   top-shape    `(unsigned long long)(int)x <= 2^64 - 1` — nothing is above
+#                the greatest value, so the answer is 1 whatever `x` is: the
+#                constant (as GCC 16.2 and Clang 23.1.5 return it), and not
+#                the sign test the rule makes of a constant between the
+#                halves.  (LCCC used to compare with -1 here, and this gate
+#                used to require that compare.)
 #
 # Every shape is measured on every backend the tree can emit for: the fold must
 # never make a function longer (this is what caught the same rule costing two
@@ -67,10 +73,14 @@ body fire64_ge "$tmp/on.s" > "$tmp/fire64_ge.s"
 check_absent "fire64_ge: no 64-bit compare is left" "$tmp/fire64_ge.s" 'cmpq'
 
 # ── 2. The controls: inside a half, or one step outside the boundary ───────
-for f in keep_in_half keep16_in_half keep_gap keep64_gap keep64_high; do
+for f in keep_in_half keep16_in_half keep_gap keep64_gap; do
     body "$f" "$tmp/on.s" > "$tmp/$f.s"
     check_present "$f: the compare survives" "$tmp/$f.s" 'cmp[bwlq]?|cmpl|cmpq'
 done
+body keep64_high "$tmp/on.s" > "$tmp/keep64_high.s"
+check_present "keep64_high: the answer is the constant 1" "$tmp/keep64_high.s" 'movl +\$1, %eax'
+check_absent "keep64_high: neither a compare nor a sign test" "$tmp/keep64_high.s" \
+    '^\s+(cmp|test|set|shr|sar|bt)'
 body keep_in_half "$tmp/on.s" > "$tmp/keep_in_half.s"
 check_present "keep_in_half: still compares with 5" "$tmp/keep_in_half.s" 'cmpl? +\$5,'
 body keep_gap "$tmp/on.s" > "$tmp/keep_gap.s"

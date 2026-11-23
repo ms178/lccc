@@ -69,6 +69,25 @@ fn bounds(cx: &Context<'_>, value: Operand, ty: IrType, facts: &Facts) -> Option
     })
 }
 
+// A count whose bounds meet is that number: `ctz(x | 1)` is 0, `clz(x |
+// MSB)` is 0, `ctz(x << 3 | 8)` is 3, and `ctz(x)` behind `(x & 7) == 4` is
+// 2. What pins it is a known bit of the operand where the count stands (its
+// own structure, or the one edge this block is entered by), never the
+// undefined-at-zero contract of a nonzero scan: `bounds` wants the one bit.
+// The instruction is replaced where it is; no other value is touched, and
+// the operand lives on only if something else reads it.
+pub(super) fn exact(
+    inst: &Instruction,
+    cx: &Context<'_>,
+    facts: &Facts,
+) -> Option<Vec<Instruction>> {
+    let Instruction::UnaryOp { dest, ty, .. } = inst else {
+        return None;
+    };
+    let (lo, hi) = bounds(cx, Operand::Value(*dest), *ty, facts)?;
+    (lo == hi).then(|| copy(*dest, constant(lo, *ty)))
+}
+
 // Unary count `ty` describes the input word. Frontend C builtins may
 // consume its result as I32 even for U64 inputs, without an explicit cast.
 // All admitted carriers preserve 0..=64; keep source width separate.

@@ -508,3 +508,195 @@ fn terminal_rewrite_keeps_edges_and_refuses_joins_or_identical_successors() {
         }
     }
 }
+
+/// What the scan computes for a word it is defined on.
+fn counted(op: IrUnaryOp, x: u64, width: usize) -> u64 {
+    match op {
+        IrUnaryOp::ClzNonZero => actual(IrUnaryOp::Clz, x, width),
+        IrUnaryOp::CtzNonZero => actual(IrUnaryOp::Ctz, x, width),
+        _ => actual(op, x, width),
+    }
+}
+
+/// Every fact about a byte (3^8 of them: each bit known zero, known one or
+/// unknown) under every scan. Where `exact` answers, every word the fact
+/// allows has that count; where it does not, two of them differ, or the scan
+/// is undefined at zero and no one bit is known (the contract is not a
+/// fact).
+#[test]
+fn an_exact_count_is_the_count_of_every_word_the_fact_allows() {
+    for op in [
+        IrUnaryOp::Popcount,
+        IrUnaryOp::Clz,
+        IrUnaryOp::Ctz,
+        IrUnaryOp::ClzNonZero,
+        IrUnaryOp::CtzNonZero,
+    ] {
+        let scan = unary(op, IrType::U8);
+        context(std::slice::from_ref(&scan), |cx| {
+            let (mut answered, mut asked) = (0, 0);
+            for known in 0..256u64 {
+                // Every subset of `known` as the bits known to be one.
+                let mut one = known;
+                loop {
+                    cx.visits.set(512);
+                    asked += 1;
+                    let facts = Facts(vec![(v(0), 8, known & !one, one)]);
+                    let allowed: Vec<u64> = (0..256).filter(|x| x & known == one).collect();
+                    let nonzero_scan = matches!(op, IrUnaryOp::ClzNonZero | IrUnaryOp::CtzNonZero);
+                    let first = counted(op, allowed[0], 8);
+                    let constant_count = allowed.iter().all(|&x| counted(op, x, 8) == first);
+                    match exact(&scan, cx, &facts) {
+                        Some(insts) => {
+                            answered += 1;
+                            assert!(
+                                matches!(insts.as_slice(), [Instruction::Copy { dest: Value(1), src }]
+                                    if *src == constant(first, IrType::U8)),
+                                "{op:?} known {known:#x} one {one:#x}: {insts:?}"
+                            );
+                            assert!(constant_count, "{op:?} known {known:#x} one {one:#x}");
+                            assert!(!nonzero_scan || one != 0);
+                        }
+                        None => assert!(
+                            !constant_count || (nonzero_scan && one == 0),
+                            "{op:?} known {known:#x} one {one:#x}: a constant count kept as a scan"
+                        ),
+                    }
+                    if one == 0 {
+                        break;
+                    }
+                    one = (one - 1) & known;
+                }
+            }
+            assert_eq!(asked, 6561);
+            assert!(answered > 0);
+        });
+    }
+}
+
+/// The spellings a program writes: `ctz(x | 1)`, `clz(x | MSB)`,
+/// `ctz(x << 3 | 8)`. And the one the front end writes for a zero-defined
+/// byte scan, `ctz(x | 0x100)`, which is not a constant.
+#[test]
+fn an_exact_count_reads_the_structure_of_its_operand() {
+    let or = |dest: u32, lhs: Operand, k: u64, ty: IrType| Instruction::BinOp {
+        dest: Value(dest),
+        op: IrBinOp::Or,
+        lhs,
+        rhs: constant(k, ty),
+        ty,
+    };
+    let scan = |dest: u32, op: IrUnaryOp, src: u32, ty: IrType| Instruction::UnaryOp {
+        dest: Value(dest),
+        op,
+        src: v(src),
+        ty,
+    };
+    let folds_to = |insts: &[Instruction], want: Option<u64>| {
+        context(insts, |cx| {
+            let last = insts.last().unwrap();
+            let got = exact(last, cx, &Facts(vec![]));
+            match want {
+                Some(n) => {
+                    let ty = last.result_type().unwrap();
+                    assert!(
+                        matches!(got.as_deref(), Some([Instruction::Copy { src, .. }])
+                            if *src == constant(n, ty)),
+                        "{insts:?}: {got:?}"
+                    );
+                }
+                None => assert!(got.is_none(), "{insts:?}: {got:?}"),
+            }
+        });
+    };
+    for ty in [IrType::U32, IrType::U64] {
+        let msb = 1u64 << (ty.size() * 8 - 1);
+        for op in [IrUnaryOp::Ctz, IrUnaryOp::CtzNonZero] {
+            folds_to(&[or(1, v(0), 1, ty), scan(2, op, 1, ty)], Some(0));
+            folds_to(&[or(1, v(0), 0x100, ty), scan(2, op, 1, ty)], None);
+            folds_to(
+                &[
+                    Instruction::BinOp {
+                        dest: Value(1),
+                        op: IrBinOp::Shl,
+                        lhs: v(0),
+                        rhs: constant(3, ty),
+                        ty,
+                    },
+                    or(2, v(1), 8, ty),
+                    scan(3, op, 2, ty),
+                ],
+                Some(3),
+            );
+            folds_to(&[scan(1, op, 0, ty)], None);
+        }
+        for op in [IrUnaryOp::Clz, IrUnaryOp::ClzNonZero] {
+            folds_to(&[or(1, v(0), msb, ty), scan(2, op, 1, ty)], Some(0));
+            folds_to(&[or(1, v(0), 1, ty), scan(2, op, 1, ty)], None);
+        }
+        folds_to(
+            &[or(1, v(0), 1, ty), scan(2, IrUnaryOp::Popcount, 1, ty)],
+            None,
+        );
+    }
+    // Through the conversions C puts in front of a scan: `ctz((int)(x | 1))`
+    // (what `__builtin_ffs(x | 1)` scans), a widening and a narrowing.
+    let cast = |dest: u32, src: u32, from_ty: IrType, to_ty: IrType| Instruction::Cast {
+        dest: Value(dest),
+        src: v(src),
+        from_ty,
+        to_ty,
+    };
+    for (from, to, bit, want) in [
+        (IrType::U32, IrType::I32, 1, Some(0)),
+        (IrType::U32, IrType::U64, 4, Some(2)),
+        (IrType::I32, IrType::I64, 4, Some(2)),
+        (IrType::U64, IrType::U32, 8, Some(3)),
+        (IrType::U64, IrType::U32, 1 << 40, None),
+    ] {
+        let shift = want.unwrap_or(0);
+        folds_to(
+            &[
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Shl,
+                    lhs: v(0),
+                    rhs: constant(shift, from),
+                    ty: from,
+                },
+                or(2, v(1), bit, from),
+                cast(3, 2, from, to),
+                scan(4, IrUnaryOp::Ctz, 3, to),
+            ],
+            want,
+        );
+    }
+    // A leading count across a widening: `clz((unsigned long)(unsigned char)x
+    // | 0x80)` is 56, and across the sign extension of a negative value 0.
+    folds_to(
+        &[
+            or(1, v(0), 0x80, IrType::U8),
+            cast(2, 1, IrType::U8, IrType::U64),
+            scan(3, IrUnaryOp::Clz, 2, IrType::U64),
+        ],
+        Some(56),
+    );
+    folds_to(
+        &[
+            or(1, v(0), 0x80, IrType::I8),
+            cast(2, 1, IrType::I8, IrType::I64),
+            scan(3, IrUnaryOp::Clz, 2, IrType::I64),
+        ],
+        Some(0),
+    );
+    // Not a count.
+    folds_to(
+        &[Instruction::UnaryOp {
+            dest: Value(1),
+            op: IrUnaryOp::Neg,
+            src: constant(4, IrType::I32),
+            ty: IrType::I32,
+        }],
+        None,
+    );
+}
