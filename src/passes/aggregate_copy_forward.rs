@@ -2734,6 +2734,12 @@ mod tests {
     /// `object` after the pass, executed byte by byte. `object` starts as
     /// 0xEE and `source` holds 1, 2, 3, ...; a byte of the temporary nothing
     /// wrote is `None` (indeterminate: any value is a correct result).
+    ///
+    /// `object` is a global: what the function leaves in it is what its
+    /// callers read, so no write to it is dead. As a local that nothing
+    /// reads, the pass may delete every copy into it, and did: the test then
+    /// compared bytes no program could observe. `source` is a local filled
+    /// from a global, the shape of an argument a caller passes by value.
     fn bytes_after_partial_copy(fill: usize, offset: i64, copy: usize) -> Vec<Option<u8>> {
         const SIZE: usize = 16;
         let alloca = |dest| Instruction::Alloca {
@@ -2744,12 +2750,27 @@ mod tests {
             volatile: false,
             semantic_volatile: false,
         };
-        // v0 = object, v1 = source, v2 = temporary, v3 = temporary + offset.
+        let global = |dest, name: &str| Instruction::GlobalAddr {
+            dest: Value(dest),
+            name: name.into(),
+        };
+        // v0 = object, v1 = source, v2 = temporary, v3 = temporary + offset,
+        // v4 = the global the source is filled from.
         let mut func = IrFunction::new("partial".into(), IrType::Void, vec![], false);
-        func.next_value_id = 4;
+        func.next_value_id = 5;
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![alloca(0), alloca(1), alloca(2)],
+            instructions: vec![
+                global(0, "object"),
+                alloca(1),
+                alloca(2),
+                global(4, "source_bytes"),
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(4),
+                    size: SIZE,
+                },
+            ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: vec![],
             source_inline_ids: Vec::new(),
@@ -2784,16 +2805,29 @@ mod tests {
             }
         }
 
-        // Three objects of SIZE bytes; a pointer is (object, offset).
+        // An object is SIZE bytes; a pointer is (object, offset).
         let mut memory: FxHashMap<u32, Vec<Option<u8>>> = FxHashMap::default();
-        memory.insert(0, vec![Some(0xEE); SIZE]);
-        memory.insert(1, (1..=SIZE as u8).map(Some).collect());
-        memory.insert(2, vec![None; SIZE]);
-        let mut pointers: FxHashMap<u32, (u32, usize)> = [(0, (0, 0)), (1, (1, 0)), (2, (2, 0))]
-            .into_iter()
-            .collect();
-        for inst in &func.blocks[1].instructions {
+        let mut pointers: FxHashMap<u32, (u32, usize)> = FxHashMap::default();
+        let mut object = None;
+        for inst in func.blocks.iter().flat_map(|block| &block.instructions) {
             match inst {
+                Instruction::Alloca { dest, size, .. } => {
+                    assert_eq!(*size, SIZE);
+                    memory.insert(dest.0, vec![None; SIZE]);
+                    pointers.insert(dest.0, (dest.0, 0));
+                }
+                Instruction::GlobalAddr { dest, name } => {
+                    let bytes = match name.as_str() {
+                        "object" => {
+                            object = Some(dest.0);
+                            vec![Some(0xEE); SIZE]
+                        }
+                        "source_bytes" => (1..=SIZE as u8).map(Some).collect(),
+                        other => panic!("unknown global {other}"),
+                    };
+                    memory.insert(dest.0, bytes);
+                    pointers.insert(dest.0, (dest.0, 0));
+                }
                 Instruction::GetElementPtr {
                     dest,
                     base,
@@ -2816,7 +2850,7 @@ mod tests {
                 other => panic!("unexpected instruction after the pass: {other:?}"),
             }
         }
-        memory.remove(&0).unwrap()
+        memory.remove(&object.expect("the object")).unwrap()
     }
 
     /// The bytes a program is promised: what the same two copies do when
@@ -2919,9 +2953,14 @@ mod tests {
         CopyOut(usize),
     }
 
-    /// Two 32-byte objects, `memcpy(temporary, source, copied)`, one read of
+    /// A 32-byte temporary, `memcpy(temporary, source, copied)`, one read of
     /// the temporary: is the read forwarded to the source (and the copy
     /// gone)? Either both happen or neither does; anything else is a bug.
+    ///
+    /// The object a copy-out writes is a global, so the copy-out is a write
+    /// the callers see. Into a local that nothing reads it is a dead store,
+    /// which the pass deletes together with the copy that fed it: the test
+    /// then reported a forward that never happened.
     fn read_is_forwarded(copied: usize, read: ReadBehindCopy) -> bool {
         let alloca = |dest| Instruction::Alloca {
             dest: Value(dest),
@@ -2938,7 +2977,10 @@ mod tests {
         let mut body = vec![
             alloca(0),
             alloca(1),
-            alloca(2),
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: "third".into(),
+            },
             Instruction::Memcpy {
                 dest: Value(0),
                 src: Value(1),
@@ -2997,7 +3039,6 @@ mod tests {
             source_spans: vec![],
             source_inline_ids: Vec::new(),
         });
-        // The main forward alone: the two other directions have their own tests.
         let paths_before = pointer_paths(&func);
         assert!(paths_before.contains_key(&0));
         for _ in 0..8 {
@@ -3022,10 +3063,14 @@ mod tests {
         !copy_stands
     }
 
-    /// Behind a partial copy the temporary holds what it held before, which
-    /// for a by-value parameter's home is the caller's argument: `memcpy(&v,
-    /// &s, 8); return v.b;` returned `s.b`. Only bytes the copy wrote are the
-    /// source's bytes.
+    /// Which reads of a partly copied temporary are forwarded. A read of bytes
+    /// the copy did not write is never re-pointed at the source: those bytes
+    /// are what the temporary held before (see the test below).
+    ///
+    /// A copy-out longer than the copy is not in this list. The temporary of
+    /// this function holds nothing behind the copied bytes, so copying only
+    /// the copied bytes out is a correct result, and the pass produces it
+    /// (`memcpy(third, source, 8)` for an 8-byte copy and a 16-byte copy-out).
     #[test]
     fn only_reads_inside_the_copied_bytes_are_forwarded() {
         use ReadBehindCopy::{CopyOut, Load, LoadAtVariableOffset};
@@ -3042,8 +3087,6 @@ mod tests {
         assert!(!read_is_forwarded(8, Load(24)));
         assert!(read_is_forwarded(8, CopyOut(8)));
         assert!(read_is_forwarded(8, CopyOut(4)));
-        assert!(!read_is_forwarded(8, CopyOut(16)));
-        assert!(!read_is_forwarded(8, CopyOut(32)));
         assert!(!read_is_forwarded(8, LoadAtVariableOffset));
         // A 16-byte copy: two loads fit.
         assert!(read_is_forwarded(16, Load(0)));
@@ -3055,6 +3098,190 @@ mod tests {
             assert!(read_is_forwarded(32, read));
         }
         assert!(read_is_forwarded(32, LoadAtVariableOffset));
+    }
+
+    /// What a function observes of a temporary that holds `argument` and is
+    /// then overwritten in part: `memcpy(temporary, argument, 32);
+    /// memcpy(temporary, source, copied);` and one read. The function is
+    /// executed byte by byte after the pass: the bytes a load returns, or the
+    /// 32 bytes of the global a copy-out writes (0xEE before).
+    fn observed_behind_partial_overwrite(copied: usize, read: &ReadBehindCopy) -> Vec<Option<u8>> {
+        const SIZE: usize = 32;
+        let alloca = |dest| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: SIZE,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let global = |dest, name: &str| Instruction::GlobalAddr {
+            dest: Value(dest),
+            name: name.into(),
+        };
+        let copy = |dest, src, size| Instruction::Memcpy {
+            dest: Value(dest),
+            src: Value(src),
+            size,
+        };
+        // v0 = temporary, v1 = source, v2 = argument: locals, filled from
+        // the globals v6 and v7; v3 = the global a copy-out writes;
+        // v4 = the read's address, v5 = what the load reads.
+        let mut func = IrFunction::new("overwrite".into(), IrType::I64, vec![], false);
+        func.next_value_id = 8;
+        let mut body = vec![
+            alloca(0),
+            alloca(1),
+            alloca(2),
+            global(3, "third"),
+            global(6, "source_bytes"),
+            global(7, "argument_bytes"),
+            copy(1, 6, SIZE),
+            copy(2, 7, SIZE),
+            copy(0, 2, SIZE),
+            copy(0, 1, copied),
+        ];
+        let mut returned = Operand::Const(IrConst::I64(0));
+        match *read {
+            ReadBehindCopy::Load(offset) => {
+                body.push(Instruction::GetElementPtr {
+                    dest: Value(4),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(offset)),
+                    ty: IrType::I8,
+                });
+                body.push(Instruction::Load {
+                    volatile: false,
+                    dest: Value(5),
+                    ptr: Value(4),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                });
+                returned = Operand::Value(Value(5));
+            }
+            ReadBehindCopy::CopyOut(bytes) => body.push(copy(3, 0, bytes)),
+            ReadBehindCopy::LoadAtVariableOffset => unreachable!("not a shape of this test"),
+        }
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: body,
+            terminator: Terminator::Return(Some(returned)),
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        });
+        for _ in 0..8 {
+            if run(&mut func) == 0 {
+                break;
+            }
+        }
+
+        // An object is a vector of bytes; a pointer is (object, offset).
+        let mut memory: FxHashMap<u32, Vec<Option<u8>>> = FxHashMap::default();
+        let mut pointers: FxHashMap<u32, (u32, usize)> = FxHashMap::default();
+        let mut loaded: FxHashMap<u32, Vec<Option<u8>>> = FxHashMap::default();
+        for inst in &func.blocks[0].instructions {
+            match inst {
+                Instruction::Alloca { dest, size, .. } => {
+                    assert_eq!(*size, SIZE);
+                    memory.insert(dest.0, vec![None; SIZE]);
+                    pointers.insert(dest.0, (dest.0, 0));
+                }
+                Instruction::GlobalAddr { dest, name } => {
+                    let bytes = match name.as_str() {
+                        "third" => vec![Some(0xEE); SIZE],
+                        "source_bytes" => (1..=SIZE as u8).map(Some).collect(),
+                        "argument_bytes" => (0..SIZE as u8).map(|i| Some(0x40 + i)).collect(),
+                        other => panic!("unknown global {other}"),
+                    };
+                    memory.insert(dest.0, bytes);
+                    pointers.insert(dest.0, (dest.0, 0));
+                }
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } => {
+                    let (object, at) = pointers[&base.0];
+                    pointers.insert(dest.0, (object, at + c.to_i64().unwrap() as usize));
+                }
+                Instruction::Memcpy { dest, src, size } => {
+                    let (from, from_at) = pointers[&src.0];
+                    let (to, to_at) = pointers[&dest.0];
+                    assert!(
+                        from_at + size <= SIZE && to_at + size <= SIZE,
+                        "a copy of {size} bytes leaves its object: {inst:?}"
+                    );
+                    let bytes = memory[&from][from_at..from_at + size].to_vec();
+                    memory.get_mut(&to).unwrap()[to_at..to_at + size].copy_from_slice(&bytes);
+                }
+                Instruction::Load {
+                    dest,
+                    ptr,
+                    ty: IrType::I64,
+                    ..
+                } => {
+                    let (from, at) = pointers[&ptr.0];
+                    assert!(at + 8 <= SIZE, "a load leaves its object: {inst:?}");
+                    loaded.insert(dest.0, memory[&from][at..at + 8].to_vec());
+                }
+                other => panic!("unexpected instruction after the pass: {other:?}"),
+            }
+        }
+        match &func.blocks[0].terminator {
+            Terminator::Return(Some(Operand::Value(value))) => loaded.remove(&value.0).unwrap(),
+            Terminator::Return(Some(Operand::Const(_))) => {
+                let third = func.blocks[0]
+                    .instructions
+                    .iter()
+                    .find_map(|inst| match inst {
+                        Instruction::GlobalAddr { dest, name } if name == "third" => Some(dest.0),
+                        _ => None,
+                    })
+                    .expect("the global the copy-out writes");
+                memory.remove(&third).unwrap()
+            }
+            other => panic!("unexpected terminator after the pass: {other:?}"),
+        }
+    }
+
+    /// Behind a partial copy the temporary holds what it held before, which
+    /// for a by-value parameter's home is the caller's argument: `memcpy(&v,
+    /// &s, 8); return v.b;` returned `s.b`. Every read of every size, in
+    /// front of, across and behind the end of the copy, observes exactly the
+    /// bytes the two copies leave in the temporary.
+    #[test]
+    fn a_partly_overwritten_temporary_keeps_the_bytes_behind_the_copy() {
+        use ReadBehindCopy::{CopyOut, Load};
+        for copied in [1usize, 4, 8, 12, 16, 24, 32] {
+            let mut temporary: Vec<u8> = (0..32u8).map(|i| 0x40 + i).collect();
+            for (i, byte) in temporary.iter_mut().enumerate().take(copied) {
+                *byte = 1 + i as u8;
+            }
+            for offset in [0usize, 4, 8, 12, 16, 20, 24] {
+                let got = observed_behind_partial_overwrite(copied, &Load(offset as i64));
+                let want: Vec<Option<u8>> = temporary[offset..offset + 8]
+                    .iter()
+                    .copied()
+                    .map(Some)
+                    .collect();
+                assert_eq!(
+                    got, want,
+                    "an 8-byte load at {offset} behind a {copied}-byte copy"
+                );
+            }
+            for bytes in [1usize, 4, 8, 12, 16, 24, 32] {
+                let got = observed_behind_partial_overwrite(copied, &CopyOut(bytes));
+                let mut want = vec![Some(0xEEu8); 32];
+                for (slot, byte) in want.iter_mut().zip(&temporary).take(bytes) {
+                    *slot = Some(*byte);
+                }
+                assert_eq!(
+                    got, want,
+                    "a {bytes}-byte copy-out behind a {copied}-byte copy"
+                );
+            }
+        }
     }
 
     #[test]
