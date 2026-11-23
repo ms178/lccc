@@ -109,14 +109,18 @@ class IntrinsicHarness(unittest.TestCase):
         cls.runner = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.runner)
 
-    def run_case(self, results, missing):
+    def run_case(self, results, missing, levels=('-O2',)):
+        status, commands = self.run_commands(results, missing, levels)
+        return status, len(commands)
+
+    def run_commands(self, results, missing, levels):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / 'contract.c'
             src.write_text('// FLAGS: -mavx512f\nint main(void) { return 0; }\n')
-            args = SimpleNamespace(lccc_flags='-O2', gcc_flags='-O2', verbose=False)
+            args = SimpleNamespace(levels=list(levels), lccc_flags='', gcc_flags='', verbose=False)
             with patch.object(self.runner, 'run', side_effect=results) as run, patch.object(self.runner, 'missing_isa', return_value=missing):
                 status = self.runner.run_cases(args, [src], Path(tmp))
-                return status, run.call_count
+                return status, [call.args[0] for call in run.call_args_list]
 
     @staticmethod
     def result(code=0, stdout='ok', stderr=''):
@@ -137,6 +141,29 @@ class IntrinsicHarness(unittest.TestCase):
     def test_success_requires_matching_output(self):
         self.assertEqual(self.run_case([self.result(), self.result(), self.result(), self.result()], []), (0, 4))
         self.assertEqual(self.run_case([self.result(), self.result(), self.result(stdout='a'), self.result(stdout='b')], []), (1, 4))
+
+    def test_every_level_is_a_run_of_every_case(self):
+        # Each level compiles with both compilers and runs both programs,
+        # with that level and the case's own flags and no other level.
+        agree = [self.result(), self.result(), self.result(), self.result()]
+        status, commands = self.run_commands(agree + agree, [], ('-O2', '-O0'))
+        self.assertEqual((status, len(commands)), (0, 8))
+        for at, level, other in ((0, '-O2', '-O0'), (4, '-O0', '-O2')):
+            for compile_command in commands[at:at + 2]:
+                self.assertIn(level, compile_command)
+                self.assertNotIn(other, compile_command)
+                self.assertIn('-mavx512f', compile_command)
+        # The two levels' programs are different files: one level cannot
+        # stand in for the other.
+        self.assertEqual(len({command[0] for command in commands if len(command) == 1}), 4)
+
+    def test_a_difference_at_one_level_fails_the_run(self):
+        agree = [self.result(), self.result(), self.result(), self.result()]
+        differ = [self.result(), self.result(), self.result(stdout='a'), self.result(stdout='b')]
+        self.assertEqual(self.run_case(agree + differ, [], ('-O2', '-O0')), (1, 8))
+        self.assertEqual(self.run_case(differ + agree, [], ('-O2', '-O0')), (1, 8))
+        # A level whose compile fails does not stop the levels behind it.
+        self.assertEqual(self.run_case([self.result(1), self.result()] + agree, [], ('-O2', '-O0')), (1, 6))
 
 
 if __name__ == '__main__':
