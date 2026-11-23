@@ -111,15 +111,15 @@ takes: a mask and zeroing, a broadcast and its width, a rounding mode, a
 register of APX, how a one-byte displacement is scaled. Nothing is copied
 from the table's columns; its rows only say which statements are worth
 asking. What comes out is `src/backend/x86/assembler/encoder/learned_rows.rs`
-(2,453 rows of 734 mnemonics), which `encoder/learned.rs` reads for both
+(2,450 rows of 731 mnemonics), which `encoder/learned.rs` reads for both
 assemblers. A row is tried only where the arms and the plain table refuse a
 statement, or wrote it in an encoding that cannot say it (`{evex}`, `{vex}`,
 a register beyond `%r15`), so what the compiler emits is encoded as before.
 
 The same script asks GNU as how large the one-byte number of every
 instruction may be (`$256` is refused in `pshufd`, cut with a warning in
-`add`, and `$-128` is taken by some forms and not by others): 342 ranges of
-263 mnemonics, which every statement is held to before it is encoded.
+`add`, and `$-128` is taken by some forms and not by others): 408 ranges of
+327 mnemonics, which every statement is held to before it is encoded.
 
 ```
 scripts/x86_learned_rows.py --as AS --verify --lccc LCCC --lccc32 LCCC32   # the gate
