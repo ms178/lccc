@@ -1278,28 +1278,36 @@ fn successors_terminator_first(
     pos_of_label: &FxHashMap<u32, usize>,
 ) -> (Vec<Vec<usize>>, Vec<usize>) {
     let n = func.blocks.len();
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut named_by_terminator = vec![0usize; n];
     let mut labels: Vec<u32> = Vec::new();
-    for (b, block) in func.blocks.iter().enumerate() {
+    // `named_by_terminator[b]` is the number of distinct edges the
+    // TERMINATOR names; asm-goto labels add edges of their own after it.
+    // Counting the terminator's labels first and taking `add`'s "was this a
+    // new edge" answer gives exactly the old value (the edge count at the
+    // moment the terminator's labels ran out, deduplicated), in O(1) per
+    // edge; the old loop read `succs[b].len()` at that same moment but
+    // deduplicated with `Vec::contains`, which is quadratic in the degree.
+    let succs = crate::common::succ_set::build_edges(n, pos_of_label, |b, add| {
+        let block = &func.blocks[b];
         labels.clear();
         collect_successor_labels(&block.terminator, &mut labels);
         let terminator_labels = labels.len();
         labels.extend(crate::ir::analysis::asm_goto_successors(block).map(|l| l.0));
+        let mut counted = 0usize;
         for (i, l) in labels.iter().enumerate() {
             if i == terminator_labels {
-                named_by_terminator[b] = succs[b].len();
+                named_by_terminator[b] = counted;
             }
-            if let Some(&t) = pos_of_label.get(l) {
-                if !succs[b].contains(&t) {
-                    succs[b].push(t);
-                }
+            if add(*l) {
+                counted += 1;
             }
         }
+        // Runs when there are no asm-goto labels at all, and harmlessly
+        // again (`counted` is final) when the cut above already fired.
         if labels.len() == terminator_labels {
-            named_by_terminator[b] = succs[b].len();
+            named_by_terminator[b] = counted;
         }
-    }
+    });
     (succs, named_by_terminator)
 }
 

@@ -1156,9 +1156,17 @@ fn get_successor_labels(term: &Terminator) -> Vec<BlockId> {
             possible_targets, ..
         } => possible_targets.clone(),
         Terminator::Switch { cases, default, .. } => {
-            let mut targets = vec![*default];
+            // Order-preserving dedup (default first, then case arms). The
+            // previous `targets.contains(&label)` scanned the growing row per
+            // case — quadratic on wide switches (limits-caselabels.c's 100k
+            // distinct case labels dominated mem2reg's rename phase).
+            let mut targets = Vec::with_capacity(cases.len() + 1);
+            let mut seen = FxHashSet::with_capacity_and_hasher(cases.len() + 1, Default::default());
+            if seen.insert(*default) {
+                targets.push(*default);
+            }
             for &(_, label) in cases {
-                if !targets.contains(&label) {
+                if seen.insert(label) {
                     targets.push(label);
                 }
             }

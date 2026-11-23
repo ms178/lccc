@@ -206,7 +206,8 @@ def install_rust(prefix: Path) -> Path:
     root = prefix / f"rust-{RUST_VERSION}"
     if marker_ok(root / ".verified", RUST_SHA256,
                  tuple(root / "bin" / tool for tool in
-                       ("rustc", "cargo", "rustfmt", "cargo-clippy"))):
+                       ("rustc", "cargo", "rustfmt", "cargo-fmt",
+                        "cargo-clippy"))):
         return root
     downloads = prefix / "dl"
     downloads.mkdir(parents=True, exist_ok=True)
@@ -235,7 +236,7 @@ def install_rust(prefix: Path) -> Path:
              "--disable-ldconfig", "--components="
              "rustc,cargo,rust-std-x86_64-unknown-linux-gnu,"
              "rustfmt-preview,clippy-preview"], timeout=900)
-    for tool in ("rustc", "cargo", "rustfmt", "cargo-clippy"):
+    for tool in ("rustc", "cargo", "rustfmt", "cargo-fmt", "cargo-clippy"):
         if not (root / "bin" / tool).is_file():
             raise RuntimeError(f"Rust install lacks {tool}")
     version = run([str(root / "bin" / "rustc"), "--version"])
@@ -410,6 +411,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.with_gdb:
         install_gdb(prefix)
     verify(gcc, rust)
+    # The CI gates call `cargo fmt` / `cargo clippy` through the PATH, and an
+    # Arena restore drops ad-hoc PATH entries: ship the tool shims into
+    # `~/.cargo/bin` (on PATH via rustup convention) so the toolchain keeps
+    # working across wipes.  `cargo-fmt` is the subcommand binary `cargo fmt`
+    # dispatches to; without it the rustfmt gate fails with "no such command".
+    shim_dir = Path.home() / ".cargo" / "bin"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    for tool in ("rustc", "cargo", "rustfmt", "cargo-fmt", "cargo-clippy"):
+        link = shim_dir / tool
+        target = rust / "bin" / tool
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(target)
     if not args.skip_corpus:
         provision_corpus()
     print(f"[arena] ready: PATH={rust / 'bin'}:{gcc.parent}:$PATH")

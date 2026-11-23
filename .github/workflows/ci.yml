@@ -680,6 +680,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_gnu_declaration_corners.sh
     - name: Parser pointer-depth resource limit
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_parser_depth_limits.sh
+    - name: Modifiable-lvalue const-member rules (C11 6.3.2.1p3)
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_sema_lvalue_gates.sh
     - name: Store-forwarding DWORD self-reload contracts
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_store_forwarding_dword_reload.sh
     - name: Conditional value carriers for decimal, _Float16 and complex arms
@@ -1646,6 +1648,15 @@ jobs:
         LCCC_BIN: target/fastbuild/lccc
         GCC_BIN: gcc-16
       run: python3 tests/correctness/run_correctness.py
+    # Severity and exact wording of the read-only-lvalue diagnostics, which
+    # codegen tests cannot see: a const object's bit-field must be an ERROR
+    # worded `member 'a' in read-only object`, while a const bit-field's own
+    # type is only a WARNING worded `read-only location`.  Pinned per case
+    # against GCC 16.2 so the two contracts cannot collapse into one.
+    - name: Read-only lvalue diagnostic contract (GCC 16 wording)
+      env:
+        LCCC_BIN: target/fastbuild/lccc
+      run: python3 tests/correctness/run_correctness.py --only-diagnostics
     - name: Volatile destructuring ratchet
       run: |
         python3 scripts/check_volatile_destructuring.py --self-test

@@ -347,7 +347,10 @@ impl Lowerer {
         self.start_block(dead);
     }
 
-    pub(super) fn lower_label_stmt(&mut self, name: &str, stmt: &Stmt) {
+    /// Start the block for one `name:` label (with its GNU nested-function
+    /// aliases). No body is lowered here; `lower_labeled_stmt` lowers the
+    /// run's shared body once after all labels of the run are registered.
+    pub(super) fn lower_name_label(&mut self, name: &str) {
         let label = self.get_or_create_user_label(name);
         // Mark this label as defined (the label: statement has been lowered).
         // This distinguishes it from labels merely referenced by a forward goto.
@@ -381,12 +384,5 @@ impl Lowerer {
                 seg_overrides: Vec::new(),
             });
         }
-        if stmt.labels_loop_or_switch() {
-            self.func_mut().pending_loop_labels.push(name.to_string());
-        } else {
-            self.func_mut().pending_loop_labels.clear();
-        }
-        self.lower_stmt(stmt);
-        self.func_mut().pending_loop_labels.clear();
     }
 }

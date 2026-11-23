@@ -9,7 +9,7 @@ use super::definitions::SwitchFrame;
 use super::lower::Lowerer;
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, IrType};
-use crate::frontend::parser::ast::{Expr, Stmt};
+use crate::frontend::parser::ast::{Expr, Label, Stmt};
 use crate::ir::reexports::{BlockId, Instruction, IrCmpOp, IrConst, Operand, Terminator, Value};
 
 impl Lowerer {
@@ -434,7 +434,47 @@ impl Lowerer {
         val
     }
 
-    pub(super) fn lower_case_stmt(&mut self, expr: &Expr, stmt: &Stmt, span: Span) {
+    pub(super) fn lower_labeled_stmt(&mut self, labels: &[Label], body: &Stmt) {
+        // A run of labels binds to ONE body statement (see `LabelRun`):
+        // register every label's block in source order — exactly the block
+        // chain the nested `Stmt::Case(Box::Stmt)` shape produced — then
+        // lower the shared body once. The flat loop replaces a recursion as
+        // deep as the label count: 100,000 `case` labels
+        // (gcc.c-torture/compile/limits-caselabels.c) overflowed the stack
+        // in the nested form and now lower in O(n) with O(1) stack.
+        for label in labels {
+            match label {
+                Label::Case(expr, lspan) => self.lower_case_label(expr, *lspan),
+                Label::CaseRange(low, high, lspan) => {
+                    self.lower_case_range_label(low, high, *lspan)
+                }
+                Label::Default(lspan) => self.lower_default_label(*lspan),
+                Label::Name(name, _) => self.lower_name_label(name),
+            }
+        }
+        // C2y named loops: `break name` / `continue name` bind to the loop
+        // only through `name:` labels that wrap it directly. A `case` (or
+        // `default`) between a name and the loop severs the binding, so only
+        // the run's trailing names count — the exact semantics of the
+        // previous chain, where each `Stmt::Label` looked at its own body.
+        if body.labels_loop_or_switch() {
+            let first_non_name = labels.iter().rposition(|l| !matches!(l, Label::Name(..)));
+            for label in labels.iter().skip(first_non_name.map_or(0, |i| i + 1)) {
+                if let Label::Name(name, _) = label {
+                    self.func_mut().pending_loop_labels.push(name.clone());
+                }
+            }
+        } else {
+            self.func_mut().pending_loop_labels.clear();
+        }
+        self.lower_stmt(body);
+        self.func_mut().pending_loop_labels.clear();
+    }
+
+    /// Register one `case expr:` label's block in the current switch frame.
+    /// No body is lowered here; `lower_labeled_stmt` lowers the run's shared
+    /// body once after all labels are registered.
+    pub(super) fn lower_case_label(&mut self, expr: &Expr, span: Span) {
         let case_val = self.eval_case_constant(expr);
         let label = self.fresh_label();
         // C11 6.8.4.2p3: no two case constants of one switch may have the
@@ -455,16 +495,11 @@ impl Lowerer {
         // Fallthrough from previous case
         self.terminate(Terminator::Branch(label));
         self.start_block(label);
-        self.lower_stmt(stmt);
     }
 
-    pub(super) fn lower_case_range_stmt(
-        &mut self,
-        low_expr: &Expr,
-        high_expr: &Expr,
-        stmt: &Stmt,
-        span: Span,
-    ) {
+    /// Register one GNU `case low ... high:` label's block (see
+    /// `lower_case_label`).
+    pub(super) fn lower_case_range_label(&mut self, low_expr: &Expr, high_expr: &Expr, span: Span) {
         let low_val = self.eval_case_constant(low_expr);
         let high_val = self.eval_case_constant(high_expr);
         let label = self.fresh_label();
@@ -490,10 +525,10 @@ impl Lowerer {
         }
         self.terminate(Terminator::Branch(label));
         self.start_block(label);
-        self.lower_stmt(stmt);
     }
 
-    pub(super) fn lower_default_stmt(&mut self, stmt: &Stmt, span: Span) {
+    /// Register the `default:` label's block (see `lower_case_label`).
+    pub(super) fn lower_default_label(&mut self, span: Span) {
         let label = self.fresh_label();
         // C11 6.8.4.2p3: at most one default label per switch.  The second
         // one used to replace the first without a word.
@@ -510,6 +545,5 @@ impl Lowerer {
         }
         self.terminate(Terminator::Branch(label));
         self.start_block(label);
-        self.lower_stmt(stmt);
     }
 }

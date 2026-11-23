@@ -34,7 +34,7 @@ use crate::common::types::{
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, EnumVariant, Expr,
     ExprId, ExternalDecl, ForInit, FunctionDef, GenericAssociation, InitDeclarator, Initializer,
-    InitializerItem, ParamDecl, PostfixOp, SizeofArg, StaticAssert, Stmt, StructFieldDecl,
+    InitializerItem, Label, ParamDecl, PostfixOp, SizeofArg, StaticAssert, Stmt, StructFieldDecl,
     TranslationUnit, TypeSpecifier, UnaryOp,
 };
 use crate::frontend::sema::builtins;
@@ -370,6 +370,36 @@ pub struct SemanticAnalyzer {
     /// Names declared `weak` (attribute or `#pragma weak`): their address may
     /// be null, so the front end cannot fold it to true.
     weak_symbols: FxHashSet<String>,
+    /// Live depth of the `resolve_struct_or_union` -> `convert_struct_fields`
+    /// -> `field_ctype` -> `build_qualified_ctype` recursion (nested
+    /// struct/union member definitions).  The parser's record trampoline
+    /// makes arbitrary nesting PARSE in constant stack, but this resolution
+    /// cycle still recurses one Rust frame chain per level and overflows the
+    /// 64 MB worker stack at ~25k levels (measured: 20k compiles, 25k
+    /// overflows).  The guard degrades deeper record chains to ONE clean
+    /// `type nesting too deep` diagnostic: gcc.c-torture limits-structnest.c
+    /// needs 10,000 levels to compile, and 16,384 leaves >1.5x headroom
+    /// under the measured cliff, so neither the torture floor nor the crash
+    /// ceiling is touched.  Depth is counted per live nesting level and
+    /// unwound on every return path.
+    record_resolve_depth: Cell<u32>,
+    /// One-shot marker so the depth diagnostic is emitted exactly once.
+    record_depth_diagnosed: Cell<bool>,
+}
+
+/// Maximum nested record-definition resolution depth; see
+/// `SemanticAnalyzer::record_resolve_depth` for the calibration.
+const MAX_RECORD_RESOLVE_DEPTH: u32 = 16_384;
+
+/// RAII unwinder for `SemanticAnalyzer::record_resolve_depth`: the counter
+/// must decrement on every return path of `resolve_struct_or_union`, and
+/// this makes that structural instead of per-return bookkeeping.
+struct RecordDepthGuard<'a>(&'a Cell<u32>);
+
+impl Drop for RecordDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 /// Where an implicit conversion occurs, for GCC 16.2's verbatim
@@ -458,6 +488,8 @@ impl SemanticAnalyzer {
             address_of_operand: Cell::new(false),
             function_scope_floor: usize::MAX,
             weak_symbols: FxHashSet::default(),
+            record_resolve_depth: Cell::new(0),
+            record_depth_diagnosed: Cell::new(false),
         };
         analyzer
     }
@@ -3398,25 +3430,29 @@ impl SemanticAnalyzer {
                 self.analyze_substatement(body);
                 self.active_break_targets.pop();
             }
-            Stmt::Case(expr, body, _) => {
-                self.analyze_expr(expr);
-                self.analyze_stmt(body);
-            }
-            Stmt::CaseRange(low, high, body, _) => {
-                self.analyze_expr(low);
-                self.analyze_expr(high);
-                self.analyze_stmt(body);
-            }
-            Stmt::Default(body, _) => {
-                self.analyze_stmt(body);
-            }
-            Stmt::Label(name, body, _) => {
-                if body.labels_loop_or_switch() {
-                    self.pending_loop_labels.push(name.clone());
+            Stmt::Labeled(run, _) => {
+                // Binding rule for C2y named loops mirrors the previous
+                // nested-label semantics exactly: only `name:` labels that
+                // wrap the loop directly (the run's trailing names, after
+                // the last `case`/`default`) bind `break name`.
+                if run.body.labels_loop_or_switch() {
+                    for (name, _) in run.trailing_names() {
+                        self.pending_loop_labels.push(name.to_string());
+                    }
                 } else {
                     self.pending_loop_labels.clear();
                 }
-                self.analyze_stmt(body);
+                for label in &run.labels {
+                    match label {
+                        Label::Case(expr, _) => self.analyze_expr(expr),
+                        Label::CaseRange(low, high, _) => {
+                            self.analyze_expr(low);
+                            self.analyze_expr(high);
+                        }
+                        Label::Default(_) | Label::Name(..) => {}
+                    }
+                }
+                self.analyze_stmt(&run.body);
                 self.pending_loop_labels.clear();
             }
             Stmt::Declaration(decl) => {
@@ -5804,14 +5840,46 @@ impl SemanticAnalyzer {
     }
 
     fn member_base_ctype(&self, base_expr: &Expr, is_pointer: bool) -> Option<CType> {
-        let base_ctype = self.expr_checker().infer_expr_ctype(base_expr)?;
-        if !is_pointer {
-            return Some(base_ctype);
+        let mut base_ctype = self.expr_checker().infer_expr_ctype(base_expr)?;
+        if is_pointer {
+            match base_ctype {
+                CType::Pointer(inner, _) | CType::Array(inner, _) => base_ctype = *inner,
+                _ => return None,
+            }
         }
-        match base_ctype {
-            CType::Pointer(inner, _) | CType::Array(inner, _) => Some(*inner),
-            _ => None,
+        // `->` DEREFERENCES its operand (C11 6.5.2.3p4), so the struct/union
+        // behind `(*pp)->a` or `pp[0]->a` sits one pointer level down and
+        // `infer_expr_ctype` reports the pointer type for those bases.  That
+        // used to lose the record: `(*pp)->a` was not recognised as a
+        // bit-field (its read-only diagnostic then had the wrong severity) and
+        // every `member_constness` query through such a base answered "not
+        // const" (a missing diagnostic).
+        //
+        // The walk is deliberately limited to `is_pointer`, i.e. to the `->`
+        // form.  This helper ALSO answers "what is the base type of `x`?" for
+        // callers that are not member accesses at all -- the ext-vector
+        // element checks pass `is_pointer = false` and expect the operand's
+        // own type.  Walking there would reinterpret an ext-vector object as
+        // its LANE type and turn legal `&v[i]` / `v[i]` on a GNU `vector_size`
+        // vector into "address of vector element requested" errors.  Arrays
+        // are unwrapped because `->` reaches a pointer through array decay.
+        let mut guard = 0u32;
+        while is_pointer
+            && let Some(pointee) = match &base_ctype {
+                CType::Pointer(inner, _) => Some((**inner).clone()),
+                CType::Array(inner, _) => Some((**inner).clone()),
+                _ => None,
+            }
+        {
+            // Bound the walk: this is a diagnostic helper, and a deeply
+            // nested pointer chain is free to stay a pointer for our purposes.
+            guard += 1;
+            if guard > 8 {
+                break;
+            }
+            base_ctype = pointee;
         }
+        Some(base_ctype)
     }
 
     /// The ext vector and selector of `expr` when it is an ext-vector
@@ -8994,6 +9062,22 @@ dereference it before applying '->' to it?"
             && content.is_char_boundary(start)
             && content.is_char_boundary(end)
         {
+            // The span of `(*pp)->a` starts at the `*`: the opening paren of
+            // an EXPLICIT dereference is not part of any token the walk
+            // covered, so the fragment would read `*pp)->a`.  Check the
+            // character before the fragment (only whitespace is ever between
+            // a delimiter and the operand) and pull the paren in when the
+            // token it belongs to is inside the fragment.
+            let mut start = start;
+            if content.as_bytes().get(start) == Some(&b'*') {
+                let mut back = start;
+                while back > 0 && content.as_bytes()[back - 1].is_ascii_whitespace() {
+                    back -= 1;
+                }
+                if back > 0 && content.as_bytes()[back - 1] == b'(' {
+                    start = back - 1;
+                }
+            }
             let text = &content[start..end];
             if !text.is_empty() && !text.contains('\n') {
                 return text.to_string();
@@ -9586,6 +9670,18 @@ dereference it before applying '->' to it?"
     /// field name. A non-literal offset falls back to source (GCC prints
     /// an internal scaled form there — a documented divergence).
     fn readonly_location_text(&self, target: &Expr) -> String {
+        let text = self.readonly_location_text_inner(target);
+        // A location MUST read as a well-formed expression: the message is
+        // pinned by tests and consumed by humans, and an unbalanced fragment
+        // (`(*pp)->a` losing its opening paren because the member-access span
+        // starts at the `*`) is a defect however GCC happens to spell the
+        // same case.  Every branch of the renderer returns either source text
+        // or a constructed spelling; balance the parens as the last step so
+        // no individual branch can regress this.
+        Self::balance_delimiters(text)
+    }
+
+    fn readonly_location_text_inner(&self, target: &Expr) -> String {
         let tc = self.expr_type_checker();
         let mut stars = 0usize;
         let mut offset_bytes: i128 = 0;
@@ -9758,6 +9854,70 @@ dereference it before applying '->' to it?"
             return format!("{}({} + {})", "*".repeat(stars), source(cur), offset_bytes);
         }
         self.expr_source_text(target)
+    }
+
+    /// Close any `(`/`[` a source fragment left open, in reverse order of
+    /// appearance, so a location renders as a complete expression.
+    ///
+    /// `expr_source_text` reconstructs a fragment from token spans, and the
+    /// span of `(*pp)->a` starts at `*` -- the opening paren of an explicit
+    /// dereference is not part of any token span.  The fragment then reads
+    /// `*pp)->a`, which no compiler would print.  Balancing is mechanical and
+    /// total: it counts delimiters outside character literals and closes what
+    /// is outstanding.  Fragments that are already balanced (the overwhelming
+    /// majority) are returned unchanged, so no measured spelling moves.
+    fn balance_delimiters(text: String) -> String {
+        let mut depth: Vec<u8> = Vec::new();
+        let mut in_char_literal = false;
+        let mut escaped = false;
+        for b in text.bytes() {
+            if in_char_literal {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'\'' {
+                    in_char_literal = false;
+                }
+                continue;
+            }
+            match b {
+                b'\'' => in_char_literal = true,
+                b'(' => depth.push(b')'),
+                b'[' => depth.push(b']'),
+                b')' | b']' => {
+                    if depth.last() == Some(&b) {
+                        depth.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth.is_empty() {
+            return text;
+        }
+        let mut out = text;
+        for close in depth.iter().rev() {
+            out.push(*close as char);
+        }
+        out
+    }
+
+    /// For a member selection (`x.f`, `p->f`), whether the read-only-ness
+    /// comes from the OBJECT the selection is made through (true) or from the
+    /// member's own qualifiers (false).  `None` for anything that is not a
+    /// member selection.
+    ///
+    /// This is the single discriminator GCC's wording and severity both turn
+    /// on: `assignment of member 'f' in read-only object` (error) versus
+    /// `assignment of read-only member 'f'` (error, except a bit-field, which
+    /// only warns -- see `is_bitfield_member_target`).
+    fn selection_is_in_readonly_object(&self, target: &Expr) -> Option<bool> {
+        match target {
+            Expr::MemberAccess(base, _, _) => Some(self.lvalue_readonly_qualpath(base)),
+            Expr::PointerMemberAccess(base, _, _) => Some(self.pointee_readonly(base)),
+            _ => None,
+        }
     }
 
     fn member_constness(&self, base: &Expr, field: &str, indirect: bool) -> (bool, bool) {
@@ -9973,6 +10133,59 @@ dereference it before applying '->' to it?"
     /// read-only elements); a dot access recurses into the object; an
     /// arrow access consults the pointee.
     fn lvalue_readonly(&self, target: &Expr) -> bool {
+        self.lvalue_readonly_qualpath(target)
+            || self
+                .expr_type_checker()
+                .infer_expr_ctype(target)
+                .is_some_and(|ty| self.type_structural_readonly(&ty))
+    }
+
+    /// C11 6.3.2.1p3 structural modifiability rule: an lvalue of struct or
+    /// union type is NOT modifiable when any member is const-qualified,
+    /// recursively through contained aggregates and unions (GCC 16.2
+    /// wording: `assignment of read-only member 'n'`).  Array members
+    /// unwrap to their element type (measured: `struct { const int a[2]; }`
+    /// is non-modifiable as an assignment target); pointers stop the walk
+    /// (`const int *p` as a member is a writable pointer object).  The walk
+    /// is ITERATIVE with a visited set: record chains reach 10k levels and
+    /// shared layouts must not re-trigger exponential walks.
+    fn type_structural_readonly(&self, ty: &crate::common::types::CType) -> bool {
+        use crate::common::types::CType as T;
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let mut work: Vec<&crate::common::types::CType> = vec![ty];
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        while let Some(cur) = work.pop() {
+            match cur {
+                T::Array(inner, _) => work.push(inner),
+                T::Struct(key) | T::Union(key) => {
+                    if !seen.insert(key.as_ref()) {
+                        continue;
+                    }
+                    let Some(layout) = layouts.get(key.as_ref()) else {
+                        continue;
+                    };
+                    for f in &layout.fields {
+                        if f.object_const {
+                            return true;
+                        }
+                        if matches!(f.ty, T::Array(..) | T::Struct(..) | T::Union(..)) {
+                            work.push(&f.ty);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Qualification-path readonly (the pre-existing rule): const flowing
+    /// along the access path from the declared object or pointee.  This is
+    /// what distinguishes GCC 16.2's wordings -- `wu.n = w` where the const
+    /// sits INSIDE `n`'s own type says `assignment of read-only member 'n'`
+    /// (base `wu` is not qualification-readonly), while `const struct s5 *p;
+    /// p->n = w` says `assignment of member 'n' in read-only object`.
+    fn lvalue_readonly_qualpath(&self, target: &Expr) -> bool {
         let tc = self.expr_type_checker();
         match target {
             Expr::Identifier(name, _) => self.symbol_table.is_top_const(name),
@@ -9984,20 +10197,20 @@ dereference it before applying '->' to it?"
                     base
                 };
                 if matches!(tc.infer_expr_ctype(base), Some(CType::Array(..))) {
-                    self.lvalue_readonly(base)
+                    self.lvalue_readonly_qualpath(base)
                 } else {
                     self.pointee_readonly(base)
                 }
             }
             Expr::MemberAccess(base, field, _) => {
-                self.lvalue_readonly(base) || self.member_constness(base, field, false).1
+                self.lvalue_readonly_qualpath(base) || self.member_constness(base, field, false).1
             }
             Expr::PointerMemberAccess(base, field, _) => {
                 self.pointee_readonly(base) || self.member_constness(base, field, true).1
             }
             Expr::GenericSelection(controlling, associations, _) => tc
                 .generic_selection_index(controlling, associations)
-                .is_some_and(|i| self.lvalue_readonly(&associations[i].expr)),
+                .is_some_and(|i| self.lvalue_readonly_qualpath(&associations[i].expr)),
             _ => false,
         }
     }
@@ -10023,15 +10236,88 @@ dereference it before applying '->' to it?"
         is_array
     }
 
+    /// Is `target` the selection of a BIT-FIELD member (through `.`, `->`, or
+    /// a statement-expression/parenthesized wrapper around either)?
+    ///
+    /// GCC 16.2 demotes the const-bitfield violation to a WARNING ("assignment
+    /// of read-only location 'v.f'", measured: `-Werror` is what makes it an
+    /// error, so it carries a `[-Werror]` tag rather than a warning option,
+    /// and plain `-std=c11 -pedantic-errors` still only warns) while a
+    /// const-qualified OBJECT of the same record is a hard constraint
+    /// violation.  This predicate is what splits those two contracts.
+    fn is_bitfield_member_target(&self, target: &Expr) -> bool {
+        let (base, field, indirect) = match target {
+            Expr::MemberAccess(base, field, _) => (Some(base), field.as_str(), false),
+            Expr::PointerMemberAccess(base, field, _) => (Some(base), field.as_str(), true),
+            _ => (None, "", false),
+        };
+        let Some(base) = base else {
+            return false;
+        };
+        let Some(CType::Struct(key) | CType::Union(key)) = self.member_base_ctype(base, indirect)
+        else {
+            return false;
+        };
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        layouts
+            .get(key.as_ref())
+            .and_then(|layout| layout.field_offset_with_bitfield(field, &*layouts))
+            .is_some_and(|(_, _, _, bit_width)| bit_width.is_some())
+    }
+
     /// Emit GCC 16.2's read-only diagnostic for a mutation whose operand
     /// fails [`Self::lvalue_readonly`]. `verb` is the measured GCC word:
     /// `assignment` for `=`/`op=`, `increment` for pre/postfix `++`, and
     /// `decrement` for `--`, each pairing with one of the three operand
     /// classes (variable / location / member in read-only object).
+    ///
+    /// Constness is a property of an LVALUE, so the not-an-lvalue verdict
+    /// that [`Self::check_lvalue_operand`] already emitted (`f() = x`,
+    /// `(a, b) = x`, `(c ? v : w) = x`) suppresses this second, nonsensical
+    /// diagnostic: `assignment of read-only location 'f()'` named a value
+    /// that can never be assigned at all, and GCC reports only the first.
+    ///
+    /// Severity is part of the contract, not an afterthought: a general
+    /// const-lvalue violation is a constraint violation (error), but GCC only
+    /// WARNS for a const bit-field, and the operand-class wordings differ
+    /// too (`read-only location 'v.f'`, never `read-only member 'f'`).
     fn check_readonly_mutation(&self, target: &Expr, op_span: Span, verb: &str) {
-        if !self.lvalue_readonly(target) {
+        if self.is_known_rvalue(target, false) || !self.lvalue_readonly(target) {
             return;
         }
+        // A read-only BIT-FIELD is the one case GCC only WARNS about, and the
+        // discriminator is WHOSE const makes the lvalue read-only -- exactly
+        // the one the wording below already uses.  Measured on GCC 16.2.0
+        // over a 14-case matrix (field-level const, object-level const,
+        // arrays of const, anonymous/nested aggregates, unions, `->` and `.`,
+        // local objects, pointer members):
+        //
+        // * the const is on the bit-field's own type (`struct S { const int
+        //   a : 3; }; s->a = 1`) -- C11 6.3.2.1p3, and GCC warns at default,
+        //   `-Wall`, `-Wextra -pedantic` and `-std=c11 -pedantic-errors`;
+        //   only `-Werror` promotes it.  Wording is the location class:
+        //   `read-only location 's->a'`, never `read-only member 'a'`.
+        // * the OBJECT is const-qualified (`const struct S *s; s->a = 1`) --
+        //   a constraint violation, and GCC errors with `assignment of member
+        //   'a' in read-only object`, bit-field or not.
+        //
+        // `selection_is_in_readonly_object` is the shared discriminator, so
+        // severity and wording cannot drift apart.
+        if self.is_bitfield_member_target(target)
+            && self.selection_is_in_readonly_object(target) == Some(false)
+        {
+            let message = format!(
+                "{verb} of read-only location '{}'",
+                self.readonly_location_text(target)
+            );
+            self.diagnostics.borrow_mut().warning(message, op_span);
+            return;
+        }
+        // The message is rendered BEFORE the engine is borrowed mutably:
+        // `readonly_location_text` re-enters `self.diagnostics.borrow()` for
+        // the source manager, and evaluating it inside the `error` argument
+        // list would panic on an already-mutably-borrowed RefCell (the
+        // invariant every other diagnostic site follows).
         let message = match target {
             // GCC 16.2 says `parameter` for a function parameter and
             // `variable` for everything else (measured).
@@ -10039,15 +10325,8 @@ dereference it before applying '->' to it?"
                 format!("{verb} of read-only parameter '{name}'")
             }
             Expr::Identifier(name, _) => format!("{verb} of read-only variable '{name}'"),
-            Expr::MemberAccess(base, field, _) => {
-                if self.lvalue_readonly(base) {
-                    format!("{verb} of member '{field}' in read-only object")
-                } else {
-                    format!("{verb} of read-only member '{field}'")
-                }
-            }
-            Expr::PointerMemberAccess(base, field, _) => {
-                if self.pointee_readonly(base) {
+            Expr::MemberAccess(_, field, _) | Expr::PointerMemberAccess(_, field, _) => {
+                if self.selection_is_in_readonly_object(target) == Some(true) {
                     format!("{verb} of member '{field}' in read-only object")
                 } else {
                     format!("{verb} of read-only member '{field}'")
@@ -10994,6 +11273,27 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         struct_aligned: Option<usize>,
         reverse_sso: bool,
     ) -> CType {
+        // Depth-guarded: nested member definitions recurse through
+        // `convert_struct_fields` -> `field_ctype` -> back here, so a record
+        // chain deeper than `MAX_RECORD_RESOLVE_DEPTH` degrades to a single
+        // clean diagnostic (and a `Void` placeholder field type) instead of
+        // overflowing the worker stack.
+        let depth = self.record_resolve_depth.get();
+        if depth >= MAX_RECORD_RESOLVE_DEPTH {
+            if !self.record_depth_diagnosed.get() {
+                self.record_depth_diagnosed.set(true);
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "type nesting too deep (exceeds {} levels)",
+                        MAX_RECORD_RESOLVE_DEPTH
+                    ),
+                    span,
+                );
+            }
+            return CType::Void;
+        }
+        self.record_resolve_depth.set(depth + 1);
+        let _depth_guard = RecordDepthGuard(&self.record_resolve_depth);
         let prefix = if is_union { "union" } else { "struct" };
         let struct_fields = fields
             .as_ref()

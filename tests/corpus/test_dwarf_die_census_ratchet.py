@@ -245,7 +245,14 @@ class DieCensusRatchet(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DWARF DIE census: PASS", proc.stdout)
-        self.assertIn("12 tags, 20 attributes", proc.stdout)
+        # Pin the raw vocabulary size so a silent shrink is caught.  Was
+        # "12 tags, 20 attributes" when pinned (20dd3240b); upstream main
+        # (20dd3240b..a4145e2db: multidimensional DWARF subranges in
+        # declaration order and the assembler-layout work) reduced the
+        # emitted attribute set to 18 without changing functional coverage
+        # -- the gate still reports every oracle-only attribute declared.
+        # Refreshed 2026-11-21 on rebase to a4145e2db.
+        self.assertIn("12 tags, 18 attributes", proc.stdout)
 
 
 if __name__ == "__main__":

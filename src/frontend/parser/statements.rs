@@ -404,29 +404,7 @@ impl Parser {
                     sw_stmt
                 }
             }
-            TokenKind::Case => {
-                let span = self.peek_span();
-                self.advance();
-                let expr = self.parse_expr();
-                if self.consume_if(&TokenKind::Ellipsis) {
-                    // GNU case range extension: case low ... high:
-                    let high = self.parse_expr();
-                    self.expect_context(&TokenKind::Colon, "after 'case' expression");
-                    let stmt = self.parse_label_body();
-                    Stmt::CaseRange(expr, high, Box::new(stmt), span)
-                } else {
-                    self.expect_context(&TokenKind::Colon, "after 'case' expression");
-                    let stmt = self.parse_label_body();
-                    Stmt::Case(expr, Box::new(stmt), span)
-                }
-            }
-            TokenKind::Default => {
-                let span = self.peek_span();
-                self.advance();
-                self.expect_context(&TokenKind::Colon, "after 'default'");
-                let stmt = self.parse_label_body();
-                Stmt::Default(Box::new(stmt), span)
-            }
+            TokenKind::Case | TokenKind::Default => self.parse_label_run(),
             TokenKind::Goto => {
                 let span = self.peek_span();
                 self.advance();
@@ -448,21 +426,12 @@ impl Parser {
                     Stmt::Goto(label, span)
                 }
             }
-            TokenKind::Identifier(name) => {
+            TokenKind::Identifier(_) => {
                 // Check for label (identifier followed by colon)
-                let name_clone = name.clone();
-                let span = self.peek_span();
                 if self.pos + 1 < self.tokens.len()
                     && matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon)
                 {
-                    self.advance(); // identifier
-                    self.advance(); // colon
-                    // Skip optional label attributes: `label: __attribute__((unused));`
-                    // In GNU C, labels can have attributes (e.g., unused, hot, cold).
-                    // We consume and discard them since they only affect diagnostics.
-                    self.skip_label_attributes();
-                    let stmt = self.parse_label_body();
-                    Stmt::Label(name_clone, Box::new(stmt), span)
+                    self.parse_label_run()
                 } else {
                     let expr = self.parse_expr();
                     self.expect_after(&TokenKind::Semicolon, "after expression");
@@ -480,6 +449,66 @@ impl Parser {
                 Stmt::Expr(Some(expr))
             }
         }
+    }
+
+    /// Parse a run of labels (`case`, GNU `case low ... high:`, `default`,
+    /// `name:`) applied to one body statement, as ONE [`Stmt::Labeled`] node.
+    ///
+    /// Consecutive labels used to parse as nested `Stmt::Case(Box::Stmt)`
+    /// chains, one AST node (and one recursive walk / Drop / Clone frame) per
+    /// label: `gcc.c-torture/compile/limits-caselabels.c` (100,000 case
+    /// labels) overflowed the stack in every consumer. Collecting the run
+    /// here keeps the AST — and therefore every walk — flat.
+    fn parse_label_run(&mut self) -> Stmt {
+        let first_span = self.peek_span();
+        let mut labels = Vec::new();
+        loop {
+            match self.peek() {
+                TokenKind::Case => {
+                    let span = self.peek_span();
+                    self.advance();
+                    let expr = self.parse_expr();
+                    if self.consume_if(&TokenKind::Ellipsis) {
+                        // GNU case range extension: case low ... high:
+                        let high = self.parse_expr();
+                        self.expect_context(&TokenKind::Colon, "after 'case' expression");
+                        labels.push(Label::CaseRange(expr, high, span));
+                    } else {
+                        self.expect_context(&TokenKind::Colon, "after 'case' expression");
+                        labels.push(Label::Case(expr, span));
+                    }
+                }
+                TokenKind::Default => {
+                    let span = self.peek_span();
+                    self.advance();
+                    self.expect_context(&TokenKind::Colon, "after 'default'");
+                    labels.push(Label::Default(span));
+                }
+                TokenKind::Identifier(name)
+                    if self.pos + 1 < self.tokens.len()
+                        && matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon) =>
+                {
+                    let span = self.peek_span();
+                    let name = name.clone();
+                    self.advance(); // identifier
+                    self.advance(); // colon
+                    // Skip optional label attributes: `label: __attribute__((unused));`
+                    // In GNU C, labels can have attributes (e.g., unused, hot, cold).
+                    // We consume and discard them since they only affect diagnostics.
+                    self.skip_label_attributes();
+                    labels.push(Label::Name(name, span));
+                }
+                _ => break,
+            }
+        }
+        let body = self.parse_label_body();
+        Stmt::Labeled(
+            LabelRun {
+                labels,
+                body: Box::new(body),
+            },
+            first_span,
+        )
     }
 
     /// Parse the statement that a label (`case`, `default`, or `name:`)

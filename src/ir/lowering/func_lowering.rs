@@ -16,7 +16,7 @@ use super::lower::Lowerer;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::{AddressSpace, CType, IrType};
 use crate::frontend::parser::ast::{
-    BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, ParamDecl, Stmt, TypeSpecifier,
+    BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, Label, ParamDecl, Stmt, TypeSpecifier,
 };
 use crate::ir::reexports::{
     Instruction, IrBinOp, IrConst, IrFunction, IrParam, Operand, Terminator, Value,
@@ -1567,10 +1567,14 @@ impl Lowerer {
 
     fn prescan_stmt(stmt: &Stmt, depth: usize, result: &mut FxHashMap<String, usize>) {
         match stmt {
-            Stmt::Label(name, inner_stmt, _) => {
-                // Record the label at the current scope depth.
-                result.insert(name.clone(), depth);
-                Self::prescan_stmt(inner_stmt, depth, result);
+            Stmt::Labeled(run, _) => {
+                // Record the name labels at the current scope depth.
+                for label in &run.labels {
+                    if let Label::Name(name, _) = label {
+                        result.insert(name.clone(), depth);
+                    }
+                }
+                Self::prescan_stmt(&run.body, depth, result);
             }
             Stmt::Compound(compound) => {
                 Self::prescan_compound_stmt(compound, depth, result);
@@ -1595,9 +1599,6 @@ impl Lowerer {
             }
             Stmt::Switch(_, body, _) => {
                 Self::prescan_stmt(body, depth, result);
-            }
-            Stmt::Case(_, inner, _) | Stmt::CaseRange(_, _, inner, _) | Stmt::Default(inner, _) => {
-                Self::prescan_stmt(inner, depth, result);
             }
             // Leaf statements: no labels inside
             Stmt::Expr(_)

@@ -1848,10 +1848,7 @@ impl Stmt {
     pub fn value_expr(&self) -> Option<&Expr> {
         match self {
             Stmt::Expr(Some(expr)) => Some(expr),
-            Stmt::Label(_, inner, _)
-            | Stmt::Case(_, inner, _)
-            | Stmt::CaseRange(_, _, inner, _)
-            | Stmt::Default(inner, _) => inner.value_expr(),
+            Stmt::Labeled(run, _) => run.body.value_expr(),
             _ => None,
         }
     }
@@ -1885,6 +1882,71 @@ pub enum BlockItem {
     StaticAssert(StaticAssert),
 }
 
+/// One label of a labeled statement.
+///
+/// `case`, GNU `case low ... high:`, `default` and `name:` all bind to the
+/// same body statement, so a run of them is one [`LabelRun`] instead of a
+/// chain of nested [`Stmt`]s.
+#[derive(Debug, Clone)]
+pub enum Label {
+    /// `case expr:`
+    Case(Expr, Span),
+    /// GNU case range: `case low ... high:` (GCC extension)
+    CaseRange(Expr, Expr, Span),
+    /// `default:`
+    Default(Span),
+    /// `name:` (GNU label attributes are consumed by the parser)
+    Name(String, Span),
+}
+
+impl Label {
+    /// The source span of the label itself.
+    pub fn span(&self) -> Span {
+        match self {
+            Label::Case(_, span)
+            | Label::CaseRange(_, _, span)
+            | Label::Default(span)
+            | Label::Name(_, span) => *span,
+        }
+    }
+}
+
+/// A run of labels applied to one body statement.
+///
+/// The parser flattens consecutive labels into this single node:
+/// `case 0: case 1: ... break;` is one [`Stmt::Labeled`] with a `Vec` of
+/// labels, NOT a 100,000-deep `Box<Stmt>` chain. The chain shape overflowed
+/// the stack in every derived recursive walk (Drop, Clone, sema, lowering)
+/// on `gcc.c-torture/compile/limits-caselabels.c`; the flat shape keeps every
+/// consumer iterative over the label list. All labels of a run bind to the
+/// one body statement.
+#[derive(Debug, Clone)]
+pub struct LabelRun {
+    pub labels: Vec<Label>,
+    pub body: Box<Stmt>,
+}
+
+impl LabelRun {
+    /// The trailing `name:` labels of this run: those after the last `case`,
+    /// GNU case range or `default` label. C2y named loops bind `break name` /
+    /// `continue name` only to labels that wrap the loop directly, and a
+    /// `case` between a name and the loop severs that binding (measured
+    /// against the previous nested-label semantics and preserved here).
+    pub fn trailing_names(&self) -> impl Iterator<Item = (&str, Span)> {
+        let first_non_name = self
+            .labels
+            .iter()
+            .rposition(|l| !matches!(l, Label::Name(..)));
+        self.labels
+            .iter()
+            .skip(first_non_name.map_or(0, |i| i + 1))
+            .filter_map(|l| match l {
+                Label::Name(name, span) => Some((name.as_str(), *span)),
+                _ => None,
+            })
+    }
+}
+
 /// Statements.
 #[derive(Debug, Clone)]
 pub enum Stmt {
@@ -1904,14 +1966,13 @@ pub enum Stmt {
     Break(Option<String>, Span),
     Continue(Option<String>, Span),
     Switch(Expr, Box<Stmt>, Span),
-    Case(Expr, Box<Stmt>, Span),
-    /// GNU case range: `case low ... high:` (GCC extension)
-    CaseRange(Expr, Expr, Box<Stmt>, Span),
-    Default(Box<Stmt>, Span),
+    /// A run of `case` / GNU case range / `default` / `name:` labels applied
+    /// to one body statement (see [`LabelRun`]). The span is the first
+    /// label's.
+    Labeled(LabelRun, Span),
     Goto(String, Span),
     /// Computed goto: goto *expr (GCC extension, labels-as-values)
     GotoIndirect(Box<Expr>, Span),
-    Label(String, Box<Stmt>, Span),
     /// A declaration in statement position (C23: declarations allowed after labels,
     /// and in other statement contexts like `case`/`default`).
     Declaration(Declaration),
@@ -1938,11 +1999,18 @@ impl Stmt {
             Stmt::If(cond, ..)
             | Stmt::While(cond, ..)
             | Stmt::DoWhile(_, cond, _)
-            | Stmt::Switch(cond, ..)
-            | Stmt::Case(cond, ..) => f(cond),
-            Stmt::CaseRange(lo, hi, ..) => {
-                f(lo);
-                f(hi);
+            | Stmt::Switch(cond, ..) => f(cond),
+            Stmt::Labeled(run, _) => {
+                for label in &run.labels {
+                    match label {
+                        Label::Case(cond, ..) => f(cond),
+                        Label::CaseRange(lo, hi, ..) => {
+                            f(lo);
+                            f(hi);
+                        }
+                        Label::Default(..) | Label::Name(..) => {}
+                    }
+                }
             }
             Stmt::For(init, cond, inc, ..) => {
                 if let Some(init) = init {
@@ -1961,9 +2029,7 @@ impl Stmt {
             | Stmt::Compound(_)
             | Stmt::Break(..)
             | Stmt::Continue(..)
-            | Stmt::Default(..)
             | Stmt::Goto(..)
-            | Stmt::Label(..)
             | Stmt::Declaration(_) => {}
         }
     }
@@ -1973,7 +2039,7 @@ impl Stmt {
     pub fn labels_loop_or_switch(&self) -> bool {
         match self {
             Stmt::While(..) | Stmt::DoWhile(..) | Stmt::For(..) | Stmt::Switch(..) => true,
-            Stmt::Label(_, inner, _) => inner.labels_loop_or_switch(),
+            Stmt::Labeled(run, _) => run.body.labels_loop_or_switch(),
             Stmt::Compound(c) if c.is_synthetic_init_scope => c.items.last().is_some_and(
                 |it| matches!(it, BlockItem::Statement(s) if s.labels_loop_or_switch()),
             ),
@@ -1993,12 +2059,9 @@ impl Stmt {
             | Stmt::Break(_, span)
             | Stmt::Continue(_, span)
             | Stmt::Switch(_, _, span)
-            | Stmt::Case(_, _, span)
-            | Stmt::CaseRange(_, _, _, span)
-            | Stmt::Default(_, span)
+            | Stmt::Labeled(_, span)
             | Stmt::Goto(_, span)
-            | Stmt::GotoIndirect(_, span)
-            | Stmt::Label(_, _, span) => Some(*span),
+            | Stmt::GotoIndirect(_, span) => Some(*span),
             Stmt::Expr(Some(expr)) => Some(expr.span()),
             Stmt::Declaration(decl) => Some(decl.span),
             Stmt::InlineAsm { span, .. } => Some(*span),

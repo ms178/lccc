@@ -2141,30 +2141,23 @@ fn build_successor_lists(
     num_blocks: usize,
     block_id_to_idx: &FxHashMap<u32, usize>,
 ) -> Vec<Vec<usize>> {
-    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
-    for (idx, block) in func.blocks.iter().enumerate() {
+    // O(1) per edge: `push_unique` scanned the edge list it was building, so
+    // a block with N successors cost O(N^2) -- and a wide `switch` makes one
+    // block the successor of everything.  `SuccSet` is the shared primitive
+    // the other three CFG builders use for the same reason.
+    crate::common::succ_set::build_edges(num_blocks, block_id_to_idx, |idx, add| {
+        let block = &func.blocks[idx];
         for_each_terminator_target(&block.terminator, |target_id| {
-            if let Some(&target_idx) = block_id_to_idx.get(&target_id) {
-                push_unique(&mut successors[idx], target_idx);
-            }
+            add(target_id);
         });
         for inst in &block.instructions {
             if let Instruction::InlineAsm { goto_labels, .. } = inst {
                 for (_, label) in goto_labels {
-                    if let Some(&target_idx) = block_id_to_idx.get(&label.0) {
-                        push_unique(&mut successors[idx], target_idx);
-                    }
+                    add(label.0);
                 }
             }
         }
-    }
-    successors
-}
-
-fn push_unique(vec: &mut Vec<usize>, x: usize) {
-    if !vec.contains(&x) {
-        vec.push(x);
-    }
+    })
 }
 
 fn invert_cfg(successors: &[Vec<usize>], num_blocks: usize) -> Vec<Vec<usize>> {

@@ -32,7 +32,7 @@ use super::lower::Lowerer;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::frontend::parser::ast::{
-    BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, Initializer, SizeofArg, Stmt,
+    BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, Initializer, Label, SizeofArg, Stmt,
     TypeSpecifier,
 };
 use crate::ir::reexports::{
@@ -252,17 +252,28 @@ impl Lowerer {
                 self.capture_expr(c, visible, scopes, result);
                 self.capture_stmt(b, visible, enclosing_labels, scopes, local_labels, result);
             }
-            Stmt::Case(c, b, _) => {
-                self.capture_expr(c, visible, scopes, result);
-                self.capture_stmt(b, visible, enclosing_labels, scopes, local_labels, result);
-            }
-            Stmt::CaseRange(l, h, b, _) => {
-                self.capture_expr(l, visible, scopes, result);
-                self.capture_expr(h, visible, scopes, result);
-                self.capture_stmt(b, visible, enclosing_labels, scopes, local_labels, result);
-            }
-            Stmt::Default(b, _) => {
-                self.capture_stmt(b, visible, enclosing_labels, scopes, local_labels, result);
+            Stmt::Labeled(run, _) => {
+                for label in &run.labels {
+                    match label {
+                        Label::Case(c, _) => self.capture_expr(c, visible, scopes, result),
+                        Label::CaseRange(l, h, _) => {
+                            self.capture_expr(l, visible, scopes, result);
+                            self.capture_expr(h, visible, scopes, result);
+                        }
+                        Label::Name(name, _) => {
+                            local_labels.insert(name.clone());
+                        }
+                        Label::Default(_) => {}
+                    }
+                }
+                self.capture_stmt(
+                    &run.body,
+                    visible,
+                    enclosing_labels,
+                    scopes,
+                    local_labels,
+                    result,
+                );
             }
             Stmt::Goto(label, _) => {
                 // Non-local when the label is neither subtree-local nor
@@ -276,17 +287,6 @@ impl Lowerer {
             }
             Stmt::GotoIndirect(e, _) => {
                 self.capture_expr(e, visible, scopes, result);
-            }
-            Stmt::Label(name, inner, _) => {
-                local_labels.insert(name.clone());
-                self.capture_stmt(
-                    inner,
-                    visible,
-                    enclosing_labels,
-                    scopes,
-                    local_labels,
-                    result,
-                );
             }
             Stmt::Declaration(decl) => {
                 for d in &decl.declarators {
@@ -1254,9 +1254,13 @@ fn collect_labels_compound(compound: &CompoundStmt, set: &mut FxHashSet<String>)
 
 fn collect_labels_stmt(stmt: &Stmt, set: &mut FxHashSet<String>) {
     match stmt {
-        Stmt::Label(name, inner, _) => {
-            set.insert(name.clone());
-            collect_labels_stmt(inner, set);
+        Stmt::Labeled(run, _) => {
+            for label in &run.labels {
+                if let Label::Name(name, _) = label {
+                    set.insert(name.clone());
+                }
+            }
+            collect_labels_stmt(&run.body, set);
         }
         Stmt::Compound(c) => collect_labels_compound(c, set),
         Stmt::If(_, t, e, _) => {
@@ -1269,9 +1273,6 @@ fn collect_labels_stmt(stmt: &Stmt, set: &mut FxHashSet<String>) {
             collect_labels_stmt(b, set)
         }
         Stmt::For(_, _, _, b, _) => collect_labels_stmt(b, set),
-        Stmt::Case(_, b, _) | Stmt::CaseRange(_, _, b, _) | Stmt::Default(b, _) => {
-            collect_labels_stmt(b, set)
-        }
         Stmt::InlineAsm { goto_labels, .. } => {
             for l in goto_labels {
                 set.insert(l.clone());

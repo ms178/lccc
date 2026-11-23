@@ -52,7 +52,7 @@ use crate::common::error::DiagnosticEngine;
 use crate::common::fx_hash::FxHashSet;
 use crate::common::source::Span;
 use crate::frontend::parser::ast::{
-    BlockItem, CompoundStmt, Declaration, Expr, ForInit, FunctionDef, Stmt, TypeSpecifier,
+    BlockItem, CompoundStmt, Declaration, Expr, ForInit, FunctionDef, Label, Stmt, TypeSpecifier,
 };
 use std::cell::RefCell;
 
@@ -271,22 +271,22 @@ impl<'a, 'd> LabelChecker<'a, 'd> {
                 self.walk_expr(cond);
                 self.walk_stmt(body);
             }
-            Stmt::Case(e, body, _) => {
-                self.walk_expr(e);
-                self.walk_stmt(body);
+            Stmt::Labeled(run, _) => {
+                for label in &run.labels {
+                    match label {
+                        Label::Case(e, _) => self.walk_expr(e),
+                        Label::CaseRange(lo, hi, _) => {
+                            self.walk_expr(lo);
+                            self.walk_expr(hi);
+                        }
+                        Label::Name(name, span) => self.define(name.as_str(), *span),
+                        Label::Default(_) => {}
+                    }
+                }
+                self.walk_stmt(&run.body);
             }
-            Stmt::CaseRange(lo, hi, body, _) => {
-                self.walk_expr(lo);
-                self.walk_expr(hi);
-                self.walk_stmt(body);
-            }
-            Stmt::Default(body, _) => self.walk_stmt(body),
             Stmt::Goto(name, span) => self.reference(name.as_str(), *span),
             Stmt::GotoIndirect(e, _) => self.walk_expr(e),
-            Stmt::Label(name, body, span) => {
-                self.define(name.as_str(), *span);
-                self.walk_stmt(body);
-            }
             Stmt::Compound(c) => self.walk_compound(c),
             Stmt::Break(..) | Stmt::Continue(..) => {}
             Stmt::Declaration(decl) => self.walk_decl(decl),

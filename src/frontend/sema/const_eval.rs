@@ -1308,7 +1308,15 @@ impl<'a> SemaConstEval<'a> {
     }
 
     fn infer_expr_ctype(&self, expr: &Expr) -> Option<CType> {
-        self.type_checker().infer_expr_ctype(expr)
+        // Pre-computed type map first, AST-level inference second -- the same
+        // resolution order `operand_size_for_unary` documents.  Consulting the
+        // bottom-up walk's map is O(1) per node and turns the deep right-nested
+        // conditional fold (gcc.c-torture class `1 ? 1 ? ... : 2 : 2`) from
+        // quadratic to linear: each Conditional arm is a whole subtree whose
+        // type recomputation per nesting level was measured at 50.5 s for
+        // depth 8000 vs 2.7 s for depth 2000 (depth^2.1) before this lookup.
+        self.lookup_expr_type(expr)
+            .or_else(|| self.type_checker().infer_expr_ctype(expr))
     }
 
     /// Get the size in bytes for a CType.

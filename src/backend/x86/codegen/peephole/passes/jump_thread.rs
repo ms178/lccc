@@ -1068,19 +1068,10 @@ fn hoist_common_arm_heads_cached(
     infos: &mut [LineInfo],
     cache: &mut Option<LabelCounts>,
 ) -> bool {
-    let mut changed = false;
+    // Function windows, collected once: the text changes below never add or
+    // remove a `.cfi_startproc`/`.cfi_endproc`, so the spans stay valid.
+    let mut windows: Vec<(usize, usize)> = Vec::new();
     let mut start = None;
-    // `label_mention_counts` scans the WHOLE translation unit. Calling it
-    // once per candidate attempt made this pass O(F^2) in the number of
-    // functions (measured: 4,394,006 `find(".LBB")` calls for only 250
-    // straight-line functions). The assembly text changes ONLY when a
-    // rewrite succeeds, and `hoist_one_arm_head` is side-effect free on
-    // every `continue` path, so a count computed for one state stays exact
-    // for every subsequent failed attempt -- including the next function.
-    // Cache it across failures and invalidate on the first success; the
-    // values seen by each attempt are byte-for-byte what the old code
-    // computed, so the emitted assembly cannot change.
-    // `cache` is owned by the caller so both phase-8e passes share it.
     for i in 0..store.len() {
         if !infos[i].pinned && infos[i].kind == LineKind::Directive {
             let s = infos[i].trimmed(store.get(i));
@@ -1089,36 +1080,95 @@ fn hoist_common_arm_heads_cached(
             } else if s == ".cfi_endproc"
                 && let Some(lo) = start.take()
             {
-                loop {
-                    let (count, duplicate) = current_counts(store, infos, cache);
-                    if !hoist_one_arm_head(store, infos, lo, i, &count, &duplicate) {
-                        *cache = Some((count, duplicate));
-                        break;
-                    }
-                    changed = true;
-                    // Text changed: the cache stays empty, so the next
-                    // iteration recomputes against the new state.
-                }
+                windows.push((lo, i));
             }
         }
     }
+    if windows.is_empty() {
+        return false;
+    }
+    // `label_mention_counts` scans the WHOLE translation unit, so it is asked
+    // once per text state, never per attempt.  A window keeps its own resume
+    // cursor: every line before the cursor was examined against the counts in
+    // hand and had no reward, and a rewrite provably cannot re-enable one (its
+    // touched lines -- the window's single instruction, the `jcc`, and the
+    // now-nop `@label:` line -- are all outside the deleted-from-local shapes
+    // this pass matches, whose bodies are real instructions that survive).
+    // Work first goes to windows with a pending rewrite, so every rewrite is
+    // followed immediately by a rescan that uses the fresh counts; windows
+    // without progress are retired after ONE attempt against those counts,
+    // which is exactly the old per-window fixpoint.  The emitted assembly is
+    // therefore unchanged; only the number of whole-TU scans is.
+    let mut cursor: Vec<usize> = windows.iter().map(|&(lo, _)| lo).collect();
+    let mut pending: std::collections::VecDeque<usize> = (0..windows.len()).collect();
+    let mut queued: Vec<bool> = vec![true; windows.len()];
+    let mut counts: Option<LabelCounts> = cache.take();
+    let mut changed = false;
+    while let Some(wi) = pending.pop_front() {
+        queued[wi] = false;
+        let (lo, hi) = windows[wi];
+        let (count, duplicate) = match cache.take() {
+            Some(owned) => owned,
+            None => match counts.take() {
+                Some(owned) => owned,
+                None => current_counts(store, infos, cache),
+            },
+        };
+        match hoist_one_arm_head(store, infos, cursor[wi], lo, hi, &count, &duplicate) {
+            Some(resume_at) => {
+                changed = true;
+                cursor[wi] = resume_at;
+                // Text changed: these counts are stale, and this window must
+                // be re-examined before the queue can drain.
+                counts = None;
+                if !queued[wi] {
+                    queued[wi] = true;
+                    pending.push_front(wi);
+                }
+            }
+            None => {
+                // Text unchanged: the counts are exact for every remaining
+                // window, which now needs at most one attempt against them.
+                counts = Some((count, duplicate));
+            }
+        }
+    }
+    *cache = counts;
     changed
 }
 
+/// `from` is the first line that still needs examining.  Rewrites are
+/// independent (a successful hoist touches only lines of its own window and
+/// never re-enables a reward for a line before it), so the caller resumes the
+/// scan after the last successful rewrite instead of restarting at `lo`; on a
+/// wide `switch` that turned O(k x lines) into O(lines) for k rewrites.
 fn hoist_one_arm_head(
     store: &mut LineStore,
     infos: &mut [LineInfo],
+    from: usize,
     lo: usize,
     hi: usize,
     count: &FxHashMap<u32, u32>,
     duplicate: &FxHashSet<u32>,
-) -> bool {
+) -> Option<usize> {
     let mentions = |k: usize| {
         local_label(label_text(infos[k].trimmed(store.get(k))))
             .filter(|l| !duplicate.contains(l))
             .map(|l| count.get(&l).copied().unwrap_or(0))
     };
-    for j in lo..hi {
+    // Window label index: `local_label -> defining line`.  Built in O(L) once
+    // per attempt instead of per candidate (see the target-arm comment below).
+    let mut label_at: FxHashMap<u32, usize> =
+        FxHashMap::with_capacity_and_hasher((hi - lo) / 2 + 1, Default::default());
+    for k in lo..hi {
+        if infos[k].kind == LineKind::Label
+            && !infos[k].is_nop()
+            && let Some(l) = local_label(label_text(infos[k].trimmed(store.get(k))))
+        {
+            label_at.entry(l).or_insert(k);
+        }
+    }
+    for j in from..hi {
         if infos[j].is_nop() || infos[j].pinned || infos[j].kind != LineKind::CondJmp {
             continue;
         }
@@ -1150,11 +1200,20 @@ fn hoist_one_arm_head(
         }
         // Target arm: its label, mentioned once (by this jcc), entered by no
         // fall-through, then byteless lines up to its first instruction.
-        let Some(d) = (lo..hi).find(|&k| {
-            infos[k].kind == LineKind::Label
-                && !infos[k].is_nop()
-                && local_label(label_text(infos[k].trimmed(store.get(k)))) == Some(target)
-        }) else {
+        //
+        // O(1) through the window's label index.  The previous formulation
+        // rescanned `lo..hi` for every candidate `jcc`, so a function with J
+        // branches and L labels paid O(J x L) string parses over the SAME
+        // lines.  On a 16k-arm sparse `switch` (16k labels, 16k conditional
+        // branches, one function) that single expression was the whole
+        // 6-second phase-8e cost measured with `CCC_TIME_PEEPHOLE=1`; the
+        // index is built once per window in O(L).  `or_insert` keeps the
+        // FIRST definition in window order, which is exactly what
+        // `(lo..hi).find` returned, so the pass's decisions are identical --
+        // and a duplicated label therefore still resolves to its first
+        // definition here (the pass separately refuses duplicated labels via
+        // `duplicate`, which is what makes that spelling unreachable).
+        let Some(&d) = label_at.get(&target) else {
             continue;
         };
         if infos[d].pinned || mentions(d) != Some(1) || d <= a {
@@ -1187,9 +1246,11 @@ fn hoist_one_arm_head(
         replace_line(store, &mut infos[j], j, format!("    {head}"));
         replace_line(store, &mut infos[a], a, jcc);
         mark_nop(&mut infos[b]);
-        return true;
+        // Resume at the rewritten `jcc`: local passes still run after phase 8e,
+        // and every line before it was examined against this same text.
+        return Some(j);
     }
-    false
+    None
 }
 
 /// A straight-line instruction that commutes with a `jcc` and may move above
@@ -1285,16 +1346,30 @@ fn conditional_tail_calls_in(
     // read-only attempts -- including whole functions with no candidate --
     // reuse the counts for the current assembly state, which are identical
     // to a fresh scan because no line changed.
+    // Rebuilt only when a rewrite actually happened.  `defs` is derived from
+    // the lines `lo..hi` and from `infos[k].is_nop()`, so an attempt that
+    // changes nothing leaves it exact; the old loop rebuilt this
+    // per-function map (and asked `current_counts`) on every attempt, which
+    // on a single wide function is a 130k-line rescan per arm.
+    // `defs` lives OUTSIDE the loop so a failed attempt can reuse it, and the
+    // loop body rebuilds it in place after a rewrite (`defs = None`).  Keeping
+    // it out here is what lets the body read it directly: an `Option` inspected
+    // inside the loop would need an `expect`, and a panic path here is not
+    // acceptable in a pass that runs on every compiled function.
+    let mut defs: Option<FxHashMap<u32, usize>> = None;
     loop {
         let (count, duplicate) = current_counts(store, infos, cache);
-        let mut defs: FxHashMap<u32, usize> = FxHashMap::default();
-        for k in lo..hi {
-            if infos[k].kind == LineKind::Label && !infos[k].is_nop() && !infos[k].pinned {
-                if let Some(l) = local_label(label_text(infos[k].trimmed(store.get(k)))) {
-                    defs.insert(l, k);
+        let defs_map = defs.get_or_insert_with(|| {
+            let mut built: FxHashMap<u32, usize> = FxHashMap::default();
+            for k in lo..hi {
+                if infos[k].kind == LineKind::Label && !infos[k].is_nop() && !infos[k].pinned {
+                    if let Some(l) = local_label(label_text(infos[k].trimmed(store.get(k)))) {
+                        built.insert(l, k);
+                    }
                 }
             }
-        }
+            built
+        });
         let mut hit = None;
         for i in lo..hi {
             if infos[i].is_nop() || infos[i].pinned || infos[i].kind != LineKind::CondJmp {
@@ -1306,7 +1381,7 @@ fn conditional_tail_calls_in(
             if mnemonic == "jmp" || duplicate.contains(&label) {
                 continue;
             }
-            let Some(&d) = defs.get(&label) else {
+            let Some(&d) = defs_map.get(&label) else {
                 continue;
             };
             if count.get(&label) == Some(&1)
@@ -1363,6 +1438,9 @@ fn conditional_tail_calls_in(
         }
         replace_line(store, &mut infos[i], i, text);
         changed = true;
+        // The text AND the nop map moved: rebuild both on the next attempt.
+        defs = None;
+        *cache = None;
     }
 }
 

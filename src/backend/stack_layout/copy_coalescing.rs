@@ -291,37 +291,34 @@ fn build_block_cfg(func: &IrFunction) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
         label_to_idx.insert(block.label.0, idx);
     }
 
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
-    let add_edge = |succs: &mut [Vec<usize>], from: usize, label: u32| {
-        if let Some(&to) = label_to_idx.get(&label) {
-            if !succs[from].contains(&to) {
-                succs[from].push(to);
-            }
-        }
-    };
-
-    for (idx, block) in func.blocks.iter().enumerate() {
+    // Edges keep terminator order (default first, then the cases) and are
+    // deduplicated in O(1) by the shared `SuccSet`; the previous
+    // `Vec::contains` per edge made a wide `switch` block quadratic.
+    let succs = crate::common::succ_set::build_edges(nblocks, &label_to_idx, |idx, add| {
+        let block = &func.blocks[idx];
         match &block.terminator {
-            Terminator::Branch(target) => add_edge(&mut succs, idx, target.0),
+            Terminator::Branch(target) => {
+                add(target.0);
+            }
             Terminator::CondBranch {
                 true_label,
                 false_label,
                 ..
             } => {
-                add_edge(&mut succs, idx, true_label.0);
-                add_edge(&mut succs, idx, false_label.0);
+                add(true_label.0);
+                add(false_label.0);
             }
             Terminator::IndirectBranch {
                 possible_targets, ..
             } => {
                 for t in possible_targets {
-                    add_edge(&mut succs, idx, t.0);
+                    add(t.0);
                 }
             }
             Terminator::Switch { cases, default, .. } => {
-                add_edge(&mut succs, idx, default.0);
+                add(default.0);
                 for (_, label) in cases {
-                    add_edge(&mut succs, idx, label.0);
+                    add(label.0);
                 }
             }
             _ => {}
@@ -329,11 +326,11 @@ fn build_block_cfg(func: &IrFunction) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
         for inst in &block.instructions {
             if let Instruction::InlineAsm { goto_labels, .. } = inst {
                 for (_, label) in goto_labels {
-                    add_edge(&mut succs, idx, label.0);
+                    add(label.0);
                 }
             }
         }
-    }
+    });
 
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
     for (src, dests) in succs.iter().enumerate() {

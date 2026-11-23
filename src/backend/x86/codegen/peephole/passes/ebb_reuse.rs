@@ -285,6 +285,20 @@ pub(super) fn reuse_ebb_copies_and_flags(store: &mut LineStore, infos: &mut [Lin
 /// editable (`all_editable`, no volatile protection).
 pub(super) fn sink_copies_into_fallthrough(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let (mentions, duplicate) = label_mention_counts(store, infos);
+    // `local_label -> every defining line, ascending`, built once and used by
+    // the target lookup below.  Ascending because the scan is in line order
+    // and `or_insert`-style dedup is not needed: duplicate definitions are
+    // legal input here and the lookup's "first definition AFTER the branch"
+    // rule must see all of them.
+    let mut label_defs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (i, info) in infos.iter().enumerate() {
+        if info.kind == LineKind::Label
+            && !info.is_nop()
+            && let Some(l) = local_label(label_text(info.trimmed(store.get(i))))
+        {
+            label_defs.entry(l).or_default().push(i as u32);
+        }
+    }
     let mut liveness: Option<FileLiveness> = None;
     let mut changed = false;
     let len = store.len();
@@ -320,9 +334,21 @@ pub(super) fn sink_copies_into_fallthrough(store: &mut LineStore, infos: &mut [L
             break;
         }
         // The target label's line, for the liveness query.
-        let target_line = (j + 1..len).find(|&n| {
-            infos[n].kind == LineKind::Label
-                && local_label(label_text(infos[n].trimmed(store.get(n)))) == Some(target)
+        //
+        // O(log n) through `label_defs`.  The previous formulation scanned
+        // `j+1..len` for EVERY conditional branch, so on a wide `switch` --
+        // whose arms sit in one run -- arm `i` walked O(arms) lines to reach
+        // its own label.  That single scan was 5.0 s of a 6 s compile on a
+        // 16k-arm switch (`CCC_TIME_PEEPHOLE=1`).  Keeping a full position
+        // list rather than just the first definition also covers the
+        // backward branch (loop back edge): its target is defined at or
+        // before `j`, so a later duplicate may be the one the old scan
+        // returned, and `partition_point` finds exactly that one.  The
+        // answer is therefore identical to the old linear scan for every
+        // input, including duplicated labels and back edges.
+        let target_line = label_defs.get(&target).and_then(|defs| {
+            defs.get(defs.partition_point(|&n| n as usize <= j))
+                .map(|&n| n as usize)
         });
         let (true, Some(target_line)) = (clean_fallthrough, target_line) else {
             j += 1;
