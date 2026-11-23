@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -50,6 +51,9 @@ MEASURED_LCCC_ATTRIBUTES = frozenset({
     "DW_AT_name", "DW_AT_producer", "DW_AT_stmt_list", "DW_AT_type",
     "DW_AT_upper_bound",
 })
+# Of those, the names DWARF 6 introduced.  A readelf older than the names
+# (binutils 2.40's) prints the attribute numbers instead, for every compiler.
+DWARF6_ATTRIBUTES = frozenset({"DW_AT_language_name", "DW_AT_language_version"})
 MEASURED_DEFERRED_TAGS = frozenset({
     "DW_TAG_enumeration_type", "DW_TAG_enumerator", "DW_TAG_lexical_block",
 })
@@ -237,23 +241,49 @@ class DieCensusRatchet(unittest.TestCase):
         readelf = optional(os.environ.get("READELF", "readelf"))
         if not all((lccc, gcc, clang, readelf)):
             self.skipTest("rebuilt lccc, gcc-16, clang-23 or readelf unavailable")
-        proc = subprocess.run(
-            [shutil.which("python3") or "python3", str(GATE),
-             "--lccc", lccc, "--gcc", gcc, "--clang", clang,
-             "--readelf", readelf],
-            cwd=ROOT, capture_output=True, text=True, timeout=180,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DWARF DIE census: PASS", proc.stdout)
-        # Pin the raw vocabulary size so a silent shrink is caught.  Was
-        # "12 tags, 20 attributes" when pinned (20dd3240b); upstream main
-        # (20dd3240b..a4145e2db: multidimensional DWARF subranges in
-        # declaration order and the assembler-layout work) reduced the
-        # emitted attribute set to 18 without changing functional coverage
-        # -- the gate still reports every oracle-only attribute declared.
-        # Refreshed 2026-11-21 on rebase to a4145e2db.
-        self.assertIn("12 tags, 18 attributes", proc.stdout)
+        # Every readelf this machine has, each once: the one the gate is given
+        # and the distribution's.  What the census counts depends on the reader
+        # as well as on the compiler, and one machine often has two.
+        readers = {os.path.realpath(found): found
+                   for found in (readelf, optional("/usr/bin/readelf")) if found}
+        for reader in readers.values():
+            with self.subTest(readelf=reader):
+                proc = subprocess.run(
+                    [shutil.which("python3") or "python3", str(GATE),
+                     "--lccc", lccc, "--gcc", gcc, "--clang", clang,
+                     "--readelf", reader],
+                    cwd=ROOT, capture_output=True, text=True, timeout=180,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("DWARF DIE census: PASS", proc.stdout)
+                # The size of the vocabulary, so that a silent shrink is
+                # caught: it is the table at the top of this file -- less the
+                # names the reader has no word for.  The readelf of binutils
+                # 2.40 prints the two DWARF 6 attributes as numbers, in the
+                # reference compilers' objects as in ours, and the gate then
+                # says which names it could not look for.  Those two and no
+                # others may come off the count; 2.47 names all twenty.
+                #
+                # The pin was the literal "12 tags, 20 attributes", measured
+                # with readelf 2.47 like the table.  It was rewritten to 18
+                # where an older readelf came first on PATH, on the reading
+                # that the compiler had stopped emitting two attributes, and
+                # from then on failed with the reader the table is measured
+                # with.  The compiler emitted twenty throughout.
+                unnamed = set(re.findall(r"^note: \S+ cannot name (\w+):",
+                                         proc.stdout, re.M))
+                self.assertIn(unnamed, (set(), set(DWARF6_ATTRIBUTES)), proc.stdout)
+                self.assertIn(
+                    f"({len(MEASURED_LCCC_TAGS)} tags, "
+                    f"{len(MEASURED_LCCC_ATTRIBUTES - unnamed)} attributes;",
+                    proc.stdout)
 
+    def test_the_names_a_reader_may_lack_are_in_the_measured_vocabulary(self) -> None:
+        # What comes off the count above is part of what is counted: a name
+        # outside the table would lower the pin for an attribute nobody emits.
+        self.assertLess(DWARF6_ATTRIBUTES, MEASURED_LCCC_ATTRIBUTES)
+        self.assertEqual(len(MEASURED_LCCC_TAGS), 12)
+        self.assertEqual(len(MEASURED_LCCC_ATTRIBUTES), 20)
 
 if __name__ == "__main__":
     unittest.main()
