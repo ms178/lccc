@@ -53,6 +53,8 @@
 //! original preheader). Guards C/D/E, bepre `latest_dep`, univsr skip of
 //! rotated self-loop pointer IVs, and complete-unroll Copy-INIT are in
 //! tree. Guard F rejects header work outside the cloned condition closure.
+//! Guard H rejects a loop in which anything but the header reads a value
+//! the header computes: those readers kept the guard's value.
 //! Rotation STAYS opt-in (`CCC_LOOP_ROTATE=1`) while default-enable needs
 //! broader fuzz/performance evidence; kill-switch `CCC_NO_LOOP_ROTATE=1`
 //! wins.
@@ -458,6 +460,69 @@ fn try_rotate_loop(
             ));
         }
         return false;
+    }
+
+    // Guard H: what the header computes is read by the header alone.
+    //
+    // The header stays behind as the guard and runs once. From the second
+    // test on, the copy at the end of the latch computes these values (step
+    // 7), under new names that only the copied test reads. A reader outside
+    // the header is given neither a merge of the two nor the copy: it keeps
+    // the guard's value for every iteration. Steps 6.6 and 6.7 build that
+    // merge for the header's phis (a phi in the body, a phi in the exit);
+    // nothing builds it for the header's other values, so
+    //
+    //   for (i = 2; i * i < n; i++) t += i * i;           added 4 each time
+    //   for (i = 0; (t = i + 1) < n; i++) s += a[t];      read a[1] each time
+    //   for (i = 0; (t = i * 3) < n; i++) ...; return t;  returned 0
+    //
+    // The first is plain C: value numbering gives the body's `i * i` the
+    // header's name. With value numbering through casts (CCC_CAST_RENAME=1)
+    // the widening of a narrow counter is such a value too, and every
+    // `unsigned char i` loop that indexes with `i + 1` read one element
+    // (tests/regression/loop_rotate_header_value_readers.c).
+    //
+    // A refusal, not the missing merges: over tests/regression at -O2
+    // (1,490 files) the guard refuses 24 of 1,978 rotations -- the seven
+    // loops of that file in each of the three tests that compile it, and
+    // the loop of gvn_cross_block_mul_dot_product.c with its two copies in
+    // `main` -- and every one of them computed a wrong result when rotated.
+    // A header value that depends on no header phi is the same in every
+    // iteration and could be read where it is; no loop of the corpus has
+    // one left in its header, so the guard does not tell them apart.
+    //
+    // Asked here, in front of the first change to the function, so that a
+    // refusal has nothing to undo. Readers inside the header are the other
+    // instructions of the closure and the branch; a header phi that takes
+    // such a value over the back edge is Guard D's.
+    let computed: FxHashSet<u32> = closure
+        .iter()
+        .filter_map(|&idx| header_insts[idx].dest())
+        .map(|dest| dest.0)
+        .collect();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        if block_idx == lp.header {
+            continue;
+        }
+        let mut read: Option<u32> = None;
+        let mut note = |value: u32| {
+            if read.is_none() && computed.contains(&value) {
+                read = Some(value);
+            }
+        };
+        for inst in &block.instructions {
+            inst.for_each_used_value(&mut note);
+        }
+        block.terminator.for_each_used_value(&mut note);
+        if let Some(value) = read {
+            if debug {
+                lccc::cli::stderr_line(format_args!(
+                    "[ROT] v{} is computed in the header and read in block {} — bail (Guard H, no merge of the guard's value and the latch's)",
+                    value, block_idx
+                ));
+            }
+            return false;
+        }
     }
 
     // Guard E: refuse to rotate when the cloned cond consumes a phi that
@@ -2926,6 +2991,212 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Who, outside the header, reads the value the header computes.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Reader {
+        Nobody,
+        Body,
+        Exit,
+        Both,
+    }
+
+    /// `for (i = seed, s = 0; (t = i + c) < bound; i++) s += x; return s + y;`
+    /// with `x` the header's `t` or the counter, `y` the header's `t` or 0:
+    ///
+    /// ```text
+    ///   0 entry:  v1 = seed                       -> 1
+    ///   1 header: v2 = phi i [v1, 0], [v6, 3]
+    ///             v5 = phi s [0, 0],  [v7, 3]
+    ///             v3 = v2 + c                     (t)
+    ///             v4 = v3 < bound
+    ///             CondBranch(v4, 3, 4)
+    ///   3 body:   v7 = v5 + (v3 | v2)
+    ///             v6 = v2 + 1                     -> 1
+    ///   4 exit:   v8 = v5 + (v3 | 0)
+    ///             ret v8
+    /// ```
+    fn loop_with_a_header_value(seed: i64, c: i64, bound: i64, reader: Reader) -> IrFunction {
+        let ty = Ty::I32;
+        let constant = |value: i64| Operand::Const(IrConst::from_i64(value, ty));
+        let value = |id: u32| Operand::Value(Value(id));
+        let add = |dest: u32, lhs: Operand, rhs: Operand| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty,
+        };
+        let in_body = matches!(reader, Reader::Body | Reader::Both);
+        let in_exit = matches!(reader, Reader::Exit | Reader::Both);
+        let mut f = IrFunction::new("header_value".into(), ty, vec![], false);
+        f.blocks.push(blk(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(1),
+                src: constant(seed),
+            }],
+            Terminator::Branch(BlockId(1)),
+        ));
+        f.blocks.push(blk(
+            1,
+            vec![
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty,
+                    incoming: vec![(value(1), BlockId(0)), (value(6), BlockId(3))],
+                },
+                Instruction::Phi {
+                    dest: Value(5),
+                    ty,
+                    incoming: vec![(constant(0), BlockId(0)), (value(7), BlockId(3))],
+                },
+                add(3, value(2), constant(c)),
+                Instruction::Cmp {
+                    dest: Value(4),
+                    op: IrCmpOp::Slt,
+                    lhs: value(3),
+                    rhs: constant(bound),
+                    ty,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: value(4),
+                true_label: BlockId(3),
+                false_label: BlockId(4),
+            },
+        ));
+        f.blocks.push(blk(
+            3,
+            vec![
+                add(7, value(5), value(if in_body { 3 } else { 2 })),
+                add(6, value(2), constant(1)),
+            ],
+            Terminator::Branch(BlockId(1)),
+        ));
+        f.blocks.push(blk(
+            4,
+            vec![add(
+                8,
+                value(5),
+                if in_exit { value(3) } else { constant(0) },
+            )],
+            Terminator::Return(Some(value(8))),
+        ));
+        f.next_value_id = 20;
+        f.next_label = 5;
+        f
+    }
+
+    /// What the loop above returns, computed from its C form.
+    fn header_value_loop_result(seed: i64, c: i64, bound: i64, reader: Reader) -> i64 {
+        let (mut i, mut s) = (seed, 0);
+        while i + c < bound {
+            s += if matches!(reader, Reader::Body | Reader::Both) {
+                i + c
+            } else {
+                i
+            };
+            i += 1;
+        }
+        s + if matches!(reader, Reader::Exit | Reader::Both) {
+            i + c
+        } else {
+            0
+        }
+    }
+
+    fn rotate_the_only_loop(f: &mut IrFunction) -> bool {
+        let cfg = CfgAnalysis::build(f);
+        let loops = merge_loops_by_header(find_natural_loops(
+            cfg.num_blocks,
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
+        ));
+        let headers = loops.iter().map(|lp| lp.header).collect();
+        assert_eq!(loops.len(), 1);
+        try_rotate_loop(f, &loops[0], &cfg, &headers)
+    }
+
+    fn written(f: &IrFunction) -> Vec<String> {
+        f.blocks
+            .iter()
+            .map(|block| format!("{:?} {:?}", block.instructions, block.terminator))
+            .collect()
+    }
+
+    /// The rotated loop computes what the loop computed, whoever reads the
+    /// header's value. Held as a property of the function, so it stands for a
+    /// rotation that builds the missing merges as it stands for a refusal: no
+    /// seed, addend or reader may change the result.
+    ///
+    /// Without Guard H the body adds the guard's `t` on every iteration and
+    /// the code behind the loop reads the guard's `t`: 50 of the 96 loops
+    /// with a reader compute another result -- 14 of 32 with the reader in
+    /// the body (every loop of two or more iterations), 18 of 32 with it
+    /// behind the loop and 18 of 32 with both (every loop that iterates).
+    #[test]
+    fn rotation_keeps_every_reader_of_a_header_value_right() {
+        let mut rotated = 0;
+        let mut loops = 0;
+        let mut wrong = Vec::new();
+        for reader in [Reader::Nobody, Reader::Body, Reader::Exit, Reader::Both] {
+            for seed in [-3, 0, 1, 2, 3, 4, 5, 9] {
+                for c in [0, 1, 3, -2] {
+                    let bound = 4;
+                    let mut f = loop_with_a_header_value(seed, c, bound, reader);
+                    let expected = header_value_loop_result(seed, c, bound, reader);
+                    assert_eq!(
+                        interpret_rotation_fixture(&f),
+                        expected,
+                        "the fixture is not the loop it is said to be: {reader:?} {seed} {c}"
+                    );
+                    loops += 1;
+                    rotated += usize::from(rotate_the_only_loop(&mut f));
+                    let mut violations = Vec::new();
+                    crate::passes::verify::verify_function(&f, "header_value", &mut violations);
+                    assert!(
+                        violations.is_empty(),
+                        "{reader:?} {seed} {c}: {violations:?}"
+                    );
+                    let computed = interpret_rotation_fixture(&f);
+                    if computed != expected {
+                        wrong.push(format!(
+                            "{reader:?}, seed {seed}, addend {c}: {computed} for {expected}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {loops} loops compute another result once rotated:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+        // The loops nobody else reads are rotated: the property above is not
+        // held by rotating nothing.
+        assert_eq!(rotated, 32);
+    }
+
+    /// Guard H as it stands: a reader outside the header is a refusal, and a
+    /// refusal leaves the function as it was -- nothing renamed, no phi
+    /// added, no value number taken.
+    #[test]
+    fn a_header_value_read_outside_the_header_is_refused_untouched() {
+        for reader in [Reader::Body, Reader::Exit, Reader::Both] {
+            let mut f = loop_with_a_header_value(0, 1, 4, reader);
+            let before = written(&f);
+            assert!(!rotate_the_only_loop(&mut f), "{reader:?}");
+            assert_eq!(written(&f), before, "{reader:?}");
+            assert_eq!(f.next_value_id, 20, "{reader:?}");
+        }
+        let mut f = loop_with_a_header_value(0, 1, 4, Reader::Nobody);
+        let before = written(&f);
+        assert!(rotate_the_only_loop(&mut f));
+        assert_ne!(written(&f), before);
     }
 
     /// The same counted loop with EXIT-ON-TRUE polarity: the CondBranch's true
