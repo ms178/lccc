@@ -406,27 +406,43 @@ off=$(count_in "$tmp/three_way_off.s" keep_second_reader)
     exit 1
 }
 
-# The known-non-negative rule is `simplify_cmp`'s, not the indicator fold's, so
-# it is attributed through `CCC_SIMPLIFY_SKIP=cmp`: `zx_lt0` is the constant `0`
-# (two instructions including `ret`) with the rule and a real comparison without
-# it, while `zx_le0` is count-neutral -- `Eq 0` against a byte and `Ule 0` both
-# select a `testb` plus one `setcc`, so only the predicate moves (`sete` instead
-# of `setbe`) and the assertion pins that it stays at four.
+# The known-non-negative rule is not the indicator fold's, and it has two
+# owners: `simplify_cmp` (the operand is a zero-extension) and the known-bits
+# facts of `bit_idioms` (the bits above the byte are zero, the sign bit among
+# them, so the signed ordering against zero is decided).  `zx_lt0` is the
+# constant `0` (two instructions including `ret`) with either one alone, and a
+# real comparison only with both off -- which is what attributes the constant
+# to these two rules and to no third one.  `zx_le0` is count-neutral: `Eq 0`
+# against a byte and `Ule 0` both select a `testb` plus one `setcc`, so only
+# the predicate moves (`sete` instead of `setbe`) and the assertion pins that
+# it stays at four.
 CCC_SIMPLIFY_SKIP=cmp "$CCC" -O2 -S "$tmp/three_way.c" -o "$tmp/three_way_nocmp.s"
+CCC_DISABLE_PASSES=bit_idioms "$CCC" -O2 -S "$tmp/three_way.c" -o "$tmp/three_way_nobits.s"
+CCC_SIMPLIFY_SKIP=cmp CCC_DISABLE_PASSES=bit_idioms \
+    "$CCC" -O2 -S "$tmp/three_way.c" -o "$tmp/three_way_neither.s"
 for pair in "zx_lt0 2 4" "zx_le0 4 4"; do
     set -- $pair
     on=$(count_in "$tmp/three_way_on.s" "$1")
-    off=$(count_in "$tmp/three_way_nocmp.s" "$1")
+    off=$(count_in "$tmp/three_way_neither.s" "$1")
     [ "$on" -le "$2" ] || {
         printf '%s: expected at most %s instructions, got %s:\n' "$1" "$2" "$on" >&2
         fn_body "$tmp/three_way_on.s" "$1" >&2
         exit 1
     }
     [ "$off" -ge "$3" ] || {
-        printf '%s: CCC_SIMPLIFY_SKIP=cmp did not restore the comparison (%s):\n' "$1" "$off" >&2
-        fn_body "$tmp/three_way_nocmp.s" "$1" >&2
+        printf '%s: CCC_SIMPLIFY_SKIP=cmp with CCC_DISABLE_PASSES=bit_idioms did not restore the comparison (%s):\n' "$1" "$off" >&2
+        fn_body "$tmp/three_way_neither.s" "$1" >&2
         exit 1
     }
+    for owner in nocmp nobits; do
+        one=$(count_in "$tmp/three_way_$owner.s" "$1")
+        [ "$one" -le "$2" ] || {
+            printf '%s: one owner alone no longer answers (%s instructions in three_way_%s.s, at most %s):\n' \
+                "$1" "$one" "$owner" "$2" >&2
+            fn_body "$tmp/three_way_$owner.s" "$1" >&2
+            exit 1
+        }
+    done
 done
 
 # ── 7b. The indicator fold on every backend ───────────────────────────────
