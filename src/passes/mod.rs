@@ -623,6 +623,18 @@ fn propagate_copies_sparing_const_homes(
     copy_prop::propagate_copies_sparing(func, u32::MAX, &spare)
 }
 
+/// What the rotation behind LICM may pay with besides LICM itself
+/// (`loop_rotate::rotate_for_hoisting`): the passes that keep a memory
+/// recurrence in a register, each under its own switch.
+#[derive(Clone, Copy, Debug)]
+struct GuardedMotion {
+    /// `loop_memory_promote` (`CCC_NO_LOOP_MEM_PROMOTE`).
+    promote: bool,
+    /// `loop_carried_forward` (`CCC_DISABLE_PASSES=loop_carried_forward`,
+    /// `CCC_NO_LOOP_CARRIED_FWD`).
+    carry_forward: bool,
+}
+
 /// Run GVN, LICM, and IVSR with shared CFG analysis per function.
 ///
 /// For each dirty function, builds CFG/dominator/loop analysis once and passes
@@ -644,6 +656,7 @@ fn run_gvn_licm_ivsr_shared(
     ivsr_lftr: bool,
     run_univsr: bool,
     run_ptr_iv_collapse: bool,
+    rotate_for_hoisting: Option<GuardedMotion>,
     time_passes: bool,
     iter: usize,
 ) -> (usize, usize, usize) {
@@ -655,6 +668,18 @@ fn run_gvn_licm_ivsr_shared(
         licm::speculation_safe_globals(module)
     } else {
         licm::SpeculationSafeGlobals::default()
+    };
+    // What the two passes that keep memory in a register need of the
+    // module; they run here only inside the rotation trial.
+    let promotable_globals = if rotate_for_hoisting.is_some_and(|motion| motion.promote) {
+        loop_memory_promote::unexposed_static_globals(module)
+    } else {
+        loop_memory_promote::UnexposedGlobals::default()
+    };
+    let forwarder = if rotate_for_hoisting.is_some_and(|motion| motion.carry_forward) {
+        loop_carried_forward::Forwarder::for_module(module)
+    } else {
+        None
     };
 
     for (i, func) in module.functions.iter_mut().enumerate() {
@@ -825,6 +850,48 @@ fn run_gvn_licm_ivsr_shared(
                         iter, func.name, n
                     ));
                 }
+            }
+        }
+
+        // Loop rotation where it pays: behind LICM and the induction-variable
+        // passes, which have by now taken everything they can from the
+        // top-tested loops, rotate the loops out of which something moves
+        // only from behind the guard (a load, a division, a call that only
+        // reads: LICM; a `*p += x` recurrence: the memory promoter; an
+        // `a[i] = f(a[i-1])` one: loop-carried forwarding), and move it.
+        // The decision is made on a copy of the function with the same
+        // passes (`loop_rotate::rotate_for_hoisting`); a function no loop
+        // of which pays is not changed. The shared analysis is not used
+        // past here.
+        if let Some(motion) = rotate_for_hoisting {
+            let t0 = time_passes.then(std::time::Instant::now);
+            let done = loop_rotate::rotate_for_hoisting(func, |f| {
+                let cfg = CfgAnalysis::build(f);
+                let mut moved = licm::licm_with_analysis(f, &cfg, &licm_safe_globals);
+                if motion.promote {
+                    moved += loop_memory_promote::run_with(f, &promotable_globals);
+                }
+                if let Some(forwarder) = &forwarder {
+                    moved += forwarder.run(f);
+                }
+                moved
+            });
+            if done.loops > 0 {
+                verify::verify_after_func_pass(func, "loop_rotate");
+                licm_total += done.moved;
+                if i < changed.len() {
+                    changed[i] = true;
+                }
+            }
+            if let Some(t0) = t0 {
+                lccc::cli::stderr_line(format_args!(
+                    "[PASS] iter={} loop_rotate (func {}): {:.4}s ({} loops, {} moved)",
+                    iter,
+                    func.name,
+                    t0.elapsed().as_secs_f64(),
+                    done.loops,
+                    done.moved
+                ));
             }
         }
     }
@@ -2089,6 +2156,9 @@ pub(crate) fn run_passes(
         std::env::var_os("CCC_NO_AFFINE_EXIT_FOLD").is_none(),
         std::env::var_os("CCC_DEBUG_AFFINE_FOLD").is_some(),
     );
+    // Loop rotation's trace switch, by the same rule (its policy is resolved
+    // below, next to the optimization level it depends on).
+    loop_rotate::set_rotate_debug(std::env::var_os("CCC_DEBUG_LOOP_ROTATE").is_some());
     // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
     // and only six generally usable GPRs.  On the real linux-cachymod setup
     // corpus these four transformations increase final machine-code size by
@@ -2382,6 +2452,21 @@ pub(crate) fn run_passes(
     }
 
     let optimize_for_size = opt_level >= 4;
+    // Which loops rotation takes (`CCC_LOOP_ROTATE`, `CCC_NO_LOOP_ROTATE`):
+    // resolved once here, like every other switch of the pipeline. -O2 and
+    // above only, and not on the size pipelines: a rotated loop carries its
+    // test twice.
+    let rotate_policy = if opt_level >= 2 && !optimize_for_size {
+        loop_rotate::RotatePolicy::resolve(
+            std::env::var_os("CCC_NO_LOOP_ROTATE").is_some(),
+            std::env::var("CCC_LOOP_ROTATE").ok().as_deref(),
+        )
+    } else {
+        loop_rotate::RotatePolicy::Off
+    };
+    // `CCC_NO_LOOP_MEM_PROMOTE`: the memory-recurrence promoter, for its
+    // late run below and for the trial the rotation above decides by.
+    let loop_mem_promote = std::env::var_os("CCC_NO_LOOP_MEM_PROMOTE").is_none();
     // -Os/-Oz are size profiles. Full inlining inflates spill-heavy TUs; but
     // disabling inlining ENTIRELY makes -Os binaries LARGER than -O3 (every
     // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
@@ -3331,23 +3416,16 @@ pub(crate) fn run_passes(
             // verify the same module twice when the recurrence changed.
         }
 
-        // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
-        // widened phi flows through the rotated form and emits `addq`
-        // directly). Transforms "guard-at-top" loops into "test-at-bottom"
-        // self-loop form (one fewer branch per iteration in the hot path;
-        // the exit falls through). Every scalar counted loop the vectorizer
-        // left alone benefits. The transform is conservative (pure-SSA cond
-        // setup only, `is_cloneable_pure` rejects Vec* intrinsics so
-        // vectorized loops bail) and the exit-merge-phi reads the body's
-        // post-iteration value (latch incoming) on the test-exit edge.
-        // -O2+, not -Os/-Oz (cloned cond grows code size). Opt-in via
-        // `CCC_LOOP_ROTATE=1`; kill-switch `CCC_NO_LOOP_ROTATE` wins.
-        // Runs at iter 0 so the rotated form flows through
-        // GVN/LICM/if-convert/dce/cfg_simplify.
-        if iter == 0 && opt_level >= 2 && !optimize_for_size {
+        // Phase 2b-rot: loop rotation in its stress mode (`CCC_LOOP_ROTATE=1`,
+        // `RotatePolicy::Always`): every loop the transformation can take,
+        // at iter 0 after iv_widen, so the rotated form flows through every
+        // pass of the main loop. The default (`RotatePolicy::Profit`) does
+        // not run here: it rotates behind the first LICM, and only the loops
+        // LICM can then hoist out of (`run_gvn_licm_ivsr_shared`).
+        if iter == 0 && rotate_policy == loop_rotate::RotatePolicy::Always {
             let n = timed_pass!(
                 "loop_rotate",
-                run_on_visited(module, &dirty, &mut changed, loop_rotate::run_function)
+                run_on_visited(module, &dirty, &mut changed, loop_rotate::rotate_every_loop)
             );
             total_changes += n;
             total_changes_excl_dce += n;
@@ -3737,6 +3815,12 @@ pub(crate) fn run_passes(
                     ivsr_lftr,
                     run_univsr,
                     run_ptr_iv_collapse,
+                    (run_licm && iter == 0 && rotate_policy == loop_rotate::RotatePolicy::Profit)
+                        .then_some(GuardedMotion {
+                            promote: loop_mem_promote,
+                            carry_forward: opt_level >= 2
+                                && !pass_disabled(&disabled, "loop_carried_forward"),
+                        }),
                     time_passes,
                     iter,
                 );
@@ -4421,7 +4505,7 @@ pub(crate) fn run_passes(
     }
     // Run memory-recurrence promotion again after CFG and copy cleanup have
     // exposed canonical natural loops.
-    if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
+    if loop_mem_promote {
         loop_memory_promote::run_module(module);
         module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
     }

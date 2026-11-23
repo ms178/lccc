@@ -1309,6 +1309,17 @@ impl BlockUses {
 /// shift chain) changes its meaning, and the existing temporary machinery in
 /// `emit_multi_phi_copies` is what handles those.
 ///
+/// A fifth condition lifts (2) and (3) for one kind of copy: one the block's
+/// exit edge makes as well (`copy_repeats_on_exit`). A bottom-tested loop
+/// whose result is read behind it has the same `s = s'` on its backedge and
+/// on its exit edge once the two phis share a name (`phi_webs`, exit twins),
+/// and a copy that runs on every way out of the block runs as well once
+/// ahead of the branch: the destination is written before anything outside
+/// can read it either way. What is left to rule out lies between the two
+/// places -- the block's own terminator and the exit edge's other copies.
+/// The exit edge then drops its share, and is not split when that was all it
+/// carried.
+///
 /// A fourth condition is about *profit*, not correctness. Absorbed copies are
 /// placed ahead of the compare feeding the branch (`place_pred_copies`), which
 /// keeps the compare fusable on every backend. That is impossible when the
@@ -1323,6 +1334,7 @@ fn self_loop_copies_can_hoist(
     copies: &[Instruction],
     uses: &BlockUses,
     block_idx: usize,
+    exit_copies: &[Instruction],
 ) -> bool {
     if copies.is_empty() {
         return false;
@@ -1373,10 +1385,26 @@ fn self_loop_copies_can_hoist(
         return false;
     }
 
-    for &dest in &dests {
+    let mut read_by_own_terminator: FxHashSet<u32> = FxHashSet::default();
+    block.terminator.for_each_used_value(|v| {
+        read_by_own_terminator.insert(v);
+    });
+    for copy in copies {
+        let Instruction::Copy { dest, .. } = copy else {
+            return false;
+        };
+        // Condition 5: the block's other edge makes the same copy, so the
+        // destination is written on every way out and only what lies between
+        // the copy's new place and its old ones can tell the difference.
+        if copy_repeats_on_exit(copy, exit_copies) {
+            if read_by_own_terminator.contains(&dest.0) {
+                return false;
+            }
+            continue;
+        }
         // Conditions 2 and 3: the destination must be invisible everywhere
         // except this block's own instructions.
-        if !uses.no_terminator_reads(dest) || !uses.only_read_within(dest, block_idx) {
+        if !uses.no_terminator_reads(dest.0) || !uses.only_read_within(dest.0, block_idx) {
             return false;
         }
     }
@@ -1407,6 +1435,59 @@ fn self_loop_copies_can_hoist(
     true
 }
 
+/// Whether `copy` (one of a self-loop's backedge copies) is made by the
+/// block's exit edge as well, in a way that lets one execution ahead of the
+/// branch stand for both.
+///
+/// `exit_copies` is the exit edge's sequence as it will run. Moving its
+/// `d = s` to the front of that sequence (and from there above the branch)
+/// changes nothing when no other copy of the sequence reads or writes `d`
+/// and none writes `s`.
+fn copy_repeats_on_exit(copy: &Instruction, exit_copies: &[Instruction]) -> bool {
+    let Instruction::Copy { dest, src } = copy else {
+        return false;
+    };
+    let mut repeated = 0usize;
+    for other in exit_copies {
+        let Instruction::Copy { dest: d, src: s } = other else {
+            return false;
+        };
+        if d == dest && s == src {
+            repeated += 1;
+            continue;
+        }
+        let reads_dest = matches!(s, Operand::Value(v) if v == dest);
+        let writes_src = matches!(src, Operand::Value(v) if v == d);
+        if d == dest || reads_dest || writes_src {
+            return false;
+        }
+    }
+    repeated == 1
+}
+
+/// The trampoline of the one edge that leaves the self-loop block
+/// `block_idx`, when the block ends in a two-way branch and that edge was
+/// split for copies of its own.
+fn exit_edge_trampoline(block: &BasicBlock, block_idx: usize, ctx: &PhiElimCtx) -> Option<usize> {
+    let Terminator::CondBranch {
+        true_label,
+        false_label,
+        ..
+    } = &block.terminator
+    else {
+        return None;
+    };
+    let exit = match (*true_label == block.label, *false_label == block.label) {
+        (true, false) => *false_label,
+        (false, true) => *true_label,
+        _ => return None,
+    };
+    if ctx.asm_goto_edges.contains(&(block_idx, exit)) {
+        return None;
+    }
+    ctx.trampoline_map.get(&(block_idx, exit)).copied()
+}
+
 /// Resolve every buffered self-loop backedge: absorb the copies into the block
 /// when that is provably safe, otherwise split the edge as before.
 fn resolve_self_loop_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
@@ -1417,14 +1498,23 @@ fn resolve_self_loop_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
     let uses = BlockUses::from_blocks(&func.blocks);
     let buffered = std::mem::take(&mut ctx.self_loop_copies);
     let debug = std::env::var("LCCC_DEBUG_PHI_HOIST").is_ok();
+    // Exit trampolines whose every copy was absorbed with the backedge's.
+    let mut emptied: FxHashSet<usize> = FxHashSet::default();
 
     for (block_idx, copies) in buffered.into_iter().enumerate() {
         if copies.is_empty() {
             continue;
         }
         let target_block_id = func.blocks[block_idx].label;
+        let exit = exit_edge_trampoline(&func.blocks[block_idx], block_idx, ctx);
         let hoist = enabled
-            && self_loop_copies_can_hoist(&func.blocks[block_idx], &copies, &uses, block_idx);
+            && self_loop_copies_can_hoist(
+                &func.blocks[block_idx],
+                &copies,
+                &uses,
+                block_idx,
+                exit.map_or(&[], |t| &ctx.trampolines[t].copies),
+            );
         if debug {
             let dests: Vec<String> = copies
                 .iter()
@@ -1442,6 +1532,24 @@ fn resolve_self_loop_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
             ));
         }
         if hoist {
+            // The exit edge's share of the absorbed copies has run by the
+            // time the edge is taken; an edge left with nothing to copy is
+            // not split at all.
+            if let Some(t) = exit {
+                let on_exit = &mut ctx.trampolines[t].copies;
+                on_exit.retain(|other| {
+                    !copies.iter().any(|own| match (own, other) {
+                        (
+                            Instruction::Copy { dest: d1, src: s1 },
+                            Instruction::Copy { dest: d2, src: s2 },
+                        ) => d1 == d2 && s1 == s2,
+                        _ => false,
+                    })
+                });
+                if on_exit.is_empty() {
+                    emptied.insert(t);
+                }
+            }
             ctx.pred_copies.entry(block_idx).or_default().extend(copies);
         } else {
             let tramp_idx = get_or_create_trampoline(
@@ -1454,6 +1562,22 @@ fn resolve_self_loop_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
             ctx.trampolines[tramp_idx].copies.extend(copies);
         }
     }
+
+    if emptied.is_empty() {
+        return;
+    }
+    let mut index = 0usize;
+    ctx.trampolines.retain(|_| {
+        let keep = !emptied.contains(&index);
+        index += 1;
+        keep
+    });
+    ctx.trampoline_map = ctx
+        .trampolines
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ((t.pred_idx, t.old_target), i))
+        .collect();
 }
 
 /// Apply all phi elimination transformations to the function:
@@ -2095,7 +2219,17 @@ mod tests {
 
     fn hoists(blocks: &[BasicBlock], block_idx: usize, copies: &[Instruction]) -> bool {
         let uses = BlockUses::from_blocks(blocks);
-        self_loop_copies_can_hoist(&blocks[block_idx], copies, &uses, block_idx)
+        self_loop_copies_can_hoist(&blocks[block_idx], copies, &uses, block_idx, &[])
+    }
+
+    fn hoists_with_exit(
+        blocks: &[BasicBlock],
+        block_idx: usize,
+        copies: &[Instruction],
+        exit_copies: &[Instruction],
+    ) -> bool {
+        let uses = BlockUses::from_blocks(blocks);
+        self_loop_copies_can_hoist(&blocks[block_idx], copies, &uses, block_idx, exit_copies)
     }
 
     /// `case 4: case 6: v = 30; break;` with the empty case blocks threaded:
@@ -2198,6 +2332,197 @@ mod tests {
         let mut blocks = rotated_loop();
         blocks[0].terminator = cond(10, 1, 2);
         assert!(!hoists(&blocks, 0, &[cp(10, 13), cp(11, 15)]));
+    }
+
+    /// The loop's result is read behind it, under the name the loop itself
+    /// uses (`phi_webs` gave the exit phi and the loop phi one name): `v10 =
+    /// v13` is wanted on the backedge and on the exit edge alike.
+    fn loop_with_a_live_out() -> Vec<BasicBlock> {
+        let mut blocks = rotated_loop();
+        blocks[1].instructions.push(cp(8, 10));
+        blocks
+    }
+
+    #[test]
+    fn absorbs_a_copy_the_exit_edge_makes_as_well() {
+        let blocks = loop_with_a_live_out();
+        let backedge = [cp(10, 13), cp(11, 15)];
+        // Alone, the read behind the loop keeps the copy on its edge.
+        assert!(!hoists(&blocks, 0, &backedge));
+        // With the exit edge making it too, once ahead of the branch is the
+        // same program.
+        assert!(hoists_with_exit(&blocks, 0, &backedge, &[cp(10, 13)]));
+        // The exit edge may carry copies of its own beside it.
+        assert!(hoists_with_exit(
+            &blocks,
+            0,
+            &backedge,
+            &[cp(10, 13), cp(30, 31)]
+        ));
+    }
+
+    #[test]
+    fn rejects_a_repeated_copy_the_exit_edge_would_see_too_early() {
+        let blocks = loop_with_a_live_out();
+        let backedge = [cp(10, 13), cp(11, 15)];
+        // Another exit copy reads the destination: it wants the old value.
+        assert!(!hoists_with_exit(
+            &blocks,
+            0,
+            &backedge,
+            &[cp(10, 13), cp(30, 10)]
+        ));
+        assert!(!hoists_with_exit(
+            &blocks,
+            0,
+            &backedge,
+            &[cp(30, 10), cp(10, 13)]
+        ));
+        // Another exit copy writes the source ahead of it.
+        assert!(!hoists_with_exit(
+            &blocks,
+            0,
+            &backedge,
+            &[cp(13, 31), cp(10, 13)]
+        ));
+        // The exit edge gives the destination a different value.
+        assert!(!hoists_with_exit(&blocks, 0, &backedge, &[cp(10, 14)]));
+        // Twice on the exit edge is not a parallel copy.
+        assert!(!hoists_with_exit(
+            &blocks,
+            0,
+            &backedge,
+            &[cp(10, 13), cp(10, 13)]
+        ));
+    }
+
+    #[test]
+    fn rejects_a_repeated_copy_the_own_terminator_reads() {
+        let mut blocks = loop_with_a_live_out();
+        blocks[0].terminator = cond(10, 1, 2);
+        assert!(!hoists_with_exit(
+            &blocks,
+            0,
+            &[cp(10, 13), cp(11, 15)],
+            &[cp(10, 13)]
+        ));
+    }
+
+    /// A copy only the backedge makes still has to be invisible outside the
+    /// block, whatever the exit edge repeats.
+    #[test]
+    fn a_private_backedge_copy_keeps_its_rule_beside_a_repeated_one() {
+        let mut blocks = loop_with_a_live_out();
+        blocks[1].instructions.push(cp(6, 11));
+        assert!(!hoists_with_exit(
+            &blocks,
+            0,
+            &[cp(10, 13), cp(11, 15)],
+            &[cp(10, 13)]
+        ));
+    }
+
+    /// End to end: a bottom-tested loop whose accumulator is returned.
+    ///
+    /// ```text
+    ///   0: -> 1
+    ///   1: s = phi [v10, 0] [s', 1] ; i = phi [v11, 0] [i', 1]
+    ///      s' = ... ; i' = ... ; c = ...      -> 1 | 2
+    ///   2: r = phi [v10, 5] [s', 1] ; ret r
+    ///   5: -> 2                                (the zero-trip path)
+    /// ```
+    ///
+    /// The exit phi and the loop phi are twins: one name, one copy ahead of
+    /// the branch, and neither edge of the loop block split.
+    #[test]
+    fn a_live_out_of_a_bottom_tested_loop_costs_no_edge_block() {
+        let ty = crate::common::types::IrType::I64;
+        let phi = |dest: u32, arms: &[(u32, u32)]| Instruction::Phi {
+            dest: Value(dest),
+            ty,
+            incoming: arms
+                .iter()
+                .map(|&(v, from)| (Operand::Value(Value(v)), BlockId(from)))
+                .collect(),
+        };
+        let add = |dest: u32, lhs: u32| Instruction::BinOp {
+            dest: Value(dest),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Const(crate::ir::reexports::IrConst::I64(1)),
+            ty,
+        };
+        let mut func = IrFunction::new("live_out".to_string(), ty, Vec::new(), false);
+        func.blocks = vec![
+            blk(0, vec![cmp9(11)], cond(9, 4, 5)),
+            blk(4, Vec::new(), Terminator::Branch(BlockId(1))),
+            blk(
+                1,
+                vec![
+                    phi(20, &[(10, 4), (22, 1)]),
+                    phi(21, &[(11, 4), (23, 1)]),
+                    add(22, 20),
+                    add(23, 21),
+                    Instruction::Cmp {
+                        dest: Value(24),
+                        op: crate::ir::reexports::IrCmpOp::Ne,
+                        lhs: Operand::Value(Value(23)),
+                        rhs: Operand::Value(Value(12)),
+                        ty,
+                    },
+                ],
+                cond(24, 1, 2),
+            ),
+            blk(5, Vec::new(), Terminator::Branch(BlockId(2))),
+            blk(
+                2,
+                vec![phi(30, &[(10, 5), (22, 1)])],
+                Terminator::Return(Some(Operand::Value(Value(30)))),
+            ),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 6;
+        let mut next_block_id = 6;
+        eliminate_phis_with_policy(&mut func, &mut next_block_id, CopyOrderPolicy::Acyclic);
+
+        assert_eq!(
+            func.blocks.len(),
+            5,
+            "an edge of the loop block was split: {func:#?}"
+        );
+        let body = func.blocks.iter().find(|b| b.label.0 == 1).unwrap();
+        assert!(
+            matches!(
+                body.terminator,
+                Terminator::CondBranch { true_label, false_label, .. }
+                    if true_label == BlockId(1) && false_label == BlockId(2)
+            ),
+            "{:?}",
+            body.terminator
+        );
+        // The exit block reads the loop's own name and copies nothing: the
+        // loop block writes that name (through a copy ahead of its branch, or
+        // with the copy folded into the addition itself), and so does the
+        // zero-trip path.
+        let exit = func.blocks.iter().find(|b| b.label.0 == 2).unwrap();
+        assert!(exit.instructions.is_empty(), "{exit:#?}");
+        let Terminator::Return(Some(Operand::Value(returned))) = exit.terminator else {
+            panic!("the exit block returns a value");
+        };
+        let defines = |label: u32| {
+            func.blocks
+                .iter()
+                .find(|b| b.label.0 == label)
+                .unwrap()
+                .instructions
+                .iter()
+                .any(|i| i.dest() == Some(returned))
+        };
+        assert!(
+            defines(1),
+            "the loop block writes the returned name: {body:#?}"
+        );
+        assert!(defines(5), "the zero-trip path writes the returned name");
     }
 
     /// A value can flow straight into another block's terminator with no

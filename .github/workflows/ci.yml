@@ -3031,6 +3031,15 @@ jobs:
         bash tests/regression/check_tls_runtime_oracle.sh
         # Dedicated-preheader transform, asserted on emitted assembly.
         bash tests/regression/check_loop_preheader.sh
+        # Loop rotation's decision: it fires where a division, an
+        # accumulator or a recurrence then leaves the loop, and leaves every
+        # other loop byte-identical to the pipeline without it.
+        bash tests/regression/check_loop_rotate_profit.sh
+        # What the shared linear address forms may call disjoint: a store
+        # that marches away from a load lets LICM hoist it, one that wraps
+        # round to it (an unsigned index, a signed one under -fwrapv) or
+        # starts on it does not.
+        bash tests/regression/check_licm_alias_disjoint.sh
         # Mask and interval folds: shift-pair masks and {0,1} membership, with a
         # {0,2} negative control and a disabled-pass attribution leg.
         python3 tests/regression/check_mask_and_interval_folds.py

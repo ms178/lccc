@@ -2566,6 +2566,26 @@ gate "volatile-access-semantics" fast \
 gate "loop-preheader" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_preheader.sh
 
+# Loop rotation is on by default where it pays, and the decision is a
+# compile-time property no run-and-compare test can see.  This gate reads
+# the assembly both ways: what was to leave the loop has left it (a
+# division, a `*p += x` kept in a register, an `a[i] = f(a[i-1])`
+# recurrence), each with rotation off as the negative control, and a loop
+# that does not pay is byte-identical to the pipeline without the pass.
+gate "loop-rotate-profit" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_rotate_profit.sh
+
+# The linear address forms LICM, the memory promoter and loop-carried
+# forwarding share decide which store can reach which load.  Too little and
+# an invariant load stays in its loop; too much and the loop reads a value
+# a store has replaced, which no small test array shows because the index
+# has to wrap first.  The gate counts the loads left in the loop for a
+# store that marches away (hoisted), one that starts on the load (kept) and
+# one whose index wraps round to it (kept: `unsigned`, and `int` under
+# -fwrapv).
+gate "licm-alias-disjoint" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_licm_alias_disjoint.sh
+
 # LICM must not hoist a volatile load out of its loop (C11 5.1.2.3): N
 # observable accesses must not become 1.  The runtime cannot see this -- a
 # hoisted volatile load computes the same answer -- so the gate asserts it

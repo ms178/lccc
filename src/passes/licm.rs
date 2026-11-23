@@ -85,7 +85,9 @@ pub(crate) fn licm_with_analysis(
 
 /// Check if an instruction is safe to hoist (pure, no side effects, not a phi).
 /// Division and remainder can trap with SIGFPE on divide-by-zero, so they must
-/// not be speculatively hoisted past a guard condition.
+/// not be speculatively hoisted past a guard condition: they are not
+/// hoistable in this sense, and `hoist_loop_invariants_with` moves one only
+/// where its execution is certain (see its trapping-`BinOp` rule).
 fn is_hoistable(inst: &Instruction) -> bool {
     matches!(
         inst,
@@ -1132,6 +1134,15 @@ fn is_load_hoistable(
         });
         return false;
     }
+    if alias_info.stores.is_empty() {
+        // `complete` with no store: nothing in the loop writes memory, so
+        // what the load reads cannot change from trip to trip, whatever its
+        // address is. It needs no linear form: there is nothing to tell it
+        // apart from. (A pointer that reaches the loop through a phi has
+        // none, and a list walk or a search loop reads fields through
+        // exactly such pointers.)
+        return true;
+    }
     let Some(load_form) = alias_info.forms.get(&ptr_id) else {
         licm_debug(|| {
             lccc::cli::stderr_line(format_args!(
@@ -1998,6 +2009,48 @@ fn hoist_loop_invariants_with(
                         }
                     }
                     all_invariant
+                } else if let Instruction::BinOp { op, lhs, rhs, .. } = inst
+                    && op.can_trap()
+                {
+                    // A division or remainder traps on a zero divisor and on
+                    // the one quotient that overflows, so it is never
+                    // speculated (`is_hoistable` keeps it out of the rule
+                    // above). It moves only to a point that implies its
+                    // execution, by the rule of a call nobody knows: a
+                    // preheader that always enters the loop, for an
+                    // instruction the first trip is certain to reach, with
+                    // nothing ahead of it in its own block that can keep
+                    // control from it. Then it traps in the hoisted program
+                    // exactly when it trapped in the first trip of the
+                    // original; what the first trip did before trapping is
+                    // lost, and the program that divides by zero has no
+                    // defined behaviour to lose.
+                    //
+                    // A top-tested loop has no such instruction outside its
+                    // header's test, which is why the quotient of two
+                    // loop-invariant values used to be recomputed on every
+                    // trip of every `for`. Loop rotation gives the loop a
+                    // preheader behind its guard, and the body's straight
+                    // line of blocks then qualifies.
+                    let stays_put = |operand: &Operand| match operand {
+                        Operand::Const(_) => true,
+                        Operand::Value(v) => {
+                            !loop_defined.contains(&v.0) || invariant.contains(&v.0)
+                        }
+                    };
+                    stays_put(lhs)
+                        && stays_put(rhs)
+                        && preheader_is_dedicated
+                        && !may_not_reach(&func.blocks[block_idx], inst_idx)
+                        && (block_idx == header
+                            || loop_first_iter_reaches_block(
+                                func,
+                                preheader,
+                                header,
+                                block_idx,
+                                &natural_loop.body,
+                                idom,
+                            ))
                 } else if let Instruction::Load {
                     ptr, ty, volatile, ..
                 } = inst
@@ -3746,6 +3799,199 @@ mod tests {
             .expect("the check")
     }
 
+    /// `bottom_tested_call_loop` with the call to `quot` replaced by the
+    /// division it stands for: `v5 = a / b` (or `%`), on the two parameters.
+    fn bottom_tested_division_loop(guarded: bool, op: IrBinOp, impure: Impure) -> IrFunction {
+        let mut func = bottom_tested_call_loop(guarded, false, impure);
+        for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+            if matches!(inst, Instruction::Call { func: callee, .. } if callee == "quot") {
+                *inst = Instruction::BinOp {
+                    dest: Value(5),
+                    op,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                };
+            }
+        }
+        func
+    }
+
+    /// The block the division of `bottom_tested_division_loop` is in.
+    fn block_dividing(func: &IrFunction) -> usize {
+        func.blocks
+            .iter()
+            .position(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| matches!(inst, Instruction::BinOp { op, .. } if op.can_trap()))
+            })
+            .expect("the division is still somewhere")
+    }
+
+    const TRAPPING: [IrBinOp; 4] = [IrBinOp::SDiv, IrBinOp::UDiv, IrBinOp::SRem, IrBinOp::URem];
+
+    /// The guard is what makes the division legal: above `if (b == 0)
+    /// return -1;` it would raise SIGFPE in the execution that returns -1.
+    #[test]
+    fn a_division_is_not_hoisted_above_the_test_that_guards_its_loop() {
+        for op in TRAPPING {
+            let func = hoisted(bottom_tested_division_loop(true, op, Impure::Absent));
+            assert_eq!(block_dividing(&func), 1, "{op:?}");
+        }
+    }
+
+    /// Behind a preheader that always enters the loop, the first trip was
+    /// going to divide: once before the loop is the same program.
+    #[test]
+    fn a_division_the_first_trip_reaches_moves_to_a_preheader_that_enters_the_loop() {
+        for op in TRAPPING {
+            let func = hoisted(bottom_tested_division_loop(false, op, Impure::Absent));
+            assert_eq!(block_dividing(&func), 0, "{op:?}");
+            // A call behind the division does not keep control from it.
+            let func = hoisted(bottom_tested_division_loop(false, op, Impure::After));
+            assert_eq!(block_dividing(&func), 0, "{op:?}, a call after it");
+        }
+    }
+
+    /// `require_nonzero(b); a / b`: the call ahead may not return, and then
+    /// the division does not run.
+    #[test]
+    fn a_division_stays_behind_a_call_that_may_not_return() {
+        for op in TRAPPING {
+            let func = hoisted(bottom_tested_division_loop(false, op, Impure::Before));
+            assert_eq!(block_dividing(&func), 1, "{op:?}");
+        }
+    }
+
+    /// A division by a value the loop computes is not invariant, whatever
+    /// its position.
+    #[test]
+    fn a_division_by_a_value_of_the_loop_stays() {
+        for op in TRAPPING {
+            let mut func = bottom_tested_division_loop(false, op, Impure::Absent);
+            for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+                if let Instruction::BinOp { op, rhs, .. } = inst
+                    && op.can_trap()
+                {
+                    // The loop's counter.
+                    *rhs = Operand::Value(Value(3));
+                }
+            }
+            assert_eq!(block_dividing(&hoisted(func)), 1, "{op:?}");
+        }
+    }
+
+    /// The guarded loop gets its safe place from the preheader pass, like
+    /// the call it stands for: below the test, once.
+    #[test]
+    fn the_preheader_pass_gives_a_guarded_division_somewhere_safe_to_go() {
+        for op in TRAPPING {
+            let mut func = bottom_tested_division_loop(true, op, Impure::Absent);
+            assert_eq!(crate::passes::loop_preheader::run_function(&mut func), 1);
+            let preheader = preheader_of(&func);
+            assert_eq!(block_dividing(&hoisted(func)), preheader, "{op:?}");
+        }
+    }
+
+    /// A division in a block the first trip may skip stays where it is:
+    /// `do { if (j & 1) s += a / b; } while (++j < 3);`.
+    #[test]
+    fn a_division_the_first_trip_may_skip_stays() {
+        for op in TRAPPING {
+            let mut func = IrFunction::new("cond".into(), IrType::I32, vec![], false);
+            let block =
+                |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+                    label: BlockId(label),
+                    instructions,
+                    terminator,
+                    source_spans: vec![],
+                    source_inline_ids: Vec::new(),
+                };
+            let value = |n: u32| Operand::Value(Value(n));
+            let int = |n: i32| Operand::Const(IrConst::I32(n));
+            func.blocks = vec![
+                block(
+                    0,
+                    vec![
+                        Instruction::ParamRef {
+                            dest: Value(0),
+                            param_idx: 0,
+                            ty: IrType::I32,
+                        },
+                        Instruction::ParamRef {
+                            dest: Value(1),
+                            param_idx: 1,
+                            ty: IrType::I32,
+                        },
+                    ],
+                    Terminator::Branch(BlockId(1)),
+                ),
+                block(
+                    1,
+                    vec![
+                        Instruction::Phi {
+                            dest: Value(3),
+                            ty: IrType::I32,
+                            incoming: vec![(int(0), BlockId(0)), (value(6), BlockId(3))],
+                        },
+                        Instruction::BinOp {
+                            dest: Value(4),
+                            op: IrBinOp::And,
+                            lhs: value(3),
+                            rhs: int(1),
+                            ty: IrType::I32,
+                        },
+                    ],
+                    Terminator::CondBranch {
+                        cond: value(4),
+                        true_label: BlockId(2),
+                        false_label: BlockId(3),
+                    },
+                ),
+                block(
+                    2,
+                    vec![Instruction::BinOp {
+                        dest: Value(5),
+                        op,
+                        lhs: value(0),
+                        rhs: value(1),
+                        ty: IrType::I32,
+                    }],
+                    Terminator::Branch(BlockId(3)),
+                ),
+                block(
+                    3,
+                    vec![
+                        Instruction::BinOp {
+                            dest: Value(6),
+                            op: IrBinOp::Add,
+                            lhs: value(3),
+                            rhs: int(1),
+                            ty: IrType::I32,
+                        },
+                        Instruction::Cmp {
+                            dest: Value(7),
+                            op: IrCmpOp::Slt,
+                            lhs: value(6),
+                            rhs: int(3),
+                            ty: IrType::I32,
+                        },
+                    ],
+                    Terminator::CondBranch {
+                        cond: value(7),
+                        true_label: BlockId(1),
+                        false_label: BlockId(4),
+                    },
+                ),
+                block(4, vec![], Terminator::Return(Some(int(0)))),
+            ];
+            func.next_value_id = 8;
+            assert_eq!(block_dividing(&hoisted(func)), 2, "{op:?}");
+        }
+    }
+
     /// The guard is what makes the division legal: above it, `quot(a, 0)`
     /// runs in the execution that was supposed to return -1.
     #[test]
@@ -3993,5 +4239,146 @@ mod tests {
             crate::passes::loop_preheader::run_function(&mut read_only),
             1
         );
+    }
+
+    /// `p = c ? a : b; do { s += *p; } while (s < 100);`: the address of the
+    /// load is a join of two pointers, which has no linear form.  Blocks:
+    /// 0 and 1 choose, 2 joins and always enters the loop, 3 is the loop.
+    /// With `store` the loop also writes through `b`.
+    fn loop_reading_a_joined_pointer(store: bool) -> IrFunction {
+        let block =
+            |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+                label: BlockId(label),
+                instructions,
+                terminator,
+                source_spans: vec![],
+                source_inline_ids: Vec::new(),
+            };
+        let param = |dest: u32, ty: IrType| Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx: dest as usize,
+            ty,
+        };
+        let mut body = vec![
+            Instruction::Phi {
+                dest: Value(4),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(2)),
+                    (Operand::Value(Value(6)), BlockId(3)),
+                ],
+            },
+            Instruction::Load {
+                dest: Value(5),
+                ptr: Value(3),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        ];
+        if store {
+            body.push(Instruction::Store {
+                val: Operand::Value(Value(4)),
+                ptr: Value(1),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+        }
+        body.extend([
+            Instruction::BinOp {
+                dest: Value(6),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(4)),
+                rhs: Operand::Value(Value(5)),
+                ty: IrType::I32,
+            },
+            Instruction::Cmp {
+                dest: Value(7),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(6)),
+                rhs: Operand::Const(IrConst::I32(100)),
+                ty: IrType::I32,
+            },
+        ]);
+        let mut func = IrFunction::new("sum".into(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    param(0, IrType::Ptr),
+                    param(1, IrType::Ptr),
+                    param(2, IrType::I32),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(1, vec![], Terminator::Branch(BlockId(2))),
+            block(
+                2,
+                vec![Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::Ptr,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(1)), BlockId(1)),
+                    ],
+                }],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                3,
+                body,
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(7)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+            ),
+            block(
+                4,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(6)))),
+            ),
+        ];
+        func.next_value_id = 8;
+        func.next_label = 5;
+        func
+    }
+
+    /// The block the load of `loop_reading_a_joined_pointer` is in.
+    fn block_loading(func: &IrFunction) -> usize {
+        func.blocks
+            .iter()
+            .position(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .any(|inst| matches!(inst, Instruction::Load { .. }))
+            })
+            .expect("the load is still somewhere")
+    }
+
+    /// Nothing in the loop writes memory, so what the load reads is the same
+    /// on every trip, whatever its address is made of.
+    #[test]
+    fn a_load_leaves_a_loop_that_writes_nothing_whatever_its_address_is() {
+        let func = hoisted(loop_reading_a_joined_pointer(false));
+        assert_eq!(
+            block_loading(&func),
+            2,
+            "in the block that always enters the loop"
+        );
+    }
+
+    /// One store in the loop, and the load's address has to be told apart
+    /// from the store's.  An address without a linear form cannot be.
+    #[test]
+    fn a_load_through_an_address_without_a_form_stays_next_to_a_store() {
+        let func = hoisted(loop_reading_a_joined_pointer(true));
+        assert_eq!(block_loading(&func), 3);
     }
 }

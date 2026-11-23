@@ -736,9 +736,9 @@ fn for_each_direct_target_mut(term: &mut Terminator, mut f: impl FnMut(&mut Bloc
 // Sub-pass: switch-case relay threading
 // ---------------------------------------------------------------------------
 
-/// Opt-in switch (`CCC_SWITCH_RELAY_THREAD=1`), the `CCC_LOOP_ROTATE=1`
-/// convention for a transformation that is correct but has no measured
-/// benefit yet on the corpus it was written for.
+/// Opt-in switch (`CCC_SWITCH_RELAY_THREAD=1`): the convention for a
+/// transformation that is correct but has no measured benefit yet on the
+/// corpus it was written for.
 ///
 /// MEASURED STATUS (2026-11-19, the reason this is not default-on): on the
 /// zlib-ng/gzip/expat/sqlite extract corpus the pass fires zero times.  The

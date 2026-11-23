@@ -1,9 +1,9 @@
 {
   "fns_over_1000": 26,
-  "fns_over_300": 233,
-  "fns_over_500": 97,
+  "fns_over_300": 232,
+  "fns_over_500": 96,
   "ignored_tests": 10,
-  "knob_literals": 576,
+  "knob_literals": 575,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -143,7 +143,6 @@
     "CCC_LOOP_IDIOM",
     "CCC_LOOP_PIN",
     "CCC_LOOP_ROTATE",
-    "CCC_LOOP_ROTATE_IGNORE_PRESSURE",
     "CCC_LOOP_SPLIT",
     "CCC_LR_SHRINK_STATS",
     "CCC_M16_FULL_PIPELINE",
@@ -582,8 +581,8 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 248,
-  "panic_sites": 859,
+  "knobs_undocumented": 247,
+  "panic_sites": 856,
   "panic_sites_hot": 94,
   "unsafe_sites": 27
 }

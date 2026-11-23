@@ -37,10 +37,8 @@ tests/regression/check_i686_const_div.sh  # passes locally; not yet wired into c
 tests/regression/check_i686_overalign_interop.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_imm_store_movl_sib.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_inline_multisite_loop_wrapper_policy.sh  # passes locally; not yet wired into ci_local.sh / a workflow
-tests/regression/check_licm_alias_disjoint.sh  # hoist does not fire: body load is not must-execute (for-form) / alias frame incomplete (rotated form); Clang hoists via guarded rotation
 tests/regression/check_load_widen_cast_no_relay.sh  # .size awk extraction empty — gate script defect
 tests/regression/check_loop_idiom.sh  # passes locally; not yet wired into ci_local.sh / a workflow
-tests/regression/check_loop_rotate_pressure.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_machinst_window_alloc.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_mcount.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_memory_fold_liveness.sh  # passes locally; not yet wired into ci_local.sh / a workflow

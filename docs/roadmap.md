@@ -43,9 +43,10 @@ work management lives in the engineering tree:
    redundant moves rather than loop structure; the web-wide in-loop-use supply
    landed (+3.6…+4.3% runtime, hottest slot 17→10 reloads) and RA-06B's
    back-edge-split framing is superseded by it, OP-05b
-   multi-store scatter (nbody/spectral), PF-17 loop-rotation hardening →
-   default-enable (the systemic ~1 branch/iter gap), RA-01b
-   marching-pointer homes.
+   multi-store scatter (nbody/spectral), RA-01b marching-pointer homes.
+   (PF-17 is done: loop rotation is on by default for the loops where it
+   pays; the ~1 branch/iteration gap it was filed for had been closed by
+   `loop_invert` in the meantime.)
 2. **Platform gates** — LK-19 IFUNC end-to-end, LK-24 external-PIE startup
    SIGSEGV, kernel objtool interop + `net/*` statement-expression typing.
 3. **P1 measured gaps** — PF-06 isort secondary IV, IS-11 andn+cmov ffs,
@@ -59,8 +60,10 @@ work management lives in the engineering tree:
 
 - gzip `longest_match` stack-mem must not rise; adler/gzip/expat oracles
   gate all RA work.
-- Loop rotation stays opt-in until the 15 known miscompile shapes are
-  root-caused.
+- Loop rotation rotates a loop only for a reason it can name (something
+  that then leaves the loop and is worth it); rotating every loop is the
+  stress mode `CCC_LOOP_ROTATE=1` and stays out of the default (measured
+  +0.4% instructions over the benchmark programs).
 - `FpContract::Off` is the default (GCC `gnu*` parity); FMA emission
   requires the FMA3 ISA feature.
 - Every optimization ships with a kill switch and a structural or runtime

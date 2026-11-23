@@ -1309,25 +1309,39 @@ fn run_round(func: &mut IrFunction, globals: &FxHashMap<String, usize>, env: Env
     applied
 }
 
-/// Module entry: global object sizes feed the dereferenceability proof.
-pub(crate) fn run_module(module: &mut IrModule) -> usize {
-    let env = Env::read();
-    if env.disabled {
-        return 0;
+/// The pass with what it needs of its module, for running it on one
+/// function at a time: the sizes of the global objects, which feed the
+/// dereferenceability proof, and the two switches.
+pub(crate) struct Forwarder {
+    globals: FxHashMap<String, usize>,
+    env: Env,
+}
+
+impl Forwarder {
+    /// `None` under `CCC_NO_LOOP_CARRIED_FWD`.
+    pub(crate) fn for_module(module: &IrModule) -> Option<Self> {
+        let env = Env::read();
+        if env.disabled {
+            return None;
+        }
+        let globals = module
+            .globals
+            .iter()
+            .map(|g| (g.name.clone(), g.size))
+            .collect();
+        Some(Self { globals, env })
     }
-    let globals: FxHashMap<String, usize> = module
-        .globals
-        .iter()
-        .map(|g| (g.name.clone(), g.size))
-        .collect();
-    module.for_each_function(|f| {
+
+    /// Forward in `f` to a fixpoint (or the round cap). Returns the number
+    /// of loads replaced.
+    pub(crate) fn run(&self, f: &mut IrFunction) -> usize {
         if f.blocks.is_empty() {
             return 0;
         }
         let mut total = 0;
         let mut converged = false;
         for _ in 0..MAX_ROUNDS {
-            let n = run_round(f, &globals, env);
+            let n = run_round(f, &self.globals, self.env);
             if n == 0 {
                 converged = true;
                 break;
@@ -1338,5 +1352,13 @@ pub(crate) fn run_module(module: &mut IrModule) -> usize {
             round_cap::note_cap_hit(round_cap::Site::LoopCarriedForward);
         }
         total
-    })
+    }
+}
+
+/// Module entry.
+pub(crate) fn run_module(module: &mut IrModule) -> usize {
+    let Some(forwarder) = Forwarder::for_module(module) else {
+        return 0;
+    };
+    module.for_each_function(|f| forwarder.run(f))
 }

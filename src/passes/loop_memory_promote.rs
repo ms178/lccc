@@ -3,7 +3,10 @@
 //! Recognizes a natural loop with **one** load and **one** store of the same
 //! loop-invariant scalar address, store in the unique latch, no may-alias
 //! memory ops in the body. The load is hoisted to the preheader, the value
-//! is carried by a phi, and a single store is emitted on the unique exit.
+//! is carried by a phi, and a single store is emitted on the unique exit:
+//! in the exit block when the loop is all that reaches it, in a block of its
+//! own on the exit edge when other code joins there (the block behind a
+//! guarded bottom-tested loop, which the guard's other arm reaches as well).
 //!
 //! # Soundness contracts
 //!
@@ -446,6 +449,89 @@ pub(crate) fn striding_phi(
     Some((init?, stride))
 }
 
+/// Whether arithmetic of type `ty` is, as far as an address can tell, what
+/// it is over the integers.
+///
+/// At the width of an address it wraps exactly as the address does, and the
+/// byte ranges the forms are compared over lie in one object. Narrower
+/// *signed* arithmetic does not wrap in a program with defined behaviour,
+/// unless the function is compiled with `-fwrapv`. Narrower *unsigned*
+/// arithmetic wraps by definition: with `unsigned i` at `UINT_MAX`,
+/// `a[i + 1]` is `a[0]`, and a form that said `a[4294967296]` let LICM take a
+/// load of `a[0]` out of a loop that stores to it (the loop then ran on a
+/// stale bound; GCC 16.2 and Clang 23 keep the load). A loop whose test
+/// keeps such a counter in range reaches this pass with the counter already
+/// widened (`iv_widen`, which proves it), so what is refused here is what
+/// nothing proved.
+fn arithmetic_is_exact(func: &IrFunction, ty: IrType) -> bool {
+    if ty == IrType::Ptr {
+        return true;
+    }
+    ty.is_integer()
+        && (ty.size() >= crate::common::types::target_ptr_size()
+            || (ty.is_signed() && !func.pass_policy.wrap_signed_overflow))
+}
+
+/// The form of `cast(x)` given the form `f` of `x`, for a cast that does not
+/// narrow; `None` when the cast does not keep the number.
+///
+/// A form states the number a value is in its own signedness. Sign
+/// extension keeps the number of a signed value and zero extension that of
+/// an unsigned one, into any wider type that can hold it; a cast between
+/// the signed and the unsigned type of one width keeps it only at the width
+/// of an address, where both are the same residue.
+fn widened_form(mut f: LinForm, from_ty: IrType, to_ty: IrType) -> Option<LinForm> {
+    let is_address = |ty: IrType| ty == IrType::Ptr;
+    if !(from_ty.is_integer() || is_address(from_ty)) || !(to_ty.is_integer() || is_address(to_ty))
+    {
+        return None;
+    }
+    let ptr = crate::common::types::target_ptr_size();
+    let (from, to) = (from_ty.size(), to_ty.size());
+    if to < from {
+        // A truncation keeps the low bits, not the number.
+        return None;
+    }
+    if from >= ptr {
+        // Residues modulo the address width from here on.
+        return Some(f);
+    }
+    // A narrow source. Its number has to fit the target in the target's
+    // own reading: every wider type holds an unsigned number, a signed one
+    // needs a signed target or one as wide as an address.
+    let keeps = if from_ty.is_unsigned() {
+        to > from || to_ty.is_unsigned()
+    } else {
+        to_ty.is_signed() || to >= ptr
+    };
+    if !keeps {
+        return None;
+    }
+    let is_constant = f.root == 0 && f.syms.is_empty() && f.march == 0;
+    if is_constant {
+        // A constant is stored as written; read it the way the source
+        // type does.
+        let bits = u32::try_from(from * 8).ok()?;
+        let spare = 64u32.checked_sub(bits)?;
+        f.konst = if from_ty.is_unsigned() {
+            ((f.konst as u64) << spare >> spare) as i64
+        } else {
+            f.konst << spare >> spare
+        };
+    } else if from_ty.is_unsigned() {
+        // No arithmetic is modelled in a narrow unsigned type, so what has
+        // a form here is one opaque value; anything else is refused rather
+        // than trusted.
+        let is_one_value = f.konst == 0
+            && f.march == 0
+            && (f.syms.is_empty() || (f.root == 0 && f.syms.len() == 1 && f.syms[0].1 == 1));
+        if !is_one_value {
+            return None;
+        }
+    }
+    Some(f)
+}
+
 pub(crate) fn resolve_lin_form(
     func: &IrFunction,
     defs: &FxHashMap<u32, &Instruction>,
@@ -486,25 +572,45 @@ pub(crate) fn resolve_lin_form(
         });
     }
 
-    if def_bi == cur_header {
-        if matches!(inst, Instruction::Phi { .. }) {
-            let (init_op, stride) = striding_phi(defs, v)?;
-            let mut f = match init_op {
-                Operand::Value(init_v) => resolve_lin_form(
-                    func, defs, lp_body, def_block, multi_def, cur_header, init_v, fuel,
-                )?,
-                Operand::Const(c) => LinForm {
-                    root: 0,
-                    syms: vec![],
-                    konst: c.to_i64()?,
-                    march: 0,
-                },
-            };
-            f.march = f.march.checked_add(stride)?;
-            return Some(f);
+    if def_bi == cur_header
+        && let Instruction::Phi { ty, .. } = inst
+    {
+        // `init + stride * t` is what the phi holds on trip `t` only while
+        // its increment does not wrap.
+        if !arithmetic_is_exact(func, *ty) {
+            return None;
         }
-        return None;
+        let (init_op, stride) = striding_phi(defs, v)?;
+        let mut f = match init_op {
+            Operand::Value(init_v) => resolve_lin_form(
+                func, defs, lp_body, def_block, multi_def, cur_header, init_v, fuel,
+            )?,
+            Operand::Const(c) => LinForm {
+                root: 0,
+                syms: vec![],
+                konst: c.to_i64()?,
+                march: 0,
+            },
+        };
+        f.march = f.march.checked_add(stride)?;
+        return Some(f);
     }
+    // Anything else the header defines is an instruction of the loop like
+    // those of every other block: it runs once per trip on that trip's
+    // values. (A bottom-tested loop computes its addresses in its header,
+    // which is its body; refusing them here left every such loop that
+    // stores without a single form, and so without a hoisted load.)
+
+    // A value this does not see into: an object of its own, unless the
+    // loop computes it, in which case nothing is known of it.
+    let opaque = || {
+        (!lp_body.contains(&def_bi)).then(|| LinForm {
+            root: object_root(inst, v),
+            syms: vec![],
+            konst: 0,
+            march: 0,
+        })
+    };
 
     match inst {
         Instruction::Copy {
@@ -513,14 +619,33 @@ pub(crate) fn resolve_lin_form(
         } => resolve_lin_form(
             func, defs, lp_body, def_block, multi_def, cur_header, *src, fuel,
         ),
+        // A copy of a constant is that constant, exactly as a header phi
+        // that starts at a constant starts there (above). Loop rotation
+        // leaves such copies: the guard's phis have one way in once the
+        // back edge is gone, and the induction variable of the rotated
+        // loop starts at one of them. Without this arm the copy was an
+        // object of its own, a scaled index over it had no form, and the
+        // loop's stores could not be told apart from its loads.
+        Instruction::Copy {
+            src: Operand::Const(c),
+            ..
+        } => Some(LinForm {
+            root: 0,
+            syms: vec![],
+            konst: c.to_i64()?,
+            march: 0,
+        }),
         Instruction::Cast {
             src: Operand::Value(src),
             from_ty,
             to_ty,
             ..
-        } if from_ty.size() <= to_ty.size() => resolve_lin_form(
-            func, defs, lp_body, def_block, multi_def, cur_header, *src, fuel,
-        ),
+        } if from_ty.size() <= to_ty.size() => {
+            let f = resolve_lin_form(
+                func, defs, lp_body, def_block, multi_def, cur_header, *src, fuel,
+            )?;
+            widened_form(f, *from_ty, *to_ty).or_else(opaque)
+        }
         Instruction::GetElementPtr { base, offset, .. } => {
             let mut f = resolve_lin_form(
                 func, defs, lp_body, def_block, multi_def, cur_header, *base, fuel,
@@ -538,6 +663,9 @@ pub(crate) fn resolve_lin_form(
             }
             Some(f)
         }
+        // The three arithmetic arms model the operation over the integers,
+        // which it is only in a type that does not wrap under it.
+        Instruction::BinOp { ty, .. } if !arithmetic_is_exact(func, *ty) => opaque(),
         Instruction::BinOp {
             op: IrBinOp::Add,
             lhs,
@@ -644,7 +772,9 @@ pub(crate) fn resolve_lin_form(
                 let Instruction::Phi { dest, ty: ity, .. } = binst else {
                     continue;
                 };
-                if *ity == IrType::Ptr {
+                // The pointer is `init + ratio * (iv - iv0)` only while the
+                // counter it is paired with does not wrap under it.
+                if *ity == IrType::Ptr || !arithmetic_is_exact(func, *ity) {
                     continue;
                 }
                 let Some((iv_init_op, iv_stride)) = striding_phi(defs, *dest) else {
@@ -677,17 +807,7 @@ pub(crate) fn resolve_lin_form(
             f.syms.sort_unstable_by_key(|s| s.0);
             Some(f)
         }
-        _ => {
-            if lp_body.contains(&def_bi) {
-                return None;
-            }
-            Some(LinForm {
-                root: object_root(inst, v),
-                syms: vec![],
-                konst: 0,
-                march: 0,
-            })
-        }
+        _ => opaque(),
     }
 }
 
@@ -900,6 +1020,15 @@ fn next_value(func: &mut IrFunction) -> Option<Value> {
     Some(Value(id))
 }
 
+/// `count` fresh consecutive block labels; the first is returned. `None`
+/// (and nothing allocated) when the label space is exhausted.
+fn next_labels(func: &mut IrFunction, count: u32) -> Option<BlockId> {
+    let max_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    let first = func.next_label.max(max_label.saturating_add(1));
+    func.next_label = first.checked_add(count)?;
+    Some(BlockId(first))
+}
+
 fn collect_defs(
     func: &IrFunction,
 ) -> (
@@ -948,6 +1077,10 @@ struct PromotePlan {
     /// route the exit edge through a did-iterate check (see
     /// `find_promotion` tier 2).
     guarded_writeback: bool,
+    /// The exit block is reached from outside the loop as well
+    /// ([`LoopShape::exit_is_shared`]): the writeback goes into a new block
+    /// on the exit edge. Never set together with `guarded_writeback`.
+    split_exit_edge: bool,
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
@@ -955,7 +1088,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 }
 
 /// `name -> (size, align)` of the module's unexposed static globals.
-type UnexposedGlobals = FxHashMap<String, (usize, usize)>;
+pub(crate) type UnexposedGlobals = FxHashMap<String, (usize, usize)>;
 
 /// Module-entry wrapper: computes the set of internal globals whose address
 /// is provably never exposed, then promotes with that knowledge. A load or
@@ -996,7 +1129,7 @@ pub(crate) fn run_module(module: &mut crate::ir::module::IrModule) -> usize {
 ///     followed transitively through `Copy` — is a direct `Load.ptr` or
 ///     `Store.ptr` (the STORED VALUE being the address is an escape, as is
 ///     any GEP/Cast/Phi/Select/call/compare/terminator use).
-fn unexposed_static_globals(module: &crate::ir::module::IrModule) -> UnexposedGlobals {
+pub(crate) fn unexposed_static_globals(module: &crate::ir::module::IrModule) -> UnexposedGlobals {
     let mut cand: UnexposedGlobals = module
         .globals
         .iter()
@@ -1124,7 +1257,9 @@ fn unexposed_static_globals(module: &crate::ir::module::IrModule) -> UnexposedGl
     cand
 }
 
-fn run_with(func: &mut IrFunction, safe_globals: &UnexposedGlobals) -> usize {
+/// Promote in one function, given the module's unexposed static globals
+/// ([`unexposed_static_globals`]).
+pub(crate) fn run_with(func: &mut IrFunction, safe_globals: &UnexposedGlobals) -> usize {
     // One pointer per `run_once`: indices stay honest and a promoted loop
     // no longer matches. Each success strictly drops the loop's memop count.
     let mut total = 0;
@@ -1151,12 +1286,17 @@ struct LoopShape {
     latch: usize,
     exit_from: usize,
     exit_block: usize,
+    /// Blocks other than the exiting one reach the exit block as well: a
+    /// store placed in it would run on paths that never entered the loop,
+    /// so the writeback needs a block of its own on the exit edge.
+    exit_is_shared: bool,
 }
 
-/// Vet the loop's control shape: a dedicated preheader, exactly one latch,
-/// exactly one exit edge, and an exit block whose ONLY predecessor is the
-/// exiting block (so the exit store is the unique writeback and the exit
-/// block is not also a join or the preheader).
+/// Vet the loop's control shape: a dedicated preheader, exactly one latch
+/// and exactly one exit edge, so that one place is passed exactly when the
+/// loop is left and the writeback there is the unique one. Whether that
+/// place is the exit block itself or has to be made on the edge is
+/// [`LoopShape::exit_is_shared`].
 fn loop_shape(
     func: &IrFunction,
     cfg: &CfgAnalysis,
@@ -1194,20 +1334,53 @@ fn loop_shape(
     if exit_block >= func.blocks.len() {
         return None;
     }
-    if cfg
+    let exit_is_shared = cfg
         .preds
         .row(exit_block)
         .iter()
-        .any(|&p| p as usize != exit_from)
-    {
-        return None;
-    }
+        .any(|&p| p as usize != exit_from);
     Some(LoopShape {
         preheader,
         latch: latches[0],
         exit_from,
         exit_block,
+        exit_is_shared,
     })
+}
+
+/// Whether the exit edge can be given a block of its own: the exiting
+/// block's terminator has to name the exit block in a label
+/// [`retarget_exit_edge`] can rewrite.
+fn exit_edge_can_be_split(func: &IrFunction, exit_from: usize) -> bool {
+    matches!(
+        func.blocks[exit_from].terminator,
+        Terminator::Branch(_) | Terminator::CondBranch { .. }
+    )
+}
+
+/// Point the exit edge `exit_from -> exit` at `to` instead. Returns whether
+/// an edge was rewritten.
+fn retarget_exit_edge(term: &mut Terminator, exit: BlockId, to: BlockId) -> bool {
+    let mut hit = false;
+    let mut retarget = |l: &mut BlockId| {
+        if *l == exit {
+            *l = to;
+            hit = true;
+        }
+    };
+    match term {
+        Terminator::Branch(t) => retarget(t),
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            retarget(true_label);
+            retarget(false_label);
+        }
+        _ => {}
+    }
+    hit
 }
 
 fn find_promotion(func: &IrFunction, safe_globals: &UnexposedGlobals) -> Option<PromotePlan> {
@@ -1245,10 +1418,16 @@ fn find_promotion(func: &IrFunction, safe_globals: &UnexposedGlobals) -> Option<
             latch,
             exit_from,
             exit_block,
+            exit_is_shared,
         }) = loop_shape(func, &cfg, lp)
         else {
             continue;
         };
+        // A shared exit block takes the writeback on the exit edge, which
+        // has to be splittable.
+        if exit_is_shared && !exit_edge_can_be_split(func, exit_from) {
+            continue;
+        }
 
         let mut loads: FxHashMap<u32, Vec<(usize, usize, Value, IrType, AddressSpace)>> =
             FxHashMap::default();
@@ -1385,16 +1564,16 @@ fn find_promotion(func: &IrFunction, safe_globals: &UnexposedGlobals) -> Option<
             )
                 // The guard retargets the exit edge, giving the exit block a
                 // second predecessor; a phi there would need a new incoming.
+                // (A shared exit block is left alone for the same reason:
+                // its phis name the exiting block.)
+                && !exit_is_shared
                 && !func.blocks[exit_block]
                     .instructions
                     .iter()
                     .any(|i| matches!(i, Instruction::Phi { .. }))
                 // Retargeting rewrites a Branch/CondBranch label; any other
                 // exit terminator (switch, computed goto) is not handled.
-                && matches!(
-                    func.blocks[exit_from].terminator,
-                    Terminator::Branch(_) | Terminator::CondBranch { .. }
-                )
+                && exit_edge_can_be_split(func, exit_from)
             {
                 guarded_writeback = true;
             } else {
@@ -1487,6 +1666,7 @@ fn find_promotion(func: &IrFunction, safe_globals: &UnexposedGlobals) -> Option<
                 exit_block,
                 store_dominates_exit: dominates(&cfg.idom, exit_from, *store_b),
                 guarded_writeback,
+                split_exit_edge: exit_is_shared,
             });
         }
     }
@@ -1509,13 +1689,19 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
         let Some(cond) = next_value(func) else {
             return 0;
         };
-        let max_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
-        let first = func.next_label.max(max_label.saturating_add(1));
-        let Some(end) = first.checked_add(2) else {
+        let Some(first) = next_labels(func, 2) else {
             return 0;
         };
-        func.next_label = end;
-        Some((flag, cond, BlockId(first), BlockId(first + 1)))
+        Some((flag, cond, first, BlockId(first.0 + 1)))
+    } else {
+        None
+    };
+    let writeback_block = if plan.split_exit_edge {
+        debug_assert!(!plan.guarded_writeback, "a shared exit is never guarded");
+        let Some(label) = next_labels(func, 1) else {
+            return 0;
+        };
+        Some(label)
     } else {
         None
     };
@@ -1591,54 +1777,76 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
         remove_inst(&mut func.blocks[plan.store_b], si);
     }
 
+    let writeback = Instruction::Store {
+        volatile: false,
+        val: exit_val,
+        ptr: plan.ptr,
+        ty: plan.load_ty,
+        seg_override: plan.load_seg,
+    };
     match guard {
-        None => {
-            let exit_insert = first_non_phi(&func.blocks[plan.exit_block]);
-            insert_inst(
-                &mut func.blocks[plan.exit_block],
-                exit_insert,
-                Instruction::Store {
-                    volatile: false,
-                    val: exit_val,
-                    ptr: plan.ptr,
-                    ty: plan.load_ty,
-                    seg_override: plan.load_seg,
-                },
-            );
-        }
+        None => match writeback_block {
+            None => {
+                let exit_insert = first_non_phi(&func.blocks[plan.exit_block]);
+                insert_inst(&mut func.blocks[plan.exit_block], exit_insert, writeback);
+            }
+            Some(store_label) => {
+                // The exit block is a join: the writeback gets the exit
+                // edge to itself, so it runs exactly when the loop is left
+                // and never on a path that went around the loop. The exit
+                // block's phis took their value over that edge from the
+                // exiting block; they take it from the new block now.
+                let exit_label = func.blocks[plan.exit_block].label;
+                let from_label = func.blocks[plan.exit_from].label;
+                let split = retarget_exit_edge(
+                    &mut func.blocks[plan.exit_from].terminator,
+                    exit_label,
+                    store_label,
+                );
+                // `find_promotion` admits a shared exit only behind a
+                // Branch/CondBranch (`exit_edge_can_be_split`).
+                debug_assert!(split, "the exit edge of a shared exit is splittable");
+                for inst in &mut func.blocks[plan.exit_block].instructions {
+                    if let Instruction::Phi { incoming, .. } = inst {
+                        for (_, from) in incoming.iter_mut().filter(|(_, from)| *from == from_label)
+                        {
+                            *from = store_label;
+                        }
+                    }
+                }
+                // Behind the exiting block, so the loop falls out into it.
+                func.blocks.insert(
+                    plan.exit_from + 1,
+                    BasicBlock {
+                        label: store_label,
+                        instructions: vec![writeback],
+                        source_spans: Vec::new(),
+                        source_inline_ids: Vec::new(),
+                        terminator: Terminator::Branch(exit_label),
+                    },
+                );
+            }
+        },
         Some((flag, cond, check_label, store_label)) => {
             // Route the single exit edge through `check`: writeback runs
             // only when the latch executed at least once, so the zero-trip
             // path performs exactly the accesses the original program did
             // (plus the benign speculative preheader load).
             let exit_label = func.blocks[plan.exit_block].label;
-            let retarget = |l: &mut BlockId| {
-                if *l == exit_label {
-                    *l = check_label;
-                }
-            };
-            match &mut func.blocks[plan.exit_from].terminator {
-                Terminator::Branch(t) => retarget(t),
-                Terminator::CondBranch {
-                    true_label,
-                    false_label,
-                    ..
-                } => {
-                    retarget(true_label);
-                    retarget(false_label);
-                }
-                // find_promotion only admits Branch/CondBranch exit edges;
-                // anything else means the plan is stale — leave the exit
-                // store out rather than corrupt the CFG. The loop itself is
-                // already rewritten consistently (phi + removed accesses),
-                // so memory would be stale: panic in debug to surface it.
-                other => {
-                    debug_assert!(
-                        false,
-                        "guarded writeback with non-branch exit terminator {other:?}"
-                    );
-                }
-            }
+            let retargeted = retarget_exit_edge(
+                &mut func.blocks[plan.exit_from].terminator,
+                exit_label,
+                check_label,
+            );
+            // find_promotion only admits Branch/CondBranch exit edges;
+            // anything else means the plan is stale. The loop itself is
+            // already rewritten consistently (phi + removed accesses), so
+            // memory would be stale: panic in debug to surface it.
+            debug_assert!(
+                retargeted,
+                "guarded writeback with a non-branch exit terminator {:?}",
+                func.blocks[plan.exit_from].terminator
+            );
             func.blocks.push(BasicBlock {
                 label: check_label,
                 instructions: vec![Instruction::Cmp {
@@ -1658,13 +1866,7 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
             });
             func.blocks.push(BasicBlock {
                 label: store_label,
-                instructions: vec![Instruction::Store {
-                    volatile: false,
-                    val: exit_val,
-                    ptr: plan.ptr,
-                    ty: plan.load_ty,
-                    seg_override: plan.load_seg,
-                }],
+                instructions: vec![writeback],
                 source_spans: Vec::new(),
                 source_inline_ids: Vec::new(),
                 terminator: Terminator::Branch(exit_label),
@@ -2142,6 +2344,494 @@ mod tests {
         assert!(
             matches!(val, Operand::Value(v) if v.0 == 2),
             "do-while exit store must write the latch new-value, got {val:?}"
+        );
+    }
+
+    /// `if (n > 0) do { *p += i; } while (++i < n);` with the guard's other
+    /// arm joining right behind the loop: the shape of a rotated loop.
+    /// `p` is a parameter, so nothing may touch `*p` unless the loop runs.
+    ///
+    /// ```text
+    /// 0: p = param 0; n = param 1; c = 0 < n; br c ? 1 : 3
+    /// 1: br 2                                   (preheader)
+    /// 2: i = phi(0 from 1, i2 from 2); x = load p; y = x + i; store y, p;
+    ///    i2 = i + 1; c2 = i2 < n; br c2 ? 2 : 3
+    /// 3: r = phi(0 from 0, i2 from 2); ret r    (the join)
+    /// ```
+    fn guarded_loop_with_a_shared_exit(exit_from: Terminator) -> IrFunction {
+        let mut func = IrFunction::new("acc".to_string(), IrType::I64, vec![], false);
+        let v = |n: u32| Operand::Value(Value(n));
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 1,
+                        ty: IrType::I64,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: crate::ir::reexports::IrCmpOp::Slt,
+                        lhs: Operand::Const(IrConst::I64(0)),
+                        rhs: v(1),
+                        ty: IrType::I64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: v(2),
+                    true_label: BlockId(1),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(1, vec![], Terminator::Branch(BlockId(2))),
+            block(
+                2,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(3),
+                        ty: IrType::I64,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I64(0)), BlockId(1)),
+                            (v(6), BlockId(2)),
+                        ],
+                    },
+                    Instruction::Load {
+                        volatile: false,
+                        dest: Value(4),
+                        ptr: Value(0),
+                        ty: IrType::I64,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(5),
+                        op: IrBinOp::Add,
+                        lhs: v(4),
+                        rhs: v(3),
+                        ty: IrType::I64,
+                    },
+                    Instruction::Store {
+                        volatile: false,
+                        val: v(5),
+                        ptr: Value(0),
+                        ty: IrType::I64,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(6),
+                        op: IrBinOp::Add,
+                        lhs: v(3),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(7),
+                        op: crate::ir::reexports::IrCmpOp::Slt,
+                        lhs: v(6),
+                        rhs: v(1),
+                        ty: IrType::I64,
+                    },
+                ],
+                exit_from,
+            ),
+            block(
+                3,
+                vec![Instruction::Phi {
+                    dest: Value(8),
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                        (v(6), BlockId(2)),
+                    ],
+                }],
+                Terminator::Return(Some(v(8))),
+            ),
+        ];
+        func.next_value_id = 9;
+        func.next_label = 4;
+        func
+    }
+
+    fn stores_in(block: &BasicBlock) -> usize {
+        block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Store { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_shared_exit_takes_the_writeback_on_the_exit_edge() {
+        let mut func = guarded_loop_with_a_shared_exit(Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(2),
+            false_label: BlockId(3),
+        });
+        assert_eq!(run(&mut func), 1, "the recurrence is promoted");
+
+        let at = |label: u32| {
+            func.blocks
+                .iter()
+                .position(|b| b.label == BlockId(label))
+                .unwrap()
+        };
+        // The loop holds neither access any more; its exit edge leads to a
+        // new block that follows it and holds the one store.
+        let body = &func.blocks[at(2)];
+        assert_eq!(stores_in(body), 0);
+        assert!(
+            !body
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { .. }))
+        );
+        let Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } = body.terminator
+        else {
+            panic!("the latch still ends in its test");
+        };
+        assert_eq!(true_label, BlockId(2));
+        assert_ne!(false_label, BlockId(3), "the exit edge is split");
+        let writeback = &func.blocks[at(false_label.0)];
+        assert_eq!(
+            at(false_label.0),
+            at(2) + 1,
+            "the loop falls out into the writeback"
+        );
+        assert!(matches!(
+            writeback.terminator,
+            Terminator::Branch(BlockId(3))
+        ));
+        assert!(
+            matches!(
+                writeback.instructions.as_slice(),
+                [Instruction::Store {
+                    val: Operand::Value(Value(5)),
+                    ptr: Value(0),
+                    ..
+                }]
+            ),
+            "the writeback stores the last trip's value: {:?}",
+            writeback.instructions
+        );
+        // The path around the loop touches the memory nowhere.
+        assert_eq!(
+            stores_in(&func.blocks[at(0)]) + stores_in(&func.blocks[at(3)]),
+            0
+        );
+        assert!(
+            !func.blocks[at(0)]
+                .instructions
+                .iter()
+                .chain(&func.blocks[at(3)].instructions)
+                .any(|i| matches!(i, Instruction::Load { .. })),
+            "the load runs in the preheader only"
+        );
+        assert!(matches!(
+            func.blocks[at(1)].instructions.as_slice(),
+            [Instruction::Load { ptr: Value(0), .. }]
+        ));
+        // The join's phi takes the loop's value over the new block.
+        let Instruction::Phi { incoming, .. } = &func.blocks[at(3)].instructions[0] else {
+            panic!("the join keeps its phi first");
+        };
+        let mut from: Vec<u32> = incoming.iter().map(|(_, b)| b.0).collect();
+        from.sort_unstable();
+        let mut expected = vec![0, false_label.0];
+        expected.sort_unstable();
+        assert_eq!(from, expected);
+
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "loop_memory_promote", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// The exit edge of a `switch` cannot be given a block of its own by
+    /// rewriting one label: the loop is left as it is.
+    #[test]
+    fn a_shared_exit_behind_a_switch_is_declined() {
+        let mut func = guarded_loop_with_a_shared_exit(Terminator::Switch {
+            val: Operand::Value(Value(7)),
+            cases: vec![(1, BlockId(2))],
+            default: BlockId(3),
+            ty: IrType::I32,
+        });
+        let before = format!("{:?}", func.blocks);
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(format!("{:?}", func.blocks), before);
+    }
+
+    // ── Linear forms: what is exact, and what is not ────────────────────────
+
+    /// The form of the address `a + 4 * (i + 1)` in the loop
+    /// ```text
+    ///   0: a = param 0                               -> 1
+    ///   1: i = phi [START, 0] [i', 1]
+    ///      n = i + 1          (in `ty`)
+    ///      w = cast n : ty -> I64
+    ///      o = w << 2 ; q = gep a, o ; store 0 -> q
+    ///      i' = i + 1 ; c = i' < 100                 -> 1 | 2
+    ///   2: ret
+    /// ```
+    /// a bottom-tested loop whose one block is its header. `in_header`
+    /// false moves everything but the phi into a block of its own.
+    fn form_of_indexed_store(
+        ty: IrType,
+        start: i64,
+        wraps: bool,
+        in_header: bool,
+    ) -> Option<LinForm> {
+        let v = |n: u32| Operand::Value(Value(n));
+        let k = |n: i64| Operand::Const(crate::ir::reexports::IrConst::I64(n));
+        let add = |dest: u32, lhs: Operand, rhs: Operand, ty: IrType| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty,
+        };
+        let body = vec![
+            add(11, v(10), k(1), ty),
+            Instruction::Cast {
+                dest: Value(12),
+                src: v(11),
+                from_ty: ty,
+                to_ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(13),
+                op: IrBinOp::Shl,
+                lhs: v(12),
+                rhs: k(2),
+                ty: IrType::I64,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(14),
+                base: Value(1),
+                offset: v(13),
+                ty: IrType::Ptr,
+            },
+            Instruction::Store {
+                val: k(0),
+                ptr: Value(14),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            add(15, v(10), k(1), ty),
+            Instruction::Cmp {
+                dest: Value(16),
+                op: crate::ir::reexports::IrCmpOp::Slt,
+                lhs: v(15),
+                rhs: k(100),
+                ty,
+            },
+        ];
+        let phi = Instruction::Phi {
+            dest: Value(10),
+            ty,
+            incoming: vec![
+                (k(start), BlockId(0)),
+                (v(15), BlockId(if in_header { 1 } else { 3 })),
+            ],
+        };
+        let entry = block(
+            0,
+            vec![Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 0,
+                ty: IrType::Ptr,
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let leave = block(2, vec![], Terminator::Return(None));
+        let back = |from_true: u32| Terminator::CondBranch {
+            cond: v(16),
+            true_label: BlockId(from_true),
+            false_label: BlockId(2),
+        };
+        let mut func = IrFunction::new("f".into(), IrType::Void, vec![], false);
+        func.pass_policy.wrap_signed_overflow = wraps;
+        let (header, body_of_loop): (usize, FxHashSet<usize>) = if in_header {
+            let mut insts = vec![phi];
+            insts.extend(body);
+            func.blocks = vec![entry, block(1, insts, back(1)), leave];
+            (1, [1].into_iter().collect())
+        } else {
+            func.blocks = vec![
+                entry,
+                block(1, vec![phi], Terminator::Branch(BlockId(3))),
+                leave,
+                block(3, body, back(1)),
+            ];
+            (1, [1, 3].into_iter().collect())
+        };
+        let mut defs = FxHashMap::default();
+        let mut def_block = FxHashMap::default();
+        for (b, blk) in func.blocks.iter().enumerate() {
+            for inst in &blk.instructions {
+                if let Some(dest) = inst.dest() {
+                    defs.insert(dest.0, inst);
+                    def_block.insert(dest.0, b);
+                }
+            }
+        }
+        resolve_lin_form(
+            &func,
+            &defs,
+            &body_of_loop,
+            &def_block,
+            &FxHashSet::default(),
+            header,
+            Value(14),
+            32,
+        )
+    }
+
+    #[test]
+    fn a_signed_counter_is_linear_and_an_unsigned_one_is_not() {
+        for in_header in [false, true] {
+            // `int i`: overflow is undefined, so `a[i + 1]` is `a + 4i + 4`.
+            let f = form_of_indexed_store(IrType::I32, 5, false, in_header).expect("a form");
+            assert_eq!(
+                (f.konst, f.march, f.syms.len()),
+                (4 * 6, 4, 0),
+                "in_header={in_header}"
+            );
+            assert_eq!(f.root, TAG_PARAM);
+            // `unsigned i`: at UINT_MAX, `a[i + 1]` is `a[0]`.
+            assert_eq!(
+                form_of_indexed_store(IrType::U32, 5, false, in_header),
+                None
+            );
+            assert_eq!(
+                form_of_indexed_store(IrType::U16, 5, false, in_header),
+                None
+            );
+            assert_eq!(form_of_indexed_store(IrType::U8, 5, false, in_header), None);
+            // `-fwrapv` defines the signed wrap as well.
+            assert_eq!(form_of_indexed_store(IrType::I32, 5, true, in_header), None);
+            // At the width of the address the counter wraps as the address does.
+            for ty in [IrType::I64, IrType::U64] {
+                for wraps in [false, true] {
+                    let f = form_of_indexed_store(ty, 5, wraps, in_header).expect("a form");
+                    assert_eq!((f.konst, f.march), (24, 4), "{ty:?} wraps={wraps}");
+                }
+            }
+        }
+    }
+
+    /// A bottom-tested loop computes its addresses in its header: they are
+    /// instructions of the loop like any other.
+    #[test]
+    fn what_the_header_computes_has_a_form() {
+        assert_eq!(
+            form_of_indexed_store(IrType::I32, 0, false, true),
+            form_of_indexed_store(IrType::I32, 0, false, false)
+        );
+        assert!(form_of_indexed_store(IrType::I32, 0, false, true).is_some());
+    }
+
+    #[test]
+    fn a_widening_cast_keeps_the_number_or_has_no_form() {
+        let constant = |konst: i64| LinForm {
+            root: 0,
+            syms: vec![],
+            konst,
+            march: 0,
+        };
+        let symbol = |konst: i64| LinForm {
+            root: 0,
+            syms: vec![(7, 1)],
+            konst,
+            march: 0,
+        };
+        use IrType::{F64, I8, I16, I32, I64, Ptr, U8, U16, U32, U64};
+        // Sign extension keeps a signed number, into a signed or an
+        // address-wide type.
+        assert_eq!(widened_form(symbol(3), I32, I64), Some(symbol(3)));
+        assert_eq!(widened_form(symbol(3), I32, U64), Some(symbol(3)));
+        assert_eq!(widened_form(symbol(3), I32, Ptr), Some(symbol(3)));
+        assert_eq!(widened_form(symbol(3), I16, I32), Some(symbol(3)));
+        assert_eq!(
+            widened_form(symbol(3), I16, U32),
+            None,
+            "-1 becomes 4294967295"
+        );
+        assert_eq!(widened_form(symbol(3), I32, U32), None, "a change of sign");
+        // Zero extension keeps an unsigned number, of one opaque value.
+        assert_eq!(widened_form(symbol(0), U32, I64), Some(symbol(0)));
+        assert_eq!(widened_form(symbol(0), U16, U32), Some(symbol(0)));
+        assert_eq!(widened_form(symbol(0), U8, U8), Some(symbol(0)));
+        assert_eq!(widened_form(symbol(0), U32, I32), None, "a change of sign");
+        assert_eq!(
+            widened_form(symbol(1), U32, I64),
+            None,
+            "a sum in a type that wraps"
+        );
+        // A constant is read the way its type reads it.
+        assert_eq!(
+            widened_form(constant(-3), U32, I64),
+            Some(constant(4_294_967_293))
+        );
+        assert_eq!(
+            widened_form(constant(4_294_967_293), I32, I64),
+            Some(constant(-3))
+        );
+        assert_eq!(widened_form(constant(-3), I32, I64), Some(constant(-3)));
+        assert_eq!(widened_form(constant(255), I8, I32), Some(constant(-1)));
+        assert_eq!(widened_form(constant(-1), U16, U64), Some(constant(65_535)));
+        // At the width of an address both readings are one residue.
+        assert_eq!(widened_form(symbol(9), I64, U64), Some(symbol(9)));
+        assert_eq!(widened_form(symbol(9), U64, Ptr), Some(symbol(9)));
+        assert_eq!(widened_form(constant(-3), U64, I64), Some(constant(-3)));
+        // A truncation keeps no number, whatever the signs.
+        assert_eq!(widened_form(symbol(0), I64, I32), None);
+        assert_eq!(widened_form(symbol(0), U64, U32), None);
+        assert_eq!(widened_form(symbol(0), U32, U16), None);
+        assert_eq!(widened_form(constant(7), I32, I8), None);
+        // Not integers.
+        assert_eq!(widened_form(symbol(0), F64, I64), None);
+        assert_eq!(widened_form(symbol(0), I32, F64), None);
+    }
+
+    /// `i = phi [k, ..]` with the constant behind a copy, as loop rotation
+    /// leaves the guard's phis: the constant, not an object.
+    #[test]
+    fn a_copy_of_a_constant_is_the_constant() {
+        let copy = Instruction::Copy {
+            dest: Value(3),
+            src: Operand::Const(crate::ir::reexports::IrConst::I64(40)),
+        };
+        let mut defs = FxHashMap::default();
+        defs.insert(3, &copy);
+        let func = IrFunction::new("f".into(), IrType::Void, vec![], false);
+        let form = resolve_lin_form(
+            &func,
+            &defs,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            usize::MAX,
+            Value(3),
+            8,
+        );
+        assert_eq!(
+            form,
+            Some(LinForm {
+                root: 0,
+                syms: vec![],
+                konst: 40,
+                march: 0,
+            })
         );
     }
 }

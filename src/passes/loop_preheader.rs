@@ -203,14 +203,16 @@ struct Plan {
 /// something out of this loop.
 ///
 /// A dedicated preheader unlocks the hoists of what can fault: a **derived
-/// pointer** load (a parameter, a call result, a GEP chain), and a **call**
+/// pointer** load (a parameter, a call result, a GEP chain), a **call**
 /// other than to a C library function defined for every argument -- a
 /// read-only callee dereferences, and a read-none one that is not `fabs` or
-/// `sqrt` can still divide (`div` does).  LICM moves neither to a block that
-/// also branches around the loop (`licm.rs`).  Loads through an alloca or a
-/// direct `GlobalAddr` and calls to those library functions are already
-/// hoistable without one, so a loop with none of the former gains nothing and
-/// would only carry an empty block.
+/// `sqrt` can still divide (`div` does) -- and an integer **division or
+/// remainder**, which traps on a zero divisor and on `INT_MIN / -1`.  LICM
+/// moves none of them to a block that also branches around the loop
+/// (`licm.rs`).  Loads through an alloca or a direct `GlobalAddr` and calls
+/// to those library functions are already hoistable without one, so a loop
+/// with none of the former gains nothing and would only carry an empty
+/// block.
 ///
 /// The load must also sit in a block LICM's must-execute rule accepts: LICM
 /// requires the hoisted load's block to dominate **every** loop block, which
@@ -245,13 +247,12 @@ fn preheader_would_unlock_a_hoist(
     // cost is ~|body|^2/2 dominance walks of O(idom depth) each, ~12.5M walks on
     // a 5 000-block loop.  The header-only form is O(|body| * depth) once.
     //
-    // Measured effect on this repo today: none that is resolvable, because the
-    // pass fires on 0 of the 51 benchmark programs at default settings (it only
-    // fires on the preheader fixtures, 1 insertion each) -- `loop_rotate` is
-    // opt-in and the profitability gate rejects the rest.  This is a latent
-    // scalability fix for large real-world loops (kernel/glibc-scale CFGs),
-    // not a measured corpus win, and it is recorded that way rather than being
-    // sold as a speedup.
+    // Measured effect on this repo: none that is resolvable.  The pass inserts
+    // 7 preheaders in 6 of the 88 benchmark programs at default settings (the
+    // profitability gate rejects the rest), none of them in a loop large
+    // enough for the difference to show.  This is a latent scalability fix for
+    // large real-world loops (kernel/glibc-scale CFGs), not a measured corpus
+    // win, and it is recorded that way rather than being sold as a speedup.
     //
     // The assertion below keeps the proof honest: if LICM's must-execute rule is
     // ever relaxed from "is the header" to something weaker, the header-only
@@ -288,7 +289,12 @@ fn preheader_would_unlock_a_hoist(
                 }
                 Instruction::Call { func: callee, info }
                     if call_needs_dedicated_preheader(callee, info)
-                        && args_defined_outside(func, natural_loop, info) =>
+                        && defined_outside(func, natural_loop, &info.args) =>
+                {
+                    return true;
+                }
+                Instruction::BinOp { op, lhs, rhs, .. }
+                    if op.can_trap() && defined_outside(func, natural_loop, &[*lhs, *rhs]) =>
                 {
                     return true;
                 }
@@ -315,15 +321,11 @@ fn call_needs_dedicated_preheader(callee: &str, info: &crate::ir::reexports::Cal
     hoistable_shape && !super::licm::call_may_be_speculated(callee, info)
 }
 
-/// Whether every argument of the call is a constant or a value no loop block
-/// defines: the cheap half of loop invariance.  An argument computed in the
-/// loop keeps the call there, and a preheader spent on it unlocks nothing.
-fn args_defined_outside(
-    func: &IrFunction,
-    natural_loop: &NaturalLoop,
-    info: &crate::ir::reexports::CallInfo,
-) -> bool {
-    info.args.iter().all(|arg| match arg {
+/// Whether every operand is a constant or a value no loop block defines: the
+/// cheap half of loop invariance.  An operand computed in the loop keeps its
+/// call or division there, and a preheader spent on it unlocks nothing.
+fn defined_outside(func: &IrFunction, natural_loop: &NaturalLoop, operands: &[Operand]) -> bool {
+    operands.iter().all(|operand| match operand {
         Operand::Const(_) => true,
         Operand::Value(value) => !natural_loop
             .body

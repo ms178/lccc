@@ -157,9 +157,75 @@ passes; the backend peepholes are documented per backend
   (`tests/regression/lib/vector_fill_stress.py`).
 - **Widening + masked conditional-sum reductions** — I32->I64 `paddq`
   pipelines, VEX-only bodies (9x AVX-SSE transition penalty avoided).
-- **Loop rotation** (`loop_rotate.rs`, IR) — **opt-in** at the IR level
-  (`CCC_LOOP_ROTATE=1`), runs after vectorize; default-enable pending
-  hardening (see `engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md`).
+- **Loop rotation** (`loop_rotate.rs`, IR) — `while (c) body` becomes
+  `if (c) do body while (c)`. On by default at `-O2` and `-O3` **for the
+  loops where it pays** (`RotatePolicy::Profit`); not at `-O1`, `-Os`, `-Oz`.
+  The pipeline bottom-tests a loop whose test is register arithmetic without
+  it (`loop_invert`, after phi elimination), so what rotation adds is one
+  block: a preheader *behind the guard*, which runs exactly when the body
+  does. Three things can only be
+  moved there and nowhere else, because they must not run when the loop does
+  not:
+  - a load, a trapping division or remainder, or a read-only call with
+    loop-invariant operands in the body (LICM; a top-tested loop keeps them
+    in the loop, every trip);
+  - a memory recurrence through a pointer, `*p += x`, which the promoter
+    then keeps in a register with one load in front of the loop and one
+    store on its exit edge;
+  - a recurrence between elements, `a[i] = f(a[i-1])`, whose first load
+    loop-carried forwarding puts in front of the loop.
+
+  The decision is made by doing it: the candidate loops of a function are
+  rotated in a copy, the three passes run on the copy, and a loop pays when
+  what left it (a) had to wait for the guard, i.e. does not leave in a second
+  copy that is only hoisted, (b) is worth at least 1/32 of one trip, counting
+  a hoisted load as 1 instruction, a load replaced by a register recurrence
+  as 8 (it was a store-to-load forwarding per trip) and a division or call
+  as 24, and (c) when it is hoisted loads alone, holds no more registers
+  through the loop than before (each load takes one of its class; an address
+  nothing reads from the loop on gives one back). Only the loop's own
+  instructions count, each known by the value it defines: what an inner loop
+  lost is the inner loop's gain, and a load the promoter put in front of an
+  inner loop is not a load that left. Stores are not counted: one that
+  leaves does so together with the load of its recurrence. Loops that do
+  not pay are set aside and the rest retried; a function in which none pays
+  keeps its IR untouched, value numbers included. `[PASS]` reports
+  `loop_rotate (func F): Ns (N loops, M moved)`; `CCC_DEBUG_LOOP_ROTATE=1`
+  names, per loop, what left it (`rotation pays: 1 carried load left the
+  loop, worth 8 of a trip of 8`) or why it was undone (`nothing left the
+  loop`, `nothing left the loop that had to wait for the guard`, `... worth
+  1 of a trip of 41232`, `... and the loop holds more registers for it`).
+
+  Which loops are tried at all is a filter in front of that
+  (`has_guarded_hoist_candidate`): a block that runs on every trip holds a
+  load, a trapping division or a read-only call with operands the loop does
+  not compute, or a load through an address the loop computes next to a
+  store of that type; and for the loads, the loop's memory is known (no
+  call that may write, nothing that writes other than a plain store). Over
+  the 1,493 files of the regression corpus that is 1,161 trials, of which
+  46 loops pay; compile time rises by 0.3%.
+
+  The transformation itself takes multi-block bodies, several latches, exits
+  from the body and nests: the header's instructions are copied into a single
+  latch, and every reader of a header value gets the definition that reaches
+  it through merges built on demand (Braun et al.). What it refuses is listed
+  in `plan_rotation`, the only place that refuses.
+
+  Switches: `CCC_NO_LOOP_ROTATE` or `CCC_LOOP_ROTATE=0|false|no|off` turns it
+  off; `CCC_LOOP_ROTATE=1|true|yes|on|always` rotates *every* loop that can
+  be, early in iteration 0 (`RotatePolicy::Always`). That mode is a stress
+  test of the transformation, not an optimization level: measured over the
+  benchmark programs it costs 0.4% in instructions (`sha256_transform` +7.5%,
+  `reduction_vecreg` +9.1%), which is why the default asks for a reason per
+  loop. Measured for the default against the pipeline without it (87
+  programs, cachegrind `Ir`, identical outputs): no program slower,
+  `linux_rbtree` 2.45% faster; `*p += x` over 1,000 trips 1.81x faster,
+  `a[i] = a[i-1] + b[i]` through parameters 2.4x faster, level with GCC 16.2.
+  Gates: `tests/regression/check_loop_rotate_profit.sh` (the decision, read
+  off the assembly in both directions) and
+  `tests/regression/loop_rotate_profit_guarded_motion.c` (nothing that moved
+  runs when the loop does not: unmapped and read-only operands, zero
+  divisors, aliasing).
   Independently, the **ARM backend peephole rotates simple loops by default**
   (`rotate_simple_loops`, off only under `CCC_NO_LOOP_ROTATE`).
 - **General complete unrolling** — nested/multi-block constant-trip loops
