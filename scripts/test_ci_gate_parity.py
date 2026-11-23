@@ -46,6 +46,7 @@ from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 import importlib
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -298,6 +299,170 @@ class UniversalContractTest(unittest.TestCase):
             '--as "\\$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"', 1)
         self.assertEqual(self.check(local=local), 1)
 
+    def test_a_literal_pin_is_refused_wherever_it_stands(self) -> None:
+        # The two tests above rewrite the FIRST pinned assembler of the
+        # local mirror. They went red when a gate without a contract was
+        # registered in front of asmdiff's: the rule held for contracted
+        # programs only, and which line came first decided what the test
+        # tested. The pin of every gate is unopenable behind single quotes,
+        # so the rule is held here for every place either mirror names a
+        # tool of the pinned tree — whatever the line runs, and for the
+        # `[ -x ... ]` that decides whether a gate runs at all.
+        tool = re.compile(r'"(\$HOME/\.cache/gas-2\.47-[^"]*)"')
+
+        def spellings(m):
+            return (("single quotes", "'" + m.group(1) + "'"),
+                    ("escaped dollar", '"' + m.group(1).replace("$", "\\$") + '"'))
+
+        def logical_line(text: str, start: int, end: int) -> tuple[int, int]:
+            # The physical line and the lines a trailing backslash joins
+            # to it, as _logical_command_lines joins them.
+            a = text.rfind("\n", 0, start) + 1
+            while a > 1 and text[:a - 1].rstrip(" \t").endswith("\\"):
+                a = text.rfind("\n", 0, a - 1) + 1
+            b = text.find("\n", end)
+            b = len(text) if b < 0 else b
+            while b < len(text) and text[:b].rstrip(" \t").endswith("\\"):
+                nxt = text.find("\n", b + 1)
+                b = len(text) if nxt < 0 else nxt
+            return a, b
+
+        for side, text in (("local", self.local), ("hosted", self.hosted)):
+            places = list(tool.finditer(text))
+            self.assertGreater(len(places), 30, side)
+            outside = []
+            for m in places:
+                a, b = logical_line(text, m.start(), m.end())
+                (clean,) = parity._logical_command_lines(text[a:b])
+                self.assertIsNone(parity._literal_pin(clean), clean.display())
+                if not any(prog in clean.tokens for prog in parity.GUARDED_PROGRAMS):
+                    outside.append(m)
+                for how, spelling in spellings(m):
+                    with self.subTest(side=side, at=m.start(), how=how):
+                        line = text[a:m.start()] + spelling + text[m.end():b]
+                        (cmd,) = parity._logical_command_lines(line)
+                        self.assertEqual(parity._literal_pin(cmd), next(
+                            raw for raw in cmd.raw if spelling in raw))
+            # Lines that run no contracted program are most of them; the
+            # walk reports those too, at the first, at the last, and at
+            # the first one no contract reaches.
+            self.assertGreater(len(outside), 10, side)
+            for m in (places[0], places[-1], outside[0]):
+                for how, spelling in spellings(m):
+                    with self.subTest(side=side, at=m.start(), how=how, through="the walk"):
+                        mutated = text[:m.start()] + spelling + text[m.end():]
+                        self.assertEqual(self.check(**{side: mutated}), 1)
+
+    def test_the_payload_of_bash_c_is_a_command_line_of_its_own(self) -> None:
+        # Single quotes around a `bash -c' payload are the calling shell's;
+        # inside it the pin expands. The rule for lines without a contract
+        # judges the payload, as the contracted path always did.
+        gate = ('python3 scripts/x86_vector_widths.py --check '
+                '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"')
+        self.assertIn(gate, self.local)
+        self.assertNotIn("scripts/x86_vector_widths.py", parity.GUARDED_PROGRAMS)
+        wrapped = self.local.replace(gate, "bash -c '" + gate + "'", 1)
+        self.assertEqual(self.check(local=wrapped), 0)
+        literal = self.local.replace(
+            gate, 'bash -c "' + gate.replace('"', "'") + '"', 1)
+        self.assertEqual(self.check(local=literal), 1)
+
+    def test_quoting_that_names_no_pinned_tool_is_none_of_the_rules_business(self) -> None:
+        # awk's `$1', a sed script, a quoted GitHub expression: the mirrors
+        # are full of dollar signs behind single quotes, and the clean tree
+        # has to pass. Only a tool of the pinned tree is the subject.
+        for line in (
+            "awk '{print $1}' target/list.txt",
+            "sed -e 's/$/ ok/' target/list.txt",
+            "printf '%s\\n' '$HOME is where the cache lives'",
+            "echo \"\\$HOME\"",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.check(local=self.local + "\n" + line + "\n"), 0)
+
+    def test_the_intrinsic_differentials_run_as_registered(self) -> None:
+        # Three gates whose verdict is GCC 16.2's. Each of these edits
+        # leaves a line that still runs and still prints PASS: without
+        # --check the census and the value differential only report; with
+        # another compiler or assembler they are another comparison.
+        local_gcc = '--gcc "${GCC16:-gcc-16}"'
+        hosted_gcc = '--gcc "${{ steps.gcc162.outputs.bin }}"'
+        pinned = '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"'
+        for side, text, lccc, gcc in (
+            ("local", self.local, '"$LCCC"', local_gcc),
+            ("hosted", self.hosted, "target/fastbuild/lccc", hosted_gcc),
+        ):
+            prefetch = f"python3 scripts/check_x86_prefetch.py {lccc}"
+            census = f"python3 scripts/x86_intrinsic_census.py --check --lccc {lccc}"
+            values = f"python3 scripts/x86_intrinsic_values.py --check --lccc {lccc}"
+            for name, old, new in (
+                ("census without --check", census, census.replace(" --check", "")),
+                ("values without --check", values, values.replace(" --check", "")),
+                ("a census that rewrites its record", census,
+                 census.replace("--check", "--update")),
+                ("prefetch of another binary", prefetch,
+                 prefetch.replace(lccc, "/usr/bin/gcc")),
+                ("census of another binary", census,
+                 census.replace(lccc, "/usr/bin/gcc")),
+                ("values of another binary", values,
+                 values.replace(lccc, "/usr/bin/gcc")),
+                ("a census of one header", census, census + " --list emmintrin.h"),
+                ("the values of one header", values, values + " --only emmintrin.h"),
+                ("the values at one level", values, values + " --levels -O2"),
+                ("a 32-bit half from another binary", prefetch,
+                 prefetch + " --lccc-i686 /usr/bin/gcc"),
+            ):
+                with self.subTest(side=side, edit=name):
+                    self.assertIn(old, text)
+                    self.assertEqual(self.check(**{side: text.replace(old, new, 1)}), 1)
+            # The reference compiler and the assembler, at each gate's own
+            # line: the first `--gcc` after the program's name is its own.
+            for program in ("check_x86_prefetch.py", "x86_intrinsic_census.py",
+                            "x86_intrinsic_values.py"):
+                start = text.index(f"python3 scripts/{program}")
+                at = text.index(gcc, start)
+                self.assertLess(at - start, 200, program)
+                with self.subTest(side=side, program=program, edit="another GCC"):
+                    mutated = text[:at] + "--gcc gcc" + text[at + len(gcc):]
+                    self.assertEqual(self.check(**{side: mutated}), 1)
+                with self.subTest(side=side, program=program, edit="no --gcc"):
+                    mutated = text[:at] + text[at + len(gcc):]
+                    self.assertEqual(self.check(**{side: mutated}), 1)
+            start = text.index("python3 scripts/x86_intrinsic_values.py")
+            at = text.index(pinned, start)
+            self.assertLess(at - start, 260)
+            for name, new in (
+                ("the image's assembler", "--as /usr/bin/as"),
+                ("no assembler", ""),
+                ("a sibling of the pin", pinned[:-1] + '-new"'),
+            ):
+                with self.subTest(side=side, edit=name):
+                    mutated = text[:at] + new + text[at + len(pinned):]
+                    self.assertEqual(self.check(**{side: mutated}), 1)
+            # The same tokens with the two values exchanged: the compiler
+            # is asked to assemble and the assembler to compile.
+            with self.subTest(side=side, edit="--gcc and --as exchanged"):
+                line = text[start:at + len(pinned)]
+                swapped = (line.replace(gcc, "--gcc " + pinned[len("--as "):])
+                           .replace(pinned, "--as " + gcc[len("--gcc "):]))
+                self.assertNotEqual(swapped, line)
+                self.assertEqual(sorted(swapped.split()), sorted(line.split()))
+                mutated = text[:start] + swapped + text[at + len(pinned):]
+                self.assertEqual(self.check(**{side: mutated}), 1)
+            # A second invocation beside the registered one is the line
+            # that runs ungated.
+            with self.subTest(side=side, edit="a second, weaker census"):
+                extra = census.replace(" --check", "")
+                self.assertEqual(
+                    self.check(**{side: text + "\n" + extra + "\n"}), 1)
+        # Deleting a gate from one mirror leaves a contract nothing matches.
+        for program in ("check_x86_prefetch.py", "x86_intrinsic_census.py",
+                        "x86_intrinsic_values.py"):
+            with self.subTest(program=program, edit="gone from the workflow"):
+                kept = "\n".join(line for line in self.hosted.splitlines()
+                                 if program not in line)
+                self.assertEqual(self.check(hosted=kept), 1)
+
     def test_brace_home_spelling_is_accepted(self) -> None:
         # R7: ${HOME} and $HOME expand identically — a working gate must
         # not be rejected for the spelling.
@@ -330,15 +495,24 @@ class UniversalContractTest(unittest.TestCase):
     def test_local_gate_registrations_are_speed_pinned(self) -> None:
         # The registration checks live in the contract walk: name AND
         # speed class, parsed (comment-immune). Demoting a fast gate to
-        # slow drops it from --fast runs, which is a coverage change.
+        # slow drops it from --fast runs, which is a coverage change; a
+        # slow gate promoted to fast puts minutes into the run people
+        # make before every commit, which is how a gate gets skipped.
+        classes = set()
         for contract in parity.INVOCATION_CONTRACTS:
             if contract.local_gate is None:
                 continue
             name, speed = contract.local_gate
+            other = {"fast": "slow", "slow": "fast"}[speed]
+            classes.add(speed)
             with self.subTest(gate=name):
                 local = self.local.replace(f'gate "{name}" {speed}',
-                                           f'gate "{name}" slow', 1)
+                                           f'gate "{name}" {other}', 1)
+                self.assertNotEqual(local, self.local)
                 self.assertEqual(self.check(local=local), 1)
+        # Both directions are exercised, not only the one the registry
+        # happened to hold when the test was written.
+        self.assertEqual(classes, {"fast", "slow"})
 
 
 class BenignWrapperTest(unittest.TestCase):

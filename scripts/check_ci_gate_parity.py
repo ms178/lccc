@@ -45,6 +45,11 @@ Shell-fidelity limits, stated honestly: tokens are compared after
 canonicalising `${VAR}` to `$VAR` (identical expansions), and any token
 whose raw spelling contains a single-quoted or backslash-escaped `$` is
 refused outright (a literal `$HOME/...` path can never be the working pin).
+For a contracted program that holds for every token of the invocation; for
+every other line of either mirror it holds for the tokens that name a tool
+of the provisioned binutils trees (PINNED_TREE), contracted or not — the
+pinned assembler of a gate nobody registered is as unopenable behind single
+quotes as asmdiff's.
 Execution channels that hide the program inside other tokens — command
 substitution, python -c payloads, encoded strings — are beyond static text
 parity and belong to review of the gate files themselves; the checker pins
@@ -208,6 +213,59 @@ class _Cmd:
 
     def display(self) -> str:
         return " ".join(self.raw)
+
+
+# Every tool of the provisioned binutils 2.47 trees is reached through this
+# prefix (scripts/ensure_gas_247.sh installs under it), in both mirrors.
+PINNED_TREE = "$HOME/.cache/gas-2.47-"
+_QUOTING = str.maketrans("", "", "'\"\\")
+
+
+def _literal_pin(cmd: _Cmd, depth: int = 0) -> str | None:
+    """The token of `cmd` that names a pinned tool the shell will not expand.
+
+    `'$HOME/.cache/gas-2.47-.../bin/as'` and `"\\$HOME/..."` hand the tool
+    a path that starts with a dollar sign. Under posix tokenisation both
+    compare equal to the working spelling, so the comparison is made on the
+    raw token. It is made for every line, whatever program the line runs:
+    the pin of a gate without a contract fails the same way, and so does
+    the `[ -x '$HOME/...' ]` that decides whether a gate runs at all.
+
+    Judged where the token lives, as _find_invocation does: the payload of
+    a `bash -c '...'` in command position is a command line of its own,
+    whose outer quotes belong to the calling shell.
+    """
+    payload: str | None = None
+    reduced = _reduce_head(cmd.tokens)
+    if reduced is not None and reduced[1] == "cc" and depth < 3:
+        payload = reduced[2]
+    for raw in cmd.raw:
+        if PINNED_TREE not in _canonical(raw.translate(_QUOTING)):
+            continue
+        if payload is not None and _unquoted(raw) == payload:
+            try:
+                tokens = shlex.split(payload, comments=True)
+                inner = shlex.split(payload, comments=True, posix=False)
+            except ValueError:
+                return raw
+            found = _literal_pin(
+                _Cmd(cmd.lineno, [_canonical(t) for t in tokens], inner),
+                depth + 1)
+            if found is not None:
+                return found
+            continue
+        if ("'" in raw or "\\" in raw) and "$" in raw:
+            return raw
+    return None
+
+
+def _unquoted(raw: str) -> str | None:
+    """What the shell passes for one raw token (None: more than one word)."""
+    try:
+        words = shlex.split(raw)
+    except ValueError:
+        return None
+    return words[0] if len(words) == 1 else None
 
 
 def _logical_command_lines(script: str) -> list[_Cmd]:
@@ -405,6 +463,9 @@ PINNED_OBJDUMP = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
 PINNED_A64_AS = "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as"
 PINNED_A64_OBJCOPY = "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
 PINNED_A64_OBJDUMP = "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objdump"
+# GCC 16.2 as the backend job's `gcc162` step provisions it: an output of a
+# step, so the text of the run body carries the expression, not a path.
+HOSTED_GCC162 = "${{ steps.gcc162.outputs.bin }}"
 
 
 @dataclass(frozen=True)
@@ -925,6 +986,63 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         },
         rest_spec=("--require-icx",),
     ),
+    # ── The x86 intrinsic differentials against GCC 16.2 ───────────────────
+    # The verdict of these three gates is the reference compiler's. Without
+    # `--check` the census and the value differential report and return 0;
+    # with another GCC they compare against another compiler's headers; and
+    # the value differential asks GNU as 2.47 whether lccc's assembly is
+    # assembly, which the assembler of the runner image answers differently
+    # for every instruction newer than itself. The local mirror names the
+    # compilers through its variables, the hosted job through the step that
+    # provisions GCC 16.2.
+    InvocationContract(
+        program="scripts/check_x86_prefetch.py",
+        name="x86-prefetch-instructions-local",
+        sides=frozenset({"local"}),
+        option_spec={"--gcc": ("${GCC16:-gcc-16}",)},
+        rest_spec=("$LCCC",),
+        local_gate=("x86-prefetch-instructions", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/check_x86_prefetch.py",
+        name="x86-prefetch-instructions-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={"--gcc": (HOSTED_GCC162,)},
+        rest_spec=("target/fastbuild/lccc",),
+    ),
+    InvocationContract(
+        program="scripts/x86_intrinsic_census.py",
+        name="x86-intrinsic-census-local",
+        sides=frozenset({"local"}),
+        option_spec={"--lccc": ("$LCCC",), "--gcc": ("${GCC16:-gcc-16}",)},
+        rest_spec=("--check",),
+        local_gate=("x86-intrinsic-census", "fast"),
+    ),
+    InvocationContract(
+        program="scripts/x86_intrinsic_census.py",
+        name="x86-intrinsic-census-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={"--lccc": ("target/fastbuild/lccc",),
+                     "--gcc": (HOSTED_GCC162,)},
+        rest_spec=("--check",),
+    ),
+    InvocationContract(
+        program="scripts/x86_intrinsic_values.py",
+        name="x86-intrinsic-values-local",
+        sides=frozenset({"local"}),
+        option_spec={"--lccc": ("$LCCC",), "--gcc": ("${GCC16:-gcc-16}",),
+                     "--as": (PINNED_AS,)},
+        rest_spec=("--check",),
+        local_gate=("x86-intrinsic-values", "slow"),
+    ),
+    InvocationContract(
+        program="scripts/x86_intrinsic_values.py",
+        name="x86-intrinsic-values-hosted",
+        sides=frozenset({"hosted"}),
+        option_spec={"--lccc": ("target/fastbuild/lccc",),
+                     "--gcc": (HOSTED_GCC162,), "--as": (PINNED_AS,)},
+        rest_spec=("--check",),
+    ),
 )
 
 # The programs under invocation contract — derived, never hand-maintained:
@@ -975,6 +1093,11 @@ PROGRAM_ENV_CHANNELS: dict[str, frozenset[str]] = {
         {"CCC_SIMPLIFY_SKIP", "CCC_DISABLE_PASSES", "CCC_VERIFY_IR",
          "CCC_VERIFY_REGALLOC", "CCC_NO_PEEPHOLE", "LCCC_AGENT_CACHE_PREFIX",
          "GCC", "CLANG", "CLANG23", "ICX", "LCCC_ICX_BIN"}),
+    # `GCC` is the default of --gcc in all three; the contracts spell the
+    # option, so a step that sets the variable too sets nothing.
+    "scripts/check_x86_prefetch.py": frozenset({"GCC"}),
+    "scripts/x86_intrinsic_census.py": frozenset({"GCC"}),
+    "scripts/x86_intrinsic_values.py": frozenset({"GCC"}),
 }
 
 
@@ -1665,6 +1788,10 @@ def check_invocation_contracts(local_text: str, hosted) -> int:
     gate registrations (parsed from comment-stripped `gate NAME fast'
     lines) must carry each contract's name and speed class.
 
+    One rule reaches past the contracted programs: no line of either
+    mirror may name a tool of the pinned binutils tree where the shell
+    does not expand it (_literal_pin).
+
     `hosted` is either the joined run-body text (synthetic blobs: the
     mutation tests) or the _RunStep records of the real tree. With
     records, the hosted side is checked STEP BY STEP — every `run:` block
@@ -1694,6 +1821,15 @@ def check_invocation_contracts(local_text: str, hosted) -> int:
 
     for side, unit, text in units:
         for cmd in _logical_command_lines(text):
+            literal = _literal_pin(cmd)
+            if literal is not None:
+                problems.append(
+                    f"{_location(side, unit, cmd)}: {literal} names a tool "
+                    "of the pinned binutils tree behind single quotes or an "
+                    "escaped dollar sign; the shell passes that text as it "
+                    "stands, and no such path exists — spell the pin in "
+                    f"double quotes: {cmd.display()}")
+                continue
             for program in GUARDED_PROGRAMS:
                 found = _find_invocation(cmd, program)
                 if found is None:
