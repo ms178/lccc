@@ -114,12 +114,21 @@ emit() {
   env -u CCC_LOOP_ROTATE -u CCC_NO_LOOP_ROTATE "$@" "$CCC" "$opt" -S "$src" -o "$out"
 }
 
-# trace <src.c> [VAR=VALUE...]: the pass's own account of what it did.
+# trace <src.c> [VAR=VALUE...]: the pass's own account of what it did, its
+# `[ROT]` lines, in $traced. The compiler's status is read on its own: a
+# compiler that died must not look like a pass that had nothing to say.
+traced=
 trace() {
-  local src=$1; shift
-  env -u CCC_LOOP_ROTATE -u CCC_NO_LOOP_ROTATE "$@" CCC_DEBUG_LOOP_ROTATE=1 \
-    "$CCC" -O2 -S "$src" -o /dev/null 2>&1 | grep -F '[ROT]' || true
+  local src=$1 all; shift
+  if ! all=$(env -u CCC_LOOP_ROTATE -u CCC_NO_LOOP_ROTATE "$@" CCC_DEBUG_LOOP_ROTATE=1 \
+      "$CCC" -O2 -S "$src" -o /dev/null 2>&1); then
+    printf 'FAIL: %s did not compile %s:\n%s\n' "$CCC" "$src" "$all" >&2
+    exit 1
+  fi
+  traced=$(sed -n '/\[ROT\]/p' <<<"$all")
 }
+# says <text>: whether the last trace has a line with <text> in it.
+says() { grep -qF -- "$1" <<<"$traced"; }
 
 # The function's loop: from the label its last conditional backward branch
 # names to that branch. (Each function measured here has one loop.)
@@ -170,7 +179,8 @@ expect "recurrence: the loop only stores"                "$(loop_of prefix "$wor
 expect "recurrence, rotation off: a load and a store"    "$(loop_of prefix "$work/prefix.off.s" | memory_in)" 2
 
 for shape in div acc prefix; do
-  if trace "$work/$shape.c" | grep -q 'rotation pays'; then
+  trace "$work/$shape.c"
+  if says 'rotation pays'; then
     ok "$shape: the trace names what left the loop"
   else
     bad "$shape: no 'rotation pays' line in the trace"
@@ -186,20 +196,23 @@ for shape in plain small reg; do
   fi
 done
 # The three are left alone for three reasons, and each is the one meant.
-if [[ -z $(trace "$work/plain.c") ]]; then
+trace "$work/plain.c"
+if [[ -z $traced ]]; then
   ok "plain: never a candidate (no trial rotation)"
 else
   bad "plain: the pass tried a loop nothing can leave"
 fi
-if trace "$work/small.c" | grep -q 'does not pay: 1 load left the loop, worth 1 of a trip of'; then
+trace "$work/small.c"
+if says 'does not pay: 1 load left the loop, worth 1 of a trip of'; then
   ok "small: tried, and undone for what it is worth"
 else
-  bad "small: not refused for its worth: $(trace "$work/small.c" | tail -1)"
+  bad "small: not refused for its worth: ${traced##*$'\n'}"
 fi
-if trace "$work/reg.c" | grep -q 'does not pay: 1 load left the loop and the loop holds more registers'; then
+trace "$work/reg.c"
+if says 'does not pay: 1 load left the loop and the loop holds more registers'; then
   ok "reg: tried, and undone for the register"
 else
-  bad "reg: not refused for the register: $(trace "$work/reg.c" | tail -1)"
+  bad "reg: not refused for the register: ${traced##*$'\n'}"
 fi
 
 # ── 3. The switches ─────────────────────────────────────────────────────────
@@ -221,7 +234,8 @@ for opt in -O1 -Os; do
     bad "$opt: rotation changed the output"
   fi
 done
-if trace "$work/plain.c" CCC_LOOP_ROTATE=1 | grep -q 'SUCCESS: rotated'; then
+trace "$work/plain.c" CCC_LOOP_ROTATE=1
+if says 'SUCCESS: rotated'; then
   ok "CCC_LOOP_ROTATE=1 rotates the loop the default leaves alone"
 else
   bad "CCC_LOOP_ROTATE=1 did not rotate the plain loop"
