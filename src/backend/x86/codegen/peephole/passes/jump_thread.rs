@@ -1351,10 +1351,15 @@ fn conditional_tail_calls_in(
     // changes nothing leaves it exact; the old loop rebuilt this
     // per-function map (and asked `current_counts`) on every attempt, which
     // on a single wide function is a 130k-line rescan per arm.
+    // `defs` lives OUTSIDE the loop so a failed attempt can reuse it, and the
+    // loop body rebuilds it in place after a rewrite (`defs = None`).  Keeping
+    // it out here is what lets the body read it directly: an `Option` inspected
+    // inside the loop would need an `expect`, and a panic path here is not
+    // acceptable in a pass that runs on every compiled function.
     let mut defs: Option<FxHashMap<u32, usize>> = None;
     loop {
         let (count, duplicate) = current_counts(store, infos, cache);
-        if defs.is_none() {
+        let defs_map = defs.get_or_insert_with(|| {
             let mut built: FxHashMap<u32, usize> = FxHashMap::default();
             for k in lo..hi {
                 if infos[k].kind == LineKind::Label && !infos[k].is_nop() && !infos[k].pinned {
@@ -1363,9 +1368,8 @@ fn conditional_tail_calls_in(
                     }
                 }
             }
-            defs = Some(built);
-        }
-        let defs_map = defs.as_ref().expect("defs built above");
+            built
+        });
         let mut hit = None;
         for i in lo..hi {
             if infos[i].is_nop() || infos[i].pinned || infos[i].kind != LineKind::CondJmp {

@@ -852,9 +852,9 @@ mod tests {
         assert_eq!(ending.get(&9).map(Vec::as_slice), Some(&[2][..]));
         // Nothing ends at a block's own start, which is why keying on starts
         // can never find a predecessor.
-        for b in &blocks {
+        for (bi, b) in blocks.iter().enumerate() {
             assert!(
-                ending.get(&b.0).is_none_or(|xs| !xs.contains(&blocks.iter().position(|x| x.0 == b.0).unwrap())),
+                ending.get(&b.0).is_none_or(|xs| !xs.contains(&bi)),
                 "a block must not be its own predecessor"
             );
         }

@@ -1657,7 +1657,10 @@ def main():
         sys.exit(1 if failures else 0)
 
     pass_count = 0
+    fail_count = 0
+    compile_fail_count = 0
     skip_count = 0
+    failures = []
     with tempfile.TemporaryDirectory(prefix="lccc_test_") as tmpdir:
         for name, src, extra_flags, expected_exit in TESTS:
             if args.filter and args.filter not in name:
