@@ -41,6 +41,14 @@ static volatile short g_s16;
 static volatile int g_s32;
 static volatile long long g_s64;
 
+/* Zero, and the compiler cannot see it.  A value with its sign bit set is
+ * negative for every input, so `s < 0` is decided at compile time (GCC,
+ * Clang and LCCC all return the constant) and the Cast it was meant to
+ * observe is dead code: nothing is left to observe at run time, and nothing
+ * for the IR census to count.  `s < g_zero` asks the same question of the
+ * register home the Cast produced. */
+static volatile int g_zero;
+
 /* U32 & 1 -> I32: sign bit clear, the Cast is representation-neutral. */
 __attribute__((noinline)) static int masked(void) {
     return (int)(g_u & 1U);
@@ -107,7 +115,7 @@ __attribute__((noinline)) static int select_is_negative(unsigned int x, int c) {
  * zero-extended positive 64-bit home and `x < 0` is false. */
 __attribute__((noinline)) static int signbit_is_negative(void) {
     int x = (int)(g_u | 0x80000000U);
-    return x < 0;
+    return x < g_zero;
 }
 
 /* On x86-64 the I32->U32 Cast emits `movl` (zero upper half).  Without it
@@ -123,7 +131,7 @@ __attribute__((noinline)) static int s2u_wide_ok(void) {
 __attribute__((noinline)) static int u8_signbit(void) {
     unsigned char u = (unsigned char)(g_u8 | 0x80U);   /* 0x85 */
     signed char s = (signed char)u;                     /* MUST be negative */
-    return s < 0 && (unsigned char)s == u
+    return s < g_zero && (unsigned char)s == u
         && ((unsigned int)s & 0xffU) == (unsigned int)u;
 }
 
@@ -137,7 +145,7 @@ __attribute__((noinline)) static int i8_signbit(void) {
 __attribute__((noinline)) static int u16_signbit(void) {
     unsigned short u = (unsigned short)(g_u16 | 0x8000U); /* 0x8005 */
     short s = (short)u;                                    /* MUST be negative */
-    return s < 0 && (unsigned short)s == u
+    return s < g_zero && (unsigned short)s == u
         && ((unsigned int)s & 0xffffU) == (unsigned int)u;
 }
 
@@ -151,7 +159,7 @@ __attribute__((noinline)) static int i16_signbit(void) {
 __attribute__((noinline)) static int u64_signbit(void) {
     unsigned long long u = g_u64 | 0x8000000000000000ULL;
     long long s = (long long)u;                          /* MUST be negative */
-    return s < 0 && (unsigned long long)s == u;
+    return s < g_zero && (unsigned long long)s == u;
 }
 
 __attribute__((noinline)) static int i64_signbit(void) {

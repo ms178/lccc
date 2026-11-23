@@ -15,11 +15,13 @@ SOURCE = ROOT / "tests/regression/llvm_ring_identities.c"
 
 # Assembly the fold must leave behind for each idiom, as (required, forbidden)
 # regular expressions over the function body.
-# Which control each form is compared against: the ring-identity sub-pass, or
-# the division strength reduction for the power-of-two forms.
+# Which control each form is compared against: the ring-identity sub-pass, the
+# division strength reduction for the power-of-two forms, or the whole pass for
+# the forms two of its rules reach.
 CONTROL = {
     "pow2rem": "disabled-div",
     "pow2div": "disabled-div",
+    "decided": "disabled-pass",
 }
 
 MECHANISM = {
@@ -32,6 +34,14 @@ MECHANISM = {
     "complement": (r"\b(?:lea|add|sub)[bwlq]?\b", r"\b(?:neg|not)[bwlq]?\b"),
     # A saturated bound selects the other arm for every pattern.
     "bound": (r"\bmov[bwlq]?\b", r"\bcmov\w*\b"),
+    # The same answer by a second road: `x <= INT64_MAX` holds for every value
+    # of the type, so the pass's known-bits facts decide the comparison before
+    # the select is looked at, and the select is the arm it chooses. Such a
+    # form stays folded with the ring-identity sub-pass off, and only the whole
+    # pass brings its compare back. The strict forms beside it (`x < INT32_MAX
+    # ? x : INT32_MAX`) are not decided -- the comparison is false at the bound
+    # -- and rest on the sub-pass alone.
+    "decided": (r"\bmov[bwlq]?\b", r"\bcmov\w*\b"),
     # A provably constant arm collapses the whole select to that constant.
     "constant": (r"\bxor[bwlq]?\b", r"\b(?:cmov|j\w+)\b"),
     # An implied-condition select is the surviving arm, with no compare left.
@@ -62,8 +72,8 @@ FORMS = {
     "ring_max_imin": "bound",
     "ring_min_umax": "bound",
     "ring_max_u0": "bound",
-    "ring_min_imax64": "bound",
-    "ring_max_imin64": "bound",
+    "ring_min_imax64": "decided",
+    "ring_max_imin64": "decided",
     "ring_zero_select": "bound",
     "ring_zero_constant_eq": "bound",
     "ring_or_chain_value": "orchain",
@@ -172,6 +182,11 @@ def main():
             off = body(assembly[control], name)
             if enabled == off:
                 raise ValueError(f"{name}: the {control} control changed nothing")
+            if kind == "decided" and body(assembly["disabled-subpass"], name) != enabled:
+                raise ValueError(
+                    f"{name}: a comparison that holds for every value is no longer "
+                    "decided without the ring-identity sub-pass"
+                )
             if kind in NO_COUNT_REDUCTION:
                 if not re.search(DIVIDER, " ".join(off)):
                     raise ValueError(f"{name}: control still has no divider to remove")

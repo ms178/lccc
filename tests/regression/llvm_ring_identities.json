@@ -36,22 +36,22 @@
     {
       "name": "ring_srem_eq_min",
       "idiom": "srem",
-      "divider_in_control": true,
+      "divider_in_control": false,
       "instructions": {
         "enabled": 6,
-        "disabled-subpass": 8,
-        "disabled-pass": 8,
+        "disabled-subpass": 9,
+        "disabled-pass": 9,
         "disabled-div": 8
       }
     },
     {
       "name": "ring_srem_ne_min",
       "idiom": "srem",
-      "divider_in_control": true,
+      "divider_in_control": false,
       "instructions": {
         "enabled": 6,
-        "disabled-subpass": 8,
-        "disabled-pass": 8,
+        "disabled-subpass": 9,
+        "disabled-pass": 9,
         "disabled-div": 8
       }
     },
@@ -200,22 +200,22 @@
     },
     {
       "name": "ring_min_imax64",
-      "idiom": "bound",
+      "idiom": "decided",
       "divider_in_control": false,
       "instructions": {
         "enabled": 2,
-        "disabled-subpass": 6,
+        "disabled-subpass": 2,
         "disabled-pass": 6,
         "disabled-div": 6
       }
     },
     {
       "name": "ring_max_imin64",
-      "idiom": "bound",
+      "idiom": "decided",
       "divider_in_control": false,
       "instructions": {
         "enabled": 2,
-        "disabled-subpass": 6,
+        "disabled-subpass": 2,
         "disabled-pass": 6,
         "disabled-div": 6
       }
@@ -324,9 +324,9 @@
       "idiom": "pow2rem",
       "divider_in_control": true,
       "instructions": {
-        "enabled": 8,
-        "disabled-subpass": 8,
-        "disabled-pass": 8,
+        "enabled": 7,
+        "disabled-subpass": 7,
+        "disabled-pass": 7,
         "disabled-div": 6
       }
     },
@@ -335,9 +335,9 @@
       "idiom": "pow2rem",
       "divider_in_control": true,
       "instructions": {
-        "enabled": 8,
-        "disabled-subpass": 8,
-        "disabled-pass": 8,
+        "enabled": 7,
+        "disabled-subpass": 7,
+        "disabled-pass": 7,
         "disabled-div": 6
       }
     },
@@ -346,9 +346,9 @@
       "idiom": "pow2rem",
       "divider_in_control": true,
       "instructions": {
-        "enabled": 8,
-        "disabled-subpass": 8,
-        "disabled-pass": 8,
+        "enabled": 7,
+        "disabled-subpass": 7,
+        "disabled-pass": 7,
         "disabled-div": 6
       }
     },
@@ -357,9 +357,9 @@
       "idiom": "pow2div",
       "divider_in_control": true,
       "instructions": {
-        "enabled": 7,
-        "disabled-subpass": 7,
-        "disabled-pass": 7,
+        "enabled": 5,
+        "disabled-subpass": 5,
+        "disabled-pass": 5,
         "disabled-div": 5
       }
     }

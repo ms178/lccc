@@ -4,7 +4,7 @@
 #
 #   (x != 0) & (x > 4)      is   x > 4       the floor already excludes zero
 #   (x > 0)  & (x > 99)     is   x > 99      the tighter floor decides both
-#   (x < 10) & (x < 5)      is   x < 5       the tighter ceiling decides both
+#   (x < 7)  & (x < 5)      is   x < 5       the tighter ceiling decides both
 #   (x != 0) | (x > 4)      is   x != 0      the floor implies the guard
 #   (x < 5)  & (x > 10)     is   0           the two sets are disjoint
 #   (x < 5)  | (x > 4)      is   1           the two sets cover everything
@@ -31,7 +31,12 @@
 #      and Clang 23.1.5 emit the same two lines),
 #   4. `CCC_NO_COMPARE_DOMINANCE=1` brings every folded shape back, which is
 #      what proves the assertions above belong to this fold and not to some
-#      other rule that happens to agree today,
+#      other rule that happens to agree today. One shape has a second owner
+#      and says so: `(x < 10) & (x < 5)`. `x < 5` leaves `x` three bits, and
+#      three bits are below 10, so the pass's known-bits facts imply the
+#      weaker ceiling with this fold off; it comes back only with the pass
+#      (`CCC_DISABLE_PASSES=bit_idioms`). `(x < 7) & (x < 5)` is the ceiling
+#      the bits do not decide (three bits reach 7), and is this fold's alone,
 #   5. -O0, -O1, -O2, -O3 and the kill switch agree bit for bit on a checksum
 #      over every 16-bit input, both sign edges, and 64-bit operands,
 #   6. GCC reaches the same checksum from the same source.
@@ -46,8 +51,12 @@ cat > "$tmp/shapes.c" <<'C'
 int      guard(int x)             { return (x != 0) & (x > 4); }
 /* Same op, two floors: the tighter one is the answer. */
 int      floor_(int x)            { return (x > 0) & (x > 99); }
-/* Same op, two ceilings, unsigned. */
-unsigned ceiling(unsigned x)      { return (x < 10) & (x < 5); }
+/* Same op, two ceilings, unsigned. Both below 8: the bits `x < 5` leaves
+   (three) do not answer `x < 7`, the order of the two constants does. */
+unsigned ceiling(unsigned x)      { return (x < 7) & (x < 5); }
+/* The same with the weaker ceiling above 8: `x < 5` leaves three bits, three
+   bits are below 10, and the known-bits facts answer without this fold. */
+unsigned ceiling_bits(unsigned x) { return (x < 10) & (x < 5); }
 /* Implied non-zero across the unsigned ordering. */
 unsigned zero_floor(unsigned x)   { return (x != 0) & (x >= 7); }
 /* The disjunction keeps the WEAKER operand: the guard, not the floor. */
@@ -72,6 +81,7 @@ C
 
 "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/shapes.s"
 CCC_NO_COMPARE_DOMINANCE=1 "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/off.s"
+CCC_DISABLE_PASSES=bit_idioms "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/nopass.s"
 
 fn_body() { # $1 = asm file, $2 = label; body between the label and ret
     sed -n "/^$2:/,/ret/p" "$1"
@@ -103,6 +113,7 @@ expect() { # $1 = label, $2 = expected count, $3 = build
 expect guard 4 shapes.s
 expect floor_ 4 shapes.s
 expect ceiling 4 shapes.s
+expect ceiling_bits 4 shapes.s
 expect zero_floor 4 shapes.s
 # 64- and 16-bit answers are a `setg` into the zeroed %eax, nothing more: the
 # extension chain that used to widen the flag twice collapses into it (GCC
@@ -120,11 +131,15 @@ if ! has "$(fn_body "$tmp/shapes.s" guard)" 'setg'; then
     fn_body "$tmp/shapes.s" guard >&2
     exit 1
 fi
-if ! has "$(fn_body "$tmp/shapes.s" ceiling)" 'setb'; then
-    echo "ceiling must keep the tighter ceiling's `setb`:" >&2
-    fn_body "$tmp/shapes.s" ceiling >&2
-    exit 1
-fi
+for name in ceiling ceiling_bits; do
+    if ! has "$(fn_body "$tmp/shapes.s" "$name")" 'setb'; then
+        echo "$name must keep the tighter ceiling's `setb`:" >&2
+        fn_body "$tmp/shapes.s" "$name" >&2
+        exit 1
+    fi
+    lacks "$(fn_body "$tmp/shapes.s" "$name")" 'cmpl[[:space:]]\+\$\(7\|10\),' \
+        "$name answered with the weaker ceiling"
+done
 if ! has "$(fn_body "$tmp/shapes.s" zero_floor)" 'setae'; then
     echo "zero_floor must keep the unsigned floor's `setae`:" >&2
     fn_body "$tmp/shapes.s" zero_floor >&2
@@ -165,6 +180,14 @@ if ! has "$(fn_body "$tmp/off.s" guard)" 'setne'; then
     fn_body "$tmp/off.s" guard >&2
     exit 1
 fi
+# The shape with two owners: the facts keep it folded when this fold is off,
+# and the pass as a whole is what it rests on. Were it to come back under the
+# kill switch, the known-bits implication would have stopped deciding an
+# ordering; were it to stay folded without the pass, a third rule would have
+# appeared and none of the counts above would say whose they are.
+expect ceiling_bits 4 off.s
+expect ceiling_bits 9 nopass.s
+expect ceiling 9 nopass.s
 
 # ── 5. Execution: every build agrees bit for bit ───────────────────────────
 cat > "$tmp/exec.c" <<'C'
@@ -173,7 +196,8 @@ cat > "$tmp/exec.c" <<'C'
 
 static int      guard(int x)             { return (x != 0) & (x > 4); }
 static int      floor_(int x)            { return (x > 0) & (x > 99); }
-static unsigned ceiling(unsigned x)      { return (x < 10) & (x < 5); }
+static unsigned ceiling(unsigned x)      { return (x < 7) & (x < 5); }
+static unsigned ceiling_bits(unsigned x) { return (x < 10) & (x < 5); }
 static unsigned zero_floor(unsigned x)   { return (x != 0) & (x >= 7); }
 static int      or_guard(int x)          { return (x != 0) | (x > 4); }
 static long     guard64(long x)          { return (x != 0) & (x > 4); }
@@ -203,6 +227,7 @@ int main(void) {
         mix((unsigned)guard((int)s));
         mix((unsigned)floor_((int)s));
         mix(ceiling(u));
+        mix(ceiling_bits(u));
         mix(zero_floor(u));
         mix((unsigned)or_guard((int)s));
         mix((unsigned long long)guard64((long)s));
@@ -224,6 +249,7 @@ int main(void) {
                 mix((unsigned)guard(edges[i]));
                 mix((unsigned)floor_(edges[i]));
                 mix(ceiling((unsigned)edges[i]));
+                mix(ceiling_bits((unsigned)edges[i]));
                 mix(zero_floor((unsigned)edges[i]));
                 mix((unsigned)or_guard(edges[i]));
                 mix((unsigned long long)guard64((long)edges[i] * 1000003L));
@@ -275,8 +301,8 @@ if command -v "${GCC_ORACLE:-gcc-16}" >/dev/null 2>&1; then
 fi
 
 # ── Instruction counts, printed so a drift is visible in the CI log ────────
-for name in guard floor_ ceiling zero_floor or_guard guard64 guard16 guard8 unrelated covered gap two_values; do
-    echo "  $name: $(count "$tmp/shapes.s" "$name") instructions (fold off: $(count "$tmp/off.s" "$name"))"
+for name in guard floor_ ceiling ceiling_bits zero_floor or_guard guard64 guard16 guard8 unrelated covered gap two_values; do
+    echo "  $name: $(count "$tmp/shapes.s" "$name") instructions (fold off: $(count "$tmp/off.s" "$name"), pass off: $(count "$tmp/nopass.s" "$name"))"
 done
 
 echo "compare-dominance gate OK"
