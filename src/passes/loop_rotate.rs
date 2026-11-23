@@ -56,9 +56,11 @@
 //! Guard H rejects a loop in which anything but the header reads a value
 //! the header computes: those readers kept the guard's value.
 //!
-//! Every refusal stands in front of the first change to the function
-//! (`try_rotate_loop`, "Nothing below refuses"): a loop that is not rotated
-//! is left as it was, value numbers included.
+//! Every refusal stands in front of the first change to the function, and
+//! the types say so: `plan_rotation` reads the function through a shared
+//! reference and is the only place that refuses, `apply_rotation` changes
+//! it and returns nothing. A loop that is not rotated is left as it was,
+//! value numbers included.
 //! Rotation STAYS opt-in (`CCC_LOOP_ROTATE=1`) while default-enable needs
 //! broader fuzz/performance evidence; kill-switch `CCC_NO_LOOP_ROTATE=1`
 //! wins.
@@ -170,9 +172,6 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
             break;
         }
         let loops = merge_loops_by_header(raw);
-        if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
-            lccc::cli::stderr_line(format_args!("[ROT] found {} loops", loops.len()));
-        }
         // Process innermost loops first (smallest body) — their rotation is
         // least likely to disturb outer-loop assumptions, and nested
         // rotation can cascade (an outer loop becomes rotatable once an
@@ -181,6 +180,10 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
         sorted.sort_by_key(|lp| lp.body.len());
         let all_headers: crate::common::fx_hash::FxHashSet<usize> =
             loops.iter().map(|lp| lp.header).collect();
+        let cx = RotationContext::new(func, &cfg, &all_headers);
+        if cx.debug {
+            lccc::cli::stderr_line(format_args!("[ROT] found {} loops", loops.len()));
+        }
         let mut did = false;
         for lp in sorted.into_iter() {
             // Guard E: do not rotate a loop nested inside another.
@@ -196,7 +199,7 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
                 .iter()
                 .any(|outer| outer.header != lp.header && outer.body.contains(&lp.header));
             if nested {
-                if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
+                if cx.debug {
                     lccc::cli::stderr_line(format_args!(
                         "[ROT] nested loop header={} — bail (Guard E)",
                         lp.header
@@ -204,7 +207,7 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
                 }
                 continue;
             }
-            if try_rotate_loop(func, lp, &cfg, &all_headers) {
+            if try_rotate_loop(func, lp, &cx) {
                 total += 1;
                 did = true;
                 break; // CFG changed — rebuild before the next candidate.
@@ -248,15 +251,11 @@ fn rotation_pressure_budget() -> usize {
 /// operands: a live-out IV is very often consumed by an outside block's
 /// `CondBranch`, and ignoring terminators would under-count and let the
 /// pressure guard miss exactly the IV-heavy shapes it exists for.
-fn live_out_loop_carried_count(
-    func: &IrFunction,
-    lp: &NaturalLoop,
-    phi_info: &[(u32, IrType, (BlockId, Operand), Operand)],
-) -> usize {
-    if phi_info.is_empty() {
+fn live_out_loop_carried_count(func: &IrFunction, lp: &NaturalLoop, phis: &[HeaderPhi]) -> usize {
+    if phis.is_empty() {
         return 0;
     }
-    let dests: FxHashSet<u32> = phi_info.iter().map(|&(d, _, _, _)| d).collect();
+    let dests: FxHashSet<u32> = phis.iter().map(|phi| phi.dest).collect();
     let mut live_out: FxHashSet<u32> = FxHashSet::default();
     for (bi, blk) in func.blocks.iter().enumerate() {
         if lp.body.contains(&bi) {
@@ -278,16 +277,155 @@ fn live_out_loop_carried_count(
     live_out.len()
 }
 
+/// What every candidate of one pass over a function's loops shares.
+struct RotationContext<'a> {
+    cfg: &'a CfgAnalysis,
+    /// The headers of all loops of the function (Guard E).
+    all_headers: &'a FxHashSet<usize>,
+    label_to_idx: FxHashMap<BlockId, usize>,
+    /// `CCC_DEBUG_LOOP_ROTATE`: a `[ROT]` line for every decision.
+    debug: bool,
+}
+
+impl<'a> RotationContext<'a> {
+    fn new(func: &IrFunction, cfg: &'a CfgAnalysis, all_headers: &'a FxHashSet<usize>) -> Self {
+        Self {
+            cfg,
+            all_headers,
+            label_to_idx: func
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.label, i))
+                .collect(),
+            debug: std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok(),
+        }
+    }
+}
+
+/// One phi of the loop's header: what it holds when the loop is entered and
+/// what the latch passes over the back edge.
+#[derive(Clone, Copy)]
+struct HeaderPhi {
+    dest: u32,
+    ty: IrType,
+    /// The value from in front of the loop.
+    init: Operand,
+    /// The value over the back edge.
+    next: Operand,
+}
+
+/// The loop as rotation takes it: `header -> latch -> header`, left through
+/// the header's conditional branch.
+struct LoopShape {
+    latch_idx: usize,
+    header_label: BlockId,
+    latch_label: BlockId,
+    continue_label: BlockId,
+    exit_label: BlockId,
+    /// The header continues into the loop when its condition is true.
+    continue_on_true: bool,
+    /// The header's branch condition.
+    cond: Value,
+}
+
+/// Where the loop's values leave it.
+struct ExitSide {
+    exit_idx: usize,
+    /// The phis the exit block has of its own, each with one incoming, from
+    /// the header.
+    own_phis: usize,
+    /// The header phis read behind the loop: each gets a merge at the top of
+    /// the exit block.
+    read_behind: Vec<HeaderPhi>,
+}
+
+/// A rotation that has been decided: everything `apply_rotation` needs.
+struct Rotation {
+    shape: LoopShape,
+    /// The header instructions that compute the condition, in header order.
+    test: Vec<Instruction>,
+    phis: Vec<HeaderPhi>,
+    exit: ExitSide,
+    /// The header's own test is proven to stay in its type's range (see
+    /// `canonicalise_affine_exit_cmps`).
+    affine_guard_proven: bool,
+}
+
 /// Try to rotate one natural loop. Returns true if the transform was applied.
-fn try_rotate_loop(
-    func: &mut IrFunction,
+///
+/// Two halves, and their types keep them apart: `plan_rotation` reads the
+/// function through a shared reference and is the only one that can refuse;
+/// `apply_rotation` changes the function and returns nothing. A loop that is
+/// refused is left exactly as it was, value numbers included, and a loop
+/// that is planned is rotated.
+fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cx: &RotationContext<'_>) -> bool {
+    let Some(plan) = plan_rotation(func, lp, cx) else {
+        return false;
+    };
+    apply_rotation(func, lp, cx.cfg, plan, cx.debug);
+    true
+}
+
+/// Every question that can refuse the rotation, in the order the steps are
+/// numbered, and what the rotation needs once none did.
+fn plan_rotation(
+    func: &IrFunction,
     lp: &NaturalLoop,
-    cfg: &CfgAnalysis,
-    all_headers: &FxHashSet<usize>,
-) -> bool {
-    let debug = std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok();
+    cx: &RotationContext<'_>,
+) -> Option<Rotation> {
+    let shape = loop_shape(func, lp, cx)?;
+    let header_insts = &func.blocks[lp.header].instructions;
+    let (closure, def_idx) = test_closure(header_insts, shape.cond, cx.debug)?;
+    if !header_values_stay_in_the_header(func, lp, header_insts, &closure, cx.debug)
+        || !test_reads_no_other_loops_phi(
+            func,
+            lp,
+            header_insts,
+            &closure,
+            &def_idx,
+            shape.cond,
+            cx,
+        )
+    {
+        return None;
+    }
+    let phis = header_phis(header_insts, shape.latch_label, &def_idx, cx.debug)?;
+    if !body_can_take_the_test(func, lp, &shape, cx.debug)
+        || !pressure_allows(func, lp, &phis, cx.debug)
+    {
+        return None;
+    }
+
+    let exit = exit_side(func, lp, &shape, &phis, cx)?;
+
+    // Prove the original controlling expression on the loop as it stands,
+    // before `apply_rotation` moves any phi. Cloning is not a no-overflow
+    // licence: the IR also represents -fwrapv and unsigned arithmetic
+    // feeding signed casts. The cloned test observes the next IVs, a subset
+    // of the original sequence through its failing test. Only that
+    // particular comparison may consume this proof. (Not a refusal, and
+    // asked last: a loop that is refused does not pay for it.)
+    let affine_guard_proven = affine_fold_enabled()
+        && loop_iv_shape(func, lp).iter().any(|iv| {
+            signed_type_bounds(iv.ty).is_some()
+                && loop_exit_threshold(func, lp, iv, cx.cfg).is_some()
+        });
+
+    Some(Rotation {
+        test: closure.iter().map(|&i| header_insts[i].clone()).collect(),
+        shape,
+        phis,
+        exit,
+        affine_guard_proven,
+    })
+}
+
+/// Steps 1 to 4: the loop as rotation takes it.
+fn loop_shape(func: &IrFunction, lp: &NaturalLoop, cx: &RotationContext<'_>) -> Option<LoopShape> {
+    let debug = cx.debug;
     // 1. Single latch that is NOT the header (a self-loop is already rotated).
-    let Some(latch_idx) = lp.single_latch(&cfg.preds) else {
+    let Some(latch_idx) = lp.single_latch(&cx.cfg.preds) else {
         if debug {
             lccc::cli::stderr_line(format_args!(
                 "[ROT] no single latch (header={}, body_len={})",
@@ -295,7 +433,7 @@ fn try_rotate_loop(
                 lp.body.len()
             ));
         }
-        return false;
+        return None;
     };
     if latch_idx == lp.header {
         if debug {
@@ -305,7 +443,7 @@ fn try_rotate_loop(
                 lp.body.len()
             ));
         }
-        return false;
+        return None;
     }
     if debug {
         lccc::cli::stderr_line(format_args!(
@@ -326,18 +464,12 @@ fn try_rotate_loop(
         if debug {
             lccc::cli::stderr_line(format_args!("[ROT] latch not Branch(header)"));
         }
-        return false;
+        return None;
     }
 
     // 3. Header terminator must be CondBranch with one in-loop and one
     //    out-of-loop target. The in-loop target is the "continue"; the
     //    out-of-loop target is the "exit".
-    let label_to_idx: FxHashMap<BlockId, usize> = func
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.label, i))
-        .collect();
     let (cond, continue_label, exit_label, continue_on_true) = match &func.blocks[lp.header]
         .terminator
     {
@@ -346,13 +478,13 @@ fn try_rotate_loop(
             true_label,
             false_label,
         } => {
-            let t_in = is_in_loop(*true_label, &label_to_idx, lp);
-            let f_in = is_in_loop(*false_label, &label_to_idx, lp);
+            let t_in = is_in_loop(*true_label, &cx.label_to_idx, lp);
+            let f_in = is_in_loop(*false_label, &cx.label_to_idx, lp);
             if t_in == f_in {
                 if debug {
                     lccc::cli::stderr_line(format_args!("[ROT] CondBranch both-in or both-out"));
                 }
-                return false; // both in (infinite) or both out (no body)
+                return None; // both in (infinite) or both out (no body)
             }
             let c = *cond;
             if t_in {
@@ -368,7 +500,7 @@ fn try_rotate_loop(
                     func.blocks[lp.header].terminator
                 ));
             }
-            return false;
+            return None;
         }
     };
     if debug {
@@ -382,14 +514,30 @@ fn try_rotate_loop(
     //    by cfg_simplify and would not reach here, but fail closed).
     let cond_val = match cond {
         Operand::Value(v) => v,
-        Operand::Const(_) => return false,
+        Operand::Const(_) => return None,
     };
+    Some(LoopShape {
+        latch_idx,
+        header_label,
+        latch_label,
+        continue_label,
+        exit_label,
+        continue_on_true,
+        cond: cond_val,
+    })
+}
 
+/// Step 5 and Guard F: the header instructions that compute the condition,
+/// as indices in header order, and where each header value is defined.
+fn test_closure(
+    header_insts: &[Instruction],
+    cond_val: Value,
+    debug: bool,
+) -> Option<(Vec<usize>, FxHashMap<u32, usize>)> {
     // 5. Collect the transitive closure of header-local instructions that
     //    feed `cond_val`. Only SSA-pure arithmetic/cmp/cast/copy/select
     //    instructions are cloned; anything with memory, calls, or atomics
     //    bails (we do not duplicate side effects).
-    let header_insts = &func.blocks[lp.header].instructions;
     let mut def_idx: FxHashMap<u32, usize> = FxHashMap::default();
     for (i, inst) in header_insts.iter().enumerate() {
         if let Some(d) = inst.dest() {
@@ -409,7 +557,7 @@ fn try_rotate_loop(
         let inst = &header_insts[idx];
         // Phis are NOT cloned — they are rewritten to latch-edge values
         // in step 7. Skip them here (do not add to closure, do not trace
-        // their incoming operands — those are handled by phi_latch_val).
+        // their incoming operands — those are `HeaderPhi::next`).
         if matches!(inst, Instruction::Phi { .. }) {
             continue;
         }
@@ -420,11 +568,11 @@ fn try_rotate_loop(
                     idx, inst
                 ));
             }
-            return false; // cond setup touches memory/calls — bail
+            return None; // cond setup touches memory/calls — bail
         }
         closure.push(idx);
         if closure.len() > MAX_CLOSURE {
-            return false; // too deep — leave to other passes
+            return None; // too deep — leave to other passes
         }
         // Add operands to the worklist.
         inst.for_each_used_value(|v_id| {
@@ -436,7 +584,7 @@ fn try_rotate_loop(
     closure.sort_unstable();
     closure.dedup();
     if closure.is_empty() {
-        return false; // cond is loop-invariant — wouldn't terminate, bail
+        return None; // cond is loop-invariant — wouldn't terminate, bail
     }
 
     // Guard F: every non-Phi header instruction must belong to the cloned
@@ -464,9 +612,19 @@ fn try_rotate_loop(
                 idx, inst
             ));
         }
-        return false;
+        return None;
     }
+    Some((closure, def_idx))
+}
 
+/// Guard H.
+fn header_values_stay_in_the_header(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    header_insts: &[Instruction],
+    closure: &[usize],
+    debug: bool,
+) -> bool {
     // Guard H: what the header computes is read by the header alone.
     //
     // The header stays behind as the guard and runs once. From the second
@@ -529,7 +687,19 @@ fn try_rotate_loop(
             return false;
         }
     }
+    true
+}
 
+/// Guard E.
+fn test_reads_no_other_loops_phi(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    header_insts: &[Instruction],
+    closure: &[usize],
+    def_idx: &FxHashMap<u32, usize>,
+    cond_val: Value,
+    cx: &RotationContext<'_>,
+) -> bool {
     // Guard E: refuse to rotate when the cloned cond consumes a phi that
     // lives in a DIFFERENT loop header. After inlining, a remainder loop
     // `for (; i < sz; i++)` has `sz` as the IV of an outer counted loop.
@@ -538,57 +708,56 @@ fn try_rotate_loop(
     // adler sz=2 returned the sz=1 result 00010001). Constant-trip inner
     // loops (`k < 8`) and loops whose limit is a param/invariant still
     // rotate. Nested loops whose trip count is an outer IV do not.
-    {
-        let mut used_outside: Vec<u32> = Vec::new();
-        for &idx in &closure {
-            header_insts[idx].for_each_used_value(|v| {
-                if !def_idx.contains_key(&v) {
-                    used_outside.push(v);
-                }
-            });
-        }
-        // The cond value itself may be defined outside (rare); include it.
-        if !def_idx.contains_key(&cond_val.0) {
-            used_outside.push(cond_val.0);
-        }
-        let mut foreign_iv = false;
-        let mut foreign_phi = 0u32;
-        'scan: for vid in used_outside {
-            for (bi, block) in func.blocks.iter().enumerate() {
-                if bi == lp.header || !all_headers.contains(&bi) {
-                    continue;
-                }
-                for inst in &block.instructions {
-                    if let Instruction::Phi { dest, .. } = inst {
-                        if dest.0 == vid {
-                            foreign_iv = true;
-                            foreign_phi = vid;
-                            break 'scan;
-                        }
+    let mut used_outside: Vec<u32> = Vec::new();
+    for &idx in closure {
+        header_insts[idx].for_each_used_value(|v| {
+            if !def_idx.contains_key(&v) {
+                used_outside.push(v);
+            }
+        });
+    }
+    // The cond value itself may be defined outside (rare); include it.
+    if !def_idx.contains_key(&cond_val.0) {
+        used_outside.push(cond_val.0);
+    }
+    let mut foreign_iv = false;
+    let mut foreign_phi = 0u32;
+    'scan: for vid in used_outside {
+        for (bi, block) in func.blocks.iter().enumerate() {
+            if bi == lp.header || !cx.all_headers.contains(&bi) {
+                continue;
+            }
+            for inst in &block.instructions {
+                if let Instruction::Phi { dest, .. } = inst {
+                    if dest.0 == vid {
+                        foreign_iv = true;
+                        foreign_phi = vid;
+                        break 'scan;
                     }
                 }
             }
         }
-        if foreign_iv {
-            if debug {
-                lccc::cli::stderr_line(format_args!(
-                    "[ROT] cond uses foreign loop-header phi v{} — bail (Guard E, nested IV as trip limit)",
-                    foreign_phi
-                ));
-            }
-            return false;
-        }
     }
+    if foreign_iv {
+        if cx.debug {
+            lccc::cli::stderr_line(format_args!(
+                "[ROT] cond uses foreign loop-header phi v{} — bail (Guard E, nested IV as trip limit)",
+                foreign_phi
+            ));
+        }
+        return false;
+    }
+    true
+}
 
-    // 5.5 Collect owned snapshots of the closure instructions and the header
-    //     phi metadata so the immutable borrow of `func.blocks[header]` ends
-    //     before we take mutable borrows of `func.blocks[latch]` below. The
-    //     Rust borrow checker can't prove the header and latch are disjoint
-    //     within `Vec<BasicBlock>`, so we copy out the needed data here.
-    let closure_insts_owned: Vec<Instruction> =
-        closure.iter().map(|&i| header_insts[i].clone()).collect();
-    // (phi_dest, phi_ty, preheader_incoming, latch_incoming)
-    let mut phi_info: Vec<(u32, IrType, (BlockId, Operand), Operand)> = Vec::new();
+/// Guards C and D: the header's phis, each with its value from in front of
+/// the loop and its value over the back edge.
+fn header_phis(
+    header_insts: &[Instruction],
+    latch_label: BlockId,
+    def_idx: &FxHashMap<u32, usize>,
+    debug: bool,
+) -> Option<Vec<HeaderPhi>> {
     // v18 Guard C: a header phi may have MULTIPLE non-latch incomings when
     // the loop header has several outside predecessors (e.g. two exits of a
     // preceding loop both flowing into this loop's header, or a break edge
@@ -603,43 +772,38 @@ fn try_rotate_loop(
     // when the init edge still named a dead preheader. Routing every
     // extra init through the guard's own phis is a future enhancement;
     // bailing keeps rotation sound (same policy as Guard A/B).
-    let mut multi_pre_header = false;
+    let mut phis: Vec<HeaderPhi> = Vec::new();
     for inst in header_insts {
-        if let Instruction::Phi { dest, incoming, ty } = inst {
-            let mut pre: Option<(BlockId, Operand)> = None;
-            let mut lat = None;
-            for (op, lbl) in incoming {
-                if *lbl == latch_label {
-                    lat = Some(*op);
-                } else if pre.is_some() && pre.as_ref().unwrap().0 != *lbl {
-                    // Second DISTINCT outside predecessor: the single-pre
-                    // self-loop phi shape cannot represent this header.
-                    multi_pre_header = true;
-                    break;
-                } else {
-                    pre = Some((*lbl, *op));
-                }
-            }
-            if multi_pre_header {
+        let Instruction::Phi { dest, incoming, ty } = inst else {
+            continue;
+        };
+        let mut init: Option<(BlockId, Operand)> = None;
+        let mut next = None;
+        for (op, label) in incoming {
+            if *label == latch_label {
+                next = Some(*op);
+            } else if init.is_some_and(|(seen, _)| seen != *label) {
+                // A second DISTINCT outside predecessor: the single-init
+                // self-loop phi cannot represent this header.
                 if debug {
                     lccc::cli::stderr_line(format_args!(
                         "[ROT] header phi v{} has >1 non-latch incoming — bail (Guard C)",
                         dest.0
                     ));
                 }
-                return false;
-            }
-            if let (Some(pre), Some(lat)) = (pre, lat) {
-                phi_info.push((dest.0, *ty, pre, lat));
+                return None;
+            } else {
+                init = Some((*label, *op));
             }
         }
-    }
-    // phi_latch_val and phi_pre_val — derived from phi_info, owned.
-    let mut phi_latch_val: FxHashMap<u32, Operand> = FxHashMap::default();
-    let mut phi_pre_val: FxHashMap<u32, (BlockId, Operand)> = FxHashMap::default();
-    for &(phi_dest, _ty, pre, lat) in &phi_info {
-        phi_latch_val.insert(phi_dest, lat);
-        phi_pre_val.insert(phi_dest, pre);
+        if let (Some((_, init)), Some(next)) = (init, next) {
+            phis.push(HeaderPhi {
+                dest: dest.0,
+                ty: *ty,
+                init,
+                next,
+            });
+        }
     }
 
     // Guard D: refuse to rotate when a header phi's latch incoming is
@@ -657,30 +821,34 @@ fn try_rotate_loop(
     // huft_build's `while (--i) { *xp++ = (j += *p++); }`, PF-17).
     // Canonical `for (i = 0; i < n; i++)` is unaffected: its latch
     // incoming is the body-defined `i + 1`.
-    for &(phi_dest, _, _, latch_op) in &phi_info {
-        let Operand::Value(v) = latch_op else {
+    for phi in &phis {
+        let Operand::Value(v) = phi.next else {
             continue;
         };
         let Some(&idx) = def_idx.get(&v.0) else {
             continue; // defined outside the header (body / preheader)
         };
         if matches!(header_insts[idx], Instruction::Phi { .. }) {
-            continue; // cross-phi latch incoming: v17 rewrite handles this
+            continue; // cross-phi latch incoming: the self-loop phis take it
         }
         if debug {
             lccc::cli::stderr_line(format_args!(
                 "[ROT] header phi v{} latch incoming v{} is defined in the header (not a phi) — bail (Guard D, while(--i) shape)",
-                phi_dest, v.0
+                phi.dest, v.0
             ));
         }
-        return false;
+        return None;
     }
-    // The immutable header borrow (`header_insts`) ends here under NLL —
-    // its last use was the phi_info collection above. The mutable borrows
-    // of `func.blocks[...]` below are disjoint from that borrow. (A prior
-    // `drop(header_insts)` here was a no-op on a `&T` and tripped the
-    // `dropping_references` lint under `-D warnings`.)
+    Some(phis)
+}
 
+/// Steps 6.5 and 6.55: one body block, and nothing in it the test may not follow.
+fn body_can_take_the_test(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    shape: &LoopShape,
+    debug: bool,
+) -> bool {
     // 6.5 Restrict to the single-block body+latch shape (header + one body
     //     block that is ALSO the latch). This is the canonical counted-loop
     //     form after mem2reg + cfg_simplify: `header → body_latch → header`.
@@ -690,13 +858,13 @@ fn try_rotate_loop(
     //     value on each self-loop iteration). Multi-block bodies need the new
     //     phi placed in the body ENTRY (not the latch) and body-wide use
     //     replacement — left to a future enhancement.
-    let single_block_body = lp.body.len() == 2 && continue_label == latch_label;
+    let single_block_body = lp.body.len() == 2 && shape.continue_label == shape.latch_label;
     if !single_block_body {
         if debug {
             lccc::cli::stderr_line(format_args!(
                 "[ROT] not single-block body (body_len={}, continue==latch={})",
                 lp.body.len(),
-                continue_label == latch_label
+                shape.continue_label == shape.latch_label
             ));
         }
         return false;
@@ -711,7 +879,7 @@ fn try_rotate_loop(
     //     a spurious loop by `find_natural_loops` (no C-level loop) — bailing
     //     here keeps recursion untouched. Volatile ops must not have their
     //     ordering relative to the rotated test perturbed either.
-    let body_block = &func.blocks[latch_idx];
+    let body_block = &func.blocks[shape.latch_idx];
     for inst in &body_block.instructions {
         match inst {
             Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
@@ -746,7 +914,11 @@ fn try_rotate_loop(
             _ => {}
         }
     }
+    true
+}
 
+/// Guard G.
+fn pressure_allows(func: &IrFunction, lp: &NaturalLoop, phis: &[HeaderPhi], debug: bool) -> bool {
     // Guard G: register-pressure profitability.
     //
     // Rotation is not free at the machine level.  After rotation the loop exit
@@ -774,7 +946,7 @@ fn try_rotate_loop(
     // A/B escape hatch for isolating the guard itself:
     // `CCC_LOOP_ROTATE_IGNORE_PRESSURE=1`.
     if !env_flag_truthy("CCC_LOOP_ROTATE_IGNORE_PRESSURE") {
-        let live_out = live_out_loop_carried_count(func, lp, &phi_info);
+        let live_out = live_out_loop_carried_count(func, lp, phis);
         let budget = rotation_pressure_budget();
         if live_out > budget {
             if debug {
@@ -786,39 +958,37 @@ fn try_rotate_loop(
             return false;
         }
     }
+    true
+}
 
-    // Prove the original controlling expression BEFORE changing any phis.
-    // Cloning is not a no-overflow licence: the IR also represents -fwrapv
-    // and unsigned arithmetic feeding signed casts. The cloned test observes
-    // the next IVs, a subset of the original sequence through its failing
-    // test. Only that particular comparison may consume this proof.
-    let affine_guard_proven = affine_fold_enabled()
-        && loop_iv_shape(func, lp).iter().any(|shape| {
-            signed_type_bounds(shape.ty).is_some()
-                && loop_exit_threshold(func, lp, shape, cfg).is_some()
-        });
-
+/// Guards A and B: where the loop's values leave it.
+fn exit_side(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    shape: &LoopShape,
+    phis: &[HeaderPhi],
+    cx: &RotationContext<'_>,
+) -> Option<ExitSide> {
+    let debug = cx.debug;
     // 6.7, decided: where the loop's values leave it.
     //
     // After rotation the exit block has two predecessors, the guard (no
     // iteration ran) and the latch (the copied test failed). Whatever
     // crosses needs the merge of the two: a header phi read behind the loop
     // gets a phi in the exit block, and a phi the exit block already has
-    // gets a second incoming. Both are built in step 6.7 below.
+    // gets a second incoming. Both are built by `merge_behind_the_loop`.
     //
-    // Everything that can refuse the rotation is asked here, in front of the
-    // first change to the function, so that a refusal leaves the function as
-    // it was. (Guards A and B used to stand behind step 6.6 and take its
-    // phis out again; the value numbers stayed taken.)
-    let Some(&exit_idx) = label_to_idx.get(&exit_label) else {
-        return false;
-    };
+    // Whether they can be built is decided here, with every other refusal:
+    // the planner cannot change the function. (Guards A and B used to stand
+    // behind step 6.6 and take its phis out again; the value numbers stayed
+    // taken.)
+    let &exit_idx = cx.label_to_idx.get(&shape.exit_label)?;
     // Guard A: the header is the exit block's only predecessor, so that the
     // exit block has exactly the guard and the latch in front of it once
     // rotated and two incomings say everything. A third predecessor (a
     // second exit of the loop, a jump around it) would be an edge on which
     // the merge has no value.
-    let exit_preds = cfg.preds.row(exit_idx);
+    let exit_preds = cx.cfg.preds.row(exit_idx);
     if exit_preds.len() != 1 || exit_preds[0] as usize != lp.header {
         if debug {
             lccc::cli::stderr_line(format_args!(
@@ -826,7 +996,7 @@ fn try_rotate_loop(
                 exit_preds.len()
             ));
         }
-        return false;
+        return None;
     }
     // The exit block's own phis. With one predecessor each has one
     // incoming, from the header; anything else is a phi this function did
@@ -840,7 +1010,7 @@ fn try_rotate_loop(
         .iter()
         .all(|inst| {
             matches!(inst, Instruction::Phi { incoming, .. }
-                if incoming.len() == 1 && incoming[0].1 == header_label)
+                if incoming.len() == 1 && incoming[0].1 == shape.header_label)
         });
     if !exit_phis_name_the_header {
         if debug {
@@ -848,7 +1018,7 @@ fn try_rotate_loop(
                 "[ROT] a phi of the exit block does not name the header alone — bail"
             ));
         }
-        return false;
+        return None;
     }
     // Guard B: the merge of a header phi is defined at the top of the exit
     // block, so it serves the readers the exit block dominates. A phi reads
@@ -866,21 +1036,22 @@ fn try_rotate_loop(
     // In valid SSA no reader that can run fails this: it is dominated by
     // the header, and every path from the header out of the loop starts
     // with the edge to the exit block (the body is one block that jumps
-    // back). The guard is asked because its answer is what the rewrite
-    // below relies on. Over tests/regression at -O2 it refused 227 times
+    // back). The guard is asked because its answer is what the rewrite in
+    // `merge_behind_the_loop` relies on. Over tests/regression at -O2 it refused 227 times
     // while it asked about a phi's own block and about dead blocks (18 and
     // 209 of them) and does not refuse now.
-    let mut external_users: Vec<(u32, IrType, Operand, Operand)> = Vec::new();
-    for &(phi_dest, phi_ty, (_pre_label, pre_op), latch_op) in &phi_info {
+    let mut merged: Vec<HeaderPhi> = Vec::new();
+    for phi in phis {
+        let phi_dest = phi.dest;
         let mut read_behind = false;
         for (bi, block) in func.blocks.iter().enumerate() {
-            if bi == lp.header || lp.body.contains(&bi) || is_unreachable(bi, cfg) {
+            if bi == lp.header || lp.body.contains(&bi) || is_unreachable(bi, cx.cfg) {
                 continue;
             }
             // The exit block's own phis read the header's value on the
             // guard's edge; they get their own second incoming.
             let own_phis = if bi == exit_idx { exit_own_phis } else { 0 };
-            let block_is_served = is_dominated_by(bi, exit_idx, cfg);
+            let block_is_served = is_dominated_by(bi, exit_idx, cx.cfg);
             let mut served = true;
             let mut read_here = false;
             for inst in &block.instructions[own_phis..] {
@@ -890,9 +1061,10 @@ fn try_rotate_loop(
                             continue;
                         }
                         read_here = true;
-                        served &= label_to_idx
+                        served &= cx
+                            .label_to_idx
                             .get(pred_label)
-                            .is_some_and(|&pred| is_dominated_by(pred, exit_idx, cfg));
+                            .is_some_and(|&pred| is_dominated_by(pred, exit_idx, cx.cfg));
                     }
                 } else {
                     let mut reads = false;
@@ -915,17 +1087,63 @@ fn try_rotate_loop(
                         phi_dest, bi, exit_idx
                     ));
                 }
-                return false;
+                return None;
             }
             read_behind |= read_here;
         }
         if read_behind {
-            external_users.push((phi_dest, phi_ty, pre_op, latch_op));
+            merged.push(*phi);
+        }
+    }
+    Some(ExitSide {
+        exit_idx,
+        own_phis: exit_own_phis,
+        read_behind: merged,
+    })
+}
+
+/// Rotate a planned loop. Nothing here refuses.
+fn apply_rotation(
+    func: &mut IrFunction,
+    lp: &NaturalLoop,
+    cfg: &CfgAnalysis,
+    plan: Rotation,
+    debug: bool,
+) {
+    let mut next_val = func.next_value_id;
+    let new_loop_phis = move_phis_into_the_latch(func, &plan, &mut next_val);
+    merge_behind_the_loop(func, lp, cfg, &plan, &new_loop_phis, &mut next_val);
+    put_the_test_at_the_latch(func, &plan, &new_loop_phis, &mut next_val, debug);
+
+    // 10. The latch no longer branches to the header — its only successor is
+    //     now `continue_label` (self or body) or `exit_label`. Remove the
+    //     stale `(op, latch_label)` incoming from every phi in the header,
+    //     because the latch→header backedge is gone. cfg_simplify then
+    //     collapses the now-single-incoming phi to the preheader value.
+    for inst in &mut func.blocks[lp.header].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            incoming.retain(|(_, lbl)| *lbl != plan.shape.latch_label);
         }
     }
 
-    // ---- Nothing below refuses: from here on the function is changed. ----
+    // 11. Advance the watermark so subsequent passes see the new IDs.
+    func.next_value_id = next_val;
 
+    if debug {
+        lccc::cli::stderr_line(format_args!(
+            "[ROT] SUCCESS: rotated header={} latch={}",
+            lp.header, plan.shape.latch_idx
+        ));
+    }
+}
+
+/// Step 6.6. Returns the self-loop phi of each header phi.
+fn move_phis_into_the_latch(
+    func: &mut IrFunction,
+    plan: &Rotation,
+    next_val: &mut u32,
+) -> FxHashMap<u32, u32> {
+    let shape = &plan.shape;
     // 6.6 Create a fresh self-loop phi in body_latch for each header phi.
     //     The new phi `i_loop = phi[header: v_pre, latch: v_latch]`
     //     becomes the IV for the rotated self-loop. The header's original
@@ -954,18 +1172,17 @@ fn try_rotate_loop(
     //     would still reference the header phi, which after step 10 holds
     //     only the preheader value (so the IV would never advance and the
     //     loop would spin forever).
-    let mut next_val = func.next_value_id;
     let mut new_loop_phis: FxHashMap<u32, u32> = FxHashMap::default(); // header_phi_dest → new_loop_phi_dest
-    let mut new_phi_insts: Vec<Instruction> = Vec::with_capacity(phi_info.len());
-    for &(phi_dest, phi_ty, (_pre_label, pre_op), latch_op) in &phi_info {
-        let new_dest = Value(next_val);
-        next_val += 1;
-        new_loop_phis.insert(phi_dest, new_dest.0);
+    let mut new_phi_insts: Vec<Instruction> = Vec::with_capacity(plan.phis.len());
+    for phi in &plan.phis {
+        let new_dest = Value(*next_val);
+        *next_val += 1;
+        new_loop_phis.insert(phi.dest, new_dest.0);
         new_phi_insts.push(Instruction::Phi {
             dest: new_dest,
-            ty: phi_ty,
+            ty: phi.ty,
             // The init edge is labelled with the GUARD (`header_label`), not
-            // with the original preheader (`_pre_label`). Steps 6/6.5 rewire
+            // with the original preheader the phi named. Steps 6/6.5 rewire
             // every original header predecessor onto the guard, so after
             // rotation the body's only entry edge is guard → body; the
             // preheader is no longer a predecessor of this block. Naming it
@@ -974,16 +1191,19 @@ fn try_rotate_loop(
             // on an edge that is not the live one, so the first iteration
             // reads an undefined register (SIGSEGV when the phi is an array
             // index — see tests/regression/loop_rotate_stale_phi_pred.c).
-            // `pre_op` itself is unchanged and still dominates: it is defined
+            // `phi.init` itself is unchanged and still dominates: it is defined
             // in the preheader, which dominates the guard and hence the body.
-            // This matches the exit-phi construction below, which already
-            // labels the guard-exit incoming with `header_label`.
-            incoming: vec![(pre_op, header_label), (latch_op, latch_label)],
+            // This matches the exit-phi construction of step 6.7, which
+            // labels the guard-exit incoming with `header_label` too.
+            incoming: vec![
+                (phi.init, shape.header_label),
+                (phi.next, shape.latch_label),
+            ],
         });
     }
     // Insert the new phis at the TOP of body_latch (phis must precede all
     // other instructions in a block).
-    let latch_block = &mut func.blocks[latch_idx];
+    let latch_block = &mut func.blocks[shape.latch_idx];
     latch_block.insert_insts(0, new_phi_insts, crate::common::source::Span::dummy());
 
     // v17 fix: rewrite the new self-loop phis' latch incomings to
@@ -1020,8 +1240,8 @@ fn try_rotate_loop(
     // new_loop_phi_dest) provides the lookup. Only Operand::Value
     // variants can reference a header phi; Operand::Const and others
     // are left untouched.
-    let latch_block = &mut func.blocks[latch_idx];
-    let n_new = phi_info.len();
+    let latch_block = &mut func.blocks[shape.latch_idx];
+    let n_new = plan.phis.len();
     for inst in latch_block.instructions.iter_mut().take(n_new) {
         if let Instruction::Phi { incoming, .. } = inst {
             for (op, _) in incoming.iter_mut() {
@@ -1039,16 +1259,29 @@ fn try_rotate_loop(
     // top and were already processed by the v17 latch-incoming rewrite
     // above; `skip(n)` jumps past the n new phis so this loop only touches
     // the body's existing instructions.
-    let latch_block = &mut func.blocks[latch_idx];
-    let n_new_phis = phi_info.len();
+    let latch_block = &mut func.blocks[shape.latch_idx];
+    let n_new_phis = plan.phis.len();
     for inst in latch_block.instructions.iter_mut().skip(n_new_phis) {
         for (&old_phi, &new_phi) in &new_loop_phis {
             let repl = Operand::Value(Value(new_phi));
             replace_operand_value(inst, Value(old_phi), repl.clone());
         }
     }
+    new_loop_phis
+}
 
-    // 6.7 The merges in the exit block (decided above).
+/// Step 6.7: what leaves the loop is merged at the top of the exit block.
+fn merge_behind_the_loop(
+    func: &mut IrFunction,
+    lp: &NaturalLoop,
+    cfg: &CfgAnalysis,
+    plan: &Rotation,
+    new_loop_phis: &FxHashMap<u32, u32>,
+    next_val: &mut u32,
+) {
+    let shape = &plan.shape;
+    let (exit_idx, exit_own_phis) = (plan.exit.exit_idx, plan.exit.own_phis);
+    // 6.7 The merges in the exit block (decided by `exit_side`).
     //
     // A header phi read behind the loop (the accumulator a function
     // returns): after step 10 the header's phi is the value from in front of
@@ -1065,19 +1298,19 @@ fn try_rotate_loop(
     // `a_next = b`), that phi is the guard's after step 10 and its self-loop
     // phi is the value meant: `rewrite_header_phi_operand`.
     let mut exit_merge_map: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut exit_phi_insts: Vec<Instruction> = Vec::with_capacity(external_users.len());
-    for &(phi_dest, phi_ty, pre_op, latch_op) in &external_users {
-        let merge = Value(next_val);
-        next_val += 1;
-        exit_merge_map.insert(phi_dest, merge.0);
+    let mut exit_phi_insts: Vec<Instruction> = Vec::with_capacity(plan.exit.read_behind.len());
+    for phi in &plan.exit.read_behind {
+        let merge = Value(*next_val);
+        *next_val += 1;
+        exit_merge_map.insert(phi.dest, merge.0);
         exit_phi_insts.push(Instruction::Phi {
             dest: merge,
-            ty: phi_ty,
+            ty: phi.ty,
             incoming: vec![
-                (pre_op, header_label), // the guard's edge: no iteration ran
+                (phi.init, shape.header_label), // the guard's edge: no iteration ran
                 (
-                    rewrite_header_phi_operand(latch_op, &new_loop_phis),
-                    latch_label,
+                    rewrite_header_phi_operand(phi.next, new_loop_phis),
+                    shape.latch_label,
                 ), // the latch's edge: the last iteration's value
             ],
         });
@@ -1103,12 +1336,16 @@ fn try_rotate_loop(
             };
             let from_guard = incoming[0].0;
             let from_latch = match from_guard {
-                Operand::Value(v) => phi_latch_val.get(&v.0).map_or(from_guard, |&latch_op| {
-                    rewrite_header_phi_operand(latch_op, &new_loop_phis)
-                }),
+                Operand::Value(v) => plan
+                    .phis
+                    .iter()
+                    .find(|phi| phi.dest == v.0)
+                    .map_or(from_guard, |phi| {
+                        rewrite_header_phi_operand(phi.next, new_loop_phis)
+                    }),
                 Operand::Const(_) => from_guard,
             };
-            incoming.push((from_latch, latch_label));
+            incoming.push((from_latch, shape.latch_label));
         }
         exit_block.insert_insts(0, exit_phi_insts, crate::common::source::Span::dummy());
     }
@@ -1140,21 +1377,38 @@ fn try_rotate_loop(
             }
         }
     }
+}
 
+/// Steps 7 to 9: a copy of the test ends the latch.
+fn put_the_test_at_the_latch(
+    func: &mut IrFunction,
+    plan: &Rotation,
+    new_loop_phis: &FxHashMap<u32, u32>,
+    next_val: &mut u32,
+    debug: bool,
+) {
+    let shape = &plan.shape;
     // 7. Clone the closure instructions to the latch, allocating fresh dest
     //    IDs and rewriting: cloned refs → new dests, phi refs → latch values.
     //    If a header phi's latch incoming is itself a header phi (cross-phi),
     //    rewrite it to the new self-loop phi — the old header phi is about
     //    to collapse to its preheader value in step 10.
-    for latch_op in phi_latch_val.values_mut() {
-        *latch_op = rewrite_header_phi_operand(*latch_op, &new_loop_phis);
-    }
+    let latch_values: Vec<(u32, Operand)> = plan
+        .phis
+        .iter()
+        .map(|phi| {
+            (
+                phi.dest,
+                rewrite_header_phi_operand(phi.next, new_loop_phis),
+            )
+        })
+        .collect();
     let mut clone_map: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut cloned_insts: Vec<Instruction> = Vec::with_capacity(closure_insts_owned.len());
-    for inst in &closure_insts_owned {
+    let mut cloned_insts: Vec<Instruction> = Vec::with_capacity(plan.test.len());
+    for inst in &plan.test {
         let new_dest_opt = if let Some(d) = inst.dest() {
-            let nd = Value(next_val);
-            next_val += 1;
+            let nd = Value(*next_val);
+            *next_val += 1;
             clone_map.insert(d.0, nd.0);
             Some(nd)
         } else {
@@ -1169,8 +1423,8 @@ fn try_rotate_loop(
         // Second: rewrite phi references → latch-edge incoming operands.
         // Phi references are NOT in clone_map (phis are not cloned), so
         // `replace_values_in_inst_map` left them untouched.
-        for (&phi_id, latch_op) in &phi_latch_val {
-            replace_operand_value(&mut cloned, Value(phi_id), (latch_op).clone());
+        for &(phi_id, latch_op) in &latch_values {
+            replace_operand_value(&mut cloned, Value(phi_id), latch_op);
         }
         // Third: rename the dest to the fresh ID.
         if new_dest_opt.is_some() {
@@ -1188,8 +1442,9 @@ fn try_rotate_loop(
     // running is worse than no switch: it makes the A/B that condemns the fold
     // the same A/B that hides it.
     let affine_folds = if affine_fold_enabled() {
-        let proved_cmp = affine_guard_proven
-            .then(|| clone_map.get(&cond_val.0).copied().map(Value))
+        let proved_cmp = plan
+            .affine_guard_proven
+            .then(|| clone_map.get(&shape.cond.0).copied().map(Value))
             .flatten();
         canonicalise_affine_exit_cmps(&mut cloned_insts, proved_cmp)
     } else {
@@ -1202,14 +1457,14 @@ fn try_rotate_loop(
     }
 
     // The cloned cond value (new ID) is the latch's new CondBranch cond.
-    let new_cond = Operand::Value(Value(*clone_map.get(&cond_val.0).expect(
+    let new_cond = Operand::Value(Value(*clone_map.get(&shape.cond.0).expect(
         "cond_val must be in clone_map (it was visited in the closure and has a dest)",
     )));
 
     // 8. Insert cloned instructions at the END of the latch (before the
     //    terminator, which we replace below). The latch's own instructions
     //    (e.g., the IV increment `i_next = i + 1`) must run BEFORE the test.
-    let latch_block = &mut func.blocks[latch_idx];
+    let latch_block = &mut func.blocks[shape.latch_idx];
     latch_block.extend_insts(cloned_insts, crate::common::source::Span::dummy());
 
     // 9. Preserve the header's branch polarity. Classifying the targets as
@@ -1217,39 +1472,17 @@ fn try_rotate_loop(
     //    header still needs an exit-on-true latch (e.g. !(n <= i)).
     latch_block.terminator = Terminator::CondBranch {
         cond: new_cond,
-        true_label: if continue_on_true {
-            continue_label
+        true_label: if shape.continue_on_true {
+            shape.continue_label
         } else {
-            exit_label
+            shape.exit_label
         },
-        false_label: if continue_on_true {
-            exit_label
+        false_label: if shape.continue_on_true {
+            shape.exit_label
         } else {
-            continue_label
+            shape.continue_label
         },
     };
-
-    // 10. The latch no longer branches to the header — its only successor is
-    //     now `continue_label` (self or body) or `exit_label`. Remove the
-    //     stale `(op, latch_label)` incoming from every phi in the header,
-    //     because the latch→header backedge is gone. cfg_simplify then
-    //     collapses the now-single-incoming phi to the preheader value.
-    for inst in &mut func.blocks[lp.header].instructions {
-        if let Instruction::Phi { incoming, .. } = inst {
-            incoming.retain(|(_, lbl)| *lbl != latch_label);
-        }
-    }
-
-    // 11. Advance the watermark so subsequent passes see the new IDs.
-    func.next_value_id = next_val;
-
-    if debug {
-        lccc::cli::stderr_line(format_args!(
-            "[ROT] SUCCESS: rotated header={} latch={}",
-            lp.header, latch_idx
-        ));
-    }
-    true
 }
 
 /// If `op` is a header phi of the loop being rotated, rewrite it to the
@@ -1287,7 +1520,7 @@ fn is_unreachable(block_idx: usize, cfg: &CfgAnalysis) -> bool {
 /// `idom` chain: `dom_idx` must be an ancestor of `block_idx` in the dominator
 /// tree. `block_idx == dom_idx` returns true (a block dominates itself).
 ///
-/// Used by Guard B in `try_rotate_loop`: a reader of a header phi behind
+/// Used by Guard B (`exit_side`): a reader of a header phi behind
 /// the loop is rewritten to the merge phi of the exit block, which has to
 /// dominate the reader's block, or for a phi reader the predecessor its
 /// incoming names. A block no path reaches has no immediate dominator and
@@ -1513,7 +1746,7 @@ fn comparison_matches_domain(op: IrCmpOp, ty: IrType) -> bool {
 ///
 /// NOTE: Phi is deliberately EXCLUDED. Header phis are NOT cloned into
 /// the latch — they are REWRITTEN to their latch-edge incoming values
-/// (step 7's `replace_operand_value` via `phi_latch_val`). If a Phi
+/// (step 7's `replace_operand_value` with `HeaderPhi::next`). If a Phi
 /// were cloned, the cloned Cmp would reference the cloned Phi (a
 /// duplicate self-loop phi) instead of the post-increment `i_next`,
 /// producing an off-by-one (the test reads the phi's stale value).
@@ -2963,7 +3196,8 @@ mod tests {
                     ));
                     let headers = loops.iter().map(|lp| lp.header).collect();
                     assert_eq!(loops.len(), 1);
-                    assert!(try_rotate_loop(&mut f, &loops[0], &cfg, &headers));
+                    let cx = RotationContext::new(&f, &cfg, &headers);
+                    assert!(try_rotate_loop(&mut f, &loops[0], &cx));
                     let mut violations = Vec::new();
                     crate::passes::verify::verify_function(
                         &f,
@@ -3101,7 +3335,8 @@ mod tests {
         ));
         let headers = loops.iter().map(|lp| lp.header).collect();
         assert_eq!(loops.len(), 1);
-        try_rotate_loop(f, &loops[0], &cfg, &headers)
+        let cx = RotationContext::new(f, &cfg, &headers);
+        try_rotate_loop(f, &loops[0], &cx)
     }
 
     fn written(f: &IrFunction) -> Vec<String> {
