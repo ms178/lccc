@@ -22,7 +22,7 @@ Accepted **and** observed to do what it says.  The *Effect* column names the evi
 | `-O2 -fstack-clash-protection` | frames over a page are probed page by page (`orl $0, (%rsp)`) | asm: `orl\s+\$0,\s+\(%rsp\)` |
 | `-m32 -O2 -fstack-clash-protection` | same probing on i686 (`orl $0, (%esp)`) | asm: `orl\s+\$0,\s+\(%esp\)` |
 | `-O2 -fstack-protector-all` | canary load from `%fs:40` and a `__stack_chk_fail` call | asm: `%fs:40`; `__stack_chk_fail` |
-| `-O2 -fstack-protector-all -mstack-protector-guard=tls -mstack-protector-guard-reg=gs -mstack-protector-guard-offset=64` | kernel-style guard location (`%gs:64`) | asm: `%gs:64` |
+| `-O2 -fstack-protector-all -mstack-protector-guard=tls -mstack-protector-guard-reg=gs -mstack-protector-guard-offset=64` | kernel-style guard location (`%gs:64`) | asm: `%gs:64`; absent `%fs:40` |
 | `-O2 -fstack-protector-all -mstack-protector-guard=tls -mstack-protector-guard-symbol=__stack_chk_guard` | guard read from a named TLS symbol | asm: `%fs:__stack_chk_guard` |
 | `-m32 -O2 -fstack-protector-all` | i686 canary from `%gs:20` | asm: `%gs:20` |
 | `-O2 -fcf-protection=full` | every function starts with `endbr64` | asm: `endbr64` |
@@ -32,7 +32,7 @@ Accepted **and** observed to do what it says.  The *Effect* column names the evi
 | `-ffast-math` | defines `__FAST_MATH__` | macros: `__FAST_MATH__ 1` |
 | `-O2 -pg` | function entry calls `mcount` / `__fentry__` | asm: `mcount\|__fentry__` |
 | `-O2 -fno-omit-frame-pointer` | keeps the frame pointer (`pushq %rbp`) | asm: `pushq\s+%rbp` |
-| `-O2 -fno-asynchronous-unwind-tables` | no `.cfi_*` unwind directives | asm: diagnostics |
+| `-O2 -fno-asynchronous-unwind-tables` | no `.cfi_*` unwind directives | asm: absent `\.cfi_startproc` |
 | `-O2 -fpatchable-function-entry=2` | two `nop`s at entry and a `__patchable_function_entries` record | asm: `__patchable_function_entries`; `^\s*nop$` |
 | `-g -O0` | emits DWARF sections (`.debug_line`, `.debug_info`) | sections: `\.debug_line`; `\.debug_info` |
 | `-Wall -Wextra` | `-Wformat`, `-Wunused-variable` and `-Wsign-compare` report | diag: `\[-Wformat`; `-Wunused-variable`; `-Wsign-compare` |

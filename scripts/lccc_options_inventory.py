@@ -228,6 +228,14 @@ class Runner:
         env.pop("LCCC_STRICT_OPTIONS", None)
         return subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env, **kw)
 
+    # ``--discover`` drives the compiler directly, so the two primitives it
+    # needs are part of the runner's surface rather than reached into.
+    def src_path(self, key: str) -> str:
+        return self._src(key)
+
+    def run_raw(self, argv: list[str]) -> subprocess.CompletedProcess:
+        return self._run(argv)
+
     def run(self, row: Row, control: bool = False) -> Result:
         opts = list(row.base) if control else list(row.opts) + list(row.base)
         src = self._src(row.source)
@@ -286,6 +294,20 @@ def evaluate(row: Row, runner) -> list[str]:
 
 
 # ---------------------------------------------------------------------------- document
+def _evidence(row: Row) -> str:
+    """What the checker measures for an ``implemented`` row, in check order.
+
+    ``expect`` patterns must be present, ``absent`` patterns must not be; both
+    are evidence and both belong in the document.  A row with neither is a
+    table error, so this asserts instead of inventing a placeholder -- a
+    document must never claim a kind of evidence the row does not have.
+    """
+    parts = [f"`{p}`" for p in row.expect]
+    parts += [f"absent `{p}`" for p in row.absent]
+    assert parts, f"{row.label}: an implemented row needs an observable effect"
+    return "; ".join(p.replace("|", "\\|") for p in parts)
+
+
 def render_document() -> str:
     seen: set[tuple[str, ...]] = set()
     out = [
@@ -314,10 +336,10 @@ def render_document() -> str:
             seen.add(r.opts)
             opt = "`" + r.label.replace("|", "\\|") + "`"
             if cls == "implemented":
-                ev = "; ".join(f"`{p}`".replace("|", "\\|") for p in r.expect) or "diagnostics"
-                out.append(f"| {opt} | {r.note} | {r.view}: {ev} |")
+                out.append(f"| {opt} | {r.note} | {r.view}: {_evidence(r)} |")
             else:
-                out.append(f"| {opt} | {r.note} | `{r.message}` |".replace("|` |", "` |"))
+                msg = r.message.replace("|", "\\|")
+                out.append(f"| {opt} | {r.note} | `{msg}` |")
         out.append("")
     return "\n".join(out).rstrip() + "\n"
 
@@ -334,11 +356,11 @@ def discover(lccc: str, gcc: str) -> int:
     counts = {"accepted": 0, "warned": 0, "refused": 0}
     refused: list[str] = []
     try:
-        src = runner._src("plain")
+        src = runner.src_path("plain")
         for name in names:
             if name in known or name.startswith("-fdump") or name.startswith("--help"):
                 continue
-            p = runner._run([lccc, name, "-fsyntax-only", src])
+            p = runner.run_raw([lccc, name, "-fsyntax-only", src])
             if p.returncode != 0:
                 counts["refused"] += 1
                 refused.append(name)
@@ -353,7 +375,37 @@ def discover(lccc: str, gcc: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------- reporting
+def verdict(row_failures: int, doc_stale: bool, total: int) -> tuple[str, int]:
+    """The final summary line and the exit status.
+
+    Pure, so the accounting is unit-tested.  A stale document is not a failed
+    row: folding it into the row count reports a row failure that never
+    happened, and with a second such fold it drives the count below zero.
+    """
+    parts = [f"options inventory: {total - row_failures} of {total} rows ok"]
+    if doc_stale:
+        parts.append("document stale")
+    return "; ".join(parts), int(bool(row_failures or doc_stale))
+
+
 # ---------------------------------------------------------------------------- self-test
+def _cell(text: str) -> str:
+    """Escape a pipe for use inside a markdown table cell."""
+    return text.replace("|", "\\|")
+
+
+def _doc_line(row: Row) -> str:
+    """The document line for `row`, matched on its option cell.
+
+    Matching the cell rather than searching for the label keeps a label that is
+    a prefix of another label (``-O2 -fstack-protector-all`` and the
+    ``-mstack-protector-guard=...`` row built on it) from picking the wrong row.
+    """
+    head = "| `" + _cell(row.label) + "` |"
+    return next(line for line in render_document().splitlines() if line.startswith(head))
+
+
 class _Fake:
     """Canned results keyed by option label; ``control`` runs return the plain result."""
 
@@ -417,6 +469,45 @@ class SelfTest(unittest.TestCase):
     def test_stale_document_is_detected(self):
         self.assertNotEqual(render_document(), render_document().replace("`-flto`", "`-fltoX`"))
 
+    def test_document_shows_absent_evidence(self):
+        # A row whose only evidence is an absence must say so.  It used to be
+        # documented as "diagnostics", which is a different measurement.
+        row = next(r for r in ROWS if r.opts == ("-O2", "-fno-asynchronous-unwind-tables"))
+        self.assertEqual(row.expect, ())          # the case that used to print "diagnostics"
+        line = _doc_line(row)
+        for pat in row.absent:
+            self.assertIn(_cell("absent `" + pat + "`"), line)
+        self.assertNotIn("diagnostics", line)
+
+    def test_document_lists_every_pattern(self):
+        # Both directions are evidence: the document must name what must be
+        # present and what must not, or a reader cannot tell what was measured.
+        for r in ROWS:
+            if r.cls != "implemented":
+                continue
+            line = _doc_line(r)
+            for pat in r.expect:
+                self.assertIn(_cell(f"`{pat}`"), line, f"{r.label}: {pat}")
+            for pat in r.absent:
+                self.assertIn(_cell(f"absent `{pat}`"), line, f"{r.label}: {pat}")
+
+    def test_document_escapes_pipes_inside_cells(self):
+        # A `|` in a pattern would otherwise end the markdown cell early.
+        self.assertIn("a\\|b", _evidence(Row(("-fx",), "implemented", "n", expect=(r"a|b",))))
+
+    def test_evidence_refuses_to_invent(self):
+        # No effect, no evidence: the document must not print a placeholder.
+        with self.assertRaises(AssertionError):
+            _evidence(Row(("-fx",), "implemented", "n"))
+
+    def test_verdict_keeps_rows_and_document_apart(self):
+        # The bug this pins: a stale document was counted as a failed row, so a
+        # fully green run reported "36 of 37 rows ok".
+        self.assertEqual(verdict(0, False, 37), ("options inventory: 37 of 37 rows ok", 0))
+        self.assertEqual(verdict(0, True, 37), ("options inventory: 37 of 37 rows ok; document stale", 1))
+        self.assertEqual(verdict(2, False, 37), ("options inventory: 35 of 37 rows ok", 1))
+        self.assertEqual(verdict(2, True, 37), ("options inventory: 35 of 37 rows ok; document stale", 1))
+
 
 # ---------------------------------------------------------------------------- main
 def main(argv=None) -> int:
@@ -440,7 +531,7 @@ def main(argv=None) -> int:
         print(f"error: compiler not found: {args.lccc}", file=sys.stderr)
         return 2
     runner = Runner(args.lccc)
-    failures = 0
+    row_failures = 0
     try:
         for row in ROWS:
             problems = evaluate(row, runner)
@@ -448,23 +539,23 @@ def main(argv=None) -> int:
             print(f"{status} [{row.cls:11}] {row.label}")
             for p in problems:
                 print(f"       {p}")
-            failures += bool(problems)
+            row_failures += bool(problems)
     finally:
         runner.close()
     doc = render_document()
+    doc_stale = (DOC.read_text() if DOC.exists() else "") != doc
     if args.write:
-        if failures:
-            print(f"refusing to write: {failures} row(s) do not behave as classified", file=sys.stderr)
+        if row_failures:
+            print(f"refusing to write: {row_failures} row(s) do not behave as classified", file=sys.stderr)
             return 1
         DOC.write_text(doc)
         print(f"wrote {DOC.relative_to(REPO)} ({len(ROWS)} rows)")
         return 0
-    current = DOC.read_text() if DOC.exists() else ""
-    if current != doc:
+    if doc_stale:
         print("FAIL docs/OPTIONS.md is stale: run `python3 scripts/lccc_options_inventory.py --write`", file=sys.stderr)
-        failures += 1
-    print(f"options inventory: {len(ROWS) - failures} of {len(ROWS)} rows ok")
-    return 1 if failures else 0
+    summary, status = verdict(row_failures, doc_stale, len(ROWS))
+    print(summary)
+    return status
 
 
 if __name__ == "__main__":
