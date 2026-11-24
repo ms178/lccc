@@ -36,7 +36,7 @@
 //!   callee-saved registers. An unmarked jump to a symbol stays unresolvable.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, is_read_modify_write, src_mentions_family};
+use super::helpers::{get_dest_reg, is_read_modify_write, second_token, src_mentions_family};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// All 16 GP families.
@@ -309,10 +309,7 @@ pub(super) fn call_window_verdict(
         return Some(false);
     }
     let t = infos[n].trimmed(store.get(n));
-    if t.split_whitespace()
-        .nth(1)
-        .is_some_and(|target| target.starts_with('.'))
-    {
+    if second_token(t).is_some_and(|target| target.starts_with('.')) {
         return Some(false);
     }
     if CALLER_SAVED & mask != 0 {
@@ -2597,7 +2594,7 @@ impl FileLiveness {
                 // values live at either the target or the fallthrough stay
                 // live across the call (sound — dead is never concluded),
                 // while a real external callee keeps the ABI model.
-                let local_target = t.split_whitespace().nth(1).and_then(resolve);
+                let local_target = second_token(t).and_then(resolve);
                 edges.extend(next);
                 match local_target {
                     Some(target) => {
@@ -2627,7 +2624,7 @@ impl FileLiveness {
                 })
             }
             LineKind::Jmp => {
-                let target = t.split_whitespace().nth(1)?;
+                let target = second_token(t)?;
                 if target.starts_with('*') {
                     return Self::tail_call_effect(store, infos, n);
                 }
@@ -2644,7 +2641,7 @@ impl FileLiveness {
                 })
             }
             LineKind::CondJmp => {
-                let target = t.split_whitespace().nth(1)?;
+                let target = second_token(t)?;
                 let Some(idx) = resolve(target) else {
                     // A conditional sibling call (`jne sym@PLT` carrying the
                     // `# LCCC_TAIL_CALL` block, `jump_thread::

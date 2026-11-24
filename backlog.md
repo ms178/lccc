@@ -1,6 +1,6 @@
 # LCCC Engineering Backlog — "Maybach" edition
 
-Rewritten 2026-11-20 against `4d28473` (`main`). Every status in this file was
+Rewritten 2026-11-20 against `dbdadc9` (`main`). Every status in this file was
 re-checked on that tree: §2 lists the probes that were run, and an item whose
 text says "measured" carries its own date. Closed work is deleted, not struck
 through — `git log -- backlog.md` is the history, and per-session narratives live
@@ -71,10 +71,10 @@ benchmark; a skipped oracle is missing evidence, not a pass.
 
 ---
 
-## 2. Baseline snapshot (R, 2026-11-20, `4d28473`)
+## 2. Baseline snapshot (R, 2026-11-20, `dbdadc9`)
 
 Every row below was produced today by running the `fastbuild` binaries built from
-`4d28473` (x86-64 rows on the host; i686 rows with header-free sources because the
+`dbdadc9` (x86-64 rows on the host; i686 rows with header-free sources because the
 audit sandbox has no 32-bit libc headers). A row is either **works** (accepted *and*
 the documented effect observed) or **open** (the item that owns it). Re-run the
 probes before starting an item; the status of a row is only as old as its date.
@@ -94,8 +94,7 @@ probes before starting an item; the status of a row is only as old as its date.
 | `_BitInt(37)` under `-std=c23` | rejected (open) | GP-06 |
 | `-mstackrealign`, `-mfsgsbase`, `-gsplit-dwarf`, `-gz`, `-g3` macro section | refused or warned as unsupported; `-g3` emits no `.debug_macro` (open) | GP-19, GP-20 |
 | `__asm__("..." : "=Z"(x) : "q"(1))` | accepted, garbage operand emitted; GCC: `impossible constraint in 'asm'` (open) | GP-17 |
-| `#define F(a;b) a` | **preprocessor never terminates** (open) | AU-01 |
-| mutation fuzz: 1 500 mutants of `tests/**/*.c`, 3 400 compilations (`-O1`, `-O2 -mavx2`, `-m32 -O1`) | 0 internal errors, 0 signals, 1 distinct hang (AU-01) | AU-02 |
+| mutation fuzz (`tests/fuzz/mutate_frontend.py`): the 1 500-mutant sequence that found the old `#define` hang, plus 2 500 fresh mutants (`--seed 424242`), `-O1` / `-O2 -mavx2` | 0 internal errors, 0 signals, 0 hangs | AU-02 |
 | run-to-run determinism, 12 benchmark programs × 4 configs × 4 runs (35 compilable pairs) | assembly and object bytes identical | AU-06 |
 
 ---
@@ -106,25 +105,24 @@ ROI = (impact × confidence) ÷ effort, each 1–5; higher is better.
 
 | Rank | ID | Title | Pillar | Effort | ROI |
 |---:|---|---|---|---|---:|
-| 1 | AU-01 | Preprocessor hang on a malformed `#define` parameter list | 1 | S | 5.0 |
-| 2 | MB-20 | Peephole compile time: decode once (58 % → ≤ 35 % of instructions) | 5 | S–M | 4.8 |
-| 3 | MB-01 | Finish the option contract: OPTIONS.md, tier classes, probe rows | 1 | S | 4.6 |
-| 4 | MB-02 | Linker option contract (generated inventory, silent `--print-gc-sections`) | 1 | M | 4.5 |
-| 5 | MB-04 | PIE by default, real `-static-pie`, default build-id | 2 | M | 4.2 |
-| 6 | AU-02 | Promote the frontend mutation fuzzer; add `cargo-fuzz` targets | 1 | S–M | 4.0 |
-| 7 | MB-10 | DWARF: line tables in the native assemblers, then DIEs | 3 | L | 3.8 |
-| 8 | AU-03 | Miri lane and a coverage report | 1 | M | 3.6 |
-| 9 | MB-12 | Warnings that real builds rely on (flow, shadow, conversion) | 4 | M–L | 3.4 |
-| 10 | MB-11 | C23 conformance inventory and half-format edge cases | 4 | S–M | 3.3 |
-| 11 | MB-14 | Linker residue: `--emit-relocs`, ELF32 `-r`, common-page-size | 2 | M | 3.2 |
-| 12 | AU-07 | One linker emit skeleton instead of two 4 k-line copies | 5 | M | 3.1 |
-| 13 | MB-32 | i686 differential gate (expand the 14 programs) | 3 | S | 3.0 |
-| 14 | MB-15 | Whole-program mode (`-fwhole-program` / honest `-flto`) | 6 | L | 3.0 |
-| 15 | AU-09 | Parked optimisations: root-cause or delete | 5 | M | 3.0 |
-| 16 | MB-07 | `-fno-strict-overflow` pointer half; UBSan handler mode | 2 | M | 2.9 |
-| 17 | MB-33 | Linker differential oracle (bfd/lld/mold/lccc-ld) | 1 | M | 2.8 |
-| 18 | AU-04 | Narrow the crate-wide `allow(dead_code, …)` | 5 | M | 2.7 |
-| 19 | MB-30 | Raptor Lake cost-model calibration from published tables | 6 | L | 2.5 |
+| 1 | MB-20 | Peephole compile time: decode once (76.9 % → ≤ 35 % of instructions) | 5 | M | 4.5 |
+| 2 | MB-02 | Linker option contract (generated inventory, silent `--print-gc-sections`) | 1 | M | 4.5 |
+| 3 | MB-04 | PIE by default, real `-static-pie`, default build-id | 2 | M | 4.2 |
+| 4 | AU-02 | Nightly lane for the frontend mutation fuzzer; add `cargo-fuzz` targets | 1 | S–M | 4.0 |
+| 5 | MB-10 | DWARF: line tables in the native assemblers, then DIEs | 3 | L | 3.8 |
+| 6 | AU-03 | Miri lane and a coverage report | 1 | M | 3.6 |
+| 7 | MB-01 | Decide the 766 tolerated options (grow the generated inventory) | 1 | M | 3.5 |
+| 8 | MB-12 | Warnings that real builds rely on (flow, shadow, conversion) | 4 | M–L | 3.4 |
+| 9 | MB-11 | C23 conformance inventory and half-format edge cases | 4 | S–M | 3.3 |
+| 10 | MB-14 | Linker residue: `--emit-relocs`, ELF32 `-r`, common-page-size | 2 | M | 3.2 |
+| 11 | AU-07 | One linker emit skeleton instead of two 4 k-line copies | 5 | M | 3.1 |
+| 12 | MB-32 | i686 differential gate (expand the 14 programs) | 3 | S | 3.0 |
+| 13 | MB-15 | Whole-program mode (`-fwhole-program` / honest `-flto`) | 6 | L | 3.0 |
+| 14 | AU-09 | Parked optimisations: root-cause or delete | 5 | M | 3.0 |
+| 15 | MB-07 | `-fno-strict-overflow` pointer half; UBSan handler mode | 2 | M | 2.9 |
+| 16 | MB-33 | Linker differential oracle (bfd/lld/mold/lccc-ld) | 1 | M | 2.8 |
+| 17 | AU-04 | Narrow the crate-wide `allow(dead_code, …)` | 5 | M | 2.7 |
+| 18 | MB-30 | Raptor Lake cost-model calibration from published tables | 6 | L | 2.5 |
 
 The GCC-16.2 conformance half of the programme is ranked separately in §12
 (`GP-01`…`GP-24`). GP-17 gained an R reproducer on 2026-11-20 (invalid output
@@ -132,9 +130,9 @@ constraint accepted) and should be read before the rest of that register.
 Audit items `AU-xx` are in §14 (whole-tree audit, 2026-11-20); AU-05, AU-06,
 AU-08, AU-10, AU-11 and AU-12 are P2–P3 and unranked here.
 
-Suggested start: AU-01 (an hour of work, removes the only known hang) → MB-20 →
-MB-01. For two agents in parallel: [AU-01, MB-01, MB-04] on the driver/linker side
-and [MB-20, AU-09] on the backend side.
+Suggested start: MB-20 (the largest measured compile-time lever) → MB-02 → MB-04.
+For two agents in parallel: [MB-02, MB-04, MB-01] on the driver/linker side and
+[MB-20, AU-09] on the backend side.
 
 **2026-11-18 performance worklist:** see the [evidence-ranked ten-item queue](engineering/BACKLOG-ROI-2026-11-18.md).
 The Nov 18 VM screens favor bounded match extension and Huffman heap codegen over
@@ -148,54 +146,53 @@ not a runtime win.
 
 ## 4. Tier M0 — Trust: promises must match artifacts
 
-### MB-01 · P0 · R — finish the option contract (the policy exists; its edges do not)
+### MB-01 · P1 · R — decide the 766 tolerated options
 
-**Why.** The driver implements a measured, tiered policy (header of
-`src/driver/cli.rs`): contract flags are hard errors, everything else unimplemented
-is tolerated with a warning, `LCCC_STRICT_OPTIONS=1` makes it strict, and
-`scripts/lccc_capability_probe.py` establishes capabilities by running the
-compiler. **Do not reopen the "unknown flag must fail" question** — the policy's
-argument (16 of 93 flags that kernel, glibc, zlib-ng, gzip and expat pass
-unconditionally had no arm) is recorded and measured. The remaining defects are at
-the edges of that policy (R, 2026-11-20):
+**Why.** The driver's tiered policy (header of `src/driver/cli.rs`) and
+`docs/OPTIONS.md` — generated by `scripts/lccc_options_inventory.py`, whose 37 rows are
+re-measured against the binary (accepted / warned / refused, plus the observable
+effect) on every `--check` — cover the options with a decided class. The rest is
+undecided. R, measured on `4d28473` by probing GCC 13.3's option names bare with
+`lccc <opt> -fsyntax-only`: of 1 140 names, **181 are accepted silently, 766 are
+accepted with a "tolerated but not implemented" warning, and 156 are refused**
+(names that need a value are over-counted as refused). Each of the 766 is either a
+presentation or diagnostic option (keep tolerated) or changes the artifact and must
+be implemented or refused: today `-fstrict-aliasing`, `-fstack-reuse=none`,
+`-fvtable-verify=std`, `-fzero-init-padding-bits=all` and `-fcheck-pointer-bounds`
+all produce a normal exit status and an artifact that ignores them. The 181 silent
+acceptances were spot-checked (`-fcf-protection`, `-fpack-struct`, `-funsigned-char`,
+`-fshort-wchar`, `-pg`, `-fno-omit-frame-pointer`, `-fno-asynchronous-unwind-tables`,
+`-ffast-math`, `-fpatchable-function-entry`): all have their effect and are rows now.
 
-1. Nothing tells a user *which* options are implemented; there is no options
-   document (`docs/` has none) and the answer exists only inside the capability
-   probe's manifest.
-2. The tolerated tier still mixes classes. `-Wshadow`, `-Wmaybe-uninitialized` and
-   friends are tolerated with "nothing will act on it" (honest, but the user gets no
-   diagnostics GCC users rely on — GP-11, GP-12), while `-gz` and `-gsplit-dwarf`
-   warn with a *different* spelling and a different prefix (AU-05).
-3. The linker side has the same shape: `-Wl,--print-gc-sections` is accepted and
-   prints nothing although a section was discarded (MB-02).
-
-**Where.** `src/driver/cli.rs` (tier arms), `scripts/lccc_capability_probe.py`,
-[`engineering/SCRIPT-MEASUREMENT-MAP.md`](engineering/SCRIPT-MEASUREMENT-MAP.md).
+**Where.** `src/driver/cli.rs` (tier arms), `scripts/lccc_options_inventory.py`
+(`ROWS`, `--discover`), `docs/OPTIONS.md` (generated).
 
 **Reproducer.**
 ```bash
-echo 'int f(int x){return x+1;}' > x.c
-lccc -Wshadow -c x.c -o x.o; echo $?     # 0 + "tolerated but not implemented" warning
-lccc -gz -c x.c -o x.o                   # "lccc: warning: ... -gz ... not supported"
-ls docs/OPTIONS.md                       # No such file
+python3 scripts/lccc_options_inventory.py --discover --lccc target/fastbuild/lccc
+# 1140 GCC option names; not yet rows: {'accepted': 181, 'warned': 766, 'refused': 156}
+lccc -fstrict-aliasing -c x.c      # rc 0, "unrecognized command-line option ... is tolerated but not implemented"
 ```
 
 **Plan.**
-1. Enumerate the tolerated tier mechanically: `gcc -Q --help=common,target` option
-   names × the capability probe; classify each as `presentation | artifact-changing`.
-   Artifact-changing options must warn at least once per invocation and be listed in
-   the document of step 2.
-2. Generate an options document (to be created under `docs/`) from the probe manifest +
-   the tier table: option, class, since-version, note. Add a gate that fails when the
-   document is stale.
-3. Add the probe rows from §2 (flag → observable effect) to the capability probe as
-   `effect:` capabilities, so "accepted" and "has the documented effect" are
-   separate columns.
+1. Teach `--discover` to read each option's value form from `gcc -Q --help=...`, so
+   options that need a value stop inflating the "refused" count, and make it print the
+   three lists to a file for triage.
+2. Triage the 766 by what the option does to the artifact: presentation / diagnostic
+   (stay tolerated, no row needed), optimisation hints with no semantic effect (stay
+   tolerated, one summary line in the document), and artifact-changing (ABI, layout,
+   security, output format) — implement it with an effect row, or move it to the
+   refused tier with a message. `-fstrict-aliasing` and the `-fsanitize-*` /
+   `-fvtable-verify` family go first.
+3. Add the decided rows to `ROWS`; the checker enforces class and effect, and
+   `--write` regenerates the document.
+4. Ratchet the tolerated count: `--discover --json` pins `warned` and fails when it
+   grows.
 
-**Gates.** The probe runs in strict mode in the existing probe slot; new rows must
-be mutation-verified (turn the option into a silent no-op and watch the `effect:`
-row fail). **Accept.** No artifact-changing option is accepted silently; the options
-document is generated and current. **Effort** S · **ROI** 4.6.
+**Gates.** `python3 scripts/lccc_options_inventory.py --self-test` and `--check`
+(mutation-verified: a wrapper that turns `-fno-plt` and `-fstack-clash-protection`
+into silent no-ops fails three rows). **Accept.** No artifact-changing option is in
+the tolerated tier; the document lists every class decision. **Effort** M · **ROI** 3.5.
 
 ### MB-02 · P0 · R — linker option contract and no silent no-ops
 
@@ -600,37 +597,47 @@ static to prove renaming. **Effort** M (stage 1) / L (stage 2) · **ROI** 3.0.
 pass-level re-verification are fixed and gated (lazy `LabelRefs`, the
 allocation-before-filter ratchet `tests/regression/check_peephole_alloc_before_filter.py`,
 pass-level dirty ticks with `CCC_PEEPHOLE_NO_DIRTY_SKIP=1` / `CCC_PEEPHOLE_VERIFY_DIRTY=1`
-as the revert and honesty switches). `LabelRefs::build` is at or below 2 % of
-instructions. What remains: the peephole is still 58.01 % of compiler instructions
-(Callgrind, 40-function TU, `-O1`, measured 2026-11) against the ≤ 35 % criterion, and
-on a 300-function TU it is about 74 % of compile time while GCC `-O1` takes about
-a quarter of lccc's total. The remaining cost is diffuse `starts_with` /
-`contains` opcode tests over text lines across hundreds of sites, with no single
-block above 2 %.
+as the revert and honesty switches), and the liveness solver reads a branch target
+with `helpers::second_token` instead of `SplitWhitespace` (byte-identical output;
+`SplitWhitespace::next` fell from 622.6 M to 261.9 M instructions, total −1.94 %).
+What remains, measured with Callgrind on `tests/regression/int_cmp_const_select_cross.c`
+at `-O1` on `4d28473` (14.29 G instructions after the step above; the baseline
+before it was 14.57 G): the peephole is **76.87 %
+inclusive** against the ≤ 35 % criterion. Where it goes: the dual-layout metric pair
+(`metric_pair::run_metric_pair`, two full peephole runs per function, 28.8 %),
+`FileLiveness::solve_function` with its inlined slice/str helpers (about 11 %),
+`LabelRefs::build` (1.7 %) and `adjust_counts` (2.2 %), `is_structural` (1.8 %, 3.7 M
+calls), `FileLiveness::hash_function` (2.3 %), and diffuse `starts_with` (2.3 %) /
+`LineKind::eq` (1.9 %) traffic over hundreds of sites. `analyse_function` runs 28 188
+times for 1 128 functions: each pass re-solves functions the previous pass edited.
 
-**Where.** `src/backend/x86/codegen/peephole/passes/{local_patterns,dead_writes,memory_fold,relay_and_lea,load_op_fuse}.rs`.
+**Where.** `src/backend/x86/codegen/peephole/passes/{liveness,local_patterns,dead_writes,memory_fold,relay_and_lea,load_op_fuse}.rs`,
+`src/backend/metric_pair.rs`.
 
 **Reproducer.**
 ```bash
-CCC_TIME_PEEPHOLE=1 lccc -O1 -c big.c -o /dev/null
-valgrind --tool=callgrind --callgrind-out-file=cg.out lccc -O1 -c big40.c -o /dev/null
-callgrind_annotate --inclusive=yes cg.out | grep -E 'combined_local_pass|peephole_optimize_inner'
+valgrind --tool=callgrind --callgrind-out-file=cg.out \
+  lccc -O1 -S -o /dev/null tests/regression/int_cmp_const_select_cross.c
+callgrind_annotate --inclusive=yes cg.out | grep -E 'peephole_optimize_inner|run_metric_pair|solve_function'
 ```
 
-**Plan.** Extend `LineInfo` with an interned opcode id and operand kinds computed on
-creation or edit, so the `starts_with` ladders become table lookups. Convert one
-recogniser family per PR, most expensive first by Callgrind inclusive cost; the
-interned-opcode-id design is the structural cure. Do not route `LineKind::eq` through
-the packed word: measured 16× worse at fastbuild opt-level 1 (pinned in the enum's
-doc comment). Re-profile after each PR before choosing the next family.
+**Plan.** In order of measured cost: (1) cut the 28 188 re-solves — key the solve on the
+function's edit generation so a pass that changed nothing in a function does not
+re-run `analyse_function` for it (the dirty-tick machinery exists at pass level);
+(2) share the decode between the two metric candidates: they differ only in block
+order, so lines that are identical in both are classified once; (3) give `LineInfo` an
+interned opcode id and operand kinds computed on creation or edit, then convert one
+recogniser family per PR, most expensive first; (4) `is_structural` as a precomputed
+`LineInfo` bit. Do not route `LineKind::eq` through the packed word: measured 16× worse
+at fastbuild opt-level 1 (pinned in the enum's doc comment). Re-profile after each PR.
 
 **Gates.** Byte-identical `.s` over the benchmark programs, the kernel corpus and the
-asm-diff corpus before and after (existing identity scripts); a compile-cost
-ratchet on two fixed inputs using Callgrind instruction counts with a 3 %
-tolerance (the deterministic proxy) **plus** a paired wall-time check reported
-separately. **Accept.** Peephole ≤ 35 % of total compiler instructions with output
-byte-identical. **Risks.** A table that disagrees with the text it caches — hence the
-identity gates. **Effort** M · **ROI** 4.8.
+asm-diff corpus before and after (existing identity scripts); a compile-cost ratchet
+on the reproducer TU using Callgrind instruction counts with a 3 % tolerance (the
+deterministic proxy) **plus** a paired wall-time check reported separately.
+**Accept.** Peephole ≤ 35 % of total compiler instructions with output byte-identical.
+**Risks.** A table that disagrees with the text it caches — hence the identity gates.
+**Effort** M · **ROI** 4.5.
 
 ### MB-22 · P2 — measure the tool honestly
 
@@ -2127,73 +2134,31 @@ Standing constraints from §1's item format apply unchanged: `fastbuild`, `-j2`,
 
 ---
 
-## 14. Whole-tree audit (2026-11-20, `4d28473`)
+## 14. Whole-tree audit (2026-11-20, `dbdadc9`)
 
 Method: the repo's own static gates (`scripts/audit_census.py`, doc-link,
 conflict-marker, backlog-ROI), source reading of every non-test `unsafe` block,
 and runtime probes on a `fastbuild` binary (§2), including a mutation fuzz
 (1 500 mutants, 3 400 compilations) and a run-to-run determinism sweep. No clippy and no CI run was used. Items
 marked **S** are source-anchored and have not been reproduced: their first plan
-step is to turn them into **R** or delete them. Census at this commit: 763 Rust
-files, 1 186 261 lines, 860 panic sites (94 in frontend/lowering/driver), 27
-`unsafe` sites, 233 / 97 / 26 functions over 300 / 500 / 1 000 lines, 577 knob
-names (249 undocumented).
+step is to turn them into **R** or delete them. Census at this commit: 769 Rust
+files, 1 195 507 lines, 859 panic sites (94 in frontend/lowering/driver), 27
+`unsafe` sites, 233 / 97 / 26 functions over 300 / 500 / 1 000 lines, 576 knob
+names (248 undocumented).
 
-### AU-01 · P0 · R — the preprocessor never terminates on a malformed `#define` parameter list
-
-**Why.** `#define F(a;b) a` hangs `lccc -E`, `-S` and `-c` forever (R: killed by a
-40 s timeout, rc 124; no use of `F` needed). Found by the mutation fuzzer (AU-02)
-in one mutant of `tests/corpus/clang-c/Sema/align-x86.c`. Cause (S, read from source): the parameter loop in
-`parse_define` (`src/frontend/preprocessor/macro_defs.rs`) advances only for
-whitespace, `)`, `...`, an identifier start or `,`; any other byte (`;`, a digit,
-`+`) neither consumes input nor leaves the loop. A hang in a build tool is worse
-than a crash: CI jobs and `cc-option` probes wait for the job timeout. The same
-function accepts `#define F(a b) a` as two parameters (R: the error only appears at
-the use site, "macro 'F' requires 2 arguments"), and has no error channel for
-duplicate parameters or an unterminated list; GCC rejects all of these at the
-definition.
-
-**Where.** `src/frontend/preprocessor/macro_defs.rs` (`parse_define`, returns
-`Option<MacroDef>`), its callers in `src/frontend/preprocessor/pipeline.rs` and
-`includes.rs`.
-
-**Reproducer.**
-```bash
-printf '#define F(a;b) a\nint x;\n' > m.c
-timeout 10 lccc -E m.c; echo $?        # 124 today; GCC: error, rc 1
-printf '#define F(a,;) a\n' > m2.c; timeout 10 lccc -E m2.c; echo $?   # 124
-printf '#define F(a b) a\nint y;\n' > m3.c; lccc -E m3.c; echo $?      # 0 today; GCC: error
-```
-
-**Plan.**
-1. Make every branch of the parameter loop consume input or return. An unexpected
-   byte returns a definition error.
-2. Give `parse_define` an error channel (`Result<MacroDef, DefineError>`) and report
-   with GCC's wording and the line: "expected parameter name, found X", "expected
-   comma in macro parameter list", "duplicate macro parameter 'a'", "missing ')'
-   in macro parameter list", "'__VA_ARGS__' can only appear in the expansion of a
-   variadic macro".
-3. Add the three reproducers above as regression cases that run under `timeout 10`
-   and assert rc 1 plus the message class (compare with `gcc -E` as oracle).
-4. Replay the three fuzz timeouts as part of AU-02's seed corpus.
-
-**Gates.** The new regression cases; the mutation fuzzer run of AU-02 reports 0
-timeouts. **Accept.** All six malformed shapes fail fast with a diagnostic; valid
-definitions (`tests/corpus/clang-c`, the benchmark programs) preprocess to
-identical bytes before and after. **Effort** S · **ROI** 5.0.
-
-### AU-02 · P1 · R — keep the frontend mutation fuzzer and add coverage-guided targets
+### AU-02 · P1 · R — run the frontend mutation fuzzer nightly and add coverage-guided targets
 
 **Why.** The existing fuzzers (`tests/fuzz/differential_fuzz.py`,
 `phi_cfg_fuzz.py`) generate *valid* programs and compare output; nothing feeds the
 frontend invalid or hostile input, although it has 94 panic sites in user-reachable
 code. `tests/fuzz/mutate_frontend.py` (added with this audit) mutates the repo's own
 C files (token insertion, truncation, byte flips, duplication, NUL and 0xFF bytes)
-and classifies results as diagnostic / ICE / signal / timeout. Result on
-`4d28473` (R): 1 500 mutants compiled 3 400 times (`-O1`, `-O2 -mavx2`, `-m32 -O1`;
-the mutant sequence is shared across configurations) → 0 internal errors, 0
-signals, 1 distinct hang (AU-01). That is a good baseline, and it is
-blind to anything the mutators cannot reach.
+and classifies results as diagnostic / ICE / signal / timeout. The first run on
+`4d28473` (1 500 mutants, 3 400 compilations over `-O1`, `-O2 -mavx2`, `-m32 -O1`)
+found one hang (a malformed `#define` parameter list, fixed and pinned by
+`tests/regression/check_malformed_define.sh`); afterwards the same sequence plus 2 500
+fresh mutants gave 0 internal errors, 0 signals, 0 hangs (R). That is a good baseline,
+and it is blind to anything the mutators cannot reach.
 
 **Where.** `tests/fuzz/mutate_frontend.py`, `tests/fuzz/README.md`; new
 `fuzz/` crate for `cargo-fuzz` targets (not present today).
@@ -2341,8 +2306,8 @@ programs (`readelf -a` diff plus `cmp`).
 
 ### AU-08 · P2 · S — 26 functions over 1 000 lines
 
-**Why.** The census lists them: `emit_intrinsic_impl` (7 021, x86 and 2 725 on
-i686), `allocate_registers` (3 670), `run_passes` (3 233), `encode_mnemonic`
+**Why.** The census lists them: `emit_intrinsic_impl` (7 131, x86 and 2 725 on
+i686), `allocate_registers` (3 686), `run_passes` (3 233), `encode_mnemonic`
 (3 147) and the three linker functions of AU-07. `i686/codegen/peephole.rs` is a
 single 27.8 k-line file whereas the x86 peephole is already split into `passes/`.
 Giant functions defeat review, make per-function compile cost unmeasurable and are
@@ -2382,9 +2347,9 @@ in the same commit; (3) record the verdict in `engineering/DECISIONS.md`. Start 
 **Accept.** No `#[ignore = "blocked on …"]` test and no default-off pass without an
 owner item. **Effort** M per feature · **ROI** 3.0.
 
-### AU-10 · P2 · S — 577 environment knobs, 249 undocumented, all read in release builds
+### AU-10 · P2 · S — 576 environment knobs, 248 undocumented, all read in release builds
 
-**Why.** The compiler reads the environment 649 times (`passes/mod.rs` 93,
+**Why.** The compiler reads the environment 651 times (`passes/mod.rs` 93,
 `vectorize.rs` 41, `driver/pipeline.rs` 39). Any `CCC_*` variable left in a build
 environment changes code generation without appearing on the command line or in a
 build log, which is the opposite of reproducible output; and each undocumented knob
@@ -2399,7 +2364,7 @@ which the documentation table is generated. (2) Gate dev-only knobs behind a car
 feature (`dev-knobs`) so a release `lccc` ignores them. (3) Print the effective
 non-default knobs under `-v`. (4) Document or delete the 249.
 
-**Accept.** Undocumented knobs: 249 → 0; a release binary built without
+**Accept.** Undocumented knobs: 248 → 0; a release binary built without
 `dev-knobs` ignores a `CCC_*` variable (test it). **Effort** M · **ROI** 2.8.
 
 ### AU-11 · P3 · S — `unsafe` hygiene

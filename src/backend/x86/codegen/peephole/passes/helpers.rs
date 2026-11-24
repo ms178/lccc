@@ -12,6 +12,46 @@ pub(super) use crate::backend::peephole_common::{
     alignment_fill_is_explicit, directive_emits_data,
 };
 
+/// `text.split_whitespace().nth(1)` -- the operand of a one-operand instruction
+/// such as `jmp`, `jne` or `call` -- without the Unicode-aware iterator.
+///
+/// The liveness solver reads the branch target of every control-transfer line
+/// on every solve, and `SplitWhitespace` was 2.6 % of all compiler
+/// instructions on a large TU (Callgrind, `-O1`).  Assembly text is ASCII, so
+/// the common case is one byte scan; any byte >= 0x80 met while scanning falls
+/// back to the exact iterator, which keeps the result identical for the
+/// Unicode whitespace the byte scan cannot classify (U+00A0, U+0085, ...).
+/// Rust's `char::is_whitespace` on ASCII is `\t \n \x0B \x0C \r` and space --
+/// not `u8::is_ascii_whitespace`, which omits `\x0B`.
+#[inline]
+pub(super) fn second_token(text: &str) -> Option<&str> {
+    #[inline(always)]
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ')
+    }
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut start = 0;
+    // Token 0 (the mnemonic), then token 1 (the operand we want).
+    for _ in 0..2 {
+        while i < len && is_ws(bytes[i]) {
+            i += 1;
+        }
+        if i == len {
+            return None;
+        }
+        start = i;
+        while i < len && !is_ws(bytes[i]) {
+            if bytes[i] >= 0x80 {
+                return text.split_whitespace().nth(1);
+            }
+            i += 1;
+        }
+    }
+    Some(&text[start..i])
+}
+
 /// The single law for stepping over a line while a pass reasons about flags,
 /// register liveness or memory: a `nop`, or a directive that emits **no data**.
 ///
@@ -1833,5 +1873,53 @@ mod operand_list_container_tests {
         assert_eq!(l[0], "$1");
         assert_eq!(&l[..l.len() - 1], &["$1", "%xmm0"]);
         assert!(l.iter().any(|s| s.starts_with("%xmm")));
+    }
+}
+
+#[cfg(test)]
+mod second_token_tests {
+    use super::second_token;
+
+    /// The helper must equal `split_whitespace().nth(1)` on every input: all
+    /// strings of up to five characters over an alphabet that mixes ASCII
+    /// whitespace (including the vertical tab and form feed that
+    /// `u8::is_ascii_whitespace` gets wrong), the separators U+001C..U+001F
+    /// that `char::is_whitespace` rejects, and non-ASCII whitespace.
+    #[test]
+    fn second_token_equals_split_whitespace_nth_1() {
+        let alphabet = [
+            "a", ".", "*", " ", "\t", "\n", "\u{b}", "\u{c}", "\r", "\u{1c}", "\u{a0}", "\u{85}",
+            "\u{2003}", "é",
+        ];
+        let mut frontier = vec![String::new()];
+        let mut checked = 0usize;
+        for _ in 0..5 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for ch in alphabet {
+                    let text = format!("{prefix}{ch}");
+                    assert_eq!(
+                        second_token(&text),
+                        text.split_whitespace().nth(1),
+                        "{text:?}"
+                    );
+                    checked += 1;
+                    next.push(text);
+                }
+            }
+            frontier = next;
+        }
+        assert!(checked > 500_000);
+    }
+
+    #[test]
+    fn second_token_reads_branch_targets() {
+        assert_eq!(second_token("jmp .L5"), Some(".L5"));
+        assert_eq!(second_token("jne\t.LBB1_2"), Some(".LBB1_2"));
+        assert_eq!(second_token("call foo@PLT"), Some("foo@PLT"));
+        assert_eq!(second_token("jmp *%rax"), Some("*%rax"));
+        assert_eq!(second_token("ret"), None);
+        assert_eq!(second_token(""), None);
+        assert_eq!(second_token("   "), None);
     }
 }

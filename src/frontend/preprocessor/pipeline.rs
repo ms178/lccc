@@ -12,7 +12,9 @@ use std::rc::Rc;
 
 use super::builtin_macros::define_builtin_macros;
 use super::conditionals::{ConditionalStack, evaluate_condition};
-use super::macro_defs::{MacroDef, MacroTable, SavedMacroDefinition, parse_define};
+use super::macro_defs::{
+    DefineError, MacroDef, MacroTable, SavedMacroDefinition, try_parse_define,
+};
 use super::text_processing::{
     CommentSegments, LineResolver, LineResolverData, LineSegments, split_first_word,
     strip_line_comment,
@@ -1325,10 +1327,29 @@ impl Preprocessor {
     /// `-D'P(x)=L_##x'` defines the two-token-pasting macro `P`, not an
     /// object-like macro literally named `P(x)` (which could never be
     /// invoked and left every `P(...)` in the source unexpanded).
+    ///
+    /// A malformed definition (`-D'F(a;b)=1'`, `-D1X`) is an error against
+    /// `<command-line>`, as in GCC, and defines nothing.
     pub fn define_macro(&mut self, name: &str, value: &str) {
-        if name.contains('(') {
-            if let Some(def) = parse_define(&format!("{name} {value}")) {
+        let spec = format!("{name} {value}");
+        match try_parse_define(&spec) {
+            Ok(def) if name.contains('(') => {
                 self.macros.define(def);
+                return;
+            }
+            // Object-like names keep the exact `value` text below.
+            Ok(_) => {}
+            // Names lccc has never defined (UCN / UTF-8 spellings) keep the
+            // historical behaviour: an object-like macro under that name.
+            Err(DefineError::UnsupportedName) if !name.contains('(') => {}
+            Err(error) => {
+                self.errors.push(PreprocessorDiagnostic {
+                    kind: None,
+                    file: "<command-line>".to_string(),
+                    line: 1,
+                    col: 1,
+                    message: error.message(),
+                });
                 return;
             }
         }
@@ -1777,7 +1798,23 @@ impl Preprocessor {
     }
 
     fn handle_define(&mut self, rest: &str, line_num: usize, col: usize) {
-        if let Some(def) = parse_define(rest) {
+        let parsed = match try_parse_define(rest) {
+            Ok(def) => Some(def),
+            // Names lccc has never defined (UCN / UTF-8 spellings) keep the
+            // historical silent skip.
+            Err(DefineError::UnsupportedName) => None,
+            Err(error) => {
+                self.errors.push(PreprocessorDiagnostic {
+                    kind: None,
+                    file: self.current_file(),
+                    line: line_num,
+                    col,
+                    message: error.message(),
+                });
+                None
+            }
+        };
+        if let Some(def) = parsed {
             self.validate_macro_stringize(&def, line_num, col);
             if super::macro_defs::is_gcc_query_operator(&def.name) {
                 // GCC 16.2 warns on EVERY #define of these operator names.
