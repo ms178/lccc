@@ -323,19 +323,94 @@ fn x86_target_attribute_errors(raw: &str, x86_64: bool) -> Vec<TargetAttributeEr
 
 impl Lowerer {
     /// Diagnose a function's x86 `target("...")` string as GCC does.
+    ///
+    /// GCC reads the `#pragma GCC target` strings in force and the
+    /// function's own attribute as one list, the pragmas first, so that an
+    /// `arch=` in a pragma and another on the function is a repetition
+    /// ("was already specified"), reported at the function. The pragmas
+    /// that were refused where they stand (`diagnose_x86_target_pragmas`)
+    /// are not part of the list, in GCC and here.
     pub(super) fn diagnose_x86_target_attribute(&self, func: &FunctionDef) {
+        self.diagnose_x86_target_options(
+            func.attrs.pragma_target.as_deref(),
+            func.attrs.target.as_deref(),
+            func.name_span,
+            func.span,
+        );
+    }
+
+    /// [`Self::diagnose_x86_target_attribute`] for any function declaration:
+    /// `name` is where its name stands and `declaration` where it begins.
+    pub(super) fn diagnose_x86_target_options(
+        &self,
+        pragma: Option<&str>,
+        own: Option<&str>,
+        name: Option<crate::common::source::Span>,
+        declaration: crate::common::source::Span,
+    ) {
         if !matches!(self.target, Target::X86_64 | Target::I686) {
             return;
         }
-        let Some(raw) = func.attrs.target.as_deref() else {
+        // One pragma alone was judged where it stands; a function without
+        // an attribute of its own has something to add only under several.
+        let pragmas: Vec<&str> = pragma
+            .into_iter()
+            .flat_map(|p| p.split('\n'))
+            .filter(|p| !p.is_empty() && !self.refused_pragma_targets.contains(*p))
+            .collect();
+        if own.is_none() && pragmas.len() < 2 {
             return;
-        };
-        for error in x86_target_attribute_errors(raw, self.target == Target::X86_64) {
-            let span = match func.name_span {
+        }
+        let list = pragmas.into_iter().chain(own).collect::<Vec<_>>().join(",");
+        for error in x86_target_attribute_errors(&list, self.target == Target::X86_64) {
+            let span = match name {
                 Some(name) if error.at_name => name,
-                _ => func.span,
+                _ => declaration,
             };
             self.diagnostics.borrow_mut().error(error.message, span);
+        }
+    }
+
+    /// The features `func` is compiled with: the target options of its last
+    /// declaration that states any (`function_decl_targets`), or -- for a
+    /// function no declaration of the unit names, a `target_clones` clone --
+    /// what the definition itself carries.
+    pub(super) fn function_target_features(&self, func: &FunctionDef) -> Vec<String> {
+        let own;
+        let options = match self.function_decl_targets.get(&func.name) {
+            Some(options) => options.as_str(),
+            None => {
+                own = func.attrs.effective_target();
+                match own.as_deref() {
+                    Some(options) => options,
+                    None => return Vec::new(),
+                }
+            }
+        };
+        crate::ir::module::normalize_target_features(options)
+    }
+
+    /// Judge every `#pragma GCC target` of the unit where it stands, once,
+    /// and remember the refused ones: GCC does not apply those to the
+    /// functions that follow.
+    pub(super) fn diagnose_x86_target_pragmas(
+        &mut self,
+        sites: &[(String, crate::common::source::Span)],
+    ) {
+        if !matches!(self.target, Target::X86_64 | Target::I686) {
+            return;
+        }
+        for (options, span) in sites {
+            let errors = x86_target_attribute_errors(options, self.target == Target::X86_64);
+            if errors.is_empty() {
+                continue;
+            }
+            // Once a string: the same pragma in a second header adds nothing.
+            if self.refused_pragma_targets.insert(options.clone()) {
+                for error in errors {
+                    self.diagnostics.borrow_mut().error(error.message, *span);
+                }
+            }
         }
     }
 

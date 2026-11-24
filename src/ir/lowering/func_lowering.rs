@@ -90,12 +90,7 @@ impl Lowerer {
             return_is_bool,
         ));
         self.diagnose_x86_target_attribute(func);
-        self.func_mut().target_features = func
-            .attrs
-            .target
-            .as_deref()
-            .map(crate::ir::module::normalize_target_features)
-            .unwrap_or_default();
+        self.func_mut().target_features = self.function_target_features(func);
         self.func_mut().x86_defers_isa =
             func.attrs.is_always_inline() && self.func_mut().target_features.is_empty();
         let return_ctype = self.type_spec_to_ctype(&func.return_type);
@@ -1228,12 +1223,7 @@ impl Lowerer {
             is_always_inline: func.attrs.is_always_inline(),
             x86_isa_needs: std::mem::take(&mut self.func_mut().x86_isa_needs),
             is_noinline: func.attrs.is_noinline(),
-            target_features: func
-                .attrs
-                .target
-                .as_deref()
-                .map(crate::ir::module::normalize_target_features)
-                .unwrap_or_default(),
+            target_features: self.function_target_features(func),
             next_value_id: next_val,
             fp_expr_tags: std::mem::take(&mut self.fp_expr_tags),
             next_label,

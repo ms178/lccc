@@ -104,14 +104,10 @@ impl Parser {
             // `continue`, which silently skipped the check).
             'item: {
                 self.skip_gcc_extensions();
-                // Handle #pragma pack directives within function bodies
-                while self.handle_pragma_pack_token() {
-                    self.consume_if(&TokenKind::Semicolon);
-                }
-                // Handle #pragma GCC visibility push/pop within function bodies
-                while self.handle_pragma_visibility_token() {
-                    self.consume_if(&TokenKind::Semicolon);
-                }
+                // The pragmas between the items of a block. (`#pragma GCC
+                // target` belongs at file scope; here it is an error, as in
+                // GCC.)
+                self.take_pragma_markers();
                 if matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
                     break 'body;
                 }
@@ -273,6 +269,14 @@ impl Parser {
         // after case/default, and other contexts where parse_stmt() is called.
         // We skip __extension__ first since it can precede declarations.
         self.skip_gcc_extensions();
+        // A pragma where a statement is expected is taken, and the statement
+        // after it is the one parsed, as GCC restarts the statement: in
+        // `if (x)` / `#pragma pack(pop)` / `return 1;` the `return` is the
+        // body of the `if`. The block-item loop sees only the pragmas
+        // between the items of a block; this is every other place (after
+        // `if (...)`, `else`, a loop header, a label). Until here a pragma
+        // there was "expected expression".
+        self.take_pragma_markers();
         // C23 standard attributes in statement position: `[[fallthrough]];`,
         // `[[maybe_unused]] int x;`, `[[gnu::...]]` etc. are hints; consume the
         // whole `[[ ... ]]` list so the guarded statement parses normally

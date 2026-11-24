@@ -208,6 +208,16 @@ pub struct Lowerer {
     /// yield a dead local's address. They are evaluated for side effects and
     /// return a null pointer (GCC 16.2's code generation).
     pub(super) sema_local_address_returns: FxHashSet<ExprId>,
+    /// The `#pragma GCC target` strings that were refused where they stand
+    /// (`diagnose_x86_target_pragmas`).
+    pub(super) refused_pragma_targets: FxHashSet<String>,
+    /// The target options of each function of the unit, by C name: those of
+    /// its last declaration that states any (a `target` attribute, or a
+    /// `#pragma GCC target` in force there). GCC merges declarations this
+    /// way: a definition that says nothing inherits what its prototype
+    /// said, and a later declaration that does say something replaces what
+    /// came before -- the definition's own attribute included.
+    pub(super) function_decl_targets: FxHashMap<String, String>,
     /// Sema's `SemaResult::generic_choices`: the association each `_Generic`
     /// selects, by its controlling operand. Sema compares qualifiers the
     /// lowerer has no record of.
@@ -486,6 +496,8 @@ impl Lowerer {
             sema_const_values,
             sema_enumerator_refs: FxHashMap::default(),
             sema_local_address_returns: FxHashSet::default(),
+            refused_pragma_targets: FxHashSet::default(),
+            function_decl_targets: FxHashMap::default(),
             sema_generic_choices: FxHashMap::default(),
             sema_atomic_lvalues: FxHashMap::default(),
             local_label_scopes: Vec::new(),
@@ -1091,6 +1103,70 @@ impl Lowerer {
         self.register_nested_function_metas(&func.name, &func.body);
     }
 
+    /// Whether a file-scope declarator declares a function: written as one
+    /// (`int f(void);`), or through a typedef of a function type (`fn_t f;`).
+    /// An object of function-pointer type is not one.
+    fn declares_function_entity(
+        &self,
+        decl: &crate::frontend::parser::ast::Declaration,
+        declarator: &crate::frontend::parser::ast::InitDeclarator,
+    ) -> bool {
+        DerivedDeclarator::declares_function(&declarator.derived)
+            || (declarator.derived.is_empty()
+                && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
+                    if self.types.function_typedefs.contains_key(name)))
+    }
+
+    /// The target options each function of the unit is compiled with
+    /// (`function_decl_targets`), before anything is lowered.
+    ///
+    /// GCC merges the declarations of a function, and the last one that
+    /// names a target decides, a definition included: a plain definition
+    /// after `__attribute__((target("avx2"))) int f(void);` is an AVX2
+    /// function, and so is one whose prototype stood in a `#pragma GCC
+    /// target("avx2")` region. A declaration's options are the pragmas in
+    /// force where it stands, then its own attribute.
+    ///
+    /// The pragmas are judged here, each once where it stands, and every
+    /// prototype's options at its name; a definition's are judged where its
+    /// body is lowered.
+    fn collect_function_decl_targets(&mut self, tu: &TranslationUnit) {
+        use crate::frontend::parser::ast::effective_target_options;
+        self.diagnose_x86_target_pragmas(&tu.pragma_target_sites);
+        for decl in &tu.decls {
+            match decl {
+                ExternalDecl::FunctionDef(func) => {
+                    if let Some(options) = func.attrs.effective_target() {
+                        self.function_decl_targets
+                            .insert(func.name.clone(), options);
+                    }
+                }
+                ExternalDecl::Declaration(decl) if !decl.is_typedef() => {
+                    for declarator in &decl.declarators {
+                        if declarator.name.is_empty()
+                            || !self.declares_function_entity(decl, declarator)
+                        {
+                            continue;
+                        }
+                        let pragma = declarator.attrs.pragma_target.as_deref();
+                        let own = declarator.attrs.target.as_deref();
+                        if let Some(options) = effective_target_options(pragma, own) {
+                            self.diagnose_x86_target_options(
+                                pragma,
+                                own,
+                                declarator.name_span,
+                                decl.span,
+                            );
+                            self.function_decl_targets
+                                .insert(declarator.name.clone(), options);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine, TypeContext) {
         // Sema has already populated TypeContext with typedefs, enum constants,
         // struct/union layouts, function typedefs, and function pointer typedefs.
@@ -1147,6 +1223,7 @@ impl Lowerer {
         // First pass: collect all function signatures (return types, param types,
         // variadic status, sret) so we can distinguish functions from globals and
         // insert proper casts/ABI handling during lowering.
+        self.collect_function_decl_targets(tu);
         for decl in &tu.decls {
             if let ExternalDecl::FunctionDef(func) = decl {
                 self.register_definition_signature(func);
@@ -1156,10 +1233,7 @@ impl Lowerer {
                     // Unlike a parser's one-way inheritance, this pre-pass also
                     // sees attributes declared after the definition. Do not
                     // classify function-pointer objects as functions.
-                    let function_entity = DerivedDeclarator::declares_function(&declarator.derived)
-                        || (declarator.derived.is_empty()
-                            && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
-                                if self.types.function_typedefs.contains_key(name)));
+                    let function_entity = self.declares_function_entity(decl, declarator);
                     if function_entity && !decl.is_typedef() && !declarator.name.is_empty() {
                         if let Some(section) = &declarator.attrs.section {
                             self.function_decl_sections

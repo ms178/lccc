@@ -1648,8 +1648,14 @@ impl MacroTable {
                 .push(ExpansionEffect::Pragma(format!("message {expanded}"), line));
             return k + 1;
         }
+        let operator_marker = super::pragmas::pack_operator_marker(&content).or_else(|| {
+            // `_Pragma("GCC target(\"avx2\")")` and the option stack: parser
+            // state like the pack setting, and marked the same way.
+            super::pragmas::strip_pragma_keyword(content.trim(), "GCC")
+                .and_then(super::pragmas::pragma_gcc_options_marker)
+        });
         if !self.asm_mode
-            && let Some(marker) = super::pragmas::pack_operator_marker(&content)
+            && let Some(marker) = operator_marker
         {
             // Unlike preprocessor-only effects, pack changes parser-owned
             // state. Emit its marker at the operator's position, not when the

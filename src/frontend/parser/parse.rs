@@ -924,6 +924,15 @@ pub struct Parser {
     /// Stack for #pragma GCC visibility push/pop.
     /// Each entry is the visibility string (e.g., "hidden", "default").
     pub(super) pragma_visibility_stack: Vec<String>,
+    /// The strings of the `#pragma GCC target`s in force, in the order
+    /// written: every function declared from here on is compiled as if its
+    /// `target` attribute began with them.
+    pub(super) pragma_targets: Vec<String>,
+    /// What `#pragma GCC push_options` saved of [`Self::pragma_targets`].
+    pub(super) pragma_options_stack: Vec<Vec<String>>,
+    /// Every `#pragma GCC target` read so far, for
+    /// `TranslationUnit::pragma_target_sites`.
+    pub(super) pragma_target_sites: Vec<(String, Span)>,
     /// Current default visibility from #pragma GCC visibility push(...).
     /// None means default visibility (no pragma active).
     pub(super) pragma_default_visibility: Option<String>,
@@ -1033,6 +1042,11 @@ pub struct Parser {
     /// carries `unused`, or names such a record or typedef directly. Scoped
     /// with the other typedef state.
     pub(super) typedef_unused: FxHashSet<String>,
+    /// Typedef names of function types (`typedef int fn(void);`, and a
+    /// typedef of such a name without a derivation in between). A plain
+    /// declarator of one declares a function (`fn f;`), which is what the
+    /// function-only attributes ask about. Scoped like `typedef_unused`.
+    pub(super) typedef_function: FxHashSet<String>,
     /// Undo records for block/for-scope typedef declarations. Names and their
     /// parser-side qualifiers are restored in reverse declaration order.
     pub(super) typedef_scope_log: Vec<TypedefScopeUndo>,
@@ -1052,6 +1066,7 @@ pub(super) struct TypedefScopeUndo {
     base_atomic: bool,
     object_atomic: bool,
     unused: bool,
+    function: bool,
 }
 
 impl Parser {
@@ -1149,6 +1164,7 @@ impl Parser {
             base_atomic: self.typedef_base_atomic.remove(name),
             object_atomic: self.typedef_object_atomic.remove(name),
             unused: self.typedef_unused.remove(name),
+            function: self.typedef_function.remove(name),
         };
         self.typedef_scope_log.push(undo);
     }
@@ -1170,6 +1186,10 @@ impl Parser {
             self.typedef_unused.remove(&undo.name);
             if undo.unused {
                 self.typedef_unused.insert(undo.name.clone());
+            }
+            self.typedef_function.remove(&undo.name);
+            if undo.function {
+                self.typedef_function.insert(undo.name.clone());
             }
             if undo.was_typedef {
                 self.typedefs.insert(undo.name.clone());
@@ -1221,6 +1241,9 @@ impl Parser {
             pack_struct_cap: None,
             pack_struct_all: false,
             pragma_visibility_stack: Vec::with_capacity(4),
+            pragma_targets: Vec::new(),
+            pragma_options_stack: Vec::new(),
+            pragma_target_sites: Vec::new(),
             pragma_default_visibility: None,
             func_decl_no_instrument: FxHashSet::default(),
             func_decl_stack_protect: FxHashSet::default(),
@@ -1244,6 +1267,7 @@ impl Parser {
             unused_record_tags: FxHashSet::default(),
             record_has_enum_cache: FxHashMap::default(),
             typedef_unused: FxHashSet::default(),
+            typedef_function: FxHashSet::default(),
         }
     }
 
@@ -1643,6 +1667,7 @@ impl Parser {
             self.emit_error("named address spaces require an x86 target", span);
             return TranslationUnit {
                 decls: Vec::new(),
+                pragma_target_sites: Vec::new(),
                 uses_atomic: false,
             };
         }
@@ -1674,7 +1699,11 @@ impl Parser {
             .tokens
             .iter()
             .any(|tok| matches!(tok.kind, TokenKind::Atomic));
-        TranslationUnit { decls, uses_atomic }
+        TranslationUnit {
+            decls,
+            pragma_target_sites: std::mem::take(&mut self.pragma_target_sites),
+            uses_atomic,
+        }
     }
 
     // === Token access helpers ===
@@ -1760,9 +1789,7 @@ impl Parser {
         // semicolon (Clang PR28094). Its synthetic marker carries its own
         // semicolon; consume that one before looking for the source delimiter.
         if matches!(expected, TokenKind::Semicolon) {
-            while self.handle_pragma_pack_token() {
-                self.consume_if(&TokenKind::Semicolon);
-            }
+            self.take_pragma_markers();
         }
         if std::mem::discriminant(self.peek()) == std::mem::discriminant(expected) {
             let span = self.peek_span();
@@ -2903,7 +2930,14 @@ impl Parser {
             }
             let ok = match target {
                 AttributeTarget::Any => true,
-                AttributeTarget::Function => is_function,
+                // `typedef int fn(void); __attribute__((target("avx2"))) fn f;`
+                // declares a function too.
+                AttributeTarget::Function => {
+                    is_function
+                        || (derived.is_empty()
+                            && matches!(type_spec, TypeSpecifier::TypedefName(name)
+                                if self.typedef_function.contains(name)))
+                }
                 AttributeTarget::Object => !is_function,
                 AttributeTarget::Record => is_record || is_typedef,
             };
@@ -3995,6 +4029,83 @@ impl Parser {
             }
             _ => false,
         }
+    }
+
+    /// Handle the synthetic tokens of `#pragma GCC target`, `push_options`,
+    /// `pop_options` and `reset_options`. Returns true if one was consumed.
+    ///
+    /// A `target` pragma adds its string to the ones in force (GCC chains
+    /// each onto the previous, so two in a row accumulate); `push_options`
+    /// saves them, `pop_options` restores what the matching push saved (a
+    /// pop without one changes nothing, where GCC warns), and
+    /// `reset_options` returns to the command line.
+    ///
+    /// Inside a function body GCC refuses the `target` pragma with these
+    /// words ("option" is what its message calls the pragma) and performs
+    /// the three stack pragmas like anywhere else.
+    pub(super) fn handle_pragma_options_token(&mut self) -> bool {
+        match self.peek() {
+            TokenKind::PragmaOptionsTarget => {
+                let span = self.peek_span();
+                self.advance();
+                let options = match self.peek() {
+                    TokenKind::StringLiteral(options) => Some(options.clone()),
+                    _ => None,
+                };
+                if options.is_some() {
+                    self.advance();
+                }
+                if self.block_depth > 0 {
+                    self.emit_error("'#pragma GCC option' is not allowed inside functions", span);
+                } else if let Some(options) = options.filter(|o| !o.is_empty()) {
+                    self.pragma_target_sites.push((options.clone(), span));
+                    self.pragma_targets.push(options);
+                }
+                true
+            }
+            TokenKind::PragmaOptionsPush => {
+                self.advance();
+                self.pragma_options_stack.push(self.pragma_targets.clone());
+                true
+            }
+            TokenKind::PragmaOptionsPop => {
+                self.advance();
+                if let Some(saved) = self.pragma_options_stack.pop() {
+                    self.pragma_targets = saved;
+                }
+                true
+            }
+            TokenKind::PragmaOptionsReset => {
+                self.advance();
+                self.pragma_targets.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Take the pragma markers at the cursor: every kind, in the order the
+    /// pragmas were written. Each marker brings its own `;`.
+    ///
+    /// One loop for all kinds, and it is the only way callers take markers.
+    /// Three loops in a row, one a kind, took `pack` pragmas, then
+    /// `visibility` pragmas, then stopped: `#pragma GCC visibility
+    /// push(hidden)` followed by `#pragma pack(push, 1)` left the second
+    /// marker to the declaration parser, which refused the unit ("expected
+    /// declaration before '#pragma pack'").
+    pub(super) fn take_pragma_markers(&mut self) {
+        while self.handle_pragma_pack_token()
+            || self.handle_pragma_visibility_token()
+            || self.handle_pragma_options_token()
+        {
+            self.consume_if(&TokenKind::Semicolon);
+        }
+    }
+
+    /// The `#pragma GCC target` strings in force, one pragma a line, as a
+    /// declaration records them (`DeclAttributes::pragma_target`).
+    pub(super) fn active_pragma_target(&self) -> Option<String> {
+        (!self.pragma_targets.is_empty()).then(|| self.pragma_targets.join("\n"))
     }
 
     /// Handle #pragma GCC visibility push/pop synthetic tokens.

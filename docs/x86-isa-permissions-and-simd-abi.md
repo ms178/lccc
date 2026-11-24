@@ -110,8 +110,46 @@ implied) happens before either.
   (`"avx2, sse"` names ` sse`), and the whole string `default` is the
   multiversioning spelling. A name of the list that lccc does not model
   (`rdseed`, `clwb`, `tbm`, ...) is accepted and changes nothing. Gate:
-  `tests/regression/check_target_attribute_arguments.py` (68 strings, 53
-  errors, lccc and GCC 16.2 each against the fixture's comments).
+  `tests/regression/check_target_attribute_arguments.py` (91
+  declarations in two fixtures, 73 errors, lccc and GCC 16.2 each against
+  the fixtures' comments).
+* **Every declaration counts, not the definition alone.** GCC merges the
+  declarations of a function, and the last one that names a target
+  decides (`Lowerer::function_decl_targets`): a definition that says
+  nothing is compiled for the target its prototype named, and
+  `target("avx2")` on a prototype followed by `target("bmi2")` on the
+  definition is BMI2 only. Until PR #1211 lccc looked at the definition
+  alone, so `__attribute__((target("avx2"))) __m256i f(__m256i);` followed
+  by a plain definition using `_mm256_add_epi32` was refused. A prototype's
+  string is judged like a definition's, at the declared name, and a
+  function declared through a typedef of a function type (`fn_type f;`)
+  is a function for the attribute (it used to draw "'target' attribute
+  ignored").
+* **`#pragma GCC target("...")`** puts its strings in front of the
+  `target` of every function declared after it, until `#pragma GCC
+  pop_options` returns to what the matching `push_options` saved or
+  `reset_options` to the command line; several pragmas accumulate, a
+  pragma takes several strings (`target("bmi", "bmi2")`), adjacent
+  literals paste, the parentheses are optional, and `_Pragma` works the
+  same. The preprocessor turns each pragma into a marker statement
+  (`pragma_gcc_options_marker`, rendered back by `-E`), the parser keeps
+  the strings in force and stamps them on each declaration
+  (`DeclAttributes::pragma_target`), and `effective_target_options` joins
+  them with the declaration's own attribute. Until PR #1211 the pragma
+  was dropped whole: the functions of a region were compiled without the
+  extensions the region asked for and refused as soon as they used one,
+  which is how vendored SIMD kernels are written. Diagnostics follow
+  GCC: a pragma whose string is refused is diagnosed once, where it
+  stands, and does not reach the functions after it (GCC prints these as
+  `cc1: error:` without a location; lccc gives the pragma's line); an
+  `arch=` in a pragma and another on the function, or in a second
+  pragma, is "was already specified" at each function declared under
+  both; the pragma inside a function body is "'#pragma GCC option' is
+  not allowed inside functions". Not done: the pragma does not update the
+  predefined macros (`__AVX2__` stays as the command line left it, where
+  GCC defines it inside the region), `#pragma GCC optimize` is ignored,
+  and the `-Wpragmas` warnings for a malformed pragma or a `pop_options`
+  without a push are not given (the pragma is ignored, as in GCC).
 
 ### 1.3 Intrinsic permission
 
@@ -344,6 +382,8 @@ instructions.
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |
+| `check_target_attribute_arguments.py` | The arguments of `target("...")` on definitions and prototypes and of `#pragma GCC target`: errors, order and position against GCC 16.2 |
+| `tests/regression/pragma_gcc_target.c` (corpus) | `#pragma GCC target` regions, the option stack and targets inherited from prototypes, executed |
 | `check_x86_scalar_intrinsics.sh` | Portable scalar intrinsics: semantics and instruction contract |
 | `check_public_simd_abi.py` | SIMD argument and result ABI against GCC |
 | `check_legacy_sse_permissions.py` | SSE1/SSE2 intrinsic boundary |

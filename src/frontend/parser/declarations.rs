@@ -46,6 +46,8 @@ struct DeclContext {
     /// `Parser::spec_names_unused_type`): each declarator of exactly that
     /// type is exempt from the unused warnings.
     spec_type_unused: bool,
+    /// Where the first declarator's name stands (`InitDeclarator::name_span`).
+    name_span: Option<crate::common::source::Span>,
 }
 
 /// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
@@ -166,16 +168,9 @@ impl Parser {
         // leaving `[[gnu::noipa]] int f(...)` to be parsed as an expression.
         self.skip_c23_attribute_lists();
 
-        // Handle #pragma pack directives (emitted as synthetic tokens by preprocessor)
-        while self.handle_pragma_pack_token() {
-            // Consume semicolons after pragma pack synthetic tokens
-            self.consume_if(&TokenKind::Semicolon);
-        }
-
-        // Handle #pragma GCC visibility push/pop directives
-        while self.handle_pragma_visibility_token() {
-            self.consume_if(&TokenKind::Semicolon);
-        }
+        // `#pragma pack`, `#pragma GCC visibility`, `#pragma GCC target` and
+        // the option stack reach the parser as marker tokens.
+        self.take_pragma_markers();
 
         if self.at_eof() {
             return None;
@@ -234,6 +229,8 @@ impl Parser {
 
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
+        // Before an initializer or a body parses declarations of its own.
+        let declarator_name_span = self.attrs.last_decl_name_span.filter(|_| name.is_some());
         let declarator_object_space = self.attrs.declarator_object_space;
         let declarator_object_volatile = self.attrs.declarator_object_volatile;
         let declarator_pointer_const = self.attrs.parsing_pointer_const();
@@ -382,6 +379,7 @@ impl Parser {
         decl_attrs.cleanup_fn = cleanup_fn;
         decl_attrs.symver = symver;
         decl_attrs.target = target;
+        decl_attrs.pragma_target = self.active_pragma_target();
         decl_attrs.target_clones = target_clones;
         decl_attrs.diagnose_as = diagnose_as;
         decl_attrs.externally_visible = externally_visible;
@@ -448,6 +446,7 @@ impl Parser {
                 spec_persistent,
                 spec_nocommon,
                 spec_type_unused,
+                name_span: declarator_name_span,
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
@@ -1150,6 +1149,7 @@ impl Parser {
             init,
             attrs: ctx.attrs,
             span: start,
+            name_span: ctx.name_span,
         });
 
         let (extra_ctor, extra_dtor, _, extra_common, extra_aligned, extra_asm_reg) =
@@ -1292,6 +1292,7 @@ impl Parser {
             self.attrs.set_noinline(ctx.spec_noinline);
             self.attrs.parsing_calling_convention = ctx.spec_calling_convention;
             let (dname, dderived) = self.parse_declarator();
+            let dname_span = self.attrs.last_decl_name_span.filter(|_| dname.is_some());
             let dderived_is_plain = dderived.is_empty();
             let d_object_space = self.attrs.declarator_object_space;
             let d_object_volatile = self.attrs.declarator_object_volatile;
@@ -1401,9 +1402,11 @@ impl Parser {
                     da.base_restrict = d_base_restrict;
                     da.asm_register = d_asm_reg;
                     da.cleanup_fn = d_cleanup_fn;
+                    da.pragma_target = self.active_pragma_target();
                     da
                 },
                 span: start,
+                name_span: dname_span,
             });
             let (_, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let Some(last_decl) = declarators.last_mut() else {
@@ -1634,6 +1637,7 @@ impl Parser {
     /// was a typedef so the caller can stamp the finished `Declaration`.
     fn register_local_typedefs(
         &mut self,
+        type_spec: &TypeSpecifier,
         declarators: &[InitDeclarator],
         decl_addr_space: AddressSpace,
     ) -> bool {
@@ -1644,7 +1648,7 @@ impl Parser {
                     self.record_typedef_scope_change(&decl.name);
                 }
             }
-            self.record_typedef_object_spaces(declarators, decl_addr_space);
+            self.record_typedef_object_spaces(declarators, decl_addr_space, type_spec);
             for decl in declarators {
                 if !decl.name.is_empty() {
                     self.typedefs.insert(decl.name.clone());
@@ -1878,6 +1882,7 @@ impl Parser {
                     da
                 },
                 span: start,
+                name_span: None,
             });
             let (_, post_init_aligned, _post_asm_reg) = self.skip_asm_and_attributes();
             let Some(last_decl) = declarators.last_mut() else {
@@ -1933,7 +1938,7 @@ impl Parser {
         }
 
         // Register typedef names or shadow them for variable declarations
-        let is_typedef = self.register_local_typedefs(&declarators, decl_addr_space);
+        let is_typedef = self.register_local_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         // The declaration's address space is lexical to it: consume it now
@@ -2509,10 +2514,22 @@ impl Parser {
         &mut self,
         declarators: &[InitDeclarator],
         decl_space: AddressSpace,
+        type_spec: &TypeSpecifier,
     ) {
+        let spec_is_function = matches!(type_spec, TypeSpecifier::TypedefName(name)
+            if self.typedef_function.contains(name));
         for decl in declarators {
             if decl.name.is_empty() {
                 continue;
+            }
+            // A function type: declared so, or named through a typedef
+            // without a derivation in between.
+            if DerivedDeclarator::declares_function(&decl.derived)
+                || (spec_is_function && decl.derived.is_empty())
+            {
+                self.typedef_function.insert(decl.name.clone());
+            } else {
+                self.typedef_function.remove(&decl.name);
             }
             let space = crate::common::type_builder::object_storage_address_space_with_object(
                 decl_space,
@@ -2561,7 +2578,7 @@ impl Parser {
         decl_space: AddressSpace,
     ) {
         if self.attrs.parsing_typedef() {
-            self.record_typedef_object_spaces(declarators, decl_space);
+            self.record_typedef_object_spaces(declarators, decl_space, type_spec);
             for decl in declarators {
                 if !decl.name.is_empty() {
                     self.typedefs.insert(decl.name.clone());

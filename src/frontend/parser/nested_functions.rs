@@ -209,8 +209,13 @@ impl Parser {
         let saved_typedef_base_volatile = self.typedef_base_volatile.clone();
         let saved_typedef_base_atomic = self.typedef_base_atomic.clone();
         let saved_typedef_object_atomic = self.typedef_object_atomic.clone();
+        let saved_typedef_function = self.typedef_function.clone();
+        let saved_pragma_targets = self.pragma_targets.clone();
+        let saved_pragma_options_stack = self.pragma_options_stack.clone();
         let saved_pragma_pack = self.pragma_pack_align.clone();
         let saved_pack_stack = self.pragma_pack_stack.clone();
+        let saved_visibility = self.pragma_default_visibility.clone();
+        let saved_visibility_stack = self.pragma_visibility_stack.clone();
         let saved_enum_consts = self.enum_constants.clone();
         let saved_unevaluable = self.unevaluable_enum_constants.clone();
         let saved_struct_aligns = self.struct_tag_alignments.clone();
@@ -230,8 +235,13 @@ impl Parser {
                 self.typedef_base_volatile = saved_typedef_base_volatile;
                 self.typedef_base_atomic = saved_typedef_base_atomic;
                 self.typedef_object_atomic = saved_typedef_object_atomic;
+                self.typedef_function = saved_typedef_function;
+                self.pragma_targets = saved_pragma_targets;
+                self.pragma_options_stack = saved_pragma_options_stack;
                 self.pragma_pack_align = saved_pragma_pack;
                 self.pragma_pack_stack = saved_pack_stack;
+                self.pragma_default_visibility = saved_visibility;
+                self.pragma_visibility_stack = saved_visibility_stack;
                 self.enum_constants = saved_enum_consts;
                 self.unevaluable_enum_constants = saved_unevaluable;
                 self.struct_tag_alignments = saved_struct_aligns;
@@ -384,6 +394,7 @@ impl Parser {
         def_attrs.tls_model = self.attrs.parsing_tls_model.take();
         def_attrs.symver = self.attrs.parsing_symver.take();
         def_attrs.target = self.attrs.parsing_target.take();
+        def_attrs.pragma_target = self.active_pragma_target();
         def_attrs.diagnose_as = self.attrs.parsing_diagnose_as.take();
         def_attrs.cleanup_fn = self.attrs.parsing_cleanup_fn.take();
         def_attrs.externally_visible = self.attrs.parsing_externally_visible;

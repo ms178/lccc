@@ -19,6 +19,69 @@ pub(super) fn strip_pragma_keyword<'a>(text: &'a str, keyword: &str) -> Option<&
     Some(rest.trim_start())
 }
 
+/// `#pragma GCC target("...")`, `push_options`, `pop_options` and
+/// `reset_options` as the synthetic statement the parser reads, without its
+/// terminating ` ;`; `None` for any other `#pragma GCC` text, and for a
+/// `target` operand that is not a list of string literals.
+///
+/// GCC compiles every function defined after `#pragma GCC target("avx2")`
+/// as if it carried `__attribute__((target("avx2")))`, until the options are
+/// popped or reset. lccc dropped the pragma, so a function of such a region
+/// that used an AVX2 intrinsic was refused ("requires the avx2
+/// instruction-set extension") although the program had asked for it in
+/// the one way that needs no attribute on every function: the idiom of
+/// vendored SIMD kernels.
+///
+/// The marker carries the pragma's strings joined with commas, which is how
+/// the attribute's several strings are read too (`target("bmi", "bmi2")`).
+/// What it does not do is GCC's update of the predefined macros: `__AVX2__`
+/// stays as the command line left it.
+pub(super) fn pragma_gcc_options_marker(content: &str) -> Option<String> {
+    match content.trim() {
+        "push_options" => return Some("__ccc_options_push".to_string()),
+        "pop_options" => return Some("__ccc_options_pop".to_string()),
+        "reset_options" => return Some("__ccc_options_reset".to_string()),
+        _ => {}
+    }
+    let operand = strip_pragma_keyword(content.trim(), "target")?.trim();
+    // The parentheses are optional in GCC.
+    let operand = match operand.strip_prefix('(') {
+        Some(inner) => inner.strip_suffix(')')?.trim(),
+        None => operand,
+    };
+    // String literals; a comma between two starts a new one, nothing
+    // between two pastes them. Escapes have no place in an option name.
+    let mut strings: Vec<String> = Vec::new();
+    let mut pasting = false;
+    let mut rest = operand;
+    while !rest.is_empty() {
+        let body = rest.strip_prefix('"')?;
+        let end = body.find('"')?;
+        let literal = &body[..end];
+        if literal.contains(['\\', '\n']) {
+            return None;
+        }
+        match strings.last_mut() {
+            Some(last) if pasting => last.push_str(literal),
+            _ => strings.push(literal.to_string()),
+        }
+        rest = body[end + 1..].trim_start();
+        pasting = true;
+        if let Some(after) = rest.strip_prefix(',') {
+            rest = after.trim_start();
+            pasting = false;
+            if rest.is_empty() {
+                return None;
+            }
+        }
+    }
+    strings.retain(|s| !s.is_empty());
+    if strings.is_empty() {
+        return None;
+    }
+    Some(format!("__ccc_options_target \"{}\"", strings.join(",")))
+}
+
 /// Translate the already-destringized operand of `_Pragma` for the forms the
 /// parser already handles. Require a complete directive and canonical decimal
 /// integers: other spellings must not be guessed (e.g. `010` is octal in C).
@@ -231,6 +294,13 @@ impl Preprocessor {
                     return None;
                 }
                 return self.handle_pragma_gcc_visibility(vis_content.trim());
+            }
+            // `#pragma GCC target(...)` and the option stack around it. As
+            // with the other markers, not in asm mode.
+            if !self.macros.asm_mode {
+                if let Some(marker) = pragma_gcc_options_marker(gcc_content) {
+                    return Some(format!("{marker} ;\n"));
+                }
             }
             if let Some(dep_content) = gcc_content.strip_prefix("dependency") {
                 self.handle_pragma_gcc_dependency(dep_content.trim(), line_num, col);
@@ -621,7 +691,8 @@ pub(crate) fn render_pragma_markers(text: &str) -> std::borrow::Cow<'_, str> {
         let trimmed = line.trim_end_matches(['\n', '\r']);
         let marker_pos = trimmed
             .find("__ccc_pack_")
-            .or_else(|| trimmed.find("__ccc_visibility_"));
+            .or_else(|| trimmed.find("__ccc_visibility_"))
+            .or_else(|| trimmed.find("__ccc_options_"));
         let Some(pos) = marker_pos else {
             out.push_str(line);
             continue;
@@ -641,6 +712,16 @@ pub(crate) fn render_pragma_markers(text: &str) -> std::borrow::Cow<'_, str> {
                             .strip_prefix("set_")
                             .map(|n| format!("#pragma pack({})", n))
                     }),
+            }
+        } else if let Some(rest) = marker.strip_prefix("__ccc_options_") {
+            match rest {
+                "push" => Some("#pragma GCC push_options".to_string()),
+                "pop" => Some("#pragma GCC pop_options".to_string()),
+                "reset" => Some("#pragma GCC reset_options".to_string()),
+                // `target "a,b"`: the strings of the pragma, joined.
+                other => other
+                    .strip_prefix("target ")
+                    .map(|strings| format!("#pragma GCC target({})", strings.trim())),
             }
         } else {
             marker
@@ -768,6 +849,77 @@ mod pack_operator_tests {
 }
 
 #[cfg(test)]
+mod gcc_options_marker_tests {
+    use super::pragma_gcc_options_marker;
+
+    #[test]
+    fn the_option_stack_has_three_markers() {
+        for (text, marker) in [
+            ("push_options", "__ccc_options_push"),
+            ("pop_options", "__ccc_options_pop"),
+            ("  reset_options ", "__ccc_options_reset"),
+        ] {
+            assert_eq!(
+                pragma_gcc_options_marker(text).as_deref(),
+                Some(marker),
+                "{text}"
+            );
+        }
+    }
+
+    /// The strings of one pragma reach the parser comma-joined, exactly as
+    /// written: no trimming, since GCC does none (`" avx2"` is unknown).
+    #[test]
+    fn target_strings_are_joined_as_written() {
+        for (text, strings) in [
+            (r#"target("avx2")"#, "avx2"),
+            (r#"target ("avx2")"#, "avx2"),
+            (r#"target "avx2""#, "avx2"),
+            (r#"target("sse4.1", "popcnt")"#, "sse4.1,popcnt"),
+            (r#"target("sse4.1" , "popcnt" )"#, "sse4.1,popcnt"),
+            (r#"target("ss" "se3")"#, "ssse3"),
+            (r#"target "ss" "se3", "avx""#, "ssse3,avx"),
+            (r#"target("avx2, bmi2")"#, "avx2, bmi2"),
+            (
+                r#"target("arch=haswell,tune=native")"#,
+                "arch=haswell,tune=native",
+            ),
+            (r#"target("", "avx")"#, "avx"),
+        ] {
+            assert_eq!(
+                pragma_gcc_options_marker(text),
+                Some(format!("__ccc_options_target \"{strings}\"")),
+                "{text}"
+            );
+        }
+    }
+
+    /// What is no list of string literals says nothing (GCC warns, or
+    /// errors, and applies nothing), and other `GCC` pragmas are not ours.
+    #[test]
+    fn anything_else_is_no_marker() {
+        for text in [
+            r#"target("avx2""#,
+            "target(avx2)",
+            "target avx2",
+            "target",
+            "target()",
+            r#"target("")"#,
+            r#"target("avx2") junk"#,
+            r#"target("avx2",)"#,
+            r#"target("av\x32")"#,
+            r#"target_clones("avx2")"#,
+            "push_options junk",
+            "optimize(\"O3\")",
+            "visibility push(hidden)",
+            "poison foo",
+        ] {
+            assert_eq!(pragma_gcc_options_marker(text), None, "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod fp_environment_tests {
     use super::*;
 
@@ -841,6 +993,18 @@ mod pragma_marker_rendering_tests {
         assert_eq!(
             render_pragma_markers("__ccc_visibility_pop ;\n"),
             "\n#pragma GCC visibility pop\n"
+        );
+    }
+
+    #[test]
+    fn option_markers_round_trip() {
+        assert_eq!(
+            render_pragma_markers(
+                "__ccc_options_push ;\n__ccc_options_target \"avx2,bmi2\" ;\n\
+                 __ccc_options_pop ;\n__ccc_options_reset ;\n"
+            ),
+            "\n#pragma GCC push_options\n\n#pragma GCC target(\"avx2,bmi2\")\n\
+             \n#pragma GCC pop_options\n\n#pragma GCC reset_options\n"
         );
     }
 

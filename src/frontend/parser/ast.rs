@@ -5,6 +5,10 @@ use crate::common::types::{AddressSpace, CType, ExtVectorLayout, PtrQuals};
 #[derive(Debug)]
 pub struct TranslationUnit {
     pub decls: Vec<ExternalDecl>,
+    /// Every `#pragma GCC target` of the unit: its strings, comma-joined,
+    /// and where it stands. Lowering judges each once, at the pragma, as
+    /// GCC does (`Lowerer::diagnose_x86_target_pragmas`).
+    pub pragma_target_sites: Vec<(String, Span)>,
     /// The `_Atomic` keyword appears somewhere in the unit (a header's
     /// `typedef _Atomic int atomic_int;` counts). No object can be atomic
     /// without it, so everything that asks "is this lvalue atomic?" is
@@ -53,6 +57,11 @@ pub struct FunctionAttributes {
     pub symver: Option<String>,
     /// __attribute__((target("..."))) - comma-joined per-function ISA features
     pub target: Option<String>,
+    /// The strings of the `#pragma GCC target`s in force where the function
+    /// is defined, one pragma a line, in the order written. GCC applies
+    /// them before the function's own attribute; see
+    /// [`effective_target_options`].
+    pub pragma_target: Option<String>,
     /// __attribute__((target_clones("..."))) - comma-joined multiversion clone targets
     pub target_clones: Option<String>,
     /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - builtin alias
@@ -133,7 +142,55 @@ pub struct DefSpecifiers {
     pub noinline: bool,
 }
 
+/// A declaration's target options in the order GCC applies them, as one
+/// comma-separated list: what the `#pragma GCC target`s in force say
+/// (`pragma`, one pragma a line), then the declaration's own `target`
+/// attribute. `None` when neither says anything.
+#[must_use]
+pub fn effective_target_options(pragma: Option<&str>, own: Option<&str>) -> Option<String> {
+    let mut options = String::new();
+    for part in pragma.into_iter().flat_map(|p| p.split('\n')).chain(own) {
+        if part.is_empty() {
+            continue;
+        }
+        if !options.is_empty() {
+            options.push(',');
+        }
+        options.push_str(part);
+    }
+    (!options.is_empty()).then_some(options)
+}
+
+#[cfg(test)]
+mod effective_target_options_tests {
+    use super::effective_target_options;
+
+    #[test]
+    fn pragmas_come_first_and_the_attribute_last() {
+        assert_eq!(effective_target_options(None, None), None);
+        assert_eq!(effective_target_options(Some(""), Some("")), None);
+        assert_eq!(
+            effective_target_options(None, Some("avx2")).as_deref(),
+            Some("avx2")
+        );
+        assert_eq!(
+            effective_target_options(Some("avx2"), None).as_deref(),
+            Some("avx2")
+        );
+        assert_eq!(
+            effective_target_options(Some("avx\nbmi2,lzcnt"), Some("no-avx")).as_deref(),
+            Some("avx,bmi2,lzcnt,no-avx")
+        );
+    }
+}
+
 impl FunctionAttributes {
+    /// [`effective_target_options`] of this definition.
+    #[must_use]
+    pub fn effective_target(&self) -> Option<String> {
+        effective_target_options(self.pragma_target.as_deref(), self.target.as_deref())
+    }
+
     /// Create a new `FunctionAttributes` with all flags cleared.
     pub fn new() -> Self {
         Self::default()
@@ -181,6 +238,7 @@ impl FunctionAttributes {
         attrs.visibility = decl.visibility.clone();
         attrs.symver = decl.symver.clone();
         attrs.target = decl.target.clone();
+        attrs.pragma_target = decl.pragma_target.clone();
         attrs.target_clones = decl.target_clones.clone();
         attrs.diagnose_as = decl.diagnose_as.clone();
         attrs.externally_visible = decl.externally_visible;
@@ -910,6 +968,9 @@ pub struct DeclAttributes {
     pub symver: Option<String>,
     /// __attribute__((target("..."))) - comma-joined per-function ISA features
     pub target: Option<String>,
+    /// The `#pragma GCC target` strings in force at the declaration (see
+    /// `FunctionAttributes::pragma_target`).
+    pub pragma_target: Option<String>,
     /// __attribute__((target_clones("..."))) - comma-joined multiversion clone targets
     pub target_clones: Option<String>,
     /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - the declared
@@ -1217,7 +1278,11 @@ pub struct InitDeclarator {
     pub init: Option<Initializer>,
     /// Declarator attributes (GCC __attribute__, asm register, etc.).
     pub attrs: DeclAttributes,
+    /// Where the declaration begins (the same for all its declarators).
     pub span: Span,
+    /// Where the declared name stands, for the diagnostics GCC puts there
+    /// (the `target` attribute's among them); `None` without a name.
+    pub name_span: Option<Span>,
 }
 
 /// CVR qualifier bits carried by a pointer star (`DerivedDeclarator::Pointer`).

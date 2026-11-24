@@ -1536,6 +1536,15 @@ impl Parser {
             // diagnostic is the TU verdict).  Merged with the body-end
             // condition: each unwinding level closes its body exactly as
             // the recursive formulation did (one expect_closing per level).
+            // A pragma between two members, or after the last, is performed
+            // where it stands. The record takes the `#pragma pack` in force
+            // at its closing brace (`record_finish`), for all its members,
+            // which is GCC's rule: `struct { char c;` / `#pragma pack(push,
+            // 1)` / `int i; };` is five bytes. Until here the member loop
+            // skipped the marker as an unknown token, so that record was
+            // eight bytes -- not GCC's layout -- and a `push` in a body was
+            // never seen by the `pop` after it.
+            self.take_pragma_markers();
             if self.nesting_budget_diagnosed
                 || matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof)
             {
