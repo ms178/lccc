@@ -16,12 +16,34 @@ pub(crate) use registers::*;
 
 pub(crate) use crate::backend::x86::assembler::encoder::strip_plt_suffix;
 
+use crate::backend::x86::assembler::encoder::learned;
+use crate::backend::x86::assembler::encoder::operand_class::{Code, Evex, evex_of};
 use crate::backend::x86::assembler::encoder::{
-    InstructionEncoder as X86InstructionEncoder, check_movext_register_sizes, gp_id, is_reg64,
-    is_size_matched_accumulator, is_vex_xop_encoding, normalize_bare_label, op_decorated,
-    string_op_size, vec_reg_id,
+    InstructionEncoder as X86InstructionEncoder, check_lock_prefixes, check_movext_register_sizes,
+    gp_id, has_vector_prefix, implied_address, is_reg64, is_size_matched_accumulator,
+    is_string_port, is_vex_xop_encoding, normalize_bare_label, op_decorated, port_behind_index,
+    repeat_prefix, string_op_size, takes_no_data_size_prefix, vec_reg_id,
 };
 use crate::backend::x86::assembler::parser::*;
+
+/// The byte of a prefix word in 32- and 16-bit code. The size words are
+/// the byte whichever size they name; the REX words are 64-bit code's.
+fn lone_prefix_byte(word: &str) -> Result<u8, String> {
+    Ok(match word {
+        "lock" => 0xF0,
+        "repne" | "repnz" | "xacquire" => 0xF2,
+        "rep" | "repe" | "repz" | "xrelease" => 0xF3,
+        "es" => 0x26,
+        "cs" => 0x2E,
+        "ss" => 0x36,
+        "ds" | "notrack" => 0x3E,
+        "fs" => 0x64,
+        "gs" => 0x65,
+        "data16" | "data32" => 0x66,
+        "addr16" | "addr32" => 0x67,
+        _ => return Err(format!("`{word}' is only supported in 64-bit mode")),
+    })
+}
 
 /// VEX scalar BMI rows whose 32-bit encodings are shared with long mode.
 /// Explicit q spellings deliberately do not enter this path.
@@ -275,14 +297,49 @@ pub struct InstructionEncoder {
     /// The `callw` spelling was used: the near call takes the 16-bit
     /// form (66 E8 rel16 / 66 FF /2) in every mode.
     pub(super) sized_op_callw: bool,
-    /// The `addr16` prefix word was used (GAS 2.47 spells the address-size
-    /// override as a standalone word). In .code32 it forces one 0x67 unless
-    /// the body already emitted one (`addr16 mov %ax,(%bx,%si)' keeps the
-    /// single 67 the 16-bit addressing itself produced).
-    pub(super) explicit_addr16: bool,
-    /// The `data16` prefix word was used: force one 0x66 operand-size
-    /// override; a body that already carries 0x66 is a GAS error.
-    pub(super) explicit_data16: bool,
+    /// The address-size word that names the other size than the code's was
+    /// written: `addr16` in 32-bit code, `addr32` in 16-bit code (the word
+    /// that names the code's own size is refused as redundant). It forces
+    /// one 0x67 unless the body already emitted one (`addr16 mov
+    /// %ax,(%bx,%si)' keeps the single 67 the 16-bit addressing itself
+    /// produced), makes an address without a register as wide as the word
+    /// says, and takes no register of the code's own address size.
+    pub(super) explicit_addr: bool,
+    /// The data-size word that names the other size than the code's was
+    /// written: `data16` in 32-bit code, `data32` in 16-bit code. It forces
+    /// one 0x66; a body that already carries 0x66 is a GAS error. The
+    /// offset of a direct branch is as wide as the word says.
+    pub(super) explicit_data: bool,
+    /// The instruction under way was written from a row learned from GNU
+    /// as (the 64-bit encoder's `learned`): the row said which registers
+    /// and which decorations it takes, and the checks that go by the
+    /// opcode have nothing to add.
+    learned_row: bool,
+}
+
+/// The part of the 64-bit encoder a delegated instruction is written by.
+#[derive(Clone, Copy)]
+enum SharedCore {
+    /// Its arms.
+    Arms,
+    /// Its rows learned from GNU as, for code of this kind.
+    Learned(Code),
+}
+
+impl crate::backend::x86::assembler::encoder::optimize::Atomic for InstructionEncoder {
+    fn mark(&self) -> (usize, usize, u64) {
+        (self.bytes.len(), self.relocations.len(), self.offset)
+    }
+
+    fn rewind(&mut self, (bytes, relocations, offset): (usize, usize, u64)) {
+        self.bytes.truncate(bytes);
+        self.relocations.truncate(relocations);
+        self.offset = offset;
+    }
+
+    fn written(&mut self, instr: &Instruction) -> Result<(), String> {
+        self.encode_as_written(instr)
+    }
 }
 
 impl InstructionEncoder {
@@ -298,15 +355,46 @@ impl InstructionEncoder {
             vex_hint: None,
             s_flip: false,
             sized_op_callw: false,
-            explicit_addr16: false,
-            explicit_data16: false,
+            explicit_addr: false,
+            explicit_data: false,
+            learned_row: false,
+        }
+    }
+
+    /// Encode one instruction atomically: as written, or as the cheaper
+    /// instruction that has the same effect, for a statement that may be
+    /// replaced (`Instruction::optimize`; see the 64-bit encoder's
+    /// `optimize`). Not in 16-bit code, where every size prefix is the
+    /// other way round and nothing the compiler writes is at stake.
+    pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+        self.encode_choosing(instr).map(|_| ())
+    }
+
+    /// [`Self::encode`], returning the instruction that replaced `instr`
+    /// if one did.
+    pub(crate) fn encode_choosing(
+        &mut self,
+        instr: &Instruction,
+    ) -> Result<Option<Instruction>, String> {
+        if self.code16 {
+            return self.encode_as_written(instr).map(|()| None);
+        }
+        crate::backend::x86::assembler::encoder::optimize::encode(self, instr, false)
+    }
+
+    /// The kind of code under way.
+    fn code(&self) -> Code {
+        if self.code16 {
+            Code::Bits16
+        } else {
+            Code::Bits32
         }
     }
 
     /// Encode one instruction atomically: callers may reuse this encoder
     /// after an error without exposing an emitted prefix, a stale relocation
     /// or a shifted location counter to the next instruction.
-    pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+    fn encode_as_written(&mut self, instr: &Instruction) -> Result<(), String> {
         let bytes = self.bytes.len();
         let relocations = self.relocations.len();
         let offset = self.offset;
@@ -317,12 +405,13 @@ impl InstructionEncoder {
         let sized_op_callw = self.sized_op_callw;
         // The encoders go by a register's number; what kind of register
         // the statement named is held against the encoding afterwards.
+        self.learned_row = false;
         let result = self.encode_checked(instr).and_then(|()| {
-            crate::backend::x86::assembler::encoder::operand_class::check(
-                instr,
-                self.bytes.get(bytes..).unwrap_or(&[]),
-                false,
-            )
+            use crate::backend::x86::assembler::encoder::operand_class::check;
+            if self.learned_row {
+                return Ok(());
+            }
+            check(instr, self.bytes.get(bytes..).unwrap_or(&[]), self.code())
         });
         if result.is_ok() {
             self.relax_got32(bytes, relocations);
@@ -338,6 +427,149 @@ impl InstructionEncoder {
             self.sized_op_callw = sized_op_callw;
         }
         result
+    }
+
+    /// Read the prefix words in front of `instr`: write the bytes of the
+    /// lock and repeat words, note the size words (`explicit_addr`,
+    /// `explicit_data`), and return how many bytes were written and the
+    /// byte of the segment a word names.
+    fn write_prefix_words(&mut self, instr: &Instruction) -> Result<(usize, Option<u8>), String> {
+        // Handle prefixes. Stacked HLE pairs (`lock xacquire addl ...`)
+        // arrive in source order; F0 sinks past any F2/F3 byte so both
+        // spellings emit the canonical F2/F3 F0 run (GAS 2.47).
+        let mut pfx: Vec<u8> = Vec::new();
+        self.explicit_addr = false;
+        self.explicit_data = false;
+        let (mut has_lock, mut has_xacquire, mut has_xrelease) = (false, false, false);
+        // The segment a prefix word names (`cs nop`, `es movsb`, and
+        // `notrack`, which is `ds`'s byte). One to an instruction: GNU as
+        // refuses `cs ds nop` and `notrack cs jmp *%eax`.
+        let mut segment_word: Option<u8> = None;
+        for prefix in &instr.prefixes {
+            match prefix.as_str() {
+                // A segment word is its byte in front of any instruction
+                // (GNU as 2.47: `cs nop` = 2e 90, `es movsb` = 26 a4, `ss
+                // mov %eax, (%ebp)` = 36 89 45 00, the default segment
+                // written out). Real-mode code is full of them; they were
+                // all "unknown prefix".
+                word @ ("cs" | "ds" | "es" | "ss" | "fs" | "gs" | "notrack") => {
+                    if word == "notrack" {
+                        // `notrack` stands in front of an indirect near
+                        // branch and of nothing else. GCC writes it in
+                        // front of the jump through a switch table under
+                        // `-fcf-protection`.
+                        let indirect = matches!(instr.operands.as_slice(), [Operand::Indirect(_)])
+                            && matches!(
+                                instr.mnemonic.to_ascii_lowercase().as_str(),
+                                "jmp" | "jmpl" | "jmpw" | "call" | "calll" | "callw"
+                            );
+                        if !indirect {
+                            return Err(
+                                "expecting indirect branch instruction after `notrack'".to_string()
+                            );
+                        }
+                    }
+                    if segment_word.is_some() {
+                        return Err("same type of prefix used twice".to_string());
+                    }
+                    segment_word = Some(lone_prefix_byte(word)?);
+                }
+                "lock" => {
+                    has_lock = true;
+                    pfx.push(0xF0);
+                }
+                // A repeat prefix stands in front of a string instruction
+                // and little else (`rep addl %eax, %ebx` was `F3 01 C3`,
+                // `rep xcryptecb` had the `F3` twice).
+                word @ ("rep" | "repz" | "repe") => {
+                    if repeat_prefix(word, instr)? {
+                        pfx.push(0xF3);
+                    }
+                }
+                word @ ("repnz" | "repne") => {
+                    if repeat_prefix(word, instr)? {
+                        pfx.push(0xF2);
+                    }
+                }
+                "xacquire" => {
+                    has_xacquire = true;
+                    pfx.push(0xF2);
+                }
+                "xrelease" => {
+                    has_xrelease = true;
+                    pfx.push(0xF3);
+                }
+                // GAS address-/operand-size override words. The word that
+                // names the code's own size is refused ("redundant addr32
+                // prefix" in 32-bit code, "redundant addr16 prefix" in
+                // 16-bit code); the other one forces one 0x67 (`addr16
+                // nop' = 67 90 in 32-bit code, `addr32 nop' = 67 90 in
+                // 16-bit code) or one 0x66. In 16-bit code the words were
+                // read as in 32-bit code: `addr32` and `data32` were
+                // refused, which real-mode code is full of, and `data16
+                // addw %ax, %bx` was `66 01 c3`, an `addl`. The legacy REX
+                // words are 64-bit-only.
+                word @ ("addr16" | "addr32") => {
+                    if (word == "addr16") == self.code16 {
+                        return Err(format!("redundant {word} prefix"));
+                    }
+                    if self.explicit_addr {
+                        return Err("same type of prefix used twice".to_string());
+                    }
+                    self.explicit_addr = true;
+                }
+                word @ ("data16" | "data32") => {
+                    if (word == "data16") == self.code16 {
+                        return Err(format!("redundant {word} prefix"));
+                    }
+                    if self.explicit_data {
+                        return Err("same type of prefix used twice".to_string());
+                    }
+                    self.explicit_data = true;
+                }
+                word if rex_prefix_word(word).is_some() => {
+                    return Err(format!("`{word}' is only supported in 64-bit mode"));
+                }
+                _ => return Err(format!("unknown prefix: {}", prefix)),
+            }
+        }
+        // `lock` and the HLE hints stand in front of a lockable
+        // instruction on memory (`lock addl %eax, %ebx` was `F0 01 C3`,
+        // which no processor runs).
+        check_lock_prefixes(instr, has_lock, has_xacquire, has_xrelease)?;
+        pfx.sort_by_key(|&b| b == 0xF0);
+        let body_prefix_count = pfx.len();
+        for b in &pfx {
+            self.bytes.push(*b);
+        }
+        // The address-size word is STRICT in GAS 2.47: a base or an index
+        // of the other width is rejected outright (`addr16 mov
+        // %eax,(%eax)' in 32-bit code and `addr32 movw %ax,(%bx)' in
+        // 16-bit code -> "(%eax)' is not a valid base/index expression"),
+        // even though the address would only differ by the 0x67. Bare
+        // absolute displacements stay legal and take the word's width
+        // (moffs16: `addr16 mov %eax,0x0898` = 67 a3 98 08).
+        if self.explicit_addr {
+            for op in &instr.operands {
+                if let Some(mem) = op.memory() {
+                    for slot in [&mem.base, &mem.index].into_iter().flatten() {
+                        let sixteen = matches!(
+                            slot.name.to_ascii_lowercase().as_str(),
+                            "bx" | "bp" | "si" | "di"
+                        );
+                        // 16-bit registers under `addr16`, which is the
+                        // word of 32-bit code; the others under `addr32`.
+                        if sixteen == self.code16 {
+                            return Err(format!(
+                                "`(%{})' is not a valid base/index expression",
+                                slot.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok((body_prefix_count, segment_word))
     }
 
     /// GAS's `-mrelax-relocations=yes` (the default) spelling of `@GOT`:
@@ -414,73 +646,8 @@ impl InstructionEncoder {
         let start_len = self.bytes.len();
         let reloc_base = self.relocations.len();
 
-        // Handle prefixes. Stacked HLE pairs (`lock xacquire addl ...`)
-        // arrive in source order; F0 sinks past any F2/F3 byte so both
-        // spellings emit the canonical F2/F3 F0 run (GAS 2.47).
-        let mut pfx: Vec<u8> = Vec::new();
-        self.explicit_addr16 = false;
-        self.explicit_data16 = false;
-        for prefix in &instr.prefixes {
-            match prefix.as_str() {
-                "lock" => pfx.push(0xF0),
-                "rep" | "repz" | "repe" => pfx.push(0xF3),
-                "repnz" | "repne" => pfx.push(0xF2),
-                "xacquire" => pfx.push(0xF2),
-                "xrelease" => pfx.push(0xF3),
-                // GAS address-/operand-size override words. In 32-bit mode
-                // `addr32`/`data32` name the DEFAULT sizes, so GAS rejects
-                // them outright ("redundant addr32 prefix"), `addr16`
-                // forces one 0x67 (redundant-but-accepted spellings like
-                // `addr16 nop' = 67 90 still emit the byte), and `data16`
-                // forces one 0x66. The legacy REX words are 64-bit-only.
-                "addr16" => {
-                    if self.explicit_addr16 {
-                        return Err("same type of prefix used twice".to_string());
-                    }
-                    self.explicit_addr16 = true;
-                }
-                "addr32" => return Err("redundant addr32 prefix".to_string()),
-                "data16" => {
-                    if self.explicit_data16 {
-                        return Err("same type of prefix used twice".to_string());
-                    }
-                    self.explicit_data16 = true;
-                }
-                "data32" => return Err("redundant data32 prefix".to_string()),
-                "rex" | "rex.x" | "rex64" => {
-                    return Err("`rex' is not supported in 32-bit mode".to_string());
-                }
-                _ => return Err(format!("unknown prefix: {}", prefix)),
-            }
-        }
-        pfx.sort_by_key(|&b| b == 0xF0);
-        let body_prefix_count = pfx.len();
-        for b in &pfx {
-            self.bytes.push(*b);
-        }
-        // The `addr16` word is STRICT 16-bit addressing in GAS 2.47: a
-        // 32-bit-only base/index is rejected outright (GAS: `addr16 mov
-        // %eax,(%eax)' -> "(%eax)' is not a valid base/index expression")
-        // even though the plain 16-bit addressing of `(%esp)`-free forms
-        // would only differ by the 0x67. Bare absolute displacements stay
-        // legal (moffs16: `addr16 mov %eax,0x0898` = 67 a3 98 08).
-        if self.explicit_addr16 {
-            for op in &instr.operands {
-                if let Some(mem) = op.memory() {
-                    for slot in [&mem.base, &mem.index].into_iter().flatten() {
-                        if !matches!(
-                            slot.name.to_ascii_lowercase().as_str(),
-                            "bx" | "bp" | "si" | "di"
-                        ) {
-                            return Err(format!(
-                                "`(%{})' is not a valid base/index expression",
-                                slot.name
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        let (body_prefix_count, segment_word) = self.write_prefix_words(instr)?;
+
         // String ops carry their ESI/EDI addressing in the OPERANDS but
         // emit no ModR/M, so `encode_modrm_mem`'s detection never runs for
         // them: flag any NON-DEFAULT address size exactly like the ModR/M
@@ -518,6 +685,9 @@ impl InstructionEncoder {
             }
         }
 
+        // A number that is one byte of the instruction, in the range GNU
+        // as takes it in (`pextrw $256, %xmm1, %edx` extracted word 0).
+        learned::check_number(&instr.mnemonic, &instr.operands, self.code())?;
         let mut result = self.encode_mnemonic(instr);
         // What the arms refuse may be a plain instruction of the shared
         // table: a spelling or a form no arm was written for.
@@ -526,6 +696,53 @@ impl InstructionEncoder {
             let unhandled = refusal.starts_with("unhandled i686 instruction");
             if let Some(from_table) = self.encode_from_table(instr, body, reloc_base, unhandled) {
                 result = from_table;
+            }
+        }
+        // `{evex}` asks for an EVEX encoding, and one this code has: APX's
+        // are 64-bit code's. The arms that write VEX wrote VEX (`{evex}
+        // vmovhlps` was `C5 ..`), and the 64-bit encoder behind them wrote
+        // APX's (`{evex} crc32l %eax, %ebx` was `62 F4 ..`, which 32-bit
+        // code does not decode).
+        let lacks_evex = |encoder: &Self| {
+            instr.force_evex
+                && evex_of(&encoder.bytes[start_len + body_prefix_count..], false) != Evex::Vector
+        };
+        if result.is_ok() && lacks_evex(self) {
+            result = Err(format!(
+                "no EVEX encoding for `{}'",
+                instr.mnemonic.to_ascii_lowercase().trim_end_matches(".s")
+            ));
+        }
+        // Or an instruction GNU as was asked about: the rows the 64-bit
+        // encoder has learned from it (`learned`) say which of them 32-bit
+        // and 16-bit code have.
+        if let (Err(refusal), true) = (&result, learned::stands_behind(&instr.prefixes)) {
+            let name = instr.mnemonic.to_ascii_lowercase();
+            if learned::knows(&name) {
+                let unhandled = refusal.starts_with("unhandled");
+                let body = start_len + body_prefix_count;
+                let pending_addr32 = self.pending_addr32;
+                self.bytes.truncate(body);
+                self.relocations.truncate(reloc_base);
+                let mut x64 = X86InstructionEncoder::new();
+                let core = SharedCore::Learned(self.code());
+                match self.encode_via_x64_encoder(instr, &mut x64, core) {
+                    Ok(sized) => {
+                        // 16-bit code inverts the operand-size prefix of
+                        // an instruction that chose its operand size.
+                        self.sized_op = sized;
+                        self.learned_row = true;
+                        result = Ok(());
+                    }
+                    Err(mismatch) => {
+                        self.bytes.truncate(body);
+                        self.relocations.truncate(reloc_base);
+                        self.pending_addr32 = pending_addr32;
+                        if unhandled {
+                            result = Err(mismatch);
+                        }
+                    }
+                }
             }
         }
         // Or a vector instruction: one on `%xmm`/`%mm` registers or on mask
@@ -540,7 +757,9 @@ impl InstructionEncoder {
             self.bytes.truncate(body);
             self.relocations.truncate(reloc_base);
             match self.encode_via_x64(instr) {
-                Ok(()) if !starts_with_rex(&self.bytes[body..]) => result = Ok(()),
+                Ok(()) if !starts_with_rex(&self.bytes[body..]) && !lacks_evex(self) => {
+                    result = Ok(());
+                }
                 _ => {
                     self.bytes.truncate(body);
                     self.relocations.truncate(reloc_base);
@@ -563,7 +782,7 @@ impl InstructionEncoder {
                 instr.mnemonic.to_ascii_lowercase().trim_end_matches(".s")
             ));
         }
-        if result.is_ok() && instr.operands.iter().any(op_decorated) {
+        if result.is_ok() && !self.learned_row && instr.operands.iter().any(op_decorated) {
             result = X86InstructionEncoder::check_decorators(
                 &self.bytes[start_len..],
                 &instr.mnemonic,
@@ -618,7 +837,7 @@ impl InstructionEncoder {
         // so those passes see the complete legacy-prefix run and re-order
         // it as a whole.
         if result.is_ok() {
-            self.splice_segment_overrides(instr, start_len)?;
+            self.splice_segment_overrides(instr, start_len, segment_word)?;
         }
 
         // `.code16`: invert the operand-size prefix.
@@ -638,14 +857,17 @@ impl InstructionEncoder {
         if result.is_ok() {
             let addr32 = std::mem::take(&mut self.pending_addr32);
             if self.code16 {
-                self.fixup_code16_prefixes(start_len, addr32);
+                // The `addr32` word asks for the same one 0x67 a 32-bit
+                // address does (`addr32 movw %ax, (%ebx)` = 67 89 03,
+                // `addr32 nop` = 67 90).
+                result = self.fixup_code16_prefixes(start_len, addr32 || self.explicit_addr);
             } else if addr32 {
                 // `.code32` with a 16-bit addressing form: splice the 0x67
                 // address-size override in after the group-1/segment prefix
                 // run (GAS: `mov %es:8(%bx), %ax` assembles to
                 // `26 67 66 8b 47 08`).
                 result = self.fixup_code32_addr16_prefix(start_len);
-            } else if self.explicit_addr16 {
+            } else if self.explicit_addr {
                 // The `addr16` prefix word on a body that encoded 32-bit
                 // addressing (redundant-but-accepted spellings: GAS
                 // `addr16 nop` = 67 90, `addr16 mov %eax,0x0898` =
@@ -659,8 +881,20 @@ impl InstructionEncoder {
                 // prefix used twice" (`addr16 monitor %ax,%ecx,%edx`).
                 result = self.fixup_code32_addr16_prefix(start_len);
             }
-            if self.explicit_data16 {
-                result = self.fixup_forced_data16(start_len);
+            if result.is_ok() && self.explicit_data {
+                // The word stands in front of no VEX, EVEX or XOP encoding
+                // and of no instruction on vector, `%mm` or mask registers
+                // (`data16 vprotw` was `66 8F ..`).
+                result = if takes_no_data_size_prefix(instr)
+                    || has_vector_prefix(&self.bytes[start_len..], false)
+                {
+                    Err(format!(
+                        "data size prefix invalid with `{}'",
+                        instr.mnemonic.to_ascii_lowercase()
+                    ))
+                } else {
+                    self.fixup_forced_data16(start_len)
+                };
             }
         } else {
             self.pending_addr32 = false;
@@ -833,6 +1067,7 @@ impl InstructionEncoder {
         if ops.len() == 1 && esi_idx.is_some() && edi_idx.is_none() {
             let mem =
                 string_mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            implied_address(stem, mem)?;
             i686_check_string_address_class(mem)?;
             let seg_byte = match mem.segment.as_deref() {
                 None | Some("ds") => None,
@@ -889,6 +1124,7 @@ impl InstructionEncoder {
             if !is_size_matched_accumulator(&ops[1], size) {
                 return Err(format!("operand type mismatch for `{stem}'"));
             }
+            implied_address(stem, mem)?;
             i686_check_string_address_class(mem)?;
             let seg_byte = match mem.segment.as_deref() {
                 None | Some("ds") => None,
@@ -920,21 +1156,15 @@ impl InstructionEncoder {
         if matches!(stem, "ins" | "outs") {
             let port_idx = if stem == "ins" { 0 } else { 1 };
             let addr_idx = 1 - port_idx;
-            let port_ok = match &ops[port_idx] {
-                Operand::Register(r) => r.name.eq_ignore_ascii_case("dx"),
-                Operand::Memory(m) => {
-                    m.base
-                        .as_ref()
-                        .is_some_and(|b| b.name.eq_ignore_ascii_case("dx"))
-                        && m.index.is_none()
-                }
-                _ => false,
-            };
-            if !port_ok {
+            if !is_string_port(&ops[port_idx]) {
                 return Err(format!("operand type mismatch for `{stem}'"));
             }
             let mem = string_mem_of(&ops[addr_idx])
                 .ok_or(format!("operand type mismatch for `{stem}'"))?;
+            if stem == "outs" {
+                implied_address(stem, mem)?;
+                port_behind_index(mem, &ops[port_idx])?;
+            }
             i686_check_string_address_class(mem)?;
             match (stem, mem.segment.as_deref()) {
                 ("ins", None | Some("es")) => {}
@@ -1030,7 +1260,7 @@ impl InstructionEncoder {
         // override (GAS: `9b 26 67 d9 7f 08` for `fstcw %es:8(%bx)` in
         // .code32).
         let mut i = start;
-        if self.bytes.get(i) == Some(&0x9B) {
+        if self.waits(i) {
             i += 1;
         }
         // GAS 2.47 orders 0x67 immediately after any segment override and
@@ -1056,11 +1286,19 @@ impl InstructionEncoder {
     }
 
     /// Put the segment override of the instruction that starts at `start`
-    /// in front of its body (see the choke point in `encode_checked`).
+    /// in front of its body (see the choke point in `encode_checked`): the
+    /// one an operand needs, or the one a segment word in front of the
+    /// statement asks for (`word`).
+    ///
+    /// One prefix when both name the same segment (GNU as 2.47: `fs mov
+    /// %eax, %fs:(%ebx)` = 64 89 03) or the operand names the default one,
+    /// which is not written (`cs mov %eax, %ds:(%ebx)` = 2e 89 03); two
+    /// different ones are "same type of prefix used twice".
     fn splice_segment_overrides(
         &mut self,
         instr: &Instruction,
         start_len: usize,
+        word: Option<u8>,
     ) -> Result<(), String> {
         // String-op default-segment law (GAS 2.47, byte-probed): ES is
         // the architectural default of the EDI side and DS of the ESI
@@ -1134,6 +1372,8 @@ impl InstructionEncoder {
         // memory operand too. Scanning for `Operand::Memory` alone
         // dropped its override: `call *%gs:0x10` called through
         // `*0x10`.)
+        // The override an operand needs: one that is not its default.
+        let mut operand: Option<u8> = None;
         for op in &instr.operands {
             let Some(mem) = op.memory() else { continue };
             let Some(seg) = &mem.segment else { continue };
@@ -1186,30 +1426,42 @@ impl InstructionEncoder {
                 // a later operand may still need its byte.
                 continue;
             }
-            // Insertion point: past the FWAIT byte (GAS keeps 0x9B ahead
-            // of every prefix: `9b 26 67 d9 7f 08`), then IN FRONT of
-            // the group-1 (lock/rep) run this function pushed before
-            // the body — GAS orders the segment override outermost
-            // (`65 f0 ff 00` for `lock incl %gs:(%eax)`, GNU as
-            // 2.44-verified) and in front of any 0x66/0x67 the body
-            // pushed (`26 67 66 8b 47 08`).
-            let mut at = start_len;
-            if self.bytes.get(at) == Some(&0x9B) {
-                at += 1;
+            // (At most one operand gets here: of a string instruction
+            // the `%esi` side alone, of any other the only one with a
+            // segment.)
+            if operand.is_some_and(|other| other != prefix) {
+                return Err("operand type mismatch".to_string());
             }
-            // A body that used the old per-arm emission left its own
-            // override in place: idempotence guard (defensive; all
-            // per-arm calls were removed).
-            if self.bytes.get(at) == Some(&prefix) {
-                continue;
+            operand = Some(prefix);
+        }
+        let prefix = match (word, operand) {
+            (Some(word), Some(operand)) if word != operand => {
+                return Err("same type of prefix used twice".to_string());
             }
-            self.bytes.insert(at, prefix);
-            for relocation in self.relocations.iter_mut() {
-                if relocation.offset >= at as u64 {
-                    relocation.offset += 1;
-                }
+            (Some(byte), _) | (None, Some(byte)) => byte,
+            (None, None) => return Ok(()),
+        };
+        // Insertion point: past the FWAIT byte of an x87 instruction (GAS
+        // keeps 0x9B ahead of every prefix: `9b 26 67 d9 7f 08`; `cs
+        // fwait`, where the byte is the instruction, is 2e 9b), then IN
+        // FRONT of the group-1 (lock/rep) run this function pushed before
+        // the body — GAS orders the segment override outermost (`65 f0 ff
+        // 00` for `lock incl %gs:(%eax)`, GNU as 2.44-verified) and in
+        // front of any 0x66/0x67 the body pushed (`26 67 66 8b 47 08`).
+        let mut at = start_len;
+        if self.waits(at) {
+            at += 1;
+        }
+        // A body that wrote the override itself keeps the one it has (no
+        // arm does; the byte is no opcode, so the guard costs nothing).
+        if self.bytes.get(at) == Some(&prefix) {
+            return Ok(());
+        }
+        self.bytes.insert(at, prefix);
+        for relocation in self.relocations.iter_mut() {
+            if relocation.offset >= at as u64 {
+                relocation.offset += 1;
             }
-            continue;
         }
         Ok(())
     }
@@ -1224,7 +1476,7 @@ impl InstructionEncoder {
     /// either ignored or a #UD sequence depending on the prefix class.
     fn fixup_forced_data16(&mut self, start: usize) -> Result<(), String> {
         let mut i = start;
-        if self.bytes.get(i) == Some(&0x9B) {
+        if self.waits(i) {
             i += 1;
         }
         while i < self.bytes.len()
@@ -1256,13 +1508,19 @@ impl InstructionEncoder {
 
     /// Rewrite the operand/address-size prefixes of the instruction that
     /// starts at `start` for 16-bit mode.
-    fn fixup_code16_prefixes(&mut self, start: usize, addr32: bool) {
+    ///
+    /// Fails for a 0x67 the instruction has for itself under the `addr32`
+    /// word (GAS: "same type of prefix used twice" for `addr32 jecxz`,
+    /// `addr32 monitor %eax, %ecx, %edx`); the 0x67 of a 32-bit address is
+    /// asked for through `addr32` and is the word's own.
+    fn fixup_code16_prefixes(&mut self, start: usize, addr32: bool) -> Result<(), String> {
         // The FWAIT byte (0x9B) of the x87 waiting forms heads the whole
         // prefix run (GAS: `9b 26 67 d9 78 08` for `fstcw %es:8(%eax)` in
-        // .code16) and is re-emitted first.
+        // .code16) and is re-emitted first. `fwait` itself is that byte
+        // and nothing else, and its prefixes stand in front of it.
         let mut i = start;
         let mut fwait = false;
-        if self.bytes.get(i) == Some(&0x9B) {
+        if self.waits(i) {
             fwait = true;
             i += 1;
         }
@@ -1299,6 +1557,9 @@ impl InstructionEncoder {
                 }
                 _ => break,
             }
+        }
+        if had_67 && self.explicit_addr {
+            return Err("same type of prefix used twice".to_string());
         }
         let body: Vec<u8> = self.bytes[i..].to_vec();
 
@@ -1355,6 +1616,16 @@ impl InstructionEncoder {
 
         self.bytes.truncate(start);
         self.bytes.extend_from_slice(&out);
+        Ok(())
+    }
+
+    /// Whether the byte at `at` is the FWAIT in front of an x87 instruction
+    /// (`fstcw` is `9B D9 /7`), which every prefix follows -- and not the
+    /// whole of `fwait`, which its prefixes precede (GAS: `data16 fwait` =
+    /// 66 9b, `addr16 fwait` = 67 9b; they came out as `9b 66` and `9b 67`,
+    /// a prefix on whatever instruction is next).
+    fn waits(&self, at: usize) -> bool {
+        self.bytes.get(at) == Some(&0x9B) && self.bytes.len() > at + 1
     }
 
     /// Main mnemonic dispatch.
@@ -1777,10 +2048,10 @@ impl InstructionEncoder {
                 self.encode_far_branch(ops, mnemonic, "call")
             }
             // `jmpl` says 32 bits, which 16-bit code has to be told: `jmpl
-            // *(%bx)` is `66 ff 27` there, and `jmpl label` `66 e9` and a
-            // 32-bit displacement. (Both came out as plain `jmp`.)
+            // *(%bx)` is `66 ff 27` there. (It came out as plain `jmp`.)
             "jmp" | "jmpl" => {
                 if mnemonic == "jmpl" {
+                    gp_integer::check_long_branch(ops, "jmp")?;
                     self.sized_op = true;
                 }
                 self.encode_jmp(ops)
@@ -1865,6 +2136,9 @@ impl InstructionEncoder {
                 // argument reads depend on it. `callw` is the explicit
                 // 16-bit spelling everywhere (e8 rel16). sized_op routes the
                 // width through encode_call + the prefix inversion.
+                if mnemonic == "calll" {
+                    gp_integer::check_long_branch(ops, "call")?;
+                }
                 if mnemonic == "calll" || (self.code16 && self.code16gcc && mnemonic == "call") {
                     self.sized_op = true;
                 }
@@ -2206,16 +2480,14 @@ impl InstructionEncoder {
                         // 32-bit mode: `monitor %ax,%ecx,%edx` = 67 0f 01
                         // c8 in .code32 but 0f 01 c8 in .code16, while the
                         // 32-bit spelling needs the byte in .code16 (67 0f
-                        // 01 c8, probed) and none in .code32. The .code16
-                        // byte rides pending_addr32 so the central fixup
-                        // emits it in canonical position; the .code32 byte
-                        // is template-forced and pushed here (an explicit
-                        // `addr16` on top of it then rejects above).
-                        if names[0] == "ax" && !self.code16 {
+                        // 01 c8, probed) and none in .code32. The byte is
+                        // template-forced and pushed here in either code:
+                        // the address-size word on top of it then rejects
+                        // (`addr16 monitor %ax, ..` in 32-bit code,
+                        // `addr32 monitor %eax, ..` in 16-bit code), and
+                        // the 16-bit fixup puts it in canonical position.
+                        if (names[0] == "ax") != self.code16 {
                             self.bytes.push(0x67);
-                        }
-                        if names[0] == "eax" && self.code16 {
-                            self.pending_addr32 = true;
                         }
                         self.bytes.extend_from_slice(&[0x0F, 0x01, ext]);
                         Ok(())
@@ -2285,11 +2557,8 @@ impl InstructionEncoder {
                 // Address-size law mirrors the monitor family above: the
                 // 16-bit spelling's 0x67 is non-default only in .code32
                 // (67 f3 0f ae f0), the 32-bit spelling's only in .code16.
-                if is_16 && !self.code16 {
+                if is_16 != self.code16 {
                     self.bytes.push(0x67);
-                }
-                if is_32 && self.code16 {
-                    self.pending_addr32 = true;
                 }
                 self.bytes.extend_from_slice(&[0xF3, 0x0F, 0xAE]);
                 self.bytes.push(self.modrm(3, 6, num));
@@ -2317,17 +2586,14 @@ impl InstructionEncoder {
             // .code32 startup path, which is `0f 00 d0` / `0f 00 d8`, with no
             // operand-size prefix whatever the register is called.)
 
-            // Standalone prefix mnemonics (e.g. from "rep; nop" split on semicolon)
-            "lock" if ops.is_empty() => {
-                self.bytes.push(0xF0);
-                Ok(())
-            }
-            "rep" | "repe" | "repz" if ops.is_empty() => {
-                self.bytes.push(0xF3);
-                Ok(())
-            }
-            "repnz" | "repne" if ops.is_empty() => {
-                self.bytes.push(0xF2);
+            // A prefix word that is the whole statement is its byte (e.g.
+            // from "rep; nop" split on semicolon). Every prefix word, as in
+            // GNU as: `lock` and the `rep`s were, the others were "no such
+            // instruction". The size words are a 0x66 or a 0x67 whichever
+            // size they name and whatever the code's own is.
+            word if ops.is_empty() && is_prefix_word(word) => {
+                let byte = lone_prefix_byte(word)?;
+                self.bytes.push(byte);
                 Ok(())
             }
 
@@ -2480,19 +2746,8 @@ impl InstructionEncoder {
             "sha1msg1" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xC9]),
             "sha1msg2" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCA]),
             "sha256rnds2" => {
-                let ops_norm: &[Operand] = if ops.len() == 3 {
-                    match &ops[0] {
-                        Operand::Register(r) if r.name == "xmm0" => &ops[1..],
-                        _ => {
-                            return Err(
-                                "sha256rnds2: explicit first operand must be %xmm0".to_string()
-                            );
-                        }
-                    }
-                } else {
-                    ops
-                };
-                self.encode_sse_op(ops_norm, &[0x0F, 0x38, 0xCB])
+                use crate::backend::x86::assembler::encoder::sha256rnds2_operands;
+                self.encode_sse_op(sha256rnds2_operands(ops)?, &[0x0F, 0x38, 0xCB])
             }
             "sha256msg1" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCC]),
             "sha256msg2" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCD]),
@@ -3436,6 +3691,27 @@ impl InstructionEncoder {
         if !stem.starts_with('v') {
             return None;
         }
+        // `{evex} vmovq` from and to memory: the 64-bit encoder writes the
+        // opcode that moves a 64-bit general register (`6E` and `7E` under
+        // `W`), which is the same instruction there. 32-bit code has no
+        // such register and no `W`: the opcode moves 32 bits (`{evex}
+        // vmovq (%ebx), %xmm1` loaded half of what it names). The rows GNU
+        // as answered have the opcodes that move 64 bits between a vector
+        // register and memory.
+        if instr.force_evex
+            && stem == "vmovq"
+            && instr
+                .operands
+                .iter()
+                .any(|op| !matches!(op, Operand::Register(_)))
+        {
+            let mut x64 = X86InstructionEncoder::new();
+            let core = SharedCore::Learned(self.code());
+            return Some(
+                self.encode_via_x64_encoder(instr, &mut x64, core)
+                    .map(|_| ()),
+            );
+        }
         // The four packed broadcasts have both VEX vector-source rows and
         // EVEX GPR-source rows, even in 32-bit mode. The local i686 encoder
         // incorrectly used a non-existent VEX GPR row (and rejected zmm),
@@ -3498,21 +3774,29 @@ impl InstructionEncoder {
         }
 
         let mut x64 = X86InstructionEncoder::new();
-        Some(self.encode_via_x64_encoder(instr, &mut x64))
+        Some(
+            self.encode_via_x64_encoder(instr, &mut x64, SharedCore::Arms)
+                .map(|_| ()),
+        )
     }
 
     /// Encode `instr` with a fresh x86-64 core and splice the bytes and
     /// translated relocations into this encoder.
     fn encode_via_x64(&mut self, instr: &Instruction) -> Result<(), String> {
         let mut x64 = X86InstructionEncoder::new();
-        self.encode_via_x64_encoder(instr, &mut x64)
+        self.encode_via_x64_encoder(instr, &mut x64, SharedCore::Arms)
+            .map(|_| ())
     }
 
+    /// Encode `instr` with `core` of `x64` and splice what comes out into
+    /// this encoder, with the address this mode writes. Whether the
+    /// instruction chose its operand size, which a learned row says.
     fn encode_via_x64_encoder(
         &mut self,
         instr: &Instruction,
         x64: &mut X86InstructionEncoder,
-    ) -> Result<(), String> {
+        core: SharedCore,
+    ) -> Result<bool, String> {
         // x86-64's public encode() normalizes a bare symbol to absolute
         // memory before reaching encode_mnemonic(). i686 must make the same
         // canonical operands when calling that core directly; otherwise a
@@ -3545,7 +3829,23 @@ impl InstructionEncoder {
         // *emitter*. Parsing opcode bytes here would be fragile across VEX2,
         // VEX3, XOP and AVX-512 instruction families.
         x64.track_memory_emission = true;
-        x64.encode_mnemonic(instr)?;
+        let sized = match core {
+            SharedCore::Arms => {
+                x64.encode_mnemonic(instr)?;
+                false
+            }
+            SharedCore::Learned(code) => {
+                let name = instr.mnemonic.to_ascii_lowercase();
+                let asked = learned::Asked {
+                    code,
+                    evex: instr.force_evex,
+                    vex: instr.vex_hint.is_some(),
+                    rex2: false,
+                };
+                x64.encode_learned(&name, &instr.operands, asked)
+                    .unwrap_or_else(|| Err(format!("no such instruction: `{name}'")))?
+            }
+        };
         // The i686 wrapper runs the shared post-encode decorator check once
         // after it has the real 32-bit prefixes. Do not recheck here.
         let memories: Vec<&MemoryOperand> =
@@ -3636,7 +3936,7 @@ impl InstructionEncoder {
                 diff_symbol: r.diff_symbol.clone(),
             });
         }
-        Ok(())
+        Ok(sized)
     }
 }
 
@@ -3858,6 +4158,7 @@ mod stack_width_tests {
             vex_hint: None,
             force_rex2: false,
             dfv: 0,
+            optimize: Default::default(),
         }
     }
 
@@ -4815,5 +5116,752 @@ mod cmov_condition_alias_tests {
     fn cmov_rejects_unknown_condition() {
         assert!(enc("cmovfool %ebx,%eax").is_err());
         assert!(enc("cmovq %ebx,%eax").is_err());
+    }
+}
+
+/// The width of a general register against the width of the operation, in
+/// 32- and 16-bit code. Bytes of GNU as 2.47 (`--32`, and behind `.code16`);
+/// it refuses every statement that is refused here.
+#[cfg(test)]
+mod operand_width_tests {
+    use super::*;
+
+    fn enc(line: &str, code16: bool) -> Result<String, String> {
+        let mut e = InstructionEncoder::new();
+        e.code16 = code16;
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(i) = item {
+                e.encode(&i)?;
+            }
+        }
+        Ok(e.bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>())
+    }
+
+    /// The encoders took the operand size from the suffix and a register
+    /// by its number: `addw $-3, %ecx` added to `%cx`, `movb $0x90, %cx`
+    /// wrote `%cl`, `sall %cl` shifted `%ecx` by one and `mulb %ecx`
+    /// multiplied by `%cl`.
+    #[test]
+    fn a_suffix_holds_the_registers_to_its_width() {
+        for statement in [
+            "adcb %ebp, (%esp)",
+            "adcl (%edx), %cx",
+            "addl $0x1234, %al",
+            "addw $-3, %ecx",
+            "andl %dh, %dh",
+            "cmpl %cl, %cl",
+            "bsfw (%ebp), %ecx",
+            "bsfl 0x1000, %cx",
+            "bsrl %cx, %cx",
+            "decw %ebp",
+            "divl %cl",
+            "imull %cx, %cx",
+            "imulw $7, (%ebp), %ecx",
+            "leal (%edx), %cx",
+            "leaw (%edx), %ebp",
+            "movb $0x90, %cx",
+            "movw %cl, %cl",
+            "mulb %ecx",
+            "pushw %ecx",
+            "rcll %cl, %cx",
+            "rcll %cx",
+            "rclw $1, %dh",
+            "sall %cl",
+            "sall %dh",
+            "shrb %ebp",
+            "testl %cx, %cx",
+            "xchgw %ebp, %eax",
+            "xchgw %eax, %eax",
+            "xchgl %ax, %ax",
+            "xaddb %cx, (%edx)",
+            "cmpxchgl %cx, 0x12(%ebx,%esi,4)",
+            "xorb $5, %ax",
+            "callw *%ebp",
+            "calll *%cx",
+            "calll %cx",
+            "jmpl *%cx",
+            "jmpw *%ecx",
+        ] {
+            for code16 in [false, true] {
+                assert!(
+                    enc(statement, code16).is_err(),
+                    "`{statement}` was assembled (16-bit code: {code16})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn what_agrees_is_assembled_in_either_code() {
+        for (statement, in_32, in_16) in [
+            ("addw $-3, %cx", "6683c1fd", "83c1fd"),
+            ("addl $0x1234, %eax", "0534120000", "660534120000"),
+            ("addb $5, %al", "0405", "0405"),
+            ("movb $0x90, %cl", "b190", "b190"),
+            ("movw %cx, %dx", "6689ca", "89ca"),
+            ("lea (%edx), %cx", "668d0a", "678d0a"),
+            ("leal (%edx), %ecx", "8d0a", "67668d0a"),
+            ("imulw $7, (%ebp), %cx", "666b4d0007", "676b4d0007"),
+            ("shll %cl, %edx", "d3e2", "66d3e2"),
+            ("shlw %cl, %dx", "66d3e2", "d3e2"),
+            ("shrb %cl, %dh", "d2ee", "d2ee"),
+            ("shld %cl, %eax, %ebx", "0fa5c3", "660fa5c3"),
+            ("shld %cl, %ax, %bx", "660fa5c3", "0fa5c3"),
+            ("rcll %ecx", "d1d1", "66d1d1"),
+            ("xchgw %bp, %ax", "6695", "95"),
+            ("xchg %eax, %ebp", "95", "6695"),
+            ("xchg %eax, %eax", "90", "6690"),
+            ("xchgw %ax, %ax", "6690", "90"),
+            ("pushw %cx", "6651", "51"),
+            ("pushl %ecx", "51", "6651"),
+            ("decw %bp", "664d", "4d"),
+            ("incl %ebp", "45", "6645"),
+            ("calll *%ecx", "ffd1", "66ffd1"),
+            ("callw *%cx", "66ffd1", "ffd1"),
+            ("jmpl *%ecx", "ffe1", "66ffe1"),
+            ("jmpw *%cx", "66ffe1", "ffe1"),
+            ("call *%cx", "66ffd1", "ffd1"),
+            ("bsfw (%ebp), %cx", "660fbc4d00", "670fbc4d00"),
+            ("testl %ecx, %ecx", "85c9", "6685c9"),
+            (
+                "cmpxchgl %ecx, 0x12(%ebx,%esi,4)",
+                "0fb14cb312",
+                "67660fb14cb312",
+            ),
+            ("xaddb %cl, (%edx)", "0fc00a", "670fc00a"),
+            ("popcntw %cx, %dx", "66f30fb8d1", "f30fb8d1"),
+            ("crc32w %cx, %ecx", "66f20f38f1c9", "f20f38f1c9"),
+            ("cmova %cx, %dx", "660f47d1", "0f47d1"),
+            ("cmova %ecx, %edx", "0f47d1", "660f47d1"),
+            ("cmova (%bx), %edx", "670f4717", "660f4717"),
+        ] {
+            assert_eq!(enc(statement, false).as_deref(), Ok(in_32), "{statement}");
+            assert_eq!(
+                enc(statement, true).as_deref(),
+                Ok(in_16),
+                "{statement} in 16-bit code"
+            );
+        }
+        // `data16` sets the size of a statement whose registers have the
+        // other one.
+        assert_eq!(
+            enc("data16 addl %eax, %ebx", false).as_deref(),
+            Ok("6601c3")
+        );
+        assert_eq!(enc("data16 pushl %eax", false).as_deref(), Ok("6650"));
+        assert_eq!(enc("data16 call *%eax", false).as_deref(), Ok("66ffd0"));
+    }
+
+    /// A direct jump has no sized spelling (`jmpl label` was assembled,
+    /// and in 16-bit code to `66 e9` and a 32-bit displacement); a direct
+    /// call has both.
+    #[test]
+    fn a_direct_jump_has_no_sized_spelling() {
+        for code16 in [false, true] {
+            for statement in ["jmpl sym", "jmpw sym", "jmpl 1f\n1:"] {
+                assert!(
+                    enc(statement, code16).is_err(),
+                    "`{statement}` was assembled (16-bit code: {code16})"
+                );
+            }
+        }
+        assert_eq!(enc("jmp sym", false).as_deref(), Ok("e900000000"));
+        assert_eq!(enc("jmp sym", true).as_deref(), Ok("e90000"));
+        assert_eq!(enc("calll sym", false).as_deref(), Ok("e800000000"));
+        assert_eq!(enc("calll sym", true).as_deref(), Ok("66e800000000"));
+        assert_eq!(enc("callw sym", false).as_deref(), Ok("66e80000"));
+        assert_eq!(enc("callw sym", true).as_deref(), Ok("e80000"));
+        assert_eq!(enc("jmpl *sym", false).as_deref(), Ok("ff2500000000"));
+        assert_eq!(enc("jmpl *sym", true).as_deref(), Ok("66ff260000"));
+    }
+
+    /// A 16-bit offset has to be one, and so has the selector beside a
+    /// 32-bit offset; beside a 16-bit offset GNU as cuts the selector.
+    #[test]
+    fn a_far_branch_s_numbers_fit_their_fields() {
+        for statement in [
+            "ljmpw $0x1234, $0x10000",
+            "ljmpw $0x1234, $0x12345678",
+            "ljmpw $0x1234, $-0x8001",
+            "ljmpw $0x1234, $0xffff7fff",
+            "lcallw $0x1234, $0x10000",
+            "jmpw $0x1234, $0x12345678",
+            "callw $0x1234, $0x12345678",
+            "ljmpl $0x10000, $0",
+            "ljmpl $-0x8001, $0",
+            "ljmpl $0xffff7fff, $0",
+            "lcalll $0x10000, $0",
+        ] {
+            for code16 in [false, true] {
+                assert!(
+                    enc(statement, code16).is_err(),
+                    "`{statement}` was assembled (16-bit code: {code16})"
+                );
+            }
+        }
+        // The size without a suffix is the code's.
+        assert!(enc("ljmp $0x10000, $0", false).is_err());
+        assert!(enc("lcall $0x10000, $0", false).is_err());
+        assert!(enc("ljmp $0x1234, $0x10000", true).is_err());
+        assert_eq!(enc("ljmp $0x10000, $0", true).as_deref(), Ok("ea00000000"));
+        for (statement, in_32, in_16) in [
+            ("ljmpw $0x1234, $0xffff", "66eaffff3412", "eaffff3412"),
+            ("ljmpw $0x1234, $-0x8000", "66ea00803412", "ea00803412"),
+            ("ljmpw $0x1234, $0xffff8000", "66ea00803412", "ea00803412"),
+            ("ljmpw $0x10000, $0", "66ea00000000", "ea00000000"),
+            ("ljmpw $-0x8001, $0", "66ea0000ff7f", "ea0000ff7f"),
+            ("ljmpl $0xffff, $0", "ea00000000ffff", "66ea00000000ffff"),
+            ("ljmpl $-0x8000, $0", "ea000000000080", "66ea000000000080"),
+            (
+                "ljmpl $0xffffffff, $0",
+                "ea00000000ffff",
+                "66ea00000000ffff",
+            ),
+            (
+                "ljmpl $0x1234, $0x100000000",
+                "ea000000003412",
+                "66ea000000003412",
+            ),
+            (
+                "ljmpl $0x1234, $-0x80000001",
+                "eaffffff7f3412",
+                "66eaffffff7f3412",
+            ),
+            ("lcallw $0x10000, $0", "669a00000000", "9a00000000"),
+        ] {
+            assert_eq!(enc(statement, false).as_deref(), Ok(in_32), "{statement}");
+            assert_eq!(
+                enc(statement, true).as_deref(),
+                Ok(in_16),
+                "{statement} in 16-bit code"
+            );
+        }
+    }
+
+    /// What `lods` and `outs` read is written through a register.
+    #[test]
+    fn an_implied_address_names_a_register() {
+        for statement in [
+            "lodsb 0x1000",
+            "lodsl 0x1000",
+            "lodsw 0x1000, %ax",
+            "outsb 0x1000, (%dx)",
+            "outsw 0x1000, %dx",
+        ] {
+            for code16 in [false, true] {
+                assert!(
+                    enc(statement, code16).is_err(),
+                    "`{statement}` was assembled (16-bit code: {code16})"
+                );
+            }
+        }
+        assert_eq!(enc("lodsb (%esi)", false).as_deref(), Ok("ac"));
+        assert_eq!(enc("lodsb (%esi,%eax)", false).as_deref(), Ok("ac"));
+        assert_eq!(enc("outsb (%esi), %dx", false).as_deref(), Ok("6e"));
+        assert_eq!(
+            enc("outsb 0x1234(,%edi,2), %dx", false).as_deref(),
+            Ok("6e")
+        );
+        assert_eq!(enc("outsb 4(%eax), (%dx)", false).as_deref(), Ok("6e"));
+        assert_eq!(enc("outsb %es:(%esi), %dx", false).as_deref(), Ok("266e"));
+        assert_eq!(enc("insb (%dx), 4(%edi,%eax)", false).as_deref(), Ok("6c"));
+        // `(%dx)` is the port while no index register has been named,
+        // and with nothing beside the register.
+        for statement in [
+            "outsb 0x1234(,%edi,2), (%dx)",
+            "outsb (%esi,%eax), (%dx)",
+            "outsb (%esi), 4(%dx)",
+            "outsb (%esi), %es:(%dx)",
+            "insb 4(%dx), (%edi)",
+            "insb %es:(%dx), (%edi)",
+        ] {
+            assert!(
+                enc(statement, false).is_err(),
+                "`{statement}` was assembled"
+            );
+        }
+    }
+}
+
+/// Prefix words in 32-bit code. The bytes are GNU as 2.47's (`as --32`).
+#[cfg(test)]
+mod prefix_word_tests {
+    use super::*;
+
+    fn assemble(line: &str) -> Result<String, String> {
+        let mut encoder = InstructionEncoder::new();
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(instruction) = item {
+                encoder.encode(&instruction)?;
+            }
+        }
+        Ok(encoder
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    fn hex(line: &str) -> String {
+        assemble(line).unwrap_or_else(|error| panic!("`{line}`: {error}"))
+    }
+
+    fn fail_msg(line: &str) -> String {
+        match assemble(line) {
+            Ok(bytes) => panic!("`{line}` was assembled: {bytes}"),
+            Err(error) => error,
+        }
+    }
+
+    /// A segment word is its byte in front of any instruction, first of
+    /// the prefixes (behind the FWAIT of an x87 instruction), and
+    /// `notrack` is `ds`'s in front of an indirect near branch. One
+    /// prefix with an operand that names the same segment or its default
+    /// one. Every one of these was "unknown prefix".
+    #[test]
+    fn segment_words_and_notrack() {
+        for (line, bytes) in [
+            ("cs nop", "2e 90"),
+            ("ds nop", "3e 90"),
+            ("es nop", "26 90"),
+            ("ss nop", "36 90"),
+            ("fs nop", "64 90"),
+            ("gs nop", "65 90"),
+            ("cs mov %eax, (%ebx)", "2e 89 03"),
+            ("cs mov %eax, %ds:(%ebx)", "2e 89 03"),
+            ("cs mov %eax, %ss:(%ebp)", "2e 89 45 00"),
+            ("ss mov %eax, (%ebp)", "36 89 45 00"),
+            ("ds mov %eax, (%ebx)", "3e 89 03"),
+            ("ss mov %eax, %ss:(%ebx)", "36 89 03"),
+            ("cs mov %eax, %cs:(%ebx)", "2e 89 03"),
+            ("fs mov %eax, %fs:(%ebx)", "64 89 03"),
+            ("es movsb", "26 a4"),
+            ("cs rep movsb", "2e f3 a4"),
+            ("rep cs movsb", "2e f3 a4"),
+            ("fs movsb %ds:(%esi), %es:(%edi)", "64 a4"),
+            ("fs movsb %fs:(%esi), %es:(%edi)", "64 a4"),
+            ("es stosb", "26 aa"),
+            ("cs lodsb", "2e ac"),
+            ("cs scasb", "2e ae"),
+            ("es cmpsb", "26 a6"),
+            ("cs xlat", "2e d7"),
+            ("lock cs addl $1, (%eax)", "2e f0 83 00 01"),
+            ("cs lock addl $1, (%eax)", "2e f0 83 00 01"),
+            ("xacquire lock cs addl $1, (%eax)", "2e f2 f0 83 00 01"),
+            ("cs data16 nop", "2e 66 90"),
+            ("data16 cs nop", "2e 66 90"),
+            ("cs addr16 nop", "2e 67 90"),
+            ("addr16 cs mov %eax, (%bx)", "2e 67 89 07"),
+            (
+                "cs addr16 data16 lock addl $1, (%bx)",
+                "2e 67 66 f0 83 07 01",
+            ),
+            ("cs fwait", "2e 9b"),
+            ("cs fstcw (%eax)", "9b 2e d9 38"),
+            ("cs fnstcw (%eax)", "2e d9 38"),
+            ("cs fsave (%eax)", "9b 2e dd 30"),
+            ("cs vaddps (%eax), %xmm1, %xmm2", "2e c5 f0 58 10"),
+            (
+                "cs {evex} vaddps (%eax), %xmm1, %xmm2",
+                "2e 62 f1 74 08 58 10",
+            ),
+            ("cs movaps (%eax), %xmm1", "2e 0f 28 08"),
+            ("cs ret", "2e c3"),
+            ("cs push %eax", "2e 50"),
+            ("cs jmp *%eax", "2e ff e0"),
+            ("cs jmp *(%eax)", "2e ff 20"),
+            ("cs ljmp *(%eax)", "2e ff 28"),
+            ("cs lgdt (%eax)", "2e 0f 01 10"),
+            ("cs pushl (%eax)", "2e ff 30"),
+            ("notrack jmp *%eax", "3e ff e0"),
+            ("notrack call *%eax", "3e ff d0"),
+            ("notrack jmp *(%eax)", "3e ff 20"),
+            ("notrack call *(%eax)", "3e ff 10"),
+            ("notrack jmp *%ds:(%eax)", "3e ff 20"),
+            ("notrack jmpl *%eax", "3e ff e0"),
+            ("notrack jmpw *%ax", "3e 66 ff e0"),
+            ("notrack calll *%eax", "3e ff d0"),
+            ("notrack callw *%ax", "3e 66 ff d0"),
+            ("gs mov %eax, 0x1234", "65 a3 34 12 00 00"),
+            ("gs mov 0x1234, %eax", "65 a1 34 12 00 00"),
+            ("es in $5, %al", "26 e4 05"),
+            ("es out %al, $5", "26 e6 05"),
+            ("es int $3", "26 cc"),
+            ("es leave", "26 c9"),
+            ("es pushf", "26 9c"),
+            ("cs cpuid", "2e 0f a2"),
+            ("cs syscall", "2e 0f 05"),
+            ("cs mov %cr0, %eax", "2e 0f 20 c0"),
+            ("cs bswap %eax", "2e 0f c8"),
+            ("cs lea (%eax), %ebx", "2e 8d 18"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+    }
+
+    /// One segment prefix to an instruction, and `notrack` in front of
+    /// nothing but an indirect near branch.
+    #[test]
+    fn what_segment_words_do_not_stand_in_front_of() {
+        for line in [
+            "cs cs nop",
+            "cs ds nop",
+            "cs mov %eax, %fs:(%ebx)",
+            "cs movsb %fs:(%esi), %es:(%edi)",
+            "notrack jmp *%fs:(%eax)",
+            "ds notrack jmp *%eax",
+            "notrack ds jmp *%eax",
+            "notrack cs jmp *%eax",
+        ] {
+            assert_eq!(fail_msg(line), "same type of prefix used twice", "{line}");
+        }
+        for line in [
+            "notrack nop",
+            "notrack ret",
+            "notrack jmp foo",
+            "notrack ljmp *(%eax)",
+            "notrack lcall *(%eax)",
+        ] {
+            assert_eq!(
+                fail_msg(line),
+                "expecting indirect branch instruction after `notrack'",
+                "{line}"
+            );
+        }
+    }
+
+    /// A prefix word that is the whole statement is its byte: the size
+    /// words whichever size they name. The REX words are 64-bit code's.
+    #[test]
+    fn a_prefix_word_alone_is_its_byte() {
+        for (line, bytes) in [
+            ("lock", "f0"),
+            ("rep", "f3"),
+            ("repne", "f2"),
+            ("data16", "66"),
+            ("addr16", "67"),
+            ("data32", "66"),
+            ("addr32", "67"),
+            ("cs", "2e"),
+            ("ds", "3e"),
+            ("es", "26"),
+            ("ss", "36"),
+            ("fs", "64"),
+            ("gs", "65"),
+            ("notrack", "3e"),
+            ("xacquire", "f2"),
+            ("xrelease", "f3"),
+            ("repz", "f3"),
+            ("repe", "f3"),
+            ("repnz", "f2"),
+            ("wait", "9b"),
+            ("fwait", "9b"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+        for word in ["rex", "rex64", "rex.w", "rexz"] {
+            assert_eq!(
+                fail_msg(word),
+                format!("`{word}' is only supported in 64-bit mode")
+            );
+            assert_eq!(
+                fail_msg(&format!("{word} nop")),
+                format!("`{word}' is only supported in 64-bit mode")
+            );
+        }
+    }
+
+    /// Requests and prefix words in either order.
+    #[test]
+    fn a_prefix_word_behind_a_request() {
+        for (line, bytes) in [
+            ("{nooptimize} lock addl $1, (%eax)", "f0 83 00 01"),
+            (
+                "{evex} cs vaddps (%eax), %xmm1, %xmm2",
+                "2e 62 f1 74 08 58 10",
+            ),
+            (
+                "cs {evex} vaddps (%eax), %xmm1, %xmm2",
+                "2e 62 f1 74 08 58 10",
+            ),
+            ("{vex3} es vaddps (%eax), %xmm1, %xmm2", "26 c4 e1 70 58 10"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+    }
+}
+
+/// Prefix words in 16-bit code (`.code16`). The bytes are GNU as 2.47's.
+#[cfg(test)]
+mod prefix_word_tests_code16 {
+    use super::*;
+
+    fn assemble(line: &str) -> Result<String, String> {
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(instruction) = item {
+                encoder.encode(&instruction)?;
+            }
+        }
+        Ok(encoder
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    fn hex(line: &str) -> String {
+        assemble(line).unwrap_or_else(|error| panic!("`{line}`: {error}"))
+    }
+
+    fn fail_msg(line: &str) -> String {
+        match assemble(line) {
+            Ok(bytes) => panic!("`{line}` was assembled: {bytes}"),
+            Err(error) => error,
+        }
+    }
+
+    /// Here `addr32` and `data32` are the 0x67 and the 0x66. `addr32` and
+    /// a 32-bit address share the one 0x67 (`addr32 movw %ax, (%ebx)` is
+    /// 67 89 03), `addr32` sizes the absolute address of a bare number,
+    /// and what a far branch or return takes behind `data32` is 32 bits
+    /// wide. Both words were read as the 16-bit ones of 32-bit code, and
+    /// every one of these was refused.
+    #[test]
+    fn the_size_words_of_16_bit_code() {
+        for (line, bytes) in [
+            ("addr32 nop", "67 90"),
+            ("data32 nop", "66 90"),
+            ("data32 addw %ax, %bx", "66 01 c3"),
+            ("addr32 movw %ax, 0x1234", "67 a3 34 12 00 00"),
+            ("addr32 movw %ax, (%ebx)", "67 89 03"),
+            ("data32 ret", "66 c3"),
+            ("data32 lret", "66 cb"),
+            ("data32 push %ax", "66 50"),
+            ("data32 pushw %ax", "66 50"),
+            ("addr32 rep movsb", "67 f3 a4"),
+            ("addr32 stosw", "67 ab"),
+            ("addr32 lodsb", "67 ac"),
+            ("data32 ljmp $0x10, $0x1234", "66 ea 34 12 00 00 10 00"),
+            ("data32 lcall $0x10, $0x1234", "66 9a 34 12 00 00 10 00"),
+            ("addr32 lgdtl 0x1234", "67 66 0f 01 15 34 12 00 00"),
+            ("data32 lidt 0x1234", "66 0f 01 1e 34 12"),
+            ("addr32 xlat", "67 d7"),
+            ("data32 iret", "66 cf"),
+            ("data32 pushf", "66 9c"),
+            ("data32 popf", "66 9d"),
+            ("data32 pusha", "66 60"),
+            ("data32 leave", "66 c9"),
+            ("data32 cbw", "66 98"),
+            ("data32 cwd", "66 99"),
+            ("addr32 mov 0x12345678, %al", "67 a0 78 56 34 12"),
+            ("addr32 mov %eax, 0x12345678", "67 66 a3 78 56 34 12"),
+            ("addr32 jmp *0x1234", "67 ff 25 34 12 00 00"),
+            ("data32 movw $0x1234, %ax", "66 b8 34 12"),
+            ("data32 fstcw (%bx)", "9b 66 d9 3f"),
+            ("data32 fwait", "66 9b"),
+            ("data32 fsave (%bx)", "9b 66 dd 37"),
+            ("data32 fnsave (%bx)", "66 dd 37"),
+            ("addr32 fstcw (%ebx)", "9b 67 d9 3b"),
+            ("addr32 fwait", "67 9b"),
+            ("addr32 monitor %ax, %ecx, %edx", "67 0f 01 c8"),
+            ("addr32 umonitor %ax", "67 f3 0f ae f0"),
+            ("data32 lea (%bx), %ax", "66 8d 07"),
+            ("addr32 lea 0x1234, %ax", "67 8d 05 34 12 00 00"),
+            ("addr32 lea (%ebx), %ax", "67 8d 03"),
+            ("data32 in $5, %ax", "66 e5 05"),
+            ("data32 movsw", "66 a5"),
+            ("data32 rep movsw", "66 f3 a5"),
+            ("data32 enter $8, $0", "66 c8 08 00 00"),
+            ("data32 lock addw %ax, (%bx)", "66 f0 01 07"),
+            ("lock data32 addw %ax, (%bx)", "66 f0 01 07"),
+            ("data32 addr32 addw %ax, (%ebx)", "67 66 01 03"),
+            ("addr32 data32 addw %ax, 0x1234", "67 66 01 05 34 12 00 00"),
+            ("addr32 incw 0x1234", "67 ff 05 34 12 00 00"),
+            ("addr32 ljmp *0x1234", "67 ff 2d 34 12 00 00"),
+            ("data32 ljmp *0x1234", "66 ff 2e 34 12"),
+            ("data32 lgdt 0x1234", "66 0f 01 16 34 12"),
+            ("addr32 movw %ax, %es:0x1234", "26 67 a3 34 12 00 00"),
+            ("addr32 movw %ax, %fs:(%ebx)", "64 67 89 03"),
+            ("addr32 movw %ax, 4(%ebx,%esi,2)", "67 89 44 73 04"),
+            ("addr32 movw %ax, (,%esi,2)", "67 89 04 75 00 00 00 00"),
+            ("addr32 cmpsb", "67 a6"),
+            ("addr32 cmpsb (%edi), (%esi)", "67 a6"),
+            ("addr32 scasb", "67 ae"),
+            ("addr32 insb", "67 6c"),
+            ("addr32 outsw", "67 6f"),
+            ("addr32 movsl", "67 66 a5"),
+            ("data32 push $5", "66 6a 05"),
+            ("data32 pushw $5", "66 6a 05"),
+            ("data32 pop %ax", "66 58"),
+            ("data32 popw %ax", "66 58"),
+            ("data32 inc %ax", "66 40"),
+            ("data32 int $0x10", "66 cd 10"),
+            ("data32 hlt", "66 f4"),
+            ("data32 mov %ax, %ds", "66 8e d8"),
+            ("data32 mov %ds, %ax", "66 8c d8"),
+            ("data32 movzbw %al, %ax", "66 0f b6 c0"),
+            ("data32 test $0x1234, %ax", "66 a9 34 12"),
+            ("data32 imul $5, %ax, %bx", "66 6b d8 05"),
+            ("data32 xchg %ax, %bx", "66 93"),
+            ("data32 cmpxchg %ax, (%bx)", "66 0f b1 07"),
+            ("data32 ljmpw $0x10, $0x1234", "66 ea 34 12 00 00 10 00"),
+            ("data32 lcallw $0x10, $0x1234", "66 9a 34 12 00 00 10 00"),
+            ("data32 jmp *%ax", "66 ff e0"),
+            ("data32 jmp *(%bx)", "66 ff 27"),
+            ("data32 call *%ax", "66 ff d0"),
+            ("data32 retw", "66 c3"),
+            ("data32 lretw", "66 cb"),
+            ("data32 iretw", "66 cf"),
+            ("addr32 vmovss 0x1234, %xmm0", "67 c5 fa 10 05 34 12 00 00"),
+            ("addr32 stosb %al, %es:(%edi)", "67 aa"),
+            ("data32 rep stosw", "66 f3 ab"),
+            ("data32 repe cmpsw", "66 f3 a7"),
+            ("addr32 data32 rep movsw", "67 66 f3 a5"),
+            ("data32 addr32 lock xchg %ax, (%ebx)", "67 66 f0 87 03"),
+            ("data32 xlat", "66 d7"),
+            ("addr32 pushf", "67 9c"),
+            ("addr32 ret", "67 c3"),
+            ("data32 mov $0x1234, %ax", "66 b8 34 12"),
+            ("addr32 mov $0x1234, %ax", "67 b8 34 12"),
+            ("data32 cli", "66 fa"),
+            ("addr32 int3", "67 cc"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
+    }
+
+    /// The words that name the code's own size are "redundant", a prefix
+    /// an instruction has for itself is not written twice, and `addr32`
+    /// takes no 16-bit base.
+    #[test]
+    fn what_the_size_words_do_not_stand_in_front_of() {
+        for (line, message) in [
+            ("addr16 nop", "redundant addr16 prefix"),
+            ("data16 nop", "redundant data16 prefix"),
+            ("data16 addw %ax, %bx", "redundant data16 prefix"),
+            ("addr16 movw %ax, (%bx)", "redundant addr16 prefix"),
+            ("addr32 addr32 nop", "same type of prefix used twice"),
+            ("data32 data32 nop", "same type of prefix used twice"),
+            ("addr32 jecxz foo", "same type of prefix used twice"),
+            (
+                "addr32 monitor %eax, %ecx, %edx",
+                "same type of prefix used twice",
+            ),
+            ("addr32 umonitor %eax", "same type of prefix used twice"),
+            (
+                "addr32 movw %ax, (%bx)",
+                "`(%bx)' is not a valid base/index expression",
+            ),
+            (
+                "addr32 movw %ax, (%bx,%si)",
+                "`(%bx)' is not a valid base/index expression",
+            ),
+        ] {
+            assert_eq!(fail_msg(line), message, "{line}");
+        }
+    }
+
+    /// Segment words, `notrack` and the prefix words that are a
+    /// statement, as in 32-bit code.
+    #[test]
+    fn segment_words_and_lone_prefix_words() {
+        for (line, bytes) in [
+            ("cs nop", "2e 90"),
+            ("ds nop", "3e 90"),
+            ("es nop", "26 90"),
+            ("ss nop", "36 90"),
+            ("fs nop", "64 90"),
+            ("gs nop", "65 90"),
+            ("cs mov %eax, (%ebx)", "2e 67 66 89 03"),
+            ("cs mov %eax, %ds:(%ebx)", "2e 67 66 89 03"),
+            ("cs mov %eax, %ss:(%ebp)", "2e 67 66 89 45 00"),
+            ("ss mov %eax, (%ebp)", "36 67 66 89 45 00"),
+            ("ds mov %eax, (%ebx)", "3e 67 66 89 03"),
+            ("ss mov %eax, %ss:(%ebx)", "36 67 66 89 03"),
+            ("cs mov %eax, %cs:(%ebx)", "2e 67 66 89 03"),
+            ("fs mov %eax, %fs:(%ebx)", "64 67 66 89 03"),
+            ("es movsb", "26 a4"),
+            ("cs rep movsb", "2e f3 a4"),
+            ("rep cs movsb", "2e f3 a4"),
+            ("fs movsb %ds:(%esi), %es:(%edi)", "64 67 a4"),
+            ("fs movsb %fs:(%esi), %es:(%edi)", "64 67 a4"),
+            ("es stosb", "26 aa"),
+            ("cs lodsb", "2e ac"),
+            ("cs scasb", "2e ae"),
+            ("es cmpsb", "26 a6"),
+            ("cs xlat", "2e d7"),
+            ("lock cs addl $1, (%eax)", "2e 67 66 f0 83 00 01"),
+            ("cs lock addl $1, (%eax)", "2e 67 66 f0 83 00 01"),
+            (
+                "xacquire lock cs addl $1, (%eax)",
+                "2e 67 66 f2 f0 83 00 01",
+            ),
+            ("cs fwait", "2e 9b"),
+            ("cs fstcw (%eax)", "9b 2e 67 d9 38"),
+            ("cs fnstcw (%eax)", "2e 67 d9 38"),
+            ("cs fsave (%eax)", "9b 2e 67 dd 30"),
+            ("cs vaddps (%eax), %xmm1, %xmm2", "2e 67 c5 f0 58 10"),
+            (
+                "cs {evex} vaddps (%eax), %xmm1, %xmm2",
+                "2e 67 62 f1 74 08 58 10",
+            ),
+            ("cs movaps (%eax), %xmm1", "2e 67 0f 28 08"),
+            ("cs ret", "2e c3"),
+            ("cs push %eax", "2e 66 50"),
+            ("cs jmp *%eax", "2e 66 ff e0"),
+            ("cs jmp *(%eax)", "2e 67 ff 20"),
+            ("cs ljmp *(%eax)", "2e 67 ff 28"),
+            ("cs lgdt (%eax)", "2e 67 0f 01 10"),
+            ("cs pushl (%eax)", "2e 67 66 ff 30"),
+            ("notrack jmp *%eax", "3e 66 ff e0"),
+            ("notrack call *%eax", "3e 66 ff d0"),
+            ("notrack jmp *(%eax)", "3e 67 ff 20"),
+            ("notrack call *(%eax)", "3e 67 ff 10"),
+            ("notrack jmp *%ds:(%eax)", "3e 67 ff 20"),
+            ("notrack jmpl *%eax", "3e 66 ff e0"),
+            ("notrack jmpw *%ax", "3e ff e0"),
+            ("notrack calll *%eax", "3e 66 ff d0"),
+            ("notrack callw *%ax", "3e ff d0"),
+            ("gs mov %eax, 0x1234", "65 66 a3 34 12"),
+            ("gs mov 0x1234, %eax", "65 66 a1 34 12"),
+            ("es in $5, %al", "26 e4 05"),
+            ("es out %al, $5", "26 e6 05"),
+            ("es int $3", "26 cc"),
+            ("es leave", "26 c9"),
+            ("es pushf", "26 9c"),
+            ("cs cpuid", "2e 0f a2"),
+            ("cs syscall", "2e 0f 05"),
+            ("cs mov %cr0, %eax", "2e 0f 20 c0"),
+            ("cs bswap %eax", "2e 66 0f c8"),
+            ("cs lea (%eax), %ebx", "2e 67 66 8d 18"),
+            ("lock", "f0"),
+            ("rep", "f3"),
+            ("repne", "f2"),
+            ("data16", "66"),
+            ("data32", "66"),
+            ("cs", "2e"),
+            ("ds", "3e"),
+            ("es", "26"),
+            ("ss", "36"),
+            ("fs", "64"),
+            ("gs", "65"),
+            ("notrack", "3e"),
+            ("xacquire", "f2"),
+            ("xrelease", "f3"),
+            ("repz", "f3"),
+            ("repe", "f3"),
+            ("repnz", "f2"),
+            ("wait", "9b"),
+            ("fwait", "9b"),
+        ] {
+            assert_eq!(hex(line), bytes, "{line}");
+        }
     }
 }

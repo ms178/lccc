@@ -79,7 +79,7 @@ note "rotated with CCC_NO_AFFINE_EXIT_FOLD=1: $folds_killed proof-based fold rep
 [[ $folds_killed -eq 0 ]] \
     || bad "CCC_NO_AFFINE_EXIT_FOLD left the rotation clone fold running ($folds_killed report(s))"
 # ... and rotation itself still ran, or the line above would be vacuous.
-grep -qF "[ROT] candidate:" "$work/rotkilled.dbg" \
+grep -qF "[ROT] SUCCESS: rotated" "$work/rotkilled.dbg" \
     || bad "rotation did not run under the fold kill switch (test would be vacuous)"
 
 # CCC_NO_AFFINE_EXIT_FOLD is the global owner switch: it must silence the
@@ -93,7 +93,7 @@ CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DISABLE_PASSES=loop_bound \
     || bad "both-owners-disabled -S build failed"
 all_killed=$(grep -cF '[AFFOLD]' "$work/bothkilled.dbg" || true)
 [[ $all_killed -eq 0 ]] || bad "an affine producer survived both disable controls"
-grep -qF '[ROT] candidate:' "$work/bothkilled.dbg" \
+grep -qF '[ROT] SUCCESS: rotated' "$work/bothkilled.dbg" \
     || bad "rotation did not run with both fold owners disabled"
 
 # ---------------------------------------------------------------- contract 3
@@ -109,8 +109,12 @@ CCC_DISABLE_PASSES=vectorize "$CCC" -O2 -march=x86-64-v3 -S "$corpus" \
 rot_body=$(body "$work/rot3.s" f_const)
 norot_body=$(body "$work/norot3.s" f_const)
 
-grep -qE "cmpq \\\$2044, %rdx" <<< "$rot_body" \
-    || bad "rotated f_const: no folded compare (\`cmpq \$2044, %rdx\`)"
+# The folded compare is on the bare induction variable, whichever register
+# the allocator gave it: the contract is the bound and the fusion, not the
+# register's name.
+folded_cmp='cmpq \$2044, %r[a-z0-9]+$'
+grep -qE "$folded_cmp" <<< "$rot_body" \
+    || bad "rotated f_const: no folded compare (\`cmpq \$2044, %reg\`)"
 grep -qE "leaq 4\(" <<< "$rot_body" \
     && bad "rotated f_const: the offset materialisation (\`leaq 4(...)\`) is still there"
 grep -q "2048" <<< "$rot_body" \
@@ -121,7 +125,7 @@ grep -qE "^[[:space:]]+(set[a-z]+|test)[bwlq]?[[:space:]]" <<< "$rot_body" \
 # The folded compare must branch directly (fused jcc on the bare IV).  One
 # awk over the captured body, not a `grep | grep -q` pipeline: the
 # pipefail-sigpipe gate rejects pipelines whose consumer may exit early.
-awk '/cmpq \$2044, %rdx/ { getline nxt; if (nxt ~ /^[[:space:]]*j/) ok = 1 }\
+awk '/cmpq \$2044, %r[a-z0-9]+$/ { getline nxt; if (nxt ~ /^[[:space:]]*j/) ok = 1 }\
      END { exit ok ? 0 : 1 }' <<< "$rot_body" \
     || bad "rotated f_const: the folded compare does not feed a conditional jump"
 
@@ -132,8 +136,8 @@ grep -qE "leaq 4\(" <<< "$norot_body" \
     && bad "unrotated f_const: the offset materialisation (\`leaq 4(...)\`) survived — the default-on fold is not firing"
 grep -q "2048" <<< "$norot_body" \
     && bad "unrotated f_const: the unfolded bound (\$2048) is still compared"
-grep -qE "cmpq \\\$2044, %rdx" <<< "$norot_body" \
-    || bad "unrotated f_const: no folded compare (\`cmpq \$2044, %rdx\`)"
+grep -qE "$folded_cmp" <<< "$norot_body" \
+    || bad "unrotated f_const: no folded compare (\`cmpq \$2044, %reg\`)"
 
 # ---------------------------------------------------------------- contract 4
 # The default pipeline folds BEFORE the vectorizer, so the folded bound is

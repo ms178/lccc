@@ -737,11 +737,11 @@ _mm_storel_epi64(__m128i *__p, __m128i __a)
 
 /* Byte-level shift left (PSLLDQ): shift __a left by __N bytes, zero-fill */
 #define _mm_slli_si128(a, N) \
-    ((__m128i)(__builtin_ia32_pslldqi128((a), ((N) * 8))))
+    ((__m128i)(__builtin_ia32_pslldqi128((a), ((int)(N) * 8))))
 
 /* Byte-level shift right (PSRLDQ): shift __a right by __N bytes, zero-fill */
 #define _mm_srli_si128(a, N) \
-    ((__m128i)(__builtin_ia32_psrldqi128((a), ((N) * 8))))
+    ((__m128i)(__builtin_ia32_psrldqi128((a), ((int)(N) * 8))))
 
 /* Bit-level shift left on each 64-bit element (PSLLQ) */
 #define _mm_slli_epi64(a, count) \

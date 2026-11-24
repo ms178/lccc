@@ -184,14 +184,22 @@ void *__lccc_simd512_pd_vfmsubadd132pd512(long, __m512d, __m512d, __m512d);
 
 /* === Float Reduce === */
 
-/* _mm512_reduce_add_ps: horizontal sum of all 16 float elements */
+/* _mm512_reduce_add_ps: the sum of the 16 floats, added in halves.
+ *
+ * The order is part of the result, since floating-point addition rounds:
+ * Intel defines REDUCE_ADD as "add the upper half to the lower half, then
+ * reduce the half", and GCC 16.2 computes exactly that. A running sum from
+ * element 0 (what this was) rounds fifteen times along another path and
+ * returns another float. */
 static __inline__ float __attribute__((__always_inline__))
 _mm512_reduce_add_ps(__m512 __a)
 {
-    float __sum = 0.0f;
-    for (int __i = 0; __i < 16; __i++)
-        __sum += __a[__i];
-    return __sum;
+    float __h8[8], __h4[4];
+    for (int __i = 0; __i < 8; __i++)
+        __h8[__i] = __a[__i + 8] + __a[__i];
+    for (int __i = 0; __i < 4; __i++)
+        __h4[__i] = __h8[__i + 4] + __h8[__i];
+    return (__h4[0] + __h4[2]) + (__h4[1] + __h4[3]);
 }
 
 /* === Integer Arithmetic (32-bit) === */
@@ -416,13 +424,6 @@ _mm_mask_shuffle_epi8(__m128i __src, __mmask16 __k, __m128i __a, __m128i __b)
 }
 
 /* === Additional AVX-512BW completeness === */
-/* xgetbv */
-static __inline__ unsigned long long __attribute__((__always_inline__))
-_xgetbv(unsigned int __imm)
-{
-    (void)__imm; return 0;
-}
-
 
 /* _MM_CMPINT_* predicates for _mm_cmp_epi* _mask */
 #define _MM_CMPINT_EQ    0

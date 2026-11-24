@@ -1,21 +1,22 @@
 /*
  * Loop-rotation correctness under register pressure.
  *
- * The `.env` sidecar sets BOTH `CCC_LOOP_ROTATE=1` and
- * `CCC_LOOP_ROTATE_IGNORE_PRESSURE=1`, i.e. the strictest configuration: the
- * pass is on and its Guard G profitability gate is disabled, so the
- * high-pressure loop below really is rotated. That is the configuration worth
- * pinning -- when Guard G fires the loop is simply left alone, which the rest
- * of the suite already covers, whereas a forced rotation of a 32-live-out
- * loop exercises the exit-phi machinery Guard G exists to cost.
+ * The `.env` sidecar sets `CCC_LOOP_ROTATE=1` (RotatePolicy::Always), so the
+ * high-pressure loop below really is rotated. That is the configuration
+ * worth pinning: the default policy rotates a loop only when something then
+ * leaves it, nothing leaves this one, and a loop that is left alone is what
+ * the rest of the suite already covers. A forced rotation of a 32-live-out
+ * loop exercises the merges behind the loop, one per value.
  *
- * Root cause this guards (measured, x86-64 -O2): rotation makes the loop exit
- * reachable from two edges, so every loop-carried value live out of the loop
- * needs an exit phi merging its init with the body's last definition. With 32
- * such values on a 16-register target the allocator spilled inside the hot
- * loop (22 -> 47 stack moves) and the benchmark lost 24.9%. The transform was
- * never wrong, only unprofitable -- so this test pins the *semantics* and
- * `check_loop_rotate_pressure.sh` pins the *decision*.
+ * What this shape cost when rotation was tried as a blanket default
+ * (measured, x86-64 -O2): rotation makes the loop exit reachable from two
+ * edges, so every loop-carried value live out of the loop needs a merge of
+ * its initial value with the body's last definition. With 32 such values on
+ * a 16-register target the allocator spilled inside the hot loop (22 -> 47
+ * stack moves) and the benchmark lost 24.9%. The transformation was never
+ * wrong, only unprofitable -- so this test pins the *semantics* and
+ * `check_loop_rotate_profit.sh` pins the *decision* (this loop is left
+ * exactly as the pipeline without rotation compiles it).
  *
  * The reference is the same recurrence written as an in-place array sweep, so
  * it shares no code shape with the code under test. Note the updates are
@@ -42,7 +43,7 @@ static int reference(int n)
     return x;
 }
 
-/* 32 loop-carried values, all 32 live out: the shape Guard G costs. */
+/* 32 loop-carried values, all 32 live out: one merge behind the loop each. */
 static int many_live_out(int n)
 {
     int a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8;
@@ -89,8 +90,8 @@ static int reference_small(int n)
 }
 
 /* Live-out through a terminator: the IV escapes via the exit CondBranch and
- * is then returned, so the exit phi's incoming comes from a branch operand.
- * Guard G counts terminator operands for exactly this reason. */
+ * is then returned, so the merge behind the loop reads a value whose only
+ * other reader is a branch. */
 static int live_out_via_terminator(int n)
 {
     int i = 0;

@@ -1123,7 +1123,9 @@
       "generic_helpers": [],
       "header": "xmmintrin.h",
       "name": "_mm_prefetch",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_prefetch"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -5915,7 +5917,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "smmintrin.h",
@@ -8413,7 +8415,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "avx2intrin.h",
@@ -8428,7 +8430,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "avx2intrin.h",
@@ -8443,7 +8445,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "avx2intrin.h",
@@ -8522,7 +8524,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "avx2intrin.h",
@@ -8537,7 +8539,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "avx2intrin.h",
@@ -8552,7 +8554,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "avx2intrin.h",
@@ -10290,7 +10292,7 @@
       "canonical_override": true,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [],
       "header": "wmmintrin.h",
@@ -15121,7 +15123,7 @@
         "function"
       ],
       "generic_helpers": [
-        "__lccc_simd512_i_vreduce_add_epu32_512"
+        "__lccc_simd512_i_vreduce_add_epu64_512"
       ],
       "header": "lcccsimd.h",
       "name": "_mm512_reduce_add_epi64",
@@ -15155,7 +15157,7 @@
         "function"
       ],
       "generic_helpers": [
-        "__lccc_simd512_i_vreduce_add_epu32_512"
+        "__lccc_simd512_i_vreduce_add_epu64_512"
       ],
       "header": "lcccsimd.h",
       "name": "_mm512_reduce_add_epu64",

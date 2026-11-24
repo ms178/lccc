@@ -180,6 +180,7 @@ impl Parser {
         let spec_restrict = self.attrs.parsing_restrict();
         let typedef_use = self.attrs.parsing_typedef_use();
         let typedef_object_volatile = self.attrs.parsing_typedef_object_volatile();
+        let typedef_object_atomic = self.attrs.parsing_typedef_object_atomic();
         // `_Atomic` in the specifiers, and `restrict`/`_Atomic` after the
         // most recent `*`, by the same rule.
         let spec_atomic = self.attrs.parsing_atomic();
@@ -356,11 +357,21 @@ impl Parser {
                 .all(|d| matches!(d, DerivedDeclarator::Array(_)));
         self.attrs.declarator_base_volatile = spec_volatile || typedef_element_volatile;
         self.attrs.declarator_base_restrict = spec_restrict;
+        // The element qualifier a typedef'd atomic pointer brings to an array
+        // of them (`typedef int *_Atomic AP; AP slots[8];`) is as little a
+        // written `volatile` as the specifiers' own `_Atomic`.
+        self.attrs.declarator_base_atomic =
+            spec_atomic || (typedef_element_volatile && typedef_object_atomic);
         // Locals and globals read the declaration-wide flag (see
         // `d.set_volatile(attrs.parsing_volatile())` in declarations.rs), so the
         // element qualifier must also be carried there.
         if typedef_element_volatile {
             self.attrs.set_volatile(true);
+            // ... and with it, where it came from: the declarators behind
+            // this one read both flags as their specifiers'.
+            if typedef_object_atomic {
+                self.attrs.set_atomic(true);
+            }
         }
         self.attrs.declarator_object_volatile = match combined.last() {
             // A typedef name's object qualifier is the typedef's own; the base
@@ -458,8 +469,11 @@ impl Parser {
             // the space and the CVR run written after it. A middle level's
             // `const` (`int *const *p`) is invisible in `CType`, so it has to
             // ride on the declarator or the read-only check cannot see it.
+            // The qualifiers the star wrote: an `_Atomic` there set
+            // `volatile` for the way the pointer is accessed, and is not one
+            // (see `DeclAttributes::base_atomic`).
             let star_cvr = u8::from(self.attrs.parsing_pointer_const())
-                | (u8::from(star_volatile) << 1)
+                | (u8::from(star_volatile && !last_star_atomic) << 1)
                 | (u8::from(last_star_restrict) << 2);
             // The last star's is also the declared object's space.
             derived.push(DerivedDeclarator::Pointer(star_space, star_cvr));
@@ -898,8 +912,10 @@ impl Parser {
         // after its declarator (`volatile int f(int a)`), so a parameter's
         // own specifiers must not leave it behind.
         let decl_volatile = self.attrs.parsing_volatile();
+        let decl_atomic = self.attrs.parsing_atomic();
         let decl_typedef_use = self.attrs.parsing_typedef_use();
         let decl_typedef_object = self.attrs.parsing_typedef_object_volatile();
+        let decl_typedef_object_atomic = self.attrs.parsing_typedef_object_atomic();
         let decl_storage = self.attrs.take_storage_classes();
         // A pending vector_size/ext_vector_type from the ENCLOSING
         // declaration is the FUNCTION RETURN TYPE's attribute:
@@ -922,8 +938,11 @@ impl Parser {
         self.attrs.parsed_alignas = decl_alignas;
         self.attrs.parsed_alignas_type = decl_alignas_type;
         self.attrs.set_volatile(decl_volatile);
+        self.attrs.set_atomic(decl_atomic);
         self.attrs.set_typedef_use(decl_typedef_use);
         self.attrs.set_typedef_object_volatile(decl_typedef_object);
+        self.attrs
+            .set_typedef_object_atomic(decl_typedef_object_atomic);
         self.attrs.restore_storage_classes(decl_storage);
         self.attrs.parsing_vector_size = decl_vector_size;
         self.attrs.parsing_vector_size_expr = decl_vector_size_expr;
@@ -1004,8 +1023,9 @@ impl Parser {
             self.attrs.set_restrict(false);
             // Each parameter's volatile and typedef qualifiers are its own
             // (`VI p, int y`: `y` is not volatile), so clear them before its
-            // specifiers are parsed.
+            // specifiers are parsed. Likewise `_Atomic`.
             self.attrs.set_volatile(false);
+            self.attrs.set_atomic(false);
             self.attrs.set_typedef_use(false);
             self.attrs.set_typedef_object_volatile(false);
             self.attrs.set_noreturn(saved_noreturn);
@@ -1031,6 +1051,7 @@ impl Parser {
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
                 let param_is_const = self.attrs.parsing_const();
                 let param_is_volatile = self.attrs.parsing_volatile();
+                let param_is_atomic = self.attrs.parsing_atomic();
                 let param_base_restrict = self.attrs.parsing_restrict();
                 let (
                     name,
@@ -1195,6 +1216,7 @@ impl Parser {
                         .unwrap_or_default(),
                     is_const: param_is_const,
                     is_volatile: param_is_volatile,
+                    is_atomic: param_is_atomic,
                     is_restrict: param_is_restrict,
                     vla_size_exprs,
                     decayed_array: !array_dims.is_empty(),
@@ -1307,16 +1329,23 @@ impl Parser {
         self.attrs.set_pointer_const(false);
         let outer_volatile = self.attrs.parsing_volatile();
         let outer_restrict = self.attrs.parsing_restrict();
+        // The specifiers' `_Atomic` is the pointee's, not this star's.
+        let outer_atomic = self.attrs.parsing_atomic();
         self.attrs.set_volatile(false);
         self.attrs.set_restrict(false);
+        self.attrs.set_atomic(false);
         self.skip_cv_qualifiers();
         let star_volatile = self.attrs.parsing_volatile();
         let star_restrict = self.attrs.parsing_restrict();
+        let star_atomic = self.attrs.parsing_atomic();
+        // As for a declarator's star (`parse_pointer_prefix`): an `_Atomic`
+        // set `volatile` for the access, and wrote none.
         let cvr = u8::from(self.attrs.parsing_pointer_const())
-            | (u8::from(star_volatile) << 1)
+            | (u8::from(star_volatile && !star_atomic) << 1)
             | (u8::from(star_restrict) << 2);
         self.attrs.set_volatile(outer_volatile || star_volatile);
         self.attrs.set_restrict(outer_restrict || star_restrict);
+        self.attrs.set_atomic(outer_atomic);
         (
             std::mem::replace(&mut self.attrs.parsing_address_space, base_space),
             cvr,
@@ -1340,6 +1369,7 @@ impl Parser {
                 fptr_calling_convention: crate::common::types::CallingConvention::Default,
                 is_const: false,
                 is_volatile: false,
+                is_atomic: false,
                 is_restrict: false,
                 vla_size_exprs: Vec::new(),
                 decayed_array: false,
@@ -2107,10 +2137,12 @@ impl Parser {
             }
             let saved_const = self.attrs.parsing_const();
             let saved_volatile = self.attrs.parsing_volatile();
+            let saved_atomic = self.attrs.parsing_atomic();
             let saved_space = self.attrs.parsing_address_space;
             let saved_pointer_const = self.attrs.parsing_pointer_const();
             self.attrs.set_const(false);
             self.attrs.set_volatile(false);
+            self.attrs.set_atomic(false);
             self.attrs.set_pointer_const(false);
             self.attrs.parsing_address_space = AddressSpace::Default;
 
@@ -2125,13 +2157,18 @@ impl Parser {
             // `pointer_const` (see its doc), not in the base-specifier
             // `const` flag: reading `parsing_const()` here silently dropped
             // every type-name `*const`, so `*(int *const *)p = 0` passed.
+            // An `_Atomic` after the star set `volatile` for the access and
+            // wrote none (see `parse_pointer_prefix`).
+            let star_written_volatile =
+                self.attrs.parsing_volatile() && !self.attrs.parsing_atomic();
             let star_cvr = u8::from(self.attrs.parsing_pointer_const())
-                | (u8::from(self.attrs.parsing_volatile()) << 1)
+                | (u8::from(star_written_volatile) << 1)
                 | restrict_bit;
             let star_space = self.attrs.parsing_address_space;
 
             self.attrs.set_const(saved_const);
             self.attrs.set_volatile(saved_volatile);
+            self.attrs.set_atomic(saved_atomic);
             self.attrs.set_pointer_const(saved_pointer_const);
             self.attrs.parsing_address_space = saved_space;
 

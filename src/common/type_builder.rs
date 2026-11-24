@@ -805,7 +805,7 @@ pub fn declarator_own_cvr(
 /// The qualifiers a parameter's specifiers wrote, as `PtrQuals` bits.
 fn written_param_cvr(param: &ParamDecl) -> u8 {
     u8::from(param.is_const) * PtrQuals::CONST
-        | u8::from(param.is_volatile) * PtrQuals::VOLATILE
+        | u8::from(param.volatile_written()) * PtrQuals::VOLATILE
         | u8::from(param.base_restrict) * PtrQuals::RESTRICT
 }
 

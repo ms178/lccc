@@ -28,47 +28,13 @@ impl X86Arch for I686Arch {
         encoder.offset = section_data_len;
         encoder.encode(instr)?;
 
-        let instr_len = encoder.bytes.len();
-
-        // Detect jump instructions for relaxation
-        let jump = {
-            // `.s`-tolerant matching (see the x86-64 writer): `jmp.s`
-            // relaxes exactly like `jmp`.
-            let mnem_lower = instr.mnemonic.to_ascii_lowercase();
-            let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-            let is_jump = mnem == "jmp"
-                || mnem.starts_with("loop")
-                || (mnem.starts_with('j') && mnem.len() >= 2);
-            if is_jump && instr.operands.len() == 1 {
-                if let Operand::Label(_) = &instr.operands[0] {
-                    let is_short_only = is_short_only_branch(mnem);
-                    let is_conditional = mnem != "jmp";
-                    if is_short_only && is_short_only_encoding(&encoder.bytes) {
-                        // Short-only jumps have no long form; register as already relaxed
-                        Some(JumpDetection {
-                            is_conditional: true,
-                            already_short: true,
-                            prefix66: false,
-                        })
-                    } else {
-                        let expected_len = if is_conditional { 6 } else { 5 };
-                        if instr_len == expected_len {
-                            Some(JumpDetection {
-                                is_conditional,
-                                already_short: false,
-                                prefix66: false,
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        // Detect jump instructions for relaxation. `data16 jmp` and
+        // `data16 jcc` are the 0x66 and a 16-bit offset: one byte shorter
+        // than the plain branch, and relaxed like it with the prefix in
+        // front (GAS 2.47: `data16 jmp 1f; 1:` = 66 eb 00, which came out
+        // as `66 e9 00 00`). Short-only jumps have no long form and
+        // register as already relaxed.
+        let jump = JumpDetection::of(instr, &encoder.bytes, false);
 
         let relocations = encoder
             .relocations
@@ -241,35 +207,8 @@ impl X86Arch for I686Arch {
         encoder.offset = 0;
         encoder.encode(instr)?;
 
-        let instr_len = encoder.bytes.len();
-
         // Detect jump instructions for relaxation (same logic as x86-64)
-        let jump = {
-            // `.s`-tolerant, case-insensitive matching: this path encodes
-            // with the x86-64 encoder, so `JMP`/`jmp.s` must relax like `jmp`.
-            let mnem_lower = instr.mnemonic.to_ascii_lowercase();
-            let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
-            if is_jump && instr.operands.len() == 1 {
-                if let Operand::Label(_) = &instr.operands[0] {
-                    let is_conditional = mnem != "jmp";
-                    let expected_len = if is_conditional { 6 } else { 5 };
-                    if instr_len == expected_len {
-                        Some(JumpDetection {
-                            is_conditional,
-                            already_short: false,
-                            prefix66: false,
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let jump = JumpDetection::of(instr, &encoder.bytes, true);
 
         // Convert x86-64 relocations. Since we're in a .code64 section of an
         // i686 object, we need to keep i686 relocation types (R_386_*) because
@@ -329,41 +268,12 @@ pub(crate) fn code16_encode_inner(
     encoder.code16gcc = gcc_mode;
     encoder.encode(instr)?;
 
-    let instr_len = encoder.bytes.len();
-    let jump = {
-        let mnem_lower = instr.mnemonic.to_ascii_lowercase();
-        let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
-        let is_jump = mnem.starts_with("loop") || (mnem.starts_with('j') && mnem.len() >= 2);
-        if is_jump && instr.operands.len() == 1 {
-            if let Operand::Label(_) = &instr.operands[0] {
-                let is_conditional = mnem != "jmp";
-                let is_short_only = is_short_only_branch(mnem);
-                // In 16-bit mode a near jump carries a 16-bit
-                // displacement, so the long forms are one byte shorter
-                // than in 32-bit mode.
-                let expected_len = if is_conditional { 4 } else { 3 };
-                if is_short_only && is_short_only_encoding(&encoder.bytes) {
-                    Some(JumpDetection {
-                        is_conditional,
-                        already_short: true,
-                        prefix66: false,
-                    })
-                } else if !is_short_only && instr_len == expected_len {
-                    Some(JumpDetection {
-                        is_conditional,
-                        already_short: false,
-                        prefix66: false,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
+    // In 16-bit mode a near jump carries a 16-bit displacement, so the
+    // long forms are one byte shorter than in 32-bit mode -- and under
+    // `data32` they are the 0x66 and a 32-bit offset, three bytes longer
+    // (GAS 2.47: `data32 jmp foo` = 66 e9 and four bytes, `data32 jne 1f;
+    // 1:` = 66 75 00).
+    let jump = JumpDetection::of(instr, &encoder.bytes, false);
 
     let relocations = encoder
         .relocations
@@ -387,6 +297,27 @@ pub(crate) fn code16_encode_inner(
 #[cfg(test)]
 mod tests {
     use super::super::assemble;
+
+    /// As the 64-bit assembler: GNU as's words and the statement, in 32-bit
+    /// code and behind `.code16`, where the message was `unhandled i686
+    /// instruction:` and the operands as Rust prints them.
+    #[test]
+    fn unknown_mnemonic_is_refused_with_the_statement() {
+        use super::super::assemble_bytes;
+        let refusal = |text: &str| assemble_bytes(text, None).unwrap_err();
+        assert_eq!(
+            refusal("\tnosuchinsn %eax\n"),
+            "no such instruction: `nosuchinsn %eax'"
+        );
+        assert_eq!(
+            refusal("\t.code16\n\tnosuchinsn $5, 8(%bx,%si)\n"),
+            "no such instruction: `nosuchinsn $5, 8(%bx,%si)'"
+        );
+        assert_eq!(
+            refusal("\tbt $256, %ecx\n"),
+            "operand type mismatch for `bt'"
+        );
+    }
 
     /// R_386_PC8 owns a 1-byte field: the REL-format addend patch must write
     /// exactly one byte, or the bytes after the field get clobbered. Linux

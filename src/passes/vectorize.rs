@@ -6611,7 +6611,9 @@ fn definition_site(func: &IrFunction, v: Value) -> Option<(usize, usize)> {
     None
 }
 
-/// The value ids that (transitively) feed the definition of `value`.
+/// The value ids that feed the definition of `value` from the loop on:
+/// transitively, but not through a value that exists before the loop is
+/// entered (`upstream` says so of the block that defines it).
 ///
 /// A read of the old accumulator may be redirected to `replacement` only when
 /// the reading instruction's own result is NOT on this chain; otherwise the
@@ -6620,7 +6622,23 @@ fn definition_site(func: &IrFunction, v: Value) -> Option<(usize, usize)> {
 /// re-reading `sum`, and the remainder path's seed `hadd(acc) -> 29` re-reading
 /// the phi the seed initialises (`41`), which left the vector loop without a
 /// single outside reader and let it be eliminated.
-fn producer_cone(func: &IrFunction, value: Value) -> FxHashSet<u32> {
+///
+/// The chain stops at what the loop starts from.  The replacement of a
+/// reduction is `start + reduced`, and where an enclosing loop carries the
+/// sum, `start` is that loop's phi, whose back-edge arm reads the inner
+/// accumulator: `for (i) for (j) s += a[i + j]`.  Followed through the
+/// phi, the chain made that arm (and anything between the loops, `s = s * 3
+/// + i`) a producer of the replacement, and the reader was left on the
+/// accumulator the transform had turned into a vector.  It is no producer:
+/// the phi's value is fixed before the inner loop runs, and what it will be
+/// next time around is the reader's business, which is exactly the read
+/// that has to be redirected.  Nothing a transform builds to reduce the
+/// accumulator is in front of the loop, so nothing is lost by stopping.
+fn producer_cone(
+    func: &IrFunction,
+    value: Value,
+    upstream: &dyn Fn(usize) -> bool,
+) -> FxHashSet<u32> {
     let mut def_of: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
@@ -6632,16 +6650,32 @@ fn producer_cone(func: &IrFunction, value: Value) -> FxHashSet<u32> {
     let mut cone: FxHashSet<u32> = FxHashSet::default();
     let mut work = vec![value.0];
     while let Some(v) = work.pop() {
+        let def = def_of.get(&v).copied();
+        if v != value.0 && def.is_some_and(|(bi, _)| upstream(bi)) {
+            continue;
+        }
         if !cone.insert(v) {
             continue;
         }
-        if let Some(&(bi, ii)) = def_of.get(&v) {
+        if let Some((bi, ii)) = def {
             for read in func.blocks[bi].instructions[ii].used_values() {
                 work.push(read);
             }
         }
     }
     cone
+}
+
+/// The header of the loop `loop_blocks`: its one block whose immediate
+/// dominator is not in the loop.  `None` where that is not one block (a set
+/// that is no natural loop): the callers then take no block for upstream.
+fn loop_header_of(loop_blocks: &FxHashSet<usize>, idom: &[usize]) -> Option<usize> {
+    let mut entered = loop_blocks.iter().copied().filter(|&block| {
+        idom.get(block)
+            .is_none_or(|&dom| dom == block || !loop_blocks.contains(&dom))
+    });
+    let header = entered.next()?;
+    entered.next().is_none().then_some(header)
 }
 
 /// A use site the rewriters may redirect.
@@ -6757,8 +6791,14 @@ fn rewrite_uses_where_available(
             replacement.0, func.name
         );
     };
-    let producers = producer_cone(func, replacement);
     let availability = Availability::build(func);
+    let header = loop_header_of(loop_blocks, &availability.idom);
+    let producers = producer_cone(func, replacement, &|block| {
+        header.is_some_and(|header| {
+            block != header
+                && crate::ir::analysis::dominates_idom(&availability.idom, block, header)
+        })
+    });
     let label_to_idx = crate::ir::analysis::build_label_map(func);
     let trace = Availability::tracing();
     let old = Value(old_id);
@@ -12130,6 +12170,113 @@ fn analyze_byte_count_loop(
 /// Emit the packed byte-sum body and remainder at the pattern's width
 /// (`vpsadbw` over 32 byte lanes with AVX2, `psadbw` over 16 on the SSE2
 /// baseline).
+/// May a transform that replaces a loop serve every reader of the values
+/// the loop carries (`carried`: the header's phis) from one block on the
+/// loop's exit edge?
+///
+/// A reader outside the loop is served from that block if the block
+/// dominates it, and the block will dominate exactly what the header
+/// dominates outside the loop: the loop has one exit, so every path from
+/// the header to such a place leaves through it. That is every reader of a
+/// well-formed function but one kind: a phi of the exit block reads its
+/// value on the exit edge itself, and takes it from the new block by a
+/// change of its label. Such a phi may name a carried value, a constant or
+/// a value from in front of the loop there; a value the loop's body
+/// computes has no producer once the body is replaced.
+///
+/// So this is `true` for well-formed IR that the callers' own analyses
+/// accepted, and the transform is refused, with nothing changed, for
+/// anything else: a second edge out of the loop, a read the header does
+/// not dominate. The alternative was found the hard way: a reader left
+/// behind keeps a value that means something else after the transform.
+fn live_out_reads_are_servable(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    header_idx: usize,
+    exit_idx: usize,
+    carried: &[Value],
+) -> bool {
+    let cfg = CfgAnalysis::build(func);
+    let label_to_idx = crate::ir::analysis::build_label_map(func);
+    let behind_header =
+        |block: usize| crate::ir::analysis::dominates_idom(&cfg.idom, header_idx, block);
+    let defined_in_loop: FxHashSet<u32> = loop_blocks
+        .iter()
+        .flat_map(|&block| func.blocks[block].instructions.iter())
+        .filter_map(|inst| inst.dest().map(|dest| dest.0))
+        .collect();
+    let is_carried = |value: u32| carried.iter().any(|c| c.0 == value);
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if loop_blocks.contains(&bi) {
+            continue;
+        }
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, label) in incoming {
+                    let Some(&pred) = label_to_idx.get(label) else {
+                        return false;
+                    };
+                    let read = match op {
+                        Operand::Value(value) => Some(value.0),
+                        Operand::Const(_) => None,
+                    };
+                    if loop_blocks.contains(&pred) {
+                        // The exit edge: the exit block's, and no value of
+                        // the body's on it.
+                        if bi != exit_idx
+                            || read.is_some_and(|v| defined_in_loop.contains(&v) && !is_carried(v))
+                        {
+                            return false;
+                        }
+                    } else if read.is_some_and(is_carried) && !behind_header(pred) {
+                        return false;
+                    }
+                }
+            } else if carried.iter().any(|c| inst.used_values().contains(&c.0))
+                && !behind_header(bi)
+            {
+                return false;
+            }
+        }
+        if carried
+            .iter()
+            .any(|c| block.terminator.used_values().contains(&c.0))
+            && !behind_header(bi)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Hand `replacement` to every reader of `old` outside the loop and outside
+/// the blocks named by `skip_labels` (the ones the transform built, which
+/// read the loop's own values on purpose). `replacement` is defined on the
+/// loop's exit edge, and `live_out_reads_are_servable` established that
+/// every such reader is behind that edge, so none is left out: after a
+/// transform that changed what `old` means, a reader that keeps it is wrong
+/// code, not a missed rewrite.
+fn redirect_live_out_reads(
+    func: &mut IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    skip_labels: &FxHashSet<u32>,
+    old: Value,
+    replacement: Value,
+) -> usize {
+    let mut redirected = 0usize;
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        if loop_blocks.contains(&bi) || skip_labels.contains(&block.label.0) {
+            continue;
+        }
+        for inst in &mut block.instructions {
+            redirected += replace_operand_value(inst, old, Operand::Value(replacement));
+        }
+        redirected +=
+            replace_terminator_value(&mut block.terminator, old, Operand::Value(replacement));
+    }
+    redirected
+}
+
 fn transform_byte_count_reduction(func: &mut IrFunction, p: &ByteCountPattern) -> usize {
     let mut next_val_id = func.next_value_id;
     let changes = transform_byte_count_reduction_inner(func, p, &mut next_val_id);
@@ -12550,6 +12697,20 @@ fn transform_byte_count_reduction_inner(
     {
         return 0;
     }
+    if !live_out_reads_are_servable(
+        func,
+        &p.loop_blocks,
+        p.header_idx,
+        p.exit_idx,
+        &[p.iv, p.acc_phi],
+    ) {
+        if debug {
+            lccc::cli::stderr_line(format_args!(
+                "[VEC-CNT] a reader of the sum or the index is not behind the loop's exit; declining"
+            ));
+        }
+        return 0;
+    }
     let Some(divide_op) = byte_count_bound_division_op(p.exit_cmp_op) else {
         return 0;
     };
@@ -12671,6 +12832,11 @@ fn transform_byte_count_reduction_inner(
         l
     };
     let rem_latch_label = {
+        let l = BlockId(func.next_label);
+        func.next_label += 1;
+        l
+    };
+    let join_label = {
         let l = BlockId(func.next_label);
         func.next_label += 1;
         l
@@ -13147,13 +13313,13 @@ fn transform_byte_count_reduction_inner(
     // exit jumps straight to the exit), otherwise at least one iteration,
     // so the remainder is bottom-tested like the vector loop.
     let rem_trips = const_trip.map(|t| t.rem);
-    let (rem_exit_label, rem_exit_acc) = match rem_trips {
+    let rem_exit_acc = match rem_trips {
         Some(0) => {
-            func.blocks[vec_exit_idx].terminator = Terminator::Branch(exit_label);
-            (vec_exit_label, h)
+            func.blocks[vec_exit_idx].terminator = Terminator::Branch(join_label);
+            h
         }
-        Some(_) => (rem_latch_label, r_acc_next),
-        None => (rem_header_label, r_acc),
+        Some(_) => r_acc_next,
+        None => r_acc,
     };
     let rem_bottom_tested = rem_trips.is_some_and(|r| r > 0);
 
@@ -13194,7 +13360,7 @@ fn transform_byte_count_reduction_inner(
         Terminator::CondBranch {
             cond: Operand::Value(rem_cmp),
             true_label: rem_body_label,
-            false_label: exit_label,
+            false_label: join_label,
         }
     };
     let rem_header_block = BasicBlock {
@@ -13227,7 +13393,7 @@ fn transform_byte_count_reduction_inner(
         Terminator::CondBranch {
             cond: Operand::Value(rem_cmp),
             true_label: rem_header_label,
-            false_label: exit_label,
+            false_label: join_label,
         }
     } else {
         Terminator::Branch(rem_header_label)
@@ -13247,219 +13413,146 @@ fn transform_byte_count_reduction_inner(
         func.blocks.push(rem_latch_block);
     }
 
-    // Final value: an exit-block phi merging r_acc (the remainder edge)
-    // with 0 (every non-loop edge -- the loop guard's bypass and any
-    // unrelated jump sharing the block: on those paths neither the vector
-    // loop nor the remainder contributed), then + acc_init, narrowed back
-    // to the accumulator's SOURCE type so every outside use keeps its
-    // original typing.  The phi is inserted with the block's other phis
-    // (phi-first discipline); the cast/add follow them.
-    let exit_block_phis = func.blocks[p.exit_idx]
-        .instructions
+    // ── The join block ───────────────────────────────────────────────
+    // The loop is left on one edge, and that edge carries its final
+    // values, so they are computed on it. `join` stands between the block
+    // that leaves (the vector exit, or the remainder's header or latch)
+    // and the old exit block, and holds:
+    //
+    //   * the scalar total: the reduced lanes and the remainder, plus the
+    //     value the accumulator entered the loop with, narrowed back to
+    //     the accumulator's source type so every reader keeps its typing;
+    //   * the final index, which is a function of the limit and not of
+    //     how the loop ran: the counting loop steps by one from a proven
+    //     zero, so it leaves with the limit (unsigned), or with
+    //     max(limit, 0) (signed: a limit that is not positive never
+    //     enters). Computed from the limit it is immune to what later
+    //     passes do to the remainder: the unroller's per-element exits
+    //     once made an index read through an exit phi come back
+    //     k-granular.
+    //
+    // Every reader outside the loop is then served from here, whatever it
+    // is. `join` is on the loop's only exit, so it dominates every block
+    // the header dominated outside the loop; and a phi of the exit block
+    // that took a value from the loop takes it from `join`.
+    // `live_out_reads_are_servable` held the readers to these two kinds
+    // before anything was changed.
+    //
+    // The values used to be computed at the top of the exit block, behind
+    // a phi that gave the start value on every other predecessor, and the
+    // readers were redirected "where the value is available". Three shapes
+    // were wrong code, and nothing said so (GCC 16.2 and Clang 23.1.5
+    // compute all of tests/regression/nested_reduction_live_out.c; 10 of
+    // its 27 functions returned something else at -O2):
+    //
+    //   * a reader that also feeds the start value was taken for a
+    //     rewrite that would feed itself, and kept reading the
+    //     accumulator, which by then is a vector of partial sums. The phi
+    //     of an enclosing loop that carries the sum is such a reader, so
+    //     `for (i) for (j) s += a[i + j]` returned the vector register;
+    //   * a phi of the exit block cannot read what its own block defines,
+    //     so a sum that merges with another path (`if (c) for (j) s +=
+    //     a[j]; else s += 2;`) kept the vector as well;
+    //   * a final index that is a constant (a constant limit) was not
+    //     handed to the readers at all: `for (j = 0; j < 100; j++) s +=
+    //     a[j]; use(j)` read the vector loop's own counter.
+    let init_wide = count_fresh(&mut *next_val_id);
+    let total_wide = count_fresh(&mut *next_val_id);
+    let mut join_insts = vec![
+        Instruction::Cast {
+            dest: init_wide,
+            src: p.acc_init.clone(),
+            from_ty: p.acc_ty,
+            to_ty: IrType::I64,
+        },
+        Instruction::BinOp {
+            dest: total_wide,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(init_wide),
+            rhs: Operand::Value(rem_exit_acc),
+            ty: IrType::I64,
+        },
+    ];
+    let total = if matches!(p.acc_ty, IrType::I64 | IrType::U64) {
+        total_wide
+    } else {
+        let narrowed = count_fresh(&mut *next_val_id);
+        join_insts.push(Instruction::Cast {
+            dest: narrowed,
+            src: Operand::Value(total_wide),
+            from_ty: IrType::I64,
+            to_ty: p.acc_ty,
+        });
+        narrowed
+    };
+    let iv_final = count_fresh(&mut *next_val_id);
+    if matches!(p.iv_ty, IrType::I32 | IrType::I64) {
+        let positive = count_fresh(&mut *next_val_id);
+        let zero = match p.iv_ty {
+            IrType::I32 => Operand::Const(IrConst::I32(0)),
+            _ => Operand::Const(IrConst::I64(0)),
+        };
+        join_insts.push(Instruction::Cmp {
+            dest: positive,
+            op: IrCmpOp::Sgt,
+            lhs: p.limit.clone(),
+            rhs: zero.clone(),
+            ty: p.iv_ty,
+        });
+        join_insts.push(Instruction::Select {
+            dest: iv_final,
+            cond: Operand::Value(positive),
+            true_val: p.limit.clone(),
+            false_val: zero,
+            ty: p.iv_ty,
+        });
+    } else {
+        // A value even where the limit is a constant: a reader may hold
+        // the index in a slot that takes no constant.
+        join_insts.push(Instruction::Copy {
+            dest: iv_final,
+            src: p.limit.clone(),
+        });
+    }
+    changes += join_insts.len() + 1;
+    func.blocks.push(BasicBlock {
+        label: join_label,
+        instructions: join_insts,
+        terminator: Terminator::Branch(exit_label),
+        source_spans: vec![],
+        source_inline_ids: Vec::new(),
+    });
+
+    // What a phi of the exit block took from the loop arrives from `join`.
+    let loop_labels: FxHashSet<u32> = p
+        .loop_blocks
         .iter()
-        .take_while(|i| matches!(i, Instruction::Phi { .. }))
-        .count();
-    // Non-loop, non-remainder predecessors of the exit block (the loop
-    // guard's bypass edge, plus any unrelated jump sharing the block).
-    // The new remainder blocks (vec_exit / rem_header / rem_body /
-    // rem_latch) are excluded by label: rem_header's false edge IS the
-    // remainder's exit and carries r_acc.
+        .map(|&block| func.blocks[block].label.0)
+        .collect();
+    for inst in &mut func.blocks[p.exit_idx].instructions {
+        let Instruction::Phi { incoming, .. } = inst else {
+            break;
+        };
+        for (_, label) in incoming.iter_mut() {
+            if loop_labels.contains(&label.0) {
+                *label = join_label;
+                changes += 1;
+            }
+        }
+    }
+    // The blocks this transform built read the vector accumulator and the
+    // byte index, and keep them.
     let new_block_labels: FxHashSet<u32> = [
         vec_exit_label.0,
         rem_header_label.0,
         rem_body_label.0,
         rem_latch_label.0,
+        join_label.0,
     ]
     .into_iter()
     .collect();
-    let exit_lbl = func.blocks[p.exit_idx].label;
-    let other_preds: Vec<BlockId> = func
-        .blocks
-        .iter()
-        .enumerate()
-        .filter(|(bi, b)| {
-            !p.loop_blocks.contains(bi)
-                && *bi != p.exit_idx
-                && !new_block_labels.contains(&b.label.0)
-                && match &b.terminator {
-                    Terminator::Branch(l) => *l == exit_lbl,
-                    Terminator::CondBranch {
-                        true_label,
-                        false_label,
-                        ..
-                    } => *true_label == exit_lbl || *false_label == exit_lbl,
-                    _ => false,
-                }
-        })
-        .map(|(_, b)| b.label)
-        .collect();
-    let total_wide = count_fresh(&mut *next_val_id);
-    let init_wide = count_fresh(&mut *next_val_id);
-    let init_op = p.acc_init.clone();
-    // Insert position: after the block's existing phis (phi-first
-    // discipline), advanced past anything this transform adds.
-    let mut pos = exit_block_phis;
-    let acc_on_exit: Operand = if other_preds.is_empty() {
-        // Single-predecessor exit (unguarded loop): r_acc is the value.
-        Operand::Value(rem_exit_acc)
-    } else {
-        // Merge: 0 on every path that did not go through the remainder
-        // (acc_init is added separately below), r_acc on the remainder
-        // edge.  Both are I64.
-        let exit_phi = count_fresh(&mut *next_val_id);
-        let mut incoming = Vec::with_capacity(other_preds.len() + 1);
-        for lbl in &other_preds {
-            incoming.push((Operand::Const(IrConst::I64(0)), *lbl));
-        }
-        incoming.push((Operand::Value(rem_exit_acc), rem_exit_label));
-        spanned_insert(
-            &mut func.blocks[p.exit_idx],
-            pos,
-            Instruction::Phi {
-                dest: exit_phi,
-                ty: IrType::I64,
-                incoming,
-            },
-        );
-        pos += 1;
-        changes += 1;
-        Operand::Value(exit_phi)
-    };
-    spanned_insert(
-        &mut func.blocks[p.exit_idx],
-        pos,
-        Instruction::Cast {
-            dest: init_wide,
-            src: init_op,
-            from_ty: p.acc_ty,
-            to_ty: IrType::I64,
-        },
-    );
-    pos += 1;
-    spanned_insert(
-        &mut func.blocks[p.exit_idx],
-        pos,
-        Instruction::BinOp {
-            dest: total_wide,
-            op: IrBinOp::Add,
-            lhs: Operand::Value(init_wide),
-            rhs: acc_on_exit,
-            ty: IrType::I64,
-        },
-    );
-    changes += 2;
-    let total = if p.acc_ty == IrType::I64 || p.acc_ty == IrType::U64 {
-        total_wide
-    } else {
-        let t = count_fresh(&mut *next_val_id);
-        spanned_insert(
-            &mut func.blocks[p.exit_idx],
-            2,
-            Instruction::Cast {
-                dest: t,
-                src: Operand::Value(total_wide),
-                from_ty: IrType::I64,
-                to_ty: p.acc_ty,
-            },
-        );
-        changes += 1;
-        t
-    };
-    // Rewrite outside uses of the accumulator phi to `total`.
-    let updates = rewrite_accumulator_uses_outside_loop(func, &p.loop_blocks, p.acc_phi.0, total);
-    changes += updates;
-
-    // ── IV exit materialisation ─────────────────────────────────────
-    // The source's final `i` is a PURE FUNCTION OF THE LIMIT, not of the
-    // loop's execution: the counting loop steps the IV by exactly +1 from
-    // a proven-zero entry, so it exits with i == limit whenever it runs
-    // and i == 0 (= the entry value) whenever it does not.  For unsigned
-    // IVs the final value is therefore the limit itself (a zero limit
-    // keeps i = 0 = limit); for signed IVs a non-positive limit keeps
-    // i = 0, so the final value is max(limit, 0).
-    //
-    // Computing it FROM THE LIMIT (in the vec-exit block, where it
-    // dominates the remainder header) instead of reading the remainder's
-    // IV makes the materialisation IMMUNE to every downstream loop
-    // transformation: the post-vectorize unroller partially unrolls the
-    // remainder with per-element early exits, and a live-out IV read
-    // through an exit phi is exactly the shape its threading misses when
-    // an intermediate pass splits the exit block (observed: the final i
-    // came back k-granular — ⌊n/4⌋·4 instead of n).  The limit-based
-    // value is loop-invariant; no restructuring can desynchronize it.
-    let iv_final_edge: Operand = if matches!(p.iv_ty, IrType::I32 | IrType::I64) {
-        // signed: max(limit, 0) via compare+select, built in the vec-exit.
-        let c = count_fresh(&mut *next_val_id);
-        let s = count_fresh(&mut *next_val_id);
-        let zero = match p.iv_ty {
-            IrType::I32 => Operand::Const(IrConst::I32(0)),
-            _ => Operand::Const(IrConst::I64(0)),
-        };
-        spanned_push(
-            &mut func.blocks[vec_exit_idx],
-            Instruction::Cmp {
-                dest: c,
-                op: IrCmpOp::Sgt,
-                lhs: p.limit.clone(),
-                rhs: zero.clone(),
-                ty: p.iv_ty,
-            },
-        );
-        spanned_push(
-            &mut func.blocks[vec_exit_idx],
-            Instruction::Select {
-                dest: s,
-                cond: Operand::Value(c),
-                true_val: p.limit.clone(),
-                false_val: zero,
-                ty: p.iv_ty,
-            },
-        );
-        Operand::Value(s)
-    } else {
-        // unsigned: the limit itself (defined outside the loop, so it
-        // dominates the remainder header and every reader).
-        p.limit.clone()
-    };
-    let iv_entry_const = match p.iv_ty {
-        IrType::I32 | IrType::U32 => Operand::Const(IrConst::I32(0)),
-        _ => Operand::Const(IrConst::I64(0)),
-    };
-    let iv_on_exit: Operand = if other_preds.is_empty() {
-        // Single-predecessor exit (unguarded loop): the limit-based value
-        // is the final IV on every path (the loop either ran to the limit
-        // or never entered, and both spell the same value).
-        iv_final_edge
-    } else {
-        // Merge: the ENTRY value (proven zero) on every bypass edge, the
-        // limit-based final value on the remainder edge.
-        let iv_exit_phi = count_fresh(&mut *next_val_id);
-        let mut incoming = Vec::with_capacity(other_preds.len() + 1);
-        for lbl in &other_preds {
-            incoming.push((iv_entry_const.clone(), *lbl));
-        }
-        incoming.push((iv_final_edge, rem_exit_label));
-        spanned_insert(
-            &mut func.blocks[p.exit_idx],
-            exit_block_phis,
-            Instruction::Phi {
-                dest: iv_exit_phi,
-                ty: p.iv_ty,
-                incoming,
-            },
-        );
-        changes += 1;
-        Operand::Value(iv_exit_phi)
-    };
-    // Rewrite every outside use of the IV phi — INCLUDING Intrinsic
-    // consumers (a later packed op reading `i`), but EXCLUDING the new
-    // blocks (which never reference the original phi: the resume index
-    // reads the byte IV).
-    if let Operand::Value(iv_repl) = &iv_on_exit {
-        let iv_updates =
-            rewrite_value_uses_outside(func, &p.loop_blocks, &new_block_labels, p.iv.0, *iv_repl);
-        changes += iv_updates;
-    }
+    changes += redirect_live_out_reads(func, &p.loop_blocks, &new_block_labels, p.acc_phi, total);
+    changes += redirect_live_out_reads(func, &p.loop_blocks, &new_block_labels, p.iv, iv_final);
 
     if debug {
         lccc::cli::stderr_line(format_args!(

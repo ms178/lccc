@@ -1862,11 +1862,12 @@ impl X86Codegen {
         self.lzcnt_enabled = opts.lzcnt;
         self.popcnt_enabled = opts.popcnt;
         // The SSE prefetch family is x86-64 baseline (GCC emits it even
-        // under `-mno-sse`), so only PRFCHW is a per-target decision here.
+        // under `-mno-sse`), so only PRFCHW and MOVRS are per-target
+        // decisions here.
         self.prefetch_isa =
             (!opts.no_prefetch).then_some(crate::backend::x86_common::X86PrefetchIsa {
                 sse: true,
-                prfchw: opts.x86_prefetch.prfchw,
+                ..opts.x86_prefetch
             });
         self.bmi2_enabled = opts.bmi2;
         self.apx_enabled = opts.apx;
@@ -5480,26 +5481,12 @@ impl X86Codegen {
     /// Extract an immediate integer value from an operand.
     /// Used for SSE/AES instructions that require compile-time immediate operands.
     pub(super) fn operand_to_imm_i64(&self, op: &Operand) -> i64 {
-        match op {
-            Operand::Const(c) => match c {
-                IrConst::I8(v) => *v as i64,
-                IrConst::I16(v) => *v as i64,
-                IrConst::I32(v) => *v as i64,
-                IrConst::I64(v) => *v,
-                _ => 0,
-            },
-            Operand::Value(_) => {
-                // TODO: this shouldn't happen for compile-time immediate arguments;
-                // the frontend should always fold these to constants.
-                0
-            }
-        }
+        crate::backend::x86_common::immediate_operand(op)
     }
 
-    /// An immediate the frontend pins to a constant (`x86_lane_immediate_bits`
-    /// and the `-O0` pinning in lowering). A non-constant here is a lowering
-    /// bug: `operand_to_imm_i64` would return 0 and the instruction would
-    /// silently take a wrong immediate, so this fails loudly instead.
+    /// An immediate the lowering has checked (`x86_immediate`): what
+    /// `operand_to_imm_i64` reads, with the instruction named in the
+    /// internal error a non-constant would be.
     pub(super) fn pinned_imm_i64(&self, op: &Operand, what: &str) -> i64 {
         assert!(
             matches!(op, Operand::Const(_)),

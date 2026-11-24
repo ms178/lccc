@@ -1,0 +1,135 @@
+# Statements the learned rows assemble (encoder/learned.rs), one statement a
+# group, each held to GNU as 2.47: 3DNow!, FMA4, XOP, TBM, Key Locker, AMX,
+# AVX10.2, SM3, MOVRS, with registers, memory, broadcasts, masks and
+# rounding; behind `{evex}` and `{vex}`, where the rows answer only when the
+# instruction has that encoding; and the statements they must refuse (a
+# register of the wrong class or width, an encoding the instruction lacks).
+;;; pfadd_mm1_mm2
+.text
+pfadd %mm1, %mm2
+;;; pfcmpeq_rbx_mm3
+.text
+pfcmpeq (%rbx), %mm3
+;;; vfmaddps_xmm1_xmm2_xmm3_xmm4
+.text
+vfmaddps %xmm1, %xmm2, %xmm3, %xmm4
+;;; vfmaddps_rbx_xmm2_xmm3_xmm4
+.text
+vfmaddps (%rbx), %xmm2, %xmm3, %xmm4
+;;; vfmaddps_xmm1_rbx_xmm3_xmm4
+.text
+vfmaddps %xmm1, (%rbx), %xmm3, %xmm4
+;;; vpcomltq_xmm1_xmm2_xmm3
+.text
+vpcomltq %xmm1, %xmm2, %xmm3
+;;; vpshaq_xmm1_rbx_xmm3
+.text
+vpshaq %xmm1, (%rbx), %xmm3
+;;; blcfill_eax_ebx
+.text
+blcfill %eax, %ebx
+;;; blcfill_rbx_rcx
+.text
+blcfill (%rbx), %rcx
+;;; aesdec128kl_rbx_xmm1
+.text
+aesdec128kl (%rbx), %xmm1
+;;; aesencwide256kl_8_rbx_rcx_4
+.text
+aesencwide256kl 8(%rbx,%rcx,4)
+;;; tileloadd_rbx_tmm1
+.text
+tileloadd (%rbx), %tmm1
+;;; tileloadd_64_rbx_rcx_2_tmm1
+.text
+tileloadd 64(%rbx,%rcx,2), %tmm1
+;;; tilestored_tmm2_rax_rdx
+.text
+tilestored %tmm2, (%rax,%rdx)
+;;; vucomxss_xmm1_xmm2
+.text
+vucomxss %xmm1, %xmm2
+;;; vucomxss_sae_xmm1_xmm2
+.text
+vucomxss {sae}, %xmm1, %xmm2
+;;; vsm3msg1_xmm1_xmm2_xmm3
+.text
+vsm3msg1 %xmm1, %xmm2, %xmm3
+;;; vsha512msg1_xmm1_ymm2
+.text
+vsha512msg1 %xmm1, %ymm2
+;;; cvttpd2pi_xmm1_mm2
+.text
+cvttpd2pi %xmm1, %mm2
+;;; cvttpd2pi_rbx_mm2
+.text
+cvttpd2pi (%rbx), %mm2
+;;; vcvtph2ibs_rn_sae_zmm1_zmm2_k1_z
+.text
+vcvtph2ibs {rn-sae}, %zmm1, %zmm2{%k1}{z}
+;;; vcvtph2ibs_rax_1to8_xmm1
+.text
+vcvtph2ibs (%rax){1to8}, %xmm1
+;;; vdpphps_rax_1to16_zmm1_zmm2
+.text
+vdpphps (%rax){1to16}, %zmm1, %zmm2
+;;; vdpphps_64_rax_zmm1_zmm2_k3
+.text
+vdpphps 64(%rax), %zmm1, %zmm2{%k3}
+;;; movrs_r16_rax
+.text
+movrs (%r16), %rax
+;;; movrs_rbx_r17d
+.text
+movrs (%rbx), %r17d
+;;; vbitrevb_xmm17_xmm2
+.text
+vbitrevb %xmm17, %xmm2
+;;; vbitrevb_r17_ymm2_k1
+.text
+vbitrevb (%r17), %ymm2{%k1}
+;;; evex_vmovq_rbx_xmm1
+.text
+{evex} vmovq (%rbx), %xmm1
+;;; evex_vmovq_xmm1_rbx
+.text
+{evex} vmovq %xmm1, (%rbx)
+;;; evex_vmovhlps_xmm1_xmm2_xmm3
+.text
+{evex} vmovhlps %xmm1, %xmm2, %xmm3
+;;; evex_pfadd_mm1_mm2 reject
+.text
+{evex} pfadd %mm1, %mm2
+;;; vex_vucomxss_xmm1_xmm2 reject
+.text
+{vex} vucomxss %xmm1, %xmm2
+;;; evex_vfmaddps_xmm1_xmm2_xmm3_xmm4 reject
+.text
+{evex} vfmaddps %xmm1, %xmm2, %xmm3, %xmm4
+;;; vfmaddps_xmm17_xmm2_xmm3_xmm4 reject
+.text
+vfmaddps %xmm17, %xmm2, %xmm3, %xmm4
+;;; pfadd_xmm1_mm2 reject
+.text
+pfadd %xmm1, %mm2
+;;; pfadd_mm1_xmm2 reject
+.text
+pfadd %mm1, %xmm2
+;;; tileloadd_rbx_xmm1 reject
+.text
+tileloadd (%rbx), %xmm1
+;;; aesdec128kl_xmm2_xmm1 reject
+.text
+aesdec128kl %xmm2, %xmm1
+;;; vsm3msg1_ymm1_ymm2_ymm3 reject
+.text
+vsm3msg1 %ymm1, %ymm2, %ymm3
+;;; vucomxss_ymm1_ymm2 reject
+.text
+vucomxss %ymm1, %ymm2
+;;; blcfill_ax_bx reject
+.text
+blcfill %ax, %bx
+;;; blcfill_eax_rbx reject
+.text
+blcfill %eax, %rbx

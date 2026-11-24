@@ -1,0 +1,524 @@
+# Segment words, `notrack` and lone prefix words in 16-bit code (.code16): the
+# statements of segment-words.casefile where real-mode code has them, each
+# held to GNU as 2.47.
+#
+# Not here: a segment word on a direct `call` (see segment-words.casefile),
+# and `cs jecxz`, where GNU as writes the address-size prefix in front of the
+# segment (67 2e e3) and lccc the segment first, as everywhere else.
+;;; cs_nop
+.text
+.code16
+cs nop
+;;; ds_nop
+.text
+.code16
+ds nop
+;;; es_nop
+.text
+.code16
+es nop
+;;; ss_nop
+.text
+.code16
+ss nop
+;;; fs_nop
+.text
+.code16
+fs nop
+;;; gs_nop
+.text
+.code16
+gs nop
+;;; cs_mov_eax_ebx
+.text
+.code16
+cs mov %eax, (%ebx)
+;;; cs_mov_eax_ds_ebx
+.text
+.code16
+cs mov %eax, %ds:(%ebx)
+;;; cs_mov_eax_ss_ebp
+.text
+.code16
+cs mov %eax, %ss:(%ebp)
+;;; ss_mov_eax_ebp
+.text
+.code16
+ss mov %eax, (%ebp)
+;;; ds_mov_eax_ebx
+.text
+.code16
+ds mov %eax, (%ebx)
+;;; ss_mov_eax_ss_ebx
+.text
+.code16
+ss mov %eax, %ss:(%ebx)
+;;; cs_mov_eax_cs_ebx
+.text
+.code16
+cs mov %eax, %cs:(%ebx)
+;;; cs_mov_eax_fs_ebx reject
+.text
+.code16
+cs mov %eax, %fs:(%ebx)
+;;; fs_mov_eax_fs_ebx
+.text
+.code16
+fs mov %eax, %fs:(%ebx)
+;;; cs_cs_nop reject
+.text
+.code16
+cs cs nop
+;;; cs_ds_nop reject
+.text
+.code16
+cs ds nop
+;;; es_movsb
+.text
+.code16
+es movsb
+;;; cs_rep_movsb
+.text
+.code16
+cs rep movsb
+;;; rep_cs_movsb
+.text
+.code16
+rep cs movsb
+;;; fs_movsb_ds_esi_es_edi
+.text
+.code16
+fs movsb %ds:(%esi), %es:(%edi)
+;;; fs_movsb_fs_esi_es_edi
+.text
+.code16
+fs movsb %fs:(%esi), %es:(%edi)
+;;; cs_movsb_fs_esi_es_edi reject
+.text
+.code16
+cs movsb %fs:(%esi), %es:(%edi)
+;;; es_stosb
+.text
+.code16
+es stosb
+;;; cs_lodsb
+.text
+.code16
+cs lodsb
+;;; cs_scasb
+.text
+.code16
+cs scasb
+;;; es_cmpsb
+.text
+.code16
+es cmpsb
+;;; cs_xlat
+.text
+.code16
+cs xlat
+;;; lock_cs_addl_1_eax
+.text
+.code16
+lock cs addl $1, (%eax)
+;;; cs_lock_addl_1_eax
+.text
+.code16
+cs lock addl $1, (%eax)
+;;; xacquire_lock_cs_addl_1_eax
+.text
+.code16
+xacquire lock cs addl $1, (%eax)
+;;; cs_data16_nop reject
+.text
+.code16
+cs data16 nop
+;;; data16_cs_nop reject
+.text
+.code16
+data16 cs nop
+;;; cs_addr16_nop reject
+.text
+.code16
+cs addr16 nop
+;;; addr16_cs_mov_eax_bx reject
+.text
+.code16
+addr16 cs mov %eax, (%bx)
+;;; cs_addr16_data16_lock_addl_1_bx reject
+.text
+.code16
+cs addr16 data16 lock addl $1, (%bx)
+;;; cs_fwait
+.text
+.code16
+cs fwait
+;;; cs_fstcw_eax
+.text
+.code16
+cs fstcw (%eax)
+;;; cs_fnstcw_eax
+.text
+.code16
+cs fnstcw (%eax)
+;;; cs_fsave_eax
+.text
+.code16
+cs fsave (%eax)
+;;; cs_vaddps_eax_xmm1_xmm2
+.text
+.code16
+cs vaddps (%eax), %xmm1, %xmm2
+;;; cs_evex_vaddps_eax_xmm1_xmm2
+.text
+.code16
+cs {evex} vaddps (%eax), %xmm1, %xmm2
+;;; cs_movaps_eax_xmm1
+.text
+.code16
+cs movaps (%eax), %xmm1
+;;; cs_jmp_1f_1
+.text
+.code16
+cs jmp 1f
+1:
+;;; cs_jne_1f_1
+.text
+.code16
+cs jne 1f
+1:
+;;; cs_jmp_foo
+.text
+.code16
+cs jmp foo
+;;; cs_jne_foo
+.text
+.code16
+cs jne foo
+;;; cs_ret
+.text
+.code16
+cs ret
+;;; cs_push_eax
+.text
+.code16
+cs push %eax
+;;; cs_jmp_eax
+.text
+.code16
+cs jmp *%eax
+;;; cs_jmp_eax_2
+.text
+.code16
+cs jmp *(%eax)
+;;; cs_ljmp_eax
+.text
+.code16
+cs ljmp *(%eax)
+;;; cs_lgdt_eax
+.text
+.code16
+cs lgdt (%eax)
+;;; cs_pushl_eax
+.text
+.code16
+cs pushl (%eax)
+;;; notrack_jmp_eax
+.text
+.code16
+notrack jmp *%eax
+;;; notrack_call_eax
+.text
+.code16
+notrack call *%eax
+;;; notrack_jmp_eax_2
+.text
+.code16
+notrack jmp *(%eax)
+;;; notrack_call_eax_2
+.text
+.code16
+notrack call *(%eax)
+;;; notrack_nop reject
+.text
+.code16
+notrack nop
+;;; notrack_jmp_1f_1 reject
+.text
+.code16
+notrack jmp 1f
+1:
+;;; notrack_jmp_fs_eax reject
+.text
+.code16
+notrack jmp *%fs:(%eax)
+;;; notrack_jmp_ds_eax
+.text
+.code16
+notrack jmp *%ds:(%eax)
+;;; notrack_ljmp_eax reject
+.text
+.code16
+notrack ljmp *(%eax)
+;;; ds_notrack_jmp_eax reject
+.text
+.code16
+ds notrack jmp *%eax
+;;; notrack_ds_jmp_eax reject
+.text
+.code16
+notrack ds jmp *%eax
+;;; notrack_cs_jmp_eax reject
+.text
+.code16
+notrack cs jmp *%eax
+;;; notrack_bnd_jmp_eax reject
+.text
+.code16
+notrack bnd jmp *%eax
+;;; notrack_jmpl_eax
+.text
+.code16
+notrack jmpl *%eax
+;;; notrack_jmpw_ax
+.text
+.code16
+notrack jmpw *%ax
+;;; notrack_calll_eax
+.text
+.code16
+notrack calll *%eax
+;;; notrack_callw_ax
+.text
+.code16
+notrack callw *%ax
+;;; notrack_ret reject
+.text
+.code16
+notrack ret
+;;; notrack_lcall_eax reject
+.text
+.code16
+notrack lcall *(%eax)
+;;; gs_mov_eax_0x1234
+.text
+.code16
+gs mov %eax, 0x1234
+;;; gs_mov_0x1234_eax
+.text
+.code16
+gs mov 0x1234, %eax
+;;; gs_movl_5_sym
+.text
+.code16
+gs movl $5, sym
+;;; gs_incl_sym
+.text
+.code16
+gs incl sym
+;;; cs_loop_1f_1
+.text
+.code16
+cs loop 1f
+1:
+;;; es_in_5_al
+.text
+.code16
+es in $5, %al
+;;; es_out_al_5
+.text
+.code16
+es out %al, $5
+;;; es_int_3
+.text
+.code16
+es int $3
+;;; es_leave
+.text
+.code16
+es leave
+;;; es_pushf
+.text
+.code16
+es pushf
+;;; cs_cpuid
+.text
+.code16
+cs cpuid
+;;; cs_syscall
+.text
+.code16
+cs syscall
+;;; cs_mov_cr0_eax
+.text
+.code16
+cs mov %cr0, %eax
+;;; cs_bswap_eax
+.text
+.code16
+cs bswap %eax
+;;; cs_lea_eax_ebx
+.text
+.code16
+cs lea (%eax), %ebx
+;;; lock
+.text
+.code16
+lock
+;;; rep
+.text
+.code16
+rep
+;;; repne
+.text
+.code16
+repne
+;;; data16
+.text
+.code16
+data16
+;;; addr16
+.text
+.code16
+addr16
+;;; data32
+.text
+.code16
+data32
+;;; addr32
+.text
+.code16
+addr32
+;;; cs
+.text
+.code16
+cs
+;;; ds
+.text
+.code16
+ds
+;;; es
+.text
+.code16
+es
+;;; ss
+.text
+.code16
+ss
+;;; fs
+.text
+.code16
+fs
+;;; gs
+.text
+.code16
+gs
+;;; notrack
+.text
+.code16
+notrack
+;;; xacquire
+.text
+.code16
+xacquire
+;;; xrelease
+.text
+.code16
+xrelease
+;;; rex reject
+.text
+.code16
+rex
+;;; rex64 reject
+.text
+.code16
+rex64
+;;; rex_w_nop reject
+.text
+.code16
+rex.w nop
+;;; rex_nop reject
+.text
+.code16
+rex nop
+;;; repz
+.text
+.code16
+repz
+;;; repe
+.text
+.code16
+repe
+;;; repnz
+.text
+.code16
+repnz
+;;; bnd reject
+.text
+.code16
+bnd
+;;; wait
+.text
+.code16
+wait
+;;; fwait
+.text
+.code16
+fwait
+;;; rex2_nop reject
+.text
+.code16
+{rex2} nop
+;;; rex_nop_2 reject
+.text
+.code16
+{rex} nop
+;;; evex_vaddps_xmm1_xmm2_xmm3
+.text
+.code16
+{evex} vaddps %xmm1, %xmm2, %xmm3
+;;; vex3_vaddps_xmm1_xmm2_xmm3
+.text
+.code16
+{vex3} vaddps %xmm1, %xmm2, %xmm3
+;;; nf_add_eax_ebx reject
+.text
+.code16
+{nf} add %eax, %ebx
+;;; disp16_mov_eax_eax reject
+.text
+.code16
+{disp16} mov (%eax), %eax
+;;; nooptimize_mov_eax_ebx
+.text
+.code16
+{nooptimize} mov %eax, %ebx
+;;; nooptimize_lock_addl_1_eax
+.text
+.code16
+{nooptimize} lock addl $1, (%eax)
+;;; vex_lock_nop reject
+.text
+.code16
+{vex} lock nop
+;;; evex_cs_vaddps_eax_xmm1_xmm2
+.text
+.code16
+{evex} cs vaddps (%eax), %xmm1, %xmm2
+;;; mov_s_eax_ebx
+.text
+.code16
+mov.s %eax, %ebx
+;;; movl_s_eax_ebx
+.text
+.code16
+movl.s %eax, %ebx
+;;; add_s_eax_ebx
+.text
+.code16
+add.s %eax, %ebx
+;;; jmp_d32_1f_1 reject
+.text
+.code16
+jmp.d32 1f
+1:

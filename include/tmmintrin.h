@@ -44,7 +44,7 @@ _mm_shuffle_epi8(__m128i __a, __m128i __b)
 /* _mm_alignr_epi8: concatenate __a (high) and __b (low) into a 32-byte
  * intermediate, shift right by __n bytes, return the low 16 bytes (PALIGNR) */
 #define _mm_alignr_epi8(__a, __b, __n) \
-    ((__m128i)(__builtin_ia32_palignr128((__a), (__b), ((__n) * 8))))
+    ((__m128i)(__builtin_ia32_palignr128((__a), (__b), ((int)(__n) * 8))))
 
 
 /* _mm_hadd_epi16: horizontal add adjacent pairs of 16-bit integers (PHADDW) */

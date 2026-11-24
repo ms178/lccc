@@ -105,6 +105,34 @@ impl Context<'_> {
         }
         let derived = match self.def(op) {
             Some(Instruction::Copy { src, .. }) => self.known(*src, ty, facts, depth - 1),
+            // An integer conversion moves bits and invents none. The low bits
+            // are the source's; what a widening adds is zeros for an unsigned
+            // source and copies of its top bit for a signed one (the source
+            // is read at `from_ty` and extended by that type's signedness:
+            // `constant_fold::fold_cast`). `ctz((int)(x | 1))` and
+            // `__builtin_ffs(x | 1)` reach their operand through one.
+            Some(Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if same_width_scalar(*to_ty, ty) && scalar(*from_ty) => {
+                let from_w = from_ty.size() * 8;
+                let from_mask = u64::MAX >> (64 - from_w);
+                let a = self.known(*src, *from_ty, facts, depth - 1);
+                let (zero, one) = (a.0 & from_mask, a.1 & from_mask);
+                if from_w >= w {
+                    (zero & mask, one & mask)
+                } else if from_ty.is_signed() {
+                    let (added, top) = (mask ^ from_mask, 1u64 << (from_w - 1));
+                    (
+                        zero | if zero & top != 0 { added } else { 0 },
+                        one | if one & top != 0 { added } else { 0 },
+                    )
+                } else {
+                    (zero | (mask ^ from_mask), one)
+                }
+            }
             Some(Instruction::Select {
                 cond,
                 true_val,
@@ -184,8 +212,28 @@ impl Context<'_> {
                 }
                 let a = self.known(*lhs, *ty, facts, 8);
                 let b = self.known(*rhs, *ty, facts, 8);
-                if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) && ((a.0 & b.1) | (a.1 & b.0)) != 0 {
-                    return Some(*op == IrCmpOp::Ne);
+                if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+                    if ((a.0 & b.1) | (a.1 & b.0)) != 0 {
+                        return Some(*op == IrCmpOp::Ne);
+                    }
+                } else {
+                    // An ordering is monotone in each operand, one way in
+                    // the left and the other way in the right. Over the box
+                    // the known bits span it is therefore largest at one of
+                    // (least, greatest) and (greatest, least) and smallest
+                    // at the other: where the two agree, every pair does.
+                    // `(x & 7) < 8`, `(x | 8) >= 8`, `(x | INT_MIN) < 0`.
+                    let w = ty.size() * 8;
+                    let signed = matches!(
+                        op,
+                        IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
+                    );
+                    let (a_least, a_greatest) = extremes(a, w, signed);
+                    let (b_least, b_greatest) = extremes(b, w, signed);
+                    let decided = compare(*op, a_least, b_greatest, w);
+                    if decided == compare(*op, a_greatest, b_least, w) {
+                        return Some(decided);
+                    }
                 }
                 let a = self.value(*lhs, *ty, facts)?;
                 let b = self.value(*rhs, *ty, facts)?;
@@ -201,10 +249,17 @@ impl Context<'_> {
                 let b = self.truth(*rhs, facts, depth - 1);
                 if a == Some(false) || b == Some(false) {
                     Some(false)
-                } else if a == Some(true) && b == Some(true) {
+                } else if a == Some(true)
+                    && b == Some(true)
+                    && boolean_tree(*lhs, self, 8)
+                    && boolean_tree(*rhs, self, 8)
+                {
+                    // Two true Booleans are both 1. Two words that are not
+                    // zero need not share a bit: `(x | 1) & (y | 2)` is 0
+                    // for `x == y == 0`, and only their bits can say more.
                     Some(true)
                 } else {
-                    None
+                    self.nonzero(op, facts, depth - 1)
                 }
             }
             Instruction::BinOp {
@@ -220,10 +275,23 @@ impl Context<'_> {
                 } else if a == Some(false) && b == Some(false) {
                     Some(false)
                 } else {
-                    None
+                    self.nonzero(op, facts, depth - 1)
                 }
             }
-            _ => None,
+            _ => self.nonzero(op, facts, depth - 1),
+        }
+    }
+    /// Whether a word is zero, as far as its bits say: a bit known to be
+    /// one makes it true, every bit known to be zero makes it false.
+    fn nonzero(&self, op: Operand, facts: &Facts, depth: u8) -> Option<bool> {
+        let ty = self.def(op)?.result_type().filter(|ty| scalar(*ty))?;
+        let (zero, one) = self.known(op, ty, facts, depth);
+        if one != 0 {
+            Some(true)
+        } else if zero == u64::MAX >> (64 - ty.size() * 8) {
+            Some(false)
+        } else {
+            None
         }
     }
     fn facts(&self, op: Operand, truth: bool, out: &mut Facts, depth: u8) {
@@ -286,6 +354,41 @@ impl Context<'_> {
                                 // Impossible masked equalities supply no assumptions.
                                 if c & !m == 0 {
                                     out.0.push((base, w, m & !c, c));
+                                }
+                            }
+                            // A shift by a constant compared for equality
+                            // fixes the bits the shift kept: `x >> n == c`
+                            // the top `w - n` bits of `x`, `x << n == c` the
+                            // low `w - n`. A constant the shift cannot
+                            // produce (a bit where it put zeros, or for an
+                            // arithmetic shift a broken run of sign copies)
+                            // is an equality nothing satisfies and supplies
+                            // no assumption.
+                            if let Some(Instruction::BinOp {
+                                op: shift @ (IrBinOp::LShr | IrBinOp::AShr | IrBinOp::Shl),
+                                lhs: base,
+                                rhs: count,
+                                ty: t,
+                                ..
+                            }) = self.def(x)
+                                && same_width_scalar(*t, *ty)
+                                && let Some(n) = fixed_shift_count(*count, w)
+                            {
+                                let kept = mask >> n;
+                                let sign_copies = mask ^ (kept >> 1);
+                                let producible = match shift {
+                                    IrBinOp::LShr => c & !kept == 0,
+                                    IrBinOp::AShr => {
+                                        c & sign_copies == 0 || c & sign_copies == sign_copies
+                                    }
+                                    _ => c & !(mask << n) == 0,
+                                };
+                                if producible {
+                                    out.0.push(if *shift == IrBinOp::Shl {
+                                        (*base, w, (!c & mask) >> n, c >> n)
+                                    } else {
+                                        (*base, w, (!c << n) & mask, (c << n) & mask)
+                                    });
                                 }
                             }
                         }
@@ -376,6 +479,16 @@ fn scalar(ty: IrType) -> bool {
 fn constant(n: u64, ty: IrType) -> Operand {
     Operand::Const(IrConst::from_i64(n as i64, ty))
 }
+/// The least and the greatest `w`-bit value with the known bits `(zero,
+/// one)`, in unsigned or in two's-complement order. Every bit that is not
+/// known takes the value that moves the result furthest; under a signed
+/// order the top bit moves it the other way.
+fn extremes((zero, one): (u64, u64), w: usize, signed: bool) -> (u64, u64) {
+    let mask = u64::MAX >> (64 - w);
+    let free = mask & !(zero | one);
+    let top = if signed { free & (1u64 << (w - 1)) } else { 0 };
+    (one | top, one | (free ^ top))
+}
 fn compare(op: IrCmpOp, a: u64, b: u64, w: usize) -> bool {
     let signed = |n: u64| ((n << (64 - w)) as i64) >> (64 - w);
     match op {
@@ -411,9 +524,30 @@ fn fold(
     fresh: Value,
 ) -> Option<Vec<Instruction>> {
     cx.visits.set(512);
+    // A select whose condition is decided is the arm it chooses:
+    // `y ? __builtin_ctz(y) : 32` for `y = x | 1`.
+    if let Instruction::Select {
+        dest,
+        cond,
+        true_val,
+        false_val,
+        ..
+    } = inst
+        && let Some(chosen) = cx.truth(*cond, facts, 8)
+    {
+        return Some(copy(*dest, if chosen { *true_val } else { *false_val }));
+    }
+    // The questions this function asks first leave the recognizers behind
+    // them the budget they had.
+    cx.visits.set(512);
     if let Some(replacement) = count_observe::fold(inst, cx) {
         return Some(replacement);
     }
+    let budget = cx.visits.get();
+    if let Some(replacement) = count_observe::exact(inst, cx, facts) {
+        return Some(replacement);
+    }
+    cx.visits.set(budget);
     if let Some(replacement) = extrema::fold(inst, cx) {
         return Some(replacement);
     }
@@ -603,10 +737,14 @@ fn fold(
     } = inst
         && scalar(*ty)
     {
-        if !facts.0.is_empty()
-            && let Some(b) = cx.truth(Operand::Value(dest), facts, 8)
-        {
+        // Decided by the facts of the edge or by the operands' own bits:
+        // `(x | 1) == 0`, `(x & 7) < 8`.
+        let budget = cx.visits.get();
+        if let Some(b) = cx.truth(Operand::Value(dest), facts, 8) {
             return Some(copy(dest, constant(u64::from(b), IrType::I32)));
+        }
+        if facts.0.is_empty() {
+            cx.visits.set(budget);
         }
         if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
             let w = ty.size() * 8;

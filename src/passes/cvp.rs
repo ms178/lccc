@@ -39,6 +39,18 @@
 //! The pass walks the dominator tree with an explicit fact stack, so
 //! gathering is `O(blocks + facts)`.
 //!
+//! A phi of `S` is one of its operands, and which one is decided by the edge
+//! taken, so it lies in the union, over its operands, of what is known of
+//! each operand *on its edge*: the edge's own fact about it and whatever
+//! holds in `S` anyway (see [`phi_facts`]).  This is what carries a loop's
+//! guard into a bottom-tested loop.  `while (m != 0) body` tests in a block
+//! that dominates the body; rotated, the body is entered from the guard and
+//! from the latch, each of which tests a value of its own, and what the body
+//! sees is their phi.  Without the rule the body of a rotated loop had lost
+//! what the body of the loop as written knew (a `switch (m)` in it kept its
+//! `case 0`, and with it a call that was meant to be unreachable:
+//! `tests/regression/scoped_retry_state.c` with every loop rotated).
+//!
 //! # Folds
 //!
 //! * `Cmp value-vs-constant` whose truth set contains / is disjoint from the
@@ -837,6 +849,133 @@ fn block_entry_facts(
     acc.unwrap_or_default()
 }
 
+/// One phi as [`phi_facts`] reads it: its operands, each with what its own
+/// edge says of it.
+struct PhiInputs {
+    dest: Value,
+    bits: u32,
+    /// `(operand, the edge's fact about it)`, one per incoming edge.
+    operands: Vec<(Operand, Option<Set>)>,
+}
+
+/// A phi with more operands than this is not looked at: the rule is for
+/// the joins of loops and diamonds, and the work is operands times facts.
+const MAX_PHI_OPERANDS: usize = 16;
+
+/// The phis of `blk` with at most [`MAX_PHI_OPERANDS`] integer operands,
+/// read on the function as it is before the pass edits it (like the entry
+/// facts: an edge the pass removes later only leaves an operand too many in
+/// the union).
+fn phi_inputs(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    copies: &FxHashMap<Value, Operand>,
+    asm_edges: &FxHashSet<(usize, BlockId)>,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+    blk: usize,
+) -> Vec<PhiInputs> {
+    let block = &func.blocks[blk];
+    let mut out = Vec::new();
+    // The facts of an edge are the same for every phi it feeds.
+    let mut of_edge: FxHashMap<BlockId, Vec<Fact>> = FxHashMap::default();
+    for inst in &block.instructions {
+        let Instruction::Phi { dest, ty, incoming } = inst else {
+            break;
+        };
+        let Some(bits) = bits_of(*ty) else { continue };
+        if incoming.is_empty() || incoming.len() > MAX_PHI_OPERANDS {
+            continue;
+        }
+        let operands = incoming
+            .iter()
+            .map(|(op, from)| {
+                let on_edge = match (op, label_to_idx.get(from)) {
+                    (Operand::Value(v), Some(&pred)) => {
+                        let facts = of_edge.entry(*from).or_insert_with(|| {
+                            edge_facts(func, defs, copies, asm_edges, pred, block.label)
+                        });
+                        known_set(facts, *v, bits)
+                    }
+                    _ => None,
+                };
+                (*op, on_edge)
+            })
+            .collect();
+        out.push(PhiInputs {
+            dest: *dest,
+            bits,
+            operands,
+        });
+    }
+    out
+}
+
+/// What is known of each phi of a block from its operands, given the facts
+/// that hold in the block (`stack`).
+///
+/// On arrival over one edge the phi *is* that edge's operand, and the
+/// operand then satisfies both the edge's fact about it and every fact that
+/// holds in the block, because those hold however the block was reached. So
+/// the phi lies in the union of the operands' sets. A constant operand is its
+/// own singleton, read through a copy if it sits behind one (loop rotation
+/// leaves such copies). One operand of which nothing is known makes the
+/// union everything, and no fact is made.
+///
+/// The fact holds wherever the block dominates: until the block is entered
+/// again the phi keeps the value it was given.
+fn phi_facts(phis: &[PhiInputs], stack: &[Fact], copies: &FxHashMap<Value, Operand>) -> Vec<Fact> {
+    let mut out = Vec::new();
+    for phi in phis {
+        let bits = phi.bits;
+        let mut union: Set = Vec::new();
+        let mut known = true;
+        for (op, on_edge) in &phi.operands {
+            // Through copies to a constant, if there is one.
+            let mut op = *op;
+            for _ in 0..16 {
+                match op {
+                    Operand::Value(v) => match copies.get(&v) {
+                        Some(src @ Operand::Const(_)) => op = *src,
+                        _ => break,
+                    },
+                    Operand::Const(_) => break,
+                }
+            }
+            let set = match op {
+                Operand::Const(c) => c.to_i128().map(|c| {
+                    let c = to_unsigned(c, bits);
+                    vec![(c, c)]
+                }),
+                Operand::Value(v) => match (on_edge, known_set(stack, v, bits)) {
+                    (Some(e), Some(k)) => Some(intersect(e, &k)),
+                    (Some(e), None) => Some(e.clone()),
+                    (None, k) => k,
+                },
+            };
+            let Some(set) = set else {
+                known = false;
+                break;
+            };
+            union.extend(set);
+        }
+        if !known {
+            continue;
+        }
+        let union = normalize(union);
+        // Everything is no fact; nothing is a block that is never entered,
+        // which is not this rule's to act on.
+        if union.is_empty() || union == [(0, umax(bits))] {
+            continue;
+        }
+        out.push(Fact {
+            value: phi.dest,
+            bits,
+            set: union,
+        });
+    }
+    out
+}
+
 /// Known interval set for `value` given the active facts.
 fn known_set(stack: &[Fact], value: Value, bits: u32) -> Option<Set> {
     let mut acc: Option<Set> = None;
@@ -1406,6 +1545,11 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
         .map(|b| block_entry_facts(func, &defs, &copies, &asm_edges, preds.row(b), b))
         .collect();
 
+    // Likewise the operands of every phi and what their edges say of them.
+    let phis: Vec<Vec<PhiInputs>> = (0..n)
+        .map(|b| phi_inputs(func, &defs, &copies, &asm_edges, &label_to_idx, b))
+        .collect();
+
     let mut stack: Vec<Fact> = entry_facts[0].clone();
     // Explicit DFS over the dominator tree: (block, next child index).
     let mut work: Vec<(usize, usize)> = vec![(0, 0)];
@@ -1413,6 +1557,16 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
 
     while let Some(&mut (blk, ref mut next)) = work.last_mut() {
         if *next == 0 {
+            // What the block's phis are known to be, given everything that
+            // holds in it; in force for the block and what it dominates,
+            // and dropped with the block's entry facts.
+            if !phis[blk].is_empty() {
+                let made = phi_facts(&phis[blk], &stack, &copies);
+                if let Some(count) = pushed.last_mut() {
+                    *count += made.len();
+                    stack.extend(made);
+                }
+            }
             // First visit: fold inside this block under the active facts.
             //
             // Correlated-select USE rewriting runs BEFORE definition
@@ -2677,6 +2831,212 @@ mod tests {
         } else {
             panic!("phi survived");
         }
+    }
+
+    /// A rotated `while (m != 0) { if (m == 0) …; m = next(m); }`:
+    ///
+    /// ```text
+    ///   b0 (guard):  c0 = v0 != 0;              br c0, b1, b3
+    ///   b1 (body):   m  = phi [first, b0], [v7, b2]
+    ///                z  = m == 0;               br z, b4, b2
+    ///   b2 (latch):  v7 = m + 1; c1 = v7 != 0;  br c1, b1, b3
+    ///   b3: ret 0     b4: ret 1                 (b4 is the impossible arm)
+    /// ```
+    ///
+    /// `first` is what the guard hands the phi: the tested value itself, a
+    /// constant, or whatever the caller passes.
+    fn rotated_loop_testing_its_phi(first: Operand, latch_tests: Value) -> IrFunction {
+        let cmp = |d: u32, op, lhs: u32| Instruction::Cmp {
+            dest: Value(d),
+            op,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::U64,
+        };
+        let br = |cond: u32, t: u32, f: u32| Terminator::CondBranch {
+            cond: Operand::Value(Value(cond)),
+            true_label: BlockId(t),
+            false_label: BlockId(f),
+        };
+        let ret = |k: i64| Terminator::Return(Some(Operand::Const(IrConst::I64(k))));
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(0, vec![cmp(1, IrCmpOp::Ne, 0)], br(1, 1, 3)),
+            mk(
+                1,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(5),
+                        ty: IrType::U64,
+                        incoming: vec![(first, BlockId(0)), (Operand::Value(Value(7)), BlockId(2))],
+                    },
+                    cmp(6, IrCmpOp::Eq, 5),
+                ],
+                br(6, 4, 2),
+            ),
+            mk(
+                2,
+                vec![
+                    add1(7, Operand::Value(Value(5))),
+                    cmp(8, IrCmpOp::Ne, latch_tests.0),
+                ],
+                br(8, 1, 3),
+            ),
+            mk(3, vec![], ret(0)),
+            mk(4, vec![], ret(1)),
+        ];
+        f.next_value_id = 9;
+        f
+    }
+
+    /// Whether the body still branches to its impossible arm.
+    fn body_can_reach_the_impossible_arm(f: &IrFunction) -> bool {
+        let mut reached = false;
+        f.blocks[1]
+            .terminator
+            .for_each_target(|to| reached |= to == BlockId(4));
+        reached
+    }
+
+    #[test]
+    fn a_phi_is_one_of_its_operands_as_its_edge_knows_it() {
+        // Both ways into the body test the value they hand the phi, so the
+        // phi is non-zero and the body's own zero test is decided.
+        let mut f = rotated_loop_testing_its_phi(Operand::Value(Value(0)), Value(7));
+        assert!(run_function_with_symbols(&mut f, &bench_syms()) > 0);
+        assert!(
+            !body_can_reach_the_impossible_arm(&f),
+            "the guard and the latch both exclude zero: {:?}",
+            f.blocks[1]
+        );
+        // The loop itself is untouched: the latch still decides.
+        assert!(matches!(
+            f.blocks[2].terminator,
+            Terminator::CondBranch { .. }
+        ));
+    }
+
+    #[test]
+    fn a_constant_operand_is_its_own_value_also_behind_a_copy() {
+        // The guard hands over a constant (what a loop entered with a known
+        // state becomes), written as the constant and as a copy of it.
+        let mut f = rotated_loop_testing_its_phi(Operand::Const(IrConst::I64(3)), Value(7));
+        assert!(run_function_with_symbols(&mut f, &bench_syms()) > 0);
+        assert!(!body_can_reach_the_impossible_arm(&f));
+
+        let mut f = rotated_loop_testing_its_phi(Operand::Value(Value(2)), Value(7));
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(2),
+            src: Operand::Const(IrConst::I64(3)),
+        });
+        assert!(run_function_with_symbols(&mut f, &bench_syms()) > 0);
+        assert!(!body_can_reach_the_impossible_arm(&f));
+
+        // A constant that *is* the excluded value proves nothing.
+        let mut f = rotated_loop_testing_its_phi(Operand::Const(IrConst::I64(0)), Value(7));
+        run_function_with_symbols(&mut f, &bench_syms());
+        assert!(body_can_reach_the_impossible_arm(&f));
+    }
+
+    #[test]
+    fn one_operand_nothing_is_known_of_leaves_the_phi_unknown() {
+        // The guard hands over a value it did not test.
+        let mut f = rotated_loop_testing_its_phi(Operand::Value(Value(2)), Value(7));
+        assert_eq!(run_function_with_symbols(&mut f, &bench_syms()), 0);
+        assert!(body_can_reach_the_impossible_arm(&f));
+
+        // The latch tests the old value, not the one it hands over.
+        let mut f = rotated_loop_testing_its_phi(Operand::Value(Value(0)), Value(5));
+        run_function_with_symbols(&mut f, &bench_syms());
+        assert!(
+            body_can_reach_the_impossible_arm(&f),
+            "what the latch knows of `m` says nothing of `m + 1`"
+        );
+    }
+
+    #[test]
+    fn a_fact_of_another_width_says_nothing_of_the_phi() {
+        // The guard and the latch compare 32 bits of a 64-bit value: the
+        // upper half is free, so the 64-bit phi may be zero in its low half
+        // and the body's 64-bit test stands.
+        let mut f = rotated_loop_testing_its_phi(Operand::Value(Value(0)), Value(7));
+        for block in [0, 2] {
+            if let Some(Instruction::Cmp { ty, .. }) = f.blocks[block].instructions.last_mut() {
+                *ty = IrType::U32;
+            }
+        }
+        run_function_with_symbols(&mut f, &bench_syms());
+        assert!(body_can_reach_the_impossible_arm(&f));
+    }
+
+    #[test]
+    fn a_phi_fact_is_dropped_with_its_block() {
+        // b0: br v0 != 0, b1, b2
+        // b1: p = phi [v0, b0]          (non-zero here)        → b2
+        // b2: z = p == 0; ret z
+        // `p` is non-zero as a fact of b1 and of what b1 dominates; b2 is
+        // reached round b1 too, and there the fact must be gone. (`p` does
+        // not dominate b2 in real SSA; the test pins the scoping, which is
+        // what keeps the stack honest.)
+        let v0 = Operand::Value(Value(0));
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![cmp0(1, IrCmpOp::Ne)],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::U64,
+                    incoming: vec![(v0, BlockId(0))],
+                }],
+                Terminator::Branch(BlockId(2)),
+            ),
+            mk(
+                2,
+                vec![Instruction::Cmp {
+                    dest: Value(4),
+                    op: IrCmpOp::Eq,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::U64,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+        ];
+        f.next_value_id = 5;
+        run_function_with_symbols(&mut f, &bench_syms());
+        assert!(
+            matches!(f.blocks[2].instructions[0], Instruction::Cmp { .. }),
+            "a fact made in b1 decided a compare outside what b1 dominates"
+        );
+    }
+
+    #[test]
+    fn a_wide_phi_is_not_read() {
+        // One operand more than the rule looks at, all of them the constant
+        // 3: the fact would be true and is not made.
+        let mut f = rotated_loop_testing_its_phi(Operand::Const(IrConst::I64(3)), Value(7));
+        let extra: Vec<u32> = (10..10 + MAX_PHI_OPERANDS as u32).collect();
+        if let Instruction::Phi { incoming, .. } = &mut f.blocks[1].instructions[0] {
+            incoming.extend(
+                extra
+                    .iter()
+                    .map(|&b| (Operand::Const(IrConst::I64(3)), BlockId(b))),
+            );
+        }
+        for &b in &extra {
+            f.blocks.push(mk(b, vec![], Terminator::Branch(BlockId(1))));
+        }
+        run_function_with_symbols(&mut f, &bench_syms());
+        assert!(body_can_reach_the_impossible_arm(&f));
     }
 
     #[test]

@@ -471,56 +471,73 @@ _mm256_cmpgt_epi64(__m256i __a, __m256i __b)
     return (__m256i)__builtin_ia32_pcmpgtq256((__v4di)(__a), (__v4di)(__b));
 }
 
-/* _mm256_extract_epi8: extract 8-bit integer */
+/* === Element extract and insert of a 256-bit vector ===
+ * The element is named by a constant inside the vector: GCC 16.2 refuses
+ * `_mm256_extract_epi32(v, 8)` and a selector of the running program (by
+ * the 128-bit half the selector would pick), and so do the macros below.
+ * They were functions that masked the selector: element 8 was element 0. */
 static __inline__ int __attribute__((__always_inline__))
-_mm256_extract_epi8(__m256i __a, int __imm)
+__lccc_mm256_extract_epi8(__m256i __a, int __imm)
 {
     unsigned char *__p = (unsigned char *)&__a;
     return (int)__p[__imm & 31];
 }
+#define _mm256_extract_epi8(__a, __imm)                                          \
+    (__LCCC_IMMEDIATE(__imm, 31, "selector must be an integer constant in the range [0, 31]"), \
+     __lccc_mm256_extract_epi8((__a), (__imm)))
 
-/* _mm256_extract_epi32: extract 32-bit integer */
 static __inline__ int __attribute__((__always_inline__))
-_mm256_extract_epi32(__m256i __a, int __imm)
+__lccc_mm256_extract_epi32(__m256i __a, int __imm)
 {
     int *__p = (int *)&__a;
     return __p[__imm & 7];
 }
+#define _mm256_extract_epi32(__a, __imm)                                         \
+    (__LCCC_IMMEDIATE(__imm, 7, "selector must be an integer constant in the range [0, 7]"), \
+     __lccc_mm256_extract_epi32((__a), (__imm)))
 
-/* _mm256_extract_epi64: extract 64-bit integer */
 static __inline__ long long __attribute__((__always_inline__))
-_mm256_extract_epi64(__m256i __a, int __imm)
+__lccc_mm256_extract_epi64(__m256i __a, int __imm)
 {
     long long *__p = (long long *)&__a;
     return __p[__imm & 3];
 }
+#define _mm256_extract_epi64(__a, __imm)                                         \
+    (__LCCC_IMMEDIATE(__imm, 3, "selector must be an integer constant in the range [0, 3]"), \
+     __lccc_mm256_extract_epi64((__a), (__imm)))
 
-/* _mm256_insert_epi8: insert 8-bit integer */
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_insert_epi8(__m256i __a, int __val, int __imm)
+__lccc_mm256_insert_epi8(__m256i __a, int __val, int __imm)
 {
     unsigned char *__p = (unsigned char *)&__a;
     __p[__imm & 31] = (unsigned char)__val;
     return __a;
 }
+#define _mm256_insert_epi8(__a, __val, __imm)                                    \
+    (__LCCC_IMMEDIATE(__imm, 31, "selector must be an integer constant in the range [0, 31]"), \
+     __lccc_mm256_insert_epi8((__a), (__val), (__imm)))
 
-/* _mm256_insert_epi32: insert 32-bit integer */
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_insert_epi32(__m256i __a, int __val, int __imm)
+__lccc_mm256_insert_epi32(__m256i __a, int __val, int __imm)
 {
     int *__p = (int *)&__a;
     __p[__imm & 7] = __val;
     return __a;
 }
+#define _mm256_insert_epi32(__a, __val, __imm)                                   \
+    (__LCCC_IMMEDIATE(__imm, 7, "selector must be an integer constant in the range [0, 7]"), \
+     __lccc_mm256_insert_epi32((__a), (__val), (__imm)))
 
-/* _mm256_insert_epi64: insert 64-bit integer */
 static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_insert_epi64(__m256i __a, long long __val, int __imm)
+__lccc_mm256_insert_epi64(__m256i __a, long long __val, int __imm)
 {
     long long *__p = (long long *)&__a;
     __p[__imm & 3] = __val;
     return __a;
 }
+#define _mm256_insert_epi64(__a, __val, __imm)                                   \
+    (__LCCC_IMMEDIATE(__imm, 3, "selector must be an integer constant in the range [0, 3]"), \
+     __lccc_mm256_insert_epi64((__a), (__val), (__imm)))
 
 /* _mm256_sub_epi64: subtract 64-bit integers */
 static __inline__ __m256i __attribute__((__always_inline__))

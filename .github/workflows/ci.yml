@@ -767,8 +767,10 @@ jobs:
         # with GCC, then compares stdout and exit code. Catches emitted-but-
         # unassemblable vector forms (a 256-bit width-changing convert used to
         # be spelled `vcvtps2pd %ymm0, %ymm0`) that a compile-only gate cannot.
+        # At -O2 here; the backend job runs the cases without optimization
+        # against GCC 16.2.
         env LCCC_BIN=target/fastbuild/lccc CC=gcc \
-          python3 tests/intrinsics/run_intrin_tests.py
+          python3 tests/intrinsics/run_intrin_tests.py --levels=-O2
     - name: Check FP-contraction parity with GCC
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
     - name: IV-widen exposed-latch trajectory gates
@@ -1047,6 +1049,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_static_local_init.sh
     - name: Standard-output contract for -o -
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
+    - name: Every input file is compiled, as GCC 16.2 does
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_every_input_compiled.sh
     - name: Inline-asm operand and template diagnostics match GCC 16.2
       run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
     - name: Ring identities against GCC 16 and Clang 23.1.5
@@ -2362,6 +2366,28 @@ jobs:
       run: >-
         python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    # A prefetch computes nothing, so no test that compares values sees one:
+    # `_mm_prefetch` emitted nothing for years and every suite passed. The
+    # instruction is the behaviour, so it is compared with GCC 16.2's for
+    # every statement form, under every CPU of the table in both modes.
+    - name: Verify the x86 prefetch instructions against GCC 16.2
+      run: >-
+        python3 scripts/check_x86_prefetch.py target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # A macro lccc defines is a promise that the intrinsics behind it exist
+    # (`__AVX512F__`, `__F16C__`). The census calls every intrinsic of GCC
+    # 16.2's headers under lccc and holds the count that does not compile to
+    # the record, in both directions.
+    - name: Verify the x86 intrinsic census against GCC 16.2's headers
+      run: >-
+        python3 scripts/x86_intrinsic_census.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+    # Which extension each SIMD helper of include/lcccsimd.h needs is held to
+    # a table generated from GCC 16.2's headers. Nothing ran the comparison
+    # (only its self-test), and it had come apart: 29 helpers, the FMA 132
+    # forms and vdpps256, had no row. A ratchet is a gate or it is a file.
+    - name: Verify SIMD helper feature permissions against the GCC 16.2 table
+      run: python3 tests/simd/check_isa_permissions.py
     - name: Verify range-fold branch contracts
       env:
         CCC: target/fastbuild/lccc
@@ -2423,6 +2449,9 @@ jobs:
         --lccc target/fastbuild/lccc-i686
     - name: Verify the vector-width table is what GNU as 2.47 says
       run: python3 scripts/x86_vector_widths.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+    - name: Verify the instructions learned from GNU as 2.47 are what it assembles
+      run: python3 scripts/x86_learned_rows.py --verify --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+        --lccc target/fastbuild/lccc-x86 --lccc32 target/fastbuild/lccc-i686
     - name: Verify x86-64 instruction-table sweep vs GNU as 2.47
       run: python3 scripts/gas_table_sweep.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
         --lccc target/fastbuild/lccc-x86
@@ -2435,6 +2464,36 @@ jobs:
     - name: Verify .code16gcc instruction-table sweep vs GNU as 2.47
       run: python3 scripts/gas_table_sweep.py --check --16gcc --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
         --lccc target/fastbuild/lccc-i686
+    - name: Self-test the replacement sweep's execution harness
+      run: python3 scripts/asm_optimize_sweep.py --self-test
+    - name: Verify x86-64 assembler replacements vs GNU as 2.47 -O2 and -Os, and execute them
+      run: python3 scripts/asm_optimize_sweep.py --check --execute --minimum 1500 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
+        --lccc target/fastbuild/lccc-x86
+    - name: Verify i686 assembler replacements vs GNU as 2.47 -O2 and -Os, and execute them
+      run: python3 scripts/asm_optimize_sweep.py --32 --check --execute --minimum 800 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
+        --lccc target/fastbuild/lccc-i686
+    # An intrinsic that compiles may still compute something else, and that
+    # is the defect nothing reports: `_xgetbv` returned 0, a 128-bit compare
+    # with a VEX-only predicate ran another predicate, and a selector that is
+    # no literal was assembled as `$0`. Every intrinsic lccc has that this
+    # runner's processor executes is called with generated arguments and held
+    # to GCC 16.2's result, with and without optimization; where GCC wants a
+    # constant, lccc is given a value and has to say so or be right; and GNU
+    # as has to take the assembly lccc writes for the tests.
+    - name: Self-test the intrinsic value differential
+      run: python3 -m unittest tests.corpus.test_x86_intrinsic_values
+    - name: Verify the values of the x86 intrinsics against GCC 16.2
+      run: >-
+        python3 scripts/x86_intrinsic_values.py --check --lccc target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
+        --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+    # The hand-written cases once more, without optimization: there nothing
+    # folds an immediate or forwards a temporary, and what goes wrong there
+    # does not show at -O2 (`_mm256_clmulepi64_epi128`).
+    - name: Intrinsic differential corpus without optimization (lccc vs GCC 16.2)
+      run: >-
+        env LCCC_BIN=target/fastbuild/lccc CC="${{ steps.gcc162.outputs.bin }}"
+        python3 tests/intrinsics/run_intrin_tests.py --levels=-O0
     - name: Verify complete SSE3 SSSE3 SSE4 encodings vs Clang 23.1.5
       run: python3 tests/regression/check_sse34_clang.py
     - name: Verify encdiff corpus vs GNU as 2.47 (offline)
@@ -2972,6 +3031,15 @@ jobs:
         bash tests/regression/check_tls_runtime_oracle.sh
         # Dedicated-preheader transform, asserted on emitted assembly.
         bash tests/regression/check_loop_preheader.sh
+        # Loop rotation's decision: it fires where a division, an
+        # accumulator or a recurrence then leaves the loop, and leaves every
+        # other loop byte-identical to the pipeline without it.
+        bash tests/regression/check_loop_rotate_profit.sh
+        # What the shared linear address forms may call disjoint: a store
+        # that marches away from a load lets LICM hoist it, one that wraps
+        # round to it (an unsigned index, a signed one under -fwrapv) or
+        # starts on it does not.
+        bash tests/regression/check_licm_alias_disjoint.sh
         # Mask and interval folds: shift-pair masks and {0,1} membership, with a
         # {0,2} negative control and a disabled-pass attribution leg.
         python3 tests/regression/check_mask_and_interval_folds.py
@@ -2998,6 +3066,10 @@ jobs:
         python3 tests/regression/check_sparse_bss_equivalence.py --lccc target/fastbuild/lccc
         bash tests/regression/check_linker_notype_code.sh
         bash tests/regression/check_i686_atomics.sh
+        # The i686 fused `res * base + val` reads an 8- or 16-bit operand
+        # narrow: run at five levels against the same recurrence through
+        # memory, and read off the -O2 assembly (the chains stay fused).
+        bash tests/regression/check_i686_mulacc_narrow_feeder.sh
         # A13/A14: a pass may synthesise a libcall only when this TU does
         # not define that symbol (per symbol, so an asm label, an alias or
         # a static definition counts), and a constant-size memcpy/memset

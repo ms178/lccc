@@ -37,7 +37,7 @@ C source
   ir/        lowering (alloca IR) → mem2reg (SSA)
   passes/    -O0 skip; -O1 light; -O2 full; -O3 +unroll; -Os/-Oz size
              TCE, rec2iter, inline, vectorize, GVN/LICM/IVSR, DSE,
-             backedge-PRE, loop_rotate (opt-in), …
+             backedge-PRE, loop_rotate (where it pays), …
   pgo/       -fprofile-generate / -fprofile-use
   backend/   split_ranges → liveness → linear-scan RA (+ Tier-2 graph
              coloring) → stack_layout → ISel (ArchCodegen) → peephole

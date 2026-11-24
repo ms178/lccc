@@ -80,7 +80,9 @@ LEGACY = re.compile(
     r"(ps|pd|ss|sd|dqa|dqu|dq|i|d|q|w|b|epi\w*|epu\w*|si128|ldq|s|\b|$)"
 )
 # The only legacy instructions the pinned contract accepts, per function.
-ALLOWED_LEGACY = {"s_sqrtsd": {"movapd", "ucomisd"}}
+# (The register copy is written `movaps`: `movapd` without its prefix byte,
+# and as much a legacy encoding that keeps the upper halves.)
+ALLOWED_LEGACY = {"s_sqrtsd": {"movapd", "movaps", "ucomisd"}}
 
 
 def scan(text: str) -> dict[str, dict[str, int]]:

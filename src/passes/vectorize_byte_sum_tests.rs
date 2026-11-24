@@ -1027,8 +1027,10 @@ fn constant_trip_counts_bottom_test_both_loops() {
                         ),
                         "{ctx}: the packed latch does not test the trip count"
                     );
+                    // The vector exit and the join block, and the three
+                    // of a remainder where there is one.
                     let added = g.blocks.len() - f.blocks.len();
-                    let want = if n % lanes == 0 { 1 } else { 4 };
+                    let want = if n % lanes == 0 { 2 } else { 5 };
                     assert_eq!(added, want, "{ctx}: remainder blocks");
                     let packed = n / lanes * lanes;
                     assert!(

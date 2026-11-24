@@ -255,13 +255,78 @@ pub struct JumpDetection {
     pub is_conditional: bool,
     /// Whether this is already in short form (e.g., jecxz, loop).
     pub already_short: bool,
-    /// Whether a dead 0x66 (the `data16` word in 64-bit mode) is spliced in
-    /// front of the opcode. In 64-bit mode the prefix is architecturally
-    /// dead on near branches, so the row underneath is chosen exactly as
-    /// for the un-prefixed branch (short when disp8-reachable, near
-    /// otherwise) and the splice byte rides along: every length and byte
-    /// offset the relaxer touches shifts by one.
-    pub prefix66: bool,
+    /// How many prefix bytes stand in front of the opcode: a segment word
+    /// (`cs jne 1f`, the branch hints), a REX word, the data-size word.
+    /// They ride along: the row underneath is chosen exactly as for the
+    /// un-prefixed branch (short when disp8-reachable, near otherwise),
+    /// and every length and byte offset the relaxer touches shifts by
+    /// their number. (This was one bit, for the dead 0x66 of `data16` in
+    /// 64-bit code; a jump behind any other prefix was not seen to be one
+    /// and kept its near form: `cs jmp 1f; 1:` was six bytes, GNU as:
+    /// `2e eb 00`.)
+    pub prefixes: u8,
+}
+
+impl JumpDetection {
+    /// What the relaxer is to know of `instr`, which the encoder wrote as
+    /// `bytes`: a `jmp` or `jcc` to a label in its near form, or -- in
+    /// 16- and 32-bit code -- a branch that has a one-byte displacement
+    /// and no other (`loop`, `jecxz`), whose displacement the relaxer
+    /// fills in. (64-bit code resolves those through a relocation of the
+    /// encoder's own.) `None` for any other statement.
+    ///
+    /// One reading for every mode: the five places that encode an
+    /// instruction each had their own, by the length of the encoding, and
+    /// disagreed (a `data16 jmp` in `.code32` of a 64-bit object was not
+    /// relaxed, in a 32-bit object it was).
+    pub fn of(instr: &Instruction, bytes: &[u8], long: bool) -> Option<Self> {
+        if !matches!(instr.operands.as_slice(), [Operand::Label(_)]) {
+            return None;
+        }
+        // GAS accepts `.s` on any mnemonic (`jmp.s` relaxes exactly like
+        // `jmp`) and is case-insensitive.
+        let lower = instr.mnemonic.to_ascii_lowercase();
+        let mnemonic = lower.strip_suffix(".s").unwrap_or(&lower);
+        if is_short_only_branch(mnemonic) {
+            return (!long && is_short_only_encoding(bytes)).then_some(JumpDetection {
+                is_conditional: true,
+                already_short: true,
+                prefixes: 0,
+            });
+        }
+        if mnemonic.starts_with('j') && mnemonic.len() >= 2 {
+            Self::near(bytes, long)
+        } else {
+            None
+        }
+    }
+
+    /// The near `jmp` or `jcc` to a label that `bytes` are: prefix bytes,
+    /// `E9` or `0F 8x`, and a displacement field of two or four bytes.
+    /// `None` for anything else the encoder wrote for such a statement (a
+    /// form with a one-byte displacement, a refusal's leftovers).
+    ///
+    /// `long` is 64-bit code, where `40`..`4F` in front of the opcode are
+    /// REX prefixes; elsewhere no prefix word writes them.
+    fn near(bytes: &[u8], long: bool) -> Option<Self> {
+        let prefixes = bytes
+            .iter()
+            .take_while(|&&byte| {
+                matches!(byte, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67)
+                    || (long && (0x40..=0x4F).contains(&byte))
+            })
+            .count();
+        let (is_conditional, field) = match &bytes[prefixes..] {
+            [0xE9, field @ ..] => (false, field),
+            [0x0F, 0x80..=0x8F, field @ ..] => (true, field),
+            _ => return None,
+        };
+        (matches!(field.len(), 2 | 4)).then_some(JumpDetection {
+            is_conditional,
+            already_short: false,
+            prefixes: u8::try_from(prefixes).ok()?,
+        })
+    }
 }
 
 // ─── Internal types ───────────────────────────────────────────────────
@@ -409,11 +474,12 @@ struct JumpInfo {
     /// Whether this writer shortened the jump and can restore its long form.
     /// Short-only instructions remain false.
     can_grow: bool,
-    /// A dead 0x66 precedes the opcode (`data16` on a 64-bit near branch):
-    /// the short form is `66 eb/7x rel8` (3 bytes) and the near form is
-    /// `66 e9/0f 8x rel32` (6/7 bytes) — one byte and one displacement
-    /// position longer than the plain rows.
-    prefix66: bool,
+    /// The prefix bytes in front of the opcode (`data16` on a 64-bit near
+    /// branch, a segment or REX word): under one the short form is `66
+    /// eb/7x rel8` (3 bytes) and the near form is `66 e9/0f 8x rel32` (6/7
+    /// bytes) — one byte and one displacement position longer than the
+    /// plain rows.
+    prefixes: usize,
     /// The operand was written `sym@PLT`.
     via_plt: bool,
     /// 64-bit code of a 64-bit object, the one place a branch that is left
@@ -437,16 +503,35 @@ struct JumpInfo {
     target_at: Option<(u64, u64)>,
 }
 
+/// [`JumpInfo::rel16`], from the near form's length, kind and prefixes.
+fn near_field_is_rel16(long_len: usize, is_conditional: bool, prefixes: usize) -> bool {
+    long_len == (if is_conditional { 4 } else { 3 }) + prefixes
+}
+
 impl JumpInfo {
     /// Offset of the near form's displacement field, where its relocation
-    /// sits: behind the opcode (two bytes for a `jcc`) and a dead 0x66.
+    /// sits: behind the prefixes and the opcode (two bytes for a `jcc`).
     fn field_offset(&self) -> u64 {
-        (self.offset + if self.is_conditional { 2 } else { 1 } + usize::from(self.prefix66)) as u64
+        (self.offset + if self.is_conditional { 2 } else { 1 } + self.prefixes) as u64
     }
 
     /// `loop` / `jrcxz` and their kin: one encoding, a rel8.
     fn is_short_only(&self) -> bool {
         self.relaxed && !self.can_grow && self.long_len == self.len
+    }
+
+    /// Whether the near form's displacement field is two bytes wide: what
+    /// is left of the near form behind its prefixes and its opcode.
+    ///
+    /// Sixteen bits in 16-bit code (`e9 rel16`) and under `data16` in
+    /// 32-bit code (`66 e9 rel16`); thirty-two in 32- and 64-bit code,
+    /// under `data32` in 16-bit code (`66 e9 rel32`) and under the dead
+    /// 0x66 of 64-bit code. The width used to be read off the near form's
+    /// length alone, which a 0x66 in front of a 16-bit field makes the
+    /// length of a 32-bit one: a jump that grew back was given a 32-bit
+    /// relocation in a two-byte field.
+    fn rel16(&self) -> bool {
+        near_field_is_rel16(self.long_len, self.is_conditional, self.prefixes)
     }
 
     /// The offset this jump goes to, when the layout resolves it.
@@ -3205,9 +3290,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
         };
         // An error that names no instruction gets the statement it is about.
         // Messages that already quote one (GAS's own wordings do) are kept
-        // verbatim.
+        // verbatim. A mnemonic no encoder has is refused in GNU as's words
+        // and with the statement: what the encoders say of it among
+        // themselves ("unhandled", and the operands as Rust prints them) is
+        // how their fallbacks tell it from a known one, not a diagnostic.
         let result = encoded.map_err(|e| {
-            if e.contains('`') || e.contains(instr.mnemonic.as_str()) {
+            if e.starts_with("unhandled ") {
+                format!("no such instruction: `{}'", instr.source_text())
+            } else if e.contains('`') || e.contains(instr.mnemonic.as_str()) {
                 e
             } else {
                 format!("{e}: `{}'", instr.source_text())
@@ -3239,7 +3329,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         is_conditional: jump_det.is_conditional,
                         relaxed: true,
                         can_grow: false,
-                        prefix66: jump_det.prefix66,
+                        prefixes: usize::from(jump_det.prefixes),
                         via_plt,
                         plt32_native,
                         linker_bound: false,
@@ -3260,7 +3350,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         is_conditional: jump_det.is_conditional,
                         relaxed: false,
                         can_grow: false,
-                        prefix66: jump_det.prefix66,
+                        prefixes: usize::from(jump_det.prefixes),
                         via_plt,
                         plt32_native,
                         linker_bound: false,
@@ -5609,7 +5699,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             spec_jump.push(j);
             specs.push(JumpSpec {
                 off: jump.offset as u64,
-                short_len: 2 + u64::from(jump.prefix66),
+                short_len: 2 + jump.prefixes as u64,
                 long_len: jump.long_len as u64,
                 short: shortened,
                 target: Point {
@@ -6012,29 +6102,25 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let jump = &self.sections[sec_idx].jumps[j];
             let (offset, old_len) = (jump.offset, jump.len);
             data.extend_from_slice(&old[cursor..offset]);
+            // The prefix bytes ride along (a dead 0x66 under `data16` in
+            // 64-bit code, a segment or REX word), and every source index
+            // shifts by their number.
+            let op = jump.prefixes;
+            data.extend_from_slice(&old[offset..offset + op]);
             let new_len = if shrink {
                 // near jcc 0x0f 0x8x rel / jmp 0xe9 rel -> short 0x7x / 0xeb disp8.
-                // With a dead 0x66 (`data16`, 64-bit) the prefix byte rides
-                // along and every source index shifts by one.
-                if jump.prefix66 {
-                    data.push(0x66);
-                }
                 if jump.is_conditional {
-                    data.push(0x70 + (old[offset + usize::from(jump.prefix66) + 1] - 0x80));
+                    data.push(0x70 + (old[offset + op + 1] - 0x80));
                 } else {
                     data.push(0xEB);
                 }
                 data.push(0);
-                2 + usize::from(jump.prefix66)
+                2 + op
             } else {
                 // short 0x7x / 0xeb disp8 -> near 0x0f 0x8x / 0xe9 rel16/32;
                 // the unconditional form keeps its old second byte as the
                 // first displacement byte, as the in-place splice did.
                 let grow = jump.long_len - old_len;
-                if jump.prefix66 {
-                    data.push(0x66);
-                }
-                let op = usize::from(jump.prefix66);
                 if jump.is_conditional {
                     data.push(0x0f);
                     data.push(0x80 + (old[offset + op] - 0x70));
@@ -6079,12 +6165,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             if shrink {
                 jump.relaxed = true;
                 jump.can_grow = true;
-                jump.len = 2 + usize::from(jump.prefix66);
+                jump.len = 2 + jump.prefixes;
                 continue;
             }
             jump.relaxed = false;
             jump.len = jump.long_len;
-            let rel16 = jump.long_len == if jump.is_conditional { 4 } else { 3 };
+            let rel16 = jump.rel16();
             let reloc = ElfRelocation {
                 offset: jump.field_offset(),
                 symbol: jump.target.clone(),
@@ -6120,21 +6206,20 @@ impl<A: X86Arch> ElfWriterCore<A> {
         });
         for (j, shrink) in order {
             let jump = &self.sections[sec_idx].jumps[j];
-            let (offset, old_len, long_len, is_conditional, prefix66) = (
+            let (offset, old_len, long_len, is_conditional, op) = (
                 jump.offset,
                 jump.len,
                 jump.long_len,
                 jump.is_conditional,
-                jump.prefix66,
+                jump.prefixes,
             );
             let (target, target_addend) = (jump.target.clone(), jump.target_addend);
             let reloc_pos = (if is_conditional {
                 offset + 2
             } else {
                 offset + 1
-            } + usize::from(prefix66)) as u64;
+            } + op) as u64;
             let data = &mut self.sections[sec_idx].data;
-            let op = usize::from(prefix66);
             if shrink {
                 if is_conditional {
                     data[offset + op] = 0x70 + (data[offset + op + 1] - 0x80);
@@ -6169,7 +6254,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     data[offset + op] = 0xE9;
                 }
                 self.shift_after(sec_idx, offset + 1, grow as i64, None);
-                let rel16 = long_len == if is_conditional { 4 } else { 3 };
+                let rel16 = near_field_is_rel16(long_len, is_conditional, op);
                 self.sections[sec_idx].relocations.push(ElfRelocation {
                     offset: reloc_pos,
                     symbol: target,
@@ -6386,7 +6471,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     } else {
                         moved(&visited, &cumulative, label_off, label_seq) + jump.target_addend
                     };
-                    let disp = target - (here + 2 + i64::from(jump.prefix66));
+                    let disp = target - (here + 2 + jump.prefixes as i64);
                     if !(-128..=127).contains(&disp) {
                         let delta = (jump.long_len - jump.len) as i64;
                         stretch += delta;
@@ -9164,9 +9249,9 @@ mod tests {
     ///
     ///   * the speculative first pass shrinks every relaxable jump to
     ///     `66 eb/7x rel8` even when it does not fit, then the growth pass
-    ///     must restore `66 e9/0f 8x rel32` through the prefix66 plumbing:
+    ///     must restore `66 e9/0f 8x rel32` through the prefix plumbing:
     ///     `grow = long_len - old_len` (long_len INCLUDES the 0x66), the
-    ///     op-offset byte surgery at `offset + prefix66`, the +1/+2
+    ///     op-offset byte surgery at `offset + prefixes`, the +1/+2
     ///     `reloc_pos` shift, and the PC32-with-addend--4 bookkeeping;
     ///   * `data16 call` never registers (no short row) -- if the relaxer
     ///     ever shrank it to `eb`, this test would catch the corruption;
@@ -9228,7 +9313,7 @@ mod tests {
         }
     }
 
-    /// The shrink direction of the same prefix66 plumbing, at writer level:
+    /// The shrink direction of the same prefix plumbing, at writer level:
     /// NEAR-local `data16` branches relax to `66 eb/7x rel8`, byte-identical
     /// to GAS 2.47 (pinned casefile-level in prefix-words.casefile; this is
     /// the writer-level twin, so both directions of the relaxer are gated
@@ -9249,7 +9334,7 @@ mod tests {
     }
 
     /// Far-BACKWARD local `data16`: the short-form fit is measured from the
-    /// SHORT form's end (`offset + 2 + prefix66`), not the long form's --
+    /// SHORT form's end (`offset + 2 + prefixes`), not the long form's --
     /// the backward arm of the S04 branch-verdict fix. At -133 the branch
     /// cannot fit disp8 and must settle long: `66 0f 85 rel32` with
     /// disp32 = -137 = .Lb(0) - end(137).

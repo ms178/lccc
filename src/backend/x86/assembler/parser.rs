@@ -279,6 +279,32 @@ pub struct Instruction {
     /// GNU as `{dfv=cf,zf,sf,of}`: APX default-flags value for CCMP/CTEST.
     /// Encoded raw in EVEX P1.vvvv (not inverted). Bits: CF=1 ZF=2 SF=4 OF=8.
     pub dfv: u8,
+    /// Whether the encoder may write a cheaper instruction that has the
+    /// same effect (`encoder::optimize`), and which kind. `Never` for a
+    /// statement behind `{nooptimize}`; otherwise what the text was parsed
+    /// under.
+    pub optimize: Optimize,
+}
+
+/// Whether the encoders may replace a statement by a cheaper instruction
+/// with the same effect (`movq $1, %rax` by `movl $1, %eax`), and what
+/// cheaper means.
+///
+/// A person who writes `movq $15, %rax` may have counted its seven bytes --
+/// glibc's `__restore_rt` is recognized by its bytes -- so a text is
+/// assembled as written unless the command line asks otherwise (`-Wa,-O`,
+/// as GNU as has it). What the compiler writes is replaced in the text
+/// itself, before it is assembled or shown (`assembler::generated`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Optimize {
+    /// As written.
+    #[default]
+    Never,
+    /// The instruction that is shorter, or faster at the same length, and
+    /// slower on no processor: `-Wa,-O`, `-Wa,-O1` and above.
+    Faster,
+    /// That, and the shorter instruction where it costs time: `-Wa,-Os`.
+    Smaller,
 }
 
 impl Instruction {
@@ -632,9 +658,20 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
-/// Parse assembly text into a list of AsmItems.
+/// Parse assembly text into a list of AsmItems, every statement to be
+/// assembled as written.
 pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
+    parse_asm_with(text, Optimize::Never)
+}
+
+/// Parse assembly text into a list of AsmItems; `optimize` says whether
+/// the encoders may replace its statements by cheaper equivalents.
+pub fn parse_asm_with(text: &str, optimize: Optimize) -> Result<Vec<AsmItem>, String> {
     let mut items = Vec::new();
+    // Behind data, or behind a prefix written as a statement of its own:
+    // the next statement may be the rest of an instruction somebody put
+    // together by hand, and is assembled as written (GNU as's rule).
+    let mut bare = false;
 
     // Strip C-style /* */ comments (used in hand-written assembly like musl)
     let text = asm_preprocess::strip_c_comments(text);
@@ -698,8 +735,38 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
             if part.is_empty() {
                 continue;
             }
-            match parse_line_items(part) {
-                Ok(line_items) => items.extend(line_items),
+            match parse_line_items(part, optimize) {
+                Ok(mut line_items) => {
+                    if optimize != Optimize::Never {
+                        for item in &mut line_items {
+                            match item {
+                                AsmItem::Instruction(instruction) => {
+                                    if bare {
+                                        instruction.optimize = Optimize::Never;
+                                    }
+                                    bare = instruction.operands.is_empty()
+                                        && is_prefix_word(&instruction.mnemonic);
+                                }
+                                AsmItem::Byte(_)
+                                | AsmItem::Short(_)
+                                | AsmItem::Long(_)
+                                | AsmItem::Quad(_)
+                                | AsmItem::Uleb128(_)
+                                | AsmItem::Sleb128(_)
+                                | AsmItem::Addr(_)
+                                | AsmItem::Fill { .. }
+                                | AsmItem::Zero(_)
+                                | AsmItem::SkipExpr(..)
+                                | AsmItem::Asciz(_)
+                                | AsmItem::Ascii(_)
+                                | AsmItem::Org(..)
+                                | AsmItem::Incbin { .. } => bare = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    items.extend(line_items);
+                }
                 Err(e) => {
                     // Decorator diagnostics (`\0raw:`) are GAS-bare: GNU as
                     // reports them without location or source echo.
@@ -713,6 +780,16 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
     }
 
     Ok(items)
+}
+
+/// The one instruction a line is, if it is one and nothing else: no label
+/// in front of it, no directive, no second statement.
+pub(crate) fn parse_statement(line: &str, optimize: Optimize) -> Option<Instruction> {
+    let mut items = parse_line_items(line, optimize).ok()?;
+    match (items.pop(), items.is_empty()) {
+        (Some(AsmItem::Instruction(instruction)), true) => Some(instruction),
+        _ => None,
+    }
 }
 
 /// Whether `text` names a directive `expand_rept_blocks` acts on, anywhere
@@ -774,7 +851,7 @@ fn directive_arg<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
 ///
 /// A line may contain a label followed by an instruction on the same line
 /// (e.g., `1: stmxcsr -8(%rsp)`), which produces two items.
-fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
+fn parse_line_items(line: &str, optimize: Optimize) -> Result<Vec<AsmItem>, String> {
     let mut items = Vec::new();
 
     // Check for label (may be followed by instruction on same line)
@@ -841,10 +918,8 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
     // Parse the remaining content as a directive or instruction
     if rest.starts_with('.') {
         items.push(parse_directive(rest)?);
-    } else if is_prefixed_instruction(rest) {
-        items.push(parse_prefixed_instruction(rest)?);
     } else {
-        items.push(parse_instruction(rest, Vec::new())?);
+        items.push(parse_instruction(rest, optimize)?);
     }
 
     Ok(items)
@@ -1751,67 +1826,103 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
     Ok(AsmItem::Symver(name.to_string(), ver.to_string(), flag))
 }
 
-/// Does this line start with an instruction prefix followed by a mnemonic?
-///
-/// The separator is matched as "any whitespace", not a literal space:
-/// hand-written kernel assembly overwhelmingly uses TABS (`rep\tstosl` in
-/// arch/x86/boot/startup/efi-mixed.S). Matching only `"rep "` left the whole
-/// line as a single mnemonic `rep` with `stosl` parsed as a label operand.
 /// Words the assembler treats as leading instruction prefixes (HLE hints
 /// `xacquire`/`xrelease` included: they only ever appear prefix-stacked).
 /// `addr16`/`addr32`/`data16`/`data32` are the GAS spellings of the
-/// address-/operand-size overrides as standalone words. `rex`/`rex.x`
-/// force explicit legacy REX bits; `rex64` also sets W (64-bit mode only).
-const INSN_PREFIXES: [&str; 22] = [
+/// address-/operand-size overrides as standalone words. The REX words are
+/// not listed here: [`rex_prefix_word`] reads them.
+pub(crate) const INSN_PREFIXES: [&str; 19] = [
     "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs", "gs",
-    "xacquire", "xrelease", "addr16", "addr32", "data16", "data32", "rex", "rex.x", "rex64",
+    "xacquire", "xrelease", "addr16", "addr32", "data16", "data32",
 ];
 
-fn is_prefixed_instruction(rest: &str) -> bool {
-    // Segment-override names are legal instruction prefixes in their own right:
-    // the kernel writes `ds wrmsr` (arch/x86/include/asm/msr.h) to reserve a
-    // byte that ALTERNATIVE can later patch into a different encoding.
-    // Case-insensitive: GAS accepts `REP MOVSQ` and `LOCK ADDQ` (glibc .S
-    // files use uppercase; `REP MOVSQ` used to fall through to the bare
-    // `rep` arm, emit a lone 0xF3 and SILENTLY DROP the instruction).
-    match rest.split_once(|c: char| c.is_whitespace()) {
-        Some((head, tail)) => {
-            !tail.trim().is_empty() && INSN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(head))
-        }
-        None => false,
+/// The byte of a REX prefix word, whatever its case; `None` for any other
+/// word.
+///
+/// GNU as has thirty-one of them, three spellings of the sixteen bytes
+/// `40`..`4F` (`40` has one): `rex` and `rex64` (W set) with the letters
+/// `x`, `y`, `z` behind them for the bits R, X and B (`rexxz` is `45`,
+/// `rex64y` is `4A`), and `rex.` with the bits' own letters (`rex.wb` is
+/// `49`). The letters stand in the order of the bits, each once. lccc knew
+/// `rex`, `rex.x` and `rex64`; of the others, those with a dot were read as
+/// a mnemonic with a size suffix (`rex.b mov %eax, %ebx`: "operand size does
+/// not match register %ebx").
+pub(crate) fn rex_prefix_word(word: &str) -> Option<u8> {
+    let bytes = word.as_bytes();
+    if bytes.len() < 3 || !bytes[..3].eq_ignore_ascii_case(b"rex") {
+        return None;
     }
+    let (mut byte, letters, names): (u8, &[u8], &[u8]) = match &bytes[3..] {
+        [b'.', letters @ ..] if !letters.is_empty() => (0x40, letters, b"wrxb"),
+        [b'6', b'4', letters @ ..] => (0x48, letters, b"xyz"),
+        letters => (0x40, letters, b"xyz"),
+    };
+    // The last of `names` is bit 0; what is left of `names` behind a
+    // letter is what may still follow it.
+    let mut left = names;
+    for letter in letters {
+        let at = left
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(letter))?;
+        byte |= 1 << (left.len() - 1 - at);
+        left = &left[at + 1..];
+    }
+    Some(byte)
 }
 
-/// Parse a prefixed instruction like "lock cmpxchgq ..." or "rep movsb".
-/// Prefixes stack: collect every leading prefix word (`lock xacquire addl`
-/// yields ["lock", "xacquire"]) so the encoder can emit the full prefix run.
+/// Is `word` one of the prefix words? Whatever its case: GNU as takes
+/// `REP MOVSQ` and `LOCK ADDQ` (glibc's .S files write them so; `REP MOVSQ`
+/// used to fall through to the bare `rep` arm, emit a lone 0xF3 and SILENTLY
+/// DROP the instruction).
+pub(crate) fn is_prefix_word(word: &str) -> bool {
+    INSN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(word)) || rex_prefix_word(word).is_some()
+}
+
+/// Parse an instruction line: the words in front of the mnemonic, the
+/// mnemonic and its operands.
+///
+/// In front of the mnemonic stand prefix words (`lock cmpxchgq ...`, `rep
+/// movsb`) and encoding requests (`{evex}`, `{nooptimize}`), any number of
+/// either and in any order: GNU as reads both kinds in one loop until it
+/// meets a mnemonic that is neither, so `{rex2} lock addl $1, (%rax)` and
+/// `{nooptimize} rep movsb` are statements. They used to be "no such
+/// instruction": requests were read only directly in front of the
+/// mnemonic, and prefix words only at the start of the line.
+///
+/// Prefix words stack: every one is collected (`lock xacquire addl` yields
+/// ["lock", "xacquire"]) so the encoder can emit the full prefix run.
 /// Duplicate detection lives in the encoder (it compares prefix BYTES:
-// `rep repe movsb` is two spellings of one byte).
-fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
+/// `rep repe movsb` is two spellings of one byte). A prefix word with
+/// nothing behind it is a statement of its own (`lock` on its line is the
+/// byte F0) and is left to be the mnemonic.
+///
+/// The separator behind a prefix word is any whitespace, not a literal
+/// space: hand-written kernel assembly overwhelmingly uses TABS (`rep\tstosl`
+/// in arch/x86/boot/startup/efi-mixed.S). Matching only `"rep "` left the
+/// whole line as a single mnemonic `rep` with `stosl` parsed as a label
+/// operand.
+fn parse_instruction(line: &str, optimize: Optimize) -> Result<AsmItem, String> {
     let mut rest = line.trim();
-    let mut prefixes: Vec<String> = Vec::new();
-    while let Some((head, tail)) = rest.split_once(|c: char| c.is_whitespace()) {
-        // Case-insensitive match (GAS: `REP MOVSQ`); store the canonical
-        // lowercase spelling so the encoder's byte mapping stays exact.
-        if !tail.trim().is_empty() && INSN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(head)) {
-            prefixes.push(head.to_ascii_lowercase());
-            rest = tail.trim();
-        } else {
-            break;
-        }
-    }
-    parse_instruction(rest, prefixes)
-}
-
-/// Parse an instruction line.
-fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
+    if rest.is_empty() {
         return Ok(AsmItem::Empty);
     }
 
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut hints = EncodingHints::default();
+    loop {
+        rest = hints.take_from(rest);
+        match rest.split_once(|c: char| c.is_whitespace()) {
+            // Stored in the canonical lowercase spelling so the encoder's
+            // byte mapping stays exact.
+            Some((head, tail)) if is_prefix_word(head) && !tail.trim().is_empty() => {
+                prefixes.push(head.to_ascii_lowercase());
+                rest = tail.trim_start();
+            }
+            _ => break,
+        }
+    }
+
     // Split mnemonic from operands
-    let (nf, force_evex, vex_hint, force_rex2, rest) = parse_encoding_hints(trimmed);
     let (mnemonic, operand_str) = split_mnemonic_operands(rest);
     let (dfv, operand_str) = parse_dfv_hint(operand_str)?;
 
@@ -1831,54 +1942,70 @@ fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, Strin
         prefixes,
         mnemonic: mnemonic.to_string(),
         operands,
-        nf,
-        force_evex,
-        vex_hint,
-        force_rex2,
+        nf: hints.nf,
+        force_evex: hints.force_evex,
+        vex_hint: hints.vex_hint,
+        force_rex2: hints.force_rex2,
         dfv,
+        optimize: if hints.nooptimize {
+            Optimize::Never
+        } else {
+            optimize
+        },
     }))
 }
 
-/// Strip stacked GNU as encoding-prefix hints (`{nf}`, `{evex}`, `{rex2}`,
-/// `{vex}`/`{vex2}`/`{vex3}`). The VEX selectors forbid the EVEX row;
-/// `{vex3}` also controls the prefix length when C5 would be legal.
-/// Selectors are last-wins, while incompatible APX modifiers are validated
-/// by the encoder (GAS accepts them syntactically, but rejects the instruction).
-fn parse_encoding_hints(line: &str) -> (bool, bool, Option<VexHint>, bool, &str) {
-    let mut nf = false;
-    let mut force_evex = false;
-    let mut vex_hint = None;
-    let mut force_rex2 = false;
-    let mut s = line.trim_start();
-    loop {
-        if !s.starts_with('{') {
-            break;
-        }
-        let Some(close) = s.find('}') else {
-            break;
-        };
-        match &s[1..close] {
-            "nf" => nf = true,
-            // GAS 2.47: `{vex} {evex} vpdpbusd` selects EVEX, while
-            // `{evex} {vex} vpdpbusd` selects VEX.
-            "evex" => {
-                force_evex = true;
-                vex_hint = None;
+/// GNU as's encoding requests in front of a mnemonic (`{nf}`, `{evex}`,
+/// `{rex2}`, `{vex}`/`{vex2}`/`{vex3}`, `{nooptimize}`). The VEX selectors
+/// forbid the EVEX row; `{vex3}` also controls the prefix length when C5
+/// would be legal. Selectors are last-wins, while incompatible APX
+/// modifiers are validated by the encoder (GAS accepts them syntactically,
+/// but rejects the instruction).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EncodingHints {
+    nf: bool,
+    force_evex: bool,
+    vex_hint: Option<VexHint>,
+    force_rex2: bool,
+    /// GNU as `{nooptimize}`: this statement as written, whatever the
+    /// command line says.
+    nooptimize: bool,
+}
+
+impl EncodingHints {
+    /// Take the requests `line` starts with; what is left of the line.
+    /// A brace that opens no request known here is left where it is, for
+    /// the mnemonic parser to refuse.
+    fn take_from<'a>(&mut self, line: &'a str) -> &'a str {
+        let mut s = line.trim_start();
+        while s.starts_with('{') {
+            let Some(close) = s.find('}') else {
+                break;
+            };
+            match &s[1..close] {
+                "nf" => self.nf = true,
+                // GAS 2.47: `{vex} {evex} vpdpbusd` selects EVEX, while
+                // `{evex} {vex} vpdpbusd` selects VEX.
+                "evex" => {
+                    self.force_evex = true;
+                    self.vex_hint = None;
+                }
+                "rex2" => self.force_rex2 = true,
+                "nooptimize" => self.nooptimize = true,
+                hint @ ("vex" | "vex2" | "vex3") => {
+                    self.vex_hint = Some(match hint {
+                        "vex2" => VexHint::Vex2,
+                        "vex3" => VexHint::Vex3,
+                        _ => VexHint::Vex,
+                    });
+                    self.force_evex = false;
+                }
+                _ => break,
             }
-            "rex2" => force_rex2 = true,
-            "vex" | "vex2" | "vex3" => {
-                vex_hint = Some(match &s[1..close] {
-                    "vex2" => VexHint::Vex2,
-                    "vex3" => VexHint::Vex3,
-                    _ => VexHint::Vex,
-                });
-                force_evex = false;
-            }
-            _ => break,
+            s = s[close + 1..].trim_start();
         }
-        s = s[close + 1..].trim_start();
+        s
     }
-    (nf, force_evex, vex_hint, force_rex2, s)
 }
 
 /// GNU as `{dfv=cf,zf,sf,of}` sits *after* the mnemonic (never as a leading
@@ -6354,7 +6481,7 @@ main:
 
     #[test]
     fn dot_assignment_lowers_to_org_with_zero_fill() {
-        let items = parse_line_items(". = base + (2 * 6)").unwrap();
+        let items = parse_line_items(". = base + (2 * 6)", Optimize::Never).unwrap();
         assert_eq!(items.len(), 1);
         match &items[0] {
             AsmItem::Org(sym, off, fill) => {
@@ -6364,7 +6491,7 @@ main:
             }
             other => panic!("expected Org, got {other:?}"),
         }
-        let items = parse_line_items("label: . = 8").unwrap();
+        let items = parse_line_items("label: . = 8", Optimize::Never).unwrap();
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0], AsmItem::Label(_)));
         assert!(matches!(items[1], AsmItem::Org(_, 8, 0)));
@@ -6380,7 +6507,10 @@ main:
             ". >= 8",
             ". = (1 + 2",
         ] {
-            assert!(parse_line_items(src).is_err(), "accepted {src:?}");
+            assert!(
+                parse_line_items(src, Optimize::Never).is_err(),
+                "accepted {src:?}"
+            );
         }
     }
 
@@ -6791,6 +6921,180 @@ mod integer_grammar_equivalence_tests {
                 "{text:?}: got {err:?}, want it to mention {want:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_word_tests {
+    use super::*;
+
+    /// The one instruction of `line`, read as a text that may be
+    /// optimized: `{nooptimize}` shows.
+    fn instruction(line: &str) -> Instruction {
+        let items = parse_asm_with(line, Optimize::Faster)
+            .unwrap_or_else(|e| panic!("parse `{line}`: {e}"));
+        let mut instructions = items.into_iter().filter_map(|item| match item {
+            AsmItem::Instruction(instruction) => Some(instruction),
+            _ => None,
+        });
+        match (instructions.next(), instructions.next()) {
+            (Some(instruction), None) => instruction,
+            _ => panic!("`{line}` is not one instruction"),
+        }
+    }
+
+    /// GNU as 2.47's table: thirty-one REX words for the sixteen bytes.
+    #[test]
+    fn every_rex_word_is_its_byte() {
+        let letters = |bits: u8, names: &str| -> String {
+            names
+                .chars()
+                .rev()
+                .enumerate()
+                .filter(|(bit, _)| bits & (1 << bit) != 0)
+                .map(|(_, name)| name)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        };
+        let mut words = 0;
+        for byte in 0x40..=0x4Fu8 {
+            let low = byte & 0x0F;
+            // `rex` and the letters x, y, z; with W, `rex64` and the same.
+            let plain = format!(
+                "{}{}",
+                if low & 8 != 0 { "rex64" } else { "rex" },
+                letters(low & 7, "xyz")
+            );
+            assert_eq!(rex_prefix_word(&plain), Some(byte), "{plain}");
+            words += 1;
+            // `rex.` and the letters w, r, x, b; `rex.` alone is no word.
+            if low != 0 {
+                let dotted = format!("rex.{}", letters(low, "wrxb"));
+                assert_eq!(rex_prefix_word(&dotted), Some(byte), "{dotted}");
+                assert_eq!(rex_prefix_word(&dotted.to_ascii_uppercase()), Some(byte));
+                words += 1;
+            }
+        }
+        assert_eq!(words, 31);
+        assert_eq!(rex_prefix_word("rex"), Some(0x40));
+        assert_eq!(rex_prefix_word("rexz"), Some(0x41));
+        assert_eq!(rex_prefix_word("rex64xyz"), Some(0x4F));
+        assert_eq!(rex_prefix_word("rex.wrxb"), Some(0x4F));
+    }
+
+    /// The letters stand in the order of the bits, each once; anything
+    /// else is no prefix word.
+    #[test]
+    fn what_is_no_rex_word() {
+        for word in [
+            "rex.", "rex.y", "rex.z", "rex.bw", "rex.ww", "rex.xr", "rexw", "rexb", "rexzx",
+            "rexxx", "rex64w", "rex64.w", "rex32", "rex6", "re", "rexq", "rex.w.b", "rax", "",
+        ] {
+            assert_eq!(rex_prefix_word(word), None, "{word}");
+            assert!(!is_prefix_word(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn the_prefix_words() {
+        for word in INSN_PREFIXES {
+            assert!(is_prefix_word(word), "{word}");
+            assert!(is_prefix_word(&word.to_ascii_uppercase()), "{word}");
+        }
+        for word in ["rex", "rex.w", "rex64z", "REX.WB"] {
+            assert!(is_prefix_word(word), "{word}");
+        }
+        for word in ["mov", "bnd", "wait", "{rex2}", "lockq"] {
+            assert!(!is_prefix_word(word), "{word}");
+        }
+    }
+
+    /// Prefix words and encoding requests stand in front of the mnemonic
+    /// in any order, as GNU as reads them.
+    #[test]
+    fn requests_and_prefix_words_in_any_order() {
+        for line in [
+            "{rex2} lock addl $1, (%rax)",
+            "lock {rex2} addl $1, (%rax)",
+            "{rex2}\tlock\taddl $1, (%rax)",
+            "LOCK {rex2} addl $1, (%rax)",
+        ] {
+            let got = instruction(line);
+            assert_eq!(got.prefixes, ["lock"], "{line}");
+            assert_eq!(got.mnemonic, "addl", "{line}");
+            assert!(got.force_rex2, "{line}");
+            assert_eq!(got.operands.len(), 2, "{line}");
+        }
+        let got = instruction("{nooptimize} rep movsb");
+        assert_eq!(got.prefixes, ["rep"]);
+        assert_eq!(got.mnemonic, "movsb");
+        assert_eq!(got.optimize, Optimize::Never);
+        assert_eq!(instruction("rep movsb").optimize, Optimize::Faster);
+
+        let got = instruction("cs {evex} data16 {nf} xacquire lock addl %eax, (%rbx)");
+        assert_eq!(got.prefixes, ["cs", "data16", "xacquire", "lock"]);
+        assert!(got.force_evex && got.nf);
+        assert_eq!(got.mnemonic, "addl");
+
+        // The last of `{vex}` and `{evex}` is the one that holds, wherever
+        // the prefix words stand.
+        let got = instruction("{vex} cs {evex} vaddps (%rax), %xmm1, %xmm2");
+        assert!(got.force_evex && got.vex_hint.is_none());
+        let got = instruction("{evex} cs {vex3} vaddps (%rax), %xmm1, %xmm2");
+        assert!(!got.force_evex);
+        assert_eq!(got.vex_hint, Some(VexHint::Vex3));
+    }
+
+    /// Every REX word is a prefix word in front of an instruction: those
+    /// with a dot used to be read as a mnemonic with a size suffix.
+    #[test]
+    fn rex_words_are_prefixes() {
+        for word in ["rex", "rex.b", "rex.wrxb", "rexxz", "rex64", "rex64y"] {
+            let got = instruction(&format!("{word} mov %eax, %ebx"));
+            assert_eq!(got.prefixes, [word]);
+            assert_eq!(got.mnemonic, "mov");
+        }
+    }
+
+    /// A prefix word with nothing behind it is a statement of its own.
+    #[test]
+    fn a_lone_prefix_word_is_the_mnemonic() {
+        for word in ["lock", "rep", "data16", "cs", "rex64", "rex.w", "notrack"] {
+            let got = instruction(word);
+            assert!(got.prefixes.is_empty(), "{word}");
+            assert_eq!(got.mnemonic, word);
+            assert!(got.operands.is_empty(), "{word}");
+            // Behind a request too.
+            let got = instruction(&format!("{{nooptimize}} {word}"));
+            assert_eq!(got.mnemonic, word);
+            assert_eq!(got.optimize, Optimize::Never);
+        }
+    }
+
+    /// A brace that opens no request is left for the mnemonic parser.
+    #[test]
+    fn requests_taken_from_the_front() {
+        let mut hints = EncodingHints::default();
+        assert_eq!(
+            hints.take_from("  {nf} {evex}  addl %eax, %ebx"),
+            "addl %eax, %ebx"
+        );
+        assert!(hints.nf && hints.force_evex && !hints.force_rex2 && !hints.nooptimize);
+        assert_eq!(hints.vex_hint, None);
+
+        let mut hints = EncodingHints::default();
+        assert_eq!(hints.take_from("{vex2} {bogus} vaddps"), "{bogus} vaddps");
+        assert_eq!(hints.vex_hint, Some(VexHint::Vex2));
+
+        let mut hints = EncodingHints::default();
+        assert_eq!(hints.take_from("{rex2"), "{rex2");
+        assert_eq!(hints, EncodingHints::default());
+
+        let mut hints = EncodingHints::default();
+        assert_eq!(hints.take_from("lock {rex2} nop"), "lock {rex2} nop");
+        assert_eq!(hints, EncodingHints::default());
     }
 }
 

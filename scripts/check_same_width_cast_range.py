@@ -19,7 +19,13 @@ This harness proves all three directions simultaneously:
    sign-clear negatives -- MUST still contain one.  A checker that only
    counted a global total would be vacuous, so each function is asserted
    separately.  `CCC_VERIFY_IR=abort` and `CCC_VALIDATE_SSA=1` also prove
-   the IR is structurally valid on every host/cross compile.
+   the IR is structurally valid on every host/cross compile.  The four
+   functions that ask "is it negative?" inside the function must still ASK it
+   in the final IR (a signed ordering Cmp): a sign bit that is set is a known
+   bit, `s < 0` on it is decided at compile time by all four compilers, and a
+   function that returns the constant observes no register home at run time
+   and leaves no Cast to count.  The fixture therefore compares against a
+   volatile zero, and the census fails the day a fold decides that too.
 2. HOST EXECUTION: LCCC, GCC 16.2, Clang 23.1.5 and (when available) ICX
    compile the same fixture; every exit status equals an independent Python
    oracle that includes `b < 0`, exact bit-pattern checks and a 64-bit
@@ -109,6 +115,11 @@ KEPT = (
     "u8_unproven", "i8_unproven", "u16_unproven", "i16_unproven",
     "u32_unproven", "i32_unproven", "u64_unproven", "i64_unproven",
 )
+# The functions whose answer is a sign test made inside the function, before
+# the return ABI can repair a register home.  Each must keep a signed ordering
+# compare in the final IR; without it the answer is a compile-time constant.
+OBSERVED = ("signbit_is_negative", "u8_signbit", "u16_signbit", "u64_signbit")
+SIGN_TEST_RE = re.compile(r"Cmp \{[^}]*op:\s*S(?:lt|le|gt|ge)\b")
 VERIFY_ENV = {"CCC_VERIFY_IR": "abort", "CCC_VALIDATE_SSA": "1"}
 INDUCTION_FIXTURE = ROOT / "tests" / "regression" / "same_width_cast_range" / "induction.c"
 # FNV-1a over loop_count(bits, n) for n=0..4096, argc=1 (seed=2).
@@ -174,6 +185,9 @@ def ir_census(lccc: Path, work: Path) -> dict:
         "ir_bytes": len(dump),
         "sections": sorted(sections),
         "cast_counts": counts,
+        "sign_tests": {
+            fn: len(SIGN_TEST_RE.findall(sections.get(fn, ""))) for fn in OBSERVED
+        },
         "dump_sha256": __import__("hashlib").sha256(dump.encode()).hexdigest(),
     }
 
@@ -392,6 +406,15 @@ def evaluate(report: dict) -> list[str]:
     for fn in KEPT:
         if counts.get(fn, 0) < 1:
             bad.append(f"{fn}: required guard Cast was lost (count={counts.get(fn)})")
+    sign_tests = ir.get("sign_tests") or {}
+    for fn in OBSERVED:
+        if fn not in sections and fn not in (*FOLDED, *KEPT):
+            bad.append(f"IR section {fn} is missing")
+        if sign_tests.get(fn, 0) < 1:
+            bad.append(
+                f"{fn}: the sign test was decided at compile time "
+                f"(signed compares={sign_tests.get(fn)}); nothing is observed at run time"
+            )
     cross = report.get("cross") or []
     isas = [t["isa"] for t in TARGETS]
     if sorted(r["isa"] for r in cross) != sorted(isas):
@@ -451,11 +474,12 @@ def self_test() -> int:
         "verifier_env": dict(VERIFY_ENV),
         "ir": {
             "ir_bytes": 4000,
-            "sections": sorted((*FOLDED, *KEPT)),
+            "sections": sorted({*FOLDED, *KEPT, *OBSERVED}),
             "cast_counts": {
                 **{fn: 0 for fn in FOLDED},
                 **{fn: 1 for fn in KEPT},
             },
+            "sign_tests": {fn: 1 for fn in OBSERVED},
         },
         "cross": [
             {"isa": t["isa"], "exit": ORACLE, "elf_machine_ok": True, "instructions": 50}
@@ -514,6 +538,17 @@ def self_test() -> int:
             lambda r, fn=fn: r["ir"]["cast_counts"].update({fn: 0}),
             f"{fn}: required guard Cast was lost",
         ))
+    for fn in OBSERVED:
+        mutations.append((
+            f"{fn} decided at compile time",
+            lambda r, fn=fn: r["ir"]["sign_tests"].update({fn: 0}),
+            f"{fn}: the sign test was decided at compile time",
+        ))
+    mutations.append((
+        "sign-test census absent",
+        lambda r: r["ir"].pop("sign_tests"),
+        "signbit_is_negative: the sign test was decided at compile time",
+    ))
     mutations.extend([
         ("induction oracle drift",
          lambda r: r["induction"].update(oracle=INDUCTION_ORACLE + 1),
@@ -623,8 +658,17 @@ def main(argv: list[str]) -> int:
         args.json.write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")
     for h in report.get("hosts", []):
         print(f"PASS host {h['compiler']:10} exit={h['exit']:3} oracle={ORACLE}")
+    # A line says PASS only for a function no verdict names: the census lines
+    # used to print PASS beside the FAIL of the same function.
+    def verdict(fn: str, what: str) -> str:
+        return "FAIL" if any(b.startswith(f"{fn}: ") and what in b for b in bad) else "PASS"
+
     for fn in (*FOLDED, *KEPT):
-        print(f"PASS IR {fn:20} casts={report.get('ir', {}).get('cast_counts', {}).get(fn)}")
+        print(f"{verdict(fn, 'Cast')} IR {fn:20} "
+              f"casts={report.get('ir', {}).get('cast_counts', {}).get(fn)}")
+    for fn in OBSERVED:
+        print(f"{verdict(fn, 'sign test')} IR {fn:20} "
+              f"sign tests={report.get('ir', {}).get('sign_tests', {}).get(fn)}")
     for r in report.get("cross", []):
         print(f"PASS {r['isa']:8} exit={r['exit']:3} instructions={r['instructions']}")
     ind = report.get("induction") or {}

@@ -158,7 +158,9 @@ def main():
                             depth += int(m[1])
                         elif established and (m := re.search(r'leaq\s+(-?\d+)\(%rbp\),\s*%rsp', line)):
                             depth = -int(m[1])
-                        if m := re.search(r'movdqu\s+%xmm(\d+),\s*(-?\d+)\(%rbp\)', line):
+                        # (A vector store is written `movups`: the same
+                        # sixteen bytes stored, one prefix byte less.)
+                        if m := re.search(r'mov(?:dqu|ups)\s+%xmm(\d+),\s*(-?\d+)\(%rbp\)', line):
                             reg, displacement = int(m[1]), int(m[2])
                             assert established and -depth <= displacement and displacement+16 <= 0, (opt, depth, line)
                             saved.add(reg)

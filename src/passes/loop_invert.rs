@@ -30,10 +30,12 @@
 //! # Why here and not in `loop_rotate`
 //!
 //! [`crate::passes::loop_rotate`] does this on SSA, where duplicating the
-//! header means rewriting header phis; that is the part which produced a
-//! string of miscompiles, and the pass is still opt-in and restricted to
-//! single-block bodies (it declines `k_memchr` with
-//! `not single-block body (body_len=3)`).
+//! header means giving every reader of a header value the definition that
+//! reaches it. That pass rotates the loops out of which something then moves
+//! (the block it puts behind the guard is where LICM, the memory promoter
+//! and loop-carried forwarding may put what must not run when the loop does
+//! not) and leaves bottom-testing every other loop to this one, which has
+//! far less to get wrong:
 //!
 //! This pass runs after `eliminate_phis`, so **there are no phis left**.
 //! Inversion degenerates to copying a handful of side-effect-free

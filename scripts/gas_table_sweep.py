@@ -42,16 +42,25 @@ The table also says what a mnemonic does *not* take.  For every mnemonic and
 operand position, a register of each kind no row has there is put in --
 `rdrand %xmm0`, `adc %cl, %mm3`, `addps %ecx, %xmm1` -- and in the vector
 positions of every row vector registers of every width, in every combination
--- `vaddps %ymm1, %xmm2, %xmm3`, `vpermd %xmm1, %xmm2, %xmm3`.  Of the
-statements GNU as refuses, lccc has to refuse every one:
+-- `vaddps %ymm1, %xmm2, %xmm3`, `vpermd %xmm1, %xmm2, %xmm3`.  And the
+statements made from the rows themselves that GNU as refuses are asked too: a
+size suffix on a register of another width (`cmovaq (%rsp), %r9w`), general
+registers of two widths where a row takes one of several (`shrd %cl, %ebp,
+%r13`), a vector register only EVEX reaches on an opcode without one
+(`vfrczpd %xmm17, %xmm17`).  Of the statements GNU as refuses, lccc has to
+refuse every one:
 
   ACCEPT   GNU as refuses the statement, lccc assembles it
 
-An encoder that goes by a register's number, or takes an instruction's vector
-length from one operand and never looks at the others, assembles such a
-statement into an instruction on other registers; the first runs found 17,000
-and 1,200 of them assembled.  One that is left is recorded by name.  (64-bit
-and 32-bit mode; the 16-bit modes use the 32-bit encoder.)
+An encoder that goes by a register's number, takes an instruction's vector
+length from one operand and never looks at the others, or takes the operand
+size from a suffix and never looks at the register, assembles such a statement
+into an instruction on other registers; the first runs found 17,000, 1,200
+and 670 of them assembled.  One that is left is recorded by name.  (64-bit,
+32-bit and `.code16` code: an operand-size prefix means the other size in
+16-bit code, so what an encoding is as wide as is asked there too.
+`.code16gcc` differs from it in the size of a few statements without a
+suffix.)
 
 The table is GPL-3.0-or-later and is *read*, never copied: it is fetched at a
 pinned commit, verified against a pinned SHA-256 (the same pin
@@ -89,6 +98,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -119,7 +129,7 @@ class Mode:
 MODES = {
     "64": Mode("64", True, ("--64",), (), "", False, True),
     "32": Mode("32", False, ("--32",), ("-m32",), "", False, True),
-    "16": Mode("16", False, ("--32",), ("-m32",), ".code16", True, False),
+    "16": Mode("16", False, ("--32",), ("-m32",), ".code16", True, True),
     "16gcc": Mode("16gcc", False, ("--32",), ("-m32",), ".code16gcc", True, False),
 }
 
@@ -144,9 +154,9 @@ FOREIGN = (
     ("RegMask", "%k2"),
 )
 VECTOR_REGISTERS = {"RegXMM", "RegYMM", "RegZMM"}
-# Of those statements, one in this many is swept: each takes a run of lccc
-# of its own, which stops at the first statement it refuses.
-FOREIGN_SHARE = 3
+# Of those statements, one in this many is swept: all of them. (It was one
+# in three while each took a run of lccc of its own; `assemble_each`.)
+FOREIGN_SHARE = 1
 
 # The assembler the expectation files were recorded with. Another release
 # assembles another set of statements, so a comparison against it says
@@ -287,8 +297,16 @@ def logical_lines(text: str) -> list[str]:
     return out
 
 
+# The mnemonics whose number the table has in front and a statement behind:
+# `out %al, $5` is the row `{ Imm8, Acc }`. GNU as exchanges the two before
+# it looks for the row ("OUT, UWRMSR, and WRMSRNS want their immediate to be
+# in the canonical place", `md_assemble` in gas/config/tc-i386.c).
+NUMBER_LAST = {"out", "uwrmsr", "wrmsrns"}
+
+
 def expand_rows(text: str):
-    """Yield (mnemonic, opcode, cpu, attributes, operand class sets), templates expanded."""
+    """Yield (mnemonic, opcode, cpu, attributes, operand class sets), templates
+    expanded and the operands in the order a statement has them."""
     templates: dict[str, list[dict]] = {}
     rows = []
     for line in logical_lines(text):
@@ -343,6 +361,9 @@ def expand_rows(text: str):
                                 for o in split_top(inner)]
             if "SSE2AVX" in attributes:
                 mnemonic = "v" + mnemonic
+            if (mnemonic in NUMBER_LAST and len(operands) > 1
+                    and any(c.startswith("Imm") for c in operands[0])):
+                operands[0], operands[1] = operands[1], operands[0]
             yield mnemonic, parts[1].strip(), parts[2].strip(), attributes, operands
 
 
@@ -793,14 +814,27 @@ def assemble_lccc(all_statements: list[str], indexes: list[int], lccc: str,
     return good, refused, crashed
 
 
+# How many statements one run of lccc is given in `assemble_each`, each as a
+# file of its own.
+EACH_BATCH = 400
+
+
 def assemble_each(all_statements: list[str], indexes: list[int], lccc: str,
                   mode: Mode, tmp: Path):
     """What lccc makes of each statement on its own: for the ones GNU as refuses.
 
     Two maps by statement index: the bytes of the ones it assembles, and
-    what happened to the ones it neither assembles nor refuses. lccc stops
-    at the first statement it refuses, so a batch says nothing about the
-    statements behind that one; each gets a run.
+    what happened to the ones it neither assembles nor refuses.
+
+    lccc stops a file at the first statement it refuses, so a file says
+    nothing about the statements behind that one, and each statement is a
+    file of its own. It goes on with the files behind one it refuses, as GCC
+    does, so one run takes many of them: an object is there for a statement
+    it assembles and not for one it refuses. (With a run for each statement
+    the 64-bit sweep took 115 seconds for one statement in three; it takes 36
+    for all of them.) A run that ends in anything but a refusal, and a driver
+    that does not go on, say nothing about the statements without an object:
+    those get a run each.
     """
     def one(i: int):
         source, obj = tmp / f"f{i}.s", tmp / f"f{i}.o"
@@ -822,14 +856,69 @@ def assemble_each(all_statements: list[str], indexes: list[int], lccc: str,
         status = "no exit status" if code is None else f"exit status {code}"
         return i, "CRASH", f"{status}: {first}" if first else status
 
+    def many(batch: tuple[int, list[int]]):
+        """(verdicts of the statements the run settles, the ones it does not)."""
+        number, part = batch
+        directory = tmp / f"each{number}"
+        directory.mkdir()
+        for i in part:
+            (directory / f"{i}.s").write_text(batch_source([all_statements[i]], mode.prelude))
+        try:
+            result = run([lccc, *mode.lccc, "-c", *(f"{i}.s" for i in part)],
+                         timeout=600, cwd=directory)
+            code, message = result.returncode, (result.stderr or result.stdout)
+        except subprocess.TimeoutExpired:
+            code, message = None, ""
+        settled, open_ = [], []
+        ended_well = code in (0, REFUSED) and "panicked" not in message \
+            and "internal error" not in message
+        for i in part:
+            obj = directory / f"{i}.o"
+            got = read_batch(str(obj), 1) if obj.exists() else None
+            if got is not None:
+                settled.append((i, "ACCEPT", f"lccc {got[0][0].hex()}"))
+            elif obj.exists() or not ended_well:
+                # An object that cannot be read back, or no word on this one.
+                open_.append(i)
+        shutil.rmtree(directory, ignore_errors=True)
+        return settled, open_
+
     accepted, crashed = {}, {}
+
+    def record(i: int, verdict: str | None, detail: str) -> None:
+        if verdict == "ACCEPT":
+            accepted[i] = detail
+        elif verdict == "CRASH":
+            crashed[i] = detail
+
     with ThreadPoolExecutor(os.cpu_count() or 1) as pool:
-        for i, verdict, detail in pool.map(one, indexes):
-            if verdict == "ACCEPT":
-                accepted[i] = detail
-            elif verdict == "CRASH":
-                crashed[i] = detail
+        alone = list(indexes)
+        if goes_on(lccc, mode, tmp):
+            batches = [(number, indexes[start:start + EACH_BATCH])
+                       for number, start in enumerate(range(0, len(indexes), EACH_BATCH))]
+            alone = []
+            for settled, open_ in pool.map(many, batches):
+                for found in settled:
+                    record(*found)
+                alone += open_
+        for found in pool.map(one, alone):
+            record(*found)
     return accepted, crashed
+
+
+def goes_on(lccc: str, mode: Mode, tmp: Path) -> bool:
+    """Whether lccc assembles the input behind one it refuses."""
+    directory = tmp / "goes-on"
+    directory.mkdir(exist_ok=True)
+    (directory / "refused.s").write_text(batch_source(["nosuchinstruction"], mode.prelude))
+    (directory / "taken.s").write_text(batch_source(["nop"], mode.prelude))
+    try:
+        run([lccc, *mode.lccc, "-c", "refused.s", "taken.s"], timeout=300, cwd=directory)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    went_on = (directory / "taken.o").exists() and not (directory / "refused.o").exists()
+    shutil.rmtree(directory, ignore_errors=True)
+    return went_on
 
 
 # ─── Verdicts and the expectation file ────────────────────────────────────
@@ -894,7 +983,12 @@ def sweep_rows(rows, mode: Mode, gas: str, lccc: str, *, per_row: int, seed: int
                     findings[verdict].append((ordered[i], detail))
         report = Report(len(rows), len(ordered), len(indexes), same, findings)
         if mode.foreign and foreign:
-            other = foreign_statements(rows, mode, only, seed, share)
+            # The statements with a register no row takes, and of the
+            # statements made from the rows above the ones GNU as refuses:
+            # a size suffix on a register of another width, registers of
+            # two widths where a row takes one of each of several.
+            other = sorted(set(foreign_statements(rows, mode, only, seed, share))
+                           | {ordered[i] for i in range(len(ordered)) if i not in reference})
             valid = assemble_gas(other, gas, mode, tmp)
             invalid = [i for i in range(len(other)) if i not in valid]
             accepted, crashed = assemble_each(other, invalid, lccc, mode, tmp)
@@ -1085,40 +1179,59 @@ def update(report: Report, mode: Mode) -> int:
 # ─── The gate, held to a planted defect of every kind ─────────────────────
 
 # An assembler behind lccc's command line: GNU as itself, which with
-# `plant` set does to one statement each what every verdict is about.
+# `plant` set does to one statement each what every verdict is about. Given
+# several files and no `-o` it assembles each into an object beside it, as a
+# compiler driver does, and with `stops` set it ends at the first one it
+# refuses, as lccc did.
 PLANTED = """#!{python}
 import os, subprocess, sys
 args = sys.argv[1:]
-source, obj = args[-1], args[args.index("-o") + 1]
 gas = [{gas!r}, "--32" if "-m32" in args else "--64"]
-lines = open(source).read().split("\\n")
-head = [line for line in lines[:2] if line.startswith("\\t.")]
-for i, line in enumerate(lines):
-    if not ({plant} and line.startswith("1:\\t")):
-        continue
-    statement = line[3:]
-    if statement == "cmc":
-        sys.exit("planted: error: no such instruction")        # REJECT
-    if statement == "sti":
-        sys.exit(3)                                             # CRASH
-    if statement == "cli":
-        open(obj, "wb").write(b"no object")                     # CRASH
-        sys.exit(0)
-    if statement == "clc":
-        lines[i] = "1:\\tstc"                                    # DIFF
-    if statement == "cld":
-        lines[i] = "1:\\tcld; nop"                               # LONGER
-    if statement == "stc":
-        lines[i] = "1:"                                         # SHORTER
-    if " %" in statement:
-        alone = "\\n".join(head + [statement, ""])
-        if subprocess.run(gas + ["-o", os.devnull, "-"], input=alone, text=True,
-                          capture_output=True).returncode:
-            if statement.startswith("nop "):
-                sys.exit(3)                                     # CRASH
-            lines[i] = "1:\\tnop"                                # ACCEPT
-open(source, "w").write("\\n".join(lines))
-sys.exit(subprocess.run(gas + ["-o", obj, source]).returncode)
+if "-o" in args:
+    files = [(args[-1], args[args.index("-o") + 1])]
+else:
+    files = [(name, name[:-2] + ".o") for name in args if name.endswith(".s")]
+
+
+def assemble(source, obj):
+    lines = open(source).read().split("\\n")
+    head = [line for line in lines[:2] if line.startswith("\\t.")]
+    for i, line in enumerate(lines):
+        if not ({plant} and line.startswith("1:\\t")):
+            continue
+        statement = line[3:]
+        if statement == "cmc":
+            print("planted: error: no such instruction", file=sys.stderr)
+            return 1                                            # REJECT
+        if statement == "sti":
+            sys.exit(3)                                         # CRASH
+        if statement == "cli":
+            open(obj, "wb").write(b"no object")                 # CRASH
+            return 0
+        if statement == "clc":
+            lines[i] = "1:\\tstc"                                # DIFF
+        if statement == "cld":
+            lines[i] = "1:\\tcld; nop"                           # LONGER
+        if statement == "stc":
+            lines[i] = "1:"                                     # SHORTER
+        if " %" in statement:
+            alone = "\\n".join(head + [statement, ""])
+            if subprocess.run(gas + ["-o", os.devnull, "-"], input=alone, text=True,
+                              capture_output=True).returncode:
+                if statement.startswith("nop "):
+                    sys.exit(3)                                 # CRASH
+                lines[i] = "1:\\tnop"                            # ACCEPT
+    open(source, "w").write("\\n".join(lines))
+    return subprocess.run(gas + ["-o", obj, source]).returncode
+
+
+status = 0
+for source, obj in files:
+    code = assemble(source, obj)
+    if code and ({stops} or code != 1):
+        sys.exit(code)
+    status = status or code
+sys.exit(status)
 """
 PLANTED_MNEMONICS = {"clc", "cld", "stc", "cmc", "sti", "cli", "nop", "bswap"}
 
@@ -1132,19 +1245,28 @@ def self_test(rows, mode: Mode, gas: str) -> list[str]:
     assembled to other bytes, to more, to fewer, refused, crashed on, left
     without an object and -- an invalid one -- assembled. Each has to come
     out as its verdict, and the expectation logic has to fail on each, and
-    on its disappearance.
+    on its disappearance. The planted one is swept twice, as a driver that
+    goes on behind a file it refuses and as one that stops there.
     """
     reports = []
     with tempfile.TemporaryDirectory() as directory:
-        for plant in (False, True):
-            wrapper = Path(directory) / f"as-planted-{plant}"
-            wrapper.write_text(PLANTED.format(python=sys.executable, plant=plant, gas=gas))
+        for plant, stops in ((False, False), (True, False), (True, True)):
+            wrapper = Path(directory) / f"as-planted-{plant}-{stops}"
+            wrapper.write_text(PLANTED.format(python=sys.executable, plant=plant, stops=stops,
+                                              gas=gas))
             wrapper.chmod(0o755)
             report, _ = sweep_rows(rows, mode, gas, str(wrapper), per_row=PER_ROW, seed=SEED,
                                    only=PLANTED_MNEMONICS, share=1)
             reports.append(report)
-    clean, planted = reports
+    clean, planted, stopping = reports
     wrong = []
+    # The statements GNU as refuses are given to an assembler many files at
+    # a time when it goes on behind a file it refuses, and one at a time
+    # when it does not (`assemble_each`): the same findings either way.
+    if stopping.counts() != planted.counts() or stopping.findings != planted.findings:
+        wrong.append("an assembler that stops at the first file it refuses: "
+                     f"{stopping.counts()} {stopping.findings}, and one that goes on: "
+                     f"{planted.counts()} {planted.findings}")
     if clean.findings or not clean.same or clean.same != clean.assembled:
         wrong.append(f"GNU as against itself: {clean.counts()} {clean.findings}")
     found = {verdict: sorted(statement for statement, _ in items)

@@ -37,7 +37,9 @@ def shape(text, name, copies, step, additions=0):
         # independently catch dropped offsets and incorrect stream bases.
         address = str(offset) + r'\(%\w+,\s*%\w+(?:,\s*1)?\)'
         assert re.search(r'\bv?movdqu\s+' + address + r',\s*%xmm', loop), name
-        assert re.search(r'\bv?movdqu\s+%xmm\d+,\s*' + address, loop), name
+        # (The store is written `movups`: the same sixteen bytes, one
+        # prefix byte less.)
+        assert re.search(r'\b(?:v?movdqu|movups)\s+%xmm\d+,\s*' + address, loop), name
     return body, start, loop
 
 
@@ -49,7 +51,9 @@ def main():
     body, start, loop = shape(vector, 'invariant64', 4, 64)
     # The lane broadcast is `unpcklpd` under SSE2 and `vunpcklpd` under VEX
     # (-march=x86-64-v3 promotes it); both spellings are the same hoisted op.
-    lane_broadcast = r'\b(?:v?unpcklpd|vpbroadcastq)\b'
+    # (`unpcklpd` between registers is written `movlhps`: the same two
+    # halves, one prefix byte less.)
+    lane_broadcast = r'\b(?:v?unpcklpd|movlhps|vpbroadcastq)\b'
     assert len(re.findall(lane_broadcast, body[:start])) == 1
     assert not re.search(lane_broadcast, loop)
     assert not re.search(r'\bv?psubq\b', function(scalar, 'sub64'))

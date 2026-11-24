@@ -1,0 +1,401 @@
+# Segment words, `notrack` and lone prefix words in 32-bit code, one statement
+# a group, each held to GNU as 2.47. A segment word is its byte in front of
+# any instruction (`cs nop` is 2e 90, `es movsb` is 26 a4), the first of the
+# prefixes behind the FWAIT of an x87 instruction; with an operand that names
+# the same segment, or the default one, it is the one prefix; with another
+# segment it is "same type of prefix used twice". `notrack` is `ds`'s byte in
+# front of an indirect near branch, which GCC writes in front of the jump
+# through a switch table under -fcf-protection. The i686 encoder had none of
+# this: every statement here that GNU as assembles was "unknown prefix".
+#
+# Not here: a segment word on a direct `call`, which GNU as leaves out with a
+# warning and lccc writes, as Clang does.
+;;; cs_nop
+.text
+cs nop
+;;; ds_nop
+.text
+ds nop
+;;; es_nop
+.text
+es nop
+;;; ss_nop
+.text
+ss nop
+;;; fs_nop
+.text
+fs nop
+;;; gs_nop
+.text
+gs nop
+;;; cs_mov_eax_ebx
+.text
+cs mov %eax, (%ebx)
+;;; cs_mov_eax_ds_ebx
+.text
+cs mov %eax, %ds:(%ebx)
+;;; cs_mov_eax_ss_ebp
+.text
+cs mov %eax, %ss:(%ebp)
+;;; ss_mov_eax_ebp
+.text
+ss mov %eax, (%ebp)
+;;; ds_mov_eax_ebx
+.text
+ds mov %eax, (%ebx)
+;;; ss_mov_eax_ss_ebx
+.text
+ss mov %eax, %ss:(%ebx)
+;;; cs_mov_eax_cs_ebx
+.text
+cs mov %eax, %cs:(%ebx)
+;;; cs_mov_eax_fs_ebx reject
+.text
+cs mov %eax, %fs:(%ebx)
+;;; fs_mov_eax_fs_ebx
+.text
+fs mov %eax, %fs:(%ebx)
+;;; cs_cs_nop reject
+.text
+cs cs nop
+;;; cs_ds_nop reject
+.text
+cs ds nop
+;;; es_movsb
+.text
+es movsb
+;;; cs_rep_movsb
+.text
+cs rep movsb
+;;; rep_cs_movsb
+.text
+rep cs movsb
+;;; fs_movsb_ds_esi_es_edi
+.text
+fs movsb %ds:(%esi), %es:(%edi)
+;;; fs_movsb_fs_esi_es_edi
+.text
+fs movsb %fs:(%esi), %es:(%edi)
+;;; cs_movsb_fs_esi_es_edi reject
+.text
+cs movsb %fs:(%esi), %es:(%edi)
+;;; es_stosb
+.text
+es stosb
+;;; cs_lodsb
+.text
+cs lodsb
+;;; cs_scasb
+.text
+cs scasb
+;;; es_cmpsb
+.text
+es cmpsb
+;;; cs_xlat
+.text
+cs xlat
+;;; lock_cs_addl_1_eax
+.text
+lock cs addl $1, (%eax)
+;;; cs_lock_addl_1_eax
+.text
+cs lock addl $1, (%eax)
+;;; xacquire_lock_cs_addl_1_eax
+.text
+xacquire lock cs addl $1, (%eax)
+;;; cs_data16_nop
+.text
+cs data16 nop
+;;; data16_cs_nop
+.text
+data16 cs nop
+;;; cs_addr16_nop
+.text
+cs addr16 nop
+;;; addr16_cs_mov_eax_bx
+.text
+addr16 cs mov %eax, (%bx)
+;;; cs_addr16_data16_lock_addl_1_bx
+.text
+cs addr16 data16 lock addl $1, (%bx)
+;;; cs_fwait
+.text
+cs fwait
+;;; cs_fstcw_eax
+.text
+cs fstcw (%eax)
+;;; cs_fnstcw_eax
+.text
+cs fnstcw (%eax)
+;;; cs_fsave_eax
+.text
+cs fsave (%eax)
+;;; cs_vaddps_eax_xmm1_xmm2
+.text
+cs vaddps (%eax), %xmm1, %xmm2
+;;; cs_evex_vaddps_eax_xmm1_xmm2
+.text
+cs {evex} vaddps (%eax), %xmm1, %xmm2
+;;; cs_movaps_eax_xmm1
+.text
+cs movaps (%eax), %xmm1
+;;; cs_jmp_1f_1
+.text
+cs jmp 1f
+1:
+;;; cs_jne_1f_1
+.text
+cs jne 1f
+1:
+;;; cs_jmp_foo
+.text
+cs jmp foo
+;;; cs_jne_foo
+.text
+cs jne foo
+;;; cs_ret
+.text
+cs ret
+;;; cs_push_eax
+.text
+cs push %eax
+;;; cs_jmp_eax
+.text
+cs jmp *%eax
+;;; cs_jmp_eax_2
+.text
+cs jmp *(%eax)
+;;; cs_ljmp_eax
+.text
+cs ljmp *(%eax)
+;;; cs_lgdt_eax
+.text
+cs lgdt (%eax)
+;;; cs_pushl_eax
+.text
+cs pushl (%eax)
+;;; notrack_jmp_eax
+.text
+notrack jmp *%eax
+;;; notrack_call_eax
+.text
+notrack call *%eax
+;;; notrack_jmp_eax_2
+.text
+notrack jmp *(%eax)
+;;; notrack_call_eax_2
+.text
+notrack call *(%eax)
+;;; notrack_nop reject
+.text
+notrack nop
+;;; notrack_jmp_1f_1 reject
+.text
+notrack jmp 1f
+1:
+;;; notrack_jmp_fs_eax reject
+.text
+notrack jmp *%fs:(%eax)
+;;; notrack_jmp_ds_eax
+.text
+notrack jmp *%ds:(%eax)
+;;; notrack_ljmp_eax reject
+.text
+notrack ljmp *(%eax)
+;;; ds_notrack_jmp_eax reject
+.text
+ds notrack jmp *%eax
+;;; notrack_ds_jmp_eax reject
+.text
+notrack ds jmp *%eax
+;;; notrack_cs_jmp_eax reject
+.text
+notrack cs jmp *%eax
+;;; notrack_bnd_jmp_eax reject
+.text
+notrack bnd jmp *%eax
+;;; notrack_jmpl_eax
+.text
+notrack jmpl *%eax
+;;; notrack_jmpw_ax
+.text
+notrack jmpw *%ax
+;;; notrack_calll_eax
+.text
+notrack calll *%eax
+;;; notrack_callw_ax
+.text
+notrack callw *%ax
+;;; notrack_ret reject
+.text
+notrack ret
+;;; notrack_lcall_eax reject
+.text
+notrack lcall *(%eax)
+;;; gs_mov_eax_0x1234
+.text
+gs mov %eax, 0x1234
+;;; gs_mov_0x1234_eax
+.text
+gs mov 0x1234, %eax
+;;; gs_movl_5_sym
+.text
+gs movl $5, sym
+;;; gs_incl_sym
+.text
+gs incl sym
+;;; cs_loop_1f_1
+.text
+cs loop 1f
+1:
+;;; cs_jecxz_1f_1
+.text
+cs jecxz 1f
+1:
+;;; es_in_5_al
+.text
+es in $5, %al
+;;; es_out_al_5
+.text
+es out %al, $5
+;;; es_int_3
+.text
+es int $3
+;;; es_leave
+.text
+es leave
+;;; es_pushf
+.text
+es pushf
+;;; cs_cpuid
+.text
+cs cpuid
+;;; cs_syscall
+.text
+cs syscall
+;;; cs_mov_cr0_eax
+.text
+cs mov %cr0, %eax
+;;; cs_bswap_eax
+.text
+cs bswap %eax
+;;; cs_lea_eax_ebx
+.text
+cs lea (%eax), %ebx
+;;; lock
+.text
+lock
+;;; rep
+.text
+rep
+;;; repne
+.text
+repne
+;;; data16
+.text
+data16
+;;; addr16
+.text
+addr16
+;;; data32
+.text
+data32
+;;; addr32
+.text
+addr32
+;;; cs
+.text
+cs
+;;; ds
+.text
+ds
+;;; es
+.text
+es
+;;; ss
+.text
+ss
+;;; fs
+.text
+fs
+;;; gs
+.text
+gs
+;;; notrack
+.text
+notrack
+;;; xacquire
+.text
+xacquire
+;;; xrelease
+.text
+xrelease
+;;; rex reject
+.text
+rex
+;;; rex64 reject
+.text
+rex64
+;;; rex_w_nop reject
+.text
+rex.w nop
+;;; rex_nop reject
+.text
+rex nop
+;;; repz
+.text
+repz
+;;; repe
+.text
+repe
+;;; repnz
+.text
+repnz
+;;; bnd reject
+.text
+bnd
+;;; wait
+.text
+wait
+;;; fwait
+.text
+fwait
+;;; rex2_nop reject
+.text
+{rex2} nop
+;;; rex_nop_2 reject
+.text
+{rex} nop
+;;; evex_vaddps_xmm1_xmm2_xmm3
+.text
+{evex} vaddps %xmm1, %xmm2, %xmm3
+;;; vex3_vaddps_xmm1_xmm2_xmm3
+.text
+{vex3} vaddps %xmm1, %xmm2, %xmm3
+;;; nf_add_eax_ebx reject
+.text
+{nf} add %eax, %ebx
+;;; disp16_mov_eax_eax reject
+.text
+{disp16} mov (%eax), %eax
+;;; nooptimize_mov_eax_ebx
+.text
+{nooptimize} mov %eax, %ebx
+;;; nooptimize_lock_addl_1_eax
+.text
+{nooptimize} lock addl $1, (%eax)
+;;; vex_lock_nop reject
+.text
+{vex} lock nop
+;;; evex_cs_vaddps_eax_xmm1_xmm2
+.text
+{evex} cs vaddps (%eax), %xmm1, %xmm2
+;;; mov_s_eax_ebx
+.text
+mov.s %eax, %ebx
+;;; movl_s_eax_ebx
+.text
+movl.s %eax, %ebx
+;;; add_s_eax_ebx
+.text
+add.s %eax, %ebx

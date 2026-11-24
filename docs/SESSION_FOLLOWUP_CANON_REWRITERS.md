@@ -39,7 +39,7 @@ data-dependency question, not an instruction-kind question:
 
 ```rust
 let (def_block, def_idx) = definition_site(func, replacement)?;   // what defines it
-let producers = producer_cone(func, replacement);                 // transitive backward slice
+let producers = producer_cone(func, replacement, upstream);       // backward slice, from the loop on
 for each read of `old` outside the loop in block bi, instruction ii {
     if bi == def_block && ii <= def_idx { continue; }   // not yet defined here
     if inst.dest() ∈ producers { continue; }            // feeds it -> cycle
@@ -50,6 +50,27 @@ for each read of `old` outside the loop in block bi, instruction ii {
 `vectorize::rewrite_uses_where_available` is the implementation, `outside_rewrite_availability_tests`
 is the regression suite (both shapes, the same-block cursor, and the bare-`Value` coverage that the
 migration exists for).
+
+**The slice stops at what the loop starts from.**  The replacement of a reduction is
+`start + reduced`.  Where an enclosing loop carries the sum, `start` is that loop's phi, and the
+phi's back-edge arm reads the inner accumulator (`for (i) for (j) s += a[i + j]`).  A slice that
+walked through the phi made that arm, and anything written between the two loops, a "producer",
+and left it reading the accumulator the transform had turned into a vector: `f` returned `%xmm0`
+where its caller reads `%rax`.  It is no producer.  The phi's value is fixed before the inner loop
+runs; what it becomes next time around is the reader's business, and that read is exactly the one
+to redirect.  `producer_cone` therefore takes `upstream` (the defining block strictly dominates the
+loop header) and neither includes nor walks through such values; nothing a transform builds to
+reduce an accumulator stands in front of the loop.
+
+**A refused rewrite is not always "a missed rewrite".**  That holds while `old` still means what the
+reader expects (an induction variable the loop keeps).  It does not hold for an accumulator a
+transform has repurposed: the reader that keeps it is wrong code.  The byte-sum reduction no longer
+depends on the question.  It computes the total and the final index in a block of their own on the
+loop's one exit edge, which dominates every reader the header dominated, relabels the exit block's
+phis to it, checks before the first mutation that every reader is of one of those two kinds
+(`live_out_reads_are_servable`), and then redirects all of them (`redirect_live_out_reads`).
+`tests/regression/nested_reduction_live_out.c` is the corpus: 27 functions, 10 of them wrong at
+`-O2` before (51 of 168 output lines), none after.
 
 **Block reach is deliberately broad.**  The no-remainder path *must* redirect readers in the original
 exit block, whose zero-trip bypass edge exists in the CFG but is proven dead by the trip-count guard.

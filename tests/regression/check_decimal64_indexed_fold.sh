@@ -26,7 +26,9 @@ if ! grep -qE 'movsd -?[0-9]*\(%r[a-z0-9]+, *%r[a-z0-9]+, *8\), %xmm' "$tmp/out.
     exit 1
 fi
 # ... and on the store side (optional PF-06 displacement).
-if ! grep -qE 'movsd %xmm[0-9]+, +-?[0-9]*\(%r[a-z0-9]+, *%r[a-z0-9]+, *8\)' "$tmp/out.s"; then
+# (A scalar store is written `movlps`: the same eight bytes stored, one prefix
+# byte less.)
+if ! grep -qE '(movsd|movlps) %xmm[0-9]+, +-?[0-9]*\(%r[a-z0-9]+, *%r[a-z0-9]+, *8\)' "$tmp/out.s"; then
     echo "FAIL: no scale-8 SIB movsd store in $tmp/out.s" >&2
     grep -E 'movsd' "$tmp/out.s" >&2 | sed -n '1,10p'
     exit 1

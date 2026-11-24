@@ -108,10 +108,12 @@ Defined in `mod.rs`.  Called when the built-in assembler is selected
 
 | File | Lines | Role |
 |------|-------|------|
-| `mod.rs` | ~30 | Public `assemble()` entry point; module wiring |
-| `parser.rs` | ~2200 | AT&T syntax parser with `.rept` expansion, GAS macro processing, expression evaluation; produces `Vec<AsmItem>` |
-| `encoder/` | ~6260 | x86-64 instruction encoder (split into focused submodules, see below) |
-| `elf_writer.rs` | ~90 | Thin x86-64 adapter: implements `X86Arch` trait for `ElfWriterCore<X86_64Arch>`, wiring architecture constants and instruction encoding |
+| `mod.rs` | ~80 | Public `assemble()` / `assemble_with()` entry points; module wiring |
+| `parser.rs` | ~6900 | AT&T syntax parser with `.rept` expansion, GAS macro processing, expression evaluation; produces `Vec<AsmItem>` |
+| `generated.rs` | ~560 | The cheaper statements of a generated text: what the code generator writes is replaced in the text itself (`encoder/optimize.rs`), so `-S` shows what `-c` assembles |
+| `cfi.rs` | ~600 | x86-64 / i386 side of the `.cfi_*` lowering into `.eh_frame` |
+| `encoder/` | ~39500 | x86-64 instruction encoder (split into focused submodules, see below) |
+| `elf_writer.rs` | ~520 | Thin x86-64 adapter: implements `X86Arch` trait for `ElfWriterCore<X86_64Arch>`, wiring architecture constants and instruction encoding |
 
 ### Encoder Submodules (`encoder/`)
 
@@ -119,20 +121,30 @@ The instruction encoder is organized as a directory of focused submodules:
 
 | File | Lines | Role |
 |------|-------|------|
-| `mod.rs` | ~1544 | `InstructionEncoder` struct, `encode()` entry point, `encode_mnemonic()` dispatch match (~800 arms), `Relocation` type, ELF relocation constants |
-| `registers.rs` | ~296 | Register number mapping (`reg_num`), register classification (`is_reg64/32/16/8`), REX extension detection, suffix inference (`infer_suffix`), condition code parsing |
-| `core.rs` | ~269 | Low-level encoding primitives: REX prefix emission (`rex`, `emit_rex_*`), ModR/M + SIB byte construction, memory operand encoding (`encode_modrm_mem`), relocation helpers |
-| `gp_integer.rs` | ~1145 | General-purpose integer instructions: MOV variants, ALU ops (ADD/SUB/AND/OR/XOR/CMP/TEST), shifts, IMUL, PUSH/POP, LEA, XCHG, CMPXCHG, conditional moves/sets, JMP/CALL/RET |
-| `sse.rs` | ~653 | SSE/SSE2/SSE3/SSSE3/SSE4.1 instructions: scalar and packed float ops, integer SIMD, shuffles, conversions, non-temporal stores, AES-NI, CRC32 |
-| `avx.rs` | ~1456 | VEX/EVEX-encoded instructions: AVX, AVX2, initial AVX-512, BMI2; VEX prefix emission (`emit_vex`), EVEX prefix emission (`emit_evex`) |
-| `system.rs` | ~513 | System and privileged instructions: I/O port ops (IN/OUT), control register moves, system table loads (LGDT/LIDT), CLFLUSH, WBINVD, RDMSR/WRMSR, segment register moves |
-| `x87_misc.rs` | ~385 | x87 FPU instructions (FLD/FSTP/FADD/etc.), bit test operations (BT/BTS/BTR/BTC), segment register loads, miscellaneous suffixless encodings |
+| `mod.rs` | ~10100 | `InstructionEncoder` struct, `encode()` entry point (prefix words, pseudo prefixes, the fallbacks below), `encode_mnemonic()` dispatch match, `Relocation` type, ELF relocation constants |
+| `registers.rs` | ~1570 | Register number mapping (`reg_num`), register classification (`is_reg64/32/16/8`), REX extension detection, suffix inference (`infer_suffix`), condition code parsing |
+| `core.rs` | ~1640 | Low-level encoding primitives: REX/REX2 prefix emission, ModR/M + SIB byte construction, memory operand encoding (`encode_modrm_mem`), relocation helpers |
+| `gp_integer.rs` | ~3840 | General-purpose integer instructions: MOV variants, ALU ops (ADD/SUB/AND/OR/XOR/CMP/TEST), shifts, IMUL, PUSH/POP, LEA, XCHG, CMPXCHG, conditional moves/sets, JMP/CALL/RET, the APX `{nf}` and new-data-destination forms |
+| `sse.rs` | ~1390 | SSE/SSE2 instructions: scalar and packed float ops, integer SIMD, shuffles, conversions, non-temporal stores, AES-NI, CRC32 |
+| `sse34.rs` | ~230 | Operand roles of the legacy SSE3/SSSE3/SSE4 opcodes, shared with i686 |
+| `avx.rs` | ~7400 | VEX/EVEX-encoded instructions: AVX, AVX2, AVX-512, BMI; VEX prefix emission (`emit_vex`), EVEX prefix emission (`emit_evex`), masks, broadcasts, rounding |
+| `promoted.rs` | ~500 | EVEX-promoted SSE/SSE2/CET forms: the `{evex}` encoding hint |
+| `apx.rs` | ~450 | APX new opcodes: PUSH2/POP2, PUSHP/POPP, JMPABS, CCMP/CTEST |
+| `xop.rs` | ~640 | XOP and LWP: the `0x8F` escape and its 5-bit map field |
+| `system.rs` | ~710 | System and privileged instructions: I/O port ops (IN/OUT), control register moves, system table loads (LGDT/LIDT), CLFLUSH, WBINVD, RDMSR/WRMSR, segment register moves |
+| `x87_misc.rs` | ~840 | x87 FPU instructions (FLD/FSTP/FADD/etc.), bit test operations (BT/BTS/BTR/BTC), segment register loads, miscellaneous suffixless encodings |
+| `table.rs` | ~1160 | Plain instructions encoded from a table: a fixed opcode, at most one ModR/M pair, immediates, the usual operand-size rules. Tried when no arm takes a statement |
+| `learned.rs` | ~980 | Instructions encoded from rows learned from GNU as: looks a statement up among the rows of its mnemonic, checks kinds, masks, broadcasts and rounding, and emits legacy, VEX, EVEX or XOP bytes; also `check_number`, the range of every one-byte number. Tried when arms and table refuse, or cannot meet `{evex}`, `{vex}` or a register beyond `%r15` |
+| `learned_rows.rs` | ~3860 | The rows and number ranges themselves. Written by `scripts/x86_learned_rows.py --write` from GNU as 2.47's bytes; not edited by hand (`tests/gas-table-sweep/README.md`) |
+| `operand_class.rs` | ~1650 | The registers a statement names, held against the registers its encoding can address: kind and width, checked in one place for every instruction after it is encoded |
+| `vector_widths.rs` | ~190 | Which widths of vector register each VEX, EVEX and XOP opcode takes together. Written by `scripts/x86_vector_widths.py --write`; not edited by hand |
+| `optimize.rs` | ~2390 | A cheaper instruction for the same effect (`movl $1, %eax` for `movq $1, %rax`): the replacements `generated.rs` applies to compiler output, and `-Wa,-O2` / `-Wa,-Os` to a person's text (`tests/asm-optimize/README.md`) |
 
 The bulk of the ELF building logic (section management, jump relaxation,
 deferred evaluation, ELF serialization) lives in the shared
-`backend::elf_writer_common` module (~1700 lines), parameterized by the
+`backend::elf_writer_common` module (~11000 lines), parameterized by the
 `X86Arch` trait.  Expression evaluation for deferred `.skip` directives uses
-the shared `backend::asm_expr` module (~410 lines).  C-comment stripping,
+the shared `backend::asm_expr` module (~1700 lines).  C-comment stripping,
 semicolon splitting, and some preprocessing helpers come from
 `backend::asm_preprocess`.
 
@@ -354,6 +366,25 @@ The encoder translates one `Instruction` into machine code bytes.  Its main
 dispatch is a large `match` on the mnemonic string (800+ arms) in
 `encoder/mod.rs`, with encoding logic organized into focused submodules
 by instruction category.
+
+A statement no arm takes is not refused yet.  `encode()` asks, in order:
+
+1. the arms (`encode_mnemonic`) -- everything the compiler emits ends here;
+2. the plain table (`table.rs`), for an instruction with a fixed opcode that
+   nobody wrote an arm for;
+3. the rows learned from GNU as (`learned.rs`), for the instructions whose
+   operand positions GNU as's bytes gave away -- and for a statement the
+   arms did encode, but in an encoding that cannot say it (`{evex}` or
+   `{vex}` was asked for, or a register beyond `%r15` named).
+
+Before any of them, `learned::check_number` holds a one-byte number to the
+range GNU as takes in that instruction.  Behind the arms and the table,
+`operand_class::check` holds the registers the statement names to the
+registers its encoding addresses (a learned row has the kinds of its
+operands in the row); behind all three, the prefix words (`lock`, `rep`,
+`data16`, `{rex2}`) are held to the instructions that take them.  A mnemonic
+none of the three knows is refused in GNU as's words: ``no such instruction:
+`frob %eax'``.
 
 **Suffix inference** -- The `infer_suffix()` function infers AT&T size
 suffixes from register operands for unsuffixed mnemonics.  This enables

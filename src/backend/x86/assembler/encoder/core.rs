@@ -801,6 +801,28 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// The relocation of a displacement that is a 32-bit number without a
+    /// sign (`disp32_unsigned`): `R_X86_64_32` for a symbol, with or
+    /// without an addend. A modifier (`sym@GOT`) says its own.
+    pub(crate) fn unsigned_reloc(
+        &self,
+        disp: &Displacement,
+        reloc: Option<(String, u32, i64)>,
+    ) -> Option<(String, u32, i64)> {
+        let plain = matches!(
+            disp,
+            Displacement::Symbol(_)
+                | Displacement::SymbolAddend(..)
+                | Displacement::SymbolPlusOffset(..)
+        );
+        match reloc {
+            Some((symbol, R_X86_64_32S, addend)) if self.disp32_unsigned && plain => {
+                Some((symbol, R_X86_64_32, addend))
+            }
+            other => other,
+        }
+    }
+
     /// Displacement value + deferred relocation for the non-RIP address
     /// paths, shared by the legacy/VEX (`encode_modrm_mem`) and EVEX
     /// (`encode_evex_mem`) encoders so both agree on reloc types. Returns
@@ -971,6 +993,7 @@ impl super::InstructionEncoder {
         // so the relocation offset correctly points to the displacement bytes.
         let (disp_val, has_symbol, deferred_reloc, diff_sym) =
             Self::symbol_disp_parts(&mem.displacement);
+        let deferred_reloc = self.unsigned_reloc(&mem.displacement, deferred_reloc);
 
         // No base register - need SIB with no-base encoding
         if base.is_none() && index.is_none() {

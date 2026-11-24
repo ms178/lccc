@@ -715,10 +715,12 @@ _mm_broadcast_ss(float const *__p)
  * constant, so these are macros: the shuffle indices are then constant
  * expressions as `__builtin_shufflevector` requires. */
 #define _mm_permute_ps(__a, __imm)                                              \
-    __builtin_shufflevector((__a), (__a), ((__imm) >> 0) & 3, ((__imm) >> 2) & 3, \
-                            ((__imm) >> 4) & 3, ((__imm) >> 6) & 3)
+    (__LCCC_IMMEDIATE(__imm, 255, "the last argument must be an 8-bit immediate"), \
+     __builtin_shufflevector((__a), (__a), ((__imm) >> 0) & 3, ((__imm) >> 2) & 3, \
+                             ((__imm) >> 4) & 3, ((__imm) >> 6) & 3))
 #define _mm_permute_pd(__a, __imm)                                              \
-    __builtin_shufflevector((__a), (__a), ((__imm) >> 0) & 1, ((__imm) >> 1) & 1)
+    (__LCCC_IMMEDIATE(__imm, 255, "the last argument must be an 8-bit immediate"), \
+     __builtin_shufflevector((__a), (__a), ((__imm) >> 0) & 1, ((__imm) >> 1) & 1))
 
 #define _mm256_ceil_ps(__a) _mm256_round_ps((__a), _MM_FROUND_CEIL)
 #define _mm256_floor_ps(__a) _mm256_round_ps((__a), _MM_FROUND_FLOOR)
@@ -732,15 +734,18 @@ _mm_broadcast_ss(float const *__p)
 /* === 16-bit element extract and insert (GCC-compatible, under -mavx) ===
  * Element N (0..15) lives in lane-128 half (N >> 3) at word (N & 7). Both are
  * macros so the half selector and the word index stay compile-time constants,
- * which the lane-128 gate and the lane-128 lowering require. */
+ * which the lane-128 gate and the lane-128 lowering require. An N past the
+ * vector is refused, as GCC refuses it (there by the half it would select). */
 #define _mm256_extract_epi16(__X, __N)                                      \
-    _mm_extract_epi16(_mm256_extractf128_si256((__X), ((__N) >> 3) & 1), (__N) & 7)
+    (__LCCC_IMMEDIATE(__N, 15, "selector must be an integer constant in the range [0, 15]"), \
+     _mm_extract_epi16(_mm256_extractf128_si256((__X), ((__N) >> 3) & 1), (__N) & 7))
 
 #define _mm256_insert_epi16(__X, __D, __N)                                  \
-    _mm256_insertf128_si256((__X),                                          \
+    (__LCCC_IMMEDIATE(__N, 15, "selector must be an integer constant in the range [0, 15]"), \
+     _mm256_insertf128_si256((__X),                                         \
         _mm_insert_epi16(_mm256_extractf128_si256((__X), ((__N) >> 3) & 1), \
                          (__D), (__N) & 7),                                 \
-        ((__N) >> 3) & 1)
+        ((__N) >> 3) & 1))
 
 /* === Movemask === */
 

@@ -1010,8 +1010,15 @@ impl I686Codegen {
                     self.state.emit("    movups (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);
                     self.state.emit("    movups (%eax), %xmm1");
-                    self.state
-                        .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0", inst, imm));
+                    if crate::backend::x86_common::compare_predicate_is_vex_only(op, imm) {
+                        // Predicates 8 to 31 are `vcmpps`/`vcmppd`'s alone:
+                        // `cmppd $13` is `cmppd $5`.
+                        self.state
+                            .emit_fmt(format_args!("    v{} ${}, %xmm1, %xmm0, %xmm0", inst, imm));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0", inst, imm));
+                    }
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movups %xmm0, (%eax)");
                 } else if dest.is_some() {

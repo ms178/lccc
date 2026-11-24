@@ -533,6 +533,51 @@ fn strip_fn_boundary_markers(asm: &str, marked: &FxHashSet<String>) -> String {
     out
 }
 
+/// Whether the x86 encoders may replace statements by cheaper instructions
+/// with the same effect, as the assembler options say: `-Wa,-O0` not,
+/// `-Wa,-O` and `-O1` and above the ones that cost no time, `-Wa,-Os` the
+/// shorter ones at any cost, the last one given winning (GNU as has the
+/// same options). Without one a text is assembled as written.
+#[cfg(not(feature = "gcc_assembler"))]
+fn x86_optimize(extra_args: &[String]) -> x86::assembler::Optimize {
+    use x86::assembler::Optimize;
+    extra_args
+        .iter()
+        .rev()
+        .find_map(|argument| {
+            let level = argument
+                .strip_prefix("-Wa,")
+                .unwrap_or(argument)
+                .strip_prefix("-O")?;
+            match level {
+                "s" => Some(Optimize::Smaller),
+                "" => Some(Optimize::Faster),
+                _ => match level.parse::<u32>() {
+                    Ok(0) => Some(Optimize::Never),
+                    Ok(_) => Some(Optimize::Faster),
+                    Err(_) => None,
+                },
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// How far the statements of a generated x86 text are replaced by cheaper
+/// instructions with the same effect (`x86::assembler::generated`): as far
+/// as costs no time, or -- optimizing for size -- as far as saves a byte.
+/// Not at all under `LCCC_NO_PEEPHOLE`, which is there to see the text as
+/// the code generator wrote it.
+fn generated_optimize(opts: &CodegenOptions) -> x86::assembler::Optimize {
+    use x86::assembler::Optimize;
+    if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
+        Optimize::Never
+    } else if opts.optimize_for_size {
+        Optimize::Smaller
+    } else {
+        Optimize::Faster
+    }
+}
+
 impl Target {
     /// Return the GCC-style target triple for this architecture.
     /// Used by configure scripts (via -dumpmachine) to detect the target.
@@ -826,7 +871,8 @@ impl Target {
                             opts.emit_cfi,
                             cfi_synth::CfiArch::X86_64,
                         );
-                        break insert_fn_entry_locs(asm, &cg.state.fn_entry_locs);
+                        let asm = insert_fn_entry_locs(asm, &cg.state.fn_entry_locs);
+                        break x86::assembler::generated::rewrite(asm, generated_optimize(opts));
                     }
                     if opts.ra_config.debug_ra {
                         lccc::cli::stderr_line(format_args!(
@@ -881,9 +927,11 @@ impl Target {
                 );
                 let optimized = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
                 if opts.code16gcc {
+                    // 16-bit code, in which every size prefix is the other
+                    // way round: as the code generator wrote it.
                     format!(".code16gcc\n{}", optimized)
                 } else {
-                    optimized
+                    i686::assembler::rewrite_generated(optimized, generated_optimize(opts))
                 }
             }
             Target::Aarch64 => {
@@ -994,11 +1042,21 @@ impl Target {
 
             match self {
                 Target::Aarch64 => arm::assembler::assemble(asm_text, output_path, debug),
-                Target::X86_64 => x86::assembler::assemble(asm_text, output_path, debug),
+                Target::X86_64 => x86::assembler::assemble_with(
+                    asm_text,
+                    output_path,
+                    debug,
+                    x86_optimize(extra_args),
+                ),
                 Target::Riscv64 => {
                     riscv::assembler::assemble_with_args(asm_text, output_path, extra_args, debug)
                 }
-                Target::I686 => i686::assembler::assemble(asm_text, output_path, debug),
+                Target::I686 => i686::assembler::assemble_with(
+                    asm_text,
+                    output_path,
+                    debug,
+                    x86_optimize(extra_args),
+                ),
             }
         }
     }

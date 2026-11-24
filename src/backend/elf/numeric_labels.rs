@@ -103,6 +103,7 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> std::borrow::Cow<'_, [AsmIte
                     vex_hint: instr.vex_hint,
                     force_rex2: instr.force_rex2,
                     dfv: instr.dfv,
+                    optimize: instr.optimize,
                 }));
             }
             AsmItem::Short(vals) => {

@@ -1110,6 +1110,7 @@ impl super::InstructionEncoder {
         };
         let (disp, has_symbol, deferred_reloc, diff_sym) =
             Self::symbol_disp_parts(&mem.displacement);
+        let deferred_reloc = self.unsigned_reloc(&mem.displacement, deferred_reloc);
         // Absolute: SIB-absolute (mod=00 rm=100, SIB base=101) + disp32,
         // like the legacy encoder and GAS — never the mod=05/RIP form.
         if base_num.is_none() && index_num.is_none() {

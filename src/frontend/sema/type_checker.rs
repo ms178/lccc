@@ -1710,6 +1710,7 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_trap"
             | "__builtin_unreachable"
             | "__builtin_prefetch"
+            | "__builtin_ia32_prefetch"
             | "__builtin___clear_cache"
             | "__builtin_cpu_init" => Some(CType::Void),
 

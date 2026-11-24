@@ -725,7 +725,7 @@ fn is_mixed_width_mnemonic(m: &str) -> bool {
             "vpbroadcast",
             "vmovmsk",
             // SHA-512 (VEX.256): the xmm source of msg1/rnds2 is deliberately narrower
-            // than the ymm destination. check_sha512_operands checks each operand width.
+            // than the ymm destination. `encode_sha512_vex` checks each operand width.
             "vsha512",
             "vperm",
             "vpsll",
@@ -785,6 +785,11 @@ fn is_mixed_width_mnemonic(m: &str) -> bool {
         ],
         _ => return false,
     };
+    // `inc` is none of the `in` family: one operand, of the size its
+    // suffix says (`incw %cl` was `incw %cx`).
+    if m.starts_with("inc") && !m.starts_with("incssp") {
+        return false;
+    }
     prefixes.iter().any(|p| m.starts_with(p))
 }
 
@@ -1438,6 +1443,16 @@ pub(crate) fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
 mod mixed_width_tests {
     use super::is_mixed_width_mnemonic;
 
+    #[test]
+    fn inc_is_no_port_input() {
+        for mnemonic in ["inc", "incb", "incw", "incl", "incq"] {
+            assert!(!is_mixed_width_mnemonic(mnemonic), "{mnemonic}");
+        }
+        for mnemonic in ["in", "inb", "inw", "inl", "insertps", "incsspq"] {
+            assert!(is_mixed_width_mnemonic(mnemonic), "{mnemonic}");
+        }
+    }
+
     /// The exemptions as one list, as they were before they were sorted by
     /// first letter.
     #[rustfmt::skip]
@@ -1460,7 +1475,11 @@ mod mixed_width_tests {
 
     #[test]
     fn the_exemptions_by_first_letter_are_the_list() {
-        let listed = |m: &str| PREFIXES.iter().any(|p| m.starts_with(p));
+        // `inc` begins like the `in` family and is none of it.
+        let listed = |m: &str| {
+            PREFIXES.iter().any(|p| m.starts_with(p))
+                && !(m.starts_with("inc") && !m.starts_with("incssp"))
+        };
         let mut asked = 0;
         let mut ask = |m: &str| {
             assert_eq!(is_mixed_width_mnemonic(m), listed(m), "{m}");

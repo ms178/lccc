@@ -61,19 +61,24 @@ def body(text, name):
     return out
 
 
+# A 16-byte move: the load is `movdqu`, and the store `movups` -- the same
+# sixteen bytes stored, one prefix byte less.
+MOVE = ("movdqu", "movups")
+
+
 class I128CopyFusion(unittest.TestCase):
     def test_single_copy_fuses_to_two_moves(self):
         """`*d = *s` for a 16-byte carrier: one load, one store, no frame slot."""
         lines = body(asm(SINGLE), "one")
-        self.assertEqual([l for l in lines if l.startswith("movdqu")],
-                         ["movdqu (%rsi), %xmm0", "movdqu %xmm0, (%rdi)"],
+        self.assertEqual([l for l in lines if l.startswith(MOVE)],
+                         ["movdqu (%rsi), %xmm0", "movups %xmm0, (%rdi)"],
                          "\n".join(lines))
-        self.assertFalse([l for l in lines if re.search(r"movdqu.*\(%r(sp|bp)\)", l)],
+        self.assertFalse([l for l in lines if re.search(r"mov(?:dqu|ups).*\(%r(sp|bp)\)", l)],
                          "the copy still round-trips its frame slot:\n" + "\n".join(lines))
 
     def test_two_copies_fuse_independently(self):
         lines = body(asm(PAIR), "two")
-        moves = [l for l in lines if l.startswith("movdqu")]
+        moves = [l for l in lines if l.startswith(MOVE)]
         self.assertEqual(len(moves), 4, "\n".join(lines))
         # Both copies take a register or a frame-slot address; what matters
         # is that neither materialises the 16 bytes in a slot in between.
@@ -83,13 +88,13 @@ class I128CopyFusion(unittest.TestCase):
     def test_segment_override_rides_the_memory_operand(self):
         source = (BENCH / "k_seg_gs_copy.c").read_text()
         lines = body(asm(source, extra_dirs=(BENCH,)), "seg_copy_pass")
-        gs = [l for l in lines if "%gs:" in l and l.startswith("movdqu")]
+        gs = [l for l in lines if "%gs:" in l and l.startswith(MOVE)]
         self.assertTrue(gs, "no segment moves:\n" + "\n".join(lines))
         # Every gs load is consumed by the gs store that follows it: the
         # payload never passes through a frame slot in the gs->gs copies.
         fused = 0
         for i, line in enumerate(gs[:-1]):
-            if line.startswith("movdqu %gs:") and re.match(r"movdqu %xmm\d+, %gs:", gs[i + 1]):
+            if line.startswith("movdqu %gs:") and re.match(r"movups %xmm\d+, %gs:", gs[i + 1]):
                 fused += 1
         self.assertGreaterEqual(fused, 2, "\n".join(lines))
 

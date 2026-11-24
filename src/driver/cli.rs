@@ -1942,9 +1942,17 @@ impl Driver {
         if self.target == Target::I686 && self.no_sse2 {
             self.no_sse = self.sse_explicitly_disabled || self.general_regs_only;
         }
-        // APX's extended GPRs exist only in 64-bit mode (GCC 16.2's wording).
+        // APX's extended GPRs exist only in 64-bit mode: asked for by name
+        // it is an error (GCC 16.2's wording), and the APX of a CPU row is
+        // left out of 32-bit code, as GCC leaves it out of `-m32
+        // -march=novalake` (no `__APX_F__` there, and no error).
         if self.target == Target::I686 && self.enable_apxf {
-            return Err("'-mapxf' is not supported for 32-bit code".to_string());
+            if self.x86_isa_flag_was_enabled("-mapxf", "-mno-apxf")
+                || self.x86_isa_flag_was_enabled("-mapx", "-mno-apx")
+            {
+                return Err("'-mapxf' is not supported for 32-bit code".to_string());
+            }
+            self.enable_apxf = false;
         }
         // GCC 16.2 rejects a `-mtune=` name outside its vocabulary ("bad
         // value for '-mtune=' switch"); configure and Kbuild `cc-option`
@@ -3239,12 +3247,6 @@ impl Driver {
                                     // Every name in this legacy pre-SSE list
                                     // is FXSR-less on GCC 16.2 (measured).
                                     self.march_fxsr = false;
-                                }
-                                "novalake" | "diamondrapids" => {
-                                    return Err(format!(
-                                        "-march={} requires unimplemented AVX10/APX lowering",
-                                        march
-                                    ));
                                 }
                                 "native" => {
                                     // The HOST CPU's features, from the CPUID table
@@ -5491,6 +5493,45 @@ mod cli_tests {
         assert!(err.contains("only valid with -m32"), "{err}");
         let err = parse(&["ccc", "-m32", "-mapxf", "x.c"]).expect_err("-m32 -mapxf");
         assert!(err.contains("not supported for 32-bit code"), "{err}");
+    }
+
+    /// Every CPU name of GCC 16.2's table is a `-march=`. `novalake` and
+    /// `diamondrapids` were refused ("requires unimplemented AVX10/APX
+    /// lowering") although each of their features was accepted as an
+    /// option of its own: their rows grant what every other row grants,
+    /// the extensions lccc announces without generating code for them
+    /// included. In 32-bit code the row's APX is left out, as GCC leaves it
+    /// out (`-m32 -march=novalake` defines no `__APX_F__` and is no error);
+    /// APX asked for by name stays an error there.
+    #[test]
+    fn the_cpus_with_avx10_2_and_apx_are_accepted() {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let parsed = |args: &[&str]| {
+            let mut d = Driver::new();
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            d.parse_cli_args(&owned).map(|_| d)
+        };
+        for cpu in ["novalake", "diamondrapids"] {
+            let march = format!("-march={cpu}");
+            let mut d = parsed(&["ccc", &march, "x.c"]).unwrap_or_else(|e| panic!("{cpu}: {e}"));
+            assert!(d.enable_avx512f && d.enable_avx2, "{cpu}");
+            for extra in [E::ApxF, E::Avx10_1, E::Avx10_2, E::Movrs, E::Sm3, E::Sm4] {
+                assert!(*d.x86_extra_slot(extra), "{cpu}: {extra:?}");
+            }
+            let mut d = parsed(&["ccc", "-m32", &march, "x.c"])
+                .unwrap_or_else(|e| panic!("-m32 {cpu}: {e}"));
+            assert!(!*d.x86_extra_slot(E::ApxF), "-m32 {cpu}");
+            assert!(*d.x86_extra_slot(E::Avx10_2), "-m32 {cpu}");
+            for spelling in ["-mapxf", "-mapx"] {
+                let err = parsed(&["ccc", "-m32", &march, spelling, "x.c"])
+                    .err()
+                    .unwrap_or_else(|| panic!("-m32 {cpu} {spelling} was accepted"));
+                assert!(err.contains("not supported for 32-bit code"), "{err}");
+            }
+            // Withdrawn by name, the row's APX is no error either.
+            parsed(&["ccc", "-m32", &march, "-mapxf", "-mno-apxf", "x.c"])
+                .unwrap_or_else(|e| panic!("-m32 {cpu} -mapxf -mno-apxf: {e}"));
+        }
     }
 
     /// `-mcpu=` on x86 is GCC's deprecated `-mtune=` alias: it fills the
@@ -8143,25 +8184,37 @@ mod prefetch_isa_tests {
     }
 
     #[test]
-    fn i686_sse_prefetch_needs_sse_or_prfchw() {
-        // The i386 default baseline is the x86-64 ISA level, so the
-        // prefetcht*/nta family is baseline for plain `-m32` (GCC 16.2 and
-        // Clang 23.1.3 both emit it there, measured). An explicit pre-SSE
-        // `-march=` still suppresses it (both oracles: 0 instructions for
-        // `-m32 -march=i686`), as does `-mno-sse`.
+    fn i686_sse_prefetch_follows_the_cpu_not_the_sse_registers() {
+        // The prefetcht*/nta family exists where the CPU of `-march=` has
+        // it (every CPU with SSE; the Athlon, Athlon Thunderbird and Geode
+        // without), where SSE is enabled, and where PRFCHW is. The default
+        // CPU of `-m32` is `x86-64`. A pre-SSE `-march=` has none: both
+        // oracles write 0 instructions for `-m32 -march=i686`.
         //
-        // The `-mno-sse` corner is a measured oracle fork: GCC 16.2 EMITS
-        // `prefetcht0` under `-m32 -mno-sse` (0F 18, an SSE encoding), while
-        // Clang 23.1.3 suppresses it. lccc follows Clang: the `-mno-sse`
-        // contract is that NO SSE instruction of any encoding is emitted
-        // (the kernel's -mno-sse use is precisely to avoid FPU/SSE state),
-        // and a lone prefetch hint does not justify breaking that invariant.
+        // `-mno-sse` is a measured oracle fork, and the same fork at both
+        // widths: GCC 16.2 writes `prefetcht0` under `-mno-sse` and
+        // `-mgeneral-regs-only` for `-m64` and for `-m32`, Clang 23.1.5
+        // writes nothing for either. This target followed Clang while the
+        // x86-64 one followed GCC (`x86_64_sse_prefetch_is_baseline`): two
+        // rules for one instruction. It follows GCC now, because the reason
+        // given for the other choice does not hold. `-mno-sse` keeps the
+        // compiler out of the XMM registers, whose state a kernel does not
+        // save; PREFETCHh has no register operand and no state, and is one
+        // of the instructions the SDM (vol. 3A, 2.5, CR4.OSFXSR) excepts
+        // from needing operating-system SSE support. The kernel, built with
+        // `-mno-sse`, writes the instruction itself (`prefetch()`). What the
+        // option does not say is that the CPU lacks the opcode: that is
+        // `-march=`'s to say, and is honoured.
+        // `scripts/check_x86_prefetch.py` holds every row of the CPU table
+        // to GCC, with and without the option.
         for flags in [
             &["-m32", "-march=i686"][..],
             &["-m32", "-march=pentiumpro"],
-            &["-m32", "-msse", "-mno-sse"],
-            &["-m32", "-mno-sse"],
-            &["-m32", "-march=raptorlake", "-mno-sse", "-mno-prfchw"],
+            &["-m32", "-march=i686", "-mno-sse"],
+            &["-m32", "-march=i686", "-msse", "-mno-sse"],
+            &["-m32", "-march=pentium2", "-mgeneral-regs-only"],
+            &["-m32", "-march=k6-2"],
+            &["-m32", "-march=haswell", "-march=i586"],
         ] {
             assert!(!parse(flags).resolved_prefetch_sse(), "{flags:?}");
         }
@@ -8172,13 +8225,51 @@ mod prefetch_isa_tests {
             &["-m32", "-msse2"],
             &["-m32", "-msse", "-march=i686"],
             &["-m32", "-march=i686", "-msse"],
+            &["-m32", "-march=i686", "-mno-sse", "-msse"],
             &["-m32", "-msse4.1"],
             &["-m32", "-march=nehalem"],
             &["-m32", "-march=raptorlake"],
             &["-m32", "-mprfchw"],
             &["-m32", "-mno-sse", "-mprfchw"],
+            &["-m32", "-march=i686", "-mprfchw"],
+            // The CPU has the opcode; the option is about the registers.
+            &["-m32", "-mno-sse"],
+            &["-m32", "-msse", "-mno-sse"],
+            &["-m32", "-mgeneral-regs-only"],
+            &["-m32", "-march=pentium3", "-mno-sse"],
+            &["-m32", "-march=raptorlake", "-mno-sse", "-mno-prfchw"],
+            &["-m32", "-march=i586", "-march=haswell", "-mno-sse"],
+            // GCC's PTA_PREFETCH_SSE: the opcode without SSE.
+            &["-m32", "-march=athlon"],
+            &["-m32", "-march=athlon-tbird", "-mno-sse"],
+            &["-m32", "-march=geode"],
         ] {
             assert!(parse(flags).resolved_prefetch_sse(), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn prefetchrst2_needs_movrs_on_both_x86_targets() {
+        // GCC 16.2: `-mmovrs`, and the two CPUs that have it; a later
+        // `-mno-movrs` or `-march=` takes it back.
+        for mode in ["-m32", "-m64"] {
+            for (flags, granted) in [
+                (&[][..], false),
+                (&["-mmovrs"][..], true),
+                (&["-mmovrs", "-mno-movrs"][..], false),
+                (&["-mno-movrs", "-mmovrs"][..], true),
+                (&["-march=diamondrapids"][..], true),
+                (&["-march=novalake"][..], true),
+                (&["-march=diamondrapids", "-mno-movrs"][..], false),
+                (&["-march=diamondrapids", "-march=haswell"][..], false),
+                (&["-march=haswell", "-march=diamondrapids"][..], true),
+                (&["-march=sapphirerapids"][..], false),
+                (&["-mno-sse", "-mmovrs"][..], true),
+            ] {
+                let mut all = vec![mode];
+                all.extend_from_slice(flags);
+                assert_eq!(parse(&all).resolved_movrs(), granted, "{all:?}");
+            }
         }
     }
 
@@ -8408,7 +8499,9 @@ mod prefetch_isa_tests {
 
         // `-mgeneral-regs-only` is a full SSE denial (it sets `no_sse`, so
         // the resolved levels drop too): no XMM state of any kind, which
-        // also vetoes the published features and the prefetch grant.
+        // also vetoes the published features. It does not take the
+        // prefetch opcodes away from a CPU that has them: they have no
+        // register (GCC 16.2 writes `prefetcht0` under it, at both widths).
         let driver = parse(&["-m32", "-mgeneral-regs-only"]);
         assert!(!driver.resolved_i686_sse());
         assert!(!driver.resolved_i686_sse2());
@@ -8422,7 +8515,8 @@ mod prefetch_isa_tests {
                 .effective_x86_features()
                 .contains(crate::common::x86_features::X86Feature::Sse2)
         );
-        assert!(!driver.resolved_prefetch_sse());
+        assert!(driver.resolved_prefetch_sse());
+        assert!(!parse(&["-m32", "-march=i686", "-mgeneral-regs-only"]).resolved_prefetch_sse());
     }
 
     #[test]
@@ -8575,11 +8669,11 @@ mod prefetch_isa_tests {
             let mut d = Driver::new();
             let march = format!("-march={}", row.name);
             let args: Vec<String> = ["ccc", &march, "x.c"].map(str::to_string).to_vec();
-            if let Err(e) = d.parse_cli_args(&args) {
-                // The only refusals: AVX10/APX CPUs, an explicit error.
-                assert!(e.contains("AVX10/APX"), "{}: {e}", row.name);
-                continue;
-            }
+            // No row is refused: an escape for the two AVX10.2/APX CPUs stood
+            // here while the driver refused them, and a row that is skipped
+            // is a row nothing holds to GCC.
+            d.parse_cli_args(&args)
+                .unwrap_or_else(|e| panic!("{}: {e}", row.name));
             let features = d.effective_x86_features();
             let drift: Vec<_> = X86Feature::ALL
                 .iter()
@@ -8599,11 +8693,7 @@ mod prefetch_isa_tests {
             .iter()
             .filter(|r| r.x86_64)
             .count();
-        assert_eq!(
-            checked,
-            x86_64_rows - 2,
-            "every GCC x86-64 CPU but the AVX10/APX two"
-        );
+        assert_eq!(checked, x86_64_rows, "every x86-64 CPU of GCC 16.2");
     }
 
     /// GCC 16.2's CPU-name macros (`gcc-16 [-m32] ... -dM -E`, measured):
@@ -8684,10 +8774,10 @@ mod prefetch_isa_tests {
             let march = format!("-march={}", row.name);
             let mut d = Driver::new();
             let args: Vec<String> = ["i686-ccc", &march, "x.c"].map(str::to_string).to_vec();
-            if let Err(e) = d.parse_cli_args(&args) {
-                assert!(e.contains("AVX10/APX"), "{}: {e}", row.name);
-                continue;
-            }
+            // Every name is accepted in 32-bit code, the two AVX10.2/APX
+            // CPUs included (GCC 16.2: `-m32 -march=novalake` is no error).
+            d.parse_cli_args(&args)
+                .unwrap_or_else(|e| panic!("{}: {e}", row.name));
             assert_eq!(d.resolved_i686_sse(), row.has(F::Sse), "{} SSE", row.name);
             assert_eq!(
                 d.resolved_i686_sse2(),

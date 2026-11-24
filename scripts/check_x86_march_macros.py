@@ -18,8 +18,12 @@ Documented differences, excluded and printed: on -m32, lccc always defines
 `__i686`/`__i686__` (the i686-linux-gnu-gcc spelling upstream chose), and
 its `__SSE_MATH__`/`__SSE2_MATH__`/`__FLT_EVAL_METHOD__` state its own
 scalar FP codegen (F32 in SSE with SSE2, F64 on x87 with declared-type
-rounding), not GCC's x87 default. `-march=diamondrapids`/`novalake` are an
-explicit lccc error (unimplemented AVX10/APX lowering).
+rounding), not GCC's x87 default.
+
+Every name of the table is accepted. (`-march=diamondrapids` and `novalake`
+used to be refused for their AVX10.2 and APX, which no code is generated
+for: neither is any other macro-only extension of a CPU row, and each of
+the two CPUs' features was accepted as an option of its own.)
 """
 import os
 import re
@@ -29,7 +33,6 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TABLE = os.path.join(ROOT, 'src', 'backend', 'x86', 'arch_table.rs')
 ENV = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
-REFUSED = {'diamondrapids', 'novalake'}
 ISA = re.compile(r'__[A-Z][A-Z0-9_]*__')
 CPU = re.compile(r'__[a-z][a-z0-9_]*')
 FORKS = {
@@ -92,12 +95,8 @@ def main(argv):
             fails += 1
             continue
         if l is None:
-            if name in REFUSED:
-                print(f'PASS {label}: refused (AVX10/APX), as documented')
-                passes += 1
-            else:
-                print(f'FAIL {label}: lccc rejects it')
-                fails += 1
+            print(f'FAIL {label}: lccc rejects it')
+            fails += 1
             continue
         problems = []
         for kind, keep in (('ISA', lambda m: m in modeled), ('CPU', lambda m: m in cpu_names)):

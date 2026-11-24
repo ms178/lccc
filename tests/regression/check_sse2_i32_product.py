@@ -20,9 +20,14 @@ SOURCE = ROOT / 'tests/regression/sse2_i32_product.c'
 COMMON = ['-O2', '-fwrapv', '-ffp-contract=off']
 # Deliberately fail closed on new SIMD instructions in these small kernels.
 # Scalar/SIMD register transfers are included; cvtsi2sdl is AT&T's I32 form.
+# What the kernels may use on %xmm registers: SSE and SSE2. (A store of a
+# scalar or of a quadword is written `movlps`, and a packed-double move or
+# bit operation as its packed-single twin: the same bytes moved, one prefix
+# byte less.)
 SSE2_KERNEL_OPS = {
     'movd', 'movq', 'movdqa', 'movdqu', 'movapd', 'movupd', 'movaps', 'movups',
-    'movsd', 'movss', 'movlpd', 'movhpd', 'paddd', 'paddq', 'pxor', 'por',
+    'movsd', 'movss', 'movlpd', 'movhpd', 'movlps', 'movhps', 'xorps', 'paddd', 'paddq',
+    'pxor', 'por',
     'pand', 'pandn', 'pmuludq', 'pshufd', 'psrldq', 'pslldq', 'psrlq',
     'pslld', 'psrld', 'psrad', 'punpckldq', 'punpckhdq', 'punpcklqdq',
     'punpckhqdq', 'addsd', 'subsd', 'mulsd', 'divsd', 'cvtsi2sdl', 'cvtsi2sdq',

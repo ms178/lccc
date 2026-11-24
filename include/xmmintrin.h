@@ -315,16 +315,40 @@ _mm_cvtss_f32(__m128 __a)
 
 /* === Prefetch === */
 
-/* Prefetch hint constants */
-#define _MM_HINT_T0  3
-#define _MM_HINT_T1  2
-#define _MM_HINT_T2  1
-#define _MM_HINT_NTA 0
+/* The selectors of _mm_prefetch, GCC 16.2's value for value: bits 0-1 are
+ * the locality, bits 2-3 the access (1 a write, 2 a shared read), bit 4
+ * says the line holds code. Each is a macro of its own name as well, so
+ * that `#ifdef _MM_HINT_T0` holds, as it does where they are macros only. */
+enum _mm_hint
+{
+    _MM_HINT_IT0 = 19,
+    _MM_HINT_IT1 = 18,
+    _MM_HINT_RST2 = 9,
+    _MM_HINT_ET0 = 7,
+    _MM_HINT_T0 = 3,
+    _MM_HINT_T1 = 2,
+    _MM_HINT_T2 = 1,
+    _MM_HINT_NTA = 0
+};
+#define _MM_HINT_IT0 _MM_HINT_IT0
+#define _MM_HINT_IT1 _MM_HINT_IT1
+#define _MM_HINT_RST2 _MM_HINT_RST2
+#define _MM_HINT_ET0 _MM_HINT_ET0
+#define _MM_HINT_T0 _MM_HINT_T0
+#define _MM_HINT_T1 _MM_HINT_T1
+#define _MM_HINT_T2 _MM_HINT_T2
+#define _MM_HINT_NTA _MM_HINT_NTA
 
-/* _mm_prefetch: hint to prefetch data into cache.
- * In our implementation this is a no-op since we don't emit prefetch
- * instructions, but it must be defined for source compatibility. */
-#define _mm_prefetch(P, I) ((void)(P), (void)(I))
+/* _mm_prefetch: bring the cache line of P closer to the processor, as the
+ * selector I says: prefetcht0/t1/t2/nta, prefetchw for _MM_HINT_ET0 where
+ * the target has it, prefetchrst2 for _MM_HINT_RST2 under -mmovrs. The
+ * selector is taken apart as GCC's header does it.
+ *
+ * (This was `((void)(P), (void)(I))`: the hint compiled to nothing, and a
+ * program that prefetches through the Intel name ran every one of those
+ * loads cold. __builtin_prefetch has emitted its instruction for long.) */
+#define _mm_prefetch(P, I) \
+    __builtin_ia32_prefetch((P), ((I) & 0xC) >> 2, ((I) & 0x3), ((I) & 0x10) >> 4)
 
 /* === Aligned memory allocation === */
 
@@ -822,12 +846,14 @@ _mm_cvtps_pi8(__m128 __a)
  * `&(A)` rejected `_mm_extract_pi16(_mm_add_pi16(a, b), 1)`, which GCC
  * accepts). */
 #define _mm_extract_pi16(A, N) \
-    ((int)(unsigned short)((unsigned long long)(long long)(__m64)(A) >> (16 * ((N) & 3))))
+    (__LCCC_IMMEDIATE(N, 3, "selector must be an integer constant in the range [0, 3]"), \
+     (int)(unsigned short)((unsigned long long)(long long)(__m64)(A) >> (16 * ((N) & 3))))
 
 #define _m_pextrw(A, N) _mm_extract_pi16(A, N)
 
 /* Insert a 16-bit integer into __m64 at position N */
 #define _mm_insert_pi16(A, D, N) __extension__ ({ \
+    __LCCC_IMMEDIATE(N, 3, "selector must be an integer constant in the range [0, 3]"); \
     __m64 __tmp = (A); \
     ((unsigned short *)&__tmp)[(N) & 3] = (unsigned short)(D); \
     __tmp; \

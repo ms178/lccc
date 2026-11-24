@@ -1085,6 +1085,13 @@ gate "temp-symlink-hardening" fast \
 gate "o-stdout" fast \
     env CCC="$LCCC" bash tests/regression/check_o_stdout.sh
 
+# GCC and Clang go on with the inputs behind one that fails (`gcc -c a.c bad.c
+# c.c` writes a.o and c.o and reports bad.c); the driver ended the run at the
+# first failure. -c, -S, -E and -fsyntax-only, C and assembly inputs, and the
+# objects GCC leaves as the oracle.
+gate "every-input-compiled" fast \
+    env CCC="$LCCC" GCC=gcc-16 bash tests/regression/check_every_input_compiled.sh
+
 # AUD-HYGIENE-1: the loose `tests/*.c`/`*.sh` scratch (compat_test.sh and the
 # IVSR/univsr probes) are gates now instead of unreferenced files.  The compat
 # suite is a run-and-compare differential against GCC; the probe
@@ -1358,6 +1365,31 @@ gate "x86-mflag-macro-parity" fast \
 # and pins GCC's rejection wording.
 gate "x86-prefer-vector-width" fast \
     python3 scripts/check_x86_prefer_vector_width.py "$LCCC" --gcc "${GCC16:-gcc-16}"
+# A prefetch computes nothing, so its gate compares the instruction: every
+# form of `__builtin_prefetch`, `_mm_prefetch` and `_m_prefetchw` under every
+# CPU of the table, as a 64-bit and as a 32-bit target, against GCC 16.2.
+gate "x86-prefetch-instructions" fast \
+    python3 scripts/check_x86_prefetch.py "$LCCC" --gcc "${GCC16:-gcc-16}"
+# A macro lccc defines is a promise that the intrinsics behind it exist. The
+# census calls every intrinsic of GCC 16.2's headers under lccc and holds the
+# count that does not compile to tests/x86-intrinsics/expected.txt, in both
+# directions.
+gate "x86-intrinsic-census" fast \
+    python3 scripts/x86_intrinsic_census.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# Which extension each SIMD helper needs, against the table generated from
+# GCC 16.2's headers (tests/simd/isa_permissions_gcc16.json). No compiler.
+gate "simd-isa-permissions" fast \
+    python3 tests/simd/check_isa_permissions.py
+# A call that compiles may still compute something else. Every intrinsic lccc
+# has that this processor executes is called with generated arguments and
+# held to GCC 16.2's result at -O2 and -O0; a value where GCC wants a
+# constant has to be refused or be right; GNU as 2.47 has to take the
+# assembly lccc writes.
+gate "x86-intrinsic-values-self-test" fast \
+    python3 -m unittest tests.corpus.test_x86_intrinsic_values
+gate "x86-intrinsic-values" slow \
+    python3 scripts/x86_intrinsic_values.py --check --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 
@@ -2534,6 +2566,26 @@ gate "volatile-access-semantics" fast \
 gate "loop-preheader" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_preheader.sh
 
+# Loop rotation is on by default where it pays, and the decision is a
+# compile-time property no run-and-compare test can see.  This gate reads
+# the assembly both ways: what was to leave the loop has left it (a
+# division, a `*p += x` kept in a register, an `a[i] = f(a[i-1])`
+# recurrence), each with rotation off as the negative control, and a loop
+# that does not pay is byte-identical to the pipeline without the pass.
+gate "loop-rotate-profit" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_rotate_profit.sh
+
+# The linear address forms LICM, the memory promoter and loop-carried
+# forwarding share decide which store can reach which load.  Too little and
+# an invariant load stays in its loop; too much and the loop reads a value
+# a store has replaced, which no small test array shows because the index
+# has to wrap first.  The gate counts the loads left in the loop for a
+# store that marches away (hoisted), one that starts on the load (kept) and
+# one whose index wraps round to it (kept: `unsigned`, and `int` under
+# -fwrapv).
+gate "licm-alias-disjoint" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_licm_alias_disjoint.sh
+
 # LICM must not hoist a volatile load out of its loop (C11 5.1.2.3): N
 # observable accesses must not become 1.  The runtime cannot see this -- a
 # hoisted volatile load computes the same answer -- so the gate asserts it
@@ -2988,6 +3040,16 @@ gate "seg-prefix-full-matrix" fast \
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 
+# The i686 fused `res * base + val` (64-bit) read all 32 bits of an 8- or
+# 16-bit operand's home, where narrow arithmetic leaves whatever it carried:
+# `unsigned short n = 0; n--; sum = sum * 31 + n;` added 0xffffffff. The
+# gate runs tests/regression/mulacc_narrow_feeder.c at five levels (each
+# recurrence against itself sent through memory) and reads the -O2 assembly:
+# narrow addends are extended in the sequence, narrow bases come from the
+# slot their cast wrote, and no chain was given up for it.
+gate "i686-mulacc-narrow-feeder" fast \
+    bash tests/regression/check_i686_mulacc_narrow_feeder.sh
+
 # i686 select-diamond -> cmov fold and load->copy relay: 17 select shapes,
 # freestanding -m32, lccc == gcc-16 == folds-disabled at -O0/-O1/-O2/-Os,
 # plus a fold-fires witness (cmov present with the pass on, absent off).
@@ -3177,6 +3239,21 @@ gate "i686-asm-diff" fast \
 gate "x86-vector-width-table" fast \
     python3 scripts/x86_vector_widths.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
 
+# The instructions no encoder arm was written for (3DNow!, FMA4, XOP, TBM,
+# LWP, Key Locker, AMX, AVX10.2, SM3, SHA512, the MMX/SSE conversions, odd
+# forms of known ones) are a table that scripts/x86_learned_rows.py solves
+# from GNU as's bytes (encoder/learned_rows.rs; encoder/learned.rs reads it).
+# --verify: is the table in the tree what GNU as answers today, and does lccc
+# make of every row what GNU as makes of it? The second question is asked
+# with what the solving held still -- every register of a kind, the
+# addresses, masks, broadcasts, rounding modes, numbers and encoding hints:
+# 370,000 statements in 64-bit, 32-bit and 16-bit code. The ones GNU as
+# assembles have to come out as the same bytes and relocations, and of the
+# 200,000 it refuses lccc has to refuse every one.
+gate "x86-learned-rows" fast \
+    python3 scripts/x86_learned_rows.py --verify --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-x86 --lccc32 target/fastbuild/lccc-i686
+
 gate "x86-gas-table-sweep" fast \
     python3 scripts/gas_table_sweep.py --check --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         --lccc target/fastbuild/lccc-x86
@@ -3191,6 +3268,33 @@ gate "code16-gas-table-sweep" fast \
 
 gate "code16gcc-gas-table-sweep" fast \
     python3 scripts/gas_table_sweep.py --check --16gcc --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        --lccc target/fastbuild/lccc-i686
+
+# What the assemblers replace. Both encoders write the cheaper instruction
+# for the same effect -- `movl $1, %eax` for `movq $1, %rax`, `movlps` for a
+# `movsd` store -- in everything the compiler emits, and under -Wa,-O2 or
+# -Wa,-Os in a person's text (encoder/optimize.rs). The statements of GNU as
+# 2.47's table again, with what an optimizer looks at on top (immediates at
+# the edges of every width, one register in every position, every form of
+# address, {nf}); two questions of each. --check: is lccc's encoding as
+# short as GNU as's under -O2 and -Os? Fails on a longer one that
+# tests/asm-optimize/expected-<mode>.txt does not name (each of those is a
+# replacement of GNU as's that is not the same instruction; README.md there
+# says why), on a statement the optimizer no longer assembles, and on any
+# other difference from the inventory. --execute: is the replacement the same
+# instruction? Every rewritten statement is run on this processor as written
+# and as replaced, from the same registers, flags, vector registers and
+# memory, and all of it has to be the same afterwards. The self-test plants
+# replacements that are wrong in every way the run can see.
+gate "asm-optimize-sweep-selftest" fast \
+    python3 scripts/asm_optimize_sweep.py --self-test
+
+gate "x86-asm-optimize-sweep" fast \
+    python3 scripts/asm_optimize_sweep.py --check --execute --minimum 1500 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        --lccc target/fastbuild/lccc-x86
+
+gate "i686-asm-optimize-sweep" fast \
+    python3 scripts/asm_optimize_sweep.py --32 --check --execute --minimum 800 --gas "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         --lccc target/fastbuild/lccc-i686
 gate "sse34-clang-encoding" fast \
     python3 tests/regression/check_sse34_clang.py

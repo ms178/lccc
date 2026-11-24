@@ -12,10 +12,12 @@
 pub mod cfi;
 pub mod elf_writer;
 pub mod encoder;
+pub(crate) mod generated;
 pub mod parser;
 
 use elf_writer::ElfWriter;
-use parser::parse_asm;
+pub use parser::Optimize;
+use parser::parse_asm_with;
 
 /// Assemble AT&T syntax x86-64 assembly text into an ELF object file.
 ///
@@ -28,7 +30,18 @@ pub fn assemble(
     output_path: &str,
     debug: Option<crate::backend::elf::DwarfDebug>,
 ) -> Result<(), String> {
-    let elf_bytes = assemble_bytes(asm_text, debug)?;
+    assemble_with(asm_text, output_path, debug, Optimize::Never)
+}
+
+/// [`assemble`], with the encoders free to write a cheaper instruction for
+/// the statements `optimize` names.
+pub fn assemble_with(
+    asm_text: &str,
+    output_path: &str,
+    debug: Option<crate::backend::elf::DwarfDebug>,
+    optimize: Optimize,
+) -> Result<(), String> {
+    let elf_bytes = assemble_bytes_with(asm_text, debug, optimize)?;
     std::fs::write(output_path, elf_bytes)
         .map_err(|e| format!("Failed to write object file: {}", e))
 }
@@ -37,7 +50,15 @@ pub(crate) fn assemble_bytes(
     asm_text: &str,
     debug: Option<crate::backend::elf::DwarfDebug>,
 ) -> Result<Vec<u8>, String> {
-    let items = parse_asm(asm_text)?;
+    assemble_bytes_with(asm_text, debug, Optimize::Never)
+}
+
+pub(crate) fn assemble_bytes_with(
+    asm_text: &str,
+    debug: Option<crate::backend::elf::DwarfDebug>,
+    optimize: Optimize,
+) -> Result<Vec<u8>, String> {
+    let items = parse_asm_with(asm_text, optimize)?;
     let items = crate::backend::x86::assembler::cfi::lower_cfi(
         items,
         crate::backend::x86::assembler::cfi::CfiArch::X86_64,

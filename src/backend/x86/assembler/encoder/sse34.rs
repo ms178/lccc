@@ -202,7 +202,11 @@ mod tests {
             ("rex64 pcmpestrm $0,%xmm9,%xmm10", "66 4d 0f 3a 60 d1 00"),
             ("rex movddup %xmm1,%xmm2", "f2 40 0f 12 d1"),
             ("rex crc32b %al,%eax", "f2 40 0f 38 f0 c0"),
-            ("rex64 crc32b %al,%rax", "f2 48 0f 38 f0 c0"),
+            // `rex64` is the `W` of the 64-bit form: in front of the
+            // 32-bit one it makes that form of it, and in front of the
+            // 64-bit one it asks for the bit twice (below).
+            ("rex64 crc32b %al,%eax", "f2 48 0f 38 f0 c0"),
+            ("crc32b %al,%rax", "f2 48 0f 38 f0 c0"),
             ("phsubsw %xmm1,%xmm2", "66 0f 38 07 d1"),
             ("pcmpistri $255,%xmm1,%xmm2", "66 0f 3a 63 d1 ff"),
             ("pcmpestrm $1,%xmm1,%xmm2", "66 0f 3a 60 d1 01"),
@@ -225,6 +229,10 @@ mod tests {
             "crc32b %xmm0,%eax",
             "rex crc32b %ah,%eax",
             "rex64 crc32b %ah,%rax",
+            // GNU as 2.47: "same type of prefix used twice". This was
+            // assembled, the word's bit folded into the instruction's own.
+            "rex64 crc32b %al,%rax",
+            "rex64 crc32q %rax,%rax",
             "extrq $256,$1,%xmm0",
             "insertq (%rax),%xmm0",
         ] {

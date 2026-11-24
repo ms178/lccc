@@ -60,11 +60,11 @@ _mm_aesimc_si128(__m128i __V)
  * intrinsics above. */
 #ifdef __AVX2__
 #include <avxintrin.h>
-static __inline__ __m256i __attribute__((__always_inline__))
-_mm256_clmulepi64_epi128(__m256i __A, __m256i __B, const int __C)
-{
-    return __CCC_M256I_FROM_BUILTIN(__builtin_ia32_vpclmulqdq256(__A, __B, __C));
-}
+/* A macro, as _mm_clmulepi64_si128 is: the selector is an immediate of the
+ * instruction, and a function's parameter is not one. As a function this
+ * compiled to `vpclmulqdq $0` for every selector at -O0. */
+#define _mm256_clmulepi64_epi128(__A, __B, __C) \
+    (__CCC_M256I_FROM_BUILTIN(__builtin_ia32_vpclmulqdq256((__A), (__B), (__C))))
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_aesenc_epi128(__m256i __V, __m256i __R)

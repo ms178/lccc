@@ -138,6 +138,10 @@ pub(super) mod parsed_attr_flag {
     /// The typedef named by the specifiers has a volatile object qualifier
     /// (`typedef int *volatile P`): the object declared through it is volatile.
     pub const TYPEDEF_OBJECT_VOLATILE: u64 = 1 << 26;
+    /// That object qualifier is the `volatile` an `_Atomic` stands for
+    /// (`typedef int *_Atomic P`; see `ParsedDeclAttrs::set_atomic`). Only
+    /// ever set together with `TYPEDEF_OBJECT_VOLATILE`, and cleared with it.
+    pub const TYPEDEF_OBJECT_ATOMIC: u64 = 1 << 39;
 
     // --- Type qualifiers ---
     /// `const` qualifier encountered.
@@ -291,6 +295,10 @@ pub(super) struct ParsedDeclAttrs {
     /// qualifier: the object for a non-pointer, the pointee for a pointer).
     /// Set by `parse_declarator_with_attrs`; read by the typedef registration.
     pub(super) declarator_base_volatile: bool,
+    /// `_Atomic` in the declaration's specifiers, written there or brought by
+    /// a typedef name (see `DeclAttributes::base_atomic`). Set by
+    /// `parse_declarator_with_attrs`; read by the typedef registration.
+    pub(super) declarator_base_atomic: bool,
     /// The `volatile` flag is set only because a declarator star added it:
     /// the declaration-wide flag keeps the union of the specifiers' and every
     /// star's `volatile` (`int *volatile a, *b;` leaves it set for `b`), and
@@ -464,6 +472,40 @@ impl ParsedDeclAttrs {
     pub fn parsing_atomic(&self) -> bool {
         self.flags & parsed_attr_flag::ATOMIC != 0
     }
+    /// Record `_Atomic`.
+    ///
+    /// The types do not carry atomic-ness, so nothing downstream could tell
+    /// an atomic object from a plain one, and every pass that reasons about
+    /// memory was free to treat it as memory only this thread touches: the
+    /// load of `while (!done) ;` was hoisted out of its loop and the loop
+    /// never ended, for `atomic_bool done`, `_Atomic int done`, a member and
+    /// a pointee alike, and `for (...) hits += x` kept `hits` in a register
+    /// for the length of the loop. An atomic object is one other threads
+    /// read and write while this one runs (C11 5.1.2.4p5); each access has
+    /// to be made where the program makes it.
+    ///
+    /// That is what `volatile` asks for, and its tracking is complete
+    /// (objects, typedef names, members, pointees, casts), so every site
+    /// that records `_Atomic` records `volatile` with it.
+    ///
+    /// The program wrote no `volatile`, though, and the qualifier rules must
+    /// not act as if it had: `void *p = &flag;` and `memcpy(dst, &flag, n)`
+    /// are well-formed for an atomic `flag` and discard nothing. So this
+    /// flag stays the record of where that `volatile` came from. It is kept
+    /// per specifier list like `volatile` itself (cleared for each
+    /// parameter and member, set aside around a star's own qualifiers,
+    /// carried by a typedef name through `Parser::typedef_base_atomic`) and
+    /// leaves the parser as `DeclAttributes::base_atomic`,
+    /// `ParamDecl::is_atomic` and `StructFieldDecl::base_atomic`; a star's
+    /// own `_Atomic` is kept out of the star's recorded qualifiers. What
+    /// reads the qualifiers a declaration wrote asks `base_volatile_written`
+    /// and its siblings. If the two flags ever disagree, that reader misses
+    /// a `volatile`; no access is affected.
+    ///
+    /// What this does not give is the atomicity of the operators: `x += 1`
+    /// on an atomic `x` is one read and one write, not a `lock`ed update,
+    /// and converting `_Atomic int *` to `int *` is accepted where GCC 16
+    /// and Clang 23 reject it. Both need a type that says atomic.
     #[inline]
     pub fn set_atomic(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::ATOMIC, v)
@@ -483,6 +525,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn parsing_typedef_object_volatile(&self) -> bool {
         self.flags & parsed_attr_flag::TYPEDEF_OBJECT_VOLATILE != 0
+    }
+    #[inline]
+    pub fn parsing_typedef_object_atomic(&self) -> bool {
+        self.flags & parsed_attr_flag::TYPEDEF_OBJECT_ATOMIC != 0
     }
     #[inline]
     pub fn parsing_constructor(&self) -> bool {
@@ -645,7 +691,17 @@ impl ParsedDeclAttrs {
     }
     #[inline]
     pub fn set_typedef_object_volatile(&mut self, v: bool) {
-        self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_VOLATILE, v)
+        self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_VOLATILE, v);
+        // What says where the qualifier came from goes when it goes; who
+        // sets it again says so again (`set_typedef_object_atomic`).
+        self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_ATOMIC, false);
+    }
+    /// Call after [`Self::set_typedef_object_volatile`]; holds only while
+    /// that flag does.
+    #[inline]
+    pub fn set_typedef_object_atomic(&mut self, v: bool) {
+        let v = v && self.parsing_typedef_object_volatile();
+        self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_ATOMIC, v)
     }
     #[inline]
     pub fn set_constructor(&mut self, v: bool) {
@@ -822,6 +878,15 @@ pub struct Parser {
     /// int VI;`, `typedef volatile int *VPI;`). Their base qualifier applies
     /// to each use, separately from the object qualifier above.
     pub(super) typedef_base_volatile: FxHashSet<String>,
+    /// Typedefs whose specifiers are `_Atomic` (`typedef _Atomic int
+    /// atomic_int;`, and every typedef built on such a name). A use of the
+    /// name is a use of `_Atomic`. Same scoping as `typedef_base_volatile`,
+    /// which holds each of these names as well.
+    pub(super) typedef_base_atomic: FxHashSet<String>,
+    /// Typedef names whose objects are `_Atomic` (`typedef int *_Atomic AP;`,
+    /// `typedef _Atomic int atomic_int;`): the names of
+    /// `typedef_object_volatile` whose `volatile` stands for it.
+    pub(super) typedef_object_atomic: FxHashSet<String>,
     /// Typedef names shadowed by local variable declarations in the current scope.
     pub(super) shadowed_typedefs: FxHashSet<String>,
     /// Names declared as a FUNCTION (anywhere, any linkage): a designator of one
@@ -983,6 +1048,8 @@ pub(super) struct TypedefScopeUndo {
     object_space: Option<AddressSpace>,
     object_volatile: bool,
     base_volatile: bool,
+    base_atomic: bool,
+    object_atomic: bool,
     unused: bool,
 }
 
@@ -1078,6 +1145,8 @@ impl Parser {
             object_space: self.typedef_object_spaces.remove(name),
             object_volatile: self.typedef_object_volatile.remove(name),
             base_volatile: self.typedef_base_volatile.remove(name),
+            base_atomic: self.typedef_base_atomic.remove(name),
+            object_atomic: self.typedef_object_atomic.remove(name),
             unused: self.typedef_unused.remove(name),
         };
         self.typedef_scope_log.push(undo);
@@ -1095,6 +1164,8 @@ impl Parser {
             self.typedef_object_spaces.remove(&undo.name);
             self.typedef_object_volatile.remove(&undo.name);
             self.typedef_base_volatile.remove(&undo.name);
+            self.typedef_base_atomic.remove(&undo.name);
+            self.typedef_object_atomic.remove(&undo.name);
             self.typedef_unused.remove(&undo.name);
             if undo.unused {
                 self.typedef_unused.insert(undo.name.clone());
@@ -1110,6 +1181,12 @@ impl Parser {
             }
             if undo.object_volatile {
                 self.typedef_object_volatile.insert(undo.name.clone());
+            }
+            if undo.base_atomic {
+                self.typedef_base_atomic.insert(undo.name.clone());
+            }
+            if undo.object_atomic {
+                self.typedef_object_atomic.insert(undo.name.clone());
             }
             if undo.base_volatile {
                 self.typedef_base_volatile.insert(undo.name);
@@ -1133,6 +1210,8 @@ impl Parser {
             typedef_object_spaces: FxHashMap::default(),
             typedef_object_volatile: FxHashSet::default(),
             typedef_base_volatile: FxHashSet::default(),
+            typedef_base_atomic: FxHashSet::default(),
+            typedef_object_atomic: FxHashSet::default(),
             shadowed_typedefs: FxHashSet::default(),
             function_names: FxHashSet::default(),
             attrs: ParsedDeclAttrs::default(),
@@ -1875,6 +1954,9 @@ impl Parser {
                 TokenKind::Atomic => {
                     self.advance();
                     self.attrs.set_atomic(true);
+                    // An atomic pointer is read and written like a volatile
+                    // one (see `ParsedDeclAttrs::set_atomic`).
+                    self.attrs.set_volatile(true);
                 }
                 TokenKind::Volatile => {
                     self.advance();

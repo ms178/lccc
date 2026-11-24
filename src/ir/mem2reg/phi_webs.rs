@@ -17,9 +17,14 @@
 //! that phi elimination already drops, and the copies that remain (the
 //! genuine `tail = a; a = next` shifts) go through its parallel-copy planner.
 //!
+//! A second kind of pair needs no phi-to-phi edge: *exit twins*, the phi at
+//! the header of a bottom-tested loop and a phi behind the loop that the
+//! latch feeds the same value.  They are unioned under the same interference
+//! test; see the comment where they are collected.
+//!
 //! Pairs stay inside one innermost loop (or end in a loop-free join); see
 //! the comment at the filter.  Pairs are unioned pass-through first (incoming phi's block dominates the
-//! phi's block), role shifts last; see the comment at the sort.
+//! phi's block), role shifts and twins last; see the comment at the sort.
 //!
 //! # Interference
 //!
@@ -128,6 +133,67 @@ pub(crate) fn coalesce_phi_webs(func: &mut IrFunction) -> usize {
                     {
                         pairs.push((dest.0, s.0));
                     }
+                }
+            }
+        }
+    }
+    // Exit twins: the phi at the header of a bottom-tested loop and a phi
+    // behind the loop, both fed the same value by the loop's latch
+    // (`m = phi [s0, preheader] [s', latch]`, `x = phi [s0, guard] [s', latch]`;
+    // loop rotation makes that shape out of every `while` whose value is used
+    // afterwards, and a `do`-`while` with a `break` has it in the source).
+    // Left as two names, the latch's two edges need different copies, so the
+    // exit edge is split for a `x = s'` of its own and the loop's result is
+    // moved once more on the way out; as one name both edges carry the same
+    // copy, which phi elimination runs once ahead of the branch
+    // (`self_loop_copies_can_hoist`, condition 5) and the allocator folds
+    // into the definition of `s'`.  The pair is (exit phi, loop phi): the
+    // scope rule below reads it like a pass-through pair that ends behind
+    // the loop.
+    {
+        // (value, block it is passed out of) -> the phis it is passed to.
+        let mut fed: Vec<((u32, usize), Vec<u32>)> = Vec::new();
+        let mut slot_of: FxHashMap<(u32, usize), usize> = FxHashMap::default();
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                let Instruction::Phi { dest, incoming, .. } = inst else {
+                    continue;
+                };
+                if !phi_block.contains_key(&dest.0) {
+                    continue;
+                }
+                for (op, from) in incoming {
+                    let (Operand::Value(s), Some(&from)) = (op, labels.get(from)) else {
+                        continue;
+                    };
+                    if s.0 == dest.0 {
+                        continue;
+                    }
+                    let slot = *slot_of.entry((s.0, from)).or_insert_with(|| {
+                        fed.push(((s.0, from), Vec::new()));
+                        fed.len() - 1
+                    });
+                    if !fed[slot].1.contains(&dest.0) {
+                        fed[slot].1.push(dest.0);
+                    }
+                }
+            }
+        }
+        for ((_, from), phis) in &fed {
+            // The loop phi is the one whose block the feeding block is
+            // dominated by: that edge is a back edge.  A loop has one header,
+            // so there is at most one such phi per fed value.
+            let Some(&in_loop) = phis
+                .iter()
+                .find(|d| analysis::dominates_idom(&cfg.idom, phi_block[d], *from))
+            else {
+                continue;
+            };
+            for &behind in phis {
+                if behind != in_loop
+                    && !analysis::dominates_idom(&cfg.idom, phi_block[&behind], *from)
+                {
+                    pairs.push((behind, in_loop));
                 }
             }
         }
@@ -501,6 +567,150 @@ mod tests {
     }
 
     /// Two phis of one block are defined simultaneously and never share.
+    /// A bottom-tested loop (1) behind a guard (0), its result read at the
+    /// join (2) of the loop's exit and the guard's zero-trip edge:
+    ///
+    /// ```text
+    ///   0: -> 4 | 5        4: -> 1        5: -> 2
+    ///   1: s = phi [v1, 4] [s', 1] ; i = phi [v2, 4] [i', 1] ; ...   -> 1 | 2
+    ///   2: r = phi [v1, 5] [s', 1] ; ret r
+    /// ```
+    fn guarded_loop_with_a_live_out(exit: Vec<Instruction>, returned: u32) -> IrFunction {
+        let ld = |d: u32, p: u32| Instruction::Load {
+            dest: Value(d),
+            ptr: Value(p),
+            ty: IrType::Ptr,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        let params = vec![
+            Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 0,
+                ty: IrType::Ptr,
+            },
+            Instruction::ParamRef {
+                dest: Value(2),
+                param_idx: 1,
+                ty: IrType::Ptr,
+            },
+        ];
+        func(vec![
+            block(0, params, cbr(1, 4, 5)),
+            block(4, vec![], Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                vec![
+                    phi(20, &[(1, 4), (22, 1)]),
+                    phi(21, &[(2, 4), (23, 1)]),
+                    ld(22, 20),
+                    ld(23, 21),
+                ],
+                cbr(23, 1, 2),
+            ),
+            block(5, vec![], Terminator::Branch(BlockId(2))),
+            block(
+                2,
+                exit,
+                Terminator::Return(Some(Operand::Value(Value(returned)))),
+            ),
+        ])
+    }
+
+    #[test]
+    fn the_phi_behind_a_loop_shares_the_name_of_the_loop_phi_it_continues() {
+        let mut f = guarded_loop_with_a_live_out(vec![phi(30, &[(1, 5), (22, 1)])], 30);
+        assert_eq!(coalesce_phi_webs(&mut f), 1);
+        assert_eq!(phi_dests(&f, 1), vec![20, 21]);
+        assert_eq!(phi_dests(&f, 2), vec![20], "the exit phi is the loop's `s`");
+        assert!(matches!(
+            f.blocks[4].terminator,
+            Terminator::Return(Some(Operand::Value(Value(20))))
+        ));
+    }
+
+    /// Two phis behind the loop that both continue `s` would be one variable
+    /// twice in one block.
+    #[test]
+    fn only_one_phi_behind_the_loop_can_take_the_name() {
+        let mut f = guarded_loop_with_a_live_out(
+            vec![phi(30, &[(1, 5), (22, 1)]), phi(31, &[(2, 5), (22, 1)])],
+            31,
+        );
+        assert_eq!(coalesce_phi_webs(&mut f), 1);
+        let behind = phi_dests(&f, 2);
+        assert_eq!(behind.iter().filter(|&&d| d == 20).count(), 1, "{behind:?}");
+    }
+
+    /// Phis that take the same value out of a block that is no latch of
+    /// theirs are not twins: `0` feeds `v1` to the phis of two sibling
+    /// blocks, and each keeps its name.
+    #[test]
+    fn phis_fed_alike_by_a_block_that_is_not_their_latch_stay_apart() {
+        let mut f = func(vec![
+            block(
+                0,
+                vec![Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                }],
+                cbr(1, 1, 2),
+            ),
+            block(1, vec![phi(20, &[(1, 0), (1, 2)])], cbr(20, 2, 3)),
+            block(2, vec![phi(30, &[(1, 0), (1, 1)])], cbr(30, 1, 3)),
+            block(3, vec![], Terminator::Return(None)),
+        ]);
+        assert_eq!(coalesce_phi_webs(&mut f), 0);
+        assert_eq!((phi_dests(&f, 1), phi_dests(&f, 2)), (vec![20], vec![30]));
+    }
+
+    /// The exit of an inner loop lies inside the outer one: the scope rule
+    /// that keeps phi-to-phi pairs inside one loop keeps twins there too.
+    #[test]
+    fn a_twin_behind_an_inner_loop_stays_apart() {
+        let ld = |d: u32, p: u32| Instruction::Load {
+            dest: Value(d),
+            ptr: Value(p),
+            ty: IrType::Ptr,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        let mut f = func(vec![
+            block(
+                0,
+                vec![Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                }],
+                Terminator::Branch(BlockId(6)),
+            ),
+            // The outer loop: 6 -> (1 | 5), 1 is the inner loop, both -> 2 -> 6.
+            block(6, vec![phi(10, &[(1, 0), (30, 2)])], cbr(10, 4, 5)),
+            block(4, vec![], Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                vec![phi(20, &[(10, 4), (22, 1)]), ld(22, 20)],
+                cbr(22, 1, 2),
+            ),
+            block(5, vec![], Terminator::Branch(BlockId(2))),
+            block(2, vec![phi(30, &[(10, 5), (22, 1)])], cbr(30, 6, 3)),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(30)))),
+            ),
+        ]);
+        coalesce_phi_webs(&mut f);
+        assert_eq!(
+            phi_dests(&f, 1),
+            vec![20],
+            "the inner loop's phi keeps its name"
+        );
+        assert_ne!(phi_dests(&f, 2), vec![20]);
+    }
+
     #[test]
     fn phis_of_one_block_never_share_a_name() {
         let mut f = func(vec![

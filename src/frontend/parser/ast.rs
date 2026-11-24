@@ -473,6 +473,9 @@ pub struct ParamDecl {
     /// `*p` access is an observable side effect (C11 5.1.2.3).  CType does
     /// not track qualifiers, so the flag rides on ParamDecl.
     pub is_volatile: bool,
+    /// Whether this parameter's base type is `_Atomic` (see
+    /// `DeclAttributes::base_atomic`; `is_volatile` is set with it).
+    pub is_atomic: bool,
     /// Whether the adjusted pointer parameter is restrict-qualified. Unlike
     /// const, this is an optimization contract: accesses based on distinct
     /// restrict parameters may be proven non-aliasing within the function.
@@ -865,6 +868,12 @@ pub struct DeclAttributes {
     /// qualifier, not the declarator's own). A typedef recorded with this flag
     /// qualifies each use of the name (see `Parser::typedef_base_volatile`).
     pub base_volatile: bool,
+    /// Whether the declaration's specifiers are `_Atomic`, written there or
+    /// brought by a typedef name (see `Parser::typedef_base_atomic`). Such
+    /// specifiers set `base_volatile` too, for the way the object is accessed
+    /// (`ParsedDeclAttrs::set_atomic`); this flag is how a reader that asks
+    /// which qualifiers the program *wrote* tells the two apart.
+    pub base_atomic: bool,
     /// Attributes written at specifier position whose measured applicability
     /// must be checked once the declaration's kind is known
     /// (`int __attribute__((noreturn)) x;` -> `'noreturn' attribute ignored`).
@@ -972,6 +981,15 @@ pub mod decl_attr_flag {
 }
 
 impl DeclAttributes {
+    /// Whether the specifiers wrote `volatile`: `base_volatile` without the
+    /// share `_Atomic` has in it (see `base_atomic`). `volatile _Atomic int`
+    /// reads as not written; a reader that acts only on what was written can
+    /// miss that one and can never invent another.
+    #[inline]
+    pub fn base_volatile_written(&self) -> bool {
+        self.base_volatile && !self.base_atomic
+    }
+
     // --- flag getters ---
 
     #[inline]
@@ -1451,6 +1469,7 @@ mod declarator_law_tests {
             fptr_calling_convention: crate::common::types::CallingConvention::Default,
             is_const: false,
             is_volatile: false,
+            is_atomic: false,
             is_restrict: false,
             vla_size_exprs: Vec::new(),
             decayed_array: false,
@@ -1752,6 +1771,8 @@ pub struct StructFieldDecl {
     /// `volatile` on the field's base type (`volatile u32 ctrl`, `volatile int a[4]`):
     /// the element or pointee access is volatile. Mirrors `DeclAttributes::base_volatile`.
     pub base_volatile: bool,
+    /// `_Atomic` on the field's base type. Mirrors `DeclAttributes::base_atomic`.
+    pub base_atomic: bool,
     /// Whether the specifiers are `restrict`-qualified (a typedef'd pointer
     /// base: `restrict ip *p`), so the pointee of `p`'s first star is.
     pub base_restrict: bool,
@@ -2525,6 +2546,13 @@ impl DerivedDeclarator {
 }
 
 impl ParamDecl {
+    /// Whether the parameter's specifiers wrote `volatile` (see
+    /// `DeclAttributes::base_volatile_written`).
+    #[inline]
+    pub fn volatile_written(&self) -> bool {
+        self.is_volatile && !self.is_atomic
+    }
+
     /// Calls `f` on each expression in this parameter's type, including a
     /// `_Alignas(type-name)` and a function-pointer parameter's own
     /// parameter types.
@@ -2536,6 +2564,15 @@ impl ParamDecl {
         for param in self.fptr_params.iter().flatten() {
             param.for_each_type_expr(f);
         }
+    }
+}
+
+impl StructFieldDecl {
+    /// Whether the member's specifiers wrote `volatile` (see
+    /// `DeclAttributes::base_volatile_written`).
+    #[inline]
+    pub fn base_volatile_written(&self) -> bool {
+        self.base_volatile && !self.base_atomic
     }
 }
 

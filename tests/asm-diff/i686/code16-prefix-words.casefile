@@ -1,0 +1,636 @@
+# The prefix words in 16-bit code (.code16), one statement a group, each held
+# to GNU as 2.47. Here the words that do something are `addr32` and `data32`:
+# they are the 0x67 and 0x66 bytes, and GNU as refuses `addr16`/`data16` as
+# "redundant". `addr32` and a 32-bit address share the one 0x67 (`addr32 movw
+# %ax, (%ebx)` is 67 89 03); a 0x67 or 0x66 an instruction has for itself is
+# "same type of prefix used twice" (`addr32 jecxz`, `addr32 monitor %eax,
+# ...`, `data32 addl %eax, %ebx`). `addr32` sizes the absolute address of a
+# bare symbol or number (`addr32 movw %ax, 0x1234` is 67 a3 34 12 00 00) and
+# refuses a 16-bit base, and a branch, a far branch and a far return behind
+# `data32` take the 32-bit operand. lccc read both words as the 16-bit ones
+# of 32-bit code and refused every statement here that GNU as assembles.
+;;; addr32_nop
+.text
+.code16
+addr32 nop
+;;; data32_nop
+.text
+.code16
+data32 nop
+;;; addr16_nop reject
+.text
+.code16
+addr16 nop
+;;; data16_nop reject
+.text
+.code16
+data16 nop
+;;; data32_addw_ax_bx
+.text
+.code16
+data32 addw %ax, %bx
+;;; data32_addl_eax_ebx reject
+.text
+.code16
+data32 addl %eax, %ebx
+;;; data16_addw_ax_bx reject
+.text
+.code16
+data16 addw %ax, %bx
+;;; data16_addl_eax_ebx reject
+.text
+.code16
+data16 addl %eax, %ebx
+;;; addr32_movw_ax_0x1234
+.text
+.code16
+addr32 movw %ax, 0x1234
+;;; addr32_movw_ax_bx reject
+.text
+.code16
+addr32 movw %ax, (%bx)
+;;; addr32_movw_ax_ebx
+.text
+.code16
+addr32 movw %ax, (%ebx)
+;;; addr16_movw_ax_bx reject
+.text
+.code16
+addr16 movw %ax, (%bx)
+;;; addr16_movw_ax_ebx reject
+.text
+.code16
+addr16 movw %ax, (%ebx)
+;;; data32_ret
+.text
+.code16
+data32 ret
+;;; data32_lret
+.text
+.code16
+data32 lret
+;;; data32_push_ax
+.text
+.code16
+data32 push %ax
+;;; data32_pushw_ax
+.text
+.code16
+data32 pushw %ax
+;;; data32_pushl_eax reject
+.text
+.code16
+data32 pushl %eax
+;;; addr32_jcxz_1f_1
+.text
+.code16
+addr32 jcxz 1f
+1:
+;;; addr32_loop_1f_1
+.text
+.code16
+addr32 loop 1f
+1:
+;;; addr32_rep_movsb
+.text
+.code16
+addr32 rep movsb
+;;; addr32_stosw
+.text
+.code16
+addr32 stosw
+;;; addr32_lodsb
+.text
+.code16
+addr32 lodsb
+;;; data32_jmp_1f_1
+.text
+.code16
+data32 jmp 1f
+1:
+;;; data32_call_1f_1
+.text
+.code16
+data32 call 1f
+1:
+;;; data32_ljmp_0x10_0x1234
+.text
+.code16
+data32 ljmp $0x10, $0x1234
+;;; data32_lcall_0x10_0x1234
+.text
+.code16
+data32 lcall $0x10, $0x1234
+;;; addr32_lgdtl_0x1234
+.text
+.code16
+addr32 lgdtl 0x1234
+;;; addr32_data32_lgdtl_0x1234 reject
+.text
+.code16
+addr32 data32 lgdtl 0x1234
+;;; data32_addr32_lgdtl_0x1234 reject
+.text
+.code16
+data32 addr32 lgdtl 0x1234
+;;; data32_lidt_0x1234
+.text
+.code16
+data32 lidt 0x1234
+;;; data32_lidtl_0x1234 reject
+.text
+.code16
+data32 lidtl 0x1234
+;;; addr32_xlat
+.text
+.code16
+addr32 xlat
+;;; data32_iret
+.text
+.code16
+data32 iret
+;;; data32_pushf
+.text
+.code16
+data32 pushf
+;;; data32_popf
+.text
+.code16
+data32 popf
+;;; data32_pusha
+.text
+.code16
+data32 pusha
+;;; data32_leave
+.text
+.code16
+data32 leave
+;;; data32_cbw
+.text
+.code16
+data32 cbw
+;;; data32_cwd
+.text
+.code16
+data32 cwd
+;;; addr32_mov_0x12345678_al
+.text
+.code16
+addr32 mov 0x12345678, %al
+;;; addr32_mov_eax_0x12345678
+.text
+.code16
+addr32 mov %eax, 0x12345678
+;;; addr32_jmp_0x1234
+.text
+.code16
+addr32 jmp *0x1234
+;;; data32_movw_0x1234_ax
+.text
+.code16
+data32 movw $0x1234, %ax
+;;; data32_mov_0x12345678_eax reject
+.text
+.code16
+data32 mov $0x12345678, %eax
+;;; data32_fstcw_bx
+.text
+.code16
+data32 fstcw (%bx)
+;;; data32_fwait
+.text
+.code16
+data32 fwait
+;;; data32_fsave_bx
+.text
+.code16
+data32 fsave (%bx)
+;;; data32_fnsave_bx
+.text
+.code16
+data32 fnsave (%bx)
+;;; addr32_fstcw_ebx
+.text
+.code16
+addr32 fstcw (%ebx)
+;;; addr32_fwait
+.text
+.code16
+addr32 fwait
+;;; addr32_monitor_eax_ecx_edx reject
+.text
+.code16
+addr32 monitor %eax, %ecx, %edx
+;;; addr32_monitor_ax_ecx_edx
+.text
+.code16
+addr32 monitor %ax, %ecx, %edx
+;;; addr32_umonitor_eax reject
+.text
+.code16
+addr32 umonitor %eax
+;;; addr32_umonitor_ax
+.text
+.code16
+addr32 umonitor %ax
+;;; data32_vaddps_xmm1_xmm2_xmm3 reject
+.text
+.code16
+data32 vaddps %xmm1, %xmm2, %xmm3
+;;; data32_movd_eax_xmm1 reject
+.text
+.code16
+data32 movd %eax, %xmm1
+;;; data32_jne_1f_1
+.text
+.code16
+data32 jne 1f
+1:
+;;; data32_jne_foo
+.text
+.code16
+data32 jne foo
+;;; data32_jmp_foo
+.text
+.code16
+data32 jmp foo
+;;; data32_call_foo
+.text
+.code16
+data32 call foo
+;;; data32_lea_bx_ax
+.text
+.code16
+data32 lea (%bx), %ax
+;;; addr32_lea_bx_ax reject
+.text
+.code16
+addr32 lea (%bx), %ax
+;;; addr32_lea_0x1234_ax
+.text
+.code16
+addr32 lea 0x1234, %ax
+;;; addr32_lea_sym_ax
+.text
+.code16
+addr32 lea sym, %ax
+;;; addr32_lea_ebx_ax
+.text
+.code16
+addr32 lea (%ebx), %ax
+;;; data32_in_5_ax
+.text
+.code16
+data32 in $5, %ax
+;;; data32_movsw
+.text
+.code16
+data32 movsw
+;;; data32_rep_movsw
+.text
+.code16
+data32 rep movsw
+;;; data32_enter_8_0
+.text
+.code16
+data32 enter $8, $0
+;;; data32_lock_addw_ax_bx
+.text
+.code16
+data32 lock addw %ax, (%bx)
+;;; lock_data32_addw_ax_bx
+.text
+.code16
+lock data32 addw %ax, (%bx)
+;;; data32_addr32_addw_ax_ebx
+.text
+.code16
+data32 addr32 addw %ax, (%ebx)
+;;; addr32_data32_addw_ax_0x1234
+.text
+.code16
+addr32 data32 addw %ax, 0x1234
+;;; addr32_addw_ax_sym
+.text
+.code16
+addr32 addw %ax, sym
+;;; addr32_movw_sym_ax
+.text
+.code16
+addr32 movw sym, %ax
+;;; addr32_movb_al_sym
+.text
+.code16
+addr32 movb %al, sym
+;;; addr32_pushw_sym
+.text
+.code16
+addr32 pushw sym
+;;; addr32_incw_0x1234
+.text
+.code16
+addr32 incw 0x1234
+;;; addr32_call_sym
+.text
+.code16
+addr32 call *sym
+;;; addr32_ljmp_0x1234
+.text
+.code16
+addr32 ljmp *0x1234
+;;; data32_ljmp_0x1234
+.text
+.code16
+data32 ljmp *0x1234
+;;; data32_lgdt_0x1234
+.text
+.code16
+data32 lgdt 0x1234
+;;; addr32_movw_ax_es_0x1234
+.text
+.code16
+addr32 movw %ax, %es:0x1234
+;;; addr32_movw_ax_fs_ebx
+.text
+.code16
+addr32 movw %ax, %fs:(%ebx)
+;;; addr32_movw_ax_4_ebx_esi_2
+.text
+.code16
+addr32 movw %ax, 4(%ebx,%esi,2)
+;;; addr32_movw_ax_bx_si reject
+.text
+.code16
+addr32 movw %ax, (%bx,%si)
+;;; addr32_movw_ax_esi_2
+.text
+.code16
+addr32 movw %ax, (,%esi,2)
+;;; addr32_cmpsb
+.text
+.code16
+addr32 cmpsb
+;;; addr32_cmpsb_edi_esi
+.text
+.code16
+addr32 cmpsb (%edi), (%esi)
+;;; addr32_scasb
+.text
+.code16
+addr32 scasb
+;;; addr32_insb
+.text
+.code16
+addr32 insb
+;;; addr32_outsw
+.text
+.code16
+addr32 outsw
+;;; addr32_movsl
+.text
+.code16
+addr32 movsl
+;;; addr32_jecxz_1f_1 reject
+.text
+.code16
+addr32 jecxz 1f
+1:
+;;; addr32_loopne_1f_1
+.text
+.code16
+addr32 loopne 1f
+1:
+;;; data32_push_5
+.text
+.code16
+data32 push $5
+;;; data32_pushw_5
+.text
+.code16
+data32 pushw $5
+;;; data32_pop_ax
+.text
+.code16
+data32 pop %ax
+;;; data32_popw_ax
+.text
+.code16
+data32 popw %ax
+;;; data32_inc_ax
+.text
+.code16
+data32 inc %ax
+;;; data32_int_0x10
+.text
+.code16
+data32 int $0x10
+;;; data32_hlt
+.text
+.code16
+data32 hlt
+;;; data32_mov_ax_ds
+.text
+.code16
+data32 mov %ax, %ds
+;;; data32_mov_ds_ax
+.text
+.code16
+data32 mov %ds, %ax
+;;; data32_movzbw_al_ax
+.text
+.code16
+data32 movzbw %al, %ax
+;;; data32_test_0x1234_ax
+.text
+.code16
+data32 test $0x1234, %ax
+;;; data32_imul_5_ax_bx
+.text
+.code16
+data32 imul $5, %ax, %bx
+;;; data32_xchg_ax_bx
+.text
+.code16
+data32 xchg %ax, %bx
+;;; data32_bswap_eax reject
+.text
+.code16
+data32 bswap %eax
+;;; data32_cmpxchg_ax_bx
+.text
+.code16
+data32 cmpxchg %ax, (%bx)
+;;; data32_ljmpw_0x10_0x1234
+.text
+.code16
+data32 ljmpw $0x10, $0x1234
+;;; data32_ljmpl_0x10_0x1234 reject
+.text
+.code16
+data32 ljmpl $0x10, $0x1234
+;;; data32_lcallw_0x10_0x1234
+.text
+.code16
+data32 lcallw $0x10, $0x1234
+;;; data32_calll_foo reject
+.text
+.code16
+data32 calll foo
+;;; data32_callw_foo
+.text
+.code16
+data32 callw foo
+;;; data32_jmp_ax
+.text
+.code16
+data32 jmp *%ax
+;;; data32_jmp_bx
+.text
+.code16
+data32 jmp *(%bx)
+;;; data32_call_ax
+.text
+.code16
+data32 call *%ax
+;;; data32_retw
+.text
+.code16
+data32 retw
+;;; data32_retl reject
+.text
+.code16
+data32 retl
+;;; data32_lretw
+.text
+.code16
+data32 lretw
+;;; data32_iretw
+.text
+.code16
+data32 iretw
+;;; data32_jmp_1f_skip_200_1
+.text
+.code16
+data32 jmp 1f
+.skip 200
+1:
+;;; data32_jne_1f_skip_200_1
+.text
+.code16
+data32 jne 1f
+.skip 200
+1:
+;;; jmp_1f_skip_200_1
+.text
+.code16
+jmp 1f
+.skip 200
+1:
+;;; jmp_1f_1
+.text
+.code16
+jmp 1f
+1:
+;;; jne_1f_1
+.text
+.code16
+jne 1f
+1:
+;;; addr32_vmovss_sym_xmm0
+.text
+.code16
+addr32 vmovss sym, %xmm0
+;;; addr32_vmovss_0x1234_xmm0
+.text
+.code16
+addr32 vmovss 0x1234, %xmm0
+;;; addr32_movss_sym_xmm0
+.text
+.code16
+addr32 movss sym, %xmm0
+;;; addr32_fldl_sym
+.text
+.code16
+addr32 fldl sym
+;;; addr32_cmpw_5_sym
+.text
+.code16
+addr32 cmpw $5, sym
+;;; addr32_movb_5_sym
+.text
+.code16
+addr32 movb $5, sym
+;;; addr32_lgdt_sym
+.text
+.code16
+addr32 lgdt sym
+;;; addr32_jmp_sym
+.text
+.code16
+addr32 jmp *sym
+;;; addr32_ljmp_sym
+.text
+.code16
+addr32 ljmp *sym
+;;; addr32_loopl_1f_1 reject
+.text
+.code16
+addr32 loopl 1f
+1:
+;;; addr32_loopw_1f_1
+.text
+.code16
+addr32 loopw 1f
+1:
+;;; addr32_movsb_si_es_di reject
+.text
+.code16
+addr32 movsb (%si), %es:(%di)
+;;; addr32_stosb_al_es_edi
+.text
+.code16
+addr32 stosb %al, %es:(%edi)
+;;; data32_rep_stosw
+.text
+.code16
+data32 rep stosw
+;;; data32_repe_cmpsw
+.text
+.code16
+data32 repe cmpsw
+;;; addr32_data32_rep_movsw
+.text
+.code16
+addr32 data32 rep movsw
+;;; data32_addr32_lock_xchg_ax_ebx
+.text
+.code16
+data32 addr32 lock xchg %ax, (%ebx)
+;;; data32_xlat
+.text
+.code16
+data32 xlat
+;;; addr32_pushf
+.text
+.code16
+addr32 pushf
+;;; addr32_ret
+.text
+.code16
+addr32 ret
+;;; data32_mov_0x1234_ax
+.text
+.code16
+data32 mov $0x1234, %ax
+;;; addr32_mov_0x1234_ax
+.text
+.code16
+addr32 mov $0x1234, %ax
+;;; data32_cli
+.text
+.code16
+data32 cli
+;;; addr32_int3
+.text
+.code16
+addr32 int3

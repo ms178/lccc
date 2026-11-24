@@ -526,27 +526,35 @@ pub(crate) fn fma231_mnemonic(
 }
 
 /// x86/i686 prefetch-ISA permissions resolved by the driver
-/// (`Driver::resolved_prefetch_sse` / `Driver::resolved_prfchw`).
+/// (`Driver::resolved_prefetch_sse` / `Driver::resolved_prfchw` /
+/// `Driver::resolved_movrs`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct X86PrefetchIsa {
     /// `prefetchnta/t0/t1/t2` (`0F 18 /0-3`) are legal.
     pub(crate) sse: bool,
     /// `prefetchw` (`0F 0D /1`) is legal.
     pub(crate) prfchw: bool,
+    /// `prefetchrst2` (`0F 18 /4`) is legal.
+    pub(crate) movrs: bool,
 }
 
 /// The x86/i686 instruction for an `IntrinsicOp::Prefetch` payload, or
 /// `None` when the target has no legal prefetch form for it (the hint is
 /// then dropped — always semantics-preserving).
 ///
-/// GCC 16.2 parity, measured for all eight `(rw, locality)` pairs:
+/// GCC 16.2 parity, measured for all twelve `(rw, locality)` pairs
+/// (`scripts/check_x86_prefetch.py` measures them again on every run):
 /// write intent becomes `prefetchw` exactly when PRFCHW is enabled (for
-/// every locality); otherwise read and write hints share the locality
+/// every locality); a shared read of locality 1 becomes `prefetchrst2`
+/// exactly when MOVRS is enabled; otherwise every hint shares the locality
 /// table (0 → `nta`, 1 → `t2`, 2 → `t1`, 3 → `t0`).
 pub(crate) fn prefetch_mnemonic(payload: u8, isa: X86PrefetchIsa) -> Option<&'static str> {
     let hint = crate::ir::reexports::PrefetchHint::decode(payload);
     if hint.write && isa.prfchw {
         return Some("prefetchw");
+    }
+    if hint.shared && hint.locality == 1 && isa.movrs {
+        return Some("prefetchrst2");
     }
     if !isa.sse {
         return None;
@@ -576,7 +584,7 @@ mod prefetch_mnemonic_tests {
     fn without_prfchw_write_hints_keep_their_locality() {
         let isa = X86PrefetchIsa {
             sse: true,
-            prfchw: false,
+            ..X86PrefetchIsa::default()
         };
         for loc in 0..4u8 {
             assert_eq!(
@@ -595,10 +603,76 @@ mod prefetch_mnemonic_tests {
     #[test]
     fn with_prfchw_write_hints_are_prefetchw() {
         for sse in [true, false] {
-            let isa = X86PrefetchIsa { sse, prfchw: true };
-            for loc in 0..4u8 {
-                assert_eq!(prefetch_mnemonic(p(true, loc), isa), Some("prefetchw"));
+            for movrs in [true, false] {
+                let isa = X86PrefetchIsa {
+                    sse,
+                    prfchw: true,
+                    movrs,
+                };
+                for loc in 0..4u8 {
+                    assert_eq!(prefetch_mnemonic(p(true, loc), isa), Some("prefetchw"));
+                }
             }
+        }
+    }
+
+    /// GCC 16.2 `-mmovrs` (and `-march=diamondrapids`, `-march=novalake`):
+    /// `__builtin_prefetch(p, 2, 1)` and `_mm_prefetch(p, _MM_HINT_RST2)`
+    /// are `prefetchrst2`. The other three localities of a shared read, and
+    /// every read and write, are what they are without MOVRS. The hint was
+    /// lowered as a read, so the instruction was never selected.
+    #[test]
+    fn with_movrs_a_shared_read_of_locality_one_is_prefetchrst2() {
+        for prfchw in [true, false] {
+            let isa = X86PrefetchIsa {
+                sse: true,
+                prfchw,
+                movrs: true,
+            };
+            let plain = X86PrefetchIsa {
+                movrs: false,
+                ..isa
+            };
+            for loc in 0..4u8 {
+                let shared = PrefetchHint::shared_read(loc).encode();
+                let expected = if loc == 1 {
+                    "prefetchrst2"
+                } else {
+                    LOCALITY[loc as usize]
+                };
+                assert_eq!(prefetch_mnemonic(shared, isa), Some(expected));
+                // Without MOVRS a shared read is a read.
+                assert_eq!(
+                    prefetch_mnemonic(shared, plain),
+                    Some(LOCALITY[loc as usize])
+                );
+                for write in [true, false] {
+                    assert_eq!(
+                        prefetch_mnemonic(p(write, loc), isa),
+                        prefetch_mnemonic(p(write, loc), plain)
+                    );
+                }
+            }
+        }
+    }
+
+    /// GCC 16.2 `-m32 -march=i686 -mmovrs`: the one hint with an
+    /// instruction is the shared read of locality 1; the SSE forms are
+    /// still not there.
+    #[test]
+    fn movrs_alone_has_one_prefetch_instruction() {
+        let isa = X86PrefetchIsa {
+            movrs: true,
+            ..X86PrefetchIsa::default()
+        };
+        for payload in 0u8..16 {
+            let expected =
+                (payload == PrefetchHint::shared_read(1).encode()).then_some("prefetchrst2");
+            assert_eq!(
+                prefetch_mnemonic(payload, isa),
+                expected,
+                "payload {payload}"
+            );
         }
     }
 
@@ -613,15 +687,41 @@ mod prefetch_mnemonic_tests {
 
     #[test]
     fn every_payload_has_a_defined_mnemonic() {
-        let isa = X86PrefetchIsa {
-            sse: true,
-            prfchw: false,
-        };
-        for payload in 0u8..=255 {
-            assert_eq!(
-                prefetch_mnemonic(payload, isa),
-                prefetch_mnemonic(payload & 7, isa)
-            );
+        for movrs in [true, false] {
+            let isa = X86PrefetchIsa {
+                sse: true,
+                prfchw: false,
+                movrs,
+            };
+            for payload in 0u8..=255 {
+                // Four bits are the hint; the rest is ignored.
+                assert_eq!(
+                    prefetch_mnemonic(payload, isa),
+                    prefetch_mnemonic(payload & 15, isa)
+                );
+                assert!(prefetch_mnemonic(payload, isa).is_some());
+            }
+        }
+    }
+
+    /// The payload round-trips, and a payload that names write intent and a
+    /// shared read at once decodes as the write.
+    #[test]
+    fn the_payload_is_three_facts_in_four_bits() {
+        for loc in 0..4u8 {
+            for hint in [
+                PrefetchHint::new(false, loc),
+                PrefetchHint::new(true, loc),
+                PrefetchHint::shared_read(loc),
+            ] {
+                assert_eq!(PrefetchHint::decode(hint.encode()), hint);
+                assert!(hint.encode() < 16);
+                assert!(!(hint.write && hint.shared));
+            }
+            assert_eq!(PrefetchHint::of_rw(0, loc), PrefetchHint::new(false, loc));
+            assert_eq!(PrefetchHint::of_rw(1, loc), PrefetchHint::new(true, loc));
+            assert_eq!(PrefetchHint::of_rw(2, loc), PrefetchHint::shared_read(loc));
+            assert_eq!(PrefetchHint::decode(12 | loc), PrefetchHint::new(true, loc));
         }
     }
 }
@@ -937,6 +1037,129 @@ mod fma_role_tests {
                 let got = sdm(digits, slot(dst), slot(vvvv), slot(rm));
                 let want = a * b + c;
                 assert_eq!(got, want, "{digits} with a={a} b={b} c={c}");
+            }
+        }
+    }
+}
+
+/// The integer an emitter writes as an instruction's immediate.
+///
+/// Fails closed. An operand that is no integer constant used to be read as
+/// 0, so the instruction was assembled with `$0` and nothing said so:
+/// `vpclmulqdq $0` for every selector at -O0, `pshufd $0` for a control
+/// word that is a variable, each found only when a program computed
+/// something else. The lowering owns the diagnostic ("the last argument must
+/// be an 8-bit immediate", `x86_immediate`) and hands every constant
+/// expression over as a constant; an operand that is none here breaks that
+/// contract, and the assertion names the breach where a wrong immediate hid
+/// it. `scripts/x86_intrinsic_values.py` asks for every intrinsic with a
+/// value where GCC wants a constant, so that no call a program can write
+/// gets this far.
+#[must_use]
+pub(crate) fn immediate_operand(op: &crate::ir::reexports::Operand) -> i64 {
+    use crate::ir::reexports::Operand;
+    let value = match op {
+        Operand::Const(constant) => constant
+            .to_i128()
+            .and_then(|value| i64::try_from(value).ok()),
+        Operand::Value(_) => None,
+    };
+    assert!(
+        value.is_some(),
+        "x86 immediate operand is not an integer constant of 64 bits: {op:?}"
+    );
+    value.unwrap_or_default()
+}
+
+#[cfg(test)]
+mod immediate_operand_tests {
+    use super::immediate_operand;
+    use crate::ir::reexports::{IrConst, Operand, Value};
+
+    #[test]
+    fn an_integer_constant_of_any_width_is_its_value() {
+        for (constant, value) in [
+            (IrConst::I8(-1), -1i64),
+            (IrConst::I16(0x1b), 0x1b),
+            (IrConst::I32(i32::MIN), i64::from(i32::MIN)),
+            (IrConst::I64(i64::MAX), i64::MAX),
+            (IrConst::I128(255), 255),
+            (IrConst::I128(i128::from(i64::MIN)), i64::MIN),
+            (IrConst::Zero, 0),
+        ] {
+            assert_eq!(immediate_operand(&Operand::Const(constant)), value);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not an integer constant")]
+    fn a_value_of_the_running_program_is_no_immediate() {
+        let _ = immediate_operand(&Operand::Value(Value(7)));
+    }
+
+    #[test]
+    #[should_panic(expected = "not an integer constant")]
+    fn a_floating_point_constant_is_no_immediate() {
+        let _ = immediate_operand(&Operand::Const(IrConst::F64(1.0)));
+    }
+
+    #[test]
+    #[should_panic(expected = "not an integer constant")]
+    fn a_constant_past_64_bits_is_no_immediate() {
+        let _ = immediate_operand(&Operand::Const(IrConst::I128(i128::from(i64::MAX) + 1)));
+    }
+}
+
+/// Is `predicate` one the legacy `cmpps`/`cmppd` cannot say?
+///
+/// The SSE encodings carry three bits of predicate (SDM vol. 2A, CMPPS,
+/// table 3-1: EQ, LT, LE, UNORD, NEQ, NLT, NLE, ORD) and ignore the rest;
+/// the VEX encodings carry five (table 3-2 adds the 24 from EQ_UQ = 8 to
+/// TRUE_US = 31). A 128-bit compare with one of the 24 therefore has to be
+/// written as `vcmpps`/`vcmppd`: as `cmppd $13` it is `cmppd $5`, GE turned
+/// into NLT, which differs exactly where a program asks for an ordered
+/// compare -- on a NaN. Both backends ask here, so the rule is stated once.
+#[must_use]
+pub(crate) fn compare_predicate_is_vex_only(
+    op: &crate::ir::reexports::IntrinsicOp,
+    predicate: i64,
+) -> bool {
+    use crate::ir::reexports::IntrinsicOp::{CmpPd128, CmpPs128};
+    matches!(op, CmpPs128 | CmpPd128) && !(0..8).contains(&predicate)
+}
+
+#[cfg(test)]
+mod compare_predicate_tests {
+    use super::compare_predicate_is_vex_only;
+    use crate::ir::reexports::IntrinsicOp;
+
+    #[test]
+    fn the_sse_compares_have_eight_predicates() {
+        for op in [IntrinsicOp::CmpPs128, IntrinsicOp::CmpPd128] {
+            for predicate in 0..8 {
+                assert!(
+                    !compare_predicate_is_vex_only(&op, predicate),
+                    "{op:?} {predicate}"
+                );
+            }
+            for predicate in (8..32).chain([-1, 255]) {
+                assert!(
+                    compare_predicate_is_vex_only(&op, predicate),
+                    "{op:?} {predicate}"
+                );
+            }
+        }
+    }
+
+    /// A shuffle shares the emitter and takes all eight bits in either encoding.
+    #[test]
+    fn other_immediates_are_not_predicates() {
+        for op in [IntrinsicOp::ShufPs128, IntrinsicOp::ShufPd128] {
+            for immediate in [0, 7, 8, 0x4e, 255] {
+                assert!(
+                    !compare_predicate_is_vex_only(&op, immediate),
+                    "{op:?} {immediate}"
+                );
             }
         }
     }

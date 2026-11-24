@@ -160,14 +160,18 @@ fn copy_chains_are_transparent_without_new_ssa_or_producer_edits() {
     }
     assert!(fold_sign_choice_zero(&cmp, &defs).is_some());
     let mut f = IrFunction::new("choice".into(), IrType::I32, vec![], false);
+    // The word and the condition are parameters: a constant here would
+    // decide the select, and the fact engine folds a decided select.
     let mut insts = vec![
-        Instruction::Copy {
+        Instruction::ParamRef {
             dest: Value(0),
-            src: Operand::Const(IrConst::I64(7)),
+            param_idx: 0,
+            ty: IrType::U64,
         },
-        Instruction::Copy {
+        Instruction::ParamRef {
             dest: Value(1),
-            src: Operand::Const(IrConst::I32(1)),
+            param_idx: 1,
+            ty: IrType::I32,
         },
     ];
     insts.extend([

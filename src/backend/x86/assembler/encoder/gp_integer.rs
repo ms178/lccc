@@ -488,6 +488,22 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
+    /// `movabs` with a size suffix: a register of that size, and for all
+    /// but `q` the accumulator at an address (only `movabsq` loads a
+    /// number).
+    pub(crate) fn encode_movabs_sized(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
+        let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        Self::check_operand_size(mnemonic, ops, size)?;
+        if size != 8 && ops.iter().any(|op| matches!(op, Operand::Immediate(_))) {
+            return Err(format!("operand type mismatch for `{mnemonic}'"));
+        }
+        self.encode_movabs(ops)
+    }
+
     pub(crate) fn encode_movabs(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("movabsq requires 2 operands".to_string());
@@ -1505,9 +1521,14 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_unary(size, &dst.name);
+                // The accumulator's own opcodes are in a row REX2 cannot
+                // stand in front of: under `{rex2}` the general form is
+                // written (GNU as: `{rex2} test $5, %al` = `D5 00 F6 C0
+                // 05`).
+                let short = is_accum(&dst.name) && !self.apx_rex2;
 
                 if size == 1 {
-                    if is_accum(&dst.name) {
+                    if short {
                         self.bytes.push(0xA8);
                     } else {
                         self.bytes.push(0xF6);
@@ -1515,7 +1536,7 @@ impl super::InstructionEncoder {
                     }
                     self.bytes.push(val as u8);
                 } else {
-                    if is_accum(&dst.name) {
+                    if short {
                         self.bytes.push(0xA9);
                     } else {
                         self.bytes.push(0xF7);
@@ -2015,6 +2036,12 @@ impl super::InstructionEncoder {
         shift_op: u8,
     ) -> Result<(), String> {
         let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        // The count is `%cl`; what is shifted has the operand size.
+        let shifted = match ops {
+            [Operand::Register(count), rest @ ..] if count.name == "cl" && !rest.is_empty() => rest,
+            _ => ops,
+        };
+        Self::check_operand_size(mnemonic, shifted, size)?;
 
         if self.apx_wants_evex() || ops.len() == 3 {
             return self.encode_shift_apx(ops, mnemonic, shift_op, size);
@@ -2161,6 +2188,11 @@ impl super::InstructionEncoder {
                 // `62 f4 7c 0c f7 f9`).
             }
         }
+        let name = ["inc", "dec", "not", "neg", "mul", "imul", "div", "idiv"]
+            .get(usize::from(op_ext))
+            .copied()
+            .unwrap_or("unary");
+        Self::check_operand_size(name, ops, size)?;
         let nf = self.apx_nf;
         let base_opcode = if op_ext <= 1 {
             if size == 1 { 0xFE } else { 0xFF }
@@ -2222,98 +2254,77 @@ impl super::InstructionEncoder {
             return Err(format!("{{nf}} unsupported for `{mnemonic}`"));
         }
         let nf = self.apx_nf;
-        let emit_body = |enc: &mut Self,
-                         rm: &str,
-                         ndd: Option<&str>,
-                         opcode: u8,
-                         imm: Option<u8>|
-         -> Result<(), String> {
-            let num = reg_num(rm).ok_or("bad register")?;
-            enc.emit_apx_evex_rr(size, "", rm, ndd, nf)?;
-            enc.bytes.push(opcode);
-            enc.bytes.push(enc.modrm(3, shift_op, num));
-            if let Some(c) = imm {
-                enc.bytes.push(c);
+        // The count: an immediate, `%cl`, or -- one operand short -- one.
+        let (count, rest) = match ops {
+            [
+                Operand::Immediate(ImmediateValue::Integer(count)),
+                rest @ ..,
+            ] => {
+                Self::check_shift_imm(mnemonic, size, *count)?;
+                (Some(*count as u8), rest)
             }
-            Ok(())
+            [Operand::Register(cl), rest @ ..] if cl.name == "cl" && !rest.is_empty() => {
+                (None, rest)
+            }
+            rest => (Some(1), rest),
         };
-        match ops {
-            [
-                Operand::Immediate(ImmediateValue::Integer(count)),
-                Operand::Register(src),
-                Operand::Register(ndd),
-            ] => {
-                Self::check_shift_imm(mnemonic, size, *count)?;
-                let count = *count as u8;
-                if count == 1 {
-                    emit_body(
-                        self,
-                        &src.name,
-                        Some(&ndd.name),
-                        if size == 1 { 0xD0 } else { 0xD1 },
-                        None,
-                    )
-                } else {
-                    emit_body(
-                        self,
-                        &src.name,
-                        Some(&ndd.name),
-                        if size == 1 { 0xC0 } else { 0xC1 },
-                        Some(count),
-                    )
-                }
+        // What is shifted, and the register the result goes to if that is
+        // another one.
+        let (shifted, ndd) = match rest {
+            [shifted] => (shifted, None),
+            [shifted, Operand::Register(ndd)] => (shifted, Some(ndd.name.as_str())),
+            _ => return Err(format!("unsupported APX {} operands", mnemonic)),
+        };
+        let wide = u8::from(size != 1);
+        let (opcode, immediate) = match count {
+            None => (0xD2 | wide, None),
+            Some(1) => (0xD0 | wide, None),
+            Some(count) => (0xC0 | wide, Some(count)),
+        };
+        match shifted {
+            Operand::Register(register) => {
+                let number = reg_num(&register.name).ok_or("bad register")?;
+                self.emit_apx_evex_rr(size, "", &register.name, ndd, nf)?;
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, shift_op, number));
+                self.bytes.extend(immediate);
+                Ok(())
             }
-            [
-                Operand::Register(cl),
-                Operand::Register(src),
-                Operand::Register(ndd),
-            ] if cl.name == "cl" => emit_body(
-                self,
-                &src.name,
-                Some(&ndd.name),
-                if size == 1 { 0xD2 } else { 0xD3 },
-                None,
-            ),
-            [
-                Operand::Immediate(ImmediateValue::Integer(count)),
-                Operand::Register(dst),
-            ] => {
-                Self::check_shift_imm(mnemonic, size, *count)?;
-                let count = *count as u8;
-                if count == 1 {
-                    emit_body(
-                        self,
-                        &dst.name,
-                        None,
-                        if size == 1 { 0xD0 } else { 0xD1 },
-                        None,
-                    )
-                } else {
-                    emit_body(
-                        self,
-                        &dst.name,
-                        None,
-                        if size == 1 { 0xC0 } else { 0xC1 },
-                        Some(count),
-                    )
+            Operand::Memory(memory) => {
+                self.emit_apx_evex_rm(size, "", memory, ndd, nf)?;
+                let relocations = self.relocations.len();
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(shift_op, memory)?;
+                if let Some(count) = immediate {
+                    self.bytes.push(count);
+                    self.adjust_rip_reloc_addend(relocations, 1);
                 }
+                Ok(())
             }
-            [Operand::Register(cl), Operand::Register(dst)] if cl.name == "cl" => emit_body(
-                self,
-                &dst.name,
-                None,
-                if size == 1 { 0xD2 } else { 0xD3 },
-                None,
-            ),
-            [Operand::Register(dst)] => emit_body(
-                self,
-                &dst.name,
-                None,
-                if size == 1 { 0xD0 } else { 0xD1 },
-                None,
-            ),
             _ => Err(format!("unsupported APX {} operands", mnemonic)),
         }
+    }
+
+    /// Refuse a general register among `operands` that is not `size`
+    /// bytes wide. The encoders here take a register's number and the
+    /// operand size from the mnemonic: `sarl $1, %r9b` was `sarl $1,
+    /// %r9d`, and `shrd %cl, %ebp, %r13` shifted `%rbp` in.
+    pub(crate) fn check_operand_size(
+        mnemonic: &str,
+        operands: &[Operand],
+        size: u8,
+    ) -> Result<(), String> {
+        for operand in operands {
+            if let Operand::Register(register) = operand {
+                if matches!(reg_class(&register.name), RegClass::Gp(width) if width != size) {
+                    return Err(format!(
+                        "`{}` operand size does not match register %{}",
+                        mnemonic, register.name
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn encode_double_shift(
@@ -2322,6 +2333,13 @@ impl super::InstructionEncoder {
         opcode: u8,
         size: u8,
     ) -> Result<(), String> {
+        // The count is `%cl` or a number; the rest has the operand size.
+        let shifted = match ops {
+            [Operand::Register(count), rest @ ..] if count.name == "cl" => rest,
+            _ => ops,
+        };
+        let name = if opcode == 0xA4 { "shld" } else { "shrd" };
+        Self::check_operand_size(name, shifted, size)?;
         if ops.len() == 4 {
             return self.encode_double_shift_ndd(ops, opcode, size);
         }
@@ -2373,6 +2391,33 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&[0x0F, opcode + 1]);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
                 Ok(())
+            }
+            // To memory, where EVEX was asked for (`{nf}`, `{evex}`): the
+            // plain forms are the table's, which knows no EVEX, and wrote
+            // `{nf} shld $5, %ecx, (%rdx)` as the instruction that writes
+            // the flags.
+            (
+                Operand::Immediate(ImmediateValue::Integer(count)),
+                Operand::Register(src),
+                Operand::Memory(mem),
+            ) if self.apx_wants_evex() => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let map4 = if opcode == 0xA4 { 0x24 } else { 0x2C };
+                self.emit_apx_evex_rm(size, &src.name, mem, None, self.apx_nf)?;
+                let rc = self.relocations.len();
+                self.bytes.push(map4);
+                self.encode_modrm_mem(src_num, mem)?;
+                self.bytes.push(*count as u8);
+                self.adjust_rip_reloc_addend(rc, 1);
+                Ok(())
+            }
+            (Operand::Register(cl), Operand::Register(src), Operand::Memory(mem))
+                if cl.name == "cl" && self.apx_wants_evex() =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                self.emit_apx_evex_rm(size, &src.name, mem, None, self.apx_nf)?;
+                self.bytes.push(opcode + 1);
+                self.encode_modrm_mem(src_num, mem)
             }
             _ => Err("unsupported double shift operands".to_string()),
         }
@@ -2569,13 +2614,28 @@ impl super::InstructionEncoder {
 
         let cc_str = &mnemonic[3..];
         // Try the condition code as-is first, then strip trailing 'b' suffix
-        let cc = cc_from_mnemonic(cc_str).or_else(|_| {
+        let as_written = cc_from_mnemonic(cc_str);
+        // The suffix names a byte: `setgeb %ecx` is no statement (it was
+        // assembled as `setge %ecx`, the APX instruction that clears the
+        // rest of the register).
+        let byte_suffix = as_written.is_err();
+        let cc = as_written.or_else(|_| {
             if let Some(stripped) = cc_str.strip_suffix('b') {
                 cc_from_mnemonic(stripped)
             } else {
                 Err(format!("unknown condition code: {}", cc_str))
             }
         })?;
+        if byte_suffix {
+            if let Operand::Register(reg) = &ops[0] {
+                if infer_reg_size(&reg.name) != 1 {
+                    return Err(format!(
+                        "incorrect register `%{}' used with `b' suffix",
+                        reg.name
+                    ));
+                }
+            }
+        }
 
         // APX auto-promotion (GAS 2.47 byte-probed): a 32/64-bit REGISTER
         // destination cannot use the legacy byte form — that would write
@@ -2587,7 +2647,9 @@ impl super::InstructionEncoder {
         // ("operand size mismatch for `setae'"); byte registers keep the
         // legacy 0F 90+cc form below. i686 has no APX: its own encoder
         // never reaches this code.
-        if !self.apx_evex && !self.apx_rex2 {
+        // (`{evex}` asks for the same instruction: it used to name the
+        // destination in `vvvv` and never set W.)
+        if !self.apx_rex2 {
             if let Operand::Register(reg) = &ops[0] {
                 match infer_reg_size(&reg.name) {
                     4 | 8 => {
@@ -2616,15 +2678,9 @@ impl super::InstructionEncoder {
             return match &ops[0] {
                 Operand::Register(reg) => {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
-                    // 32/64-bit registers take the NDD form (P2.ND=1,
-                    // vvvv=dest — `{evex} setae %eax` = 62 f4 7f 18 43 c0);
-                    // byte registers the plain promoted form (P2=08).
-                    let ndd = if infer_reg_size(&reg.name) >= 4 {
-                        Some(reg.name.as_str())
-                    } else {
-                        None
-                    };
-                    self.emit_apx_evex_rr_pp(false, "", &reg.name, ndd, false, 3)?;
+                    // A byte register: the plain promoted form (P2=08).
+                    // (32- and 64-bit ones were taken above.)
+                    self.emit_apx_evex_rr_pp(false, "", &reg.name, None, false, 3)?;
                     self.bytes.push(0x40 + cc);
                     self.bytes.push(self.modrm(3, 0, num));
                     Ok(())
@@ -2811,11 +2867,14 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// A direct near branch has no 16-bit form in long mode that a
+    /// A direct near call has no 16-bit form in long mode that a
     /// processor reads the way it is written (see `encode_jmp`), so the
-    /// `w` spelling is for indirect targets only.
-    fn refuse_word_branch(mnemonic: &str, name: &str) -> Result<(), String> {
-        if mnemonic.strip_prefix(name) == Some("w") {
+    /// `w` spelling is for indirect targets only. (GNU as assembles
+    /// `callw label` to `66 e8` and a 16-bit displacement, which one make
+    /// of processor reads as written and the other reads two bytes more
+    /// of.)
+    fn refuse_word_call(mnemonic: &str) -> Result<(), String> {
+        if mnemonic == "callw" {
             return Err(format!(
                 "`{mnemonic}' with a direct target is not supported in 64-bit mode"
             ));
@@ -2830,7 +2889,12 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
-                Self::refuse_word_branch(mnemonic, "jmp")?;
+                // A direct jump has no sized spelling: GNU as refuses
+                // `jmpq label` as it does `jmpw label` (what a jump jumps
+                // over is found when the labels are).
+                if mnemonic != "jmp" {
+                    return Err("invalid instruction suffix for `jmp'".to_string());
+                }
                 // Near jump with 32-bit displacement (will be resolved by linker/relocator)
                 // Always use R_X86_64_PLT32 for branch targets, matching modern GCC/binutils.
                 // R_X86_64_PC32 is rejected by ld for PIE executables calling shared lib functions.
@@ -2915,7 +2979,7 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
-                Self::refuse_word_branch(mnemonic, "call")?;
+                Self::refuse_word_call(mnemonic)?;
                 // Use PLT32 for external function calls (linker will resolve)
                 let sym = strip_plt_suffix(label);
                 if self.explicit_data16 && sym.len() != label.len() {
@@ -3359,22 +3423,16 @@ impl super::InstructionEncoder {
         // 26 6e) — and the order is fixed (`outsb %dx,(%esi)` is
         // "operand type mismatch for `outs'").
         if ops.len() == 2 && matches!(stem, "ins" | "outs") {
-            let port_is_dx = |op: &Operand| match op {
-                Operand::Register(r) => r.name.eq_ignore_ascii_case("dx"),
-                Operand::Memory(m) => {
-                    m.base
-                        .as_ref()
-                        .is_some_and(|b| b.name.eq_ignore_ascii_case("dx"))
-                        && m.index.is_none()
-                }
-                _ => false,
-            };
             let addr_idx = if stem == "ins" { 1 } else { 0 };
-            if !port_is_dx(&ops[1 - addr_idx]) {
+            if !is_string_port(&ops[1 - addr_idx]) {
                 return Err(format!("operand type mismatch for `{stem}'"));
             }
             let mem =
                 mem_of(&ops[addr_idx]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            if stem == "outs" {
+                implied_address(stem, mem)?;
+                port_behind_index(mem, &ops[1])?;
+            }
             match (stem, mem.segment.as_deref()) {
                 ("ins", None | Some("es")) => {}
                 ("ins", Some(_)) => {
@@ -3426,6 +3484,7 @@ impl super::InstructionEncoder {
         }
         if ops.len() == 1 && esi_idx.is_some() && edi_idx.is_none() {
             let mem = mem_of(&ops[0]).ok_or(format!("operand type mismatch for `{stem}'"))?;
+            implied_address(stem, mem)?;
             let seg_byte = match mem.segment.as_deref() {
                 None | Some("ds") => None,
                 Some("es") => Some(0x26),
@@ -3488,6 +3547,7 @@ impl super::InstructionEncoder {
             if !is_size_matched_accumulator(&ops[1], size) {
                 return Err(format!("operand type mismatch for `{stem}'"));
             }
+            implied_address(stem, mem)?;
             let seg_byte = match mem.segment.as_deref() {
                 None | Some("ds") => None,
                 Some("es") => Some(0x26),
@@ -3571,6 +3631,50 @@ impl super::InstructionEncoder {
         self.bytes.push(if size == 1 { opcode } else { opcode + 1 });
         Ok(())
     }
+}
+
+/// The address `lods`, `outs` and `xlat` read is implied by the
+/// instruction; the one written is for the reader. GNU as takes any that
+/// names a register (and warns unless it is the implied one), and no
+/// displacement alone: `lodsb sym` and `xlat 0x1000` are "operand type
+/// mismatch". (`movs`, `cmps`, `scas`, `stos` and `ins` take that as
+/// well: their rows of GNU as's table carry another mark, and its
+/// generator adds the displacement to those.)
+pub(crate) fn implied_address(stem: &str, mem: &MemoryOperand) -> Result<(), String> {
+    if mem.base.is_some() || mem.index.is_some() {
+        Ok(())
+    } else {
+        Err(format!("operand type mismatch for `{stem}'"))
+    }
+}
+
+/// Whether `op` is the port of `ins` and `outs`: `%dx`, or `(%dx)` with
+/// nothing else in the parentheses or in front of them (`4(%dx)` and
+/// `%es:(%dx)` are addresses, and none a string instruction takes).
+pub(crate) fn is_string_port(op: &Operand) -> bool {
+    match op {
+        Operand::Register(register) => register.name.eq_ignore_ascii_case("dx"),
+        Operand::Memory(mem) => {
+            mem.base
+                .as_ref()
+                .is_some_and(|base| base.name.eq_ignore_ascii_case("dx"))
+                && mem.index.is_none()
+                && mem.segment.is_none()
+                && matches!(mem.displacement, Displacement::None)
+        }
+        _ => false,
+    }
+}
+
+/// GNU as reads `(%dx)` as the port only while the statement has named no
+/// index register: behind `outsb 0x1234(,%edi,2)` it is an address to it,
+/// and no string address. (`%dx` without the parentheses is the port
+/// there too.)
+pub(crate) fn port_behind_index(address: &MemoryOperand, port: &Operand) -> Result<(), String> {
+    if address.index.is_some() && matches!(port, Operand::Memory(_)) {
+        return Err("`(%dx)' is not a valid string address expression".to_string());
+    }
+    Ok(())
 }
 
 /// True when `op` is the size-matched accumulator register operand of a
