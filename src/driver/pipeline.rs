@@ -5058,8 +5058,10 @@ impl Driver {
         let frame_report = frame_diagnostics
             .warning_enabled(crate::common::error::WarningKind::FrameLargerThan)
             .then(|| std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())));
+        let codegen_errors: crate::backend::CodegenErrors = Default::default();
         let opts = crate::backend::CodegenOptions {
             frame_report: frame_report.clone(),
+            codegen_errors: Some(codegen_errors.clone()),
             debug_homes,
             ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
@@ -5161,6 +5163,27 @@ impl Driver {
             &opts,
             source_manager.map(|sm| &**sm),
         );
+        // What code generation refused: printed where GCC prints it, and the
+        // compilation fails.
+        {
+            let errors = std::mem::take(
+                &mut *codegen_errors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if !errors.is_empty() {
+                if let Some(sm) = source_manager {
+                    frame_diagnostics.set_shared_source_manager(sm.clone());
+                }
+                for (file_id, start, end, message) in errors {
+                    frame_diagnostics.error(
+                        message,
+                        crate::common::source::Span::new(start, end, file_id),
+                    );
+                }
+                return Err("code generation diagnostics failed".to_string());
+            }
+        }
         if let Some(report) = frame_report {
             let report = report
                 .lock()

@@ -912,6 +912,11 @@ impl X86Codegen {
         // skip allocating stack slots for values assigned to registers.
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         collect_inline_asm_callee_saved_x86(func, &mut asm_clobbered_regs);
+        if !self.state.omit_frame_pointer {
+            // %rbp is the frame pointer here, in no pool and saved by the
+            // frame itself (a statement that takes it was refused).
+            asm_clobbered_regs.retain(|&reg| reg != PhysReg(6));
+        }
         let callee_base: &[PhysReg] = if self.state.omit_frame_pointer {
             &X86_CALLEE_SAVED_WITH_RBP
         } else {

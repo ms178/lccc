@@ -568,15 +568,7 @@ pub(super) fn collect_inline_asm_callee_saved_x86(func: &IrFunction, used: &mut 
         }
     }
     fn clobber_to_phys(name: &str) -> Option<PhysReg> {
-        let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
-        match name {
-            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(PhysReg(1)),
-            "r12" | "r12d" | "r12w" | "r12b" => Some(PhysReg(2)),
-            "r13" | "r13d" | "r13w" | "r13b" => Some(PhysReg(3)),
-            "r14" | "r14d" | "r14w" | "r14b" => Some(PhysReg(4)),
-            "r15" | "r15d" | "r15w" | "r15b" => Some(PhysReg(5)),
-            _ => None,
-        }
+        callee_saved_of_register_name(name)
     }
     crate::backend::stack_layout::collect_inline_asm_callee_saved_with_overflow(
         func,
@@ -591,19 +583,31 @@ pub(super) fn collect_inline_asm_callee_saved_x86(func: &IrFunction, used: &mut 
     );
 }
 
+/// The callee-saved register a name designates, by any spelling of it
+/// (`rbx`, `ebx`, `bx`, `bl`, `bh`; with `%` or braces).
+///
+/// `%rbp` is one of them: a function that omits its frame pointer allocates
+/// it, and a statement that said `"rbp"` used to destroy a live value
+/// there. The caller drops it again where the function keeps its frame
+/// pointer (the register is in no pool then, and the statement is refused).
+fn callee_saved_of_register_name(name: &str) -> Option<PhysReg> {
+    let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
+    match crate::backend::inline_asm::x86_normalize_reg_to_64bit(name)?.as_ref() {
+        "rbx" => Some(PhysReg(1)),
+        "r12" => Some(PhysReg(2)),
+        "r13" => Some(PhysReg(3)),
+        "r14" => Some(PhysReg(4)),
+        "r15" => Some(PhysReg(5)),
+        "rbp" => Some(PhysReg(6)),
+        _ => None,
+    }
+}
+
 /// Check if a constraint string refers to a specific x86-64 callee-saved register.
 fn constraint_to_callee_saved_x86(constraint: &str) -> Option<PhysReg> {
     // Handle explicit register constraint: {regname}
     if constraint.starts_with('{') && constraint.ends_with('}') {
-        let reg = &constraint[1..constraint.len() - 1];
-        return match reg {
-            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(PhysReg(1)),
-            "r12" | "r12d" | "r12w" | "r12b" => Some(PhysReg(2)),
-            "r13" | "r13d" | "r13w" | "r13b" => Some(PhysReg(3)),
-            "r14" | "r14d" | "r14w" | "r14b" => Some(PhysReg(4)),
-            "r15" | "r15d" | "r15w" | "r15b" => Some(PhysReg(5)),
-            _ => None,
-        };
+        return callee_saved_of_register_name(constraint);
     }
     // Check single-character constraint letters
     // Note: 'a','c','d','S','D' are caller-saved, no save needed
@@ -11317,6 +11321,52 @@ impl X86Codegen {
 /// allocator's fold-deferral pool so the two cannot drift apart.
 pub(crate) fn x86_const_fold_base_reg(phys: PhysReg) -> bool {
     !is_xmm_reg(phys) && !matches!(phys.0, 10 | 16)
+}
+
+#[cfg(test)]
+mod asm_callee_saved_name_tests {
+    use super::*;
+
+    /// Every spelling of a callee-saved register is that register, `%rbp`
+    /// among them (it had none: a statement that said `"rbp"` destroyed the
+    /// frame pointer the function went on addressing its slots through).
+    #[test]
+    fn a_name_is_its_callee_saved_register_by_any_spelling() {
+        for (reg, spellings) in [
+            (PhysReg(1), &["rbx", "ebx", "bx", "bl", "bh"][..]),
+            (PhysReg(2), &["r12", "r12d", "r12w", "r12b"]),
+            (PhysReg(3), &["r13", "r13d", "r13w", "r13b"]),
+            (PhysReg(4), &["r14", "r14d", "r14w", "r14b"]),
+            (PhysReg(5), &["r15", "r15d", "r15w", "r15b"]),
+            (PhysReg(6), &["rbp", "ebp", "bp", "bpl"]),
+        ] {
+            for spelling in spellings {
+                for written in [
+                    spelling.to_string(),
+                    format!("%{spelling}"),
+                    format!("{{{spelling}}}"),
+                ] {
+                    assert_eq!(
+                        callee_saved_of_register_name(&written),
+                        Some(reg),
+                        "{written}"
+                    );
+                }
+                assert_eq!(
+                    constraint_to_callee_saved_x86(&format!("{{{spelling}}}")),
+                    Some(reg),
+                    "{{{spelling}}}"
+                );
+            }
+        }
+        for other in [
+            "rax", "ecx", "dl", "rsi", "dil", "r8", "r11d", "rsp", "cc", "memory", "xmm0", "",
+        ] {
+            assert_eq!(callee_saved_of_register_name(other), None, "{other:?}");
+        }
+        assert!(X86_CALLEE_SAVED_WITH_RBP.contains(&PhysReg(6)));
+        assert!(!X86_CALLEE_SAVED.contains(&PhysReg(6)));
+    }
 }
 
 #[cfg(test)]

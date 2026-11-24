@@ -100,6 +100,14 @@ pub(crate) struct DebugHomeReport {
 
 pub(crate) type DebugHomes = std::sync::Arc<std::sync::Mutex<DebugHomeReport>>;
 
+/// What code generation has to refuse: errors only it can see, with the
+/// place GCC reports them at. The driver prints them and fails the
+/// compilation. An ordered set, because the x86-64 pipeline generates a
+/// function more than once (interprocedural register allocation retries)
+/// and every round finds the same error.
+pub(crate) type CodegenErrors =
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<(u32, u32, u32, String)>>>;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DebugHome {
     pub base_register: u8,
@@ -110,6 +118,8 @@ pub(crate) struct DebugHome {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
     pub(crate) frame_report: Option<FrameReport>,
+    /// Where code generation reports what it refuses (`CodegenErrors`).
+    pub(crate) codegen_errors: Option<CodegenErrors>,
     pub(crate) debug_homes: Option<DebugHomes>,
     /// Invocation-owned RA/codegen policy, parsed once by the driver before
     /// any per-function backend work starts.

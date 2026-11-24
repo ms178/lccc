@@ -2328,6 +2328,9 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
                     self.store_output_from_reg(operand, ptr, constraint, &all_output_reg_refs);
                 }
             }
+            if let Some(repair) = &trampoline.exit_repair {
+                self.state().emit_fmt(format_args!("    {repair}"));
+            }
             self.state().reg_cache.invalidate_all();
             self.emit_branch_to_block(trampoline.target);
         }

@@ -6621,19 +6621,38 @@ fn generate_function_body(
         )
         .is_none();
 
-    let has_inline_asm_fp = func.blocks.iter().any(|block| {
-        block.instructions.iter().any(|inst| {
-            if let Instruction::InlineAsm {
-                template, clobbers, ..
-            } = inst
-            {
-                template_mentions_frame_pointer(template)
-                    || clobbers.iter().any(|c| clobber_is_frame_pointer(c))
-            } else {
-                false
-            }
-        })
-    });
+    // An x86-64 statement that takes %rbp for itself (a clobber, a register
+    // variable) asks for the opposite of one that reads it: the function
+    // must not address its frame through a register the statement destroys.
+    // It used to get a frame pointer like the readers, and every slot access
+    // behind the statement went through the destroyed register. Now %rbp is
+    // an ordinary callee-saved register of such a function, as in GCC --
+    // and where the function cannot do without its frame pointer the
+    // statement is refused in GCC's words, below. (i686 decides the same in
+    // its own prologue; the other targets keep their rule.)
+    let asm_takes_frame_pointer = crate::common::types::target_elf_machine() == 62 // EM_X86_64
+        && func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(inst, Instruction::InlineAsm { outputs, inputs, clobbers, .. }
+                    if crate::backend::inline_asm::x86_asm_takes_frame_pointer(
+                        outputs, inputs, clobbers,
+                    ))
+            })
+        });
+    let has_inline_asm_fp = !asm_takes_frame_pointer
+        && func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                if let Instruction::InlineAsm {
+                    template, clobbers, ..
+                } = inst
+                {
+                    template_mentions_frame_pointer(template)
+                        || clobbers.iter().any(|c| clobber_is_frame_pointer(c))
+                } else {
+                    false
+                }
+            })
+        });
     let has_frame_address = func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| {
             matches!(
@@ -6734,6 +6753,12 @@ fn generate_function_body(
     // by accident and makes one addressing mode -- the validated one -- total.
     if frame_size > i32::MAX as i64 {
         cg.state().omit_frame_pointer = false;
+    }
+    if asm_takes_frame_pointer && !cg.state_ref().omit_frame_pointer {
+        // GCC reports it at the end of the function, where it finds out.
+        let at = func.body_span.closing_delimiter().unwrap_or(func.body_span);
+        cg.state_ref()
+            .report_error(at, "bp cannot be used in 'asm' here");
     }
     cg.emit_prologue(func, frame_size);
     // Use counts must be visible to `emit_store_params`: the x86 prologue

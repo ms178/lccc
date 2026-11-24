@@ -656,6 +656,11 @@ impl Parser {
 
         self.expect_closing(&TokenKind::RParen, open);
         self.validate_inline_asm(&template, &outputs, &inputs, goto_labels.len(), open);
+        let asm_target =
+            asm_validate::AsmTarget::from_elf_machine(crate::common::types::target_elf_machine());
+        for problem in asm_validate::validate_clobbers(&clobbers, asm_target) {
+            self.emit_error(problem.message, span);
+        }
         self.consume_if(&TokenKind::Semicolon);
 
         Stmt::InlineAsm {

@@ -58,6 +58,9 @@ pub struct PendingAsmGotoTrampoline {
     pub label: BlockId,
     pub target: BlockId,
     pub outputs: Vec<(crate::backend::inline_asm::AsmOperand, Value, String)>,
+    /// What the backend repairs behind the statement
+    /// (`InlineAsmEmitter::begin_inline_asm`), emitted behind the stores.
+    pub exit_repair: Option<String>,
 }
 
 /// Per-instruction sibling-call shape hint, computed by the generation
@@ -327,6 +330,9 @@ pub struct CodegenState {
     /// none of which changes the register's content.
     pub call_ret_vector_in_xmm0: FxHashSet<u32>,
     pub(crate) frame_report: Option<crate::backend::FrameReport>,
+    /// Where an error only code generation can see is reported
+    /// ([`Self::report_error`]).
+    pub(crate) codegen_errors: Option<crate::backend::CodegenErrors>,
     pub(crate) debug_homes: Option<crate::backend::DebugHomes>,
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.
@@ -1027,6 +1033,7 @@ impl CodegenState {
         Self {
             call_ret_vector_in_xmm0: Default::default(),
             frame_report: None,
+            codegen_errors: None,
             debug_homes: None,
             out: AsmOutput::new(),
             disable_regalloc: false,
@@ -2070,10 +2077,28 @@ impl CodegenState {
         }
     }
 
+    /// Report an error of the program that only code generation can see, at
+    /// `span`. The driver prints it and fails the compilation; the assembly
+    /// of the function is still written, and discarded.
+    ///
+    /// Returns whether anybody listens: a caller of the backend that passed
+    /// no report (a unit test of an emitter) gets the code and no error.
+    pub(crate) fn report_error(&self, span: crate::common::source::Span, message: &str) -> bool {
+        let Some(errors) = &self.codegen_errors else {
+            return false;
+        };
+        errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((span.file_id, span.start, span.end, message.to_string()));
+        true
+    }
+
     /// Set the compilation-wide TLS inputs from the codegen options (shared by
     /// every backend's `apply_options`).
     pub fn apply_tls_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.frame_report = opts.frame_report.clone();
+        self.codegen_errors = opts.codegen_errors.clone();
         self.debug_homes = opts.debug_homes.clone();
         self.shared_lib = opts.shared_lib;
         self.stack_clash_protection = opts.stack_clash_protection;
@@ -2445,6 +2470,38 @@ pub(crate) fn vector_reg_bank(reg: &str) -> u32 {
     reg.trim_start_matches(|c: char| !c.is_ascii_digit())
         .parse()
         .unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod codegen_error_tests {
+    use super::*;
+    use crate::common::source::Span;
+
+    /// An error is recorded once, however often the function is generated
+    /// (the x86-64 pipeline generates it again for every register allocation
+    /// retry), and in source order.
+    #[test]
+    fn an_error_is_reported_once_and_in_source_order() {
+        let errors: crate::backend::CodegenErrors = Default::default();
+        let mut state = CodegenState::new();
+        assert!(
+            !state.report_error(Span::new(4, 5, 0), "nobody listens"),
+            "no report, no listener"
+        );
+        state.codegen_errors = Some(errors.clone());
+        for _round in 0..3 {
+            assert!(state.report_error(Span::new(90, 91, 0), "bp cannot be used in 'asm' here"));
+            assert!(state.report_error(Span::new(40, 41, 0), "bp cannot be used in 'asm' here"));
+        }
+        let got: Vec<_> = errors.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            got,
+            [
+                (0, 40, 41, "bp cannot be used in 'asm' here".to_string()),
+                (0, 90, 91, "bp cannot be used in 'asm' here".to_string()),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

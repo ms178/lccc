@@ -231,6 +231,84 @@ impl I686Codegen {
         self.used_callee_saved.sort_by_key(|reg| reg.0);
     }
 
+    /// Whether this function omits its frame pointer: what the invocation
+    /// asked for, unless the function needs one.
+    ///
+    /// The decision used to stay with the code generator: the first
+    /// function with a variable-length array, an `alloca` or a
+    /// `__builtin_frame_address` cost every function after it in the file
+    /// its frame pointer register, and two instructions each.
+    fn decide_frame_pointer(&mut self, func: &IrFunction) {
+        self.omit_frame_pointer = self.omit_frame_pointer_requested;
+
+        // Dynamic alloca (VLAs) requires the frame pointer to track the stack,
+        // since ESP changes by runtime-computed amounts.
+        if self.state.has_dyn_alloca {
+            self.omit_frame_pointer = false;
+        }
+        if self.state.stack_clash_protection {
+            let total_allocas = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter_map(|inst| match inst {
+                    crate::ir::reexports::Instruction::Alloca { size, .. } => Some(*size),
+                    _ => None,
+                })
+                .fold(0usize, |acc, s| acc.saturating_add(s));
+            if total_allocas > 12_288 {
+                self.omit_frame_pointer = false;
+            }
+        }
+
+        // Runtime ESP realignment requires EBP-relative local/param
+        // addressing for the duration of the call.
+        if has_overaligned_call_args(func) {
+            self.omit_frame_pointer = false;
+        }
+
+        // __builtin_frame_address(0) and __builtin_setjmp read %ebp directly;
+        // under -fomit-frame-pointer the register would hold a stale
+        // caller-owned value.  Mirror the has_frame_address veto the x86-64
+        // pipeline applies in backend/generation.rs.
+        // gcc.c-torture execute/frame-address.c caught this: at -O1/-O2 the
+        // noipa helper containing the intrinsic lost its frame pointer while
+        // its caller (holding a dynamic alloca) kept one, so the stack-address
+        // containment check failed and the test aborted.
+        if func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    crate::ir::reexports::Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::FrameAddress
+                            | crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
+                        ..
+                    }
+                )
+            })
+        }) {
+            self.omit_frame_pointer = false;
+        }
+    }
+
+    /// GCC's refusal of an assembler statement that takes `%ebp` in a
+    /// function that keeps its frame pointer, at the function's end.
+    fn refuse_asm_that_takes_the_frame_pointer(&self, func: &IrFunction) {
+        let takes_ebp = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(inst, Instruction::InlineAsm { outputs, inputs, clobbers, .. }
+                if crate::backend::inline_asm::x86_asm_takes_frame_pointer(
+                    outputs, inputs, clobbers,
+                ))
+            })
+        });
+        if takes_ebp {
+            let at = func.body_span.closing_delimiter().unwrap_or(func.body_span);
+            self.state
+                .report_error(at, "bp cannot be used in 'asm' here");
+        }
+    }
+
     // ---- calculate_stack_space ----
 
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
@@ -311,54 +389,7 @@ impl I686Codegen {
 
         self.narrow_images = super::comparison::compute_narrow_images(func);
 
-        // Dynamic alloca (VLAs) requires the frame pointer to track the stack,
-        // since ESP changes by runtime-computed amounts.
-        if self.state.has_dyn_alloca {
-            self.omit_frame_pointer = false;
-        }
-        if self.state.stack_clash_protection {
-            let total_allocas = func
-                .blocks
-                .iter()
-                .flat_map(|b| &b.instructions)
-                .filter_map(|inst| match inst {
-                    crate::ir::reexports::Instruction::Alloca { size, .. } => Some(*size),
-                    _ => None,
-                })
-                .fold(0usize, |acc, s| acc.saturating_add(s));
-            if total_allocas > 12_288 {
-                self.omit_frame_pointer = false;
-            }
-        }
-
-        // Runtime ESP realignment requires EBP-relative local/param
-        // addressing for the duration of the call.
-        if has_overaligned_call_args(func) {
-            self.omit_frame_pointer = false;
-        }
-
-        // __builtin_frame_address(0) and __builtin_setjmp read %ebp directly;
-        // under -fomit-frame-pointer the register would hold a stale
-        // caller-owned value.  Mirror the has_frame_address veto the x86-64
-        // pipeline applies in backend/generation.rs.
-        // gcc.c-torture execute/frame-address.c caught this: at -O1/-O2 the
-        // noipa helper containing the intrinsic lost its frame pointer while
-        // its caller (holding a dynamic alloca) kept one, so the stack-address
-        // containment check failed and the test aborted.
-        if func.blocks.iter().any(|block| {
-            block.instructions.iter().any(|inst| {
-                matches!(
-                    inst,
-                    crate::ir::reexports::Instruction::Intrinsic {
-                        op: crate::ir::intrinsics::IntrinsicOp::FrameAddress
-                            | crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
-                        ..
-                    }
-                )
-            })
-        }) {
-            self.omit_frame_pointer = false;
-        }
+        self.decide_frame_pointer(func);
 
         // Compute named parameter stack bytes for va_start (variadic functions).
         {
@@ -400,6 +431,16 @@ impl I686Codegen {
             i686_clobber_to_phys,
             callee_saved_set,
         );
+        // %ebp is an ordinary callee-saved register where the frame pointer
+        // is omitted, and a statement that takes it (`"ebp"` in any spelling,
+        // a register variable) is served like one that takes %esi. Where the
+        // function keeps its frame pointer the statement cannot be compiled:
+        // every slot access behind it would go through the destroyed
+        // register. GCC refuses it in these words, at the function's end.
+        if !self.omit_frame_pointer {
+            asm_clobbered_regs.retain(|&reg| reg != PhysReg(3));
+            self.refuse_asm_that_takes_the_frame_pointer(func);
+        }
         // In PIC mode, %ebx (PhysReg(0)) is reserved as the GOT base pointer --
         // but ONLY for functions that actually reference the GOT.
         //
@@ -706,6 +747,7 @@ impl I686Codegen {
         }
         let mut space = space + conflict_params.len() as i64 * 4;
         space = self.allocate_static_chain_homes(func, space);
+        space = self.allocate_got_home(func, space);
         self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
             func.uses_sret,
             &func.ret_eightbyte_classes,
@@ -719,6 +761,42 @@ impl I686Codegen {
     }
 
     // ---- aligned_frame_size ----
+
+    /// A frame home for the GOT pointer, in a function that keeps it in
+    /// `%ebx` and has an assembler statement that takes `%ebx`.
+    ///
+    /// The statement overwrites the pointer (`"b"(x)`, the `"=b"` of a
+    /// `cpuid`, a clobber), and everything behind it that addresses a
+    /// global or calls through the PLT read the wrong register: a PIE that
+    /// asked `cpuid` and then called `printf` crashed. The prologue stores
+    /// the pointer here once and `begin_inline_asm` reloads it behind each
+    /// such statement.
+    ///
+    /// The alternatives, per execution of the statement: computing the
+    /// pointer again (`call __x86.get_pc_thunk.bx` and an `addl`) is four
+    /// instructions with a call and a return, 11 bytes; the reload is one
+    /// load, 4 bytes, and the store is paid once per call of the function,
+    /// not per statement, which is what a compare-exchange loop wants (the
+    /// timing is in docs/x86-inline-asm-registers.md). Pushing `%ebx` around the
+    /// statement moves `%esp` under a template that may call. GCC keeps the
+    /// pointer in another register and copies it to `%ebx` before every PLT
+    /// call; here that would take one of three callee-saved registers from
+    /// the whole function.
+    fn allocate_got_home(&mut self, func: &IrFunction, mut space: i64) -> i64 {
+        self.got_home_slot = None;
+        let takes_ebx = self.pic_got_live
+            && func.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    matches!(inst, Instruction::InlineAsm { outputs, inputs, clobbers, .. }
+                        if self.asm_statement_takes_ebx(outputs, inputs, clobbers))
+                })
+            });
+        if takes_ebx {
+            space += 4;
+            self.got_home_slot = Some(StackSlot(-space));
+        }
+        space
+    }
 
     /// Keep chain storage layout separate from general value-slot allocation.
     fn allocate_static_chain_homes(&mut self, func: &IrFunction, mut space: i64) -> i64 {
@@ -893,6 +971,11 @@ impl I686Codegen {
             let reg = if self.is_fastcall { "eax" } else { "ecx" };
             let home = self.slot_ref(slot);
             emit!(self.state, "    movl %{}, {}", reg, home);
+        }
+        // The GOT pointer's frame home (`allocate_got_home`).
+        if let Some(slot) = self.got_home_slot {
+            let home = self.slot_ref(slot);
+            emit!(self.state, "    movl %ebx, {}", home);
         }
     }
 

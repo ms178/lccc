@@ -3829,6 +3829,12 @@ gate "symbol-annotations" fast \
 gate "x86-gpr-intrinsics" fast \
     python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc
 
+# Assembler statements against the registers the compiler keeps for itself
+# (the i686 GOT pointer in %ebx, the frame pointer, live values): programs,
+# shared libraries, refusals and clobber names against GCC 16.2.
+gate "asm-registers" fast \
+    python3 tests/regression/check_asm_registers.py --lccc target/fastbuild/lccc
+
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
 # sqlite_put_varint plus a shrunk-corpus gcc differential — the golden-gate

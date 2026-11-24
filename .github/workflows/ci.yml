@@ -3110,6 +3110,13 @@ jobs:
         # explicit and implicit operands; x86-64 and i686, with three
         # planted differences as negative controls.
         python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc
+        # Assembler statements and the registers the compiler keeps for
+        # itself: %ebx as the i686 GOT pointer, the frame pointer, every
+        # spelling of a clobber, memory operands that name globals and
+        # thread-local objects in position-independent code. 92 programs
+        # against GCC 16.2 (x86-64 and i686, -O0 to -Os, with and without
+        # PIC), shared libraries linked with -z text, GCC's refusals.
+        python3 tests/regression/check_asm_registers.py --lccc target/fastbuild/lccc
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.
