@@ -198,6 +198,37 @@ NOINLINE word clobber_three(word x, word y) {
     return a + 2 * b + 3 * c + 5 * d + 7 * e;
 }
 
+/* A template that destroys a register without naming it: the clobber list
+   is all the compiler has. (lccc's x86-64 peephole drops the save of a
+   callee-saved register that the function's text does not mention, and
+   keeps it here because a template line counts as a mention of every
+   register.) */
+__asm__(".text\n"
+        "destroy_bx:\n"
+        "    xorl %ebx, %ebx\n"
+        "    ret\n"
+        "destroy_bp:\n"
+        "    xorl %ebp, %ebp\n"
+        "    ret\n");
+#if defined(__x86_64__)
+/* Step over the red zone: the call writes its return address below %rsp. */
+#define CALL(routine) "subq $128, %%rsp\n\tcall " routine "\n\taddq $128, %%rsp"
+#else
+#define CALL(routine) "call " routine
+#endif
+
+NOINLINE word clobber_by_call_bx(word x, word y) {
+    word a = x * 3 + y, b = x - y, c = x ^ y, d = x + 7 * y, e = y - 5 * x;
+    __asm__ volatile(CALL("destroy_bx") : : : "ebx", "cc");
+    return a + 2 * b + 3 * c + 5 * d + 7 * e;
+}
+
+NOINLINE word clobber_by_call_bp(word x, word y) {
+    word a = x * 3 + y, b = x - y, c = x ^ y, d = x + 7 * y, e = y - 5 * x;
+    __asm__ volatile(CALL("destroy_bp") : : : "ebp", "cc");
+    return a + 2 * b + 3 * c + 5 * d + 7 * e;
+}
+
 /* A register variable in a callee-saved register is an operand in it: the
    statement reads the register by name, so the value has to be there. */
 NOINLINE word register_variable(word x, word y) {
@@ -217,6 +248,8 @@ static const struct {
     COMMON(ENTRY)
     EXTENDED(ENTRY)
     { "three", clobber_three },
+    { "by call, ebx", clobber_by_call_bx },
+    { "by call, ebp", clobber_by_call_bp },
     { "register variable", register_variable },
 };
 
