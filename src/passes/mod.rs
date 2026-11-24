@@ -5082,6 +5082,30 @@ pub(crate) fn run_passes(
         verify::verify_after_pass(module, "satsub");
     }
 
+    // Loops whose header computes what the body reads (`while (n--)`):
+    // machine-level inversion cannot bottom-test them, the SSA rotation can
+    // (`loop_rotate::rotate_fed_loops`). Here, behind every pass that
+    // matches a loop's shape, so that none of them sees the rotated one;
+    // the guard a rotation leaves may test constants, and its blocks may
+    // merge, which the three passes behind it see to (the copy propagator
+    // is the one that leaves the hoisted constants in their homes, as for
+    // jump threading above). Off with rotation (`CCC_NO_LOOP_ROTATE`).
+    if rotate_policy != loop_rotate::RotatePolicy::Off {
+        for func in &mut module.functions {
+            if func.is_declaration {
+                continue;
+            }
+            let rotated = loop_rotate::rotate_fed_loops(func);
+            if rotated > 0 {
+                constant_fold::fold_function(func);
+                cfg_simplify::run_function(func);
+                propagate_copies_sparing_const_homes(func, target);
+                dce::eliminate_dead_code(func);
+                verify::verify_after_func_pass(func, "loop_rotate_late");
+            }
+        }
+    }
+
     // Phase 11f: FMA operand-negation peel. LAST IR transform: after every
     // vectorizer (their SLP matchers must not see the Signed variants) and
     // in phi-SSA form (the rewrite's soundness argument is dominance, and

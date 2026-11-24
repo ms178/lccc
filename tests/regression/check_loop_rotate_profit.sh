@@ -28,6 +28,13 @@
 #   3. The switches mean what the documentation says: `CCC_NO_LOOP_ROTATE`
 #      and `CCC_LOOP_ROTATE=0` are off; `CCC_LOOP_ROTATE=1` rotates the loop
 #      (2) leaves alone; -O1 and -Os do not rotate.
+#   4. The one loop that is rotated for its branch: a header that computes
+#      what the body reads (`while (n--)`), which machine-level inversion
+#      cannot bottom-test. Rotated late, it is one block closed by one
+#      conditional branch, its counter stepped in place; with rotation off
+#      it jumps back to a test at the top. The same loop with an ordered
+#      test on the old counter (`while (n-- > 0)`), whose rotation would
+#      keep two counters alive across the back edge, is left byte for byte.
 #
 # Assertions read x86-64 assembly.
 # ============================================================================
@@ -104,6 +111,23 @@ long costs_a_register(const long *p, const long *a, long n)
 }
 C
 
+# The header steps the counter the body's stores do not need, but the test
+# does: nothing here leaves the loop, so (1) to (3) never look at it.
+cat > "$work/fed.c" <<'C'
+void copy_down(char *d, const char *s, unsigned long n)
+{
+    while (n--)
+        *d++ = *s++;
+}
+C
+cat > "$work/fedgt.c" <<'C'
+void copy_down_signed(char *d, const char *s, long n)
+{
+    while (n-- > 0)
+        *d++ = *s++;
+}
+C
+
 fail=0
 ok()  { printf 'ok:   %s\n' "$1"; }
 bad() { printf 'FAIL: %s\n' "$1" >&2; fail=1; }
@@ -150,6 +174,14 @@ loop_of() { # loop_of <fn> <file.s>
     }' "$2"
 }
 
+# The instructions of a function, labels and directives included.
+body_of() { # body_of <fn> <file.s>
+  awk -v fn="$1:" '
+    $0 == fn { inf = 1; next }
+    inf && /^[[:space:]]*\.size[[:space:]]/ { exit }
+    inf { print }' "$2"
+}
+
 # Instructions of a loop that touch memory (`lea` computes, it does not).
 memory_in() { grep -E '^[[:space:]]+[a-z]' | grep -vE '^[[:space:]]+lea' | grep -cE '\(%r' || true; }
 count() { grep -cE "$1" || true; }
@@ -159,7 +191,7 @@ expect() {
   if [[ $2 == "$3" ]]; then ok "$1 ($2)"; else bad "$1: got $2, want $3"; fi
 }
 
-for shape in div acc prefix plain small reg; do
+for shape in div acc prefix plain small reg fed fedgt; do
   emit "$work/$shape.on.s"  "$work/$shape.c" -O2
   emit "$work/$shape.off.s" "$work/$shape.c" -O2 CCC_NO_LOOP_ROTATE=1
 done
@@ -240,6 +272,47 @@ if says 'SUCCESS: rotated'; then
 else
   bad "CCC_LOOP_ROTATE=1 did not rotate the plain loop"
 fi
+
+# ── 4. A header that computes what the body reads ───────────────────────────
+jumps='^[[:space:]]+jmp[[:space:]]'
+expect "fed header: no jump left in the function" \
+  "$(body_of copy_down "$work/fed.on.s" | count "$jumps")" 0
+expect "fed header: the loop is closed by its test" \
+  "$(loop_of copy_down "$work/fed.on.s" | count '^[[:space:]]+jne[[:space:]]')" 1
+expect "fed header: the counter is stepped in place" \
+  "$(loop_of copy_down "$work/fed.on.s" | count '^[[:space:]]+subq[[:space:]]+\$1,')" 1
+expect "fed header: no register is copied in the loop" \
+  "$(loop_of copy_down "$work/fed.on.s" | count '^[[:space:]]+mov[a-z]*[[:space:]]+%[a-z0-9]+,[[:space:]]*%')" 0
+expect "fed header, rotation off: a jump back to the test" \
+  "$(body_of copy_down "$work/fed.off.s" | count "$jumps")" 1
+trace "$work/fed.c"
+if says 'computes what the loop reads'; then
+  ok "fed header: the trace says why it was rotated"
+else
+  bad "fed header: no line for the late rotation in the trace"
+fi
+if cmp -s "$work/fedgt.on.s" "$work/fedgt.off.s"; then
+  ok "fed header, ordered test on the old counter: identical to rotation off"
+else
+  bad "fed header, ordered test on the old counter: the default differs from rotation off"
+fi
+# (Its load makes it a candidate of the trial in (1), which finds nothing
+# that leaves and undoes itself; the late rotation does not come for it.)
+trace "$work/fedgt.c"
+if says 'computes what the loop reads'; then
+  bad "fed header, ordered test on the old counter: rotated: ${traced##*$'\n'}"
+else
+  ok "fed header, ordered test on the old counter: not rotated"
+fi
+for opt in -O1 -Os; do
+  emit "$work/fed.opt.on.s"  "$work/fed.c" "$opt"
+  emit "$work/fed.opt.off.s" "$work/fed.c" "$opt" CCC_NO_LOOP_ROTATE=1
+  if cmp -s "$work/fed.opt.on.s" "$work/fed.opt.off.s"; then
+    ok "fed header, $opt: no rotation"
+  else
+    bad "fed header, $opt: rotation changed the output"
+  fi
+done
 
 if ((fail)); then
   echo "loop rotation profit gate: FAIL"

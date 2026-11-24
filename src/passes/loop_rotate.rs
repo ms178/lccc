@@ -17,9 +17,11 @@
 //!
 //! # What it is for
 //!
-//! Not for the branch. The default pipeline already bottom-tests every loop
-//! after phi elimination ([`crate::passes::loop_invert`]), so the hot path of
-//! a top-tested loop has one taken branch per trip either way. What only the
+//! Rarely for the branch. The default pipeline already bottom-tests a loop
+//! after phi elimination ([`crate::passes::loop_invert`]) wherever the
+//! header's values stay in the header, so the hot path of such a loop has
+//! one taken branch per trip either way. (Where they do not, see
+//! [`rotate_fed_loops`] below.) What only the
 //! SSA form can give is `PH`: **a block that runs exactly when the body is
 //! going to run at least once**. A top-tested loop has no such place: its
 //! preheader also runs on the zero-trip path, so nothing that can fault or
@@ -51,6 +53,13 @@
 //!   induction-variable strength reduction, the affine folds, the
 //!   machine-level inversion and its down-counter): rotating every loop at
 //!   the same place costs 3.4% of the benchmark suite's instructions.
+//!
+//!   The same policy takes a second kind of loop, late: the one whose
+//!   header computes a value the body reads (`while (n--)`). Machine-level
+//!   inversion cannot bottom-test it, because it cannot give the body the
+//!   latch's copy of that value; this pass can, and
+//!   [`rotate_fed_loops`] does so behind every pass that matches a loop's
+//!   shape, for the loops whose bottom test comes out tight.
 //! * [`RotatePolicy::Always`] (`CCC_LOOP_ROTATE=1`): every loop the
 //!   transformation can take, early in the pipeline. This is the stress
 //!   mode: it puts the SSA reconstruction below in front of every loop of a
@@ -1273,6 +1282,173 @@ fn rotate_loops_where(
 /// Returns the number of loops rotated.
 pub(crate) fn rotate_every_loop(func: &mut IrFunction) -> usize {
     rotate_loops_where(func, |_, _| true).len()
+}
+
+/// Most pure instructions in the header of a loop [`rotate_fed_loops`]
+/// takes: the bound of the pass it stands in for
+/// (`loop_invert::MAX_DUP_INSTS`).
+const MAX_FED_HEADER_INSTS: usize = 8;
+
+/// Whether `lp` is a loop that machine-level inversion will leave
+/// top-tested for one reason only, that its header computes a value the
+/// rest of the function reads, and that is worth rotating here instead:
+///
+/// 1. The header is phis and then a handful of pure instructions:
+///    inversion's own list and bound. No load: a header that reads memory
+///    is the one case inversion refuses on measurement (its rule 2), and
+///    that measurement is not revisited here.
+/// 2. A latch jumps back to it unconditionally: the jump a bottom test
+///    saves. (A latch that branches is a loop bottom-tested already.)
+/// 3. Something outside the header reads a value the header computes: the
+///    body, the code behind the loop, or a header phi over a back edge.
+///    Without that, inversion takes the loop and is the better tool: its
+///    copy of the test starts a live range of its own, and its two folds
+///    (the value bound, the down-counter) apply to what it rotated.
+/// 4. With `settled`: no header phi is read in the header behind the
+///    instruction that computes its next value. In the rotated loop such
+///    a read stands at the bottom next to the new value and keeps the old
+///    one alive beside it; the copy the phi becomes then cannot go into
+///    the latch, the back edge gets a block of its own, and the loop has
+///    two branches a trip again plus that block's copies of *every*
+///    carried value: worse than the top-tested loop it was. The test of
+///    `while (n--)` is such a read. `retarget_loop_tests` moves it onto
+///    the stepped value where it can (an equality test), which is why the
+///    question is asked again after it ran; `while (n-- > 0)` on a signed
+///    counter, where it cannot, stays top-tested.
+fn header_feeds_the_loop(func: &IrFunction, lp: &NaturalLoop, settled: bool) -> bool {
+    let Some(header) = func.blocks.get(lp.header) else {
+        return false;
+    };
+    // 1. Each value the header computes, and where.
+    let mut computed: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut pure = 0usize;
+    for (at, inst) in header.instructions.iter().enumerate() {
+        match inst {
+            Instruction::Phi { .. } => {}
+            Instruction::Load { .. } => return false,
+            other if is_duplicable(other) => {
+                pure += 1;
+                if let Some(dest) = other.dest() {
+                    computed.insert(dest.0, at);
+                }
+            }
+            _ => return false,
+        }
+    }
+    if computed.is_empty() || pure > MAX_FED_HEADER_INSTS {
+        return false;
+    }
+    // 2.
+    let jumps_back = lp.body.iter().any(|&b| {
+        b != lp.header
+            && func.blocks.get(b).is_some_and(
+                |block| matches!(block.terminator, Terminator::Branch(to) if to == header.label),
+            )
+    });
+    if !jumps_back {
+        return false;
+    }
+    // 3.
+    let read_outside = func.blocks.iter().enumerate().any(|(index, block)| {
+        let mut reads = false;
+        if index == lp.header {
+            for inst in &block.instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    reads |= incoming.iter().any(
+                        |(operand, _)| matches!(operand, Operand::Value(v) if computed.contains_key(&v.0)),
+                    );
+                }
+            }
+        } else {
+            let mut see = |v: u32| reads |= computed.contains_key(&v);
+            for inst in &block.instructions {
+                inst.for_each_used_value(&mut see);
+            }
+            block.terminator.for_each_used_value(&mut see);
+        }
+        reads
+    });
+    if !read_outside {
+        return false;
+    }
+    // 4.
+    if settled {
+        for inst in &header.instructions {
+            let Instruction::Phi { dest, incoming, .. } = inst else {
+                continue;
+            };
+            let next_at = incoming
+                .iter()
+                .filter_map(|(operand, _)| match operand {
+                    Operand::Value(v) => computed.get(&v.0).copied(),
+                    Operand::Const(_) => None,
+                })
+                .min();
+            let Some(next_at) = next_at else {
+                continue;
+            };
+            let mut read_behind = false;
+            let mut see = |v: u32| read_behind |= v == dest.0;
+            for later in &header.instructions[next_at + 1..] {
+                later.for_each_used_value(&mut see);
+            }
+            header.terminator.for_each_used_value(&mut see);
+            if read_behind {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Rotate the loops that would keep their test at the top for good. Returns
+/// the number of loops rotated. Part of [`RotatePolicy::Profit`].
+///
+/// A loop is bottom-tested in the end by `loop_invert`, after phi
+/// elimination, which copies the header's handful of pure instructions into
+/// the latch. It can do so only while nothing outside the header reads what
+/// the header computes: out of single assignment it has no way to give such
+/// a reader the latch's copy. `while (n--)`, `while (--i >= 0)`, `while
+/// (i++ != n)` and `for (;;) { x = step(x); if (!x) break; … }` all compute
+/// at the top what the body reads, the stepped counter, and stayed
+/// top-tested: a branch not taken and a jump back on every trip, which on a
+/// byte copy is 0.51 s against 0.37 s for the same loop with its test at
+/// the bottom (819 million trips, this host).
+///
+/// Here every reader can still be given its definition. The pass runs
+/// behind everything that looks at a loop's shape, so none of those sees a
+/// rotated loop (the reason the default policy does not rotate early), and
+/// it takes exactly the loops of [`header_feeds_the_loop`]: the ones
+/// inversion will refuse for that one reason and whose bottom test will be
+/// tight. A loop's test is moved onto the value the loop goes round with
+/// first (`retarget_loop_tests`), which is what makes `while (n--)` one of
+/// them.
+pub(crate) fn rotate_fed_loops(func: &mut IrFunction) -> usize {
+    if func.blocks.len() < 2 {
+        return 0;
+    }
+    let (_, loops) = loops_innermost_first(func);
+    if !loops
+        .iter()
+        .any(|lp| header_feeds_the_loop(func, lp, false))
+    {
+        return 0;
+    }
+    crate::ir::mem2reg::phi_eliminate::retarget_loop_tests(func);
+    let debug = rotate_debug();
+    let done = rotate_loops_where(func, |func, lp| {
+        let feeds = header_feeds_the_loop(func, lp, true);
+        if feeds {
+            trace!(
+                debug,
+                "{}: header .LBB{}: computes what the loop reads: rotated so that it is bottom-tested",
+                func.name,
+                func.blocks[lp.header].label.0
+            );
+        }
+        feeds
+    });
+    done.len()
 }
 
 /// Whether the body of `lp` holds something that has to stay in a
