@@ -3107,8 +3107,12 @@ jobs:
         # The scalar and system intrinsics of x86gprintrin.h (CLWB, WRPKRU,
         # XSAVEOPT, ENCLS, ...): the same instruction in the same form as
         # GCC 16.2's, and, stopped in front of it under GDB, the same
-        # explicit and implicit operands; x86-64 and i686, with three
-        # planted differences as negative controls.
+        # explicit and implicit operands; x86-64 and i686, with four
+        # negative controls. No instruction an intrinsic stands for is
+        # executed (each is stepped over, and both programs must exit
+        # normally), so the verdict is the same on every runner: with
+        # MOVDIRI taken for a register move the gate died of SIGILL on the
+        # processors that lack it.
         python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc
         # Assembler statements and the registers the compiler keeps for
         # itself: %ebx as the i686 GOT pointer, the frame pointer, every

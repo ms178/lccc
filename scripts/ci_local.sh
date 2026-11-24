@@ -3824,8 +3824,9 @@ gate "symbol-annotations" fast \
 
 # The scalar and system intrinsics of x86gprintrin.h against GCC 16.2: which
 # instruction, in which form, and with which operands when it is reached
-# (the two programs are stopped in front of it under GDB; nothing privileged
-# is executed).
+# (the two programs are stopped in front of it under GDB; nothing an
+# intrinsic stands for is executed, so the verdict does not depend on the
+# processor the gate runs on).
 gate "x86-gpr-intrinsics" fast \
     python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc
 

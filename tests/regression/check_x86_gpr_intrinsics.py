@@ -25,6 +25,16 @@ without executing one:
 Both hold for x86-64 and for i686. Without GDB or GCC 16.2 the gate fails,
 unless `--allow-missing-tools` is given, in which case it says what it did
 not check.
+
+The verdict must not depend on the machine the gate runs on, so nothing an
+intrinsic stands for is ever executed: every instruction of a caller that
+is not glue (`GLUE`) and does not merely read the flags (`FLAG_READER`) is
+stepped over, a caller in which GCC's code is glue and nothing else is a
+failure, and both programs have to run to a normal exit. `GLUE` names its
+moves one by one for that reason: as `mov[a-z]*` it took MOVDIRI for a
+register move, the two direct-store callers were neither compared nor
+stepped over, and the gate passed where the processor has MOVDIRI and died
+of SIGILL where it has not. `glue_problems` pins the classification.
 """
 
 from __future__ import annotations
@@ -45,6 +55,7 @@ CONTROL = HERE / "fixtures" / "x86_gpr_intrinsics" / "control.c"
 CONTROL_FINDINGS = [
     # (objdump's names for `setz` and `setc`)
     "t_control_form: lccc `tpause reg32; sete reg8`, GCC `tpause reg32; setb reg8`",
+    "t_control_glue: nothing but glue in GCC's code (`mov; ret`)",
     "t_control_implicit: at `wrpkru` lccc has ['ax=0x1001', 'cx=0x1', 'dx=0x0'], "
     "GCC has ['ax=0x1001', 'cx=0x0', 'dx=0x0']",
     "t_control_operand: at `clwb` lccc has ['buf+0x80'], GCC has ['buf+0x40']",
@@ -59,11 +70,24 @@ OPTIONS_64 = ["-mfsgsbase", "-muintr"]
 
 # Instructions that move values into place and say nothing about the
 # intrinsic. `set*` is not here: which flag an intrinsic returns is part of
-# what it is.
+# what it is. The moves are the plain one, `movabs` and the extending ones,
+# spelled out: MOVDIRI, MOVDIR64B, MOVBE, MOVNTI, MOVRS and the string
+# moves are instructions of their own.
 GLUE = re.compile(
-    r"^(mov[a-z]*|lea[lq]?|push[lq]?|pop[lq]?|ret[lq]?|xor[lq]?|and[lq]?|or[lq]?|add[lq]?|sub[lq]?|"
+    r"^(mov[bwlq]?|movabs|mov[sz][bw][wlq]|movslq|lea[lq]?|push[lq]?|pop[lq]?|ret[lq]?|xor[lq]?|"
+    r"and[lq]?|or[lq]?|add[lq]?|sub[lq]?|"
     r"sh[lr][lq]?|sa[lr][lq]?|nop[wl]?|endbr64|endbr32|call[lq]?|cltq|cdqe|cwtl|data16|xchg|"
     r"test[blq]?|cmp[blq]?|j[a-z]+|not[lq]?|neg[lq]?|cs|ds)$")
+# Not glue, and safe to execute anywhere: these read the flags the stepped
+# over instruction would have written, and write a register.
+FLAG_READER = re.compile(r"^(set[a-z]+|cmov[a-z]+)$")
+# What `GLUE` has to take for glue, and what it must not.
+GLUE_WORDS = ("mov movb movw movl movq movabs movzbl movzbw movzwl movsbl movsbw movswl movslq "
+              "movsbq movswq lea leal leaq push pushq pop popl ret xor and or add sub shl shr "
+              "nop nopw nopl endbr64 endbr32 call cltq cwtl data16 xchg test cmp jne jmp not neg").split()
+NOT_GLUE_WORDS = ("movdiri movdir64b movbe movnti movntq movrs movsb movsw movsl movsq movd movaps "
+                  "movups movdqa movdqu movss movsd cmove setb sete setne adc sbb bt stc "
+                  "pushf popf pushfq popfq clwb wrpkru xsaveopt64 crc32q ptwrite rdpid").split()
 
 # Registers an instruction reads without naming them.
 A, B, C, D = "ax", "bx", "cx", "dx"
@@ -91,6 +115,10 @@ WRITE_ONLY = {"rdpid", "rdfsbase", "rdgsbase"}
 REGISTER_OR_MEMORY = {"crc32": {"b": 8, "w": 16, "l": 32, "q": 64}, "ptwrite": {"l": 32, "q": 64}}
 # These go through the stack; stepping over one half would leave it unbalanced.
 NOT_STEPPED = {"t_readeflags", "t_writeeflags"}
+# Arguments the driver does not make up. POPF is executed, so what it loads
+# is the six status flags and nothing else: the made-up 0x...7788 set TF and
+# DF, and the 64-bit programs died of SIGTRAP on the way out of this caller.
+ARGUMENTS = {"t_writeeflags": ["0x8d5"]}
 
 REG64 = "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15".split()
 REG32 = "eax ebx ecx edx esi edi ebp esp".split()
@@ -196,6 +224,20 @@ def contract(insns: list[Insn]) -> list[Insn]:
     return [i for i in insns if not GLUE.match(i.mnemonic)]
 
 
+def glue_problems() -> list[str]:
+    """The classification every other check rests on, word by word."""
+    return ([f"`{word}` is not taken for glue" for word in GLUE_WORDS if not GLUE.match(word)] +
+            [f"`{word}` is taken for glue" for word in NOT_GLUE_WORDS if GLUE.match(word)] +
+            [f"`{word}` is taken for a flag reader" for word in GLUE_WORDS + NOT_GLUE_WORDS
+             if FLAG_READER.match(word) and not word.startswith(("set", "cmov"))])
+
+
+def stepped_over(insns: list[Insn]) -> list[tuple[int, int]]:
+    """(address, address of the next instruction) of everything in a caller
+    that is never executed: all of `contract` but the flag readers."""
+    return [(i.addr, i.next) for i in contract(insns) if not FLAG_READER.match(i.mnemonic)]
+
+
 def driver_source(source: Path, wide: bool) -> str:
     """A `main` that calls every caller with arguments each compiler's code
     can be recognised by: pointers into one buffer, distinct integers."""
@@ -207,8 +249,8 @@ def driver_source(source: Path, wide: bool) -> str:
     calls = []
     for m in re.finditer(r"^[\w ]+?\**\s*(t_\w+)\(([^)]*)\)\s*\{", text, re.M):
         name, params = m.group(1), m.group(2).strip()
-        args = []
-        for index, param in enumerate([] if params == "void" else params.split(",")):
+        args = list(ARGUMENTS.get(name, []))
+        for index, param in enumerate([] if params == "void" or args else params.split(",")):
             param = param.strip()
             if "*" in param:
                 args.append(f"(void *)(g_buf + {64 * (index + 1)})")
@@ -225,15 +267,19 @@ def driver_source(source: Path, wide: bool) -> str:
             "\n".join(calls) + "\n    return 0;\n}\n")
 
 
-def register_dump(gdb: str, binary: Path, stops: list[tuple[str, int, int]], wide: bool):
-    """{caller: {register: value}} at each stop; the stop's instruction is
-    stepped over, never executed."""
+def register_dump(gdb: str, binary: Path, stops: list[tuple[str, int, int]],
+                  skips: list[tuple[int, int]], wide: bool):
+    """{caller: {register: value}} at each stop. The stop's instruction is
+    stepped over, never executed, and so is every instruction of `skips`."""
     regs = REG64 if wide else REG32
     script = ["set pagination off", "set confirm off", "set width 0"]
     for name, addr, after in stops:
         script += [f"break *{addr:#x}", "commands", "silent", f'printf "STOP {name}\\n"']
         script += [f'printf "REG {reg} %lx\\n", (unsigned long)${reg}' for reg in regs]
         script += ['printf "BUF %lx\\n", (unsigned long)&g_buf', f"set $pc = {after:#x}", "continue", "end"]
+    for addr, after in skips:
+        script += [f"break *{addr:#x}", "commands", "silent", f'printf "SKIP {addr:#x}\\n"',
+                   f"set $pc = {after:#x}", "continue", "end"]
     script += ["run", "quit"]
     path = binary.with_suffix(".gdb")
     path.write_text("\n".join(script) + "\n")
@@ -305,16 +351,29 @@ def check_mode(args, tools, wide: bool, tmp: Path, source: Path = CALLERS,
         return [], len(ours), 0
     theirs = disassemble(tools["objdump"], binaries["gcc"])
     stops = {"lccc": [], "gcc": []}
+    skips = {"lccc": [], "gcc": []}
     for name in sorted(theirs):
         if name not in ours:
             problems.append(f"{mode}: {name}: missing from lccc's program")
             continue
         mine, want = contract(ours[name]), contract(theirs[name])
+        if not want:
+            # Nothing to compare and nothing to step over: the intrinsic's
+            # instruction was taken for glue, and would be executed.
+            body = [i.mnemonic for i in theirs[name]]
+            body = body[:next((n + 1 for n, word in enumerate(body) if word.startswith("ret")), len(body))]
+            problems.append(f"{mode}: {name}: nothing but glue in GCC's code (`{'; '.join(body)}`)")
+            continue
+        if name not in NOT_STEPPED:
+            # Whatever the comparison below says, neither program gets to
+            # execute an instruction an intrinsic stands for.
+            for label, insns in (("lccc", ours[name]), ("gcc", theirs[name])):
+                skips[label] += stepped_over(insns)
         if [i.shape(wide) for i in mine] != [i.shape(wide) for i in want]:
             problems.append(f"{mode}: {name}: lccc `{'; '.join(i.shape(wide) for i in mine)}`, "
                             f"GCC `{'; '.join(i.shape(wide) for i in want)}`")
             continue
-        if name in NOT_STEPPED or not want:
+        if name in NOT_STEPPED:
             continue
         stops["lccc"].append((name, mine[0].addr, mine[0].next))
         stops["gcc"].append((name, want[0].addr, want[0].next))
@@ -322,10 +381,23 @@ def check_mode(args, tools, wide: bool, tmp: Path, source: Path = CALLERS,
     if tools["gdb"]:
         dumps = {}
         for label in ("lccc", "gcc"):
-            dumps[label], raw = register_dump(tools["gdb"], binaries[label], stops[label], wide)
+            # A stop steps over its own instruction.
+            stopped = {addr for _, addr, _ in stops[label]}
+            others = [skip for skip in skips[label] if skip[0] not in stopped]
+            dumps[label], raw = register_dump(tools["gdb"], binaries[label], stops[label], others, wide)
+            skipped = sorted(line.split()[1] for line in raw.splitlines() if line.startswith("SKIP "))
             if len(dumps[label]) != len(stops[label]):
                 problems.append(f"{mode}: GDB stopped in {len(dumps[label])} of {len(stops[label])} "
                                 f"callers of {label}'s program: {raw.strip()[-300:]}")
+            elif "exited normally]" not in raw:
+                problems.append(f"{mode}: {label}'s program did not run to a normal exit under GDB: "
+                                f"{raw.strip()[-300:]}")
+            elif skipped != sorted(f"{addr:#x}" for addr, _ in others):
+                # Each caller runs once, so each of its instructions is
+                # reached once: more or fewer and the gate has lost track of
+                # what the program executes.
+                problems.append(f"{mode}: {label}'s program reached {len(skipped)} of the {len(others)} "
+                                "instructions that are stepped over without a register dump, once each")
         for (name, _, _) in stops["gcc"]:
             if name not in dumps["lccc"] or name not in dumps["gcc"]:
                 continue
@@ -390,9 +462,9 @@ def main() -> int:
         print(f"FAIL: not found: {', '.join(missing)} (GCC must be 16.2; or --allow-missing-tools)")
         return 1
 
-    problems, summary = [], []
+    problems, summary = [f"classification: {problem}" for problem in glue_problems()], []
     with tempfile.TemporaryDirectory(prefix="lccc-gpr-intrinsics-") as tmp:
-        # The gate itself first: three planted differences, each reported.
+        # The gate itself first: the planted differences, each reported.
         if not missing:
             found, _, _ = check_mode(args, tools, True, Path(tmp), CONTROL, ("-DCONTROL_BROKEN",))
             if sorted(found) != sorted(f"-m64: {finding}" for finding in CONTROL_FINDINGS):
@@ -405,7 +477,7 @@ def main() -> int:
     for problem in problems:
         print(f"FAIL: {problem}")
     unchecked = (f"; NOT CHECKED (missing {', '.join(missing)})" if missing
-                 else "; 3 negative controls reported")
+                 else f"; {len(CONTROL_FINDINGS)} negative controls reported")
     print(f"x86-gpr-intrinsics: {'; '.join(summary)}{unchecked}, {'FAIL' if problems else 'PASS'}")
     return 1 if problems else 0
 
