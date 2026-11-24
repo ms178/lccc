@@ -132,8 +132,10 @@
 //! disables it.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrBinOp, IrFunction, IrModule, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, Operand,
+    Terminator, Value,
 };
 
 /// Eliminate all phi nodes in the module by lowering them to copies.
@@ -709,6 +711,461 @@ struct PhiElimCtx<'a> {
     copy_order: CopyOrderPolicy,
 }
 
+/// `LCCC_DEBUG_PHI_HOIST`: one line on stderr per loop test retargeted and
+/// per set of self-loop copies absorbed or split.
+fn phi_hoist_trace() -> bool {
+    std::env::var("LCCC_DEBUG_PHI_HOIST").is_ok()
+}
+
+/// Where each value of a function is defined, for [`retarget_loop_tests`].
+struct DefSites {
+    /// Indexed by value number: `(block, instruction)`, [`Self::NONE`] for a
+    /// value no instruction defines (a parameter), [`Self::MANY`] for one
+    /// with more than one definition.
+    sites: Vec<(u32, u32)>,
+}
+
+impl DefSites {
+    const NONE: (u32, u32) = (u32::MAX, u32::MAX);
+    const MANY: (u32, u32) = (u32::MAX, u32::MAX - 1);
+
+    fn of(func: &IrFunction) -> Self {
+        let mut this = Self { sites: Vec::new() };
+        for (b, block) in func.blocks.iter().enumerate() {
+            for (i, inst) in block.instructions.iter().enumerate() {
+                if let Some(dest) = inst.dest() {
+                    this.define(dest, b, i);
+                }
+                // An inline-asm output is written by the statement and is
+                // no `dest()`: a value named there is defined there too.
+                if let Instruction::InlineAsm { outputs, .. } = inst {
+                    for (_, output, _) in outputs {
+                        this.define(*output, b, i);
+                    }
+                }
+            }
+        }
+        this
+    }
+
+    fn define(&mut self, value: Value, block: usize, inst: usize) {
+        let value = value.0 as usize;
+        if value >= self.sites.len() {
+            self.sites.resize(value + 1, Self::NONE);
+        }
+        self.sites[value] = if self.sites[value] == Self::NONE {
+            // Block and instruction counts are far below `u32::MAX` (labels
+            // and value numbers are `u32` themselves), where the two marks
+            // above live; a count that is not, were there one, reads as
+            // `MANY` and the value is left alone.
+            match (u32::try_from(block), u32::try_from(inst)) {
+                (Ok(block), Ok(inst)) if block != u32::MAX => (block, inst),
+                _ => Self::MANY,
+            }
+        } else {
+            Self::MANY
+        };
+    }
+
+    /// The one definition of `value`, as `(block, instruction)`.
+    fn one(&self, value: Value) -> Option<(usize, usize)> {
+        match self.sites.get(value.0 as usize) {
+            Some(&site) if site != Self::NONE && site != Self::MANY => {
+                Some((site.0 as usize, site.1 as usize))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Most links [`offset_from`] follows from a value down to the phi: a sum
+/// and a cast on either side of it are three.
+const MAX_STEP_LINKS: usize = 4;
+
+/// `value - phi` modulo two to the power of `8 * width`, when `value` is
+/// `phi` and constants added and subtracted, with casts in between.
+///
+/// Each link has to keep the low `width` bytes of what it reads, which is
+/// what makes the sum of the constants the answer whatever the wider types
+/// do above them: an addition or subtraction in an integer type of at least
+/// that width, a cast between two such types (to the narrower one it cuts,
+/// to the wider one it makes up bits above the ones that count). A cast
+/// *from* a narrower type reads fewer bits than the phi has and is no link.
+/// Also returns whether a cast was among them, for the trace.
+fn offset_from(
+    func: &IrFunction,
+    defs: &DefSites,
+    value: Value,
+    phi: Value,
+    width: usize,
+) -> Option<(i64, bool)> {
+    let keeps_the_bits = |ty: IrType| ty.is_integer() && (width..=8).contains(&ty.size());
+    let mut value = value;
+    let mut offset = 0i64;
+    let mut cast = false;
+    for _ in 0..=MAX_STEP_LINKS {
+        if value == phi {
+            return Some((offset, cast));
+        }
+        let (block, at) = defs.one(value)?;
+        value = match &func.blocks[block].instructions[at] {
+            Instruction::BinOp {
+                op: op @ (IrBinOp::Add | IrBinOp::Sub),
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if keeps_the_bits(*ty) => {
+                let (from, by) = match (op, lhs, rhs) {
+                    (_, Operand::Value(from), Operand::Const(by)) => (*from, by.to_i64()?),
+                    // `k + x`; `k - x` is no step of `x`.
+                    (IrBinOp::Add, Operand::Const(by), Operand::Value(from)) => {
+                        (*from, by.to_i64()?)
+                    }
+                    _ => return None,
+                };
+                offset = match op {
+                    IrBinOp::Add => offset.wrapping_add(by),
+                    _ => offset.wrapping_sub(by),
+                };
+                from
+            }
+            Instruction::Cast {
+                src: Operand::Value(from),
+                from_ty,
+                to_ty,
+                ..
+            } if keeps_the_bits(*from_ty) && keeps_the_bits(*to_ty) => {
+                cast = true;
+                *from
+            }
+            _ => return None,
+        };
+    }
+    None
+}
+
+/// Let a loop's test read the value the loop goes round with. Returns the
+/// number of tests rewritten.
+///
+/// `do { … } while (--n);` arrives here as
+///
+/// ```text
+///   H:  n  = phi [n0, entry], [n1, L]
+///       …
+///   L:  n1 = n - 1
+///       c  = n != 1          ; the mid-level form: a zero test of a
+///       br c, H, X           ;   difference compares its operands
+/// ```
+///
+/// and everything from here on has to keep two values where the loop has
+/// one. The test reads `n` after `n1` exists, so the two are alive at once
+/// and cannot share a register; the copy `n = n1` the phi becomes therefore
+/// stays a copy, and it belongs on the back edge, which leaves a block with
+/// two ways out and is split for it. The result is `lea -1(n), n1; cmp $1,
+/// n; je X; mov n1, n; jmp H`: five instructions and two branches a trip for
+/// what is `sub $1, n; jne H`.
+///
+/// Adding one constant to both sides of an equality changes nothing in a
+/// ring, so `n != 1` is `n1 != 0` at every width, signed or unsigned,
+/// wrapping or not, and the test can read `n1` instead. Then `n` dies where
+/// `n1` is made, the two share a register, and the copy goes, together with
+/// the block that held it. No value lives longer for it: `next` has to
+/// reach the phi, so it is alive at the test either way.
+///
+/// It is done here, as late as it can be, and not by keeping the mid-level
+/// passes from comparing the operands: they find a counted loop by the
+/// compare of its counter, and a test written on the old value in the source
+/// (`while (n-- != 1)`) is the same case and has no other place to be caught.
+///
+/// The test comes in two forms:
+///
+/// * `c = phi ==/!= K`, a compare in the block that branches on it. An
+///   ordered test does not commute with a wrapping addition.
+/// * The branch reads `phi` itself, which asks `phi != 0`: the test of
+///   `while (n--)` is the old value and nothing else. A compare of `next` is
+///   appended for it and takes the place of the test the branch made.
+///
+/// And the step is `phi` plus and minus constants, with casts on the way
+/// ([`offset_from`]): `next = phi ± k`; `next = (T)(phi ± k)`, the sum made
+/// in `int`, where C computes `unsigned char n; n--`, and cut back; `next =
+/// (T)phi ± k`, as the narrowing passes leave that. Every link is an integer
+/// that has the phi's bits and no more than 64. Cutting a value to its low
+/// bits commutes with addition, so each of them is `phi ± k` modulo the
+/// phi's width.
+///
+/// What is asked beyond that, each for a reason:
+///
+/// * `next` is what the loop hands the phi (the identity does not need
+///   that; it is what makes the old value die and the rewrite worth doing),
+///   and it has been computed, on this trip, when the test is. There are
+///   two ways to know that it has. This block computes it ahead of the
+///   test, wherever it is handed on from: the header of `while (n--)`, step
+///   and test at the top and the back edge from the bottom. Or this block
+///   is the one that hands it on, wherever it was computed: then the step
+///   dominates the end of this block, and from the phi's block there is no
+///   way to the test that misses the step, because such a way, behind any
+///   way to the phi's block that misses the step (there is one, the phi's
+///   block dominates the step and not the reverse), would reach the end of
+///   this block without it. Either way the `next` the test reads was made
+///   from the `phi` it used to read. The second is the loop whose counter
+///   steps at the top of a body of several blocks:
+///
+///   ```text
+///     H:  n  = phi [n0, entry], [n1, L]
+///         n1 = n - 1
+///         br …, A, B
+///     …
+///     L:  c  = n != 1
+///         br c, H, X
+///   ```
+/// * each value read on the way (`c`, `phi`, `next`, the links between the
+///   two) has one definition. Single assignment says so of every value; it
+///   is looked up, not assumed, and a value with two definitions is left
+///   alone.
+/// * test, phi and `next` are integers of one width of at most 64 bits, so
+///   the three agree on which bits there are.
+/// * the new constant is no harder to load than the old one.
+pub(crate) fn retarget_loop_tests(func: &mut IrFunction) -> usize {
+    let has_phi = func
+        .blocks
+        .iter()
+        .any(|block| matches!(block.instructions.first(), Some(Instruction::Phi { .. })));
+    if !has_phi {
+        return 0;
+    }
+    let defs = DefSites::of(func);
+
+    /// How a block's branch reads the value it tests.
+    #[derive(Clone, Copy)]
+    enum Reads {
+        /// Through the compare at this index of the block.
+        Compare(usize),
+        /// Directly: the branch asks whether the value is zero.
+        Itself,
+    }
+    /// One test to rewrite: it is to read `next` against `bound`.
+    struct Retarget {
+        block: usize,
+        reads: Reads,
+        ty: IrType,
+        next: Value,
+        bound: IrConst,
+        /// For the trace: where the step stands, and whether a cast is
+        /// among its links.
+        step_in_block: bool,
+        cut_back: bool,
+    }
+    let mut rewrites: Vec<Retarget> = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        let Terminator::CondBranch {
+            cond: Operand::Value(cond),
+            ..
+        } = &block.terminator
+        else {
+            continue;
+        };
+        let Some((cond_block, cond_at)) = defs.one(*cond) else {
+            continue;
+        };
+        // The value tested, the constant it is tested against, and how.
+        let (phi, bound, reads, test_ty) = match &func.blocks[cond_block].instructions[cond_at] {
+            // A compare, in this block: what it is to read has to be there
+            // to be read.
+            Instruction::Cmp {
+                op: IrCmpOp::Eq | IrCmpOp::Ne,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if cond_block == b => match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(k)) | (Operand::Const(k), Operand::Value(v)) => {
+                    (*v, k.to_i64(), Reads::Compare(cond_at), *ty)
+                }
+                _ => continue,
+            },
+            Instruction::Phi { ty, .. } => (*cond, Some(0), Reads::Itself, *ty),
+            _ => continue,
+        };
+        let Some((phi_block, phi_inst)) = defs.one(phi) else {
+            continue;
+        };
+        let Instruction::Phi {
+            ty: phi_ty,
+            incoming,
+            ..
+        } = &func.blocks[phi_block].instructions[phi_inst]
+        else {
+            continue;
+        };
+        // The value the loop goes round with: what this block hands the
+        // phi, or what it has computed ahead of the test for another block
+        // to hand on. One value, or there is no telling which.
+        let ahead_of_test = |at: usize| match reads {
+            Reads::Compare(test) => at < test,
+            // The compare to come goes behind everything the block holds.
+            Reads::Itself => true,
+        };
+        let mut next: Option<Value> = None;
+        let mut one_value = true;
+        for (operand, from) in incoming {
+            let handed = *from == block.label;
+            let candidate = match operand {
+                Operand::Value(v)
+                    if handed
+                        || defs
+                            .one(*v)
+                            .is_some_and(|(block, at)| block == b && ahead_of_test(at)) =>
+                {
+                    *v
+                }
+                // This block hands the phi a constant: no step.
+                _ if handed => {
+                    one_value = false;
+                    break;
+                }
+                _ => continue,
+            };
+            if next.is_some_and(|other| other != candidate) {
+                one_value = false;
+                break;
+            }
+            next = Some(candidate);
+        }
+        let (Some(next), true) = (next, one_value) else {
+            continue;
+        };
+        let Some((next_block, next_at)) = defs.one(next) else {
+            continue;
+        };
+        // Handed on from here and computed here: ahead of the test, then.
+        // (Computed in another block it is ahead of it by the argument
+        // above.)
+        if next_block == b && !ahead_of_test(next_at) {
+            continue;
+        }
+        // The step, and the three that have to agree on which bits there
+        // are: the test, the phi, and `next` as its definition types it.
+        let width = test_ty.size();
+        let next_ty = match &func.blocks[next_block].instructions[next_at] {
+            Instruction::BinOp { ty, .. } => *ty,
+            Instruction::Cast { to_ty, .. } => *to_ty,
+            _ => continue,
+        };
+        if ![*phi_ty, next_ty, test_ty]
+            .iter()
+            .all(|t| t.is_integer() && t.size() == width)
+            || width > 8
+        {
+            continue;
+        }
+        let Some((by, cut_back)) = offset_from(func, &defs, next, phi, width) else {
+            continue;
+        };
+        let Some(bound) = bound else {
+            continue;
+        };
+        // `phi == K` is `phi + k == K + k`, modulo the width; `truncate_i64`
+        // keeps the bits the type has.
+        let moved = test_ty.truncate_i64(bound.wrapping_add(by));
+        // A 64-bit compare takes a sign-extended 32-bit immediate; a
+        // constant beyond that costs a register and an instruction.
+        let fits_imm32 = |k: i64| i32::try_from(k).is_ok();
+        if width == 8 && !fits_imm32(moved) && fits_imm32(bound) {
+            continue;
+        }
+        rewrites.push(Retarget {
+            block: b,
+            reads,
+            ty: test_ty,
+            next,
+            bound: IrConst::from_i64(moved, test_ty),
+            step_in_block: next_block == b,
+            cut_back,
+        });
+    }
+    if rewrites.is_empty() {
+        return 0;
+    }
+
+    let trace = phi_hoist_trace();
+    // Only a branch that read its value directly needs a new name.
+    let mut fresh = if rewrites
+        .iter()
+        .any(|rewrite| matches!(rewrite.reads, Reads::Itself))
+    {
+        func.sound_next_value_id()
+    } else {
+        func.next_value_id
+    };
+    for rewrite in &rewrites {
+        let block = &mut func.blocks[rewrite.block];
+        let was = match rewrite.reads {
+            Reads::Compare(at) => {
+                let Instruction::Cmp { lhs, rhs, .. } = &mut block.instructions[at] else {
+                    continue;
+                };
+                let (value, constant) = if matches!(lhs, Operand::Value(_)) {
+                    (lhs, rhs)
+                } else {
+                    (rhs, lhs)
+                };
+                let was = trace.then(|| format!("{value:?} against {constant:?}"));
+                *value = Operand::Value(rewrite.next);
+                *constant = Operand::Const(rewrite.bound);
+                was
+            }
+            Reads::Itself => {
+                let Terminator::CondBranch { cond, .. } = &mut block.terminator else {
+                    continue;
+                };
+                let was = trace.then(|| format!("{cond:?} itself"));
+                let dest = Value(fresh);
+                fresh += 1;
+                *cond = Operand::Value(dest);
+                // The compare belongs to the statement the branch does.
+                let span = block
+                    .source_spans
+                    .last()
+                    .copied()
+                    .unwrap_or_else(crate::common::source::Span::dummy);
+                block.push_inst(
+                    Instruction::Cmp {
+                        dest,
+                        op: IrCmpOp::Ne,
+                        lhs: Operand::Value(rewrite.next),
+                        rhs: Operand::Const(rewrite.bound),
+                        ty: rewrite.ty,
+                    },
+                    span,
+                );
+                was
+            }
+        };
+        if let Some(was) = was {
+            lccc::cli::stderr_line(format_args!(
+                "[PHI] loop test of block {}: {} becomes v{} against {:?} (step in {}{})",
+                block.label.0,
+                was,
+                rewrite.next.0,
+                rewrite.bound,
+                if rewrite.step_in_block {
+                    "the block"
+                } else {
+                    "a dominating block"
+                },
+                if rewrite.cut_back {
+                    ", through a cast"
+                } else {
+                    ""
+                },
+            ));
+        }
+    }
+    func.next_value_id = func.next_value_id.max(fresh);
+    rewrites.len()
+}
+
 /// Module entry [`eliminate_phis`] with an explicit [`CopyOrderPolicy`].
 ///
 /// The production wrapper reads the opt-in gate; the unit tests pass a policy
@@ -719,6 +1176,7 @@ fn eliminate_phis_with_policy(
     next_block_id: &mut u32,
     policy: CopyOrderPolicy,
 ) {
+    retarget_loop_tests(func);
     // Phi-web coalescing (see `phi_webs`) on the targets that run the
     // cycle-accurate resolver; narrow-GPR targets keep separate webs for the
     // same register-economy reason they keep the legacy resolver.
@@ -1309,6 +1767,13 @@ impl BlockUses {
 /// shift chain) changes its meaning, and the existing temporary machinery in
 /// `emit_multi_phi_copies` is what handles those.
 ///
+/// (A shift chain in reader-first order, `a = b; b = t`, would be sound to
+/// absorb as well, and the check was once relaxed to take it. Over the 1,493
+/// files of the regression corpus and the 88 benchmark programs that changed
+/// none of 835 decisions: where a loop rotates values, something behind the
+/// loop reads them, and conditions 2 and 3 keep the back edge split whatever
+/// this one says. A weaker check that nothing exercises is not kept.)
+///
 /// A fifth condition lifts (2) and (3) for one kind of copy: one the block's
 /// exit edge makes as well (`copy_repeats_on_exit`). A bottom-tested loop
 /// whose result is read behind it has the same `s = s'` on its backedge and
@@ -1497,7 +1962,7 @@ fn resolve_self_loop_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
     let enabled = self_loop_hoist_enabled();
     let uses = BlockUses::from_blocks(&func.blocks);
     let buffered = std::mem::take(&mut ctx.self_loop_copies);
-    let debug = std::env::var("LCCC_DEBUG_PHI_HOIST").is_ok();
+    let debug = phi_hoist_trace();
     // Exit trampolines whose every copy was absorbed with the backedge's.
     let mut emptied: FxHashSet<usize> = FxHashSet::default();
 
@@ -2313,6 +2778,875 @@ mod tests {
         }
     }
 
+    /// `do { s += n; } while (--n);` as the mid-level passes leave it, the
+    /// test on the *old* counter:
+    ///
+    /// ```text
+    ///   b0:  br b1
+    ///   b1:  n  = phi [v1, b0], [n1, b1]        (v10, v12)
+    ///        s  = phi [0,  b0], [s1, b1]        (v11, v13)
+    ///        s1 = s + n
+    ///        n1 = n <step> k
+    ///        c  = n <op> bound                  (v14)
+    ///        br c, b1, b2
+    ///   b2:  ret s1
+    /// ```
+    fn countdown(ty: IrType, step: IrBinOp, by: i64, op: IrCmpOp, bound: i64) -> IrFunction {
+        let v = |n: u32| Operand::Value(Value(n));
+        let k = |c: i64| Operand::Const(IrConst::I64(c));
+        let phi = |dest: u32, first: Operand, next: u32| Instruction::Phi {
+            dest: Value(dest),
+            ty,
+            incoming: vec![(first, BlockId(0)), (v(next), BlockId(1))],
+        };
+        let mut func = IrFunction::new("f".to_string(), ty, vec![], false);
+        func.blocks = vec![
+            blk(0, Vec::new(), Terminator::Branch(BlockId(1))),
+            blk(
+                1,
+                vec![
+                    phi(10, v(1), 12),
+                    phi(11, k(0), 13),
+                    Instruction::BinOp {
+                        dest: Value(13),
+                        op: IrBinOp::Add,
+                        lhs: v(11),
+                        rhs: v(10),
+                        ty,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(12),
+                        op: step,
+                        lhs: v(10),
+                        rhs: k(by),
+                        ty,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(14),
+                        op,
+                        lhs: v(10),
+                        rhs: k(bound),
+                        ty,
+                    },
+                ],
+                cond(14, 1, 2),
+            ),
+            blk(2, Vec::new(), Terminator::Return(Some(v(13)))),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 3;
+        func
+    }
+
+    /// The loop's test: `(compared value, constant)`.
+    fn test_of(func: &IrFunction) -> (Operand, i64) {
+        let test = func.blocks[1]
+            .instructions
+            .iter()
+            .find(|inst| inst.dest() == Some(Value(14)));
+        let Some(Instruction::Cmp { lhs, rhs, .. }) = test else {
+            panic!("the test is a compare: {test:?}");
+        };
+        match (lhs, rhs) {
+            (value, Operand::Const(c)) | (Operand::Const(c), value) => {
+                (*value, c.to_i64().expect("an integer bound"))
+            }
+            other => panic!("one side is a constant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_latch_test_reads_the_value_it_hands_on() {
+        // `n != 1` with `n1 = n - 1`: `n1 != 0`.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 0));
+
+        // `n == 1`, the same test with the labels the other way round.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Eq, 1);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 0));
+
+        // Counting up to a bound: `i != 99` with `i1 = i + 1` is `i1 != 100`.
+        let mut func = countdown(IrType::I32, IrBinOp::Add, 1, IrCmpOp::Ne, 99);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 100));
+
+        // The constant on the left of the compare and of the addition.
+        let mut func = countdown(IrType::I32, IrBinOp::Add, 4, IrCmpOp::Ne, 96);
+        for inst in &mut func.blocks[1].instructions {
+            match inst {
+                Instruction::Cmp { lhs, rhs, .. } => std::mem::swap(lhs, rhs),
+                Instruction::BinOp {
+                    dest: Value(12),
+                    lhs,
+                    rhs,
+                    ..
+                } => std::mem::swap(lhs, rhs),
+                _ => {}
+            }
+        }
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 100));
+
+        // Once rewritten there is nothing left to rewrite.
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+    }
+
+    #[test]
+    fn the_moved_bound_wraps_as_the_type_does() {
+        // `n != 0` with `n1 = n - 1` in 8 unsigned bits: `n1 != 255`.
+        let mut func = countdown(IrType::U8, IrBinOp::Sub, 1, IrCmpOp::Ne, 0);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 255));
+
+        // The same in 8 signed bits is -1, and at the top of the range the
+        // sum comes round: `n != 127` with `n1 = n + 1` is `n1 != -128`.
+        let mut func = countdown(IrType::I8, IrBinOp::Sub, 1, IrCmpOp::Ne, 0);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), -1));
+        let mut func = countdown(IrType::I8, IrBinOp::Add, 1, IrCmpOp::Ne, 127);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), -128));
+
+        // Every pair of an 8-bit ring: the two tests agree on every value.
+        for bound in 0u8..=255 {
+            for by in [1u8, 2, 3, 127, 128, 255] {
+                for n in 0u8..=255 {
+                    assert_eq!(n != bound, n.wrapping_sub(by) != bound.wrapping_sub(by));
+                    assert_eq!(n != bound, n.wrapping_add(by) != bound.wrapping_add(by));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_latch_test_that_cannot_move_is_left_alone() {
+        let untouched = |func: &mut IrFunction, why: &str| {
+            let before = test_of(func);
+            assert_eq!(retarget_loop_tests(func), 0, "{why}");
+            assert_eq!(test_of(func), before, "{why}");
+        };
+
+        // An ordered test does not commute with an addition that wraps:
+        // `n <u 1` is not `n - 1 <u 0`.
+        for op in [IrCmpOp::Ult, IrCmpOp::Slt, IrCmpOp::Uge, IrCmpOp::Sgt] {
+            let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, op, 1);
+            untouched(&mut func, "an ordered test");
+        }
+
+        // The step is not a constant step of the compared value.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        if let Instruction::BinOp { op, .. } = &mut func.blocks[1].instructions[3] {
+            *op = IrBinOp::Mul;
+        }
+        untouched(&mut func, "a multiplication");
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        if let Instruction::BinOp { lhs, rhs, .. } = &mut func.blocks[1].instructions[3] {
+            // `1 - n` is not `n - 1`.
+            std::mem::swap(lhs, rhs);
+        }
+        untouched(&mut func, "the constant minus the counter");
+
+        // The step stands behind the test: the test cannot read it.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        func.blocks[1].instructions.swap(3, 4);
+        untouched(&mut func, "the step behind the test");
+
+        // Not single assignment: with the counter written again between the
+        // step and the test, the test reads another value than the step did.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        func.blocks[1].instructions.insert(4, cp(10, 11));
+        untouched(&mut func, "the counter written twice");
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        func.blocks[1].instructions.insert(4, cp(12, 11));
+        untouched(&mut func, "the step written twice");
+        // ... or in another block, or the test itself.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        func.blocks[2].instructions.push(cp(12, 11));
+        untouched(&mut func, "the step written again behind the loop");
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        func.blocks[0].instructions.push(cp(14, 1));
+        untouched(&mut func, "the test written twice");
+
+        // The compare is of another width than the counter. (The low half
+        // of `n - 1` is the low half of `n`, less one, so the identity
+        // would hold there too; what a compare of one width reads of a value
+        // of another is not this function's to say.)
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        if let Instruction::Cmp { ty, .. } = &mut func.blocks[1].instructions[4] {
+            *ty = IrType::U32;
+        }
+        untouched(&mut func, "a narrower compare");
+
+        // The compared value is not the phi the step is handed to.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        if let Instruction::Cmp { lhs, .. } = &mut func.blocks[1].instructions[4] {
+            *lhs = Operand::Value(Value(11));
+        }
+        untouched(&mut func, "another phi");
+
+        // The new bound would need a register where the old one did not:
+        // `n != 0x7fffffff` with `n1 = n + 1` in 64 bits.
+        let mut func = countdown(
+            IrType::I64,
+            IrBinOp::Add,
+            1,
+            IrCmpOp::Ne,
+            i64::from(i32::MAX),
+        );
+        untouched(&mut func, "a bound past 32 bits");
+        // In 32 bits every bound is an immediate.
+        let mut func = countdown(
+            IrType::U32,
+            IrBinOp::Add,
+            1,
+            IrCmpOp::Ne,
+            i64::from(i32::MAX),
+        );
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(
+            test_of(&func),
+            (Operand::Value(Value(12)), i64::from(i32::MAX) + 1)
+        );
+
+        // A float has no ring to do this in.
+        let mut func = countdown(IrType::F64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        untouched(&mut func, "a float");
+    }
+
+    /// A countdown over a body of several blocks, the step in block
+    /// `step_in` (1 the header, 2 or 3 an arm, 4 the latch) and the test in
+    /// the latch:
+    ///
+    /// ```text
+    ///   B0: br B1
+    ///   B1: n = phi [v1, B0], [n1, B4]      (10, 12)
+    ///       s = phi [0, B0], [s1, B4]       (11, 13)
+    ///       odd = n & 1                     (15)
+    ///       br odd, B2, B3
+    ///   B2: br B4
+    ///   B3: br B4
+    ///   B4: s1 = s + n
+    ///       c = n != 1                      (14)
+    ///       br c, B1, B5
+    ///   B5: ret s1
+    /// ```
+    fn countdown_over_arms(step_in: usize) -> IrFunction {
+        let ty = IrType::U64;
+        let v = |n: u32| Operand::Value(Value(n));
+        let k = |c: i64| Operand::Const(IrConst::I64(c));
+        let phi = |dest: u32, first: Operand, next: u32| Instruction::Phi {
+            dest: Value(dest),
+            ty,
+            incoming: vec![(first, BlockId(0)), (v(next), BlockId(4))],
+        };
+        let binop = |dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand| Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty,
+        };
+        let mut func = IrFunction::new("f".to_string(), ty, vec![], false);
+        func.blocks = vec![
+            blk(0, Vec::new(), Terminator::Branch(BlockId(1))),
+            blk(
+                1,
+                vec![
+                    phi(10, v(1), 12),
+                    phi(11, k(0), 13),
+                    binop(15, IrBinOp::And, v(10), k(1)),
+                ],
+                cond(15, 2, 3),
+            ),
+            blk(2, Vec::new(), Terminator::Branch(BlockId(4))),
+            blk(3, Vec::new(), Terminator::Branch(BlockId(4))),
+            blk(
+                4,
+                vec![
+                    binop(13, IrBinOp::Add, v(11), v(10)),
+                    Instruction::Cmp {
+                        dest: Value(14),
+                        op: IrCmpOp::Ne,
+                        lhs: v(10),
+                        rhs: k(1),
+                        ty,
+                    },
+                ],
+                cond(14, 1, 5),
+            ),
+            blk(5, Vec::new(), Terminator::Return(Some(v(13)))),
+        ];
+        // The step goes in front of whatever its block holds behind the phis.
+        let step = binop(12, IrBinOp::Sub, v(10), k(1));
+        let at = if step_in == 1 { 2 } else { 0 };
+        func.blocks[step_in].instructions.insert(at, step);
+        func.next_value_id = 64;
+        func.next_label = 6;
+        func
+    }
+
+    /// The test of [`countdown_over_arms`]: `(compared value, constant)`.
+    fn latch_test_over_arms(func: &IrFunction) -> (Operand, i64) {
+        let test = func.blocks[4]
+            .instructions
+            .iter()
+            .find(|inst| inst.dest() == Some(Value(14)));
+        let Some(Instruction::Cmp { lhs, rhs, .. }) = test else {
+            panic!("the test is a compare: {test:?}");
+        };
+        match (lhs, rhs) {
+            (value, Operand::Const(c)) | (Operand::Const(c), value) => {
+                (*value, c.to_i64().expect("an integer bound"))
+            }
+            other => panic!("one side is a constant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_latch_test_reads_a_step_made_in_a_dominating_block() {
+        // The step at the top of the body, the test at its bottom: the
+        // header dominates the latch, the step has run when the test does.
+        let mut func = countdown_over_arms(1);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(latch_test_over_arms(&func), (Operand::Value(Value(12)), 0));
+        // In the latch itself, ahead of the test.
+        let mut func = countdown_over_arms(4);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(latch_test_over_arms(&func), (Operand::Value(Value(12)), 0));
+        // Behind the test it has not run yet.
+        let mut func = countdown_over_arms(4);
+        let step = func.blocks[4].instructions.remove(0);
+        func.blocks[4].instructions.push(step);
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert_eq!(latch_test_over_arms(&func), (Operand::Value(Value(10)), 1));
+    }
+
+    #[test]
+    fn a_latch_test_is_not_moved_onto_a_step_the_latch_does_not_hand_on() {
+        // The step stands in one arm only, so it does not dominate the
+        // latch and cannot be what the latch hands the phi: a function in
+        // single-assignment form hands on a merge of the two arms. With the
+        // merge in place the test has no step to read.
+        let mut func = countdown_over_arms(2);
+        func.blocks[4].instructions.insert(
+            0,
+            Instruction::Phi {
+                dest: Value(16),
+                ty: IrType::U64,
+                incoming: vec![
+                    (Operand::Value(Value(12)), BlockId(2)),
+                    (Operand::Value(Value(10)), BlockId(3)),
+                ],
+            },
+        );
+        if let Instruction::Phi { incoming, .. } = &mut func.blocks[1].instructions[0] {
+            incoming[1].0 = Operand::Value(Value(16));
+        }
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert_eq!(latch_test_over_arms(&func), (Operand::Value(Value(10)), 1));
+
+        // The test stands in another block than the branch that reads it:
+        // nothing says the step has run there.
+        let mut func = countdown_over_arms(4);
+        let test = func.blocks[4].instructions.pop().expect("the test");
+        func.blocks[1].instructions.push(test);
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+    }
+
+    /// The branch of [`countdown`]'s loop: the value it reads, and the
+    /// compare that defines that value if one does.
+    fn branch_of(func: &IrFunction) -> (Value, Option<&Instruction>) {
+        let Terminator::CondBranch {
+            cond: Operand::Value(cond),
+            ..
+        } = &func.blocks[1].terminator
+        else {
+            panic!("the loop ends in a branch on a value");
+        };
+        let test = func.blocks[1]
+            .instructions
+            .iter()
+            .find(|inst| inst.dest() == Some(*cond) && matches!(inst, Instruction::Cmp { .. }));
+        (*cond, test)
+    }
+
+    /// [`countdown`] with the branch on the counter itself, `while (n--)`
+    /// as a `do` loop: no compare, the branch asks whether `n` is zero.
+    fn countdown_on_itself(ty: IrType, step: IrBinOp, by: i64) -> IrFunction {
+        let mut func = countdown(ty, step, by, IrCmpOp::Ne, 0);
+        let test = func.blocks[1].instructions.pop();
+        assert!(matches!(test, Some(Instruction::Cmp { .. })));
+        func.blocks[1].terminator = cond(10, 1, 2);
+        func
+    }
+
+    #[test]
+    fn a_branch_on_the_counter_itself_gets_a_compare_of_the_stepped_one() {
+        // `n != 0` with `n1 = n - 1`: `n1 != -1`, in a compare that did not
+        // exist, at the end of the block, under a name nothing else has.
+        let mut func = countdown_on_itself(IrType::U64, IrBinOp::Sub, 1);
+        let names_before = func.next_value_id;
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        let (branch, test) = branch_of(&func);
+        assert!(branch.0 >= names_before && func.next_value_id > branch.0);
+        assert!(
+            matches!(
+                test,
+                Some(Instruction::Cmp {
+                    op: IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(12)),
+                    rhs: Operand::Const(k),
+                    ty: IrType::U64,
+                    ..
+                }) if k.to_i64() == Some(-1)
+            ),
+            "{test:?}"
+        );
+        assert!(matches!(
+            func.blocks[1].instructions.last(),
+            Some(Instruction::Cmp { dest, .. }) if *dest == branch
+        ));
+        // The branch keeps its two ways out: nonzero stays in the loop.
+        assert!(matches!(
+            func.blocks[1].terminator,
+            Terminator::CondBranch {
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+                ..
+            }
+        ));
+        // The compare reads the stepped counter now: nothing more to do.
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+
+        // Counting up by three in 8 unsigned bits: `n != 0` is `n1 != 3`;
+        // down by one it is `n1 != 255`.
+        let mut func = countdown_on_itself(IrType::U8, IrBinOp::Add, 3);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        let (_, test) = branch_of(&func);
+        assert!(
+            matches!(test, Some(Instruction::Cmp { rhs: Operand::Const(k), .. }) if k.to_i64() == Some(3)),
+            "{test:?}"
+        );
+        let mut func = countdown_on_itself(IrType::U8, IrBinOp::Sub, 1);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        let (_, test) = branch_of(&func);
+        assert!(
+            matches!(test, Some(Instruction::Cmp { rhs: Operand::Const(k), .. }) if k.to_i64() == Some(255)),
+            "{test:?}"
+        );
+
+        // A step no 32-bit immediate holds, where the test was free.
+        let mut func = countdown_on_itself(IrType::U64, IrBinOp::Sub, 1 << 40);
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert!(matches!(branch_of(&func), (Value(10), None)));
+        // A float is zero in two ways and steps in no ring.
+        let mut func = countdown_on_itself(IrType::F64, IrBinOp::Sub, 1);
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        // The branch reads a value that is no phi: not a loop's counter.
+        let mut func = countdown_on_itself(IrType::U64, IrBinOp::Sub, 1);
+        func.blocks[1].terminator = cond(13, 1, 2);
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert!(matches!(branch_of(&func), (Value(13), None)));
+    }
+
+    /// [`countdown`] over a counter of type `narrow` whose step is made in
+    /// `wide` and cast back, as C's promotion leaves `n--`:
+    ///
+    /// ```text
+    ///   w  = n - by       (v15, in `wide`)
+    ///   n1 = (narrow)w    (v12)
+    /// ```
+    fn countdown_through_cast(narrow: IrType, wide: IrType, by: i64, bound: i64) -> IrFunction {
+        let mut func = countdown(narrow, IrBinOp::Sub, by, IrCmpOp::Ne, bound);
+        let insts = &mut func.blocks[1].instructions;
+        match &mut insts[3] {
+            Instruction::BinOp { dest, ty, .. } => {
+                *dest = Value(15);
+                *ty = wide;
+            }
+            other => panic!("the step: {other:?}"),
+        }
+        insts.insert(
+            4,
+            Instruction::Cast {
+                dest: Value(12),
+                src: Operand::Value(Value(15)),
+                from_ty: wide,
+                to_ty: narrow,
+            },
+        );
+        func
+    }
+
+    #[test]
+    fn a_step_made_in_a_wider_type_and_cut_back_is_the_same_step() {
+        // `unsigned char n; do … while (n-- != 1);`
+        let mut func = countdown_through_cast(IrType::U8, IrType::I32, 1, 1);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 0));
+        // The bound wraps in the counter's width, not in the sum's:
+        // `n != 0` with a step of 3 is `n1 != 253`.
+        let mut func = countdown_through_cast(IrType::U8, IrType::I32, 3, 0);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 253));
+        let mut func = countdown_through_cast(IrType::I16, IrType::I32, 1, -32768);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 32767));
+        // The same width under the other sign is all the bits.
+        let mut func = countdown_through_cast(IrType::U32, IrType::I32, 1, 1);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 0));
+        // The branch on the counter itself, through the cast.
+        let mut func = countdown_through_cast(IrType::U16, IrType::I32, 1, 0);
+        let test = func.blocks[1].instructions.pop();
+        assert!(matches!(test, Some(Instruction::Cmp { .. })));
+        func.blocks[1].terminator = cond(10, 1, 2);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        let (_, test) = branch_of(&func);
+        assert!(
+            matches!(
+                test,
+                Some(Instruction::Cmp {
+                    lhs: Operand::Value(Value(12)),
+                    rhs: Operand::Const(k),
+                    ty: IrType::U16,
+                    ..
+                }) if k.to_i64() == Some(65535)
+            ),
+            "{test:?}"
+        );
+
+        // Every counter of 8 bits, every step and bound: cutting the wide
+        // sum back gives the value the test is moved onto.
+        for n in 0u8..=255 {
+            for by in [1i32, 3, 7, 200, 256, 1000] {
+                let next = (i32::from(n) - by) as u8;
+                for bound in [0u8, 1, 5, 254, 255] {
+                    let moved = (i64::from(bound) - i64::from(by)) as u8;
+                    assert_eq!(n != bound, next != moved, "{n} - {by} against {bound}");
+                }
+            }
+        }
+
+        let untouched = |func: &mut IrFunction, why: &str| {
+            let before = test_of(func);
+            assert_eq!(retarget_loop_tests(func), 0, "{why}");
+            assert_eq!(test_of(func), before, "{why}");
+        };
+        // A cast to a wider type makes up the high bits: `(u32)(u8)(n - 1)`
+        // is not `n - 1` in 32 bits.
+        let mut func = countdown_through_cast(IrType::U32, IrType::U8, 1, 1);
+        untouched(&mut func, "a sum narrower than the counter");
+        // A cast that reads fewer bits of the sum than the counter has:
+        // `(u32)(u8)w` again, spelled in the cast alone.
+        let mut func = countdown_through_cast(IrType::U32, IrType::I64, 1, 1);
+        if let Instruction::Cast { from_ty, .. } = &mut func.blocks[1].instructions[4] {
+            *from_ty = IrType::U8;
+        }
+        untouched(&mut func, "a cast that reads a byte of the sum");
+        // One that reads more than it keeps is the same cut: the sum in
+        // 32 bits, read as 16, kept as 8.
+        let mut func = countdown_through_cast(IrType::U8, IrType::I32, 1, 1);
+        if let Instruction::Cast { from_ty, .. } = &mut func.blocks[1].instructions[4] {
+            *from_ty = IrType::I16;
+        }
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 0));
+        // The cast is to another width than the counter's.
+        let mut func = countdown_through_cast(IrType::U8, IrType::I32, 1, 1);
+        if let Instruction::Cast { to_ty, .. } = &mut func.blocks[1].instructions[4] {
+            *to_ty = IrType::U16;
+        }
+        untouched(&mut func, "a cast to another width than the counter's");
+        // A sum of 128 bits is beyond the constants here.
+        let mut func = countdown_through_cast(IrType::U64, IrType::I128, 1, 1);
+        untouched(&mut func, "a sum of 128 bits");
+        // The sum behind the cast is of something else.
+        let mut func = countdown_through_cast(IrType::U8, IrType::I32, 1, 1);
+        if let Instruction::BinOp { lhs, .. } = &mut func.blocks[1].instructions[3] {
+            *lhs = Operand::Value(Value(11));
+        }
+        untouched(&mut func, "a sum of another value");
+        // The sum has two definitions.
+        let mut func = countdown_through_cast(IrType::U8, IrType::I32, 1, 1);
+        func.blocks[2].instructions.push(cp(15, 11));
+        untouched(&mut func, "the sum written twice");
+    }
+
+    /// [`countdown`] over a counter of type `narrow` that is cast first and
+    /// stepped then, as the narrowing passes leave `n--`:
+    ///
+    /// ```text
+    ///   t  = (to)n        (v15, the cast reading `n` as `from`)
+    ///   n1 = t - by       (v12, in `sum`)
+    /// ```
+    fn countdown_cast_first(
+        narrow: IrType,
+        (from, to): (IrType, IrType),
+        sum: IrType,
+        by: i64,
+        bound: i64,
+    ) -> IrFunction {
+        let mut func = countdown(narrow, IrBinOp::Sub, by, IrCmpOp::Ne, bound);
+        let insts = &mut func.blocks[1].instructions;
+        match &mut insts[3] {
+            Instruction::BinOp { lhs, ty, .. } => {
+                *lhs = Operand::Value(Value(15));
+                *ty = sum;
+            }
+            other => panic!("the step: {other:?}"),
+        }
+        insts.insert(
+            3,
+            Instruction::Cast {
+                dest: Value(15),
+                src: Operand::Value(Value(10)),
+                from_ty: from,
+                to_ty: to,
+            },
+        );
+        func
+    }
+
+    #[test]
+    fn a_counter_cast_first_and_stepped_then_is_the_same_step() {
+        // `(u16)n - 1`, the cast reading `n` as the `int` it was promoted
+        // to: the shape of `unsigned short n; n-- != 1` at -O2.
+        let mut func =
+            countdown_cast_first(IrType::U16, (IrType::I32, IrType::U16), IrType::U16, 1, 1);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 0));
+        // Widened, stepped in the wide type, and handed back by a cast.
+        let mut func =
+            countdown_cast_first(IrType::U8, (IrType::U8, IrType::I32), IrType::I32, 3, 0);
+        match &mut func.blocks[1].instructions[4] {
+            Instruction::BinOp { dest, .. } => *dest = Value(16),
+            other => panic!("the step: {other:?}"),
+        }
+        func.blocks[1].instructions.insert(
+            5,
+            Instruction::Cast {
+                dest: Value(12),
+                src: Operand::Value(Value(16)),
+                from_ty: IrType::I32,
+                to_ty: IrType::U8,
+            },
+        );
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), 253));
+
+        let untouched = |func: &mut IrFunction, why: &str| {
+            let before = test_of(func);
+            assert_eq!(retarget_loop_tests(func), 0, "{why}");
+            assert_eq!(test_of(func), before, "{why}");
+        };
+        // `(u32)(u8)n - 1`: the cast reads one byte of a counter of four.
+        let mut func =
+            countdown_cast_first(IrType::U32, (IrType::U8, IrType::U32), IrType::U32, 1, 1);
+        untouched(&mut func, "a cast that reads a byte of the counter");
+        // The step is made in fewer bits than the counter has.
+        let mut func =
+            countdown_cast_first(IrType::U32, (IrType::U32, IrType::U16), IrType::U16, 1, 1);
+        untouched(&mut func, "a step in half the counter's width");
+        // More links than are followed.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        let insts = &mut func.blocks[1].instructions;
+        let Instruction::BinOp { lhs, .. } = &mut insts[3] else {
+            panic!("the step");
+        };
+        *lhs = Operand::Value(Value(40 + MAX_STEP_LINKS as u32));
+        for link in 0..=MAX_STEP_LINKS as u32 {
+            let from = if link == 0 { 10 } else { 40 + link };
+            insts.insert(
+                3,
+                Instruction::BinOp {
+                    dest: Value(41 + link),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(from)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U64,
+                },
+            );
+        }
+        untouched(&mut func, "a chain longer than is followed");
+    }
+
+    /// `while (n--) …;` before rotation: step and test at the top, the back
+    /// edge from the bottom.
+    ///
+    /// ```text
+    ///   B0: br B1
+    ///   B1: n  = phi [v1, B0], [n1, B2]     (10, 12)
+    ///       n1 = n - 1
+    ///       c  = n != 0                     (14)
+    ///       br c, B2, B3
+    ///   B2: br B1
+    ///   B3: ret n1
+    /// ```
+    fn while_post_decrement() -> IrFunction {
+        let ty = IrType::U64;
+        let v = |n: u32| Operand::Value(Value(n));
+        let k = |c: i64| Operand::Const(IrConst::I64(c));
+        let mut func = IrFunction::new("f".to_string(), ty, vec![], false);
+        func.blocks = vec![
+            blk(0, Vec::new(), Terminator::Branch(BlockId(1))),
+            blk(
+                1,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(10),
+                        ty,
+                        incoming: vec![(v(1), BlockId(0)), (v(12), BlockId(2))],
+                    },
+                    Instruction::BinOp {
+                        dest: Value(12),
+                        op: IrBinOp::Sub,
+                        lhs: v(10),
+                        rhs: k(1),
+                        ty,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(14),
+                        op: IrCmpOp::Ne,
+                        lhs: v(10),
+                        rhs: k(0),
+                        ty,
+                    },
+                ],
+                cond(14, 2, 3),
+            ),
+            blk(2, Vec::new(), Terminator::Branch(BlockId(1))),
+            blk(3, Vec::new(), Terminator::Return(Some(v(12)))),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 4;
+        func
+    }
+
+    #[test]
+    fn a_header_test_reads_the_step_made_ahead_of_it() {
+        // The header hands the phi nothing; it has computed what the latch
+        // will, ahead of its test.
+        let mut func = while_post_decrement();
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        assert_eq!(test_of(&func), (Operand::Value(Value(12)), -1));
+
+        // The same with the branch on the counter itself.
+        let mut func = while_post_decrement();
+        func.blocks[1].instructions.pop();
+        func.blocks[1].terminator = cond(10, 2, 3);
+        assert_eq!(retarget_loop_tests(&mut func), 1);
+        let (cond_value, test) = branch_of(&func);
+        assert!(cond_value != Value(10));
+        assert!(
+            matches!(
+                test,
+                Some(Instruction::Cmp {
+                    op: IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(12)),
+                    rhs: Operand::Const(k),
+                    ..
+                }) if k.to_i64() == Some(-1)
+            ),
+            "{test:?}"
+        );
+
+        // The step behind the test, in a block that does not hand it on:
+        // it has not run when the test does.
+        let mut func = while_post_decrement();
+        func.blocks[1].instructions.swap(1, 2);
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert_eq!(test_of(&func), (Operand::Value(Value(10)), 0));
+
+        // The step in the latch, which the header neither is nor follows.
+        let mut func = while_post_decrement();
+        let step = func.blocks[1].instructions.remove(1);
+        func.blocks[2].instructions.push(step);
+        if let Terminator::Return(value) = &mut func.blocks[3].terminator {
+            *value = Some(Operand::Value(Value(10)));
+        }
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert_eq!(test_of(&func), (Operand::Value(Value(10)), 0));
+
+        // Two values on their way to the phi, both made ahead of the test:
+        // no telling which one the test is about.
+        let mut func = while_post_decrement();
+        func.blocks[1].instructions.insert(
+            2,
+            Instruction::BinOp {
+                dest: Value(16),
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(Value(10)),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::U64,
+            },
+        );
+        func.blocks
+            .push(blk(4, Vec::new(), Terminator::Branch(BlockId(1))));
+        if let Instruction::Phi { incoming, .. } = &mut func.blocks[1].instructions[0] {
+            incoming.push((Operand::Value(Value(16)), BlockId(4)));
+        }
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert_eq!(test_of(&func), (Operand::Value(Value(10)), 0));
+
+        // The block hands the phi a constant: that is no step.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        if let Instruction::Phi { incoming, .. } = &mut func.blocks[1].instructions[0] {
+            incoming[1].0 = Operand::Const(IrConst::I64(7));
+        }
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert_eq!(test_of(&func), (Operand::Value(Value(10)), 1));
+    }
+
+    #[test]
+    fn a_value_an_inline_asm_statement_writes_has_that_definition_too() {
+        // `next` is also the output of an asm statement between the step
+        // and the test: it is not `n - 1` when the test runs.
+        let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+        func.blocks[1].instructions.insert(
+            4,
+            Instruction::InlineAsm {
+                template: String::new(),
+                outputs: vec![("=r".to_string(), Value(12), None)],
+                inputs: Vec::new(),
+                clobbers: Vec::new(),
+                operand_types: vec![IrType::U64],
+                goto_labels: Vec::new(),
+                input_symbols: Vec::new(),
+                seg_overrides: Vec::new(),
+            },
+        );
+        assert_eq!(retarget_loop_tests(&mut func), 0);
+        assert_eq!(test_of(&func), (Operand::Value(Value(10)), 1));
+    }
+
+    /// The point of it: with the test on the handed-on value the phi's copy
+    /// goes into the block and the back edge is not split. `do s += n; while
+    /// (--n);` lowers to one block that branches to itself.
+    #[test]
+    fn a_countdown_loop_keeps_no_block_on_its_back_edge() {
+        for policy in [CopyOrderPolicy::Acyclic, CopyOrderPolicy::Legacy] {
+            let mut func = countdown(IrType::U64, IrBinOp::Sub, 1, IrCmpOp::Ne, 1);
+            let mut next_block_id = 3;
+            eliminate_phis_with_policy(&mut func, &mut next_block_id, policy);
+            assert_eq!(func.blocks.len(), 3, "{policy:?}: no block was added");
+            assert!(
+                matches!(
+                    func.blocks[1].terminator,
+                    Terminator::CondBranch {
+                        true_label: BlockId(1),
+                        false_label: BlockId(2),
+                        ..
+                    }
+                ),
+                "{policy:?}: {:?}",
+                func.blocks[1].terminator
+            );
+        }
+    }
+
     #[test]
     fn absorbs_block_local_commuting_copies() {
         let blocks = rotated_loop();
@@ -2541,6 +3875,10 @@ mod tests {
         // A swap: each destination is also a source, so sequentialising changes
         // the meaning.
         assert!(!hoists(&blocks, 0, &[cp(10, 11), cp(11, 10)]));
+        // A shift chain, in either order: sound reader-first, and refused
+        // all the same (see `self_loop_copies_can_hoist`).
+        assert!(!hoists(&blocks, 0, &[cp(10, 11), cp(11, 13)]));
+        assert!(!hoists(&blocks, 0, &[cp(11, 13), cp(10, 11)]));
     }
 
     /// A destination read that follows its source's definition is still safe to
