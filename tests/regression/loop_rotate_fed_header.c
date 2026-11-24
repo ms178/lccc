@@ -26,6 +26,9 @@
  *     which need no moving;
  *   - ordered tests on the old value (`while (n-- > 0)`), which cannot be
  *     moved and are left top-tested: they still have to be right;
+ *   - bodies that read the value from before the header's step, beside the
+ *     stepped one or alone: rotated, such a loop would go round with both
+ *     values, so it is left top-tested as well;
  *   - a header of several instructions, two values leaving it;
  *   - a body of several blocks, with `continue` (two back edges) and
  *     `break` (an exit that does not pass the header);
@@ -155,6 +158,33 @@ NOINLINE static struct seen post_inc_lt(unsigned i, unsigned n)
         s.trips++;
     }
     s.left = i;
+    return s;
+}
+
+/* --- bodies that read the value from before the step --------------------- */
+
+NOINLINE static struct seen old_and_new(unsigned long n)
+{
+    struct seen s = { 0, 0, 0 };
+    unsigned long before;
+    while (before = n, n-- != 0) {
+        s.sum = mix(mix(s.sum, before), n);
+        s.trips++;
+    }
+    s.left = n ^ (before << 32);
+    return s;
+}
+
+NOINLINE static struct seen halves_of_old(u64 x)
+{
+    struct seen s = { 0, 0, 0 };
+    u64 half;
+    while ((half = x >> 1) != 0) {
+        s.sum = mix(s.sum, x);
+        x = half;
+        s.trips++;
+    }
+    s.left = x ^ (half << 1);
     return s;
 }
 
@@ -353,6 +383,7 @@ int main(void)
         show("pre_inc_lt", n, pre_inc_lt(-3, (int)n - 2));
         show("post_dec_gt", n, post_dec_gt((long)n));
         show("post_inc_lt", n, post_inc_lt(4u, 4u + (unsigned)n));
+        show("old_and_new", n, old_and_new((unsigned long)n));
         show("two_at_once", n, two_at_once(1000ul, (unsigned long)n));
         show("derived", n, derived((unsigned)n, 5u));
         show("with_continue", n, with_continue((unsigned long)n));
@@ -389,6 +420,11 @@ int main(void)
     show("halve", 2, halve(2));
     show("halve", -1, halve(~0ULL));
     show("halve", 12345, halve(0x123456789abcdefULL));
+    show("halves_of_old", 0, halves_of_old(0));
+    show("halves_of_old", 1, halves_of_old(1));
+    show("halves_of_old", 2, halves_of_old(2));
+    show("halves_of_old", -1, halves_of_old(~0ULL));
+    show("halves_of_old", 12345, halves_of_old(0x123456789abcdefULL));
     /* A narrow counter that starts at zero leaves all ones and runs no trip;
      * one that starts at its top value runs that many. */
     show("while_post_dec_u8", 255, while_post_dec_u8(255));

@@ -1304,40 +1304,66 @@ const MAX_FED_HEADER_INSTS: usize = 8;
 ///    Without that, inversion takes the loop and is the better tool: its
 ///    copy of the test starts a live range of its own, and its two folds
 ///    (the value bound, the down-counter) apply to what it rotated.
-/// 4. With `settled`: no header phi is read in the header behind the
-///    instruction that computes its next value. In the rotated loop such
-///    a read stands at the bottom next to the new value and keeps the old
-///    one alive beside it; the copy the phi becomes then cannot go into
-///    the latch, the back edge gets a block of its own, and the loop has
-///    two branches a trip again plus that block's copies of *every*
-///    carried value: worse than the top-tested loop it was. The test of
+/// 4. With `settled`: a header phi whose next value the header computes is
+///    read by nothing behind that computation: not later in the header,
+///    not in the body, not behind the loop, not by another phi. The
+///    rotated loop goes round with the *next* value, and each such reader
+///    keeps the old one alive beside it: a second register through the
+///    loop and a copy a trip between the two. Where the reader stands at
+///    the bottom next to the new value, or behind the exit, the copy
+///    cannot go into the latch either; the back edge then gets a block of
+///    its own, and the loop has two branches a trip again plus that
+///    block's copies of *every* carried value: worse than the top-tested
+///    loop it was. (A loop copying eight bytes a trip that steps its
+///    pointer at the top and loads through the old one cost
+///    `expat_siphash24` 5% of its instructions that way.) The test of
 ///    `while (n--)` is such a read. `retarget_loop_tests` moves it onto
 ///    the stepped value where it can (an equality test), which is why the
 ///    question is asked again after it ran; `while (n-- > 0)` on a signed
 ///    counter, where it cannot, stays top-tested.
-fn header_feeds_the_loop(func: &IrFunction, lp: &NaturalLoop, settled: bool) -> bool {
-    let Some(header) = func.blocks.get(lp.header) else {
+/// Clause 1 of [`header_feeds_the_loop`], which a block answers alone: it
+/// starts with a phi, goes on with at most [`MAX_FED_HEADER_INSTS`] pure
+/// instructions that are no load, at least one of which defines a value,
+/// and ends in a conditional branch (the test: a rotation needs one). Most
+/// functions have no such block, and for them [`rotate_fed_loops`] is over
+/// before it has looked for a loop.
+fn may_be_fed_header(block: &BasicBlock) -> bool {
+    if !matches!(block.instructions.first(), Some(Instruction::Phi { .. }))
+        || !matches!(block.terminator, Terminator::CondBranch { .. })
+    {
         return false;
-    };
-    // 1. Each value the header computes, and where.
-    let mut computed: FxHashMap<u32, usize> = FxHashMap::default();
+    }
     let mut pure = 0usize;
-    for (at, inst) in header.instructions.iter().enumerate() {
+    let mut defines = false;
+    for inst in &block.instructions {
         match inst {
             Instruction::Phi { .. } => {}
             Instruction::Load { .. } => return false,
             other if is_duplicable(other) => {
                 pure += 1;
-                if let Some(dest) = other.dest() {
-                    computed.insert(dest.0, at);
-                }
+                defines |= other.dest().is_some();
             }
             _ => return false,
         }
     }
-    if computed.is_empty() || pure > MAX_FED_HEADER_INSTS {
+    defines && pure <= MAX_FED_HEADER_INSTS
+}
+
+fn header_feeds_the_loop(func: &IrFunction, lp: &NaturalLoop, settled: bool) -> bool {
+    let Some(header) = func.blocks.get(lp.header) else {
+        return false;
+    };
+    // 1. Each value the header computes, and where.
+    if !may_be_fed_header(header) {
         return false;
     }
+    let computed: FxHashMap<u32, usize> = header
+        .instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| !matches!(inst, Instruction::Phi { .. }))
+        .filter_map(|(at, inst)| inst.dest().map(|dest| (dest.0, at)))
+        .collect();
     // 2.
     let jumps_back = lp.body.iter().any(|&b| {
         b != lp.header
@@ -1371,8 +1397,10 @@ fn header_feeds_the_loop(func: &IrFunction, lp: &NaturalLoop, settled: bool) -> 
     if !read_outside {
         return false;
     }
-    // 4.
+    // 4. The phis the header steps, each with the place of its step (the
+    // first, where it is handed more than one).
     if settled {
+        let mut stepped: FxHashMap<u32, usize> = FxHashMap::default();
         for inst in &header.instructions {
             let Instruction::Phi { dest, incoming, .. } = inst else {
                 continue;
@@ -1384,17 +1412,30 @@ fn header_feeds_the_loop(func: &IrFunction, lp: &NaturalLoop, settled: bool) -> 
                     Operand::Const(_) => None,
                 })
                 .min();
-            let Some(next_at) = next_at else {
-                continue;
-            };
-            let mut read_behind = false;
-            let mut see = |v: u32| read_behind |= v == dest.0;
-            for later in &header.instructions[next_at + 1..] {
-                later.for_each_used_value(&mut see);
+            if let Some(next_at) = next_at {
+                stepped.insert(dest.0, next_at);
             }
-            header.terminator.for_each_used_value(&mut see);
-            if read_behind {
-                return false;
+        }
+        if !stepped.is_empty() {
+            for (index, block) in func.blocks.iter().enumerate() {
+                let mut read_behind = false;
+                for (at, inst) in block.instructions.iter().enumerate() {
+                    // Up to its step, in the header, the old value is the
+                    // only one there is. A phi reads on an edge, behind
+                    // whatever the block it comes from computed.
+                    let ahead = index == lp.header && !matches!(inst, Instruction::Phi { .. });
+                    inst.for_each_used_value(|v| {
+                        if let Some(&next_at) = stepped.get(&v) {
+                            read_behind |= !(ahead && at <= next_at);
+                        }
+                    });
+                }
+                block
+                    .terminator
+                    .for_each_used_value(|v| read_behind |= stepped.contains_key(&v));
+                if read_behind {
+                    return false;
+                }
             }
         }
     }
@@ -1402,7 +1443,7 @@ fn header_feeds_the_loop(func: &IrFunction, lp: &NaturalLoop, settled: bool) -> 
 }
 
 /// Rotate the loops that would keep their test at the top for good. Returns
-/// the number of loops rotated. Part of [`RotatePolicy::Profit`].
+/// the number of loops rotated. Run whenever rotation is not off.
 ///
 /// A loop is bottom-tested in the end by `loop_invert`, after phi
 /// elimination, which copies the header's handful of pure instructions into
@@ -1411,9 +1452,10 @@ fn header_feeds_the_loop(func: &IrFunction, lp: &NaturalLoop, settled: bool) -> 
 /// a reader the latch's copy. `while (n--)`, `while (--i >= 0)`, `while
 /// (i++ != n)` and `for (;;) { x = step(x); if (!x) break; … }` all compute
 /// at the top what the body reads, the stepped counter, and stayed
-/// top-tested: a branch not taken and a jump back on every trip, which on a
-/// byte copy is 0.51 s against 0.37 s for the same loop with its test at
-/// the bottom (819 million trips, this host).
+/// top-tested: a branch not taken and a jump back on every trip. On
+/// `while (n--) *d++ = *s++;` (819 million trips, this host, best of 9)
+/// that loop took 0.405 s as it was, 0.377 s once its test read the
+/// stepped counter, and takes 0.348 s rotated.
 ///
 /// Here every reader can still be given its definition. The pass runs
 /// behind everything that looks at a loop's shape, so none of those sees a
@@ -1424,7 +1466,7 @@ fn header_feeds_the_loop(func: &IrFunction, lp: &NaturalLoop, settled: bool) -> 
 /// first (`retarget_loop_tests`), which is what makes `while (n--)` one of
 /// them.
 pub(crate) fn rotate_fed_loops(func: &mut IrFunction) -> usize {
-    if func.blocks.len() < 2 {
+    if func.blocks.len() < 2 || !func.blocks.iter().any(may_be_fed_header) {
         return 0;
     }
     let (_, loops) = loops_innermost_first(func);
@@ -1435,19 +1477,18 @@ pub(crate) fn rotate_fed_loops(func: &mut IrFunction) -> usize {
         return 0;
     }
     crate::ir::mem2reg::phi_eliminate::retarget_loop_tests(func);
+    let done = rotate_loops_where(func, |func, lp| header_feeds_the_loop(func, lp, true));
+    // Said of the rotations made, not of the loops picked: `plan_rotation`
+    // may still refuse one, and says so itself.
     let debug = rotate_debug();
-    let done = rotate_loops_where(func, |func, lp| {
-        let feeds = header_feeds_the_loop(func, lp, true);
-        if feeds {
-            trace!(
-                debug,
-                "{}: header .LBB{}: computes what the loop reads: rotated so that it is bottom-tested",
-                func.name,
-                func.blocks[lp.header].label.0
-            );
-        }
-        feeds
-    });
+    for rotated in &done {
+        trace!(
+            debug,
+            "{}: header .LBB{}: computes what the loop reads: rotated so that it is bottom-tested",
+            func.name,
+            rotated.guard.0
+        );
+    }
     done.len()
 }
 
@@ -1476,9 +1517,10 @@ pub(crate) fn rotate_fed_loops(func: &mut IrFunction) -> usize {
 ///
 /// The test is a filter for [`rotate_for_hoisting`], not its decision: it
 /// keeps the trial rotation, which copies the function, away from loops in
-/// which there is nothing to try. Over the regression corpus (1,493 files)
-/// the two exclusions leave 1,161 of the 2,232 trials the clauses above ask
-/// for, and no loop that pays is among the ones they drop.
+/// which there is nothing to try. Measured when it was written, over the
+/// 1,493 files the regression corpus then had: the two exclusions left
+/// 1,161 of the 2,232 trials the clauses above ask for, and no loop that
+/// pays was among the ones they dropped.
 fn has_guarded_hoist_candidate(func: &IrFunction, cfg: &CfgAnalysis, lp: &NaturalLoop) -> bool {
     let latches: Vec<usize> = cfg
         .preds

@@ -927,11 +927,46 @@ fn offset_from(
 ///   the three agree on which bits there are.
 /// * the new constant is no harder to load than the old one.
 pub(crate) fn retarget_loop_tests(func: &mut IrFunction) -> usize {
-    let has_phi = func
-        .blocks
-        .iter()
-        .any(|block| matches!(block.instructions.first(), Some(Instruction::Phi { .. })));
-    if !has_phi {
+    // A function is looked at closely only if one of its branches tests a
+    // phi: directly, or through an equality compare in the branch's own
+    // block. Most do not, and are done with here, before the definitions of
+    // every value are looked up.
+    let mut phis: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::Phi { dest, .. } = inst else {
+                break;
+            };
+            phis.insert(dest.0);
+        }
+    }
+    let tests_a_phi = !phis.is_empty()
+        && func.blocks.iter().any(|block| {
+            let Terminator::CondBranch {
+                cond: Operand::Value(cond),
+                ..
+            } = &block.terminator
+            else {
+                return false;
+            };
+            phis.contains(&cond.0)
+                || block.instructions.iter().any(|inst| {
+                    matches!(
+                        inst,
+                        Instruction::Cmp {
+                            dest,
+                            op: IrCmpOp::Eq | IrCmpOp::Ne,
+                            lhs,
+                            rhs,
+                            ..
+                        } if dest == cond
+                            && [lhs, rhs].iter().any(
+                                |side| matches!(side, Operand::Value(v) if phis.contains(&v.0)),
+                            )
+                    )
+                })
+        });
+    if !tests_a_phi {
         return 0;
     }
     let defs = DefSites::of(func);

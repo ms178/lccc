@@ -32,9 +32,13 @@
 #      what the body reads (`while (n--)`), which machine-level inversion
 #      cannot bottom-test. Rotated late, it is one block closed by one
 #      conditional branch, its counter stepped in place; with rotation off
-#      it jumps back to a test at the top. The same loop with an ordered
-#      test on the old counter (`while (n-- > 0)`), whose rotation would
-#      keep two counters alive across the back edge, is left byte for byte.
+#      it jumps back to a test at the top. Two loops whose rotation would
+#      keep the old value of the counter alive beside the new one are left
+#      byte for byte: the same copy with an ordered test on the old counter
+#      (`while (n-- > 0)`), and a loop whose body reads the value its
+#      header has stepped past. A header that tests memory is not taken
+#      either: that is the one shape measured slower with its test at the
+#      bottom.
 #
 # Assertions read x86-64 assembly.
 # ============================================================================
@@ -127,6 +131,34 @@ void copy_down_signed(char *d, const char *s, long n)
         *d++ = *s++;
 }
 C
+# The header halves `x`, the body adds the `x` of before: rotated, the loop
+# would go round with both.
+cat > "$work/fedold.c" <<'C'
+unsigned long sum_halves(unsigned long x)
+{
+    unsigned long sum = 0, half;
+    while ((half = x >> 1) != 0) {
+        sum += x;
+        x = half;
+    }
+    return sum;
+}
+C
+
+# The header steps the pointer the body reads and tests what it points to.
+# (Step first: nothing reads the pointer of before, so the load is all that
+# keeps this loop from being taken.)
+cat > "$work/fedload.c" <<'C'
+unsigned long count_until_zero(const unsigned char *p, unsigned long *seen)
+{
+    unsigned long n = 0;
+    while (*++p) {
+        seen[n & 7] += (unsigned long)p;
+        n++;
+    }
+    return n;
+}
+C
 
 fail=0
 ok()  { printf 'ok:   %s\n' "$1"; }
@@ -191,7 +223,7 @@ expect() {
   if [[ $2 == "$3" ]]; then ok "$1 ($2)"; else bad "$1: got $2, want $3"; fi
 }
 
-for shape in div acc prefix plain small reg fed fedgt; do
+for shape in div acc prefix plain small reg fed fedgt fedold; do
   emit "$work/$shape.on.s"  "$work/$shape.c" -O2
   emit "$work/$shape.off.s" "$work/$shape.c" -O2 CCC_NO_LOOP_ROTATE=1
 done
@@ -303,6 +335,23 @@ if says 'computes what the loop reads'; then
   bad "fed header, ordered test on the old counter: rotated: ${traced##*$'\n'}"
 else
   ok "fed header, ordered test on the old counter: not rotated"
+fi
+if cmp -s "$work/fedold.on.s" "$work/fedold.off.s"; then
+  ok "fed header, body reads the value from before the step: identical to rotation off"
+else
+  bad "fed header, body reads the value from before the step: the default differs from rotation off"
+fi
+trace "$work/fedold.c"
+if says 'computes what the loop reads'; then
+  bad "fed header, body reads the value from before the step: rotated: ${traced##*$'\n'}"
+else
+  ok "fed header, body reads the value from before the step: not rotated"
+fi
+trace "$work/fedload.c"
+if says 'computes what the loop reads'; then
+  bad "fed header that tests memory: rotated: ${traced##*$'\n'}"
+else
+  ok "fed header that tests memory: not rotated"
 fi
 for opt in -O1 -Os; do
   emit "$work/fed.opt.on.s"  "$work/fed.c" "$opt"
