@@ -322,7 +322,9 @@ fn pin_param_abi_reads(store: &LineStore, infos: &mut [LineInfo]) {
             let dest_reg = parse_dest_reg_fast(next_trimmed);
             infos[j].pinned = true;
             infos[j].has_indirect_mem = true;
-            infos[j].kind = LineKind::Other { dest_reg };
+            // Not a bare `kind` write: the line may have been a label, jump or
+            // call, and `set_kind` drops its cached structural bit with it.
+            infos[j].set_kind(LineKind::Other { dest_reg }, next_trimmed);
             infos[j].rbp_offset = RBP_OFFSET_NONE;
             break;
         }
@@ -363,7 +365,7 @@ fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
                 // %rax held a live value (miscompiled call argument setup).
                 let dest_reg = parse_dest_reg_fast(trimmed);
                 infos[i].pinned = true;
-                infos[i].kind = LineKind::Other { dest_reg };
+                infos[i].set_kind(LineKind::Other { dest_reg }, trimmed);
                 infos[i].has_indirect_mem = true;
                 infos[i].rbp_offset = RBP_OFFSET_NONE;
             }

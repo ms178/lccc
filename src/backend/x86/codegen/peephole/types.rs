@@ -97,9 +97,10 @@ pub(super) struct LineInfo {
     /// peephole pass. Used for parameter pre-stores (movq %arg_reg, %callee_saved)
     /// that must survive across function calls.
     pub(super) pinned: bool,
-    /// Cached answer to the liveness pass's structural-line predicate. This is
-    /// derived from `kind` plus the trimmed text once when the line is
-    /// classified; liveness may inspect the same line in thousands of solves.
+    /// Cached answer to the liveness pass's structural-line predicate, derived
+    /// from `kind` and the trimmed text. It is maintained by `classify_line`,
+    /// `replace_line`, `mark_nop` and [`LineInfo::set_kind`]; any other kind
+    /// mutation must use `set_kind` to keep it correct.
     pub(super) structural: bool,
     /// For `LineKind::Directive` only: whether a window may step over this line
     /// (see [`crate::backend::peephole_common::inert_directive`]). Computed once
@@ -122,6 +123,12 @@ pub(super) struct LineInfo {
     /// [`CfiMark`]).
     pub(super) cfi: CfiMark,
 }
+
+// Every pass streams `LineInfo` through its inner loop and the liveness solver
+// copies it by value. The record must stay within one 24-byte word: the fields
+// fit in the existing padding (`LineKind` is 8 bytes, `RegId` is `u8`), and a
+// growth past that is a build failure rather than a silent bandwidth loss.
+const _: () = assert!(std::mem::size_of::<LineInfo>() <= 24);
 
 /// What kind of assembly line this is, with pre-extracted fields for the
 /// patterns we care about.
@@ -377,6 +384,18 @@ impl LineInfo {
                 .any(|prefix| text.starts_with(prefix)),
             _ => text.starts_with('#'),
         }
+    }
+
+    /// Change this line's kind in place and keep the cached `structural` bit
+    /// consistent with it.  Every in-place kind mutation must go through here:
+    /// a bare `info.kind = ...` leaves `structural` describing the old kind,
+    /// and a stale `true` silently turns a non-barrier into a liveness barrier
+    /// (or a stale `false` hides one).  `trimmed` must be
+    /// `self.trimmed(line)` for the line this info describes.
+    #[inline]
+    pub(super) fn set_kind(&mut self, kind: LineKind, trimmed: &str) {
+        self.kind = kind;
+        self.structural = self.structural_for(trimmed);
     }
 
     /// True for a live (non-nop) `.cfi_startproc` line.  The nop check is
@@ -4553,54 +4572,63 @@ mod pack_digest_tests {
         assert_eq!(a.pack() & 0xff, 0, "reg field intact under negative offset");
     }
 
-    /// The cached bit must be identical to the previous text-based predicate
-    /// for instructions, control flow, comments and every directive exception.
+    /// Hand-written truth table for the structural predicate.  The expected
+    /// bits are stated per line from the specification (control transfers,
+    /// labels, calls, inline asm, comment markers and every directive except
+    /// the byte-neutral annotation/alignment ones are structural), NOT re-derived
+    /// from the production predicate: a re-derivation would only prove the code
+    /// equals a copy of itself.
     #[test]
-    fn structural_metadata_matches_text_oracle() {
-        let cases = [
-            "",
-            "f:",
-            "    jmp .L1",
-            "    jne .L1",
-            "    call foo",
-            "    ret",
-            "# LCCC_CALL_ARGS 2",
-            "    movq %rax, %rbx",
-            "    nop",
-            "    .long .L1 - .Lbase",
-            "    .section .rodata",
-            "    .cfi_startproc",
-            "    .loc 1 4 0",
-            "    .p2align 4",
-            "    .balign 16",
-            "    .align 8",
+    fn structural_metadata_matches_truth_table() {
+        let table: &[(&str, bool)] = &[
+            ("", false),
+            ("f:", true),
+            ("    jmp .L1", true),
+            ("    jne .L1", true),
+            ("    jmpq *%rax", true),
+            ("    call foo", true),
+            ("    ret", true),
+            ("# LCCC_CALL_ARGS 2", true),
+            ("    movq %rax, %rbx", false),
+            ("    nop", false),
+            ("    .long .L1 - .Lbase", true),
+            ("    .section .rodata", true),
+            ("    .cfi_startproc", false),
+            ("    .cfi_endproc", false),
+            ("    .cfi_def_cfa_offset 16", false),
+            ("    .loc 1 4 0", false),
+            ("    .p2align 4", false),
+            ("    .balign 16", false),
+            ("    .align 8", false),
         ];
-        for raw in cases {
-            let info = classify_line(raw);
-            let text = raw.get(info.trim_start as usize..).unwrap_or(raw);
-            let expected = if info.is_nop() {
-                false
-            } else {
-                match info.kind {
-                    LineKind::Label
-                    | LineKind::Jmp
-                    | LineKind::CondJmp
-                    | LineKind::JmpIndirect
-                    | LineKind::Call
-                    | LineKind::Ret
-                    | LineKind::InlineAsm => true,
-                    LineKind::Directive => ![".cfi_", ".loc ", ".p2align ", ".balign ", ".align "]
-                        .iter()
-                        .any(|prefix| text.starts_with(prefix)),
-                    _ => text.starts_with('#'),
-                }
-            };
-            assert_eq!(info.structural, expected, "{raw:?}");
+        for &(raw, expected) in table {
+            assert_eq!(classify_line(raw).structural, expected, "{raw:?}");
         }
         assert!(
             opaque_line_info(0).structural,
             "the fail-closed inline-asm constructor is structural"
         );
+    }
+
+    #[test]
+    fn set_kind_keeps_structural_bit_in_sync() {
+        let call_text = "    call foo";
+        let mut info = classify_line(call_text);
+        assert!(info.structural, "a call is structural");
+        let plain = classify_line("    movq %rax, %rbx");
+        let trimmed = info.trimmed(call_text);
+        info.set_kind(plain.kind, trimmed);
+        assert_eq!(info.kind, plain.kind);
+        assert!(
+            !info.structural,
+            "a call reclassified as an ordinary instruction must drop the barrier bit"
+        );
+        let mov_text = "    movq %rax, %rbx";
+        let mut relabel = classify_line(mov_text);
+        assert!(!relabel.structural);
+        let mov_trimmed = relabel.trimmed(mov_text);
+        relabel.set_kind(LineKind::Label, mov_trimmed);
+        assert!(relabel.structural, "a label kind is structural");
     }
 
     #[test]

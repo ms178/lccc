@@ -61,7 +61,16 @@ ARCHES = (
     ("riscv64", "-riscv", [WIDE]),
 )
 
-MODE = re.compile(r"mode=(\w+)")
+# One `[pair]` telemetry line per scheduled pair: its candidate sizes and mode.
+PAIR_LINE = re.compile(r"\[pair\] arch=\S+ chain=(\d+)B orig=(\d+)B mode=(\w+)")
+# The default size floor, read from its definition so this check cannot drift
+# from `MIN_PARALLEL_PAIR_BYTES` in the backend.
+MIN_PAIR_BYTES = int(
+    re.search(
+        r"const MIN_PARALLEL_PAIR_BYTES: usize = (\d+);",
+        (ROOT / "src/backend/metric_pair.rs").read_text(),
+    ).group(1)
+)
 COUNTERS = re.compile(r"parallel=(\d+) serial=(\d+) deduped=(\d+)")
 
 
@@ -98,8 +107,10 @@ def effective_threads():
 def compile_asm(compiler, source, knob, workdir, tag, opt="-O1", *, dump=None):
     """Compile one source in one scheduling mode.
 
-    Returns `(sha256, modes, counters)` where `modes` holds one entry per pair
-    and `counters` holds the last `(parallel, serial, deduped)` triple seen.
+    Returns `(sha256, modes, counters, sizes)`: `modes` holds one entry per
+    scheduled pair, `sizes` the `(chain, orig)` candidate byte counts of the same
+    pairs in the same order, and `counters` the last `(parallel, serial,
+    deduped)` triple seen.
     """
     out = workdir / f"{source.stem}-{tag}.s"
     env = dict(os.environ)
@@ -116,12 +127,19 @@ def compile_asm(compiler, source, knob, workdir, tag, opt="-O1", *, dump=None):
     )
     if result.returncode != 0:
         raise ValueError(f"{source.name} [{tag}] failed: {result.stderr.strip()[:400]}")
+    pairs = PAIR_LINE.findall(result.stderr)
     counters = COUNTERS.findall(result.stderr)
     return (
         hashlib.sha256(out.read_bytes()).hexdigest(),
-        MODE.findall(result.stderr),
+        [mode for _, _, mode in pairs],
         tuple(int(value) for value in counters[-1]) if counters else None,
+        [(int(chain), int(orig)) for chain, orig, _ in pairs],
     )
+
+
+def expected_auto_mode(threads, chain, orig):
+    """The default policy: spawn only on a multi-thread host, at or above the floor."""
+    return "parallel" if threads > 1 and chain + orig >= MIN_PAIR_BYTES else "serial"
 
 
 def check_accounting(label, source_name, opt, modes, counters, failures):
@@ -145,7 +163,7 @@ def check_debug_dump(compiler, workdir, expected_sha, threads, failures):
         folder = workdir / f"dump-{knob}"
         folder.mkdir()
         dump = folder / "peephole.raw.s"
-        digest, modes, _ = compile_asm(compiler, ROOT / WIDE, knob, folder, "dump", dump=dump)
+        digest, modes, _, _ = compile_asm(compiler, ROOT / WIDE, knob, folder, "dump", dump=dump)
         paths = [dump, folder / "peephole.raw-chain.s", folder / "peephole.raw-orig.s"]
         if mode not in modes:
             failures.append(f"CCC_DUMP_ASM ({knob}): fixture did not run a {mode} pair")
@@ -197,21 +215,25 @@ def main():
                     continue
                 for opt in levels:
                     key = f"{name} {opt}"
-                    hashes, modes, counters = {}, {}, {}
+                    hashes, modes, counters, sizes = {}, {}, {}, {}
                     for tag, knob in (("serial", "0"), ("auto", None), ("forced", "1")):
-                        hashes[tag], modes[tag], counters[tag] = compile_asm(
+                        hashes[tag], modes[tag], counters[tag], sizes[tag] = compile_asm(
                             binary, source, knob, workdir, f"{opt}{tag}", opt
                         )
                     if len(set(hashes.values())) != 1:
                         failures.append(
                             f"{label}/{key}: scheduling mode changed the assembly {hashes}"
                         )
-                    expected_auto = "serial" if threads == 1 else "parallel"
-                    if modes["auto"] and any(mode != expected_auto for mode in modes["auto"]):
-                        failures.append(
-                            f"{label}/{key}: backend default {modes['auto']} does not match "
-                            f"expected {expected_auto}"
-                        )
+                    # The default gate is size-and-host: a pair below the floor is
+                    # serial even on a multi-thread host, so each pair is checked
+                    # against its own telemetry sizes, not a blanket expectation.
+                    for (chain, orig), mode in zip(sizes["auto"], modes["auto"]):
+                        want = expected_auto_mode(threads, chain, orig)
+                        if mode != want:
+                            failures.append(
+                                f"{label}/{key}: default gate ran a {chain}+{orig}B pair "
+                                f"as {mode}, expected {want} on a {threads}-thread host"
+                            )
                     arch_pairs += len(modes["auto"])
                     if "parallel" in modes["serial"]:
                         failures.append(f"{label}/{key}: kill switch ignored {modes['serial']}")
