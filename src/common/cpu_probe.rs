@@ -515,6 +515,10 @@ pub const NAME_ALIASES: &[(&str, &str)] = &[
 /// Symbol of the probe initialiser the driver appends to the translation unit.
 pub const INIT_SYMBOL: &str = "__lccc_cpu_init";
 
+/// Symbol of the local PC thunk the i686 PIC flavour of the initialiser
+/// derives its GOT base through (`%ebx` = the caller's return address).
+const PC_THUNK_SYMBOL: &str = "__lccc_cpu_pc_thunk";
+
 /// Resolve a feature name (case-insensitively, with aliases) to its probe.
 pub fn lookup(name: &str) -> Option<Probe> {
     let lower = name.to_ascii_lowercase();
@@ -683,16 +687,24 @@ pub fn runtime_asm(target: ProbeTarget, pic: bool, emit_cfi: bool) -> String {
     };
     let ctx = Ctx { mode };
     let mut out = String::with_capacity(4096);
+    // Every symbol the helper defines is typed and sized, like the symbols
+    // of compiled code: the words are 4-byte objects, the initialiser (and
+    // the i686 PC thunk) a function. Without the annotations they reached
+    // the symbol table as untyped, zero-sized names, which is what tools
+    // that walk it by extent refuse or guess at (objtool: "__lccc_cpu_init()
+    // is missing an ELF size annotation"; `nm -S`, perf and bloaty show no
+    // extent; a debugger attributes the bytes to whatever symbol follows).
     out.push_str("\t.bss\n");
-    for word in CpuWord::ALL {
+    for symbol in CpuWord::ALL
+        .iter()
+        .map(|word| word.symbol())
+        .chain([READY_SYMBOL])
+    {
         out.push_str(&format!(
-            "\t.local\t{sym}\n\t.p2align 2\n{sym}:\n\t.zero\t4\n",
-            sym = word.symbol()
+            "\t.local\t{symbol}\n\t.type\t{symbol}, @object\n\t.size\t{symbol}, 4\n\
+             \t.p2align 2\n{symbol}:\n\t.zero\t4\n"
         ));
     }
-    out.push_str(&format!(
-        "\t.local\t{READY_SYMBOL}\n\t.p2align 2\n{READY_SYMBOL}:\n\t.zero\t4\n"
-    ));
     out.push_str("\t.text\n\t.local\t");
     out.push_str(INIT_SYMBOL);
     out.push_str("\n\t.type\t");
@@ -726,7 +738,7 @@ pub fn runtime_asm(target: ProbeTarget, pic: bool, emit_cfi: bool) -> String {
                 out.push_str("\t.cfi_def_cfa_offset 8\n\t.cfi_offset %esi, -8\n");
                 out.push_str("\t.cfi_def_cfa_offset 12\n\t.cfi_offset %ebx, -12\n");
             }
-            out.push_str("\tcall\t.Llccc_cpu_got\n");
+            out.push_str(&format!("\tcall\t{PC_THUNK_SYMBOL}\n"));
             out.push_str("\taddl\t$_GLOBAL_OFFSET_TABLE_, %ebx\n");
             // CPUID owns EBX, so the base lives in the callee-saved %esi.
             out.push_str("\tmovl\t%ebx, %esi\n");
@@ -878,13 +890,32 @@ pub fn runtime_asm(target: ProbeTarget, pic: bool, emit_cfi: bool) -> String {
     if emit_cfi {
         out.push_str("\t.cfi_endproc\n");
     }
+    out.push_str(&format!("\t.size\t{INIT_SYMBOL}, .-{INIT_SYMBOL}\n"));
     if mode == Mode::I686GotRelative {
         // Local PC thunk: reads the return address without popping it, so the
         // caller's `ret` still finds its own return address on the stack.  The
         // `addl $_GLOBAL_OFFSET_TABLE_` above resolves through R_386_GOTPC
         // against *this* instruction's address, exactly like the shared
         // `__x86.get_pc_thunk.bx` stub the backend emits for PIC functions.
-        out.push_str(".Llccc_cpu_got:\n\tmovl\t(%esp), %ebx\n\tret\n");
+        //
+        // A function of its own -- typed, sized, and with the (empty) CFI of
+        // a leaf that touches no register an unwinder restores -- so that
+        // its two instructions belong to a symbol and are not bytes after
+        // the end of the initialiser.
+        out.push_str(&format!(
+            "\t.local\t{PC_THUNK_SYMBOL}\n\t.type\t{PC_THUNK_SYMBOL}, @function\n\
+             {PC_THUNK_SYMBOL}:\n"
+        ));
+        if emit_cfi {
+            out.push_str("\t.cfi_startproc\n");
+        }
+        out.push_str("\tmovl\t(%esp), %ebx\n\tret\n");
+        if emit_cfi {
+            out.push_str("\t.cfi_endproc\n");
+        }
+        out.push_str(&format!(
+            "\t.size\t{PC_THUNK_SYMBOL}, .-{PC_THUNK_SYMBOL}\n"
+        ));
     }
     out
 }
@@ -1418,7 +1449,9 @@ mod tests {
         assert!(pic.contains("\tmovl\t%ebx, %esi\n"));
         assert!(pic.contains("pushl\t%esi"));
         assert!(pic.contains("popl\t%esi"));
-        assert!(pic.contains(".Llccc_cpu_got:"));
+        assert!(pic.contains("\tcall\t__lccc_cpu_pc_thunk\n"));
+        assert!(pic.contains("\n__lccc_cpu_pc_thunk:\n"));
+        assert!(!abs.contains("__lccc_cpu_pc_thunk"));
         assert!(!pic.contains("%rip"));
         // Both flavours save and restore %ebx (CPUID clobbers it).
         for variant in [&abs, &pic] {
@@ -1426,6 +1459,73 @@ mod tests {
             assert!(variant.contains("popl\t%ebx"));
         }
         assert!(runtime_asm(ProbeTarget::I686, false, false).starts_with("\t.bss\n"));
+    }
+
+    /// Every symbol the helper defines reaches the symbol table typed and
+    /// sized, in each flavour, with and without CFI: a label of the text
+    /// that is no `.L` label has a `.type` and a `.size` of its own, an
+    /// object's size is its 4 bytes, and a function's size is taken where
+    /// its last instruction ends.
+    #[test]
+    fn every_defined_symbol_is_typed_and_sized() {
+        for (target, pic) in [
+            (ProbeTarget::X86_64, false),
+            (ProbeTarget::X86_64, true),
+            (ProbeTarget::I686, false),
+            (ProbeTarget::I686, true),
+        ] {
+            for cfi in [false, true] {
+                let asm = runtime_asm(target, pic, cfi);
+                let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+                let labels: Vec<&str> = lines
+                    .iter()
+                    .filter_map(|line| line.strip_suffix(':'))
+                    .filter(|label| !label.starts_with(".L"))
+                    .collect();
+                let mut expected: Vec<&str> = defined_symbols().collect();
+                if target == ProbeTarget::I686 && pic {
+                    expected.push(PC_THUNK_SYMBOL);
+                }
+                let mut sorted = labels.clone();
+                sorted.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(sorted, expected, "{target:?} pic={pic}");
+                for label in labels {
+                    let function = label == INIT_SYMBOL || label == PC_THUNK_SYMBOL;
+                    let kind = if function { "@function" } else { "@object" };
+                    let size = if function {
+                        format!(".size\t{label}, .-{label}")
+                    } else {
+                        format!(".size\t{label}, 4")
+                    };
+                    assert!(
+                        lines.contains(&format!(".local\t{label}").as_str()),
+                        "{label}"
+                    );
+                    assert!(
+                        lines.contains(&format!(".type\t{label}, {kind}").as_str()),
+                        "{label} has no type ({target:?} pic={pic})"
+                    );
+                    let at = lines.iter().position(|line| *line == size);
+                    let defined = lines
+                        .iter()
+                        .position(|line| line.strip_suffix(':') == Some(label));
+                    assert!(at.is_some(), "{label} has no size ({target:?} pic={pic})");
+                    if function {
+                        // The size is taken after the body: right behind the
+                        // function's last `ret` (and its `.cfi_endproc`).
+                        let at = at.unwrap();
+                        assert!(at > defined.unwrap(), "{label}");
+                        let before = lines[at - 1 - usize::from(cfi)];
+                        assert_eq!(before, "ret", "{label} ({target:?} pic={pic} cfi={cfi})");
+                    }
+                }
+                assert_eq!(
+                    asm.matches(".cfi_startproc").count(),
+                    asm.matches(".cfi_endproc").count()
+                );
+            }
+        }
     }
 
     #[test]

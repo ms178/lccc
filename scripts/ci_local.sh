@@ -3816,6 +3816,12 @@ gate "atomic-operators" fast \
 gate "target-attribute-arguments" fast \
     python3 tests/regression/check_target_attribute_arguments.py --lccc target/fastbuild/lccc
 
+# Every symbol the compiler defines has a type and a size: the program's
+# functions and objects, and the helpers the driver adds (the CPUID probe of
+# `__builtin_cpu_supports`, the profile writer). Four targets, readelf only.
+gate "symbol-annotations" fast \
+    python3 tests/regression/check_symbol_annotations.py
+
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
 # sqlite_put_varint plus a shrunk-corpus gcc differential — the golden-gate

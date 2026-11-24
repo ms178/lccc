@@ -3100,6 +3100,10 @@ jobs:
         # an error (it was ignored in silence), in GCC's words, on GCC's
         # lines; the fixture's comments are re-measured against GCC 16.2.
         python3 tests/regression/check_target_attribute_arguments.py --lccc target/fastbuild/lccc
+        # Every symbol the compiler defines is typed and sized, the CPUID
+        # probe helper and the profile writer included (objtool refused the
+        # helper: "missing an ELF size annotation"); four targets, readelf.
+        python3 tests/regression/check_symbol_annotations.py
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.
