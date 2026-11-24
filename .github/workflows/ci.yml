@@ -3104,6 +3104,12 @@ jobs:
         # probe helper and the profile writer included (objtool refused the
         # helper: "missing an ELF size annotation"); four targets, readelf.
         python3 tests/regression/check_symbol_annotations.py
+        # The scalar and system intrinsics of x86gprintrin.h (CLWB, WRPKRU,
+        # XSAVEOPT, ENCLS, ...): the same instruction in the same form as
+        # GCC 16.2's, and, stopped in front of it under GDB, the same
+        # explicit and implicit operands; x86-64 and i686, with three
+        # planted differences as negative controls.
+        python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.

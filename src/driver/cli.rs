@@ -893,6 +893,14 @@ impl Driver {
         {
             return true;
         }
+        // A plain extension's own option: the grant is the caller's (it
+        // also enables what the extension contains), the denial is here.
+        if let Some((extra, denied)) = Self::x86_plain_extra_option(arg) {
+            if denied {
+                self.withdraw_x86_extra(extra);
+            }
+            return true;
+        }
         match arg {
             "-mgeneral-regs-only" => self.deny_general_registers(),
             "-mno-avx2" => {
@@ -1474,7 +1482,7 @@ impl Driver {
         }
         for extra in E::ALL {
             if row.has_extra(extra) {
-                *self.x86_extra_slot(extra) = true;
+                self.set_x86_extra(extra, true);
             }
         }
         // AES-NI, PCLMUL and GFNI are not rungs of the SSE ladder: GCC's
@@ -1712,7 +1720,7 @@ impl Driver {
     /// in `gcc/common/config/i386/i386-common.cc`), so a later re-grant is
     /// the only thing that brings it back.
     fn withdraw_x86_extra(&mut self, extra: crate::backend::x86::arch_table::X86ExtraFeature) {
-        *self.x86_extra_slot(extra) = false;
+        self.set_x86_extra(extra, false);
         self.x86_extras_explicit &= !(1 << extra as u8);
     }
 
@@ -1739,9 +1747,8 @@ impl Driver {
                     required &= !(1u64 << crate::common::x86_features::X86Feature::Xsave as u8);
                 }
                 let lacking = required & !bits != 0 || extra.requires_extras() & !extras != 0;
-                let slot = self.x86_extra_slot(extra);
-                if *slot && lacking {
-                    *slot = false;
+                if lacking && self.x86_extra_enabled(extra) {
+                    self.set_x86_extra(extra, false);
                     changed = true;
                 }
             }
@@ -1752,20 +1759,20 @@ impl Driver {
     }
 
     /// The enabled macro-only extensions, one bit per `X86ExtraFeature`.
-    fn x86_extras(&mut self) -> u32 {
+    fn x86_extras(&mut self) -> u64 {
         use crate::backend::x86::arch_table::X86ExtraFeature as E;
         E::ALL
             .into_iter()
-            .filter(|&extra| *self.x86_extra_slot(extra))
+            .filter(|&extra| self.x86_extra_enabled(extra))
             .fold(0, |bits, extra| bits | 1 << extra as u8)
     }
 
     /// Enable the macro-only extensions of `bits`.
-    fn set_x86_extras(&mut self, bits: u32) {
+    fn set_x86_extras(&mut self, bits: u64) {
         use crate::backend::x86::arch_table::X86ExtraFeature as E;
         for extra in E::ALL {
             if bits & 1 << extra as u8 != 0 {
-                *self.x86_extra_slot(extra) = true;
+                self.set_x86_extra(extra, true);
             }
         }
     }
@@ -1780,7 +1787,7 @@ impl Driver {
         &mut self,
         extra: crate::backend::x86::arch_table::X86ExtraFeature,
     ) {
-        *self.x86_extra_slot(extra) = true;
+        self.set_x86_extra(extra, true);
         self.x86_extras_explicit |= 1 << extra as u8;
         let contained = extra.requires_extras();
         self.set_x86_extras(contained);
@@ -1846,13 +1853,16 @@ impl Driver {
         }
     }
 
-    /// The driver bit of a macro-only extension.
+    /// The driver field of a macro-only extension that code generation or
+    /// another option reads, `None` for the plain ones, which live as bits
+    /// of `x86_plain_extras` (the scalar and system extensions: nothing
+    /// reads them but the predefined macro).
     fn x86_extra_slot(
         &mut self,
         extra: crate::backend::x86::arch_table::X86ExtraFeature,
-    ) -> &mut bool {
+    ) -> Option<&mut bool> {
         use crate::backend::x86::arch_table::X86ExtraFeature as E;
-        match extra {
+        Some(match extra {
             E::Prfchw => &mut self.enable_prfchw,
             E::AvxIfma => &mut self.enable_avxifma,
             E::AvxNeConvert => &mut self.enable_avxneconvert,
@@ -1867,7 +1877,71 @@ impl Driver {
             E::Avx10_1 => &mut self.enable_avx10_1,
             E::Avx10_2 => &mut self.enable_avx10_2,
             E::ApxF => &mut self.enable_apxf,
+            _ => return None,
+        })
+    }
+
+    /// Whether a macro-only extension is enabled.
+    fn x86_extra_enabled(
+        &mut self,
+        extra: crate::backend::x86::arch_table::X86ExtraFeature,
+    ) -> bool {
+        match self.x86_extra_slot(extra) {
+            Some(slot) => *slot,
+            None => self.x86_plain_extras & (1 << extra as u8) != 0,
         }
+    }
+
+    /// Enable or disable a macro-only extension.
+    fn set_x86_extra(
+        &mut self,
+        extra: crate::backend::x86::arch_table::X86ExtraFeature,
+        enabled: bool,
+    ) {
+        match self.x86_extra_slot(extra) {
+            Some(slot) => *slot = enabled,
+            None if enabled => self.x86_plain_extras |= 1 << extra as u8,
+            None => self.x86_plain_extras &= !(1 << extra as u8),
+        }
+    }
+
+    /// `-mNAME` / `-mno-NAME` of a plain extension: the extension and
+    /// whether the option denies it. The extensions with a field of their
+    /// own have their arms in the matches above.
+    fn x86_plain_extra_option(
+        arg: &str,
+    ) -> Option<(crate::backend::x86::arch_table::X86ExtraFeature, bool)> {
+        let option = arg.strip_prefix("-m")?;
+        let (denied, name) = option
+            .strip_prefix("no-")
+            .map_or((false, option), |name| (true, name));
+        crate::backend::x86::arch_table::X86ExtraFeature::ALL
+            .into_iter()
+            .find(|extra| extra.option() == name && !Self::x86_extra_has_field(*extra))
+            .map(|extra| (extra, denied))
+    }
+
+    /// The extensions `x86_extra_slot` has a field for (kept equal to it by
+    /// `plain_extras_are_the_ones_without_a_field`).
+    const fn x86_extra_has_field(extra: crate::backend::x86::arch_table::X86ExtraFeature) -> bool {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        matches!(
+            extra,
+            E::Prfchw
+                | E::AvxIfma
+                | E::AvxNeConvert
+                | E::Cmpccxadd
+                | E::Sm3
+                | E::Sm4
+                | E::Movrs
+                | E::UserMsr
+                | E::AmxTile
+                | E::AmxInt8
+                | E::AmxBf16
+                | E::Avx10_1
+                | E::Avx10_2
+                | E::ApxF
+        )
     }
 
     /// Parse GCC-compatible command-line arguments and populate driver fields.
@@ -1957,6 +2031,28 @@ impl Driver {
                 return Err("'-mapxf' is not supported for 32-bit code".to_string());
             }
             self.enable_apxf = false;
+        }
+        if self.target == Target::I686 {
+            use crate::backend::x86::arch_table::X86ExtraFeature as E;
+            // User interrupts are a 64-bit extension as well: an error by
+            // name, left out of a CPU row (GCC 16.2: `-m32
+            // -march=sierraforest` has no `__UINTR__` and is no error).
+            if self.x86_extra_enabled(E::Uintr) {
+                if self.x86_isa_flag_was_enabled("-muintr", "-mno-uintr") {
+                    return Err("'-muintr' not supported for 32-bit code".to_string());
+                }
+                self.set_x86_extra(E::Uintr, false);
+            }
+            // LAHF and SAHF exist in every 32-bit mode; only long mode made
+            // them a CPUID bit. GCC defines `__LAHF_SAHF__` for every `-m32`
+            // CPU, and `-mno-sahf` is what removes it (measured).
+            let denied = self
+                .x86_explicit_isa_args
+                .iter()
+                .rev()
+                .find(|arg| matches!(arg.as_str(), "-msahf" | "-mno-sahf"))
+                .is_some_and(|arg| arg == "-mno-sahf");
+            self.set_x86_extra(E::Sahf, !denied);
         }
         // GCC 16.2 rejects a `-mtune=` name outside its vocabulary ("bad
         // value for '-mtune=' switch"); configure and Kbuild `cc-option`
@@ -3172,8 +3268,7 @@ impl Driver {
                 // (`grant_avx10_family`). The `-256`/`-512` spellings are not
                 // GCC 16.2 options and fall through to the unsupported-option
                 // error below, exactly as GCC rejects them.
-                "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt"
-                | "-mno-xsavec" => {}
+                "-mxsave" | "-mno-xsave" => {}
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
                 "-mcmodel=kernel" => self.code_model_kernel = true,
                 // SA-YG-1: `-mcmodel=large` used to be silently folded into
@@ -5462,6 +5557,125 @@ mod cli_tests {
     /// `arch_table.rs`; GCC rejects the others with "bad value"), whatever
     /// the order of `-m32`; `-mapxf` is refused for 32-bit code, as by GCC.
     #[test]
+    fn plain_extras_follow_their_options_and_the_cpu_row() {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let parsed = |args: &[&str]| {
+            let mut d = Driver::new();
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            d.parse_cli_args(&owned).map(|_| d)
+        };
+        let enabled = |args: &[&str], extra: E| {
+            parsed(args)
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+                .x86_extra_enabled(extra)
+        };
+        // By name, and nothing else with it.
+        let mut d = parsed(&["ccc", "-madx", "-mrdseed", "x.c"]).expect("-madx -mrdseed");
+        assert!(d.x86_extra_enabled(E::Adx) && d.x86_extra_enabled(E::Rdseed));
+        assert!(!d.x86_extra_enabled(E::Clwb) && !d.enable_xsave && !d.enable_avx);
+        // From a CPU row (GCC 16.2: skylake has all four, x86-64 none).
+        for extra in [
+            E::Adx,
+            E::Rdseed,
+            E::Clflushopt,
+            E::Fsgsbase,
+            E::Xsavec,
+            E::Xsaves,
+        ] {
+            assert!(
+                enabled(&["ccc", "-march=skylake", "x.c"], extra),
+                "{extra:?}"
+            );
+            assert!(
+                !enabled(&["ccc", "-march=x86-64", "x.c"], extra),
+                "{extra:?}"
+            );
+        }
+        // The last explicit spelling decides, on either side of `-march=`.
+        for (args, want) in [
+            (&["ccc", "-march=skylake", "-mno-adx", "x.c"][..], false),
+            (&["ccc", "-mno-adx", "-march=skylake", "x.c"], false),
+            (&["ccc", "-mno-adx", "-madx", "x.c"], true),
+            (&["ccc", "-madx", "-mno-adx", "x.c"], false),
+            (&["ccc", "-march=skylake", "-mno-adx", "-madx", "x.c"], true),
+            (&["ccc", "-madx", "-march=x86-64", "x.c"], true),
+        ] {
+            assert_eq!(enabled(args, E::Adx), want, "{args:?}");
+        }
+        // The XSAVE family brings XSAVE and leaves with it.
+        let mut d = parsed(&["ccc", "-mxsaves", "x.c"]).expect("-mxsaves");
+        assert!(d.x86_extra_enabled(E::Xsaves) && d.enable_xsave);
+        for extra in [E::Xsavec, E::Xsaveopt, E::Xsaves] {
+            let option = format!("-m{}", extra.option());
+            assert!(
+                !enabled(&["ccc", &option, "-mno-xsave", "x.c"], extra),
+                "{extra:?}"
+            );
+            assert!(
+                !enabled(&["ccc", "-march=skylake", "-mno-xsave", "x.c"], extra),
+                "{extra:?}"
+            );
+        }
+        // 32-bit code: LAHF/SAHF is there unless denied; user interrupts are
+        // an error by name and left out of a row.
+        assert!(enabled(&["ccc", "-m32", "x.c"], E::Sahf));
+        assert!(enabled(&["ccc", "-m32", "-march=i386", "x.c"], E::Sahf));
+        assert!(!enabled(&["ccc", "-m32", "-mno-sahf", "x.c"], E::Sahf));
+        assert!(enabled(
+            &["ccc", "-m32", "-mno-sahf", "-msahf", "x.c"],
+            E::Sahf
+        ));
+        assert!(!enabled(&["ccc", "x.c"], E::Sahf));
+        assert!(enabled(&["ccc", "-msahf", "x.c"], E::Sahf));
+        assert!(enabled(&["ccc", "-march=sierraforest", "x.c"], E::Uintr));
+        assert!(!enabled(
+            &["ccc", "-m32", "-march=sierraforest", "x.c"],
+            E::Uintr
+        ));
+        let err = parsed(&["ccc", "-m32", "-muintr", "x.c"])
+            .err()
+            .expect("-m32 -muintr");
+        assert_eq!(err, "'-muintr' not supported for 32-bit code");
+        assert!(parsed(&["ccc", "-m32", "-muintr", "-mno-uintr", "x.c"]).is_ok());
+    }
+
+    /// `x86_extra_has_field` is the list `x86_extra_slot` has fields for:
+    /// an extension in one and not the other would take its option twice,
+    /// or not at all.
+    #[test]
+    fn plain_extras_are_the_ones_without_a_field() {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let mut d = Driver::new();
+        let mut plain = 0;
+        for extra in E::ALL {
+            assert_eq!(
+                Driver::x86_extra_has_field(extra),
+                d.x86_extra_slot(extra).is_some(),
+                "{extra:?}"
+            );
+            let option = format!("-m{}", extra.option());
+            let denial = format!("-mno-{}", extra.option());
+            let is_plain = !Driver::x86_extra_has_field(extra);
+            assert_eq!(
+                Driver::x86_plain_extra_option(&option),
+                is_plain.then_some((extra, false)),
+                "{option}"
+            );
+            assert_eq!(
+                Driver::x86_plain_extra_option(&denial),
+                is_plain.then_some((extra, true)),
+                "{denial}"
+            );
+            plain += usize::from(is_plain);
+        }
+        assert_eq!(plain, E::ALL.len() - 14);
+        assert_eq!(Driver::x86_plain_extra_option("-mxyzzy"), None);
+        assert_eq!(Driver::x86_plain_extra_option("-fadx"), None);
+        // One bit each: the storage is a `u64`.
+        assert!(E::ALL.len() <= 64);
+    }
+
+    #[test]
     fn mtune_vocabulary_and_32_bit_apx_follow_gcc() {
         let parse = |args: &[&str]| {
             let mut d = Driver::new();
@@ -5520,12 +5734,12 @@ mod cli_tests {
             let mut d = parsed(&["ccc", &march, "x.c"]).unwrap_or_else(|e| panic!("{cpu}: {e}"));
             assert!(d.enable_avx512f && d.enable_avx2, "{cpu}");
             for extra in [E::ApxF, E::Avx10_1, E::Avx10_2, E::Movrs, E::Sm3, E::Sm4] {
-                assert!(*d.x86_extra_slot(extra), "{cpu}: {extra:?}");
+                assert!(d.x86_extra_enabled(extra), "{cpu}: {extra:?}");
             }
             let mut d = parsed(&["ccc", "-m32", &march, "x.c"])
                 .unwrap_or_else(|e| panic!("-m32 {cpu}: {e}"));
-            assert!(!*d.x86_extra_slot(E::ApxF), "-m32 {cpu}");
-            assert!(*d.x86_extra_slot(E::Avx10_2), "-m32 {cpu}");
+            assert!(!d.x86_extra_enabled(E::ApxF), "-m32 {cpu}");
+            assert!(d.x86_extra_enabled(E::Avx10_2), "-m32 {cpu}");
             for spelling in ["-mapxf", "-mapx"] {
                 let err = parsed(&["ccc", "-m32", &march, spelling, "x.c"])
                     .err()
@@ -8688,7 +8902,7 @@ mod prefetch_isa_tests {
             // The macro-only extensions (`__PRFCHW__`, `__AMX_TILE__`, ...).
             let extras: Vec<_> = X86ExtraFeature::ALL
                 .into_iter()
-                .filter(|&e| *d.x86_extra_slot(e) != row.has_extra(e))
+                .filter(|&e| d.x86_extra_enabled(e) != row.has_extra(e))
                 .collect();
             assert!(extras.is_empty(), "{}: extras {extras:?}", row.name);
             checked += 1;
@@ -8926,12 +9140,12 @@ mod prefetch_isa_tests {
         // Extensions leave with the features they require: AVXIFMA with
         // AVX2, SHA512 only with AVX; CMPCCXADD survives `-mno-sse`.
         d = parse(&["ccc", "-march=clearwaterforest", "-mno-avx2"]);
-        assert!(!*d.x86_extra_slot(E::AvxIfma) && d.enable_sha512);
+        assert!(!d.x86_extra_enabled(E::AvxIfma) && d.enable_sha512);
         d = parse(&["ccc", "-march=clearwaterforest", "-mno-avx"]);
-        assert!(!d.enable_sha512 && *d.x86_extra_slot(E::Cmpccxadd));
+        assert!(!d.enable_sha512 && d.x86_extra_enabled(E::Cmpccxadd));
         d = parse(&["ccc", "-mno-avx2", "-march=clearwaterforest"]);
         assert!(
-            !*d.x86_extra_slot(E::AvxIfma),
+            !d.x86_extra_enabled(E::AvxIfma),
             "a sticky denial applies to a later -march="
         );
         // `-mno-avx512bmm` takes BMM alone.
@@ -8985,8 +9199,8 @@ mod x86_macro_gate_tests {
     fn avx10_option_grants_the_avx512_base_set() {
         use crate::backend::x86::arch_table::X86ExtraFeature as E;
         let mut d = parse(&["-mavx10.1"]);
-        assert!(*d.x86_extra_slot(E::Avx10_1));
-        assert!(!*d.x86_extra_slot(E::Avx10_2));
+        assert!(d.x86_extra_enabled(E::Avx10_1));
+        assert!(!d.x86_extra_enabled(E::Avx10_2));
         let f = d.effective_x86_features();
         for feat in [
             F::Avx,
@@ -9010,7 +9224,7 @@ mod x86_macro_gate_tests {
         assert!(!f.contains(F::Fma), "-mavx10.1 does not imply FMA");
 
         let mut d2 = parse(&["-mavx10.2"]);
-        assert!(*d2.x86_extra_slot(E::Avx10_1) && *d2.x86_extra_slot(E::Avx10_2));
+        assert!(d2.x86_extra_enabled(E::Avx10_1) && d2.x86_extra_enabled(E::Avx10_2));
 
         for flag in ["-mavx10.1-256", "-mavx10.1-512", "-mavx10.2-512"] {
             let args = ["ccc", flag, "x.c"].map(str::to_string);
@@ -9092,19 +9306,22 @@ mod x86_macro_gate_tests {
             let extra = if flag == "-msm3" { E::Sm3 } else { E::Sm4 };
             let mut d = parse(&[flag, "-mno-xsave"]);
             assert!(
-                *d.x86_extra_slot(extra),
+                d.x86_extra_enabled(extra),
                 "{flag} -mno-xsave keeps the macro"
             );
             assert!(!d.resolved_xsave());
             let mut d = parse(&[flag, "-mno-avx"]);
-            assert!(!*d.x86_extra_slot(extra), "{flag} -mno-avx withdraws it");
+            assert!(!d.x86_extra_enabled(extra), "{flag} -mno-avx withdraws it");
             let mut d = parse(&[flag, "-mno-sse4.2"]);
-            assert!(!*d.x86_extra_slot(extra), "{flag} -mno-sse4.2 withdraws it");
+            assert!(
+                !d.x86_extra_enabled(extra),
+                "{flag} -mno-sse4.2 withdraws it"
+            );
             let mut d = parse(&[flag, "-mno-avx2"]);
-            assert!(*d.x86_extra_slot(extra), "{flag} -mno-avx2 keeps it");
+            assert!(d.x86_extra_enabled(extra), "{flag} -mno-avx2 keeps it");
             // The positive option re-grants the AVX class (GCC: `AVX_SET`).
             let mut d = parse(&["-mno-xsave", flag]);
-            assert!(*d.x86_extra_slot(extra) && d.resolved_xsave());
+            assert!(d.x86_extra_enabled(extra) && d.resolved_xsave());
         }
         // USERMSR uses no SSE state, so it survives every SSE/AVX denial.
         for flag in ["-mno-sse2", "-mno-avx", "-mgeneral-regs-only"] {
@@ -9113,15 +9330,18 @@ mod x86_macro_gate_tests {
         }
 
         let mut d = parse(&["-mamx-tile"]);
-        assert!(d.resolved_xsave() && *d.x86_extra_slot(E::AmxTile));
+        assert!(d.resolved_xsave() && d.x86_extra_enabled(E::AmxTile));
 
         for flag in ["-mamx-int8", "-mamx-bf16"] {
             let mut d = parse(&[flag]);
             assert!(!d.resolved_xsave(), "{flag} must not grant XSAVE");
-            assert!(*d.x86_extra_slot(E::AmxTile), "{flag} grants the container");
+            assert!(
+                d.x86_extra_enabled(E::AmxTile),
+                "{flag} grants the container"
+            );
         }
-        assert!(*parse(&["-mamx-int8"]).x86_extra_slot(E::AmxInt8));
-        assert!(*parse(&["-mamx-bf16"]).x86_extra_slot(E::AmxBf16));
+        assert!(parse(&["-mamx-int8"]).x86_extra_enabled(E::AmxInt8));
+        assert!(parse(&["-mamx-bf16"]).x86_extra_enabled(E::AmxBf16));
 
         // The denial cascades through everything XSAVE carries.
         for flags in [
@@ -9131,13 +9351,13 @@ mod x86_macro_gate_tests {
         ] {
             let mut d = parse(flags);
             for extra in [E::AmxTile, E::AmxInt8, E::AmxBf16] {
-                assert!(!*d.x86_extra_slot(extra), "{extra:?} {flags:?}");
+                assert!(!d.x86_extra_enabled(extra), "{extra:?} {flags:?}");
             }
             assert!(!d.resolved_xsave(), "{flags:?}");
         }
         // A later grant reopens it, like every other last-wins pair.
         let mut d = parse(&["-mno-xsave", "-mamx-tile"]);
-        assert!(d.resolved_xsave() && *d.x86_extra_slot(E::AmxTile));
+        assert!(d.resolved_xsave() && d.x86_extra_enabled(E::AmxTile));
         // SHA-512 has two decisions, and GCC 16.2 splits them the same way
         // (measured with `-dM -E` and by compiling the intrinsic):
         //   * the ANNOUNCEMENT (`__SHA512__`) follows the option alone, so it

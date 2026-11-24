@@ -236,7 +236,62 @@ path they select compiles.
 ### 1.6 Predefined macros
 
 The ISA macros (`__AVX2__`, `__BMI2__`, ...) follow the resolved
-permission (§1). GCC also names the CPU:
+permission (§1).
+
+**The scalar and system extensions** (PR #1211) are announced the same
+way: `adx`, `cldemote`, `clflushopt`, `clwb`, `clzero`, `enqcmd`,
+`fsgsbase`, `hreset`, `movdir64b`, `movdiri`, `mwaitx`, `pconfig`, `pku`,
+`ptwrite`, `rdpid`, `rdseed`, `rtm`, `sahf`, `serialize`, `sgx`, `shstk`,
+`tsxldtrk`, `uintr`, `waitpkg`, `wbnoinvd`, `xsavec`, `xsaveopt` and
+`xsaves`. Each is one or a few instructions on general registers or memory
+that no generated code uses, so the whole of it is an option, a macro and
+the intrinsics of `include/x86gprintrin.h`:
+
+* `-mNAME` / `-mno-NAME` are accepted (they were "unsupported machine
+  option"), the last explicit spelling deciding on either side of a
+  `-march=`, and each CPU row grants what GCC grants: `-march=skylake`
+  now defines `__ADX__`, `__RDSEED__`, `__CLFLUSHOPT__`, `__FSGSBASE__`,
+  `__XSAVEC__`, `__XSAVES__`, `__SGX__`, ... Before, lccc defined none of
+  these 28 macros for any CPU.
+* They are rows of the generated table (`X86ExtraFeature`, measured from
+  GCC by `scripts/gen_x86_arch_table.py` like the features), and the
+  driver keeps them as bits of one word (`Driver::x86_plain_extras`)
+  instead of a field, an option arm and a macro arm each: an extension of
+  this kind is added by adding its row. The 14 older macro-only
+  extensions keep their fields, which code generation or another option
+  reads.
+* What GCC makes of them is measured, not assumed: the XSAVE family
+  brings `__XSAVE__` and leaves with `-mno-xsave`; `__LAHF_SAHF__` is
+  defined in every 32-bit mode unless `-mno-sahf` denies it; `-muintr` is
+  an error in 32-bit code ("'-muintr' not supported for 32-bit code") and
+  a CPU row's user interrupts are left out there. `-march=native` grants
+  them from the same CPUID probe as `__builtin_cpu_supports`.
+* The macro is a promise of the intrinsics, and the header keeps it: 83
+  intrinsics of 27 GCC headers that could not be called can
+  (`tests/x86-intrinsics/expected.txt`: 6,183 missing before, 6,100
+  after). Each is the instruction itself, as an assembler statement; the
+  add-with-carry family (`_addcarry_u64`, `_subborrow_u64`, ...) is
+  arithmetic. `tests/regression/check_x86_gpr_intrinsics.py` holds every
+  one to GCC 16.2 without executing it: the same instruction in the same
+  form, and, with both programs stopped in front of it under GDB, the
+  same explicit operands and the same implicitly read registers (ECX = 0
+  for `rdpkru`, EDX:EAX for the XSAVE family, RBX/RCX/RDX per enclave
+  leaf). The ones a process may execute are executed
+  (`x86_gpr_intrinsics_runtime.c`, and `_i686`).
+
+Not announced, and their options still refused: `prefetchi` (the
+instruction prefetches only through a RIP-relative operand, which the
+assembler-statement form does not produce: the intrinsic would be a
+no-operation), `kl`/`widekl`, `lwp`, `tbm`, `sse4a`, `fma4`, `xop`, the
+AMX sub-extensions and 3DNow!, whose intrinsics lccc does not have.
+
+Known cost: lccc does not carry the carry flag from one `_addcarry_u64`
+to the next. A 2,048-limb addition takes 2.25 s where GCC 16.2 takes
+0.75 s and Clang 23.1.5 0.50 s (400,000 rounds, Ice Lake); about fifteen
+instructions a limb instead of one `adc` chain. The results are equal;
+the code generation is open work.
+
+GCC also names the CPU:
 
 * `-march=X` defines X's measured `-march=` macros. The default `x86-64`
   (and v2 to v4) define `__k8`/`__k8__`.
@@ -383,6 +438,7 @@ instructions.
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
 | `check_target_attribute_isa.sh` | `target()` scoping, ordering, errors and intrinsic verdicts, re-measured on GCC |
 | `check_target_attribute_arguments.py` | The arguments of `target("...")` on definitions and prototypes and of `#pragma GCC target`: errors, order and position against GCC 16.2 |
+| `check_x86_gpr_intrinsics.py` | The scalar and system intrinsics: instruction, form and (under GDB, without executing it) operands against GCC 16.2, x86-64 and i686 |
 | `tests/regression/pragma_gcc_target.c` (corpus) | `#pragma GCC target` regions, the option stack and targets inherited from prototypes, executed |
 | `check_x86_scalar_intrinsics.sh` | Portable scalar intrinsics: semantics and instruction contract |
 | `check_public_simd_abi.py` | SIMD argument and result ABI against GCC |

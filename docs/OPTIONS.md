@@ -30,6 +30,8 @@ Accepted **and** observed to do what it says.  The *Effect* column names the evi
 | `-O1 -funsigned-char` | plain `char` is unsigned (`c < 0` folds to 0) | asm: `xorl\s+%eax,\s+%eax` |
 | `-fshort-wchar` | `wchar_t` is 2 bytes | macros: `__SIZEOF_WCHAR_T__ 2` |
 | `-ffast-math` | defines `__FAST_MATH__` | macros: `__FAST_MATH__ 1` |
+| `-madx -mrdseed -mclwb -mfsgsbase -mrdpid` | the scalar and system ISA options define GCC's macros (their intrinsics are in `x86gprintrin.h`; all 28 options are held to GCC by `check_x86_mflag_macros.py`) | macros: `__ADX__ 1`; `__RDSEED__ 1`; `__CLWB__ 1`; `__FSGSBASE__ 1`; `__RDPID__ 1` |
+| `-march=skylake -mno-adx` | a CPU's extensions are announced and an explicit `-mno-` removes one | macros: `__RDSEED__ 1`; `__XSAVEC__ 1`; absent `__ADX__` |
 | `-O2 -pg` | function entry calls `mcount` / `__fentry__` | asm: `mcount\|__fentry__` |
 | `-O2 -fno-omit-frame-pointer` | keeps the frame pointer (`pushq %rbp`) | asm: `pushq\s+%rbp` |
 | `-O2 -fno-asynchronous-unwind-tables` | no `.cfi_*` unwind directives | asm: absent `\.cfi_startproc` |
@@ -66,4 +68,6 @@ A hard error, because accepting it silently would change what the artifact is (s
 | `-ftest-coverage` | no `.gcno`/`.gcda` output | `-ftest-coverage is not implemented` |
 | `-mstackrealign` | no stack realignment | `unsupported machine option -mstackrealign` |
 | `-m32 -nostdlib -Wl,--emit-relocs` | the i686 linker cannot retain relocations | `--emit-relocs is not supported by the elf_i386` |
+| `-m32 -muintr` | user interrupts exist in 64-bit code only (GCC's words) | `'-muintr' not supported for 32-bit code` |
+| `-mxop` | no XOP code generation and no XOP intrinsics, so no `__XOP__` | `unsupported machine option -mxop` |
 | `-mxyzzy-lccc-control` | unknown `-m` options are errors (negative control) | `unsupported machine option` |

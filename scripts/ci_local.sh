@@ -3822,6 +3822,13 @@ gate "target-attribute-arguments" fast \
 gate "symbol-annotations" fast \
     python3 tests/regression/check_symbol_annotations.py
 
+# The scalar and system intrinsics of x86gprintrin.h against GCC 16.2: which
+# instruction, in which form, and with which operands when it is reached
+# (the two programs are stopped in front of it under GDB; nothing privileged
+# is executed).
+gate "x86-gpr-intrinsics" fast \
+    python3 tests/regression/check_x86_gpr_intrinsics.py --lccc target/fastbuild/lccc
+
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
 # sqlite_put_varint plus a shrunk-corpus gcc differential — the golden-gate

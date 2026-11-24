@@ -581,7 +581,12 @@ pub struct Driver {
     /// The extensions granted by their own `-m` option (as opposed to a
     /// `-march=` row): those keep their grant when the only missing
     /// prerequisite is XSAVE itself, exactly like GCC's option bits.
-    pub(super) x86_extras_explicit: u32,
+    pub(super) x86_extras_explicit: u64,
+    /// The enabled macro-only extensions that have no field of their own:
+    /// one bit per `X86ExtraFeature`, for the scalar and system extensions
+    /// (`adx`, `rdseed`, `clwb`, ...) that nothing but the predefined macro
+    /// and the header's intrinsics read. See `Driver::x86_extra_slot`.
+    pub(super) x86_plain_extras: u64,
     /// `-mprefer-vector-width=` (or the `-mprefer-avx128` alias), in bits.
     /// `None` keeps the resolved value: the tuning row's SIMD datapath,
     /// floored at 256 because every 256-bit emitter here runs at full rate up
@@ -1023,6 +1028,7 @@ impl Driver {
             x86_tune: None,
             x86_tune_spelling: None,
             x86_extras_explicit: 0,
+            x86_plain_extras: 0,
             x86_prefer_vector_bits: None,
             x86_march: None,
             pack_struct_cap: None,
@@ -2323,6 +2329,33 @@ impl Driver {
         }
     }
 
+    /// The x86 macros that are not rows of the feature table: the CPU's
+    /// names, and the extensions that are announced without being a code
+    /// generation permission.
+    fn define_x86_cpu_and_extension_macros(&self, preprocessor: &mut Preprocessor) {
+        for macro_name in self.x86_cpu_name_macros() {
+            preprocessor.define_macro(macro_name, "1");
+        }
+        // `__PRFCHW__` mirrors the codegen permission exactly (GCC defines
+        // it for `-mprfchw` and every PRFCHW `-march=`, independent of SSE).
+        if self.resolved_prfchw() {
+            preprocessor.define_macro("__PRFCHW__", "1");
+        }
+        if self.resolved_abm() {
+            preprocessor.define_macro("__ABM__", "1");
+        }
+        // The scalar and system extensions (`__ADX__`, `__RDSEED__`,
+        // `__CLWB__`, ...): the macro of each one that is enabled, from the
+        // table GCC's own macros were measured into.
+        if matches!(self.target, Target::X86_64 | Target::I686) {
+            for extra in crate::backend::x86::arch_table::X86ExtraFeature::ALL {
+                if self.x86_plain_extras & (1 << extra as u8) != 0 {
+                    preprocessor.define_macro(extra.macro_name(), "1");
+                }
+            }
+        }
+    }
+
     /// Configure the preprocessor with CLI-defined macros and target.
     pub(super) fn configure_preprocessor(
         &self,
@@ -2561,17 +2594,7 @@ impl Driver {
             self.enable_apxf,
             self.enable_user_msr,
         );
-        for macro_name in self.x86_cpu_name_macros() {
-            preprocessor.define_macro(macro_name, "1");
-        }
-        // `__PRFCHW__` mirrors the codegen permission exactly (GCC defines
-        // it for `-mprfchw` and every PRFCHW `-march=`, independent of SSE).
-        if self.resolved_prfchw() {
-            preprocessor.define_macro("__PRFCHW__", "1");
-        }
-        if self.resolved_abm() {
-            preprocessor.define_macro("__ABM__", "1");
-        }
+        self.define_x86_cpu_and_extension_macros(preprocessor);
         // Define _REENTRANT when -pthread is used.
         // GCC and Clang automatically define _REENTRANT=1 when -pthread is passed.
         // Many configure scripts (e.g., iperf3's ax_pthread.m4) check for this macro

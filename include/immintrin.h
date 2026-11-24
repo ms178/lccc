@@ -7,8 +7,7 @@
 #error "x86 SIMD intrinsics (immintrin.h) require an x86 target"
 #endif
 
-#include <ia32intrin.h>
-#include <xsaveintrin.h>
+#include <x86gprintrin.h>
 #include <prfchwintrin.h>
 #include <wmmintrin.h>
 #include <smmintrin.h>

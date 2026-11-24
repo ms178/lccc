@@ -512,6 +512,20 @@ pub const NAME_ALIASES: &[(&str, &str)] = &[
     ("amx_fp16", "amx-fp16"),
 ];
 
+/// The one extension whose `-m` option is not its probe name: `-msahf`
+/// permits LAHF and SAHF in long mode, which CPUID (and GCC's
+/// `__builtin_cpu_supports`, which refuses "sahf") calls `lahf_lm`.
+pub const SAHF_OPTION_AND_PROBE: (&str, &str) = ("sahf", "lahf-lm");
+
+/// The probe name of the extension a `-m` option names.
+pub fn probe_name_of_option(option: &str) -> &str {
+    if option == SAHF_OPTION_AND_PROBE.0 {
+        SAHF_OPTION_AND_PROBE.1
+    } else {
+        option
+    }
+}
+
 /// Symbol of the probe initialiser the driver appends to the translation unit.
 pub const INIT_SYMBOL: &str = "__lccc_cpu_init";
 
@@ -1177,8 +1191,11 @@ mod tests {
             .map(|f| f.name())
             .chain(X86ExtraFeature::ALL.iter().map(|f| f.option()));
         for name in names {
-            assert!(lookup(name).is_some(), "{name} has no runtime probe entry");
+            let probe = probe_name_of_option(name);
+            assert!(lookup(probe).is_some(), "{name} has no runtime probe entry");
         }
+        // The option's own name is no probe name, as in GCC.
+        assert!(lookup("sahf").is_none() && lookup("lahf-lm").is_some());
     }
 
     /// The names of GCC 16.2's `ISA_NAMES_TABLE` the probe once lacked, at

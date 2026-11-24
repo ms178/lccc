@@ -145,6 +145,40 @@ EXTRA_MACROS = [
     ('Avx10_1', '__AVX10_1__'),
     ('Avx10_2', '__AVX10_2__'),
     ('ApxF', '__APX_F__'),
+    # The scalar and system extensions: one or a few instructions each on
+    # general registers or memory, reached through the intrinsics of
+    # `include/x86gprintrin.h` (and nowhere in generated code). Until they
+    # were listed here lccc refused their options and defined none of
+    # their macros, so `-march=skylake` lacked `__ADX__`, `__RDSEED__`,
+    # `__CLFLUSHOPT__`, ... and a build that passed `-mrdseed` stopped.
+    ('Adx', '__ADX__'),
+    ('Cldemote', '__CLDEMOTE__'),
+    ('Clflushopt', '__CLFLUSHOPT__'),
+    ('Clwb', '__CLWB__'),
+    ('Clzero', '__CLZERO__'),
+    ('Enqcmd', '__ENQCMD__'),
+    ('Fsgsbase', '__FSGSBASE__'),
+    ('Hreset', '__HRESET__'),
+    ('Movdir64b', '__MOVDIR64B__'),
+    ('Movdiri', '__MOVDIRI__'),
+    ('Mwaitx', '__MWAITX__'),
+    ('Pconfig', '__PCONFIG__'),
+    ('Pku', '__PKU__'),
+    ('Ptwrite', '__PTWRITE__'),
+    ('Rdpid', '__RDPID__'),
+    ('Rdseed', '__RDSEED__'),
+    ('Rtm', '__RTM__'),
+    ('Sahf', '__LAHF_SAHF__'),
+    ('Serialize', '__SERIALIZE__'),
+    ('Sgx', '__SGX__'),
+    ('Shstk', '__SHSTK__'),
+    ('Tsxldtrk', '__TSXLDTRK__'),
+    ('Uintr', '__UINTR__'),
+    ('Waitpkg', '__WAITPKG__'),
+    ('Wbnoinvd', '__WBNOINVD__'),
+    ('Xsavec', '__XSAVEC__'),
+    ('Xsaveopt', '__XSAVEOPT__'),
+    ('Xsaves', '__XSAVES__'),
 ]
 # GCC's option for each macro-only extension.
 EXTRA_OPTION_NAMES = {
@@ -153,6 +187,14 @@ EXTRA_OPTION_NAMES = {
     'Movrs': 'movrs', 'UserMsr': 'usermsr', 'AmxTile': 'amx-tile',
     'AmxInt8': 'amx-int8', 'AmxBf16': 'amx-bf16', 'Avx10_1': 'avx10.1',
     'Avx10_2': 'avx10.2', 'ApxF': 'apxf',
+    'Adx': 'adx', 'Cldemote': 'cldemote', 'Clflushopt': 'clflushopt', 'Clwb': 'clwb',
+    'Clzero': 'clzero', 'Enqcmd': 'enqcmd', 'Fsgsbase': 'fsgsbase', 'Hreset': 'hreset',
+    'Movdir64b': 'movdir64b', 'Movdiri': 'movdiri', 'Mwaitx': 'mwaitx',
+    'Pconfig': 'pconfig', 'Pku': 'pku', 'Ptwrite': 'ptwrite',
+    'Rdpid': 'rdpid', 'Rdseed': 'rdseed', 'Rtm': 'rtm', 'Sahf': 'sahf',
+    'Serialize': 'serialize', 'Sgx': 'sgx', 'Shstk': 'shstk', 'Tsxldtrk': 'tsxldtrk',
+    'Uintr': 'uintr', 'Waitpkg': 'waitpkg', 'Wbnoinvd': 'wbnoinvd', 'Xsavec': 'xsavec',
+    'Xsaveopt': 'xsaveopt', 'Xsaves': 'xsaves',
 }
 CMOV_PROBE = 'int f(int a, int b) { return a < b ? b : a; }\n'
 
@@ -664,7 +706,7 @@ def render(rows, options, implied, requires, derived, tunes, vocabulary):
         '    /// AMX-TILE); its option enables them (`-mamx-int8` defines',
         '    /// `__AMX_TILE__`).',
         '    #[must_use]',
-        '    pub(crate) const fn requires_extras(self) -> u32 {',
+        '    pub(crate) const fn requires_extras(self) -> u64 {',
         '        match self {',
         *[f'            {" | ".join("X86ExtraFeature::" + v for v in variants_)} => '
           + ' | '.join(f'1 << X86ExtraFeature::{e} as u8' for e in key) + ','
@@ -689,7 +731,7 @@ def render(rows, options, implied, requires, derived, tunes, vocabulary):
         '    /// GCC accepts the name for x86-64 code (`-m64`).',
         '    pub x86_64: bool,',
         '    pub(crate) features: u64,',
-        '    pub(crate) extras: u32,',
+        '    pub(crate) extras: u64,',
         '    /// GCC\'s `-march=` CPU macros (`__haswell`, `__core_avx2__`, ...).',
         '    pub arch_macros: &\'static [&\'static str],',
         '    /// GCC\'s `-mtune=` macros (`__tune_haswell__`, ...); `-march=` alone',

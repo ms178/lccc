@@ -17,13 +17,17 @@ impl X86ArchRow {
     #[must_use]
     pub(crate) fn host(names: &[&str]) -> X86ArchRow {
         let mut features = 0u64;
-        let mut extras = 0u32;
+        let mut extras = 0u64;
         for name in names {
+            // The probe calls LAHF/SAHF in long mode by its CPUID name; the
+            // option, and with it the extension, is `sahf`.
+            let (option, probe) = crate::common::cpu_probe::SAHF_OPTION_AND_PROBE;
+            let name = if *name == probe { option } else { name };
             if let Some(feature) = X86Feature::parse(name) {
                 features |= 1 << feature as u8;
             } else if let Some(extra) = X86ExtraFeature::ALL
                 .into_iter()
-                .find(|extra| extra.option() == *name)
+                .find(|extra| extra.option() == name)
             {
                 extras |= 1 << extra as u8;
             }
@@ -43,5 +47,40 @@ impl X86ArchRow {
             arch_macros: &[],
             tune_macros: &[],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{X86ArchRow, X86ExtraFeature, X86Feature};
+
+    /// The probe's names reach the extension of the same option name, and
+    /// LAHF/SAHF, which the probe knows by its CPUID name, reaches `sahf`.
+    #[test]
+    fn host_names_reach_features_and_extensions() {
+        let row = X86ArchRow::host(&["avx2", "adx", "rdseed", "lahf-lm", "xsaves", "clwb"]);
+        assert!(row.has(X86Feature::Avx2));
+        for extra in [
+            X86ExtraFeature::Adx,
+            X86ExtraFeature::Rdseed,
+            X86ExtraFeature::Sahf,
+            X86ExtraFeature::Xsaves,
+            X86ExtraFeature::Clwb,
+        ] {
+            assert!(row.has_extra(extra), "{extra:?}");
+        }
+        assert!(!row.has_extra(X86ExtraFeature::Rdpid));
+        // A name nothing models is dropped, not an error.
+        let row = X86ArchRow::host(&["xop", "tbm", "no-such-thing"]);
+        assert_eq!((row.features, row.extras), (0, 0));
+    }
+
+    /// Every extension has a bit of the row's `u64`.
+    #[test]
+    fn every_extension_fits_the_row() {
+        assert!(X86ExtraFeature::ALL.len() <= 64);
+        let all: Vec<&str> = X86ExtraFeature::ALL.iter().map(|e| e.option()).collect();
+        let row = X86ArchRow::host(&all);
+        assert_eq!(row.extras.count_ones() as usize, X86ExtraFeature::ALL.len());
     }
 }
