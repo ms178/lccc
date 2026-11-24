@@ -3811,6 +3811,11 @@ gate "cross-backend-atomics" fast \
 gate "atomic-operators" fast \
     bash tests/regression/check_atomic_operators.sh
 
+# The arguments of `target("...")`, judged as GCC 16.2 judges them: unknown
+# arguments are errors, and the fixture's comments are GCC's own output.
+gate "target-attribute-arguments" fast \
+    python3 tests/regression/check_target_attribute_arguments.py --lccc target/fastbuild/lccc
+
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
 # sqlite_put_varint plus a shrunk-corpus gcc differential — the golden-gate

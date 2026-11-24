@@ -520,3 +520,149 @@ pub(crate) fn x86_target_option(name: &str) -> Option<&'static X86TargetOption> 
         .ok()
         .map(|i| &X86_TARGET_OPTIONS[i])
 }
+
+/// Every plain name GCC takes as an argument of `target("...")`, sorted:
+/// the ISA extensions and the handful of code-generation flags (`cld`,
+/// `recip`, ...). Far more names than lccc models ([`x86_target_option`]):
+/// a name of this list that lccc does not model changes nothing, and a
+/// name outside it is GCC's "attribute 'target' argument ... is unknown".
+pub(crate) const X86_TARGET_ATTRIBUTE_NAMES: &[&str] = &[
+    "3dnow",
+    "3dnowa",
+    "80387",
+    "abm",
+    "adx",
+    "aes",
+    "align-stringops",
+    "amx-avx512",
+    "amx-bf16",
+    "amx-complex",
+    "amx-fp16",
+    "amx-fp8",
+    "amx-int8",
+    "amx-movrs",
+    "amx-tf32",
+    "amx-tile",
+    "apxf",
+    "avx",
+    "avx10.1",
+    "avx10.2",
+    "avx2",
+    "avx512bf16",
+    "avx512bitalg",
+    "avx512bmm",
+    "avx512bw",
+    "avx512cd",
+    "avx512dq",
+    "avx512f",
+    "avx512fp16",
+    "avx512ifma",
+    "avx512vbmi",
+    "avx512vbmi2",
+    "avx512vl",
+    "avx512vnni",
+    "avx512vp2intersect",
+    "avx512vpopcntdq",
+    "avxifma",
+    "avxneconvert",
+    "avxvnni",
+    "avxvnniint16",
+    "avxvnniint8",
+    "bmi",
+    "bmi2",
+    "cld",
+    "cldemote",
+    "clflushopt",
+    "clwb",
+    "clzero",
+    "cmpccxadd",
+    "crc32",
+    "cx16",
+    "enqcmd",
+    "f16c",
+    "fancy-math-387",
+    "fma",
+    "fma4",
+    "fsgsbase",
+    "fxsr",
+    "general-regs-only",
+    "gfni",
+    "hle",
+    "hreset",
+    "ieee-fp",
+    "inline-all-stringops",
+    "inline-stringops-dynamically",
+    "kl",
+    "lwp",
+    "lzcnt",
+    "mmx",
+    "movbe",
+    "movdir64b",
+    "movdiri",
+    "movrs",
+    "mwait",
+    "mwaitx",
+    "pclmul",
+    "pconfig",
+    "pku",
+    "popcnt",
+    "prefetchi",
+    "prfchw",
+    "ptwrite",
+    "raoint",
+    "rdpid",
+    "rdrnd",
+    "rdseed",
+    "recip",
+    "relax-cmpxchg-loop",
+    "rtm",
+    "sahf",
+    "serialize",
+    "sgx",
+    "sha",
+    "sha512",
+    "shstk",
+    "sm3",
+    "sm4",
+    "sse",
+    "sse2",
+    "sse3",
+    "sse4",
+    "sse4.1",
+    "sse4.2",
+    "sse4a",
+    "ssse3",
+    "tbm",
+    "tsxldtrk",
+    "uintr",
+    "usermsr",
+    "vaes",
+    "vpclmulqdq",
+    "waitpkg",
+    "wbnoinvd",
+    "widekl",
+    "xop",
+    "xsave",
+    "xsavec",
+    "xsaveopt",
+    "xsaves",
+];
+
+/// The names of [`X86_TARGET_ATTRIBUTE_NAMES`] whose `no-` form GCC refuses.
+pub(crate) const X86_TARGET_ATTRIBUTE_NO_NEGATION: &[&str] = &["general-regs-only"];
+
+/// The names of [`X86_TARGET_ATTRIBUTE_NAMES`] GCC takes for x86-64 code only.
+pub(crate) const X86_TARGET_ATTRIBUTE_X86_64_ONLY: &[&str] = &["apxf", "uintr"];
+
+/// The values GCC takes in `target("fpmath=...")`.
+pub(crate) const X86_TARGET_ATTRIBUTE_FPMATH: &[&str] =
+    &["387", "sse", "sse+387", "387+sse", "both"];
+
+/// The values GCC takes in `target("prefer-vector-width=...")`.
+pub(crate) const X86_TARGET_ATTRIBUTE_VECTOR_WIDTH: &[&str] = &["none", "128", "256", "512"];
+
+/// GCC takes `name` (without `no-`) as an argument of `target("...")`.
+#[must_use]
+pub(crate) fn x86_target_attribute_name_known(name: &str) -> bool {
+    X86_TARGET_ATTRIBUTE_NAMES.binary_search(&name).is_ok()
+}

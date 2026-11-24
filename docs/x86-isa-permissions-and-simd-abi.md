@@ -91,10 +91,27 @@ implied) happens before either.
 * **Then the override implications**, unless the implied feature is
   explicit, from the command line or an option: `-mno-popcnt` with
   `target("sse4.2")` has no POPCNT.
-* **Errors** use GCC's wording: a repeated `key=`, an unknown or `native`
-  CPU, `arch=generic` (allowed only for `tune=`), and a 32-bit-only CPU
-  on x86-64. `target` together with `target_clones` is diagnosed, and the
-  `target_clones` attribute is ignored, as in GCC.
+* **Errors** use GCC's wording: a repeated `arch=` or `tune=`, an unknown
+  or `native` CPU, `arch=generic` (allowed only for `tune=`), and a
+  32-bit-only CPU on x86-64. `target` together with `target_clones` is
+  diagnosed, and the `target_clones` attribute is ignored, as in GCC.
+* **An argument GCC does not know is an error**: "attribute 'target'
+  argument 'foo' is unknown", once per argument, at the function's name.
+  Until PR #1211 lccc ignored such an argument in silence, so
+  `target("avx2,ssse4.1")` compiled its function without the misspelt
+  extension and `target("AVX2")`, `target("-mavx2")` and `target("bmi 2")`
+  without any. The vocabulary is measured, not listed by hand: the
+  generator tries every `-mNAME` option GCC documents as an attribute
+  argument, in both modes, and records the 119 names GCC takes
+  (`X86_TARGET_ATTRIBUTE_NAMES`), the one it will not negate
+  (`general-regs-only`), and the values of `fpmath=` and
+  `prefer-vector-width=`; `arch=` and `tune=` are the only other keys.
+  The string is read as GCC reads it, a blank being part of a name
+  (`"avx2, sse"` names ` sse`), and the whole string `default` is the
+  multiversioning spelling. A name of the list that lccc does not model
+  (`rdseed`, `clwb`, `tbm`, ...) is accepted and changes nothing. Gate:
+  `tests/regression/check_target_attribute_arguments.py` (68 strings, 53
+  errors, lccc and GCC 16.2 each against the fixture's comments).
 
 ### 1.3 Intrinsic permission
 

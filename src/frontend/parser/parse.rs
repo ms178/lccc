@@ -3135,7 +3135,9 @@ impl Parser {
             // ISA-subset rule and the x86-64 emitter's per-function ISA.
             "target" | "__target__" => {
                 self.advance();
-                self.attrs.parsing_target = self.parse_target_attr_arg();
+                // As written: GCC reads a blank as part of the name, and
+                // `target(" avx2")` is its "argument ' avx2' is unknown".
+                self.attrs.parsing_target = self.parse_string_list_attr_arg(false);
             }
             "target_clones" | "__target_clones__" => {
                 self.advance();
@@ -3411,6 +3413,12 @@ impl Parser {
     /// `target("bmi", "bmi2")` and `target("bmi,bmi2")` are identical.
     /// Malformed contents are skipped to the matching paren.
     fn parse_target_attr_arg(&mut self) -> Option<String> {
+        self.parse_string_list_attr_arg(true)
+    }
+
+    /// [`Self::parse_target_attr_arg`]; `trim` strips the blanks around each
+    /// argument. An empty argument is dropped either way.
+    fn parse_string_list_attr_arg(&mut self, trim: bool) -> Option<String> {
         if !matches!(self.peek(), TokenKind::LParen) {
             return None;
         }
@@ -3451,7 +3459,7 @@ impl Parser {
         parts.push(cur);
         let joined = parts
             .iter()
-            .map(|p| p.trim())
+            .map(|p| if trim { p.trim() } else { p.as_str() })
             .filter(|p| !p.is_empty())
             .collect::<Vec<_>>()
             .join(",");

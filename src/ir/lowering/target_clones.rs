@@ -173,40 +173,152 @@ mod gcc_prio {
     }
 }
 
-/// GCC 16.2's verdict on an x86 `target("...")` string, or `None` when it
-/// is accepted: a repeated `key=` option, `arch=generic`, a CPU name GCC
-/// does not know (`native` included), and a 32-bit-only CPU on x86-64 are
-/// errors there, worded as GCC words them.
-fn x86_target_attribute_error(raw: &str, x86_64: bool) -> Option<String> {
-    let options: Vec<&str> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|o| !o.is_empty())
-        .collect();
-    for (index, option) in options.iter().enumerate() {
-        if let Some((key, _)) = option.split_once('=')
-            && options[..index]
-                .iter()
-                .any(|prev| prev.split_once('=').is_some_and(|(k, _)| k == key))
-        {
-            return Some(format!(
-                "attribute value '{option}' was already specified in 'target' attribute"
+/// One of GCC 16.2's errors for an x86 `target("...")` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetAttributeError {
+    message: String,
+    /// GCC reports it at the function's name (the argument errors); the
+    /// CPU-name errors go to the start of the declaration.
+    at_name: bool,
+}
+
+/// GCC 16.2's errors for an x86 `target("...")` string, in GCC's order;
+/// empty when it is accepted. Measured on `gcc-16 -c`, message for message.
+///
+/// GCC reads the string twice, and an error of the first reading ends the
+/// second.
+///
+/// 1. Argument by argument, split at the commas and taken as written -- a
+///    blank is part of the name, so `"avx2, sse"` names ` sse` -- with only
+///    a trailing comma forgiven. An argument is a plain name GCC knows
+///    ([`X86_TARGET_ATTRIBUTE_NAMES`], 119 of them), or one of the four
+///    `KEY=value` forms, either behind an optional `no-`. Anything else is
+///    "attribute 'target' argument '...' is unknown", once per argument.
+///    lccc took every such string in silence: `target("avx2,ssse4.1")`
+///    compiled its function without the misspelt extension, and
+///    `target("bmi 2")`, `target("AVX2")` and `target("-mavx2")` without
+///    any, where GCC stops the build. A closed-list key with a value off
+///    its list (`fpmath=`, `prefer-vector-width=`), a second `arch=` or
+///    `tune=`, and `no-general-regs-only` are errors of this reading too;
+///    the last one ends it on the spot.
+/// 2. The CPU names: `arch=generic`, a name GCC does not know (`native`
+///    included), a 32-bit-only CPU on x86-64, then the same for `tune=`
+///    (which does take `native` and `generic`).
+///
+/// A name of the list that lccc does not model (`rdseed`, `clwb`, ...)
+/// is accepted and changes nothing, as before.
+///
+/// [`X86_TARGET_ATTRIBUTE_NAMES`]: crate::backend::x86::arch_table::X86_TARGET_ATTRIBUTE_NAMES
+fn x86_target_attribute_errors(raw: &str, x86_64: bool) -> Vec<TargetAttributeError> {
+    use crate::backend::x86::arch_table::{
+        X86_TARGET_ATTRIBUTE_FPMATH, X86_TARGET_ATTRIBUTE_NO_NEGATION,
+        X86_TARGET_ATTRIBUTE_VECTOR_WIDTH, x86_target_attribute_name_known, x86_tune_name_valid,
+    };
+    let at_name = |message: String| TargetAttributeError {
+        message,
+        at_name: true,
+    };
+    let at_declaration = |message: String| TargetAttributeError {
+        message,
+        at_name: false,
+    };
+    // The whole string `default` is the function-multiversioning spelling
+    // and no option; as one argument among others it is unknown.
+    if raw == "default" {
+        return Vec::new();
+    }
+    let mut arguments: Vec<&str> = raw.split(',').collect();
+    if arguments.last() == Some(&"") {
+        arguments.pop();
+    }
+    let mut errors = Vec::new();
+    let (mut arch, mut tune) = (None, None);
+    for argument in arguments {
+        let body = argument.strip_prefix("no-").unwrap_or(argument);
+        let unknown = || {
+            at_name(format!(
+                "attribute 'target' argument '{argument}' is unknown"
+            ))
+        };
+        let Some((key, value)) = body.split_once('=') else {
+            if !x86_target_attribute_name_known(body) {
+                errors.push(unknown());
+            } else if body.len() != argument.len()
+                && X86_TARGET_ATTRIBUTE_NO_NEGATION.contains(&body)
+            {
+                errors.push(at_name(format!(
+                    "pragma or attribute 'target(\"{body}\")' does not allow a negated form"
+                )));
+                return errors;
+            }
+            continue;
+        };
+        let cpu = match key {
+            _ if value.is_empty() => {
+                errors.push(unknown());
+                continue;
+            }
+            "arch" => &mut arch,
+            "tune" => &mut tune,
+            "fpmath" | "prefer-vector-width" => {
+                let values = if key == "fpmath" {
+                    X86_TARGET_ATTRIBUTE_FPMATH
+                } else {
+                    X86_TARGET_ATTRIBUTE_VECTOR_WIDTH
+                };
+                if !values.contains(&value) {
+                    errors.push(at_name(format!(
+                        "attribute value '{body}' is unknown in 'target' attribute"
+                    )));
+                }
+                continue;
+            }
+            _ => {
+                errors.push(unknown());
+                continue;
+            }
+        };
+        if cpu.is_some() {
+            errors.push(at_name(format!(
+                "attribute value '{body}' was already specified in 'target' attribute"
+            )));
+        } else {
+            *cpu = Some(value);
+        }
+    }
+    if !errors.is_empty() {
+        return errors;
+    }
+    const NOT_X86_64: &str = "CPU you selected does not support x86-64 instruction set";
+    if let Some(arch) = arch {
+        if arch == "generic" {
+            errors.push(at_declaration(
+                "'generic' CPU can be used only for 'target(\"tune=\")' attribute".into(),
             ));
+            return errors;
+        }
+        match crate::backend::x86::isa::X86Isa::arch_row(arch) {
+            None => errors.push(at_declaration(format!(
+                "bad value '{arch}' for 'target(\"arch=\")' attribute"
+            ))),
+            Some(row) if x86_64 && !row.x86_64 => {
+                errors.push(at_declaration(NOT_X86_64.into()));
+                return errors;
+            }
+            Some(_) => {}
         }
     }
-    let arch = options.iter().find_map(|o| o.strip_prefix("arch="))?;
-    if arch == "generic" {
-        return Some("'generic' CPU can be used only for 'target(\"tune=\")' attribute".into());
+    if let Some(tune) = tune.filter(|&tune| tune != "native" && !x86_tune_name_valid(tune, x86_64))
+    {
+        errors.push(at_declaration(
+            if x86_64 && x86_tune_name_valid(tune, false) {
+                NOT_X86_64.into()
+            } else {
+                format!("bad value '{tune}' for 'target(\"tune=\")' attribute")
+            },
+        ));
     }
-    match crate::backend::x86::isa::X86Isa::arch_row(arch) {
-        None => Some(format!(
-            "bad value '{arch}' for 'target(\"arch=\")' attribute"
-        )),
-        Some(row) if x86_64 && !row.x86_64 => {
-            Some("CPU you selected does not support x86-64 instruction set".into())
-        }
-        Some(_) => None,
-    }
+    errors
 }
 
 impl Lowerer {
@@ -218,8 +330,12 @@ impl Lowerer {
         let Some(raw) = func.attrs.target.as_deref() else {
             return;
         };
-        if let Some(message) = x86_target_attribute_error(raw, self.target == Target::X86_64) {
-            self.diagnostics.borrow_mut().error(message, func.span);
+        for error in x86_target_attribute_errors(raw, self.target == Target::X86_64) {
+            let span = match func.name_span {
+                Some(name) if error.at_name => name,
+                _ => func.span,
+            };
+            self.diagnostics.borrow_mut().error(error.message, span);
         }
     }
 
@@ -459,7 +575,155 @@ impl Lowerer {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_clone_spec, x86_target_attribute_error};
+    use super::{resolve_clone_spec, x86_target_attribute_errors};
+
+    /// The first verdict, as the tests below read it.
+    fn x86_target_attribute_error(raw: &str, x86_64: bool) -> Option<String> {
+        x86_target_attribute_errors(raw, x86_64)
+            .into_iter()
+            .next()
+            .map(|error| error.message)
+    }
+
+    /// Every argument GCC 16.2 does not know is an error of its own, at the
+    /// function's name; a known name lccc does not model is not one.
+    #[test]
+    fn unknown_target_attribute_arguments_are_errors() {
+        let messages = |raw: &str| -> Vec<String> {
+            let errors = x86_target_attribute_errors(raw, true);
+            assert!(errors.iter().all(|e| e.at_name), "{raw}: {errors:?}");
+            errors.into_iter().map(|e| e.message).collect()
+        };
+        let unknown =
+            |argument: &str| format!("attribute 'target' argument '{argument}' is unknown");
+        // Accepted: modelled names, names GCC knows and lccc does not model,
+        // flags, negations, the four keys, a trailing comma.
+        for raw in [
+            "avx2",
+            "no-avx512f,avx2",
+            "rdseed",
+            "clwb,no-xop,sse4a",
+            "cld,no-recip,80387,no-ieee-fp",
+            "general-regs-only",
+            "sse4.1,sse4.2,sse4,no-sse4",
+            "fpmath=sse",
+            "fpmath=sse+387",
+            "fpmath=sse,fpmath=387",
+            "prefer-vector-width=256,prefer-vector-width=none",
+            "arch=haswell,tune=native",
+            "no-arch=k8",
+            "avx2,sse,",
+            "",
+            "default",
+        ] {
+            assert_eq!(messages(raw), Vec::<String>::new(), "{raw}");
+        }
+        // Refused: GCC's wording, every unknown argument named as written.
+        for (raw, argument) in [
+            ("foo", "foo"),
+            ("no-foo", "no-foo"),
+            ("AVX2", "AVX2"),
+            ("mavx2", "mavx2"),
+            ("-mavx2", "-mavx2"),
+            ("sse4_1", "sse4_1"),
+            ("avx2, sse", " sse"),
+            (" avx2", " avx2"),
+            ("avx2 ", "avx2 "),
+            (",avx2", ""),
+            ("avx2,,sse", ""),
+            ("no-", "no-"),
+            ("no-no-sse", "no-no-sse"),
+            ("avx2,bar=3", "bar=3"),
+            ("sse=1", "sse=1"),
+            ("arch=", "arch="),
+            ("branch-cost=2", "branch-cost=2"),
+            ("fpmath=sse,387", "387"),
+            ("foo,arch=zzz", "foo"),
+            ("arch=haswell,foo", "foo"),
+            ("default,avx2", "default"),
+            ("avx2,default", "default"),
+            ("default,", "default"),
+            ("no-default", "no-default"),
+        ] {
+            assert_eq!(messages(raw), vec![unknown(argument)], "{raw}");
+        }
+        assert_eq!(
+            messages("sse,foo,bar"),
+            vec![unknown("foo"), unknown("bar")]
+        );
+        assert_eq!(
+            messages("fpmath=bogus"),
+            vec!["attribute value 'fpmath=bogus' is unknown in 'target' attribute"]
+        );
+        assert_eq!(
+            messages("prefer-vector-width=64,foo"),
+            vec![
+                "attribute value 'prefer-vector-width=64' is unknown in 'target' attribute"
+                    .to_string(),
+                unknown("foo"),
+            ]
+        );
+        // The negated form GCC refuses ends the reading.
+        assert_eq!(
+            messages("no-general-regs-only,foo"),
+            vec![
+                "pragma or attribute 'target(\"general-regs-only\")' does not allow a negated form"
+            ]
+        );
+        assert_eq!(
+            messages("arch=k8,arch=k8,foo"),
+            vec![
+                "attribute value 'arch=k8' was already specified in 'target' attribute".to_string(),
+                unknown("foo"),
+            ]
+        );
+        assert_eq!(
+            messages("no-arch=k8,arch=k8"),
+            vec!["attribute value 'arch=k8' was already specified in 'target' attribute"]
+        );
+    }
+
+    /// The CPU names of `arch=` and `tune=`, judged after the arguments and
+    /// reported at the declaration.
+    #[test]
+    fn target_attribute_cpu_names_are_judged_like_gcc() {
+        let messages = |raw: &str, x86_64: bool| -> Vec<String> {
+            let errors = x86_target_attribute_errors(raw, x86_64);
+            assert!(errors.iter().all(|e| !e.at_name), "{raw}: {errors:?}");
+            errors.into_iter().map(|e| e.message).collect()
+        };
+        let bad = |value: &str, key: &str| {
+            format!("bad value '{value}' for 'target(\"{key}=\")' attribute")
+        };
+        for raw in [
+            "tune=native",
+            "tune=generic",
+            "tune=intel",
+            "arch=haswell,tune=znver4",
+        ] {
+            assert_eq!(messages(raw, true), Vec::<String>::new(), "{raw}");
+        }
+        assert_eq!(messages("tune=zzz", true), vec![bad("zzz", "tune")]);
+        assert_eq!(
+            messages("tune=x86-64-v3", true),
+            vec![bad("x86-64-v3", "tune")]
+        );
+        // Both names, `arch=` first whatever the order written.
+        for raw in ["arch=zzz,tune=yyy", "tune=yyy,arch=zzz"] {
+            assert_eq!(
+                messages(raw, true),
+                vec![bad("zzz", "arch"), bad("yyy", "tune")]
+            );
+        }
+        let not_x86_64 = "CPU you selected does not support x86-64 instruction set";
+        assert_eq!(messages("tune=i386", true), vec![not_x86_64]);
+        assert_eq!(messages("arch=pentium4,tune=i386", true), vec![not_x86_64]);
+        assert_eq!(messages("tune=i386", false), Vec::<String>::new());
+        assert_eq!(
+            messages("tune=generic,arch=generic", true),
+            vec!["'generic' CPU can be used only for 'target(\"tune=\")' attribute"]
+        );
+    }
 
     /// The verdicts GCC 16.2 gives (measured on `gcc-16 -c`).
     #[test]

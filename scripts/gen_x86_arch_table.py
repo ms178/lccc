@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate src/backend/x86/arch_table.rs from GCC 16.2.
 
-Two tables, neither transcribed by hand:
+Three tables, none transcribed by hand:
 
 * Every CPU name GCC accepts in ``-march=`` and in
   ``__attribute__((target("arch=NAME")))`` (the two lists are verified to
@@ -9,6 +9,11 @@ Two tables, neither transcribed by hand:
   enables, read from GCC's predefined macros (``gcc -march=NAME -dM -E``)
   in the CPU's widest mode, and CMOV, which has no macro, from GCC's code
   generation.
+* The vocabulary of ``target("...")``: every plain name GCC takes there
+  (121 of them; lccc models some 50), the ones it will not negate, the
+  ones it takes for x86-64 only, and the values of ``fpmath=`` and
+  ``prefer-vector-width=``. A name outside it is an error in GCC, and the
+  lowering reports it from this list.
 * Every ISA option of ``target("...")``: the features ``NAME`` enables
   and disables and the features ``no-NAME`` disables, each with everything
   GCC's implication graph attaches to it. Measured with ``#pragma GCC
@@ -457,6 +462,83 @@ def measure_options():
     return sorted(options)
 
 
+# `fpmath=` and `prefer-vector-width=` spellings tried against GCC; the
+# table keeps the ones it takes.
+FPMATH_CANDIDATES = ['387', 'sse', 'sse+387', '387+sse', 'both', 'sse387', 'none', 'avx']
+VECTOR_WIDTH_CANDIDATES = ['none', '64', '128', '256', '512', '1024']
+# `KEY=` spellings tried as attribute arguments: every `-mKEY=` option GCC
+# documents. The table keeps the ones whose value GCC goes on to judge.
+UNKNOWN_ARGUMENT = re.compile(r"attribute 'target' argument '[^']*' is unknown")
+
+
+def attribute_verdict(mode, argument):
+    """GCC's first diagnostic for `target("argument")`, or None if accepted."""
+    src = f'__attribute__((target("{argument}"))) int f(void) {{ return 0; }}\n'
+    proc = run([mode, '-x', 'c', '-c', '-', '-o', os.devnull], src)
+    if proc.returncode == 0:
+        return None
+    match = re.search(r'error: (.*)', proc.stderr)
+    if not match:
+        sys.exit(f'target("{argument}") fails without an error:\n{proc.stderr}')
+    return match.group(1)
+
+
+def measure_attribute_vocabulary():
+    """What GCC takes inside `target("...")`, apart from what it does:
+
+    * the plain names (`avx2`, `rdseed`, `cld`, ...): every `-mNAME` option
+      GCC documents is tried as `NAME`, in 64-bit and in 32-bit code;
+    * the names whose `no-` form GCC refuses;
+    * the names GCC takes for x86-64 code only;
+    * the `KEY=` arguments, and the values of the two keys whose values are
+      a closed list (`fpmath=`, `prefer-vector-width=`; `arch=` and `tune=`
+      take the CPU names of the tables above).
+
+    Anything else is GCC's "attribute 'target' argument '...' is unknown"."""
+    listing = run(['--help=target']).stdout
+    plain, keyed = set(), set()
+    for line in listing.splitlines():
+        match = re.match(r'\s+-m([a-z0-9][-a-z0-9_.]*)(=?)', line)
+        if match:
+            (keyed if match.group(2) else plain).add(match.group(1))
+    # `-mno-NAME` entries of the listing are negations, not names.
+    plain = sorted(n for n in plain if not (n.startswith('no-') and n[3:] in plain))
+
+    def judge(name):
+        return name, [attribute_verdict(mode, form)
+                      for mode in ('-m64', '-m32') for form in (name, f'no-{name}')]
+
+    with ThreadPoolExecutor(os.cpu_count() or 1) as pool:
+        verdicts = dict(pool.map(judge, plain))
+    names, no_negation, x86_64_only = [], [], []
+    for name, (take64, deny64, take32, deny32) in sorted(verdicts.items()):
+        unknown64 = take64 is not None and UNKNOWN_ARGUMENT.fullmatch(take64)
+        unknown32 = take32 is not None and UNKNOWN_ARGUMENT.fullmatch(take32)
+        if unknown64 and unknown32:
+            continue
+        if unknown64 or unknown32:
+            sys.exit(f'target("{name}"): known in one mode only ({take64!r}, {take32!r})')
+        names.append(name)
+        if take64 is None and take32 is not None:
+            x86_64_only.append(name)
+        elif take64 is not None:
+            sys.exit(f'target("{name}"): a known name GCC refuses on x86-64: {take64}')
+        if (deny64 is None) != (deny32 is None) and name not in x86_64_only:
+            sys.exit(f'target("no-{name}"): the two modes disagree ({deny64!r}, {deny32!r})')
+        if deny64 is not None:
+            if 'does not allow a negated form' not in deny64:
+                sys.exit(f'target("no-{name}"): unexpected refusal: {deny64}')
+            no_negation.append(name)
+    keys = sorted(key for key in keyed
+                  if not UNKNOWN_ARGUMENT.fullmatch(attribute_verdict('-m64', f'{key}=lccc-probe') or ''))
+    if keys != ['arch', 'fpmath', 'prefer-vector-width', 'tune']:
+        sys.exit(f'target("KEY="): GCC takes {keys}; the lowering knows four keys')
+    fpmath = [v for v in FPMATH_CANDIDATES if attribute_verdict('-m64', f'fpmath={v}') is None]
+    widths = [v for v in VECTOR_WIDTH_CANDIDATES
+              if attribute_verdict('-m64', f'prefer-vector-width={v}') is None]
+    return names, no_negation, x86_64_only, fpmath, widths
+
+
 def measure_abm_derived(rows):
     """{CPU: features it has only through ABM}. GCC grants a CPU's ABM-
     derived POPCNT and LZCNT only while ABM itself is not denied:
@@ -532,7 +614,7 @@ def bit(item):
     return PSEUDO_CONST.get(item, f'1 << {item} as u8')
 
 
-def render(rows, options, implied, requires, derived, tunes):
+def render(rows, options, implied, requires, derived, tunes, vocabulary):
     extras = [variant for variant, _ in EXTRA_MACROS]
     out = [
         '//! GCC 16.2\'s x86 CPU names (`-march=` and `target("arch=")`), the',
@@ -808,6 +890,31 @@ def render(rows, options, implied, requires, derived, tunes):
         '        .map(|i| &X86_TARGET_OPTIONS[i])',
         '}',
         '',
+        '/// Every plain name GCC takes as an argument of `target("...")`, sorted:',
+        '/// the ISA extensions and the handful of code-generation flags (`cld`,',
+        '/// `recip`, ...). Far more names than lccc models ([`x86_target_option`]):',
+        '/// a name of this list that lccc does not model changes nothing, and a',
+        '/// name outside it is GCC\'s "attribute \'target\' argument ... is unknown".',
+        f'pub(crate) const X86_TARGET_ATTRIBUTE_NAMES: &[&str] = &[{rust_strs(vocabulary[0])}];',
+        '',
+        '/// The names of [`X86_TARGET_ATTRIBUTE_NAMES`] whose `no-` form GCC refuses.',
+        f'pub(crate) const X86_TARGET_ATTRIBUTE_NO_NEGATION: &[&str] = &[{rust_strs(vocabulary[1])}];',
+        '',
+        '/// The names of [`X86_TARGET_ATTRIBUTE_NAMES`] GCC takes for x86-64 code only.',
+        f'pub(crate) const X86_TARGET_ATTRIBUTE_X86_64_ONLY: &[&str] = &[{rust_strs(vocabulary[2])}];',
+        '',
+        '/// The values GCC takes in `target("fpmath=...")`.',
+        f'pub(crate) const X86_TARGET_ATTRIBUTE_FPMATH: &[&str] = &[{rust_strs(vocabulary[3])}];',
+        '',
+        '/// The values GCC takes in `target("prefer-vector-width=...")`.',
+        f'pub(crate) const X86_TARGET_ATTRIBUTE_VECTOR_WIDTH: &[&str] = &[{rust_strs(vocabulary[4])}];',
+        '',
+        '/// GCC takes `name` (without `no-`) as an argument of `target("...")`.',
+        '#[must_use]',
+        'pub(crate) fn x86_target_attribute_name_known(name: &str) -> bool {',
+        '    X86_TARGET_ATTRIBUTE_NAMES.binary_search(&name).is_ok()',
+        '}',
+        '',
     ]
     return '\n'.join(out)
 
@@ -866,8 +973,15 @@ def main(argv):
     checked = verify_march_negation(rows, options, derived)
     print(f'-march= with -mno-: {checked} cases match the model ({GCC})')
     tunes = measure_tune_vocabulary(rows)
+    vocabulary = measure_attribute_vocabulary()
+    # Every name lccc models is one GCC takes, or the model has a name the
+    # diagnostic would refuse.
+    stray = sorted({o[0] for o in options} - set(vocabulary[0]) - set(LEGACY_OPTION_NAMES.values()))
+    if stray:
+        sys.exit(f'modelled target options GCC does not take: {stray}')
     text = rustfmt(
-        render(rows, options, measure_implied(options), measure_extra_requires(), derived, tunes)
+        render(rows, options, measure_implied(options), measure_extra_requires(), derived, tunes,
+               vocabulary)
     )
     if argv == ['--check']:
         check_committed(text, OUTPUT.read_text() if OUTPUT.exists() else '',

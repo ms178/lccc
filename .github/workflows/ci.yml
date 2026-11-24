@@ -3096,6 +3096,10 @@ jobs:
         # and lost updates under threads): the instruction each becomes on
         # all four backends, and the threaded program at every level.
         bash tests/regression/check_atomic_operators.sh
+        # The arguments of `target("...")`: an argument GCC does not know is
+        # an error (it was ignored in silence), in GCC's words, on GCC's
+        # lines; the fixture's comments are re-measured against GCC 16.2.
+        python3 tests/regression/check_target_attribute_arguments.py --lccc target/fastbuild/lccc
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.
