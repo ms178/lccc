@@ -109,13 +109,35 @@ pub(super) fn is_callee_saved_reg(reg: RegId) -> bool {
 #[inline]
 pub(super) fn is_rsp_shift_line(t: &str) -> bool {
     let t = t.trim_ascii();
-    if t.starts_with("push") || t.starts_with("pop") {
+    if is_push_or_pop_line(t) {
         return true;
     }
     if t.starts_with("subq $") || t.starts_with("addq $") {
         return t.ends_with("%rsp");
     }
     false
+}
+
+/// Whether the instruction `t` pushes onto or pops off the stack, in any
+/// spelling (`pushq`, `pushfq`, `popq`, `popfq`, `push2`, ...).
+///
+/// By mnemonic and not by the bare prefix `pop`: `popcnt` begins with it and
+/// moves no stack pointer. Read as a `pop`, `popcntq %rax, %rdi` made
+/// `eliminate_never_read_stores` believe `%rsp` stood 8 bytes higher from
+/// there on, so that every later `N(%rsp)` was taken for the slot at `N + 8`:
+/// the slots really read had "no reader" and their stores were deleted, and
+/// the function went on to read uninitialised stack. Any frame-pointer-less
+/// function that ran a `popcnt` and afterwards reloaded a spilled value was
+/// miscompiled this way at every level above `-O0`
+/// (`tests/regression/popcnt_stack_slot_reads.c`).
+#[inline]
+pub(super) fn is_push_or_pop_line(t: &str) -> bool {
+    let t = t.trim_ascii();
+    let mnemonic = t
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or("");
+    mnemonic.starts_with("push") || (mnemonic.starts_with("pop") && !mnemonic.starts_with("popcnt"))
 }
 
 /// Check if a line of assembly text references a given register family.
@@ -1083,6 +1105,55 @@ pub(super) fn count_top_level_operands(ops: &str) -> usize {
 }
 
 // ── tests: register rewriting and redefinition predicates ───────────────────
+
+#[cfg(test)]
+mod stack_shift_tests {
+    use super::{is_push_or_pop_line, is_rsp_shift_line};
+
+    /// `popcnt` is not a `pop`: it leaves `%rsp` where it is.
+    #[test]
+    fn popcnt_does_not_shift_the_stack_pointer() {
+        for line in [
+            "popcntq %rax, %rdi",
+            "popcntl %esi, %esi",
+            "popcntw %ax, %cx",
+            "popcnt %rax, %rdi",
+            "    popcntq 8(%rsp), %rax",
+            "popcntl (%rdi), %eax",
+        ] {
+            assert!(!is_push_or_pop_line(line), "{line}");
+            assert!(!is_rsp_shift_line(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn every_push_and_pop_spelling_shifts_the_stack_pointer() {
+        for line in [
+            "pushq %rbx",
+            "push %rbx",
+            "pushq $1",
+            "pushq 8(%rsp)",
+            "pushfq",
+            "pushf",
+            "pushw %ax",
+            "popq %rbx",
+            "pop %rbx",
+            "popfq",
+            "popf",
+            "popw %ax",
+            "    popq %rbp",
+            "push2 %rax, %rbx",
+            "pop2 %rax, %rbx",
+        ] {
+            assert!(is_push_or_pop_line(line), "{line}");
+            assert!(is_rsp_shift_line(line), "{line}");
+        }
+        assert!(is_rsp_shift_line("subq $24, %rsp"));
+        assert!(is_rsp_shift_line("addq $24, %rsp"));
+        assert!(!is_rsp_shift_line("addq $24, %rax"));
+        assert!(!is_push_or_pop_line("movq %rax, %rbx"));
+    }
+}
 
 #[cfg(test)]
 mod register_rewrite_tests {

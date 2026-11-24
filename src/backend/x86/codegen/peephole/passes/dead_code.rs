@@ -456,13 +456,22 @@ fn frame_base(line: &str, default: u8) -> u8 {
 /// rsp down 8 (delta +8), `pop` reverses it (delta -8), `subq $N,%rsp` adds
 /// N and `addq $N,%rsp` subtracts N. `None` means the shift cannot be parsed
 /// as a constant, so the caller must keep its historical fail-closed rule.
+///
+/// By mnemonic: only the pushes and pops of one 8-byte word have the step
+/// this returns. `pushw`/`popw` move 2 bytes and APX `push2`/`pop2` 16, so
+/// they are `None` like any other shift that cannot be read off the text --
+/// and `popcnt`, which the prefix `pop` used to cover, is not a shift at all
+/// (`helpers::is_push_or_pop_line`).
 fn rsp_delta_step(t: &str) -> Option<i64> {
     let t = t.trim_ascii();
-    if t.starts_with("push") {
-        return Some(8);
-    }
-    if t.starts_with("pop") {
-        return Some(-8);
+    let mnemonic = t
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or("");
+    match mnemonic {
+        "push" | "pushq" | "pushf" | "pushfq" => return Some(8),
+        "pop" | "popq" | "popf" | "popfq" => return Some(-8),
+        _ => {}
     }
     if let Some(rest) = t.strip_prefix("subq $") {
         return rest
@@ -1647,7 +1656,7 @@ fn step_rsp_depth(
         // frame slot at the pre-shift depth; counting only the delta step would
         // drop that frame access. Register/immediate forms carry no frame
         // operand and are safe to model as a bare step.
-        if (t.starts_with("push") || t.starts_with("pop")) && t.contains('(') {
+        if is_push_or_pop_line(t) && t.contains('(') {
             return false;
         }
         match rsp_delta_step(t) {
@@ -1782,6 +1791,50 @@ mod tests {
         assert!(!infos[stores[0]].is_nop() && !infos[stores[1]].is_nop());
         assert!(infos[stores[2]].is_nop() && !infos[stores[3]].is_nop());
         assert!(!eliminate_dead_stores(&store, &mut infos));
+    }
+
+    /// `popcnt` is no `pop`: `%rsp` stands where it stood, and the slot read
+    /// after it is the slot the text names. Taken for a pop it moved every
+    /// later read up by 8 bytes, so the store that fed `0(%rsp)` had no
+    /// reader and was deleted (`tests/regression/popcnt_stack_slot_reads.c`
+    /// is the program this is the kernel of).
+    #[test]
+    fn never_read_stores_keep_the_slot_read_after_a_popcnt() {
+        let asm = "f:\n.cfi_startproc\n    subq $24, %rsp\n    movq %rsi, 0(%rsp)\n    movq %rdx, 8(%rsp)\n    movq %rcx, 16(%rsp)\n    popcntq %rdi, %rax\n    movq 0(%rsp), %rsi\n    addq %rsi, %rax\n    movq 8(%rsp), %rdx\n    addq %rdx, %rax\n    addq $24, %rsp\n    ret\n.cfi_endproc\n.size f, .-f\n";
+        let (store, mut infos) = build(asm);
+        let slot_store = |infos: &[LineInfo], at: i32| {
+            (0..store.len())
+                .find(
+                    |&i| matches!(infos[i].kind, LineKind::StoreRbp { offset, .. } if offset == at),
+                )
+                .expect("the store is in the text")
+        };
+        let (s0, s8, s16) = (
+            slot_store(&infos, 0),
+            slot_store(&infos, 8),
+            slot_store(&infos, 16),
+        );
+        eliminate_never_read_stores(&store, &mut infos);
+        assert!(!infos[s0].is_nop(), "0(%rsp) is read after the popcnt");
+        assert!(!infos[s8].is_nop(), "8(%rsp) is read after the popcnt");
+        assert!(infos[s16].is_nop(), "16(%rsp) has no reader and goes");
+    }
+
+    /// The steps a stack shift has, by mnemonic.
+    #[test]
+    fn rsp_delta_step_reads_the_mnemonic_not_a_prefix() {
+        assert_eq!(rsp_delta_step("pushq %rbx"), Some(8));
+        assert_eq!(rsp_delta_step("push %rbx"), Some(8));
+        assert_eq!(rsp_delta_step("pushfq"), Some(8));
+        assert_eq!(rsp_delta_step("popq %rbx"), Some(-8));
+        assert_eq!(rsp_delta_step("popfq"), Some(-8));
+        assert_eq!(rsp_delta_step("subq $40, %rsp"), Some(40));
+        assert_eq!(rsp_delta_step("addq $40, %rsp"), Some(-40));
+        // Not one 8-byte word, or no shift at all.
+        assert_eq!(rsp_delta_step("pushw %ax"), None);
+        assert_eq!(rsp_delta_step("popw %ax"), None);
+        assert_eq!(rsp_delta_step("push2 %rax, %rbx"), None);
+        assert_eq!(rsp_delta_step("popcntq %rdi, %rax"), None);
     }
 
     /// A vector spill overwritten by a later spill of the same bytes, with no
