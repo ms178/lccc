@@ -66,6 +66,13 @@ pub(super) enum AddendHi {
     /// High half = sign replication of the low source (sext feeder):
     /// `movl src,%ecx; sarl $31,%ecx` before the add.
     Sext,
+    /// The low source is `bytes` (1 or 2) wide and its 32-bit home holds
+    /// those bytes and nothing certain above them: narrow arithmetic is not
+    /// cut back in its home (`unsigned short n = 0; n--` leaves `0xffffffff`
+    /// there), the casts that read it do the cutting, and the feeder cast of
+    /// a fused chain emits nothing. The fused add therefore extends the
+    /// source itself, through %ecx, by sign if `signed`.
+    Narrow { bytes: u8, signed: bool },
     /// High half readable from this reference (materialized slot's high
     /// word).
     Ref(MulRef),
@@ -88,6 +95,11 @@ impl I686Codegen {
     ///   zero-high constant; the addend may be ANY materialized-before-head
     ///   wide value (both halves readable from its slot pair), a constant
     ///   (lo+hi immediates), or a feeder.
+    /// - a feeder whose source is 8 or 16 bits wide is not read as 32: the
+    ///   home of a narrow value holds its own bits and nothing certain
+    ///   above them, and a virtual cast extends nothing. A narrow addend is
+    ///   extended by the fused add itself ([`AddendHi::Narrow`]); a narrow
+    ///   base keeps its cast and is read from the slot the cast writes.
     pub(super) fn resolve_mulacc_plans(&mut self, func: &crate::ir::reexports::IrFunction) {
         self.mulacc_plans.clear();
         self.mulacc_head_of.clear();
@@ -135,6 +147,10 @@ impl I686Codegen {
 
         for chain in &table.chains {
             // ---- Shared reference helpers (final RA; TOKENS, not strings). ----
+            // A type whose values do not fill a 32-bit home.
+            fn sub_word(ty: IrType) -> bool {
+                matches!(ty, IrType::U8 | IrType::I8 | IrType::U16 | IrType::I16)
+            }
             // NARROW (32-bit) source reference: safe register home
             // (∉ {eax,edx,ecx} — the fused sequence's scratch set), or slot.
             fn narrow_ref_of(cg: &I686Codegen, v: &Value) -> Option<MulRef> {
@@ -186,8 +202,15 @@ impl I686Codegen {
                                     Some(MulRef::Imm(v as i32))
                                 }
                                 Operand::Value(sv) => {
-                                    if let Some(r) = narrow_ref_of(cg, sv) {
-                                        return Some(r);
+                                    // The multiply reads all 32 bits of its
+                                    // operand, twice, with no register left
+                                    // to extend an 8- or 16-bit source into
+                                    // (see `AddendHi::Narrow`): such a base
+                                    // is read from the slot its cast wrote.
+                                    if !sub_word(*from_ty) {
+                                        if let Some(r) = narrow_ref_of(cg, sv) {
+                                            return Some(r);
+                                        }
                                     }
                                     // Materialized fallback: zext slot low half.
                                     if !cg.zext_wide_values.contains(&v.0) {
@@ -236,10 +259,17 @@ impl I686Codegen {
                                 ),
                                 Operand::Value(sv) => {
                                     if let Some(r) = narrow_ref_of(cg, sv) {
-                                        let hi = if from_ty.is_signed() {
-                                            AddendHi::Sext
-                                        } else {
-                                            AddendHi::Imm(0)
+                                        let hi = match from_ty {
+                                            IrType::U8 | IrType::I8 => AddendHi::Narrow {
+                                                bytes: 1,
+                                                signed: from_ty.is_signed(),
+                                            },
+                                            IrType::U16 | IrType::I16 => AddendHi::Narrow {
+                                                bytes: 2,
+                                                signed: from_ty.is_signed(),
+                                            },
+                                            _ if from_ty.is_signed() => AddendHi::Sext,
+                                            _ => AddendHi::Imm(0),
                                         };
                                         return Some((r, hi));
                                     }
@@ -302,6 +332,13 @@ impl I686Codegen {
             // (exactly the narrow_ref_of outcome: safe register home or slot).
             for f in chain.feeders() {
                 let src_direct = match feeder_src.get(&f) {
+                    // The base of 8 or 16 bits was not taken directly: its
+                    // cast has to write the slot the multiply reads.
+                    Some((Operand::Value(_), from_ty))
+                        if chain.rhs_feeder == Some(f) && sub_word(*from_ty) =>
+                    {
+                        false
+                    }
                     Some((Operand::Value(sv), _)) => narrow_ref_of(self, sv).is_some(),
                     Some((Operand::Const(_), _)) => true,
                     _ => false,
@@ -353,6 +390,44 @@ impl I686Codegen {
             MulRef::Reg(p) => format!("%{}", phys_reg_name(*p)),
             MulRef::Slot(s) => self.slot_ref(*s),
             MulRef::SlotHi(s) => self.slot_ref_offset(*s, 4),
+        }
+    }
+
+    /// `%ecx` = the low `bytes` (1 or 2) of `src`, extended to 32 bits: the
+    /// extension the virtual feeder cast of an [`AddendHi::Narrow`] addend
+    /// would have made.
+    fn emit_narrow_addend_into_ecx(&mut self, src: &MulRef, bytes: u8, signed: bool) {
+        let extend = match (bytes, signed) {
+            (1, false) => "movzbl",
+            (1, true) => "movsbl",
+            (_, false) => "movzwl",
+            (_, true) => "movswl",
+        };
+        match src {
+            MulRef::Reg(p) => {
+                let reg = phys_reg_name(*p);
+                if bytes == 2 {
+                    let word = crate::backend::x86_common::reg_to_16(reg);
+                    emit!(self.state, "    {} %{}, %ecx", extend, word);
+                } else if reg == "ebx" {
+                    emit!(self.state, "    {} %bl, %ecx", extend);
+                } else {
+                    // %esi, %edi and %ebp have no byte register here.
+                    emit!(self.state, "    movl %{}, %ecx", reg);
+                    emit!(self.state, "    {} %cl, %ecx", extend);
+                }
+            }
+            // A slot holds the value's own bytes first, whatever follows.
+            MulRef::Slot(_) => {
+                let slot = self.mulref_str(src);
+                emit!(self.state, "    {} {}, %ecx", extend, slot);
+            }
+            // Never the reference of a narrow source (`narrow_ref_of` gives
+            // a register or a slot); read whole, which is what they are.
+            MulRef::Imm(_) | MulRef::SlotHi(_) => {
+                let whole = self.mulref_str(src);
+                emit!(self.state, "    movl {}, %ecx", whole);
+            }
         }
     }
 
@@ -411,6 +486,18 @@ impl I686Codegen {
                     let hi = self.mulref_str(hi_ref);
                     emit!(self.state, "    addl {}, %eax", addend_lo);
                     emit!(self.state, "    adcl {}, %edx", hi);
+                }
+                AddendHi::Narrow { bytes, signed } => {
+                    // %ecx is dead after the cross-term add above.
+                    self.emit_narrow_addend_into_ecx(&addend_lo_t, *bytes, *signed);
+                    self.state.emit("    addl %ecx, %eax");
+                    self.state.emit("    adcl $0, %edx");
+                    if *signed {
+                        // A negative addend is its unsigned reading less
+                        // 2^32: -1 into the high half, 0 for the others.
+                        self.state.emit("    sarl $31, %ecx");
+                        self.state.emit("    addl %ecx, %edx");
+                    }
                 }
             }
         }

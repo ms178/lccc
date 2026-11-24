@@ -3040,6 +3040,16 @@ gate "seg-prefix-full-matrix" fast \
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 
+# The i686 fused `res * base + val` (64-bit) read all 32 bits of an 8- or
+# 16-bit operand's home, where narrow arithmetic leaves whatever it carried:
+# `unsigned short n = 0; n--; sum = sum * 31 + n;` added 0xffffffff. The
+# gate runs tests/regression/mulacc_narrow_feeder.c at five levels (each
+# recurrence against itself sent through memory) and reads the -O2 assembly:
+# narrow addends are extended in the sequence, narrow bases come from the
+# slot their cast wrote, and no chain was given up for it.
+gate "i686-mulacc-narrow-feeder" fast \
+    bash tests/regression/check_i686_mulacc_narrow_feeder.sh
+
 # i686 select-diamond -> cmov fold and load->copy relay: 17 select shapes,
 # freestanding -m32, lccc == gcc-16 == folds-disabled at -O0/-O1/-O2/-Os,
 # plus a fold-fires witness (cmov present with the pass on, absent off).

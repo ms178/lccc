@@ -3066,6 +3066,10 @@ jobs:
         python3 tests/regression/check_sparse_bss_equivalence.py --lccc target/fastbuild/lccc
         bash tests/regression/check_linker_notype_code.sh
         bash tests/regression/check_i686_atomics.sh
+        # The i686 fused `res * base + val` reads an 8- or 16-bit operand
+        # narrow: run at five levels against the same recurrence through
+        # memory, and read off the -O2 assembly (the chains stay fused).
+        bash tests/regression/check_i686_mulacc_narrow_feeder.sh
         # A13/A14: a pass may synthesise a libcall only when this TU does
         # not define that symbol (per symbol, so an asm label, an alias or
         # a static definition counts), and a constant-size memcpy/memset
