@@ -2954,13 +2954,111 @@ fn stringify_arg(arg: &str) -> String {
     result
 }
 
-/// Parse a #define directive line and return a MacroDef.
-/// The line should be the text after `#define ` (with leading whitespace stripped).
-/// Operates on bytes for performance.
-pub fn parse_define(line: &str) -> Option<MacroDef> {
+/// Why a `#define` line could not be turned into a [`MacroDef`].
+///
+/// The messages follow cpplib's wording, so a build log reads the same under
+/// GCC and lccc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefineError {
+    /// `#define` with nothing after it.
+    NoName,
+    /// The macro name starts with a character that cannot start an identifier.
+    NotIdentifier,
+    /// A name starting with a backslash or a non-ASCII byte (a universal
+    /// character name or UTF-8 identifier). lccc has never defined these;
+    /// the directive is skipped without a diagnostic, as before.
+    UnsupportedName,
+    /// A parameter name was required; the payload is the offending token
+    /// (empty at the end of the line).
+    ExpectedParamName(String),
+    /// After a parameter name only `,` or `)` may follow.
+    ExpectedCommaOrParen(String),
+    /// The parameter list runs to the end of the line.
+    MissingCloseParen,
+    /// `...` must be followed by `)`.
+    ExpectedCloseAfterEllipsis,
+    /// The same parameter name appears twice.
+    DuplicateParam(String),
+}
+
+impl DefineError {
+    /// The diagnostic text, in cpplib's wording.
+    pub fn message(&self) -> String {
+        match self {
+            DefineError::NoName => "no macro name given in #define directive".to_string(),
+            DefineError::NotIdentifier => "macro names must be identifiers".to_string(),
+            DefineError::UnsupportedName => "unsupported macro name".to_string(),
+            DefineError::ExpectedParamName(t) if t.is_empty() => {
+                "expected parameter name before end of line".to_string()
+            }
+            DefineError::ExpectedParamName(t) => format!("expected parameter name, found \"{t}\""),
+            DefineError::ExpectedCommaOrParen(t) => format!("expected ',' or ')', found \"{t}\""),
+            DefineError::MissingCloseParen => "expected ')' before end of line".to_string(),
+            DefineError::ExpectedCloseAfterEllipsis => "expected ')' after \"...\"".to_string(),
+            DefineError::DuplicateParam(n) => format!("duplicate macro parameter \"{n}\""),
+        }
+    }
+}
+
+/// The text of the preprocessing token starting at `bytes[i]`, for diagnostics.
+///
+/// This is only used to name the offending token in an error message, so it
+/// follows the usual maximal-munch spellings without being a full lexer.
+fn diagnostic_token(line: &str, i: usize) -> String {
+    let bytes = line.as_bytes();
+    let b = bytes[i];
+    let mut j = i + 1;
+    if b.is_ascii_digit() || (b == b'.' && bytes.get(j).is_some_and(|c| c.is_ascii_digit())) {
+        // pp-number: digits, letters, '_', '.', and a sign after an exponent.
+        while j < bytes.len() {
+            let c = bytes[j];
+            let exp_sign =
+                (c == b'+' || c == b'-') && matches!(bytes[j - 1], b'e' | b'E' | b'p' | b'P');
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || exp_sign {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    } else if b == b'"' || b == b'\'' {
+        while j < bytes.len() && bytes[j] != b {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                j += 1;
+            }
+            j += 1;
+        }
+        j = (j + 1).min(bytes.len());
+    } else if b >= 0x80 {
+        while j < bytes.len() && !line.is_char_boundary(j) {
+            j += 1;
+        }
+    } else {
+        const THREE: [&str; 4] = ["<<=", ">>=", "...", "%:%"];
+        const TWO: [&str; 22] = [
+            "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "*=", "/=", "%=",
+            "+=", "-=", "&=", "^=", "|=", "##", "::", "<:",
+        ];
+        let rest = &line[i..];
+        if let Some(t) = THREE.iter().find(|t| rest.starts_with(**t)) {
+            j = i + t.len();
+        } else if let Some(t) = TWO.iter().find(|t| rest.starts_with(**t)) {
+            j = i + t.len();
+        }
+    }
+    line[i..j.min(line.len())].to_string()
+}
+
+/// Parse the text after `#define` (the macro name, an optional parameter list
+/// and the body) into a [`MacroDef`].
+///
+/// Every byte of a parameter list is either consumed or reported: a malformed
+/// list is an error at the definition, never a loop and never a silently
+/// different macro. The accepted grammar is cpplib's: `()`, `(a, b)`,
+/// `(a, ...)`, `(...)` and the GNU named variadic `(args...)` / `(args ...)`.
+pub fn try_parse_define(line: &str) -> Result<MacroDef, DefineError> {
     let line = line.trim();
     if line.is_empty() {
-        return None;
+        return Err(DefineError::NoName);
     }
 
     let bytes = line.as_bytes();
@@ -2969,77 +3067,103 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
 
     // Parse macro name
     if !is_ident_start_byte(bytes[0]) {
-        return None;
+        return Err(if bytes[0] == b'\\' || bytes[0] >= 0x80 {
+            DefineError::UnsupportedName
+        } else {
+            DefineError::NotIdentifier
+        });
     }
     while i < len && is_ident_cont_byte(bytes[i]) {
         i += 1;
     }
     let name = bytes_to_str(bytes, 0, i).to_string();
 
-    // Check if function-like (opening paren immediately after name, no space)
+    // Function-like only when the opening paren follows the name immediately.
     if i < len && bytes[i] == b'(' {
-        // Function-like macro
         i += 1; // skip '('
-        let mut params = Vec::with_capacity(8);
+        let mut params: Vec<String> = Vec::with_capacity(8);
         let mut is_variadic = false;
         let mut has_named_variadic = false;
 
+        #[derive(Clone, Copy, PartialEq)]
+        enum Expect {
+            /// Directly after `(`: a name, `...` or `)`.
+            NameOrClose,
+            /// After a comma: a name or `...`.
+            Name,
+            /// After a name: `,`, `...` (named variadic) or `)`.
+            CommaOrClose,
+        }
+        let mut expect = Expect::NameOrClose;
+
+        let skip_ws = |i: &mut usize| {
+            while *i < len && matches!(bytes[*i], b' ' | b'\t' | 0x0b | 0x0c) {
+                *i += 1;
+            }
+        };
+        let ellipsis_at = |i: usize| bytes[i..].starts_with(b"...");
+
         loop {
-            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                i += 1;
-            }
-
+            skip_ws(&mut i);
             if i >= len {
-                break;
+                return Err(match expect {
+                    Expect::CommaOrClose => DefineError::MissingCloseParen,
+                    _ => DefineError::ExpectedParamName(String::new()),
+                });
             }
-
-            if bytes[i] == b')' {
-                i += 1;
-                break;
-            }
-
-            if bytes[i] == b'.' && i + 2 < len && bytes[i + 1] == b'.' && bytes[i + 2] == b'.' {
-                is_variadic = true;
-                i += 3;
-                while i < len && bytes[i] != b')' {
-                    i += 1;
-                }
-                if i < len {
-                    i += 1;
-                }
-                break;
-            }
-
-            if is_ident_start_byte(bytes[i]) {
-                let start = i;
-                while i < len && is_ident_cont_byte(bytes[i]) {
-                    i += 1;
-                }
-                let param = bytes_to_str(bytes, start, i).to_string();
-
-                if i + 2 < len && bytes[i] == b'.' && bytes[i + 1] == b'.' && bytes[i + 2] == b'.' {
-                    is_variadic = true;
-                    has_named_variadic = true;
-                    params.push(param);
-                    i += 3;
-                    while i < len && bytes[i] != b')' {
+            let c = bytes[i];
+            match expect {
+                Expect::NameOrClose | Expect::Name => {
+                    if c == b')' && expect == Expect::NameOrClose {
+                        i += 1;
+                        break;
+                    }
+                    if ellipsis_at(i) {
+                        i += 3;
+                        is_variadic = true;
+                        skip_ws(&mut i);
+                        if i < len && bytes[i] == b')' {
+                            i += 1;
+                            break;
+                        }
+                        return Err(DefineError::ExpectedCloseAfterEllipsis);
+                    }
+                    if !is_ident_start_byte(c) {
+                        return Err(DefineError::ExpectedParamName(diagnostic_token(line, i)));
+                    }
+                    let start = i;
+                    while i < len && is_ident_cont_byte(bytes[i]) {
                         i += 1;
                     }
-                    if i < len {
-                        i += 1;
+                    let param = bytes_to_str(bytes, start, i);
+                    if params.iter().any(|p| p == param) {
+                        return Err(DefineError::DuplicateParam(param.to_string()));
                     }
-                    break;
+                    params.push(param.to_string());
+                    expect = Expect::CommaOrClose;
                 }
-
-                params.push(param);
-            }
-
-            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                i += 1;
-            }
-
-            if i < len && bytes[i] == b',' {
-                i += 1;
+                Expect::CommaOrClose => {
+                    if c == b',' {
+                        i += 1;
+                        expect = Expect::Name;
+                    } else if c == b')' {
+                        i += 1;
+                        break;
+                    } else if ellipsis_at(i) {
+                        // GNU named variadic: `args...` or `args ...`.
+                        i += 3;
+                        is_variadic = true;
+                        has_named_variadic = true;
+                        skip_ws(&mut i);
+                        if i < len && bytes[i] == b')' {
+                            i += 1;
+                            break;
+                        }
+                        return Err(DefineError::ExpectedCloseAfterEllipsis);
+                    } else {
+                        return Err(DefineError::ExpectedCommaOrParen(diagnostic_token(line, i)));
+                    }
+                }
             }
         }
 
@@ -3050,7 +3174,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
             String::new()
         };
 
-        Some(MacroDef {
+        Ok(MacroDef {
             name,
             is_function_like: true,
             params,
@@ -3066,7 +3190,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
             String::new()
         };
 
-        Some(MacroDef {
+        Ok(MacroDef {
             name,
             is_function_like: false,
             params: Vec::new(),
@@ -3075,6 +3199,13 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
             body,
         })
     }
+}
+
+/// Parse a #define directive line and return a MacroDef.
+/// The line should be the text after `#define ` (with leading whitespace stripped).
+/// Operates on bytes for performance.
+pub fn parse_define(line: &str) -> Option<MacroDef> {
+    try_parse_define(line).ok()
 }
 
 /// Inline integer-to-string formatting buffer.
@@ -3543,5 +3674,137 @@ mod query_operator_lifetime_tests {
         assert_eq!(MacroTable::query_arg_end(b"(unterminated", 0), 13);
         assert_eq!(MacroTable::query_arg_end(b"(", 0), 1);
         assert_eq!(MacroTable::query_arg_end(b"(\"open)", 0), 7);
+    }
+}
+
+#[cfg(test)]
+mod define_parse_tests {
+    use super::*;
+
+    fn ok(line: &str) -> MacroDef {
+        try_parse_define(line).unwrap_or_else(|e| panic!("{line:?} must parse: {}", e.message()))
+    }
+
+    fn err(line: &str) -> String {
+        match try_parse_define(line) {
+            Ok(def) => panic!("{line:?} must be rejected, got {def:?}"),
+            Err(e) => e.message(),
+        }
+    }
+
+    #[test]
+    fn accepted_parameter_lists() {
+        let d = ok("F() 1");
+        assert!(d.is_function_like && d.params.is_empty() && !d.is_variadic);
+        assert_eq!(d.body, "1");
+
+        let d = ok("F( a , b )a+b");
+        assert_eq!(d.params, ["a", "b"]);
+        assert_eq!(d.body, "a+b");
+
+        let d = ok("F(...) __VA_ARGS__");
+        assert!(d.is_variadic && !d.has_named_variadic && d.params.is_empty());
+
+        let d = ok("F(a, ...) x");
+        assert!(d.is_variadic && !d.has_named_variadic);
+        assert_eq!(d.params, ["a"]);
+
+        // GNU named variadic, with and without a space before the ellipsis.
+        for line in ["F(args...) args", "F(args ...) args", "F(args... ) args"] {
+            let d = ok(line);
+            assert!(d.is_variadic && d.has_named_variadic, "{line}");
+            assert_eq!(d.params, ["args"], "{line}");
+        }
+
+        // A space before the parenthesis makes the macro object-like.
+        let d = ok("X (a;b)");
+        assert!(!d.is_function_like);
+        assert_eq!(d.body, "(a;b)");
+    }
+
+    #[test]
+    fn malformed_parameter_lists_are_rejected_with_cpplib_wording() {
+        // The hang found by the mutation fuzzer: `;` was never consumed.
+        assert_eq!(err("F(a;b) a"), "expected ',' or ')', found \";\"");
+        assert_eq!(err("F(a,;) a"), "expected parameter name, found \";\"");
+        // Two names without a comma used to be accepted as two parameters.
+        assert_eq!(err("F(a b) a"), "expected ',' or ')', found \"b\"");
+        assert_eq!(err("F(a,) a"), "expected parameter name, found \")\"");
+        assert_eq!(err("F(,a) a"), "expected parameter name, found \",\"");
+        assert_eq!(err("F(1) a"), "expected parameter name, found \"1\"");
+        assert_eq!(
+            err("F(0x1p+3) a"),
+            "expected parameter name, found \"0x1p+3\""
+        );
+        assert_eq!(
+            err("F(\"s\") a"),
+            "expected parameter name, found \"\"s\"\""
+        );
+        assert_eq!(err("F(a+=b) a"), "expected ',' or ')', found \"+=\"");
+    }
+
+    #[test]
+    fn unterminated_and_misplaced_lists() {
+        assert_eq!(err("F(a"), "expected ')' before end of line");
+        assert_eq!(err("F(a,"), "expected parameter name before end of line");
+        assert_eq!(err("F("), "expected parameter name before end of line");
+        assert_eq!(err("F(...x) y"), "expected ')' after \"...\"");
+        assert_eq!(err("F(a...b) y"), "expected ')' after \"...\"");
+        assert_eq!(err("F(a, a) y"), "duplicate macro parameter \"a\"");
+        assert_eq!(err("F(a, b, a) y"), "duplicate macro parameter \"a\"");
+    }
+
+    #[test]
+    fn missing_or_invalid_macro_names() {
+        assert_eq!(err(""), "no macro name given in #define directive");
+        assert_eq!(err("   "), "no macro name given in #define directive");
+        assert_eq!(err("123 x"), "macro names must be identifiers");
+        assert_eq!(err("+ x"), "macro names must be identifiers");
+        // Names lccc has never defined keep their silent skip.
+        assert!(matches!(
+            try_parse_define("\\u00e9 1"),
+            Err(DefineError::UnsupportedName)
+        ));
+        assert!(matches!(
+            try_parse_define("é 1"),
+            Err(DefineError::UnsupportedName)
+        ));
+        assert!(parse_define("\\u00e9 1").is_none());
+    }
+
+    /// The property behind the original hang: whatever the parameter list holds,
+    /// the parser returns. Exhaustive over every string of up to four bytes drawn
+    /// from the characters that matter, including multi-byte UTF-8.
+    #[test]
+    fn every_short_parameter_list_terminates() {
+        let alphabet = ["a", "_", ",", ";", ")", " ", ".", "1", "\"", "é", "#", "\t"];
+        let mut cases = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for ch in alphabet {
+                    next.push(format!("{prefix}{ch}"));
+                }
+            }
+            cases.extend(next.iter().cloned());
+            frontier = next;
+        }
+        let mut accepted = 0usize;
+        for list in &cases {
+            if let Ok(def) = try_parse_define(&format!("F({list}) body")) {
+                accepted += 1;
+                // An accepted definition has distinct identifier parameters only.
+                assert!(def.is_function_like, "{list:?}");
+                for (n, param) in def.params.iter().enumerate() {
+                    assert!(param.bytes().all(is_ident_cont_byte), "{list:?}: {param:?}");
+                    assert!(
+                        !def.params[..n].contains(param),
+                        "{list:?}: duplicate {param:?}"
+                    );
+                }
+            }
+        }
+        assert!(accepted > 0 && accepted < cases.len());
     }
 }

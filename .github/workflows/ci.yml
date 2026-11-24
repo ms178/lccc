@@ -3475,6 +3475,14 @@ jobs:
         # value pin. The local gate of the same name; parity is checked by
         # check_ci_gate_parity.py.
         env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_pp_directive_comment_bridge.sh
+        # Backlog AU-01 (a malformed #define parameter list never hangs and is
+        # diagnosed at the definition) and MB-01 (every documented option measured
+        # against the binary; docs/OPTIONS.md generated from the same table).
+        # Local gates of the same names; parity is checked by
+        # check_ci_gate_parity.py.
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_malformed_define.sh
+        python3 scripts/lccc_options_inventory.py --self-test
+        python3 scripts/lccc_options_inventory.py --check --lccc target/fastbuild/lccc
         python3 scripts/test_oracle_delta_gate.py
         bash tests/regression/check_i686_integer_isa_parity.sh
         env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_fp_select_minmax.sh

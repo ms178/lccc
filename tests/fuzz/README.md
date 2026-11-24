@@ -190,4 +190,4 @@ include context: use the original working directory and compiler/environment, an
 expect path-sensitive inputs (for example, quoted includes) to behave differently.
 Use a trusted compiler and flags, and keep the output directory outside the seed
 glob. The timeout is per invocation, not a wall-clock budget for the whole run.
-Open work is tracked in `backlog.md` under AU-01 and AU-02.
+Open work is tracked in `backlog.md` under AU-02.

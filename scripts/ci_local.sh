@@ -1250,6 +1250,17 @@ gate "nullptr-check-policy" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_nullptr_check_policy.sh
 gate "pp-directive-comment-bridge" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_pp_directive_comment_bridge.sh
+# Backlog AU-01: a malformed #define parameter list must be diagnosed at the
+# definition and must never hang (timeout-guarded), valid lists keep GCC's tokens.
+gate "malformed-define" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_malformed_define.sh
+# Backlog MB-01: every documented option is measured against the binary
+# (accepted / warned / refused, plus the observable effect); docs/OPTIONS.md is
+# generated from the same table and fails the gate when stale.
+gate "options-inventory" fast \
+    python3 scripts/lccc_options_inventory.py --self-test
+gate "options-inventory-measured" fast \
+    python3 scripts/lccc_options_inventory.py --check --lccc "$LCCC"
 # The kernel harness refuses to build a kernel the package does not ship; these
 # are the readers that decide it (value spellings, prefix anchoring, drift
 # direction, empty configs), pinned without a kernel tree.
