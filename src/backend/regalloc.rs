@@ -4829,6 +4829,18 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 } if x86_fp_pool && !is_32bit => {
                     eligible.insert(dest.0);
                 }
+                // The halves of a full adder: created for x86-64 alone
+                // (`passes::carry_chain`), whose emitter computes in
+                // %rax/%rcx and lands both results with `store_rax_to`. In a
+                // slot, each link of a chain would store its carry and the
+                // next one load it, between an `adc` and the `adc` it feeds.
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: IntrinsicOp::Carry(_),
+                    ..
+                } => {
+                    eligible.insert(dest.0);
+                }
                 // Session 28: PHI destinations are real values with real live
                 // intervals (loop-carried state: switch machines, running
                 // pointers).  Without a register home every use reloads them

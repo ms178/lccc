@@ -1718,6 +1718,10 @@ fn peephole_optimize_inner(
                 "fold_carry_addend",
                 multiword::fold_carry_addend(&mut store, &mut infos)
             );
+            fix1!(
+                "forward_carry_flag",
+                multiword::forward_carry_flag(&mut store, &mut infos)
+            );
         }
         if !sk("acc_roundtrip") {
             {

@@ -18,7 +18,7 @@
 //! allocated GPR, see [`rbp_pointer_load`]) into ANY GP destination when the
 //! loaded register is provably dead afterwards ([`FileLiveness`]). Plain
 //! stack-slot reloads are left to store forwarding.  Supported consumers:
-//! `add/sub/and/or/xor/cmp/test/imul` with the load's exact width.
+//! `add/sub/and/or/xor/cmp/test/imul/adc/sbb` with the load's exact width.
 //!
 //! The *copy-bridged* variant handles the loop-carried-phi relay the register
 //! allocator emits for `acc = mem OP x` recurrences (gzip CRC, adler, hashes):
@@ -447,8 +447,14 @@ fn parse_memory_load(t: &str) -> Option<(bool, &str, RegId)> {
     Some((is_q, src, fam))
 }
 
-/// Consumers whose first (source) operand may be a memory operand.
-const FUSIBLE_OPS: &[&str] = &["add", "sub", "and", "or", "xor", "cmp", "test", "imul"];
+/// Consumers whose first (source) operand may be a memory operand.  `adc`
+/// and `sbb` read the carry flag, which the deleted load never wrote and
+/// which the consumer reads where it stood: the second word of a chain
+/// (`passes::carry_chain`) takes its limb from memory like the first.  Only
+/// the direct form takes them: neither commutes with its carry in hand.
+const FUSIBLE_OPS: &[&str] = &[
+    "add", "sub", "and", "or", "xor", "cmp", "test", "imul", "adc", "sbb",
+];
 /// Subset for which `B = T op C` equals `B = C op T`.
 const COMMUTATIVE_OPS: &[&str] = &["add", "and", "or", "xor", "imul"];
 
@@ -3252,6 +3258,31 @@ mod tests {
         let asm = format!("{PRO}    movq (%rdi), %rcx\n    imulq %rcx, %rax\n{EPI}");
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+    }
+
+    /// `adc`/`sbb` take a limb from memory like `add`/`sub` do: the carry
+    /// they read is not the load's to change.  They have no commuted form,
+    /// so a load into their destination stays a load.
+    #[test]
+    fn fuses_adc_and_sbb_in_the_direct_form_only() {
+        for (op, mov, tmp, dst) in [
+            ("adcq", "movq", "%r8", "%rax"),
+            ("sbbq", "movq", "%r8", "%rax"),
+            ("adcl", "movl", "%r8d", "%eax"),
+            ("sbbl", "movl", "%r8d", "%eax"),
+        ] {
+            let asm = format!("{PRO}    {mov} 8(%rdx), {tmp}\n    {op} {tmp}, {dst}\n{EPI}");
+            let out = body(&run(&asm, fuse_load_into_alu));
+            assert!(has(&out, &format!("{op} 8(%rdx), {dst}")), "{out:?}");
+            assert!(!out.iter().any(|l| l.starts_with("mov")), "{out:?}");
+
+            let asm = format!(
+                "{PRO}    {mov} 8(%rdx), {tmp}\n    {op} {dst}, {tmp}\n    movq %r8, %rax\n{EPI}"
+            );
+            let out = body(&run(&asm, fuse_load_into_alu));
+            assert!(has(&out, &format!("{mov} 8(%rdx), {tmp}")), "{out:?}");
+            assert!(has(&out, &format!("{op} {dst}, {tmp}")), "{out:?}");
+        }
     }
 
     #[test]

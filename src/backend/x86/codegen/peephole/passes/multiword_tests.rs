@@ -17,7 +17,8 @@ fn run_folds(body: &str) -> (bool, String) {
         let b = fold_carry_into_adc(&mut store, &mut infos);
         let c = fold_carry_addend(&mut store, &mut infos);
         let d = fold_product_pair(&mut store, &mut infos);
-        if !(a || b || c || d) {
+        let e = forward_carry_flag(&mut store, &mut infos);
+        if !(a || b || c || d || e) {
             break;
         }
         changed = true;
@@ -194,6 +195,12 @@ impl Cpu {
                     .wrapping_mul(self.read(&self.place(operands[0]), Size::Q));
                 self.write(&dst, Size::Q, product);
                 self.carry = false;
+            }
+            "btl" | "btq" => {
+                let Place::Imm(bit) = self.place(operands[0]) else {
+                    panic!("model tests constant bits only ({line})");
+                };
+                self.carry = (self.read(&self.place(operands[1]), size) >> bit) & 1 != 0;
             }
             "setb" | "setc" | "setnae" => {
                 let dst = self.place(operands[0]);
@@ -1062,4 +1069,125 @@ fn a_product_whose_inputs_or_low_half_changed_is_recomputed() {
     unchanged("    movq %rsi, %rax\n    mulq %rcx\n.Ljoin:\n    imulq %rcx, %rsi\n    ret");
     // A factor in %rdx is destroyed by the multiply itself.
     unchanged("    movq %rsi, %rax\n    mulq %rdx\n    imulq %rdx, %rsi\n    ret");
+}
+
+/// One link of a chain as the full adder emits it: the carry in from
+/// `carry` by `bt`, the sum of two limbs, the carry out into `out`.
+fn link(offset: u32, carry: &str, out: &str, mnemonic: &str) -> String {
+    format!(
+        "    movq {offset}(%rsp), %rax\n    btl $0, {carry}\n    {mnemonic} {offset}(%rdi), %rax\n    \
+         setc %cl\n    movzbl %cl, {out}\n    movq %rax, {offset}(%rsp)"
+    )
+}
+
+#[test]
+fn a_carry_still_in_the_flag_is_not_put_back() {
+    for (first, then) in [("addq", "adcq"), ("subq", "sbbq")] {
+        // Four limbs in memory: one `add`, three `adc`, and no boolean.
+        let body = format!(
+            "    movq (%rsp), %rax\n    {first} (%rdi), %rax\n    setc %cl\n    movzbl %cl, %r10d\n    \
+             movq %rax, (%rsp)\n{}\n{}\n{}\n    movl %r9d, %eax\n    ret",
+            link(8, "%r10d", "%r8d", then),
+            link(16, "%r8d", "%r11d", then),
+            link(24, "%r11d", "%r9d", then),
+        );
+        let out = folded(&body, &["%rcx", "%r10", "%r8", "%r11"]);
+        let text = lines(&out);
+        assert!(!text.iter().any(|line| line.starts_with("bt")), "{out}");
+        // The last carry is returned: its `setc` and extension stay.
+        assert_eq!(
+            text.iter().filter(|line| line.starts_with("setc")).count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(
+            text.iter().filter(|line| line.starts_with(then)).count(),
+            3,
+            "{out}"
+        );
+        assert_eq!(
+            text,
+            lines(&format!(
+                "movq (%rsp), %rax\n{first} (%rdi), %rax\nmovq %rax, (%rsp)\n\
+                 movq 8(%rsp), %rax\n{then} 8(%rdi), %rax\nmovq %rax, 8(%rsp)\n\
+                 movq 16(%rsp), %rax\n{then} 16(%rdi), %rax\nmovq %rax, 16(%rsp)\n\
+                 movq 24(%rsp), %rax\n{then} 24(%rdi), %rax\nsetc %cl\nmovzbl %cl, %r9d\n\
+                 movq %rax, 24(%rsp)\nmovl %r9d, %eax\nret"
+            )),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn a_carry_that_is_read_again_keeps_its_boolean() {
+    // The boolean is added up as well: only the `bt` goes.
+    let out = folded(
+        "    addq %rsi, %rax\n    setc %cl\n    movzbl %cl, %r10d\n    movq %rdx, %r8\n    \
+         btl $0, %r10d\n    adcq %r9, %r8\n    movq %r10, %rsi\n    ret",
+        &["%rcx"],
+    );
+    assert_eq!(
+        lines(&out),
+        [
+            "addq %rsi, %rax",
+            "setc %cl",
+            "movzbl %cl, %r10d",
+            "movq %rdx, %r8",
+            "adcq %r9, %r8",
+            "movq %r10, %rsi",
+            "ret"
+        ]
+    );
+    // The byte is its own extension (`setc %al; movzbl %al, %eax`), and a
+    // 64-bit test of it.
+    let out = folded(
+        "    addq %rsi, %rdx\n    setc %r10b\n    movzbq %r10b, %r10\n    movq %rdi, %r8\n    \
+         btq $0, %r10\n    sbbq %r9, %r8\n    ret",
+        &["%r10"],
+    );
+    assert_eq!(
+        lines(&out),
+        ["addq %rsi, %rdx", "movq %rdi, %r8", "sbbq %r9, %r8", "ret"]
+    );
+}
+
+#[test]
+fn a_carry_the_flag_no_longer_holds_is_tested() {
+    let chain = |between: &str, set: &str, bit: &str| {
+        format!(
+            "    addq %rsi, %rax\n    {set} %cl\n    movzbl %cl, %r10d\n{between}    movq %rdx, %r8\n    \
+             btl {bit}, %r10d\n    adcq %r9, %r8\n    ret"
+        )
+    };
+    // The reference shape folds.
+    folded(&chain("", "setc", "$0"), &["%rcx", "%r10"]);
+    // A flag was written in between: the counter of a loop, a compare.
+    unchanged(&chain("    addq $1, %r11\n", "setc", "$0"));
+    unchanged(&chain("    cmpq %r11, %rdi\n", "setc", "$0"));
+    // The boolean was written in between, in whole or in its low byte.
+    unchanged(&chain("    movq %r11, %r10\n", "setc", "$0"));
+    unchanged(&chain("    movb %r11b, %r10b\n", "setc", "$0"));
+    // Not the carry, or not its bit.
+    unchanged(&chain("", "setnc", "$0"));
+    unchanged(&chain("", "sete", "$0"));
+    unchanged(&chain("", "setc", "$1"));
+    // Another path may arrive with a different flag; a call returns with
+    // any flag.
+    unchanged(&chain(".Ljoin:\n", "setc", "$0"));
+    unchanged(&chain("    call helper\n", "setc", "$0"));
+    // The byte was written between the `setc` and its extension.
+    unchanged(
+        "    addq %rsi, %rax\n    setc %cl\n    movb %r11b, %cl\n    movzbl %cl, %r10d\n    \
+         btl $0, %r10d\n    adcq %r9, %r8\n    ret",
+    );
+    // A boolean that is no extension of a `setc` at all.
+    unchanged(
+        "    addq %rsi, %rax\n    movq %rdi, %r10\n    btl $0, %r10d\n    adcq %r9, %r8\n    ret",
+    );
+    // A variable bit.
+    unchanged(
+        "    addq %rsi, %rax\n    setc %cl\n    movzbl %cl, %r10d\n    btl %edi, %r10d\n    \
+         adcq %r9, %r8\n    ret",
+    );
 }

@@ -28,6 +28,7 @@ pub(crate) mod bool_thread;
 pub(crate) mod builtin_policy;
 pub(crate) mod byte_load;
 pub(crate) mod byval_scalar;
+pub(crate) mod carry_chain;
 pub(crate) mod cfg_simplify;
 pub(crate) mod const_array_promote;
 pub(crate) mod constant_fold;
@@ -5083,6 +5084,17 @@ pub(crate) fn run_passes(
             changed
         });
         verify::verify_after_pass(module, "satsub");
+    }
+
+    // Full adders (`x + y + carry` and its carry out) as the two halves of
+    // `IntrinsicOp::Carry`, which the x86-64 backend emits as `adc`/`sbb`
+    // and `setc` (`carry_chain`). Here, behind every pass that reads the
+    // comparisons and the `|` the idiom is spelled with: none of them knows
+    // the intrinsic. Pass name for CCC_DISABLE_PASSES: "carry".
+    if matches!(target, crate::backend::Target::X86_64) && !pass_disabled(&disabled, "carry") {
+        let dce = !pass_disabled(&disabled, "dce");
+        module.for_each_function(|f| carry_chain::run(f, dce));
+        verify::verify_after_pass(module, "carry");
     }
 
     // Loops whose header computes what the body reads (`while (n--)`):

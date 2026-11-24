@@ -4,7 +4,34 @@ use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, shift_mnemonic};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
+use crate::ir::intrinsics::CarryOp;
 use crate::ir::reexports::{BlockId, IrBinOp, IrCmpOp, IrConst, Operand, Value};
+
+/// Where a full adder finds its carry in ([`X86Codegen::emit_carry_impl`]).
+enum CarryIn {
+    /// Constant 0: a plain `add` or `sub`.
+    Clear,
+    /// Constant 1: `stc`.
+    Set,
+    /// Bit 0 of a register home.
+    Reg(PhysReg),
+    /// Bit 0 of the stack slot at this frame offset.
+    Slot(i64),
+    /// To be fetched into `%rcx` by the general loader.
+    Staged,
+}
+
+/// Where a full adder finds its second operand.
+enum Addend {
+    /// What `adc` takes as an immediate.
+    Immediate(i32),
+    /// A register home.
+    Reg(PhysReg),
+    /// A constant of more than 32 bits: `movabs` into `%rcx`.
+    Wide(i64),
+    /// To be fetched into `%rcx` by the general loader.
+    Staged,
+}
 
 impl X86Codegen {
     // ---- Unary ----
@@ -1308,6 +1335,186 @@ impl X86Codegen {
             .emit_fmt(format_args!("    {op}{sfx} {src}, %{d_name}"));
         self.note_inplace_compute(d, dest.0);
         self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    /// The halves of a full adder ([`CarryOp`]): `word = x + y + c` (or
+    /// `x - y - c`) and `out`, its carry (or borrow), from one `adc` (`sbb`)
+    /// and one `setc`. Either half may be absent: the word alone is the
+    /// `adc`, the carry alone the `adc` into scratch and its `setc`.
+    ///
+    /// ```text
+    ///     movq  x, %rax
+    ///     btl   $0, c            ; CF = c   (a constant c: `stc`, or `add`)
+    ///     adcq  y, %rax
+    ///     setc  %cl
+    ///     movq  %rax, word
+    ///     movzbl %cl, %eax
+    ///     movq  %rax, out
+    /// ```
+    ///
+    /// The flag is set last, behind every load: a load may write flags (a
+    /// zero is loaded with `xor`, the address of an over-aligned object is
+    /// computed with `and`). So `c` is tested where it lives, a register or
+    /// its stack slot, and `y` is read by the `adc` itself from its
+    /// register or as an immediate; a 64-bit constant is the one thing
+    /// loaded behind the flag, by `movabs`, which writes none. Where `y`
+    /// and `c` both have to be fetched by the general loader (neither has a
+    /// home of its own) there is one scratch register for the two: the flag
+    /// is set first and kept on the stack while `x` and `y` are loaded,
+    /// as the select of two over-aligned addresses keeps its condition
+    /// (`emit_select_over_aligned_arms`).
+    ///
+    /// The carry is taken out of the flags before anything is stored, so
+    /// that no store has to preserve them, and `x`, `y` and `c` are all
+    /// read before the first result is written: the carry's home may be
+    /// the home of an operand that dies here.
+    pub(super) fn emit_carry_impl(
+        &mut self,
+        word: Option<&Value>,
+        out: Option<&Value>,
+        op: CarryOp,
+        args: &[Operand],
+    ) {
+        let (x, y, c) = (&args[0], &args[1], &args[2]);
+        let (acc, sfx) = if op.wide { ("rax", 'q') } else { ("eax", 'l') };
+        // A home this instruction may name: a fresh general register that
+        // is not the scratch pair it computes in.
+        let home = |this: &Self, operand: &Operand| {
+            this.operand_reg(operand)
+                .filter(|r| !is_xmm_reg(*r) && !matches!(phys_reg_name(*r), "rax" | "rcx"))
+        };
+        let carry = match c {
+            Operand::Const(k) if k.to_i64().is_some_and(|k| k & 1 != 0) => CarryIn::Set,
+            Operand::Const(_) => CarryIn::Clear,
+            Operand::Value(v) => match (home(self, c), self.sole_slot_home(v)) {
+                (Some(reg), _) => CarryIn::Reg(reg),
+                (None, Some(slot)) => CarryIn::Slot(slot),
+                (None, None) => CarryIn::Staged,
+            },
+        };
+        let addend = match y {
+            Operand::Const(k) => {
+                let k = k.to_i64().unwrap_or(0);
+                if !op.wide {
+                    // The low 32 bits, as the immediate that has them.
+                    Addend::Immediate(k as i32)
+                } else if let Ok(imm) = i32::try_from(k) {
+                    // `adc` sign-extends its 32-bit immediate at 64 bits.
+                    Addend::Immediate(imm)
+                } else {
+                    Addend::Wide(k)
+                }
+            }
+            Operand::Value(_) => match home(self, y) {
+                Some(reg) => Addend::Reg(reg),
+                None => Addend::Staged,
+            },
+        };
+
+        if matches!(addend, Addend::Staged) && matches!(carry, CarryIn::Staged) {
+            self.operand_to_reg(c, "rcx");
+            self.state.emit("    btl $0, %ecx");
+            self.state.emit("    pushfq");
+            self.state.out.rsp_frame_size += 8;
+            self.operand_to_reg(x, "rax");
+            self.operand_to_reg(y, "rcx");
+            self.state.emit("    popfq");
+            self.state.out.rsp_frame_size -= 8;
+        } else {
+            self.operand_to_reg(x, "rax");
+            if matches!(addend, Addend::Staged) {
+                self.operand_to_reg(y, "rcx");
+            }
+            match carry {
+                CarryIn::Clear => {}
+                CarryIn::Set => self.state.emit("    stc"),
+                CarryIn::Reg(reg) => self.state.emit_fmt(format_args!(
+                    "    btl $0, %{}",
+                    super::emit::phys_reg_name_32(reg)
+                )),
+                CarryIn::Slot(slot) => {
+                    let slot = self.slot_ref(slot);
+                    self.state.emit_fmt(format_args!("    btl $0, {slot}"));
+                }
+                CarryIn::Staged => {
+                    self.operand_to_reg(c, "rcx");
+                    self.state.emit("    btl $0, %ecx");
+                }
+            }
+            if let Addend::Wide(k) = addend {
+                self.state.reg_cache.invalidate_sec();
+                self.state.emit_fmt(format_args!("    movabsq ${k}, %rcx"));
+            }
+        }
+        let mnemonic = match (op.borrow, matches!(carry, CarryIn::Clear)) {
+            (false, true) => "add",
+            (false, false) => "adc",
+            (true, true) => "sub",
+            (true, false) => "sbb",
+        };
+        match addend {
+            Addend::Immediate(imm) => self
+                .state
+                .emit_fmt(format_args!("    {mnemonic}{sfx} ${imm}, %{acc}")),
+            Addend::Reg(reg) => {
+                let name = if op.wide {
+                    phys_reg_name(reg)
+                } else {
+                    super::emit::phys_reg_name_32(reg)
+                };
+                self.state
+                    .emit_fmt(format_args!("    {mnemonic}{sfx} %{name}, %{acc}"));
+            }
+            Addend::Wide(_) | Addend::Staged => {
+                let name = if op.wide { "rcx" } else { "ecx" };
+                self.state
+                    .emit_fmt(format_args!("    {mnemonic}{sfx} %{name}, %{acc}"));
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+        match (word, out) {
+            (Some(word), Some(out)) => {
+                self.state.emit("    setc %cl");
+                self.state.reg_cache.invalidate_sec();
+                self.store_rax_to(word);
+                self.state.emit("    movzbl %cl, %eax");
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(out);
+            }
+            (Some(word), None) => self.store_rax_to(word),
+            (None, Some(out)) => {
+                self.state.emit("    setc %al");
+                self.state.emit("    movzbl %al, %eax");
+                self.store_rax_to(out);
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// The stack slot that is the one home of `v`, holding the value
+    /// itself: no register is assigned (an assigned value is stored to its
+    /// register only), and the slot is neither the storage of an object
+    /// (`v` being its address) nor of a vector.
+    fn sole_slot_home(&self, v: &Value) -> Option<i64> {
+        if self.reg_assignments.contains_key(&v.0)
+            || self.state.is_alloca(v.0)
+            || self.state.vector_values.contains(&v.0)
+        {
+            return None;
+        }
+        self.state.get_slot(v.0).map(|slot| slot.0)
+    }
+
+    /// [`ArchCodegen::emit_carry_pair`]: both halves, always.
+    pub(super) fn emit_carry_pair_impl(
+        &mut self,
+        word: &Value,
+        out: &Value,
+        op: CarryOp,
+        args: &[Operand],
+    ) -> bool {
+        self.emit_carry_impl(Some(word), Some(out), op, args);
         true
     }
 
@@ -3274,6 +3481,10 @@ struct StagedBt {
     /// The base sits in %rax, which the caller therefore cannot pre-zero.
     base_in_rax: bool,
 }
+
+#[cfg(test)]
+#[path = "alu_carry_tests.rs"]
+mod carry_tests;
 
 #[cfg(test)]
 mod bit_test_width_tests {

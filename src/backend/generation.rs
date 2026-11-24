@@ -7439,6 +7439,9 @@ fn generate_function_body(
         // load/store pair emitted the store, so the loop must not emit it
         // again (it would read the value's now-stale frame slot).
         let mut skip_i128_copy_store = false;
+        // The carry half of a full adder, emitted with the word before it:
+        // its index in the block.
+        let mut carry_out_emitted: Option<usize> = None;
 
         cg.state().block_use_counts.clear();
         cg.state().pending_load_cmp.clear();
@@ -7565,6 +7568,10 @@ fn generate_function_body(
                 continue;
             }
             if bit_test_fusions.take_covered() {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            if carry_out_emitted == Some(idx) {
                 cg.state().current_program_point += 1;
                 continue;
             }
@@ -7956,6 +7963,34 @@ fn generate_function_body(
             if bit_test_fusions.try_emit(cg, block, idx) {
                 cg.state().current_program_point += 1;
                 continue;
+            }
+
+            // The word of a full adder directly followed by its carry out:
+            // one `adc` and its flag (`passes::carry_chain` places them so).
+            if let (
+                Instruction::Intrinsic {
+                    dest: Some(word),
+                    op: crate::ir::intrinsics::IntrinsicOp::Carry(carry),
+                    args,
+                    ..
+                },
+                Some(Instruction::Intrinsic {
+                    dest: Some(out),
+                    op: crate::ir::intrinsics::IntrinsicOp::Carry(partner),
+                    args: out_args,
+                    ..
+                }),
+            ) = (inst, block.instructions.get(idx + 1))
+                && !carry.out
+                && *partner == carry.partner()
+                && args == out_args
+            {
+                cg.flush_machinst();
+                if cg.emit_carry_pair(word, out, *carry, args) {
+                    carry_out_emitted = Some(idx + 1);
+                    cg.state().current_program_point += 1;
+                    continue;
+                }
             }
 
             if let Some(fusion) = conditional_increment_fusions

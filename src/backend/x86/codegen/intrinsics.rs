@@ -3526,6 +3526,17 @@ impl X86Codegen {
                     self.store_rax_to(d);
                 }
             }
+            // One half of a full adder whose partner is not directly
+            // behind it (dead, or parted from it): the pair is emitted by
+            // the driver (`emit_carry_pair`).
+            IntrinsicOp::Carry(carry) => {
+                let (word, out) = if carry.out {
+                    (None, dest.as_ref())
+                } else {
+                    (dest.as_ref(), None)
+                };
+                self.emit_carry_impl(word, out, *carry, args);
+            }
             IntrinsicOp::Pdep32
             | IntrinsicOp::Pdep64
             | IntrinsicOp::Pext32

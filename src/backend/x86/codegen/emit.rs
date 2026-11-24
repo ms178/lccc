@@ -10761,6 +10761,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_fused_bit_test_modify_branch(&mut self, test_dest: &Value, modify_dest: &Value, op: IrBinOp, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_modify_branch_impl;
         fn emit_fused_bit_test_cmp(&mut self, dest: &Value, base: &Operand, index: &Operand, ty: IrType, bit_clear: bool) -> bool => emit_fused_bit_test_cmp_impl;
         fn emit_fused_bit_test_add(&mut self, dest: &Value, base: &Operand, index: &Operand, bt_ty: IrType, addend: &Operand, addend2: Option<&Operand>, sub: bool, ty: IrType) -> bool => emit_fused_bit_test_add_impl;
+        fn emit_carry_pair(&mut self, word: &Value, out: &Value, op: crate::ir::intrinsics::CarryOp, args: &[Operand]) -> bool => emit_carry_pair_impl;
         fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) => emit_cond_branch_blocks_impl;
         fn begin_home_write_block(&mut self, label: BlockId) => begin_home_write_block_impl;
         fn begin_ir_point(&mut self) => settle_transient_home_evictions;

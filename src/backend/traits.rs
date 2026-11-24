@@ -2946,6 +2946,20 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         false
     }
 
+    /// The two halves of a full adder (`IntrinsicOp::Carry`), the word
+    /// directly followed by its carry out on the same operands, emitted
+    /// together: x86 `adc`/`sbb` and `setc`. Returns false when this backend
+    /// has no fused form (the halves are then emitted one by one).
+    fn emit_carry_pair(
+        &mut self,
+        _word: &Value,
+        _out: &Value,
+        _op: crate::ir::intrinsics::CarryOp,
+        _args: &[Operand],
+    ) -> bool {
+        false
+    }
+
     /// Whether `dest = a + BitTest(base, index)` (or `a - BitTest(...)`) with
     /// a single-use test may fold the tested bit straight into the sum (x86:
     /// `bt` leaves it in CF, `adc $0` / `sbb $0` add or subtract it).

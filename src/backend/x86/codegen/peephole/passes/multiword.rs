@@ -19,7 +19,7 @@
 //! five instructions with a four-deep dependency chain from `s` to `hi`,
 //! where the machine has a carry flag for exactly this: `addq; adcq $0`.
 //! GCC 16.2 and Clang 23.1.5 both emit the two-instruction form for this
-//! source, and one `mulq` for the product.  Four independent rewrites:
+//! source, and one `mulq` for the product.  Five independent rewrites:
 //!
 //! 1. [`fold_carry_compare`] -- the carry *producer*.  A `cmp` that recomputes
 //!    the carry of the addition (or the borrow of the subtraction) just
@@ -32,6 +32,10 @@
 //! 3. [`fold_carry_addend`] -- `adc $0, h; add x, h` is `adc x, h`.
 //! 4. [`fold_product_pair`] -- `movq a, %rax; mulq b` leaves the low half of
 //!    the product in `%rax`; a following `imulq b, a` recomputes it.
+//! 5. [`forward_carry_flag`] -- the carry *between* two links of a chain
+//!    (`passes::carry_chain`).  `setc b; movzb b, r; ...; bt $0, r` puts
+//!    back into CF what is still there when nothing in between wrote the
+//!    flags: `add; adc; adc` with no boolean in between.
 //!
 //! # Soundness
 //!
@@ -52,7 +56,12 @@
 //! * the addend fold needs the flags dead after the pair: one `adc` of both
 //!   produces the same sum and different flags;
 //! * the product fold needs `%rax` and both factors unchanged between the
-//!   `mul` and the `imul` it replaces, and the `imul`'s flags dead.
+//!   `mul` and the `imul` it replaces, and the `imul`'s flags dead;
+//! * the forwarding needs CF at the `bt` to be the bit the `bt` tests: no
+//!   line between the `setc` and the `bt` writes a flag, the byte or its
+//!   extension, and none is a label, a branch or a call.  A `bt` leaves ZF
+//!   as it was and the four other flags undefined, so that nothing can
+//!   tell a deleted one from one that ran.
 //!
 //! No rewrite deletes or duplicates a memory access the program made, and
 //! none touches a pinned line or one flagged as a volatile access.  The
@@ -393,6 +402,152 @@ pub(super) fn fold_carry_into_adc(store: &mut LineStore, infos: &mut [LineInfo])
         changed = true;
     }
     changed
+}
+
+/// The lines `(setc, extension)` that put the carry flag into bit 0 of
+/// `reg`, when the flag still holds it at line `at`: straight-line code
+/// from the `setc` on, with no write of a flag, of the byte, or of `reg`
+/// besides the extension itself.
+fn carry_still_in_flag(
+    store: &LineStore,
+    infos: &[LineInfo],
+    at: usize,
+    reg: RegId,
+) -> Option<(usize, usize, RegId)> {
+    // What may stand between: a line that neither is control flow nor
+    // touches the flags.
+    let neutral = |i: usize| {
+        let info = infos[i];
+        !info.is_barrier()
+            && !info.pinned
+            && flags_effect(info.trimmed(store.get(i))) == FlagsEffect::Neutral
+    };
+    // The nearest write of `reg` above: the extension of a byte.
+    let mut k = at;
+    let byte = loop {
+        k = prev_real(store, infos, k)?;
+        if !neutral(k) {
+            return None;
+        }
+        let t = infos[k].trimmed(store.get(k));
+        if !writes_family(&infos[k], t, reg) {
+            continue;
+        }
+        let (mnem, args) = mnemonic(t)?;
+        let (src, dst) = split_two_operands(args)?;
+        let width = match mnem {
+            "movzbl" => Width::L,
+            "movzbq" => Width::Q,
+            _ => return None,
+        };
+        let byte = plain_gp_operand(src)?;
+        if width.register(dst) != Some(reg) || src != REG_NAMES[3][byte as usize] {
+            return None;
+        }
+        break byte;
+    };
+    // The nearest write of the byte above that: `setc`.
+    let mut j = k;
+    loop {
+        j = prev_real(store, infos, j)?;
+        let info = infos[j];
+        let t = info.trimmed(store.get(j));
+        if info.is_barrier() || info.pinned {
+            return None;
+        }
+        if writes_family(&info, t, byte) {
+            let (mnem, operand) = mnemonic(t)?;
+            return (carry_setcc(mnem) == Some(true) && operand == REG_NAMES[3][byte as usize])
+                .then_some((j, k, byte));
+        }
+        if flags_effect(t) != FlagsEffect::Neutral {
+            return None;
+        }
+    }
+}
+
+/// Drop the `bt` that puts a carry back into the flag it never left:
+///
+/// ```text
+/// adcq  y, %rax                     adcq  y, %rax
+/// setc  %cl
+/// movzbl %cl, %r10d
+/// movq  %rax, 8(%rdi)        ->     movq  %rax, 8(%rdi)
+/// movq  16(%rsi), %rax              movq  16(%rsi), %rax
+/// btl   $0, %r10d
+/// adcq  16(%rdx), %rax              adcq  16(%rdx), %rax
+/// ```
+///
+/// The full adder (`IntrinsicOp::Carry`) takes its carry in from a
+/// register, with `bt`, because that is where a value lives; between two
+/// links of a chain the flag itself has survived, since only moves were
+/// emitted in between.  With the `bt` gone the boolean usually has no
+/// reader left, and the `setc` and its extension go with it.
+pub(super) fn forward_carry_flag(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let mut liveness = None;
+    for b in 0..store.len() {
+        if infos[b].is_nop() || !rewritable(infos, &[b]) {
+            continue;
+        }
+        let Some((width, bit, tested)) = sized(infos[b].trimmed(store.get(b)), "bt") else {
+            continue;
+        };
+        let Some(reg) = width.register(tested) else {
+            continue;
+        };
+        if immediate(bit) != Some(0) {
+            continue;
+        }
+        let Some((j, k, byte)) = carry_still_in_flag(store, infos, b, reg) else {
+            continue;
+        };
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+        mark_nop(&mut infos[b]);
+        lv.refresh_at(store, infos, b);
+        changed = true;
+        // The boolean, if that was its last reader: the extension first,
+        // then the byte it extended.
+        if !rewritable(infos, &[j, k]) || !provably_dead_lv(lv, store, infos, k, reg, &[k]) {
+            continue;
+        }
+        mark_nop(&mut infos[k]);
+        lv.refresh_at(store, infos, k);
+        if byte == reg
+            || byte_set_again_unread(store, infos, j, byte)
+            || provably_dead_lv(lv, store, infos, j, byte, &[j])
+        {
+            mark_nop(&mut infos[j]);
+            lv.refresh_at(store, infos, j);
+        }
+    }
+    changed
+}
+
+/// True when the byte the `setcc` at `j` wrote is written again, by another
+/// `setcc`, before anything reads its register.  A `setcc` reads no
+/// register and writes one byte, so the earlier one changed nothing that is
+/// seen -- which the liveness cannot say, modelling a partial write as a
+/// read of the rest.  (Every link of a chain sets the same scratch byte.)
+fn byte_set_again_unread(store: &LineStore, infos: &[LineInfo], j: usize, byte: RegId) -> bool {
+    let mask = 1u16 << byte;
+    let mut n = j;
+    loop {
+        let Some(next) = next_real(store, infos, n) else {
+            return false;
+        };
+        n = next;
+        let info = infos[n];
+        let t = info.trimmed(store.get(n));
+        if info.is_barrier() || info.pinned || implicit_reg_refs(t.as_bytes()) & mask != 0 {
+            return false;
+        }
+        if info.reg_refs & mask == 0 {
+            continue;
+        }
+        return matches!(info.kind, LineKind::SetCC { reg } if reg == byte)
+            && mnemonic(t).is_some_and(|(_, operand)| operand == REG_NAMES[3][byte as usize]);
+    }
 }
 
 /// True when the flags a compare at `c` sets are read for CF alone: the
