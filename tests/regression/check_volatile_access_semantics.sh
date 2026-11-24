@@ -17,6 +17,22 @@
 #     observer, but nothing downstream may multiply that into a whole loop.
 #     The check is SHAPE + ORACLE, and says so: the loop must still contain a
 #     reference to the object and a back edge.
+#  6b. an _Atomic object is accessed where the program accesses it, however
+#     it is named: through a typedef (`atomic_bool`), by the qualifier on
+#     the object, as a member, behind a pointer, behind a cast.  For
+#     `_Atomic` item 6 used to hold by accident: the types carry no
+#     atomic-ness, the accumulator was plain memory, and it stayed in its
+#     loop only because nothing could move a global's store out of a
+#     top-tested loop.  Loop rotation can, and did; and without it `while
+#     (!flag) ;` already read its flag once and span on a register.  The
+#     parser now records `volatile` wherever it records `_Atomic`
+#     (`ParsedDeclAttrs::set_atomic`), and the cells below hold each form to
+#     it, with the same loops over plain objects as the control: there the
+#     load does leave the loop.  (That the qualifier rules do not take that
+#     `volatile` for a written one is check_qualifier_conversions.py's.)
+#     The cast cells hold one more form of plain `volatile` to the same
+#     rule: a cast to a pointer to a typedef name that is volatile, the
+#     register idiom `*(vu32 *)ADDR`, whose object used to be read once.
 set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -166,6 +182,142 @@ if [ "$n_ref" -ge 1 ] && grep -qE '^[[:space:]]*j[a-z]+ +\.' <<<"$loop"; then
         echo "FAIL: $fn collapsed to a closed form (refs=$n_ref)"; echo "      loop was: $loop"; rc=1
     fi
 done
+
+# 6b. Atomic objects, by every way of naming one.
+cat >"$td/atomic.c" <<'EOF'
+#include <stdatomic.h>
+struct ctl { long pad; _Atomic int stop; long work; };
+struct plain_ctl { long pad; int stop; long work; };
+atomic_bool a_typedef;
+_Atomic int a_named;
+int p_named;
+atomic_long a_hits;
+/* A waiter: the flag is all the loop reads. */
+unsigned long spin_typedef(void) { unsigned long n = 0; while (!a_typedef) n++; return n; }
+unsigned long spin_named(void) { unsigned long n = 0; while (!a_named) n++; return n; }
+unsigned long spin_member(struct ctl *c) { unsigned long n = 0; while (!c->stop) n++; return n; }
+unsigned long spin_pointee(_Atomic int *f) { unsigned long n = 0; while (!*f) n++; return n; }
+unsigned long spin_trailing(int _Atomic *f) { unsigned long n = 0; while (!*f) n++; return n; }
+unsigned long spin_specifier(_Atomic(int) *f) { unsigned long n = 0; while (!*f) n++; return n; }
+/* The same loops over plain objects: one load, in front. */
+unsigned long spin_plain_named(void) { unsigned long n = 0; while (!p_named) n++; return n; }
+unsigned long spin_plain_member(struct plain_ctl *c) { unsigned long n = 0; while (!c->stop) n++; return n; }
+/* An accumulator: one read and one write a trip. */
+void acc_typedef(int n) { for (int i = 0; i < n; i++) a_hits += 3; }
+void acc_member(struct ctl *c, int n) { for (int i = 0; i < n; i++) c->stop += 3; }
+void acc_pointee(_Atomic long *p, int n) { for (int i = 0; i < n; i++) *p += 3; }
+/* The controls are bottom-tested, so that what leaves them does not wait
+ * for a decision of loop rotation. */
+void acc_plain_member(struct plain_ctl *c, int n) { int i = 0; do c->stop += 3; while (++i < n); }
+/* The neighbour of an atomic member is an ordinary member. */
+long neighbour(struct ctl *c, int n) { long s = 0; int i = 0; do s += c->work; while (++i < n); return s; }
+/* Behind a cast the object is named by the cast's type alone: `_Atomic`
+ * written there, or a typedef name that is atomic or volatile. */
+typedef volatile unsigned v_reg;
+typedef volatile struct shared { int go; } shared;
+unsigned long spin_cast_atomic(void *p) { unsigned long n = 0; while (!*(_Atomic int *)p) n++; return n; }
+unsigned long spin_cast_specifier(void *p) { unsigned long n = 0; while (!*(_Atomic(int) *)p) n++; return n; }
+unsigned long spin_cast_typedef(void *p) { unsigned long n = 0; while (!*(atomic_int *)p) n++; return n; }
+unsigned long spin_cast_index(void *p, long i) { unsigned long n = 0; while (!((atomic_int *)p)[i]) n++; return n; }
+unsigned long spin_cast_volatile_typedef(void *p) { unsigned long n = 0; while (!(*(v_reg *)p & 1u)) n++; return n; }
+unsigned long spin_cast_volatile_record(void *p) { unsigned long n = 0; while (!((shared *)p)->go) n++; return n; }
+/* Not these: a plain pointee, a struct tag that only shares its spelling
+ * with a volatile typedef, and an atomic *pointer* to a plain object. */
+unsigned long spin_cast_plain(void *p) { unsigned long n = 0; while (!*(int *)p) n++; return n; }
+unsigned long spin_cast_tag(void *p) { unsigned long n = 0; while (!((struct shared *)p)->go) n++; return n; }
+unsigned long spin_cast_atomic_pointer(void *p) { unsigned long n = 0; while (!*(_Atomic(int *))p) n++; return n; }
+EOF
+"$CCC" -O2 -S "$td/atomic.c" -o "$td/atomic.s" || { echo "FAIL: compile atomic.c"; rc=1; }
+# The instructions of <fn> that lie on a cycle of its control flow and name
+# memory: a symbol, or a register-indirect operand (frame slots excepted).
+memory_in_loop() {
+    python3 - "$td/atomic.s" "$1" <<'PY'
+import re
+import sys
+
+path, fn = sys.argv[1], sys.argv[2]
+lines, inside = [], False
+for raw in open(path, encoding="utf-8", errors="replace"):
+    text = raw.rstrip("\n")
+    if text.startswith(fn + ":"):
+        inside = True
+        continue
+    if inside and re.match(r"\s*\.size\s", text):
+        break
+    if inside and text.strip() and not re.match(r"\s*(#|\.[a-z0-9_]+\b(?!:))", text):
+        lines.append(text.strip())
+blocks, names = [[]], {}
+for text in lines:
+    label = re.match(r"(\.L[A-Za-z0-9_.$]*):", text)
+    if label:
+        if blocks[-1]:
+            blocks.append([])
+        names[label.group(1)] = len(blocks) - 1
+        continue
+    blocks[-1].append(text)
+    if re.match(r"(j[a-z]+|ret[a-z]*|ud2)\b", text):
+        blocks.append([])
+succ = []
+for i, block in enumerate(blocks):
+    out = []
+    last = block[-1] if block else ""
+    jump = re.match(r"(j[a-z]+)\s+(\S+)", last)
+    if jump and jump.group(2) in names:
+        out.append(names[jump.group(2)])
+    if not re.match(r"(jmp|ret[a-z]*|ud2)\b", last) and i + 1 < len(blocks):
+        out.append(i + 1)
+    succ.append(out)
+
+def reaches(start):
+    seen, work = set(), list(succ[start])
+    while work:
+        b = work.pop()
+        if b not in seen:
+            seen.add(b)
+            work.extend(succ[b])
+    return seen
+
+in_loop = [i for i in range(len(blocks)) if i in reaches(i)]
+if not in_loop:
+    print("no-loop")
+    sys.exit(0)
+memory = re.compile(r"\((?!%rsp|%rbp)%r[a-z0-9]+|[A-Za-z_][A-Za-z0-9_]*\(%rip\)")
+print(sum(1 for i in in_loop for text in blocks[i]
+          if memory.search(text) and not text.startswith("lea")))
+PY
+}
+for probe in spin_typedef:1 spin_named:1 spin_member:1 spin_pointee:1 \
+             spin_trailing:1 spin_specifier:1 \
+             spin_plain_named:0 spin_plain_member:0 neighbour:0 \
+             spin_cast_atomic:1 spin_cast_specifier:1 spin_cast_typedef:1 \
+             spin_cast_index:1 spin_cast_volatile_typedef:1 \
+             spin_cast_volatile_record:1 \
+             spin_cast_plain:0 spin_cast_tag:0 spin_cast_atomic_pointer:0; do
+    IFS=: read -r fn want <<<"$probe"
+    got=$(memory_in_loop "$fn")
+    if [[ $got == "$want" ]]; then
+        echo "ok: $fn reads memory $got time(s) a trip"
+    else
+        echo "FAIL: $fn reads memory $got time(s) a trip, expected $want"; rc=1
+    fi
+done
+# A read and a write a trip: two instructions, or one that does both.
+for fn in acc_typedef acc_member acc_pointee; do
+    got=$(memory_in_loop "$fn")
+    if [[ $got == 1 || $got == 2 ]]; then
+        echo "ok: $fn keeps its read and its write in the loop ($got instruction(s))"
+    else
+        echo "FAIL: $fn has $got memory instruction(s) in its loop, expected 1 or 2"; rc=1
+    fi
+done
+# The control: a plain accumulator behind a pointer is what the memory
+# promoter is for, and leaves its loop.
+got=$(memory_in_loop acc_plain_member)
+if [[ $got == 0 ]]; then
+    echo "ok: acc_plain_member keeps its accumulator in a register"
+else
+    echo "FAIL: acc_plain_member has $got memory instruction(s) in its loop, expected 0"; rc=1
+fi
 
 # 7. An extern declaration still describes a volatile object or pointee.
 # Both file- and block-scope declarations used to lose their qualifier before

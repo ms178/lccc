@@ -315,3 +315,71 @@ const int (*ret_arr_const(void))[2] { return ret_g2; }
 ret_ci (*ret_alias_const(void))[2] { return ret_g2; }
 volatile int (*ret_arr_vol(void))[2] { return ret_g2; } /* expect: warning discarded-array-qualifiers */
 const int (*const *ret_arr_star(void))[2] { static const int (*const p)[2] = ret_g2; return &p; }
+
+/* `_Atomic` is not one of these qualifiers. An atomic object is one other
+ * threads read and write while this one runs, so LCCC accesses it the way
+ * it accesses a volatile one, and that is all the two share: the program
+ * wrote no `volatile`, and a pointer to an atomic object converts to
+ * `void *`, and to a pointer to the same atomic type under another name,
+ * without a word. The spellings are the ones the access rule has to follow
+ * (the qualifier, `_Atomic(T)`, a typedef name and a typedef of one, a
+ * member, a parameter, a star's own `_Atomic`); a `volatile` that was
+ * written next to any of them still counts. */
+typedef _Atomic int at_int;
+typedef at_int at_alias;
+typedef _Atomic(long) at_long;
+typedef volatile int at_vint;
+struct at_rec { _Atomic int direct; at_int named; volatile int vol; int plain; at_long wide; at_vint tvol; };
+_Atomic int at_obj;
+at_int at_named;
+at_alias at_chained;
+_Atomic(void *) at_ptr;
+int *_Atomic at_star;
+at_int at_arr[4];
+struct at_rec at_s;
+void *at_ret_direct(void) { return &at_obj; }
+void *at_ret_named(void) { return &at_named; }
+const void *at_ret_const(void) { return &at_chained; }
+void *at_ret_vol(volatile int *v) { return v; } /* expect: warning discarded-qualifiers */
+_Atomic int *at_ret_same(at_int *p) { return p; }
+void at_conversions(_Atomic int *pd, at_int *pn, volatile int *pv, at_alias *pc,
+                    struct at_rec *r, int *_Atomic *pps, at_int at_param, at_vint *ptv) {
+    void *a1 = &at_obj;
+    void *a2 = &at_named;
+    void *a3 = &at_chained;
+    void *a4 = &at_ptr;
+    void *a5 = &at_star;
+    void *a6 = at_arr;
+    void *a7 = &at_arr[1];
+    void *a8 = &at_s.direct;
+    void *a9 = &at_s.named;
+    void *a10 = &r->wide;
+    void *a11 = pd;
+    void *a12 = pn;
+    void *a13 = pc;
+    void *a14 = pps;
+    void *a15 = &at_param;
+    const void *a16 = &r->named;
+    take_v(&at_obj);
+    take_v(pn);
+    take_cv(&at_s.named);
+    take_v(&at_s);
+    a1 = &at_obj;
+    a1 = pd;
+    _Atomic int *b1 = pn;
+    at_int *b2 = &at_obj;
+    at_alias *b3 = pd;
+    at_long *b4 = &r->wide;
+    /* Members and parameters after an atomic one are their own. */
+    void *v1 = pv; /* expect: warning discarded-qualifiers */
+    void *v2 = &at_s.vol; /* expect: warning discarded-qualifiers */
+    void *v3 = &r->vol; /* expect: warning discarded-qualifiers */
+    take_v(pv); /* expect: warning discarded-qualifiers */
+    void *v4 = &at_s.plain;
+    void *v5 = ptv; /* expect: warning discarded-qualifiers */
+    void *v6 = &r->tvol; /* expect: warning discarded-qualifiers */
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7; (void)a8; (void)a9; (void)a10;
+    (void)a11; (void)a12; (void)a13; (void)a14; (void)a15; (void)a16;
+    (void)b1; (void)b2; (void)b3; (void)b4;
+    (void)v1; (void)v2; (void)v3; (void)v4; (void)v5; (void)v6;
+}

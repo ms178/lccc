@@ -317,10 +317,41 @@ impl Parser {
         let mut stars = 0usize;
         let mut before_first_star = true;
         let mut volatile_before_star = false;
+        // The token before this one was `struct`, `union` or `enum`: the
+        // identifier behind it is a tag, whatever typedef shares its name.
+        let mut after_tag_keyword = false;
         let end = end.min(self.tokens.len());
         for tok in &self.tokens[start.min(end)..end] {
-            match tok.kind {
+            let names_tag = std::mem::replace(
+                &mut after_tag_keyword,
+                matches!(
+                    tok.kind,
+                    TokenKind::Struct | TokenKind::Union | TokenKind::Enum
+                ),
+            );
+            match &tok.kind {
                 TokenKind::Eof => break,
+                // The pointee is accessed as a volatile one without the
+                // keyword in two more ways: its type is `_Atomic` (see
+                // `ParsedDeclAttrs::set_atomic`), or it is named by a typedef
+                // whose specifiers are volatile or atomic (`typedef volatile
+                // unsigned vu32; *(vu32 *)REG`, the register idiom of older
+                // vendor headers: read once and never again, `while
+                // (!(*(vu32 *)STATUS & READY))` did not end). Neither writes
+                // a qualifier here, so only the access learns of it; sema
+                // reads a typedef name's qualifiers from the typedef's own
+                // record.
+                TokenKind::Atomic if depth == 0 && before_first_star => {
+                    volatile_before_star = true;
+                }
+                TokenKind::Identifier(name)
+                    if depth == 0
+                        && before_first_star
+                        && !names_tag
+                        && self.typedef_base_volatile.contains(name) =>
+                {
+                    volatile_before_star = true;
+                }
                 TokenKind::Const if depth == 0 && before_first_star => {
                     q.pointee_qualified = true;
                     q.base_const = true;

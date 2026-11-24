@@ -207,6 +207,8 @@ impl Parser {
         let saved_typedef_spaces = self.typedef_object_spaces.clone();
         let saved_typedef_volatile = self.typedef_object_volatile.clone();
         let saved_typedef_base_volatile = self.typedef_base_volatile.clone();
+        let saved_typedef_base_atomic = self.typedef_base_atomic.clone();
+        let saved_typedef_object_atomic = self.typedef_object_atomic.clone();
         let saved_pragma_pack = self.pragma_pack_align.clone();
         let saved_pack_stack = self.pragma_pack_stack.clone();
         let saved_enum_consts = self.enum_constants.clone();
@@ -226,6 +228,8 @@ impl Parser {
                 self.typedef_object_spaces = saved_typedef_spaces;
                 self.typedef_object_volatile = saved_typedef_volatile;
                 self.typedef_base_volatile = saved_typedef_base_volatile;
+                self.typedef_base_atomic = saved_typedef_base_atomic;
+                self.typedef_object_atomic = saved_typedef_object_atomic;
                 self.pragma_pack_align = saved_pragma_pack;
                 self.pragma_pack_stack = saved_pack_stack;
                 self.enum_constants = saved_enum_consts;
@@ -267,8 +271,9 @@ impl Parser {
         let def_name_span = self.attrs.last_decl_name_span;
         // The return type's base qualifiers, before the body's declarations
         // overwrite the per-declarator slots.
+        // (`volatile` as written: not the one `_Atomic` sets for the access.)
         let (ret_base_volatile, ret_base_restrict) = (
-            self.attrs.declarator_base_volatile,
+            self.attrs.declarator_base_volatile && !self.attrs.declarator_base_atomic,
             self.attrs.declarator_base_restrict,
         );
         let (_post_ctor, _post_dtor, post_mode, _post_common, _post_aligned, _first_asm_reg) =

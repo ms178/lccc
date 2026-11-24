@@ -106,6 +106,7 @@ struct RecordLevel {
     /// at pop, plus `parse_struct_or_union`'s `parsing_const` wrap).
     nested_body_saved_const: bool,
     nested_body_outer_volatile: bool,
+    nested_body_outer_atomic: bool,
     nested_body_outer_const: bool,
     nested_body_outer_pointer_const: bool,
     nested_body_outer_counted_by: Option<String>,
@@ -256,6 +257,11 @@ impl Parser {
                     // Atomic-ness is not tracked in types; the flag records the
                     // object qualifier (`DeclAttributes::object_atomic`).
                     self.attrs.set_atomic(true);
+                    // What is tracked is how the object is accessed, and an
+                    // atomic object is accessed as a volatile one is: where
+                    // the program reads or writes it, and as often (see
+                    // `ParsedDeclAttrs::set_atomic`).
+                    self.attrs.set_volatile(true);
                     if matches!(self.peek(), TokenKind::LParen) {
                         let open = self.peek_span();
                         self.advance(); // consume '('
@@ -522,9 +528,15 @@ impl Parser {
                             self.attrs.set_volatile(true);
                             self.attrs.volatile_from_stars = false;
                         }
+                        // `atomic_int x;` is `_Atomic int x;`.
+                        if self.typedef_base_atomic.contains(&name) {
+                            self.attrs.set_atomic(true);
+                        }
                         self.attrs.set_typedef_object_volatile(
                             self.typedef_object_volatile.contains(&name),
                         );
+                        self.attrs
+                            .set_typedef_object_atomic(self.typedef_object_atomic.contains(&name));
                         flags.typedef_name = Some(name);
                         self.advance();
                         any_base_specifier = true;
@@ -1468,6 +1480,8 @@ impl Parser {
         // The members' `volatile` qualifiers must not outlive the body:
         // `struct S { volatile int a; } s;` leaves `s` non-volatile.
         let outer_volatile = self.attrs.parsing_volatile();
+        // Likewise `_Atomic`: `struct S { _Atomic int a; } s;` is no atomic `s`.
+        let outer_atomic = self.attrs.parsing_atomic();
         let outer_const = self.attrs.parsing_const();
         let outer_pointer_const = self.attrs.parsing_pointer_const();
         let outer_counted_by = self.attrs.parsing_counted_by.take();
@@ -1510,6 +1524,7 @@ impl Parser {
                     // post-body `__attribute__` side effect on any of these
                     // flags survives the hand-back.
                     self.attrs.set_volatile(level.nested_body_outer_volatile);
+                    self.attrs.set_atomic(level.nested_body_outer_atomic);
                     self.attrs.set_const(level.nested_body_outer_const);
                     self.attrs
                         .set_pointer_const(level.nested_body_outer_pointer_const);
@@ -1548,8 +1563,10 @@ impl Parser {
             // declarator — anonymous/bitfield arms — never snapshot it).
             self.attrs.parsing_address_space = AddressSpace::Default;
             // Likewise `volatile`: a previous member's qualifier must not
-            // make this member volatile (`volatile int a; int b;`).
+            // make this member volatile (`volatile int a; int b;`), nor its
+            // `_Atomic` this member atomic.
             self.attrs.set_volatile(false);
+            self.attrs.set_atomic(false);
             self.attrs.set_const(false);
             self.attrs.set_pointer_const(false);
             if matches!(self.peek(), TokenKind::Semicolon) {
@@ -1584,6 +1601,7 @@ impl Parser {
                     nested_header,
                     nested_body_saved_const: self.attrs.parsing_const(),
                     nested_body_outer_volatile: self.attrs.parsing_volatile(),
+                    nested_body_outer_atomic: self.attrs.parsing_atomic(),
                     nested_body_outer_const: self.attrs.parsing_const(),
                     nested_body_outer_pointer_const: self.attrs.parsing_pointer_const(),
                     nested_body_outer_counted_by: self.attrs.parsing_counted_by.take(),
@@ -1614,6 +1632,7 @@ impl Parser {
             }
         }
         self.attrs.set_volatile(outer_volatile);
+        self.attrs.set_atomic(outer_atomic);
         self.attrs.set_const(outer_const);
         self.attrs.set_pointer_const(outer_pointer_const);
         self.attrs.parsing_counted_by = outer_counted_by;
@@ -1753,6 +1772,7 @@ impl Parser {
                 alignas_type,
                 is_packed: pre_spec_packed,
                 base_volatile: false,
+                base_atomic: false,
                 base_restrict: false,
                 base_const: self.attrs.parsing_const(),
                 object_volatile: false,
@@ -1962,6 +1982,7 @@ impl Parser {
                     alignas_type: alignas_type.clone(),
                     is_packed: packed_from_type || extra_packed,
                     base_volatile: false,
+                    base_atomic: false,
                     base_restrict: false,
                     base_const: false,
                     object_volatile: false,
@@ -2002,6 +2023,7 @@ impl Parser {
             }
             // The declarator's volatile qualifiers (see `declarator_base_volatile`).
             let decl_base_volatile = self.attrs.declarator_base_volatile;
+            let decl_base_atomic = self.attrs.declarator_base_atomic;
             let decl_base_restrict = self.attrs.declarator_base_restrict;
             let decl_object_volatile = self.attrs.declarator_object_volatile;
             let field_base_const = field_spec_const;
@@ -2086,6 +2108,7 @@ impl Parser {
                 alignas_type: alignas_type.clone(),
                 is_packed,
                 base_volatile: decl_base_volatile,
+                base_atomic: decl_base_atomic,
                 base_restrict: decl_base_restrict,
                 base_const: field_base_const,
                 object_volatile: decl_object_volatile,
@@ -2620,5 +2643,217 @@ mod typeof_type_qualifier_tests {
             assert_eq!(quals.base_volatile, base_volatile, "{source}");
             assert_eq!(quals.unqual, unqual, "{source}");
         }
+    }
+}
+
+/// `_Atomic` records `volatile` for the way the object is accessed (see
+/// `ParsedDeclAttrs::set_atomic`); these pin the other half, that the parser
+/// still says which of the two the program wrote.
+#[cfg(test)]
+mod atomic_provenance_tests {
+    use super::super::Parser;
+    use crate::frontend::lexer::Lexer;
+    use crate::frontend::parser::ast::{
+        CVR_VOLATILE, Declaration, DerivedDeclarator, ExternalDecl, TypeSpecifier,
+    };
+
+    fn parse(source: &str) -> (Parser, Vec<Declaration>) {
+        let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+        let tu = parser.parse();
+        assert_eq!(parser.error_count, 0, "{source}");
+        let decls = tu
+            .decls
+            .into_iter()
+            .filter_map(|decl| match decl {
+                ExternalDecl::Declaration(decl) => Some(decl),
+                _ => None,
+            })
+            .collect();
+        (parser, decls)
+    }
+
+    /// `(base_volatile, base_atomic, object_volatile, object_atomic)` of the
+    /// declarator named `name`.
+    fn flags(decls: &[Declaration], name: &str) -> (bool, bool, bool, bool) {
+        let attrs = decls
+            .iter()
+            .flat_map(|decl| &decl.declarators)
+            .find(|declarator| declarator.name == name)
+            .map(|declarator| &declarator.attrs)
+            .unwrap_or_else(|| panic!("no declarator `{name}`"));
+        (
+            attrs.base_volatile,
+            attrs.base_atomic,
+            attrs.object_volatile,
+            attrs.object_atomic,
+        )
+    }
+
+    #[test]
+    fn an_atomic_specifier_is_volatile_for_the_access_and_says_where_from() {
+        let (_, decls) = parse(
+            "_Atomic int direct; _Atomic(long) spec; int _Atomic trailing; \
+             volatile int vol; int plain; _Atomic int *pointee; \
+             _Atomic int both, second; volatile int v_first, v_second;",
+        );
+        for name in ["direct", "spec", "trailing", "both", "second"] {
+            assert_eq!(flags(&decls, name), (true, true, true, true), "{name}");
+        }
+        // `volatile` that was written: no atomic share in it.
+        for name in ["vol", "v_first", "v_second"] {
+            assert_eq!(flags(&decls, name), (true, false, true, false), "{name}");
+        }
+        assert_eq!(flags(&decls, "plain"), (false, false, false, false));
+        // The pointee is atomic; the pointer is a plain object.
+        assert_eq!(flags(&decls, "pointee"), (true, true, false, false));
+        // An earlier declaration's `_Atomic` is not the next one's.
+        let (_, decls) = parse("_Atomic int a; volatile int v; int p;");
+        assert_eq!(flags(&decls, "v"), (true, false, true, false));
+        assert_eq!(flags(&decls, "p"), (false, false, false, false));
+    }
+
+    #[test]
+    fn a_typedef_name_carries_atomic_like_the_keyword() {
+        let (parser, decls) = parse(
+            "typedef _Atomic int at_int; typedef at_int at_alias; \
+             typedef volatile int v_int; typedef int p_int; \
+             at_int named; at_alias chained; v_int vol; p_int plain; \
+             at_int *pointee; at_alias arr[4];",
+        );
+        for name in ["at_int", "at_alias"] {
+            assert!(parser.typedef_base_atomic.contains(name), "{name}");
+            // The access rule reads this set, and keeps reading it.
+            assert!(parser.typedef_base_volatile.contains(name), "{name}");
+        }
+        assert!(!parser.typedef_base_atomic.contains("v_int"));
+        assert!(parser.typedef_base_volatile.contains("v_int"));
+        assert!(!parser.typedef_base_atomic.contains("p_int"));
+        for name in ["named", "chained", "arr"] {
+            let (base_volatile, base_atomic, ..) = flags(&decls, name);
+            assert!(base_volatile && base_atomic, "{name}");
+        }
+        assert_eq!(flags(&decls, "pointee"), (true, true, false, false));
+        let (base_volatile, base_atomic, ..) = flags(&decls, "vol");
+        assert!(base_volatile && !base_atomic);
+        assert_eq!(flags(&decls, "plain"), (false, false, false, false));
+    }
+
+    #[test]
+    fn a_block_scope_typedef_gives_the_outer_name_its_atomic_back() {
+        let (parser, _) = parse(
+            "typedef _Atomic int cell; \
+             int f(void) { { typedef long cell; cell inner = 0; (void)inner; } return 0; }",
+        );
+        assert!(parser.typedef_base_atomic.contains("cell"));
+        let (parser, _) = parse(
+            "typedef long cell; \
+             int f(void) { { typedef _Atomic int cell; cell inner; (void)inner; } return 0; }",
+        );
+        assert!(!parser.typedef_base_atomic.contains("cell"));
+        assert!(!parser.typedef_base_volatile.contains("cell"));
+    }
+
+    #[test]
+    fn each_parameter_and_member_has_its_own_atomic() {
+        let (_, decls) = parse(
+            "void f(_Atomic int *a, volatile int *v, int *p, _Atomic int by_value, int last); \
+             _Atomic int g(int inner), after;",
+        );
+        let Some(DerivedDeclarator::Function(params, ..)) = decls[0].declarators[0].derived.last()
+        else {
+            panic!("`f` is a function declarator");
+        };
+        let got: Vec<(bool, bool)> = params
+            .iter()
+            .map(|param| (param.is_volatile, param.is_atomic))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (true, true),
+                (true, false),
+                (false, false),
+                (true, true),
+                (false, false),
+            ]
+        );
+        assert!(params[1].volatile_written() && !params[0].volatile_written());
+        // The parameter list of `g` does not take the declaration's
+        // `_Atomic` away from the declarator behind it.
+        assert_eq!(flags(&decls, "after"), (true, true, true, true));
+
+        let (_, decls) = parse(
+            "struct s { _Atomic int a; volatile int v; int p; \
+                        struct { _Atomic long inner; int inner_plain; } nested; int tail; } \
+             volatile outer;",
+        );
+        let TypeSpecifier::Struct(_, Some(fields), ..) = &decls[0].type_spec else {
+            panic!("a struct definition");
+        };
+        let member = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("no member `{name}`"))
+        };
+        assert!(member("a").base_volatile && member("a").base_atomic);
+        assert!(member("v").base_volatile_written());
+        assert!(!member("a").base_volatile_written());
+        for name in ["p", "nested", "tail"] {
+            assert!(
+                !member(name).base_volatile && !member(name).base_atomic,
+                "{name}"
+            );
+        }
+        let TypeSpecifier::Struct(_, Some(inner), ..) = &member("nested").type_spec else {
+            panic!("a nested struct definition");
+        };
+        assert!(inner[0].base_atomic && inner[0].base_volatile);
+        assert!(!inner[1].base_atomic && !inner[1].base_volatile);
+        // The members' `_Atomic` is not the object's, and the object's own
+        // `volatile` was written.
+        assert_eq!(flags(&decls, "outer"), (true, false, true, false));
+    }
+
+    #[test]
+    fn an_array_of_a_typedef_d_atomic_pointer_has_atomic_elements() {
+        let (parser, decls) = parse(
+            "typedef int *_Atomic AP; typedef int *volatile VP; \
+             AP one; AP slots[8]; VP v_slots[8]; AP *indirect;",
+        );
+        assert!(parser.typedef_object_atomic.contains("AP"));
+        assert!(!parser.typedef_base_atomic.contains("AP"));
+        assert!(!parser.typedef_object_atomic.contains("VP"));
+        // The typedef's object qualifier is the declared object's ...
+        assert_eq!(flags(&decls, "one"), (false, false, true, false));
+        // ... and an array's elements', where the base flag carries it.
+        let (base_volatile, base_atomic, ..) = flags(&decls, "slots");
+        assert!(base_volatile && base_atomic);
+        let (base_volatile, base_atomic, ..) = flags(&decls, "v_slots");
+        assert!(base_volatile && !base_atomic);
+        assert_eq!(flags(&decls, "indirect"), (false, false, false, false));
+    }
+
+    #[test]
+    fn a_stars_own_atomic_writes_no_volatile() {
+        let (_, decls) = parse("int *_Atomic ap; int *volatile vp; int *_Atomic *pap;");
+        let star = |name: &str, level: usize| {
+            let declarator = decls
+                .iter()
+                .flat_map(|decl| &decl.declarators)
+                .find(|declarator| declarator.name == name)
+                .unwrap_or_else(|| panic!("no declarator `{name}`"));
+            match &declarator.derived[level] {
+                DerivedDeclarator::Pointer(_, cvr) => *cvr,
+                other => panic!("`{name}` level {level} is {other:?}"),
+            }
+        };
+        // The pointer object is accessed as a volatile one ...
+        assert_eq!(flags(&decls, "ap"), (false, false, true, true));
+        // ... and its star records no qualifier, where a written one does.
+        assert_eq!(star("ap", 0) & CVR_VOLATILE, 0);
+        assert_eq!(star("vp", 0) & CVR_VOLATILE, CVR_VOLATILE);
+        assert_eq!(star("pap", 0) & CVR_VOLATILE, 0);
+        assert_eq!(flags(&decls, "pap"), (false, false, false, false));
     }
 }

@@ -1534,7 +1534,7 @@ impl SemanticAnalyzer {
                     &decl.type_spec,
                     written_cvr(
                         decl.is_const(),
-                        declarator.attrs.base_volatile,
+                        declarator.attrs.base_volatile_written(),
                         declarator.attrs.base_restrict,
                     ),
                 );
@@ -1606,7 +1606,8 @@ impl SemanticAnalyzer {
                 // Pointee qualifier of a pointer typedef, from the declaration's
                 // base-type `const`/`volatile`, or inherited from a typedef
                 // name it is built on (`typedef CNPT CNPT2;`).
-                let pointee_qualified = (decl.is_const() || decl.is_volatile())
+                let pointee_qualified = (decl.is_const()
+                    || (decl.is_volatile() && !declarator.attrs.base_atomic))
                     && matches!(resolved_ctype, CType::Pointer(..))
                     || (declarator.derived.is_empty()
                         && matches!(&decl.type_spec, TypeSpecifier::TypedefName(base)
@@ -1717,7 +1718,7 @@ impl SemanticAnalyzer {
                 // key for each declarator, breaking pointer-array compatibility checks.
                 let written = written_cvr(
                     decl.is_const(),
-                    init_decl.attrs.base_volatile,
+                    init_decl.attrs.base_volatile_written(),
                     init_decl.attrs.base_restrict,
                 );
                 type_builder::build_qualified_ctype_with_base(
@@ -2103,7 +2104,7 @@ impl SemanticAnalyzer {
                     &decl.type_spec,
                     written_cvr(
                         decl.is_const(),
-                        init_decl.attrs.base_volatile,
+                        init_decl.attrs.base_volatile_written(),
                         init_decl.attrs.base_restrict,
                     ),
                 )
@@ -10845,7 +10846,11 @@ dereference it before applying '->' to it?"
         }
         self.specifier_cvr(
             &param.type_spec,
-            written_cvr(param.is_const, param.is_volatile, param.base_restrict),
+            written_cvr(
+                param.is_const,
+                param.volatile_written(),
+                param.base_restrict,
+            ),
         )
     }
 
@@ -10869,7 +10874,7 @@ dereference it before applying '->' to it?"
     }
 
     fn field_ctype(&self, f: &StructFieldDecl) -> CType {
-        let written = written_cvr(f.base_const, f.base_volatile, f.base_restrict);
+        let written = written_cvr(f.base_const, f.base_volatile_written(), f.base_restrict);
         // Resolved vector sizes are already `TypeSpecifier::Vector` nodes
         // (see Parser::apply_pending_vector_attr). A size that needed sema's
         // layout engine is resolved here and inserted at the same position.
@@ -10916,7 +10921,7 @@ dereference it before applying '->' to it?"
     /// a qualifier (`fold_simple_derived`), so a folded star's own bits are
     /// exactly none.
     fn field_own_cvr(&self, f: &StructFieldDecl) -> Option<u8> {
-        let written = written_cvr(f.base_const, f.base_volatile, f.base_restrict);
+        let written = written_cvr(f.base_const, f.base_volatile_written(), f.base_restrict);
         if !f.derived.is_empty() {
             let ty = self.field_ctype(f);
             return type_builder::declarator_own_cvr(&f.derived, &ty, || {

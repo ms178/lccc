@@ -242,6 +242,7 @@ impl Parser {
             self.attrs.declarator_object_atomic,
         );
         let declarator_base_volatile = self.attrs.declarator_base_volatile;
+        let declarator_base_atomic = self.attrs.declarator_base_atomic;
         let declarator_base_restrict = self.attrs.declarator_base_restrict;
         let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
             self.parse_asm_and_attributes();
@@ -346,6 +347,7 @@ impl Parser {
         decl_attrs.pointer_const = declarator_pointer_const;
         (decl_attrs.object_restrict, decl_attrs.object_atomic) = declarator_object_quals;
         decl_attrs.base_volatile = declarator_base_volatile;
+        decl_attrs.base_atomic = declarator_base_atomic;
         decl_attrs.base_restrict = declarator_base_restrict;
         decl_attrs.set_constructor(is_constructor);
         decl_attrs.set_destructor(is_destructor);
@@ -734,7 +736,8 @@ impl Parser {
                 &derived,
             ),
             return_base_cvr: u8::from(return_base_const) * crate::frontend::parser::ast::CVR_CONST
-                | u8::from(decl_attrs.base_volatile) * crate::frontend::parser::ast::CVR_VOLATILE
+                | u8::from(decl_attrs.base_volatile && !decl_attrs.base_atomic)
+                    * crate::frontend::parser::ast::CVR_VOLATILE
                 | u8::from(decl_attrs.base_restrict) * crate::frontend::parser::ast::CVR_RESTRICT,
             return_star_cvr: crate::frontend::parser::ast::return_star_chain(
                 &return_type,
@@ -1297,6 +1300,7 @@ impl Parser {
                 self.attrs.declarator_object_atomic,
             );
             let d_base_volatile = self.attrs.declarator_base_volatile;
+            let d_base_atomic = self.attrs.declarator_base_atomic;
             let d_base_restrict = self.attrs.declarator_base_restrict;
             let (d_ctor, d_dtor, _, d_common, _, d_asm_reg) = self.parse_asm_and_attributes();
             ctx.is_common = ctx.is_common || d_common;
@@ -1392,6 +1396,7 @@ impl Parser {
                     da.pointer_const = d_pointer_const;
                     (da.object_restrict, da.object_atomic) = d_object_quals;
                     da.base_volatile = d_base_volatile;
+                    da.base_atomic = d_base_atomic;
                     da.base_restrict = d_base_restrict;
                     da.asm_register = d_asm_reg;
                     da.cleanup_fn = d_cleanup_fn;
@@ -1770,6 +1775,7 @@ impl Parser {
                 self.attrs.declarator_object_atomic,
             );
             let l_base_volatile = self.attrs.declarator_base_volatile;
+            let l_base_atomic = self.attrs.declarator_base_atomic;
             let l_base_restrict = self.attrs.declarator_base_restrict;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let local_maybe_unused = spec_maybe_unused
@@ -1834,6 +1840,7 @@ impl Parser {
                     da.pointer_const = l_pointer_const;
                     (da.object_restrict, da.object_atomic) = l_object_quals;
                     da.base_volatile = l_base_volatile;
+                    da.base_atomic = l_base_atomic;
                     da.base_restrict = l_base_restrict;
                     da.section = local_section;
                     da.tls_model = local_tls_model;
@@ -2445,6 +2452,9 @@ impl Parser {
                     // `_Atomic(T)` forms parse elsewhere).
                     self.advance();
                     self.attrs.set_atomic(true);
+                    // Accessed like a volatile object (see
+                    // `ParsedDeclAttrs::set_atomic`).
+                    self.attrs.set_volatile(true);
                 }
                 TokenKind::Auto => {
                     self.advance();
@@ -2522,6 +2532,16 @@ impl Parser {
                 self.typedef_base_volatile.insert(decl.name.clone());
             } else {
                 self.typedef_base_volatile.remove(&decl.name);
+            }
+            if decl.attrs.base_atomic {
+                self.typedef_base_atomic.insert(decl.name.clone());
+            } else {
+                self.typedef_base_atomic.remove(&decl.name);
+            }
+            if decl.attrs.object_atomic {
+                self.typedef_object_atomic.insert(decl.name.clone());
+            } else {
+                self.typedef_object_atomic.remove(&decl.name);
             }
             // `unused` written on the typedef, or inherited from the record
             // or typedef it names without a derivation in between.
