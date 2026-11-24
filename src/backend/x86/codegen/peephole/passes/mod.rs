@@ -5150,6 +5150,45 @@ mod tests {
         }
     }
 
+    /// A zero-extended byte or word is its own sign extension: bit 31 is
+    /// clear. (`movl` and 32-bit arithmetic are not: bit 31 may be set.)
+    #[test]
+    fn test_redundant_cltq_after_narrow_zero_extensions() {
+        for producer in [
+            "movzbl %cl, %eax",
+            "movzbl -8(%rbp), %eax",
+            "movzbq %dil, %rax",
+            "movzbq %al, %rax",
+            "movzwl %di, %eax",
+            "movzwq %di, %rax",
+            "movzwq %ax, %rax",
+        ] {
+            for between in ["", "    movq %rax, %r8\n"] {
+                let asm = format!("    {producer}\n{between}    cltq\n    movq %rax, (%rsi)\n");
+                let result = peephole_optimize(asm);
+                assert!(
+                    !result.contains("cltq"),
+                    "{producer} already extends to 64 bits: {result}"
+                );
+            }
+        }
+        for producer in ["movl %ecx, %eax", "movl -8(%rbp), %eax", "addl %ecx, %eax"] {
+            let asm = format!("    {producer}\n    cltq\n    movq %rax, (%rsi)\n");
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains("cltq") || result.contains("movslq"),
+                "bit 31 of {producer} may be set: {result}"
+            );
+        }
+        // Something that writes %eax in between.
+        let asm = "    movzbl %cl, %eax\n    negl %eax\n    cltq\n    movq %rax, (%rsi)\n";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("cltq") || result.contains("movslq"),
+            "{result}"
+        );
+    }
+
     #[test]
     fn test_narrow_sign_extension_does_not_hide_rax_clobber_from_cltq() {
         for producer in ["movsbq %dil, %rax", "movswq %di, %rax"] {

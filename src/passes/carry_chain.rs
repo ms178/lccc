@@ -17,6 +17,13 @@
 //! portable limb arithmetic is written like this. Lowered one instruction at
 //! a time it is fourteen instructions a limb; the machine has one, `adc`.
 //!
+//! The variations are few, and all of them are matched: either addend in
+//! a comparison (`s1 <u y`, `s2 <u c`); a borrow that says the difference
+//! grew (`d1 >u x`, `d2 >u d1`); the carry added first (`(x + c) + y`,
+//! mini-gmp and OpenSSL); and the two partial carries joined by `+`, `^`
+//! or `||` instead of `|` (`cy = s < a; ...; cy += t < s`, and what
+//! `(unsigned __int128)a + b + c` is split into).
+//!
 //! The pass rewrites the five instructions into the two halves of
 //! [`IntrinsicOp::Carry`], adjacent and on the same operands:
 //!
@@ -51,10 +58,18 @@
 //!   constant 0 or 1, a conversion or a copy of one, `v & 1`, a bitwise
 //!   combination of two, and a phi or select of nothing else. For such `c`,
 //!   `s2 = x + y + c` and `out` is its carry: at most one of the two partial
-//!   carries is set, and their `|` is their sum. (A carry in that is not
-//!   proven a bit is left alone: `__builtin_addcll(a, b, n, &o)` adds any
-//!   `n`, and `adc` adds one bit.) `c` is the bit itself, found behind the
-//!   conversions and the `!= 0` the sources write.
+//!   carries is set, so their `|`, their `+` and their `^` are the same
+//!   bit. (A carry in that is not proven a bit is left alone:
+//!   `__builtin_addcll(a, b, n, &o)` adds any `n`, and `adc` adds one bit;
+//!   and of three words the two carries may both be set, which `+` counts
+//!   and `^` cancels.) `c` is the bit itself, found behind the conversions
+//!   and the `!= 0` the sources write.
+//! * Which operand is the bit does not matter to an addition, and of
+//!   `x - y - w` it may be `y` or `w` but not `x` ([`Shape::bits`]).
+//! * The `+` of an adder's partial carries is itself a bit where one of
+//!   the adder's operands is, which round a loop is that same `+`: the
+//!   greatest fixed point of [`booleans`] holds by induction over the
+//!   trips, and falls as soon as the loop is entered with a word.
 //! * The new instructions read `x`, `y` and `c`, which the old ones read
 //!   (transitively) at the same place or earlier, so every definition still
 //!   dominates its uses. `out` moves up to behind the word, which dominated
@@ -124,9 +139,10 @@ impl Facts {
     }
 
     fn is_bool(&mut self, func: &IrFunction, v: Value) -> bool {
-        self.bools
-            .get_or_insert_with(|| booleans(func))
-            .contains(&v.0)
+        if self.bools.is_none() {
+            self.bools = Some(booleans(func, self));
+        }
+        self.bools.as_ref().is_some_and(|bits| bits.contains(&v.0))
     }
 }
 
@@ -162,13 +178,23 @@ fn is_integer(ty: IrType) -> bool {
 /// reads it, so a carry that travels round a loop through a phi (`c = 0;
 /// for (...) c = adc(c, ...)`) is found. Linear in the candidates and their
 /// operands.
-fn booleans(func: &IrFunction) -> FxHashSet<u32> {
+///
+/// A `+` of two bits is not a bit, except the one sources write most: the
+/// sum of an adder's two partial carries (`c = s < a; ...; c += t < s`,
+/// and the high half of `(unsigned __int128)a + b + c`). Those two are
+/// never both set where one of the adder's operands is a bit
+/// ([`Shape::bits`]), so the sum is a candidate that stands for as long as
+/// one of them does -- which, round a loop, is the sum itself.
+fn booleans(func: &IrFunction, facts: &Facts) -> FxHashSet<u32> {
     // What each candidate reads, and whether it reads a constant other
     // than 0 or 1.
     let mut reads: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut struck: Vec<u32> = Vec::new();
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    // The sums of partial carries, with the operands of which one has to
+    // be a bit.
+    let mut sums: Vec<(u32, Vec<Operand>)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
             let (dest, operands): (Value, Vec<&Operand>) = match inst {
                 Instruction::Cmp { dest, .. }
                 | Instruction::Intrinsic {
@@ -204,6 +230,20 @@ fn booleans(func: &IrFunction) -> FxHashSet<u32> {
                     rhs,
                     ty,
                 } if is_integer(*ty) => (*dest, vec![lhs, rhs]),
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty,
+                } if is_integer(*ty) => {
+                    let Some(shape) = shape_at(func, facts, (bi, ii)) else {
+                        continue;
+                    };
+                    sums.push((dest.0, shape.bits().into_iter().cloned().collect()));
+                    // The partial carries themselves: comparisons.
+                    (*dest, vec![lhs, rhs])
+                }
                 Instruction::Select {
                     dest,
                     true_val,
@@ -242,12 +282,43 @@ fn booleans(func: &IrFunction) -> FxHashSet<u32> {
             }
         }
     }
+    // A sum stands while one of its adder's operands may be a bit: how
+    // many of them still may, and which sums each of them holds up. A
+    // constant bit holds its sum up for good.
+    let mut standing: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut holds_up: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (sum, operands) in &sums {
+        let mut count = 0u32;
+        for operand in operands {
+            match operand {
+                Operand::Const(_) if const_bit(operand).is_some() => count += 1,
+                Operand::Value(v) if reads.contains_key(&v.0) => {
+                    count += 1;
+                    holds_up.entry(v.0).or_default().push(*sum);
+                }
+                _ => {}
+            }
+        }
+        if count == 0 {
+            struck.push(*sum);
+        }
+        standing.insert(*sum, count);
+    }
     let mut set: FxHashSet<u32> = reads.keys().copied().collect();
     while let Some(v) = struck.pop() {
-        if set.remove(&v)
-            && let Some(dependents) = readers.get(&v)
-        {
+        if !set.remove(&v) {
+            continue;
+        }
+        if let Some(dependents) = readers.get(&v) {
             struck.extend(dependents.iter().copied().filter(|d| set.contains(d)));
+        }
+        for sum in holds_up.get(&v).into_iter().flatten() {
+            if let Some(count) = standing.get_mut(sum) {
+                *count -= 1;
+                if *count == 0 {
+                    struck.push(*sum);
+                }
+            }
         }
     }
     set
@@ -373,24 +444,58 @@ fn partial_carry(func: &IrFunction, facts: &Facts, mut v: Value) -> Option<Value
     None
 }
 
-/// One full adder: where its second operation and its `|` are, and what
-/// they become.
-struct Adder {
-    /// `s2 = s1 + c` (or `d2 = d1 - c`), replaced by the word half.
+/// The two operations whose partial carries a join combines, before any
+/// of their operands is known to be a bit: `(x + y) + w` or `(x - y) - w`.
+struct Shape {
+    /// The second operation, `s2 = s1 + w` (or `d2 = d1 - w`): where the
+    /// word half goes.
     word_at: Position,
     word: Value,
-    or_dest: Value,
-    or_ty: IrType,
     op: CarryOp,
-    args: [Operand; 3],
+    x: Operand,
+    y: Operand,
+    w: Operand,
 }
 
-/// What the two partial carries say the adder is: the second operation,
-/// its result, the operation and the operands.
-type Found = (Position, Value, CarryOp, [Operand; 3]);
+impl Shape {
+    /// The operands of which one has to be 0 or 1 for the two partial
+    /// carries never to be both set, the one the sources mean first.
+    ///
+    /// Of `x + y + w`, any: the sum of two words and a bit is less than
+    /// twice 2^n, so it carries once at most. Of `x - y - w`, either
+    /// subtrahend: a word and a bit are 2^n together at most, so the
+    /// difference borrows once at most. (Not `x`: `1 - y - w` borrows
+    /// twice for `y = w = 2^n - 1`.)
+    fn bits(&self) -> Vec<&Operand> {
+        if self.op.borrow {
+            vec![&self.w, &self.y]
+        } else {
+            vec![&self.w, &self.x, &self.y]
+        }
+    }
 
-/// `c1 = s1 <u x|y` with `s1 = x + y`; `c2 = s2 <u s1|c` with `s2 = s1 + c`.
-fn add_adder(func: &IrFunction, facts: &mut Facts, c1: Value, c2: Value) -> Option<Found> {
+    /// The operands of the halves, `(x, y, c)`, with `c` the bit behind
+    /// the first operand that is proven one.
+    fn args(&self, func: &IrFunction, facts: &mut Facts) -> Option<[Operand; 3]> {
+        let (at, c) = self
+            .bits()
+            .into_iter()
+            .enumerate()
+            .find_map(|(at, operand)| Some((at, carry_of(func, facts, operand)?)))?;
+        let (x, y, w) = (self.x.clone(), self.y.clone(), self.w.clone());
+        Some(match (self.op.borrow, at) {
+            // `w` is the carry.
+            (_, 0) => [x, y, c],
+            // The subtraction's `y`, or the addition's `x`.
+            (true, _) => [x, w, c],
+            (false, 1) => [y, w, c],
+            (false, _) => [x, w, c],
+        })
+    }
+}
+
+/// `c1 = s1 <u x|y` with `s1 = x + y`; `c2 = s2 <u s1|w` with `s2 = s1 + w`.
+fn add_shape(func: &IrFunction, facts: &Facts, c1: Value, c2: Value) -> Option<Shape> {
     let (s1_operand, bound1, ty1) = unsigned_less(func, facts, c1)?;
     let (s1, x, y, add1_ty) = binop(func, facts, &s1_operand, IrBinOp::Add)?;
     if bound1 != x && bound1 != y {
@@ -399,14 +504,14 @@ fn add_adder(func: &IrFunction, facts: &mut Facts, c1: Value, c2: Value) -> Opti
     let (s2_operand, bound2, ty2) = unsigned_less(func, facts, c2)?;
     let (s2, a, b, add2_ty) = binop(func, facts, &s2_operand, IrBinOp::Add)?;
     let s1_operand = Operand::Value(s1);
-    let carry_in = if a == s1_operand {
+    let w = if a == s1_operand {
         b
     } else if b == s1_operand {
         a
     } else {
         return None;
     };
-    if bound2 != s1_operand && bound2 != carry_in {
+    if bound2 != s1_operand && bound2 != w {
         return None;
     }
     let op = word_op(add1_ty, false)?;
@@ -416,34 +521,69 @@ fn add_adder(func: &IrFunction, facts: &mut Facts, c1: Value, c2: Value) -> Opti
     {
         return None;
     }
-    let c = carry_of(func, facts, &carry_in)?;
     let word_at = (*facts.defs.get(s2.0 as usize)?)?;
-    Some((word_at, s2, op, [x, y, c]))
+    Some(Shape {
+        word_at,
+        word: s2,
+        op,
+        x,
+        y,
+        w,
+    })
 }
 
-/// `b1 = x <u y` with `d1 = x - y`; `b2 = d1 <u c` (or `d1 <u d2`) with
-/// `d2 = d1 - c`. `or_at` is where the `|` is: the first spelling of `b2`
-/// does not read the word, which must then be found, ahead of the `|` in
-/// its block.
-fn sub_adder(
+/// A word that no comparison reads (`d1 <u w` tests the operands of
+/// `d2 = d1 - w`, not `d2`) is looked for in the block of the join: the
+/// nearest one ahead of it, or else the first one behind it.
+fn word_near(
     func: &IrFunction,
-    facts: &mut Facts,
+    join_at: Position,
+    is_word: impl Fn(&Instruction) -> bool,
+) -> Option<(Position, Value)> {
+    let (bi, join_index) = join_at;
+    let insts = &func.blocks[bi].instructions;
+    let found = |(ii, inst): (usize, &Instruction)| {
+        is_word(inst)
+            .then(|| inst.dest())
+            .flatten()
+            .map(|word| ((bi, ii), word))
+    };
+    insts[..join_index]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(found)
+        .or_else(|| {
+            insts
+                .iter()
+                .enumerate()
+                .skip(join_index + 1)
+                .find_map(found)
+        })
+}
+
+/// `b1 = x <u y` (or `x <u d1`: the difference is the greater) with
+/// `d1 = x - y`; `b2 = d1 <u w` (or `d1 <u d2`) with `d2 = d1 - w`.
+/// `join_at` is where the join is ([`word_near`]).
+fn sub_shape(
+    func: &IrFunction,
+    facts: &Facts,
     b1: Value,
     b2: Value,
-    or_at: Position,
-) -> Option<Found> {
-    let (x, y, ty1) = unsigned_less(func, facts, b1)?;
+    join_at: Position,
+) -> Option<Shape> {
+    let (first, second, ty1) = unsigned_less(func, facts, b1)?;
     let (d1_operand, bound, ty2) = unsigned_less(func, facts, b2)?;
-    let (d1, sub_x, sub_y, sub1_ty) = binop(func, facts, &d1_operand, IrBinOp::Sub)?;
-    if sub_x != x || sub_y != y {
+    let (d1, x, y, sub1_ty) = binop(func, facts, &d1_operand, IrBinOp::Sub)?;
+    let d1_operand = Operand::Value(d1);
+    if first != x || (second != y && second != d1_operand) {
         return None;
     }
     let op = word_op(sub1_ty, true)?;
     if word_op(ty1, true) != Some(op) || word_op(ty2, true) != Some(op) {
         return None;
     }
-    let d1_operand = Operand::Value(d1);
-    let is_word = |inst: &Instruction, carry_in: Option<&Operand>| match inst {
+    let is_word = |inst: &Instruction, subtrahend: Option<&Operand>| match inst {
         Instruction::BinOp {
             op: IrBinOp::Sub,
             lhs,
@@ -453,7 +593,7 @@ fn sub_adder(
         } => {
             *lhs == d1_operand
                 && word_op(*ty, true) == Some(op)
-                && carry_in.is_none_or(|c| rhs == c)
+                && subtrahend.is_none_or(|w| rhs == w)
         }
         _ => false,
     };
@@ -462,57 +602,154 @@ fn sub_adder(
         && let Some(inst @ Instruction::BinOp { rhs, .. }) = facts.def(func, *d2)
         && is_word(inst, None)
     {
-        let c = carry_of(func, facts, rhs)?;
         let word_at = (*facts.defs.get(d2.0 as usize)?)?;
-        return Some((word_at, *d2, op, [x, y, c]));
+        return Some(Shape {
+            word_at,
+            word: *d2,
+            op,
+            x,
+            y,
+            w: rhs.clone(),
+        });
     }
-    // `d1 <u c`: the bound is the carry in, and the word is the subtraction
-    // of it from `d1`, looked for from the `|` upwards.
-    let c = carry_of(func, facts, &bound)?;
-    let (bi, or_index) = or_at;
-    let (ii, word) = func.blocks[bi].instructions[..or_index]
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(ii, inst)| {
-            (is_word(inst, Some(&bound)))
-                .then(|| inst.dest())
-                .flatten()
-                .map(|d| (ii, d))
-        })?;
-    Some(((bi, ii), word, op, [x, y, c]))
+    // `d1 <u w`: the bound is the second subtrahend, and the word is the
+    // subtraction of it from `d1`.
+    let (word_at, word) = word_near(func, join_at, |inst| is_word(inst, Some(&bound)))?;
+    Some(Shape {
+        word_at,
+        word,
+        op,
+        x,
+        y,
+        w: bound,
+    })
 }
 
-/// The adder whose carries the `|` at `or_at` combines, if it is one.
-fn adder_at(func: &IrFunction, facts: &mut Facts, or_at: Position) -> Option<Adder> {
-    let Instruction::BinOp {
-        dest: or_dest,
-        op: IrBinOp::Or,
-        lhs: Operand::Value(first),
-        rhs: Operand::Value(second),
-        ty: or_ty,
-    } = &func.blocks[or_at.0].instructions[or_at.1]
-    else {
-        return None;
-    };
-    if !is_integer(*or_ty) {
+/// The subtrahends added up first: `s = y + w`, `b1 = s <u y|w` (they
+/// wrap), `b2 = x <u s`, and the word `x - s` ([`word_near`]). mini-gmp:
+/// `b += cy; cy = b < cy; cy += a < b; r = a - b`.
+///
+/// With `y` or `w` a bit, `y + w` wraps only to 0, from which nothing
+/// borrows: one of the two at most is set, and their join is the borrow of
+/// `x - y - w`.
+fn sub_of_sum_shape(
+    func: &IrFunction,
+    facts: &Facts,
+    b1: Value,
+    b2: Value,
+    join_at: Position,
+) -> Option<Shape> {
+    let (s_operand, bound, ty1) = unsigned_less(func, facts, b1)?;
+    let (s, y, w, add_ty) = binop(func, facts, &s_operand, IrBinOp::Add)?;
+    if bound != y && bound != w {
         return None;
     }
-    let first = partial_carry(func, facts, *first)?;
-    let second = partial_carry(func, facts, *second)?;
+    let s_operand = Operand::Value(s);
+    let (x, subtrahend, ty2) = unsigned_less(func, facts, b2)?;
+    if subtrahend != s_operand {
+        return None;
+    }
+    let op = word_op(add_ty, true)?;
+    if word_op(ty1, true) != Some(op) || word_op(ty2, true) != Some(op) {
+        return None;
+    }
+    let (word_at, word) = word_near(func, join_at, |inst| {
+        matches!(
+            inst,
+            Instruction::BinOp { op: IrBinOp::Sub, lhs, rhs, ty, .. }
+                if *lhs == x && *rhs == s_operand && word_op(*ty, true) == Some(op)
+        )
+    })?;
+    Some(Shape {
+        word_at,
+        word,
+        op,
+        x,
+        y,
+        w,
+    })
+}
+
+/// What joins two partial carries of which one at most is set: their `|`,
+/// and so their `+` and their `^`.
+fn is_join(op: IrBinOp) -> bool {
+    matches!(op, IrBinOp::Or | IrBinOp::Add | IrBinOp::Xor)
+}
+
+/// The join of two values that `inst` is: `(result, type, the two)`. A
+/// `|`, `+` or `^`; or `c1 || c2` as the optimizer leaves it, the select
+/// `c1 ? 1 : c2`.
+fn join_of(inst: &Instruction) -> Option<(Value, IrType, Value, Value)> {
+    match inst {
+        Instruction::BinOp {
+            dest,
+            op,
+            lhs: Operand::Value(first),
+            rhs: Operand::Value(second),
+            ty,
+        } if is_join(*op) && is_integer(*ty) => Some((*dest, *ty, *first, *second)),
+        Instruction::Select {
+            dest,
+            cond: Operand::Value(first),
+            true_val,
+            false_val: Operand::Value(second),
+            ty,
+        } if is_integer(*ty) && const_bit(true_val) == Some(true) => {
+            Some((*dest, *ty, *first, *second))
+        }
+        _ => None,
+    }
+}
+
+/// The two operations whose partial carries the instruction at `join_at`
+/// joins, if it joins two.
+fn shape_at(func: &IrFunction, facts: &Facts, join_at: Position) -> Option<Shape> {
+    let (_, _, first, second) = join_of(&func.blocks[join_at.0].instructions[join_at.1])?;
+    let first = partial_carry(func, facts, first)?;
+    let second = partial_carry(func, facts, second)?;
     [(first, second), (second, first)]
         .into_iter()
         .find_map(|(c1, c2)| {
-            add_adder(func, facts, c1, c2).or_else(|| sub_adder(func, facts, c1, c2, or_at))
+            add_shape(func, facts, c1, c2)
+                .or_else(|| sub_shape(func, facts, c1, c2, join_at))
+                .or_else(|| sub_of_sum_shape(func, facts, c1, c2, join_at))
         })
-        .map(|(word_at, word, op, args)| Adder {
-            word_at,
-            word,
-            or_dest: *or_dest,
-            or_ty: *or_ty,
-            op,
-            args,
-        })
+}
+
+/// One full adder: where its word and its join are, and what they become.
+struct Adder {
+    /// `s2 = s1 + c` (or `d2 = d1 - c`, or `x - s`): the word.
+    word_at: Position,
+    word: Value,
+    /// Where the halves go: in place of the word, which keeps its name; or,
+    /// where the word stands behind the join in its block, in place of the
+    /// join, the word under a new name (`behind`). Both results are then
+    /// defined ahead of everything that read the old ones.
+    at: Position,
+    behind: bool,
+    join_dest: Value,
+    join_ty: IrType,
+    op: CarryOp,
+    args: [Operand; 3],
+}
+
+/// The adder whose carries the instruction at `join_at` joins, if it is
+/// one: the shape, and an operand of it that is a bit.
+fn adder_at(func: &IrFunction, facts: &mut Facts, join_at: Position) -> Option<Adder> {
+    let shape = shape_at(func, facts, join_at)?;
+    let args = shape.args(func, facts)?;
+    let (join_dest, join_ty, ..) = join_of(&func.blocks[join_at.0].instructions[join_at.1])?;
+    let behind = shape.word_at.0 == join_at.0 && shape.word_at.1 > join_at.1;
+    Some(Adder {
+        word_at: shape.word_at,
+        word: shape.word,
+        at: if behind { join_at } else { shape.word_at },
+        behind,
+        join_dest,
+        join_ty,
+        op: shape.op,
+        args,
+    })
 }
 
 /// A carry out read at `ty` is the carry out: 0 or 1 in a whole register,
@@ -538,22 +775,27 @@ fn carry_halves(op: CarryOp, word: Value, out: Value, args: &[Operand; 3]) -> [I
     ]
 }
 
-/// Put `halves[0]` in place of the instruction at each position and
-/// `halves[1]` behind it, and read `renamed` values by their new names
-/// everywhere.
+/// Put the first instruction of each group in place of the one at its
+/// position and the others behind it, and read `renamed` values by their
+/// new names everywhere.
 fn install(
     func: &mut IrFunction,
-    mut pairs: Vec<(Position, [Instruction; 2])>,
+    mut groups: Vec<(Position, Vec<Instruction>)>,
     renamed: &FxHashMap<u32, Value>,
 ) {
     // From the back of each block, so that an insertion moves nothing that
     // is still to be placed.
-    pairs.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    for ((bi, ii), [word, out]) in pairs {
+    groups.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for ((bi, ii), group) in groups {
         let block = &mut func.blocks[bi];
         let span = block.span_at(ii);
-        block.instructions[ii] = word;
-        block.insert_inst(ii + 1, out, span);
+        for (offset, inst) in group.into_iter().enumerate() {
+            if offset == 0 {
+                block.instructions[ii] = inst;
+            } else {
+                block.insert_inst(ii + offset, inst, span);
+            }
+        }
     }
     if renamed.is_empty() {
         return;
@@ -575,8 +817,23 @@ fn install(
 
 /// Rewrite the full adders of `func`. Returns how many there were.
 fn full_adders(func: &mut IrFunction) -> usize {
-    // Most functions have no `|` of two values: nothing is computed for
-    // them.
+    // A function that compares no two unsigned words has no carry: nothing
+    // is computed for it.
+    let compares = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Cmp {
+                    op: IrCmpOp::Ult | IrCmpOp::Ugt,
+                    ty: IrType::U32 | IrType::U64,
+                    ..
+                }
+            )
+        })
+    });
+    if !compares {
+        return 0;
+    }
     let candidates: Vec<Position> = func
         .blocks
         .iter()
@@ -586,17 +843,7 @@ fn full_adders(func: &mut IrFunction) -> usize {
                 .instructions
                 .iter()
                 .enumerate()
-                .filter(|(_, inst)| {
-                    matches!(
-                        inst,
-                        Instruction::BinOp {
-                            op: IrBinOp::Or,
-                            lhs: Operand::Value(_),
-                            rhs: Operand::Value(_),
-                            ..
-                        }
-                    )
-                })
+                .filter(|(_, inst)| join_of(inst).is_some())
                 .map(move |(ii, _)| (bi, ii))
         })
         .collect();
@@ -606,9 +853,9 @@ fn full_adders(func: &mut IrFunction) -> usize {
     let mut facts = Facts::of(func);
     let mut adders: Vec<Adder> = Vec::new();
     let mut claimed: FxHashSet<Position> = FxHashSet::default();
-    for or_at in candidates {
-        if let Some(adder) = adder_at(func, &mut facts, or_at)
-            // Two `|` of the same adder's carries, spelled two ways: the
+    for join_at in candidates {
+        if let Some(adder) = adder_at(func, &mut facts, join_at)
+            // Two joins of the same adder's carries, spelled two ways: the
             // second one keeps its comparisons.
             && claimed.insert(adder.word_at)
         {
@@ -620,44 +867,53 @@ fn full_adders(func: &mut IrFunction) -> usize {
     }
 
     let mut next = func.sound_next_value_id();
-    // The carry out that each `|` (and each conversion of one) is.
+    // The carry out that each join (and each conversion of one) is.
     let mut carry: FxHashMap<u32, Value> = FxHashMap::default();
-    // The ones that are read by that name: at 32 bits or fewer.
+    // What reads a join reads instead: the carry out at 32 bits or fewer,
+    // and a conversion of it, made where the carry out is, above that.
     let mut renamed: FxHashMap<u32, Value> = FxHashMap::default();
-    let outs: Vec<Value> = adders
+    let outs: Vec<(Value, Value, Option<Instruction>)> = adders
         .iter()
         .map(|adder| {
-            let out = Value(next);
-            next += 1;
-            carry.insert(adder.or_dest.0, out);
-            if narrow(adder.or_ty) {
-                renamed.insert(adder.or_dest.0, out);
+            let mut fresh = || {
+                next += 1;
+                Value(next - 1)
+            };
+            // A word behind its join is computed where the join was, under
+            // a new name; the old one is left for dead-code elimination.
+            let word = if adder.behind {
+                let word = fresh();
+                renamed.insert(adder.word.0, word);
+                word
+            } else {
+                adder.word
+            };
+            let out = fresh();
+            carry.insert(adder.join_dest.0, out);
+            if narrow(adder.join_ty) {
+                renamed.insert(adder.join_dest.0, out);
+                return (word, out, None);
             }
-            out
+            let wide = fresh();
+            renamed.insert(adder.join_dest.0, wide);
+            let conversion = Instruction::Cast {
+                dest: wide,
+                src: Operand::Value(out),
+                from_ty: IrType::U32,
+                to_ty: adder.join_ty,
+            };
+            (word, out, Some(conversion))
         })
         .collect();
     func.next_value_id = next;
 
-    for block in &mut func.blocks {
-        for inst in &mut block.instructions {
+    // A conversion of a join to 32 bits or fewer is the carry out
+    // (`unsigned char c = _addcarry_u64(...)`), and so is its `!= 0`
+    // (`bool c = ...`); a wider conversion is one for the next link to
+    // look through.
+    for block in &func.blocks {
+        for inst in &block.instructions {
             match inst {
-                // A 64-bit `|` is a conversion of the carry out.
-                Instruction::BinOp {
-                    dest,
-                    op: IrBinOp::Or,
-                    ty,
-                    ..
-                } if !narrow(*ty) && carry.contains_key(&dest.0) => {
-                    *inst = Instruction::Cast {
-                        dest: *dest,
-                        src: Operand::Value(carry[&dest.0]),
-                        from_ty: IrType::I32,
-                        to_ty: *ty,
-                    };
-                }
-                // A conversion of a carry out to 32 bits or fewer is the
-                // carry out (`unsigned char c = _addcarry_u64(...)`), and a
-                // wider one is one for the next link to look through.
                 Instruction::Cast {
                     dest,
                     src: Operand::Value(src),
@@ -671,29 +927,40 @@ fn full_adders(func: &mut IrFunction) -> usize {
                         }
                     }
                 }
+                Instruction::Cmp {
+                    dest,
+                    op: IrCmpOp::Ne,
+                    lhs: Operand::Value(src),
+                    rhs,
+                    ..
+                } if const_bit(rhs) == Some(false) => {
+                    if let Some(&out) = carry.get(&src.0) {
+                        carry.insert(dest.0, out);
+                        renamed.insert(dest.0, out);
+                    }
+                }
                 _ => {}
             }
         }
     }
 
     let count = adders.len();
-    let pairs = adders
+    let groups = adders
         .into_iter()
         .zip(outs)
-        .map(|(mut adder, out)| {
+        .map(|(mut adder, (word, out, conversion))| {
             // The carry in of a link is the carry out of the one before.
             if let Operand::Value(c) = &adder.args[2]
                 && let Some(&previous) = carry.get(&c.0)
             {
                 adder.args[2] = Operand::Value(previous);
             }
-            (
-                adder.word_at,
-                carry_halves(adder.op, adder.word, out, &adder.args),
-            )
+            let mut group = carry_halves(adder.op, word, out, &adder.args).to_vec();
+            group.extend(conversion);
+            (adder.at, group)
         })
         .collect();
-    install(func, pairs, &renamed);
+    install(func, groups, &renamed);
     count
 }
 
@@ -723,7 +990,7 @@ fn chain_heads(func: &mut IrFunction) -> usize {
     let facts = Facts::of(func);
     let mut next = func.sound_next_value_id();
     let mut renamed: FxHashMap<u32, Value> = FxHashMap::default();
-    let mut pairs: Vec<(Position, [Instruction; 2])> = Vec::new();
+    let mut pairs: Vec<(Position, Vec<Instruction>)> = Vec::new();
     let mut claimed: FxHashSet<Position> = FxHashSet::default();
     // In the order of the function, so that the names given do not depend
     // on a hash.
@@ -780,7 +1047,7 @@ fn chain_heads(func: &mut IrFunction) -> usize {
         let out = Value(next);
         next += 1;
         renamed.insert(c, out);
-        pairs.push((at, carry_halves(op, word, out, &args)));
+        pairs.push((at, carry_halves(op, word, out, &args).to_vec()));
     }
     func.next_value_id = next;
     let count = pairs.len();
@@ -1305,23 +1572,102 @@ mod tests {
         }
     }
 
-    /// `d1 <u c` does not read the word: one that stands behind the `|`
-    /// cannot take the carry out with it.
+    /// `d1 <u c` does not read the word. One that stands behind the `|`
+    /// is computed where the `|` was, under a new name, so that the carry
+    /// out is there for what read the `|` ahead of the word.
     #[test]
-    fn a_word_behind_the_or_is_left_alone() {
+    fn a_word_behind_the_join_moves_up_to_it() {
         let mut insts = header_subtractor(cmp(15, IrCmpOp::Ult, v(10), v(12), U64));
         let word = insts.remove(6);
+        insts.push(cast(19, 16, IrType::I32, U64));
         insts.push(word);
-        insts.push(bin(20, IrBinOp::Xor, v(13), v(16), U64));
+        insts.push(bin(20, IrBinOp::Xor, v(13), v(19), U64));
         let mut func = function(insts, v(20));
-        assert_eq!(run(&mut func, true), 0);
+        assert_eq!(run(&mut func, true), 1);
+        let found = halves(&func);
+        assert_eq!(found.len(), 2, "{func:#?}");
+        let (at, op, word, args) = &found[0];
+        let (out_at, _, out, _) = &found[1];
+        assert!(op.borrow && !op.out);
+        assert_ne!(*word, Value(13), "the word has a new name");
+        assert_eq!(*args, vec![v(0), v(1), v(11)]);
+        assert_eq!(*out_at, at + 1);
+        let insts = &func.blocks[0].instructions;
+        // 3 parameters, `c != 0`, the pair, and behind it the two readers.
+        assert_eq!(insts.len(), 8, "{func:#?}");
+        assert!(
+            matches!(&insts[6], Instruction::Cast { src, .. } if *src == Operand::Value(*out)),
+            "{func:#?}"
+        );
+        assert!(
+            matches!(&insts[7], Instruction::BinOp { lhs, .. } if *lhs == Operand::Value(*word)),
+            "{func:#?}"
+        );
+        assert_eq!(spelling_left(&func), 0, "{func:#?}");
     }
 
-    /// A 64-bit `|` of converted comparisons (`carry = (s < a) | (t < s)`
-    /// in `unsigned long long`) is a conversion of the carry out.
+    /// The subtrahends added up first (mini-gmp's `mpn_sub_n`): `s = y + c`,
+    /// `s <u c`, `x <u s`, and the word `x - s` behind their sum.
     #[test]
-    fn a_wide_or_becomes_a_conversion() {
-        let insts = vec![
+    fn a_subtraction_of_the_summed_subtrahends_is_a_borrow_pair() {
+        let subtractor = || {
+            vec![
+                param(0, 0, U64),
+                param(1, 1, U64),
+                param(2, 2, U64),
+                bin(3, IrBinOp::And, v(2), Operand::Const(IrConst::I64(1)), U64),
+                bin(10, IrBinOp::Add, v(1), v(3), U64),
+                cmp(11, IrCmpOp::Ult, v(10), v(3), U64),
+                cast(12, 11, IrType::I32, U64),
+                cmp(14, IrCmpOp::Ult, v(0), v(10), U64),
+                cast(15, 14, IrType::I32, U64),
+                bin(16, IrBinOp::Add, v(12), v(15), U64),
+                bin(13, IrBinOp::Sub, v(0), v(10), U64),
+                bin(17, IrBinOp::Xor, v(16), v(13), U64),
+            ]
+        };
+        let mut func = function(subtractor(), v(17));
+        assert_eq!(run(&mut func, true), 1, "{func:#?}");
+        let found = halves(&func);
+        assert!(found[0].1.borrow);
+        assert_eq!(found[0].3, vec![v(0), v(1), v(3)]);
+        wide_carry(&func, 17);
+        // 3 parameters, the bit, the pair, its conversion and the `^`.
+        assert_eq!(func.blocks[0].instructions.len(), 8, "{func:#?}");
+
+        // The word ahead of the join keeps its place and its name.
+        let mut insts = subtractor();
+        let word = insts.remove(10);
+        insts.insert(5, word);
+        let mut func = function(insts, v(17));
+        assert_eq!(run(&mut func, true), 1, "{func:#?}");
+        assert_eq!(halves(&func)[0].2, Value(13));
+        assert_eq!(func.blocks[0].instructions.len(), 8, "{func:#?}");
+
+        let miss = |what: &str, edit: &dyn Fn(&mut Vec<Instruction>)| {
+            let mut insts = subtractor();
+            edit(&mut insts);
+            assert_eq!(run(&mut function(insts, v(17)), true), 0, "{what}");
+        };
+        miss("the difference the other way round", &|insts| {
+            insts[10] = bin(13, IrBinOp::Sub, v(10), v(0), U64);
+        });
+        miss("a borrow against one subtrahend", &|insts| {
+            insts[7] = cmp(14, IrCmpOp::Ult, v(0), v(1), U64);
+        });
+        miss("a wrap tested against the minuend", &|insts| {
+            insts[5] = cmp(11, IrCmpOp::Ult, v(10), v(0), U64);
+        });
+        miss("two words subtracted", &|insts| {
+            insts[3] = bin(3, IrBinOp::And, v(2), Operand::Const(IrConst::I64(3)), U64);
+        });
+    }
+
+    /// `x + y + (w & 1)` with its two partial carries converted to 64 bits
+    /// and joined by `join` at 64 bits; the join is `%16`, and `%17` reads
+    /// it and the word.
+    fn wide_adder(join: IrBinOp) -> Vec<Instruction> {
+        vec![
             param(0, 0, U64),
             param(1, 1, U64),
             param(2, 2, U64),
@@ -1332,19 +1678,223 @@ mod tests {
             bin(13, IrBinOp::Add, v(10), v(3), U64),
             cmp(14, IrCmpOp::Ult, v(13), v(10), U64),
             cast(15, 14, IrType::I32, U64),
-            bin(16, IrBinOp::Or, v(12), v(15), U64),
+            bin(16, join, v(12), v(15), U64),
             bin(17, IrBinOp::Xor, v(16), v(13), U64),
-        ];
-        let mut func = function(insts, v(17));
+        ]
+    }
+
+    /// The conversion of the carry out that stands directly behind the
+    /// pair, if `reader` reads it: `(the carry out, the conversion)`.
+    fn wide_carry(func: &IrFunction, reader: u32) -> (Value, Value) {
+        let found = halves(func);
+        assert_eq!(found.len(), 2, "{func:#?}");
+        let (out_at, _, out, _) = &found[1];
+        let Instruction::Cast {
+            dest,
+            src,
+            from_ty: IrType::U32,
+            to_ty: IrType::U64,
+        } = &func.blocks[0].instructions[out_at + 1]
+        else {
+            panic!("no conversion behind the carry out: {func:#?}");
+        };
+        assert_eq!(*src, Operand::Value(*out));
+        let mut read = false;
+        for inst in &func.blocks[0].instructions {
+            if inst.dest() == Some(Value(reader)) {
+                inst.for_each_used_value(|used| read |= used == dest.0);
+            }
+        }
+        assert!(read, "%{reader} reads the conversion: {func:#?}");
+        (*out, *dest)
+    }
+
+    /// A 64-bit `|` of converted comparisons (`carry = (s < a) | (t < s)`
+    /// in `unsigned long long`) is a conversion of the carry out, made
+    /// where the carry out is: a zero extension, and so a 32-bit move
+    /// where the old one, from a comparison's `int`, was a sign extension.
+    #[test]
+    fn a_wide_or_becomes_a_conversion() {
+        let mut func = function(wide_adder(IrBinOp::Or), v(17));
         assert_eq!(run(&mut func, true), 1);
         let found = halves(&func);
         assert_eq!(found[0].3, vec![v(0), v(1), v(3)]);
+        wide_carry(&func, 17);
+        assert_eq!(spelling_left(&func), 0, "{func:#?}");
+    }
+
+    /// Two carries of which one at most is set add up to their `|`, and
+    /// their `^` is it too (`cy = s < a; ...; cy += t < s`).
+    #[test]
+    fn a_sum_and_an_exclusive_or_of_the_carries_are_the_carry() {
+        for join in [IrBinOp::Add, IrBinOp::Xor] {
+            let mut func = function(wide_adder(join), v(17));
+            assert_eq!(run(&mut func, true), 1, "{join:?}");
+            assert_eq!(halves(&func)[0].3, vec![v(0), v(1), v(3)]);
+            wide_carry(&func, 17);
+            // Only the `^` that reads the results is left.
+            assert_eq!(
+                count(&func, |inst| matches!(
+                    inst,
+                    Instruction::BinOp { .. } | Instruction::Cmp { .. }
+                )),
+                2,
+                "{join:?}: {func:#?}"
+            );
+        }
+    }
+
+    /// ... and of two that may both be set (a sum of three words carries
+    /// twice) neither is: `+` counts to two, `^` says no carry.
+    #[test]
+    fn carries_of_three_words_are_not_joined() {
+        for join in [IrBinOp::Or, IrBinOp::Add, IrBinOp::Xor] {
+            let mut insts = wide_adder(join);
+            // The third operand is the word itself, not its lowest bit.
+            insts[7] = bin(13, IrBinOp::Add, v(10), v(2), U64);
+            let mut func = function(insts, v(17));
+            assert_eq!(run(&mut func, true), 0, "{join:?}");
+        }
+    }
+
+    /// Whichever of the three operands is the bit, it is the carry in:
+    /// `(x + c) + y` (mini-gmp adds the carry first) and `(c + y) + w`.
+    #[test]
+    fn the_bit_may_be_any_operand_of_an_addition() {
+        // %3 is the bit; the first addition reads `first`, the second adds
+        // `third`, and the comparisons are against the operand named.
+        for (first, third, want) in [
+            // (x + c) + y
+            ((v(0), v(3)), v(1), vec![v(0), v(1), v(3)]),
+            // (c + x) + y
+            ((v(3), v(0)), v(1), vec![v(0), v(1), v(3)]),
+            // (x + y) + c: the control.
+            ((v(0), v(1)), v(3), vec![v(0), v(1), v(3)]),
+        ] {
+            let mut insts = wide_adder(IrBinOp::Add);
+            insts[4] = bin(10, IrBinOp::Add, first.0.clone(), first.1.clone(), U64);
+            insts[5] = cmp(11, IrCmpOp::Ult, v(10), first.1.clone(), U64);
+            insts[7] = bin(13, IrBinOp::Add, v(10), third.clone(), U64);
+            insts[8] = cmp(14, IrCmpOp::Ult, v(13), third.clone(), U64);
+            let mut func = function(insts, v(17));
+            assert_eq!(run(&mut func, true), 1, "{first:?} + {third:?}");
+            assert_eq!(halves(&func)[0].3, want, "{first:?} + {third:?}");
+        }
+    }
+
+    /// Of a subtraction either subtrahend may be the bit, and the minuend
+    /// may not: `1 - y - w` borrows twice.
+    #[test]
+    fn the_bit_may_be_either_subtrahend_and_not_the_minuend() {
+        let subtractor = |minuend: u32, first: u32, second: u32| {
+            vec![
+                param(0, 0, U64),
+                param(1, 1, U64),
+                param(2, 2, U64),
+                bin(3, IrBinOp::And, v(2), Operand::Const(IrConst::I64(1)), U64),
+                bin(10, IrBinOp::Sub, v(minuend), v(first), U64),
+                cmp(11, IrCmpOp::Ult, v(minuend), v(first), U64),
+                cast(12, 11, IrType::I32, U64),
+                bin(13, IrBinOp::Sub, v(10), v(second), U64),
+                cmp(14, IrCmpOp::Ult, v(10), v(second), U64),
+                cast(15, 14, IrType::I32, U64),
+                bin(16, IrBinOp::Add, v(12), v(15), U64),
+                bin(17, IrBinOp::Xor, v(16), v(13), U64),
+            ]
+        };
+        // (x - y) - c, and (x - c) - y: both are x - y - c.
+        for (first, second) in [(1, 3), (3, 1)] {
+            let mut func = function(subtractor(0, first, second), v(17));
+            assert_eq!(run(&mut func, true), 1, "(x - %{first}) - %{second}");
+            let found = halves(&func);
+            assert!(found[0].1.borrow);
+            assert_eq!(found[0].3, vec![v(0), v(1), v(3)]);
+            wide_carry(&func, 17);
+        }
+        // (c - x) - y.
+        let mut func = function(subtractor(3, 0, 1), v(17));
+        assert_eq!(run(&mut func, true), 0, "{func:#?}");
+    }
+
+    /// The first borrow spelled as the second one may be: `d1 >u x`, the
+    /// difference is the greater (GMP's `sub_n`).
+    #[test]
+    fn a_first_borrow_may_say_the_difference_grew() {
+        let mut insts = header_subtractor(cmp(15, IrCmpOp::Ugt, v(13), v(10), U64));
+        insts[7] = cmp(14, IrCmpOp::Ugt, v(10), v(0), U64);
+        let result = reading(&mut insts, &[(13, U64), (16, IrType::I32)]);
+        let mut func = function(insts, result);
+        assert_eq!(run(&mut func, true), 1, "{func:#?}");
+        let found = halves(&func);
+        assert!(found[0].1.borrow);
+        assert_eq!(found[0].3, vec![v(0), v(1), v(11)]);
+        assert_eq!(spelling_left(&func), 0, "{func:#?}");
+        // Against the subtrahend it says nothing of the kind.
+        let mut insts = header_subtractor(cmp(15, IrCmpOp::Ugt, v(13), v(10), U64));
+        insts[7] = cmp(14, IrCmpOp::Ugt, v(10), v(1), U64);
+        let result = reading(&mut insts, &[(13, U64), (16, IrType::I32)]);
+        assert_eq!(run(&mut function(insts, result), true), 0);
+    }
+
+    /// `c1 || c2` as the optimizer leaves it, `c1 ? 1 : c2`, and the
+    /// `!= 0` a `bool` makes of it.
+    #[test]
+    fn a_logical_or_of_the_carries_is_the_carry() {
+        let mut insts = vec![param(2, 2, IrType::U8)];
+        insts.extend(header_adder(100, v(2), U64));
+        // In place of the `|` and its conversion.
+        insts.truncate(9);
+        insts.push(cast(120, 115, IrType::U8, IrType::I64));
+        insts.push(Instruction::Select {
+            dest: Value(116),
+            cond: v(114),
+            true_val: Operand::Const(IrConst::I64(1)),
+            false_val: v(120),
+            ty: IrType::I64,
+        });
+        insts.push(cmp(
+            117,
+            IrCmpOp::Ne,
+            v(116),
+            Operand::Const(IrConst::I64(0)),
+            IrType::I64,
+        ));
+        let result = reading(&mut insts, &[(113, U64), (117, IrType::U8)]);
+        let mut func = function(insts, result);
+        assert_eq!(run(&mut func, true), 1, "{func:#?}");
+        let found = halves(&func);
+        assert_eq!(found.len(), 2, "{func:#?}");
+        assert_eq!(found[0].3, vec![v(100), v(101), v(111)]);
+        // The `bool` is the carry out: nothing converts it.
         let out = found[1].2;
-        assert!(func.blocks[0].instructions.iter().any(|inst| matches!(
-            inst,
-            Instruction::Cast { dest: Value(16), src: Operand::Value(s), to_ty: IrType::U64, .. }
-                if *s == out
-        )));
+        assert_eq!(
+            count(&func, |inst| matches!(
+                inst,
+                Instruction::Cast { src: Operand::Value(read), from_ty: IrType::U8, .. }
+                    if *read == out
+            )),
+            1,
+            "{func:#?}"
+        );
+        assert_eq!(
+            count(&func, |inst| matches!(inst, Instruction::Select { .. })),
+            0
+        );
+        assert_eq!(spelling_left(&func), 0, "{func:#?}");
+        // A select of anything else is no join.
+        let mut insts = vec![param(2, 2, IrType::U8)];
+        insts.extend(header_adder(100, v(2), U64));
+        insts.truncate(9);
+        insts.push(cast(120, 115, IrType::U8, IrType::I64));
+        insts.push(Instruction::Select {
+            dest: Value(116),
+            cond: v(114),
+            true_val: Operand::Const(IrConst::I64(2)),
+            false_val: v(120),
+            ty: IrType::I64,
+        });
+        let result = reading(&mut insts, &[(113, U64), (116, IrType::I64)]);
+        assert_eq!(run(&mut function(insts, result), true), 0);
     }
 
     /// What must not match.
@@ -1433,7 +1983,7 @@ mod tests {
             bin(20, IrBinOp::Or, v(19), v(10), U64),
         ];
         let func = function(insts, v(17));
-        let set = booleans(&func);
+        let set = booleans(&func, &Facts::of(&func));
         for bit in [10, 11, 12, 13, 17, 18] {
             assert!(set.contains(&bit), "%{bit} is a bit");
         }
@@ -1519,6 +2069,95 @@ mod tests {
             "and the carry out is what comes round: {body:#?}"
         );
         assert_eq!(body.len(), 3);
+    }
+
+    /// One trip of a limb loop over `x = %0`, `y = %1`: `%50` goes round,
+    /// starting at `start` and continuing as the `join` of the two partial
+    /// carries of `(x + y) + %50`. Returns the function and the body.
+    fn counted_loop(start: Operand, join: IrBinOp) -> IrFunction {
+        let mut func = IrFunction::new("limbs".into(), U64, vec![], false);
+        let block = |label: u32, instructions, terminator| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        };
+        func.blocks.push(block(
+            0,
+            vec![param(0, 0, U64), param(1, 1, U64), param(2, 2, U64)],
+            Terminator::Branch(BlockId(1)),
+        ));
+        func.blocks.push(block(
+            1,
+            vec![
+                Instruction::Phi {
+                    dest: Value(50),
+                    ty: U64,
+                    incoming: vec![(start, BlockId(0)), (v(16), BlockId(1))],
+                },
+                bin(10, IrBinOp::Add, v(0), v(1), U64),
+                cmp(11, IrCmpOp::Ult, v(10), v(0), U64),
+                cast(12, 11, IrType::I32, U64),
+                bin(13, IrBinOp::Add, v(10), v(50), U64),
+                cmp(14, IrCmpOp::Ult, v(13), v(10), U64),
+                cast(15, 14, IrType::I32, U64),
+                bin(16, join, v(12), v(15), U64),
+            ],
+            Terminator::CondBranch {
+                cond: v(13),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ));
+        func.blocks
+            .push(block(2, vec![], Terminator::Return(Some(v(50)))));
+        func.next_value_id = func.sound_next_value_id();
+        func
+    }
+
+    /// The sum of the two carries goes round the loop and is the third
+    /// operand of the next trip: it is a bit because the third operand is
+    /// one, which is the sum itself. Started at 0 or 1 it stands; started
+    /// at a word it falls, and the loop counts carries (0, 1 or 2 a trip).
+    #[test]
+    fn a_sum_of_carries_round_a_loop_is_a_bit_if_it_starts_as_one() {
+        for start in [0, 1] {
+            let mut func = counted_loop(Operand::Const(IrConst::I64(start)), IrBinOp::Add);
+            assert!(booleans(&func, &Facts::of(&func)).contains(&16));
+            assert_eq!(run(&mut func, true), 1, "started at {start}");
+            let body = &func.blocks[1].instructions;
+            let Instruction::Intrinsic {
+                op: IntrinsicOp::Carry(op),
+                args,
+                ..
+            } = &body[1]
+            else {
+                panic!("{body:#?}");
+            };
+            assert_eq!(*op, word_add(true));
+            assert_eq!(*args, vec![v(0), v(1), v(50)]);
+            // The phi, the pair and the conversion that comes round.
+            assert_eq!(body.len(), 4, "{body:#?}");
+            let Instruction::Cast { dest: wide, .. } = &body[3] else {
+                panic!("{body:#?}");
+            };
+            assert!(
+                matches!(&body[0], Instruction::Phi { incoming, .. }
+                    if incoming[1].0 == Operand::Value(*wide)),
+                "{body:#?}"
+            );
+        }
+        for start in [Operand::Const(IrConst::I64(2)), v(2)] {
+            let mut func = counted_loop(start.clone(), IrBinOp::Add);
+            let bits = booleans(&func, &Facts::of(&func));
+            assert!(!bits.contains(&16) && !bits.contains(&50), "{start:?}");
+            assert_eq!(run(&mut func, true), 0, "started at {start:?}");
+        }
+        // With `|` the join is a bit whatever it joins, and the carry in is
+        // one from the second trip on; the first trip adds the word.
+        let mut func = counted_loop(v(2), IrBinOp::Or);
+        assert_eq!(run(&mut func, true), 0);
     }
 
     /// The table of [`CarryOp::evaluate`] against 128-bit arithmetic.

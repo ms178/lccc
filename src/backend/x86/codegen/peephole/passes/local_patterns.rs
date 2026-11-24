@@ -3069,6 +3069,9 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                     prev_ext,
                     ExtKind::ProducerMovslqToRax | ExtKind::MovslqEaxRax
                 ),
+                // A sign extension, or the zero extension of a byte or a
+                // word: bit 31 is clear and the upper half zero already
+                // (`setc %cl; movzbl %cl, %eax; cltq`).
                 ExtKind::Cltq => matches!(
                     prev_ext,
                     ExtKind::ProducerMovsbqToRax
@@ -3078,6 +3081,12 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         | ExtKind::MovsbqAlRax
                         | ExtKind::MovslqEaxRax
                         | ExtKind::Cltq
+                        | ExtKind::ProducerMovzbToEax
+                        | ExtKind::ProducerMovzbqToRax
+                        | ExtKind::ProducerMovzwToEax
+                        | ExtKind::ProducerMovzwqToRax
+                        | ExtKind::MovzbqAlRax
+                        | ExtKind::MovzwqAxRax
                 ),
                 ExtKind::MovlEaxEax => matches!(
                     prev_ext,
@@ -3153,6 +3162,12 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 | ExtKind::MovsbqAlRax
                                 | ExtKind::MovslqEaxRax
                                 | ExtKind::Cltq
+                                | ExtKind::ProducerMovzbToEax
+                                | ExtKind::ProducerMovzbqToRax
+                                | ExtKind::ProducerMovzwToEax
+                                | ExtKind::ProducerMovzwqToRax
+                                | ExtKind::MovzbqAlRax
+                                | ExtKind::MovzwqAxRax
                         ) {
                             found_producer = true;
                             break;

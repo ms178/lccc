@@ -1,10 +1,12 @@
 /* Full adders: `x + y + carry` and `x - y - borrow` with their carry out,
  * in every spelling C has for them -- the header intrinsics
  * (`_addcarry_u64`, `_subborrow_u32`, ...), the builtins
- * (`__builtin_addcll`, `__builtin_subc`, ...) and comparisons
- * (`s = a + b; c = s < a; t = s + cin; c |= t < s`) -- alone, in chains of
- * limbs, in loops, across branches, with constant operands, with a carry in
- * that is a whole word, and with either result unused.
+ * (`__builtin_addcll`, `__builtin_subc`, ...), comparisons
+ * (`s = a + b; c = s < a; t = s + cin; c |= t < s`), `unsigned __int128`
+ * and the limb loops of GMP, mini-gmp and OpenSSL as they are written
+ * there -- alone, in chains of limbs, in loops, across branches, with
+ * constant operands, with a carry in that is a whole word, and with either
+ * result unused.
  *
  * On x86-64 the optimizer turns each of them into `adc`/`sbb`
  * (src/passes/carry_chain.rs). Every result is checked here against an
@@ -589,6 +591,350 @@ static NOINLINE u32 cmp_addn32(u32 *r, const u32 *a, const u32 *b, long n)
     return c;
 }
 
+/* ---- 7. Other orders, other joins, other first borrows. ---- */
+
+/* The carry added first, the two carries added up (mini-gmp's order). */
+static NOINLINE u64 cmp_add_carry_first(u64 a, u64 b, u64 x, u64 y, u64 *cout)
+{
+    u64 cy = x < y;
+    u64 r = a + cy;
+    cy = r < cy;
+    r += b;
+    cy += r < b;
+    *cout = cy;
+    return r;
+}
+
+/* The borrow subtracted first. */
+static NOINLINE u64 cmp_sub_borrow_first(u64 a, u64 b, u64 x, u64 y, u64 *bout)
+{
+    u64 bin = x > y;
+    u64 d = a - bin;
+    u64 e = d - b;
+    *bout = (a < bin) + (d < b);
+    return e;
+}
+
+/* Both borrows spelled "the difference is the greater" (GMP's sub_n). */
+static NOINLINE u64 cmp_sub_both_grew(u64 a, u64 b, u64 x, u64 y, u64 *bout)
+{
+    u64 bin = x > y;
+    u64 d = a - b;
+    u64 b1 = d > a;
+    u64 e = d - bin;
+    u64 b2 = e > d;
+    *bout = b1 | b2;
+    return e;
+}
+
+/* The borrow computed ahead of the difference. */
+static NOINLINE u64 cmp_sub_borrow_ahead(u64 a, u64 b, u64 x, u64 y, u64 *bout)
+{
+    u64 bin = x > y;
+    u64 d = a - b;
+    *bout = (a < b) | (d < bin);
+    return d - bin;
+}
+
+/* The subtrahends added up first (mini-gmp's order). */
+static NOINLINE u64 cmp_sub_of_sum(u64 a, u64 b, u64 x, u64 y, u64 *bout)
+{
+    u64 cy = x > y;
+    b += cy;
+    cy = b < cy;
+    cy += a < b;
+    *bout = cy;
+    return a - b;
+}
+
+/* Not an adder: two words added up and subtracted borrow twice. */
+static NOINLINE u64 cmp_sub_of_sum_word(u64 a, u64 b, u64 w, u64 *bout)
+{
+    u64 s = b + w;
+    u64 n = s < w;
+    n += a < s;
+    *bout = n;
+    return a - s;
+}
+
+/* `||` of the carries, the carry in an `int` that is not a bit. */
+static NOINLINE int cmp_add_logical_int(u64 a, u64 b, int cin, u64 *r)
+{
+    u64 s = a + b;
+    u64 t = s + (cin != 0);
+    *r = t;
+    return s < a || t < s;
+}
+
+/* Not adders: the carries of a sum of three words are counted, and there
+ * may be two of them. */
+static NOINLINE u64 cmp_add_plus_word(u64 a, u64 b, u64 cin, u64 *cout)
+{
+    u64 s = a + b;
+    u64 t = s + cin;
+    *cout = (s < a) + (t < s);
+    return t;
+}
+
+static NOINLINE u64 cmp_add_xor_word(u64 a, u64 b, u64 cin, u64 *cout)
+{
+    u64 s = a + b;
+    u64 t = s + cin;
+    *cout = (s < a) ^ (t < s);
+    return t;
+}
+
+static NOINLINE u64 cmp_sub_plus_word(u64 a, u64 b, u64 bin, u64 *bout)
+{
+    u64 d = a - b;
+    u64 e = d - bin;
+    *bout = (a < b) + (d < bin);
+    return e;
+}
+
+/* Not an adder either: the minuend is a bit, the subtrahends are words,
+ * and `1 - y - w` can borrow twice. */
+static NOINLINE u64 cmp_sub_from_bit(u64 p, u64 q, u64 y, u64 w, u64 *bout)
+{
+    u64 x = p < q;
+    u64 d = x - y;
+    u64 e = d - w;
+    *bout = (x < y) + (d < w);
+    return e;
+}
+
+/* ---- 8. Limb loops as libraries write them. ---- */
+
+/* GMP, mpn/generic/add_n.c and sub_n.c (n >= 1). */
+static NOINLINE u64 lib_gmp_add_n(u64 *rp, const u64 *up, const u64 *vp, long n)
+{
+    u64 ul, vl, sl, rl, cy, cy1, cy2;
+    cy = 0;
+    do {
+        ul = *up++;
+        vl = *vp++;
+        sl = ul + vl;
+        cy1 = sl < ul;
+        rl = sl + cy;
+        cy2 = rl < sl;
+        cy = cy1 | cy2;
+        *rp++ = rl;
+    } while (--n != 0);
+    return cy;
+}
+
+static NOINLINE u64 lib_gmp_sub_n(u64 *rp, const u64 *up, const u64 *vp, long n)
+{
+    u64 ul, vl, sl, rl, cy, cy1, cy2;
+    cy = 0;
+    do {
+        ul = *up++;
+        vl = *vp++;
+        sl = ul - vl;
+        cy1 = sl > ul;
+        rl = sl - cy;
+        cy2 = rl > sl;
+        cy = cy1 | cy2;
+        *rp++ = rl;
+    } while (--n != 0);
+    return cy;
+}
+
+/* mini-gmp.c, mpn_add_n and mpn_sub_n. */
+static NOINLINE u64 lib_mini_add_n(u64 *rp, const u64 *ap, const u64 *bp, long n)
+{
+    long i;
+    u64 cy;
+    for (i = 0, cy = 0; i < n; i++) {
+        u64 a, b, r;
+        a = ap[i];
+        b = bp[i];
+        r = a + cy;
+        cy = (r < cy);
+        r += b;
+        cy += (r < b);
+        rp[i] = r;
+    }
+    return cy;
+}
+
+static NOINLINE u64 lib_mini_sub_n(u64 *rp, const u64 *ap, const u64 *bp, long n)
+{
+    long i;
+    u64 cy;
+    for (i = 0, cy = 0; i < n; i++) {
+        u64 a, b;
+        a = ap[i];
+        b = bp[i];
+        b += cy;
+        cy = (b < cy);
+        cy += (a < b);
+        rp[i] = a - b;
+    }
+    return cy;
+}
+
+/* OpenSSL, crypto/bn/bn_asm.c, bn_add_words and bn_sub_words without
+ * BN_LLONG, one limb a trip. */
+static NOINLINE u64 lib_ossl_add_words(u64 *r, const u64 *a, const u64 *b, int n)
+{
+    u64 c, l, t;
+    if (n <= 0)
+        return 0;
+    c = 0;
+    while (n) {
+        t = a[0];
+        t = (t + c) & 0xffffffffffffffffull;
+        c = (t < c);
+        l = (t + b[0]) & 0xffffffffffffffffull;
+        c += (l < t);
+        r[0] = l;
+        a++;
+        b++;
+        r++;
+        n--;
+    }
+    return c;
+}
+
+static NOINLINE u64 lib_ossl_sub_words(u64 *r, const u64 *a, const u64 *b, int n)
+{
+    u64 t1, t2;
+    int c = 0;
+    if (n <= 0)
+        return 0;
+    while (n) {
+        t1 = a[0];
+        t2 = b[0];
+        r[0] = (t1 - t2 - c) & 0xffffffffffffffffull;
+        if (t1 != t2)
+            c = (t1 < t2);
+        a++;
+        b++;
+        r++;
+        n--;
+    }
+    return (u64)c;
+}
+
+/* The double word. */
+#if defined(__SIZEOF_INT128__)
+#define HAVE_INT128 1
+static NOINLINE u64 lib_i128_add_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned __int128 t = (unsigned __int128)a[i] + b[i] + c;
+        r[i] = (u64)t;
+        c = (u64)(t >> 64);
+    }
+    return c;
+}
+
+static NOINLINE u64 lib_i128_sub_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 borrow = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned __int128 t = (unsigned __int128)a[i] - b[i] - borrow;
+        r[i] = (u64)t;
+        borrow = (u64)(t >> 64) & 1;
+    }
+    return borrow;
+}
+
+/* Three words in the double word: the high half counts to two. */
+static NOINLINE u64 lib_i128_add3_n(u64 *r, const u64 *a, const u64 *b, const u64 *w, long n)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned __int128 t = (unsigned __int128)a[i] + b[i] + w[i];
+        r[i] = (u64)t ^ c;
+        c = (u64)(t >> 64);
+    }
+    return c;
+}
+#else
+#define HAVE_INT128 0
+#endif
+
+/* The overflow builtins. */
+static NOINLINE u64 lib_ovf_add_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_add_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_add_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 | c2;
+    }
+    return c;
+}
+
+static NOINLINE u64 lib_ovf_sub_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        unsigned long long s, t;
+        u64 c1 = __builtin_sub_overflow((unsigned long long)a[i], (unsigned long long)b[i], &s);
+        u64 c2 = __builtin_sub_overflow(s, (unsigned long long)c, &t);
+        r[i] = t;
+        c = c1 + c2;
+    }
+    return c;
+}
+
+/* The carry a `_Bool`, the carries joined by `||`. */
+static NOINLINE u64 lib_bool_add_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    _Bool c = 0;
+    for (long i = 0; i < n; i++) {
+        u64 s = a[i] + b[i];
+        u64 t = s + c;
+        c = s < a[i] || t < s;
+        r[i] = t;
+    }
+    return c;
+}
+
+static NOINLINE u64 lib_bool_sub_n(u64 *r, const u64 *a, const u64 *b, long n)
+{
+    _Bool borrow = 0;
+    for (long i = 0; i < n; i++) {
+        u64 d = a[i] - b[i];
+        u64 e = d - borrow;
+        borrow = a[i] < b[i] || d < (u64)borrow;
+        r[i] = e;
+    }
+    return borrow;
+}
+
+/* Not adders: the carries of three words a trip are counted (0, 1 or 2),
+ * and the count is what goes round. */
+static NOINLINE u64 lib_count_n(u64 *r, const u64 *a, const u64 *b, const u64 *w, long n)
+{
+    u64 c = 0;
+    for (long i = 0; i < n; i++) {
+        u64 s = a[i] + b[i];
+        u64 t = s + w[i];
+        r[i] = t ^ c;
+        c = (s < a[i]) + (t < s);
+    }
+    return c;
+}
+
+/* The count is the third word of the next trip: it starts as a word. */
+static NOINLINE u64 lib_count_carried_n(u64 *r, const u64 *a, const u64 *b, u64 c, long n)
+{
+    for (long i = 0; i < n; i++) {
+        u64 s = a[i] + b[i];
+        u64 t = s + c;
+        r[i] = t;
+        c = (s < a[i]) + (t < s);
+    }
+    return c;
+}
+
 /* ---- The driver. ---- */
 
 #define LIMBS 9
@@ -753,6 +1099,42 @@ static void word_carries(u64 a, u64 b, u64 cin)
     r = cmp_sub_word(a, b, cin, &o);
     expect("cmp_sub_word", r, want);
     expect("cmp_sub_word borrow", o, want_c);
+    {
+        unsigned c;
+        int word = (int)(cin & 0x7fffffffu);
+        o = (u64)cmp_add_logical_int(a, b, word, &r);
+        expect("cmp_add_logical_int", r, ref_add64(a, b, word != 0, &c));
+        expect("cmp_add_logical_int carry", o, c);
+    }
+    {
+        /* The two carries on their own: counted, and exclusive-or'ed. */
+        unsigned c1, c2;
+        u64 s = ref_add64(a, b, 0, &c1);
+        u64 t = ref_add64(s, cin, 0, &c2);
+        r = cmp_add_plus_word(a, b, cin, &o);
+        expect("cmp_add_plus_word", r, t);
+        expect("cmp_add_plus_word carries", o, c1 + c2);
+        r = cmp_add_xor_word(a, b, cin, &o);
+        expect("cmp_add_xor_word", r, t);
+        expect("cmp_add_xor_word carries", o, c1 ^ c2);
+        s = ref_sub64(a, b, 0, &c1);
+        t = ref_sub64(s, cin, 0, &c2);
+        r = cmp_sub_plus_word(a, b, cin, &o);
+        expect("cmp_sub_plus_word", r, t);
+        expect("cmp_sub_plus_word borrows", o, c1 + c2);
+        /* A minuend of 0 or 1 and two words. */
+        s = ref_sub64(a < b, b, 0, &c1);
+        t = ref_sub64(s, cin, 0, &c2);
+        r = cmp_sub_from_bit(a, b, b, cin, &o);
+        expect("cmp_sub_from_bit", r, t);
+        expect("cmp_sub_from_bit borrows", o, c1 + c2);
+        /* Two words added up, and their sum subtracted. */
+        s = ref_add64(b, cin, 0, &c1);
+        t = ref_sub64(a, s, 0, &c2);
+        r = cmp_sub_of_sum_word(a, b, cin, &o);
+        expect("cmp_sub_of_sum_word", r, t);
+        expect("cmp_sub_of_sum_word borrows", o, c1 + c2);
+    }
 
 #if HAVE_BUILTINS
     want = ref_add_word(a, b, cin, &want_c);
@@ -801,6 +1183,9 @@ static void compared(u64 a, u64 b, u64 x, u64 y)
     r = cmp_add_xor(a, b, x, y, &o);
     expect("cmp_add_xor", r, want);
     expect("cmp_add_xor carry", o, want_c);
+    r = cmp_add_carry_first(a, b, x, y, &o);
+    expect("cmp_add_carry_first", r, want);
+    expect("cmp_add_carry_first carry", o, want_c);
     r = cmp_add_shared(a, b, x, y, &o);
     expect("cmp_add_shared", r, want);
     {
@@ -828,6 +1213,18 @@ static void compared(u64 a, u64 b, u64 x, u64 y)
     r = cmp_sub_grew(a, b, x, y, &o);
     expect("cmp_sub_grew", r, want);
     expect("cmp_sub_grew borrow", o, want_c);
+    r = cmp_sub_borrow_first(a, b, x, y, &o);
+    expect("cmp_sub_borrow_first", r, want);
+    expect("cmp_sub_borrow_first borrow", o, want_c);
+    r = cmp_sub_both_grew(a, b, x, y, &o);
+    expect("cmp_sub_both_grew", r, want);
+    expect("cmp_sub_both_grew borrow", o, want_c);
+    r = cmp_sub_borrow_ahead(a, b, x, y, &o);
+    expect("cmp_sub_borrow_ahead", r, want);
+    expect("cmp_sub_borrow_ahead borrow", o, want_c);
+    r = cmp_sub_of_sum(a, b, x, y, &o);
+    expect("cmp_sub_of_sum", r, want);
+    expect("cmp_sub_of_sum borrow", o, want_c);
 
     want = ref_add32((u32)a, (u32)b, (u32)x != (u32)y, &want_c);
     r32 = cmp_add32((u32)a, (u32)b, (u32)x, (u32)y, &o32);
@@ -837,6 +1234,85 @@ static void compared(u64 a, u64 b, u64 x, u64 y)
     r32 = cmp_sub32((u32)a, (u32)b, (u32)x, (u32)y, &o32);
     expect("cmp_sub32", r32, want);
     expect("cmp_sub32 borrow", o32, want_c);
+}
+
+/* The loops of section 8, at every length. */
+static void libraries(const u64 *a, const u64 *b)
+{
+    u64 r[LIMBS], want[LIMBS], w[LIMBS];
+    unsigned want_c;
+    for (int i = 0; i < LIMBS; i++)
+        w[i] = limb();
+    for (int n = 0; n <= LIMBS; n++) {
+        for (int i = 0; i < LIMBS; i++)
+            r[i] = want[i] = 0x3c3c3c3c3c3c3c3cull - (u64)i;
+
+        want_c = ref_addn(want, a, b, n, 0);
+        if (n > 0) {
+            expect("lib_gmp_add_n carry", lib_gmp_add_n(r, a, b, n), want_c);
+            expect_limbs("lib_gmp_add_n", r, want, LIMBS);
+        }
+        expect("lib_mini_add_n carry", lib_mini_add_n(r, a, b, n), want_c);
+        expect_limbs("lib_mini_add_n", r, want, LIMBS);
+        expect("lib_ossl_add_words carry", lib_ossl_add_words(r, a, b, n), want_c);
+        expect_limbs("lib_ossl_add_words", r, want, LIMBS);
+        expect("lib_ovf_add_n carry", lib_ovf_add_n(r, a, b, n), want_c);
+        expect_limbs("lib_ovf_add_n", r, want, LIMBS);
+        expect("lib_bool_add_n carry", lib_bool_add_n(r, a, b, n), want_c);
+        expect_limbs("lib_bool_add_n", r, want, LIMBS);
+#if HAVE_INT128
+        expect("lib_i128_add_n carry", lib_i128_add_n(r, a, b, n), want_c);
+        expect_limbs("lib_i128_add_n", r, want, LIMBS);
+#endif
+
+        want_c = ref_subn(want, a, b, n, 0);
+        if (n > 0) {
+            expect("lib_gmp_sub_n borrow", lib_gmp_sub_n(r, a, b, n), want_c);
+            expect_limbs("lib_gmp_sub_n", r, want, LIMBS);
+        }
+        expect("lib_mini_sub_n borrow", lib_mini_sub_n(r, a, b, n), want_c);
+        expect_limbs("lib_mini_sub_n", r, want, LIMBS);
+        expect("lib_ossl_sub_words borrow", lib_ossl_sub_words(r, a, b, n), want_c);
+        expect_limbs("lib_ossl_sub_words", r, want, LIMBS);
+        expect("lib_ovf_sub_n borrow", lib_ovf_sub_n(r, a, b, n), want_c);
+        expect_limbs("lib_ovf_sub_n", r, want, LIMBS);
+        expect("lib_bool_sub_n borrow", lib_bool_sub_n(r, a, b, n), want_c);
+        expect_limbs("lib_bool_sub_n", r, want, LIMBS);
+#if HAVE_INT128
+        expect("lib_i128_sub_n borrow", lib_i128_sub_n(r, a, b, n), want_c);
+        expect_limbs("lib_i128_sub_n", r, want, LIMBS);
+#endif
+
+        {
+            /* Three words a trip: the count of carries goes round. */
+            u64 count = 0;
+            for (int i = 0; i < n; i++) {
+                unsigned c1, c2;
+                u64 s = ref_add64(a[i], b[i], 0, &c1);
+                u64 t = ref_add64(s, w[i], 0, &c2);
+                want[i] = t ^ count;
+                count = c1 + c2;
+            }
+            expect("lib_count_n count", lib_count_n(r, a, b, w, n), count);
+            expect_limbs("lib_count_n", r, want, LIMBS);
+#if HAVE_INT128
+            expect("lib_i128_add3_n count", lib_i128_add3_n(r, a, b, w, n), count);
+            expect_limbs("lib_i128_add3_n", r, want, LIMBS);
+#endif
+        }
+        for (unsigned k = 0; k < NEDGES; k++) {
+            /* The count is the third word, and the first one any word. */
+            u64 count = edges[k];
+            for (int i = 0; i < n; i++) {
+                unsigned c1, c2;
+                u64 s = ref_add64(a[i], b[i], 0, &c1);
+                want[i] = ref_add64(s, count, 0, &c2);
+                count = c1 + c2;
+            }
+            expect("lib_count_carried_n count", lib_count_carried_n(r, a, b, edges[k], n), count);
+            expect_limbs("lib_count_carried_n", r, want, LIMBS);
+        }
+    }
 }
 
 static void chains(void)
@@ -856,6 +1332,7 @@ static void chains(void)
         expect("cmp_subn borrow", cmp_subn(r, a, b, n), want_c);
         expect_limbs("cmp_subn", r, want, LIMBS);
     }
+    libraries(a, b);
     {
         u32 a32[LIMBS], b32[LIMBS], r32[LIMBS], want32[LIMBS];
         for (int n = 0; n <= LIMBS; n++) {

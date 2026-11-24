@@ -5093,7 +5093,13 @@ pub(crate) fn run_passes(
     // the intrinsic. Pass name for CCC_DISABLE_PASSES: "carry".
     if matches!(target, crate::backend::Target::X86_64) && !pass_disabled(&disabled, "carry") {
         let dce = !pass_disabled(&disabled, "dce");
+        if dump_each_pass {
+            dump_ir_filtered(module, "before carry");
+        }
         module.for_each_function(|f| carry_chain::run(f, dce));
+        if dump_each_pass {
+            dump_ir_filtered(module, "after carry");
+        }
         verify::verify_after_pass(module, "carry");
     }
 
