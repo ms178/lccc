@@ -202,8 +202,34 @@ passes; the backend peepholes are documented per backend
   not compute, or a load through an address the loop computes next to a
   store of that type; and for the loads, the loop's memory is known (no
   call that may write, nothing that writes other than a plain store). Over
-  the 1,493 files of the regression corpus that is 1,161 trials, of which
-  46 loops pay; compile time rises by 0.3%.
+  the 1,498 files of the regression corpus that is 1,134 trials, of which
+  47 loops pay; compile time rises by 0.3%.
+
+  One kind of loop is rotated for its branch and not for what can leave it:
+  a loop whose header computes a value that is read outside the header,
+  `while (n--) use(n);` (`rotate_fed_loops`, late, behind every pass that
+  matches the shape of a loop). `loop_invert` copies the header into the
+  latch after phi elimination and cannot hand the body the latch's copy of
+  such a value, so these loops stayed top-tested, a jump back on every trip.
+  A loop is taken when its header is phis and at most 8 pure instructions
+  without a load (`MAX_FED_HEADER_INSTS`, the bound of `loop_invert`), a
+  latch jumps back to it unconditionally, and **no header phi that the
+  header steps has a reader behind the step**, in the header, the body,
+  behind the loop or in another phi. Such a reader keeps the value of
+  before the step alive next to the new one: the rotated loop then goes
+  round with two values where it had one, pays a copy a trip for it, and
+  where the old value is read at the bottom or behind the exit the copies
+  do not fit into the latch and the back edge gets a block of its own (the
+  rule was first asked of the header only: `expat_siphash24` +5.0% `Ir`, a
+  word-copy loop that steps its pointer at the top and loads through the old
+  one; with it the program is unchanged). The test of `while (n--)` is such
+  a reader, which is why loop-test retargeting (next bullet) runs first.
+  `while (n-- > 0)`, whose ordered test cannot be moved, and a body that
+  reads the old value stay as they were. Over the regression corpus 163
+  loops in 36 files are rotated this way, for 0.07% more compile time
+  together with the retargeting and the phi facts below.
+  `CCC_DEBUG_LOOP_ROTATE=1` says `computes what the loop reads: rotated so
+  that it is bottom-tested`.
 
   The transformation itself takes multi-block bodies, several latches, exits
   from the body and nests: the header's instructions are copied into a single
@@ -214,20 +240,62 @@ passes; the backend peepholes are documented per backend
   Switches: `CCC_NO_LOOP_ROTATE` or `CCC_LOOP_ROTATE=0|false|no|off` turns it
   off; `CCC_LOOP_ROTATE=1|true|yes|on|always` rotates *every* loop that can
   be, early in iteration 0 (`RotatePolicy::Always`). That mode is a stress
-  test of the transformation, not an optimization level: measured over the
-  benchmark programs it costs 0.4% in instructions (`sha256_transform` +7.5%,
-  `reduction_vecreg` +9.1%), which is why the default asks for a reason per
+  test of the transformation, not an optimization level: measured against
+  the default over the 91 benchmark programs it costs 2.5% in instructions
+  (49 programs worse, `zlib_ng_slide_hash` 13 times its count,
+  `percpu_ptr_walk` +33.7%; 35 better, `zlib_ng_huffman_heap` -9.3%,
+  `linux_find_bit` -7.9%), which is why the default asks for a reason per
   loop. Measured for the default against the pipeline without it (87
   programs, cachegrind `Ir`, identical outputs): no program slower,
   `linux_rbtree` 2.45% faster; `*p += x` over 1,000 trips 1.81x faster,
   `a[i] = a[i-1] + b[i]` through parameters 2.4x faster, level with GCC 16.2.
+  With loop-test retargeting, the phi facts and the late rotation on top
+  (91 programs): 0.032% fewer instructions in total, `zlib_ng_adler32`
+  -9.2%, `gzip_longest_match` -0.67%, `ra01_global_match` -0.62%, none
+  worse; `while (n--) *d++ = *s++;` 0.405 s -> 0.348 s
+  over 819 million trips (GCC 16.2, which keeps one induction variable
+  where this compiler keeps three: 0.279 s).
   Gates: `tests/regression/check_loop_rotate_profit.sh` (the decision, read
-  off the assembly in both directions) and
-  `tests/regression/loop_rotate_profit_guarded_motion.c` (nothing that moved
-  runs when the loop does not: unmapped and read-only operands, zero
-  divisors, aliasing).
+  off the assembly in both directions, for the guarded motion and for the
+  fed headers), `tests/regression/loop_rotate_profit_guarded_motion.c`
+  (nothing that moved runs when the loop does not: unmapped and read-only
+  operands, zero divisors, aliasing) and
+  `tests/regression/loop_rotate_fed_header.c` (every value a body sees and
+  what is left in the counter, for no trip, one, two and many; every integer
+  width, `continue`, `break`, nests).
   Independently, the **ARM backend peephole rotates simple loops by default**
   (`rotate_simple_loops`, off only under `CCC_NO_LOOP_ROTATE`).
+- **Loop-test retargeting** (`ir/mem2reg/phi_eliminate.rs`,
+  `retarget_loop_tests`; in front of phi elimination, and in front of the
+  late rotation above) — `do { … } while (--n);` arrives as `n1 = n - 1;
+  n != 1`, because the mid-level compares the operands of a difference that
+  is tested for zero. Then `n` and `n1` are alive at once, the copy between
+  them stays, and the back edge gets a block of its own: `lea; cmp; je; mov;
+  jmp` for what is `sub; jne`. A test `n ==/!= K`, or a branch on `n`
+  itself, is made to read `n1 ==/!= K + k` when `n1` is `n` plus and minus
+  constants, through the casts C puts around a narrow counter (at most
+  `MAX_STEP_LINKS` = 4 links, each an integer type of at least the
+  counter's width and at most 64 bits). `n1` has to be what the block hands
+  the phi of `n`, or what the block computed ahead of the test. Equality
+  only, because adding a constant to both sides is an identity in a ring
+  and for nothing else; a 64-bit bound that would stop fitting a 32-bit
+  immediate is left alone; every value involved must have one definition
+  (the outputs of inline assembly count as definitions).
+  Over the regression corpus 357 tests are moved, 124 of them through a
+  cast, and (the late rotation included) the back edges that keep a block
+  of their own for a one-block loop's copies go from 220 to 11.
+  `LCCC_DEBUG_PHI_HOIST=1` prints `[PHI]
+  loop test of block N: … becomes vM against K (step in the block | a
+  dominating block[, through a cast])`.
+  Test: `tests/regression/latch_test_retarget_wrap.c` (every width, both
+  signs, steps of 1, 3 and 7 both ways, bounds at both ends of the range).
+- **Phi facts in CVP** (`cvp.rs`, `phi_facts`) — a phi lies in the union of
+  what its operands can be, each taken with its own edge's fact and with the
+  facts of the block (at most `MAX_PHI_OPERANDS` = 16 operands; one operand
+  of which nothing is known makes no fact). This is what carries a loop's
+  guard into a bottom-tested loop: the body of a rotated `while (m != 0)`
+  is entered from the guard and from the latch, each testing a value of its
+  own, and sees their phi.
 - **General complete unrolling** — nested/multi-block constant-trip loops
   with FP-aware expansion budget.
 - **Tri-state FP contraction** — `FpContract { Off, OnExpr, Fast }`,
@@ -418,6 +486,23 @@ GVN, LICM, and IVSR share a single `CfgAnalysis` (dominator tree + loop nesting)
 ### LICM (Loop-Invariant Code Motion)
 
 Hoists computations out of loops when their operands don't change within the loop. Identifies natural loops via the dominator tree, then moves invariant instructions to loop preheaders. Critical for inner-loop performance on code like matrix multiply.
+
+What LICM, store forwarding and register promotion never touch is an access
+the program is observed through: a load or store that is `volatile`, and
+since PR #1208 one that reaches an `_Atomic` object, by any spelling (a
+typedef such as `atomic_bool`, the qualifier, `_Atomic(T)`, a member, a
+pointee, a cast). Another thread may write between two reads of an atomic
+object, so `while (!atomic_flag) ;` has to read on every trip; before, the
+flag was memory like any other and the read was hoisted. The frontend marks
+such an access volatile and records that nobody wrote `volatile`, so the
+qualifier-conversion diagnostics stay those of GCC (`void *p = &atomic_obj`
+is silent). A cast through a typedef of a volatile type, `*(vu32 *)REG`,
+keeps the typedef's qualifier as well. Gate:
+`tests/regression/check_volatile_access_semantics.sh`, section 6b. Not
+implemented: atomicity of the *operators*. `x++`, `x += v` and `x = v` on an
+atomic object are one load, the operation and one store; the `<stdatomic.h>`
+functions and the `__atomic_*` builtins are the atomic operations (`lock
+xadd`, `xchg`, `lock cmpxchg`).
 
 ### IPCP (Interprocedural Constant Propagation)
 
