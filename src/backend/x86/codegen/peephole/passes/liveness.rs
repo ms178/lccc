@@ -3854,7 +3854,10 @@ mod tests {
             fn_cache_gen_full(1, FN_CACHE_LINE_BUDGET - 16, 17),
             "one line past the budget rotates the generation"
         );
-        assert!(fn_cache_gen_full(FN_CACHE_CAP, 0, 16), "the entry cap rotates the generation");
+        assert!(
+            fn_cache_gen_full(FN_CACHE_CAP, 0, 16),
+            "the entry cap rotates the generation"
+        );
         assert!(
             !fn_cache_gen_full(FN_CACHE_CAP - 1, 0, 16),
             "one entry under the cap still admits"
