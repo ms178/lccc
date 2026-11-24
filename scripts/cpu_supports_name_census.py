@@ -236,12 +236,24 @@ def lccc_names(src_root: Path) -> set[str]:
     comment or in another table cannot enter the set.
     """
     probe = (src_root / "src/common/cpu_probe.rs").read_text(encoding="utf-8")
-    table = probe.split("pub const PROBE_TABLE", 1)[-1].split("\n];", 1)[0]
-    canonical = set(LCCC_PROBE_ENTRY_RE.findall(table))
-    alias_block = probe.split("pub const NAME_ALIASES", 1)[1] if "pub const NAME_ALIASES" in probe else ""
+    canonical = set(LCCC_PROBE_ENTRY_RE.findall(_table_body(probe, "PROBE_TABLE")))
     aliases = {alias for alias, _canonical in
-               re.findall(r'\("([^"]+)",\s*"([^"]+)"\s*\)', alias_block)}
+               re.findall(r'\("([^"]+)",\s*"([^"]+)"\s*\)', _table_body(probe, "NAME_ALIASES"))}
     return canonical | aliases
+
+
+def _table_body(source: str, name: str) -> str:
+    """The text of `pub const NAME ... = &[ ... ];`, and nothing after it.
+
+    The alias table used to be read from its declaration to the end of the
+    file, so the first pair of strings anybody wrote below it (the option and
+    probe names of LAHF/SAHF, `("sahf", "lahf-lm")`) was taken for an alias
+    and the gate reported a probe name the compiler does not have.
+    """
+    marker = f"pub const {name}"
+    if marker not in source:
+        return ""
+    return source.split(marker, 1)[1].split("\n];", 1)[0]
 
 
 def main(argv: list[str] | None = None) -> int:

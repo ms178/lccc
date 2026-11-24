@@ -61,6 +61,25 @@ pub const OTHER: &[(&str, Probe)] = &[
 ];
 """
 
+# A pair of strings below the alias table is no alias. (`cpu_probe.rs` names
+# the option and the probe of LAHF/SAHF that way; the alias table used to be
+# read to the end of the file, and the gate reported a probe name `sahf`.)
+PAIR_BELOW_THE_ALIASES = """\
+pub const PROBE_TABLE: &[(&str, Probe)] = &[
+    ("lahf-lm", Probe::new(CpuWord::Ext1Ecx, 0, Xstate::None)),
+];
+
+pub const NAME_ALIASES: &[(&str, &str)] = &[
+    ("lahf_lm", "lahf-lm"),
+];
+
+pub const SAHF_OPTION_AND_PROBE: (&str, &str) = ("sahf", "lahf-lm");
+
+fn pairs() -> [(&'static str, &'static str); 1] {
+    [("not-an-alias", "lahf-lm")]
+}
+"""
+
 
 def names_for(source: str) -> set[str]:
     with tempfile.TemporaryDirectory() as td:
@@ -86,6 +105,13 @@ class CensusExtractionTest(unittest.TestCase):
         self.assertEqual(found, {"sse2"})
         self.assertNotIn("fictional", found)
         self.assertNotIn("decoy", found)
+
+    def test_a_pair_below_the_alias_table_is_no_alias(self) -> None:
+        found = names_for(PAIR_BELOW_THE_ALIASES)
+        self.assertEqual(found, {"lahf-lm", "lahf_lm"})
+
+    def test_a_source_without_an_alias_table_has_no_aliases(self) -> None:
+        self.assertEqual(names_for(DECOY), {"sse2"})
 
     def test_gcc_isa_names_table_is_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
