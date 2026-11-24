@@ -4,11 +4,12 @@
 Scheduling, accounting and reproducibility are checked on **every backend**
 (x86-64, i686, AArch64, RISC-V). The x86-64 debug dumps have a separate check:
 
-1. *Scheduling* — `LCCC_PEEPHOLE_PAIR_PARALLEL=0`, unset (heuristic) and `=1`
-   must emit byte-identical assembly. The split is latency-only, so no
-   assembly-level difference is permitted; the only observable proof that the
-   concurrent branch ran is the `[pair] … mode=…` telemetry, which also pins
-   the kill switch and the single-thread fallback.
+1. *Scheduling* — `LCCC_PEEPHOLE_PAIR_PARALLEL=0`, unset (size-gated
+   default) and `=1` must emit byte-identical assembly on every backend. The
+   split is output-neutral, so no assembly-level difference is permitted; the
+   only observable proof that the concurrent branch ran is the
+   `[pair] … mode=…` telemetry, which also pins the kill switch and the
+   single-thread fallback.
 2. *Accounting* — the serial and parallel counters must match their reported
    modes. Identical candidates increment the dedupe counter but aren't
    scheduled, so they don't produce a `[pair]` line.
@@ -204,6 +205,12 @@ def main():
                     if len(set(hashes.values())) != 1:
                         failures.append(
                             f"{label}/{key}: scheduling mode changed the assembly {hashes}"
+                        )
+                    expected_auto = "serial" if threads == 1 else "parallel"
+                    if modes["auto"] and any(mode != expected_auto for mode in modes["auto"]):
+                        failures.append(
+                            f"{label}/{key}: backend default {modes['auto']} does not match "
+                            f"expected {expected_auto}"
                         )
                     arch_pairs += len(modes["auto"])
                     if "parallel" in modes["serial"]:

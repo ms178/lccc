@@ -4545,7 +4545,10 @@ mod fp_const_hoist_tests {
              \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
              \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
             &[0],
-            |infos| infos[1].kind = LineKind::InlineAsm,
+            |infos| {
+                infos[1].kind = LineKind::InlineAsm;
+                infos[1].structural = true;
+            },
         );
         assert!(!changed, "inline asm vetoes");
     }

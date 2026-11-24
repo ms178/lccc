@@ -473,35 +473,6 @@ fn verify_span_refresh() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CCC_VERIFY_LIVENESS_SPAN").is_some())
 }
 
-/// Whether line `n` influences the analysis beyond its own read/write
-/// effect: control transfers and labels (CFG edges), calls (their read set
-/// depends on the marker lines after them, a local target adds an edge),
-/// inline asm, comment lines (the `# LCCC_*` markers consulted by call and
-/// ret modelling) and every directive except the byte-neutral annotation
-/// and alignment ones (`.long`/`.quad` jump-table entries and section
-/// switches are read by `resolve_jump_tables`).
-fn is_structural(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
-    if infos[n].is_nop() {
-        return false;
-    }
-    match infos[n].kind {
-        LineKind::Label
-        | LineKind::Jmp
-        | LineKind::CondJmp
-        | LineKind::JmpIndirect
-        | LineKind::Call
-        | LineKind::Ret
-        | LineKind::InlineAsm => true,
-        LineKind::Directive => {
-            let t = infos[n].trimmed(store.get(n));
-            ![".cfi_", ".loc ", ".p2align ", ".balign ", ".align "]
-                .iter()
-                .any(|p| t.starts_with(p))
-        }
-        _ => infos[n].trimmed(store.get(n)).starts_with('#'),
-    }
-}
-
 /// One `#APP` .. `#NO_APP` region whose text was read: `first..=last` are its
 /// lines, `reads` the general registers it may read, `targets` the lines of
 /// the function's labels it names (an asm goto target, an exception fixup, a
@@ -1519,7 +1490,7 @@ impl FileLiveness {
         if hi >= end || lo <= start || self.textual_ret.contains(&start) {
             return false;
         }
-        if (lo..=hi).any(|p| self.structural[p] || is_structural(store, infos, p)) {
+        if (lo..=hi).any(|p| self.structural[p] || infos[p].structural) {
             return false;
         }
         let real = |n: usize| !infos[n].is_steppable();
@@ -1590,7 +1561,7 @@ impl FileLiveness {
         let mut gen_after = 0u16;
         let mut killed_after = 0u16;
         for n in (succ..end).filter(|&n| real(n)).take(8) {
-            if is_structural(store, infos, n) {
+            if infos[n].structural {
                 break;
             }
             let eff = Self::straight_effect(infos, n, infos[n].trimmed(store.get(n)));
@@ -1759,17 +1730,28 @@ impl FileLiveness {
             structural: bool,
         }
         type CachedFnLiveness = (Vec<CachedLine>, bool);
-        /// Entries kept across passes for one compilation thread.  Measured
-        /// against the code this replaces, which held the same 256 and then
-        /// threw the whole table away.
-        const FN_CACHE_CAP: usize = 256;
+        /// Entries kept per generation for one compilation thread.  This
+        /// replaces the previous 256-entry cap: a whole file easily exceeds
+        /// that, so each pass re-solved whatever the window had evicted.
+        /// A per-generation cap that covers whole files keeps the cache
+        /// useful; the two-generation rotation bounds retention to roughly
+        /// twice the cap in entry count (bytes scale with function length:
+        /// one entry costs `fn_len * size_of::<CachedLine>()` ≈ `fn_len * 10`
+        /// plus map overhead).
+        const FN_CACHE_CAP: usize = 4096;
         type FnCacheMap = FxHashMap<(u64, u64), CachedFnLiveness>;
         thread_local! {
             static FN_CACHE: std::cell::RefCell<(FnCacheMap, FnCacheMap)> =
                 std::cell::RefCell::new((FxHashMap::default(), FxHashMap::default()));
         }
         let fn_len = end.saturating_sub(start);
-        let cache_key = if neutralise.is_none() && fn_len >= 16 {
+        // Only plain re-analyses are cached: the neutralised probes
+        // (`live_after_dropping_region`) are region-specific, and on the
+        // 1128-function reproducer TU zero of them fired, so keying them
+        // measured as noise.  If kernel TUs turn out to be probe-heavy,
+        // probe caching should be revisited with a probe histogram in
+        // hand (see MB-20 follow-ups).
+        let cache_key = if neutralise.is_none() && fn_len >= 1 {
             let key = Self::hash_function(store, infos, start, end);
             let hit = FN_CACHE.with(|c| {
                 let mut banks = c.borrow_mut();
@@ -2092,7 +2074,7 @@ impl FileLiveness {
             }
         }
         for n in start..end {
-            self.structural[n] = is_structural(store, infos, n);
+            self.structural[n] = infos[n].structural;
         }
         true
     }
@@ -2548,9 +2530,11 @@ impl FileLiveness {
     ) -> Option<Effect> {
         let mentioned = infos[n].reg_refs;
 
-        if infos[n].kind == LineKind::InlineAsm
-            || infos[n].pinned && infos[n].kind == LineKind::InlineAsm
-        {
+        // Opaque assembly is classified directly; `pinned` is deliberately
+        // not a second test because every InlineAsm line is already opaque.
+        // `matches!` avoids invoking derived `LineKind::eq` in this hot path
+        // (one check per line per solve).
+        if matches!(infos[n].kind, LineKind::InlineAsm) {
             edges.extend(next);
             return Some(Effect {
                 reads: ALL,
@@ -3798,6 +3782,27 @@ mod tests {
         assert_same_as_fresh(&store, &infos, &lv);
         let label = line_of(&store, ".Lnext:");
         assert!(!lv.try_refresh_span(&store, &infos, n, label));
+    }
+
+    #[test]
+    fn refresh_span_refuses_a_newly_structural_replacement() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "# LCCC_RET_RDX 0\n",
+            "    movq %rdi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos, mut lv) = build(asm);
+        let n = line_of(&store, "movq %rdi, %rax");
+        assert!(!infos[n].structural);
+        edit(&mut store, &mut infos, n, ".Lfresh:");
+        assert!(infos[n].structural, "replace_line must refresh the cache");
+        assert!(
+            !lv.try_refresh_span(&store, &infos, n, n),
+            "the pre-edit liveness solution cannot be spliced across a new label"
+        );
     }
 
     fn line_of(store: &LineStore, needle: &str) -> usize {
