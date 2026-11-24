@@ -119,7 +119,7 @@ def main() -> int:
         tmp = Path(tmp)
         # The check itself: both bare symbols of the control are reported.
         control = tmp / "untyped.o"
-        subprocess.run([str(bindir / X86_64), "-c", str(FIXTURES / "untyped.s"), "-o",
+        subprocess.run([str(bindir / X86_64), "-c", str(FIXTURES / "untyped.S"), "-o",
                         str(control)], check=True, capture_output=True)
         found = unannotated(symbols(args.readelf, control))
         if sorted(found) != ["bare_function: type NOTYPE", "bare_object: type NOTYPE"]:
