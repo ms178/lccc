@@ -97,6 +97,26 @@ pub(super) fn tail_call_marked(store: &LineStore, infos: &[LineInfo], n: usize) 
 /// after the call text; one line of slack.
 const CALL_MARKER_WINDOW: usize = 6;
 
+/// Entries per generation of the function-liveness memo (`analyse_function`).
+const FN_CACHE_CAP: usize = 4096;
+/// Cached lines per generation.  The memo's cost is per LINE, not per entry: a
+/// cached function holds `fn_len` records of `size_of::<CachedLine>()` (10)
+/// bytes.  An entry-count cap alone let 4096 entries of 20k-line functions
+/// retain ~800 MB per generation, so the line total is what rotates the memo.
+/// `1 << 20` lines is ~10 MiB per generation and ~20 MiB with the previous one.
+const FN_CACHE_LINE_BUDGET: usize = 1 << 20;
+/// Shortest function worth memoising.  A miss pays a hash, an allocation and a
+/// map insert, which a sub-16-line solve does not earn back.
+const FN_CACHE_MIN_LINES: usize = 16;
+const _: () = assert!(FN_CACHE_MIN_LINES <= FN_CACHE_LINE_BUDGET);
+
+/// Whether a memo generation must rotate before admitting `extra` more lines.
+/// An empty generation never rotates, so one oversized function is still
+/// memoised (its own size bounds that single entry).
+fn fn_cache_gen_full(entries: usize, lines: usize, extra: usize) -> bool {
+    entries != 0 && (entries >= FN_CACHE_CAP || lines.saturating_add(extra) > FN_CACHE_LINE_BUDGET)
+}
+
 /// The marker protocol of the `call` on line `n`, parsed from the contiguous
 /// block of comment/directive lines that directly follows the call text.
 ///
@@ -409,7 +429,7 @@ pub(super) struct FileLiveness {
     /// Whether the line belongs to an analysable function.
     known: Vec<bool>,
     /// Whether the line shaped the CFG or the function-wide context at the
-    /// last analysis (see `is_structural`).  `refresh_span` must know the
+    /// last analysis (see `LineInfo::structural`).  `refresh_span` must know the
     /// PRE-edit shape of the lines it re-derives, and the edit has already
     /// replaced their text.
     structural: Vec<bool>,
@@ -471,35 +491,6 @@ thread_local! {
 fn verify_span_refresh() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("CCC_VERIFY_LIVENESS_SPAN").is_some())
-}
-
-/// Whether line `n` influences the analysis beyond its own read/write
-/// effect: control transfers and labels (CFG edges), calls (their read set
-/// depends on the marker lines after them, a local target adds an edge),
-/// inline asm, comment lines (the `# LCCC_*` markers consulted by call and
-/// ret modelling) and every directive except the byte-neutral annotation
-/// and alignment ones (`.long`/`.quad` jump-table entries and section
-/// switches are read by `resolve_jump_tables`).
-fn is_structural(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
-    if infos[n].is_nop() {
-        return false;
-    }
-    match infos[n].kind {
-        LineKind::Label
-        | LineKind::Jmp
-        | LineKind::CondJmp
-        | LineKind::JmpIndirect
-        | LineKind::Call
-        | LineKind::Ret
-        | LineKind::InlineAsm => true,
-        LineKind::Directive => {
-            let t = infos[n].trimmed(store.get(n));
-            ![".cfi_", ".loc ", ".p2align ", ".balign ", ".align "]
-                .iter()
-                .any(|p| t.starts_with(p))
-        }
-        _ => infos[n].trimmed(store.get(n)).starts_with('#'),
-    }
 }
 
 /// One `#APP` .. `#NO_APP` region whose text was read: `first..=last` are its
@@ -1412,7 +1403,7 @@ impl FileLiveness {
     /// for minutes in `fuse_load_into_alu`).  Most edits are local:
     ///
     /// * when the span is straight-line code both before and after the edit
-    ///   (no line of it is `is_structural`, now or at the last analysis),
+    ///   (no line of it is structural, now or at the last analysis),
     ///   the CFG and every other line's effect are unchanged;
     /// * the span is then re-derived backwards from the live-in of the first
     ///   real line after it, which the edit did not touch;
@@ -1519,7 +1510,7 @@ impl FileLiveness {
         if hi >= end || lo <= start || self.textual_ret.contains(&start) {
             return false;
         }
-        if (lo..=hi).any(|p| self.structural[p] || is_structural(store, infos, p)) {
+        if (lo..=hi).any(|p| self.structural[p] || infos[p].structural) {
             return false;
         }
         let real = |n: usize| !infos[n].is_steppable();
@@ -1590,7 +1581,7 @@ impl FileLiveness {
         let mut gen_after = 0u16;
         let mut killed_after = 0u16;
         for n in (succ..end).filter(|&n| real(n)).take(8) {
-            if is_structural(store, infos, n) {
+            if infos[n].structural {
                 break;
             }
             let eff = Self::straight_effect(infos, n, infos[n].trimmed(store.get(n)));
@@ -1759,29 +1750,44 @@ impl FileLiveness {
             structural: bool,
         }
         type CachedFnLiveness = (Vec<CachedLine>, bool);
-        /// Entries kept across passes for one compilation thread.  Measured
-        /// against the code this replaces, which held the same 256 and then
-        /// threw the whole table away.
-        const FN_CACHE_CAP: usize = 256;
-        type FnCacheMap = FxHashMap<(u64, u64), CachedFnLiveness>;
+        /// One generation of the memo for one compilation thread: the entries
+        /// and their total line count, so the rotation test is O(1).  The
+        /// bounds (`FN_CACHE_CAP`, `FN_CACHE_LINE_BUDGET`) are module-level.
+        #[derive(Default)]
+        struct FnCacheGen {
+            map: FxHashMap<(u64, u64), CachedFnLiveness>,
+            lines: usize,
+        }
+        // Two generations: `.0` is current, `.1` the previous one.  Retention
+        // is at most two generations, so the memo holds at most about twice
+        // `FN_CACHE_LINE_BUDGET` lines.
         thread_local! {
-            static FN_CACHE: std::cell::RefCell<(FnCacheMap, FnCacheMap)> =
-                std::cell::RefCell::new((FxHashMap::default(), FxHashMap::default()));
+            static FN_CACHE: std::cell::RefCell<(FnCacheGen, FnCacheGen)> =
+                std::cell::RefCell::new((FnCacheGen::default(), FnCacheGen::default()));
         }
         let fn_len = end.saturating_sub(start);
-        let cache_key = if neutralise.is_none() && fn_len >= 16 {
+        // Only plain re-analyses are cached: the neutralised probes
+        // (`live_after_dropping_region`) are region-specific, and on the
+        // 1128-function reproducer TU zero of them fired, so keying them
+        // measured as noise.  If kernel TUs turn out to be probe-heavy,
+        // probe caching should be revisited with a probe histogram in
+        // hand (see MB-20 follow-ups).
+        let cache_key = if neutralise.is_none() && fn_len >= FN_CACHE_MIN_LINES {
             let key = Self::hash_function(store, infos, start, end);
             let hit = FN_CACHE.with(|c| {
                 let mut banks = c.borrow_mut();
-                if !banks.0.contains_key(&key)
-                    && let Some(promoted) = banks.1.remove(&key)
+                if !banks.0.map.contains_key(&key)
+                    && let Some(promoted) = banks.1.map.remove(&key)
                 {
-                    if banks.0.len() >= FN_CACHE_CAP {
+                    let promoted_lines = promoted.0.len();
+                    banks.1.lines -= promoted_lines;
+                    if fn_cache_gen_full(banks.0.map.len(), banks.0.lines, promoted_lines) {
                         banks.1 = std::mem::take(&mut banks.0);
                     }
-                    banks.0.insert(key, promoted);
+                    banks.0.lines += promoted_lines;
+                    banks.0.map.insert(key, promoted);
                 }
-                if let Some((cached, tret)) = banks.0.get(&key)
+                if let Some((cached, tret)) = banks.0.map.get(&key)
                     && cached.len() == fn_len
                 {
                     // Five zipped streams: equal-length slices let the
@@ -1837,7 +1843,7 @@ impl FileLiveness {
                 // immediately preceding pass are promoted on hit while new
                 // functions continue to be cached (neither a clear-the-world
                 // cliff nor a permanent freeze after FN_CACHE_CAP functions).
-                if banks.0.len() >= FN_CACHE_CAP {
+                if fn_cache_gen_full(banks.0.map.len(), banks.0.lines, fn_len) {
                     banks.1 = std::mem::take(&mut banks.0);
                 }
                 let mut cached = Vec::with_capacity(fn_len);
@@ -1858,9 +1864,17 @@ impl FileLiveness {
                             structural: st,
                         }),
                 );
-                banks
+                // A same-key entry can only be displaced by a 128-bit hash
+                // collision (the length check above then misses); its lines
+                // leave the count so `lines` stays the exact sum of entries.
+                banks.0.lines += fn_len;
+                if let Some((displaced, _)) = banks
                     .0
-                    .insert(key, (cached, self.textual_ret.contains(&start)));
+                    .map
+                    .insert(key, (cached, self.textual_ret.contains(&start)))
+                {
+                    banks.0.lines -= displaced.len();
+                }
             });
         }
     }
@@ -2092,7 +2106,7 @@ impl FileLiveness {
             }
         }
         for n in start..end {
-            self.structural[n] = is_structural(store, infos, n);
+            self.structural[n] = infos[n].structural;
         }
         true
     }
@@ -2548,9 +2562,11 @@ impl FileLiveness {
     ) -> Option<Effect> {
         let mentioned = infos[n].reg_refs;
 
-        if infos[n].kind == LineKind::InlineAsm
-            || infos[n].pinned && infos[n].kind == LineKind::InlineAsm
-        {
+        // Opaque assembly is classified directly; `pinned` is deliberately
+        // not a second test because every InlineAsm line is already opaque.
+        // `matches!` avoids invoking derived `LineKind::eq` in this hot path
+        // (one check per line per solve).
+        if matches!(infos[n].kind, LineKind::InlineAsm) {
             edges.extend(next);
             return Some(Effect {
                 reads: ALL,
@@ -3800,6 +3816,58 @@ mod tests {
         assert!(!lv.try_refresh_span(&store, &infos, n, label));
     }
 
+    #[test]
+    fn refresh_span_refuses_a_newly_structural_replacement() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "# LCCC_RET_RDX 0\n",
+            "    movq %rdi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos, mut lv) = build(asm);
+        let n = line_of(&store, "movq %rdi, %rax");
+        assert!(!infos[n].structural);
+        edit(&mut store, &mut infos, n, ".Lfresh:");
+        assert!(infos[n].structural, "replace_line must refresh the cache");
+        assert!(
+            !lv.try_refresh_span(&store, &infos, n, n),
+            "the pre-edit liveness solution cannot be spliced across a new label"
+        );
+    }
+
+    /// The memo rotates on whichever bound is hit first, and the line bound is
+    /// what keeps retention proportional to bytes: 4096 entries of 20k-line
+    /// functions are 80M lines, far past the budget, so they must not fit.
+    #[test]
+    fn fn_cache_rotation_bounds_lines_not_only_entries() {
+        assert!(
+            !fn_cache_gen_full(0, 0, usize::MAX),
+            "an empty generation admits any single entry"
+        );
+        assert!(
+            !fn_cache_gen_full(1, FN_CACHE_LINE_BUDGET - 16, 16),
+            "an entry that exactly fills the line budget is admitted"
+        );
+        assert!(
+            fn_cache_gen_full(1, FN_CACHE_LINE_BUDGET - 16, 17),
+            "one line past the budget rotates the generation"
+        );
+        assert!(
+            fn_cache_gen_full(FN_CACHE_CAP, 0, 16),
+            "the entry cap rotates the generation"
+        );
+        assert!(
+            !fn_cache_gen_full(FN_CACHE_CAP - 1, 0, 16),
+            "one entry under the cap still admits"
+        );
+        assert!(
+            fn_cache_gen_full(2, usize::MAX, 1),
+            "the line total saturates instead of wrapping"
+        );
+    }
+
     fn line_of(store: &LineStore, needle: &str) -> usize {
         (0..store.len())
             .find(|&i| store.get(i).contains(needle))
@@ -4860,7 +4928,7 @@ mod tests {
         let typed = FileLiveness::straight_effect(&infos, 0, &t);
         assert_eq!(typed.writes, RAX, "`movq %rdi, %rax` kills %rax");
 
-        infos[0].kind = LineKind::Other { dest_reg: REG_NONE };
+        infos[0].set_kind(LineKind::Other { dest_reg: REG_NONE }, t);
         let retyped = FileLiveness::straight_effect(&infos, 0, &t);
         let raw = FileLiveness::straight_effect_uncached(&infos[0], &t);
         assert_eq!((retyped.reads, retyped.writes), (raw.reads, raw.writes));

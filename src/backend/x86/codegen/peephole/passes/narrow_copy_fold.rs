@@ -1643,6 +1643,7 @@ mod inline_asm_tests {
                     rbp_offset: RBP_OFFSET_NONE,
                     reg_refs: u16::MAX,
                     pinned: true,
+                    structural: true,
                     inert_dir: false,
                     volatile_access: false,
                     cfi: CfiMark::None,

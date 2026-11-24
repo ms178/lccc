@@ -19,7 +19,7 @@
     "host": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
     "host_image": {
       "os": "ubuntu24",
-      "version": "20261111.370.1"
+      "version": "20261116.376.1"
     },
     "jobs": 2,
     "link_mode": "lccc-ld",
@@ -40,8 +40,8 @@
     }
   },
   "counts": {
-    "compile-fail": 5,
-    "pass": 1995,
+    "compile-fail": 2,
+    "pass": 1998,
     "reference-compile-skip": 15,
     "unsupported": 1
   },
@@ -87,36 +87,12 @@
       "94295e8540fb2060f52c6f07755d83866a3899b4c9a91ec5fdc877d2866f8ddd"
     ],
     [
-      "limits-caselabels.c",
-      "-O2",
-      "compile-fail",
-      "lccc-compile",
-      1,
-      "e983572fb4ec125e7729eba94f8b4ef7c854a3b7736ea648d916c35563eb3679"
-    ],
-    [
-      "limits-exprparen.c",
-      "-O2",
-      "compile-fail",
-      "lccc-compile",
-      1,
-      "f0caeaa1a3fa9537a1b4edbfd248d04e820e1d6f56cd2ef8d1e29be7580bd5e5"
-    ],
-    [
       "limits-fnargs.c",
       "-O2",
       "unsupported",
       "run_expensive_tests",
       0,
       "309310a5490a69f1087ea6b8486df85a7ec8f7fe9ceb6bf243bc660cb4f95f7e"
-    ],
-    [
-      "limits-structnest.c",
-      "-O2",
-      "compile-fail",
-      "lccc-compile",
-      1,
-      "7a2608a3dcc73c195f722360c9305a4eab63046f0cfe1809c4407d5eb2c70db6"
     ],
     [
       "mipscop-1.c",
@@ -216,6 +192,6 @@
     ]
   ],
   "schema": 1,
-  "source_head": "7d845e20959b5b1c33ec1207f955a26cde5c92a3",
-  "source_run": 44180754480
+  "source_head": "307cd03b495d13c8224ec59b6db433d0bd094ebf",
+  "source_run": 45388535959
 }

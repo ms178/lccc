@@ -97,6 +97,11 @@ pub(super) struct LineInfo {
     /// peephole pass. Used for parameter pre-stores (movq %arg_reg, %callee_saved)
     /// that must survive across function calls.
     pub(super) pinned: bool,
+    /// Cached answer to the liveness pass's structural-line predicate, derived
+    /// from `kind` and the trimmed text. It is maintained by `classify_line`,
+    /// `replace_line`, `mark_nop` and [`LineInfo::set_kind`]; any other kind
+    /// mutation must use `set_kind` to keep it correct.
+    pub(super) structural: bool,
     /// For `LineKind::Directive` only: whether a window may step over this line
     /// (see [`crate::backend::peephole_common::inert_directive`]). Computed once
     /// at classification so the barrier test in the hot loop stays integer-only
@@ -118,6 +123,12 @@ pub(super) struct LineInfo {
     /// [`CfiMark`]).
     pub(super) cfi: CfiMark,
 }
+
+// Every pass streams `LineInfo` through its inner loop and the liveness solver
+// copies it by value. The record must stay within one 24-byte word: the fields
+// fit in the existing padding (`LineKind` is 8 bytes, `RegId` is `u8`), and a
+// growth past that is a build failure rather than a silent bandwidth loss.
+const _: () = assert!(std::mem::size_of::<LineInfo>() <= 24);
 
 /// What kind of assembly line this is, with pre-extracted fields for the
 /// patterns we care about.
@@ -353,6 +364,40 @@ impl LineInfo {
         self.kind == LineKind::Nop
     }
 
+    /// The original liveness structural-line predicate, evaluated once while
+    /// classifying a line instead of re-reading its text in every solve.
+    #[inline]
+    fn structural_for(self, text: &str) -> bool {
+        if self.is_nop() {
+            return false;
+        }
+        match self.kind {
+            LineKind::Label
+            | LineKind::Jmp
+            | LineKind::CondJmp
+            | LineKind::JmpIndirect
+            | LineKind::Call
+            | LineKind::Ret
+            | LineKind::InlineAsm => true,
+            LineKind::Directive => ![".cfi_", ".loc ", ".p2align ", ".balign ", ".align "]
+                .iter()
+                .any(|prefix| text.starts_with(prefix)),
+            _ => text.starts_with('#'),
+        }
+    }
+
+    /// Change this line's kind in place and keep the cached `structural` bit
+    /// consistent with it.  Every in-place kind mutation must go through here:
+    /// a bare `info.kind = ...` leaves `structural` describing the old kind,
+    /// and a stale `true` silently turns a non-barrier into a liveness barrier
+    /// (or a stale `false` hides one).  `trimmed` must be
+    /// `self.trimmed(line)` for the line this info describes.
+    #[inline]
+    pub(super) fn set_kind(&mut self, kind: LineKind, trimmed: &str) {
+        self.kind = kind;
+        self.structural = self.structural_for(trimmed);
+    }
+
     /// True for a live (non-nop) `.cfi_startproc` line.  The nop check is
     /// folded in because every converted scan site paired the two tests; a
     /// deleted line must never open a function.
@@ -513,6 +558,7 @@ impl LineInfo {
             rbp_offset,
             reg_refs,
             pinned,
+            structural,
             inert_dir,
             volatile_access,
             cfi,
@@ -526,7 +572,8 @@ impl LineInfo {
                 | ((has_indirect_mem as u64) << 48)
                 | ((pinned as u64) << 49)
                 | ((inert_dir as u64) << 50)
-                | ((volatile_access as u64) << 51),
+                | ((volatile_access as u64) << 51)
+                | ((structural as u64) << 52),
             rbp_offset as u32 as u64,
         ]
     }
@@ -545,6 +592,7 @@ pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs: 0,
         pinned: false,
+        structural: false,
         inert_dir: false,
         volatile_access: false,
         cfi: CfiMark::None,
@@ -573,6 +621,7 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
         rbp_offset: rbp_off,
         reg_refs,
         pinned: false,
+        structural: false,
         inert_dir: false,
         volatile_access: false,
         cfi: CfiMark::None,
@@ -613,6 +662,7 @@ pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) ->
         rbp_offset: rbp_off,
         reg_refs: scan_register_refs(sb),
         pinned: false,
+        structural: false,
         inert_dir: false,
         volatile_access: false,
         cfi: CfiMark::None,
@@ -663,6 +713,7 @@ pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> Lin
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs,
         pinned: false,
+        structural: false,
         inert_dir: false,
         volatile_access: false,
         cfi: CfiMark::None,
@@ -680,6 +731,7 @@ pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs: 0,
         pinned: false,
+        structural: false,
         inert_dir: false,
         volatile_access: false,
         cfi: CfiMark::None,
@@ -795,6 +847,7 @@ pub(super) fn opaque_line_info(ts: u16) -> LineInfo {
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs: u16::MAX,
         pinned: true,
+        structural: true,
         // Not a directive line; the field is only read for
         // `LineKind::Directive`, and false is the fail-closed value.
         inert_dir: false,
@@ -803,8 +856,17 @@ pub(super) fn opaque_line_info(ts: u16) -> LineInfo {
     }
 }
 
-/// Parse one assembly line into a `LineInfo`.
+/// Parse one assembly line into a `LineInfo`, including its structural bit.
+/// All parser fast paths stay in `classify_line_inner`; this wrapper computes
+/// the extra derived property exactly once from the same trimmed line text.
 pub(super) fn classify_line(raw: &str) -> LineInfo {
+    let mut info = classify_line_inner(raw);
+    let text = raw.get(info.trim_start as usize..).unwrap_or(raw);
+    info.structural = info.structural_for(text);
+    info
+}
+
+fn classify_line_inner(raw: &str) -> LineInfo {
     let b = raw.as_bytes();
 
     // Compute trim offset once and cache it
@@ -1128,6 +1190,7 @@ fn classify_other_line_info(s: &str, sb: &[u8], first: u8, ts: u16) -> LineInfo 
         pinned: first == b'l'
             && s.starts_with("leaq ")
             && (s.contains("@TLSDESC") || s.contains("@tlsdesc")),
+        structural: false,
         inert_dir: false,
         volatile_access: false,
         cfi: CfiMark::None,
@@ -1688,6 +1751,7 @@ pub(super) fn mark_nop(info: &mut LineInfo) {
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs: 0,
         pinned: false,
+        structural: false,
         inert_dir: false,
         volatile_access: false,
         cfi: CfiMark::None,
@@ -4508,6 +4572,83 @@ mod pack_digest_tests {
         assert_eq!(a.pack() & 0xff, 0, "reg field intact under negative offset");
     }
 
+    /// Hand-written truth table for the structural predicate.  The expected
+    /// bits are stated per line from the specification (control transfers,
+    /// labels, calls, inline asm, comment markers and every directive except
+    /// the byte-neutral annotation/alignment ones are structural), NOT re-derived
+    /// from the production predicate: a re-derivation would only prove the code
+    /// equals a copy of itself.
+    #[test]
+    fn structural_metadata_matches_truth_table() {
+        let table: &[(&str, bool)] = &[
+            ("", false),
+            ("f:", true),
+            ("    jmp .L1", true),
+            ("    jne .L1", true),
+            ("    jmpq *%rax", true),
+            ("    call foo", true),
+            ("    ret", true),
+            ("# LCCC_CALL_ARGS 2", true),
+            ("    movq %rax, %rbx", false),
+            ("    nop", false),
+            ("    .long .L1 - .Lbase", true),
+            ("    .section .rodata", true),
+            ("    .cfi_startproc", false),
+            ("    .cfi_endproc", false),
+            ("    .cfi_def_cfa_offset 16", false),
+            ("    .loc 1 4 0", false),
+            ("    .p2align 4", false),
+            ("    .balign 16", false),
+            ("    .align 8", false),
+        ];
+        for &(raw, expected) in table {
+            assert_eq!(classify_line(raw).structural, expected, "{raw:?}");
+        }
+        assert!(
+            opaque_line_info(0).structural,
+            "the fail-closed inline-asm constructor is structural"
+        );
+    }
+
+    #[test]
+    fn set_kind_keeps_structural_bit_in_sync() {
+        let call_text = "    call foo";
+        let mut info = classify_line(call_text);
+        assert!(info.structural, "a call is structural");
+        let plain = classify_line("    movq %rax, %rbx");
+        let trimmed = info.trimmed(call_text);
+        info.set_kind(plain.kind, trimmed);
+        assert_eq!(info.kind, plain.kind);
+        assert!(
+            !info.structural,
+            "a call reclassified as an ordinary instruction must drop the barrier bit"
+        );
+        let mov_text = "    movq %rax, %rbx";
+        let mut relabel = classify_line(mov_text);
+        assert!(!relabel.structural);
+        let mov_trimmed = relabel.trimmed(mov_text);
+        relabel.set_kind(LineKind::Label, mov_trimmed);
+        assert!(relabel.structural, "a label kind is structural");
+    }
+
+    #[test]
+    fn structural_metadata_tracks_replace_and_nop_helpers() {
+        let mut store = LineStore::new("    movq %rax, %rbx\n".to_string());
+        let mut info = classify_line(store.get(0));
+        assert!(!info.structural, "ordinary instruction is non-structural");
+
+        replace_line(&mut store, &mut info, 0, ".Lfresh:".to_string());
+        assert!(info.structural, "replacement label is structural");
+        replace_line(&mut store, &mut info, 0, "    movq %rax, %rbx".to_string());
+        assert!(
+            !info.structural,
+            "reclassified instruction is non-structural"
+        );
+
+        mark_nop(&mut info);
+        assert!(!info.structural, "a deleted line is non-structural");
+    }
+
     /// `digest_words` must separate every single-field change: two
     /// `LineInfo`s that differ in exactly one field must produce different
     /// word triples (this is the lossless-key property the liveness memo
@@ -4538,6 +4679,9 @@ mod pack_digest_tests {
         let mut v = base;
         v.pinned = !base.pinned;
         variants.push(("pinned", v));
+        let mut v = base;
+        v.structural = !base.structural;
+        variants.push(("structural", v));
         let mut v = base;
         v.inert_dir = !base.inert_dir;
         variants.push(("inert_dir", v));

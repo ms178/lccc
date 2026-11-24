@@ -11,22 +11,24 @@
 //!
 //! This module owns that scheduling decision for **all four backends** (x86-64,
 //! i686, AArch64, RISC-V): every one of them runs a real text peephole in
-//! `ArchCodegen::peephole_for_metric`, so every one of them paid the two pass
-//! mixes serially.  It is a *latency* change only.  The pipeline is
+//! `ArchCodegen::peephole_for_metric`, so every one of them pays the two pass
+//! mixes. Scheduling is a *latency* change only. The pipeline is
 //! text-in/text-out, the per-arch policy a backend needs is captured by value
 //! or by shared reference at the call site, and the emitted assembly is
-//! byte-identical in both scheduling modes — asserted, not assumed, by
+//! byte-identical in both scheduling modes, asserted by
 //! `tests/regression/check_peephole_pair_parallel.py` for each architecture.
 //!
-//! It is deliberately *not* a throughput optimization: a `make -j N` build
-//! already saturates the host, and this adds at most one runnable thread at a
-//! time, only while a pair above [`MIN_PARALLEL_PAIR_BYTES`] is measured.
-//! `LCCC_PEEPHOLE_PAIR_PARALLEL=0` restores serial behaviour for every backend.
+//! The default gate is size-and-host: a pair spawns only when its combined
+//! candidate bytes reach [`MIN_PARALLEL_PAIR_BYTES`] and the host has more than
+//! one hardware thread. Its latency is measured by
+//! `scripts/measure_peephole_pair.py`; those results are workload-specific and
+//! are not a universal speedup claim.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Combined candidate bytes below which a pair stays serial.
+/// Combined candidate bytes below which a pair stays serial under the default
+/// policy. The explicit `LCCC_PEEPHOLE_PAIR_PARALLEL=1` override bypasses it.
 ///
 /// Calibrated from measurement, not folklore.  A scoped spawn+join costs
 /// 47-59 µs on a current x86-64 host (10 000-iteration microbenchmark), while
@@ -101,7 +103,7 @@ pub(crate) fn metric_candidate_suffix() -> &'static str {
 /// `0`/`off`/`false` never spawns; `1`/`on`/`true` always spawns on a
 /// multi-thread host, ignoring the size gate (that is what makes the parallel
 /// branch reachable in a test on any machine); unset/`auto`/anything else
-/// keeps the size-and-host heuristic.  Unrecognised values never abort: a typo
+/// keeps the size-and-host heuristic. Unrecognised values never abort: a typo
 /// degrades to the default rather than failing a build.
 fn pair_override() -> Option<bool> {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
@@ -302,6 +304,44 @@ mod tests {
             pair_mode_for(Some(false), true, usize::MAX),
             PairMode::Serial,
             "the kill switch wins over size and host"
+        );
+    }
+
+    /// `pair_mode_for` takes no architecture argument, so the size gate is the
+    /// same for x86-64, i686, AArch64 and RISC-V by construction; the boundary
+    /// is asserted once, here, and the per-backend agreement is what
+    /// `check_peephole_pair_parallel.py` verifies from the telemetry.
+    #[test]
+    fn size_gate_boundary_and_overrides_are_explicit() {
+        assert_eq!(
+            pair_mode_for(None, true, MIN_PARALLEL_PAIR_BYTES),
+            PairMode::Parallel,
+            "the gate is inclusive"
+        );
+        assert_eq!(
+            pair_mode_for(None, true, MIN_PARALLEL_PAIR_BYTES - 1),
+            PairMode::Serial,
+            "sub-threshold pairs stay serial"
+        );
+        assert_eq!(
+            pair_mode_for(None, false, usize::MAX),
+            PairMode::Serial,
+            "a single-thread host never spawns"
+        );
+        assert_eq!(
+            pair_mode_for(Some(true), false, usize::MAX),
+            PairMode::Serial,
+            "a forced spawn still cannot overlap on one hardware thread"
+        );
+        assert_eq!(
+            pair_mode_for(Some(true), true, 0),
+            PairMode::Parallel,
+            "explicit force bypasses the size gate"
+        );
+        assert_eq!(
+            pair_mode_for(Some(false), true, usize::MAX),
+            PairMode::Serial,
+            "explicit kill switch overrides the size gate"
         );
     }
 

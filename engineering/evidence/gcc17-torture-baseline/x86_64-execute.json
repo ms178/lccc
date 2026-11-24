@@ -19,7 +19,7 @@
     "host": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
     "host_image": {
       "os": "ubuntu24",
-      "version": "20261111.370.1"
+      "version": "20261116.376.1"
     },
     "jobs": 2,
     "link_mode": "lccc-ld",
@@ -86,6 +86,6 @@
     ]
   ],
   "schema": 1,
-  "source_head": "7d845e20959b5b1c33ec1207f955a26cde5c92a3",
-  "source_run": 44180754480
+  "source_head": "307cd03b495d13c8224ec59b6db433d0bd094ebf",
+  "source_run": 45388535959
 }
