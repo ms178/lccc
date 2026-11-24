@@ -560,6 +560,14 @@ pub(super) fn bit_test_adc_fusion_enabled() -> bool {
     bit_test_flag_fusion_enabled() && !no_bt_adc_fusion()
 }
 
+/// Whether a compare-exchange may hand ZF to the conditional branch that
+/// ends its block (`lock cmpxchg; jne retry`) instead of materializing its
+/// success flag. The prologue's scan and the emitter both read this; the
+/// knob that forces every compare to materialize forces this one too.
+pub(super) fn cmpxchg_flag_fusion_enabled() -> bool {
+    !no_flag_fusion()
+}
+
 /// Whether a `BitTest` may leave its answer in CF for the next instruction
 /// (`bt; cmovb`, `bt; setnc`) instead of materializing it.  The prologue's
 /// fused-producer scan and the emitters must agree on this, so both read it;

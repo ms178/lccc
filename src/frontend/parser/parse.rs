@@ -502,10 +502,11 @@ impl ParsedDeclAttrs {
     /// and its siblings. If the two flags ever disagree, that reader misses
     /// a `volatile`; no access is affected.
     ///
-    /// What this does not give is the atomicity of the operators: `x += 1`
-    /// on an atomic `x` is one read and one write, not a `lock`ed update,
-    /// and converting `_Atomic int *` to `int *` is accepted where GCC 16
-    /// and Clang 23 reject it. Both need a type that says atomic.
+    /// The flag is also what the type itself is told: the qualifier records
+    /// carry `_Atomic` as a bit of its own (`PtrQuals::ATOMIC`, from
+    /// `written_cvr`), which is what makes `x += 1` on an atomic `x` a
+    /// `lock`ed update and `_Atomic int *` to `int *` the error GCC 16 and
+    /// Clang 23 give (see `ir::lowering::atomic_access`).
     #[inline]
     pub fn set_atomic(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::ATOMIC, v)
@@ -1640,7 +1641,10 @@ impl Parser {
             })
         {
             self.emit_error("named address spaces require an x86 target", span);
-            return TranslationUnit { decls: Vec::new() };
+            return TranslationUnit {
+                decls: Vec::new(),
+                uses_atomic: false,
+            };
         }
         let mut decls = Vec::with_capacity(16);
         while !self.at_eof() {
@@ -1666,7 +1670,11 @@ impl Parser {
                 self.advance();
             }
         }
-        TranslationUnit { decls }
+        let uses_atomic = self
+            .tokens
+            .iter()
+            .any(|tok| matches!(tok.kind, TokenKind::Atomic));
+        TranslationUnit { decls, uses_atomic }
     }
 
     // === Token access helpers ===
@@ -1992,7 +2000,8 @@ impl Parser {
                 TokenKind::Const => CVR_CONST,
                 TokenKind::Volatile => CVR_VOLATILE,
                 TokenKind::Restrict => CVR_RESTRICT,
-                TokenKind::Static | TokenKind::Atomic => 0,
+                TokenKind::Atomic => CVR_ATOMIC,
+                TokenKind::Static => 0,
                 _ => return cvr,
             };
             self.advance();

@@ -498,11 +498,46 @@ such an access volatile and records that nobody wrote `volatile`, so the
 qualifier-conversion diagnostics stay those of GCC (`void *p = &atomic_obj`
 is silent). A cast through a typedef of a volatile type, `*(vu32 *)REG`,
 keeps the typedef's qualifier as well. Gate:
-`tests/regression/check_volatile_access_semantics.sh`, section 6b. Not
-implemented: atomicity of the *operators*. `x++`, `x += v` and `x = v` on an
-atomic object are one load, the operation and one store; the `<stdatomic.h>`
-functions and the `__atomic_*` builtins are the atomic operations (`lock
-xadd`, `xchg`, `lock cmpxchg`).
+`tests/regression/check_volatile_access_semantics.sh`, section 6b.
+
+The *operators* on an atomic object are atomic operations too (C11
+6.5.2.4p2, 6.5.16.2p3, 6.2.6.1p9). They used to be the three steps of a
+volatile object's update, and `refs++` from two threads lost counts
+(`tests/regression/atomic_operators.c`: 229,349 of 400,000 increments
+survived). `_Atomic` is now part of what a type records (`PtrQuals::ATOMIC`),
+sema tells the lowering which lvalues designate an atomic object
+(`SemaResult::atomic_lvalues`), and `src/ir/lowering/atomic_access.rs`
+chooses the operation:
+
+| Source | IR | x86-64 at `-O2` |
+|---|---|---|
+| a read of `x` | `AtomicLoad` | `mov` (AArch64 `ldar`) |
+| `x = v` | `AtomicStore` | `xchg` (AArch64 `stlr`) |
+| `x++;` `x -= v;` `x \|= v;`, result unused | `AtomicRmw` | `lock add` / `lock sub` / `lock or` |
+| `++x`, `x += v`, result used | `AtomicRmw` | `lock xadd` |
+| `x *= v`, `x <<= v`, `d += v` on a `double`, a `_Bool`, `-ftrapv` | load + `AtomicCmpxchg` loop | `lock cmpxchg; jne` |
+
+The retry branch of the loop reads ZF from `lock cmpxchg` itself, and an
+`AtomicRmw` whose result nobody reads -- `atomic_fetch_or` with its value
+dropped included -- is one locked ALU instruction instead of `lock xadd` or a
+five-instruction loop. Covered: integers and pointers on every target
+(sixteen bytes through libatomic's `_16` entry points, as GCC does, so
+`-latomic` at the link), `float` and `double` on x86. Not covered: `long
+double`, complex and structure objects, which keep a volatile object's
+accesses where GCC calls libatomic's generic `__atomic_load`,
+`__atomic_store` and `__atomic_compare_exchange`; and a floating update does
+not save and restore the floating-point environment around its loop (Clang
+does not either; GCC does). Gate: `tests/regression/check_atomic_operators.sh`.
+
+Because the type says atomic, the frontend also follows GCC and Clang where
+it used to be silent: a pointer to an atomic object does not convert to a
+pointer to the plain type or back (an error), `_Generic` tells `_Atomic int
+*` from `int *` and `volatile int *` (it took the first association of the
+right shape), and an atomic bit-field is refused. One spelling is still read
+short: `volatile` written beside `_Atomic` on the same object is not
+recorded as written, so `_Generic(&v, volatile _Atomic int *: ...)` selects
+the `_Atomic int *` association and `void *p = &v;` does not report the
+discarded `volatile`.
 
 ### IPCP (Interprocedural Constant Propagation)
 

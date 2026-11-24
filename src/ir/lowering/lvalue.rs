@@ -46,6 +46,14 @@ impl Lowerer {
     /// Try to get the lvalue (address) of an expression.
     /// Returns Some(LValue) if the expression is an lvalue, None otherwise.
     pub(super) fn lower_lvalue(&mut self, expr: &Expr) -> Option<LValue> {
+        let mut lv = self.lower_lvalue_untagged(expr)?;
+        // Whether the object is atomic is sema's verdict on the expression,
+        // whatever arm produced the address.
+        lv.atomic = self.lvalue_is_atomic(expr);
+        Some(lv)
+    }
+
+    fn lower_lvalue_untagged(&mut self, expr: &Expr) -> Option<LValue> {
         // Access volatility is a pure syntactic/type property of the lvalue
         // (see expr_access_is_volatile); computing it up front keeps every arm
         // below honest without re-walking the expression per arm.
@@ -187,6 +195,7 @@ impl Lowerer {
                         kind: LValueKind::X87VectorLane(addr, addr_space),
                         volatile: vol,
                         sso: SsoMode::None,
+                        atomic: false,
                     });
                 }
                 Some(LValue::address(addr, addr_space, vol))
@@ -382,6 +391,7 @@ impl Lowerer {
             },
             volatile: vol,
             sso: SsoMode::None,
+            atomic: false,
         }
     }
 
@@ -570,6 +580,9 @@ impl Lowerer {
             let normalized = self.emit_bool_normalize_typed(Operand::Value(bit), IrType::U8);
             return self.emit_implicit_cast(normalized, IrType::I32, ty);
         }
+        if let Some(ptr) = self.atomic_target(lv, ty) {
+            return self.emit_atomic_load(ptr, ty);
+        }
         let addr = self.lvalue_addr(lv);
         let seg_override = self.lvalue_addr_space(lv);
         let dest = self.fresh_value();
@@ -644,6 +657,10 @@ impl Lowerer {
         if let LValueKind::X87VectorLane(addr, seg) = lv.kind {
             let val = self.emit_implicit_cast(val, ty, IrType::F128);
             self.store_x87_lane(addr, val, lv.volatile, seg);
+            return;
+        }
+        if let Some(ptr) = self.atomic_target(lv, ty) {
+            self.emit_atomic_store(ptr, val, ty);
             return;
         }
         let addr = self.lvalue_addr(lv);
@@ -859,6 +876,7 @@ impl Lowerer {
                 kind: LValueKind::X87VectorLane(addr, addr_space),
                 volatile: vol,
                 sso: SsoMode::None,
+                atomic: false,
             });
         }
         Some(LValue::address(addr, addr_space, vol))

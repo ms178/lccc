@@ -5,6 +5,11 @@ use crate::common::types::{AddressSpace, CType, ExtVectorLayout, PtrQuals};
 #[derive(Debug)]
 pub struct TranslationUnit {
     pub decls: Vec<ExternalDecl>,
+    /// The `_Atomic` keyword appears somewhere in the unit (a header's
+    /// `typedef _Atomic int atomic_int;` counts). No object can be atomic
+    /// without it, so everything that asks "is this lvalue atomic?" is
+    /// skipped outright when it is absent.
+    pub uses_atomic: bool,
 }
 
 /// Top-level declarations in a translation unit.
@@ -1222,7 +1227,12 @@ pub struct InitDeclarator {
 pub const CVR_CONST: u8 = PtrQuals::CONST;
 pub const CVR_VOLATILE: u8 = PtrQuals::VOLATILE;
 pub const CVR_RESTRICT: u8 = PtrQuals::RESTRICT;
-pub const CVR_ALL: u8 = CVR_CONST | CVR_VOLATILE | CVR_RESTRICT;
+/// `_Atomic` written among a star's qualifiers or a specifier list's; see
+/// [`PtrQuals::ATOMIC`].
+pub const CVR_ATOMIC: u8 = PtrQuals::ATOMIC;
+pub const CVR_ALL: u8 = CVR_CONST | CVR_VOLATILE | CVR_RESTRICT | CVR_ATOMIC;
+// `CastQualifiers` packs one level's bits into a field of `CVR_ALL`'s width.
+const _: () = assert!(CVR_ALL == (1 << CVR_ALL.count_ones()) - 1);
 
 /// `true` when the `const` bit is set in a CVR mask.
 pub fn cvr_is_const(cvr: u8) -> bool {
@@ -2175,14 +2185,16 @@ pub struct CastQualifiers {
     /// (`(const char *const *)`), its length (`0` otherwise, or past
     /// [`Self::MAX_STAR_CHAIN`] levels) ...
     pub star_chain_len: u8,
-    /// ... and each star's `CVR_*` bits, 3 per level (level 1, closest to
+    /// ... and each star's `CVR_*` bits, 4 per level (level 1, closest to
     /// the base, in the lowest bits). See [`Self::star_chain`].
     pub star_chain_cvr: u64,
 }
 
 impl CastQualifiers {
+    /// Bits of [`Self::star_chain_cvr`] per pointer level: one per `CVR_*`.
+    const STAR_BITS: usize = CVR_ALL.count_ones() as usize;
     /// The longest star chain [`Self::star_chain_cvr`] holds.
-    pub const MAX_STAR_CHAIN: usize = 21;
+    pub const MAX_STAR_CHAIN: usize = u64::BITS as usize / Self::STAR_BITS;
 
     /// The per-level qualifiers of a plain star-chain type name, innermost
     /// level first; `None` for any other type name.
@@ -2190,7 +2202,9 @@ impl CastQualifiers {
         let len = usize::from(self.star_chain_len);
         (len > 0).then(|| {
             (0..len)
-                .map(|level| ((self.star_chain_cvr >> (3 * level)) & 0b111) as u8)
+                .map(|level| {
+                    ((self.star_chain_cvr >> (Self::STAR_BITS * level)) & u64::from(CVR_ALL)) as u8
+                })
                 .collect()
         })
     }
@@ -2215,7 +2229,7 @@ impl CastQualifiers {
         if plain {
             self.star_chain_len = wraps as u8;
             self.star_chain_cvr = levels.iter().enumerate().fold(0, |bits, (level, cvr)| {
-                bits | (u64::from(cvr & 0b111) << (3 * level))
+                bits | (u64::from(cvr & CVR_ALL) << (Self::STAR_BITS * level))
             });
         }
     }
@@ -2356,6 +2370,13 @@ pub struct GenericAssociation {
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`,
     /// since CType does not track const/volatile qualifiers.
     pub is_const: bool,
+    /// Every qualifier the association's type name wrote, as a cast's type
+    /// name records them: the base type's and each star's. `const int *`,
+    /// `volatile int *`, `_Atomic int *` and `int *` are four types, and a
+    /// selection has to tell them apart (C11 6.5.1.1p2: "compatible"); the
+    /// record lets sema compare them level by level against the controlling
+    /// operand's own (`PtrQuals`). Empty for `default`.
+    pub quals: CastQualifiers,
 }
 
 /// Sizeof argument can be a type or expression.

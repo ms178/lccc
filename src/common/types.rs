@@ -571,7 +571,16 @@ impl PtrQuals {
     pub const CONST: u8 = 1 << 0;
     pub const VOLATILE: u8 = 1 << 1;
     pub const RESTRICT: u8 = 1 << 2;
-    const CVR: u8 = Self::CONST | Self::VOLATILE | Self::RESTRICT;
+    /// `_Atomic`, which C counts among the qualifiers (C11 6.7.3) and which
+    /// is recorded with them, by the same paths and under the same "all or
+    /// `None`" rule. It differs from the other three in what a mismatch
+    /// means: `_Atomic int` is not compatible with `int` (6.2.5p27: its size,
+    /// representation and alignment need not match), so a pointer to one
+    /// does not convert to a pointer to the other in either direction, where
+    /// a missing `const` or `volatile` is a discarded qualifier one way and
+    /// nothing the other. See [`Self::atomic_conflict`].
+    pub const ATOMIC: u8 = 1 << 3;
+    const CVR: u8 = Self::CONST | Self::VOLATILE | Self::RESTRICT | Self::ATOMIC;
     const RECORDED: u8 = 1 << 7;
 
     /// A pointer into the generic address space, qualifiers unrecorded.
@@ -603,6 +612,13 @@ impl PtrQuals {
     /// it cannot establish incompatibility. Unlike Eq, this is semantic.
     pub const fn has_known_cvr_conflict(self, other: Self) -> bool {
         matches!((self.cvr(), other.cvr()), (Some(a), Some(b)) if a != b)
+    }
+
+    /// One pointee is known to be `_Atomic` and the other known not to be:
+    /// pointers to incompatible types, whatever else qualifies them. An
+    /// unrecorded side proves nothing.
+    pub const fn atomic_conflict(self, other: Self) -> bool {
+        matches!((self.cvr(), other.cvr()), (Some(a), Some(b)) if (a ^ b) & Self::ATOMIC != 0)
     }
 
     /// The same qualifiers on a pointee in `space`.
@@ -646,11 +662,14 @@ const _: () = {
     assert!(PtrQuals::CONST == crate::frontend::parser::ast::CVR_CONST);
     assert!(PtrQuals::VOLATILE == crate::frontend::parser::ast::CVR_VOLATILE);
     assert!(PtrQuals::RESTRICT == crate::frontend::parser::ast::CVR_RESTRICT);
+    assert!(PtrQuals::ATOMIC == crate::frontend::parser::ast::CVR_ATOMIC);
 };
 
-/// `PtrQuals` qualifier bits as GCC spells them (`const volatile restrict`).
+/// `PtrQuals` qualifier bits as GCC spells them: `_Atomic` first, then
+/// `const volatile restrict` (`pp_c_cv_qualifiers`; measured on gcc-16.2:
+/// "discards '_Atomic volatile' qualifier", `'int * _Atomic*'`).
 pub fn cvr_spelling(cvr: u8) -> &'static str {
-    const NAMES: [&str; 8] = [
+    const NAMES: [&str; 16] = [
         "",
         "const",
         "volatile",
@@ -659,8 +678,16 @@ pub fn cvr_spelling(cvr: u8) -> &'static str {
         "const restrict",
         "volatile restrict",
         "const volatile restrict",
+        "_Atomic",
+        "_Atomic const",
+        "_Atomic volatile",
+        "_Atomic const volatile",
+        "_Atomic restrict",
+        "_Atomic const restrict",
+        "_Atomic volatile restrict",
+        "_Atomic const volatile restrict",
     ];
-    NAMES[usize::from(cvr & 0b111)]
+    NAMES[usize::from(cvr & 0b1111)]
 }
 
 /// A qualification conflict anywhere in the shared derived shape. Parameter
@@ -5177,6 +5204,45 @@ mod record_display_tag_tests {
         // containing one is already ambiguous. Pinned so changing the marker is
         // a deliberate edit here rather than a silent behaviour change.
         assert_eq!(CType::record_display_tag("struct.a#b#2"), "a");
+    }
+
+    #[test]
+    fn atomic_is_recorded_with_the_qualifiers_and_separates_types() {
+        use super::{AddressSpace, cvr_spelling};
+        let recorded = |cvr| PtrQuals::recorded(AddressSpace::Default, cvr);
+        let (plain, atomic) = (recorded(0), recorded(PtrQuals::ATOMIC));
+        let atomic_const = recorded(PtrQuals::ATOMIC | PtrQuals::CONST);
+        assert_eq!(atomic.cvr(), Some(PtrQuals::ATOMIC));
+        assert_eq!(atomic_const.cvr(), Some(PtrQuals::ATOMIC | PtrQuals::CONST));
+        // `_Atomic T` against `T`, either way round; never between two
+        // atomic pointees, and never on a side nobody recorded.
+        assert!(atomic.atomic_conflict(plain) && plain.atomic_conflict(atomic));
+        assert!(recorded(PtrQuals::VOLATILE).atomic_conflict(atomic));
+        assert!(!atomic.atomic_conflict(atomic_const));
+        assert!(!plain.atomic_conflict(recorded(PtrQuals::CONST)));
+        assert!(!atomic.atomic_conflict(PtrQuals::GENERIC));
+        assert!(!PtrQuals::GENERIC.atomic_conflict(plain));
+        // GCC's spelling: `_Atomic` first.
+        assert_eq!(cvr_spelling(PtrQuals::ATOMIC), "_Atomic");
+        assert_eq!(
+            cvr_spelling(PtrQuals::ATOMIC | PtrQuals::VOLATILE),
+            "_Atomic volatile"
+        );
+        assert_eq!(
+            cvr_spelling(PtrQuals::CONST | PtrQuals::VOLATILE),
+            "const volatile"
+        );
+        let int_ptr = |cvr| CType::Pointer(Box::new(CType::Int), recorded(cvr));
+        assert_eq!(int_ptr(PtrQuals::ATOMIC).to_string(), "_Atomic int *");
+        assert_eq!(
+            CType::Pointer(Box::new(int_ptr(0)), recorded(PtrQuals::ATOMIC)).to_string(),
+            "int * _Atomic*"
+        );
+        // A selection needs both: the association `_Atomic int *` takes an
+        // atomic operand and no other.
+        assert!(int_ptr(PtrQuals::ATOMIC).generic_association_matches(&int_ptr(PtrQuals::ATOMIC)));
+        assert!(!int_ptr(PtrQuals::ATOMIC).generic_association_matches(&int_ptr(0)));
+        assert!(!int_ptr(0).generic_association_matches(&int_ptr(PtrQuals::VOLATILE)));
     }
 
     #[test]

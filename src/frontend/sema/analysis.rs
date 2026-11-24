@@ -243,6 +243,28 @@ pub struct SemaResult {
     /// Every object declared at file scope, in declaration order, for the debug
     /// information's `DW_TAG_variable` set (see [`FileScopeObject`]).
     pub file_scope_objects: Vec<FileScopeObject>,
+    /// The association each `_Generic` selects, keyed by its controlling
+    /// operand, for every selection sema decided on an operand type it knew.
+    /// The qualifiers that tell `volatile int *` from `int *` and `_Atomic
+    /// int *` live in sema's records (`PtrQuals`, the symbol table's object
+    /// qualifiers), which the lowerer does not have: left to its own
+    /// qualifier-blind match it took the first association of the right
+    /// shape. It reads the verdict here and keeps its own rule for what
+    /// sema never visited.
+    pub generic_choices: FxHashMap<ExprId, (Span, u32)>,
+    /// The lvalue expressions whose object is `_Atomic`-qualified (C11
+    /// 6.2.5p27), recorded where sema met them as the operand of an
+    /// assignment, a compound assignment, `++`/`--`, or an lvalue
+    /// conversion. Reading, writing and updating such an object is an atomic
+    /// operation (6.5.2.4p2, 6.5.16.2p3: "a read-modify-write operation with
+    /// memory_order_seq_cst"), and whether an lvalue designates one is a
+    /// question about qualifiers, which only sema records. Empty in a
+    /// translation unit that never says `_Atomic`.
+    ///
+    /// Both maps carry the expression's span beside its identity: an
+    /// `ExprId` is the node's address, and a reader that finds a span other
+    /// than its own node's is looking at a stale address, not at this node.
+    pub atomic_lvalues: FxHashMap<ExprId, Span>,
 }
 
 impl Default for SemaResult {
@@ -256,6 +278,8 @@ impl Default for SemaResult {
             enumerator_refs: FxHashMap::default(),
             local_address_returns: FxHashSet::default(),
             file_scope_objects: Vec::new(),
+            generic_choices: FxHashMap::default(),
+            atomic_lvalues: FxHashMap::default(),
         }
     }
 }
@@ -306,6 +330,8 @@ pub struct SemanticAnalyzer {
     /// Association indices resolved before a _Generic's tag/typedef scope
     /// disappears. None records an unresolved selection, not a cache miss.
     generic_selections: FxHashMap<ExprId, Option<usize>>,
+    /// `TranslationUnit::uses_atomic` of the unit being analyzed.
+    unit_uses_atomic: bool,
     /// Identifier callees bound to objects, not same-named noreturn functions.
     /// Retain the binding kind after its block scope disappears.
     object_call_bindings: FxHashSet<ExprId>,
@@ -468,6 +494,7 @@ impl SemanticAnalyzer {
             current_return_type: None,
             condition_truth: FxHashMap::default(),
             generic_selections: FxHashMap::default(),
+            unit_uses_atomic: false,
             object_call_bindings: FxHashSet::default(),
             function_nesting_stack: Vec::new(),
             prior_file_function_decls: FxHashMap::default(),
@@ -498,6 +525,7 @@ impl SemanticAnalyzer {
     /// Returns Ok(()) on success, or an error count on failure.
     /// All errors are emitted through the DiagnosticEngine with source spans.
     pub fn analyze(&mut self, tu: &TranslationUnit) -> Result<(), usize> {
+        self.unit_uses_atomic = tu.uses_atomic;
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
@@ -1536,6 +1564,7 @@ impl SemanticAnalyzer {
                         decl.is_const(),
                         declarator.attrs.base_volatile_written(),
                         declarator.attrs.base_restrict,
+                        declarator.attrs.base_atomic,
                     ),
                 );
                 let mut resolved_ctype = if declarator.derived.is_empty() {
@@ -1720,6 +1749,7 @@ impl SemanticAnalyzer {
                     decl.is_const(),
                     init_decl.attrs.base_volatile_written(),
                     init_decl.attrs.base_restrict,
+                    init_decl.attrs.base_atomic,
                 );
                 type_builder::build_qualified_ctype_with_base(
                     self,
@@ -2106,6 +2136,7 @@ impl SemanticAnalyzer {
                         decl.is_const(),
                         init_decl.attrs.base_volatile_written(),
                         init_decl.attrs.base_restrict,
+                        init_decl.attrs.base_atomic,
                     ),
                 )
             });
@@ -4165,6 +4196,20 @@ impl SemanticAnalyzer {
             .expr_type_checker()
             .generic_selection_index(controlling, associations);
         self.generic_selections.insert(expr.id(), selected);
+        // The verdict for the lowerer, when it rests on a known operand type
+        // (a type operand always is one).
+        if let Some(index) = selected {
+            let known = matches!(controlling, Expr::TypeOperand(..))
+                || self
+                    .expr_type_checker()
+                    .infer_expr_ctype(controlling)
+                    .is_some();
+            if known {
+                self.result
+                    .generic_choices
+                    .insert(controlling.id(), (controlling.span(), index as u32));
+            }
+        }
     }
 
     /// A call: builtin argument rules, implicit declarations, noreturn
@@ -4815,6 +4860,25 @@ impl SemanticAnalyzer {
         if let Some(ctype) = checker.infer_expr_ctype(expr) {
             self.result.expr_types.insert(expr.id(), ctype);
         }
+        // An lvalue that designates an `_Atomic` object, for the lowerer
+        // (`SemaResult::atomic_lvalues`). Only the forms that can designate
+        // an object are asked, and none in a unit without the keyword.
+        if self.unit_uses_atomic
+            && matches!(
+                expr,
+                Expr::Identifier(..)
+                    | Expr::Deref(..)
+                    | Expr::ArraySubscript(..)
+                    | Expr::MemberAccess(..)
+                    | Expr::PointerMemberAccess(..)
+            )
+            && self
+                .expr_type_checker()
+                .lvalue_object_cvr(expr)
+                .is_some_and(|cvr| cvr & PtrQuals::ATOMIC != 0)
+        {
+            self.result.atomic_lvalues.insert(expr.id(), expr.span());
+        }
     }
 
     /// Try to evaluate an expression as a compile-time constant using
@@ -5180,7 +5244,8 @@ impl SemanticAnalyzer {
                 let distinct = if a_void || b_void {
                     !matches!(op, BinOp::Eq | BinOp::Ne) && a_void != b_void
                 } else {
-                    pointee_compat_at(a, b, false) == PtrCompat::Incompatible
+                    a_space.atomic_conflict(*b_space)
+                        || pointee_compat_at(a, b, false) == PtrCompat::Incompatible
                 };
                 if distinct {
                     self.diagnostics.borrow_mut().warning_with_kind(
@@ -8118,6 +8183,22 @@ dereference it before applying '->' to it?"
                     return None;
                 }
                 let name = f.name.clone().unwrap_or_default();
+                // A bit-field is not an object an atomic operation can
+                // address: GCC 16.2's constraint and wording (Clang 23
+                // refuses it as a "non-integral type").
+                if f.bit_width.is_some()
+                    && self
+                        .field_own_cvr(f)
+                        .is_some_and(|cvr| cvr & PtrQuals::ATOMIC != 0)
+                {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "bit-field '{}' has atomic type",
+                            f.name.as_deref().unwrap_or("<anonymous>")
+                        ),
+                        f.span,
+                    );
+                }
                 let bit_width = f
                     .bit_width
                     .as_ref()
@@ -10850,6 +10931,7 @@ dereference it before applying '->' to it?"
                 param.is_const,
                 param.volatile_written(),
                 param.base_restrict,
+                param.is_atomic,
             ),
         )
     }
@@ -10874,7 +10956,12 @@ dereference it before applying '->' to it?"
     }
 
     fn field_ctype(&self, f: &StructFieldDecl) -> CType {
-        let written = written_cvr(f.base_const, f.base_volatile_written(), f.base_restrict);
+        let written = written_cvr(
+            f.base_const,
+            f.base_volatile_written(),
+            f.base_restrict,
+            f.base_atomic,
+        );
         // Resolved vector sizes are already `TypeSpecifier::Vector` nodes
         // (see Parser::apply_pending_vector_attr). A size that needed sema's
         // layout engine is resolved here and inserted at the same position.
@@ -10921,7 +11008,12 @@ dereference it before applying '->' to it?"
     /// a qualifier (`fold_simple_derived`), so a folded star's own bits are
     /// exactly none.
     fn field_own_cvr(&self, f: &StructFieldDecl) -> Option<u8> {
-        let written = written_cvr(f.base_const, f.base_volatile_written(), f.base_restrict);
+        let written = written_cvr(
+            f.base_const,
+            f.base_volatile_written(),
+            f.base_restrict,
+            f.base_atomic,
+        );
         if !f.derived.is_empty() {
             let ty = self.field_ctype(f);
             return type_builder::declarator_own_cvr(&f.derived, &ty, || {
@@ -11239,10 +11331,13 @@ pub(super) fn fold_to_type(
 }
 
 /// The qualifiers written in a declaration's specifiers, as `PtrQuals` bits.
-fn written_cvr(is_const: bool, is_volatile: bool, is_restrict: bool) -> u8 {
+/// `is_volatile` is the keyword (`base_volatile_written`), not the access
+/// flag `_Atomic` sets with it; `is_atomic` is `_Atomic` itself.
+fn written_cvr(is_const: bool, is_volatile: bool, is_restrict: bool, is_atomic: bool) -> u8 {
     u8::from(is_const) * PtrQuals::CONST
         | u8::from(is_volatile) * PtrQuals::VOLATILE
         | u8::from(is_restrict) * PtrQuals::RESTRICT
+        | u8::from(is_atomic) * PtrQuals::ATOMIC
 }
 
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
@@ -11663,12 +11758,22 @@ fn enum_matches_integer(a: &CType, b: &CType) -> bool {
 /// The qualifiers of `from`'s pointee that pointer type `to`'s pointee lacks,
 /// when both are recorded (see `PtrQuals`), and whether that pointee is an
 /// array (its elements carry them).
+///
+/// `_Atomic` alone is never a discarded qualifier. Between two object types
+/// it makes the pointers incompatible (`pointer_argument_compat`), so the
+/// only conversion that reaches here with one is to or from `void *`, and
+/// there "assignments between atomic and non-atomic objects are OK" (GCC's
+/// `convert_for_assignment` masks it out of the test): `void *p = &flag;`
+/// and `memcpy(dst, &flag, n)` discard nothing. When another qualifier is
+/// dropped beside it, GCC names both (`volatile _Atomic int v; void *p =
+/// &v;`: "discards '_Atomic volatile' qualifier"), so the returned bits
+/// keep it for the message.
 fn discarded_pointee_qualifiers(from: &CType, to: &CType) -> Option<(u8, bool)> {
     let (CType::Pointer(from_inner, from_quals), CType::Pointer(_, to_quals)) = (from, to) else {
         return None;
     };
     let dropped = from_quals.cvr()? & !to_quals.cvr()?;
-    (dropped != 0).then(|| (dropped, matches!(**from_inner, CType::Array(..))))
+    (dropped & !PtrQuals::ATOMIC != 0).then(|| (dropped, matches!(**from_inner, CType::Array(..))))
 }
 
 fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
@@ -11781,6 +11886,13 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
             }
             if **from_inner == CType::Void || **to_inner == CType::Void {
                 return PtrCompat::Compatible;
+            }
+            // `_Atomic T` and `T` are not compatible types (C11 6.2.5p27),
+            // so neither pointer converts to the other: gcc-16.2 and
+            // clang-23 both refuse `int *p = &atomic_int_object;` and its
+            // converse, where the other qualifiers are merely discarded.
+            if from_space.atomic_conflict(*to_space) {
+                return PtrCompat::Incompatible;
             }
             pointee_compat(from_inner, to_inner)
         }

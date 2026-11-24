@@ -4,7 +4,7 @@
 //! register operands only overwrite AL/AX/EAX, so results must be canonicalized
 //! before they are stored as the backend's 64-bit SSA representation.
 
-use super::emit::{X86Codegen, is_gpr_reg, phys_reg_name};
+use super::emit::{X86Codegen, is_gpr_reg, phys_reg_name, typed_phys_reg_name};
 use crate::common::types::IrType;
 use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
 
@@ -97,6 +97,53 @@ impl X86Codegen {
             self.store_rax_rdx_to(dest);
             return;
         }
+        // Nobody reads the previous value (`x++;`, `refs--;`, `flags |= bit;`
+        // as statements, `atomic_fetch_or` with its result dropped): the
+        // update is one locked ALU instruction on the memory operand, which
+        // is GCC's and Clang's choice too. `lock xadd` for these took %rax
+        // for a result no one wanted, and the bitwise forms ran a five
+        // instruction compare-exchange loop where `lock or` is the whole
+        // operation.
+        if self.unused_atomic_rmw_dests.contains(&dest.0) && !ty.is_float() {
+            let mnemonic = match op {
+                AtomicRmwOp::Add => Some("add"),
+                AtomicRmwOp::Sub => Some("sub"),
+                AtomicRmwOp::And => Some("and"),
+                AtomicRmwOp::Or => Some("or"),
+                AtomicRmwOp::Xor => Some("xor"),
+                AtomicRmwOp::Nand | AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => None,
+            };
+            if let Some(mnemonic) = mnemonic {
+                let suffix = Self::type_suffix(ty);
+                let narrow = !matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
+                // The immediate, reduced to the operand width the suffix
+                // names (the assembler takes no `addb $300`).
+                let imm = Self::const_as_imm32_typed(val, narrow).map(|v| match ty {
+                    IrType::I8 | IrType::U8 => i64::from(v as i8),
+                    IrType::I16 | IrType::U16 => i64::from(v as i16),
+                    IrType::I32 | IrType::U32 => i64::from(v as i32),
+                    _ => v,
+                });
+                let addr = self.atomic_address_reg(ptr, "rcx");
+                // The operand is only read: an immediate, its register
+                // home as it stands, or %rax once staged there.
+                let src = match imm {
+                    Some(imm) => format!("${imm}"),
+                    None => match self.operand_reg(val).filter(|&r| is_gpr_reg(r)) {
+                        Some(home) => format!("%{}", typed_phys_reg_name(home, ty)),
+                        None => {
+                            self.operand_to_rax(val);
+                            format!("%{}", Self::reg_for_type("rax", ty))
+                        }
+                    },
+                };
+                self.prepare_atomic_side_effect();
+                self.state
+                    .emit_fmt(format_args!("    lock {mnemonic}{suffix} {src}, (%{addr})"));
+                return;
+            }
+        }
+
         let addr = self.atomic_address_reg(ptr, "rcx");
 
         // TestAndSet carries a dummy IR operand. Avoid materializing a value
@@ -262,6 +309,15 @@ impl X86Codegen {
         self.state.emit_fmt(format_args!(
             "    lock cmpxchg{suffix} %{desired_reg}, (%{addr})"
         ));
+        if returns_bool && self.fused_cmpxchg_dests.contains(&dest.0) {
+            // The branch that ends the block is the flag's only reader and
+            // nothing is emitted in between: it takes ZF as it stands
+            // (`pending_cmp`'s contract, `Eq` being "ZF set", the exchange
+            // having happened).
+            self.pending_cmp = Some((dest.0, crate::ir::reexports::IrCmpOp::Eq));
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
         if returns_bool {
             // Consume CMPXCHG's ZF before any flag-changing instruction.
             self.state.emit("    sete %al");

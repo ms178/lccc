@@ -151,14 +151,19 @@ impl<'a> ExprTypeChecker<'a> {
     pub(crate) fn lvalue_object_cvr(&self, expr: &Expr) -> Option<u8> {
         match expr {
             Expr::Identifier(name, _) => self.symbols.object_cvr(name),
+            // `_Atomic` is the one qualifier a member does not take from
+            // its containing object: a member of an atomic structure is not
+            // itself an atomic object (accessing one is undefined, C11
+            // 6.5.2.3p5), and typing `&s.m` as a pointer to atomic would
+            // refuse the conversions GCC accepts for it.
             Expr::MemberAccess(base, field, _) => {
-                let outer = self.lvalue_object_cvr(base)?;
+                let outer = self.lvalue_object_cvr(base)? & !PtrQuals::ATOMIC;
                 let record = self.infer_expr_ctype(base)?;
                 Some(outer | self.member_own_cvr(&record, field)?)
             }
             Expr::PointerMemberAccess(base, field, _) => {
                 let (record, outer) = self.designated_pointee(base)?;
-                Some(outer | self.member_own_cvr(&record, field)?)
+                Some((outer & !PtrQuals::ATOMIC) | self.member_own_cvr(&record, field)?)
             }
             Expr::Deref(inner, _) => self.designated_pointee(inner).map(|(_, cvr)| cvr),
             Expr::ArraySubscript(lhs, rhs, _) => {
@@ -935,11 +940,12 @@ impl<'a> ExprTypeChecker<'a> {
     ) -> Option<usize> {
         // An expression operand undergoes lvalue conversion; a type operand
         // (C2y) none. Constness follows the rule lowering shares.
+        // (`infer_value_ctype`: an array operand decays to a pointer to its
+        // element with the array object's qualifiers, which an association
+        // such as `_Atomic int *` or `const char *` is selected by.)
         let controlling_ct = match controlling {
             Expr::TypeOperand(ts, ..) => Some(self.resolve_type_spec(ts)),
-            _ => self
-                .infer_expr_ctype(controlling)
-                .map(|ct| ct.decayed_value_ctype()),
+            _ => self.infer_value_ctype(controlling),
         };
         let (ctrl_const, compare_const) =
             qualifiers::controlling_const(controlling, associations, self);
@@ -948,7 +954,12 @@ impl<'a> ExprTypeChecker<'a> {
             match &assoc.type_spec {
                 None => default_index = Some(index),
                 Some(type_spec) => {
-                    let assoc_ct = self.resolve_type_spec(type_spec);
+                    // With the type name's own qualifiers recorded on each
+                    // pointer level, as a cast's are: `volatile int *` and
+                    // `_Atomic int *` are not `int *`, and
+                    // `generic_association_matches` compares the records
+                    // level by level where both sides have one.
+                    let assoc_ct = self.cast_ctype(type_spec, &assoc.quals);
                     if controlling_ct
                         .as_ref()
                         .is_some_and(|ct| ct.generic_association_matches(&assoc_ct))
@@ -975,10 +986,17 @@ impl<'a> ExprTypeChecker<'a> {
             while let TypeSpecifier::Pointer(inner, _) = leaf {
                 leaf = inner;
             }
-            let base =
-                crate::common::type_builder::specifier_cvr_with(leaf, quals.base_cvr, &|n| {
+            let base = match leaf {
+                // `typeof(lvalue)` is the lvalue's type with the object's
+                // own qualifiers (`__typeof__(counter) *` points at an
+                // atomic `counter`'s type); of anything else, unknown.
+                TypeSpecifier::Typeof(operand, false) => self
+                    .lvalue_object_cvr(operand)
+                    .map(|own| own | quals.base_cvr),
+                _ => crate::common::type_builder::specifier_cvr_with(leaf, quals.base_cvr, &|n| {
                     self.types.typedef_top_cvr(n)
-                });
+                }),
+            };
             crate::common::type_builder::record_pointer_quals(&mut ty, base, &levels);
         }
         ty

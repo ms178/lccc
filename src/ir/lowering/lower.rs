@@ -208,6 +208,13 @@ pub struct Lowerer {
     /// yield a dead local's address. They are evaluated for side effects and
     /// return a null pointer (GCC 16.2's code generation).
     pub(super) sema_local_address_returns: FxHashSet<ExprId>,
+    /// Sema's `SemaResult::generic_choices`: the association each `_Generic`
+    /// selects, by its controlling operand. Sema compares qualifiers the
+    /// lowerer has no record of.
+    pub(super) sema_generic_choices: FxHashMap<ExprId, (Span, u32)>,
+    /// Sema's `SemaResult::atomic_lvalues`: the lvalues that designate an
+    /// `_Atomic` object. See `Lowerer::lvalue_is_atomic`.
+    pub(super) sema_atomic_lvalues: FxHashMap<ExprId, Span>,
     /// Stack of local label scopes from GNU __label__ declarations.
     /// Each entry maps a label name to its scope-qualified name.
     /// When resolving a label, the stack is searched top-down so that
@@ -318,6 +325,18 @@ impl Lowerer {
     /// (`SemaResult::local_address_returns`).
     pub fn with_local_address_returns(mut self, returns: FxHashSet<ExprId>) -> Self {
         self.sema_local_address_returns = returns;
+        self
+    }
+
+    /// Sema's `_Generic` verdicts and atomic lvalues (`SemaResult`'s
+    /// `generic_choices` and `atomic_lvalues`).
+    pub fn with_qualifier_verdicts(
+        mut self,
+        generic_choices: FxHashMap<ExprId, (Span, u32)>,
+        atomic_lvalues: FxHashMap<ExprId, Span>,
+    ) -> Self {
+        self.sema_generic_choices = generic_choices;
+        self.sema_atomic_lvalues = atomic_lvalues;
         self
     }
 
@@ -467,6 +486,8 @@ impl Lowerer {
             sema_const_values,
             sema_enumerator_refs: FxHashMap::default(),
             sema_local_address_returns: FxHashSet::default(),
+            sema_generic_choices: FxHashMap::default(),
+            sema_atomic_lvalues: FxHashMap::default(),
             local_label_scopes: Vec::new(),
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),

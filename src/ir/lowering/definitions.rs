@@ -314,6 +314,10 @@ pub(super) struct LValue {
     /// Reverse scalar_storage_order handling for a member lvalue: the value
     /// must be byte-fixed-up on every load/store (SsoMode::None otherwise).
     pub sso: SsoMode,
+    /// The object is `_Atomic`: a load, a store and an update of it are
+    /// atomic operations (see `atomic_access`). Set by `lower_lvalue` alone,
+    /// from sema's verdict on the expression.
+    pub atomic: bool,
 }
 
 impl LValue {
@@ -322,6 +326,7 @@ impl LValue {
             kind: LValueKind::Variable(v),
             volatile,
             sso: SsoMode::None,
+            atomic: false,
         }
     }
     pub(super) fn address(v: Value, seg: AddressSpace, volatile: bool) -> Self {
@@ -329,6 +334,7 @@ impl LValue {
             kind: LValueKind::Address(v, seg),
             volatile,
             sso: SsoMode::None,
+            atomic: false,
         }
     }
 }

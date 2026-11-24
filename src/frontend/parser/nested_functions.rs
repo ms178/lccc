@@ -272,9 +272,10 @@ impl Parser {
         // The return type's base qualifiers, before the body's declarations
         // overwrite the per-declarator slots.
         // (`volatile` as written: not the one `_Atomic` sets for the access.)
-        let (ret_base_volatile, ret_base_restrict) = (
+        let (ret_base_volatile, ret_base_restrict, ret_base_atomic) = (
             self.attrs.declarator_base_volatile && !self.attrs.declarator_base_atomic,
             self.attrs.declarator_base_restrict,
+            self.attrs.declarator_base_atomic,
         );
         let (_post_ctor, _post_dtor, post_mode, _post_common, _post_aligned, _first_asm_reg) =
             self.parse_asm_and_attributes();
@@ -453,7 +454,8 @@ impl Parser {
             ),
             return_base_cvr: u8::from(return_base_const) * crate::frontend::parser::ast::CVR_CONST
                 | u8::from(ret_base_volatile) * crate::frontend::parser::ast::CVR_VOLATILE
-                | u8::from(ret_base_restrict) * crate::frontend::parser::ast::CVR_RESTRICT,
+                | u8::from(ret_base_restrict) * crate::frontend::parser::ast::CVR_RESTRICT
+                | u8::from(ret_base_atomic) * crate::frontend::parser::ast::CVR_ATOMIC,
             return_star_cvr: crate::frontend::parser::ast::return_star_chain(
                 &return_type,
                 &derived,

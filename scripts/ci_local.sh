@@ -3805,6 +3805,12 @@ gate "peephole-phi-hoist-safety" fast \
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 
+# The operators on `_Atomic` objects (`x++`, `x += v`, `x = v`, a read) are
+# atomic operations: one locked instruction or a compare-exchange loop on
+# every backend, and no update lost by the threaded program at any level.
+gate "atomic-operators" fast \
+    bash tests/regression/check_atomic_operators.sh
+
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
 # sqlite_put_varint plus a shrunk-corpus gcc differential — the golden-gate

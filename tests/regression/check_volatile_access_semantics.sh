@@ -171,7 +171,15 @@ for fn in atomic_acc vol_acc; do
     tail_lbl=$(echo "$body" | sed -n "${tail_ln}p" | grep -oE '\.[A-Za-z][A-Za-z0-9_]*' | tail -1)
     head_ln=$(echo "$body" | grep -n "^${tail_lbl}:" | sed -n '1,1p' | cut -d: -f1)
     loop=$(echo "$body" | sed -n "${head_ln},${tail_ln}p")
-    n_ref=$(echo "$loop" | grep -c "$obj" || true)
+    # The volatile object is named by the access itself. The atomic one is
+    # updated by a locked instruction through a register the loop has no
+    # reason to reload (`lock addl $3, (%rsi)`, the `leaq` above the loop):
+    # what must stay inside is that instruction.
+    if [ "$fn" = atomic_acc ]; then
+        n_ref=$(echo "$loop" | grep -cE '^[[:space:]]*lock ' || true)
+    else
+        n_ref=$(echo "$loop" | grep -c "$obj" || true)
+    fi
     case $n_ref in ''|*[!0-9]*) n_ref=0 ;; esac
     # Here-string, not `echo | grep -q`: under `set -o pipefail` the early-exiting
 # consumer SIGPIPEs the producer and the pipeline reports failure even when the

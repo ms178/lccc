@@ -250,12 +250,13 @@ impl Parser {
                 }
                 // _Atomic as type specifier: _Atomic(type-name)
                 // C11 §6.7.2.4: _Atomic(T) is a type specifier equivalent to T
-                // with atomic qualification. Since we don't track atomic-ness,
-                // we just parse and return the inner type.
+                // with atomic qualification. The specifier is the inner
+                // type; the qualification travels in the flag.
                 TokenKind::Atomic => {
                     self.advance();
-                    // Atomic-ness is not tracked in types; the flag records the
-                    // object qualifier (`DeclAttributes::object_atomic`).
+                    // `CType` has no atomic variant; the flag is the record
+                    // (`DeclAttributes::base_atomic` and `object_atomic`),
+                    // which sema writes into the qualifier bits of the type.
                     self.attrs.set_atomic(true);
                     // What is tracked is how the object is accessed, and an
                     // atomic object is accessed as a volatile one is: where
@@ -279,11 +280,36 @@ impl Parser {
                         let enclosing_address_space =
                             std::mem::take(&mut self.attrs.parsing_address_space);
                         let inner = self.parse_type_specifier();
+                        let inner_base_const = self.attrs.parsing_const();
                         self.attrs.set_const(saved_const);
                         if let Some(inner_type) = inner {
-                            let result = self.parse_abstract_declarator_suffix(inner_type);
+                            let (result, pointer_quals) =
+                                self.parse_abstract_declarator_suffix_quals(inner_type);
                             self.attrs.parsing_address_space = enclosing_address_space;
                             self.expect_closing(&TokenKind::RParen, open);
+                            // `_Atomic(T *)` is an atomic POINTER: the
+                            // qualifier belongs to the type the parentheses
+                            // name, where `_Atomic T *` qualifies `T`. A bare
+                            // `Pointer` specifier cannot say which was
+                            // written -- a member's `_Atomic char *p` is
+                            // folded into the same shape -- so the named type
+                            // is kept as the unit `typeof(T *)` is: whatever
+                            // qualifies the specifier then qualifies the
+                            // pointer, by the rule every `typeof` and
+                            // pointer typedef already follows. (`unqual`
+                            // drops nothing here: the type name of an atomic
+                            // specifier may not be qualified, C11 6.7.2.4p3.)
+                            if matches!(result, TypeSpecifier::Pointer(..)) {
+                                return Some(TypeSpecifier::TypeofType(
+                                    Box::new(result),
+                                    TypeofTypeQualifiers {
+                                        base_const: inner_base_const,
+                                        base_volatile: false,
+                                        pointer_quals,
+                                        unqual: true,
+                                    },
+                                ));
+                            }
                             return Some(result);
                         }
                         // Fallback: if we can't parse a type, emit error and skip
@@ -2835,6 +2861,35 @@ mod atomic_provenance_tests {
     }
 
     #[test]
+    fn an_atomic_specifier_naming_a_pointer_is_kept_as_one_type() {
+        // `_Atomic(char *) p` is an atomic pointer; `_Atomic char *p` is a
+        // pointer to an atomic `char`. A member's declarator is folded into
+        // its specifier, so the two would be the same `Pointer(Char)` there:
+        // the specifier form is the unit `typeof_unqual(char *)` is.
+        let (_, decls) = parse(
+            "struct s { _Atomic(char *) unit; _Atomic char *pointee; _Atomic(int) scalar; }; \
+             _Atomic(char *) g_unit; _Atomic char *g_pointee;",
+        );
+        let TypeSpecifier::Struct(_, Some(fields), ..) = &decls[0].type_spec else {
+            panic!("expected a struct definition, got {:?}", decls[0].type_spec);
+        };
+        assert!(
+            matches!(&fields[0].type_spec, TypeSpecifier::TypeofType(inner, quals)
+                if matches!(**inner, TypeSpecifier::Pointer(..)) && quals.unqual),
+            "{:?}",
+            fields[0].type_spec
+        );
+        assert!(!matches!(
+            fields[1].type_spec,
+            TypeSpecifier::TypeofType(..)
+        ));
+        assert!(matches!(fields[2].type_spec, TypeSpecifier::Int));
+        assert!(fields.iter().all(|f| f.base_atomic));
+        assert!(matches!(decls[1].type_spec, TypeSpecifier::TypeofType(..)));
+        assert!(matches!(decls[2].type_spec, TypeSpecifier::Char));
+    }
+
+    #[test]
     fn a_stars_own_atomic_writes_no_volatile() {
         let (_, decls) = parse("int *_Atomic ap; int *volatile vp; int *_Atomic *pap;");
         let star = |name: &str, level: usize| {
@@ -2850,8 +2905,19 @@ mod atomic_provenance_tests {
         };
         // The pointer object is accessed as a volatile one ...
         assert_eq!(flags(&decls, "ap"), (false, false, true, true));
-        // ... and its star records no qualifier, where a written one does.
+        // ... and its star records no `volatile`, where a written one does:
+        // what it records is the `_Atomic` itself.
         assert_eq!(star("ap", 0) & CVR_VOLATILE, 0);
+        assert_eq!(
+            star("ap", 0) & crate::frontend::parser::ast::CVR_ATOMIC,
+            crate::frontend::parser::ast::CVR_ATOMIC
+        );
+        assert_eq!(star("vp", 0) & crate::frontend::parser::ast::CVR_ATOMIC, 0);
+        assert_eq!(
+            star("pap", 0) & crate::frontend::parser::ast::CVR_ATOMIC,
+            crate::frontend::parser::ast::CVR_ATOMIC
+        );
+        assert_eq!(star("pap", 1) & crate::frontend::parser::ast::CVR_ATOMIC, 0);
         assert_eq!(star("vp", 0) & CVR_VOLATILE, CVR_VOLATILE);
         assert_eq!(star("pap", 0) & CVR_VOLATILE, 0);
         assert_eq!(flags(&decls, "pap"), (false, false, false, false));

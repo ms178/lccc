@@ -1221,6 +1221,20 @@ pub struct X86Codegen {
     /// materialization (setcc/movzbl/store) and the consumer uses the live
     /// flags directly (jcc/cmovcc).
     pub(super) fused_cmp_dests: FxHashMap<u32, u32>,
+    /// Success flags of compare-exchanges that are the last instruction of
+    /// their block and are read by its conditional branch alone: the retry
+    /// test of every compare-exchange loop. `lock cmpxchg` leaves the answer
+    /// in ZF, so the branch takes it from there (`lock cmpxchg; jne retry`,
+    /// as GCC and Clang emit) and the `sete; movzbl; test` in between is
+    /// never emitted. Computed by the prologue scan beside
+    /// `fused_cmp_dests`.
+    pub(super) fused_cmpxchg_dests: crate::common::fx_hash::FxHashSet<u32>,
+    /// Atomic read-modify-writes whose result -- the object's previous
+    /// value -- has no use of any kind. Such an update is one locked ALU
+    /// instruction on the memory operand (`lock add`, `lock or`); see
+    /// `emit_atomic_rmw_impl`. Computed by the prologue scan from every use,
+    /// pointer operands included.
+    pub(super) unused_atomic_rmw_dests: crate::common::fx_hash::FxHashSet<u32>,
     /// Destinations of the flag-neutral forwarding Copy/Cast instructions in a
     /// fused Cmp chain. Their value is never materialized (the consumer uses
     /// the live flags), so their emitters must skip them — emitting them would
@@ -1737,6 +1751,8 @@ impl X86Codegen {
             zext_loaded_values: FxHashSet::default(),
             narrow_call_arg_sign_casts: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
+            fused_cmpxchg_dests: Default::default(),
+            unused_atomic_rmw_dests: Default::default(),
             fused_forward_dests: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             cmp_replay_multi: FxHashMap::default(),
@@ -5468,9 +5484,38 @@ impl X86Codegen {
                             .with_out_checked(|o| o.emit_instr_imm_reg("    movabsq", *v, reg));
                     }
                 }
-                _ => self
-                    .state
-                    .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                // Every other constant is the 64-bit image `operand_to_rax`
+                // gives it: a float's bits, a decimal's container, the low
+                // half of a 128-bit integer. This arm used to zero the
+                // register whatever the constant was, so a floating constant
+                // staged here was 0.0: `__atomic_store(&d, &v, order)` with
+                // `v` a known `3.25` -- which is `atomic_store(&d, 3.25)` on
+                // an `_Atomic double` -- stored zero, and the exchange and
+                // compare-exchange forms did the same with their operand.
+                other => {
+                    let image: u64 = match other {
+                        IrConst::F32(v) => u64::from(v.to_bits()),
+                        IrConst::F64(v) | IrConst::LongDouble(v, _) => v.to_bits(),
+                        IrConst::D32(v) => u64::from(*v),
+                        IrConst::D64(v) => *v,
+                        IrConst::I128(v) => *v as u64,
+                        _ => 0,
+                    };
+                    if image == 0 {
+                        self.state
+                            .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg)));
+                    } else if let Ok(low) = u32::try_from(image) {
+                        // `movl` zero-extends; spell the upper half of the
+                        // unsigned range as its negative twin.
+                        self.state.with_out_checked(|o| {
+                            o.emit_instr_imm_reg("    movl", low as i32 as i64, reg_name_to_32(reg))
+                        });
+                    } else {
+                        self.state.with_out_checked(|o| {
+                            o.emit_instr_imm_reg("    movabsq", image as i64, reg)
+                        });
+                    }
+                }
             },
             Operand::Value(v) => {
                 self.value_to_reg(v, reg);

@@ -8,7 +8,7 @@ use crate::common::const_eval as shared_const_eval;
 use crate::common::types::{AddressSpace, CType, IrType, widened_op_type};
 use crate::frontend::parser::ast::{BinOp, Expr, PostfixOp, UnaryOp};
 use crate::ir::reexports::{
-    Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator, Value,
+    AtomicRmwOp, Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator, Value,
 };
 
 impl Lowerer {
@@ -1930,7 +1930,37 @@ impl Lowerer {
         }
 
         if let Some(lv) = self.lower_lvalue_for_mutation(inner) {
-            let loaded = self.load_lvalue_typed(&lv, ty);
+            let (step, binop_ty) = self.inc_dec_step_and_type(ty, inner);
+            let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
+            let promoted_ty = Self::integer_promote(ty);
+            let traps = self.signed_overflow_traps()
+                && !self.is_bool_lvalue(inner)
+                && ty != IrType::Ptr
+                && ty.size() >= 4
+                && promoted_ty.is_signed();
+            // `x++` on an `_Atomic` object is one read-modify-write (C11
+            // 6.5.2.4p2): a locked add where the step is an integer one, a
+            // compare-exchange loop around the computation below for a
+            // floating object, a `_Bool` and the trapping form. See
+            // `atomic_access`.
+            let atomic = self.atomic_target(&lv, ty).map(|ptr| {
+                let rmw = (!traps
+                    && (ty == IrType::Ptr || ty.is_integer())
+                    && !self.is_bool_lvalue(inner))
+                .then(|| {
+                    let op = if is_inc {
+                        AtomicRmwOp::Add
+                    } else {
+                        AtomicRmwOp::Sub
+                    };
+                    (op, step)
+                });
+                self.begin_atomic_update(ptr, ty, rmw)
+            });
+            let loaded = match &atomic {
+                Some((_, old)) => *old,
+                None => self.load_lvalue_typed(&lv, ty),
+            };
             let loaded_val = self.operand_to_value(loaded);
 
             // The loaded value is an SSA definition and is therefore already
@@ -1939,15 +1969,7 @@ impl Lowerer {
             // non-promotable stack home.  The latter was an old workaround for
             // backend copy coalescing, but it both obscured the true live range
             // and generated a store/load pair on every loop iteration.
-            let (step, binop_ty) = self.inc_dec_step_and_type(ty, inner);
-            let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
-            let promoted_ty = Self::integer_promote(ty);
-            let result = if self.signed_overflow_traps()
-                && !self.is_bool_lvalue(inner)
-                && ty != IrType::Ptr
-                && ty.size() >= 4
-                && promoted_ty.is_signed()
-            {
+            let result = if traps {
                 let lhs_op = if ty.size() < binop_ty.size() {
                     Operand::Value(self.emit_cast_val(Operand::Value(loaded_val), ty, binop_ty))
                 } else {
@@ -1964,7 +1986,10 @@ impl Lowerer {
             } else {
                 Operand::Value(result)
             };
-            self.store_lvalue_typed(&lv, store_op, ty);
+            match atomic {
+                Some((update, old)) => self.finish_atomic_update(update, old, store_op),
+                None => self.store_lvalue_typed(&lv, store_op, ty),
+            }
             if return_new {
                 return store_op;
             }

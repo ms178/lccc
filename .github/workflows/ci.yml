@@ -3091,6 +3091,11 @@ jobs:
         bash tests/regression/check_fixed_slp_distances_codegen.sh
         bash tests/regression/check_narrow_cmp_flag_law.sh
         bash tests/regression/check_atomic_backends.sh
+        # `x++`, `x += v`, `x = v` and a read of an `_Atomic` object are
+        # atomic operations (they were a volatile object's plain accesses,
+        # and lost updates under threads): the instruction each becomes on
+        # all four backends, and the threaded program at every level.
+        bash tests/regression/check_atomic_operators.sh
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.

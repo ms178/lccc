@@ -3487,7 +3487,8 @@ impl Driver {
         .with_default_visibility(self.default_visibility.clone())
         .with_builtin_policy(self.builtin_policy.clone())
         .with_enumerator_refs(sema_result.enumerator_refs)
-        .with_local_address_returns(sema_result.local_address_returns);
+        .with_local_address_returns(sema_result.local_address_returns)
+        .with_qualifier_verdicts(sema_result.generic_choices, sema_result.atomic_lvalues);
         let (mut module, mut diagnostics, _lowered_types) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one

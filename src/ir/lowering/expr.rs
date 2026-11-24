@@ -269,6 +269,13 @@ impl Lowerer {
     }
 
     fn lower_expr_inner(&mut self, expr: &Expr) -> Operand {
+        // The value of an `_Atomic` object is an atomic load of it. A unit
+        // that names no atomic object pays one emptiness test.
+        if !self.sema_atomic_lvalues.is_empty() {
+            if let Some(value) = self.try_lower_atomic_read(expr) {
+                return value;
+            }
+        }
         match expr {
             // Literals
             Expr::IntLiteral(val, _) => Operand::Const(IrConst::I64(*val)),

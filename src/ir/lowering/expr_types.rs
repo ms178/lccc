@@ -1078,6 +1078,17 @@ impl Lowerer {
         controlling: &Expr,
         associations: &'a [GenericAssociation],
     ) -> Option<&'a Expr> {
+        // Sema's verdict first: it compared the qualifiers of every pointer
+        // level (`volatile int *` is not `int *`, nor is `_Atomic int *`),
+        // which the types here do not carry. The span is the entry's proof
+        // that it belongs to this node.
+        if let Some(&(span, index)) = self.sema_generic_choices.get(&controlling.id()) {
+            if span == controlling.span() {
+                if let Some(assoc) = associations.get(index as usize) {
+                    return Some(&assoc.expr);
+                }
+            }
+        }
         // C23 6.5.1.1p2: an expression operand undergoes lvalue conversion
         // (array and function decay included); a type operand (C2y) none.
         // Its type is computed fresh, not from the ExprId cache, which can

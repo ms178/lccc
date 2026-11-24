@@ -738,7 +738,8 @@ impl Parser {
             return_base_cvr: u8::from(return_base_const) * crate::frontend::parser::ast::CVR_CONST
                 | u8::from(decl_attrs.base_volatile && !decl_attrs.base_atomic)
                     * crate::frontend::parser::ast::CVR_VOLATILE
-                | u8::from(decl_attrs.base_restrict) * crate::frontend::parser::ast::CVR_RESTRICT,
+                | u8::from(decl_attrs.base_restrict) * crate::frontend::parser::ast::CVR_RESTRICT
+                | u8::from(decl_attrs.base_atomic) * crate::frontend::parser::ast::CVR_ATOMIC,
             return_star_cvr: crate::frontend::parser::ast::return_star_chain(
                 &return_type,
                 &derived,

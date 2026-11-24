@@ -471,10 +471,11 @@ impl Parser {
             // ride on the declarator or the read-only check cannot see it.
             // The qualifiers the star wrote: an `_Atomic` there set
             // `volatile` for the way the pointer is accessed, and is not one
-            // (see `DeclAttributes::base_atomic`).
+            // (see `DeclAttributes::base_atomic`); it is recorded as itself.
             let star_cvr = u8::from(self.attrs.parsing_pointer_const())
                 | (u8::from(star_volatile && !last_star_atomic) << 1)
-                | (u8::from(last_star_restrict) << 2);
+                | (u8::from(last_star_restrict) << 2)
+                | (u8::from(last_star_atomic) * CVR_ATOMIC);
             // The last star's is also the declared object's space.
             derived.push(DerivedDeclarator::Pointer(star_space, star_cvr));
             object_space = star_space;
@@ -1342,7 +1343,8 @@ impl Parser {
         // set `volatile` for the access, and wrote none.
         let cvr = u8::from(self.attrs.parsing_pointer_const())
             | (u8::from(star_volatile && !star_atomic) << 1)
-            | (u8::from(star_restrict) << 2);
+            | (u8::from(star_restrict) << 2)
+            | (u8::from(star_atomic) * CVR_ATOMIC);
         self.attrs.set_volatile(outer_volatile || star_volatile);
         self.attrs.set_restrict(outer_restrict || star_restrict);
         self.attrs.set_atomic(outer_atomic);
@@ -2159,11 +2161,12 @@ impl Parser {
             // every type-name `*const`, so `*(int *const *)p = 0` passed.
             // An `_Atomic` after the star set `volatile` for the access and
             // wrote none (see `parse_pointer_prefix`).
-            let star_written_volatile =
-                self.attrs.parsing_volatile() && !self.attrs.parsing_atomic();
+            let star_atomic = self.attrs.parsing_atomic();
+            let star_written_volatile = self.attrs.parsing_volatile() && !star_atomic;
             let star_cvr = u8::from(self.attrs.parsing_pointer_const())
                 | (u8::from(star_written_volatile) << 1)
-                | restrict_bit;
+                | restrict_bit
+                | (u8::from(star_atomic) * CVR_ATOMIC);
             let star_space = self.attrs.parsing_address_space;
 
             self.attrs.set_const(saved_const);

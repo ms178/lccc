@@ -1,5 +1,6 @@
 mod aggregate_abi;
 mod array_init_plan;
+mod atomic_access;
 pub(crate) mod complex;
 pub(crate) mod const_eval;
 mod const_eval_global_addr;

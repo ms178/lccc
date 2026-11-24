@@ -1507,6 +1507,79 @@ impl X86Codegen {
             self.demorgan_branch = replay_scan.demorgan;
             self.demorgan_skip.clear();
 
+            // Compare-exchange success flags whose only reader is the
+            // conditional branch right behind them (see
+            // `fused_cmpxchg_dests`). The 16-byte form is a libatomic call
+            // or a CMPXCHG16B sequence of its own and keeps its boolean.
+            // Every use counts for the two atomic sets below, a pointer
+            // operand included (`*p++` on an atomic `p` loads through the
+            // previous value): `use_counts` sees `Operand`s only, which is
+            // all a compare's boolean can be and not all these can.
+            let mut atomic_uses: FxHashMap<u32, u32> = FxHashMap::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::AtomicRmw { dest, .. }
+                    | Instruction::AtomicCmpxchg { dest, .. } = inst
+                    {
+                        atomic_uses.entry(dest.0).or_insert(0);
+                    }
+                }
+            }
+            if !atomic_uses.is_empty() {
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        inst.for_each_used_value(|v| {
+                            if let Some(n) = atomic_uses.get_mut(&v) {
+                                *n += 1;
+                            }
+                        });
+                    }
+                    block.terminator.for_each_used_value(|v| {
+                        if let Some(n) = atomic_uses.get_mut(&v) {
+                            *n += 1;
+                        }
+                    });
+                }
+            }
+            // Read-modify-writes whose previous value nobody reads (see
+            // `unused_atomic_rmw_dests`).
+            self.unused_atomic_rmw_dests.clear();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::AtomicRmw { dest, .. } = inst {
+                        if atomic_uses.get(&dest.0) == Some(&0) {
+                            self.unused_atomic_rmw_dests.insert(dest.0);
+                        }
+                    }
+                }
+            }
+            self.fused_cmpxchg_dests.clear();
+            if super::comparison::cmpxchg_flag_fusion_enabled() {
+                for block in &func.blocks {
+                    let (
+                        Some(Instruction::AtomicCmpxchg {
+                            dest,
+                            ty,
+                            returns_bool: true,
+                            ..
+                        }),
+                        Terminator::CondBranch {
+                            cond: Operand::Value(cond),
+                            ..
+                        },
+                    ) = (block.instructions.last(), &block.terminator)
+                    else {
+                        continue;
+                    };
+                    if cond.0 == dest.0
+                        && atomic_uses.get(&dest.0) == Some(&1)
+                        && !crate::backend::generation::is_wide_int_type(*ty)
+                    {
+                        self.fused_cmpxchg_dests.insert(dest.0);
+                    }
+                }
+            }
+
             self.fused_cmp_dests = fused;
             self.fused_forward_dests = fused_forward;
             self.value_use_counts = use_counts;
