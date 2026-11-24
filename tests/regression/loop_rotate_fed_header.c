@@ -171,7 +171,7 @@ NOINLINE static struct seen old_and_new(unsigned long n)
         s.sum = mix(mix(s.sum, before), n);
         s.trips++;
     }
-    s.left = n ^ (before << 32);
+    s.left = n ^ ((u64)before << 32);
     return s;
 }
 
@@ -210,7 +210,7 @@ NOINLINE static struct seen two_at_once(unsigned long a, unsigned long b)
         s.sum = mix(mix(s.sum, a), b);
         s.trips++;
     }
-    s.left = a ^ (b << 32);
+    s.left = a ^ ((u64)b << 32);
     return s;
 }
 
