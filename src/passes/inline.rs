@@ -1103,6 +1103,160 @@ fn loop_guard_site_admitted(
     charge.saturating_mul(per_clone) <= budget_remaining
 }
 
+/// Clone every site of a wide loop-guard callee as a single transaction.
+///
+/// The entry census proves where sites lie, not whether they can all be
+/// *selected*: target ISA, stack-protector policy, section/size limits, the
+/// caller budget, skip-list entries and ID capacity may still veto a site.
+/// Processing callers independently could then clone only a subset and keep
+/// the outlined body, the opposite of this tier's code-size justification.
+/// Stage at most two callers in private copies; publish none until each call
+/// passes the real selector and cloner. The common no-candidate path does no
+/// cloning or CFG analysis. Budgets and global block labels commit with the
+/// functions, never on failure.
+fn inline_loop_guard_groups(
+    module: &mut IrModule,
+    callee_map: &FxHashMap<String, CalleeData>,
+    skip_list: &[String],
+    global_max_block_id: &mut u32,
+    remaining_budget: &mut [usize],
+    recursive_callees: &FxHashSet<String>,
+) -> usize {
+    let candidates: Vec<String> = module
+        .functions
+        .iter()
+        .filter(|f| callee_map.get(&f.name).is_some_and(|d| d.loop_guard_only))
+        .map(|f| f.name.clone())
+        .collect();
+    let mut total_inlined = 0;
+    for name in candidates {
+        // An indirect call-graph cycle is as unsafe as direct recursion: the
+        // cloned body could call its caller and expose a new self-call.
+        if recursive_callees.contains(&name) {
+            continue;
+        }
+        let data = &callee_map[&name];
+        let count_in = |f: &IrFunction| {
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter(|inst| matches!(inst, Instruction::Call { func, .. } if func == &name))
+                .count()
+        };
+        let actual_sites: usize = module.functions.iter().map(&count_in).sum();
+        if actual_sites == 0 || actual_sites != data.direct_call_count {
+            // A prior transformation created or removed a site after the
+            // entry census. Its size proof is no longer applicable.
+            continue;
+        }
+        let clone_cost: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+        let mut staged = Vec::with_capacity(actual_sites);
+        let mut staged_max_label = *global_max_block_id;
+        let mut cloned = 0;
+        let mut failed = false;
+        for (idx, caller) in module.functions.iter().enumerate() {
+            let sites_here = count_in(caller);
+            if sites_here == 0 {
+                continue;
+            }
+            // Only subsequent sites in THIS caller may bypass the soft cap;
+            // another caller must earn its own first clone independently.
+            let mut committed = FxHashSet::default();
+            // Check the complete charge before cloning: a later site must not
+            // be allowed to escape the budget merely because the first one
+            // committed. The first clone is paid for by deleting the body
+            // only when another caller owns at least one of its sites.
+            let charged_sites = if actual_sites > sites_here {
+                sites_here - 1
+            } else {
+                sites_here
+            };
+            if charged_sites.saturating_mul(clone_cost) > remaining_budget[idx] {
+                failed = true;
+                break;
+            }
+            let mut trial = caller.clone();
+            let mut budget = remaining_budget[idx];
+            for remaining in (1..=sites_here).rev() {
+                let eligible: Vec<_> =
+                    find_inline_call_sites(&trial, callee_map, skip_list, trial.section.is_some())
+                        .into_iter()
+                        .filter(|s| s.callee_name == name)
+                        .collect();
+                if eligible.len() != remaining {
+                    failed = true;
+                    break;
+                }
+                let cfg = crate::ir::analysis::CfgAnalysis::build(&trial);
+                let loops = loop_analysis::find_natural_loops(
+                    cfg.num_blocks,
+                    &cfg.preds,
+                    &cfg.succs,
+                    &cfg.idom,
+                );
+                let mut loop_blocks = FxHashSet::default();
+                for lp in &loops {
+                    loop_blocks.extend(lp.body.iter().copied());
+                }
+                let caller_inst_count: usize =
+                    trial.blocks.iter().map(|b| b.instructions.len()).sum();
+                let caller_is_recursive = trial.blocks.iter().any(|b| {
+                    b.instructions.iter().any(|inst| {
+                        matches!(inst, Instruction::Call { func, .. } if func == &trial.name)
+                    })
+                });
+                let picked = select_inline_site(
+                    &eligible,
+                    callee_map,
+                    &committed,
+                    caller_inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE,
+                    caller_inst_count > MAX_CALLER_INSTRUCTIONS_HARD_CAP,
+                    caller_inst_count > MAX_CALLER_INSTRUCTIONS_ABSOLUTE_CAP,
+                    trial.section.is_some(),
+                    caller_is_recursive,
+                    budget,
+                    MAX_ALWAYS_INLINE_BUDGET_PER_CALLER,
+                    MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER,
+                    None,
+                    false,
+                    &loop_blocks,
+                    &FxHashSet::default(),
+                    &FxHashSet::default(),
+                    !loop_blocks.is_empty(),
+                    false,
+                    &FxHashSet::default(),
+                );
+                let Some((site, _, _, _)) = picked else {
+                    failed = true;
+                    break;
+                };
+                if !inline_call_site(&mut trial, &site, data, &mut staged_max_label) {
+                    failed = true;
+                    break;
+                }
+                committed.insert(name.clone());
+                trial.has_inlined_calls = true;
+                budget = budget.saturating_sub(clone_cost);
+                cloned += 1;
+            }
+            if failed {
+                break;
+            }
+            staged.push((idx, trial, budget));
+        }
+        if failed || cloned != actual_sites {
+            continue;
+        }
+        for (idx, caller, budget) in staged {
+            module.functions[idx] = caller;
+            remaining_budget[idx] = budget;
+        }
+        *global_max_block_id = staged_max_label;
+        total_inlined += cloned;
+    }
+    total_inlined
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_inline_site(
     call_sites: &[InlineCallSite],
@@ -1732,15 +1886,6 @@ fn inline_run_with(
     features: InlineFeatures,
 ) -> usize {
     let mut total_inlined = 0;
-    // Atomic commitment for the loop-guard tier, module-wide ON PURPOSE: a
-    // callee must be cloned at EVERY site or at none, or the outlined copy the
-    // tier was meant to delete survives beside the clone and the clone is a net
-    // addition (`sqlite_varint`: +468 bytes of `.text` for one of two sites).
-    // A per-caller set cannot express that — the sites of one callee live in
-    // different functions — so the set spans the whole invocation. Admission
-    // already proves every enclosing caller is inside the headroom bound, and
-    // the per-caller budget still charges every clone.
-    let mut loop_guard_committed: FxHashSet<String> = FxHashSet::default();
     let debug_inline = std::env::var("CCC_INLINE_DEBUG").is_ok();
     let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
         .unwrap_or_default()
@@ -1846,6 +1991,47 @@ fn inline_run_with(
         }
     }
 
+    // The loop-guard tier is atomic across the whole module, not per caller.
+    // Clone into private function copies and publish only if every site can
+    // actually be selected and cloned. Do this before the ordinary rounds so
+    // subsequent budgets account for the cost and caller snapshots reflect
+    // the group; otherwise a later hard-cap/ISA/SSP veto strands a partial
+    // clone beside its still-live outlined body. An active PGO profile owns
+    // call-site admission, so never pre-empt its cold-site veto.
+    let guard_active = !size_optimized
+        && !always_inline_only
+        && !(pgo_profile.is_some() && crate::pgo::inline_pgo::inline_decisions_active())
+        && callee_map.values().any(|d| d.loop_guard_only);
+    let mut guard_remaining_budget = if guard_active {
+        vec![MAX_INLINE_BUDGET_PER_CALLER; module.functions.len()]
+    } else {
+        Vec::new()
+    };
+    if guard_active {
+        let guarded = inline_loop_guard_groups(
+            module,
+            &callee_map,
+            &skip_list,
+            &mut global_max_block_id,
+            &mut guard_remaining_budget,
+            &recursive_callees,
+        );
+        if guarded > 0 {
+            // An inlined caller may itself be a clonable wrapper. Refresh all
+            // snapshots before a later pass can copy its old, un-inlined call.
+            callee_map = build_callee_map_with(module, &callee_ctx);
+            total_inlined += guarded;
+            if debug_inline {
+                lccc::cli::stderr_line(format_args!(
+                    "[INLINE] Atomically inlined {} loop-guard sites",
+                    guarded
+                ));
+            }
+        }
+    }
+    // Failed groups must not fall through to independent per-caller cloning.
+    callee_map.retain(|_, data| !data.loop_guard_only);
+
     // Process each function as a potential caller
     for func_idx in 0..module.functions.len() {
         let inlined_before = total_inlined;
@@ -1878,7 +2064,10 @@ fn inline_run_with(
                 })
             })
         };
-        let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
+        let mut budget_remaining = guard_remaining_budget
+            .get(func_idx)
+            .copied()
+            .unwrap_or(MAX_INLINE_BUDGET_PER_CALLER);
         // Relative growth allowance for hot in-loop declared-inline leaves
         // only (see `select_inline_site`): at most the caller's entry size.
         let mut hot_leaf_budget_remaining = hot_leaf_enabled.then(|| {
@@ -2236,7 +2425,7 @@ fn inline_run_with(
                 let found_site = select_inline_site(
                     &call_sites,
                     &callee_map,
-                    &loop_guard_committed,
+                    &FxHashSet::default(),
                     caller_too_large,
                     caller_at_hard_cap,
                     caller_at_absolute_cap,
@@ -2310,12 +2499,6 @@ fn inline_run_with(
                 );
 
                 if success {
-                    // Commit the loop-guard callee: its remaining sites are now
-                    // mandatory, or the outlined copy it was meant to delete
-                    // survives alongside the clone.
-                    if callee_data.loop_guard_only {
-                        loop_guard_committed.insert(site.callee_name.clone());
-                    }
                     if size_optimized
                         && !callee_data.is_always_inline
                         && !callee_data.is_single_call_site_static
@@ -10650,6 +10833,125 @@ mod loop_guard_tests {
             module.functions.iter().all(|f| f.name != "varint"),
             "dead-static cleanup must remove the now-unreferenced outlined body"
         );
+    }
+
+    #[test]
+    fn loop_guard_does_not_clone_a_subset_of_isa_or_ssp_incompatible_sites() {
+        // Both entry sites lie in loops, so a loop-only census sees two.
+        // The second caller cannot legally clone this callee: its stack
+        // protector policy differs. Inlining the first call would keep the
+        // outlined copy for the second and increase total code size.
+        let callee = loop_guard_callee("guarded", 25, 184);
+        let mut hot = loop_caller("hot", "guarded", 1);
+        hot.is_static = false;
+        let mut incompatible = loop_caller("incompatible", "guarded", 1);
+        incompatible.is_static = false;
+        incompatible.ssp.no_stack_protector = true;
+        let mut module = IrModule::new();
+        module.functions = vec![hot, incompatible, callee];
+        assert_eq!(
+            callee_context(&module).loop_site_counts.get("guarded"),
+            Some(&2)
+        );
+        super::inline_run(&mut module, false);
+        assert_eq!(
+            module
+                .functions
+                .iter()
+                .map(|f| count_direct_calls(f, "guarded"))
+                .sum::<usize>(),
+            2,
+            "a group with one ineligible call must not leave a partial clone"
+        );
+    }
+
+    #[test]
+    fn loop_guard_clones_two_sites_in_one_caller_only_if_the_budget_covers_both() {
+        for (instructions, should_inline) in [(161, true), (184, false)] {
+            let callee = loop_guard_callee("guarded", 25, instructions);
+            let mut hot = loop_caller("hot", "guarded", 2);
+            hot.is_static = false;
+            let mut module = IrModule::new();
+            module.functions = vec![hot, callee];
+            assert_eq!(
+                callee_context(&module).loop_site_counts.get("guarded"),
+                Some(&2)
+            );
+            let inlined = super::inline_run(&mut module, false);
+            let violations = crate::passes::verify::verify_module(&module, "two-site guard");
+            assert!(violations.is_empty(), "invalid cloned IR: {violations:?}");
+            assert_eq!(inlined, if should_inline { 2 } else { 0 });
+            assert_eq!(
+                module
+                    .functions
+                    .iter()
+                    .map(|f| count_direct_calls(f, "guarded"))
+                    .sum::<usize>(),
+                if should_inline { 0 } else { 2 },
+                "both sites must be treated as a group"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_guard_rollback_when_another_caller_exceeds_the_soft_cap() {
+        let callee = loop_guard_callee("guarded", 25, 184);
+        let mut small = loop_caller("small", "guarded", 1);
+        small.is_static = false;
+        let mut large = loop_caller("large", "guarded", 1);
+        large.is_static = false;
+        // Add SSA-unique work before the loop. Its call is hot, but putting
+        // 184 more instructions in this already-large caller is not allowed.
+        large.blocks[0]
+            .instructions
+            .extend(
+                (0..MAX_CALLER_INSTRUCTIONS_AFTER_INLINE).map(|i| Instruction::Copy {
+                    dest: Value(64 + i as u32),
+                    src: Operand::Const(IrConst::I32(i as i32)),
+                }),
+            );
+        large.next_value_id = 64 + MAX_CALLER_INSTRUCTIONS_AFTER_INLINE as u32;
+        let mut module = IrModule::new();
+        module.functions = vec![small, large, callee];
+        assert!(crate::passes::verify::verify_module(&module, "cap input").is_empty());
+        assert_eq!(super::inline_run(&mut module, false), 0);
+        assert_eq!(count_direct_calls(&module.functions[0], "guarded"), 1);
+        assert_eq!(count_direct_calls(&module.functions[1], "guarded"), 1);
+    }
+
+    #[test]
+    fn loop_guard_rollback_on_second_cloners_label_exhaustion() {
+        let callee = loop_guard_callee("guarded", 25, 184);
+        let mut first = loop_caller("first", "guarded", 1);
+        first.is_static = false;
+        let mut second = loop_caller("second", "guarded", 1);
+        second.is_static = false;
+        let mut module = IrModule::new();
+        module.functions = vec![first, second, callee];
+        let map = build_callee_map(&module);
+        assert!(map["guarded"].loop_guard_only);
+        // There is room for exactly one clone. The second attempt must
+        // fail without publishing the first, consuming a caller budget or
+        // advancing the module-wide block label counter.
+        let original_max = u32::MAX - (25 + LABEL_MAP_RESERVED + 2);
+        let mut max_label = original_max;
+        let mut budgets = vec![MAX_INLINE_BUDGET_PER_CALLER; module.functions.len()];
+        assert_eq!(
+            inline_loop_guard_groups(
+                &mut module,
+                &map,
+                &[],
+                &mut max_label,
+                &mut budgets,
+                &FxHashSet::default(),
+            ),
+            0
+        );
+        assert_eq!(max_label, original_max);
+        assert!(budgets.iter().all(|&b| b == MAX_INLINE_BUDGET_PER_CALLER));
+        assert_eq!(count_direct_calls(&module.functions[0], "guarded"), 1);
+        assert_eq!(count_direct_calls(&module.functions[1], "guarded"), 1);
+        assert!(crate::passes::verify::verify_module(&module, "rollback").is_empty());
     }
 
     #[test]
