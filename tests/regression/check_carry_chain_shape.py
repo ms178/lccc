@@ -18,9 +18,18 @@ the assembly (x86-64, -O2) and holds, for each of its functions:
 
 `SHAPES` is that table; `--print-table` prints it from the compiler at hand.
 
-With the pass switched off (`CCC_DISABLE_PASSES=carry`) the same reading
-must find the chains gone: that is the negative control, and it fails the
-gate if fewer than `MUST_BREAK` functions lose their pin.
+A limb loop is two loops since `limb_unroll`: four limbs a trip, and the
+loop as it was for the rest. Between the two the carry is a boolean once
+(one `setc`, one `bt`), and that is what their rows allow. What the split is
+for is held apart, in `FOUR_A_TRIP`:
+
+* **four links in the flag**: the longest run of `adc`/`sbb` in straight
+  line code -- no label, no branch and no `setc`/`bt` between one and the
+  next -- is four, exactly.
+
+With the passes switched off the same reading must find that gone, which is
+the negative control: without `carry` at least `MUST_BREAK` functions lose
+their pin, and without `limb_unroll` every function of `FOUR_A_TRIP` does.
 """
 
 from __future__ import annotations
@@ -63,8 +72,8 @@ SHAPES: dict[str, tuple[int, int, int]] = {
     "hdr_mixed": (3, 0, 16),
     "hdr_interrupted": (2, 3, 39),
     "hdr_in_place": (3, 0, 16),
-    "hdr_addn": (1, 0, 16),
-    "hdr_subn": (1, 0, 16),
+    "hdr_addn": (5, 2, 44),
+    "hdr_subn": (5, 2, 44),
     "hdr_addn_pairs": (2, 2, 33),
     "hdr_branchy": (2, 2, 37),
     "bi_addc": (0, 0, 12),
@@ -91,8 +100,8 @@ SHAPES: dict[str, tuple[int, int, int]] = {
     "cmp_signed": (0, 0, 17),
     "cmp_add_shared": (0, 0, 18),
     "cmp_add4": (3, 0, 16),
-    "cmp_subn": (1, 0, 16),
-    "cmp_addn32": (1, 0, 16),
+    "cmp_subn": (5, 2, 44),
+    "cmp_addn32": (5, 2, 44),
     "cmp_add_carry_first": (1, 0, 8),
     "cmp_sub_borrow_first": (1, 0, 11),
     "cmp_sub_both_grew": (1, 0, 11),
@@ -104,19 +113,19 @@ SHAPES: dict[str, tuple[int, int, int]] = {
     "cmp_add_xor_word": (0, 0, 14),
     "cmp_sub_plus_word": (0, 0, 15),
     "cmp_sub_from_bit": (0, 0, 18),
-    "lib_gmp_add_n": (1, 0, 16),
-    "lib_gmp_sub_n": (1, 0, 16),
-    "lib_mini_add_n": (1, 0, 16),
-    "lib_mini_sub_n": (1, 0, 16),
-    "lib_ossl_add_words": (1, 0, 22),
+    "lib_gmp_add_n": (5, 2, 62),
+    "lib_gmp_sub_n": (5, 2, 62),
+    "lib_mini_add_n": (5, 2, 44),
+    "lib_mini_sub_n": (5, 2, 44),
+    "lib_ossl_add_words": (5, 2, 65),
     "lib_ossl_sub_words": (0, 0, 30),
-    "lib_i128_add_n": (1, 0, 16),
+    "lib_i128_add_n": (5, 2, 44),
     "lib_i128_sub_n": (1, 0, 21),
     "lib_i128_add3_n": (0, 0, 30),
-    "lib_ovf_add_n": (1, 0, 16),
-    "lib_ovf_sub_n": (1, 0, 16),
-    "lib_bool_add_n": (1, 0, 16),
-    "lib_bool_sub_n": (1, 0, 16),
+    "lib_ovf_add_n": (5, 2, 44),
+    "lib_ovf_sub_n": (5, 2, 44),
+    "lib_bool_add_n": (5, 2, 48),
+    "lib_bool_sub_n": (5, 2, 48),
     "lib_count_n": (0, 0, 35),
     "lib_count_carried_n": (0, 0, 27),
     "two_add_ssaaaa": (1, 0, 7),
@@ -131,10 +140,34 @@ SHAPES: dict[str, tuple[int, int, int]] = {
 # How many of them the pass is responsible for, at the least.
 MUST_BREAK = 50
 
+# The limb loops: `limb_unroll` splits each, and the main loop's four links
+# pass the carry on in the flag.
+FOUR_A_TRIP = (
+    "hdr_addn",
+    "hdr_subn",
+    "cmp_subn",
+    "cmp_addn32",
+    "lib_gmp_add_n",
+    "lib_gmp_sub_n",
+    "lib_mini_add_n",
+    "lib_mini_sub_n",
+    "lib_ossl_add_words",
+    "lib_i128_add_n",
+    "lib_ovf_add_n",
+    "lib_ovf_sub_n",
+    "lib_bool_add_n",
+    "lib_bool_sub_n",
+)
+LINKS_A_TRIP = 4
 
-def read_shapes(assembly: str) -> dict[str, tuple[int, int, int]]:
-    """{function: (adc + sbb, carry traffic between the first and the last
-    of them, instructions)}"""
+
+LINK = re.compile(r"(adc|sbb)[bwlq]?\s")
+CARRY_AS_A_BOOLEAN = re.compile(r"(setc|setb|setnae|bt[lq]?)\s")
+LEAVES_THE_LINE = re.compile(r"(j[a-z]+|call[q]?|ret[q]?|loop[a-z]*)\b")
+
+
+def read_functions(assembly: str) -> dict[str, list[str]]:
+    """{function: its lines, labels included}"""
     functions: dict[str, list[str]] = {}
     current = None
     for line in assembly.splitlines():
@@ -144,25 +177,57 @@ def read_shapes(assembly: str) -> dict[str, tuple[int, int, int]]:
             current = functions.setdefault(head.group(1), [])
         elif text.startswith(".size"):
             current = None
-        elif current is not None and text and not text.startswith((".", "#")) and not text.endswith(":"):
-            current.append(text)
+        elif current is not None and text and not text.startswith("#"):
+            if text.endswith(":") or not text.startswith("."):
+                current.append(text)
+    return {name: body for name, body in functions.items() if name.startswith(PREFIXES)}
+
+
+def read_shapes(assembly: str) -> dict[str, tuple[int, int, int]]:
+    """{function: (adc + sbb, carry traffic between the first and the last
+    of them, instructions)}"""
     shapes = {}
-    for name, body in functions.items():
-        if not name.startswith(PREFIXES):
-            continue
-        links = [i for i, text in enumerate(body) if re.match(r"(adc|sbb)[bwlq]?\s", text)]
+    for name, lines in read_functions(assembly).items():
+        body = [text for text in lines if not text.endswith(":")]
+        links = [i for i, text in enumerate(body) if LINK.match(text)]
         inside = body[links[0]:links[-1]] if links else []
-        traffic = sum(1 for text in inside if re.match(r"(setc|setb|setnae|bt[lq]?)\s", text))
+        traffic = sum(1 for text in inside if CARRY_AS_A_BOOLEAN.match(text))
         shapes[name] = (len(links), traffic, len(body))
     return shapes
 
 
-def compile_shapes(lccc: str, env: dict[str, str]) -> dict[str, tuple[int, int, int]]:
+def read_runs(assembly: str) -> dict[str, int]:
+    """{function: the most `adc`/`sbb` in a row, with no label, no branch
+    and no `setc`/`bt` between one and the next}"""
+    runs = {}
+    for name, lines in read_functions(assembly).items():
+        longest = run = 0
+        for text in lines:
+            if LINK.match(text):
+                run += 1
+                longest = max(longest, run)
+            elif text.endswith(":") or CARRY_AS_A_BOOLEAN.match(text) or LEAVES_THE_LINE.match(text):
+                run = 0
+        runs[name] = longest
+    return runs
+
+
+def compile_assembly(lccc: str, env: dict[str, str]) -> str:
     with tempfile.TemporaryDirectory(prefix="lccc-carry-shape-") as tmp:
         out = Path(tmp) / "adders.s"
         subprocess.run([lccc, "-O2", "-S", str(FIXTURE), "-o", str(out)], check=True,
                        env={**os.environ, **env})
-        return read_shapes(out.read_text())
+        return out.read_text()
+
+
+def compile_shapes(lccc: str, env: dict[str, str]) -> dict[str, tuple[int, int, int]]:
+    return read_shapes(compile_assembly(lccc, env))
+
+
+def short_trips(runs: dict[str, int]) -> list[str]:
+    """The functions of FOUR_A_TRIP that do not have four links in a row."""
+    return [f"{name}: {runs.get(name, 0)} adc/sbb in a row, pinned {LINKS_A_TRIP}"
+            for name in FOUR_A_TRIP if runs.get(name, 0) != LINKS_A_TRIP]
 
 
 def differences(shapes: dict[str, tuple[int, int, int]]) -> list[str]:
@@ -187,24 +252,33 @@ def main() -> int:
     parser.add_argument("--lccc", default=str(ROOT / "target/fastbuild/lccc"))
     parser.add_argument("--print-table", action="store_true", help="print SHAPES as this compiler has it")
     args = parser.parse_args()
-    shapes = compile_shapes(args.lccc, {})
+    assembly = compile_assembly(args.lccc, {})
+    shapes = read_shapes(assembly)
     if args.print_table:
         for name, (links, traffic, size) in shapes.items():
             print(f'    "{name}": ({links}, {traffic}, {size}),')
         return 0
-    problems = differences(shapes)
-    # The gate itself: without the pass, the pins must not hold.
+    problems = differences(shapes) + short_trips(read_runs(assembly))
+    problems += [f"{name}: in FOUR_A_TRIP and not in SHAPES" for name in FOUR_A_TRIP if name not in SHAPES]
+    # The gate itself: without the passes, the pins must not hold.
     broken = differences(compile_shapes(args.lccc, {"CCC_DISABLE_PASSES": "carry"}))
     if len(broken) < MUST_BREAK:
         problems.append(f"negative control: with the pass off only {len(broken)} functions lose their pin, "
                         f"at least {MUST_BREAK} expected")
+    whole = read_runs(compile_assembly(args.lccc, {"CCC_DISABLE_PASSES": "limb_unroll"}))
+    unsplit = len(short_trips(whole))
+    if unsplit != len(FOUR_A_TRIP):
+        problems.append(f"negative control: with limb_unroll off only {unsplit} of {len(FOUR_A_TRIP)} limb loops "
+                        f"lose their four links")
     for problem in problems:
         print(f"FAIL: {problem}")
     chains = sum(1 for links, _, _ in SHAPES.values() if links)
     print(f"carry-chain-shape: {len(SHAPES)} functions pinned, {chains} with adc/sbb "
           f"({sum(links for links, _, _ in SHAPES.values())} links), "
           f"{sum(size for _, _, size in shapes.values())} instructions; "
-          f"{len(broken)} pins break with the pass off, {'FAIL' if problems else 'PASS'}")
+          f"{len(FOUR_A_TRIP)} limb loops with {LINKS_A_TRIP} links a trip; "
+          f"{len(broken)} pins break without carry and {unsplit} trips without limb_unroll, "
+          f"{'FAIL' if problems else 'PASS'}")
     return 1 if problems else 0
 
 

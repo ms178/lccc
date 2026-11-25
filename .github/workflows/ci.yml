@@ -3124,8 +3124,28 @@ jobs:
         # Multi-word adders as adc/sbb chains (docs/x86-carry-chain.md):
         # the assembly of carry_chain_adders.c, function by function -- how
         # many adc/sbb, no setc/bt inside a straight chain, no more
-        # instructions than today. With the pass off the pins must break.
+        # instructions than today, and four adc/sbb in a row in the main
+        # loop of every limb loop. With the carry pass off the pins must
+        # break, and with limb_unroll off the fours.
         python3 tests/regression/check_carry_chain_shape.py --lccc target/fastbuild/lccc
+        # Random limb loops, which limb_unroll splits into four limbs a
+        # trip and a remainder: eight generated programs of eight loops
+        # each (every way a counted loop is spelled; half of them plain,
+        # half with any adder spelling and now and then more than a limb
+        # in the trip), each through eight configurations (the seven of
+        # the adders below, and the split off), every one printing what
+        # GCC 16.2's program prints. One planted wrong carry is the
+        # negative control, and at least 26 of the 64 loops have to be
+        # split.
+        python3 tests/regression/check_carry_chain_fuzz.py --limbs --lccc target/fastbuild/lccc --gcc gcc-16
+        # What a loop carries from one iteration to the next has a
+        # register: the state of zstd_count's generator is not stored to
+        # the frame and not reloaded from it on the way round the query
+        # loop, and the digit loop of csv_field_sum has no register move
+        # and ten instructions. (The codegen gate sees neither: the first
+        # leaves its counts alone, the second is no workload of it.) The
+        # matchers are tried first on the code that had both defects.
+        python3 tests/regression/check_loop_carried_homes.py --lccc target/fastbuild/lccc
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.

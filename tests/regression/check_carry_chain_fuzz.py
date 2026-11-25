@@ -45,15 +45,38 @@ carry planted wrong (`-DFUZZ_PLANT`), and that function, alone, has to be
 reported. `carry_chain_adders.c` itself goes through the same
 configurations.
 
-A run in CI is eight programs through seven configurations. `--full` adds
-the other seven, `--seeds`/`--start` choose the programs, `--keep` saves
-the source of whatever differs and `--dump` prints one program.
+With `--limbs` a program is eight limb loops and nothing else, as the
+libraries write them and as `limb_unroll` splits them into four limbs a
+trip and a remainder: one adder a trip over up to 24 limbs; the counter a
+`long`, an `int` or unsigned; counted up to `n` with `<` or `!=`, down to
+nothing, by `while (m)`, `do ... while (--m)`, `do ... while (m-- != 1)` or
+`while (n-- > 0)`, from a start that is not zero and may be behind the
+limit, to a constant limit; through an index, through stepped pointers, or
+both; the counter, the pointers and the last sum read behind the loop.
+Every other loop is plain -- an adder the optimizer knows and nothing else
+in the trip, which is the loop the split is for. The rest are any spelling
+at all, now and then with a sum of the limbs, a call or an edited carry in
+the trip, which the split has to leave alone. These programs go through
+the split switched off as well, and the gate proves that they are what
+they are meant to be: at -O2 at least `MUST_SPLIT` of the 64 loops of the
+run in CI are split (four `adc`/`sbb` in a row with `limb_unroll` and not
+without it). `--census` lists every loop of the seeds with what it is made
+of and whether it is split.
+
+A run in CI is eight programs through seven configurations, and eight
+programs of limb loops through eight. `--full` adds the other
+configurations, `--seeds`/`--start` choose the programs, `--keep` saves the
+source of whatever differs and `--dump` prints one program.
 
 The eight are seeds 9 to 16, chosen by breaking the compiler: with the
 fold of a compare behind a store (`fold_carry_compare`) allowed to name
 memory, seeds 13 and 14 differ from GCC; with the registers it names
 allowed to be written in between, seeds 10 and 16 do. A change to the
-generator changes what a seed is; choose the window again then.
+generator changes what a seed is; choose the window again then. The limb
+loops are drawn from a stream of their own (the programs without them are
+what they were before there were any), and their window is seeds 9 to 16
+too: 26 of its 64 loops are split, in each of the ten spellings of a loop
+that the pass takes.
 """
 
 from __future__ import annotations
@@ -62,6 +85,7 @@ import argparse
 import concurrent.futures
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -110,19 +134,48 @@ CONSTANTS = {
 }
 
 
+# Limb loops in a program of `--limbs`: every other one plain, the adder
+# one of `ADDERS` and nothing else in the trip.
+LIMB_LOOPS = 8
+# The spellings of `Program.limb` that are a full adder to the optimizer (3
+# and 8 test the carry coming in, 9 counts carries).
+ADDERS = (0, 1, 2, 4, 5, 6, 7)
+# How many of the 64 limb loops of the run in CI (`--limbs`, seeds
+# `LIMBS_FROM` and the seven behind it) `limb_unroll` splits at the least:
+# what it splits today (`--limbs --census` says which; of the 640 loops of
+# seeds 1 to 80 it is 235). The others are loops it has to leave alone (a
+# call or a sum in the trip, a carry that is edited, a spelling that is no
+# adder, a count that is known and small) and loops it does not take yet
+# (`docs/x86-carry-chain.md` lists them). The number goes up with the pass
+# and never down. Other windows are counted and not judged.
+MUST_SPLIT = 26
+
+
 class Program:
     """One generated translation unit."""
 
-    def __init__(self, seed: int, functions: int):
+    def __init__(self, seed: int, functions: int, limb_loops: int = 0):
         self.r = random.Random(seed)
         self.count = 0
         self.functions: list[tuple[str, str, str]] = []  # (name, kind, word type)
+        self.shapes: dict[str, str] = {}  # what a limb loop is made of, for a report
+        self.spelling = self.extra = ""
         self.text = [PREAMBLE]
+        if limb_loops:
+            # The numbers of a limb loop are long enough for five trips of
+            # four limbs and a remainder.
+            self.text.append("enum { LONG = 24 };")
         for index in range(functions):
             # `f0` is a chain in every program: the negative control plants
             # its wrong carry there.
             kind = 0.0 if index == 0 else self.r.random()
             (self.chain if kind < 0.45 else self.loop if kind < 0.80 else self.accumulate)(index)
+        # The limb loops, from a stream of their own: what the functions
+        # above are does not depend on them. Every other one is plain.
+        others, self.r = self.r, random.Random(f"limbs of {seed}")
+        for index in range(functions, functions + limb_loops):
+            self.limbs(index, plain=(index - functions) % 2 == 0)
+        self.r = others
         self.text.append(self.main())
 
     def source(self) -> str:
@@ -148,15 +201,18 @@ class Program:
         it a carry, or, one time in twelve, something that does not."""
         return self.r.choice(wrong) if self.r.random() < 0.085 else self.r.choice(right)
 
-    def limb(self, word: str, sub: bool, x: str, y: str, c: str, out: str) -> list[str]:
+    def limb(self, word: str, sub: bool, x: str, y: str, c: str, out: str,
+             among: tuple[int, ...] | None = None) -> list[str]:
         """Statements that set `out` to `x + y + c` (or `x - y - c`) in some
-        spelling and `c` to what that spelling takes for the carry."""
+        spelling and `c` to what that spelling takes for the carry. `among`
+        narrows the spellings to choose from."""
         bits = 64 if word == "u64" else 32
         kind = self.pick(*CARRY_TYPES, word)
         s, t, c1, c2 = (self.fresh(stem) for stem in ("s", "t", "ca", "cb"))
         cw = f"({word}){c}"
         everything = [x, y, s, t, cw]
-        variant = self.r.randrange(10)
+        variant = self.r.randrange(10) if among is None else self.r.choice(among)
+        self.spelling = f"{'sub' if sub else 'add'} spelling {variant}"
         if variant <= 2 and not sub:
             # Sum first, carry first, or the second word and the carry first.
             first, second, third = [(x, y, cw), (x, cw, y), (y, cw, x)][variant]
@@ -319,6 +375,96 @@ class Program:
         self.text.append("\n".join(body))
         self.functions.append((name, "loop", word))
 
+    def limbs(self, index: int, plain: bool) -> None:
+        """A limb loop as a library writes it: one adder a trip and a
+        counter stepped by one, in the ways a counted loop is spelled. A
+        `plain` one is an adder the optimizer knows and nothing else in the
+        trip, which is the loop `limb_unroll` is for; the others are any
+        spelling at all, and now and then more than a limb."""
+        word = self.pick("u64", "u64", "u64", "u32")
+        kind = self.pick(word, word, word, *CARRY_TYPES)
+        sub = self.r.random() < 0.4
+        count = self.pick("long", "long", "unsigned long", "int", "unsigned", "u64", "u32")
+        name = f"f{index}"
+
+        def trip(x: str, y: str, store: str) -> str:
+            lines = self.limb(word, sub, "x", "y", "c", "t", ADDERS if plain else None)
+            # Mostly nothing else in the trip. Now and then a sum of the
+            # limbs, the last limb kept, a call, or a carry that is edited:
+            # loops the split has to leave alone, but for the limb kept.
+            extra = "" if plain else self.pick(
+                "", "", "", "", "", "", "", "", "      h += t;\n", "      last = t;\n", "      sink(c);\n",
+                "      " + self.r.choice(CARRY_EDITS) + "\n")
+            self.extra = extra
+            return (f"      {word} x = {x}, y = {y}, t;\n      " + "\n      ".join(lines) +
+                    f"\n      {store} = t;\n" + extra)
+
+        def indexed(i: str) -> str:
+            return trip(f"a[{i}]", f"b[{i}]", f"r[{i}]")
+
+        def stepped() -> str:
+            return trip("*a++", "*b++", "*r++")
+
+        behind = "0"
+        form = self.r.randrange(14)
+        if form == 0:
+            loop = f"    for ({count} i = 0; i < ({count})n; i++) {{\n" + indexed("i") + "    }"
+        elif form == 1:
+            loop = f"    for ({count} i = 0; i != ({count})n; i++) {{\n" + indexed("i") + "    }"
+        elif form == 2:
+            loop = f"    for ({count} i = ({count})n; i > 0; i--) {{\n" + indexed("n - (long)i") + "    }"
+        elif form == 3:
+            loop = f"    for ({count} i = ({count})n; i != 0; i--) {{\n" + stepped() + "    }"
+            behind = "(u64)(r - r0)"
+        elif form == 4:
+            loop = f"    {count} m = ({count})n;\n    while (m) {{\n" + stepped() + "      m--;\n    }"
+            behind = "(u64)(a - a0) * 5"
+        elif form == 5:
+            loop = (f"    if (n > 0) {{\n    {count} m = ({count})n;\n    do {{\n" + stepped() +
+                    "    } while (--m != 0);\n    }")
+        elif form == 6:
+            loop = (f"    if (n > 0) {{\n    {count} m = ({count})n;\n    do {{\n" + stepped() +
+                    "    } while (--m);\n    }")
+            behind = "(u64)(b - b0)"
+        elif form == 7:
+            loop = (f"    {count} i = 0;\n    if (n > 0) {{\n    do {{\n" + indexed("i") +
+                    f"    }} while (++i < ({count})n);\n    }}")
+            behind = "(u64)i * 7"
+        elif form == 8:
+            # From a start that is not zero, and may be behind the limit.
+            loop = (f"    {count} i = ({count})(p & 3);\n    for (; i < ({count})n; i++) {{\n" + indexed("i") +
+                    "    }")
+            behind = "(u64)i"
+        elif form == 9:
+            limit = self.r.randrange(3, 12)
+            loop = f"    for (int i = 0; i <= {limit}; i++) {{\n" + indexed("i") + "    }"
+        elif form == 10:
+            limit = self.r.randrange(3, 12)
+            loop = f"    for ({count} i = {limit}; i >= 1; i--) {{\n" + indexed(f"{limit} - (long)i") + "    }"
+        elif form == 11:
+            loop = f"    for ({count} i = 0; i < ({count})n; i++) {{\n" + trip("a[i]", "*b++", "r[i]") + "    }"
+            behind = "(u64)(b - b0)"
+        elif form == 12:
+            # The test reads the counter before it is stepped.
+            loop = (f"    if (n > 0) {{\n    {count} m = ({count})n;\n    do {{\n" + stepped() +
+                    "    } while (m-- != 1);\n    }")
+        else:
+            loop = "    while (n-- > 0) {\n" + stepped() + "    }"
+            behind = "(u64)n"
+        start = self.pick("0", "0", "0", "0", "1", "p & 1", "(p >> 63)", "q < p", self.initial(word))
+        # `f0` of a program of limb loops is where the negative control
+        # plants its wrong carry.
+        plant = ["#ifdef FUZZ_PLANT", "    c = !c;", "#endif"] if index == 0 else []
+        body = [f"static NOINLINE u64 {name}({word} *r, const {word} *a, const {word} *b, long n, u64 p, u64 q)",
+                "{", f"    {kind} c = {start}; u64 h = q; {word} last = 0;",
+                f"    const {word} *a0 = a, *b0 = b; {word} *r0 = r;", "    (void)a0; (void)b0; (void)r0;", loop,
+                *plant, f"    return (u64)c + h + last + {behind};", "}"]
+        self.text.append("\n".join(body))
+        self.functions.append((name, "limbs", word))
+        self.shapes[name] = (f"{'plain' if plain else 'any'} loop {form}, {self.spelling}, {word} limbs, "
+                             f"{count} counter, {kind} carry from "
+                             f"`{start}`" + (f", `{self.extra.strip()}`" if self.extra else ""))
+
     def column(self, word: str, i: str) -> list[str]:
         """One sum or difference kept in `acc`, and what is done with its
         carry: the forms of a multi-word accumulator."""
@@ -394,12 +540,13 @@ class Program:
     def main(self) -> str:
         lines = ["int main(void)", "{"]
         for name, kind, word in self.functions:
+            size = "LONG" if kind == "limbs" else "LIMBS"
             lines.append("    {")
-            lines.append(f"        u64 h = 0xcbf29ce484222325ull; {word} a[LIMBS], b[LIMBS], r[LIMBS + 1];")
+            lines.append(f"        u64 h = 0xcbf29ce484222325ull; {word} a[{size}], b[{size}], r[{size} + 1];")
             lines.append("        for (int trial = 0; trial < 96; trial++) {")
-            lines.append(f"            for (int i = 0; i < LIMBS; i++) {{ a[i] = ({word})rnd(); b[i] = ({word})rnd(); "
+            lines.append(f"            for (int i = 0; i < {size}; i++) {{ a[i] = ({word})rnd(); b[i] = ({word})rnd(); "
                          f"r[i] = ({word})(0x5a5a5a5a5a5a5a5aull + i); }}")
-            lines.append("            r[LIMBS] = 0x77; u64 p = rnd(), q = rnd();")
+            lines.append(f"            r[{size}] = 0x77; u64 p = rnd(), q = rnd();")
             # Now and then in place: the result over either operand, or one
             # limb ahead of the first.
             lines.append(f"            {word} *dst = trial % 5 == 3 ? a : trial % 7 == 5 ? b : "
@@ -414,10 +561,10 @@ class Program:
                 lines.append(f"            h = fold(h, {name}(dst, alias, a, b, trial % (LIMBS + 1), p, q));")
                 lines.append("            h = fold(h, apart);")
             else:
-                lines.append("            long n = trial % (dst == a + 1 ? LIMBS : LIMBS + 1);")
+                lines.append(f"            long n = trial % (dst == a + 1 ? {size} : {size} + 1);")
                 lines.append(f"            h = fold(h, {name}(dst, a, b, n, p, q));")
-            lines.append("            for (int i = 0; i < LIMBS; i++) h = fold(h, a[i] ^ ((u64)b[i] << 1));")
-            lines.append("            for (int i = 0; i <= LIMBS; i++) h = fold(h, r[i]);")
+            lines.append(f"            for (int i = 0; i < {size}; i++) h = fold(h, a[i] ^ ((u64)b[i] << 1));")
+            lines.append(f"            for (int i = 0; i <= {size}; i++) h = fold(h, r[i]);")
             lines.append("        }")
             lines.append(f'        printf("{name} %016llx %016llx\\n", h, g_sink);')
             lines.append("    }")
@@ -426,7 +573,8 @@ class Program:
 
 
 # (options, environment): every optimization level, the other code models,
-# and the carry pass, the peephole and register allocation off in turn.
+# and the carry pass, the split of the limb loops, the peephole and register
+# allocation off in turn.
 CONFIGS = [
     (("-O0",), {}), (("-O1",), {}), (("-O2",), {}), (("-O3",), {}), (("-Os",), {}), (("-Og",), {}),
     (("-O2", "-march=native"), {}), (("-O2", "-fPIC"), {}), (("-O2", "-m32"), {}),
@@ -435,8 +583,15 @@ CONFIGS = [
     (("-O2",), {"LCCC_NO_PEEPHOLE": "1"}),
     (("-O2",), {"CCC_DISABLE_PASSES": "carry"}),
     (("-O3",), {"CCC_PEEPHOLE_SKIP": "multiword"}),
+    (("-O2",), {"CCC_DISABLE_PASSES": "limb_unroll"}),
 ]
 QUICK = [0, 2, 3, 4, 8, 9, 10]
+# And for the programs of limb loops: the same, and the split off.
+QUICK_LIMBS = QUICK + [14]
+# The first of the eight seeds of a run in CI (see the header for how the
+# windows were chosen).
+ADDERS_FROM = 9
+LIMBS_FROM = 9
 
 
 def build_and_run(compiler: str, options: tuple[str, ...], env: dict[str, str], source: Path,
@@ -483,12 +638,75 @@ def check_source(what: str, source: Path, args, configs, tmp: Path, plant: bool 
     return findings
 
 
-def check_seed(seed: int, args, configs, tmp: Path, plant: bool = False) -> tuple[list[str], int]:
-    """(findings, functions compared) for one seed."""
-    program = Program(seed, args.functions)
+def carry_runs(lccc: str, source: Path, env: dict[str, str]) -> dict[str, int] | None:
+    """For each function of `source` at -O2, its longest run of `adc`/`sbb`
+    -- no label, no branch and no `setc`/`bt` between one and the next.
+    None where lccc does not compile for x86-64."""
+    built = subprocess.run([lccc, "-O2", "-S", str(source), "-o", "-"], capture_output=True, text=True,
+                           check=False, timeout=600, env={**os.environ, **env})
+    if built.returncode != 0 or "%rsp" not in built.stdout:
+        return None
+    longest: dict[str, int] = {}
+    current, run = None, 0
+    for line in built.stdout.splitlines():
+        text = line.strip()
+        head = re.match(r"^([A-Za-z_]\w*):", line)
+        if head:
+            current, run = head.group(1), 0
+        elif current is None or not text or text.startswith("#"):
+            continue
+        elif re.match(r"(adc|sbb)[bwlq]?\s", text):
+            run += 1
+            longest[current] = max(longest.get(current, 0), run)
+        elif text.endswith(":") or re.match(r"(setc|setb|setnae|bt[lq]?)\s|(j[a-z]+|call[q]?|ret[q]?)\b", text):
+            run = 0
+    return longest
+
+
+def split_loops(lccc: str, source: Path, names: list[str]) -> list[str] | None:
+    """The functions among `names` that `limb_unroll` split: four `adc`/`sbb`
+    in a row with the pass and not without it (a loop of a constant few
+    trips is unrolled whole, by another pass, and is not counted). None
+    where lccc does not compile for x86-64."""
+    with_split = carry_runs(lccc, source, {})
+    without = carry_runs(lccc, source, {"CCC_DISABLE_PASSES": "limb_unroll"})
+    if with_split is None or without is None:
+        return None
+    return [name for name in names if with_split.get(name, 0) >= 4 > without.get(name, 0)]
+
+
+def check_seed(seed: int, args, configs, tmp: Path, plant: bool = False
+               ) -> tuple[list[str], int, list[str] | None]:
+    """(findings, functions compared, which of the limb loops are split)
+    for one seed."""
+    program = Program(seed, args.functions, args.limb_loops)
     source = tmp / f"seed{seed}.c"
     source.write_text(program.source())
-    return check_source(f"seed {seed}", source, args, configs, tmp, plant), len(program.functions)
+    split = None if plant or not program.shapes else split_loops(args.lccc, source, list(program.shapes))
+    return check_source(f"seed {seed}", source, args, configs, tmp, plant), len(program.functions), split
+
+
+def census(args) -> int:
+    """Which limb loops of the seeds are split, one a line: what
+    `MUST_SPLIT` is chosen from, and where to look for the loop that ought
+    to be split and is not."""
+    loops = split = 0
+    with tempfile.TemporaryDirectory(prefix="lccc-carry-fuzz-") as tmp:
+        for seed in range(args.start, args.start + args.seeds):
+            program = Program(seed, args.functions, args.limb_loops)
+            source = Path(tmp) / f"seed{seed}.c"
+            source.write_text(program.source())
+            done = split_loops(args.lccc, source, list(program.shapes))
+            if done is None:
+                print("FAIL: lccc does not compile this for x86-64")
+                return 1
+            for name, shape in program.shapes.items():
+                print(f"seed {seed} {name} {'split' if name in done else 'whole'}: {shape}")
+            loops += len(program.shapes)
+            split += len(done)
+    print(f"carry-chain-fuzz: seeds {args.start}..{args.start + args.seeds - 1}, {split} of {loops} limb loops "
+          f"split at -O2 ({split * 100 // max(1, loops)} in a hundred)")
+    return 0
 
 
 def main() -> int:
@@ -496,43 +714,69 @@ def main() -> int:
     parser.add_argument("--lccc", default=str(ROOT / "target/fastbuild/lccc"))
     parser.add_argument("--gcc", default=None, help="the reference compiler (default: gcc-16, else gcc)")
     parser.add_argument("--seeds", type=int, default=8, help="how many programs")
-    parser.add_argument("--start", type=int, default=9, help="the first seed")
+    parser.add_argument("--start", type=int, default=None,
+                        help=f"the first seed (default: {ADDERS_FROM}, with --limbs {LIMBS_FROM})")
     parser.add_argument("--functions", type=int, default=10, help="functions in a program")
+    parser.add_argument("--limbs", action="store_true",
+                        help=f"programs of {LIMB_LOOPS} limb loops and nothing else, and not the fixture")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
-    parser.add_argument("--full", action="store_true", help="all configurations, not the quick seven")
+    parser.add_argument("--full", action="store_true", help="all configurations, not the quick ones")
     parser.add_argument("--keep", default=None, help="a directory for the sources that differ")
     parser.add_argument("--dump", type=int, default=None, help="print the program of this seed and stop")
+    parser.add_argument("--census", action="store_true",
+                        help="with --limbs: say which limb loops are split, and what each is made of, and stop")
     args = parser.parse_args()
+    args.limb_loops = 0
+    if args.limbs:
+        args.functions, args.limb_loops = 0, LIMB_LOOPS
+    if args.start is None:
+        args.start = LIMBS_FROM if args.limbs else ADDERS_FROM
     if args.dump is not None:
-        print(Program(args.dump, args.functions).source())
+        print(Program(args.dump, args.functions, args.limb_loops).source())
         return 0
+    if args.census:
+        if not args.limbs:
+            parser.error("--census is a census of limb loops: give --limbs")
+        return census(args)
     args.gcc = args.gcc or shutil.which("gcc-16") or shutil.which("gcc")
     if args.gcc is None:
         print("FAIL: no reference compiler (gcc-16 or gcc)")
         return 1
     if args.keep:
         Path(args.keep).mkdir(parents=True, exist_ok=True)
-    configs = CONFIGS if args.full else [CONFIGS[i] for i in QUICK]
+    configs = CONFIGS if args.full else [CONFIGS[i] for i in (QUICK_LIMBS if args.limbs else QUICK)]
     problems: list[str] = []
-    compared = 0
+    compared = split = 0
+    x86_64 = True
     with tempfile.TemporaryDirectory(prefix="lccc-carry-fuzz-") as tmp:
         # The gate itself first: a planted wrong carry is found, in `f0` and
         # nowhere else, with and without optimization.
-        control, _ = check_seed(args.start, args, [CONFIGS[0], CONFIGS[2]], Path(tmp), plant=True)
+        control = check_seed(args.start, args, [CONFIGS[0], CONFIGS[2]], Path(tmp), plant=True)[0]
         if len(control) != 2 or not all(found.endswith("differs from GCC in f0") for found in control):
             problems.append(f"negative control: a planted carry in f0 was reported as {control}")
-        # The adders somebody did think of, through the same configurations.
-        problems += check_source("carry_chain_adders.c", FIXTURE, args, configs, Path(tmp))
+        if not args.limbs:
+            # The adders somebody did think of, through the same configurations.
+            problems += check_source("carry_chain_adders.c", FIXTURE, args, configs, Path(tmp))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-            for findings, functions in pool.map(
+            for findings, functions, split_here in pool.map(
                     lambda seed: check_seed(seed, args, configs, Path(tmp)),
                     range(args.start, args.start + args.seeds)):
                 problems += findings
                 compared += functions
+                split += len(split_here or [])
+                x86_64 = x86_64 and (split_here is not None or not args.limbs)
+    what = f"seeds {args.start}..{args.start + args.seeds - 1}"
+    if args.limbs:
+        # The limb loops are the loops the split is for: enough of them split.
+        if x86_64 and (args.start, args.seeds) == (LIMBS_FROM, 8) and split < MUST_SPLIT:
+            problems.append(f"only {split} of {compared} limb loops are split at -O2 (four adc/sbb in a row "
+                            f"with limb_unroll and not without), at least {MUST_SPLIT} expected")
+        what += f", {compared} limb loops ({split} split)" if x86_64 else f", {compared} limb loops"
+    else:
+        what += f", {compared} functions and carry_chain_adders.c"
     for problem in problems:
         print(f"FAIL: {problem}")
-    print(f"carry-chain-fuzz: seeds {args.start}..{args.start + args.seeds - 1}, {compared} functions "
-          f"and carry_chain_adders.c, {len(configs)} configurations each against GCC, "
+    print(f"carry-chain-fuzz: {what}, {len(configs)} configurations each against GCC, "
           f"1 negative control, {'FAIL' if problems else 'PASS'}")
     return 1 if problems else 0
 

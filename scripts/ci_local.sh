@@ -3838,14 +3838,28 @@ gate "asm-registers" fast \
 
 # Multi-word adders as adc/sbb chains (docs/x86-carry-chain.md). The shape
 # gate reads the assembly of carry_chain_adders.c (adc/sbb per function, no
-# setc/bt inside a straight chain, an instruction ceiling); the fuzz gate
-# compares generated adders, and things that only look like adders, with
-# GCC 16.2's programs through seven configurations. Both carry their
-# negative control (the pass off; a planted wrong carry).
+# setc/bt inside a straight chain, an instruction ceiling, four adc/sbb in
+# a row in the main loop of a limb loop); the fuzz gate compares generated
+# adders, and things that only look like adders, with GCC 16.2's programs
+# through seven configurations, and with --limbs generated limb loops
+# through eight, where a floor is held under the share that limb_unroll
+# splits. All carry their negative control (the passes off; a planted wrong
+# carry).
 gate "carry-chain-shape" fast \
     python3 tests/regression/check_carry_chain_shape.py --lccc target/fastbuild/lccc
+gate "carry-chain-fuzz-limbs" fast \
+    python3 tests/regression/check_carry_chain_fuzz.py --limbs --lccc target/fastbuild/lccc --gcc gcc-16
 gate "carry-chain-fuzz" fast \
     python3 tests/regression/check_carry_chain_fuzz.py --lccc target/fastbuild/lccc --gcc gcc-16
+
+# What a loop carries has a register: the state of zstd_count's generator
+# round its query loop (the recurrence floor does not take a value that a
+# copy carries round a loop), and both phis of csv_field_sum's digit loop
+# share theirs with what is copied back (a temporary in a phi's register
+# takes the one the back-edge source leaves). The matchers first refuse
+# the code that had the two defects.
+gate "loop-carried-homes" fast \
+    python3 tests/regression/check_loop_carried_homes.py --lccc target/fastbuild/lccc
 
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
