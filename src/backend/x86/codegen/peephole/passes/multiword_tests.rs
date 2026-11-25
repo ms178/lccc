@@ -1391,3 +1391,51 @@ fn a_carry_out_that_cannot_move_keeps_its_scratch_byte() {
     );
     not_widened("    adcq %rdx, %rax\n    setc %cl\n    ret");
 }
+
+#[test]
+fn a_sum_stored_before_its_carry_is_read_keeps_the_flag() {
+    // `c[0] += lo; hi += c[0] < lo; c[1] += hi; c[2] += c[1] < hi`: the
+    // store of each sum stands between the addition and the compare.
+    let out = folded(
+        "    movq (%rsp), %r8\n    addq %rsi, %r8\n    movq %r8, (%rsp)\n    cmpq %rsi, %r8\n    \
+         adcq $0, %rdx\n    movq 8(%rsp), %r10\n    addq %rdx, %r10\n    movq %r10, 8(%rsp)\n    \
+         cmpq %rdx, %r10\n    movq 16(%rsp), %rdx\n    adcq $0, %rdx\n    movq %rdx, 16(%rsp)\n    ret",
+        &[],
+    );
+    assert!(!out.contains("cmpq"), "{out}");
+    // A borrow: `d = a - x` stored, then `a < x`.
+    let out = folded(
+        "    movq %r9, %r8\n    subq %rsi, %r8\n    movq %r8, (%rsp)\n    cmpq %rsi, %r9\n    \
+         sbbq $0, %rdx\n    movq %rdx, %rax\n    ret",
+        &[],
+    );
+    assert!(!out.contains("cmpq"), "{out}");
+    // The other addend, which the sum's register held before the addition.
+    let out = folded(
+        "    movq %r9, %r8\n    addq (%rdi), %r8\n    movq %r8, (%rdi)\n    cmpq %r9, %r8\n    \
+         adcq $0, %rdx\n    movq %rdx, %rax\n    ret",
+        &[],
+    );
+    assert!(!out.contains("cmpq"), "{out}");
+
+    // An addend written in between is not the addend any more.
+    unchanged(
+        "    addq %rsi, %r8\n    movq (%rsp), %rsi\n    cmpq %rsi, %r8\n    adcq $0, %rdx\n    \
+         movq %rdx, %rax\n    ret",
+    );
+    // Nor is the sum.
+    unchanged(
+        "    addq %rsi, %r8\n    movq (%rsp), %r8\n    cmpq %rsi, %r8\n    adcq $0, %rdx\n    \
+         movq %rdx, %rax\n    ret",
+    );
+    // An addend in memory may be what the store in between wrote.
+    unchanged(
+        "    addq (%rdi), %r8\n    movq %r8, (%rdi)\n    cmpq (%rdi), %r8\n    adcq $0, %rdx\n    \
+         movq %rdx, %rax\n    ret",
+    );
+    // Something else wrote the flags in between.
+    unchanged(
+        "    addq %rsi, %r8\n    movq %r8, (%rsp)\n    subq $1, %r11\n    movq %r11, 8(%rsp)\n    \
+         cmpq %rsi, %r8\n    adcq $0, %rdx\n    movq %rdx, %rax\n    ret",
+    );
+}

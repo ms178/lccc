@@ -748,6 +748,37 @@ fn carry_is_the_only_flag_read(store: &LineStore, infos: &[LineInfo], c: usize) 
     false
 }
 
+/// The nearest line above `c` that reads or writes the flags, when only
+/// flag-neutral straight-line code that writes none of the `named`
+/// registers separates the two: what the flags at `c` would be without `c`,
+/// computed from the values the `named` registers still hold.
+fn arithmetic_above(
+    store: &LineStore,
+    infos: &[LineInfo],
+    c: usize,
+    named: &[Option<RegId>],
+) -> Option<usize> {
+    let mut p = c;
+    loop {
+        p = prev_real(store, infos, p)?;
+        let info = infos[p];
+        if info.is_barrier() || info.pinned {
+            return None;
+        }
+        let t = info.trimmed(store.get(p));
+        if flags_effect(t) != FlagsEffect::Neutral {
+            return Some(p);
+        }
+        if named
+            .iter()
+            .flatten()
+            .any(|&fam| writes_family(&info, t, fam))
+        {
+            return None;
+        }
+    }
+}
+
 /// Remove a compare that recomputes the carry or borrow of the arithmetic
 /// just before it, turning an `lea` addition back into the `add` that sets
 /// the flag.  `cmp R, L` sets CF to `L <u R`; with `s' = s + x` and
@@ -765,6 +796,13 @@ fn carry_is_the_only_flag_read(store: &LineStore, infos: &[LineInfo], c: usize) 
 /// difference borrows exactly when the minuend is below the subtrahend.
 /// The compare read its operands a second time; a deleted compare of a
 /// memory operand therefore removes a repeated read, never the only one.
+///
+/// The arithmetic need not be the line above: the sum is usually stored
+/// first (`c[0] += lo; hi += c[0] < lo` is `add; mov s, (m); cmp`).
+/// Flag-neutral lines that write neither register the compare names may
+/// stand between ([`arithmetic_above`]); the compare then names registers
+/// and immediates only, since a store in between may be to the memory it
+/// would read again.
 pub(super) fn fold_carry_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     for c in 0..store.len() {
@@ -774,8 +812,23 @@ pub(super) fn fold_carry_compare(store: &mut LineStore, infos: &mut [LineInfo]) 
         let Some((width, right, left)) = sized(infos[c].trimmed(store.get(c)), "cmp") else {
             continue;
         };
-        let Some(p) = prev_real(store, infos, c) else {
+        let Some(above) = prev_real(store, infos, c) else {
             continue;
+        };
+        // The line above, or the arithmetic that moves and stores of other
+        // registers separate from the compare.
+        let adjacent = flags_effect(infos[above].trimmed(store.get(above))) != FlagsEffect::Neutral
+            || sized(infos[above].trimmed(store.get(above)), "lea").is_some();
+        let p = if adjacent {
+            above
+        } else {
+            let named = [width.register(left), width.register(right)];
+            let registers_only =
+                named[0].is_some() && (named[1].is_some() || immediate(right).is_some());
+            match arithmetic_above(store, infos, c, &named) {
+                Some(p) if registers_only => p,
+                _ => continue,
+            }
         };
         if !rewritable(infos, &[p, c]) {
             continue;
