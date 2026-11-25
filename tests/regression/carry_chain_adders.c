@@ -1236,6 +1236,160 @@ static void compared(u64 a, u64 b, u64 x, u64 y)
     expect("cmp_sub32 borrow", o32, want_c);
 }
 
+/* ---- 9. Two words: the carry is added, not chained (`hi += lo < x`). ---- */
+
+/* GMP's longlong.h, generic C. */
+static NOINLINE void two_add_ssaaaa(u64 *sh, u64 *sl, u64 ah, u64 al, u64 bh, u64 bl)
+{
+    u64 x = al + bl;
+    *sh = ah + bh + (x < al);
+    *sl = x;
+}
+
+static NOINLINE void two_sub_ddmmss(u64 *sh, u64 *sl, u64 ah, u64 al, u64 bh, u64 bl)
+{
+    u64 x = al - bl;
+    *sh = ah - bh - (al < bl);
+    *sl = x;
+}
+
+/* A 128-bit accumulator in memory. */
+static NOINLINE void two_acc_add(u64 *hi, u64 *lo, u64 x)
+{
+    u64 l = *lo + x;
+    *hi += l < x;
+    *lo = l;
+}
+
+static NOINLINE void two_acc_sub(u64 *hi, u64 *lo, u64 x)
+{
+    u64 l = *lo;
+    *hi -= l < x;
+    *lo = l - x;
+}
+
+/* The column sum of a schoolbook product: each sum is stored before its
+ * carry is read. */
+static NOINLINE void two_acc3(u64 c[3], u64 lo, u64 hi)
+{
+    c[0] += lo;
+    hi += c[0] < lo;
+    c[1] += hi;
+    c[2] += c[1] < hi;
+}
+
+/* The store between a sum and the reading of its carry may be to the word
+ * that was added. The comparison then reads the sum itself, and is no
+ * carry: the result of the addition must not stand in for it. */
+static NOINLINE u64 two_stored_over_addend(u64 *r, const u64 *x, u64 hi)
+{
+    u64 s = r[0] + x[0];
+    r[1] = s;
+    hi += s < x[0];
+    return hi;
+}
+
+static NOINLINE u64 two_stored_over_minuend(u64 *r, const u64 *x, u64 hi)
+{
+    u64 d = x[0] - r[0];
+    r[1] = d;
+    hi -= x[0] < r[0];
+    return hi;
+}
+
+/* The same in a chain whose result goes over an operand. */
+static NOINLINE unsigned two_sum_in_place(u64 *out, const u64 *a, u64 k)
+{
+    u64 s = a[0] + k;
+    out[0] = s;
+    return s < a[0];
+}
+
+static void double_words(const u64 *a, const u64 *b)
+{
+    for (int i = 0; i + 1 < LIMBS; i++) {
+        unsigned c;
+        u64 hi, lo, want_lo, want_hi, acc[3], want[3], top = a[(i + 2) % LIMBS];
+        u64 pair[2], apart[2];
+
+        /* Apart: an addition and its carry. Over the addend: the stored
+         * sum is what is compared, and `s < s` is no carry. */
+        pair[0] = a[i];
+        pair[1] = 0;
+        apart[0] = b[i];
+        apart[1] = 0;
+        hi = two_stored_over_addend(pair, apart, top);
+        want_lo = ref_add64(a[i], b[i], 0, &c);
+        expect("two_stored_over_addend sum", pair[1], want_lo);
+        expect("two_stored_over_addend apart", hi, top + c);
+        pair[0] = a[i];
+        pair[1] = b[i];
+        hi = two_stored_over_addend(pair, pair + 1, top);
+        expect("two_stored_over_addend sum over the addend", pair[1], want_lo);
+        expect("two_stored_over_addend over the addend", hi, top);
+
+        /* A difference stored over its minuend: `d < r[0]` is whatever it
+         * is, not the borrow of `x[0] - r[0]`. */
+        pair[0] = a[i];
+        pair[1] = 0;
+        apart[0] = b[i];
+        hi = two_stored_over_minuend(pair, apart, top);
+        want_lo = ref_sub64(b[i], a[i], 0, &c);
+        expect("two_stored_over_minuend difference", pair[1], want_lo);
+        expect("two_stored_over_minuend apart", hi, top - c);
+        pair[0] = a[i];
+        pair[1] = b[i];
+        hi = two_stored_over_minuend(pair, pair + 1, top);
+        expect("two_stored_over_minuend difference over the minuend", pair[1], want_lo);
+        expect("two_stored_over_minuend over the minuend", hi, top - (want_lo < a[i]));
+
+        pair[0] = a[i];
+        want_lo = ref_add64(a[i], b[i], 0, &c);
+        expect("two_sum_in_place apart", two_sum_in_place(apart, pair, b[i]), c);
+        expect("two_sum_in_place sum", apart[0], want_lo);
+        expect("two_sum_in_place over the operand", two_sum_in_place(pair, pair, b[i]), 0);
+        expect("two_sum_in_place sum over the operand", pair[0], want_lo);
+
+        two_add_ssaaaa(&hi, &lo, a[i + 1], a[i], b[i + 1], b[i]);
+        want_lo = ref_add64(a[i], b[i], 0, &c);
+        want_hi = ref_add64(a[i + 1], b[i + 1], c, &c);
+        expect("two_add_ssaaaa low", lo, want_lo);
+        expect("two_add_ssaaaa high", hi, want_hi);
+
+        two_sub_ddmmss(&hi, &lo, a[i + 1], a[i], b[i + 1], b[i]);
+        want_lo = ref_sub64(a[i], b[i], 0, &c);
+        want_hi = ref_sub64(a[i + 1], b[i + 1], c, &c);
+        expect("two_sub_ddmmss low", lo, want_lo);
+        expect("two_sub_ddmmss high", hi, want_hi);
+
+        hi = a[i + 1];
+        lo = a[i];
+        two_acc_add(&hi, &lo, b[i]);
+        want_lo = ref_add64(a[i], b[i], 0, &c);
+        want_hi = ref_add64(a[i + 1], 0, c, &c);
+        expect("two_acc_add low", lo, want_lo);
+        expect("two_acc_add high", hi, want_hi);
+
+        hi = a[i + 1];
+        lo = a[i];
+        two_acc_sub(&hi, &lo, b[i]);
+        want_lo = ref_sub64(a[i], b[i], 0, &c);
+        want_hi = ref_sub64(a[i + 1], 0, c, &c);
+        expect("two_acc_sub low", lo, want_lo);
+        expect("two_acc_sub high", hi, want_hi);
+
+        acc[0] = a[i];
+        acc[1] = a[i + 1];
+        acc[2] = b[i + 1];
+        two_acc3(acc, b[i], top);
+        want[0] = ref_add64(a[i], b[i], 0, &c);
+        top = ref_add64(top, 0, c, &c);
+        want[1] = ref_add64(a[i + 1], top, 0, &c);
+        want[2] = ref_add64(b[i + 1], 0, c, &c);
+        expect_limbs("two_acc3", acc, want, 3);
+    }
+}
+
 /* The loops of section 8, at every length. */
 static void libraries(const u64 *a, const u64 *b)
 {
@@ -1333,6 +1487,7 @@ static void chains(void)
         expect_limbs("cmp_subn", r, want, LIMBS);
     }
     libraries(a, b);
+    double_words(a, b);
     {
         u32 a32[LIMBS], b32[LIMBS], r32[LIMBS], want32[LIMBS];
         for (int n = 0; n <= LIMBS; n++) {

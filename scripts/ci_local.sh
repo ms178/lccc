@@ -3836,6 +3836,17 @@ gate "x86-gpr-intrinsics" fast \
 gate "asm-registers" fast \
     python3 tests/regression/check_asm_registers.py --lccc target/fastbuild/lccc
 
+# Multi-word adders as adc/sbb chains (docs/x86-carry-chain.md). The shape
+# gate reads the assembly of carry_chain_adders.c (adc/sbb per function, no
+# setc/bt inside a straight chain, an instruction ceiling); the fuzz gate
+# compares generated adders, and things that only look like adders, with
+# GCC 16.2's programs through seven configurations. Both carry their
+# negative control (the pass off; a planted wrong carry).
+gate "carry-chain-shape" fast \
+    python3 tests/regression/check_carry_chain_shape.py --lccc target/fastbuild/lccc
+gate "carry-chain-fuzz" fast \
+    python3 tests/regression/check_carry_chain_fuzz.py --lccc target/fastbuild/lccc --gcc gcc-16
+
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
 # sqlite_put_varint plus a shrunk-corpus gcc differential — the golden-gate

@@ -20,9 +20,10 @@
 //! The variations are few, and all of them are matched: either addend in
 //! a comparison (`s1 <u y`, `s2 <u c`); a borrow that says the difference
 //! grew (`d1 >u x`, `d2 >u d1`); the carry added first (`(x + c) + y`,
-//! mini-gmp and OpenSSL); and the two partial carries joined by `+`, `^`
-//! or `||` instead of `|` (`cy = s < a; ...; cy += t < s`, and what
-//! `(unsigned __int128)a + b + c` is split into).
+//! mini-gmp and OpenSSL); the subtrahends added up first (`x - (y + c)`
+//! with `(y + c) <u c` and `x <u (y + c)`, mini-gmp); and the two partial
+//! carries joined by `+`, `^` or `||` instead of `|` (`cy = s < a; ...;
+//! cy += t < s`, and what `(unsigned __int128)a + b + c` is split into).
 //!
 //! The pass rewrites the five instructions into the two halves of
 //! [`IntrinsicOp::Carry`], adjacent and on the same operands:
@@ -74,9 +75,13 @@
 //!   (transitively) at the same place or earlier, so every definition still
 //!   dominates its uses. `out` moves up to behind the word, which dominated
 //!   the `|` -- by construction where the `|` reads a comparison of the word
-//!   (every addition, and the subtraction spelled `d2 >u d1`), and checked
-//!   where it does not (the subtraction spelled `d1 <u c`: the word must sit
-//!   earlier in the block of the `|`).
+//!   (every addition, and the subtraction spelled `d2 >u d1`). Where it
+//!   reads none (`d1 <u c`, and `x <u (y + c)`), the word is looked for in
+//!   the block of the `|` ([`word_near`]): one ahead of the `|` takes the
+//!   pair, and one behind it is computed where the `|` was, under a new
+//!   name, so that either way both halves stand ahead of every reader of
+//!   the word and of the `|`. The word is arithmetic on values and reads no
+//!   memory, so where in the block it is computed changes nothing else.
 //! * A carry out is 0 or 1 in a whole register, as a comparison's result
 //!   is, and takes the place of the `|` wherever that is read at 32 bits or
 //!   fewer; a 64-bit `|` becomes a conversion of it.

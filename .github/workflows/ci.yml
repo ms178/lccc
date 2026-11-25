@@ -3121,6 +3121,11 @@ jobs:
         # against GCC 16.2 (x86-64 and i686, -O0 to -Os, with and without
         # PIC), shared libraries linked with -z text, GCC's refusals.
         python3 tests/regression/check_asm_registers.py --lccc target/fastbuild/lccc
+        # Multi-word adders as adc/sbb chains (docs/x86-carry-chain.md):
+        # the assembly of carry_chain_adders.c, function by function -- how
+        # many adc/sbb, no setc/bt inside a straight chain, no more
+        # instructions than today. With the pass off the pins must break.
+        python3 tests/regression/check_carry_chain_shape.py --lccc target/fastbuild/lccc
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.
@@ -3320,6 +3325,12 @@ jobs:
         # file: a second fixed 4 GiB image exhausts a 21 GiB sandbox, and a
         # fixed /tmp swapon diagnostic cannot be written by a non-root caller.
         python3 tests/regression/check_agent_swap_reuse.py
+        # Random multi-word adders, and random things that only look like
+        # them: eight generated programs and carry_chain_adders.c, each
+        # through seven configurations (-O0 to -Os, -m32, the IR verifier,
+        # no register allocation), every one printing what GCC 16.2's
+        # program prints. One planted wrong carry is the negative control.
+        python3 tests/regression/check_carry_chain_fuzz.py --lccc target/fastbuild/lccc --gcc gcc-16
         python3 scripts/edg_corpus_mine.py selftest
         # IPA-RA must not summarize weak/interposable bodies: a strong
         # override linked from another TU clobbers %r8-%r11 (was 55, not 79)
