@@ -87,6 +87,39 @@ through `%rax` instead of clobbering its dead source. Static size is the
 wrong metric for a hot-path/cold-path split, same charter as the stencil5
 and chacha20 notes above.
 
+Baseline notes (2026-11-25): `--update-baseline` for three changes to the
+register allocator that go together: a value that is dead while a loop
+runs is no span of that loop (`LiveRange::alive_within`); the recurrence
+floor does not take a value that a copy carries round a loop
+(`carried_round_loop`); a temporary in a phi's register may take the
+register the back-edge source leaves (`rehome_phi_blockers`). Two
+workloads re-pin: zstd_count 118→121 insns / 5→6 pushes, sqlite_varint
+262→263 insns / 7→6 pushes. (zlib_ng_adler32 is recorded at the 209 insns /
+43 moves it already had; these changes do not touch it.)
+zstd_count is the trade the 2026-11-17 note asks for, at par: the limit of
+the eight-byte compare loop is in a register now (`cmpq 0(%rsp), %r9` →
+`cmpq %rsi, %r9`), and what `main` keeps in the frame instead is the masked
+offset of the query, written once and read once a query; the register is a
+sixth callee-saved one, hence the push. Cachegrind: 99,860,199 →
+101,957,365 instructions (+2.10 %: one a query, the offset's four-byte slot
+does not fold into the 64-bit `xor` that reads it), 9,604,917 → 9,604,886
+data references. Wall clock against the old allocation, interleaved runs,
+median / minimum of four sittings of 201 or 301 rounds: 0.9951 / 0.9853,
+1.0010 / 0.9913, 1.0032 / 0.9998, 1.0065 / 1.0108. The first of the three
+changes alone is what must not land: the floor then gives the match
+pointer the register of `state = state * 1664525 + 1013904223`, the slot
+sits between one query and the next, and three sittings read 1.0393 to
+1.0624 / 1.0717 to 1.0737.
+sqlite_varint: 354,875,458 → 354,059,864 instructions (−0.23 %), wall clock
+1.0039 / 0.9982. The other programs of tests/benchmark/programs that these
+changes touch, one sitting of 41 or 201 rounds each: glibc_dl_hash 0.9491 /
+0.9595, linux_rbtree 0.9710 / 0.9816, zlib_ng_huffman_heap 0.9858 / 0.9819,
+gzip_longest_match 1.0016 / 0.9941, expat_utf8_content 1.0081 / 0.9990,
+linux_xxhash64 1.0009 / 1.0058, lz4_compress 1.0024 / 1.0074,
+csv_field_sum 1.0014 / 1.0075. Over the 87 programs there that compile
+alone: 15,972 → 15,943 instructions, 424 → 420 pushes, 1,017 → 1,006 stack
+operands, 1,552 → 1,541 register moves.
+
 Usage:
     python3 ci-codegen-gate.py --lccc target/fastbuild/lccc
     python3 ci-codegen-gate.py --lccc ... --update-baseline

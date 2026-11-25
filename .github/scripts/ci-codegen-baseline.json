@@ -8,10 +8,10 @@
     "fma": 0
   },
   "zlib_ng_adler32": {
-    "insns": 214,
+    "insns": 209,
     "stackmem": 0,
     "pushes": 6,
-    "moves": 46,
+    "moves": 43,
     "ymm": 0,
     "fma": 0
   },
@@ -24,9 +24,9 @@
     "fma": 0
   },
   "sqlite_varint": {
-    "insns": 262,
+    "insns": 263,
     "stackmem": 7,
-    "pushes": 7,
+    "pushes": 6,
     "moves": 29,
     "ymm": 0,
     "fma": 0
@@ -48,9 +48,9 @@
     "fma": 0
   },
   "zstd_count": {
-    "insns": 118,
+    "insns": 121,
     "stackmem": 2,
-    "pushes": 5,
+    "pushes": 6,
     "moves": 20,
     "ymm": 0,
     "fma": 0
@@ -72,10 +72,10 @@
     "fma": 0
   },
   "portable_bit_counts": {
-    "insns": 231,
+    "insns": 205,
     "stackmem": 6,
     "pushes": 8,
-    "moves": 71,
+    "moves": 63,
     "ymm": 0,
     "fma": 0
   },

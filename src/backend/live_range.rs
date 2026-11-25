@@ -210,6 +210,20 @@ pub struct LiveRange {
     /// construction {phi} ∪ {backedge sources}, so the phi's incoming
     /// operands are always members and say nothing about recurrence.
     pub span_recurrence: bool,
+    /// True for a value that a copy carries round a loop: a value written
+    /// by several copies (what phi elimination makes of a phi) and every
+    /// value on a chain of definitions from it back to one of those copies
+    /// (`state = state * a + c`: the phi, the product and the sum). Its
+    /// slot would sit between one iteration and the next.
+    ///
+    /// `span_recurrence` says as much of a web, but only of one that spans
+    /// a loop, and it does not see the source of a latch copy that kept a
+    /// home of its own -- the phi coalescing took no candidate from it, so
+    /// it is in no web and in no back-edge pair. This flag is set for every
+    /// range of a function with a loop and is read by the recurrence floor
+    /// alone, which must not serve one carried chain with the register of
+    /// another (see `find_recurrence_floor_victim`).
+    pub carried_round_loop: bool,
     /// Set by `mark_loop_spanning` once it has measured this range's
     /// in-loop use profile. Hand-built ranges (tests) leave it false,
     /// which the invariant-demotion gate reads as "not analyzed" and
@@ -269,10 +283,18 @@ impl LiveRange {
             span_in_loop_uses: 0,
             span_exposed_uses: 0,
             span_recurrence: false,
+            carried_round_loop: false,
             span_marked: false,
             cost_boost: 1,
             occupancy_len: 0,
         }
+    }
+
+    /// Whether the value is alive at some point of the closed interval
+    /// `[from, to]`. A range without hole data is its envelope, which the
+    /// caller has tested: it is alive throughout.
+    pub(crate) fn alive_within(&self, from: u32, to: u32) -> bool {
+        self.segments.is_empty() || self.segments.iter().any(|&(s, e)| s <= to && e >= from)
     }
 
     /// Install hole-aware live coverage (sorted, disjoint, CLOSED point
@@ -817,6 +839,7 @@ pub(crate) fn mark_loop_spanning_with_copy_policy(
             }
         }
     }
+    let carried_round_loop = values_carried_round_loop(func, &def_uses, &def_is_phi);
     // (point -> vids consumed there as the folding-friendly address or
     // base of the access itself). Every other use context — ALU source,
     // compare operand, select arm, call argument, phi materialization —
@@ -1075,7 +1098,18 @@ pub(crate) fn mark_loop_spanning_with_copy_policy(
         let mut max_extent_len = 0u32;
         let mut in_loop_use = false;
         for (((header_start, latch_end), peak), b) in loop_extents.iter().zip(&peaks).zip(&bars) {
-            if range.start <= *header_start && range.end >= *latch_end {
+            // The envelope covers the loop, and the value is alive somewhere
+            // in it. A value that is alive only on a way round the loop --
+            // defined ahead of it and read behind it in the layout, the loop
+            // on no path between the two -- holds no register while the
+            // loop runs: the scan tests interference on the segments, so
+            // the loop's own values take its register for the length of
+            // the hole. Counted as a span it was demoted before anything
+            // else (it has no read in the loop).
+            if range.start <= *header_start
+                && range.end >= *latch_end
+                && range.alive_within(*header_start, *latch_end)
+            {
                 spans = true;
                 reserve = reserve.max(*peak);
                 bar = bar.max(*b);
@@ -1193,13 +1227,8 @@ pub(crate) fn mark_loop_spanning_with_copy_policy(
             // recurrence, whether or not the source was coalesced into
             // it.
             if !recurrence {
-                // The dependency walk below is bounded: a recurrence is a
-                // CYCLE, and every cycle this pass can act on is short. Three
-                // hops is one more than the longest faithful chain measured
-                // (`if`-converted body: phi -> Select -> BinOp -> phi); the
-                // bound keeps a pathological acyclic fan-in from making the
-                // flag fire on work that never loops back.
-                const RECURRENCE_CHAIN_DEPTH: usize = 3;
+                // The dependency walk below is bounded by
+                // `RECURRENCE_CHAIN_DEPTH`.
                 // The visited set is per query, not shared across the pairs:
                 // the walk is breadth-first and stops at the depth bound, so
                 // a node first reached at the bound never explores its
@@ -1240,6 +1269,11 @@ pub(crate) fn mark_loop_spanning_with_copy_policy(
             }
         }
         range.fold_only_uses = fold_only.contains(&range.value_id);
+        // A web is carried when one of its members is: they share the home.
+        range.carried_round_loop = carried_round_loop.contains(&range.value_id)
+            || members_of
+                .get(&range.value_id)
+                .is_some_and(|ms| ms.iter().any(|m| carried_round_loop.contains(m)));
         if spans {
             range.spans_loop = true;
             range.span_in_loop_uses = in_loop_uses;
@@ -1252,6 +1286,92 @@ pub(crate) fn mark_loop_spanning_with_copy_policy(
             range.span_has_in_loop_use = in_loop_use;
         }
     }
+}
+
+/// The longest chain of definitions from a phi back to the value copied
+/// into it that is taken for one recurrence. A recurrence is a CYCLE, and
+/// every cycle the allocator can act on is short. Three hops is one more
+/// than the longest faithful chain measured (`if`-converted body: phi ->
+/// Select -> BinOp -> phi); the bound keeps a pathological acyclic fan-in
+/// from making the flag fire on work that never loops back.
+const RECURRENCE_CHAIN_DEPTH: usize = 3;
+
+/// The values a copy carries round a loop (`LiveRange::carried_round_loop`).
+///
+/// After phi elimination a phi is a value with several `Copy` definitions,
+/// one in each predecessor. A copy whose source is computed from that value
+/// closes a cycle, and there is no way from a value back to itself but
+/// round a loop: the phi, the source and every definition between them are
+/// carried from one iteration to the next. `def_uses` gives the operands of
+/// a definition and `def_is_phi` the phis that are still instructions; the
+/// walk does not go through another phi (that is another chain) and is
+/// `RECURRENCE_CHAIN_DEPTH` definitions long at most.
+fn values_carried_round_loop(
+    func: &IrFunction,
+    def_uses: &FxHashMap<u32, Vec<u32>>,
+    def_is_phi: &FxHashSet<u32>,
+) -> FxHashSet<u32> {
+    // What each phi takes its value from. A constant is a definition like
+    // any other and no source.
+    let mut copied_from: FxHashMap<u32, (u32, Vec<u32>)> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Copy { dest, src } = inst {
+            let (definitions, sources) = copied_from.entry(dest.0).or_default();
+            *definitions += 1;
+            if let Operand::Value(v) = src {
+                sources.push(v.0);
+            }
+        }
+    }
+    let mut phis: FxHashMap<u32, Vec<u32>> = copied_from
+        .into_iter()
+        .filter(|(_, (definitions, _))| *definitions > 1)
+        .map(|(phi, (_, sources))| (phi, sources))
+        .collect();
+    for &phi in def_is_phi {
+        phis.insert(phi, def_uses.get(&phi).cloned().unwrap_or_default());
+    }
+    // Whether a chain of at most `steps` definitions leads from `value` to
+    // a read of `phi`; every value on such a chain is recorded.
+    fn reads(
+        value: u32,
+        phi: u32,
+        steps: usize,
+        def_uses: &FxHashMap<u32, Vec<u32>>,
+        phis: &FxHashMap<u32, Vec<u32>>,
+        carried: &mut FxHashSet<u32>,
+    ) -> bool {
+        if steps == 0 || phis.contains_key(&value) {
+            return false;
+        }
+        let Some(operands) = def_uses.get(&value) else {
+            return false;
+        };
+        let mut found = false;
+        for &operand in operands {
+            found |= operand == phi || reads(operand, phi, steps - 1, def_uses, phis, carried);
+        }
+        if found {
+            carried.insert(value);
+        }
+        found
+    }
+    let mut carried: FxHashSet<u32> = FxHashSet::default();
+    for (&phi, sources) in &phis {
+        for &source in sources {
+            if reads(
+                source,
+                phi,
+                RECURRENCE_CHAIN_DEPTH,
+                def_uses,
+                &phis,
+                &mut carried,
+            ) {
+                carried.insert(phi);
+            }
+        }
+    }
+    carried
 }
 
 /// Ceiling on latency-exposed in-loop reads per pass for a span to be
@@ -2748,6 +2868,16 @@ impl LinearScanAllocator {
             if interval.range.span_marked && interval.range.span_recurrence {
                 continue;
             }
+            // Nor for one that the test above does not see: the web spans
+            // no loop that was measured, or the value is the source of a
+            // latch copy with a home of its own. zstd_count's query loop
+            // lost `state = state * 1664525 + 1013904223` here: the sum is
+            // read four times in the body, so it is no member of the phi's
+            // web, and its slot put a store and a reload between one query
+            // and the next (+5 % to +7 % wall clock, 301 paired rounds).
+            if interval.range.carried_round_loop {
+                continue;
+            }
             // ABI-hinted values are a codegen contract (see
             // select_evict_victim's hint guard for the corruption this
             // prevents).
@@ -3788,6 +3918,32 @@ mod tests {
         assert!(!flag(&ranges, 2));
         assert!(!flag(&ranges, 3));
         assert!(!flag(&ranges, 4));
+        // A hole over the whole extent: the value is alive ahead of the
+        // loop and behind it, and the loop is on no path between the two.
+        // It holds no register while the loop runs and is no span. Alive
+        // in a part of the extent, it is one.
+        let mut ranges = vec![
+            lr(1, 10, 400, vec![10, 400], 40),
+            lr(2, 10, 400, vec![10, 400], 40),
+            lr(3, 10, 400, vec![10, 400], 40),
+            lr(4, 10, 400, vec![10, 400], 40),
+        ];
+        ranges[1].set_segments(vec![(10, 49), (391, 400)]);
+        ranges[2].set_segments(vec![(10, 50), (391, 400)]);
+        ranges[3].set_segments(vec![(10, 20), (390, 400)]);
+        mark_loop_spanning(
+            &mut ranges,
+            &[(50, 390)],
+            &FxHashMap::default(),
+            &empty_fn(),
+            &FxHashMap::default(),
+            true,
+            &[],
+        );
+        assert!(flag(&ranges, 1), "no hole data: the envelope");
+        assert!(!flag(&ranges, 2), "dead from the header to the latch");
+        assert!(flag(&ranges, 3), "alive at the header");
+        assert!(flag(&ranges, 4), "alive at the latch");
         // Empty extent list marks nothing.
         let mut x = vec![lr(9, 0, 100, vec![1], 1)];
         mark_loop_spanning(
@@ -4661,6 +4817,205 @@ mod tests {
         assert!(alloc.spill_slots.contains_key(&2));
     }
 
+    /// The floor does not take a value that a copy carries round a loop
+    /// either, marked a recurrence or not: zstd_count's `state = state *
+    /// 1664525 + 1013904223` is no member of its phi's web (the body reads
+    /// the sum four times, so it keeps a home of its own) and was the
+    /// cheapest active when the match pointer came in.
+    #[test]
+    fn recurrence_floor_never_steals_a_value_carried_round_a_loop() {
+        let scan = |carried: bool| {
+            // Two registers, both held when the recurrence arrives; the
+            // state is the cheaper of the two holders.
+            // Three exposed reads in the loop each: more than the cap at
+            // admission demotes, so both hold a register at that point.
+            let held = |id: u32, uses: Vec<u32>| {
+                let mut r = spanned(id, 0, 900, uses, 300);
+                r.span_marked = true;
+                r.span_has_in_loop_use = true;
+                r.span_in_loop_uses = 3;
+                r.span_exposed_uses = 3;
+                r
+            };
+            let mut state = held(1, vec![100, 900]);
+            state.carried_round_loop = carried;
+            let invariant = held(3, vec![100, 400, 900]);
+            let mut hot = spanned(2, 50, 850, vec![100, 300, 500, 850], 500);
+            hot.span_marked = true;
+            hot.span_recurrence = true;
+            hot.span_has_in_loop_use = true;
+            let cfg = RaConfig {
+                loop_span_reserve: 1,
+                ..RaConfig::default()
+            };
+            let mut alloc = LinearScanAllocator::new_with_config(
+                vec![state, invariant, hot],
+                vec![PhysReg(1), PhysReg(2)],
+                &std::sync::Arc::new(cfg),
+            );
+            alloc.run();
+            alloc
+        };
+        // The cheapest active is the victim...
+        let plain = scan(false);
+        assert!(
+            plain.assignments.contains_key(&2),
+            "{:?}",
+            plain.assignments
+        );
+        assert!(
+            plain.spill_slots.contains_key(&1),
+            "{:?}",
+            plain.spill_slots
+        );
+        assert!(plain.assignments.contains_key(&3));
+        // ...unless it is carried: then the next one is.
+        let carried = scan(true);
+        assert!(
+            carried.assignments.contains_key(&2),
+            "{:?}",
+            carried.assignments
+        );
+        assert!(
+            carried.assignments.contains_key(&1),
+            "the state keeps its register: {:?}",
+            carried.assignments
+        );
+        assert!(
+            carried.spill_slots.contains_key(&3),
+            "{:?}",
+            carried.spill_slots
+        );
+    }
+
+    /// What `carried_round_loop` is set for: the phi (a value with several
+    /// copies), the value copied back into it and the definitions between
+    /// the two; three definitions at most, and not through another phi.
+    #[test]
+    fn mark_loop_spanning_finds_what_a_copy_carries_round_a_loop() {
+        use crate::ir::constants::IrConst;
+        use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+        let copy = |dest, src| Instruction::Copy {
+            dest: Value(dest),
+            src,
+        };
+        let val = |v| Operand::Value(Value(v));
+        let num = |n| Operand::Const(IrConst::I32(n));
+        let op = |dest, op, lhs, rhs| Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty: IrType::I32,
+        };
+        let block = |label, instructions, terminator| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+            source_inline_ids: Vec::new(),
+        };
+        let mut f = empty_fn();
+        f.blocks = vec![
+            block(
+                0,
+                vec![
+                    copy(1, num(1)),  // state
+                    copy(5, num(0)),  // a phi that is fed, not carried
+                    copy(10, num(0)), // a chain of three definitions
+                    copy(20, num(0)), // and one of four
+                    copy(30, num(0)), // two phis that feed each other
+                    copy(31, num(0)),
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    op(2, IrBinOp::Mul, val(1), num(1664525)),
+                    op(3, IrBinOp::Add, val(2), num(1013904223)),
+                    // A reader of the sum that is on no way back.
+                    op(4, IrBinOp::And, val(3), num(127)),
+                    op(11, IrBinOp::Add, val(10), num(1)),
+                    op(12, IrBinOp::Add, val(11), num(1)),
+                    op(13, IrBinOp::Add, val(12), num(1)),
+                    op(21, IrBinOp::Add, val(20), num(1)),
+                    op(22, IrBinOp::Add, val(21), num(1)),
+                    op(23, IrBinOp::Add, val(22), num(1)),
+                    op(24, IrBinOp::Add, val(23), num(1)),
+                    op(32, IrBinOp::Add, val(31), num(1)),
+                    copy(1, val(3)),
+                    copy(5, val(4)),
+                    copy(10, val(13)),
+                    copy(20, val(24)),
+                    copy(31, val(30)),
+                    copy(30, val(32)),
+                ],
+                Terminator::CondBranch {
+                    cond: val(4),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(2, vec![], Terminator::Return(Some(val(5)))),
+        ];
+        let ids = [
+            1, 2, 3, 4, 5, 10, 11, 12, 13, 20, 21, 22, 23, 24, 30, 31, 32,
+        ];
+        // No range is a span here (the extent is behind all of them): the
+        // flag does not depend on it.
+        let mut ranges: Vec<LiveRange> = ids.iter().map(|&v| lr(v, 0, 30, vec![30], 1)).collect();
+        mark_loop_spanning(
+            &mut ranges,
+            &[(40, 50)],
+            &FxHashMap::default(),
+            &f,
+            &FxHashMap::default(),
+            true,
+            &[],
+        );
+        let carried: Vec<u32> = ranges
+            .iter()
+            .filter(|r| r.carried_round_loop)
+            .map(|r| r.value_id)
+            .collect();
+        assert_eq!(
+            carried,
+            [1, 2, 3, 10, 11, 12, 13],
+            "the state and its two definitions, the chain of three and its phi; \
+             not the reader, the fed phi, the chain of four or the two phis"
+        );
+        assert!(ranges.iter().all(|r| !r.spans_loop));
+
+        // A web is carried with any of its members: 3 is merged into 50.
+        let mut web = vec![lr(50, 0, 30, vec![30], 1), lr(51, 0, 30, vec![30], 1)];
+        let member_of: FxHashMap<u32, u32> = [(3, 50), (4, 51)].into_iter().collect();
+        mark_loop_spanning(
+            &mut web,
+            &[(40, 50)],
+            &member_of,
+            &f,
+            &FxHashMap::default(),
+            true,
+            &[],
+        );
+        assert!(web[0].carried_round_loop, "a member of 50 is carried");
+        assert!(!web[1].carried_round_loop, "no member of 51 is");
+
+        // A function without a loop has nothing to carry and is not looked at.
+        let mut none = vec![lr(1, 0, 30, vec![30], 1)];
+        mark_loop_spanning(
+            &mut none,
+            &[],
+            &FxHashMap::default(),
+            &f,
+            &FxHashMap::default(),
+            true,
+            &[],
+        );
+        assert!(!none[0].carried_round_loop);
+    }
+
     /// RA-RECURRENCE-KEEP: ordinary eviction never whole-value demotes a
     /// resident loop recurrence for a PHANTOM conflict priced at ZERO —
     /// i.e. when the recurrence's position-relative remaining spill cost
@@ -5003,6 +5358,7 @@ mod tests {
             span_in_loop_uses: 0,
             span_exposed_uses: 0,
             span_recurrence: false,
+            carried_round_loop: false,
             span_marked: false,
             cost_boost: 1,
             occupancy_len: 0,
