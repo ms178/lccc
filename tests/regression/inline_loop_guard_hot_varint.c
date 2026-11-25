@@ -4,13 +4,18 @@
  * standalone harness exercises every 1..9 byte length and checks two loop
  * traversals against an independent recurrence on the original values.
  *
- * Both hot_forward and hot_backward are externally visible, yet each has
- * exactly one call from this TU's main. A caller's one visible call does NOT
- * prove it runs once: another TU can call it arbitrarily often. The guard
- * tier must inline both decoder sites atomically at -O2, leave the decoder
- * outlined under -Os, and preserve the result at every optimization level.
+ * By default, hot_forward and hot_backward are exported yet each has one
+ * call from this TU's main. With LOOP_GUARD_STATIC_WRAPPERS, they are static
+ * and each has one call from an exported service instead. Neither one-call
+ * shape proves a caller is cold: other TUs may invoke an exported service
+ * repeatedly. The guard tier must clone both decoder sites at -O2, keep the
+ * decoder outlined at -Os, and preserve the result at every optimization
+ * level. The structural companion builds and checks both shapes.
  */
+/* A libc-free mode also permits executable checks on cross targets. */
+#ifndef LOOP_GUARD_FREESTANDING
 #include <stdio.h>
+#endif
 
 #define SLOT_2_0 0x001fc07fU
 #define SLOT_4_2_0 0xf01fc07fU
@@ -177,7 +182,13 @@ static const u64 values[] = {
 #define COUNT (sizeof(values) / sizeof(values[0]))
 #define REPS 99U
 
-__attribute__((noinline)) u64 hot_forward(const u8 encoded[][9]) {
+#ifdef LOOP_GUARD_STATIC_WRAPPERS
+#define HOT_LINKAGE static
+#else
+#define HOT_LINKAGE
+#endif
+
+HOT_LINKAGE __attribute__((noinline)) u64 hot_forward(const u8 encoded[][9]) {
     u64 sum = 0;
     for (unsigned int pass = 0; pass < REPS; pass++) {
         for (unsigned int i = 0; i < COUNT; i++) {
@@ -189,7 +200,7 @@ __attribute__((noinline)) u64 hot_forward(const u8 encoded[][9]) {
     return sum;
 }
 
-__attribute__((noinline)) u64 hot_backward(const u8 encoded[][9]) {
+HOT_LINKAGE __attribute__((noinline)) u64 hot_backward(const u8 encoded[][9]) {
     u64 sum = 0;
     for (unsigned int pass = 0; pass < REPS; pass++) {
         for (unsigned int i = COUNT; i != 0; i--) {
@@ -201,6 +212,21 @@ __attribute__((noinline)) u64 hot_backward(const u8 encoded[][9]) {
     }
     return sum;
 }
+
+#ifdef LOOP_GUARD_STATIC_WRAPPERS
+/* Each helper is static but reached through an exported root, not just main. */
+__attribute__((noinline)) u64 service_forward(const u8 encoded[][9]) {
+    return hot_forward(encoded);
+}
+__attribute__((noinline)) u64 service_backward(const u8 encoded[][9]) {
+    return hot_backward(encoded);
+}
+#define RUN_FORWARD service_forward
+#define RUN_BACKWARD service_backward
+#else
+#define RUN_FORWARD hot_forward
+#define RUN_BACKWARD hot_backward
+#endif
 
 int main(void) {
     u8 encoded[COUNT][9] = {{0}};
@@ -223,13 +249,17 @@ int main(void) {
             expected_backward = (expected_backward << 3) | (expected_backward >> 61);
         }
     }
-    const u64 forward = hot_forward((const u8 (*)[9])encoded);
-    const u64 backward = hot_backward((const u8 (*)[9])encoded);
+    const u64 forward = RUN_FORWARD((const u8 (*)[9])encoded);
+    const u64 backward = RUN_BACKWARD((const u8 (*)[9])encoded);
     if (forward != expected_forward || backward != expected_backward) {
+#ifndef LOOP_GUARD_FREESTANDING
         printf("fail: %llx/%llx %llx/%llx\n", forward, expected_forward,
                backward, expected_backward);
+#endif
         return 1;
     }
+#ifndef LOOP_GUARD_FREESTANDING
     printf("%llx %llx\n", forward, backward);
+#endif
     return 0;
 }

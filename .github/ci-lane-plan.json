@@ -416,7 +416,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 573.64,
+      "predicted_gate_seconds": 577.53,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -645,7 +645,7 @@
           "name": "bash tests/regression/check_const_trip_loop_inline.sh"
         },
         {
-          "measured_s": 0.25,
+          "measured_s": 4.14,
           "name": "bash tests/regression/check_inline_loop_guard_hot_varint.sh"
         },
         {
