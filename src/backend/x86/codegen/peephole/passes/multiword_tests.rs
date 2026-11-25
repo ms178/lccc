@@ -32,7 +32,8 @@ fn run_folds(body: &str) -> (bool, String) {
     (changed, out)
 }
 
-/// Sixteen registers, 8-byte memory cells keyed by address, and CF.
+/// Sixteen registers, 8-byte memory cells keyed by address (a 32-bit store
+/// writes the low half of its cell), and CF.
 #[derive(Clone, PartialEq, Debug)]
 struct Cpu {
     regs: [u64; 16],
@@ -117,8 +118,15 @@ impl Cpu {
                 }
             }
             Place::Mem(address) => {
-                assert!(size == Size::Q, "model stores whole cells only");
-                self.memory.insert(*address, value);
+                let cell = match size {
+                    Size::Q => value,
+                    Size::L => {
+                        let high = self.read(&Place::Mem(*address), Size::Q) & !0xffff_ffff;
+                        high | (value & 0xffff_ffff)
+                    }
+                    Size::B => panic!("model stores no bytes"),
+                };
+                self.memory.insert(*address, cell);
             }
             Place::Imm(_) => panic!("write to an immediate"),
         }
@@ -232,8 +240,13 @@ impl Cpu {
         }
     }
 
+    /// Every line of `body` that is an instruction; a directive is none.
     fn run(mut self, body: &str) -> Self {
-        for line in body.lines().map(str::trim_ascii).filter(|l| !l.is_empty()) {
+        for line in body
+            .lines()
+            .map(str::trim_ascii)
+            .filter(|l| !l.is_empty() && !l.starts_with('.'))
+        {
             self.step(line);
         }
         self
@@ -1500,4 +1513,293 @@ fn a_second_destination_between_the_lines_is_a_write() {
     unchanged(&chain("    xchg %cl, (%rdi)\n", ""));
     // Two other registers swapped behind the extension change neither.
     folded(&chain("", "    xchg %rbx, %r11\n"), &["%rcx", "%r10"]);
+}
+
+// ── A carry parked in the frame ──────────────────────────────────────────
+
+/// Two links of a chain whose carry found no register: the first parks
+/// its carry out in the frame (`park`), the second tests the slot
+/// (`test`); `between` stands between the two.
+fn parked(first: &str, then: &str, park: &str, between: &str, test: &str) -> String {
+    format!(
+        "    movq (%rdi), %rax\n    {first} 8(%rdi), %rax\n    setc %cl\n    movq %rax, 16(%rdi)\n    \
+         movzbl %cl, %eax\n    {park}\n{between}    movq 24(%rdi), %rax\n    {test}\n    \
+         {then} 32(%rdi), %rax\n    movq %rax, 40(%rdi)\n    ret"
+    )
+}
+
+#[test]
+fn a_carry_parked_in_the_frame_is_not_put_back() {
+    let between = [
+        "",
+        // Another slot loaded, another slot stored.
+        "    movq 16(%rsp), %r8\n",
+        "    movq %r9, 24(%rsp)\n    movl %r9d, 32(%rsp)\n",
+        // A store that ends where the tested byte begins, and one that
+        // begins behind it.
+        "    movl %r9d, 4(%rsp)\n",
+        "    movq %r9, (%rsp)\n",
+        "    movq %r9, 9(%rsp)\n",
+        // Through a pointer: the limb of the trip, and `%rbp`, which is a
+        // pointer where `%rsp` is the frame's base.
+        "    movq %r9, 48(%rdi)\n    movq %r9, (%rbp)\n    movq 8(%rbp), %r8\n",
+    ];
+    for (first, then) in [("addq", "adcq"), ("subq", "sbbq")] {
+        for (park, test) in [
+            ("movl %eax, 8(%rsp)", "btl $0, 8(%rsp)"),
+            ("movq %rax, 8(%rsp)", "btl $0, 8(%rsp)"),
+            ("movq %rax, 8(%rsp)", "btq $0, 8(%rsp)"),
+            ("movl %eax, (%rsp)", "btl $0, (%rsp)"),
+        ] {
+            for between in between {
+                // The store at `(%rsp)` and the slot `(%rsp)` are one.
+                if park.ends_with(", (%rsp)") && between.contains(", (%rsp)") {
+                    continue;
+                }
+                let body = parked(first, then, park, between, test);
+                let out = folded(&body, &[]);
+                // The test is gone and nothing else: the boolean is still
+                // stored, and the slot still holds it.
+                let expected: Vec<&str> = lines(&body)
+                    .into_iter()
+                    .filter(|line| *line != test)
+                    .collect();
+                assert_eq!(lines(&out), expected, "{body}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_parked_carry_that_may_have_changed_is_tested() {
+    let chain = |between: &str| {
+        parked(
+            "addq",
+            "adcq",
+            "movl %eax, 8(%rsp)",
+            between,
+            "btl $0, 8(%rsp)",
+        )
+    };
+    folded(&chain(""), &[]);
+    for between in [
+        // The slot written again, in whole or over its first byte.
+        "    movl %r9d, 8(%rsp)\n",
+        "    movq %r9, 8(%rsp)\n",
+        "    movq %r9, 4(%rsp)\n",
+        "    movq %r9, 1(%rsp)\n",
+        "    movl %r9d, 5(%rsp)\n",
+        // Written by something that is not a plain move of 32 or 64 bits.
+        "    movb %r9b, 8(%rsp)\n",
+        "    movw %r9w, 16(%rsp)\n",
+        "    movss %xmm0, 16(%rsp)\n",
+        "    xchg %r9, 16(%rsp)\n",
+        "    notq 16(%rsp)\n",
+        // Read by something that is not a plain move.
+        "    movzbl 16(%rsp), %r8d\n",
+        // The frame's base moved: the same text names another slot.
+        "    pushq %r9\n",
+        "    popq %r9\n",
+        "    leaq -16(%rsp), %rsp\n",
+        "    movq %r9, %rsp\n",
+        // A flag written, another path, a call.
+        "    addq $1, %r11\n",
+        "    cmpq %r11, %r9\n",
+        ".Ljoin:\n",
+        "    call helper\n",
+        "    jmp .Lelsewhere\n",
+    ] {
+        unchanged(&chain(between));
+    }
+
+    // An address in the frame, anywhere in the function: what is stored
+    // through a pointer may then be stored into the slot.
+    for taken in [
+        "    leaq 32(%rsp), %r8\n",
+        "    leaq (%rsp), %r8\n",
+        "    leaq 8(%rsp,%r9,8), %r8\n",
+        "    movq 32(%rsp,%r9,8), %r8\n",
+        "    movq %r9, (%rsp,%r8)\n",
+        "    movq %rsp, %r8\n",
+        "    movq %rsp, 32(%rsp)\n",
+        "    addq %rsp, %r8\n",
+        // A directive that emits data may be any of these (this one is
+        // `mov %rsp, %rax`), and one that switches sections ends the
+        // function's text.
+        "    .byte 0x48, 0x89, 0xe0\n",
+        "    .long 0\n",
+        "    .section .text.unlikely\n",
+        "    .p2align 4, 0xcc\n",
+    ] {
+        unchanged(&format!("{taken}{}", chain("")));
+        let behind = chain("").replace("    ret", &format!("{taken}    ret"));
+        unchanged(&behind);
+    }
+    // Directives that emit nothing, in front of the chain and behind it,
+    // refuse nothing.
+    for inert in [
+        "    .p2align 4\n",
+        "    .loc 1 12 4\n",
+        "    .cfi_def_cfa_offset 16\n",
+    ] {
+        folded(&format!("{inert}{}", chain("")), &[]);
+        let behind = chain("").replace("    ret", &format!("{inert}    ret"));
+        folded(&behind, &[]);
+    }
+
+    // A frame addressed through `%rbp`.
+    unchanged(&parked(
+        "addq",
+        "adcq",
+        "movl %eax, -8(%rbp)",
+        "",
+        "btl $0, -8(%rbp)",
+    ));
+    // Another slot than the one that was parked in, another bit.
+    unchanged(&parked(
+        "addq",
+        "adcq",
+        "movl %eax, 8(%rsp)",
+        "",
+        "btl $0, 16(%rsp)",
+    ));
+    unchanged(&parked(
+        "addq",
+        "adcq",
+        "movl %eax, 8(%rsp)",
+        "",
+        "btl $1, 8(%rsp)",
+    ));
+    // What was parked is not the carry: another register, a carry whose
+    // flag was written since, the complement.
+    unchanged(&parked(
+        "addq",
+        "adcq",
+        "movl %r9d, 8(%rsp)",
+        "",
+        "btl $0, 8(%rsp)",
+    ));
+    unchanged(
+        "    addq 8(%rdi), %rax\n    setc %cl\n    movzbl %cl, %eax\n    addq $1, %r11\n    \
+         movl %eax, 8(%rsp)\n    movq 24(%rdi), %rax\n    btl $0, 8(%rsp)\n    \
+         adcq 32(%rdi), %rax\n    ret",
+    );
+    unchanged(
+        "    addq 8(%rdi), %rax\n    setnc %cl\n    movzbl %cl, %eax\n    movl %eax, 8(%rsp)\n    \
+         movq 24(%rdi), %rax\n    btl $0, 8(%rsp)\n    adcq 32(%rdi), %rax\n    ret",
+    );
+    // An immediate parked.
+    unchanged(
+        "    addq 8(%rdi), %rax\n    movl $1, 8(%rsp)\n    movq 24(%rdi), %rax\n    \
+         btl $0, 8(%rsp)\n    adcq 32(%rdi), %rax\n    ret",
+    );
+}
+
+/// What the pipeline does with a parked carry: the test dropped
+/// ([`forward_carry_flag`]), the store into a slot nobody reads any more
+/// dropped (`eliminate_never_read_stores`, here by hand: `park`), and then
+/// the boolean nobody reads ([`drop_unread_carries`]).
+fn unparked(body: &str, park: &str) -> (bool, String) {
+    let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+    let mut store = LineStore::new(text);
+    let mut infos: Vec<_> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    forward_carry_flag(&mut store, &mut infos);
+    for i in 0..store.len() {
+        if store.get(i).trim_ascii() == park {
+            mark_nop(&mut infos[i]);
+        }
+    }
+    let changed = drop_unread_carries(&mut store, &mut infos);
+    let out = (0..store.len())
+        .filter(|&i| !infos[i].is_nop())
+        .map(|i| store.get(i).trim_ascii())
+        .filter(|line| !line.starts_with(".cfi") && *line != "foo:")
+        .collect::<Vec<_>>()
+        .join("\n");
+    (changed, out)
+}
+
+#[test]
+fn a_carry_taken_out_of_the_flag_for_nobody_is_not_taken_out() {
+    let park = "movl %eax, 8(%rsp)";
+    for (first, then) in [("addq", "adcq"), ("subq", "sbbq")] {
+        let body = parked(first, then, park, "", "btl $0, 8(%rsp)");
+        let (changed, out) = unparked(&body, park);
+        assert!(changed, "{body}");
+        assert_eq!(
+            lines(&out),
+            lines(&format!(
+                "movq (%rdi), %rax\n{first} 8(%rdi), %rax\nmovq %rax, 16(%rdi)\n\
+                 movq 24(%rdi), %rax\n{then} 32(%rdi), %rax\nmovq %rax, 40(%rdi)\nret"
+            )),
+            "{body}"
+        );
+        // The same sums and the same registers but the scratch byte's, in
+        // every memory cell but the slot.
+        for state in states() {
+            let before = state.clone().run(&body);
+            let mut after = state.clone().run(&out);
+            after.regs[1] = before.regs[1];
+            let slot = 0x7000_0008;
+            match before.memory.get(&slot) {
+                Some(parked) => after.memory.insert(slot, *parked),
+                None => after.memory.remove(&slot),
+            };
+            assert_eq!(before, after, "{body}\n=>\n{out}");
+        }
+    }
+
+    let alone = |body: &str| {
+        let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = drop_unread_carries(&mut store, &mut infos);
+        let left = (0..store.len()).filter(|&i| !infos[i].is_nop()).count();
+        (changed, store.len() - left)
+    };
+    // A boolean that is read stays: stored, returned, added up, or its
+    // byte read.
+    for reader in [
+        "    movl %eax, 8(%rsp)\n    movq 24(%rdi), %rax\n",
+        "",
+        "    addq %rax, %r8\n    movq 24(%rdi), %rax\n",
+        "    movq %rax, %r9\n    movq 24(%rdi), %rax\n",
+    ] {
+        let body = format!(
+            "    addq 8(%rdi), %rax\n    setc %cl\n    movq %rax, 16(%rdi)\n    movzbl %cl, %eax\n\
+             {reader}    ret"
+        );
+        assert_eq!(alone(&body), (false, 0), "{body}");
+    }
+    // The extension is unread and the byte is read: the `setc` stays.
+    let body = "    addq 8(%rdi), %rax\n    setc %cl\n    movzbl %cl, %eax\n    movq 24(%rdi), %rax\n    \
+                movq %rcx, %r9\n    ret";
+    assert_eq!(alone(body), (true, 1), "{body}");
+    // Neither is read: both go, the byte's own extension included.
+    for pair in [
+        "    setc %cl\n    movzbl %cl, %eax\n",
+        "    setc %al\n    movzbl %al, %eax\n",
+        "    setb %r10b\n    movzbq %r10b, %r10\n    movq %r9, %r10\n",
+    ] {
+        let body = format!(
+            "    addq 8(%rdi), %rax\n{pair}    movq 24(%rdi), %rax\n    movq %rax, %rcx\n    ret"
+        );
+        assert_eq!(alone(&body), (true, 2), "{body}");
+    }
+    // Not a carry, or a flag written between the `setc` and its
+    // extension: not this pass's.
+    for pair in [
+        "    sete %cl\n    movzbl %cl, %eax\n",
+        "    setc %cl\n    addq $1, %r11\n    movzbl %cl, %eax\n",
+        "    setc %cl\n.Ljoin:\n    movzbl %cl, %eax\n",
+    ] {
+        let body = format!(
+            "    addq 8(%rdi), %rax\n{pair}    movq 24(%rdi), %rax\n    movq %rax, %rcx\n    ret"
+        );
+        assert_eq!(alone(&body), (false, 0), "{body}");
+    }
 }

@@ -2908,6 +2908,21 @@ fn peephole_optimize_inner(
         dead_code::eliminate_flow_dead_vector_stores(&store, &mut infos);
     }
 
+    // Phase 5c: the carry of an `adc` chain that was parked in the frame
+    // between two links (`multiword::forward_carry_flag` dropped the `bt`
+    // that read the slot). The store into the slot went just above, so the
+    // `setc` and its extension are read by nobody; and with them gone, what
+    // they stood between closes up: the sum that was saved round them
+    // (`movq %rax, S; movzbl %cl, %eax; ...; movq S, %rax`) is a store and
+    // a load of the register it is still in, which store forwarding drops
+    // and whose slot is then read by nobody either.
+    if !skip_phase5 && !sk("multiword") && multiword::drop_unread_carries(&mut store, &mut infos) {
+        if !sk("store_fwd") {
+            store_forwarding::global_store_forwarding(&mut store, &mut infos);
+        }
+        dead_code::eliminate_never_read_stores(&store, &mut infos);
+    }
+
     // Select a native mask only from an already-BMI2, low-byte-saturating
     // sequence. Run before save/frame cleanup so dead temporaries do not
     // leave unnecessary callee-save traffic behind.

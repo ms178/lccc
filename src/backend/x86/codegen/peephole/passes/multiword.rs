@@ -65,7 +65,11 @@
 //!   line between the `setc` and the `bt` writes a flag, the byte or its
 //!   extension, and none is a label, a branch or a call.  A `bt` leaves ZF
 //!   as it was and the four other flags undefined, so that nothing can
-//!   tell a deleted one from one that ran.
+//!   tell a deleted one from one that ran.  Where the `bt` reads a slot of
+//!   the frame, the function in addition takes no address in its frame
+//!   (so that nothing but a line that names the slot writes it), and no
+//!   line between the store into the slot and the `bt` writes the byte
+//!   that is tested or moves the frame's base;
 //! * the widening in place needs CF at the extension to be CF at the `setc`
 //!   and the register untouched from the `setc` on (only flag-neutral lines
 //!   that do not name it lie between), and the scratch byte, which is no
@@ -79,12 +83,13 @@
 
 use super::super::types::*;
 use super::flag_peepholes::{FlagsEffect, flags_dead_after, flags_effect};
-use super::helpers::writes_family;
+use super::helpers::{is_rsp_shift_line, writes_family};
 use super::liveness::FileLiveness;
 use super::load_op_fuse::may_write_families;
 use super::relay_and_lea::{
-    line_refs_family, plain_gp_operand, provably_dead_lv, split_two_operands,
+    function_range, line_refs_family, plain_gp_operand, provably_dead_lv, split_two_operands,
 };
+use super::{direct_stack_slot, direct_stack_slot_in_line};
 
 const RAX: RegId = 0;
 const RDX: RegId = 2;
@@ -486,6 +491,108 @@ fn carry_still_in_flag(
     }
 }
 
+/// Whether the frame of the function round line `at` is written by nothing
+/// but the lines that name a slot of it: `%rsp` is its base and the
+/// function takes no address in it.
+///
+/// The discipline of `eliminate_never_read_stores`: memory reached through
+/// a pointer is not this frame unless an address of the frame was made,
+/// by a `lea`, by an indexed operand (`8(%rsp,%rax,8)`, an array of the
+/// frame) or by a copy of `%rsp` itself. That pass knows how far each such
+/// address reaches, because it follows the depth of the stack through the
+/// whole function; here any of them refuses the function. So every line
+/// that names `%rsp` has to be a push or a pop, the frame's own
+/// `sub`/`add` of a constant, or an instruction other than `lea` with the
+/// one plain operand `D(%rsp)`. A frame addressed through `%rbp` is not
+/// looked at: `(%rbp)` is a slot in one function and a pointer in another.
+/// And a directive that emits data refuses the function as well: `.byte
+/// 0x48, 0x89, 0xe0` is `mov %rsp, %rax` and names nothing.
+fn frame_is_private(store: &LineStore, infos: &[LineInfo], at: usize) -> bool {
+    let Some((start, end)) = function_range(store, infos, at) else {
+        return false;
+    };
+    (start..end).all(|k| {
+        let info = infos[k];
+        // Nothing, or a directive that emits nothing and switches nothing.
+        if info.is_steppable() || info.kind == LineKind::Label {
+            return true;
+        }
+        // DIRECTIVE-LAW: bails
+        if info.kind == LineKind::Directive {
+            return false;
+        }
+        let t = info.trimmed(store.get(k));
+        if !line_refs_family(t, RSP) || is_rsp_shift_line(t) {
+            return true;
+        }
+        let Some((mnem, _)) = mnemonic(t) else {
+            return false;
+        };
+        !mnem.starts_with("lea")
+            && t.matches("%rsp").count() == 1
+            && parse_frame_mem(t).is_some_and(|operand| operand.base == b's' && !operand.sib)
+    })
+}
+
+/// The line that parked a register in the stack slot `slot` and the
+/// register (`movl %eax, 4(%rsp)`), when at line `at` the slot still holds
+/// what was parked and no flag has been written since.
+///
+/// A carry that found no register is kept in a slot of the frame between
+/// two links of a chain, and the `bt` that puts it back reads the slot.
+/// The frame is one nothing reaches but by naming a slot
+/// ([`frame_is_private`]), so a store through a pointer in between is not
+/// a store into it: between the two, every line that names the frame must
+/// be a plain move of a word or half a word that, if it writes, leaves the
+/// tested byte alone, and none may move the frame's base.
+fn parked_in(
+    store: &LineStore,
+    infos: &[LineInfo],
+    at: usize,
+    (base, offset): (u8, i32),
+) -> Option<(usize, RegId)> {
+    if RegId::from(base) != RSP {
+        return None;
+    }
+    let mut k = at;
+    loop {
+        k = prev_real(store, infos, k)?;
+        let info = infos[k];
+        let t = info.trimmed(store.get(k));
+        if info.is_barrier()
+            || info.pinned
+            || flags_effect(t) != FlagsEffect::Neutral
+            || may_write(&info, t, RegId::from(base))
+        {
+            return None;
+        }
+        // Memory that is not named as a slot of this frame is not the
+        // frame (`(%rbp)` is a pointer where `%rsp` is the base).
+        if direct_stack_slot_in_line(t).is_none_or(|(named, _)| named != base) {
+            continue;
+        }
+        let (width, src, dst) = sized(t, "mov")?;
+        let Some((written_base, written)) = direct_stack_slot(dst) else {
+            // A load from the frame.
+            continue;
+        };
+        if written_base != base {
+            return None;
+        }
+        if written == offset {
+            let reg = width.register(src)?;
+            return frame_is_private(store, infos, at).then_some((k, reg));
+        }
+        let bytes = match width {
+            Width::L => 4,
+            Width::Q => 8,
+        };
+        if (written..written.saturating_add(bytes)).contains(&offset) {
+            return None;
+        }
+    }
+}
+
 /// Drop the `bt` that puts a carry back into the flag it never left:
 ///
 /// ```text
@@ -503,6 +610,12 @@ fn carry_still_in_flag(
 /// links of a chain the flag itself has survived, since only moves were
 /// emitted in between.  With the `bt` gone the boolean usually has no
 /// reader left, and the `setc` and its extension go with it.
+///
+/// The same where the boolean was parked in the frame in between
+/// (`movl %r10d, 4(%rsp)` ... `btl $0, 4(%rsp)`: [`parked_in`]).  Its
+/// `setc`, extension and store stay for [`drop_unread_carries`], behind
+/// the pass that knows which slots are read; the chain no longer waits
+/// for them.
 pub(super) fn forward_carry_flag(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let mut liveness = None;
@@ -513,33 +626,102 @@ pub(super) fn forward_carry_flag(store: &mut LineStore, infos: &mut [LineInfo]) 
         let Some((width, bit, tested)) = sized(infos[b].trimmed(store.get(b)), "bt") else {
             continue;
         };
-        let Some(reg) = width.register(tested) else {
-            continue;
-        };
         if immediate(bit) != Some(0) {
             continue;
         }
-        let Some((j, k, byte)) = carry_still_in_flag(store, infos, b, reg) else {
+        // Where the bit was last in a register: at the `bt` itself, or at
+        // the line that parked it in the slot the `bt` reads.
+        let slot = direct_stack_slot(tested);
+        let (from, reg) = match (width.register(tested), slot) {
+            (Some(reg), _) => (b, reg),
+            (None, Some(slot)) => match parked_in(store, infos, b, slot) {
+                Some(parked) => parked,
+                None => continue,
+            },
+            (None, None) => continue,
+        };
+        let Some((j, k, byte)) = carry_still_in_flag(store, infos, from, reg) else {
             continue;
         };
         let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
         mark_nop(&mut infos[b]);
         lv.refresh_at(store, infos, b);
         changed = true;
-        // The boolean, if that was its last reader: the extension first,
-        // then the byte it extended.
-        if !rewritable(infos, &[j, k]) || !provably_dead_lv(lv, store, infos, k, reg, &[k]) {
+        // The boolean, if that was its last reader. A parked one is still
+        // read by the store that parked it: [`drop_unread_carries`] looks
+        // again when the stores nobody reads are gone.
+        if from == b {
+            drop_boolean_if_unread(store, infos, lv, (j, k), reg, byte);
+        }
+    }
+    changed
+}
+
+/// Drop the boolean made by the `setc` and the extension at `lines`, the
+/// byte `byte` extended into `reg`, if nothing reads it: the extension
+/// first, then the byte it extended.
+fn drop_boolean_if_unread(
+    store: &LineStore,
+    infos: &mut [LineInfo],
+    lv: &mut FileLiveness,
+    (j, k): (usize, usize),
+    reg: RegId,
+    byte: RegId,
+) -> bool {
+    if !rewritable(infos, &[j, k]) || !provably_dead_lv(lv, store, infos, k, reg, &[k]) {
+        return false;
+    }
+    mark_nop(&mut infos[k]);
+    lv.refresh_at(store, infos, k);
+    if byte == reg
+        || byte_set_again_unread(store, infos, j, byte)
+        || provably_dead_lv(lv, store, infos, j, byte, &[j])
+    {
+        mark_nop(&mut infos[j]);
+        lv.refresh_at(store, infos, j);
+    }
+    true
+}
+
+/// Drop the carries that were taken out of the flag for nobody: a `setc`
+/// and its extension whose register is not read.
+///
+/// [`forward_carry_flag`] leaves one wherever the boolean was parked in
+/// the frame, because the store that parked it reads it. That store goes
+/// with the others whose slot nobody reads (`eliminate_never_read_stores`,
+/// which knows the frame: escaped addresses, pushes in the body), and the
+/// boolean is then as dead as its `bt`. Ahead of [`widen_carry_in_place`],
+/// which would make the pair a `mov $0` and a `setc` that no later pass
+/// takes for dead.
+pub(super) fn drop_unread_carries(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let mut liveness = None;
+    for k in 0..store.len() {
+        if infos[k].is_nop() {
             continue;
         }
-        mark_nop(&mut infos[k]);
-        lv.refresh_at(store, infos, k);
-        if byte == reg
-            || byte_set_again_unread(store, infos, j, byte)
-            || provably_dead_lv(lv, store, infos, j, byte, &[j])
-        {
-            mark_nop(&mut infos[j]);
-            lv.refresh_at(store, infos, j);
-        }
+        let t = infos[k].trimmed(store.get(k));
+        let Some((mnem, args)) = mnemonic(t) else {
+            continue;
+        };
+        let width = match mnem {
+            "movzbl" => Width::L,
+            "movzbq" => Width::Q,
+            _ => continue,
+        };
+        let Some(reg) = split_two_operands(args).and_then(|(_, dst)| width.register(dst)) else {
+            continue;
+        };
+        // The pair as the line behind the extension sees it.
+        let Some(behind) = next_real(store, infos, k) else {
+            continue;
+        };
+        // The nearest write of `reg` above that line is this extension.
+        let Some((j, k, byte)) = carry_still_in_flag(store, infos, behind, reg) else {
+            continue;
+        };
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+        changed |= drop_boolean_if_unread(store, infos, lv, (j, k), reg, byte);
     }
     changed
 }
