@@ -1090,8 +1090,16 @@ fn loop_guard_site_admitted(
         .filter(|s| s.callee_name == site.callee_name)
         .count();
     let first_clone_free = callee_data.direct_call_count > sites_here;
-    let charge = if first_clone_free { sites_here - 1 } else { sites_here };
-    let per_clone: usize = callee_data.blocks.iter().map(|b| b.instructions.len()).sum();
+    let charge = if first_clone_free {
+        sites_here - 1
+    } else {
+        sites_here
+    };
+    let per_clone: usize = callee_data
+        .blocks
+        .iter()
+        .map(|b| b.instructions.len())
+        .sum();
     charge.saturating_mul(per_clone) <= budget_remaining
 }
 
@@ -4244,21 +4252,17 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         if is_recursive || function_has_back_edge(func) {
             return false;
         }
-        let asm_alias = asm_templates.iter().find_map(|(_, symbol, alias)| {
-            if *symbol == func.name.as_str() {
-                Some(*alias)
-            } else {
-                None
-            }
-        });
-        let address_referenced = function_referenced_as_value(
+        let asm_alias = module
+            .asm_labels
+            .get(&func.name)
+            .filter(|a| a.as_str() != func.name.as_str());
+        let address_referenced = callee_is_address_referenced(
             &func.name,
+            asm_alias.map(|s| s.as_str()),
             &value_referenced,
             &asm_templates,
             &module.asm_symbol_context(),
-        ) || asm_alias.is_some_and(|a| {
-            function_referenced_as_value(a, &value_referenced, &asm_templates, &module.asm_symbol_context())
-        });
+        );
         !address_referenced
     });
     let loop_site_counts: FxHashMap<String, usize> = if !has_plausible_loop_guard_candidate {
@@ -4267,114 +4271,129 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         // Build loop-block sets for callers that either (a) meet the selector's
         // needs_loop_info predicate, or (b) are sole callers of once-called
         // functions, so we can determine whether that sole call is in a loop.
-    let mut needs_loop_info_for_census: FxHashSet<usize> = FxHashSet::default();
-    for (idx, f) in module.functions.iter().enumerate() {
-        let inst_count: usize = f.blocks.iter().map(|b| b.instructions.len()).sum();
-        let caller_too_large = inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
-        let has_looping_callee = f.blocks.iter().any(|block| {
-            block.instructions.iter().any(|inst| {
-                matches!(
-                    inst,
-                    Instruction::Call { func: callee_name, .. }
-                        if looping_names.contains(callee_name.as_str())
-                )
-            })
-        });
-        if caller_too_large || has_looping_callee {
-            needs_loop_info_for_census.insert(idx);
-        }
-    }
-    // Sole callers of once-called functions need loop info for cold-once-called
-    // classification, but only if they actually contain loops.
-    let mut sole_caller_indices: FxHashMap<&str, usize> = FxHashMap::default();
-    for (idx, f) in module.functions.iter().enumerate() {
-        sole_caller_indices.insert(f.name.as_str(), idx);
-    }
-    let once_called_names: Vec<String> = call_site_counts
-        .iter()
-        .filter(|(_, count)| **count == 1)
-        .map(|(name, _)| name.clone())
-        .collect();
-    for callee in &once_called_names {
-        if let Some(caller_name) = sole_caller.get(callee.as_str()) {
-            if let Some(&idx) = sole_caller_indices.get(caller_name.as_str()) {
+        let mut needs_loop_info_for_census: FxHashSet<usize> = FxHashSet::default();
+        for (idx, f) in module.functions.iter().enumerate() {
+            let inst_count: usize = f.blocks.iter().map(|b| b.instructions.len()).sum();
+            let caller_too_large = inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
+            let has_looping_callee = f.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    matches!(
+                        inst,
+                        Instruction::Call { func: callee_name, .. }
+                            if looping_names.contains(callee_name.as_str())
+                    )
+                })
+            });
+            if caller_too_large || has_looping_callee {
                 needs_loop_info_for_census.insert(idx);
             }
         }
-    }
-
-    let mut caller_loop_blocks: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
-    for &idx in &needs_loop_info_for_census {
-        let f = &module.functions[idx];
-        let cfg = crate::ir::analysis::CfgAnalysis::build(f);
-        let loops =
-            loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
-        if loops.is_empty() {
-            continue;
+        // Sole callers of once-called functions need loop info for cold-once-called
+        // classification, but only if they actually contain loops.
+        let mut sole_caller_indices: FxHashMap<&str, usize> = FxHashMap::default();
+        for (idx, f) in module.functions.iter().enumerate() {
+            sole_caller_indices.insert(f.name.as_str(), idx);
         }
-        let mut in_loop: FxHashSet<usize> = FxHashSet::default();
-        for lp in &loops {
-            in_loop.extend(lp.body.iter().copied());
-        }
-        caller_loop_blocks.insert(f.name.clone(), in_loop);
-    }
-
-    // Raw loop-site counts: in-loop call sites, regardless of caller heat.
-    let mut raw_loop_site_counts: FxHashMap<String, usize> = FxHashMap::default();
-    for f in &module.functions {
-        let Some(in_loop) = caller_loop_blocks.get(&f.name) else {
-            continue;
-        };
-        for (bi, block) in f.blocks.iter().enumerate() {
-            if !in_loop.contains(&bi) {
-                continue;
-            }
-            for inst in &block.instructions {
-                if let Instruction::Call {
-                    func: callee_name, ..
-                } = inst
-                {
-                    *raw_loop_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
+        let once_called_names: Vec<String> = call_site_counts
+            .iter()
+            .filter(|(_, count)| **count == 1)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for callee in &once_called_names {
+            if let Some(caller_name) = sole_caller.get(callee.as_str()) {
+                if let Some(&idx) = sole_caller_indices.get(caller_name.as_str()) {
+                    needs_loop_info_for_census.insert(idx);
                 }
             }
         }
-    }
 
-    // A caller is cold-once-called when it has exactly one call site and that
-    // sole call site is not inside any natural loop. Inlining a wide body into
-    // such a caller is a static-size/code-quality loss: the caller runs once.
-    let mut cold_once_called: FxHashSet<String> = FxHashSet::default();
-    for callee in &once_called_names {
-        if raw_loop_site_counts.get(callee.as_str()).copied().unwrap_or(0) == 0 {
-            cold_once_called.insert(callee.clone());
-        }
-    }
-
-    // Profitable loop-site counts: in-loop sites whose caller is not
-    // cold-once-called. This is the count used for loop-guard admission.
-    let mut profitable_loop_site_counts: FxHashMap<String, usize> = FxHashMap::default();
-    for f in &module.functions {
-        if cold_once_called.contains(&f.name) {
-            continue;
-        }
-        let Some(in_loop) = caller_loop_blocks.get(&f.name) else {
-            continue;
-        };
-        for (bi, block) in f.blocks.iter().enumerate() {
-            if !in_loop.contains(&bi) {
+        let mut caller_loop_blocks: FxHashMap<String, FxHashSet<usize>> =
+            FxHashMap::default();
+        for &idx in &needs_loop_info_for_census {
+            let f = &module.functions[idx];
+            let cfg = crate::ir::analysis::CfgAnalysis::build(f);
+            let loops = loop_analysis::find_natural_loops(
+                cfg.num_blocks,
+                &cfg.preds,
+                &cfg.succs,
+                &cfg.idom,
+            );
+            if loops.is_empty() {
                 continue;
             }
-            for inst in &block.instructions {
-                if let Instruction::Call {
-                    func: callee_name, ..
-                } = inst
-                {
-                    *profitable_loop_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
+            let mut in_loop: FxHashSet<usize> = FxHashSet::default();
+            for lp in &loops {
+                in_loop.extend(lp.body.iter().copied());
+            }
+            caller_loop_blocks.insert(f.name.clone(), in_loop);
+        }
+
+        // Raw loop-site counts: in-loop call sites, regardless of caller heat.
+        let mut raw_loop_site_counts: FxHashMap<String, usize> = FxHashMap::default();
+        for f in &module.functions {
+            let Some(in_loop) = caller_loop_blocks.get(&f.name) else {
+                continue;
+            };
+            for (bi, block) in f.blocks.iter().enumerate() {
+                if !in_loop.contains(&bi) {
+                    continue;
+                }
+                for inst in &block.instructions {
+                    if let Instruction::Call {
+                        func: callee_name, ..
+                    } = inst
+                    {
+                        *raw_loop_site_counts
+                            .entry(callee_name.clone())
+                            .or_insert(0) += 1;
+                    }
                 }
             }
         }
-    }
-    profitable_loop_site_counts
+
+        // A caller is cold-once-called when it has exactly one call site and that
+        // sole call site is not inside any natural loop. Inlining a wide body into
+        // such a caller is a static-size/code-quality loss: the caller runs once.
+        let mut cold_once_called: FxHashSet<String> = FxHashSet::default();
+        for callee in &once_called_names {
+            if raw_loop_site_counts
+                .get(callee.as_str())
+                .copied()
+                .unwrap_or(0)
+                == 0
+            {
+                cold_once_called.insert(callee.clone());
+            }
+        }
+
+        // Profitable loop-site counts: in-loop sites whose caller is not
+        // cold-once-called. This is the count used for loop-guard admission.
+        let mut profitable_loop_site_counts: FxHashMap<String, usize> =
+            FxHashMap::default();
+        for f in &module.functions {
+            if cold_once_called.contains(&f.name) {
+                continue;
+            }
+            let Some(in_loop) = caller_loop_blocks.get(&f.name) else {
+                continue;
+            };
+            for (bi, block) in f.blocks.iter().enumerate() {
+                if !in_loop.contains(&bi) {
+                    continue;
+                }
+                for inst in &block.instructions {
+                    if let Instruction::Call {
+                        func: callee_name, ..
+                    } = inst
+                    {
+                        *profitable_loop_site_counts
+                            .entry(callee_name.clone())
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        profitable_loop_site_counts
     };
 
     CalleeContext {
@@ -4668,7 +4687,7 @@ fn callee_data_for(
         // no other tier inspects the body.
         let address_referenced = callee_is_address_referenced(
             &func.name,
-            asm_alias,
+            asm_alias.map(|s| s.as_str()),
             &value_referenced,
             &asm_templates,
             &ctx.asm_context,
@@ -9779,7 +9798,9 @@ mod loop_guard_tests {
     use super::*;
     use crate::common::types::IrType;
     use crate::ir::module::IrModule;
-    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, Instruction, IrConst, Operand, Terminator, Value};
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, CallInfo, Instruction, IrConst, Operand, Terminator, Value,
+    };
 
     /// The admission predicate shared by `callee_data_for` and these tests.
     /// Argument order mirrors `is_loop_guard_shape` so each case reads as one
@@ -10656,7 +10677,11 @@ mod loop_guard_tests {
             total_calls, 0,
             "all loop-guard sites should be inlined when every caller is hot"
         );
-        let callee_fn = module.functions.iter().find(|f| f.name == "varint").unwrap();
+        let callee_fn = module
+            .functions
+            .iter()
+            .find(|f| f.name == "varint")
+            .unwrap();
         let callee_insts: usize = callee_fn.blocks.iter().map(|b| b.instructions.len()).sum();
         // The outlined body should be dead/empty after both sites inlined.
         // dead_statics runs in the pipeline; inline_run itself may leave it but
@@ -10783,7 +10808,10 @@ mod loop_guard_tests {
             .iter()
             .map(|f| count_direct_calls(f, "varint"))
             .sum();
-        assert_eq!(total_calls, 2, "size-optimized mode must not loop-guard inline");
+        assert_eq!(
+            total_calls, 2,
+            "size-optimized mode must not loop-guard inline"
+        );
     }
 
     #[test]
