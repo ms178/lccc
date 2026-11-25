@@ -36,6 +36,10 @@
 //!    (`passes::carry_chain`).  `setc b; movzb b, r; ...; bt $0, r` puts
 //!    back into CF what is still there when nothing in between wrote the
 //!    flags: `add; adc; adc` with no boolean in between.
+//! 6. [`widen_carry_in_place`] -- the carry that does leave the flag (round
+//!    a loop, into a result).  `setc b; movzb b, r` becomes `mov $0, r;
+//!    setc r`: the same two instructions with one of them, not two, between
+//!    the flag and the register.  Late, once, behind every fold above.
 //!
 //! # Soundness
 //!
@@ -62,6 +66,11 @@
 //!   extension, and none is a label, a branch or a call.  A `bt` leaves ZF
 //!   as it was and the four other flags undefined, so that nothing can
 //!   tell a deleted one from one that ran.
+//! * the widening in place needs CF at the extension to be CF at the `setc`
+//!   and the register untouched from the `setc` on (only flag-neutral lines
+//!   that do not name it lie between), and the scratch byte, which is no
+//!   longer written, dead behind the extension.  A `mov` of an immediate
+//!   writes no flag.
 //!
 //! No rewrite deletes or duplicates a memory access the program made, and
 //! none touches a pinned line or one flagged as a volatile access.  The
@@ -548,6 +557,164 @@ fn byte_set_again_unread(store: &LineStore, infos: &[LineInfo], j: usize, byte: 
         return matches!(info.kind, LineKind::SetCC { reg } if reg == byte)
             && mnemonic(t).is_some_and(|(_, operand)| operand == REG_NAMES[3][byte as usize]);
     }
+}
+
+/// True when the flags read at `j` are those of an addition or a
+/// subtraction (`add`, `adc`, `sub`, `sbb`): straight-line, flag-neutral
+/// code leads from it to `j`.
+fn reads_the_carry_of_arithmetic(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
+    let mut p = j;
+    loop {
+        let Some(above) = prev_real(store, infos, p) else {
+            return false;
+        };
+        p = above;
+        let info = infos[p];
+        if info.is_barrier() || info.pinned {
+            return false;
+        }
+        let t = info.trimmed(store.get(p));
+        if flags_effect(t) == FlagsEffect::Neutral {
+            continue;
+        }
+        return ["adc", "sbb", "add", "sub"]
+            .iter()
+            .any(|stem| sized(t, stem).is_some());
+    }
+}
+
+/// Take the carry out of the flag straight into the register it is kept in:
+///
+/// ```text
+/// adcq   (%rdx,%r9,8), %rax         adcq   (%rdx,%r9,8), %rax
+/// setc   %cl                 ->     movl   $0, %r11d
+/// movzbl %cl, %r11d                 setc   %r11b
+/// ```
+///
+/// Two instructions either way.  On the left the register is ready two
+/// steps behind the flag (the extension reads the byte the `setc` wrote),
+/// on the right one: the `mov` depends on nothing.  Round a limb loop that
+/// path is the loop -- `bt`, `adc`, `setc`, extension -- and where the
+/// extension is not eliminated at rename (Ice Lake with current microcode,
+/// Zen) it is a cycle in four.  Measured there on four limb loops (2,048
+/// limbs 400,000 times): 0.80, 0.99, 1.00 and 0.99 s before, 0.75 s each
+/// after.
+///
+/// Only the carry of an `add`/`adc`/`sub`/`sbb` is rewritten, which is what
+/// the full adder emits; a compare's `setcc` keeps the form the other folds
+/// look for.  Runs once, late, for the same reason.
+pub(super) fn widen_carry_in_place(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut liveness: Option<FileLiveness> = None;
+    let mut changed = false;
+    // Every link of a chain sets the same scratch byte, so one is dead only
+    // once the links that follow have let go of theirs: from the last line
+    // up, and again while a sweep still finds one (round a loop the link
+    // that follows is the one above).
+    while widen_carries_once(store, infos, &mut liveness) {
+        changed = true;
+    }
+    changed
+}
+
+/// One sweep of [`widen_carry_in_place`], from the last line up.
+fn widen_carries_once(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    liveness: &mut Option<FileLiveness>,
+) -> bool {
+    let mut changed = false;
+    for j in (0..store.len()).rev() {
+        if infos[j].is_nop() || !rewritable(infos, &[j]) {
+            continue;
+        }
+        let Some((mnem, operand)) = mnemonic(infos[j].trimmed(store.get(j))) else {
+            continue;
+        };
+        if carry_setcc(mnem) != Some(true) {
+            continue;
+        }
+        let Some(byte) = plain_gp_operand(operand) else {
+            continue;
+        };
+        if operand != REG_NAMES[3][byte as usize] || !reads_the_carry_of_arithmetic(store, infos, j)
+        {
+            continue;
+        }
+        // The extension: the next line that names the byte's register.
+        // What lies between writes no flag and is no control flow.
+        let byte_mask = 1u16 << byte;
+        let mut between_refs = 0u16;
+        let mut n = j;
+        let extension = loop {
+            let Some(next) = next_real(store, infos, n) else {
+                break None;
+            };
+            n = next;
+            let info = infos[n];
+            let t = info.trimmed(store.get(n));
+            if info.is_barrier() || info.pinned {
+                break None;
+            }
+            let refs = info.reg_refs | implicit_reg_refs(t.as_bytes());
+            if refs & byte_mask != 0 {
+                break Some(n);
+            }
+            if flags_effect(t) != FlagsEffect::Neutral {
+                break None;
+            }
+            between_refs |= refs;
+        };
+        let Some(k) = extension else {
+            continue;
+        };
+        if !rewritable(infos, &[k]) {
+            continue;
+        }
+        let Some((mnem, args)) = mnemonic(infos[k].trimmed(store.get(k))) else {
+            continue;
+        };
+        let width = match mnem {
+            "movzbl" => Width::L,
+            "movzbq" => Width::Q,
+            _ => continue,
+        };
+        let Some((src, dst)) = split_two_operands(args) else {
+            continue;
+        };
+        let Some(reg) = width.register(dst) else {
+            continue;
+        };
+        // From the `setc` on the register is the new one: nothing in
+        // between may have read the old one.
+        if src != REG_NAMES[3][byte as usize] || reg == RSP || between_refs & (1u16 << reg) != 0 {
+            continue;
+        }
+        if byte != reg {
+            // The scratch byte is not written any more.  Asked of the
+            // rewritten program: a `setcc` is modelled as a read of the
+            // rest of its register, which round a loop keeps the scratch
+            // alive through this very pair.
+            let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+            let dead = byte_set_again_unread(store, infos, k, byte)
+                || provably_dead_lv(lv, store, infos, k, byte, &[j, k])
+                || matches!(
+                    lv.live_after_dropping_region(store, infos, k, j, k, byte_mask),
+                    Some(live) if live & byte_mask == 0
+                );
+            if !dead {
+                continue;
+            }
+        }
+        let zero = format!("    movl $0, {}", Width::L.name(reg));
+        let set = format!("    setc {}", REG_NAMES[3][reg as usize]);
+        replace_line(store, &mut infos[j], j, zero);
+        replace_line(store, &mut infos[k], k, set);
+        if let Some(lv) = liveness.as_mut() {
+            lv.refresh_at(store, infos, j);
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// True when the flags a compare at `c` sets are read for CF alone: the

@@ -1191,3 +1191,203 @@ fn a_carry_the_flag_no_longer_holds_is_tested() {
          adcq %r9, %r8\n    ret",
     );
 }
+
+/// [`widen_carry_in_place`] alone, once, as the pipeline runs it.
+fn widen(body: &str) -> (bool, String) {
+    let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+    let mut store = LineStore::new(text);
+    let mut infos: Vec<_> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    let changed = widen_carry_in_place(&mut store, &mut infos);
+    let out = (0..store.len())
+        .filter(|&i| !infos[i].is_nop())
+        .map(|i| store.get(i).trim_ascii())
+        .filter(|line| !line.starts_with(".cfi") && *line != "foo:")
+        .collect::<Vec<_>>()
+        .join("\n");
+    (changed, out)
+}
+
+/// Widen in place and require the same registers (all but `scratch`) and
+/// memory from every state.
+fn widened(body: &str, scratch: &[&str]) -> String {
+    let (changed, out) = widen(body);
+    assert!(changed, "not widened:\n{body}");
+    let scratch: Vec<usize> = scratch
+        .iter()
+        .map(|name| {
+            REG_NAMES[0]
+                .iter()
+                .position(|n| n == name)
+                .expect("scratch register")
+        })
+        .collect();
+    for state in states() {
+        let before = state.clone().run(body);
+        let after = state.clone().run(&out);
+        for fam in (0..16).filter(|fam| !scratch.contains(fam)) {
+            assert_eq!(
+                before.regs[fam], after.regs[fam],
+                "{} differs\n--- before\n{body}\n--- after\n{out}\n{state:x?}",
+                REG_NAMES[0][fam]
+            );
+        }
+        assert_eq!(before.memory, after.memory, "memory\n{body}\n=>\n{out}");
+    }
+    out
+}
+
+fn not_widened(body: &str) {
+    let (changed, out) = widen(body);
+    assert!(!changed, "must stay:\n{body}\n=>\n{out}");
+}
+
+#[test]
+fn a_carry_out_goes_straight_into_its_register() {
+    // Every producer the full adder emits, both widths of the extension.
+    for producer in ["addq", "adcq", "subq", "sbbq"] {
+        for extension in ["movzbl %cl, %r11d", "movzbq %cl, %r11"] {
+            let body = format!(
+                "    movq (%rsp), %rax\n    btl $0, %r11d\n    {producer} (%rdi), %rax\n    setc %cl\n    \
+                 {extension}\n    movq %rax, (%rsp)\n    movq %r11, %rax\n    ret"
+            );
+            let out = widened(&body, &["%rcx"]);
+            assert_eq!(
+                lines(&out),
+                lines(&format!(
+                    "movq (%rsp), %rax\nbtl $0, %r11d\n{producer} (%rdi), %rax\nmovl $0, %r11d\n\
+                     setc %r11b\nmovq %rax, (%rsp)\nmovq %r11, %rax\nret"
+                )),
+                "{out}"
+            );
+        }
+    }
+    // The word stored between the two: the store stays where it is.
+    let out = widened(
+        "    adcq 8(%rdi), %rax\n    setc %cl\n    movq %rax, 8(%rsp)\n    movzbl %cl, %r9d\n    \
+         movl %r9d, %eax\n    ret",
+        &["%rcx"],
+    );
+    assert_eq!(
+        lines(&out),
+        lines(
+            "adcq 8(%rdi), %rax\nmovl $0, %r9d\nmovq %rax, 8(%rsp)\nsetc %r9b\nmovl %r9d, %eax\nret"
+        ),
+        "{out}"
+    );
+    // The byte and its extension in one register: nothing to prove dead.
+    let out = widened(
+        "    sbbq %rsi, %rdx\n    setb %al\n    movzbl %al, %eax\n    ret",
+        &[],
+    );
+    assert_eq!(
+        lines(&out),
+        lines("sbbq %rsi, %rdx\nmovl $0, %eax\nsetc %al\nret"),
+        "{out}"
+    );
+    // Two links that both keep their carry: one scratch byte for the two,
+    // and neither keeps it.
+    let out = widened(
+        "    adcq 8(%rdi), %rax\n    setc %cl\n    movzbl %cl, %r12d\n    movq %rax, 8(%rsp)\n    \
+         movq 16(%rsp), %rax\n    adcq 16(%rdi), %rax\n    setc %cl\n    movzbl %cl, %r13d\n    \
+         leaq (%r12,%r13), %rax\n    ret",
+        &["%rcx"],
+    );
+    assert!(!out.contains("%cl"), "{out}");
+    // The low bytes that need a REX prefix have their own names.
+    let out = widened(
+        "    adcq %rdx, %rax\n    setc %cl\n    movzbl %cl, %esi\n    movq %rsi, (%rsp)\n    ret",
+        &["%rcx"],
+    );
+    assert!(out.contains("movl $0, %esi\nsetc %sil"), "{out}");
+}
+
+#[test]
+fn a_carry_round_a_loop_goes_straight_into_its_register() {
+    // The scratch byte is written again every trip, which the liveness
+    // reads as a use of the rest of %rcx: the question has to be asked of
+    // the rewritten loop.  (%rcx carries the bound into the function and is
+    // copied out of the way, so it is not private to the pair either.)
+    let (changed, out) = widen(
+        "    movq %rcx, %r8\n    movl $0, %r9d\n    movl $0, %r11d\n.Lhead:\n    \
+         movq (%rsi,%r9,8), %rax\n    btl $0, %r11d\n    adcq (%rdx,%r9,8), %rax\n    setc %cl\n    \
+         movzbl %cl, %r11d\n    movq %rax, (%rdi,%r9,8)\n    addq $1, %r9\n    cmpq %r8, %r9\n    \
+         jl .Lhead\n    movq %r11, %rax\n    ret",
+    );
+    assert!(changed, "{out}");
+    assert!(
+        out.contains(
+            "adcq (%rdx,%r9,8), %rax\nmovl $0, %r11d\nsetc %r11b\nmovq %rax, (%rdi,%r9,8)"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn two_carries_a_trip_both_go_straight_into_their_registers() {
+    // Each link's scratch byte is the other's, round the back edge: the
+    // lower one is settled by a second sweep.
+    let (changed, out) = widen(
+        "    movq %rcx, %r12\n    movl $0, %r9d\n    movl $0, %r10d\n.Lhead:\n    \
+         movq (%rsi,%r10,8), %rax\n    btl $0, %r9d\n    adcq (%rdx,%r10,8), %rax\n    setc %cl\n    \
+         movzbl %cl, %r8d\n    movq %rax, (%rdi,%r10,8)\n    addl %r8d, %r11d\n    \
+         movq 8(%rsi,%r10,8), %rax\n    btl $0, %r8d\n    adcq 8(%rdx,%r10,8), %rax\n    setc %cl\n    \
+         movzbl %cl, %r9d\n    movq %rax, 8(%rdi,%r10,8)\n    addq $2, %r10\n    cmpq %r12, %r10\n    \
+         jl .Lhead\n    leal (%r11,%r9), %eax\n    ret",
+    );
+    assert!(changed, "{out}");
+    assert!(!out.contains("%cl"), "{out}");
+    assert_eq!(out.matches("movl $0, %r8d\nsetc %r8b").count(), 1, "{out}");
+    assert_eq!(out.matches("movl $0, %r9d\nsetc %r9b").count(), 1, "{out}");
+}
+
+#[test]
+fn a_carry_out_that_cannot_move_keeps_its_scratch_byte() {
+    let stays = |what: &str, body: &str| {
+        let (changed, out) = widen(body);
+        assert!(!changed, "{what}:\n{body}\n=>\n{out}");
+    };
+    stays(
+        "the scratch byte is read again",
+        "    adcq %rdx, %rax\n    setc %cl\n    movzbl %cl, %r9d\n    movzbl %cl, %r10d\n    \
+         movq %r10, (%rsp)\n    movl %r9d, %eax\n    ret",
+    );
+    stays(
+        "the whole scratch register is read",
+        "    adcq %rdx, %rax\n    setc %cl\n    movzbl %cl, %r9d\n    movq %rcx, (%rsp)\n    \
+         movl %r9d, %eax\n    ret",
+    );
+    stays(
+        "the old value of the register is read in between",
+        "    adcq %rdx, %rax\n    setc %cl\n    movq %r9, (%rsp)\n    movzbl %cl, %r9d\n    \
+         movl %r9d, %eax\n    ret",
+    );
+    stays(
+        "the old value addresses the store in between",
+        "    adcq %rdx, %rax\n    setc %cl\n    movq %rax, (%rsp,%r9,8)\n    movzbl %cl, %r9d\n    \
+         movl %r9d, %eax\n    ret",
+    );
+    stays(
+        "the flags are written in between",
+        "    adcq %rdx, %rax\n    setc %cl\n    addq $1, %r8\n    movzbl %cl, %r9d\n    \
+         movl %r9d, %eax\n    ret",
+    );
+    stays(
+        "the carry is a compare's",
+        "    cmpq %rsi, %rdx\n    setb %cl\n    movzbl %cl, %r9d\n    movl %r9d, %eax\n    ret",
+    );
+    stays(
+        "not the carry",
+        "    adcq %rdx, %rax\n    setae %cl\n    movzbl %cl, %r9d\n    movl %r9d, %eax\n    ret",
+    );
+    stays(
+        "a label between the addition and the setc",
+        "    adcq %rdx, %rax\n.Lin:\n    setc %cl\n    movzbl %cl, %r9d\n    movl %r9d, %eax\n    ret",
+    );
+    stays(
+        "the byte is not extended",
+        "    adcq %rdx, %rax\n    setc %cl\n    movb %cl, (%rsp)\n    ret",
+    );
+    not_widened("    adcq %rdx, %rax\n    setc %cl\n    ret");
+}

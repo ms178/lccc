@@ -2973,6 +2973,16 @@ fn peephole_optimize_inner(
         load_op_fuse::narrow_wide_immediates(&mut store, &mut infos);
     }
 
+    // Phase 7c: the carry out of an `adc`/`sbb` straight into its register
+    // (`setc %cl; movzbl %cl, %r` -> `movl $0, %r; setc %rb`): one step from
+    // the flag to the register instead of two, which round a limb loop is
+    // one cycle in four.  Behind every pass that folds the `setcc; movzb`
+    // pair into something better (`multiword`'s own folds first of all), so
+    // that none of them has to know both spellings.
+    if !sk("multiword") && !sk("widen_carry") {
+        multiword::widen_carry_in_place(&mut store, &mut infos);
+    }
+
     // Armed HERE, not at function entry: the first `late!` below must measure
     // only its own phase, not everything since `time_peephole` was read.
     let mut late_clock = time_peephole.then(std::time::Instant::now);
