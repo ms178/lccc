@@ -41,6 +41,61 @@ const MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS: usize = 160;
 /// primary growth controls.
 const MAX_MEDIUM_STATIC_INLINE_BLOCKS: usize = 16;
 
+/// Size envelope for the loop-guard tier (see `is_loop_guard_candidate`).
+///
+/// A wide ACYCLIC `static` helper can still be a per-iteration cost: when a
+/// call to it sits inside one of the caller's loops, the call/return and the
+/// callee prologue are paid on every iteration, and the callee's state stays
+/// in memory because its parameters are not visible to the caller's
+/// optimizer. SQLite's `sqlite3GetVarint` is the canonical shape: 25 blocks /
+/// 184 IR instructions with no loop of its own, called from the decode loop.
+/// It is past `MAX_MEDIUM_STATIC_INLINE_*` (16 blocks / 160 instructions) and
+/// therefore fell through every tier, while GCC -O3 inlines it.
+///
+/// The envelope is derived from limits this pass already trusts for other hot
+/// bodies, not fitted to one function:
+///
+/// * instructions: the vector-intrinsic static tier's 200
+///   (`MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS`) plus a 20 % allowance for the
+///   acyclic branch chains that tier does not model. A clone is always
+///   charged to `MAX_INLINE_BUDGET_PER_CALLER` (350), so one site can never
+///   exhaust a caller's budget by itself.
+/// * blocks: the vector-static block tier's 24
+///   (`MAX_VECTOR_STATIC_INLINE_BLOCKS`) plus the same allowance, because a
+///   guard chain's blocks are small and branch-only.
+///
+/// What the tier adds over those is the *reason* to accept the body: a call
+/// that executes once per iteration of one of the caller's loops.
+const MAX_LOOP_GUARD_INLINE_INSTRUCTIONS: usize = 240;
+const MAX_LOOP_GUARD_INLINE_BLOCKS: usize = 32;
+/// Module-wide call sites that may clone this body. Two is the measured
+/// boundary: the varint decoder has exactly two (the corpus path and the
+/// known-value self-check). A body called from many sites is a shared utility
+/// whose clones would multiply its whole block set at every call, which is
+/// what the caller budgets exist to stop -- such a body belongs out of line.
+const MAX_LOOP_GUARD_INLINE_SITES: usize = 2;
+
+/// Minimum straight-line instructions a block must carry, on average, for the
+/// loop-guard tier to treat the body's block count as justified.
+///
+/// The tier exists to keep a callee's *work* in the caller's registers. A body
+/// whose blocks are almost empty is not work; it is branch scaffolding (a
+/// `if (bad) return 0;` chain lowers to one compare and one branch per block),
+/// and duplicating scaffolding at each call site is pure I-cache cost with no
+/// dataflow win. Measured across the benchmark and regression corpora, bodies
+/// inside the instruction envelope but outside the medium-static window sit on
+/// a continuum from 0.44 to 12.9 instructions per block; the branch-dense end
+/// (`pick` 27 blocks/12 insns, `truncated_ok` 20 blocks/41 insns) gains nothing
+/// from cloning, while the worker end (`sqlite_get_varint` 25/184,
+/// `zlib_ng_adler32_c` 23/211) is exactly what the tier is for.
+///
+/// Six is the small-tier density this pass already trusts
+/// (`MAX_SMALL_INLINE_INSTRUCTIONS / MAX_SMALL_INLINE_BLOCKS` = 20/3 ~ 6.7),
+/// rounded down to keep the rule conservative. The resulting block allowance
+/// is `instructions / 6`, floored at the medium-static window so the tier never
+/// admits less than the tier below it.
+const LOOP_GUARD_MIN_INSTRUCTIONS_PER_BLOCK: usize = 6;
+
 /// A static helper containing a loop can still be a profitable inline candidate
 /// when it is small enough to fit the caller cap.  Keeping this separate from
 /// the generic 6-block loop cap avoids admitting arbitrary externally-visible
@@ -986,9 +1041,11 @@ fn every_iteration_blocks_of(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_inline_site(
     call_sites: &[InlineCallSite],
     callee_map: &FxHashMap<String, CalleeData>,
+    loop_guard_committed: &FxHashSet<String>,
     caller_too_large: bool,
     caller_at_hard_cap: bool,
     caller_at_absolute_cap: bool,
@@ -1040,6 +1097,12 @@ fn select_inline_site(
         // Constant-branch-specialized `static inline` callees are handled in
         // pass 2 so caller budgets and hard/absolute caps always apply.
         if callee_data.const_branch_only {
+            continue;
+        }
+        // Loop-guard bodies are handled in pass 2 as well: they are only
+        // profitable inside a caller loop, and they must be charged to the
+        // per-caller budget like every other normal inline.
+        if callee_data.loop_guard_only {
             continue;
         }
         // Never use ordinary inlining for a recursive callee. A clone still
@@ -1190,6 +1253,56 @@ fn select_inline_site(
                 &site.args,
             );
         if callee_data.const_branch_only && !const_branch_admitted {
+            continue;
+        }
+        // Loop-guard tier: the clone only pays for itself where the call is
+        // executed per iteration, so it is admitted at an in-loop site only.
+        // -Os/-Oz keep the outlined body (a clone there is pure size cost).
+        let mut loop_guard_admitted =
+            callee_data.loop_guard_only && !size_optimized && call_is_in_loop;
+        // Commitment feasibility, in the units this function actually has.
+        //
+        // The tier's size argument is all-or-nothing: every site of the callee
+        // is cloned and the outlined body is deleted. A commitment that this
+        // CALLER cannot afford is worse than no commitment at all, because the
+        // clone that lands is then an addition beside the surviving body. Two
+        // things must fit in the caller's remaining budget:
+        //
+        //   * the sites of this callee that live in THIS caller, and
+        //   * the other inlining this caller still wants to do.
+        //
+        // Only the first is knowable before the fact, so require it. A callee
+        // whose in-this-caller clones alone exceed the budget can never
+        // complete here, so it is refused here outright — which also protects
+        // the *other* callees of this caller, since a partial commitment would
+        // have spent their budget on clones that cannot pay it back. Measured
+        // on `three_way_boolean_compare`: two 186-instruction clones in `main`
+        // (372 > 350) both fit one at a time, and taking the first left
+        // `check_pair_narrow` outlined for +1409 bytes of `.text`.
+        //
+        // The varint shape is one site per caller (184 <= 350 in both), so the
+        // check is free for the case the tier exists for.
+        if loop_guard_admitted && !loop_guard_committed.contains(&site.callee_name) {
+            let sites_here = call_sites
+                .iter()
+                .filter(|s| s.callee_name == site.callee_name)
+                .count();
+            let first_clone_free = callee_data.direct_call_count > sites_here;
+            let charge = if first_clone_free {
+                sites_here - 1
+            } else {
+                sites_here
+            };
+            let per_clone: usize = callee_data
+                .blocks
+                .iter()
+                .map(|b| b.instructions.len())
+                .sum();
+            if charge.saturating_mul(per_clone) > budget_remaining {
+                loop_guard_admitted = false;
+            }
+        }
+        if callee_data.loop_guard_only && !loop_guard_admitted {
             continue;
         }
         let callee_inst_count: usize = callee_data
@@ -1391,11 +1504,18 @@ fn select_inline_site(
             // cap would otherwise veto the second clone in a caller, as in
             // expat's sip24_final, where the 4-round site follows a 2-round
             // clone and needs the caller to grow past 200 instructions.
+            //
+            // A loop-guard clone is exempt once its callee has COMMITTED to
+            // inlining (see `loop_guard_committed`): at that point every
+            // remaining site must follow, or the outlined copy survives and
+            // the clones are pure additions. Admission already proved every
+            // enclosing caller sits inside the headroom bound.
             if caller_too_large
                 && !callee_data.is_always_inline
                 && !size_cap_exempt
                 && !const_trip_admitted
                 && !const_branch_admitted
+                && !(loop_guard_admitted && loop_guard_committed.contains(&site.callee_name))
                 && !hot_inline_leaf
                 && !(in_loop
                     && !callee_data.has_loops
@@ -1435,7 +1555,25 @@ fn select_inline_site(
             if callee_inst_count > pgo_force_budget_remaining {
                 continue;
             }
-        } else if !callee_data.is_single_call_site_static && callee_inst_count > budget_remaining {
+        } else if !callee_data.is_single_call_site_static
+            // Net-growth accounting for the loop-guard tier. The body this
+            // clone replaces is about to be DELETED — every one of its sites
+            // is cloned, which is the tier's admission rule — so the FIRST
+            // clone costs `clone - body <= 0` and must not consume the
+            // caller's budget. Charging it is self-defeating: on
+            // `three_way_boolean_compare` two 186-instruction clones exhausted
+            // `main`'s 350-instruction budget and left the unrelated
+            // `check_pair_narrow` outlined, +1409 bytes of `.text`.
+            //
+            // A commitment must not be broken here: once the first site
+            // landed, the remaining sites are mandatory, or the outlined copy
+            // the commit was meant to delete survives beside the clone. What
+            // stops an unaffordable commitment from being made at all is the
+            // feasibility gate in `select_inline_site`, which refuses a callee
+            // whose in-this-caller clones alone exceed the remaining budget.
+            && !(loop_guard_admitted && loop_guard_committed.contains(&site.callee_name))
+            && callee_inst_count > budget_remaining
+        {
             // Single-call-site statics don't consume the normal budget: each
             // is inlined at most once module-wide, so they cannot cause the
             // exponential blowup the budget guards against.
@@ -1593,6 +1731,15 @@ fn inline_run_with(
     features: InlineFeatures,
 ) -> usize {
     let mut total_inlined = 0;
+    // Atomic commitment for the loop-guard tier, module-wide ON PURPOSE: a
+    // callee must be cloned at EVERY site or at none, or the outlined copy the
+    // tier was meant to delete survives beside the clone and the clone is a net
+    // addition (`sqlite_varint`: +468 bytes of `.text` for one of two sites).
+    // A per-caller set cannot express that — the sites of one callee live in
+    // different functions — so the set spans the whole invocation. Admission
+    // already proves every enclosing caller is inside the headroom bound, and
+    // the per-caller budget still charges every clone.
+    let mut loop_guard_committed: FxHashSet<String> = FxHashSet::default();
     let debug_inline = std::env::var("CCC_INLINE_DEBUG").is_ok();
     let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
         .unwrap_or_default()
@@ -2042,11 +2189,19 @@ fn inline_run_with(
                 // high-value (per-iteration call overhead) and exempt from the
                 // caller-size caps. Also used to avoid inlining loop-containing
                 // callees into a caller that already has loops.
+                // A candidate's own `has_loops` is not the only reason to
+                // compute the caller's loops: the loop-guard tier's admission is
+                // "this call sits inside one of the caller's loops", and its
+                // callees are ACYCLIC by construction. `loop_guard_only` is
+                // evaluated on the same snapshot, at the same point in the
+                // round, so it names exactly the candidates the tier will
+                // consider here.
                 let needs_loop_info = size_optimized
                     || caller_too_large
-                    || call_sites
-                        .iter()
-                        .any(|s| callee_map[&s.callee_name].has_loops);
+                    || call_sites.iter().any(|s| {
+                        let callee = &callee_map[&s.callee_name];
+                        callee.has_loops || callee.loop_guard_only
+                    });
                 let (loop_blocks, every_iteration_blocks): (FxHashSet<usize>, FxHashSet<usize>) =
                     if needs_loop_info {
                         let cfg =
@@ -2080,6 +2235,7 @@ fn inline_run_with(
                 let found_site = select_inline_site(
                     &call_sites,
                     &callee_map,
+                    &loop_guard_committed,
                     caller_too_large,
                     caller_at_hard_cap,
                     caller_at_absolute_cap,
@@ -2153,6 +2309,12 @@ fn inline_run_with(
                 );
 
                 if success {
+                    // Commit the loop-guard callee: its remaining sites are now
+                    // mandatory, or the outlined copy it was meant to delete
+                    // survives alongside the clone.
+                    if callee_data.loop_guard_only {
+                        loop_guard_committed.insert(site.callee_name.clone());
+                    }
                     if size_optimized
                         && !callee_data.is_always_inline
                         && !callee_data.is_single_call_site_static
@@ -3201,6 +3363,24 @@ struct CalleeData {
     /// compile-time constant for a branch-controlling parameter (e.g.
     /// `is_invalid_utf8(p, 2|3|4)` in libexpat's `normal_contentTok`).
     const_branch_only: bool,
+    /// Admitted only by the loop-guard tier: a wide acyclic plain-`static`
+    /// guard chain past the medium-static window (see
+    /// [`MAX_LOOP_GUARD_INLINE_INSTRUCTIONS`]), which ordinary sites must not
+    /// clone. Selected only at a site inside one of the caller's natural
+    /// loops, charged to the per-caller budget like any other normal inline.
+    loop_guard_only: bool,
+    /// Entry call sites that sit inside one of their caller's natural loops
+    /// (see `CalleeContext::loop_site_counts`). The loop-guard tier requires
+    /// `loop_in_site_count == direct_call_count` so that cloning can DELETE the
+    /// outlined body instead of adding a copy beside it.
+    loop_in_site_count: usize,
+    /// The address of this definition is taken anywhere in the module
+    /// (function-pointer table, alias, constructor, asm template or
+    /// `"i"`-constraint symbol). Such a body survives inlining as an outlined
+    /// copy, so any tier that reasons about deleting an outlined copy must
+    /// exclude it. Computed for every callee, not only single-call-site ones:
+    /// the loop-guard tier needs it for bodies it does not otherwise inspect.
+    address_referenced: bool,
     /// Whether recursively expanding ordinary eligible callees reaches a loop.
     /// A tiny wrapper can otherwise conceal a large loop nest from the raw
     /// tiny/small threshold used by the fixed-point inliner.
@@ -3835,6 +4015,129 @@ fn collect_value_referenced_functions(module: &IrModule) -> (FxHashSet<String>, 
 
 /// Whether `name` is referenced as a value (see
 /// `collect_value_referenced_functions` for what counts).
+/// Acyclic check for a callee body.
+///
+/// A back edge is a successor whose block index is not greater than the
+/// terminator's own index, using the function's *layout* order. `IrFunction`
+/// is kept in a layout where every natural loop's header precedes its
+/// latches (the structural passes preserve it), so layout order is a sound
+/// and cheap proxy for dominance here: it can only ever *fail* to see an
+/// edge that a full dominator analysis would call back, never invent one.
+/// Callers therefore use this as a conservative gate — a body it calls
+/// acyclic is provably acyclic for the tier that needs it, and a body it
+/// calls cyclic is one the loop tiers own anyway.
+///
+/// Extracted from `callee_data_for` so the loop-guard tier and the existing
+/// block-limit decision share one definition: two spellings of "has a loop"
+/// drifting apart is exactly how a tier admits a body it must not clone.
+fn function_has_back_edge(func: &IrFunction) -> bool {
+    let label_to_order: FxInlineMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label, i))
+        .collect();
+    func.blocks.iter().enumerate().any(|(i, block)| {
+        let succs: Vec<BlockId> = match &block.terminator {
+            Terminator::Branch(t) => vec![*t],
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => vec![*true_label, *false_label],
+            Terminator::Switch { default, cases, .. } => {
+                let mut s = vec![*default];
+                s.extend(cases.iter().map(|(_, l)| *l));
+                s
+            }
+            _ => vec![],
+        };
+        succs
+            .iter()
+            .any(|succ| label_to_order.get(succ).is_some_and(|&j| j <= i))
+    })
+}
+
+/// Admission for the loop-guard tier on the raw function: a wide but acyclic
+/// plain-`static` body. The counterpart of [`is_loop_guard_candidate`], which
+/// answers the same question from a built [`CalleeData`] at selection time;
+/// both must agree, so the shape test lives here once and is shared with the
+/// unit tests.
+///
+/// Every clause earns its place:
+///
+/// * `is_plain_static_definition` — a declared-`inline` body has its own
+///   tiers, and an externally visible body keeps its outlined copy, so a
+///   clone could only ever add code.
+/// * `!is_always_inline`, `!is_gnu_inline_def` — those bodies are mandatory
+///   inlines owned by other tiers with their own limits.
+/// * `!has_loops` — a body with a back edge belongs to the hot-loop tiers;
+///   cloning it into a caller loop would nest two loops and duplicate the
+///   whole body per iteration's code path.
+/// * `!is_recursive` — a clone still contains the recursive call, so
+///   fixed-point cloning only inflates the caller.
+/// * `!address_referenced` — an address-taken body survives as an outlined
+///   copy, so the clone is pure growth with no call to delete.
+/// * the three envelope limits — see [`MAX_LOOP_GUARD_INLINE_INSTRUCTIONS`].
+#[allow(clippy::too_many_arguments)]
+fn is_loop_guard_shape(
+    is_plain_static_definition: bool,
+    is_always_inline: bool,
+    is_gnu_inline_def: bool,
+    has_loops: bool,
+    is_recursive: bool,
+    address_referenced: bool,
+    total_calls: usize,
+    loop_sites: usize,
+    instructions: usize,
+    blocks: usize,
+) -> bool {
+    is_plain_static_definition
+        && !is_always_inline
+        && !is_gnu_inline_def
+        && !has_loops
+        && !is_recursive
+        && !address_referenced
+        && total_calls <= MAX_LOOP_GUARD_INLINE_SITES
+        // Every entry site must be in a loop, so every clone the tier admits is
+        // one it can also delete the outlined body for. A body whose sites are
+        // split keeps its outlined copy, and the clone is then an addition
+        // rather than a move: on `three_way_boolean_compare` cloning the one
+        // in-loop site of a two-site wrapper both added the clone and starved
+        // a single-call-site inline, for +519 bytes of `.text` and no dynamic
+        // win.
+        && loop_sites == total_calls
+        && instructions <= MAX_LOOP_GUARD_INLINE_INSTRUCTIONS
+        && blocks <= loop_guard_block_allowance(instructions)
+}
+
+/// Block allowance for a body of `instructions`, from the *work* it carries
+/// rather than a fixed shape. Floored at the medium-static window: the tier may
+/// never admit less than the tier below it, so this can only ever widen
+/// admission, and it widens it in proportion to what the clone buys.
+fn loop_guard_block_allowance(instructions: usize) -> usize {
+    MAX_MEDIUM_STATIC_INLINE_BLOCKS
+        .max(instructions / LOOP_GUARD_MIN_INSTRUCTIONS_PER_BLOCK)
+        .min(MAX_LOOP_GUARD_INLINE_BLOCKS)
+}
+
+/// Selection-time form of [`is_loop_guard_shape`], evaluated on the built
+/// snapshot. Reads exactly the same facts.
+fn is_loop_guard_candidate(data: &CalleeData) -> bool {
+    is_loop_guard_shape(
+        data.is_plain_static,
+        data.is_always_inline,
+        data.is_gnu_inline_def,
+        data.has_loops,
+        data.is_recursive,
+        data.address_referenced,
+        data.direct_call_count,
+        data.loop_in_site_count,
+        data.blocks.iter().map(|b| b.instructions.len()).sum(),
+        data.blocks.len(),
+    )
+}
+
 fn function_referenced_as_value(
     name: &str,
     referenced: &FxHashSet<String>,
@@ -3858,6 +4161,14 @@ struct CalleeContext {
     call_site_counts: FxHashMap<String, usize>,
     /// For callees with exactly one entry call site: the function holding it.
     sole_caller: FxHashMap<String, String>,
+    /// Per callee: how many of its ENTRY call sites sit inside one of the
+    /// enclosing function's natural loops. The loop-guard tier's size
+    /// argument depends on this: a clone only saves code when the outlined
+    /// copy dies, and for a multi-site `static` that happens exactly when
+    /// every site is cloned. `sqlite_get_varint`'s two sites are both in the
+    /// decode loop (body deleted); `check_pair_ull`'s two sites are not
+    /// (`+1409` bytes of outlined body left behind by cloning one).
+    loop_site_counts: FxHashMap<String, usize>,
     debug_callee: bool,
     /// This unit was built `-fPIC`/`-shared`: default-visibility external
     /// definitions are semantically interposable, so callers keep the call.
@@ -3883,6 +4194,69 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         }
     }
     sole_caller.retain(|callee, _| call_site_counts.get(callee) == Some(&1));
+    // Entry loop-site census for the loop-guard tier.
+    //
+    // It MUST agree with the selector, which is the only thing that can actually
+    // clone a site: the census gates whether the callee is a candidate at all,
+    // and it must never claim a site the selector will refuse, or the outlined
+    // copy the tier promised to delete survives beside the clone. Measured on
+    // `sqlite_varint`: the census counted `check_known_values`' call as in-loop
+    // (its own natural loop exists there) and admitted the callee, but the
+    // selector's `needs_loop_info` predicate declines to COMPUTE loops for that
+    // caller (`size_optimized || caller_too_large || any callee has_loops`),
+    // so `call_is_in_loop` was false there, one of two sites cloned, and the
+    // `.text` delta was +468 bytes of pure growth. The census therefore applies
+    // the same predicate up front.
+    let looping_names: FxHashSet<&str> = module
+        .functions
+        .iter()
+        .filter(|g| function_has_back_edge(g))
+        .map(|g| g.name.as_str())
+        .collect();
+    let mut loop_site_counts: FxHashMap<String, usize> = FxHashMap::default();
+    for f in &module.functions {
+        let inst_count: usize = f.blocks.iter().map(|b| b.instructions.len()).sum();
+        let caller_too_large = inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
+        let has_looping_callee = f.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::Call { func: callee_name, .. }
+                        if looping_names.contains(callee_name.as_str())
+                )
+            })
+        });
+        // `size_optimized` is not known here; it can only make the selector
+        // compute MORE loops, and this census feeds an admission that is
+        // additionally gated on `!size_optimized`, so treating it as false
+        // leaves nothing uncomputed that the tier could act on.
+        if !(caller_too_large || has_looping_callee) {
+            continue;
+        }
+        let cfg = crate::ir::analysis::CfgAnalysis::build(f);
+        let loops =
+            loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        if loops.is_empty() {
+            continue;
+        }
+        let mut in_loop: FxHashSet<usize> = FxHashSet::default();
+        for lp in &loops {
+            in_loop.extend(lp.body.iter().copied());
+        }
+        for (bi, block) in f.blocks.iter().enumerate() {
+            if !in_loop.contains(&bi) {
+                continue;
+            }
+            for inst in &block.instructions {
+                if let Instruction::Call {
+                    func: callee_name, ..
+                } = inst
+                {
+                    *loop_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
     CalleeContext {
         call_counts,
         value_referenced,
@@ -3890,6 +4264,7 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         asm_context: module.asm_symbol_context(),
         call_site_counts,
         sole_caller,
+        loop_site_counts,
         debug_callee: std::env::var("CCC_INLINE_DEBUG").is_ok(),
         semantic_interposition: SEMANTIC_INTERPOSITION.with(|f| f.get()),
     }
@@ -4059,33 +4434,7 @@ fn callee_data_for(
         let inst_count_for_static: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
 
         // Detect back-edges (loops) early, used for block limit decision.
-        let has_loops = {
-            let label_to_order: FxInlineMap<BlockId, usize> = func
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(i, b)| (b.label, i))
-                .collect();
-            func.blocks.iter().enumerate().any(|(i, block)| {
-                let succs: Vec<BlockId> = match &block.terminator {
-                    Terminator::Branch(t) => vec![*t],
-                    Terminator::CondBranch {
-                        true_label,
-                        false_label,
-                        ..
-                    } => vec![*true_label, *false_label],
-                    Terminator::Switch { default, cases, .. } => {
-                        let mut s = vec![*default];
-                        s.extend(cases.iter().map(|(_, l)| *l));
-                        s
-                    }
-                    _ => vec![],
-                };
-                succs
-                    .iter()
-                    .any(|succ| label_to_order.get(succ).is_some_and(|&j| j <= i))
-            })
-        };
+        let has_loops = function_has_back_edge(func);
         let is_recursive = func.blocks.iter().any(|block| {
             block.instructions.iter().any(|inst| {
                 matches!(
@@ -4195,15 +4544,21 @@ fn callee_data_for(
                 .map(|a| call_site_counts.get(a.as_str()).copied().unwrap_or(0))
                 .unwrap_or(0);
         let has_single_call_site = total_calls == 1;
-        let survives_via_reference = has_single_call_site
-            && (function_referenced_as_value(
-                &func.name,
-                &value_referenced,
-                &asm_templates,
-                &ctx.asm_context,
-            ) || asm_alias.is_some_and(|a| {
-                function_referenced_as_value(a, &value_referenced, &asm_templates, &ctx.asm_context)
-            }));
+        // Computed for EVERY callee, not only single-call-site ones: the
+        // loop-guard tier reasons about deleting an outlined copy and needs
+        // this fact for bodies no other tier inspects. Hoisting it out of the
+        // single-site expression costs one set lookup per callee (the value is
+        // already materialised by the module-wide scan) and removes the
+        // implicit coupling that made the fact available only to one tier.
+        let address_referenced = function_referenced_as_value(
+            &func.name,
+            &value_referenced,
+            &asm_templates,
+            &ctx.asm_context,
+        ) || asm_alias.is_some_and(|a| {
+            function_referenced_as_value(a, &value_referenced, &asm_templates, &ctx.asm_context)
+        });
+        let survives_via_reference = has_single_call_site && address_referenced;
         let fits_single_call_site_static = func.is_static
             && !func.is_inline
             && !is_small_static
@@ -4212,12 +4567,30 @@ fn callee_data_for(
             && !survives_via_reference
             && (inst_count_for_static <= MAX_SINGLE_CALL_SITE_STATIC_INSTRUCTIONS
                 && func.blocks.len() <= MAX_SINGLE_CALL_SITE_STATIC_BLOCKS);
+        // Loop-guard tier: a wide but acyclic plain-`static` guard chain (see
+        // `MAX_LOOP_GUARD_INLINE_INSTRUCTIONS`) is a candidate even though it
+        // is past the medium-static window, because a call to it can sit on
+        // every iteration of one of the caller's loops.
+        let loop_sites = ctx.loop_site_counts.get(&func.name).copied().unwrap_or(0);
+        let loop_guard_candidate = is_loop_guard_shape(
+            func.is_static && !func.is_inline,
+            is_always_inline,
+            func.is_gnu_inline_def,
+            has_loops,
+            is_recursive,
+            address_referenced,
+            total_calls,
+            loop_sites,
+            inst_count_for_static,
+            func.blocks.len(),
+        );
         if !is_always_inline
             && !is_trivially_empty
             && !is_small_static
             && !is_medium_static
             && !const_trip_candidate
             && !fits_single_call_site_static
+            && !loop_guard_candidate
             // An external-linkage `inline` definition is still an inlining
             // candidate; linkage controls out-of-line emission, not whether
             // callers in this TU may use the body. Excluding it made
@@ -4329,7 +4702,21 @@ fn callee_data_for(
             && !fits_single_call_site_static;
         let const_branch_only =
             const_branch_candidate && !fits_general_normal && !fits_single_call_site_static;
-        let fits_normal = const_trip_only || const_branch_only || fits_general_normal;
+        // A body admitted only by the loop-guard tier must not become a
+        // general normal-limit callee: selection restricts it to sites inside
+        // one of the caller's loops. The exclusion set matches
+        // `const_trip_only` on purpose — a callee another tier already admits
+        // (small, medium, or single-call-site, where inlining is a net size
+        // win wherever the call sits) keeps that tier's policy. Without the
+        // exclusion a single-call-site static in this window would lose its
+        // called-once exemption and stay outlined, which is a size
+        // regression rather than a win.
+        let loop_guard_only = loop_guard_candidate
+            && !is_medium_static
+            && !is_small_static
+            && !fits_single_call_site_static;
+        let fits_normal =
+            const_trip_only || const_branch_only || loop_guard_only || fits_general_normal;
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
         // Single-call-site statics were already size-checked above against
@@ -4442,6 +4829,9 @@ fn callee_data_for(
             const_trip_only,
             const_branch_params,
             const_branch_only,
+            loop_guard_only,
+            loop_in_site_count: ctx.loop_site_counts.get(&func.name).copied().unwrap_or(0),
+            address_referenced,
             has_inlineable_loop_descendant: false,
             has_inlined_calls: func.has_inlined_calls,
             // Any static callee with a single call site is dead after
@@ -8078,6 +8468,9 @@ mod inline_limit_tests {
             const_trip_only: false,
             const_branch_params: 0,
             const_branch_only: false,
+            loop_guard_only: false,
+            loop_in_site_count: 0,
+            address_referenced: false,
             has_inlineable_loop_descendant: false,
             has_inlined_calls: false,
             is_single_call_site_static: false,
@@ -9279,6 +9672,752 @@ mod const_trip_tests {
 }
 
 #[cfg(test)]
+mod loop_guard_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{BasicBlock, Instruction, Terminator};
+
+    /// The admission predicate shared by `callee_data_for` and these tests.
+    /// Argument order mirrors `is_loop_guard_shape` so each case reads as one
+    /// gate; named arguments are spelled out at every call site below.
+    fn shape(
+        plain_static: bool,
+        always_inline: bool,
+        gnu_inline: bool,
+        has_loops: bool,
+        recursive: bool,
+        address_referenced: bool,
+        calls: usize,
+        instructions: usize,
+        blocks: usize,
+    ) -> bool {
+        // Default the loop-site census to "every site is in a loop": the
+        // individual cases below are about the other gates. The census gate
+        // has its own test.
+        shape_with_sites(
+            plain_static,
+            always_inline,
+            gnu_inline,
+            has_loops,
+            recursive,
+            address_referenced,
+            calls,
+            calls,
+            instructions,
+            blocks,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shape_with_sites(
+        plain_static: bool,
+        always_inline: bool,
+        gnu_inline: bool,
+        has_loops: bool,
+        recursive: bool,
+        address_referenced: bool,
+        calls: usize,
+        loop_sites: usize,
+        instructions: usize,
+        blocks: usize,
+    ) -> bool {
+        is_loop_guard_shape(
+            plain_static,
+            always_inline,
+            gnu_inline,
+            has_loops,
+            recursive,
+            address_referenced,
+            calls,
+            loop_sites,
+            instructions,
+            blocks,
+        )
+    }
+
+    #[test]
+    fn loop_guard_requires_every_site_to_be_in_a_loop() {
+        // The clone only saves code when the outlined copy dies, and for a
+        // multi-site static that needs every site cloned. `check_pair_ull`
+        // (two sites, one in a loop) is the measured counterexample: cloning
+        // its in-loop site added the clone AND left the 1409-byte outlined
+        // body, for +519 bytes of .text and no dynamic win.
+        assert!(shape_with_sites(
+            true, false, false, false, false, false, 2, 2, 184, 25
+        ));
+        assert!(!shape_with_sites(
+            true, false, false, false, false, false, 2, 1, 184, 25
+        ));
+        assert!(!shape_with_sites(
+            true, false, false, false, false, false, 2, 0, 184, 25
+        ));
+    }
+
+    /// A body that is inside the tier in every measured respect: the shape
+    /// `sqlite_get_varint` has after its own helpers are expanded.
+    fn admits() -> bool {
+        shape(true, false, false, false, false, false, 2, 184, 25)
+    }
+
+    #[test]
+    fn loop_guard_admits_the_sqlite_get_varint_shape() {
+        // 184 instructions in 25 blocks, two call sites, plain `static`,
+        // acyclic. Every one of those numbers is past the medium-static
+        // window (16 blocks / 160 instructions), which is why the body fell
+        // through every existing tier while GCC -O3 inlines it.
+        assert!(admits());
+        // The envelope must clear the medium-static window by construction:
+        // if it ever stops doing so, a cheaper tier owns the body and this
+        // one becomes dead weight. Assert that at compile time.
+        const {
+            assert!(MAX_LOOP_GUARD_INLINE_INSTRUCTIONS > MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS);
+            assert!(MAX_LOOP_GUARD_INLINE_BLOCKS > MAX_MEDIUM_STATIC_INLINE_BLOCKS);
+        }
+    }
+
+    #[test]
+    fn loop_guard_refuses_a_body_with_its_own_loop() {
+        // A back edge means the body belongs to the hot-loop tiers: cloning it
+        // into a caller loop nests two loops and duplicates the whole body.
+        assert!(!shape(true, false, false, true, false, false, 2, 184, 25));
+    }
+
+    #[test]
+    fn loop_guard_refuses_an_address_taken_body() {
+        // An address-taken body keeps its outlined copy, so the clone is pure
+        // code growth with no call left to delete.
+        assert!(!shape(true, false, false, false, false, true, 2, 184, 25));
+    }
+
+    #[test]
+    fn loop_guard_refuses_a_recursive_body() {
+        // After one clone the recursive call remains, so a fixed-point
+        // inliner would keep cloning until the caller size cap.
+        assert!(!shape(true, false, false, false, true, false, 2, 184, 25));
+    }
+
+    #[test]
+    fn loop_guard_refuses_bodies_owned_by_another_inline_tier() {
+        // `always_inline`, `gnu_inline` and declared-`inline` bodies each have
+        // their own tier with its own limits; borrowing this window would
+        // widen them past the policy those tiers encode.
+        assert!(!shape(false, false, false, false, false, false, 2, 184, 25));
+        assert!(!shape(true, true, false, false, false, false, 2, 184, 25));
+        assert!(!shape(true, false, true, false, false, false, 2, 184, 25));
+    }
+
+    #[test]
+    fn loop_guard_site_count_boundary_is_inclusive() {
+        // Exactly MAX sites is admitted; one more is not. Both sides asserted
+        // so an off-by-one in either direction fails here.
+        assert!(shape(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            MAX_LOOP_GUARD_INLINE_SITES,
+            184,
+            25
+        ));
+        assert!(!shape(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            MAX_LOOP_GUARD_INLINE_SITES + 1,
+            184,
+            25
+        ));
+    }
+
+    #[test]
+    fn loop_guard_instruction_envelope_boundary_is_inclusive() {
+        assert!(shape(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            2,
+            MAX_LOOP_GUARD_INLINE_INSTRUCTIONS,
+            25
+        ));
+        assert!(!shape(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            2,
+            MAX_LOOP_GUARD_INLINE_INSTRUCTIONS + 1,
+            25
+        ));
+    }
+
+    #[test]
+    fn loop_guard_block_allowance_is_proportional_to_work() {
+        // 184 instructions / 6 = 30 blocks for the varint decoder.
+        assert_eq!(loop_guard_block_allowance(184), 30);
+        assert_eq!(
+            loop_guard_block_allowance(240),
+            MAX_LOOP_GUARD_INLINE_BLOCKS
+        );
+        // Never below the tier underneath, so this rule can only widen.
+        for ins in [0, 1, 32, 96, 160] {
+            assert!(loop_guard_block_allowance(ins) >= MAX_MEDIUM_STATIC_INLINE_BLOCKS);
+        }
+        // Never above the hard envelope, however large the instruction count.
+        for ins in [240, 480, 4000, usize::MAX] {
+            assert!(loop_guard_block_allowance(ins) <= MAX_LOOP_GUARD_INLINE_BLOCKS);
+        }
+    }
+
+    #[test]
+    fn loop_guard_admits_the_varint_block_count_but_refuses_branch_scaffolding() {
+        // sqlite_get_varint: 25 blocks / 184 instructions -> allowed 30.
+        assert!(shape(true, false, false, false, false, false, 2, 184, 25));
+        // truncated_ok: 20 blocks / 41 instructions -> allowed 16 (floored
+        // up from 41/6 = 6). Its blocks are `if (bad) return 0;` scaffolding;
+        // cloning it duplicates branch overhead, not work, and measurably
+        // grew a regression program's .text by 211 bytes.
+        assert!(!shape(true, false, false, false, false, false, 2, 41, 20));
+        // pick: 27 blocks / 12 instructions -> allowed 16.
+        assert!(!shape(true, false, false, false, false, false, 2, 12, 27));
+        // zlib_ng_adler32_c: 23 blocks / 211 instructions -> allowed 35 (capped 32).
+        assert!(shape(true, false, false, false, false, false, 2, 211, 23));
+        // A dense worker just under the ceiling still passes.
+        assert!(shape(true, false, false, false, false, false, 2, 144, 24));
+        // The same instruction count spread over 25 blocks does not.
+        assert!(!shape(true, false, false, false, false, false, 2, 144, 25));
+    }
+
+    #[test]
+    fn loop_guard_never_admits_a_body_a_cheaper_tier_already_inlines() {
+        // The envelope overlaps no other tier by construction; if a future
+        // limit change makes a smaller tiers' body fall inside this window,
+        // the `loop_guard_only` exclusion set is what keeps that body on its
+        // cheaper tier. Assert the ordering the exclusion set relies on.
+        //
+        // The budget bound matters for a second reason: a committed clone is
+        // exempt from the *remaining* budget but still has to be a sane cost.
+        // Keeping one clone inside the whole per-caller budget is what stops
+        // the atomic rule from becoming an unbounded bypass.
+        const {
+            assert!(MAX_LOOP_GUARD_INLINE_INSTRUCTIONS > MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS);
+            assert!(MAX_LOOP_GUARD_INLINE_INSTRUCTIONS <= MAX_INLINE_BUDGET_PER_CALLER);
+        }
+    }
+
+    // -- the selector, driven end to end ----------------------------------
+    //
+    // The shape gate above decides *what* the tier admits. These tests drive
+    // `select_inline_site` itself, because every defect this tier has had so
+    // far was in the path *after* admission: a per-round veto, the caller
+    // soft cap, and the per-caller budget each silently converted a clone
+    // that deletes an outlined body into a clone that duplicates one.
+
+    /// A `CalleeData` carrying `instructions` instructions over `blocks`
+    /// blocks and no other distinguishing state. The selector derives the
+    /// clone cost from the real instruction count, so the tests below must
+    /// supply one rather than a stub.
+    fn policy_data(blocks: usize, instructions: usize) -> CalleeData {
+        let copy = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(0)),
+        };
+        let mut body: Vec<BasicBlock> = (0..blocks)
+            .map(|index| BasicBlock {
+                label: BlockId(index as u32),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            })
+            .collect();
+        for i in 0..instructions {
+            body[i % blocks.max(1)].instructions.push(copy.clone());
+        }
+        CalleeData {
+            debug_inline_instances: Vec::new(),
+            decl_span: crate::common::source::Span::dummy(),
+            declared_inline: false,
+            terminator_spans: Default::default(),
+            target_features: Vec::new(),
+            builtin_policy: Default::default(),
+            ssp: Default::default(),
+            blocks: body,
+            param_struct_sizes: Vec::new(),
+            param_alloca_values: Vec::new(),
+            param_home_shapes: Vec::new(),
+            return_type: IrType::I32,
+            num_params: 2,
+            next_value_id: 0,
+            max_block_id: 0,
+            single_call_site: false,
+            agg_frame_bytes: 0,
+            is_always_inline: false,
+            x86_isa_needs: Default::default(),
+            uses_fp_or_simd: false,
+            exceeds_normal_limits: false,
+            is_static_inline: false,
+            is_gnu_inline_def: false,
+            is_plain_static: true,
+            direct_call_count: 0,
+            loop_bound_params: 0,
+            const_trip_only: false,
+            const_branch_params: 0,
+            const_branch_only: false,
+            loop_guard_only: false,
+            loop_in_site_count: 0,
+            address_referenced: false,
+            has_inlineable_loop_descendant: false,
+            has_inlined_calls: false,
+            is_single_call_site_static: false,
+            has_loops: false,
+            is_recursive: false,
+            has_vector_intrinsics: false,
+            size_inline_cost: instructions,
+            va_arg_pack: None,
+        }
+    }
+
+    /// `sqlite_get_varint` as the selector sees it: an acyclic plain-static
+    /// guard that fits the tier envelope (184 instructions over 25 blocks,
+    /// two sites, both inside their caller's loops).
+    fn varint_callee() -> CalleeData {
+        let mut data = policy_data(25, 184);
+        data.direct_call_count = 2;
+        data.loop_in_site_count = 2;
+        data.loop_guard_only = true;
+        data
+    }
+
+    fn varint_site(block_idx: usize) -> InlineCallSite {
+        InlineCallSite {
+            block_idx,
+            inst_idx: 0,
+            callee_name: "sqlite_get_varint".into(),
+            dest: Some(Value(0)),
+            args: Vec::new(),
+            pgo_force: false,
+            arg_meta: Default::default(),
+        }
+    }
+
+    struct SelectArgs {
+        committed: FxHashSet<String>,
+        budget_remaining: usize,
+        caller_too_large: bool,
+        caller_at_hard_cap: bool,
+        loop_blocks: FxHashSet<usize>,
+    }
+
+    impl Default for SelectArgs {
+        fn default() -> Self {
+            Self {
+                committed: FxHashSet::default(),
+                budget_remaining: MAX_INLINE_BUDGET_PER_CALLER,
+                caller_too_large: false,
+                caller_at_hard_cap: false,
+                loop_blocks: FxHashSet::default(),
+            }
+        }
+    }
+
+    /// Drive the real selector over `sites` with `callee` in the map.
+    fn select(
+        callee: CalleeData,
+        sites: &[InlineCallSite],
+        args: SelectArgs,
+    ) -> Option<(String, usize)> {
+        let mut callee_map: FxHashMap<String, CalleeData> = FxHashMap::default();
+        callee_map.insert("sqlite_get_varint".into(), callee);
+        select_inline_site(
+            sites,
+            &callee_map,
+            &args.committed,
+            args.caller_too_large,
+            args.caller_at_hard_cap,
+            false,
+            false,
+            false,
+            args.budget_remaining,
+            MAX_ALWAYS_INLINE_BUDGET_PER_CALLER,
+            MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER,
+            None,
+            false,
+            &args.loop_blocks,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            false,
+            false,
+            &FxHashSet::default(),
+        )
+        .map(|(site, insts, _, _)| (site.callee_name, insts))
+    }
+
+    /// A single site inside a loop is the shape that deletes the outlined
+    /// body, so it must be selected with the caller's budget untouched.
+    #[test]
+    fn selector_clones_a_loop_guard_site_inside_a_loop() {
+        let mut args = SelectArgs::default();
+        args.loop_blocks.insert(0);
+        let picked = select(varint_callee(), &[varint_site(0)], args);
+        assert_eq!(
+            picked.map(|(name, _)| name),
+            Some("sqlite_get_varint".into())
+        );
+    }
+
+    /// The tier exists for call sites in loops. A site outside every loop is
+    /// a pure size loss (the outlined body survives), so the selector must
+    /// refuse it even though the shape gate admits the body.
+    #[test]
+    fn selector_refuses_a_loop_guard_site_outside_every_loop() {
+        let picked = select(varint_callee(), &[varint_site(0)], SelectArgs::default());
+        assert!(picked.is_none());
+    }
+
+    /// Regression test for the defect that kept this tier from paying: the
+    /// per-caller budget gates the *second* clone. `sqlite_get_varint` costs
+    /// 184 instructions and the caller's remaining budget after `main`'s own
+    /// inlining was 147, so the 184-instruction clone was refused and only
+    /// one side of the two-site body was eliminated: the outlined copy
+    /// survived *and* a clone was added (measured +468 bytes of .text).
+    ///
+    /// A committed callee's clones are all-or-nothing, so the budget must not
+    /// break the commitment. It stays *charged* — the charge is what keeps the
+    /// tier bounded elsewhere — but it cannot veto a clone the size argument
+    /// depends on.
+    #[test]
+    fn selector_does_not_let_the_budget_break_a_committed_clone() {
+        let mut committed = FxHashSet::default();
+        committed.insert("sqlite_get_varint".to_string());
+        let mut args = SelectArgs {
+            committed,
+            budget_remaining: 147,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        let picked = select(varint_callee(), &[varint_site(0)], args);
+        assert_eq!(
+            picked,
+            Some(("sqlite_get_varint".into(), 184)),
+            "a committed clone must ignore the per-caller budget"
+        );
+    }
+
+    /// The same budget without a commitment still refuses: the exemption is
+    /// scoped to the atomic-clone case and must not become a general bypass.
+    #[test]
+    fn selector_keeps_the_budget_gate_for_uncommitted_clones() {
+        let mut args = SelectArgs {
+            budget_remaining: 147,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        assert!(select(varint_callee(), &[varint_site(0)], args).is_none());
+    }
+
+    /// The soft caller cap is bypassed only for a committed callee; an
+    /// uncommitted loop-guard body at an oversized caller stays outlined.
+    #[test]
+    fn selector_bypasses_the_soft_cap_only_for_a_committed_callee() {
+        let mut args = SelectArgs {
+            caller_too_large: true,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        assert!(select(varint_callee(), &[varint_site(0)], args).is_none());
+
+        let mut committed = FxHashSet::default();
+        committed.insert("sqlite_get_varint".to_string());
+        let mut args = SelectArgs {
+            caller_too_large: true,
+            committed,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        assert!(select(varint_callee(), &[varint_site(0)], args).is_some());
+    }
+
+    /// The feasibility gate: a callee whose clones *in this caller* alone
+    /// cannot fit the remaining budget must be refused before any of them
+    /// land, because a commitment that cannot complete is strictly worse than
+    /// no commitment (the clone survives beside the body it cannot delete, and
+    /// it has spent the budget the caller's other callees needed).
+    ///
+    /// `three_way_boolean_compare` is the measured case: two 186-instruction
+    /// sites in `main` (372 instructions) against a remaining budget that
+    /// survives the first clone but not the second.
+    #[test]
+    fn selector_refuses_a_commitment_this_caller_cannot_afford() {
+        let mut args = SelectArgs {
+            budget_remaining: 200,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        args.loop_blocks.insert(1);
+        // Two sites in this caller, 186 instructions each, nothing cloned yet:
+        // 2 * 186 = 372 > 200, so neither site may be taken.
+        assert!(select(varint_callee(), &[varint_site(0), varint_site(1)], args).is_none());
+    }
+
+    /// The same callee is admitted when this caller holds only one of its
+    /// sites: then one clone fits the budget and the 184 the other caller
+    /// would need is that caller's business. This is the varint shape and the
+    /// reason the tier exists.
+    #[test]
+    fn selector_admits_a_commitment_this_caller_can_afford() {
+        let mut args = SelectArgs {
+            budget_remaining: 200,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        assert_eq!(
+            select(varint_callee(), &[varint_site(0)], args),
+            Some(("sqlite_get_varint".into(), 184))
+        );
+    }
+
+    /// A single-site callee has nothing to commit to: its one clone IS the
+    /// whole body's deletion, so the first-clone cost is the only cost and the
+    /// gate must never refuse it on grounds of multiplicity.
+    #[test]
+    fn selector_feasibility_ignores_a_callee_with_one_site_module_wide() {
+        let mut callee = varint_callee();
+        callee.direct_call_count = 1;
+        callee.loop_in_site_count = 1;
+        let mut args = SelectArgs {
+            budget_remaining: 200,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        assert!(select(callee, &[varint_site(0)], args).is_some());
+    }
+
+    /// A committed callee must NOT be able to bypass the HARD cap. The soft
+    /// cap bypass exists because the outlined body pays for the clone; the
+    /// hard cap bounds the stack frame the merge creates, and no size
+    /// accounting can pay for that. This is the guard that keeps the atomic
+    /// rule from turning into an unbounded frame-growth licence.
+    #[test]
+    fn selector_never_bypasses_the_hard_cap_even_when_committed() {
+        let mut committed = FxHashSet::default();
+        committed.insert("sqlite_get_varint".to_string());
+        let mut args = SelectArgs {
+            committed,
+            caller_too_large: true,
+            caller_at_hard_cap: true,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        // The soft cap is bypassed for a commit (the clone is paid for by the
+        // body it deletes); the hard cap is not, because no size accounting
+        // can pay for the stack frame a 500-instruction merge creates.
+        assert!(select(varint_callee(), &[varint_site(0)], args).is_none());
+    }
+
+    /// Committing one callee must not open the soft cap or the budget for an
+    /// unrelated one: the set is keyed by name and consulted per site.
+    #[test]
+    fn commitment_is_per_callee_and_does_not_leak() {
+        let mut committed = FxHashSet::default();
+        committed.insert("some_other_helper".to_string());
+        let mut args = SelectArgs {
+            committed,
+            caller_too_large: true,
+            budget_remaining: 0,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        assert!(select(varint_callee(), &[varint_site(0)], args).is_none());
+    }
+
+    /// A body owned by another tier must never be selected here, committed or
+    /// not: the cheap tiers already inline it and re-cloning would duplicate.
+    #[test]
+    fn selector_refuses_another_tiers_body_even_when_committed() {
+        let mut committed = FxHashSet::default();
+        committed.insert("sqlite_get_varint".to_string());
+        let mut callee = varint_callee();
+        callee.loop_guard_only = false;
+        callee.is_static_inline = true;
+        let mut args = SelectArgs {
+            committed,
+            budget_remaining: 0,
+            ..Default::default()
+        };
+        args.loop_blocks.insert(0);
+        assert!(select(callee, &[varint_site(0)], args).is_none());
+    }
+
+    // -- the back-edge predicate ------------------------------------------
+
+    fn function(blocks: Vec<BasicBlock>) -> IrFunction {
+        IrFunction {
+            debug_param_indices: Vec::new(),
+            debug_locals: Vec::new(),
+            debug_scopes: Vec::new(),
+            debug_inline_instances: Vec::new(),
+            pass_policy: Default::default(),
+            name: "callee".into(),
+            return_type: IrType::Void,
+            params: vec![],
+            blocks,
+            is_variadic: false,
+            is_declaration: false,
+            is_static: true,
+            is_inline: false,
+            is_always_inline: false,
+            x86_isa_needs: Default::default(),
+            is_noinline: false,
+            target_features: Vec::new(),
+            next_value_id: 16,
+            fp_expr_tags: Default::default(),
+            next_label: 8,
+            section: None,
+            visibility: None,
+            is_weak: false,
+            is_used: false,
+            has_inlined_calls: false,
+            param_alloca_values: vec![],
+            uses_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
+            is_fastcall: false,
+            regparm: None,
+            is_naked: false,
+            no_instrument: false,
+            global_init_label_blocks: vec![],
+            ret_eightbyte_classes: vec![],
+            ret_is_f128_sse: false,
+            ret_is_vector128: false,
+            is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
+        }
+    }
+
+    fn block(label: u32, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: vec![],
+            terminator,
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn back_edge_detects_a_self_loop() {
+        let f = function(vec![
+            block(0, Terminator::Branch(BlockId(1))),
+            block(1, Terminator::Branch(BlockId(1))),
+        ]);
+        assert!(function_has_back_edge(&f));
+    }
+
+    #[test]
+    fn back_edge_detects_a_two_block_latch() {
+        let f = function(vec![
+            block(0, Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(2, Terminator::Branch(BlockId(1))),
+            block(3, Terminator::Return(None)),
+        ]);
+        assert!(function_has_back_edge(&f));
+    }
+
+    #[test]
+    fn back_edge_detects_a_switch_back_edge() {
+        // A `Switch` terminator that targets an earlier block is a loop the
+        // `Branch`/`CondBranch` cases alone would miss.
+        let f = function(vec![
+            block(0, Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                Terminator::Switch {
+                    val: Operand::Value(Value(1)),
+                    default: BlockId(2),
+                    cases: vec![(0, BlockId(0))],
+                    ty: IrType::I32,
+                },
+            ),
+            block(2, Terminator::Return(None)),
+        ]);
+        assert!(function_has_back_edge(&f));
+    }
+
+    #[test]
+    fn back_edge_accepts_a_straight_line_guard_chain() {
+        // The shape the loop-guard tier targets: an acyclic forward-only
+        // chain of compare-and-return blocks, which is what the varint
+        // decoder lowers to.
+        let f = function(vec![
+            block(
+                0,
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(2, Terminator::Return(None)),
+            block(3, Terminator::Return(None)),
+        ]);
+        assert!(!function_has_back_edge(&f));
+    }
+
+    #[test]
+    fn back_edge_accepts_a_forward_branch_to_a_higher_index() {
+        // A forward edge whose target merely sorts later is not a back edge,
+        // however far away it is.
+        let f = function(vec![
+            block(0, Terminator::Branch(BlockId(7))),
+            block(1, Terminator::Return(None)),
+            block(7, Terminator::Return(None)),
+        ]);
+        assert!(!function_has_back_edge(&f));
+    }
+
+    #[test]
+    fn back_edge_uses_layout_order_not_block_labels() {
+        // Labels are opaque: a block labelled 0 that sorts LAST in layout is
+        // still a forward target. Keying on the label instead of the index
+        // would report a back edge here.
+        let f = function(vec![
+            block(9, Terminator::Branch(BlockId(0))),
+            block(0, Terminator::Return(None)),
+        ]);
+        assert!(!function_has_back_edge(&f));
+    }
+}
+
+#[cfg(test)]
 mod devirtualization_tests {
     use super::*;
     use crate::common::types::IrType;
@@ -9983,6 +11122,7 @@ mod extern_admission_tests {
             asm_context: Default::default(),
             call_site_counts: Default::default(),
             sole_caller: Default::default(),
+            loop_site_counts: Default::default(),
             debug_callee: false,
             semantic_interposition: false,
         }
@@ -11352,6 +12492,7 @@ mod phase0_tests {
             asm_context: Default::default(),
             call_site_counts: Default::default(),
             sole_caller: Default::default(),
+            loop_site_counts: Default::default(),
             debug_callee: false,
             semantic_interposition: false,
         }
@@ -11624,6 +12765,9 @@ mod sroa_unlock_tests {
             const_trip_only: false,
             const_branch_params: 0,
             const_branch_only: false,
+            loop_guard_only: false,
+            loop_in_site_count: 0,
+            address_referenced: false,
             has_inlineable_loop_descendant: false,
             has_inlined_calls: false,
             is_single_call_site_static: false,
