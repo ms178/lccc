@@ -196,6 +196,23 @@ impl Cpu {
                 self.write(&dst, Size::Q, product);
                 self.carry = false;
             }
+            // Two destinations each; neither writes a flag.
+            "xchg" | "xchgq" => {
+                let (a, b) = (self.place(operands[0]), self.place(operands[1]));
+                let (x, y) = (self.read(&a, Size::Q), self.read(&b, Size::Q));
+                self.write(&a, Size::Q, y);
+                self.write(&b, Size::Q, x);
+            }
+            "mulxq" => {
+                let (factor, low) = top_level_operands(operands[0]).expect("mulx operands");
+                let product =
+                    u128::from(self.regs[2]) * u128::from(self.read(&self.place(factor), Size::Q));
+                // The high half is written last: it wins when both name
+                // one register.
+                let (low, high) = (self.place(low), self.place(operands[1]));
+                self.write(&low, Size::Q, product as u64);
+                self.write(&high, Size::Q, (product >> 64) as u64);
+            }
             "btl" | "btq" => {
                 let Place::Imm(bit) = self.place(operands[0]) else {
                     panic!("model tests constant bits only ({line})");
@@ -1438,4 +1455,49 @@ fn a_sum_stored_before_its_carry_is_read_keeps_the_flag() {
         "    addq %rsi, %r8\n    movq %r8, (%rsp)\n    subq $1, %r11\n    movq %r11, 8(%rsp)\n    \
          cmpq %rsi, %r8\n    adcq $0, %rdx\n    movq %rdx, %rax\n    ret",
     );
+}
+
+#[test]
+fn a_second_destination_between_the_lines_is_a_write() {
+    // `xchg` writes both its operands and `mulx` two of its three: what
+    // the compare names is another value by then, and the compare is a
+    // comparison of its own, not the carry of the addition above it.
+    let pair = |between: &str| {
+        format!(
+            "    addq %r9, %r8\n    {between}\n    cmpq %r9, %r8\n    adcq $0, %r11\n    \
+             movq %r11, %rax\n    ret"
+        )
+    };
+    for between in [
+        "xchg %r9, %rbx",
+        "xchg %r8, %rbx",
+        "xchg %rbx, %r9",
+        "xchg %r9, (%rdi)",
+        "mulxq %r12, %r9, %rbx",
+        "mulxq %r12, %rbx, %r8",
+    ] {
+        unchanged(&pair(between));
+    }
+    // The same lines, naming neither register, are looked past.
+    for between in ["xchg %r10, %rbx", "mulxq %r12, %r10, %rbx"] {
+        let out = folded(&pair(between), &[]);
+        assert!(!out.contains("cmpq"), "{out}");
+    }
+
+    // The boolean a `bt` tests, likewise: swapped for another value behind
+    // its extension, or its byte swapped before it was extended.
+    let chain = |early: &str, late: &str| {
+        format!(
+            "    addq %rsi, %rax\n    setc %cl\n{early}    movzbl %cl, %r10d\n{late}    \
+             movq %rdx, %r8\n    btl $0, %r10d\n    adcq %r9, %r8\n    ret"
+        )
+    };
+    folded(&chain("", ""), &["%rcx", "%r10"]);
+    unchanged(&chain("", "    xchg %r10, %rbx\n"));
+    unchanged(&chain("", "    xchg %rbx, %r10\n"));
+    unchanged(&chain("", "    mulxq %r12, %r10, %r11\n"));
+    unchanged(&chain("    xchg %rcx, %rbx\n", ""));
+    unchanged(&chain("    xchg %cl, (%rdi)\n", ""));
+    // Two other registers swapped behind the extension change neither.
+    folded(&chain("", "    xchg %rbx, %r11\n"), &["%rcx", "%r10"]);
 }

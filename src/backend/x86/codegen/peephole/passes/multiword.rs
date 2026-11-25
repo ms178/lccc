@@ -81,6 +81,7 @@ use super::super::types::*;
 use super::flag_peepholes::{FlagsEffect, flags_dead_after, flags_effect};
 use super::helpers::writes_family;
 use super::liveness::FileLiveness;
+use super::load_op_fuse::may_write_families;
 use super::relay_and_lea::{
     line_refs_family, plain_gp_operand, provably_dead_lv, split_two_operands,
 };
@@ -413,6 +414,16 @@ pub(super) fn fold_carry_into_adc(store: &mut LineStore, infos: &mut [LineInfo])
     changed
 }
 
+/// True when the line may write register family `fam`.  The windows of
+/// [`carry_still_in_flag`] and [`arithmetic_above`] are any flag-neutral
+/// line, not a list of mnemonics, so the question is asked of the oracle
+/// that over-approximates: `xchg` writes both its operands and `mulx` two
+/// of its three, which the destination of a line does not say, and a
+/// mnemonic nobody listed writes everything.
+fn may_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
+    fam > REG_GP_MAX || may_write_families(t, info) & (1u16 << fam) != 0
+}
+
 /// The lines `(setc, extension)` that put the carry flag into bit 0 of
 /// `reg`, when the flag still holds it at line `at`: straight-line code
 /// from the `setc` on, with no write of a flag, of the byte, or of `reg`
@@ -439,7 +450,7 @@ fn carry_still_in_flag(
             return None;
         }
         let t = infos[k].trimmed(store.get(k));
-        if !writes_family(&infos[k], t, reg) {
+        if !may_write(&infos[k], t, reg) {
             continue;
         }
         let (mnem, args) = mnemonic(t)?;
@@ -464,7 +475,7 @@ fn carry_still_in_flag(
         if info.is_barrier() || info.pinned {
             return None;
         }
-        if writes_family(&info, t, byte) {
+        if may_write(&info, t, byte) {
             let (mnem, operand) = mnemonic(t)?;
             return (carry_setcc(mnem) == Some(true) && operand == REG_NAMES[3][byte as usize])
                 .then_some((j, k, byte));
@@ -769,11 +780,7 @@ fn arithmetic_above(
         if flags_effect(t) != FlagsEffect::Neutral {
             return Some(p);
         }
-        if named
-            .iter()
-            .flatten()
-            .any(|&fam| writes_family(&info, t, fam))
-        {
+        if named.iter().flatten().any(|&fam| may_write(&info, t, fam)) {
             return None;
         }
     }
@@ -825,10 +832,13 @@ pub(super) fn fold_carry_compare(store: &mut LineStore, infos: &mut [LineInfo]) 
             let named = [width.register(left), width.register(right)];
             let registers_only =
                 named[0].is_some() && (named[1].is_some() || immediate(right).is_some());
-            match arithmetic_above(store, infos, c, &named) {
-                Some(p) if registers_only => p,
-                _ => continue,
+            if !registers_only {
+                continue;
             }
+            let Some(p) = arithmetic_above(store, infos, c, &named) else {
+                continue;
+            };
+            p
         };
         if !rewritable(infos, &[p, c]) {
             continue;
