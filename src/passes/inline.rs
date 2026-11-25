@@ -4193,16 +4193,12 @@ fn callee_context(module: &IrModule) -> CalleeContext {
     // Entry loop-site census for the loop-guard tier.
     //
     // It MUST agree with the selector, which is the only thing that can actually
-    // clone a site: the census gates whether the callee is a candidate at all,
-    // and it must never claim a site the selector will refuse, or the outlined
-    // copy the tier promised to delete survives beside the clone. Measured on
-    // `sqlite_varint`: the census counted `check_known_values`' call as in-loop
-    // (its own natural loop exists there) and admitted the callee, but the
-    // selector's `needs_loop_info` predicate declines to COMPUTE loops for that
-    // caller (`size_optimized || caller_too_large || any callee has_loops`),
-    // so `call_is_in_loop` was false there, one of two sites cloned, and the
-    // `.text` delta was +468 bytes of pure growth. The census therefore applies
-    // the same predicate up front.
+    // clone a site: both need loop information for callers of a plausible
+    // loop-guard candidate. Such a callee is *acyclic*, so querying only
+    // callers of looping callees misses every small hot caller. Conversely,
+    // counting a site that the selector cannot see leaves an outlined body
+    // beside a clone. Only callers of plausible targets (and the sole callers
+    // needed for the cold-site filter below) need a CFG analysis.
     //
     // A second filter excludes in-loop sites whose enclosing caller is
     // "cold-once-called": the caller has exactly one call site and that site
@@ -4214,35 +4210,34 @@ fn callee_context(module: &IrModule) -> CalleeContext {
     // sqlite_varint golden workload is the measured case: it is called once
     // from main outside any loop, so its in-loop call to sqlite_get_varint
     // must not make sqlite_get_varint a loop-guard candidate.
-    let looping_names: FxHashSet<&str> = module
-        .functions
-        .iter()
-        .filter(|g| function_has_back_edge(g))
-        .map(|g| g.name.as_str())
-        .collect();
-
     // Fast path: skip the census entirely if no function can plausibly be a
-    // loop-guard candidate. Conservative: any doubt keeps the census.
-    let has_plausible_loop_guard_candidate = module.functions.iter().any(|func| {
+    // loop-guard candidate. Keep the target names, not merely a boolean: their
+    // callers must be analyzed even though the candidate itself has no loop.
+    let mut plausible_targets: FxHashSet<&str> = FxHashSet::default();
+    for func in &module.functions {
         if !func.is_static || func.is_inline || func.is_always_inline || func.is_gnu_inline_def {
-            return false;
+            continue;
         }
-        let total_calls = call_site_counts.get(&func.name).copied().unwrap_or(0);
+        let asm_alias = module
+            .asm_labels
+            .get(&func.name)
+            .filter(|a| a.as_str() != func.name.as_str());
+        let total_calls = call_site_counts.get(&func.name).copied().unwrap_or(0)
+            + asm_alias
+                .and_then(|a| call_site_counts.get(a.as_str()))
+                .copied()
+                .unwrap_or(0);
         if total_calls == 0 || total_calls > MAX_LOOP_GUARD_INLINE_SITES {
-            return false;
+            continue;
         }
         let inst_count: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
-        if inst_count > MAX_LOOP_GUARD_INLINE_INSTRUCTIONS {
-            return false;
-        }
         let block_count = func.blocks.len();
-        if block_count > MAX_LOOP_GUARD_INLINE_BLOCKS {
-            return false;
-        }
-        if inst_count <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
-            && block_count <= MAX_MEDIUM_STATIC_INLINE_BLOCKS
+        if inst_count > MAX_LOOP_GUARD_INLINE_INSTRUCTIONS
+            || block_count > MAX_LOOP_GUARD_INLINE_BLOCKS
+            || (inst_count <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
+                && block_count <= MAX_MEDIUM_STATIC_INLINE_BLOCKS)
         {
-            return false;
+            continue;
         }
         let is_recursive = func.blocks.iter().any(|block| {
             block.instructions.iter().any(|inst| {
@@ -4250,41 +4245,35 @@ fn callee_context(module: &IrModule) -> CalleeContext {
             })
         });
         if is_recursive || function_has_back_edge(func) {
-            return false;
+            continue;
         }
-        let asm_alias = module
-            .asm_labels
-            .get(&func.name)
-            .filter(|a| a.as_str() != func.name.as_str());
-        let address_referenced = callee_is_address_referenced(
+        if callee_is_address_referenced(
             &func.name,
             asm_alias.map(|s| s.as_str()),
             &value_referenced,
             &asm_templates,
             &module.asm_symbol_context(),
-        );
-        !address_referenced
-    });
-    let loop_site_counts: FxHashMap<String, usize> = if !has_plausible_loop_guard_candidate {
+        ) {
+            continue;
+        }
+        plausible_targets.insert(func.name.as_str());
+        if let Some(alias) = asm_alias {
+            plausible_targets.insert(alias.as_str());
+        }
+    }
+    let loop_site_counts: FxHashMap<String, usize> = if plausible_targets.is_empty() {
         FxHashMap::default()
     } else {
-        // Build loop-block sets for callers that either (a) meet the selector's
-        // needs_loop_info predicate, or (b) are sole callers of once-called
-        // functions, so we can determine whether that sole call is in a loop.
+        // Analyze only callers of potential guard bodies and sole callers of
+        // once-called functions (to classify the enclosing caller as cold).
         let mut needs_loop_info_for_census: FxHashSet<usize> = FxHashSet::default();
         for (idx, f) in module.functions.iter().enumerate() {
-            let inst_count: usize = f.blocks.iter().map(|b| b.instructions.len()).sum();
-            let caller_too_large = inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
-            let has_looping_callee = f.blocks.iter().any(|block| {
+            if f.blocks.iter().any(|block| {
                 block.instructions.iter().any(|inst| {
-                    matches!(
-                        inst,
-                        Instruction::Call { func: callee_name, .. }
-                            if looping_names.contains(callee_name.as_str())
-                    )
+                    matches!(inst, Instruction::Call { func: callee_name, .. }
+                        if plausible_targets.contains(callee_name.as_str()))
                 })
-            });
-            if caller_too_large || has_looping_callee {
+            }) {
                 needs_loop_info_for_census.insert(idx);
             }
         }
