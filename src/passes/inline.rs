@@ -4320,9 +4320,11 @@ struct CalleeContext {
     sole_caller: FxHashMap<String, String>,
     /// Per callee: how many of its ENTRY call sites sit inside one of the
     /// enclosing function's natural loops in a caller that is not
-    /// cold-once-called. A cold-once-called caller has exactly one call site
-    /// and that sole call is not in any loop; inlining a wide body there is a
-    /// static-size/code-quality loss and it must not make or break loop-guard
+    /// cold-once-called. Only a non-escaping static caller with exactly one
+    /// call site outside all loops can be classified this way: an external or
+    /// address-taken caller may run arbitrarily often beyond the visible TU.
+    /// Cloning a wide body into such a cold internal caller risks code bloat
+    /// and must not make or break loop-guard
     /// admission. `sqlite_get_varint`'s two hot-loop sites count; a site in a
     /// once-called `check_known_values` wrapper does not.
     loop_site_counts: FxHashMap<String, usize>,
@@ -4362,12 +4364,13 @@ fn callee_context(module: &IrModule) -> CalleeContext {
     // needed for the cold-site filter below) need a CFG analysis.
     //
     // A second filter excludes in-loop sites whose enclosing caller is
-    // "cold-once-called": the caller has exactly one call site and that site
-    // is not inside any loop. Cloning a wide body into such a caller bloats a
-    // function that runs once (the loop inside it runs a trivial number of
-    // iterations relative to the clone cost), and the all-sites-or-none
-    // commitment would otherwise force a bad clone into the cold caller or
-    // block a profitable hot-caller clone. check_known_values in the
+    // "cold-once-called": a non-escaping static body with exactly one call
+    // site, itself outside all loops. An externally visible or address-taken
+    // function may run arbitrarily often via callers outside this TU, even
+    // when its in-TU call count is one. Cloning a wide body into a known-cold
+    // caller bloats code, and all-sites-or-none would otherwise force a bad
+    // clone into the cold caller or block a profitable hot-caller clone.
+    // check_known_values in the
     // sqlite_varint golden workload is the measured case: it is called once
     // from main outside any loop, so its in-loop call to sqlite_get_varint
     // must not make sqlite_get_varint a loop-guard candidate.
@@ -4444,10 +4447,21 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         for (idx, f) in module.functions.iter().enumerate() {
             sole_caller_indices.insert(f.name.as_str(), idx);
         }
-        let once_called_names: Vec<String> = call_site_counts
+        let once_called_names: Vec<String> = module
+            .functions
             .iter()
-            .filter(|(_, count)| **count == 1)
-            .map(|(name, _)| name.clone())
+            .filter(|f| {
+                f.is_static
+                    && !f.is_declaration
+                    && call_site_counts.get(&f.name) == Some(&1)
+                    && !function_referenced_as_value(
+                        &f.name,
+                        &value_referenced,
+                        &asm_templates,
+                        &asm_context,
+                    )
+            })
+            .map(|f| f.name.clone())
             .collect();
         for callee in &once_called_names {
             if let Some(caller_name) = sole_caller.get(callee.as_str()) {
@@ -10833,6 +10847,53 @@ mod loop_guard_tests {
             module.functions.iter().all(|f| f.name != "varint"),
             "dead-static cleanup must remove the now-unreferenced outlined body"
         );
+    }
+
+    #[test]
+    fn externally_visible_once_called_hot_callers_are_not_inferred_cold() {
+        // Seeing one direct call from main does not prove an exported caller
+        // runs once: it may also be called by another translation unit.
+        // The inner loop must still make both guard sites eligible.
+        let callee = loop_guard_callee("guarded", 25, 184);
+        let mut first = loop_caller("first", "guarded", 1);
+        first.is_static = false;
+        first.is_noinline = true;
+        let mut second = loop_caller("second", "guarded", 1);
+        second.is_static = false;
+        second.is_noinline = true;
+        let mut main = IrFunction::new("main".into(), IrType::I32, vec![], false);
+        main.next_value_id = 2;
+        main.next_label = 1;
+        main.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: ["first", "second"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| Instruction::Call {
+                    func: name.to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(i as u32)),
+                        return_type: IrType::I32,
+                        ..CallInfo::default()
+                    },
+                })
+                .collect(),
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+            source_inline_ids: Vec::new(),
+        }];
+        let mut module = IrModule::new();
+        module.functions = vec![main, first, second, callee];
+        assert_eq!(
+            callee_context(&module).loop_site_counts.get("guarded"),
+            Some(&2)
+        );
+        assert!(crate::passes::verify::verify_module(&module, "hot input").is_empty());
+        assert_eq!(super::inline_run(&mut module, false), 2);
+        assert_eq!(count_direct_calls(&module.functions[1], "guarded"), 0);
+        assert_eq!(count_direct_calls(&module.functions[2], "guarded"), 0);
+        let violations = crate::passes::verify::verify_module(&module, "hot inline");
+        assert!(violations.is_empty(), "invalid cloned IR: {violations:?}");
     }
 
     #[test]

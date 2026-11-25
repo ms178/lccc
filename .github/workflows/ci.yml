@@ -3453,6 +3453,9 @@ jobs:
         bash tests/regression/check_tls_dynamic_witness.sh
         bash tests/regression/check_rmw_index_zext_codegen.sh
         bash tests/regression/check_const_trip_loop_inline.sh
+        # Both hot varint callers must clone the decoder together at -O2; -Os
+        # keeps it outlined. Runtime correctness is covered by the C corpus.
+        bash tests/regression/check_inline_loop_guard_hot_varint.sh
         # Sign-only SUB/TEST/CMOV: a dedicated gate, directly wired here and in
         # ci_local.sh.  The same script also carries the i686 branch-fold leg.
         env CCC=target/fastbuild/lccc \

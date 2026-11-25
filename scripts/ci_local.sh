@@ -1963,6 +1963,9 @@ gate "loop-store-motion" fast \
 gate "const-trip-loop-inline" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
 
+gate "inline-loop-guard-hot-varint" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_inline_loop_guard_hot_varint.sh
+
 gate "debug-code-parity" fast \
     env CCC=target/fastbuild/lccc python3 tests/regression/check_debug_code_parity.py
 
