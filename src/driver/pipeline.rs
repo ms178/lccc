@@ -4239,6 +4239,22 @@ impl Driver {
         }
 
         self.fold_phi_relays(&mut module);
+        // The late relay fold leaves SQLite-style merged byte pointers with
+        // direct constant-offset incoming arms. Turn their pointer difference
+        // into an integer offset phi *before* SSA phi elimination; afterwards
+        // the pointer web would already be a set of edge copies and the proof
+        // that every arm shares one base would be lost.
+        if self.opt_level >= 2
+            && !crate::passes::pass_disabled(
+                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                "ptr_delta_phi",
+            )
+        {
+            let changed = module.for_each_function(crate::passes::ptr_delta_phi::run);
+            if changed != 0 {
+                crate::passes::verify::verify_after_pass(&module, "ptr_delta_phi");
+            }
+        }
         self.schedule_bit_test_modify_pairs(&mut module);
 
         // Lower SSA phi nodes to copies before codegen

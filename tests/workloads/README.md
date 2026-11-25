@@ -16,3 +16,7 @@ retain raw individual and aggregate measurements, and label evidence honestly.
   the pinned `ms178/archpkgbuilds` patch, complete bounded CTest suite, and
   independently validated binary round trips. Every test and the whole suite
   have hard timeouts so a generated-code hang cannot consume an Arena session.
+- [`sqlite-3.54.1/`](sqlite-3.54.1/README.md) — latest official release tag
+  (2026-11-25), recipe-matched GCC 16.2/LCCC builds, independent `lccc-ld`
+  link, two SQL/integrity differential suites and six upstream `speedtest1`
+  sets with hashes and raw paired VM timings. The Tcl suite is not installed.
