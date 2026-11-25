@@ -424,14 +424,23 @@ fn word_op(ty: IrType, borrow: bool) -> Option<CarryOp> {
 }
 
 /// The comparison behind an operand of the `|`: the operand itself, or what
-/// a conversion of it converts. Each link is read once, so that all of it
+/// a conversion of it converts, or what is asked to be non-zero
+/// (`__builtin_sub_overflow` returns a `bool` made of the comparison: a
+/// conversion, `!= 0`, a conversion). A comparison is 0 or 1, and so is
+/// every such link above it. Each link is read once, so that all of it
 /// dies with the `|`.
 fn partial_carry(func: &IrFunction, facts: &Facts, mut v: Value) -> Option<Value> {
-    for _ in 0..4 {
+    for _ in 0..6 {
         if !facts.read_once(v) {
             return None;
         }
         match facts.def(func, v)? {
+            Instruction::Cmp {
+                op: IrCmpOp::Ne,
+                lhs: Operand::Value(tested),
+                rhs,
+                ..
+            } if const_bit(rhs) == Some(false) => v = *tested,
             Instruction::Cmp { .. } => return Some(v),
             Instruction::Cast {
                 src: Operand::Value(src),
@@ -755,6 +764,71 @@ fn adder_at(func: &IrFunction, facts: &mut Facts, join_at: Position) -> Option<A
         op: shape.op,
         args,
     })
+}
+
+/// The matcher asked ahead of time: which carries of a function go round a
+/// loop. Nothing is rewritten ([`run`] does that at the end of the
+/// pipeline); `passes::limb_unroll` decides on the answer how a limb loop
+/// is laid out. Valid for the function as it was when [`Carried::of`] read
+/// it.
+pub(crate) struct Carried {
+    facts: Facts,
+}
+
+/// The one full adder a loop hands its carry through.
+pub(crate) struct LoopAdder {
+    /// The adder's sum.
+    pub(crate) word: Value,
+    /// Its carry out, where the carries are joined.
+    pub(crate) out: Value,
+    /// The two words that are added.
+    pub(crate) words: [Operand; 2],
+}
+
+impl Carried {
+    pub(crate) fn of(func: &IrFunction) -> Self {
+        Self {
+            facts: Facts::of(func),
+        }
+    }
+
+    /// The full adder of a loop whose carry goes round it: the blocks
+    /// `blocks` hold exactly one adder, `phi`, a phi of the loop's header,
+    /// is its carry in, and what `phi` receives round the loop (`back`) is
+    /// its carry out. `None` for any other loop: no adder, an adder the
+    /// phi does not go through, or more than one.
+    pub(crate) fn adder_round_loop(
+        &mut self,
+        func: &IrFunction,
+        phi: Value,
+        back: &Operand,
+        blocks: &[usize],
+    ) -> Option<LoopAdder> {
+        let facts = &mut self.facts;
+        let mut adders: Vec<Adder> = Vec::new();
+        let mut claimed: FxHashSet<Position> = FxHashSet::default();
+        for &bi in blocks {
+            for ii in 0..func.blocks[bi].instructions.len() {
+                if join_of(&func.blocks[bi].instructions[ii]).is_some()
+                    && let Some(adder) = adder_at(func, facts, (bi, ii))
+                    && claimed.insert(adder.word_at)
+                {
+                    adders.push(adder);
+                }
+            }
+        }
+        let [adder] = &adders[..] else {
+            return None;
+        };
+        let received = carry_of(func, facts, back)?;
+        let passed_on = matches!(received, Operand::Value(v) if v == adder.join_dest);
+        let taken = matches!(adder.args[2], Operand::Value(v) if v == phi);
+        (passed_on && taken).then(|| LoopAdder {
+            word: adder.word,
+            out: adder.join_dest,
+            words: [adder.args[0].clone(), adder.args[1].clone()],
+        })
+    }
 }
 
 /// A carry out read at `ty` is the carry out: 0 or 1 in a whole register,

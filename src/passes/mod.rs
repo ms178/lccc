@@ -68,6 +68,7 @@ pub(crate) mod iv_widen;
 mod join_store_forward;
 pub(crate) mod jump_thread;
 pub(crate) mod licm;
+pub(crate) mod limb_unroll;
 pub(crate) mod live_range_shrinkage;
 pub(crate) mod load_forward;
 pub(crate) mod loop_align;
@@ -4120,6 +4121,34 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += ipcp_changes + purity_changes;
         }
 
+        // Four limbs a trip (`limb_unroll`): a loop that hands a carry
+        // round its back edge is split by its trip count into a main loop
+        // of four bodies a trip and the loop as it was, so that the `adc`
+        // chain `carry_chain` forms behind this pipeline runs through four
+        // limbs before the carry leaves the flag. Once, at the end of the
+        // first round: the round has merged what the source and the
+        // inliner wrote twice (`_subborrow_u64` tests its carry in in two
+        // places), so the adder is the one the carry pass will see, and
+        // the rounds that follow fold the copies' addresses. Counted as a
+        // late change of the CFG, which is what it is, so that those rounds
+        // run. Only where the carry pass runs, which pays for the copies.
+        // Pass name for CCC_DISABLE_PASSES: "limb_unroll"
+        if iter == 0
+            && !optimize_for_size
+            && !dis.unroll
+            && matches!(target, crate::backend::Target::X86_64)
+            && !pass_disabled(&disabled, "carry")
+            && !pass_disabled(&disabled, "limb_unroll")
+        {
+            let n = timed_pass!(
+                "limb_unroll",
+                run_on_visited(module, &dirty, &mut changed, limb_unroll::run)
+            );
+            cur_pass_changes[10] += n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         if iter == 0 {
             iter0_total_changes = total_changes_excl_dce;
         }
@@ -4980,6 +5009,29 @@ pub(crate) fn run_passes(
     // so nothing between the old and new positions observes the move.
     dead_statics::eliminate_dead_static_functions(module);
 
+    // Full adders (`x + y + carry` and its carry out) as the two halves of
+    // `IntrinsicOp::Carry`, which the x86-64 backend emits as `adc`/`sbb`
+    // and `setc` (`carry_chain`). Here, behind the iterated pipeline, whose
+    // passes read the comparisons and the join the idiom is spelled with
+    // and do not know the intrinsic; and ahead of the latency-driven
+    // reassociation below, which rebuilds sums in order of availability
+    // and takes the idiom apart where the carries are joined by `+`: in a
+    // chain, `t = (c1 + c2) + s` became `t = (c1 + s) + c2`, and the adder
+    // behind the first one was not one any more (measured on the four
+    // limbs a trip `limb_unroll` makes of an `unsigned __int128` sum: one
+    // `adc` of four). Pass name for CCC_DISABLE_PASSES: "carry".
+    if matches!(target, crate::backend::Target::X86_64) && !pass_disabled(&disabled, "carry") {
+        let dce = !pass_disabled(&disabled, "dce");
+        if dump_each_pass {
+            dump_ir_filtered(module, "before carry");
+        }
+        module.for_each_function(|f| carry_chain::run(f, dce));
+        if dump_each_pass {
+            dump_ir_filtered(module, "after carry");
+        }
+        verify::verify_after_pass(module, "carry");
+    }
+
     // Phase 11g: Latency-driven reassociation of associative integer trees
     // inside loops (see reassoc_latency.rs): the operands of a single-use
     // Add/And/Or/Xor tree are recombined in order of availability, so the
@@ -5084,23 +5136,6 @@ pub(crate) fn run_passes(
             changed
         });
         verify::verify_after_pass(module, "satsub");
-    }
-
-    // Full adders (`x + y + carry` and its carry out) as the two halves of
-    // `IntrinsicOp::Carry`, which the x86-64 backend emits as `adc`/`sbb`
-    // and `setc` (`carry_chain`). Here, behind every pass that reads the
-    // comparisons and the `|` the idiom is spelled with: none of them knows
-    // the intrinsic. Pass name for CCC_DISABLE_PASSES: "carry".
-    if matches!(target, crate::backend::Target::X86_64) && !pass_disabled(&disabled, "carry") {
-        let dce = !pass_disabled(&disabled, "dce");
-        if dump_each_pass {
-            dump_ir_filtered(module, "before carry");
-        }
-        module.for_each_function(|f| carry_chain::run(f, dce));
-        if dump_each_pass {
-            dump_ir_filtered(module, "after carry");
-        }
-        verify::verify_after_pass(module, "carry");
     }
 
     // Loops whose header computes what the body reads (`while (n--)`):
