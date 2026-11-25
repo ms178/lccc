@@ -31,6 +31,12 @@ LCCC_BUILD_JOBS=2 scripts/build_lccc_fast.sh
 JOBS=2 tests/workloads/sqlite-3.54.1/run.sh
 # Targeted SQLite varint C and code-shape regression (fast, independent):
 tests/workloads/sqlite-3.54.1/check_ptr_delta_phi.sh
+# Interleaved A/B (same compiler, pass enabled vs disabled), with the
+# independently checked SQLite decoder and a reproducible 4096-input corpus.
+python3 scripts/perf_ab.py --env CCC_DISABLE_PASSES=ptr_delta_phi \
+  --only ptr_delta_phi_bench --reps 11 --cflag=-march=x86-64-v3 \
+  --json target/sqlite-3.54.1/varint-ab.json \
+  tests/workloads/sqlite-3.54.1/ptr_delta_phi_bench.c
 ```
 
 The runner downloads the pinned release ZIP into `$SQLITE_CACHE` (default
@@ -52,7 +58,12 @@ capped at 2. `SPEED_SIZE=25`, `SPEED_REPEATS=3` and
 speedtest1 matrix; each GCC/LCCC pair runs on fresh file-backed databases.
 The script checks each pair's result hash, test identities, SQL and database
 integrity **before** writing a `PASS` manifest. It reports raw per-test times
-and medians separately, with no PMU/hardware-speed claim.
+and medians separately, with no PMU/hardware-speed claim. The separate
+`ptr_delta_phi_bench.c` includes the 3.54.1 decoder fixture verbatim, runs the
+90,000-case independent oracle before every timing, and then calls the decoder
+on a cache-resident, mixed-length corpus. `perf_ab.py` alternates A/B order and
+compares complete output on *every* sample. Its VM times are a screen, not
+PMU instruction counts or proof of end-to-end speedup.
 
 The two deterministic SQL cases cover indexed joins, aggregates, windows,
 triggers, rollback, foreign keys, strict tables, upsert, JSON, FTS5, R-tree,

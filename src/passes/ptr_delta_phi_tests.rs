@@ -4,6 +4,12 @@ use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
 };
 
+fn assert_valid(f: &IrFunction) {
+    let mut violations = Vec::new();
+    crate::passes::verify::verify_function(f, "ptr_delta_phi_test", &mut violations);
+    assert!(violations.is_empty(), "invalid IR: {violations:#?}");
+}
+
 fn value(n: u32) -> Value {
     Value(n)
 }
@@ -84,6 +90,7 @@ fn diamond() -> IrFunction {
             Terminator::Return(Some(v(5))),
         ),
     ];
+    f.next_label = 4;
     f
 }
 
@@ -136,6 +143,7 @@ fn constant_offset_phi_replaces_pointer_difference_and_drops_dead_pointer_web() 
             ))
     );
     assert!(f.next_value_id > integer_phi.0.0);
+    assert_valid(&f);
 }
 
 #[test]
@@ -203,6 +211,7 @@ fn nested_merge_keeps_pointer_phi_when_used_for_load() {
             Terminator::Return(Some(v(9))),
         ),
     ];
+    f.next_label = 6;
     assert_eq!(run(&mut f), 1);
     assert_eq!(
         f.blocks[5]
@@ -225,7 +234,7 @@ fn nested_merge_keeps_pointer_phi_when_used_for_load() {
             ..
         }
     )));
-    crate::passes::verify::verify_after_func_pass(&f, "ptr_delta_phi_nested");
+    assert_valid(&f);
 }
 
 #[test]
@@ -273,4 +282,131 @@ fn i686_out_of_range_offset_and_phi_cycle_fail_closed() {
     let mut f = diamond();
     f.blocks[1].instructions[0] = gep(3, 4, Operand::Const(IrConst::I64(1)));
     assert_eq!(run(&mut f), 0);
+}
+
+#[test]
+fn repeated_subtractions_share_one_phi_and_keep_debug_metadata_aligned() {
+    let mut f = diamond();
+    let mut acc = 5;
+    let mut next = 6;
+    for _ in 1..128 {
+        f.blocks[3].instructions.push(sub(next, 4, 0, IrType::I64));
+        f.blocks[3].instructions.push(Instruction::BinOp {
+            dest: value(next + 1),
+            op: IrBinOp::Add,
+            lhs: v(acc),
+            rhs: v(next),
+            ty: IrType::I64,
+        });
+        acc = next + 1;
+        next += 2;
+    }
+    f.blocks[3].terminator = Terminator::Return(Some(v(acc)));
+    for block in &mut f.blocks {
+        block.source_spans = vec![crate::common::source::Span::dummy(); block.instructions.len()];
+        block.source_inline_ids =
+            vec![crate::ir::instruction::NO_INLINE_INSTANCE; block.instructions.len()];
+    }
+    f.next_value_id = 1; // stale even with a large number of destinations
+    let first_free = f.sound_next_value_id();
+    assert_eq!(run(&mut f), 128);
+    assert_eq!(f.next_value_id, first_free + 1, "only one new phi ID");
+    assert_eq!(
+        f.blocks[3]
+            .instructions
+            .iter()
+            .filter(|inst| matches!(
+                inst,
+                Instruction::Phi {
+                    ty: IrType::I64,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "all 128 differences of the same pair must share one integer phi"
+    );
+    assert!(
+        f.blocks
+            .iter()
+            .all(|b| b.instructions.iter().all(|inst| !matches!(
+                inst,
+                Instruction::BinOp {
+                    op: IrBinOp::Sub,
+                    ..
+                }
+            )))
+    );
+    assert!(
+        f.blocks
+            .iter()
+            .all(|b| b.source_spans.len() == b.instructions.len()
+                && b.source_inline_ids.len() == b.instructions.len())
+    );
+    assert_valid(&f);
+}
+
+#[test]
+fn negative_offset_and_copy_chains_preserve_signed_offsets() {
+    let mut f = diamond();
+    f.blocks[1].instructions[0] = gep(3, 0, Operand::Const(IrConst::I32(-7)));
+    f.blocks[3].instructions.insert(
+        1,
+        Instruction::Copy {
+            dest: value(6),
+            src: v(4),
+        },
+    );
+    f.blocks[3].instructions[2] = sub(5, 6, 0, IrType::I64);
+    assert_eq!(run(&mut f), 1);
+    let incoming = f.blocks[3]
+        .instructions
+        .iter()
+        .find_map(|inst| match inst {
+            Instruction::Phi {
+                ty: IrType::I64,
+                incoming,
+                ..
+            } => Some(incoming),
+            _ => None,
+        })
+        .expect("signed integer phi");
+    assert_eq!(incoming[0].0, Operand::Const(IrConst::I64(-7)));
+    assert_valid(&f);
+}
+
+#[test]
+fn duplicate_definition_through_inline_asm_and_large_id_fail_closed() {
+    let mut f = diamond();
+    f.blocks[0].instructions.push(Instruction::InlineAsm {
+        template: String::new(),
+        outputs: vec![("=r".into(), value(3), None)],
+        inputs: Vec::new(),
+        clobbers: Vec::new(),
+        operand_types: vec![IrType::Ptr],
+        goto_labels: Vec::new(),
+        input_symbols: Vec::new(),
+        seg_overrides: Vec::new(),
+    });
+    // The asm defines %3 first, then the GEP would re-define it: do not
+    // derive an offset from an SSA value with multiple definitions.
+    assert_eq!(run(&mut f), 0);
+    assert!(matches!(
+        f.blocks[3].instructions[1],
+        Instruction::BinOp {
+            op: IrBinOp::Sub,
+            ..
+        }
+    ));
+
+    let mut f = diamond();
+    f.next_value_id = 1_000_002; // bounded memory even for malformed huge IDs
+    assert_eq!(run(&mut f), 0);
+    assert!(matches!(
+        f.blocks[3].instructions[1],
+        Instruction::BinOp {
+            op: IrBinOp::Sub,
+            ..
+        }
+    ));
 }

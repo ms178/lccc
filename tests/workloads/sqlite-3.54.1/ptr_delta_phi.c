@@ -91,7 +91,7 @@ int main(void){
       encoded[n-1] = next_byte() & (n<9 ? 0x7fU : 0xffU);
       bytes = sqlite_varint_delta(encoded, &actual);
       reference_bytes = reference_decode(encoded, &reference);
-      if(bytes != n || reference_bytes != n || actual != reference){
+      if((unsigned)bytes != n || (unsigned)reference_bytes != n || actual != reference){
         fprintf(stderr,"varint mismatch: n=%u iter=%u got=%u/%llu want=%u/%llu\n",
                 n,j,bytes,(unsigned long long)actual,reference_bytes,
                 (unsigned long long)reference);

@@ -6,6 +6,10 @@ LCCC=${LCCC:-$ROOT/target/fastbuild/lccc}
 GCC=${GCC:-gcc-16}
 CLANG=${CLANG:-clang-23}
 fixture="$ROOT/tests/workloads/sqlite-3.54.1/ptr_delta_phi.c"
+# Do not allow the optimizer's own IR/SSA checker or a C diagnostic to be
+# bypassed just because the binary happened to print the expected checksum.
+export CCC_VERIFY_IR=abort CCC_VALIDATE_SSA=1
+flags=(-std=c11 -O2 -march=x86-64-v3 -Wall -Wextra -Werror)
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 for key in gcc lccc clang lccc-off; do
@@ -15,13 +19,13 @@ for key in gcc lccc clang lccc-off; do
         *) cc=$LCCC ;;
     esac
     if [[ $key == lccc-off ]]; then
-        CCC_DISABLE_PASSES=ptr_delta_phi "$cc" -O2 -march=x86-64-v3 \
-            -S "$fixture" -o "$work/$key.s"
-        CCC_DISABLE_PASSES=ptr_delta_phi "$cc" -O2 -march=x86-64-v3 \
-            "$fixture" -o "$work/$key"
+        CCC_DISABLE_PASSES=ptr_delta_phi timeout --kill-after=5s 120 \
+            "$cc" "${flags[@]}" -S "$fixture" -o "$work/$key.s"
+        CCC_DISABLE_PASSES=ptr_delta_phi timeout --kill-after=5s 120 \
+            "$cc" "${flags[@]}" "$fixture" -o "$work/$key"
     else
-        "$cc" -O2 -march=x86-64-v3 -S "$fixture" -o "$work/$key.s"
-        "$cc" -O2 -march=x86-64-v3 "$fixture" -o "$work/$key"
+        timeout --kill-after=5s 120 "$cc" "${flags[@]}" -S "$fixture" -o "$work/$key.s"
+        timeout --kill-after=5s 120 "$cc" "${flags[@]}" "$fixture" -o "$work/$key"
     fi
     timeout --kill-after=5s 30 "$work/$key" > "$work/$key.out"
     grep -q '^ptr_delta_phi: 90000 varints verified;' "$work/$key.out"

@@ -32,6 +32,9 @@ struct PhiPlan {
 
 struct Plan {
     sub_dest: Value,
+    sub_site: (usize, usize),
+    lhs: Value,
+    base: Value,
     ty: IrType,
     root: Arm,
     phis: Vec<PhiPlan>,
@@ -48,10 +51,13 @@ fn offset_constant(op: Operand, ty: IrType) -> Option<i64> {
 }
 
 fn materialize_constant(n: i64, ty: IrType) -> Operand {
-    match ty {
-        IrType::I64 => Operand::Const(IrConst::I64(n)),
-        IrType::I32 => Operand::Const(IrConst::I32(n as i32)),
-        _ => unreachable!("the matcher accepts only signed pointer-width types"),
+    // Only I32/I64 subtractions enter build_plan. offset_constant has already
+    // checked the I32 range; this cast therefore preserves the exact bits.
+    if ty == IrType::I64 {
+        Operand::Const(IrConst::I64(n))
+    } else {
+        debug_assert_eq!(ty, IrType::I32);
+        Operand::Const(IrConst::I32(n as i32))
     }
 }
 
@@ -120,6 +126,7 @@ fn build_plan(
     lhs: Value,
     base: Value,
     ty: IrType,
+    sub_site: (usize, usize),
 ) -> Option<Plan> {
     let mut matcher = Matcher {
         func,
@@ -136,62 +143,42 @@ fn build_plan(
     }
     Some(Plan {
         sub_dest: dest,
+        sub_site,
+        lhs,
+        base,
         ty,
         root,
         phis: matcher.phis,
     })
 }
 
-fn fresh_value(func: &mut IrFunction) -> Value {
-    let id = func.sound_next_value_id();
-    func.next_value_id = id + 1;
-    Value(id)
-}
-
-fn apply(func: &mut IrFunction, plan: Plan) {
-    // Phi plans are in postorder, so every nested integer phi is already
-    // assigned an id when its parent needs it. Allocate before inserting;
-    // the source phi and its edge labels remain untouched.
+fn materialize_plan(plan: &Plan, next_id: &mut u32, pending: &mut [Vec<Instruction>]) -> Operand {
+    // The next free ID was soundly scanned ONCE before applying any plans.
+    // There are at most 1,000,000 unique SSA definitions and 16 new phis
+    // per subtraction, so even the worst case stays far below u32::MAX.
+    // Allocate all IDs before translating incoming edges; the plan is in
+    // postorder, and nested phis refer only to already-proven source phis.
     let mut replacements = FxHashMap::default();
     for p in &plan.phis {
-        replacements.insert(p.original, fresh_value(func));
+        replacements.insert(p.original, Value(*next_id));
+        *next_id += 1;
     }
     let convert = |arm: Arm| match arm {
         Arm::Constant(n) => materialize_constant(n, plan.ty),
         Arm::Phi(original) => Operand::Value(replacements[&original]),
     };
-    for p in plan.phis {
-        let new_phi = Instruction::Phi {
+    for p in &plan.phis {
+        pending[p.block].push(Instruction::Phi {
             dest: replacements[&p.original],
             ty: plan.ty,
             incoming: p
                 .incoming
-                .into_iter()
-                .map(|(arm, edge)| (convert(arm), edge))
+                .iter()
+                .map(|&(arm, edge)| (convert(arm), edge))
                 .collect(),
-        };
-        let block = &mut func.blocks[p.block];
-        let at = block
-            .instructions
-            .iter()
-            .take_while(|i| matches!(i, Instruction::Phi { .. }))
-            .count();
-        block.insert_inst(at, new_phi, crate::common::source::Span::dummy());
+        });
     }
-    for block in &mut func.blocks {
-        if let Some(inst) = block
-            .instructions
-            .iter_mut()
-            .find(|i| i.dest() == Some(plan.sub_dest))
-        {
-            *inst = Instruction::Copy {
-                dest: plan.sub_dest,
-                src: convert(plan.root),
-            };
-            return;
-        }
-    }
-    unreachable!("a matched subtract destination must still exist");
+    convert(plan.root)
 }
 
 /// Rewrite every proven constant-offset pointer subtraction in a function.
@@ -242,12 +229,24 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     // Not in SSA: do not infer facts across different defs.
                     return 0;
                 }
+            } else if let Instruction::InlineAsm { outputs, .. } = inst {
+                // An asm output can define a fresh SSA Value even though
+                // dest() returns None. An output already defined by an earlier
+                // instruction is a memory home (see the IR verifier), not a
+                // second SSA definition. Record the former so a later normal
+                // definition cannot silently masquerade as the only one.
+                for (_, value, _) in outputs {
+                    let entry = &mut defs[value.0 as usize];
+                    if entry.is_none() {
+                        *entry = Some((bi, ii));
+                    }
+                }
             }
         }
     }
     let mut plans = Vec::new();
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
             if let Instruction::BinOp {
                 dest,
                 op: IrBinOp::Sub,
@@ -255,21 +254,45 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 rhs: Operand::Value(base),
                 ty: ty @ (IrType::I32 | IrType::I64),
             } = inst
+                && let Some(plan) = build_plan(func, &defs, *dest, *lhs, *base, *ty, (bi, ii))
+                && !plan.phis.is_empty()
             {
-                if let Some(plan) = build_plan(func, &defs, *dest, *lhs, *base, *ty) {
-                    if !plan.phis.is_empty() {
-                        plans.push(plan);
-                    }
-                }
+                plans.push(plan);
             }
         }
     }
     let count = plans.len();
+    if count == 0 {
+        return 0;
+    }
+    // All subtract sites are recorded BEFORE any insertion, so rewriting at
+    // their original indices is O(1), even for a huge single exit block.
+    // Phis are spliced once per block, not one quadratic Vec insert per phi.
+    let mut pending: Vec<Vec<Instruction>> = (0..func.blocks.len()).map(|_| Vec::new()).collect();
+    let mut roots: FxHashMap<(Value, Value, IrType), Operand> = FxHashMap::default();
+    let mut next_id = next_id;
     for plan in plans {
-        apply(func, plan);
+        let root = *roots
+            .entry((plan.lhs, plan.base, plan.ty))
+            .or_insert_with(|| materialize_plan(&plan, &mut next_id, &mut pending));
+        let inst = &mut func.blocks[plan.sub_site.0].instructions[plan.sub_site.1];
+        debug_assert_eq!(inst.dest(), Some(plan.sub_dest));
+        *inst = Instruction::Copy {
+            dest: plan.sub_dest,
+            src: root,
+        };
     }
-    if count > 0 {
-        crate::passes::dce::eliminate_dead_code(func);
+    for (block, new_phis) in func.blocks.iter_mut().zip(pending) {
+        if !new_phis.is_empty() {
+            let at = block
+                .instructions
+                .iter()
+                .take_while(|i| matches!(i, Instruction::Phi { .. }))
+                .count();
+            block.insert_insts(at, new_phis, crate::common::source::Span::dummy());
+        }
     }
+    func.next_value_id = next_id;
+    crate::passes::dce::eliminate_dead_code(func);
     count
 }
