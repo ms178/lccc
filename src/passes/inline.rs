@@ -3981,20 +3981,6 @@ mod self_recursion;
 use devirt::devirtualize_constant_indirect_calls;
 pub(crate) use self_recursion::inline_self_recursion;
 
-fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
-    let mut counts = FxHashMap::default();
-    for function in &module.functions {
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                if let Instruction::Call { func, .. } = instruction {
-                    *counts.entry(func.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-    counts
-}
-
 /// Names of functions referenced as VALUES anywhere in the module outside of
 /// direct `Call` instructions: via `&func` (`GlobalAddr`), in global
 /// initializer tables (`GlobalInit::GlobalAddr...`), as an inline-asm "i"
@@ -4018,15 +4004,12 @@ fn collect_value_referenced_functions(module: &IrModule) -> (FxHashSet<String>, 
 /// `collect_value_referenced_functions` for what counts).
 /// Acyclic check for a callee body.
 ///
-/// A back edge is a successor whose block index is not greater than the
-/// terminator's own index, using the function's *layout* order. `IrFunction`
-/// is kept in a layout where every natural loop's header precedes its
-/// latches (the structural passes preserve it), so layout order is a sound
-/// and cheap proxy for dominance here: it can only ever *fail* to see an
-/// edge that a full dominator analysis would call back, never invent one.
-/// Callers therefore use this as a conservative gate — a body it calls
-/// acyclic is provably acyclic for the tier that needs it, and a body it
-/// calls cyclic is one the loop tiers own anyway.
+/// A non-forward edge is a successor whose block index is not greater than
+/// the terminator's own index, using the function's *layout* order. Every
+/// directed cycle has at least one non-forward edge under ANY layout, so no
+/// cycle can evade this test. A reordered but acyclic CFG may have a backward
+/// edge, however; that only conservatively refuses an optimization. This is
+/// not a dominator analysis and must not be used as proof of a natural loop.
 ///
 /// Extracted from `callee_data_for` so the loop-guard tier and the existing
 /// block-limit decision share one definition: two spellings of "has a loop"
@@ -4039,23 +4022,19 @@ fn function_has_back_edge(func: &IrFunction) -> bool {
         .map(|(i, b)| (b.label, i))
         .collect();
     func.blocks.iter().enumerate().any(|(i, block)| {
-        let succs: Vec<BlockId> = match &block.terminator {
-            Terminator::Branch(t) => vec![*t],
+        let non_forward = |succ: &BlockId| label_to_order.get(succ).is_some_and(|&j| j <= i);
+        match &block.terminator {
+            Terminator::Branch(t) => non_forward(t),
             Terminator::CondBranch {
                 true_label,
                 false_label,
                 ..
-            } => vec![*true_label, *false_label],
+            } => non_forward(true_label) || non_forward(false_label),
             Terminator::Switch { default, cases, .. } => {
-                let mut s = vec![*default];
-                s.extend(cases.iter().map(|(_, l)| *l));
-                s
+                non_forward(default) || cases.iter().any(|(_, label)| non_forward(label))
             }
-            _ => vec![],
-        };
-        succs
-            .iter()
-            .any(|succ| label_to_order.get(succ).is_some_and(|&j| j <= i))
+            _ => false,
+        }
     })
 }
 
@@ -4098,7 +4077,7 @@ fn is_loop_guard_shape(
         && !has_loops
         && !is_recursive
         && !address_referenced
-        && total_calls <= MAX_LOOP_GUARD_INLINE_SITES
+        && (1..=MAX_LOOP_GUARD_INLINE_SITES).contains(&total_calls)
         // Every entry site must be in a loop, so every clone the tier admits is
         // one it can also delete the outlined body for. A body whose sites are
         // split keeps its outlined copy, and the clone is then an addition
@@ -4150,7 +4129,6 @@ fn callee_is_address_referenced(
 /// A refreshed snapshot deliberately reuses the invocation-entry call graph:
 /// eligibility is then judged exactly as it was for the raw snapshot.
 struct CalleeContext {
-    call_counts: FxHashMap<String, usize>,
     value_referenced: FxHashSet<String>,
     asm_templates: Vec<String>,
     asm_context: crate::common::asm_scan::AsmSymbolContext,
@@ -4172,8 +4150,8 @@ struct CalleeContext {
 }
 
 fn callee_context(module: &IrModule) -> CalleeContext {
-    let call_counts = direct_call_counts(module);
     let (value_referenced, asm_templates) = collect_value_referenced_functions(module);
+    let asm_context = module.asm_symbol_context();
     let mut call_site_counts: FxHashMap<String, usize> = FxHashMap::default();
     let mut sole_caller: FxHashMap<String, String> = FxHashMap::default();
     for f in &module.functions {
@@ -4252,7 +4230,7 @@ fn callee_context(module: &IrModule) -> CalleeContext {
             asm_alias.map(|s| s.as_str()),
             &value_referenced,
             &asm_templates,
-            &module.asm_symbol_context(),
+            &asm_context,
         ) {
             continue;
         }
@@ -4382,10 +4360,9 @@ fn callee_context(module: &IrModule) -> CalleeContext {
     };
 
     CalleeContext {
-        call_counts,
         value_referenced,
         asm_templates,
-        asm_context: module.asm_symbol_context(),
+        asm_context,
         call_site_counts,
         sole_caller,
         loop_site_counts,
@@ -4479,7 +4456,6 @@ fn callee_data_for(
     module: &IrModule,
     ctx: &CalleeContext,
 ) -> Option<CalleeData> {
-    let call_counts = &ctx.call_counts;
     let value_referenced = &ctx.value_referenced;
     let asm_templates = &ctx.asm_templates;
     let call_site_counts = &ctx.call_site_counts;
@@ -4568,7 +4544,7 @@ fn callee_data_for(
                 )
             })
         });
-        let direct_call_count = call_counts.get(&func.name).copied().unwrap_or(0);
+        let direct_call_count = ctx.call_site_counts.get(&func.name).copied().unwrap_or(0);
         let is_small_static = is_static_like
             && !func.is_inline
             && inst_count_for_static <= MAX_STATIC_NONINLINE_INSTRUCTIONS
@@ -9918,6 +9894,8 @@ mod loop_guard_tests {
 
     #[test]
     fn loop_guard_site_count_boundary_is_inclusive() {
+        // No callers cannot repay a clone, even if both zero counts agree.
+        assert!(!shape(true, false, false, false, false, false, 0, 184, 25));
         // Exactly MAX sites is admitted; one more is not. Both sides asserted
         // so an off-by-one in either direction fails here.
         assert!(shape(
@@ -10526,6 +10504,19 @@ mod loop_guard_tests {
         assert!(!function_has_back_edge(&f));
     }
 
+    #[test]
+    fn reordered_acyclic_cfg_is_rejected_conservatively() {
+        // Layout 0 -> 2 -> 1 reaches a return without a cycle, but the
+        // non-forward 2 -> 1 edge is enough to refuse this optimization.
+        // A cycle can never evade the test; a DAG may be a false positive.
+        let f = function(vec![
+            block(0, Terminator::Branch(BlockId(2))),
+            block(1, Terminator::Return(None)),
+            block(2, Terminator::Branch(BlockId(1))),
+        ]);
+        assert!(function_has_back_edge(&f));
+    }
+
     // -- end-to-end / regression ------------------------------------------
     //
     // The selector unit tests above prove the admission gates in isolation.
@@ -10538,10 +10529,6 @@ mod loop_guard_tests {
         f.is_static = true;
         f.next_value_id = instructions as u32 + 16;
         f.next_label = blocks as u32;
-        let copy = Instruction::Copy {
-            dest: Value(0),
-            src: Operand::Const(IrConst::I32(0)),
-        };
         let mut body: Vec<BasicBlock> = (0..blocks)
             .map(|index| BasicBlock {
                 label: BlockId(index as u32),
@@ -10560,7 +10547,12 @@ mod loop_guard_tests {
             })
             .collect();
         for i in 0..instructions {
-            body[i % blocks.max(1)].instructions.push(copy.clone());
+            body[i % blocks.max(1)]
+                .instructions
+                .push(Instruction::Copy {
+                    dest: Value(i as u32),
+                    src: Operand::Const(IrConst::I32(i as i32)),
+                });
         }
         f.blocks = body;
         f
@@ -10572,11 +10564,11 @@ mod loop_guard_tests {
         f.next_value_id = 64;
         f.next_label = 4;
         let mut loop_body = Vec::new();
-        for _ in 0..call_count_in_loop {
+        for i in 0..call_count_in_loop {
             loop_body.push(Instruction::Call {
                 func: callee.to_string(),
                 info: CallInfo {
-                    dest: Some(Value(1)),
+                    dest: Some(Value(i as u32 + 1)),
                     return_type: IrType::I32,
                     ..CallInfo::default()
                 },
@@ -10586,7 +10578,7 @@ mod loop_guard_tests {
             BasicBlock {
                 label: BlockId(0),
                 instructions: vec![Instruction::Copy {
-                    dest: Value(10),
+                    dest: Value(0),
                     src: Operand::Const(IrConst::I32(0)),
                 }],
                 terminator: Terminator::Branch(BlockId(1)),
@@ -10636,7 +10628,13 @@ mod loop_guard_tests {
 
         let mut module = IrModule::new();
         module.functions = vec![hot1, hot2, callee];
-        super::inline_run(&mut module, false);
+        assert!(
+            crate::passes::verify::verify_module(&module, "guard input").is_empty(),
+            "the synthetic input must be valid SSA"
+        );
+        assert_eq!(super::inline_run(&mut module, false), 2);
+        let violations = crate::passes::verify::verify_module(&module, "guard inline");
+        assert!(violations.is_empty(), "invalid cloned IR: {violations:?}");
 
         let total_calls: usize = module
             .functions
@@ -10647,17 +10645,11 @@ mod loop_guard_tests {
             total_calls, 0,
             "all loop-guard sites should be inlined when every caller is hot"
         );
-        let callee_fn = module
-            .functions
-            .iter()
-            .find(|f| f.name == "varint")
-            .unwrap();
-        let callee_insts: usize = callee_fn.blocks.iter().map(|b| b.instructions.len()).sum();
-        // The outlined body should be dead/empty after both sites inlined.
-        // dead_statics runs in the pipeline; inline_run itself may leave it but
-        // with no callers. Accept either fully removed or still present but
-        // uncalled.
-        let _ = callee_insts;
+        crate::passes::dead_statics::eliminate_dead_static_functions(&mut module);
+        assert!(
+            module.functions.iter().all(|f| f.name != "varint"),
+            "dead-static cleanup must remove the now-unreferenced outlined body"
+        );
     }
 
     #[test]
@@ -11475,7 +11467,6 @@ mod extern_admission_tests {
 
     fn quiet_context() -> CalleeContext {
         CalleeContext {
-            call_counts: Default::default(),
             value_referenced: Default::default(),
             asm_templates: Vec::new(),
             asm_context: Default::default(),
@@ -12845,7 +12836,6 @@ mod phase0_tests {
 
     fn quiet_context() -> CalleeContext {
         CalleeContext {
-            call_counts: Default::default(),
             value_referenced: Default::default(),
             asm_templates: Vec::new(),
             asm_context: Default::default(),
