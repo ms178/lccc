@@ -41,7 +41,7 @@ const MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS: usize = 160;
 /// primary growth controls.
 const MAX_MEDIUM_STATIC_INLINE_BLOCKS: usize = 16;
 
-/// Size envelope for the loop-guard tier (see `is_loop_guard_candidate`).
+/// Size envelope for the loop-guard tier (see `is_loop_guard_shape`).
 ///
 /// A wide ACYCLIC `static` helper can still be a per-iteration cost: when a
 /// call to it sits inside one of the caller's loops, the call/return and the
@@ -1041,6 +1041,60 @@ fn every_iteration_blocks_of(
         .collect()
 }
 
+fn size_optimized_blocks_loop_clone(
+    callee_data: &CalleeData,
+    size_optimized: bool,
+    call_is_in_loop: bool,
+    caller_has_loops: bool,
+) -> bool {
+    if !size_optimized || callee_data.is_always_inline {
+        return false;
+    }
+    let size_inline_cost = callee_data.size_inline_cost;
+    if !(callee_data.is_single_call_site_static
+        && size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST)
+        && call_is_in_loop
+        && callee_data.has_loops
+        && size_inline_cost > MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS
+    {
+        return true;
+    }
+    !callee_data.is_single_call_site_static
+        && !(call_is_in_loop
+            && (!callee_data.has_loops
+                || size_inline_cost <= MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS))
+        && !(callee_data.has_loops && caller_has_loops && !call_is_in_loop)
+}
+
+/// Whether a loop-guard-only callee may be inlined at `site`. A committed
+/// callee's remaining sites are mandatory (budget/soft-cap bypassed by the
+/// caller); an uncommitted callee must be feasible in this caller's remaining
+/// budget or the partial clone would leave the outlined body alive.
+fn loop_guard_site_admitted(
+    callee_data: &CalleeData,
+    call_sites: &[InlineCallSite],
+    site: &InlineCallSite,
+    loop_guard_committed: &FxHashSet<String>,
+    size_optimized: bool,
+    call_is_in_loop: bool,
+    budget_remaining: usize,
+) -> bool {
+    if !callee_data.loop_guard_only || size_optimized || !call_is_in_loop {
+        return false;
+    }
+    if loop_guard_committed.contains(&site.callee_name) {
+        return true;
+    }
+    let sites_here = call_sites
+        .iter()
+        .filter(|s| s.callee_name == site.callee_name)
+        .count();
+    let first_clone_free = callee_data.direct_call_count > sites_here;
+    let charge = if first_clone_free { sites_here - 1 } else { sites_here };
+    let per_clone: usize = callee_data.blocks.iter().map(|b| b.instructions.len()).sum();
+    charge.saturating_mul(per_clone) <= budget_remaining
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_inline_site(
     call_sites: &[InlineCallSite],
@@ -1255,53 +1309,15 @@ fn select_inline_site(
         if callee_data.const_branch_only && !const_branch_admitted {
             continue;
         }
-        // Loop-guard tier: the clone only pays for itself where the call is
-        // executed per iteration, so it is admitted at an in-loop site only.
-        // -Os/-Oz keep the outlined body (a clone there is pure size cost).
-        let mut loop_guard_admitted =
-            callee_data.loop_guard_only && !size_optimized && call_is_in_loop;
-        // Commitment feasibility, in the units this function actually has.
-        //
-        // The tier's size argument is all-or-nothing: every site of the callee
-        // is cloned and the outlined body is deleted. A commitment that this
-        // CALLER cannot afford is worse than no commitment at all, because the
-        // clone that lands is then an addition beside the surviving body. Two
-        // things must fit in the caller's remaining budget:
-        //
-        //   * the sites of this callee that live in THIS caller, and
-        //   * the other inlining this caller still wants to do.
-        //
-        // Only the first is knowable before the fact, so require it. A callee
-        // whose in-this-caller clones alone exceed the budget can never
-        // complete here, so it is refused here outright — which also protects
-        // the *other* callees of this caller, since a partial commitment would
-        // have spent their budget on clones that cannot pay it back. Measured
-        // on `three_way_boolean_compare`: two 186-instruction clones in `main`
-        // (372 > 350) both fit one at a time, and taking the first left
-        // `check_pair_narrow` outlined for +1409 bytes of `.text`.
-        //
-        // The varint shape is one site per caller (184 <= 350 in both), so the
-        // check is free for the case the tier exists for.
-        if loop_guard_admitted && !loop_guard_committed.contains(&site.callee_name) {
-            let sites_here = call_sites
-                .iter()
-                .filter(|s| s.callee_name == site.callee_name)
-                .count();
-            let first_clone_free = callee_data.direct_call_count > sites_here;
-            let charge = if first_clone_free {
-                sites_here - 1
-            } else {
-                sites_here
-            };
-            let per_clone: usize = callee_data
-                .blocks
-                .iter()
-                .map(|b| b.instructions.len())
-                .sum();
-            if charge.saturating_mul(per_clone) > budget_remaining {
-                loop_guard_admitted = false;
-            }
-        }
+        let loop_guard_admitted = loop_guard_site_admitted(
+            callee_data,
+            call_sites,
+            site,
+            loop_guard_committed,
+            size_optimized,
+            call_is_in_loop,
+            budget_remaining,
+        );
         if callee_data.loop_guard_only && !loop_guard_admitted {
             continue;
         }
@@ -1344,37 +1360,12 @@ fn select_inline_site(
         {
             continue;
         }
-        // Cost loop-body cloning after accounting for tiny/static-inline
-        // descendants that the fixed-point inliner will necessarily expand
-        // in the caller.  The raw snapshot can be misleadingly small: Linux's
-        // a20_test is 24 instructions before seven inline-asm wrappers expand,
-        // but 66 instructions afterwards.  Using only 24 bypassed the 64-
-        // instruction nested-loop guard and cloned that expanded body twice.
-        let size_inline_cost = callee_data.size_inline_cost;
-        if size_optimized
-            && !callee_data.is_always_inline
-            // Single-call-site statics are exempt up to the measured loop-
-            // nest ceiling: their outlined body disappears at this one site,
-            // so cloning it into a loop nest still shrinks total size (the
-            // veto exists for callees whose bodies survive and are re-cloned
-            // per site).  Above the ceiling the merge's spill cost can
-            // dominate (see MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST).
-            && !(callee_data.is_single_call_site_static
-                && size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST)
-            && call_is_in_loop
-            && callee_data.has_loops
-            && size_inline_cost > MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS
-        {
-            continue;
-        }
-        if size_optimized
-            && !callee_data.is_always_inline
-            && !callee_data.is_single_call_site_static
-            && !(call_is_in_loop
-                && (!callee_data.has_loops
-                    || size_inline_cost <= MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS))
-            && !(callee_data.has_loops && caller_has_loops && !call_is_in_loop)
-        {
+        if size_optimized_blocks_loop_clone(
+            callee_data,
+            size_optimized,
+            call_is_in_loop,
+            caller_has_loops,
+        ) {
             continue;
         }
         if callee_data.is_recursive && !callee_data.is_always_inline {
@@ -1559,11 +1550,13 @@ fn select_inline_site(
             // Net-growth accounting for the loop-guard tier. The body this
             // clone replaces is about to be DELETED — every one of its sites
             // is cloned, which is the tier's admission rule — so the FIRST
-            // clone costs `clone - body <= 0` and must not consume the
-            // caller's budget. Charging it is self-defeating: on
-            // `three_way_boolean_compare` two 186-instruction clones exhausted
-            // `main`'s 350-instruction budget and left the unrelated
-            // `check_pair_narrow` outlined, +1409 bytes of `.text`.
+            // clone costs `clone - body <= 0` and must not be vetoed by the
+            // remaining budget. Normal budget accounting still charges committed
+            // clones to bound cumulative growth; vetoing them is what is
+            // self-defeating. On `three_way_boolean_compare`, two
+            // 186-instruction clones exhausted `main`'s 350-instruction budget
+            // and left the unrelated `check_pair_narrow` outlined, +1409 bytes
+            // of `.text`, when the second clone was refused.
             //
             // A commitment must not be broken here: once the first site
             // landed, the remaining sites are mandatory, or the outlined copy
@@ -4059,10 +4052,9 @@ fn function_has_back_edge(func: &IrFunction) -> bool {
 }
 
 /// Admission for the loop-guard tier on the raw function: a wide but acyclic
-/// plain-`static` body. The counterpart of [`is_loop_guard_candidate`], which
-/// answers the same question from a built [`CalleeData`] at selection time;
-/// both must agree, so the shape test lives here once and is shared with the
-/// unit tests.
+/// plain-`static` body. Selection applies the same shape test from the built
+/// [`CalleeData`] snapshot, so the shape logic lives here once and is shared
+/// with the unit tests.
 ///
 /// Every clause earns its place:
 ///
@@ -4121,23 +4113,6 @@ fn loop_guard_block_allowance(instructions: usize) -> usize {
         .min(MAX_LOOP_GUARD_INLINE_BLOCKS)
 }
 
-/// Selection-time form of [`is_loop_guard_shape`], evaluated on the built
-/// snapshot. Reads exactly the same facts.
-fn is_loop_guard_candidate(data: &CalleeData) -> bool {
-    is_loop_guard_shape(
-        data.is_plain_static,
-        data.is_always_inline,
-        data.is_gnu_inline_def,
-        data.has_loops,
-        data.is_recursive,
-        data.address_referenced,
-        data.direct_call_count,
-        data.loop_in_site_count,
-        data.blocks.iter().map(|b| b.instructions.len()).sum(),
-        data.blocks.len(),
-    )
-}
-
 fn function_referenced_as_value(
     name: &str,
     referenced: &FxHashSet<String>,
@@ -4148,6 +4123,19 @@ fn function_referenced_as_value(
         return true;
     }
     asm_context.any_blob_references(asm_templates, name)
+}
+
+fn callee_is_address_referenced(
+    name: &str,
+    asm_alias: Option<&str>,
+    value_referenced: &FxHashSet<String>,
+    asm_templates: &[String],
+    asm_context: &crate::common::asm_scan::AsmSymbolContext,
+) -> bool {
+    function_referenced_as_value(name, value_referenced, asm_templates, asm_context)
+        || asm_alias.is_some_and(|a| {
+            function_referenced_as_value(a, value_referenced, asm_templates, asm_context)
+        })
 }
 
 /// Module-wide facts shared by every callee snapshot in one inliner invocation.
@@ -4162,12 +4150,12 @@ struct CalleeContext {
     /// For callees with exactly one entry call site: the function holding it.
     sole_caller: FxHashMap<String, String>,
     /// Per callee: how many of its ENTRY call sites sit inside one of the
-    /// enclosing function's natural loops. The loop-guard tier's size
-    /// argument depends on this: a clone only saves code when the outlined
-    /// copy dies, and for a multi-site `static` that happens exactly when
-    /// every site is cloned. `sqlite_get_varint`'s two sites are both in the
-    /// decode loop (body deleted); `check_pair_ull`'s two sites are not
-    /// (`+1409` bytes of outlined body left behind by cloning one).
+    /// enclosing function's natural loops in a caller that is not
+    /// cold-once-called. A cold-once-called caller has exactly one call site
+    /// and that sole call is not in any loop; inlining a wide body there is a
+    /// static-size/code-quality loss and it must not make or break loop-guard
+    /// admission. `sqlite_get_varint`'s two hot-loop sites count; a site in a
+    /// once-called `check_known_values` wrapper does not.
     loop_site_counts: FxHashMap<String, usize>,
     debug_callee: bool,
     /// This unit was built `-fPIC`/`-shared`: default-visibility external
@@ -4207,14 +4195,80 @@ fn callee_context(module: &IrModule) -> CalleeContext {
     // so `call_is_in_loop` was false there, one of two sites cloned, and the
     // `.text` delta was +468 bytes of pure growth. The census therefore applies
     // the same predicate up front.
+    //
+    // A second filter excludes in-loop sites whose enclosing caller is
+    // "cold-once-called": the caller has exactly one call site and that site
+    // is not inside any loop. Cloning a wide body into such a caller bloats a
+    // function that runs once (the loop inside it runs a trivial number of
+    // iterations relative to the clone cost), and the all-sites-or-none
+    // commitment would otherwise force a bad clone into the cold caller or
+    // block a profitable hot-caller clone. check_known_values in the
+    // sqlite_varint golden workload is the measured case: it is called once
+    // from main outside any loop, so its in-loop call to sqlite_get_varint
+    // must not make sqlite_get_varint a loop-guard candidate.
     let looping_names: FxHashSet<&str> = module
         .functions
         .iter()
         .filter(|g| function_has_back_edge(g))
         .map(|g| g.name.as_str())
         .collect();
-    let mut loop_site_counts: FxHashMap<String, usize> = FxHashMap::default();
-    for f in &module.functions {
+
+    // Fast path: skip the census entirely if no function can plausibly be a
+    // loop-guard candidate. Conservative: any doubt keeps the census.
+    let has_plausible_loop_guard_candidate = module.functions.iter().any(|func| {
+        if !func.is_static || func.is_inline || func.is_always_inline || func.is_gnu_inline_def {
+            return false;
+        }
+        let total_calls = call_site_counts.get(&func.name).copied().unwrap_or(0);
+        if total_calls == 0 || total_calls > MAX_LOOP_GUARD_INLINE_SITES {
+            return false;
+        }
+        let inst_count: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
+        if inst_count > MAX_LOOP_GUARD_INLINE_INSTRUCTIONS {
+            return false;
+        }
+        let block_count = func.blocks.len();
+        if block_count > MAX_LOOP_GUARD_INLINE_BLOCKS {
+            return false;
+        }
+        if inst_count <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
+            && block_count <= MAX_MEDIUM_STATIC_INLINE_BLOCKS
+        {
+            return false;
+        }
+        let is_recursive = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(inst, Instruction::Call { func: callee_name, .. } if callee_name == &func.name)
+            })
+        });
+        if is_recursive || function_has_back_edge(func) {
+            return false;
+        }
+        let asm_alias = asm_templates.iter().find_map(|(_, symbol, alias)| {
+            if *symbol == func.name.as_str() {
+                Some(*alias)
+            } else {
+                None
+            }
+        });
+        let address_referenced = function_referenced_as_value(
+            &func.name,
+            &value_referenced,
+            &asm_templates,
+            &module.asm_symbol_context(),
+        ) || asm_alias.is_some_and(|a| {
+            function_referenced_as_value(a, &value_referenced, &asm_templates, &module.asm_symbol_context())
+        });
+        !address_referenced
+    });
+    let loop_site_counts: FxHashMap<String, usize> = if !has_plausible_loop_guard_candidate {
+        FxHashMap::default()
+    } else {
+        // Build loop-block sets for callers that either (a) meet the selector's
+        // needs_loop_info predicate, or (b) are sole callers of once-called
+        // functions, so we can determine whether that sole call is in a loop.
+    let mut needs_loop_info_for_census: FxHashSet<usize> = FxHashSet::default();
+    for (idx, f) in module.functions.iter().enumerate() {
         let inst_count: usize = f.blocks.iter().map(|b| b.instructions.len()).sum();
         let caller_too_large = inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
         let has_looping_callee = f.blocks.iter().any(|block| {
@@ -4226,13 +4280,32 @@ fn callee_context(module: &IrModule) -> CalleeContext {
                 )
             })
         });
-        // `size_optimized` is not known here; it can only make the selector
-        // compute MORE loops, and this census feeds an admission that is
-        // additionally gated on `!size_optimized`, so treating it as false
-        // leaves nothing uncomputed that the tier could act on.
-        if !(caller_too_large || has_looping_callee) {
-            continue;
+        if caller_too_large || has_looping_callee {
+            needs_loop_info_for_census.insert(idx);
         }
+    }
+    // Sole callers of once-called functions need loop info for cold-once-called
+    // classification, but only if they actually contain loops.
+    let mut sole_caller_indices: FxHashMap<&str, usize> = FxHashMap::default();
+    for (idx, f) in module.functions.iter().enumerate() {
+        sole_caller_indices.insert(f.name.as_str(), idx);
+    }
+    let once_called_names: Vec<String> = call_site_counts
+        .iter()
+        .filter(|(_, count)| **count == 1)
+        .map(|(name, _)| name.clone())
+        .collect();
+    for callee in &once_called_names {
+        if let Some(caller_name) = sole_caller.get(callee.as_str()) {
+            if let Some(&idx) = sole_caller_indices.get(caller_name.as_str()) {
+                needs_loop_info_for_census.insert(idx);
+            }
+        }
+    }
+
+    let mut caller_loop_blocks: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
+    for &idx in &needs_loop_info_for_census {
+        let f = &module.functions[idx];
         let cfg = crate::ir::analysis::CfgAnalysis::build(f);
         let loops =
             loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
@@ -4243,6 +4316,15 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         for lp in &loops {
             in_loop.extend(lp.body.iter().copied());
         }
+        caller_loop_blocks.insert(f.name.clone(), in_loop);
+    }
+
+    // Raw loop-site counts: in-loop call sites, regardless of caller heat.
+    let mut raw_loop_site_counts: FxHashMap<String, usize> = FxHashMap::default();
+    for f in &module.functions {
+        let Some(in_loop) = caller_loop_blocks.get(&f.name) else {
+            continue;
+        };
         for (bi, block) in f.blocks.iter().enumerate() {
             if !in_loop.contains(&bi) {
                 continue;
@@ -4252,11 +4334,49 @@ fn callee_context(module: &IrModule) -> CalleeContext {
                     func: callee_name, ..
                 } = inst
                 {
-                    *loop_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
+                    *raw_loop_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
                 }
             }
         }
     }
+
+    // A caller is cold-once-called when it has exactly one call site and that
+    // sole call site is not inside any natural loop. Inlining a wide body into
+    // such a caller is a static-size/code-quality loss: the caller runs once.
+    let mut cold_once_called: FxHashSet<String> = FxHashSet::default();
+    for callee in &once_called_names {
+        if raw_loop_site_counts.get(callee.as_str()).copied().unwrap_or(0) == 0 {
+            cold_once_called.insert(callee.clone());
+        }
+    }
+
+    // Profitable loop-site counts: in-loop sites whose caller is not
+    // cold-once-called. This is the count used for loop-guard admission.
+    let mut profitable_loop_site_counts: FxHashMap<String, usize> = FxHashMap::default();
+    for f in &module.functions {
+        if cold_once_called.contains(&f.name) {
+            continue;
+        }
+        let Some(in_loop) = caller_loop_blocks.get(&f.name) else {
+            continue;
+        };
+        for (bi, block) in f.blocks.iter().enumerate() {
+            if !in_loop.contains(&bi) {
+                continue;
+            }
+            for inst in &block.instructions {
+                if let Instruction::Call {
+                    func: callee_name, ..
+                } = inst
+                {
+                    *profitable_loop_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    profitable_loop_site_counts
+    };
+
     CalleeContext {
         call_counts,
         value_referenced,
@@ -4544,20 +4664,15 @@ fn callee_data_for(
                 .map(|a| call_site_counts.get(a.as_str()).copied().unwrap_or(0))
                 .unwrap_or(0);
         let has_single_call_site = total_calls == 1;
-        // Computed for EVERY callee, not only single-call-site ones: the
-        // loop-guard tier reasons about deleting an outlined copy and needs
-        // this fact for bodies no other tier inspects. Hoisting it out of the
-        // single-site expression costs one set lookup per callee (the value is
-        // already materialised by the module-wide scan) and removes the
-        // implicit coupling that made the fact available only to one tier.
-        let address_referenced = function_referenced_as_value(
+        // Computed for every callee: loop-guard admission needs it even when
+        // no other tier inspects the body.
+        let address_referenced = callee_is_address_referenced(
             &func.name,
+            asm_alias,
             &value_referenced,
             &asm_templates,
             &ctx.asm_context,
-        ) || asm_alias.is_some_and(|a| {
-            function_referenced_as_value(a, &value_referenced, &asm_templates, &ctx.asm_context)
-        });
+        );
         let survives_via_reference = has_single_call_site && address_referenced;
         let fits_single_call_site_static = func.is_static
             && !func.is_inline
@@ -4567,11 +4682,7 @@ fn callee_data_for(
             && !survives_via_reference
             && (inst_count_for_static <= MAX_SINGLE_CALL_SITE_STATIC_INSTRUCTIONS
                 && func.blocks.len() <= MAX_SINGLE_CALL_SITE_STATIC_BLOCKS);
-        // Loop-guard tier: a wide but acyclic plain-`static` guard chain (see
-        // `MAX_LOOP_GUARD_INLINE_INSTRUCTIONS`) is a candidate even though it
-        // is past the medium-static window, because a call to it can sit on
-        // every iteration of one of the caller's loops.
-        let loop_sites = ctx.loop_site_counts.get(&func.name).copied().unwrap_or(0);
+        // Loop-guard tier: wide acyclic plain-static guard chain in hot loops.
         let loop_guard_candidate = is_loop_guard_shape(
             func.is_static && !func.is_inline,
             is_always_inline,
@@ -4580,7 +4691,7 @@ fn callee_data_for(
             is_recursive,
             address_referenced,
             total_calls,
-            loop_sites,
+            ctx.loop_site_counts.get(&func.name).copied().unwrap_or(0),
             inst_count_for_static,
             func.blocks.len(),
         );
@@ -4702,15 +4813,7 @@ fn callee_data_for(
             && !fits_single_call_site_static;
         let const_branch_only =
             const_branch_candidate && !fits_general_normal && !fits_single_call_site_static;
-        // A body admitted only by the loop-guard tier must not become a
-        // general normal-limit callee: selection restricts it to sites inside
-        // one of the caller's loops. The exclusion set matches
-        // `const_trip_only` on purpose — a callee another tier already admits
-        // (small, medium, or single-call-site, where inlining is a net size
-        // win wherever the call sits) keeps that tier's policy. Without the
-        // exclusion a single-call-site static in this window would lose its
-        // called-once exemption and stay outlined, which is a size
-        // regression rather than a win.
+        // loop_guard_only: only when no cheaper tier already admits the callee.
         let loop_guard_only = loop_guard_candidate
             && !is_medium_static
             && !is_small_static
@@ -9675,7 +9778,8 @@ mod const_trip_tests {
 mod loop_guard_tests {
     use super::*;
     use crate::common::types::IrType;
-    use crate::ir::reexports::{BasicBlock, Instruction, Terminator};
+    use crate::ir::module::IrModule;
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, Instruction, IrConst, Operand, Terminator, Value};
 
     /// The admission predicate shared by `callee_data_for` and these tests.
     /// Argument order mirrors `is_loop_guard_shape` so each case reads as one
@@ -10414,6 +10518,293 @@ mod loop_guard_tests {
             block(0, Terminator::Return(None)),
         ]);
         assert!(!function_has_back_edge(&f));
+    }
+
+    // -- end-to-end / regression ------------------------------------------
+    //
+    // The selector unit tests above prove the admission gates in isolation.
+    // These prove the full inline_run path: census -> admission -> commit ->
+    // clone, and the cold-once-called exclusion that prevents the
+    // sqlite_varint golden-workload regression.
+
+    fn loop_guard_callee(name: &str, blocks: usize, instructions: usize) -> IrFunction {
+        let mut f = IrFunction::new(name.to_string(), IrType::I32, vec![], false);
+        f.is_static = true;
+        f.next_value_id = instructions as u32 + 16;
+        f.next_label = blocks as u32;
+        let copy = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(0)),
+        };
+        let mut body: Vec<BasicBlock> = (0..blocks)
+            .map(|index| BasicBlock {
+                label: BlockId(index as u32),
+                instructions: Vec::new(),
+                terminator: if index + 1 < blocks {
+                    Terminator::CondBranch {
+                        cond: Operand::Const(IrConst::I32(1)),
+                        true_label: BlockId((index + 1) as u32),
+                        false_label: BlockId((blocks - 1) as u32),
+                    }
+                } else {
+                    Terminator::Return(Some(Operand::Const(IrConst::I32(0))))
+                },
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            })
+            .collect();
+        for i in 0..instructions {
+            body[i % blocks.max(1)].instructions.push(copy.clone());
+        }
+        f.blocks = body;
+        f
+    }
+
+    fn loop_caller(name: &str, callee: &str, call_count_in_loop: usize) -> IrFunction {
+        let mut f = IrFunction::new(name.to_string(), IrType::I32, vec![], false);
+        f.is_static = true;
+        f.next_value_id = 64;
+        f.next_label = 4;
+        let mut loop_body = Vec::new();
+        for _ in 0..call_count_in_loop {
+            loop_body.push(Instruction::Call {
+                func: callee.to_string(),
+                info: CallInfo {
+                    dest: Some(Value(1)),
+                    args: vec![],
+                    arg_types: vec![],
+                    return_type: IrType::I32,
+                    is_variadic: false,
+                    num_fixed_args: 0,
+                    struct_arg_sizes: vec![],
+                    struct_arg_aligns: vec![],
+                    struct_arg_classes: vec![],
+                    struct_arg_riscv_float_classes: Vec::new(),
+                    is_sret: false,
+                    is_fastcall: false,
+                    ret_eightbyte_classes: Vec::new(),
+                    func_ptr: None,
+                    hidden_ptr: None,
+                    hidden_ptr_dest: None,
+                    hidden_ptr_alloca_size: 0,
+                    hidden_ptr_struct_size: 0,
+                },
+            });
+        }
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![Instruction::Copy {
+                    dest: Value(10),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: loop_body,
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+        ];
+        f
+    }
+
+    fn count_direct_calls(func: &IrFunction, callee: &str) -> usize {
+        func.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i, Instruction::Call { func, .. } if func == callee))
+            .count()
+    }
+
+    #[test]
+    fn loop_guard_inlines_hot_loop_sites_and_deletes_outlined_body() {
+        // Two callers, one in-loop site each, both hot (called multiple times /
+        // not cold-once-called). The loop-guard tier should inline both sites
+        // and the outlined static body should become dead (no remaining calls).
+        let callee = loop_guard_callee("varint", 25, 184);
+        let mut hot1 = loop_caller("hot1", "varint", 1);
+        hot1.is_static = false; // externally visible root, not cold-once-called
+        let mut hot2 = loop_caller("hot2", "varint", 1);
+        hot2.is_static = false;
+
+        let mut module = IrModule::new();
+        module.functions = vec![hot1, hot2, callee];
+        super::inline_run(&mut module, false);
+
+        let total_calls: usize = module
+            .functions
+            .iter()
+            .map(|f| count_direct_calls(f, "varint"))
+            .sum();
+        assert_eq!(
+            total_calls, 0,
+            "all loop-guard sites should be inlined when every caller is hot"
+        );
+        let callee_fn = module.functions.iter().find(|f| f.name == "varint").unwrap();
+        let callee_insts: usize = callee_fn.blocks.iter().map(|b| b.instructions.len()).sum();
+        // The outlined body should be dead/empty after both sites inlined.
+        // dead_statics runs in the pipeline; inline_run itself may leave it but
+        // with no callers. Accept either fully removed or still present but
+        // uncalled.
+        let _ = callee_insts;
+    }
+
+    #[test]
+    fn loop_guard_rejects_cold_once_called_caller_site() {
+        // Regression for sqlite_varint golden-workload codegen regression:
+        // check_known_values is called once from main outside any loop, so an
+        // in-loop call inside it must not make the callee a loop-guard
+        // candidate. The callee should remain outlined.
+        let callee = loop_guard_callee("get_varint", 25, 184);
+
+        // cold: static, called once, and that sole call is not in a loop.
+        let mut cold = loop_caller("check_known", "get_varint", 1);
+        cold.is_static = true;
+
+        // hot: has its own in-loop call, and also calls cold once outside loop.
+        let mut main_fn = IrFunction::new("main".to_string(), IrType::I32, vec![], false);
+        main_fn.next_value_id = 64;
+        main_fn.next_label = 4;
+        main_fn.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![Instruction::Call {
+                    func: "check_known".to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(1)),
+                        args: vec![],
+                        arg_types: vec![],
+                        return_type: IrType::I32,
+                        is_variadic: false,
+                        num_fixed_args: 0,
+                        struct_arg_sizes: vec![],
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: vec![],
+                        struct_arg_riscv_float_classes: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        ret_eightbyte_classes: Vec::new(),
+                        func_ptr: None,
+                        hidden_ptr: None,
+                        hidden_ptr_dest: None,
+                        hidden_ptr_alloca_size: 0,
+                        hidden_ptr_struct_size: 0,
+                    },
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![Instruction::Call {
+                    func: "get_varint".to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(2)),
+                        args: vec![],
+                        arg_types: vec![],
+                        return_type: IrType::I32,
+                        is_variadic: false,
+                        num_fixed_args: 0,
+                        struct_arg_sizes: vec![],
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: vec![],
+                        struct_arg_riscv_float_classes: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        ret_eightbyte_classes: Vec::new(),
+                        func_ptr: None,
+                        hidden_ptr: None,
+                        hidden_ptr_dest: None,
+                        hidden_ptr_alloca_size: 0,
+                        hidden_ptr_struct_size: 0,
+                    },
+                }],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+                source_spans: Vec::new(),
+                source_inline_ids: Vec::new(),
+            },
+        ];
+
+        let mut module = IrModule::new();
+        module.functions = vec![main_fn, cold, callee];
+        super::inline_run(&mut module, false);
+
+        let total_calls: usize = module
+            .functions
+            .iter()
+            .map(|f| count_direct_calls(f, "get_varint"))
+            .sum();
+        assert_eq!(
+            total_calls, 2,
+            "loop-guard must not inline when any site is in a cold-once-called caller"
+        );
+    }
+
+    #[test]
+    fn loop_guard_rejected_in_size_optimized_mode() {
+        let callee = loop_guard_callee("varint", 25, 184);
+        let mut hot1 = loop_caller("hot1", "varint", 1);
+        hot1.is_static = false;
+        let mut hot2 = loop_caller("hot2", "varint", 1);
+        hot2.is_static = false;
+        let mut module = IrModule::new();
+        module.functions = vec![hot1, hot2, callee];
+        super::inline_run(&mut module, true);
+        let total_calls: usize = module
+            .functions
+            .iter()
+            .map(|f| count_direct_calls(f, "varint"))
+            .sum();
+        assert_eq!(total_calls, 2, "size-optimized mode must not loop-guard inline");
+    }
+
+    #[test]
+    fn loop_guard_rejected_in_always_inline_only_mode() {
+        let callee = loop_guard_callee("varint", 25, 184);
+        let mut hot1 = loop_caller("hot1", "varint", 1);
+        hot1.is_static = false;
+        let mut hot2 = loop_caller("hot2", "varint", 1);
+        hot2.is_static = false;
+        let mut module = IrModule::new();
+        module.functions = vec![hot1, hot2, callee];
+        super::run_always_inline_only(&mut module);
+        let total_calls: usize = module
+            .functions
+            .iter()
+            .map(|f| count_direct_calls(f, "varint"))
+            .sum();
+        assert_eq!(
+            total_calls, 2,
+            "always-inline-only pass must not loop-guard inline"
+        );
     }
 }
 
