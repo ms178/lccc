@@ -4307,8 +4307,7 @@ fn callee_context(module: &IrModule) -> CalleeContext {
             }
         }
 
-        let mut caller_loop_blocks: FxHashMap<String, FxHashSet<usize>> =
-            FxHashMap::default();
+        let mut caller_loop_blocks: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
         for &idx in &needs_loop_info_for_census {
             let f = &module.functions[idx];
             let cfg = crate::ir::analysis::CfgAnalysis::build(f);
@@ -4343,9 +4342,7 @@ fn callee_context(module: &IrModule) -> CalleeContext {
                         func: callee_name, ..
                     } = inst
                     {
-                        *raw_loop_site_counts
-                            .entry(callee_name.clone())
-                            .or_insert(0) += 1;
+                        *raw_loop_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
                     }
                 }
             }
@@ -4368,8 +4365,7 @@ fn callee_context(module: &IrModule) -> CalleeContext {
 
         // Profitable loop-site counts: in-loop sites whose caller is not
         // cold-once-called. This is the count used for loop-guard admission.
-        let mut profitable_loop_site_counts: FxHashMap<String, usize> =
-            FxHashMap::default();
+        let mut profitable_loop_site_counts: FxHashMap<String, usize> = FxHashMap::default();
         for f in &module.functions {
             if cold_once_called.contains(&f.name) {
                 continue;
@@ -10592,23 +10588,8 @@ mod loop_guard_tests {
                 func: callee.to_string(),
                 info: CallInfo {
                     dest: Some(Value(1)),
-                    args: vec![],
-                    arg_types: vec![],
                     return_type: IrType::I32,
-                    is_variadic: false,
-                    num_fixed_args: 0,
-                    struct_arg_sizes: vec![],
-                    struct_arg_aligns: vec![],
-                    struct_arg_classes: vec![],
-                    struct_arg_riscv_float_classes: Vec::new(),
-                    is_sret: false,
-                    is_fastcall: false,
-                    ret_eightbyte_classes: Vec::new(),
-                    func_ptr: None,
-                    hidden_ptr: None,
-                    hidden_ptr_dest: None,
-                    hidden_ptr_alloca_size: 0,
-                    hidden_ptr_struct_size: 0,
+                    ..CallInfo::default()
                 },
             });
         }
@@ -10713,23 +10694,8 @@ mod loop_guard_tests {
                     func: "check_known".to_string(),
                     info: CallInfo {
                         dest: Some(Value(1)),
-                        args: vec![],
-                        arg_types: vec![],
                         return_type: IrType::I32,
-                        is_variadic: false,
-                        num_fixed_args: 0,
-                        struct_arg_sizes: vec![],
-                        struct_arg_aligns: vec![],
-                        struct_arg_classes: vec![],
-                        struct_arg_riscv_float_classes: Vec::new(),
-                        is_sret: false,
-                        is_fastcall: false,
-                        ret_eightbyte_classes: Vec::new(),
-                        func_ptr: None,
-                        hidden_ptr: None,
-                        hidden_ptr_dest: None,
-                        hidden_ptr_alloca_size: 0,
-                        hidden_ptr_struct_size: 0,
+                        ..CallInfo::default()
                     },
                 }],
                 terminator: Terminator::Branch(BlockId(1)),
@@ -10742,23 +10708,8 @@ mod loop_guard_tests {
                     func: "get_varint".to_string(),
                     info: CallInfo {
                         dest: Some(Value(2)),
-                        args: vec![],
-                        arg_types: vec![],
                         return_type: IrType::I32,
-                        is_variadic: false,
-                        num_fixed_args: 0,
-                        struct_arg_sizes: vec![],
-                        struct_arg_aligns: vec![],
-                        struct_arg_classes: vec![],
-                        struct_arg_riscv_float_classes: Vec::new(),
-                        is_sret: false,
-                        is_fastcall: false,
-                        ret_eightbyte_classes: Vec::new(),
-                        func_ptr: None,
-                        hidden_ptr: None,
-                        hidden_ptr_dest: None,
-                        hidden_ptr_alloca_size: 0,
-                        hidden_ptr_struct_size: 0,
+                        ..CallInfo::default()
                     },
                 }],
                 terminator: Terminator::CondBranch {
