@@ -22,7 +22,10 @@ spec.loader.exec_module(summary)
 
 
 def output(number=100, answer="a" * 48, test="case", duration="0.500"):
-    return (f"  100 - {test}........................    {duration}s\n"
+    return ("-- Speedtest1 for SQLite 3.54.1 2026-10-16 14:45:20 "
+            "555e07ef33f69a0957d24d8e555b\n"
+            "       Begin testset \"main\"\n"
+            f"  100 - {test}........................    {duration}s\n"
             f"       TOTAL............................    {duration}s\n"
             f"Verification Hash: {number} {answer}\n")
 
@@ -65,6 +68,32 @@ class SpeedtestSummary(unittest.TestCase):
         p.write_text(output().replace("Verification Hash:", "Gone:"))
         with self.assertRaisesRegex(ValueError, "missing total"):
             summary.parse_run(p)
+
+    def test_stdout_warning_and_duplicate_hash_are_not_hidden_by_valid_rows(self):
+        path = self.put("gcc", output() + "warning: output was truncated\n")
+        with self.assertRaisesRegex(ValueError, "unexpected speedtest stdout"):
+            summary.parse_run(path)
+        path.write_text(output() + "Verification Hash: 100 " + "a" * 48 + "\n")
+        with self.assertRaisesRegex(ValueError, "duplicate total or verification"):
+            summary.parse_run(path)
+        path.write_text(output() + "       TOTAL............................    0.500s\n")
+        with self.assertRaisesRegex(ValueError, "duplicate total or verification"):
+            summary.parse_run(path)
+        path.write_text(output().replace(
+            "       Begin testset", output().splitlines()[0] + "\n       Begin testset"))
+        with self.assertRaisesRegex(ValueError, "unexpected speedtest stdout"):
+            summary.parse_run(path)
+        path.write_text(output() + "  999 - unexpected....................    0.500s\n")
+        with self.assertRaisesRegex(ValueError, "unexpected speedtest stdout"):
+            summary.parse_run(path)
+
+    def test_wrong_reported_sqlite_version_or_testset_is_fatal(self):
+        path = self.put("gcc", output().replace("SQLite 3.54.1", "SQLite 0.0.0"))
+        with self.assertRaisesRegex(ValueError, "unexpected speedtest stdout"):
+            summary.parse_run(path, expected_set="main")
+        path.write_text(output().replace('Begin testset "main"', 'Begin testset "other"'))
+        with self.assertRaisesRegex(ValueError, "different speedtest1 testset"):
+            summary.parse_run(path, expected_set="main")
 
     def test_compiler_digest_streamed_from_real_bytes(self):
         path = self.artifacts / "compiler"

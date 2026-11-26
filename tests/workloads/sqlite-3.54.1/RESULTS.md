@@ -159,7 +159,7 @@ cases and all six speedtest hashes and integrity checks. Every one of the **84**
 seven-round paired SQLite samples passed its hash, identity, empty-stderr and
 fresh-database integrity gates. The replacement compiler passed **14/14**
 pass-specific Rust tests; the updated comparator/runner and A/B harness tests
-passed **17/17** and **10/10**. Host GCC/Clang/LCCC on/off passed 90,000
+passed **19/19** and **10/10**. Host GCC/Clang/LCCC on/off passed 90,000
 varints plus 4,096 inputs for **each** backward encoding. On i686 and pinned
 QEMU 11.1.3 AArch64/RISC-V 64, the independent-oracle binaries passed 90,000
 varints plus **100,000** guarded deltas per compiler/mode, while pass-on/off
@@ -167,8 +167,11 @@ emitted identical negative-control functions on each target. GDB/nm confirmed
 that the final SQLite `sqlite3GetVarint` is **404 bytes** with the pass versus
 **409** without it (no debug-type information was embedded in these builds).
 
-The updated differential gates additionally reject unexpected runtime stderr
-and stale PASS outputs, and the database-integrity shell gate now checks the
+The updated differential gates additionally reject unexpected runtime stderr,
+extra/duplicated stdout lines after a valid hash, and stale PASS outputs. The
+strict parser accepted all **164** retained enabled/disabled/Clang/paired/smoke
+speedtest logs (72 + 6 + 84 + 2) and rejected injected warnings, duplicate
+summary/hash, out-of-order rows, incorrect version and wrong testset. The database-integrity shell gate checks the
 CLI **exit status** separately from its `ok` stdout (command substitution
 alone could conceal a nonzero exit). Synthetic nonzero, stderr, corrupt and
 successful CLI unit cases cover this guard; a real SQLite CLI also returned

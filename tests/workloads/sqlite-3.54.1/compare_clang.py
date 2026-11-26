@@ -115,7 +115,7 @@ def main() -> None:
         run_speedtest([str(build / "speedtest1"), "--size", str(manifest["speedtest_size"]),
                        "--nosync", "--testset", testset, "--verify", str(db)], text,
                       cwd=build)
-        run = parse_run(text)
+        run = parse_run(text, expected_set=testset)
         if (run["verification_hash"] != expected["verification_hash"] or
                 run["verification_bytes"] != expected["verified_bytes"] or
                 run["tests"] != [tuple(row) for row in expected["runs"]["gcc"][0]["tests"]] or

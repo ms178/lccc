@@ -118,7 +118,7 @@ def main() -> None:
                     if proc.returncode:
                         raise RuntimeError(f"speedtest failed for {log}: rc={proc.returncode}")
                     require_silent(proc.stderr, err)
-                    run = parse_run(log)
+                    run = parse_run(log, expected_set=testset)
                     validate_run(run, expected, log)
                     integrity = subprocess.run(
                         [str(exe / "sqlite3"), "-batch", "-bail", str(db),

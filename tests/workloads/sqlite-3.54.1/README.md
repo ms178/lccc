@@ -99,9 +99,12 @@ capped at 2. `SPEED_SIZE=25`, `SPEED_REPEATS=3` and
 speedtest1 matrix; each GCC/LCCC pair runs on fresh file-backed databases.
 The script checks each pair's result hash, test identities, SQL and database
 integrity and scans every configure/build/link log for warnings **before**
-writing a `PASS` manifest; reruns invalidate stale PASS manifests at startup.
-It reports raw per-test times and medians separately, with no
-PMU/hardware-speed claim. The separate
+writing a `PASS` manifest; reruns invalidate stale PASS manifests even if an
+early prerequisite check fails. The speedtest parser requires exactly one
+ordered pinned-version header, requested set name, timed-row sequence, total
+and verification hash: a stdout warning after a valid hash is not a PASS. The integrity gate requires
+zero CLI exit status, `ok` stdout and empty stderr. It reports raw per-test
+times and medians separately, with no PMU/hardware-speed claim. The separate
 `ptr_delta_phi_bench.c` includes the 3.54.1 decoder fixture verbatim, runs the
 90,000-case independent oracle before every timing, and then calls the decoder
 on a cache-resident, mixed-length corpus. `perf_ab.py` alternates A/B order and

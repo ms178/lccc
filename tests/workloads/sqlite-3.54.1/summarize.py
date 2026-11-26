@@ -20,14 +20,37 @@ from collections import defaultdict
 TOTAL = re.compile(r"^\s*TOTAL\.*\s+(\d+\.\d{3})s\s*$", re.M)
 VERIFY = re.compile(r"^Verification Hash: (\d+) ([0-9a-f]{48})\s*$", re.M)
 TEST = re.compile(r"^\s*(\d+) - (.*?)\.{2,}\s+(\d+\.\d{3})s\s*$", re.M)
+# This exact release header is produced by the pinned 3.54.1 source archive.
+# A valid hash under a different SQLite binary is not sufficient provenance.
+HEADER = re.compile(
+    r"^-- Speedtest1 for SQLite 3\.54\.1 2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b$"
+)
+BEGIN = re.compile(r'^\s*Begin testset "(?P<set>[a-z0-9]+)"$')
 
 
-def parse_run(path: pathlib.Path) -> dict:
+def parse_run(path: pathlib.Path, expected_set: str | None = None) -> dict:
     text = path.read_text()
-    total, verification = TOTAL.search(text), VERIFY.search(text)
+    totals, verifications = list(TOTAL.finditer(text)), list(VERIFY.finditer(text))
     tests = TEST.findall(text)
-    if not total or not verification or not tests:
+    if not totals or not verifications or not tests:
         raise ValueError(f"missing total/hash/test rows in {path}")
+    if len(totals) != 1 or len(verifications) != 1:
+        raise ValueError(f"duplicate total or verification row in {path}")
+    # The hash covers SQLite's verified SQL output, not arbitrary lines that a
+    # binary can print around it. A warning after a valid hash, duplicate
+    # header, or test row after the total once passed. This pinned speedtest
+    # prints exactly: release header, set name, timed rows, total, hash.
+    lines = text.splitlines()
+    if len(lines) != len(tests) + 4:
+        raise ValueError(f"unexpected speedtest stdout line count in {path}")
+    patterns = [HEADER, BEGIN, *([TEST] * len(tests)), TOTAL, VERIFY]
+    for number, (line, pattern) in enumerate(zip(lines, patterns), 1):
+        if not pattern.fullmatch(line):
+            raise ValueError(f"unexpected speedtest stdout in {path}:{number}: {line[:160]!r}")
+    parsed_set = BEGIN.fullmatch(lines[1])
+    if expected_set is not None and parsed_set is not None and parsed_set["set"] != expected_set:
+        raise ValueError(f"different speedtest1 testset in {path}: {parsed_set['set']} != {expected_set}")
+    total, verification = totals[0], verifications[0]
     identities = [(int(number), name.strip()) for number, name, _ in tests]
     if len(set(identities)) != len(identities):
         raise ValueError(f"duplicate tests in {path}")
@@ -64,7 +87,7 @@ def summarize(artifact_dir: pathlib.Path, sets: list[str], repeats: int) -> dict
         for repeat in range(1, repeats + 1):
             for key in ("gcc", "lccc"):
                 path = artifact_dir / f"bench-{testset}-{repeat}-{key}.txt"
-                run = parse_run(path)
+                run = parse_run(path, expected_set=testset)
                 if identities is None:
                     identities = run["tests"]
                 if run["tests"] != identities:
