@@ -6,6 +6,7 @@ LCCC=${LCCC:-$ROOT/target/fastbuild/lccc}
 GCC=${GCC:-gcc-16}
 CLANG=${CLANG:-clang-23}
 fixture="$ROOT/tests/workloads/sqlite-3.54.1/ptr_delta_phi.c"
+negative_fixture="$ROOT/tests/workloads/sqlite-3.54.1/ptr_delta_phi_negative_bench.c"
 # Do not allow the optimizer's own IR/SSA checker or a C diagnostic to be
 # bypassed just because the binary happened to print the expected checksum.
 export CCC_VERIFY_IR=abort CCC_VALIDATE_SSA=1
@@ -32,6 +33,20 @@ for key in gcc lccc clang lccc-off; do
     cmp "$work/gcc.out" "$work/$key.out" || {
         echo "different answers for $key and GCC" >&2; exit 1;
     }
+    # Native host regression for the guarded negative arm. Keep the timing
+    # loop short here; perf_ab.py separately runs interleaved full-length
+    # measurements. A shared `PASS` never substitutes for GCC/Clang parity.
+    if [[ $key == lccc-off ]]; then
+        CCC_DISABLE_PASSES=ptr_delta_phi timeout --kill-after=5s 120 \
+            "$cc" "${flags[@]}" -DBENCH_PASSES=1 "$negative_fixture" -o "$work/$key-negative"
+    else
+        timeout --kill-after=5s 120 \
+            "$cc" "${flags[@]}" -DBENCH_PASSES=1 "$negative_fixture" -o "$work/$key-negative"
+    fi
+    timeout --kill-after=5s 30 "$work/$key-negative" > "$work/$key-negative.out"
+    cmp "$work/gcc-negative.out" "$work/$key-negative.out" || {
+        echo "different negative-offset answers for $key and GCC" >&2; exit 1;
+    }
 done
 # The pass is never credited merely because an output is equal: show its
 # mechanism in the isolated function, and prove the kill switch restores the
@@ -47,4 +62,4 @@ fi
 if ! grep -Eq 'subq[[:space:]]+%rdi,' "$work/off.func"; then
     echo 'disabled pass did not restore the baseline pointer subtraction' >&2; exit 1
 fi
-printf 'SQLite varint: 90000 cases x GCC/LCCC/Clang/LCCC-off: PASS; pointer-delta IR fold: PASS\n'
+printf 'SQLite varint (90000 cases) and negative delta (4096 cases) x GCC/LCCC/Clang/LCCC-off: PASS; pointer-delta IR fold: PASS\n'

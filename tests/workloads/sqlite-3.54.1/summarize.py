@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -42,6 +43,16 @@ def parse_run(path: pathlib.Path) -> dict:
 
 def version(executable: str) -> str:
     return subprocess.check_output([executable, "--version"], text=True).splitlines()[0]
+
+
+def compiler_sha256(executable: str) -> str:
+    # Stream the large fastbuild binary: avoid a 146 MB Python allocation on
+    # the constrained compilation VM simply to record its identity.
+    digest = hashlib.sha256()
+    with pathlib.Path(executable).open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def summarize(artifact_dir: pathlib.Path, sets: list[str], repeats: int) -> dict:
@@ -99,6 +110,8 @@ def main(args: list[str]) -> int:
         "archpkgbuilds_lemon_patch_sha256": recipe_patch_sha,
         "lemon_patch_status": patch_status, "applied_patch_sha256": applied_sha,
         "lccc": str(pathlib.Path(lccc).resolve()), "lccc_version": version(lccc),
+        "lccc_compiler_sha256": compiler_sha256(lccc),
+        "lccc_disable_passes": os.environ.get("CCC_DISABLE_PASSES", ""),
         "lccc_ld": str(pathlib.Path(lccc_ld).resolve()), "lccc_ld_version": version(lccc_ld),
         "gcc": str(pathlib.Path(shutil.which(gcc) or gcc).resolve()),
         "gcc_version": version(gcc), "cflags": cflags, "cppflags": cppflags.strip(),

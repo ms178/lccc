@@ -40,6 +40,39 @@ fn gep(dest: u32, base: u32, offset: Operand) -> Instruction {
         ty: IrType::I64,
     }
 }
+fn add(dest: u32, base: u32, offset: Operand, ty: IrType) -> Instruction {
+    Instruction::BinOp {
+        dest: value(dest),
+        op: IrBinOp::Add,
+        lhs: v(base),
+        rhs: offset,
+        ty,
+    }
+}
+fn sub_const(dest: u32, base: u32, offset: Operand, ty: IrType) -> Instruction {
+    Instruction::BinOp {
+        dest: value(dest),
+        op: IrBinOp::Sub,
+        lhs: v(base),
+        rhs: offset,
+        ty,
+    }
+}
+
+struct TargetSize(usize);
+impl TargetSize {
+    fn set(size: usize) -> Self {
+        let previous = crate::common::types::target_ptr_size();
+        crate::common::types::set_target_ptr_size(size);
+        Self(previous)
+    }
+}
+impl Drop for TargetSize {
+    fn drop(&mut self) {
+        crate::common::types::set_target_ptr_size(self.0);
+    }
+}
+
 fn phi(dest: u32, ty: IrType, incoming: &[(u32, u32)]) -> Instruction {
     Instruction::Phi {
         dest: value(dest),
@@ -264,6 +297,7 @@ fn different_base_and_variable_offset_fail_closed() {
 
 #[test]
 fn i686_out_of_range_offset_and_phi_cycle_fail_closed() {
+    let _width = TargetSize::set(4);
     let mut f = diamond();
     f.blocks[3].instructions[1] = sub(5, 4, 0, IrType::I32);
     assert_eq!(run(&mut f), 1); // +8 fits the I32 pointer-difference result
@@ -279,6 +313,7 @@ fn i686_out_of_range_offset_and_phi_cycle_fail_closed() {
     f.blocks[3].instructions[1] = sub(5, 4, 0, IrType::I32);
     assert_eq!(run(&mut f), 0);
 
+    drop(_width); // exercise the cycle independently of the width guard
     let mut f = diamond();
     f.blocks[1].instructions[0] = gep(3, 4, Operand::Const(IrConst::I64(1)));
     assert_eq!(run(&mut f), 0);
@@ -409,4 +444,134 @@ fn duplicate_definition_through_inline_asm_and_large_id_fail_closed() {
             ..
         }
     ));
+}
+
+#[test]
+fn pointer_width_add_matches_aarch64_riscv_and_commuted_addresses() {
+    let _width = TargetSize::set(8);
+    for commuted in [false, true] {
+        let mut f = diamond();
+        let (lhs, rhs) = if commuted {
+            (Operand::Const(IrConst::I64(-7)), v(0))
+        } else {
+            (v(0), Operand::Const(IrConst::I64(-7)))
+        };
+        f.blocks[1].instructions[0] = Instruction::BinOp {
+            dest: value(3),
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::I64,
+        };
+        assert_eq!(run(&mut f), 1);
+        let phi = f.blocks[3].instructions.iter().find_map(|inst| match inst {
+            Instruction::Phi {
+                ty: IrType::I64,
+                incoming,
+                ..
+            } => Some(incoming.as_slice()),
+            _ => None,
+        });
+        assert!(phi.is_some(), "missing new integer phi");
+        let phi = phi.unwrap_or(&[]);
+        assert_eq!(phi[0].0, Operand::Const(IrConst::I64(-7)));
+        assert_valid(&f);
+    }
+}
+
+#[test]
+fn pointer_width_add_i686_rewrites_without_truncating_offsets() {
+    let _width = TargetSize::set(4);
+    let mut f = diamond();
+    f.return_type = IrType::I32;
+    f.blocks[1].instructions[0] = add(3, 0, Operand::Const(IrConst::I32(8)), IrType::I32);
+    f.blocks[3].instructions[1] = sub(5, 4, 0, IrType::I32);
+    assert_eq!(run(&mut f), 1);
+    assert!(f.blocks[3].instructions.iter().any(|inst| matches!(
+        inst,
+        Instruction::Phi {
+            ty: IrType::I32,
+            ..
+        }
+    )));
+    assert_valid(&f);
+
+    let mut f = diamond();
+    f.blocks[1].instructions[0] = add(3, 0, Operand::Const(IrConst::I64(1i64 << 40)), IrType::I32);
+    f.blocks[3].instructions[1] = sub(5, 4, 0, IrType::I32);
+    assert_eq!(run(&mut f), 0, "I64 offset must not silently wrap on i686");
+}
+
+#[test]
+fn non_pointer_width_subtraction_rejects_even_a_constant_gep() {
+    let _width = TargetSize::set(4);
+    let mut f = diamond();
+    assert_eq!(
+        run(&mut f),
+        0,
+        "I64 pointer subtraction on ILP32 can observe wrap"
+    );
+    assert!(matches!(
+        f.blocks[3].instructions[1],
+        Instruction::BinOp {
+            op: IrBinOp::Sub,
+            ..
+        }
+    ));
+    drop(_width);
+    let _width = TargetSize::set(8);
+    let mut f = diamond();
+    f.blocks[3].instructions[1] = sub(5, 4, 0, IrType::I32);
+    assert_eq!(
+        run(&mut f),
+        0,
+        "I32 pointer subtraction on LP64 can truncate"
+    );
+}
+
+#[test]
+fn mismatched_width_variable_or_other_base_add_fails_closed() {
+    let _width = TargetSize::set(8);
+    for replacement in [
+        add(3, 0, Operand::Const(IrConst::I32(8)), IrType::I32),
+        add(3, 0, v(2), IrType::I64),
+        add(3, 1, Operand::Const(IrConst::I64(8)), IrType::I64),
+    ] {
+        let mut f = diamond();
+        f.blocks[1].instructions[0] = replacement;
+        assert_eq!(run(&mut f), 0);
+        assert!(matches!(
+            f.blocks[3].instructions[1],
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn guarded_backward_step_is_a_negative_control_in_both_target_widths() {
+    // A proposed Sub(base, 7) fold was functionally correct, but made a
+    // guarded three-arm host VM benchmark slower in two interleaved runs.
+    // Preserve the conservative fallback until codegen and runtime both win.
+    for (width, ty, offset) in [
+        (8, IrType::I64, IrConst::I64(7)),
+        (4, IrType::I32, IrConst::I32(7)),
+    ] {
+        let _width = TargetSize::set(width);
+        let mut f = diamond();
+        f.return_type = ty;
+        f.blocks[1].instructions[0] = sub_const(3, 0, Operand::Const(offset), ty);
+        f.blocks[3].instructions[1] = sub(5, 4, 0, ty);
+        assert_eq!(run(&mut f), 0, "width={width}, offset={offset:?}");
+        assert!(matches!(
+            f.blocks[3].instructions[1],
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                ..
+            }
+        ));
+        assert_valid(&f);
+    }
 }

@@ -3,14 +3,15 @@
 //! SQLite's `sqlite3GetVarint` advances `p` 0..8 times in branch arms and
 //! returns `(u8)(p - start) + 1`. After SSA promotion the return is a subtraction
 //! of a pointer phi from `start`, although EVERY arm of that phi is either
-//! `start` or `GetElementPtr(start, constant)`. Keeping the pointer phi makes
-//! the backend compute `lea start+n; ...; sub start` at the shared exit. An
-//! integer phi of the proven offsets is equivalent and avoids the subtraction;
-//! dropping the now-dead pointer phi also lets its GEP fold into a load.
+//! `start` or `GetElementPtr(start, constant)` on x86-64. On i686, AArch64
+//! and RISC-V the same lowering produces a pointer-width `Add(start, constant)`.
+//! Keeping the pointer phi makes the backend compute `start+n; ...; sub start`
+//! at the shared exit. An integer phi of the proven offsets avoids the
+//! subtraction; a dead pointer phi no longer holds its address web live.
 //!
 //! This pass deliberately does NOT speculate about arbitrary pointers: only a
-//! uniquely defined, acyclic tree of pointer phis/copies/GEPs rooted at the
-//! exact same SSA base is accepted. Variable offsets, a different base, phis
+//! uniquely defined, acyclic tree of pointer phis/copies/constant addresses
+//! rooted at the exact same SSA base is accepted. Variable offsets, a different base, phis
 //! with non-pointer types, cycles, and offsets that do not fit the subtraction
 //! type all leave the original IR unchanged. Existing pointer phis remain if
 //! they have another use. Run in SSA immediately before phi elimination.
@@ -88,6 +89,33 @@ impl Matcher<'_> {
             Instruction::GetElementPtr { base, offset, .. } if *base == self.base => {
                 offset_constant(*offset, self.ty).map(Arm::Constant)
             }
+            // The non-x86 pointer lowering expresses the same byte address
+            // as integer Add rather than GEP. Require the EXACT source SSA
+            // base and the target's pointer width: an I32 add on an LP64
+            // pointer could truncate high bits before the later subtraction.
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs: Operand::Value(base),
+                rhs: offset,
+                ty,
+                ..
+            }
+            | Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs: offset,
+                rhs: Operand::Value(base),
+                ty,
+                ..
+            } if *base == self.base
+                && *ty == self.ty
+                && *ty == crate::common::types::target_int_ir_type() =>
+            {
+                offset_constant(*offset, self.ty).map(Arm::Constant)
+            }
+            // Deliberately skip `Sub(base, constant)` backward steps here:
+            // a guarded three-arm candidate shrank x86 code but REGRESSED
+            // 31-pair host VM timing. The negative-control regression keeps
+            // that case out until a backend-aware improvement is measured.
             Instruction::Phi {
                 ty: IrType::Ptr,
                 incoming,
@@ -128,6 +156,14 @@ fn build_plan(
     ty: IrType,
     sub_site: (usize, usize),
 ) -> Option<Plan> {
+    // The subtraction must live in the same modular ring as pointer
+    // arithmetic. On ILP32 an I64 subtraction of zero-extended wrapped
+    // pointer values is NOT in general equal to the I64 constant offset.
+    // This is conservative even for frontends that only form such a wide
+    // subtraction after a separate, explicitly representable cast.
+    if ty != crate::common::types::target_int_ir_type() {
+        return None;
+    }
     let mut matcher = Matcher {
         func,
         defs,

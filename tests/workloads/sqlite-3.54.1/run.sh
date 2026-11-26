@@ -26,7 +26,7 @@ RECIPE_COMMIT=0516be29c004aa2a64e8a66ba84a3eda154ccd6e
 RECIPE_SHA256=74e7677d9728114cf6a6d2caca42942f40454824e839dabf0922a80995212ed1
 RECIPE_PATCH_SHA256=55746d93b0df4b349c4aa4f09535746dac3530f9fd6de241c9f38e2c92e8ee97
 
-for tool in curl unzip patch sha256sum python3 make timeout "$GCC"; do
+for tool in curl unzip patch sha256sum python3 make timeout realpath "$GCC"; do
     command -v "$tool" >/dev/null || { echo "missing required command: $tool" >&2; exit 2; }
 done
 [[ -x $LCCC && -x $LCCC_LD ]] || { echo 'LCCC and lccc-ld must be executable' >&2; exit 2; }
@@ -56,6 +56,16 @@ fi
 CPPFLAGS=$(awk '/^_sqlite_cppflags=\(/,/^\)/ { if ($1 ~ /^-D/) printf "%s ", $1 }' "$RECIPE_DIR/PKGBUILD")
 [[ $CPPFLAGS == *SQLITE_ENABLE_STAT4* ]] || { echo 'recipe flags could not be read' >&2; exit 1; }
 mkdir -p "$CACHE" "$WORK_ROOT" "$ARTIFACT_DIR"
+# Build steps cd into SQLite's out-of-tree build directories. Resolve user
+# overrides once so a relative artifact/work/compiler path remains valid there.
+CACHE=$(realpath "$CACHE")
+WORK_ROOT=$(realpath "$WORK_ROOT")
+ARTIFACT_DIR=$(realpath "$ARTIFACT_DIR")
+RECIPE_DIR=$(realpath "$RECIPE_DIR")
+LCCC=$(realpath "$LCCC")
+LCCC_LD=$(realpath "$LCCC_LD")
+# An interrupted rerun must never leave a prior successful PASS manifest.
+rm -f -- "$ARTIFACT_DIR/manifest.json"
 if ! python3 "$ROOT/tests/workloads/sqlite-3.54.1/test_summarize.py" \
     > "$ARTIFACT_DIR/summary-selftest.log" 2>&1; then
     cat "$ARTIFACT_DIR/summary-selftest.log" >&2
@@ -158,6 +168,15 @@ done
         "$($GCC -print-file-name=crtendS.o)" /usr/lib/x86_64-linux-gnu/crtn.o \
         > "$ARTIFACT_DIR/ld-build.log" 2>&1
 )
+# Diagnostics are a release gate, not merely a note discovered after timing.
+# Configure, both compiler builds, the speedtest CLI, and standalone lccc-ld
+# must all be free of warnings. Keep the original logs on failure.
+for log in "$ARTIFACT_DIR"/{configure-gcc,configure-lccc,build-gcc,build-lccc,speedtest-build-gcc,speedtest-build-lccc,shell-ld-build,ld-build}.log; do
+    if grep -in 'warning' "$log"; then
+        echo "warning-free SQLite build requirement failed: $log" >&2
+        exit 1
+    fi
+done
 for test in relational features; do
     input="$ROOT/tests/workloads/sqlite-3.54.1/$test.sql"
     for key in lccc gcc ld; do
@@ -165,6 +184,9 @@ for test in relational features; do
         [[ $key == ld ]] && bin="$WORK/build-lccc/sqlite3-lccc-ld"
         timeout --kill-after=5s 120 "$bin" -batch -bail :memory: < "$input" \
             > "$ARTIFACT_DIR/sql-$test-$key.txt" 2> "$ARTIFACT_DIR/sql-$test-$key.err"
+        [[ ! -s "$ARTIFACT_DIR/sql-$test-$key.err" ]] || {
+            echo "unexpected SQL stderr: $test/$key" >&2; exit 1;
+        }
         grep -q '^PASS|' "$ARTIFACT_DIR/sql-$test-$key.txt" || {
             echo "missing SQL invariants for $test/$key" >&2; exit 1;
         }
@@ -196,10 +218,17 @@ for testset in $SPEED_SETS; do
             timeout --kill-after=5s 180 "$WORK/build-$key/speedtest1" \
                 --size "$SPEED_SIZE" --nosync --testset "$testset" --verify \
                 "$db" > "$out" 2> "$ARTIFACT_DIR/bench-$testset-$rep-$key.err"
+            [[ ! -s "$ARTIFACT_DIR/bench-$testset-$rep-$key.err" ]] || {
+                echo "unexpected speedtest stderr: $testset/$rep/$key" >&2; exit 1;
+            }
             grep -q '^Verification Hash: ' "$out" || { echo "no speedtest verification: $out" >&2; exit 1; }
             [[ $("$WORK/build-$key/sqlite3" -batch -bail "$db" 'PRAGMA integrity_check;') == ok ]] || {
                 echo "speedtest DB failed integrity_check: $db" >&2; exit 1;
             }
+            # Only hashes and raw timing logs are consumed after integrity.
+            # Retaining 36 verified databases per build cost ~284 MiB in this
+            # bounded run and needlessly crowded the constrained build host.
+            rm -f -- "$db" "$db-journal" "$db-wal" "$db-shm"
         done
     done
 done
