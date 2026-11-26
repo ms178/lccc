@@ -3872,6 +3872,16 @@ gate "loop-carried-homes" fast \
 gate "switch-table-liveness" fast \
     python3 tests/regression/check_switch_table_liveness.py --lccc target/fastbuild/lccc --gcc gcc-16
 
+# A branch on a merge that one way in brings a constant to is left by
+# if-conversion and threaded behind the optimizer's rounds, a level of
+# nested conditions a round, and the set fold then makes what is left of a
+# character class one bit test. The fixture's output in 14 configurations
+# against GCC 16.2's, eleven functions no longer than today, no constant
+# written to be tested in zlib's sift loop; the early position of the
+# threader off and the set fold off are the negative controls.
+gate "boolean-merge-threads" fast \
+    python3 tests/regression/check_boolean_merge_threads.py --lccc target/fastbuild/lccc --gcc gcc-16
+
 # Indexed SIB fold with a scratch-homed index (S13): the x86-64 fold decider
 # must accept %rdx/%r11-homed SIB operands. Structural fold assertion on
 # sqlite_put_varint plus a shrunk-corpus gcc differential — the golden-gate

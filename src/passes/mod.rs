@@ -4208,6 +4208,35 @@ pub(crate) fn run_passes(
         std::mem::swap(&mut dirty, &mut changed);
     }
 
+    // The branches a way in decides, behind the rounds: the threads of the
+    // late `jump_thread` position below (which stays for what the late passes
+    // expose and for the latch copies), taken where the late passes still
+    // follow, a level of nested conditions a round, and the set fold of the
+    // rounds once more on a function that took one. Threaded only at the end
+    // of the pipeline, `if (smaller(...)) j++` of zlib's sift loop kept
+    // 16.27 M of its 16.41 M instructions; here it keeps 14.03 M. See
+    // `jump_thread::thread_decided_and_fold`.
+    // CCC_DISABLE_PASSES=jump_thread disables both positions,
+    // jump_thread_early this one; range_fold and set_membership the folds.
+    if opt_level >= 2
+        && !optimize_for_size
+        && !pass_disabled(&disabled, "jump_thread")
+        && !pass_disabled(&disabled, "jump_thread_early")
+    {
+        if dump_each_pass {
+            dump_ir_filtered(module, "before jump_thread_early");
+        }
+        let fold_ranges = !pass_disabled(&disabled, "range_fold");
+        let fold_sets = !pass_disabled(&disabled, "set_membership");
+        module.for_each_function(|func| {
+            jump_thread::thread_decided_and_fold(func, fold_ranges, fold_sets)
+        });
+        verify::verify_after_pass(module, "jump_thread_early");
+        if dump_each_pass {
+            dump_ir_filtered(module, "after jump_thread_early");
+        }
+    }
+
     // Loops the two late vectorizer entries below produced; both feed the
     // single late interleave after the x86 twin.
     let mut late_vectorized = 0usize;

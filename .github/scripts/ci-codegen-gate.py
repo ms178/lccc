@@ -120,6 +120,27 @@ csv_field_sum 1.0014 / 1.0075. Over the 87 programs there that compile
 alone: 15,972 → 15,943 instructions, 424 → 420 pushes, 1,017 → 1,006 stack
 operands, 1,552 → 1,541 register moves.
 
+Baseline notes (2026-11-26): `--update-baseline` for a change to the metric
+and a change to the compiler.
+The metric: a function body is read to its `.size`, across a data island
+(`function_body_metrics`). It used to end at the first `.section`, which cut
+`main` of sqlite_varint -- the one workload with an island, the table of its
+dispatch -- off at 263 of its 369 instructions, and made the number depend on
+which blocks the layout puts in front of the table: the change below moves
+the shared epilogue there, and the old count read 273 for a unit that had
+become one instruction shorter. Read whole, sqlite_varint was 369 insns / 10
+stack operands / 48 moves; no other workload has an island and none of their
+numbers moves with the metric.
+The compiler: the branch on a merge that one way in brings a constant to is
+left by if-conversion and threaded behind the optimizer's rounds
+(`jump_thread::thread_decided_and_fold`). Three workloads re-pin:
+expat_xml_scan 206→203 insns, sqlite_varint 369→368, safe_count_guards
+226→229 insns / 55→56 moves (`main` of clz_safe_guards.c: the guard of a
+shift count was two conditional moves over the shift and is a branch round
+it). Cachegrind, as the benchmark harness builds them: expat_xml_scan
+1,529,625 → 1,428,038 instructions (−6.64 %; GCC 16.2: 1,460,771),
+sqlite_varint 785,589 → 785,588.
+
 Usage:
     python3 ci-codegen-gate.py --lccc target/fastbuild/lccc
     python3 ci-codegen-gate.py --lccc ... --update-baseline
@@ -235,12 +256,22 @@ def score_chunk(lines: list, m: dict) -> None:
 
 
 def function_body_metrics(asm: str) -> dict:
-    """Aggregate metrics over function bodies only (between .type @function
-    and the next .type/.size/.section). Bodies are scored per-function so
-    the rbp-as-GPR proof stays function-local."""
+    """Aggregate metrics over function bodies only: from `.type @function`
+    to the function's `.size` (or the next `.type @function`), less what
+    lies in a section that holds no code. Bodies are scored per-function so
+    the rbp-as-GPR proof stays function-local.
+
+    A function may leave the text section and come back: a switch's table or
+    a vector constant is emitted where it is used, as `.section .rodata ...
+    .section .text`. The island is skipped and the count goes on behind it.
+    (It used to stop at the first `.section`, so a function with an island
+    was counted up to the island only, and the number moved with whichever
+    blocks the layout put in front of it: see the 2026-11-26 baseline note.)
+    """
     m = {"insns": 0, "stackmem": 0, "pushes": 0, "moves": 0, "ymm": 0, "fma": 0}
     chunk: list = []
     in_func = False
+    in_code = True
 
     def flush():
         if chunk:
@@ -252,12 +283,18 @@ def function_body_metrics(asm: str) -> dict:
         if s.startswith(".type") and "@function" in s:
             flush()
             in_func = True
+            in_code = True
             continue
-        if s == ".size" or (s.startswith(".section") and in_func):
+        if s.startswith(".size"):
             flush()
             in_func = False
             continue
-        if not in_func:
+        if s.startswith(".section") or s in (".text", ".data", ".bss"):
+            in_code = s == ".text" or s.split(None, 1)[1:2] == [".text"] or (
+                s.startswith(".section") and s.split()[1].split(",")[0].startswith(".text")
+            )
+            continue
+        if not in_func or not in_code:
             continue
         chunk.append(line)
     flush()

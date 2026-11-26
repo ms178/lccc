@@ -3160,6 +3160,18 @@ jobs:
         # less the three instructions a dispatch saves; the check first
         # refuses one function as it was emitted before.
         python3 tests/regression/check_switch_table_liveness.py --lccc target/fastbuild/lccc --gcc gcc-16
+        # A branch on a merge that one way in brings a constant to (`if
+        # (smaller(...)) j++` with `smaller` an inlined `a < b || (a == b &&
+        # c <= d)`) is left by if-conversion and threaded behind the
+        # optimizer's rounds, a level of nested conditions a round; the set
+        # fold then makes what is left of a character class one bit test.
+        # Held: the fixture's output in 14 configurations against GCC
+        # 16.2's, eleven functions no longer than today (seven of them
+        # with a bit test, through helpers that return `int`, `_Bool` and
+        # `unsigned char`), and no constant written to be tested in zlib's
+        # sift loop; with the early position of the threader off every pin
+        # has to break, and with the set fold off every bit test.
+        python3 tests/regression/check_boolean_merge_threads.py --lccc target/fastbuild/lccc --gcc gcc-16
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
         # only place the audit's site counts are measurable; the ratchet is
         # what stops them growing back.  Runs in ci_local.sh too.

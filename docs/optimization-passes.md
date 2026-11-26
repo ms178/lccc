@@ -39,6 +39,34 @@ passes; the backend peepholes are documented per backend
   private arms; measured rejections are listed in
   `engineering/subsystems/optimizer.md`. Disable: `CCC_DISABLE_PASSES=jump_thread`
   (not the x86 peephole of the same name, `CCC_PEEPHOLE_SKIP=jump_thread`).
+- **Decided branches behind the rounds**
+  (`jump_thread::thread_decided_and_fold`, same levels) -- the threads of
+  the pass above without its latch copies, taken once more between the
+  optimizer's rounds and the late passes, for the branch on a merge that one
+  way in brings a constant to: `if (smaller(...)) j++;` with `smaller` an
+  inlined `a < b || (a == b && c <= d)`. Four parts. If-conversion leaves
+  such a branch (`if_convert::branch_is_decided_on_entry`: a phi of the
+  block with a constant arm, read directly or through casts and compares
+  against constants; a select would write the constant, test it and compute
+  both arms on the way in that knew). The threader sends that way in to its
+  arm; a function that took a thread is cleaned up and asked again, up to
+  four rounds, a level of nested conditions a round. The constant is read
+  through what the helper's return type puts between the merge and its
+  branch (`jump_thread::constant_on_entry` folds the block for the one way
+  in: nothing for `int`, `!= 0` for `_Bool`, a narrowing cast for `unsigned
+  char`, and 256 as a byte is 0), and `simplify` reads the comparison
+  through the same links (`truth_base`: a branch on an integer conversion of
+  a truth value is a branch on the truth value). `range_fold` and
+  `set_membership` then run once more on that function, because the hits of
+  `while (i < n && separator(s[i])) i++` are at the loop's step only now and
+  the set fold takes a chain of tests of a `char` only where its hits meet
+  without a value: 32 instructions and nine branches a character before, 15
+  and four with one bit test after (GCC 16.2: 14), whatever the helpers
+  return. Measured (Cachegrind, instructions): `zlib_ng_huffman_heap`
+  16,406,812 -> 14,027,589, `expat_xml_scan` 1,529,625 -> 1,428,038 (GCC
+  16.2: 1,460,771). Gate: `tests/regression/check_boolean_merge_threads.py`.
+  Disable: `CCC_DISABLE_PASSES=jump_thread_early` (this position),
+  `jump_thread` (both).
 - **Join store forwarding** (`join_store_forward.rs`) -- a reload after a
   join whose predecessors all store to the same pointer becomes a phi of the
   stored values (list_sort's `tail->next`). `join_store_forward`.
@@ -556,7 +584,7 @@ CCC_DISABLE_PASSES="gvn,licm" ./target/fastbuild/lccc input.c -o output
 CCC_DISABLE_PASSES="all"      ./target/fastbuild/lccc input.c -o output
 ```
 
-Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `sccp`, `jump_thread`, `join_store_forward`, `phi_relay_fold`, `ret_dup`, `loop_memset`, `vector_fill`, `tce`, `tce_acc`, `rec2iter`, `self_inline`, `boolthread`.
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `sccp`, `jump_thread`, `jump_thread_early`, `join_store_forward`, `phi_relay_fold`, `ret_dup`, `loop_memset`, `vector_fill`, `tce`, `tce_acc`, `rec2iter`, `self_inline`, `boolthread`.
 
 Timing data is available via:
 

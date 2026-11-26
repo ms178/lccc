@@ -66,7 +66,7 @@ use crate::common::source::Span;
 use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrCmpOp, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
     replace_values_in_inst_map, replace_values_in_terminator_map,
 };
 
@@ -349,6 +349,65 @@ fn unique_arm(incoming: &[(Operand, BlockId)], from: BlockId) -> Option<Operand>
     it.next().is_none().then_some(first)
 }
 
+/// What `cond`, a value `block` computes, is when the block is entered from
+/// `from` -- as far as the constants that edge brings the block's phis
+/// decide it.
+///
+/// The block is folded for that one way in: a phi is the constant its arm
+/// from `from` is, and an integer cast, an integer comparison and a copy of
+/// what is known are folded by the constant folder's own oracles
+/// (`constant_fold::eval_cast_const`, `eval_cmp_const`), so that the answer
+/// is the one the cleanup computes in the copy the thread makes.  That
+/// reads a constant through whatever stands between a merge and its branch
+/// where a condition is inlined from a function of its own: nothing for a
+/// helper that returns `int`, `(p != 0)` for one that returns `_Bool`, a
+/// cast to a byte for `unsigned char` -- and a constant that is not 0 or 1
+/// as far as the cast keeps it (256 as a byte is 0).  The instructions read
+/// are the ones `if_convert::branch_is_decided_on_entry` reads when it
+/// leaves the branch to this pass.
+fn constant_on_entry(block: &BasicBlock, from: BlockId, cond: Value) -> Option<IrConst> {
+    let mut known: FxHashMap<u32, IrConst> = FxHashMap::default();
+    for inst in &block.instructions {
+        let read = |op: &Operand| match op {
+            Operand::Const(k) => Some(*k),
+            Operand::Value(x) => known.get(&x.0).copied(),
+        };
+        let folded = match inst {
+            Instruction::Phi { incoming, ty, .. } if ty.is_integer() => {
+                match unique_arm(incoming, from) {
+                    Some(Operand::Const(k)) => Some(k),
+                    _ => None,
+                }
+            }
+            Instruction::Copy { src, .. } => read(src),
+            Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer() && to_ty.is_integer() => {
+                read(src).and_then(|k| super::constant_fold::eval_cast_const(k, *from_ty, *to_ty))
+            }
+            Instruction::Cmp {
+                op, lhs, rhs, ty, ..
+            } if ty.is_integer() => read(lhs)
+                .zip(read(rhs))
+                .and_then(|(l, r)| super::constant_fold::eval_cmp_const(*op, l, r, *ty)),
+            _ => None,
+        };
+        let Some(dest) = inst.dest() else {
+            continue;
+        };
+        if dest == cond {
+            return folded;
+        }
+        if let Some(k) = folded {
+            known.insert(dest.0, k);
+        }
+    }
+    None
+}
+
 fn phi_def<'a>(b: &'a BasicBlock, v: Value) -> Option<&'a [(Operand, BlockId)]> {
     b.instructions.iter().find_map(|i| match i {
         Instruction::Phi { dest, incoming, .. } if *dest == v => Some(&incoming[..]),
@@ -395,8 +454,59 @@ impl Search<'_> {
             if let Some(t) = self.trace(vec![bk], x, &decide) {
                 return Some(t);
             }
+            if let Some(t) = self.folded_on_entry(bk, *c, *true_label, *false_label) {
+                return Some(t);
+            }
             if let Some(t) = self.implied_by_pred(bk, *c, *true_label, *false_label) {
                 return Some(t);
+            }
+        }
+        None
+    }
+
+    /// The head's branch is decided for a predecessor by the constants it
+    /// brings the head's phis, folded through what the head computes of
+    /// them ([`constant_on_entry`]).  [`Self::trace`] reads a phi the branch
+    /// tests directly, through `!= 0` and through a cast of a phi of 0 and
+    /// 1; this reads the rest: a merge of a constant and a value behind a
+    /// cast, a chain of casts and comparisons, a constant other than 0 and
+    /// 1.  The head is copied for that edge like any other thread.
+    fn folded_on_entry(
+        &self,
+        head: usize,
+        c: Value,
+        true_label: BlockId,
+        false_label: BlockId,
+    ) -> Option<Thread> {
+        let block = &self.func.blocks[head];
+        let brings_a_constant = |inst: &Instruction| {
+            matches!(inst, Instruction::Phi { incoming, .. }
+                if incoming.iter().any(|(arm, _)| matches!(arm, Operand::Const(_))))
+        };
+        if !block.instructions.iter().any(brings_a_constant)
+            || non_phi_count(block) > MAX_PATH_INSTS
+            || !block.instructions.iter().all(duplicable)
+        {
+            return None;
+        }
+        for &p in &self.cfg.preds[head] {
+            let from = &self.func.blocks[p];
+            if p == head
+                || !self.cfg.reachable(p)
+                || edges_to(&from.terminator, block.label) != Some(1)
+            {
+                continue;
+            }
+            let Some(k) = constant_on_entry(block, from.label, c) else {
+                continue;
+            };
+            let thread = Thread {
+                pred: p,
+                path: vec![head],
+                target: Some(if k.is_zero() { false_label } else { true_label }),
+            };
+            if !self.refused.contains(&thread) {
+                return Some(thread);
             }
         }
         None
@@ -1248,6 +1358,86 @@ fn enters_loop_body(
     })
 }
 
+/// The threads of [`run`] without the latch copies: for the position behind
+/// the optimizer's rounds, where the branches a merge decides are taken out
+/// before the late passes run.  The latch copies wait for the last position:
+/// they are a layout decision, and the passes between the two (the late
+/// vectorizer, the strength reductions) read a loop with one latch.
+fn thread_decided(func: &mut IrFunction) -> usize {
+    if func.blocks.len() < 2 {
+        return 0;
+    }
+    thread_decided_branches(func)
+}
+
+/// Rounds of thread and cleanup one function gets from
+/// [`thread_decided_and_fold`]: a level of nested conditions a round.  What a
+/// deeper nest keeps is the late position's.
+const EARLY_THREAD_ROUNDS: usize = 4;
+
+/// The early position of the threader, behind the optimizer's rounds, for
+/// one function.  Returns the number of threads and folds.
+///
+/// If-conversion leaves a branch on a merge that some predecessor brings a
+/// constant to (`if_convert::branch_is_decided_on_entry`): that predecessor
+/// knows the arm, and a select would write the constant, test it and compute
+/// both arms.  The rounds have had every other use of such a merge by now
+/// (the diamond that flattens to a select did, and its merge is no phi any
+/// more), so what is left is threaded here, where the late passes still
+/// follow.
+///
+/// A function that took a thread is cleaned up -- a copy ends in a jump to a
+/// block with one way in and holds what its phis became: merge, fold,
+/// propagate, collect -- and asked again.  A condition built from conditions
+/// (`separator(c)` as `space(c) || c == ','`, with `space` an `||` of its
+/// own) is a merge that branches into a merge, and each round takes the
+/// level the one before it laid open.
+///
+/// Then the set fold of the rounds once more (`fold_ranges`, `fold_sets`:
+/// the two passes, each under its own switch).  `while (i < n &&
+/// separator(s[i])) i++` has its hits at the loop's step only now, and
+/// `set_membership` takes a chain of tests of a `char` only where the hits
+/// meet without a value (the merge of a value is left to if-conversion and
+/// the vectorizer): seven tests a character before, one range test and one
+/// bit test after.
+pub(crate) fn thread_decided_and_fold(
+    func: &mut IrFunction,
+    fold_ranges: bool,
+    fold_sets: bool,
+) -> usize {
+    let cleanup = |func: &mut IrFunction| {
+        super::cfg_simplify::simplify_cfg(func);
+        super::constant_fold::fold_function(func);
+        super::copy_prop::propagate_copies(func);
+        super::simplify::simplify_function(func);
+        super::dce::eliminate_dead_code(func);
+        super::cfg_simplify::simplify_cfg(func);
+    };
+    let mut threads = 0;
+    for _ in 0..EARLY_THREAD_ROUNDS {
+        let taken = thread_decided(func);
+        if taken == 0 {
+            break;
+        }
+        threads += taken;
+        cleanup(func);
+    }
+    if threads == 0 {
+        return 0;
+    }
+    let mut folds = 0;
+    if fold_ranges {
+        folds += super::range_check::run_function(func);
+    }
+    if fold_sets {
+        folds += super::set_membership::run_function(func);
+    }
+    if folds > 0 {
+        cleanup(func);
+    }
+    threads + folds
+}
+
 /// Apply decided-branch threads until none is left (or the budget is spent).
 fn thread_decided_branches(func: &mut IrFunction) -> usize {
     let mut refused = FxHashSet::default();
@@ -1400,12 +1590,20 @@ mod tests {
             1,
             "only the entry branch should survive"
         );
-        let mut f = bool_cast_merge(256);
-        assert_eq!(
-            thread_decided_branches(&mut f),
-            0,
-            "a narrowing cast can erase nonzero bits"
-        );
+        // A narrowing cast can erase nonzero bits: 256 as a byte is 0, so
+        // the arm that brings it goes where the arm that brings 0 goes.
+        // (Read as "nonzero", it would go the other way; the threader used
+        // to refuse the merge for that reason, and now folds the constant
+        // through the cast.)
+        let original = bool_cast_merge(256);
+        let mut f = original.clone();
+        assert_eq!(thread_decided_branches(&mut f), 2);
+        for arm in [0i64, 1, 77] {
+            let (mut m1, mut m2) = (FxHashMap::default(), FxHashMap::default());
+            let want = eval(&original, &[arm], &mut m1);
+            assert_eq!(want, Some(-1), "both arms bring a byte of 0");
+            assert_eq!(eval(&f, &[arm], &mut m2), want, "param {arm}");
+        }
     }
 
     #[test]
@@ -1504,6 +1702,21 @@ mod tests {
     /// but stale value instance passes structural checks).
     fn eval(f: &IrFunction, params: &[i64], mem: &mut FxHashMap<i64, i64>) -> Option<i64> {
         use crate::ir::reexports::IrBinOp;
+        // `x` as a value of the integer type `ty`: its low bytes, extended
+        // by the type's signedness.
+        let as_type = |x: i64, ty: IrType| -> Option<i64> {
+            Some(match (ty.size(), ty.is_unsigned()) {
+                (1, true) => i64::from(x as u8),
+                (1, false) => i64::from(x as i8),
+                (2, true) => i64::from(x as u16),
+                (2, false) => i64::from(x as i16),
+                (4, true) => i64::from(x as u32),
+                (4, false) => i64::from(x as i32),
+                (8, _) if ty.is_integer() => x,
+                _ => return None,
+            })
+        };
+
         let labels = analysis::build_label_map(f);
         let mut env: FxHashMap<u32, i64> = FxHashMap::default();
         let val = |env: &FxHashMap<u32, i64>, op: &Operand| -> Option<i64> {
@@ -1534,6 +1747,7 @@ mod tests {
                             IrBinOp::Add => l.wrapping_add(r),
                             IrBinOp::Sub => l.wrapping_sub(r),
                             IrBinOp::Mul => l.wrapping_mul(r),
+                            IrBinOp::BitTest => (l >> (r & 63)) & 1,
                             _ => return None,
                         }
                     }
@@ -1541,6 +1755,12 @@ mod tests {
                         let (l, r) = (val(&env, lhs)?, val(&env, rhs)?);
                         i64::from(op.eval_i64(l, r))
                     }
+                    Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    } => as_type(as_type(val(&env, src)?, *from_ty)?, *to_ty)?,
                     Instruction::GetElementPtr { base, offset, .. } => {
                         env.get(&base.0)?.wrapping_add(val(&env, offset)?)
                     }
@@ -2406,5 +2626,465 @@ mod tests {
             &f,
             &[(vec![0], vec![]), (vec![1], vec![]), (vec![5], vec![])],
         );
+    }
+    fn k32(x: i32) -> Operand {
+        Operand::Const(crate::ir::reexports::IrConst::I32(x))
+    }
+
+    fn jump(to: u32) -> Terminator {
+        Terminator::Branch(BlockId(to))
+    }
+
+    /// `g` returns what `f` does for every input of `inputs`.
+    fn assert_agree(f: &IrFunction, g: &IrFunction, inputs: &[Vec<i64>]) {
+        for input in inputs {
+            let (mut m1, mut m2) = (FxHashMap::default(), FxHashMap::default());
+            let want = eval(f, input, &mut m1);
+            assert!(want.is_some(), "reference run failed for {input:?}");
+            assert_eq!(want, eval(g, input, &mut m2), "result for {input:?}");
+        }
+    }
+
+    /// `if ((c == 95 || c == 58) || c == 45) return 10; return 20;` with the
+    /// inner `||` inlined from a function of its own, read through `width`:
+    ///
+    /// ```text
+    /// b0: c = param 0; t0 = (c == 95); br t0 ? b3 : b1
+    /// b1: t1 = (c == 58); br b3
+    /// b3: p = phi [1, b0], [t1, b1]; w = cast p to width; br w ? b5 : b4
+    /// b4: u = (c == 45); br b5
+    /// b5: q = phi [1, b3], [u, b4]; br q ? b6 : b7
+    /// b6: return 10
+    /// b7: return 20
+    /// ```
+    fn or_nest(width: IrType) -> IrFunction {
+        nest_bringing(1, width)
+    }
+
+    /// [`or_nest`] with `brought` for the constant b0 brings the inner
+    /// merge.
+    fn nest_bringing(brought: i32, width: IrType) -> IrFunction {
+        let cmp = |dest: u32, k: i32| Instruction::Cmp {
+            dest: Value(dest),
+            op: IrCmpOp::Eq,
+            lhs: v(0),
+            rhs: k32(k),
+            ty: IrType::I32,
+        };
+        let phi_of = |dest: u32, arms: &[(Operand, u32)]| Instruction::Phi {
+            dest: Value(dest),
+            ty: IrType::I32,
+            incoming: arms.iter().map(|&(x, b)| (x, BlockId(b))).collect(),
+        };
+        let ret = |x: i32| Terminator::Return(Some(k32(x)));
+        let mut f = IrFunction::new("nest".into(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I32,
+                    },
+                    cmp(1, 95),
+                ],
+                cbr(1, 3, 1),
+            ),
+            block(1, vec![cmp(2, 58)], jump(3)),
+            block(
+                3,
+                vec![
+                    phi_of(3, &[(k32(brought), 0), (v(2), 1)]),
+                    Instruction::Cast {
+                        dest: Value(6),
+                        src: v(3),
+                        from_ty: IrType::I32,
+                        to_ty: width,
+                    },
+                ],
+                cbr(6, 5, 4),
+            ),
+            block(4, vec![cmp(4, 45)], jump(5)),
+            block(5, vec![phi_of(5, &[(k32(1), 3), (v(4), 4)])], cbr(5, 6, 7)),
+            block(6, vec![], ret(10)),
+            block(7, vec![], ret(20)),
+        ];
+        f
+    }
+
+    /// Every character the nest tests for, its neighbours, and others.
+    fn characters() -> Vec<Vec<i64>> {
+        [0, 1, 44, 45, 46, 57, 58, 59, 94, 95, 96, 255, -1]
+            .iter()
+            .map(|&c| vec![c])
+            .collect()
+    }
+
+    /// The position behind the rounds takes the decided branches and leaves
+    /// the latch copies to the last position.
+    #[test]
+    fn the_early_position_threads_and_copies_no_latch() {
+        // A loop whose header branches on what it loads, with a latch that
+        // jumps back: `run` copies the header into the latch, and
+        // `thread_decided` leaves that to it.
+        //
+        // b0: p = param 0; br b1
+        // b1: q = phi [p, b0], [q8, b2], [q16, b3]; x = *q; br x ? b2 : b3
+        // b2: q8 = q + 8; br b1
+        // b3: q16 = q + 16; y = *q16; br y ? b1 : b4
+        // b4: return q
+        let step = |dest: u32, by: i64| Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(1),
+            offset: Operand::Const(crate::ir::reexports::IrConst::I64(by)),
+            ty: IrType::Ptr,
+        };
+        let mut f = IrFunction::new("walk".into(), IrType::Ptr, vec![], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                }],
+                jump(1),
+            ),
+            block(
+                1,
+                vec![phi(1, &[(0, 0), (3, 2), (4, 3)]), load(2, 1)],
+                cbr(2, 2, 3),
+            ),
+            block(2, vec![step(3, 8)], jump(1)),
+            block(3, vec![step(4, 16), load(5, 4)], cbr(5, 1, 4)),
+            block(4, vec![], Terminator::Return(Some(v(1)))),
+        ];
+        let (mut early, mut late) = (f.clone(), f.clone());
+        let threads = thread_decided(&mut early);
+        let with_copies = run(&mut late);
+        assert!(
+            with_copies > threads,
+            "the last position copies the header into its latch"
+        );
+        assert_ne!(format!("{early:?}"), format!("{late:?}"));
+        assert_eq!(
+            tail_duplicate_latches(&mut early),
+            with_copies - threads,
+            "the copies the early position left"
+        );
+        assert_eq!(format!("{early:?}"), format!("{late:?}"));
+        // The list merge loop: each arm knows the pointer it did not
+        // advance, and both positions thread that.
+        let (mut early, mut late) = (merge_loop(), merge_loop());
+        assert_eq!(thread_decided(&mut early), 2);
+        assert_eq!(thread_decided_branches(&mut late), 2);
+        assert_eq!(format!("{early:?}"), format!("{late:?}"));
+        // One block has no branch to decide.
+        let mut one = or_nest(IrType::I64);
+        one.blocks.truncate(1);
+        one.blocks[0].terminator = Terminator::Return(None);
+        assert_eq!(thread_decided(&mut one), 0);
+    }
+
+    /// The return the edge `from -> (true or false)` reaches over jumps
+    /// alone; `None` when a test lies between.
+    fn lands(f: &IrFunction, from: u32, on_true: bool) -> Option<i64> {
+        let Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } = block_of(f, from)?.terminator
+        else {
+            return None;
+        };
+        let mut at = if on_true { true_label } else { false_label };
+        for _ in 0..f.blocks.len() {
+            match &block_of(f, at.0)?.terminator {
+                Terminator::Branch(next) => at = *next,
+                Terminator::Return(Some(Operand::Const(k))) => return k.to_i64(),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The branch `if_convert` leaves for the early position: a merge with
+    /// one constant arm, branched on through a cast, that branches into a
+    /// merge of the same kind.  One round takes the inner level, the next
+    /// the outer one it laid open: the way in that brought the constant
+    /// reaches its return without a test, and no merge is left.
+    #[test]
+    fn a_nest_of_merges_is_threaded_a_level_a_round() {
+        for width in [IrType::I64, IrType::U8, IrType::I32] {
+            let f = or_nest(width);
+            assert_eq!(lands(&f, 0, true), None, "two merges test it first");
+            // One call of the threader: the inner level.
+            let mut once = f.clone();
+            assert!(thread_decided(&mut once) > 0, "{width:?}");
+            assert_agree(&f, &once, &characters());
+            // The position, without its folds: both levels.
+            let mut g = f.clone();
+            assert!(
+                thread_decided_and_fold(&mut g, false, false) > 0,
+                "{width:?}"
+            );
+            assert_agree(&f, &g, &characters());
+            assert_eq!(lands(&g, 0, true), Some(10), "{width:?}: the hit returns");
+            let merges = g
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter(|i| matches!(i, Instruction::Phi { .. }))
+                .count();
+            assert_eq!(merges, 0, "{width:?}: no merge is left to test");
+            let before = format!("{g:?}");
+            assert_eq!(thread_decided_and_fold(&mut g, false, false), 0);
+            assert_eq!(format!("{g:?}"), before, "{width:?}: a fixed point");
+            // With them: the three tests of one value that are left are one
+            // range test and one bit test.
+            let mut folded = f.clone();
+            assert!(thread_decided_and_fold(&mut folded, true, true) > 0);
+            assert_eq!(bit_tests(&folded), 1, "{width:?}");
+            assert_agree(&f, &folded, &characters());
+            assert_eq!(thread_decided_and_fold(&mut folded, true, true), 0);
+        }
+    }
+
+    /// A constant is read through what stands between the merge and its
+    /// branch as far as that keeps it: 256 through a cast to a byte is 0 and
+    /// goes where 0 goes, 255 as a signed byte is -1 and goes where 1 goes.
+    #[test]
+    fn a_constant_is_folded_through_the_cast_it_is_tested_through() {
+        use IrType::{I8, I16, I32, I64, U8, U16};
+        // (constant, cast, where b0's hit lands once the nest is threaded:
+        //  10 when the constant is true behind the cast, and otherwise what
+        //  the rest of the nest decides -- no return over jumps alone)
+        let cases = [
+            (1, I64, Some(10)),
+            (1, U8, Some(10)),
+            (7, U8, Some(10)),
+            (255, I8, Some(10)),
+            (-1, U16, Some(10)),
+            (256, I16, Some(10)),
+            (256, U8, None),
+            (0x1_0000, U16, None),
+            (0, I32, None),
+            (0, U8, None),
+        ];
+        for (brought, width, lands_on) in cases {
+            let f = nest_bringing(brought, width);
+            let mut g = f.clone();
+            assert!(
+                thread_decided_and_fold(&mut g, false, false) > 0,
+                "{brought} through {width:?}"
+            );
+            assert_agree(&f, &g, &characters());
+            assert_eq!(lands(&g, 0, true), lands_on, "{brought} through {width:?}");
+        }
+    }
+
+    /// What a block computes of the constants one way in brings it.
+    #[test]
+    fn the_constant_a_way_in_decides() {
+        use crate::ir::reexports::IrConst;
+        use IrType::{F64, I8, I32, I64, U8};
+        let phi_of = |dest: u32, ty: IrType, arms: &[(Operand, u32)]| Instruction::Phi {
+            dest: Value(dest),
+            ty,
+            incoming: arms.iter().map(|&(x, b)| (x, BlockId(b))).collect(),
+        };
+        let cast = |dest: u32, src: u32, from_ty: IrType, to_ty: IrType| Instruction::Cast {
+            dest: Value(dest),
+            src: v(src),
+            from_ty,
+            to_ty,
+        };
+        let cmp = |dest: u32, op: IrCmpOp, lhs: Operand, rhs: Operand| Instruction::Cmp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty: I32,
+        };
+        let b = block(
+            3,
+            vec![
+                phi_of(
+                    3,
+                    I32,
+                    &[(k32(300), 0), (v(2), 1), (k32(0), 2), (k32(1), 2)],
+                ),
+                phi_of(4, F64, &[(k32(1), 0), (k32(1), 1)]),
+                cast(6, 3, I32, U8),
+                cmp(7, IrCmpOp::Eq, v(6), k32(44)),
+                Instruction::Copy {
+                    dest: Value(8),
+                    src: v(7),
+                },
+                cast(9, 3, I32, F64),
+                cmp(10, IrCmpOp::Slt, k32(299), v(3)),
+                cmp(11, IrCmpOp::Eq, v(3), v(0)),
+                cast(12, 8, I32, I8),
+                cmp(13, IrCmpOp::Ne, v(12), k32(0)),
+                cast(14, 4, F64, I64),
+            ],
+            jump(4),
+        );
+        let on = |x: u32, from: u32| {
+            constant_on_entry(&b, BlockId(from), Value(x)).and_then(|k: IrConst| k.to_i64())
+        };
+        // From b0: the phi's 300, 44 as a byte, the comparison with 44, its
+        // copy, and a chain behind it.
+        assert_eq!(on(3, 0), Some(300));
+        assert_eq!(on(6, 0), Some(44));
+        assert_eq!(on(7, 0), Some(1));
+        assert_eq!(on(8, 0), Some(1));
+        assert_eq!(on(10, 0), Some(1), "299 < 300");
+        assert_eq!(on(12, 0), Some(1));
+        assert_eq!(on(13, 0), Some(1));
+        // A compare with a value of elsewhere, a cast to a float, and what
+        // a phi of another type brings are not folded.
+        assert_eq!(on(11, 0), None);
+        assert_eq!(on(9, 0), None);
+        assert_eq!(on(4, 0), None);
+        assert_eq!(on(14, 0), None);
+        // From b1 the arm is a value: nothing is known.
+        assert_eq!(on(3, 1), None);
+        assert_eq!(on(7, 1), None);
+        // Two arms for one predecessor, and a predecessor without one.
+        assert_eq!(on(3, 2), None);
+        assert_eq!(on(3, 9), None);
+        // A value the block does not compute.
+        assert_eq!(on(2, 0), None);
+    }
+
+    /// `if (c == 32 || c == 9 || c == 13 || c == 44) return 10; return 20;`
+    /// over a `signed char`, the condition inlined from a helper:
+    ///
+    /// ```text
+    /// b0: c = param 0; t0 = (c == 32); br t0 ? b5 : b1
+    /// b1: t1 = (c == 9);  br t1 ? b5 : b2
+    /// b2: t2 = (c == 13); br t2 ? b5 : b3
+    /// b3: t3 = (c == 44); br b5
+    /// b5: p = phi [1, b0], [1, b1], [1, b2], [t3, b3]; br p ? b6 : b7
+    /// ```
+    fn class_of_a_char() -> IrFunction {
+        use crate::ir::reexports::IrConst;
+        let cmp = |dest: u32, k: i8| Instruction::Cmp {
+            dest: Value(dest),
+            op: IrCmpOp::Eq,
+            lhs: v(0),
+            rhs: Operand::Const(IrConst::I8(k)),
+            ty: IrType::I8,
+        };
+        let mut f = IrFunction::new("class".into(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I8,
+                    },
+                    cmp(1, 32),
+                ],
+                cbr(1, 5, 1),
+            ),
+            block(1, vec![cmp(2, 9)], cbr(2, 5, 2)),
+            block(2, vec![cmp(3, 13)], cbr(3, 5, 3)),
+            block(3, vec![cmp(4, 44)], jump(5)),
+            block(
+                5,
+                vec![Instruction::Phi {
+                    dest: Value(5),
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I64(1)), BlockId(0)),
+                        (Operand::Const(IrConst::I64(1)), BlockId(1)),
+                        (Operand::Const(IrConst::I64(1)), BlockId(2)),
+                        (v(4), BlockId(3)),
+                    ],
+                }],
+                cbr(5, 6, 7),
+            ),
+            block(6, vec![], Terminator::Return(Some(k32(10)))),
+            block(7, vec![], Terminator::Return(Some(k32(20)))),
+        ];
+        f.next_value_id = 6;
+        f.next_label = 8;
+        f
+    }
+
+    fn bit_tests(f: &IrFunction) -> usize {
+        use crate::ir::reexports::IrBinOp;
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::BitTest,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// Once the hits of a character class are threaded to where they go,
+    /// they meet without a value, and the set fold that follows the threads
+    /// tests the class with one bit test.  Before the threads it refuses:
+    /// the merge of a value over a `char` is if-conversion's.
+    #[test]
+    fn a_class_whose_hits_are_threaded_is_one_bit_test() {
+        let every_char: Vec<Vec<i64>> = (-128..=127).map(|c| vec![c]).collect();
+        let f = class_of_a_char();
+        let mut unthreaded = f.clone();
+        assert_eq!(
+            super::super::set_membership::run_function(&mut unthreaded),
+            0,
+            "the set fold leaves the merge of a value"
+        );
+        let mut g = f.clone();
+        assert!(thread_decided_and_fold(&mut g, true, true) > 0);
+        assert_eq!(bit_tests(&g), 1);
+        assert_agree(&f, &g, &every_char);
+        // Each fold under its own switch: without the set fold the threads
+        // stand, as a chain of tests.
+        let mut chain = f.clone();
+        assert!(thread_decided_and_fold(&mut chain, true, false) > 0);
+        assert_eq!(bit_tests(&chain), 0);
+        assert_eq!(lands(&chain, 0, true), Some(10));
+        assert_agree(&f, &chain, &every_char);
+        let mut neither = f.clone();
+        assert!(thread_decided_and_fold(&mut neither, false, false) > 0);
+        assert_eq!(bit_tests(&neither), 0);
+        assert_agree(&f, &neither, &every_char);
+    }
+
+    /// A function without a decided branch is not touched: no cleanup, no
+    /// fold.
+    #[test]
+    fn a_function_that_takes_no_thread_is_left_as_it_is() {
+        // The class with the merge already gone: hits at the return.
+        let mut f = class_of_a_char();
+        for b in &mut f.blocks {
+            if let Terminator::CondBranch { true_label, .. } = &mut b.terminator
+                && *true_label == BlockId(5)
+                && b.label != BlockId(5)
+            {
+                *true_label = BlockId(6);
+            }
+        }
+        if let Some(b) = f.blocks.iter_mut().find(|b| b.label == BlockId(5)) {
+            b.instructions.clear();
+            b.terminator = cbr(4, 6, 7);
+        }
+        let before = format!("{f:?}");
+        assert_eq!(thread_decided_and_fold(&mut f, true, true), 0);
+        assert_eq!(format!("{f:?}"), before, "not even the set fold runs");
     }
 }

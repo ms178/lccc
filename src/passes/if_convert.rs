@@ -2630,22 +2630,36 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     rewrites + if_convert_diamonds(func)
 }
 
-/// Whether the conditional branch that ends `block` is decided by the edge
-/// control came in on: its condition is a phi of this block whose arms are
-/// all constants, read directly or through casts and compares against
-/// constants in the block.
+/// Whether the conditional branch that ends `block` is decided by an edge
+/// control comes in on: its condition is a phi of this block with a constant
+/// arm, read directly or through casts and compares against constants in the
+/// block.
 ///
-/// Such a branch tests nothing.  Each way in already knows which arm it
-/// takes, and the jump threaders send it there (`jump_thread`, `bool_thread`):
-/// no test, no branch, no value.  A select is the opposite trade -- it
-/// materializes the constant on every way in, tests it, and computes both
-/// arms -- and once the branch is a select there is nothing left to thread.
-/// The kernel's `if (static_branch_likely(&key)) x = f(x);` is this shape: the
-/// helper's `return false` and `return true` meet in a phi of 0 and 1, the way
-/// in is decided by an asm goto, and no condition exists that a select could
-/// test instead.  (A phi two arms of one branch feed is turned into a select
-/// on that branch's condition first, by this pass, and is no phi any more
-/// when its own turn comes.)
+/// On that way in the branch tests nothing.  The predecessor knows which arm
+/// it takes, and the jump threaders send it there (`jump_thread`,
+/// `bool_thread`): no test, no branch, no value.  A select is the opposite
+/// trade -- it materializes the constant, tests it, and computes both arms
+/// on a path that needed neither -- and once the branch is a select there is
+/// nothing left to thread.  Two shapes:
+///
+/// * every arm a constant: the kernel's `if (static_branch_likely(&key)) x =
+///   f(x);`.  The helper's `return false` and `return true` meet in a phi of
+///   0 and 1, the way in is decided by an asm goto, and no condition exists
+///   that a select could test instead;
+/// * some arm a constant: `if (smaller(...)) j++;` with `smaller` an inlined
+///   `a < b || (a == b && c <= d)` branches on `phi [1, A], [t, B]`.  As a
+///   select, zlib's sift loop ran `movl $1, %r12d; leal 1(%rdx), %r9d; testq
+///   %r12, %r12; cmovne` on the path that had just decided to step:
+///   16.41 M instructions for a run that takes 14.01 M with the branch kept
+///   and threaded.
+///
+/// A phi that two arms of one branch feed is turned into a select on that
+/// branch's condition first, by this pass, and is no phi any more when its
+/// own turn comes: a nest of conditions is converted from the inside out,
+/// and only what stays a merge of control flow is left to the threaders.
+/// (The order matters to the vectorizer too: converted from the outside in,
+/// the classifier loops `if (alpha(s[i])) n++` and `if (space(s[i])) n++`
+/// kept a select of a phi and stayed scalar.)
 fn branch_is_decided_on_entry(block: &BasicBlock) -> bool {
     let Terminator::CondBranch {
         cond: Operand::Value(cond),
@@ -2670,7 +2684,7 @@ fn branch_is_decided_on_entry(block: &BasicBlock) -> bool {
                 return incoming.len() >= 2
                     && incoming
                         .iter()
-                        .all(|(arm, _)| matches!(arm, Operand::Const(_)));
+                        .any(|(arm, _)| matches!(arm, Operand::Const(_)));
             }
             Instruction::Cast {
                 src: Operand::Value(src),
@@ -7278,31 +7292,77 @@ mod decided_on_entry_tests {
         assert!(has_select(&f));
     }
 
+    /// What counts as decided: a phi of this block with a constant arm, read
+    /// directly or through casts and compares against constants.
     #[test]
-    fn only_a_phi_of_constants_decides() {
+    fn a_phi_with_a_constant_arm_decides() {
         let decided = |insts: Vec<Instruction>, tested: u32| {
             branch_is_decided_on_entry(&block(2, insts, branch_on(tested, 3, 4)))
         };
-        // The phi itself.
+        let value = |n: u32| Operand::Value(Value(n));
+        // Every arm a constant: each way in knows the arm.
         assert!(decided(vec![phi(10, vec![(int(0), 0), (int(1), 1)])], 10));
-        // One arm is a value: that way in still has to test it.
-        assert!(!decided(
-            vec![phi(10, vec![(int(0), 0), (Operand::Value(Value(5)), 1)])],
+        // One arm a constant: that way in knows it, whichever arm it is.
+        assert!(decided(vec![phi(10, vec![(int(0), 0), (value(5), 1)])], 10));
+        assert!(decided(vec![phi(10, vec![(value(5), 0), (int(1), 1)])], 10));
+        assert!(decided(
+            vec![phi(10, vec![(value(5), 0), (value(6), 1), (int(1), 7)])],
             10
         ));
-        // A compare of the phi with another value is no constant per way in.
+        // No arm a constant: every way in has to test.
+        assert!(!decided(
+            vec![phi(10, vec![(value(5), 0), (value(6), 1)])],
+            10
+        ));
+        // One way in: a copy with a phi's name, which merges nothing.
+        assert!(!decided(vec![phi(10, vec![(int(1), 0)])], 10));
+        // Read through a cast, a compare against a constant on either side,
+        // and a copy.
+        let cast = |dest: u32, src: u32| Instruction::Cast {
+            dest: Value(dest),
+            src: value(src),
+            from_ty: IrType::I32,
+            to_ty: IrType::U8,
+        };
+        let cmp = |dest: u32, lhs: Operand, rhs: Operand| Instruction::Cmp {
+            dest: Value(dest),
+            op: IrCmpOp::Ne,
+            lhs,
+            rhs,
+            ty: IrType::I32,
+        };
+        let merge = || phi(10, vec![(int(0), 0), (value(5), 1)]);
+        assert!(decided(vec![merge(), cast(11, 10)], 11));
+        assert!(decided(vec![merge(), cmp(12, value(10), int(0))], 12));
+        assert!(decided(vec![merge(), cmp(12, int(0), value(10))], 12));
+        assert!(decided(
+            vec![
+                merge(),
+                Instruction::Copy {
+                    dest: Value(13),
+                    src: value(10),
+                },
+                cast(11, 13),
+                cmp(12, value(11), int(0)),
+            ],
+            12
+        ));
+        // A compare of the phi with another value is no constant on any way
+        // in.
+        assert!(!decided(vec![merge(), cmp(12, value(10), value(5))], 12));
+        // Arithmetic on the phi is not read through.
         assert!(!decided(
             vec![
-                phi(10, vec![(int(0), 0), (int(1), 1)]),
-                Instruction::Cmp {
-                    dest: Value(12),
-                    op: IrCmpOp::Eq,
-                    lhs: Operand::Value(Value(10)),
-                    rhs: Operand::Value(Value(5)),
+                merge(),
+                Instruction::BinOp {
+                    dest: Value(14),
+                    op: IrBinOp::Add,
+                    lhs: value(10),
+                    rhs: int(1),
                     ty: IrType::I32,
                 },
             ],
-            12
+            14
         ));
         // A value defined in another block, and a constant condition.
         assert!(!decided(vec![], 10));
@@ -7315,5 +7375,106 @@ mod decided_on_entry_tests {
                 false_label: BlockId(4),
             }
         )));
+        // A block that ends in a jump decides nothing.
+        assert!(!branch_is_decided_on_entry(&block(
+            2,
+            vec![merge()],
+            jump(3)
+        )));
+    }
+
+    /// `if (a < b || t) x = x * 3 + 1; return x;` with the condition inlined:
+    ///
+    /// b0: x = param 0; a = param 1; t = param 2; CondBranch(a, b2, b1)
+    /// b1: Branch(b2)
+    /// b2: p = phi [1, b0], [t, b1]; CondBranch(p, b3, b4)
+    /// b3: y = x * 3; z = y + 1; Branch(b4)
+    /// b4: r = phi [x, b2], [z, b3]; Return r
+    ///
+    /// b0 knows the arm.  A select in b2 would write the 1, test it and
+    /// compute `x * 3 + 1` on the way that knew; the threader sends b0 to b3.
+    fn one_way_in_knows() -> IrFunction {
+        let mut f = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+        f.next_value_id = 40;
+        let param = |dest: u32, param_idx: usize| Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx,
+            ty: IrType::I32,
+        };
+        let bin = |dest: u32, op: IrBinOp, lhs: u32, rhs: i32| Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: int(rhs),
+            ty: IrType::I32,
+        };
+        f.blocks = vec![
+            block(
+                0,
+                vec![param(1, 0), param(2, 1), param(3, 2)],
+                branch_on(2, 2, 1),
+            ),
+            block(1, vec![], jump(2)),
+            block(
+                2,
+                vec![phi(10, vec![(int(1), 0), (Operand::Value(Value(3)), 1)])],
+                branch_on(10, 3, 4),
+            ),
+            block(
+                3,
+                vec![bin(20, IrBinOp::Mul, 1, 3), bin(21, IrBinOp::Add, 20, 1)],
+                jump(4),
+            ),
+            block(
+                4,
+                vec![phi(
+                    30,
+                    vec![
+                        (Operand::Value(Value(1)), 2),
+                        (Operand::Value(Value(21)), 3),
+                    ],
+                )],
+                Terminator::Return(Some(Operand::Value(Value(30)))),
+            ),
+        ];
+        f
+    }
+
+    /// The branch on the merge stays a branch: its arms are not turned into
+    /// a select on a phi that one way in fills with a constant.
+    #[test]
+    fn a_branch_one_way_in_decides_keeps_its_arms() {
+        let mut f = one_way_in_knows();
+        assert!(branch_is_decided_on_entry(&f.blocks[2]));
+        if_convert_function(&mut f);
+        assert!(
+            matches!(
+                f.blocks.iter().find(|b| b.label == BlockId(2)),
+                Some(BasicBlock {
+                    terminator: Terminator::CondBranch { .. },
+                    ..
+                })
+            ),
+            "the merge still branches"
+        );
+        assert!(
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|inst| matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::Mul,
+                        ..
+                    }
+                )),
+            "the arm is still there"
+        );
+        let arm = f
+            .blocks
+            .iter()
+            .find(|b| b.label == BlockId(3))
+            .expect("the arm keeps its block");
+        assert_eq!(arm.instructions.len(), 2, "and holds the arithmetic");
     }
 }
